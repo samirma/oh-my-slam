@@ -116,12 +116,9 @@ deterministically from a fixed, perceptually distinct palette, so that the value
 The mapping is a pure function of the object `id`, so re-running against the same map
 yields the same colours, and the palette cycles by hue once it is exhausted.
 
-## 3. Scene description (JSON)
+## 3. Scene description (JSON) returned by the tools
 
-The default output of all three tools. Coordinates are metres, right-handed, `+y` up; the
-frame is the camera for a single image and the map origin for a map.
-
-Use a well known json scheme url that support
+Use a well known json scheme url that support JSON OBB
 
 ## 4. Constraints
 
