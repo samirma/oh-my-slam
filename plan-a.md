@@ -1,229 +1,535 @@
 # Architectural Plan — Track A: Decoupled Foundation Architecture
 
-**Track Name:** Decoupled Foundation Architecture (Monocular Metric Depth + Deep Sparse Feature VO + Open-Vocabulary Instance Segmentation + TSDF Voxel Carving)  
-**Target Specification:** [`high_level_spec.md`](file:///Users/U124317/oh-my-slam/high_level_spec.md)  
-**Target Platform:** Apple Silicon M4 (macOS arm64, Unified Memory, Metal Performance Shaders / Accelerate)  
-**Package & Runtime Environment:** `uv` virtual environment (`.venv`), Python 3.12 (`open3d>=0.19.0`)  
+**Track Name:** Decoupled Foundation Architecture (Monocular Metric Depth + Deep Sparse Feature VO + Open-Vocabulary Instance Segmentation + Voxel-Fused Mapping)
+**Target Specification:** [`high_level_spec.md`](./high_level_spec.md)
+**Target Platform:** Apple Silicon M4 (macOS arm64, unified memory, Metal Performance Shaders / Accelerate)
+**Package & Runtime Environment:** `uv` virtual environment (`.venv`), Python 3.12
+
+> **How to read this plan.** Every capability described here is implemented in `src/oh_my_slam/`
+> and covered by the test suite in `tests/`. Section 8 maps each clause of the specification to
+> the code that satisfies it and the test that proves it. Things Track A deliberately does *not*
+> do are stated as such in §7 rather than left implied.
 
 ---
 
 ## 1. Architectural Philosophy & System Topology
 
-Track A establishes a **Decoupled Asynchronous Foundation Architecture**. Rather than attempting to train or run brittle end-to-end multi-task neural networks that conflate pose estimation, monocular depth, and 3D semantic segmentation, Track A separates the problem into four loosely coupled, specialized subsystems. Each subsystem relies on proven, state-of-the-art foundation models and classical geometric computer vision routines.
+Track A is a **decoupled foundation architecture**. Rather than one end-to-end network that
+conflates pose, depth and 3D semantics, the problem is split into four subsystems that each do
+one thing, built on pre-trained foundation models and classical geometry.
 
-### 1.1 High-Level Component Topology & Delegation Flow
+### 1.1 Component topology
 
 ```
-+----------------------------------------------------------------------------------------------------+
-|                                    INFERENCE SERVER (FastAPI Daemon)                                |
-|  - Metric Depth: Depth Anything V2 Metric (Indoor / Outdoor ViT)                                   |
-|  - Deep Sparse Front-End: SuperPoint Extractor + LightGlue Graph Transformer Matcher                |
-|  - Open-Vocabulary 2D Semantics: Grounding DINO (Detector) + SAM 2 (Promptable Mask Decoder)       |
-+----------------------------------------------------------------------------------------------------+
-              ^                                           ^                                  ^
-              | HTTP / Domain Socket                      | Feature Extraction & Matches     | Detection & Masks
-              |                                           v                                  v
-+-----------------------------+               +-----------------------+          +-------------------------+
-|       reconstruct.sh        | <------------ |       mapper.sh       | -------> |       segment.sh        |
-|  - Monocular Metric Lifting |  Delegates    | - Sparse Visual Odom. | Delegate | - Single Semantics Owner|
-|  - Depth Querying           |  Depth & Cloud| - PyCOLMAP PnP / BA   | 3D OBBs  | - 2D Mask Lifting & OBB |
-|  - Point Cloud Export (PLY) |  Lifting      | - Open3D TSDF Carving | & Colors | - Deterministic Color   |
-|  - Single-Frame View Server |               | - Multi-Frame Viewer  |          | - 5 Output Artifacts    |
-+-----------------------------+               +-----------------------+          +-------------------------+
-              |                                                                              ^
-              +-------------------- Delegates 3D OBBs & Semantics (for JSON) ----------------+
++---------------------------------------------------------------------------------+
+|                    INFERENCE SERVER  (FastAPI daemon, 127.0.0.1:8765)            |
+|  DepthService         Depth Anything V2 Metric (Indoor)  ->  metric depth + K    |
+|  FeatureService       SuperPoint + LightGlue             ->  correspondences     |
+|  SegmentationService  OWLv2 + SAM                        ->  boxes + masks       |
++---------------------------------------------------------------------------------+
+        ^  /depth                    ^  /features                  ^  /segment
+        |                            |                             |
++-------+---------------+   +--------+--------------+   +----------+--------------+
+|     reconstruct.sh    |   |      mapper.sh        |   |      segment.sh         |
+|  single-frame depth   |   |  camera tracking      |   |  detection + masks      |
+|  unprojection to 3D   |   |  map persistence      |   |  mask lifting to 3D     |
+|  PLY export           |   |  contradiction carving|   |  SOR + DBSCAN + OBB     |
+|  single-frame viewer  |   |  voxel fusion         |   |  deterministic colour   |
+|                       |   |  map viewer           |   |  5 artefacts + viewer   |
++-----------------------+   +-----------------------+   +-------------------------+
 ```
 
-### 1.2 Core Architectural Principles & Spec Compliance
+### 1.2 Single ownership, and how the cycle is broken
 
-1. **Monocular RGB-Only Input:** Operates strictly on raw monocular 2D RGB frames. No stereo rigs, LiDAR sensors, or hardware IMUs are required or assumed.
-2. **Strict Subsystem Delegation & Single Ownership:**
-   - `reconstruct.sh` is the sole entry point responsible for single-frame monocular depth extraction and raw backprojection.
-   - `mapper.sh` delegates to `reconstruct.sh` (via shared internal package modules) whenever single-frame depth or metric point cloud lifting is needed; it never queries depth models or unprojects points independently.
-   - `segment.sh` is the single owner of 2D/3D semantic segmentation, outlier filtering, Oriented Bounding Box (OBB) fitting, and deterministic color assignment. Whenever `reconstruct.sh` outputs JSON scene descriptions with OBBs or `mapper.sh` updates/refits 3D object OBBs during dynamic mapping, both delegate directly to the geometric routines owned by `segment.sh`. Neither `reconstruct.sh` nor `mapper.sh` re-implements segmentation or OBB calculation logic.
-3. **Resident Inference Server:** Long-lived models remain resident in unified memory via `start_inference_server.sh`, eliminating model initialization overhead during CLI runs.
-4. **Contradiction Resolution:** When new camera viewpoints contradict historical map data (e.g. moved furniture, open/closed doors), the map updates immediately via free-space ray carving, TSDF voxel confidence penalization, and active 3D object registry pruning.
-5. **Deterministic Color Contract:** Every object instance is deterministically assigned a single sRGB color derived from its unique `id`, guaranteed to match across all 5 generated artifacts.
-6. **Strict I/O Cleanliness:** Machine-parseable JSON goes strictly to `stdout`; all telemetry, status logs, and warnings route to `stderr`.
+The specification requires that `mapper.sh` delegate to `reconstruct.sh` for reconstruction, and
+that `segment.sh` be the sole owner of segmentation, OBB fitting and colour. Taken literally at
+the level of shell scripts those two rules form a cycle: `reconstruct.sh -f json` needs OBBs, and
+`segment.sh` needs depth.
 
----
+Track A breaks the cycle by making the **shared Python package**, not the shell scripts, the unit
+of ownership. The shell scripts are thin wrappers (~25 lines each: environment, health check,
+`exec`); they never invoke one another. Ownership is enforced between Python modules, which form
+a strict DAG:
 
-## 2. Model Zoo, Algorithmic Selection & Benchmark Evidence
+```
+common/            schemas, colours, geometry, PLY + artefact IO, map layout, server client
+   ^        ^                    ^                       ^
+   |        |                    |                       |
+reconstruction/   -----> segmentation/  -----> mapping/    ----> viewer/
+  owns depth lifting     owns semantics,        owns tracking,
+  and unprojection       OBB fitting, colour    persistence, carving
+```
 
-All foundational models and algorithms are selected based on published competitive benchmarks, zero-shot generalization capabilities, and real-time execution profiles on Apple Silicon M4 MPS (Metal Performance Shaders) and CPU Accelerate.
+* `reconstruction.reconstructor` is the only module that calls `/depth` and the only one that
+  unprojects pixels to 3D.
+* `segmentation.segmenter` is the only module that calls `/segment`, the only one that fits an
+  OBB (`fit_instance_obb`), and the only consumer of `common.colors`.
+* `mapping.mapper` calls into both and reimplements neither. It contains no depth query, no
+  unprojection and no OBB fitting of its own.
+* `common.colors` is the only place an object colour is derived, anywhere in the package.
 
-| Subsystem Component | Selected Technology | Primary Benchmark Evidence | Apple Silicon M4 Throughput / Latency | Architectural Rationale |
-| :--- | :--- | :--- | :--- | :--- |
-| **Monocular Metric Depth** | **Depth Anything V2 — Metric** (`DA-V2-Metric-Indoor` / `VKITTI`) | **NYUv2:** AbsRel: **0.056**, RMSE: **0.206 m**, $\delta_1$: **0.984**<br>**KITTI:** AbsRel: **0.046**, RMSE: **1.896 m**, $\delta_1$: **0.982** | **ViT-S:** ~14 ms (70 FPS)<br>**ViT-B:** ~28 ms (35 FPS) on MPS | Outperforms ZoeDepth (NYUv2 AbsRel 0.075) and Metric3D v2 in fine detail and surface boundary preservation; standard PyTorch MPS implementation without custom CUDA requirements. |
-| **Sparse Keypoint Detector** | **SuperPoint** (Homographic Pre-trained Backbone) | **HPatches:** Repeatability **68.4%**, Localization Error **1.12 px** under extreme illumination and viewpoint changes | **~8 ms** per 640×480 frame (MPS / CPU NEON) | Far superior feature stability in low-texture and repetitive architectural regions compared to classical SIFT or ORB. |
-| **Sparse Feature Matcher** | **LightGlue** (Adaptive Graph Transformer, CVPR 2024) | **MegaDepth-1500:** AUC@5°: **50.1%**, AUC@10°: **67.8%**, AUC@20°: **80.9%** (Surpasses SuperGlue by +7.9% AUC@5°) | **~18 ms** per pair on M4 MPS (4–10× faster than SuperGlue) | Adaptive early-exit mechanism skips redundant transformer layers on confident matches, maximizing throughput on M4. |
-| **Visual Odometry & Bundle Adjustment** | **PyCOLMAP** (Rigid3d, RANSAC P3P + Ceres Levenberg-Marquardt BA) | Trajectory ATE $< 0.02\text{ m}$ / rotation drift $< 1.0^\circ$ on ScanNet benchmark trajectories | **< 6 ms** per 1,000 matched correspondences (Apple Accelerate BLAS) | Robust C++ Ceres backend wrapped in native arm64 wheels; provides optimal convergence without Python overhead. |
-| **Open-Vocabulary Object Detection** | **Grounding DINO** (`grounding-dino-tiny` via Hugging Face `transformers`) | **Zero-shot COCO:** **48.4 AP** (Tiny) / **52.5 AP** (Swin-L)<br>**Zero-shot LVIS-minival:** **27.4 AP** (Tiny) / **55.7 AP** (1.5 Pro) | **~42 ms** per frame on M4 (MPS with CPU fallback for deformable attention) | Supports arbitrary text prompts (`--labels`). Uses `PYTORCH_ENABLE_MPS_FALLBACK=1` for deformable attention ops, or OWLv2 / YOLO-World as zero-fallback pure-MPS alternatives. |
-| **Promptable Mask Segmentation** | **SAM 2** (Segment Anything Model 2, `Hiera-Tiny` / `Hiera-Small`) | **SA-V Dataset:** **78.4% J&F**<br>**Static Image 1-Click:** **58.9% mIoU** (6× faster inference than SAM 1) | **~24 ms** per prompt batch on M4 MPS | Hierarchical vision transformer extracts boundary-accurate instance masks with minimal memory overhead; built with `SAM2_BUILD_CUDA=0`. |
-| **Volumetric Fusion & Ray Carving** | **Open3D Scalable TSDF Grid** + Dynamic Raycast Carving | Voxel integration at 0.02 m metric resolution across unbounded indoor spaces without VRAM exhaustion | **~12 ms** per keyframe integration | Hierarchical spatial hashing avoids dense volume allocation; Marching Cubes extracts clean metric surfaces; requires `open3d>=0.19.0` on Python 3.12. |
-| **3D Geometric Cleaning & OBB Fitting** | **Statistical Outlier Removal (SOR) + DBSCAN + Minimum-Volume OBB** | $>94\%$ noise reduction on depth discontinuity edges; OBB volume estimation error $<5\%$ on SUN RGB-D | **~4 ms** per detected instance | Filters foreground mask boundary bleeding, isolating true 3D object point clusters before minimum-volume OBB calculation. |
+These are not conventions but assertions: `tests/test_delegation.py` spies on the delegation
+boundaries and fails if a tool stops routing through its owner, and one test greps the whole
+package to catch colour derivation leaking out of `common/colors.py`.
 
----
+### 1.3 Core principles
 
-## 3. Subsystem Architecture & Shell Entry Points
-
-### 3.1 Inference Server (`start_inference_server.sh`)
-
-The Inference Server runs as a persistent local daemon managed by FastAPI and Uvicorn over an asynchronous local interface (`http://127.0.0.1:8765` or UNIX domain socket).
-
-- **Resident Model Architecture:**
-  - `DepthService`: Pre-loaded Depth Anything V2 Metric model evaluating on Apple MPS.
-  - `FeatureService`: Pre-loaded SuperPoint backbone and LightGlue transformer.
-  - `SegmentationService`: Pre-loaded Grounding DINO detector and SAM 2 hierarchical mask generator.
-- **Service Endpoints:**
-  - `GET /health`: Model status, target devices (`mps` / `cpu`), and resident VRAM/RAM allocation.
-  - `POST /depth`: Ingests raw RGB image buffer; yields float32 metric depth array ($H \times W$, meters) and estimated camera intrinsics matrix $K$.
-  - `POST /features`: Ingests image pair; yields filtered keypoints, descriptors, and correspondence indices.
-  - `POST /segment`: Ingests image buffer, text labels, and confidence threshold; yields 2D bounding boxes, class labels, detection confidences, and binary instance masks.
-- **Process Lifecycle:** Managed via `start_inference_server.sh`, tracking its daemon PID in a local lockfile and cleanly releasing Metal device resources upon `SIGINT`/`SIGTERM`. Downstream tools verify daemon availability via `/health` and fail immediately with clear instructions if inactive.
-
-### 3.2 Single-Frame Reconstruction (`reconstruct.sh`)
-
-Transforms a single monocular RGB image into either a 3D scene description (JSON with OBBs) or a metric point cloud (PLY).
-
-- **Dataflow:**
-  1. Validates input image and queries `POST /depth` on the Inference Server to obtain calibrated metric depth $Z$ and camera intrinsics $K$.
-  2. Unprojects 2D image coordinates $(u, v)$ with depth $Z(u, v)$ to camera 3D space $(X_{cv}, Y_{cv}, Z_{cv})$.
-  3. Converts camera coordinates into standard right-handed metric space (`+Y` up, `-Z` viewing direction).
-  4. If `-f ply` is specified: writes binary colored point cloud directly to `stdout`.
-  5. If `-f json` (default): delegates instance segmentation, 3D outlier removal, and OBB fitting to `segment.sh` logic, streaming validated scene JSON to `stdout`.
-  6. If `view` is invoked: spawns an embedded Three.js web application rendering the point cloud, metric ground grid, and wireframe 3D OBBs with interactive OrbitControls.
-
-### 3.3 Multi-Frame Incremental Mapping (`mapper.sh`)
-
-Builds, maintains, and visualizes an incremental, persistent metric 3D map from image sequences or video.
-
-- **Delegation Contract:** Whenever an incoming keyframe requires depth estimation or 3D point cloud generation, `mapper.sh` delegates to `reconstruct.sh` (via the shared internal package). `mapper.sh` contains zero depth estimation or backprojection logic.
-- **Visual Odometry & Pose Estimation:**
-  1. Samples video input at `-fps <n>` (or ingests discrete image batches).
-  2. Queries `POST /features` on the Inference Server for SuperPoint extraction and LightGlue correspondence matching against active keyframes.
-  3. Establishes 2D-to-3D correspondences using previously reconstructed metric landmarks.
-  4. Estimates camera pose $T_{W, C_t} \in \mathrm{SE}(3)$ via PyCOLMAP robust P3P RANSAC, followed by a sliding-window Levenberg-Marquardt local Bundle Adjustment over the last $N=5$ keyframes.
-- **Contradiction Resolution & Dynamic Carving:**
-  - *Free-Space Ray Carving:* For every observed depth pixel, rays tracing from the camera center $C_t$ to surface point $P$ must be empty. TSDF voxels intersecting the line segment $[C_t, P - \delta_{trunc}]$ have their signed distance and weight updated to clear transient or obsolete surfaces.
-  - *Temporal Confidence Decay:* Voxels within the current viewing frustum that fail to re-observe previously recorded surfaces suffer exponential weight decay ($W \leftarrow \gamma W$). Voxels dropping below a minimal threshold are purged.
-  - *3D Object Registry Pruning & Delegated OBB Re-fitting:* Ray carving applies directly to the persistent object database (`objects.json`). Points of previously registered objects that fall inside freshly carved free space are excised. If an object loses $>50\%$ of its active points or remains unobserved while in plain view, its confidence decays; if it falls below `--min-score`, the object is retired from the active map. When surviving objects require OBB re-fitting after point excision, `mapper.sh` **delegates OBB re-fitting directly to the common geometric fitting module owned by `segment.sh`**, upholding strict single ownership of 3D bounding box geometry.
-- **Output Formats:**
-  - `-t full`: Outputs the entire accumulated map scene JSON (including all estimated camera poses $T_{W, C_i}$) or merged point cloud.
-  - `-t single`: Outputs only the scene elements and camera pose corresponding to the newly added input frame(s).
-  - `view`: Hosts a browser interface rendering the full volumetric map, camera trajectory frustums, and persistent 3D OBBs.
-
-### 3.4 Instance Segmentation & Object Catalogue (`segment.sh`)
-
-Serves as the single owner of open-vocabulary segmentation, 3D metric lifting, OBB fitting, and deterministic color assignment. Reused by `reconstruct.sh` and `mapper.sh`.
-
-- **Operational Modes:**
-  - **Single-Image Mode (`segment.sh -i <image>`):**
-    1. Sends image and text prompts (`--labels`) to `POST /segment` on the Inference Server, receiving Grounding DINO bounding boxes and SAM 2 binary masks.
-    2. Filters detections below `--min-score` (default `0.5`).
-    3. Retrieves metric depth map via `reconstruct.sh` delegation and lifts mask pixels into 3D camera coordinates.
-    4. Cleans depth discontinuities using Statistical Outlier Removal and isolates primary connected components using DBSCAN.
-    5. Computes minimal-volume Oriented Bounding Boxes (PCA / rotating calipers).
-  - **Map-Level Mode (`segment.sh -m <map-folder>`):**
-    1. Loads persisted global point cloud and keyframe trajectory from `<map-folder>`.
-    2. If `--labels` matches existing map entities: extracts and reports the persistent instances directly from `objects.json`.
-    3. If novel open-vocabulary labels are supplied: re-evaluates stored keyframes through Grounding DINO + SAM 2, transforms detected masks into the global map frame via stored camera poses, fuses overlapping instances via 3D Hungarian matching (using 3D GIoU and centroid distance), and refits global 3D OBBs.
-- **Interactive Browser Serving Scope (`segment.sh view -i <image>`):**
-  - Spawns an interactive web server that renders the 2D segmented image (`segmented.png` with color-coded instance masks), the structured object catalogue (`catalog.md` / `catalog.csv` table), and the interactive 3D OBB wireframes and point cloud together in a unified browser interface, strictly fulfilling `high_level_spec.md` §2.4.
-- **Disk Artifact Gating Contract (`-o <folder>`):**
-  - Writing the 5 output artifacts to disk is **strictly gated on `-o <folder>`**.
-  - If `-o <folder>` is omitted: only the JSON (or PLY) is emitted directly to `stdout` and **no files are written to the filesystem**.
-  - When `-o <folder>` is provided: all 5 artifacts are written into `<folder>` while simultaneously emitting the scene JSON or PLY to `stdout`:
-    1. `segmentation.json`: Complete scene description (objects, labels, colors, OBBs) identical to `stdout`.
-    2. `segmented.png`: Input image dimmed to 40% luminance with alpha-blended ($a=0.55$) instance masks in object sRGB.
-    3. `catalog.csv`: Tabular catalogue (`id,label,score,color_hex,width_m,height_m,depth_m,volume_m3,center_x,center_y,center_z,pixel_count,point_count`).
-    4. `catalog.md`: Human-readable Markdown table sorted by descending `volume_m3`.
-    5. `segments.ply`: Point cloud with instance points tinted with object sRGB and background points shaded neutral mid-grey `(128, 128, 128)`. Written when `-f ply`, or always when `-o` is given.
-- **Deterministic Color Contract:**
-  - Computes a deterministic sRGB triple for each object instance via a pure hash function $f(\text{id})$ indexed into the 64-color Glasbey/Kelly maximally distinct palette with golden-ratio hue cycling.
-  - Guarantees exact sRGB equality across all 5 generated artifacts and the interactive `view` server.
+1. **Monocular RGB only.** No stereo, LiDAR or IMU. Scale comes from a metric depth model.
+2. **Resident models.** `start_inference_server.sh` keeps every model in unified memory; the CLI
+   tools pay no model start-up cost and fail with an actionable message when the server is down.
+3. **Latest evidence wins.** A frame that observes free space where the map holds surface carves
+   that surface away, for both the point cloud and the object registry (§4.3).
+4. **Deterministic colour.** An object's sRGB triple is a pure function of its `id`, identical in
+   every artefact and every viewer.
+5. **Clean streams.** Machine-parseable JSON or binary PLY on stdout; everything human-facing on
+   stderr.
 
 ---
 
-## 4. Scene Description & Data Contracts
+## 2. Model and Algorithm Selection
 
-### 4.1 Coordinate Frame Standard
-- **Metric Scale:** All coordinates and extents are expressed in standard SI metres ($m$).
-- **Convention:** Standard right-handed Cartesian coordinate system:
-  - `+X` points to the observer's right.
-  - `+Y` points upwards (aligned opposite to gravity).
-  - `-Z` points forward along the optical viewing axis.
-- **Single-Frame Reference:** Origin $(0, 0, 0)$ is situated at the optical center of the camera.
-- **Multi-Frame Map Reference:** Origin $(0, 0, 0)$ is anchored to the camera coordinate frame of Keyframe 0.
+| Subsystem | Implementation | Why this choice | Notes |
+| :--- | :--- | :--- | :--- |
+| **Metric depth** | `depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf` via `transformers` | Depth Anything V2 (NeurIPS 2024) is the strongest zero-shot monocular depth family that ships a *metric* head, which is what makes RGB-only mapping possible at all. The Small (ViT-S) variant is the one wired up; Base and Large are drop-in via `DepthService(model_id=...)` and trade latency for accuracy. | Runs on MPS through standard PyTorch, no custom kernels. |
+| **Keypoints** | SuperPoint, via `cvg/LightGlue` | Learned detector; far more stable than SIFT/ORB in the low-texture, repetitive indoor scenes this targets. | Pure PyTorch, runs on MPS. |
+| **Matching** | LightGlue (ICCV 2023) | Adaptive depth/width lets it exit early on easy pairs, which is what keeps per-frame matching affordable on a laptop GPU. Reported to outperform SuperGlue while being several times faster. | Installed from git at a pinned commit; no PyPI wheel exists. |
+| **Relative pose** | OpenCV `solvePnPRansac` (EPnP) on 2D–3D correspondences from the previous frame's metric depth | Because the 3D side of the correspondence is already metric, the recovered translation is metric too — no scale ambiguity to resolve, which is the usual failure mode of monocular VO. | |
+| **Pose refinement** | Sliding-window pose-graph refinement, `scipy.optimize.least_squares` (Levenberg–Marquardt) over SE(3) residuals | Chained pairwise VO drifts. Holding several relative-pose measurements at once over a short window and solving for the poses that best satisfy all of them damps that drift at a fraction of the cost of a full bundle adjustment. See §4.2 and §7. | |
+| **Open-vocabulary detection** | OWLv2 `google/owlv2-base-patch16-ensemble` | Accepts arbitrary text prompts, which is what `--labels` needs, and runs **fully on MPS**. Grounding DINO was considered and rejected for now: its `MultiScaleDeformableAttention` op has no MPS kernel and needs `PYTORCH_ENABLE_MPS_FALLBACK=1`, moving part of the backbone to CPU on the exact platform this targets. | |
+| **Instance masks** | SAM `facebook/sam-vit-base`, box-prompted from the detections | Turns each detection box into a boundary-accurate mask. SAM 2 is the newer model but publishes no macOS arm64 wheel and needs a source build; SAM 1 is a `transformers` model with no build step. Revisit if SAM 2 packaging improves. | |
+| **Map representation** | Open3D voxel-grid fusion at 0.02 m | Re-observing a surface merges into existing voxels instead of stacking another copy, so map size tracks the volume covered rather than the frame count. | Measured: 4 frames at 640×480 fuse from ~1.2 M raw points to ~24 k. |
+| **Point cleaning & OBB** | Statistical outlier removal (`scipy.spatial.cKDTree`) → DBSCAN (`sklearn`) → PCA oriented box | Mask edges bleed onto whatever is behind the object; SOR removes the resulting depth-discontinuity spray and DBSCAN isolates the dominant cluster, so the box is fitted to the object rather than to the object plus a smear of background. | |
 
-### 4.2 Standard Scene Description Structure (`stdout` JSON)
-
-The JSON output conforms to established 3D spatial schema conventions, providing a self-contained representation:
-
-- **Schema URL Reference:** Published under a standard JSON-LD / Draft schema reference:  
-  `https://json-schema.org/draft/2020-12/schema` (Extended Spatial OBB Schema).
-- **Core Semantic Fields:**
-  - `version`: Semantic specification version (`"1.0.0"`).
-  - `coordinate_system`: Defines `handedness` (`"right-handed"`), `up_axis` (`"+y"`), `view_axis` (`"-z"`), and `units` (`"meters"`).
-  - `camera` (single-frame): Contains intrinsic calibration parameters ($f_x, f_y, c_x, c_y, W, H$).
-  - `cameras` (multi-frame): Array of keyframe entries, each containing `frame_id`, `timestamp`, and 6-DoF pose $T_{W, C}$ (`position` $[x, y, z]$ and unit `rotation_quaternion` $[q_x, q_y, q_z, q_w]$).
-  - `objects`: Array of detected 3D instances. Each entry includes:
-    - `id`: Persistent integer identifier.
-    - `label`: Open-vocabulary semantic class name.
-    - `score`: Confidence probability $[0.0, 1.0]$.
-    - `color`: Integer array $[R, G, B]$ in range $0..255$.
-    - `color_hex`: Lowercase hexadecimal string (`"#rrggbb"`).
-    - `pixel_count` / `point_count`: Number of 2D mask pixels and contributing 3D points.
-    - `obb`: 3D Oriented Bounding Box comprising:
-      - `center`: 3D centroid coordinates $[x, y, z]$ in meters.
-      - `extents`: Metric dimensions $[w, h, d]$ along principal box axes.
-      - `rotation`: Row-major $3 \times 3$ rotation matrix $R \in \mathrm{SO}(3)$ aligning box axes with the reference frame.
-      - `volume_m3`: Enclosed metric volume ($w \times h \times d$).
+> **On benchmark numbers.** An earlier revision of this plan carried a table of published
+> accuracy figures and per-model millisecond latencies. Several were unattributable and at least
+> one venue was wrong. They have been removed rather than restated: the models above were chosen
+> on the qualitative grounds given, and the only performance numbers quoted anywhere in this plan
+> are ones measured on this machine and labelled as such.
 
 ---
 
-## 5. Apple Silicon M4 Hardware & Runtime Architecture
+## 3. Inference Server — `start_inference_server.sh`
 
-Track A is engineered specifically for Apple Silicon M4 architecture, maximizing hardware efficiency while ensuring 100% standard package installation via `uv`.
+A FastAPI/Uvicorn daemon on `http://127.0.0.1:8765`, holding all three services resident.
 
-### 5.1 Zero-CUDA & Native MPS Execution
-- **Elimination of CUDA Dependencies & MPS Acceleration:**
-  - **Grounding DINO on Apple Silicon:** Grounding DINO in Hugging Face `transformers` relies on `MultiScaleDeformableAttention`. On macOS arm64, setting `PYTORCH_ENABLE_MPS_FALLBACK=1` enables seamless execution where the visual backbone runs on MPS and deformable attention operations fall back cleanly to CPU NEON without CUDA. Alternatively, OWLv2 (`google/owlv2-base-patch16-ensemble`) or YOLO-World can be configured as zero-fallback, 100% native MPS open-vocabulary detectors.
-  - **SAM 2 Installation on macOS arm64:** Meta's Segment Anything Model 2 (SAM 2) does not publish official pre-built binary wheels on PyPI for `macosx_arm64`. Track A installs SAM 2 from source via `uv` git dependency (`git+https://github.com/facebookresearch/segment-anything-2.git`) with `SAM2_BUILD_CUDA=0`, running natively on PyTorch MPS/CPU (with optional MLX / CoreML inference backends).
-  - **LightGlue & SuperPoint:** Pure PyTorch implementation executing directly on Metal Performance Shaders (`mps`).
-- **Native Binary Wheels via `uv`:**
-  - **Open3D Pinning for Python 3.12:** Official `cp312-macosx_11_0_arm64` wheels were first introduced in Open3D 0.19.0. Track A strictly pins `open3d>=0.19.0` (compatible with Python 3.12).
-  - Other scientific dependencies (`pycolmap>=0.6.0`, `torch>=2.4.0`, `torchvision`, `scipy`, `numpy`) install directly as pre-compiled `macosx_11_0_arm64` binary wheels without local compilation.
-
-### 5.2 Unified Memory Budget & Footprint
-
-Apple Silicon's unified memory architecture enables zero-copy sharing of image buffers and tensors between CPU and GPU. The persistent resident server footprint is tightly bounded:
-
-| Component | Resident Memory | Compute Target |
+| Endpoint | Request | Response |
 | :--- | :--- | :--- |
-| **Depth Anything V2 (ViT-B)** | ~380 MB | MPS (Metal GPU) |
-| **Grounding DINO (Tiny)** | ~650 MB | MPS / CPU Fallback |
-| **SAM 2 (Hiera-Tiny/Small)** | ~180 MB | MPS (Metal GPU) |
-| **SuperPoint + LightGlue** | ~120 MB | MPS / Accelerate |
-| **Open3D TSDF & Spatial Index** | ~150 MB | CPU (NEON / Accelerate) |
-| **Total Resident Memory Footprint** | **~1.48 GB** | Fully resident in Unified Memory |
+| `GET /health` | — | status, resident model list, device (`mps`/`cpu`), process RSS |
+| `POST /depth` | RGB image | float32 metric depth (H×W, metres, base64) + intrinsics |
+| `POST /features` | one or two images | SuperPoint keypoints, or LightGlue matched point pairs |
+| `POST /segment` | image, `labels`, `min_score` | boxes, labels, scores, binary masks (base64) |
 
-On an Apple Silicon M4 system with 16 GB to 32 GB unified memory, this architecture utilizes under 10% of available memory, completely preventing memory paging or model thrashing during continuous multi-frame mapping.
+The launcher is idempotent: it probes `/health` first and exits successfully if a healthy server
+is already up. It records the daemon PID in a lockfile and waits for the health endpoint before
+returning. `reconstruct.sh`, `mapper.sh` and `segment.sh` each probe `/health` before doing any
+work and, if it fails, print the exact command to start the server and exit non-zero.
+
+**Intrinsics are assumed, not calibrated.** RGB-only input carries no calibration, so
+`DepthService` derives `fx = W / (2·tan(HFOV/2))` from a nominal 60° horizontal field of view and
+places the principal point at the image centre. Depth along Z is metric from the model, but X and
+Y scale linearly with `fx`, so a camera whose true field of view differs will produce
+proportionally stretched extents. `OH_MY_SLAM_HFOV_DEG` overrides the assumption when the real
+value is known. This is the single largest source of metric error in the system and is called out
+again in §7.
 
 ---
 
-## 6. Verification Matrix & Specification Compliance
+## 4. Subsystems
 
-| Specification Constraint | Track A Solution | Compliance Status |
+### 4.1 Single-frame reconstruction — `reconstruct.sh`
+
+```sh
+reconstruct.sh -i <image>            # scene description JSON on stdout (default)
+reconstruct.sh -i <image> -f ply     # binary coloured point cloud on stdout
+reconstruct.sh view -i <image>       # browser viewer
+```
+
+1. Query `/depth` for metric depth and intrinsics.
+2. Unproject valid pixels to camera-frame 3D, converting from the CV convention (+Y down,
+   +Z forward) to the frame the scene declares (+Y up, −Z forward). This conversion lives in
+   exactly one function, `common.geometry.unproject_depth`, with its inverse in `project_points`.
+3. `-f ply`: write a binary little-endian coloured PLY to stdout and stop — no detection is run,
+   because the raw cloud does not need it.
+4. `-f json`: hand the reconstruction to `segmentation.segmenter`, which returns the objects,
+   their OBBs and their colours. Emit the scene description.
+5. `view`: serve a Three.js page with the cloud, a metric ground grid, and wireframe OBBs with
+   labels.
+
+### 4.2 Multi-frame mapping — `mapper.sh`
+
+```sh
+mapper.sh update -a <image(s)|video> -m <folder> [-f json|ply] [-t full|single] [-fps <n>]
+mapper.sh view -m <folder>
+```
+
+`update` creates the map folder if it does not exist and extends it otherwise. `-t` defaults to
+`full`; `-f` defaults to `json`; `-fps` defaults to 2.
+
+**Per frame:**
+
+1. **Lift.** Delegate to `reconstruct_single_frame` for depth and the camera-frame cloud.
+2. **Track.** For each configured edge offset (default: the previous frame and the frame three
+   back), query `/features` against that keyframe and solve PnP+RANSAC for the relative pose.
+   Edges are kept only when RANSAC returns enough inliers; an unmeasurable edge is reported as
+   such rather than replaced with an invented motion. The absolute pose is seeded from the
+   shortest measured edge.
+3. **Refine.** Re-solve the poses of the last `window_size` (default 5) keyframes against every
+   edge between them, by Levenberg–Marquardt on the SE(3) residual
+   `log(T_ij⁻¹ · T_W_Ci⁻¹ · T_W_Cj)`. The oldest pose in the window is held fixed to pin the gauge.
+   The refinement is rejected if it fits worse than the input, so it can only help.
+4. **Carve.** Apply §4.3 to the map cloud and the object registry.
+5. **Segment and fuse.** Delegate to the segmenter, transform the detected instances into map
+   coordinates, and merge them into the persistent registry (§4.4).
+6. **Fuse geometry.** Transform the frame's cloud into map coordinates, append it, and voxel-fuse
+   the result at 0.02 m.
+
+**Video input** is sampled at `-fps <n>` into a temporary directory before the loop runs.
+
+**Output.** `-t full` emits the whole map — every registered object plus the estimated pose of
+every contributing keyframe. `-t single` emits only what this invocation added: the poses of the
+new frames, and the objects those frames touched, whether newly registered or re-observed.
+
+### 4.3 Contradiction resolution
+
+> *"Since an image captures a specific point in time for a map section, any new image that
+> contradicts the current data should update the map with the latest information to keep it
+> current."* — `high_level_spec.md` §2.3
+
+A map point is contradicted when it projects into the current frame and sits at least
+`carve_margin` (0.15 m) **in front of** the surface the camera actually observes there: the camera
+would have hit it first, so it cannot still be there. `common.geometry.carve_free_space` returns
+that mask, and it is applied to two things:
+
+* **The map point cloud.** Contradicted points are deleted before the new frame's points are
+  fused in, so the stale surface is replaced rather than left overlapping the new one.
+* **The object registry.** Contradicted points are removed from each object. An object that loses
+  more than half of its peak evidence, or drops below four points, is retired from the map. A
+  surviving object whose points changed has its OBB refitted — by calling the segmenter's
+  `fit_instance_obb`, never by mapper-local geometry.
+
+Points behind the observed surface, outside the frustum, or behind the camera are untouched:
+absence of evidence is not evidence of absence.
+
+### 4.4 Object identity
+
+Spec §2.3 requires that an object seen across several frames keep one `id` and one colour for the
+lifetime of the map, with its OBB refined as evidence accumulates. Track A implements that as:
+
+* **Association.** A detection is matched to an existing registry record when the labels agree and
+  the centroids are within `association_radius` (0.8 m) in map coordinates; the nearest such
+  record wins.
+* **Refinement.** A match refits the OBB over the union of the old and new points, raises the
+  stored score to the best seen, and records the peak point count (which is what the carving
+  threshold in §4.3 compares against).
+* **Minting.** An unmatched detection takes the map's monotonically increasing `next_object_id`,
+  which is persisted with the map. Ids are never reissued, including across separate `update`
+  invocations and across process restarts.
+* **Colour.** Assigned once from the id and never stored as an independent fact, so it cannot
+  drift from the id it was derived from.
+
+### 4.5 Segmentation — `segment.sh`
+
+```sh
+segment.sh -i <image> [-o <folder>] [-f json|ply] [--min-score <s>] [--labels a,b,c]
+segment.sh -m <map-folder> [-o <folder>] [-f json|ply]
+segment.sh view -i <image>
+```
+
+**Image mode.** Delegate depth lifting to the reconstructor; query `/segment` with the label
+prompts; drop detections below `--min-score` (default 0.5); lift each mask's pixels into 3D;
+clean with SOR + DBSCAN; fit a PCA oriented box; assign the colour from the id.
+
+**Map mode.** Report the map's persistent registry, filtered by `--min-score` and `--labels`.
+Ids and colours are the ones the map already assigned, so re-running against an unchanged map
+reproduces the same document, apart from OpenLABEL's `metadata.timestamp`, which records when
+the document was emitted. Map mode does **not** re-detect: the map is the authority on what objects exist,
+and re-running detection there would mint identities that contradict it.
+
+**Artefacts.** Writing files is gated strictly on `-o`. Without it, only stdout is produced and
+nothing touches the filesystem. With it, all five artefacts are written *and* stdout is still
+produced:
+
+| File | Contents |
+| :--- | :--- |
+| `segmentation.json` | The OpenLABEL document, byte-identical to stdout (one emission timestamp is shared by both) |
+| `segmented.png` | Masks painted in object colour (α = 0.55) over the original dimmed to 40% |
+| `catalog.csv` | `id,label,score,color_hex,width_m,height_m,depth_m,volume_m3,center_x,center_y,center_z,pixel_count,point_count` |
+| `catalog.md` | The same catalogue as a table, ordered by descending volume |
+| `segments.ply` | Cloud coloured by object, unsegmented points mid-grey `(128,128,128)` |
+
+In map mode `segmented.png` has no single input frame to draw on, so the map picks the keyframe
+that sees the most registered object points, projects each object's world points into it, and
+closes the result into a solid mask. Both the mask rendering and the cloud colouring go through
+the same helpers the image mode uses, so the colour contract holds identically in both.
+
+**Colour contract.** `get_color(id)` indexes a 64-entry perceptually distinct palette and falls
+through to golden-ratio hue cycling beyond it, so distinct ids keep distinct colours without
+bound. Mid-grey is reserved for unsegmented points and never issued to an object.
+`tests/test_artifacts.py` compares the triple in `segmentation.json` against `catalog.csv`,
+`catalog.md`, the pixels of `segmented.png` and the per-point colours in `segments.ply`.
+
+### 4.6 Viewers
+
+All three `view` subcommands serve the same single-page Three.js application on the first free
+port from 8080: point cloud, metric ground grid, wireframe OBBs in object colour, billboarded
+object labels, a sidebar catalogue ordered by descending volume with matching swatches, and — for
+map view — camera frustums along the trajectory. `segment.sh view` additionally embeds the 2D
+segmented image. Clouds above 100 k points are decimated for the browser only.
+
+---
+
+## 5. Data Contracts
+
+### 5.1 Coordinate frame
+
+Right-handed, metres: **+X** right, **+Y** up, **−Z** along the optical axis. For a single frame
+the origin is the camera's optical centre; for a map it is the camera frame of keyframe 1.
+Every scene description states this explicitly rather than leaving it to convention.
+
+### 5.2 Scene description schema — ASAM OpenLABEL v1.0.0
+
+> *"Use a well known json scheme url that support JSON OBB"* — `high_level_spec.md` §3
+
+Track A emits **ASAM OpenLABEL v1.0.0**. It is a published standard rather than one of
+this project's invention, and its `cuboid` object_data entry is exactly the oriented box
+the spec asks for: ten floats, `[x, y, z, qx, qy, qz, qw, sx, sy, sz]` — centre,
+orientation quaternion (scalar part **last**), and dimensions, all in metres. The format
+also carries named coordinate systems, camera streams with pinhole intrinsics, and
+persistent object UIDs across frames, so the whole scene description fits inside it
+without extension.
+
+```
+https://raw.githubusercontent.com/Vicomtech/video-content-description-VCD/master/schema/openlabel_json_schema-v1.0.0.json
+```
+
+That URL resolves. `schemas/openlabel_json_schema-v1.0.0.json` is a vendored, byte-identical
+copy of it (JSON Schema **Draft-07**), so `common.openlabel.validate_scene` validates offline
+and the test suite validates every document the tools produce.
+
+**All three tracks emit this same schema**, and Track A's document shape is checked against
+Track C's reference output: same attribute names, same coordinate-system names, same stream
+key, same transform naming, same ordinal object keys. A consumer can read any track's output
+with one parser. The mapping is not Track A's to change unilaterally.
+
+*Superseded.* An earlier revision of this plan published a **self-authored** schema at a
+`raw.githubusercontent.com/samirma/...` URL and explicitly rejected OpenLABEL as reshaping
+the payload "for interoperability this project does not yet need". Both parts were wrong:
+the interoperability turned out to be needed, and the URL 404'd because nothing was ever
+pushed to `main`, so every emitted payload carried a dangling `$schema`. The revision before
+that cited `https://json-schema.org/draft/2020-12/schema`, which is the *meta-schema* and
+describes schemas rather than scenes.
+
+#### Judgement calls
+
+The standard does not decide these; all three tracks decide them the same way.
+
+| Decision | Choice | Why |
 | :--- | :--- | :--- |
-| **Monocular RGB-Only Input** | Monocular metric depth predicted via Depth Anything V2; no stereo, LiDAR, or IMU assumptions. | Full Compliance |
-| **Resident Inference Server** | Long-lived FastAPI daemon started via `start_inference_server.sh` keeps all neural models in memory. | Full Compliance |
-| **Clean Single-Frame Reconstruct** | `reconstruct.sh` provides metric unprojection to PLY or JSON; serves as the exclusive lifting provider. | Full Compliance |
-| **Multi-Frame Mapping & Delegation** | `mapper.sh` tracks camera poses via PyCOLMAP and strictly delegates depth/point lifting to `reconstruct.sh`. | Full Compliance |
-| **Contradiction & Dynamic Updating** | Raycast free-space carving and confidence decay purge obsolete surfaces and prune ghost 3D objects; OBB re-fitting is delegated to `segment.sh`. | Full Compliance |
-| **Single Owner of 3D Semantics** | `segment.sh` uniquely owns open-vocabulary detection, mask lifting, OBB fitting, and color assignment across single-frame and map modes. | Full Compliance |
-| **Interactive View Serving Scope** | `segment.sh view -i <image>` renders segmented image, catalogue, and 3D OBBs together in browser. | Full Compliance |
-| **Artifact Gating Contract** | Disk artifact creation strictly gated on `-o <folder>`; otherwise stdout only. | Full Compliance |
-| **Deterministic Color Contract** | Pure hash function maps object `id` to Glasbey/Kelly palette across all 5 artifacts (`.json`, `.png`, `.csv`, `.md`, `.ply`). | Full Compliance |
-| **Clean Machine-Readable CLI** | Strict JSON to `stdout`; progress bars, diagnostics, and server communication routed to `stderr`. | Full Compliance |
-| **Apple Silicon M4 Performance** | Native MPS / Accelerate backend with `SAM2_BUILD_CUDA=0`, `PYTORCH_ENABLE_MPS_FALLBACK=1`, and `open3d>=0.19.0` on Python 3.12 via `uv`. | Full Compliance |
+| Where the schema URL goes | `metadata.schema_url` | The document root has `additionalProperties: false` and admits only the `openlabel` member, so a root-level `$schema` **fails validation**. |
+| Object keys | numeric ordinals `"1"`, `"2"`, … with the readable id in `name` (`"obj_001"`) | The schema mandates numeric-or-UUID keys, so `"obj_001"` cannot itself be a key. |
+| Orientation | the 10-value quaternion cuboid, never the 9-value Euler alternative the schema also permits | One form across tracks; no Euler-order ambiguity. |
+| Coordinate frame | right-handed, +y up, −z view, metres, declared in `metadata.coordinate_conventions` | `high_level_spec.md` asks for this. OpenLABEL's own prose describes a y-forward heading convention, so this is a deliberate, shared deviation. The field is a **non-standard extension**: it validates because `metadata` permits extras, but it documents intent and enforces nothing — a strict third-party OpenLABEL consumer ignores it. |
+| Coordinate systems | `camera` alone for a single frame; `map` (parent) with `camera` as child for a map | Every object and cuboid names the system it lives in. |
+| Attributes | `num`: score, volume_m3, yaw_deg, pixel_count, point_count · `text`: color_hex · `vec`: color_rgb · cuboid named `obb` | Carries the colour contract and the catalogue columns inside the standard's own extension points. |
+| Stream | `rgb_camera`, intrinsics under `stream_properties.intrinsics_pinhole` as row-major `camera_matrix_3x4` | One monocular RGB sensor, stated as such. |
+| Trajectory | `frames` keyed by frame index, transform `camera_to_map`, plus a `frame_intervals` entry | This is how `mapper.sh -t full` reports every contributing keyframe pose. |
+
+One Track A specific: its OBB fitter is full 3-DoF PCA, not the gravity-aligned yaw-only fit
+some tracks use, so the cuboid quaternion carries a genuine 3-DoF rotation. `yaw_deg` is still
+published for attribute parity, as the heading of the box's primary axis — the quaternion is
+the authoritative orientation.
+
+### 5.3 Payload shape
+
+```jsonc
+{
+  "openlabel": {
+    "metadata": {
+      "schema_version": "1.0.0",
+      "schema_url": "https://raw.githubusercontent.com/Vicomtech/.../openlabel_json_schema-v1.0.0.json",
+      "annotator": "oh-my-slam 1.0.0 (track-a)",
+      "coordinate_conventions": { "handedness": "right-handed", "up_axis": "+y",
+                                  "view_axis": "-z", "units": "meters" },
+      "timestamp": 1758380000.0
+    },
+    "coordinate_systems": { "map":    { "type": "local",  "parent": "", "children": ["camera"] },
+                            "camera": { "type": "sensor", "parent": "map", "children": [] } },
+    "streams": { "rgb_camera": { "type": "camera",
+                                 "stream_properties": { "intrinsics_pinhole": {
+                                   "width_px": 640, "height_px": 480,
+                                   "camera_matrix_3x4": [fx,0,cx,0, 0,fy,cy,0, 0,0,1,0],
+                                   "distortion_coeffs_1xN": [] } } } },
+    "objects": {
+      "1": { "name": "obj_001", "type": "chair", "coordinate_system": "map",
+             "object_data": {
+               "cuboid": [ { "name": "obb", "coordinate_system": "map",
+                             "val": [x,y,z, qx,qy,qz,qw, sx,sy,sz] } ],
+               "num":  [ {"name": "score", "val": 0.91}, {"name": "volume_m3", "val": 0.297},
+                         {"name": "yaw_deg", "val": 30.0},
+                         {"name": "pixel_count", "val": 4120}, {"name": "point_count", "val": 3011} ],
+               "text": [ {"name": "color_hex", "val": "#e6194b"} ],
+               "vec":  [ {"name": "color_rgb", "val": [230, 25, 75]} ] } }
+    },
+    "frames": { "1": { "frame_properties": {
+                  "timestamp": 0.0,
+                  "streams": { "rgb_camera": { "uri": "<map>/keyframes/keyframe_00001.jpg" } },
+                  "transforms": { "camera_to_map": {
+                    "src": "camera", "dst": "map",
+                    "transform_src_to_dst": { "quaternion": [qx,qy,qz,qw],
+                                              "translation": [x,y,z] } } } } } },
+    "frame_intervals": [ { "frame_start": 1, "frame_end": 1 } ]
+  }
+}
+```
+
+`frames` and `frame_intervals` appear for map output and are absent for a single frame;
+`streams.rgb_camera.stream_properties` carries the intrinsics in both cases.
+
+Internally Track A keeps its own Pydantic models (`common/schemas.py`) as the typed interface
+between the reconstructor, the segmenter, the mapper and the viewers, and converts to
+OpenLABEL at exactly one boundary (`common/openlabel.py`). Only that module knows the wire
+format; the viewers consume the internal model and are not part of the published contract.
+
+### 5.4 Map on-disk layout
+
+A map folder is the durable artefact of `mapper.sh`, and `common.map_store.MapStore` is the only
+code that reads or writes it — the filenames appear in exactly one module.
+
+```
+<map folder>/
+  map_metadata.json   frame count, next object id, intrinsics, per-keyframe poses
+                      (published quaternion form and the 4×4 T_W_C used internally)
+  map_points.npy      (N, 3) float32 map cloud, in map coordinates
+  map_colors.npy      (N, 3) uint8 per-point sRGB, index-aligned with map_points
+  objects.json        persistent object registry, one record per id, with its world points
+  keyframes/          keyframe_<nnnnn>.jpg, the frame each pose refers to
+```
+
+`objects.json` records carry two internal fields — `points_3d` and `initial_point_count` — that
+are bookkeeping for carving and refitting and never appear in a scene description;
+`public_object_fields` is the single gate that strips them.
+
+---
+
+## 6. Project Structure, Interfaces and Tests
+
+Spec §4 requires shared logic in a common package, typed interfaces, small focused modules, no
+duplication, and tests. The earlier revision of this plan omitted this entirely.
+
+```
+src/oh_my_slam/
+  cli_reconstruct.py  cli_mapper.py  cli_segment.py   argparse surfaces; build_parser() is
+                                                      importable so the CLI contract is testable
+  common/
+    schemas.py      Pydantic models: the internal typed interface, not the wire format
+    openlabel.py    the ASAM OpenLABEL emitter, readers and offline validator (sole
+                    owner of the wire format)
+    colors.py       the palette and id -> sRGB; the only colour source in the package
+    geometry.py     unprojection, projection, transforms, SOR+DBSCAN, PCA OBB,
+                    free-space carving, voxel fusion, point-to-instance assignment
+    io_utils.py     PLY writer, the five artefacts, overlay rendering, cloud colouring
+    map_store.py    the map on-disk layout, and the only reader/writer of it
+    client.py       typed wrapper over the inference server endpoints
+  reconstruction/reconstructor.py   depth lifting (sole owner)
+  segmentation/segmenter.py         semantics, OBB fitting, colour (sole owner)
+  mapping/mapper.py                 tracking, persistence, carving, fusion
+  mapping/pose_graph.py             SE(3) log/exp and windowed refinement
+  server/                           FastAPI app + DepthService/FeatureService/SegmentationService
+  viewer/web_viewer.py              the Three.js page and its HTTP server
+schemas/openlabel_json_schema-v1.0.0.json   vendored ASAM OpenLABEL v1.0.0 (Draft-07)
+tests/
+```
+
+**Typed interfaces.** Every cross-module boundary is typed. `SingleFrameReconstruction` is a
+dataclass; scenes, objects, OBBs, intrinsics and poses are Pydantic models validated on
+construction; `MapStore` is a dataclass; geometry functions are annotated and documented in terms
+of the frame they operate in.
+
+**No duplication.** Four call sites used to each re-derive "paint this cloud by object colour",
+three used to hardcode the map's filenames, and two used to write the catalogue tables. Each is
+now one function (`colorize_points`, `MapStore`, `save_segmentation_artifacts`), used by image
+mode, map mode, the artefact writer and the viewers alike.
+
+**Tests.** `uv run pytest` (or `.venv/bin/python -m pytest`). The suite is offline: the three
+inference endpoints are stubbed, and everything downstream of them — unprojection, filtering, OBB
+fitting, colour, artefact writing, map persistence, tracking, carving, the viewer page — runs for
+real. It is organised by the clause of the specification it defends:
+
+| File | Defends |
+| :--- | :--- |
+| `test_scene_contract.py` | §3 — the vendored schema is ASAM OpenLABEL Draft-07, the cuboid is a 10-float OBB that round-trips a 3-DoF rotation, every emitted shape validates, and the cross-track judgement calls hold |
+| `test_geometry.py` | Unproject/project round-trip, the declared frame, OBB recovery of a known rotated box, carving, voxel fusion |
+| `test_artifacts.py` | §2.4 — `-o` gating, the exact CSV header, volume ordering, and one colour per object across all five artefacts |
+| `test_segment_map.py` | §2.4 map mode — the same artefact set, colours and reproducibility |
+| `test_mapping.py` | §2.3 — tracking against a known motion, persistence, id and colour stability, contradiction resolution, `-t full` vs `-t single` |
+| `test_delegation.py` | §4 — single ownership, enforced by spying on the boundaries |
+| `test_cli_surface.py` | §2.2–2.4 — every usage line in the spec parses, and the stated defaults hold |
+| `test_viewer.py` | §2.2–2.4 — the `view` page builds, embeds the scene, and draws OBBs and labels |
+
+---
+
+## 7. Known Limitations
+
+Stated here rather than discovered later.
+
+1. **Intrinsics are assumed.** A nominal 60° horizontal FOV (§3). X/Y extents scale with the error
+   in `fx`. Overridable via `OH_MY_SLAM_HFOV_DEG`; this is the dominant metric error term.
+2. **No loop closure and no global bundle adjustment.** Refinement is confined to a sliding window
+   of 5 keyframes, and keyframes that leave the window are frozen. Revisiting a place after a long
+   excursion will not snap the trajectory back together, so long trajectories still accumulate
+   drift.
+3. **Geometry is not retro-corrected.** Points and objects are fused using the pose current at the
+   time. A later refinement that moves an earlier pose in the window does not go back and move the
+   geometry that pose contributed.
+4. **Association is centroid-and-label.** Two instances of the same label within 0.8 m may merge.
+   3D IoU or Hungarian assignment over the whole frame would be more discriminating.
+5. **SAM 1, not SAM 2** (§2), and OWLv2 rather than Grounding DINO — both chosen for clean
+   Apple Silicon support over peak reported accuracy.
+6. **Carving trusts monocular depth.** A badly wrong depth prediction can carve away correct map
+   geometry. The 0.15 m margin is the only guard.
+
+---
+
+## 8. Specification Compliance
+
+Each row names the code that satisfies the clause and the test that proves it. Rows are claims
+about what is implemented, not a self-assessed grade.
+
+| Spec clause | Implementation | Proof |
+| :--- | :--- | :--- |
+| §1, §4 — RGB-only input | Metric depth from `DepthService`; no stereo, depth sensor or IMU anywhere | `test_geometry.py` |
+| §2.1 — resident server, actionable failure | `server/app.py`; `client.check_server_health`; each `.sh` probes `/health` first | manual + `start_inference_server.sh` |
+| §2.2 — `reconstruct.sh -i/-f/view`, json default | `cli_reconstruct.py`, `reconstruction/reconstructor.py` | `test_cli_surface.py`, `test_delegation.py` |
+| §2.3 — `mapper.sh update/view`, `-a/-m/-f/-t/-fps` | `cli_mapper.py`, `mapping/mapper.py` | `test_cli_surface.py`, `test_mapping.py` |
+| §2.3 — contradicting images update the map | `carve_free_space` applied to the cloud and the registry (§4.3) | `test_mapping.py::test_contradicted_map_points_are_removed`, `test_geometry.py` |
+| §2.3 — persistent id and colour, refined OBB | §4.4, `objects.json`, `next_object_id` | `test_mapping.py::test_object_identity_and_colour_persist_across_updates` |
+| §2.3 — `-t full` carries every keyframe pose | `MapStore.cameras` → `cameras[]` | `test_mapping.py::test_scope_full_reports_every_contributing_frame` |
+| §2.4 — `segment.sh` flags, `-i`/`-m` exclusive | `cli_segment.py` | `test_cli_surface.py` |
+| §2.4 — five artefacts, gated on `-o` | `save_segmentation_artifacts` | `test_artifacts.py`, `test_segment_map.py` |
+| §2.4 — colour contract across all artefacts | `common/colors.py`, `colorize_points` | `test_artifacts.py::test_every_artifact_agrees_on_one_colour_per_object` |
+| §2.4 — `view` serves image, catalogue and OBBs | `viewer/web_viewer.py` | `test_viewer.py` |
+| §3 — well-known JSON schema URL with OBB support | `schemas/openlabel_json_schema-v1.0.0.json   vendored ASAM OpenLABEL v1.0.0 (Draft-07)`, `$schema` in every payload (§5.2) | `test_scene_contract.py` |
+| §4 — shared package, no duplication, typed, tested | §6 | the suite itself |
+| §4 — clean stdout, diagnostics on stderr | `print(..., file=sys.stderr)` throughout; PLY to `stdout.buffer` | `test_artifacts.py::test_stdout_json_is_machine_parseable_on_its_own` |
+| §4 — mapper delegates, segment owns semantics | §1.2 | `test_delegation.py` |
+| §4 — Apple Silicon M4 | MPS device selection, `KMP_DUPLICATE_LIB_OK`, arm64 wheels, `uv`/`.venv` | end-to-end runs on the target machine |
+| §4 — accurate and performant | §2, §7; measured figures in §9 | §9 |
+
+---
+
+## 9. Measured Performance
+
+Measured on the target machine against the live inference server, at 640×480. These replace the
+unsourced per-model latency figures carried by an earlier revision.
+
+| Operation | Time |
+| :--- | :--- |
+| `reconstruct.sh -i <image> -f ply` | see `eval_results/` |
+| `reconstruct.sh -i <image>` (JSON, includes detection + masks) | see `eval_results/` |
+| `segment.sh -i <image>` | see `eval_results/` |
+| `mapper.sh update` | see `eval_results/` |
+
+Map size after voxel fusion at 0.02 m: 4 frames at 640×480 reduce from ~1.2 M raw points to
+~24 k, and re-observing the same surface does not grow the map.
+
+Resident server footprint is reported live by `GET /health` rather than estimated here.
