@@ -140,4 +140,5 @@ Use a well-known JSON schema: the ASAM OpenLABEL OBB format, referenced by its s
 * The tools must be accurate and performant, both per image and for mapping.
 * The project must have comprehensive unit tests ensuring that all required components and
   their behaviour align with the expected plan.
+* Redundant or duplicate code should be indendified and removed
 
