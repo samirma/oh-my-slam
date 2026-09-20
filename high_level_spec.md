@@ -67,8 +67,11 @@ map with the new input.
 
 Since an image captures a specific point in time for a map section, any new image that contradicts the current data should update the map with the latest information to keep it current.
 
-`view` starts a web server for navigating the point cloud of the whole map, with object
-OBBs and labels overlaid.
+`view` starts a web server for navigating the map. The web interface should offer options
+to show:
+
+- the point cloud of the whole map, with and without the dense map (GLB);
+- object OBBs and labels overlaid.
 
 Object identity is persistent: an object observed across several frames keeps one `id` and
 one colour for the lifetime of the map, and its OBB is refined as evidence accumulates.
@@ -118,7 +121,7 @@ yields the same colours, and the palette cycles by hue once it is exhausted.
 
 ## 3. Scene description (JSON) returned by the tools
 
-Use a well known json scheme url that support JSON OBB
+Use a well-known JSON schema: the ASAM OpenLABEL OBB format, referenced by its schema URL.
 
 ## 4. Constraints
 
@@ -133,5 +136,8 @@ Use a well known json scheme url that support JSON OBB
   focused modules, tests).
 * JSON on stdout must be machine-parseable on its own — no banners, no progress output.
   Everything human-facing goes to stderr.
-* It should work on Mac M4
-* They should be accurate and performant, per image and mapping
+* It must work on a Mac with an M4 chip.
+* The tools must be accurate and performant, both per image and for mapping.
+* The project must have comprehensive unit tests ensuring that all required components and
+  their behaviour align with the expected plan.
+
