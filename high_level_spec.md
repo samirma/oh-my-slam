@@ -7,14 +7,15 @@ video, incrementally assembles them into a persistent map that can be inspected 
 browser, and describes that map as a set of **labelled objects with oriented bounding
 boxes (OBBs)**.
 
-The system is exposed through four shell entry points:
+The system is exposed through five shell entry points:
 
 | Entry point | Responsibility |
 | --- | --- |
 | `start_inference_server.sh` | Start the depth- and segmentation-inference server and any other long-lived services required for mapping. |
 | `reconstruct.sh` | Single-frame reconstruction: image → scene description (JSON + OBBs) or point cloud. |
-| `mapper.sh` | Multi-frame mapping: build, update and visualise a persistent map. |
+| `mapper.sh` | Multi-frame mapping: build and update a persistent map. |
 | `segment.sh` | Instance segmentation: image or map → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
+| `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
 
 ## 2. Components
 
@@ -26,16 +27,16 @@ start_inference_server.sh
 
 Loads the monocular depth-estimation model, the instance-segmentation model, and any other
 service or model needed for mapping, and keeps them resident, so that individual
-reconstructions do not pay model start-up cost. `reconstruct.sh`, `mapper.sh` and
-`segment.sh` talk to this server; if it is not running they must fail with a clear,
-actionable error.
+reconstructions do not pay model start-up cost. `reconstruct.sh`, `mapper.sh`, `segment.sh`
+and image-mode `view.sh` use this server. Any operation that requires inference must fail
+with a clear, actionable error if the server is not running. Viewing an already persisted
+map must not require the inference server.
 
 ### 2.2 Single-frame reconstruction — `reconstruct.sh`
 
 ```sh
 reconstruct.sh -i <image>                # JSON scene description (default) to stdout
 reconstruct.sh -i <image> -f ply         # point cloud to stdout
-reconstruct.sh view -i <image>           # serve the reconstruction in a browser
 ```
 
 * `-i <image>` — input RGB image.
@@ -43,14 +44,11 @@ reconstruct.sh view -i <image>           # serve the reconstruction in a browser
   it can be piped or redirected; diagnostics go to stderr.
   * `json` — the scene description of §3: detected objects, their labels and their OBBs.
   * `ply` — the raw point cloud, with per-point colour.
-* `view` — start a web server that renders the reconstructed point cloud interactively,
-  with the OBBs drawn over it.
 
 ### 2.3 Mapping — `mapper.sh`
 
 ```sh
 mapper.sh update -a <image(s)|video> -m <folder> [-f json|ply] -t full|single [-fps <n>]
-mapper.sh view -m <folder>
 ```
 
 `update` creates the map if `<folder>` does not yet exist, otherwise extends the existing
@@ -65,13 +63,9 @@ map with the new input.
 * `-t single` — return the scene for the **newly added** input only.
 * `-fps <n>` — for video input, the number of frames per second to sample for analysis.
 
-Since an image captures a specific point in time for a map section, any new image that contradicts the current data should update the map with the latest information to keep it current.
-
-`view` starts a web server for navigating the map. The web interface should offer options
-to show:
-
-- the point cloud of the whole map, with and without the dense map (GLB);
-- object OBBs and labels overlaid.
+Since an image captures a specific point in time for a map section, any new image that
+contradicts the current data should update the map with the latest information to keep it
+current.
 
 Object identity is persistent: an object observed across several frames keeps one `id` and
 one colour for the lifetime of the map, and its OBB is refined as evidence accumulates.
@@ -81,7 +75,6 @@ one colour for the lifetime of the map, and its OBB is refined as evidence accum
 ```sh
 segment.sh -i <image> [-o <folder>] [-f json|ply] [--min-score <s>] [--labels a,b,c]
 segment.sh -m <map-folder> [-o <folder>] [-f json|ply]
-segment.sh view -i <image>
 ```
 
 Segments the input into object instances, lifts each instance into 3D using the depth from
@@ -94,7 +87,6 @@ the inference server, and fits an OBB to it.
 * `-f json|ply` — stdout format, **default `json`**.
 * `--min-score <s>` — drop detections below this confidence (default `0.5`).
 * `--labels a,b,c` — restrict the output to these class labels.
-* `view` — serve the segmented image, the catalogue and the 3D OBBs in a browser.
 
 #### Output artefacts
 
@@ -114,10 +106,31 @@ Every artefact of a single run agrees on colour. One colour per object `id`, dra
 deterministically from a fixed, perceptually distinct palette, so that the value in
 `segmentation.json` (`color` / `color_hex`), the pixels of that instance's mask in
 `segmented.png`, the swatch column of `catalog.csv` / `catalog.md`, the per-point colour in
-`segments.ply`, and the OBB colour in the `view` server are **the same sRGB triple**.
+`segments.ply`, and the OBB colour rendered by `view.sh` are **the same sRGB triple**.
 
 The mapping is a pure function of the object `id`, so re-running against the same map
 yields the same colours, and the palette cycles by hue once it is exhausted.
+
+### 2.5 Visualisation — `view.sh`
+
+```sh
+view.sh -i <image>
+view.sh -m <map-folder>
+```
+
+Starts a local web server for interactive browser visualisation. Exactly one input is
+required: `-i` and `-m` are mutually exclusive.
+
+* `-i <image>` — reconstruct and segment one RGB image, then show its colour point cloud,
+  segmented image, object catalogue, and labelled OBBs.
+* `-m <map-folder>` — load an existing map without modifying it, then show its complete
+  point cloud, photorealistic 3D mesh, camera poses, and labelled OBBs.
+
+The interface must provide independent controls for the available point-cloud, mesh,
+camera-pose, segmentation, label, and OBB layers. `view.sh` owns only the web server and
+browser UI. It consumes reconstruction, mapping, and segmentation data through their
+existing implementations and must not duplicate depth inference, point-cloud generation,
+map loading, segmentation, OBB fitting, object identity, or colour assignment.
 
 ## 3. Scene description (JSON) returned by the tools
 
@@ -127,18 +140,18 @@ Use a well-known JSON schema: the ASAM OpenLABEL OBB format, referenced by its s
 
 * **Input is RGB only.** No depth sensor, no stereo pair, no IMU — depth comes from
   monocular inference.
-* **Python**, with dependencies and the virtual environment managed by `uv` (`.venv`).
+* **Python**, with dependencies and the virtual environment managed by `uv` (`.venv`), is
+  preferable but not mandatory.
 * `mapper.sh` delegates to `reconstruct.sh` whenever depth/reconstruction is needed, and
   `segment.sh` is the single owner of segmentation, OBB fitting and colour assignment;
-  neither `reconstruct.sh` nor `mapper.sh` re-implements that logic.
+  neither `reconstruct.sh`, `mapper.sh` nor `view.sh` re-implements that logic.
 * Shared logic lives in a common Python package used by all tools. Avoid duplicated and
   redundant code; follow standard Python project conventions (typed interfaces, small
   focused modules, tests).
 * JSON on stdout must be machine-parseable on its own — no banners, no progress output.
   Everything human-facing goes to stderr.
-* It must work on a Mac with an M4 chip.
+* It must work on a Mac with an M4 chip; MPS support is preferable but not mandatory.
 * The tools must be accurate and performant, both per image and for mapping.
 * The project must have comprehensive unit tests ensuring that all required components and
   their behaviour align with the expected plan.
-* Redundant or duplicate code should be indendified and removed
-
+* The licence shouldn't be a blocker.
