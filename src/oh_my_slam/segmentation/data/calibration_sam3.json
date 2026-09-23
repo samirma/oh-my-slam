@@ -1,0 +1,7 @@
+{
+  "source": "sam3",
+  "status": "identity",
+  "note": "Identity map until tools/calibrate_scores.py is run on the LVIS subset (blocked on user consent U2).",
+  "knots_raw": [0.0, 1.0],
+  "knots_calibrated": [0.0, 1.0]
+}

@@ -1,0 +1,199 @@
+[project]
+name = "oh-my-slam"
+version = "0.1.0"
+description = "Monocular RGB mapping: single-image reconstruction, persistent maps and OpenLABEL objects with oriented bounding boxes."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # core numerics and IO
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "pillow>=11",
+    "pillow-heif>=1.0",
+    "av>=15",
+    "opencv-python-headless>=4.12,<5",
+    "jsonschema>=4.23",
+    "trimesh>=4.5",
+    "psutil>=6",
+    # geometry back-ends
+    "open3d==0.20.*",
+    "pycolmap==4.2.*",
+    # inference server
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.10",
+    # models (loaded only inside the inference server). torch 2.13 corrupts attention on macOS 26.
+    "torch==2.14.*",
+    "torchvision==0.29.*",
+    "transformers>=5.17",
+    "ultralytics==8.4.159",
+    "clip @ git+https://github.com/ultralytics/CLIP.git@a13192f8cb767260d7dfd98c843b0716593169e7",
+    # Gate G1: MoGe pinned to the last pre-V3 commit (MoGe-2); V3 main does not install on macOS.
+    "moge @ git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030",
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183",
+    "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6",
+    "geocalib @ git+https://github.com/cvg/GeoCalib.git@97b8968e7798a66bf04fcf791fb535624241bda7",
+    "mapanything @ git+https://github.com/facebookresearch/map-anything.git@3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "pytest-timeout>=2.3",
+    "pytest-cov>=6",
+    "ruff>=0.16",
+    "mypy>=1.15",
+    "import-linter>=2.1",
+    "playwright>=1.50",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oh_my_slam"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+override-dependencies = [
+    # One OpenCV distribution only: MapAnything pins headless 4.10, MoGe/GeoCalib/Ultralytics want
+    # the GUI build. Both provide `cv2`; keep the headless build and drop the GUI one.
+    "opencv-python-headless>=4.12,<5",
+    "opencv-python; sys_platform == 'never'",
+    # MoGe lists gradio for its demo app only; never imported by inference.
+    "gradio; sys_platform == 'never'",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["src/oh_my_slam/viewer/static"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["RUF059", "N802", "PTH", "RUF005", "B008", "SIM117", "RUF021", "F841"]
+"src/oh_my_slam/tools/**" = ["RUF059"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PTH", "N"]
+ignore = ["RUF001", "RUF002", "RUF003", "N802", "N803", "N806", "N815", "SIM105", "SIM108", "E501", "PTH101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = false
+warn_return_any = false
+ignore_missing_imports = true
+disallow_untyped_calls = false
+disallow_any_generics = false
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["oh_my_slam.server.models.*", "oh_my_slam.tools.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# NumPy dtype generics and untyped third-party APIs (open3d, trimesh, pycolmap) produce noise here.
+module = ["oh_my_slam.mapping.*", "oh_my_slam.viewer.*", "oh_my_slam.reconstruction.*",
+          "oh_my_slam.server.app"]
+disable_error_code = ["misc", "union-attr", "arg-type", "attr-defined", "str-bytes-safe",
+                      "call-overload"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+timeout = 600
+markers = [
+    "models: needs the real inference server and model weights",
+    "browser: needs Chrome through Playwright",
+    "eval: needs evaluation datasets in ~/oh-my-slam-data",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["oh_my_slam"]
+# measure the CLI and server processes the tests start (os._exit paths save data explicitly)
+patch = ["subprocess"]
+parallel = true
+sigterm = true
+omit = [
+    "src/oh_my_slam/server/models/*",
+    "src/oh_my_slam/tools/*",
+]
+
+[tool.importlinter]
+root_package = "oh_my_slam"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layered ownership: cli > viewer > mapping > segmentation > reconstruction > client > schema > core"
+type = "layers"
+layers = [
+    "oh_my_slam.cli",
+    "oh_my_slam.tools",
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.client",
+    "oh_my_slam.schema",
+    "oh_my_slam.core",
+]
+
+[[tool.importlinter.contracts]]
+name = "Only the CLI starts the server; nothing else imports it"
+type = "forbidden"
+source_modules = [
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.client",
+    "oh_my_slam.schema",
+    "oh_my_slam.core",
+]
+forbidden_modules = ["oh_my_slam.server"]
+
+[[tool.importlinter.contracts]]
+name = "The server owns models only (no pipeline logic)"
+type = "forbidden"
+source_modules = ["oh_my_slam.server"]
+forbidden_modules = [
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Model frameworks stay inside the server process"
+type = "forbidden"
+source_modules = [
+    "oh_my_slam.cli",
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.client",
+    "oh_my_slam.schema",
+    "oh_my_slam.core",
+]
+forbidden_modules = ["torch", "ultralytics", "moge", "geocalib", "mapanything", "transformers"]
+
+[[tool.importlinter.contracts]]
+name = "Mapping and viewer never call the inference client directly (delegation via reconstruction/segmentation)"
+type = "forbidden"
+source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
+forbidden_modules = ["oh_my_slam.client.client"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Reconstruction never touches segmentation"
+type = "forbidden"
+source_modules = ["oh_my_slam.reconstruction"]
+forbidden_modules = ["oh_my_slam.segmentation", "oh_my_slam.mapping"]

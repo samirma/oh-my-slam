@@ -1,0 +1,6 @@
+three.js 0.186.0 (r186), MIT — https://registry.npmjs.org/three/-/three-0.186.0.tgz
+  integrity sha512-cr/fIM2ddMSVbYVgkfD4jLJv7Fh/8ZTjvo+7gQeSVGUZHxpx9FDwoL5iC7hUz/LiRA8wMbqfnb90xKfm1/HHkQ==
+  files: build/three.module.js, build/three.core.js, examples/jsm/{controls/OrbitControls,
+  renderers/CSS2DRenderer, loaders/GLTFLoader, utils/BufferGeometryUtils, utils/SkeletonUtils,
+  lines/LineSegments2, lines/LineMaterial, lines/LineSegmentsGeometry}.js (as addons/…)
+lil-gui 0.21.0, MIT — https://registry.npmjs.org/lil-gui/-/lil-gui-0.21.0.tgz (dist/lil-gui.esm.min.js, lil-gui.min.css)

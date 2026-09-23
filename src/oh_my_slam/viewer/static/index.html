@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>oh-my-slam viewer</title>
+  <link rel="stylesheet" href="/static/vendor/lil-gui/lil-gui.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/vendor/three/build/three.module.js",
+        "three/addons/": "/static/vendor/three/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="viewport">
+      <div id="canvas-host"></div>
+      <div id="topbar">
+        <span id="title">oh-my-slam</span>
+        <span id="stats" data-testid="stats">loading…</span>
+        <span class="spacer"></span>
+        <button id="reset-view" title="Reset view (R)">Reset view</button>
+        <button id="toggle-panel" title="Show/hide the side panel">☰</button>
+      </div>
+      <div id="tooltip" role="tooltip" hidden></div>
+      <div id="help">Drag to orbit · right-drag / two-finger to pan · wheel to zoom · click a box to select · R resets the view</div>
+    </div>
+    <aside id="panel" aria-label="Controls">
+      <nav id="tabs" role="tablist">
+        <button role="tab" data-tab="layers" class="active">Layers</button>
+        <button role="tab" data-tab="display">Display</button>
+        <button role="tab" data-tab="catalogue">Catalogue</button>
+        <button role="tab" data-tab="image" id="tab-image-btn" hidden>Image</button>
+      </nav>
+      <section id="tab-layers" class="tab active" role="tabpanel"></section>
+      <section id="tab-display" class="tab" role="tabpanel"></section>
+      <section id="tab-catalogue" class="tab" role="tabpanel">
+        <input id="filter" type="search" placeholder="Filter by label…" aria-label="Filter catalogue">
+        <div class="table-wrap">
+          <table id="catalogue" data-testid="catalogue">
+            <thead><tr><th></th><th>id</th><th>label</th><th>score</th><th>W×D×H m</th><th>m³</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <section id="tab-image" class="tab" role="tabpanel">
+        <img id="segmented" alt="Segmented image">
+        <p class="hint">Instance masks in each object's colour over the dimmed photo.</p>
+      </section>
+    </aside>
+  </div>
+  <div id="loading" role="status" aria-live="polite">
+    <div class="box">
+      <div class="spinner"></div>
+      <div id="loading-title">Loading scene…</div>
+      <ul id="loading-list"></ul>
+    </div>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

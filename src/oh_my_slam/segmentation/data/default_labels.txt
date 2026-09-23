@@ -1,0 +1,295 @@
+# Default open vocabulary (curated LVIS/COCO nouns, indoor + outdoor). One label per line; the
+# first spelling of a concept is canonical. Lines starting with '#' are comments.
+person
+chair
+armchair
+stool
+bench
+sofa
+ottoman
+bed
+crib
+dining table
+coffee table
+side table
+desk
+cabinet
+cupboard
+wardrobe
+chest of drawers
+bookcase
+shelf
+tv stand
+nightstand
+television
+computer monitor
+laptop
+keyboard
+computer mouse
+cell phone
+tablet computer
+remote control
+speaker
+headphones
+camera
+printer
+router
+clock
+wall clock
+lamp
+floor lamp
+table lamp
+pendant lamp
+chandelier
+ceiling fan
+light switch
+power outlet
+air conditioner
+radiator
+heater
+fan
+fireplace
+door
+window
+curtain
+blinds
+mirror
+picture frame
+painting
+poster
+rug
+carpet
+cushion
+pillow
+blanket
+towel
+basket
+box
+cardboard box
+suitcase
+backpack
+handbag
+umbrella
+shoe
+boot
+hat
+jacket
+book
+magazine
+newspaper
+notebook
+pen
+paper
+envelope
+calendar
+whiteboard
+blackboard
+potted plant
+flower
+vase
+candle
+figurine
+sculpture
+statue
+trophy
+globe
+toy
+teddy bear
+ball
+guitar
+piano
+drum
+bottle
+wine bottle
+wine glass
+glass
+cup
+mug
+bowl
+plate
+tray
+jar
+teapot
+kettle
+coffee maker
+pitcher
+fork
+knife
+spoon
+chopsticks
+napkin
+tablecloth
+menu
+cutting board
+pan
+pot
+microwave oven
+oven
+stove
+toaster
+blender
+refrigerator
+freezer
+dishwasher
+washing machine
+dryer
+sink
+faucet
+toilet
+bathtub
+shower
+soap dispenser
+toothbrush
+trash can
+recycling bin
+bucket
+mop
+broom
+vacuum cleaner
+ladder
+toolbox
+fire extinguisher
+smoke detector
+thermostat
+bar counter
+counter
+kitchen island
+bar stool
+high chair
+cash register
+coat rack
+hanger
+shopping bag
+bag
+food
+bread
+cake
+pizza
+sandwich
+fruit
+apple
+banana
+orange
+salad
+wine rack
+display case
+vending machine
+water dispenser
+column
+pillar
+staircase
+railing
+banister
+handrail
+ceiling light
+spotlight
+sign
+exit sign
+wall
+floor
+ceiling
+beam
+arch
+balcony
+awning
+balustrade
+facade
+roof
+chimney
+gate
+fence
+wall lamp
+street light
+lamppost
+traffic light
+traffic sign
+stop sign
+parking meter
+fire hydrant
+bollard
+manhole cover
+mailbox
+bicycle
+motorcycle
+scooter
+car
+taxi
+bus
+truck
+van
+train
+tram
+boat
+airplane
+bicycle rack
+planter
+tree
+bush
+hedge
+grass
+flower bed
+palm tree
+fountain
+monument
+flag
+flagpole
+banner
+billboard
+shop window
+storefront
+doorway
+window shutter
+shutter
+stairs
+steps
+sidewalk
+crosswalk
+road
+pole
+wire
+antenna
+satellite dish
+air vent
+pipe
+drainpipe
+gutter
+dog
+cat
+bird
+pigeon
+horse
+stroller
+wheelchair
+crutch
+walking stick
+helmet
+glasses
+sunglasses
+watch
+necklace
+wallet
+key
+lock
+doorknob
+door handle
+bottle opener
+corkscrew
+ice bucket
+thermos
+lunch box
+paper towel
+tissue box
+soap
+shampoo
+hair dryer
+comb
+brush
+scissors
+tape
+stapler
+calculator
+file cabinet
+folder
+binder
+drawer
+table

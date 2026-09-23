@@ -1,0 +1,77 @@
+:root {
+  --bg: #15171c;
+  --panel: #1d2027;
+  --panel-2: #252932;
+  --text: #e8eaef;
+  --muted: #9aa1ad;
+  --accent: #5b8cff;
+  --border: #323744;
+  --panel-width: 360px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+#app { display: flex; height: 100vh; width: 100vw; overflow: hidden; }
+#viewport { position: relative; flex: 1; min-width: 0; }
+#canvas-host { position: absolute; inset: 0; }
+#canvas-host canvas { display: block; }
+#topbar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center;
+  gap: 12px; padding: 8px 12px; background: linear-gradient(#15171ccc, #15171c00);
+  pointer-events: none; z-index: 5; }
+#topbar > * { pointer-events: auto; }
+#title { font-weight: 600; font-size: 14px; }
+#stats { color: var(--muted); font-variant-numeric: tabular-nums; }
+.spacer { flex: 1; }
+button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; }
+button:hover { border-color: var(--accent); }
+#help { position: absolute; bottom: 8px; left: 12px; color: var(--muted); font-size: 11px;
+  background: #15171cb0; padding: 3px 8px; border-radius: 4px; pointer-events: none; }
+#tooltip { position: absolute; z-index: 10; pointer-events: none; background: #0d0f13ee;
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px;
+  min-width: 150px; box-shadow: 0 4px 14px #0008; }
+#tooltip .t-title { font-weight: 600; margin-bottom: 2px; display: flex; align-items: center;
+  gap: 6px; }
+#tooltip .sw, .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px;
+  border: 1px solid #0006; flex: none; }
+#panel { width: var(--panel-width); background: var(--panel); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; transition: margin-right .15s ease; }
+#app.panel-hidden #panel { margin-right: calc(-1 * var(--panel-width)); }
+#tabs { display: flex; border-bottom: 1px solid var(--border); }
+#tabs button { flex: 1; border: none; border-radius: 0; background: none; padding: 10px 4px;
+  color: var(--muted); border-bottom: 2px solid transparent; }
+#tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab { display: none; padding: 10px; overflow: auto; flex: 1; min-height: 0; }
+.tab.active { display: flex; flex-direction: column; }
+.tab .lil-gui.root { width: 100%; --width: 100%; --background-color: var(--panel);
+  --widget-color: var(--panel-2); --font-size: 12px; }
+#filter { width: 100%; padding: 6px 8px; margin-bottom: 8px; background: var(--panel-2);
+  color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.table-wrap { overflow: auto; flex: 1; min-height: 0; }
+#catalogue { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+#catalogue th { position: sticky; top: 0; background: var(--panel); text-align: left;
+  color: var(--muted); font-weight: 500; padding: 4px; border-bottom: 1px solid var(--border); }
+#catalogue td { padding: 4px; border-bottom: 1px solid #2a2f3a; white-space: nowrap; }
+#catalogue tbody tr { cursor: pointer; }
+#catalogue tbody tr:hover { background: #2a3040; }
+#catalogue tbody tr.selected { background: #33406a; }
+#segmented { width: 100%; image-rendering: pixelated; border-radius: 4px;
+  border: 1px solid var(--border); }
+.hint { color: var(--muted); font-size: 11px; }
+.obj-label { font-size: 11px; padding: 1px 5px; border-radius: 3px; background: #0d0f13d0;
+  color: #fff; border-left: 3px solid; white-space: nowrap; pointer-events: auto; cursor: pointer;
+  transform: translateY(-4px); }
+.obj-label.selected { background: #1f2d55; font-weight: 600; }
+#loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: #15171cd8; z-index: 20; }
+#loading.done { display: none; }
+#loading .box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 22px; min-width: 300px; }
+#loading ul { list-style: none; padding: 0; margin: 10px 0 0; color: var(--muted); }
+#loading li { display: flex; justify-content: space-between; gap: 16px; }
+#loading li.ok { color: var(--text); }
+#loading li.err { color: #ff7b7b; }
+.spinner { width: 22px; height: 22px; border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite; float: right; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 900px) { :root { --panel-width: 300px; } }
