@@ -1,3 +1,43 @@
-# Session worktrees (see https://code.claude.com/docs/en/worktrees)
+# Python bytecode and packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+
+# Virtual environment (managed by uv)
+.venv/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+.hypothesis/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Browser tests (Playwright)
+test-results/
+playwright-report/
+
+# Logs (OpenMVS / COLMAP tools write *.log into their working directory)
+*.log
+
+# Local outputs. Maps, validation runs, reports and datasets live outside the repo
+# in ~/oh-my-slam-data; never create benchmark/ or eval_results/ here (see CLAUDE.md).
+/out/
+
+# Claude Code: session worktrees and personal settings
 .claude/worktrees/
+.claude/settings.local.json
 worktrees/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
