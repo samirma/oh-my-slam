@@ -47,7 +47,6 @@ def single_image_scene(seg: FrameSegmentation, tool: str) -> Json:
     md_extra: Json = {
         "tool": tool,
         "intrinsics_source": f.intrinsics.source,
-        "segmentation_mode": seg.mode,
         "depth_grid": {"width": f.grid_size[0], "height": f.grid_size[1]},
     }
     if f.gravity is not None:

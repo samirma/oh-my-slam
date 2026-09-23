@@ -103,17 +103,13 @@ class YoloeSegmenter:
             )
         return out
 
-    def run(self, req: SegmentRequest, refiner: Any = None) -> dict[str, Any]:
+    def run(self, req: SegmentRequest) -> dict[str, Any]:
         rgb = load_rgb(Path(req.image_path), max_side=req.max_side)
         h, w = rgb.shape[:2]
         dets = self.detect_array(rgb, req.labels, req.conf, req.iou, req.imgsz)
-        mode = "degraded"
-        if refiner is not None and req.refine:
-            dets = refiner.refine(rgb, dets, req.max_concepts)
-            mode = "full"
         instances = []
         for d in dets:
             m = d.pop("mask_array")
             d["mask"] = rle.encode(m)
             instances.append(d)
-        return {"width": w, "height": h, "mode": mode, "instances": instances, "timings": {}}
+        return {"width": w, "height": h, "instances": instances, "timings": {}}

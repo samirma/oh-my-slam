@@ -1,5 +1,5 @@
 """Score calibration: monotone piecewise-linear maps from raw model scores to calibrated
-precision-like scores, one per segmentation path (``yoloe``, ``sam3``).
+precision-like scores, one per segmentation path (``yoloe``).
 
 Maps are fitted by ``tools/calibrate_scores.py`` (isotonic regression on an LVIS subset) and
 committed under ``segmentation/data``. A missing or identity map returns the raw score.

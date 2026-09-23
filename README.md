@@ -6,7 +6,7 @@ bounding boxes (ASAM OpenLABEL 1.0.0). RGB only — depth, intrinsics and gravit
 
 | Entry point | What it does |
 |---|---|
-| `./start_inference_server.sh` | Starts the resident model server (MoGe-2, GeoCalib, YOLOE-26x-seg, SAM 3 if available, MapAnything). |
+| `./start_inference_server.sh` | Starts the resident model server (MoGe-2, GeoCalib, YOLOE-26x-seg, MapAnything). |
 | `./reconstruct.sh -i IMG [-f json\|ply]` | One image → OpenLABEL scene (default) or coloured point cloud, camera frame, on stdout. |
 | `./mapper.sh update -a IMGS\|FOLDERS\|VIDEO -m DIR -t full\|single [-f json\|ply] [-fps N]` | Creates or extends a persistent map. |
 | `./segment.sh -i IMG [-o DIR] [-f json\|ply] [--min-score S] [--labels a,b]` / `-m MAP` | Objects, OBBs, colours; with `-o` also `segmented.png`, `catalog.csv/.md`, `segments.ply`. |
@@ -18,15 +18,13 @@ bounding boxes (ASAM OpenLABEL 1.0.0). RGB only — depth, intrinsics and gravit
 brew install colmap                 # COLMAP 4.2.x (features/matching CLI; GLOMAP inside)
 uv sync                             # Python 3.12 environment in .venv (torch 2.14, pycolmap 4.2, …)
 ./scripts/install_tools.sh          # checks colmap 4.2.x; installs OpenMVS 2.4.0 (sha256-pinned)
-hf auth login                       # optional: SAM 3 (facebook/sam3) is gated on Hugging Face
 ./start_inference_server.sh         # first start downloads ~2 GB of weights (MapAnything 4.9 GB
                                     # comes from the HF cache if present); later starts ~30 s
 ```
 
 Model weights: MoGe-2 ViT-L normal (HF), GeoCalib (GitHub release, torch hub cache),
 YOLOE-26x-seg + MobileCLIP2-B (Ultralytics, `~/Library/Caches/oh-my-slam/weights`),
-MapAnything Apache-2.0 checkpoint (HF). Without SAM 3 access the server reports `degraded` and
-segmentation uses YOLOE alone. See `THIRD_PARTY_LICENSES.md`.
+MapAnything Apache-2.0 checkpoint (HF). See `THIRD_PARTY_LICENSES.md`.
 
 ## Usage
 
@@ -116,7 +114,6 @@ each map update also keeps its record in `map.json → updates[].timings`).
 
 * `inference server is not running — start it with ./start_inference_server.sh` (exit 3): start it;
   `--status` shows which models loaded; the log is `~/Library/Caches/oh-my-slam/server.log`.
-* `degraded`: SAM 3 is not accessible (gated) — YOLOE-only segmentation, everything else works.
 * Exit 5 on update: the new images do not overlap the map (no verified feature matches).
 * Exit 6: another `mapper.sh update` is running on the same map.
 * Evaluation/calibration datasets (TUM RGB-D, NYUv2, LVIS) are not downloaded automatically; put

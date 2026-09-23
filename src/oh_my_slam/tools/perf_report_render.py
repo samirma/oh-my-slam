@@ -591,7 +591,7 @@ def write(out: Path) -> None:
         f"{mach.get('memory_gb')} GB), macOS {mach.get('tools', {}).get('macos')}, inference "
         f"server on **{mach.get('server', {}).get('device')}** "
         f"({mach.get('server', {}).get('precision')}, status "
-        f"`{mach.get('server', {}).get('status')}` — SAM 3 unavailable, YOLOE-only). Warm "
+        f"`{mach.get('server', {}).get('status')}` — YOLOE segmentation). Warm "
         "server, every command run on its own, one after another.\n")
     add(_summary(out, data, shots_d, cold))
     add("## Contents\n\n1. [Performance per map](#performance-per-map)\n"
@@ -1002,7 +1002,7 @@ def _summary(out: Path, data: dict[str, Any], shots_d: dict[str, Any], cold: dic
                        f"{'unchanged' if unchanged else '**changed**'} by viewing; {n_new} new "
                        f"screenshots and {n_old} reused from the validation run.")
     bullets.append("Known issues and blocked items (AC26/AC27 data-limited — C31/C30, small "
-                   "\"television\" false positives, SAM 3 inaccessible — U1, dataset-based "
+                   "\"television\" false positives, dataset-based "
                    "accuracy targets not run — U2) are in the development report.")
     md.append("\n" + "\n".join(f"- {b}" for b in bullets) + "\n")
     return "\n".join(md)

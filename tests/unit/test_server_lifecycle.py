@@ -61,7 +61,7 @@ def test_start_is_idempotent_and_stop_cleans_up(stub_server: None) -> None:
     status = run_start("--status")
     assert status.returncode == 0
     h = p.Health.model_validate_json(status.stdout)
-    assert h.status == "degraded" and h.pid == state["pid"]
+    assert h.status == "ready" and h.pid == state["pid"]
     t0 = time.monotonic()
     stopped = run_start("--stop")
     assert stopped.returncode == 0
@@ -110,7 +110,7 @@ def test_concurrent_clients_never_crash_the_server(stub_server: None, tmp_path: 
     assert len(codes) == 200
     assert set(codes) <= {200, 503}
     assert codes.count(200) > 0
-    assert InferenceClient().health().status == "degraded"
+    assert InferenceClient().health().status == "ready"
 
 
 def test_second_server_process_refuses_to_start(stub_server: None) -> None:

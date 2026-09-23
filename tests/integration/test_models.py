@@ -28,7 +28,7 @@ SAMPLE = Path(os.environ.get("OH_MY_SLAM_SAMPLE_IMAGE", "/Users/U124317/robot_vi
 def client() -> InferenceClient:
     c = InferenceClient()
     h = c.require_ready()
-    assert h.status in ("ready", "degraded")
+    assert h.status == "ready"
     return c
 
 
@@ -43,8 +43,6 @@ def test_smoke_health_reports_models(client: InferenceClient) -> None:
     h = client.health()
     assert h.models["geometry"].loaded and h.models["segment_yoloe"].loaded
     assert h.device in ("mps", "cpu")
-    if h.status == "degraded":
-        assert not h.models["segment_sam3"].loaded
 
 
 def test_smoke_geometry(client: InferenceClient, sample: Path, tmp_path: Path) -> None:

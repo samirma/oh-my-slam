@@ -45,8 +45,8 @@ def test_health_and_loading_state(image: Path, tmp_path: Path) -> None:
     state.worker.call(state.registry.load_all, "cpu")
     state.loading = False
     h = p.Health.model_validate(client.get(p.ROUTE_HEALTH).json())
-    assert h.status == "degraded"  # SAM 3 stub refuses to load, like a missing HF access
-    assert h.models["segment_sam3"].error
+    assert h.status == "ready"
+    assert "segment_sam3" not in h.models
     assert h.queue_limit == 8
     state.stopping = True
     assert client.get(p.ROUTE_HEALTH).json()["status"] == "stopping"
@@ -77,7 +77,7 @@ def test_endpoints_with_stub_models(image: Path, tmp_path: Path) -> None:
                               max_side=200).model_dump(),
     )
     seg = p.SegmentResponse.model_validate(s.json())
-    assert seg.mode == "degraded" and len(seg.instances) == 2
+    assert len(seg.instances) == 2
     m = rle.decode(seg.instances[0].mask)
     assert m.shape == (150, 200) and m.any()
 

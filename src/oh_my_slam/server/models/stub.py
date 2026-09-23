@@ -1,9 +1,7 @@
 """Deterministic stand-in models (``OH_MY_SLAM_SERVER_STUB=1``) for lifecycle and protocol tests.
 
 They exercise the real server, worker thread, file hand-off and RLE paths without weights.
-``OH_MY_SLAM_STUB_DELAY`` (seconds) slows every request down for queueing tests;
-``OH_MY_SLAM_STUB_FAIL_SAM3=1`` (default) makes the optional refiner fail so the server is
-``degraded`` just like without SAM 3 access.
+``OH_MY_SLAM_STUB_DELAY`` (seconds) slows every request down for queueing tests.
 """
 
 from __future__ import annotations
@@ -95,7 +93,7 @@ class StubSegment(_Base):
     key = "segment_yoloe"
     name = "stub segmenter"
 
-    def run(self, req: SegmentRequest, refiner: Any = None) -> dict[str, Any]:
+    def run(self, req: SegmentRequest) -> dict[str, Any]:
         _delay()
         rgb = load_rgb(Path(req.image_path), max_side=req.max_side)
         h, w = rgb.shape[:2]
@@ -109,21 +107,7 @@ class StubSegment(_Base):
                 "box_xyxy": [float(x0), h / 4, float(x0 + w // 4), 3 * h / 4],
                 "mask": rle.encode(m),
             })
-        return {"width": w, "height": h, "mode": "degraded", "instances": instances,
-                "timings": {}}
-
-
-class StubSam3(_Base):
-    key = "segment_sam3"
-    name = "stub SAM 3"
-    required = False
-
-    def load(self, device: str) -> None:
-        if os.environ.get("OH_MY_SLAM_STUB_FAIL_SAM3", "1") == "1":
-            raise PermissionError("stub: gated model access denied")
-
-    def refine(self, rgb: np.ndarray, dets: list, max_concepts: int) -> list:
-        return dets
+        return {"width": w, "height": h, "instances": instances, "timings": {}}
 
 
 class StubMultiview(_Base):
@@ -145,4 +129,4 @@ class StubMultiview(_Base):
 
 
 def stub_adapters() -> list[Any]:
-    return [StubGeometry(), StubGravity(), StubSegment(), StubSam3(), StubMultiview()]
+    return [StubGeometry(), StubGravity(), StubSegment(), StubMultiview()]

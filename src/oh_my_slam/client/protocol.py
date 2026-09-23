@@ -100,7 +100,7 @@ class GravityResponse(BaseModel):
     timings: Timings = Field(default_factory=Timings)
 
 
-# --- segmentation (YOLOE -> SAM 3) ---------------------------------------------------------------
+# --- segmentation (YOLOE) ------------------------------------------------------------------------------
 
 
 class SegmentRequest(BaseModel):
@@ -110,14 +110,12 @@ class SegmentRequest(BaseModel):
     conf: float = 0.05  # raw pre-filter, well below any calibrated threshold
     iou: float = 0.6
     imgsz: int = 1024
-    refine: bool = True
-    max_concepts: int = 8
 
 
 class Instance(BaseModel):
     label: str
     score: float  # raw model score (calibrated by the client)
-    source: Literal["yoloe", "sam3"]
+    source: Literal["yoloe"]
     box_xyxy: list[float]  # on the mask grid
     mask: dict[str, object]  # COCO RLE {"size": [h, w], "counts": str}
 
@@ -125,7 +123,6 @@ class Instance(BaseModel):
 class SegmentResponse(BaseModel):
     width: int
     height: int
-    mode: Literal["full", "degraded"]
     instances: list[Instance]
     timings: Timings = Field(default_factory=Timings)
 

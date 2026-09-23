@@ -69,7 +69,6 @@ class FrameSegmentation:
     label_map: NDArray[np.int32]  # object id per grid pixel (0 = none), exclusive masks
     point_pixels: dict[int, NDArray[np.int64]]  # lifted pixel indices per object id
     points: dict[int, NDArray[np.float64]]  # lifted points per object id (camera frame)
-    mode: str = "degraded"
 
     def segments_cloud(self) -> PointCloud:
         """Every frame point, grey unless it is one of an object's lifted points."""

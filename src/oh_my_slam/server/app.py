@@ -107,10 +107,7 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post(p.ROUTE_SEGMENT, response_model=p.SegmentResponse)
     async def segment(req: p.SegmentRequest) -> Any:
-        refiner = state.registry.get("segment_sam3")
-        return await dispatch(
-            "segment_yoloe", lambda a: a.run(req, refiner=refiner), p.SegmentResponse
-        )
+        return await dispatch("segment_yoloe", lambda a: a.run(req), p.SegmentResponse)
 
     @app.post(p.ROUTE_MULTIVIEW, response_model=p.MultiviewResponse)
     async def multiview(req: p.MultiviewRequest) -> Any:

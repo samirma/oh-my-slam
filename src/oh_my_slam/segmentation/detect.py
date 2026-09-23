@@ -115,7 +115,7 @@ class Detection:
         return int(self.mask.sum())
 
 
-def _raw_threshold(min_score: float, sources: tuple[str, ...] = ("yoloe", "sam3")) -> float:
+def _raw_threshold(min_score: float, sources: tuple[str, ...] = ("yoloe",)) -> float:
     """Lowest raw score that can calibrate to >= ``min_score`` on any path."""
     lows = []
     for s in sources:

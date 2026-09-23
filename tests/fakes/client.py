@@ -100,7 +100,7 @@ class FakeClient:
     def health(self, timeout: float = 0.5) -> p.Health:
         if self.down:
             raise ServerUnavailableError("fake down")
-        return p.Health(status="degraded")
+        return p.Health(status="ready")
 
     def require_ready(self, wait_loading_s: float = 0) -> p.Health:
         return self.health()
@@ -152,7 +152,7 @@ class FakeClient:
             for i in f.instances
             if i.label in wanted and i.score >= req.conf
         ]
-        return p.SegmentResponse(width=w, height=h, mode="degraded", instances=inst)
+        return p.SegmentResponse(width=w, height=h, instances=inst)
 
     def multiview(self, req: p.MultiviewRequest) -> p.MultiviewResponse:
         self.calls["multiview"] += 1

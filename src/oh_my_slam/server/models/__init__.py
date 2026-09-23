@@ -1,7 +1,7 @@
 """Model adapters loaded by the inference server.
 
 Every adapter method runs on the single GPU worker thread. ``load`` may raise; required adapters
-put the server in ``error``, optional ones (SAM 3) put it in ``degraded``.
+put the server in ``error``, optional ones put it in ``degraded``.
 """
 
 from __future__ import annotations
@@ -97,12 +97,10 @@ def build_registry(stub: bool = False) -> Registry:
     from oh_my_slam.server.models.geometry_moge import MoGeGeometry
     from oh_my_slam.server.models.gravity_geocalib import GeoCalibGravity
     from oh_my_slam.server.models.multiview_mapanything import MapAnythingMultiview
-    from oh_my_slam.server.models.seg_sam3 import Sam3Refiner
     from oh_my_slam.server.models.seg_yoloe import YoloeSegmenter
 
     reg.add(MoGeGeometry())
     reg.add(GeoCalibGravity())
     reg.add(YoloeSegmenter())
-    reg.add(Sam3Refiner())
     reg.add(MapAnythingMultiview())
     return reg

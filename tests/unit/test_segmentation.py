@@ -99,7 +99,6 @@ def test_calibration_maps() -> None:
         calibration.CalibrationMap("x", (0.0,), (0.0,))
     with pytest.raises(ValueError):
         calibration.CalibrationMap("x", (1.0, 0.0), (0.0, 1.0))
-    assert calibration.calibrate(0.7, "sam3") == pytest.approx(0.7)
     assert calibration.load_map("unknown-path").is_identity
 
 
