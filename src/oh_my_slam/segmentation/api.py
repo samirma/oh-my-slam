@@ -28,7 +28,14 @@ from oh_my_slam.reconstruction.api import (
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, color_hex_for_id
-from oh_my_slam.segmentation.detect import DEFAULT_MIN_SCORE, Detection, detect, floor_gap
+from oh_my_slam.segmentation.detect import (
+    DEFAULT_MIN_SCORE,
+    DETECTION_FLOOR,
+    Detection,
+    detect,
+    floor_gap,
+    priority,
+)
 from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask
 from oh_my_slam.segmentation.obb import OBB, fit_obb
 
@@ -84,10 +91,11 @@ class FrameSegmentation:
 
 
 def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArray[np.bool_]]:
-    """Resolve overlaps: larger masks are painted first, smaller ones on top."""
+    """Resolve overlaps by ``priority``: a pixel belongs to the highest-scoring detection covering
+    it, so a lower-score detection never changes a higher-score object's mask, points or OBB."""
     owner = np.full(shape, -1, np.int32)
-    for i in sorted(range(len(dets)), key=lambda k: -dets[k].area):
-        owner[dets[i].mask] = i
+    for i in sorted(range(len(dets)), key=lambda k: priority(dets[k])):
+        owner[dets[i].mask & (owner < 0)] = i
     return [owner == i for i in range(len(dets))]
 
 
@@ -127,11 +135,16 @@ def segment_frame(
     client: InferenceClient | None = None,
     detections: list[Detection] | None = None,
 ) -> FrameSegmentation:
-    """Objects of one image in its camera frame; ids 1..N by score, then area."""
+    """Objects of one image in its camera frame.
+
+    Ids are 1..N over the objects that survive lifting, in detection ``priority`` order (score
+    desc, then area, label, box). A detection is only ever affected by higher-priority ones, so
+    the same image and options give the same ids, and a higher ``min_score`` only drops objects
+    from the end: the objects kept at both thresholds have the same id, colour and OBB."""
     if detections is None:
         detections = detect(frame.image_path, min_score=min_score,
                             max_side=max(frame.grid_size), client=client)
-    instances = lift_detections(frame, detections)
+    instances = sorted(lift_detections(frame, detections), key=lambda i: priority(i.detection))
     up = frame.gravity.up_cam if frame.gravity is not None else DEFAULT_UP_CAM
     floor = None
     if frame.gravity is not None and frame.gravity.floor_height is not None:
@@ -164,15 +177,18 @@ def reconstruct_and_detect(
     """Reconstruction and detection with the detection request issued concurrently, so the
     server's queue stays busy while this process decodes and post-processes.
 
-    ``keyframe=True`` uses the mapper's settings (smaller grid, fewer tokens, descriptor)."""
+    ``keyframe=True`` uses the mapper's settings (smaller grid, fewer tokens, descriptor). Map
+    keyframes always use the default threshold, so they ask the server for exactly it instead of
+    the lower ``DETECTION_FLOOR`` that keeps single-image ids stable across ``--min-score``."""
     from concurrent.futures import ThreadPoolExecutor
 
     side = KEYFRAME_GRID_SIDE if keyframe else MAX_GRID_SIDE
+    floor = min_score if keyframe else DETECTION_FLOOR
     det_client = client.clone()
     try:
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(detect, image_path, min_score=min_score, max_side=side,
-                              client=det_client)
+            fut = pool.submit(detect, image_path, min_score=min_score, floor=floor,
+                              max_side=side, client=det_client)
             frame = reconstruct_image(
                 image_path, want_gravity=True, client=client, intrinsics=intrinsics,
                 max_side=side, num_tokens=KEYFRAME_TOKENS if keyframe else SINGLE_IMAGE_TOKENS,

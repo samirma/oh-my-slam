@@ -1,5 +1,11 @@
 """Instance detection: the segment endpoint → background / min-score filters → cross-label
-de-duplication → stable ordering. Also owns the vocabulary and label rules."""
+de-duplication → stable ordering. Also owns the vocabulary and label rules.
+
+Stable across thresholds: the server is always asked for every detection above a fixed floor
+(``DETECTION_FLOOR``), and ``--min-score`` filters client-side. Every later step (de-duplication,
+exclusive masks, id assignment) processes detections in ``priority`` order, in which a detection
+can only be affected by detections that precede it — so raising the threshold removes objects
+from the end and never changes the ones that remain."""
 
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ from oh_my_slam.client.client import InferenceClient, connect
 from oh_my_slam.core import rle, timing
 
 DEFAULT_MIN_SCORE = 0.5
+DETECTION_FLOOR = 0.25  # score floor requested from the server; the lowest accepted --min-score
 DEDUPE_IOU = 0.7
 MIN_AREA_PX = 64
 
@@ -120,10 +127,15 @@ def mask_iou(a: NDArray[Any], b: NDArray[Any]) -> float:
     return float(inter / np.logical_or(a, b).sum())
 
 
+def priority(d: Detection) -> tuple[float, int, str, tuple[float, float, float, float]]:
+    """Total, deterministic order of detections: score desc, then mask area desc, label, box."""
+    return (-d.score, -d.area, d.label, d.box)
+
+
 def dedupe(dets: list[Detection], iou: float = DEDUPE_IOU) -> list[Detection]:
-    """Greedy cross-label suppression by mask IoU (highest score wins)."""
+    """Greedy cross-label suppression by mask IoU (the higher-priority detection wins)."""
     kept: list[Detection] = []
-    for d in sorted(dets, key=lambda x: (-x.score, -x.area)):
+    for d in sorted(dets, key=priority):
         x0, y0, x1, y1 = d.box
         dup = False
         for k in kept:
@@ -139,31 +151,36 @@ def dedupe(dets: list[Detection], iou: float = DEDUPE_IOU) -> list[Detection]:
 
 
 def order(dets: list[Detection]) -> list[Detection]:
-    """Stable output order: score desc, then mask area desc, then label."""
-    return sorted(dets, key=lambda d: (-round(d.score, 6), -d.area, d.label))
+    """Stable output order (``priority``)."""
+    return sorted(dets, key=priority)
 
 
 def detect(
     image_path: Path,
     *,
     min_score: float = DEFAULT_MIN_SCORE,
+    floor: float = DETECTION_FLOOR,
     max_side: int = 1024,
     client: InferenceClient | None = None,
     min_area_px: int = MIN_AREA_PX,
 ) -> list[Detection]:
-    """Detections for one image on the ``max_side`` grid (same grid as reconstruction)."""
+    """Detections scoring at least ``min_score`` on the ``max_side`` grid (same grid as
+    reconstruction). The server is asked for everything above ``floor`` (<= ``min_score``), so
+    the request — and the detections it returns — do not depend on ``min_score``."""
+    if not 0.0 < floor <= min_score:
+        raise ValueError(f"min_score {min_score} is below the detection floor {floor}")
     with timing.part("segmentation"):
-        return _detect(image_path, min_score, max_side, client or connect(), min_area_px)
+        return _detect(image_path, min_score, floor, max_side, client or connect(), min_area_px)
 
 
-def _detect(image_path: Path, min_score: float, max_side: int, client: InferenceClient,
-            min_area_px: int) -> list[Detection]:
+def _detect(image_path: Path, min_score: float, floor: float, max_side: int,
+            client: InferenceClient, min_area_px: int) -> list[Detection]:
     res = client.segment_image(
         p.SegmentRequest(
             image_path=str(Path(image_path).resolve()),
             labels=list(default_vocabulary()),
             max_side=max_side,
-            conf=max(0.01, min_score - 1e-6),
+            conf=floor - 1e-6,  # the model keeps scores strictly above its threshold
         )
     )
     dets: list[Detection] = []
