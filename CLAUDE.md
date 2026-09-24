@@ -38,7 +38,8 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
     the Python-module level.
 - **Inference server:** every inference-requiring operation must fail with an actionable error when
   the server is down. `view.sh -m` (viewing a persisted map) must work without it.
-- **stdout:** exactly one JSON document or one PLY. Everything else goes to stderr.
+- **stdout:** exactly one JSON document or one PLY, or nothing when `-o <file>` sends the
+  result to a file. Everything else goes to stderr.
 - **Colour contract:** an object's colour is a pure function of its `id`. The same sRGB triple must
   appear in all of these:
   - `segmentation.json`
