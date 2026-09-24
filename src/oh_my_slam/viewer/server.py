@@ -1,36 +1,116 @@
-"""Read-only local web server for the viewer (127.0.0.1, free port unless ``--port``)."""
+"""Read-only local web server for the viewer (127.0.0.1, any free port unless ``--port``).
+
+Routes (GET/HEAD only; anything else is 405):
+
+* ``/`` — the page; ``/static/…`` — its scripts, styles and vendored libraries.
+* ``/api/meta`` — JSON: mode, title, stats, display transform, camera poses (from the scene), the
+  point-cloud controls (from ``core.cloud_attrs``) and their defaults.
+* ``/api/scene`` — the OpenLABEL scene JSON; ``/api/catalog`` — the catalogue rows (JSON);
+  ``/api/segmented.png`` — the segmented image (``view.sh -i`` only).
+* ``/api/cloud?key=value&…`` — the point cloud derived with those §2.2 attributes (keys not given
+  keep their defaults; ``label`` and ``encoding`` concern PLY files only and are refused). Invalid
+  input is a 400 with ``{"error": "<actionable message>"}``. The 200 body is one binary document
+  (see :func:`cloud_payload`).
+"""
 
 from __future__ import annotations
 
 import json
 import mimetypes
+import struct
 import threading
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
-from oh_my_slam.viewer.bundle import ViewBundle
+import numpy as np
+
+from oh_my_slam.core.errors import UsageError
+from oh_my_slam.core.log import get_logger
+from oh_my_slam.viewer.bundle import DisplayCloud, ViewBundle
+
+log = get_logger("oh_my_slam.viewer")
 
 STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
 _TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
           ".json": "application/json", ".png": "image/png", ".txt": "text/plain",
           ".md": "text/plain"}
+CLOUD_CACHE = 3  # recent cloud payloads kept (e.g. toggling a control back and forth)
+
+
+def cloud_payload(dc: DisplayCloud, attrs: str) -> bytes:
+    """Binary cloud document: ``uint32`` little-endian length ``J`` of a UTF-8 JSON header, the
+    header (space-padded so that ``4 + J`` is a multiple of 4), then the buffers, each starting on
+    a 4-byte boundary at ``4 + J + offset``. The header::
+
+        {"count": n, "total": n0, "step": k, "attrs": "color=rgb,…", "seconds": s,
+         "buffers": [{"name", "type", "size", "offset", "bytes"}, …]}
+
+    ``count`` points are shown out of ``total`` derived (every ``step``-th). Buffers, little-endian,
+    ``size`` components per point: ``position`` float32 x 3 (always), ``color`` uint8 x 3 (sRGB;
+    absent for ``color=none``), ``label`` int32 x 1 (object id, 0 = unsegmented), ``normal``
+    float32 x 3 (``normals=on``)."""
+    c = dc.cloud
+    parts: list[tuple[str, str, int, Any]] = [("position", "float32", 3, c.xyz)]
+    if c.rgb is not None:
+        parts.append(("color", "uint8", 3, c.rgb))
+    if c.label is not None:
+        parts.append(("label", "int32", 1, c.label))
+    if c.normals is not None:
+        parts.append(("normal", "float32", 3, c.normals))
+    buffers, blobs, offset = [], [], 0
+    for name, dtype, size, arr in parts:
+        data = np.ascontiguousarray(arr, dtype=np.dtype(dtype).newbyteorder("<")).tobytes()
+        pad = -len(data) % 4
+        buffers.append({"name": name, "type": dtype, "size": size, "offset": offset,
+                        "bytes": len(data)})
+        blobs.append(data + b"\0" * pad)
+        offset += len(data) + pad
+    header = json.dumps({"count": len(c), "total": dc.total, "step": dc.step, "attrs": attrs,
+                         "seconds": round(dc.seconds, 4), "buffers": buffers}).encode()
+    header += b" " * (-(4 + len(header)) % 4)
+    return struct.pack("<I", len(header)) + header + b"".join(blobs)
+
+
+def parse_cloud_payload(body: bytes) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    """Inverse of :func:`cloud_payload` (for tests and tools): the header and the arrays."""
+    (n,) = struct.unpack_from("<I", body)
+    header = json.loads(body[4:4 + n])
+    base = 4 + n
+    arrays = {}
+    for b in header["buffers"]:
+        dtype = np.dtype(b["type"]).newbyteorder("<")
+        a = np.frombuffer(body, dtype, b["bytes"] // dtype.itemsize, base + b["offset"])
+        arrays[b["name"]] = a.reshape(-1, b["size"]) if b["size"] > 1 else a
+    return header, arrays
 
 
 def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
     payloads: dict[str, tuple[str, Any]] = {
         "/api/meta": ("application/json", lambda: json.dumps(bundle.meta()).encode()),
         "/api/scene": ("application/json", lambda: json.dumps(bundle.scene).encode()),
-        "/api/points.bin": ("application/octet-stream", bundle.points_bytes),
-        "/api/colors.bin": ("application/octet-stream", bundle.colors_bytes),
-        "/api/segments.bin": ("application/octet-stream", bundle.segments_bytes),
-        "/api/labels.bin": ("application/octet-stream", bundle.labels_bytes),
         "/api/catalog": ("application/json", lambda: json.dumps(bundle.catalog).encode()),
     }
     cache: dict[str, bytes] = {}
+    clouds: OrderedDict[str, bytes] = OrderedDict()
     lock = threading.Lock()
+
+    def cloud_bytes(query: str) -> bytes:
+        attrs = bundle.parse_attrs(parse_qsl(query, keep_blank_values=True))
+        key = bundle.describe(attrs)
+        with lock:
+            if key in clouds:
+                clouds.move_to_end(key)
+                return clouds[key]
+        body = cloud_payload(bundle.cloud(attrs), key)
+        with lock:
+            clouds[key] = body
+            while len(clouds) > CLOUD_CACHE:
+                clouds.popitem(last=False)
+        return body
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "oh-my-slam-viewer"
@@ -47,11 +127,15 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
             if self.command != "HEAD":
                 self.wfile.write(body)
 
+        def _error(self, code: int, message: str) -> None:
+            self._send(code, "application/json", json.dumps({"error": message}).encode())
+
         def do_HEAD(self) -> None:
             self.do_GET()
 
         def do_GET(self) -> None:
-            path = unquote(urlparse(self.path).path)
+            url = urlparse(self.path)
+            path = unquote(url.path)
             try:
                 if path in ("/", "/index.html"):
                     self._send(200, "text/html; charset=utf-8",
@@ -62,6 +146,13 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
                         if path not in cache:
                             cache[path] = fn()
                     self._send(200, ctype, cache[path])
+                elif path == "/api/cloud":
+                    try:
+                        body = cloud_bytes(url.query)
+                    except (UsageError, ValueError) as exc:  # bad attributes, or not derivable
+                        self._error(400, str(exc))
+                        return
+                    self._send(200, "application/octet-stream", body)
                 elif path == "/api/segmented.png" and bundle.segmented_png is not None:
                     self._send(200, "image/png", bundle.segmented_png)
                 elif path.startswith("/static/"):
@@ -79,11 +170,17 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
                     self._send(404, "text/plain", b"not found")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as exc:  # keep serving; the page shows the message
+                log.warning("viewer: %s failed: %s", path, exc, exc_info=True)
+                try:
+                    self._error(500, f"{type(exc).__name__}: {exc}")
+                except OSError:
+                    pass
 
         def do_POST(self) -> None:
             self._send(405, "text/plain", b"read-only")
 
-        do_PUT = do_DELETE = do_POST
+        do_PUT = do_DELETE = do_PATCH = do_POST
 
     return Handler
 

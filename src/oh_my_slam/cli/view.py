@@ -3,12 +3,19 @@
     view.sh -i <image>        reconstruct + segment one image (needs the inference server)
     view.sh -m <map-folder>   open a persisted map read-only (no server needed)
 
-Binds 127.0.0.1 on a free port (or --port), prints the URL on stderr, opens the default browser
-unless --no-browser, and serves until Ctrl-C.
+Binds 127.0.0.1 on a free port (or --port), opens the default browser unless --no-browser, and
+serves until Ctrl-C. Nothing is written to stdout. Once the server accepts connections, stderr
+carries exactly one line of the form (``URL_LINE``)::
+
+    view.sh: listening on http://127.0.0.1:<port>/
+
+The page sets ``<body data-rendered="true">`` once its first frame with the point cloud has been
+drawn (and keeps it), or ``data-error="<message>"`` if loading fails.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import webbrowser
 from pathlib import Path
@@ -18,6 +25,7 @@ from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.log import claim_stdout, get_logger
 
 PROG = "view.sh"
+URL_LINE = re.compile(r"^view\.sh: listening on (http://127\.0\.0\.1:\d+/)$")
 log = get_logger("oh_my_slam.cli.view")
 
 
@@ -49,8 +57,9 @@ def main(argv: list[str]) -> int:
         bundle = map_bundle(args.map)
     httpd = serve(bundle, args.port)
     url = url_of(httpd)
-    print(f"{PROG}: serving {bundle.mode} '{bundle.title}' at {url} (Ctrl-C to stop)",
-          file=sys.stderr, flush=True)
+    print(f"{PROG}: listening on {url}", file=sys.stderr, flush=True)
+    print(f"{PROG}: showing {bundle.mode} '{bundle.title}' (Ctrl-C to stop)", file=sys.stderr,
+          flush=True)
     if not args.no_browser:
         webbrowser.open(url)
     try:

@@ -12,6 +12,6 @@ there) and the vendored ASAM OpenLABEL JSON schema.
 | MapAnything (`facebookresearch/map-anything` @ 3d10cf7, weights `facebook/map-anything-apache`) | Metric multi-view fallback for poses | Apache-2.0 code and weights | The Apache-licensed checkpoint is used instead of the CC-BY-NC one |
 | COLMAP 4.2 / GLOMAP (Homebrew CLI, PyPI `pycolmap`) | Features, matching, SfM, bundle adjustment | BSD-3-Clause | ALIKED/LightGlue ONNX models downloaded by COLMAP |
 | Open3D 0.20 | TSDF fusion of the map cloud | MIT | |
-| three.js r186, lil-gui | Browser viewer | MIT | Vendored |
+| three.js r186 | Browser viewer | MIT | Vendored |
 | ASAM OpenLABEL 1.0.0 JSON schema | Scene description validation | ASAM (schema published for implementers) | Vendored, sha256-pinned |
 | PyTorch, torchvision, transformers, FastAPI, uvicorn, httpx, NumPy, SciPy, Pillow, pillow-heif, PyAV, OpenCV | Runtime | BSD / MIT / Apache-2.0 / LGPL (FFmpeg in PyAV/OpenCV wheels) | |
