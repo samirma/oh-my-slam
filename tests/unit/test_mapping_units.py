@@ -339,10 +339,11 @@ def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path) -> None:
 
     ap = cli_mapper.build_parser()
     a = ap.parse_args(["update", "-a", "x.mp4", "-m", "m", "-t", "full"])
-    assert (a.format, a.mode, a.fps) == ("json", "full", None)
-    a = ap.parse_args(["update", "-a", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-t", "single",
-                       "-fps", "3"])
+    assert (a.format, a.mode, a.fps, a.output, a.attrs) == ("json", "full", None, None, None)
+    a = ap.parse_args(["update", "-a", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-o", "c.ply",
+                       "-p", "voxel=0.05,normals=on", "-t", "single", "-fps", "3"])
     assert a.inputs == [Path("a.jpg"), Path("b.jpg")] and a.fps == 3.0
+    assert (a.output, a.attrs) == (Path("c.ply"), ["voxel=0.05,normals=on"])
     for bad in (["update", "-a", "x.mp4", "-m", "m"], ["update", "-m", "m", "-t", "full"],
                 ["-a", "x"], ["update", "-a", "x", "-m", "m", "-t", "partial"]):
         with pytest.raises(SystemExit) as e:
@@ -352,6 +353,45 @@ def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path) -> None:
     res = subprocess.run([str(repo / "mapper.sh"), "update", "-a", "x.mp4", "-m",
                           str(tmp_path / "m")], capture_output=True, env=os.environ.copy())
     assert res.returncode == 2 and res.stdout == b""
+
+
+def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyPatch,
+                                                     tmp_path: Path) -> None:
+    """``-p`` is checked (map scope, needs -f ply) before ``update`` could reach the server;
+    ``-o`` receives the payload."""
+    import io
+    from types import SimpleNamespace
+
+    from oh_my_slam.cli import mapper as cli_mapper
+    from oh_my_slam.core import timing
+    from oh_my_slam.core.cloud_attrs import CloudAttrs
+    from oh_my_slam.core.log import PayloadWriter
+    from oh_my_slam.mapping import api
+
+    calls: list[dict] = []
+
+    def fake_update(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        return SimpleNamespace(payload=b"PAYLOAD", timings=timing.Timings().to_dict())
+
+    stdout = io.BytesIO()
+    monkeypatch.setattr(api, "update", fake_update)
+    monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
+        stdout) if output is None else PayloadWriter(path=output))
+    base = ["update", "-a", "x.jpg", "-m", str(tmp_path / "m"), "-t", "full"]
+    for bad in (["-p", "voxel=0.1"], ["-f", "ply", "-p", "stride=2"],
+                ["-f", "ply", "-p", "max-depth=3"], ["-f", "ply", "-p", "voxel=-1"]):
+        with pytest.raises(UsageError):
+            cli_mapper.main(base + bad)
+    assert calls == []
+    target = tmp_path / "out.ply"
+    assert cli_mapper.main(base + ["-f", "ply", "-p", "voxel=0.1,normals=on,color=height",
+                                   "-o", str(target)]) == 0
+    assert calls[0]["attrs"] == CloudAttrs(color="height", voxel=0.1, normals=True)
+    assert calls[0]["fmt"] == "ply" and target.read_bytes() == b"PAYLOAD"
+    assert stdout.getvalue() == b""
+    assert cli_mapper.main(base) == 0
+    assert calls[1]["attrs"] == CloudAttrs() and stdout.getvalue() == b"PAYLOAD"
 
 
 # --- map cloud: fused surface + latest-frame attribution ----------------------------------------

@@ -22,7 +22,7 @@ ASCII = "ascii 1.0"
 
 @dataclass
 class PointCloud:
-    """xyz (N, 3) float32; optional rgb (N, 3) uint8, label (N,) int32 and normals (N, 3) float32."""
+    """xyz (N, 3) float32; optional rgb (N, 3) uint8, label (N,) int32, normals (N, 3) float32."""
 
     xyz: NDArray[np.float32]
     rgb: NDArray[np.uint8] | None = None

@@ -1,22 +1,32 @@
 """``mapper.sh update`` — build and update a persistent map.
 
-    mapper.sh update -a <image(s)|folder(s)|video> -m <folder> [-f json|ply] -t full|single
-                     [-fps <n>]
+    mapper.sh update -a <image(s)|folder(s)|video> -m <folder> [-f json|ply] [-o <file>]
+                     [-p <attrs>] -t full|single [-fps <n>]
 
 Creates the map if <folder> is missing or empty, extends it if it is a map, refuses any other
-non-empty folder (exit 4). stdout: the OpenLABEL scene (json, default) of the whole map
-(-t full, with every keyframe pose) or of the new input only (-t single); -f ply writes the map
-cloud (full) or the new frames' points (single), map coordinates.
+non-empty folder (exit 4). The result goes to stdout, or to ``-o <file>`` (stdout then stays
+empty): the OpenLABEL scene (json, default) of the whole map (-t full, with every keyframe pose) or
+of the new input only (-t single); -f ply writes the map cloud (full) or the new frames' points
+(single), map coordinates, shaped by the ``-p`` point-cloud attributes (map scope: the pixel-level
+keys are refused). Options are validated before the server is contacted.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from oh_my_slam.cli.common import ArgumentParser, run_main
+from oh_my_slam.cli.common import (
+    ArgumentParser,
+    add_result_options,
+    attrs_help,
+    cloud_attrs_arg,
+    run_main,
+)
+from oh_my_slam.core.cloud_attrs import CloudScope
 from oh_my_slam.core.log import claim_stdout, get_logger
 
 PROG = "mapper.sh"
+SCOPE = CloudScope.MAP
 log = get_logger("oh_my_slam.cli.mapper")
 
 
@@ -28,7 +38,8 @@ def build_parser() -> ArgumentParser:
                     help="image files, image folders, or exactly one video")
     up.add_argument("-m", dest="map", type=Path, required=True, help="map folder")
     up.add_argument("-f", dest="format", choices=("json", "ply"), default="json",
-                    help="stdout format (default: json)")
+                    help="output format (default: json)")
+    add_result_options(up, attrs_help(SCOPE, "requires -f ply"))
     up.add_argument("-t", dest="mode", choices=("full", "single"), required=True,
                     help="full = whole map with all keyframe poses; single = new input only")
     up.add_argument("-fps", dest="fps", type=float, default=None,
@@ -42,7 +53,9 @@ def main(argv: list[str]) -> int:
     from oh_my_slam.mapping.ingest import DEFAULT_FPS
 
     args = build_parser().parse_args(argv)
-    out = claim_stdout()
+    attrs = cloud_attrs_arg(args.attrs, SCOPE, writes_ply=args.format == "ply",
+                            requires="only the PLY output has: use -f ply")
+    out = claim_stdout(args.output)
     is_video = len(args.inputs) == 1 and args.inputs[0].suffix.lower() in VIDEO_SUFFIXES
     fps = DEFAULT_FPS if args.fps is None else args.fps
     if args.fps is not None and not is_video:
@@ -52,7 +65,7 @@ def main(argv: list[str]) -> int:
     from oh_my_slam.core import timing
     from oh_my_slam.mapping.api import update
 
-    res = update(args.map, args.inputs, fps=fps, mode=args.mode, fmt=args.format)
+    res = update(args.map, args.inputs, fps=fps, mode=args.mode, fmt=args.format, attrs=attrs)
     out.write_bytes(res.payload)
     timing.report(res.timings, log, command="mapper.sh update", mode=args.mode,
                   format=args.format, fps=fps if is_video else None, map=str(args.map))

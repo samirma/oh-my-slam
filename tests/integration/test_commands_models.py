@@ -63,8 +63,9 @@ def test_reconstruct_and_segment_on_three_images(images: list[Path], tmp_path: P
         assert res.returncode == 0
         cloud = parse_ply(res.stdout)
         out = tmp_path / img.stem
-        res, t_seg = run("segment.sh", "-i", str(img), "-o", str(out))
+        res, t_seg = run("segment.sh", "-i", str(img), "-d", str(out))
         assert res.returncode == 0
         assert len(list(out.iterdir())) == 5
+        assert (out / "segmentation.json").read_bytes() == res.stdout
         print(f"{img.name}: json {t_json:.2f}s ({len(objs)} objects), ply {t_ply:.2f}s "
-              f"({len(cloud)} pts), segment -o {t_seg:.2f}s")
+              f"({len(cloud)} pts), segment -d {t_seg:.2f}s")

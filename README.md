@@ -7,9 +7,9 @@ bounding boxes (ASAM OpenLABEL 1.0.0). RGB only — depth, intrinsics and gravit
 | Entry point | What it does |
 |---|---|
 | `./start_inference_server.sh` | Starts the resident model server (MoGe-2, GeoCalib, YOLOE-26x-seg, MapAnything). |
-| `./reconstruct.sh -i IMG [-f json\|ply]` | One image → OpenLABEL scene (default) or coloured point cloud, camera frame, on stdout. |
-| `./mapper.sh update -a IMGS\|FOLDERS\|VIDEO -m DIR -t full\|single [-f json\|ply] [-fps N]` | Creates or extends a persistent map. |
-| `./segment.sh -i IMG [-o DIR] [-f json\|ply] [--min-score S]` / `-m MAP` | Objects, OBBs, colours; with `-o` also `segmented.png`, `catalog.csv/.md`, `segments.ply`. |
+| `./reconstruct.sh -i IMG [-f json\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default) or point cloud, camera frame. |
+| `./mapper.sh update -a IMGS\|FOLDERS\|VIDEO -m DIR [-f json\|ply] [-o FILE] [-p ATTRS] -t full\|single [-fps N]` | Creates or extends a persistent map. |
+| `./segment.sh -i IMG [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` / `-m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | Objects, OBBs, colours; with `-d` also `segmentation.json`, `segmented.png`, `catalog.csv/.md`, `segments.ply`. |
 | `./view.sh -i IMG` / `-m MAP` | Local browser viewer (127.0.0.1, free port). `-m` needs no server. |
 
 ## Install
@@ -31,16 +31,30 @@ MapAnything Apache-2.0 checkpoint (HF). See `THIRD_PARTY_LICENSES.md`.
 ```sh
 ./start_inference_server.sh --status            # health JSON on stdout (exit 3 if not running)
 ./reconstruct.sh -i photo.jpg > scene.json
-./reconstruct.sh -i photo.jpg -f ply > cloud.ply
-./segment.sh -i photo.jpg -o out/ --min-score 0.6
+./reconstruct.sh -i photo.jpg -f ply -o cloud.ply
+./reconstruct.sh -i photo.jpg -f ply -p color=segment,voxel=0.01,normals=on > objects.ply
+./segment.sh -i photo.jpg -d out/ --min-score 0.6
 ./mapper.sh update -a walk.mp4 -m maps/home -t full -fps 2 > map.json
-./mapper.sh update -a more_photos/ -m maps/home -t single > new_part.json
-./segment.sh -m maps/home -o out_map/
+./mapper.sh update -a more_photos/ -m maps/home -t single -f ply -o new_part.ply
+./segment.sh -m maps/home -d out_map/
 ./view.sh -m maps/home
 ./start_inference_server.sh --stop
 ```
 
-stdout carries exactly one JSON document or one binary PLY; progress and diagnostics go to stderr.
+stdout carries exactly one JSON document or one PLY — or nothing when `-o FILE` receives the result
+(written atomically); progress and diagnostics go to stderr. `segment.sh` writes files only with
+`-o` or `-d`; `-d` artefacts `segmentation.json` / `segments.ply` are byte-identical to what `-f json`
+/ `-f ply` output. `--min-score` (default 0.5) accepts [0.25, 1]: the detector is always asked for
+everything above 0.25, so a threshold only adds or removes objects and the others keep id and colour.
+
+Point-cloud attributes (`-p key=value[,key=value…]`, every PLY output; unknown keys and bad values
+exit 2 before any inference): `color=rgb|segment|height|none` (default `rgb`, fixed to `segment` in
+`segment.sh`), `stride=N` (1), `min-depth`/`max-depth` in metres (full range), `edge` relative depth
+jump (0.04; 0 disables the flying-pixel filter), `voxel` in metres (0 = off; first point per voxel,
+colours never averaged), `normals=on|off`, `label=on|off` (object id, 0 = unsegmented),
+`encoding=binary|ascii`. `stride`, depth range and `edge` apply to single images only and are
+refused on maps. The PLY header records the effective attributes in a `comment attributes …` line.
+
 Exit codes: 0 ok, 1 internal error, 2 usage/input error, 3 inference server not running,
 4 `-m` folder is neither empty nor a map, 5 nothing could be registered (e.g. no overlap),
 6 another update holds the map lock.
@@ -87,8 +101,10 @@ leaves the previous map untouched.
   merging, removal on evidence of absence → map cloud (surface of a TSDF fusion); no mesh.
 * **Ownership** (enforced by import-linter and `tests/unit/test_ownership.py`): reconstruction owns
   depth/intrinsics/gravity/clouds/fusion; segmentation owns instances, lifting, OBBs, colours,
-  catalogue and artefacts; mapping owns inputs, SfM, map frame, identity and the store; the viewer
-  only serves data. Shell scripts never call each other.
+  catalogue and artefacts, and derives every emitted cloud (`segmentation/cloud.py`: the point-cloud
+  attributes of `core/cloud_attrs.py` applied to reconstruction's points with the colour contract);
+  mapping owns inputs, SfM, map frame, identity and the store; the viewer only serves data. Shell
+  scripts never call each other.
 
 ## Development
 

@@ -1,19 +1,29 @@
 """``segment.sh`` — instance segmentation of an image or of a persisted map.
 
-    segment.sh -i <image> [-o <folder>] [-f json|ply] [--min-score <s>]
-    segment.sh -m <map-folder> [-o <folder>] [-f json|ply]
+    segment.sh -i <image> [-f json|ply] [-o <file>] [-d <folder>] [-p <attrs>] [--min-score <s>]
+    segment.sh -m <map-folder> [-f json|ply] [-o <file>] [-d <folder>] [-p <attrs>]
 
-stdout: the OpenLABEL scene (json, default) or the segment-coloured PLY. With ``-o`` the five
-artefacts are written (segmentation.json identical to the JSON payload); without it nothing is
-written. ``-m`` reads the map without modifying it and needs no inference server.
+The result — the OpenLABEL scene (json, default) or the object-coloured PLY — goes to stdout, or
+to ``-o <file>`` (stdout then stays empty). ``-d <folder>`` also writes the five artefacts:
+``segmentation.json`` and ``segments.ply`` are byte-identical to what ``-f json`` and ``-f ply``
+output for the same run. Without ``-o`` and ``-d`` no file is written. ``-p`` shapes the PLY
+(``color`` is fixed to ``segment``) and needs ``-f ply`` or ``-d``; it never changes objects, ids
+or colours. ``-m`` runs no inference, needs no inference server and never modifies the map.
 """
 
 from __future__ import annotations
 
+import argparse
 import time
 from pathlib import Path
 
-from oh_my_slam.cli.common import ArgumentParser, run_main
+from oh_my_slam.cli.common import (
+    ArgumentParser,
+    add_result_options,
+    attrs_help,
+    cloud_attrs_arg,
+    run_main,
+)
 from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope
 from oh_my_slam.core.errors import InputError, UsageError
@@ -41,15 +51,22 @@ def build_parser() -> ArgumentParser:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("-i", dest="image", type=Path, help="input RGB image")
     src.add_argument("-m", dest="map", type=Path, help="existing map folder (read-only)")
-    ap.add_argument("-o", dest="out", type=Path, help="write the five artefacts here")
     ap.add_argument("-f", dest="format", choices=("json", "ply"), default="json",
-                    help="stdout format (default: json)")
+                    help="output format (default: json)")
+    add_result_options(ap, attrs_help(
+        CloudScope.IMAGE | CloudScope.SEGMENT,
+        "shapes the -f ply output and segments.ply, so it needs -f ply or -d; with -m the "
+        "pixel-level keys (stride, min-depth, max-depth, edge) are refused"))
+    ap.add_argument("-d", dest="artifacts", type=Path, metavar="FOLDER",
+                    help="also write segmentation.json, segmented.png, catalog.csv, catalog.md "
+                         "and segments.ply into FOLDER")
     ap.add_argument("--min-score", dest="min_score", default=None,
                     help="drop detections below this score (default 0.5; -i only)")
     return ap
 
 
-def _segment_image(args: object) -> tuple[bytes, bytes]:
+def _segment_image(args: argparse.Namespace, attrs: CloudAttrs, min_score: float
+                   ) -> tuple[bytes, bytes | None]:
     from oh_my_slam.client.client import connect
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.artifacts import write_artifacts
@@ -57,10 +74,9 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
     from oh_my_slam.segmentation.render import segmented_image
     from oh_my_slam.segmentation.scene import single_image_scene
 
-    image: Path = args.image  # type: ignore[attr-defined]
+    image: Path = args.image
     if not image.is_file():
         raise InputError(f"image not found: {image}")
-    min_score = 0.5 if args.min_score is None else _score(args.min_score)  # type: ignore[attr-defined]
     stage = timing.stage
     with stage("connect"):
         client = connect()
@@ -70,44 +86,52 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
         seg = segment_frame(frame, client=client, detections=dets)
     with stage("export"):
         scene = json_payload_bytes(single_image_scene(seg, tool="segment"))
-        ply = cloud_ply(image_cloud_source(frame, seg),
-                        CloudAttrs.defaults(CloudScope.IMAGE | CloudScope.SEGMENT))
-    if args.out is not None:  # type: ignore[attr-defined]
+        ply = cloud_ply(image_cloud_source(frame, seg), attrs) \
+            if args.format == "ply" or args.artifacts is not None else None
+    if args.artifacts is not None:
+        assert ply is not None
         with stage("artifacts"):
-            write_artifacts(args.out, scene, segmented_image(frame.rgb, seg.label_map),  # type: ignore[attr-defined]
+            write_artifacts(args.artifacts, scene, segmented_image(frame.rgb, seg.label_map),
                             seg.objects, ply, title=f"Objects in {image.name}")
     timing.count(objects=len(seg.objects), detections=len(dets))
     log.info("%d objects", len(seg.objects))
     return scene, ply
 
 
-def _segment_map(args: object) -> tuple[bytes, bytes]:
-    if args.min_score is not None:  # type: ignore[attr-defined]
-        raise UsageError("-m exports the map's persistent objects; --min-score applies to -i only")
-    from oh_my_slam.mapping.export import map_segment_outputs
-
-    scene, ply = map_segment_outputs(
-        args.map, args.out, CloudAttrs.defaults(CloudScope.MAP | CloudScope.SEGMENT))  # type: ignore[attr-defined]
+def _result(fmt: str, scene: bytes, ply: bytes | None) -> bytes:
+    if fmt == "json":
+        return scene
     assert ply is not None
-    return scene, ply
+    return ply
 
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    out = claim_stdout()
+    on_map = args.map is not None
+    if on_map and args.min_score is not None:
+        raise UsageError("-m exports the map's persistent objects; --min-score applies to -i only")
+    min_score = 0.5 if args.min_score is None else _score(args.min_score)
+    scope = (CloudScope.MAP if on_map else CloudScope.IMAGE) | CloudScope.SEGMENT
+    attrs = cloud_attrs_arg(args.attrs, scope,
+                            writes_ply=args.format == "ply" or args.artifacts is not None,
+                            requires="shape the PLY output: use -f ply or -d <folder>")
+    out = claim_stdout(args.output)
     t0 = time.perf_counter()
-    if args.map is not None:
-        scene, ply = _segment_map(args)
-        out.write_bytes(ply if args.format == "ply" else scene)
+    if on_map:
+        from oh_my_slam.mapping.export import map_segment_outputs
+
+        scene, ply = map_segment_outputs(args.map, args.artifacts, attrs,
+                                         want_ply=args.format == "ply")
+        out.write_bytes(_result(args.format, scene, ply))
         log.info("done in %.2f s", time.perf_counter() - t0)
         return 0
     with timing.collect() as tm:
-        scene, ply = _segment_image(args)
+        scene, ply = _segment_image(args, attrs, min_score)
         with timing.stage("write"):
-            out.write_bytes(ply if args.format == "ply" else scene)
+            out.write_bytes(_result(args.format, scene, ply))
     log.info("done in %.2f s", time.perf_counter() - t0)
     timing.report(tm, log, command="segment.sh -i", format=args.format, image=str(args.image),
-                  artifacts=args.out is not None)
+                  artifacts=args.artifacts is not None)
     return 0
 
 

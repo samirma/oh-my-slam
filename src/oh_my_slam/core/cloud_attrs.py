@@ -7,8 +7,8 @@ raised before any inference runs.
 
 Scopes: ``IMAGE`` (a single image: every key) or ``MAP`` (a persisted map: the pixel-level keys
 ``stride``, ``min-depth``, ``max-depth`` and ``edge`` apply before unprojection and are refused),
-optionally combined with ``SEGMENT`` (``segment.sh``: ``color`` defaults to ``segment`` and any other
-value is refused).
+optionally combined with ``SEGMENT`` (``segment.sh``: ``color`` defaults to ``segment`` and any
+other value is refused).
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class CloudAttrs:
         return ",".join(f"{k}={v}" for k, v in self.items(scope))
 
 
-# --- the attribute table ---------------------------------------------------------------------------
+# --- the attribute table --------------------------------------------------------------------------
 
 
 def _choice(options: tuple[str, ...]) -> Callable[[str], str]:
@@ -111,7 +111,8 @@ def _num(x: Any) -> str:
 class AttrSpec:
     key: str  # as written in -p
     field: str  # CloudAttrs field
-    values: str  # accepted values, for help and errors
+    metavar: str  # compact value syntax for help texts
+    values: str  # accepted values, for errors
     effect: str  # one line for help texts and UI tooltips
     pixel_level: bool  # applies before unprojection, so single images only
     parse: Callable[[str], Any]  # raises ValueError on a bad value
@@ -119,25 +120,27 @@ class AttrSpec:
 
 
 ATTRIBUTES: tuple[AttrSpec, ...] = (
-    AttrSpec("color", "color", "rgb|segment|height|none",
+    AttrSpec("color", "color", "rgb|segment|height|none", "rgb|segment|height|none",
              "per-point colour: image colour, object colour, height ramp, or no colour",
              False, _choice(COLOR_MODES), str),
-    AttrSpec("stride", "stride", "an integer >= 1", "keep every n-th pixel along each image axis",
-             True, _stride, str),
-    AttrSpec("min-depth", "min_depth", "metres >= 0", "drop pixels closer than this depth",
-             True, _metres(0.0), _num),
-    AttrSpec("max-depth", "max_depth", "metres > 0 (or inf)", "drop pixels farther than this depth",
-             True, _metres(0.0, allow_inf=True, strict=True), _num),
-    AttrSpec("edge", "edge", "a relative depth jump >= 0",
+    AttrSpec("stride", "stride", "N", "an integer >= 1",
+             "keep every n-th pixel along each image axis", True, _stride, str),
+    AttrSpec("min-depth", "min_depth", "METRES", "metres >= 0",
+             "drop pixels closer than this depth", True, _metres(0.0), _num),
+    AttrSpec("max-depth", "max_depth", "METRES|inf", "metres > 0 (or inf)",
+             "drop pixels farther than this depth", True,
+             _metres(0.0, allow_inf=True, strict=True), _num),
+    AttrSpec("edge", "edge", "JUMP", "a relative depth jump >= 0",
              "drop flying pixels on depth discontinuities (0 disables)", True, _metres(0.0), _num),
-    AttrSpec("voxel", "voxel", "metres >= 0",
+    AttrSpec("voxel", "voxel", "METRES", "metres >= 0",
              "keep one point per voxel of this size (0 = off; colours are not averaged)",
              False, _metres(0.0), _num),
-    AttrSpec("normals", "normals", "on|off", "add nx ny nz float properties", False, _on_off,
-             lambda b: "on" if b else "off"),
-    AttrSpec("label", "label", "on|off", "add an int label property (object id, 0 = unsegmented)",
+    AttrSpec("normals", "normals", "on|off", "on|off", "add nx ny nz float properties",
              False, _on_off, lambda b: "on" if b else "off"),
-    AttrSpec("encoding", "encoding", "binary|ascii",
+    AttrSpec("label", "label", "on|off", "on|off",
+             "add an int label property (object id, 0 = unsegmented)",
+             False, _on_off, lambda b: "on" if b else "off"),
+    AttrSpec("encoding", "encoding", "binary|ascii", "binary|ascii",
              "binary_little_endian 1.0 or ASCII PLY", False, _choice(ENCODINGS), str),
 )
 _BY_KEY = {a.key: a for a in ATTRIBUTES}
@@ -155,9 +158,10 @@ def help_text(scope: CloudScope) -> str:
     parts = []
     for a in applicable(scope):
         values = "segment (fixed)" if a.key == "color" and CloudScope.SEGMENT in scope \
-            else a.values.replace(" ", "")
+            else a.metavar
         parts.append(f"{a.key}={values} [{a.format(getattr(d, a.field))}]")
-    return "point-cloud attributes key=value[,key=value...]: " + ", ".join(parts)
+    return "point-cloud attributes key=value[,key=value...], defaults in brackets: " \
+        + ", ".join(parts)
 
 
 # --- parsing and validation ---------------------------------------------------------------------

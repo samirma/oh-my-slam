@@ -47,7 +47,7 @@ class ImageCloudSource:
     valid: NDArray[np.bool_]  # (H, W) model validity
     rgb: NDArray[np.uint8]  # (H, W, 3) the image resized to the grid
     K: Intrinsics  # intrinsics of the grid
-    labels: NDArray[np.int32] | None = None  # (H, W) object id per pixel, 0 = none; None = not segmented
+    labels: NDArray[np.int32] | None = None  # (H, W) object id per pixel (0 = none), if segmented
     up: NDArray[np.float64] | None = None  # unit up direction (camera frame); None = not estimated
 
     @cached_property

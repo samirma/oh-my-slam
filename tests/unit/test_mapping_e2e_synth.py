@@ -12,13 +12,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from oh_my_slam.core.cloud_attrs import CloudScope, parse_cloud_attrs
 from oh_my_slam.core.errors import MapLockedError, NotAMapError, RegistrationError
 from oh_my_slam.core.geometry import rot_z
-from oh_my_slam.core.ply import parse_ply
+from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.api import update
 from oh_my_slam.schema.validate import validation_errors
-from oh_my_slam.segmentation.colors import color_hex_for_id
+from oh_my_slam.segmentation.colors import color_hex_for_id, hex_to_rgb
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
 from tests.fakes.client import FakeClient
 from tests.synth.mapping import add_frames, mapping_room, ring
@@ -152,11 +153,28 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     single_ids = {int(k) for k in doc_b["openlabel"]["objects"]}
     assert single_ids <= {o["id"] for v in by_b.values() for o in v}
 
-    # --- update C: removed / moved / added ----------------------------------------------------
-    res_c = update(mdir, [base / "c"], mode="full", fmt="ply", client=client, progress=quiet)
-    parse_ply(res_c.payload)
+    # --- update C: removed / moved / added (PLY payload with point-cloud attributes) ------------
+    attrs = parse_cloud_attrs("color=segment,label=on,normals=on,voxel=0.03", CloudScope.MAP)
+    res_c = update(mdir, [base / "c"], mode="full", fmt="ply", attrs=attrs, client=client,
+                   progress=quiet)
+    cloud_c = parse_ply(res_c.payload)
+    assert parse_header(res_c.payload).comments[-1] == \
+        f"attributes {attrs.describe(CloudScope.MAP)}"
     full_c = json.loads((mdir / "scene.json").read_text())
     by_c = objects_by_label(full_c)
+    # colour contract on the map cloud: every labelled point has its object's colour, the others
+    # are grey, and only objects of the scene appear; normals are unit vectors
+    assert cloud_c.label is not None and cloud_c.rgb is not None and cloud_c.normals is not None
+    scene_ids = {int(k) for k in full_c["openlabel"]["objects"]}
+    assert set(np.unique(cloud_c.label)) - {0} <= scene_ids and (cloud_c.label > 0).any()
+    for oid in set(np.unique(cloud_c.label)) - {0}:
+        np.testing.assert_array_equal(np.unique(cloud_c.rgb[cloud_c.label == oid], axis=0),
+                                      [hex_to_rgb(color_hex_for_id(int(oid)))])
+    np.testing.assert_array_equal(np.unique(cloud_c.rgb[cloud_c.label == 0], axis=0),
+                                  [(128, 128, 128)])
+    np.testing.assert_allclose(np.linalg.norm(cloud_c.normals, axis=1), 1.0, atol=1e-4)
+    keys = np.floor(cloud_c.xyz.astype(np.float64) / 0.03).astype(np.int64)
+    assert len(np.unique(keys, axis=0)) == len(cloud_c)  # one point per voxel
     all_ids = [o["id"] for v in by_c.values() for o in v]
     assert "box" not in by_c  # removed box gone
     assert ids_a["sofa"] in [o["id"] for o in by_c["sofa"]]  # unchanged object kept

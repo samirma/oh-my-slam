@@ -65,7 +65,7 @@ def full_scene(root: Path, meta: dict[str, Any], records: list[store.FrameRecord
 
 
 def payload_objects(objs: ObjectState, mode: str) -> list[SceneObject]:
-    """The objects a ``-t full`` (all) or ``-t single`` (observed by the new input) payload covers."""
+    """Objects a ``-t full`` (all) or ``-t single`` (observed by the new input) payload covers."""
     exported = objs.exported()
     return exported if mode == "full" else [o for o in exported if o.id in objs.observed]
 

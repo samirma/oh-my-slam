@@ -70,7 +70,7 @@ def frame_cloud(
     return PointCloud(pts.astype(np.float32), colors), idx
 
 
-# --- normals ---------------------------------------------------------------------------------------
+# --- normals --------------------------------------------------------------------------------------
 
 
 def _tangent(P: NDArray[np.float64], z: NDArray[np.float64], axis: int) -> NDArray[np.float64]:
