@@ -44,7 +44,8 @@ class FusionStats:
 
 
 class TsdfFusion:
-    def __init__(self, voxel_size: float, depth_max: float, block_count: int = 40000) -> None:
+    def __init__(self, voxel_size: float, depth_max: float, block_count: int = 40000,
+                 trunc_voxels: float = TRUNC_VOXELS, with_color: bool = True) -> None:
         import open3d as o3d
         import open3d.core as o3c
 
@@ -52,12 +53,15 @@ class TsdfFusion:
         self._o3c = o3c
         self.voxel_size = voxel_size
         self.depth_max = depth_max
-        self.trunc = TRUNC_VOXELS * voxel_size
+        self.trunc_voxels = float(trunc_voxels)
+        self.trunc = self.trunc_voxels * voxel_size
+        self.with_color = with_color
         self.device = o3c.Device("CPU:0")
+        n_attr = 3 if with_color else 2
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
-            attr_names=("tsdf", "weight", "color"),
-            attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
-            attr_channels=((1), (1), (3)),
+            attr_names=("tsdf", "weight", "color")[:n_attr],
+            attr_dtypes=(o3c.float32, o3c.float32, o3c.float32)[:n_attr],
+            attr_channels=((1), (1), (3))[:n_attr],
             voxel_size=voxel_size,
             block_resolution=8,
             block_count=block_count,
@@ -78,17 +82,23 @@ class TsdfFusion:
         if not (d > 0).any():
             return
         depth_img = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(d)))
-        color_img = o3d.t.geometry.Image(
-            o3c.Tensor(np.ascontiguousarray(c.astype(np.float32) / 255.0))
-        )
         intr = o3c.Tensor(Kd, dtype=o3c.float64)
         extr = o3c.Tensor(T_world_cam.inverse().matrix(), dtype=o3c.float64)
         coords = self.vbg.compute_unique_block_coordinates(
             depth_img, intr, extr, depth_scale=1.0, depth_max=self.depth_max,
-            trunc_voxel_multiplier=TRUNC_VOXELS,
+            trunc_voxel_multiplier=self.trunc_voxels,
         )
-        self.vbg.integrate(coords, depth_img, color_img, intr, intr, extr, depth_scale=1.0,
-                           depth_max=self.depth_max, trunc_voxel_multiplier=TRUNC_VOXELS)
+        if self.with_color:
+            color_img = o3d.t.geometry.Image(
+                o3c.Tensor(np.ascontiguousarray(c.astype(np.float32) / 255.0))
+            )
+            self.vbg.integrate(coords, depth_img, color_img, intr, intr, extr, depth_scale=1.0,
+                               depth_max=self.depth_max,
+                               trunc_voxel_multiplier=self.trunc_voxels)
+        else:
+            self.vbg.integrate(coords, depth_img, intr, extr, depth_scale=1.0,
+                               depth_max=self.depth_max,
+                               trunc_voxel_multiplier=self.trunc_voxels)
         self.stats.frames += 1
         self.stats.seconds += time.perf_counter() - t0
 
@@ -98,7 +108,15 @@ class TsdfFusion:
         return mesh.to_legacy()
 
     def extract_points(self, weight_threshold: float = 1.0) -> tuple[NDArray[Any], NDArray[Any]]:
-        pcd = self.vbg.extract_point_cloud(weight_threshold=weight_threshold)
+        empty = np.zeros((0, 3)), np.zeros((0, 3))
+        if self.vbg.hashmap().size() == 0:
+            return empty
+        try:
+            pcd = self.vbg.extract_point_cloud(weight_threshold=weight_threshold)
+        except RuntimeError as e:  # Open3D raises instead of returning no surface points
+            if "shape {0}" in str(e):
+                return empty
+            raise
         pts = pcd.point.positions.numpy() if "positions" in pcd.point else np.zeros((0, 3))
         cols = pcd.point.colors.numpy() if "colors" in pcd.point else np.zeros((0, 3))
         return pts, cols

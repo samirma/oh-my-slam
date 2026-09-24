@@ -102,6 +102,7 @@ uv run pytest -m browser                                              # Edge/Chr
 uv run python -m oh_my_slam.tools.perf latency photo.jpg              # AC22 timings (one at a time)
 uv run python -m oh_my_slam.tools.validate_inputs --inputs ~/robot_view   # user-input validation
 uv run python -m oh_my_slam.tools.perf_report measure|renders|shots|write --out DIR  # R44 report
+uv run python -m oh_my_slam.tools.cloud_quality --map maps/NAME     # cloud layering / accuracy metrics
 ```
 
 Useful environment variables: `OH_MY_SLAM_DEVICE=cpu`, `OH_MY_SLAM_FEATURES=aliked`,

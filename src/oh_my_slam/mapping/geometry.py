@@ -1,5 +1,5 @@
-"""Map geometry for an update: the coloured cloud (latest colour wins, object id per point) and
-the textured mesh (TSDF fusion of the valid, aligned depth maps, oldest first) — built with the
+"""Map geometry for an update: the coloured cloud (TSDF-fused surface; latest colour wins, object
+id per point) and the textured mesh (TSDF fusion of the valid, aligned depth maps, oldest first) — built with the
 reconstruction package's fusion/mesh/texture code."""
 
 from __future__ import annotations
@@ -12,17 +12,22 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import timing
-from oh_my_slam.core.geometry import voxel_downsample_indices
+from oh_my_slam.core.geometry import project
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_valid
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.mesh import clean_mesh
-from oh_my_slam.reconstruction.pointcloud import cloud_mask, frame_cloud
+from oh_my_slam.reconstruction.pointcloud import cloud_mask
 from oh_my_slam.reconstruction.texture import TextureView, texture_mesh
 
-CLOUD_STRIDE = 2
+# Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
+# centimetres still average into one surface), attributed from the latest frame that sees it.
+CLOUD_TRUNC_VOXELS = 8.0
+CLOUD_MIN_VIEWS = 3  # a surface voxel must be seen by this many frames (fewer in tiny maps)
+VIS_TOL_MIN = 0.02
+VIS_TOL_REL = 0.03
 MIN_TEXTURE_VALID = 0.7
 MAX_TEXTURE_VIEWS = 300
 MESH_MAX_FACES = 200_000
@@ -70,22 +75,56 @@ def _frame_data(ctx: Any, rec: store.FrameRecord, objs: ObjectState,
     return FrameData(rec, depth, valid, rgb, labels, image_path, nf is not None)
 
 
-def frames_cloud(frames: list[FrameData], voxel: float) -> PointCloud:
-    """All frames' valid points (oldest first), voxel-downsampled keeping the latest point."""
-    parts = []
+def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
+                       ) -> NDArray[np.float64]:
+    """Surface points of a fine TSDF of all frames' valid, edge-free depth.
+
+    Each keyframe's monocular depth disagrees with its neighbours by a few percent even after
+    alignment, so back-projecting every frame leaves one offset copy of each surface per view;
+    the TSDF averages them into a single surface. Speckle seen by one view only is dropped once
+    enough frames are fused.
+    """
+    fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS, with_color=False)
     for fd in frames:
         m = cloud_mask(fd.depth, fd.valid)
-        sub = np.zeros_like(m)
-        sub[::CLOUD_STRIDE, ::CLOUD_STRIDE] = True
-        m &= sub
-        cloud, idx = frame_cloud(fd.depth, fd.rgb, fd.rec.K_grid, m, fd.rec.T_map_cam)
-        cloud.label = fd.labels.reshape(-1)[idx].astype(np.int32)
-        parts.append(cloud)
-    allc = PointCloud.concat(parts)
-    if len(allc) == 0:
-        return allc
-    keep = voxel_downsample_indices(allc.xyz, voxel, keep="last")
-    return allc.subset(keep)
+        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rgb, fd.rec.K_grid.K(), fd.rec.T_map_cam)
+    views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
+    pts, _ = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
+    return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+
+
+def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
+                     ) -> tuple[NDArray[np.uint8], NDArray[np.int32], NDArray[np.bool_]]:
+    """Colour and object id of each point from the latest frame that sees it (oldest → newest).
+
+    A frame sees a point when it projects onto a valid pixel whose depth agrees within
+    max(VIS_TOL_MIN, VIS_TOL_REL·z). Returns (rgb, label, seen by a new frame); unseen points
+    keep mid-grey and label 0.
+    """
+    n = len(xyz)
+    rgb = np.full((n, 3), 128, np.uint8)
+    label = np.zeros(n, np.int32)
+    seen_new = np.zeros(n, bool)
+    pts = np.asarray(xyz, dtype=np.float64)
+    for fd in frames:
+        cam = fd.rec.T_map_cam.inverse()
+        pc = pts @ cam.R.T + cam.t
+        uv, z = project(pc, fd.rec.K_grid.K())
+        h, w = fd.depth.shape
+        with np.errstate(invalid="ignore"):
+            u = np.floor(uv[:, 0] + 0.5)
+            v = np.floor(uv[:, 1] + 0.5)
+            idx = np.nonzero((z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h))[0]
+        uu = u[idx].astype(np.int64)
+        vv = v[idx].astype(np.int64)
+        dz = fd.depth[vv, uu]
+        vis = fd.valid[vv, uu] & (np.abs(z[idx] - dz) < np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z[idx]))
+        idx, uu, vv = idx[vis], uu[vis], vv[vis]
+        rgb[idx] = fd.rgb[vv, uu]
+        label[idx] = fd.labels[vv, uu]
+        if fd.is_new:
+            seen_new[idx] = True
+    return rgb, label, seen_new
 
 
 def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
@@ -101,9 +140,13 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
                   if (fd.valid & (fd.depth > 0)).any()]
         med = float(np.median(depths)) if depths else 2.0
         voxel = choose_voxel_size(med)
+        depth_max = float(np.clip(2.5 * med, 3.0, 30.0))
         cloud_voxel = max(0.005, voxel / 2)
-        cloud = frames_cloud(frames, cloud_voxel)
-        new_cloud = frames_cloud([fd for fd in frames if fd.is_new], cloud_voxel)
+        confident = [fd for fd in frames if not fd.rec.low_confidence]
+        xyz = fused_cloud_points(confident, cloud_voxel, depth_max)
+        rgb, label, seen_new = attribute_points(xyz, confident)
+        cloud = PointCloud(xyz, rgb, label)
+        new_cloud = cloud.subset(np.nonzero(seen_new)[0])
         assert cloud.label is not None
         tx.write_bytes(store.CLOUD_PLY, ply_bytes(PointCloud(cloud.xyz, cloud.rgb),
                                                   comment="oh-my-slam map cloud, metres, z up"))
@@ -112,7 +155,6 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
              f"{time.perf_counter() - t0:.0f} s")
     t1 = time.perf_counter()
     with timing.stage("fusion"):
-        depth_max = float(np.clip(2.5 * med, 3.0, 30.0))
         fusion = TsdfFusion(voxel, depth_max)
         for fd in frames:
             if fd.rec.low_confidence:

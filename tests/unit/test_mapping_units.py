@@ -351,3 +351,70 @@ def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path) -> None:
     res = subprocess.run([str(repo / "mapper.sh"), "update", "-a", "x.mp4", "-m",
                           str(tmp_path / "m")], capture_output=True, env=os.environ.copy())
     assert res.returncode == 2 and res.stdout == b""
+
+
+# --- map cloud: fused surface + latest-frame attribution ----------------------------------------
+
+
+def _cloud_frames(scales: list[float]) -> tuple[Room, list]:
+    from oh_my_slam.mapping.geometry import FrameData
+    from tests.synth.scene import default_room, orbit_poses
+
+    room = default_room()
+    K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
+    frames = []
+    for i, (pose, s) in enumerate(zip(orbit_poses(len(scales)), scales, strict=True)):
+        r = render(room, pose, K)
+        rec = store.FrameRecord(i, store.frame_name(i), "", "", None, 1, 320, 240, K, pose, 320, 240)
+        # labels: synthetic box k -> object id k + 1 (floor and walls unlabelled)
+        frames.append(FrameData(rec, (r.depth * s).astype(np.float32), r.depth > 0, r.rgb,
+                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32), None,
+                                i == len(scales) - 1))
+    return room, frames
+
+
+def _surface_distance(room: Room, xyz: np.ndarray) -> np.ndarray:
+    import open3d as o3d
+
+    scene = o3d.t.geometry.RaycastingScene()
+    for mesh, _, _ in room.meshes():
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    return scene.compute_distance(o3d.core.Tensor(xyz.astype(np.float32))).numpy()
+
+
+def test_fused_cloud_collapses_per_frame_depth_disagreement() -> None:
+    """Frames whose depth disagrees by ±3 % give one surface, not one offset copy per frame."""
+    from oh_my_slam.mapping.geometry import fused_cloud_points
+    from oh_my_slam.reconstruction.pointcloud import frame_cloud
+
+    scales = [1.03, 0.97, 1.02, 0.98, 1.03, 0.97, 1.01, 0.99, 1.03, 0.97, 1.02, 0.98]
+    room, frames = _cloud_frames(scales)
+    stacked = np.concatenate([frame_cloud(fd.depth, fd.rgb, fd.rec.K_grid, fd.valid,
+                                          fd.rec.T_map_cam)[0].xyz for fd in frames])
+    fused = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    assert len(fused) > 10_000
+    d_old = _surface_distance(room, stacked)
+    d_new = _surface_distance(room, fused)
+    # the stacked copies sit up to ±3 % (~6 cm at 2 m) off the surface; the fused one averages
+    assert np.percentile(d_new, 90) < 0.5 * np.percentile(d_old, 90)
+    assert np.median(d_new) < 0.015
+
+
+def test_attribute_points_latest_visible_frame_wins() -> None:
+    from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
+
+    room, frames = _cloud_frames([1.0] * 8)
+    xyz = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    rgb, label, seen_new = attribute_points(xyz, frames)
+    d = _surface_distance(room, xyz)
+    assert np.median(d) < 0.01
+    # object ids land on the boxes, and only on points near their surfaces
+    assert set(np.unique(label)) <= {0, 1, 2, 3} and (label > 0).mean() > 0.05
+    # the newest frame's colour wins where it sees a point; points it cannot see keep older ones
+    last = frames[-1]
+    cam = last.rec.T_map_cam.inverse()
+    pc = xyz @ cam.R.T + cam.t
+    assert seen_new.any() and not seen_new.all()
+    behind = pc[:, 2] <= 0
+    assert not seen_new[behind].any()
+    assert (rgb[~seen_new] != 128).any(axis=1).mean() > 0.9  # others were coloured by older frames
