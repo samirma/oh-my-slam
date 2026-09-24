@@ -32,41 +32,47 @@ OFF_PLANE = 0.015
 SEEDS = 6000
 
 
+MIN_OVERLAP_PX = 500
+
+
+def pair_agreement(reader: store.MapReader, ri: store.FrameRecord, rj: store.FrameRecord
+                   ) -> tuple[float, float] | None:
+    """Median and p90 of |z_i→j / z_j - 1| with keyframe ``ri``'s depth back-projected into
+    ``rj`` (visible surfaces only); None when they share fewer than ``MIN_OVERLAP_PX`` pixels."""
+    di, vi = reader.depth(ri), reader.valid(ri)
+    dj, vj = reader.depth(rj), reader.valid(rj)
+    v, u = np.nonzero(vi & (di > 0))
+    u, v = u[::7], v[::7]
+    Ki = ri.K_grid.K()
+    z = di[v, u].astype(np.float64)
+    pc = np.stack([(u - Ki[0, 2]) / Ki[0, 0] * z, (v - Ki[1, 2]) / Ki[1, 1] * z, z], 1)
+    T = rj.T_map_cam.inverse().compose(ri.T_map_cam)
+    uv, zq = project(pc @ T.R.T + T.t, rj.K_grid.K())
+    h, w = dj.shape
+    with np.errstate(invalid="ignore"):
+        uu, vv = np.floor(uv[:, 0] + 0.5), np.floor(uv[:, 1] + 0.5)
+        ok = (zq > 0.1) & (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
+    uu, vv, zq = uu[ok].astype(int), vv[ok].astype(int), zq[ok]
+    keep = vj[vv, uu] & (dj[vv, uu] > 0)
+    if keep.sum() < MIN_OVERLAP_PX:
+        return None
+    r = np.abs(zq[keep] / dj[vv[keep], uu[keep]] - 1)
+    r = r[r < 0.3]  # same visible surface only
+    return float(np.median(r)), float(np.percentile(r, 90))
+
+
 def frame_agreement(reader: store.MapReader, gaps: tuple[int, ...] = GAPS, step: int = 3
                     ) -> dict[str, Any]:
     frames = sorted(reader.frames, key=lambda r: r.index)
-    cache: dict[int, tuple[NDArray[Any], NDArray[Any]]] = {}
-
-    def data(i: int) -> tuple[NDArray[Any], NDArray[Any]]:
-        if i not in cache:
-            cache[i] = (reader.depth(frames[i]), reader.valid(frames[i]))
-        return cache[i]
-
     out: dict[str, Any] = {}
     for gap in gaps:
         med, p90 = [], []
         for i in range(0, len(frames) - gap, step):
-            (di, vi), (dj, vj) = data(i), data(i + gap)
-            ri, rj = frames[i], frames[i + gap]
-            v, u = np.nonzero(vi & (di > 0))
-            u, v = u[::7], v[::7]
-            Ki = ri.K_grid.K()
-            z = di[v, u].astype(np.float64)
-            pc = np.stack([(u - Ki[0, 2]) / Ki[0, 0] * z, (v - Ki[1, 2]) / Ki[1, 1] * z, z], 1)
-            T = rj.T_map_cam.inverse().compose(ri.T_map_cam)
-            uv, zq = project(pc @ T.R.T + T.t, rj.K_grid.K())
-            h, w = dj.shape
-            with np.errstate(invalid="ignore"):
-                uu, vv = np.floor(uv[:, 0] + 0.5), np.floor(uv[:, 1] + 0.5)
-                ok = (zq > 0.1) & (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
-            uu, vv, zq = uu[ok].astype(int), vv[ok].astype(int), zq[ok]
-            keep = vj[vv, uu] & (dj[vv, uu] > 0)
-            if keep.sum() < 500:
+            res = pair_agreement(reader, frames[i], frames[i + gap])
+            if res is None:
                 continue
-            r = np.abs(zq[keep] / dj[vv[keep], uu[keep]] - 1)
-            r = r[r < 0.3]  # same visible surface only
-            med.append(np.median(r))
-            p90.append(np.percentile(r, 90))
+            med.append(res[0])
+            p90.append(res[1])
         if med:
             out[str(gap)] = {"pairs": len(med), "median_pct": round(float(np.median(med)) * 100, 2),
                              "p90_pct": round(float(np.median(p90)) * 100, 2)}
