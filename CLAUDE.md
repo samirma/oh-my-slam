@@ -16,8 +16,16 @@ Commands:
   (coverage: add `--cov=oh_my_slam`). Real models: `OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models`
   with the server running. Browser: `uv run pytest -m browser` (Playwright, Edge channel).
 - Lint/types/ownership: `uv run ruff check . && uv run mypy src && uv run lint-imports`.
+- Benchmark evaluator (spec §5): `uv run python -m oh_my_slam.tools.evaluate [--out DIR]
+  [--targets PATH] [--baseline PATH] [--set-baseline] [--splits N]`. It needs the model weights
+  and restarts the server to time the cold start. It writes `result.json` + `summary.md` to
+  `~/oh-my-slam-data/evaluations/<UTC>/`. Targets are in `examples/targets.json`, the baseline
+  is `~/oh-my-slam-data/evaluations/baseline.json`, and ground truth goes in
+  `examples/ground_truth/`. It is a GPU benchmark: run it alone.
 - Per-stage timings of any `mapper.sh update` / `reconstruct.sh` / `segment.sh -i`: `timings:`
   line on stderr, JSON with `OH_MY_SLAM_TIMINGS=path`, and `map.json → updates[].timings`.
+- Mapping features default to SIFT. `OH_MY_SLAM_FEATURES=aliked` selects ALIKED/LightGlue
+  (Homebrew CLI only).
 
 Never import torch/open3d in the same process (duplicate libomp aborts): torch lives only in the
 server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segment.sh -m` are read-only.
@@ -26,23 +34,30 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
 
 - **Five entry points:** `start_inference_server.sh`, `reconstruct.sh`, `mapper.sh`, `segment.sh`, `view.sh`.
 - **Ownership:**
-  - `segment.sh` is the only owner of segmentation, OBB fitting and colour assignment.
-  - `mapper.sh` delegates depth/reconstruction to `reconstruct.sh`.
+  - Segmentation code (`oh_my_slam.segmentation`, behind `segment.sh`) is the only owner of
+    segmentation, OBB fitting, colour assignment and the derivation of every emitted point cloud.
+  - Mapping delegates depth/reconstruction to the reconstruction code (`oh_my_slam.reconstruction`,
+    behind `reconstruct.sh`).
   - `view.sh` owns only the web server and UI.
   - Shared logic lives in one common Python package. Taken literally at the shell level these rules
     form a cycle (`reconstruct -f json` needs objects, `segment` needs depth), so enforce ownership at
-    the Python-module level.
+    the Python-module level: import-linter contracts in `pyproject.toml` and
+    `tests/unit/test_ownership.py`. The shell scripts never call each other.
 - **Inference server:** every inference-requiring operation must fail with an actionable error when
-  the server is down. `view.sh -m` (viewing a persisted map) must work without it.
-- **stdout:** exactly one JSON document or one PLY, or nothing when `-o <file>` sends the
-  result to a file. Everything else goes to stderr.
+  the server is down (exit 3). `segment.sh -m` and `view.sh -m` (persisted maps) must work without it.
+- **stdout:** at most one JSON document or one PLY. It is empty when `-o <file>` sends the result
+  to a file (`reconstruct.sh`, `mapper.sh`, `segment.sh`), and `view.sh` never writes to stdout.
+  Everything else goes to stderr.
 - **Colour contract:** an object's colour is a pure function of its `id`. The same sRGB triple must
   appear in all of these:
   - `segmentation.json`
   - the `segmented.png` mask pixels, which rules out alpha blending
   - `catalog.csv` and `catalog.md`
-  - `segments.ply`, where unsegmented points are mid-grey
+  - `segments.ply` and any PLY or viewer cloud with `color=segment`; unsegmented points are
+    mid-grey `#808080`
   - the OBB colour rendered by `view.sh`
+- **Point-cloud attributes** (`-p`, spec §2.2) are defined once in `core/cloud_attrs.py`. They are
+  shared by every PLY writer and by the `view.sh` controls.
 - **Scene JSON is ASAM OpenLABEL 1.0.0** (verified online 2026-09-22):
   - The canonical schema URL is `https://openlabel.asam.net/V1-0-0/schema/openlabel_json_schema.json`.
     The `…-v1.0.0.json` variant returns 404.
