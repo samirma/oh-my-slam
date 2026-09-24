@@ -406,11 +406,12 @@ def _cloud_frames(scales: list[float]) -> tuple[Room, list]:
     frames = []
     for i, (pose, s) in enumerate(zip(orbit_poses(len(scales)), scales, strict=True)):
         r = render(room, pose, K)
-        rec = store.FrameRecord(i, store.frame_name(i), "", "", 1, 320, 240, K, pose, 320, 240)
+        last = i == len(scales) - 1  # the last frame is a later update's
+        rec = store.FrameRecord(i, store.frame_name(i), "", "", 1, 320, 240, K, pose, 320, 240,
+                                update_id=2 if last else 1)
         # labels: synthetic box k -> object id k + 1 (floor and walls unlabelled)
         frames.append(FrameData(rec, (r.depth * s).astype(np.float32), r.depth > 0, r.rgb,
-                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32),
-                                i == len(scales) - 1))
+                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32), last))
     return room, frames
 
 
@@ -441,7 +442,7 @@ def test_fused_cloud_collapses_per_frame_depth_disagreement() -> None:
     assert np.median(d_new) < 0.015
 
 
-def test_attribute_points_latest_visible_frame_wins() -> None:
+def test_attribute_points_latest_visible_update_wins() -> None:
     from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
 
     room, frames = _cloud_frames([1.0] * 8)
@@ -451,7 +452,7 @@ def test_attribute_points_latest_visible_frame_wins() -> None:
     assert np.median(d) < 0.01
     # object ids land on the boxes, and only on points near their surfaces
     assert set(np.unique(label)) <= {0, 1, 2, 3} and (label > 0).mean() > 0.05
-    # the newest frame's colour wins where it sees a point; points it cannot see keep older ones
+    # the newest update's colour wins where it sees a point; points it cannot see keep older ones
     last = frames[-1]
     cam = last.rec.T_map_cam.inverse()
     pc = xyz @ cam.R.T + cam.t
@@ -459,3 +460,46 @@ def test_attribute_points_latest_visible_frame_wins() -> None:
     behind = pc[:, 2] <= 0
     assert not seen_new[behind].any()
     assert (rgb[~seen_new] != 128).any(axis=1).mean() > 0.9  # others were coloured by older frames
+
+
+# --- SfM extension stays in the map frame -------------------------------------------------------
+
+
+class _PoseModel:
+    """Duck-typed SfmModel: named camera-to-world poses and a similarity transform."""
+
+    def __init__(self, poses: dict[str, Pose]) -> None:
+        self.poses = dict(poses)
+
+    @property
+    def registered(self) -> list[str]:
+        return sorted(self.poses)
+
+    def pose(self, name: str) -> Pose:
+        return self.poses[name]
+
+    def transform(self, s: float, R: np.ndarray, t: np.ndarray) -> None:
+        self.poses = {n: Pose(R @ T.R, s * R @ T.t + t) for n, T in self.poses.items()}
+
+
+def test_incremental_extension_is_brought_back_onto_the_map() -> None:
+    """COLMAP returns an extended model re-normalised by a similarity (fixed frames included):
+    it is mapped back so the fixed frames sit at their stored poses; a model whose fixed frames
+    did not stay rigid is rejected."""
+    from oh_my_slam.mapping.sfm import _back_onto
+
+    rng = np.random.default_rng(1)
+    stored = {f"f{i}": look_at(rng.uniform(-2, 2, 3) + [0, 0, 1.5], np.array([0.0, 0.0, 0.4]))
+              for i in range(5)}
+    new = {"n0": look_at(np.array([2.5, 0.3, 1.4]), np.array([0.0, 0.0, 0.4]))}
+    R = rotation_between([0, 0, 1], [0.2, 0.5, 0.8])
+    out = _PoseModel({**stored, **new})
+    out.transform(3.7, R, np.array([1.0, -2.0, 0.5]))  # COLMAP's normalisation
+    sim = mframe.similarity_by_poses([out.pose(n) for n in stored], list(stored.values()))
+    assert sim.s == pytest.approx(1 / 3.7)
+    back = _back_onto(out, _PoseModel(stored))  # type: ignore[arg-type]
+    assert back is not None
+    for n, T in {**stored, **new}.items():
+        np.testing.assert_allclose(back.pose(n).matrix(), T.matrix(), atol=1e-9)
+    moved = _PoseModel({**stored, "f0": Pose(stored["f0"].R, stored["f0"].t + [0.8, 0, 0])})
+    assert _back_onto(moved, _PoseModel(stored)) is None  # type: ignore[arg-type]

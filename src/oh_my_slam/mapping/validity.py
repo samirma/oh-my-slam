@@ -6,13 +6,16 @@ Two tests on a 4-px grid, both directions (design step 10):
 * free space — an old point projects into a new keyframe that sees clearly *behind* it;
 * occlusion of old free space — a new surface lies in front of what an old keyframe observed along
   the same ray (the old ray would carve the new surface).
-Margin τ(z) = max(0.15 m, 0.10 z). A cell is invalidated with 2 votes, or 1 vote beyond 1.5 τ.
-Depth-edge pixels never vote.
+Margin τ(z) = max(0.15 m, 0.10 z). The keyframes of one update are one observation of the scene, so
+a cell is invalidated only when that update as a whole contradicts it: votes from 2 of its
+keyframes, or 1 vote beyond 1.5 τ, and more of its keyframes contradicting the cell than
+re-observing it within τ. Depth-edge pixels never vote. Only a later update invalidates an earlier
+one's pixels; keyframes of the same update never invalidate each other.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -20,8 +23,9 @@ from numpy.typing import NDArray
 from scipy import ndimage
 
 from oh_my_slam.core.geometry import depth_edge_mask, project, unproject_pixels
-from oh_my_slam.core.images import load_png, png_bytes
+from oh_my_slam.core.images import png_bytes
 from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.mapping import store
 
 GRID = 4
 TAU_MIN = 0.15
@@ -44,17 +48,22 @@ class View:
     valid: NDArray[np.bool_]
     K: Intrinsics  # grid intrinsics
     T_map_cam: Pose
+    _usable: NDArray[np.bool_] | None = field(default=None, init=False, repr=False,
+                                              compare=False)
 
     def usable(self) -> NDArray[np.bool_]:
         """Valid pixels away from depth edges and the image border (monocular depth of objects
-        cut by the border is unreliable)."""
-        ok = self.valid & (self.depth > 0)
-        ok &= ~depth_edge_mask(np.where(ok, self.depth, 0.0))
-        h, w = ok.shape
-        mh, mw = max(1, int(BORDER * h)), max(1, int(BORDER * w))
-        ok[:mh] = ok[-mh:] = False
-        ok[:, :mw] = ok[:, -mw:] = False
-        return ok
+        cut by the border is unreliable). Computed once per view (depth and validity are not
+        modified after construction)."""
+        if self._usable is None:
+            ok = self.valid & (self.depth > 0)
+            ok &= ~depth_edge_mask(np.where(ok, self.depth, 0.0))
+            h, w = ok.shape
+            mh, mw = max(1, int(BORDER * h)), max(1, int(BORDER * w))
+            ok[:mh] = ok[-mh:] = False
+            ok[:, :mw] = ok[:, -mw:] = False
+            self._usable = ok
+        return self._usable
 
     def grid_points(self) -> tuple[NDArray[Any], NDArray[Any], NDArray[Any]]:
         """Map-frame points at the centres of GRID cells: (points, rows, cols) of cells."""
@@ -69,6 +78,13 @@ class View:
 
     def lookup(self, pts_map: NDArray[Any]) -> tuple[NDArray[Any], NDArray[Any], NDArray[Any]]:
         """Project map points: (inside mask, point z in this camera, observed depth there)."""
+        inside, z, d, _, _ = self.lookup_pixels(pts_map)
+        return inside, z, d
+
+    def lookup_pixels(self, pts_map: NDArray[Any]) -> tuple[NDArray[Any], NDArray[Any],
+                                                             NDArray[Any], NDArray[np.int64],
+                                                             NDArray[np.int64]]:
+        """``lookup`` plus the pixel (u, v) each point projects to (0 where not inside)."""
         pc = self.T_map_cam.inverse().apply(pts_map)
         uv, z = project(pc, self.K.K())
         h, w = self.depth.shape
@@ -77,13 +93,28 @@ class View:
             v = np.rint(uv[:, 1])
             inside = (z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
         d = np.zeros(len(pts_map))
-        ui, vi = u[inside].astype(int), v[inside].astype(int)
+        ui = np.zeros(len(pts_map), np.int64)
+        vi = np.zeros(len(pts_map), np.int64)
+        ui[inside], vi[inside] = u[inside], v[inside]
         use = self.usable()
-        ok = use[vi, ui]
-        d_in = np.where(ok, self.depth[vi, ui], 0.0)
-        d[inside] = d_in
+        ok = use[vi[inside], ui[inside]]
+        d[inside] = np.where(ok, self.depth[vi[inside], ui[inside]], 0.0)
         inside[np.flatnonzero(inside)[~ok]] = False
-        return inside, z, d
+        return inside, z, d, ui, vi
+
+
+def keyframe_view(nf: Any) -> View:
+    """View of a placed keyframe of this update (aligned depth, model validity)."""
+    return View(nf.depth, nf.frame.valid & (nf.depth > 0), nf.record.K_grid, nf.record.T_map_cam)
+
+
+def stored_view(path_of: Any, rec: store.FrameRecord) -> View | None:
+    """View of a stored keyframe with its current validity; None when it has no depth."""
+    if not path_of(store.frame_file(rec.name, "depth.npy")).exists():
+        return None
+    depth = store.load_depth(path_of, rec.name)
+    valid = store.load_valid(path_of, rec.name, depth)
+    return View(depth, valid & (depth > 0), rec.K_grid, rec.T_map_cam)
 
 
 MIN_OVERLAP = 200
@@ -105,47 +136,51 @@ def _normalised(d: NDArray[Any], z: NDArray[Any]) -> NDArray[Any] | None:
 
 
 def contradicted_cells(old: View, new_views: list[View]) -> NDArray[np.bool_]:
-    """Boolean GRID-cell mask of ``old`` contradicted by the new views (a cell needs votes from
-    two different new keyframes, or one vote beyond 1.5 τ)."""
+    """Boolean GRID-cell mask of ``old`` contradicted by the update whose keyframes are
+    ``new_views`` (their order does not matter): votes from two different keyframes, or one vote
+    beyond 1.5 τ, and more keyframes contradicting the cell than re-observing it within τ."""
     h, w = old.depth.shape
     gh, gw = (h + GRID - 1) // GRID, (w + GRID - 1) // GRID
     votes = np.zeros((gh, gw), np.int32)
+    support = np.zeros((gh, gw), np.int32)
     strong = np.zeros((gh, gw), bool)
     pts, rows, cols = old.grid_points()
     for nv in new_views:
         voted = np.zeros((gh, gw), bool)
+        agreed = np.zeros((gh, gw), bool)
         # (1) old point now in free space in front of a new surface
         if len(pts):
             inside, z, d = nv.lookup(pts)
-            dn = _normalised(d[inside], z[inside])
-            if dn is not None:
-                zi = z[inside]
-                diff = dn - zi
-                t = tau(zi)
-                ri, ci = rows[inside], cols[inside]
-                hit = diff > t
-                voted[ri[hit], ci[hit]] = True
-                s = diff > STRONG * t
-                strong[ri[s], ci[s]] = True
+            _vote(d[inside], z[inside], rows[inside], cols[inside], voted, agreed, strong)
         # (2) new surface in front of what the old keyframe observed
         q, _, _ = nv.grid_points()
         if len(q):
             inside, z, d = old.lookup(q)
-            dn = _normalised(d[inside], z[inside])
-            if dn is not None:
-                zi = z[inside]
-                diff = dn - zi
-                t = tau(zi)
-                pc = old.T_map_cam.inverse().apply(q[inside])
-                uv, _ = project(pc, old.K.K())
-                r = np.clip(np.rint(uv[:, 1]).astype(int) // GRID, 0, gh - 1)
-                c = np.clip(np.rint(uv[:, 0]).astype(int) // GRID, 0, gw - 1)
-                hit = diff > t
-                voted[r[hit], c[hit]] = True
-                s = diff > STRONG * t
-                strong[r[s], c[s]] = True
+            pc = old.T_map_cam.inverse().apply(q[inside])
+            uv, _ = project(pc, old.K.K())
+            r = np.clip(np.rint(uv[:, 1]).astype(int) // GRID, 0, gh - 1)
+            c = np.clip(np.rint(uv[:, 0]).astype(int) // GRID, 0, gw - 1)
+            _vote(d[inside], z[inside], r, c, voted, agreed, strong)
         votes += voted
-    return (votes >= 2) | strong
+        support += agreed & ~voted
+    return ((votes >= 2) | strong) & (votes > support)
+
+
+def _vote(d: NDArray[Any], z: NDArray[Any], r: NDArray[Any], c: NDArray[Any],
+          voted: NDArray[np.bool_], agreed: NDArray[np.bool_], strong: NDArray[np.bool_]) -> None:
+    """One keyframe's verdicts on the cells (r, c): observed depth ``d`` (normalised by the
+    overlap's median ratio) clearly behind the predicted ``z`` contradicts, within τ agrees."""
+    dn = _normalised(d, z)
+    if dn is None:
+        return
+    diff = dn - z
+    t = tau(z)
+    hit = diff > t
+    voted[r[hit], c[hit]] = True
+    s = diff > STRONG * t
+    strong[r[s], c[s]] = True
+    ok = np.abs(diff) <= t
+    agreed[r[ok], c[ok]] = True
 
 
 def cells_to_pixels(cells: NDArray[Any], shape: tuple[int, int]) -> NDArray[np.bool_]:
@@ -167,25 +202,20 @@ def apply_latest_wins(ctx: Any, records: list[Any], progress: Any) -> None:
     if not new or not ctx.old_frames:
         return
     tx = ctx.tx
-    new_views = [View(nf.depth, nf.frame.valid & (nf.depth > 0), nf.record.K_grid,
-                      nf.record.T_map_cam) for nf in new]
+    new_views = [keyframe_view(nf) for nf in new]
     changed, pixels = 0, 0
     for rec in ctx.old_frames:
-        d = f"per_frame/{rec.name}"
-        dp = tx.current(f"{d}/depth.npy")
-        if not dp.exists():
+        old = stored_view(tx.current, rec)
+        if old is None:
             continue
-        depth = np.load(dp).astype(np.float32)
-        vp = tx.current(f"{d}/valid.png")
-        valid = (load_png(vp) > 0) if vp.exists() else depth > 0
-        old = View(depth, valid, rec.K_grid, rec.T_map_cam)
         cells = contradicted_cells(old, new_views)
         if not cells.any():
             continue
-        kill = cells_to_pixels(cells, depth.shape) & valid
+        kill = cells_to_pixels(cells, old.depth.shape) & old.valid
         if not kill.any():
             continue
-        tx.write_bytes(f"{d}/valid.png", png_bytes((valid & ~kill).astype(np.uint8) * 255))
+        tx.write_bytes(store.frame_file(rec.name, "valid.png"),
+                       png_bytes((old.valid & ~kill).astype(np.uint8) * 255))
         changed += 1
         pixels += int(kill.sum())
     ctx.notes["latest_wins"] = {"frames_changed": changed, "pixels_invalidated": pixels}

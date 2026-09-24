@@ -220,3 +220,23 @@ def test_non_overlapping_update_is_rejected(world, tmp_path: Path) -> None:  # t
     with pytest.raises(RegistrationError):
         update(mdir, imgs, client=client, progress=quiet)
     assert store.full_tree_hash(mdir) == before
+
+
+def test_one_update_and_split_updates_agree(world, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """§5 stability: the same 14 frames mapped in one update and in two (7 + 7) give the same
+    objects, labels, ids and colours, and boxes within the tolerance that two SfM runs of the
+    same frames (7 of which fix the metric scale in the split case) allow."""
+    client = world["client"]
+    imgs = sorted((world["base"] / "a").iterdir())
+    one = json.loads(update(tmp_path / "one", imgs, client=client, progress=quiet).payload)
+    update(tmp_path / "two", imgs[:7], client=client, progress=quiet)
+    two = json.loads(update(tmp_path / "two", imgs[7:], client=client, progress=quiet).payload)
+    a, b = objects_by_label(one), objects_by_label(two)
+    assert sorted(a) == sorted(b) == ["box", "cabinet", "sofa"], (a.keys(), b.keys())
+    for label in a:
+        (oa,), (ob,) = a[label], b[label]
+        assert oa["id"] == ob["id"], label
+        assert oa["object_data"]["text"] == ob["object_data"]["text"]  # colour
+        iou = obb_iou_upright(cuboid_obb(oa), cuboid_obb(ob))
+        centre = np.linalg.norm(cuboid_obb(oa).center - cuboid_obb(ob).center)
+        assert iou > 0.5 and centre < 0.15, (label, iou, centre)

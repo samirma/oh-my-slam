@@ -1,9 +1,10 @@
 """Map geometry for an update: the coloured cloud (surface of a TSDF fusion of the valid, aligned
-depth maps; latest colour wins, object id per point), built with the reconstruction package's
-fusion code."""
+depth maps; colour and object id per point from the latest update that sees it), built with the
+reconstruction package's fusion code."""
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -16,17 +17,19 @@ from oh_my_slam.core.geometry import project
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_valid
+from oh_my_slam.mapping.objects import ObjectState, label_map_for
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.pointcloud import pixel_mask
-from oh_my_slam.segmentation.colors import UNSEGMENTED
+from oh_my_slam.segmentation.api import UNSEGMENTED
 
 # Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
-# centimetres still average into one surface), attributed from the latest frame that sees it.
+# centimetres still average into one surface), attributed from the latest update that sees it.
 CLOUD_TRUNC_VOXELS = 8.0
 CLOUD_MIN_VIEWS = 3  # a surface voxel must be seen by this many frames (fewer in tiny maps)
 VIS_TOL_MIN = 0.02
 VIS_TOL_REL = 0.03
+LABEL_SHARE_DIVISOR = 3  # an object id needs the votes of >= 1/3 of the views that see a point
+ATTRIBUTE_CHUNK = 1_000_000  # points attributed at a time (bounds the vote's memory)
 
 
 @dataclass
@@ -49,18 +52,15 @@ class MapGeometry:
 def _frame_data(ctx: Any, rec: store.FrameRecord, objs: ObjectState,
                 new_by_name: dict[str, Any]) -> FrameData:
     tx = ctx.tx
-    d = f"per_frame/{rec.name}"
     nf = new_by_name.get(rec.name)
     if nf is not None and nf.depth is not None:
         depth = nf.depth
         rgb = nf.frame.rgb
     else:
-        depth = np.load(tx.current(f"{d}/depth.npy")).astype(np.float32)
+        depth = store.load_depth(tx.current, rec.name)
         rgb = load_rgb(tx.current(rec.image), max_side=max(rec.grid_width, rec.grid_height))
-    valid = load_valid(tx.current(f"{d}/valid.png"), depth)
-    inst_p = tx.current(f"{d}/instances.json")
-    import json
-
+    valid = store.load_valid(tx.current, rec.name, depth)
+    inst_p = tx.current(store.frame_file(rec.name, "instances.json"))
     insts = json.loads(inst_p.read_text()).get("instances", []) if inst_p.exists() else []
     labels = label_map_for(insts, depth.shape, objs)
     return FrameData(rec, depth, valid, rgb, labels, nf is not None)
@@ -73,48 +73,113 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
     Each keyframe's monocular depth disagrees with its neighbours by a few percent even after
     alignment, so back-projecting every frame leaves one offset copy of each surface per view;
     the TSDF averages them into a single surface. Speckle seen by one view only is dropped once
-    enough frames are fused.
+    enough frames are fused. Frames are fused in ``FrameRecord.order_key`` order and the points
+    are returned sorted, so the cloud does not depend on the keyframes' order within an update.
     """
     fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS)
-    for fd in frames:
+    for fd in sorted(frames, key=lambda fd: fd.rec.order_key):
         m = pixel_mask(fd.depth, fd.valid)
         fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam)
     views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
     pts = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
-    return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    # Open3D's parallel hash map returns the points in no fixed order
+    return pts[np.lexsort((pts[:, 2], pts[:, 1], pts[:, 0]))]
+
+
+def _visible(fd: FrameData, pts: NDArray[np.float64]
+             ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64],
+                        NDArray[np.float64]]:
+    """(point indices, pixel rows, pixel cols, footprint in m/px) of the points ``fd`` sees: they
+    project onto a valid pixel whose depth agrees within max(VIS_TOL_MIN, VIS_TOL_REL·z)."""
+    cam = fd.rec.T_map_cam.inverse()
+    pc = pts @ cam.R.T + cam.t
+    K = fd.rec.K_grid
+    uv, z = project(pc, K.K())
+    h, w = fd.depth.shape
+    with np.errstate(invalid="ignore"):
+        u = np.floor(uv[:, 0] + 0.5)
+        v = np.floor(uv[:, 1] + 0.5)
+        idx = np.nonzero((z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h))[0]
+    uu = u[idx].astype(np.int64)
+    vv = v[idx].astype(np.int64)
+    dz = fd.depth[vv, uu]
+    vis = fd.valid[vv, uu] & (np.abs(z[idx] - dz) < np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z[idx]))
+    idx, uu, vv = idx[vis], uu[vis], vv[vis]
+    return idx, vv, uu, z[idx] / K.fx
+
+
+def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData]
+                      ) -> tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.int32]]:
+    """(seen, colour, object id) of each point from the keyframes of one update, whatever their
+    order: the colour of the finest view (smallest footprint; ties: larger colour, then larger id)
+    and the object id with most votes among the views that see the point (ties: finest view),
+    kept only if at least a third of those views give it."""
+    n = len(pts)
+    views = np.zeros(n, np.int32)
+    best = np.full(n, np.inf)
+    best_key = np.full(n, -1, np.int64)
+    rgb = np.zeros((n, 3), np.uint8)
+    p_idx, p_lab, p_fp = [], [], []
+    for fd in frames:
+        idx, vv, uu, fp = _visible(fd, pts)
+        views[idx] += 1
+        col = fd.rgb[vv, uu]
+        lab = fd.labels[vv, uu]
+        key = ((col[:, 0].astype(np.int64) << 16) | (col[:, 1].astype(np.int64) << 8)
+               | col[:, 2].astype(np.int64)) * (1 << 31) + lab
+        better = (fp < best[idx]) | ((fp == best[idx]) & (key > best_key[idx]))
+        sel = idx[better]
+        best[sel], best_key[sel], rgb[sel] = fp[better], key[better], col[better]
+        on = lab > 0
+        p_idx.append(idx[on])
+        p_lab.append(lab[on])
+        p_fp.append(fp[on])
+    label = np.zeros(n, np.int32)
+    P = np.concatenate(p_idx) if p_idx else np.zeros(0, np.int64)
+    if len(P):
+        L, F = np.concatenate(p_lab), np.concatenate(p_fp)
+        o = np.lexsort((F, L, P))
+        P, L, F = P[o], L[o], F[o]
+        start = np.flatnonzero(np.r_[True, (P[1:] != P[:-1]) | (L[1:] != L[:-1])])
+        votes = np.diff(np.r_[start, len(P)])
+        gp, gl, gf = P[start], L[start], F[start]  # gf: finest view voting for (point, id)
+        o = np.lexsort((gl, gf, -votes, gp))
+        gp, gl, votes = gp[o], gl[o], votes[o]
+        win = np.r_[True, gp[1:] != gp[:-1]]
+        wp, wl, wv = gp[win], gl[win], votes[win]
+        ok = wv * LABEL_SHARE_DIVISOR >= views[wp]
+        label[wp[ok]] = wl[ok]
+    return views > 0, rgb, label
 
 
 def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
                      ) -> tuple[NDArray[np.uint8], NDArray[np.int32], NDArray[np.bool_]]:
-    """Colour and object id of each point from the latest frame that sees it (oldest → newest).
+    """Colour and object id of each point from the latest update whose keyframes see it.
 
-    A frame sees a point when it projects onto a valid pixel whose depth agrees within
-    max(VIS_TOL_MIN, VIS_TOL_REL·z). Returns (rgb, label, seen by a new frame); unseen points
-    keep mid-grey and label 0.
+    Updates are applied oldest → newest, so a later update wins wherever it sees a point. The
+    keyframes of one update are one observation: within it, their order never matters
+    (``_attribute_update``). Returns (rgb, label, seen by a new frame); unseen points keep
+    mid-grey and label 0.
     """
     n = len(xyz)
     rgb = np.full((n, 3), UNSEGMENTED, np.uint8)
     label = np.zeros(n, np.int32)
     seen_new = np.zeros(n, bool)
-    pts = np.asarray(xyz, dtype=np.float64)
+    pts_all = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    by_update: dict[int, list[FrameData]] = {}
     for fd in frames:
-        cam = fd.rec.T_map_cam.inverse()
-        pc = pts @ cam.R.T + cam.t
-        uv, z = project(pc, fd.rec.K_grid.K())
-        h, w = fd.depth.shape
-        with np.errstate(invalid="ignore"):
-            u = np.floor(uv[:, 0] + 0.5)
-            v = np.floor(uv[:, 1] + 0.5)
-            idx = np.nonzero((z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h))[0]
-        uu = u[idx].astype(np.int64)
-        vv = v[idx].astype(np.int64)
-        dz = fd.depth[vv, uu]
-        vis = fd.valid[vv, uu] & (np.abs(z[idx] - dz) < np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z[idx]))
-        idx, uu, vv = idx[vis], uu[vis], vv[vis]
-        rgb[idx] = fd.rgb[vv, uu]
-        label[idx] = fd.labels[vv, uu]
-        if fd.is_new:
-            seen_new[idx] = True
+        by_update.setdefault(fd.rec.update_id, []).append(fd)
+    for start in range(0, n, ATTRIBUTE_CHUNK):
+        sl = slice(start, min(n, start + ATTRIBUTE_CHUNK))
+        pts = pts_all[sl]
+        for uid in sorted(by_update):
+            seen, col, lab = _attribute_update(pts, by_update[uid])
+            where = np.flatnonzero(seen) + start
+            rgb[where] = col[seen]
+            label[where] = lab[seen]
+            if any(fd.is_new for fd in by_update[uid]):
+                seen_new[where] = True
     return rgb, label, seen_new
 
 
@@ -126,7 +191,7 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
     with timing.stage("cloud"):
         new_by_name = {nf.kf.name: nf for nf in ctx.new if nf.record is not None}
         frames = [_frame_data(ctx, r, objs, new_by_name)
-                  for r in sorted(records, key=lambda r: r.index)]
+                  for r in sorted(records, key=lambda r: r.order_key)]
         depths = [np.median(fd.depth[fd.valid & (fd.depth > 0)]) for fd in frames
                   if (fd.valid & (fd.depth > 0)).any()]
         med = float(np.median(depths)) if depths else 2.0

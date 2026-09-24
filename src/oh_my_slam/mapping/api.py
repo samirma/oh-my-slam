@@ -1,9 +1,13 @@
 """``mapper.sh update``: create or extend a persistent map.
 
 Order (design, "Mapping update"): lock + stage → inputs/keyframes → per-keyframe geometry,
-gravity and detections (delegated to reconstruction / segmentation) → features, matching, poses →
-focal re-run rule → metric scale, gravity and map frame (new maps) → per-keyframe depth
-alignment → latest wins → objects → fused cloud → scene export → commit.
+gravity and descriptor (``reconstruction.api``) with detections (``segmentation.api``) → features,
+matching, poses → focal re-run rule → metric scale, gravity and map frame (new maps) →
+per-keyframe depth alignment → latest wins → objects → fused cloud → scene export → commit.
+
+The keyframes of one update are one observation of the scene: latest wins, object association
+and the cloud's colours and labels do not depend on their order (``validity``, ``objects``,
+``geometry``); only a later update wins over an earlier one. Capture timestamps are never read.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -41,12 +45,15 @@ from oh_my_slam.mapping.sfm import (
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
 from oh_my_slam.reconstruction.depth import fit_frame_scale
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-from oh_my_slam.segmentation.api import reconstruct_and_detect
-from oh_my_slam.segmentation.detect import Detection
+from oh_my_slam.segmentation.api import Detection, detect_alongside
+
+if TYPE_CHECKING:
+    from oh_my_slam.mapping.geometry import MapGeometry
+    from oh_my_slam.mapping.objects import ObjectState
 
 log = get_logger("oh_my_slam.mapper")
 
-MAP_GRID_SIDE = 768
+KEYFRAME_GRID_SIDE = 768  # depth and segmentation grid of map keyframes
 FOCAL_RERUN_REL = 0.03
 DEPTH_SCALE_RANGE = (0.8, 1.25)
 SEQ_OVERLAP = 12
@@ -112,16 +119,28 @@ def _infer_frames(kfs: list[ingest.Keyframe], work: Path, client: Any, progress:
     return out
 
 
+def _reconstruct_keyframe(path: Path, client: Any, intrinsics: Intrinsics | None,
+                          work_dir: Path | None = None, first: bool = True
+                          ) -> FrameReconstruction:
+    """Keyframe geometry with the mapper's settings (grid, tokens); the first pass also asks for
+    gravity and the retrieval descriptor."""
+    return reconstruct_image(path, intrinsics=intrinsics, max_side=KEYFRAME_GRID_SIDE,
+                             num_tokens=KEYFRAME_TOKENS, want_gravity=first,
+                             want_descriptor=first, work_dir=work_dir, client=client)
+
+
 def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
                                     ) -> tuple[FrameReconstruction, list[Detection]]:
+    """Depth, gravity and descriptor from reconstruction, detections from segmentation (at the
+    default threshold, requested while the reconstruction runs)."""
     own = client.clone()
     try:
-        frame, dets = reconstruct_and_detect(kf.path, own, keyframe=True, intrinsics=kf.exif,
-                                             work_dir=work)
+        return detect_alongside(
+            kf.path, own, lambda c: _reconstruct_keyframe(kf.path, c, kf.exif, work),
+            max_side=KEYFRAME_GRID_SIDE)
     finally:
         if own is not client:
             own.close()
-    return frame, dets
 
 
 # ------------------------------------------------------------------------------------------------
@@ -162,9 +181,9 @@ def _pairs_update(ctx: UpdateContext, is_video: bool) -> set[tuple[int, int]]:
     reader_desc = []
     keep_ids = []
     for f in ctx.old_frames:
-        p = ctx.tx.current(f"per_frame/{f.name}/descriptor.npy")
-        if p.exists():
-            reader_desc.append(np.load(p))
+        d = _stored_descriptor(ctx, f)
+        if d is not None:
+            reader_desc.append(d)
             keep_ids.append(f.index)
     if any(nf.frame.descriptor is None for nf in ctx.new):
         return pairs | retrieval.all_pairs(new_ids, old_ids)
@@ -239,25 +258,33 @@ def _new_pool(ctx: UpdateContext) -> list[PoolView]:
             for nf in ctx.new]
 
 
+def _stored_descriptor(ctx: UpdateContext, rec: store.FrameRecord) -> NDArray[np.float32] | None:
+    p = ctx.tx.current(store.frame_file(rec.name, "descriptor.npy"))
+    return np.load(p) if p.exists() else None
+
+
 def _old_pool(ctx: UpdateContext) -> list[PoolView]:
-    out = []
-    for f in ctx.old_frames:
-        p = ctx.tx.current(f"per_frame/{f.name}/descriptor.npy")
-        out.append(PoolView(Path(f.image).name, ctx.tx.current(f.image), f.K,
-                            np.load(p) if p.exists() else None, f.T_map_cam))
-    return out
+    return [PoolView(Path(f.image).name, ctx.tx.current(f.image), f.K,
+                     _stored_descriptor(ctx, f), f.T_map_cam) for f in ctx.old_frames]
+
+
+def _sparse_scale(nf: NewFrame, model: SfmModel, name: str, min_points: int = 50) -> Any:
+    """Robust scale of the keyframe's depth to its well-triangulated SfM points (``ScaleFit``),
+    None without points."""
+    uv, xyz = model.observations(name)
+    if not len(xyz):
+        return None
+    z = model.pose(name).inverse().apply(xyz)[:, 2]
+    pred = mframe.sample_depth_at(nf.frame.depth, uv, nf.full_size, nf.frame.K_grid)
+    return fit_frame_scale(pred, z, min_points=min_points)
 
 
 def _depth_consistent(ctx: UpdateContext, model: SfmModel, name: str) -> bool:
-    """Registration sanity check: MoGe depth vs SfM depth ratio within [0.5, 2]."""
+    """Registration sanity check: MoGe depth vs SfM depth ratio within [0.5, 2] (fewer than 20
+    points cannot contradict the pose)."""
     nf = next(n for n in ctx.new if f"{n.kf.name}.jpg" == name)
-    uv, xyz = model.observations(name)
-    if len(xyz) < 20:
-        return True  # nothing to contradict the pose
-    z = model.pose(name).inverse().apply(xyz)[:, 2]
-    pred = mframe.sample_depth_at(nf.frame.depth, uv, nf.full_size, nf.frame.K_grid)
-    fit = fit_frame_scale(pred, z, min_points=20)
-    return not fit.ok or (REJECT_SCALE[0] <= fit.scale <= REJECT_SCALE[1])
+    fit = _sparse_scale(nf, model, name, min_points=20)
+    return fit is None or not fit.ok or (REJECT_SCALE[0] <= fit.scale <= REJECT_SCALE[1])
 
 
 def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) -> SfmModel:
@@ -408,7 +435,7 @@ def _remap_small(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,
         raise RegistrationError("the map's keyframes could not be re-posed with the new input")
     fds = _frame_depths(ctx)
     for f in ctx.old_frames:
-        d = np.load(tx.current(f"per_frame/{f.name}/depth.npy")).astype(np.float32)
+        d = store.load_depth(tx.current, f.name)
         fds.append(mframe.FrameDepth(Path(f.image).name, d, f.K_grid, (f.width, f.height)))
     try:
         s = mframe.metric_scale(model, fds).scale
@@ -447,9 +474,7 @@ def _rerun_focal(ctx: UpdateContext, model: SfmModel, client: Any, progress: Pro
         nf, K = item
         own = client.clone()
         try:
-            fr = reconstruct_image(nf.kf.path, intrinsics=K, max_side=MAP_GRID_SIDE,
-                                   num_tokens=KEYFRAME_TOKENS, want_gravity=False,
-                                   want_descriptor=False, client=own)
+            fr = _reconstruct_keyframe(nf.kf.path, own, K, first=False)
         finally:
             if own is not client:
                 own.close()
@@ -543,8 +568,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     def old_depth(name: str) -> Any:
         def load() -> NDArray[np.float32]:
             if name not in cache:
-                cache[name] = np.load(ctx.tx.current(f"per_frame/{name}/depth.npy")).astype(
-                    np.float32)
+                cache[name] = store.load_depth(ctx.tx.current, name)
             return cache[name]
         return load
 
@@ -562,13 +586,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             continue
         T = model.pose(name)
         K = model.intrinsics(name).with_source("colmap")
-        uv, xyz = model.observations(name)
         stats: dict[str, Any] = dict(model.image_stats(name))
-        fit = None
-        if len(xyz) and name not in dense_only:
-            z = T.inverse().apply(xyz)[:, 2]
-            pred = mframe.sample_depth_at(nf.frame.depth, uv, nf.full_size, nf.frame.K_grid)
-            fit = fit_frame_scale(pred, z)
+        fit = None if name in dense_only else _sparse_scale(nf, model, name)
         if fit is not None and fit.ok and fit.spread <= DENSE_MAX_SPREAD:
             s = fit.scale
             if not (REJECT_SCALE[0] <= s <= REJECT_SCALE[1]):
@@ -669,12 +688,13 @@ def _stage_frames(ctx: UpdateContext) -> None:
     for nf in ctx.new:
         if nf.record is None or nf.depth is None:
             continue
-        d = f"per_frame/{nf.kf.name}"
-        tx.save_npy(f"{d}/depth.npy", nf.depth.astype(np.float16))
-        tx.write_bytes(f"{d}/valid.png", png_bytes((nf.frame.valid & (nf.depth > 0)).astype(
-            np.uint8) * 255))
+        name = nf.kf.name
+        tx.save_npy(store.frame_file(name, "depth.npy"), nf.depth.astype(np.float16))
+        tx.write_bytes(store.frame_file(name, "valid.png"), png_bytes(
+            (nf.frame.valid & (nf.depth > 0)).astype(np.uint8) * 255))
         if nf.frame.descriptor is not None:
-            tx.save_npy(f"{d}/descriptor.npy", nf.frame.descriptor.astype(np.float32))
+            tx.save_npy(store.frame_file(name, "descriptor.npy"),
+                        nf.frame.descriptor.astype(np.float32))
     # keyframe images of rejected frames are not kept
     for name in ctx.rejected:
         p = tx.staging / "frames" / f"{name}.jpg"
@@ -685,6 +705,24 @@ def _frames_json(ctx: UpdateContext) -> list[store.FrameRecord]:
     records = list(ctx.old_frames) + [nf.record for nf in ctx.new if nf.record is not None]
     ctx.tx.write_json(store.FRAMES_JSON, {"frames": [r.to_dict() for r in records]})
     return records
+
+
+def integrate(ctx: UpdateContext, progress: Progress
+              ) -> tuple[list[store.FrameRecord], ObjectState, MapGeometry]:
+    """Fold the update's placed keyframes into the map (staged): frames, latest wins, objects and
+    the cloud. Returns (all frame records, object state, map geometry)."""
+    from oh_my_slam.mapping import objects, validity
+    from oh_my_slam.mapping.geometry import build_geometry
+
+    with timing.stage("persist_frames"):
+        _stage_frames(ctx)
+        records = _frames_json(ctx)
+    with timing.stage("validity"):
+        validity.apply_latest_wins(ctx, records, progress)
+    with timing.stage("objects"):
+        objs = objects.update_objects(ctx, records, progress)
+    geo = build_geometry(ctx, records, objs, progress)  # stage cloud
+    return records, objs, geo
 
 
 # ------------------------------------------------------------------------------------------------
@@ -714,8 +752,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             ) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
-    from oh_my_slam.mapping import export, objects, validity
-    from oh_my_slam.mapping.geometry import build_geometry
+    from oh_my_slam.mapping import export
     from oh_my_slam.reconstruction.api import connect_server as connect
 
     stage = timing.stage
@@ -769,14 +806,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                              + ", ".join(sorted(ctx.rejected)[:30]))
                 with stage("persist_frames"):
                     model.write(tx.stage(store.SFM_MODEL))
-            with stage("persist_frames"):
-                _stage_frames(ctx)
-                records = _frames_json(ctx)
-            with stage("validity"):
-                validity.apply_latest_wins(ctx, records, progress)
-            with stage("objects"):
-                objs = objects.update_objects(ctx, records, progress)
-            geo = build_geometry(ctx, records, objs, progress)  # stage cloud
+            records, objs, geo = integrate(ctx, progress)
             new_names = [nf.kf.name for nf in new if nf.record is not None]
             timing.count(keyframes_registered=len(new_names), keyframes_rejected=len(ctx.rejected),
                          map_frames_after=len(records), objects=len(objs.objects),

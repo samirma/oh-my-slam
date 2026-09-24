@@ -57,6 +57,43 @@ def test_endpoint_callers() -> None:
         assert owners <= {"client/client.py", "server/app.py", "client/protocol.py"}, owners
 
 
+def test_import_contracts_express_the_ownership_rules() -> None:
+    """The §4 rules are import-linter contracts, not only conventions."""
+    import tomllib
+
+    cfg = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    contracts = {c["name"]: c for c in cfg["tool"]["importlinter"]["contracts"]}
+    by_source: dict[str, set[str]] = {}
+    for c in contracts.values():
+        if c["type"] == "forbidden":
+            for s in c["source_modules"]:
+                by_source.setdefault(s, set()).update(c["forbidden_modules"])
+    seg_internals = {f"oh_my_slam.segmentation.{m}" for m in ("detect", "lift", "obb", "colors")}
+    assert seg_internals <= by_source["oh_my_slam.mapping"]
+    assert seg_internals <= by_source["oh_my_slam.viewer"]
+    assert "oh_my_slam.client" in by_source["oh_my_slam.mapping"]
+    assert {"oh_my_slam.segmentation", "oh_my_slam.mapping"} <= by_source[
+        "oh_my_slam.reconstruction"]
+    for pkg in ("mapping", "segmentation", "viewer", "server"):
+        assert "open3d" in by_source[f"oh_my_slam.{pkg}"], pkg
+
+
+def test_mapping_delegates_depth_and_segmentation() -> None:
+    """Mapping gets keyframe depth from ``reconstruction.api`` and detections, lifting, boxes and
+    colours from ``segmentation.api``; it never fits, lifts, detects or colours by itself."""
+    files = _py_files("mapping")
+    assert _grep(r"reconstruct_image\(", files) == {"mapping/api.py"}
+    assert _grep(r"detect_alongside\(", files) == {"mapping/api.py"}
+    assert _grep(r"lift_detections\(", files) == {"mapping/objects.py"}
+    assert _grep(r"fit_object_obb\(", files) == {"mapping/objects.py"}
+    assert not _grep(r"\bfit_obb\(|\blift_mask\(|\bdetect\(|color(_hex)?_for_id\(|"
+                     r"segmentation\.(detect|lift|obb|colors)\b", files)
+    # segmentation owns lifting and colours; it does not know the mapper's keyframe settings
+    seg = _py_files("segmentation")
+    assert not _grep(r"KEYFRAME_TOKENS|KEYFRAME_GRID_SIDE|want_descriptor", seg)
+
+
+
 # view.sh owns only the web server and UI (spec §2.5). It may call the owners' public APIs — one
 # reconstruction + segmentation run (segmentation.api), the read-only map export, the shared
 # point-cloud derivation (segmentation.cloud) and attribute definition (core.cloud_attrs) — but never
