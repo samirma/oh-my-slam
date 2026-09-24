@@ -131,6 +131,7 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
                         frames={"0": ol.frame(0.0, stream_uris={"camera": "x.jpg"})})
     (cam,) = scene_cameras(image)
     np.testing.assert_array_equal(cam["T"], np.eye(4))
+    assert cam["position"] == [0.0, 0.0, 0.0] and cam["source"] == "x.jpg"
     assert cam["K"] == [500.0, 510.0, 320.0, 240.0] and cam["size"] == [640, 480]
     # a map: one camera per frame, at the frame's camera-to-map transform
     poses = [Pose(rot_z(0.3 * k), np.array([k, 2.0 * k, 0.5])) for k in range(3)]
@@ -145,8 +146,13 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
     cams = scene_cameras(scene)
     assert [c["name"] for c in cams] == ["f000000", "f000001", "f000002"]
     assert [c["update"] for c in cams] == [1, 1, 2]
-    for c, p in zip(cams, poses, strict=True):
+    assert [c["source"] for c in cams] == ["f0.jpg", "f1.jpg", "f2.jpg"]
+    for c, p, fr in zip(cams, poses, frames.values(), strict=True):
         np.testing.assert_allclose(c["T"], p.matrix(), atol=1e-6)
+        # the listed camera centre is exactly the translation the scene JSON states
+        tr = fr["frame_properties"]["transforms"]["camera_0_to_map"]["transform_src_to_dst"]
+        assert c["position"] == tr["translation"] == [float(round(v, 6)) for v in p.t]
+        assert np.asarray(c["T"])[:3, 3].tolist() == c["position"]
 
 
 def test_upright_display_frame() -> None:

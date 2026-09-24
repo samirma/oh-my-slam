@@ -80,15 +80,18 @@ class ViewBundle:
     segmented_png: bytes | None = None
     display_transform: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     stats: Json = field(default_factory=dict)
+    camera_sources: dict[str, str] = field(default_factory=dict)  # camera name → input file name
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def scope(self) -> CloudScope:
         return scope_of(self.source)
 
-    @property
+    @cached_property
     def cameras(self) -> list[Json]:
-        return scene_cameras(self.scene)
+        """Every camera of the scene JSON at its pose there (see :func:`scene_cameras`)."""
+        return [c | {"source": self.camera_sources.get(c["name"], c["source"])}
+                for c in scene_cameras(self.scene)]
 
     # -- point-cloud attributes -------------------------------------------------------------------
 
@@ -186,8 +189,9 @@ def scene_cameras(scene: Json) -> list[Json]:
     """The camera of every frame of an OpenLABEL scene, in the objects' coordinate system: the
     frame's ``<stream> → <cs>`` transform (a map keyframe), or the identity for a stream whose
     sensor frame is itself a root coordinate system (a single image, whose scene is in its camera
-    frame). ``T`` is camera-to-scene (4 x 4, row-major); ``K`` is ``fx, fy, cx, cy`` of the stream's
-    pinhole intrinsics at ``size`` (width, height)."""
+    frame). ``T`` is camera-to-scene (4 x 4, row-major) and ``position`` its translation, the
+    camera centre in the scene frame (metres); ``K`` is ``fx, fy, cx, cy`` of the stream's pinhole
+    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image."""
     root = scene.get("openlabel", {})
     streams: Json = root.get("streams", {})
     systems: Json = root.get("coordinate_systems", {})
@@ -195,7 +199,7 @@ def scene_cameras(scene: Json) -> list[Json]:
     for fid, fr in sorted(root.get("frames", {}).items(), key=lambda kv: int(kv[0])):
         props = fr.get("frame_properties", {})
         by_src = {t["src"]: t for t in props.get("transforms", {}).values()}
-        for name in props.get("streams", {}):
+        for name, stream in props.get("streams", {}).items():
             pin = streams.get(name, {}).get("stream_properties", {}).get("intrinsics_pinhole")
             if pin is None:
                 continue
@@ -208,8 +212,10 @@ def scene_cameras(scene: Json) -> list[Json]:
             m = pin["camera_matrix"]
             out.append({
                 "name": props.get("keyframe", name), "frame": int(fid), "T": T.tolist(),
+                "position": T[:3, 3].tolist(),
                 "K": [m[0], m[5], m[2], m[6]], "size": [pin["width_px"], pin["height_px"]],
                 "update": props.get("update_id"),
+                "source": Path(str(stream.get("uri", ""))).name,
             })
     return out
 
@@ -278,4 +284,6 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         source=source,
         catalog=catalog_rows(objs),
         stats={"objects": len(objs), "frames": len(reader.frames), "map_points": len(source.xyz)},
+        # keyframe images are copies (frames/fNNNNNN.jpg); name the input they came from
+        camera_sources={r.name: Path(r.source).name for r in reader.frames if r.source},
     )

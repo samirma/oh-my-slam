@@ -33,6 +33,7 @@
       <nav id="tabs" role="tablist">
         <button type="button" role="tab" data-tab="controls" class="active" aria-selected="true">Controls</button>
         <button type="button" role="tab" data-tab="catalogue" aria-selected="false">Catalogue <span id="obj-count" class="badge"></span></button>
+        <button type="button" role="tab" data-tab="cameras" aria-selected="false">Cameras <span id="cam-count" class="badge"></span></button>
         <button type="button" role="tab" data-tab="image" id="tab-image-btn" aria-selected="false" hidden>Image</button>
       </nav>
       <section id="tab-controls" class="tab active" role="tabpanel">
@@ -60,6 +61,20 @@
         <div class="table-wrap">
           <table id="catalogue" data-testid="catalogue">
             <thead><tr><th></th><th>id</th><th>label</th><th>score</th><th>W×D×H m</th><th>m³</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <section id="tab-cameras" class="tab" role="tabpanel">
+        <div class="cam-head">
+          <input id="cam-filter" type="search" placeholder="Filter by name…" aria-label="Filter cameras">
+          <button id="cam-prev" type="button" title="Go to the previous camera ([)" aria-label="Previous camera">◀</button>
+          <button id="cam-next" type="button" title="Go to the next camera (])" aria-label="Next camera">▶</button>
+        </div>
+        <p class="hint" id="cam-note"></p>
+        <div class="table-wrap">
+          <table id="cameras" data-testid="cameras">
+            <thead><tr><th>camera</th><th class="num">x</th><th class="num">y</th><th class="num">z</th><th></th></tr></thead>
             <tbody></tbody>
           </table>
         </div>

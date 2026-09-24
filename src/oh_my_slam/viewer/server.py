@@ -3,8 +3,9 @@
 Routes (GET/HEAD only; anything else is 405):
 
 * ``/`` — the page; ``/static/…`` — its scripts, styles and vendored libraries.
-* ``/api/meta`` — JSON: mode, title, stats, display transform, camera poses (from the scene), the
-  point-cloud controls (from ``core.cloud_attrs``) and their defaults.
+* ``/api/meta`` — JSON: mode, title, stats, display transform, the cameras of the scene JSON (pose
+  ``T``, centre ``position`` in the scene frame, intrinsics, image name), the point-cloud controls
+  (from ``core.cloud_attrs``) and their defaults.
 * ``/api/scene`` — the OpenLABEL scene JSON; ``/api/catalog`` — the catalogue rows (JSON);
   ``/api/segmented.png`` — the segmented image (``view.sh -i`` only).
 * ``/api/cloud?key=value&…`` — the point cloud derived with those §2.2 attributes (keys not given
