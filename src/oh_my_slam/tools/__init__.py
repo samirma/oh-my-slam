@@ -1,1 +1,1 @@
-"""Developer tools: map cloud quality metrics."""
+"""Developer tools: the benchmark evaluator (``evaluate``) and map cloud quality metrics."""
