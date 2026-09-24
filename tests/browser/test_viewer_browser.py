@@ -321,3 +321,22 @@ def test_layouts(view: View, tmp_path: Path) -> None:
 
 def test_map_unchanged_after_viewing(map_view: View) -> None:
     assert full_tree_hash(map_view.root) == map_view.before  # type: ignore[attr-defined]
+
+
+def test_empty_map_still_renders(browser: Any, tmp_path: Path) -> None:
+    """A map without points, frames or objects: the page loads, signals and logs no errors."""
+    from oh_my_slam.mapping import store
+
+    root = tmp_path / "m"
+    with store.MapTransaction(root) as tx:
+        tx.write_json(store.FRAMES_JSON, {"frames": []})
+        tx.commit({"update_count": 1})
+    bundle = map_bundle(root)
+    with running(bundle) as url:
+        v = View(browser, bundle, url)
+        assert v.js("() => window.__viewer.cloud.count") == 0
+        assert v.pg.is_disabled("#layer-cameras")
+        v.pg.fill("#attr-voxel", "0.1")
+        v.settle()
+        assert v.errors == []
+        v.pg.close()

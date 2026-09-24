@@ -56,6 +56,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(state.display.background);
 const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 5000);
 camera.up.set(0, 0, 1);  // map and display frames are z-up
+camera.position.set(-3, -3.6, 2.7);  // until the cloud is framed (e.g. an empty map)
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.12;
@@ -193,6 +194,10 @@ function pointMaterial({ color, normal, exact }) {
       void main() { gl_FragColor = vec4(vColor, 1.0); }`,
   });
 }
+function ordinal(n) {
+  const s = (n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+  return `${n}${s}`;
+}
 function clearGroup(g) {
   for (const c of [...g.children]) { g.remove(c); c.geometry?.dispose(); c.material?.dispose(); }
 }
@@ -245,7 +250,8 @@ function showCloud({ header, arrays }) {
     }
   }
   const shown = header.count.toLocaleString();
-  const thin = header.step > 1 ? ` (every ${header.step}th of ${header.total.toLocaleString()})` : '';
+  const thin = header.step > 1
+    ? ` of ${header.total.toLocaleString()} shown (every ${ordinal(header.step)}, for display)` : '';
   $('#cloud-status').textContent = `${shown} points${thin} · derived in ${Math.round(header.seconds * 1000)} ms`;
   updateStats();
 }
@@ -631,7 +637,7 @@ function buildDisplay() {
     for (const m of pointMaterials()) m.uniforms.shade.value = SHADE[sel.value];
   });
   host.append(el('div', { class: 'row attr' }, el('label', { for: 'display-normals' }, 'normals'), sel, el('output')));
-  host.append(rangeRow('labels', 'display-labels', 0, 60, 1, state.display.labelDensity,
+  host.append(rangeRow('max labels', 'display-labels', 0, 60, 1, state.display.labelDensity,
     (v) => `${v}`, (v) => { state.display.labelDensity = v; updateLabels(); }));
   const bg = el('input', { type: 'color', id: 'display-bg' });
   bg.value = state.display.background;

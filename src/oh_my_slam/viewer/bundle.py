@@ -37,7 +37,7 @@ from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.geometry import quat_to_rot, rotation_between
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-from oh_my_slam.segmentation.cloud import CloudSource, derive_cloud, scope_of
+from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_cloud, scope_of
 
 Json = dict[str, Any]
 
@@ -65,7 +65,6 @@ class DisplayCloud:
     """A derived cloud as the page shows it."""
 
     cloud: PointCloud
-    attrs: CloudAttrs  # the attributes the page asked for (label/encoding at their defaults)
     total: int  # points of the derived cloud before display thinning
     step: int  # display thinning: every ``step``-th point (1 = none)
     seconds: float  # derivation time
@@ -120,10 +119,10 @@ class ViewBundle:
 
     def _depth_extent(self) -> float:
         """Slider maximum for the depth range: the farthest valid depth, rounded up."""
-        depth = getattr(self.source, "depth", None)
-        if depth is None:
+        if not isinstance(self.source, ImageCloudSource):
             return 10.0
-        d = np.asarray(depth)[np.asarray(self.source.valid) & (np.asarray(depth) > 0)]
+        depth = np.asarray(self.source.depth)
+        d = depth[np.asarray(self.source.valid) & (depth > 0) & np.isfinite(depth)]
         top = float(d.max()) if d.size else 10.0
         return max(0.1, math.ceil(top * 10.0) / 10.0)
 
@@ -156,7 +155,7 @@ class ViewBundle:
         total = len(full)
         step = max(1, math.ceil(total / MAX_DISPLAY_POINTS))
         shown = full if step == 1 else full.subset(np.arange(0, total, step))
-        return DisplayCloud(shown, attrs, total, step, seconds)
+        return DisplayCloud(shown, total, step, seconds)
 
     def meta(self) -> Json:
         return {
