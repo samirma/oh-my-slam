@@ -1,4 +1,4 @@
-"""Well-known locations: server runtime files, model weights, data."""
+"""Well-known locations: server runtime files, model weights, scratch space."""
 
 from __future__ import annotations
 
@@ -45,11 +45,6 @@ def weights_dir() -> Path:
     base = Path(env) if env else Path.home() / "Library" / "Caches" / "oh-my-slam" / "weights"
     base.mkdir(parents=True, exist_ok=True)
     return base
-
-
-def data_dir() -> Path:
-    env = os.environ.get("OH_MY_SLAM_DATA_DIR")
-    return Path(env) if env else Path.home() / "oh-my-slam-data"
 
 
 def scratch_dir() -> Path:

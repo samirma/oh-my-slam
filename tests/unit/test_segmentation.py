@@ -18,7 +18,7 @@ from oh_my_slam.core.ply import PointCloud, read_ply
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.schema.validate import validation_errors
-from oh_my_slam.segmentation import calibration, detect
+from oh_my_slam.segmentation import detect
 from oh_my_slam.segmentation.api import (
     colorize_cloud,
     exclusive_masks,
@@ -83,21 +83,6 @@ def test_vocabulary_and_label_rules() -> None:
     assert detect.floor_gap("chair") > 0 and detect.floor_gap("bottle") == 0
 
 
-def test_calibration_maps() -> None:
-    ident = calibration.load_map("yoloe")
-    assert ident.is_identity and ident(0.42) == pytest.approx(0.42)
-    m = calibration.CalibrationMap("x", (0.0, 0.2, 1.0), (0.0, 0.5, 0.9))
-    assert m(0.2) == pytest.approx(0.5) and m(1.0) == pytest.approx(0.9)
-    assert m.to_dict()["knots_raw"] == [0.0, 0.2, 1.0]
-    with pytest.raises(ValueError):
-        calibration.CalibrationMap("x", (0.0, 1.0), (1.0, 0.0))
-    with pytest.raises(ValueError):
-        calibration.CalibrationMap("x", (0.0,), (0.0,))
-    with pytest.raises(ValueError):
-        calibration.CalibrationMap("x", (1.0, 0.0), (0.0, 1.0))
-    assert calibration.load_map("unknown-path").is_identity
-
-
 def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]
     client, img = synth
     frame = reconstruct_image(img, client=client)
@@ -130,8 +115,8 @@ def test_exclusive_masks_small_on_top() -> None:
     big[:, :] = True
     small = np.zeros((10, 10), bool)
     small[2:4, 2:4] = True
-    dets = [Detection("table", 0.9, 0.9, "yoloe", big, (0, 0, 10, 10)),
-            Detection("cup", 0.8, 0.8, "yoloe", small, (2, 2, 4, 4))]
+    dets = [Detection("table", 0.9, "yoloe", big, (0, 0, 10, 10)),
+            Detection("cup", 0.8, "yoloe", small, (2, 2, 4, 4))]
     a, b = exclusive_masks(dets, (10, 10))
     assert b.sum() == 4 and a.sum() == 96 and not (a & b).any()
 

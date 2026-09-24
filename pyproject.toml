@@ -75,7 +75,6 @@ extend-exclude = ["src/oh_my_slam/viewer/static"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["RUF059", "N802", "PTH", "RUF005", "B008", "SIM117", "RUF021", "F841"]
-"src/oh_my_slam/tools/**" = ["RUF059"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PTH", "N"]
@@ -92,7 +91,7 @@ disallow_any_generics = false
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["oh_my_slam.server.models.*", "oh_my_slam.tools.*"]
+module = ["oh_my_slam.server.models.*"]
 ignore_errors = true
 
 [[tool.mypy.overrides]]

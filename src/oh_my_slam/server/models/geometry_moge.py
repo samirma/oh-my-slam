@@ -73,7 +73,7 @@ class MoGeGeometry:
 
     def infer_array(self, rgb: np.ndarray, fov_x_deg: float | None, num_tokens: int,
                     fp16: bool | None = None) -> dict[str, Any]:
-        """Raw inference on an RGB uint8 array (used by the gates as well)."""
+        """Raw inference on an RGB uint8 array."""
         import torch
 
         t = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device)

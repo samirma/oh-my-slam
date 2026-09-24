@@ -86,9 +86,9 @@ leaves the previous map untouched.
   dense) → latest-wins validity → object association (Hungarian on projected-mask IoU / 3D overlap),
   merging, removal on evidence of absence → map cloud (surface of a TSDF fusion); no mesh.
 * **Ownership** (enforced by import-linter and `tests/unit/test_ownership.py`): reconstruction owns
-  depth/intrinsics/gravity/clouds/fusion; segmentation owns instances, calibration,
-  lifting, OBBs, colours, catalogue and artefacts; mapping owns inputs, SfM, map frame, identity and
-  the store; the viewer only serves data. Shell scripts never call each other.
+  depth/intrinsics/gravity/clouds/fusion; segmentation owns instances, lifting, OBBs, colours,
+  catalogue and artefacts; mapping owns inputs, SfM, map frame, identity and the store; the viewer
+  only serves data. Shell scripts never call each other.
 
 ## Development
 
@@ -98,9 +98,6 @@ uv run pytest --cov=oh_my_slam -m "not models and not browser and not eval"
 uv run lint-imports && uv run ruff check . && uv run mypy src
 OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models                 # with the server running
 uv run pytest -m browser                                              # Edge/Chrome via Playwright
-uv run python -m oh_my_slam.tools.perf latency photo.jpg              # AC22 timings (one at a time)
-uv run python -m oh_my_slam.tools.validate_inputs --inputs ~/robot_view   # user-input validation
-uv run python -m oh_my_slam.tools.perf_report measure|renders|shots|write --out DIR  # R44 report
 uv run python -m oh_my_slam.tools.cloud_quality --map maps/NAME     # cloud layering / accuracy metrics
 ```
 
@@ -116,5 +113,3 @@ each map update also keeps its record in `map.json → updates[].timings`).
   `--status` shows which models loaded; the log is `~/Library/Caches/oh-my-slam/server.log`.
 * Exit 5 on update: the new images do not overlap the map (no verified feature matches).
 * Exit 6: another `mapper.sh update` is running on the same map.
-* Evaluation/calibration datasets (TUM RGB-D, NYUv2, LVIS) are not downloaded automatically; put
-  them in `~/oh-my-slam-data` and run `tools/evaluate.py` / `tools/calibrate_scores.py`.

@@ -1,1 +1,1 @@
-"""Developer tools: score calibration, evaluation, performance, validation harness."""
+"""Developer tools: map cloud quality metrics."""

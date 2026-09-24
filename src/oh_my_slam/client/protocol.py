@@ -107,14 +107,14 @@ class SegmentRequest(BaseModel):
     image_path: str
     labels: list[str]
     max_side: int = 1024
-    conf: float = 0.05  # raw pre-filter, well below any calibrated threshold
+    conf: float = 0.05  # score pre-filter
     iou: float = 0.6
     imgsz: int = 1024
 
 
 class Instance(BaseModel):
     label: str
-    score: float  # raw model score (calibrated by the client)
+    score: float  # model score
     source: Literal["yoloe"]
     box_xyxy: list[float]  # on the mask grid
     mask: dict[str, object]  # COCO RLE {"size": [h, w], "counts": str}

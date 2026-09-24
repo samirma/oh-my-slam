@@ -42,7 +42,7 @@ def build_parser() -> ArgumentParser:
     ap.add_argument("-f", dest="format", choices=("json", "ply"), default="json",
                     help="stdout format (default: json)")
     ap.add_argument("--min-score", dest="min_score", default=None,
-                    help="drop detections below this calibrated score (default 0.5; -i only)")
+                    help="drop detections below this score (default 0.5; -i only)")
     return ap
 
 

@@ -1,6 +1,5 @@
-"""Instance detection: the segment endpoint → calibrated scores → background / min-score
-filters → cross-label de-duplication → stable ordering. Also owns the vocabulary and label
-rules."""
+"""Instance detection: the segment endpoint → background / min-score filters → cross-label
+de-duplication → stable ordering. Also owns the vocabulary and label rules."""
 
 from __future__ import annotations
 
@@ -17,7 +16,6 @@ from numpy.typing import NDArray
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient, connect
 from oh_my_slam.core import rle, timing
-from oh_my_slam.segmentation.calibration import load_map
 
 DEFAULT_MIN_SCORE = 0.5
 DEDUPE_IOU = 0.7
@@ -105,8 +103,7 @@ def compatible(a: str, b: str) -> bool:
 @dataclass
 class Detection:
     label: str
-    score: float  # calibrated
-    raw_score: float
+    score: float
     source: str
     mask: NDArray[np.bool_]
     box: tuple[float, float, float, float]
@@ -114,15 +111,6 @@ class Detection:
     @property
     def area(self) -> int:
         return int(self.mask.sum())
-
-
-def _raw_threshold(min_score: float, sources: tuple[str, ...] = ("yoloe",)) -> float:
-    """Lowest raw score that can calibrate to >= ``min_score`` on any path."""
-    lows = []
-    for s in sources:
-        m = load_map(s)
-        lows.append(float(np.interp(min_score, m.knots_calibrated, m.knots_raw)))
-    return max(0.01, min(lows) - 1e-6)
 
 
 def mask_iou(a: NDArray[Any], b: NDArray[Any]) -> float:
@@ -133,7 +121,7 @@ def mask_iou(a: NDArray[Any], b: NDArray[Any]) -> float:
 
 
 def dedupe(dets: list[Detection], iou: float = DEDUPE_IOU) -> list[Detection]:
-    """Greedy cross-label suppression by mask IoU (highest calibrated score wins)."""
+    """Greedy cross-label suppression by mask IoU (highest score wins)."""
     kept: list[Detection] = []
     for d in sorted(dets, key=lambda x: (-x.score, -x.area)):
         x0, y0, x1, y1 = d.box
@@ -151,7 +139,7 @@ def dedupe(dets: list[Detection], iou: float = DEDUPE_IOU) -> list[Detection]:
 
 
 def order(dets: list[Detection]) -> list[Detection]:
-    """Stable output order: calibrated score desc, then mask area desc, then label."""
+    """Stable output order: score desc, then mask area desc, then label."""
     return sorted(dets, key=lambda d: (-round(d.score, 6), -d.area, d.label))
 
 
@@ -175,7 +163,7 @@ def _detect(image_path: Path, min_score: float, max_side: int, client: Inference
             image_path=str(Path(image_path).resolve()),
             labels=list(default_vocabulary()),
             max_side=max_side,
-            conf=_raw_threshold(min_score),
+            conf=max(0.01, min_score - 1e-6),
         )
     )
     dets: list[Detection] = []
@@ -183,13 +171,13 @@ def _detect(image_path: Path, min_score: float, max_side: int, client: Inference
         label = normalize_label(inst.label)
         if label in BACKGROUND_LABELS:
             continue
-        score = load_map(inst.source)(inst.score)
+        score = float(np.clip(inst.score, 0.0, 1.0))
         if score < min_score:
             continue
         mask = rle.decode(inst.mask)
         if mask.sum() < min_area_px:
             continue
         b = inst.box_xyxy
-        dets.append(Detection(label, score, inst.score, inst.source, mask,
+        dets.append(Detection(label, score, inst.source, mask,
                               (float(b[0]), float(b[1]), float(b[2]), float(b[3]))))
     return order(dedupe(dets))

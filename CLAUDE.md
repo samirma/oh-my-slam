@@ -16,12 +16,8 @@ Commands:
   (coverage: add `--cov=oh_my_slam`). Real models: `OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models`
   with the server running. Browser: `uv run pytest -m browser` (Playwright, Edge channel).
 - Lint/types/ownership: `uv run ruff check . && uv run mypy src && uv run lint-imports`.
-- Validation on the user's inputs: `uv run python -m oh_my_slam.tools.validate_inputs --inputs
-  /Users/U124317/robot_view` (outputs in `~/oh-my-slam-data/validation/<UTC>/`).
-- Performance/development report (R44): `uv run python -m oh_my_slam.tools.perf_report
-  measure|renders|shots|write --out DIR` (`~/oh-my-slam-data/reports/<UTC>/`). Per-stage timings of
-  any `mapper.sh update` / `reconstruct.sh` / `segment.sh -i`: `timings:` line on stderr, JSON with
-  `OH_MY_SLAM_TIMINGS=path`, and `map.json → updates[].timings`.
+- Per-stage timings of any `mapper.sh update` / `reconstruct.sh` / `segment.sh -i`: `timings:`
+  line on stderr, JSON with `OH_MY_SLAM_TIMINGS=path`, and `map.json → updates[].timings`.
 
 Never import torch/open3d in the same process (duplicate libomp aborts): torch lives only in the
 server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segment.sh -m` are read-only.

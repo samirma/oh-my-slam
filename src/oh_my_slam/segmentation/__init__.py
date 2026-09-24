@@ -1,1 +1,1 @@
-"""Segmentation owner: instances, calibration, lifting, OBBs, colours, catalogue, artefacts."""
+"""Segmentation owner: instances, lifting, OBBs, colours, catalogue, artefacts."""
