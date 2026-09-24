@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 from oh_my_slam.core.geometry import rotation_between
 from oh_my_slam.core.images import png_bytes
 from oh_my_slam.core.ply import PointCloud
+from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 
 MAX_DISPLAY_POINTS = 3_000_000
 
@@ -95,7 +96,7 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
     cloud, _ = frame.camera_cloud()
     assert segcloud.label is not None
     cloud, (segs, labels) = _thin(cloud, [segcloud.rgb, segcloud.label])
-    up = frame.gravity.up_cam if frame.gravity is not None else np.array([0.0, -1.0, 0.0])
+    up = frame.gravity.up_cam if frame.gravity is not None else DEFAULT_UP_CAM
     return ViewBundle(
         mode="image",
         title=Path(image).name,

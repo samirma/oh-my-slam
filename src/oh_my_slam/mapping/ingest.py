@@ -20,6 +20,7 @@ from oh_my_slam.core.images import (
     save_jpeg,
 )
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping.store import frame_name
 
 DEFAULT_FPS = 2.0
 
@@ -91,14 +92,14 @@ def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int
 
         assert spec.video is not None
         for f in sample_frames(spec.video, fps):
-            name = f"f{idx:06d}"
+            name = frame_name(idx)
             path = frames_dir / f"{name}.jpg"
             save_jpeg(f.rgb, path, quality=95)
             yield Keyframe(name, idx, path, f"{spec.video}@{f.timestamp:.3f}", None)
             idx += 1
         return
     for src in spec.images:
-        name = f"f{idx:06d}"
+        name = frame_name(idx)
         path = frames_dir / f"{name}.jpg"
         _write_image_keyframe(src, path)
         yield Keyframe(name, idx, path, str(src), exif_intrinsics(src))

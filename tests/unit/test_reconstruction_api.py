@@ -28,16 +28,15 @@ def scene(tmp_path: Path) -> tuple[FakeClient, Path, Pose]:
 
 def test_reconstruct_image_model_intrinsics_and_gravity(scene) -> None:  # type: ignore[no-untyped-def]
     client, img, pose = scene
-    f = reconstruct_image(img, client=client, want_descriptor=True, want_normals=True)
+    f = reconstruct_image(img, client=client, want_descriptor=True)
     assert f.intrinsics.source == "model" and f.intrinsics.fx == pytest.approx(260.0)
     assert f.grid_size == (320, 240)
     assert f.gravity is not None and f.gravity.source == "geocalib+floor"
     true_up = pose.R.T @ np.array([0.0, 0.0, 1.0])
     assert angle_between_deg(f.gravity.up_cam, true_up) < 1.0
-    assert f.descriptor is not None and f.normals is not None
+    assert f.descriptor is not None
     cloud, idx = f.camera_cloud()
     np.testing.assert_array_equal(cloud.rgb, f.rgb.reshape(-1, 3)[idx])
-    assert len(f.cloud_in(pose)) == len(cloud)
     assert client.calls["geometry"] == 1 and client.calls["gravity"] == 1
 
 

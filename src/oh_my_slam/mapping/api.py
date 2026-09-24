@@ -39,6 +39,7 @@ from oh_my_slam.mapping.sfm import (
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
 from oh_my_slam.reconstruction.depth import fit_frame_scale
+from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.api import reconstruct_and_detect
 from oh_my_slam.segmentation.detect import Detection
 
@@ -494,7 +495,7 @@ def _define_map_frame(ctx: UpdateContext, model: SfmModel, progress: Progress) -
 def _single_image_map(ctx: UpdateContext) -> None:
     """One image: identity pose, map frame from its gravity (C14)."""
     nf = ctx.new[0]
-    up = nf.frame.gravity.up_cam if nf.frame.gravity is not None else np.array([0, -1.0, 0])
+    up = nf.frame.gravity.up_cam if nf.frame.gravity is not None else DEFAULT_UP_CAM
     sim = mframe.map_transform(Pose.identity(), up, 1.0)
     T = mframe.transform_pose(sim, Pose.identity())
     nf.record = _record(ctx, nf, T, "identity", nf.frame.intrinsics, camera_id=1, stats={})
@@ -615,7 +616,6 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
 
 
 LEVEL_MAX_DEG = 10.0
-MAP_FLOOR_MAX_BELOW = 0.10
 
 
 def _level_with_floor(ctx: UpdateContext, model: SfmModel, progress: Progress) -> None:
@@ -623,22 +623,9 @@ def _level_with_floor(ctx: UpdateContext, model: SfmModel, progress: Progress) -
     (depth-aligned) map — the lowest well-supported horizontal surface — and rotate the map about
     its origin so the floor normal is exactly +z."""
     from oh_my_slam.core.geometry import angle_between_deg, ransac_plane, rotation_between
-    from oh_my_slam.mapping.validity import View
-    from oh_my_slam.reconstruction.gravity import floor_candidate_height
+    from oh_my_slam.mapping.objects import map_floor
 
-    pts = []
-    for nf in ctx.new:
-        if nf.record is None or nf.depth is None or nf.record.low_confidence:
-            continue
-        v = View(nf.depth, nf.frame.valid & (nf.depth > 0), nf.record.K_grid, nf.record.T_map_cam)
-        p, _, _ = v.grid_points()
-        pts.append(p[:: max(1, len(p) // 4000)])
-    if not pts:
-        return
-    allp = np.concatenate(pts)
-    # maps accumulate stray points below the floor (see-through shelves, reflections, drift):
-    # allow up to 10 % of points beneath the floor peak (single images use 3 %)
-    fz = floor_candidate_height(allp[:, 2], max_below=MAP_FLOOR_MAX_BELOW)
+    allp, fz = map_floor(ctx, per_frame=4000)
     if fz is None:
         return
     band = allp[np.abs(allp[:, 2] - fz) < 0.15]

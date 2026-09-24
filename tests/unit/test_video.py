@@ -55,9 +55,6 @@ def test_laplacian_variance_orders_sharpness(rng: np.random.Generator) -> None:
 def test_sample_frames_one_per_slot_sharpest(tmp_path: Path) -> None:
     clip = tmp_path / "clip.mp4"
     _make_clip(clip, seconds=3.0, fps=10)
-    info = video.probe(clip)
-    assert (info.width, info.height, info.rotation) == (64, 48, 0)
-    assert info.fps == pytest.approx(10)
     frames = list(video.sample_frames(clip, fps=2))
     assert [f.slot for f in frames] == list(range(6))
     for f in frames:
@@ -73,10 +70,6 @@ def test_rotation_metadata_yields_upright_frames(tmp_path: Path) -> None:
     clip = tmp_path / "portrait.mp4"
     # display_rotation 90 = counter-clockwise: stored landscape, shown portrait.
     _make_clip(clip, seconds=1.0, fps=10, rotate=90)
-    info = video.probe(clip)
-    # ffmpeg's display rotation is counter-clockwise: 90 CCW == 270 clockwise.
-    assert info.rotation == 270
-    assert (info.width, info.height) == (48, 64)
     frames = list(video.sample_frames(clip, fps=2))
     assert frames and frames[0].rgb.shape == (64, 48, 3)
     rgb = frames[0].rgb
@@ -97,13 +90,9 @@ def test_upright_rotations() -> None:
 def test_video_errors(tmp_path: Path) -> None:
     with pytest.raises(InputError):
         list(video.sample_frames(tmp_path / "missing.mp4", 2))
-    with pytest.raises(InputError):
-        video.probe(tmp_path / "missing.mp4")
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"garbage")
     with pytest.raises(InputError):
         list(video.sample_frames(bad, 2))
-    with pytest.raises(InputError):
-        video.probe(bad)
     with pytest.raises(InputError):
         list(video.sample_frames(bad, 0))

@@ -63,7 +63,7 @@ def test_store_killed_process_leaves_map_untouched(tmp_path: Path) -> None:
     """A real process killed (SIGKILL) during staging: map.json unchanged, next update cleans."""
     root = tmp_path / "m"
     _make_map(root)
-    before = store.tree_hash(root)
+    before = store.full_tree_hash(root)
     code = (
         "import os, time, sys\n"
         "from pathlib import Path\n"
@@ -77,7 +77,7 @@ def test_store_killed_process_leaves_map_untouched(tmp_path: Path) -> None:
     assert proc.stdout is not None and proc.stdout.readline().strip() == "staged"
     proc.kill()
     proc.wait()
-    assert store.tree_hash(root) == before
+    assert store.full_tree_hash(root) == before
     assert (root / "per_frame/f000000/x.bin").read_bytes() == b"one"
     with store.MapTransaction(root) as tx:  # lock released by the kernel; staging discarded
         assert not (root / store.STAGING / "per_frame").exists()
@@ -243,10 +243,11 @@ def test_metric_scale_gravity_and_map_frame() -> None:
         poses[name] = mframe.transform_pose(to_sfm, T)
         up_cam = T.R.T @ np.array([0.0, 0.0, 1.0])
         frames.append(mframe.FrameDepth(name, r.depth, K, (K.width, K.height), up_cam, 1.0))
-    from oh_my_slam.core.geometry import unproject
+    from oh_my_slam.core.geometry import unproject_pixels
 
     r0 = render(room, true_poses[2], K)
-    surf = true_poses[2].apply(unproject(r0.depth, K.K()))
+    v, u = np.nonzero(np.isfinite(r0.depth) & (r0.depth > 0))
+    surf = true_poses[2].apply(unproject_pixels(u, v, r0.depth[v, u], K.K()))
     pts = surf[rng.choice(len(surf), 600, replace=False)]  # points on visible surfaces
     model = _FakeModel(poses, to_sfm.apply(pts), to_sfm)
     res = mframe.metric_scale(model, frames)

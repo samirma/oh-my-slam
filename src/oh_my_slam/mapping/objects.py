@@ -19,6 +19,7 @@ from scipy.spatial import cKDTree
 from oh_my_slam.core import rle
 from oh_my_slam.core.geometry import voxel_downsample_indices
 from oh_my_slam.core.images import load_png
+from oh_my_slam.mapping.store import OBJECTS_JSON
 from oh_my_slam.mapping.validity import View, tau, well_registered
 from oh_my_slam.reconstruction.gravity import floor_candidate_height
 from oh_my_slam.segmentation.api import SceneObject, lift_detections
@@ -40,6 +41,7 @@ MIN_VISIBLE_SAMPLES = 50
 FEW_MIN_OBSERVATIONS = 4
 ABSENCE_TAU_MIN = 0.25
 ABSENCE_TAU_REL = 0.15
+MAP_FLOOR_MAX_BELOW = 0.10
 UP = np.array([0.0, 0.0, 1.0])
 
 
@@ -148,15 +150,11 @@ class ObjectState:
         return [o.scene_object() for o in sorted(self.objects, key=lambda o: o.id)
                 if o.confirmed and o.obb is not None]
 
-    @property
-    def scene_objects(self) -> list[SceneObject]:
-        return self.exported()
-
 
 def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
     import json
 
-    p = current("objects.json")
+    p = current(OBJECTS_JSON)
     if not p.exists():
         return ObjectState([], int(meta.get("next_object_id", 1)), floor_z=meta.get("floor_z"))
     d = json.loads(p.read_text())
@@ -246,18 +244,23 @@ def refit(obj: MapObject, floor_z: float | None) -> None:
 # the update
 
 
-def _map_floor(ctx: Any) -> float | None:
-    zs = []
+def map_floor(ctx: Any, per_frame: int | None = None) -> tuple[NDArray[np.float64], float | None]:
+    """Map-frame grid points of this update's confidently placed keyframes (about ``per_frame``
+    of each, all when None) and the floor height among them: the lowest well-supported
+    horizontal surface. Maps accumulate stray points below the floor (see-through shelves,
+    reflections, drift), so up to 10 % of the points may lie beneath it (single images: 3 %)."""
+    pts = []
     for nf in ctx.new:
-        if nf.record is None or nf.depth is None:
+        if nf.record is None or nf.depth is None or nf.record.low_confidence:
             continue
         view = View(nf.depth, nf.frame.valid & (nf.depth > 0), nf.record.K_grid,
                     nf.record.T_map_cam)
-        pts, _, _ = view.grid_points()
-        zs.append(pts[:, 2])
-    if not zs:
-        return None
-    return floor_candidate_height(np.concatenate(zs), max_below=0.10)  # maps: stray points below
+        p, _, _ = view.grid_points()
+        pts.append(p if per_frame is None else p[:: max(1, len(p) // per_frame)])
+    if not pts:
+        return np.zeros((0, 3)), None
+    allp = np.concatenate(pts)
+    return allp, floor_candidate_height(allp[:, 2], max_below=MAP_FLOOR_MAX_BELOW)
 
 
 def _instances_json(frame_items: list[tuple[int, Any]]) -> dict[str, Any]:
@@ -272,7 +275,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     tx = ctx.tx
     state = load_state(tx.current, ctx.meta)
     uid = ctx.update_id
-    fz = _map_floor(ctx)
+    _, fz = map_floor(ctx)
     if state.floor_z is None or (fz is not None and not ctx.old_frames):
         state.floor_z = fz
     ctx.meta["floor_z"] = state.floor_z
@@ -319,7 +322,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     for o in state.objects:
         if o.id in touched:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
-    tx.write_json("objects.json", {
+    tx.write_json(OBJECTS_JSON, {
         "next_id": state.next_id,
         "floor_z": state.floor_z,
         "merged_into": {str(k): v for k, v in state.merged_into.items()},

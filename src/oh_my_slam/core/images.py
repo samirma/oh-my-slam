@@ -38,11 +38,6 @@ def is_image_file(path: Path) -> bool:
     return p.is_file() and not p.name.startswith(".") and p.suffix.lower() in IMAGE_SUFFIXES
 
 
-def is_video_file(path: Path) -> bool:
-    p = Path(path)
-    return p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
-
-
 def open_image(path: Path) -> Image.Image:
     """Open an image with EXIF orientation applied (not yet converted to RGB)."""
     path = Path(path)
@@ -73,13 +68,6 @@ def resize_to_max_side(img: Image.Image, max_side: int) -> Image.Image:
         return img
     size = (max(1, round(w * scale)), max(1, round(h * scale)))
     return img.resize(size, Image.Resampling.LANCZOS)
-
-
-def scaled_size(width: int, height: int, max_side: int) -> tuple[int, int]:
-    scale = max_side / max(width, height)
-    if scale >= 1.0:
-        return width, height
-    return max(1, round(width * scale)), max(1, round(height * scale))
 
 
 def upright_size(path: Path) -> tuple[int, int]:
@@ -162,14 +150,8 @@ def save_jpeg(rgb: NDArray[np.uint8], path: Path, quality: int = 95) -> None:
     atomic_write_bytes(path, buf.getvalue())
 
 
-def save_png(array: NDArray[Any], path: Path) -> None:
-    """Lossless PNG without colour profile or gamma chunk."""
-    from oh_my_slam.core.atomic import atomic_write_bytes
-
-    atomic_write_bytes(path, png_bytes(array))
-
-
 def png_bytes(array: NDArray[Any]) -> bytes:
+    """Lossless PNG without colour profile or gamma chunk."""
     import io
 
     buf = io.BytesIO()

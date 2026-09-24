@@ -36,17 +36,6 @@ class PointCloud:
             self.xyz[index], self.rgb[index], None if self.label is None else self.label[index]
         )
 
-    @staticmethod
-    def concat(clouds: list[PointCloud]) -> PointCloud:
-        if not clouds:
-            return PointCloud(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8))
-        labels = None
-        if all(c.label is not None for c in clouds):
-            labels = np.concatenate([c.label for c in clouds if c.label is not None])
-        return PointCloud(
-            np.concatenate([c.xyz for c in clouds]), np.concatenate([c.rgb for c in clouds]), labels
-        )
-
 
 def _dtype(with_label: bool) -> np.dtype[Any]:
     fields: list[tuple[str, str]] = [
@@ -85,12 +74,6 @@ def ply_bytes(cloud: PointCloud, comment: str | None = None) -> bytes:
     if with_label and cloud.label is not None:
         arr["label"] = cloud.label
     return ("\n".join(header) + "\n").encode("ascii") + arr.tobytes()
-
-
-def write_ply(path: Path, cloud: PointCloud, comment: str | None = None) -> None:
-    from oh_my_slam.core.atomic import atomic_write_bytes
-
-    atomic_write_bytes(path, ply_bytes(cloud, comment))
 
 
 _PLY_TYPES = {

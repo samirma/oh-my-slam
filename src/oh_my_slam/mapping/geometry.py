@@ -19,6 +19,7 @@ from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_valid
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.pointcloud import cloud_mask
+from oh_my_slam.segmentation.colors import UNSEGMENTED
 
 # Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
 # centimetres still average into one surface), attributed from the latest frame that sees it.
@@ -92,7 +93,7 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
     keep mid-grey and label 0.
     """
     n = len(xyz)
-    rgb = np.full((n, 3), 128, np.uint8)
+    rgb = np.full((n, 3), UNSEGMENTED, np.uint8)
     label = np.zeros(n, np.int32)
     seen_new = np.zeros(n, bool)
     pts = np.asarray(xyz, dtype=np.float64)

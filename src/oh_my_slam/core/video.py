@@ -27,15 +27,6 @@ class SampledFrame:
     sharpness: float
 
 
-@dataclass
-class VideoInfo:
-    width: int
-    height: int
-    fps: float
-    duration: float
-    rotation: int  # degrees clockwise to display upright (0, 90, 180, 270)
-
-
 def laplacian_variance(gray: NDArray[Any]) -> float:
     """Sharpness score: variance of the 4-neighbour Laplacian."""
     g = np.asarray(gray, dtype=np.float32)
@@ -70,34 +61,6 @@ def upright(rgb: NDArray[np.uint8], rotation_cw: int) -> NDArray[np.uint8]:
     if k == 0:
         return rgb
     return np.ascontiguousarray(np.rot90(rgb, k=-k))
-
-
-def probe(path: Path) -> VideoInfo:
-    import av
-
-    path = Path(path)
-    if not path.is_file():
-        raise InputError(f"video not found: {path}")
-    try:
-        with av.open(str(path)) as container:
-            stream = container.streams.video[0]
-            fps = float(stream.average_rate or stream.guessed_rate or 30.0)
-            if stream.duration is not None and stream.time_base is not None:
-                duration = float(stream.duration * stream.time_base)
-            elif container.duration is not None:
-                duration = container.duration / 1_000_000.0
-            else:
-                duration = 0.0
-            first = next(container.decode(stream), None)
-            rotation = _rotation_of(stream, first)
-            w, h = stream.codec_context.width, stream.codec_context.height
-    except InputError:
-        raise
-    except Exception as exc:
-        raise InputError(f"cannot read video {path}: {exc}") from exc
-    if rotation in (90, 270):
-        w, h = h, w
-    return VideoInfo(width=w, height=h, fps=fps, duration=duration, rotation=rotation)
 
 
 def sample_frames(path: Path, fps: float) -> Iterator[SampledFrame]:

@@ -10,7 +10,7 @@ from PIL import Image
 
 from oh_my_slam.core import atomic, images, paths, rle
 from oh_my_slam.core.errors import ExitCode, InputError, ServerUnavailableError
-from oh_my_slam.core.ply import PointCloud, parse_ply, ply_bytes, read_ply, write_ply
+from oh_my_slam.core.ply import PointCloud, parse_ply, ply_bytes, read_ply
 
 # --- PLY ------------------------------------------------------------------------------------------
 
@@ -26,7 +26,7 @@ def test_ply_roundtrip_with_and_without_label(tmp_path: Path, rng: np.random.Gen
     np.testing.assert_array_equal(back.rgb, rgb)
     assert back.label is None
     labelled = PointCloud(xyz, rgb, np.arange(100))
-    write_ply(tmp_path / "a.ply", labelled)
+    (tmp_path / "a.ply").write_bytes(ply_bytes(labelled))
     back = read_ply(tmp_path / "a.ply")
     assert back.label is not None
     np.testing.assert_array_equal(back.label, np.arange(100))
@@ -45,13 +45,10 @@ def test_ply_validation_errors(rng: np.random.Generator) -> None:
         parse_ply(b"ply\nformat ascii 1.0\nend_header\n")
 
 
-def test_pointcloud_concat_and_subset() -> None:
-    a = PointCloud(np.zeros((2, 3)), np.zeros((2, 3)), np.array([1, 2]))
-    b = PointCloud(np.ones((3, 3)), np.ones((3, 3)), np.array([3, 4, 5]))
-    c = PointCloud.concat([a, b])
-    assert len(c) == 5 and c.label is not None and c.label.tolist() == [1, 2, 3, 4, 5]
-    assert len(c.subset(np.array([0, 4]))) == 2
-    assert len(PointCloud.concat([])) == 0
+def test_pointcloud_subset() -> None:
+    c = PointCloud(np.zeros((5, 3)), np.zeros((5, 3)), np.array([1, 2, 3, 4, 5]))
+    sub = c.subset(np.array([0, 4]))
+    assert len(sub) == 2 and sub.label is not None and sub.label.tolist() == [1, 5]
 
 
 # --- RLE ------------------------------------------------------------------------------------------
@@ -94,19 +91,6 @@ def test_atomic_writes(tmp_path: Path) -> None:
     atomic.atomic_save_npy(tmp_path / "a.npy", np.arange(3))
     assert np.load(tmp_path / "a.npy").tolist() == [0, 1, 2]
     assert not [f for f in os.listdir(tmp_path) if f.endswith(".tmp")]
-
-
-def test_replace_dir(tmp_path: Path) -> None:
-    src, dst = tmp_path / "src", tmp_path / "dst"
-    src.mkdir()
-    (src / "a").write_text("new")
-    dst.mkdir()
-    (dst / "a").write_text("old")
-    atomic.replace_dir(src, dst)
-    assert (dst / "a").read_text() == "new" and not src.exists()
-    src.mkdir()
-    atomic.replace_dir(src, tmp_path / "fresh")
-    assert (tmp_path / "fresh").is_dir()
     atomic.fsync_dir(tmp_path)
 
 
@@ -180,8 +164,6 @@ def test_orientation_applied(tmp_path: Path) -> None:
     assert intr is not None and (intr.width, intr.height) == (30, 40)
     small = images.load_rgb(p, max_side=20)
     assert max(small.shape[:2]) == 20
-    assert images.scaled_size(4000, 3000, 1024) == (1024, 768)
-    assert images.scaled_size(100, 50, 1024) == (100, 50)
 
 
 def test_image_errors_and_types(tmp_path: Path) -> None:
@@ -192,7 +174,7 @@ def test_image_errors_and_types(tmp_path: Path) -> None:
     with pytest.raises(InputError):
         images.load_rgb(bad)
     ok = tmp_path / "x.png"
-    images.save_png(np.zeros((4, 4, 3), np.uint8), ok)
+    ok.write_bytes(images.png_bytes(np.zeros((4, 4, 3), np.uint8)))
     assert images.is_image_file(ok)
     hidden = tmp_path / ".DS_Store"
     hidden.write_bytes(b"")

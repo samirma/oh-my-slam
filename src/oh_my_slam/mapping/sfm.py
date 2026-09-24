@@ -395,9 +395,3 @@ class Sfm:
         rec = pycolmap.triangulate_points(rec, str(self.db), str(self.image_dir), str(out),
                                           clear_points=False, refine_intrinsics=False)
         return SfmModel(rec, method)
-
-
-def load_model(path: Path) -> SfmModel:
-    import pycolmap
-
-    return SfmModel(pycolmap.Reconstruction(str(path)), "stored")

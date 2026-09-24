@@ -8,7 +8,6 @@ right-handed, metric and gravity-aligned with z up. A :class:`Pose` is always ca
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -132,13 +131,3 @@ class Pose:
             quat_to_rot(np.asarray(d["quaternion_xyzw"], dtype=np.float64)),
             np.asarray(d["translation"], dtype=np.float64),
         )
-
-
-@dataclass(frozen=True)
-class FrameRef:
-    """One input frame: where it came from and when it was captured (video) if known."""
-
-    index: int
-    name: str
-    image_path: Path
-    timestamp: float | None = None

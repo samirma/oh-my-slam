@@ -88,12 +88,6 @@ def rotation_between(a: NDArray[Any], b: NDArray[Any]) -> F64:
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
-def rotation_angle_deg(R: NDArray[Any]) -> float:
-    """Angle of a rotation matrix in degrees."""
-    c = (np.trace(np.asarray(R, dtype=np.float64)) - 1.0) / 2.0
-    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
-
-
 def angle_between_deg(a: NDArray[Any], b: NDArray[Any]) -> float:
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -109,12 +103,6 @@ def se3(R: NDArray[Any], t: NDArray[Any]) -> F64:
     T[:3, :3] = R
     T[:3, 3] = t
     return T
-
-
-def se3_inverse(T: NDArray[Any]) -> F64:
-    T = np.asarray(T, dtype=np.float64)
-    R, t = T[:3, :3], T[:3, 3]
-    return se3(R.T, -R.T @ t)
 
 
 @dataclass(frozen=True)
@@ -176,25 +164,6 @@ def umeyama(src: NDArray[Any], dst: NDArray[Any], with_scale: bool = True) -> Si
 
 
 # --- camera projection ---------------------------------------------------------------------------
-
-
-def pixel_grid(width: int, height: int) -> tuple[F64, F64]:
-    """Pixel-centre coordinates (u, v) for an image, each of shape (H, W)."""
-    u, v = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
-    return u, v
-
-
-def unproject(depth: NDArray[Any], K: NDArray[Any], mask: NDArray[Any] | None = None) -> F64:
-    """Camera-frame points (N, 3) for pixels with finite positive depth (row-major order)."""
-    depth = np.asarray(depth, dtype=np.float64)
-    valid = np.isfinite(depth) & (depth > 0)
-    if mask is not None:
-        valid &= np.asarray(mask, dtype=bool)
-    v, u = np.nonzero(valid)
-    z = depth[v, u]
-    x = (u - K[0, 2]) / K[0, 0] * z
-    y = (v - K[1, 2]) / K[1, 1] * z
-    return np.stack([x, y, z], axis=1)
 
 
 def unproject_pixels(u: NDArray[Any], v: NDArray[Any], z: NDArray[Any], K: NDArray[Any]) -> F64:

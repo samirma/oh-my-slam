@@ -50,9 +50,9 @@ class FakeClient:
 
     def add(self, path: Path, rgb: NDArray[np.uint8], frame: FakeFrame) -> Path:
         if path.suffix == ".png":
-            from oh_my_slam.core.images import save_png
+            from oh_my_slam.core.images import png_bytes
 
-            save_png(rgb, path)
+            path.write_bytes(png_bytes(rgb))
         else:
             save_jpeg(rgb, path, quality=98)
         self.frames[str(Path(path).resolve())] = frame
@@ -113,10 +113,6 @@ class FakeClient:
         depth = (f.depth * self.depth_scale).astype(np.float32)
         atomic_save_npy(out / "depth.npy", depth)
         atomic_save_npy(out / "mask.npy", (depth > 0).astype(np.uint8))
-        normals = None
-        if req.want_normals:
-            atomic_save_npy(out / "normals.npy", np.zeros((*depth.shape, 3), np.float16))
-            normals = str(out / "normals.npy")
         h, w = depth.shape
         K = f.K
         if req.fov_x_deg is not None:
@@ -130,7 +126,7 @@ class FakeClient:
             intrinsics=p.PixelIntrinsics(fx=K.fx, fy=K.fy, cx=K.cx, cy=K.cy),
             fov_x_deg=float(np.degrees(2 * np.arctan(w / (2 * K.fx)))),
             depth_path=str(out / "depth.npy"), mask_path=str(out / "mask.npy"),
-            normals_path=normals, descriptor=[float(v) for v in desc],
+            descriptor=[float(v) for v in desc],
         )
 
     def gravity(self, req: p.GravityRequest) -> p.GravityResponse:

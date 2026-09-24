@@ -58,9 +58,6 @@ class StubGeometry(_Base):
         out = Path(req.out_dir)
         atomic_save_npy(out / "depth.npy", depth)
         atomic_save_npy(out / "mask.npy", np.ones((h, w), np.uint8))
-        normals = np.zeros((h, w, 3), np.float16)
-        normals[..., 2] = -1
-        atomic_save_npy(out / "normals.npy", normals)
         desc = np.resize(rgb.reshape(-1, 3).mean(0), 16).astype(np.float64) + 1e-3
         desc /= np.linalg.norm(desc)
         return {
@@ -68,7 +65,6 @@ class StubGeometry(_Base):
             "intrinsics": {"fx": fx, "fy": fx, "cx": w / 2, "cy": h / 2},
             "fov_x_deg": fov,
             "depth_path": str(out / "depth.npy"), "mask_path": str(out / "mask.npy"),
-            "normals_path": str(out / "normals.npy") if req.want_normals else None,
             "descriptor": desc.tolist() if req.want_descriptor else None,
             "timings": {},
         }

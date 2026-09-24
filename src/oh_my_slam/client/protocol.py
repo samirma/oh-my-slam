@@ -55,7 +55,6 @@ class GeometryRequest(BaseModel):
     max_side: int = 1024
     fov_x_deg: float | None = None
     num_tokens: int = 2500
-    want_normals: bool = True
     want_descriptor: bool = True
 
 
@@ -75,7 +74,6 @@ class GeometryResponse(BaseModel):
     fov_x_deg: float
     depth_path: str  # float32 (H, W), metres, 0 where invalid
     mask_path: str  # uint8 (H, W), 1 = valid
-    normals_path: str | None = None  # float16 (H, W, 3), camera frame (OpenCV)
     descriptor: list[float] | None = None  # L2-normalised global image descriptor
     timings: Timings = Field(default_factory=Timings)
 

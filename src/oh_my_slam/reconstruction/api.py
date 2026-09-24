@@ -1,4 +1,4 @@
-"""Single-image reconstruction: intrinsics, metric depth, normals, descriptor and gravity.
+"""Single-image reconstruction: intrinsics, metric depth, descriptor and gravity.
 
 Intrinsics priority: explicitly given (e.g. from COLMAP) > EXIF > model estimate; the chosen
 source is recorded. The depth grid has the long side <= ``max_side``; colours for points come from
@@ -22,7 +22,7 @@ from oh_my_slam.core import paths, timing
 from oh_my_slam.core.images import exif_intrinsics, load_rgb
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
-from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.gravity import GravityEstimate, refine_with_floor
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE, cloud_mask, frame_cloud
 
@@ -40,7 +40,6 @@ class FrameReconstruction:
     valid: NDArray[np.bool_]  # model validity mask
     K_grid: Intrinsics  # intrinsics of the depth grid
     intrinsics: Intrinsics  # full-resolution intrinsics (with source)
-    normals: NDArray[np.float16] | None = None
     descriptor: NDArray[np.float32] | None = None
     gravity: GravityEstimate | None = None
     meta: dict[str, Any] = field(default_factory=dict)
@@ -56,11 +55,6 @@ class FrameReconstruction:
         """Coloured points in the camera frame (OpenCV axes, metres) and their pixel indices."""
         return frame_cloud(self.depth, self.rgb, self.K_grid,
                            self.point_mask() if mask is None else mask)
-
-    def cloud_in(self, T_parent_cam: Pose, mask: NDArray[Any] | None = None) -> PointCloud:
-        cloud, _ = frame_cloud(self.depth, self.rgb, self.K_grid,
-                               self.point_mask() if mask is None else mask, T_parent_cam)
-        return cloud
 
 
 def connect_server() -> InferenceClient:
@@ -81,7 +75,6 @@ def reconstruct_image(
     max_side: int = MAX_GRID_SIDE,
     num_tokens: int = SINGLE_IMAGE_TOKENS,
     want_gravity: bool = True,
-    want_normals: bool = False,
     want_descriptor: bool = False,
     work_dir: Path | None = None,
     client: InferenceClient | None = None,
@@ -105,13 +98,11 @@ def reconstruct_image(
                     max_side=max_side,
                     fov_x_deg=fov_x,
                     num_tokens=num_tokens,
-                    want_normals=want_normals,
                     want_descriptor=want_descriptor,
                 )
             )
             depth = np.load(g.depth_path).astype(np.float32)
             valid = np.load(g.mask_path).astype(bool)
-            normals = np.load(g.normals_path) if (want_normals and g.normals_path) else None
         finally:
             if own_dir:
                 shutil.rmtree(out_dir, ignore_errors=True)
@@ -128,7 +119,6 @@ def reconstruct_image(
         valid=valid,
         K_grid=K_grid,
         intrinsics=intr,
-        normals=normals,
         descriptor=None if g.descriptor is None else np.asarray(g.descriptor, np.float32),
         meta={"geometry_s": g.timings.compute_s, "model_fov_x_deg": g.fov_x_deg},
     )

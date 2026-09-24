@@ -5,7 +5,7 @@ Layout (all paths relative to the map folder)::
     map.json            format version, map frame, scale, next ids, update history (written last)
     frames/fNNNNNN.jpg  keyframe images
     frames.json         per keyframe: camera, K, T_map_cam, registration stats, pose source, update
-    per_frame/fNNNNNN/  depth.npy (float16, metric, aligned), normals.npy, valid.png (latest wins),
+    per_frame/fNNNNNN/  depth.npy (float16, metric, aligned), valid.png (latest wins),
                         instances.json (RLE masks, labels, scores, object ids), descriptor.npy
     sfm/database.db     COLMAP database;  sfm/model/  COLMAP model in map coordinates
     cloud.ply  cloud_objects.npy  objects.json  objects/points_NNNNNN.npy
@@ -201,9 +201,6 @@ class MapReader:
     def image_path(self, fr: FrameRecord) -> Path:
         return self.path(fr.image)
 
-    def objects_json(self) -> dict[str, Any]:
-        return self.read_json(OBJECTS_JSON) if self.exists(OBJECTS_JSON) else {"objects": []}
-
     @property
     def update_id(self) -> int:
         return int(self.meta.get("update_count", 0))
@@ -283,11 +280,6 @@ class MapTransaction:
     def save_npy(self, rel: str, arr: NDArray[Any]) -> None:
         atomic_save_npy(self.stage(rel), arr)
 
-    def copy_in(self, rel: str, src: Path) -> Path:
-        dst = self.stage(rel)
-        shutil.copyfile(src, dst)
-        return dst
-
     def clone_for_edit(self, rel: str) -> Path:
         """Staged copy of a committed file (APFS clone when possible) to be modified in place."""
         dst = self.stage(rel)
@@ -297,21 +289,6 @@ class MapTransaction:
         res = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
         if res.returncode != 0:
             shutil.copyfile(src, dst)
-        return dst
-
-    def clone_tree_for_edit(self, rel: str) -> Path:
-        """Staged copy of a committed directory (e.g. the COLMAP model) to modify."""
-        dst = self.staging / rel
-        src = self.root / rel
-        if not dst.exists():
-            if src.is_dir():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                res = subprocess.run(["cp", "-cR", str(src), str(dst)], capture_output=True)
-                if res.returncode != 0:
-                    shutil.rmtree(dst, ignore_errors=True)
-                    shutil.copytree(src, dst)
-            else:
-                dst.mkdir(parents=True)
         return dst
 
     def delete(self, rel: str) -> None:
@@ -375,18 +352,6 @@ def read_frames(tx: MapTransaction) -> list[FrameRecord]:
     if not p.exists():
         return []
     return [FrameRecord.from_dict(f) for f in json.loads(p.read_text()).get("frames", [])]
-
-
-def tree_hash(root: Path, names: tuple[str, ...] = (MAP_JSON, FRAMES_JSON)) -> str:
-    """Hash of map.json and frames.json (used to prove a map was not modified)."""
-    import hashlib
-
-    h = hashlib.sha256()
-    for n in names:
-        p = Path(root) / n
-        h.update(n.encode())
-        h.update(p.read_bytes() if p.exists() else b"<missing>")
-    return h.hexdigest()
 
 
 def full_tree_hash(root: Path) -> str:

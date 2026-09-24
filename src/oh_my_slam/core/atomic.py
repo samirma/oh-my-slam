@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -55,21 +54,6 @@ def atomic_save_npy(path: Path, array: np.ndarray[Any, Any]) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-
-
-def replace_dir(src: Path, dst: Path) -> None:
-    """Move directory ``src`` over ``dst`` (dst removed first; not atomic across the two steps)."""
-    dst = Path(dst)
-    if dst.exists():
-        trash = dst.with_name(f".{dst.name}.old")
-        if trash.exists():
-            shutil.rmtree(trash)
-        dst.rename(trash)
-        Path(src).rename(dst)
-        shutil.rmtree(trash, ignore_errors=True)
-    else:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        Path(src).rename(dst)
 
 
 def fsync_dir(path: Path) -> None:

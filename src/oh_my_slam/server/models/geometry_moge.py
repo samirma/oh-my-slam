@@ -1,5 +1,5 @@
-"""MoGe-2 (ViT-L, normal head): metric point map, depth, validity mask, normals, intrinsics, plus a
-global DINOv2 class-token descriptor for retrieval."""
+"""MoGe-2 (ViT-L, normal head): metric point map, depth, validity mask, intrinsics, plus a global
+DINOv2 class-token descriptor for retrieval."""
 
 from __future__ import annotations
 
@@ -110,11 +110,6 @@ class MoGeGeometry:
         out_dir.mkdir(parents=True, exist_ok=True)
         atomic_save_npy(out_dir / "depth.npy", depth)
         atomic_save_npy(out_dir / "mask.npy", valid.astype(np.uint8))
-        normals_path = None
-        if req.want_normals and "normal" in out:
-            normals = np.where(valid[..., None], out["normal"], 0.0).astype(np.float16)
-            atomic_save_npy(out_dir / "normals.npy", normals)
-            normals_path = str(out_dir / "normals.npy")
         descriptor = None
         if req.want_descriptor and "descriptor" in out:
             descriptor = [float(v) for v in out["descriptor"]]
@@ -127,7 +122,6 @@ class MoGeGeometry:
             "fov_x_deg": math.degrees(2 * math.atan(w / (2 * fx))),
             "depth_path": str(out_dir / "depth.npy"),
             "mask_path": str(out_dir / "mask.npy"),
-            "normals_path": normals_path,
             "descriptor": descriptor,
             "timings": {},
         }
