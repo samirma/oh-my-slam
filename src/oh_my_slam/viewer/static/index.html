@@ -4,7 +4,6 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>oh-my-slam viewer</title>
-  <link rel="stylesheet" href="/static/vendor/lil-gui/lil-gui.min.css">
   <link rel="stylesheet" href="/static/style.css">
   <script type="importmap">
     {
@@ -17,27 +16,45 @@
 </head>
 <body>
   <div id="app">
-    <div id="viewport">
+    <main id="viewport">
       <div id="canvas-host"></div>
       <div id="topbar">
         <span id="title">oh-my-slam</span>
         <span id="stats" data-testid="stats">loading…</span>
+        <span id="busy" class="pill" role="status" aria-live="polite" hidden><span class="spinner-sm"></span>Updating point cloud…</span>
         <span class="spacer"></span>
-        <button id="reset-view" title="Reset view (R)">Reset view</button>
-        <button id="toggle-panel" title="Show/hide the side panel">☰</button>
+        <button id="reset-view" type="button" title="Reset view (R)">Reset view</button>
+        <button id="toggle-panel" type="button" title="Show/hide the side panel" aria-controls="panel" aria-expanded="true">☰</button>
       </div>
       <div id="tooltip" role="tooltip" hidden></div>
       <div id="help">Drag to orbit · right-drag / two-finger to pan · wheel to zoom · click a box to select · R resets the view</div>
-    </div>
+    </main>
     <aside id="panel" aria-label="Controls">
       <nav id="tabs" role="tablist">
-        <button role="tab" data-tab="layers" class="active">Layers</button>
-        <button role="tab" data-tab="display">Display</button>
-        <button role="tab" data-tab="catalogue">Catalogue</button>
-        <button role="tab" data-tab="image" id="tab-image-btn" hidden>Image</button>
+        <button type="button" role="tab" data-tab="controls" class="active" aria-selected="true">Controls</button>
+        <button type="button" role="tab" data-tab="catalogue" aria-selected="false">Catalogue <span id="obj-count" class="badge"></span></button>
+        <button type="button" role="tab" data-tab="image" id="tab-image-btn" aria-selected="false" hidden>Image</button>
       </nav>
-      <section id="tab-layers" class="tab active" role="tabpanel"></section>
-      <section id="tab-display" class="tab" role="tabpanel"></section>
+      <section id="tab-controls" class="tab active" role="tabpanel">
+        <details class="group" id="group-layers" open>
+          <summary>Layers</summary>
+          <div class="rows" id="layers"></div>
+        </details>
+        <details class="group" id="group-cloud" open>
+          <summary>Point cloud <span class="spinner-sm" id="cloud-busy" hidden></span></summary>
+          <div class="rows" id="cloud-controls"></div>
+          <div id="cloud-error" class="error" role="alert" hidden></div>
+          <div id="cloud-status" class="status" data-testid="cloud-status"></div>
+          <div class="cli-row">
+            <code id="cloud-cli" title="The same attributes on the command line (-p)"></code>
+            <button id="cloud-defaults" type="button" title="Reset every point-cloud attribute to its default">Defaults</button>
+          </div>
+        </details>
+        <details class="group" id="group-display" open>
+          <summary>Display</summary>
+          <div class="rows" id="display"></div>
+        </details>
+      </section>
       <section id="tab-catalogue" class="tab" role="tabpanel">
         <input id="filter" type="search" placeholder="Filter by label…" aria-label="Filter catalogue">
         <div class="table-wrap">
@@ -49,7 +66,7 @@
       </section>
       <section id="tab-image" class="tab" role="tabpanel">
         <img id="segmented" alt="Segmented image">
-        <p class="hint">Instance masks in each object's colour over the dimmed photo.</p>
+        <p class="hint">Each instance mask painted opaque in its object's colour over the dimmed photo.</p>
       </section>
     </aside>
   </div>

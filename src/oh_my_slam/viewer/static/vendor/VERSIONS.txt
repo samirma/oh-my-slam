@@ -3,4 +3,3 @@ three.js 0.186.0 (r186), MIT — https://registry.npmjs.org/three/-/three-0.186.
   files: build/three.module.js, build/three.core.js, examples/jsm/{controls/OrbitControls,
   renderers/CSS2DRenderer, lines/LineSegments2, lines/LineMaterial,
   lines/LineSegmentsGeometry}.js (as addons/…)
-lil-gui 0.21.0, MIT — https://registry.npmjs.org/lil-gui/-/lil-gui-0.21.0.tgz (dist/lil-gui.esm.min.js, lil-gui.min.css)

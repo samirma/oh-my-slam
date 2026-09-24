@@ -57,10 +57,46 @@ def test_endpoint_callers() -> None:
         assert owners <= {"client/client.py", "server/app.py", "client/protocol.py"}, owners
 
 
-def test_viewer_has_no_inference_fitting_or_colour_logic() -> None:
-    files = _py_files("viewer")
-    assert not _grep(r"import torch|from oh_my_slam\.client", files)
-    assert not _grep(r"segmentation\.(colors|obb|lift)|reconstruction\.(pointcloud|fusion)", files)
+# view.sh owns only the web server and UI (spec §2.5). It may call the owners' public APIs — one
+# reconstruction + segmentation run (segmentation.api), the read-only map export, the shared
+# point-cloud derivation (segmentation.cloud) and attribute definition (core.cloud_attrs) — but never
+# the internals behind them, and it re-implements none of their logic.
+VIEWER_FORBIDDEN_IMPORTS = (
+    r"import torch|oh_my_slam\.client|oh_my_slam\.server"
+    r"|segmentation\.(colors|obb|lift|detect)"
+    r"|reconstruction\.(pointcloud|fusion|depth|multiview)"
+    r"|mapping\.(api|objects|sfm|geometry|fusion)"
+)
+VIEWER_REIMPLEMENTATION = (
+    r"unproject|pixel_mask|depth_edge_mask|depth_normals|point_normals|voxel_keys"
+    r"|voxel_downsample|fit_obb|fit_upright_obb|color_for_id|color_hex_for_id|segment_colors"
+    r"|height_colors|PALETTE|np\.random|default_rng|K\.fx|\.K\(\)"
+)
+
+
+def test_viewer_only_calls_the_owners_apis() -> None:
+    files = _py_files("viewer") + [SRC / "cli" / "view.py"]
+    assert not _grep(VIEWER_FORBIDDEN_IMPORTS, files)
+    assert not _grep(VIEWER_REIMPLEMENTATION, files)
+    bundle = (SRC / "viewer" / "bundle.py").read_text("utf-8")
+    # every displayed cloud is the shared derivation, controlled by the shared attribute set
+    for call in ("derive_cloud(", "applicable(", "parse_cloud_attrs(", "image_cloud_source(",
+                 "reader_source(", "segment_frame(", "single_image_scene(", "scene_bytes("):
+        assert call in bundle, call
+
+
+def test_viewer_page_has_no_palette_or_randomness() -> None:
+    """Colours reach the page only as data (scene JSON, derived clouds); nothing random."""
+    from oh_my_slam.segmentation.colors import PALETTE_HEX, UNSEGMENTED_HEX
+
+    static = SRC / "viewer" / "static"
+    pages = [p for p in static.rglob("*") if p.suffix in (".js", ".html", ".css")
+             and "vendor" not in p.relative_to(static).parts]
+    assert pages
+    for p in pages:
+        text = p.read_text("utf-8").lower()
+        assert not [h for h in (*PALETTE_HEX, UNSEGMENTED_HEX) if h in text], p
+        assert "math.random" not in text, p
 
 
 @pytest.mark.parametrize("script", ["reconstruct.sh", "mapper.sh", "segment.sh", "view.sh",
