@@ -41,3 +41,5 @@ worktrees/
 .DS_Store
 .idea/
 .vscode/
+
+maps/

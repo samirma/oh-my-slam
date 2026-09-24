@@ -37,6 +37,7 @@ map must not require the inference server.
 ```sh
 reconstruct.sh -i <image>                # JSON scene description (default) to stdout
 reconstruct.sh -i <image> -f ply         # point cloud to stdout
+reconstruct.sh -i <image> -f ply -p color=segment,voxel=0.01,normals=on
 ```
 
 * `-i <image>` — input RGB image.
@@ -44,6 +45,31 @@ reconstruct.sh -i <image> -f ply         # point cloud to stdout
   it can be piped or redirected; diagnostics go to stderr.
   * `json` — the scene description of §3: detected objects, their labels and their OBBs.
   * `ply` — the raw point cloud, with per-point colour.
+* `-p <key=value[,key=value…]>` — point-cloud attributes for the PLY output (table below);
+  requires `-f ply`. Keys that are not given keep their defaults. An unknown key or an
+  out-of-range value fails with an actionable error before any inference runs.
+
+#### Point-cloud attributes
+
+| Key | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `color` | `rgb` \| `segment` \| `height` \| `none` | `rgb` | Per-point colour: the image colour; the object colour of the §2.4 colour contract (unsegmented points mid-grey, as in `segments.ply`); a ramp along the estimated up axis; or no colour properties at all. |
+| `stride` | integer ≥ 1 | `1` | Keep every n-th pixel along each image axis. |
+| `min-depth`, `max-depth` | metres | full range | Keep only pixels whose depth lies within the range. |
+| `edge` | relative depth jump ≥ 0 | `0.04` | Drop pixels on depth discontinuities (flying pixels); `0` disables the filter. |
+| `voxel` | metres ≥ 0 | `0` (off) | Keep one representative point per voxel. Colours are not averaged, so object colours stay exact. |
+| `normals` | `on` \| `off` | `off` | Add `nx ny nz` float properties. |
+| `label` | `on` \| `off` | `off` | Add an `int label` property holding the object `id` (`0` = unsegmented). |
+| `encoding` | `binary` \| `ascii` | `binary` | `binary_little_endian 1.0` or ASCII PLY. |
+
+* Pixel-level attributes (`stride`, depth range, `edge`) apply before unprojection; `voxel`
+  applies to the resulting 3D points.
+* Attributes shape only the emitted cloud. The scene description, OBBs, object `id`s and
+  colours are the same whatever `-p` says.
+* The PLY header records the effective attributes, defaults included, in a `comment` line,
+  so every file states how it was produced.
+* The attribute set, its defaults and its validation are defined once in the shared package
+  and reused by `view.sh` (§2.5).
 
 ### 2.3 Mapping — `mapper.sh`
 
@@ -122,11 +148,11 @@ Starts a local web server for interactive browser visualisation. Exactly one inp
 required: `-i` and `-m` are mutually exclusive.
 
 * `-i <image>` — reconstruct and segment one RGB image, then show its colour point cloud,
-  segmented image, object catalogue, and labelled OBBs.
+  segmented image, object catalogue, and labelled OBBs, camera-pose.
 * `-m <map-folder>` — load an existing map without modifying it, then show its complete
-  point cloud, photorealistic 3D mesh, camera poses, and labelled OBBs.
+  point cloud, camera poses, and labelled OBBs.
 
-The interface must provide independent controls for the available point-cloud, mesh,
+The interface must provide independent controls for the available point-cloud,
 camera-pose, segmentation, label, and OBB layers. `view.sh` owns only the web server and
 browser UI. It consumes reconstruction, mapping, and segmentation data through their
 existing implementations and must not duplicate depth inference, point-cloud generation,
@@ -155,3 +181,32 @@ Use a well-known JSON schema: the ASAM OpenLABEL OBB format, referenced by its s
 * The project must have comprehensive unit tests ensuring that all required components and
   their behaviour align with the expected plan.
 * The licence shouldn't be a blocker.
+
+## 5. Benchmark evaluators
+
+The project must ship benchmark evaluators that measure the accuracy and performance of
+every entry point, using the files in `examples/` as reference inputs:
+
+* `examples/restaurant.jpg` — single-frame reference for `reconstruct.sh`, `segment.sh -i`
+  and `view.sh -i`.
+* `examples/ainex-captures/` — an ordered 79-frame capture sequence for `mapper.sh` and
+  `segment.sh -m`. File names encode the capture motion
+  (`NNN_<direction>_<yaw°>_<level|up|down>`), which gives the expected relative yaw and pitch
+  of each frame.
+
+The evaluators must report at least:
+
+* **Performance** — per-stage and end-to-end wall time and peak memory, per image and per
+  mapping update.
+* **Pose accuracy** — estimated camera yaw and pitch against the headings encoded in the
+  capture file names, and the fraction of frames successfully registered.
+* **Map quality** — point-cloud consistency across overlapping frames (e.g. the loop back to
+  the starting heading), and stability of object `id`s, labels and OBBs across frames that
+  observe the same object.
+* **Segmentation** — detections, labels and scores per frame, plus contract checks (colour
+  contract, OpenLABEL validity, stdout purity).
+
+Evaluators run as a single command, write a machine-readable result (JSON) and a
+human-readable summary, and store results outside the repository so runs can be compared
+over time. Ground-truth annotations added later for the example files must be picked up
+without changing evaluator code.
