@@ -195,3 +195,38 @@ name = "Reconstruction never touches segmentation"
 type = "forbidden"
 source_modules = ["oh_my_slam.reconstruction"]
 forbidden_modules = ["oh_my_slam.segmentation", "oh_my_slam.mapping"]
+
+[[tool.importlinter.contracts]]
+name = "Mapping never talks to the inference server: depth through reconstruction, detections through segmentation"
+type = "forbidden"
+source_modules = ["oh_my_slam.mapping"]
+forbidden_modules = ["oh_my_slam.client"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Segmentation alone detects, lifts, fits OBBs and assigns colours: mapping and viewer use it through its API"
+type = "forbidden"
+source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
+forbidden_modules = [
+    "oh_my_slam.segmentation.detect",
+    "oh_my_slam.segmentation.lift",
+    "oh_my_slam.segmentation.obb",
+    "oh_my_slam.segmentation.colors",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Depth fusion (Open3D) lives in reconstruction; the server never loads it next to torch"
+type = "forbidden"
+source_modules = [
+    "oh_my_slam.cli",
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.client",
+    "oh_my_slam.schema",
+    "oh_my_slam.core",
+    "oh_my_slam.server",
+]
+forbidden_modules = ["open3d"]
+allow_indirect_imports = true

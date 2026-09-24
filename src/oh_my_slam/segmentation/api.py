@@ -1,12 +1,16 @@
 """Segmentation API: detections → exclusive masks → 3D points → upright OBBs → ids and colours.
 
 ``segment_frame`` serves ``segment.sh -i``, ``reconstruct.sh`` (JSON) and ``view.sh -i``;
-``lift_detections`` serves the mapper (per keyframe, in map coordinates); ``export_map`` draws a
-map's persistent objects on its keyframes. Emitted clouds are derived in ``segmentation.cloud``.
+``detect_alongside`` and ``lift_detections`` serve the mapper (detections of a keyframe while the
+mapper's own reconstruction call runs; instances in map coordinates), ``fit_object_obb`` fits the
+boxes of both; ``export_map`` draws a map's persistent objects on its keyframes. Emitted clouds are
+derived in ``segmentation.cloud``. Other packages use segmentation through this module (and
+``cloud``, ``scene``, ``artifacts``), never its internals (import-linter contract).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,28 +21,30 @@ from numpy.typing import NDArray
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import timing
 from oh_my_slam.core.geometry import depth_edge_mask
-from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.core.types import Pose
 from oh_my_slam.reconstruction.api import (
-    KEYFRAME_TOKENS,
     SINGLE_IMAGE_TOKENS,
     FrameReconstruction,
     reconstruct_image,
 )
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
+from oh_my_slam.segmentation.colors import UNSEGMENTED as UNSEGMENTED
 from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
     DETECTION_FLOOR,
-    Detection,
     detect,
     floor_gap,
     priority,
 )
+from oh_my_slam.segmentation.detect import Detection as Detection
+from oh_my_slam.segmentation.detect import compatible as compatible
 from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask
-from oh_my_slam.segmentation.obb import OBB, fit_obb
+from oh_my_slam.segmentation.obb import OBB as OBB
+from oh_my_slam.segmentation.obb import fit_obb
+from oh_my_slam.segmentation.obb import obb_iou_upright as obb_iou_upright
 
-KEYFRAME_GRID_SIDE = 768  # depth/segmentation grid of map keyframes
 
 @dataclass
 class SceneObject:
@@ -93,6 +99,14 @@ def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArr
     for i in sorted(range(len(dets)), key=lambda k: priority(dets[k])):
         owner[dets[i].mask & (owner < 0)] = i
     return [owner == i for i in range(len(dets))]
+
+
+def fit_object_obb(points: NDArray[Any], label: str, up: NDArray[Any],
+                   floor_level: float | None = None) -> OBB:
+    """Upright OBB of an object's points; floor-standing classes are grounded on the floor at
+    ``floor_level`` (the floor's coordinate along ``up``) when their visible bottom floats just
+    above it."""
+    return fit_obb(points, up, floor_level, floor_gap(label))
 
 
 def lift_detections(
@@ -150,7 +164,7 @@ def segment_frame(
     point_pixels: dict[int, NDArray[np.int64]] = {}
     points: dict[int, NDArray[np.float64]] = {}
     for oid, inst in enumerate(instances, start=1):
-        box = fit_obb(inst.lifted.points, up, floor, floor_gap(inst.detection.label))
+        box = fit_object_obb(inst.lifted.points, inst.detection.label, up, floor)
         label_map[inst.mask] = oid
         objects.append(SceneObject(
             id=oid, label=inst.detection.label, score=inst.detection.score, obb=box,
@@ -161,39 +175,51 @@ def segment_frame(
     return FrameSegmentation(frame, objects, label_map, point_pixels, points)
 
 
-def reconstruct_and_detect(
+def detect_alongside(
     image_path: Path,
     client: InferenceClient,
+    reconstruct: Callable[[InferenceClient], FrameReconstruction],
     *,
+    max_side: int,
     min_score: float = DEFAULT_MIN_SCORE,
-    keyframe: bool = False,
-    intrinsics: Intrinsics | None = None,
-    work_dir: Path | None = None,
+    floor: float | None = None,
 ) -> tuple[FrameReconstruction, list[Detection]]:
-    """Reconstruction and detection with the detection request issued concurrently, so the
-    server's queue stays busy while this process decodes and post-processes.
-
-    ``keyframe=True`` uses the mapper's settings (smaller grid, fewer tokens, descriptor). Map
-    keyframes always use the default threshold, so they ask the server for exactly it instead of
-    the lower ``DETECTION_FLOOR`` that keeps single-image ids stable across ``--min-score``."""
+    """Detections of ``image_path`` requested on a second connection while the caller's
+    ``reconstruct(client)`` runs, so the server's queue stays busy while this process decodes and
+    post-processes. ``max_side`` must be the reconstruction's grid; the server is asked for
+    everything above ``floor`` (default: ``min_score``)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    side = KEYFRAME_GRID_SIDE if keyframe else MAX_GRID_SIDE
-    floor = min_score if keyframe else DETECTION_FLOOR
     det_client = client.clone()
     try:
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(detect, image_path, min_score=min_score, floor=floor,
-                              max_side=side, client=det_client)
-            frame = reconstruct_image(
-                image_path, want_gravity=True, client=client, intrinsics=intrinsics,
-                max_side=side, num_tokens=KEYFRAME_TOKENS if keyframe else SINGLE_IMAGE_TOKENS,
-                want_descriptor=keyframe, work_dir=work_dir)
+            fut = pool.submit(detect, image_path, min_score=min_score,
+                              floor=min_score if floor is None else floor, max_side=max_side,
+                              client=det_client)
+            frame = reconstruct(client)
             dets = fut.result()
     finally:
         if det_client is not client:
             det_client.close()
     return frame, dets
+
+
+def reconstruct_and_detect(
+    image_path: Path,
+    client: InferenceClient,
+    *,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> tuple[FrameReconstruction, list[Detection]]:
+    """Single-image reconstruction (delegated to ``reconstruction``) and detection, issued
+    concurrently. The server is asked for detections down to ``DETECTION_FLOOR``, so the ids of
+    the objects kept do not depend on ``min_score``."""
+
+    def reconstruct(c: InferenceClient) -> FrameReconstruction:
+        return reconstruct_image(image_path, want_gravity=True, client=c, max_side=MAX_GRID_SIDE,
+                                 num_tokens=SINGLE_IMAGE_TOKENS)
+
+    return detect_alongside(image_path, client, reconstruct, max_side=MAX_GRID_SIDE,
+                            min_score=min_score, floor=DETECTION_FLOOR)
 
 
 @dataclass

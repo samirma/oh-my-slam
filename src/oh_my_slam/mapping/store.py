@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,28 @@ def frame_name(index: int) -> str:
     return f"f{index:06d}"
 
 
+def frame_file(name: str, file: str) -> str:
+    """Map-relative path of a keyframe's per-frame file (``depth.npy``, ``valid.png``, …)."""
+    return f"per_frame/{name}/{file}"
+
+
+def load_depth(path_of: Callable[[str], Path], name: str) -> NDArray[np.float32]:
+    """A keyframe's aligned metric depth (``path_of`` resolves map-relative paths)."""
+    return np.load(path_of(frame_file(name, "depth.npy"))).astype(np.float32)
+
+
+def load_valid(path_of: Callable[[str], Path], name: str,
+               depth: NDArray[Any] | None = None) -> NDArray[np.bool_]:
+    """A keyframe's validity with latest wins applied (``valid.png``), or ``depth > 0`` for a
+    keyframe stored without it."""
+    from oh_my_slam.core.images import load_png
+
+    p = path_of(frame_file(name, "valid.png"))
+    if p.exists():
+        return load_png(p) > 0
+    return (load_depth(path_of, name) if depth is None else np.asarray(depth)) > 0
+
+
 @dataclass
 class FrameRecord:
     index: int
@@ -79,6 +102,15 @@ class FrameRecord:
     @property
     def K_grid(self) -> Intrinsics:
         return self.K.resized(self.grid_width, self.grid_height)
+
+    @property
+    def order_key(self) -> tuple[float, ...]:
+        """Processing order for code that must visit keyframes one at a time: updates oldest
+        first, and within an update an order defined by content (the pose) — the keyframes of
+        one update are one observation. The index only separates bit-identical poses."""
+        T = self.T_map_cam
+        return (float(self.update_id), *T.t.tolist(), *T.R.reshape(-1).tolist(),
+                float(self.index))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,15 +210,10 @@ class MapReader:
         return f"per_frame/{name}"
 
     def depth(self, fr: FrameRecord) -> NDArray[np.float32]:
-        return np.load(self.path(f"{self.frame_dir(fr.name)}/depth.npy")).astype(np.float32)
+        return load_depth(self.path, fr.name)
 
     def valid(self, fr: FrameRecord) -> NDArray[np.bool_]:
-        from oh_my_slam.core.images import load_png
-
-        p = self.path(f"{self.frame_dir(fr.name)}/valid.png")
-        if not p.exists():
-            return self.depth(fr) > 0
-        return load_png(p) > 0
+        return load_valid(self.path, fr.name)
 
     def instances(self, fr: FrameRecord) -> list[dict[str, Any]]:
         rel = f"{self.frame_dir(fr.name)}/instances.json"

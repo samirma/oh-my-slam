@@ -97,8 +97,12 @@ leaves the previous map untouched.
   detections → COLMAP SIFT features + matching → GLOMAP (global) poses, incremental fallback,
   MapAnything multi-view poses for rotation-dominant input (chunked and anchored on posed views) →
   metric scale (MoGe vs SfM depth) and z-up map frame → per-keyframe depth alignment (sparse or
-  dense) → latest-wins validity → object association (Hungarian on projected-mask IoU / 3D overlap),
-  merging, removal on evidence of absence → map cloud (surface of a TSDF fusion); no mesh.
+  dense) → latest-wins validity → object association (all of the update's instances grouped at
+  once, strongest projected-mask IoU / 3D overlap first), merging (lower id kept), confirmation from
+  all evidence, removal on evidence of absence → map cloud (surface of a TSDF fusion; colour and
+  object id from the latest update that sees each point); no mesh. The keyframes of one update are
+  one observation: their order changes nothing but keyframe names and the numbering of new objects
+  (by earliest keyframe); a later update wins over an earlier one. Capture timestamps are not read.
 * **Ownership** (enforced by import-linter and `tests/unit/test_ownership.py`): reconstruction owns
   depth/intrinsics/gravity/clouds/fusion; segmentation owns instances, lifting, OBBs, colours,
   catalogue and artefacts, and derives every emitted cloud (`segmentation/cloud.py`: the point-cloud
