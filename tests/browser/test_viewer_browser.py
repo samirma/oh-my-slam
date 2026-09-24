@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.browser,
               pytest.mark.skipif(shutil.which("colmap") is None, reason="needs colmap")]
 
 CHANNELS = ("msedge", "chrome")
-LAYERS = ("points", "segments", "mesh", "cameras", "labels", "obbs")
+LAYERS = ("points", "segments", "cameras", "labels", "obbs")
 
 
 @pytest.fixture(scope="module")
@@ -68,7 +68,7 @@ def page(synth_map: Path) -> Iterator[tuple[Any, list[str], Path, str]]:
 def visibility(pg: Any) -> dict[str, bool]:
     return pg.evaluate("""() => {
       const g = window.__viewerGroups;
-      return {points: g.points.visible, segments: g.segments.visible, mesh: g.mesh.visible,
+      return {points: g.points.visible, segments: g.segments.visible,
               cameras: g.cameras.visible, labels: g.labels.visible, obbs: g.obbs.visible};
     }""")
 
@@ -118,7 +118,7 @@ def test_exact_obb_and_segment_colours(page: Any, tmp_path: Path) -> None:
     px = {tuple(p) for p in _pixels(pg, tmp_path)}
     assert (128, 128, 128) in px  # unsegmented points exactly mid-grey
     assert any(tuple(int(hx[i:i + 2], 16) for i in (1, 3, 5)) in px for _, hx in objs)
-    _set_only(pg, {"mesh", "cameras", "labels", "obbs"})
+    _set_only(pg, {"points", "cameras", "labels", "obbs"})
     assert errors == []
 
 

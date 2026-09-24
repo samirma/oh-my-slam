@@ -28,7 +28,6 @@ class ViewBundle:
     labels: NDArray[np.int32]  # per-point object id (0 = none)
     catalog: list[dict[str, Any]]
     frustums: list[dict[str, Any]] = field(default_factory=list)
-    mesh_path: Path | None = None
     segmented_png: bytes | None = None
     display_transform: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     stats: dict[str, Any] = field(default_factory=dict)
@@ -41,7 +40,6 @@ class ViewBundle:
             "display_transform": self.display_transform,
             "frustums": self.frustums,
             "catalog": self.catalog,
-            "has_mesh": self.mesh_path is not None and self.mesh_path.exists(),
             "has_segmented": self.segmented_png is not None,
             "points": len(self.cloud),
         }
@@ -108,7 +106,7 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
         catalog=catalog_rows(seg.objects),
         segmented_png=png_bytes(segmented_image(frame.rgb, seg.label_map)),
         display_transform=_upright_transform(up).tolist(),
-        stats={"points": len(cloud), "objects": len(seg.objects), "frames": 1, "triangles": 0},
+        stats={"points": len(cloud), "objects": len(seg.objects), "frames": 1},
     )
 
 
@@ -137,16 +135,6 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         }
         for f in reader.frames
     ]
-    mesh = reader.path(store.MESH_GLB)
-    triangles = 0
-    if mesh.exists():
-        try:
-            import trimesh
-
-            sc = trimesh.load(str(mesh), force="scene")
-            triangles = int(sum(len(g.faces) for g in sc.geometry.values()))
-        except Exception:
-            triangles = 0
     return ViewBundle(
         mode="map",
         title=reader.root.name,
@@ -156,7 +144,6 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         labels=labels,
         catalog=catalog_rows(objs),
         frustums=frustums,
-        mesh_path=mesh if mesh.exists() else None,
         stats={"points": len(disp), "objects": len(objs), "frames": len(reader.frames),
-               "triangles": triangles, "map_points": len(cloud)},
+               "map_points": len(cloud)},
     )

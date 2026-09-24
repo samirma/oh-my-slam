@@ -9,7 +9,6 @@ Per map, one JSON document on stdout:
   This is what stacks parallel copies of a surface when frames are merged without fusion.
 * ``planar_patches``: 10 cm patches of the cloud that are clearly planar: thickness (std along the
   normal) p50/p90 in mm and the share of points more than 1.5 cm off the patch plane.
-* ``cloud_to_mesh``: distance of cloud points to the textured mesh (cm percentiles).
 """
 
 from __future__ import annotations
@@ -102,31 +101,12 @@ def planar_patches(xyz: NDArray[Any], radius: float = PATCH_RADIUS, seeds: int =
             "off_plane_pct": round(float(np.mean(off)) * 100, 2)}
 
 
-def cloud_to_mesh(xyz: NDArray[Any], mesh_path: Path, n: int = 400_000) -> dict[str, Any]:
-    import open3d as o3d
-    import trimesh
-
-    if not mesh_path.exists() or len(xyz) == 0:
-        return {}
-    mesh = trimesh.load(mesh_path, force="mesh")
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.core.Tensor(np.asarray(mesh.vertices, np.float32)),
-                        o3d.core.Tensor(np.asarray(mesh.faces, np.uint32)))
-    sel = np.random.default_rng(0).choice(len(xyz), min(n, len(xyz)), replace=False)
-    d = scene.compute_distance(o3d.core.Tensor(np.asarray(xyz, np.float32)[sel])).numpy() * 100
-    p = np.percentile(d, [50, 75, 90, 95])
-    return {"p50_cm": round(float(p[0]), 2), "p75_cm": round(float(p[1]), 2),
-            "p90_cm": round(float(p[2]), 2), "p95_cm": round(float(p[3]), 2),
-            "over_5cm_pct": round(float((d > 5).mean()) * 100, 2)}
-
-
 def measure(root: Path) -> dict[str, Any]:
     reader = store.MapReader(root)
     xyz = read_ply(reader.path(store.CLOUD_PLY)).xyz if reader.exists(store.CLOUD_PLY) \
         else np.zeros((0, 3), np.float32)
     return {"map": str(reader.root), "keyframes": len(reader.frames), "cloud_points": len(xyz),
-            "frame_agreement": frame_agreement(reader), "planar_patches": planar_patches(xyz),
-            "cloud_to_mesh": cloud_to_mesh(xyz, reader.path(store.MESH_GLB))}
+            "frame_agreement": frame_agreement(reader), "planar_patches": planar_patches(xyz)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,10 +115,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     out = [measure(m) for m in args.map]
     for m in out:
-        pp, cm = m["planar_patches"], m["cloud_to_mesh"]
+        pp = m["planar_patches"]
         print(f"{Path(m['map']).name}: {m['cloud_points']} pts | patch thickness p50 "
-              f"{pp.get('thickness_p50_mm')} mm, off-plane {pp.get('off_plane_pct')} % | "
-              f"cloud→mesh p50/p90 {cm.get('p50_cm')}/{cm.get('p90_cm')} cm", file=sys.stderr)
+              f"{pp.get('thickness_p50_mm')} mm, off-plane {pp.get('off_plane_pct')} %",
+              file=sys.stderr)
     json.dump(out[0] if len(out) == 1 else out, sys.stdout, indent=1)
     sys.stdout.write("\n")
     return 0

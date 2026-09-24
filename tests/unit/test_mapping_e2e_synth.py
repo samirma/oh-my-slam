@@ -99,7 +99,7 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     doc_a = json.loads(res.payload)
     assert validation_errors(doc_a) == []
     assert len(res.new_frames) >= 13  # >= 90 % registered
-    assert (mdir / "map.json").exists() and (mdir / "mesh" / "mesh.glb").exists()
+    assert (mdir / "map.json").exists() and not (mdir / "mesh").exists()
     for rel in ("frames.json", "cloud.ply", "cloud_objects.npy", "objects.json", "scene.json",
                 "sfm/database.db", "sfm/model"):
         assert (mdir / rel).exists(), rel
@@ -107,7 +107,7 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     # per-stage timings (R44): in the result and, up to the commit, in the update history
     expected_stages = {"setup", "ingest", "inference", "features_matching", "sfm", "map_frame",
                        "depth_alignment", "persist_frames", "validity", "objects", "cloud",
-                       "fusion", "mesh", "texture", "export"}
+                       "export"}
     assert expected_stages | {"commit"} <= set(res.timings["stages_s"])
     assert sum(res.timings["stages_s"].values()) <= res.timings["total_s"] + 0.01
     assert res.timings["counts"]["keyframes_sampled"] == len(imgs_a)

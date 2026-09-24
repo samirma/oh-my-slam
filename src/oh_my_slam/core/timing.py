@@ -133,7 +133,7 @@ def summary_line(d: dict[str, Any]) -> str:
 
 
 def peak_rss_mb() -> dict[str, float]:
-    """Peak resident set of this process and of its largest waited-for child (COLMAP, OpenMVS).
+    """Peak resident set of this process and of its largest waited-for child (e.g. COLMAP).
 
     ``ru_maxrss`` is in bytes on macOS (kilobytes on Linux)."""
     unit = 1.0 if os.uname().sysname == "Darwin" else 1024.0

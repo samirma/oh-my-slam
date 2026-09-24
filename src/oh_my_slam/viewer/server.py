@@ -15,8 +15,8 @@ from oh_my_slam.viewer.bundle import ViewBundle
 
 STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
 _TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
-          ".json": "application/json", ".png": "image/png", ".glb": "model/gltf-binary",
-          ".txt": "text/plain", ".md": "text/plain"}
+          ".json": "application/json", ".png": "image/png", ".txt": "text/plain",
+          ".md": "text/plain"}
 
 
 def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
@@ -62,8 +62,6 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
                         if path not in cache:
                             cache[path] = fn()
                     self._send(200, ctype, cache[path])
-                elif path == "/api/mesh.glb" and bundle.mesh_path is not None:
-                    self._send(200, "model/gltf-binary", bundle.mesh_path.read_bytes())
                 elif path == "/api/segmented.png" and bundle.segmented_png is not None:
                     self._send(200, "image/png", bundle.segmented_png)
                 elif path.startswith("/static/"):

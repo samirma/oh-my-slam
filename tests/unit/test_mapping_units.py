@@ -368,7 +368,7 @@ def _cloud_frames(scales: list[float]) -> tuple[Room, list]:
         rec = store.FrameRecord(i, store.frame_name(i), "", "", None, 1, 320, 240, K, pose, 320, 240)
         # labels: synthetic box k -> object id k + 1 (floor and walls unlabelled)
         frames.append(FrameData(rec, (r.depth * s).astype(np.float32), r.depth > 0, r.rgb,
-                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32), None,
+                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32),
                                 i == len(scales) - 1))
     return room, frames
 

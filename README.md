@@ -17,7 +17,7 @@ bounding boxes (ASAM OpenLABEL 1.0.0). RGB only — depth, intrinsics and gravit
 ```sh
 brew install colmap                 # COLMAP 4.2.x (features/matching CLI; GLOMAP inside)
 uv sync                             # Python 3.12 environment in .venv (torch 2.14, pycolmap 4.2, …)
-./scripts/install_tools.sh          # checks colmap 4.2.x; installs OpenMVS 2.4.0 (sha256-pinned)
+./scripts/install_tools.sh          # checks colmap 4.2.x
 ./start_inference_server.sh         # first start downloads ~2 GB of weights (MapAnything 4.9 GB
                                     # comes from the HF cache if present); later starts ~30 s
 ```
@@ -66,8 +66,7 @@ frames/fNNNNNN.jpg, frames.json   keyframes: camera, K, T_map_cam, registration 
 per_frame/fNNNNNN/   depth.npy (float16, aligned metres), valid.png (latest wins),
                      instances.json (RLE masks, labels, scores, object ids), descriptor.npy
 sfm/database.db, sfm/model/       COLMAP database and model (map coordinates)
-cloud.ply, cloud_objects.npy      map cloud (latest colour wins) and object id per point
-mesh/mesh.glb                     textured mesh (TSDF fusion + OpenMVS texturing)
+cloud.ply, cloud_objects.npy      map cloud (TSDF-fused surface, latest colour wins) and object id per point
 objects.json, objects/points_NNNNNN.npy, scene.json
 ```
 
@@ -85,9 +84,9 @@ leaves the previous map untouched.
   MapAnything multi-view poses for rotation-dominant input (chunked and anchored on posed views) →
   metric scale (MoGe vs SfM depth) and z-up map frame → per-keyframe depth alignment (sparse or
   dense) → latest-wins validity → object association (Hungarian on projected-mask IoU / 3D overlap),
-  merging, removal on evidence of absence → cloud, TSDF mesh, OpenMVS texture.
+  merging, removal on evidence of absence → map cloud (surface of a TSDF fusion); no mesh.
 * **Ownership** (enforced by import-linter and `tests/unit/test_ownership.py`): reconstruction owns
-  depth/intrinsics/gravity/clouds/fusion/mesh/texture; segmentation owns instances, calibration,
+  depth/intrinsics/gravity/clouds/fusion; segmentation owns instances, calibration,
   lifting, OBBs, colours, catalogue and artefacts; mapping owns inputs, SfM, map frame, identity and
   the store; the viewer only serves data. Shell scripts never call each other.
 

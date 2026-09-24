@@ -7,7 +7,6 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,15 +17,13 @@ from oh_my_slam.viewer.server import serve, url_of
 
 
 @pytest.fixture
-def server(tmp_path: Path) -> Iterator[str]:
-    mesh = tmp_path / "mesh.glb"
-    mesh.write_bytes(b"glTF-fake")
+def server() -> Iterator[str]:
     cloud = PointCloud(np.arange(12, dtype=np.float32).reshape(4, 3),
                        np.array([[1, 2, 3]] * 4, np.uint8))
     b = ViewBundle(
         mode="map", title="t", scene={"openlabel": {"metadata": {"schema_version": "1.0.0"}}},
         cloud=cloud, segments=np.full((4, 3), 128, np.uint8), labels=np.array([0, 1, 1, 0]),
-        catalog=[{"id": 1}], frustums=[], mesh_path=mesh, segmented_png=b"\x89PNGfake",
+        catalog=[{"id": 1}], frustums=[], segmented_png=b"\x89PNGfake",
         stats={"points": 4},
     )
     httpd = serve(b, 0)
@@ -53,14 +50,13 @@ def test_routes(server: str) -> None:
     assert code == 200 and "text/html" in ctype and b"importmap" in body
     code, _, body = get(server + "api/meta")
     meta = json.loads(body)
-    assert meta["mode"] == "map" and meta["points"] == 4 and meta["has_mesh"]
+    assert meta["mode"] == "map" and meta["points"] == 4 and meta["has_segmented"]
     assert json.loads(get(server + "api/scene")[2])["openlabel"]["metadata"]
     assert np.frombuffer(get(server + "api/points.bin")[2], "<f4").reshape(-1, 3).shape == (4, 3)
     assert get(server + "api/colors.bin")[2] == bytes([1, 2, 3] * 4)
     assert set(get(server + "api/segments.bin")[2]) == {128}
     assert np.frombuffer(get(server + "api/labels.bin")[2], "<i4").tolist() == [0, 1, 1, 0]
     assert get(server + "api/catalog")[2] == b'[{"id": 1}]'
-    assert get(server + "api/mesh.glb")[2] == b"glTF-fake"
     assert get(server + "api/segmented.png")[1] == "image/png"
     code, ctype, _ = get(server + "static/app.js")
     assert code == 200 and ctype == "text/javascript"

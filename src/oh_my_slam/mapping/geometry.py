@@ -1,6 +1,6 @@
-"""Map geometry for an update: the coloured cloud (TSDF-fused surface; latest colour wins, object
-id per point) and the textured mesh (TSDF fusion of the valid, aligned depth maps, oldest first) — built with the
-reconstruction package's fusion/mesh/texture code."""
+"""Map geometry for an update: the coloured cloud (surface of a TSDF fusion of the valid, aligned
+depth maps; latest colour wins, object id per point), built with the reconstruction package's
+fusion code."""
 
 from __future__ import annotations
 
@@ -18,9 +18,7 @@ from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_valid
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
-from oh_my_slam.reconstruction.mesh import clean_mesh
 from oh_my_slam.reconstruction.pointcloud import cloud_mask
-from oh_my_slam.reconstruction.texture import TextureView, texture_mesh
 
 # Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
 # centimetres still average into one surface), attributed from the latest frame that sees it.
@@ -28,9 +26,6 @@ CLOUD_TRUNC_VOXELS = 8.0
 CLOUD_MIN_VIEWS = 3  # a surface voxel must be seen by this many frames (fewer in tiny maps)
 VIS_TOL_MIN = 0.02
 VIS_TOL_REL = 0.03
-MIN_TEXTURE_VALID = 0.7
-MAX_TEXTURE_VIEWS = 300
-MESH_MAX_FACES = 200_000
 
 
 @dataclass
@@ -40,7 +35,6 @@ class FrameData:
     valid: NDArray[np.bool_]
     rgb: NDArray[np.uint8]
     labels: NDArray[np.int32]
-    image_path: Any
     is_new: bool
 
 
@@ -48,8 +42,6 @@ class FrameData:
 class MapGeometry:
     cloud: PointCloud  # map cloud, label = object id
     new_cloud: PointCloud  # points of this update's keyframes
-    mesh_method: str
-    voxel: float
     stats: dict[str, Any]
 
 
@@ -61,18 +53,16 @@ def _frame_data(ctx: Any, rec: store.FrameRecord, objs: ObjectState,
     if nf is not None and nf.depth is not None:
         depth = nf.depth
         rgb = nf.frame.rgb
-        image_path = tx.current(rec.image)
     else:
         depth = np.load(tx.current(f"{d}/depth.npy")).astype(np.float32)
-        image_path = tx.current(rec.image)
-        rgb = load_rgb(image_path, max_side=max(rec.grid_width, rec.grid_height))
+        rgb = load_rgb(tx.current(rec.image), max_side=max(rec.grid_width, rec.grid_height))
     valid = load_valid(tx.current(f"{d}/valid.png"), depth)
     inst_p = tx.current(f"{d}/instances.json")
     import json
 
     insts = json.loads(inst_p.read_text()).get("instances", []) if inst_p.exists() else []
     labels = label_map_for(insts, depth.shape, objs)
-    return FrameData(rec, depth, valid, rgb, labels, image_path, nf is not None)
+    return FrameData(rec, depth, valid, rgb, labels, nf is not None)
 
 
 def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
@@ -84,12 +74,12 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
     the TSDF averages them into a single surface. Speckle seen by one view only is dropped once
     enough frames are fused.
     """
-    fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS, with_color=False)
+    fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS)
     for fd in frames:
         m = cloud_mask(fd.depth, fd.valid)
-        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rgb, fd.rec.K_grid.K(), fd.rec.T_map_cam)
+        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam)
     views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
-    pts, _ = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
+    pts = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
     return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
 
 
@@ -129,7 +119,7 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
 
 def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
                    progress: Any) -> MapGeometry:
-    """Cloud, TSDF mesh and texture (timed as the stages cloud / fusion / mesh / texture)."""
+    """The map cloud with its object ids (timed as the stage ``cloud``)."""
     tx = ctx.tx
     t0 = time.perf_counter()
     with timing.stage("cloud"):
@@ -153,35 +143,6 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         tx.save_npy(store.CLOUD_OBJECTS, cloud.label.astype(np.int32))
     progress(f"cloud: {len(cloud)} points (voxel {cloud_voxel * 100:.1f} cm) in "
              f"{time.perf_counter() - t0:.0f} s")
-    t1 = time.perf_counter()
-    with timing.stage("fusion"):
-        fusion = TsdfFusion(voxel, depth_max)
-        for fd in frames:
-            if fd.rec.low_confidence:
-                continue
-            fusion.integrate(np.where(fd.valid, fd.depth, 0.0), fd.rgb, fd.rec.K_grid.K(),
-                             fd.rec.T_map_cam)
-    # OpenMVS view selection is superlinear in the face count (100 k faces: 2 s, 250 k: 32 s,
-    # 740 k: > 10 min on a synthetic room); the texture carries the detail, so the textured
-    # mesh is decimated to MESH_MAX_FACES.
-    with timing.stage("mesh"):
-        mesh = clean_mesh(fusion.extract_mesh(), max_faces=MESH_MAX_FACES)
-    with timing.stage("texture"):
-        views = [
-            TextureView(fd.image_path, fd.rec.K.K(), fd.rec.width, fd.rec.height,
-                        fd.rec.T_map_cam)
-            for fd in frames
-            if not fd.rec.low_confidence and fd.valid.mean() >= MIN_TEXTURE_VALID
-        ]
-        if len(views) > MAX_TEXTURE_VIEWS:
-            keep = np.linspace(0, len(views) - 1, MAX_TEXTURE_VIEWS).round().astype(int)
-            views = [views[i] for i in keep]
-        out = tx.stage(store.MESH_GLB)
-        method = texture_mesh(mesh, views, out, ctx.work / "texture") if len(mesh.triangles) \
-            else "empty"
-    progress(f"mesh: {len(mesh.triangles)} faces, textured with {method} from {len(views)} "
-             f"views in {time.perf_counter() - t1:.0f} s")
-    stats = {"cloud_points": len(cloud), "mesh_faces": len(mesh.triangles), "voxel": voxel,
-             "texture": method, "texture_views": len(views)}
+    stats = {"cloud_points": len(cloud), "voxel": cloud_voxel}
     ctx.notes["geometry"] = stats
-    return MapGeometry(cloud, new_cloud, method, voxel, stats)
+    return MapGeometry(cloud, new_cloud, stats)

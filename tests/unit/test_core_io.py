@@ -123,12 +123,8 @@ def test_paths_short_socket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert paths.scratch_dir().is_dir()
     monkeypatch.setenv("OH_MY_SLAM_WEIGHTS_DIR", str(tmp_path / "w"))
     assert paths.weights_dir().is_dir()
-    monkeypatch.setenv("OH_MY_SLAM_OPENMVS_DIR", "/x/openmvs")
-    assert paths.openmvs_dir() == Path("/x/openmvs")
     monkeypatch.setenv("OH_MY_SLAM_DATA_DIR", "/x/data")
     assert paths.data_dir() == Path("/x/data")
-    monkeypatch.delenv("OH_MY_SLAM_TOOLS_DIR", raising=False)
-    assert "oh-my-slam" in str(paths.tools_dir())
 
 
 def test_error_codes() -> None:

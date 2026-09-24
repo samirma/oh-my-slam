@@ -1,1 +1,1 @@
-"""Reconstruction owner: depth, intrinsics, gravity, point clouds, fusion, mesh, texture."""
+"""Reconstruction owner: depth, intrinsics, gravity, point clouds, fusion."""

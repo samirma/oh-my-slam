@@ -8,7 +8,7 @@ Layout (all paths relative to the map folder)::
     per_frame/fNNNNNN/  depth.npy (float16, metric, aligned), normals.npy, valid.png (latest wins),
                         instances.json (RLE masks, labels, scores, object ids), descriptor.npy
     sfm/database.db     COLMAP database;  sfm/model/  COLMAP model in map coordinates
-    cloud.ply  cloud_objects.npy  mesh/mesh.glb  objects.json  objects/points_NNNNNN.npy
+    cloud.ply  cloud_objects.npy  objects.json  objects/points_NNNNNN.npy
     scene.json          cached full scene
 
 Updates write every new or changed file into ``.staging/`` first. ``commit`` writes the list of
@@ -45,7 +45,6 @@ OBJECTS_JSON = "objects.json"
 SCENE_JSON = "scene.json"
 CLOUD_PLY = "cloud.ply"
 CLOUD_OBJECTS = "cloud_objects.npy"
-MESH_GLB = "mesh/mesh.glb"
 SFM_DB = "sfm/database.db"
 SFM_MODEL = "sfm/model"
 STAGING = ".staging"

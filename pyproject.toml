@@ -13,7 +13,6 @@ dependencies = [
     "av>=15",
     "opencv-python-headless>=4.12,<5",
     "jsonschema>=4.23",
-    "trimesh>=4.5",
     "psutil>=6",
     # geometry back-ends
     "open3d==0.20.*",
@@ -97,7 +96,7 @@ module = ["oh_my_slam.server.models.*", "oh_my_slam.tools.*"]
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# NumPy dtype generics and untyped third-party APIs (open3d, trimesh, pycolmap) produce noise here.
+# NumPy dtype generics and untyped third-party APIs (open3d, pycolmap) produce noise here.
 module = ["oh_my_slam.mapping.*", "oh_my_slam.viewer.*", "oh_my_slam.reconstruction.*",
           "oh_my_slam.server.app"]
 disable_error_code = ["misc", "union-attr", "arg-type", "attr-defined", "str-bytes-safe",

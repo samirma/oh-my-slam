@@ -1,6 +1,6 @@
 """Rotation-dominant input (a camera turning in place, like the AiNex robot head): detection,
 chunked pose-anchored multi-view poses, then an update anchored on the existing map; plus the
-textured mesh, -t single PLY and fixed old poses."""
+-t single PLY and fixed old poses."""
 
 from __future__ import annotations
 
@@ -57,14 +57,6 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
     centres = np.array([f.T_map_cam.t for f in r.frames])
     assert np.linalg.norm(centres - centres.mean(0), axis=1).max() < 0.3
     old_poses = {f.name: f.T_map_cam.matrix() for f in r.frames}
-
-    # textured mesh
-    import trimesh
-
-    scene = trimesh.load(mdir / "mesh" / "mesh.glb", force="scene")
-    geom = next(iter(scene.geometry.values()))
-    tex = np.asarray(geom.visual.material.baseColorTexture.convert("RGB"))
-    assert tex.std() > 10
 
     # anchored update, -t single -f ply
     res2 = update(mdir, [tmp_path / "b"], mode="single", fmt="ply", client=client,

@@ -3,7 +3,7 @@
 Order (design, "Mapping update"): lock + stage → inputs/keyframes → per-keyframe geometry,
 gravity and detections (delegated to reconstruction / segmentation) → features, matching, poses →
 focal re-run rule → metric scale, gravity and map frame (new maps) → per-keyframe depth
-alignment → latest wins → objects → fusion, cloud, mesh → scene export → commit.
+alignment → latest wins → objects → fused cloud → scene export → commit.
 """
 
 from __future__ import annotations
@@ -785,7 +785,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str, 
                 validity.apply_latest_wins(ctx, records, progress)
             with stage("objects"):
                 objs = objects.update_objects(ctx, records, progress)
-            geo = build_geometry(ctx, records, objs, progress)  # stages cloud/fusion/mesh/texture
+            geo = build_geometry(ctx, records, objs, progress)  # stage cloud
             new_names = [nf.kf.name for nf in new if nf.record is not None]
             timing.count(keyframes_registered=len(new_names), keyframes_rejected=len(ctx.rejected),
                          map_frames_after=len(records), objects=len(objs.objects),

@@ -3,7 +3,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
@@ -12,7 +11,7 @@ import GUI from '/static/vendor/lil-gui/lil-gui.esm.min.js';
 const $ = (sel) => document.querySelector(sel);
 const state = {
   meta: null, scene: null, objects: [], selected: null, hovered: null,
-  layers: { points: true, segments: false, mesh: true, cameras: true, labels: true, obbs: true },
+  layers: { points: true, segments: false, cameras: true, labels: true, obbs: true },
   display: { pointSize: 2.0, labelDensity: 12, background: '#15171c' },
   bbox: new THREE.Box3(),
 };
@@ -43,7 +42,7 @@ controls.screenSpacePanning = true;
 const root = new THREE.Group();  // display transform (image mode: camera → z-up)
 scene.add(root);
 const groups = {};
-for (const k of ['points', 'segments', 'mesh', 'cameras', 'obbs', 'labels', 'pick']) {
+for (const k of ['points', 'segments', 'cameras', 'obbs', 'labels', 'pick']) {
   groups[k] = new THREE.Group();
   groups[k].name = k;
   root.add(groups[k]);
@@ -201,23 +200,6 @@ function buildFrustums(frustums, size) {
   groups.cameras.add(lines);
 }
 
-// ---------------------------------------------------------------- mesh (unlit, exact texture)
-async function loadMesh() {
-  const buf = await fetchWithProgress('/api/mesh.glb', 'textured mesh');
-  const gltf = await new Promise((resolve, reject) => new GLTFLoader().parse(buf, '', resolve, reject));
-  let tris = 0;
-  gltf.scene.traverse((m) => {
-    if (!m.isMesh) return;
-    const old = m.material;
-    const map = old.map || null;
-    if (map) map.colorSpace = THREE.SRGBColorSpace;
-    m.material = new THREE.MeshBasicMaterial({ map, vertexColors: !map && !!m.geometry.attributes.color, side: THREE.DoubleSide });
-    tris += m.geometry.index ? m.geometry.index.count / 3 : m.geometry.attributes.position.count / 3;
-  });
-  groups.mesh.add(gltf.scene);
-  return tris;
-}
-
 // ---------------------------------------------------------------- framing
 function frameBox(box, pad = 1.15) {
   const sphere = box.getBoundingSphere(new THREE.Sphere());
@@ -366,20 +348,19 @@ window.addEventListener('keydown', (e) => {
 });
 
 function applyLayers() {
-  for (const k of ['points', 'segments', 'mesh', 'cameras', 'obbs']) groups[k].visible = state.layers[k];
+  for (const k of ['points', 'segments', 'cameras', 'obbs']) groups[k].visible = state.layers[k];
   groups.pick.visible = state.layers.obbs;
   updateLabels();
 }
 function buildGui() {
   const layers = new GUI({ container: $('#tab-layers'), title: 'Layers' });
   const avail = {
-    points: 'Point cloud (RGB)', segments: 'Segmentation (object colours)', mesh: 'Textured mesh',
+    points: 'Point cloud (RGB)', segments: 'Segmentation (object colours)',
     cameras: 'Camera poses', labels: 'Labels', obbs: 'Oriented boxes',
   };
   for (const [k, name] of Object.entries(avail)) {
     const c = layers.add(state.layers, k).name(name).onChange(applyLayers);
     c.domElement.dataset.layer = k;
-    if (k === 'mesh' && !state.meta.has_mesh) c.disable();
     if (k === 'cameras' && !state.meta.frustums.length) c.disable();
   }
   const disp = new GUI({ container: $('#tab-display'), title: 'Display' });
@@ -442,10 +423,6 @@ async function main() {
     }
   }
   buildObjects(state.scene);
-  let tris = 0;
-  if (state.meta.has_mesh) {
-    try { tris = await loadMesh(); } catch (err) { console.warn('mesh failed to load', err); }
-  }
   const size = state.bbox.isEmpty() ? 1 : state.bbox.getSize(new THREE.Vector3()).length();
   buildFrustums(state.meta.frustums, size);
   for (const f of state.meta.frustums) state.bbox.expandByPoint(new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]));
@@ -455,13 +432,11 @@ async function main() {
   }
   state.layers.segments = false;
   state.layers.cameras = state.meta.frustums.length > 0;
-  state.layers.mesh = state.meta.has_mesh;
-  state.layers.points = !state.meta.has_mesh;
   buildGui();
   buildCatalogue();
   applyLayers();
   const s = state.meta.stats;
-  $('#stats').textContent = `${Number(s.points).toLocaleString()} points · ${Number(tris || s.triangles || 0).toLocaleString()} triangles · ${s.objects} objects · ${s.frames} frame${s.frames === 1 ? '' : 's'}`;
+  $('#stats').textContent = `${Number(s.points).toLocaleString()} points · ${s.objects} objects · ${s.frames} frame${s.frames === 1 ? '' : 's'}`;
   resize();
   resetView();
   $('#loading').classList.add('done');
