@@ -74,9 +74,6 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
 
 ## Working rules for this repo
 
-- **Never name a directory `benchmark/` or `eval_results/`.** An external AI IDE (Antigravity)
-  deletes directories with those names across checkouts. Keep evaluation data and anything
-  irreplaceable outside the repo.
 - **Never bind a fixed port.** Orphaned processes from earlier work hold ports such as 8080, 8081
   and 8088.
 - Run benchmarks one at a time; concurrent GPU work invalidates timings.

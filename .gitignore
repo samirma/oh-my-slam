@@ -28,8 +28,7 @@ playwright-report/
 # Logs (OpenMVS / COLMAP tools write *.log into their working directory)
 *.log
 
-# Local outputs. Maps, validation runs, reports and datasets live outside the repo
-# in ~/oh-my-slam-data; never create benchmark/ or eval_results/ here (see CLAUDE.md).
+# Local outputs. Maps, evaluation runs and datasets live outside the repo in ~/oh-my-slam-data.
 /out/
 
 # Claude Code: session worktrees and personal settings
