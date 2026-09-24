@@ -1,12 +1,11 @@
 """Mapper inputs: ``-a`` expansion (image files, image folders, or exactly one video), keyframe
-sampling and naming, capture timestamps."""
+sampling and naming."""
 
 from __future__ import annotations
 
 import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from PIL import ExifTags, Image
@@ -38,7 +37,6 @@ class Keyframe:
     index: int
     path: Path  # JPEG written into the map staging area
     source: str
-    timestamp: float | None
     exif: Intrinsics | None  # intrinsics from the original file's EXIF, if any
 
 
@@ -72,19 +70,6 @@ def resolve_inputs(args: list[Path]) -> InputSpec:
     return InputSpec("images", images)
 
 
-def _exif_time(path: Path) -> float | None:
-    try:
-        with Image.open(path) as img:
-            exif = img.getexif()
-            sub = exif.get_ifd(ExifTags.IFD.Exif)
-            raw = sub.get(0x9003) or exif.get(0x0132)  # DateTimeOriginal / DateTime
-        if not raw:
-            return None
-        return datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S").timestamp()
-    except Exception:
-        return None
-
-
 def _write_image_keyframe(src: Path, dst: Path) -> None:
     """Upright JPEG copy: byte copy for upright JPEGs (keeps EXIF), re-encode otherwise."""
     with Image.open(src) as img:
@@ -109,12 +94,12 @@ def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int
             name = f"f{idx:06d}"
             path = frames_dir / f"{name}.jpg"
             save_jpeg(f.rgb, path, quality=95)
-            yield Keyframe(name, idx, path, f"{spec.video}@{f.timestamp:.3f}", f.timestamp, None)
+            yield Keyframe(name, idx, path, f"{spec.video}@{f.timestamp:.3f}", None)
             idx += 1
         return
     for src in spec.images:
         name = f"f{idx:06d}"
         path = frames_dir / f"{name}.jpg"
         _write_image_keyframe(src, path)
-        yield Keyframe(name, idx, path, str(src), _exif_time(src), exif_intrinsics(src))
+        yield Keyframe(name, idx, path, str(src), exif_intrinsics(src))
         idx += 1

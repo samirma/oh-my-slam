@@ -44,7 +44,7 @@ def full_scene(root: Path, meta: dict[str, Any], records: list[store.FrameRecord
     for r in recs:
         key = camera_key(r.camera_id)
         frames[str(r.index)] = ol.frame(
-            timestamp=r.timestamp if r.timestamp is not None else float(r.index),
+            timestamp=float(r.index),
             stream_uris={key: r.image},
             transforms={f"{key}_to_map": ol.transform(key, "map", r.T_map_cam)},
             keyframe=r.name, pose_source=r.pose_source, update_id=r.update_id,

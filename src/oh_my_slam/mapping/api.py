@@ -512,7 +512,7 @@ def _record(ctx: UpdateContext, nf: NewFrame, T: Pose, source: str, K: Intrinsic
     g = nf.frame.gravity
     return store.FrameRecord(
         index=nf.kf.index, name=nf.kf.name, image=f"frames/{nf.kf.name}.jpg",
-        source=nf.kf.source, timestamp=nf.kf.timestamp, camera_id=camera_id, width=w, height=h,
+        source=nf.kf.source, camera_id=camera_id, width=w, height=h,
         K=K, T_map_cam=T, grid_width=gw, grid_height=gh, pose_source=source,
         update_id=ctx.update_id, stats=stats,
         up_cam=None if g is None else [float(v) for v in g.up_cam],

@@ -61,8 +61,7 @@ class FrameRecord:
     index: int
     name: str
     image: str  # relative path of the keyframe image
-    source: str  # original input (file, or video + timestamp)
-    timestamp: float | None
+    source: str  # original input (file, or video + time in the video)
     camera_id: int
     width: int
     height: int
@@ -87,7 +86,6 @@ class FrameRecord:
             "name": self.name,
             "image": self.image,
             "source": self.source,
-            "timestamp": self.timestamp,
             "camera_id": self.camera_id,
             "width": self.width,
             "height": self.height,
@@ -109,7 +107,6 @@ class FrameRecord:
             name=d["name"],
             image=d["image"],
             source=d.get("source", ""),
-            timestamp=d.get("timestamp"),
             camera_id=int(d.get("camera_id", 0)),
             width=int(d["width"]),
             height=int(d["height"]),

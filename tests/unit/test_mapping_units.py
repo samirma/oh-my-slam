@@ -125,7 +125,7 @@ def test_store_lock_delete_and_folder_rules(tmp_path: Path) -> None:
 
 
 def test_frame_record_roundtrip() -> None:
-    rec = store.FrameRecord(3, "f000003", "frames/f000003.jpg", "x.jpg", 1.5, 1, 640, 480,
+    rec = store.FrameRecord(3, "f000003", "frames/f000003.jpg", "x.jpg", 1, 640, 480,
                             Intrinsics(500, 500, 320, 240, 640, 480, "colmap"),
                             Pose(rot_z(0.3), np.array([1.0, 2.0, 3.0])), 320, 240)
     back = store.FrameRecord.from_dict(json.loads(json.dumps(rec.to_dict())))
@@ -181,7 +181,7 @@ def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
     clip = tmp_path / "c.mp4"
     _make_clip(clip, seconds=2.0, fps=10)
     vk = list(ingest.keyframes(ingest.resolve_inputs([clip]), 2.0, tmp_path / "vf", 0))
-    assert len(vk) == 4 and vk[1].timestamp is not None and vk[1].timestamp >= 0.5
+    assert len(vk) == 4 and float(vk[1].source.rsplit("@", 1)[1]) >= 0.5
 
 
 # --- retrieval ----------------------------------------------------------------------------------
@@ -365,7 +365,7 @@ def _cloud_frames(scales: list[float]) -> tuple[Room, list]:
     frames = []
     for i, (pose, s) in enumerate(zip(orbit_poses(len(scales)), scales, strict=True)):
         r = render(room, pose, K)
-        rec = store.FrameRecord(i, store.frame_name(i), "", "", None, 1, 320, 240, K, pose, 320, 240)
+        rec = store.FrameRecord(i, store.frame_name(i), "", "", 1, 320, 240, K, pose, 320, 240)
         # labels: synthetic box k -> object id k + 1 (floor and walls unlabelled)
         frames.append(FrameData(rec, (r.depth * s).astype(np.float32), r.depth > 0, r.rgb,
                                 np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32),
