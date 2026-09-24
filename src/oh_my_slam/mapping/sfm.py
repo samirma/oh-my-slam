@@ -158,6 +158,35 @@ class SfmModel:
         self.rec.write(str(path))
 
 
+FIXED_ROT_TOL_DEG = 2.0
+FIXED_POS_TOL = 0.05  # of the fixed frames' spread
+
+
+def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
+    """COLMAP re-normalises an extended reconstruction — a similarity away from its input, the
+    fixed frames included — so map it back onto the input with the similarity that takes the
+    frames of both onto their input poses. None when those frames did not stay rigid (or are too
+    few to tell)."""
+    from oh_my_slam.mapping.frame import similarity_by_poses
+
+    common = sorted(set(model.registered) & set(base.registered))
+    if len(common) < 2:
+        return None
+    ref = [base.pose(n) for n in common]
+    sim = similarity_by_poses([model.pose(n) for n in common], ref)
+    model.transform(sim.s, sim.R, sim.t)
+    centres = np.array([r.t for r in ref])
+    tol = max(1e-4, FIXED_POS_TOL * float(np.linalg.norm(centres - centres.mean(0), axis=1).max()))
+    for n, r in zip(common, ref, strict=True):
+        p = model.pose(n)
+        rot = np.degrees(np.arccos(np.clip((np.trace(p.R.T @ r.R) - 1) / 2, -1.0, 1.0)))
+        if rot > FIXED_ROT_TOL_DEG or np.linalg.norm(p.t - r.t) > tol:
+            log.warning("incremental extension moved the fixed frame %s (%.2f°, %.3g); "
+                        "its result is not used", n, rot, float(np.linalg.norm(p.t - r.t)))
+            return None
+    return model
+
+
 class Sfm:
     def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
                  features: str = FEATURES) -> None:
@@ -311,9 +340,19 @@ class Sfm:
 
     # -- mapping ---------------------------------------------------------------------------------
 
-    def _largest(self, recs: dict[int, Any]) -> Any | None:
+    def _largest(self, recs: dict[int, Any], anchors: set[str] | None = None) -> Any | None:
+        """The reconstruction with the most registered images; with ``anchors`` (the images of
+        an input model being extended), the one that continues that model — COLMAP starts a
+        separate reconstruction, in an unrelated frame, for images it cannot attach to it."""
         if not recs:
             return None
+        if anchors:
+            def held(r: Any) -> int:
+                return sum(im.name in anchors for im in r.images.values() if im.has_pose)
+            recs = {k: r for k, r in recs.items() if held(r) > 0}
+            if not recs:
+                return None
+            return max(recs.values(), key=lambda r: (held(r), r.num_reg_images()))
         return max(recs.values(), key=lambda r: r.num_reg_images())
 
     def map_global(self, out: Path) -> SfmModel | None:
@@ -336,8 +375,12 @@ class Sfm:
         opts.num_threads = -1
         recs = pycolmap.incremental_mapping(str(self.db), str(self.image_dir), str(out), opts,
                                             input_path=str(input_path) if input_path else "")
-        rec = self._largest(recs)
-        return None if rec is None else SfmModel(rec, "sfm-incremental")
+        if not input_path:
+            rec = self._largest(recs)
+            return None if rec is None else SfmModel(rec, "sfm-incremental")
+        base = SfmModel(pycolmap.Reconstruction(str(input_path)), "input")
+        rec = self._largest(recs, set(base.registered))
+        return None if rec is None else _back_onto(SfmModel(rec, "sfm-incremental"), base)
 
     def _posed_reconstruction(self, poses: dict[str, Pose], base: Any = None) -> Any:
         """``base`` (or an empty reconstruction) plus images at the given camera-to-world poses.

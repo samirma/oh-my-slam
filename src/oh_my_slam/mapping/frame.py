@@ -115,19 +115,34 @@ def map_transform(first_pose: Pose, up_world: NDArray[Any], scale: float) -> Sim
     return Sim3(scale, R, t)
 
 
-def align_by_poses(out_poses: list[Pose], ref_poses: list[Pose]) -> Pose:
-    """Rigid ``T_ref_out`` mapping poses of an output frame onto reference poses of the same
-    cameras: rotation = SVD average of R_ref R_out^T, translation = mean residual. Works for
-    rotation-only rigs where the camera centres (almost) coincide."""
-    if not out_poses:
-        return Pose.identity()
+def similarity_by_poses(out_poses: list[Pose], ref_poses: list[Pose],
+                        with_scale: bool = True) -> Sim3:
+    """Similarity mapping poses of an output frame onto reference poses of the same cameras:
+    rotation = SVD average of R_ref R_out^T, scale = ratio of the camera centres' RMS spreads
+    (1 when they coincide, or without ``with_scale``), translation = mean residual."""
     M = sum(r.R @ o.R.T for o, r in zip(out_poses, ref_poses, strict=True))
     U, _, Vt = np.linalg.svd(M)
     D = np.eye(3)
     D[2, 2] = np.sign(np.linalg.det(U @ Vt))
     R = U @ D @ Vt
-    t = np.mean([r.t - R @ o.t for o, r in zip(out_poses, ref_poses, strict=True)], axis=0)
-    return Pose(R, t)
+    co = np.array([o.t for o in out_poses])
+    cr = np.array([r.t for r in ref_poses])
+    s = 1.0
+    if with_scale:
+        so = float(np.sqrt(((co - co.mean(0)) ** 2).sum(1).mean()))
+        sr = float(np.sqrt(((cr - cr.mean(0)) ** 2).sum(1).mean()))
+        s = sr / so if so > 1e-9 else 1.0
+    return Sim3(s, R, cr.mean(0) - s * R @ co.mean(0))
+
+
+def align_by_poses(out_poses: list[Pose], ref_poses: list[Pose]) -> Pose:
+    """Rigid ``T_ref_out`` mapping poses of an output frame onto reference poses of the same
+    cameras (``similarity_by_poses`` without scale). Works for rotation-only rigs where the
+    camera centres (almost) coincide."""
+    if not out_poses:
+        return Pose.identity()
+    sim = similarity_by_poses(out_poses, ref_poses, with_scale=False)
+    return Pose(sim.R, sim.t)
 
 
 def transform_pose(sim: Sim3, T: Pose) -> Pose:
