@@ -90,6 +90,7 @@ function resize() {
   camera.aspect = w / Math.max(h, 1);
   camera.updateProjectionMatrix();
   for (const o of state.objects) o.line.material.resolution.set(w, h);
+  state.camHighlight?.material.resolution.set(w, h);
   const focal = focalPx();
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
 }
@@ -310,17 +311,23 @@ function buildObjects(doc) {
 }
 
 // ---------------------------------------------------------------- camera poses (scene JSON)
+// f.T is the served camera-to-scene pose (row-major 4 x 4, OpenCV axes: x right, y down, z forward).
+function poseMatrix(f) { return new THREE.Matrix4().fromArray(f.T.flat()).transpose(); }
 function buildFrustums(cams, size) {
   if (!cams.length) return;
   const d = Math.max(0.05, size * (cams.length === 1 ? 0.05 : 0.025));
   const pos = [];
+  state.frustumSegments = [];
   for (const f of cams) {
-    const T = new THREE.Matrix4().fromArray(f.T.flat()).transpose();
+    const T = poseMatrix(f);
     const [fx, fy, cx, cy] = f.K; const [w, h] = f.size;
     const c = new THREE.Vector3(0, 0, 0).applyMatrix4(T);
     const cs = [[0, 0], [w, 0], [w, h], [0, h]].map(([u, v]) =>
       new THREE.Vector3((u - cx) / fx * d, (v - cy) / fy * d, d).applyMatrix4(T));
-    for (let i = 0; i < 4; i++) { pos.push(...c.toArray(), ...cs[i].toArray(), ...cs[i].toArray(), ...cs[(i + 1) % 4].toArray()); }
+    const segs = [];
+    for (let i = 0; i < 4; i++) { segs.push(...c.toArray(), ...cs[i].toArray(), ...cs[i].toArray(), ...cs[(i + 1) % 4].toArray()); }
+    state.frustumSegments.push(segs);
+    pos.push(...segs);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -330,7 +337,137 @@ function buildFrustums(cams, size) {
   groups.cameras.add(lines);
 }
 
+// ---------------------------------------------------------------- cameras: list, highlight, go to
+// The list shows each served camera centre (f.position, scene frame, metres). "Go to" flies the
+// viewpoint to that centre, looking along the camera's optical axis with a field of view that
+// shows the camera's whole image; the pose is the served one, only mapped into the display frame.
+const FLIGHT_MS = 650;
+function selectCamera(i) {
+  state.cameraIndex = i;
+  document.querySelectorAll('#cameras tbody tr[data-index]').forEach((tr) => {
+    const on = Number(tr.dataset.index) === i;
+    tr.classList.toggle('selected', on);
+    tr.setAttribute('aria-selected', String(on));
+    if (on) tr.scrollIntoView({ block: 'nearest' });
+  });
+  if (state.camHighlight) {
+    groups.cameras.remove(state.camHighlight);
+    state.camHighlight.geometry.dispose();
+    state.camHighlight.material.dispose();
+    state.camHighlight = null;
+  }
+  if (i == null || !state.frustumSegments) return;
+  const geom = new LineSegmentsGeometry().setPositions(state.frustumSegments[i]);
+  const mat = new LineMaterial({ color: srgb('#5b8cff'), linewidth: 3.0, worldUnits: false });
+  mat.resolution.set(host.clientWidth, host.clientHeight);
+  state.camHighlight = new LineSegments2(geom, mat);
+  state.camHighlight.name = 'selected-camera';
+  state.camHighlight.renderOrder = 2;
+  groups.cameras.add(state.camHighlight);
+}
+function cameraView(f) {
+  const M = poseMatrix(f).premultiply(root.matrixWorld);  // camera → display frame
+  const eye = new THREE.Vector3().setFromMatrixPosition(M);
+  const fwd = new THREE.Vector3(0, 0, 1).transformDirection(M);
+  const [fx, fy] = f.K; const [w, h] = f.size;
+  // vertical field of view of the viewport that shows the camera's whole image
+  const half = Math.max(h / (2 * fy), w / (2 * fx) / Math.max(camera.aspect, 1e-3));
+  const fov = THREE.MathUtils.clamp(THREE.MathUtils.radToDeg(2 * Math.atan(half)), 5, 150);
+  // orbit pivot straight ahead: towards the middle of the scene, 0.5 m at least
+  let dist = 1.0;
+  if (!state.bbox.isEmpty()) {
+    const ahead = state.bbox.getCenter(new THREE.Vector3()).sub(eye).dot(fwd);
+    const size = state.bbox.getSize(new THREE.Vector3()).length();
+    dist = THREE.MathUtils.clamp(ahead, 0.5, Math.max(0.5, size / 2));
+  }
+  return { eye, target: eye.clone().addScaledVector(fwd, dist), fov };
+}
+function goToCamera(i) {
+  const f = state.meta.cameras[i];
+  if (!f) return;
+  selectCamera(i);
+  const to = cameraView(f);
+  camera.near = 0.01;
+  camera.far = Math.max(camera.far, 1000);
+  state.flight = { from: { pos: camera.position.clone(), target: controls.target.clone(), fov: camera.fov },
+    to, t0: performance.now() };
+  state.flying = true;
+  controls.enabled = false;
+  controls.enableDamping = false;  // no leftover orbit inertia moves the camera after arrival
+}
+function stepFlight(now) {
+  const f = state.flight;
+  if (!f) return;
+  const t = Math.min(1, (now - f.t0) / FLIGHT_MS);
+  const e = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;  // ease in-out
+  camera.position.lerpVectors(f.from.pos, f.to.eye, e);
+  controls.target.lerpVectors(f.from.target, f.to.target, e);
+  setFov(f.from.fov + (f.to.fov - f.from.fov) * e);
+  if (t < 1) return;
+  camera.position.copy(f.to.eye);
+  controls.target.copy(f.to.target);
+  endFlight();
+}
+function endFlight() {
+  state.flight = null;
+  state.flying = false;
+  controls.enabled = true;
+  controls.enableDamping = true;
+}
+function stepCamera(delta) {
+  const rows = [...document.querySelectorAll('#cameras tbody tr[data-index]')].filter((tr) => !tr.hidden);
+  if (!rows.length) return;
+  const at = rows.findIndex((tr) => Number(tr.dataset.index) === state.cameraIndex);
+  const next = at < 0 ? (delta > 0 ? 0 : rows.length - 1) : (at + delta + rows.length) % rows.length;
+  goToCamera(Number(rows[next].dataset.index));
+}
+function fmtCoord(v) { return (Math.abs(v) < 5e-4 ? 0 : v).toFixed(3); }
+function buildCameraList() {
+  const cams = state.meta.cameras;
+  const tbody = $('#cameras tbody');
+  $('#cam-count').textContent = cams.length ? String(cams.length) : '';
+  const cs = state.scene.openlabel.coordinate_systems || {};
+  const axes = cs.map?.axes?.replaceAll(',', ', ');
+  $('#cam-note').textContent = state.meta.mode === 'map'
+    ? `Camera centres in the map frame${axes ? ` (${axes})` : ''}, metres. Go to moves the view to a camera, looking where it looked.`
+    : 'Camera centre in the scene frame (the image\'s camera frame, OpenCV axes), metres. Go to shows the scene from the photo\'s viewpoint.';
+  cams.forEach((f, i) => {
+    const [x, y, z] = f.position;
+    const title = [f.source && `image ${f.source}`, `frame ${f.frame}`, f.update != null && `update ${f.update}`]
+      .filter(Boolean).join(' · ');
+    const go = el('button', { type: 'button', class: 'goto', title: 'Move the viewpoint to this camera',
+      'aria-label': `Go to camera ${f.name}` }, 'Go to');
+    go.addEventListener('click', (e) => { e.stopPropagation(); goToCamera(i); });
+    const tr = el('tr', { 'data-index': i, title, 'aria-selected': 'false' },
+      el('td', { class: 'cam-name' }, el('span', {}, f.name),
+        f.source && f.source !== f.name ? el('small', {}, f.source) : ''),
+      el('td', { class: 'num' }, fmtCoord(x)), el('td', { class: 'num' }, fmtCoord(y)),
+      el('td', { class: 'num' }, fmtCoord(z)), el('td', {}, go));
+    tr.addEventListener('click', () => selectCamera(state.cameraIndex === i ? null : i));
+    tr.addEventListener('dblclick', () => goToCamera(i));
+    tbody.appendChild(tr);
+  });
+  if (!cams.length) tbody.append(el('tr', {}, el('td', { colspan: 5, class: 'muted' }, 'No cameras.')));
+  $('#cam-prev').disabled = $('#cam-next').disabled = !cams.length;
+  $('#cam-prev').addEventListener('click', () => stepCamera(-1));
+  $('#cam-next').addEventListener('click', () => stepCamera(1));
+  $('#cam-filter').addEventListener('input', (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    tbody.querySelectorAll('tr[data-index]').forEach((tr) => {
+      const f = cams[Number(tr.dataset.index)];
+      tr.hidden = q && !`${f.name} ${f.source || ''}`.toLowerCase().includes(q);
+    });
+  });
+}
+
 // ---------------------------------------------------------------- framing
+const DEFAULT_FOV = 55;
+function setFov(fov) {
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+  const focal = focalPx();
+  for (const m of pointMaterials()) m.uniforms.focal.value = focal;
+}
 function frameBox(box, pad = 1.15) {
   const sphere = box.getBoundingSphere(new THREE.Sphere());
   const r = Math.max(sphere.radius, 0.05) * pad;
@@ -344,6 +481,8 @@ function frameBox(box, pad = 1.15) {
   controls.update();
 }
 function resetView() {
+  if (state.flight) endFlight();
+  setFov(DEFAULT_FOV);
   if (state.meta && state.meta.mode === 'image' && state.photoTarget) {
     // image mode: start just behind the photo's own viewpoint, looking forward
     const eye = new THREE.Vector3(0, 0, 0).applyMatrix4(root.matrixWorld);
@@ -371,6 +510,7 @@ function robustBox(positions, matrix) {
     new THREE.Vector3(q(xs, 0.98), q(ys, 0.98), q(zs, 0.98)));
 }
 function frameObject(o) {
+  if (state.flight) endFlight();
   const box = new THREE.Box3().setFromPoints(o.corners.map((p) => p.clone().applyMatrix4(root.matrixWorld)));
   const sphere = box.getBoundingSphere(new THREE.Sphere());
   const r = Math.max(sphere.radius, 0.1) * 2.2;
@@ -482,7 +622,9 @@ $('#reset-view').addEventListener('click', resetView);
 window.addEventListener('keydown', (e) => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
   if (e.key === 'r' || e.key === 'R') resetView();
-  if (e.key === 'Escape') select(null);
+  if (e.key === 'Escape') { select(null); selectCamera(null); }
+  if (e.key === '[') stepCamera(-1);
+  if (e.key === ']') stepCamera(1);
 });
 
 // ---------------------------------------------------------------- Layers
@@ -704,6 +846,7 @@ async function main() {
   buildCloudControls();
   buildDisplay();
   buildCatalogue();
+  buildCameraList();
   applyLayers();
   resize();
   resetView();
@@ -717,6 +860,7 @@ let cloudFrames = 0;
 let lastLabelUpdate = 0;
 function animate(t) {
   requestAnimationFrame(animate);
+  stepFlight(performance.now());
   controls.update();
   if (t - lastLabelUpdate > 150) { lastLabelUpdate = t; if (state.objects.length) updateLabels(); }
   if (state.ready && state.cloudInScene && !document.body.dataset.rendered && ++cloudFrames > 1) {

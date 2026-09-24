@@ -48,8 +48,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
   display: flex; flex-direction: column; min-height: 0; transition: margin-right .15s ease; }
 #app.panel-hidden #panel { margin-right: calc(-1 * var(--panel-width)); }
 #tabs { display: flex; border-bottom: 1px solid var(--border); flex: none; }
-#tabs button { flex: 1; border: none; border-radius: 0; background: none; padding: 10px 4px;
-  color: var(--muted); border-bottom: 2px solid transparent; }
+#tabs button { flex: 1 1 auto; border: none; border-radius: 0; background: none; padding: 10px 4px;
+  color: var(--muted); border-bottom: 2px solid transparent; white-space: nowrap; min-width: 0; }
 #tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
 #tabs button[hidden] { display: none; }
 .badge { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--panel-2);
@@ -57,7 +57,6 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
 .badge:empty { display: none; }
 .tab { display: none; overflow: auto; flex: 1; min-height: 0; }
 .tab.active { display: flex; flex-direction: column; }
-#tab-catalogue, #tab-image { padding: 10px; }
 
 /* ---- control groups */
 .group { border-bottom: 1px solid var(--border); flex: none; }
@@ -99,17 +98,29 @@ input.switch:checked::after { left: 15px; }
 .spinner-sm { width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent);
   border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; flex: none; }
 
-/* ---- catalogue and image */
-#filter { width: 100%; padding: 6px 8px; margin-bottom: 8px; background: var(--panel-2);
-  color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+/* ---- catalogue, cameras and image */
+#filter, #cam-filter { width: 100%; padding: 6px 8px; background: var(--panel-2);
+  color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+#filter { margin-bottom: 8px; }
+#tab-catalogue, #tab-cameras, #tab-image { padding: 10px; }
 .table-wrap { overflow: auto; flex: 1; min-height: 0; }
-#catalogue { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-#catalogue th { position: sticky; top: 0; background: var(--panel); text-align: left;
-  color: var(--muted); font-weight: 500; padding: 4px; border-bottom: 1px solid var(--border); }
-#catalogue td { padding: 4px; border-bottom: 1px solid #2a2f3a; white-space: nowrap; }
-#catalogue tbody tr[data-id] { cursor: pointer; }
-#catalogue tbody tr[data-id]:hover { background: #2a3040; }
-#catalogue tbody tr.selected { background: #33406a; }
+#catalogue, #cameras { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+#catalogue th, #cameras th { position: sticky; top: 0; z-index: 1; background: var(--panel);
+  text-align: left; color: var(--muted); font-weight: 500; padding: 4px;
+  border-bottom: 1px solid var(--border); }
+#catalogue td, #cameras td { padding: 4px; border-bottom: 1px solid #2a2f3a; white-space: nowrap; }
+#catalogue tbody tr[data-id], #cameras tbody tr[data-index] { cursor: pointer; }
+#catalogue tbody tr[data-id]:hover, #cameras tbody tr[data-index]:hover { background: #2a3040; }
+#catalogue tbody tr.selected, #cameras tbody tr.selected { background: #33406a; }
+#cameras th.num, #cameras td.num { text-align: right; }
+#cameras td.num { font-size: 12px; }
+#cameras .cam-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+#cameras .cam-name small { display: block; color: var(--muted); font-size: 10px; overflow: hidden;
+  text-overflow: ellipsis; }
+#cameras button.goto { padding: 2px 7px; font-size: 12px; }
+.cam-head { display: flex; gap: 6px; margin-bottom: 6px; }
+.cam-head button { padding: 4px 8px; flex: none; }
+#cam-note { margin: 0 0 6px; }
 #segmented { width: 100%; image-rendering: pixelated; border-radius: 4px;
   border: 1px solid var(--border); }
 .hint { color: var(--muted); font-size: 11px; }

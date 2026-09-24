@@ -114,6 +114,7 @@ def test_image_meta_controls_cameras_and_artefacts(image_view: Any) -> None:
     # the intrinsics the scene JSON states
     (cam,) = meta["cameras"]
     np.testing.assert_array_equal(cam["T"], np.eye(4))
+    assert cam["position"] == [0.0, 0.0, 0.0] and cam["source"] == img.name
     pin = scene["openlabel"]["streams"]["camera"]["stream_properties"]["intrinsics_pinhole"]
     m = pin["camera_matrix"]
     assert cam["K"] == [m[0], m[5], m[2], m[6]] and cam["size"] == [pin["width_px"],
@@ -196,9 +197,27 @@ def test_map_meta_cameras_and_controls(map_view: Any) -> None:
     frames = MapReader(root).frames
     assert len(meta["cameras"]) == len(frames) == meta["stats"]["frames"] > 0
     for cam, fr in zip(meta["cameras"], sorted(frames, key=lambda f: f.index), strict=True):
-        assert cam["name"] == fr.name
+        assert cam["name"] == fr.name and cam["source"] == Path(fr.source).name
         np.testing.assert_allclose(cam["T"], fr.T_map_cam.matrix(), atol=1e-5)
         np.testing.assert_allclose(cam["K"], [fr.K.fx, fr.K.fy, fr.K.cx, fr.K.cy], atol=1e-5)
+
+
+@needs_colmap
+def test_map_camera_positions_are_the_scene_translations(map_view: Any) -> None:
+    """/api/meta lists each camera centre exactly as the scene JSON's camera-to-map translation."""
+    url, _, _ = map_view
+    meta = json.loads(get(url + "api/meta")[1])
+    scene = json.loads(get(url + "api/scene")[1])["openlabel"]
+    translations = {}
+    for fid, fr in scene["frames"].items():
+        props = fr["frame_properties"]
+        (tr,) = props["transforms"].values()
+        assert tr["dst"] == "map"
+        translations[int(fid)] = (props["keyframe"], tr["transform_src_to_dst"]["translation"])
+    assert len(translations) == len(meta["cameras"])
+    for cam in meta["cameras"]:
+        assert (cam["name"], cam["position"]) == translations[cam["frame"]]
+        assert np.asarray(cam["T"])[:3, 3].tolist() == cam["position"]
 
 
 @needs_colmap

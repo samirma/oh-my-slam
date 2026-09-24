@@ -319,6 +319,159 @@ def test_layouts(view: View, tmp_path: Path) -> None:
     assert v.errors == []
 
 
+# ------------------------------------------------------------------------------------------------
+# cameras: listed with their centres, "Go to" moves the viewpoint there (spec §2.5)
+
+
+def coord(x: float) -> str:
+    return f"{0.0 if abs(x) < 5e-4 else x:.3f}"
+
+
+def display_frame(v: View, cam: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Camera centre and optical axis of a served camera, in the page's display frame."""
+    M = np.asarray(v.js("() => window.__viewer.meta.display_transform")) @ np.asarray(cam["T"])
+    return M[:3, 3], M[:3, 2]
+
+
+def viewer_camera(v: View) -> dict[str, Any]:
+    return v.js("""() => {
+      const c = window.__viewerCamera, d = c.getWorldDirection(c.position.clone());
+      return {pos: c.position.toArray(), dir: d.toArray(), fov: c.fov};
+    }""")
+
+
+def go_to(v: View, index: int) -> dict[str, Any]:
+    v.pg.click('#tabs button[data-tab="cameras"]')
+    v.pg.click(f'#cameras tr[data-index="{index}"] button.goto')
+    v.pg.wait_for_function("() => !window.__viewer.flying", timeout=10000)
+    v.settle()
+    return viewer_camera(v)
+
+
+def assert_at_camera(v: View, index: int, cam_state: dict[str, Any]) -> None:
+    cam = v.js("() => window.__viewer.meta.cameras")[index]
+    centre, axis = display_frame(v, cam)
+    assert np.linalg.norm(np.asarray(cam_state["pos"]) - centre) < 1e-3  # within 1 mm
+    assert float(np.dot(cam_state["dir"], axis)) > 0.9999  # looking along the optical axis
+    fx, fy = cam["K"][:2]
+    w, h = cam["size"]
+    aspect = v.js("() => window.__viewerCamera.aspect")
+    fov = np.degrees(2 * np.arctan(max(h / (2 * fy), w / (2 * fx) / aspect)))
+    assert abs(cam_state["fov"] - fov) < 1e-6  # the camera's whole field in view
+    assert v.js("() => window.__viewer.cameraIndex") == index
+    assert v.js("() => window.__viewerGroups.cameras.children.some(c => c.name === 'selected-camera')")
+
+
+def test_cameras_are_listed_with_their_centres(view: View) -> None:
+    v = view
+    v.pg.click('#tabs button[data-tab="cameras"]')
+    cams = v.js("() => window.__viewer.meta.cameras")
+    rows = v.pg.locator("#cameras tbody tr[data-index]")
+    assert rows.count() == len(cams) == len(v.bundle.cameras) > 0
+    assert v.pg.inner_text("#cam-count") == str(len(cams))
+    for i, cam in enumerate(cams):
+        cells = rows.nth(i).locator("td")
+        assert cells.nth(0).inner_text().splitlines()[0] == cam["name"]
+        assert [cells.nth(k).inner_text() for k in (1, 2, 3)] == [coord(x) for x in cam["position"]]
+        assert cam["position"] == v.bundle.cameras[i]["position"]
+    note = v.pg.inner_text("#cam-note")
+    assert ("map frame" in note) if v.bundle.mode == "map" else ("camera frame" in note)
+    v.pg.click('#tabs button[data-tab="controls"]')
+    assert v.errors == []
+
+
+def test_go_to_camera_and_reset_view(view: View, tmp_path: Path) -> None:
+    v = view
+    v.pg.click("#reset-view")
+    v.settle()
+    home = viewer_camera(v)
+    index = len(v.bundle.cameras) // 2
+    assert_at_camera(v, index, go_to(v, index))
+    out = Path(os.environ.get("OH_MY_SLAM_VIEWER_SHOTS") or tmp_path)
+    out.mkdir(parents=True, exist_ok=True)
+    v.pg.screenshot(path=str(out / f"{v.bundle.mode}-go-to-camera-desktop.png"))
+    # Reset view still restores the default view (and field of view)
+    v.pg.click("#reset-view")
+    v.settle()
+    back = viewer_camera(v)
+    assert back["fov"] == 55
+    np.testing.assert_allclose(back["pos"], home["pos"], atol=1e-6)
+    # phone width: the list sits under the view; going to a camera fits the new aspect
+    v.pg.set_viewport_size({"width": 390, "height": 844})
+    v.settle()
+    assert_at_camera(v, index, go_to(v, index))
+    v.pg.screenshot(path=str(out / f"{v.bundle.mode}-go-to-camera-phone.png"))
+    v.pg.keyboard.press("Escape")
+    assert v.js("() => window.__viewerGroups.cameras.children.length") == 1  # highlight gone
+    v.pg.set_viewport_size({"width": 1280, "height": 800})
+    v.pg.click("#reset-view")
+    v.pg.click('#tabs button[data-tab="controls"]')
+    v.settle()
+    assert v.errors == []
+
+
+@pytest.fixture(scope="module")
+def ring_view(browser: Any) -> Iterator[View]:
+    """100 cameras on a circle around a small cloud (no objects), to exercise a long list."""
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.schema import openlabel as ol
+    from oh_my_slam.segmentation.cloud import map_cloud_source
+    from tests.synth.scene import look_at
+
+    K = Intrinsics(320.0, 320.0, 320.0, 240.0, 640, 480)
+    angles = np.linspace(0, 2 * np.pi, 100, endpoint=False)
+    poses = [look_at(np.array([3 * np.cos(a), 3 * np.sin(a), 1.2]), np.array([0.0, 0.0, 0.8]))
+             for a in angles]
+    frames = {str(k): ol.frame(float(k), stream_uris={"camera_0": f"frames/f{k:06d}.jpg"},
+                               transforms={"camera_0_to_map": ol.transform("camera_0", "map", p)},
+                               keyframe=f"f{k:06d}", update_id=1)
+              for k, p in enumerate(poses)}
+    scene = ol.document(ol.metadata("ring"), {},
+                        coordinate_systems={"map": ol.map_cs(["camera_0"]),
+                                            "camera_0": ol.sensor_cs("map")},
+                        streams={"camera_0": ol.camera_stream(K)}, frames=frames)
+    rng = np.random.default_rng(0)
+    xyz = rng.normal(size=(5000, 3)) * [1.0, 1.0, 0.4] + [0.0, 0.0, 0.8]
+    source = map_cloud_source(xyz, rng.integers(0, 255, (5000, 3), np.uint8), None, set(),
+                              np.zeros((1, 3)))
+    bundle = ViewBundle(mode="map", title="ring", scene=scene, source=source, catalog=[],
+                        stats={"objects": 0, "frames": len(poses)})
+    with running(bundle) as url:
+        v = View(browser, bundle, url)
+        yield v
+        v.pg.close()
+
+
+def test_long_camera_list(ring_view: View) -> None:
+    v = ring_view
+    v.pg.click('#tabs button[data-tab="cameras"]')
+    wrap = "#tab-cameras .table-wrap"
+    assert v.js(f"() => {{ const w = document.querySelector('{wrap}'); "
+                "return w.scrollHeight > 2 * w.clientHeight; }")  # scrolls, the page does not
+    assert v.js("() => document.documentElement.scrollHeight") <= 800
+    assert_at_camera(v, 90, go_to(v, 90))
+    # "]" steps to the next camera; the selected row is kept in view
+    v.pg.keyboard.press("]")
+    v.pg.wait_for_function("() => !window.__viewer.flying", timeout=10000)
+    v.settle()
+    assert_at_camera(v, 91, viewer_camera(v))
+    row = v.pg.locator('#cameras tr[data-index="91"]').bounding_box()
+    box = v.pg.locator(wrap).bounding_box()
+    assert row and box and box["y"] <= row["y"] and row["y"] + row["height"] <= box["y"] + box["height"]
+    assert "selected" in (v.pg.get_attribute('#cameras tr[data-index="91"]', "class") or "")
+    # the filter narrows the list; stepping wraps around the visible rows
+    v.pg.fill("#cam-filter", "f00009")
+    assert v.pg.locator("#cameras tbody tr[data-index]:visible").count() == 10
+    v.pg.click("#cam-next")
+    v.pg.wait_for_function("() => !window.__viewer.flying", timeout=10000)
+    v.settle()
+    assert v.js("() => window.__viewer.cameraIndex") == 92
+    v.pg.click("#reset-view")
+    v.settle()
+    assert v.js("() => window.__viewerCamera.fov") == 55
+    assert v.errors == []
+
+
 def test_map_unchanged_after_viewing(map_view: View) -> None:
     assert full_tree_hash(map_view.root) == map_view.before  # type: ignore[attr-defined]
 
