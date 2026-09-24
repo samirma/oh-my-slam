@@ -191,8 +191,8 @@ class Evaluation:
         self.check_payloads(rec)
         self.details[f"viewer.{tag}"] = {"url": seen.url, "render_s": seen.render_s,
                                          "error": seen.error,
-                                         "console_errors": seen.console_errors[:10]}
-        if seen.render_s is not None:
+                                         "console_errors": (seen.console_errors or [])[:10]}
+        if seen.console_errors is not None:  # the page was opened
             self.contracts.check("console_errors", "view", tag, seen.console_errors)
         if seen.scene is None:
             return
@@ -285,9 +285,10 @@ class Evaluation:
             rows.append({**detection_row(c.name, objs), "wall_s": round(rec.wall_s, 3)})
         self.details["segmentation.frames"] = rows
         done = [r for r in rows if "error" not in r]
+        failed = [r["error"] for r in rows if "error" in r]
         self.metrics.add(SEG_METRICS[1], sum(r["objects"] > 0 for r in done) / len(done)
                          if done else None, {"segmented": len(done), "frames": len(rows)},
-                         error=f"no frame was segmented ({rows[0]['error'] if rows else 'none'})")
+                         error=f"no frame was segmented ({failed[0] if failed else 'no frames'})")
 
     def build_maps(self, captures: list[Capture]) -> tuple[Json | None, Json | None]:
         """The one-update map and the split map; their ``-t full`` scenes."""

@@ -68,7 +68,7 @@ class ViewOutcome:
     url: str | None
     render_s: float | None
     error: str | None  # why render_s is missing
-    console_errors: list[str]
+    console_errors: list[str] | None  # None: the page was never opened
     scene: bytes | None  # what /api/scene served
 
 
@@ -100,8 +100,9 @@ class BrowserProbe:
             live = runner.start(spec)
             try:
                 url = self._wait_url(live, live.t0 + spec.timeout_s)
-                render_s, console = None, list[str]()
+                render_s, console = None, None
                 if url is not None and browser is not None:
+                    console = list[str]()
                     render_s, error = self._render(browser, url, live.t0, console)
                 scene = None if url is None else _fetch(url, SCENE_API)
             finally:

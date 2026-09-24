@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from oh_my_slam.tools.evaluate.metrics import load_targets
+from oh_my_slam.tools.evaluate.names import captures_in
 from oh_my_slam.tools.evaluate.report import build_result, write_report
 from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
@@ -105,6 +106,21 @@ cat {payload}""")
     assert checks["banner"] and "does not start with a JSON object" in checks["banner"][0]
     assert ev.contracts.checks[("openlabel", "reconstruct")] == {"json": [], "file": []}
     assert ev.contracts.checks[("stdout", "segment")]["failed"] == []  # failed, but silent
+
+
+def test_frames_are_segmented_one_by_one(tmp_path: Path) -> None:
+    payload = tmp_path / "scene.json"
+    payload.write_bytes(scene_bytes())
+    repo = fake_repo(tmp_path, segment=f'case "$2" in *002_*) echo boom >&2; exit 1;; esac\n'
+                                       f"cat {payload}")
+    ev = Evaluation(tmp_path / "out", Runner(tmp_path / "out", repo), BrowserProbe(None))
+    ev.frames(captures_in(EXAMPLES / "ainex-captures")[:3])
+    m = ev.metrics.items["seg.frames.with_detections_fraction"]
+    assert m.value == 1.0 and m.detail == {"segmented": 2, "frames": 3}
+    assert sorted(ev.images) == ["ainex-captures/001_bootstrap_level.jpg",
+                                 "ainex-captures/003_bootstrap_side2_level.jpg"]
+    rows = ev.details["segmentation.frames"]
+    assert rows[0]["objects"] == 4 and "boom" in rows[1]["error"]
 
 
 def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path) -> None:
@@ -221,6 +237,7 @@ def test_view_render_time_in_a_browser(tmp_path: Path) -> None:
 def test_view_load_failure_in_a_browser(tmp_path: Path) -> None:
     seen = probe_fake_view(tmp_path, FAILS)
     assert seen.render_s is None and seen.error == "the page failed to load: cloud: 500"
+    assert seen.console_errors == []  # the page was opened, so its console was watched
 
 
 @pytest.mark.parametrize(("stderr", "url"), [
