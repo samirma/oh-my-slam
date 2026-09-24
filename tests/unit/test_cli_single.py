@@ -11,7 +11,7 @@ import pytest
 
 from oh_my_slam.cli import reconstruct as cli_reconstruct
 from oh_my_slam.cli import segment as cli_segment
-from oh_my_slam.cli.common import ArgumentParser, parse_labels
+from oh_my_slam.cli.common import ArgumentParser
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.ply import parse_ply
@@ -86,11 +86,6 @@ def test_segment_with_artifacts_labels_and_min_score(env, tmp_path: Path) -> Non
     full = json.loads(payload)["openlabel"]["objects"]
 
     cap.__init__()
-    assert cli_segment.main(["-i", str(img), "--labels", "sofa,espresso machine"]) == 0
-    only = json.loads(cap.buf.getvalue())["openlabel"]["objects"]
-    assert {o["type"] for o in only.values()} == {"sofa"}
-
-    cap.__init__()
     assert cli_segment.main(["-i", str(img), "--min-score", "0.8"]) == 0
     hi = json.loads(cap.buf.getvalue())["openlabel"]["objects"]
     assert set(hi) <= set(full)
@@ -113,8 +108,6 @@ def test_segment_without_o_writes_nothing(env, tmp_path: Path) -> None:  # type:
 def test_segment_usage_errors(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     img, _cap, _ = env
     with pytest.raises(UsageError):
-        cli_segment.main(["-m", str(tmp_path), "--labels", "chair"])
-    with pytest.raises(UsageError):
         cli_segment.main(["-m", str(tmp_path), "--min-score", "0.3"])
     with pytest.raises(UsageError):
         cli_segment.main(["-i", str(img), "--min-score", "abc"])
@@ -133,13 +126,12 @@ def test_spec_usage_lines_parse_with_defaults() -> None:
     assert r.format == "json"
     assert cli_reconstruct.build_parser().parse_args(["-i", "x.jpg", "-f", "ply"]).format == "ply"
     s = cli_segment.build_parser().parse_args(["-i", "x.jpg"])
-    assert (s.format, s.out, s.min_score, s.labels) == ("json", None, None, None)
+    assert (s.format, s.out, s.min_score) == ("json", None, None)
     s = cli_segment.build_parser().parse_args(
-        ["-i", "x.jpg", "-o", "o", "-f", "ply", "--min-score", "0.3", "--labels", "a,b,c"])
-    assert parse_labels(s.labels) == ["a", "b", "c"] and s.format == "ply"
+        ["-i", "x.jpg", "-o", "o", "-f", "ply", "--min-score", "0.3"])
+    assert s.min_score == "0.3" and s.format == "ply"
     s = cli_segment.build_parser().parse_args(["-m", "map", "-o", "o", "-f", "json"])
     assert s.map == Path("map")
-    assert parse_labels(" , ") is None and parse_labels(None) is None
     with pytest.raises(SystemExit) as e:
         ArgumentParser(prog="x").parse_args(["--bad"])
     assert e.value.code == 2

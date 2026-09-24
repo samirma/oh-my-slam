@@ -68,10 +68,6 @@ def test_detect_filters_and_orders(synth) -> None:  # type: ignore[no-untyped-de
     assert labels.count("cabinet") == 1 and "cupboard" not in labels  # duplicate suppressed
     assert all(d.score >= 0.5 for d in dets)
     assert [d.score for d in dets] == sorted([d.score for d in dets], reverse=True)
-    only = detect.detect(img, client=client, labels=["Sofa"])
-    assert [d.label for d in only] == ["sofa"]
-    floors = detect.detect(img, client=client, labels=["floor"])
-    assert [d.label for d in floors] == ["floor"]  # explicitly asked for
     hi = detect.detect(img, client=client, min_score=0.85)
     assert {d.label for d in hi} <= {"cabinet"}
 

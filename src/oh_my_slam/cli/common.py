@@ -60,10 +60,3 @@ def _save_coverage() -> None:
             cov.save()
     except Exception:  # never let coverage bookkeeping change an exit code
         pass
-
-
-def parse_labels(value: str | None) -> list[str] | None:
-    if value is None:
-        return None
-    labels = [v.strip() for v in value.split(",") if v.strip()]
-    return labels or None

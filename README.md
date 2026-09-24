@@ -9,7 +9,7 @@ bounding boxes (ASAM OpenLABEL 1.0.0). RGB only — depth, intrinsics and gravit
 | `./start_inference_server.sh` | Starts the resident model server (MoGe-2, GeoCalib, YOLOE-26x-seg, MapAnything). |
 | `./reconstruct.sh -i IMG [-f json\|ply]` | One image → OpenLABEL scene (default) or coloured point cloud, camera frame, on stdout. |
 | `./mapper.sh update -a IMGS\|FOLDERS\|VIDEO -m DIR -t full\|single [-f json\|ply] [-fps N]` | Creates or extends a persistent map. |
-| `./segment.sh -i IMG [-o DIR] [-f json\|ply] [--min-score S] [--labels a,b]` / `-m MAP` | Objects, OBBs, colours; with `-o` also `segmented.png`, `catalog.csv/.md`, `segments.ply`. |
+| `./segment.sh -i IMG [-o DIR] [-f json\|ply] [--min-score S]` / `-m MAP` | Objects, OBBs, colours; with `-o` also `segmented.png`, `catalog.csv/.md`, `segments.ply`. |
 | `./view.sh -i IMG` / `-m MAP` | Local browser viewer (127.0.0.1, free port). `-m` needs no server. |
 
 ## Install
@@ -32,7 +32,7 @@ MapAnything Apache-2.0 checkpoint (HF). See `THIRD_PARTY_LICENSES.md`.
 ./start_inference_server.sh --status            # health JSON on stdout (exit 3 if not running)
 ./reconstruct.sh -i photo.jpg > scene.json
 ./reconstruct.sh -i photo.jpg -f ply > cloud.ply
-./segment.sh -i photo.jpg -o out/ --labels chair,"dining table" --min-score 0.6
+./segment.sh -i photo.jpg -o out/ --min-score 0.6
 ./mapper.sh update -a walk.mp4 -m maps/home -t full -fps 2 > map.json
 ./mapper.sh update -a more_photos/ -m maps/home -t single > new_part.json
 ./segment.sh -m maps/home -o out_map/

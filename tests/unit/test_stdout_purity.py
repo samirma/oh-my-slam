@@ -126,7 +126,7 @@ def test_usage_errors_exit_2(image: Path, tmp_path: Path) -> None:
         ("reconstruct.sh", []),
         ("reconstruct.sh", ["-i", str(image), "-f", "xyz"]),
         ("segment.sh", ["-i", str(image), "-m", str(tmp_path)]),
-        ("segment.sh", ["-m", str(tmp_path), "--labels", "chair"]),
+        ("segment.sh", ["-m", str(tmp_path), "--min-score", "0.3"]),
         ("segment.sh", []),
     ]:
         res = sh(script, *args)

@@ -1,5 +1,6 @@
-"""Instance detection: the segment endpoint → calibrated scores → label / min-score filters →
-cross-label de-duplication → stable ordering. Also owns the vocabulary and label rules."""
+"""Instance detection: the segment endpoint → calibrated scores → background / min-score
+filters → cross-label de-duplication → stable ordering. Also owns the vocabulary and label
+rules."""
 
 from __future__ import annotations
 
@@ -157,7 +158,6 @@ def order(dets: list[Detection]) -> list[Detection]:
 def detect(
     image_path: Path,
     *,
-    labels: list[str] | None = None,
     min_score: float = DEFAULT_MIN_SCORE,
     max_side: int = 1024,
     client: InferenceClient | None = None,
@@ -165,17 +165,15 @@ def detect(
 ) -> list[Detection]:
     """Detections for one image on the ``max_side`` grid (same grid as reconstruction)."""
     with timing.part("segmentation"):
-        return _detect(image_path, labels, min_score, max_side, client or connect(), min_area_px)
+        return _detect(image_path, min_score, max_side, client or connect(), min_area_px)
 
 
-def _detect(image_path: Path, labels: list[str] | None, min_score: float, max_side: int,
-            client: InferenceClient, min_area_px: int) -> list[Detection]:
-    wanted = [normalize_label(label) for label in labels] if labels else None
-    vocab = list(dict.fromkeys(wanted)) if wanted else list(default_vocabulary())
+def _detect(image_path: Path, min_score: float, max_side: int, client: InferenceClient,
+            min_area_px: int) -> list[Detection]:
     res = client.segment_image(
         p.SegmentRequest(
             image_path=str(Path(image_path).resolve()),
-            labels=vocab,
+            labels=list(default_vocabulary()),
             max_side=max_side,
             conf=_raw_threshold(min_score),
         )
@@ -183,9 +181,7 @@ def _detect(image_path: Path, labels: list[str] | None, min_score: float, max_si
     dets: list[Detection] = []
     for inst in res.instances:
         label = normalize_label(inst.label)
-        if wanted is None and label in BACKGROUND_LABELS:
-            continue
-        if wanted is not None and label not in wanted:
+        if label in BACKGROUND_LABELS:
             continue
         score = load_map(inst.source)(inst.score)
         if score < min_score:

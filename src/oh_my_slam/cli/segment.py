@@ -1,6 +1,6 @@
 """``segment.sh`` — instance segmentation of an image or of a persisted map.
 
-    segment.sh -i <image> [-o <folder>] [-f json|ply] [--min-score <s>] [--labels a,b,c]
+    segment.sh -i <image> [-o <folder>] [-f json|ply] [--min-score <s>]
     segment.sh -m <map-folder> [-o <folder>] [-f json|ply]
 
 stdout: the OpenLABEL scene (json, default) or the segment-coloured PLY. With ``-o`` the five
@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from oh_my_slam.cli.common import ArgumentParser, parse_labels, run_main
+from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.core import timing
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.log import claim_stdout, get_logger, json_payload_bytes
@@ -43,8 +43,6 @@ def build_parser() -> ArgumentParser:
                     help="stdout format (default: json)")
     ap.add_argument("--min-score", dest="min_score", default=None,
                     help="drop detections below this calibrated score (default 0.5; -i only)")
-    ap.add_argument("--labels", dest="labels", default=None,
-                    help="comma-separated labels to keep (any words; -i only)")
     return ap
 
 
@@ -59,12 +57,11 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
     if not image.is_file():
         raise InputError(f"image not found: {image}")
     min_score = 0.5 if args.min_score is None else _score(args.min_score)  # type: ignore[attr-defined]
-    labels = parse_labels(args.labels)  # type: ignore[attr-defined]
     stage = timing.stage
     with stage("connect"):
         client = connect()
     with stage("inference"):
-        frame, dets = reconstruct_and_detect(image, client, labels=labels, min_score=min_score)
+        frame, dets = reconstruct_and_detect(image, client, min_score=min_score)
     with stage("segment"):
         seg = segment_frame(frame, client=client, detections=dets)
     with stage("export"):
@@ -81,9 +78,8 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
 
 
 def _segment_map(args: object) -> tuple[bytes, bytes]:
-    if args.min_score is not None or args.labels is not None:  # type: ignore[attr-defined]
-        raise UsageError("-m exports the map's persistent objects; --min-score and --labels "
-                         "apply to -i only")
+    if args.min_score is not None:  # type: ignore[attr-defined]
+        raise UsageError("-m exports the map's persistent objects; --min-score applies to -i only")
     from oh_my_slam.mapping.export import map_segment_outputs
 
     return map_segment_outputs(args.map, args.out)  # type: ignore[attr-defined]

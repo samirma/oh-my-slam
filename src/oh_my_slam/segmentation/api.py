@@ -123,14 +123,13 @@ def _lift_detections(frame: FrameReconstruction, dets: list[Detection], T_parent
 def segment_frame(
     frame: FrameReconstruction,
     *,
-    labels: list[str] | None = None,
     min_score: float = DEFAULT_MIN_SCORE,
     client: InferenceClient | None = None,
     detections: list[Detection] | None = None,
 ) -> FrameSegmentation:
     """Objects of one image in its camera frame; ids 1..N by score, then area."""
     if detections is None:
-        detections = detect(frame.image_path, labels=labels, min_score=min_score,
+        detections = detect(frame.image_path, min_score=min_score,
                             max_side=max(frame.grid_size), client=client)
     instances = lift_detections(frame, detections)
     up = frame.gravity.up_cam if frame.gravity is not None else DEFAULT_UP_CAM
@@ -157,7 +156,6 @@ def reconstruct_and_detect(
     image_path: Path,
     client: InferenceClient,
     *,
-    labels: list[str] | None = None,
     min_score: float = DEFAULT_MIN_SCORE,
     keyframe: bool = False,
     intrinsics: Intrinsics | None = None,
@@ -173,8 +171,8 @@ def reconstruct_and_detect(
     det_client = client.clone()
     try:
         with ThreadPoolExecutor(1) as pool:
-            fut = pool.submit(detect, image_path, labels=labels, min_score=min_score,
-                              max_side=side, client=det_client)
+            fut = pool.submit(detect, image_path, min_score=min_score, max_side=side,
+                              client=det_client)
             frame = reconstruct_image(
                 image_path, want_gravity=True, client=client, intrinsics=intrinsics,
                 max_side=side, num_tokens=KEYFRAME_TOKENS if keyframe else SINGLE_IMAGE_TOKENS,
