@@ -24,7 +24,7 @@ from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.gravity import GravityEstimate, refine_with_floor
-from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE, cloud_mask, frame_cloud
+from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE, frame_cloud, pixel_mask
 
 log = get_logger("oh_my_slam.reconstruction")
 
@@ -48,13 +48,10 @@ class FrameReconstruction:
     def grid_size(self) -> tuple[int, int]:
         return self.depth.shape[1], self.depth.shape[0]
 
-    def point_mask(self) -> NDArray[np.bool_]:
-        return cloud_mask(self.depth, self.valid)
-
-    def camera_cloud(self, mask: NDArray[Any] | None = None) -> tuple[PointCloud, NDArray[Any]]:
-        """Coloured points in the camera frame (OpenCV axes, metres) and their pixel indices."""
-        return frame_cloud(self.depth, self.rgb, self.K_grid,
-                           self.point_mask() if mask is None else mask)
+    def camera_cloud(self) -> tuple[PointCloud, NDArray[Any]]:
+        """Coloured points in the camera frame (OpenCV axes, metres) with the default pixel
+        selection, and their pixel indices."""
+        return frame_cloud(self.depth, self.rgb, self.K_grid, pixel_mask(self.depth, self.valid))
 
 
 def connect_server() -> InferenceClient:

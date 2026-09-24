@@ -15,9 +15,9 @@ from pathlib import Path
 
 from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.core import timing
+from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.log import claim_stdout, get_logger, json_payload_bytes
-from oh_my_slam.core.ply import ply_bytes
 
 PROG = "segment.sh"
 log = get_logger("oh_my_slam.cli.segment")
@@ -53,6 +53,7 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
     from oh_my_slam.client.client import connect
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.artifacts import write_artifacts
+    from oh_my_slam.segmentation.cloud import cloud_ply, image_cloud_source
     from oh_my_slam.segmentation.render import segmented_image
     from oh_my_slam.segmentation.scene import single_image_scene
 
@@ -69,12 +70,12 @@ def _segment_image(args: object) -> tuple[bytes, bytes]:
         seg = segment_frame(frame, client=client, detections=dets)
     with stage("export"):
         scene = json_payload_bytes(single_image_scene(seg, tool="segment"))
-        cloud = seg.segments_cloud()
-        ply = ply_bytes(cloud, comment="oh-my-slam segments")
+        ply = cloud_ply(image_cloud_source(frame, seg),
+                        CloudAttrs.defaults(CloudScope.IMAGE | CloudScope.SEGMENT))
     if args.out is not None:  # type: ignore[attr-defined]
         with stage("artifacts"):
             write_artifacts(args.out, scene, segmented_image(frame.rgb, seg.label_map),  # type: ignore[attr-defined]
-                            seg.objects, cloud, title=f"Objects in {image.name}")
+                            seg.objects, ply, title=f"Objects in {image.name}")
     timing.count(objects=len(seg.objects), detections=len(dets))
     log.info("%d objects", len(seg.objects))
     return scene, ply
@@ -85,7 +86,10 @@ def _segment_map(args: object) -> tuple[bytes, bytes]:
         raise UsageError("-m exports the map's persistent objects; --min-score applies to -i only")
     from oh_my_slam.mapping.export import map_segment_outputs
 
-    return map_segment_outputs(args.map, args.out)  # type: ignore[attr-defined]
+    scene, ply = map_segment_outputs(
+        args.map, args.out, CloudAttrs.defaults(CloudScope.MAP | CloudScope.SEGMENT))  # type: ignore[attr-defined]
+    assert ply is not None
+    return scene, ply
 
 
 def main(argv: list[str]) -> int:

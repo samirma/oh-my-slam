@@ -12,22 +12,28 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.images import load_png
 from oh_my_slam.core.log import json_payload_bytes
-from oh_my_slam.core.ply import PointCloud, read_ply
+from oh_my_slam.core.ply import read_ply
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import detect
 from oh_my_slam.segmentation.api import (
-    colorize_cloud,
     exclusive_masks,
     reconstruct_and_detect,
     segment_frame,
 )
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES, write_artifacts
 from oh_my_slam.segmentation.catalog import CSV_HEADER, catalog_csv, catalog_md
-from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id
+from oh_my_slam.segmentation.cloud import (
+    cloud_ply,
+    derive_cloud,
+    image_cloud_source,
+    map_cloud_source,
+)
+from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, segment_colors
 from oh_my_slam.segmentation.render import (
     choose_contact_frames,
     contact_sheet,
@@ -98,11 +104,12 @@ def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]
     for o in seg.objects:
         assert o.pixel_count == int((seg.label_map == o.id).sum())
         assert o.point_count == len(seg.points[o.id])
-    cloud = seg.segments_cloud()
-    assert cloud.label is not None
-    for o in seg.objects:
+    cloud = derive_cloud(image_cloud_source(frame, seg), CloudAttrs(color="segment", label=True))
+    assert cloud.label is not None and cloud.rgb is not None
+    for o in seg.objects:  # colour contract: the object colour on exactly its lifted points
         np.testing.assert_array_equal(np.unique(cloud.rgb[cloud.label == o.id], axis=0),
                                       [o.color])
+        assert int((cloud.label == o.id).sum()) == o.point_count
     np.testing.assert_array_equal(np.unique(cloud.rgb[cloud.label == 0], axis=0), [UNSEGMENTED])
     f2, dets = reconstruct_and_detect(img, client)
     assert len(dets) == 3 and f2.gravity is not None
@@ -207,7 +214,8 @@ def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  #
 
     payload = json_payload_bytes(scene)
     out = tmp_path / "out"
-    files = write_artifacts(out, payload, png, seg.objects, seg.segments_cloud(), "t")
+    ply_payload = cloud_ply(image_cloud_source(frame, seg), CloudAttrs(color="segment"))
+    files = write_artifacts(out, payload, png, seg.objects, ply_payload, "t")
     assert sorted(p.name for p in out.iterdir()) == sorted(ARTIFACT_NAMES)
     assert [f.name for f in files] == list(ARTIFACT_NAMES)
     assert (out / "segmentation.json").read_bytes() == payload
@@ -215,8 +223,9 @@ def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  #
     img_back = load_png(out / "segmented.png")
     np.testing.assert_array_equal(img_back, png)
     assert "icc_profile" not in Image.open(out / "segmented.png").info
+    assert (out / "segments.ply").read_bytes() == ply_payload
     ply = read_ply(out / "segments.ply")
-    assert ply.label is not None and len(ply) == len(seg.segments_cloud())
+    assert ply.label is None and ply.rgb is not None  # label is off by default
 
 
 def test_contact_sheet_and_set_cover() -> None:
@@ -235,14 +244,17 @@ def test_contact_sheet_and_set_cover() -> None:
     assert contact_sheet([]).shape[0] > 0
 
 
-def test_colorize_cloud() -> None:
-    c = PointCloud(np.zeros((4, 3)), np.zeros((4, 3)), np.array([0, 3, 3, 9]))
-    out = colorize_cloud(c, {3})
+def test_map_source_keeps_only_exported_objects() -> None:
+    src = map_cloud_source(np.zeros((4, 3)), np.zeros((4, 3), np.uint8), np.array([0, 3, 3, 9]),
+                           {3}, np.zeros((0, 3)))
+    out = derive_cloud(src, CloudAttrs(color="segment", label=True))
     assert out.label is not None and out.label.tolist() == [0, 3, 3, 0]
+    assert out.rgb is not None
     assert tuple(out.rgb[1]) == color_for_id(3) and tuple(out.rgb[3]) == UNSEGMENTED
+    assert segment_colors(np.array([], np.int32)).shape == (0, 3)
 
 
-def test_export_map_contact_sheet_and_cloud() -> None:
+def test_export_map_contact_sheet() -> None:
     from oh_my_slam.segmentation.api import KeyframeLabels, SceneObject, export_map
     from oh_my_slam.segmentation.obb import OBB
 
@@ -254,12 +266,10 @@ def test_export_map_contact_sheet_and_cloud() -> None:
         for j, oid in enumerate(ids):
             lab[5:15, 5 + 15 * j: 15 + 15 * j] = oid
         kfs.append(KeyframeLabels(name, np.full((40, 60, 3), 100, np.uint8), lab))
-    cloud = PointCloud(np.zeros((5, 3)), np.zeros((5, 3)), np.array([3, 5, 8, 99, 0]))
-    out = export_map(objs, kfs, cloud)
+    out = export_map(objs, kfs)
     assert out.tiles == ["f000001", "f000002"]
     sheet_colors = {tuple(c) for c in out.segmented.reshape(-1, 3)}
     assert {color_for_id(3), color_for_id(5), color_for_id(8)} <= sheet_colors
     assert color_for_id(99) not in sheet_colors  # unknown id never painted
-    assert out.segments.label is not None and out.segments.label.tolist() == [3, 5, 8, 0, 0]
-    empty = export_map([], kfs[:1], cloud)
+    empty = export_map([], kfs[:1])
     assert empty.tiles == ["f000000"]

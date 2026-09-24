@@ -79,9 +79,21 @@ def _upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
     return T
 
 
+def _display_cloud(source: Any) -> tuple[PointCloud, NDArray[np.uint8], NDArray[np.int32]]:
+    """Image-coloured points, their segment colours and object ids (default attributes)."""
+    from oh_my_slam.core.cloud_attrs import CloudAttrs
+    from oh_my_slam.segmentation.cloud import derive_cloud
+
+    cloud = derive_cloud(source, CloudAttrs(color="rgb", label=True))
+    segs = derive_cloud(source, CloudAttrs(color="segment")).rgb
+    assert cloud.label is not None and segs is not None
+    return PointCloud(cloud.xyz, cloud.rgb), segs, cloud.label
+
+
 def image_bundle(image: Path, client: Any = None) -> ViewBundle:
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.catalog import catalog_rows
+    from oh_my_slam.segmentation.cloud import image_cloud_source
     from oh_my_slam.segmentation.render import segmented_image
     from oh_my_slam.segmentation.scene import single_image_scene
 
@@ -92,10 +104,8 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
     frame, dets = reconstruct_and_detect(Path(image), client)
     seg = segment_frame(frame, client=client, detections=dets)
     scene = single_image_scene(seg, tool="view")
-    segcloud = seg.segments_cloud()
-    cloud, _ = frame.camera_cloud()
-    assert segcloud.label is not None
-    cloud, (segs, labels) = _thin(cloud, [segcloud.rgb, segcloud.label])
+    full, segs, labels = _display_cloud(image_cloud_source(frame, seg))
+    cloud, (segs, labels) = _thin(full, [segs, labels])
     up = frame.gravity.up_cam if frame.gravity is not None else DEFAULT_UP_CAM
     return ViewBundle(
         mode="image",
@@ -115,17 +125,14 @@ def map_bundle(map_dir: Path) -> ViewBundle:
     import json
 
     from oh_my_slam.mapping import store
-    from oh_my_slam.mapping.export import map_cloud, map_objects, scene_bytes
-    from oh_my_slam.segmentation.api import colorize_cloud
+    from oh_my_slam.mapping.export import map_objects, reader_source, scene_bytes
     from oh_my_slam.segmentation.catalog import catalog_rows
 
     reader = store.MapReader(Path(map_dir))
     scene = json.loads(scene_bytes(reader))
     _, objs = map_objects(reader)
-    cloud = map_cloud(reader)
-    seg = colorize_cloud(cloud, {o.id for o in objs})
-    assert seg.label is not None
-    disp, (segs, labels) = _thin(PointCloud(cloud.xyz, cloud.rgb), [seg.rgb, seg.label])
+    cloud, segs, labels = _display_cloud(reader_source(reader, objs))
+    disp, (segs, labels) = _thin(cloud, [segs, labels])
     frustums = [
         {
             "name": f.name,

@@ -10,7 +10,7 @@ from PIL import Image
 
 from oh_my_slam.core import atomic, images, paths, rle
 from oh_my_slam.core.errors import ExitCode, InputError, ServerUnavailableError
-from oh_my_slam.core.ply import PointCloud, parse_ply, ply_bytes, read_ply
+from oh_my_slam.core.ply import PointCloud, parse_header, parse_ply, ply_bytes, read_ply
 
 # --- PLY ------------------------------------------------------------------------------------------
 
@@ -19,8 +19,8 @@ def test_ply_roundtrip_with_and_without_label(tmp_path: Path, rng: np.random.Gen
     xyz = rng.normal(size=(100, 3)).astype(np.float32)
     rgb = rng.integers(0, 256, size=(100, 3)).astype(np.uint8)
     cloud = PointCloud(xyz, rgb)
-    data = ply_bytes(cloud, comment="test")
-    assert data.startswith(b"ply\nformat binary_little_endian 1.0\n")
+    data = ply_bytes(cloud, comments=["test"])
+    assert data.startswith(b"ply\nformat binary_little_endian 1.0\ncomment test\n")
     back = parse_ply(data)
     np.testing.assert_array_equal(back.xyz, xyz)
     np.testing.assert_array_equal(back.rgb, rgb)
@@ -42,13 +42,75 @@ def test_ply_validation_errors(rng: np.random.Generator) -> None:
     with pytest.raises(ValueError):
         parse_ply(b"not a ply")
     with pytest.raises(ValueError):
-        parse_ply(b"ply\nformat ascii 1.0\nend_header\n")
+        parse_ply(b"ply\nformat ascii 1.0\nend_header\n")  # no vertex element
+    with pytest.raises(ValueError):
+        parse_ply(b"ply\nformat binary_big_endian 1.0\nelement vertex 0\nend_header\n")
+    with pytest.raises(ValueError):
+        PointCloud(np.zeros((3, 3)), normals=np.zeros((2, 3)))
+    with pytest.raises(ValueError):
+        ply_bytes(PointCloud(np.zeros((1, 3))), comments=["two\nlines"])
+    with pytest.raises(ValueError):
+        ply_bytes(PointCloud(np.zeros((1, 3))), encoding="utf8")
+
+
+def _cloud(rng: np.random.Generator, n: int, *, rgb: bool, label: bool, normals: bool
+           ) -> PointCloud:
+    nrm = rng.normal(size=(n, 3))
+    nrm /= np.linalg.norm(nrm, axis=1, keepdims=True)
+    return PointCloud(rng.normal(size=(n, 3)).astype(np.float32),
+                      rng.integers(0, 256, (n, 3)).astype(np.uint8) if rgb else None,
+                      rng.integers(0, 40, n).astype(np.int32) if label else None,
+                      nrm.astype(np.float32) if normals else None)
+
+
+@pytest.mark.parametrize("encoding", ["binary", "ascii"])
+@pytest.mark.parametrize(("rgb", "label", "normals"),
+                         [(True, False, False), (False, False, False), (True, True, True),
+                          (False, True, True), (True, False, True)])
+def test_ply_writer_reader_roundtrip(rng: np.random.Generator, encoding: str, rgb: bool,
+                                     label: bool, normals: bool) -> None:
+    cloud = _cloud(rng, 57, rgb=rgb, label=label, normals=normals)
+    data = ply_bytes(cloud, encoding=encoding, comments=["first", "attributes color=rgb"])
+    fmt = b"binary_little_endian 1.0" if encoding == "binary" else b"ascii 1.0"
+    assert data.startswith(b"ply\nformat " + fmt + b"\ncomment first\ncomment attributes")
+    header = parse_header(data)
+    assert header.comments == ["first", "attributes color=rgb"] and header.count == 57
+    names = [n for n, _ in header.fields]
+    expected = ["x", "y", "z"] + (["nx", "ny", "nz"] if normals else []) \
+        + (["red", "green", "blue"] if rgb else []) + (["label"] if label else [])
+    assert names == expected
+    head = data[:header.body_offset].decode()
+    assert ("property uchar red" in head) == rgb and ("property int label" in head) == label
+    assert ("property float nx" in head) == normals
+    back = parse_ply(data)
+    np.testing.assert_array_equal(back.xyz, cloud.xyz)  # exact, also in ASCII (%.9g)
+    for a, b in ((back.rgb, cloud.rgb), (back.label, cloud.label), (back.normals, cloud.normals)):
+        assert (a is None) == (b is None)
+        if a is not None:
+            np.testing.assert_array_equal(a, b)
+    if encoding == "binary":
+        per = 12 + 12 * normals + 3 * rgb + 4 * label
+        assert len(data) == header.body_offset + 57 * per
+    else:
+        assert data[header.body_offset:].count(b"\n") == 57
+    # deterministic: the same cloud gives the same bytes
+    assert ply_bytes(cloud, encoding=encoding, comments=["first", "attributes color=rgb"]) == data
+
+
+def test_ply_empty_cloud_both_encodings() -> None:
+    for enc in ("binary", "ascii"):
+        data = ply_bytes(PointCloud(np.zeros((0, 3)), np.zeros((0, 3))), encoding=enc)
+        back = parse_ply(data)
+        assert len(back) == 0 and back.rgb is not None and back.label is None
 
 
 def test_pointcloud_subset() -> None:
-    c = PointCloud(np.zeros((5, 3)), np.zeros((5, 3)), np.array([1, 2, 3, 4, 5]))
+    c = PointCloud(np.zeros((5, 3)), np.zeros((5, 3)), np.array([1, 2, 3, 4, 5]),
+                   np.arange(15).reshape(5, 3))
     sub = c.subset(np.array([0, 4]))
     assert len(sub) == 2 and sub.label is not None and sub.label.tolist() == [1, 5]
+    assert sub.normals is not None and sub.normals[1].tolist() == [12, 13, 14]
+    assert PointCloud(np.zeros((2, 3))).subset(np.array([1])).rgb is None
 
 
 # --- RLE ------------------------------------------------------------------------------------------

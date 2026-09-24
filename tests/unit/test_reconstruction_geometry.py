@@ -10,7 +10,7 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction import depth as dmod
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.gravity import GravityEstimate, mean_up, refine_with_floor
-from oh_my_slam.reconstruction.pointcloud import cloud_mask, frame_cloud
+from oh_my_slam.reconstruction.pointcloud import frame_cloud, pixel_mask
 from tests.synth.scene import default_room, look_at, orbit_poses, render
 
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
@@ -20,7 +20,7 @@ def test_frame_cloud_colours_and_edges() -> None:
     room = default_room()
     pose = look_at(np.array([2.5, 2.0, 1.5]), np.array([0.0, 0.0, 0.5]))
     r = render(room, pose, K)
-    m = cloud_mask(r.depth, r.depth > 0)
+    m = pixel_mask(r.depth, r.depth > 0)
     assert m.sum() > 0.8 * (r.depth > 0).sum()
     cloud, idx = frame_cloud(r.depth, r.rgb, K, m, pose)
     np.testing.assert_array_equal(cloud.rgb, r.rgb.reshape(-1, 3)[idx])

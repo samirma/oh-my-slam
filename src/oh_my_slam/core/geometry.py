@@ -185,8 +185,11 @@ def project(points_cam: NDArray[Any], K: NDArray[Any]) -> tuple[F64, F64]:
 
 
 def depth_edge_mask(depth: NDArray[Any], rel_threshold: float = 0.04, size: int = 3) -> NDArray[Any]:
-    """True where depth jumps by more than ``rel_threshold`` (relative) within a window."""
+    """True where depth jumps by more than ``rel_threshold`` (relative) within a window, and on
+    valid pixels touching invalid ones. ``rel_threshold <= 0`` disables the test (no edges)."""
     d = np.asarray(depth, dtype=np.float64)
+    if rel_threshold <= 0:
+        return np.zeros(d.shape, bool)
     valid = np.isfinite(d) & (d > 0)
     big = np.where(valid, d, np.nan)
     fill_hi = np.where(valid, d, -np.inf)

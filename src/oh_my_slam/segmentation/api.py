@@ -1,8 +1,8 @@
 """Segmentation API: detections → exclusive masks → 3D points → upright OBBs → ids and colours.
 
 ``segment_frame`` serves ``segment.sh -i``, ``reconstruct.sh`` (JSON) and ``view.sh -i``;
-``lift_detections`` serves the mapper (per keyframe, in map coordinates); ``export_map`` turns a
-map's persistent objects into the segment artefacts.
+``lift_detections`` serves the mapper (per keyframe, in map coordinates); ``export_map`` draws a
+map's persistent objects on its keyframes. Emitted clouds are derived in ``segmentation.cloud``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from numpy.typing import NDArray
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import timing
 from oh_my_slam.core.geometry import depth_edge_mask
-from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.api import (
     KEYFRAME_TOKENS,
@@ -27,7 +26,7 @@ from oh_my_slam.reconstruction.api import (
 )
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
-from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, color_hex_for_id
+from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
     DETECTION_FLOOR,
@@ -77,17 +76,14 @@ class FrameSegmentation:
     point_pixels: dict[int, NDArray[np.int64]]  # lifted pixel indices per object id
     points: dict[int, NDArray[np.float64]]  # lifted points per object id (camera frame)
 
-    def segments_cloud(self) -> PointCloud:
-        """Every frame point, grey unless it is one of an object's lifted points."""
-        cloud, idx = self.frame.camera_cloud()
-        owner = np.zeros(self.label_map.size, np.int32)
+    def point_labels(self) -> NDArray[np.int32]:
+        """Object id per grid pixel for the pixels lifted into an object's points, 0 elsewhere
+        (mask pixels dropped by lifting stay unsegmented)."""
+        out = np.zeros(self.label_map.shape, np.int32)
+        flat = out.reshape(-1)
         for oid, pix in self.point_pixels.items():
-            owner[pix] = oid
-        labels = owner[idx]
-        rgb = np.tile(np.array(UNSEGMENTED, np.uint8), (len(idx), 1))
-        for obj in self.objects:
-            rgb[labels == obj.id] = obj.color
-        return PointCloud(cloud.xyz, rgb, labels)
+            flat[pix] = oid
+        return out
 
 
 def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArray[np.bool_]]:
@@ -212,13 +208,12 @@ class KeyframeLabels:
 @dataclass
 class MapSegmentation:
     segmented: NDArray[np.uint8]  # contact sheet of <= 6 keyframes
-    segments: PointCloud  # map cloud coloured by object (grey elsewhere), label = object id
     tiles: list[str]  # keyframe names on the sheet
 
 
-def export_map(objects: list[SceneObject], keyframes: list[KeyframeLabels],
-               cloud: PointCloud) -> MapSegmentation:
-    """Segment artefacts for a persisted map (objects keep their ids and colours)."""
+def export_map(objects: list[SceneObject], keyframes: list[KeyframeLabels]) -> MapSegmentation:
+    """``segmented.png`` of a persisted map (objects keep their ids and colours); the segments
+    cloud is derived by ``segmentation.cloud``."""
     from oh_my_slam.segmentation.render import choose_contact_frames, contact_sheet
 
     ids = {o.id for o in objects}
@@ -232,16 +227,4 @@ def export_map(objects: list[SceneObject], keyframes: list[KeyframeLabels],
          np.where(np.isin(keyframes[i].label_map, id_list), keyframes[i].label_map, 0))
         for i in chosen
     ]
-    return MapSegmentation(contact_sheet(tiles), colorize_cloud(cloud, ids),
-                           [keyframes[i].name for i in chosen])
-
-
-def colorize_cloud(cloud: PointCloud, valid_ids: set[int]) -> PointCloud:
-    """Segment colours for a labelled cloud (label = object id, 0 = none)."""
-    labels = cloud.label if cloud.label is not None else np.zeros(len(cloud), np.int32)
-    labels = np.where(np.isin(labels, list(valid_ids)), labels, 0).astype(np.int32)
-    rgb = np.tile(np.array(UNSEGMENTED, np.uint8), (len(cloud), 1))
-    for oid in np.unique(labels):
-        if oid > 0:
-            rgb[labels == oid] = color_for_id(int(oid))
-    return PointCloud(cloud.xyz, rgb, labels)
+    return MapSegmentation(contact_sheet(tiles), [keyframes[i].name for i in chosen])

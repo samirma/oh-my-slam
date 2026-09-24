@@ -1,5 +1,6 @@
-"""Map scene export (OpenLABEL, map frame) for ``-t full`` / ``-t single``, the PLY payloads, and
-the read-only inputs for ``segment.sh -m``."""
+"""Map scene export (OpenLABEL, map frame) for ``-t full`` / ``-t single``, the PLY payloads
+(derived with the point-cloud attributes by ``segmentation.cloud``), and the read-only outputs of
+``segment.sh -m``."""
 
 from __future__ import annotations
 
@@ -9,13 +10,15 @@ from typing import Any
 
 import numpy as np
 
+from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.log import json_payload_bytes
-from oh_my_slam.core.ply import PointCloud, ply_bytes, read_ply
+from oh_my_slam.core.ply import PointCloud, read_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_state
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.api import KeyframeLabels, SceneObject, export_map
+from oh_my_slam.segmentation.cloud import MapCloudSource, cloud_ply, map_cloud_source
 from oh_my_slam.segmentation.scene import objects_block, ontology_labels
 
 Json = dict[str, Any]
@@ -61,12 +64,18 @@ def full_scene(root: Path, meta: dict[str, Any], records: list[store.FrameRecord
                        labels_for_ontology=ontology_labels(objects))
 
 
+def payload_objects(objs: ObjectState, mode: str) -> list[SceneObject]:
+    """The objects a ``-t full`` (all) or ``-t single`` (observed by the new input) payload covers."""
+    exported = objs.exported()
+    return exported if mode == "full" else [o for o in exported if o.id in objs.observed]
+
+
 def scene_payload(scene_full: Json, mode: str, new_names: list[str],
                   records: list[store.FrameRecord], objs: ObjectState) -> bytes:
     if mode == "full":
         return json_payload_bytes(scene_full)
     new = set(new_names)
-    keep_objs = [o for o in objs.exported() if o.id in objs.observed]
+    keep_objs = payload_objects(objs, mode)
     doc = json.loads(json.dumps(scene_full))
     root = doc["openlabel"]
     new_idx = {str(r.index) for r in records if r.name in new}
@@ -77,9 +86,20 @@ def scene_payload(scene_full: Json, mode: str, new_names: list[str],
     return json_payload_bytes(doc)
 
 
-def ply_payload(geo: Any, mode: str, new_names: set[str]) -> bytes:
+def map_source(cloud: PointCloud, objects: list[SceneObject], records: list[store.FrameRecord]
+               ) -> MapCloudSource:
+    """Cloud source of a map: point labels restricted to ``objects``, normals oriented towards
+    the keyframe camera centres."""
+    rgb = cloud.rgb if cloud.rgb is not None else np.zeros((len(cloud), 3), np.uint8)
+    return map_cloud_source(cloud.xyz, rgb, cloud.label, {o.id for o in objects},
+                            np.array([r.T_map_cam.t for r in records]).reshape(-1, 3))
+
+
+def ply_payload(geo: Any, mode: str, records: list[store.FrameRecord], objs: ObjectState,
+                attrs: CloudAttrs) -> bytes:
+    """``-f ply``: the whole map cloud (full) or the new keyframes' points (single)."""
     cloud = geo.cloud if mode == "full" else geo.new_cloud
-    return ply_bytes(PointCloud(cloud.xyz, cloud.rgb), comment=f"oh-my-slam map ({mode})")
+    return cloud_ply(map_source(cloud, payload_objects(objs, mode), records), attrs)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -92,12 +112,18 @@ def map_objects(reader: store.MapReader) -> tuple[ObjectState, list[SceneObject]
 
 
 def map_cloud(reader: store.MapReader) -> PointCloud:
+    """The stored map cloud with its object id per point."""
     if not reader.exists(store.CLOUD_PLY):
-        return PointCloud(np.zeros((0, 3)), np.zeros((0, 3)))
+        return PointCloud(np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0))
     cloud = read_ply(reader.path(store.CLOUD_PLY))
     lp = reader.path(store.CLOUD_OBJECTS)
     labels = np.load(lp).astype(np.int32) if lp.exists() else np.zeros(len(cloud), np.int32)
     return PointCloud(cloud.xyz, cloud.rgb, labels)
+
+
+def reader_source(reader: store.MapReader, objects: list[SceneObject]) -> MapCloudSource:
+    """Cloud source of a persisted map (``segment.sh -m``, ``view.sh -m``)."""
+    return map_source(map_cloud(reader), objects, reader.frames)
 
 
 def keyframe_labels(reader: store.MapReader, state: ObjectState) -> list[KeyframeLabels]:
@@ -116,18 +142,21 @@ def scene_bytes(reader: store.MapReader) -> bytes:
     return json_payload_bytes(full_scene(reader.root, reader.meta, reader.frames, objs))
 
 
-def map_segment_outputs(map_dir: Path, out_dir: Path | None) -> tuple[bytes, bytes]:
-    """``segment.sh -m``: (scene JSON bytes, segments PLY bytes); artefacts when ``out_dir``."""
+def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudAttrs,
+                        want_ply: bool = True) -> tuple[bytes, bytes | None]:
+    """``segment.sh -m``: (scene JSON, segments PLY — also when ``artifacts_dir`` is given, else
+    only if ``want_ply``); writes the artefacts into ``artifacts_dir``. Read-only: no inference,
+    the map is never modified."""
     from oh_my_slam.segmentation.artifacts import write_artifacts
 
     reader = store.MapReader(map_dir)
     state, objs = map_objects(reader)
     scene = scene_bytes(reader)
-    need_sheet = out_dir is not None
-    kfs = keyframe_labels(reader, state) if need_sheet else []
-    seg = export_map(objs, kfs, map_cloud(reader))
-    ply = ply_bytes(seg.segments, comment="oh-my-slam map segments")
-    if out_dir is not None:
-        write_artifacts(out_dir, scene, seg.segmented, objs, seg.segments,
+    ply = cloud_ply(reader_source(reader, objs), attrs) \
+        if want_ply or artifacts_dir is not None else None
+    if artifacts_dir is not None:
+        assert ply is not None
+        sheet = export_map(objs, keyframe_labels(reader, state)).segmented
+        write_artifacts(artifacts_dir, scene, sheet, objs, ply,
                         title=f"Objects in map {reader.root.name}")
     return scene, ply

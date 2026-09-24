@@ -4,12 +4,18 @@
 1-19; every further cycle ``k = (id - 1) // 19`` rotates the hue of the same 19 colours by
 ``k * 0.381966`` of a turn in HLS space (lightness and saturation unchanged, so no colour is
 ever grey). Unsegmented points are ``UNSEGMENTED`` (#808080), never an object colour.
+
+Also the ``color=height`` ramp of the point-cloud attributes (viridis, low → high).
 """
 
 from __future__ import annotations
 
 import colorsys
 from functools import cache
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
 
 PALETTE_HEX = (
     "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6",
@@ -76,3 +82,32 @@ def color_for_id(object_id: int) -> RGB:
 
 def color_hex_for_id(object_id: int) -> str:
     return rgb_to_hex(color_for_id(object_id))
+
+
+def segment_colors(labels: NDArray[Any]) -> NDArray[np.uint8]:
+    """Per-point object colour for object ids (``UNSEGMENTED`` grey for 0)."""
+    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+    ids, inverse = np.unique(lab, return_inverse=True)
+    table = np.array([UNSEGMENTED if i <= 0 else color_for_id(int(i)) for i in ids], np.uint8)
+    return table.reshape(-1, 3)[inverse.reshape(-1)]
+
+
+# viridis sampled at 0, 0.1, ..., 1 (matplotlib), linearly interpolated
+_VIRIDIS = np.array([hex_to_rgb(h) for h in (
+    "#440154", "#482475", "#414487", "#355f8d", "#2a788e", "#21918c", "#22a884", "#44bf70",
+    "#7ad151", "#bddf26", "#fde725")], np.float64)
+HEIGHT_RANGE_PERCENTILES = (1.0, 99.0)
+
+
+def height_colors(heights: NDArray[Any]) -> NDArray[np.uint8]:
+    """Viridis ramp over the robust range (1st-99th percentile) of ``heights`` (along up)."""
+    h = np.asarray(heights, dtype=np.float64).reshape(-1)
+    if len(h) == 0:
+        return np.zeros((0, 3), np.uint8)
+    lo, hi = np.percentile(h, HEIGHT_RANGE_PERCENTILES)
+    t = np.clip((h - lo) / (hi - lo), 0.0, 1.0) if hi > lo else np.full(len(h), 0.5)
+    x = t * (len(_VIRIDIS) - 1)
+    i = np.minimum(x.astype(np.int64), len(_VIRIDIS) - 2)
+    f = (x - i)[:, None]
+    rgb = _VIRIDIS[i] * (1 - f) + _VIRIDIS[i + 1] * f
+    return np.rint(rgb).astype(np.uint8)

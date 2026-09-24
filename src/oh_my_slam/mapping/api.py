@@ -22,6 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
+from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import RegistrationError
 from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
@@ -700,14 +701,17 @@ class UpdateResult:
 
 
 def update(map_dir: Path, inputs: list[Path], *, fps: float = ingest.DEFAULT_FPS,
-           mode: str = "full", fmt: str = "json", client: Any = None,
-           progress: Progress = _progress) -> UpdateResult:
+           mode: str = "full", fmt: str = "json", attrs: CloudAttrs | None = None,
+           client: Any = None, progress: Progress = _progress) -> UpdateResult:
+    """``attrs``: point-cloud attributes of the ``fmt="ply"`` payload (map scope; default rgb)."""
     with timing.collect() as tm:
-        return _update(map_dir, inputs, fps, mode, fmt, client, progress, tm)
+        return _update(map_dir, inputs, fps, mode, fmt, attrs or CloudAttrs(), client, progress,
+                       tm)
 
 
-def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str, client: Any,
-            progress: Progress, tm: timing.Timings) -> UpdateResult:
+def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
+            attrs: CloudAttrs, client: Any, progress: Progress, tm: timing.Timings
+            ) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
     from oh_my_slam.mapping import export, objects, validity
@@ -794,7 +798,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str, 
                 scene_full = export.full_scene(tx.root, meta, records, objs.exported())
                 tx.write_json(store.SCENE_JSON, scene_full)
                 if fmt == "ply":
-                    payload = export.ply_payload(geo, mode, set(new_names))
+                    payload = export.ply_payload(geo, mode, records, objs, attrs)
                 else:
                     payload = export.scene_payload(scene_full, mode, new_names, records, objs)
             # timings up to the commit (map.json is written by the commit itself)

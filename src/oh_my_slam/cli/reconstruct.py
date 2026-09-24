@@ -13,11 +13,12 @@ from pathlib import Path
 from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.client.client import connect
 from oh_my_slam.core import timing
+from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.log import PayloadWriter, claim_stdout, get_logger, json_payload_bytes
-from oh_my_slam.core.ply import ply_bytes
 from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
+from oh_my_slam.segmentation.cloud import cloud_ply, image_cloud_source
 from oh_my_slam.segmentation.scene import single_image_scene
 
 PROG = "reconstruct.sh"
@@ -54,12 +55,11 @@ def _run(args: argparse.Namespace, out: PayloadWriter) -> dict[str, int]:
         with stage("inference"):
             frame = reconstruct_image(args.image, want_gravity=False, client=client)
         with stage("export"):
-            cloud, _ = frame.camera_cloud()
-            data = ply_bytes(cloud, comment="oh-my-slam camera frame, metres")
+            data = cloud_ply(image_cloud_source(frame), CloudAttrs())
         with stage("write"):
             out.write_bytes(data)
-        log.info("%d points in %.2f s", len(cloud), time.perf_counter() - t0)
-        return {"points": len(cloud)}
+        log.info("%d bytes of PLY in %.2f s", len(data), time.perf_counter() - t0)
+        return {"ply_bytes": len(data)}
     with stage("inference"):
         frame, dets = reconstruct_and_detect(args.image, client)
     with stage("segment"):

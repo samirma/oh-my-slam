@@ -95,7 +95,7 @@ def test_segment_with_artifacts_labels_and_min_score(env, tmp_path: Path) -> Non
 
     cap.__init__()
     assert cli_segment.main(["-i", str(img), "-f", "ply"]) == 0
-    assert parse_ply(cap.buf.getvalue()).label is not None
+    assert parse_ply(cap.buf.getvalue()).label is None  # label property off by default
 
 
 def test_segment_without_o_writes_nothing(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

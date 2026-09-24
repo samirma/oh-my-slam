@@ -18,7 +18,7 @@ from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_valid
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
-from oh_my_slam.reconstruction.pointcloud import cloud_mask
+from oh_my_slam.reconstruction.pointcloud import pixel_mask
 from oh_my_slam.segmentation.colors import UNSEGMENTED
 
 # Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
@@ -77,7 +77,7 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
     """
     fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS)
     for fd in frames:
-        m = cloud_mask(fd.depth, fd.valid)
+        m = pixel_mask(fd.depth, fd.valid)
         fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam)
     views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
     pts = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
@@ -140,7 +140,7 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         new_cloud = cloud.subset(np.nonzero(seen_new)[0])
         assert cloud.label is not None
         tx.write_bytes(store.CLOUD_PLY, ply_bytes(PointCloud(cloud.xyz, cloud.rgb),
-                                                  comment="oh-my-slam map cloud, metres, z up"))
+                                                  comments=["oh-my-slam map cloud, metres, z up"]))
         tx.save_npy(store.CLOUD_OBJECTS, cloud.label.astype(np.int32))
     progress(f"cloud: {len(cloud)} points (voxel {cloud_voxel * 100:.1f} cm) in "
              f"{time.perf_counter() - t0:.0f} s")
