@@ -1,11 +1,12 @@
 """Instance detection: the segment endpoint → background / min-score filters → cross-label
 de-duplication → stable ordering. Also owns the vocabulary and label rules.
 
-Stable across thresholds: the server is always asked for every detection above a fixed floor
-(``DETECTION_FLOOR``), and ``--min-score`` filters client-side. Every later step (de-duplication,
-exclusive masks, id assignment) processes detections in ``priority`` order, in which a detection
-can only be affected by detections that precede it — so raising the threshold removes objects
-from the end and never changes the ones that remain."""
+Stable across thresholds: for a single image the server is always asked for every detection above
+a fixed floor (``DETECTION_FLOOR``) and ``--min-score`` is applied only after the objects have been
+resolved (``segmentation.api.segment_frame``). De-duplication and id order follow ``priority``
+(score first), so a detection is only ever suppressed by a higher-scoring one; overlapping pixels
+are resolved by nesting (``claim_order``), independently of ``--min-score``. Raising the threshold
+therefore removes objects from the end and never changes the ones that remain."""
 
 from __future__ import annotations
 
@@ -25,6 +26,10 @@ from oh_my_slam.core import rle, timing
 
 DEFAULT_MIN_SCORE = 0.5
 DETECTION_FLOOR = 0.25  # score floor requested from the server; the lowest accepted --min-score
+# Detections scoring at least this claim overlapping pixels before lower-scoring ones
+# (``claim_order``): the default threshold, so the default output never depends on detections
+# that are only reported with a lower --min-score.
+TRUSTED_SCORE = DEFAULT_MIN_SCORE
 DEDUPE_IOU = 0.7
 MIN_AREA_PX = 64
 
@@ -117,7 +122,7 @@ class Detection:
 
     @property
     def area(self) -> int:
-        return int(self.mask.sum())
+        return int(np.count_nonzero(self.mask))
 
 
 def mask_iou(a: NDArray[Any], b: NDArray[Any]) -> float:
@@ -130,6 +135,15 @@ def mask_iou(a: NDArray[Any], b: NDArray[Any]) -> float:
 def priority(d: Detection) -> tuple[float, int, str, tuple[float, float, float, float]]:
     """Total, deterministic order of detections: score desc, then mask area desc, label, box."""
     return (-d.score, -d.area, d.label, d.box)
+
+
+def claim_order(d: Detection) -> tuple[bool, int, float, str, tuple[float, float, float, float]]:
+    """Order in which detections claim overlapping pixels (first wins): trusted detections
+    (``TRUSTED_SCORE`` and above) before the others, and within each tier the smallest mask first,
+    so a nested object (a plate on a table, a person on a sofa) keeps its pixels whatever the
+    scores. A lower-scoring detection only gets pixels no trusted one covers: those are mostly
+    fragments of the trusted object around them (a chair's back detected as another chair)."""
+    return (d.score < TRUSTED_SCORE, d.area, -d.score, d.label, d.box)
 
 
 def dedupe(dets: list[Detection], iou: float = DEDUPE_IOU) -> list[Detection]:

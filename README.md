@@ -45,7 +45,9 @@ stdout carries exactly one JSON document or one PLY — or nothing when `-o FILE
 (written atomically); progress and diagnostics go to stderr. `segment.sh` writes files only with
 `-o` or `-d`; `-d` artefacts `segmentation.json` / `segments.ply` are byte-identical to what `-f json`
 / `-f ply` output. `--min-score` (default 0.5) accepts [0.25, 1]: the detector is always asked for
-everything above 0.25, so a threshold only adds or removes objects and the others keep id and colour.
+everything above 0.25 and overlaps are resolved before the threshold applies (a nested, smaller mask
+keeps its pixels — a plate on a table; detections below 0.5 only get pixels no detection at 0.5 or
+above covers), so a threshold only adds or removes objects and the others keep id, colour and box.
 
 Point-cloud attributes (`-p key=value[,key=value…]`, every PLY output; unknown keys and bad values
 exit 2 before any inference): `color=rgb|segment|height|none` (default `rgb`, fixed to `segment` in

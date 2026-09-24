@@ -81,9 +81,9 @@ def _segment_image(args: argparse.Namespace, attrs: CloudAttrs, min_score: float
     with stage("connect"):
         client = connect()
     with stage("inference"):
-        frame, dets = reconstruct_and_detect(image, client, min_score=min_score)
+        frame, dets = reconstruct_and_detect(image, client)
     with stage("segment"):
-        seg = segment_frame(frame, client=client, detections=dets)
+        seg = segment_frame(frame, client=client, detections=dets, min_score=min_score)
     with stage("export"):
         scene = json_payload_bytes(single_image_scene(seg, tool="segment"))
         ply = cloud_ply(image_cloud_source(frame, seg), attrs) \

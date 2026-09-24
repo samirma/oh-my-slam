@@ -34,6 +34,7 @@ from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
     DETECTION_FLOOR,
+    claim_order,
     detect,
     floor_gap,
     priority,
@@ -92,12 +93,26 @@ class FrameSegmentation:
         return out
 
 
-def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArray[np.bool_]]:
-    """Resolve overlaps by ``priority``: a pixel belongs to the highest-scoring detection covering
-    it, so a lower-score detection never changes a higher-score object's mask, points or OBB."""
+def pixel_owners(dets: list[Detection], shape: tuple[int, int]) -> NDArray[np.int32]:
+    """Index of the detection owning each pixel (-1: none), claimed in ``claim_order``: among the
+    trusted detections (the default threshold and above) the smallest mask covering a pixel wins,
+    so nested objects keep their pixels; lower-scoring detections only get the pixels left over.
+    The result depends on the detections alone, never on the ``--min-score`` applied later."""
     owner = np.full(shape, -1, np.int32)
-    for i in sorted(range(len(dets)), key=lambda k: priority(dets[k])):
-        owner[dets[i].mask & (owner < 0)] = i
+    for i in sorted(range(len(dets)), key=lambda k: claim_order(dets[k])):
+        mask = dets[i].mask
+        rows, cols = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
+        if len(rows) == 0:
+            continue
+        box = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1))  # a view of owner
+        sub = owner[box]
+        sub[mask[box] & (sub < 0)] = i
+    return owner
+
+
+def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArray[np.bool_]]:
+    """Per-detection masks with every pixel given to at most one detection (``pixel_owners``)."""
+    owner = pixel_owners(dets, shape)
     return [owner == i for i in range(len(dets))]
 
 
@@ -115,22 +130,30 @@ def lift_detections(
     T_parent_cam: Pose | None = None,
     depth: NDArray[Any] | None = None,
     valid: NDArray[Any] | None = None,
+    *,
+    min_score: float = 0.0,
 ) -> list[LiftedInstance]:
-    """Exclusive masks lifted to 3D (``depth`` overrides the frame's, e.g. scale-aligned)."""
+    """Exclusive masks lifted to 3D (``depth`` overrides the frame's, e.g. scale-aligned).
+
+    Overlaps are resolved among all of ``dets``; only the detections scoring at least
+    ``min_score`` are lifted, so the result for one of them does not depend on ``min_score``."""
     with timing.part("lift"):
-        return _lift_detections(frame, dets, T_parent_cam, depth, valid)
+        return _lift_detections(frame, dets, T_parent_cam, depth, valid, min_score)
 
 
 def _lift_detections(frame: FrameReconstruction, dets: list[Detection], T_parent_cam: Pose | None,
-                     depth: NDArray[Any] | None, valid: NDArray[Any] | None
+                     depth: NDArray[Any] | None, valid: NDArray[Any] | None, min_score: float
                      ) -> list[LiftedInstance]:
     d = frame.depth if depth is None else depth
     v = frame.valid if valid is None else valid
     edges = depth_edge_mask(np.where(v & (d > 0), d, 0.0))
-    masks = exclusive_masks(dets, d.shape)
+    owner = pixel_owners(dets, d.shape)
     out = []
-    for det, m in zip(dets, masks, strict=True):
-        if m.sum() == 0:
+    for i, det in enumerate(dets):
+        if det.score < min_score:
+            continue
+        m = owner == i
+        if not m.any():
             continue
         lifted = lift_mask(m, d, frame.K_grid, v, T_parent_cam, edges=edges)
         if len(lifted.points) >= MIN_POINTS:
@@ -147,14 +170,24 @@ def segment_frame(
 ) -> FrameSegmentation:
     """Objects of one image in its camera frame.
 
-    Ids are 1..N over the objects that survive lifting, in detection ``priority`` order (score
-    desc, then area, label, box). A detection is only ever affected by higher-priority ones, so
-    the same image and options give the same ids, and a higher ``min_score`` only drops objects
-    from the end: the objects kept at both thresholds have the same id, colour and OBB."""
+    ``detections`` must be every detection down to ``DETECTION_FLOOR`` (as ``detect`` and
+    ``reconstruct_and_detect`` return them), whatever ``min_score``: overlapping pixels are
+    resolved once among all of them (``pixel_owners``), and only then are the objects below
+    ``min_score`` dropped. An object's mask, points and OBB therefore never depend on
+    ``min_score``, nor does whether it survives lifting.
+
+    Ids are 1..N over the objects kept, in detection ``priority`` order (score desc, then area,
+    label, box), so the same image and options give the same ids, and a higher ``min_score`` only
+    drops objects from the end: the objects kept at both thresholds have the same id, colour,
+    mask, points and OBB. The pixels of a detection below ``min_score`` that a larger object
+    would otherwise cover stay unsegmented (they are not that object's surface)."""
+    if not DETECTION_FLOOR <= min_score <= 1.0:
+        raise ValueError(f"min_score {min_score} is outside [{DETECTION_FLOOR}, 1]")
     if detections is None:
-        detections = detect(frame.image_path, min_score=min_score,
+        detections = detect(frame.image_path, min_score=DETECTION_FLOOR,
                             max_side=max(frame.grid_size), client=client)
-    instances = sorted(lift_detections(frame, detections), key=lambda i: priority(i.detection))
+    instances = sorted(lift_detections(frame, detections, min_score=min_score),
+                       key=lambda i: priority(i.detection))
     up = frame.gravity.up_cam if frame.gravity is not None else DEFAULT_UP_CAM
     floor = None
     if frame.gravity is not None and frame.gravity.floor_height is not None:
@@ -207,19 +240,17 @@ def detect_alongside(
 def reconstruct_and_detect(
     image_path: Path,
     client: InferenceClient,
-    *,
-    min_score: float = DEFAULT_MIN_SCORE,
 ) -> tuple[FrameReconstruction, list[Detection]]:
     """Single-image reconstruction (delegated to ``reconstruction``) and detection, issued
-    concurrently. The server is asked for detections down to ``DETECTION_FLOOR``, so the ids of
-    the objects kept do not depend on ``min_score``."""
+    concurrently. Returns every detection down to ``DETECTION_FLOOR``: ``segment_frame`` applies
+    ``--min-score`` after resolving overlaps, so the objects kept do not depend on it."""
 
     def reconstruct(c: InferenceClient) -> FrameReconstruction:
         return reconstruct_image(image_path, want_gravity=True, client=c, max_side=MAX_GRID_SIDE,
                                  num_tokens=SINGLE_IMAGE_TOKENS)
 
     return detect_alongside(image_path, client, reconstruct, max_side=MAX_GRID_SIDE,
-                            min_score=min_score, floor=DETECTION_FLOOR)
+                            min_score=DETECTION_FLOOR, floor=DETECTION_FLOOR)
 
 
 @dataclass

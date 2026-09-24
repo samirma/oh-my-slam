@@ -115,31 +115,49 @@ def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]
     assert len(dets) == 3 and f2.gravity is not None
 
 
-def test_exclusive_masks_higher_score_keeps_the_pixel() -> None:
-    from oh_my_slam.segmentation.detect import Detection
+def _rect(r0: int, r1: int, c0: int, c1: int) -> np.ndarray:
+    m = np.zeros((10, 10), bool)
+    m[r0:r1, c0:c1] = True
+    return m
 
-    big = np.zeros((10, 10), bool)
-    big[:, :] = True
-    small = np.zeros((10, 10), bool)
-    small[2:4, 2:4] = True
-    dets = [Detection("cup", 0.8, "yoloe", small, (2, 2, 4, 4)),
-            Detection("table", 0.9, "yoloe", big, (0, 0, 10, 10))]
-    cup, table = exclusive_masks(dets, (10, 10))
-    assert table.sum() == 100 and cup.sum() == 0  # the lower score never takes pixels
-    dets[0].score = 0.95
-    cup, table = exclusive_masks(dets, (10, 10))
+
+@pytest.mark.parametrize("cup_score", [0.55, 0.95])
+def test_exclusive_masks_nested_object_keeps_its_pixels(cup_score: float) -> None:
+    """A plate on a table: the smaller mask keeps its pixels whether it scores lower or higher
+    than the larger one around it, and every pixel has at most one owner."""
+    dets = [detect.Detection("table", 0.9, "yoloe", _rect(0, 10, 0, 10), (0, 0, 10, 10)),
+            detect.Detection("cup", cup_score, "yoloe", _rect(2, 4, 2, 4), (2, 2, 4, 4))]
+    table, cup = exclusive_masks(dets, (10, 10))
     assert cup.sum() == 4 and table.sum() == 96 and not (cup & table).any()
+    assert [m.sum() for m in exclusive_masks(dets[::-1], (10, 10))] == [4, 96]  # order-free
+
+
+def test_exclusive_masks_low_score_detections_get_only_leftover_pixels() -> None:
+    """Below the default threshold a detection never takes pixels from one at or above it (such
+    detections are mostly fragments of the object around them), but nests among its peers."""
+    trusted = detect.Detection("chair", 0.6, "yoloe", _rect(0, 6, 0, 10), (0, 0, 10, 6))
+    fragment = detect.Detection("chair", 0.3, "yoloe", _rect(2, 8, 2, 6), (2, 2, 6, 8))
+    chair, frag = exclusive_masks([trusted, fragment], (10, 10))
+    assert chair.sum() == 60 and frag.sum() == 8 and not (chair & frag).any()
+    low_table = detect.Detection("table", 0.45, "yoloe", _rect(0, 10, 0, 10), (0, 0, 10, 10))
+    low_cup = detect.Detection("cup", 0.3, "yoloe", _rect(2, 4, 2, 4), (2, 2, 4, 4))
+    table, cup = exclusive_masks([low_table, low_cup], (10, 10))
+    assert cup.sum() == 4 and table.sum() == 96
 
 
 @pytest.fixture
 def overlapping(tmp_path: Path) -> tuple[FakeClient, Path]:
-    """Three boxes plus low-score detections that overlap them (and each other)."""
+    """Three boxes (cabinet 0.9, box 0.8, sofa 0.7), a cushion (0.55) nested in the sofa, and
+    low-score detections that overlap them (and each other)."""
     room = default_room()
     pose = look_at(np.array([2.6, 2.2, 1.6]), np.array([0.0, 0.0, 0.4]))
     r = render(room, pose, K)
     inst = [FakeInstance(b.label, 0.9 - 0.1 * k, r.ids == k + 2) for k, b in enumerate(room.boxes)]
     sofa = r.ids == 4
     rows, cols = np.nonzero(sofa)
+    cushion = np.zeros_like(sofa)
+    cushion[85:115, 50:90] = True
+    inst.append(FakeInstance("cushion", 0.55, cushion & sofa))
     blob = np.zeros_like(sofa)  # covers the left half of the sofa and the floor next to it
     blob[rows.min() - 10: rows.max() + 10, cols.min() - 20: (cols.min() + cols.max()) // 2] = True
     inst.append(FakeInstance("chair", 0.45, blob))
@@ -153,11 +171,18 @@ def overlapping(tmp_path: Path) -> tuple[FakeClient, Path]:
     return client, img
 
 
-def _objects(client: FakeClient, img: Path, min_score: float) -> dict[int, tuple]:
-    frame = reconstruct_image(img, client=client)
-    seg = segment_frame(frame, client=client, min_score=min_score)
+def _objects(client: FakeClient, img: Path, min_score: float, via_cli_path: bool = False
+             ) -> dict[int, tuple]:
+    if via_cli_path:  # segment.sh / reconstruct.sh / view.sh: floor-level detections, then filter
+        frame, dets = reconstruct_and_detect(img, client)
+        seg = segment_frame(frame, client=client, detections=dets, min_score=min_score)
+    else:
+        frame = reconstruct_image(img, client=client)
+        seg = segment_frame(frame, client=client, min_score=min_score)
+    pixels = {o.id: np.flatnonzero(seg.label_map == o.id).tolist() for o in seg.objects}
     return {o.id: (o.label, o.score, o.color, o.obb.center.tolist(), o.obb.size.tolist(),
-                   o.obb.R.tolist(), o.pixel_count, o.point_count) for o in seg.objects}
+                   o.obb.R.tolist(), o.pixel_count, o.point_count, pixels[o.id],
+                   seg.points[o.id].tolist()) for o in seg.objects}
 
 
 def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: ignore[no-untyped-def]
@@ -170,17 +195,41 @@ def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: i
         return real(req)
 
     client.segment_image = spy  # type: ignore[method-assign]
-    hi = _objects(client, img, 0.5)
-    lo = _objects(client, img, 0.3)
-    assert [v[0] for v in hi.values()] == ["cabinet", "box", "sofa"]
-    assert {v[0] for v in lo.values()} == {"cabinet", "box", "sofa", "chair", "lamp"}
-    for oid, obj in hi.items():  # same id, colour, OBB, masks and points at both thresholds
-        assert lo[oid] == obj
-    assert max(hi) < min(set(lo) - set(hi))  # new objects are appended after the kept ones
-    assert _objects(client, img, 0.5) == hi  # re-running gives the same ids and colours
+    runs = {t: _objects(client, img, t) for t in (0.3, 0.5, 0.6, 0.85)}
+    labels = {t: [v[0] for v in objs.values()] for t, objs in runs.items()}
+    assert labels[0.85] == ["cabinet"]
+    assert labels[0.6] == ["cabinet", "box", "sofa"]
+    assert labels[0.5] == ["cabinet", "box", "sofa", "cushion"]  # nested in the sofa, kept
+    assert set(labels[0.3]) == {"cabinet", "box", "sofa", "cushion", "chair", "lamp"}
+    for t in runs:
+        assert list(runs[t]) == list(range(1, len(runs[t]) + 1))
+    for lo, hi in ((0.3, 0.5), (0.5, 0.6), (0.6, 0.85), (0.3, 0.85)):
+        # same id, colour, OBB, pixels and points at both thresholds; new ones appended
+        assert {oid: runs[lo][oid] for oid in runs[hi]} == runs[hi]
+    by_label = {v[0]: v for v in runs[0.5].values()}
+    sofa, cushion = by_label["sofa"], by_label["cushion"]
+    assert not set(sofa[8]) & set(cushion[8]) and cushion[6] > 500  # the cushion's own pixels
+    assert _objects(client, img, 0.5) == runs[0.5]  # re-running gives the same ids and colours
+    assert _objects(client, img, 0.5, via_cli_path=True) == runs[0.5]  # same code, same objects
     assert len(set(confs)) == 1  # the server request does not depend on --min-score
     with pytest.raises(ValueError):
         detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR / 2)
+    frame = reconstruct_image(img, client=client)
+    with pytest.raises(ValueError):
+        segment_frame(frame, client=client, min_score=detect.DETECTION_FLOOR / 2)
+
+
+def test_segment_frame_does_not_depend_on_the_detection_order(overlapping) -> None:  # type: ignore[no-untyped-def]
+    client, img = overlapping
+    ref = _objects(client, img, 0.3)
+    real = client.segment_image
+
+    def reversed_order(req):  # type: ignore[no-untyped-def]
+        res = real(req)
+        return res.model_copy(update={"instances": res.instances[::-1]})
+
+    client.segment_image = reversed_order  # type: ignore[method-assign]
+    assert _objects(client, img, 0.3) == ref
 
 
 def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
