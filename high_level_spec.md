@@ -193,6 +193,8 @@ controls for the §2.2 attributes that affect what is displayed: `color`, `strid
 `voxel` and `normals` for a map. Changing a control re-derives the cloud through the shared
 point-cloud code from data already computed, and never re-runs inference. `encoding` and the
 `label` property concern PLY files only and have no control.
+The web interface must show the position coordinates of every displayed camera and provide an
+option to move the viewer viewpoint to that camera position.
 
 `view.sh` owns only the web server and browser UI. It consumes reconstruction, mapping, and
 segmentation data through their existing implementations and must not duplicate depth
