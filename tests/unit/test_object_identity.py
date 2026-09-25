@@ -237,10 +237,13 @@ def test_pieces_the_fused_surface_joins_are_one_surface() -> None:
 def test_objects_without_map_cloud_points_are_not_exported() -> None:
     rng = np.random.default_rng(2)
     objs = []
-    for oid, cloud in ((1, 5000), (2, 0), (3, None), (4, mo.EXPORT_MIN_CLOUD_POINTS)):
+    for oid, cloud, least in ((1, 5000, None), (2, 0, None), (3, None, None),
+                              (4, mo.EXPORT_MIN_CLOUD_POINTS, None), (5, 400, 500),
+                              (6, 500, 500)):
         o = obj(oid, "cup", {0: blob(rng, (2.0, 0.1 * oid, 0.0))}, 2.0)
-        o.confirmed, o.cloud_points = True, cloud
+        o.confirmed, o.cloud_points, o.cloud_min = True, cloud, least
         objs.append(o)
     # a pendant lamp whose surface did not survive the fusion has no point in the cloud: its box
-    # would have no points in segments.ply; a map written before the counts keeps its objects
-    assert [o.id for o in ObjectState(objs, 10).exported()] == [1, 3, 4]
+    # would have no points in segments.ply; an object needs the points its size calls for
+    # (cloud_min); a map written before the counts keeps its objects
+    assert [o.id for o in ObjectState(objs, 10).exported()] == [1, 3, 4, 6]

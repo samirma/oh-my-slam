@@ -5,11 +5,15 @@ reconstruction package's fusion code.
 Object ids come from the keyframes' instance masks, which a detector draws generously: a "carpet"
 mask that covers a counter top and the floor beyond it, of which only the counter was lifted into
 the object (lifting keeps a mask's largest spatial cluster). A keyframe's vote for an object
-therefore counts only for points inside the object's box grown by ``ATTRIBUTE_MARGIN_M``, so an
-object's points in the cloud (``segments.ply``, ``color=segment``, its ``point_count``) coincide
-with its box. A confirmed object that wins no point this way — its detecting keyframes are fewer
-than a third of those that see its surface, like a light switch on a wall — takes the unlabelled
-cloud points nearest to its own lifted points (``support_labels``)."""
+therefore counts only for points inside the object's box grown by the depth noise at its viewing
+distance (``attribution_margin``), so an object's points in the cloud (``segments.ply``,
+``color=segment``, its ``point_count``) coincide with its box. The vote needs a third of the
+keyframes that see a point, and an object detected in fewer of them wins only part of its
+surface — a refrigerator detected in 7 of the ~20 keyframes that see its front, half of it — or
+nothing — a dishwasher detected in 2 of ~15, a light switch on a wall. Each confirmed object
+therefore also takes the unlabelled cloud points of its gate nearest to its own lifted points
+(``support_labels``); it is exported only when that makes it visibly drawn
+(``objects.min_cloud_points``)."""
 
 from __future__ import annotations
 
@@ -26,12 +30,7 @@ from oh_my_slam.core.geometry import project
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.objects import (
-    EXPORT_MIN_CLOUD_POINTS,
-    ObjectState,
-    fit_points,
-    label_map_for,
-)
+from oh_my_slam.mapping.objects import ObjectState, fit_points, label_map_for
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.pointcloud import pixel_mask
 from oh_my_slam.segmentation.api import OBB, UNSEGMENTED
@@ -44,13 +43,18 @@ VIS_TOL_MIN = 0.02
 VIS_TOL_REL = 0.03
 LABEL_SHARE_DIVISOR = 3  # an object id needs the votes of >= 1/3 of the views that see a point
 ATTRIBUTE_CHUNK = 1_000_000  # points attributed at a time (bounds the vote's memory)
-# A vote for an object counts only within its box grown by this: the fused surface lies within a
-# few centimetres of the points the box was fitted to (TSDF band 4 cm, box at the 2-98 % extent).
+# A vote for an object counts only within its box grown by max(ATTRIBUTE_MARGIN_M,
+# ATTRIBUTE_MARGIN_REL · its viewing distance): the fused surface lies within a few centimetres of
+# the points the box was fitted to (TSDF band 4 cm, box at the 2-98 % extent), plus the depth
+# disagreement of the keyframes that saw it (p90 ~3 % of the distance after the global depth
+# adjustment), which matters most across a thin box (a dishwasher front 6 cm deep at 3 m).
 ATTRIBUTE_MARGIN_M = 0.05
-# Fallback of a confirmed object without cloud points: the SUPPORT_NEIGHBOURS unlabelled cloud
-# points nearest each of its own lifted points (at least SUPPORT_MIN_POINTS of them), within
+ATTRIBUTE_MARGIN_REL = 0.03
+# The surface of a confirmed object beyond its votes: the SUPPORT_NEIGHBOURS unlabelled cloud points
+# nearest each of its own lifted points (at least SUPPORT_MIN_POINTS of them), within
 # max(SUPPORT_RADIUS_MIN, SUPPORT_RADIUS_REL · its viewing distance) — the depth disagreement of
-# the keyframes that saw it and of the fused surface — and inside its grown box.
+# the keyframes that saw it and of the fused surface — and inside its attribution gate; a point
+# several objects pick goes to the one whose own points are nearest.
 SUPPORT_MIN_POINTS = 30
 SUPPORT_NEIGHBOURS = 4
 SUPPORT_RADIUS_MIN = 0.03
@@ -150,27 +154,41 @@ def _visible(fd: FrameData, pts: NDArray[np.float64]
     return idx, vv, uu, z[idx] / K.fx
 
 
-def _in_boxes(pts: NDArray[np.float64], lab: NDArray[Any], boxes: dict[int, OBB]
-              ) -> NDArray[np.bool_]:
-    """Whether each point lies in the box (grown by ``ATTRIBUTE_MARGIN_M``) of the object it is
-    labelled with; objects without a box have none."""
+def attribution_margin(obs_depth: float) -> float:
+    """How far beyond its box an object's cloud points may lie (its attribution gate), for an
+    object seen from ``obs_depth`` metres."""
+    return max(ATTRIBUTE_MARGIN_M, ATTRIBUTE_MARGIN_REL * float(obs_depth))
+
+
+Gates = dict[int, tuple[OBB, float]]  # object id -> (box, margin of its attribution gate)
+
+
+def attribution_gates(objs: ObjectState) -> Gates:
+    """Each object's box and attribution margin (``attribution_margin``)."""
+    return {o.id: (o.obb, attribution_margin(o.obs_depth)) for o in objs.objects
+            if o.obb is not None}
+
+
+def _in_boxes(pts: NDArray[np.float64], lab: NDArray[Any], gates: Gates) -> NDArray[np.bool_]:
+    """Whether each point lies in the attribution gate of the object it is labelled with;
+    objects without a box have none."""
     out = np.zeros(len(pts), bool)
     for oid in np.unique(lab).tolist():
-        box = boxes.get(int(oid))
-        if box is not None:
+        gate = gates.get(int(oid))
+        if gate is not None:
             sel = lab == oid
-            out[sel] = box.contains(pts[sel], ATTRIBUTE_MARGIN_M)
+            out[sel] = gate[0].contains(pts[sel], gate[1])
     return out
 
 
 def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData],
-                      boxes: dict[int, OBB] | None = None
+                      boxes: Gates | None = None
                       ) -> tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.int32]]:
     """(seen, colour, object id) of each point from the keyframes of one update, whatever their
     order: the colour of the finest view (smallest footprint; ties: larger colour, then larger id)
     and the object id with most votes among the views that see the point (ties: finest view),
-    kept only if at least a third of those views give it. With ``boxes`` (object id → OBB), a
-    vote counts only for a point inside the voted object's grown box (``_in_boxes``)."""
+    kept only if at least a third of those views give it. With ``boxes`` (object id → box and
+    margin), a vote counts only for a point inside the voted object's gate (``_in_boxes``)."""
     n = len(pts)
     views = np.zeros(n, np.int32)
     best = np.full(n, np.inf)
@@ -212,7 +230,7 @@ def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData],
 
 
 def attribute_points(xyz: NDArray[Any], frames: list[FrameData],
-                     boxes: dict[int, OBB] | None = None
+                     boxes: Gates | None = None
                      ) -> tuple[NDArray[np.uint8], NDArray[np.int32], NDArray[np.bool_]]:
     """Colour and object id of each point from the latest update whose keyframes see it.
 
@@ -243,35 +261,51 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData],
 
 
 def support_labels(xyz: NDArray[Any], label: NDArray[np.int32], objs: ObjectState) -> int:
-    """Give each confirmed object with a box but fewer than ``EXPORT_MIN_CLOUD_POINTS`` cloud
-    points the unlabelled cloud points its own lifted points (``objects.fit_points``) pick: the
-    ``SUPPORT_NEIGHBOURS`` nearest to each, within the support radius and inside its grown box.
-    Objects are served in id order; ``label`` is modified in place. Returns how many objects
-    took points."""
+    """Give the confirmed objects the unlabelled cloud points of their own surface: each of an
+    object's own lifted points (``objects.fit_points``) picks the ``SUPPORT_NEIGHBOURS`` nearest
+    unlabelled cloud points inside the object's attribution gate, within ``support_radius``; a
+    point that several objects pick takes the id of the object whose own point is nearest (ties:
+    the lower id), so the order of the objects does not matter. ``label`` is modified in place.
+    Returns how many objects took points."""
     from scipy.spatial import cKDTree
 
     pts_all = np.asarray(xyz, np.float64).reshape(-1, 3)
-    counts = np.bincount(label[label > 0]) if (label > 0).any() else np.zeros(1, np.int64)
-    served = 0
+    free = label == 0
+    best_d = np.full(len(pts_all), np.inf)
+    best_id = np.zeros(len(pts_all), np.int32)
     for o in sorted(objs.objects, key=lambda o: o.id):
-        have = int(counts[o.id]) if o.id < len(counts) else 0
-        if not o.confirmed or o.obb is None or have >= EXPORT_MIN_CLOUD_POINTS:
+        if not o.confirmed or o.obb is None:
             continue
         own = np.asarray(fit_points(o), np.float64)
         if len(own) < SUPPORT_MIN_POINTS:
             continue
-        cand = np.flatnonzero(o.obb.contains(pts_all, ATTRIBUTE_MARGIN_M) & (label == 0))
+        cand = np.flatnonzero(free & o.obb.contains(pts_all, attribution_margin(o.obs_depth)))
         if not len(cand):
             continue
-        radius = max(SUPPORT_RADIUS_MIN, SUPPORT_RADIUS_REL * o.obs_depth)
         k = min(SUPPORT_NEIGHBOURS, len(cand))
-        d, j = cKDTree(pts_all[cand]).query(own, k=k, distance_upper_bound=radius)
-        d, j = np.reshape(d, (len(own), k)), np.reshape(j, (len(own), k))
-        take = cand[np.unique(j[np.isfinite(d)])]
-        if len(take):
-            label[take] = o.id
-            served += 1
-    return served
+        d, j = cKDTree(pts_all[cand]).query(own, k=k,
+                                            distance_upper_bound=support_radius(o.obs_depth))
+        d, j = np.reshape(d, -1), np.reshape(j, -1)
+        ok = np.isfinite(d)
+        picked, dist = cand[j[ok]], d[ok]
+        if not len(picked):
+            continue
+        order = np.lexsort((dist, picked))  # per picked point, its nearest own point first
+        picked, dist = picked[order], dist[order]
+        first = np.r_[True, picked[1:] != picked[:-1]]
+        picked, dist = picked[first], dist[first]
+        better = dist < best_d[picked]  # strict: a tie keeps the lower id
+        best_d[picked[better]] = dist[better]
+        best_id[picked[better]] = o.id
+    take = best_id > 0
+    label[take] = best_id[take]
+    return len(np.unique(best_id[take]))
+
+
+def support_radius(obs_depth: float) -> float:
+    """How far a cloud point may lie from an object's own lifted points to be its surface, for
+    an object seen from ``obs_depth`` metres."""
+    return max(SUPPORT_RADIUS_MIN, SUPPORT_RADIUS_REL * float(obs_depth))
 
 
 def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:
@@ -303,8 +337,7 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         for fd in fused.frames:
             fd.labels = _frame_labels(ctx, fd.rec, fd.depth.shape, objs)
         xyz = fused.xyz
-        boxes = {o.id: o.obb for o in objs.objects if o.obb is not None}
-        rgb, label, seen_new = attribute_points(xyz, fused.frames, boxes)
+        rgb, label, seen_new = attribute_points(xyz, fused.frames, attribution_gates(objs))
         supported = support_labels(xyz, label, objs)
         cloud = PointCloud(xyz, rgb, label)
         new_cloud = cloud.subset(np.nonzero(seen_new)[0])
@@ -314,6 +347,6 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         tx.save_npy(store.CLOUD_OBJECTS, cloud.label.astype(np.int32))
     progress(f"cloud: {len(cloud)} points (voxel {fused.voxel * 100:.1f} cm) in "
              f"{fused.seconds + time.perf_counter() - t0:.0f} s")
-    stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "support_fallback": supported}
+    stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "support_objects": supported}
     ctx.notes["geometry"] = stats
     return MapGeometry(cloud, new_cloud, stats)

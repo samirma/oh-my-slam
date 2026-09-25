@@ -54,11 +54,12 @@ Semantics (spec §2.3):
   together merge when their sightings agree once the depth ratio measured between their
   keyframes is removed (``_depth_explained``).
 * **Point counts** are those of the map cloud: the points attributed to the object
-  (``set_cloud_counts``; only inside its box, and for an object that wins none there, the cloud
-  points nearest its own lifted points: ``geometry``), as the ``point_count`` of a single image
-  counts its cloud's points. An object is exported only with at least
-  ``EXPORT_MIN_CLOUD_POINTS`` of them, so every exported object appears in the cloud
-  (``segments.ply``, ``color=segment``) in its colour.
+  (``set_cloud_counts``; its votes inside its box grown by the depth noise, and the unlabelled
+  cloud points nearest its own lifted points: ``geometry``), as the
+  ``point_count`` of a single image counts its cloud's points. An object is exported only with
+  ``min_cloud_points`` of them — a share of the points its box's largest face holds in the cloud —
+  so every exported object is visibly drawn in the cloud (``segments.ply``, ``color=segment``) in
+  its colour.
 * **Boxes cover the observed surface.** A box is fitted to the points the keyframes saw: an
   object seen only from the front (a refrigerator against a wall) has the depth of its visible
   surface, not its physical depth; no class-typical size is assumed.
@@ -187,13 +188,17 @@ DEPTH_PAIRS = 3
 DEPTH_RATIO_MIN = 0.05
 DEPTH_RATIO_MAX = 0.3
 RATIO_MIN_POINTS = 500  # shared surface points for a keyframe pair's depth ratio
-# An object is exported only with at least this many map-cloud points: every exported object is
-# then drawn in the cloud (segments.ply, color=segment) in its colour. A confirmed object whose
-# detecting keyframes are fewer than a third of those that see its surface wins no point in the
-# vote; it takes the cloud points nearest its own lifted points instead (``geometry.
-# support_labels``). It still has none when its surface did not survive the fusion (seen by fewer
-# than 3 keyframes, e.g. a pendant lamp).
-EXPORT_MIN_CLOUD_POINTS = 1
+# An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
+# of the points its box's largest face holds in the cloud (one per cloud voxel), and at least
+# EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
+# color=segment) in its colour. A confirmed object whose detecting keyframes are fewer than a
+# third of those that see its surface wins few or no points in the vote (a dishwasher detected in
+# 2 of the ~15 keyframes that see its front won 1 of its ~16k points); every confirmed object also
+# takes the unlabelled cloud points nearest its own lifted points (``geometry.support_labels``).
+# It still has too few when its surface did not survive the fusion (seen by fewer than 3
+# keyframes, e.g. a pendant lamp).
+EXPORT_MIN_CLOUD_POINTS = 10
+EXPORT_MIN_SUPPORT = 0.05
 UP = np.array([0.0, 0.0, 1.0])
 
 
@@ -289,6 +294,7 @@ class MapObject:
     pixel_count: int = 0
     sightings: list[Sighting] = field(default_factory=list)  # one per detection (sorted)
     cloud_points: int | None = None  # map-cloud points attributed to it (None: not yet counted)
+    cloud_min: int | None = None  # the cloud points it needs to be exported (min_cloud_points)
 
     @property
     def observations(self) -> int:
@@ -363,13 +369,15 @@ class MapObject:
             "views_in_frustum": self.views_in_frustum, "created_update": self.created_update,
             "last_seen_update": self.last_seen_update, "obs_depth": self.obs_depth,
             "pixel_count": self.pixel_count, "point_count": self.point_count,
-            "cloud_points": self.cloud_points, "point_file": points_file(self.id),
+            "cloud_points": self.cloud_points, "cloud_min_points": self.cloud_min,
+            "point_file": points_file(self.id),
             "sightings": [s.to_list() for s in self.sightings],
         }
 
     @staticmethod
     def from_dict(d: dict[str, Any], points: NDArray[np.float32]) -> MapObject:
         cloud = d.get("cloud_points")
+        least = d.get("cloud_min_points")
         return MapObject(
             id=int(d["id"]), label=d["label"], label_votes=dict(d.get("label_votes", {})),
             scores=list(d.get("scores", [])), points=points,
@@ -383,6 +391,7 @@ class MapObject:
             sightings=sorted((Sighting.from_list(v) for v in d.get("sightings", [])),
                              key=Sighting.key),
             cloud_points=None if cloud is None else int(cloud),
+            cloud_min=None if least is None else int(least),
         )
 
     @property
@@ -491,11 +500,21 @@ class ObjectState:
         return oid if oid in self.by_id() else None
 
     def exported(self) -> list[SceneObject]:
-        """The confirmed objects with a box and points in the map cloud (not yet counted: maps
-        written before cloud counts were recorded)."""
+        """The confirmed objects with a box and enough points in the map cloud
+        (``min_cloud_points``; not yet counted: maps written before cloud counts were
+        recorded)."""
         return [o.scene_object() for o in sorted(self.objects, key=lambda o: o.id)
                 if o.confirmed and o.obb is not None
-                and (o.cloud_points is None or o.cloud_points >= EXPORT_MIN_CLOUD_POINTS)]
+                and (o.cloud_points is None or o.cloud_points >= (
+                    EXPORT_MIN_CLOUD_POINTS if o.cloud_min is None else o.cloud_min))]
+
+
+def min_cloud_points(box: OBB, voxel: float) -> int:
+    """The map-cloud points an object with ``box`` needs to be exported: ``EXPORT_MIN_SUPPORT`` of
+    those its largest face holds in a cloud of ``voxel`` spacing, at least
+    ``EXPORT_MIN_CLOUD_POINTS``."""
+    a, b = np.sort(np.asarray(box.size, np.float64))[1:]
+    return max(EXPORT_MIN_CLOUD_POINTS, int(np.ceil(EXPORT_MIN_SUPPORT * a * b / voxel ** 2)))
 
 
 def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
@@ -998,13 +1017,16 @@ def save_state(tx: Any, state: ObjectState) -> None:
     })
 
 
-def set_cloud_counts(tx: Any, state: ObjectState, labels: NDArray[Any]) -> None:
+def set_cloud_counts(tx: Any, state: ObjectState, labels: NDArray[Any],
+                     voxel: float | None = None) -> None:
     """Record each object's point count in the map cloud (``labels``: object id per cloud point)
-    and store the state again."""
+    and, for a cloud of ``voxel`` spacing, the count it needs to be exported
+    (``min_cloud_points``); store the state again."""
     ids = np.asarray(labels, np.int64).reshape(-1)
     counts = np.bincount(ids[ids > 0]) if (ids > 0).any() else np.zeros(1, np.int64)
     for o in state.objects:
         o.cloud_points = int(counts[o.id]) if o.id < len(counts) else 0
+        o.cloud_min = None if voxel is None or o.obb is None else min_cloud_points(o.obb, voxel)
     save_state(tx, state)
 
 
