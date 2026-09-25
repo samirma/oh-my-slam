@@ -340,23 +340,39 @@ appears in all of these:
 
 Masks are opaque, and each pixel and point belongs to at most one object.
 
-Ids 1–19 use this palette, which is Sasha Trubetskoy's list of distinct colours without grey,
-white and black:
+Every object colour reads on the viewer's dark surfaces and on the dimmed `segmented.png`:
+
+* WCAG contrast of at least 3:1 (the WCAG 1.4.11 minimum for graphical objects) against the
+  viewer's panel `#1d2027`, and therefore against its darker canvas `#15171c`. That also makes
+  every object colour brighter than any pixel of the dimmed photo (35 % of white).
+* OKLab lightness at most 0.93 (no near-white), OKLab chroma at least 0.08, and an OKLab distance
+  of at least 0.11 from the unsegmented mid-grey.
+
+Ids 1–19 use this palette. Ten colours come from Sasha Trubetskoy's list of distinct colours; the
+entries that fail the rules above (navy, maroon, purple, beige and the palest pastels) are
+replaced. Any two differ by at least 0.095 ΔE_OK, about five just-noticeable differences:
 
 | id | colour | id | colour | id | colour | id | colour |
 |---:|---|---:|---|---:|---|---:|---|
-| 1 | `#e6194b` | 6 | `#911eb4` | 11 | `#469990` | 16 | `#aaffc3` |
-| 2 | `#3cb44b` | 7 | `#42d4f4` | 12 | `#dcbeff` | 17 | `#808000` |
-| 3 | `#ffe119` | 8 | `#f032e6` | 13 | `#9a6324` | 18 | `#ffd8b1` |
-| 4 | `#4363d8` | 9 | `#bfef45` | 14 | `#fffac8` | 19 | `#000075` |
-| 5 | `#f58231` | 10 | `#fabed4` | 15 | `#800000` | | |
+| 1 | `#e6194b` | 6 | `#9c4dff` | 11 | `#1fb5a3` | 16 | `#ffc49b` |
+| 2 | `#3cb44b` | 7 | `#42d4f4` | 12 | `#dcbeff` | 17 | `#5a9cff` |
+| 3 | `#ffe119` | 8 | `#f032e6` | 13 | `#9a6324` | 18 | `#b4339c` |
+| 4 | `#4363d8` | 9 | `#a8f04a` | 14 | `#8ef0c0` | 19 | `#c9a227` |
+| 5 | `#f58231` | 10 | `#ff9ec7` | 15 | `#808000` | | |
 
-Higher ids cycle:
+Higher ids cycle by hue, and vary lightness and chroma as they go:
 
-* Cycle `k = (id − 1) // 19` rotates the hue of the same 19 colours by `k × 0.381966` of a turn in
-  HLS, keeping lightness and saturation.
-* A rotated colour that collides with an earlier id after 8-bit rounding is nudged in steps of
-  0.002 turn until it is unused. Every id therefore gets a distinct colour.
+* Id `19 + n + 1` aims at the OKLCh hue `n × 137.508°` (the golden angle).
+* The candidates are the 8-bit colours within ±30° of that hue, on six lightness tiers
+  (0.62–0.91) and three chroma levels (0.24, 0.15 and 0.10, clipped to the sRGB gamut), that meet
+  the rules above.
+* The id takes the candidate farthest in OKLab from every earlier id, with the last 10 ids counted
+  1.5 times as close, so that neighbouring ids differ most.
+* A colour that would repeat an earlier id after 8-bit rounding is nudged to the nearest unused
+  triple. Every id therefore gets a distinct colour.
+
+For ids 1–120, any two colours differ by at least 0.045 ΔE_OK and consecutive ids by at least
+0.15 (`tests/unit/test_colors.py`).
 
 Mid-grey `#808080` (128, 128, 128) is reserved for unsegmented points, and the palette never
 produces it. The `color=height` ramp is viridis.
