@@ -63,33 +63,59 @@ COMPATIBLE_GROUPS: tuple[frozenset[str], ...] = (
 )
 
 
-# Floor-standing classes: when a floor plane is known, a box whose visible bottom floats at most
-# this many metres above the floor is extended down to it (lower part occluded, e.g. a chair
-# behind a table). Everything else keeps its visible-surface box.
+# Floor grounding (``segmentation.obb.ground_upright``). When a floor plane is known, the box of a
+# floor-standing class whose visible bottom floats at most the class's gap (metres) above the floor
+# is extended down to it: its lower part is occluded (a chair behind a table) or too thin to be
+# seen (a table's legs). Everything else keeps its visible-surface box.
 _FLOOR_GAP = 0.8
+# Classes that also stand on furniture or hang on walls (a plant on a counter, a wall shelf): only
+# a bottom trimmed off at the floor contact (depth edges, occlusion by the floor's clutter) is
+# closed.
+_CONTACT_GAP = 0.15
 FLOOR_STANDING: dict[str, float] = {
     **{k: _FLOOR_GAP for k in (
         "chair", "armchair", "stool", "bar stool", "high chair", "bench", "sofa", "ottoman", "bed",
         "crib", "dining table", "coffee table", "side table", "desk", "table", "cabinet",
-        "cupboard", "wardrobe", "chest of drawers", "bookcase", "shelf", "tv stand", "nightstand",
-        "floor lamp", "potted plant", "planter", "trash can", "recycling bin", "refrigerator",
+        "cupboard", "wardrobe", "chest of drawers", "bookcase", "tv stand", "nightstand",
+        "floor lamp", "trash can", "recycling bin", "refrigerator",
         "freezer", "dishwasher", "washing machine", "dryer", "oven", "stove", "piano",
         "kitchen island", "counter", "bar counter", "display case", "vending machine",
         "water dispenser", "coat rack", "fire hydrant", "bollard", "mailbox", "bicycle",
         "motorcycle", "scooter", "car", "taxi", "bus", "truck", "van", "street light",
         "lamppost", "traffic light", "stroller", "wheelchair", "file cabinet", "toilet",
-        "bathtub", "fireplace", "radiator", "suitcase", "fan", "column", "pillar", "tree",
+        "bathtub", "fireplace", "column", "pillar", "tree",
         "palm tree", "bush", "hedge", "fence",
+    )},
+    **{k: _CONTACT_GAP for k in (
+        "shelf", "potted plant", "planter", "suitcase", "fan", "radiator",
     )},
     "person": 1.2,
     "dog": 0.5,
     "cat": 0.5,
     "horse": 1.0,
 }
+# Classes whose visible part is often just their top surface (a table seen from above): grounded
+# whatever the visible height. For the other classes the visible part must span at least
+# GROUND_MIN_VISIBLE of the grounded height (the gap at most 4x the evidence), so a box is never
+# extrapolated to the floor from a sliver (a picture on a book cover detected as a person); a
+# chair whose backrest shows above a table (~0.25 of its height) is still grounded.
+TOP_SURFACE = frozenset({
+    "dining table", "coffee table", "side table", "desk", "table", "kitchen island", "counter",
+    "bar counter", "nightstand", "tv stand", "bed", "crib", "bench", "ottoman",
+})
+GROUND_MIN_VISIBLE = 0.2
 
 
 def floor_gap(label: str) -> float:
     return FLOOR_STANDING.get(normalize_label(label), 0.0)
+
+
+def grounding(label: str) -> tuple[float, float]:
+    """(largest gap to the floor that is closed, smallest visible share of the grounded height)
+    for a class; (0, 0) for classes that are never grounded."""
+    lab = normalize_label(label)
+    gap = FLOOR_STANDING.get(lab, 0.0)
+    return gap, (0.0 if lab in TOP_SURFACE or gap == 0.0 else GROUND_MIN_VISIBLE)
 
 
 def normalize_label(label: str) -> str:

@@ -170,6 +170,17 @@ fruit
 apple
 banana
 orange
+# common produce (LVIS): without them a tomato or a watermelon takes the nearest label (apple)
+tomato
+watermelon
+lemon
+pear
+pineapple
+grape
+carrot
+broccoli
+potato
+onion
 salad
 wine rack
 display case

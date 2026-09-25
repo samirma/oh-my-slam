@@ -22,6 +22,7 @@ LOW_PCT = 2.0
 HIGH_PCT = 98.0
 MAX_FIT_SAMPLES = 5000
 MIN_SIZE = 0.01  # metres, avoids zero-thickness boxes
+TINY = 0.1  # metres: a box under this in every dimension is never grounded
 
 
 @dataclass
@@ -114,13 +115,17 @@ def fit_upright_obb(points: NDArray[Any], seed: int = 0) -> OBB:
     return OBB(center, rot_z(yaw), size)
 
 
-def ground_upright(box: OBB, floor_z: float, max_gap: float) -> OBB:
+def ground_upright(box: OBB, floor_z: float, max_gap: float, min_visible: float = 0.0) -> OBB:
     """Extend a z-up box down to the floor when its visible bottom floats at most ``max_gap``
-    above it (floor-standing objects whose lower part is occluded)."""
+    above it (floor-standing objects whose lower part is occluded), its visible height is at least
+    ``min_visible`` of the grounded height (no extrapolation from a sliver) and it is not tiny
+    (``TINY``: under that in every dimension, it cannot stand for a floor-standing object)."""
     bottom = box.center[2] - box.size[2] / 2
     top = box.center[2] + box.size[2] / 2
     gap = bottom - floor_z
     if not (0.0 < gap <= max_gap) or top <= floor_z:
+        return box
+    if box.size[2] < min_visible * (top - floor_z) or float(np.max(box.size)) < TINY:
         return box
     center = box.center.copy()
     center[2] = (top + floor_z) / 2
@@ -130,7 +135,7 @@ def ground_upright(box: OBB, floor_z: float, max_gap: float) -> OBB:
 
 
 def fit_obb(points: NDArray[Any], up: NDArray[Any], floor_level: float | None = None,
-            max_gap: float = 0.0) -> OBB:
+            max_gap: float = 0.0, min_visible: float = 0.0) -> OBB:
     """Upright OBB for points in any frame, given that frame's unit "up" direction.
 
     ``floor_level`` is the floor's coordinate along ``up`` (``up · x`` for floor points); with
@@ -141,7 +146,7 @@ def fit_obb(points: NDArray[Any], up: NDArray[Any], floor_level: float | None = 
     R_g = rotation_between(up, np.array([0.0, 0.0, 1.0]))  # parent -> gravity-aligned
     box = fit_upright_obb(np.asarray(points, dtype=np.float64) @ R_g.T)
     if floor_level is not None and max_gap > 0:
-        box = ground_upright(box, floor_level, max_gap)
+        box = ground_upright(box, floor_level, max_gap, min_visible)
     return OBB(R_g.T @ box.center, R_g.T @ box.R, box.size)
 
 

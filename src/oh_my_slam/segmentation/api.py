@@ -36,7 +36,7 @@ from oh_my_slam.segmentation.detect import (
     DETECTION_FLOOR,
     claim_order,
     detect,
-    floor_gap,
+    grounding,
     priority,
 )
 from oh_my_slam.segmentation.detect import Detection as Detection
@@ -58,6 +58,9 @@ class SceneObject:
     observations: int = 1
     confirmed: bool = True
     frames: list[int] = field(default_factory=list)
+    # every label the object was detected as, most evidence first (a map object whose label
+    # flickered between keyframes); empty or one label: just ``label``
+    labels: tuple[str, ...] = ()
 
     @property
     def color(self) -> tuple[int, int, int]:
@@ -114,8 +117,8 @@ def fit_object_obb(points: NDArray[Any], label: str, up: NDArray[Any],
                    floor_level: float | None = None) -> OBB:
     """Upright OBB of an object's points; floor-standing classes are grounded on the floor at
     ``floor_level`` (the floor's coordinate along ``up``) when their visible bottom floats just
-    above it."""
-    return fit_obb(points, up, floor_level, floor_gap(label))
+    above it and the visible part is not a sliver of the grounded box (``detect.grounding``)."""
+    return fit_obb(points, up, floor_level, *grounding(label))
 
 
 def lift_detections(

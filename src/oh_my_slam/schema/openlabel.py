@@ -153,7 +153,7 @@ def text(name: str, val: str) -> Json:
     return {"name": name, "val": val}
 
 
-def vec(name: str, val: Sequence[float | int]) -> Json:
+def vec(name: str, val: Sequence[float | int | str]) -> Json:
     return {"name": name, "val": list(val)}
 
 
