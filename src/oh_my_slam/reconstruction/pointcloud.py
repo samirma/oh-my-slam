@@ -193,9 +193,3 @@ class PointNormals:
         with ThreadPoolExecutor(max_workers=min(len(chunks), os.cpu_count() or 1)) as pool:
             list(pool.map(work, chunks))  # each chunk writes its own rows
 
-
-def point_normals(xyz: NDArray[Any], viewpoints: NDArray[Any], k: int = NORMAL_NEIGHBOURS
-                  ) -> NDArray[np.float32]:
-    """Unit normals of every point of an unordered cloud (see :class:`PointNormals`)."""
-    pts = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
-    return PointNormals(pts, viewpoints, k).at(np.arange(len(pts)))

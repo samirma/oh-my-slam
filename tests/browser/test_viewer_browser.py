@@ -584,8 +584,9 @@ def label_boxes(v: View) -> list[dict[str, Any]]:
 
 
 def test_every_box_in_view_is_labelled(view: View) -> None:
-    """Spec §2.5 "labelled OBBs": each box whose top is in view shows at least its id tag, inside
-    the view; names are added where they fit, and always for the selected box."""
+    """Spec §2.5 "labelled OBBs": each box whose top is in view shows its id tag inside the view
+    (these scenes have room for every tag, so no "+N" chip); names are added where they fit, and
+    always for the selected box."""
     v = view
     for w, h in ((1280, 800), (390, 844)):
         v.pg.set_viewport_size({"width": w, "height": h})
@@ -598,6 +599,7 @@ def test_every_box_in_view_is_labelled(view: View) -> None:
             if b["shown"]:
                 assert b["inside"] and b["text"].split()[0] == str(b["id"]), b
         assert any(b["mode"] == "full" for b in boxes)
+        assert v.js("() => window.__viewer.chips.length") == 0
     v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
     # "id tags only" keeps every tag; the selected box still shows its name
@@ -612,6 +614,156 @@ def test_every_box_in_view_is_labelled(view: View) -> None:
     v.pg.keyboard.press("Escape")
     v.pg.select_option("#display-labels", "fit")
     v.pg.click('#tabs button[data-tab="controls"]')
+    v.settle()
+    assert v.errors == []
+
+
+DENSE_LABELS = ("cup", "chair", "dining table", "bottle", "potted plant", "person", "plate", "lamp")
+
+
+@pytest.fixture(scope="module")
+def dense_view(browser: Any) -> Iterator[View]:
+    """120 small boxes crowded in the middle of a 6 x 6 m floor: more id tags than fit near their
+    boxes at desktop and at phone width."""
+    from oh_my_slam.schema import openlabel as ol
+    from oh_my_slam.segmentation.cloud import map_cloud_source
+    from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
+
+    rng = np.random.default_rng(5)
+    objects = {}
+    for k in range(1, 121):
+        centre = np.array([rng.uniform(-0.9, 0.9), rng.uniform(-0.6, 0.6), 0.0])
+        size = rng.uniform(0.05, 0.14, 3)
+        centre[2] = size[2] / 2
+        w, d, h = (float(s) for s in size)
+        cub = ol.cuboid(centre, np.eye(3), size, "map", attributes_num=[
+            ol.num("width_m", w), ol.num("depth_m", d), ol.num("height_m", h),
+            ol.num("volume_m3", w * d * h)])
+        label = DENSE_LABELS[k % len(DENSE_LABELS)]
+        objects[str(k)] = ol.object_entry(
+            f"{label} {k}", label, "map", cub, nums=[ol.num("score", 0.9)],
+            texts=[ol.text("color_hex", color_hex_for_id(k))], vecs=[ol.vec("color", list(color_for_id(k)))])
+    scene = ol.document(ol.metadata("dense"), objects, coordinate_systems={"map": ol.map_cs([])})
+    xyz = np.c_[rng.uniform(-3, 3, 40_000), rng.uniform(-3, 3, 40_000), rng.normal(0, 0.005, 40_000)]
+    source = map_cloud_source(xyz, rng.integers(60, 200, (len(xyz), 3), np.uint8), None, set(),
+                              np.array([[0.0, -4.0, 1.5]]))
+    bundle = ViewBundle(mode="map", title="dense", scene=scene, source=source, catalog=[],
+                        stats={"objects": len(objects), "frames": 0})
+    with running(bundle) as url:
+        v = View(browser, bundle, url)
+        yield v
+        v.pg.close()
+
+
+def label_layout(v: View) -> dict[str, Any]:
+    """Page-pixel rectangles of every visible id tag and "+N" chip, the header's, and each box's
+    anchor (the top face's centre) with how it is labelled."""
+    return v.js("""() => {
+      const rect = (e) => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]; };
+      const cam = window.__viewerCamera, host = rect(document.querySelector('#canvas-host'));
+      const chips = window.__viewer.chips;
+      return {
+        host, header: ['#info', '#actions'].map((s) => rect(document.querySelector(s))),
+        boxes: window.__viewer.objects.map((o) => {
+          const p = o.anchor.clone().project(cam);
+          return {id: o.id, inView: p.z < 1 && p.z > -1 && Math.abs(p.x) <= 1 && Math.abs(p.y) <= 1,
+                  anchor: [host[0] + (p.x + 1) / 2 * (host[2] - host[0]),
+                           host[1] + (1 - p.y) / 2 * (host[3] - host[1])],
+                  tag: o.div.hidden ? null : rect(o.div), text: o.div.innerText,
+                  chip: o.mode === 'cluster' ? chips.indexOf(o.chip) : null};
+        }),
+        chips: chips.map((c) => ({rect: rect(c.button), hidden: c.div.hidden, text: c.button.innerText,
+                                  ids: c.members.map((o) => o.id)})),
+      };
+    }""")
+
+
+def intersects(a: list[float], b: list[float]) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+# Pan the view (camera and orbit target, parallel to the image plane) so that the top-most box
+# anchor on screen lands just inside the header card's bottom-right corner: the top of the crowd
+# is then under the header.
+UNDER_THE_HEADER = """() => {
+  const c = window.__viewerCamera, t = window.__viewerControls.target, V = c.position.constructor;
+  const host = document.querySelector('#canvas-host').getBoundingClientRect();
+  const info = document.querySelector('#info').getBoundingClientRect();
+  let top = null;
+  for (const o of window.__viewer.objects) {
+    const p = o.anchor.clone().project(c);
+    if (!top || p.y > top.p.y) top = {o, p};
+  }
+  const sx = (top.p.x + 1) / 2 * host.width, sy = (1 - top.p.y) / 2 * host.height;
+  const tx = info.right - host.left - 30, ty = info.bottom - host.top - 10;
+  const right = new V().setFromMatrixColumn(c.matrixWorld, 0);
+  const up = new V().setFromMatrixColumn(c.matrixWorld, 1);
+  const fwd = new V().setFromMatrixColumn(c.matrixWorld, 2).negate();
+  const z = top.o.anchor.clone().sub(c.position).dot(fwd);
+  const f = host.height / (2 * Math.tan(c.fov * Math.PI / 360));
+  const move = right.multiplyScalar(-(tx - sx) * z / f).add(up.multiplyScalar((ty - sy) * z / f));
+  c.position.add(move);
+  t.add(move);
+}"""
+
+
+def test_dense_labels_never_overlap(dense_view: View) -> None:
+    """With more boxes than room for their tags (120 boxes, desktop and phone): no two visible
+    tags or chips intersect, none intersects the header, every box whose top is in view is either
+    tagged or listed by a visible "+N" chip, and a chip lists its boxes, each selecting its box."""
+    v = dense_view
+    for w, h in ((1440, 900), (390, 844)):
+        v.pg.set_viewport_size({"width": w, "height": h})
+        v.pg.click("#reset-view")
+        v.settle()
+        v.js(UNDER_THE_HEADER)
+        v.settle()
+        lay = label_layout(v)
+        boxes = lay["boxes"]
+        in_view = [b for b in boxes if b["inView"]]
+        assert len(boxes) == 120 and len(in_view) >= 100, (w, len(in_view))
+        # the header covers some boxes' anchors: their tags went elsewhere
+        assert any(intersects([*b["anchor"], *b["anchor"]], hd) for b in in_view for hd in lay["header"])
+        chips = [c for c in lay["chips"] if not c["hidden"]]
+        assert len(chips) == len(lay["chips"]) > 0, w
+        for b in boxes:
+            if not b["inView"]:
+                assert b["tag"] is None and b["chip"] is None, b
+            elif b["tag"] is not None:
+                assert b["chip"] is None and b["text"].split()[0] == str(b["id"]), b
+            else:
+                assert b["chip"] is not None and b["id"] in lay["chips"][b["chip"]]["ids"], b
+        for c in chips:
+            assert len(c["ids"]) >= 2 and c["text"] == f"+{len(c['ids'])}", c
+        rects = [b["tag"] for b in boxes if b["tag"] is not None] + [c["rect"] for c in chips]
+        host = lay["host"]
+        for i, a in enumerate(rects):
+            assert host[0] - 0.5 <= a[0] and a[2] <= host[2] + 0.5, a
+            assert host[1] - 0.5 <= a[1] and a[3] <= host[3] + 0.5, a
+            assert not any(intersects(a, hd) for hd in lay["header"]), (w, a)
+            for b in rects[i + 1:]:
+                assert not intersects(a, b), (w, a, b)
+    # a chip lists its boxes; peeking at an entry thickens its box, clicking it selects the box
+    k = max(range(len(chips)), key=lambda i: len(chips[i]["ids"]))
+    ids = sorted(chips[k]["ids"])
+    v.pg.locator(".obj-cluster:not([hidden]) .chip").nth(k).click()
+    assert v.pg.is_visible("#cluster-pop")
+    entries = v.pg.locator("#cluster-pop button")
+    assert [int(entries.nth(i).get_attribute("data-id") or 0) for i in range(entries.count())] == ids
+    assert entries.nth(0).inner_text().split()[0] == str(ids[0])
+    pop = v.pg.locator("#cluster-pop").bounding_box()
+    assert pop and not any(intersects([pop["x"], pop["y"], pop["x"] + pop["width"],
+                                       pop["y"] + pop["height"]], hd) for hd in lay["header"])
+    entries.nth(0).hover()
+    assert v.js("() => window.__viewer.peek") == ids[0]
+    assert v.js(f"() => window.__viewer.objects.find(o => o.id === {ids[0]}).line.material.linewidth") > 2
+    entries.nth(0).click()
+    assert v.pg.is_hidden("#cluster-pop")
+    assert v.js("() => window.__viewer.selected") == ids[0]
+    v.settle()
+    assert v.js(f"() => window.__viewer.objects.find(o => o.id === {ids[0]}).mode") == "full"
+    v.pg.keyboard.press("Escape")
+    v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
     assert v.errors == []
 

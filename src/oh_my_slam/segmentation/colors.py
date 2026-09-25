@@ -101,11 +101,6 @@ def oklab(rgb: Any) -> NDArray[np.float64]:
     return np.cbrt(_linear(rgb) @ _LMS.T) @ _LAB.T
 
 
-def delta_e(rgb1: Any, rgb2: Any) -> NDArray[np.float64]:
-    """Euclidean OKLab distance (ΔE_OK) between 8-bit sRGB triples."""
-    return np.asarray(np.linalg.norm(oklab(rgb1) - oklab(rgb2), axis=-1))
-
-
 def contrast_ratio(rgb1: Any, rgb2: Any) -> NDArray[np.float64]:
     """WCAG 2.x contrast ratio between 8-bit sRGB triples (1 to 21)."""
     y1, y2 = _linear(rgb1) @ _LUMA, _linear(rgb2) @ _LUMA
