@@ -42,6 +42,7 @@ from oh_my_slam.mapping.sfm import (
     Sfm,
     SfmModel,
     check_versions,
+    vet,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
 from oh_my_slam.reconstruction.depth import DepthCorrection, fit_frame_scale
@@ -224,22 +225,53 @@ def _pick_anchors(chunk: list[PoolView], pool: list[PoolView], k: int) -> list[P
     return [posed[i] for i in order[:k]]
 
 
+def _temporal_anchors(chunk: list[PoolView], by_name: dict[str, PoolView], k: int
+                      ) -> list[PoolView]:
+    """The ``k`` posed views nearest in capture order to the chunk, before and after it
+    (``trajectory.temporal_anchors``): consecutive video keyframes are close in space."""
+    from oh_my_slam.mapping.trajectory import temporal_anchors
+
+    posed = sorted(n for n, p in by_name.items() if p.pose is not None)
+    return [by_name[n] for n in temporal_anchors(chunk[0].name, chunk[-1].name, posed, k)]
+
+
 def _multiview_poses(ctx: UpdateContext, todo: list[PoolView], pool: list[PoolView],
-                     client: Any) -> dict[str, Pose]:
+                     client: Any, temporal: bool = False) -> dict[str, Pose]:
     """Chunked, pose-anchored MapAnything poses (metric).
 
     Each chunk carries up to ``MV_ANCHORS`` already-posed views (the most similar ones); the
     model returns poses in its own frame (the first view's), so every chunk is brought into the
     reference frame with the rotation/translation that maps its anchors onto their known poses
     (see ``frame.align_by_poses``; valid for rotation-only rigs). The first chunk of a new map
-    has no anchors and defines the frame."""
-    from oh_my_slam.reconstruction.multiview import run_multiview
+    has no anchors and defines the frame. ``temporal`` (keyframes of one video, ``todo`` in capture
+    order): chunks never span two runs of consecutive keyframes (``trajectory.capture_runs``) and
+    their anchors are the posed keyframes next to them in capture order."""
+    from oh_my_slam.mapping.trajectory import capture_runs
 
     posed: dict[str, Pose] = {}
     by_name = {p.name: p for p in pool}
+    if not temporal:
+        _multiview_chunks(ctx, todo, by_name, posed, client, temporal=False)
+        return posed
+    views = {v.name: v for v in todo}
+    order = sorted({*views, *by_name})
+    for run in capture_runs(order, set(views)):
+        _multiview_chunks(ctx, [views[n] for n in run], by_name, posed, client, temporal=True)
+    return posed
+
+
+def _multiview_chunks(ctx: UpdateContext, todo: list[PoolView], by_name: dict[str, PoolView],
+                      posed: dict[str, Pose], client: Any, temporal: bool) -> None:
+    """``_multiview_poses`` of the views ``todo``, chunk after chunk (placed views join the pool
+    ``by_name`` and anchor the next chunks)."""
+    from oh_my_slam.reconstruction.multiview import run_multiview
+
     i = 0
     while i < len(todo):
-        anchors = _pick_anchors(todo[i:i + MV_CHUNK], list(by_name.values()), MV_ANCHORS)
+        if temporal:
+            anchors = _temporal_anchors(todo[i:i + MV_CHUNK - MV_ANCHORS], by_name, MV_ANCHORS)
+        else:
+            anchors = _pick_anchors(todo[i:i + MV_CHUNK], list(by_name.values()), MV_ANCHORS)
         chunk = todo[i:i + MV_CHUNK - len(anchors)]
         views = anchors + chunk
         res, _ = run_multiview(
@@ -256,7 +288,6 @@ def _multiview_poses(ctx: UpdateContext, todo: list[PoolView], pool: list[PoolVi
             posed[v.name] = T
             by_name[v.name] = PoolView(v.name, v.image, v.K, v.descriptor, T)
         i += len(chunk)
-    return posed
 
 
 def _new_pool(ctx: UpdateContext) -> list[PoolView]:
@@ -322,10 +353,11 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
         component = new_names
     model: SfmModel | None = None
     if not rotation:
-        model = sfm.map_global(ctx.work / "sfm_global")
+        turns = sfm.rotation_pairs()
+        model = _vetted(ctx, sfm.map_global(ctx.work / "sfm_global"), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is None or placed < MIN_PLACED_FRACTION:
-            model = sfm.map_incremental(ctx.work / "sfm_incr")
+            model = _vetted(ctx, sfm.map_incremental(ctx.work / "sfm_incr"), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is not None and placed >= MIN_PLACED_FRACTION:
             ratio = model.baseline_ratio()
@@ -333,8 +365,11 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             rotation = ratio < ROTATION_BASELINE_RATIO
             if not rotation:
                 model = _complete_registration(sfm, model, new_names, ctx.work)
+                _vet(ctx, model, turns)
                 progress(f"{model.method}: {len(model.registered)} keyframes posed in "
                          f"{time.perf_counter() - t0:.0f} s")
+                model = _join_unplaced(ctx, sfm, model, new_names, turns, is_video, client,
+                                       progress)
                 return model
     reason = "rotation-dominant input" if rotation else "SfM placed too few frames"
     progress(f"multi-view fallback ({reason}); {len(component)} connected keyframes")
@@ -359,12 +394,14 @@ def _keyframe_intrinsics(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> dict[
 
 
 def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free: set[str],
-                      refine_focal: bool, rotation: bool) -> tuple[dict[str, Pose], float]:
+                      refine_focal: bool, rotation: bool, model: SfmModel | None = None
+                      ) -> tuple[dict[str, Pose], float]:
     """Refine the multi-view poses of the keyframes ``free`` with every verified feature match
     and the keyframes' monocular depth (``mapping.panorama``; staged for ``rotation``-dominant
     input); every other keyframe — this update's other posed keyframes and the map's — holds
     still. Returns all poses and the factor of the shared focal length (1 unless
-    ``refine_focal``)."""
+    ``refine_focal``). With the SfM ``model`` the poses are in, its cameras (refined focal
+    length) are used."""
     from oh_my_slam.mapping import panorama
 
     new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
@@ -372,7 +409,8 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
     with timing.stage("pose_refinement"):
         pairs = panorama.verified_matches(sfm.db, (set(poses) & set(new)) | set(old))
         linked = {n for p in pairs if p.a in free or p.b in free for n in (p.a, p.b)}
-        K = _keyframe_intrinsics(ctx, sfm, linked & set(new))
+        K = (_keyframe_intrinsics(ctx, sfm, linked & set(new)) if model is None
+             else _model_intrinsics(sfm, model, linked & set(new)))
         views: dict[str, panorama.View] = {}
         for n in sorted(linked):
             if n in new and n in K:
@@ -405,7 +443,233 @@ def _complete_registration(sfm: Sfm, model: SfmModel, names: set[str], work: Pat
     if more is None or len(more.registered) <= len(model.registered):
         return model
     more.method = model.method + "+incremental"
+    more.notes = {**model.notes, **more.notes}
+    more.others = model.others
     return more
+
+
+def _vet(ctx: UpdateContext, model: SfmModel, turns: set[frozenset[str]]) -> None:
+    """``sfm.vet`` (unsupported SfM poses are not accepted), noted per mapper run."""
+    out = vet(model, turns)
+    if out["unsupported"]:
+        ctx.notes.setdefault("sfm_unsupported", {})[model.method] = out
+
+
+def _vetted(ctx: UpdateContext, model: SfmModel | None, turns: set[frozenset[str]]
+            ) -> SfmModel | None:
+    if model is not None:
+        _vet(ctx, model, turns)
+    return model
+
+
+def _model_intrinsics(sfm: Sfm, model: SfmModel, names: set[str]) -> dict[str, Intrinsics]:
+    """Full-resolution intrinsics of new keyframes: the model's camera (refined focal length)
+    where the model holds it, else the database's."""
+    out = {}
+    for n, (cid, K) in sfm.image_intrinsics(names).items():
+        if model.rec.exists_camera(cid):
+            cam = model.rec.cameras[cid]
+            Km = np.asarray(cam.calibration_matrix())
+            K = Intrinsics(Km[0, 0], Km[1, 1], Km[0, 2], Km[1, 2], cam.width, cam.height,
+                           "colmap")
+        out[n] = K
+    return out
+
+
+def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set[str],
+                   turns: set[frozenset[str]], is_video: bool, client: Any, progress: Progress
+                   ) -> SfmModel:
+    """Bring every keyframe of a new map onto the main reconstruction consistently
+    (``mapping.trajectory``):
+
+    1. keyframes of another reconstruction that shares keyframes with it join through the
+       similarity from the shared poses (``trajectory.merge_by_shared``, verified on each);
+    2. blocks the monocular depth shows to be mis-scaled, or the gravity estimates tilted
+       (``trajectory.fix_blocks``: parts hanging on the rest by a bridge or an articulation, whose
+       scale and orientation the global mapper cannot pin down), are scaled and levelled about the
+       keyframe they hang on, and what hangs on them follows;
+    3. keyframes it does not hold (never registered, or not accepted by ``sfm.vet``) that verified
+       matches connect to the posed ones get anchored multi-view poses (``_multiview_poses``; for
+       video anchored on the posed keyframes next to them in capture order);
+    4. the poses of 2 and 3 are refined with every verified match and the monocular depth, the
+       rest fixed (``_refine_multiview``; the model is brought to metres first, as the multi-view
+       poses and the depth are); realigned blocks are levelled with gravity again, and for video
+       a run left floating far from its capture-order neighbours is moved between them;
+    5. the collapse guard (``trajectory.collapsed_keyframes``) rejects poses that coincide with
+       another keyframe's centre while showing different content, unless the matches support them,
+       and re-placed poses that still disagree with their gravity (``trajectory.tilted_keyframes``).
+
+    Keyframes without a verified connection, and rejected poses, are left out (never guessed)."""
+    from oh_my_slam.mapping import trajectory as traj
+
+    posed = {n: model.pose(n) for n in model.registered}
+    merged: dict[str, Pose] = {}
+    for rec in model.others:
+        other = SfmModel(rec, model.method)
+        vet(other, turns)
+        extra = traj.merge_by_shared({**posed, **merged},
+                                     {n: other.pose(n) for n in other.registered})
+        if extra:
+            merged.update(extra)
+    join: dict[str, Any] = {"reconstructions": model.notes.get("reconstructions"),
+                            "merged_by_shared_keyframes": sorted(merged)}
+    realigned = _fix_blocks(ctx, sfm, model, join)
+    posed = {n: model.pose(n) for n in model.registered}
+    missing = new_names - set(posed) - set(merged) - set(realigned)
+    anchored = set(posed) | set(merged) | set(realigned)
+    connected = sfm.connected(anchored, missing) if missing else set()
+    free: dict[str, Pose] = {}
+    mv: dict[str, Pose] = {}
+    if connected or realigned:
+        try:
+            scale = mframe.metric_scale(model, _frame_depths(ctx)).scale
+        except ValueError:
+            scale = float("nan")
+        if np.isfinite(scale):
+            model.transform(scale, np.eye(3), np.zeros(3))
+            model.notes["prescale"] = scale
+            posed = {n: model.pose(n) for n in model.registered}
+            merged = {n: Pose(T.R, scale * T.t) for n, T in merged.items()}
+            free = {n: Pose(T.R, scale * T.t) for n, T in realigned.items()}
+            if connected:
+                K = _model_intrinsics(sfm, model, new_names)
+                known = {**posed, **merged, **free}
+                pool = [PoolView(v.name, v.image, K.get(v.name, v.K), v.descriptor,
+                                 known.get(v.name)) for v in _new_pool(ctx)]
+                todo = sorted((v for v in pool if v.name in connected), key=lambda v: v.name)
+                progress(f"anchored multi-view for {len(todo)} keyframes the SfM model does not "
+                         "hold" + (" (anchored in capture order)" if is_video else ""))
+                mv = _multiview_poses(ctx, todo, [v for v in pool if v.pose is not None], client,
+                                      temporal=is_video)
+            allp, _ = _refine_multiview(ctx, sfm, {**posed, **merged, **free, **mv},
+                                        set(free) | set(mv), refine_focal=False, rotation=False,
+                                        model=model)
+            free = {n: allp[n] for n in free}
+            mv = {n: allp[n] for n in mv}
+            _relevel_blocks(ctx, {**posed, **merged}, free, join)
+            if is_video:
+                _attach_floating(ctx, {**posed, **merged}, free, mv, join)
+        else:  # no metric scale to place them with
+            connected = set()
+    left_out = (missing - connected) | (set(realigned) - set(free))
+    final = {**posed, **merged, **free, **mv}
+    supported = set(posed) | set(merged) | {
+        n for n in (*free, *mv) if _refined_pose_supported(ctx, n)}
+    radius = traj.collapse_radius(final, sorted(final), set(posed) | set(merged))
+    bad = traj.collapsed_keyframes(final, supported, radius, turns)
+    tilted = traj.tilted_keyframes(final, _ups_cam(ctx), set(posed) | set(merged),
+                                   set(free) | set(mv))
+    free = {n: T for n, T in free.items() if n not in bad | tilted}
+    mv = {n: T for n, T in mv.items() if n not in bad | tilted}
+    join.update(multiview=sorted(mv), collapsed_rejected=sorted(bad),
+                gravity_rejected=sorted(tilted), no_connection=sorted(left_out))
+    ctx.notes["sfm_join"] = join
+    if bad:
+        log.warning("collapse guard: %d keyframes placed onto another keyframe's centre are left "
+                    "out: %s", len(bad), ", ".join(sorted(bad)))
+    if tilted:
+        log.warning("%d re-placed keyframes disagree with their gravity by more than %.0f° and "
+                    "are left out: %s", len(tilted), traj.TILT_REJECT_DEG,
+                    ", ".join(sorted(tilted)))
+    if left_out:
+        progress(f"{len(left_out)} keyframes have no verified matches to the posed ones (or no "
+                 "metric scale to place them with) and are left out")
+    if not merged and not free and not mv:
+        return model
+    base = ctx.work / "sfm_join_base"
+    model.write(base)
+    method = model.method + ("+merged" if merged else "") + ("+realigned" if free else "") + (
+        "+multiview" if mv else "")
+    out = sfm.extend_with_poses(base, {**merged, **free, **mv}, ctx.work / "sfm_join", method)
+    out.notes.update(model.notes)
+    progress(f"{method}: {len(out.registered)} keyframes posed ({len(merged)} from another "
+             f"reconstruction, {len(free)} realigned, {len(mv)} by anchored multi-view)")
+    return out
+
+
+def _ups_cam(ctx: UpdateContext) -> dict[str, NDArray[np.float64]]:
+    """This update's keyframes' gravity estimates (up in the camera)."""
+    return {f"{nf.kf.name}.jpg": np.asarray(nf.frame.gravity.up_cam, np.float64)
+            for nf in ctx.new if nf.frame.gravity is not None}
+
+
+def _fix_blocks(ctx: UpdateContext, sfm: Sfm, model: SfmModel, join: dict[str, Any]
+                ) -> dict[str, Pose]:
+    """Poses of the model's keyframes whose SfM scale disagrees with their depth or whose tilt
+    disagrees with their gravity, block by block (``trajectory.fix_blocks``: scaled and levelled
+    about the keyframe each block hangs on; blocks hanging on a moved one follow it). They are
+    deregistered from the model (their points go; the mapper re-triangulates them at the new
+    poses), and so are such blocks that hang on nothing."""
+    from oh_my_slam.mapping import trajectory as traj
+
+    try:
+        ratios = mframe.metric_scale(model, _frame_depths(ctx)).per_frame
+    except ValueError:
+        ratios = {}
+    poses = {n: model.pose(n) for n in model.registered}
+    ups = {n: poses[n].R @ u for n, u in _ups_cam(ctx).items() if n in poses}
+    links = {p: k for p, (k, _) in sfm.verified_pairs().items()}
+    fix = traj.fix_blocks(poses, ratios, model.covisibility(), links, ups)
+    if not fix.poses and not fix.unanchored:
+        return {}
+    model.deregister(set(fix.poses) | fix.unanchored)
+    join["fixed_blocks"] = fix.moves
+    moves = [f"{len(m['keyframes'])} keyframes x{m['factor']:.3g}, levelled {m['tilt_deg']:.0f}° "
+             f"about {m['pivot']}" for m in fix.moves]
+    if fix.unanchored:
+        moves.append(f"{len(fix.unanchored)} such keyframes hang on nothing")
+    log.warning("SfM blocks that disagree with the depth (scale) or gravity (tilt): %s",
+                "; ".join(moves))
+    return fix.poses
+
+
+def _relevel_blocks(ctx: UpdateContext, fixed: dict[str, Pose], free: dict[str, Pose],
+                    join: dict[str, Any]) -> None:
+    """Level the realigned blocks with their gravity again after the refinement (in place): the
+    one weak link they hang on can pull their tilt away from it, while their gravity estimates
+    agree within degrees (``trajectory.level_block``, about the keyframe they were fixed about)."""
+    from oh_my_slam.mapping import trajectory as traj
+
+    ups = _ups_cam(ctx)
+    up = traj.mean_direction([T.R @ ups[n] for n, T in sorted(fixed.items()) if n in ups])
+    if up is None:
+        return
+    for m in join.get("fixed_blocks", []):
+        block = [f for f in m["keyframes"] if f in free]
+        new = traj.level_block({**fixed, **free}, block, m["about"], ups, up)
+        if new:
+            m["relevelled_deg"] = round(traj.rotation_deg(new[block[0]].R, free[block[0]].R), 2)
+            free.update(new)
+
+
+def _attach_floating(ctx: UpdateContext, fixed: dict[str, Pose], free: dict[str, Pose],
+                     mv: dict[str, Pose], join: dict[str, Any]) -> None:
+    """Video: a joined run placed implausibly far from the keyframes before and after it in
+    capture order — multi-view poses anchored on keyframes it does not overlap, a block with no
+    usable link — keeps its own shape and is moved rigidly between them
+    (``trajectory.floating_runs``, ``trajectory.attach_run``; in place)."""
+    from oh_my_slam.mapping import trajectory as traj
+
+    ups = _ups_cam(ctx)
+    up = traj.mean_direction([T.R @ ups[n] for n, T in sorted(fixed.items()) if n in ups])
+    if up is None:
+        return
+    allp = {**fixed, **free, **mv}
+    for run, before, after in traj.floating_runs(allp, sorted(allp), {*free, *mv}):
+        new = traj.attach_run(allp, run, before, after, up)
+        for n, T in new.items():
+            (free if n in free else mv)[n] = T
+        allp.update(new)
+        join.setdefault("attached_by_neighbours", []).append(
+            {"keyframes": run, "before": before, "after": after})
+        log.warning("%d keyframes %s..%s floated away from their capture-order neighbours: moved "
+                    "between %s and %s", len(run), run[0], run[-1], before, after)
+
+
+def _refined_pose_supported(ctx: UpdateContext, name: str) -> bool:
+    res, matches = ctx.pose_support.get(name, (float("inf"), 0))
+    return validity.pose_supported({"pose_matches": matches,
+                                    "pose_residual_deg": res if np.isfinite(res) else None})
 
 
 def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, client: Any,
@@ -568,7 +832,9 @@ def _define_map_frame(ctx: UpdateContext, model: SfmModel, progress: Progress) -
     first = next(f"{nf.kf.name}.jpg" for nf in ctx.new if f"{nf.kf.name}.jpg" in poses)
     sim = mframe.map_transform(poses[first], up, scale.scale)
     model.transform(sim.s, sim.R, sim.t)
-    ctx.meta["scale"] = {"sfm_to_metric": scale.scale, "spread": scale.spread,
+    # a model joined with realigned or multi-view poses is in metres already (``_join_unplaced``)
+    ctx.meta["scale"] = {"sfm_to_metric": scale.scale * model.notes.get("prescale", 1.0),
+                         "spread": scale.spread,
                          "frames": len(scale.per_frame), "method": method}
     ctx.meta["map_frame"] = {
         "units": "m", "axes": "x-forward,y-left,z-up", "gravity_aligned": True,
