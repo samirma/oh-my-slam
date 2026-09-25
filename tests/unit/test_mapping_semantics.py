@@ -411,8 +411,12 @@ def test_merge_keeps_the_lower_id(tmp_path: Path) -> None:
     the two merge into the lower id, which old keyframes' instances now resolve to."""
     sofa = Box(np.array([0.0, 0.0, 0.4]), np.array([2.4, 0.8, 0.8]), 0.0, (50, 70, 210), "sofa")
     room = Room(boxes=[sofa])
-    left = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (-1.4, -1.1)]
-    right = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (1.1, 1.4)]
+    # three views of each half, so that the fused cloud keeps the front the halves' boxes are
+    # fitted to (a surface seen by fewer than 3 keyframes does not survive the fusion, and a
+    # keyframe's vote for an object counts only inside the object's box)
+    left = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4]))
+            for x in (-1.4, -1.1, -0.8)]
+    right = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (0.8, 1.1, 1.4)]
 
     def half(poses: list[Pose], keep_x: Any) -> Any:
         """Detector that only segments the part of the sofa where ``keep_x(x_map)``."""
@@ -440,7 +444,7 @@ def test_merge_keeps_the_lower_id(tmp_path: Path) -> None:
     assert merged.id == halves[0] and r2.objs.merged_into == {halves[1]: halves[0]}
     assert r2.objs.resolve(halves[1]) == halves[0]
     assert not (mdir / objects.points_file(halves[1])).exists()
-    assert merged.obb.size[0] > 2.0 and merged.observations == 7
+    assert merged.obb.size[0] > 2.0 and merged.observations == 9
     # every labelled cloud point, including those attributed from update 1's keyframes whose
     # instances name the merged id, carries the kept id and its colour
     assert set(np.unique(r2.cloud.label)) == {0, halves[0]}
@@ -491,8 +495,12 @@ def test_split_ids_do_not_depend_on_earlier_updates_bookkeeping(tmp_path: Path) 
     cab = Box(np.array([0.2, 1.6, 0.4]), np.array([0.6, 0.5, 0.8]), 0.0, (220, 40, 40),
               "cabinet")
     room = Room(boxes=[sofa, cab])
-    left = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (-1.4, -1.1)]
-    right = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (1.1, 1.4)]
+    # three views of each half, so that the fused cloud keeps the front the halves' boxes are
+    # fitted to (a surface seen by fewer than 3 keyframes does not survive the fusion, and a
+    # keyframe's vote for an object counts only inside the object's box)
+    left = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4]))
+            for x in (-1.4, -1.1, -0.8)]
+    right = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (0.8, 1.1, 1.4)]
     whole = [look_at(np.array([x, -2.3, 1.4]), np.array([x, 0.0, 0.4])) for x in (-0.3, 0.0, 0.3)]
     behind = [look_at(np.array([x, 2.3, 1.4]), np.array([0.2, 1.6, 0.4])) for x in (-0.3, 0.2, 0.7)]
 

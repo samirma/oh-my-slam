@@ -113,6 +113,11 @@ GROUND_MIN_VISIBLE = 0.2
 SURFACES = TOP_SURFACE | frozenset({"rug", "carpet"})
 
 
+def surface_label(label: str) -> bool:
+    """Whether a label names a horizontal surface (``SURFACES``)."""
+    return normalize_label(label) in SURFACES
+
+
 def split_surface(a: str, b: str) -> bool:
     """Whether instances labelled ``a`` and ``b`` that touch with continuous depth may be pieces
     of one horizontal surface (``SURFACES``, compatible labels)."""

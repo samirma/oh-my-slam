@@ -20,6 +20,9 @@ Semantics (spec §2.3):
 * **Boxes** are fitted (by segmentation) to the points of the sightings that agree with each
   other (``fit_points``): monocular depth of small objects varies between keyframes, and the union
   of inconsistent sightings is a streak along the viewing rays, not the object.
+* **Keyframes re-scaled by a later update.** An update adjusts the depth scale of every keyframe
+  of the map (``mapping.api._adjust_depth_scales``: a loop it closes spreads over the whole loop);
+  the objects of the stored keyframes it re-scales move with them (``rescale_objects``).
 * **Latest wins across updates.** An update whose keyframes, as a whole, see through an object
   removes it or gives it a strike; an update that re-detects it or sees it in place clears its
   strikes (``_absence``). Keyframes of the same update never remove each other's objects.
@@ -36,7 +39,9 @@ Semantics (spec §2.3):
   counter top around a book) is often split by the detector into several instances of one kind.
   Instances of one keyframe that ``split_surface`` allows and that touch with continuous depth
   (``surface_pieces``) are one instance of that keyframe (``join_instances``); pieces seen from
-  different keyframes that share surface at one height are merged (``_one_surface``).
+  different keyframes that share or continue surface at one height are merged, whatever surface
+  labels they carry (a counter top labelled desk from one side and rug from another:
+  ``_one_surface``).
 * **Merging** joins duplicates: objects with compatible labels that overlap, and — whatever their
   labels — objects of comparable size that occupy the same space (most of either one's points on
   the other's surface) and that no keyframe detected as two instances: the detector's label
@@ -49,9 +54,11 @@ Semantics (spec §2.3):
   together merge when their sightings agree once the depth ratio measured between their
   keyframes is removed (``_depth_explained``).
 * **Point counts** are those of the map cloud: the points attributed to the object
-  (``set_cloud_counts``), as the ``point_count`` of a single image counts its cloud's points. An
-  object is exported only with at least ``EXPORT_MIN_CLOUD_POINTS`` of them, so every exported
-  object appears in the cloud (``segments.ply``, ``color=segment``) in its colour.
+  (``set_cloud_counts``; only inside its box, and for an object that wins none there, the cloud
+  points nearest its own lifted points: ``geometry``), as the ``point_count`` of a single image
+  counts its cloud's points. An object is exported only with at least
+  ``EXPORT_MIN_CLOUD_POINTS`` of them, so every exported object appears in the cloud
+  (``segments.ply``, ``color=segment``) in its colour.
 * **Boxes cover the observed surface.** A box is fitted to the points the keyframes saw: an
   object seen only from the front (a refrigerator against a wall) has the depth of its visible
   surface, not its physical depth; no class-typical size is assumed.
@@ -90,6 +97,7 @@ from oh_my_slam.segmentation.api import (
     lift_detections,
     obb_iou_upright,
     split_surface,
+    surface_label,
 )
 
 POINT_CAP = 30000
@@ -147,6 +155,28 @@ SURFACE_CONTACT_REL = 0.03
 SURFACE_SHARED_POINTS = 100
 SURFACE_PLAN_M = 0.05
 SURFACE_HEIGHT_TOL = 0.1
+# ... or when the map's fused surface joins them (``_Surfaces.joined``), though their own points
+# neither meet nor lie at one height: monocular depth of a surface seen at close range disagrees
+# between keyframes by 20-30 % (a counter top 0.5 m below the camera placed 10 cm lower and
+# further by the keyframes that close a loop). The fused surface averages every keyframe that
+# sees the gap between the pieces, so a horizontal patch of it that reaches both is their surface:
+# points whose local normal is within ~30° of vertical (|n_z| >= BRIDGE_NORMAL_Z, from the cloud
+# thinned to BRIDGE_SAMPLE voxels), joined through BRIDGE_VOXEL voxels, inside the pieces' plan
+# extent grown by BRIDGE_PAD and their median heights ± BRIDGE_BAND; at least BRIDGE_SHARE of
+# each piece's points near the patches (within BRIDGE_NEAR) lie on one patch. The pieces' median
+# heights are at most BRIDGE_HEIGHT_TOL apart and their points at most BRIDGE_GAP_M apart in plan;
+# at floor height (within BRIDGE_FLOOR_M of it) the floor would join anything, so it is not used.
+BRIDGE_HEIGHT_TOL = 0.15
+BRIDGE_GAP_M = 0.3
+BRIDGE_PAD = 0.3
+BRIDGE_BAND = 0.05
+BRIDGE_SAMPLE = 0.01
+BRIDGE_VOXEL = 0.02
+BRIDGE_NORMAL_Z = 0.85
+BRIDGE_NEAR = 0.03
+BRIDGE_SHARE = 0.5
+BRIDGE_MIN_POINTS = 20
+BRIDGE_FLOOR_M = 0.15
 # Depth-explained duplicates (``_depth_explained``): the DEPTH_PAIRS pairs of detecting keyframes
 # nearest by viewpoint are compared; a pair counts when its keyframes' depths disagree by at least
 # DEPTH_RATIO_MIN — beyond the alignment noise (consecutive keyframes agree within ~2 %), else the
@@ -157,9 +187,11 @@ DEPTH_RATIO_MIN = 0.05
 DEPTH_RATIO_MAX = 0.3
 RATIO_MIN_POINTS = 500  # shared surface points for a keyframe pair's depth ratio
 # An object is exported only with at least this many map-cloud points: every exported object is
-# then drawn in the cloud (segments.ply, color=segment) in its colour. A confirmed object may have
-# none when its surface did not survive the fusion (seen by fewer than 3 keyframes, e.g. a pendant
-# lamp) or when fewer than a third of the keyframes that see its surface detected it.
+# then drawn in the cloud (segments.ply, color=segment) in its colour. A confirmed object whose
+# detecting keyframes are fewer than a third of those that see its surface wins no point in the
+# vote; it takes the cloud points nearest its own lifted points instead (``geometry.
+# support_labels``). It still has none when its surface did not survive the fusion (seen by fewer
+# than 3 keyframes, e.g. a pendant lamp).
 EXPORT_MIN_CLOUD_POINTS = 1
 UP = np.array([0.0, 0.0, 1.0])
 
@@ -767,10 +799,59 @@ def _instances_json(frame_items: list[tuple[int, LiftedInstance]]) -> dict[str, 
     ]}
 
 
-def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
+def rescale_objects(state: ObjectState, rescaled: dict[int, float], records: list[Any]
+                    ) -> set[int]:
+    """Move the stored objects with the stored keyframes whose depth this update re-scaled
+    (``rescaled``: keyframe index -> factor; ``mapping.api._adjust_depth_scales``): each
+    sighting scales about its keyframe's camera centre by that keyframe's factor; the points —
+    which do not record their keyframe — scale about the sightings' mean camera centre by the
+    sightings' mean factor (geometric, weighted by their points; keyframes not re-scaled count
+    as 1), and the box is refitted. Returns the ids of the objects that moved."""
+    moved: set[int] = set()
+    if not rescaled:
+        return moved
+    poses = {r.index: r.T_map_cam for r in records}
+    for o in state.objects:
+        if not any(s.frame in rescaled and s.frame in poses for s in o.sightings):
+            continue
+        out, logs, weights, centres = [], [], [], []
+        for s in o.sightings:
+            T = poses.get(s.frame)
+            c = rescaled.get(s.frame, 1.0) if T is not None else 1.0
+            if T is not None:
+                centres.append(T.t)
+                logs.append(np.log(c))
+                weights.append(float(max(s.points, 1)))
+            if c == 1.0 or T is None:
+                out.append(s)
+                continue
+
+            def moved_to(v: tuple[float, float, float], C: NDArray[Any] = T.t, c: float = c
+                         ) -> tuple[float, float, float]:
+                w = C + c * (np.asarray(v, np.float64) - C)
+                return (float(w[0]), float(w[1]), float(w[2]))
+            out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
+                                moved_to(s.lo), moved_to(s.hi)))
+        w = np.asarray(weights)
+        c_obj = float(np.exp(np.sum(w * np.asarray(logs)) / np.sum(w)))
+        C_obj = np.sum(np.asarray(centres) * w[:, None], axis=0) / np.sum(w)
+        if len(o.points):
+            o.points = canonical_points(C_obj + c_obj * (o.points.astype(np.float64) - C_obj))
+        o.obs_depth *= c_obj
+        o.sightings = sorted(out, key=Sighting.key)
+        refit(o, state.floor_z)
+        moved.add(o.id)
+    return moved
+
+
+def update_objects(ctx: Any, records: list[Any], progress: Any,
+                   surface: NDArray[Any] | None = None) -> ObjectState:
+    """The update's objects (see the module docstring); ``surface``: the map's fused surface
+    (``geometry.fuse_map``), evidence that pieces of a horizontal surface are one object."""
     tx = ctx.tx
     state = load_state(tx.current, ctx.meta)
     uid = ctx.update_id
+    moved = rescale_objects(state, getattr(ctx, "rescaled", {}) or {}, records)
     _, fz = map_floor(ctx)
     if state.floor_z is None or (fz is not None and not ctx.old_frames):
         state.floor_z = fz
@@ -836,7 +917,8 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     # 3. merge duplicates (lower id kept; keepers are refitted), then count the keyframes of the
     #    whole map that have each object in view and confirm
     alias: dict[int, int] = {}
-    merged = _merge(state, touched, alias, views)
+    surfaces = None if surface is None else _Surfaces(surface, state.floor_z)
+    merged = _merge(state, touched, alias, views, surfaces)
     for o in state.objects:
         o.views_in_frustum = count_views(o, records)
         confirm(o)
@@ -883,7 +965,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
         tx.write_json(frame_file(nf.record.name, "instances.json"), _instances_json(items))
     state.observed = touched
     for o in state.objects:
-        if o.id in touched:
+        if o.id in touched or o.id in moved:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
     save_state(tx, state)
     confirmed = sum(o.confirmed for o in state.objects)
@@ -1252,27 +1334,114 @@ def _depth_explained(a: MapObject, b: MapObject, views: _Views) -> float:
     return support / (len(pairs) // 2 + 1)
 
 
-def _one_surface(a: MapObject, b: MapObject) -> float:
-    """>= 1 when two objects are pieces of one horizontal surface seen from different keyframes
-    (a counter top around the camera, labelled desk from one side and bed from another): some
-    labels of the two (their label or any label they were detected as) are pieces of one surface
-    (``split_surface``), no keyframe detected both (it would have seen two things there), their
-    median heights agree within ``SURFACE_HEIGHT_TOL`` and they share surface: the points of
-    ``a`` within ``SURFACE_PLAN_M`` horizontally and ``SURFACE_HEIGHT_TOL`` vertically of
-    ``b``'s, over ``SURFACE_SHARED_POINTS``."""
+def _surface_kinds(a: MapObject, b: MapObject) -> bool:
+    """Whether two objects may be pieces of one horizontal surface by their labels: some labels
+    of the two (their label or any label they were detected as) are compatible surface labels
+    (``split_surface``), or both are labelled as horizontal surfaces of whatever kind
+    (``surface_label``: the detector names one counter top a desk from one side and a rug from
+    another; the geometry of ``_one_surface`` decides)."""
     la, lb = {a.label, *a.label_votes}, {b.label, *b.label_votes}
-    if not any(split_surface(x, y) for x in sorted(la) for y in sorted(lb)):
+    if any(split_surface(x, y) for x in sorted(la) for y in sorted(lb)):
+        return True
+    return surface_label(a.label) and surface_label(b.label)
+
+
+class _Surfaces:
+    """The map's fused surface (``geometry.fuse_map``) as evidence that two pieces are one
+    horizontal surface (``joined``; see ``BRIDGE_*``), with the results cached per pair of
+    point sets."""
+
+    def __init__(self, cloud: NDArray[Any], floor_z: float | None) -> None:
+        self.cloud = np.asarray(cloud, np.float64).reshape(-1, 3)
+        self.floor_z = floor_z
+        self.cache: dict[tuple[Any, ...], bool] = {}
+
+    def joined(self, a: MapObject, b: MapObject) -> bool:
+        key = (a.id, b.id, len(a.points), len(b.points), a.points[:1].tobytes(),
+               b.points[:1].tobytes())
+        if key not in self.cache:
+            self.cache[key] = self._joined(a, b)
+        return self.cache[key]
+
+    def _joined(self, a: MapObject, b: MapObject) -> bool:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        from oh_my_slam.core.geometry import voxel_downsample_indices
+
+        ha, hb = float(np.median(a.points[:, 2])), float(np.median(b.points[:, 2]))
+        if self.floor_z is not None and max(ha, hb) < self.floor_z + BRIDGE_FLOOR_M:
+            return False
+        gap, _ = cKDTree(a.points[:, :2]).query(b.points[:, :2], k=1,
+                                                distance_upper_bound=BRIDGE_GAP_M)
+        if not np.isfinite(gap).any():
+            return False
+        both = np.concatenate([a.points, b.points]).astype(np.float64)
+        lo, hi = both[:, :2].min(0) - BRIDGE_PAD, both[:, :2].max(0) + BRIDGE_PAD
+        c = self.cloud
+        sel = (np.all((c[:, :2] >= lo) & (c[:, :2] <= hi), axis=1)
+               & (c[:, 2] >= min(ha, hb) - BRIDGE_BAND) & (c[:, 2] <= max(ha, hb) + BRIDGE_BAND))
+        p = c[sel]
+        if len(p) < 50:
+            return False
+        p = p[np.sort(voxel_downsample_indices(p, BRIDGE_SAMPLE))]
+        if len(p) < 50:
+            return False
+        _, nn = cKDTree(p).query(p, k=10)
+        q = p[nn] - p[nn].mean(axis=1, keepdims=True)
+        _, vec = np.linalg.eigh(np.einsum("nki,nkj->nij", q, q))
+        flat = p[np.abs(vec[:, 2, 0]) >= BRIDGE_NORMAL_Z]
+        if len(flat) < 50:
+            return False
+        keys = np.unique(np.floor(flat / BRIDGE_VOXEL).astype(np.int64), axis=0)
+        links = cKDTree(keys).query_pairs(1.8, output_type="ndarray")  # 26-neighbourhood
+        graph = coo_matrix((np.ones(len(links)), (links[:, 0], links[:, 1])),
+                           shape=(len(keys), len(keys)))
+        _, comp = connected_components(graph, directed=False)
+        centres = cKDTree((keys + 0.5) * BRIDGE_VOXEL)
+
+        def on(o: MapObject) -> NDArray[np.int64]:
+            d, j = centres.query(np.asarray(o.points, np.float64), k=1,
+                                 distance_upper_bound=BRIDGE_NEAR)
+            return np.asarray(comp[j[np.isfinite(d)]], np.int64)
+
+        ca, cb = on(a), on(b)
+        if len(ca) < BRIDGE_MIN_POINTS or len(cb) < BRIDGE_MIN_POINTS:
+            return False
+        for patch in np.intersect1d(ca, cb).tolist():
+            if (ca == patch).mean() >= BRIDGE_SHARE and (cb == patch).mean() >= BRIDGE_SHARE:
+                return True
+        return False
+
+
+def _one_surface(a: MapObject, b: MapObject, surfaces: _Surfaces | None = None) -> float:
+    """>= 1 when two objects are pieces of one horizontal surface seen from different keyframes
+    (a counter top around the camera, labelled desk from one side and bed or rug from another):
+    their labels allow it (``_surface_kinds``), no keyframe detected both (it would have seen two
+    things there), and either their median heights agree within ``SURFACE_HEIGHT_TOL`` (a rug
+    under a table is a different surface) and they share surface — the points of ``a`` within
+    ``SURFACE_PLAN_M`` horizontally and ``SURFACE_HEIGHT_TOL`` vertically of ``b``'s, over
+    ``SURFACE_SHARED_POINTS`` — or the map's fused surface joins them (``surfaces``:
+    ``_Surfaces.joined``)."""
+    if not _surface_kinds(a, b):
         return 0.0
     if set(a.frames) & set(b.frames) or len(a.points) == 0 or len(b.points) == 0:
         return 0.0
-    if abs(float(np.median(a.points[:, 2]) - np.median(b.points[:, 2]))) > SURFACE_HEIGHT_TOL:
-        return 0.0
-    k = np.array([1.0, 1.0, SURFACE_PLAN_M / SURFACE_HEIGHT_TOL])
-    d, _ = cKDTree(b.points * k).query(a.points * k, k=1, distance_upper_bound=SURFACE_PLAN_M)
-    return float(np.isfinite(d).sum()) / SURFACE_SHARED_POINTS
+    dz = abs(float(np.median(a.points[:, 2]) - np.median(b.points[:, 2])))
+    shared = 0.0
+    if dz <= SURFACE_HEIGHT_TOL:
+        k = np.array([1.0, 1.0, SURFACE_PLAN_M / SURFACE_HEIGHT_TOL])
+        d, _ = cKDTree(b.points * k).query(a.points * k, k=1,
+                                           distance_upper_bound=SURFACE_PLAN_M)
+        shared = float(np.isfinite(d).sum()) / SURFACE_SHARED_POINTS
+    if shared < 1.0 and surfaces is not None and dz <= BRIDGE_HEIGHT_TOL \
+            and surfaces.joined(a, b):
+        return 1.0
+    return shared
 
 
-def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None) -> float:
+def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
+                    surfaces: _Surfaces | None = None) -> float:
     """>= 1 when two objects are one physical object. Compatible labels: >= 50 % of the smaller
     one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box >= 60 %
     inside the other), or (with ``views``) copies placed by keyframes whose depths disagree
@@ -1280,14 +1449,15 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None) -> 
     keyframes): no keyframe detected both (it would have seen two things there), their sizes are
     comparable (``MERGE_SCALE``: neither is a part of the other or an item resting on it) and
     >= 50 % of either one's points lie on the other's surface. Whatever the labels: pieces of one
-    horizontal surface (``_one_surface``). The value orders the merges (strongest first)."""
+    horizontal surface (``_one_surface``, with ``surfaces``: the map's fused surface). The value
+    orders the merges (strongest first)."""
     same_kind = compatible(a.label, b.label)
     if not same_kind and set(a.frames) & set(b.frames):
         return 0.0
     if np.linalg.norm(a.centroid - b.centroid) > max(CENTROID_GATE * 2,
                                                      _extent(a.points) + _extent(b.points)):
         return 0.0
-    surface = _one_surface(a, b)
+    surface = _one_surface(a, b, surfaces)
     if not same_kind:
         sa, sb = _scale(a), _scale(b)
         if min(sa, sb) < MERGE_SCALE * max(sa, sb):
@@ -1311,10 +1481,11 @@ def _content_key(o: MapObject) -> tuple[Any, ...]:
 
 
 def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
-           views: _Views | None = None) -> int:
+           views: _Views | None = None, surfaces: _Surfaces | None = None) -> int:
     """Merge duplicates among the objects (at least one of each pair touched by this update),
     strongest pair first; the lower id is kept and ``alias`` maps each merged id to its keeper.
-    ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``)."""
+    ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``),
+    ``surfaces`` (the map's fused surface) the surface-continuity test (``_Surfaces``)."""
     strength: dict[tuple[int, int], float] = {}
 
     def pairs_of(o: MapObject) -> None:
@@ -1322,7 +1493,7 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
             if p.id == o.id or not (o.id in touched or p.id in touched):
                 continue
             a, b = (o, p) if o.id < p.id else (p, o)
-            s = _merge_strength(a, b, views)
+            s = _merge_strength(a, b, views, surfaces)
             if s >= 1.0:
                 strength[(a.id, b.id)] = s
             else:

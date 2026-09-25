@@ -1,6 +1,15 @@
 """Map geometry for an update: the coloured cloud (surface of a TSDF fusion of the valid, aligned
 depth maps; colour and object id per point from the latest update that sees it), built with the
-reconstruction package's fusion code."""
+reconstruction package's fusion code.
+
+Object ids come from the keyframes' instance masks, which a detector draws generously: a "carpet"
+mask that covers a counter top and the floor beyond it, of which only the counter was lifted into
+the object (lifting keeps a mask's largest spatial cluster). A keyframe's vote for an object
+therefore counts only for points inside the object's box grown by ``ATTRIBUTE_MARGIN_M``, so an
+object's points in the cloud (``segments.ply``, ``color=segment``, its ``point_count``) coincide
+with its box. A confirmed object that wins no point this way — its detecting keyframes are fewer
+than a third of those that see its surface, like a light switch on a wall — takes the unlabelled
+cloud points nearest to its own lifted points (``support_labels``)."""
 
 from __future__ import annotations
 
@@ -17,10 +26,15 @@ from oh_my_slam.core.geometry import project
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.objects import ObjectState, label_map_for
+from oh_my_slam.mapping.objects import (
+    EXPORT_MIN_CLOUD_POINTS,
+    ObjectState,
+    fit_points,
+    label_map_for,
+)
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.pointcloud import pixel_mask
-from oh_my_slam.segmentation.api import UNSEGMENTED
+from oh_my_slam.segmentation.api import OBB, UNSEGMENTED
 
 # Map cloud = surface of a fine TSDF (voxel/2, wide band so frames that disagree by a few
 # centimetres still average into one surface), attributed from the latest update that sees it.
@@ -30,6 +44,17 @@ VIS_TOL_MIN = 0.02
 VIS_TOL_REL = 0.03
 LABEL_SHARE_DIVISOR = 3  # an object id needs the votes of >= 1/3 of the views that see a point
 ATTRIBUTE_CHUNK = 1_000_000  # points attributed at a time (bounds the vote's memory)
+# A vote for an object counts only within its box grown by this: the fused surface lies within a
+# few centimetres of the points the box was fitted to (TSDF band 4 cm, box at the 2-98 % extent).
+ATTRIBUTE_MARGIN_M = 0.05
+# Fallback of a confirmed object without cloud points: the SUPPORT_NEIGHBOURS unlabelled cloud
+# points nearest each of its own lifted points (at least SUPPORT_MIN_POINTS of them), within
+# max(SUPPORT_RADIUS_MIN, SUPPORT_RADIUS_REL · its viewing distance) — the depth disagreement of
+# the keyframes that saw it and of the fused surface — and inside its grown box.
+SUPPORT_MIN_POINTS = 30
+SUPPORT_NEIGHBOURS = 4
+SUPPORT_RADIUS_MIN = 0.03
+SUPPORT_RADIUS_REL = 0.02
 
 
 @dataclass
@@ -49,8 +74,19 @@ class MapGeometry:
     stats: dict[str, Any]
 
 
-def _frame_data(ctx: Any, rec: store.FrameRecord, objs: ObjectState,
-                new_by_name: dict[str, Any]) -> FrameData:
+@dataclass
+class FusedCloud:
+    """The fused surface of the map's confident keyframes (``fuse_map``), before object ids are
+    attributed to it: the objects of the update use it (``objects.update_objects``)."""
+
+    frames: list[FrameData]  # the confident keyframes (their labels are set by build_geometry)
+    xyz: NDArray[np.float64]
+    voxel: float
+    seconds: float
+
+
+def _frame_data(ctx: Any, rec: store.FrameRecord, new_by_name: dict[str, Any]) -> FrameData:
+    """A keyframe's aligned depth, validity and colour (object ids not yet set)."""
     tx = ctx.tx
     nf = new_by_name.get(rec.name)
     if nf is not None and nf.depth is not None:
@@ -60,10 +96,15 @@ def _frame_data(ctx: Any, rec: store.FrameRecord, objs: ObjectState,
         depth = store.load_depth(tx.current, rec.name)
         rgb = load_rgb(tx.current(rec.image), max_side=max(rec.grid_width, rec.grid_height))
     valid = store.load_valid(tx.current, rec.name, depth)
-    inst_p = tx.current(store.frame_file(rec.name, "instances.json"))
+    return FrameData(rec, depth, valid, rgb, np.zeros(depth.shape, np.int32), nf is not None)
+
+
+def _frame_labels(ctx: Any, rec: store.FrameRecord, shape: tuple[int, ...], objs: ObjectState
+                  ) -> NDArray[np.int32]:
+    """Per-pixel persistent object ids of a keyframe (its instances as stored or staged)."""
+    inst_p = ctx.tx.current(store.frame_file(rec.name, "instances.json"))
     insts = json.loads(inst_p.read_text()).get("instances", []) if inst_p.exists() else []
-    labels = label_map_for(insts, depth.shape, objs)
-    return FrameData(rec, depth, valid, rgb, labels, nf is not None)
+    return label_map_for(insts, (int(shape[0]), int(shape[1])), objs)
 
 
 def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
@@ -109,12 +150,27 @@ def _visible(fd: FrameData, pts: NDArray[np.float64]
     return idx, vv, uu, z[idx] / K.fx
 
 
-def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData]
+def _in_boxes(pts: NDArray[np.float64], lab: NDArray[Any], boxes: dict[int, OBB]
+              ) -> NDArray[np.bool_]:
+    """Whether each point lies in the box (grown by ``ATTRIBUTE_MARGIN_M``) of the object it is
+    labelled with; objects without a box have none."""
+    out = np.zeros(len(pts), bool)
+    for oid in np.unique(lab).tolist():
+        box = boxes.get(int(oid))
+        if box is not None:
+            sel = lab == oid
+            out[sel] = box.contains(pts[sel], ATTRIBUTE_MARGIN_M)
+    return out
+
+
+def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData],
+                      boxes: dict[int, OBB] | None = None
                       ) -> tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.int32]]:
     """(seen, colour, object id) of each point from the keyframes of one update, whatever their
     order: the colour of the finest view (smallest footprint; ties: larger colour, then larger id)
     and the object id with most votes among the views that see the point (ties: finest view),
-    kept only if at least a third of those views give it."""
+    kept only if at least a third of those views give it. With ``boxes`` (object id → OBB), a
+    vote counts only for a point inside the voted object's grown box (``_in_boxes``)."""
     n = len(pts)
     views = np.zeros(n, np.int32)
     best = np.full(n, np.inf)
@@ -132,6 +188,8 @@ def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData]
         sel = idx[better]
         best[sel], best_key[sel], rgb[sel] = fp[better], key[better], col[better]
         on = lab > 0
+        if boxes is not None and on.any():
+            on[on] = _in_boxes(pts[idx[on]], lab[on], boxes)
         p_idx.append(idx[on])
         p_lab.append(lab[on])
         p_fp.append(fp[on])
@@ -153,14 +211,15 @@ def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData]
     return views > 0, rgb, label
 
 
-def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
+def attribute_points(xyz: NDArray[Any], frames: list[FrameData],
+                     boxes: dict[int, OBB] | None = None
                      ) -> tuple[NDArray[np.uint8], NDArray[np.int32], NDArray[np.bool_]]:
     """Colour and object id of each point from the latest update whose keyframes see it.
 
     Updates are applied oldest → newest, so a later update wins wherever it sees a point. The
     keyframes of one update are one observation: within it, their order never matters
-    (``_attribute_update``). Returns (rgb, label, seen by a new frame); unseen points keep
-    mid-grey and label 0.
+    (``_attribute_update``; ``boxes`` gate the votes). Returns (rgb, label, seen by a new frame);
+    unseen points keep mid-grey and label 0.
     """
     n = len(xyz)
     rgb = np.full((n, 3), UNSEGMENTED, np.uint8)
@@ -174,7 +233,7 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
         sl = slice(start, min(n, start + ATTRIBUTE_CHUNK))
         pts = pts_all[sl]
         for uid in sorted(by_update):
-            seen, col, lab = _attribute_update(pts, by_update[uid])
+            seen, col, lab = _attribute_update(pts, by_update[uid], boxes)
             where = np.flatnonzero(seen) + start
             rgb[where] = col[seen]
             label[where] = lab[seen]
@@ -183,14 +242,44 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData]
     return rgb, label, seen_new
 
 
-def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
-                   progress: Any) -> MapGeometry:
-    """The map cloud with its object ids (timed as the stage ``cloud``)."""
-    tx = ctx.tx
+def support_labels(xyz: NDArray[Any], label: NDArray[np.int32], objs: ObjectState) -> int:
+    """Give each confirmed object with a box but fewer than ``EXPORT_MIN_CLOUD_POINTS`` cloud
+    points the unlabelled cloud points its own lifted points (``objects.fit_points``) pick: the
+    ``SUPPORT_NEIGHBOURS`` nearest to each, within the support radius and inside its grown box.
+    Objects are served in id order; ``label`` is modified in place. Returns how many objects
+    took points."""
+    from scipy.spatial import cKDTree
+
+    pts_all = np.asarray(xyz, np.float64).reshape(-1, 3)
+    counts = np.bincount(label[label > 0]) if (label > 0).any() else np.zeros(1, np.int64)
+    served = 0
+    for o in sorted(objs.objects, key=lambda o: o.id):
+        have = int(counts[o.id]) if o.id < len(counts) else 0
+        if not o.confirmed or o.obb is None or have >= EXPORT_MIN_CLOUD_POINTS:
+            continue
+        own = np.asarray(fit_points(o), np.float64)
+        if len(own) < SUPPORT_MIN_POINTS:
+            continue
+        cand = np.flatnonzero(o.obb.contains(pts_all, ATTRIBUTE_MARGIN_M) & (label == 0))
+        if not len(cand):
+            continue
+        radius = max(SUPPORT_RADIUS_MIN, SUPPORT_RADIUS_REL * o.obs_depth)
+        k = min(SUPPORT_NEIGHBOURS, len(cand))
+        d, j = cKDTree(pts_all[cand]).query(own, k=k, distance_upper_bound=radius)
+        d, j = np.reshape(d, (len(own), k)), np.reshape(j, (len(own), k))
+        take = cand[np.unique(j[np.isfinite(d)])]
+        if len(take):
+            label[take] = o.id
+            served += 1
+    return served
+
+
+def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:
+    """The fused surface of the map's confident keyframes (timed as the stage ``cloud``)."""
     t0 = time.perf_counter()
     with timing.stage("cloud"):
         new_by_name = {nf.kf.name: nf for nf in ctx.new if nf.record is not None}
-        frames = [_frame_data(ctx, r, objs, new_by_name)
+        frames = [_frame_data(ctx, r, new_by_name)
                   for r in sorted(records, key=lambda r: r.order_key)]
         depths = [np.median(fd.depth[fd.valid & (fd.depth > 0)]) for fd in frames
                   if (fd.valid & (fd.depth > 0)).any()]
@@ -200,15 +289,31 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         cloud_voxel = max(0.005, voxel / 2)
         confident = [fd for fd in frames if not fd.rec.low_confidence]
         xyz = fused_cloud_points(confident, cloud_voxel, depth_max)
-        rgb, label, seen_new = attribute_points(xyz, confident)
+    return FusedCloud(confident, xyz, cloud_voxel, time.perf_counter() - t0)
+
+
+def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
+                   progress: Any, fused: FusedCloud | None = None) -> MapGeometry:
+    """The map cloud with its object ids (timed as the stage ``cloud``): the fused surface
+    (``fused``, else fused here) attributed from the keyframes' instances."""
+    tx = ctx.tx
+    fused = fused if fused is not None else fuse_map(ctx, records)
+    t0 = time.perf_counter()
+    with timing.stage("cloud"):
+        for fd in fused.frames:
+            fd.labels = _frame_labels(ctx, fd.rec, fd.depth.shape, objs)
+        xyz = fused.xyz
+        boxes = {o.id: o.obb for o in objs.objects if o.obb is not None}
+        rgb, label, seen_new = attribute_points(xyz, fused.frames, boxes)
+        supported = support_labels(xyz, label, objs)
         cloud = PointCloud(xyz, rgb, label)
         new_cloud = cloud.subset(np.nonzero(seen_new)[0])
         assert cloud.label is not None
         tx.write_bytes(store.CLOUD_PLY, ply_bytes(PointCloud(cloud.xyz, cloud.rgb),
                                                   comments=["oh-my-slam map cloud, metres, z up"]))
         tx.save_npy(store.CLOUD_OBJECTS, cloud.label.astype(np.int32))
-    progress(f"cloud: {len(cloud)} points (voxel {cloud_voxel * 100:.1f} cm) in "
-             f"{time.perf_counter() - t0:.0f} s")
-    stats = {"cloud_points": len(cloud), "voxel": cloud_voxel}
+    progress(f"cloud: {len(cloud)} points (voxel {fused.voxel * 100:.1f} cm) in "
+             f"{fused.seconds + time.perf_counter() - t0:.0f} s")
+    stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "support_fallback": supported}
     ctx.notes["geometry"] = stats
     return MapGeometry(cloud, new_cloud, stats)

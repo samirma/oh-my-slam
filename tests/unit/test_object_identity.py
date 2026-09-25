@@ -156,14 +156,79 @@ def test_pieces_of_one_surface_seen_from_different_keyframes_are_merged() -> Non
     desk = obj(2, "desk", {0: front[:3000], 1: front[3000:]}, 1.0)
     bed = obj(152, "bed", {56: side[:3000], 60: side[3000:]}, 1.0, {"bed": 1.6, "desk": 0.7})
     assert merge(desk, bed) == {152: 2}
-    # at another height (a shelf under the counter), seen together, or without a surface label
-    # in common, the pieces stay apart
+    # at another height (a shelf under the counter), or seen together, the pieces stay apart
     low = obj(152, "bed", {56: side - (0, 0, 0.3)}, 1.0, {"bed": 0.8, "desk": 0.7})
     assert merge(obj(2, "desk", {0: front}, 1.0), low) == {}
     seen = obj(152, "bed", {0: side[:3000], 60: side[3000:]}, 1.0, {"bed": 1.6, "desk": 0.7})
     assert merge(obj(2, "desk", {0: front[:3000], 1: front[3000:]}, 1.0), seen) == {}
+    # never detected as a desk: both are still labelled as horizontal surfaces
     only_bed = obj(152, "bed", {56: side}, 1.0)
-    assert merge(obj(2, "desk", {0: front}, 1.0), only_bed) == {}
+    assert merge(obj(2, "desk", {0: front}, 1.0), only_bed) == {152: 2}
+    # a piece that is not labelled as a surface (a cabinet top at that height) stays apart
+    top = obj(152, "cabinet", {56: side[:600]}, 1.0)
+    assert merge(obj(2, "desk", {0: front}, 1.0), top) == {}
+
+
+def test_a_counter_corner_labelled_rug_joins_the_counter() -> None:
+    """The kitchen island: a desk (detected as desk, bed, kitchen island) and, from the keyframes
+    that close the loop, its marble corner labelled rug. They continue one surface at one height
+    (the corner overlaps the counter's edge by a few centimetres) and no keyframe saw both. A rug
+    on the floor under the counter is another surface."""
+    rng = np.random.default_rng(3)
+    top = rng.uniform(-0.5, 0.5, (8000, 3)) * (1.5, 0.7, 0.02) + (0.46, -0.42, -0.3)
+    corner = rng.uniform(-0.5, 0.5, (1500, 3)) * (0.45, 0.25, 0.02) + (-0.46, -0.42, -0.31)
+    desk = obj(2, "desk", {0: top[:4000], 51: top[4000:]}, 1.0,
+               {"desk": 7.5, "bed": 3.6, "kitchen island": 1.1})
+    rug = obj(79, "rug", {27: corner[:700], 72: corner[700:]}, 1.2, {"rug": 1.1, "carpet": 0.8})
+    alias: dict[int, int] = {}
+    state = ObjectState([desk, rug], 400)
+    assert mo._merge(state, {2, 79}, alias) == 1 and alias == {79: 2}
+    (kept,) = state.objects
+    assert kept.label == "desk" and "rug" in kept.label_votes
+    floor = obj(81, "carpet", {27: corner - (0, 0, 1.0), 74: corner - (0, 0, 1.0)}, 1.5)
+    alias = {}
+    assert mo._merge(ObjectState([obj(2, "desk", {0: top}, 1.0), floor], 400), {2, 81},
+                     alias) == 0
+
+
+def test_pieces_the_fused_surface_joins_are_one_surface() -> None:
+    """The kitchen island's near-field corner, placed 9 cm lower and 10 cm beyond the counter's
+    points by the keyframes that close the loop (their depth of a surface 0.5 m away disagrees),
+    is joined to the counter by the map's fused surface: one horizontal patch reaches both. A
+    step between them (another surface at another height), or the floor, joins nothing."""
+    rng = np.random.default_rng(4)
+    top = rng.uniform(-0.5, 0.5, (8000, 3)) * (1.0, 0.8, 0.02) + (0.5, 0.0, -0.31)
+    corner = rng.uniform(-0.5, 0.5, (1500, 3)) * (0.2, 0.3, 0.02) + (-0.2, 0.0, -0.40)
+    desk = obj(2, "desk", {0: top[:4000], 51: top[4000:]}, 0.5, {"desk": 7.5, "bed": 3.6})
+    rug = obj(79, "rug", {72: corner[:700], 75: corner[700:]}, 0.7)
+    assert mo._one_surface(desk, rug) < 1.0  # their own points neither meet nor share a height
+
+    def fused(z_of_x: object) -> np.ndarray:
+        """A 5 mm cloud of the counter top from x = -0.35 to 1.05 at height ``z_of_x(x)``."""
+        x, y = np.meshgrid(np.arange(-0.35, 1.05, 0.005), np.arange(-0.45, 0.45, 0.005))
+        x, y = x.ravel(), y.ravel()
+        return np.stack([x, y, z_of_x(x)], 1)  # type: ignore[operator]
+
+    # the fused surface slopes from the counter's height down to the corner's, without a step
+    sloped = fused(lambda x: np.interp(x, [-0.35, -0.1, 0.1, 1.05], [-0.4, -0.39, -0.32, -0.31]))
+    surfaces = mo._Surfaces(sloped, floor_z=-1.3)
+    assert mo._one_surface(desk, rug, surfaces) >= 1.0
+    alias: dict[int, int] = {}
+    mo._merge(ObjectState([desk, rug], 400), {2, 79}, alias, surfaces=surfaces)
+    assert alias == {79: 2}
+    # a step: the corner's surface ends in a vertical face 9 cm below the counter's
+    step = fused(lambda x: np.where(x < 0.0, -0.40, -0.31))
+    face = np.stack(np.meshgrid(np.array([0.0]), np.arange(-0.45, 0.45, 0.005),
+                                np.arange(-0.40, -0.31, 0.005)), -1).reshape(-1, 3)
+    walled = mo._Surfaces(np.concatenate([step[step[:, 0] < -0.02], step[step[:, 0] > 0.02],
+                                          face]), floor_z=-1.3)
+    assert mo._one_surface(desk, rug, walled) < 1.0
+    # pieces at floor height: the floor would join anything
+    low = mo._Surfaces(sloped, floor_z=-0.42)
+    assert mo._one_surface(desk, rug, low) < 1.0
+    # a piece labelled as something else is never joined
+    box = obj(79, "cabinet", {72: corner[:700], 75: corner[700:]}, 0.7)
+    assert mo._one_surface(desk, box, surfaces) == 0.0
 
 
 # --- export ------------------------------------------------------------------------------------------

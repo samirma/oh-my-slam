@@ -42,6 +42,7 @@ from oh_my_slam.segmentation.detect import (
 from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
 from oh_my_slam.segmentation.detect import split_surface as split_surface
+from oh_my_slam.segmentation.detect import surface_label as surface_label
 from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask
 from oh_my_slam.segmentation.obb import OBB as OBB
 from oh_my_slam.segmentation.obb import fit_obb
