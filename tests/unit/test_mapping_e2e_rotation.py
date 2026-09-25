@@ -74,3 +74,33 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
         assert abs(err) < 3.0, (f.name, err)
     meta = json.loads((mdir / "map.json").read_text())
     assert meta["updates"][-1]["frames_added"] == res2.new_frames
+
+
+def test_noisy_multiview_poses_are_refined_and_updates_stay_consistent(tmp_path: Path) -> None:
+    """Multi-view poses off by degrees and decimetres (like MapAnything's on a turning head) are
+    refined with the matches and depth: headings within a fraction of a degree, one camera centre
+    for the head, and an anchored update that agrees with the map where it revisits it."""
+    client = FakeClient(mv_noise=(3.0, 0.15))
+    room = mapping_room()
+    first = turning(28, 0.0, 12.0)
+    add_frames(client, room, first, tmp_path / "a", "a", depth_noise=0.03, seed=4)
+    second = turning(8, 5.0, 45.0)
+    add_frames(client, room, second, tmp_path / "b", "b", depth_noise=0.03, seed=5)
+    mdir = tmp_path / "map"
+    msgs: list[str] = []
+    update(mdir, [tmp_path / "a"], client=client, progress=msgs.append)
+    update(mdir, [tmp_path / "b"], client=client, progress=msgs.append)
+    r = MapReader(mdir)
+    assert len(r.frames) == 36
+    truth = first + second
+    y0 = yaw(r.frames[0].T_map_cam)
+    for f, T in zip(r.frames, truth, strict=True):
+        err = (yaw(f.T_map_cam) - y0 - (yaw(T) - yaw(first[0])) + 180) % 360 - 180
+        assert abs(err) < 0.75, (f.name, f.update_id, err)
+    centres = np.array([f.T_map_cam.t for f in r.frames])
+    assert np.linalg.norm(centres - np.median(centres, axis=0), axis=1).max() < 0.06
+    meta = json.loads((mdir / "map.json").read_text())
+    assert meta["scale"]["method"] == "multiview_depth"
+    for u in meta["updates"]:
+        ref = u["notes"]["pose_refinement"]
+        assert ref["median_after_deg"] < ref["median_before_deg"], ref
