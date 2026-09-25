@@ -162,6 +162,20 @@ def test_fixed_keyframes_hold_and_isolated_ones_keep_their_scale() -> None:
                adjust_depth_corrections(3, meas, np.zeros(3), {0, 1, 2}).corrections)
 
 
+def test_a_scale_fixed_keyframe_keeps_its_scale_but_tilts() -> None:
+    """Keyframe 0 holds the scale; its near field (1 log unit below the pivot) is 10 % too deep
+    against keyframes 1 and 2, its far field agrees: it tilts, its scale stays."""
+    meas = [BinRatio(0, j, r, lever, lever, 1.0) for j in (1, 2)
+            for r, lever in ((0.1, -1.0), (0.0, 0.0), (-0.1, 1.0)) for _ in range(20)]
+    fixed = adjust_depth_corrections(3, meas, np.zeros(3), {0}).corrections
+    held = adjust_depth_corrections(3, meas, np.zeros(3), set(), scale_fixed={0}).corrections
+    assert fixed[0].identity and held[0].log_scale == 0.0
+    # the tilt between them is found either way; held, keyframe 0 takes its share of it
+    for c in (fixed, held):
+        assert c[0].slope - c[1].slope == pytest.approx(0.1, abs=0.03)
+    assert held[0].slope > 0.04 and abs(held[1].slope) < abs(fixed[1].slope)
+
+
 def test_depth_correction_composes_and_is_clamped() -> None:
     d = np.array([0.3, 0.7, 1.5, 3.0, 6.0, 0.0])
     a = DepthCorrection(0.05, -0.1, float(np.log(1.5)))
@@ -230,8 +244,10 @@ def test_an_update_that_closes_the_loop_re_scales_the_map_too(tmp_path: Path) ->
     note = ctx.notes["depth_scale_adjustment"]
     assert note["fixed"] == 2 and note["adjusted"] == N - 2
     assert note["pair_ratio_p90_after"] < note["pair_ratio_p90_before"]
-    # the seed and the sparse-scaled keyframe hold; the others are re-scaled, their depth too
-    assert 0 not in ctx.rescaled and 5 not in ctx.rescaled and len(ctx.rescaled) >= 10
+    # the seed and the sparse-scaled keyframe hold their scale (they may tilt); the others are
+    # re-scaled, their depth too
+    assert all(ctx.rescaled[k].log_scale == 0.0 for k in (0, 5) if k in ctx.rescaled)
+    assert len(ctx.rescaled) >= 10
     for k, c in ctx.rescaled.items():
         assert old[k].depth_scale == pytest.approx(chain[k] * c.scale)
         stored = np.load(tmp_path / frame_file(old[k].name, "depth.npy")).astype(np.float64)
@@ -255,7 +271,7 @@ def test_mapper_holds_the_seed_of_a_new_map() -> None:
     ctx = SimpleNamespace(old_frames=[], new=new, notes={}, rescaled={}, tx=None)
     api._adjust_depth_scales(ctx, lambda m: None)  # type: ignore[arg-type]
     scales = np.array([nf.record.depth_scale for nf in new])
-    assert scales[0] == 1.0 and "depth_scale_adjusted" not in new[0].record.stats
+    assert scales[0] == 1.0 and new[0].record.stats.get("depth_scale_adjusted", 1.0) == 1.0
     np.testing.assert_allclose(np.log(scales), 0.0, atol=0.012)
     for nf, d in zip(new, raw, strict=True):  # the aligned depth is the true depth again
         ok = d > 0

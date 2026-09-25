@@ -351,14 +351,16 @@ class DepthAdjustment:
 
 
 def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any], fixed: set[int],
-                             scales: tuple[float, ...] = ROBUST_SCALES, iterations: int = 10
-                             ) -> DepthAdjustment:
+                             scales: tuple[float, ...] = ROBUST_SCALES, iterations: int = 10,
+                             scale_fixed: set[int] | None = None) -> DepthAdjustment:
     """Per-keyframe corrections (log scale a, slope b about ``pivots[k]``; identity for ``k`` in
-    ``fixed``) minimising Σ w ρ(r + a_s + b_s (ℓ_s − p_s) − a_t − b_t (ℓ_t − p_t)) over the
-    ``bins`` (r their log ratio, ℓ their log depths in the source and target keyframes), with the
-    Cauchy loss ρ at each robust scale of ``scales`` in turn (iteratively reweighted least
-    squares; ``inf``: plain least squares), a tiny ridge on a and the prior b = 0 weighing
-    ``SLOPE_PRIOR`` average bins; slopes are clamped to ±``MAX_SLOPE``."""
+    ``fixed``, a = 0 for ``k`` in ``scale_fixed``: its scale holds, its tilt is solved)
+    minimising Σ w ρ(r + a_s + b_s (ℓ_s − p_s) − a_t − b_t (ℓ_t − p_t)) over the ``bins`` (r their
+    log ratio, ℓ their log depths in the source and target keyframes), with the Cauchy loss ρ at
+    each robust scale of ``scales`` in turn (iteratively reweighted least squares; ``inf``: plain
+    least squares), a tiny ridge on a and the prior b = 0 weighing ``SLOPE_PRIOR`` average bins
+    (which also holds the one tilt the pairs cannot see: the same tilt of every keyframe); slopes
+    are clamped to ±``MAX_SLOPE``."""
     from scipy.sparse import csr_matrix
 
     ident = [DepthCorrection(0.0, 0.0, float(pivots[k])) for k in range(n)]
@@ -371,24 +373,26 @@ def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any],
     piv = np.asarray(pivots, np.float64)
     ls = np.array([b.log_src for b in bins], np.float64) - piv[src]
     lt = np.array([b.log_dst for b in bins], np.float64) - piv[dst]
-    free = [k for k in range(n) if k not in fixed]
-    if not free:
+    tilted = [k for k in range(n) if k not in fixed]
+    scaled = [k for k in tilted if k not in (scale_fixed or set())]
+    if not tilted:
         return DepthAdjustment(ident, np.abs(r), np.abs(r))
-    col = np.full(n, -1, np.int64)
-    col[free] = np.arange(len(free))
-    nf = len(free)
+    col_a = np.full(n, -1, np.int64)
+    col_a[scaled] = np.arange(len(scaled))
+    col_b = np.full(n, -1, np.int64)
+    col_b[tilted] = len(scaled) + np.arange(len(tilted))
+    nx = len(scaled) + len(tilted)
     rows, cols, vals = [], [], []
-    for k, (cc, coef) in enumerate(((col[src], 1.0), (col[dst], -1.0))):
-        lever = ls if k == 0 else lt
-        ok = cc >= 0
-        idx = np.flatnonzero(ok)
-        rows += [idx, idx]
-        cols += [cc[ok], nf + cc[ok]]
-        vals += [np.full(len(idx), coef), coef * lever[ok]]
+    for ends, coef, lever in ((src, 1.0, ls), (dst, -1.0, lt)):
+        for col, v in ((col_a[ends], np.full(len(ends), coef)), (col_b[ends], coef * lever)):
+            ok = col >= 0
+            rows.append(np.flatnonzero(ok))
+            cols.append(col[ok])
+            vals.append(v[ok])
     A = csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                   shape=(len(bins), 2 * nf))
-    reg = np.r_[np.full(nf, RIDGE), np.full(nf, SLOPE_PRIOR)] * float(wts.mean())
-    x = np.zeros(2 * nf)
+                   shape=(len(bins), nx))
+    reg = np.r_[np.full(len(scaled), RIDGE), np.full(len(tilted), SLOPE_PRIOR)] * float(wts.mean())
+    x = np.zeros(nx)
     for c in scales:
         for _ in range(iterations):
             res = r + A @ x
@@ -400,10 +404,11 @@ def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any],
             x = x_new
             if done or not np.isfinite(c):
                 break
-    x[nf:] = np.clip(x[nf:], -MAX_SLOPE, MAX_SLOPE)
+    x[len(scaled):] = np.clip(x[len(scaled):], -MAX_SLOPE, MAX_SLOPE)
     out = list(ident)
-    for k in free:
-        out[k] = DepthCorrection(float(x[col[k]]), float(x[nf + col[k]]), float(piv[k]))
+    for k in tilted:
+        a = float(x[col_a[k]]) if col_a[k] >= 0 else 0.0
+        out[k] = DepthCorrection(a, float(x[col_b[k]]), float(piv[k]))
     return DepthAdjustment(out, np.abs(r), np.abs(r + A @ x))
 
 

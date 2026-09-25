@@ -713,7 +713,8 @@ class _ScaleNode:
     name: str
     T: Pose
     load: Callable[[], Any]  # -> reconstruction.depth.DepthView of its aligned, valid depth
-    free: bool  # adjusted (else it holds the gauge: sparse-scaled, or the map's seed)
+    free: bool  # its scale is adjusted (else it holds the gauge: sparse-scaled, or the seed);
+    # its tilt always is
     low: bool  # low confidence: adjusted after the others, without pulling on them
     nf: NewFrame | None = None
     rec: store.FrameRecord | None = None
@@ -736,8 +737,8 @@ def _anchored(stats: dict[str, Any]) -> bool:
 
 
 def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
-    """The map's confident keyframes (loaded lazily) and this update's placed ones, free unless
-    their scale is anchored (``_anchored``)."""
+    """The map's confident keyframes (loaded lazily) and this update's placed ones, their scale
+    free unless it is anchored (``_anchored``)."""
     nodes: list[_ScaleNode] = []
     for f in ctx.old_frames:
         if f.low_confidence:
@@ -765,7 +766,7 @@ def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
 
 
 def _scale_pairs(nodes: list[_ScaleNode], scene_depth: float) -> list[tuple[int, int]]:
-    """Candidate pairs: each free keyframe with its ``SCALE_PAIR_NEIGHBOURS`` nearest keyframes
+    """Candidate pairs: each keyframe with its ``SCALE_PAIR_NEIGHBOURS`` nearest keyframes
     by viewpoint (camera distance over the scene depth plus 1 − cos of the angle between the
     optical axes) whose optical axes differ by less than ``SCALE_PAIR_MAX_ANGLE_DEG`` — sequence
     neighbours and loop closures alike, whatever their place in the sequence (the cap matters for
@@ -776,9 +777,7 @@ def _scale_pairs(nodes: list[_ScaleNode], scene_depth: float) -> list[tuple[int,
     dist = np.linalg.norm(C[:, None] - C[None], axis=2) / max(0.5, scene_depth) + (1.0 - cos)
     near = cos > np.cos(np.radians(SCALE_PAIR_MAX_ANGLE_DEG))
     out: set[tuple[int, int]] = set()
-    for i, n in enumerate(nodes):
-        if not n.free:
-            continue
+    for i in range(len(nodes)):
         cand = [j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
         out.update((min(i, j), max(i, j)) for j in cand[:SCALE_PAIR_NEIGHBOURS])
     return sorted(out)
@@ -794,10 +793,12 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     every pair of overlapping keyframes (``_scale_pairs``) measures the ratio of their depths on
     the surfaces both see, in bins of depth (``reconstruction.depth.pair_bins``), and one
     correction per keyframe — a scale and a near/far tilt about its median depth — is solved from
-    all of them at once (``adjust_depth_corrections``: robust least squares), sparse-scaled
-    keyframes and the map's seed fixed (they hold the metric scale). Low-confidence keyframes are
-    adjusted afterwards, to the others, so they never pull on them. Two rounds: the second
-    re-measures the pairs at the corrected depths.
+    all of them at once (``adjust_depth_corrections``: robust least squares). Sparse-scaled
+    keyframes and the map's seed keep their scale (they hold the metric scale) but are tilted like
+    the others: their near/far error is no more known than anyone's, and a seed held untilted
+    left the same-heading pair 001/053 of ``ainex-captures`` 1.7 % apart instead of 0.5 %.
+    Low-confidence keyframes are adjusted afterwards, to the others, so they never pull on them.
+    Two rounds: the second re-measures the pairs at the corrected depths.
 
     The map's stored keyframes take part like this update's: where a later update closes a loop,
     the correction is spread over the whole loop as it would have been had the sequence come in
@@ -807,7 +808,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     from oh_my_slam.reconstruction.depth import adjust_depth_corrections, pair_bins
 
     nodes = _scale_nodes(ctx)
-    if not any(n.free for n in nodes) or len(nodes) < 2:
+    if len(nodes) < 2:
         return
     depths = [float(np.median(n.nf.depth[n.nf.depth > 0])) for n in nodes
               if n.nf is not None and n.nf.depth is not None and (n.nf.depth > 0).any()]
@@ -827,23 +828,26 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
         measured = len({(min(b.src, b.dst), max(b.src, b.dst)) for b in meas})
         # confident keyframes first; then the low-confidence ones, to them
         for low in (False, True):
-            active = {k for k, n in enumerate(nodes) if n.free and n.low == low}
+            active = {k for k, n in enumerate(nodes) if n.low == low}
             if not active:
                 continue
             use = {k for k, n in enumerate(nodes) if not n.low or k in active}
             sub = [b for b in meas if b.src in use and b.dst in use
                    and (b.src in active or b.dst in active)]
-            adj = adjust_depth_corrections(len(nodes), sub, pivots,
-                                           set(range(len(nodes))) - active)
+            adj = adjust_depth_corrections(
+                len(nodes), sub, pivots, set(range(len(nodes))) - active,
+                scale_fixed={k for k in active if not nodes[k].free})
             for k in active:
-                corr[k] = corr[k].then(adj.corrections[k])
+                c = corr[k].then(adj.corrections[k])
+                # a held scale stays exactly held (composing about shifted pivots rounds it)
+                corr[k] = c if nodes[k].free else DepthCorrection(0.0, c.slope, c.pivot)
             if not low:
                 if rnd == 0:
                     first = adj.residuals_before.tolist()
                 last = adj.residuals_after.tolist()
     for k, n in enumerate(nodes):
         c = corr[k]
-        if not n.free or c.identity:
+        if c.identity:
             continue
         if n.nf is not None and n.nf.record is not None and n.nf.depth is not None:
             rec = n.nf.record
@@ -864,7 +868,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
             ctx.rescaled[rec.index] = c
     free = [k for k, n in enumerate(nodes) if n.free]
     scale_dev = np.abs([corr[k].scale - 1.0 for k in free])
-    exps = [corr[k].exponent for k in free]
+    exps = [c.exponent for c in corr]
     largest = float(scale_dev.max()) if len(scale_dev) else 0.0
     summary: dict[str, Any] = {
         "pairs": measured, "adjusted": len(free), "fixed": len(nodes) - len(free),
