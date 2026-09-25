@@ -232,12 +232,19 @@ def color_hex_for_id(object_id: int) -> str:
     return rgb_to_hex(color_for_id(object_id))
 
 
+SEGMENT_CHUNK = 1 << 18  # labels coloured per step: a map's temporaries stay a few MB
+
+
 def segment_colors(labels: NDArray[Any]) -> NDArray[np.uint8]:
     """Per-point object colour for object ids (``UNSEGMENTED`` grey for 0)."""
-    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
-    ids, inverse = np.unique(lab, return_inverse=True)
-    table = np.array([UNSEGMENTED if i <= 0 else color_for_id(int(i)) for i in ids], np.uint8)
-    return table.reshape(-1, 3)[inverse.reshape(-1)]
+    lab = np.asarray(labels).reshape(-1)
+    out = np.empty((len(lab), 3), np.uint8)
+    for s in range(0, len(lab), SEGMENT_CHUNK):
+        ids, inverse = np.unique(np.asarray(lab[s:s + SEGMENT_CHUNK], dtype=np.int64),
+                                 return_inverse=True)
+        table = np.array([UNSEGMENTED if i <= 0 else color_for_id(int(i)) for i in ids], np.uint8)
+        out[s:s + SEGMENT_CHUNK] = table.reshape(-1, 3)[inverse.reshape(-1)]
+    return out
 
 
 # viridis sampled at 0, 0.1, ..., 1 (matplotlib), linearly interpolated

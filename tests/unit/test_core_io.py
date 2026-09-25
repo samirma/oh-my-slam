@@ -104,6 +104,39 @@ def test_ply_empty_cloud_both_encodings() -> None:
         assert len(back) == 0 and back.rgb is not None and back.label is None
 
 
+@pytest.mark.parametrize(("rgb", "label", "normals"),
+                         [(True, True, True), (False, False, False), (True, False, False)])
+def test_read_ply_reads_a_binary_body_in_chunks(tmp_path: Path, rng: np.random.Generator,
+                                                monkeypatch: pytest.MonkeyPatch, rgb: bool,
+                                                label: bool, normals: bool) -> None:
+    """``read_ply`` streams a binary body into the cloud's arrays (a large map cloud is never
+    held twice); the values are exactly those of ``parse_ply``, chunk boundaries included."""
+    import oh_my_slam.core.ply as ply
+
+    monkeypatch.setattr(ply, "READ_CHUNK_BYTES", 100)  # a few vertices per chunk
+    cloud = _cloud(rng, 57, rgb=rgb, label=label, normals=normals)
+    long_header = [f"comment line {i:05d} " + "x" * 60 for i in range(1500)]  # > one header read
+    for enc, comments in (("binary", ["c"]), ("binary", long_header), ("ascii", ["c"])):
+        data = ply_bytes(cloud, encoding=enc, comments=comments)
+        (tmp_path / "c.ply").write_bytes(data)
+        back, ref = read_ply(tmp_path / "c.ply"), parse_ply(data)
+        for a, b in ((back.xyz, ref.xyz), (back.rgb, ref.rgb), (back.label, ref.label),
+                     (back.normals, ref.normals)):
+            assert (a is None) == (b is None)
+            if a is not None:
+                assert a.dtype == b.dtype
+                np.testing.assert_array_equal(a, b)
+    empty = ply_bytes(PointCloud(np.zeros((0, 3)), np.zeros((0, 3))))
+    (tmp_path / "e.ply").write_bytes(empty)
+    assert len(read_ply(tmp_path / "e.ply")) == 0
+    (tmp_path / "t.ply").write_bytes(ply_bytes(cloud)[:-5])
+    with pytest.raises(ValueError, match="shorter than its 57 vertices"):
+        read_ply(tmp_path / "t.ply")
+    (tmp_path / "n.ply").write_bytes(b"not a ply")
+    with pytest.raises(ValueError, match="not a PLY file"):
+        read_ply(tmp_path / "n.ply")
+
+
 def test_pointcloud_subset() -> None:
     c = PointCloud(np.zeros((5, 3)), np.zeros((5, 3)), np.array([1, 2, 3, 4, 5]),
                    np.arange(15).reshape(5, 3))

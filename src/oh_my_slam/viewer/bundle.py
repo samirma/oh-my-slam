@@ -70,6 +70,17 @@ class DisplayCloud:
     total: int  # points of the derived cloud before display thinning
     step: int  # display thinning: every ``step``-th point (1 = none)
     seconds: float  # derivation time
+    owned_bytes: int | None = None  # memory of its arrays not shared with the source (None: all)
+
+
+def owned_bytes(cloud: PointCloud, source: CloudSource) -> int:
+    """Bytes of ``cloud``'s arrays that are not views of ``source``'s arrays: what keeping the
+    cloud costs beyond the source (a map cloud with every point shares positions, colours and
+    labels with its source, see ``derive_thinned``)."""
+    shared = [a for a in (getattr(source, n, None) for n in ("xyz", "rgb", "labels"))
+              if isinstance(a, np.ndarray)]
+    return sum(a.nbytes for a in (cloud.xyz, cloud.rgb, cloud.label, cloud.normals)
+               if a is not None and not any(np.may_share_memory(a, s) for s in shared))
 
 
 @dataclass
@@ -158,7 +169,8 @@ class ViewBundle:
             thin = derive_thinned(self.source, replace(attrs, label=self.source.labels is not None),
                                   MAX_DISPLAY_POINTS)
             seconds = time.perf_counter() - t0
-        return DisplayCloud(thin.cloud, thin.total, thin.step, seconds)
+        return DisplayCloud(thin.cloud, thin.total, thin.step, seconds,
+                            owned_bytes(thin.cloud, self.source))
 
     def meta(self) -> Json:
         return {

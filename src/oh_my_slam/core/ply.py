@@ -174,5 +174,45 @@ def parse_ply(data: bytes) -> PointCloud:
                       stack("nx", "ny", "nz"))
 
 
+READ_CHUNK_BYTES = 1 << 22  # binary PLY body read per step (``read_ply``)
+_HEADER_READ = 1 << 16
+_HEADER_MAX = 1 << 24
+
+
 def read_ply(path: Path) -> PointCloud:
-    return parse_ply(Path(path).read_bytes())
+    """``parse_ply`` of a file. A binary body is read in chunks of ``READ_CHUNK_BYTES`` straight
+    into the cloud's arrays, so the file is never held in memory as a whole (a large map cloud
+    would otherwise need its size again on top of the cloud)."""
+    with Path(path).open("rb") as f:
+        head = b""
+        while b"end_header\n" not in head:
+            more = f.read(_HEADER_READ)
+            if not more or len(head) > _HEADER_MAX:
+                break
+            head += more
+        h = parse_header(head)
+        if h.encoding != "binary":
+            return parse_ply(head + f.read())
+        dtype = np.dtype(h.fields)
+        names = set(dtype.names or ())
+        if not {"x", "y", "z"} <= names:
+            raise ValueError("PLY vertices have no x y z")
+        groups = [(cols, np.empty((h.count, 3), np_t)) for cols, np_t in (
+            (("x", "y", "z"), np.float32), (("red", "green", "blue"), np.uint8),
+            (("nx", "ny", "nz"), np.float32)) if set(cols) <= names]
+        label = np.empty(h.count, np.int32) if "label" in names else None
+        step = max(1, READ_CHUNK_BYTES // dtype.itemsize)
+        buf = np.empty(min(step, h.count), dtype)
+        f.seek(h.body_offset)
+        for start in range(0, h.count, step):
+            part = buf[:min(step, h.count - start)]
+            if f.readinto(part.view(np.uint8)) != part.nbytes:
+                raise ValueError(f"PLY body is shorter than its {h.count} vertices")
+            rows = slice(start, start + len(part))
+            for cols, out in groups:
+                for i, c in enumerate(cols):
+                    out[rows, i] = part[c]
+            if label is not None:
+                label[rows] = part["label"]
+    arrays = {cols[0]: out for cols, out in groups}
+    return PointCloud(arrays["x"], arrays.get("red"), label, arrays.get("nx"))

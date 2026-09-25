@@ -278,3 +278,34 @@ def test_derive_thinned_is_a_subset_of_derive_cloud(room_map: MapCloudSource) ->
             np.testing.assert_array_equal(getattr(t.cloud, name), getattr(full, name)[sel])
     t = derive_thinned(room_map, CloudAttrs(), None)
     assert (t.total, t.step, len(t.cloud)) == (len(room_map.xyz), 1, len(room_map.xyz))
+
+
+def test_complete_map_cloud_shares_the_source_arrays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A map cloud with every point costs no copy of the map: positions, colours and labels are
+    read-only views of the source's arrays; any selection of points copies (and colours are
+    derived per chunk with exactly the values of a single pass)."""
+    import oh_my_slam.segmentation.cloud as sc
+    import oh_my_slam.segmentation.colors as colors
+
+    monkeypatch.setattr(sc, "CHUNK_POINTS", 7)
+    monkeypatch.setattr(colors, "SEGMENT_CHUNK", 5)
+    rng = np.random.default_rng(2)
+    xyz = rng.normal(size=(40, 3)).astype(np.float32)
+    rgb = rng.integers(0, 256, (40, 3)).astype(np.uint8)
+    given = rng.integers(0, 6, 40)
+    src = map_cloud_source(xyz, rgb, given, {2, 5}, np.zeros((1, 3)))
+    assert src.labels is not None
+    assert src.labels.tolist() == np.where(np.isin(given, [2, 5]), given, 0).tolist()
+    cloud = derive_cloud(src, CloudAttrs(label=True))
+    assert cloud.rgb is not None and cloud.label is not None
+    for mine, theirs in ((cloud.xyz, xyz), (cloud.rgb, rgb), (cloud.label, src.labels)):
+        assert np.shares_memory(mine, theirs) and not mine.flags.writeable
+    assert xyz.flags.writeable and rgb.flags.writeable  # the caller's arrays are untouched
+    seg = derive_cloud(src, CloudAttrs(color="segment", label=True))
+    assert seg.rgb is not None and not np.shares_memory(seg.rgb, rgb)
+    expected = [UNSEGMENTED if i == 0 else color_for_id(int(i)) for i in src.labels]
+    assert [tuple(c) for c in seg.rgb] == expected
+    thin = derive_cloud(src, CloudAttrs(voxel=0.5, label=True))
+    assert not np.shares_memory(thin.xyz, xyz) and thin.xyz.flags.writeable
+    h = derive_cloud(src, CloudAttrs(color="height"))
+    np.testing.assert_array_equal(h.rgb, height_colors(xyz[:, 2].astype(np.float64)))

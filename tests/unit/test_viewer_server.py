@@ -17,7 +17,7 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.cloud import derive_cloud, map_cloud_source
 from oh_my_slam.viewer.bundle import ViewBundle, scene_cameras, upright_transform
-from oh_my_slam.viewer.server import parse_cloud_payload
+from oh_my_slam.viewer.server import cloud_document, cloud_payload, parse_cloud_payload
 from tests.browser.scenes import running
 
 RGB = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], np.uint8)
@@ -86,6 +86,26 @@ def test_cloud_document(server: str) -> None:
     assert set(arrays) == {"position", "label", "normal"}
     assert head["attrs"] == "color=none,voxel=0,normals=on"
     np.testing.assert_allclose(np.linalg.norm(arrays["normal"], axis=1), 1.0, atol=1e-5)
+
+
+def test_cloud_is_sent_from_the_cloud_arrays(server: str) -> None:
+    """The response is the document of :func:`cloud_payload`, sent piece by piece from the
+    cloud's arrays; a complete map cloud shares them with the source, so it costs nothing."""
+    bundle = small_map()
+    for attrs, owned in ((CloudAttrs(), 0), (CloudAttrs(color="segment"), 12)):
+        dc = bundle.cloud(attrs)
+        assert dc.owned_bytes == owned  # segment: its own colours (4 points x 3 bytes)
+        doc = cloud_document(dc, bundle.describe(attrs))
+        body = doc.tobytes()
+        assert body == cloud_payload(dc, bundle.describe(attrs)) and doc.size == len(body)
+        assert doc.owned_bytes == owned
+        assert not any(isinstance(p, memoryview) and not p.readonly for p in doc.pieces)
+    served = get(server + "api/cloud?color=segment")[2]
+    head = urllib.request.urlopen(urllib.request.Request(server + "api/cloud?color=segment",
+                                                         method="HEAD"))
+    assert int(head.headers["Content-Length"]) == len(served)
+    _, arrays = parse_cloud_payload(served)
+    np.testing.assert_array_equal(arrays["position"].ravel(), np.arange(12))
 
 
 @pytest.mark.parametrize(("query", "message"), [

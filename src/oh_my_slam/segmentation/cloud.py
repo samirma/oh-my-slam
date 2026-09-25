@@ -14,6 +14,11 @@ map's from the k nearest neighbours in the whole map (``PointNormals``, kept per
 point's normal is the same whatever ``voxel`` says, and their cost follows the emitted points.
 ``derive_thinned`` also keeps every ``step``-th point of a cloud larger than a display budget
 (the viewer) before the normals, with every other value exactly that of ``derive_cloud``.
+
+Memory: a map cloud can hold ten million points, so a derivation copies nothing it does not have
+to. Positions stay in the source's dtype (float64 only where arithmetic needs it: ``voxel``,
+``color=height``), and when no point is dropped the cloud shares the source's position, colour
+and label arrays through read-only views instead of copying them.
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ if TYPE_CHECKING:
     from oh_my_slam.reconstruction.api import FrameReconstruction
     from oh_my_slam.segmentation.api import FrameSegmentation
 
+# element-wise passes over a whole map cloud work on this many points at a time (small temporaries)
+CHUNK_POINTS = 1 << 18
 IMAGE_FRAME = "oh-my-slam camera frame (OpenCV axes: x right, y down, z forward), metres"
 MAP_FRAME = "oh-my-slam map frame (z up), metres"
 
@@ -101,8 +108,11 @@ def map_cloud_source(xyz: NDArray[Any], rgb: NDArray[np.uint8], labels: NDArray[
     """Source of a map cloud; point labels of objects not in ``object_ids`` become 0."""
     lab = None
     if labels is not None:
-        lab = np.asarray(labels, np.int32).reshape(-1)
-        lab = np.where(np.isin(lab, sorted(object_ids)), lab, 0).astype(np.int32)
+        given, ids = np.asarray(labels, np.int32).reshape(-1), sorted(object_ids)
+        lab = np.empty(len(given), np.int32)
+        for s in range(0, len(given), CHUNK_POINTS):  # temporaries of one chunk only
+            part = given[s:s + CHUNK_POINTS]
+            lab[s:s + CHUNK_POINTS] = np.where(np.isin(part, ids), part, 0)
     return MapCloudSource(np.asarray(xyz), np.asarray(rgb, np.uint8), lab,
                           np.asarray(viewpoints, np.float64).reshape(-1, 3))
 
@@ -129,7 +139,10 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     height ramp's range included); normals are computed for the kept points only."""
     if (attrs.color == "segment" or attrs.label) and source.labels is None:
         raise ValueError("color=segment and label=on need a segmented source")
-    # xyz[i] is the point of source row rows[i] (a flat pixel index, or a map point index)
+    # xyz[i] is the point of source row rows[i] (a flat pixel index, or a map point index);
+    # rows None: every map point in storage order, whose arrays the cloud then shares (read-only)
+    # with the source instead of copying them
+    rows: NDArray[np.int64] | None
     if isinstance(source, ImageCloudSource):
         if attrs.color == "height" and source.up is None:
             raise ValueError("color=height needs the image's estimated gravity")
@@ -137,37 +150,50 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
         xyz, rows = pixel_points(source.depth, source.K, mask)
         rgb, labels = source.rgb.reshape(-1, 3), source.labels
     else:
-        xyz = np.asarray(source.xyz, np.float64).reshape(-1, 3)
-        rows = np.arange(len(xyz))
+        xyz, rows = _readonly(np.asarray(source.xyz).reshape(-1, 3)), None
         rgb, labels = source.rgb, source.labels
     if attrs.voxel > 0:
         keep = voxel_downsample_indices(xyz, attrs.voxel, keep="first")
-        xyz, rows = xyz[keep], rows[keep]
-    lab = None if labels is None else labels.reshape(-1)[rows]
+        xyz, rows = xyz[keep], keep if rows is None else rows[keep]
+
+    def pick(a: NDArray[Any]) -> NDArray[Any]:
+        return _readonly(a) if rows is None else a[rows]
+
+    lab = None if labels is None else pick(labels.reshape(-1))
     colour: NDArray[np.uint8] | None
     if attrs.color == "rgb":
-        colour = rgb[rows]
+        colour = pick(rgb)
     elif attrs.color == "segment":
         assert lab is not None
         colour = segment_colors(lab)
     elif attrs.color == "height":
         up = source.up if isinstance(source, ImageCloudSource) else np.array([0.0, 0.0, 1.0])
-        colour = height_colors(xyz @ np.asarray(up, np.float64))
+        colour = height_colors(np.asarray(xyz, np.float64) @ np.asarray(up, np.float64))
     else:
         colour = None
-    total = len(rows)
+    total = len(xyz)
     step = 1 if max_points is None or total <= max_points else math.ceil(total / max_points)
-    if step > 1:
-        sel = np.arange(0, total, step)
-        xyz, rows = xyz[sel], rows[sel]
-        lab = None if lab is None else lab[sel]
-        colour = None if colour is None else colour[sel]
+    if step > 1:  # strided views; PointCloud makes them contiguous
+        xyz = xyz[::step]
+        rows = np.arange(0, total, step) if rows is None else rows[::step]
+        lab = None if lab is None else lab[::step]
+        colour = None if colour is None else colour[::step]
     normals: NDArray[np.float32] | None = None
     if attrs.normals:
-        normals = (source.normals.reshape(-1, 3)[rows] if isinstance(source, ImageCloudSource)
-                   else source.normals.at(rows))
-    cloud = PointCloud(xyz.astype(np.float32), colour, lab if attrs.label else None, normals)
+        if isinstance(source, ImageCloudSource):
+            assert rows is not None
+            normals = source.normals.reshape(-1, 3)[rows]
+        else:
+            normals = source.normals.at(np.arange(total) if rows is None else rows)
+    cloud = PointCloud(xyz, colour, lab if attrs.label else None, normals)
     return ThinnedCloud(cloud, total, step)
+
+
+def _readonly(a: NDArray[Any]) -> NDArray[Any]:
+    """A view of ``a`` that cannot write into it (a derived cloud sharing its source's array)."""
+    v = a.view()
+    v.flags.writeable = False
+    return v
 
 
 def cloud_ply(source: CloudSource, attrs: CloudAttrs) -> bytes:

@@ -118,7 +118,7 @@ def map_cloud(reader: store.MapReader) -> PointCloud:
         return PointCloud(np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0))
     cloud = read_ply(reader.path(store.CLOUD_PLY))
     lp = reader.path(store.CLOUD_OBJECTS)
-    labels = np.load(lp).astype(np.int32) if lp.exists() else np.zeros(len(cloud), np.int32)
+    labels = np.asarray(np.load(lp), np.int32) if lp.exists() else np.zeros(len(cloud), np.int32)
     return PointCloud(cloud.xyz, cloud.rgb, labels)
 
 
