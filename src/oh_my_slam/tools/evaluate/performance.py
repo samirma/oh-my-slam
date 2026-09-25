@@ -1,6 +1,7 @@
 """Performance metrics per group of runs: end-to-end wall time (or, for ``view.sh``, the time
-until the page has rendered), the command's peak resident set and the server's peak footprint;
-per-stage times (``OH_MY_SLAM_TIMINGS``) are kept in the metric detail."""
+until the page has rendered), the command's peak resident set and the server's peak footprint.
+Per stage (``OH_MY_SLAM_TIMINGS`` + ``memory.stage_peaks``) the time metric's detail keeps
+``stages``: the median seconds over the group's runs and the peak client / server memory."""
 
 from __future__ import annotations
 
@@ -37,13 +38,21 @@ def _seconds(rec: RunRecord, what: str) -> float | None:
     return rec.wall_s if what == "wall_s" else rec.notes.get("render_s")
 
 
-def _stages(recs: list[RunRecord]) -> dict[str, float]:
-    """Median over the runs of each stage's seconds."""
-    per: dict[str, list[float]] = {}
+def _peak(values: list[float | None]) -> float | None:
+    known = [v for v in values if v is not None]
+    return max(known) if known else None
+
+
+def _stages(recs: list[RunRecord]) -> dict[str, dict[str, float | None]]:
+    """Per stage over the runs: median seconds, peak client MB and peak server GB."""
+    per: dict[str, list[dict[str, float | None]]] = {}
     for r in recs:
-        for k, v in ((r.timings or {}).get("stages_s") or {}).items():
-            per.setdefault(k, []).append(float(v))
-    return {k: round(float(np.median(v)), 3) for k, v in per.items()}
+        for k, v in (r.stages or {}).items():
+            per.setdefault(k, []).append(v)
+    return {k: {"s": round(float(np.median([float(x["s"] or 0.0) for x in v])), 3),
+                "client_peak_mb": _peak([x.get("client_peak_mb") for x in v]),
+                "server_peak_gb": _peak([x.get("server_peak_gb") for x in v])}
+            for k, v in per.items()}
 
 
 def perf_metrics(m: Metrics, records: list[RunRecord]) -> None:
@@ -58,10 +67,10 @@ def perf_metrics(m: Metrics, records: list[RunRecord]) -> None:
         secs = [_seconds(r, what) for r in recs]
         timed = [s for s in secs if s is not None]
         detail: dict[str, Any] = {"runs": len(recs), "failed": [r.tag for r in recs if not r.ok],
-                                  "stages_s": _stages(ok)}
+                                  "stages": _stages(ok)}
         if len(recs) <= PER_RUN_DETAIL_MAX:
             detail["per_run"] = {r.tag: {what: None if s is None else round(s, 3),
-                                         "stages_s": (r.timings or {}).get("stages_s")}
+                                         "stages": r.stages}
                                  for r, s in zip(recs, secs, strict=True)}
         else:
             detail[f"max_{what}"] = round(max(timed), 3) if timed else None

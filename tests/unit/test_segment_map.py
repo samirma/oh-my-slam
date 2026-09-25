@@ -48,6 +48,11 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
     assert res.returncode == 0, res.stderr.decode()
     doc = json.loads(res.stdout)
     assert validation_errors(doc) == [] and len(doc["openlabel"]["objects"]) == 3
+    assert doc["openlabel"]["metadata"]["tool"] == "segment"  # not the mapper that stored it
+    stored = store.MapReader(one_image_map).read_json(store.SCENE_JSON)
+    assert stored["openlabel"]["metadata"]["tool"] == "mapper"
+    assert doc["openlabel"]["objects"] == stored["openlabel"]["objects"]
+    assert b"timings: total" in res.stderr  # per-stage timings, as for -i
     art = tmp_path / "art"
     ply = segment("-m", str(one_image_map), "-f", "ply", "-d", str(art), "-p",
                   "label=on,voxel=0.02,normals=on")

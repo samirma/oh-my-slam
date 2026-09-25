@@ -120,10 +120,15 @@ def main(argv: list[str]) -> int:
     if on_map:
         from oh_my_slam.mapping.export import map_segment_outputs
 
-        scene, ply = map_segment_outputs(args.map, args.artifacts, attrs,
-                                         want_ply=args.format == "ply")
-        out.write_bytes(_result(args.format, scene, ply))
+        with timing.collect() as tm:
+            with timing.stage("export"):
+                scene, ply = map_segment_outputs(args.map, args.artifacts, attrs,
+                                                 want_ply=args.format == "ply")
+            with timing.stage("write"):
+                out.write_bytes(_result(args.format, scene, ply))
         log.info("done in %.2f s", time.perf_counter() - t0)
+        timing.report(tm, log, command="segment.sh -m", format=args.format, map=str(args.map),
+                      artifacts=args.artifacts is not None)
         return 0
     with timing.collect() as tm:
         scene, ply = _segment_image(args, attrs, min_score)

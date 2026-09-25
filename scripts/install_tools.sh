@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Checks the external tool oh-my-slam uses outside Python:
-#   * Homebrew COLMAP 4.2.x (ALIKED/LightGlue feature extraction + matching through ONNX/CoreML)
+#   * Homebrew COLMAP 4.2.x: mapper.sh runs feature extraction and matching through its CLI —
+#     SIFT by default; ALIKED/LightGlue with OH_MY_SLAM_FEATURES=aliked, which needs this build's
+#     ONNX Runtime (CoreML) that the PyPI pycolmap wheel lacks. pycolmap in .venv (same 4.2.x)
+#     does the mapping itself.
 set -euo pipefail
 
 say() { echo "install_tools: $*" >&2; }

@@ -11,14 +11,15 @@ import pytest
 
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.tools.evaluate import groundtruth as gt
-from oh_my_slam.tools.evaluate.__main__ import load_baseline, main
+from oh_my_slam.tools.evaluate.__main__ import latest_run, load_baseline, main
 from oh_my_slam.tools.evaluate.metrics import (
     Metrics,
     TargetsError,
     baseline_values,
     load_targets,
 )
-from oh_my_slam.tools.evaluate.report import build_result, write_report
+from oh_my_slam.tools.evaluate.performance import perf_metrics
+from oh_my_slam.tools.evaluate.report import build_result, summary_md, write_report
 from oh_my_slam.tools.evaluate.runner import RunRecord, RunSpec
 from oh_my_slam.tools.evaluate.scene import DocObject
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, expected_ids
@@ -99,6 +100,15 @@ def test_regressions_against_a_stored_baseline(tmp_path: Path) -> None:
     assert m.items["perf.a.wall_s"].passed  # a regression still within target passes
     m = judged(tmp_path, {"perf.a.wall_s": 1.0, "pose.b.fraction": 1.0}, base)  # improvements
     assert not any(x.regression for x in m.items.values())
+
+
+def test_renamed_metrics_of_stored_runs_keep_their_history() -> None:
+    old = {"metrics": [{"id": "seg.map.recall", "value": 0.99, "detail": None, "error": None},
+                       {"id": "seg.map.precision", "value": 0.88}]}
+    assert baseline_values(old) == {"seg.map_consistency.map_objects_detected": 0.99,
+                                    "seg.map_consistency.detections_in_map": 0.88}
+    assert set(Metrics.from_result(old).items) == {"seg.map_consistency.map_objects_detected",
+                                                   "seg.map_consistency.detections_in_map"}
 
 
 def test_missing_or_broken_baseline_is_reported(tmp_path: Path) -> None:
@@ -184,13 +194,22 @@ def test_no_ground_truth_adds_no_metrics() -> None:
 # -- report --------------------------------------------------------------------------------------------
 
 
-def record(tmp_path: Path, tag: str, code: int, stderr: str) -> RunRecord:
+def record(tmp_path: Path, tag: str, code: int, stderr: str, group: str = "reconstruct_json",
+           stages: dict | None = None) -> RunRecord:
     out, err = tmp_path / f"{tag}.stdout", tmp_path / f"{tag}.stderr.txt"
     out.write_bytes(b"")
     err.write_text(stderr)
-    return RunRecord(RunSpec(tag, "reconstruct_json", "reconstruct.sh", ("-i", "x.jpg")),
+    return RunRecord(RunSpec(tag, group, "reconstruct.sh", ("-i", "x.jpg")),
                      ["reconstruct.sh", "-i", "x.jpg"], code, 1.25, 812.0, 11.2, out, err, stderr,
-                     {"stages_s": {"inference": 0.9, "export": 0.1}})
+                     {"stages_s": {"inference": 0.9, "export": 0.1}}, stages=stages)
+
+
+def result_of(m: Metrics, runs: list[RunRecord], baseline: dict,
+              details: dict | None = None) -> dict:
+    return build_result(m, runs, details or {}, started="2026-09-24T10:00:00+00:00",
+                        finished="2026-09-24T10:30:00+00:00", duration_s=1800.0,
+                        env={"commit": "abc", "dirty": False}, targets=Path("targets.json"),
+                        baseline=baseline)
 
 
 def test_result_and_summary_are_written(tmp_path: Path) -> None:
@@ -198,28 +217,102 @@ def test_result_and_summary_are_written(tmp_path: Path) -> None:
                {"perf.a.wall_s": 2.0})
     runs = [record(tmp_path, "reconstruct_json", 0, "timings: total 1.2 s"),
             record(tmp_path, "segment_image", 3, "segment.sh: error: server down\nhint: start it")]
-    result = build_result(m, runs, {"poses.single": [{"capture": "001.jpg",
-                                                      "commanded_yaw_deg": 0.0,
-                                                      "registered": False}]},
-                          started="2026-09-24T10:00:00+00:00", finished="2026-09-24T10:30:00+00:00",
-                          duration_s=1800.0, env={"commit": "abc", "dirty": False},
-                          targets=Path("targets.json"),
-                          baseline={"path": "b.json", "status": "compared"})
+    result = result_of(m, runs, {"path": "b.json", "status": "compared"},
+                       {"poses.single": [{"capture": "001.jpg", "commanded_yaw_deg": 0.0,
+                                          "registered": False}]})
     res, md = write_report(tmp_path / "out", result)
     doc = json.loads(res.read_text())
     assert doc["summary"] == {"metrics": 3, "passed": 2, "failed": 1, "untargeted": 0,
-                              "regressions": 1}
+                              "baseline": "compared", "regressions": 1}
     by_id = {x["id"]: x for x in doc["metrics"]}
     assert by_id["perf.a.wall_s"]["baseline"] == 2.0 and by_id["perf.a.wall_s"]["regression"]
+    assert by_id["perf.a.wall_s"]["target"]["tolerance_rel"] == 0.1
     assert [r["ok"] for r in doc["runs"]] == [True, False]
     assert doc["runs"][1]["stderr_tail"].endswith("hint: start it")
     text = md.read_text()
-    assert "**Result: FAIL**" in text
-    assert "## Failed metrics" in text and "pose.b.fraction" in text
-    assert "## Regressions against the baseline" in text
+    assert "**Result: FAIL**" in text and "1 regressions against the baseline" in text
+    # the why column: the error of a metric without a value, the baseline delta of a regression
+    assert "| pose.b.fraction | — | >= 0.9 | reconstruct_json failed (exit 3): down |" in text
+    assert ("| perf.a.wall_s | 2.4 | 2 | <= 3 s | worse than the baseline 2 s by 0.4 "
+            "(tolerance 0.2) |") in text
     assert "segment.sh: error: server down" in text  # stderr tail of the failed run
     assert "| inference 0.90, export 0.10 |" in text
     assert "## Poses — single map" in text
+    assert "No ground-truth annotations" in text
+
+
+def test_why_a_metric_misses_its_target(tmp_path: Path) -> None:
+    m = judged(tmp_path, {"perf.a.wall_s": 3.5, "pose.b.fraction": 0.8, "contract.c.x": 2})
+    text = summary_md(result_of(m, [], {"path": "b.json", "status": "missing"}))
+    assert "| perf.a.wall_s | 3.5 | <= 3 s | 3.5 s exceeds the limit 3 s |" in text
+    assert "| pose.b.fraction | 0.8 | >= 0.9 | 0.8 is below the minimum 0.9 |" in text
+    assert "| contract.c.x | 2 | <= 0 | 2 exceeds the limit 0 |" in text
+
+
+@pytest.mark.parametrize("status", ["missing", "unreadable: Expecting value"])
+def test_without_a_baseline_nothing_is_compared(tmp_path: Path, status: str) -> None:
+    m = judged(tmp_path, {"perf.a.wall_s": 2.0, "pose.b.fraction": 0.95, "contract.c.x": 0})
+    result = result_of(m, [], {"path": "b.json", "status": status})
+    word = status.split(":")[0]
+    assert result["summary"]["regressions"] is None and result["summary"]["baseline"] == word
+    text = summary_md(result)
+    assert f"baseline {word} — not compared" in text
+    assert "regressions against the baseline" not in text
+    assert "**Result: PASS**" in text
+
+
+def test_per_stage_time_and_memory(tmp_path: Path) -> None:
+    def st(s: float, mb: float, gb: float | None) -> dict:
+        return {"s": s, "client_peak_mb": mb, "server_peak_gb": gb}
+
+    runs = [record(tmp_path, "recon", 0, "", stages={"inference": st(0.9, 500.0, 11.3),
+                                                      "export": st(0.1, 510.0, None)}),
+            *(record(tmp_path, f"mapper_split_{k}", 0, "", "mapper_split",
+                     {"sfm": st(20.0 + k, 2000.0 * k, 14.0 + k)}) for k in (1, 2))]
+    m = Metrics()
+    perf_metrics(m, runs)
+    stages = m.items["perf.reconstruct_json.wall_s"].detail["stages"]
+    assert stages == {"inference": st(0.9, 500.0, 11.3), "export": st(0.1, 510.0, None)}
+    assert m.items["perf.mapper_split.wall_s"].detail["stages"] == {"sfm": st(21.5, 4000.0, 16.0)}
+    text = summary_md(result_of(m, runs, {"status": "missing"}))
+    assert "## Per-stage time and peak memory" in text
+    assert "| reconstruct_json | inference | 0.9 | 500 | 11.3 |" in text
+    assert "| reconstruct_json | export | 0.1 | 510 | — |" in text
+    # a few runs (the split map's updates): one row per update
+    assert "| mapper_split_1 | sfm | 21 | 2000 | 15 |" in text
+    assert "| mapper_split_2 | sfm | 22 | 4000 | 16 |" in text
+
+
+def test_resummarise_judges_a_stored_run_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """A stored run is judged against the current targets and baseline without running anything,
+    and can then be stored as the baseline."""
+    m = judged(tmp_path, {"perf.a.wall_s": 2.4, "pose.b.fraction": 0.95, "contract.c.x": 0})
+    run = tmp_path / "evaluations" / "20260924T230511Z"
+    write_report(run, result_of(m, [], {"path": "b.json", "status": "missing"}))
+    older = tmp_path / "evaluations" / "20260901T000000Z"
+    write_report(older, result_of(m, [], {"path": "b.json", "status": "missing"}))
+    assert latest_run(tmp_path / "evaluations") == run
+    stricter = targets_file(tmp_path, {"metrics": {"perf.a.wall_s": {"op": "<=", "value": 2,
+                                                                     "unit": "s"}}})
+    baseline = tmp_path / "baseline.json"
+    args = ["--resummarise", str(run), "--targets", str(stricter), "--baseline", str(baseline)]
+    assert main(args) == 1  # 2.4 s now misses 2 s
+    doc = json.loads((run / "result.json").read_text())
+    assert doc["summary"]["failed"] == 1 and doc["summary"]["untargeted"] == 2
+    assert doc["summary"]["regressions"] is None and doc["judged"]
+    assert "2.4 s exceeds the limit 2 s" in (run / "summary.md").read_text()
+    assert not baseline.exists()
+    monkeypatch.setattr("oh_my_slam.tools.evaluate.__main__.DATA", tmp_path / "evaluations")
+    assert main(["--resummarise", "latest", "--targets", str(stricter), "--baseline",
+                 str(baseline), "--set-baseline"]) == 1
+    assert json.loads(baseline.read_text())["started"] == doc["started"]
+    assert main(["--resummarise", str(run), "--targets", str(stricter), "--baseline",
+                 str(baseline)]) == 1
+    doc = json.loads((run / "result.json").read_text())
+    assert doc["summary"]["regressions"] == 0 and doc["baseline"]["status"] == "compared"
+    assert main(["--resummarise", str(tmp_path / "none")]) == 2
+    assert str(run / "summary.md") in capsys.readouterr().out
 
 
 def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

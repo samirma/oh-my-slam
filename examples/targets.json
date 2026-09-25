@@ -1,5 +1,17 @@
 {
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
+  "rationale": {
+    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights) and are reference only: the evaluator reads only op, value, the tolerances, unit and description.",
+    "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), segment.sh -m 60 -> 2.5 s (1.2 s), view.sh -m 10 -> 4 s (1.9 s).",
+    "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; segment.sh -m 1.2 GB -> 2 GB; view.sh -m 462 MB -> 800 MB.",
+    "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and segment.sh -m / view.sh -m, which do not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
+    "pose.*": "The references are the commanded headings in the capture names, and the true heading deviates from them: SIFT homographies between the images themselves (pure rotation, measured 2026-09-25) give ~8 deg between 001 and 053 and ~9 deg between 026 and 078, which the names call the same heading, and 004 (commanded +15) at ~15-18 deg. A perfect estimator therefore scores a few degrees of median yaw error and ~9 deg on the same-heading pairs, so yaw_err_median <= 7, yaw_err_max <= 15 and same_heading_yaw_diff_max <= 10 stay: tighter targets would fail a correct map. Registration and pitch direction are exact properties of a working mapper on 79 rendered frames: >= 0.95 (at most 3 of 79 frames unregistered, 1 of 31 tilted frames with the wrong sign), up from 0.9. The head turns in place: the camera circles the neck axis at a few cm, plus the small sideways steps of the bootstrap_side frames, so the camera centres should lie within about 0.1 m; centre_radius <= 0.25 m (was 1 m) leaves room for monocular scale error but rejects the drifting trajectory of the one-update map (0.80 m measured).",
+    "map.*.frame_agreement_*": "Spec intent: the map is one consistent cloud. The same-heading pairs see the same surfaces from nearly the same pose, so their stored depths must agree to within monocular depth noise once aligned: median <= 3 % (was 5 %) and p90 <= 10 % (was 15 %), i.e. ~6-9 cm / 20-30 cm at 2-3 m. The one-update map meets this (1.1 % / 6.0 %); the split map (6.8 % / 15.6 %) does not, which is the defect these targets are meant to show.",
+    "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection).",
+    "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. The seg.map_consistency metrics (formerly seg.map.recall / precision) compare the map's objects with per-frame detections of the same detector: they measure consistency, not accuracy. A map object is built from detections in the frames it observes, so map_objects_detected must be ~1 (>= 0.95; measured 0.997); detections_in_map >= 0.8 (measured 0.88) allows the map to drop small or unstable detections. Accuracy is gt.*.",
+    "contract.*": "Every contract is a count of violations: 0.",
+    "gt.*": "Accuracy against annotations in examples/ground_truth/ (none yet, so never measured). Set from typical monocular performance: object recall >= 0.7, precision >= 0.6, OBB IoU >= 0.3 (monocular boxes of partially visible objects), yaw error median <= 3 deg / max <= 8 deg after the best common offset, pitch error median <= 3 deg. Review them when the first annotations land."
+  },
   "defaults": {
     "tolerance_rel": 0.1,
     "tolerance_abs": 0.0
@@ -7,203 +19,235 @@
   "metrics": {
     "perf.server.cold_start_s": {
       "op": "<=",
-      "value": 120,
+      "value": 45,
+      "measured": 23.9554,
       "unit": "s",
       "tolerance_rel": 0.25,
       "description": "start_inference_server.sh after --stop until ready, cached weights (AC22)"
     },
     "perf.server.resident_gb": {
       "op": "<=",
-      "value": 14,
+      "value": 13,
+      "measured": 9.7966,
       "unit": "GB",
       "description": "server physical footprint right after it is ready (AC22)"
     },
     "perf.server.peak_gb": {
       "op": "<=",
-      "value": 22,
+      "value": 20,
+      "measured": 15.253,
       "unit": "GB",
       "description": "server lifetime peak footprint over the whole evaluation (AC22 multi-view peak)"
     },
     "perf.reconstruct_json.wall_s": {
       "op": "<=",
       "value": 3.0,
+      "measured": 2.105,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "reconstruct.sh -i restaurant.jpg (JSON), warm server (AC22)"
     },
     "perf.reconstruct_json.client_peak_mb": {
       "op": "<=",
-      "value": 4000,
+      "value": 800,
+      "measured": 507.2,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: reconstruct.sh -i restaurant.jpg (JSON), warm server (AC22)"
     },
     "perf.reconstruct_json.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 11.3644,
       "unit": "GB",
       "description": "peak server footprint during: reconstruct.sh -i restaurant.jpg (JSON), warm server (AC22)"
     },
     "perf.reconstruct_ply.wall_s": {
       "op": "<=",
       "value": 1.5,
+      "measured": 0.9533,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "reconstruct.sh -i restaurant.jpg -f ply, warm server (AC22)"
     },
     "perf.reconstruct_ply.client_peak_mb": {
       "op": "<=",
-      "value": 4000,
+      "value": 450,
+      "measured": 260.0,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: reconstruct.sh -i restaurant.jpg -f ply, warm server (AC22)"
     },
     "perf.reconstruct_ply.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 11.3618,
       "unit": "GB",
       "description": "peak server footprint during: reconstruct.sh -i restaurant.jpg -f ply, warm server (AC22)"
     },
     "perf.segment_image.wall_s": {
       "op": "<=",
-      "value": 4.0,
+      "value": 3.5,
+      "measured": 2.1545,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
     },
     "perf.segment_image.client_peak_mb": {
       "op": "<=",
-      "value": 4000,
+      "value": 800,
+      "measured": 533.4,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
     },
     "perf.segment_image.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 11.3656,
       "unit": "GB",
       "description": "peak server footprint during: segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
     },
     "perf.segment_frames.wall_s": {
       "op": "<=",
-      "value": 2.5,
+      "value": 2.0,
+      "measured": 1.0676,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "segment.sh -i per ainex-captures frame (median over the frames)"
     },
     "perf.segment_frames.client_peak_mb": {
       "op": "<=",
-      "value": 3000,
+      "value": 300,
+      "measured": 164.3,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: segment.sh -i per ainex-captures frame (median over the frames)"
     },
     "perf.segment_frames.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 11.3765,
       "unit": "GB",
       "description": "peak server footprint during: segment.sh -i per ainex-captures frame (median over the frames)"
     },
     "perf.view_image.render_s": {
       "op": "<=",
-      "value": 20.0,
+      "value": 5.0,
+      "measured": 2.626,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "view.sh -i restaurant.jpg: process start until the page has rendered"
     },
     "perf.view_image.client_peak_mb": {
       "op": "<=",
-      "value": 6000,
+      "value": 800,
+      "measured": 534.2003,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: view.sh -i restaurant.jpg: process start until the page has rendered"
     },
     "perf.view_image.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 11.3666,
       "unit": "GB",
       "description": "peak server footprint during: view.sh -i restaurant.jpg: process start until the page has rendered"
     },
     "perf.mapper_single.wall_s": {
       "op": "<=",
       "value": 300,
+      "measured": 159.145,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "mapper.sh update of all 79 ainex-captures frames in one update"
     },
     "perf.mapper_single.client_peak_mb": {
       "op": "<=",
-      "value": 12000,
+      "value": 8000,
+      "measured": 4964.1226,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: mapper.sh update of all 79 ainex-captures frames in one update"
     },
     "perf.mapper_single.server_peak_gb": {
       "op": "<=",
-      "value": 22,
+      "value": 20,
+      "measured": 14.7134,
       "unit": "GB",
       "description": "peak server footprint during: mapper.sh update of all 79 ainex-captures frames in one update"
     },
     "perf.mapper_split.wall_s": {
       "op": "<=",
-      "value": 450,
+      "value": 360,
+      "measured": 180.789,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "mapper.sh update of the same frames split across the updates (sum)"
     },
     "perf.mapper_split.client_peak_mb": {
       "op": "<=",
-      "value": 12000,
+      "value": 8000,
+      "measured": 4430.7,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: mapper.sh update of the same frames split across the updates (sum)"
     },
     "perf.mapper_split.server_peak_gb": {
       "op": "<=",
-      "value": 22,
+      "value": 20,
+      "measured": 15.253,
       "unit": "GB",
       "description": "peak server footprint during: mapper.sh update of the same frames split across the updates (sum)"
     },
     "perf.segment_map.wall_s": {
       "op": "<=",
-      "value": 60,
+      "value": 2.5,
+      "measured": 1.2029,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "segment.sh -m on the one-update map with -d DIR (no inference)"
     },
     "perf.segment_map.client_peak_mb": {
       "op": "<=",
-      "value": 6000,
+      "value": 2000,
+      "measured": 1191.5756,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: segment.sh -m on the one-update map with -d DIR (no inference)"
     },
     "perf.segment_map.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 10.7318,
       "unit": "GB",
       "description": "peak server footprint during: segment.sh -m on the one-update map with -d DIR (no inference)"
     },
     "perf.view_map.render_s": {
       "op": "<=",
-      "value": 10.0,
+      "value": 4.0,
+      "measured": 1.9113,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "view.sh -m on the one-update map: process start until the page has rendered"
     },
     "perf.view_map.client_peak_mb": {
       "op": "<=",
-      "value": 6000,
+      "value": 800,
+      "measured": 461.865,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: view.sh -m on the one-update map: process start until the page has rendered"
     },
     "perf.view_map.server_peak_gb": {
       "op": "<=",
-      "value": 16,
+      "value": 14,
+      "measured": 10.7318,
       "unit": "GB",
       "description": "peak server footprint during: view.sh -m on the one-update map: process start until the page has rendered"
     },
     "seg.restaurant.objects": {
       "op": ">=",
-      "value": 10,
+      "value": 100,
+      "measured": 115.0,
       "unit": "",
       "description": "objects segment.sh -i finds in restaurant.jpg (AC25)"
     },
     "seg.frames.with_detections_fraction": {
       "op": ">=",
-      "value": 0.8,
+      "value": 0.9,
+      "measured": 0.9367,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "share of ainex-captures frames with at least one detection"
@@ -211,26 +255,30 @@
     "seg.min_score": {
       "op": ">=",
       "value": 0.5,
+      "measured": 0.5002,
       "unit": "",
       "description": "lowest score over every segment.sh -i output (default --min-score 0.5)"
     },
-    "seg.map.recall": {
+    "seg.map_consistency.map_objects_detected": {
       "op": ">=",
-      "value": 0.5,
+      "value": 0.95,
+      "measured": 0.9967,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "map objects observed in a frame whose label segment.sh -i also detects in that frame"
+      "description": "consistency, not accuracy: (frame, map object) observations whose label segment.sh -i also detects in that frame (the map object is backed by the frame's detections)"
     },
-    "seg.map.precision": {
+    "seg.map_consistency.detections_in_map": {
       "op": ">=",
-      "value": 0.5,
+      "value": 0.8,
+      "measured": 0.8791,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "per-frame detections whose label matches a map object observed in that frame"
+      "description": "consistency, not accuracy: per-frame segment.sh -i detections whose label matches a map object observing that frame (detections the map keeps)"
     },
     "pose.single.registered_fraction": {
       "op": ">=",
-      "value": 0.9,
+      "value": 0.95,
+      "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0.03,
       "description": "captures registered (one-update map; AC26: at least 71 of 79)"
@@ -238,6 +286,7 @@
     "pose.single.yaw_err_median_deg": {
       "op": "<=",
       "value": 7,
+      "measured": 4.0091,
       "unit": "deg",
       "tolerance_abs": 1.0,
       "description": "median |yaw relative to frame 001 - commanded yaw| (one-update map)"
@@ -245,13 +294,15 @@
     "pose.single.yaw_err_max_deg": {
       "op": "<=",
       "value": 15,
+      "measured": 11.0863,
       "unit": "deg",
       "tolerance_abs": 2.0,
       "description": "worst |yaw error| (one-update map); the names are commanded values and the actual headings deviate by several degrees"
     },
     "pose.single.pitch_direction_fraction": {
       "op": ">=",
-      "value": 0.9,
+      "value": 0.95,
+      "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "up/down frames pitched in the named direction relative to their level frame (one-update map)"
@@ -259,34 +310,39 @@
     "pose.single.same_heading_yaw_diff_max_deg": {
       "op": "<=",
       "value": 10,
+      "measured": 8.91,
       "unit": "deg",
       "tolerance_abs": 1.5,
       "description": "yaw difference of the same-heading pairs 001/053 and 026/078 (one-update map)"
     },
     "pose.single.centre_radius_m": {
       "op": "<=",
-      "value": 1.0,
+      "value": 0.25,
+      "measured": 0.8027,
       "unit": "m",
       "tolerance_abs": 0.1,
       "description": "largest camera-centre distance from their mean; the head turns in place (AC26; one-update map)"
     },
     "map.single.frame_agreement_median_pct": {
       "op": "<=",
-      "value": 5,
+      "value": 3,
+      "measured": 1.11,
       "unit": "%",
       "tolerance_abs": 0.5,
       "description": "median depth disagreement |z_i->j / z_j - 1| of the same-heading pairs, worst pair (one-update map)"
     },
     "map.single.frame_agreement_p90_pct": {
       "op": "<=",
-      "value": 15,
+      "value": 10,
+      "measured": 5.97,
       "unit": "%",
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (one-update map)"
     },
     "pose.split.registered_fraction": {
       "op": ">=",
-      "value": 0.9,
+      "value": 0.95,
+      "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0.03,
       "description": "captures registered (split map; AC26: at least 71 of 79)"
@@ -294,6 +350,7 @@
     "pose.split.yaw_err_median_deg": {
       "op": "<=",
       "value": 7,
+      "measured": 5.2593,
       "unit": "deg",
       "tolerance_abs": 1.0,
       "description": "median |yaw relative to frame 001 - commanded yaw| (split map)"
@@ -301,13 +358,15 @@
     "pose.split.yaw_err_max_deg": {
       "op": "<=",
       "value": 15,
+      "measured": 9.3713,
       "unit": "deg",
       "tolerance_abs": 2.0,
       "description": "worst |yaw error| (split map); the names are commanded values and the actual headings deviate by several degrees"
     },
     "pose.split.pitch_direction_fraction": {
       "op": ">=",
-      "value": 0.9,
+      "value": 0.95,
+      "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "up/down frames pitched in the named direction relative to their level frame (split map)"
@@ -315,69 +374,79 @@
     "pose.split.same_heading_yaw_diff_max_deg": {
       "op": "<=",
       "value": 10,
+      "measured": 7.72,
       "unit": "deg",
       "tolerance_abs": 1.5,
       "description": "yaw difference of the same-heading pairs 001/053 and 026/078 (split map)"
     },
     "pose.split.centre_radius_m": {
       "op": "<=",
-      "value": 1.0,
+      "value": 0.25,
+      "measured": 0.2709,
       "unit": "m",
       "tolerance_abs": 0.1,
       "description": "largest camera-centre distance from their mean; the head turns in place (AC26; split map)"
     },
     "map.split.frame_agreement_median_pct": {
       "op": "<=",
-      "value": 5,
+      "value": 3,
+      "measured": 6.84,
       "unit": "%",
       "tolerance_abs": 0.5,
       "description": "median depth disagreement |z_i->j / z_j - 1| of the same-heading pairs, worst pair (split map)"
     },
     "map.split.frame_agreement_p90_pct": {
       "op": "<=",
-      "value": 15,
+      "value": 10,
+      "measured": 15.56,
       "unit": "%",
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (split map)"
     },
     "map.stability.matched_fraction": {
       "op": ">=",
-      "value": 0.7,
+      "value": 0.9,
+      "measured": 0.8636,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "objects paired between the one-update and the split map / the larger object count"
     },
     "map.stability.label_agreement": {
       "op": ">=",
-      "value": 0.9,
+      "value": 0.95,
+      "measured": 0.9474,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "paired objects with the same (or a compatible) label"
     },
     "map.stability.id_agreement": {
       "op": ">=",
-      "value": 0.5,
+      "value": 0.8,
+      "measured": 0.2632,
       "unit": "",
       "tolerance_abs": 0.1,
       "description": "paired objects with the same id in both maps"
     },
     "map.stability.centre_delta_median_m": {
       "op": "<=",
-      "value": 0.15,
+      "value": 0.1,
+      "measured": 0.124,
       "unit": "m",
       "tolerance_abs": 0.03,
       "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
     },
     "map.stability.extent_delta_median_rel": {
       "op": "<=",
-      "value": 0.25,
+      "value": 0.2,
+      "measured": 0.158,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "median relative OBB size difference of paired objects"
     },
     "map.stability.obb_iou_median": {
       "op": ">=",
-      "value": 0.4,
+      "value": 0.5,
+      "measured": 0.2245,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "median 3D IoU of paired OBBs"
@@ -385,114 +454,133 @@
     "contract.stdout.server": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (server)"
     },
     "contract.stdout.reconstruct": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (reconstruct)"
     },
     "contract.stdout.mapper": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (mapper)"
     },
     "contract.stdout.segment": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (segment)"
     },
     "contract.stdout.view": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (view)"
     },
     "contract.openlabel.reconstruct": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "JSON outputs failing the OpenLABEL 1.0.0 schema or the extra checks (reconstruct)"
     },
     "contract.openlabel.mapper": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "JSON outputs failing the OpenLABEL 1.0.0 schema or the extra checks (mapper)"
     },
     "contract.openlabel.segment": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "JSON outputs failing the OpenLABEL 1.0.0 schema or the extra checks (segment)"
     },
     "contract.openlabel.view": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "JSON outputs failing the OpenLABEL 1.0.0 schema or the extra checks (view)"
     },
     "contract.colour.reconstruct": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (reconstruct)"
     },
     "contract.colour.mapper": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (mapper)"
     },
     "contract.colour.segment": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (segment)"
     },
     "contract.colour.view": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (view)"
     },
     "contract.artifacts.segment": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "segment.sh -d folders without exactly the five artefacts or whose segmentation.json differs from stdout (segment)"
     },
     "contract.same_objects.image": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "reconstruct.sh vs segment.sh -i (image), segment.sh -m vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (image)"
     },
     "contract.same_objects.map": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "reconstruct.sh vs segment.sh -i (image), segment.sh -m vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (map)"
     },
     "contract.readonly.map": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "segment.sh -m / view.sh -m runs that changed the map folder (map)"
     },
     "contract.console_errors.view": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "view.sh pages with browser console errors (view)"
     },
     "contract.exit_codes": {
       "op": "<=",
       "value": 0,
+      "measured": 0.0,
       "unit": "",
       "description": "commands that failed, timed out or exited with an unexpected code"
     },

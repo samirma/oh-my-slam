@@ -11,15 +11,20 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from oh_my_slam.core.ply import PointCloud
+from oh_my_slam.tools.evaluate.memory import stage_peaks
 from oh_my_slam.tools.evaluate.metrics import load_targets
 from oh_my_slam.tools.evaluate.names import captures_in
 from oh_my_slam.tools.evaluate.report import build_result, write_report
 from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe, ViewOutcome, served_url
-from tests.unit.test_evaluate_contracts import scene_bytes
+from oh_my_slam.viewer.bundle import DisplayCloud
+from oh_my_slam.viewer.server import cloud_payload
+from tests.unit.test_evaluate_contracts import labelled_cloud, scene_bytes
 
 ENTRY_POINTS = ("start_inference_server.sh", "reconstruct.sh", "mapper.sh", "segment.sh",
                 "view.sh")
@@ -50,6 +55,57 @@ printf '{"stages_s": {"inference": 0.5}, "peak_rss_mb": {"self": 123.0}}' > "$OH
     assert runner.records == [rec]
     with pytest.raises(ValueError, match="duplicate"):
         runner.run(RunSpec("recon", "g", "reconstruct.sh"))
+
+
+STAGED = """import logging, time
+import numpy as np
+from oh_my_slam.core import timing
+with timing.collect() as tm:
+    with timing.stage("load"):
+        time.sleep(0.5)
+    with timing.stage("inference"):
+        a = np.ones(40_000_000)  # 320 MB, touched
+        time.sleep(0.8)
+        del a
+    with timing.stage("write"):
+        print('{"openlabel": {}}')
+timing.report(tm, logging.getLogger("fake"))
+"""
+
+
+def test_per_stage_peak_memory_of_a_run(tmp_path: Path) -> None:
+    """A command instrumented with core.timing: the runner attributes its process-tree samples
+    to the stages through the recorded windows, and keeps the command's own stage peaks."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script(repo, "reconstruct.sh", STAGED, shebang=f"#!{sys.executable}")
+    rec = Runner(tmp_path / "out", repo).run(RunSpec("r", "reconstruct_json", "reconstruct.sh"))
+    assert rec.ok and rec.stages is not None
+    assert list(rec.stages) == ["load", "inference", "write"]  # in the order they ran
+    load, inference = rec.stages["load"], rec.stages["inference"]
+    assert inference["s"] == pytest.approx(0.8, abs=0.3)
+    assert load["client_peak_mb"] and inference["client_peak_mb"]
+    assert inference["client_peak_mb"] >= load["client_peak_mb"] + 250
+    assert inference["client_peak_mb"] <= rec.client_peak_mb + 1
+    assert inference["server_peak_gb"] is None  # no server in the offline suite
+    assert rec.to_dict()["stages"] == rec.stages
+
+
+def test_stage_peaks_attribute_samples_by_window() -> None:
+    timings = {"stages_s": {"b": 0.5, "a": 1.0, "c": 0.01, "d": 0.2},
+               "stages_peak_rss_mb": {"a": 300.0, "b": 120.0, "c": 50.0},
+               "t0_unix": 1000.0,
+               "stage_windows": [["a", 0.0, 1.0], ["b", 1.0, 1.5], ["c", 1.52, 1.53]]}
+    samples = [(1000.1, 250.0, 11.0), (1000.5, 400.0, 12.0), (1001.2, 200.0, 11.5),
+               (1001.6, 150.0, 13.0)]
+    got = stage_peaks(timings, samples)
+    assert got is not None and list(got) == ["a", "b", "c", "d"]  # by start; unwindowed last
+    assert got["a"] == {"s": 1.0, "client_peak_mb": 400.0, "server_peak_gb": 12.0}
+    assert got["b"] == {"s": 0.5, "client_peak_mb": 200.0, "server_peak_gb": 11.5}
+    # shorter than the sampling period: the samples around it
+    assert got["c"] == {"s": 0.01, "client_peak_mb": 200.0, "server_peak_gb": 13.0}
+    assert got["d"] == {"s": 0.2, "client_peak_mb": None, "server_peak_gb": None}
+    assert stage_peaks(None, samples) is None and stage_peaks({"stages_s": {}}, []) is None
 
 
 def test_failures_become_records(tmp_path: Path) -> None:
@@ -158,10 +214,12 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
 
 VIEW = """import http.server, os, sys
 SCENE = open(os.environ["FAKE_SCENE"], "rb").read()
+CLOUD = open(os.environ["FAKE_CLOUD"], "rb").read()
 PAGE = os.environ.get("FAKE_PAGE", "").encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = {"/api/scene": SCENE, "/": PAGE, "/favicon.ico": b""}.get(self.path)
+        body = {"/api/scene": SCENE, "/api/cloud?color=segment": CLOUD, "/": PAGE,
+                "/favicon.ico": b""}.get(self.path)
         self.send_response(200 if body is not None else 404)
         self.end_headers()
         self.wfile.write(body or b"")
@@ -181,12 +239,17 @@ RENDERS = 'setTimeout(() => { document.body.dataset.rendered = "true"; }, 200);'
 FAILS = 'setTimeout(() => { document.body.dataset.error = "cloud: 500"; }, 100);'
 
 
-def view_runner(tmp_path: Path, page_script: str = RENDERS) -> Runner:
+def view_runner(tmp_path: Path, page_script: str = RENDERS, cloud: PointCloud | None = None
+                ) -> Runner:
     repo = tmp_path / "repo"
     repo.mkdir()
     script(repo, "view.sh", VIEW, shebang=f"#!{sys.executable}")
     (tmp_path / "scene.json").write_bytes(scene_bytes())
+    cloud = labelled_cloud() if cloud is None else cloud
+    (tmp_path / "cloud.bin").write_bytes(
+        cloud_payload(DisplayCloud(cloud, len(cloud), 1, 0.0), "color=segment"))
     env = {**os.environ, "FAKE_SCENE": str(tmp_path / "scene.json"),
+           "FAKE_CLOUD": str(tmp_path / "cloud.bin"),
            "FAKE_PAGE": f"<!doctype html><html><body><script>{page_script}</script></body></html>"}
     return Runner(tmp_path / "out", repo, env)
 
@@ -204,10 +267,24 @@ def test_view_url_and_scene_without_a_browser(tmp_path: Path) -> None:
     assert rec.notes["render_error"] == "browser: no browser available"
     assert ev.contracts.checks[("stdout", "view")] == {"view_image": []}
     assert ev.contracts.checks[("openlabel", "view")] == {"view_image": []}
-    assert ev.contracts.checks[("colour", "view")] == {"view_image": []}
+    # the scene's OBB colours and the served color=segment cloud keep the colour contract
+    assert ev.contracts.checks[("colour", "view")] == {"view_image": [],
+                                                       "view_image/cloud color=segment": []}
     same = ev.contracts.checks[("same_objects", "image")]["view.sh vs segment.sh -i"]
     assert same and same[0].startswith("1 objects differ (ids [7])")
     assert ("console_errors", "view") not in ev.contracts.checks
+
+
+def test_view_cloud_breaking_the_colour_contract(tmp_path: Path) -> None:
+    cloud = labelled_cloud()
+    assert cloud.rgb is not None and cloud.label is not None
+    cloud.rgb[np.flatnonzero(cloud.label == 7)[:3]] = (10, 200, 10)  # blended / foreign colour
+    cloud.label[:2] = 99  # an object the scene does not have
+    ev = Evaluation(tmp_path / "out", view_runner(tmp_path, cloud=cloud), BrowserProbe(None))
+    ev.view("view_map", ("map", "mapper.sh -t full", None), "-m", "m")
+    problems = ev.contracts.checks[("colour", "view")]["view_map/cloud color=segment"]
+    assert any("not in their object's colour" in p for p in problems)
+    assert any("labels not in the scene: [99]" in p for p in problems)
 
 
 def probe_fake_view(tmp_path: Path, page_script: str) -> ViewOutcome:
@@ -230,6 +307,7 @@ def test_view_render_time_in_a_browser(tmp_path: Path) -> None:
     assert seen.error is None and seen.render_s is not None and 0.2 < seen.render_s < 60
     assert seen.url and seen.url.startswith("http://127.0.0.1:")  # not the docs URL before it
     assert seen.scene == scene_bytes()
+    assert seen.cloud == (tmp_path / "cloud.bin").read_bytes()  # fetched after rendering
     assert seen.console_errors == [] and seen.record.ok
 
 
