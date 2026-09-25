@@ -163,33 +163,51 @@ The two modes differ:
 * **`-i`** reconstructs and segments the image once, through the inference server. It shows the
   cloud, the segmented image, the catalogue, the labelled OBBs and the camera at its estimated
   pose. The display rotates the camera frame so that the estimated up direction is +z.
-* **`-m`** opens the map read-only, without the server. It shows the map cloud, every keyframe
-  camera and the labelled OBBs.
+* **`-m`** opens the map read-only, without the server. It shows the map's complete cloud, every
+  keyframe camera and the labelled OBBs.
+
+The first view of an image is from just behind the photo's viewpoint. The first view of a map
+looks down 60° on the whole scene and all its cameras, so that the walls of a room hide little
+of its floor, objects and camera cluster. *Reset view* (`R`) returns to it.
 
 The page has four tabs:
 
 * **Controls**
-  * *Layers* has one independent switch each for the point cloud, the segmentation (object
-    colours), the camera poses, the labels and the oriented boxes.
+  * *Layers* has one independent switch each for the point cloud, the segmentation overlay, the
+    camera poses, the labels and the oriented boxes. The segmentation overlay draws only the
+    points of each object, in its colour, over the cloud. It is not the `color=segment`
+    attribute, which recolours the whole cloud (unsegmented points grey); the layer's note says
+    when that attribute is on as well.
   * *Point cloud* has live controls for the point-cloud attributes that affect the display. For
     an image these are `color`, `stride`, `min-depth`, `max-depth`, `edge`, `voxel` and
     `normals`. For a map they are `color`, `voxel` and `normals`. The panel also shows the
     equivalent `-p …` string and a *Defaults* button.
-  * *Display* sets the point size, the normals shading, the maximum number of labels and the
-    background.
+  * *Display* sets the point size, the normals shading, the labels (*id tags + names that fit*,
+    or *id tags only*) and the background.
 * **Catalogue** lists the objects, with a label filter.
 * **Cameras** lists every displayed camera's centre (x, y, z in metres, in the scene frame), with
   a *Go to* button that moves the viewpoint to that camera, looking where it looked. `[` and `]`
   step through the cameras.
-* **Image** shows the segmented image (`-i` only).
+* **Image** shows the segmented image (`-i` only). A click enlarges it to the window; in the
+  enlarged view a click switches between fit and actual pixels, and `Esc` closes it.
 
 Other keys: `R` resets the view, and `Esc` clears the selection.
+
+Every box whose top is in view carries a label: its id on a tag in the object's colour, and its
+name wherever that fits without covering another label. Larger boxes on screen get their names
+first, and a tag that fits nowhere is still drawn at its box. The selected and hovered box always
+show their names, and labels never leave the view. Camera frustums fade out as the viewpoint comes
+near them. The camera being looked through and its neighbours, for example the rest of a capture
+that turns in place, therefore never draw lines across the view. Boxes that enclose the viewpoint
+fade the same way, except the selected one.
 
 The viewer contains no geometry, segmentation or colour logic of its own:
 
 * Every displayed cloud is derived on request from data already in memory, by the same code
   that writes PLY files. A control therefore never re-runs inference.
-* Clouds above 3,000,000 points are thinned for display only, and the page says so.
+* The page shows the complete cloud up to 12,000,000 points. In Edge on the M4 Max, a cloud of
+  that size loads in about 2 s and orbits at 60 frames per second. Larger clouds are thinned for
+  display only, keeping every k-th point, and the page says so.
 * `encoding` and `label` concern PLY files only and have no control.
 
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.
@@ -211,7 +229,7 @@ runs. The definition lives once, in `core/cloud_attrs.py`.
 | `max-depth` | metres > 0, or `inf` | `inf` | image only | Drop pixels farther than this. |
 | `edge` | relative depth jump ≥ 0 | `0.04` | image only | Drop flying pixels on depth discontinuities; `0` disables the filter. |
 | `voxel` | metres ≥ 0 | `0` (off) | image, map | Keep the first point (in pixel or storage order) of each voxel. Colours are never averaged. |
-| `normals` | `on`, `off` | `off` | image, map | Add `nx ny nz`. For an image they come from the depth grid; for a map they are oriented towards the keyframe cameras. |
+| `normals` | `on`, `off` | `off` | image, map | Add `nx ny nz`. For an image they come from the depth grid. For a map they come from each point's 16 nearest neighbours in the whole map, are oriented towards the keyframe cameras, and are computed only for the emitted points. |
 | `label` | `on`, `off` | `off` | image, map | Add `int label`: the object id, `0` = unsegmented. |
 | `encoding` | `binary`, `ascii` | `binary` | image, map | `binary_little_endian 1.0` or `ascii 1.0`. |
 
@@ -340,23 +358,39 @@ appears in all of these:
 
 Masks are opaque, and each pixel and point belongs to at most one object.
 
-Ids 1–19 use this palette, which is Sasha Trubetskoy's list of distinct colours without grey,
-white and black:
+Every object colour reads on the viewer's dark surfaces and on the dimmed `segmented.png`:
+
+* WCAG contrast of at least 3:1 (the WCAG 1.4.11 minimum for graphical objects) against the
+  viewer's panel `#1d2027`, and therefore against its darker canvas `#15171c`. That also makes
+  every object colour brighter than any pixel of the dimmed photo (35 % of white).
+* OKLab lightness at most 0.93 (no near-white), OKLab chroma at least 0.08, and an OKLab distance
+  of at least 0.11 from the unsegmented mid-grey.
+
+Ids 1–19 use this palette. Ten colours come from Sasha Trubetskoy's list of distinct colours; the
+entries that fail the rules above (navy, maroon, purple, beige and the palest pastels) are
+replaced. Any two differ by at least 0.095 ΔE_OK, about five just-noticeable differences:
 
 | id | colour | id | colour | id | colour | id | colour |
 |---:|---|---:|---|---:|---|---:|---|
-| 1 | `#e6194b` | 6 | `#911eb4` | 11 | `#469990` | 16 | `#aaffc3` |
-| 2 | `#3cb44b` | 7 | `#42d4f4` | 12 | `#dcbeff` | 17 | `#808000` |
-| 3 | `#ffe119` | 8 | `#f032e6` | 13 | `#9a6324` | 18 | `#ffd8b1` |
-| 4 | `#4363d8` | 9 | `#bfef45` | 14 | `#fffac8` | 19 | `#000075` |
-| 5 | `#f58231` | 10 | `#fabed4` | 15 | `#800000` | | |
+| 1 | `#e6194b` | 6 | `#9c4dff` | 11 | `#1fb5a3` | 16 | `#ffc49b` |
+| 2 | `#3cb44b` | 7 | `#42d4f4` | 12 | `#dcbeff` | 17 | `#5a9cff` |
+| 3 | `#ffe119` | 8 | `#f032e6` | 13 | `#9a6324` | 18 | `#b4339c` |
+| 4 | `#4363d8` | 9 | `#a8f04a` | 14 | `#8ef0c0` | 19 | `#c9a227` |
+| 5 | `#f58231` | 10 | `#ff9ec7` | 15 | `#808000` | | |
 
-Higher ids cycle:
+Higher ids cycle by hue, and vary lightness and chroma as they go:
 
-* Cycle `k = (id − 1) // 19` rotates the hue of the same 19 colours by `k × 0.381966` of a turn in
-  HLS, keeping lightness and saturation.
-* A rotated colour that collides with an earlier id after 8-bit rounding is nudged in steps of
-  0.002 turn until it is unused. Every id therefore gets a distinct colour.
+* Id `19 + n + 1` aims at the OKLCh hue `n × 137.508°` (the golden angle).
+* The candidates are the 8-bit colours within ±30° of that hue, on six lightness tiers
+  (0.62–0.91) and three chroma levels (0.24, 0.15 and 0.10, clipped to the sRGB gamut), that meet
+  the rules above.
+* The id takes the candidate farthest in OKLab from every earlier id, with the last 10 ids counted
+  1.5 times as close, so that neighbouring ids differ most.
+* A colour that would repeat an earlier id after 8-bit rounding is nudged to the nearest unused
+  triple. Every id therefore gets a distinct colour.
+
+For ids 1–120, any two colours differ by at least 0.045 ΔE_OK and consecutive ids by at least
+0.15 (`tests/unit/test_colors.py`).
 
 Mid-grey `#808080` (128, 128, 128) is reserved for unsegmented points, and the palette never
 produces it. The `color=height` ramp is viridis.
@@ -374,7 +408,7 @@ produces it. The `color=height` ramp is viridis.
 | `sfm/database.db`, `sfm/model/` | The COLMAP database, and the COLMAP model in map coordinates. |
 | `cloud.ply`, `cloud_objects.npy` | The map cloud, and the object id of each of its points. |
 | `objects.json`, `objects/points_NNNNNN.npy` | Object state (evidence, strikes, merges) and each object's canonical points. |
-| `scene.json` | The cached full scene. |
+| `scene.json` | The full scene as of the last update. `segment.sh -m` and `view.sh -m` rebuild the scene from the persisted state instead, so that object colours follow the current palette. |
 | `.lock`, `.staging/` | The update lock, and the staging area of an update in progress. |
 
 An update writes everything into `.staging/`, then records the list of staged files (the commit

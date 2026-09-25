@@ -14,7 +14,7 @@ re-check every row below. These matter most:
 
 * three.js (vendored browser library)
 * the ASAM OpenLABEL JSON schema
-* the 19 palette colours and 11 viridis samples in `segmentation/colors.py`
+* 10 of the 19 palette colours and the 11 viridis samples in `segmentation/colors.py`
 * the label list in `segmentation/data/default_labels.txt`
 
 Every other component is installed by `uv sync`, by Homebrew, or on the first server start.
@@ -110,7 +110,7 @@ rows are listed because they are copyleft or otherwise notable:
 |---|---|---|
 | ASAM OpenLABEL 1.0.0 JSON schema | Vendored as `src/oh_my_slam/schema/openlabel_json_schema.json`, sha256-pinned; published at `https://openlabel.asam.net/V1-0-0/schema/openlabel_json_schema.json` | **UNVERIFIED**. ASAM publishes the schema openly and the standard is free of charge with registration. The schema repository's licence text (`code.asam.net`) could not be read. |
 | LVIS vocabulary | Label names curated from LVIS and COCO nouns in `segmentation/data/default_labels.txt`; the ontology URI `https://www.lvisdataset.org/` | LVIS annotations CC-BY-4.0; COCO annotations CC-BY-4.0 (COCO Consortium). No images are used. |
-| Distinct-colour palette | Sasha Trubetskoy, "List of 20 Simple, Distinct Colors" (sashamaps.net); 19 colours used, without grey, white and black | No licence is stated on the source page, which offers the list for free download. The colours are credited in `segmentation/colors.py`. |
+| Distinct-colour palette | Sasha Trubetskoy, "List of 20 Simple, Distinct Colors" (sashamaps.net); 10 colours used (the other 9 palette colours are this project's own) | No licence is stated on the source page, which offers the list for free download. The colours are credited in `segmentation/colors.py`. |
 | Viridis colour map | 11 samples used for `color=height` | CC0-1.0 (mpl-colormaps by Nathaniel Smith and Stéfan van der Walt) |
 
 ## Development tools (`[dependency-groups] dev` and build)

@@ -117,7 +117,7 @@ def test_viewer_only_calls_the_owners_apis() -> None:
     assert not _grep(VIEWER_REIMPLEMENTATION, files)
     bundle = (SRC / "viewer" / "bundle.py").read_text("utf-8")
     # every displayed cloud is the shared derivation, controlled by the shared attribute set
-    for call in ("derive_cloud(", "applicable(", "parse_cloud_attrs(", "image_cloud_source(",
+    for call in ("derive_thinned(", "applicable(", "parse_cloud_attrs(", "image_cloud_source(",
                  "reader_source(", "segment_frame(", "single_image_scene(", "scene_bytes("):
         assert call in bundle, call
 

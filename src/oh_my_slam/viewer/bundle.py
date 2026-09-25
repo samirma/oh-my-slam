@@ -37,13 +37,15 @@ from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.geometry import quat_to_rot, rotation_between
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_cloud, scope_of
+from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
 
 Json = dict[str, Any]
 
-# Browsers stay responsive up to a few million points; a larger derived cloud is thinned for display
-# only, deterministically (every k-th point in derivation order), and the page says so.
-MAX_DISPLAY_POINTS = 3_000_000
+# The page shows the complete derived cloud up to this many points: measured in Edge (ANGLE Metal)
+# on the M4 Max, 12 M points load in ~2 s and orbit at 60 frames/s (16 M drop frames, 24 M run at
+# 30 frames/s). A larger cloud is thinned for display only, deterministically (every k-th point in
+# derivation order, ``derive_thinned``), and the page says so.
+MAX_DISPLAY_POINTS = 12_000_000
 
 # Spec §2.5: these attributes concern PLY files only and have no control in the viewer.
 PLY_ONLY = frozenset({"label", "encoding"})
@@ -148,17 +150,15 @@ class ViewBundle:
 
     def cloud(self, attrs: CloudAttrs) -> DisplayCloud:
         """The cloud ``attrs`` describe, derived from the in-memory source (no inference), with
-        each point's object id; thinned for display beyond ``MAX_DISPLAY_POINTS``. Raises
-        ``ValueError`` when the source cannot provide ``attrs`` (e.g. ``color=height`` without
-        an estimated gravity)."""
-        with self._lock:  # one derivation at a time; sources cache their normals
+        each point's object id; beyond ``MAX_DISPLAY_POINTS`` every ``step``-th point of it
+        (``derive_thinned``: normals only for those). Raises ``ValueError`` when the source cannot
+        provide ``attrs`` (e.g. ``color=height`` without an estimated gravity)."""
+        with self._lock:  # one derivation at a time; sources keep their normals
             t0 = time.perf_counter()
-            full = derive_cloud(self.source, replace(attrs, label=self.source.labels is not None))
+            thin = derive_thinned(self.source, replace(attrs, label=self.source.labels is not None),
+                                  MAX_DISPLAY_POINTS)
             seconds = time.perf_counter() - t0
-        total = len(full)
-        step = max(1, math.ceil(total / MAX_DISPLAY_POINTS))
-        shown = full if step == 1 else full.subset(np.arange(0, total, step))
-        return DisplayCloud(shown, total, step, seconds)
+        return DisplayCloud(thin.cloud, thin.total, thin.step, seconds)
 
     def meta(self) -> Json:
         return {

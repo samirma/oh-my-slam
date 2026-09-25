@@ -4,14 +4,21 @@ A source holds data that is already computed — one image's depth grid (reconst
 per-pixel object ids of its segmentation, or a map's points with their object ids — and
 ``derive_cloud`` applies the attributes to it without any inference: pixel selection (``stride``,
 depth range, ``edge``; images only), unprojection, ``voxel`` thinning (one representative point per
-voxel, the first in pixel/storage order, colours never averaged), then colour, normals and label.
+voxel, the first in pixel/storage order, colours never averaged), then colour, label and normals.
 Object colours are the colour contract of ``segmentation.colors``; unsegmented points are grey.
 The same source and attributes always give the same cloud, and attributes never change objects,
 ids or colours.
+
+Normals are computed last, for the emitted points only: an image's come from its depth grid, a
+map's from the k nearest neighbours in the whole map (``PointNormals``, kept per source), so a
+point's normal is the same whatever ``voxel`` says, and their cost follows the emitted points.
+``derive_thinned`` also keeps every ``step``-th point of a cloud larger than a display budget
+(the viewer) before the normals, with every other value exactly that of ``derive_cloud``.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -24,10 +31,10 @@ from oh_my_slam.core.geometry import voxel_downsample_indices
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.pointcloud import (
+    PointNormals,
     depth_normals,
     pixel_mask,
     pixel_points,
-    point_normals,
 )
 from oh_my_slam.segmentation.colors import height_colors, segment_colors
 
@@ -66,9 +73,9 @@ class MapCloudSource:
     viewpoints: NDArray[np.float64]  # (M, 3) camera centres, to orient normals
 
     @cached_property
-    def normals(self) -> NDArray[np.float32]:
-        """(N, 3) normals of the whole cloud (computed once)."""
-        return point_normals(self.xyz, self.viewpoints)
+    def normals(self) -> PointNormals:
+        """Normals of the map's points, computed on demand for the points emitted and kept."""
+        return PointNormals(self.xyz, self.viewpoints)
 
 
 CloudSource = ImageCloudSource | MapCloudSource
@@ -100,8 +107,26 @@ def map_cloud_source(xyz: NDArray[Any], rgb: NDArray[np.uint8], labels: NDArray[
                           np.asarray(viewpoints, np.float64).reshape(-1, 3))
 
 
+@dataclass(frozen=True)
+class ThinnedCloud:
+    """A derived cloud, possibly thinned: ``cloud`` holds every ``step``-th of the ``total``
+    points ``derive_cloud`` gives for the same attributes, with exactly their values."""
+
+    cloud: PointCloud
+    total: int
+    step: int
+
+
 def derive_cloud(source: CloudSource, attrs: CloudAttrs) -> PointCloud:
     """The cloud ``attrs`` describe, from data already computed (no inference)."""
+    return derive_thinned(source, attrs, None).cloud
+
+
+def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | None
+                   ) -> ThinnedCloud:
+    """``derive_cloud``, keeping only every ``step``-th point (``step`` = ceil(total /
+    max_points)) when it has more than ``max_points``. Colours are those of the whole cloud (the
+    height ramp's range included); normals are computed for the kept points only."""
     if (attrs.color == "segment" or attrs.label) and source.labels is None:
         raise ValueError("color=segment and label=on need a segmented source")
     # xyz[i] is the point of source row rows[i] (a flat pixel index, or a map point index)
@@ -111,12 +136,10 @@ def derive_cloud(source: CloudSource, attrs: CloudAttrs) -> PointCloud:
         mask = pixel_mask(source.depth, source.valid, attrs)
         xyz, rows = pixel_points(source.depth, source.K, mask)
         rgb, labels = source.rgb.reshape(-1, 3), source.labels
-        normals = source.normals.reshape(-1, 3) if attrs.normals else None
     else:
         xyz = np.asarray(source.xyz, np.float64).reshape(-1, 3)
         rows = np.arange(len(xyz))
         rgb, labels = source.rgb, source.labels
-        normals = source.normals if attrs.normals else None
     if attrs.voxel > 0:
         keep = voxel_downsample_indices(xyz, attrs.voxel, keep="first")
         xyz, rows = xyz[keep], rows[keep]
@@ -132,8 +155,19 @@ def derive_cloud(source: CloudSource, attrs: CloudAttrs) -> PointCloud:
         colour = height_colors(xyz @ np.asarray(up, np.float64))
     else:
         colour = None
-    return PointCloud(xyz.astype(np.float32), colour, lab if attrs.label else None,
-                      None if normals is None else normals[rows])
+    total = len(rows)
+    step = 1 if max_points is None or total <= max_points else math.ceil(total / max_points)
+    if step > 1:
+        sel = np.arange(0, total, step)
+        xyz, rows = xyz[sel], rows[sel]
+        lab = None if lab is None else lab[sel]
+        colour = None if colour is None else colour[sel]
+    normals: NDArray[np.float32] | None = None
+    if attrs.normals:
+        normals = (source.normals.reshape(-1, 3)[rows] if isinstance(source, ImageCloudSource)
+                   else source.normals.at(rows))
+    cloud = PointCloud(xyz.astype(np.float32), colour, lab if attrs.label else None, normals)
+    return ThinnedCloud(cloud, total, step)
 
 
 def cloud_ply(source: CloudSource, attrs: CloudAttrs) -> bytes:

@@ -109,6 +109,20 @@ def test_voxel_downsample_latest_wins() -> None:
     assert g.voxel_downsample_indices(np.zeros((0, 3)), 0.1).size == 0
 
 
+@pytest.mark.parametrize("voxel", [0.5, 0.05, 1e-3, 1e-12])
+def test_voxel_downsample_matches_the_row_unique(voxel: float, rng: np.random.Generator) -> None:
+    """Packed 1-D keys give exactly the voxels of a row-wise unique (also when the key range is
+    too large to pack and the rows are used as they are)."""
+    pts = np.vstack([rng.normal(0, 3, (20_000, 3)), rng.normal(0, 3, (500, 3)).repeat(3, 0)])
+    keys = g.voxel_keys(pts, voxel)
+    for keep in ("first", "last"):
+        if keep == "first":
+            ref = np.sort(np.unique(keys, axis=0, return_index=True)[1])
+        else:
+            ref = np.sort(len(pts) - 1 - np.unique(keys[::-1], axis=0, return_index=True)[1])
+        np.testing.assert_array_equal(g.voxel_downsample_indices(pts, voxel, keep=keep), ref)
+
+
 def test_ransac_plane_with_prior(rng: np.random.Generator) -> None:
     floor = np.c_[rng.uniform(-2, 2, 500), rng.uniform(-2, 2, 500), rng.normal(0, 0.005, 500)]
     wall = np.c_[rng.uniform(-2, 2, 800), np.full(800, 1.0), rng.uniform(0, 2, 800)]

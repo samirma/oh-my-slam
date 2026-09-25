@@ -3,7 +3,6 @@
 // the scene JSON and /api/meta. Nothing is recomputed here.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
@@ -20,22 +19,29 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
+// [key, name, what it shows]
 const LAYERS = [
-  ['points', 'Point cloud'],
-  ['segments', 'Segmentation (object colours)'],
-  ['cameras', 'Camera poses'],
-  ['labels', 'Labels'],
-  ['obbs', 'Oriented boxes'],
+  ['points', 'Point cloud', 'The derived cloud, coloured by the color attribute below'],
+  ['segments', 'Segmentation overlay',
+    'Only the points of each object, in the object\'s colour, drawn over the point cloud whatever its color attribute'],
+  ['cameras', 'Camera poses', 'A frustum at each camera\'s pose; frustums next to the viewpoint fade out'],
+  ['labels', 'Labels', 'Every box gets its id tag in its colour; names where they fit (all on hover)'],
+  ['obbs', 'Oriented boxes', 'The objects\' oriented bounding boxes, in their colours'],
 ];
+// the color attribute's options, as the menu words them (the value stays the -p value)
+const COLOR_WORDS = {
+  rgb: 'rgb · image colours', segment: 'segment · object colours',
+  height: 'height · up-axis ramp', none: 'none · plain',
+};
 const DEBOUNCE_MS = 250;
 const state = {
   meta: null, scene: null, objects: [], objectRgb: new Map(), selected: null, hovered: null,
   layers: { points: true, segments: false, cameras: true, labels: true, obbs: true },
-  display: { pointSize: 2.0, labelDensity: 12, background: '#15171c', normals: 'shade' },
+  display: { pointSize: 2.0, labels: 'fit', background: '#15171c', normals: 'shade' },
   attrs: {},          // current point-cloud attributes, as the -p values the server parses
   cloud: null,        // header of the cloud on screen
   cloudSeq: 0, abort: null, debounce: null, framed: false, cloudInScene: false,
-  bbox: new THREE.Box3(), ready: false,
+  bbox: new THREE.Box3(), pointsBox: new THREE.Box3(), ready: false, labelsDirty: true,
 };
 window.__viewer = state; // for tests and debugging
 
@@ -46,11 +52,8 @@ renderer.setPixelRatio(window.devicePixelRatio);
 renderer.outputColorSpace = THREE.SRGBColorSpace;   // material colours are converted back exactly
 renderer.toneMapping = THREE.NoToneMapping;          // no tone mapping: colours stay exact
 host.appendChild(renderer.domElement);
-const labelRenderer = new CSS2DRenderer();
-labelRenderer.domElement.style.position = 'absolute';
-labelRenderer.domElement.style.top = '0';
-labelRenderer.domElement.style.pointerEvents = 'none';
-host.appendChild(labelRenderer.domElement);
+const labelLayer = el('div', { id: 'labels', 'aria-label': 'Object labels' });
+host.appendChild(labelLayer);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(state.display.background);
@@ -86,13 +89,13 @@ function pointMaterials() {
 function resize() {
   const w = host.clientWidth, h = host.clientHeight;
   renderer.setSize(w, h);
-  labelRenderer.setSize(w, h);
   camera.aspect = w / Math.max(h, 1);
   camera.updateProjectionMatrix();
   for (const o of state.objects) o.line.material.resolution.set(w, h);
   state.camHighlight?.material.resolution.set(w, h);
   const focal = focalPx();
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
+  state.labelsDirty = true;
 }
 window.addEventListener('resize', resize);
 
@@ -214,6 +217,7 @@ function showCloud({ header, arrays }) {
   if (arrays.normal) g.setAttribute('normal', new THREE.BufferAttribute(arrays.normal, 3));
   const pts = new THREE.Points(g, pointMaterial({ color: !!arrays.color, normal: !!arrays.normal }));
   pts.name = 'points';
+  pts.frustumCulled = false;
   groups.points.add(pts);
   // segmentation layer: the segmented points (object id != 0) in their object's colour, exactly
   // the colour the scene JSON states for that id (§2.4); drawn over the cloud
@@ -231,16 +235,19 @@ function showCloud({ header, arrays }) {
     sg.setIndex(new THREE.BufferAttribute(idx.slice(0, m), 1));
     const seg = new THREE.Points(sg, pointMaterial({ color: true, exact: true }));
     seg.name = 'segments';
+    seg.frustumCulled = false;
     seg.renderOrder = 1;  // after the cloud: same positions, depth test passes (less-or-equal)
     groups.segments.add(seg);
   }
   state.cloud = header;
   state.cloudInScene = true;
   updateNormalsControl();
+  updateLayerNotes();
   const pos = arrays.position;
   if (!state.framed && pos.length) {
     state.framed = true;
-    state.bbox.union(robustBox(pos, root.matrixWorld));
+    state.pointsBox = robustBox(pos, root.matrixWorld);
+    state.bbox.union(state.pointsBox);
     if (state.meta.mode === 'image') {
       // look-at point: median depth straight ahead of the photo's camera (camera frame +z)
       const zs = [];
@@ -252,7 +259,7 @@ function showCloud({ header, arrays }) {
   }
   const shown = header.count.toLocaleString();
   const thin = header.step > 1
-    ? ` of ${header.total.toLocaleString()} shown (every ${ordinal(header.step)}, for display)` : '';
+    ? ` of ${header.total.toLocaleString()} shown (every ${ordinal(header.step)}: display limit ${state.meta.max_points.toLocaleString()})` : '';
   $('#cloud-status').textContent = `${shown} points${thin} · derived in ${Math.round(header.seconds * 1000)} ms`;
   updateStats();
 }
@@ -271,6 +278,12 @@ function obbCorners(c) {
 const EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
 function prop(o, kind, name) { const v = (o.object_data[kind] || []).find((n) => n.name === name); return v ? v.val : null; }
 function attr(cub, name) { const v = ((cub.attributes || {}).num || []).find((n) => n.name === name); return v ? v.val : 0; }
+// text on a tag of this background: black or white, whichever contrasts more (WCAG luminance)
+function inkFor(rgb) {
+  const lin = rgb.map((v) => { const u = v / 255; return u <= 0.04045 ? u / 12.92 : ((u + 0.055) / 1.055) ** 2.4; });
+  const y = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+  return (y + 0.05) / 0.05 >= 1.05 / (y + 0.05) ? '#000' : '#fff';
+}
 
 function buildObjects(doc) {
   const objs = doc.openlabel.objects || {};
@@ -295,29 +308,51 @@ function buildObjects(doc) {
     pick.quaternion.set(qx, qy, qz, qw);
     pick.userData.id = Number(id);
     groups.pick.add(pick);
-    const div = el('div', { class: 'obj-label' }, `${o.type} ${id}`);
-    div.style.borderLeftColor = hex;
+    // label: the id tag in the object's colour, then the name; anchored at the top face's centre
+    const tag = el('span', { class: 'tag' }, String(id));
+    tag.style.background = hex;
+    tag.style.color = inkFor(rgb || [128, 128, 128]);
+    const div = el('div', { class: 'obj-label', 'data-id': id, title: `${o.type} ${id}` }, tag,
+      el('span', { class: 'name' }, o.type));
     div.addEventListener('click', (e) => { e.stopPropagation(); select(Number(id), true); });
-    const label = new CSS2DObject(div);
-    const top = corners.reduce((m, p) => (p.z > m.z ? p : m), corners[0]);
-    label.position.copy(top);
-    groups.labels.add(label);
+    div.addEventListener('pointerenter', () => { state.hovered = Number(id); state.labelsDirty = true; });
+    div.addEventListener('pointerleave', () => { if (state.hovered === Number(id)) state.hovered = null; state.labelsDirty = true; });
+    labelLayer.appendChild(div);
+    const display = corners.map((p) => p.clone().applyMatrix4(root.matrixWorld));
+    display.sort((a, b) => b.z - a.z);
+    const anchor = display.slice(0, 4).reduce((s, p) => s.add(p), new THREE.Vector3()).multiplyScalar(0.25);
+    const inv = new THREE.Quaternion(qx, qy, qz, qw).invert();
     state.objects.push({
       id: Number(id), label: o.type, hex, score: prop(o, 'num', 'score'), volume: attr(cub, 'volume_m3'),
       dims: [attr(cub, 'width_m'), attr(cub, 'depth_m'), attr(cub, 'height_m')],
-      center: new THREE.Vector3(x, y, z), corners, line, pick, labelObj: label, div,
+      center: new THREE.Vector3(x, y, z), half: new THREE.Vector3(sx / 2, sy / 2, sz / 2), inv,
+      corners, line, pick, div, anchor, size: Math.cbrt(Math.max(sx * sy * sz, 1e-9)),
+      w: 0, wTag: 0, h: 0, mode: null,
     });
   }
 }
 
 // ---------------------------------------------------------------- camera poses (scene JSON)
 // f.T is the served camera-to-scene pose (row-major 4 x 4, OpenCV axes: x right, y down, z forward).
+// Each frustum fades out as the viewpoint comes near it (within FADE_NEAR x its depth: hidden;
+// beyond FADE_FAR x: fully drawn), so the cameras next to the eye — the one being looked through
+// and its neighbours in a capture that turns in place — never draw lines across the view.
+const FADE_NEAR = 2.0, FADE_FAR = 5.0;
 function poseMatrix(f) { return new THREE.Matrix4().fromArray(f.T.flat()).transpose(); }
+function frustumFade(dist) {
+  const d = state.frustumDepth || 1;
+  return THREE.MathUtils.smoothstep(dist, FADE_NEAR * d, FADE_FAR * d);
+}
+// how much of camera i's frustum is drawn from the current viewpoint (0 hidden … 1 full); tests
+window.__viewerFrustumFade = (i) =>
+  frustumFade(camera.position.distanceTo(state.frustumCentres[i].clone().applyMatrix4(root.matrixWorld)));
 function buildFrustums(cams, size) {
   if (!cams.length) return;
   const d = Math.max(0.05, size * (cams.length === 1 ? 0.05 : 0.025));
-  const pos = [];
+  state.frustumDepth = d;
+  const pos = [], centre = [];
   state.frustumSegments = [];
+  state.frustumCentres = [];
   for (const f of cams) {
     const T = poseMatrix(f);
     const [fx, fy, cx, cy] = f.K; const [w, h] = f.size;
@@ -326,14 +361,39 @@ function buildFrustums(cams, size) {
       new THREE.Vector3((u - cx) / fx * d, (v - cy) / fy * d, d).applyMatrix4(T));
     const segs = [];
     for (let i = 0; i < 4; i++) { segs.push(...c.toArray(), ...cs[i].toArray(), ...cs[i].toArray(), ...cs[(i + 1) % 4].toArray()); }
+    const mid = new THREE.Vector3(0, 0, d / 2).applyMatrix4(T);  // the frustum's middle
     state.frustumSegments.push(segs);
+    state.frustumCentres.push(mid);
     pos.push(...segs);
+    for (let k = 0; k < 16; k++) centre.push(mid.x, mid.y, mid.z);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  const lines = new THREE.LineSegments(g, new THREE.LineBasicMaterial(
-    { color: srgb('#c9d1dc'), transparent: true, opacity: cams.length === 1 ? 0.6 : 0.85 }));
+  g.setAttribute('centre', new THREE.Float32BufferAttribute(centre, 3));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      color: { value: new THREE.Vector3(0xc9 / 255, 0xd1 / 255, 0xdc / 255) },  // sRGB, as written
+      opacity: { value: cams.length === 1 ? 0.6 : 0.85 },
+      fadeNear: { value: FADE_NEAR * d }, fadeFar: { value: FADE_FAR * d },
+    },
+    vertexShader: `
+      attribute vec3 centre;
+      uniform float fadeNear; uniform float fadeFar;
+      varying float vFade;
+      void main() {
+        vec3 c = (modelMatrix * vec4(centre, 1.0)).xyz;
+        vFade = smoothstep(fadeNear, fadeFar, distance(cameraPosition, c));
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 color; uniform float opacity;
+      varying float vFade;
+      void main() { if (vFade <= 0.001) discard; gl_FragColor = vec4(color, opacity * vFade); }`,
+    transparent: true, depthWrite: false,
+  });
+  const lines = new THREE.LineSegments(g, mat);
   lines.name = 'frustums';
+  lines.frustumCulled = false;
   groups.cameras.add(lines);
 }
 
@@ -358,12 +418,22 @@ function selectCamera(i) {
   }
   if (i == null || !state.frustumSegments) return;
   const geom = new LineSegmentsGeometry().setPositions(state.frustumSegments[i]);
-  const mat = new LineMaterial({ color: srgb('#5b8cff'), linewidth: 3.0, worldUnits: false });
+  const mat = new LineMaterial({ color: srgb('#5b8cff'), linewidth: 3.0, worldUnits: false, transparent: true });
   mat.resolution.set(host.clientWidth, host.clientHeight);
   state.camHighlight = new LineSegments2(geom, mat);
   state.camHighlight.name = 'selected-camera';
   state.camHighlight.renderOrder = 2;
   groups.cameras.add(state.camHighlight);
+  fadeHighlight();
+}
+// the selected camera's highlight fades like its frustum: hidden while looking through it
+function fadeHighlight() {
+  const hl = state.camHighlight;
+  if (!hl) return;
+  const c = state.frustumCentres[state.cameraIndex].clone().applyMatrix4(root.matrixWorld);
+  const a = frustumFade(camera.position.distanceTo(c));
+  hl.material.opacity = a;
+  hl.visible = a > 0.001;
 }
 function cameraView(f) {
   const M = poseMatrix(f).premultiply(root.matrixWorld);  // camera → display frame
@@ -462,21 +532,43 @@ function buildCameraList() {
 
 // ---------------------------------------------------------------- framing
 const DEFAULT_FOV = 55;
+// Map overview: a bird's-eye three-quarter view, HOME_PITCH below the horizon, of the whole scene
+// (the points' 2nd-98th percentile box and every camera centre). Steep enough that the walls of a
+// room hide little of its floor and objects and the camera cluster shows inside it; from the
+// south-west (HOME_AZIMUTH) so that the up axis stays vertical on screen.
+const HOME_PITCH = 60, HOME_AZIMUTH = new THREE.Vector2(-1, -1.2).normalize();
 function setFov(fov) {
   camera.fov = fov;
   camera.updateProjectionMatrix();
   const focal = focalPx();
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
 }
-function frameBox(box, pad = 1.15) {
-  const sphere = box.getBoundingSphere(new THREE.Sphere());
-  const r = Math.max(sphere.radius, 0.05) * pad;
-  const dist = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2));
-  const dir = new THREE.Vector3(-1, -1.2, 0.9).normalize();
-  controls.target.copy(sphere.center);
-  camera.position.copy(sphere.center).addScaledVector(dir, dist);
+// the distance from `target` along `dir` (unit, target → eye) at which all corners of `box` lie
+// inside the viewport, with `pad` of margin
+function fitDistance(box, target, dir, pad = 1.06) {
+  const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / pad;
+  const tanH = tanV * camera.aspect;
+  const fwd = dir.clone().negate();
+  const right = new THREE.Vector3().crossVectors(fwd, camera.up).normalize();
+  const up = new THREE.Vector3().crossVectors(right, fwd).normalize();
+  let dist = 0.1;
+  for (const x of [box.min.x, box.max.x]) for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) {
+    const rel = new THREE.Vector3(x, y, z).sub(target);
+    const along = rel.dot(dir);  // towards the eye
+    dist = Math.max(dist, Math.abs(rel.dot(right)) / tanH + along, Math.abs(rel.dot(up)) / tanV + along);
+  }
+  return dist;
+}
+function homeView(box) {
+  const pitch = THREE.MathUtils.degToRad(HOME_PITCH);
+  const dir = new THREE.Vector3(HOME_AZIMUTH.x * Math.cos(pitch), HOME_AZIMUTH.y * Math.cos(pitch), Math.sin(pitch));
+  const target = box.getCenter(new THREE.Vector3());
+  const dist = fitDistance(box, target, dir);
+  controls.target.copy(target);
+  camera.position.copy(target).addScaledVector(dir, dist);
+  const size = box.getSize(new THREE.Vector3()).length();
   camera.near = Math.max(dist / 1000, 0.005);
-  camera.far = dist * 50 + r * 10;
+  camera.far = dist * 50 + size * 10;
   camera.updateProjectionMatrix();
   controls.update();
 }
@@ -484,16 +576,18 @@ function resetView() {
   if (state.flight) endFlight();
   setFov(DEFAULT_FOV);
   if (state.meta && state.meta.mode === 'image' && state.photoTarget) {
-    // image mode: start just behind the photo's own viewpoint, looking forward
+    // image mode: start just behind the photo's own viewpoint, looking forward — close enough
+    // (at most one frustum depth) that the photo's own frustum is faded out, not drawn across it
     const eye = new THREE.Vector3(0, 0, 0).applyMatrix4(root.matrixWorld);
+    const back = Math.min(0.3, state.frustumDepth || 0.3);
     controls.target.copy(state.photoTarget);
-    camera.position.copy(eye).addScaledVector(state.photoTarget.clone().sub(eye).normalize(), -0.3);
+    camera.position.copy(eye).addScaledVector(state.photoTarget.clone().sub(eye).normalize(), -back);
     camera.near = 0.01; camera.far = 5000;
     camera.updateProjectionMatrix();
     controls.update();
     return;
   }
-  if (!state.bbox.isEmpty()) frameBox(state.bbox);
+  if (!state.bbox.isEmpty()) homeView(state.bbox);
 }
 function robustBox(positions, matrix) {
   // 2nd-98th percentile bounds of a sample: far outliers (windows, sky) do not shrink the view
@@ -535,34 +629,103 @@ function select(id, frame = false) {
   });
   const o = state.objects.find((x) => x.id === id);
   if (o && frame) frameObject(o);
-  updateLabels();
+  fadeBoxes();
+  state.labelsDirty = true;
 }
-function updateLabels() {
+
+// Labels (spec §2.5: labelled OBBs). Every box whose top is in view gets at least its id tag, in
+// its colour, so every OBB can be identified (the catalogue and the hover card give the rest).
+// Names are added where they fit: boxes are taken by apparent size (the selected and hovered one
+// first), each tries its full label above its anchor, then its tag there, then its tag beside or
+// below the anchor, and keeps the first placement that overlaps no label placed before; a tag
+// that fits nowhere is still shown at its anchor, under the others. Labels stay inside the view.
+const LABEL_GAP = 2;
+function measureLabels() {
+  for (const o of state.objects) {
+    o.div.classList.remove('compact');
+    o.w = o.div.offsetWidth; o.h = o.div.offsetHeight;
+    o.wTag = o.div.firstChild.offsetWidth;
+  }
+  state.measured = state.objects.every((o) => o.w > 0);
+}
+function layoutLabels() {
   const show = state.layers.labels;
   groups.labels.visible = show;
-  if (!show) return;
-  const camPos = camera.position.clone();
-  const ranked = state.objects
-    .map((o) => ({ o, d: o.center.clone().applyMatrix4(root.matrixWorld).distanceTo(camPos) }))
-    .sort((a, b) => (b.o.volume / (1 + b.d)) - (a.o.volume / (1 + a.d)));
-  const keep = new Set(ranked.slice(0, state.display.labelDensity).map((r) => r.o.id));
-  if (state.selected != null) keep.add(state.selected);
-  if (state.hovered != null) keep.add(state.hovered);
-  // declutter: drop labels whose screen positions collide with a higher-ranked label
-  const placed = [];
+  labelLayer.hidden = !show;
+  if (!show || !state.objects.length) return;
+  if (!state.measured) measureLabels();
   const w = host.clientWidth, h = host.clientHeight;
-  for (const { o } of ranked) {
-    let vis = keep.has(o.id);
-    if (vis) {
-      const p = o.labelObj.position.clone().applyMatrix4(root.matrixWorld).project(camera);
-      const sx = (p.x + 1) / 2 * w, sy = (1 - p.y) / 2 * h;
-      const pri = o.id === state.selected || o.id === state.hovered;
-      if (!pri && placed.some(([x, y]) => Math.abs(x - sx) < 70 && Math.abs(y - sy) < 16)) vis = false;
-      if (vis) placed.push([sx, sy]);
+  const eye = camera.position;
+  const p = new THREE.Vector3();
+  const cands = [];
+  for (const o of state.objects) {
+    p.copy(o.anchor).project(camera);
+    const sx = (p.x + 1) / 2 * w, sy = (1 - p.y) / 2 * h;
+    const inView = p.z < 1 && p.z > -1 && sx >= 0 && sx <= w && sy >= 0 && sy <= h;
+    if (!inView) { o.mode = null; continue; }
+    const pri = o.id === state.selected ? 2 : (o.id === state.hovered ? 1 : 0);
+    cands.push({ o, sx, sy, pri, rank: o.size / Math.max(eye.distanceTo(o.anchor), 1e-3) });
+  }
+  cands.sort((a, b) => (b.pri - a.pri) || (b.rank - a.rank) || (a.o.id - b.o.id));
+  const placed = [];
+  const hits = (x, y, bw, bh) => placed.some((r) => x < r[2] && r[0] < x + bw && y < r[3] && r[1] < y + bh);
+  const clampX = (x, bw) => Math.min(Math.max(x, LABEL_GAP), Math.max(LABEL_GAP, w - bw - LABEL_GAP));
+  const clampY = (y, bh) => Math.min(Math.max(y, LABEL_GAP), Math.max(LABEL_GAP, h - bh - LABEL_GAP));
+  const namesToo = state.display.labels === 'fit';
+  for (const { o, sx, sy, pri } of cands) {
+    const lh = o.h;
+    const tries = [];
+    if (namesToo || pri) tries.push([o.w, sx - o.wTag / 2, sy - lh - 3, 'full']);
+    tries.push([o.wTag, sx - o.wTag / 2, sy - lh - 3, 'compact'],
+      [o.wTag, sx + 4, sy - lh / 2, 'compact'], [o.wTag, sx - o.wTag - 4, sy - lh / 2, 'compact'],
+      [o.wTag, sx - o.wTag / 2, sy + 3, 'compact']);
+    let chosen = null;
+    for (const [bw, x0, y0, mode] of tries) {
+      const x = clampX(x0, bw), y = clampY(y0, lh);
+      if (pri || !hits(x - 1, y - 1, bw + 2, lh + 2)) { chosen = [x, y, bw, mode, false]; break; }
     }
-    o.labelObj.visible = vis;
+    if (!chosen) {
+      const [bw, x0, y0] = tries[namesToo ? 1 : 0];
+      chosen = [clampX(x0, bw), clampY(y0, lh), bw, 'compact', true];
+    }
+    const [x, y, bw, mode, under] = chosen;
+    if (!under) placed.push([x, y, x + bw, y + lh]);
+    o.mode = mode;
+    o.x = x; o.y = y; o.under = under; o.pri = pri;
+  }
+  for (const o of state.objects) {
+    const d = o.div;
+    if (o.mode == null) { if (!d.hidden) d.hidden = true; continue; }
+    if (d.hidden) d.hidden = false;
+    d.classList.toggle('compact', o.mode === 'compact');
+    d.classList.toggle('under', o.under);
+    d.style.transform = `translate(${Math.round(o.x)}px, ${Math.round(o.y)}px)`;
+    d.style.zIndex = String(o.pri ? 3 : (o.under ? 1 : 2));
   }
 }
+function updateLabels() { state.labelsDirty = true; }
+
+// Boxes the viewpoint is inside of, or next to, fade to OBB_FADE_MIN so that their edges do not
+// cross the whole view (e.g. after "Go to" a camera standing in a box); the selected one stays.
+const OBB_FADE_MIN = 0.2;
+function fadeBoxes() {
+  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const eye = camera.position.clone().applyMatrix4(inv);  // scene frame
+  const reach = Math.max(0.15, Math.min(1.0, 0.03 * (state.sceneSize || 5)));
+  const v = new THREE.Vector3();
+  for (const o of state.objects) {
+    v.copy(eye).sub(o.center).applyQuaternion(o.inv);
+    const out = Math.hypot(Math.max(Math.abs(v.x) - o.half.x, 0), Math.max(Math.abs(v.y) - o.half.y, 0),
+      Math.max(Math.abs(v.z) - o.half.z, 0));
+    const a = o.id === state.selected ? 1 : OBB_FADE_MIN + (1 - OBB_FADE_MIN) * THREE.MathUtils.smoothstep(out, 0, reach);
+    const m = o.line.material;
+    if (a >= 0.999) { if (m.transparent) { m.transparent = false; m.opacity = 1; m.needsUpdate = true; } } else {
+      if (!m.transparent) { m.transparent = true; m.needsUpdate = true; }
+      m.opacity = a;
+    }
+  }
+}
+
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
 function pickAt(ev) {
@@ -579,7 +742,7 @@ function pickAt(ev) {
 const tooltip = $('#tooltip');
 renderer.domElement.addEventListener('pointermove', (ev) => {
   const id = pickAt(ev);
-  if (id !== state.hovered) { state.hovered = id; updateLabels(); }
+  if (id !== state.hovered) { state.hovered = id; state.labelsDirty = true; }
   if (id == null) { tooltip.hidden = true; renderer.domElement.style.cursor = ''; return; }
   const o = state.objects.find((x) => x.id === id);
   const [w, d, h] = o.dims;
@@ -621,31 +784,56 @@ $('#toggle-panel').addEventListener('click', () => {
 $('#reset-view').addEventListener('click', resetView);
 window.addEventListener('keydown', (e) => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (!$('#lightbox').hidden) { if (e.key === 'Escape') closeLightbox(); return; }
   if (e.key === 'r' || e.key === 'R') resetView();
   if (e.key === 'Escape') { select(null); selectCamera(null); }
   if (e.key === '[') stepCamera(-1);
   if (e.key === ']') stepCamera(1);
 });
 
+// ---------------------------------------------------------------- segmented image: lightbox
+function openLightbox() {
+  const box = $('#lightbox');
+  box.hidden = false;
+  box.classList.remove('actual');
+  $('#lightbox-close').focus();
+}
+function closeLightbox() { $('#lightbox').hidden = true; $('#segmented-open').focus(); }
+$('#segmented-open').addEventListener('click', openLightbox);
+$('#lightbox-close').addEventListener('click', closeLightbox);
+$('#lightbox').addEventListener('click', (e) => { if (e.target.id === 'lightbox') closeLightbox(); });
+$('#lightbox img').addEventListener('click', () => $('#lightbox').classList.toggle('actual'));
+
 // ---------------------------------------------------------------- Layers
 function applyLayers() {
   for (const k of ['points', 'segments', 'cameras', 'obbs']) groups[k].visible = state.layers[k];
+  groups.labels.visible = state.layers.labels;
   groups.pick.visible = state.layers.obbs;
   if (!state.layers.obbs) tooltip.hidden = true;
-  updateLabels();
+  state.labelsDirty = true;
 }
 function buildLayers() {
   const counts = { cameras: state.meta.cameras.length, labels: state.objects.length, obbs: state.objects.length };
-  for (const [k, name] of LAYERS) {
+  for (const [k, name, help] of LAYERS) {
     const cb = el('input', { type: 'checkbox', id: `layer-${k}` });
     cb.checked = state.layers[k];
     cb.addEventListener('change', () => { state.layers[k] = cb.checked; applyLayers(); });
     const text = k === 'cameras' && counts.cameras === 1 ? 'Camera pose' : name;
-    const row = el('label', { class: 'row check', 'data-layer': k, for: `layer-${k}` }, cb,
-      el('span', {}, text), el('span', { class: 'count' }, k in counts ? String(counts[k]) : ''));
+    const row = el('label', { class: 'row check', 'data-layer': k, for: `layer-${k}`, title: help }, cb,
+      el('span', {}, text, el('small', { class: 'layer-note', id: `layer-note-${k}` })),
+      el('span', { class: 'count' }, k in counts ? String(counts[k]) : ''));
     if (k === 'cameras' && !counts.cameras) { cb.disabled = true; row.classList.add('disabled'); }
     $('#layers').append(row);
   }
+  updateLayerNotes();
+}
+// what the two object-colour displays are doing, so that they cannot be confused
+function updateLayerNotes() {
+  const note = $('#layer-note-segments');
+  if (!note) return;
+  note.textContent = state.attrs.color === 'segment'
+    ? 'the point cloud is coloured by object too (color=segment)'
+    : 'object points in their colours, over the cloud';
 }
 
 // ---------------------------------------------------------------- Point cloud (attributes)
@@ -667,7 +855,8 @@ function buildCloudControls() {
     let input;
     let set;  // (value) → update the widget
     if (c.kind === 'choice') {
-      input = el('select', { id }, ...c.options.map((o) => el('option', { value: o }, o)));
+      const words = c.key === 'color' ? COLOR_WORDS : {};
+      input = el('select', { id }, ...c.options.map((o) => el('option', { value: o }, words[o] || o)));
       input.addEventListener('change', () => setAttr(c.key, input.value));
       set = (v) => { input.value = v; };
     } else if (c.kind === 'toggle') {
@@ -713,6 +902,7 @@ function setAttr(key, value) {
 }
 function attrsChanged() {
   updateCli();
+  updateLayerNotes();
   setBusy(true);
   clearTimeout(state.debounce);
   state.debounce = setTimeout(reloadCloud, DEBOUNCE_MS);
@@ -779,8 +969,12 @@ function buildDisplay() {
     for (const m of pointMaterials()) m.uniforms.shade.value = SHADE[sel.value];
   });
   host.append(el('div', { class: 'row attr' }, el('label', { for: 'display-normals' }, 'normals'), sel, el('output')));
-  host.append(rangeRow('max labels', 'display-labels', 0, 60, 1, state.display.labelDensity,
-    (v) => `${v}`, (v) => { state.display.labelDensity = v; updateLabels(); }));
+  const lab = el('select', { id: 'display-labels' },
+    el('option', { value: 'fit' }, 'id tags + names that fit'), el('option', { value: 'ids' }, 'id tags only'));
+  lab.value = state.display.labels;
+  lab.addEventListener('change', () => { state.display.labels = lab.value; state.labelsDirty = true; });
+  host.append(el('div', { class: 'row attr', title: 'Every box always gets its id tag; the name shows on hover and selection' },
+    el('label', { for: 'display-labels' }, 'labels'), lab, el('output')));
   const bg = el('input', { type: 'color', id: 'display-bg' });
   bg.value = state.display.background;
   bg.addEventListener('input', () => { state.display.background = bg.value; scene.background.set(bg.value); });
@@ -797,12 +991,13 @@ function buildCatalogue() {
     const [w, d, h] = o.dims;
     const tr = el('tr', { 'data-id': o.id },
       el('td', {}, el('span', { class: 'swatch', style: `background:${o.hex}`, title: o.hex })),
-      el('td', {}, String(o.id)), el('td', {}, o.label),
-      el('td', {}, o.score != null ? o.score.toFixed(2) : ''),
-      el('td', {}, `${w.toFixed(2)}×${d.toFixed(2)}×${h.toFixed(2)}`), el('td', {}, o.volume.toFixed(3)));
+      el('td', { class: 'num' }, String(o.id)), el('td', { class: 'label', title: o.label }, o.label),
+      el('td', { class: 'num' }, o.score != null ? o.score.toFixed(2) : ''),
+      el('td', { class: 'num dims' }, `${w.toFixed(2)}×${d.toFixed(2)}×${h.toFixed(2)}`),
+      el('td', { class: 'num' }, o.volume.toFixed(3)));
     tr.addEventListener('click', () => select(o.id, true));
-    tr.addEventListener('mouseenter', () => { state.hovered = o.id; updateLabels(); });
-    tr.addEventListener('mouseleave', () => { state.hovered = null; updateLabels(); });
+    tr.addEventListener('mouseenter', () => { state.hovered = o.id; state.labelsDirty = true; });
+    tr.addEventListener('mouseleave', () => { state.hovered = null; state.labelsDirty = true; });
     tbody.appendChild(tr);
   }
   if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'No objects.')));
@@ -815,8 +1010,11 @@ function buildCatalogue() {
 }
 function updateStats() {
   const s = state.meta.stats;
-  const pts = state.cloud ? state.cloud.count : 0;
-  $('#stats').textContent = `${pts.toLocaleString()} points · ${s.objects} objects · ${s.frames} frame${s.frames === 1 ? '' : 's'}`;
+  const c = state.cloud;
+  const pts = c ? c.count : 0;
+  const shown = c && c.step > 1 ? `${pts.toLocaleString()} of ${c.total.toLocaleString()} points (display limit)` : `${pts.toLocaleString()} points`;
+  const items = [shown, `${s.objects} objects`, `${s.frames} frame${s.frames === 1 ? '' : 's'}`];
+  $('#stats').replaceChildren(...items.flatMap((t, i) => [i ? ' · ' : '', el('span', { class: 'stat' }, t)]));
 }
 
 // ---------------------------------------------------------------- main
@@ -835,11 +1033,13 @@ async function main() {
   const buffer = await fetchWithProgress(`/api/cloud?${attrQuery()}`, loadRow('point cloud'));
   showCloud(parseCloud(buffer));
   const size = state.bbox.isEmpty() ? 1 : state.bbox.getSize(new THREE.Vector3()).length();
+  state.sceneSize = size;
   buildFrustums(state.meta.cameras, size);
   for (const f of state.meta.cameras) state.bbox.expandByPoint(new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]).applyMatrix4(root.matrixWorld));
   if (state.meta.has_segmented) {
     $('#tab-image-btn').hidden = false;
     $('#segmented').src = '/api/segmented.png';
+    $('#lightbox img').src = '/api/segmented.png';
   }
   state.layers.cameras = state.meta.cameras.length > 0;
   buildLayers();
@@ -857,17 +1057,23 @@ async function main() {
 // <body data-rendered="true"> once a frame showing the point cloud has been drawn and presented:
 // set in the animation frame after the first one that rendered the loaded cloud; never removed.
 let cloudFrames = 0;
-let lastLabelUpdate = 0;
-function animate(t) {
+const lastView = new THREE.Matrix4();
+function animate() {
   requestAnimationFrame(animate);
   stepFlight(performance.now());
   controls.update();
-  if (t - lastLabelUpdate > 150) { lastLabelUpdate = t; if (state.objects.length) updateLabels(); }
+  camera.updateMatrixWorld();
+  if (!lastView.equals(camera.matrixWorld)) {  // the viewpoint moved: labels and fades follow
+    lastView.copy(camera.matrixWorld);
+    state.labelsDirty = true;
+    if (state.objects.length) fadeBoxes();
+    fadeHighlight();
+  }
+  if (state.labelsDirty && state.ready) { state.labelsDirty = false; layoutLabels(); }
   if (state.ready && state.cloudInScene && !document.body.dataset.rendered && ++cloudFrames > 1) {
     document.body.dataset.rendered = 'true';
   }
   renderer.render(scene, camera);
-  labelRenderer.render(scene, camera);
 }
 requestAnimationFrame(animate);
 main().catch((err) => {

@@ -137,13 +137,13 @@ def keyframe_labels(reader: store.MapReader, state: ObjectState) -> list[Keyfram
 
 
 def scene_bytes(reader: store.MapReader, tool: str | None = None) -> bytes:
-    """The map's ``-t full`` scene (the one the last update stored); ``tool`` replaces the
-    ``metadata.tool`` of the producing command (``mapper``)."""
-    if reader.exists(store.SCENE_JSON):
-        doc = reader.read_json(store.SCENE_JSON)
-    else:
-        _, objs = map_objects(reader)
-        doc = full_scene(reader.root, reader.meta, reader.frames, objs)
+    """The map's scene JSON (``segment.sh -m``, ``view.sh -m``), built from its persisted state by
+    the code that wrote ``scene.json``, rather than read back from that file: the object colours
+    are a pure function of the ids *now* (§2.4), so they agree with the PLY, ``segmented.png`` and
+    catalogue derived in the same run even for a map written before a palette change. ``tool``
+    replaces the ``metadata.tool`` of the producing command (``mapper``)."""
+    _, objs = map_objects(reader)
+    doc = full_scene(reader.root, reader.meta, reader.frames, objs)
     if tool is not None:
         doc["openlabel"]["metadata"]["tool"] = tool
     return json_payload_bytes(doc)
