@@ -1,7 +1,7 @@
 """Evaluator metrics on synthetic data: yaw alignment and wrap, pitch direction, registration,
 same-heading and all-pairs depth agreement, one-update vs split object stability (label agreement
-on a label-blind pairing), near-duplicate objects, cloud points outside their object's box,
-segmentation vs map."""
+on a label-blind pairing), near-duplicate objects, detected mask points and cloud points outside
+their object's box, segmentation vs map."""
 
 from __future__ import annotations
 
@@ -18,8 +18,10 @@ from oh_my_slam.mapping.store import FrameRecord
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.obb import OBB
 from oh_my_slam.tools.evaluate.mapquality import (
+    FAR_GAP,
+    MASK_MARGIN_M,
     NEAR_DUPLICATE_GAP_M,
-    OUT_OF_BOX_MARGIN_M,
+    PAIRS_MAX_ANGLE_DEG,
     agreement_metrics,
     box_gap,
     duplicate_metrics,
@@ -195,30 +197,52 @@ def sphere_depth(radius: float = 2.0) -> np.ndarray:
 
 def test_all_overlapping_pairs_agreement(captures: list, tmp_path: Path) -> None:
     """Two laps of a head turning in place (12° steps, the second lap offset by 5°) inside a
-    sphere; the last 10 keyframes place it 15 % further (a depth scale that drifted). Every pair
-    less than 30° apart and more than 10 keyframes apart is compared — loop closures included."""
+    sphere; keyframes 50-52 place it 15 % further (a depth that drifted over a few keyframes).
+    Every pair less than 45° apart is compared, whatever its distance in capture order: sequence
+    neighbours and loop closures; the detail splits them."""
     yaws = [12.0 * k for k in range(30)] + [12.0 * k + 5.0 for k in range(30)]
     recs = [record(i, captures[i % len(captures)].name, cam(y)) for i, y in enumerate(yaws)]
-    depths = {r.name: sphere_depth() * (1.15 if r.index >= 50 else 1.0) for r in recs}
+
+    def off(r: FrameRecord) -> bool:
+        return 50 <= r.index < 53
+
+    depths = {r.name: sphere_depth() * (1.15 if off(r) else 1.0) for r in recs}
     write_map(tmp_path, recs, depths)
     pairs = overlapping_pairs(recs)
-    assert all(b.index - a.index > 10 for a, b in pairs)
+    assert (recs[0], recs[1]) in pairs and (recs[0], recs[3]) in pairs  # neighbours, 12-36°
+    assert (recs[0], recs[4]) not in pairs  # 48° apart
     assert (recs[0], recs[29]) in pairs  # the first lap closes on itself (12° apart)
-    assert (recs[0], recs[1]) not in pairs and (recs[0], recs[2]) not in pairs
+    assert PAIRS_MAX_ANGLE_DEG == 45.0
     m = Metrics()
     worst = agreement_metrics(m, "map.t", tmp_path, captures)
-    drifted = sum(1 for a, b in pairs if (a.index >= 50) != (b.index >= 50))
+    drifted = [(a, b) for a, b in pairs if off(a) != off(b)]
     median = m.items["map.t.frame_agreement_pairs_median_pct"]
     detail = median.detail
-    assert detail["pairs"] == len(pairs) and 0 < drifted < len(pairs) / 2
+    assert detail["pairs"] == len(pairs) and 0 < len(drifted) < len(pairs) / 10
     assert median.value == pytest.approx(0.0, abs=0.2)  # float16 depth storage
     over = m.items["map.t.frame_agreement_pairs_over10_pct"].value
-    assert over == pytest.approx(100.0 * drifted / len(pairs), abs=0.01)
-    # |1/1.15 - 1| = 13.0 % for every pair of a drifted and an undrifted keyframe
-    assert worst[0]["median_pct"] == pytest.approx(13.04, abs=0.1)
-    assert m.items["map.t.frame_agreement_pairs_p90_pct"].value == pytest.approx(
-        13.04 if drifted / len(pairs) > 0.1 else 0.0, abs=0.2)
+    assert over == pytest.approx(100.0 * len(drifted) / len(pairs), abs=0.01)
+    # a drifted keyframe compared into an undrifted one: 15 %; the reverse: |1/1.15 - 1| = 13 %
+    assert {round(r["median_pct"]) for r in worst} == {15, 13}
+    assert worst[0]["median_pct"] == pytest.approx(15.0, abs=0.1)
+    assert m.items["map.t.frame_agreement_pairs_max_pct"].value == pytest.approx(15.0, abs=0.1)
+    assert m.items["map.t.frame_agreement_pairs_p90_pct"].value == pytest.approx(0.0, abs=0.2)
+    near = [(a, b) for a, b in pairs if b.index - a.index <= FAR_GAP]
+    assert detail["neighbours"]["pairs"] == len(near)
+    assert detail["far"]["pairs"] == len(pairs) - len(near)
+    assert detail["neighbours"]["over10_pct"] == pytest.approx(
+        100.0 * sum(1 for p in drifted if p in near) / len(near), abs=0.01)
+    assert {"gap", "angle_deg"} <= set(worst[0])
     assert set(detail["same_heading"]) >= {"001_bootstrap_level.jpg~053_right_to_000_level.jpg"}
+
+
+def test_a_pair_that_disagrees_everywhere_counts_as_grossly_inconsistent(
+        captures: list, tmp_path: Path) -> None:
+    recs = [record(0, captures[0].name, cam(0.0)), record(1, captures[1].name, cam(5.0))]
+    write_map(tmp_path, recs, {"f000001": sphere_depth() * 1.6, "f000000": sphere_depth()})
+    m = Metrics()
+    agreement_metrics(m, "map.t", tmp_path, captures)
+    assert m.items["map.t.frame_agreement_pairs_max_pct"].value == pytest.approx(30.0)
 
 
 def box(oid: int, label: str, centre: tuple[float, float, float],
@@ -373,16 +397,18 @@ def test_near_duplicates_count_pieces_of_one_surface_labelled_differently() -> N
         assert duplicate_metrics(m, "m", [desk, other]) == []
 
 
-def test_cloud_points_outside_their_object_box(tmp_path: Path) -> None:
+def test_cloud_points_outside_their_object_gate(tmp_path: Path) -> None:
     from oh_my_slam.core.ply import PointCloud, ply_bytes
+    from oh_my_slam.mapping.geometry import attribution_margin
 
     rng = np.random.default_rng(0)
     desk = box(2, "desk", (0.0, 0.0, 0.7), (1.2, 0.6, 0.1))
     cup = box(5, "cup", (2.0, 0.0, 0.8), (0.1, 0.1, 0.1))
+    gate = attribution_margin(2.0)  # the objects' default viewing distance
     on_desk = rng.uniform(-0.5, 0.5, (900, 3)) * (1.2, 0.6, 0.1) + (0.0, 0.0, 0.7)
     floor = rng.uniform(-0.5, 0.5, (100, 3)) * (1.0, 1.0, 0.0) + (0.0, 2.0, 0.0)
     near = on_desk[:50].copy()
-    near[:, 2] = 0.75 + OUT_OF_BOX_MARGIN_M - 0.01  # above the top, within the margin
+    near[:, 2] = 0.75 + gate - 0.01  # above the top, within the gate
     cup_pts = rng.uniform(-0.05, 0.05, (60, 3)) + (2.0, 0.0, 0.8)
     grey = rng.uniform(-1, 1, (200, 3))
     xyz = np.concatenate([on_desk, floor, near, cup_pts, grey])
@@ -391,10 +417,50 @@ def test_cloud_points_outside_their_object_box(tmp_path: Path) -> None:
     np.save(tmp_path / "cloud_objects.npy", labels.astype(np.int32))
     write_map(tmp_path, [record(0, "001_bootstrap_level.jpg", cam(0.0))])
     m = Metrics()
-    rows = out_of_box_metrics(m, "map.t", tmp_path, [desk, cup])
-    assert m.items["map.t.out_of_box_share"].value == pytest.approx(100 / 1050, abs=1e-4)
+    rows = out_of_box_metrics(m, "map.t", tmp_path, [desk, cup])["cloud_out_of_box_share"]
+    assert m.items["map.t.cloud_out_of_box_share"].value == pytest.approx(100 / 1050, abs=1e-4)
     assert rows[0]["id"] == 2 and rows[0]["points"] == 1050
     assert rows[1] == {"id": 5, "label": "cup", "points": 60, "outside_share": 0.0}
+    # no keyframe detected either object: nothing to lift
+    assert m.items["map.t.mask_out_of_box_share"].value == 0.0
+
+
+def test_detected_mask_points_outside_their_object_box(tmp_path: Path) -> None:
+    """A keyframe looks at a wall 2 m away; the desk's box covers a patch of the wall, and its
+    mask covers that patch plus as much again to the right (bleeding onto the wall). The cup's
+    mask lies inside its box; a mask of a merged id counts for the object it merged into."""
+    from oh_my_slam.core import rle
+
+    rec = record(0, "001_bootstrap_level.jpg", cam(0.0))
+    write_map(tmp_path, [rec], {rec.name: np.full((K.height, K.width), 2.0)})
+    T = rec.T_map_cam
+    # pixel (u, v) at depth 2 → map point
+    def at(u: float, v: float) -> np.ndarray:
+        return np.asarray(T.apply(np.array([[(u - K.cx) / K.fx * 2, (v - K.cy) / K.fy * 2, 2.0]]))[0])
+
+    lo, hi = at(40, 30), at(80, 90)  # the desk patch: columns 40-79, rows 30-89
+    centre = (lo + hi) / 2
+    size = np.abs(hi - lo) + (0.1, 0.0, 0.0)
+    size[0] = 0.1  # the wall's thickness
+    desk = box(2, "desk", tuple(centre), tuple(np.maximum(size, 0.1)))
+    cup = box(5, "cup", tuple(at(120, 60)), (0.3, 0.3, 0.3))
+    desk_mask = np.zeros((K.height, K.width), bool)
+    desk_mask[30:90, 40:120] = True  # half on the patch, half 0.8-1.6 m beside it
+    cup_mask = np.zeros((K.height, K.width), bool)
+    cup_mask[57:63, 117:123] = True
+    inst = {"instances": [{"object_id": 2, "label": "desk", "mask": rle.encode(desk_mask)},
+                          {"object_id": 9, "label": "cup", "mask": rle.encode(cup_mask)}]}
+    (tmp_path / "per_frame" / rec.name / "instances.json").write_text(json.dumps(inst))
+    (tmp_path / "objects.json").write_text(json.dumps({"merged_into": {"9": 5}, "objects": []}))
+    m = Metrics()
+    rows = out_of_box_metrics(m, "map.t", tmp_path, [desk, cup])["mask_out_of_box_share"]
+    by = {r["id"]: r for r in rows}
+    assert by[2]["points"] == 60 * 80 and by[5]["points"] == 36
+    # the margin (5 % of 2 m = 10 cm, ~5 px) keeps a few columns beside the patch
+    margin_px = int(max(MASK_MARGIN_M, 0.05 * 2.0) / 2.0 * K.fx)
+    assert by[2]["outside_share"] == pytest.approx((40 - margin_px) / 80, abs=0.03)
+    assert by[5]["outside_share"] == 0.0
+    assert m.items["map.t.mask_out_of_box_share"].value == by[2]["outside_share"]
 
 
 def test_far_apart_boxes_are_not_matched() -> None:

@@ -320,15 +320,19 @@ def _details(details: dict[str, Any]) -> list[str]:
         if rows:
             out += _section(
                 f"Least consistent overlapping keyframe pairs — {name} map",
-                ["captures", "median disagreement %", "p90 %"],
-                [[r["pair"], r["median_pct"], r["p90_pct"]] for r in rows])
+                ["captures", "keyframes apart", "angle °", "median disagreement %", "p90 %"],
+                [[r["pair"], r.get("gap"), r.get("angle_deg"), r["median_pct"], r["p90_pct"]]
+                 for r in rows])
+    titles = {"mask_out_of_box_share": "Detected mask points outside their object's box",
+              "cloud_out_of_box_share": "Cloud points outside their object's attribution gate"}
     for name in ("single", "split"):
-        rows = [r for r in details.get(f"map.{name}.out_of_box") or [] if r["outside_share"] > 0]
-        if rows:
-            out += _section(
-                f"Cloud points outside their object's box — {name} map",
-                ["id", "label", "points", "share outside"],
-                [[r["id"], r["label"], r["points"], r["outside_share"]] for r in rows[:10]])
+        per_metric = details.get(f"map.{name}.out_of_box") or {}
+        for key, title in titles.items():
+            rows = [r for r in per_metric.get(key, []) if r["outside_share"] > 0]
+            if rows:
+                out += _section(
+                    f"{title} — {name} map", ["id", "label", "points", "share outside"],
+                    [[r["id"], r["label"], r["points"], r["outside_share"]] for r in rows[:10]])
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
     return out

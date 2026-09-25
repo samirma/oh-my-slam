@@ -9,12 +9,13 @@ surface (frames merged without agreeing) show up here. Two groups of pairs:
 
 * the spec's same-heading pairs (§5: 001/053 and 026/078), which see the same surfaces from
   nearly the same pose (``frame_agreement_*``: worst pair's median and p90);
-* every overlapping pair that is not a sequence neighbour (``frame_agreement_pairs_*``): optical
-  axes less than ``PAIRS_MAX_ANGLE_DEG`` apart, more than ``PAIRS_MIN_GAP`` keyframes apart in
-  capture order, and at least ``MIN_OVERLAP_PX`` shared pixels — loop closures included, where a
-  depth scale that drifted along the sequence shows. Reported: the median and the p90 over the
-  pairs of each pair's median disagreement, and the share of pairs whose median disagreement
-  exceeds ``GROSS_PCT``.
+* every overlapping pair (``frame_agreement_pairs_*``): optical axes less than
+  ``PAIRS_MAX_ANGLE_DEG`` apart and at least ``MIN_OVERLAP_PX`` shared pixels, whatever their
+  distance in capture order — sequence neighbours, where keyframe-by-keyframe depth disagrees
+  locally, and loop closures, where a depth scale that drifted along the sequence shows.
+  Reported: the median and the p90 over the pairs of each pair's median disagreement, the share
+  of pairs whose median disagreement exceeds ``GROSS_PCT`` and the worst pair; the detail repeats
+  them for the neighbours (at most ``FAR_GAP`` keyframes apart) and the far pairs (more).
 
 Duplicates method (``near_duplicates``): pairs of exported objects that no keyframe observed
 together (their ``frame_intervals`` are disjoint: a keyframe that detected both saw two things),
@@ -25,10 +26,20 @@ detector names pieces of one counter top differently) with box tops within
 object mapped twice — typically by keyframes whose monocular depth disagrees, which places the
 copies along the same viewing rays at different depths — is such a pair.
 
-Out-of-box method (``out_of_box_share``): for each exported object, the share of the map-cloud
-points attributed to it (``cloud_objects.npy``, drawn in its colour by ``segments.ply`` and
-``color=segment``) that lie outside its OBB grown by ``OUT_OF_BOX_MARGIN_M``; the metric is the
-largest share over the objects. The box and the coloured points of an object must coincide.
+Out-of-box methods: an object's box and what the map shows as the object must coincide.
+
+* ``mask_out_of_box_share``: for each exported object, its detections' mask pixels in the
+  keyframes that detected it (``per_frame/*/instances.json``, merged ids resolved) are lifted with
+  those keyframes' stored depth and pose (valid pixels off depth edges); the share of them outside
+  its OBB grown by max(``MASK_MARGIN_M``, ``MASK_MARGIN_REL`` · their depth) — the depth noise — is
+  mask that bled onto other surfaces (a "carpet" mask over a counter and the floor beyond it) or
+  sightings that place the object elsewhere. The metric is the largest share over the objects.
+  It does not use the mapper's box fit or its cloud attribution, only what the detector saw.
+* ``cloud_out_of_box_share``: the share of each exported object's map-cloud points
+  (``cloud_objects.npy``, drawn in its colour by ``segments.ply`` and ``color=segment``) outside
+  the mapper's attribution gate (``mapping.geometry.attribution_margin``: its OBB grown by the
+  depth noise at its viewing distance): a check that the gate holds for every path that labels
+  cloud points (votes, the support fallback, later updates), 0 by construction when it does.
 
 Stability method: the split map is brought into the one-update map's frame by the rigid transform
 that best maps the camera poses of the captures registered in both (rotation average + mean
@@ -75,14 +86,17 @@ SAME_SURFACE = 0.3  # larger relative differences are occlusions, not the same s
 PIXEL_STEP = 7  # every 7th valid pixel of the source keyframe is back-projected
 SAME_HEADING_METRICS = ("frame_agreement_median_pct", "frame_agreement_p90_pct")
 PAIRS_METRICS = ("frame_agreement_pairs_median_pct", "frame_agreement_pairs_p90_pct",
-                 "frame_agreement_pairs_over10_pct")
+                 "frame_agreement_pairs_over10_pct", "frame_agreement_pairs_max_pct")
 AGREEMENT_METRICS = (*SAME_HEADING_METRICS, *PAIRS_METRICS)
-PAIRS_MAX_ANGLE_DEG = 30.0
-PAIRS_MIN_GAP = 10
+PAIRS_MAX_ANGLE_DEG = 45.0
+FAR_GAP = 10  # pairs more than this many keyframes apart are "far" (loop closures) in the detail
 GROSS_PCT = 10.0  # a pair disagreeing by more than this is grossly inconsistent
 WORST_LISTED = 10
-OUT_OF_BOX_METRIC = "out_of_box_share"
-OUT_OF_BOX_MARGIN_M = 0.05
+MASK_OUT_OF_BOX_METRIC = "mask_out_of_box_share"
+CLOUD_OUT_OF_BOX_METRIC = "cloud_out_of_box_share"
+OUT_OF_BOX_METRICS = (MASK_OUT_OF_BOX_METRIC, CLOUD_OUT_OF_BOX_METRIC)
+MASK_MARGIN_M = 0.05
+MASK_MARGIN_REL = 0.05
 STABILITY_METRICS = ("matched_fraction", "label_agreement", "id_agreement",
                      "centre_delta_median_m", "extent_delta_median_rel", "obb_iou_median")
 DUPLICATE_METRIC = "near_duplicates"
@@ -95,7 +109,8 @@ NEAR_DUPLICATE_GAP_M = 0.3
 def pair_agreement(reader: MapReader, ri: FrameRecord, rj: FrameRecord
                    ) -> tuple[float, float] | None:
     """Median and p90 of |z_i→j / z_j - 1| with keyframe ``ri``'s depth back-projected into
-    ``rj`` (same surfaces only); None when they share fewer than ``MIN_OVERLAP_PX`` pixels."""
+    ``rj`` (same surfaces only); None when they share fewer than ``MIN_OVERLAP_PX`` pixels, and
+    ``SAME_SURFACE`` when they share pixels but disagree beyond it everywhere."""
     di, vi = reader.depth(ri), reader.valid(ri)
     dj, vj = reader.depth(rj), reader.valid(rj)
     v, u = np.nonzero(vi & (di > 0))
@@ -115,20 +130,21 @@ def pair_agreement(reader: MapReader, ri: FrameRecord, rj: FrameRecord
         return None
     r = np.abs(zq[keep] / dj[vv[keep], uu[keep]] - 1)
     r = r[r < SAME_SURFACE]
+    if not len(r):
+        return SAME_SURFACE, SAME_SURFACE
     return float(np.median(r)), float(np.percentile(r, 90))
 
 
 def overlapping_pairs(frames: list[FrameRecord]) -> list[tuple[FrameRecord, FrameRecord]]:
     """Keyframe pairs (earlier first) whose optical axes are less than ``PAIRS_MAX_ANGLE_DEG``
-    apart and that are more than ``PAIRS_MIN_GAP`` keyframes apart in capture order."""
+    apart, whatever their distance in capture order."""
     fr = sorted(frames, key=lambda r: r.index)
     if len(fr) < 2:
         return []
     F = np.array([r.T_map_cam.R[:, 2] for r in fr])
     cos = F @ F.T
     near = cos > float(np.cos(np.radians(PAIRS_MAX_ANGLE_DEG)))
-    return [(a, b) for i, a in enumerate(fr) for j, b in enumerate(fr)
-            if j > i and b.index - a.index > PAIRS_MIN_GAP and near[i, j]]
+    return [(a, b) for i, a in enumerate(fr) for j, b in enumerate(fr) if j > i and near[i, j]]
 
 
 def _pct(res: tuple[float, float]) -> dict[str, float]:
@@ -138,9 +154,9 @@ def _pct(res: tuple[float, float]) -> dict[str, float]:
 def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Capture]
                       ) -> list[dict[str, Any]]:
     """``<prefix>.frame_agreement_*``: depth disagreement of the spec's same-heading keyframe
-    pairs (worst pair's median and p90, in %) and of every overlapping pair that is not a
-    sequence neighbour (``overlapping_pairs``: median and p90 over the pairs of each pair's
-    median, and the share of pairs above ``GROSS_PCT``, in %). Returns the worst pairs."""
+    pairs (worst pair's median and p90, in %) and of every overlapping pair
+    (``overlapping_pairs``: median and p90 over the pairs of each pair's median, the share of
+    pairs above ``GROSS_PCT`` and the worst pair, in %). Returns the worst pairs."""
     ids = [f"{prefix}.{k}" for k in SAME_HEADING_METRICS]
     reader = MapReader(map_dir)
     by_capture = {Path(r.source).name: r for r in reader.frames}
@@ -161,35 +177,50 @@ def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Cap
     return pair_metrics(m, prefix, reader, pairs)
 
 
+def pair_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Median, p90, share above ``GROSS_PCT`` (all in %) and worst of the pairs' medians."""
+    med = np.array([r["median_pct"] for r in rows], np.float64)
+    if not len(med):
+        return {"pairs": 0}
+    return {"pairs": len(med), "median_pct": round(float(np.median(med)), 3),
+            "p90_pct": round(float(np.percentile(med, 90)), 3),
+            "over10_pct": round(float(np.mean(med > GROSS_PCT) * 100), 3),
+            "max_pct": round(float(med.max()), 2)}
+
+
 def pair_metrics(m: Metrics, prefix: str, reader: MapReader, same_heading: dict[str, Any]
                  ) -> list[dict[str, Any]]:
     """``<prefix>.frame_agreement_pairs_*`` over ``overlapping_pairs`` (see the module
-    docstring); the detail lists the worst pairs and the same-heading pairs. Returns the worst
-    pairs."""
+    docstring); the detail repeats them for the neighbours and the far pairs and lists the worst
+    pairs and the same-heading pairs. Returns the worst pairs."""
     ids = [f"{prefix}.{k}" for k in PAIRS_METRICS]
     source = {r.name: Path(r.source).name for r in reader.frames}
+    axis = {r.name: r.T_map_cam.R[:, 2] for r in reader.frames}
     rows: list[dict[str, Any]] = []
     candidates = overlapping_pairs(reader.frames)
     for a, b in candidates:
         res = pair_agreement(reader, a, b)
         if res is not None:
-            rows.append({"pair": f"{source[a.name]}~{source[b.name]}", **_pct(res)})
+            cos = float(np.clip(axis[a.name] @ axis[b.name], -1.0, 1.0))
+            rows.append({"pair": f"{source[a.name]}~{source[b.name]}", "gap": b.index - a.index,
+                         "angle_deg": round(float(np.degrees(np.arccos(cos))), 1), **_pct(res)})
     if not rows:
         m.fail(ids, f"no overlapping keyframe pair to compare ({len(candidates)} candidates)")
         return []
-    med = np.array([r["median_pct"] for r in rows])
     worst = sorted(rows, key=lambda r: (-r["median_pct"], r["pair"]))[:WORST_LISTED]
+    stats = pair_stats(rows)
     detail = {
-        "pairs": len(rows), "candidates": len(candidates),
-        "definition": f"optical axes < {PAIRS_MAX_ANGLE_DEG:g} deg apart, > {PAIRS_MIN_GAP} "
-                      f"keyframes apart, >= {MIN_OVERLAP_PX} shared pixels",
-        "max_pct": round(float(med.max()), 2),
-        "over_5_pct": round(float(np.mean(med > 5.0) * 100), 2),
+        **stats, "candidates": len(candidates),
+        "definition": f"optical axes < {PAIRS_MAX_ANGLE_DEG:g} deg apart, >= {MIN_OVERLAP_PX} "
+                      "shared pixels, any distance in capture order",
+        "neighbours": {"definition": f"<= {FAR_GAP} keyframes apart",
+                       **pair_stats([r for r in rows if r["gap"] <= FAR_GAP])},
+        "far": {"definition": f"> {FAR_GAP} keyframes apart (loop closures)",
+                **pair_stats([r for r in rows if r["gap"] > FAR_GAP])},
         "worst": worst, "same_heading": same_heading,
     }
-    m.add(ids[0], round(float(np.median(med)), 3), detail)
-    m.add(ids[1], round(float(np.percentile(med, 90)), 3), detail)
-    m.add(ids[2], round(float(np.mean(med > GROSS_PCT) * 100), 3), detail)
+    for mid, key in zip(ids, ("median_pct", "p90_pct", "over10_pct", "max_pct"), strict=True):
+        m.add(mid, stats[key], detail)
     return worst
 
 
@@ -369,16 +400,82 @@ def duplicate_metrics(m: Metrics, prefix: str, objs: list[DocObject]) -> list[di
 
 
 # ------------------------------------------------------------------------------------------------
-# attributed points outside the box
+# points outside the box
 
 
-def out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
-    """Per exported object with map-cloud points: their number and the share outside its OBB
-    grown by ``OUT_OF_BOX_MARGIN_M``, worst first."""
+def _share_row(o: DocObject, points: int, outside: int) -> dict[str, Any]:
+    return {"id": o.id, "label": o.label, "points": points,
+            "outside_share": round(outside / points, 4) if points else 0.0}
+
+
+def _merged_into(reader: MapReader) -> dict[int, int]:
+    if not reader.exists("objects.json"):
+        return {}
+    return {int(k): int(v) for k, v in
+            reader.read_json("objects.json").get("merged_into", {}).items()}
+
+
+def _resolve(merged: dict[int, int], oid: int) -> int:
+    seen: set[int] = set()
+    while oid in merged and oid not in seen:
+        seen.add(oid)
+        oid = merged[oid]
+    return oid
+
+
+def mask_out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
+    """Per exported object with detections: its lifted mask pixels and the share outside its
+    OBB grown by max(``MASK_MARGIN_M``, ``MASK_MARGIN_REL`` · depth), worst first."""
+    from oh_my_slam.core import rle
+    from oh_my_slam.core.geometry import depth_edge_mask
+
+    reader = MapReader(map_dir)
+    merged = _merged_into(reader)
+    boxes = {o.id: (o, box) for o in objs if (box := o.obb()) is not None}
+    total: dict[int, int] = {}
+    out: dict[int, int] = {}
+    for fr in reader.frames:
+        insts = [(_resolve(merged, int(i["object_id"])), i) for i in reader.instances(fr)]
+        insts = [(oid, i) for oid, i in insts if oid in boxes]
+        if not insts:
+            continue
+        d = reader.depth(fr)
+        ok = reader.valid(fr) & (d > 0)
+        ok &= ~depth_edge_mask(np.where(ok, d, 0.0))
+        K = fr.K_grid.K()
+        T = fr.T_map_cam
+        for oid, inst in insts:
+            mask = rle.decode(inst["mask"])
+            if mask.shape != d.shape:
+                continue
+            v, u = np.nonzero(mask & ok)
+            if not len(v):
+                continue
+            z = d[v, u].astype(np.float64)
+            pc = np.stack([(u - K[0, 2]) / K[0, 0] * z, (v - K[1, 2]) / K[1, 1] * z, z], 1)
+            box = boxes[oid][1]
+            local = np.abs((pc @ T.R.T + T.t - box.center) @ box.R) - box.size / 2
+            margin = np.maximum(MASK_MARGIN_M, MASK_MARGIN_REL * z)
+            total[oid] = total.get(oid, 0) + len(z)
+            out[oid] = out.get(oid, 0) + int(np.any(local > margin[:, None], axis=1).sum())
+    rows = [_share_row(boxes[k][0], total[k], out[k]) for k in total]
+    return sorted(rows, key=lambda r: (-r["outside_share"], r["id"]))
+
+
+def cloud_out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
+    """Per exported object with map-cloud points: their number and the share outside the
+    mapper's attribution gate for it, worst first."""
     from oh_my_slam.mapping.export import map_cloud
+    from oh_my_slam.mapping.geometry import attribution_margin
 
-    cloud = map_cloud(MapReader(map_dir))
+    reader = MapReader(map_dir)
+    cloud = map_cloud(reader)
+    stored = (reader.read_json("objects.json").get("objects", [])
+              if reader.exists("objects.json") else [])
+    depth = {int(o["id"]): float(o.get("obs_depth", 2.0)) for o in stored}
     labels = np.asarray(cloud.label, np.int64).reshape(-1)
+    if not len(labels):
+        return []
     xyz = np.asarray(cloud.xyz, np.float64)
     order = np.argsort(labels, kind="stable")
     ids, starts = np.unique(labels[order], return_index=True)
@@ -390,19 +487,27 @@ def out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]
         idx = where.get(o.id)
         if box is None or idx is None or not len(idx):
             continue
+        margin = attribution_margin(depth.get(o.id, 2.0))
         local = np.abs((xyz[idx] - box.center) @ box.R) - box.size / 2
-        outside = np.any(local > OUT_OF_BOX_MARGIN_M, axis=1)
-        rows.append({"id": o.id, "label": o.label, "points": len(idx),
-                     "outside_share": round(float(outside.mean()), 4)})
+        rows.append(_share_row(o, len(idx), int(np.any(local > margin + 1e-4, axis=1).sum())))
     return sorted(rows, key=lambda r: (-r["outside_share"], r["id"]))
 
 
 def out_of_box_metrics(m: Metrics, prefix: str, map_dir: Path, objs: list[DocObject]
-                       ) -> list[dict[str, Any]]:
-    """``<prefix>.out_of_box_share``: the largest share, over the exported objects, of their
-    map-cloud points outside their OBB grown by ``OUT_OF_BOX_MARGIN_M``; returns the per-object
-    rows for the report."""
-    rows = out_of_box_rows(map_dir, objs)
-    m.add(f"{prefix}.{OUT_OF_BOX_METRIC}", max((r["outside_share"] for r in rows), default=0.0),
-          {"objects": len(rows), "margin_m": OUT_OF_BOX_MARGIN_M, "worst": rows[:WORST_LISTED]})
-    return rows
+                       ) -> dict[str, list[dict[str, Any]]]:
+    """``<prefix>.mask_out_of_box_share`` and ``<prefix>.cloud_out_of_box_share`` (see the
+    module docstring): the largest share over the exported objects; returns the per-object rows
+    of each for the report."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, rows, margin in (
+            (MASK_OUT_OF_BOX_METRIC, mask_out_of_box_rows(map_dir, objs),
+             f"max({MASK_MARGIN_M:g} m, {MASK_MARGIN_REL:g} x depth)"),
+            (CLOUD_OUT_OF_BOX_METRIC, cloud_out_of_box_rows(map_dir, objs),
+             "the mapper's attribution gate")):
+        shares = [r["outside_share"] for r in rows]
+        m.add(f"{prefix}.{key}", max(shares, default=0.0),
+              {"objects": len(rows), "margin": margin,
+               "median": round(float(np.median(shares)), 4) if shares else None,
+               "worst": rows[:WORST_LISTED]})
+        out[key] = rows
+    return out

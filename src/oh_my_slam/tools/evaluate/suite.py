@@ -47,7 +47,7 @@ from oh_my_slam.tools.evaluate.contracts import (
 from oh_my_slam.tools.evaluate.mapquality import (
     AGREEMENT_METRICS,
     DUPLICATE_METRIC,
-    OUT_OF_BOX_METRIC,
+    OUT_OF_BOX_METRICS,
     STABILITY_METRICS,
     agreement_metrics,
     duplicate_metrics,
@@ -93,7 +93,7 @@ def expected_ids() -> list[str]:
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
     ids += [f"map.{mp}.{k}" for mp in MAPS
-            for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, OUT_OF_BOX_METRIC)]
+            for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, *OUT_OF_BOX_METRICS)]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
     ids += [mid for mid, *_ in ContractLog().results()]
     return [*ids, "contract.exit_codes"]
@@ -351,10 +351,10 @@ class Evaluation:
                 else:
                     self.details[f"map.{name}.duplicates"] = duplicate_metrics(
                         self.metrics, f"map.{name}", doc_objects(doc))
-            mid = f"map.{name}.{OUT_OF_BOX_METRIC}"
-            with self.metrics.expect(mid):
+            ids = [f"map.{name}.{k}" for k in OUT_OF_BOX_METRICS]
+            with self.metrics.expect(*ids):
                 if doc is None:
-                    self.metrics.fail([mid], f"the {name} map was not built")
+                    self.metrics.fail(ids, f"the {name} map was not built")
                 else:
                     self.details[f"map.{name}.out_of_box"] = out_of_box_metrics(
                         self.metrics, f"map.{name}", dirs[name], doc_objects(doc))
