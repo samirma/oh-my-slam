@@ -2,19 +2,24 @@
 
     uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--set-baseline] [--baseline PATH]
                                                [--targets PATH] [--splits N]
+    uv run python -m oh_my_slam.tools.evaluate --resummarise DIR|latest [--set-baseline]
 
 Runs, strictly one at a time, ``start_inference_server.sh`` (cold start, resident memory),
 ``reconstruct.sh`` / ``segment.sh -i`` / ``view.sh -i`` on ``restaurant.jpg``, ``segment.sh -i`` on
 every ``ainex-captures`` frame, ``mapper.sh update`` on the sequence in one update and split across
-``N`` updates, and ``segment.sh -m`` / ``view.sh -m`` on the resulting maps. Metrics: performance,
-pose accuracy, map quality, segmentation, contracts (and ground truth when annotations exist under
-``examples/ground_truth/``). Each has a target in ``examples/targets.json`` (data) and is compared
-with the stored baseline run (``~/oh-my-slam-data/evaluations/baseline.json``).
+``N`` updates, and ``segment.sh -m`` / ``view.sh -m`` on the resulting maps. Metrics: performance
+(end to end and per stage: time, client and server peak memory), pose accuracy, map quality,
+segmentation (and its consistency with the map), contracts, and ground truth when annotations exist
+under ``examples/ground_truth/``. Each has a target in ``examples/targets.json`` (data) and is
+compared with the stored baseline run (``~/oh-my-slam-data/evaluations/baseline.json``); without a
+baseline the report says so instead of counting regressions.
 
 Output (default ``~/oh-my-slam-data/evaluations/<UTC>/``, never inside the repository):
 ``result.json``, ``summary.md``, ``runs/`` (stdout, stderr, timings per command), ``outputs/``
 (``-o`` / ``-d`` results) and ``maps/`` (the two maps). Progress goes to stderr; stdout gets the
 path of ``summary.md``. Exit 0 when every metric passes, 1 when one fails, 2 on a usage error.
+``--resummarise`` runs nothing: it judges a stored run's values again against the current targets
+and baseline and rewrites its report; with ``--set-baseline`` it stores that run as the baseline.
 
 Modules: ``names`` (capture-name grammar), ``runner`` / ``memory`` (running and measuring
 commands), ``suite`` (the plan), ``contracts``, ``performance``, ``poses``, ``mapquality``,

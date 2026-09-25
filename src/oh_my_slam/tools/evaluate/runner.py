@@ -1,7 +1,7 @@
 """Sequential command runs. Each run keeps its stdout and stderr in files, its per-stage timings
 (``OH_MY_SLAM_TIMINGS``), its wall time and the peaks of the command's resident set and of the
-server's footprint. A command that fails, times out or cannot start becomes a record with the
-stderr tail — never an exception."""
+server's footprint, overall and per stage (``memory.stage_peaks``). A command that fails, times
+out or cannot start becomes a record with the stderr tail — never an exception."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.core.timing import ENV_PATH as TIMINGS_ENV
-from oh_my_slam.tools.evaluate.memory import PeakSampler, server_pid
+from oh_my_slam.tools.evaluate.memory import PeakSampler, server_pid, stage_peaks
 
 REPO = Path(__file__).resolve().parents[4]
 TAIL_LINES = 30
@@ -53,6 +53,8 @@ class RunRecord:
     timings: dict[str, Any] | None = None
     error: str | None = None  # did not start / timed out
     notes: dict[str, Any] = field(default_factory=dict)
+    # per stage: {"s", "client_peak_mb", "server_peak_gb"} (None: the command records no stages)
+    stages: dict[str, dict[str, float | None]] | None = None
 
     @property
     def tag(self) -> str:
@@ -79,7 +81,7 @@ class RunRecord:
             "server_peak_gb": None if self.server_peak_gb is None else round(self.server_peak_gb, 2),
             "stdout": str(self.stdout_path), "stdout_bytes": len(self.stdout_bytes()),
             "stderr": str(self.stderr_path), "stderr_tail": self.stderr_tail if not self.ok else "",
-            "timings": self.timings, "error": self.error, **self.notes,
+            "timings": self.timings, "stages": self.stages, "error": self.error, **self.notes,
         }
 
 
@@ -152,8 +154,8 @@ class Live:
     def finish(self, error: str | None = None) -> RunRecord:
         wall = time.perf_counter() - self.t0
         if self.sampler is not None:
-            self.sampler.sample()
             self.sampler.stop()
+            self.sampler.sample()
         timings = self._timings()
         client = self.sampler.client_peak_mb if self.sampler else 0.0
         if timings:
@@ -161,7 +163,8 @@ class Live:
         rec = RunRecord(
             self.spec, self.argv, None if self.proc is None else self.proc.returncode, wall,
             client, self.sampler.server_peak_gb if self.sampler else None, self.stdout_path,
-            self.stderr_path, _tail(self.stderr_path), timings, error or self.error)
+            self.stderr_path, _tail(self.stderr_path), timings, error or self.error,
+            stages=stage_peaks(timings, self.sampler.samples if self.sampler else []))
         self.runner.finished(rec)
         return rec
 

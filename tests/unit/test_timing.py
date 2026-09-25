@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from oh_my_slam.core import timing
@@ -82,3 +83,40 @@ def test_report_logs_one_line_and_writes_the_env_file(tmp_path: Path,
     # a finished record (dict) can be reported too
     monkeypatch.delenv(timing.ENV_PATH)
     assert timing.report(rec, logger)["stages_s"] == rec["stages_s"]
+
+
+def test_peak_memory_per_stage_and_the_stage_windows() -> None:
+    """Each stage's peak resident set comes from the sampler (and the boundary readings); peaks
+    include nested stages; every stage has its wall-clock window after ``t0_unix``."""
+    t_start = time.time()
+    with timing.collect(sample_every=0.01) as t:
+        with timing.stage("small"):
+            time.sleep(0.08)
+        with timing.stage("outer"):
+            with timing.stage("big"):
+                a = np.ones(25_000_000)  # 200 MB, touched
+                time.sleep(0.08)
+                del a
+            time.sleep(0.02)
+        with timing.stage("after"):
+            time.sleep(0.08)
+    d = t.to_dict()
+    peaks = d["stages_peak_rss_mb"]
+    assert list(peaks) == list(d["stages_s"])  # same stages, deterministic structure
+    assert peaks["big"] >= peaks["small"] + 150
+    assert peaks["outer"] >= peaks["big"]  # inclusive of the nested stage
+    assert peaks["after"] > 10  # (macOS may keep freed pages resident: no drop is asserted)
+    assert t_start - 1e-3 <= d["t0_unix"] <= t_start + 1  # rounded to ms
+    names = [w[0] for w in d["stage_windows"]]
+    assert names == ["small", "outer", "big", "after"]  # by start time
+    small, outer, big, after = d["stage_windows"]
+    assert 0 <= small[1] < small[2] <= outer[1] <= big[1] < big[2] <= outer[2] <= after[1]
+    assert big[2] - big[1] == pytest.approx(d["stages_s"]["big"], abs=0.01)
+    assert t._sampler is None  # the sampler stops with the collection
+
+
+def test_without_sampling_the_boundaries_still_give_peaks() -> None:
+    t = timing.Timings(sample_every=None)
+    with t.stage("x"):
+        pass
+    assert t.to_dict()["stages_peak_rss_mb"]["x"] > 10

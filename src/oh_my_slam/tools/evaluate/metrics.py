@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Any
 
 OPS = ("<=", ">=")
+# Metric ids renamed since earlier runs: stored results and baselines are read under the new id.
+RENAMED = {"seg.map.recall": "seg.map_consistency.map_objects_detected",
+           "seg.map.precision": "seg.map_consistency.detections_in_map"}
 
 
 @dataclass(frozen=True)
@@ -97,9 +100,20 @@ class Metric:
         t = self.target
         return {
             "id": self.id, "value": self.value, "passed": self.passed, "error": self.error,
-            "target": None if t is None else {"op": t.op, "value": t.value, "unit": t.unit},
+            "target": None if t is None else {
+                "op": t.op, "value": t.value, "unit": t.unit, "tolerance_abs": t.tolerance_abs,
+                "tolerance_rel": t.tolerance_rel},
             "baseline": self.baseline, "regression": self.regression, "detail": self.detail,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Metric:
+        """A metric of a stored ``result.json`` with its value, detail and error (to judge it
+        again against other targets or another baseline)."""
+        v = d.get("value")
+        return cls(RENAMED.get(str(d["id"]), str(d["id"])),
+                   float(v) if isinstance(v, int | float) else None, d.get("detail"),
+                   d.get("error"))
 
 
 class Metrics:
@@ -107,6 +121,15 @@ class Metrics:
 
     def __init__(self) -> None:
         self.items: dict[str, Metric] = {}
+
+    @classmethod
+    def from_result(cls, result: dict[str, Any]) -> Metrics:
+        """The metrics of a stored ``result.json``, not yet judged."""
+        out = cls()
+        for d in result.get("metrics", []):
+            m = Metric.from_dict(d)
+            out.items[m.id] = m
+        return out
 
     def add(self, mid: str, value: float | None, detail: Any = None,
             error: str | None = None) -> None:
@@ -140,6 +163,6 @@ class Metrics:
 
 
 def baseline_values(result: dict[str, Any]) -> dict[str, float]:
-    """Metric values of a stored ``result.json`` (the baseline run)."""
-    return {m["id"]: float(m["value"]) for m in result.get("metrics", [])
+    """Metric values of a stored ``result.json`` (the baseline run), by current metric id."""
+    return {RENAMED.get(m["id"], m["id"]): float(m["value"]) for m in result.get("metrics", [])
             if isinstance(m.get("value"), int | float)}

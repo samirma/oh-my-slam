@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from oh_my_slam.segmentation.colors import (
 )
 from oh_my_slam.segmentation.render import DIM
 from oh_my_slam.tools.evaluate.scene import DocObject
+from oh_my_slam.viewer.server import parse_cloud_payload
 
 MAX_LISTED = 5
 # Contract → the subjects (entry points, or the pair of outputs compared) it is reported for.
@@ -162,6 +164,19 @@ def cloud_colour_problems(cloud: PointCloud, ids: set[int] | None) -> list[str]:
         out.append(f"{len(foreign)} colours are neither object colours nor grey: "
                    f"{[_rgb(c) for c in foreign[:MAX_LISTED]]}")
     return out
+
+
+def served_cloud_problems(body: bytes | None, ids: set[int] | None) -> list[str]:
+    """The viewer's ``/api/cloud?color=segment`` payload (``viewer.server.cloud_payload``) holds
+    exactly the object colours of its points (the object ids of ``ids``; unsegmented grey)."""
+    if body is None:
+        return ["the viewer served no color=segment cloud"]
+    try:
+        _, arrays = parse_cloud_payload(body)
+        cloud = PointCloud(arrays["position"], arrays.get("color"), arrays.get("label"))
+    except (ValueError, KeyError, TypeError, struct.error) as exc:
+        return [f"unreadable cloud payload: {type(exc).__name__}: {exc}"]
+    return cloud_colour_problems(cloud, ids)
 
 
 def png_colour_problems(rgb: NDArray[np.uint8], objs: list[DocObject], sheet: bool) -> list[str]:

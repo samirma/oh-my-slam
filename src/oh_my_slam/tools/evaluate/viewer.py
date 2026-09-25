@@ -5,8 +5,10 @@ The viewer's contract: stdout stays empty; once its socket listens it prints exa
 line ``view.sh: listening on http://127.0.0.1:<port>/`` (``oh_my_slam.cli.view.URL_LINE``; a
 loopback ``http://`` URL in another line is accepted as a fallback); the page sets ``<body
 data-rendered="true">`` after the first frame that drew the point cloud, or ``data-error`` on a
-load failure; ``/api/scene`` serves the OpenLABEL scene it draws (OBB colours included). The
-browser is launched before view.sh starts, so its start-up is not counted."""
+load failure; ``/api/scene`` serves the OpenLABEL scene it draws (OBB colours included) and
+``/api/cloud?color=segment`` the point cloud it draws with ``color=segment`` (fetched after the
+page has rendered, so it is not part of the render time). The browser is launched before view.sh
+starts, so its start-up is not counted."""
 
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ SETTLED_JS = ("() => document.body !== null && (document.body.dataset.rendered =
 PAGE_ERROR_JS = "() => document.body.dataset.error ?? null"
 RENDER_TIMEOUT_S = 120.0  # from the URL to the rendered page
 SCENE_API = "/api/scene"
+SEGMENT_CLOUD_API = "/api/cloud?color=segment"
 
 
 def served_url(stderr: str) -> str | None:
@@ -70,6 +73,7 @@ class ViewOutcome:
     error: str | None  # why render_s is missing
     console_errors: list[str] | None  # None: the page was never opened
     scene: bytes | None  # what /api/scene served
+    cloud: bytes | None = None  # what /api/cloud?color=segment served
 
 
 def _fetch(url: str, path: str) -> bytes | None:
@@ -105,11 +109,13 @@ class BrowserProbe:
                     console = list[str]()
                     render_s, error = self._render(browser, url, live.t0, console)
                 scene = None if url is None else _fetch(url, SCENE_API)
+                cloud = None if url is None else _fetch(url, SEGMENT_CLOUD_API)
             finally:
                 live.stop()
             rec = live.finish(error=None if url else "no URL on stderr")
             rec.notes.update(url=url, render_s=render_s)
-            return ViewOutcome(rec, url, render_s, error if url else rec.failure(), console, scene)
+            return ViewOutcome(rec, url, render_s, error if url else rec.failure(), console, scene,
+                               cloud)
 
     def _wait_url(self, live: Live, deadline: float) -> str | None:
         while live.poll() is None and time.perf_counter() < deadline:

@@ -29,9 +29,12 @@ from oh_my_slam.tools.evaluate.contracts import (
     png_colour_problems,
     same_objects_problems,
     scene_colour_problems,
+    served_cloud_problems,
     subject_of,
 )
 from oh_my_slam.tools.evaluate.scene import doc_objects
+from oh_my_slam.viewer.bundle import DisplayCloud
+from oh_my_slam.viewer.server import cloud_payload
 
 IDS = (1, 2, 7, 23)  # 23: a hue-rotated palette colour
 
@@ -135,6 +138,23 @@ def test_cloud_colours_without_labels() -> None:
     assert cloud_colour_problems(plain, {1, 2})  # colours of ids 7, 23 are foreign
     assert cloud_colour_problems(plain, None)
     assert cloud_colour_problems(PointCloud(cloud.xyz), set(IDS)) == ["no colour properties"]
+
+
+def test_viewer_cloud_colours() -> None:
+    """The viewer's /api/cloud?color=segment payload, decoded with the viewer's own parser."""
+    def served(cloud: PointCloud) -> bytes:
+        return cloud_payload(DisplayCloud(cloud, len(cloud), 1, 0.0), "color=segment")
+
+    cloud = labelled_cloud()
+    assert served_cloud_problems(served(cloud), set(IDS)) == []
+    assert served_cloud_problems(served(PointCloud(cloud.xyz, cloud.rgb)), set(IDS)) == []
+    assert served_cloud_problems(served(cloud), {1}) == ["labels not in the scene: [2, 7, 23]"]
+    assert cloud.rgb is not None
+    cloud.rgb[0] = (1, 2, 3)
+    assert "1 points not in their object's colour" in served_cloud_problems(served(cloud),
+                                                                            set(IDS))[0]
+    assert served_cloud_problems(None, set(IDS)) == ["the viewer served no color=segment cloud"]
+    assert served_cloud_problems(b"\x01", set(IDS))[0].startswith("unreadable cloud payload")
 
 
 def label_map(h: int = 60, w: int = 80) -> np.ndarray:

@@ -41,6 +41,7 @@ from oh_my_slam.tools.evaluate.contracts import (
     png_colour_problems,
     same_objects_problems,
     scene_colour_problems,
+    served_cloud_problems,
     subject_of,
 )
 from oh_my_slam.tools.evaluate.mapquality import (
@@ -63,9 +64,10 @@ from oh_my_slam.tools.evaluate.poses import (
 from oh_my_slam.tools.evaluate.runner import REPO, Runner, RunRecord, RunSpec
 from oh_my_slam.tools.evaluate.scene import DocObject, Json, doc_objects
 from oh_my_slam.tools.evaluate.segmentation import (
-    MAP_AGREEMENT_METRICS,
+    MAP_CONSISTENCY,
+    MAP_CONSISTENCY_METRICS,
     detection_row,
-    map_agreement,
+    map_consistency,
 )
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 
@@ -84,7 +86,7 @@ SEG_METRICS = ("seg.restaurant.objects", "seg.frames.with_detections_fraction", 
 def expected_ids() -> list[str]:
     """Every metric a run records (ground-truth metrics come on top when annotations exist)."""
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
-    ids += [f"seg.map.{k}" for k in MAP_AGREEMENT_METRICS]
+    ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
     ids += [f"map.{mp}.{k}" for mp in MAPS for k in AGREEMENT_METRICS]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
@@ -202,6 +204,8 @@ class Evaluation:
             return
         objs = doc_objects(doc)
         self.contracts.check("colour", "view", tag, scene_colour_problems(objs))
+        self.contracts.check("colour", "view", f"{tag}/cloud color=segment",
+                             served_cloud_problems(seen.cloud, {o.id for o in objs}))
         subject, name, other = source
         if other is not None:
             self.contracts.check("same_objects", subject, f"view.sh vs {name}",
@@ -343,15 +347,15 @@ class Evaluation:
                 self.details["map.stability"] = stability_metrics(
                     self.metrics, "map.stability", doc_objects(single), doc_objects(split),
                     split_alignment(poses["single"], poses["split"]))
-        ids = [f"seg.map.{k}" for k in MAP_AGREEMENT_METRICS]
+        ids = [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
         with self.metrics.expect(*ids):
             if single is None:
                 self.metrics.fail(ids, "the single map was not built")
             else:
                 frames = {c.name: self.images[f"{SEQUENCE}/{c.name}"] for c in captures
                           if f"{SEQUENCE}/{c.name}" in self.images}
-                self.details["segmentation.map"] = map_agreement(
-                    self.metrics, "seg.map", frames, doc_objects(single),
+                self.details["segmentation.map"] = map_consistency(
+                    self.metrics, MAP_CONSISTENCY, frames, doc_objects(single),
                     capture_sources(single, dirs["single"]))
 
     def map_commands(self, single: Json | None, split: Json | None) -> None:

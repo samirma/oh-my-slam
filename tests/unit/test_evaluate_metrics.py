@@ -23,7 +23,12 @@ from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import captures_in
 from oh_my_slam.tools.evaluate.poses import capture_poses, capture_sources, pose_metrics
 from oh_my_slam.tools.evaluate.scene import DocObject, pitch_deg, yaw_deg
-from oh_my_slam.tools.evaluate.segmentation import map_agreement, paired_labels
+from oh_my_slam.tools.evaluate.segmentation import (
+    MAP_CONSISTENCY,
+    MAP_CONSISTENCY_METRICS,
+    map_consistency,
+    paired_labels,
+)
 
 SEQUENCE = Path(__file__).resolve().parents[2] / "examples" / "ainex-captures"
 K = Intrinsics(100.0, 100.0, 80.0, 60.0, 160, 120, "given")
@@ -228,7 +233,7 @@ def test_label_pairing_prefers_identical_labels() -> None:
     assert paired_labels([], ["cup"]) == 0
 
 
-def test_segmentation_agrees_with_the_objects_the_map_observed_per_frame() -> None:
+def test_segmentation_is_consistent_with_the_objects_the_map_observed_per_frame() -> None:
     map_objs = [DocObject(1, "chair", 0.9, None, None, None, frozenset({0, 1})),
                 DocObject(2, "sofa", 0.9, None, None, None, frozenset({1})),
                 DocObject(3, "plant", 0.9, None, None, None, frozenset({5}))]
@@ -236,8 +241,10 @@ def test_segmentation_agrees_with_the_objects_the_map_observed_per_frame() -> No
               "b.jpg": [DocObject(1, "couch", 0.7, None, None, None),
                         DocObject(2, "cup", 0.6, None, None, None)]}
     m = Metrics()
-    rows = map_agreement(m, "seg.map", frames, map_objs, {0: "a.jpg", 1: "b.jpg", 5: "c.jpg"})
+    rows = map_consistency(m, MAP_CONSISTENCY, frames, map_objs,
+                           {0: "a.jpg", 1: "b.jpg", 5: "c.jpg"})
     # frame a: chair ↔ chair; frame b: {chair, sofa} vs {couch, cup} → sofa ~ couch
-    assert m.items["seg.map.recall"].value == pytest.approx(2 / 3)
-    assert m.items["seg.map.precision"].value == pytest.approx(2 / 3)
+    assert set(m.items) == {f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS}
+    assert m.items["seg.map_consistency.map_objects_detected"].value == pytest.approx(2 / 3)
+    assert m.items["seg.map_consistency.detections_in_map"].value == pytest.approx(2 / 3)
     assert [r["paired"] for r in rows] == [1, 1]
