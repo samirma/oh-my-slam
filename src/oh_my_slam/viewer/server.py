@@ -39,7 +39,8 @@ STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
 _TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
           ".json": "application/json", ".png": "image/png", ".txt": "text/plain",
           ".md": "text/plain"}
-CLOUD_CACHE = 3  # recent cloud payloads kept (e.g. toggling a control back and forth)
+CLOUD_CACHE = 3  # recent cloud payloads kept (e.g. toggling a control back and forth) …
+CLOUD_CACHE_BYTES = 1_000_000_000  # … within this many bytes (the latest one always)
 
 
 def cloud_payload(dc: DisplayCloud, attrs: str) -> bytes:
@@ -109,7 +110,8 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
         body = cloud_payload(bundle.cloud(attrs), key)
         with lock:
             clouds[key] = body
-            while len(clouds) > CLOUD_CACHE:
+            while len(clouds) > 1 and (len(clouds) > CLOUD_CACHE
+                                       or sum(map(len, clouds.values())) > CLOUD_CACHE_BYTES):
                 clouds.popitem(last=False)
         return body
 

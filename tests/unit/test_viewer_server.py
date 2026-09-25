@@ -123,6 +123,18 @@ def test_display_thinning_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> N
     assert dc.cloud.label is None  # an unsegmented source has no object ids
 
 
+def test_realistic_maps_are_shown_complete() -> None:
+    """Spec §2.5 "complete point cloud": the 5.4 M-point evaluation map (and anything up to 12 M
+    points, 60 frames/s in Edge on the M4 Max) is served unthinned."""
+    import oh_my_slam.viewer.bundle as vb
+
+    assert vb.MAX_DISPLAY_POINTS >= 12_000_000
+    b = ViewBundle(mode="map", title="t", scene={}, catalog=[],
+                   source=map_cloud_source(np.zeros((5, 3)), np.zeros((5, 3), np.uint8), None,
+                                           set(), np.zeros((1, 3))))
+    assert b.meta()["max_points"] == vb.MAX_DISPLAY_POINTS
+
+
 def test_cameras_are_the_poses_of_the_scene_json() -> None:
     K = Intrinsics(500.0, 510.0, 320.0, 240.0, 640, 480)
     # a single image: the scene is in the camera frame, the camera sits at the identity

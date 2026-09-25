@@ -41,9 +41,11 @@ from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_
 
 Json = dict[str, Any]
 
-# Browsers stay responsive up to a few million points; a larger derived cloud is thinned for display
-# only, deterministically (every k-th point in derivation order), and the page says so.
-MAX_DISPLAY_POINTS = 3_000_000
+# The page shows the complete derived cloud up to this many points: measured in Edge (ANGLE Metal)
+# on the M4 Max, 12 M points load in ~2 s and orbit at 60 frames/s (16 M drop frames, 24 M run at
+# 30 frames/s). A larger cloud is thinned for display only, deterministically (every k-th point in
+# derivation order, ``derive_thinned``), and the page says so.
+MAX_DISPLAY_POINTS = 12_000_000
 
 # Spec §2.5: these attributes concern PLY files only and have no control in the viewer.
 PLY_ONLY = frozenset({"label", "encoding"})
