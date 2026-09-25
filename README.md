@@ -339,11 +339,13 @@ Each object is keyed by its id as a string and has these fields:
 | `object_data.cuboid[0]` | `name` `"obb"`, `coordinate_system`, `val` = `[x, y, z, qx, qy, qz, qw, sx, sy, sz]` (centre, box-to-parent rotation with the scalar last and `qw ≥ 0`, size = width, depth, height), and `attributes.num` `width_m`, `depth_m`, `height_m`, `volume_m3` |
 | `object_data.num` | `score`, `pixel_count`, `point_count`, `observations` |
 | `object_data.text` | `color_hex` |
-| `object_data.vec` | `color` `[r, g, b]` |
+| `object_data.vec` | `color` `[r, g, b]`; for a map object detected under several labels, also `detected_as` (every label, most evidence first) |
 | `object_data.boolean` | `confirmed` |
 | `frame_intervals` | the frames that detected the object |
 
-For a map object, `score` is the mean of its three best detection scores.
+For a map object, `score` is the mean of its three best detection scores, and `point_count` is
+the number of map-cloud points attributed to it (its points in `segments.ply`), as for a single
+image, where it counts the object's lifted points.
 
 ## Colour contract and palette
 
@@ -432,10 +434,21 @@ point leaves the map untouched. One killed after it is completed by the next upd
 * **Persistent identity.** Each object keeps one id and one colour for the life of the map, and
   its OBB is refitted from all accumulated evidence:
   * New ids come from a counter and are never reused.
-  * A merge keeps the lower id.
-  * An object is exported once it is confirmed, meaning it was detected in at least min(3, V)
-    keyframes, where V is the number of keyframes that could see it.
+  * Duplicates are merged, and a merge keeps the lower id. Objects of compatible labels merge
+    when their points or boxes overlap. Objects of different labels merge when the detector's
+    label flickered between keyframes: no keyframe detected both, their sizes are comparable
+    (not a part of the other or an item resting on it), and at least half of either one's
+    points lie on the other's surface. The merged object takes the label with the most
+    evidence and lists the others in `detected_as`.
+  * An object is exported once it is confirmed: detected with a reliable mask (not mostly in
+    the image-border band, where the object is cut off and monocular depth is unreliable) in at
+    least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
+    ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
   * Unconfirmed objects are kept, so that a later update can still confirm them.
+  * The OBB is fitted to the detections that agree with each other: monocular depth of a small
+    object can vary by tens of percent between keyframes, and the union of such detections is a
+    streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
+    overlap (allowing for depth noise) the detection most others agree with.
 * **Geometry.** The map's geometry is a point cloud: the surface of a TSDF fusion of the aligned
   depth maps. Each point takes its colour and object id from the latest update that sees it. No
   mesh is produced.
@@ -474,7 +487,12 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
    across labels are removed (mask IoU > 0.7, higher priority wins).
 5. **Exclusive masks and lifting:** the claim order above gives every pixel at most one owner,
    and the masks are lifted to 3D without depth-edge pixels.
-6. **OBBs:** each object gets an upright OBB, then ids and colours are assigned.
+6. **OBBs:** each object gets an upright OBB, then ids and colours are assigned. A box of a
+   floor-standing class is extended down to the floor when its visible bottom floats at most
+   the class's gap above it (0.8 m for furniture, 1.2 m for a person, 0.15 m for classes that
+   also stand on furniture or hang on walls, such as plants and shelves). The visible part must
+   span at least a fifth of the grounded height, except for classes seen mostly from the top
+   (tables, desks, counters, beds), and boxes under 10 cm are never grounded.
 
 Geometry and detection requests run concurrently on two connections.
 
@@ -607,6 +625,24 @@ when one fails, and 2 on a usage error. It needs the model weights. It also need
 or Google Chrome for Playwright's page timing. Run it on an otherwise idle machine, because
 concurrent GPU work invalidates timings. `OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m eval`
 runs it end to end as a test.
+
+## Known limitations
+
+* **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
+  confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the
+  mislabelled instances shows that the detector itself prefers the wrong label. A kettle scores
+  0.63 as a teapot and 0.10 as a kettle. The counter scores 0.57 as a desk and 0.03 as a
+  counter. The light switch scores 0.57 as a power outlet and 0.32 as a light switch. The toaster
+  scores 0.77 as a tissue box and 0.05 as a toaster, and the coffee maker scores 0.64 as a water
+  dispenser and 0.17 as a coffee maker. A horse picture on a book cover is detected as a person.
+  The vocabulary, prompt form and NMS settings do not cause these errors, so they are not
+  patched per scene. One gap was in the vocabulary: common produce was missing, so a tomato or a
+  watermelon took the nearest label (apple). Tomato, watermelon and a few other LVIS produce
+  nouns are now included.
+* **Label flicker.** When the detector names one object differently from keyframe to keyframe,
+  the map keeps one object with the best-supported label and lists the others in `detected_as`.
+* **Monocular depth of small, distant objects** varies between keyframes, so their map boxes
+  are only as consistent as the agreeing detections (see Update semantics).
 
 ## Development
 

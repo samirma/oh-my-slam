@@ -8,13 +8,18 @@ Semantics (spec §2.3):
   one keyframe in one group, and an object the map already held absorbs a group only when most of
   the group's instances match it directly. A group without such an object becomes a new object.
 * **Evidence is order-free.** An object's evidence — label votes, scores, the keyframes that
-  detected it, its mean viewing distance and a canonical point set (``canonical_points``) — is a
-  pure function of the instances it received, so its label and OBB do not depend on the order or
-  the grouping into updates in which that evidence arrived.
-* **Confirmation** is recomputed from all evidence: detected in >= min(3, V) keyframes, where V
-  counts the map's keyframes whose view contains the object's unoccluded centroid or that detected
-  it (also keyframes of earlier updates, for an object first detected now). Unconfirmed objects are
-  kept, never exported, so a later update can still confirm them.
+  detected it, one ``Sighting`` per detection, its mean viewing distance and a canonical point set
+  (``canonical_points``) — is a pure function of the instances it received, so its label and OBB
+  do not depend on the order or the grouping into updates in which that evidence arrived.
+* **Confirmation** is recomputed from all evidence (``confirm``): detections with a reliable mask
+  (not mostly in the image-border band, where monocular depth is unreliable) in >= 2 distinct
+  keyframes — or in the one keyframe that had the object in view, when no other keyframe of the
+  map did (``views_in_frustum``; occlusion is ignored, so a detection whose depth puts it behind
+  another surface cannot confirm itself). Unconfirmed objects are kept, never exported, so a later
+  update can still confirm them.
+* **Boxes** are fitted (by segmentation) to the points of the sightings that agree with each
+  other (``fit_points``): monocular depth of small objects varies between keyframes, and the union
+  of inconsistent sightings is a streak along the viewing rays, not the object.
 * **Latest wins across updates.** An update whose keyframes, as a whole, see through an object
   removes it or gives it a strike; an update that re-detects it or sees it in place clears its
   strikes (``_absence``). Keyframes of the same update never remove each other's objects.
@@ -27,6 +32,13 @@ Semantics (spec §2.3):
   same ids wherever it associates the same detections. A merge keeps the lower id; merged and
   removed ids disappear for good (merges are recorded in ``merged_into`` so old per-frame instance
   files still resolve).
+* **Merging** joins duplicates: objects with compatible labels that overlap, and — whatever their
+  labels — objects of comparable size that occupy the same space (most of either one's points on
+  the other's surface) and that no keyframe detected as two instances: the detector's label
+  flickered between keyframes (a door seen as a wardrobe). The merged object's label is the one
+  with the most evidence (score-weighted votes); the others are exported as ``detected_as``.
+* **Point counts** are those of the map cloud: the points attributed to the object
+  (``set_cloud_counts``), as the ``point_count`` of a single image counts its cloud's points.
 """
 
 from __future__ import annotations
@@ -42,7 +54,14 @@ from scipy.spatial import cKDTree
 from oh_my_slam.core import rle
 from oh_my_slam.core.geometry import voxel_keys
 from oh_my_slam.mapping.store import OBJECTS_JSON, frame_file
-from oh_my_slam.mapping.validity import View, keyframe_view, stored_view, tau, well_registered
+from oh_my_slam.mapping.validity import (
+    BORDER,
+    View,
+    keyframe_view,
+    stored_view,
+    tau,
+    well_registered,
+)
 from oh_my_slam.reconstruction.gravity import floor_candidate_height
 from oh_my_slam.segmentation.api import (
     OBB,
@@ -58,10 +77,29 @@ POINT_CAP = 30000
 POINT_VOXEL = 0.01
 IOU_GATE = 0.3
 CENTROID_GATE = 1.5
-CONFIRM_DETECTIONS = 3
+# Confirmation: reliable detections in this many distinct keyframes (when another keyframe had the
+# object in view). A detection is reliable unless most of its mask lies in the image-border band
+# that ``View.usable`` excludes (``BORDER``): there the object is cut off and its monocular depth
+# is unreliable, which is where one-off phantoms come from (a counter's edge at the bottom of a
+# downward view, labelled "carpet" and placed inside the counter).
+CONFIRM_DETECTIONS = 2
+BORDER_EVIDENCE = 0.5  # largest share of a reliable detection's mask in the border band
+IN_VIEW_SHARE = 0.5  # a keyframe has an object in view when this share of its points projects in
+VIEW_SAMPLES = 200  # points per object for the in-view test
 MERGE_OVERLAP = 0.5
 MERGE_BOX_IOU = 0.3  # compatible objects whose boxes overlap this much are one physical object
 MERGE_CONTAINMENT = 0.6
+# Objects of incompatible labels are one object when no keyframe detected both, the smaller one's
+# size is at least this share of the larger's (not a part of it or an item resting on it) and
+# MERGE_OVERLAP of either one's points lie on the other's surface.
+MERGE_SCALE = 0.5
+# Box fit: two sightings agree when their bounds overlap or are at most max(CONSENSUS_TOL_MIN,
+# CONSENSUS_TOL_REL · viewing distance) apart (monocular depth noise); with at least CONSENSUS_MIN
+# sightings the box is fitted to the points in the bounds of those agreeing with the best one.
+CONSENSUS_MIN = 3
+CONSENSUS_TOL_MIN = 0.05
+CONSENSUS_TOL_REL = 0.03
+CONSENSUS_MARGIN = 0.02
 REMOVE_FRACTION = 0.6
 REMOVE_FRACTION_FEW = 0.8
 REMOVE_MIN_FRAMES = 3
@@ -73,6 +111,7 @@ ABSENCE_TAU_REL = 0.15
 MAP_FLOOR_MAX_BELOW = 0.10
 MASK_DILATE = 3
 PAIR_NEIGHBOURS = 10  # keyframes (nearest by viewpoint) whose instances each keyframe's meet
+EARLIER_VIEWS = 2  # an existing object's detecting keyframes (nearest by viewpoint) re-checked
 UP = np.array([0.0, 0.0, 1.0])
 
 
@@ -120,6 +159,36 @@ def canonical_points(points: NDArray[Any]) -> NDArray[np.float32]:
 # objects and instances
 
 
+@dataclass(frozen=True)
+class Sighting:
+    """Summary of one detection of an object: its keyframe, lifted point count, the share of its
+    mask in the image-border band, and the centroid and robust (2-98 %) bounds of its points in
+    map coordinates."""
+
+    frame: int
+    points: int
+    border: float
+    centroid: tuple[float, float, float]
+    lo: tuple[float, float, float]
+    hi: tuple[float, float, float]
+
+    @property
+    def reliable(self) -> bool:
+        return self.border <= BORDER_EVIDENCE
+
+    def key(self) -> tuple[Any, ...]:
+        return (self.frame, self.points, self.centroid, self.lo, self.hi, self.border)
+
+    def to_list(self) -> list[float]:
+        return [self.frame, self.points, self.border, *self.centroid, *self.lo, *self.hi]
+
+    @staticmethod
+    def from_list(v: list[float]) -> Sighting:
+        def t(x: list[float]) -> tuple[float, float, float]:
+            return (float(x[0]), float(x[1]), float(x[2]))
+        return Sighting(int(v[0]), int(v[1]), float(v[2]), t(v[3:6]), t(v[6:9]), t(v[9:12]))
+
+
 @dataclass
 class MapObject:
     id: int
@@ -131,16 +200,27 @@ class MapObject:
     frames: list[int] = field(default_factory=list)  # keyframes that detected it (sorted)
     confirmed: bool = False
     strikes: int = 0
-    views_in_frustum: int = 0
+    views_in_frustum: int = 0  # keyframes of the map that have it in view (or detected it)
     created_update: int = 0
     last_seen_update: int = 0
     obs_depth: float = 2.0  # mean camera distance of its detections
     pixel_count: int = 0
+    sightings: list[Sighting] = field(default_factory=list)  # one per detection (sorted)
+    cloud_points: int | None = None  # map-cloud points attributed to it (None: not yet counted)
 
     @property
     def observations(self) -> int:
         """Keyframes in which the object was detected."""
         return len(self.frames)
+
+    def reliable_frames(self) -> set[int]:
+        """Keyframes with a reliable detection (``Sighting.reliable``); keyframes without a
+        sighting (maps written before sightings were recorded) count as reliable."""
+        seen = {s.frame for s in self.sightings}
+        return {s.frame for s in self.sightings if s.reliable} | (set(self.frames) - seen)
+
+    def _add_sightings(self, new: list[Sighting]) -> None:
+        self.sightings = sorted([*self.sightings, *new], key=Sighting.key)
 
     @property
     def score(self) -> float:
@@ -171,6 +251,7 @@ class MapObject:
                                / (n0 + len(obs)))
         self.pixel_count = max([self.pixel_count] + [ob.pixel_count for ob in obs])
         self.last_seen_update = max(self.last_seen_update, uid)
+        self._add_sightings([ob.sighting for ob in obs])
 
     def absorb(self, gone: MapObject) -> None:
         """Merge another object's evidence into this one."""
@@ -188,6 +269,7 @@ class MapObject:
         self.created_update = min(self.created_update, gone.created_update)
         self.last_seen_update = max(self.last_seen_update, gone.last_seen_update)
         self.pixel_count = max(self.pixel_count, gone.pixel_count)
+        self._add_sightings(gone.sightings)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,11 +280,14 @@ class MapObject:
             "confirmed": self.confirmed, "strikes": self.strikes,
             "views_in_frustum": self.views_in_frustum, "created_update": self.created_update,
             "last_seen_update": self.last_seen_update, "obs_depth": self.obs_depth,
-            "pixel_count": self.pixel_count, "point_file": points_file(self.id),
+            "pixel_count": self.pixel_count, "point_count": self.point_count,
+            "cloud_points": self.cloud_points, "point_file": points_file(self.id),
+            "sightings": [s.to_list() for s in self.sightings],
         }
 
     @staticmethod
     def from_dict(d: dict[str, Any], points: NDArray[np.float32]) -> MapObject:
+        cloud = d.get("cloud_points")
         return MapObject(
             id=int(d["id"]), label=d["label"], label_votes=dict(d.get("label_votes", {})),
             scores=list(d.get("scores", [])), points=points,
@@ -213,14 +298,27 @@ class MapObject:
             created_update=int(d.get("created_update", 0)),
             last_seen_update=int(d.get("last_seen_update", 0)),
             obs_depth=float(d.get("obs_depth", 2.0)), pixel_count=int(d.get("pixel_count", 0)),
+            sightings=sorted((Sighting.from_list(v) for v in d.get("sightings", [])),
+                             key=Sighting.key),
+            cloud_points=None if cloud is None else int(cloud),
         )
+
+    @property
+    def point_count(self) -> int:
+        """Points of the map cloud attributed to the object (as a single image's ``point_count``
+        counts its cloud's points); the stored sample's size for a map written before counts
+        were recorded."""
+        return len(self.points) if self.cloud_points is None else self.cloud_points
 
     def scene_object(self) -> SceneObject:
         assert self.obb is not None
         return SceneObject(
             id=self.id, label=self.label, score=self.score, obb=self.obb,
-            pixel_count=self.pixel_count, point_count=len(self.points),
+            pixel_count=self.pixel_count, point_count=self.point_count,
             observations=self.observations, confirmed=self.confirmed, frames=list(self.frames),
+            labels=(self.label, *(lab for lab, _ in sorted(self.label_votes.items(),
+                                                           key=lambda kv: (-kv[1], kv[0]))
+                                  if lab != self.label)),
         )
 
 
@@ -243,6 +341,16 @@ class Observation:
         dist = float(np.median(np.linalg.norm(pts - view.T_map_cam.t, axis=1)))
         return Observation(frame, view, inst, pts.astype(np.float32), pts.mean(0), dist,
                            _extent(pts))
+
+    @property
+    def sighting(self) -> Sighting:
+        lo, hi = np.percentile(self.points.astype(np.float64), [2, 98], axis=0)
+        c = self.centroid
+
+        def t(x: NDArray[Any]) -> tuple[float, float, float]:
+            return (float(x[0]), float(x[1]), float(x[2]))
+        return Sighting(self.frame, len(self.points), border_share(self.inst.mask), t(c), t(lo),
+                        t(hi))
 
     @property
     def label(self) -> str:
@@ -404,9 +512,42 @@ def visibility_evidence(view: View, pts: NDArray[Any]) -> tuple[int, int]:
     return through, consistent
 
 
-def centroid_visible(view: View, c: NDArray[Any]) -> bool:
-    inside, z, d = view.lookup(c[None])
-    return bool(inside[0] and z[0] <= d[0] + tau(z[0]))
+def border_share(mask: NDArray[np.bool_]) -> float:
+    """Share of a mask's pixels in the image-border band that ``View.usable`` excludes."""
+    m = np.asarray(mask, bool)
+    n = int(m.sum())
+    if n == 0:
+        return 0.0
+    h, w = m.shape
+    bh, bw = max(1, int(BORDER * h)), max(1, int(BORDER * w))
+    inner = int(m[bh:h - bh, bw:w - bw].sum())
+    return float((n - inner) / n)
+
+
+def in_view(pts: NDArray[Any], K: Any, T_map_cam: Any) -> bool:
+    """Whether a keyframe (grid intrinsics ``K`` and pose) has at least ``IN_VIEW_SHARE`` of the
+    points in front of it and inside its image. Occlusion is ignored: the question is whether the
+    keyframe could have detected the object, and an object whose depth is wrong would otherwise
+    hide from every other keyframe."""
+    if len(pts) == 0:
+        return False
+    pc = T_map_cam.inverse().apply(np.asarray(pts, np.float64))
+    z = pc[:, 2]
+    w, h = K.width, K.height
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = K.fx * pc[:, 0] / z + K.cx
+        v = K.fy * pc[:, 1] / z + K.cy
+        inside = (z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    return bool(inside.mean() >= IN_VIEW_SHARE)
+
+
+def count_views(obj: MapObject, records: list[Any]) -> int:
+    """Keyframes of the map (``records``) that detected the object or have it in view."""
+    pts = obj.points
+    if len(pts) > VIEW_SAMPLES:
+        pts = pts[np.linspace(0, len(pts) - 1, VIEW_SAMPLES).astype(int)]
+    detected = set(obj.frames)
+    return sum(1 for r in records if r.index in detected or in_view(pts, r.K_grid, r.T_map_cam))
 
 
 def below_floor(obj: MapObject, floor_z: float | None, margin: float = 0.3) -> bool:
@@ -417,15 +558,49 @@ def below_floor(obj: MapObject, floor_z: float | None, margin: float = 0.3) -> b
     return float(np.percentile(obj.points[:, 2], 90)) < floor_z - margin
 
 
+def agreeing_sightings(obj: MapObject) -> list[Sighting]:
+    """The sightings that agree with the one most others agree with (ties: more points, then
+    content). Two sightings agree when their bounds overlap, allowing a gap of the depth noise at
+    the object's distance: the partial views of a large object overlap one another, while
+    sightings of a small object that monocular depth scattered along the viewing rays do not."""
+    s = obj.sightings
+    if not s:
+        return []
+    lo = np.array([x.lo for x in s])
+    hi = np.array([x.hi for x in s])
+    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * obj.obs_depth)
+    near = np.all((lo[:, None] <= hi[None] + tol) & (lo[None] <= hi[:, None] + tol), axis=2)
+    best = min(range(len(s)), key=lambda i: (-int(near[i].sum()), -s[i].points, s[i].key()))
+    return [x for x, ok in zip(s, near[best], strict=True) if ok]
+
+
+def fit_points(obj: MapObject) -> NDArray[np.float32]:
+    """The points a box is fitted to: with at least ``CONSENSUS_MIN`` sightings (all recorded),
+    those inside the bounds of the agreeing sightings (``agreeing_sightings``), else all."""
+    s = obj.sightings
+    if len(s) < CONSENSUS_MIN or {x.frame for x in s} != set(obj.frames):
+        return obj.points
+    keep = agreeing_sightings(obj)
+    if len(keep) == len(s):
+        return obj.points
+    lo = np.min([x.lo for x in keep], axis=0) - CONSENSUS_MARGIN
+    hi = np.max([x.hi for x in keep], axis=0) + CONSENSUS_MARGIN
+    inside = np.all((obj.points >= lo) & (obj.points <= hi), axis=1)
+    return obj.points[inside] if inside.sum() >= 10 else obj.points
+
+
 def refit(obj: MapObject, floor_z: float | None) -> None:
     if len(obj.points) < 10:
         return
-    obj.obb = fit_object_obb(obj.points, obj.label, UP, floor_z)
+    obj.obb = fit_object_obb(fit_points(obj), obj.label, UP, floor_z)
 
 
 def confirm(obj: MapObject) -> None:
-    """Confirmed when detected in >= min(3, V) keyframes (V: ``views_in_frustum``)."""
-    obj.confirmed = obj.observations >= min(CONFIRM_DETECTIONS, max(1, obj.views_in_frustum))
+    """Confirmed when reliable detections (``MapObject.reliable_frames``) come from at least
+    ``CONFIRM_DETECTIONS`` keyframes, or from one when no other keyframe of the map has the object
+    in view (``views_in_frustum`` <= 1: a single image, or a place only one keyframe saw)."""
+    need = CONFIRM_DETECTIONS if obj.views_in_frustum > 1 else 1
+    obj.confirmed = len(obj.reliable_frames()) >= need
 
 
 # ------------------------------------------------------------------------------------------------
@@ -498,7 +673,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     #    objects get provisional ids >= first_new (content order) until their final numbering
     owner: list[int] = [0] * len(obs)  # object id per observation
     touched: set[int] = set()
-    groups = _group(obs, state.objects)
+    groups = _group(obs, state.objects, _Earlier(ctx, state))
     existing = state.by_id()
     fresh_groups = sorted((m for oid, m in groups if oid is None),
                           key=lambda m: min(obs[i].key for i in m))
@@ -519,17 +694,12 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
         if o.id in touched:
             refit(o, state.floor_z)
 
-    # 3. merge duplicates (lower id kept; keepers are refitted), then count views and confirm
+    # 3. merge duplicates (lower id kept; keepers are refitted), then count the keyframes of the
+    #    whole map that have each object in view and confirm
     alias: dict[int, int] = {}
     merged = _merge(state, touched, alias)
-    old_views = _OldViews(ctx)
     for o in state.objects:
-        c = o.centroid
-        seen = {f for f, (_, v) in new_views.items() if centroid_visible(v, c)}
-        seen |= set(o.frames) & set(new_views)
-        o.views_in_frustum += len(seen)
-        if o.id >= first_new:  # first detected now: earlier keyframes that saw its place count
-            o.views_in_frustum += old_views.count_visible(c)
+        o.views_in_frustum = count_views(o, records)
         confirm(o)
 
     # 4. drop non-physical objects and objects this update shows to be gone
@@ -576,12 +746,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     for o in state.objects:
         if o.id in touched:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
-    tx.write_json(OBJECTS_JSON, {
-        "next_id": state.next_id,
-        "floor_z": state.floor_z,
-        "merged_into": {str(k): v for k, v in sorted(state.merged_into.items())},
-        "objects": [o.to_dict() for o in sorted(state.objects, key=lambda o: o.id)],
-    })
+    save_state(tx, state)
     confirmed = sum(o.confirmed for o in state.objects)
     state.summary = {
         "instances": len(obs), "touched": len(touched), "new": len(fresh), "merged": merged,
@@ -594,15 +759,92 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     return state
 
 
+def save_state(tx: Any, state: ObjectState) -> None:
+    tx.write_json(OBJECTS_JSON, {
+        "next_id": state.next_id,
+        "floor_z": state.floor_z,
+        "merged_into": {str(k): v for k, v in sorted(state.merged_into.items())},
+        "objects": [o.to_dict() for o in sorted(state.objects, key=lambda o: o.id)],
+    })
+
+
+def set_cloud_counts(tx: Any, state: ObjectState, labels: NDArray[Any]) -> None:
+    """Record each object's point count in the map cloud (``labels``: object id per cloud point)
+    and store the state again."""
+    ids = np.asarray(labels, np.int64).reshape(-1)
+    counts = np.bincount(ids[ids > 0]) if (ids > 0).any() else np.zeros(1, np.int64)
+    for o in state.objects:
+        o.cloud_points = int(counts[o.id]) if o.id < len(counts) else 0
+    save_state(tx, state)
+
+
 # ------------------------------------------------------------------------------------------------
 # association
 
 
-def _object_affinity(ob: Observation, o: MapObject, tree: cKDTree) -> float:
+def _object_affinity(ob: Observation, o: MapObject, tree: cKDTree,
+                     earlier: _Earlier | None = None) -> float:
     """How well an instance matches an existing object: max(projected-mask IoU, share of the
-    instance's points on the object's)."""
-    iou = projected_iou(ob.view, ob.inst.mask, o.points)
-    return max(iou, overlap_fraction(ob.points, o.points, ob.radius, tree))
+    instance's points on the object's); when neither reaches the gate, also the IoU of the
+    object's mask in its detecting keyframes of earlier updates (``_Earlier``) with the instance's
+    projected points — the other direction of ``_pair_affinity``, so an object whose depth
+    differs between the updates (its points lie behind the new keyframe's surface, hidden) is
+    matched as it would be within one update."""
+    s = max(projected_iou(ob.view, ob.inst.mask, o.points),
+            overlap_fraction(ob.points, o.points, ob.radius, tree))
+    if s < IOU_GATE and earlier is not None:
+        for view, mask in earlier.masks(o, ob):
+            s = max(s, projected_iou(view, mask, ob.points))
+    return s
+
+
+class _Earlier:
+    """Keyframes of earlier updates that detected an existing object: their stored views and the
+    object's masks in them (``instances.json``), loaded lazily. ``masks`` gives the
+    ``EARLIER_VIEWS`` of them nearest to an instance's viewpoint."""
+
+    def __init__(self, ctx: Any, state: ObjectState) -> None:
+        self.ctx = ctx
+        self.state = state
+        self.records = {r.index: r for r in ctx.old_frames}
+        self.views: dict[int, View | None] = {}
+        self.instances: dict[int, list[dict[str, Any]]] = {}
+
+    def _view(self, rec: Any) -> View | None:
+        if rec.index not in self.views:
+            self.views[rec.index] = stored_view(self.ctx.tx.current, rec)
+        return self.views[rec.index]
+
+    def _mask(self, rec: Any, oid: int, shape: tuple[int, int]) -> NDArray[np.bool_] | None:
+        if rec.index not in self.instances:
+            import json
+
+            p = self.ctx.tx.current(frame_file(rec.name, "instances.json"))
+            self.instances[rec.index] = (json.loads(p.read_text()).get("instances", [])
+                                         if p.exists() else [])
+        masks = [rle.decode(x["mask"]) for x in self.instances[rec.index]
+                 if self.state.resolve(int(x["object_id"])) == oid]
+        masks = [m for m in masks if m.shape == shape]
+        return np.logical_or.reduce(masks) if masks else None
+
+    def masks(self, o: MapObject, ob: Observation) -> list[tuple[View, NDArray[np.bool_]]]:
+        T = ob.view.T_map_cam
+        scale = max(0.5, ob.depth)
+
+        def distance(f: int) -> tuple[float, int]:
+            R = self.records[f].T_map_cam
+            return (float(np.linalg.norm(R.t - T.t)) / scale
+                    + 1.0 - float(R.R[:, 2] @ T.R[:, 2]), f)
+
+        out = []
+        for f in sorted((f for f in o.frames if f in self.records), key=distance)[:EARLIER_VIEWS]:
+            view = self._view(self.records[f])
+            if view is None:
+                continue
+            mask = self._mask(self.records[f], o.id, view.depth.shape)
+            if mask is not None:
+                out.append((view, mask))
+        return out
 
 
 def _pair_affinity(a: Observation, b: Observation) -> float:
@@ -698,7 +940,7 @@ def _candidate_objects(obs: list[Observation], objs: list[MapObject]
     return sorted(zip(i[ok].tolist(), [have[x] for x in k[ok].tolist()], strict=True))
 
 
-def _group(obs: list[Observation], objects: list[MapObject]
+def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier | None = None
            ) -> list[tuple[int | None, list[int]]]:
     """Group this update's instances into objects without regard to the keyframes' order.
 
@@ -716,7 +958,7 @@ def _group(obs: list[Observation], objects: list[MapObject]
     for i, j in _candidate_objects(obs, objs):
         if j not in trees:
             trees[j] = cKDTree(objs[j].points)
-        s = _object_affinity(obs[i], objs[j], trees[j])
+        s = _object_affinity(obs[i], objs[j], trees[j], earlier)
         if s >= IOU_GATE:
             to_obj[(i, j)] = s
             edges.append((-s, 0, obs[i].key, (objs[j].id,), i, n + j))
@@ -787,15 +1029,37 @@ def containment(a: OBB, b: OBB, pad: float = 0.1, samples: int = 3000) -> float:
     return float(big.contains(pts).mean())
 
 
+def _scale(o: MapObject) -> float:
+    """Size of an object: the largest robust (2-98 %) extent — horizontal diagonal or height — of
+    the points its box is fitted to (``fit_points``)."""
+    pts = fit_points(o)
+    if len(pts) < 2:
+        return 0.0
+    lo, hi = np.percentile(pts[:, 2], [2, 98])
+    return max(_extent(pts), float(hi - lo))
+
+
 def _merge_strength(a: MapObject, b: MapObject) -> float:
-    """>= 1 when two objects are one physical object: compatible labels and >= 50 % of the
-    smaller one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box
-    >= 60 % inside the other). The value orders the merges (strongest first)."""
-    if not compatible(a.label, b.label):
+    """>= 1 when two objects are one physical object. Compatible labels: >= 50 % of the smaller
+    one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box >= 60 %
+    inside the other). Incompatible labels (the detector's label flickered between keyframes):
+    no keyframe detected both (it would have seen two things there), their sizes are comparable
+    (``MERGE_SCALE``: neither is a part of the other or an item resting on it) and >= 50 % of
+    either one's points lie on the other's surface. The value orders the merges (strongest
+    first)."""
+    same_kind = compatible(a.label, b.label)
+    if not same_kind and set(a.frames) & set(b.frames):
         return 0.0
     if np.linalg.norm(a.centroid - b.centroid) > max(CENTROID_GATE * 2,
                                                      _extent(a.points) + _extent(b.points)):
         return 0.0
+    if not same_kind:
+        sa, sb = _scale(a), _scale(b)
+        if min(sa, sb) < MERGE_SCALE * max(sa, sb):
+            return 0.0
+        radius = max(0.05, 0.02 * min(a.obs_depth, b.obs_depth))
+        return max(overlap_fraction(a.points, b.points, radius),
+                   overlap_fraction(b.points, a.points, radius)) / MERGE_OVERLAP
     small, big = (a, b) if len(a.points) <= len(b.points) else (b, a)
     radius = max(0.05, 0.02 * small.obs_depth)
     s = overlap_fraction(small.points, big.points, radius) / MERGE_OVERLAP
@@ -849,33 +1113,6 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int]) -> int:
 
 # ------------------------------------------------------------------------------------------------
 # absence
-
-
-class _OldViews:
-    """Keyframes of earlier updates, loaded lazily (only where a point projects into them)."""
-
-    def __init__(self, ctx: Any) -> None:
-        self.ctx = ctx
-        self.cache: dict[str, View | None] = {}
-
-    def _view(self, rec: Any) -> View | None:
-        if rec.name not in self.cache:
-            self.cache[rec.name] = stored_view(self.ctx.tx.current, rec)
-        return self.cache[rec.name]
-
-    def count_visible(self, c: NDArray[Any]) -> int:
-        n = 0
-        for rec in self.ctx.old_frames:
-            K = rec.K_grid
-            pc = rec.T_map_cam.inverse().apply(np.asarray(c, np.float64)[None])[0]
-            if pc[2] <= 0:
-                continue
-            u, v = K.fx * pc[0] / pc[2] + K.cx, K.fy * pc[1] / pc[2] + K.cy
-            if not (0 <= u < K.width and 0 <= v < K.height):
-                continue
-            view = self._view(rec)
-            n += int(view is not None and centroid_visible(view, c))
-        return n
 
 
 def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]]) -> list[int]:

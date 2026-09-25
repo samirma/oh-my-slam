@@ -8,7 +8,9 @@ observes, and how many detections does the map keep), not accuracy — accuracy 
 Method: the map exports, for each object, the keyframes that observed it (the object's
 ``frame_intervals``, keyframe indices). For every registered capture, the labels of the map objects
 observed in its keyframe are compared with the labels ``segment.sh -i`` detects in the same capture:
-labels are paired one-to-one, identical labels first, then compatible ones (e.g. sofa / couch).
+labels are paired one-to-one, identical labels first, then compatible ones (e.g. sofa / couch). A
+map object whose detections carried several labels (the detector's label flickered between
+keyframes and the map merged them: its ``detected_as`` labels) pairs with any of them.
 ``map_objects_detected`` = paired map objects / map objects observed; ``detections_in_map`` =
 paired detections / detections (the rest were dropped or merged away by the map); both are summed
 over the frames."""
@@ -16,6 +18,7 @@ over the frames."""
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import numpy as np
@@ -38,16 +41,18 @@ def detection_row(name: str, objs: list[DocObject]) -> dict[str, Any]:
             "scores": [round(s, 3) for s in scores]}
 
 
-def paired_labels(a: list[str], b: list[str]) -> int:
-    """Size of a one-to-one pairing of labels ``a`` with ``b``: exact matches first, then
-    compatible labels."""
-    left = [normalize_label(x) for x in a]
+def paired_labels(a: Sequence[str | Collection[str]], b: Sequence[str]) -> int:
+    """Size of a one-to-one pairing of ``a`` with the labels ``b``: exact matches first, then
+    compatible labels. An item of ``a`` may be several labels (a map object's ``detected_as``); it
+    pairs with any of them."""
+    left = [(normalize_label(x),) if isinstance(x, str) else tuple(normalize_label(v) for v in x)
+            for x in a]
     right = [normalize_label(x) for x in b]
     n = 0
     for exact in (True, False):
         for x in list(left):
-            j = next((k for k, y in enumerate(right) if (x == y if exact else compatible(x, y))),
-                     None)
+            j = next((k for k, y in enumerate(right)
+                      if any(v == y if exact else compatible(v, y) for v in x)), None)
             if j is not None:
                 left.remove(x)
                 right.pop(j)
@@ -65,7 +70,7 @@ def map_consistency(m: Metrics, prefix: str, frames: dict[str, list[DocObject]],
     for key, capture in sorted(sources.items()):
         if capture not in frames:
             continue
-        observed = [o.label for o in map_objs if key in o.frames]
+        observed = [o.labels or (o.label,) for o in map_objs if key in o.frames]
         detected = [o.label for o in frames[capture]]
         k = paired_labels(observed, detected)
         rows.append({"image": capture, "keyframe": key, "map_objects": len(observed),

@@ -783,6 +783,9 @@ def integrate(ctx: UpdateContext, progress: Progress
     with timing.stage("objects"):
         objs = objects.update_objects(ctx, records, progress)
     geo = build_geometry(ctx, records, objs, progress)  # stage cloud
+    with timing.stage("objects"):
+        assert geo.cloud.label is not None
+        objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label)
     return records, objs, geo
 
 

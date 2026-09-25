@@ -25,6 +25,7 @@ class DocObject:
     color: tuple[int, ...] | None
     cuboid: tuple[float, ...] | None  # x, y, z, qx, qy, qz, qw, sx, sy, sz
     frames: frozenset[int] = field(default_factory=frozenset)  # frames that observed it
+    labels: tuple[str, ...] = ()  # ``detected_as``: every label it was detected as (maps)
 
     def obb(self) -> OBB | None:
         if self.cuboid is None or len(self.cuboid) != 10:
@@ -58,7 +59,8 @@ def doc_objects(doc: Json) -> list[DocObject]:
             color_hex=_named(data.get("text"), "color_hex"),
             color=None if vec is None else tuple(int(v) for v in vec),
             cuboid=None if cub is None else tuple(float(v) for v in cub),
-            frames=_frames(obj.get("frame_intervals"))))
+            frames=_frames(obj.get("frame_intervals")),
+            labels=tuple(str(v) for v in _named(data.get("vec"), "detected_as") or ())))
     return sorted(out, key=lambda o: o.id)
 
 
