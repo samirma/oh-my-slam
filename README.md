@@ -555,6 +555,35 @@ Geometry and detection requests run concurrently on two connections.
      rotation-dominant when more than half of the verified pairs are panoramic, or when the
      baseline-to-depth ratio is below 0.02. MapAnything runs in chunks of 24, anchored on up to
      4 already-posed keyframes, and is also the fallback when SfM fails.
+   * **Weakly linked parts of a new map** (typical of a video walk through several rooms): a
+     stretch that hangs on the rest by one weak link — a doorway crossed with a few dozen
+     matches, or one keyframe shared with the rest — has no scale of its own for the global
+     mapper, which returns it shrunk onto one point or at an arbitrary scale depending on its
+     random start, and its orientation rests on that link alone. After SfM:
+     1. An SfM pose needs 20 triangulated points. Keyframes with fewer are not accepted as posed
+        (a stretch shrunk onto a point triangulates nothing); incremental mapping with the others
+        fixed may register them again.
+     2. Each keyframe's SfM scale is measured against its MoGe depth (median depth ratio at its
+        triangulated points), and its tilt against its GeoCalib gravity (1–3° on correctly posed
+        keyframes). Co-visible keyframes whose ratios agree within 15 % and gravity within 10°
+        form blocks. A block that hangs on the rest by a bridge or through one viewpoint and
+        disagrees with the largest block by more than 12 % in scale or 5° in gravity is scaled and
+        levelled about the keyframe it hangs on (the one with the most verified matches to it);
+        what hangs on it follows.
+     3. Keyframes still unplaced that verified matches connect to the posed ones get MapAnything
+        poses anchored on the posed keyframes next to them in capture order (video) or on the most
+        similar ones (photos). A secondary reconstruction that shares 3 or more keyframes with the
+        main one is merged through the similarity of the shared poses instead.
+     4. Realigned and multi-view keyframes are refined with every verified match and the depth,
+        the rest fixed, and realigned blocks are levelled with their gravity again (the weak link
+        can pull their tilt away).
+     5. Guards: a keyframe placed within a tenth of the median step of another keyframe's centre
+        while looking elsewhere (optical axes more than 3° apart) is left out, unless its own
+        points or matches support the pose or the pair's matches are a pure rotation; a re-placed
+        keyframe whose gravity is still more than 25° off is left out too.
+
+     Keyframes with no verified match to the rest are left out and listed. `map.json`
+     (`updates[].notes.sfm_unsupported`, `sfm_join`) records what was re-placed and how.
    * **Update:** incremental mapping runs with the map's keyframes fixed, and the result is
      mapped back onto the map frame. A result that moved the fixed keyframes is discarded.
      Keyframes it cannot place, or whose depth contradicts the pose, are posed by anchored
@@ -725,6 +754,15 @@ runs it end to end as a test.
   fused surface joins them (see Update semantics). At floor height only the first test applies,
   since the floor joins anything: two pieces of one rug that neither overlap nor touch stay two
   objects.
+* **Video through several rooms.** Where a walk crosses a doorway in a second or two,
+  consecutive keyframes share only a few matches, and the global mapper can leave the stretch
+  behind the doorway at any scale or tilt, or shrink it onto one point (see Poses). The mapper
+  corrects the scale with the depth and the tilt with gravity, but the stretch's heading and
+  position still rest on that one link, or on multi-view poses anchored on its capture-order
+  neighbours, so they can be a few degrees and decimetres off. Keyframes whose gravity still
+  disagrees by more than 25° afterwards are left out: on the user's `livingroom.mp4` at `-fps 1`,
+  the dim corridor at 77–81 s. The global mapper starts from random positions, so two runs on one
+  video can differ in such stretches.
 
 ## Development
 
