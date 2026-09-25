@@ -1,5 +1,6 @@
 """Evaluator metrics on synthetic data: yaw alignment and wrap, pitch direction, registration,
-same-heading depth agreement, one-update vs split object stability, segmentation vs map."""
+same-heading depth agreement, one-update vs split object stability (label agreement on a
+label-blind pairing), near-duplicate objects, segmentation vs map."""
 
 from __future__ import annotations
 
@@ -8,13 +9,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping.store import FrameRecord
 from oh_my_slam.schema import openlabel as ol
+from oh_my_slam.segmentation.obb import OBB
 from oh_my_slam.tools.evaluate.mapquality import (
+    NEAR_DUPLICATE_GAP_M,
     agreement_metrics,
+    box_gap,
+    duplicate_metrics,
     match_objects,
     split_alignment,
     stability_metrics,
@@ -232,6 +238,79 @@ def test_overlapping_objects_of_different_labels_are_not_swapped() -> None:
     # geometry alone decides between two objects whose labels both changed
     both = [box(2, "lamp", (0.02, 0, 0)), box(35, "cup", (0.18, 0, 0))]
     assert pair_ids(single, both) == {(2, 2), (35, 35)}
+
+
+def test_label_agreement_is_measured_on_a_label_blind_pairing() -> None:
+    """Ids and boxes are compared on a label-aware pairing (the desk pairs with the desk), but the
+    labels are compared on pairs that geometry alone chose: when each split box lies on the
+    other label's box, the labels disagree there, whatever the label-aware pairing says."""
+    single = [box(2, "desk", (0.0, 0, 0)), box(35, "carpet", (0.2, 0, 0))]
+    split = [box(2, "desk", (0.15, 0, 0)), box(35, "carpet", (0.05, 0, 0))]
+    m = Metrics()
+    rows = stability_metrics(m, "s", single, split, Pose.identity())
+    assert {(r["single_id"], r["split_id"]) for r in rows} == {(2, 2), (35, 35)}
+    agreement = m.items["s.label_agreement"]
+    assert m.items["s.id_agreement"].value == 1.0
+    assert agreement.value == 0.0 and agreement.detail["label_aware"] == 1.0
+    assert sorted(agreement.detail["disagreeing"]) == [[2, "desk", 35, "carpet"],
+                                                       [35, "carpet", 2, "desk"]]
+    # boxes that stay in place agree however they are paired
+    m = Metrics()
+    stability_metrics(m, "s", single, [box(2, "table", (0.01, 0, 0)),
+                                       box(35, "rug", (0.21, 0, 0))], Pose.identity())
+    assert m.items["s.label_agreement"].value == 1.0
+
+
+def test_box_gap_is_the_distance_between_the_boxes() -> None:
+    def ob(c: tuple[float, float, float], size: tuple[float, float, float] = (1, 1, 1),
+           yaw: float = 0.0) -> OBB:
+        return OBB(np.array(c, float), rot_z(np.radians(yaw)), np.array(size, float))
+
+    assert box_gap(ob((0, 0, 0)), ob((1.5, 0, 0))) == pytest.approx(0.5)
+    assert box_gap(ob((0, 0, 0)), ob((1.5, 1.5, 0))) == pytest.approx(np.sqrt(0.5))  # edges
+    assert box_gap(ob((0, 0, 0)), ob((0, 0, 2.0))) == pytest.approx(1.0)  # one above the other
+    # a box turned 45°: its corner points at the other box's face
+    assert box_gap(ob((0, 0, 0)), ob((2.0, 0, 0), yaw=45)) == pytest.approx(1.5 - np.sqrt(0.5))
+    assert box_gap(ob((0, 0, 0)), ob((0.9, 0, 0))) == 0.0  # overlapping
+    assert box_gap(ob((0, 0, 0), (2, 2, 2)), ob((0.1, 0, 0), (0.2, 0.2, 0.2))) == 0.0  # inside
+    # tilted boxes (general orientation) against a dense sampling of their volumes
+    rng = np.random.default_rng(0)
+
+    def rotation() -> np.ndarray:
+        q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        return q * np.sign(np.linalg.det(q))
+
+    for _ in range(5):
+        a = OBB(rng.normal(0, 1, 3), rotation(), rng.uniform(0.2, 1, 3))
+        b = OBB(rng.normal(0, 1, 3) + [2.5, 0, 0], rotation(), rng.uniform(0.2, 1, 3))
+        pa = (rng.uniform(-0.5, 0.5, (40000, 3)) * a.size) @ a.R.T + a.center
+        pb = (rng.uniform(-0.5, 0.5, (40000, 3)) * b.size) @ b.R.T + b.center
+        sampled = float(cKDTree(pb).query(pa)[0].min())  # >= the true gap, close to it
+        assert box_gap(a, b) <= sampled + 1e-9 and sampled - box_gap(a, b) < 0.1
+
+
+def test_near_duplicates_are_compatible_objects_never_seen_together_close_by() -> None:
+    def obj(oid: int, label: str, x: float, frames: set[int]) -> DocObject:
+        d = box(oid, label, (x, 0.0, 0.0), (0.3, 0.1, 0.2))
+        return DocObject(d.id, d.label, d.score, None, None, d.cuboid, frozenset(frames))
+
+    # the faucet of a sink, placed twice by keyframes whose depth disagrees: 0.1 m between boxes
+    faucets = [obj(60, "faucet", 2.8, {25, 26, 27}), obj(257, "faucet", 2.4, {70, 71, 72})]
+    m = Metrics()
+    (row,) = duplicate_metrics(m, "map.single", faucets)
+    assert m.items["map.single.near_duplicates"].value == 1
+    assert row["ids"] == [60, 257] and row["gap_m"] == pytest.approx(0.1)
+    # a keyframe that detected both saw two faucets; other labels, or further apart: not counted
+    for pair in ([obj(60, "faucet", 2.8, {25, 71}), obj(257, "faucet", 2.4, {70, 71})],
+                 [obj(60, "faucet", 2.8, {25}), obj(257, "cup", 2.4, {70})],
+                 [obj(60, "faucet", 2.8, {25}),
+                  obj(257, "faucet", 2.8 - 0.3 - NEAR_DUPLICATE_GAP_M - 0.05, {70})]):
+        m = Metrics()
+        assert duplicate_metrics(m, "map.split", pair) == []
+        assert m.items["map.split.near_duplicates"].value == 0
+    # overlapping boxes of compatible labels (a cup and a mug) are counted too
+    m = Metrics()
+    assert len(duplicate_metrics(m, "m", [obj(1, "cup", 1.0, {1}), obj(2, "mug", 1.1, {2})])) == 1
 
 
 def test_far_apart_boxes_are_not_matched() -> None:

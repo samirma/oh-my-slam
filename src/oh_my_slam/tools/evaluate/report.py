@@ -307,6 +307,14 @@ def _details(details: dict[str, Any]) -> list[str]:
             [[r["single_id"], r["split_id"], f"{r['single_label']} / {r['split_label']}",
               r["iou"], r["centre_delta_m"], r["extent_delta_rel"]]
              for r in details["map.stability"]])
+    for name in ("single", "split"):
+        rows = details.get(f"map.{name}.duplicates")
+        if rows:
+            out += _section(
+                f"Near-duplicate objects — {name} map", ["ids", "labels", "box gap m",
+                                                          "centre distance m"],
+                [[" / ".join(map(str, r["ids"])), " / ".join(r["labels"]), r["gap_m"],
+                  r["centre_distance_m"]] for r in rows])
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
     return out

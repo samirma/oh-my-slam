@@ -1,13 +1,14 @@
 {
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
   "rationale": {
-    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights) and are reference only: the evaluator reads only op, value, the tolerances, unit and description.",
-    "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), segment.sh -m 60 -> 2.5 s (1.2 s), view.sh -m 10 -> 4 s (1.9 s).",
-    "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; segment.sh -m 1.2 GB -> 2 GB; view.sh -m 462 MB -> 800 MB.",
+    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description.",
+    "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), segment.sh -m 60 -> 2.5 s (1.2 s), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), segment.sh -m 2.5 -> 2.0 s (1.27 s), view.sh -m 4 -> 3 s (1.99 s).",
+    "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; segment.sh -m 1.2 GB -> 2 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), segment.sh -m 2 GB -> 1100 MB (710 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
     "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and segment.sh -m / view.sh -m, which do not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
     "pose.*": "The references are the commanded headings in the capture names, and the true heading deviates from them: SIFT homographies between the images themselves (pure rotation, measured 2026-09-25) give ~8 deg between 001 and 053 and ~9 deg between 026 and 078, which the names call the same heading, and 004 (commanded +15) at ~15-18 deg. A perfect estimator therefore scores a few degrees of median yaw error and ~9 deg on the same-heading pairs, so yaw_err_median <= 7, yaw_err_max <= 15 and same_heading_yaw_diff_max <= 10 stay: tighter targets would fail a correct map. Registration and pitch direction are exact properties of a working mapper on 79 rendered frames: >= 0.95 (at most 3 of 79 frames unregistered, 1 of 31 tilted frames with the wrong sign), up from 0.9. The head turns in place: the camera circles the neck axis at a few cm, plus the small sideways steps of the bootstrap_side frames, so the camera centres should lie within about 0.1 m; centre_radius <= 0.25 m (was 1 m) leaves room for monocular scale error but rejects the drifting trajectory of the one-update map (0.80 m measured).",
     "map.*.frame_agreement_*": "Spec intent: the map is one consistent cloud. The same-heading pairs see the same surfaces from nearly the same pose, so their stored depths must agree to within monocular depth noise once aligned: median <= 3 % (was 5 %) and p90 <= 10 % (was 15 %), i.e. ~6-9 cm / 20-30 cm at 2-3 m. The one-update map meets this (1.1 % / 6.0 %); the split map (6.8 % / 15.6 %) does not, which is the defect these targets are meant to show.",
-    "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection).",
+    "map.*.near_duplicates": "Spec §2.3: an object observed across several frames keeps one id, so no physical object may be exported twice. Counted: pairs of exported objects with compatible labels that no keyframe observed together (a keyframe that detected both saw two things) whose boxes overlap or lie within 0.3 m. A copy made by inconsistent monocular depth lies along the same viewing rays, offset by the depth disagreement of the keyframes that saw each copy; the frame-agreement target allows a p90 of 10 %, i.e. 0.3 m at 3 m, the distance of the farthest objects of the sequence. Target 0 (the baseline run had 1 in each map: the sink's faucet mapped twice where the 360-degree loop closes).",
+    "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing.",
     "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. The seg.map_consistency metrics (formerly seg.map.recall / precision) compare the map's objects with per-frame detections of the same detector: they measure consistency, not accuracy. A map object pairs with a per-frame detection under its label or any of its detected_as labels (the labels its detections carried when the detector's label flickered between keyframes and the map merged them). A map object is built from detections in the frames it observes, so map_objects_detected must be ~1 (>= 0.95; measured 0.997); detections_in_map >= 0.8 (measured 0.88) allows the map to drop small or unstable detections. Accuracy is gt.*.",
     "contract.*": "Every contract is a count of violations: 0.",
     "gt.*": "Accuracy against annotations in examples/ground_truth/ (none yet, so never measured). Set from typical monocular performance: object recall >= 0.7, precision >= 0.6, OBB IoU >= 0.3 (monocular boxes of partially visible objects), yaw error median <= 3 deg / max <= 8 deg after the best common offset, pitch error median <= 3 deg. Review them when the first annotations land."
@@ -19,8 +20,8 @@
   "metrics": {
     "perf.server.cold_start_s": {
       "op": "<=",
-      "value": 45,
-      "measured": 23.9554,
+      "value": 40,
+      "measured": 24.5933,
       "unit": "s",
       "tolerance_rel": 0.25,
       "description": "start_inference_server.sh after --stop until ready, cached weights (AC22)"
@@ -107,16 +108,16 @@
     },
     "perf.segment_frames.wall_s": {
       "op": "<=",
-      "value": 2.0,
-      "measured": 1.0676,
+      "value": 1.6,
+      "measured": 1.0671,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "segment.sh -i per ainex-captures frame (median over the frames)"
     },
     "perf.segment_frames.client_peak_mb": {
       "op": "<=",
-      "value": 300,
-      "measured": 164.3,
+      "value": 250,
+      "measured": 165.1,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: segment.sh -i per ainex-captures frame (median over the frames)"
     },
@@ -151,8 +152,8 @@
     },
     "perf.mapper_single.wall_s": {
       "op": "<=",
-      "value": 300,
-      "measured": 159.145,
+      "value": 270,
+      "measured": 176.9931,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "mapper.sh update of all 79 ainex-captures frames in one update"
@@ -173,8 +174,8 @@
     },
     "perf.mapper_split.wall_s": {
       "op": "<=",
-      "value": 360,
-      "measured": 180.789,
+      "value": 300,
+      "measured": 197.9368,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "mapper.sh update of the same frames split across the updates (sum)"
@@ -195,16 +196,16 @@
     },
     "perf.segment_map.wall_s": {
       "op": "<=",
-      "value": 2.5,
-      "measured": 1.2029,
+      "value": 2.0,
+      "measured": 1.2726,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "segment.sh -m on the one-update map with -d DIR (no inference)"
     },
     "perf.segment_map.client_peak_mb": {
       "op": "<=",
-      "value": 2000,
-      "measured": 1191.5756,
+      "value": 1100,
+      "measured": 710.0,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: segment.sh -m on the one-update map with -d DIR (no inference)"
     },
@@ -217,16 +218,16 @@
     },
     "perf.view_map.render_s": {
       "op": "<=",
-      "value": 4.0,
-      "measured": 1.9113,
+      "value": 3.0,
+      "measured": 1.9896,
       "unit": "s",
       "tolerance_rel": 0.2,
       "description": "view.sh -m on the one-update map: process start until the page has rendered"
     },
     "perf.view_map.client_peak_mb": {
       "op": "<=",
-      "value": 800,
-      "measured": 461.865,
+      "value": 350,
+      "measured": 214.1061,
       "unit": "MB",
       "description": "peak resident set of the command's process tree: view.sh -m on the one-update map: process start until the page has rendered"
     },
@@ -339,6 +340,14 @@
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (one-update map)"
     },
+    "map.single.near_duplicates": {
+      "op": "<=",
+      "value": 0,
+      "measured": 1.0,
+      "unit": "",
+      "tolerance_abs": 0,
+      "description": "pairs of exported objects with compatible labels, never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; one-update map)"
+    },
     "pose.split.registered_fraction": {
       "op": ">=",
       "value": 0.95,
@@ -403,6 +412,14 @@
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (split map)"
     },
+    "map.split.near_duplicates": {
+      "op": "<=",
+      "value": 0,
+      "measured": 1.0,
+      "unit": "",
+      "tolerance_abs": 0,
+      "description": "pairs of exported objects with compatible labels, never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; split map)"
+    },
     "map.stability.matched_fraction": {
       "op": ">=",
       "value": 0.9,
@@ -417,7 +434,7 @@
       "measured": 0.9474,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "paired objects with the same (or a compatible) label"
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
     },
     "map.stability.id_agreement": {
       "op": ">=",

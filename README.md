@@ -596,7 +596,7 @@ are:
 |---|---|
 | `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
-| `map.*` | Frame agreement over overlapping keyframes, and the stability of ids, labels and OBBs between the one-update and the split map. |
+| `map.*` | Frame agreement over overlapping keyframes; near-duplicate objects (compatible labels, never detected in the same keyframe, boxes within 0.3 m); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
 | `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
