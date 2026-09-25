@@ -74,6 +74,34 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
     assert store.full_tree_hash(one_image_map) == before  # nothing in the map changed
 
 
+def test_map_scene_colours_follow_the_current_palette(one_image_map: Path, tmp_path: Path
+                                                     ) -> None:
+    """A map written with another palette: its scene JSON is rebuilt from the persisted state, so
+    it carries today's colour of each id (as the PLY and catalogue do) and is otherwise the stored
+    scene.json."""
+    import shutil
+
+    from oh_my_slam.mapping.export import scene_bytes
+    from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
+
+    old = tmp_path / "old"
+    shutil.copytree(one_image_map, old)
+    stored = json.loads((old / store.SCENE_JSON).read_text())
+    for o in stored["openlabel"]["objects"].values():
+        o["object_data"]["text"] = [{"name": "color_hex", "val": "#000075"}]
+        o["object_data"]["vec"] = [{"name": "color", "val": [0, 0, 117]}]
+    (old / store.SCENE_JSON).write_text(json.dumps(stored))
+    doc = json.loads(scene_bytes(store.MapReader(old)))
+    for key, o in doc["openlabel"]["objects"].items():
+        assert o["object_data"]["text"] == [{"name": "color_hex", "val": color_hex_for_id(int(key))}]
+        assert o["object_data"]["vec"] == [{"name": "color", "val": list(color_for_id(int(key)))}]
+        o["object_data"]["text"] = stored["openlabel"]["objects"][key]["object_data"]["text"]
+        o["object_data"]["vec"] = stored["openlabel"]["objects"][key]["object_data"]["vec"]
+    assert doc["openlabel"]["objects"] == stored["openlabel"]["objects"]
+    for k in ("frames", "streams", "coordinate_systems", "frame_intervals"):
+        assert doc["openlabel"].get(k) == stored["openlabel"].get(k), k
+
+
 @pytest.mark.parametrize(("args", "hint"), [
     (["-f", "ply", "-p", "stride=2"], b"pixel-level attribute"),
     (["-f", "ply", "-p", "edge=0"], b"pixel-level attribute"),

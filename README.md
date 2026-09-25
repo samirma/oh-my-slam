@@ -211,7 +211,7 @@ runs. The definition lives once, in `core/cloud_attrs.py`.
 | `max-depth` | metres > 0, or `inf` | `inf` | image only | Drop pixels farther than this. |
 | `edge` | relative depth jump ≥ 0 | `0.04` | image only | Drop flying pixels on depth discontinuities; `0` disables the filter. |
 | `voxel` | metres ≥ 0 | `0` (off) | image, map | Keep the first point (in pixel or storage order) of each voxel. Colours are never averaged. |
-| `normals` | `on`, `off` | `off` | image, map | Add `nx ny nz`. For an image they come from the depth grid; for a map they are oriented towards the keyframe cameras. |
+| `normals` | `on`, `off` | `off` | image, map | Add `nx ny nz`. For an image they come from the depth grid. For a map they come from each point's 16 nearest neighbours in the whole map, are oriented towards the keyframe cameras, and are computed only for the emitted points. |
 | `label` | `on`, `off` | `off` | image, map | Add `int label`: the object id, `0` = unsegmented. |
 | `encoding` | `binary`, `ascii` | `binary` | image, map | `binary_little_endian 1.0` or `ascii 1.0`. |
 
@@ -390,7 +390,7 @@ produces it. The `color=height` ramp is viridis.
 | `sfm/database.db`, `sfm/model/` | The COLMAP database, and the COLMAP model in map coordinates. |
 | `cloud.ply`, `cloud_objects.npy` | The map cloud, and the object id of each of its points. |
 | `objects.json`, `objects/points_NNNNNN.npy` | Object state (evidence, strikes, merges) and each object's canonical points. |
-| `scene.json` | The cached full scene. |
+| `scene.json` | The full scene as of the last update. `segment.sh -m` and `view.sh -m` rebuild the scene from the persisted state instead, so that object colours follow the current palette. |
 | `.lock`, `.staging/` | The update lock, and the staging area of an update in progress. |
 
 An update writes everything into `.staging/`, then records the list of staged files (the commit
