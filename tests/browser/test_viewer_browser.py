@@ -3,7 +3,7 @@ image (fake inference client) and a map (real mapper, COLMAP): the ``data-render
 toggles that affect only their layer, attribute controls taken from the shared attribute table that
 re-derive the cloud without inference, exact §2.4 colours on screen, camera frustums at the scene's
 poses, catalogue ↔ 3D selection, errors shown in the page, no console errors, layouts at desktop
-and phone widths, and the map unchanged by viewing.
+and phone widths, frames drawn only when something changes, and the map unchanged by viewing.
 
 Set ``OH_MY_SLAM_VIEWER_SHOTS=<folder>`` to keep the layout screenshots."""
 
@@ -13,6 +13,7 @@ import base64
 import io
 import os
 import shutil
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -115,17 +116,21 @@ def set_only(v: View, on: set[str]) -> None:
     for layer in LAYERS:
         if vis[layer] != (layer in on):
             v.pg.click(f'[data-layer="{layer}"] input')
-    v.js("() => { window.__viewerGroups.points.parent.parent.background.setRGB(0, 0, 0); }")
+    v.js("() => { window.__viewerGroups.points.parent.parent.background.setRGB(0, 0, 0);"
+         " window.__viewerInvalidate(); }")  # changed behind the page's back: ask for a frame
     v.settle()
 
 
-def canvas_pixels(v: View) -> set[tuple[int, int, int]]:
-    """The WebGL canvas only (no HTML overlays such as labels)."""
+def canvas_image(v: View) -> np.ndarray:
+    """The WebGL canvas only (no HTML overlays such as labels), as last drawn."""
     from PIL import Image
 
     url = v.js("() => document.querySelector('#canvas-host canvas').toDataURL('image/png')")
-    img = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
-    return {tuple(p) for p in np.asarray(img).reshape(-1, 3).tolist()}
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB"))
+
+
+def canvas_pixels(v: View) -> set[tuple[int, int, int]]:
+    return {tuple(p) for p in canvas_image(v).reshape(-1, 3).tolist()}
 
 
 def object_colours(v: View) -> list[tuple[int, int, int]]:
@@ -167,6 +172,80 @@ def test_each_toggle_affects_only_its_layer(view: View) -> None:
         assert changed == {layer}, (layer, changed)
         v.pg.click(f'[data-layer="{layer}"] input')  # restore
         assert visibility(v) == before
+    assert v.errors == []
+
+
+FRAMES = "() => window.__viewer.frames"
+
+
+def frames_while_idle(v: View, ms: int = 2000) -> int:
+    """Frames drawn while the page is left alone for ``ms``."""
+    before = v.js(FRAMES)
+    v.pg.wait_for_timeout(ms)
+    return int(v.js(FRAMES) - before)
+
+
+def wait_until_idle(v: View, timeout_s: float = 15.0) -> None:
+    """Until no frame is drawn for 500 ms (e.g. once an orbit's damping has settled)."""
+    deadline = time.monotonic() + timeout_s
+    while frames_while_idle(v, 500):
+        assert time.monotonic() < deadline, "the page keeps drawing"
+
+
+def canvas_point(v: View) -> tuple[float, float]:
+    """A point of the view where no label, header or help line covers the canvas."""
+    at = v.js("""() => {
+      const c = document.querySelector('#canvas-host canvas'), r = c.getBoundingClientRect();
+      for (let fy = 0.5; fy < 0.9; fy += 0.02) for (let fx = 0.2; fx < 0.7; fx += 0.02) {
+        const x = r.left + fx * r.width, y = r.top + fy * r.height;
+        if (document.elementFromPoint(x, y) === c) return [x, y];
+      }
+      return null;
+    }""")
+    assert at, "no free point on the canvas"
+    return at[0], at[1]
+
+
+def test_frames_are_drawn_only_when_something_changes(view: View) -> None:
+    """An idle page draws nothing (a large cloud would keep the GPU busy, next to the inference
+    server); orbiting, a layer toggle and a colour change each draw, and the canvas shows them."""
+    v = view
+    v.pg.click('#tabs button[data-tab="controls"]')
+    v.pg.click("#reset-view")
+    v.settle()
+    wait_until_idle(v)
+    assert frames_while_idle(v) == 0
+    assert v.js("() => document.body.dataset.rendered") == "true"
+    # orbiting: drawn while the view moves and its damping settles, then nothing
+    x, y = canvas_point(v)
+    before, f0 = canvas_image(v), v.js(FRAMES)
+    v.pg.mouse.move(x, y)
+    v.pg.mouse.down()
+    for i in range(1, 11):
+        v.pg.mouse.move(x + 6 * i, y + 2 * i)
+    v.pg.mouse.up()
+    wait_until_idle(v)
+    assert v.js(FRAMES) - f0 >= 10
+    assert not np.array_equal(canvas_image(v), before)
+    assert frames_while_idle(v) == 0
+    # a layer toggle
+    before, f0 = canvas_image(v), v.js(FRAMES)
+    v.pg.click('[data-layer="points"] input')
+    v.settle()
+    assert v.js(FRAMES) > f0 and not np.array_equal(canvas_image(v), before)
+    v.pg.click('[data-layer="points"] input')
+    v.settle()
+    # a colour change: drawn again once the re-derived cloud has arrived, not only on the input
+    before, f0 = canvas_image(v), v.js(FRAMES)
+    v.pg.select_option("#attr-color", "height")
+    v.settle()
+    assert "color=height" in v.js("() => window.__viewer.cloud.attrs")
+    assert v.js(FRAMES) > f0 and not np.array_equal(canvas_image(v), before)
+    wait_until_idle(v)
+    assert frames_while_idle(v) == 0
+    restore_defaults(v)
+    v.pg.click("#reset-view")
+    v.settle()
     assert v.errors == []
 
 

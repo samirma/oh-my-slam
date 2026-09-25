@@ -213,6 +213,10 @@ The viewer contains no geometry, segmentation or colour logic of its own:
   display only, keeping every k-th point, and the page says so.
 * `encoding` and `label` concern PLY files only and have no control.
 
+The page draws a frame only when something visible changes: the viewpoint, a layer, a control,
+the selection, the window size. An idle page therefore leaves the GPU to the inference server; with
+the 8.9-million-point living-room map open, it draws no frames in 10 s, where it used to draw 600.
+
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.
 The evaluator waits for this attribute.
 

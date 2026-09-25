@@ -44,6 +44,7 @@ const state = {
   cloud: null,        // header of the cloud on screen
   cloudSeq: 0, abort: null, debounce: null, framed: false, cloudInScene: false,
   bbox: new THREE.Box3(), pointsBox: new THREE.Box3(), ready: false, labelsDirty: true,
+  frames: 0,          // frames drawn so far (drawn on demand only; read by the tests)
 };
 window.__viewer = state; // for tests and debugging
 
@@ -66,6 +67,23 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.12;
 controls.screenSpacePanning = true;
+
+// Frames are drawn on demand: an idle page draws nothing, so that a large cloud does not keep the
+// GPU busy (on a shared machine it slows the inference server down and wastes power). Whatever
+// changes the canvas calls invalidate(); the animation loop keeps running (cheap without drawing)
+// and also draws whenever the viewpoint moved: orbiting and its damping, flights, framing, resets.
+const REDRAW_FRAMES = 2;  // frames drawn after each change: a margin for anything that lands late
+let redraw = 1;           // the first frame: the empty view's background
+function invalidate(frames = REDRAW_FRAMES) { redraw = Math.max(redraw, frames); }
+window.__viewerInvalidate = invalidate;  // for tests and tools that change the scene directly
+controls.addEventListener('change', () => invalidate());
+// safety net: input anywhere on the page may change what is drawn (pointer moves are not needed:
+// a drag moves the viewpoint, and hovering redraws when it changes a box's outline)
+for (const type of ['pointerdown', 'pointerup', 'wheel', 'keydown', 'input', 'change', 'click']) {
+  window.addEventListener(type, () => invalidate(), { capture: true, passive: true });
+}
+document.addEventListener('visibilitychange', () => invalidate());
+renderer.domElement.addEventListener('webglcontextrestored', () => invalidate());
 
 const root = new THREE.Group();  // display transform (image mode: camera frame → z-up)
 scene.add(root);
@@ -99,6 +117,7 @@ function resize() {
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
   closeCluster();
   state.labelsDirty = true;
+  invalidate();  // resizing the canvas clears it
 }
 window.addEventListener('resize', resize);
 
@@ -244,6 +263,7 @@ function showCloud({ header, arrays }) {
   }
   state.cloud = header;
   state.cloudInScene = true;
+  invalidate();
   updateNormalsControl();
   updateLayerNotes();
   const pos = arrays.position;
@@ -419,6 +439,7 @@ function selectCamera(i) {
     state.camHighlight.geometry.dispose();
     state.camHighlight.material.dispose();
     state.camHighlight = null;
+    invalidate();
   }
   if (i == null || !state.frustumSegments) return;
   const geom = new LineSegmentsGeometry().setPositions(state.frustumSegments[i]);
@@ -438,6 +459,7 @@ function fadeHighlight() {
   const a = frustumFade(camera.position.distanceTo(c));
   hl.material.opacity = a;
   hl.visible = a > 0.001;
+  invalidate();
 }
 function cameraView(f) {
   const M = poseMatrix(f).premultiply(root.matrixWorld);  // camera → display frame
@@ -546,6 +568,7 @@ function setFov(fov) {
   camera.updateProjectionMatrix();
   const focal = focalPx();
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
+  invalidate();
 }
 // the distance from `target` along `dir` (unit, target → eye) at which all corners of `box` lie
 // inside the viewport, with `pad` of margin
@@ -624,7 +647,7 @@ function frameObject(o) {
 function lineWidths() {
   for (const o of state.objects) {
     const w = o.id === state.selected ? 5.0 : (o.id === state.hovered || o.id === state.peek ? 3.5 : 2.0);
-    if (o.line.material.linewidth !== w) o.line.material.linewidth = w;
+    if (o.line.material.linewidth !== w) { o.line.material.linewidth = w; invalidate(); }
   }
 }
 function select(id, frame = false) {
@@ -1032,6 +1055,7 @@ function fadeBoxes() {
       m.opacity = a;
     }
   }
+  invalidate();
 }
 
 const raycaster = new THREE.Raycaster();
@@ -1120,6 +1144,7 @@ function applyLayers() {
   if (!state.layers.obbs) tooltip.hidden = true;
   closeCluster();
   state.labelsDirty = true;
+  invalidate();
 }
 function buildLayers() {
   const counts = { cameras: state.meta.cameras.length, labels: state.objects.length, obbs: state.objects.length };
@@ -1269,6 +1294,7 @@ function buildDisplay() {
     (v) => `${Number(v).toFixed(1)} cm`, (v) => {
       state.display.pointSize = v;
       for (const m of pointMaterials()) m.uniforms.size.value = v;
+      invalidate();
     }));
   const sel = el('select', { id: 'display-normals' },
     el('option', { value: 'shade' }, 'shading'), el('option', { value: 'normals' }, 'normal colours'),
@@ -1277,6 +1303,7 @@ function buildDisplay() {
   sel.addEventListener('change', () => {
     state.display.normals = sel.value;
     for (const m of pointMaterials()) m.uniforms.shade.value = SHADE[sel.value];
+    invalidate();
   });
   host.append(el('div', { class: 'row attr' }, el('label', { for: 'display-normals' }, 'normals'), sel, el('output')));
   const lab = el('select', { id: 'display-labels' },
@@ -1288,7 +1315,11 @@ function buildDisplay() {
     el('label', { for: 'display-labels' }, 'labels'), lab, el('output')));
   const bg = el('input', { type: 'color', id: 'display-bg' });
   bg.value = state.display.background;
-  bg.addEventListener('input', () => { state.display.background = bg.value; scene.background.set(bg.value); });
+  bg.addEventListener('input', () => {
+    state.display.background = bg.value;
+    scene.background.set(bg.value);
+    invalidate();
+  });
   host.append(el('div', { class: 'row attr' }, el('label', { for: 'display-bg' }, 'background'), bg, el('output')));
   updateNormalsControl();
 }
@@ -1364,30 +1395,46 @@ async function main() {
   resetView();
   $('#loading').classList.add('done');
   state.ready = true;
+  invalidate();
 }
 
+// The viewpoint as last seen by the loop; a change beyond VIEW_EPS (1 µm, 1 µrad: far below a
+// pixel) moves the labels, updates the fades and draws. Orbit damping's last creep stays below it,
+// so a settled view stops drawing.
+const VIEW_EPS = 1e-6;
+const lastView = new THREE.Matrix4(), lastProj = new THREE.Matrix4();
+function differs(a, b) {
+  const x = a.elements, y = b.elements;
+  for (let i = 0; i < 16; i++) if (Math.abs(x[i] - y[i]) > VIEW_EPS) return true;
+  return false;
+}
 // <body data-rendered="true"> once a frame showing the point cloud has been drawn and presented:
-// set in the animation frame after the first one that rendered the loaded cloud; never removed.
-let cloudFrames = 0;
-const lastView = new THREE.Matrix4();
+// set in the animation frame after the first one that drew the loaded cloud; never removed.
+let cloudDrawn = false;
 function animate() {
   requestAnimationFrame(animate);
+  if (cloudDrawn && !document.body.dataset.rendered) document.body.dataset.rendered = 'true';
   stepFlight(performance.now());
   controls.update();
   camera.updateMatrixWorld();
-  if (!lastView.equals(camera.matrixWorld)) {  // the viewpoint moved: labels and fades follow
+  if (differs(lastView, camera.matrixWorld) || differs(lastProj, camera.projectionMatrix)) {
+    // the viewpoint moved: labels and fades follow, and the view is drawn
     lastView.copy(camera.matrixWorld);
+    lastProj.copy(camera.projectionMatrix);
     state.labelsDirty = true;
     if (state.objects.length) fadeBoxes();
     fadeHighlight();
+    invalidate();
   }
   if (state.cluster && clusterViewMoved()) closeCluster();
   // an open chip list holds the labels still (they would move under the pointer)
   if (state.labelsDirty && state.ready && !state.cluster) { state.labelsDirty = false; layoutLabels(); }
-  if (state.ready && state.cloudInScene && !document.body.dataset.rendered && ++cloudFrames > 1) {
-    document.body.dataset.rendered = 'true';
+  if (redraw > 0) {
+    redraw--;
+    renderer.render(scene, camera);
+    state.frames++;
+    if (state.ready && state.cloudInScene) cloudDrawn = true;
   }
-  renderer.render(scene, camera);
 }
 requestAnimationFrame(animate);
 main().catch((err) => {
