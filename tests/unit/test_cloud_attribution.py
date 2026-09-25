@@ -1,7 +1,9 @@
 """Object ids of the map cloud (``mapping.geometry``): a keyframe's vote for an object counts only
-inside the object's grown box, so a generous detection mask (a "carpet" mask over a counter top
-and the floor beyond it) cannot paint the floor in the counter's colour; a confirmed object that
-wins no point in the vote takes the cloud points nearest its own lifted points."""
+inside the object's attribution gate (its box grown by the depth noise at its viewing distance),
+so a generous detection mask (a "carpet" mask over a counter top and the floor beyond it) cannot
+paint the floor in the counter's colour; a confirmed object also takes the unlabelled cloud points
+nearest its own lifted points (its surface beyond what the vote gave it), and is exported only
+with enough cloud points for its size."""
 
 from __future__ import annotations
 
@@ -11,8 +13,11 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import objects as mo
 from oh_my_slam.mapping.geometry import (
     ATTRIBUTE_MARGIN_M,
+    ATTRIBUTE_MARGIN_REL,
     FrameData,
     attribute_points,
+    attribution_gates,
+    attribution_margin,
     support_labels,
 )
 from oh_my_slam.mapping.objects import MapObject, ObjectState
@@ -22,6 +27,7 @@ from oh_my_slam.segmentation.obb import OBB
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
 SHAPE = (240, 320)
 WALL = 2.0
+VOXEL = 0.005  # the cloud's point spacing in these tests
 
 
 def camera(yaw_deg: float) -> Pose:
@@ -57,7 +63,7 @@ def test_votes_outside_the_object_box_are_rejected() -> None:
     pts = wall_points()
     box = OBB(np.array([WALL, 0.25, 0.0]), np.eye(3), np.array([0.02, 0.2, 0.2]))
     _, loose, _ = attribute_points(pts, frames)
-    _, gated, _ = attribute_points(pts, frames, {5: box})
+    _, gated, _ = attribute_points(pts, frames, {5: (box, ATTRIBUTE_MARGIN_M)})
     assert (loose == 5).sum() > 4 * (gated == 5).sum() > 0
     inside = box.contains(pts, ATTRIBUTE_MARGIN_M)
     assert np.all(inside[gated == 5]) and (gated[~inside] == 0).all()
@@ -92,15 +98,20 @@ def test_an_object_that_wins_no_vote_takes_the_points_near_its_own() -> None:
     assert np.abs(mine[:, 1] + 0.3).max() < 0.06 and np.abs(mine[:, 2] - 0.1).max() < 0.08
 
 
-def test_support_fallback_leaves_labelled_points_and_other_objects_alone() -> None:
+def test_support_leaves_labelled_points_and_other_objects_alone() -> None:
     pts = wall_points(0.005)
-    # an object that already has cloud points keeps exactly them
+    # an object that already has cloud points keeps them and adds the unlabelled ones of its own
+    # surface
     o = switch()
+    assert o.obb is not None
     label = np.zeros(len(pts), np.int32)
-    label[:10] = o.id
+    voted = np.flatnonzero(o.obb.contains(pts, ATTRIBUTE_MARGIN_M))[:20]
+    label[voted] = o.id
+    label[:5] = 9  # another object's points elsewhere on the wall
     before = label.copy()
-    assert support_labels(pts, label, ObjectState([o], 200)) == 0
-    assert np.array_equal(label, before)
+    assert support_labels(pts, label, ObjectState([o], 200)) == 1
+    assert (label[voted] == o.id).all() and (label[:5] == 9).all()
+    assert (label == o.id).sum() > len(voted) and (label[before > 0] == before[before > 0]).all()
     # unconfirmed objects take nothing; points of another object are never taken
     label = np.zeros(len(pts), np.int32)
     assert support_labels(pts, label, ObjectState([switch(confirmed=False)], 200)) == 0
@@ -113,3 +124,79 @@ def test_support_fallback_leaves_labelled_points_and_other_objects_alone() -> No
     # lifted points far from any cloud point (a pendant lamp the fusion did not keep): nothing
     label = np.zeros(len(pts), np.int32)
     assert support_labels(pts, label, ObjectState([switch(offset=0.5)], 200)) == 0
+
+
+def test_a_point_two_objects_pick_goes_to_the_nearest_whatever_their_order() -> None:
+    """Two switches side by side whose own points both reach the wall between them: each shared
+    point goes to the object whose lifted point is nearest, in either order of the objects."""
+    pts = wall_points(0.005)
+    a = switch()
+    b = switch()
+    b.id = 107
+    b.points = (b.points + np.array([0.0, 0.05, 0.0], np.float32)).astype(np.float32)
+    mo.refit(b, None)
+    out = []
+    for order in ([a, b], [b, a]):
+        label = np.zeros(len(pts), np.int32)
+        assert support_labels(pts, label, ObjectState(list(order), 200)) == 2
+        out.append(label)
+    assert np.array_equal(out[0], out[1])
+    ya = pts[out[0] == a.id][:, 1].mean()
+    yb = pts[out[0] == b.id][:, 1].mean()
+    assert ya < yb
+
+
+def dishwasher(seen_from: float = 3.0) -> MapObject:
+    """A dishwasher front on the wall (0.54 x 0.78 m), its box 6 cm deep, its lifted points 3 cm
+    in front of the fused wall, seen from ``seen_from`` metres."""
+    rng = np.random.default_rng(1)
+    pts = rng.uniform(-0.5, 0.5, (6000, 3)) * (0.06, 0.54, 0.4) + (WALL - 0.03, 0.0, 0.0)
+    o = MapObject(74, "dishwasher", {"dishwasher": 1.2}, [0.7, 0.6], mo.canonical_points(pts),
+                  frames=[40, 44], confirmed=True, obs_depth=seen_from)
+    mo.refit(o, None)
+    return o
+
+
+def test_a_thin_object_with_a_token_vote_takes_its_surface() -> None:
+    """Detected in 2 of the many keyframes that see it, the dishwasher wins 1 point of its front
+    in the vote, far below what its box's face holds in the cloud; it takes the wall points behind
+    its own lifted points (its box is 6 cm deep, the wall 3 cm behind its points) and is exported.
+    With only the token point, it would not be."""
+    pts = wall_points(VOXEL)
+    o = dishwasher()
+    assert o.obb is not None
+    need = mo.min_cloud_points(o.obb, VOXEL)
+    face = np.prod(np.sort(o.obb.size)[1:]) / VOXEL ** 2
+    assert need == int(np.ceil(mo.EXPORT_MIN_SUPPORT * face)) > 100
+    label = np.zeros(len(pts), np.int32)
+    label[np.flatnonzero(o.obb.contains(pts))[:1]] = o.id  # the vote's single point
+    assert support_labels(pts, label, ObjectState([o], 200)) == 1
+    mine = pts[label == o.id]
+    assert len(mine) >= need
+    assert o.obb.contains(mine, attribution_margin(o.obs_depth)).all()
+    written: dict[str, object] = {}
+    from types import SimpleNamespace
+    tx = SimpleNamespace(write_json=lambda rel, obj: written.__setitem__(rel, obj))
+    state = ObjectState([o], 200)
+    mo.set_cloud_counts(tx, state, label, VOXEL)
+    assert o.cloud_min == need and [x.id for x in state.exported()] == [74]
+    # with only the token point it would not be exported
+    mo.set_cloud_counts(tx, state, np.where(np.arange(len(pts)) == 0, o.id, 0), VOXEL)
+    assert state.exported() == []
+    stored = written[mo.OBJECTS_JSON]["objects"][0]  # type: ignore[index]
+    assert stored["cloud_min_points"] == need
+    assert MapObject.from_dict(stored, o.points).cloud_min == need
+
+
+def test_the_attribution_gate_grows_with_the_viewing_distance() -> None:
+    near, far = dishwasher(1.0), dishwasher(3.0)
+    assert attribution_margin(near.obs_depth) == ATTRIBUTE_MARGIN_M
+    assert attribution_margin(far.obs_depth) == ATTRIBUTE_MARGIN_REL * 3.0 > ATTRIBUTE_MARGIN_M
+    gates = attribution_gates(ObjectState([far], 200))
+    box, margin = gates[74]
+    # a point 8 cm in front of the thin box counts at 3 m, not at 1 m
+    axis = int(np.argmin(box.size))
+    p = box.center.copy()
+    p += box.R[:, axis] * (box.size[axis] / 2 + 0.08)
+    assert box.contains(p[None], margin)[0]
+    assert not box.contains(p[None], attribution_margin(near.obs_depth))[0]

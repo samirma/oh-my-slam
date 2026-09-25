@@ -44,7 +44,7 @@ from oh_my_slam.mapping.sfm import (
     check_versions,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
-from oh_my_slam.reconstruction.depth import fit_frame_scale
+from oh_my_slam.reconstruction.depth import DepthCorrection, fit_frame_scale
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.api import Detection, detect_alongside
 
@@ -91,8 +91,9 @@ class UpdateContext:
     notes: dict[str, Any] = field(default_factory=dict)
     # refined multi-view keyframes: (median match residual in degrees, matches)
     pose_support: dict[str, tuple[float, int]] = field(default_factory=dict)
-    # stored keyframes whose depth this update re-scaled (index -> factor; their objects follow)
-    rescaled: dict[int, float] = field(default_factory=dict)
+    # stored keyframes whose depth this update corrected (index -> correction; their objects
+    # follow)
+    rescaled: dict[int, DepthCorrection] = field(default_factory=dict)
 
 
 Progress = Callable[[str], None]
@@ -698,22 +699,22 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid))
 
 
-SCALE_PAIR_MAX_ANGLE_DEG = 40.0  # keyframes whose optical axes differ more share little surface
-SCALE_PAIR_NEIGHBOURS = 30  # candidate partners of each adjusted keyframe (nearest by viewpoint)
-SCALE_ROUNDS = 2  # measure, solve; re-measure at the corrected scales, solve again
-MAX_SCALE_CORRECTION = 1.5  # a correction is clamped to [1/1.5, 1.5]
-RESCALE_MIN = 1e-3  # a stored keyframe's depth is rewritten only for a larger |log| correction
+SCALE_PAIR_MAX_ANGLE_DEG = 45.0  # keyframes whose optical axes differ more share little surface
+SCALE_PAIR_NEIGHBOURS = 50  # candidate partners of each adjusted keyframe (nearest by viewpoint)
+SCALE_ROUNDS = 2  # measure, solve; re-measure at the corrected depths, solve again
+RESCALE_MIN = 1e-3  # a stored keyframe's depth is rewritten only for a larger correction
 
 
 @dataclass
 class _ScaleNode:
-    """A keyframe taking part in the global depth-scale adjustment: one of this update's (``nf``)
-    or a stored one (``rec``)."""
+    """A keyframe taking part in the global depth adjustment: one of this update's (``nf``) or a
+    stored one (``rec``)."""
 
     name: str
     T: Pose
     load: Callable[[], Any]  # -> reconstruction.depth.DepthView of its aligned, valid depth
-    free: bool  # adjusted (else it holds the gauge: sparse-scaled, or the map's seed)
+    free: bool  # its scale is adjusted (else it holds the gauge: sparse-scaled, or the seed);
+    # its tilt always is
     low: bool  # low confidence: adjusted after the others, without pulling on them
     nf: NewFrame | None = None
     rec: store.FrameRecord | None = None
@@ -736,8 +737,8 @@ def _anchored(stats: dict[str, Any]) -> bool:
 
 
 def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
-    """The map's confident keyframes (loaded lazily) and this update's placed ones, free unless
-    their scale is anchored (``_anchored``)."""
+    """The map's confident keyframes (loaded lazily) and this update's placed ones, their scale
+    free unless it is anchored (``_anchored``)."""
     nodes: list[_ScaleNode] = []
     for f in ctx.old_frames:
         if f.low_confidence:
@@ -765,117 +766,126 @@ def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
 
 
 def _scale_pairs(nodes: list[_ScaleNode], scene_depth: float) -> list[tuple[int, int]]:
-    """Candidate pairs: each free keyframe with its ``SCALE_PAIR_NEIGHBOURS`` nearest keyframes
+    """Candidate pairs: each keyframe with its ``SCALE_PAIR_NEIGHBOURS`` nearest keyframes
     by viewpoint (camera distance over the scene depth plus 1 − cos of the angle between the
-    optical axes) whose optical axes differ by less than ``SCALE_PAIR_MAX_ANGLE_DEG`` — loop
-    closures included, whatever their place in the sequence."""
+    optical axes) whose optical axes differ by less than ``SCALE_PAIR_MAX_ANGLE_DEG`` — sequence
+    neighbours and loop closures alike, whatever their place in the sequence (the cap matters for
+    long sequences only)."""
     C = np.array([n.T.t for n in nodes])
     F = np.array([n.T.R[:, 2] for n in nodes])
     cos = np.clip(F @ F.T, -1.0, 1.0)
     dist = np.linalg.norm(C[:, None] - C[None], axis=2) / max(0.5, scene_depth) + (1.0 - cos)
     near = cos > np.cos(np.radians(SCALE_PAIR_MAX_ANGLE_DEG))
     out: set[tuple[int, int]] = set()
-    for i, n in enumerate(nodes):
-        if not n.free:
-            continue
+    for i in range(len(nodes)):
         cand = [j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
         out.update((min(i, j), max(i, j)) for j in cand[:SCALE_PAIR_NEIGHBOURS])
     return sorted(out)
 
 
 def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
-    """Global adjustment of the map's per-keyframe depth scales.
+    """Global adjustment of the map's per-keyframe depth.
 
     ``_align_depths`` scales each keyframe to a few neighbours, one after another, so the scale
     drifts along a long sequence and the keyframes that close a loop disagree with those that
-    opened it (10-20 % around the 360° loop of a turning head). Here every pair of overlapping
-    keyframes (``_scale_pairs``) measures the ratio of their depths on the surfaces both see
-    (``reconstruction.depth.pair_log_ratio``) and one correction per keyframe is solved from all
-    of them at once (``adjust_log_scales``: robust least squares on the log ratios), sparse-scaled
-    keyframes and the map's seed fixed (they hold the metric scale). Low-confidence keyframes are
-    adjusted afterwards, to the others, so they never pull on them. Two rounds: the second
-    re-measures the pairs at the corrected scales.
+    opened it (10-20 % around the 360° loop of a turning head); and one scale cannot reconcile a
+    keyframe whose near field disagrees with its neighbours' while its far field agrees. Here
+    every pair of overlapping keyframes (``_scale_pairs``) measures the ratio of their depths on
+    the surfaces both see, in bins of depth (``reconstruction.depth.pair_bins``), and one
+    correction per keyframe — a scale and a near/far tilt about its median depth — is solved from
+    all of them at once (``adjust_depth_corrections``: robust least squares). Sparse-scaled
+    keyframes and the map's seed keep their scale (they hold the metric scale) but are tilted like
+    the others: their near/far error is no more known than anyone's, and a seed held untilted
+    left the same-heading pair 001/053 of ``ainex-captures`` 1.7 % apart instead of 0.5 %.
+    Low-confidence keyframes are adjusted afterwards, to the others, so they never pull on them.
+    Two rounds: the second re-measures the pairs at the corrected depths.
 
     The map's stored keyframes take part like this update's: where a later update closes a loop,
     the correction is spread over the whole loop as it would have been had the sequence come in
     one update, so the map does not depend on how its input was split into updates. A stored
-    keyframe whose scale changes has its depth rewritten and is listed in ``ctx.rescaled``; its
-    objects move with it (``objects.update_objects``)."""
-    from oh_my_slam.reconstruction.depth import adjust_log_scales, pair_log_ratio, pair_weight
+    keyframe whose depth changes has it rewritten and is listed in ``ctx.rescaled``; its objects
+    move with it (``objects.update_objects``)."""
+    from oh_my_slam.reconstruction.depth import adjust_depth_corrections, pair_bins
 
     nodes = _scale_nodes(ctx)
-    if not any(n.free for n in nodes) or len(nodes) < 2:
+    if len(nodes) < 2:
         return
     depths = [float(np.median(n.nf.depth[n.nf.depth > 0])) for n in nodes
               if n.nf is not None and n.nf.depth is not None and (n.nf.depth > 0).any()]
     pairs = _scale_pairs(nodes, float(np.median(depths)) if depths else 2.0)
-    views: dict[int, Any] = {}
-
-    def view(k: int) -> Any:
-        if k not in views:
-            views[k] = nodes[k].load()
-        return views[k]
-
-    x = np.zeros(len(nodes))
+    used = sorted({k for p in pairs for k in p})
+    base = {k: nodes[k].load() for k in used}
+    corr = [DepthCorrection() for _ in nodes]
     first: list[float] = []
     last: list[float] = []
     measured = 0
     for rnd in range(SCALE_ROUNDS):
-        meas: list[tuple[int, int, float, float]] = []
-        for i, j in pairs:
-            p = pair_log_ratio(view(i), view(j), float(np.exp(x[i])), float(np.exp(x[j])))
-            if p is not None:
-                meas.append((i, j, p.log_ratio, pair_weight(p)))
-        measured = len(meas)
+        views = {k: v.corrected(corr[k]) for k, v in base.items()}
+        pivots = np.zeros(len(nodes))
+        for k, v in views.items():
+            pivots[k] = v.log_median()
+        meas = [b for i, j in pairs for b in pair_bins(i, j, views[i], views[j])]
+        measured = len({(min(b.src, b.dst), max(b.src, b.dst)) for b in meas})
         # confident keyframes first; then the low-confidence ones, to them
         for low in (False, True):
-            active = {k for k, n in enumerate(nodes) if n.free and n.low == low}
+            active = {k for k, n in enumerate(nodes) if n.low == low}
             if not active:
                 continue
             use = {k for k, n in enumerate(nodes) if not n.low or k in active}
-            sub = [m for m in meas if m[0] in use and m[1] in use
-                   and (m[0] in active or m[1] in active)]
-            adj = adjust_log_scales(len(nodes), sub, set(range(len(nodes))) - active)
-            x += adj.log_scale
+            sub = [b for b in meas if b.src in use and b.dst in use
+                   and (b.src in active or b.dst in active)]
+            adj = adjust_depth_corrections(
+                len(nodes), sub, pivots, set(range(len(nodes))) - active,
+                scale_fixed={k for k in active if not nodes[k].free})
+            for k in active:
+                c = corr[k].then(adj.corrections[k])
+                # a held scale stays exactly held (composing about shifted pivots rounds it)
+                corr[k] = c if nodes[k].free else DepthCorrection(0.0, c.slope, c.pivot)
             if not low:
                 if rnd == 0:
                     first = adj.residuals_before.tolist()
                 last = adj.residuals_after.tolist()
-    x = np.clip(x, -np.log(MAX_SCALE_CORRECTION), np.log(MAX_SCALE_CORRECTION))
     for k, n in enumerate(nodes):
-        if not n.free:
+        c = corr[k]
+        if c.identity:
             continue
-        c = float(np.exp(x[k]))
-        if n.nf is not None and n.nf.record is not None:
+        if n.nf is not None and n.nf.record is not None and n.nf.depth is not None:
             rec = n.nf.record
-            rec.depth_scale = float(rec.depth_scale * c)
-            rec.stats["depth_scale_adjusted"] = round(c, 5)
-            n.nf.depth = (n.nf.frame.depth * rec.depth_scale).astype(np.float32)
-        elif n.rec is not None and abs(x[k]) > RESCALE_MIN:
+            n.nf.depth = c.apply(n.nf.depth).astype(np.float32)
+            rec.depth_scale = float(rec.depth_scale * c.scale)
+            rec.stats["depth_scale_adjusted"] = round(c.scale, 5)
+            rec.stats["depth_exponent"] = round(c.exponent, 5)
+        elif n.rec is not None and max(abs(c.log_scale), abs(c.slope)) > RESCALE_MIN:
             rec = n.rec
             d = store.load_depth(ctx.tx.current, rec.name)
-            ctx.tx.save_npy(store.frame_file(rec.name, "depth.npy"), (d * c).astype(np.float16))
-            rec.depth_scale = float(rec.depth_scale * c)
+            ctx.tx.save_npy(store.frame_file(rec.name, "depth.npy"),
+                            c.apply(d).astype(np.float16))
+            rec.depth_scale = float(rec.depth_scale * c.scale)
             rec.stats["depth_scale_adjusted"] = round(
-                float(rec.stats.get("depth_scale_adjusted", 1.0)) * c, 5)
+                float(rec.stats.get("depth_scale_adjusted", 1.0)) * c.scale, 5)
+            rec.stats["depth_exponent"] = round(
+                float(rec.stats.get("depth_exponent", 1.0)) * c.exponent, 5)
             ctx.rescaled[rec.index] = c
     free = [k for k, n in enumerate(nodes) if n.free]
-    corr = np.abs(np.exp(x[free]) - 1.0)
-    largest = float(corr.max()) if len(corr) else 0.0
+    scale_dev = np.abs([corr[k].scale - 1.0 for k in free])
+    exps = [c.exponent for c in corr]
+    largest = float(scale_dev.max()) if len(scale_dev) else 0.0
     summary: dict[str, Any] = {
         "pairs": measured, "adjusted": len(free), "fixed": len(nodes) - len(free),
-        "stored_rescaled": len(ctx.rescaled),
+        "stored_rescaled": len(ctx.rescaled), "depth_bins": len(last),
         "pair_ratio_median_before": round(float(np.median(first)), 5) if first else None,
         "pair_ratio_p90_before": round(float(np.percentile(first, 90)), 5) if first else None,
         "pair_ratio_median_after": round(float(np.median(last)), 5) if last else None,
         "pair_ratio_p90_after": round(float(np.percentile(last, 90)), 5) if last else None,
         "max_correction": round(largest, 5),
+        "exponent_range": [round(min(exps), 4), round(max(exps), 4)] if exps else None,
     }
     ctx.notes["depth_scale_adjustment"] = summary
     timing.count(depth_scale_pairs=measured)
     progress(f"depth scales adjusted over {measured} keyframe pairs: |log ratio| p90 "
              f"{summary['pair_ratio_p90_before']} -> {summary['pair_ratio_p90_after']} "
              f"(largest correction {100 * largest:.1f} %"
+             + (f", exponents {min(exps):.3f}-{max(exps):.3f}" if exps else "")
              + (f"; {len(ctx.rescaled)} stored keyframes re-scaled" if ctx.rescaled else "")
              + ")")
 
@@ -971,7 +981,7 @@ def integrate(ctx: UpdateContext, progress: Progress
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
     with timing.stage("objects"):
         assert geo.cloud.label is not None
-        objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label)
+        objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label, geo.stats["voxel"])
     return records, objs, geo
 
 
