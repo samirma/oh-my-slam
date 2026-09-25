@@ -86,7 +86,10 @@ def test_vocabulary_and_label_rules() -> None:
         assert needed in vocab
     assert detect.normalize_label("  Dining_Table ") == "dining table"
     assert detect.compatible("sofa", "couch") and not detect.compatible("sofa", "person")
-    assert detect.floor_gap("chair") > 0 and detect.floor_gap("bottle") == 0
+    # floor grounding: (largest gap closed, smallest visible share of the grounded height)
+    assert detect.grounding("Chair") == (detect.FLOOR_STANDING["chair"], detect.GROUND_MIN_VISIBLE)
+    assert detect.grounding("dining table") == (detect.FLOOR_STANDING["dining table"], 0.0)
+    assert detect.grounding("bottle") == (0.0, 0.0)
 
 
 def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]

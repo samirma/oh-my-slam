@@ -106,10 +106,6 @@ TOP_SURFACE = frozenset({
 GROUND_MIN_VISIBLE = 0.2
 
 
-def floor_gap(label: str) -> float:
-    return FLOOR_STANDING.get(normalize_label(label), 0.0)
-
-
 def grounding(label: str) -> tuple[float, float]:
     """(largest gap to the floor that is closed, smallest visible share of the grounded height)
     for a class; (0, 0) for classes that are never grounded."""
