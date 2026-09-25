@@ -313,6 +313,25 @@ def test_layouts(view: View, tmp_path: Path) -> None:
         assert box["scroll"] <= w, name  # no horizontal overflow
         assert box["canvas"]["width"] > 0.3 * w and box["canvas"]["height"] > 0.3 * h, name
         assert box["panel"]["right"] <= w + 1 and box["panel"]["width"] > 0, name
+        # the title and stats sit on their own scrim and never run under the buttons
+        head = v.js("""() => {
+          const r = (s) => document.querySelector(s).getBoundingClientRect();
+          return {info: r('#info'), actions: r('#actions'),
+                  scrim: getComputedStyle(document.querySelector('#info')).backgroundColor};
+        }""")
+        i, a = head["info"], head["actions"]
+        assert i["right"] <= a["left"] or i["bottom"] <= a["top"], name
+        assert head["scrim"] not in ("rgba(0, 0, 0, 0)", "transparent"), name
+        # every catalogue column fits the panel: no sideways scrolling, numbers not clipped
+        v.pg.click('#tabs button[data-tab="catalogue"]')
+        cat = v.js("""() => {
+          const w = document.querySelector('#tab-catalogue .table-wrap');
+          const cells = [...document.querySelectorAll('#catalogue td.num')];
+          return {scroll: w.scrollWidth, client: w.clientWidth,
+                  clipped: cells.filter(c => c.offsetParent && c.scrollWidth > c.clientWidth + 1).length};
+        }""")
+        assert cat["scroll"] <= cat["client"] and cat["clipped"] == 0, (name, cat)
+        v.pg.click('#tabs button[data-tab="controls"]')
         v.pg.screenshot(path=str(out / f"{v.bundle.mode}-{name}.png"))
     v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
@@ -401,6 +420,11 @@ def test_go_to_camera_and_reset_view(view: View, tmp_path: Path) -> None:
     v.settle()
     assert_at_camera(v, index, go_to(v, index))
     v.pg.screenshot(path=str(out / f"{v.bundle.mode}-go-to-camera-phone.png"))
+    # looking through the camera: its highlight and its frustum are faded out, not drawn across
+    # the view
+    assert v.js("() => window.__viewerFrustumFade(window.__viewer.cameraIndex)") == 0
+    assert v.js("() => window.__viewerGroups.cameras.children"
+                ".find(c => c.name === 'selected-camera').visible") is False
     v.pg.keyboard.press("Escape")
     assert v.js("() => window.__viewerGroups.cameras.children.length") == 1  # highlight gone
     v.pg.set_viewport_size({"width": 1280, "height": 800})
@@ -493,3 +517,156 @@ def test_empty_map_still_renders(browser: Any, tmp_path: Path) -> None:
         v.settle()
         assert v.errors == []
         v.pg.close()
+
+
+# ------------------------------------------------------------------------------------------------
+# frustums, the default views, labels, the segmented image and the two object-colour displays
+
+
+def fades(v: View) -> list[float]:
+    n = len(v.bundle.cameras)
+    return v.js(f"() => [...Array({n}).keys()].map(i => window.__viewerFrustumFade(i))")
+
+
+def test_frustums_fade_only_next_to_the_viewpoint(view: View) -> None:
+    v = view
+    v.pg.click("#reset-view")
+    v.settle()
+    if v.bundle.mode == "image":
+        # the default view starts just behind the photo: its frustum does not cross the photo
+        assert fades(v) == [0]
+    else:
+        assert min(fades(v)) == 1  # the overview draws every camera
+        # looking through a camera, its neighbours fade too; far cameras stay drawn
+        go_to(v, 0)
+        cams = np.array([c["position"] for c in v.bundle.cameras])
+        d = np.linalg.norm(cams - cams[0], axis=1)
+        depth = v.js("() => window.__viewer.frustumDepth")
+        f = fades(v)
+        assert f[0] == 0
+        assert all(a < 0.5 for a, x in zip(f, d, strict=True) if x < depth)
+        assert all(a == 1 for a, x in zip(f, d, strict=True) if x > 6 * depth)
+        v.pg.keyboard.press("Escape")
+        v.pg.click("#reset-view")
+        v.pg.click('#tabs button[data-tab="controls"]')
+        v.settle()
+    assert v.errors == []
+
+
+def test_map_overview_looks_down_on_the_scene_and_its_cameras(map_view: View) -> None:
+    v = map_view
+    v.pg.click("#reset-view")
+    v.settle()
+    cam = viewer_camera(v)
+    assert np.degrees(np.arcsin(-cam["dir"][2])) == pytest.approx(60, abs=0.5)  # bird's-eye
+    inside = v.js("""() => window.__viewer.meta.cameras.every(f => {
+      const p = new window.__viewerCamera.position.constructor(f.T[0][3], f.T[1][3], f.T[2][3])
+        .applyMatrix4(window.__viewerGroups.points.parent.matrixWorld).project(window.__viewerCamera);
+      return Math.abs(p.x) < 1 && Math.abs(p.y) < 1 && p.z < 1;
+    })""")
+    assert inside  # every camera centre is in view
+    assert v.errors == []
+
+
+def label_boxes(v: View) -> list[dict[str, Any]]:
+    return v.js("""() => {
+      const host = document.querySelector('#canvas-host').getBoundingClientRect();
+      const cam = window.__viewerCamera;
+      return window.__viewer.objects.map(o => {
+        const p = o.anchor.clone().project(cam);
+        const inView = p.z < 1 && p.z > -1 && Math.abs(p.x) <= 1 && Math.abs(p.y) <= 1;
+        const r = o.div.getBoundingClientRect();
+        return {id: o.id, inView, shown: !o.div.hidden, mode: o.mode, text: o.div.innerText,
+                inside: r.left >= host.left - 0.5 && r.right <= host.right + 0.5
+                        && r.top >= host.top - 0.5 && r.bottom <= host.bottom + 0.5};
+      });
+    }""")
+
+
+def test_every_box_in_view_is_labelled(view: View) -> None:
+    """Spec §2.5 "labelled OBBs": each box whose top is in view shows at least its id tag, inside
+    the view; names are added where they fit, and always for the selected box."""
+    v = view
+    for w, h in ((1280, 800), (390, 844)):
+        v.pg.set_viewport_size({"width": w, "height": h})
+        v.pg.click("#reset-view")
+        v.settle()
+        boxes = label_boxes(v)
+        assert boxes and any(b["inView"] for b in boxes)
+        for b in boxes:
+            assert b["shown"] == b["inView"], b
+            if b["shown"]:
+                assert b["inside"] and b["text"].split()[0] == str(b["id"]), b
+        assert any(b["mode"] == "full" for b in boxes)
+    v.pg.set_viewport_size({"width": 1280, "height": 800})
+    v.settle()
+    # "id tags only" keeps every tag; the selected box still shows its name
+    v.pg.select_option("#display-labels", "ids")
+    oid = v.bundle.catalog[0]["id"]
+    v.js(f"() => document.querySelector('.obj-label[data-id=\"{oid}\"]').click()")
+    v.pg.click("#reset-view")
+    v.settle()
+    boxes = label_boxes(v)
+    assert all(b["mode"] == ("full" if b["id"] == oid else "compact") for b in boxes if b["shown"])
+    assert v.js("() => window.__viewer.selected") == oid
+    v.pg.keyboard.press("Escape")
+    v.pg.select_option("#display-labels", "fit")
+    v.pg.click('#tabs button[data-tab="controls"]')
+    v.settle()
+    assert v.errors == []
+
+
+def test_boxes_around_the_viewpoint_fade_and_come_back_exact(view: View) -> None:
+    v = view
+    o = v.bundle.catalog[0]["id"]
+    v.js(f"""() => {{
+      const o = window.__viewer.objects.find(x => x.id === {o});
+      const c = o.center.clone().applyMatrix4(window.__viewerGroups.points.parent.matrixWorld);
+      window.__viewerCamera.position.copy(c);
+      window.__viewerControls.target.copy(c.clone().add(new c.constructor(0.3, 0.3, 0)));
+    }}""")
+    v.settle()
+    m = v.js(f"() => {{ const m = window.__viewer.objects.find(x => x.id === {o}).line.material;"
+             " return [m.opacity, m.transparent]; }")
+    assert m[0] == pytest.approx(0.2) and m[1] is True  # inside the box: its edges fade
+    v.pg.click("#reset-view")
+    v.settle()
+    assert v.js("() => window.__viewer.objects.every(o => o.line.material.opacity === 1"
+                " && !o.line.material.transparent)")  # opaque again: exact colours
+    assert v.errors == []
+
+
+def test_segmented_image_enlarges(image_view: View) -> None:
+    v = image_view
+    v.pg.click("#tab-image-btn")
+    thumb = v.pg.locator("#segmented").bounding_box()
+    v.pg.click("#segmented-open")
+    assert v.pg.is_visible("#lightbox")
+    # fitted to the window (small images are scaled up, pixels kept sharp)
+    big = v.js("""() => { const i = document.querySelector('#lightbox img');
+      const r = i.getBoundingClientRect(), s = Math.min(r.width / i.naturalWidth, r.height / i.naturalHeight);
+      return {width: i.naturalWidth * s}; }""")
+    assert thumb and big["width"] > 2 * thumb["width"]
+    v.pg.click("#lightbox img")  # actual pixels
+    natural = v.js("() => document.querySelector('#lightbox img').naturalWidth")
+    shown = v.pg.locator("#lightbox img").bounding_box()
+    assert shown and shown["width"] == pytest.approx(natural, abs=1)
+    v.pg.keyboard.press("Escape")
+    assert v.pg.is_hidden("#lightbox")
+    v.pg.click('#tabs button[data-tab="controls"]')
+    assert v.errors == []
+
+
+def test_segmentation_layer_and_color_segment_are_told_apart(view: View) -> None:
+    v = view
+    v.pg.click('#tabs button[data-tab="controls"]')
+    assert v.pg.inner_text('[data-layer="segments"]').startswith("Segmentation overlay")
+    assert "over the cloud" in v.pg.inner_text("#layer-note-segments")
+    assert v.pg.inner_text('#attr-color option[value="segment"]') == "segment · object colours"
+    v.pg.select_option("#attr-color", "segment")
+    v.settle()
+    assert "color=segment" in v.pg.inner_text("#layer-note-segments")
+    assert not v.pg.is_checked("#layer-segments")  # still its own, independent layer
+    restore_defaults(v)
+    assert "over the cloud" in v.pg.inner_text("#layer-note-segments")
+    assert v.errors == []

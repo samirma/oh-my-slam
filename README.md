@@ -163,33 +163,51 @@ The two modes differ:
 * **`-i`** reconstructs and segments the image once, through the inference server. It shows the
   cloud, the segmented image, the catalogue, the labelled OBBs and the camera at its estimated
   pose. The display rotates the camera frame so that the estimated up direction is +z.
-* **`-m`** opens the map read-only, without the server. It shows the map cloud, every keyframe
-  camera and the labelled OBBs.
+* **`-m`** opens the map read-only, without the server. It shows the map's complete cloud, every
+  keyframe camera and the labelled OBBs.
+
+The first view of an image is from just behind the photo's viewpoint. The first view of a map
+looks down 60° on the whole scene and all its cameras, so that the walls of a room hide little
+of its floor, objects and camera cluster. *Reset view* (`R`) returns to it.
 
 The page has four tabs:
 
 * **Controls**
-  * *Layers* has one independent switch each for the point cloud, the segmentation (object
-    colours), the camera poses, the labels and the oriented boxes.
+  * *Layers* has one independent switch each for the point cloud, the segmentation overlay, the
+    camera poses, the labels and the oriented boxes. The segmentation overlay draws only the
+    points of each object, in its colour, over the cloud. It is not the `color=segment`
+    attribute, which recolours the whole cloud (unsegmented points grey); the layer's note says
+    when that attribute is on as well.
   * *Point cloud* has live controls for the point-cloud attributes that affect the display. For
     an image these are `color`, `stride`, `min-depth`, `max-depth`, `edge`, `voxel` and
     `normals`. For a map they are `color`, `voxel` and `normals`. The panel also shows the
     equivalent `-p …` string and a *Defaults* button.
-  * *Display* sets the point size, the normals shading, the maximum number of labels and the
-    background.
+  * *Display* sets the point size, the normals shading, the labels (*id tags + names that fit*,
+    or *id tags only*) and the background.
 * **Catalogue** lists the objects, with a label filter.
 * **Cameras** lists every displayed camera's centre (x, y, z in metres, in the scene frame), with
   a *Go to* button that moves the viewpoint to that camera, looking where it looked. `[` and `]`
   step through the cameras.
-* **Image** shows the segmented image (`-i` only).
+* **Image** shows the segmented image (`-i` only). A click enlarges it to the window; in the
+  enlarged view a click switches between fit and actual pixels, and `Esc` closes it.
 
 Other keys: `R` resets the view, and `Esc` clears the selection.
+
+Every box whose top is in view carries a label: its id on a tag in the object's colour, and its
+name wherever that fits without covering another label. Larger boxes on screen get their names
+first, and a tag that fits nowhere is still drawn at its box. The selected and hovered box always
+show their names, and labels never leave the view. Camera frustums fade out as the viewpoint comes
+near them. The camera being looked through and its neighbours, for example the rest of a capture
+that turns in place, therefore never draw lines across the view. Boxes that enclose the viewpoint
+fade the same way, except the selected one.
 
 The viewer contains no geometry, segmentation or colour logic of its own:
 
 * Every displayed cloud is derived on request from data already in memory, by the same code
   that writes PLY files. A control therefore never re-runs inference.
-* Clouds above 3,000,000 points are thinned for display only, and the page says so.
+* The page shows the complete cloud up to 12,000,000 points. In Edge on the M4 Max, a cloud of
+  that size loads in about 2 s and orbits at 60 frames per second. Larger clouds are thinned for
+  display only, keeping every k-th point, and the page says so.
 * `encoding` and `label` concern PLY files only and have no control.
 
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.

@@ -7,6 +7,7 @@
   --accent: #5b8cff;
   --border: #323744;
   --danger: #ff7b7b;
+  --scrim: #0d0f13d9;
   --panel-width: 340px;
 }
 * { box-sizing: border-box; }
@@ -14,16 +15,23 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 #app { display: flex; height: 100vh; height: 100dvh; width: 100vw; overflow: hidden; }
 #viewport { position: relative; flex: 1; min-width: 0; min-height: 0; }
-#canvas-host { position: absolute; inset: 0; }
+#canvas-host { position: absolute; inset: 0; overflow: hidden; }
 #canvas-host canvas { display: block; }
-#topbar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center;
-  flex-wrap: wrap; gap: 6px 12px; padding: 8px 12px; background: linear-gradient(#15171ccc, #15171c00);
-  pointer-events: none; z-index: 5; }
+
+/* ---- top bar: the title and stats sit on their own scrim (readable over any cloud); the buttons
+   are a separate block that never shares a line box with them */
+#topbar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: flex-start;
+  gap: 8px; padding: 8px; pointer-events: none; z-index: 5; }
 #topbar > * { pointer-events: auto; }
+#info { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0;
+  margin-right: auto; padding: 5px 10px; border-radius: 8px; background: var(--scrim);
+  border: 1px solid #ffffff14; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 #title { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  max-width: 40vw; }
-#stats { color: var(--muted); font-variant-numeric: tabular-nums; }
-.spacer { flex: 1; }
+  max-width: 100%; }
+#stats { color: #c3c8d1; font-variant-numeric: tabular-nums; }
+#stats .stat { white-space: nowrap; }
+#actions { display: flex; gap: 6px; flex: none; }
+#actions button { background: var(--scrim); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
   background: #253255; border: 1px solid #3a4f86; font-size: 12px; }
 .pill[hidden], .spinner-sm[hidden] { display: none; }
@@ -42,6 +50,21 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
   gap: 6px; }
 #tooltip .sw, .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px;
   border: 1px solid #0006; flex: none; vertical-align: middle; }
+
+/* ---- object labels: an id tag in the object's colour, and the name where it fits */
+#labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+#labels[hidden] { display: none; }
+.obj-label { position: absolute; left: 0; top: 0; display: flex; align-items: stretch;
+  font-size: 11px; line-height: 15px; border-radius: 3px; overflow: hidden; white-space: nowrap;
+  background: #0d0f13d9; color: #fff; pointer-events: auto; cursor: pointer;
+  box-shadow: 0 1px 3px #0009; will-change: transform; }
+.obj-label[hidden] { display: none; }
+.obj-label .tag { padding: 0 4px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.obj-label .name { padding: 0 5px 0 4px; }
+.obj-label.compact .name { display: none; }
+.obj-label.under { opacity: .85; }
+.obj-label.selected { outline: 2px solid #fff; outline-offset: 0; font-weight: 600; }
+.obj-label.selected .name { background: #1f2d55; }
 
 /* ---- side panel */
 #panel { width: var(--panel-width); flex: none; background: var(--panel); border-left: 1px solid var(--border);
@@ -70,6 +93,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
   padding: 3px 0; cursor: pointer; }
 .row.check.disabled { color: var(--muted); cursor: default; }
 .row.check .count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.layer-note { display: block; color: var(--muted); font-size: 11px; }
+.layer-note:empty { display: none; }
 .row.attr { display: grid; grid-template-columns: 78px minmax(0, 1fr) 64px; align-items: center; gap: 8px;
   min-height: 26px; }
 .row.attr > label { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -78,6 +103,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
 .row.attr output { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
 select, input[type="text"] { width: 100%; background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; }
+select { text-overflow: ellipsis; }
 select:disabled { opacity: .5; }
 input[type="range"] { width: 100%; margin: 0; accent-color: var(--accent); }
 input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
@@ -109,6 +135,16 @@ input.switch:checked::after { left: 15px; }
   text-align: left; color: var(--muted); font-weight: 500; padding: 4px;
   border-bottom: 1px solid var(--border); }
 #catalogue td, #cameras td { padding: 4px; border-bottom: 1px solid #2a2f3a; white-space: nowrap; }
+/* fixed columns: every number fits, the label takes what is left and ends in an ellipsis */
+#catalogue { table-layout: fixed; font-size: 12px; }
+#catalogue th.num, #catalogue td.num { text-align: right; }
+#catalogue .c-sw { width: 22px; }
+#catalogue .c-id { width: 34px; }
+#catalogue .c-score { width: 40px; }
+#catalogue .c-dims { width: 106px; }
+#catalogue .c-vol { width: 48px; }
+#catalogue td.label { overflow: hidden; text-overflow: ellipsis; }
+#catalogue td.dims { letter-spacing: -0.2px; }
 #catalogue tbody tr[data-id], #cameras tbody tr[data-index] { cursor: pointer; }
 #catalogue tbody tr[data-id]:hover, #cameras tbody tr[data-index]:hover { background: #2a3040; }
 #catalogue tbody tr.selected, #cameras tbody tr.selected { background: #33406a; }
@@ -121,13 +157,22 @@ input.switch:checked::after { left: 15px; }
 .cam-head { display: flex; gap: 6px; margin-bottom: 6px; }
 .cam-head button { padding: 4px 8px; flex: none; }
 #cam-note { margin: 0 0 6px; }
-#segmented { width: 100%; image-rendering: pixelated; border-radius: 4px;
-  border: 1px solid var(--border); }
+#segmented-open { position: relative; display: block; width: 100%; padding: 0; border: 1px solid var(--border);
+  border-radius: 4px; background: none; cursor: zoom-in; overflow: hidden; flex: none; }
+#segmented { display: block; width: 100%; image-rendering: pixelated; }
+#segmented-open .zoom-hint { position: absolute; right: 6px; bottom: 6px; padding: 1px 7px; border-radius: 4px;
+  background: var(--scrim); font-size: 11px; }
 .hint { color: var(--muted); font-size: 11px; }
-.obj-label { font-size: 11px; padding: 1px 5px; border-radius: 3px; background: #0d0f13d0;
-  color: #fff; border-left: 3px solid; white-space: nowrap; pointer-events: auto; cursor: pointer;
-  transform: translateY(-4px); }
-.obj-label.selected { background: #1f2d55; font-weight: 600; }
+
+/* ---- lightbox: the segmented image fitted to the window; a click shows its actual pixels */
+#lightbox { position: fixed; inset: 0; z-index: 30; background: #080a0ef2; display: flex;
+  align-items: center; justify-content: center; padding: 16px; overflow: auto; }
+#lightbox[hidden] { display: none; }
+#lightbox img { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated;
+  cursor: zoom-in; }
+#lightbox.actual { align-items: flex-start; justify-content: flex-start; }
+#lightbox.actual img { width: auto; height: auto; flex: none; cursor: zoom-out; }
+#lightbox-close { position: fixed; top: 10px; right: 10px; z-index: 31; }
 
 /* ---- loading overlay */
 #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -143,13 +188,19 @@ input.switch:checked::after { left: 15px; }
   border-radius: 50%; animation: spin 0.8s linear infinite; float: right; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- narrow screens: the panel goes below the 3D view */
-@media (max-width: 900px) { :root { --panel-width: 300px; } }
+/* ---- wide screens get a wider panel; narrow screens: the panel goes below the 3D view */
+@media (min-width: 1280px) { :root { --panel-width: 380px; } }
+@media (max-width: 900px) {
+  :root { --panel-width: 300px; }
+  #catalogue .c-score, #catalogue td:nth-child(4) { display: none; }
+}
 @media (max-width: 700px) {
   #app { flex-direction: column; }
   #panel { width: 100%; height: 46%; border-left: none; border-top: 1px solid var(--border);
     transition: none; }
   #app.panel-hidden #panel { display: none; margin-right: 0; }
   #help { display: none; }
-  #title { max-width: 55vw; }
+  #catalogue .c-score, #catalogue td:nth-child(4) { display: table-cell; }
+  #info { font-size: 12px; }
+  #title { font-size: 13px; }
 }

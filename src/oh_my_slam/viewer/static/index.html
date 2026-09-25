@@ -19,15 +19,18 @@
     <main id="viewport">
       <div id="canvas-host"></div>
       <div id="topbar">
-        <span id="title">oh-my-slam</span>
-        <span id="stats" data-testid="stats">loading…</span>
-        <span id="busy" class="pill" role="status" aria-live="polite" hidden><span class="spinner-sm"></span>Updating point cloud…</span>
-        <span class="spacer"></span>
-        <button id="reset-view" type="button" title="Reset view (R)">Reset view</button>
-        <button id="toggle-panel" type="button" title="Show/hide the side panel" aria-controls="panel" aria-expanded="true">☰</button>
+        <div id="info">
+          <span id="title">oh-my-slam</span>
+          <span id="stats" data-testid="stats">loading…</span>
+          <span id="busy" class="pill" role="status" aria-live="polite" hidden><span class="spinner-sm"></span>Updating point cloud…</span>
+        </div>
+        <div id="actions">
+          <button id="reset-view" type="button" title="Reset view (R)">Reset view</button>
+          <button id="toggle-panel" type="button" title="Show/hide the side panel" aria-controls="panel" aria-expanded="true">☰</button>
+        </div>
       </div>
       <div id="tooltip" role="tooltip" hidden></div>
-      <div id="help">Drag to orbit · right-drag / two-finger to pan · wheel to zoom · click a box to select · R resets the view</div>
+      <div id="help">Drag to orbit · right-drag / two-finger to pan · wheel to zoom · click a box or tag to select · R resets the view</div>
     </main>
     <aside id="panel" aria-label="Controls">
       <nav id="tabs" role="tablist">
@@ -60,7 +63,7 @@
         <input id="filter" type="search" placeholder="Filter by label…" aria-label="Filter catalogue">
         <div class="table-wrap">
           <table id="catalogue" data-testid="catalogue">
-            <thead><tr><th></th><th>id</th><th>label</th><th>score</th><th>W×D×H m</th><th>m³</th></tr></thead>
+            <thead><tr><th class="c-sw"></th><th class="c-id num">id</th><th class="c-label">label</th><th class="c-score num">score</th><th class="c-dims num" title="width × depth × height">W×D×H m</th><th class="c-vol num">m³</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -80,10 +83,17 @@
         </div>
       </section>
       <section id="tab-image" class="tab" role="tabpanel">
-        <img id="segmented" alt="Segmented image">
-        <p class="hint">Each instance mask painted opaque in its object's colour over the dimmed photo.</p>
+        <button id="segmented-open" type="button" title="Enlarge the segmented image" aria-label="Enlarge the segmented image">
+          <img id="segmented" alt="Segmented image">
+          <span class="zoom-hint">⤢ Enlarge</span>
+        </button>
+        <p class="hint">Each instance mask painted opaque in its object's colour over the dimmed photo. Click to enlarge; in the enlarged view, click to switch between fit and actual pixels.</p>
       </section>
     </aside>
+  </div>
+  <div id="lightbox" role="dialog" aria-modal="true" aria-label="Segmented image" hidden>
+    <img alt="Segmented image, enlarged">
+    <button id="lightbox-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
   </div>
   <div id="loading" role="status" aria-live="polite">
     <div class="box">
