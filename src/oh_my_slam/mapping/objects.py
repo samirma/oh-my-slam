@@ -193,10 +193,10 @@ RATIO_MIN_POINTS = 500  # shared surface points for a keyframe pair's depth rati
 # EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
 # color=segment) in its colour. A confirmed object whose detecting keyframes are fewer than a
 # third of those that see its surface wins few or no points in the vote (a dishwasher detected in
-# 2 of the ~15 keyframes that see its front won 1 of its ~16k points); every confirmed object also
-# takes the unlabelled cloud points nearest its own lifted points (``geometry.support_labels``).
-# It still has too few when its surface did not survive the fusion (seen by fewer than 3
-# keyframes, e.g. a pendant lamp).
+# 2 of the ~13 keyframes that see its front won 1 of the ~21,700 cloud points in its box); every
+# confirmed object also takes the unlabelled cloud points nearest its own lifted points
+# (``geometry.support_labels``). It still has too few when its surface did not survive the
+# fusion (seen by fewer than 3 keyframes, e.g. a pendant lamp).
 EXPORT_MIN_CLOUD_POINTS = 10
 EXPORT_MIN_SUPPORT = 0.05
 UP = np.array([0.0, 0.0, 1.0])

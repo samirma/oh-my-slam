@@ -444,7 +444,7 @@ point leaves the map untouched. One killed after it is completed by the next upd
     points lie on the other's surface. The merged object takes the label with the most
     evidence and lists the others in `detected_as`.
   * **Copies placed by inconsistent depth** are merged too. Keyframes whose monocular depth
-    disagrees (locally, even after the global scale adjustment of Refinement) can place an
+    disagrees (locally, even after the global depth adjustment of Refinement) can place an
     object twice along the same viewing rays. Objects of compatible labels that no keyframe
     detected together merge when, for most of the 3 pairs of their keyframes nearest by
     viewpoint, the two keyframes' depths disagree by at least 5 % (measured on the surfaces both
@@ -466,15 +466,21 @@ point leaves the map untouched. One killed after it is completed by the next upd
     the image-border band, where the object is cut off and monocular depth is unreliable) in at
     least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
     ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
-    It must also have at least one point in the map cloud, so that it appears in
-    `segments.ply` and every `color=segment` cloud in its colour. A keyframe's vote for an
-    object counts only for cloud points inside the object's box grown by 5 cm: detection masks
+    It must also be visibly drawn in the map cloud, so that it appears in `segments.ply` and
+    every `color=segment` cloud in its colour: it needs at least 5 % of the cloud points its
+    box's largest face holds (one per cloud voxel), and at least 10. A keyframe's vote for an
+    object counts only for cloud points inside the object's attribution gate, its box grown by
+    the depth noise at its viewing distance (max(5 cm, 3 % of the distance)): detection masks
     are drawn generously (a "carpet" mask over a counter top and the floor beyond it), and the
-    object's coloured points must coincide with its box. A confirmed object that wins no point
-    in the vote — fewer than a third of the keyframes that see its surface detected it, such as
-    a light switch on a wall — takes the unlabelled cloud points nearest its own lifted points,
-    inside its grown box. It has none only when its surface did not survive the fusion (seen by
-    fewer than 3 keyframes, such as a pendant lamp); it is then not exported.
+    object's coloured points must coincide with its box. The vote needs a third of the
+    keyframes that see a point, so an object detected in fewer of them wins only part of its
+    surface (a refrigerator detected in 7 of the ~15 keyframes that see its front) or none of it
+    (a light switch on a wall, a dishwasher detected in 2 of ~13). Each confirmed object
+    therefore also takes the unlabelled cloud points nearest its own lifted points (the 4
+    nearest to each, within max(3 cm, 2 % of its viewing distance), inside its gate; a point two
+    objects pick goes to the nearer). An object stays short only when its surface did not
+    survive the fusion (seen by fewer than 3 keyframes, such as a pendant lamp); it is then not
+    exported.
   * Unconfirmed objects are kept, so that a later update can still confirm them.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
@@ -563,16 +569,23 @@ Geometry and detection requests run concurrently on two connections.
    3. Each keyframe's depth is aligned to the map. The scale comes from its SfM points, or
       densely from overlapping keyframes. A scale outside 0.5–2 rejects the keyframe. A scale
       outside 0.8–1.25 marks it low-confidence, and such keyframes are excluded from fusion.
-      Dense alignment goes keyframe by keyframe, so its scale drifts along a long sequence;
-      the scales of all the map's keyframes are therefore adjusted together: each keyframe is
-      paired with its 30 nearest keyframes by viewpoint whose optical axes differ by less than
-      40° (loop closures included), each pair measures the median log ratio of the two depths on
-      the surfaces both see, and one correction per keyframe is solved from all pairs at once
-      (robust least squares on the log ratios; sparse-scaled keyframes and the map's first
-      keyframe hold the metric scale; low-confidence keyframes follow the others). The map's
-      stored keyframes take part too, so a later update that closes a loop spreads the
-      correction over the whole loop, as one update with the whole sequence would: their depth
-      is rewritten and their objects move with them.
+      Dense alignment goes keyframe by keyframe, so its scale drifts along a long sequence, and
+      one scale per keyframe cannot reconcile a near field (a counter top 0.3–0.7 m away) that
+      disagrees with the neighbours' by 10–30 % while the far walls agree. The depth of all the
+      map's keyframes is therefore adjusted together: each keyframe is paired with every
+      keyframe (up to its 50 nearest by viewpoint) whose optical axis differs by less than 45°,
+      sequence neighbours and loop closures alike. Each pair measures the median log ratio of
+      the two depths on the surfaces both see, in both directions and in 6 bins of depth, and
+      one correction per keyframe — a scale and a near/far tilt about its median depth,
+      `log d' = log d + a + b (log d − log median)` — is solved from all of them at once
+      (robust least squares; the tilt has a prior of 0 and is at most ±0.3, and no pixel's depth
+      changes by more than a factor 1.5; sparse-scaled keyframes and the map's first keyframe
+      hold the metric scale but are tilted like the others; low-confidence keyframes follow the
+      others). The map's stored
+      keyframes take part too, so a later update that closes a loop spreads the correction over
+      the whole loop, as one update with the whole sequence would: their depth is rewritten and
+      their objects move with them. `frames.json` records each keyframe's `depth_scale` (at its
+      median depth) and `stats.depth_exponent` (1 + b).
    4. For a new map, the map is levelled with the floor plane.
 6. **Integration.** The update applies latest wins, fuses the cloud (Open3D TSDF), updates the
    objects (the fused surface tells pieces of one horizontal surface), gives the cloud's points
@@ -619,7 +632,7 @@ are:
 |---|---|
 | `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
-| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair that is not a sequence neighbour (optical axes < 30° apart, > 10 keyframes apart: median and p90 over the pairs, share of pairs above 10 %); near-duplicate objects (compatible labels, or both horizontal-surface labels at one height; never detected in the same keyframe; boxes within 0.3 m); the largest share of an object's cloud points outside its box grown by 5 cm; and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
+| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); near-duplicate objects (compatible labels, or both horizontal-surface labels at one height; never detected in the same keyframe; boxes within 0.3 m); the largest share of an object's detected mask points (lifted with the detecting keyframe's depth) outside its box grown by the depth noise, max(5 cm, 5 % of the depth), and, as a check of the mapper's attribution gate, of its cloud points outside that gate; and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
 | `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
@@ -689,21 +702,24 @@ runs it end to end as a test.
   are only as consistent as the agreeing detections (see Update semantics).
 * **Boxes cover the observed surface, not the whole object.** An OBB is fitted to the points the
   keyframes saw. An object seen only from the front has the depth of its visible surface: in
-  the `ainex-captures` map the refrigerator against the wall is about 0.8 × 0.17 × 1.7 m,
-  because only its front was seen. The fit does not invent the hidden part from a class-typical size,
+  the `ainex-captures` map the refrigerator against the wall is about 0.8 m wide and 1.65 m
+  tall but only 0.1–0.15 m deep, because only its front was seen. The fit does not invent the hidden part from a class-typical size,
   which would be wrong for any object that is not typical. The only extension is floor
   grounding, where the visible bottom floats just above the detected floor (see Coordinate
   conventions).
-* **Monocular depth disagrees locally.** The global scale adjustment (Refinement) removes the
-  drift around the 360° loop of `ainex-captures`: the keyframes that close it (right 100°–150°)
-  now agree with those that opened it (left 180°–210°) to 2–3 % (median disagreement of their
-  pairs; 15–21 % with keyframe-by-keyframe alignment alone). One scale per keyframe cannot
-  remove disagreement that varies across an image, though. Surfaces close to the camera (the
-  kitchen island 0.3–0.7 m below it) are placed up to 20–30 % differently by different
-  keyframes, and pairs that see them together with far walls disagree most: over the ~190
-  overlapping keyframe pairs of that map that are not sequence neighbours, the median pair
-  disagrees by about 1.5 %, 90 % of the pairs by less than 4 %, and the worst pairs (the
-  bootstrap frames at left 15°–30° against the return at right-to 40°–0°) by 7–10 %.
+* **Monocular depth disagrees locally.** Before the global depth adjustment (Refinement), the
+  keyframes that close the 360° loop of `ainex-captures` disagreed with those that opened it by
+  15–21 %, and the near field of a keyframe (the kitchen island 0.3–0.7 m below the camera, seen
+  at a grazing angle) by 10–30 % with its neighbours' while their far walls agreed. A scale and
+  a near/far tilt per keyframe remove most of it: over the ~775 overlapping keyframe pairs of
+  that map (optical axes < 45° apart, sequence neighbours and loop closures alike), the median
+  pair disagrees by about 1.8 %, 90 % of the pairs by less than 3.5 %, and the worst pair by
+  9–11 % (with one scale per keyframe: 1.9 %, 5.5 % and 21 %, keyframes two apart). What remains
+  varies across an image in a way a tilt in depth does not model: the worst pairs are 40–45°
+  apart and overlap only near their image borders, where monocular depth is least reliable (the
+  bootstrap frame at left 15° against left 60°, left 60° against the return at right-to 10°).
+  The tilt also means a keyframe's depth is not one scale of MoGe's: `frames.json` records
+  `depth_scale` at its median depth and `stats.depth_exponent`.
 * **Large horizontal surfaces at floor height can stay fragmented.** Pieces of a surface seen
   from different keyframes merge when they share surface or when a horizontal patch of the
   fused surface joins them (see Update semantics). At floor height only the first test applies,

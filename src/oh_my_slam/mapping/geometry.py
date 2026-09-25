@@ -9,8 +9,8 @@ therefore counts only for points inside the object's box grown by the depth nois
 distance (``attribution_margin``), so an object's points in the cloud (``segments.ply``,
 ``color=segment``, its ``point_count``) coincide with its box. The vote needs a third of the
 keyframes that see a point, and an object detected in fewer of them wins only part of its
-surface — a refrigerator detected in 7 of the ~20 keyframes that see its front, half of it — or
-nothing — a dishwasher detected in 2 of ~15, a light switch on a wall. Each confirmed object
+surface — a refrigerator detected in 7 of the ~15 keyframes that see its front, half of it — or
+nothing — a dishwasher detected in 2 of ~13, a light switch on a wall. Each confirmed object
 therefore also takes the unlabelled cloud points of its gate nearest to its own lifted points
 (``support_labels``); it is exported only when that makes it visibly drawn
 (``objects.min_cloud_points``)."""
