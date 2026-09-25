@@ -197,10 +197,15 @@ def test_keyframe_order_within_an_update_does_not_matter(tmp_path: Path) -> None
         assert labels == ["box", "cabinet", "sofa"], labels
         flicker = [o for o in res.objs.objects if not o.confirmed]
         assert len(flicker) == 1 and flicker[0].observations == 1
-        # new ids follow the earliest keyframe that detected each object
+        # new ids follow the earliest keyframe that detected each object: the number of its
+        # first detection, counting the detections of the keyframes in capture order
         new = sorted(res.objs.objects, key=lambda o: o.id)
         assert [o.frames[0] for o in new] == sorted(o.frames[0] for o in new)
-        assert res.objs.next_id == 1 + len(new)
+        assert res.objs.next_id == 1 + sum(len(sh.dets) for sh in shots)
+        order = [shots[i] for i in (perm if res is b else range(len(shots)))]
+        before = np.cumsum([0] + [len(sh.dets) for sh in order])
+        for o in new:
+            assert before[o.frames[0]] < o.id <= before[o.frames[0] + 1], (o.id, o.frames)
 
 
 def test_attribution_latest_update_wins_and_finest_view_within_an_update() -> None:
@@ -475,6 +480,53 @@ def test_split_updates_give_the_same_objects_and_ids(tmp_path: Path) -> None:
         assert obb_iou_upright(o.obb, p.obb) > 0.9, (o.label, o.obb, p.obb)
         assert np.linalg.norm(o.obb.center - p.obb.center) < 0.05
     assert {o.label for o in a.values()} == {"cabinet", "box", "sofa"}
+
+
+def test_split_ids_do_not_depend_on_earlier_updates_bookkeeping(tmp_path: Path) -> None:
+    """A sofa seen only in halves by the first split becomes two objects there (merged when the
+    second split sees it whole), and the first split's flicker detection stays an unconfirmed
+    candidate: neither shifts the ids of later objects — the one-update map and the split map
+    give every object the same id."""
+    sofa = Box(np.array([0.0, 0.0, 0.4]), np.array([2.4, 0.8, 0.8]), 0.0, (50, 70, 210), "sofa")
+    cab = Box(np.array([0.2, 1.6, 0.4]), np.array([0.6, 0.5, 0.8]), 0.0, (220, 40, 40),
+              "cabinet")
+    room = Room(boxes=[sofa, cab])
+    left = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (-1.4, -1.1)]
+    right = [look_at(np.array([x, -2.2, 1.2]), np.array([x, 0.0, 0.4])) for x in (1.1, 1.4)]
+    whole = [look_at(np.array([x, -2.3, 1.4]), np.array([x, 0.0, 0.4])) for x in (-0.3, 0.0, 0.3)]
+    behind = [look_at(np.array([x, 2.3, 1.4]), np.array([0.2, 1.6, 0.4])) for x in (-0.3, 0.2, 0.7)]
+
+    def half(poses: list[Pose], keep_x: Any) -> Any:
+        def detect(k: int, label: str, m: np.ndarray) -> np.ndarray | None:
+            if label != "sofa":
+                return None
+            v, u = np.nonzero(m)
+            z = render(room, poses[k], K).depth[v, u]
+            cam = np.stack([(u - K.cx) / K.fx * z, (v - K.cy) / K.fy * z, z], 1)
+            keep = keep_x(poses[k].apply(cam)[:, 0])
+            out = np.zeros_like(m)
+            out[v[keep], u[keep]] = True
+            return out
+        return detect
+
+    first = (shoot(room, left, detect=half(left, lambda x: x < -0.35))
+             + shoot(room, right, detect=half(right, lambda x: x > 0.35)))
+    wall = render(room, first[1].pose, K).ids == 1
+    flick = np.zeros_like(wall)
+    flick[40:70, 180:220] = True
+    first[1].dets.append(("box", flick & wall, 0.6))  # a one-off false positive
+    second = shoot(room, whole, detect=lambda k, lab, m: m if lab == "sofa" else None)
+    third = shoot(room, behind, detect=lambda k, lab, m: m if lab == "cabinet" else None)
+    assert all(sh.dets for sh in first + second + third)
+    one = known_pose_update(tmp_path / "one", first + second + third, tmp_path / "w1")
+    for k, part in enumerate((first, second, third)):
+        split = known_pose_update(tmp_path / "split", part, tmp_path / f"w3{k}")
+    assert len(split.objs.merged_into) == 1  # the halves merged in the second split
+    ids = {o.id: (o.label, o.confirmed) for o in one.objs.objects}
+    assert ids == {o.id: (o.label, o.confirmed) for o in split.objs.objects}, ids
+    assert sorted(lab for lab, ok in ids.values() if ok) == ["cabinet", "sofa"]
+    assert sorted(exported(one)) == sorted(exported(split))
+    assert one.objs.next_id == split.objs.next_id
 
 
 # --- inputs ----------------------------------------------------------------------------------------

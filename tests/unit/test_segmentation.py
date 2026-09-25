@@ -21,7 +21,7 @@ from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import detect
 from oh_my_slam.segmentation.api import (
-    exclusive_masks,
+    pixel_owners,
     reconstruct_and_detect,
     segment_frame,
 )
@@ -119,6 +119,12 @@ def _rect(r0: int, r1: int, c0: int, c1: int) -> np.ndarray:
     m = np.zeros((10, 10), bool)
     m[r0:r1, c0:c1] = True
     return m
+
+
+def exclusive_masks(dets: list[detect.Detection], shape: tuple[int, int]) -> list[np.ndarray]:
+    """Per-detection masks after ``pixel_owners`` gave every pixel to at most one detection."""
+    owner = pixel_owners(dets, shape)
+    return [owner == i for i in range(len(dets))]
 
 
 @pytest.mark.parametrize("cup_score", [0.55, 0.95])

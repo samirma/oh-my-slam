@@ -5,8 +5,10 @@ ALIKED/LightGlue; the PyPI pycolmap wheel has no ONNX); mapping, triangulation a
 adjustment run through pycolmap on the same database. Both must be 4.2.x.
 
 New map: global mapping (GLOMAP) → incremental if < 60 % placed → multi-view (MapAnything)
-poses + triangulation + BA. Rotation-dominant input goes straight to the multi-view path.
-Update: incremental mapping with the existing frames fixed.
+poses refined with the verified matches and monocular depth (``panorama``) + triangulation.
+Rotation-dominant input goes straight to the multi-view path.
+Update: incremental mapping with the existing frames fixed; keyframes it cannot place (all of
+them for rotation-dominant input) get anchored, refined multi-view poses.
 """
 
 from __future__ import annotations
@@ -382,9 +384,29 @@ class Sfm:
         rec = self._largest(recs, set(base.registered))
         return None if rec is None else _back_onto(SfmModel(rec, "sfm-incremental"), base)
 
-    def _posed_reconstruction(self, poses: dict[str, Pose], base: Any = None) -> Any:
+    def image_intrinsics(self, names: set[str]) -> dict[str, tuple[int, Intrinsics]]:
+        """(camera id, full-resolution intrinsics) in the database of each of ``names``."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            cams = {c.camera_id: c for c in db.read_all_cameras()}
+            out = {}
+            for im in db.read_all_images():
+                if im.name in names:
+                    cam = cams[im.camera_id]
+                    K = np.asarray(cam.calibration_matrix())
+                    out[im.name] = (int(im.camera_id), Intrinsics(
+                        K[0, 0], K[1, 1], K[0, 2], K[1, 2], cam.width, cam.height, "colmap"))
+            return out
+        finally:
+            db.close()
+
+    def _posed_reconstruction(self, poses: dict[str, Pose], base: Any = None,
+                              focal_scale: float = 1.0) -> Any:
         """``base`` (or an empty reconstruction) plus images at the given camera-to-world poses.
-        Images of ``base`` that are in ``poses`` keep their stored pose."""
+        Images of ``base`` that are in ``poses`` keep their stored pose. Cameras not yet in the
+        reconstruction come from the database, their focal length times ``focal_scale``."""
         import pycolmap
 
         db = pycolmap.Database.open(str(self.db))
@@ -401,7 +423,12 @@ class Sfm:
             if rec.exists_image(im.image_id):
                 continue
             if not rec.exists_camera(im.camera_id):
-                rec.add_camera_with_trivial_rig(cams[im.camera_id])
+                cam = cams[im.camera_id]
+                if focal_scale != 1.0:
+                    params = np.asarray(cam.params, np.float64).copy()
+                    params[list(cam.focal_length_idxs())] *= focal_scale
+                    cam.params = params.tolist()
+                rec.add_camera_with_trivial_rig(cam)
             Tcw = T.inverse()
             img = pycolmap.Image(name=name, camera_id=im.camera_id, image_id=im.image_id)
             rec.add_image_with_trivial_frame(
@@ -409,12 +436,14 @@ class Sfm:
         return rec
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
-                               refine_intrinsics: bool = True, bundle: bool = True) -> SfmModel:
+                               refine_intrinsics: bool = True, bundle: bool = True,
+                               focal_scale: float = 1.0) -> SfmModel:
         """Reconstruction from known camera-to-world poses: triangulate the database matches,
-        then bundle-adjust (intrinsics shared per camera)."""
+        then (``bundle``) bundle-adjust (intrinsics shared per camera). The cameras' focal lengths
+        are the database's times ``focal_scale``."""
         import pycolmap
 
-        rec = self._posed_reconstruction(poses)
+        rec = self._posed_reconstruction(poses, focal_scale=focal_scale)
         out.mkdir(parents=True, exist_ok=True)
         rec = pycolmap.triangulate_points(rec, str(self.db), str(self.image_dir), str(out),
                                           clear_points=True, refine_intrinsics=False)

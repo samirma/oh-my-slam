@@ -44,11 +44,6 @@ class Capture:
     yaw_deg: float  # commanded yaw relative to frame 001, positive to the left
     tilt: str  # "level" | "up" | "down"
 
-    @property
-    def heading_deg(self) -> float:
-        """The commanded yaw wrapped to [-180, 180) (``left_210`` and ``right_150`` agree)."""
-        return wrap_deg(self.yaw_deg)
-
 
 def parse_capture(name: str) -> Capture:
     """Parse one capture file name; ``ValueError`` if it does not follow the grammar."""

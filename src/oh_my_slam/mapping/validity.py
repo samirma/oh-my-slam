@@ -188,9 +188,23 @@ def cells_to_pixels(cells: NDArray[Any], shape: tuple[int, int]) -> NDArray[np.b
     return ndimage.binary_dilation(full, iterations=1)
 
 
+POSE_MAX_RESIDUAL_DEG = 1.0
+POSE_MIN_MATCHES = 20
+
+
+def pose_supported(stats: dict[str, Any]) -> bool:
+    """A multi-view pose refined with feature matches (``stats`` has ``pose_matches``) is
+    supported when its keyframe has matches that agree with it (median residual <= 1°)."""
+    if "pose_matches" not in stats:
+        return True
+    res = stats.get("pose_residual_deg")
+    return (stats["pose_matches"] >= POSE_MIN_MATCHES and res is not None
+            and res <= POSE_MAX_RESIDUAL_DEG)
+
+
 def well_registered(stats: dict[str, Any], pose_source: str) -> bool:
     if pose_source in ("identity", "multiview"):
-        return True
+        return pose_supported(stats)
     return (stats.get("observations", 0) >= MIN_OBSERVATIONS
             and stats.get("reproj_error", 0.0) <= MAX_REPROJ)
 

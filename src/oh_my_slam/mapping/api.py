@@ -32,7 +32,7 @@ from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import frame as mframe
-from oh_my_slam.mapping import ingest, retrieval, store
+from oh_my_slam.mapping import ingest, retrieval, store, validity
 from oh_my_slam.mapping.sfm import (
     MIN_PLACED_FRACTION,
     ROTATION_BASELINE_RATIO,
@@ -88,6 +88,8 @@ class UpdateContext:
     rejected: list[str] = field(default_factory=list)
     model: SfmModel | None = None
     notes: dict[str, Any] = field(default_factory=dict)
+    # refined multi-view keyframes: (median match residual in degrees, matches)
+    pose_support: dict[str, tuple[float, int]] = field(default_factory=dict)
 
 
 Progress = Callable[[str], None]
@@ -334,11 +336,57 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     progress(f"multi-view fallback ({reason}); {len(component)} connected keyframes")
     todo = [v for v in _new_pool(ctx) if v.name in component]
     poses = _multiview_poses(ctx, todo, [], client)
-    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv")
-    mv_model.notes["reason"] = reason
-    progress(f"multi-view + BA: {len(mv_model.registered)} keyframes in "
+    # the first keyframe holds the gauge; the depth fixes the scale, the matches the focal length
+    poses, focal = _refine_multiview(ctx, sfm, poses, set(poses) - {todo[0].name},
+                                     refine_focal=True, rotation=rotation)
+    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", bundle=False,
+                                          focal_scale=focal)
+    mv_model.notes.update(reason=reason, metric=True)
+    progress(f"multi-view + refinement: {len(mv_model.registered)} keyframes in "
              f"{time.perf_counter() - t0:.0f} s")
     return mv_model
+
+
+def _keyframe_intrinsics(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> dict[str, Intrinsics]:
+    """Full-resolution intrinsics of new keyframes: the map's camera when they share one with
+    stored keyframes (the map holds its refined focal length), else the database's."""
+    by_camera = {f.camera_id: f.K for f in ctx.old_frames}
+    return {n: by_camera.get(cid, K) for n, (cid, K) in sfm.image_intrinsics(names).items()}
+
+
+def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free: set[str],
+                      refine_focal: bool, rotation: bool) -> tuple[dict[str, Pose], float]:
+    """Refine the multi-view poses of the keyframes ``free`` with every verified feature match
+    and the keyframes' monocular depth (``mapping.panorama``; staged for ``rotation``-dominant
+    input); every other keyframe — this update's other posed keyframes and the map's — holds
+    still. Returns all poses and the factor of the shared focal length (1 unless
+    ``refine_focal``)."""
+    from oh_my_slam.mapping import panorama
+
+    new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    old = {Path(f.image).name: f for f in ctx.old_frames}
+    with timing.stage("pose_refinement"):
+        pairs = panorama.verified_matches(sfm.db, (set(poses) & set(new)) | set(old))
+        linked = {n for p in pairs if p.a in free or p.b in free for n in (p.a, p.b)}
+        K = _keyframe_intrinsics(ctx, sfm, linked & set(new))
+        views: dict[str, panorama.View] = {}
+        for n in sorted(linked):
+            if n in new and n in K:
+                nf = new[n]
+                views[n] = panorama.View(poses[n], K[n], nf.frame.depth, nf.frame.K_grid,
+                                         nf.full_size)
+            elif n in old:
+                f = old[n]
+                views[n] = panorama.View(f.T_map_cam, f.K, store.load_depth(ctx.tx.current, f.name),
+                                         f.K_grid, (f.width, f.height))
+        refine = panorama.refine_turning if rotation else panorama.refine_poses
+        fit = refine(pairs, views, free, refine_focal=refine_focal)
+    ctx.notes["pose_refinement"] = fit.summary()
+    ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
+                                 fit.per_frame_matches.get(n, 0)) for n in fit.poses})
+    log.info("pose refinement of %d keyframes: median residual %.3f° -> %.3f° (%d pairs)",
+             len(fit.poses), fit.median_before_deg, fit.median_after_deg, fit.pairs)
+    return {**poses, **fit.poses}, fit.focal_scale
 
 
 def _complete_registration(sfm: Sfm, model: SfmModel, names: set[str], work: Path) -> SfmModel:
@@ -389,6 +437,8 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
                  + (" (rotation-dominant input)" if rotation else ""))
         mv = _multiview_poses(ctx, todo, pool, client)
         poses.update(mv)
+        poses, _ = _refine_multiview(ctx, sfm, poses, set(mv), refine_focal=False,
+                                     rotation=rotation)
         ctx.notes["mv_names"] = sorted(mv)
     model = sfm.extend_with_poses(model_in, poses, ctx.work / "sfm_ext", method)
     progress(f"registered {len(poses)}/{len(new_names)} new keyframes ({method}) in "
@@ -499,18 +549,23 @@ def _frame_depths(ctx: UpdateContext) -> list[mframe.FrameDepth]:
 
 def _define_map_frame(ctx: UpdateContext, model: SfmModel, progress: Progress) -> None:
     fds = _frame_depths(ctx)
-    try:
-        scale = mframe.metric_scale(model, fds)
-    except ValueError:
-        # no frame with enough triangulated points: keep the (metric) multi-view scale
-        scale = mframe.ScaleResult(1.0, 0.0, {}, {})
+    method = "moge_over_sfm_median"
+    if model.notes.get("metric"):
+        # refined multi-view poses are in the units of the keyframes' metric depth already
+        scale, method = mframe.ScaleResult(1.0, 0.0, {}, {}), "multiview_depth"
+    else:
+        try:
+            scale = mframe.metric_scale(model, fds)
+        except ValueError:
+            # no frame with enough triangulated points: keep the (metric) multi-view scale
+            scale = mframe.ScaleResult(1.0, 0.0, {}, {})
     poses = {n: model.pose(n) for n in model.registered}
     up = mframe.world_up(poses, fds)
     first = next(f"{nf.kf.name}.jpg" for nf in ctx.new if f"{nf.kf.name}.jpg" in poses)
     sim = mframe.map_transform(poses[first], up, scale.scale)
     model.transform(sim.s, sim.R, sim.t)
     ctx.meta["scale"] = {"sfm_to_metric": scale.scale, "spread": scale.spread,
-                         "frames": len(scale.per_frame), "method": "moge_over_sfm_median"}
+                         "frames": len(scale.per_frame), "method": method}
     ctx.meta["map_frame"] = {
         "units": "m", "axes": "x-forward,y-left,z-up", "gravity_aligned": True,
         "origin": f"camera centre of {first}", "up_source": "geocalib+floor weighted mean",
@@ -557,8 +612,9 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     too few points (low texture, pure rotation) are aligned densely to overlapping keyframes that
     are already aligned (``reconstruction.depth.dense_scale``). A sparse scale outside [0.5, 2]
     means the pose contradicts the keyframe's own depth: the keyframe is left out. Sparse scales
-    outside [0.8, 1.25], inconsistent dense fits and unsupported keyframes are low confidence
-    (excluded from fusion, latest wins and absence tests)."""
+    outside [0.8, 1.25], inconsistent dense fits, unsupported keyframes and refined multi-view
+    poses the matches do not support (``pose_supported``) are low confidence (excluded from
+    fusion, latest wins and absence tests)."""
     from oh_my_slam.reconstruction.depth import dense_scale
 
     lo, hi = DEPTH_SCALE_RANGE
@@ -587,6 +643,10 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
         T = model.pose(name)
         K = model.intrinsics(name).with_source("colmap")
         stats: dict[str, Any] = dict(model.image_stats(name))
+        if name in ctx.pose_support:
+            res, n_matches = ctx.pose_support[name]
+            stats.update(pose_residual_deg=round(res, 4) if np.isfinite(res) else None,
+                         pose_matches=n_matches)
         fit = None if name in dense_only else _sparse_scale(nf, model, name)
         if fit is not None and fit.ok and fit.spread <= DENSE_MAX_SPREAD:
             s = fit.scale
@@ -631,7 +691,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             model.rec.deregister_frame(model.rec.find_image_with_name(name).frame_id)
             continue
         _set_aligned(ctx, nf, T, K, model, name, stats, s, low)
-        if not low:
+        if not nf.record.low_confidence:
             pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid))
 
 
@@ -673,7 +733,8 @@ def _set_aligned(ctx: UpdateContext, nf: NewFrame, T: Pose, K: Intrinsics, model
                  name: str, stats: dict[str, Any], s: float, low: bool) -> None:
     nf.record = _record(ctx, nf, T, model.method, K, model.camera_id(name), stats)
     nf.record.depth_scale = float(s)
-    nf.record.low_confidence = bool(low)
+    # low confidence: an unreliable depth scale, or a multi-view pose the matches do not support
+    nf.record.low_confidence = bool(low) or not validity.pose_supported(stats)
     nf.depth = (nf.frame.depth * s).astype(np.float32)
 
 
@@ -711,7 +772,7 @@ def integrate(ctx: UpdateContext, progress: Progress
               ) -> tuple[list[store.FrameRecord], ObjectState, MapGeometry]:
     """Fold the update's placed keyframes into the map (staged): frames, latest wins, objects and
     the cloud. Returns (all frame records, object state, map geometry)."""
-    from oh_my_slam.mapping import objects, validity
+    from oh_my_slam.mapping import objects
     from oh_my_slam.mapping.geometry import build_geometry
 
     with timing.stage("persist_frames"):

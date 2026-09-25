@@ -17,10 +17,6 @@ SCHEMA_SHA256 = "22879dd20878d4fec02f96eccd401896e40988c3a77ded269b18505854bcdaa
 _QUAT_TOL = 1e-3
 
 
-class SceneValidationError(ValueError):
-    """Raised with every problem found, one per line."""
-
-
 def schema_bytes() -> bytes:
     return resources.files("oh_my_slam.schema").joinpath("openlabel_json_schema.json").read_bytes()
 
@@ -137,10 +133,5 @@ def extra_errors(doc: Any) -> list[str]:
 
 
 def validation_errors(doc: Any) -> list[str]:
+    """Every problem of ``doc`` (empty: valid) — the evaluator's OpenLABEL contract check."""
     return schema_errors(doc) + extra_errors(doc)
-
-
-def validate_scene(doc: Any) -> None:
-    errors = validation_errors(doc)
-    if errors:
-        raise SceneValidationError("\n".join(errors))

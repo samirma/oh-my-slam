@@ -1,11 +1,22 @@
 """Memory of the measured processes: the command's process tree (resident set) and the inference
-server (physical footprint, which on Apple silicon includes Metal/MPS allocations)."""
+server (physical footprint, which on Apple silicon includes Metal/MPS allocations).
+
+Per stage: the server reports no memory of its own (``/health`` has none), so :class:`PeakSampler`
+keeps timestamped samples of both, and :func:`stage_peaks` attributes them to the stages of the
+command through the stage time windows the command records (``core.timing``: ``t0_unix``,
+``stage_windows``; both processes read the same wall clock). The client's per-stage peak is the
+larger of the command's own in-process peak (``stages_peak_rss_mb``, sampled every 50 ms, exact
+when the stage set the process's high-water mark) and the tree samples (which add child processes
+such as COLMAP)."""
 
 from __future__ import annotations
 
 import ctypes
 import sys
 import threading
+import time
+from bisect import bisect_left, bisect_right
+from typing import Any
 
 import psutil
 
@@ -64,20 +75,27 @@ def tree_rss_mb(pid: int) -> float:
     return total / 1e6
 
 
+Sample = tuple[float, float, float | None]  # (wall-clock time, client tree MB, server GB)
+
+
 class PeakSampler:
     """Samples, every ``every`` seconds until stopped, the resident set of a command's process
-    tree and the server's physical footprint; keeps the peaks."""
+    tree and the server's physical footprint; keeps the peaks and the timestamped samples."""
 
     def __init__(self, pid: int, server: int | None, every: float = 0.2) -> None:
         self.pid, self.server, self.every = pid, server, every
         self.client_peak_mb = 0.0
         self.server_peak_gb: float | None = None
+        self.samples: list[Sample] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def sample(self) -> None:
-        self.client_peak_mb = max(self.client_peak_mb, tree_rss_mb(self.pid))
+        t = time.time()
+        tree = tree_rss_mb(self.pid)
         fp = phys_footprint_gb(self.server) if self.server is not None else None
+        self.samples.append((t, tree, None if fp is None else fp[0]))
+        self.client_peak_mb = max(self.client_peak_mb, tree)
         if fp is not None:
             self.server_peak_gb = max(self.server_peak_gb or 0.0, fp[0])
 
@@ -92,3 +110,40 @@ class PeakSampler:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join()
+
+
+def _during(samples: list[Sample], windows: list[tuple[float, float]]) -> list[Sample]:
+    """The samples taken within any of ``windows``; a window shorter than the sampling period
+    (no sample inside) gets the samples just before and just after it."""
+    times = [s[0] for s in samples]
+    out: list[Sample] = []
+    for a, b in windows:
+        i, j = bisect_left(times, a), bisect_right(times, b)
+        out += samples[i:j] if j > i else samples[max(i - 1, 0):i] + samples[j:j + 1]
+    return out
+
+
+def stage_peaks(timings: dict[str, Any] | None, samples: list[Sample]
+                ) -> dict[str, dict[str, float | None]] | None:
+    """Per stage of one run (``timings``: its ``OH_MY_SLAM_TIMINGS`` record): seconds, the
+    client's peak resident set (MB) and the server's peak footprint (GB) while it ran; None when
+    the command records no timings."""
+    if not timings or not timings.get("stages_s"):
+        return None
+    own = timings.get("stages_peak_rss_mb") or {}
+    t0 = timings.get("t0_unix")
+    windows: dict[str, list[tuple[float, float]]] = {}
+    if isinstance(t0, int | float):
+        for name, a, b in timings.get("stage_windows") or []:
+            windows.setdefault(name, []).append((t0 + a, t0 + b))
+    ordered = sorted(timings["stages_s"], key=lambda k: min(
+        (w[0] for w in windows.get(k, [])), default=float("inf")))
+    out: dict[str, dict[str, float | None]] = {}
+    for name in ordered:
+        seen = _during(samples, windows.get(name, []))
+        client = max([float(own.get(name) or 0.0), *(s[1] for s in seen)])
+        server = [s[2] for s in seen if s[2] is not None]
+        out[name] = {"s": round(float(timings["stages_s"][name]), 3),
+                     "client_peak_mb": round(client, 1) if client > 0 else None,
+                     "server_peak_gb": round(max(server), 2) if server else None}
+    return out

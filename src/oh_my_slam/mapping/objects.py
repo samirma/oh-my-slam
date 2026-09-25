@@ -18,11 +18,15 @@ Semantics (spec §2.3):
 * **Latest wins across updates.** An update whose keyframes, as a whole, see through an object
   removes it or gives it a strike; an update that re-detects it or sees it in place clears its
   strikes (``_absence``). Keyframes of the same update never remove each other's objects.
-* **Ids** come from ``next_object_id`` and are never reused. The new objects of an update are
-  numbered in the order of their earliest keyframe — bookkeeping only, so that a sequence mapped in
-  one update or split over several in order gets the same ids. A merge keeps the lower id; merged
-  and removed ids disappear for good (merges are recorded in ``merged_into`` so old per-frame
-  instance files still resolve).
+* **Ids** come from ``next_object_id`` and are never reused. It counts the map's detections: the
+  detections of an update's keyframes are numbered in keyframe order, continuing the count, and a
+  new object takes the number of its first detection (earliest keyframe, then the detector's
+  order). Ids therefore have gaps, and they are bookkeeping only, but they depend on nothing
+  except which detections form the object — not on the unconfirmed candidates, merges or removals
+  of earlier updates — so a sequence mapped in one update or split over several in order gets the
+  same ids wherever it associates the same detections. A merge keeps the lower id; merged and
+  removed ids disappear for good (merges are recorded in ``merged_into`` so old per-frame instance
+  files still resolve).
 """
 
 from __future__ import annotations
@@ -464,10 +468,19 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
     ctx.meta["floor_z"] = state.floor_z
     old_ids = {o.id for o in state.objects}
 
-    # 1. every instance of the update, lifted into the map
+    # 1. every instance of the update, lifted into the map, with the number of its detection:
+    #    all detections of the update's keyframes (placed or not) in keyframe order, continuing
+    #    the map's count
+    first_new = state.next_id
+    first_number: dict[int, int] = {}
+    count = first_new
+    for nf in sorted(ctx.new, key=lambda nf: nf.kf.index):
+        first_number[nf.kf.index] = count
+        count += len(nf.dets)
     new_views: dict[int, tuple[Any, View]] = {}
     per_frame: dict[int, list[int]] = {}
     obs: list[Observation] = []
+    number: list[int] = []  # detection number per observation
     for nf in ctx.new:
         if nf.record is None or nf.depth is None:
             continue
@@ -478,10 +491,11 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
                                 valid=view.valid)
         per_frame[rec.index] = list(range(len(obs), len(obs) + len(insts)))
         obs.extend(Observation.of(rec.index, view, inst) for inst in insts)
+        rank = {id(det): j for j, det in enumerate(nf.dets)}
+        number.extend(first_number[nf.kf.index] + rank[id(inst.detection)] for inst in insts)
 
     # 2. group them (order-free) and fold each group into an existing or a new object; new
     #    objects get provisional ids >= first_new (content order) until their final numbering
-    first_new = state.next_id
     owner: list[int] = [0] * len(obs)  # object id per observation
     touched: set[int] = set()
     groups = _group(obs, state.objects)
@@ -528,21 +542,28 @@ def update_objects(ctx: Any, records: list[Any], progress: Any) -> ObjectState:
             tx.delete(points_file(oid))
     state.objects = [o for o in state.objects if o.id not in gone]
 
-    # 5. final ids of the new objects: order of their earliest keyframe (bookkeeping)
-    fresh = sorted((o for o in state.objects if o.id >= first_new),
-                   key=lambda o: (o.frames[0] if o.frames else -1, o.label, *o.centroid.tolist()))
-    rename = {o.id: first_new + k for k, o in enumerate(fresh)}
+    # 5. final ids of the new objects: the number of their first detection (bookkeeping)
+    def resolved(oid: int) -> int:
+        while oid in alias:
+            oid = alias[oid]
+        return oid
+
+    first_detection: dict[int, int] = {}
+    for i, oid in enumerate(owner):
+        k = resolved(oid)
+        first_detection[k] = min(first_detection.get(k, number[i]), number[i])
+    fresh = [o for o in state.objects if o.id >= first_new]
+    rename = {o.id: first_detection[o.id] for o in fresh}
     for o in fresh:
         o.id = rename[o.id]
-    state.next_id = first_new + len(fresh)
+    state.next_id = count
     for old, keeper in alias.items():
         if old < first_new:  # a stored id; its keeper has a lower id, so is stored too
             state.merged_into[old] = keeper
     touched = {rename.get(t, t) for t in touched if t not in alias and t not in gone}
 
     def final_id(oid: int) -> int:
-        while oid in alias:
-            oid = alias[oid]
+        oid = resolved(oid)
         if oid in gone:
             return 0 if oid >= first_new else oid  # a removed id resolves to nothing
         return rename.get(oid, oid)

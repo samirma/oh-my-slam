@@ -23,7 +23,12 @@ from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import captures_in
 from oh_my_slam.tools.evaluate.poses import capture_poses, capture_sources, pose_metrics
 from oh_my_slam.tools.evaluate.scene import DocObject, pitch_deg, yaw_deg
-from oh_my_slam.tools.evaluate.segmentation import map_agreement, paired_labels
+from oh_my_slam.tools.evaluate.segmentation import (
+    MAP_CONSISTENCY,
+    MAP_CONSISTENCY_METRICS,
+    map_consistency,
+    paired_labels,
+)
 
 SEQUENCE = Path(__file__).resolve().parents[2] / "examples" / "ainex-captures"
 K = Intrinsics(100.0, 100.0, 80.0, 60.0, 160, 120, "given")
@@ -210,6 +215,25 @@ def test_split_map_objects_are_matched_after_pose_alignment() -> None:
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1), (2, 7), (3, 3)}
 
 
+def test_overlapping_objects_of_different_labels_are_not_swapped() -> None:
+    """A desk and the carpet under it, both in both maps with the same ids, but the split map's
+    boxes are shifted so that each overlaps the other label's box of the one-update map more than
+    its own. Labels break that tie; an object whose label changed still pairs with its box."""
+    def pair_ids(a: list[DocObject], b: list[DocObject]) -> set[tuple[int, int]]:
+        ab = [(o, o.obb()) for o in a]
+        bb = [(o, o.obb()) for o in b]
+        return {(a[i].id, b[j].id) for i, j, _, _ in match_objects(ab, bb)}  # type: ignore[arg-type]
+
+    single = [box(2, "desk", (0.0, 0, 0)), box(35, "carpet", (0.2, 0, 0))]
+    split = [box(2, "desk", (0.15, 0, 0)), box(35, "carpet", (0.05, 0, 0))]
+    assert pair_ids(single, split) == {(2, 2), (35, 35)}
+    relabelled = [box(2, "table", (0.15, 0, 0)), box(35, "carpet", (0.05, 0, 0))]
+    assert pair_ids(single, relabelled) == {(2, 2), (35, 35)}
+    # geometry alone decides between two objects whose labels both changed
+    both = [box(2, "lamp", (0.02, 0, 0)), box(35, "cup", (0.18, 0, 0))]
+    assert pair_ids(single, both) == {(2, 2), (35, 35)}
+
+
 def test_far_apart_boxes_are_not_matched() -> None:
     a = [(o, o.obb()) for o in [box(1, "chair", (0, 0, 0))]]
     b = [(o, o.obb()) for o in [box(1, "chair", (3, 0, 0))]]
@@ -228,7 +252,7 @@ def test_label_pairing_prefers_identical_labels() -> None:
     assert paired_labels([], ["cup"]) == 0
 
 
-def test_segmentation_agrees_with_the_objects_the_map_observed_per_frame() -> None:
+def test_segmentation_is_consistent_with_the_objects_the_map_observed_per_frame() -> None:
     map_objs = [DocObject(1, "chair", 0.9, None, None, None, frozenset({0, 1})),
                 DocObject(2, "sofa", 0.9, None, None, None, frozenset({1})),
                 DocObject(3, "plant", 0.9, None, None, None, frozenset({5}))]
@@ -236,8 +260,10 @@ def test_segmentation_agrees_with_the_objects_the_map_observed_per_frame() -> No
               "b.jpg": [DocObject(1, "couch", 0.7, None, None, None),
                         DocObject(2, "cup", 0.6, None, None, None)]}
     m = Metrics()
-    rows = map_agreement(m, "seg.map", frames, map_objs, {0: "a.jpg", 1: "b.jpg", 5: "c.jpg"})
+    rows = map_consistency(m, MAP_CONSISTENCY, frames, map_objs,
+                           {0: "a.jpg", 1: "b.jpg", 5: "c.jpg"})
     # frame a: chair ↔ chair; frame b: {chair, sofa} vs {couch, cup} → sofa ~ couch
-    assert m.items["seg.map.recall"].value == pytest.approx(2 / 3)
-    assert m.items["seg.map.precision"].value == pytest.approx(2 / 3)
+    assert set(m.items) == {f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS}
+    assert m.items["seg.map_consistency.map_objects_detected"].value == pytest.approx(2 / 3)
+    assert m.items["seg.map_consistency.detections_in_map"].value == pytest.approx(2 / 3)
     assert [r["paired"] for r in rows] == [1, 1]

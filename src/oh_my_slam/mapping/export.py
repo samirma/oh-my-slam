@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.log import json_payload_bytes
@@ -135,13 +136,17 @@ def keyframe_labels(reader: store.MapReader, state: ObjectState) -> list[Keyfram
     return out
 
 
-def scene_bytes(reader: store.MapReader) -> bytes:
+def scene_bytes(reader: store.MapReader, tool: str | None = None) -> bytes:
     """The map's scene JSON (``segment.sh -m``, ``view.sh -m``), built from its persisted state by
     the code that wrote ``scene.json``, rather than read back from that file: the object colours
     are a pure function of the ids *now* (§2.4), so they agree with the PLY, ``segmented.png`` and
-    catalogue derived in the same run even for a map written before a palette change."""
+    catalogue derived in the same run even for a map written before a palette change. ``tool``
+    replaces the ``metadata.tool`` of the producing command (``mapper``)."""
     _, objs = map_objects(reader)
-    return json_payload_bytes(full_scene(reader.root, reader.meta, reader.frames, objs))
+    doc = full_scene(reader.root, reader.meta, reader.frames, objs)
+    if tool is not None:
+        doc["openlabel"]["metadata"]["tool"] = tool
+    return json_payload_bytes(doc)
 
 
 def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudAttrs,
@@ -153,12 +158,13 @@ def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudA
 
     reader = store.MapReader(map_dir)
     state, objs = map_objects(reader)
-    scene = scene_bytes(reader)
+    scene = scene_bytes(reader, tool="segment")
     ply = cloud_ply(reader_source(reader, objs), attrs) \
         if want_ply or artifacts_dir is not None else None
     if artifacts_dir is not None:
         assert ply is not None
-        sheet = export_map(objs, keyframe_labels(reader, state)).segmented
-        write_artifacts(artifacts_dir, scene, sheet, objs, ply,
-                        title=f"Objects in map {reader.root.name}")
+        with timing.stage("artifacts"):
+            sheet = export_map(objs, keyframe_labels(reader, state)).segmented
+            write_artifacts(artifacts_dir, scene, sheet, objs, ply,
+                            title=f"Objects in map {reader.root.name}")
     return scene, ply

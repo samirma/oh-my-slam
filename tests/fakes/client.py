@@ -40,13 +40,17 @@ class FakeFrame:
 
 
 class FakeClient:
-    def __init__(self, depth_scale: float = 1.0, down: bool = False) -> None:
+    def __init__(self, depth_scale: float = 1.0, down: bool = False,
+                 mv_noise: tuple[float, float] = (0.0, 0.0)) -> None:
+        """``mv_noise``: (degrees, metres) of random error on each multi-view pose that is not
+        given as an anchor (MapAnything's rotations and centres are not exact)."""
         self.frames: dict[str, FakeFrame] = {}
         self._alias: dict[str, str] = {}
         self._thumbs: dict[str, NDArray[np.float32]] = {}
         self.calls: Counter[str] = Counter()
         self.depth_scale = depth_scale
         self.down = down
+        self.mv_noise = mv_noise
 
     def add(self, path: Path, rgb: NDArray[np.uint8], frame: FakeFrame) -> Path:
         if path.suffix == ".png":
@@ -153,9 +157,24 @@ class FakeClient:
     def multiview(self, req: p.MultiviewRequest) -> p.MultiviewResponse:
         self.calls["multiview"] += 1
         views = []
-        for path in req.image_paths:
+        for i, path in enumerate(req.image_paths):
             f = self._get(path)
             pose = f.pose or Pose.identity()
+            anchor = req.poses is not None and req.poses[i] is not None
+            if any(self.mv_noise) and not anchor:
+                pose = _perturbed(pose, *self.mv_noise, seed=self.calls["multiview"] * 1000 + i)
             views.append(p.MultiviewView(pose=pose.matrix().tolist(), intrinsics=f.K.K().tolist(),
                                          width=f.K.width, height=f.K.height))
         return p.MultiviewResponse(views=views)
+
+
+def _perturbed(pose: Pose, deg: float, metres: float, seed: int) -> Pose:
+    from oh_my_slam.core.geometry import quat_to_rot
+
+    rng = np.random.default_rng(seed)
+    axis = rng.normal(size=3)
+    axis /= np.linalg.norm(axis)
+    half = np.radians(deg) / 2
+    R = quat_to_rot(np.r_[axis * np.sin(half), np.cos(half)])
+    t = rng.normal(size=3)
+    return Pose(R @ pose.R, pose.t + t / np.linalg.norm(t) * metres)

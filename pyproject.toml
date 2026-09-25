@@ -108,7 +108,7 @@ timeout = 600
 markers = [
     "models: needs the real inference server and model weights",
     "browser: needs Chrome through Playwright",
-    "eval: needs evaluation datasets in ~/oh-my-slam-data",
+    "eval: runs the spec §5 evaluator end to end (real server and weights, ~10 min on the GPU)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 

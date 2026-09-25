@@ -267,7 +267,7 @@ The same source and attributes always give byte-identical files.
   error.
 * **stderr** gets everything human-facing. Log lines start with `[oh-my-slam]`, and errors look
   like `<command>: error: …`.
-* **Timing summary.** `reconstruct.sh`, `segment.sh -i` and `mapper.sh update` each log a
+* **Timing summary.** `reconstruct.sh`, `segment.sh` and `mapper.sh update` each log a
   one-line `timings:` summary.
 * **stdout of the other commands.** `view.sh` writes nothing to stdout. `--status` writes the
   health JSON.
@@ -317,7 +317,7 @@ quaternions.
 
 | Field | Single image | Map |
 |---|---|---|
-| `metadata` | `schema_version` `"1.0.0"`, `schema_url` `https://openlabel.asam.net/V1-0-0/schema/openlabel_json_schema.json`, `name` (file name), `annotator` `"oh-my-slam <version>"`, `tagged_file`, `tool` (`reconstruct`, `segment` or `view`), `intrinsics_source` (`exif` or `model`), `depth_grid`, `gravity` (`up_cam`, source, uncertainties, floor height) | The same base fields, with `tool` `"mapper"`, plus `map_frame`, `scale` (SfM → metric), `update_count`, `keyframes`, `floor_z`, and `scope: "single"` for `-t single` |
+| `metadata` | `schema_version` `"1.0.0"`, `schema_url` `https://openlabel.asam.net/V1-0-0/schema/openlabel_json_schema.json`, `name` (file name), `annotator` `"oh-my-slam <version>"`, `tagged_file`, `tool` (`reconstruct`, `segment` or `view`), `intrinsics_source` (`exif` or `model`), `depth_grid`, `gravity` (`up_cam`, source, uncertainties, floor height) | The same base fields, with `tool` `"mapper"` (`"segment"` in the output of `segment.sh -m`), plus `map_frame`, `scale` (SfM → metric), `update_count`, `keyframes`, `floor_z`, and `scope: "single"` for `-t single` |
 | `ontologies` | `"0"`: `uri` `https://www.lvisdataset.org/`, `boundary_list` (vocabulary ∪ labels found), `boundary_mode` `include` | the same |
 | `coordinate_systems` | `camera`: `sensor_cs`, root | `map`: `scene_cs`, root, `axes` `"x-forward,y-left,z-up"`, `gravity_aligned`, `units` `"m"`; one `camera_<id>` `sensor_cs` child per COLMAP camera |
 | `streams` | `camera`: `intrinsics_pinhole` (`width_px`, `height_px`, 3×4 `camera_matrix`, zero `distortion_coeffs`), `intrinsics_source`, `uri` | `camera_<id>`, the same fields (full-resolution intrinsics; source `colmap` once SfM has refined them) |
@@ -537,6 +537,7 @@ at the Python-module level:
 ```sh
 uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--targets PATH] [--baseline PATH] \
                                            [--set-baseline] [--splits N]
+uv run python -m oh_my_slam.tools.evaluate --resummarise DIR|latest [--set-baseline]
 ```
 
 A single command benchmarks every entry point on `examples/`, strictly one command at a time
@@ -554,18 +555,44 @@ are:
 
 | Group | Measures |
 |---|---|
-| `perf.*` | Wall time, client and server peak memory, and `view.sh` time to the rendered page. |
+| `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
 | `map.*` | Frame agreement over overlapping keyframes, and the stability of ids, labels and OBBs between the one-update and the split map. |
-| `seg.*` | Detections per frame, and segmentation compared with the map's objects. |
-| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. |
-| `gt.*` | Ground truth, when annotations exist. |
+| `seg.*` | Detections per frame. |
+| `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
+| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `gt.*` | Accuracy against ground truth, when annotations exist. |
+
+Per-stage memory comes from two sources. Each command records its stages (`core.timing`), and
+the peak resident set of its own process during each stage, sampled every 50 ms. It writes these
+to `OH_MY_SLAM_TIMINGS`, and a map update also keeps them in `map.json → updates[].timings`. The
+server reports no memory of its own, so the evaluator samples two figures every 0.2 s: the
+command's process tree, which includes COLMAP, and the server's physical footprint. It
+attributes each sample to the stage whose time window it falls in.
 
 Targets are data in `examples/targets.json`. Each target is an `op`/`value` pair with regression
-tolerances, and a target can be edited without changing code. Each run is also compared with
-the stored baseline `~/oh-my-slam-data/evaluations/baseline.json` (`--set-baseline` stores the
-current run there), and regressions are flagged. Ground-truth files dropped into
+tolerances, and a target can be edited without changing code. The file's `rationale` explains
+each group of targets. Each metric's `measured` value is the reference run the targets were
+derived from, and the evaluator ignores it. Ground-truth files dropped into
 `examples/ground_truth/` are picked up without code changes (see its `README.md`).
+
+Each run is compared with the stored baseline `~/oh-my-slam-data/evaluations/baseline.json`,
+and regressions are flagged. Without a baseline the report says `baseline missing — not
+compared`, and `summary.regressions` in `result.json` is `null`. For each failed or regressed
+metric, the summary's `why` column gives the error, the value against the target, or the change
+from the baseline and the tolerance it exceeded.
+
+To keep a finished run as the baseline, either pass `--set-baseline` to the run itself or store
+it afterwards:
+
+```sh
+uv run python -m oh_my_slam.tools.evaluate --resummarise latest --set-baseline
+```
+
+`--resummarise DIR|latest` runs nothing. It judges the values of a stored run (`latest` is the
+newest `<UTC>` folder) against the current targets and baseline again, and rewrites its
+`result.json` and `summary.md`. Use it after editing the targets, or with `--set-baseline` to
+store that run as the baseline.
 
 Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by default:
 
@@ -578,7 +605,8 @@ Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by 
 The command prints the path of `summary.md` on stdout. It exits 0 when every metric passes, 1
 when one fails, and 2 on a usage error. It needs the model weights. It also needs Microsoft Edge
 or Google Chrome for Playwright's page timing. Run it on an otherwise idle machine, because
-concurrent GPU work invalidates timings.
+concurrent GPU work invalidates timings. `OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m eval`
+runs it end to end as a test.
 
 ## Development
 
@@ -591,9 +619,8 @@ uv run ruff check . && uv run mypy src && uv run lint-imports         # lint, ty
 ```
 
 The offline suite runs against a deterministic stub server. The mapping end-to-end tests are
-skipped when `colmap` is not installed. The `eval` marker is declared in `pyproject.toml` but no
-test uses it yet. `python -m oh_my_slam.tools.cloud_quality --map DIR` prints the cloud
-layering and frame-agreement metrics that the evaluator uses.
+skipped when `colmap` is not installed. The `eval` marker selects the evaluator's end-to-end run
+(see [Benchmark evaluator](#benchmark-evaluator)).
 
 Environment variables:
 
@@ -601,7 +628,7 @@ Environment variables:
 |---|---|
 | `OH_MY_SLAM_DEVICE=cpu\|mps` | Selects the server's device. |
 | `OH_MY_SLAM_FEATURES=sift\|aliked` | COLMAP features for mapping (default `sift`). |
-| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh -i` or `mapper.sh update` there. Each map update also keeps its record in `map.json → updates[].timings`. |
+| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` there: stage times, per-stage peak resident set and stage time windows. Each map update also keeps its record in `map.json → updates[].timings`. |
 | `OH_MY_SLAM_DEBUG=1` | Prints tracebacks for internal errors. |
 | `OH_MY_SLAM_LOG=DEBUG` | Sets the log level. |
 | `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch). |
