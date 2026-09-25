@@ -6,7 +6,9 @@ adjustment run through pycolmap on the same database. Both must be 4.2.x.
 
 New map: global mapping (GLOMAP) → incremental if < 60 % placed → multi-view (MapAnything)
 poses refined with the verified matches and monocular depth (``panorama``) + triangulation.
-Rotation-dominant input goes straight to the multi-view path.
+Rotation-dominant input goes straight to the multi-view path. SfM poses without triangulated
+support are not accepted (``vet``); the mapper then joins what the main reconstruction lacks or
+got wrong in scale or tilt (``mapping.trajectory``).
 Update: incremental mapping with the existing frames fixed; keyframes it cannot place (all of
 them for rotation-dominant input) get anchored, refined multi-view poses.
 """
@@ -88,10 +90,33 @@ class SfmModel:
     rec: Any  # pycolmap.Reconstruction
     method: str
     notes: dict[str, Any] = field(default_factory=dict)
+    # the mapper's other reconstructions (its own frames each; they may share keyframes)
+    others: list[Any] = field(default_factory=list)
 
     @property
     def registered(self) -> list[str]:
         return sorted(im.name for im in self.rec.images.values() if im.has_pose)
+
+    def supported(self, min_points: int) -> set[str]:
+        """Registered keyframes with at least ``min_points`` triangulated observations."""
+        return {im.name for im in self.rec.images.values()
+                if im.has_pose and im.num_points3D >= min_points}
+
+    def covisibility(self) -> dict[frozenset[str], int]:
+        """Triangulated points shared by each pair of registered keyframes."""
+        name = {im.image_id: im.name for im in self.rec.images.values() if im.has_pose}
+        out: Counter[frozenset[str]] = Counter()
+        for p in self.rec.points3D.values():
+            ids = sorted({el.image_id for el in p.track.elements if el.image_id in name})
+            for i, a in enumerate(ids):
+                for b in ids[i + 1:]:
+                    out[frozenset((name[a], name[b]))] += 1
+        return dict(out)
+
+    def deregister(self, names: set[str]) -> None:
+        for n in sorted(names):
+            if self.rec.find_image_with_name(n) is not None:
+                self.rec.deregister_frame(self.rec.find_image_with_name(n).frame_id)
 
     def pose(self, name: str) -> Pose:
         """Camera-to-world (model frame)."""
@@ -162,6 +187,29 @@ class SfmModel:
 
 FIXED_ROT_TOL_DEG = 2.0
 FIXED_POS_TOL = 0.05  # of the fixed frames' spread
+
+
+def vet(model: SfmModel, rotation_pairs: set[frozenset[str]]) -> dict[str, list[str]]:
+    """Deregister the keyframes whose SfM pose nothing supports: fewer than
+    ``trajectory.SUPPORT_MIN_POINTS`` triangulated observations (a part of the view graph that the
+    global mapper shrank onto one centre, or a keyframe it registered with next to no points). The
+    unsupported keyframes that also collapsed onto another keyframe's centre (``trajectory.
+    collapsed_keyframes``) are listed apart. Returns both lists (names)."""
+    from oh_my_slam.mapping import trajectory as traj
+
+    names = model.registered
+    supported = model.supported(traj.SUPPORT_MIN_POINTS)
+    unsupported = set(names) - supported
+    if not unsupported:
+        return {"unsupported": [], "collapsed": []}
+    poses = {n: model.pose(n) for n in names}
+    radius = traj.collapse_radius(poses, names, supported)
+    collapsed = traj.collapsed_keyframes(poses, supported, radius, rotation_pairs)
+    model.deregister(unsupported)
+    log.warning("%s: %d keyframes registered without support (< %d points) are not accepted as "
+                "posed%s", model.method, len(unsupported), traj.SUPPORT_MIN_POINTS,
+                f", {len(collapsed)} of them collapsed onto one camera centre" if collapsed else "")
+    return {"unsupported": sorted(unsupported), "collapsed": sorted(collapsed)}
 
 
 def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
@@ -286,6 +334,28 @@ class Sfm:
                 "rotation_fraction": rot / total if total else 0.0,
                 "planar_fraction": configs[_PLANAR] / total if total else 0.0}
 
+    def verified_pairs(self, min_inliers: int = 15) -> dict[frozenset[str], tuple[int, int]]:
+        """(inlier matches, two-view configuration) of every verified image pair."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            id_name = {im.image_id: im.name for im in db.read_all_images()}
+            pair_ids, geoms = db.read_two_view_geometries()
+        finally:
+            db.close()
+        out = {}
+        for pid, g in zip(pair_ids, geoms, strict=True):
+            a, b = pycolmap.pair_id_to_image_pair(int(pid))
+            if len(g.inlier_matches) >= min_inliers and a in id_name and b in id_name:
+                out[frozenset((id_name[a], id_name[b]))] = (len(g.inlier_matches), int(g.config))
+        return out
+
+    def rotation_pairs(self, min_inliers: int = 15) -> set[frozenset[str]]:
+        """Verified pairs whose two-view geometry is a pure rotation (panoramic)."""
+        return {p for p, (_, c) in self.verified_pairs(min_inliers).items()
+                if c in (_PANORAMIC, _PLANAR_OR_PANORAMIC)}
+
     def match_graph(self, min_inliers: int = 15) -> dict[str, set[str]]:
         """Adjacency of verified image pairs (by image name)."""
         import pycolmap
@@ -364,7 +434,14 @@ class Sfm:
         opts.num_threads = -1
         recs = pycolmap.global_mapping(str(self.db), str(self.image_dir), str(out), opts)
         rec = self._largest(recs)
-        return None if rec is None else SfmModel(rec, "sfm-global")
+        return None if rec is None else self._with_others(SfmModel(rec, "sfm-global"), recs)
+
+    @staticmethod
+    def _with_others(model: SfmModel, recs: dict[int, Any]) -> SfmModel:
+        model.others = [r for r in recs.values() if r is not model.rec]
+        model.notes["reconstructions"] = sorted((r.num_reg_images() for r in recs.values()),
+                                                reverse=True)
+        return model
 
     def map_incremental(self, out: Path, input_path: Path | None = None,
                         fix_existing: bool = False) -> SfmModel | None:
@@ -379,7 +456,8 @@ class Sfm:
                                             input_path=str(input_path) if input_path else "")
         if not input_path:
             rec = self._largest(recs)
-            return None if rec is None else SfmModel(rec, "sfm-incremental")
+            return None if rec is None else self._with_others(SfmModel(rec, "sfm-incremental"),
+                                                              recs)
         base = SfmModel(pycolmap.Reconstruction(str(input_path)), "input")
         rec = self._largest(recs, set(base.registered))
         return None if rec is None else _back_onto(SfmModel(rec, "sfm-incremental"), base)
