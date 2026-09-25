@@ -20,9 +20,9 @@ Semantics (spec §2.3):
 * **Boxes** are fitted (by segmentation) to the points of the sightings that agree with each
   other (``fit_points``): monocular depth of small objects varies between keyframes, and the union
   of inconsistent sightings is a streak along the viewing rays, not the object.
-* **Keyframes re-scaled by a later update.** An update adjusts the depth scale of every keyframe
-  of the map (``mapping.api._adjust_depth_scales``: a loop it closes spreads over the whole loop);
-  the objects of the stored keyframes it re-scales move with them (``rescale_objects``).
+* **Keyframes re-scaled by a later update.** An update adjusts the depth of every keyframe of the
+  map (``mapping.api._adjust_depth_scales``: a loop it closes spreads over the whole loop); the
+  objects of the stored keyframes it corrects move with them (``rescale_objects``).
 * **Latest wins across updates.** An update whose keyframes, as a whole, see through an object
   removes it or gives it a strike; an update that re-detects it or sees it in place clears its
   strikes (``_absence``). Keyframes of the same update never remove each other's objects.
@@ -86,6 +86,7 @@ from oh_my_slam.mapping.validity import (
     tau,
     well_registered,
 )
+from oh_my_slam.reconstruction.depth import DepthCorrection
 from oh_my_slam.reconstruction.gravity import floor_candidate_height
 from oh_my_slam.segmentation.api import (
     OBB,
@@ -799,14 +800,15 @@ def _instances_json(frame_items: list[tuple[int, LiftedInstance]]) -> dict[str, 
     ]}
 
 
-def rescale_objects(state: ObjectState, rescaled: dict[int, float], records: list[Any]
+def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], records: list[Any]
                     ) -> set[int]:
-    """Move the stored objects with the stored keyframes whose depth this update re-scaled
-    (``rescaled``: keyframe index -> factor; ``mapping.api._adjust_depth_scales``): each
-    sighting scales about its keyframe's camera centre by that keyframe's factor; the points —
-    which do not record their keyframe — scale about the sightings' mean camera centre by the
-    sightings' mean factor (geometric, weighted by their points; keyframes not re-scaled count
-    as 1), and the box is refitted. Returns the ids of the objects that moved."""
+    """Move the stored objects with the stored keyframes whose depth this update corrected
+    (``rescaled``: keyframe index -> correction; ``mapping.api._adjust_depth_scales``): each
+    sighting's centroid and bounds move along their viewing rays, about their keyframe's camera
+    centre, by that keyframe's factor at their depth; the points — which do not record their
+    keyframe — scale about the sightings' mean camera centre by the sightings' mean factor at
+    their centroids (geometric, weighted by their points; keyframes not corrected count as 1),
+    and the box is refitted. Returns the ids of the objects that moved."""
     moved: set[int] = set()
     if not rescaled:
         return moved
@@ -817,18 +819,19 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, float], records: lis
         out, logs, weights, centres = [], [], [], []
         for s in o.sightings:
             T = poses.get(s.frame)
-            c = rescaled.get(s.frame, 1.0) if T is not None else 1.0
+            corr = rescaled.get(s.frame) if T is not None else None
             if T is not None:
                 centres.append(T.t)
+                c = 1.0 if corr is None else _factor_at(corr, T, s.centroid)
                 logs.append(np.log(c))
                 weights.append(float(max(s.points, 1)))
-            if c == 1.0 or T is None:
+            if corr is None or T is None:
                 out.append(s)
                 continue
 
-            def moved_to(v: tuple[float, float, float], C: NDArray[Any] = T.t, c: float = c
-                         ) -> tuple[float, float, float]:
-                w = C + c * (np.asarray(v, np.float64) - C)
+            def moved_to(v: tuple[float, float, float], T: Pose = T,
+                         corr: DepthCorrection = corr) -> tuple[float, float, float]:
+                w = T.t + _factor_at(corr, T, v) * (np.asarray(v, np.float64) - T.t)
                 return (float(w[0]), float(w[1]), float(w[2]))
             out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
                                 moved_to(s.lo), moved_to(s.hi)))
@@ -842,6 +845,12 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, float], records: lis
         refit(o, state.floor_z)
         moved.add(o.id)
     return moved
+
+
+def _factor_at(corr: DepthCorrection, T: Pose, p: Any) -> float:
+    """``corr``'s depth factor at map point ``p`` seen from camera ``T`` (its z-depth there)."""
+    z = float((np.asarray(p, np.float64) - T.t) @ T.R[:, 2])
+    return float(corr.factor(np.array([z]))[0])
 
 
 def update_objects(ctx: Any, records: list[Any], progress: Any,
