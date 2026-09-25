@@ -1,6 +1,7 @@
 """Evaluator metrics on synthetic data: yaw alignment and wrap, pitch direction, registration,
-same-heading depth agreement, one-update vs split object stability (label agreement on a
-label-blind pairing), near-duplicate objects, segmentation vs map."""
+same-heading and all-pairs depth agreement, one-update vs split object stability (label agreement
+on a label-blind pairing), near-duplicate objects, cloud points outside their object's box,
+segmentation vs map."""
 
 from __future__ import annotations
 
@@ -18,10 +19,13 @@ from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.obb import OBB
 from oh_my_slam.tools.evaluate.mapquality import (
     NEAR_DUPLICATE_GAP_M,
+    OUT_OF_BOX_MARGIN_M,
     agreement_metrics,
     box_gap,
     duplicate_metrics,
     match_objects,
+    out_of_box_metrics,
+    overlapping_pairs,
     split_alignment,
     stability_metrics,
 )
@@ -182,6 +186,41 @@ def test_depth_agreement_needs_a_registered_pair(captures: list, tmp_path: Path)
     assert "not registered" in (m.items["map.t.frame_agreement_median_pct"].error or "")
 
 
+def sphere_depth(radius: float = 2.0) -> np.ndarray:
+    """z-depth of a sphere around the camera centre: every rotation of the camera agrees."""
+    v, u = np.mgrid[0:K.height, 0:K.width]
+    x, y = (u - K.cx) / K.fx, (v - K.cy) / K.fy
+    return (radius / np.sqrt(1.0 + x * x + y * y)).astype(np.float32)
+
+
+def test_all_overlapping_pairs_agreement(captures: list, tmp_path: Path) -> None:
+    """Two laps of a head turning in place (12° steps, the second lap offset by 5°) inside a
+    sphere; the last 10 keyframes place it 15 % further (a depth scale that drifted). Every pair
+    less than 30° apart and more than 10 keyframes apart is compared — loop closures included."""
+    yaws = [12.0 * k for k in range(30)] + [12.0 * k + 5.0 for k in range(30)]
+    recs = [record(i, captures[i % len(captures)].name, cam(y)) for i, y in enumerate(yaws)]
+    depths = {r.name: sphere_depth() * (1.15 if r.index >= 50 else 1.0) for r in recs}
+    write_map(tmp_path, recs, depths)
+    pairs = overlapping_pairs(recs)
+    assert all(b.index - a.index > 10 for a, b in pairs)
+    assert (recs[0], recs[29]) in pairs  # the first lap closes on itself (12° apart)
+    assert (recs[0], recs[1]) not in pairs and (recs[0], recs[2]) not in pairs
+    m = Metrics()
+    worst = agreement_metrics(m, "map.t", tmp_path, captures)
+    drifted = sum(1 for a, b in pairs if (a.index >= 50) != (b.index >= 50))
+    median = m.items["map.t.frame_agreement_pairs_median_pct"]
+    detail = median.detail
+    assert detail["pairs"] == len(pairs) and 0 < drifted < len(pairs) / 2
+    assert median.value == pytest.approx(0.0, abs=0.2)  # float16 depth storage
+    over = m.items["map.t.frame_agreement_pairs_over10_pct"].value
+    assert over == pytest.approx(100.0 * drifted / len(pairs), abs=0.01)
+    # |1/1.15 - 1| = 13.0 % for every pair of a drifted and an undrifted keyframe
+    assert worst[0]["median_pct"] == pytest.approx(13.04, abs=0.1)
+    assert m.items["map.t.frame_agreement_pairs_p90_pct"].value == pytest.approx(
+        13.04 if drifted / len(pairs) > 0.1 else 0.0, abs=0.2)
+    assert set(detail["same_heading"]) >= {"001_bootstrap_level.jpg~053_right_to_000_level.jpg"}
+
+
 def box(oid: int, label: str, centre: tuple[float, float, float],
         size: tuple[float, float, float] = (0.6, 0.4, 0.9), yaw: float = 0.0) -> DocObject:
     return DocObject(oid, label, 0.9, None, None,
@@ -311,6 +350,51 @@ def test_near_duplicates_are_compatible_objects_never_seen_together_close_by() -
     # overlapping boxes of compatible labels (a cup and a mug) are counted too
     m = Metrics()
     assert len(duplicate_metrics(m, "m", [obj(1, "cup", 1.0, {1}), obj(2, "mug", 1.1, {2})])) == 1
+
+
+def test_near_duplicates_count_pieces_of_one_surface_labelled_differently() -> None:
+    """A counter top mapped as a desk and, from the far side of a loop, as a rug: both surface
+    labels, never seen together, tops at about one height. A rug on the floor under a desk, or
+    a cabinet next to it, is not a duplicate."""
+    def obj(oid: int, label: str, centre: tuple[float, float, float],
+            size: tuple[float, float, float], frames: set[int]) -> DocObject:
+        d = box(oid, label, centre, size)
+        return DocObject(d.id, d.label, d.score, None, None, d.cuboid, frozenset(frames))
+
+    desk = obj(2, "desk", (0.46, -0.42, -0.29), (1.55, 0.76, 0.17), {0, 1, 2})
+    corner = obj(79, "rug", (-0.45, -0.45, -0.39), (0.43, 0.12, 0.08), {27, 72})
+    m = Metrics()
+    (row,) = duplicate_metrics(m, "m", [desk, corner])
+    assert row["ids"] == [2, 79] and row["labels"] == ["desk", "rug"]
+    floor_rug = obj(81, "rug", (0.3, -0.42, -1.3), (1.5, 1.0, 0.03), {27, 74})
+    cabinet = obj(90, "cabinet", (-0.45, -0.45, -0.39), (0.43, 0.12, 0.08), {27, 72})
+    for other in (floor_rug, cabinet):
+        m = Metrics()
+        assert duplicate_metrics(m, "m", [desk, other]) == []
+
+
+def test_cloud_points_outside_their_object_box(tmp_path: Path) -> None:
+    from oh_my_slam.core.ply import PointCloud, ply_bytes
+
+    rng = np.random.default_rng(0)
+    desk = box(2, "desk", (0.0, 0.0, 0.7), (1.2, 0.6, 0.1))
+    cup = box(5, "cup", (2.0, 0.0, 0.8), (0.1, 0.1, 0.1))
+    on_desk = rng.uniform(-0.5, 0.5, (900, 3)) * (1.2, 0.6, 0.1) + (0.0, 0.0, 0.7)
+    floor = rng.uniform(-0.5, 0.5, (100, 3)) * (1.0, 1.0, 0.0) + (0.0, 2.0, 0.0)
+    near = on_desk[:50].copy()
+    near[:, 2] = 0.75 + OUT_OF_BOX_MARGIN_M - 0.01  # above the top, within the margin
+    cup_pts = rng.uniform(-0.05, 0.05, (60, 3)) + (2.0, 0.0, 0.8)
+    grey = rng.uniform(-1, 1, (200, 3))
+    xyz = np.concatenate([on_desk, floor, near, cup_pts, grey])
+    labels = np.concatenate([np.full(900 + 100 + 50, 2), np.full(60, 5), np.zeros(200)])
+    (tmp_path / "cloud.ply").write_bytes(ply_bytes(PointCloud(xyz, np.zeros_like(xyz, np.uint8))))
+    np.save(tmp_path / "cloud_objects.npy", labels.astype(np.int32))
+    write_map(tmp_path, [record(0, "001_bootstrap_level.jpg", cam(0.0))])
+    m = Metrics()
+    rows = out_of_box_metrics(m, "map.t", tmp_path, [desk, cup])
+    assert m.items["map.t.out_of_box_share"].value == pytest.approx(100 / 1050, abs=1e-4)
+    assert rows[0]["id"] == 2 and rows[0]["points"] == 1050
+    assert rows[1] == {"id": 5, "label": "cup", "points": 60, "outside_share": 0.0}
 
 
 def test_far_apart_boxes_are_not_matched() -> None:

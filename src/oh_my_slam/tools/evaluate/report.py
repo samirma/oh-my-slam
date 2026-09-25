@@ -315,6 +315,20 @@ def _details(details: dict[str, Any]) -> list[str]:
                                                           "centre distance m"],
                 [[" / ".join(map(str, r["ids"])), " / ".join(r["labels"]), r["gap_m"],
                   r["centre_distance_m"]] for r in rows])
+    for name in ("single", "split"):
+        rows = details.get(f"map.{name}.pairs")
+        if rows:
+            out += _section(
+                f"Least consistent overlapping keyframe pairs — {name} map",
+                ["captures", "median disagreement %", "p90 %"],
+                [[r["pair"], r["median_pct"], r["p90_pct"]] for r in rows])
+    for name in ("single", "split"):
+        rows = [r for r in details.get(f"map.{name}.out_of_box") or [] if r["outside_share"] > 0]
+        if rows:
+            out += _section(
+                f"Cloud points outside their object's box — {name} map",
+                ["id", "label", "points", "share outside"],
+                [[r["id"], r["label"], r["points"], r["outside_share"]] for r in rows[:10]])
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
     return out

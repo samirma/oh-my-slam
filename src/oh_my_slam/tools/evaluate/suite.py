@@ -47,9 +47,11 @@ from oh_my_slam.tools.evaluate.contracts import (
 from oh_my_slam.tools.evaluate.mapquality import (
     AGREEMENT_METRICS,
     DUPLICATE_METRIC,
+    OUT_OF_BOX_METRIC,
     STABILITY_METRICS,
     agreement_metrics,
     duplicate_metrics,
+    out_of_box_metrics,
     split_alignment,
     stability_metrics,
 )
@@ -90,7 +92,8 @@ def expected_ids() -> list[str]:
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
-    ids += [f"map.{mp}.{k}" for mp in MAPS for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC)]
+    ids += [f"map.{mp}.{k}" for mp in MAPS
+            for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, OUT_OF_BOX_METRIC)]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
     ids += [mid for mid, *_ in ContractLog().results()]
     return [*ids, "contract.exit_codes"]
@@ -339,7 +342,8 @@ class Evaluation:
                 if doc is None:
                     self.metrics.fail(ids, f"the {name} map was not built")
                 else:
-                    agreement_metrics(self.metrics, f"map.{name}", dirs[name], captures)
+                    self.details[f"map.{name}.pairs"] = agreement_metrics(
+                        self.metrics, f"map.{name}", dirs[name], captures)
             mid = f"map.{name}.{DUPLICATE_METRIC}"
             with self.metrics.expect(mid):
                 if doc is None:
@@ -347,6 +351,13 @@ class Evaluation:
                 else:
                     self.details[f"map.{name}.duplicates"] = duplicate_metrics(
                         self.metrics, f"map.{name}", doc_objects(doc))
+            mid = f"map.{name}.{OUT_OF_BOX_METRIC}"
+            with self.metrics.expect(mid):
+                if doc is None:
+                    self.metrics.fail([mid], f"the {name} map was not built")
+                else:
+                    self.details[f"map.{name}.out_of_box"] = out_of_box_metrics(
+                        self.metrics, f"map.{name}", dirs[name], doc_objects(doc))
         self.single_poses = poses.get("single")
         ids = [f"map.stability.{k}" for k in STABILITY_METRICS]
         with self.metrics.expect(*ids):

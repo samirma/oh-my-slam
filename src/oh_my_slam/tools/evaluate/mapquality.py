@@ -1,17 +1,34 @@
-"""Map quality: point-cloud consistency across same-heading keyframes, duplicated objects, and the
-stability of the objects when the same sequence is mapped in one update versus split across
-several.
+"""Map quality: point-cloud consistency across overlapping keyframes, duplicated objects, whether
+each object's points in the cloud lie in its box, and the stability of the objects when the same
+sequence is mapped in one update versus split across several.
 
 Consistency method: keyframe ``i``'s stored depth is back-projected into keyframe ``j`` with the
 map's poses; where it lands on a valid pixel of ``j`` that shows the same surface (relative
 difference below ``SAME_SURFACE``), ``|z_i→j / z_j - 1|`` is the disagreement. Stacked copies of a
-surface (frames merged without agreeing) show up here.
+surface (frames merged without agreeing) show up here. Two groups of pairs:
 
-Duplicates method (``near_duplicates``): pairs of exported objects with compatible labels that no
-keyframe observed together (their ``frame_intervals`` are disjoint: a keyframe that detected both
-saw two things) and whose boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M`` of each other
-(``box_gap``). An object mapped twice — typically by keyframes whose monocular depth disagrees,
-which places the copies along the same viewing rays at different depths — is such a pair.
+* the spec's same-heading pairs (§5: 001/053 and 026/078), which see the same surfaces from
+  nearly the same pose (``frame_agreement_*``: worst pair's median and p90);
+* every overlapping pair that is not a sequence neighbour (``frame_agreement_pairs_*``): optical
+  axes less than ``PAIRS_MAX_ANGLE_DEG`` apart, more than ``PAIRS_MIN_GAP`` keyframes apart in
+  capture order, and at least ``MIN_OVERLAP_PX`` shared pixels — loop closures included, where a
+  depth scale that drifted along the sequence shows. Reported: the median and the p90 over the
+  pairs of each pair's median disagreement, and the share of pairs whose median disagreement
+  exceeds ``GROSS_PCT``.
+
+Duplicates method (``near_duplicates``): pairs of exported objects that no keyframe observed
+together (their ``frame_intervals`` are disjoint: a keyframe that detected both saw two things),
+whose boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M`` of each other (``box_gap``) and whose
+labels are compatible — or are both horizontal-surface labels (desk, counter, bed, rug, …: the
+detector names pieces of one counter top differently) with box tops within
+``NEAR_DUPLICATE_GAP_M`` of each other (one surface at one height, not a rug under a table). An
+object mapped twice — typically by keyframes whose monocular depth disagrees, which places the
+copies along the same viewing rays at different depths — is such a pair.
+
+Out-of-box method (``out_of_box_share``): for each exported object, the share of the map-cloud
+points attributed to it (``cloud_objects.npy``, drawn in its colour by ``segments.ply`` and
+``color=segment``) that lie outside its OBB grown by ``OUT_OF_BOX_MARGIN_M``; the metric is the
+largest share over the objects. The box and the coloured points of an object must coincide.
 
 Stability method: the split map is brought into the one-update map's frame by the rigid transform
 that best maps the camera poses of the captures registered in both (rotation average + mean
@@ -44,7 +61,7 @@ from oh_my_slam.core.geometry import project
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.frame import align_by_poses
 from oh_my_slam.mapping.store import FrameRecord, MapReader
-from oh_my_slam.segmentation.detect import compatible
+from oh_my_slam.segmentation.detect import compatible, surface_label
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import Capture, same_heading_pairs
@@ -56,7 +73,16 @@ LABEL_PENALTY = 1.0  # label-aware pairing (see the module docstring)
 MIN_OVERLAP_PX = 500  # fewer shared pixels: the pair is not compared
 SAME_SURFACE = 0.3  # larger relative differences are occlusions, not the same surface
 PIXEL_STEP = 7  # every 7th valid pixel of the source keyframe is back-projected
-AGREEMENT_METRICS = ("frame_agreement_median_pct", "frame_agreement_p90_pct")
+SAME_HEADING_METRICS = ("frame_agreement_median_pct", "frame_agreement_p90_pct")
+PAIRS_METRICS = ("frame_agreement_pairs_median_pct", "frame_agreement_pairs_p90_pct",
+                 "frame_agreement_pairs_over10_pct")
+AGREEMENT_METRICS = (*SAME_HEADING_METRICS, *PAIRS_METRICS)
+PAIRS_MAX_ANGLE_DEG = 30.0
+PAIRS_MIN_GAP = 10
+GROSS_PCT = 10.0  # a pair disagreeing by more than this is grossly inconsistent
+WORST_LISTED = 10
+OUT_OF_BOX_METRIC = "out_of_box_share"
+OUT_OF_BOX_MARGIN_M = 0.05
 STABILITY_METRICS = ("matched_fraction", "label_agreement", "id_agreement",
                      "centre_delta_median_m", "extent_delta_median_rel", "obb_iou_median")
 DUPLICATE_METRIC = "near_duplicates"
@@ -92,10 +118,30 @@ def pair_agreement(reader: MapReader, ri: FrameRecord, rj: FrameRecord
     return float(np.median(r)), float(np.percentile(r, 90))
 
 
-def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Capture]) -> None:
+def overlapping_pairs(frames: list[FrameRecord]) -> list[tuple[FrameRecord, FrameRecord]]:
+    """Keyframe pairs (earlier first) whose optical axes are less than ``PAIRS_MAX_ANGLE_DEG``
+    apart and that are more than ``PAIRS_MIN_GAP`` keyframes apart in capture order."""
+    fr = sorted(frames, key=lambda r: r.index)
+    if len(fr) < 2:
+        return []
+    F = np.array([r.T_map_cam.R[:, 2] for r in fr])
+    cos = F @ F.T
+    near = cos > float(np.cos(np.radians(PAIRS_MAX_ANGLE_DEG)))
+    return [(a, b) for i, a in enumerate(fr) for j, b in enumerate(fr)
+            if j > i and b.index - a.index > PAIRS_MIN_GAP and near[i, j]]
+
+
+def _pct(res: tuple[float, float]) -> dict[str, float]:
+    return {"median_pct": round(res[0] * 100, 2), "p90_pct": round(res[1] * 100, 2)}
+
+
+def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Capture]
+                      ) -> list[dict[str, Any]]:
     """``<prefix>.frame_agreement_*``: depth disagreement of the spec's same-heading keyframe
-    pairs (worst pair's median and p90, in %)."""
-    ids = [f"{prefix}.{k}" for k in AGREEMENT_METRICS]
+    pairs (worst pair's median and p90, in %) and of every overlapping pair that is not a
+    sequence neighbour (``overlapping_pairs``: median and p90 over the pairs of each pair's
+    median, and the share of pairs above ``GROSS_PCT``, in %). Returns the worst pairs."""
+    ids = [f"{prefix}.{k}" for k in SAME_HEADING_METRICS]
     reader = MapReader(map_dir)
     by_capture = {Path(r.source).name: r for r in reader.frames}
     pairs: dict[str, Any] = {}
@@ -105,14 +151,46 @@ def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Cap
             pairs[key] = "not registered"
             continue
         res = pair_agreement(reader, by_capture[a.name], by_capture[b.name])
-        pairs[key] = "no overlap" if res is None else {
-            "median_pct": round(res[0] * 100, 2), "p90_pct": round(res[1] * 100, 2)}
+        pairs[key] = "no overlap" if res is None else _pct(res)
     done = [v for v in pairs.values() if isinstance(v, dict)]
     if not done:
         m.fail(ids, f"no same-heading pair could be compared: {pairs}")
-        return
-    m.add(ids[0], max(v["median_pct"] for v in done), pairs)
-    m.add(ids[1], max(v["p90_pct"] for v in done), pairs)
+    else:
+        m.add(ids[0], max(v["median_pct"] for v in done), pairs)
+        m.add(ids[1], max(v["p90_pct"] for v in done), pairs)
+    return pair_metrics(m, prefix, reader, pairs)
+
+
+def pair_metrics(m: Metrics, prefix: str, reader: MapReader, same_heading: dict[str, Any]
+                 ) -> list[dict[str, Any]]:
+    """``<prefix>.frame_agreement_pairs_*`` over ``overlapping_pairs`` (see the module
+    docstring); the detail lists the worst pairs and the same-heading pairs. Returns the worst
+    pairs."""
+    ids = [f"{prefix}.{k}" for k in PAIRS_METRICS]
+    source = {r.name: Path(r.source).name for r in reader.frames}
+    rows: list[dict[str, Any]] = []
+    candidates = overlapping_pairs(reader.frames)
+    for a, b in candidates:
+        res = pair_agreement(reader, a, b)
+        if res is not None:
+            rows.append({"pair": f"{source[a.name]}~{source[b.name]}", **_pct(res)})
+    if not rows:
+        m.fail(ids, f"no overlapping keyframe pair to compare ({len(candidates)} candidates)")
+        return []
+    med = np.array([r["median_pct"] for r in rows])
+    worst = sorted(rows, key=lambda r: (-r["median_pct"], r["pair"]))[:WORST_LISTED]
+    detail = {
+        "pairs": len(rows), "candidates": len(candidates),
+        "definition": f"optical axes < {PAIRS_MAX_ANGLE_DEG:g} deg apart, > {PAIRS_MIN_GAP} "
+                      f"keyframes apart, >= {MIN_OVERLAP_PX} shared pixels",
+        "max_pct": round(float(med.max()), 2),
+        "over_5_pct": round(float(np.mean(med > 5.0) * 100), 2),
+        "worst": worst, "same_heading": same_heading,
+    }
+    m.add(ids[0], round(float(np.median(med)), 3), detail)
+    m.add(ids[1], round(float(np.percentile(med, 90)), 3), detail)
+    m.add(ids[2], round(float(np.mean(med > GROSS_PCT) * 100), 3), detail)
+    return worst
 
 
 def split_alignment(single: dict[str, Pose], split: dict[str, Pose]) -> Pose:
@@ -248,13 +326,26 @@ def box_gap(a: OBB, b: OBB) -> float:
                      _segment_distances(ca[ia], ca[ja], cb[ia], cb[ja]).min()))
 
 
+def duplicate_candidates(a: DocObject, ba: OBB, b: DocObject, bb: OBB) -> bool:
+    """Labels that may name one object: compatible, or both horizontal-surface labels with box
+    tops (the surface height) within ``NEAR_DUPLICATE_GAP_M``."""
+    if compatible(a.label, b.label):
+        return True
+    if not (surface_label(a.label) and surface_label(b.label)):
+        return False
+    top_a = float(ba.corners()[:, 2].max())
+    top_b = float(bb.corners()[:, 2].max())
+    return abs(top_a - top_b) <= NEAR_DUPLICATE_GAP_M
+
+
 def near_duplicates(objs: list[DocObject]) -> list[dict[str, Any]]:
-    """Pairs of objects with compatible labels that no keyframe observed together and whose
-    boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M`` (``box_gap``), by ascending ids."""
+    """Pairs of objects that may name one object (``duplicate_candidates``), that no keyframe
+    observed together and whose boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M``
+    (``box_gap``), by ascending ids."""
     boxes = [(o, box) for o in objs if (box := o.obb()) is not None]
     out = []
     for (a, ba), (b, bb) in itertools.combinations(boxes, 2):
-        if not compatible(a.label, b.label) or a.frames & b.frames:
+        if a.frames & b.frames or not duplicate_candidates(a, ba, b, bb):
             continue
         reach = float(np.linalg.norm(ba.size) + np.linalg.norm(bb.size)) / 2
         if float(np.linalg.norm(ba.center - bb.center)) > reach + NEAR_DUPLICATE_GAP_M:
@@ -274,4 +365,44 @@ def duplicate_metrics(m: Metrics, prefix: str, objs: list[DocObject]) -> list[di
     rows = near_duplicates(objs)
     m.add(f"{prefix}.{DUPLICATE_METRIC}", len(rows),
           {"objects": len(objs), "gap_m": NEAR_DUPLICATE_GAP_M, "pairs": rows})
+    return rows
+
+
+# ------------------------------------------------------------------------------------------------
+# attributed points outside the box
+
+
+def out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
+    """Per exported object with map-cloud points: their number and the share outside its OBB
+    grown by ``OUT_OF_BOX_MARGIN_M``, worst first."""
+    from oh_my_slam.mapping.export import map_cloud
+
+    cloud = map_cloud(MapReader(map_dir))
+    labels = np.asarray(cloud.label, np.int64).reshape(-1)
+    xyz = np.asarray(cloud.xyz, np.float64)
+    order = np.argsort(labels, kind="stable")
+    ids, starts = np.unique(labels[order], return_index=True)
+    ends = np.r_[starts[1:], len(order)]
+    where = {int(i): order[s:e] for i, s, e in zip(ids, starts, ends, strict=True)}
+    rows = []
+    for o in objs:
+        box = o.obb()
+        idx = where.get(o.id)
+        if box is None or idx is None or not len(idx):
+            continue
+        local = np.abs((xyz[idx] - box.center) @ box.R) - box.size / 2
+        outside = np.any(local > OUT_OF_BOX_MARGIN_M, axis=1)
+        rows.append({"id": o.id, "label": o.label, "points": len(idx),
+                     "outside_share": round(float(outside.mean()), 4)})
+    return sorted(rows, key=lambda r: (-r["outside_share"], r["id"]))
+
+
+def out_of_box_metrics(m: Metrics, prefix: str, map_dir: Path, objs: list[DocObject]
+                       ) -> list[dict[str, Any]]:
+    """``<prefix>.out_of_box_share``: the largest share, over the exported objects, of their
+    map-cloud points outside their OBB grown by ``OUT_OF_BOX_MARGIN_M``; returns the per-object
+    rows for the report."""
+    rows = out_of_box_rows(map_dir, objs)
+    m.add(f"{prefix}.{OUT_OF_BOX_METRIC}", max((r["outside_share"] for r in rows), default=0.0),
+          {"objects": len(rows), "margin_m": OUT_OF_BOX_MARGIN_M, "worst": rows[:WORST_LISTED]})
     return rows

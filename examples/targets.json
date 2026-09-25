@@ -7,7 +7,9 @@
     "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and segment.sh -m / view.sh -m, which do not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
     "pose.*": "The references are the commanded headings in the capture names, and the true heading deviates from them: SIFT homographies between the images themselves (pure rotation, measured 2026-09-25) give ~8 deg between 001 and 053 and ~9 deg between 026 and 078, which the names call the same heading, and 004 (commanded +15) at ~15-18 deg. A perfect estimator therefore scores a few degrees of median yaw error and ~9 deg on the same-heading pairs, so yaw_err_median <= 7, yaw_err_max <= 15 and same_heading_yaw_diff_max <= 10 stay: tighter targets would fail a correct map. Registration and pitch direction are exact properties of a working mapper on 79 rendered frames: >= 0.95 (at most 3 of 79 frames unregistered, 1 of 31 tilted frames with the wrong sign), up from 0.9. The head turns in place: the camera circles the neck axis at a few cm, plus the small sideways steps of the bootstrap_side frames, so the camera centres should lie within about 0.1 m; centre_radius <= 0.25 m (was 1 m) leaves room for monocular scale error but rejects the drifting trajectory of the one-update map (0.80 m measured).",
     "map.*.frame_agreement_*": "Spec intent: the map is one consistent cloud. The same-heading pairs see the same surfaces from nearly the same pose, so their stored depths must agree to within monocular depth noise once aligned: median <= 3 % (was 5 %) and p90 <= 10 % (was 15 %), i.e. ~6-9 cm / 20-30 cm at 2-3 m. The one-update map meets this (1.1 % / 6.0 %); the split map (6.8 % / 15.6 %) does not, which is the defect these targets are meant to show.",
-    "map.*.near_duplicates": "Spec §2.3: an object observed across several frames keeps one id, so no physical object may be exported twice. Counted: pairs of exported objects with compatible labels that no keyframe observed together (a keyframe that detected both saw two things) whose boxes overlap or lie within 0.3 m. A copy made by inconsistent monocular depth lies along the same viewing rays, offset by the depth disagreement of the keyframes that saw each copy; the frame-agreement target allows a p90 of 10 %, i.e. 0.3 m at 3 m, the distance of the farthest objects of the sequence. Target 0 (the baseline run had 1 in each map: the sink's faucet mapped twice where the 360-degree loop closes).",
+    "map.*.frame_agreement_pairs_*": "Spec intent: the map is one consistent cloud wherever keyframes overlap, not only at the two same-heading pairs of §5, which see the same surfaces from nearly the same pose. Every pair of keyframes whose optical axes are less than 30 deg apart and that are more than 10 keyframes apart (not sequence neighbours, which the keyframe-by-keyframe depth alignment makes agree by construction; loop closures included) and share at least 500 pixels is compared; each pair's median disagreement |z_i->j / z_j - 1| measures how differently its two keyframes place the surfaces both see. Targets: the median pair within monocular depth noise, <= 3 % (as for the same-heading pairs); 90 % of the pairs within 5 % (0.1-0.15 m at 2-3 m); and at most 2 % of the pairs grossly inconsistent, above 10 % (0.3 m at 3 m: the depth disagreement the near-duplicate test and the object merges tolerate). One scale per keyframe cannot remove disagreement that varies across an image (surfaces 0.3-0.7 m from the camera are placed up to 20-30 % differently by different keyframes), so a few isolated pairs of the example sequence stay near 10 %; a drifting depth scale fails all three at once. Measured (commit 521f1e1, keyframe-by-keyframe alignment only): median 1.32 / 1.34 %, p90 5.45 / 5.56 %, above 10 % 4.2 / 3.7 % (one-update / split map; worst pairs 16-17 %, the keyframes closing the 360-degree loop). With the global adjustment of the depth scales over all overlapping pairs (maps built 2026-09-25): median 1.48 / 1.51 %, p90 3.95 / 3.73 %, above 10 % 0.52 / 0 %.",
+    "map.*.near_duplicates": "Spec §2.3: an object observed across several frames keeps one id, so no physical object may be exported twice. Counted: pairs of exported objects with compatible labels that no keyframe observed together (a keyframe that detected both saw two things) whose boxes overlap or lie within 0.3 m. A copy made by inconsistent monocular depth lies along the same viewing rays, offset by the depth disagreement of the keyframes that saw each copy; the frame-agreement target allows a p90 of 10 %, i.e. 0.3 m at 3 m, the distance of the farthest objects of the sequence. Target 0 (the baseline run had 1 in each map: the sink's faucet mapped twice where the 360-degree loop closes). Pairs of horizontal-surface labels (desk, table, counter, kitchen island, bed, rug, carpet, ...) are counted too when their box tops lie within 0.3 m of each other, whatever their label groups: the detector names pieces of one counter top differently (the kitchen island was a desk and, 0.25 m away, a 'rug' at its corner: 1 pair in each map at commit 521f1e1, which the compatible-label rule missed); a rug on the floor under a table is 0.4 m or more below the table top and is not counted.",
+    "map.*.out_of_box_share": "Spec §2.4 colour contract and §2.3 objects: an object's box and its points in the map cloud (drawn in its colour by segments.ply and every color=segment cloud, and counted as its point_count) must be the same object. The metric is the largest share, over the exported objects, of their cloud points outside their OBB grown by 0.05 m (the fused surface lies within a few centimetres of the points a box is fitted to: TSDF band 4 cm, box at the 2-98 % extent). Target <= 0.05: a few per cent of an object's points may stray past its box, not a patch of floor. Measured (commit 521f1e1): 0.87 / 0.83 (one-update / split map): the desk (kitchen island) held 118k cloud points of which 87 % lay on the floor 1.5-2.4 m from its box, from 'carpet' masks merged into it; also a rug 54 %, a cup 47 %, a shelf 33-61 %. Since a keyframe's vote for an object counts only inside the object's grown box: 0 / 0.",
     "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing.",
     "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. The seg.map_consistency metrics (formerly seg.map.recall / precision) compare the map's objects with per-frame detections of the same detector: they measure consistency, not accuracy. A map object pairs with a per-frame detection under its label or any of its detected_as labels (the labels its detections carried when the detector's label flickered between keyframes and the map merged them). A map object is built from detections in the frames it observes, so map_objects_detected must be ~1 (>= 0.95; measured 0.997); detections_in_map >= 0.8 (measured 0.88) allows the map to drop small or unstable detections. Accuracy is gt.*.",
     "contract.*": "Every contract is a count of violations: 0.",
@@ -340,13 +342,45 @@
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (one-update map)"
     },
+    "map.single.frame_agreement_pairs_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "measured": 1.48,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over every overlapping keyframe pair (optical axes < 30 deg apart, > 10 keyframes apart, >= 500 shared pixels), of the pair's median depth disagreement |z_i->j / z_j - 1| (one-update map)"
+    },
+    "map.single.frame_agreement_pairs_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "measured": 3.95,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same pairs, of the pair's median depth disagreement (one-update map)"
+    },
+    "map.single.frame_agreement_pairs_over10_pct": {
+      "op": "<=",
+      "value": 2,
+      "measured": 0.524,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "share of the same pairs whose median depth disagreement exceeds 10 % (one-update map)"
+    },
     "map.single.near_duplicates": {
       "op": "<=",
       "value": 0,
       "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0,
-      "description": "pairs of exported objects with compatible labels, never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; one-update map)"
+      "description": "pairs of exported objects with compatible labels (or both horizontal-surface labels with box tops within 0.3 m), never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; one-update map)"
+    },
+    "map.single.out_of_box_share": {
+      "op": "<=",
+      "value": 0.05,
+      "measured": 0.0,
+      "unit": "",
+      "tolerance_abs": 0.02,
+      "description": "largest share, over the exported objects, of their map-cloud points (their colour in segments.ply / color=segment) outside their OBB grown by 0.05 m (one-update map)"
     },
     "pose.split.registered_fraction": {
       "op": ">=",
@@ -412,13 +446,45 @@
       "tolerance_abs": 1.5,
       "description": "p90 depth disagreement of the same-heading pairs, worst pair (split map)"
     },
+    "map.split.frame_agreement_pairs_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "measured": 1.505,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over every overlapping keyframe pair (optical axes < 30 deg apart, > 10 keyframes apart, >= 500 shared pixels), of the pair's median depth disagreement |z_i->j / z_j - 1| (split map)"
+    },
+    "map.split.frame_agreement_pairs_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "measured": 3.73,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same pairs, of the pair's median depth disagreement (split map)"
+    },
+    "map.split.frame_agreement_pairs_over10_pct": {
+      "op": "<=",
+      "value": 2,
+      "measured": 0.0,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "share of the same pairs whose median depth disagreement exceeds 10 % (split map)"
+    },
     "map.split.near_duplicates": {
       "op": "<=",
       "value": 0,
       "measured": 1.0,
       "unit": "",
       "tolerance_abs": 0,
-      "description": "pairs of exported objects with compatible labels, never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; split map)"
+      "description": "pairs of exported objects with compatible labels (or both horizontal-surface labels with box tops within 0.3 m), never observed in the same keyframe, whose boxes overlap or lie within 0.3 m (an object mapped twice; split map)"
+    },
+    "map.split.out_of_box_share": {
+      "op": "<=",
+      "value": 0.05,
+      "measured": 0.0,
+      "unit": "",
+      "tolerance_abs": 0.02,
+      "description": "largest share, over the exported objects, of their map-cloud points (their colour in segments.ply / color=segment) outside their OBB grown by 0.05 m (split map)"
     },
     "map.stability.matched_fraction": {
       "op": ">=",
