@@ -10,7 +10,7 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, parse_cloud_attr
 from oh_my_slam.core.geometry import voxel_downsample_indices, voxel_keys
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask, point_normals
+from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask
 from oh_my_slam.segmentation.cloud import (
     ImageCloudSource,
     MapCloudSource,
@@ -237,6 +237,11 @@ def room_map() -> MapCloudSource:
     return map_cloud_source(xyz, rgb, labels, {4}, np.array([[0.0, 0.5, 1.2], [0.2, 0.0, 1.2]]))
 
 
+def all_normals(xyz: np.ndarray, viewpoints: np.ndarray) -> np.ndarray:
+    """Normals of every point of the cloud, asked for at once, in order."""
+    return PointNormals(xyz, viewpoints).at(np.arange(len(xyz)))
+
+
 def test_map_normals_only_for_the_emitted_points(room_map: MapCloudSource) -> None:
     """Normals are computed for the points a derivation emits, and a point's normal does not
     depend on ``voxel``, on which other points are asked for, or on their order (the same values
@@ -251,7 +256,7 @@ def test_map_normals_only_for_the_emitted_points(room_map: MapCloudSource) -> No
     rows = np.random.default_rng(3).permutation(len(room_map.xyz))[:5000]
     fresh = PointNormals(room_map.xyz, room_map.viewpoints)
     np.testing.assert_array_equal(fresh.at(rows[::-1])[::-1], full.normals[rows])
-    np.testing.assert_array_equal(point_normals(room_map.xyz, room_map.viewpoints), full.normals)
+    np.testing.assert_array_equal(all_normals(room_map.xyz, room_map.viewpoints), full.normals)
     # correct geometry away from edges and the box: floor up, walls facing the cameras
     x, y, z = np.asarray(room_map.xyz).T
     part = np.repeat(np.arange(4), 15_000)

@@ -18,6 +18,11 @@ def colours(n: int) -> np.ndarray:
     return np.array([c.color_for_id(i) for i in range(1, n + 1)])
 
 
+def delta_e(rgb1: object, rgb2: object) -> np.ndarray:
+    """Euclidean OKLab distance (ΔE_OK) between 8-bit sRGB triples."""
+    return np.asarray(np.linalg.norm(c.oklab(rgb1) - c.oklab(rgb2), axis=-1))
+
+
 def pairwise(rgb: np.ndarray) -> np.ndarray:
     lab = c.oklab(rgb)
     d = np.linalg.norm(lab[:, None] - lab[None], axis=-1)
@@ -37,7 +42,7 @@ def test_ids_1_to_1000_unique_admissible_and_never_grey() -> None:
     assert len({tuple(x) for x in cols}) == 1000
     assert not (cols == c.UNSEGMENTED).all(axis=1).any()
     assert c.admissible(cols).all()
-    assert c.delta_e(cols, c.UNSEGMENTED).min() >= c.MIN_GREY_DISTANCE
+    assert delta_e(cols, c.UNSEGMENTED).min() >= c.MIN_GREY_DISTANCE
 
 
 def test_visible_on_the_viewer_and_on_the_dimmed_image() -> None:
