@@ -25,7 +25,8 @@ const LAYERS = [
   ['segments', 'Segmentation overlay',
     'Only the points of each object, in the object\'s colour, drawn over the point cloud whatever its color attribute'],
   ['cameras', 'Camera poses', 'A frustum at each camera\'s pose; frustums next to the viewpoint fade out'],
-  ['labels', 'Labels', 'Every box gets its id tag in its colour; names where they fit (all on hover)'],
+  ['labels', 'Labels',
+    'Every box gets its id tag in its colour, or a "+N" chip where tags are crowded; names where they fit'],
   ['obbs', 'Oriented boxes', 'The objects\' oriented bounding boxes, in their colours'],
 ];
 // the color attribute's options, as the menu words them (the value stays the -p value)
@@ -35,7 +36,8 @@ const COLOR_WORDS = {
 };
 const DEBOUNCE_MS = 250;
 const state = {
-  meta: null, scene: null, objects: [], objectRgb: new Map(), selected: null, hovered: null,
+  meta: null, scene: null, objects: [], objectRgb: new Map(), selected: null, hovered: null, peek: null,
+  chips: [], leaders: [], cluster: null,  // "+N" chips, leader lines, the chip whose list is open
   layers: { points: true, segments: false, cameras: true, labels: true, obbs: true },
   display: { pointSize: 2.0, labels: 'fit', background: '#15171c', normals: 'shade' },
   attrs: {},          // current point-cloud attributes, as the -p values the server parses
@@ -95,6 +97,7 @@ function resize() {
   state.camHighlight?.material.resolution.set(w, h);
   const focal = focalPx();
   for (const m of pointMaterials()) m.uniforms.focal.value = focal;
+  closeCluster();
   state.labelsDirty = true;
 }
 window.addEventListener('resize', resize);
@@ -311,23 +314,24 @@ function buildObjects(doc) {
     // label: the id tag in the object's colour, then the name; anchored at the top face's centre
     const tag = el('span', { class: 'tag' }, String(id));
     tag.style.background = hex;
-    tag.style.color = inkFor(rgb || [128, 128, 128]);
+    const ink = inkFor(rgb || [128, 128, 128]);
+    tag.style.color = ink;
     const div = el('div', { class: 'obj-label', 'data-id': id, title: `${o.type} ${id}` }, tag,
       el('span', { class: 'name' }, o.type));
     div.addEventListener('click', (e) => { e.stopPropagation(); select(Number(id), true); });
-    div.addEventListener('pointerenter', () => { state.hovered = Number(id); state.labelsDirty = true; });
-    div.addEventListener('pointerleave', () => { if (state.hovered === Number(id)) state.hovered = null; state.labelsDirty = true; });
+    div.addEventListener('pointerenter', () => setHover(Number(id)));
+    div.addEventListener('pointerleave', () => { if (state.hovered === Number(id)) setHover(null); });
     labelLayer.appendChild(div);
     const display = corners.map((p) => p.clone().applyMatrix4(root.matrixWorld));
     display.sort((a, b) => b.z - a.z);
     const anchor = display.slice(0, 4).reduce((s, p) => s.add(p), new THREE.Vector3()).multiplyScalar(0.25);
     const inv = new THREE.Quaternion(qx, qy, qz, qw).invert();
     state.objects.push({
-      id: Number(id), label: o.type, hex, score: prop(o, 'num', 'score'), volume: attr(cub, 'volume_m3'),
+      id: Number(id), label: o.type, hex, ink, score: prop(o, 'num', 'score'), volume: attr(cub, 'volume_m3'),
       dims: [attr(cub, 'width_m'), attr(cub, 'depth_m'), attr(cub, 'height_m')],
       center: new THREE.Vector3(x, y, z), half: new THREE.Vector3(sx / 2, sy / 2, sz / 2), inv,
       corners, line, pick, div, anchor, size: Math.cbrt(Math.max(sx * sy * sz, 1e-9)),
-      w: 0, wTag: 0, h: 0, mode: null,
+      w: 0, wTag: 0, h: 0, mode: null, chip: null, rect: null, sx: 0, sy: 0,
     });
   }
 }
@@ -615,13 +619,18 @@ function frameObject(o) {
 }
 
 // ---------------------------------------------------------------- selection, hover, labels
+// Box outlines: the selected box thickest, the hovered one (in 3D, its tag or its catalogue row)
+// and the one peeked at in a chip's list thicker; never a different colour.
+function lineWidths() {
+  for (const o of state.objects) {
+    const w = o.id === state.selected ? 5.0 : (o.id === state.hovered || o.id === state.peek ? 3.5 : 2.0);
+    if (o.line.material.linewidth !== w) o.line.material.linewidth = w;
+  }
+}
 function select(id, frame = false) {
   state.selected = id;
-  for (const o of state.objects) {
-    const on = o.id === id;
-    o.line.material.linewidth = on ? 5.0 : 2.0;  // thicker, never a different colour
-    o.div.classList.toggle('selected', on);
-  }
+  for (const o of state.objects) o.div.classList.toggle('selected', o.id === id);
+  lineWidths();
   document.querySelectorAll('#catalogue tbody tr').forEach((tr) => {
     const on = Number(tr.dataset.id) === id;
     tr.classList.toggle('selected', on);
@@ -630,23 +639,103 @@ function select(id, frame = false) {
   const o = state.objects.find((x) => x.id === id);
   if (o && frame) frameObject(o);
   fadeBoxes();
+  closeCluster();
   state.labelsDirty = true;
 }
+// Hovering thickens the box and shows its label's name over the others (or lights up the chip
+// that holds its tag) without moving any label.
+function setHover(id) {
+  if (id === state.hovered) return;
+  const mark = (x, on) => {
+    const o = state.objects.find((q) => q.id === x);
+    o?.div.classList.toggle('hover', on);
+    o?.chip?.div?.classList.toggle('hover', on);
+  };
+  mark(state.hovered, false);
+  state.hovered = id;
+  mark(id, true);
+  lineWidths();
+}
+function setPeek(id) {
+  if (id === state.peek) return;
+  state.peek = id;
+  lineWidths();
+  if (state.cluster) drawClusterLeaders();
+}
 
-// Labels (spec §2.5: labelled OBBs). Every box whose top is in view gets at least its id tag, in
-// its colour, so every OBB can be identified (the catalogue and the hover card give the rest).
-// Names are added where they fit: boxes are taken by apparent size (the selected and hovered one
-// first), each tries its full label above its anchor, then its tag there, then its tag beside or
-// below the anchor, and keeps the first placement that overlaps no label placed before; a tag
-// that fits nowhere is still shown at its anchor, under the others. Labels stay inside the view.
-const LABEL_GAP = 2;
+// Labels (spec §2.5: labelled OBBs). No label covers another label, the header or the help line,
+// and none leaves the view:
+// 1. the selected box first, with its name;
+// 2. every other box whose top is in view, by apparent size (largest first): its id tag in its
+//    colour next to the top face's centre (above, right, left or below it) or, where those are
+//    taken, on rings farther out, joined to that point by a leader line in its colour;
+// 3. the tags that fit nowhere near their box go into a "+N" chip placed there (farther out if
+//    need be), one per neighbourhood of CLUSTER_RADIUS; a chip of a single box becomes that box's
+//    tag, with a leader. Hovering or clicking a chip lists its boxes (id tag and name; each entry
+//    selects its box) and draws a line from the chip to each of them;
+// 4. names are added to the tags, largest boxes first, wherever the longer label still fits.
+// Whatever the layout, hovering a box shows its id and label, and its catalogue row selects it.
+const LABEL_GAP = 2;        // px between two labels, and between a label and the view's edge
+const OBSTACLE_PAD = 4;     // px kept clear around the header and the help line
+const LEADER_MIN = 5;       // px: a label farther than this from its box gets a leader line
+const CLUSTER_RADIUS = 60;  // px: a tag that fits nowhere joins a chip started this close
+const TAG_RINGS = [22, 34, 48, 64];  // px from the anchor to the label's centre
+const CHIP_RINGS = [...TAG_RINGS, 84, 110, 145, 190, 250, 330, 430];
+const DIRS = [0, 1, 11, 2, 10, 3, 9, 4, 8, 5, 7, 6].map((k) => {  // from straight up, both ways
+  const a = -Math.PI / 2 + (k * Math.PI) / 6;
+  return [Math.cos(a), Math.sin(a)];
+});
+const CELL = 64;
+// the rectangles taken so far ([x0, y0, x1, y1] in px), bucketed on a coarse grid
+class RectIndex {
+  constructor() { this.cells = new Map(); }
+  add(r) {
+    for (let i = Math.floor(r[0] / CELL); i <= Math.floor(r[2] / CELL); i++) {
+      for (let j = Math.floor(r[1] / CELL); j <= Math.floor(r[3] / CELL); j++) {
+        const k = (i + 64) * 4096 + j + 64;
+        const list = this.cells.get(k);
+        if (!list) this.cells.set(k, [r]); else if (!list.includes(r)) list.push(r);
+      }
+    }
+  }
+  hits(x0, y0, x1, y1, ignore) {
+    for (let i = Math.floor(x0 / CELL); i <= Math.floor(x1 / CELL); i++) {
+      for (let j = Math.floor(y0 / CELL); j <= Math.floor(y1 / CELL); j++) {
+        const list = this.cells.get((i + 64) * 4096 + j + 64);
+        if (!list) continue;
+        for (const r of list) if (r !== ignore && x0 < r[2] && r[0] < x1 && y0 < r[3] && r[1] < y1) return true;
+      }
+    }
+    return false;
+  }
+}
+// the header (title card and buttons) and the help line, in the label layer's pixels
+function obstacles() {
+  const at = host.getBoundingClientRect();
+  const out = [];
+  for (const sel of ['#info', '#actions', '#help']) {
+    const e = $(sel);
+    const r = e && e.offsetParent ? e.getBoundingClientRect() : null;
+    if (r && r.width && r.height) {
+      out.push([r.left - at.left - OBSTACLE_PAD, r.top - at.top - OBSTACLE_PAD,
+        r.right - at.left + OBSTACLE_PAD, r.bottom - at.top + OBSTACLE_PAD]);
+    }
+  }
+  return out;
+}
 function measureLabels() {
+  const width = (e) => Math.ceil(e.getBoundingClientRect().width);
   for (const o of state.objects) {
     o.div.classList.remove('compact');
-    o.w = o.div.offsetWidth; o.h = o.div.offsetHeight;
-    o.wTag = o.div.firstChild.offsetWidth;
+    o.w = width(o.div); o.h = Math.ceil(o.div.getBoundingClientRect().height);
+    o.wTag = width(o.div.firstChild);
   }
-  state.measured = state.objects.every((o) => o.w > 0);
+  const probe = chipAt(0);  // room for up to three digits
+  probe.button.textContent = '+999';
+  probe.key = null;
+  probe.div.hidden = false;
+  state.chipSize = [width(probe.div), Math.ceil(probe.div.getBoundingClientRect().height)];
+  state.measured = state.objects.every((o) => o.w > 0) && state.chipSize[0] > 0;
 }
 function layoutLabels() {
   const show = state.layers.labels;
@@ -654,56 +743,275 @@ function layoutLabels() {
   labelLayer.hidden = !show;
   if (!show || !state.objects.length) return;
   if (!state.measured) measureLabels();
-  const w = host.clientWidth, h = host.clientHeight;
+  const W = host.clientWidth, H = host.clientHeight;
+  const taken = new RectIndex();
+  for (const r of obstacles()) taken.add(r);
+  const free = (x, y, bw, bh, ignore = null) => x >= LABEL_GAP && y >= LABEL_GAP
+    && x + bw <= W - LABEL_GAP && y + bh <= H - LABEL_GAP
+    && !taken.hits(x - LABEL_GAP, y - LABEL_GAP, x + bw + LABEL_GAP, y + bh + LABEL_GAP, ignore);
+  const clampX = (x, bw) => Math.min(Math.max(x, LABEL_GAP), W - bw - LABEL_GAP);
+  const clampY = (y, bh) => Math.min(Math.max(y, LABEL_GAP), H - bh - LABEL_GAP);
+  // the first free bw x bh place around the anchor (sx, sy): next to it, then on the rings
+  const spot = (sx, sy, bw, bh, rings) => {
+    for (const [x0, y0] of [[sx - bw / 2, sy - bh - 3], [sx + 4, sy - bh / 2], [sx - bw - 4, sy - bh / 2],
+      [sx - bw / 2, sy + 3]]) {
+      const x = clampX(x0, bw), y = clampY(y0, bh);
+      if (free(x, y, bw, bh)) return [x, y];
+    }
+    for (const r of rings) {
+      for (const [dx, dy] of DIRS) {
+        const x = clampX(sx + dx * r - bw / 2, bw), y = clampY(sy + dy * r - bh / 2, bh);
+        if (free(x, y, bw, bh)) return [x, y];
+      }
+    }
+    return null;
+  };
   const eye = camera.position;
   const p = new THREE.Vector3();
-  const cands = [];
+  const boxes = [];  // the boxes whose top is in view, largest on screen first
   for (const o of state.objects) {
+    o.mode = null; o.chip = null;
     p.copy(o.anchor).project(camera);
-    const sx = (p.x + 1) / 2 * w, sy = (1 - p.y) / 2 * h;
-    const inView = p.z < 1 && p.z > -1 && sx >= 0 && sx <= w && sy >= 0 && sy <= h;
-    if (!inView) { o.mode = null; continue; }
-    const pri = o.id === state.selected ? 2 : (o.id === state.hovered ? 1 : 0);
-    cands.push({ o, sx, sy, pri, rank: o.size / Math.max(eye.distanceTo(o.anchor), 1e-3) });
+    const sx = (p.x + 1) / 2 * W, sy = (1 - p.y) / 2 * H;
+    if (!(p.z < 1 && p.z > -1 && sx >= 0 && sx <= W && sy >= 0 && sy <= H)) continue;
+    o.sx = sx; o.sy = sy;
+    o.rank = o.size / Math.max(eye.distanceTo(o.anchor), 1e-3);
+    boxes.push(o);
   }
-  cands.sort((a, b) => (b.pri - a.pri) || (b.rank - a.rank) || (a.o.id - b.o.id));
-  const placed = [];
-  const hits = (x, y, bw, bh) => placed.some((r) => x < r[2] && r[0] < x + bw && y < r[3] && r[1] < y + bh);
-  const clampX = (x, bw) => Math.min(Math.max(x, LABEL_GAP), Math.max(LABEL_GAP, w - bw - LABEL_GAP));
-  const clampY = (y, bh) => Math.min(Math.max(y, LABEL_GAP), Math.max(LABEL_GAP, h - bh - LABEL_GAP));
-  const namesToo = state.display.labels === 'fit';
-  for (const { o, sx, sy, pri } of cands) {
-    const lh = o.h;
-    const tries = [];
-    if (namesToo || pri) tries.push([o.w, sx - o.wTag / 2, sy - lh - 3, 'full']);
-    tries.push([o.wTag, sx - o.wTag / 2, sy - lh - 3, 'compact'],
-      [o.wTag, sx + 4, sy - lh / 2, 'compact'], [o.wTag, sx - o.wTag - 4, sy - lh / 2, 'compact'],
-      [o.wTag, sx - o.wTag / 2, sy + 3, 'compact']);
-    let chosen = null;
-    for (const [bw, x0, y0, mode] of tries) {
-      const x = clampX(x0, bw), y = clampY(y0, lh);
-      if (pri || !hits(x - 1, y - 1, bw + 2, lh + 2)) { chosen = [x, y, bw, mode, false]; break; }
-    }
-    if (!chosen) {
-      const [bw, x0, y0] = tries[namesToo ? 1 : 0];
-      chosen = [clampX(x0, bw), clampY(y0, lh), bw, 'compact', true];
-    }
-    const [x, y, bw, mode, under] = chosen;
-    if (!under) placed.push([x, y, x + bw, y + lh]);
+  boxes.sort((a, b) => (b.rank - a.rank) || (a.id - b.id));
+  const labelled = [];
+  const put = (o, [x, y], bw, mode) => {
+    o.rect = [x, y, x + bw, y + o.h];
     o.mode = mode;
-    o.x = x; o.y = y; o.under = under; o.pri = pri;
+    taken.add(o.rect);
+    labelled.push(o);
+  };
+  // 1. the selected box, with its name
+  const sel = boxes.find((o) => o.id === state.selected);
+  if (sel) {
+    const full = spot(sel.sx, sel.sy, sel.w, sel.h, TAG_RINGS);
+    const tag = full ? null : spot(sel.sx, sel.sy, sel.wTag, sel.h, TAG_RINGS);
+    if (full) put(sel, full, sel.w, 'full');
+    else if (tag) put(sel, tag, sel.wTag, 'compact');
+    else put(sel, [clampX(sel.sx - sel.w / 2, sel.w), clampY(sel.sy - sel.h - 3, sel.h)], sel.w, 'full');
   }
+  // 2. an id tag next to every other box
+  const loose = [];
+  for (const o of boxes) {
+    if (o === sel) continue;
+    const at = spot(o.sx, o.sy, o.wTag, o.h, TAG_RINGS);
+    if (at) put(o, at, o.wTag, 'compact'); else loose.push(o);
+  }
+  // 3. the tags that fit nowhere near their box: "+N" chips
+  const chips = [];
+  const [cw, chh] = state.chipSize;
+  const nearest = (o, limit) => {
+    let best = null, d0 = limit;
+    for (const c of chips) { const d = Math.hypot(c.hx - o.sx, c.hy - o.sy); if (d <= d0) { d0 = d; best = c; } }
+    return best;
+  };
+  for (const o of loose) {
+    let chip = nearest(o, CLUSTER_RADIUS);
+    if (!chip) {
+      const at = spot(o.sx, o.sy, cw, chh, CHIP_RINGS);
+      if (at) {
+        chip = { hx: o.sx, hy: o.sy, rect: [at[0], at[1], at[0] + cw, at[1] + chh], members: [] };
+        taken.add(chip.rect);
+        chips.push(chip);
+      } else {
+        chip = nearest(o, Infinity);  // no room left near it: the nearest chip anywhere
+      }
+    }
+    if (chip) { chip.members.push(o); o.mode = 'cluster'; o.chip = chip; }
+  }
+  // a chip of one box is its tag, in the chip's place (which is free and no smaller than the tag)
+  const lone = chips.filter((c) => c.members.length === 1 && c.members[0].wTag <= cw && c.members[0].h <= chh);
+  for (const c of lone) {
+    const o = c.members[0];
+    c.rect[2] = c.rect[0] + o.wTag; c.rect[3] = c.rect[1] + o.h;
+    o.rect = c.rect; o.mode = 'compact'; o.chip = null;
+    labelled.push(o);
+  }
+  chips.splice(0, chips.length, ...chips.filter((c) => !lone.includes(c)));
+  // 4. names, wherever the longer label still fits (growing rightwards, else leftwards)
+  if (state.display.labels === 'fit') {
+    for (const o of labelled) {
+      if (o.mode !== 'compact') continue;
+      const r = o.rect;
+      for (const x of [r[0], r[2] - o.w]) {
+        if (free(x, r[1], o.w, o.h, r)) { r[0] = x; r[2] = x + o.w; taken.add(r); o.mode = 'full'; break; }
+      }
+    }
+  }
+  state.chips = chips;
+  drawLabels(labelled);
+}
+window.__viewerLayoutLabels = layoutLabels;  // for tests and timing
+function drawLabels(labelled) {
   for (const o of state.objects) {
     const d = o.div;
-    if (o.mode == null) { if (!d.hidden) d.hidden = true; continue; }
+    if (o.mode !== 'full' && o.mode !== 'compact') { if (!d.hidden) d.hidden = true; continue; }
     if (d.hidden) d.hidden = false;
     d.classList.toggle('compact', o.mode === 'compact');
-    d.classList.toggle('under', o.under);
-    d.style.transform = `translate(${Math.round(o.x)}px, ${Math.round(o.y)}px)`;
-    d.style.zIndex = String(o.pri ? 3 : (o.under ? 1 : 2));
+    d.style.transform = `translate(${Math.round(o.rect[0])}px, ${Math.round(o.rect[1])}px)`;
+    d.style.zIndex = o.id === state.selected ? '3' : '2';
   }
+  state.chips.forEach((c, i) => {
+    const e = chipAt(i);
+    c.div = e.div; c.button = e.button;
+    const key = c.members.map((o) => o.id).join(',');
+    if (e.key !== key) {
+      e.key = key;
+      const n = c.members.length;
+      e.button.textContent = `+${n}`;
+      const names = c.members.slice(0, 12).map((o) => `${o.id} ${o.label}`).join(', ');
+      e.button.title = `${n} more object${n === 1 ? '' : 's'} here: ${names}${n > 12 ? ', …' : ''}`;
+      e.button.setAttribute('aria-label', e.button.title);
+    }
+    e.div.classList.toggle('hover', c.members.some((o) => o.id === state.hovered));
+    if (e.div.hidden) e.div.hidden = false;
+    e.div.style.transform = `translate(${Math.round(c.rect[0])}px, ${Math.round(c.rect[1])}px)`;
+  });
+  for (let i = state.chips.length; i < chipPool.length; i++) if (!chipPool[i].div.hidden) chipPool[i].div.hidden = true;
+  // a leader from the box (its top face's centre) to the nearest point of its label
+  state.leaders = [];
+  for (const o of labelled) {
+    const [x0, y0, x1, y1] = o.rect;
+    const px = Math.min(Math.max(o.sx, x0), x1), py = Math.min(Math.max(o.sy, y0), y1);
+    if (Math.hypot(px - o.sx, py - o.sy) > LEADER_MIN) state.leaders.push([o.sx, o.sy, px, py, o.hex, false]);
+  }
+  drawLeaders(state.leaders);
 }
-function updateLabels() { state.labelsDirty = true; }
+
+// leader lines: one dark halo path under all of them, then a line and a dot at the box per leader
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const leaderSvg = document.createElementNS(SVG_NS, 'svg');
+leaderSvg.id = 'leaders';
+leaderSvg.setAttribute('aria-hidden', 'true');
+const leaderHalo = document.createElementNS(SVG_NS, 'path');
+leaderHalo.setAttribute('class', 'halo');
+leaderSvg.append(leaderHalo);
+labelLayer.appendChild(leaderSvg);
+const leaderPool = [];
+function drawLeaders(list) {
+  let d = '';
+  list.forEach(([ax, ay, bx, by, hex, strong], i) => {
+    if (i === leaderPool.length) {
+      const line = document.createElementNS(SVG_NS, 'line');
+      const dot = document.createElementNS(SVG_NS, 'circle');
+      dot.setAttribute('r', '2.5');
+      leaderSvg.append(line, dot);
+      leaderPool.push({ line, dot });
+    }
+    const { line, dot } = leaderPool[i];
+    const [a, b, c, e] = [ax, ay, bx, by].map((v) => v.toFixed(1));
+    line.setAttribute('x1', a); line.setAttribute('y1', b); line.setAttribute('x2', c); line.setAttribute('y2', e);
+    line.setAttribute('stroke', hex);
+    line.classList.toggle('strong', strong);
+    dot.setAttribute('cx', a); dot.setAttribute('cy', b); dot.setAttribute('fill', hex);
+    line.style.display = dot.style.display = '';
+    d += `M${a} ${b}L${c} ${e}`;
+  });
+  leaderHalo.setAttribute('d', d);
+  for (let i = list.length; i < leaderPool.length; i++) leaderPool[i].line.style.display = leaderPool[i].dot.style.display = 'none';
+}
+
+// "+N" chips (a pool, reused by index) and the list one of them opens
+const chipPool = [];
+function chipAt(i) {
+  while (chipPool.length <= i) {
+    const k = chipPool.length;
+    const button = el('button', { type: 'button', class: 'chip', 'aria-haspopup': 'menu', 'aria-expanded': 'false' });
+    const div = el('div', { class: 'obj-cluster' }, button);
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const c = state.chips[k];
+      if (!c) return;
+      if (state.cluster?.chip === c && state.cluster.pinned) closeCluster(); else openCluster(c, true);
+    });
+    div.addEventListener('pointerenter', (e) => { if (e.pointerType === 'mouse' && state.chips[k]) openCluster(state.chips[k], false); });
+    div.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') scheduleCloseCluster(); });
+    labelLayer.appendChild(div);
+    chipPool.push({ div, button, key: null });
+  }
+  return chipPool[i];
+}
+const clusterPop = el('div', { id: 'cluster-pop', role: 'menu', 'aria-label': 'Objects under this chip' });
+clusterPop.hidden = true;
+clusterPop.addEventListener('pointerenter', () => clearTimeout(state.clusterTimer));
+clusterPop.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') scheduleCloseCluster(); });
+labelLayer.appendChild(clusterPop);
+function clusterEntry(o) {
+  const tag = el('span', { class: 'tag' }, String(o.id));
+  tag.style.background = o.hex;
+  tag.style.color = o.ink;
+  const b = el('button', { type: 'button', role: 'menuitem', 'data-id': o.id, title: `Select ${o.label} ${o.id}` },
+    tag, el('span', { class: 'name' }, o.label));
+  b.addEventListener('click', (e) => { e.stopPropagation(); select(o.id, true); });
+  b.addEventListener('pointerenter', () => setPeek(o.id));
+  b.addEventListener('pointerleave', () => setPeek(null));
+  b.addEventListener('focus', () => setPeek(o.id));
+  b.addEventListener('blur', () => setPeek(null));
+  return b;
+}
+function openCluster(chip, pinned) {
+  clearTimeout(state.clusterTimer);
+  if (state.cluster?.chip === chip) { state.cluster.pinned ||= pinned; return; }
+  closeCluster();
+  state.cluster = { chip, pinned, view: camera.matrixWorld.clone() };
+  chip.div.classList.add('open');
+  chip.button.setAttribute('aria-expanded', 'true');
+  clusterPop.replaceChildren(...[...chip.members].sort((a, b) => a.id - b.id).map(clusterEntry));
+  clusterPop.hidden = false;
+  // below the chip if the list fits there (or has more room there), else above; inside the view,
+  // clear of the header and the help line
+  const W = host.clientWidth, H = host.clientHeight;
+  const obs = obstacles();
+  const top = Math.max(LABEL_GAP, ...obs.filter((r) => r[1] < H / 2).map((r) => r[3]));
+  const bottom = Math.min(H - LABEL_GAP, ...obs.filter((r) => r[1] >= H / 2).map((r) => r[1]));
+  const [x0, y0] = chip.rect;
+  const cw = chip.div.offsetWidth, ch = chip.div.offsetHeight;
+  const below = bottom - (y0 + ch + 4), above = y0 - 4 - top;
+  clusterPop.style.maxHeight = '';
+  const natural = clusterPop.offsetHeight;
+  const down = below >= natural || below >= above;
+  clusterPop.style.maxHeight = `${Math.max(48, Math.floor(down ? below : above))}px`;
+  const pw = clusterPop.offsetWidth, ph = clusterPop.offsetHeight;
+  const x = Math.min(Math.max(x0 + cw / 2 - pw / 2, LABEL_GAP), W - pw - LABEL_GAP);
+  const y = down ? y0 + ch + 4 : y0 - 4 - ph;
+  clusterPop.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+  drawClusterLeaders();
+}
+// while a chip's list is open: a line from the chip to each of its boxes (the peeked one bolder)
+function drawClusterLeaders() {
+  const c = state.cluster?.chip;
+  if (!c) return;
+  const cx = c.rect[0] + c.div.offsetWidth / 2, cy = (c.rect[1] + c.rect[3]) / 2;
+  drawLeaders([...state.leaders, ...c.members.map((o) => [o.sx, o.sy, cx, cy, o.hex, o.id === state.peek])]);
+}
+function scheduleCloseCluster() {
+  clearTimeout(state.clusterTimer);
+  if (state.cluster && !state.cluster.pinned) state.clusterTimer = setTimeout(closeCluster, 250);
+}
+function closeCluster() {
+  clearTimeout(state.clusterTimer);
+  const cur = state.cluster;
+  if (!cur) return;
+  state.cluster = null;
+  cur.chip.div.classList.remove('open');
+  cur.chip.button.setAttribute('aria-expanded', 'false');
+  clusterPop.hidden = true;
+  clusterPop.replaceChildren();
+  setPeek(null);
+  drawLeaders(state.leaders);
+  state.labelsDirty = true;
+}
+// whether the view has moved since the list opened (orbit damping's last creep moves it far less)
+function clusterViewMoved() {
+  const a = state.cluster.view.elements, b = camera.matrixWorld.elements;
+  for (let i = 0; i < 16; i++) if (Math.abs(a[i] - b[i]) > 1e-3) return true;
+  return false;
+}
 
 // Boxes the viewpoint is inside of, or next to, fade to OBB_FADE_MIN so that their edges do not
 // cross the whole view (e.g. after "Go to" a camera standing in a box); the selected one stays.
@@ -742,7 +1050,7 @@ function pickAt(ev) {
 const tooltip = $('#tooltip');
 renderer.domElement.addEventListener('pointermove', (ev) => {
   const id = pickAt(ev);
-  if (id !== state.hovered) { state.hovered = id; state.labelsDirty = true; }
+  setHover(id);
   if (id == null) { tooltip.hidden = true; renderer.domElement.style.cursor = ''; return; }
   const o = state.objects.find((x) => x.id === id);
   const [w, d, h] = o.dims;
@@ -759,7 +1067,7 @@ renderer.domElement.addEventListener('pointermove', (ev) => {
   renderer.domElement.style.cursor = 'pointer';
 });
 let downAt = null;
-renderer.domElement.addEventListener('pointerdown', (ev) => { downAt = [ev.clientX, ev.clientY]; });
+renderer.domElement.addEventListener('pointerdown', (ev) => { downAt = [ev.clientX, ev.clientY]; closeCluster(); });
 renderer.domElement.addEventListener('pointerup', (ev) => {
   if (!downAt || Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) > 4) return;
   const id = pickAt(ev);
@@ -810,6 +1118,7 @@ function applyLayers() {
   groups.labels.visible = state.layers.labels;
   groups.pick.visible = state.layers.obbs;
   if (!state.layers.obbs) tooltip.hidden = true;
+  closeCluster();
   state.labelsDirty = true;
 }
 function buildLayers() {
@@ -910,6 +1219,7 @@ function attrsChanged() {
 function setBusy(on) {
   state.busy = on;
   $('#busy').hidden = !on;
+  state.labelsDirty = true;
   $('#cloud-busy').hidden = !on;
   $('#group-cloud').setAttribute('aria-busy', String(on));
 }
@@ -972,8 +1282,9 @@ function buildDisplay() {
   const lab = el('select', { id: 'display-labels' },
     el('option', { value: 'fit' }, 'id tags + names that fit'), el('option', { value: 'ids' }, 'id tags only'));
   lab.value = state.display.labels;
-  lab.addEventListener('change', () => { state.display.labels = lab.value; state.labelsDirty = true; });
-  host.append(el('div', { class: 'row attr', title: 'Every box always gets its id tag; the name shows on hover and selection' },
+  lab.addEventListener('change', () => { state.display.labels = lab.value; closeCluster(); state.labelsDirty = true; });
+  host.append(el('div', { class: 'row attr',
+    title: 'Every box gets its id tag (or a "+N" chip where tags are crowded); names where they fit, on hover and on selection' },
     el('label', { for: 'display-labels' }, 'labels'), lab, el('output')));
   const bg = el('input', { type: 'color', id: 'display-bg' });
   bg.value = state.display.background;
@@ -996,8 +1307,8 @@ function buildCatalogue() {
       el('td', { class: 'num dims' }, `${w.toFixed(2)}×${d.toFixed(2)}×${h.toFixed(2)}`),
       el('td', { class: 'num' }, o.volume.toFixed(3)));
     tr.addEventListener('click', () => select(o.id, true));
-    tr.addEventListener('mouseenter', () => { state.hovered = o.id; state.labelsDirty = true; });
-    tr.addEventListener('mouseleave', () => { state.hovered = null; state.labelsDirty = true; });
+    tr.addEventListener('mouseenter', () => setHover(o.id));
+    tr.addEventListener('mouseleave', () => setHover(null));
     tbody.appendChild(tr);
   }
   if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'No objects.')));
@@ -1015,6 +1326,7 @@ function updateStats() {
   const shown = c && c.step > 1 ? `${pts.toLocaleString()} of ${c.total.toLocaleString()} points (display limit)` : `${pts.toLocaleString()} points`;
   const items = [shown, `${s.objects} objects`, `${s.frames} frame${s.frames === 1 ? '' : 's'}`];
   $('#stats').replaceChildren(...items.flatMap((t, i) => [i ? ' · ' : '', el('span', { class: 'stat' }, t)]));
+  state.labelsDirty = true;
 }
 
 // ---------------------------------------------------------------- main
@@ -1069,7 +1381,9 @@ function animate() {
     if (state.objects.length) fadeBoxes();
     fadeHighlight();
   }
-  if (state.labelsDirty && state.ready) { state.labelsDirty = false; layoutLabels(); }
+  if (state.cluster && clusterViewMoved()) closeCluster();
+  // an open chip list holds the labels still (they would move under the pointer)
+  if (state.labelsDirty && state.ready && !state.cluster) { state.labelsDirty = false; layoutLabels(); }
   if (state.ready && state.cloudInScene && !document.body.dataset.rendered && ++cloudFrames > 1) {
     document.body.dataset.rendered = 'true';
   }

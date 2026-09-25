@@ -193,10 +193,13 @@ The page has four tabs:
 
 Other keys: `R` resets the view, and `Esc` clears the selection.
 
-Every box whose top is in view carries a label: its id on a tag in the object's colour, and its
-name wherever that fits without covering another label. Larger boxes on screen get their names
-first, and a tag that fits nowhere is still drawn at its box. The selected and hovered box always
-show their names, and labels never leave the view. Camera frustums fade out as the viewpoint comes
+Every box whose top is in view carries a label: its id on a tag in the object's colour, next to
+the box or, when that spot is taken, a little farther out with a leader line to it. No label
+covers another label, the header or the help line, and labels never leave the view. Tags that
+still do not fit are counted on a `+N` chip near their boxes: hovering or clicking the chip lists
+them (id and name), and clicking an entry selects that box. Names are added wherever they fit,
+larger boxes on screen first. The selected box always shows its name, and hovering a box or its
+tag shows its id and name. Camera frustums fade out as the viewpoint comes
 near them. The camera being looked through and its neighbours, for example the rest of a capture
 that turns in place, therefore never draw lines across the view. Boxes that enclose the viewpoint
 fade the same way, except the selected one.
