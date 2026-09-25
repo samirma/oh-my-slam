@@ -278,6 +278,37 @@ def test_mapper_holds_the_seed_of_a_new_map() -> None:
         assert float(np.median(np.abs(np.log(nf.depth[ok] / d[ok])))) < 0.012
 
 
+def test_held_keyframes_of_a_large_scene_keep_their_median_depth() -> None:
+    """A street-sized scene (the room scaled 5×: median depths 7-12 m) in which every keyframe
+    holds its scale (sparse-scaled, as in an outdoor video) and has a near/far error about its
+    median depth: the adjustment tilts each keyframe about its own median, which stays where the
+    SfM points put it. (Composed about 1 m, the held scale placed each keyframe median^b too deep
+    or too shallow: 25-35 % at 10 m.)"""
+    s = 5.0
+    poses = [Pose(T.R, s * T.t) for T in loop_poses()]
+    true = [s * depth_grid(T, KG).astype(np.float64) for T in loop_poses()]
+    tilt = tilts(4)
+    raw = []
+    for d, t in zip(true, tilt, strict=True):
+        ok = d > 0
+        piv = float(np.log(np.median(d[ok])))
+        raw.append(np.where(ok, d * np.exp(t * (np.log(np.where(ok, d, 1.0)) - piv)), 0.0))
+    new = [new_frame(record(k, poses[k], "sparse"), raw[k], 1.0) for k in range(N)]
+    ctx = SimpleNamespace(old_frames=[], new=new, notes={}, rescaled={}, tx=None)
+    api._adjust_depth_scales(ctx, lambda m: None)  # type: ignore[arg-type]
+    assert ctx.notes["depth_scale_adjustment"]["fixed"] == N
+    exps = ctx.notes["depth_scale_adjustment"]["exponent_range"]
+    assert exps[1] - exps[0] > 0.05  # the keyframes were tilted
+    medians = [float(np.median(nf.depth[d > 0]) / np.median(r[d > 0]))
+               for nf, r, d in zip(new, raw, true, strict=True)]
+    np.testing.assert_allclose(medians, 1.0, atol=2e-3)
+    for nf, r, d in zip(new, raw, true, strict=True):
+        ok = d > 0
+        err = np.abs(np.log(nf.depth[ok] / d[ok]))
+        assert float(np.median(err)) < 0.03
+        assert float(np.median(err)) <= float(np.median(np.abs(np.log(r[ok] / d[ok])))) + 0.005
+
+
 def test_stored_objects_move_with_their_rescaled_keyframes() -> None:
     from oh_my_slam.mapping import objects as mo
 

@@ -1081,7 +1081,12 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     pairs = _scale_pairs(nodes, float(np.median(depths)) if depths else 2.0)
     used = sorted({k for p in pairs for k in p})
     base = {k: nodes[k].load() for k in used}
-    corr = [DepthCorrection() for _ in nodes]
+    # Each keyframe's correction is composed about its own median depth (``then`` keeps the
+    # first correction's pivot), so that a held scale — log_scale 0 — is the factor 1 at that
+    # median. Composed onto a pivot of 0 (1 m), zeroing the scale turned a tilt b about the median
+    # into d ** b: an outdoor keyframe of median depth 11 m with b = 0.14 was placed 40 % too deep.
+    corr = [DepthCorrection(0.0, 0.0, base[k].log_median() if k in base else 0.0)
+            for k in range(len(nodes))]
     first: list[float] = []
     last: list[float] = []
     measured = 0
