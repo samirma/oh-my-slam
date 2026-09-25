@@ -58,6 +58,12 @@ Semantics (spec §2.3):
   object there is mapped twice, the copies offset alike. Pairs of such copies — compatible
   labels, never detected together, seen from distant viewpoints by keyframes that disagree —
   merge when other pairs between the same keyframes are displaced alike (``_loop_copies``).
+* **Objects seen twice.** An object seen from two sides of a room by keyframes that never see it
+  together is placed once by each set, each copy along its own keyframes' viewing rays at their
+  depth (a lamp 0.2 m from itself, a door handle seen from 1.7 m and from 4.5 m), or a label
+  flickers between the sets (a dock seen as a toilet from one side and as a dryer from the
+  other). Two such objects merge when each set of keyframes saw the other's place as the object
+  it detected there, and never as something else beside it (``_seen_as_one``).
 * **Point counts** are those of the map cloud: the points attributed to the object
   (``set_cloud_counts``; its votes inside its box grown by the depth noise, and the unlabelled
   cloud points nearest its own lifted points: ``geometry``), as the
@@ -73,6 +79,7 @@ Semantics (spec §2.3):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -211,6 +218,31 @@ LOOP_LINK = 0.6
 LOOP_SUPPORT = 2
 LOOP_PRECISE = 0.5  # m: a pair whose sightings all span at most this pins the offset down
 LOOP_OVERLAP = 0.5  # share of the shorter bounds that must overlap along each axis
+# Objects seen twice (``_seen_as_one``): keyframes that see an object from different sides place it
+# at depths a few percent apart, and each copy lies on its own keyframes' viewing rays. In
+# livingroom.mp4 a lamp seen along x by keyframes 62-76 and along y by keyframes 109-131 is placed
+# twice 0.21 m apart (each set 2-4 % short), a bottle on the dining table 0.16 m apart, a door
+# handle seen from 1.7 m and from 4.5 m 0.12 m apart: no depth ratio measured between the sets
+# explains it (they share little surface), nor do the objects' points or boxes overlap. The
+# SEEN_SAMPLES points of each object are projected into the detecting keyframes of the other.
+# There, an unoccluded point in view lies on the detection (its mask grown by the depth noise at
+# the object's distance, max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL · depth), at least MASK_DILATE
+# px), or in free space (the keyframe sees farther than the point by more than that noise: the
+# copy is misplaced), or beside the detection on another surface: that keyframe saw something
+# else there. Each object's keyframes must judge at least SEEN_EVIDENCE of the other's points and
+# see at most SEEN_APART of them beside their detections; then each object, moved along its own
+# viewing rays (about its keyframes' mean camera centre) by the depth factor nearest 1 among
+# SEEN_STEPS steps each way up to 1 ± SEEN_DEPTH, must lie on the other's detections with at
+# least SEEN_ON of its judged points, and the two moved copies must stand in one place: the middle
+# of each (of its 2-98 % bounds) within the other's bounds grown by the depth noise, along both
+# horizontal axes. The faces of a lamp seen from two sides pass; a metal rack that the keyframes
+# of a sideboard see in front of it, standing beside the sideboard's end, does not.
+SEEN_SAMPLES = 400
+SEEN_EVIDENCE = 20
+SEEN_APART = 0.2
+SEEN_ON = 0.4
+SEEN_DEPTH = 0.15
+SEEN_STEPS = 6
 # An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
 # of the cells of its box's largest face at the resolution its keyframes sampled it, and at least
 # EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
@@ -325,6 +357,19 @@ class MapObject:
     sightings: list[Sighting] = field(default_factory=list)  # one per detection (sorted)
     cloud_points: int | None = None  # map-cloud points attributed to it (None: not yet counted)
     cloud_min: int | None = None  # the cloud points it needs to be exported (min_cloud_points)
+    _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def memo(self, name: str, compute: Callable[[], Any]) -> Any:
+        """``compute()``, once per state of the object's evidence: its points, sightings and
+        keyframes, which are replaced, never modified in place, when evidence arrives (the merge
+        tests compare every pair of objects, most of them unchanged since the last round)."""
+        state = (self.points, self.sightings, self.frames)
+        held = self._memo.get("")
+        if held is None or any(x is not y for x, y in zip(held, state, strict=True)):
+            self._memo = {"": state}
+        if name not in self._memo:
+            self._memo[name] = compute()
+        return self._memo[name]
 
     @property
     def observations(self) -> int:
@@ -347,7 +392,14 @@ class MapObject:
 
     @property
     def centroid(self) -> NDArray[np.float64]:
-        return self.points.mean(0).astype(np.float64) if len(self.points) else np.zeros(3)
+        c: NDArray[np.float64] = self.memo("centroid", lambda: self.points.mean(0).astype(
+            np.float64) if len(self.points) else np.zeros(3))
+        return c.copy()
+
+    @property
+    def extent(self) -> float:
+        """Horizontal diagonal of its points (``_extent``)."""
+        return float(self.memo("extent", lambda: _extent(self.points)))
 
     def add_points(self, pts: NDArray[Any]) -> None:
         self.points = canonical_points(np.concatenate([self.points, np.asarray(pts, np.float32)]))
@@ -985,7 +1037,11 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     #    whole map that have each object in view and confirm
     alias: dict[int, int] = {}
     surfaces = None if surface is None else _Surfaces(surface, state.floor_z)
-    merged = _merge(state, touched, alias, views, surfaces)
+    instances: dict[int, list[tuple[int, Any]]] = {}
+    for i, ob in enumerate(obs):
+        instances.setdefault(ob.frame, []).append((owner[i], ob.inst.mask))
+    masks = _Masks(ctx, views, instances, state.merged_into, alias)
+    merged = _merge(state, touched, alias, views, surfaces, masks)
     for o in state.objects:
         o.views_in_frustum = count_views(o, records)
         confirm(o)
@@ -1256,7 +1312,7 @@ def _candidate_objects(obs: list[Observation], objs: list[MapObject]
         return []
     c = np.array([ob.centroid for ob in obs])
     co = np.array([objs[j].centroid for j in have])
-    eo = np.array([_extent(objs[j].points) for j in have])
+    eo = np.array([objs[j].extent for j in have])
     i, k = _near(c, np.zeros(len(obs)), co, eo)
     compat = _compatible_matrix([ob.label for ob in obs], [objs[j].label for j in have])
     ok = compat[i, k]
@@ -1355,18 +1411,20 @@ def containment(a: OBB, b: OBB, pad: float = 0.1, samples: int = 3000) -> float:
 def _scale(o: MapObject) -> float:
     """Size of an object: the largest robust (2-98 %) extent — horizontal diagonal or height — of
     the points its box is fitted to (``fit_points``)."""
-    pts = fit_points(o)
-    if len(pts) < 2:
-        return 0.0
-    lo, hi = np.percentile(pts[:, 2], [2, 98])
-    return max(_extent(pts), float(hi - lo))
+    def compute() -> float:
+        pts = fit_points(o)
+        if len(pts) < 2:
+            return 0.0
+        lo, hi = np.percentile(pts[:, 2], [2, 98])
+        return max(_extent(pts), float(hi - lo))
+    return float(o.memo("scale", compute))
 
 
 def _reach(a: MapObject, b: MapObject) -> float:
     """How far apart the copies of one object that disagreeing keyframes placed may lie:
     ``DEPTH_RATIO_MAX`` of the farther one's viewing distance, plus their mean extent."""
     return (DEPTH_RATIO_MAX * max(a.obs_depth, b.obs_depth)
-            + (_extent(a.points) + _extent(b.points)) / 2)
+            + (a.extent + b.extent) / 2)
 
 
 def _viewpoint_distance(Ta: Pose, Tb: Pose, scale: float) -> float:
@@ -1753,24 +1811,213 @@ def _one_surface(a: MapObject, b: MapObject, surfaces: _Surfaces | None = None) 
     return shared
 
 
+@dataclass
+class _Grown:
+    """An object's detections in one keyframe, grown by the depth noise (``SEEN_*``): a crop of
+    the grid at (``r0``, ``c0``)."""
+
+    r0: int
+    c0: int
+    mask: NDArray[np.bool_]
+
+    def covers(self, u: NDArray[np.int64], v: NDArray[np.int64]) -> NDArray[np.bool_]:
+        h, w = self.mask.shape
+        r, c = v - self.r0, u - self.c0
+        ok = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+        out = np.zeros(len(u), bool)
+        out[ok] = self.mask[r[ok], c[ok]]
+        return out
+
+
+class _Masks:
+    """The detection masks of the objects in their keyframes, for ``_seen_as_one``: this update's
+    instances (``instances``: keyframe -> [(object id, mask)], in memory) and those of the stored
+    keyframes (their ``instances.json``, loaded lazily), by the object that owns them now (ids
+    resolved through the map's earlier merges and this update's, ``alias``). Grown masks and test
+    results are cached; ``forget`` drops those of an object whose evidence changed."""
+
+    def __init__(self, ctx: Any, views: _Views, instances: dict[int, list[tuple[int, Any]]],
+                 merged_into: dict[int, int], alias: dict[int, int]) -> None:
+        self.ctx = ctx
+        self.views = views
+        self.frames = {f: list(v) for f, v in instances.items()}
+        self.merged_into = merged_into
+        self.alias = alias
+        self.grown: dict[tuple[int, int], _Grown | None] = {}
+        self.results: dict[tuple[Any, ...], float] = {}
+
+    def owner(self, oid: int) -> int:
+        seen: set[int] = set()
+        while oid not in seen:
+            seen.add(oid)
+            nxt = self.alias.get(oid, self.merged_into.get(oid))
+            if nxt is None:
+                break
+            oid = nxt
+        return oid
+
+    def _instances(self, f: int) -> list[tuple[int, Any]]:
+        if f not in self.frames:
+            import json
+
+            rec = self.views.records.get(f)
+            out: list[tuple[int, Any]] = []
+            if rec is not None and self.ctx is not None:
+                p = self.ctx.tx.current(frame_file(rec.name, "instances.json"))
+                if p.exists():
+                    out = [(int(x["object_id"]), x["mask"])
+                           for x in json.loads(p.read_text()).get("instances", [])]
+            self.frames[f] = out
+        return self.frames[f]
+
+    def mask(self, o: MapObject, f: int, view: View) -> _Grown | None:
+        """``o``'s detections in keyframe ``f`` grown by the depth noise at its distance there."""
+        key = (o.id, f)
+        if key not in self.grown:
+            masks = [m if isinstance(m, np.ndarray) else rle.decode(m)
+                     for oid, m in self._instances(f) if self.owner(oid) == o.id]
+            masks = [m for m in masks if m.shape == view.depth.shape]
+            self.grown[key] = _grow(np.logical_or.reduce(masks), view) if masks else None
+        return self.grown[key]
+
+    def forget(self, *ids: int) -> None:
+        drop = set(ids)
+        self.grown = {k: v for k, v in self.grown.items() if k[0] not in drop}
+
+
+def _grow(mask: NDArray[np.bool_], view: View) -> _Grown | None:
+    """``mask`` grown by the depth noise at the median depth under it (``SEEN_*``)."""
+    box = _bbox(mask)
+    if box is None:
+        return None
+    ok = mask & view.valid & (view.depth > 0)
+    z = float(np.median(view.depth[ok])) if ok.any() else 1.0
+    r = int(np.ceil(max(MASK_DILATE,
+                        max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * z) * view.K.fx / z)))
+    h, w = mask.shape
+    r0, r1 = max(0, box[0] - r), min(h, box[1] + r)
+    c0, c1 = max(0, box[2] - r), min(w, box[3] + r)
+    near = ndimage.distance_transform_edt(~mask[r0:r1, c0:c1]) <= r
+    return _Grown(r0, c0, near)
+
+
+def _seen_samples(o: MapObject) -> NDArray[np.float64]:
+    pts = np.asarray(o.points, np.float64)
+    if len(pts) > SEEN_SAMPLES:
+        pts = pts[np.linspace(0, len(pts) - 1, SEEN_SAMPLES).astype(int)]
+    return pts
+
+
+def _judged(o: MapObject, pts: NDArray[np.float64], masks: _Masks) -> NDArray[np.float64]:
+    """How the keyframes that detected ``o`` saw the points ``pts`` (of another object): counts of
+    (on its detections, in free space, beside its detections, judged), over the unoccluded points
+    in view of each keyframe (``SEEN_*``)."""
+    out = np.zeros(4)
+    for f in o.frames:
+        view = masks.views.get(f)
+        grown = None if view is None else masks.mask(o, f, view)
+        if view is None or grown is None:
+            continue
+        inside, z, d, u, v = view.lookup_pixels(pts)
+        keep = inside & (z - d <= tau(z))  # occluded points tell nothing
+        if not keep.any():
+            continue
+        z, d, u, v = z[keep], d[keep], u[keep], v[keep]
+        free = d - z > np.maximum(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * z)
+        on = grown.covers(u, v) & ~free
+        out += [on.sum(), free.sum(), (~on & ~free).sum(), len(z)]
+    return out
+
+
+def _ray_origin(o: MapObject, views: _Views) -> NDArray[np.float64] | None:
+    """Mean camera centre of an object's sightings (weighted by their points)."""
+    centres, weights = [], []
+    for s in o.sightings:
+        T = views.pose(s.frame)
+        if T is not None:
+            centres.append(T.t)
+            weights.append(float(max(s.points, 1)))
+    return None if not centres else np.average(np.asarray(centres), axis=0, weights=weights)
+
+
+def _placed(o: MapObject, pts: NDArray[np.float64], origin: NDArray[np.float64], masks: _Masks
+            ) -> tuple[float, float] | None:
+    """(depth factor, share on ``o``'s detections) of the factor nearest 1 that moves ``pts``
+    along their viewing rays (about ``origin``) onto the detections of ``o`` (``SEEN_ON``)."""
+    step = np.log1p(SEEN_DEPTH) / SEEN_STEPS
+    for k in range(2 * SEEN_STEPS + 1):  # factors 1, 1 + x, 1 / (1 + x), ...
+        factor = float(np.exp(step * ((k + 1) // 2) * (1 if k % 2 else -1)))
+        c = _judged(o, origin + factor * (pts - origin), masks)
+        if c[3] >= SEEN_EVIDENCE and c[0] >= SEEN_ON * c[3]:
+            return factor, float(c[0] / c[3])
+    return None
+
+
+def _meet_in_plan(a: NDArray[np.float64], b: NDArray[np.float64], tol: float) -> bool:
+    """Whether each of two point sets has its middle (of its 2-98 % bounds) within the other's
+    bounds grown by ``tol``, along both horizontal axes."""
+    lo_a, hi_a = np.percentile(a[:, :2], [2, 98], axis=0)
+    lo_b, hi_b = np.percentile(b[:, :2], [2, 98], axis=0)
+    mid_a, mid_b = (lo_a + hi_a) / 2, (lo_b + hi_b) / 2
+    return bool(np.all((mid_a >= lo_b - tol) & (mid_a <= hi_b + tol)
+                       & (mid_b >= lo_a - tol) & (mid_b <= hi_a + tol)))
+
+
+def _seen_as_one(a: MapObject, b: MapObject, masks: _Masks) -> float:
+    """>= 1 when two objects that no keyframe detected together are one object seen twice: by
+    keyframes on different sides that placed it at different depths, or under another label
+    (``SEEN_*``). Both must be detected reliably in ``CONFIRM_DETECTIONS`` keyframes, their centres
+    within ``_reach``. The value is the smaller on-detection share over ``SEEN_ON``; 0 when the
+    keyframes saw them apart, or saw too little to tell."""
+    if set(a.frames) & set(b.frames) or not a.sightings or not b.sightings \
+            or min(len(a.reliable_frames()), len(b.reliable_frames())) < CONFIRM_DETECTIONS \
+            or len(a.points) == 0 or len(b.points) == 0 \
+            or np.linalg.norm(a.centroid - b.centroid) > _reach(a, b):
+        return 0.0
+    key = (a.id, b.id, len(a.points), len(b.points), tuple(a.frames), tuple(b.frames))
+    if key not in masks.results:
+        masks.results[key] = _seen_twice(a, b, masks)
+    return masks.results[key]
+
+
+def _seen_twice(a: MapObject, b: MapObject, masks: _Masks) -> float:
+    """The tests of ``_seen_as_one`` once its gates are passed (``SEEN_*``)."""
+    pa, pb = _seen_samples(a), _seen_samples(b)
+    for c in (_judged(a, pb, masks), _judged(b, pa, masks)):
+        if c[3] < SEEN_EVIDENCE or c[2] > SEEN_APART * c[3]:
+            return 0.0
+    ca, cb = _ray_origin(a, masks.views), _ray_origin(b, masks.views)
+    if ca is None or cb is None:
+        return 0.0
+    on_a, on_b = _placed(a, pb, cb, masks), _placed(b, pa, ca, masks)
+    if on_a is None or on_b is None:
+        return 0.0
+    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * max(a.obs_depth, b.obs_depth))
+    if not _meet_in_plan(ca + on_b[0] * (pa - ca), cb + on_a[0] * (pb - cb), tol):
+        return 0.0
+    return min(on_a[1], on_b[1]) / SEEN_ON
+
+
 def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
                     surfaces: _Surfaces | None = None,
-                    loops: set[frozenset[int]] | None = None) -> float:
+                    loops: set[frozenset[int]] | None = None,
+                    masks: _Masks | None = None) -> float:
     """>= 1 when two objects are one physical object. Compatible labels: >= 50 % of the smaller
     one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box >= 60 %
     inside the other), or (with ``views``) copies placed by keyframes whose depths disagree
     (``_depth_explained``), or copies of a loop whose keyframes are misaligned (``loops``: pairs
-    of ids from ``_loop_copies``; still never detected together). Incompatible labels (the detector's label flickered between
-    keyframes): no keyframe detected both (it would have seen two things there), their sizes are
-    comparable (``MERGE_SCALE``: neither is a part of the other or an item resting on it) and
-    >= 50 % of either one's points lie on the other's surface. Whatever the labels: pieces of one
-    horizontal surface (``_one_surface``, with ``surfaces``: the map's fused surface). The value
-    orders the merges (strongest first)."""
+    of ids from ``_loop_copies``; still never detected together). Incompatible labels (the
+    detector's label flickered between keyframes): no keyframe detected both (it would have seen
+    two things there), their sizes are comparable (``MERGE_SCALE``: neither is a part of the other
+    or an item resting on it) and >= 50 % of either one's points lie on the other's surface.
+    Whatever the labels: pieces of one horizontal surface (``_one_surface``, with ``surfaces``:
+    the map's fused surface); with ``masks`` (the detections of the objects in their keyframes),
+    one object seen twice by keyframes that never saw it together (``_seen_as_one``; incompatible
+    labels of comparable size only). The value orders the merges (strongest first)."""
     same_kind = compatible(a.label, b.label)
     if not same_kind and set(a.frames) & set(b.frames):
         return 0.0
-    if np.linalg.norm(a.centroid - b.centroid) > max(CENTROID_GATE * 2,
-                                                     _extent(a.points) + _extent(b.points)):
+    if np.linalg.norm(a.centroid - b.centroid) > max(CENTROID_GATE * 2, a.extent + b.extent):
         return 0.0
     surface = _one_surface(a, b, surfaces)
     if not same_kind:
@@ -1778,8 +2025,9 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
         if min(sa, sb) < MERGE_SCALE * max(sa, sb):
             return surface
         radius = max(0.05, 0.02 * min(a.obs_depth, b.obs_depth))
-        return max(surface, overlap_fraction(a.points, b.points, radius) / MERGE_OVERLAP,
-                   overlap_fraction(b.points, a.points, radius) / MERGE_OVERLAP)
+        s = max(surface, overlap_fraction(a.points, b.points, radius) / MERGE_OVERLAP,
+                overlap_fraction(b.points, a.points, radius) / MERGE_OVERLAP)
+        return max(s, _seen_as_one(a, b, masks)) if s < 1.0 and masks is not None else s
     small, big = (a, b) if len(a.points) <= len(b.points) else (b, a)
     radius = max(0.05, 0.02 * small.obs_depth)
     s = max(surface, overlap_fraction(small.points, big.points, radius) / MERGE_OVERLAP)
@@ -1791,6 +2039,8 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
     if s < 1.0 and loops and frozenset((a.id, b.id)) in loops \
             and not set(a.frames) & set(b.frames):
         s = 1.0
+    if s < 1.0 and masks is not None:
+        s = max(s, _seen_as_one(a, b, masks))
     return s
 
 
@@ -1799,37 +2049,52 @@ def _content_key(o: MapObject) -> tuple[Any, ...]:
 
 
 def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
-           views: _Views | None = None, surfaces: _Surfaces | None = None) -> int:
+           views: _Views | None = None, surfaces: _Surfaces | None = None,
+           masks: _Masks | None = None) -> int:
     """Merge duplicates among the objects (at least one of each pair touched by this update),
     strongest pair first; the lower id is kept and ``alias`` maps each merged id to its keeper.
     ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``) and
     the loop copies (``_loop_copies``: sought among the objects once no other merge is left —
     the copies of a group are recognised on whole objects, not on the pieces the other tests
     join — and merged like the rest; again until none is found), ``surfaces`` (the map's fused
-    surface) the surface-continuity test (``_Surfaces``)."""
+    surface) the surface-continuity test (``_Surfaces``), ``masks`` (the objects' detections) the
+    objects seen twice (``_seen_as_one``: tested, likewise on whole objects, once no other merge
+    and no loop copy is left, then with every other test)."""
     strength: dict[tuple[int, int], float] = {}
     loops: set[frozenset[int]] = set()
+    seen: _Masks | None = None
 
     def pairs_of(o: MapObject) -> None:
         for p in state.objects:
             if p.id == o.id or not (o.id in touched or p.id in touched):
                 continue
             a, b = (o, p) if o.id < p.id else (p, o)
-            s = _merge_strength(a, b, views, surfaces, loops)
+            s = _merge_strength(a, b, views, surfaces, loops, seen)
             if s >= 1.0:
                 strength[(a.id, b.id)] = s
             else:
                 strength.pop((a.id, b.id), None)
+
+    def exhausted() -> None:
+        """No merge left: look for loop copies, then (once) for objects seen twice."""
+        nonlocal loops, seen
+        if views is not None:
+            found = _loop_copies(state.objects, touched, views) - loops
+            loops |= found
+            for oid in sorted({x for p in found for x in p}):
+                pairs_of(by[oid])
+        if strength or masks is None or seen is not None:
+            return
+        seen = masks
+        strength.update(_seen_pairs(state.objects, touched, seen))
 
     by = state.by_id()
     for o in sorted(state.objects, key=lambda o: o.id):
         if o.id in touched:
             pairs_of(o)
     merged = 0
-    if not strength and views is not None:
-        loops = _loop_copies(state.objects, touched, views)
-        for oid in sorted({x for p in loops for x in p}):
-            pairs_of(by[oid])
+    if not strength:
+        exhausted()
     while strength:
         (ka, kb), _ = min(strength.items(), key=lambda kv: (
             -kv[1], sorted([_content_key(by[kv[0][0]]), _content_key(by[kv[0][1]])])))
@@ -1837,6 +2102,8 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         keep.absorb(gone)
         refit(keep, state.floor_z)
         alias[gone.id] = keep.id
+        if masks is not None:
+            masks.forget(keep.id, gone.id)
         state.objects = [o for o in state.objects if o.id != gone.id]
         del by[gone.id]
         touched.add(keep.id)
@@ -1846,12 +2113,46 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         strength = {k: v for k, v in strength.items() if gone.id not in k and keep.id not in k}
         pairs_of(keep)
         merged += 1
-        if not strength and views is not None:
-            found = _loop_copies(state.objects, touched, views) - loops
-            loops |= found
-            for oid in sorted({x for p in found for x in p}):
-                pairs_of(by[oid])
+        if not strength:
+            exhausted()
     return merged
+
+
+def _seen_pairs(objects: list[MapObject], touched: set[int], masks: _Masks
+                ) -> dict[tuple[int, int], float]:
+    """The pairs (ids, lower first; at least one touched by this update) of objects seen twice
+    (``_seen_as_one``) under the label conditions of ``_merge_strength``, with their strength.
+    The pairs are first gated all at once (centres within ``_reach`` and the merge gate, reliable
+    detections)."""
+    objs = sorted((o for o in objects if len(o.points) and o.sightings
+                   and len(o.reliable_frames()) >= CONFIRM_DETECTIONS), key=lambda o: o.id)
+    if len(objs) < 2:
+        return {}
+    c = np.array([o.centroid for o in objs])
+    e = np.array([o.extent for o in objs])
+    depth = np.array([o.obs_depth for o in objs])
+    hit = np.array([o.id in touched for o in objs])
+    i, j = np.triu_indices(len(objs), 1)
+    near = np.linalg.norm(c[i] - c[j], axis=1) <= np.minimum(
+        DEPTH_RATIO_MAX * np.maximum(depth[i], depth[j]) + (e[i] + e[j]) / 2,
+        np.maximum(CENTROID_GATE * 2, e[i] + e[j]))
+    out: dict[tuple[int, int], float] = {}
+    scale: dict[int, float] = {}
+    for x, y in zip(i[near & (hit[i] | hit[j])].tolist(), j[near & (hit[i] | hit[j])].tolist(),
+                    strict=True):
+        a, b = objs[x], objs[y]
+        if set(a.frames) & set(b.frames):
+            continue
+        if not compatible(a.label, b.label):
+            for o in (a, b):
+                if o.id not in scale:
+                    scale[o.id] = _scale(o)
+            if min(scale[a.id], scale[b.id]) < MERGE_SCALE * max(scale[a.id], scale[b.id]):
+                continue
+        s = _seen_as_one(a, b, masks)
+        if s >= 1.0:
+            out[(a.id, b.id)] = s
+    return out
 
 
 # ------------------------------------------------------------------------------------------------

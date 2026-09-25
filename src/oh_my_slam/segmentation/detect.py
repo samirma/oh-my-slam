@@ -53,6 +53,7 @@ COMPATIBLE_GROUPS: tuple[frozenset[str], ...] = (
                "tv stand", "display case", "file cabinet", "drawer"}),
     frozenset({"cup", "mug", "glass", "wine glass"}),
     frozenset({"bottle", "wine bottle"}),
+    frozenset({"book", "magazine", "newspaper"}),
     frozenset({"painting", "picture frame", "poster", "mirror"}),
     frozenset({"rug", "carpet"}),
     frozenset({"cushion", "pillow"}),
@@ -65,8 +66,9 @@ COMPATIBLE_GROUPS: tuple[frozenset[str], ...] = (
 
 # Floor grounding (``segmentation.obb.ground_upright``). When a floor plane is known, the box of a
 # floor-standing class whose visible bottom floats at most the class's gap (metres) above the floor
-# is extended down to it: its lower part is occluded (a chair behind a table) or too thin to be
-# seen (a table's legs). Everything else keeps its visible-surface box.
+# is extended down to it: its lower part is occluded (a chair behind a table, a door behind a
+# kitchen island) or too thin to be seen (a table's legs). Everything else keeps its
+# visible-surface box.
 _FLOOR_GAP = 0.8
 # Classes that also stand on furniture or hang on walls (a plant on a counter, a wall shelf): only
 # a bottom trimmed off at the floor contact (depth edges, occlusion by the floor's clutter) is
@@ -83,7 +85,7 @@ FLOOR_STANDING: dict[str, float] = {
         "water dispenser", "coat rack", "fire hydrant", "bollard", "mailbox", "bicycle",
         "motorcycle", "scooter", "car", "taxi", "bus", "truck", "van", "street light",
         "lamppost", "traffic light", "stroller", "wheelchair", "file cabinet", "toilet",
-        "bathtub", "fireplace", "column", "pillar", "tree",
+        "bathtub", "fireplace", "column", "pillar", "door", "doorway", "gate", "tree",
         "palm tree", "bush", "hedge", "fence",
     )},
     **{k: _CONTACT_GAP for k in (

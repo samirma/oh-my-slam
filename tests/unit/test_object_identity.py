@@ -1,7 +1,8 @@
 """Object identity (spec §2.3, one id per physical object): copies of one object placed by
 keyframes whose monocular depth disagrees (a loop closed by keyframes whose depth scale drifted)
-are merged, pieces of one horizontal surface are one object — within a keyframe and across
-keyframes — and objects without points in the map cloud are not exported."""
+are merged, so is one object seen twice by keyframes on different sides, pieces of one horizontal
+surface are one object — within a keyframe and across keyframes — and objects without points in
+the map cloud are not exported."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy import ndimage
 
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import objects as mo
@@ -94,6 +96,104 @@ def test_copies_placed_by_keyframes_whose_depth_disagrees_are_merged() -> None:
     both = {**far, 0: far[1]}
     assert merged(obj(60, "faucet", near, 2.5), obj(257, "faucet", both, 2.8), views) == {}
     assert merged(obj(60, "faucet", near, 2.5), obj(257, "cup", far, 2.8), views) == {}
+
+
+# --- objects seen twice --------------------------------------------------------------------------
+
+
+def pose_at(centre: tuple[float, float, float], yaw_deg: float) -> Pose:
+    return Pose(camera(yaw_deg).R, np.asarray(centre, np.float64))
+
+
+def render(pose: Pose, bodies: list[np.ndarray], wall_at: float) -> np.ndarray:
+    """Depth grid of a keyframe that sees ``bodies`` (dense point sets, in its placement) in front
+    of a fronto-parallel wall ``wall_at`` metres ahead."""
+    depth = np.full(SHAPE, wall_at, np.float32)
+    for pts in bodies:
+        pc = pose.inverse().apply(pts)
+        u = np.rint(K.fx * pc[:, 0] / pc[:, 2] + K.cx).astype(int)
+        v = np.rint(K.fy * pc[:, 1] / pc[:, 2] + K.cy).astype(int)
+        ok = (u >= 0) & (u < SHAPE[1]) & (v >= 0) & (v < SHAPE[0])
+        np.minimum.at(depth, (v[ok], u[ok]), pc[ok, 2].astype(np.float32))
+    return depth
+
+
+def seen_twice(labels: tuple[str, str], other: tuple[float, float, float] | None = None,
+               factor: float = 0.95) -> tuple[list[MapObject], mo._Masks]:
+    """A 0.15 m object at (3, 0, 0), detected by three keyframes looking along +x from x = 0 and
+    by three looking along +y from y = -3; each set places what it sees at ``factor`` of its
+    depth, 5 % short by default: two copies 0.2 m apart, each along its own set's viewing rays.
+    With ``other``, a second such object stands there, and the second set detects only it."""
+    rng = np.random.default_rng(5)
+    bodies = [rng.uniform(-0.075, 0.075, (4000, 3)) + (3.0, 0.0, 0.0)]
+    if other is not None:
+        bodies.append(rng.uniform(-0.075, 0.075, (4000, 3)) + other)
+    sets = {f: (pose_at((0.0, y, 0.0), 0.0), 0) for f, y in ((0, -0.2), (1, 0.0), (2, 0.2))}
+    sets.update({f: (pose_at((x, -3.0, 0.0), 90.0), 1) for f, x in ((3, 2.8), (4, 3.0), (5, 3.2))})
+    views, instances = {}, {}
+    parts: tuple[dict[int, np.ndarray], dict[int, np.ndarray]] = ({}, {})
+    for f, (pose, side) in sets.items():
+        placed = [pose.t + factor * (p - pose.t) for p in bodies]
+        depth = render(pose, placed, 4.5)
+        views[f] = View(depth, np.ones(SHAPE, bool), K, pose)
+        mask = ndimage.binary_closing(render(pose, [placed[side % len(placed)]], 99.0) < 99.0,
+                                      iterations=2)
+        instances[f] = [(60 if side == 0 else 257, mask)]
+        v, u = np.nonzero(mask & (depth < 4.5))
+        z = depth[v, u].astype(np.float64)
+        parts[side][f] = pose.apply(np.stack([(u - K.cx) / K.fx * z, (v - K.cy) / K.fy * z, z], 1))
+    objs = [obj(60, labels[0], parts[0], 2.9), obj(257, labels[1], parts[1], 2.9)]
+    return objs, mo._Masks(None, keyframes(views), instances, {}, {})
+
+
+def test_an_object_seen_from_two_sides_is_one_object() -> None:
+    """A lamp on a sideboard seen along x by some keyframes and along y by others: each set
+    places it along its own viewing rays, 0.2 m from the other's copy; the points and boxes of
+    the copies do not overlap enough, and no depth ratio relates the sets. Each set saw the other
+    copy's place as the lamp it detected (or as free space), never as something beside it."""
+    (a, b), masks = seen_twice(("lamp", "lamp"), None)
+    assert mo._merge_strength(a, b) < 1.0
+    assert mo._seen_as_one(a, b, masks) >= 1.0
+    alias: dict[int, int] = {}
+    state = ObjectState([a, b], 400)
+    assert mo._merge(state, {60, 257}, alias, masks.views, masks=masks) == 1
+    assert alias == {257: 60} and state.objects[0].frames == [0, 1, 2, 3, 4, 5]
+    # without the detections the copies stay two objects
+    (a, b), _ = seen_twice(("lamp", "lamp"), None)
+    assert mo._merge(ObjectState([a, b], 400), {60, 257}, {}, masks.views) == 0
+    # a label that flickered between the sides (a dock seen as a toilet and as a dryer)
+    (a, b), masks = seen_twice(("toilet", "dryer"), None)
+    alias = {}
+    assert mo._merge(ObjectState([a, b], 400), {60, 257}, alias, masks.views, masks=masks) == 1
+
+
+def test_two_objects_each_seen_from_one_side_stay_two() -> None:
+    """Two lamps 0.45 m apart, each detected by one set of keyframes only: each set sees the other
+    lamp in place beside the one it detected, so they are two objects."""
+    (a, b), masks = seen_twice(("lamp", "lamp"), (3.3, 0.35, 0.0), factor=1.0)
+    assert mo._seen_as_one(a, b, masks) == 0.0
+    alias: dict[int, int] = {}
+    assert mo._merge(ObjectState([a, b], 400), {60, 257}, alias, masks.views, masks=masks) == 0
+    # objects that a keyframe detected together are never one
+    (a, b), masks = seen_twice(("lamp", "lamp"), None)
+    b.frames = sorted({*b.frames, 0})
+    assert mo._seen_as_one(a, b, masks) == 0.0
+
+
+def test_moved_copies_must_stand_in_one_place() -> None:
+    """Seen from 3 m (depth noise 9 cm): the two faces of a 0.15 m lamp seen from two sides stand
+    in one place; a sideboard and a rack beside its end, whose corners meet, do not, nor do the
+    two faces of a 1 m cabinet (the middle of each lies 0.5 m from the other)."""
+    rng = np.random.default_rng(6)
+    lamp = rng.uniform(0, 1, (400, 3)) * (0.02, 0.15, 0.3)  # the face seen along x
+    shade = rng.uniform(0, 1, (400, 3)) * (0.15, 0.02, 0.3)  # the face seen along y
+    assert mo._meet_in_plan(lamp, shade, 0.09)
+    sideboard = rng.uniform(0, 1, (400, 3)) * (1.4, 0.4, 0.8)
+    rack = rng.uniform(0, 1, (400, 3)) * (0.8, 0.3, 1.5) + (1.35, 0.35, 0.0)
+    assert not mo._meet_in_plan(sideboard, rack, 0.09)
+    front = rng.uniform(0, 1, (400, 3)) * (0.02, 1.0, 1.0)
+    side = rng.uniform(0, 1, (400, 3)) * (1.0, 0.02, 1.0)
+    assert not mo._meet_in_plan(front, side, 0.09)
 
 
 # --- split surfaces --------------------------------------------------------------------------------

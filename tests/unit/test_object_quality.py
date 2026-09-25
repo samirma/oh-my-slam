@@ -74,6 +74,9 @@ def test_grounding_only_where_the_evidence_supports_it() -> None:
     assert bottom(b) > 0.7
     b = fit_object_obb(slab(rng, (0.3, 0.3, 0.4), (0, 0, 0.3)), "potted plant", UP, floor)
     assert bottom(b) == pytest.approx(floor, abs=1e-6)
+    # a door whose lower 0.4 m the keyframes that detected it never saw (behind a kitchen island)
+    b = fit_object_obb(slab(rng, (0.85, 0.05, 1.5), (0, 0, 1.15)), "door", UP, floor)
+    assert bottom(b) == pytest.approx(floor, abs=1e-6) and b.size[2] == pytest.approx(1.9, abs=0.05)
     # classes that are not floor-standing keep their visible box; no floor, no grounding
     b = fit_object_obb(slab(rng, (0.07, 0.07, 0.25), (0, 0, 0.3)), "bottle", UP, floor)
     assert bottom(b) > 0.15

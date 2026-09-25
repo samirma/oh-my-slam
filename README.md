@@ -456,6 +456,25 @@ point leaves the map untouched. One killed after it is completed by the next upd
     detected together merge when, for most of the 3 pairs of their keyframes nearest by
     viewpoint, the two keyframes' depths disagree by at least 5 % (measured on the surfaces both
     see) and the detections coincide once that ratio is removed.
+  * **Objects seen twice** are merged. Keyframes that see an object from different sides of a
+    room place it at depths a few percent apart, and each set puts its copy on its own viewing
+    rays: in the `livingroom.mp4` map a lamp seen along x from one side and along y from another
+    was two objects 0.2 m apart, and a door handle seen from 1.7 m and from 4.5 m two objects
+    0.12 m apart. The detector's label can also differ between the sides (a robot-vacuum dock
+    seen as a toilet from one side and as a dryer from the other). Two objects that no keyframe
+    detected together, each detected reliably in at least 2 keyframes, of compatible labels or of
+    comparable size, merge when both of these hold:
+    * The keyframes of each saw the other's place as the object they detected. The other's points
+      that such a keyframe sees (unoccluded, in view) lie on its detection, grown by the depth
+      noise at the object's distance (max(5 cm, 3 % of the distance)), or in free space, where
+      the keyframe sees farther. At most a fifth of them may lie beside its detection on another
+      surface, where the keyframe saw something else (two lamps side by side, each detected from
+      one side only, stay two).
+    * Each object, moved along its own viewing rays by a depth factor within ±15 %, lies on the
+      other's detections for at least 40 % of the points those keyframes see, and the two moved
+      copies stand in one place: along both horizontal axes, the middle of each lies within the
+      other's extent grown by the depth noise (a metal rack seen in front of a sideboard, but
+      standing beside its end, stays apart).
   * **Horizontal surfaces** (tables, desks, counters, beds, rugs) are often split by the
     detector around the items that rest on them: a counter top around a book becomes a left and
     a right "desk". Two detections of one keyframe with compatible surface labels whose masks
@@ -541,10 +560,12 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
    and the masks are lifted to 3D without depth-edge pixels.
 6. **OBBs:** each object gets an upright OBB, then ids and colours are assigned. A box of a
    floor-standing class is extended down to the floor when its visible bottom floats at most
-   the class's gap above it (0.8 m for furniture, 1.2 m for a person, 0.15 m for classes that
-   also stand on furniture or hang on walls, such as plants and shelves). The visible part must
-   span at least a fifth of the grounded height, except for classes seen mostly from the top
-   (tables, desks, counters, beds), and boxes under 10 cm are never grounded.
+   the class's gap above it (0.8 m for furniture and doors, 1.2 m for a person, 0.15 m for
+   classes that also stand on furniture or hang on walls, such as plants and shelves). The
+   visible part must span at least a fifth of the grounded height, except for classes seen
+   mostly from the top (tables, desks, counters, beds), and boxes under 10 cm are never
+   grounded. A door behind a kitchen island, or cut off by the bottom of every keyframe that
+   detected it, therefore still reaches the floor.
 
 Geometry and detection requests run concurrently on two connections.
 
