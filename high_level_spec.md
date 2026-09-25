@@ -89,24 +89,27 @@ The same `-p` attributes apply to every command that writes a PLY: `reconstruct.
 ### 2.3 Mapping — `mapper.sh`
 
 ```sh
-mapper.sh update -a <image(s)|video> -m <map-folder> [-f json|ply] [-o <file>] [-p <attrs>] -t full|single [-fps <n>]
+mapper.sh update -i <image(s)|video> -m <map-folder>   # whole map as JSON (default) to stdout
+mapper.sh update -i <image(s)|video> -m <map-folder> [-f json|ply] [-o <file>] [-p <attrs>] [-t full|single] [-fps <n>]
 ```
 
 `update` creates the map if `<map-folder>` does not yet exist or is empty, and otherwise
 extends the existing map with the new input. A non-empty folder that is not a map is refused
-and left untouched.
+and left untouched. Only `-i` and `-m` are required; every other option has a default.
 
-* `-a <image(s)|video>` — one or more images, or a video file.
+* `-i <image(s)|video>` — one or more images, or a video file.
 * `-m <map-folder>` — map directory; holds the persisted map and its metadata.
 * `-f json|ply` — output format, **default `json`**: the scene description of §3, or the
-  point cloud, in map coordinates. `-t` (required) selects what either format covers.
-* `-t full` — return the **entire** map: every object, and the estimated camera pose of each
-  contributing frame (PLY: the whole map cloud).
-* `-t single` — return only what the **newly added** input covers: the poses of the new
-  frames and the objects observed in them (PLY: the new frames' points).
+  point cloud, in map coordinates. `-t` selects what either format covers.
+* `-t full|single` — scope of the result, **default `full`**:
+  * `full` — the **entire** map: every object, and the estimated camera pose of each
+    contributing frame (PLY: the whole map cloud).
+  * `single` — only what the **newly added** input covers: the poses of the new frames and
+    the objects observed in them (PLY: the new frames' points).
 * `-o <file>` — write the result to this file instead of stdout; stdout then stays empty.
 * `-p <attrs>` — point-cloud attributes for `-f ply` (§2.2).
-* `-fps <n>` — for video input, the number of frames per second to sample for analysis.
+* `-fps <n>` — for video input, the number of frames per second to sample for analysis
+  (default `2`); ignored for images.
 
 The map's geometry is a point cloud; no surface mesh is produced.
 
@@ -250,21 +253,7 @@ every entry point, using the files in `examples/` as reference inputs. Video sam
   EXIF) of a robot head turning in place, for `mapper.sh` and, frame by frame, `segment.sh -i`;
   and — on the resulting map — for `segment.sh -m` and `view.sh -m`. File names encode the
   **commanded** head motion as `NNN_<motion>_<tilt>.jpg`:
-  * `NNN` — capture order, 001–079.
-  * `<motion>` — the yaw relative to frame 001, positive to the left:
-    * `bootstrap` → 0°;
-    * `bootstrap_leftYYY` → +YYY°;
-    * `bootstrap_side1`, `bootstrap_side2` → 0°, and `bootstrap_leftYYY_side` → +YYY°, each
-      after a small sideways step (translation not recorded);
-    * `left_YYY` → +YYY°;
-    * `right_to_YYY` → +YYY° (turning right, back towards 0°);
-    * `right_YYY` → −YYY°.
-  * `<tilt>` — `level`, or `up` / `down` for a pitch in that direction relative to the `level`
-    frame of the same heading (magnitude not recorded).
-
-  Frames 001 and 053 (`right_to_000`) share a heading, as do 026 (`left_210`) and 078
-  (`right_150`), which closes the 360° loop. The names are commanded values, not measurements:
-  the actual heading can deviate by several degrees.
+  * `NNN` — capture order
 
 The evaluators must report at least:
 
