@@ -11,7 +11,7 @@ OpenLABEL mapping and the colour palette).
 |---|---|
 | `start_inference_server.sh [--foreground\|--status\|--stop] [--timeout S]` | Starts the resident model server, or stops or queries it. |
 | `reconstruct.sh -i IMAGE [-f json\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default) or point cloud, in the camera frame. |
-| `mapper.sh update -a IMAGES\|FOLDERS\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] -t full\|single [-fps N]` | Creates or extends a persistent map. |
+| `mapper.sh update -i IMAGES\|FOLDERS\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
 | `segment.sh -i IMAGE [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` | Objects of one image: OBBs, colours, and with `-d` five artefact files. |
 | `segment.sh -m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | The persistent objects of a map, read-only and without the server. |
 | `view.sh -i IMAGE \| -m MAP [--port N] [--no-browser]` | Local browser viewer. `-m` needs no server. |
@@ -46,8 +46,8 @@ Model weights are downloaded on the first server start:
 ./reconstruct.sh -i photo.jpg > scene.json
 ./reconstruct.sh -i photo.jpg -f ply -p color=segment,voxel=0.01,normals=on -o objects.ply
 ./segment.sh -i photo.jpg -d out/ --min-score 0.6
-./mapper.sh update -a walk.mp4 -m maps/home -t full -fps 2 > map.json
-./mapper.sh update -a more_photos/ -m maps/home -t single -f ply -o new_part.ply
+./mapper.sh update -i walk.mp4 -m maps/home > map.json
+./mapper.sh update -i more_photos/ -m maps/home -t single -f ply -o new_part.ply
 ./segment.sh -m maps/home -d out_map/
 ./view.sh -m maps/home
 ./start_inference_server.sh --stop
@@ -83,9 +83,12 @@ describes what runs inside it.
 
 ### `mapper.sh update`
 
-`mapper.sh update -a INPUTS… -m MAP [-f json|ply] [-o FILE] [-p ATTRS] -t full|single [-fps N]`
+`mapper.sh update -i INPUTS… -m MAP [-f json|ply] [-o FILE] [-p ATTRS] [-t full|single] [-fps N]`
 
-* **`-a`** takes image files, folders of images, or exactly one video:
+Only `-i` and `-m` are required. With no other option, the command writes the whole map as JSON
+to stdout.
+
+* **`-i`** takes image files, folders of images, or exactly one video:
   * Images keep the order given; the files in a folder are sorted by name.
   * Hidden and non-image files in a folder are skipped.
   * Image types: jpg, jpeg, png, bmp, tif, tiff, webp, heic, heif.
@@ -94,7 +97,7 @@ describes what runs inside it.
   * A folder that is missing, or that contains only hidden entries, becomes a new map.
   * A map is extended.
   * Any other folder is refused and left untouched (exit 4).
-* **`-t`** is required:
+* **`-t`** sets the scope of the result (default `full`):
   * `full` returns the whole map: every exported object and every keyframe pose. With `-f ply`
     it returns the whole map cloud.
   * `single` returns only the keyframes added by this update and the objects they observe. With

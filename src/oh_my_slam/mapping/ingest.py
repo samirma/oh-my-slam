@@ -1,4 +1,4 @@
-"""Mapper inputs: ``-a`` expansion (image files, image folders, or exactly one video), keyframe
+"""Mapper inputs: ``-i`` expansion (image files, image folders, or exactly one video), keyframe
 sampling and naming."""
 
 from __future__ import annotations
@@ -49,11 +49,11 @@ def resolve_inputs(args: list[Path]) -> InputSpec:
     """Files and folders of images (folders sorted by name, hidden/non-image skipped), or
     exactly one video."""
     if not args:
-        raise UsageError("-a needs at least one image, image folder or video")
+        raise UsageError("-i needs at least one image, image folder or video")
     videos = [a for a in args if a.is_file() and a.suffix.lower() in VIDEO_SUFFIXES]
     if videos:
         if len(args) != 1:
-            raise UsageError("-a takes exactly one video, or images/folders (not both)")
+            raise UsageError("-i takes exactly one video, or images/folders (not both)")
         return InputSpec("video", [], videos[0])
     images: list[Path] = []
     for a in args:

@@ -334,25 +334,36 @@ def test_object_bookkeeping_and_projection() -> None:
 
 
 @pytest.mark.parametrize("env", [{}])
-def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path) -> None:
+def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path,
+                              capsys: pytest.CaptureFixture[str]) -> None:
+    """Only ``-i`` and ``-m`` are required (``-t`` defaults to full); ``-a`` no longer exists."""
     from oh_my_slam.cli import mapper as cli_mapper
 
     ap = cli_mapper.build_parser()
-    a = ap.parse_args(["update", "-a", "x.mp4", "-m", "m", "-t", "full"])
+    a = ap.parse_args(["update", "-i", "x.mp4", "-m", "m"])
+    assert (a.inputs, a.map) == ([Path("x.mp4")], Path("m"))
     assert (a.format, a.mode, a.fps, a.output, a.attrs) == ("json", "full", None, None, None)
-    a = ap.parse_args(["update", "-a", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-o", "c.ply",
+    assert ap.parse_args(["update", "-i", "x.mp4", "-m", "m", "-t", "full"]).mode == "full"
+    a = ap.parse_args(["update", "-i", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-o", "c.ply",
                        "-p", "voxel=0.05,normals=on", "-t", "single", "-fps", "3"])
-    assert a.inputs == [Path("a.jpg"), Path("b.jpg")] and a.fps == 3.0
+    assert a.inputs == [Path("a.jpg"), Path("b.jpg")] and (a.mode, a.fps) == ("single", 3.0)
     assert (a.output, a.attrs) == (Path("c.ply"), ["voxel=0.05,normals=on"])
-    for bad in (["update", "-a", "x.mp4", "-m", "m"], ["update", "-m", "m", "-t", "full"],
-                ["-a", "x"], ["update", "-a", "x", "-m", "m", "-t", "partial"]):
+    for bad, message in ((["update", "-m", "m"], "required: -i"),
+                         (["update", "-i", "x.mp4"], "required: -m"),
+                         (["update", "-a", "x.mp4", "-m", "m"], "required: -i"),
+                         (["update", "-i", "x.mp4", "-m", "m", "-a", "y.mp4"],
+                          "unrecognized arguments: -a"),
+                         (["-i", "x"], "invalid choice"),
+                         (["update", "-i", "x", "-m", "m", "-t", "partial"], "invalid choice")):
         with pytest.raises(SystemExit) as e:
             ap.parse_args(bad)
         assert e.value.code == 2
+        assert message in capsys.readouterr().err, bad
     repo = Path(__file__).resolve().parents[2]
     res = subprocess.run([str(repo / "mapper.sh"), "update", "-a", "x.mp4", "-m",
                           str(tmp_path / "m")], capture_output=True, env=os.environ.copy())
-    assert res.returncode == 2 and res.stdout == b""
+    assert res.returncode == 2 and res.stdout == b"" and b"required: -i" in res.stderr
+    assert not (tmp_path / "m").exists()
 
 
 def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyPatch,
@@ -378,7 +389,7 @@ def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(api, "update", fake_update)
     monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
         stdout) if output is None else PayloadWriter(path=output))
-    base = ["update", "-a", "x.jpg", "-m", str(tmp_path / "m"), "-t", "full"]
+    base = ["update", "-i", "x.jpg", "-m", str(tmp_path / "m")]
     for bad in (["-p", "voxel=0.1"], ["-f", "ply", "-p", "stride=2"],
                 ["-f", "ply", "-p", "max-depth=3"], ["-f", "ply", "-p", "voxel=-1"]):
         with pytest.raises(UsageError):
@@ -390,8 +401,11 @@ def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyP
     assert calls[0]["attrs"] == CloudAttrs(color="height", voxel=0.1, normals=True)
     assert calls[0]["fmt"] == "ply" and target.read_bytes() == b"PAYLOAD"
     assert stdout.getvalue() == b""
-    assert cli_mapper.main(base) == 0
+    assert cli_mapper.main(base) == 0  # defaults: the whole map as JSON to stdout
     assert calls[1]["attrs"] == CloudAttrs() and stdout.getvalue() == b"PAYLOAD"
+    assert (calls[1]["mode"], calls[1]["fmt"], calls[1]["fps"]) == ("full", "json", 2.0)
+    assert cli_mapper.main(base + ["-t", "single"]) == 0
+    assert calls[2]["mode"] == "single"
 
 
 # --- map cloud: fused surface + latest-frame attribution ----------------------------------------

@@ -6,8 +6,9 @@ strictly one command at a time.
 2. ``restaurant.jpg``: ``reconstruct.sh`` (JSON, PLY, ``-o`` PLY coloured by segment),
    ``segment.sh -i`` (artefacts, ``-o`` PLY) and ``view.sh -i``.
 3. Every ``ainex-captures`` frame: ``segment.sh -i``.
-4. ``mapper.sh update``: the sequence in one update, and split across ``splits`` updates into a
-   second map (first update ``-o`` JSON, middle ones ``-t single -f ply``, last ``-t full``).
+4. ``mapper.sh update``: the sequence in one update (default options: the whole map as JSON),
+   and split across ``splits`` updates into a second map (first update ``-o`` JSON, middle ones
+   ``-t single -f ply``, last ``-t full``).
 5. On the one-update map: ``segment.sh -m`` (artefacts), ``view.sh -m``; ``segment.sh -m -f ply
    -o`` on the split map.
 
@@ -303,19 +304,18 @@ class Evaluation:
         """The one-update map and the split map; their ``-t full`` scenes."""
         single_dir, split_dir = self.out / "maps" / "single", self.out / "maps" / "split"
         single = self.scene(self.run("mapper_single", "mapper_single", "mapper.sh", "update",
-                                     "-a", self.examples / SEQUENCE, "-m", single_dir,
-                                     "-t", "full"))
+                                     "-i", self.examples / SEQUENCE, "-m", single_dir))
         split = None
         parts = np.array_split(np.arange(len(captures)), self.splits)
         for k, idx in enumerate(parts, start=1):
             tag = f"mapper_split_{k}"
             args: tuple[str | Path, ...] = (
-                "update", "-a", *(self.examples / SEQUENCE / captures[i].name for i in idx),
+                "update", "-i", *(self.examples / SEQUENCE / captures[i].name for i in idx),
                 "-m", split_dir)
             if k == 1:
                 target = self.out / "outputs" / f"{tag}.json"
-                self.scene(self.run(tag, "mapper_split", "mapper.sh", *args, "-t", "full",
-                                    "-o", target, stdout="empty", output=target))
+                self.scene(self.run(tag, "mapper_split", "mapper.sh", *args, "-o", target,
+                                    stdout="empty", output=target))
             elif k < len(parts):
                 self.cloud_colours(self.run(tag, "mapper_split", "mapper.sh", *args, "-t",
                                             "single", "-f", "ply", "-p", LABELLED_SEGMENTS,

@@ -66,8 +66,9 @@ def test_down_server_fails_fast(image: Path, tmp_path: Path) -> None:
         ("reconstruct.sh", ["-i", str(image), "-f", "ply", "-p", "voxel=0.01"]),
         ("segment.sh", ["-i", str(image)]),
         ("segment.sh", ["-i", str(image), "-o", str(tmp_path / "x.json")]),
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m"), "-t", "full",
-                       "-f", "ply", "-p", "voxel=0.05"]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m")]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
+                       "-p", "voxel=0.05"]),
     ]:
         t0 = time.monotonic()
         res = sh(script, *args)
@@ -88,10 +89,10 @@ def test_bad_attributes_exit_2_before_the_server_is_contacted(image: Path, tmp_p
         ("segment.sh", ["-i", str(image), "-f", "ply", "-p", "stride=0"], b"stride must be"),
         ("segment.sh", ["-i", str(image), "-f", "ply", "-p", "color=height"], b"fixed to segment"),
         ("segment.sh", ["-i", str(image), "-p", "voxel=0.1"], b"-f ply or -d"),
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m"), "-t", "full",
-                       "-f", "ply", "-p", "stride=2"], b"pixel-level attribute"),
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m"), "-t", "full",
-                       "-p", "voxel=0.1"], b"-f ply"),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
+                       "-p", "stride=2"], b"pixel-level attribute"),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-p", "voxel=0.1"],
+         b"-f ply"),
     ]:
         res = sh(script, *args)
         assert res.returncode == 2, (script, args, res.stderr)
@@ -127,9 +128,8 @@ def test_output_file_leaves_stdout_empty(stub_server: None, image: Path, tmp_pat
          "ply"),
         ("segment.sh", ["-i", str(image), "-f", "ply", "-p", "label=on"], "ply"),
         ("segment.sh", ["-i", str(image), "-d", str(tmp_path / "art")], "json"),
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "map"), "-t", "full"],
-         "json"),
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "map2"), "-t", "single",
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "map")], "json"),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "map2"), "-t", "single",
                        "-f", "ply", "-p", "color=segment,label=on,voxel=0.05"], "ply"),
     ]:
         target = tmp_path / "results" / f"{script}-{len(args)}.{kind}"
@@ -190,8 +190,10 @@ def test_usage_errors_exit_2(image: Path, tmp_path: Path) -> None:
         ("segment.sh", ["-m", str(tmp_path), "--min-score", "0.3"]),
         ("segment.sh", []),
         ("segment.sh", ["-i", str(image), "-o", str(tmp_path)]),  # -o names a file, not a folder
-        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m2"), "-t", "full",
-                       "-f", "ply", "-p", "min-depth=1"]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m2"), "-f", "ply",
+                       "-p", "min-depth=1"]),
+        ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m2")]),  # -i, not -a
+        ("mapper.sh", ["update", "-i", str(image)]),
     ]:
         res = sh(script, *args)
         assert res.returncode == 2, (script, args, res.stderr)
