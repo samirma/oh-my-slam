@@ -7,15 +7,16 @@ import numpy as np
 import pytest
 
 from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, parse_cloud_attrs
-from oh_my_slam.core.geometry import voxel_keys
+from oh_my_slam.core.geometry import voxel_downsample_indices, voxel_keys
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.reconstruction.pointcloud import pixel_mask
+from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask, point_normals
 from oh_my_slam.segmentation.cloud import (
     ImageCloudSource,
     MapCloudSource,
     cloud_ply,
     derive_cloud,
+    derive_thinned,
     map_cloud_source,
 )
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, height_colors
@@ -217,3 +218,63 @@ def test_ply_header_records_the_effective_attributes(image: ImageCloudSource,
                               "encoding=binary"]
     assert [n for n, _ in mhead.fields] == ["x", "y", "z"]
     assert cloud_ply(image, attrs) == data  # byte-identical on every run
+
+
+@pytest.fixture()
+def room_map() -> MapCloudSource:
+    """Three walls and a floor, 60 000 noisy points (several normal chunks), with objects."""
+    rng = np.random.default_rng(11)
+    n = 15_000
+    floor = np.c_[rng.uniform(-2, 2, n), rng.uniform(-2, 2, n), rng.normal(0, 0.003, n)]
+    wall_x = np.c_[np.full(n, 2.0) + rng.normal(0, 0.003, n), rng.uniform(-2, 2, n),
+                   rng.uniform(0, 2.5, n)]
+    wall_y = np.c_[rng.uniform(-2, 2, n), np.full(n, -2.0) + rng.normal(0, 0.003, n),
+                   rng.uniform(0, 2.5, n)]
+    box = np.c_[rng.uniform(-0.3, 0.3, n), rng.uniform(-0.3, 0.3, n), rng.uniform(0, 0.6, n)]
+    xyz = np.vstack([floor, wall_x, wall_y, box])
+    labels = np.r_[np.zeros(3 * n, np.int32), np.full(n, 4, np.int32)]
+    rgb = rng.integers(0, 256, (len(xyz), 3)).astype(np.uint8)
+    return map_cloud_source(xyz, rgb, labels, {4}, np.array([[0.0, 0.5, 1.2], [0.2, 0.0, 1.2]]))
+
+
+def test_map_normals_only_for_the_emitted_points(room_map: MapCloudSource) -> None:
+    """Normals are computed for the points a derivation emits, and a point's normal does not
+    depend on ``voxel``, on which other points are asked for, or on their order (the same values
+    ``segment.sh -m`` / ``mapper.sh -f ply`` / the viewer emit)."""
+    thin = derive_cloud(room_map, CloudAttrs(voxel=0.1, normals=True))
+    assert room_map.normals._done.sum() == len(thin) < len(room_map.xyz) / 5
+    full = derive_cloud(room_map, CloudAttrs(normals=True))
+    assert room_map.normals._done.all()
+    keep = voxel_downsample_indices(np.asarray(room_map.xyz, np.float64), 0.1, keep="first")
+    np.testing.assert_array_equal(thin.normals, full.normals[keep])
+    # a fresh source asked in another order, and the whole-cloud function, agree bit for bit
+    rows = np.random.default_rng(3).permutation(len(room_map.xyz))[:5000]
+    fresh = PointNormals(room_map.xyz, room_map.viewpoints)
+    np.testing.assert_array_equal(fresh.at(rows[::-1])[::-1], full.normals[rows])
+    np.testing.assert_array_equal(point_normals(room_map.xyz, room_map.viewpoints), full.normals)
+    # correct geometry away from edges and the box: floor up, walls facing the cameras
+    x, y, z = np.asarray(room_map.xyz).T
+    part = np.repeat(np.arange(4), 15_000)
+    floor = (part == 0) & (np.abs(x) < 1.8) & (np.abs(y) < 1.8) & (np.hypot(x, y) > 0.7)
+    wall_x = (part == 1) & (np.abs(y) < 1.8) & (z > 0.2) & (z < 2.3)
+    wall_y = (part == 2) & (np.abs(x) < 1.8) & (z > 0.2) & (z < 2.3)
+    for m, axis, sign in ((floor, 2, 1), (wall_x, 0, -1), (wall_y, 1, 1)):
+        assert m.sum() > 5000 and (sign * full.normals[m, axis] > 0.98).mean() > 0.99
+    np.testing.assert_allclose(np.linalg.norm(full.normals, axis=1), 1.0, atol=1e-5)
+
+
+def test_derive_thinned_is_a_subset_of_derive_cloud(room_map: MapCloudSource) -> None:
+    for attrs in (CloudAttrs(color="height", normals=True, label=True),
+                  CloudAttrs(color="segment", voxel=0.05, normals=True, label=True)):
+        src = map_cloud_source(room_map.xyz, room_map.rgb, room_map.labels, {4},
+                               room_map.viewpoints)
+        t = derive_thinned(src, attrs, 7_000)
+        assert src.normals._done.sum() == len(t.cloud)  # normals only for the kept points
+        full = derive_cloud(src, attrs)
+        assert t.total == len(full) and t.step == -(-len(full) // 7_000) > 1
+        sel = np.arange(0, len(full), t.step)
+        assert len(t.cloud) == len(sel) <= 7_000
+        for name in ("xyz", "rgb", "label", "normals"):
+            np.testing.assert_array_equal(getattr(t.cloud, name), getattr(full, name)[sel])
+    t = derive_thinned(room_map, CloudAttrs(), None)
+    assert (t.total, t.step, len(t.cloud)) == (len(room_map.xyz), 1, len(room_map.xyz))

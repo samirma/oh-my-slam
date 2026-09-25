@@ -219,7 +219,7 @@ def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "la
     """
     if len(points) == 0:
         return np.zeros(0, dtype=np.int64)
-    keys = voxel_keys(points, voxel)
+    keys = _packed(voxel_keys(points, voxel))
     if keep == "last":
         rev = keys[::-1]
         _, idx = np.unique(rev, axis=0, return_index=True)
@@ -227,6 +227,17 @@ def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "la
     else:
         _, out = np.unique(keys, axis=0, return_index=True)
     return np.sort(out)
+
+
+def _packed(keys: NDArray[np.int64]) -> NDArray[np.int64]:
+    """(N, 3) voxel keys as one int64 per voxel (a 1-D unique sorts far faster than rows), or the
+    rows themselves when the key range does not fit. Equal rows <=> equal packed values."""
+    lo = keys.min(axis=0)
+    span = (keys.max(axis=0) - lo + 1).astype(object)  # Python ints: no overflow in the check
+    if span[0] * span[1] * span[2] >= 2**62:
+        return keys
+    k = keys - lo
+    return (k[:, 0] * int(span[1] * span[2]) + k[:, 1] * int(span[2]) + k[:, 2]).astype(np.int64)
 
 
 def fit_plane(points: NDArray[Any]) -> tuple[F64, float]:

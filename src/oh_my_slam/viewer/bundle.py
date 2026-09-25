@@ -37,7 +37,7 @@ from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.geometry import quat_to_rot, rotation_between
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_cloud, scope_of
+from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
 
 Json = dict[str, Any]
 
@@ -148,17 +148,15 @@ class ViewBundle:
 
     def cloud(self, attrs: CloudAttrs) -> DisplayCloud:
         """The cloud ``attrs`` describe, derived from the in-memory source (no inference), with
-        each point's object id; thinned for display beyond ``MAX_DISPLAY_POINTS``. Raises
-        ``ValueError`` when the source cannot provide ``attrs`` (e.g. ``color=height`` without
-        an estimated gravity)."""
-        with self._lock:  # one derivation at a time; sources cache their normals
+        each point's object id; beyond ``MAX_DISPLAY_POINTS`` every ``step``-th point of it
+        (``derive_thinned``: normals only for those). Raises ``ValueError`` when the source cannot
+        provide ``attrs`` (e.g. ``color=height`` without an estimated gravity)."""
+        with self._lock:  # one derivation at a time; sources keep their normals
             t0 = time.perf_counter()
-            full = derive_cloud(self.source, replace(attrs, label=self.source.labels is not None))
+            thin = derive_thinned(self.source, replace(attrs, label=self.source.labels is not None),
+                                  MAX_DISPLAY_POINTS)
             seconds = time.perf_counter() - t0
-        total = len(full)
-        step = max(1, math.ceil(total / MAX_DISPLAY_POINTS))
-        shown = full if step == 1 else full.subset(np.arange(0, total, step))
-        return DisplayCloud(shown, total, step, seconds)
+        return DisplayCloud(thin.cloud, thin.total, thin.step, seconds)
 
     def meta(self) -> Json:
         return {
