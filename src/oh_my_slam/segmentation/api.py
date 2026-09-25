@@ -110,12 +110,6 @@ def pixel_owners(dets: list[Detection], shape: tuple[int, int]) -> NDArray[np.in
     return owner
 
 
-def exclusive_masks(dets: list[Detection], shape: tuple[int, int]) -> list[NDArray[np.bool_]]:
-    """Per-detection masks with every pixel given to at most one detection (``pixel_owners``)."""
-    owner = pixel_owners(dets, shape)
-    return [owner == i for i in range(len(dets))]
-
-
 def fit_object_obb(points: NDArray[Any], label: str, up: NDArray[Any],
                    floor_level: float | None = None) -> OBB:
     """Upright OBB of an object's points; floor-standing classes are grounded on the floor at

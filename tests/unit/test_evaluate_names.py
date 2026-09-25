@@ -37,7 +37,7 @@ def test_all_79_real_names_parse(captures: list) -> None:
 def test_known_commanded_yaws(captures: list, index: int, yaw: float, heading: float) -> None:
     c = captures[index - 1]
     assert c.index == index
-    assert c.yaw_deg == yaw and c.heading_deg == heading
+    assert c.yaw_deg == yaw and wrap_deg(c.yaw_deg) == heading
 
 
 def test_every_motion_form() -> None:

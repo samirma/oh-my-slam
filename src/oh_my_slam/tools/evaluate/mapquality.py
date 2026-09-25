@@ -1,6 +1,11 @@
 """Map quality: point-cloud consistency across same-heading keyframes, and the stability of the
 objects when the same sequence is mapped in one update versus split across several.
 
+Consistency method: keyframe ``i``'s stored depth is back-projected into keyframe ``j`` with the
+map's poses; where it lands on a valid pixel of ``j`` that shows the same surface (relative
+difference below ``SAME_SURFACE``), ``|z_i→j / z_j - 1|`` is the disagreement. Stacked copies of a
+surface (frames merged without agreeing) show up here.
+
 Stability method: the split map is brought into the one-update map's frame by the rigid transform
 that best maps the camera poses of the captures registered in both (rotation average + mean
 translation, robust for a camera turning in place). Objects are then paired one-to-one (Hungarian)
@@ -16,21 +21,50 @@ from typing import Any
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from oh_my_slam.core.geometry import project
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.frame import align_by_poses
-from oh_my_slam.mapping.store import MapReader
+from oh_my_slam.mapping.store import FrameRecord, MapReader
 from oh_my_slam.segmentation.detect import compatible
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
-from oh_my_slam.tools.cloud_quality import pair_agreement
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import Capture, same_heading_pairs
 from oh_my_slam.tools.evaluate.scene import DocObject
 
 MATCH_IOU = 0.05
 MATCH_CENTRE_M = 0.25
+MIN_OVERLAP_PX = 500  # fewer shared pixels: the pair is not compared
+SAME_SURFACE = 0.3  # larger relative differences are occlusions, not the same surface
+PIXEL_STEP = 7  # every 7th valid pixel of the source keyframe is back-projected
 AGREEMENT_METRICS = ("frame_agreement_median_pct", "frame_agreement_p90_pct")
 STABILITY_METRICS = ("matched_fraction", "label_agreement", "id_agreement",
                      "centre_delta_median_m", "extent_delta_median_rel", "obb_iou_median")
+
+
+def pair_agreement(reader: MapReader, ri: FrameRecord, rj: FrameRecord
+                   ) -> tuple[float, float] | None:
+    """Median and p90 of |z_i→j / z_j - 1| with keyframe ``ri``'s depth back-projected into
+    ``rj`` (same surfaces only); None when they share fewer than ``MIN_OVERLAP_PX`` pixels."""
+    di, vi = reader.depth(ri), reader.valid(ri)
+    dj, vj = reader.depth(rj), reader.valid(rj)
+    v, u = np.nonzero(vi & (di > 0))
+    u, v = u[::PIXEL_STEP], v[::PIXEL_STEP]
+    Ki = ri.K_grid.K()
+    z = di[v, u].astype(np.float64)
+    pc = np.stack([(u - Ki[0, 2]) / Ki[0, 0] * z, (v - Ki[1, 2]) / Ki[1, 1] * z, z], 1)
+    T = rj.T_map_cam.inverse().compose(ri.T_map_cam)
+    uv, zq = project(pc @ T.R.T + T.t, rj.K_grid.K())
+    h, w = dj.shape
+    with np.errstate(invalid="ignore"):
+        uu, vv = np.floor(uv[:, 0] + 0.5), np.floor(uv[:, 1] + 0.5)
+        ok = (zq > 0.1) & (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
+    uu, vv, zq = uu[ok].astype(int), vv[ok].astype(int), zq[ok]
+    keep = vj[vv, uu] & (dj[vv, uu] > 0)
+    if keep.sum() < MIN_OVERLAP_PX:
+        return None
+    r = np.abs(zq[keep] / dj[vv[keep], uu[keep]] - 1)
+    r = r[r < SAME_SURFACE]
+    return float(np.median(r)), float(np.percentile(r, 90))
 
 
 def agreement_metrics(m: Metrics, prefix: str, map_dir: Path, captures: list[Capture]) -> None:

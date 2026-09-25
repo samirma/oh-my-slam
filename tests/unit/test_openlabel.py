@@ -12,11 +12,9 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.schema.validate import (
     SCHEMA_SHA256,
-    SceneValidationError,
     extra_errors,
     schema_bytes,
     schema_errors,
-    validate_scene,
     validation_errors,
 )
 
@@ -82,7 +80,6 @@ def test_vendored_schema_is_pinned() -> None:
 def test_examples_validate(make) -> None:  # type: ignore[no-untyped-def]
     doc = make()
     assert validation_errors(doc) == []
-    validate_scene(doc)
     json.loads(json.dumps(doc))
     md = doc["openlabel"]["metadata"]
     assert md["schema_url"] == ol.SCHEMA_URL and md["schema_version"] == "1.0.0"
@@ -143,9 +140,7 @@ def test_extra_checks_catch_what_the_schema_misses() -> None:
     bad = copy.deepcopy(doc)
     del bad["openlabel"]["streams"]["camera"]["stream_properties"]["intrinsics_pinhole"]
     assert any("without intrinsics" in e for e in extra_errors(bad))
-
-    with pytest.raises(SceneValidationError):
-        validate_scene(bad)
+    assert any("without intrinsics" in e for e in validation_errors(bad))  # schema + extra checks
 
 
 def test_map_transform_checks() -> None:
