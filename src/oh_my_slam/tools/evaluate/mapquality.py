@@ -4,9 +4,12 @@ objects when the same sequence is mapped in one update versus split across sever
 Stability method: the split map is brought into the one-update map's frame by the rigid transform
 that best maps the camera poses of the captures registered in both (rotation average + mean
 translation, robust for a camera turning in place). Objects are then paired one-to-one (Hungarian)
-on cost ``(1 - IoU) + centre distance``; a pair is admissible when its boxes overlap
-(IoU ≥ ``MATCH_IOU``) or its centres lie within ``MATCH_CENTRE_M``. Labels are not used for
-pairing, so label agreement is measured independently."""
+on cost ``(1 - IoU) + centre distance``, plus ``LABEL_PENALTY`` for incompatible labels; a pair is
+admissible when its boxes overlap (IoU ≥ ``MATCH_IOU``) or its centres lie within
+``MATCH_CENTRE_M``. Labels only break geometric ambiguity — a desk standing on a carpet overlaps
+it, and pairing the desk of one map with the carpet of the other would count a correct map as
+unstable twice (label and id) — and never gate a pair: an object whose label changed is still
+paired with its nearest box, so label agreement stays an independent measurement."""
 
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from oh_my_slam.tools.evaluate.scene import DocObject
 
 MATCH_IOU = 0.05
 MATCH_CENTRE_M = 0.25
+LABEL_PENALTY = 1.0
 AGREEMENT_METRICS = ("frame_agreement_median_pct", "frame_agreement_p90_pct")
 STABILITY_METRICS = ("matched_fraction", "label_agreement", "id_agreement",
                      "centre_delta_median_m", "extent_delta_median_rel", "obb_iou_median")
@@ -81,6 +85,8 @@ def match_objects(a: list[tuple[DocObject, OBB]], b: list[tuple[DocObject, OBB]]
                 iou[i, j] = obb_iou_upright(ba, bb, samples=4000)
             if iou[i, j] >= MATCH_IOU or dist[i, j] <= MATCH_CENTRE_M:
                 cost[i, j] = (1.0 - iou[i, j]) + dist[i, j]
+                if not compatible(a[i][0].label, b[j][0].label):
+                    cost[i, j] += LABEL_PENALTY
     rows, cols = linear_sum_assignment(cost)
     return [(int(i), int(j), float(iou[i, j]), float(dist[i, j]))
             for i, j in zip(rows, cols, strict=True) if cost[i, j] < big]

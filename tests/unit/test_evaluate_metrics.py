@@ -210,6 +210,25 @@ def test_split_map_objects_are_matched_after_pose_alignment() -> None:
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1), (2, 7), (3, 3)}
 
 
+def test_overlapping_objects_of_different_labels_are_not_swapped() -> None:
+    """A desk and the carpet under it, both in both maps with the same ids, but the split map's
+    boxes are shifted so that each overlaps the other label's box of the one-update map more than
+    its own. Labels break that tie; an object whose label changed still pairs with its box."""
+    def pair_ids(a: list[DocObject], b: list[DocObject]) -> set[tuple[int, int]]:
+        ab = [(o, o.obb()) for o in a]
+        bb = [(o, o.obb()) for o in b]
+        return {(a[i].id, b[j].id) for i, j, _, _ in match_objects(ab, bb)}  # type: ignore[arg-type]
+
+    single = [box(2, "desk", (0.0, 0, 0)), box(35, "carpet", (0.2, 0, 0))]
+    split = [box(2, "desk", (0.15, 0, 0)), box(35, "carpet", (0.05, 0, 0))]
+    assert pair_ids(single, split) == {(2, 2), (35, 35)}
+    relabelled = [box(2, "table", (0.15, 0, 0)), box(35, "carpet", (0.05, 0, 0))]
+    assert pair_ids(single, relabelled) == {(2, 2), (35, 35)}
+    # geometry alone decides between two objects whose labels both changed
+    both = [box(2, "lamp", (0.02, 0, 0)), box(35, "cup", (0.18, 0, 0))]
+    assert pair_ids(single, both) == {(2, 2), (35, 35)}
+
+
 def test_far_apart_boxes_are_not_matched() -> None:
     a = [(o, o.obb()) for o in [box(1, "chair", (0, 0, 0))]]
     b = [(o, o.obb()) for o in [box(1, "chair", (3, 0, 0))]]
