@@ -104,6 +104,19 @@ TOP_SURFACE = frozenset({
     "bar counter", "nightstand", "tv stand", "bed", "crib", "bench", "ottoman",
 })
 GROUND_MIN_VISIBLE = 0.2
+# Horizontal surfaces that run out of the view and under the items resting on them (a counter top
+# around a book lying on it, a rug under a chair): the detector splits one such surface into
+# several instances of the same kind around those items. Instances of these classes with
+# compatible labels that touch in one image with continuous depth are pieces of one surface
+# (``split_surface``; joined by the mapper). Other classes that touch side by side (two cabinets,
+# books on a shelf, chairs in a row) are usually separate objects.
+SURFACES = TOP_SURFACE | frozenset({"rug", "carpet"})
+
+
+def split_surface(a: str, b: str) -> bool:
+    """Whether instances labelled ``a`` and ``b`` that touch with continuous depth may be pieces
+    of one horizontal surface (``SURFACES``, compatible labels)."""
+    return normalize_label(a) in SURFACES and normalize_label(b) in SURFACES and compatible(a, b)
 
 
 def grounding(label: str) -> tuple[float, float]:

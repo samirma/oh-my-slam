@@ -41,6 +41,7 @@ from oh_my_slam.segmentation.detect import (
 )
 from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
+from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask
 from oh_my_slam.segmentation.obb import OBB as OBB
 from oh_my_slam.segmentation.obb import fit_obb
@@ -76,6 +77,24 @@ class LiftedInstance:
     detection: Detection
     mask: NDArray[np.bool_]  # exclusive mask on the grid
     lifted: Lifted
+
+
+def join_instances(pieces: list[LiftedInstance]) -> LiftedInstance:
+    """One instance from pieces of one object in the same image (e.g. a surface the detector split
+    around the items on it, ``split_surface``): the union of their exclusive masks and lifted
+    points, under the label, score and source of the piece that comes first in ``priority``."""
+    if len(pieces) == 1:
+        return pieces[0]
+    best = min(pieces, key=lambda p: priority(p.detection))
+    mask = np.logical_or.reduce([p.mask for p in pieces])
+    boxes = np.array([p.detection.box for p in pieces])
+    box = (float(boxes[:, 0].min()), float(boxes[:, 1].min()), float(boxes[:, 2].max()),
+           float(boxes[:, 3].max()))
+    det = Detection(best.detection.label, best.detection.score, best.detection.source, mask, box)
+    lifted = Lifted(np.concatenate([p.lifted.points for p in pieces]),
+                    np.concatenate([p.lifted.pixels for p in pieces]),
+                    sum(p.lifted.mask_pixels for p in pieces))
+    return LiftedInstance(det, mask, lifted)
 
 
 @dataclass

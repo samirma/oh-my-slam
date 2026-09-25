@@ -90,6 +90,9 @@ def test_vocabulary_and_label_rules() -> None:
     assert detect.grounding("Chair") == (detect.FLOOR_STANDING["chair"], detect.GROUND_MIN_VISIBLE)
     assert detect.grounding("dining table") == (detect.FLOOR_STANDING["dining table"], 0.0)
     assert detect.grounding("bottle") == (0.0, 0.0)
+    # pieces of one horizontal surface: surface classes with compatible labels only
+    assert detect.split_surface("desk", "kitchen island") and detect.split_surface("rug", "carpet")
+    assert not detect.split_surface("desk", "bed") and not detect.split_surface("cabinet", "cabinet")
 
 
 def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]

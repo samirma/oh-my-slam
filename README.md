@@ -440,15 +440,36 @@ point leaves the map untouched. One killed after it is completed by the next upd
     (not a part of the other or an item resting on it), and at least half of either one's
     points lie on the other's surface. The merged object takes the label with the most
     evidence and lists the others in `detected_as`.
+  * **Copies placed by inconsistent depth** are merged too. Each keyframe's depth scale is
+    aligned to its neighbours, so it drifts along a long sequence. Where a loop closes, the last
+    keyframes can place an object 10–15 % nearer than the first ones did: two copies along the
+    same viewing rays, 0.3–0.4 m apart at 3 m. Objects of compatible labels that no keyframe
+    detected together merge when, for most of the 3 pairs of their keyframes nearest by
+    viewpoint, the two keyframes' depths disagree by at least 5 % (measured on the surfaces both
+    see) and the detections coincide once that ratio is removed.
+  * **Horizontal surfaces** (tables, desks, counters, beds, rugs) are often split by the
+    detector around the items that rest on them: a counter top around a book becomes a left and
+    a right "desk". Two detections of one keyframe with compatible surface labels whose masks
+    touch with continuous depth (at least 50 contact pixels, depth within 3 %) are one
+    detection. Pieces of one surface seen from different keyframes (a desk from one side, a bed
+    from another, once also detected as a desk) merge when they share surface: at least 100 of
+    their 1 cm points within 5 cm horizontally and 10 cm vertically, at median heights within
+    10 cm, and no keyframe detected both.
   * An object is exported once it is confirmed: detected with a reliable mask (not mostly in
     the image-border band, where the object is cut off and monocular depth is unreliable) in at
     least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
     ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
+    It must also have at least one point in the map cloud, so that it appears in
+    `segments.ply` and every `color=segment` cloud in its colour. A confirmed object can have
+    none: its surface did not survive the fusion (seen by fewer than 3 keyframes, such as a
+    pendant lamp), or fewer than a third of the keyframes that see its surface detected it.
   * Unconfirmed objects are kept, so that a later update can still confirm them.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
     overlap (allowing for depth noise) the detection most others agree with.
+  * The OBB covers the **observed surface** only (see Known limitations): no class-typical size
+    is assumed.
 * **Geometry.** The map's geometry is a point cloud: the surface of a TSDF fusion of the aligned
   depth maps. Each point takes its colour and object id from the latest update that sees it. No
   mesh is produced.
@@ -643,6 +664,24 @@ runs it end to end as a test.
   the map keeps one object with the best-supported label and lists the others in `detected_as`.
 * **Monocular depth of small, distant objects** varies between keyframes, so their map boxes
   are only as consistent as the agreeing detections (see Update semantics).
+* **Boxes cover the observed surface, not the whole object.** An OBB is fitted to the points the
+  keyframes saw. An object seen only from the front has the depth of its visible surface: in
+  the `ainex-captures` map the refrigerator against the wall is about 0.8 × 0.17 × 1.7 m,
+  because only its front was seen. The fit does not invent the hidden part from a class-typical size,
+  which would be wrong for any object that is not typical. The only extension is floor
+  grounding, where the visible bottom floats just above the detected floor (see Coordinate
+  conventions).
+* **Depth-scale drift around a loop.** Each keyframe's depth scale is aligned to overlapping
+  keyframes one after another, so it drifts along a long sequence. In the `ainex-captures` map,
+  the keyframes that close the 360° loop (right 100°–140°) place the sink area 10–13 % nearer
+  than the keyframes that saw it first (left 210°), about 0.3 m at 2.6 m. The two groups of
+  keyframes therefore disagree about those surfaces. Objects duplicated by the drift are merged
+  (see Update semantics), but the depth scales are not re-optimised globally.
+* **Large horizontal surfaces can stay fragmented.** Pieces of a surface seen from different
+  keyframes merge only when they share surface and a surface label; pieces that merely meet at
+  an edge stay separate. In the `ainex-captures` map, the kitchen island that the robot stands
+  on is one object in front of the robot (detected as desk and bed) and a separate "rug" piece
+  behind it, about 5 cm away.
 
 ## Development
 
