@@ -52,7 +52,12 @@ Semantics (spec §2.3):
   saw it first: two copies along the same viewing rays, too far apart for the overlap tests (a
   faucet 0.4 m from itself at 3 m). Objects of compatible labels that no keyframe detected
   together merge when their sightings agree once the depth ratio measured between their
-  keyframes is removed (``_depth_explained``).
+  keyframes is removed, either keyframe's (``_depth_explained``).
+* **Loop copies.** Where a weakly linked stretch of a video comes back to a place, its
+  keyframes can be misaligned with the first visit's as a whole (pose, not only depth): every
+  object there is mapped twice, the copies offset alike. Pairs of such copies — compatible
+  labels, never detected together, seen from distant viewpoints by keyframes that disagree —
+  merge when other pairs between the same keyframes are displaced alike (``_loop_copies``).
 * **Point counts** are those of the map cloud: the points attributed to the object
   (``set_cloud_counts``; its votes inside its box grown by the depth noise, and the unlabelled
   cloud points nearest its own lifted points: ``geometry``), as the
@@ -189,6 +194,23 @@ DEPTH_PAIRS = 3
 DEPTH_RATIO_MIN = 0.05
 DEPTH_RATIO_MAX = 0.3
 RATIO_MIN_POINTS = 500  # shared surface points for a keyframe pair's depth ratio
+# Loop copies (``_loop_copies``): where a video's weakly linked stretch comes back to a place, its
+# keyframes can be misaligned with the first visit's by more than a depth scale — in
+# livingroom.mp4 the stretch 31-52, placed through one link, puts the dining area 0.3-0.45 m off
+# (along x, and 0.15-0.3 m lower) from where keyframes 54-65, which see it from the other side,
+# do: ten objects on the table and the sideboard mapped twice, each pair offset alike, none
+# explained by the depth ratio along one keyframe's rays. The copies are recognised as a group:
+# a candidate pair's nearest confident keyframes are at least LOOP_VIEW_DIST apart by viewpoint
+# (seen from different places: consecutive keyframes of a video are ~0.1 apart, the two visits
+# of the dining area 1.4-3.3) and disagree in depth, and LOOP_SUPPORT other candidate pairs
+# linking the same keyframes (keyframes within LOOP_LINK: one stretch, one alignment) are
+# displaced alike. A single pair is never enough: two chairs side by side, or two cars parked
+# in a row, are offset like a copy.
+LOOP_VIEW_DIST = 1.0
+LOOP_LINK = 0.6
+LOOP_SUPPORT = 2
+LOOP_PRECISE = 0.5  # m: a pair whose sightings all span at most this pins the offset down
+LOOP_OVERLAP = 0.5  # share of the shorter bounds that must overlap along each axis
 # An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
 # of the cells of its box's largest face at the resolution its keyframes sampled it, and at least
 # EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
@@ -1340,6 +1362,63 @@ def _scale(o: MapObject) -> float:
     return max(_extent(pts), float(hi - lo))
 
 
+def _reach(a: MapObject, b: MapObject) -> float:
+    """How far apart the copies of one object that disagreeing keyframes placed may lie:
+    ``DEPTH_RATIO_MAX`` of the farther one's viewing distance, plus their mean extent."""
+    return (DEPTH_RATIO_MAX * max(a.obs_depth, b.obs_depth)
+            + (_extent(a.points) + _extent(b.points)) / 2)
+
+
+def _viewpoint_distance(Ta: Pose, Tb: Pose, scale: float) -> float:
+    """Distance between two viewpoints: camera distance over the scene depth ``scale``, plus
+    1 − cos of the angle between the optical axes (as ``_neighbour_frames``)."""
+    return float(np.linalg.norm(Ta.t - Tb.t)) / scale + 1.0 - float(Ta.R[:, 2] @ Tb.R[:, 2])
+
+
+def _nearest_pairs(a: MapObject, b: MapObject, views: _Views, confident: bool = False
+                   ) -> list[tuple[float, Sighting, Sighting]]:
+    """The ``DEPTH_PAIRS`` pairs (sighting of ``a``, sighting of ``b``) whose keyframes are nearest
+    by viewpoint (ties by content), with that distance; ``confident``: only confident keyframes
+    (not of low confidence: an unreliable depth scale or a pose the matches do not support) and
+    sightings that fit their object (``_fits``)."""
+    scale = max(0.5, min(a.obs_depth, b.obs_depth))
+
+    def usable(o: MapObject, s: Sighting) -> Pose | None:
+        rec = views.records.get(s.frame)
+        if confident and ((rec is not None and getattr(rec, "low_confidence", False))
+                          or not _fits(o, s)):
+            return None
+        return views.pose(s.frame)
+
+    pairs: list[tuple[float, tuple[Any, ...], tuple[Any, ...], Sighting, Sighting]] = []
+    for sa in a.sightings:
+        Ta = usable(a, sa)
+        if Ta is None:
+            continue
+        for sb in b.sightings:
+            Tb = usable(b, sb)
+            if Tb is not None:
+                pairs.append((_viewpoint_distance(Ta, Tb, scale), sa.key(), sb.key(), sa, sb))
+    return [(d, sa, sb) for d, _, _, sa, sb in sorted(pairs, key=lambda p: p[:3])[:DEPTH_PAIRS]]
+
+
+def _fits(o: MapObject, s: Sighting) -> bool:
+    """Whether a sighting spans no more than its object's box (axis-aligned extent) plus the
+    depth noise along every axis: a mask that bled onto the surfaces behind (the legs of a chair
+    onto the floor and the table: 0.93 m deep for a chair 0.39 m deep) places nothing."""
+    if o.obb is None:
+        return True
+    box = np.abs(o.obb.R) @ np.asarray(o.obb.size, np.float64)
+    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * o.obs_depth)
+    return bool(np.all(np.subtract(s.hi, s.lo) <= box + 2 * tol))
+
+
+def _overlaps(sa: Sighting, sb: Sighting, tol: float, shift: Any = 0.0) -> bool:
+    """Whether ``sa``'s bounds, moved by ``shift``, overlap ``sb``'s within ``tol``."""
+    lo, hi = np.asarray(sa.lo) + shift, np.asarray(sa.hi) + shift
+    return bool(np.all((np.asarray(sb.lo) <= hi + tol) & (lo <= np.asarray(sb.hi) + tol)))
+
+
 def _depth_explained(a: MapObject, b: MapObject, views: _Views) -> float:
     """>= 1 when two objects of compatible labels that no keyframe detected together are one
     object placed twice by keyframes whose depths disagree (a loop closed by keyframes whose
@@ -1347,44 +1426,225 @@ def _depth_explained(a: MapObject, b: MapObject, views: _Views) -> float:
 
     The ``DEPTH_PAIRS`` pairs (sighting of ``a``, sighting of ``b``) whose keyframes are nearest by
     viewpoint are compared. A pair supports the merge when its keyframes' depths disagree by at
-    least ``DEPTH_RATIO_MIN`` (``depth_ratio``) and ``b``'s sighting, scaled about its keyframe's
-    camera centre by the inverse of that ratio (into ``a``'s keyframe's depth), overlaps ``a``'s
-    sighting within the depth-noise tolerance of the box consensus. Returns the supporting pairs
-    over a strict majority of the pairs compared."""
+    least ``DEPTH_RATIO_MIN`` (``depth_ratio``) and one sighting, scaled about its keyframe's
+    camera centre by the inverse of that ratio (into the other keyframe's depth), overlaps the
+    other sighting within the depth-noise tolerance of the box consensus. Returns the supporting
+    pairs over a strict majority of the pairs compared, the better of the two directions (either
+    keyframe's depth may be the one that drifted, and the two ratios are not reciprocal: they are
+    measured on what each keyframe sees). Symmetric: the order of ``a`` and ``b`` — the merge
+    orders pairs by provisional ids — never matters; tested one way only, a basket placed twice
+    across the loop of ``livingroom.mp4`` scored 1.5 one way and 0 the other and stayed two."""
     if not compatible(a.label, b.label) or set(a.frames) & set(b.frames):
         return 0.0
-    far = max(a.obs_depth, b.obs_depth)
-    reach = DEPTH_RATIO_MAX * far + (_extent(a.points) + _extent(b.points)) / 2
-    if not a.sightings or not b.sightings or np.linalg.norm(a.centroid - b.centroid) > reach:
+    if not a.sightings or not b.sightings or np.linalg.norm(a.centroid - b.centroid) > _reach(a, b):
         return 0.0
-    scale = max(0.5, min(a.obs_depth, b.obs_depth))
-    pairs: list[tuple[float, tuple[Any, ...], tuple[Any, ...], Sighting, Sighting]] = []
-    for sa in a.sightings:
-        Ta = views.pose(sa.frame)
-        if Ta is None:
-            continue
-        for sb in b.sightings:
-            Tb = views.pose(sb.frame)
-            if Tb is not None:
-                d = (float(np.linalg.norm(Ta.t - Tb.t)) / scale
-                     + 1.0 - float(Ta.R[:, 2] @ Tb.R[:, 2]))
-                pairs.append((d, sa.key(), sb.key(), sa, sb))
-    pairs = sorted(pairs, key=lambda p: p[:3])[:DEPTH_PAIRS]
+    pairs = _nearest_pairs(a, b, views)
     if not pairs:
         return 0.0
-    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * far)
-    support = 0
-    for *_, sa, sb in pairs:
-        r = views.ratio(sa.frame, sb.frame)
-        Tb = views.pose(sb.frame)
-        if r is None or Tb is None or abs(np.log(r)) < np.log1p(DEPTH_RATIO_MIN):
-            continue
-        c = Tb.t
-        lo = c + (np.asarray(sb.lo) - c) / r
-        hi = c + (np.asarray(sb.hi) - c) / r
-        if np.all((np.asarray(sa.lo) <= hi + tol) & (lo <= np.asarray(sa.hi) + tol)):
-            support += 1
-    return support / (len(pairs) // 2 + 1)
+    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * max(a.obs_depth, b.obs_depth))
+
+    def support(swap: bool) -> int:
+        n = 0
+        for _, sa, sb in pairs:
+            if swap:
+                sa, sb = sb, sa
+            r = views.ratio(sa.frame, sb.frame)
+            Tb = views.pose(sb.frame)
+            if r is None or Tb is None or abs(np.log(r)) < np.log1p(DEPTH_RATIO_MIN):
+                continue
+            c = Tb.t
+            moved = Sighting(sb.frame, sb.points, sb.border, sb.centroid,
+                             _t3(c + (np.asarray(sb.lo) - c) / r),
+                             _t3(c + (np.asarray(sb.hi) - c) / r))
+            n += _overlaps(moved, sa, tol)
+        return n
+
+    return max(support(False), support(True)) / (len(pairs) // 2 + 1)
+
+
+def _t3(x: Any) -> tuple[float, float, float]:
+    return (float(x[0]), float(x[1]), float(x[2]))
+
+
+@dataclass
+class _Copy:
+    """A candidate loop copy (``_loop_copies``): objects ``a`` and ``b``, their nearest keyframe
+    pairs, the depth-noise tolerance and the offset from ``a``'s sightings to ``b``'s."""
+
+    a: MapObject
+    b: MapObject
+    pairs: list[tuple[Sighting, Sighting]]
+    tol: float
+    offset: NDArray[np.float64]
+
+    def explained(self, shift: NDArray[np.float64]) -> bool:
+        """Whether moving ``a``'s sightings by ``shift`` lays them on ``b``'s, for a strict
+        majority of the keyframe pairs: along every axis the bounds overlap, within the
+        tolerance, by at least ``LOOP_OVERLAP`` of the shorter one (bounds that merely touch are
+        neighbours: two pillows side by side on a sofa)."""
+        ok = 0
+        for sa, sb in self.pairs:
+            lo_a, hi_a = np.asarray(sa.lo) + shift, np.asarray(sa.hi) + shift
+            lo_b, hi_b = np.asarray(sb.lo), np.asarray(sb.hi)
+            common = np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b) + self.tol
+            ok += bool(np.all(common >= LOOP_OVERLAP * np.minimum(hi_a - lo_a, hi_b - lo_b)))
+        return 2 * ok > len(self.pairs)
+
+    @property
+    def precise(self) -> bool:
+        """Whether its offset pins the displacement down: every sighting spans at most
+        ``LOOP_PRECISE`` (the middle of a chair seen from behind and from the front differs by
+        half its depth, and its bounds overlap any copy offset by less than its size)."""
+        return all(float(np.max(np.subtract(s.hi, s.lo))) <= LOOP_PRECISE
+                   for pair in self.pairs for s in pair)
+
+
+def _loop_copies(objects: list[MapObject], touched: set[int], views: _Views
+                 ) -> set[frozenset[int]]:
+    """Pairs of objects that are one object placed twice across a loop whose keyframes are
+    misaligned (``_Loops``)."""
+    return _Loops(objects, touched, views).copies()
+
+
+class _Loops:
+    """Loop copies among ``objects``: the copies of a whole group of objects that keyframes
+    misaligned across a loop placed twice are displaced alike (see ``LOOP_*``).
+
+    A candidate pair (``candidates``): compatible labels, no keyframe detected both, each detected
+    reliably in at least ``CONFIRM_DETECTIONS`` keyframes, one of them touched by this update,
+    centres within ``_reach``; its ``DEPTH_PAIRS`` nearest pairs of confident keyframes are at
+    least ``LOOP_VIEW_DIST`` apart by viewpoint (the copies were seen from different places,
+    never from neighbouring viewpoints whose alignment the overlap tests trust) and at least one
+    of them disagrees in depth by ``DEPTH_RATIO_MIN`` (``depth_ratio``, either direction: the
+    keyframes are shown to be misaligned). Its offset is the mean, over those keyframe pairs, of
+    the move from the middle of ``a``'s sighting bounds to the middle of ``b``'s.
+
+    Support (``support``): another candidate that links the same keyframes (some keyframe pair of
+    each within ``LOOP_LINK`` of the other's, either way round), or an object already joined
+    across the loop (its sightings in keyframes linked with each side, ``spanning``), agrees when
+    each one's offset lays the other's sightings on its counterpart's (``_Copy.explained``). A
+    candidate that ``LOOP_SUPPORT`` agree with is a copy; an object that would be a copy of two
+    others is left alone (ambiguous)."""
+
+    def __init__(self, objects: list[MapObject], touched: set[int], views: _Views) -> None:
+        self.views = views
+        self.robust = [o for o in objects if len(o.points) and o.sightings
+                       and len(o.reliable_frames()) >= CONFIRM_DETECTIONS]
+        self.scene = max(0.5, float(np.median([o.obs_depth for o in self.robust]))) \
+            if self.robust else 1.0
+        self._links: dict[tuple[int, int], bool] = {}
+        self.cands = self.candidates(touched)
+
+    def candidates(self, touched: set[int]) -> list[_Copy]:
+        robust, views = self.robust, self.views
+        if len(robust) < 2:
+            return []
+        cent = np.array([o.centroid for o in robust])
+        compat = _compatible_matrix([o.label for o in robust], [o.label for o in robust])
+        out: list[_Copy] = []
+        for i, j in zip(*np.triu_indices(len(robust), 1), strict=True):
+            a, b = robust[int(i)], robust[int(j)]
+            if not compat[i, j] or not (a.id in touched or b.id in touched) \
+                    or set(a.frames) & set(b.frames) \
+                    or np.linalg.norm(cent[i] - cent[j]) > _reach(a, b):
+                continue
+            near = _nearest_pairs(a, b, views, confident=True)
+            if not near or near[0][0] < LOOP_VIEW_DIST:
+                continue
+            pairs = [(sa, sb) for _, sa, sb in near]
+            if _disagree(views, pairs) is False:
+                continue
+            offset = np.mean([(np.add(sb.lo, sb.hi) - np.add(sa.lo, sa.hi)) / 2
+                              for sa, sb in pairs], axis=0)
+            tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * max(a.obs_depth, b.obs_depth))
+            out.append(_Copy(a, b, pairs, tol, offset))
+        return out
+
+    def distance(self, fa: int, fb: int) -> float:
+        """Viewpoint distance of two keyframes (0 for one keyframe, inf when one is unknown)."""
+        if fa == fb:
+            return 0.0
+        Ta, Tb = self.views.pose(fa), self.views.pose(fb)
+        return np.inf if Ta is None or Tb is None else _viewpoint_distance(Ta, Tb, self.scene)
+
+    def linked(self, fa: int, fb: int) -> bool:
+        key = (min(fa, fb), max(fa, fb))
+        if key not in self._links:
+            self._links[key] = self.distance(fa, fb) <= LOOP_LINK
+        return self._links[key]
+
+    def way(self, c: _Copy, d: _Copy) -> int:
+        """+1: ``d`` links the keyframes ``c`` links in the same order, -1 reversed, 0 not."""
+        for flip in (False, True):
+            for sa, sb in c.pairs:
+                for sc, sd in d.pairs:
+                    if flip:
+                        sc, sd = sd, sc
+                    if self.linked(sa.frame, sc.frame) and self.linked(sb.frame, sd.frame):
+                        return -1 if flip else 1
+        return 0
+
+    def spanning(self, c: _Copy, x: MapObject) -> _Copy | None:
+        """``x`` seen across the loop: its sightings in the keyframes nearest to (and linked
+        with) those of ``c``'s two sides, as a copy of itself; None when it is not."""
+        ends: list[Sighting] = []
+        for side in ({sa.frame for sa, _ in c.pairs}, {sb.frame for _, sb in c.pairs}):
+            best = min(((self.distance(sx.frame, f), sx.key(), sx) for sx in x.sightings
+                        for f in sorted(side)), key=lambda t: t[:2], default=None)
+            if best is None or best[0] > LOOP_LINK:
+                return None
+            ends.append(best[2])
+        s1, s2 = ends
+        if s1.frame == s2.frame:
+            return None
+        return _Copy(x, x, [(s1, s2)], max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * x.obs_depth),
+                     (np.add(s2.lo, s2.hi) - np.add(s1.lo, s1.hi)) / 2)
+
+    def support(self, c: _Copy) -> list[int]:
+        """Ids of what agrees with candidate ``c``: the lower id of each agreeing candidate pair,
+        and each agreeing object joined across the loop. Only precise ones (``_Copy.precise``)
+        vouch for an offset: ``c`` must be explained by theirs, and they by ``c``'s when ``c`` is
+        precise itself (a large object's offset is not)."""
+        out: list[int] = []
+
+        def agrees(d: _Copy, w: int) -> bool:
+            return d.precise and c.explained(w * d.offset) \
+                and (not c.precise or d.explained(w * c.offset))
+
+        for d in self.cands:
+            if d is c or {d.a.id, d.b.id} & {c.a.id, c.b.id}:
+                continue
+            w = self.way(c, d)
+            if w and agrees(d, w):
+                out.append(d.a.id)
+        for x in self.robust:
+            if x.id in (c.a.id, c.b.id):
+                continue
+            e = self.spanning(c, x)
+            if e is not None and agrees(e, 1):
+                out.append(x.id)
+        return out
+
+    def copies(self) -> set[frozenset[int]]:
+        found = [c for c in self.cands if len(self.support(c)) >= LOOP_SUPPORT]
+        count: dict[int, int] = {}
+        for c in found:
+            for oid in (c.a.id, c.b.id):
+                count[oid] = count.get(oid, 0) + 1
+        return {frozenset((c.a.id, c.b.id)) for c in found
+                if count[c.a.id] == 1 and count[c.b.id] == 1}
+
+
+def _disagree(views: _Views, pairs: list[tuple[Sighting, Sighting]]) -> bool | None:
+    """Whether the keyframes of some of ``pairs`` disagree in depth by at least
+    ``DEPTH_RATIO_MIN`` (``depth_ratio``, either way); None when no pair shares enough surface to
+    tell (seen from opposite sides)."""
+    ratios = [r for sa, sb in pairs
+              for r in (views.ratio(sa.frame, sb.frame), views.ratio(sb.frame, sa.frame))
+              if r is not None]
+    if not ratios:
+        return None
+    return any(abs(np.log(r)) >= np.log1p(DEPTH_RATIO_MIN) for r in ratios)
 
 
 def _surface_kinds(a: MapObject, b: MapObject) -> bool:
@@ -1494,11 +1754,13 @@ def _one_surface(a: MapObject, b: MapObject, surfaces: _Surfaces | None = None) 
 
 
 def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
-                    surfaces: _Surfaces | None = None) -> float:
+                    surfaces: _Surfaces | None = None,
+                    loops: set[frozenset[int]] | None = None) -> float:
     """>= 1 when two objects are one physical object. Compatible labels: >= 50 % of the smaller
     one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box >= 60 %
     inside the other), or (with ``views``) copies placed by keyframes whose depths disagree
-    (``_depth_explained``). Incompatible labels (the detector's label flickered between
+    (``_depth_explained``), or copies of a loop whose keyframes are misaligned (``loops``: pairs
+    of ids from ``_loop_copies``; still never detected together). Incompatible labels (the detector's label flickered between
     keyframes): no keyframe detected both (it would have seen two things there), their sizes are
     comparable (``MERGE_SCALE``: neither is a part of the other or an item resting on it) and
     >= 50 % of either one's points lie on the other's surface. Whatever the labels: pieces of one
@@ -1526,6 +1788,9 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
                 containment(a.obb, b.obb) / MERGE_CONTAINMENT)
     if s < 1.0 and views is not None:
         s = max(s, _depth_explained(a, b, views))
+    if s < 1.0 and loops and frozenset((a.id, b.id)) in loops \
+            and not set(a.frames) & set(b.frames):
+        s = 1.0
     return s
 
 
@@ -1537,16 +1802,20 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
            views: _Views | None = None, surfaces: _Surfaces | None = None) -> int:
     """Merge duplicates among the objects (at least one of each pair touched by this update),
     strongest pair first; the lower id is kept and ``alias`` maps each merged id to its keeper.
-    ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``),
-    ``surfaces`` (the map's fused surface) the surface-continuity test (``_Surfaces``)."""
+    ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``) and
+    the loop copies (``_loop_copies``: sought among the objects once no other merge is left —
+    the copies of a group are recognised on whole objects, not on the pieces the other tests
+    join — and merged like the rest; again until none is found), ``surfaces`` (the map's fused
+    surface) the surface-continuity test (``_Surfaces``)."""
     strength: dict[tuple[int, int], float] = {}
+    loops: set[frozenset[int]] = set()
 
     def pairs_of(o: MapObject) -> None:
         for p in state.objects:
             if p.id == o.id or not (o.id in touched or p.id in touched):
                 continue
             a, b = (o, p) if o.id < p.id else (p, o)
-            s = _merge_strength(a, b, views, surfaces)
+            s = _merge_strength(a, b, views, surfaces, loops)
             if s >= 1.0:
                 strength[(a.id, b.id)] = s
             else:
@@ -1557,6 +1826,10 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         if o.id in touched:
             pairs_of(o)
     merged = 0
+    if not strength and views is not None:
+        loops = _loop_copies(state.objects, touched, views)
+        for oid in sorted({x for p in loops for x in p}):
+            pairs_of(by[oid])
     while strength:
         (ka, kb), _ = min(strength.items(), key=lambda kv: (
             -kv[1], sorted([_content_key(by[kv[0][0]]), _content_key(by[kv[0][1]])])))
@@ -1568,9 +1841,16 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         del by[gone.id]
         touched.add(keep.id)
         touched.discard(gone.id)
+        loops = {frozenset(keep.id if x == gone.id else x for x in p) for p in loops}
+        loops = {p for p in loops if len(p) == 2}
         strength = {k: v for k, v in strength.items() if gone.id not in k and keep.id not in k}
         pairs_of(keep)
         merged += 1
+        if not strength and views is not None:
+            found = _loop_copies(state.objects, touched, views) - loops
+            loops |= found
+            for oid in sorted({x for p in found for x in p}):
+                pairs_of(by[oid])
     return merged
 
 
