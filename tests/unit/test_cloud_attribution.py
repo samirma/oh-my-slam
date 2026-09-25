@@ -8,6 +8,7 @@ with enough cloud points for its size."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import objects as mo
@@ -200,3 +201,136 @@ def test_the_attribution_gate_grows_with_the_viewing_distance() -> None:
     p += box.R[:, axis] * (box.size[axis] / 2 + 0.08)
     assert box.contains(p[None], margin)[0]
     assert not box.contains(p[None], attribution_margin(near.obs_depth))[0]
+
+
+# ------------------------------------------------------------------------------------------------
+# outdoor distances: the export minimum at the map's sampling, support only for fused objects
+
+STREET_VOXEL = 0.02  # the cloud voxel of a street map (median depth ~12 m)
+STREET_FOCAL = 660.0  # focal length (px) of the 768-px depth grid of a 1080p video
+
+
+def parked_car(distance: float, oid: int = 58) -> MapObject:
+    """A parked car's side (4 m long, 1.4 m high, its box 1.5 m deep) seen from ``distance``."""
+    rng = np.random.default_rng(2)
+    pts = rng.uniform(-0.5, 0.5, (4000, 3)) * (1.5, 4.0, 1.4) + (distance, 0.0, 0.0)
+    o = MapObject(oid, "car", {"car": 1.6}, [0.7, 0.7], mo.canonical_points(pts),
+                  frames=[3, 9], confirmed=True, obs_depth=distance)
+    mo.refit(o, None)
+    return o
+
+
+def _counts(objs: list[MapObject], label: np.ndarray, focal: float = 0.0) -> list[int]:
+    """Export ids after recording ``label`` as the cloud's object ids."""
+    from types import SimpleNamespace
+    state = ObjectState(objs, 600)
+    tx = SimpleNamespace(write_json=lambda rel, obj: None)
+    mo.set_cloud_counts(tx, state, label, STREET_VOXEL, focal)
+    return [x.id for x in state.exported()]
+
+
+def test_a_distant_object_with_sparse_points_is_exported() -> None:
+    """A car seen from 40 m: a depth pixel covers 6 cm there (9 cloud voxels of 2 cm), and its
+    detections give it about one point per pixel of its side. 150 points are well drawn at that
+    distance; a fixed share of its face's 2 cm voxels (~750) would drop it."""
+    o = parked_car(40.0)
+    assert o.obb is not None
+    face = float(np.prod(np.sort(o.obb.size)[1:]))
+    cell = 40.0 / STREET_FOCAL
+    assert mo.sample_spacing(STREET_VOXEL, 40.0, STREET_FOCAL) == cell
+    need = mo.min_cloud_points(o.obb, STREET_VOXEL, 40.0, STREET_FOCAL)
+    assert need == int(np.ceil(mo.EXPORT_MIN_SUPPORT * face / cell ** 2)) < 100
+    assert mo.min_cloud_points(o.obb, STREET_VOXEL) > 5 * need  # the voxel-only share
+    label = np.zeros(1000, np.int32)
+    label[:150] = o.id
+    assert _counts([o], label, STREET_FOCAL) == [o.id]
+    assert o.cloud_min == need
+    assert _counts([o], label) == []  # without the sampling at its distance it would not be
+    # near objects keep the voxel: at 3 m a depth pixel covers 4.5 mm, less than a voxel
+    near = parked_car(3.0)
+    assert near.obb is not None
+    assert mo.min_cloud_points(near.obb, STREET_VOXEL, 3.0, STREET_FOCAL) == \
+        mo.min_cloud_points(near.obb, STREET_VOXEL)
+
+
+def test_a_tiny_or_unsupported_object_is_not_exported() -> None:
+    """At 40 m a traffic sign's face (0.6 x 0.6 m) holds ~100 depth pixels; with a handful of
+    points it is not drawn (the floor of EXPORT_MIN_CLOUD_POINTS), nor is a car with a tenth of
+    what its side's pixels would give."""
+    rng = np.random.default_rng(3)
+    pts = rng.uniform(-0.5, 0.5, (500, 3)) * (0.05, 0.6, 0.6) + (40.0, 3.0, 2.0)
+    sign = MapObject(61, "traffic sign", {"traffic sign": 1.6}, [0.7, 0.7],
+                     mo.canonical_points(pts), frames=[3, 9], confirmed=True, obs_depth=40.0)
+    mo.refit(sign, None)
+    assert sign.obb is not None
+    assert mo.min_cloud_points(sign.obb, STREET_VOXEL, 40.0, STREET_FOCAL) == \
+        mo.EXPORT_MIN_CLOUD_POINTS
+    car = parked_car(40.0)
+    assert car.obb is not None
+    need = mo.min_cloud_points(car.obb, STREET_VOXEL, 40.0, STREET_FOCAL)
+    label = np.zeros(1000, np.int32)
+    label[:6] = sign.id
+    label[10:10 + need // 10] = car.id
+    assert _counts([sign, car], label, STREET_FOCAL) == []
+    label[20:40] = sign.id
+    assert _counts([sign, car], label, STREET_FOCAL) == [sign.id]
+
+
+def _sighting(frame: int, pts: np.ndarray) -> mo.Sighting:
+    lo, hi = np.percentile(pts, [2, 98], axis=0)
+    c = pts.mean(0)
+    return mo.Sighting(frame, len(pts), 0.0, (float(c[0]), float(c[1]), float(c[2])),
+                       (float(lo[0]), float(lo[1]), float(lo[2])),
+                       (float(hi[0]), float(hi[1]), float(hi[2])))
+
+
+def test_only_objects_their_keyframes_fused_take_support() -> None:
+    """The switch's detecting keyframe fused the wall it is on (2 m, within the fused depth):
+    it takes the wall points near its own. Detected only from beyond the fused depth (a car
+    100 m down a street, placed by far monocular depth), an object's own surface is not in the
+    cloud: it takes no support, however near its lifted points come to other surfaces."""
+    from oh_my_slam.mapping.geometry import fused_objects
+
+    pts = wall_points(0.005)
+    o = switch()
+    o.sightings = [_sighting(0, o.points.astype(np.float64))]
+    fd = frame(0, 0.0, np.zeros(SHAPE, np.int32))
+    assert fused_objects(ObjectState([o], 200), [fd], 3.0) == {o.id}
+    assert fused_objects(ObjectState([o], 200), [fd], 1.5) == set()  # the wall beyond the cut
+    assert fused_objects(ObjectState([o], 200), [frame(1, 0.0, fd.labels)], 3.0) == set()
+    label = np.zeros(len(pts), np.int32)
+    assert support_labels(pts, label, ObjectState([o], 200), set()) == 0 and not label.any()
+    assert support_labels(pts, label, ObjectState([o], 200), {o.id}) == 1
+    assert (label == o.id).sum() >= 30
+
+
+def test_the_sampling_is_that_of_the_nearest_detection() -> None:
+    """A car driving towards the camera: one keyframe detects it 11 m away (2 cm sampling, its
+    mask ~8,000 lifted points), two others 43-52 m away, where it had driven off; its mean
+    viewing distance is 35 m. Its cloud points are those of its nearest detection's surface, so
+    it needs a share of its face's 2 cm voxels, not of the 5 cm cells of 35 m: 325 points (the
+    road under where it was) do not export it."""
+    from oh_my_slam.mapping.geometry import nearest_detections
+
+    o = parked_car(35.0, oid=286)
+    assert o.obb is not None
+    near = mo.min_cloud_points(o.obb, STREET_VOXEL, 11.0, STREET_FOCAL)
+    assert near == mo.min_cloud_points(o.obb, STREET_VOXEL)  # 11 m / 660 px < 2 cm
+    assert mo.min_cloud_points(o.obb, STREET_VOXEL, 35.0, STREET_FOCAL) < 325 < near
+    label = np.zeros(1000, np.int32)
+    label[:325] = o.id
+    assert _counts([o], label, STREET_FOCAL) == [o.id]  # at its mean distance it would be
+    from types import SimpleNamespace
+    state = ObjectState([o], 600)
+    tx = SimpleNamespace(write_json=lambda rel, obj: None)
+    mo.set_cloud_counts(tx, state, label, STREET_VOXEL, STREET_FOCAL, {o.id: 11.0})
+    assert o.cloud_min == near and state.exported() == []
+    # the nearest detection: the depth of its sighting's centre in the detecting keyframe
+    frames = [frame(k, 0.0, np.zeros(SHAPE, np.int32)) for k in (0, 1)]
+    frames[1].rec.T_map_cam = Pose(frames[1].rec.T_map_cam.R, np.array([-30.0, 0.0, 0.0]))
+    pts = o.points.astype(np.float64) - np.array([24.0, 0.0, 0.0])  # 11 m ahead of both
+    o.sightings = [_sighting(0, pts), _sighting(1, pts)]
+    got = nearest_detections(ObjectState([o], 600), frames)
+    assert set(got) == {o.id} and got[o.id] == pytest.approx(11.0, abs=0.05)
+    assert nearest_detections(ObjectState([o], 600), frames[1:])[o.id] == \
+        pytest.approx(41.0, abs=0.05)

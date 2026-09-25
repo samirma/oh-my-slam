@@ -466,25 +466,31 @@ point leaves the map untouched. One killed after it is completed by the next upd
     at most 0.3 m apart. The second test catches pieces that monocular depth of a close surface
     placed apart (the kitchen island's corner, 0.5 m below the camera, placed 10 cm lower by the
     keyframes that close the loop). At floor height it is not used: the floor joins anything.
-  * An object is exported once it is confirmed: detected with a reliable mask (not mostly in
-    the image-border band, where the object is cut off and monocular depth is unreliable) in at
+  * An object is exported once it is confirmed: detected with a reliable mask (not mostly in the
+    image-border band, where the object is cut off and monocular depth is unreliable) in at
     least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
     ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
     It must also be visibly drawn in the map cloud, so that it appears in `segments.ply` and
-    every `color=segment` cloud in its colour: it needs at least 5 % of the cloud points its
-    box's largest face holds (one per cloud voxel), and at least 10. A keyframe's vote for an
-    object counts only for cloud points inside the object's attribution gate, its box grown by
-    the depth noise at its viewing distance (max(5 cm, 3 % of the distance)): detection masks
-    are drawn generously (a "carpet" mask over a counter top and the floor beyond it), and the
-    object's coloured points must coincide with its box. The vote needs a third of the
-    keyframes that see a point, so an object detected in fewer of them wins only part of its
-    surface (a refrigerator detected in 7 of the ~15 keyframes that see its front) or none of it
-    (a light switch on a wall, a dishwasher detected in 2 of ~13). Each confirmed object
-    therefore also takes the unlabelled cloud points nearest its own lifted points (the 4
-    nearest to each, within max(3 cm, 2 % of its viewing distance), inside its gate; a point two
-    objects pick goes to the nearer). An object stays short only when its surface did not
-    survive the fusion (seen by fewer than 3 keyframes, such as a pendant lamp); it is then not
-    exported.
+    every `color=segment` cloud in its colour: it needs at least 5 % of the cells of its box's
+    largest face at the map's sampling at its nearest detection, and at least 10. A cell is a
+    cloud voxel, or the footprint of one depth-grid pixel where that is coarser: a car seen from
+    40 m at the nearest in a 1080p video (grid focal 660 px) has one depth pixel per 6 cm, 9
+    voxels of 2 cm, and its detections cannot give it more points than its masks have pixels. A
+    keyframe's vote for an object counts only for cloud points inside the object's attribution
+    gate, its box grown by the depth noise at its viewing distance (max(5 cm, 3 % of the
+    distance)): detection masks are drawn generously (a "carpet" mask over a counter top and the
+    floor beyond it), and the object's coloured points must coincide with its box. The vote
+    needs a third of the keyframes that see a point, so an object detected in fewer of them wins
+    only part of its surface (a refrigerator detected in 7 of the ~15 keyframes that see its
+    front) or none of it (a light switch on a wall, a dishwasher detected in 2 of ~13). Each
+    confirmed object therefore also takes the unlabelled cloud points nearest its own lifted
+    points (the 4 nearest to each, within max(3 cm, 2 % of its viewing distance), inside its
+    gate; a point two objects pick goes to the nearer), provided a keyframe that detected it
+    fused it: an object detected only beyond the fused depth (a car 40–100 m down a street) has
+    no surface of its own in the cloud, and the points near its far-placed lifted points are
+    other surfaces. An object stays short when its surface did not survive the fusion (seen by
+    fewer than 3 keyframes, such as a pendant lamp) or when its detections are all beyond the
+    fused depth and do not meet the cloud; it is then not exported.
   * Unconfirmed objects are kept, so that a later update can still confirm them.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
@@ -622,7 +628,11 @@ Geometry and detection requests run concurrently on two connections.
    4. For a new map, the map is levelled with the floor plane.
 6. **Integration.** The update applies latest wins, fuses the cloud (Open3D TSDF), updates the
    objects (the fused surface tells pieces of one horizontal surface), gives the cloud's points
-   their object ids, exports the scene and commits.
+   their object ids, exports the scene and commits. Each keyframe is fused up to 2.5 times the
+   map's median depth (at most 30 m) as it placed that depth before its near/far tilt: the tilt
+   moves surfaces, not which of them the keyframe contributes (outdoors, where it deepens the
+   far field by 15–35 %, a fixed cut dropped the views that make facades 10–20 m from the path
+   reach 3 keyframes).
 
 ### Ownership
 

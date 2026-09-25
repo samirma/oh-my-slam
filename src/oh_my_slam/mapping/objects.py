@@ -57,7 +57,8 @@ Semantics (spec §2.3):
   (``set_cloud_counts``; its votes inside its box grown by the depth noise, and the unlabelled
   cloud points nearest its own lifted points: ``geometry``), as the
   ``point_count`` of a single image counts its cloud's points. An object is exported only with
-  ``min_cloud_points`` of them — a share of the points its box's largest face holds in the cloud —
+  ``min_cloud_points`` of them — a share of the cells of its box's largest face at the map's
+  sampling at its nearest detection (a cloud voxel, or a depth pixel's footprint where coarser) —
   so every exported object is visibly drawn in the cloud (``segments.ply``, ``color=segment``) in
   its colour.
 * **Boxes cover the observed surface.** A box is fitted to the points the keyframes saw: an
@@ -189,14 +190,21 @@ DEPTH_RATIO_MIN = 0.05
 DEPTH_RATIO_MAX = 0.3
 RATIO_MIN_POINTS = 500  # shared surface points for a keyframe pair's depth ratio
 # An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
-# of the points its box's largest face holds in the cloud (one per cloud voxel), and at least
+# of the cells of its box's largest face at the resolution its keyframes sampled it, and at least
 # EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
-# color=segment) in its colour. A confirmed object whose detecting keyframes are fewer than a
-# third of those that see its surface wins few or no points in the vote (a dishwasher detected in
-# 2 of the ~13 keyframes that see its front won 1 of the ~21,700 cloud points in its box); every
-# confirmed object also takes the unlabelled cloud points nearest its own lifted points
-# (``geometry.support_labels``). It still has too few when its surface did not survive the
-# fusion (seen by fewer than 3 keyframes, e.g. a pendant lamp).
+# color=segment) in its colour. A cell is a cloud voxel, or the footprint of one pixel of the
+# fused depth grid at the depth of its nearest detection where that is larger: an object's points
+# come from its detections (the votes of the keyframes that detected it, and the unlabelled cloud
+# points nearest its own lifted points, ``geometry.support_labels``: at most a few per depth pixel
+# of its masks, the densest from its nearest detection), and a car seen from 40-60 m in a 1080p
+# video (grid focal 660 px) has one depth pixel per 6-9 cm, 9-20 cloud voxels of 2 cm. The
+# nearest detection, not the mean viewing distance: a car driving towards the camera, seen from
+# 11 m by one keyframe and from 43-52 m by others, sampled at 2 cm, must be drawn at 2 cm. A confirmed object whose detecting keyframes are
+# fewer than a third of those that see its surface wins few or no points in the vote (a
+# dishwasher detected in 2 of the ~13 keyframes that see its front won 1 of the ~21,700 cloud
+# points in its box) and lives on its support. It still has too few when its surface did not
+# survive the fusion (seen by fewer than 3 keyframes, e.g. a pendant lamp), or when its detections
+# placed it where the cloud holds no surface.
 EXPORT_MIN_CLOUD_POINTS = 10
 EXPORT_MIN_SUPPORT = 0.05
 UP = np.array([0.0, 0.0, 1.0])
@@ -509,12 +517,21 @@ class ObjectState:
                     EXPORT_MIN_CLOUD_POINTS if o.cloud_min is None else o.cloud_min))]
 
 
-def min_cloud_points(box: OBB, voxel: float) -> int:
-    """The map-cloud points an object with ``box`` needs to be exported: ``EXPORT_MIN_SUPPORT`` of
-    those its largest face holds in a cloud of ``voxel`` spacing, at least
-    ``EXPORT_MIN_CLOUD_POINTS``."""
+def sample_spacing(voxel: float, obs_depth: float = 0.0, focal: float = 0.0) -> float:
+    """How finely the map samples a surface seen from ``obs_depth`` metres: the cloud's ``voxel``,
+    or the footprint of one pixel of the fused depth grids (focal length ``focal`` px) where that
+    is coarser; ``focal`` 0: the voxel."""
+    return max(float(voxel), float(obs_depth) / focal) if focal > 0 else float(voxel)
+
+
+def min_cloud_points(box: OBB, voxel: float, seen_from: float = 0.0, focal: float = 0.0) -> int:
+    """The map-cloud points an object with ``box``, detected from ``seen_from`` metres at the
+    nearest, needs to be exported: ``EXPORT_MIN_SUPPORT`` of the cells of its largest face at the
+    map's sampling (``sample_spacing``: the cloud ``voxel``, or the depth pixel's footprint where
+    coarser), at least ``EXPORT_MIN_CLOUD_POINTS``."""
     a, b = np.sort(np.asarray(box.size, np.float64))[1:]
-    return max(EXPORT_MIN_CLOUD_POINTS, int(np.ceil(EXPORT_MIN_SUPPORT * a * b / voxel ** 2)))
+    cell = sample_spacing(voxel, seen_from, focal)
+    return max(EXPORT_MIN_CLOUD_POINTS, int(np.ceil(EXPORT_MIN_SUPPORT * a * b / cell ** 2)))
 
 
 def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
@@ -1018,15 +1035,20 @@ def save_state(tx: Any, state: ObjectState) -> None:
 
 
 def set_cloud_counts(tx: Any, state: ObjectState, labels: NDArray[Any],
-                     voxel: float | None = None) -> None:
+                     voxel: float | None = None, focal: float = 0.0,
+                     nearest: dict[int, float] | None = None) -> None:
     """Record each object's point count in the map cloud (``labels``: object id per cloud point)
-    and, for a cloud of ``voxel`` spacing, the count it needs to be exported
-    (``min_cloud_points``); store the state again."""
+    and, for a cloud of ``voxel`` spacing fused from depth grids of focal length ``focal`` px, the
+    count it needs to be exported: ``min_cloud_points`` at the depth of its nearest detection
+    (``nearest``: object id → depth, ``geometry.nearest_detections``; else its mean viewing
+    distance). Store the state again."""
     ids = np.asarray(labels, np.int64).reshape(-1)
     counts = np.bincount(ids[ids > 0]) if (ids > 0).any() else np.zeros(1, np.int64)
     for o in state.objects:
         o.cloud_points = int(counts[o.id]) if o.id < len(counts) else 0
-        o.cloud_min = None if voxel is None or o.obb is None else min_cloud_points(o.obb, voxel)
+        seen_from = (nearest or {}).get(o.id, o.obs_depth)
+        o.cloud_min = (None if voxel is None or o.obb is None
+                       else min_cloud_points(o.obb, voxel, seen_from, focal))
     save_state(tx, state)
 
 

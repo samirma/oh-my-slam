@@ -21,10 +21,14 @@ def choose_voxel_size(median_depth: float, fraction: float = 0.005) -> float:
     return float(np.clip(fraction * median_depth, MIN_VOXEL, MAX_VOXEL))
 
 
+def fusion_step(shape: tuple[int, ...], max_side: int = FUSION_MAX_SIDE) -> int:
+    """The subsampling of a depth grid of ``shape`` (rows, cols) for integration (1: none)."""
+    return max(1, int(np.ceil(max(int(shape[0]), int(shape[1])) / max_side)))
+
+
 def _downsample(depth: NDArray[Any], K: NDArray[Any], max_side: int
                 ) -> tuple[NDArray[Any], NDArray[Any]]:
-    h, w = depth.shape
-    step = int(np.ceil(max(h, w) / max_side))
+    step = fusion_step(depth.shape, max_side)
     if step <= 1:
         return depth, K
     d = depth[::step, ::step]
@@ -67,25 +71,27 @@ class TsdfFusion:
         self.stats = FusionStats()
 
     def integrate(self, depth: NDArray[Any], K: NDArray[Any], T_world_cam: Pose,
-                  max_side: int = FUSION_MAX_SIDE) -> None:
-        """Integrate one frame; ``depth`` in metres with 0 for invalid/latest-wins-removed pixels."""
+                  max_side: int = FUSION_MAX_SIDE, depth_max: float | None = None) -> None:
+        """Integrate one frame; ``depth`` in metres with 0 for invalid/latest-wins-removed pixels,
+        up to ``depth_max`` (default: the fusion's)."""
         import time
 
         o3d, o3c = self._o3d, self._o3c
         t0 = time.perf_counter()
+        cut = float(self.depth_max if depth_max is None else depth_max)
         d, Kd = _downsample(np.asarray(depth, np.float32), np.asarray(K, np.float64), max_side)
-        d = np.where(np.isfinite(d) & (d > 0) & (d < self.depth_max), d, 0.0).astype(np.float32)
+        d = np.where(np.isfinite(d) & (d > 0) & (d < cut), d, 0.0).astype(np.float32)
         if not (d > 0).any():
             return
         depth_img = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(d)))
         intr = o3c.Tensor(Kd, dtype=o3c.float64)
         extr = o3c.Tensor(T_world_cam.inverse().matrix(), dtype=o3c.float64)
         coords = self.vbg.compute_unique_block_coordinates(
-            depth_img, intr, extr, depth_scale=1.0, depth_max=self.depth_max,
+            depth_img, intr, extr, depth_scale=1.0, depth_max=cut,
             trunc_voxel_multiplier=self.trunc_voxels,
         )
         self.vbg.integrate(coords, depth_img, intr, extr, depth_scale=1.0,
-                           depth_max=self.depth_max, trunc_voxel_multiplier=self.trunc_voxels)
+                           depth_max=cut, trunc_voxel_multiplier=self.trunc_voxels)
         self.stats.frames += 1
         self.stats.seconds += time.perf_counter() - t0
 

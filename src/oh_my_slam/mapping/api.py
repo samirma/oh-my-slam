@@ -1252,7 +1252,8 @@ def integrate(ctx: UpdateContext, progress: Progress
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
     with timing.stage("objects"):
         assert geo.cloud.label is not None
-        objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label, geo.stats["voxel"])
+        objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label, geo.stats["voxel"],
+                                 geo.stats["focal_px"], geo.nearest)
     return records, objs, geo
 
 

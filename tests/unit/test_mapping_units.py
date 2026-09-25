@@ -503,3 +503,39 @@ def test_incremental_extension_is_brought_back_onto_the_map() -> None:
         np.testing.assert_allclose(back.pose(n).matrix(), T.matrix(), atol=1e-9)
     moved = _PoseModel({**stored, "f0": Pose(stored["f0"].R, stored["f0"].t + [0.8, 0, 0])})
     assert _back_onto(moved, _PoseModel(stored)) is None  # type: ignore[arg-type]
+
+
+def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None:
+    """A street keyframe: the road 8 m ahead (the median depth) and a facade 27 m away, fused
+    up to 30 m. Its near/far correction (exponent 1.2 about its median) places the facade at
+    34.4 m: the keyframe still fuses it (its cut moves with the correction, to 39 m), where a
+    fixed 30 m cut would drop it. Uncorrected, the same depth beyond 30 m is not fused."""
+    from oh_my_slam.core.types import Intrinsics, Pose
+    from oh_my_slam.mapping.geometry import FrameData, fused_cloud_points, fusion_depth_max
+    from oh_my_slam.mapping.store import FrameRecord
+
+    K = Intrinsics(40.0, 40.0, 32.0, 24.0, 64, 48)
+    raw = np.full((48, 64), 8.0)
+    raw[:16] = 27.0  # the facade: the top third of the image
+    e, med = 1.2, 8.0
+    tilted = med * (raw / med) ** e
+    assert tilted[0, 0] == pytest.approx(34.4, abs=0.1) and np.median(tilted) == med
+
+    def frames(depth: np.ndarray, exponent: float) -> list[FrameData]:
+        out = []
+        for k in range(3):
+            T = Pose(np.eye(3), np.array([0.05 * k, 0.0, 0.0]))
+            rec = FrameRecord(k, f"f{k:06d}", "", "", 1, 64, 48, K, T, 64, 48,
+                              stats={"depth_exponent": exponent})
+            out.append(FrameData(rec, depth.astype(np.float32), np.ones(depth.shape, bool),
+                                 np.zeros(depth.shape + (3,), np.uint8),
+                                 np.zeros(depth.shape, np.int32), True))
+        return out
+
+    corrected = frames(tilted, e)
+    assert fusion_depth_max(corrected[0], 30.0) == pytest.approx(med * (30.0 / med) ** e)
+    assert fusion_depth_max(frames(raw, 1.0)[0], 30.0) == 30.0
+    far = fused_cloud_points(corrected, voxel=0.1, depth_max=30.0)
+    assert (np.abs(far[:, 2] - 34.4) < 0.3).sum() > 50  # the facade, where the correction put it
+    beyond = fused_cloud_points(frames(tilted, 1.0), voxel=0.1, depth_max=30.0)
+    assert not (beyond[:, 2] > 30.0).any()  # the same depth uncorrected: beyond the cut

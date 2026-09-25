@@ -12,14 +12,15 @@ keyframes that see a point, and an object detected in fewer of them wins only pa
 surface — a refrigerator detected in 7 of the ~15 keyframes that see its front, half of it — or
 nothing — a dishwasher detected in 2 of ~13, a light switch on a wall. Each confirmed object
 therefore also takes the unlabelled cloud points of its gate nearest to its own lifted points
-(``support_labels``); it is exported only when that makes it visibly drawn
-(``objects.min_cloud_points``)."""
+(``support_labels``) — if a keyframe that detected it fused it (``fused_objects``: not a car
+detected only 40-100 m away, beyond the fused depth) — and it is exported only when that makes it
+visibly drawn (``objects.min_cloud_points``, at the map's sampling at its nearest detection)."""
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -31,7 +32,8 @@ from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, fit_points, label_map_for
-from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
+from oh_my_slam.reconstruction.depth import MAX_FACTOR
+from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size, fusion_step
 from oh_my_slam.reconstruction.pointcloud import pixel_mask
 from oh_my_slam.segmentation.api import OBB, UNSEGMENTED
 
@@ -76,6 +78,7 @@ class MapGeometry:
     cloud: PointCloud  # map cloud, label = object id
     new_cloud: PointCloud  # points of this update's keyframes
     stats: dict[str, Any]
+    nearest: dict[int, float] = field(default_factory=dict)  # nearest_detections
 
 
 @dataclass
@@ -87,6 +90,8 @@ class FusedCloud:
     xyz: NDArray[np.float64]
     voxel: float
     seconds: float
+    focal: float = 0.0  # focal length (px) of the fused depth grids (median over the keyframes)
+    depth_max: float = float("inf")  # the fusion's depth cut (``fusion_depth_max`` per keyframe)
 
 
 def _frame_data(ctx: Any, rec: store.FrameRecord, new_by_name: dict[str, Any]) -> FrameData:
@@ -111,9 +116,29 @@ def _frame_labels(ctx: Any, rec: store.FrameRecord, shape: tuple[int, ...], objs
     return label_map_for(insts, (int(shape[0]), int(shape[1])), objs)
 
 
+def fusion_depth_max(fd: FrameData, depth_max: float) -> float:
+    """How deep keyframe ``fd`` is fused: ``depth_max`` where the keyframe placed it before its
+    near/far correction (``mapping.api._adjust_depth_scales``: about its median depth m,
+    d' = m · (d / m) ** exponent, the factor within [1/MAX_FACTOR, MAX_FACTOR]).
+
+    The correction moves a keyframe's surfaces; it does not change which of them the keyframe
+    contributes. Outdoors the keyframes tilt by exponents up to ~1.2 (far field 15-35 % deeper):
+    cut at a fixed ``depth_max``, the keyframes that see a facade from 25-30 m no longer counted
+    for it, and the facades 10-20 m from a street walk fell below ``CLOUD_MIN_VIEWS`` (street.mp4:
+    8.2 M cloud points untilted, 6.9 M tilted)."""
+    e = float(fd.rec.stats.get("depth_exponent", 1.0))
+    d = fd.depth[fd.valid & (fd.depth > 0)]
+    if e == 1.0 or not len(d):
+        return depth_max
+    med = float(np.median(d))
+    return float(np.clip(med * (depth_max / med) ** e, depth_max / MAX_FACTOR,
+                         depth_max * MAX_FACTOR))
+
+
 def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
                        ) -> NDArray[np.float64]:
-    """Surface points of a fine TSDF of all frames' valid, edge-free depth.
+    """Surface points of a fine TSDF of all frames' valid, edge-free depth, each frame up to
+    ``depth_max`` as it placed it before its near/far correction (``fusion_depth_max``).
 
     Each keyframe's monocular depth disagrees with its neighbours by a few percent even after
     alignment, so back-projecting every frame leaves one offset copy of each surface per view;
@@ -124,7 +149,8 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float
     fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS)
     for fd in sorted(frames, key=lambda fd: fd.rec.order_key):
         m = pixel_mask(fd.depth, fd.valid)
-        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam)
+        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam,
+                         depth_max=fusion_depth_max(fd, depth_max))
     views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
     pts = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
     pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
@@ -260,13 +286,54 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData],
     return rgb, label, seen_new
 
 
-def support_labels(xyz: NDArray[Any], label: NDArray[np.int32], objs: ObjectState) -> int:
+def _sighting_depths(objs: ObjectState, frames: list[FrameData], depth_max: float
+                     ) -> dict[int, list[tuple[float, float]]]:
+    """Per object: (depth in the keyframe's camera, that keyframe's fused depth) of each of its
+    sightings in the fused keyframes ``frames``."""
+    cams = {fd.rec.index: (fd.rec.T_map_cam, fusion_depth_max(fd, depth_max)
+                           if np.isfinite(depth_max) else depth_max) for fd in frames}
+    out: dict[int, list[tuple[float, float]]] = {}
+    for o in objs.objects:
+        for sg in o.sightings:
+            cam = cams.get(sg.frame)
+            if cam is not None:
+                z = float((np.asarray(sg.centroid, np.float64) - cam[0].t) @ cam[0].R[:, 2])
+                out.setdefault(o.id, []).append((z, cam[1]))
+    return out
+
+
+def nearest_detections(objs: ObjectState, frames: list[FrameData]) -> dict[int, float]:
+    """Per object, the depth (in that keyframe's camera) of its nearest sighting among the fused
+    keyframes ``frames``: its finest view, which sampled it most densely
+    (``objects.min_cloud_points``). Objects without such a sighting are left out."""
+    ahead = {oid: [z for z, _ in zs if z > 0]
+             for oid, zs in _sighting_depths(objs, frames, float("inf")).items()}
+    return {oid: min(zs) for oid, zs in ahead.items() if zs}
+
+
+def fused_objects(objs: ObjectState, frames: list[FrameData], depth_max: float) -> set[int]:
+    """Ids of the objects that a keyframe which detected them fused: one of their sightings (its
+    centroid, in that keyframe's camera) lies within the keyframe's fused depth
+    (``fusion_depth_max``) — ``frames`` are the fused keyframes.
+
+    Only these take support (``support_labels``). An object detected only beyond that depth (a
+    car 40-100 m down a street) has no surface of its own in the cloud: its lifted points are
+    placed by far monocular depth, its gate and support radius grow to 1-3 m, and the cloud
+    points near them are other surfaces (the road, a facade). Its votes still count: a point
+    that its keyframes see at the depth where they detected it."""
+    return {oid for oid, zs in _sighting_depths(objs, frames, depth_max).items()
+            if any(0.0 < z < cut for z, cut in zs)}
+
+
+def support_labels(xyz: NDArray[Any], label: NDArray[np.int32], objs: ObjectState,
+                   fused: set[int] | None = None) -> int:
     """Give the confirmed objects the unlabelled cloud points of their own surface: each of an
     object's own lifted points (``objects.fit_points``) picks the ``SUPPORT_NEIGHBOURS`` nearest
     unlabelled cloud points inside the object's attribution gate, within ``support_radius``; a
     point that several objects pick takes the id of the object whose own point is nearest (ties:
-    the lower id), so the order of the objects does not matter. ``label`` is modified in place.
-    Returns how many objects took points."""
+    the lower id), so the order of the objects does not matter. With ``fused``, only the objects
+    it holds take points (``fused_objects``). ``label`` is modified in place. Returns how many
+    objects took points."""
     from scipy.spatial import cKDTree
 
     pts_all = np.asarray(xyz, np.float64).reshape(-1, 3)
@@ -274,7 +341,7 @@ def support_labels(xyz: NDArray[Any], label: NDArray[np.int32], objs: ObjectStat
     best_d = np.full(len(pts_all), np.inf)
     best_id = np.zeros(len(pts_all), np.int32)
     for o in sorted(objs.objects, key=lambda o: o.id):
-        if not o.confirmed or o.obb is None:
+        if not o.confirmed or o.obb is None or (fused is not None and o.id not in fused):
             continue
         own = np.asarray(fit_points(o), np.float64)
         if len(own) < SUPPORT_MIN_POINTS:
@@ -323,7 +390,9 @@ def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:
         cloud_voxel = max(0.005, voxel / 2)
         confident = [fd for fd in frames if not fd.rec.low_confidence]
         xyz = fused_cloud_points(confident, cloud_voxel, depth_max)
-    return FusedCloud(confident, xyz, cloud_voxel, time.perf_counter() - t0)
+        focal = float(np.median([fd.rec.K_grid.fx / fusion_step(fd.depth.shape)
+                                 for fd in confident])) if confident else 0.0
+    return FusedCloud(confident, xyz, cloud_voxel, time.perf_counter() - t0, focal, depth_max)
 
 
 def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
@@ -338,7 +407,8 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
             fd.labels = _frame_labels(ctx, fd.rec, fd.depth.shape, objs)
         xyz = fused.xyz
         rgb, label, seen_new = attribute_points(xyz, fused.frames, attribution_gates(objs))
-        supported = support_labels(xyz, label, objs)
+        supported = support_labels(xyz, label, objs,
+                                   fused_objects(objs, fused.frames, fused.depth_max))
         cloud = PointCloud(xyz, rgb, label)
         new_cloud = cloud.subset(np.nonzero(seen_new)[0])
         assert cloud.label is not None
@@ -347,6 +417,7 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         tx.save_npy(store.CLOUD_OBJECTS, cloud.label.astype(np.int32))
     progress(f"cloud: {len(cloud)} points (voxel {fused.voxel * 100:.1f} cm) in "
              f"{fused.seconds + time.perf_counter() - t0:.0f} s")
-    stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "support_objects": supported}
+    stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "focal_px": round(fused.focal, 2),
+             "support_objects": supported}
     ctx.notes["geometry"] = stats
-    return MapGeometry(cloud, new_cloud, stats)
+    return MapGeometry(cloud, new_cloud, stats, nearest_detections(objs, fused.frames))
