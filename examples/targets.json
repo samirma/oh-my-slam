@@ -158,8 +158,9 @@
       "value": 270,
       "measured": 176.9931,
       "unit": "s",
-      "tolerance_rel": 0.2,
-      "description": "mapper.sh update of all 79 ainex-captures frames in one update"
+      "tolerance_rel": 0.35,
+      "description": "mapper.sh update of all 79 ainex-captures frames in one update",
+      "tolerance_note": "Regression tolerance set to the run-to-run spread measured on unchanged code on 2026-09-25 (8 runs, commits 521f1e1..10289bf): 172-259 s, driven by MapAnything compute on the server (50-112 s for identical requests; swap and GPU contention)."
     },
     "perf.mapper_single.client_peak_mb": {
       "op": "<=",
@@ -180,8 +181,9 @@
       "value": 300,
       "measured": 197.9368,
       "unit": "s",
-      "tolerance_rel": 0.2,
-      "description": "mapper.sh update of the same frames split across the updates (sum)"
+      "tolerance_rel": 0.35,
+      "description": "mapper.sh update of the same frames split across the updates (sum)",
+      "tolerance_note": "Regression tolerance set to the run-to-run spread measured on unchanged code on 2026-09-25 (8 runs, commits 521f1e1..10289bf): same MapAnything variance as the one-update map."
     },
     "perf.mapper_split.client_peak_mb": {
       "op": "<=",
@@ -232,7 +234,9 @@
       "value": 350,
       "measured": 214.1061,
       "unit": "MB",
-      "description": "peak resident set of the command's process tree: view.sh -m on the one-update map: process start until the page has rendered"
+      "description": "peak resident set of the command's process tree: view.sh -m on the one-update map: process start until the page has rendered",
+      "tolerance_rel": 0.15,
+      "tolerance_note": "Regression tolerance set to the run-to-run spread measured on unchanged code on 2026-09-25 (8 runs, commits 521f1e1..10289bf): 208-236 MB on the same map."
     },
     "perf.view_map.server_peak_gb": {
       "op": "<=",
@@ -564,8 +568,9 @@
       "value": 0.5,
       "measured": 0.2245,
       "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "median 3D IoU of paired OBBs"
+      "tolerance_abs": 0.08,
+      "description": "median 3D IoU of paired OBBs",
+      "tolerance_note": "Regression tolerance set to the run-to-run spread measured on unchanged code on 2026-09-25 (8 runs, commits 521f1e1..10289bf): 0.663-0.777 (0.663 and 0.711 at the same commit)."
     },
     "contract.stdout.server": {
       "op": "<=",
