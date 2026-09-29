@@ -131,6 +131,22 @@ def test_preflight_creates_missing_parents_and_names_the_path(tmp_path: Path,
         PayloadWriter(path=not_a_folder / "x" / "y.json")
 
 
+def test_output_to_a_device_or_fifo_is_written_in_place(tmp_path: Path) -> None:
+    """``-o /dev/null`` and a named pipe cannot be replaced by a rename: they are written to."""
+    preflight_file(Path(os.devnull), "-o")
+    writer = PayloadWriter(path=Path(os.devnull))
+    writer.write_bytes(b"{}\n")
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        PayloadWriter(path=fifo).write_bytes(b"{}\n")
+        assert os.read(reader, 16) == b"{}\n"
+    finally:
+        os.close(reader)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["pipe"]
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
 def test_preflight_rejects_a_read_only_folder(tmp_path: Path) -> None:
     ro = tmp_path / "ro"

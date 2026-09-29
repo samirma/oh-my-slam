@@ -1268,7 +1268,9 @@ def integrate(ctx: UpdateContext, progress: Progress
     fused = fuse_map(ctx, records)  # stage cloud; the objects test surface continuity on it
     with timing.stage("objects"):
         objs = objects.update_objects(ctx, records, progress, surface=fused.xyz)
-    if objs.invalidated:  # objects removed: their pixels are gone from the keyframes, fuse again
+    if objs.invalidated or objs.summary.get("vacated"):
+        # objects removed: their pixels are gone from the keyframes and their places are drawn
+        # from the keyframes that saw through them; fuse again
         fused = fuse_map(ctx, records)
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
     with timing.stage("objects"):

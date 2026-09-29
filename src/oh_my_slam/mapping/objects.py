@@ -590,6 +590,30 @@ def points_file(oid: int) -> str:
 
 
 @dataclass
+class Vacated:
+    """The place of an object that an update removed (``retire_pixels``): the pixels retired from
+    each keyframe that detected it (``masks``: keyframe name -> RLE mask; the object's detection,
+    grown by ``RETIRE_DILATE``) and the keyframes that saw through it (``witnesses``: the latest
+    observation of the place). The map cloud there is drawn from the witnesses
+    (``geometry.fused_cloud_points``): the older keyframes' views of the place are retired, so the
+    surface behind the object is seen only by them, often fewer than a surface's usual views."""
+
+    update: int
+    object: int
+    masks: dict[str, dict[str, Any]]
+    witnesses: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"update": self.update, "object": self.object,
+                "masks": dict(sorted(self.masks.items())), "witnesses": sorted(self.witnesses)}
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> Vacated:
+        return Vacated(int(d["update"]), int(d["object"]), dict(d.get("masks", {})),
+                       [str(n) for n in d.get("witnesses", [])])
+
+
+@dataclass
 class ObjectState:
     objects: list[MapObject]
     next_id: int
@@ -599,6 +623,7 @@ class ObjectState:
     # keyframe index -> pixels this update invalidated in it: the masks of the objects it removed
     invalidated: dict[int, int] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
+    vacated: list[Vacated] = field(default_factory=list)  # places of removed objects (all updates)
 
     def by_id(self) -> dict[int, MapObject]:
         return {o.id: o for o in self.objects}
@@ -651,7 +676,18 @@ def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
         objs.append(MapObject.from_dict(od, pts))
     return ObjectState(objs, int(d.get("next_id", meta.get("next_object_id", 1))),
                        {int(k): int(v) for k, v in d.get("merged_into", {}).items()},
-                       floor_z=d.get("floor_z", meta.get("floor_z")))
+                       floor_z=d.get("floor_z", meta.get("floor_z")),
+                       vacated=[Vacated.from_dict(v) for v in d.get("vacated", [])])
+
+
+def load_vacated(current: Any) -> list[Vacated]:
+    """The places of the objects the map's updates removed (``Vacated``), as stored or staged."""
+    import json
+
+    p = current(OBJECTS_JSON)
+    if not p.exists():
+        return []
+    return [Vacated.from_dict(v) for v in json.loads(p.read_text()).get("vacated", [])]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1096,9 +1132,12 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     poses = {i: r.T_map_cam for i, r in views.records.items()}
     revisit = {o.id: revisiting_frames(o, placed, poses) for o in state.objects if o.id in touched}
     candidates = [o for o in state.objects if o.id not in dropped]
-    removed = _absence(candidates, new_views, revisit)
-    state.invalidated = retire_pixels(ctx, views, masks, [o for o in candidates
-                                                          if o.id in set(removed)])
+    witnesses: dict[int, list[int]] = {}
+    removed = _absence(candidates, new_views, revisit, witnesses)
+    state.invalidated, vacated = retire_pixels(ctx, views, masks, [o for o in candidates
+                                                                   if o.id in set(removed)],
+                                               witnesses)
+    state.vacated.extend(vacated)
     gone = dropped | set(removed)
     for oid in sorted(gone | set(alias)):
         if oid < first_new:
@@ -1146,6 +1185,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         "removed": sorted(oid for oid in removed if oid < first_new),
         "withdrawn": sum(oid >= first_new for oid in removed),
         "pixels_invalidated": sum(state.invalidated.values()),
+        "vacated": len(vacated),
         "below_floor_dropped": len(dropped),
         "total": len(state.objects), "confirmed": confirmed,
         "unconfirmed": len(state.objects) - confirmed,
@@ -1184,17 +1224,22 @@ def revisiting_frames(o: MapObject, placed: list[Any], poses: dict[int, Pose]) -
 RETIRE_DILATE = 2
 
 
-def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject]
-                  ) -> dict[int, int]:
+def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject],
+                  witnesses: dict[int, list[int]] | None = None
+                  ) -> tuple[dict[int, int], list[Vacated]]:
     """Latest wins for the cloud: the detection masks of the objects this update removes are
     invalidated in the keyframes that detected them (``valid.png``, staged), so fusion stops
     drawing them: the object's own record and its points in the map cloud go together. Returns
-    keyframe index -> number of pixels invalidated."""
+    keyframe index -> number of pixels invalidated, and the removed objects' places (``Vacated``,
+    with their ``witnesses``: object id -> indices of the keyframes that saw through it), where
+    the map cloud is then drawn from the witnesses."""
     from oh_my_slam.core.images import png_bytes
 
     kill: dict[int, NDArray[np.bool_]] = {}
-    for o in gone:
-        for f in o.frames:
+    places: list[Vacated] = []
+    for o in sorted(gone, key=lambda o: o.id):
+        retired: dict[str, dict[str, Any]] = {}
+        for f in sorted(o.frames):
             view = views.get(f)
             if view is None:
                 continue
@@ -1202,18 +1247,24 @@ def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject]
                      for oid, m in masks.instances(f) if masks.owner(oid) == o.id]
             found = [m for m in found if m.shape == view.depth.shape]
             if found:
-                kill[f] = kill.get(f, np.zeros(view.depth.shape, bool)) | np.logical_or.reduce(found)
+                m = ndimage.binary_dilation(np.logical_or.reduce(found), iterations=RETIRE_DILATE)
+                kill[f] = kill.get(f, np.zeros(view.depth.shape, bool)) | m
+                retired[views.records[f].name] = rle.encode(m)
+        seen_through = [views.records[f].name for f in (witnesses or {}).get(o.id, [])
+                        if f in views.records]
+        if retired and seen_through:
+            places.append(Vacated(int(ctx.update_id), o.id, retired, seen_through))
     out: dict[int, int] = {}
     for f, m in kill.items():
         view = views.get(f)
         assert view is not None
-        m = ndimage.binary_dilation(m, iterations=RETIRE_DILATE) & view.valid
+        m = m & view.valid
         if m.any():
             name = views.records[f].name
             ctx.tx.write_bytes(frame_file(name, "valid.png"),
                                png_bytes((view.valid & ~m).astype(np.uint8) * 255))
             out[f] = int(m.sum())
-    return out
+    return out, places
 
 
 def save_state(tx: Any, state: ObjectState) -> None:
@@ -1222,6 +1273,7 @@ def save_state(tx: Any, state: ObjectState) -> None:
         "floor_z": state.floor_z,
         "merged_into": {str(k): v for k, v in sorted(state.merged_into.items())},
         "objects": [o.to_dict() for o in sorted(state.objects, key=lambda o: o.id)],
+        "vacated": [v.to_dict() for v in state.vacated],
     })
 
 
@@ -2288,7 +2340,8 @@ def _judges(nf: Any, o: MapObject, size: float) -> bool:
 
 
 def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]],
-             judges: dict[int, set[int]] | None = None) -> list[int]:
+             judges: dict[int, set[int]] | None = None,
+             witnesses: dict[int, list[int]] | None = None) -> list[int]:
     """Objects that this update, as a whole, shows to be gone.
 
     Each keyframe of the update that is registered well enough to judge the object (``_judges``)
@@ -2302,10 +2355,12 @@ def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]]
 
     ``judges`` (object id -> keyframe indices): an object that the update itself detected is
     judged only by the keyframes that photograph its place again (``revisiting_frames``); an
-    object the update did not detect (no entry) is judged by all of them."""
+    object the update did not detect (no entry) is judged by all of them. ``witnesses``, when
+    given, receives the keyframes that saw through each removed object (object id -> indices)."""
     removed = []
     for o in candidates:
         verdicts: list[tuple[float, bool]] = []  # (fraction seen through, pose well supported)
+        through_frames: list[int] = []
         only = (judges or {}).get(o.id)
         size = float(np.linalg.norm(np.ptp(o.points, axis=0))) if len(o.points) else 0.0
         for idx, (nf, view) in new_views.items():
@@ -2319,6 +2374,8 @@ def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]]
                          or "pose_matches" in nf.record.stats
                          or nf.record.pose_source in ("identity", "multiview"))
             verdicts.append((through / n, supported))
+            if through / n >= REMOVE_FRACTION:
+                through_frames.append(idx)
         if not verdicts:
             continue
         strong = [(f, ok) for f, ok in verdicts if f >= REMOVE_FRACTION]
@@ -2335,6 +2392,8 @@ def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]]
             o.strikes += 1
             if o.strikes >= 2:
                 removed.append(o.id)
+        if witnesses is not None and removed and removed[-1] == o.id:
+            witnesses[o.id] = sorted(through_frames)
     return removed
 
 
