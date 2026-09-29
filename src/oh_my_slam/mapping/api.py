@@ -37,6 +37,7 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import frame as mframe
 from oh_my_slam.mapping import ingest, retrieval, store, validity
 from oh_my_slam.mapping.sfm import (
+    MAX_EPIPOLAR_DEG,
     MIN_PLACED_FRACTION,
     ROTATION_BASELINE_RATIO,
     ROTATION_PAIR_FRACTION,
@@ -44,6 +45,7 @@ from oh_my_slam.mapping.sfm import (
     Sfm,
     SfmModel,
     check_versions,
+    contradicted,
     vet,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
@@ -157,12 +159,19 @@ def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
 
 
 def _camera_prior(new: list[NewFrame], old: list[store.FrameRecord]) -> CameraPrior:
+    """The camera of the new keyframes: without EXIF, an existing camera of the same image size
+    (e.g. more frames of the same video); with EXIF, an existing camera of the same image size
+    whose EXIF focal prior is the same (more photos of the same device and zoom,
+    ``Sfm.existing_camera``) — else a new one."""
     w, h = new[0].full_size
     focals = [nf.frame.intrinsics.fx for nf in new if nf.full_size == (w, h)]
     same = [f for f in old if (f.width, f.height) == (w, h)]
     existing = same[-1].camera_id if same and all(nf.kf.exif is None for nf in new) else None
-    # same image size as an existing camera (e.g. more frames of the same video): reuse it
-    return CameraPrior(w, h, focal=float(np.median(focals)), existing_id=existing)
+    same_focal: tuple[int, ...] = ()
+    if same and all(nf.kf.exif is not None for nf in new):
+        same_focal = tuple(dict.fromkeys(f.camera_id for f in reversed(same)))
+    return CameraPrior(w, h, focal=float(np.median(focals)), existing_id=existing,
+                       same_focal_ids=same_focal)
 
 
 def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
@@ -292,8 +301,12 @@ def _multiview_chunks(ctx: UpdateContext, todo: list[PoolView], by_name: dict[st
         i += len(chunk)
 
 
-def _new_pool(ctx: UpdateContext) -> list[PoolView]:
-    return [PoolView(f"{nf.kf.name}.jpg", nf.kf.path, nf.frame.intrinsics, nf.frame.descriptor)
+def _new_pool(ctx: UpdateContext, K: dict[str, Intrinsics] | None = None) -> list[PoolView]:
+    """This update's keyframes, with the intrinsics ``K`` where given (the SfM camera), else
+    their own."""
+    K = K or {}
+    return [PoolView(f"{nf.kf.name}.jpg", nf.kf.path,
+                     K.get(f"{nf.kf.name}.jpg", nf.frame.intrinsics), nf.frame.descriptor)
             for nf in ctx.new]
 
 
@@ -481,6 +494,18 @@ def _vetted(ctx: UpdateContext, model: SfmModel | None, turns: set[frozenset[str
     return model
 
 
+def _contradicting(sfm: Sfm, poses: dict[str, Pose], K: dict[str, Intrinsics],
+                   judged: set[str]) -> dict[str, float]:
+    """The keyframes of ``judged`` whose pose contradicts their own verified matches with the
+    keyframes of ``poses`` (``sfm.contradicted``)."""
+    from oh_my_slam.mapping import panorama
+
+    if not judged & set(poses):
+        return {}
+    bad = contradicted(poses, K, panorama.verified_matches(sfm.db, set(poses)))
+    return {n: v for n, v in bad.items() if n in judged}
+
+
 def _model_intrinsics(sfm: Sfm, model: SfmModel, names: set[str]) -> dict[str, Intrinsics]:
     """Full-resolution intrinsics of new keyframes: the model's camera (refined focal length)
     where the model holds it, else the database's."""
@@ -534,6 +559,25 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                             "merged_by_shared_keyframes": sorted(merged)}
     realigned = _fix_blocks(ctx, sfm, model, join)
     posed = {n: model.pose(n) for n in model.registered}
+    # a keyframe the SfM model posed against its own verified matches is joined like an unplaced
+    # one (the global mapper settled the 6-photo office map's f000005 on its 67 matches to one
+    # keyframe against its 931 to two others: 0.43° off them; the next update registered onto it)
+    K_model = {n: model.intrinsics(n) for n in model.registered}
+    bad_fit = _contradicting(sfm, {**posed, **merged}, {
+        **K_model, **_model_intrinsics(sfm, model, set(merged))}, set(posed))
+    n_shared = len(merged)
+    rereg: dict[str, Pose] = {}
+    if bad_fit:
+        model.deregister(set(bad_fit))
+        posed = {n: T for n, T in posed.items() if n not in bad_fit}
+        rereg = _reregister(ctx, sfm, model, set(bad_fit))
+        merged.update(rereg)
+        join["contradicted"] = {n: round(v, 3) for n, v in sorted(bad_fit.items())}
+        join["reregistered"] = sorted(rereg)
+        log.warning("%s: %d keyframes whose pose contradicts their verified matches (median "
+                    "epipolar distance > %.2f°) are registered again with the others fixed (%d) "
+                    "or joined like unplaced ones: %s", model.method, len(bad_fit),
+                    MAX_EPIPOLAR_DEG, len(rereg), ", ".join(sorted(bad_fit)))
     missing = new_names - set(posed) - set(merged) - set(realigned)
     anchored = set(posed) | set(merged) | set(realigned)
     connected = sfm.connected(anchored, missing) if missing else set()
@@ -597,13 +641,41 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
         return model
     base = ctx.work / "sfm_join_base"
     model.write(base)
-    method = model.method + ("+merged" if merged else "") + ("+realigned" if free else "") + (
+    method = model.method + ("+merged" if n_shared else "") + (
+        "+reregistered" if rereg else "") + ("+realigned" if free else "") + (
         "+multiview" if mv else "")
     out = sfm.extend_with_poses(base, {**merged, **free, **mv}, ctx.work / "sfm_join", method)
     out.notes.update(model.notes)
-    progress(f"{method}: {len(out.registered)} keyframes posed ({len(merged)} from another "
-             f"reconstruction, {len(free)} realigned, {len(mv)} by anchored multi-view)")
+    progress(f"{method}: {len(out.registered)} keyframes posed ({n_shared} from another "
+             f"reconstruction, {len(rereg)} registered again, {len(free)} realigned, {len(mv)} "
+             "by anchored multi-view)")
     return out
+
+
+def _reregister(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: set[str]
+                ) -> dict[str, Pose]:
+    """Poses (model frame) of the deregistered keyframes ``names`` from an incremental
+    registration with the model's keyframes and cameras fixed, where the pose has
+    ``trajectory.SUPPORT_MIN_POINTS`` points and no longer contradicts the keyframe's verified
+    matches (``_contradicting``). COLMAP may register other keyframes the model does not hold
+    too; only these are taken."""
+    from oh_my_slam.mapping.trajectory import SUPPORT_MIN_POINTS
+
+    if not names or not sfm.connected(set(model.registered), names):
+        return {}
+    base = ctx.work / "sfm_rereg_base"
+    model.write(base)
+    more = sfm.map_incremental(ctx.work / "sfm_rereg", input_path=base, fix_existing=True,
+                               constant_cameras=sfm.model_cameras(base))
+    if more is None:
+        return {}
+    got = {n: more.pose(n) for n in sorted(names & more.supported(SUPPORT_MIN_POINTS))}
+    if not got:
+        return {}
+    posed = {n: model.pose(n) for n in model.registered}
+    K = {**{n: model.intrinsics(n) for n in posed}, **{n: more.intrinsics(n) for n in got}}
+    still = _contradicting(sfm, {**posed, **got}, K, set(got))
+    return {n: T for n, T in got.items() if n not in still}
 
 
 def _ups_cam(ctx: UpdateContext) -> dict[str, NDArray[np.float64]]:
@@ -706,31 +778,61 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
     model_in = ctx.tx.root / store.SFM_MODEL
     poses: dict[str, Pose] = {}
     method = "sfm-incremental"
+    inc: SfmModel | None = None
     if not rotation and len(ctx.old_frames) >= 3:
-        inc = sfm.map_incremental(ctx.work / "sfm_out", input_path=model_in, fix_existing=True)
+        # the map's cameras keep the intrinsics its stored keyframes were posed and fused with
+        held = sfm.model_cameras(model_in)
+        inc = sfm.map_incremental(ctx.work / "sfm_out", input_path=model_in, fix_existing=True,
+                                  constant_cameras=held)
         if inc is not None:
-            for name in sorted(set(inc.registered) & connected):
+            if inc.notes.get("moved_fixed"):
+                ctx.notes["sfm_moved_fixed"] = inc.notes["moved_fixed"]
+            bad = _contradicted_new(ctx, sfm, inc, connected)
+            for name in sorted((set(inc.registered) & connected) - set(bad)):
                 if _depth_consistent(ctx, inc, name):
                     poses[name] = inc.pose(name)
     missing = sorted(connected - set(poses))
     if missing:
         method = "multiview" if not poses else "sfm-incremental+multiview"
-        pool = _old_pool(ctx) + [v for v in _new_pool(ctx) if v.name in poses]
+        K = (_model_intrinsics(sfm, inc, new_names) if inc is not None
+             else _keyframe_intrinsics(ctx, sfm, new_names))
+        pool = _old_pool(ctx) + [v for v in _new_pool(ctx, K) if v.name in poses]
         for v in pool:
             if v.name in poses:
                 v.pose = poses[v.name]
-        todo = [v for v in _new_pool(ctx) if v.name in set(missing)]
+        todo = [v for v in _new_pool(ctx, K) if v.name in set(missing)]
         progress(f"anchored multi-view for {len(todo)} keyframes"
                  + (" (rotation-dominant input)" if rotation else ""))
         mv = _multiview_poses(ctx, todo, pool, client)
         poses.update(mv)
         poses, _ = _refine_multiview(ctx, sfm, poses, set(mv), refine_focal=False,
-                                     rotation=rotation)
+                                     rotation=rotation, model=inc)
         ctx.notes["mv_names"] = sorted(mv)
-    model = sfm.extend_with_poses(model_in, poses, ctx.work / "sfm_ext", method)
+    # new cameras keep the intrinsics the incremental extension refined the poses with
+    model = sfm.extend_with_poses(
+        model_in, poses, ctx.work / "sfm_ext", method,
+        cameras=None if inc is None else {int(c): cam for c, cam in inc.rec.cameras.items()})
     progress(f"registered {len(poses)}/{len(new_names)} new keyframes ({method}) in "
              f"{time.perf_counter() - t0:.0f} s")
     return model
+
+
+def _contradicted_new(ctx: UpdateContext, sfm: Sfm, inc: SfmModel, new: set[str]
+                      ) -> dict[str, float]:
+    """This update's keyframes the incremental extension posed against their own verified
+    matches (``sfm.contradicted``, judged with the map's keyframes); they are placed like the
+    keyframes it could not register."""
+    placed = set(inc.registered) & new
+    old = {Path(f.image).name: f for f in ctx.old_frames}
+    poses = {**{n: f.T_map_cam for n, f in old.items()}, **{n: inc.pose(n) for n in placed}}
+    K = {**{n: f.K for n, f in old.items()}, **{n: inc.intrinsics(n) for n in placed}}
+    bad = _contradicting(sfm, poses, K, placed)
+    if bad:
+        ctx.notes["sfm_contradicted"] = {n: round(v, 3) for n, v in sorted(bad.items())}
+        log.warning("%d new keyframes posed against their verified matches (median epipolar "
+                    "distance > %.2f°) are placed by the multi-view path: %s", len(bad),
+                    MAX_EPIPOLAR_DEG, ", ".join(sorted(bad)))
+    return bad
 
 
 def _remap_small(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,

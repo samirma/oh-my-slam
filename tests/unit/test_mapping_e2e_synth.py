@@ -222,6 +222,60 @@ def test_non_overlapping_update_is_rejected(world, tmp_path: Path) -> None:  # t
     assert store.full_tree_hash(mdir) == before
 
 
+@pytest.mark.parametrize("f35_later", [28, 27])
+def test_photos_in_a_later_update_keep_refined_intrinsics(tmp_path: Path, f35_later: int) -> None:
+    """Office split (OS-2): photos with EXIF mapped 7 + 7. The EXIF focal is 8 % off (a phone's
+    35 mm-equivalent tag); the first update refines it. The second update's photos, of the same
+    device (same EXIF focal), share the map's camera — its refined focal length, not a second
+    camera left at the EXIF prior; of another zoom (another EXIF focal) they get their own camera,
+    whose focal length the extension refines and the map keeps. Either way they are posed as
+    accurately as the first update's."""
+    from PIL import Image
+
+    from oh_my_slam.core.types import Pose
+    from oh_my_slam.mapping.frame import similarity_by_poses, transform_pose
+    from tests.synth.mapping import K as K_TRUE
+
+    client = FakeClient()
+    poses = ring(14, span=1.3 * np.pi)
+    imgs = add_frames(client, mapping_room(), poses, tmp_path / "in", "p", depth_noise=0.03,
+                      seed=4)
+    f35 = 28  # FocalLengthIn35mmFilm: 28 * 500 px / 43.27 mm = 323.5 px, true 300 px
+    jpgs = []
+    for k, src in enumerate(imgs):
+        dst = src.with_suffix(".jpg")
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0xA405] = f35 if k < 7 else f35_later
+        Image.open(src).convert("RGB").save(dst, quality=98, exif=exif)
+        client.frames[str(dst.resolve())] = client.frames[str(src.resolve())]
+        jpgs.append(dst)
+    mdir = tmp_path / "map"
+    update(mdir, jpgs[:7], client=client, progress=quiet)
+    update(mdir, jpgs[7:], client=client, progress=quiet)
+    frames = json.loads((mdir / "frames.json").read_text())["frames"]
+    assert len(frames) == 14
+    cameras = {f["camera_id"] for f in frames}
+    assert len(cameras) == (1 if f35_later == f35 else 2)
+    for f in frames:  # refined, not the EXIF prior (323.5 or 312.0 px)
+        assert abs(f["K"]["fx"] - K_TRUE.fx) < 0.02 * K_TRUE.fx, (f["name"], f["K"]["fx"])
+    assert not any(f["low_confidence"] for f in frames)
+
+    def pose(f: dict) -> Pose:
+        from oh_my_slam.core.geometry import quat_to_rot
+
+        T = f["T_map_cam"]
+        return Pose(quat_to_rot(np.array(T["quaternion_xyzw"])), np.array(T["translation"]))
+
+    first = [f for f in frames if f["update_id"] == 1]
+    truth = {f"f{i:06d}": p for i, p in enumerate(poses)}
+    sim = similarity_by_poses([pose(f) for f in first], [truth[f["name"]] for f in first])
+    for f in frames:
+        T, ref = transform_pose(sim, pose(f)), truth[f["name"]]
+        rot = np.degrees(np.arccos(np.clip((np.trace(T.R.T @ ref.R) - 1) / 2, -1, 1)))
+        assert np.linalg.norm(T.t - ref.t) < 0.03 and rot < 0.5, (f["name"], f["update_id"],
+                                                                  T.t - ref.t, rot)
+
+
 def test_one_update_and_split_updates_agree(world, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     """§5 stability: the same 14 frames mapped in one update and in two (7 + 7) give the same
     objects, labels, ids and colours, and boxes within the tolerance that two SfM runs of the
