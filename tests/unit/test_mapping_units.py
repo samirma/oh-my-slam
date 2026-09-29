@@ -485,6 +485,57 @@ def test_fused_cloud_collapses_per_frame_depth_disagreement() -> None:
     assert np.median(d_new) < 0.015
 
 
+def _wall_frames(spread: float | None = None) -> tuple[Room, list]:
+    """One keyframe (0) looking at the +x wall, which no other keyframe has in view, and three
+    (1-3) looking at the -x wall; keyframe 0's depth scale spread is ``spread``."""
+    from oh_my_slam.mapping.geometry import FrameData
+
+    room = Room()
+    K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
+    poses = [look_at(np.array([0.5, 0.0, 1.3]), np.array([3.0, 0.0, 1.0]))]
+    poses += [look_at(np.array([0.5, dy, 1.3]), np.array([-3.0, dy, 1.0]))
+              for dy in (-0.1, 0.0, 0.1)]
+    frames = []
+    for i, pose in enumerate(poses):
+        r = render(room, pose, K)
+        stats = {} if i or spread is None else {"depth_scale_method": "dense",
+                                                "depth_scale_spread": spread}
+        rec = store.FrameRecord(i, store.frame_name(i), "", "", 1, 320, 240, K, pose, 320, 240,
+                                stats=stats)
+        frames.append(FrameData(rec, r.depth.astype(np.float32), r.depth > 0, r.rgb,
+                                np.zeros(r.depth.shape, np.int32), False))
+    return room, frames
+
+
+def test_a_surface_that_only_one_keyframe_has_in_view_is_in_the_cloud() -> None:
+    """CLOUD_MIN_VIEWS drops speckle, not what only one or two keyframes look at (a laptop at the
+    corner of two photos): the +x wall, which only keyframe 0 sees, is drawn."""
+    from oh_my_slam.mapping.geometry import fused_cloud_points
+
+    room, frames = _wall_frames()
+    xyz = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    wall = xyz[:, 0] > 2.5
+    assert wall.sum() > 5000 and (xyz[:, 0] < -2.5).sum() > 5000
+    assert np.percentile(_surface_distance(room, xyz[wall]), 99) < 0.02
+
+
+def test_speckle_that_other_keyframes_see_through_needs_the_usual_views() -> None:
+    """A blob that one keyframe places in front of the -x wall, where the other keyframes see the
+    wall, is not drawn; nor is what only a keyframe with an ill-measured depth scale sees."""
+    from oh_my_slam.mapping.geometry import fused_cloud_points
+
+    room, frames = _wall_frames()
+    blob = np.zeros(frames[1].depth.shape, bool)
+    blob[100:140, 140:180] = True
+    frames[1].depth = np.where(blob, 0.6 * frames[1].depth, frames[1].depth).astype(np.float32)
+    xyz = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    floating = (xyz[:, 0] < -0.5) & (xyz[:, 0] > -2.5) & (xyz[:, 2] > 0.3) & (xyz[:, 2] < 2.3)
+    assert floating.sum() < 20
+    room, frames = _wall_frames(spread=0.2)
+    xyz = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    assert (xyz[:, 0] > 2.5).sum() == 0 and (xyz[:, 0] < -2.5).sum() > 5000
+
+
 def test_attribute_points_latest_visible_update_wins() -> None:
     from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
 

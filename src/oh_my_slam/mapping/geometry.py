@@ -1,6 +1,8 @@
 """Map geometry for an update: the coloured cloud (surface of a TSDF fusion of the valid, aligned
 depth maps; colour and object id per point from the latest update that sees it), built with the
-reconstruction package's fusion code.
+reconstruction package's fusion code. A surface is kept where ``CLOUD_MIN_VIEWS`` keyframes
+updated it, or where every keyframe that has it in view sees it (``_few_views``); the places of
+removed objects are drawn from the keyframes that saw through them (``_vacated``).
 
 Object ids come from the keyframes' instance masks, which a detector draws generously: a "carpet"
 mask that covers a counter top and the floor beyond it, of which only the counter was lifted into
@@ -174,20 +176,20 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float,
     (``_vacated``; ``retired``: the keyframes whose pixels were retired, fused or not).
     """
     fusion = TsdfFusion(voxel, depth_max, trunc_voxels=CLOUD_TRUNC_VOXELS)
-    for fd in sorted(frames, key=lambda fd: fd.rec.order_key):
-        m = pixel_mask(fd.depth, fd.valid)
-        fusion.integrate(np.where(m, fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam,
+    fused = [pixel_mask(fd.depth, fd.valid) & (fd.depth < fusion_depth_max(fd, depth_max))
+             for fd in frames]  # per frame, the pixels it fuses
+    for i in sorted(range(len(frames)), key=lambda i: frames[i].rec.order_key):
+        fd = frames[i]
+        fusion.integrate(np.where(fused[i], fd.depth, 0.0), fd.rec.K_grid.K(), fd.rec.T_map_cam,
                          depth_max=fusion_depth_max(fd, depth_max))
     views = max(1, min(CLOUD_MIN_VIEWS, fusion.stats.frames))
     pts = _extract(fusion, views)
     if views > 1:
-        # the surfaces that fewer than ``views`` frames fused (Open3D's weight counts the frames
-        # that updated a voxel: the ones that saw its surface or saw through it)
         low = _extract(fusion, 1)
-        few = low[~_member(low, pts)]
-        weight = np.where(_member(few, _extract(fusion, 2)), 2, 1) if views > 2 else np.ones(
-            len(few), np.int64)
-        add = _few_views(few, weight, frames, depth_max, views)
+        few = low[~_member(low, pts)]  # the surfaces that fewer than ``views`` frames updated
+        weight = (np.where(_member(few, _extract(fusion, 2)), 2, 1) if views > 2
+                  else np.ones(len(few), np.int64))
+        add = _few_views(few, weight, frames, fused, depth_max, views)
         keep = np.ones(len(pts), bool)
         if vacated:
             keep, witnessed = _vacated(pts, few, frames, vacated, retired or frames)
@@ -198,7 +200,8 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float,
 
 
 def _extract(fusion: TsdfFusion, views: int) -> NDArray[np.float64]:
-    """The fused surface where at least ``views`` frames updated the voxels."""
+    """The fused surface where at least ``views`` frames updated the voxels (Open3D's weight
+    counts the frames that updated a voxel: the ones that saw its surface or saw through it)."""
     pts = fusion.extract_points(weight_threshold=views - 0.5)  # Open3D keeps weight > threshold
     return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
 
@@ -215,7 +218,10 @@ def _member(a: NDArray[Any], b: NDArray[Any]) -> NDArray[np.bool_]:
 
     if not len(a) or not len(b):
         return np.zeros(len(a), bool)
-    return np.isin(key(a), key(b))
+    kb = np.sort(key(b))
+    ka = key(a)
+    at = np.minimum(np.searchsorted(kb, ka), len(kb) - 1)
+    return np.asarray(kb[at] == ka)
 
 
 def _trusted(fd: FrameData) -> bool:
@@ -226,39 +232,52 @@ def _trusted(fd: FrameData) -> bool:
 
 
 def _few_views(pts: NDArray[np.float64], weight: NDArray[Any], frames: list[FrameData],
-               depth_max: float, views: int) -> NDArray[np.bool_]:
-    """Which surface points that fewer than ``views`` frames fused (``weight`` frames) stay: every
-    frame that has the point in view fused it — its image holds a fused pixel there (``valid``,
-    edge-free) and the point lies within the frame's fused depth (``fusion_depth_max``), whatever
-    the pixel shows — and a frame that sees it (``_visible``) is ``_trusted``.
+               fused: list[NDArray[np.bool_]], depth_max: float, views: int) -> NDArray[np.bool_]:
+    """Which surface points that fewer than ``views`` frames updated (``weight`` of them) stay:
+    as many frames updated them as have them in view, and a frame that sees them (``_visible``'s
+    depth agreement) is ``_trusted``. A frame has a point in view when the point lies within its
+    fused depth (``fusion_depth_max``) and projects onto a pixel it fuses (``fused``: valid,
+    edge-free, within that depth), whatever the pixel shows — a nearer surface, the point, or a
+    farther one.
+
+    The weight, not a count of the frames whose depth lies near the point, decides: a surface
+    that 5 frames see has, a centimetre or two beside it, a second zero crossing that 1 or 2 of
+    them updated (the rim of the TSDF band), which only the weight tells from the surface.
 
     A surface seen by one or two keyframes because no other keyframe looks there (a laptop at the
     corner of two photos, the half of a monitor that one photo shows, the sill that the latest
-    photos show where a removed cup stood) is kept; one that other keyframes look at without
-    fusing it (they see a nearer surface, or through it) needs ``views`` of them, as before."""
+    photos show where a removed cup stood) is kept; one that other keyframes look at and do not
+    see (they see a nearer surface, or through it) needs ``views`` of them, as before."""
     if not len(pts):
         return np.zeros(0, bool)
     cells = np.floor(pts / FEW_VIEWS_CELL).astype(np.int64)
-    uc, inv = np.unique(cells, axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
-    centres = (uc + 0.5) * FEW_VIEWS_CELL
+    base = cells.min(axis=0)
+    cells -= base
+    span = cells.max(axis=0) + 1
+    ck = (cells[:, 0] * span[1] + cells[:, 1]) * span[2] + cells[:, 2]
+    order = np.argsort(ck, kind="stable")  # the points cell by cell
+    uk, first, count = np.unique(ck[order], return_index=True, return_counts=True)
+    uc = np.stack([uk // (span[1] * span[2]), (uk // span[2]) % span[1], uk % span[2]], axis=1)
+    centres = (uc + base + 0.5) * FEW_VIEWS_CELL
     rad = FEW_VIEWS_CELL * float(np.sqrt(3.0)) / 2
     in_view = np.zeros(len(pts), np.int32)
-    seen = np.zeros(len(pts), bool)
-    for fd in frames:
+    trusted = np.zeros(len(pts), bool)
+    for fd, m in zip(frames, fused, strict=True):
         cut = fusion_depth_max(fd, depth_max)
         K = fd.rec.K_grid.K()
         cam = fd.rec.T_map_cam.inverse()
         h, w = fd.depth.shape
-        uvc, zc = project(centres @ cam.R.T + cam.t, K)
+        uvc, zc = project(centres @ cam.R.T + cam.t, K)  # cull the cells outside the frustum
         marg = rad * float(K[0, 0]) / np.maximum(zc - rad, 1e-3)
         with np.errstate(invalid="ignore"):
             near = (zc > -rad) & (zc - rad < cut)
             framed = ((uvc[:, 0] > -marg) & (uvc[:, 0] < w + marg)
                       & (uvc[:, 1] > -marg) & (uvc[:, 1] < h + marg))
-        sel = np.flatnonzero((near & (framed | (zc < rad)))[inv])
-        if not len(sel):
+        c = np.flatnonzero(near & (framed | (zc < rad)))
+        if not len(c):
             continue
+        n = count[c]
+        sel = order[np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n - first[c], n)]
         uv, z = project(pts[sel] @ cam.R.T + cam.t, K)
         with np.errstate(invalid="ignore"):
             u = np.floor(uv[:, 0] + 0.5)
@@ -266,13 +285,13 @@ def _few_views(pts: NDArray[np.float64], weight: NDArray[Any], frames: list[Fram
             ok = (z > 0) & (z < cut) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
         sel, z = sel[ok], z[ok]
         uu, vv = u[ok].astype(np.int64), v[ok].astype(np.int64)
-        fused = pixel_mask(fd.depth, fd.valid)[vv, uu]
-        in_view[sel[fused]] += 1
+        on = m[vv, uu]
+        sel, z, uu, vv = sel[on], z[on], uu[on], vv[on]
+        in_view[sel] += 1
         if _trusted(fd):
-            d = fd.depth[vv, uu]
-            sees = fd.valid[vv, uu] & (np.abs(z - d) < np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z))
-            seen[sel[sees]] = True
-    return (np.asarray(weight) >= np.minimum(views, in_view)) & seen
+            sees = np.abs(fd.depth[vv, uu] - z) < np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z)
+            trusted[sel[sees]] = True
+    return (np.asarray(weight) >= np.minimum(views, in_view)) & trusted
 
 
 def _vacated_region(pts: NDArray[np.float64], place: Vacated, by_name: dict[str, FrameData]
@@ -280,8 +299,11 @@ def _vacated_region(pts: NDArray[np.float64], place: Vacated, by_name: dict[str,
     """Whether each point lies in a removed object's place: it projects onto a pixel retired from
     a keyframe that detected the object, at or behind the object's surface there (up to the depth
     noise, max(VACATED_MARGIN_M, VACATED_MARGIN_REL · depth), in front of it): the object itself
-    and what it hid from that keyframe."""
+    and what it hid from that keyframe; or it lies in the object's box grown by the depth noise
+    (``attribution_margin``): what stood by it, such as its shadow on the surface it stood on."""
     out = np.zeros(len(pts), bool)
+    if place.box is not None and len(pts):
+        out |= place.box.contains(pts, attribution_margin(place.obs_depth))
     for name, enc in place.masks.items():
         fd = by_name.get(name)
         if fd is None:

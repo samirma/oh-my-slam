@@ -11,6 +11,7 @@ continuously are one observation of it: the same views without the look away cha
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -99,6 +100,39 @@ def test_one_update_and_two_end_in_the_same_map(tmp_path: Path) -> None:
         assert {o.id for o in res.objs.objects if o.confirmed} == {1}
     _same_object(a[1], b[1])
     assert one.objs.next_id == two.objs.next_id  # ids count detections, not what was removed
+
+
+def _place_of_the_cup(res: Result) -> tuple[np.ndarray, np.ndarray]:
+    """(floor points where the cup stood, floor points of a ring around it), with colours."""
+    xyz = res.cloud.xyz
+    d = np.abs(xyz[:, :2] - CUP.center[:2]).max(axis=1)
+    floor = np.abs(xyz[:, 2]) < 0.02
+    return (d < 0.06) & floor, (d >= 0.12) & (d < 0.2) & floor
+
+
+def test_the_place_of_a_removed_cup_is_drawn_from_the_latest_views(tmp_path: Path) -> None:
+    """The cup, detected in 4 views, is removed by the 2 latest views, which see the empty floor
+    where it stood. Its pixels are retired from the 4 views, so only the 2 latest see that floor:
+    it is drawn from them anyway, as densely as the floor around it and in the floor's colour,
+    and nothing of the cup is left, in one update or in two."""
+    at4 = AT + [look_at(EYE + [0.0, 0.12, 0.0], np.array([0.3, 0.4, 0.3]))]
+    late = [look_at(EYE + [0.0, dy, 0.0], np.array([0.3, 0.4, 0.3])) for dy in (0.03, -0.03)]
+    before, after = shoot(WITH_CUP, at4 + AWAY), shoot(WITHOUT, late)
+    one = known_pose_update(tmp_path / "one", before + after, tmp_path / "w1")
+    split = tmp_path / "split"
+    known_pose_update(split, before, tmp_path / "w2")
+    two = known_pose_update(split, after, tmp_path / "w3")
+    for res, mdir in ((one, tmp_path / "one"), (two, split)):
+        assert [o.label for o in res.objs.exported()] == ["cabinet"]
+        assert _cup_points(res) == 0
+        place, ring = _place_of_the_cup(res)
+        density = place.sum() / 0.12 ** 2, ring.sum() / (0.4 ** 2 - 0.24 ** 2)
+        assert density[0] > 0.8 * density[1] > 0
+        floor = np.array(WITHOUT.floor_color, float)
+        colours = res.cloud.rgb[place].astype(float)
+        assert np.abs(colours.mean(axis=0) - floor).max() < 40  # the floor, not the cup
+        (vacated,) = json.loads((mdir / objects.OBJECTS_JSON).read_text())["vacated"]
+        assert sorted(vacated["witnesses"]) == sorted(res.names[-2:])
 
 
 def test_views_that_watch_a_place_continuously_are_one_observation(tmp_path: Path) -> None:

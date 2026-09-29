@@ -457,9 +457,19 @@ point leaves the map untouched. One killed after it is completed by the next upd
     remove it. Fewer remove an object detected in at least 4 keyframes when every one of them
     sees at least 70 % through, else the object gets a strike, and a second strike from a later
     update removes it. An update that sees it in place clears its strikes.
-  * **The removed object's pixels go too.** Its detection masks are invalidated in the keyframes
-    that detected it (`valid.png`), so the fused map cloud loses the object's points together
-    with its record.
+  * **The removed object's pixels go too.** Its detection masks (grown by 2 px) are invalidated
+    in the keyframes that detected it (`valid.png`), so the fused map cloud loses the object's
+    points together with its record.
+  * **Its place shows the latest observation.** The keyframes that saw through the object (its
+    witnesses) are then the only ones that see the surface it stood on or hid, often fewer than
+    the 3 keyframes a surface usually needs (the cup is removed by 2 photos). The map records
+    the place (`objects.json → vacated`: the retired masks, the object's box and the witnesses)
+    and, in it, draws what a witness sees however few keyframes see it, takes colour and object
+    id from the witnesses (not the cup's shadow in the older photos), and drops points that a
+    witness sees through and no witness or later update sees (what is left of the object). The
+    place is its detecting keyframes' retired pixels at or behind the object (up to the depth
+    noise, max(5 cm, 8 % of the depth), in front), and its box grown by max(5 cm, 3 % of its
+    viewing distance). A later update that sees the place again is fused like any other.
   * **A place that changed within one update.** The order of addition is the only sign of
     "latest", so an update whose last keyframes contradict its first ones ends with the latter:
     mapping `examples/office_sequence` in one update leaves the map without the cup, as mapping
@@ -547,8 +557,8 @@ point leaves the map untouched. One killed after it is completed by the next upd
     gate; a point two objects pick goes to the nearer), provided a keyframe that detected it
     fused it: an object detected only beyond the fused depth (a car 40–100 m down a street) has
     no surface of its own in the cloud, and the points near its far-placed lifted points are
-    other surfaces. An object stays short when its surface did not survive the fusion (seen by
-    fewer than 3 keyframes, such as a pendant lamp) or when its detections are all beyond the
+    other surfaces. An object stays short when its surface did not survive the fusion (other
+    keyframes look at it without seeing it, see *Geometry*) or when its detections are all beyond the
     fused depth and do not meet the cloud; it is then still a candidate.
   * Unconfirmed candidates are kept in the map's state, so that a later update can still confirm
     them; they are never emitted, in any format or scope.
@@ -560,7 +570,19 @@ point leaves the map untouched. One killed after it is completed by the next upd
     is assumed.
 * **Geometry.** The map's geometry is a point cloud: the surface of a TSDF fusion of the aligned
   depth maps. Each point takes its colour and object id from the latest update that sees it. No
-  mesh is produced.
+  mesh is produced. A surface is drawn where 3 keyframes updated it in the TSDF, or, where
+  fewer keyframes have it in view, where all of them updated it: the laptop and the right half
+  of the monitor that only photos 0 and 12 of `office_sequence` show, or a backpack that only
+  photo 7 shows. A keyframe has a point in view when the point lies within its fused depth and
+  projects onto a pixel it fuses (valid, not a depth edge, within that depth), whatever that
+  pixel shows. Speckle that other keyframes look at without seeing it (a blob one keyframe
+  places in front of a wall that the others see) still needs 3 of them, and so does the second
+  zero crossing that 1 or 2 keyframes leave a centimetre or two beside a surface many see (the
+  rim of the TSDF band). What only one or two
+  keyframes see is drawn only from keyframes whose depth scale was measured with a spread
+  (IQR / median of the depth ratios) of at most 0.1: nothing else checks a keyframe there, and a
+  keyframe that fits the map worse (a stretch of `livingroom.mp4` scaled with spreads of
+  0.14–0.27) would draw a surface where it is not. Low-confidence keyframes are not fused.
 
 ## How it works
 

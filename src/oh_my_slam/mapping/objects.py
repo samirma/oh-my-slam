@@ -29,7 +29,7 @@ Semantics (spec §2.3):
   strikes (``_absence``). The margin of "seen through" scales with the object's size, so that a
   cup on a windowsill can be seen through (``absence_tau``). The removed object's detection masks
   are invalidated in the keyframes that detected it (``retire_pixels``), so the map cloud loses
-  its points too.
+  its points too, and its place is drawn from the keyframes that saw through it (``Vacated``).
 * **Latest wins within an update.** Order of addition is the only sign of "latest": an object
   that the update detected is judged, as above, by the update's keyframes that photograph its
   place again (``revisiting_frames``: added after the camera looked away, at about the viewpoint
@@ -593,24 +593,32 @@ def points_file(oid: int) -> str:
 class Vacated:
     """The place of an object that an update removed (``retire_pixels``): the pixels retired from
     each keyframe that detected it (``masks``: keyframe name -> RLE mask; the object's detection,
-    grown by ``RETIRE_DILATE``) and the keyframes that saw through it (``witnesses``: the latest
-    observation of the place). The map cloud there is drawn from the witnesses
-    (``geometry.fused_cloud_points``): the older keyframes' views of the place are retired, so the
-    surface behind the object is seen only by them, often fewer than a surface's usual views."""
+    grown by ``RETIRE_DILATE``), its box and viewing distance (the box grown by the depth noise
+    holds what stood by it, such as its shadow) and the keyframes that saw through it
+    (``witnesses``: the latest observation of the place). The map cloud there is drawn from the
+    witnesses (``geometry.fused_cloud_points``, ``geometry.attribute_points``): the older
+    keyframes' views of the place are retired, so the surface behind the object is seen only by
+    them, often fewer than a surface's usual views."""
 
     update: int
     object: int
     masks: dict[str, dict[str, Any]]
     witnesses: list[str]
+    box: OBB | None = None
+    obs_depth: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {"update": self.update, "object": self.object,
-                "masks": dict(sorted(self.masks.items())), "witnesses": sorted(self.witnesses)}
+                "masks": dict(sorted(self.masks.items())), "witnesses": sorted(self.witnesses),
+                "box": None if self.box is None else self.box.to_dict(),
+                "obs_depth": self.obs_depth}
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> Vacated:
         return Vacated(int(d["update"]), int(d["object"]), dict(d.get("masks", {})),
-                       [str(n) for n in d.get("witnesses", [])])
+                       [str(n) for n in d.get("witnesses", [])],
+                       None if d.get("box") is None else OBB.from_dict(d["box"]),
+                       float(d.get("obs_depth", 0.0)))
 
 
 @dataclass
@@ -1253,7 +1261,8 @@ def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject],
         seen_through = [views.records[f].name for f in (witnesses or {}).get(o.id, [])
                         if f in views.records]
         if retired and seen_through:
-            places.append(Vacated(int(ctx.update_id), o.id, retired, seen_through))
+            places.append(Vacated(int(ctx.update_id), o.id, retired, seen_through, o.obb,
+                                  float(o.obs_depth)))
     out: dict[int, int] = {}
     for f, m in kill.items():
         view = views.get(f)
