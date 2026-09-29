@@ -727,6 +727,9 @@ from the baseline and the tolerance it exceeded.
 To keep a finished run as the baseline, either pass `--set-baseline` to the run itself or store
 it afterwards:
 
+* `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
+  ones): the whole sequence in one update, and as an extended map (an update with the early images,
+  then one with the rest)
 ```sh
 uv run python -m oh_my_slam.tools.evaluate --resummarise latest --set-baseline
 ```
@@ -736,6 +739,7 @@ newest `<UTC>` folder) against the current targets and baseline again, and rewri
 `result.json` and `summary.md`. Use it after editing the targets, or with `--set-baseline` to
 store that run as the baseline.
 
+| `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by default:
 
 * `result.json` (machine-readable)

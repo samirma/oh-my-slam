@@ -24,6 +24,13 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "Reference: the commanded headings in the capture names. The actual headings deviate from "
      "them by several degrees, and these errors include that deviation."),
     ("map", "Map quality", ""),
+    ("map_update", "Map update",
+     "`examples/office_sequence/` is mapped in one update, and as an extended map (an update with "
+     "the early images, then one with the rest). `absent_fraction` and `incremental.absent_fraction`"
+     " are the share of the annotated objects that changed (the cup) that those two maps no longer "
+     "have; `before_present_fraction` is the same test on the extended map after its first update "
+     "(the control: an object never seen early cannot be seen to disappear); `stability.*` "
+     "compares the objects that never changed between the two updates of the extended map."),
     ("seg", "Segmentation", ""),
     ("seg.map_consistency", "Segmentation vs map: consistency, not accuracy",
      "The map's objects come from the same detector on the same keyframes, so these metrics "
@@ -333,8 +340,33 @@ def _details(details: dict[str, Any]) -> list[str]:
                 out += _section(
                     f"{title} — {name} map", ["id", "label", "points", "share outside"],
                     [[r["id"], r["label"], r["points"], r["outside_share"]] for r in rows[:10]])
+    out += _map_update_details(details.get("map_update") or {})
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
+    return out
+
+
+def _map_update_details(d: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for key, title in (("final", "map of the whole sequence (one update)"),
+                       ("incremental", "extended map (second update)"),
+                       ("before", "extended map after its first update (early images)")):
+        rows = [[a["label"], o["id"], o["label"], ", ".join(o.get("detected_as") or []),
+                 o.get("coverage") if o.get("localised") else "label only",
+                 o.get("image"), ", ".join(o.get("frames") or [])]
+                for a in d.get("absent", []) for o in a[key]]
+        if rows or d.get("absent"):
+            out += _section(
+                f"Map update: objects of the absent labels in the {title}",
+                ["absent", "object id", "label", "detected as", "covers region", "in image",
+                 "observed in"],
+                rows or [["none", None, None, None, None, None, None]])
+    if d.get("stability"):
+        out += _section(
+            "Map update: objects that never changed, first update vs second update",
+            ["second update id", "first update id", "labels", "IoU", "centre Δ m", "extent Δ"],
+            [[r["single_id"], r["split_id"], f"{r['single_label']} / {r['split_label']}",
+              r["iou"], r["centre_delta_m"], r["extent_delta_rel"]] for r in d["stability"]])
     return out
 
 

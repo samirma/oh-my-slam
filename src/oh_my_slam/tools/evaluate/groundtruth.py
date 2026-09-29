@@ -8,6 +8,9 @@ Every ``*.json`` file below the folder is discovered; its ``kind`` selects the m
 * ``poses`` — per-capture yaw / pitch of ``ainex-captures``, compared with the one-update map:
   ``gt.poses.yaw_err_median_deg`` / ``.yaw_err_max_deg`` (after the best common yaw offset) and
   ``gt.poses.pitch_err_median_deg``.
+* ``map_update`` — what changed during ``examples/office_sequence/`` (objects that must be absent
+  from the final map, where they were seen) and, optionally, which objects never changed; judged by
+  ``mapupdate`` into the ``map_update.*`` metrics (``MapUpdatePlan`` below).
 
 Malformed files and files about images that were not evaluated are skipped with a reason.
 """
@@ -29,7 +32,8 @@ from oh_my_slam.tools.evaluate.names import wrap_deg
 from oh_my_slam.tools.evaluate.scene import DocObject, pitch_deg, yaw_deg
 from oh_my_slam.tools.evaluate.segmentation import paired_labels
 
-KINDS = ("objects", "poses")
+KINDS = ("objects", "poses", "map_update")
+MAP_UPDATE_SEQUENCE = "office_sequence"  # the example folder (under examples/) the kind is about
 
 
 @dataclass(frozen=True)
@@ -66,9 +70,82 @@ def _validate(kind: str, data: dict[str, Any]) -> None:
             cub = o.get("cuboid")
             if not isinstance(o.get("label"), str) or (cub is not None and len(cub) != 10):
                 raise ValueError("each object needs a 'label' and an optional 10-value 'cuboid'")
+    elif kind == "map_update":
+        _map_update_parts(data)
     elif not isinstance(data.get("frames"), dict) or not all(
             isinstance(v, dict) for v in data["frames"].values()):
         raise ValueError("a 'poses' file needs a 'frames' object of capture name → values")
+
+
+@dataclass(frozen=True)
+class Absent:
+    """An object that was in the scene early in the sequence and is gone from it later: its label
+    and, per image that shows it, its region (x0, y0, x1, y1 as shares of the image size)."""
+
+    label: str
+    seen_in: dict[str, tuple[float, float, float, float]]
+
+
+@dataclass(frozen=True)
+class MapUpdatePlan:
+    """The ``map_update`` files of one run, merged."""
+
+    sequence: str
+    absent: list[Absent]
+    stable: list[str]  # labels the stability comparison is restricted to (empty: every object)
+    files: list[Path]
+
+    def before_images(self, images: list[str]) -> list[str]:
+        """The images up to the last one that shows an absent object (``images``: in capture
+        order): the sequence's early part, where the scene still had it."""
+        seen = [images.index(n) for a in self.absent for n in a.seen_in if n in images]
+        return images[:max(seen) + 1] if seen else []
+
+
+def _map_update_parts(data: dict[str, Any]) -> tuple[str, list[Absent], list[str]]:
+    seq, absent = data.get("sequence"), data.get("absent")
+    if not isinstance(seq, str) or not isinstance(absent, list) or not absent:
+        raise ValueError("a 'map_update' file needs 'sequence' and a non-empty 'absent' list")
+    items = []
+    for a in absent:
+        seen = a.get("seen_in") if isinstance(a, dict) else None
+        if not isinstance(seen, dict) or not seen or not isinstance(a.get("label"), str):
+            raise ValueError("each absent object needs a 'label' and 'seen_in' (image name → "
+                             "region)")
+        regions = {}
+        for name, box in seen.items():
+            ok = isinstance(box, list) and len(box) == 4 and all(
+                isinstance(v, int | float) and 0.0 <= v <= 1.0 for v in box)
+            if not ok or not (box[0] < box[2] and box[1] < box[3]):
+                raise ValueError(f"'seen_in' {name}: a region is [x0, y0, x1, y1] within 0..1 "
+                                 "with x0 < x1 and y0 < y1")
+            regions[str(name)] = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+        items.append(Absent(a["label"], regions))
+    stable = data.get("stable", [])
+    if not isinstance(stable, list) or not all(isinstance(v, str) for v in stable):
+        raise ValueError("'stable' is a list of labels")
+    return seq, items, list(stable)
+
+
+def map_update_plan(files: list[GroundTruth], skipped: list[dict[str, str]]
+                    ) -> MapUpdatePlan | None:
+    """The plan of the ``map_update`` files about ``MAP_UPDATE_SEQUENCE`` (their absent objects and
+    stable labels are merged); files about another sequence are skipped with a reason."""
+    absent: list[Absent] = []
+    stable: list[str] = []
+    used: list[Path] = []
+    for f in files:
+        if f.kind != "map_update":
+            continue
+        seq, items, labels = _map_update_parts(f.data)
+        if seq != MAP_UPDATE_SEQUENCE:
+            skipped.append({"file": str(f.path), "reason": f"{seq} is not evaluated "
+                                                           f"(only {MAP_UPDATE_SEQUENCE})"})
+            continue
+        absent += items
+        stable += [v for v in labels if v not in stable]
+        used.append(f.path)
+    return MapUpdatePlan(MAP_UPDATE_SEQUENCE, absent, stable, used) if used else None
 
 
 def _gt_objects(data: dict[str, Any]) -> list[DocObject]:

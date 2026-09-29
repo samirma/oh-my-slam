@@ -11,6 +11,9 @@ strictly one command at a time.
    ``-t single -f ply``, last ``-t full``).
 5. On the one-update map: ``segment.sh -m`` (artefacts), ``view.sh -m``; ``segment.sh -m -f ply
    -o`` on the split map.
+6. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and of an
+   extended map (an update with its early part, then one with the rest), judged by ``mapupdate``
+   (the ``map_update.*`` metrics).
 
 Every output is checked against the contracts; the metrics are computed from the outputs.
 """
@@ -31,6 +34,7 @@ from oh_my_slam.core.ply import parse_ply, read_ply
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.store import full_tree_hash
 from oh_my_slam.tools.evaluate import groundtruth as gt
+from oh_my_slam.tools.evaluate import mapupdate
 from oh_my_slam.tools.evaluate.contracts import (
     ContractLog,
     artifact_problems,
@@ -96,6 +100,7 @@ def expected_ids() -> list[str]:
     ids += [f"map.{mp}.{k}" for mp in MAPS
             for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, *OUT_OF_BOX_METRICS)]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
+    ids += mapupdate.metric_ids()
     ids += [mid for mid, *_ in ContractLog().results()]
     return [*ids, "contract.exit_codes"]
 
@@ -401,6 +406,51 @@ class Evaluation:
             self.contracts.check("readonly", "map", "segment.sh -m, view.sh -m",
                                  [] if same else ["the map folder changed"])
 
+    def map_update(self) -> None:
+        """The office sequence mapped whole in one update, and mapped as an extended map (its
+        early part, then the rest); the ``map_update`` files of the ground truth say what changed
+        (no file: the metrics fail, nothing is mapped)."""
+        ids = mapupdate.metric_ids()
+        files, skipped = gt.discover(self.examples / GROUND_TRUTH)
+        plan = gt.map_update_plan(files, skipped)
+        if plan is None:
+            self.metrics.fail(ids, "no 'map_update' file in examples/ground_truth/ (see its "
+                                   "README.md): what changed in the sequence is not annotated")
+            return
+        folder = self.examples / plan.sequence
+        images = mapupdate.sequence_images(folder)
+        early = plan.before_images(images)
+        self.details["map_update"] = {"annotation": [str(p) for p in plan.files],
+                                      "images": images, "before_images": early}
+        if not early:
+            self.metrics.fail(ids, f"no annotated image is in {folder}")
+            return
+        maps = self.out / "maps"
+        single_dir, ext_dir = maps / "office", maps / "office_extended"
+        single = self.scene(self.run("mapper_office", "mapper_office", "mapper.sh", "update",
+                                     "-i", folder, "-m", single_dir))
+        first = self.scene(self.run("mapper_office_early", "mapper_office_extended", "mapper.sh",
+                                    "update", "-i", *(folder / n for n in early), "-m", ext_dir))
+        # the first update's view is read now: the map's frame records change with the next
+        view_first = None if first is None else mapupdate.MapView.of(first, ext_dir)
+        later = images[len(early):]
+        rest = None
+        if first is not None and later:
+            rest = self.scene(self.run("mapper_office_rest", "mapper_office_extended", "mapper.sh",
+                                       "update", "-i", *(folder / n for n in later), "-m",
+                                       ext_dir))
+        with self.metrics.expect(*ids):
+            built = {"the whole sequence": single, "the early images": first,
+                     "the rest of the images": rest}
+            missing = [name for name, doc in built.items() if doc is None]
+            if missing or view_first is None or single is None or rest is None:
+                self.metrics.fail(ids, f"the map of {missing[0]} was not built"
+                                  if missing else "the map was not built")
+            else:
+                self.details["map_update"].update(mapupdate.map_update_metrics(
+                    self.metrics, plan, images, mapupdate.MapView.of(single, single_dir),
+                    view_first, mapupdate.MapView.of(rest, ext_dir)))
+
     def ground_truth(self) -> None:
         files, skipped = gt.discover(self.examples / GROUND_TRUTH)
         gt.object_metrics(self.metrics, [f for f in files if f.kind == "objects"], self.images,
@@ -432,6 +482,7 @@ class Evaluation:
             single, split = maps or (None, None)
             self.section("pose accuracy, map quality", self.map_metrics, captures, single, split)
             self.section("segment.sh -m, view.sh -m", self.map_commands, single, split)
+            self.section("office_sequence: mapper.sh update (map update)", self.map_update)
         finally:
             self.section("restore the inference server", self.server_restore)
         self.section("summary", self.summarise)
