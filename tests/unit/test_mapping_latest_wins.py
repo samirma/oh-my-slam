@@ -135,31 +135,49 @@ def test_the_place_of_a_removed_cup_is_drawn_from_the_latest_views(tmp_path: Pat
         assert sorted(vacated["witnesses"]) == sorted(res.names[-2:])
 
 
-def test_views_that_watch_a_place_continuously_are_one_observation(tmp_path: Path) -> None:
-    """The same views without the look away in between: the camera never left the cup, the update
-    is one observation of it, and the disagreement between its views does not remove it."""
+def test_a_cup_gone_while_the_camera_watches_it_is_gone(tmp_path: Path) -> None:
+    """The same views without the look away in between: the cup vanishes while the camera watches
+    its place. The latest views win whether or not the camera looked away."""
     before, after = _scene()
     res = known_pose_update(tmp_path / "m", before[:3] + after, tmp_path / "w")
+    assert [o.label for o in res.objs.exported()] == ["cabinet"]
+    assert res.objs.summary["withdrawn"] == 1 and _cup_points(res) == 0
+
+
+def test_views_whose_depth_disagrees_do_not_remove_a_cup_that_stays(tmp_path: Path) -> None:
+    """Monocular depth of two keyframes disagrees by a few percent (here each view's depth is
+    scaled by up to ±8 %): views that watch a cup that stays, or see it again from elsewhere, do
+    not see through it."""
+    far = [look_at(np.array([1.9, -1.8, 1.4 + dz]), np.array([-0.3, 0.1, 0.1]))
+           for dz in (0.0, 0.05, 0.1)]
+    shots = shoot(WITH_CUP, AT + AWAY + AT + far, depth_noise=0.08, seed=3)
+    res = known_pose_update(tmp_path / "m", shots, tmp_path / "w")
     assert {o.label for o in res.objs.exported()} == {"cabinet", "cup"}
     assert not res.objs.summary["removed"] and not res.objs.summary["withdrawn"]
 
 
-def test_a_view_from_the_other_side_does_not_judge_the_cup(tmp_path: Path) -> None:
-    """After the camera looks away it comes back to the room from a different corner: monocular
-    depth of a small object differs by tens of percent between viewpoints metres apart, so the
-    views do not photograph the cup's place again."""
+def test_a_cup_gone_when_the_camera_comes_back_from_another_side_is_gone(tmp_path: Path) -> None:
+    """After the camera looks away it comes back to the room from a different corner, 3.5 m away
+    instead of 1.9 m: it sees the cup's place, and the floor there, from another viewpoint and
+    distance. Its depth is compared with the cup's detections where both see the same
+    surroundings, so the latest views win from there too, in one update or in two."""
     far = [look_at(np.array([1.9, -1.8, 1.4 + dz]), np.array([-0.3, 0.1, 0.1]))
            for dz in (0.0, 0.05, 0.1)]
     before, _ = _scene()
-    res = known_pose_update(tmp_path / "m", before + shoot(WITHOUT, far), tmp_path / "w")
-    assert "cup" in {o.label for o in res.objs.objects}
+    one = known_pose_update(tmp_path / "one", before + shoot(WITHOUT, far), tmp_path / "w1")
+    assert "cup" not in {o.label for o in one.objs.objects} and _cup_points(one) == 0
+    split = tmp_path / "split"
+    first = known_pose_update(split, before, tmp_path / "w2")
+    (cup,) = [o for o in first.objs.objects if o.label == "cup"]
+    two = known_pose_update(split, shoot(WITHOUT, far), tmp_path / "w3")
+    assert two.objs.summary["removed"] == [cup.id] and _cup_points(two) == 0
 
 
 # --- the pieces -------------------------------------------------------------------------------------
 
 
 def _record(index: int, pose: Pose) -> Any:
-    return SimpleNamespace(index=index, K_grid=K, T_map_cam=pose,
+    return SimpleNamespace(index=index, K_grid=K, T_map_cam=pose, low_confidence=False,
                            stats={"observations": 500.0, "reproj_error": 0.5},
                            pose_source="sfm-global")
 
@@ -176,49 +194,71 @@ def _cup_object(frames: list[int]) -> MapObject:
                      obs_depth=1.5)
 
 
-def test_revisiting_frames_need_a_look_away_and_the_same_viewpoint() -> None:
-    poses = AT + AWAY + AT
-    placed = [_record(i, p) for i, p in enumerate(poses)]
-    by_index = {r.index: r.T_map_cam for r in placed}
+def _depth(room: Room, pose: Pose, scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    d = render(room, pose, K).depth * scale
+    return d, d > 0
+
+
+def _places(judges: dict[int, tuple[Room, Pose, float]], detected: float = 1.0
+            ) -> tuple[Any, MapObject]:
+    """``_Places`` over the cup's three detecting views (``AT``, the cup in place: keyframes 0-2;
+    their depth scaled by ``detected``) and the judging views ``judges`` (index -> room, pose,
+    depth scale)."""
     cup = _cup_object([0, 1, 2])
-    assert objects.revisiting_frames(cup, placed, by_index) == {6, 7, 8}
-    # no look away: the sweep is one observation
-    assert objects.revisiting_frames(cup, placed[:3] + placed[6:], by_index) == set()
-    # a look away and a return to the room from a distant viewpoint: not the same viewpoint
-    moved = [_record(i, look_at(np.array([1.9, -1.8, 1.4]), np.array([-0.3, 0.1, 0.1])))
-             for i in (6, 7, 8)]
-    assert objects.revisiting_frames(cup, placed[:6] + moved, by_index) == set()
+    views, records, instances = {}, [], {}
+    for i, pose in enumerate(AT):
+        r = render(WITH_CUP, pose, K)
+        views[i] = validity.View(r.depth * detected, r.depth > 0, K, pose)
+        records.append(_record(i, pose))
+        instances[i] = [(cup.id, r.ids == 3)]
+    for i, (room, pose, scale) in judges.items():
+        views[i] = validity.View(*_depth(room, pose, scale), K, pose)
+        records.append(_record(i, pose))
+    v = objects._Views(None, views, records)
+    return objects._Places(v, objects._Masks(None, v, instances, {}, {}), [cup]), cup
+
+
+def test_a_keyframe_judges_a_place_it_sees_as_the_detections_saw_its_surroundings() -> None:
+    far = look_at(np.array([1.9, -1.8, 1.4]), np.array([-0.3, 0.1, 0.1]))
+    wall = Room(boxes=[CABINET, Box(np.array([-1.0, 0.2, 0.6]), np.array([0.1, 1.0, 1.0]), 0.0,
+                                    (60, 60, 200), "screen")])
+    places, cup = _places({10: (WITHOUT, AT[0], 1.0), 11: (WITH_CUP, AT[0], 1.0),
+                           12: (WITHOUT, AT[0], 1.12), 13: (WITH_CUP, AT[0], 1.12),
+                           14: (WITHOUT, far, 1.0), 15: (wall, AT[0], 1.0),
+                           16: (WITHOUT, AWAY[1], 1.0), 17: (WITHOUT, AT[0], 1.6)})
+    gone, here = places.verdict(cup, 10), places.verdict(cup, 11)
+    assert gone is not None and gone.share > 0.8 and here is not None and here.share < 0.2
+    # a keyframe whose depth is 12 % deeper everywhere: its depth is divided by that ratio
+    deeper, deeper_here = places.verdict(cup, 12), places.verdict(cup, 13)
+    assert deeper is not None and deeper.share > 0.8 and abs(deeper.ratio - 1.12) < 0.03
+    assert deeper_here is not None and deeper_here.share < 0.2
+    far_verdict = places.verdict(cup, 14)  # another corner, 3.5 m away
+    assert far_verdict is not None and far_verdict.share >= objects.REMOVE_FRACTION
+    # hidden behind a screen, out of view, or a depth that disagrees with the detections' about
+    # the cup's surroundings by more than the depth noise: no verdict
+    assert places.verdict(cup, 15) is None and places.verdict(cup, 16) is None
+    assert places.verdict(cup, 17) is None
 
 
 def test_a_small_object_is_seen_through_by_a_margin_of_its_size() -> None:
     z = np.array([1.5])
     assert objects.absence_tau(z, 0.2)[0] < 0.5 * objects.absence_tau(z)[0]
     assert objects.absence_tau(z, 2.0)[0] == objects.absence_tau(z)[0]  # a large object: as before
-    cup = _cup_object([0, 1, 2, 3])
-    view = validity.View(*_depth(WITHOUT, AT[0]), K, AT[0])
-    through, consistent = objects.visibility_evidence(view, cup.points)
-    assert through > 0.8 * (through + consistent) > 0
-    here = validity.View(*_depth(WITH_CUP, AT[0]), K, AT[0])
-    through, consistent = objects.visibility_evidence(here, cup.points)
-    assert consistent > 0.8 * (through + consistent) > 0
-    nf = SimpleNamespace(record=_record(0, AT[0]))
-    assert objects._absence([cup], {0: (nf, view)}) == [cup.id]  # an established object
-    assert objects._absence([_cup_object([0, 1, 2, 3])], {0: (nf, here)}) == []
 
 
-def _depth(room: Room, pose: Pose) -> tuple[np.ndarray, np.ndarray]:
-    d = render(room, pose, K).depth
-    return d, d > 0
-
-
-def test_an_object_hidden_behind_another_is_not_seen_through() -> None:
-    """What is left of an occluded object is its edge along the occluder: not enough of it is
-    visible to judge it."""
-    wall = Room(boxes=[Box(np.array([-1.0, 0.2, 0.6]), np.array([0.1, 1.0, 1.0]), 0.0,
-                           (60, 60, 200), "screen")])
-    cup = _cup_object([0, 1, 2, 3])
-    view = validity.View(*_depth(wall, AT[0]), K, AT[0])
-    assert objects.visibility_evidence(view, cup.points) == (0, 0)
+def test_a_keyframe_must_see_through_more_than_the_detections_do() -> None:
+    """The cup's detecting keyframes see 15 % farther than the points it was given (its lifted
+    points disagree with their depth, as monocular depth of a small object, or of a see-through
+    one, varies between keyframes), so they see through most of it themselves: a keyframe that
+    sees the cup where they do is no evidence that it is gone, though it sees behind its points
+    once its depth is divided by its ratio to those keyframes."""
+    places, cup = _places({10: (WITH_CUP, AT[0], 1.0), 11: (WITHOUT, AT[0], 1.0)}, detected=1.15)
+    assert places.transparency(cup) > 0.5
+    here = places.verdict(cup, 10)
+    assert here is not None and abs(here.ratio - 1 / 1.15) < 0.03
+    assert here.share < objects.REMOVE_FRACTION
+    clean, cup = _places({10: (WITH_CUP, AT[0], 1.0)})
+    assert clean.transparency(cup) < 0.05
 
 
 def test_a_pose_uncertain_by_a_few_degrees_judges_only_what_is_large_against_the_error() -> None:
@@ -227,19 +267,18 @@ def test_a_pose_uncertain_by_a_few_degrees_judges_only_what_is_large_against_the
     rec = _record(0, AT[0])
     rec.pose_source = "multiview"
     rec.stats = {"pose_matches": 1200, "pose_residual_deg": 2.0}
-    nf = SimpleNamespace(record=rec)
     cup = _cup_object([0, 1, 2, 3])
     cup.obs_depth = 0.7
     assert not validity.well_registered(rec.stats, rec.pose_source)
     size = float(np.linalg.norm(np.ptp(cup.points, axis=0)))
-    assert objects._judges(nf, cup, size)
-    assert not objects._judges(nf, cup, 0.05)
+    assert objects._judges(rec, cup, size)
+    assert not objects._judges(rec, cup, 0.05)
     rec.pose_source = "sfm-incremental+multiview"  # a map that joins SfM and multi-view keyframes
-    assert objects._judges(nf, cup, size)
+    assert objects._judges(rec, cup, size)
     rec.stats = {"pose_matches": 5, "pose_residual_deg": 0.3}  # too few matches: never
-    assert not objects._judges(nf, cup, size)
+    assert not objects._judges(rec, cup, size)
     rec.stats = {"observations": 29.0, "reproj_error": 1.8}  # a weak SfM pose: never
-    assert not objects._judges(nf, cup, size)
+    assert not objects._judges(rec, cup, size)
 
 
 def test_a_map_of_a_few_keyframes_panned_from_one_spot_has_no_sfm_scale(monkeypatch: Any) -> None:

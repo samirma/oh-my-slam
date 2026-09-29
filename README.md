@@ -445,19 +445,46 @@ point leaves the map untouched. One killed after it is completed by the next upd
 * **Later wins.** "Latest" is the order of addition. A later update invalidates, per pixel, the
   parts of older keyframes that it contradicts: free space seen behind an old point, or a new
   surface in front of an old ray. It also removes, or gives a strike to, objects that it sees
-  through. Keyframes of the same update never invalidate each other's pixels. Capture timestamps
-  are never read.
-  * **Removing an object.** An update removes an object of an earlier map when most of the
-    keyframes that see enough of it (in view, unoccluded, at least half of the samples that fall
-    in the image) see through it: at least 60 % of its samples lie in front of a surface farther
-    than a margin. The margin is max(0.25 m, 15 % of the depth), but for a small object at most
-    15 % of its own extent (at least max(5 cm, 8 % of the depth), the depth noise): a cup on a
-    windowsill is seen through by 5-20 cm. A keyframe judges when it is well registered, or when
-    its pose was refined with feature matches and the matches' residual, seen from the object's
-    distance, is at most 15 % of the object's extent (2° is 2.5 cm at 0.7 m). Three keyframes
-    remove it. Fewer remove an object detected in at least 4 keyframes when every one of them
-    sees at least 70 % through, else the object gets a strike, and a second strike from a later
-    update removes it. An update that sees it in place clears its strikes.
+  through. Keyframes of the same update invalidate each other's pixels only where an object
+  changed during the update (below). Capture timestamps are never read.
+  * **Which keyframes judge an object.** Every object of the map (every confirmed one: a
+    candidate that later keyframes see through is one whose depth nothing confirmed, and it stays
+    a candidate) is judged by the update's keyframes added after its last detection — within the
+    update as across updates, whether the camera looked away or not, from any viewpoint and
+    distance. A keyframe judges when its pose error, seen from the object's distance, is at most
+    15 % of the object's extent (2° is 2.5 cm at 0.7 m): an SfM pose with 100 points whose
+    reprojection error (as an angle: pixels over the focal length) is below that, or a pose
+    refined with feature matches whose residual is; it is not low confidence, has at least 80 % of the object's
+    samples in its image (the image border counts), at least half of them unoccluded, on at
+    least 20 distinct depth pixels, and agrees with the object's detections about its
+    surroundings. Monocular depth of two keyframes disagrees by a smooth factor (tens of percent
+    between viewpoints metres apart) and a video's loop can be misaligned by decimetres, so the
+    surface in a band around the object's mask in the detecting keyframe nearest by viewpoint
+    (half the mask's size wide: its support, the wall behind it) is lifted into the map and
+    compared with the judging keyframe's depth: where it sees the same surface (within a factor
+    1.3), their median ratio must lie within 25 % of 1 and half of the band within the depth
+    noise, max(5 cm, 8 % of the depth), of it once divided out. The keyframe's depth is divided
+    by that ratio. A keyframe that detected something at the object's place does not judge it:
+    another object, at most twice its size (not its support), whose mask holds half the
+    object's samples, or 20 of them when a keyframe detected that object at the object's own
+    place (the object under another label, which a keyframe across the room places a little
+    apart: a bag seen as a handbag), unless a keyframe detected it beside the object.
+  * **Removing an object.** A sample is seen through when the keyframe sees farther than it by a
+    margin: max(0.25 m, 15 % of the depth), but for a small object at most 15 % of its own
+    extent (at least the depth noise): a cup on a windowsill is seen through by 5-20 cm. The
+    keyframe's verdict is the share of the samples it sees through beyond what it would see
+    through anyway: the share the object's own detecting keyframes see through (its 3 largest
+    detections: monocular depth sees between a ladder's rungs and a plant's leaves, and places a
+    small object differently from one keyframe to the next), or the share of the object's
+    surroundings the judging keyframe sees through, where nothing changed, whichever is larger.
+    The latest keyframe wins: a keyframe that sees the object in place (at most 40 % through)
+    outweighs every earlier one, so only the keyframes added after the last such one count. The
+    update removes the object when most of those see through at least 60 % of it: three
+    keyframes remove it; two remove an object detected in at least 4 keyframes when both see at
+    least 70 % through from well-supported poses (absence, like presence, is confirmed by two
+    keyframes); else the object gets a strike, and a second strike from a later update removes
+    it. An update that sees it in place clears its strikes; an update counts once, however many
+    of its keyframes judge.
   * **The removed object's pixels go too.** Its detection masks (grown by 2 px) are invalidated
     in the keyframes that detected it (`valid.png`), so the fused map cloud loses the object's
     points together with its record.
@@ -474,17 +501,34 @@ point leaves the map untouched. One killed after it is completed by the next upd
   * **A place that changed within one update.** The order of addition is the only sign of
     "latest", so an update whose last keyframes contradict its first ones ends with the latter:
     mapping `examples/office_sequence` in one update leaves the map without the cup, as mapping
-    it in two does. An object the update detected is judged, by the rule above, by the update's
-    keyframes that photograph its place again: added after a keyframe that no longer had at
-    least half of the object in view (the camera looked away after the last detection), and at
-    about the same viewpoint as a keyframe that detected it (camera distance over the object's
-    viewing depth plus 1 − cos of the angle between the optical axes, at most 0.35). Keyframes
-    that watch a place continuously (a video's neighbours, a sweep) or see it from another side
-    are one observation of it and never remove it: their disagreements are depth errors (monocular
-    depth of one object differs by tens of percent between viewpoints metres apart). An update
-    still counts once: it gives an object one strike at most, and no keyframe of it invalidates
-    another's pixels. The ids of the update's detections stay counted, so the other objects keep
-    theirs.
+    it in two does. An object the update detected is judged, by the rules above, by the
+    update's keyframes added after its last detection. An object the update first detected where
+    its earlier keyframes saw free space (judged by the same rules, with three keyframes at
+    least) arrived: the pixels with which those keyframes saw through it are retired, so that its own
+    keyframes draw it however few they are. The ids of the update's detections stay counted, so
+    the other objects keep theirs.
+  * **An object that moved.** Objects are re-identified by label, size and colour: an object
+    detected only by keyframes added after every detection of another of a compatible label, of
+    comparable size (scales within a factor 1.5) and colour (median CIELab of its detections'
+    pixels: chroma within 10, lightness within 25), standing apart from it, is that object moved
+    there when the places were judged empty in their turn: the old place by at least one
+    keyframe added after its last detection, the new place by at least one keyframe added before
+    the first detection there (keyframes that judge as above, from at most 1.5 times the
+    farthest distance the object was detected from — their silence counts only where the
+    detector would have seen it at 2/3 of its smallest detected size — and without a detection
+    of something of its size there that its own keyframes did not detect beside it), and at one
+    of the two places the verdicts show the change as they show a removal (three keyframes, or
+    two for an established object at its old place). Monocular depth cannot tell a thin object from the
+    wall right behind it (a paper-towel roll on a shelf at 2.5 m), so the detector's silence at
+    one place counts, but only with the depth's evidence at the other. The object keeps its id at
+    its new place, with the box and points of its latest detections; its old place is vacated
+    like a removed object's (its old detections name no object any more, and the keyframes that
+    saw it empty draw it), and the pixels with which earlier keyframes saw through its new place
+    are retired, so its latest keyframes draw it there however few they are. In 10 photos of a
+    living room mapped in one update, a paper-towel roll stands on a shelf in photos 6–7 and on
+    the dining table in photos 8–9: the map shows it once, on the table, with the id it got on
+    the shelf. A cup of another colour that
+    appears elsewhere is another object, and a second cup beside one that stays is a second one.
 * **Persistent identity.** Each object keeps one id and one colour for the life of the map, and
   its OBB is refitted from all accumulated evidence:
   * New ids come from a counter and are never reused.
@@ -702,7 +746,13 @@ Geometry and detection requests run concurrently on two connections.
         fixed may register them again. After step 2, a pose that contradicts the keyframe's own
         verified matches (median symmetric epipolar distance above 0.25°; correct poses stay
         within about 0.1°) is not accepted either: on the 6-photo office map the global mapper
-        settled one keyframe on 67 matches to one neighbour against 931 to two others.
+        settled one keyframe on 67 matches to one neighbour against 931 to two others. Nor is a
+        pose whose SfM points the keyframe's own depth contradicts: its depth ratio over the
+        model's metric scale lies outside 0.8–1.25 for photos (the depth alignment would leave
+        it unfused, and no neighbour covers its view) or 0.5–2 for video (it would be left out).
+        Two photos taken walking down a hallway, a forward motion the global mapper cannot
+        resolve, were placed 1.3–3.9 m along it and 0.5–1.6 m apart in height from run to run,
+        with ratios of 1.3–4. Such keyframes are joined like unplaced ones (step 3).
      2. Each keyframe's SfM scale is measured against its MoGe depth (median depth ratio at its
         triangulated points), and its tilt against its GeoCalib gravity (1–3° on correctly posed
         keyframes). Co-visible keyframes whose ratios agree within 15 % and gravity within 10°

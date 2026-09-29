@@ -8,9 +8,8 @@ latest wins → fused cloud → objects → object ids of the cloud → scene ex
 
 The keyframes of one update are one observation of the scene: latest wins, object association
 and the cloud's colours and labels do not depend on their order (``validity``, ``objects``,
-``geometry``); a later update wins over an earlier one, and within an update only a place that
-the camera left and came back to is judged by order of addition (``objects.revisiting_frames``).
-Capture timestamps are never read.
+``geometry``); a later keyframe wins over an earlier one where they disagree about an object
+(``objects._Places``), within an update as across updates. Capture timestamps are never read.
 """
 
 from __future__ import annotations
@@ -566,6 +565,17 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     bad_fit = _contradicting(sfm, {**posed, **merged}, {
         **K_model, **_model_intrinsics(sfm, model, set(merged))}, set(posed))
     n_shared = len(merged)
+    # a keyframe whose SfM points its own depth contradicts (``_depth_contradicted``) is joined
+    # like an unplaced one too, instead of being left out (or, for photos, left unfused as low
+    # confidence) by the depth alignment
+    off = _depth_contradicted(ctx, model, set(posed) - set(bad_fit), photos=not is_video)
+    if off:
+        model.deregister(set(off))
+        posed = {n: T for n, T in posed.items() if n not in off}
+        join["depth_contradicted"] = {n: round(v, 3) for n, v in sorted(off.items())}
+        log.warning("%s: %d keyframes whose SfM pose their depth contradicts (depth alignment "
+                    "would leave them out or unfused) are joined like unplaced ones: %s",
+                    model.method, len(off), ", ".join(sorted(off)))
     rereg: dict[str, Pose] = {}
     if bad_fit:
         model.deregister(set(bad_fit))
@@ -649,6 +659,60 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     progress(f"{method}: {len(out.registered)} keyframes posed ({n_shared} from another "
              f"reconstruction, {len(rereg)} registered again, {len(free)} realigned, {len(mv)} "
              "by anchored multi-view)")
+    return out
+
+
+def _depth_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], photos: bool
+                        ) -> dict[str, float]:
+    """The keyframes of ``names`` whose SfM pose their own depth contradicts, so that the depth
+    alignment (``_align_depths``) would leave them out, or leave a photo unfused: the sparse
+    scale it will measure (``_sparse_scale``, a fit it uses: spread at most
+    ``DENSE_MAX_SPREAD``), in units of the model's metric scale (``frame.metric_scale``), lies
+    outside ``REJECT_SCALE`` and the dense test does not support the pose either (as there:
+    ``dense_scale`` against the keyframes whose sparse scale fits; thin see-through structures in
+    front can make the sparse scale alone disagree), or, for photos, outside
+    ``DEPTH_SCALE_RANGE`` (low confidence: no neighbour covers a photo's view, a video's do). Such
+    a pose is wrong, not the depth: two photos taken walking down a hallway, which the global
+    mapper places on a forward motion it cannot resolve (at 1.3-3.9 m along it and 0.5-1.6 m
+    apart in height from run to run), measure 1.3-4. Blocks of such keyframes large enough to be
+    judged as a whole are rescaled before (``_fix_blocks``). Returns name -> sparse scale in the
+    model's units."""
+    from oh_my_slam.reconstruction.depth import dense_scale
+
+    try:
+        metric = mframe.metric_scale(model, _frame_depths(ctx)).scale
+    except ValueError:
+        return {}
+    by_name = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    sparse: dict[str, float] = {}
+    for n in sorted(names):
+        nf = by_name.get(n)
+        fit = None if nf is None else _sparse_scale(nf, model, n)
+        if fit is not None and fit.ok and fit.spread <= DENSE_MAX_SPREAD:
+            sparse[n] = float(fit.scale)
+    lo, hi = DEPTH_SCALE_RANGE
+    fits = [n for n, sc in sparse.items() if lo <= sc * metric <= hi]
+    out: dict[str, float] = {}
+    for n, sc in sparse.items():
+        q = sc * metric
+        if REJECT_SCALE[0] <= q <= REJECT_SCALE[1]:
+            if photos and not lo <= q <= hi:
+                out[n] = q
+            continue
+        T = model.pose(n)
+        nf = by_name[n]
+        ranked = sorted((r for r in fits if r != n), key=lambda r: -float(
+            model.pose(r).R[:, 2] @ T.R[:, 2]) + 0.1 * float(np.linalg.norm(model.pose(r).t - T.t))
+        )[:DENSE_REFS]
+        refs = [(sparse[r] * by_name[r].frame.depth,
+                 model.intrinsics(r).resized(*by_name[r].frame.grid_size).K(),
+                 model.pose(r).matrix()) for r in ranked]
+        dense = dense_scale(nf.frame.depth, model.intrinsics(n).resized(*nf.frame.grid_size).K(),
+                            T.matrix(), refs) if refs else None
+        if dense is not None and dense.ok and dense.spread <= DENSE_MAX_SPREAD and (
+                REJECT_SCALE[0] <= dense.scale * metric <= REJECT_SCALE[1]):
+            continue  # the dense test supports the pose: the alignment keeps it
+        out[n] = q
     return out
 
 

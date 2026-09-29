@@ -30,18 +30,23 @@ Semantics (spec §2.3):
 * **Keyframes re-scaled by a later update.** An update adjusts the depth of every keyframe of the
   map (``mapping.api._adjust_depth_scales``: a loop it closes spreads over the whole loop); the
   objects of the stored keyframes it corrects move with them (``rescale_objects``).
-* **Latest wins across updates.** An update whose keyframes, as a whole, see through an object
-  removes it or gives it a strike; an update that re-detects it or sees it in place clears its
-  strikes (``_absence``). The margin of "seen through" scales with the object's size, so that a
-  cup on a windowsill can be seen through (``absence_tau``). The removed object's detection masks
-  are invalidated in the keyframes that detected it (``retire_pixels``), so the map cloud loses
-  its points too, and its place is drawn from the keyframes that saw through it (``Vacated``).
-* **Latest wins within an update.** Order of addition is the only sign of "latest": an object
-  that the update detected is judged, as above, by the update's keyframes that photograph its
-  place again (``revisiting_frames``: added after the camera looked away, at about the viewpoint
-  of a detecting keyframe). Keyframes that watch a place continuously, or see it from another
-  side, never remove each other's objects: they are one observation, and their disagreements are
-  depth errors.
+* **Latest wins.** Order of addition is the only sign of "latest", within an update as across
+  updates. Every object is judged by the update's keyframes added after its last detection that
+  could have detected it there and agree with its detections about its surroundings
+  (``_Places``: in view and unoccluded, near enough, their depth divided by the local ratio to
+  the detecting keyframes, from any viewpoint and distance); seeing through it by more than the
+  depth noise, the object's size-scaled margin (``absence_tau``) and the disagreement of its own
+  detections removes it or gives it a strike, and an update that re-detects it or sees it in
+  place clears its strikes (``_absence``). The removed object's detection masks are invalidated
+  in the keyframes that detected it (``retire_pixels``), so the map cloud loses its points too,
+  and its place is drawn from the keyframes that saw through it (``Vacated``). An object first
+  detected where the update's earlier keyframes saw free space arrived: their views through it
+  are retired, so that its keyframes draw it however few they are.
+* **Moved objects.** An object that keyframes added later detect only elsewhere — re-identified by
+  label, size and colour, its old place seen empty after and its new place seen empty before
+  (``_moves``) — keeps its id at its new place; its old place is vacated like a removed object's,
+  and the earlier keyframes' views through its new place are retired, within one update or
+  across updates.
 * **Ids** come from ``next_object_id`` and are never reused. It counts the map's detections: the
   detections of an update's keyframes are numbered in keyframe order, continuing the count, and a
   new object takes the number of its first detection (earliest keyframe, then the detector's
@@ -107,11 +112,12 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from oh_my_slam.core import rle
-from oh_my_slam.core.geometry import depth_edge_mask, project, voxel_keys
+from oh_my_slam.core.geometry import depth_edge_mask, project, unproject_pixels, voxel_keys
 from oh_my_slam.core.types import Pose
-from oh_my_slam.mapping.store import OBJECTS_JSON, frame_file
+from oh_my_slam.mapping.store import OBJECTS_JSON, frame_file, load_valid
 from oh_my_slam.mapping.validity import (
     BORDER,
+    MIN_OBSERVATIONS,
     POSE_MAX_RESIDUAL_DEG,
     View,
     keyframe_view,
@@ -170,10 +176,6 @@ REMOVE_FRACTION = 0.6
 REMOVE_FRACTION_FEW = 0.7
 REMOVE_MIN_FRAMES = 3
 FEW_MIN_INLIERS = 100
-MIN_VISIBLE_SAMPLES = 50
-# A keyframe photographs a place again when its viewpoint distance (``_viewpoint_distance``) to a
-# keyframe that detected it is at most REVISIT_VIEW.
-REVISIT_VIEW = 0.35
 VISIBLE_SHARE = 0.5  # of an object's samples, unoccluded in a keyframe that judges it
 FEW_MIN_OBSERVATIONS = 4
 # "Seen through" needs the surface behind an object's point by more than a margin. The margin of a
@@ -189,6 +191,37 @@ ABSENCE_TAU_SIZE = 0.15
 # A multi-view pose that matches leave uncertain by more than POSE_MAX_RESIDUAL_DEG still judges an
 # object at least this many times the pose's lateral error at the object's distance.
 ABSENCE_POSE_SHARE = 0.15
+# Latest wins for objects (``_Places``). A keyframe judges an object's place when it sees it:
+# PLACE_FRAMED of its samples in the image (the image-border band counts), VISIBLE_SHARE of them
+# unoccluded, on at least PLACE_MIN_PIXELS distinct pixels of its depth grid (a far or tiny object
+# is a few pixels, all of them depth edges); its silence there is evidence only from at most
+# PLACE_RANGE times the farthest distance a keyframe detected it from (it then appears at least
+# 2/3 as large as in the smallest detection); and when it agrees with the object's detections
+# about the object's surroundings: the surface in a band around the object's mask (RING_WIDTH of the mask's size, beyond
+# MASK_DILATE px; RING_SAMPLES points, at least RING_MIN) in the detecting keyframe nearest by
+# viewpoint (the nearest PLACE_REFS are tried), within a factor RING_SAME of the judge's depth where
+# it sees the same surface; their median ratio at most RING_BIAS from 1 (the depth disagreement
+# the global adjustment leaves between keyframes; validity.MAX_GLOBAL_BIAS), and VISIBLE_SHARE of
+# the points within the depth noise (``absence_tau``'s floor) of it once it is removed. What its
+# own PLACE_REFS largest detections' keyframes see through (its transparency) is no evidence.
+PLACE_FRAMED = 0.8
+PLACE_RANGE = 1.5
+PLACE_MIN_PIXELS = 20
+PLACE_REFS = 3
+RING_WIDTH = 0.5
+RING_SAMPLES = 400
+RING_MIN = 20
+RING_SAME = 1.3
+RING_BIAS = 0.25
+# Moved objects (``_moves``): an object detected only by keyframes added after every detection of an
+# object of a compatible label, of comparable size (scales within MOVE_SCALE) and colour (median
+# CIELab of the detections' pixels in MOVE_COLOUR_VIEWS of its keyframes: chroma within
+# MOVE_CHROMA, lightness within MOVE_LIGHTNESS; lighting changes lightness more than chroma),
+# standing elsewhere (their boxes grown by the depth noise do not meet).
+MOVE_SCALE = 1.5
+MOVE_CHROMA = 10.0
+MOVE_LIGHTNESS = 25.0
+MOVE_COLOUR_VIEWS = 3
 MAP_FLOOR_MAX_BELOW = 0.10
 MASK_DILATE = 3
 PAIR_NEIGHBOURS = 10  # keyframes (nearest by viewpoint) whose instances each keyframe's meet
@@ -878,28 +911,6 @@ def absence_tau(z: NDArray[Any], size: float = float("inf")) -> NDArray[Any]:
     return np.minimum(wide, narrow)
 
 
-def visibility_evidence(view: View, pts: NDArray[Any]) -> tuple[int, int]:
-    """(seen-through, consistent) counts of an object's in-view, unoccluded surface samples; (0, 0)
-    when less than ``VISIBLE_SHARE`` of the samples that project into the image are unoccluded:
-    what remains of a hidden object is its edge along the occluder, where depth is unreliable."""
-    if len(pts) > 3000:
-        pts = pts[np.linspace(0, len(pts) - 1, 3000).astype(int)]
-    size = float(np.linalg.norm(np.ptp(pts, axis=0))) if len(pts) else 0.0
-    uv, zc = project(view.T_map_cam.inverse().apply(np.asarray(pts, np.float64)), view.K.K())
-    h, w = view.depth.shape
-    with np.errstate(invalid="ignore"):
-        framed = int(((zc > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w)
-                      & (uv[:, 1] >= 0) & (uv[:, 1] < h)).sum())
-    inside, z, d = view.lookup(pts)
-    z, d = z[inside], d[inside]
-    t = absence_tau(z, size)
-    through = int((d - z > t).sum())
-    consistent = int((np.abs(d - z) <= t).sum())
-    if through + consistent < VISIBLE_SHARE * framed:
-        return 0, 0
-    return through, consistent
-
-
 def border_share(mask: NDArray[np.bool_]) -> float:
     """Share of a mask's pixels in the image-border band that ``View.usable`` excludes."""
     m = np.asarray(mask, bool)
@@ -1278,23 +1289,62 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         o.views_in_frustum = count_views(o, records)
         confirm(o)
 
-    # 4. drop non-physical objects and objects this update shows to be gone: every object is judged
-    #    by the keyframes of the update that photograph its place again (``revisiting_frames``;
-    #    all of them for an object the update did not detect)
+    # 4. drop non-physical objects, and let the latest keyframes win (``_Places``): every object is
+    #    judged by this update's keyframes added after its last detection that could have detected
+    #    it there (``_absence``); an object they see elsewhere moves there first (``_moves``: it
+    #    keeps the id of where it was, and that place is vacated like a removed object's); an
+    #    object first detected where the update's earlier keyframes saw free space arrived, and
+    #    their views through it are retired so that the latest keyframes draw it
     dropped = {o.id for o in state.objects if below_floor(o, state.floor_z)}
-    placed = sorted((views.records[f] for f in new_views), key=lambda r: r.index)
-    poses = {i: r.T_map_cam for i, r in views.records.items()}
-    revisit = {o.id: revisiting_frames(o, placed, poses) for o in state.objects if o.id in touched}
-    candidates = [o for o in state.objects if o.id not in dropped]
+    places = _Places(views, masks, state.objects)
+    new_idx = sorted(new_views)
+    moves = [mv for mv in _moves(state, touched - dropped, places, _Colours(ctx, views, masks))
+             if mv.src.id not in dropped and mv.dst.id not in dropped]
+
+    def later(o: MapObject) -> list[Verdict]:
+        return places.verdicts(o, [f for f in new_idx if f > max(o.frames)])
+
+    src_ids = {mv.src.id for mv in moves}
+    # only the map's objects: a candidate (unconfirmed) that later keyframes see through is one
+    # whose single detection's depth nothing confirms, and it stays a candidate
+    candidates = [o for o in state.objects
+                  if o.confirmed and o.id not in dropped and o.id not in src_ids]
     witnesses: dict[int, list[int]] = {}
-    removed = _absence(candidates, new_views, revisit, witnesses)
-    state.invalidated, vacated = retire_pixels(ctx, views, masks, [o for o in candidates
-                                                                   if o.id in set(removed)],
-                                               witnesses)
+    removed = _absence(candidates, {o.id: later(o) for o in candidates}, witnesses)
+    kept = [mv for mv in moves if mv.dst.id not in removed]
+    if len(kept) < len(moves):  # moved to a place the update then saw empty: judged as before
+        back = [mv.src for mv in moves if mv not in kept]
+        removed += _absence(back, {o.id: later(o) for o in back}, witnesses)
+    moves = kept
+    arrived: dict[int, NDArray[np.bool_]] = {}
+
+    def arrive(o: MapObject, through: list[Verdict]) -> None:
+        for v in through:
+            px = places.through_pixels(o, v)
+            arrived[v.frame] = arrived[v.frame] | px if v.frame in arrived else px
+
+    for mv in moves:
+        witnesses[mv.src.id] = mv.departed
+        arrive(mv.dst, mv.arrived)
+    settled = dropped | set(removed) | {mv.dst.id for mv in moves}
+    for o in state.objects:
+        if o.confirmed and o.id in touched and o.id not in settled \
+                and min(o.frames) in new_views:
+            earlier = places.verdicts(o, [f for f in new_idx if f < min(o.frames)])
+            if _judgement(o, earlier, few=False) == "gone":  # absent: 3 keyframes or more
+                last = max((v.frame for v in earlier if v.share <= 1.0 - REMOVE_FRACTION),
+                           default=-1)
+                arrive(o, [v for v in earlier if v.share >= REMOVE_FRACTION and v.frame > last])
+    retired = set(removed) | {mv.src.id for mv in moves}
+    state.invalidated, vacated = retire_pixels(ctx, views, masks, [o for o in state.objects
+                                                                   if o.id in retired],
+                                               witnesses, arrived)
     state.vacated.extend(vacated)
-    gone = dropped | set(removed)
+    moved_from = {mv.src.id: mv.dst for mv in moves}
+    _forget_detections(ctx, views, masks, [mv.src for mv in moves], new_views)
+    gone = dropped | retired
     for oid in sorted(gone | set(alias)):
-        if oid < first_new:
+        if oid < first_new and oid not in moved_from:
             tx.delete(points_file(oid))
             tx.delete(sources_file(oid))
     state.objects = [o for o in state.objects if o.id not in gone]
@@ -1311,16 +1361,34 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     fresh = [o for o in state.objects if o.id >= first_new]
     rename = {o.id: first_detection[o.id] for o in fresh}
-    for o in fresh:
-        o.id = rename[o.id]
+    moved_ids: list[int] = []
+    for src_id, dst in sorted(moved_from.items()):
+        # a moved object keeps the id of where it was; an id of its own that the map stored
+        # resolves to it
+        src_final = src_id if src_id < first_new else first_detection[src_id]
+        if dst.id < first_new:
+            state.merged_into[dst.id] = src_final
+            tx.delete(points_file(dst.id))
+            tx.delete(sources_file(dst.id))
+        rename[dst.id] = src_final
+        dst.created_update = min(dst.created_update, next(mv.src.created_update for mv in moves
+                                                          if mv.src.id == src_id))
+        moved_ids.append(src_final)
+    for o in state.objects:
+        o.id = rename.get(o.id, o.id)
     state.next_id = count
     for old, keeper in alias.items():
         if old < first_new:  # a stored id; its keeper has a lower id, so is stored too
             state.merged_into[old] = keeper
     touched = {rename.get(t, t) for t in touched if t not in alias and t not in gone}
+    for v in vacated:  # the places of this update record the objects' final ids
+        if v.object >= first_new:
+            v.object = first_detection.get(v.object, v.object)
 
     def final_id(oid: int) -> int:
         oid = resolved(oid)
+        if oid in moved_from:
+            return 0  # detected where it no longer is
         if oid in gone:
             return 0 if oid >= first_new else oid  # a removed id resolves to nothing
         return rename.get(oid, oid)
@@ -1340,6 +1408,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         "instances": len(obs), "touched": len(touched), "new": len(fresh), "merged": merged,
         "removed": sorted(oid for oid in removed if oid < first_new),
         "withdrawn": sum(oid >= first_new for oid in removed),
+        "moved": sorted(moved_ids),
         "pixels_invalidated": sum(state.invalidated.values()),
         "vacated": len(vacated),
         "below_floor_dropped": len(dropped),
@@ -1347,51 +1416,28 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         "unconfirmed": len(state.objects) - confirmed,
     }
     progress(f"objects: {confirmed} confirmed of {len(state.objects)}; "
-             f"{len(removed)} removed, {merged} merged")
+             f"{len(removed)} removed, {len(moved_ids)} moved, {merged} merged")
     return state
-
-
-def revisiting_frames(o: MapObject, placed: list[Any], poses: dict[int, Pose]) -> set[int]:
-    """The keyframes of one update (``placed``: its placed keyframes) that judge an object which
-    the update itself detected: the ones that photograph its place again.
-
-    Order of addition is the only sign of "latest", but keyframes that watch a place continuously
-    are one observation of it (a video's neighbours, a sweep), and their disagreements are depth
-    errors, as are those of keyframes that see it from another side (monocular depth of one
-    object differs by tens of percent between viewpoints metres apart). A place has changed when
-    the camera looked away after the last detection (a keyframe without the object in view), and
-    came back to about the same viewpoint as a keyframe that detected it (``REVISIT_VIEW``),
-    added after the look away. ``poses``: the map's keyframes' poses by index."""
-    pts = o.points
-    if len(pts) > VIEW_SAMPLES:
-        pts = pts[np.linspace(0, len(pts) - 1, VIEW_SAMPLES).astype(int)]
-    indices = {r.index for r in placed}
-    last = max((f for f in o.frames if f in indices), default=-1)
-    away = next((r.index for r in placed
-                 if r.index > last and not in_view(pts, r.K_grid, r.T_map_cam)), None)
-    if away is None:
-        return set()
-    scale = max(0.5, o.obs_depth)
-    seen = [poses[f] for f in o.frames if f in poses]
-    return {r.index for r in placed if r.index > away
-            and any(_viewpoint_distance(r.T_map_cam, T, scale) <= REVISIT_VIEW for T in seen)}
 
 
 RETIRE_DILATE = 2
 
 
 def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject],
-                  witnesses: dict[int, list[int]] | None = None
+                  witnesses: dict[int, list[int]] | None = None,
+                  arrived: dict[int, NDArray[np.bool_]] | None = None
                   ) -> tuple[dict[int, int], list[Vacated]]:
     """Latest wins for the cloud: the detection masks of the objects this update removes are
     invalidated in the keyframes that detected them (``valid.png``, staged), so fusion stops
     drawing them: the object's own record and its points in the map cloud go together. Returns
     keyframe index -> number of pixels invalidated, and the removed objects' places (``Vacated``,
     with their ``witnesses``: object id -> indices of the keyframes that saw through it), where
-    the map cloud is then drawn from the witnesses."""
+    the map cloud is then drawn from the witnesses. ``arrived`` (keyframe index -> pixels): the
+    pixels with which earlier keyframes saw through the new place of a moved object (``Move``)
+    are invalidated too, so that its keyframes alone draw it there."""
     from oh_my_slam.core.images import png_bytes
 
-    kill: dict[int, NDArray[np.bool_]] = {}
+    kill: dict[int, NDArray[np.bool_]] = {f: m.copy() for f, m in (arrived or {}).items()}
     places: list[Vacated] = []
     for o in sorted(gone, key=lambda o: o.id):
         retired: dict[str, dict[str, Any]] = {}
@@ -1422,6 +1468,34 @@ def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject],
                                png_bytes((view.valid & ~m).astype(np.uint8) * 255))
             out[f] = int(m.sum())
     return out, places
+
+
+def _forget_detections(ctx: Any, views: _Views, masks: _Masks, objs: list[MapObject],
+                       new_views: dict[int, Any]) -> None:
+    """The stored keyframes' detections of objects that moved (``Move.src``) no longer name them
+    (``instances.json``, staged: object id 0, as a removed object's): they show where the object
+    no longer is, and the object keeps its id elsewhere. This update's keyframes are written with
+    their final ids by ``update_objects``."""
+    import json
+
+    ids = {o.id for o in objs}
+    for f in sorted({f for o in objs for f in o.frames} - set(new_views)):
+        rec = views.records.get(f)
+        if rec is None:
+            continue
+        rel = frame_file(rec.name, "instances.json")
+        p = ctx.tx.current(rel)
+        if not p.exists():
+            continue
+        data = json.loads(p.read_text())
+        insts = data.get("instances", [])
+        hit = False
+        for x in insts:
+            if masks.owner(int(x["object_id"])) in ids:
+                x["object_id"] = 0
+                hit = True
+        if hit:
+            ctx.tx.write_json(rel, data)
 
 
 def save_state(tx: Any, state: ObjectState) -> None:
@@ -1481,6 +1555,7 @@ class _Views:
         self.ctx = ctx
         self.records = {r.index: r for r in records}
         self.views: dict[int, View | None] = dict(new)
+        self.prior: dict[int, View | None] = {}
         self.ratios: dict[tuple[int, int], float | None] = {}
 
     def pose(self, index: int) -> Pose | None:
@@ -1493,6 +1568,21 @@ class _Views:
             self.views[index] = (None if rec is None or self.ctx is None
                                  else stored_view(self.ctx.tx.current, rec))
         return self.views[index]
+
+    def before(self, index: int) -> View | None:
+        """The keyframe's view as the map held it before this update (a stored keyframe's
+        committed validity: this update's latest wins not applied); this update's keyframes'
+        as ``get``."""
+        if index not in self.prior:
+            rec = self.records.get(index)
+            root = None if self.ctx is None else getattr(self.ctx.tx, "root", None)
+            stored = {r.index for r in getattr(self.ctx, "old_frames", None) or []}
+            now = self.get(index)
+            if now is not None and rec is not None and root is not None and index in stored:
+                valid = load_valid(lambda rel: root / rel, rec.name, now.depth)
+                now = View(now.depth, valid & (now.depth > 0), now.K, now.T_map_cam)
+            self.prior[index] = now
+        return self.prior[index]
 
     def ratio(self, a: int, b: int) -> float | None:
         if (a, b) not in self.ratios:
@@ -2575,80 +2665,530 @@ def _seen_pairs(objects: list[MapObject], touched: set[int], masks: _Masks
 
 
 # ------------------------------------------------------------------------------------------------
-# absence
+# latest wins for objects: how keyframes saw an object's place
 
 
-def _judges(nf: Any, o: MapObject, size: float) -> bool:
-    """Whether keyframe ``nf`` is registered well enough to judge object ``o`` (extent ``size``):
-    well registered (``well_registered``), or a pose refined with feature matches (``stats`` has
-    ``pose_matches``, whatever the map's ``pose_source``: a map joins SfM and multi-view
-    keyframes) whose match residual, seen from the object's distance, is small against the object
-    (a cup 0.7 m away, 2° off: 2.5 cm)."""
-    rec = nf.record
+def _judges(rec: Any, o: MapObject, size: float) -> bool:
+    """Whether keyframe ``rec`` (a record) is registered well enough to judge object ``o``
+    (extent ``size``): well registered (``well_registered``); or its pose error, seen from the
+    object's distance, is small against the object (``ABSENCE_POSE_SHARE`` of its extent: a cup
+    0.7 m away, 2° off, is 2.5 cm off): an SfM pose with ``validity.MIN_OBSERVATIONS`` points
+    whose reprojection error, as an angle (error in pixels over the focal length), is below that,
+    or a pose refined with feature matches (``stats`` has ``pose_matches``, whatever the map's
+    ``pose_source``: a map joins SfM and multi-view keyframes) whose match residual is."""
     if well_registered(rec.stats, rec.pose_source):
         return True
-    if "pose_matches" not in rec.stats:
-        return False
     limit = float(np.degrees(ABSENCE_POSE_SHARE * size / max(o.obs_depth, 0.1)))
+    if "pose_matches" not in rec.stats:
+        err = rec.stats.get("reproj_error")
+        fx = getattr(getattr(rec, "K", None), "fx", 0.0)
+        return (rec.stats.get("observations", 0) >= MIN_OBSERVATIONS and err is not None
+                and fx > 0 and float(np.degrees(float(err) / fx)) <= limit)
     return pose_supported(rec.stats, max(POSE_MAX_RESIDUAL_DEG, limit))
 
 
-def _absence(candidates: list[MapObject], new_views: dict[int, tuple[Any, View]],
-             judges: dict[int, set[int]] | None = None,
+@dataclass(frozen=True)
+class Verdict:
+    """How one keyframe saw an object's place (``_Places.verdict``): the share of the object's
+    judged samples it saw through, whether its pose is well supported (many SfM inliers or feature
+    matches: the few-keyframes rule of ``_judgement``), and its depth ratio to the object's
+    detections there (measured on the object's surroundings; its depth is divided by it)."""
+
+    frame: int
+    share: float
+    supported: bool
+    ratio: float = 1.0
+
+
+class _Places:
+    """Latest wins for objects: how the map's keyframes saw the places of its objects.
+
+    A keyframe judges an object's place (``verdict``) only where it could have detected the
+    object: well registered (``_judges``), not low confidence, at least ``PLACE_FRAMED`` of the
+    object's samples in its image (the image-border band counts: a place at the edge of the latest
+    photo is seen), from at most ``PLACE_RANGE`` times the distance the object was detected from,
+    and at least ``VISIBLE_SHARE`` of the samples unoccluded (``PLACE_MIN_SAMPLES`` at least).
+
+    Monocular depth of two keyframes disagrees — by a largely smooth factor between keyframes far
+    apart, tens of percent between viewpoints metres apart, and by pose errors where a video
+    closes a loop — so the keyframe must also agree with the object's detections about its
+    surroundings: the surface around the object's mask in the detecting keyframe nearest by
+    viewpoint (a band ``RING_WIDTH`` of the mask's size wide: its support, the wall behind it),
+    lifted into the map, must lie on the judging keyframe's depth for ``VISIBLE_SHARE`` of the
+    points it sees there, once their median ratio (at most ``RING_BIAS`` from 1) is removed, within
+    the depth noise (``absence_tau``'s floor). Its depth is divided by that ratio. A keyframe that
+    disagrees locally (a loop misaligned by decimetres, another scale there) does not judge.
+
+    A sample is seen through when the keyframe sees farther than it by the absence margin
+    (``absence_tau``, which scales with the object's size). The verdict is the share seen through
+    beyond what the object's own detecting keyframes see through (``transparency``): monocular
+    depth sees between a ladder's rungs and a plant's leaves, and places a small object
+    differently from one keyframe to the next; a keyframe that sees through no more of it than
+    they do is no evidence."""
+
+    def __init__(self, views: _Views, masks: _Masks, objects: list[MapObject]) -> None:
+        self.views = views
+        self.masks = masks
+        self.objects = {o.id: o for o in objects}
+        self._rings: dict[tuple[int, int], NDArray[np.float64] | None] = {}
+        self._noise: dict[int, float] = {}
+        self._edges: dict[int, NDArray[np.bool_]] = {}
+
+    def _edge(self, f: int, view: View) -> NDArray[np.bool_]:
+        if f not in self._edges:
+            ok = view.valid & (view.depth > 0)
+            self._edges[f] = depth_edge_mask(np.where(ok, view.depth, 0.0))
+        return self._edges[f]
+
+    @staticmethod
+    def samples(o: MapObject) -> tuple[NDArray[np.float64], float]:
+        def compute() -> tuple[NDArray[np.float64], float]:
+            pts = np.asarray(o.points, np.float64)
+            if len(pts) > SEEN_SAMPLES:
+                pts = pts[np.linspace(0, len(pts) - 1, SEEN_SAMPLES).astype(int)]
+            return pts, float(np.linalg.norm(np.ptp(pts, axis=0))) if len(pts) else 0.0
+        out: tuple[NDArray[np.float64], float] = o.memo("place_samples", compute)
+        return out
+
+    def reach(self, o: MapObject) -> float:
+        """The farthest distance a keyframe detected the object from."""
+        far = [float(np.linalg.norm(np.asarray(s.centroid) - T.t)) for s in o.sightings
+               if (T := self.views.pose(s.frame)) is not None]
+        return max(far) if far else float(o.obs_depth)
+
+    def _detecting(self, o: MapObject, n: int) -> list[int]:
+        size = {s.frame: s.points for s in o.sightings}
+        return sorted(o.frames, key=lambda f: (-size.get(f, 0), f))[:n]
+
+    def transparency(self, o: MapObject) -> float:
+        """The share of the object's samples its own detecting keyframes see through (by the
+        margin of ``verdict``; the largest over up to ``PLACE_REFS`` of them, the largest
+        detections): monocular depth sees between the rungs of a ladder or the leaves of a plant,
+        and places a small object differently from one keyframe to the next. A keyframe that
+        judges the object must see through it by more than that (``verdict``)."""
+        if o.id not in self._noise:
+            pts, size = self.samples(o)
+            worst = 0.0
+            for f in self._detecting(o, PLACE_REFS):
+                view = self.views.before(f)
+                if view is None:
+                    continue
+                ok, z, d, _, _ = _lookup_valid(view, pts)
+                t = absence_tau(z, size)
+                through = ok & (d - z > t)
+                judged = through | (ok & (np.abs(d - z) <= t))
+                if judged.sum() >= PLACE_MIN_PIXELS:
+                    worst = max(worst, float(through.sum() / judged.sum()))
+            self._noise[o.id] = worst
+        return self._noise[o.id]
+
+    def ring(self, o: MapObject, f: int) -> NDArray[np.float64] | None:
+        """Map points of the surface around the object's detection in keyframe ``f``."""
+        key = (o.id, f)
+        if key not in self._rings:
+            self._rings[key] = None
+            view = self.views.before(f)
+            masks = [] if view is None else [
+                m if isinstance(m, np.ndarray) else rle.decode(m)
+                for oid, m in self.masks.instances(f) if self.masks.owner(oid) == o.id]
+            masks = [m for m in masks if view is not None and m.shape == view.depth.shape]
+            if view is not None and masks:
+                mask = np.logical_or.reduce(masks)
+                width = max(MASK_DILATE + 1, int(np.ceil(RING_WIDTH * np.sqrt(mask.sum()))))
+                box = _bbox(mask)
+                assert box is not None
+                h, w = mask.shape
+                r0, r1 = max(0, box[0] - width), min(h, box[1] + width)
+                c0, c1 = max(0, box[2] - width), min(w, box[3] + width)
+                dist = ndimage.distance_transform_edt(~mask[r0:r1, c0:c1])
+                band = (dist > MASK_DILATE) & (dist <= width)
+                ok = view.valid[r0:r1, c0:c1] & (view.depth[r0:r1, c0:c1] > 0)
+                ok &= ~self._edge(f, view)[r0:r1, c0:c1]
+                v, u = np.nonzero(band & ok)
+                if len(v) >= RING_MIN:
+                    if len(v) > RING_SAMPLES:
+                        k = np.linspace(0, len(v) - 1, RING_SAMPLES).astype(int)
+                        v, u = v[k], u[k]
+                    v, u = v + r0, u + c0
+                    z = view.depth[v, u].astype(np.float64)
+                    self._rings[key] = view.T_map_cam.apply(unproject_pixels(u, v, z,
+                                                                             view.K.K()))
+        return self._rings[key]
+
+    def occupied(self, o: MapObject, j: int, uv: NDArray[np.float64]) -> bool:
+        """Whether keyframe ``j`` detected something at the object's place (``uv``: its samples
+        in the image): another object, not much larger (not its support: at most twice its size),
+        whose mask (grown by ``MASK_DILATE``) holds ``VISIBLE_SHARE`` of the samples — or
+        ``PLACE_MIN_PIXELS`` of them when a keyframe detected it at the object's own place
+        (``_overlap``: the object itself under another label, which a keyframe across the room
+        places a little apart: a bag seen as a handbag). An item a keyframe detected beside the
+        object does not count. The keyframe then did not see the place empty."""
+        if not len(uv):
+            return False
+        mine = set(o.frames)
+        for oid, m in self.masks.instances(j):
+            p = self.objects.get(self.masks.owner(oid))
+            if p is None or p is o or _scale(p) > 2 * _scale(o):
+                continue
+            both = sorted(mine & set(p.frames))
+            if both and not self._overlap(o, p, both[0]):
+                continue  # detected beside it
+            mask = m if isinstance(m, np.ndarray) else rle.decode(m)
+            h, w = mask.shape
+            u = np.clip(np.rint(uv[:, 0]).astype(np.int64), 0, w - 1)
+            v = np.clip(np.rint(uv[:, 1]).astype(np.int64), 0, h - 1)
+            r = MASK_DILATE
+            r0, r1 = max(0, int(v.min()) - r), min(h, int(v.max()) + r + 1)
+            c0, c1 = max(0, int(u.min()) - r), min(w, int(u.max()) + r + 1)
+            crop = mask[max(0, r0 - r):r1 + r, max(0, c0 - r):c1 + r]
+            if not crop.any():
+                continue
+            near = ndimage.binary_dilation(crop, iterations=r)
+            hit = near[v - max(0, r0 - r), u - max(0, c0 - r)]
+            # the object itself under another label (a keyframe detected both at one place):
+            # anywhere on its place; anything else: over most of it
+            if (both and int(hit.sum()) >= PLACE_MIN_PIXELS) or float(hit.mean()) >= VISIBLE_SHARE:
+                return True
+        return False
+
+    def _mask_of(self, o: MapObject, f: int) -> NDArray[np.bool_] | None:
+        found = [m if isinstance(m, np.ndarray) else rle.decode(m)
+                 for oid, m in self.masks.instances(f) if self.masks.owner(oid) == o.id]
+        return np.logical_or.reduce(found) if found else None
+
+    def _overlap(self, o: MapObject, p: MapObject, f: int) -> bool:
+        """Whether keyframe ``f`` detected ``o`` and ``p`` at one place: the centre of either
+        mask inside the other's bounding box (grown by ``MASK_DILATE``). A keyframe's masks are
+        exclusive, so one thing detected twice (a bag as a bag and as a handbag) is two masks
+        side by side, each over the other's middle; an item beside another is not."""
+        a, b = self._mask_of(o, f), self._mask_of(p, f)
+        if a is None or b is None or a.shape != b.shape:
+            return False
+        for x, y in ((a, b), (b, a)):
+            box = _bbox(y)
+            v, u = np.nonzero(x)
+            if box is None or not len(v):
+                continue
+            cv, cu = float(v.mean()), float(u.mean())
+            if box[0] - MASK_DILATE <= cv <= box[1] + MASK_DILATE \
+                    and box[2] - MASK_DILATE <= cu <= box[3] + MASK_DILATE:
+                return True
+        return False
+
+    def local_ratio(self, o: MapObject, j: int, view: View) -> tuple[float, float] | None:
+        """Keyframe ``j``'s depth ratio to the object's detections around the object, when it
+        agrees with them there (see the class docstring), and the share of those surroundings it
+        sees through by the object's margin once divided by that ratio: what it sees through
+        where nothing changed (a pose a few centimetres off beside a depth edge); None when it
+        does not agree."""
+        T = view.T_map_cam
+        scale = max(0.5, float(o.obs_depth))
+        refs = sorted((f for f in o.frames if self.views.pose(f) is not None),
+                      key=lambda f: (_viewpoint_distance(T, self.views.pose(f), scale), f))
+        for f in refs[:PLACE_REFS]:
+            ring = self.ring(o, f)
+            if ring is None:
+                continue
+            ok, z, d, _, _ = _lookup_valid(view, ring)
+            if ok.sum() < RING_MIN:
+                continue
+            r = d[ok] / z[ok]
+            same = (r > 1.0 / RING_SAME) & (r < RING_SAME)
+            if same.sum() < RING_MIN:
+                continue
+            rho = float(np.median(r[same]))
+            if not (1.0 - RING_BIAS <= rho <= 1.0 + RING_BIAS):
+                continue
+            tol = np.maximum(ABSENCE_TAU_SMALL_MIN / z[ok], ABSENCE_TAU_SMALL_REL)
+            if float((np.abs(r / rho - 1.0) <= tol).mean()) >= VISIBLE_SHARE:
+                _, size = self.samples(o)
+                beyond = r / rho - 1.0 > absence_tau(z[ok], size) / z[ok]
+                return rho, float(beyond.mean())
+        return None
+
+    def verdict(self, o: MapObject, j: int, detectable: bool = False) -> Verdict | None:
+        """Keyframe ``j``'s verdict on the object's place (see the class docstring); with
+        ``detectable``, only from where it could have detected the object too (``PLACE_RANGE``:
+        its silence there is evidence)."""
+        rec = self.views.records.get(j)
+        pts, size = self.samples(o)
+        if rec is None or rec.low_confidence or not len(pts) or j in o.frames \
+                or not _judges(rec, o, size) or not in_view(pts, rec.K_grid, rec.T_map_cam):
+            return None
+        view = self.views.before(j)  # this update's latest wins may have retired the place
+        if view is None:
+            return None
+        uv, z = project(view.T_map_cam.inverse().apply(pts), view.K.K())
+        h, w = view.depth.shape
+        with np.errstate(invalid="ignore"):
+            framed = (z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+        if framed.mean() < PLACE_FRAMED:
+            return None
+        if detectable and float(np.median(z[framed])) > PLACE_RANGE * self.reach(o):
+            return None
+        if self.occupied(o, j, uv[framed]):
+            return None
+        local = self.local_ratio(o, j, view)
+        if local is None:
+            return None
+        ratio, around = local
+        ok, zz, d, u, v = _lookup_valid(view, pts[framed])
+        dn = d / ratio
+        t = absence_tau(zz, size)
+        through = ok & (dn - zz > t)
+        judged = through | (ok & (np.abs(dn - zz) <= t))
+        pixels = len(np.unique(v[judged] * w + u[judged]))
+        if judged.sum() < VISIBLE_SHARE * int(framed.sum()) or pixels < PLACE_MIN_PIXELS:
+            return None
+        supported = (rec.stats.get("observations", FEW_MIN_INLIERS) >= FEW_MIN_INLIERS
+                     or "pose_matches" in rec.stats
+                     or rec.pose_source in ("identity", "multiview"))
+        seen = float(through.sum() / judged.sum())
+        # what its own detections see through, and what this keyframe sees through around the
+        # object where nothing changed, are no evidence
+        s0 = max(self.transparency(o), around)
+        share = max(0.0, (seen - s0) / (1.0 - s0)) if s0 < 1.0 else 0.0
+        return Verdict(j, share, supported, ratio)
+
+    def verdicts(self, o: MapObject, frames: list[int], detectable: bool = False
+                 ) -> list[Verdict]:
+        out = []
+        for f in frames:
+            v = self.verdict(o, f, detectable)
+            if v is not None:
+                out.append(v)
+        return out
+
+    def through_pixels(self, o: MapObject, v: Verdict) -> NDArray[np.bool_]:
+        """The pixels with which keyframe ``v.frame`` saw through the object (its points): under
+        its footprint (the points projected, grown by ``MASK_DILATE``), valid and farther than
+        its farthest point there by the margin of ``verdict``, its depth divided by
+        ``v.ratio``."""
+        view = self.views.get(v.frame)
+        assert view is not None
+        pts = np.asarray(o.points, np.float64)
+        _, size = self.samples(o)
+        h, w = view.depth.shape
+        uv, z = project(view.T_map_cam.inverse().apply(pts), view.K.K())
+        with np.errstate(invalid="ignore"):
+            ok = (z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+        out = np.zeros((h, w), bool)
+        if not ok.any():
+            return out
+        u = np.rint(uv[ok, 0]).astype(np.int64).clip(0, w - 1)
+        v_ = np.rint(uv[ok, 1]).astype(np.int64).clip(0, h - 1)
+        far = np.zeros((h, w))
+        np.maximum.at(far, (v_, u), z[ok])
+        far = ndimage.grey_dilation(far, size=(2 * MASK_DILATE + 1, 2 * MASK_DILATE + 1))
+        t = absence_tau(far, size)
+        return (far > 0) & view.valid & (view.depth / v.ratio > far + t)
+
+
+def _lookup_valid(view: View, pts: NDArray[np.float64]
+                  ) -> tuple[NDArray[np.bool_], NDArray[np.float64], NDArray[np.float64],
+                             NDArray[np.int64], NDArray[np.int64]]:
+    """(on a valid pixel, depth in the camera, observed depth, u, v) of each point; unlike
+    ``View.lookup``, the image-border band and depth edges count."""
+    uv, z = project(view.T_map_cam.inverse().apply(pts), view.K.K())
+    h, w = view.depth.shape
+    with np.errstate(invalid="ignore"):
+        inside = (z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    u = np.zeros(len(pts), np.int64)
+    v = np.zeros(len(pts), np.int64)
+    u[inside] = np.rint(uv[inside, 0]).astype(np.int64).clip(0, w - 1)
+    v[inside] = np.rint(uv[inside, 1]).astype(np.int64).clip(0, h - 1)
+    d = np.where(inside, view.depth[v, u], 0.0).astype(np.float64)
+    ok = inside & view.valid[v, u] & (d > 0)
+    return ok, np.where(inside, z, 0.0), d, u, v
+
+
+def _judgement(o: MapObject, verdicts: list[Verdict], few: bool = True) -> str | None:
+    """What the verdicts of keyframes say about an object's place, the latest winning: a keyframe
+    that sees the object in place (<= 1 - ``REMOVE_FRACTION`` of its samples seen through) outweighs
+    every earlier one, so only the verdicts of the keyframes added after the last such keyframe
+    count ("in place" when there are none). Of those: "gone" when most see through it
+    (>= ``REMOVE_FRACTION``) and at least ``REMOVE_MIN_FRAMES`` do, or (with ``few``) at least
+    ``CONFIRM_DETECTIONS`` do — absence, like presence, is confirmed by two keyframes — every one
+    of them >= ``REMOVE_FRACTION_FEW`` from a well-supported pose, and the object is established
+    (>= ``FEW_MIN_OBSERVATIONS`` detections); "strike" when most see through it with
+    less evidence; None otherwise."""
+    if not verdicts:
+        return None
+    ordered = sorted(verdicts, key=lambda v: v.frame)
+    last_in_place = max((k for k, v in enumerate(ordered) if v.share <= 1.0 - REMOVE_FRACTION),
+                        default=-1)
+    after = ordered[last_in_place + 1:]
+    if not after:
+        return "in place"
+    strong = [v for v in after if v.share >= REMOVE_FRACTION]
+    if 2 * len(strong) <= len(after):
+        return None
+    established = (few and len(strong) >= CONFIRM_DETECTIONS
+                   and all(v.share >= REMOVE_FRACTION_FEW and v.supported for v in strong)
+                   and o.observations >= FEW_MIN_OBSERVATIONS)
+    return "gone" if len(strong) >= REMOVE_MIN_FRAMES or established else "strike"
+
+
+def _absence(candidates: list[MapObject], verdicts: dict[int, list[Verdict]],
              witnesses: dict[int, list[int]] | None = None) -> list[int]:
-    """Objects that this update, as a whole, shows to be gone.
-
-    Each keyframe of the update that is registered well enough to judge the object (``_judges``)
-    and sees enough of its surface (in view, unoccluded; out of view or occluded is unknown, never
-    free) gives one verdict: through when >= 60 % of the samples are seen through, in place when
-    <= 40 % are. The update contradicts the object when most of those keyframes see through it. A
-    contradiction by >= 3 keyframes removes the object; by fewer, it removes an established object
-    (>= 4 detections) only when every one of them sees >= 70 % through from a well-supported pose,
-    else it is a strike and a second strike (from a later update) removes it. An update that sees
-    the object in place clears its strikes (latest wins).
-
-    ``judges`` (object id -> keyframe indices): an object that the update itself detected is
-    judged only by the keyframes that photograph its place again (``revisiting_frames``); an
-    object the update did not detect (no entry) is judged by all of them. ``witnesses``, when
-    given, receives the keyframes that saw through each removed object (object id -> indices)."""
+    """Objects that this update, as a whole, shows to be gone (``_judgement`` of the verdicts of
+    its keyframes added after each object's last detection, ``_Places``): "gone" removes the
+    object; a "strike" is remembered, and a second strike (from a later update) removes it; "in
+    place" clears the strikes (latest wins). An update counts once, however many of its keyframes
+    judge. ``witnesses``, when given, receives the keyframes that saw through each removed object
+    (object id -> indices)."""
     removed = []
     for o in candidates:
-        verdicts: list[tuple[float, bool]] = []  # (fraction seen through, pose well supported)
-        through_frames: list[int] = []
-        only = (judges or {}).get(o.id)
-        size = float(np.linalg.norm(np.ptp(o.points, axis=0))) if len(o.points) else 0.0
-        for idx, (nf, view) in new_views.items():
-            if (only is not None and idx not in only) or not _judges(nf, o, size):
-                continue
-            through, consistent = visibility_evidence(view, o.points)
-            n = through + consistent
-            if n < MIN_VISIBLE_SAMPLES:
-                continue
-            supported = (nf.record.stats.get("observations", FEW_MIN_INLIERS) >= FEW_MIN_INLIERS
-                         or "pose_matches" in nf.record.stats
-                         or nf.record.pose_source in ("identity", "multiview"))
-            verdicts.append((through / n, supported))
-            if through / n >= REMOVE_FRACTION:
-                through_frames.append(idx)
-        if not verdicts:
-            continue
-        strong = [(f, ok) for f, ok in verdicts if f >= REMOVE_FRACTION]
-        in_place = [f for f, _ in verdicts if f <= 1.0 - REMOVE_FRACTION]
-        if 2 * len(strong) <= len(verdicts):
-            if 2 * len(in_place) > len(verdicts):
-                o.strikes = 0
-            continue
-        few_rule = (all(f >= REMOVE_FRACTION_FEW and ok for f, ok in strong)
-                    and o.observations >= FEW_MIN_OBSERVATIONS)
-        if len(strong) >= REMOVE_MIN_FRAMES or few_rule:
-            removed.append(o.id)
-        else:
+        vs = verdicts.get(o.id, [])
+        verdict = _judgement(o, vs)
+        if verdict == "in place":
+            o.strikes = 0
+        elif verdict == "strike":
             o.strikes += 1
-            if o.strikes >= 2:
-                removed.append(o.id)
-        if witnesses is not None and removed and removed[-1] == o.id:
-            witnesses[o.id] = sorted(through_frames)
+        if verdict == "gone" or (verdict == "strike" and o.strikes >= 2):
+            removed.append(o.id)
+            if witnesses is not None:
+                last = max((v.frame for v in vs if v.share <= 1.0 - REMOVE_FRACTION), default=-1)
+                witnesses[o.id] = sorted(v.frame for v in vs
+                                         if v.share >= REMOVE_FRACTION and v.frame > last)
     return removed
+
+
+# ------------------------------------------------------------------------------------------------
+# moved objects
+
+
+@dataclass
+class Move:
+    """An object that the latest keyframes see elsewhere (``_moves``): ``src`` where it was, ``dst``
+    where it is now; ``departed``: keyframes added after ``src``'s last detection that saw its
+    place without it; ``arrived``: the verdicts of keyframes added before ``dst``'s first detection
+    that saw through its place (free space then, the object now)."""
+
+    src: MapObject
+    dst: MapObject
+    departed: list[int]
+    arrived: list[Verdict]
+
+
+class _Colours:
+    """Median CIELab colour (L 0-100, a, b) of the objects' detections: the pixels of their masks
+    (``_Masks``) in up to ``MOVE_COLOUR_VIEWS`` of their detecting keyframes (the largest
+    detections), per keyframe, then the median over the keyframes. This update's keyframe images
+    are in memory, stored ones are loaded when needed."""
+
+    def __init__(self, ctx: Any, views: _Views, masks: _Masks) -> None:
+        self.ctx = ctx
+        self.views = views
+        self.masks = masks
+        self.rgb: dict[int, NDArray[np.uint8]] = {}
+        for nf in getattr(ctx, "new", []) or []:
+            if nf.record is not None and getattr(nf.frame, "rgb", None) is not None:
+                self.rgb[nf.record.index] = nf.frame.rgb
+        self.cache: dict[int, NDArray[np.float64] | None] = {}
+
+    def _image(self, f: int, shape: tuple[int, int]) -> NDArray[np.uint8] | None:
+        img = self.rgb.get(f)
+        if img is None:
+            from oh_my_slam.core.images import load_rgb
+
+            rec = self.views.records.get(f)
+            if rec is None or self.ctx is None:
+                return None
+            p = self.ctx.tx.current(rec.image)
+            if not p.exists():
+                return None
+            img = load_rgb(p, max_side=max(shape))
+        return img if img.shape[:2] == shape else None
+
+    def of(self, o: MapObject) -> NDArray[np.float64] | None:
+        if o.id not in self.cache:
+            import cv2
+
+            size = {s.frame: s.points for s in o.sightings}
+            per_frame = []
+            for f in sorted(o.frames, key=lambda f: (-size.get(f, 0), f))[:MOVE_COLOUR_VIEWS]:
+                rec = self.views.records.get(f)
+                if rec is None:
+                    continue
+                shape = (int(rec.K_grid.height), int(rec.K_grid.width))
+                found = [m if isinstance(m, np.ndarray) else rle.decode(m)
+                         for oid, m in self.masks.instances(f) if self.masks.owner(oid) == o.id]
+                found = [m for m in found if m.shape == shape]
+                img = self._image(f, shape) if found else None
+                if img is None:
+                    continue
+                px = img[np.logical_or.reduce(found)]
+                if len(px):
+                    lab = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+                    lab = lab.astype(np.float64)
+                    lab[:, 0] *= 100.0 / 255.0
+                    lab[:, 1:] -= 128.0
+                    per_frame.append(np.median(lab, axis=0))
+            self.cache[o.id] = np.median(per_frame, axis=0) if per_frame else None
+        return self.cache[o.id]
+
+
+def _moves(state: ObjectState, touched: set[int], places: _Places, colours: _Colours
+           ) -> list[Move]:
+    """Objects the latest keyframes see elsewhere: the object keeps its id, and its old place, like
+    a removed object's, shows the latest views (spec §2.3: a later update wins, object identity is
+    persistent).
+
+    ``dst`` (touched by this update) and ``src`` are confirmed objects of compatible labels,
+    comparable size and colour (``MOVE_*``), standing apart, every detection of ``src`` made by a
+    keyframe added before every detection of ``dst`` (in the order of addition). The move needs
+    the place of each seen without it in its turn (``_Places.verdict``: keyframes that could have
+    detected it there, and detected nothing else of its size there: ``_Places.occupied``):
+    ``src``'s by at least one keyframe added after its last detection, and ``dst``'s by at least
+    one added before its first detection; and at one of the two places the keyframes' depth shows the
+    change as it shows a removal (``_judgement`` "gone") — monocular depth cannot tell a thin
+    object from the wall right behind it, and the detector's silence alone is no proof of absence.
+    Each object moves once: the pairs whose colours agree best first."""
+    objs = sorted((o for o in state.objects if o.confirmed and len(o.points) and o.frames
+                   and o.obb is not None), key=lambda o: o.id)
+    order = sorted(places.views.records)
+    cands: list[tuple[float, int, int, MapObject, MapObject]] = []
+    for b in objs:
+        if b.id not in touched:
+            continue
+        first_b = min(b.frames)
+        for a in objs:
+            if a is b or max(a.frames) >= first_b or not compatible(a.label, b.label):
+                continue
+            sa, sb = _scale(a), _scale(b)
+            if min(sa, sb) <= 0 or max(sa, sb) > MOVE_SCALE * min(sa, sb):
+                continue
+            assert a.obb is not None and b.obb is not None
+            gap = (max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * a.obs_depth)
+                   + max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * b.obs_depth))
+            pa = OBB(a.obb.center, a.obb.R, a.obb.size + gap)
+            if obb_iou_upright(pa, OBB(b.obb.center, b.obb.R, b.obb.size + gap)) > 0 or \
+                    bool(pa.contains(b.centroid[None], 0.0)[0]):
+                continue
+            ca, cb = colours.of(a), colours.of(b)
+            if ca is None or cb is None:
+                continue
+            chroma = float(np.linalg.norm(ca[1:] - cb[1:]))
+            if chroma > MOVE_CHROMA or abs(float(ca[0] - cb[0])) > MOVE_LIGHTNESS:
+                continue
+            cands.append((chroma, a.id, b.id, a, b))
+    moves: list[Move] = []
+    used: set[int] = set()
+    for _, _, _, a, b in sorted(cands, key=lambda c: c[:3]):
+        if a.id in used or b.id in used:
+            continue
+        dep = places.verdicts(a, [f for f in order if f > max(a.frames)], detectable=True)
+        arr = places.verdicts(b, [f for f in order if f < min(b.frames)], detectable=True)
+        if not dep or not arr:
+            continue
+        if _judgement(a, dep) != "gone" and _judgement(b, arr, few=False) != "gone":
+            continue
+        last = max((v.frame for v in arr if v.share <= 1.0 - REMOVE_FRACTION), default=-1)
+        moves.append(Move(a, b, [v.frame for v in dep],
+                          [v for v in arr if v.share >= REMOVE_FRACTION and v.frame > last]))
+        used |= {a.id, b.id}
+    return moves
 
 
 def label_map_for(reader_instances: list[dict[str, Any]], shape: tuple[int, int],

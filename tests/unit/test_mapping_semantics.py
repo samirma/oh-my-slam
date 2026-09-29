@@ -306,49 +306,35 @@ def test_later_update_wins_over_an_earlier_one(tmp_path: Path) -> None:
     assert again.id > cab.id
 
 
-def _absence_view(room: Room, pose: Pose) -> tuple[Any, validity.View]:
-    from types import SimpleNamespace
-
-    r = render(room, pose, K)
-    rec = SimpleNamespace(stats={"observations": 500.0, "reproj_error": 0.5},
-                          pose_source="sfm-global")
-    return SimpleNamespace(record=rec), validity.View(r.depth, r.depth > 0, K, pose)
-
-
 def test_removal_needs_the_update_as_a_whole() -> None:
-    """Three keyframes that see through an object do not remove it when most of the update's
-    keyframes see it in place (monocular depth errors); an update that sees it in place clears
-    its strikes, one that sees through it with most keyframes removes it."""
-    box = Box(np.array([0.0, 0.0, 0.4]), np.array([0.6, 0.6, 0.8]), 0.0, (200, 60, 60), "box")
-    with_box, without = Room(boxes=[box]), Room(boxes=[])
-    rng = np.random.default_rng(0)
-    local = rng.uniform(-0.5, 0.5, (4000, 3)) * box.size
-    face = np.argmax(np.abs(local) / box.size, axis=1)
-    local[np.arange(len(local)), face] = np.sign(local[np.arange(len(local)), face]) \
-        * box.size[face] / 2
-    pts = (local + box.center).astype(np.float32)
-    pts = pts[pts[:, 2] > 0.35]  # near the floor, seeing through is within the margin anyway
-
+    """Keyframes that see through an object do not remove it when a later keyframe of the update
+    sees it in place (the latest wins; monocular depth errors); an update that sees it in place
+    clears its strikes, one whose latest keyframes see through it removes it. Absence, like
+    presence, needs two keyframes: one keyframe gives a strike, however established the
+    object."""
     def obj() -> MapObject:
-        return MapObject(4, "box", {"box": 4.0}, [0.9] * 4, pts, frames=[0, 1, 2, 3],
-                         confirmed=True)
+        return MapObject(4, "box", {"box": 4.0}, [0.9] * 4, np.zeros((10, 3), np.float32),
+                         frames=[0, 1, 2, 3], confirmed=True)
 
-    poses = ring(12)
-    through = {i: _absence_view(without, p) for i, p in enumerate(poses[:3])}
-    in_place = {i + 3: _absence_view(with_box, p) for i, p in enumerate(poses[3:])}
+    through = [objects.Verdict(i + 10, 0.95, True) for i in range(3)]
+    in_place = [objects.Verdict(i + 20, 0.05, True) for i in range(2)]
     o = obj()
     o.strikes = 1
-    assert objects._absence([o], {**through, **in_place}) == []
-    assert o.strikes == 0  # most keyframes saw it in place
-    o = obj()
-    assert objects._absence([o], through) == [4]  # >= 3 keyframes, all through
-    # a single keyframe: an established object (>= 4 detections) goes, a weak one gets a strike
-    one = {0: through[0]}
-    assert objects._absence([obj()], one) == [4]
+    assert objects._absence([o], {4: through + in_place}) == []
+    assert o.strikes == 0  # the latest keyframes saw it in place
+    later = [objects.Verdict(v.frame + 20, v.share, True) for v in through]
+    assert objects._absence([obj()], {4: in_place + later}) == [4]  # then gone: it went
+    assert objects._absence([obj()], {4: through}) == [4]  # >= 3 keyframes, all through
+    # two keyframes: an established object (>= 4 detections) goes, a weak one gets a strike
+    assert objects._absence([obj()], {4: through[:2]}) == [4]
     weak = obj()
     weak.frames = [0, 1]
-    assert objects._absence([weak], one) == [] and weak.strikes == 1
-    assert objects._absence([weak], one) == [4]  # a second strike (from a later update)
+    assert objects._absence([weak], {4: through[:2]}) == [] and weak.strikes == 1
+    assert objects._absence([weak], {4: through[:2]}) == [4]  # a second strike (a later update)
+    one = obj()
+    assert objects._absence([one], {4: through[:1]}) == [] and one.strikes == 1
+    # from poses few matches support: a strike
+    assert objects._absence([obj()], {4: [objects.Verdict(f, 0.95, False) for f in (0, 1)]}) == []
 
 
 def test_pixels_are_invalidated_only_when_the_update_as_a_whole_contradicts_them() -> None:
