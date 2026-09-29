@@ -25,7 +25,11 @@ from oh_my_slam.client.client import InferenceClient, connect
 from oh_my_slam.core import rle, timing
 
 DEFAULT_MIN_SCORE = 0.5
-DETECTION_FLOOR = 0.25  # score floor requested from the server; the lowest accepted --min-score
+# Score floor requested from the server, and so the lowest accepted --min-score (the spec sets no
+# bound). Lowering it never changes an object at or above TRUSTED_SCORE: detections are ordered
+# and de-duplicated by score first, those below TRUSTED_SCORE claim only pixels no trusted one
+# covers, and the detector suppresses a candidate only by a higher-scoring one.
+DETECTION_FLOOR = 0.05
 # Detections scoring at least this claim overlapping pixels before lower-scoring ones
 # (``claim_order``): the default threshold, so the default output never depends on detections
 # that are only reported with a lower --min-score.

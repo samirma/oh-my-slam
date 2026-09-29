@@ -28,7 +28,6 @@ def object_entry(obj: SceneObject, coordinate_system: str) -> Json:
         texts=[ol.text("color_hex", obj.color_hex)],
         vecs=[ol.vec("color", list(obj.color))]
         + ([ol.vec("detected_as", list(obj.labels))] if len(obj.labels) > 1 else []),
-        booleans=[ol.boolean("confirmed", obj.confirmed)],
         frame_ids=obj.frames or None,
     )
 

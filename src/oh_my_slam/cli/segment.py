@@ -25,6 +25,7 @@ from oh_my_slam.cli.common import (
     run_main,
 )
 from oh_my_slam.core import timing
+from oh_my_slam.core.atomic import preflight_dir
 from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.log import claim_stdout, get_logger, json_payload_bytes
@@ -115,7 +116,9 @@ def main(argv: list[str]) -> int:
     attrs = cloud_attrs_arg(args.attrs, scope,
                             writes_ply=args.format == "ply" or args.artifacts is not None,
                             requires="shape the PLY output: use -f ply or -d <folder>")
-    out = claim_stdout(args.output)
+    out = claim_stdout(args.output)  # -o is checked writable here, before any work
+    if args.artifacts is not None:
+        preflight_dir(args.artifacts, "-d")
     t0 = time.perf_counter()
     if on_map:
         from oh_my_slam.mapping.export import map_segment_outputs

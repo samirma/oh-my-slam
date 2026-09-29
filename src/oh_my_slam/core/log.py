@@ -19,8 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from oh_my_slam.core.atomic import atomic_write_bytes
-from oh_my_slam.core.errors import UsageError
+from oh_my_slam.core.atomic import atomic_write_bytes, preflight_file
 
 _LOGGER_NAME = "oh_my_slam"
 
@@ -49,13 +48,14 @@ def json_payload_bytes(obj: Any) -> bytes:
 
 class PayloadWriter:
     """Writes the single payload: to a stream (the saved real stdout) or, when ``path`` is given,
-    atomically to that file (created with its parent folders, replaced if it exists)."""
+    atomically to that file (created with its parent folders, replaced if it exists). A file that
+    cannot be written is a usage error, raised when the writer is made."""
 
     def __init__(self, stream: BinaryIO | None = None, path: Path | None = None) -> None:
         if (stream is None) == (path is None):
             raise ValueError("give exactly one of stream and path")
-        if path is not None and Path(path).is_dir():
-            raise UsageError(f"-o {path} is a folder; give the path of the file to write")
+        if path is not None:
+            preflight_file(Path(path), "-o")  # before any work: exit 2 rather than a late failure
         self._stream = stream
         self._path = None if path is None else Path(path)
         self._written = False

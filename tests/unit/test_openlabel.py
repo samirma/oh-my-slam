@@ -34,7 +34,6 @@ def single_image_example() -> dict:
         nums=[ol.num("score", 0.91), ol.num("pixel_count", 1200), ol.num("point_count", 800)],
         texts=[ol.text("color_hex", "#e6194b")],
         vecs=[ol.vec("color", [230, 25, 75])],
-        booleans=[ol.boolean("confirmed", True)],
     )
     return ol.document(
         ol.metadata("restaurant", tagged_file="restaurant.jpg", intrinsics_source="exif"),

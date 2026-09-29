@@ -157,10 +157,6 @@ def vec(name: str, val: Sequence[float | int | str]) -> Json:
     return {"name": name, "val": list(val)}
 
 
-def boolean(name: str, val: bool) -> Json:
-    return {"name": name, "val": bool(val)}
-
-
 def object_entry(
     name: str,
     type_: str,
@@ -169,7 +165,6 @@ def object_entry(
     nums: Sequence[Json] = (),
     texts: Sequence[Json] = (),
     vecs: Sequence[Json] = (),
-    booleans: Sequence[Json] = (),
     frame_ids: Sequence[int] | None = None,
 ) -> Json:
     data: Json = {}
@@ -181,8 +176,6 @@ def object_entry(
         data["text"] = list(texts)
     if vecs:
         data["vec"] = list(vecs)
-    if booleans:
-        data["boolean"] = list(booleans)
     obj: Json = {
         "name": name,
         "type": type_,

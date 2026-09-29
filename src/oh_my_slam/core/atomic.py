@@ -9,9 +9,32 @@ from typing import Any
 
 import numpy as np
 
+from oh_my_slam.core.errors import UsageError
+
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 _FILE_MODE = 0o666 & ~_UMASK  # mkstemp creates 0600; published files get the usual mode
+
+
+def preflight_dir(folder: Path, option: str) -> None:
+    """Create ``folder`` (with its parents) and prove that a file can be written in it, so that
+    ``-o`` / ``-d`` targets fail before any work starts; a usage error (exit 2) names the path."""
+    folder = Path(folder)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError as exc:
+        raise UsageError(f"{option} {folder}: cannot write there ({exc.strerror or exc})") from exc
+
+
+def preflight_file(path: Path, option: str) -> None:
+    """``preflight_dir`` for the folder of a file the command will write, which must not be a
+    folder itself."""
+    path = Path(path)
+    if path.is_dir():
+        raise UsageError(f"{option} {path} is a folder; give the path of the file to write")
+    preflight_dir(path.parent, option)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:

@@ -124,6 +124,35 @@ def test_store_lock_delete_and_folder_rules(tmp_path: Path) -> None:
     assert store.classify(f) == "other"
 
 
+def test_folder_is_empty_only_without_entries_or_with_tool_leftovers(tmp_path: Path) -> None:
+    """Spec 2.3: a map is created when the folder is missing or empty. A `.git` (or any other
+    hidden entry) makes it non-empty and is refused untouched; `.DS_Store` and this tool's own
+    `.lock` / `.staging` leftovers do not."""
+    nothing = tmp_path / "nothing"
+    nothing.mkdir()
+    only_ds = tmp_path / "ds"
+    only_ds.mkdir()
+    (only_ds / ".DS_Store").write_text("")
+    leftovers = tmp_path / "leftovers"
+    (leftovers / ".staging").mkdir(parents=True)
+    (leftovers / ".lock").write_text("")
+    for empty in (nothing, only_ds, leftovers):
+        assert store.classify(empty) == "empty", empty
+        with store.MapTransaction(empty) as tx:
+            assert tx.created
+    dotgit = tmp_path / "dotgit"
+    (dotgit / ".git").mkdir(parents=True)
+    hidden_file = tmp_path / "hidden_file"
+    hidden_file.mkdir()
+    (hidden_file / ".env").write_text("x")
+    for other in (dotgit, hidden_file):
+        before = sorted(p.name for p in other.iterdir())
+        assert store.classify(other) == "other", other
+        with pytest.raises(NotAMapError), store.MapTransaction(other):
+            pass
+        assert sorted(p.name for p in other.iterdir()) == before  # untouched, no .lock either
+
+
 def test_frame_record_roundtrip() -> None:
     rec = store.FrameRecord(3, "f000003", "frames/f000003.jpg", "x.jpg", 1, 640, 480,
                             Intrinsics(500, 500, 320, 240, 640, 480, "colmap"),

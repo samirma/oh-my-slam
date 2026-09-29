@@ -4,7 +4,7 @@
     view.sh -m <map-folder>   open a persisted map read-only (no server needed)
 
 Binds 127.0.0.1 on a free port (or --port), opens the default browser unless --no-browser, and
-serves until Ctrl-C. Nothing is written to stdout. Once the server accepts connections, stderr
+serves until Ctrl-C or SIGTERM (both exit 0). Nothing is written to stdout. Once the server accepts connections, stderr
 carries exactly one line of the form (``URL_LINE``)::
 
     view.sh: listening on http://127.0.0.1:<port>/
@@ -16,6 +16,7 @@ drawn (and keeps it), or ``data-error="<message>"`` if loading fails.
 from __future__ import annotations
 
 import re
+import signal
 import sys
 import webbrowser
 from pathlib import Path
@@ -27,6 +28,18 @@ from oh_my_slam.core.log import claim_stdout, get_logger
 PROG = "view.sh"
 URL_LINE = re.compile(r"^view\.sh: listening on (http://127\.0\.0\.1:\d+/)$")
 log = get_logger("oh_my_slam.cli.view")
+
+
+def _stop_on_signal(signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+def _install_stop_handlers() -> None:
+    """Ctrl-C and SIGTERM are the normal stop. A process started as a shell background job
+    inherits SIGINT as ignored, and Python then installs no handler of its own, so both are set
+    explicitly."""
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, _stop_on_signal)
 
 
 def build_parser() -> ArgumentParser:
@@ -55,14 +68,15 @@ def main(argv: list[str]) -> int:
         bundle = image_bundle(args.image, client)
     else:
         bundle = map_bundle(args.map)
+    _install_stop_handlers()
     httpd = serve(bundle, args.port)
-    url = url_of(httpd)
-    print(f"{PROG}: listening on {url}", file=sys.stderr, flush=True)
-    print(f"{PROG}: showing {bundle.mode} '{bundle.title}' (Ctrl-C to stop)", file=sys.stderr,
-          flush=True)
-    if not args.no_browser:
-        webbrowser.open(url)
     try:
+        url = url_of(httpd)
+        print(f"{PROG}: listening on {url}", file=sys.stderr, flush=True)
+        print(f"{PROG}: showing {bundle.mode} '{bundle.title}' (Ctrl-C to stop)", file=sys.stderr,
+              flush=True)
+        if not args.no_browser:
+            webbrowser.open(url)
         httpd.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass

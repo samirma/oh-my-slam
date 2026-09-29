@@ -114,7 +114,10 @@ def test_failures_become_records(tmp_path: Path) -> None:
     script(repo, "segment.sh", 'echo "loading" >&2\necho "segment.sh: error: server down" >&2\n'
                                "exit 3")
     (repo / "mapper.sh").write_text("not executable")
-    script(repo, "view.sh", "sleep 30")
+    # like view.sh, stop on Ctrl-C even when started as a background job (SIGINT ignored)
+    script(repo, "view.sh", "import signal, time\n"
+                            "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+                            "time.sleep(30)", shebang=f"#!{sys.executable}")
     runner = Runner(tmp_path / "out", repo)
     failed = runner.run(RunSpec("seg", "g", "segment.sh"))
     assert not failed.ok and failed.exit_code == 3
@@ -212,7 +215,8 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     assert "**Result: FAIL**" in md.read_text()
 
 
-VIEW = """import http.server, os, sys
+VIEW = """import http.server, os, signal, sys
+signal.signal(signal.SIGINT, signal.default_int_handler)  # a background job starts with it ignored
 SCENE = open(os.environ["FAKE_SCENE"], "rb").read()
 CLOUD = open(os.environ["FAKE_CLOUD"], "rb").read()
 PAGE = os.environ.get("FAKE_PAGE", "").encode()

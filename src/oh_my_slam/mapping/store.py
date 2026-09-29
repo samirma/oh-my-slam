@@ -155,8 +155,13 @@ class FrameRecord:
         )
 
 
+# Entries that may sit in a folder that still counts as empty: what macOS and this tool leave
+# behind. Any other entry, hidden or not (a `.git`), makes the folder non-empty.
+TOOL_ENTRIES = frozenset({".DS_Store", LOCK, STAGING})
+
+
 def classify(root: Path) -> str:
-    """'missing', 'empty' (only hidden entries), 'map' or 'other'."""
+    """'missing', 'empty' (no entry, or only ``TOOL_ENTRIES``), 'map' or 'other'."""
     root = Path(root)
     if not root.exists():
         return "missing"
@@ -164,8 +169,7 @@ def classify(root: Path) -> str:
         return "other"
     if (root / MAP_JSON).is_file():
         return "map"
-    visible = [p for p in root.iterdir() if not p.name.startswith(".")]
-    return "empty" if not visible else "other"
+    return "other" if any(p.name not in TOOL_ENTRIES for p in root.iterdir()) else "empty"
 
 
 def _committed_manifest(root: Path) -> list[str] | None:

@@ -27,10 +27,17 @@ def sh(script: str, *args: str) -> subprocess.CompletedProcess[bytes]:
                           env=os.environ.copy())
 
 
-def start_view(*args: str) -> tuple[subprocess.Popen[bytes], str, list[str]]:
-    """Start view.sh; returns the process, its URL and the stderr lines up to the URL line."""
+def _ignore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # what a shell `&` job starts with
+
+
+def start_view(*args: str, background_job: bool = False
+               ) -> tuple[subprocess.Popen[bytes], str, list[str]]:
+    """Start view.sh; returns the process, its URL and the stderr lines up to the URL line.
+    ``background_job`` starts it with SIGINT ignored, as a shell ``&`` job would."""
     proc = subprocess.Popen([str(REPO / "view.sh"), *args, "--no-browser"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy(),
+                            preexec_fn=_ignore_sigint if background_job else None)
     assert proc.stderr is not None
     lines: list[str] = []
     while True:
@@ -44,9 +51,20 @@ def start_view(*args: str) -> tuple[subprocess.Popen[bytes], str, list[str]]:
             return proc, m.group(1), lines
 
 
-def stop_view(proc: subprocess.Popen[bytes]) -> bytes:
-    proc.send_signal(signal.SIGINT)
-    out, _ = proc.communicate(timeout=20)
+def stop_view(proc: subprocess.Popen[bytes], sig: signal.Signals = signal.SIGINT) -> bytes:
+    """Stop view.sh with ``sig``; it must exit 0 within 5 s. A server that does not is killed, so
+    a failing test never leaves one running."""
+    try:
+        proc.send_signal(sig)
+        out, _ = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise AssertionError(f"view.sh did not stop on {sig.name} within 5 s") from None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     assert proc.returncode == 0
     return out
 
@@ -92,14 +110,20 @@ def test_view_image_controls_work_without_the_server(image: Path) -> None:
     assert out == b""
 
 
+def minimal_map(root: Path) -> Path:
+    from oh_my_slam.mapping import store
+
+    with store.MapTransaction(root) as tx:
+        tx.write_json(store.FRAMES_JSON, {"frames": []})
+        tx.commit({"update_count": 1})
+    return root
+
+
 def test_view_map_serves_without_server(tmp_path: Path) -> None:
     """A minimal map folder is served read-only; the URL goes to stderr, stdout stays empty."""
     from oh_my_slam.mapping import store
 
-    root = tmp_path / "m"
-    with store.MapTransaction(root) as tx:
-        tx.write_json(store.FRAMES_JSON, {"frames": []})
-        tx.commit({"update_count": 1})
+    root = minimal_map(tmp_path / "m")
     before = store.full_tree_hash(root)
     proc, url, lines = start_view("-m", str(root))
     try:
@@ -111,3 +135,35 @@ def test_view_map_serves_without_server(tmp_path: Path) -> None:
         out = stop_view(proc)
     assert out == b""
     assert store.full_tree_hash(root) == before
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_view_stops_on_signal_even_as_a_background_job(tmp_path: Path, sig: signal.Signals
+                                                       ) -> None:
+    """Ctrl-C and SIGTERM are the normal stop (exit 0, stdout empty) — also for a process that
+    starts with SIGINT ignored, as every shell `&` job does."""
+    proc, _url, _ = start_view("-m", str(minimal_map(tmp_path / "m")), background_job=True)
+    t0 = time.monotonic()
+    assert stop_view(proc, sig) == b""
+    assert time.monotonic() - t0 < 5.0
+
+
+def test_view_usage_errors(tmp_path: Path, image: Path) -> None:
+    """Neither -i nor -m, both, and a missing image are usage errors (2); an existing folder that
+    is not a map is exit 4. None of them starts a server, writes to stdout or needs one."""
+    plain = tmp_path / "not_a_map"
+    plain.mkdir()
+    (plain / "a.txt").write_text("x")
+    map_dir = minimal_map(tmp_path / "m")
+    cases = {
+        "neither": ([], 2),
+        "both": (["-i", str(image), "-m", str(map_dir)], 2),
+        "missing image": (["-i", str(tmp_path / "nope.jpg")], 2),
+        "not a map": (["-m", str(plain)], 4),
+        "missing map folder": (["-m", str(tmp_path / "nope")], 4),
+    }
+    for name, (args, code) in cases.items():
+        res = sh("view.sh", *args, "--no-browser")
+        assert res.returncode == code, (name, res.stderr)
+        assert res.stdout == b"" and b"view.sh" in res.stderr, name
+    assert [p.name for p in plain.iterdir()] == ["a.txt"]

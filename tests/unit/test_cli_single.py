@@ -186,6 +186,10 @@ def test_segment_min_score_keeps_ids_and_colours(env) -> None:  # type: ignore[n
     for k, o in hi.items():
         assert o == full[k]  # same id, label, colour and OBB
         assert o["object_data"]["num"][0]["val"] >= 0.8
+    # the spec sets no lower bound: a low threshold is accepted and only adds objects
+    assert cli_segment.main(["-i", str(img), "--min-score", "0.1"]) == 0
+    low = json.loads(cap.take())["openlabel"]["objects"]
+    assert {k: low[k] for k in full} == full
 
 
 def test_segment_output_file_and_no_files_by_default(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -205,7 +209,7 @@ def test_segment_usage_errors(env, tmp_path: Path) -> None:  # type: ignore[no-u
     for args in (["-m", str(tmp_path), "--min-score", "0.6"],
                  ["-i", str(img), "--min-score", "abc"],
                  ["-i", str(img), "--min-score", "1.5"],
-                 ["-i", str(img), "--min-score", "0.1"],  # below the detection floor
+                 ["-i", str(img), "--min-score", "0.01"],  # below the detection floor
                  ["-i", str(img), "-p", "voxel=0.1"],  # -p needs -f ply or -d
                  ["-i", str(img), "-f", "ply", "-p", "color=rgb"],  # colour fixed to segment
                  ["-m", str(tmp_path), "-f", "ply", "-p", "stride=2"]):  # pixel-level on a map

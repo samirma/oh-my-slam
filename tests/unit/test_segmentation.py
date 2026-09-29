@@ -234,6 +234,35 @@ def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: i
         segment_frame(frame, client=client, min_score=detect.DETECTION_FLOOR / 2)
 
 
+def test_low_scoring_detections_never_change_the_default_objects(overlapping) -> None:  # type: ignore[no-untyped-def]
+    """The spec sets no lower bound on --min-score, so the detector is asked for scores down to
+    ``DETECTION_FLOOR`` (0.05). Detections below the default 0.5 — however many, whatever they
+    cover — leave the objects at 0.5 with the same ids, colours, masks, points and OBBs."""
+    client, img = overlapping
+    frame = reconstruct_image(img, client=client)
+    dets = detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR)
+    h, w = frame.depth.shape
+    everywhere = np.ones((h, w), bool)
+    middle = np.zeros((h, w), bool)
+    middle[h // 4: 3 * h // 4, w // 4: 3 * w // 4] = True
+    low = [detect.Detection("chair", 0.2, "yoloe", everywhere, (0.0, 0.0, float(w), float(h))),
+           detect.Detection("lamp", 0.08, "yoloe", middle,
+                            (w / 4, h / 4, 3 * w / 4, 3 * h / 4)),
+           detect.Detection("cup", 0.06, "yoloe", middle[::-1], (0.0, 0.0, 1.0, 1.0))]
+
+    def signature(detections: list[detect.Detection], min_score: float) -> dict[int, tuple]:
+        seg = segment_frame(frame, client=client, detections=detections, min_score=min_score)
+        return {o.id: (o.label, o.score, o.color, o.obb.center.tolist(), o.obb.size.tolist(),
+                       np.flatnonzero(seg.label_map == o.id).tolist(),
+                       seg.points[o.id].tolist()) for o in seg.objects}
+
+    plain = signature(dets, 0.5)
+    assert plain and signature(dets + low, 0.5) == plain
+    assert signature(dets, 0.5) == signature(dets + low[:1], 0.5)
+    everything = signature(dets + low, detect.DETECTION_FLOOR)  # the lowest --min-score works
+    assert {oid: everything[oid] for oid in plain} == plain and len(everything) > len(plain)
+
+
 def test_segment_frame_does_not_depend_on_the_detection_order(overlapping) -> None:  # type: ignore[no-untyped-def]
     client, img = overlapping
     ref = _objects(client, img, 0.3)
@@ -259,6 +288,7 @@ def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  #
         assert entry["type"] == o.label and entry["name"] == f"{o.label} {o.id}"
         assert entry["object_data"]["text"][0]["val"] == o.color_hex
         assert entry["object_data"]["vec"][0]["val"] == list(o.color)
+        assert "boolean" not in entry["object_data"]  # every listed object is an object
     md = scene["openlabel"]["metadata"]
     assert md["intrinsics_source"] == "model" and md["gravity"]["source"].startswith("geocalib")
 

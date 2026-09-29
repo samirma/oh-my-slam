@@ -94,12 +94,14 @@ to stdout.
   * Image types: jpg, jpeg, png, bmp, tif, tiff, webp, heic, heif.
   * Video types: mp4, mov, m4v, avi, mkv, webm.
 * **`-m`** is the map folder:
-  * A folder that is missing, or that contains only hidden entries, becomes a new map.
+  * A folder that is missing or empty becomes a new map. A folder holding nothing but a
+    `.DS_Store` or this tool's own `.lock` / `.staging` leftovers is empty. Any other entry makes
+    it non-empty, hidden ones too: a folder with only a `.git` is refused.
   * A map is extended.
   * Any other folder is refused and left untouched (exit 4).
 * **`-t`** sets the scope of the result (default `full`):
-  * `full` returns the whole map: every exported object and every keyframe pose. With `-f ply`
-    it returns the whole map cloud.
+  * `full` returns the whole map: every object (see *Update semantics* for when a detection is an
+    object of the map) and every keyframe pose. With `-f ply` it returns the whole map cloud.
   * `single` returns only the keyframes added by this update and the objects they observe. With
     `-f ply` it returns the points those keyframes see.
 * **`-fps`** applies to video only (default `2`). The command keeps the sharpest frame in each
@@ -124,12 +126,15 @@ Exactly one of `-i` and `-m` is required.
 * **`-p`** shapes both the `-f ply` output and `segments.ply`, so it needs `-f ply` or `-d`.
   `color` is fixed to `segment`, and any other value is refused. With `-m`, the pixel-level keys
   are refused.
-* **`--min-score S`** applies to `-i` only (default `0.5`). Allowed values are `[0.25, 1]`.
+* **`--min-score S`** applies to `-i` only (default `0.5`). Allowed values are `[0.05, 1]`. The spec sets no
+  bound; 0.05 is the lowest score the detector is asked for.
 
 `--min-score` only adds or removes objects. The objects kept at two thresholds have the same id,
 colour, mask, points and box, for these reasons:
 
-* The detector is always asked for every detection scoring above the fixed floor of 0.25.
+* The detector is always asked for every detection scoring above the fixed floor of 0.05. The
+  floor has no effect on the default output: detections below 0.5 are dropped by the default
+  threshold, never claim pixels from one at or above it, and rank after it in ids.
 * Overlapping masks are resolved among all of those detections before the threshold applies.
   Every pixel goes to at most one detection:
   * Detections scoring 0.5 or more claim pixels first, smallest mask first. A nested object
@@ -273,8 +278,9 @@ The same source and attributes always give byte-identical files.
   PLY, and no banners or progress. The commands redirect fd 1 to stderr before any library runs,
   so output from native code (COLMAP, Open3D) lands on stderr too.
 * **`-o FILE`** (`reconstruct.sh`, `mapper.sh`, `segment.sh`) writes that payload atomically to
-  `FILE`, creating parent folders, and leaves stdout empty. `-o` naming a folder is a usage
-  error.
+  `FILE`, creating parent folders, and leaves stdout empty. A `-o` target (and a `segment.sh -d`
+  folder) that is a folder, or where nothing can be written, is a usage error (exit 2) raised
+  before the server is contacted or any work starts.
 * **stderr** gets everything human-facing. Log lines start with `[oh-my-slam]`, and errors look
   like `<command>: error: …`.
 * **Timing summary.** `reconstruct.sh`, `segment.sh` and `mapper.sh update` each log a
@@ -291,7 +297,7 @@ The same source and attributes always give byte-identical files.
 | 4 | `-m` folder is not empty and not a map (`mapper.sh`), or is not a map (`segment.sh -m`, `view.sh -m`). |
 | 5 | Nothing could be registered, for example because the new images do not overlap the map. The map is unchanged. |
 | 6 | Another `mapper.sh update` holds the map lock. |
-| 130 | Interrupted (Ctrl-C). `view.sh` treats Ctrl-C as its normal stop and exits 0. |
+| 130 | Interrupted (Ctrl-C). `view.sh` treats Ctrl-C and SIGTERM as its normal stop and exits 0, also when it was started as a shell background job. |
 
 ## Coordinate conventions
 
@@ -350,7 +356,6 @@ Each object is keyed by its id as a string and has these fields:
 | `object_data.num` | `score`, `pixel_count`, `point_count`, `observations` |
 | `object_data.text` | `color_hex` |
 | `object_data.vec` | `color` `[r, g, b]`; for a map object detected under several labels, also `detected_as` (every label, most evidence first) |
-| `object_data.boolean` | `confirmed` |
 | `frame_intervals` | the frames that detected the object |
 
 For a map object, `score` is the mean of its three best detection scores, and `point_count` is
@@ -488,7 +493,11 @@ point leaves the map untouched. One killed after it is completed by the next upd
     at most 0.3 m apart. The second test catches pieces that monocular depth of a close surface
     placed apart (the kitchen island's corner, 0.5 m below the camera, placed 10 cm lower by the
     keyframes that close the loop). At floor height it is not used: the floor joins anything.
-  * An object is exported once it is confirmed: detected with a reliable mask (not mostly in the
+  * **Every object of the map is a confirmed one.** A detection is only a candidate until it is
+    confirmed, and a candidate is not an object of the map: `-t full` and `segment.sh -m` list
+    every object, that is every confirmed candidate (`-t single` those that the new frames
+    observe), and the scene JSON carries no confirmed flag, since every object in it is. A
+    candidate is confirmed once it is detected with a reliable mask (not mostly in the
     image-border band, where the object is cut off and monocular depth is unreliable) in at
     least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
     ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
@@ -512,8 +521,9 @@ point leaves the map untouched. One killed after it is completed by the next upd
     no surface of its own in the cloud, and the points near its far-placed lifted points are
     other surfaces. An object stays short when its surface did not survive the fusion (seen by
     fewer than 3 keyframes, such as a pendant lamp) or when its detections are all beyond the
-    fused depth and do not meet the cloud; it is then not exported.
-  * Unconfirmed objects are kept, so that a later update can still confirm them.
+    fused depth and do not meet the cloud; it is then still a candidate.
+  * Unconfirmed candidates are kept in the map's state, so that a later update can still confirm
+    them; they are never emitted, in any format or scope.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
@@ -553,7 +563,7 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
 2. **Depth:** MoGe-2 metric depth on a grid whose long side is at most 1024 px. Point colours
    are the resized pixels.
 3. **Gravity:** GeoCalib, refined by a RANSAC floor plane within 5°.
-4. **Detection:** YOLOE detections above the 0.25 floor. Background labels (wall, floor,
+4. **Detection:** YOLOE detections above the 0.05 floor. Background labels (wall, floor,
    ceiling, …) are prompted but never reported. Masks under 64 px are dropped, and duplicates
    across labels are removed (mask IoU > 0.7, higher priority wins).
 5. **Exclusive masks and lifting:** the claim order above gives every pixel at most one owner,
