@@ -699,7 +699,10 @@ Geometry and detection requests run concurrently on two connections.
      random start, and its orientation rests on that link alone. After SfM:
      1. An SfM pose needs 20 triangulated points. Keyframes with fewer are not accepted as posed
         (a stretch shrunk onto a point triangulates nothing); incremental mapping with the others
-        fixed may register them again.
+        fixed may register them again. After step 2, a pose that contradicts the keyframe's own
+        verified matches (median symmetric epipolar distance above 0.25°; correct poses stay
+        within about 0.1°) is not accepted either: on the 6-photo office map the global mapper
+        settled one keyframe on 67 matches to one neighbour against 931 to two others.
      2. Each keyframe's SfM scale is measured against its MoGe depth (median depth ratio at its
         triangulated points), and its tilt against its GeoCalib gravity (1–3° on correctly posed
         keyframes). Co-visible keyframes whose ratios agree within 15 % and gravity within 10°
@@ -721,10 +724,16 @@ Geometry and detection requests run concurrently on two connections.
 
      Keyframes with no verified match to the rest are left out and listed. `map.json`
      (`updates[].notes.sfm_unsupported`, `sfm_join`) records what was re-placed and how.
-   * **Update:** incremental mapping runs with the map's keyframes fixed, and the result is
-     mapped back onto the map frame. A result that moved the fixed keyframes is discarded.
-     Keyframes it cannot place, or whose depth contradicts the pose, are posed by anchored
-     MapAnything.
+   * **Update:** photos of the same size whose EXIF focal length matches an existing camera's
+     prior (the same device and zoom) share that camera, and so its refined focal length;
+     without EXIF, frames of the same size share it as before. Incremental mapping continues
+     the stored model only (no further models), with the map's keyframes and cameras fixed and
+     a fixed random seed, and the result is mapped back onto the map frame. A fixed keyframe
+     that COLMAP dropped and registered again elsewhere (a weakly supported stored pose) is left
+     out of that similarity and keeps its stored pose; a result that moved most of them is
+     discarded. New cameras keep the focal length the extension refined. Keyframes it cannot
+     place, whose depth contradicts the pose, or whose pose contradicts their verified matches
+     (as above) are posed by anchored MapAnything and refined with the matches and depth.
    * **Maps with fewer than 3 keyframes:** SfM is re-run over all keyframes and aligned to the
      stored poses.
    * If no new keyframe overlaps the map, the command exits 5 and the map is unchanged.

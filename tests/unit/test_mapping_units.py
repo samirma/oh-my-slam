@@ -564,6 +564,7 @@ class _PoseModel:
 
     def __init__(self, poses: dict[str, Pose]) -> None:
         self.poses = dict(poses)
+        self.notes: dict[str, object] = {}
 
     @property
     def registered(self) -> list[str]:
@@ -578,8 +579,11 @@ class _PoseModel:
 
 def test_incremental_extension_is_brought_back_onto_the_map() -> None:
     """COLMAP returns an extended model re-normalised by a similarity (fixed frames included):
-    it is mapped back so the fixed frames sit at their stored poses; a model whose fixed frames
-    did not stay rigid is rejected."""
+    it is mapped back so the fixed frames sit at their stored poses. A fixed frame COLMAP dropped
+    and registered again elsewhere (a weakly supported stored pose) is left out of the similarity
+    and reported — the new frames, registered on the others, still land in the map frame (office
+    split: one re-placed keyframe discarded the whole extension, and every new keyframe fell back
+    to multi-view poses decimetres off). A model whose fixed frames mostly moved is rejected."""
     from oh_my_slam.mapping.sfm import _back_onto
 
     rng = np.random.default_rng(1)
@@ -587,16 +591,96 @@ def test_incremental_extension_is_brought_back_onto_the_map() -> None:
               for i in range(5)}
     new = {"n0": look_at(np.array([2.5, 0.3, 1.4]), np.array([0.0, 0.0, 0.4]))}
     R = rotation_between([0, 0, 1], [0.2, 0.5, 0.8])
-    out = _PoseModel({**stored, **new})
-    out.transform(3.7, R, np.array([1.0, -2.0, 0.5]))  # COLMAP's normalisation
+
+    def colmap_output(poses: dict[str, Pose]) -> _PoseModel:
+        out = _PoseModel(poses)
+        out.transform(3.7, R, np.array([1.0, -2.0, 0.5]))  # COLMAP's normalisation
+        return out
+
+    out = colmap_output({**stored, **new})
     sim = mframe.similarity_by_poses([out.pose(n) for n in stored], list(stored.values()))
     assert sim.s == pytest.approx(1 / 3.7)
     back = _back_onto(out, _PoseModel(stored))  # type: ignore[arg-type]
-    assert back is not None
+    assert back is not None and "moved_fixed" not in back.notes
     for n, T in {**stored, **new}.items():
         np.testing.assert_allclose(back.pose(n).matrix(), T.matrix(), atol=1e-9)
-    moved = _PoseModel({**stored, "f0": Pose(stored["f0"].R, stored["f0"].t + [0.8, 0, 0])})
-    assert _back_onto(moved, _PoseModel(stored)) is None  # type: ignore[arg-type]
+    replaced = Pose(rot_z(0.05) @ stored["f0"].R, stored["f0"].t + [0.08, 0, 0])
+    back = _back_onto(colmap_output({**stored, "f0": replaced, **new}),  # type: ignore[arg-type]
+                      _PoseModel(stored))  # type: ignore[arg-type]
+    assert back is not None and back.notes["moved_fixed"] == ["f0"]
+    for n, T in {**{k: v for k, v in stored.items() if k != "f0"}, **new}.items():
+        np.testing.assert_allclose(back.pose(n).matrix(), T.matrix(), atol=1e-9)
+    moved = {n: Pose(T.R, T.t + rng.normal(0, 0.5, 3)) for n, T in stored.items()
+             if n in ("f0", "f1", "f2")}
+    assert _back_onto(colmap_output({**stored, **moved}),  # type: ignore[arg-type]
+                      _PoseModel(stored)) is None  # type: ignore[arg-type]
+
+
+def test_poses_that_contradict_their_matches_are_found() -> None:
+    """``sfm.contradicted``: exact matches of five keyframes looking at one scene; one keyframe
+    posed 0.5° off (the 6-photo office map's global-mapper pose of f000005 was 0.43° off its
+    matches, every correct pose within 0.12°) is found — and only it, although its partners'
+    pairs share its error. Two cameras at one centre agree for any translation direction when
+    their rotations do."""
+    from oh_my_slam.mapping.panorama import PairMatches
+    from oh_my_slam.mapping.sfm import contradicted, epipolar_deg
+
+    K = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480)
+    rng = np.random.default_rng(3)
+    X = rng.uniform([-1.5, -1.0, -0.5], [1.5, 1.0, 1.5], (400, 3)) + [0.0, 0.0, 0.0]
+    poses = {f"k{i}": look_at(np.array([4.0 * np.cos(a), 4.0 * np.sin(a), 1.2]),
+                              np.array([0.0, 0.0, 0.3]))
+             for i, a in enumerate(np.linspace(0.0, 0.8, 5))}
+
+    def project(T: Pose) -> np.ndarray:
+        pc = T.inverse().apply(X)
+        return np.column_stack([K.fx * pc[:, 0] / pc[:, 2] + K.cx, K.fy * pc[:, 1] / pc[:, 2] + K.cy])
+
+    uv = {n: project(T) for n, T in poses.items()}
+    names = sorted(poses)
+    matches = [PairMatches(a, b, uv[a], uv[b]) for i, a in enumerate(names) for b in names[i + 1:]]
+    Ks = {n: K for n in names}
+    assert contradicted(poses, Ks, matches) == {}
+    off = dict(poses, k2=Pose(rotation_between([0, 0, 1], [np.sin(np.radians(0.5)), 0,
+                                                            np.cos(np.radians(0.5))])
+                              @ poses["k2"].R, poses["k2"].t))
+    bad = contradicted(off, Ks, matches)
+    assert list(bad) == ["k2"] and 0.25 < bad["k2"] < 1.0
+    # a pure rotation: any translation direction fits the matches of a correct rotation
+    turned = Pose(rot_z(0.2) @ poses["k0"].R, poses["k0"].t)
+    uv_turned = project(turned)
+    for d in ([0.3, -0.5, 0.8], [-1.0, 0.2, 0.1]):
+        posed = Pose(turned.R, turned.t + 1e-3 * np.array(d))
+        assert epipolar_deg(poses["k0"], K, posed, K, uv["k0"], uv_turned).max() < 1e-6
+
+
+def test_incremental_extension_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An extension continues the stored model only (COLMAP's further models restart from the
+    images left — the stored ones included — in an unrelated frame), holds the map's cameras and
+    is seeded; mapping from scratch keeps COLMAP's defaults."""
+    import pycolmap
+
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    seen: list[object] = []
+
+    def fake(db: str, images: str, out: str, opts: object, input_path: str = "") -> dict:
+        seen.append(opts)
+        return {}
+
+    monkeypatch.setattr(pycolmap, "incremental_mapping", fake)
+    model = tmp_path / "model"
+    model.mkdir()
+    pycolmap.Reconstruction().write(str(model))
+    s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
+    assert s.map_incremental(tmp_path / "a") is None
+    assert s.map_incremental(tmp_path / "b", input_path=model, fix_existing=True,
+                             constant_cameras={1}) is None
+    scratch, ext = seen
+    assert scratch.multiple_models and scratch.random_seed == -1  # type: ignore[attr-defined]
+    assert not ext.multiple_models and ext.fix_existing_frames  # type: ignore[attr-defined]
+    assert ext.random_seed == sfm_mod.EXTEND_SEED  # type: ignore[attr-defined]
+    assert set(ext.constant_cameras) == {1}  # type: ignore[attr-defined]
 
 
 def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None:

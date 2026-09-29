@@ -7,10 +7,13 @@ adjustment run through pycolmap on the same database. Both must be 4.2.x.
 New map: global mapping (GLOMAP) → incremental if < 60 % placed → multi-view (MapAnything)
 poses refined with the verified matches and monocular depth (``panorama``) + triangulation.
 Rotation-dominant input goes straight to the multi-view path. SfM poses without triangulated
-support are not accepted (``vet``); the mapper then joins what the main reconstruction lacks or
-got wrong in scale or tilt (``mapping.trajectory``).
-Update: incremental mapping with the existing frames fixed; keyframes it cannot place (all of
-them for rotation-dominant input) get anchored, refined multi-view poses.
+support are not accepted (``vet``), nor are poses that contradict their own verified matches
+(``contradicted``); the mapper then joins what the main reconstruction lacks or got wrong in
+scale or tilt (``mapping.trajectory``).
+Update: photos of the device that took the map's share its camera (``Sfm.existing_camera``);
+incremental mapping continues the stored model with its frames and cameras fixed (``_back_onto``
+maps it back); keyframes it cannot place (all of them for rotation-dominant input) get anchored,
+refined multi-view poses.
 """
 
 from __future__ import annotations
@@ -77,12 +80,18 @@ def _run(args: list[str], log_path: Path) -> None:
         raise SfmError(f"colmap {args[0]} failed ({res.returncode}): " + " | ".join(tail))
 
 
+FOCAL_MATCH_REL = 0.01  # EXIF focal priors this close are the same camera (device and zoom)
+
+
 @dataclass
 class CameraPrior:
     width: int
     height: int
     focal: float | None = None  # full-resolution pixels
-    existing_id: int | None = None
+    existing_id: int | None = None  # reuse this database camera (same image size)
+    # else the first of these database cameras of the same image size whose focal prior is
+    # ``focal`` (within ``FOCAL_MATCH_REL``): photos of the same device, with EXIF, in a later update
+    same_focal_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -187,6 +196,7 @@ class SfmModel:
 
 FIXED_ROT_TOL_DEG = 2.0
 FIXED_POS_TOL = 0.05  # of the fixed frames' spread
+EXTEND_SEED = 0  # random seed of incremental extensions (COLMAP's default -1 is time-seeded)
 
 
 def vet(model: SfmModel, rotation_pairs: set[frozenset[str]]) -> dict[str, list[str]]:
@@ -212,28 +222,110 @@ def vet(model: SfmModel, rotation_pairs: set[frozenset[str]]) -> dict[str, list[
     return {"unsupported": sorted(unsupported), "collapsed": sorted(collapsed)}
 
 
+# A keyframe's poses agree with its verified matches to a few hundredths of a degree (median
+# symmetric epipolar distance; livingroom and lv at most 0.12°, the office in one update 0.08°);
+# the global mapper's 6-photo office map placed one 0.43° off (0.26° with its neighbours' pairs).
+MAX_EPIPOLAR_DEG = 0.25
+EPIPOLAR_MIN_MATCHES = 50
+
+
+def epipolar_deg(Ta: Pose, Ka: Intrinsics, Tb: Pose, Kb: Intrinsics, uv_a: NDArray[Any],
+                 uv_b: NDArray[Any]) -> NDArray[np.float64]:
+    """Symmetric epipolar distance of matched keypoints (full-resolution pixels) under the
+    camera-to-world poses ``Ta``, ``Tb``, in degrees (pixels over the focal length). It measures
+    rotation errors and translation-direction errors alike; for two views with no baseline it is
+    zero for any translation direction when the rotation is right."""
+    R = Tb.R.T @ Ta.R
+    t = Tb.R.T @ (Ta.t - Tb.t)
+    n = float(np.linalg.norm(t))
+    if n <= 0:
+        return np.zeros(len(uv_a))
+    t = t / n
+    tx = np.array([[0.0, -t[2], t[1]], [t[2], 0.0, -t[0]], [-t[1], t[0], 0.0]])
+    F = np.linalg.inv(Kb.K()).T @ tx @ R @ np.linalg.inv(Ka.K())
+    xa = np.column_stack([uv_a, np.ones(len(uv_a))])
+    xb = np.column_stack([uv_b, np.ones(len(uv_b))])
+    la, lb = xa @ F.T, xb @ F  # epipolar lines in b and in a
+    num = np.abs(np.sum(xb * la, axis=1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = 0.5 * (num / np.hypot(la[:, 0], la[:, 1]) / Kb.fx
+                   + num / np.hypot(lb[:, 0], lb[:, 1]) / Ka.fx)
+    return np.degrees(np.nan_to_num(d, nan=0.0))
+
+
+def contradicted(poses: dict[str, Pose], K: dict[str, Intrinsics], matches: list[Any],
+                 max_deg: float = MAX_EPIPOLAR_DEG, min_matches: int = EPIPOLAR_MIN_MATCHES
+                 ) -> dict[str, float]:
+    """Keyframes whose pose contradicts their own verified matches (``panorama.PairMatches``):
+    the median epipolar distance (``epipolar_deg``) over all their matches to the other posed
+    keyframes is above ``max_deg``. A wrong pose also spoils its partners' pairs, so the worst
+    keyframe is taken out first and the rest judged again without it. Returns name → median."""
+    errs = [(p.a, p.b, epipolar_deg(poses[p.a], K[p.a], poses[p.b], K[p.b], p.uv_a, p.uv_b))
+            for p in matches if p.a in poses and p.b in poses and p.a in K and p.b in K]
+    out: dict[str, float] = {}
+    while True:
+        per: dict[str, list[NDArray[Any]]] = {}
+        for a, b, e in errs:
+            if a not in out and b not in out:
+                per.setdefault(a, []).append(e)
+                per.setdefault(b, []).append(e)
+        med = {n: float(np.median(np.concatenate(v))) for n, v in per.items()
+               if sum(len(x) for x in v) >= min_matches}
+        bad = {n: m for n, m in med.items() if m > max_deg}
+        if not bad:
+            return out
+        worst = max(sorted(bad), key=lambda n: bad[n])
+        out[worst] = bad[worst]
+
+
 def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
     """COLMAP re-normalises an extended reconstruction — a similarity away from its input, the
     fixed frames included — so map it back onto the input with the similarity that takes the
-    frames of both onto their input poses. None when those frames did not stay rigid (or are too
-    few to tell)."""
+    frames of both onto their input poses.
+
+    COLMAP can also drop a fixed frame whose observations the new images' points contradict (a
+    weakly supported stored pose: a few dozen points, each over the reprojection limit once the
+    new tracks triangulate) and register it again, elsewhere: the other fixed frames stay exactly
+    where they were, and so does everything registered on them. Such re-placed frames are left out
+    of the similarity (the worst one at a time, refitting on the rest) and listed in
+    ``model.notes["moved_fixed"]``; the map keeps their stored poses. None when fewer than two
+    frames, or not more than half of them, stayed rigid (then the extension moved the map)."""
     from oh_my_slam.mapping.frame import similarity_by_poses
 
     common = sorted(set(model.registered) & set(base.registered))
     if len(common) < 2:
         return None
-    ref = [base.pose(n) for n in common]
-    sim = similarity_by_poses([model.pose(n) for n in common], ref)
-    model.transform(sim.s, sim.R, sim.t)
-    centres = np.array([r.t for r in ref])
+    ref = {n: base.pose(n) for n in common}
+    out = {n: model.pose(n) for n in common}
+    keep = list(common)
+    centres = np.array([r.t for r in ref.values()])
     tol = max(1e-4, FIXED_POS_TOL * float(np.linalg.norm(centres - centres.mean(0), axis=1).max()))
-    for n, r in zip(common, ref, strict=True):
-        p = model.pose(n)
-        rot = np.degrees(np.arccos(np.clip((np.trace(p.R.T @ r.R) - 1) / 2, -1.0, 1.0)))
-        if rot > FIXED_ROT_TOL_DEG or np.linalg.norm(p.t - r.t) > tol:
-            log.warning("incremental extension moved the fixed frame %s (%.2f°, %.3g); "
-                        "its result is not used", n, rot, float(np.linalg.norm(p.t - r.t)))
+    moved: dict[str, tuple[float, float]] = {}
+    while True:
+        sim = similarity_by_poses([out[n] for n in keep], [ref[n] for n in keep])
+        dev = {}
+        for n in keep:
+            M = sim.transform_pose(out[n].matrix())
+            rot = float(np.degrees(np.arccos(np.clip((np.trace(M[:3, :3].T @ ref[n].R) - 1) / 2,
+                                                     -1.0, 1.0))))
+            dev[n] = (rot, float(np.linalg.norm(M[:3, 3] - ref[n].t)))
+        off = [n for n in keep if dev[n][0] > FIXED_ROT_TOL_DEG or dev[n][1] > tol]
+        if not off:
+            break
+        worst = max(off, key=lambda n: max(dev[n][0] / FIXED_ROT_TOL_DEG, dev[n][1] / tol))
+        moved[worst] = dev[worst]
+        keep.remove(worst)
+        if len(keep) < 2 or 2 * len(keep) <= len(common):
+            log.warning("incremental extension moved the fixed frames (%s); its result is not "
+                        "used", ", ".join(f"{n} {r:.2f}° {d:.3g}" for n, (r, d) in
+                                           sorted(moved.items())))
             return None
+    model.transform(sim.s, sim.R, sim.t)
+    if moved:
+        model.notes["moved_fixed"] = sorted(moved)
+        log.warning("incremental extension re-placed %d weakly supported fixed frames (%s); they "
+                    "keep their stored poses", len(moved), ", ".join(
+                        f"{n} {r:.2f}° {d:.3g}" for n, (r, d) in sorted(moved.items())))
     return model
 
 
@@ -264,8 +356,9 @@ class Sfm:
         else:
             args += ["--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
                      str(MAX_FEATURES)]
-        if prior.existing_id is not None and self._has_camera(prior.existing_id, prior):
-            args += ["--ImageReader.existing_camera_id", str(prior.existing_id)]
+        existing = self.existing_camera(prior)
+        if existing is not None:
+            args += ["--ImageReader.existing_camera_id", str(existing)]
         else:
             args += ["--ImageReader.single_camera", "1"]
             if prior.focal is not None:
@@ -274,7 +367,18 @@ class Sfm:
         _run(args, self.log_path)
         return self._camera_of(names[0])
 
-    def _has_camera(self, camera_id: int, prior: CameraPrior) -> bool:
+    def existing_camera(self, prior: CameraPrior) -> int | None:
+        """The database camera the new images share (``CameraPrior``): the map then keeps one
+        camera, with the intrinsics its earlier updates refined, instead of starting another one
+        at the uncalibrated prior."""
+        if prior.existing_id is not None and self._has_camera(prior.existing_id, prior):
+            return prior.existing_id
+        for cid in prior.same_focal_ids:
+            if self._has_camera(cid, prior, match_focal=True):
+                return cid
+        return None
+
+    def _has_camera(self, camera_id: int, prior: CameraPrior, match_focal: bool = False) -> bool:
         import pycolmap
 
         if not self.db.exists():
@@ -284,7 +388,14 @@ class Sfm:
             if not db.exists_camera(camera_id):
                 return False
             cam = db.read_camera(camera_id)
-            return (cam.width, cam.height) == (prior.width, prior.height)
+            if (cam.width, cam.height) != (prior.width, prior.height):
+                return False
+            if not match_focal:
+                return True
+            if prior.focal is None:
+                return False
+            f = float(np.mean(np.asarray(cam.params)[list(cam.focal_length_idxs())]))
+            return abs(f - prior.focal) <= FOCAL_MATCH_REL * prior.focal
         finally:
             db.close()
 
@@ -444,7 +555,11 @@ class Sfm:
         return model
 
     def map_incremental(self, out: Path, input_path: Path | None = None,
-                        fix_existing: bool = False) -> SfmModel | None:
+                        fix_existing: bool = False, constant_cameras: set[int] | None = None
+                        ) -> SfmModel | None:
+        """Incremental mapping; with ``input_path``, an extension of that reconstruction (its
+        frames fixed with ``fix_existing``, the intrinsics of ``constant_cameras`` held), with a
+        fixed random seed so that the same input extends a map the same way."""
         import pycolmap
 
         opts = pycolmap.IncrementalPipelineOptions()
@@ -452,6 +567,15 @@ class Sfm:
         opts.fix_existing_frames = fix_existing
         opts.structure_less_registration_fallback = True
         opts.num_threads = -1
+        if input_path:
+            # only the input's continuation: with several models COLMAP goes on to start fresh
+            # ones from the images left, the input's own images included, in an unrelated frame —
+            # one of those holding as many of the input's images, and more images, was taken for
+            # the extension and rejected as having moved its fixed frames
+            opts.multiple_models = False
+            opts.random_seed = EXTEND_SEED
+            if constant_cameras:
+                opts.constant_cameras = set(constant_cameras)
         recs = pycolmap.incremental_mapping(str(self.db), str(self.image_dir), str(out), opts,
                                             input_path=str(input_path) if input_path else "")
         if not input_path:
@@ -461,6 +585,13 @@ class Sfm:
         base = SfmModel(pycolmap.Reconstruction(str(input_path)), "input")
         rec = self._largest(recs, set(base.registered))
         return None if rec is None else _back_onto(SfmModel(rec, "sfm-incremental"), base)
+
+    @staticmethod
+    def model_cameras(path: Path) -> set[int]:
+        """Camera ids of a stored reconstruction."""
+        import pycolmap
+
+        return {int(c) for c in pycolmap.Reconstruction(str(path)).cameras}
 
     def image_intrinsics(self, names: set[str]) -> dict[str, tuple[int, Intrinsics]]:
         """(camera id, full-resolution intrinsics) in the database of each of ``names``."""
@@ -481,10 +612,12 @@ class Sfm:
             db.close()
 
     def _posed_reconstruction(self, poses: dict[str, Pose], base: Any = None,
-                              focal_scale: float = 1.0) -> Any:
+                              focal_scale: float = 1.0, cameras: dict[int, Any] | None = None
+                              ) -> Any:
         """``base`` (or an empty reconstruction) plus images at the given camera-to-world poses.
         Images of ``base`` that are in ``poses`` keep their stored pose. Cameras not yet in the
-        reconstruction come from the database, their focal length times ``focal_scale``."""
+        reconstruction come from ``cameras`` (the ones the poses were estimated with), else from
+        the database, their focal length times ``focal_scale``."""
         import pycolmap
 
         db = pycolmap.Database.open(str(self.db))
@@ -502,6 +635,8 @@ class Sfm:
                 continue
             if not rec.exists_camera(im.camera_id):
                 cam = cams[im.camera_id]
+                if cameras and im.camera_id in cameras:
+                    cam.params = np.asarray(cameras[im.camera_id].params, np.float64).tolist()
                 if focal_scale != 1.0:
                     params = np.asarray(cam.params, np.float64).copy()
                     params[list(cam.focal_length_idxs())] *= focal_scale
@@ -534,13 +669,14 @@ class Sfm:
         return SfmModel(rec, "multiview")
 
     def extend_with_poses(self, base_path: Path, poses: dict[str, Pose], out: Path,
-                          method: str) -> SfmModel:
+                          method: str, cameras: dict[int, Any] | None = None) -> SfmModel:
         """The stored map model plus new images at known map poses; points re-triangulated
-        (existing frames untouched)."""
+        (existing frames untouched). New cameras take the intrinsics of ``cameras`` where given
+        (those the poses were estimated with: an incremental extension refines them)."""
         import pycolmap
 
         base = pycolmap.Reconstruction(str(base_path))
-        rec = self._posed_reconstruction(poses, base)
+        rec = self._posed_reconstruction(poses, base, cameras=cameras)
         out.mkdir(parents=True, exist_ok=True)
         rec = pycolmap.triangulate_points(rec, str(self.db), str(self.image_dir), str(out),
                                           clear_points=False, refine_intrinsics=False)
