@@ -331,6 +331,69 @@ def test_pieces_the_fused_surface_joins_are_one_surface() -> None:
     assert mo._one_surface(desk, box, surfaces) == 0.0
 
 
+# --- parts named on their own ----------------------------------------------------------------------
+
+
+def figurine(part_frames: tuple[int, ...] = (2, 3), part_at: tuple[float, float, float] = (0, 0, 0)
+             ) -> tuple[MapObject, MapObject, mo._Masks]:
+    """A 10 x 8 x 16 cm figurine 0.6 m ahead on a sill (z = 0), detected whole ("figurine") by
+    keyframes 0 and 1 and only its 4 x 3 x 6 cm top ("bottle opener") by ``part_frames``, all
+    looking along +x from beside one another. ``part_at`` moves the part's detections (another
+    thing seen there, placed where the figurine's top is not)."""
+    rng = np.random.default_rng(7)
+    body = rng.uniform(-0.5, 0.5, (40000, 3)) * (0.1, 0.08, 0.16) + (0.6, 0.0, 0.08)
+    top = (body[:, 2] > 0.1) & (np.abs(body[:, 1]) < 0.015) & (np.abs(body[:, 0] - 0.6) < 0.02)
+    views, instances = {}, {}
+    parts: tuple[dict[int, np.ndarray], dict[int, np.ndarray]] = ({}, {})
+    for f in (0, 1, *part_frames):
+        pose = pose_at((0.0, 0.04 * f - 0.06, 0.05), 0.0)
+        whole = f in (0, 1)
+        shown = body if whole else body[top] + part_at
+        depth = render(pose, [body] if whole or not any(part_at) else [body, shown], 1.5)
+        views[f] = View(depth, np.ones(SHAPE, bool), K, pose)
+        mask = ndimage.binary_closing(render(pose, [shown], 99.0) < 99.0, iterations=2)
+        instances[f] = [(30 if whole else 40, mask)]
+        v, u = np.nonzero(mask & (depth < 1.5))
+        z = depth[v, u].astype(np.float64)
+        pts = pose.apply(np.stack([(u - K.cx) / K.fx * z, (v - K.cy) / K.fy * z, z], 1))
+        parts[0 if whole else 1][f] = pts
+    return (obj(30, "figurine", parts[0], 0.6), obj(40, "bottle opener", parts[1], 0.6),
+            mo._Masks(None, keyframes(views), instances, {}, {}))
+
+
+def test_a_part_named_on_its_own_is_its_object() -> None:
+    """The detector names a solar figurine in two keyframes and only its top, as a bottle
+    opener, in two others (never both in one keyframe): the part lies on the whole's surface,
+    each set of keyframes saw the other's place, and the whole's keyframes saw the part's place
+    as the whole. One object, labelled as the whole (the part's label names a part)."""
+    whole, part, masks = figurine()
+    assert mo._merge_strength(whole, part) < 1.0  # sizes too different for the flicker test
+    assert mo._part_of(whole, part, masks.views, masks) >= 1.0
+    alias: dict[int, int] = {}
+    state = ObjectState([whole, part], 400)
+    assert mo._merge(state, {30, 40}, alias, masks.views, masks=masks) == 1 and alias == {40: 30}
+    (kept,) = state.objects
+    assert kept.label == "figurine" and kept.frames == [0, 1, 2, 3]
+    assert kept.scene_object().labels == ("figurine", "bottle opener")
+    assert kept.obb is not None and kept.obb.size[2] == pytest.approx(0.16, abs=0.03)
+
+
+def test_items_on_or_beside_an_object_are_not_its_parts() -> None:
+    """What is not a part stays a separate object: something named once, something seen together
+    with the whole, and something inside the whole's box but not on its surface (a car seen
+    through a window, flattened onto the glass where another keyframe saw a tree)."""
+    whole, part, masks = figurine(part_frames=(2,))
+    assert mo._part_of(whole, part, masks.views, masks) == 0.0  # the part named once
+    whole, part, masks = figurine()
+    part.frames = sorted({*part.frames, 0})  # a keyframe that detected both saw two things
+    assert mo._part_of(whole, part, masks.views, masks) == 0.0
+    whole, part, masks = figurine(part_at=(-0.048, 0.0, 0.0))  # 1.8 cm in front of the figurine
+    assert whole.obb is not None and whole.obb.contains(part.points, 0.02).mean() > 0.9
+    assert mo._part_of(whole, part, masks.views, masks) == 0.0
+    assert mo._merge(ObjectState([whole, part], 400), {30, 40}, {}, masks.views,
+                     masks=masks) == 0
+
+
 # --- export ------------------------------------------------------------------------------------------
 
 

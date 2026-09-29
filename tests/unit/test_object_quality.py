@@ -4,6 +4,8 @@ the map cloud."""
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -181,6 +183,137 @@ def test_box_fitted_to_the_sightings_that_agree() -> None:
     # sightings persist with the object
     back = MapObject.from_dict(k.to_dict(), k.points)
     assert back.sightings == k.sightings
+
+
+def sourced(oid: int, label: str, parts: list[tuple[np.ndarray, float, bool]]) -> MapObject:
+    """An object from detections (points, border share, keyframe placed confidently), their
+    points recorded with their sources, as ``MapObject.add`` does."""
+    o = MapObject(oid, label, {label: 0.8}, [0.8], np.zeros((0, 3), np.float32),
+                  frames=list(range(len(parts))), obs_depth=0.7)
+    for p, border, confident in parts:
+        o.add_points(p, mo.source_of(border <= mo.BORDER_EVIDENCE, confident))
+    o.sightings = sorted((replace(sighting(f, p, border), confident=conf)
+                          for f, (p, border, conf) in enumerate(parts)), key=Sighting.key)
+    mo.refit(o, None)
+    return o
+
+
+def test_box_shaped_by_the_sightings_placed_confidently() -> None:
+    """A wallet on a sill seen by four confidently placed keyframes and by three of a later update
+    whose poses are uncertain (low confidence) and place it up to 11 cm off, onto the item beside
+    it: the box is the wallet's, from the confident sightings; their points alone shape it (the
+    others' points that fall in their bounds too). The uncertain ones still shape the box of an
+    object that nothing else saw, and a detection cut by the image border shapes it only while
+    the reliable ones are not the majority."""
+    rng = np.random.default_rng(8)
+
+    def wallet(dx: float = 0.0, dy: float = 0.0) -> np.ndarray:
+        return slab(rng, (0.11, 0.08, 0.02), (0.35 + dx, 0.45 + dy, -0.37), n=800)
+
+    good = [(wallet(), 0.0, True) for _ in range(4)]
+    off = [(wallet(-0.08, 0.08), 0.0, False), (wallet(0.0, -0.05), 0.2, False),
+           (wallet(-0.06, 0.03), 0.0, False)]
+    w = sourced(8, "wallet", good + off)
+    assert w.obb is not None and w.obb.size[0] == pytest.approx(0.11, abs=0.015)
+    assert w.obb.size[1] == pytest.approx(0.08, abs=0.015)
+    assert mo.shaping_sightings(w) == [s for s in w.sightings if s.confident]
+    # all confident: the offset copies agree within the depth noise and widen the box
+    wide = sourced(8, "wallet", good + [(p, b, True) for p, b, _ in off])
+    assert wide.obb is not None and wide.obb.size[0] > 0.15
+    # seen only by uncertain keyframes: they are all there is
+    alone = sourced(9, "wallet", off[:1] + [(wallet(-0.08, 0.08), 0.0, False)])
+    assert alone.obb is not None and alone.obb.size[0] == pytest.approx(0.11, abs=0.02)
+    # a globe cut by the image border in one of five keyframes, placed 8 cm aside: left out
+    ball = [(slab(rng, (0.09, 0.08, 0.16), (0.07, 0.62, -0.3), n=800), 0.0, True)
+            for _ in range(4)]
+    cut = (slab(rng, (0.06, 0.05, 0.16), (0.15, 0.55, -0.3), n=500), 1.0, True)
+    g = sourced(14, "globe", [*ball, cut])
+    assert g.obb is not None and g.obb.size[0] < 0.12
+    # a counter seen piecewise, mostly by views cut by the border: every piece counts
+    parts = [(slab(rng, (1.0, 0.6, 0.05), (x, 0.0, 0.9), n=2000), b, True)
+             for x, b in ((0.0, 0.0), (0.6, 0.8), (1.2, 0.8))]
+    c = sourced(2, "counter", parts)
+    assert c.obb is not None and c.obb.size[0] == pytest.approx(2.1, abs=0.1)
+
+
+def test_point_sources_persist(tmp_path: Any) -> None:
+    rng = np.random.default_rng(9)
+    o = sourced(3, "cup", [(slab(rng, (0.1, 0.1, 0.1), (1, 0, 0)), 0.0, True),
+                           (slab(rng, (0.1, 0.1, 0.1), (1.2, 0, 0)), 0.0, False)])
+    assert set(np.unique(o.point_sources()).tolist()) >= {mo.SRC_RELIABLE, mo.SRC_LOW_CONFIDENCE}
+    files: dict[str, Any] = {}
+    tx = SimpleNamespace(write_json=lambda rel, obj: files.__setitem__(rel, obj))
+    mo.save_state(tx, ObjectState([o], 10))
+    (tmp_path / "objects").mkdir()
+    (tmp_path / mo.OBJECTS_JSON).write_text(json.dumps(files[mo.OBJECTS_JSON]))
+    np.save(tmp_path / mo.points_file(3), o.points)
+    np.save(tmp_path / mo.sources_file(3), o.point_sources())
+    (back,) = mo.load_state(lambda rel: tmp_path / rel, {}).objects
+    np.testing.assert_array_equal(back.point_sources(), o.point_sources())
+    assert back.sightings == o.sightings and not all(s.confident for s in back.sightings)
+    np.testing.assert_array_equal(mo.fit_points(back), mo.fit_points(o))
+    # maps written before sources and confidence were recorded: every point, every sighting counts
+    (tmp_path / mo.sources_file(3)).unlink()
+    (legacy,) = mo.load_state(lambda rel: tmp_path / rel, {}).objects
+    assert (legacy.point_sources() == mo.SRC_ANY).all()
+    assert Sighting.from_list(o.sightings[0].to_list()[:12]).confident
+
+
+def test_support_bled_onto_is_trimmed_from_a_mask() -> None:
+    """A window's mask that ran onto a strip of the windowsill in front of it: the strip is
+    trimmed from the mask and from the lifted points; a laptop's base (half of it) and a flat
+    keyboard are left whole."""
+    from oh_my_slam.segmentation.api import LiftedInstance, trim_support
+    from oh_my_slam.segmentation.detect import Detection
+    from oh_my_slam.segmentation.lift import lift_mask
+
+    p = np.radians(25.0)  # the camera at the origin looks along +x, 25° down
+    f = np.array([np.cos(p), 0.0, -np.sin(p)])
+    right = np.array([0.0, -1.0, 0.0])
+    pose = Pose(np.stack([right, np.cross(f, right), f], axis=1), np.zeros(3))
+    v, u = np.mgrid[0:240, 0:320]
+    rays = np.stack([(u - K.cx) / K.fx, (v - K.cy) / K.fy, np.ones(u.shape)], -1) @ pose.R.T
+
+    def scene(vertical: tuple[float, float, float], horizontal: tuple[float, float, float],
+              ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Depth of a vertical plane at x = ``vertical[0]`` (z from its [1] to [2]) above a
+        horizontal one at z = ``horizontal[0]`` (x from [1] to [2]), |y| <= 0.4; the masks of
+        each."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tv = vertical[0] / rays[..., 0]
+            zv = tv * rays[..., 2]
+            onv = (tv > 0) & (np.abs(tv * rays[..., 1]) <= 0.4) & (zv >= vertical[1]) \
+                & (zv <= vertical[2])
+            th = horizontal[0] / rays[..., 2]
+            xh = th * rays[..., 0]
+            onh = (th > 0) & (np.abs(th * rays[..., 1]) <= 0.4) & (xh >= horizontal[1]) \
+                & (xh <= horizontal[2])
+        depth = np.where(onv, tv, np.where(onh, th, 3.0))
+        onh &= ~onv
+        return depth.astype(np.float32), onv, onh
+
+    def instance(mask: np.ndarray, depth: np.ndarray, label: str) -> LiftedInstance:
+        lifted = lift_mask(mask, depth, K, None, pose)
+        return LiftedInstance(Detection(label, 0.8, "yoloe", mask, (0, 0, 1, 1)), mask, lifted)
+
+    depth, window, sill = scene((0.8, -0.35, 0.3), (-0.35, 0.5, 0.8))
+    # the mask covers the sill up to 0.18 m in front of the glass
+    xs = np.where(sill, depth * rays[..., 0], np.inf)
+    bled = window | (sill & (xs >= 0.62))
+    inst = instance(bled, depth, "window")
+    out = trim_support(inst, depth, K, np.ones(depth.shape, bool), pose)
+    # what is left of the strip lies against the glass (within the footprint's cell)
+    assert (out.mask & window).sum() == window.sum() and (xs[out.mask & sill] > 0.75).all()
+    assert (bled & sill & ~out.mask).sum() > 0.8 * (bled & sill).sum()
+    x = out.lifted.points[:, 0]
+    assert np.percentile(x, 2) > 0.77 and np.percentile(inst.lifted.points[:, 0], 2) < 0.66
+    # a laptop: its base (half of what the mask covers) is the laptop
+    depth, screen, base = scene((0.8, -0.35, -0.15), (-0.35, 0.6, 0.8))
+    lap = instance(screen | base, depth, "laptop")
+    assert trim_support(lap, depth, K, np.ones(depth.shape, bool), pose) is lap
+    # a flat keyboard: nothing stands above its bottom band
+    kb = instance(base, depth, "keyboard")
+    assert trim_support(kb, depth, K, np.ones(depth.shape, bool), pose) is kb
 
 
 # --- point counts --------------------------------------------------------------------------------
