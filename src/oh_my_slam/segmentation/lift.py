@@ -139,3 +139,55 @@ def lift_mask(
     if T_parent_cam is not None:
         pts = T_parent_cam.apply(pts)
     return Lifted(pts, pix, int(mask.sum()))
+
+
+# Support bleed: a detector's mask of an upright object often runs onto the surface it stands on or
+# rises from, in front of it (a window's mask covering a strip of the windowsill, a chair's the
+# floor between the camera and its legs). That strip is the object's support, not the object: the
+# mask's points in its bottom band (up to max(SUPPORT_TOL_MIN, SUPPORT_BAND · its height) above
+# its 2nd percentile height) that lie outside the plan footprint of its points above the band
+# (SUPPORT_CELL cells, grown by one). Heights, not surface normals, decide: monocular depth often
+# bends such a strip into the object's own surface. It is trimmed only from an object mostly
+# above its bottom band (SUPPORT_UPRIGHT of its points) and when it is a fringe (at most
+# SUPPORT_MAX_SHARE of the points): what lies at the bottom of a flat object (a keyboard, a table
+# top) or makes up much of it (a laptop's base) is the object.
+SUPPORT_TOL_MIN = 0.02
+SUPPORT_BAND = 0.25
+SUPPORT_CELL = 0.02
+SUPPORT_UPRIGHT = 0.5
+SUPPORT_MAX_SHARE = 0.25
+
+
+def support_fringe(mask: NDArray[Any], depth: NDArray[Any], K: Intrinsics, valid: NDArray[Any],
+                   T_parent_cam: Pose, pixels: NDArray[Any]) -> NDArray[np.bool_]:
+    """The pixels of ``mask`` that are the support the mask bled onto (see ``SUPPORT_*``; all
+    False when nothing is trimmed). The parent frame is gravity-aligned (z up); ``pixels``: the
+    flat indices of the mask's lifted pixels, whose points decide (the other valid pixels of the
+    mask follow them)."""
+    m = np.asarray(mask, bool)
+    out = np.zeros(m.shape, bool)
+    pix = np.asarray(pixels, np.int64)
+    if len(pix) < MIN_POINTS:
+        return out
+    w = m.shape[1]
+    d = np.asarray(depth, np.float64)
+    v, u = np.nonzero(m & np.asarray(valid, bool) & np.isfinite(d) & (d > 0))
+    P = T_parent_cam.apply(unproject_pixels(u, v, d[v, u], K.K()))
+    lifted = np.isin(v * w + u, pix)
+    z = P[lifted, 2]
+    lo, hi = np.percentile(z, [2, 98])
+    top = lo + max(SUPPORT_TOL_MIN, SUPPORT_BAND * float(hi - lo))
+    above = lifted & (P[:, 2] > top)
+    if above.sum() < SUPPORT_UPRIGHT * lifted.sum() or above.sum() < MIN_POINTS:
+        return out
+    cells = np.floor(P[:, :2] / SUPPORT_CELL).astype(np.int64)
+    c0 = cells.min(0) - 1
+    grid = np.zeros(tuple(cells.max(0) - c0 + 2), bool)
+    grid[tuple((cells[above] - c0).T)] = True
+    grid = ndimage.binary_dilation(grid, structure=np.ones((3, 3), bool))
+    fringe = (P[:, 2] <= top) & ~grid[tuple((cells - c0).T)]
+    n = int((fringe & lifted).sum())
+    if n == 0 or n > SUPPORT_MAX_SHARE * lifted.sum():
+        return out
+    out[v[fringe], u[fringe]] = True
+    return out

@@ -20,7 +20,13 @@ Semantics (spec §2.3):
   update can still confirm them.
 * **Boxes** are fitted (by segmentation) to the points of the sightings that agree with each
   other (``fit_points``): monocular depth of small objects varies between keyframes, and the union
-  of inconsistent sightings is a streak along the viewing rays, not the object.
+  of inconsistent sightings is a streak along the viewing rays, not the object. Only the best
+  evidence shapes a box (``shaping_sightings``): the detections of confidently placed keyframes
+  once there are two (a keyframe of low confidence places the object offset as a whole, onto its
+  neighbour), and of these the reliable ones when they are the majority; each object records
+  which kind of detection each of its points came from (``sources``). A mask that bled onto the
+  support in front of an object (a window's onto the windowsill) is trimmed before anything else
+  (``segmentation.api.trim_support``).
 * **Keyframes re-scaled by a later update.** An update adjusts the depth of every keyframe of the
   map (``mapping.api._adjust_depth_scales``: a loop it closes spreads over the whole loop); the
   objects of the stored keyframes it corrects move with them (``rescale_objects``).
@@ -55,7 +61,9 @@ Semantics (spec §2.3):
 * **Merging** joins duplicates: objects with compatible labels that overlap, and — whatever their
   labels — objects of comparable size that occupy the same space (most of either one's points on
   the other's surface) and that no keyframe detected as two instances: the detector's label
-  flickered between keyframes (a door seen as a wardrobe). The merged object's label is the one
+  flickered between keyframes (a door seen as a wardrobe); and a part the detector named on its
+  own in the keyframes that did not name the whole (a figurine's top as a bottle opener:
+  ``_part_of``). The merged object's label is the one
   with the most evidence (score-weighted votes); the others are exported as ``detected_as``.
 * **Depth-explained duplicates.** The per-keyframe depth scale drifts along a long sequence, so
   the keyframes that close a loop can place an object 10-15 % nearer or further than those that
@@ -125,6 +133,7 @@ from oh_my_slam.segmentation.api import (
     obb_iou_upright,
     split_surface,
     surface_label,
+    trim_support,
 )
 
 POINT_CAP = 30000
@@ -151,6 +160,9 @@ MERGE_SCALE = 0.5
 # CONSENSUS_TOL_REL · viewing distance) apart (monocular depth noise); with at least CONSENSUS_MIN
 # sightings the box is fitted to the points in the bounds of those agreeing with the best one.
 CONSENSUS_MIN = 3
+# ... and only the sightings that may shape it take part (``shaping_sightings``): those of
+# confidently placed keyframes, and of these the reliable ones, each set once it has SHAPE_MIN.
+SHAPE_MIN = 2
 CONSENSUS_TOL_MIN = 0.05
 CONSENSUS_TOL_REL = 0.03
 CONSENSUS_MARGIN = 0.02
@@ -270,6 +282,38 @@ SEEN_APART = 0.2
 SEEN_ON = 0.4
 SEEN_DEPTH = 0.15
 SEEN_STEPS = 6
+# Parts named on their own (``_part_of``): the detector names an object in some keyframes and only
+# a part of it in others (a solar figurine detected whole in two keyframes, its top alone as a
+# "bottle opener" in two others; never both in one keyframe). The part — under a label that is not
+# compatible, smaller than MERGE_SCALE of the whole, so no other test applies, but at least
+# PART_MIN_SCALE of it (a substantial part: a handle on a door, a faucet in front of a window, a
+# switch on a wall are items of their own) — and the whole are
+# each detected reliably in CONFIRM_DETECTIONS keyframes (the detector names them consistently).
+# The part lies on the whole: PART_INSIDE of its points inside the whole's box grown by
+# CONSENSUS_MARGIN, and PART_SURFACE of them within max(POINT_VOXEL, PART_NEAR_REL · its viewing
+# distance) — the depth noise between keyframes — of the whole's own points: the whole's
+# keyframes lifted that surface as the whole (a car seen through a window and placed on the glass
+# lies in the box of a tree seen there by other keyframes, not on its surface). Each side's
+# keyframes saw the other's place and named only what they detected there: every keyframe that
+# detected one had at least PART_FRAMED of the other's points in its image and VISIBLE_SHARE of
+# those it can judge (at least PART_EVIDENCE: a 2 x 1.5 x 4 cm part has ~20 points) unoccluded; the whole's keyframes saw the part from
+# at most PART_RANGE times the distance its own keyframes detected it from (they could have
+# detected it), and in each of them that judges at least PART_EVIDENCE of the part's points (at
+# least CONFIRM_DETECTIONS do) PART_ON of those lie on its detection of the whole or in free space
+# (it sees past a thin part there), most of them on it, never beside it (``_judged``): a
+# thermos standing on a book lies beside the flat masks of the book in most of the book's
+# keyframes, though a few masks that ran up over it put it in the book's box. An item resting on or in a larger object (a cup on a table, a book in a bookcase,
+# a cushion on a sofa) is usually detected together with it by some keyframe, or out of view or
+# too far away in the keyframes that detected the other: never merged. A merged part votes for
+# its labels in proportion to its size (its scale over the whole's): its label names a part.
+PART_INSIDE = 0.9
+PART_MIN_SCALE = 0.25
+PART_FRAMED = 0.8
+PART_RANGE = 1.5
+PART_ON = 0.8
+PART_EVIDENCE = 10
+PART_SURFACE = 0.8
+PART_NEAR_REL = 0.02
 # An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
 # of the cells of its box's largest face at the resolution its keyframes sampled it, and at least
 # EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
@@ -313,9 +357,17 @@ def canonical_points(points: NDArray[Any]) -> NDArray[np.float32]:
     A pure function of the point *set* that composes — ``canonical(canonical(a) ∪ b) ==
     canonical(a ∪ b)`` — so an object's points, and the OBB fitted to them, do not depend on the
     order in which its instances arrived or on how they were split into updates."""
+    return canonical_sources(points, np.zeros(len(np.asarray(points).reshape(-1, 3)), np.uint8))[0]
+
+
+def canonical_sources(points: NDArray[Any], sources: NDArray[Any]
+                      ) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
+    """``canonical_points`` with each point's sources (``SRC_*`` bits): a kept point carries the
+    union of the sources of its voxel's points, so it composes as the points do."""
     p = np.asarray(points, np.float32).reshape(-1, 3)
+    src = np.asarray(sources, np.uint8).reshape(-1)
     if len(p) == 0:
-        return np.zeros((0, 3), np.float32)
+        return np.zeros((0, 3), np.float32), np.zeros(0, np.uint8)
     p64 = p.astype(np.float64)
     keys = voxel_keys(p64, POINT_VOXEL)
     d = np.sum((p64 - (keys + 0.5) * POINT_VOXEL) ** 2, axis=1)
@@ -323,12 +375,27 @@ def canonical_points(points: NDArray[Any]) -> NDArray[np.float32]:
     k = keys[order]
     first = np.r_[True, np.any(k[1:] != k[:-1], axis=1)]
     sel = order[first]
+    merged = np.bitwise_or.reduceat(src[order], np.flatnonzero(first)).astype(np.uint8)
     p, keys = p[sel], keys[sel]
     if len(p) > POINT_CAP:
         h = _voxel_hash(keys)
-        keep = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0], h))[:POINT_CAP]
-        p = p[np.sort(keep)]
-    return p
+        keep = np.sort(np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0], h))[:POINT_CAP])
+        p, merged = p[keep], merged[keep]
+    return p, merged
+
+
+# Where an object's points came from (bits of ``MapObject.sources``): a detection that shapes a box
+# first (``shaping_sightings``) — a reliable one from a confidently placed keyframe —, one mostly
+# in the image-border band, one from a keyframe of low confidence.
+SRC_RELIABLE = 1
+SRC_BORDER = 2
+SRC_LOW_CONFIDENCE = 4
+SRC_ANY = SRC_RELIABLE | SRC_BORDER | SRC_LOW_CONFIDENCE
+
+
+def source_of(reliable: bool, confident: bool) -> int:
+    """The ``SRC_*`` bit of a detection's points."""
+    return SRC_LOW_CONFIDENCE if not confident else SRC_RELIABLE if reliable else SRC_BORDER
 
 
 # ------------------------------------------------------------------------------------------------
@@ -338,8 +405,9 @@ def canonical_points(points: NDArray[Any]) -> NDArray[np.float32]:
 @dataclass(frozen=True)
 class Sighting:
     """Summary of one detection of an object: its keyframe, lifted point count, the share of its
-    mask in the image-border band, and the centroid and robust (2-98 %) bounds of its points in
-    map coordinates."""
+    mask in the image-border band, the centroid and robust (2-98 %) bounds of its points in map
+    coordinates, and whether its keyframe was placed confidently (not ``low_confidence``: a
+    reliable depth scale and a pose the matches support)."""
 
     frame: int
     points: int
@@ -347,22 +415,26 @@ class Sighting:
     centroid: tuple[float, float, float]
     lo: tuple[float, float, float]
     hi: tuple[float, float, float]
+    confident: bool = True
 
     @property
     def reliable(self) -> bool:
         return self.border <= BORDER_EVIDENCE
 
     def key(self) -> tuple[Any, ...]:
-        return (self.frame, self.points, self.centroid, self.lo, self.hi, self.border)
+        return (self.frame, self.points, self.centroid, self.lo, self.hi, self.border,
+                self.confident)
 
     def to_list(self) -> list[float]:
-        return [self.frame, self.points, self.border, *self.centroid, *self.lo, *self.hi]
+        return [self.frame, self.points, self.border, *self.centroid, *self.lo, *self.hi,
+                float(self.confident)]
 
     @staticmethod
     def from_list(v: list[float]) -> Sighting:
         def t(x: list[float]) -> tuple[float, float, float]:
             return (float(x[0]), float(x[1]), float(x[2]))
-        return Sighting(int(v[0]), int(v[1]), float(v[2]), t(v[3:6]), t(v[6:9]), t(v[9:12]))
+        return Sighting(int(v[0]), int(v[1]), float(v[2]), t(v[3:6]), t(v[6:9]), t(v[9:12]),
+                        bool(v[12]) if len(v) > 12 else True)
 
 
 @dataclass
@@ -384,6 +456,9 @@ class MapObject:
     sightings: list[Sighting] = field(default_factory=list)  # one per detection (sorted)
     cloud_points: int | None = None  # map-cloud points attributed to it (None: not yet counted)
     cloud_min: int | None = None  # the cloud points it needs to be exported (min_cloud_points)
+    # SRC_* bits per point (None: not recorded — a map written before sources were, or points
+    # given directly — every point counts as a source of every kind)
+    sources: NDArray[np.uint8] | None = None
     _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def memo(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -428,8 +503,18 @@ class MapObject:
         """Horizontal diagonal of its points (``_extent``)."""
         return float(self.memo("extent", lambda: _extent(self.points)))
 
-    def add_points(self, pts: NDArray[Any]) -> None:
-        self.points = canonical_points(np.concatenate([self.points, np.asarray(pts, np.float32)]))
+    def point_sources(self) -> NDArray[np.uint8]:
+        """``sources``, every kind (``SRC_ANY``) for points whose sources were not recorded."""
+        if self.sources is None or len(self.sources) != len(self.points):
+            return np.full(len(self.points), SRC_ANY, np.uint8)
+        return self.sources
+
+    def add_points(self, pts: NDArray[Any], sources: NDArray[Any] | int = SRC_ANY) -> None:
+        """Add points (their ``SRC_*`` bits: one for all, or one per point)."""
+        new = np.asarray(pts, np.float32).reshape(-1, 3)
+        src = np.broadcast_to(np.asarray(sources, np.uint8), (len(new),))
+        self.points, self.sources = canonical_sources(
+            np.concatenate([self.points, new]), np.concatenate([self.point_sources(), src]))
 
     def vote(self, label: str, score: float) -> None:
         self.label_votes[label] = self.label_votes.get(label, 0.0) + score
@@ -442,7 +527,9 @@ class MapObject:
         n0 = len(self.frames)
         for ob in obs:
             self.vote(ob.label, ob.score)
-        self.add_points(np.concatenate([ob.points for ob in obs]))
+        self.add_points(np.concatenate([ob.points for ob in obs]),
+                        np.concatenate([np.full(len(ob.points), ob.source, np.uint8)
+                                        for ob in obs]))
         self.frames = sorted(set(self.frames) | {ob.frame for ob in obs})
         self.obs_depth = float((self.obs_depth * n0 + sum(ob.depth for ob in obs))
                                / (n0 + len(obs)))
@@ -456,7 +543,7 @@ class MapObject:
             self.label_votes[lab] = self.label_votes.get(lab, 0.0) + v
         self.label = max(self.label_votes.items(), key=lambda kv: (kv[1], kv[0]))[0]
         self.scores = sorted(self.scores + gone.scores, reverse=True)[:10]
-        self.add_points(gone.points)
+        self.add_points(gone.points, gone.point_sources())
         n_a, n_b = len(self.frames), len(gone.frames)
         if n_a + n_b:
             self.obs_depth = (self.obs_depth * n_a + gone.obs_depth * n_b) / (n_a + n_b)
@@ -535,15 +622,16 @@ class Observation:
     depth: float  # median camera distance
     extent: float
     members: tuple[LiftedInstance, ...] = ()
+    confident: bool = True  # its keyframe was placed confidently (not ``low_confidence``)
     _tree: cKDTree | None = field(default=None, repr=False)
 
     @staticmethod
     def of(frame: int, view: View, inst: LiftedInstance,
-           members: tuple[LiftedInstance, ...] = ()) -> Observation:
+           members: tuple[LiftedInstance, ...] = (), confident: bool = True) -> Observation:
         pts = np.asarray(inst.lifted.points, np.float64)
         dist = float(np.median(np.linalg.norm(pts - view.T_map_cam.t, axis=1)))
         return Observation(frame, view, inst, pts.astype(np.float32), pts.mean(0), dist,
-                           _extent(pts), members or (inst,))
+                           _extent(pts), members or (inst,), confident)
 
     @property
     def sighting(self) -> Sighting:
@@ -553,7 +641,12 @@ class Observation:
         def t(x: NDArray[Any]) -> tuple[float, float, float]:
             return (float(x[0]), float(x[1]), float(x[2]))
         return Sighting(self.frame, len(self.points), border_share(self.inst.mask), t(c), t(lo),
-                        t(hi))
+                        t(hi), self.confident)
+
+    @property
+    def source(self) -> int:
+        """The ``SRC_*`` bit of its points."""
+        return source_of(border_share(self.inst.mask) <= BORDER_EVIDENCE, self.confident)
 
     @property
     def label(self) -> str:
@@ -587,6 +680,11 @@ class Observation:
 
 def points_file(oid: int) -> str:
     return f"objects/points_{oid:06d}.npy"
+
+
+def sources_file(oid: int) -> str:
+    """The ``SRC_*`` bits of the points of ``points_file`` (absent: not recorded)."""
+    return f"objects/sources_{oid:06d}.npy"
 
 
 @dataclass
@@ -681,7 +779,12 @@ def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
     for od in d.get("objects", []):
         pp = current(points_file(int(od["id"])))
         pts = np.load(pp).astype(np.float32) if pp.exists() else np.zeros((0, 3), np.float32)
-        objs.append(MapObject.from_dict(od, pts))
+        o = MapObject.from_dict(od, pts)
+        sp = current(sources_file(o.id))
+        if sp.exists():
+            src = np.load(sp).astype(np.uint8)
+            o.sources = src if len(src) == len(pts) else None
+        objs.append(o)
     return ObjectState(objs, int(d.get("next_id", meta.get("next_object_id", 1))),
                        {int(k): int(v) for k, v in d.get("merged_into", {}).items()},
                        floor_z=d.get("floor_z", meta.get("floor_z")),
@@ -922,35 +1025,74 @@ def below_floor(obj: MapObject, floor_z: float | None, margin: float = 0.3) -> b
     return float(np.percentile(obj.points[:, 2], 90)) < floor_z - margin
 
 
-def agreeing_sightings(obj: MapObject) -> list[Sighting]:
-    """The sightings that agree with the one most others agree with (ties: more points, then
-    content). Two sightings agree when their bounds overlap, allowing a gap of the depth noise at
-    the object's distance: the partial views of a large object overlap one another, while
-    sightings of a small object that monocular depth scattered along the viewing rays do not."""
+def shaping_sightings(obj: MapObject) -> list[Sighting]:
+    """The sightings that may shape an object's box: those of confidently placed keyframes when
+    at least ``SHAPE_MIN`` of them detected it (a keyframe of low confidence — an unreliable depth
+    scale, or a pose the matches do not support — places the object offset as a whole: a wallet
+    placed onto the neighbouring item; the map cloud leaves these keyframes out too), and of
+    these the reliable ones (``Sighting.reliable``) when they are at least ``SHAPE_MIN`` and a
+    strict majority: a detection mostly in the image-border band is cut off and its monocular
+    depth unreliable, as for confirmation. The others still count as evidence (label, keyframes,
+    confirmation); they shape the box only while nothing better saw the object."""
     s = obj.sightings
+    confident = [x for x in s if x.confident]
+    if len(confident) >= SHAPE_MIN:
+        s = confident
+    reliable = [x for x in s if x.reliable]
+    if len(reliable) >= SHAPE_MIN and 2 * len(reliable) > len(s):
+        s = reliable
+    return s
+
+
+def _agreeing(s: list[Sighting], obs_depth: float) -> list[Sighting]:
+    """The sightings of ``s`` that agree with the one most others agree with (ties: more points,
+    then content). Two sightings agree when their bounds overlap, allowing a gap of the depth
+    noise at ``obs_depth``: the partial views of a large object overlap one another, while
+    sightings of a small object that monocular depth scattered along the viewing rays do not."""
     if not s:
         return []
     lo = np.array([x.lo for x in s])
     hi = np.array([x.hi for x in s])
-    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * obj.obs_depth)
+    tol = max(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * obs_depth)
     near = np.all((lo[:, None] <= hi[None] + tol) & (lo[None] <= hi[:, None] + tol), axis=2)
     best = min(range(len(s)), key=lambda i: (-int(near[i].sum()), -s[i].points, s[i].key()))
     return [x for x, ok in zip(s, near[best], strict=True) if ok]
 
 
+def agreeing_sightings(obj: MapObject) -> list[Sighting]:
+    """The sightings that shape the box (``shaping_sightings``) that agree with one another
+    (``_agreeing``) — all of them when there are fewer than ``CONSENSUS_MIN``."""
+    s = shaping_sightings(obj)
+    return _agreeing(s, obj.obs_depth) if len(s) >= CONSENSUS_MIN else s
+
+
 def fit_points(obj: MapObject) -> NDArray[np.float32]:
-    """The points a box is fitted to: with at least ``CONSENSUS_MIN`` sightings (all recorded),
-    those inside the bounds of the agreeing sightings (``agreeing_sightings``), else all."""
-    s = obj.sightings
-    if len(s) < CONSENSUS_MIN or {x.frame for x in s} != set(obj.frames):
-        return obj.points
-    keep = agreeing_sightings(obj)
-    if len(keep) == len(s):
-        return obj.points
-    lo = np.min([x.lo for x in keep], axis=0) - CONSENSUS_MARGIN
-    hi = np.max([x.hi for x in keep], axis=0) + CONSENSUS_MARGIN
-    inside = np.all((obj.points >= lo) & (obj.points <= hi), axis=1)
-    return obj.points[inside] if inside.sum() >= 10 else obj.points
+    """The points a box is fitted to (all of them unless every detection has its sighting
+    recorded): the points of the kinds of detection that shape the box (``shaping_sightings``,
+    ``SRC_*``), and when some of those disagree (``agreeing_sightings``), only those inside the
+    bounds (plus ``CONSENSUS_MARGIN``) of the agreeing ones."""
+    def compute() -> NDArray[np.float32]:
+        s = obj.sightings
+        if not s or {x.frame for x in s} != set(obj.frames):
+            return obj.points
+        shaping = shaping_sightings(obj)
+        keep = agreeing_sightings(obj)
+        ok = np.ones(len(obj.points), bool)
+        if len(shaping) < len(s):
+            allowed = 0
+            for x in shaping:
+                allowed |= source_of(x.reliable, x.confident)
+            ok = (obj.point_sources() & allowed) != 0
+        if len(keep) < len(shaping):
+            lo = np.min([x.lo for x in keep], axis=0) - CONSENSUS_MARGIN
+            hi = np.max([x.hi for x in keep], axis=0) + CONSENSUS_MARGIN
+            ok &= np.all((obj.points >= lo) & (obj.points <= hi), axis=1)
+        if ok.all() or ok.sum() < 10:
+            return obj.points
+        pts: NDArray[np.float32] = obj.points[ok]
+        return pts
+    out: NDArray[np.float32] = obj.memo("fit_points", compute)
+    return out
 
 
 def refit(obj: MapObject, floor_z: float | None) -> None:
@@ -1031,12 +1173,13 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
                 w = T.t + _factor_at(corr, T, v) * (np.asarray(v, np.float64) - T.t)
                 return (float(w[0]), float(w[1]), float(w[2]))
             out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
-                                moved_to(s.lo), moved_to(s.hi)))
+                                moved_to(s.lo), moved_to(s.hi), s.confident))
         w = np.asarray(weights)
         c_obj = float(np.exp(np.sum(w * np.asarray(logs)) / np.sum(w)))
         C_obj = np.sum(np.asarray(centres) * w[:, None], axis=0) / np.sum(w)
         if len(o.points):
-            o.points = canonical_points(C_obj + c_obj * (o.points.astype(np.float64) - C_obj))
+            o.points, o.sources = canonical_sources(
+                C_obj + c_obj * (o.points.astype(np.float64) - C_obj), o.point_sources())
         o.obs_depth *= c_obj
         o.sightings = sorted(out, key=Sighting.key)
         refit(o, state.floor_z)
@@ -1063,7 +1206,8 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         state.floor_z = fz
     ctx.meta["floor_z"] = state.floor_z
 
-    # 1. every instance of the update, lifted into the map, with the number of its detection:
+    # 1. every instance of the update, lifted into the map (without the support its mask bled
+    #    onto: ``trim_support``), with the number of its detection:
     #    all detections of the update's keyframes (placed or not) in keyframe order, continuing
     #    the map's count; the pieces of a split surface are one instance (numbered by the first)
     first_new = state.next_id
@@ -1082,14 +1226,16 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         rec = nf.record
         view = keyframe_view(nf)
         new_views[rec.index] = (nf, view)
-        insts = lift_detections(nf.frame, nf.dets, rec.T_map_cam, depth=nf.depth,
-                                valid=view.valid)
+        insts = [trim_support(inst, nf.depth, nf.frame.K_grid, view.valid, rec.T_map_cam)
+                 for inst in lift_detections(nf.frame, nf.dets, rec.T_map_cam, depth=nf.depth,
+                                             valid=view.valid)]
         pieces = surface_pieces(view, insts)
         per_frame[rec.index] = list(range(len(obs), len(obs) + len(pieces)))
         rank = {id(det): j for j, det in enumerate(nf.dets)}
         for group in pieces:
             members = tuple(insts[k] for k in group)
-            obs.append(Observation.of(rec.index, view, join_instances(list(members)), members))
+            obs.append(Observation.of(rec.index, view, join_instances(list(members)), members,
+                                      confident=not rec.low_confidence))
             number.append(first_number[nf.kf.index]
                           + min(rank[id(m.detection)] for m in members))
     views = _Views(ctx, {f: v for f, (_, v) in new_views.items()}, records)
@@ -1150,6 +1296,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     for oid in sorted(gone | set(alias)):
         if oid < first_new:
             tx.delete(points_file(oid))
+            tx.delete(sources_file(oid))
     state.objects = [o for o in state.objects if o.id not in gone]
 
     # 5. final ids of the new objects: the number of their first detection (bookkeeping)
@@ -1186,6 +1333,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     for o in state.objects:
         if o.id in touched or o.id in moved:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
+            tx.save_npy(sources_file(o.id), o.point_sources())
     save_state(tx, state)
     confirmed = sum(o.confirmed for o in state.objects)
     state.summary = {
@@ -2088,19 +2236,23 @@ def _judged(o: MapObject, pts: NDArray[np.float64], masks: _Masks) -> NDArray[np
     in view of each keyframe (``SEEN_*``)."""
     out = np.zeros(4)
     for f in o.frames:
-        view = masks.views.get(f)
-        grown = None if view is None else masks.mask(o, f, view)
-        if view is None or grown is None:
-            continue
-        inside, z, d, u, v = view.lookup_pixels(pts)
-        keep = inside & (z - d <= tau(z))  # occluded points tell nothing
-        if not keep.any():
-            continue
-        z, d, u, v = z[keep], d[keep], u[keep], v[keep]
-        free = d - z > np.maximum(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * z)
-        on = grown.covers(u, v) & ~free
-        out += [on.sum(), free.sum(), (~on & ~free).sum(), len(z)]
+        out += _judged_in(o, f, pts, masks)
     return out
+
+
+def _judged_in(o: MapObject, f: int, pts: NDArray[np.float64], masks: _Masks
+               ) -> NDArray[np.float64]:
+    """``_judged`` for one keyframe ``f`` that detected ``o``."""
+    view = masks.views.get(f)
+    grown = None if view is None else masks.mask(o, f, view)
+    if view is None or grown is None:
+        return np.zeros(4)
+    inside, z, d, u, v = view.lookup_pixels(pts)
+    keep = inside & (z - d <= tau(z))  # occluded points tell nothing
+    z, d, u, v = z[keep], d[keep], u[keep], v[keep]
+    free = d - z > np.maximum(CONSENSUS_TOL_MIN, CONSENSUS_TOL_REL * z)
+    on = grown.covers(u, v) & ~free
+    return np.array([on.sum(), free.sum(), (~on & ~free).sum(), len(z)], np.float64)
 
 
 def _ray_origin(o: MapObject, views: _Views) -> NDArray[np.float64] | None:
@@ -2172,10 +2324,84 @@ def _seen_twice(a: MapObject, b: MapObject, masks: _Masks) -> float:
     return min(on_a[1], on_b[1]) / SEEN_ON
 
 
+def _part_whole(a: MapObject, b: MapObject) -> tuple[MapObject, MapObject, float] | None:
+    """(part, whole, part's scale over the whole's) when one of two objects is smaller than
+    ``MERGE_SCALE`` of the other (``_scale``); None otherwise."""
+    sa, sb = _scale(a), _scale(b)
+    if min(sa, sb) >= MERGE_SCALE * max(sa, sb) or max(sa, sb) <= 0:
+        return None
+    return (a, b, sa / sb) if sa < sb else (b, a, sb / sa)
+
+
+def _sees(view: View, pts: NDArray[np.float64]) -> bool:
+    """Whether a keyframe had ``pts`` in view: ``PART_FRAMED`` of them in its image, and of those
+    it can judge (at least ``PART_EVIDENCE``) ``VISIBLE_SHARE`` unoccluded."""
+    if len(pts) == 0:
+        return False
+    uv, zc = project(view.T_map_cam.inverse().apply(pts), view.K.K())
+    h, w = view.depth.shape
+    with np.errstate(invalid="ignore"):
+        framed = (zc > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    if framed.mean() < PART_FRAMED:
+        return False
+    inside, z, d = view.lookup(pts)
+    z, d = z[inside], d[inside]
+    return len(z) >= PART_EVIDENCE and float((z - d <= tau(z)).mean()) >= VISIBLE_SHARE
+
+
+def _part_of(a: MapObject, b: MapObject, views: _Views, masks: _Masks | None = None) -> float:
+    """>= 1 when the smaller of two objects of incompatible labels that no keyframe detected
+    together is a part of the larger that the detector named on its own (``PART_*``); with
+    ``masks`` (the objects' detections), the whole's keyframes must also have seen the part's
+    place as the whole: in each, ``PART_ON`` of the part's points it judges lie on its detection
+    or in free space, more on it than free (``_judged_in``). The value is the share of the part inside the whole's box over
+    ``PART_INSIDE``."""
+    pw = _part_whole(a, b)
+    if pw is None or set(a.frames) & set(b.frames) \
+            or min(len(a.reliable_frames()), len(b.reliable_frames())) < CONFIRM_DETECTIONS:
+        return 0.0
+    part, whole, ratio = pw
+    if ratio < PART_MIN_SCALE:
+        return 0.0
+    own = np.asarray(fit_points(part), np.float64)
+    if whole.obb is None or len(own) == 0:
+        return 0.0
+    inside = float(whole.obb.contains(own, CONSENSUS_MARGIN).mean())
+    near = max(POINT_VOXEL, PART_NEAR_REL * part.obs_depth)
+    if inside < PART_INSIDE or overlap_fraction(own, whole.points, near) < PART_SURFACE:
+        return 0.0
+    reach = [float(np.linalg.norm(T.t - np.asarray(s.centroid)))
+             for s in part.sightings if (T := views.pose(s.frame)) is not None]
+    if not reach:
+        return 0.0
+    samples = own[np.linspace(0, len(own) - 1, min(len(own), SEEN_SAMPLES)).astype(int)]
+    for o, other in ((part, whole), (whole, part)):
+        pts = samples if other is part else _seen_samples(other)
+        for f in o.frames:
+            view = views.get(f)
+            if view is None or not _sees(view, pts):
+                return 0.0
+            if o is whole and float(np.linalg.norm(view.T_map_cam.t - part.centroid)) \
+                    > PART_RANGE * max(reach):
+                return 0.0
+    if masks is not None:
+        judges = 0
+        for f in whole.frames:
+            on, free, _, judged = _judged_in(whole, f, samples, masks)
+            if judged < PART_EVIDENCE:
+                continue
+            if on + free < PART_ON * judged or on < free:
+                return 0.0
+            judges += 1
+        if judges < CONFIRM_DETECTIONS:
+            return 0.0
+    return inside / PART_INSIDE
+
+
 def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
                     surfaces: _Surfaces | None = None,
                     loops: set[frozenset[int]] | None = None,
-                    masks: _Masks | None = None) -> float:
+                    masks: _Masks | None = None, parts: _Masks | None = None) -> float:
     """>= 1 when two objects are one physical object. Compatible labels: >= 50 % of the smaller
     one's points on the other, or boxes overlapping (IoU >= 0.3, or the smaller padded box >= 60 %
     inside the other), or (with ``views``) copies placed by keyframes whose depths disagree
@@ -2183,11 +2409,13 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
     of ids from ``_loop_copies``; still never detected together). Incompatible labels (the
     detector's label flickered between keyframes): no keyframe detected both (it would have seen
     two things there), their sizes are comparable (``MERGE_SCALE``: neither is a part of the other
-    or an item resting on it) and >= 50 % of either one's points lie on the other's surface.
-    Whatever the labels: pieces of one horizontal surface (``_one_surface``, with ``surfaces``:
+    or an item resting on it) and >= 50 % of either one's points lie on the other's surface, or
+    (with ``views``) the smaller is a part of the larger that the detector named on its own
+    (``_part_of``). Whatever the labels: pieces of one horizontal surface (``_one_surface``, with ``surfaces``:
     the map's fused surface); with ``masks`` (the detections of the objects in their keyframes),
     one object seen twice by keyframes that never saw it together (``_seen_as_one``; incompatible
-    labels of comparable size only). The value orders the merges (strongest first)."""
+    labels of comparable size only); ``parts``: the detections for ``_part_of``. The value
+    orders the merges (strongest first)."""
     same_kind = compatible(a.label, b.label)
     if not same_kind and set(a.frames) & set(b.frames):
         return 0.0
@@ -2195,8 +2423,9 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
         return 0.0
     surface = _one_surface(a, b, surfaces)
     if not same_kind:
-        sa, sb = _scale(a), _scale(b)
-        if min(sa, sb) < MERGE_SCALE * max(sa, sb):
+        if _part_whole(a, b) is not None:
+            if surface < 1.0 and views is not None:
+                return max(surface, _part_of(a, b, views, parts))
             return surface
         radius = max(0.05, 0.02 * min(a.obs_depth, b.obs_depth))
         s = max(surface, overlap_fraction(a.points, b.points, radius) / MERGE_OVERLAP,
@@ -2216,6 +2445,21 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
     if s < 1.0 and masks is not None:
         s = max(s, _seen_as_one(a, b, masks))
     return s
+
+
+def _weigh_part(a: MapObject, b: MapObject, views: _Views | None, surfaces: _Surfaces | None,
+                masks: _Masks | None = None) -> None:
+    """Before two objects merge: when one is a part of the other named on its own (``_part_of``,
+    not pieces of one surface), its label votes are scaled by its size over the whole's — its
+    label names a part (``PART_*``)."""
+    if views is None or compatible(a.label, b.label):
+        return
+    pw = _part_whole(a, b)
+    if pw is None or _one_surface(a, b, surfaces) >= 1.0 \
+            or _part_of(a, b, views, masks) < 1.0:
+        return
+    part, _, ratio = pw
+    part.label_votes = {k: v * ratio for k, v in part.label_votes.items()}
 
 
 def _content_key(o: MapObject) -> tuple[Any, ...]:
@@ -2243,7 +2487,7 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
             if p.id == o.id or not (o.id in touched or p.id in touched):
                 continue
             a, b = (o, p) if o.id < p.id else (p, o)
-            s = _merge_strength(a, b, views, surfaces, loops, seen)
+            s = _merge_strength(a, b, views, surfaces, loops, seen, masks)
             if s >= 1.0:
                 strength[(a.id, b.id)] = s
             else:
@@ -2273,6 +2517,7 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         (ka, kb), _ = min(strength.items(), key=lambda kv: (
             -kv[1], sorted([_content_key(by[kv[0][0]]), _content_key(by[kv[0][1]])])))
         keep, gone = by[ka], by[kb]  # ka < kb: the lower id is kept
+        _weigh_part(keep, gone, views, surfaces, masks)
         keep.absorb(gone)
         refit(keep, state.floor_z)
         alias[gone.id] = keep.id

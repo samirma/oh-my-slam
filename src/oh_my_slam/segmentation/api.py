@@ -1,8 +1,9 @@
 """Segmentation API: detections → exclusive masks → 3D points → upright OBBs → ids and colours.
 
 ``segment_frame`` serves ``segment.sh -i``, ``reconstruct.sh`` (JSON) and ``view.sh -i``;
-``detect_alongside`` and ``lift_detections`` serve the mapper (detections of a keyframe while the
-mapper's own reconstruction call runs; instances in map coordinates), ``fit_object_obb`` fits the
+``detect_alongside``, ``lift_detections`` and ``trim_support`` serve the mapper (detections of a
+keyframe while the mapper's own reconstruction call runs; instances in map coordinates, without
+the support their masks bled onto), ``fit_object_obb`` fits the
 boxes of both; ``export_map`` draws a map's persistent objects on its keyframes. Emitted clouds are
 derived in ``segmentation.cloud``. Other packages use segmentation through this module (and
 ``cloud``, ``scene``, ``artifacts``), never its internals (import-linter contract).
@@ -21,7 +22,7 @@ from numpy.typing import NDArray
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import timing
 from oh_my_slam.core.geometry import depth_edge_mask
-from oh_my_slam.core.types import Pose
+from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.api import (
     SINGLE_IMAGE_TOKENS,
     FrameReconstruction,
@@ -44,7 +45,7 @@ from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
 from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.detect import surface_label as surface_label
-from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask
+from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask, support_fringe
 from oh_my_slam.segmentation.obb import OBB as OBB
 from oh_my_slam.segmentation.obb import fit_obb
 from oh_my_slam.segmentation.obb import obb_iou_upright as obb_iou_upright
@@ -131,6 +132,21 @@ def pixel_owners(dets: list[Detection], shape: tuple[int, int]) -> NDArray[np.in
         sub = owner[box]
         sub[mask[box] & (sub < 0)] = i
     return owner
+
+
+def trim_support(inst: LiftedInstance, depth: NDArray[Any], K: Intrinsics, valid: NDArray[Any],
+                 T_parent_cam: Pose) -> LiftedInstance:
+    """``inst`` without the support its mask bled onto (``lift.support_fringe``: a strip of the
+    windowsill in front of a window, the floor in front of a chair), from its mask and its lifted
+    points; ``inst`` itself when there is none. The parent frame is gravity-aligned (z up), as the
+    instance's points are."""
+    drop = support_fringe(inst.mask, depth, K, valid, T_parent_cam, inst.lifted.pixels)
+    if not drop.any():
+        return inst
+    keep = ~drop.reshape(-1)[inst.lifted.pixels]
+    mask = inst.mask & ~drop
+    lifted = Lifted(inst.lifted.points[keep], inst.lifted.pixels[keep], int(mask.sum()))
+    return LiftedInstance(inst.detection, mask, lifted)
 
 
 def fit_object_obb(points: NDArray[Any], label: str, up: NDArray[Any],

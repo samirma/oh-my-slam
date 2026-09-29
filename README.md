@@ -494,6 +494,23 @@ point leaves the map untouched. One killed after it is completed by the next upd
     (not a part of the other or an item resting on it), and at least half of either one's
     points lie on the other's surface. The merged object takes the label with the most
     evidence and lists the others in `detected_as`.
+  * **A part named on its own** joins its object. The detector can name an object in some
+    keyframes and only a part of it in others: in `office_sequence` a solar figurine is a
+    "figurine" in two photos and its top alone a "bottle opener" in two others. The smaller of two
+    objects of different labels (less than half the other's size, but at least a quarter: a
+    handle on a door or a faucet in front of a window is an item of its own) that no keyframe
+    detected together merges into the larger when each is detected reliably in at least 2 keyframes, at
+    least 90 % of its points lie inside the larger's box (grown by 2 cm) and 80 % on the larger's
+    own surface (within max(1 cm, 2 % of the viewing distance) of its points), every keyframe that
+    detected either had at least 80 % of the other in its image and mostly unoccluded, the
+    larger's keyframes saw the part from at most 1.5 times the distance it was detected from, and
+    in each of them that sees at least 10 of the part's points (at least 2 must) 80 % of those lie
+    on its detection of the larger object or in free space where it sees past a thin part, more
+    of them on it than free. An item resting on or in a larger object (a cup on a
+    table, a book in a bookcase) is usually detected together with it by some keyframe, lies
+    beside the larger object's masks in most of its keyframes, or is out of view in the other's
+    keyframes, and stays separate. The part's label votes count in proportion to its size, so the
+    object keeps the whole's label.
   * **Copies placed by inconsistent depth** are merged too. Keyframes whose monocular depth
     disagrees (locally, even after the global depth adjustment of Refinement) can place an
     object twice along the same viewing rays. Objects of compatible labels that no keyframe
@@ -567,6 +584,20 @@ point leaves the map untouched. One killed after it is completed by the next upd
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
     overlap (allowing for depth noise) the detection most others agree with.
+  * Only the best evidence shapes the OBB. Once 2 confidently placed keyframes detected an
+    object, the detections of low-confidence keyframes no longer shape its box: an uncertain pose
+    moves the whole detection, and in a split `office_sequence` map it placed the wallet onto the
+    Raspberry Pi case beside it. Of the rest, detections mostly in the image-border band are left
+    out once the reliable ones are at least 2 and the majority. The other detections still count
+    for the label and for confirmation. Each object records which kind of detection each of its
+    points came from, so the box is fitted to the points of the detections that shape it.
+  * A mask that ran onto the surface an object stands on or rises from is trimmed before the
+    detection is used. The mask points in the object's bottom band (a quarter of its height) that
+    lie outside the plan footprint of its points above that band are removed from the mask and the
+    points: a strip of the windowsill in front of a window, the floor in front of a chair. This
+    happens only when the object is mostly above that band and the strip is at most a quarter of
+    its points, so a keyboard or a laptop's base is left whole. Heights decide, not surface
+    normals, because monocular depth often bends such a strip into the object's own surface.
   * The OBB covers the **observed surface** only (see Known limitations): no class-typical size
     is assumed.
 * **Geometry.** The map's geometry is a point cloud: the surface of a TSDF fusion of the aligned
