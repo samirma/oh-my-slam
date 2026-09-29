@@ -1,7 +1,8 @@
 """Mapping semantics (spec §2.3) on rendered rooms with known poses (no SfM, no server):
 
 * the keyframes of one update are one observation — permuting them changes nothing but
-  bookkeeping (keyframe names, and the ids that follow capture order);
+  bookkeeping (keyframe names, and the ids that follow capture order) as long as they agree; a
+  place that changed during the update is ``test_mapping_latest_wins.py``;
 * a later update wins over an earlier one;
 * persistent identity: one id and one colour per object for the map's lifetime, OBBs refined as
   evidence accumulates, merges keep the lower id;

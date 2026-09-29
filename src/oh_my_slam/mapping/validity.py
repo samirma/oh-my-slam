@@ -10,7 +10,8 @@ Margin τ(z) = max(0.15 m, 0.10 z). The keyframes of one update are one observat
 a cell is invalidated only when that update as a whole contradicts it: votes from 2 of its
 keyframes, or 1 vote beyond 1.5 τ, and more of its keyframes contradicting the cell than
 re-observing it within τ. Depth-edge pixels never vote. Only a later update invalidates an earlier
-one's pixels; keyframes of the same update never invalidate each other.
+one's pixels; keyframes of the same update never invalidate each other's pixels (an object
+that an update removes loses the pixels of its masks: ``objects.retire_pixels``).
 """
 
 from __future__ import annotations
@@ -192,14 +193,16 @@ POSE_MAX_RESIDUAL_DEG = 1.0
 POSE_MIN_MATCHES = 20
 
 
-def pose_supported(stats: dict[str, Any]) -> bool:
+def pose_supported(stats: dict[str, Any], max_residual_deg: float = POSE_MAX_RESIDUAL_DEG
+                   ) -> bool:
     """A multi-view pose refined with feature matches (``stats`` has ``pose_matches``) is
-    supported when its keyframe has matches that agree with it (median residual <= 1°)."""
+    supported when its keyframe has matches that agree with it (median residual <= 1°, or
+    ``max_residual_deg``)."""
     if "pose_matches" not in stats:
         return True
     res = stats.get("pose_residual_deg")
     return (stats["pose_matches"] >= POSE_MIN_MATCHES and res is not None
-            and res <= POSE_MAX_RESIDUAL_DEG)
+            and res <= max_residual_deg)
 
 
 def well_registered(stats: dict[str, Any], pose_source: str) -> bool:

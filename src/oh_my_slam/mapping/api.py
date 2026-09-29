@@ -8,7 +8,9 @@ latest wins → fused cloud → objects → object ids of the cloud → scene ex
 
 The keyframes of one update are one observation of the scene: latest wins, object association
 and the cloud's colours and labels do not depend on their order (``validity``, ``objects``,
-``geometry``); only a later update wins over an earlier one. Capture timestamps are never read.
+``geometry``); a later update wins over an earlier one, and within an update only a place that
+the camera left and came back to is judged by order of addition (``objects.revisiting_frames``).
+Capture timestamps are never read.
 """
 
 from __future__ import annotations
@@ -352,6 +354,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     if len(component) < 2:
         component = new_names
     model: SfmModel | None = None
+    scaleless = False
     if not rotation:
         turns = sfm.rotation_pairs()
         model = _vetted(ctx, sfm.map_global(ctx.work / "sfm_global"), turns)
@@ -363,6 +366,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             ratio = model.baseline_ratio()
             ctx.notes["baseline_ratio"] = ratio
             rotation = ratio < ROTATION_BASELINE_RATIO
+            scaleless = not rotation and not _metric_scale_known(model, ctx)
+            rotation = rotation or scaleless
             if not rotation:
                 model = _complete_registration(sfm, model, new_names, ctx.work)
                 _vet(ctx, model, turns)
@@ -371,7 +376,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                 model = _join_unplaced(ctx, sfm, model, new_names, turns, is_video, client,
                                        progress)
                 return model
-    reason = "rotation-dominant input" if rotation else "SfM placed too few frames"
+    reason = ("no metric scale from the SfM points" if scaleless else "rotation-dominant input"
+              if rotation else "SfM placed too few frames")
     progress(f"multi-view fallback ({reason}); {len(component)} connected keyframes")
     todo = [v for v in _new_pool(ctx) if v.name in component]
     poses = _multiview_poses(ctx, todo, [], client)
@@ -384,6 +390,19 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     progress(f"multi-view + refinement: {len(mv_model.registered)} keyframes in "
              f"{time.perf_counter() - t0:.0f} s")
     return mv_model
+
+
+def _metric_scale_known(model: SfmModel, ctx: UpdateContext) -> bool:
+    """Whether the SfM points fix the model's metric scale (``frame.metric_scale``: some keyframe
+    has enough well-triangulated points). A few keyframes panned from one spot triangulate too few:
+    their SfM units are arbitrary (a camera 8 cm from the last one placed 3 m away), and the
+    depth of the keyframes, in metres, would not fit the poses. The multi-view poses, in metres
+    already, do."""
+    try:
+        mframe.metric_scale(model, _frame_depths(ctx))
+    except ValueError:
+        return False
+    return True
 
 
 def _keyframe_intrinsics(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> dict[str, Intrinsics]:
@@ -1249,6 +1268,8 @@ def integrate(ctx: UpdateContext, progress: Progress
     fused = fuse_map(ctx, records)  # stage cloud; the objects test surface continuity on it
     with timing.stage("objects"):
         objs = objects.update_objects(ctx, records, progress, surface=fused.xyz)
+    if objs.invalidated:  # objects removed: their pixels are gone from the keyframes, fuse again
+        fused = fuse_map(ctx, records)
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
     with timing.stage("objects"):
         assert geo.cloud.label is not None

@@ -440,12 +440,40 @@ point leaves the map untouched. One killed after it is completed by the next upd
   * Object association groups all of the update's instances at once, strongest agreement first.
   * Latest wins and the cloud's colours and object ids do not depend on keyframe order either.
   * Order only affects keyframe names and the numbering of new objects (by their earliest
-    keyframe).
+    keyframe), and a place that changed during the update (see *Later wins*).
 * **Later wins.** "Latest" is the order of addition. A later update invalidates, per pixel, the
   parts of older keyframes that it contradicts: free space seen behind an old point, or a new
   surface in front of an old ray. It also removes, or gives a strike to, objects that it sees
-  through. Keyframes of the same update never invalidate each other. Capture timestamps are
-  never read.
+  through. Keyframes of the same update never invalidate each other's pixels. Capture timestamps
+  are never read.
+  * **Removing an object.** An update removes an object of an earlier map when most of the
+    keyframes that see enough of it (in view, unoccluded, at least half of the samples that fall
+    in the image) see through it: at least 60 % of its samples lie in front of a surface farther
+    than a margin. The margin is max(0.25 m, 15 % of the depth), but for a small object at most
+    15 % of its own extent (at least max(5 cm, 8 % of the depth), the depth noise): a cup on a
+    windowsill is seen through by 5-20 cm. A keyframe judges when it is well registered, or when
+    its pose was refined with feature matches and the matches' residual, seen from the object's
+    distance, is at most 15 % of the object's extent (2° is 2.5 cm at 0.7 m). Three keyframes
+    remove it. Fewer remove an object detected in at least 4 keyframes when every one of them
+    sees at least 70 % through, else the object gets a strike, and a second strike from a later
+    update removes it. An update that sees it in place clears its strikes.
+  * **The removed object's pixels go too.** Its detection masks are invalidated in the keyframes
+    that detected it (`valid.png`), so the fused map cloud loses the object's points together
+    with its record.
+  * **A place that changed within one update.** The order of addition is the only sign of
+    "latest", so an update whose last keyframes contradict its first ones ends with the latter:
+    mapping `examples/office_sequence` in one update leaves the map without the cup, as mapping
+    it in two does. An object the update detected is judged, by the rule above, by the update's
+    keyframes that photograph its place again: added after a keyframe that no longer had at
+    least half of the object in view (the camera looked away after the last detection), and at
+    about the same viewpoint as a keyframe that detected it (camera distance over the object's
+    viewing depth plus 1 − cos of the angle between the optical axes, at most 0.35). Keyframes
+    that watch a place continuously (a video's neighbours, a sweep) or see it from another side
+    are one observation of it and never remove it: their disagreements are depth errors (monocular
+    depth of one object differs by tens of percent between viewpoints metres apart). An update
+    still counts once: it gives an object one strike at most, and no keyframe of it invalidates
+    another's pixels. The ids of the update's detections stay counted, so the other objects keep
+    theirs.
 * **Persistent identity.** Each object keeps one id and one colour for the life of the map, and
   its OBB is refitted from all accumulated evidence:
   * New ids come from a counter and are never reused.
@@ -597,8 +625,11 @@ Geometry and detection requests run concurrently on two connections.
      keyframes, incremental mapping runs instead. Rotation-dominant input goes to MapAnything
      multi-view poses followed by triangulation and bundle adjustment. Input counts as
      rotation-dominant when more than half of the verified pairs are panoramic, or when the
-     baseline-to-depth ratio is below 0.02. MapAnything runs in chunks of 24, anchored on up to
-     4 already-posed keyframes, and is also the fallback when SfM fails.
+     baseline-to-depth ratio is below 0.02, or when the SfM points fix no metric scale (no
+     keyframe has 50 well-triangulated points: a few photos panned from one spot, whose SfM
+     units are arbitrary — the camera 8 cm from the last one placed 3 m away). MapAnything runs
+     in chunks of 24, anchored on up to 4 already-posed keyframes, and is also the fallback when
+     SfM fails.
    * **Weakly linked parts of a new map** (typical of a video walk through several rooms): a
      stretch that hangs on the rest by one weak link — a doorway crossed with a few dozen
      matches, or one keyframe shared with the rest — has no scale of its own for the global
