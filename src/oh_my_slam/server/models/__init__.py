@@ -8,17 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Protocol
-
-
-class ModelAdapter(Protocol):
-    key: str
-    name: str
-    required: bool
-
-    def load(self, device: str) -> None: ...
-
-    def warmup(self) -> None: ...
+from typing import Any
 
 
 def select_device() -> str:

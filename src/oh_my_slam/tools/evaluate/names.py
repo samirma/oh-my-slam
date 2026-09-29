@@ -16,7 +16,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-TILTS = ("level", "up", "down")
 IMAGE_SUFFIXES = (".jpg", ".jpeg")
 # The spec's same-heading pairs (capture numbers): 053 returns to 001's heading, and 078
 # (right_150 = -150°) meets 026 (left_210 = +210°), which closes the 360° loop.

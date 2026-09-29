@@ -515,7 +515,7 @@ class MapObject:
         return SceneObject(
             id=self.id, label=self.label, score=self.score, obb=self.obb,
             pixel_count=self.pixel_count, point_count=self.point_count,
-            observations=self.observations, confirmed=self.confirmed, frames=list(self.frames),
+            observations=self.observations, frames=list(self.frames),
             labels=(self.label, *(lab for lab, _ in sorted(self.label_votes.items(),
                                                            key=lambda kv: (-kv[1], kv[0]))
                                   if lab != self.label)),

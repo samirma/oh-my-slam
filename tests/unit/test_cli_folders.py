@@ -75,6 +75,23 @@ def test_mapper_refuses_a_non_empty_folder_that_is_not_a_map(stub_server: None, 
         assert snapshot(folder) == before, name
 
 
+def test_mapper_refuses_a_non_map_folder_with_the_server_down(tmp_path: Path,
+                                                               image: Path) -> None:
+    """No server runs here: the refusal (exit 4) comes before the server is contacted, and the
+    folder is untouched (no lock file). A new or empty folder still needs the server (exit 3)."""
+    for name, folder in _non_map_folders(tmp_path).items():
+        before = snapshot(folder)
+        res = sh("mapper.sh", "update", "-i", str(image), "-m", str(folder))
+        assert res.returncode == 4, (name, res.stderr.decode())
+        assert res.stdout == b"" and b"not empty and not a map" in res.stderr, name
+        assert snapshot(folder) == before, name
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    for folder in (empty, tmp_path / "new"):
+        res = sh("mapper.sh", "update", "-i", str(image), "-m", str(folder))
+        assert res.returncode == 3, res.stderr.decode()
+
+
 @pytest.mark.parametrize("args", [
     ["segment.sh", "-i", "{image}", "-o", "{bad}/out.json"],
     ["segment.sh", "-i", "{image}", "-d", "{bad}/out"],

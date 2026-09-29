@@ -144,7 +144,6 @@ ATTRIBUTES: tuple[AttrSpec, ...] = (
              "binary_little_endian 1.0 or ASCII PLY", False, _choice(ENCODINGS), str),
 )
 _BY_KEY = {a.key: a for a in ATTRIBUTES}
-KEYS = tuple(_BY_KEY)
 
 
 def applicable(scope: CloudScope) -> tuple[AttrSpec, ...]:

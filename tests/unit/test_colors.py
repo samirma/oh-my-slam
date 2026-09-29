@@ -103,6 +103,6 @@ def test_hex_helpers_and_invalid_id() -> None:
     assert c.rgb_to_hex((10, 11, 12)) == "#0a0b0c"
     with pytest.raises(ValueError):
         c.color_for_id(0)
-    assert np.array(c.UNSEGMENTED).tolist() == [128, 128, 128] and c.UNSEGMENTED_HEX == "#808080"
+    assert np.array(c.UNSEGMENTED).tolist() == [128, 128, 128] and c.rgb_to_hex(c.UNSEGMENTED) == "#808080"
     assert c.oklab((255, 255, 255))[0] == pytest.approx(1.0, abs=1e-4)
     assert c.contrast_ratio((0, 0, 0), (255, 255, 255)) == pytest.approx(21.0)

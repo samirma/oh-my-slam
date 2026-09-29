@@ -172,6 +172,16 @@ def classify(root: Path) -> str:
     return "other" if any(p.name not in TOOL_ENTRIES for p in root.iterdir()) else "empty"
 
 
+def refuse_non_map(root: Path) -> str:
+    """``classify(root)``, raising ``NotAMapError`` for a non-empty folder that is not a map (spec
+    2.3: refused and left untouched). Cheap and server-free, so callers check it first."""
+    state = classify(root)
+    if state == "other":
+        raise NotAMapError(f"{Path(root).resolve()} is not empty and not a map; "
+                           "use a new or empty folder")
+    return state
+
+
 def _committed_manifest(root: Path) -> list[str] | None:
     marker = root / STAGING / COMMIT
     if not marker.is_file():
@@ -250,10 +260,7 @@ class MapTransaction:
     # -- lifecycle -------------------------------------------------------------------------------
 
     def __enter__(self) -> MapTransaction:
-        state = classify(self.root)
-        if state == "other":
-            raise NotAMapError(
-                f"{self.root} is not empty and not a map; use a new or empty folder")
+        state = refuse_non_map(self.root)
         self.created = state in ("missing", "empty")
         self.root.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.root / LOCK, os.O_RDWR | os.O_CREAT, 0o644)

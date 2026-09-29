@@ -17,13 +17,14 @@ from oh_my_slam.mapping import api
 from oh_my_slam.mapping.store import FrameRecord, frame_file
 from oh_my_slam.reconstruction.depth import (
     MAX_FACTOR,
+    PAIR_MIN_POINTS,
     BinRatio,
     DepthCorrection,
     DepthView,
+    _transfer,
     adjust_depth_corrections,
     pair_bins,
-    pair_log_ratio,
-    transfer_log_ratios,
+    robust_ratio,
 )
 from tests.synth.turning import depth_grid, head_pose
 
@@ -76,12 +77,24 @@ def solve(views: list[DepthView], pairs: list[tuple[int, int]], fixed: set[int],
     return corr
 
 
+def pair_log_ratio(a: DepthView, b: DepthView) -> float | None:
+    """How much deeper keyframe ``a`` places the surfaces both keyframes see than ``b`` does (log;
+    the mean of the robust a→b and reversed b→a transfer ratios); None when neither direction
+    transfers ``PAIR_MIN_POINTS`` points onto the same surface."""
+    parts = []
+    for sign, src, dst in ((1.0, a, b), (-1.0, b, a)):
+        r = _transfer(src, dst)[0]
+        if len(r) >= PAIR_MIN_POINTS:
+            parts.append(sign * float(np.log(robust_ratio(np.exp(r), np.ones_like(r)).scale)))
+    return float(np.mean(parts)) if parts else None
+
+
 def worst_pair(views: list[DepthView], corr: list[DepthCorrection],
                pairs: list[tuple[int, int]]) -> float:
     """The largest median |log ratio| over the pairs, at the corrected depths."""
     out = 0.0
     for i, j in pairs:
-        r = transfer_log_ratios(views[i].corrected(corr[i]), views[j].corrected(corr[j]))
+        r = _transfer(views[i].corrected(corr[i]), views[j].corrected(corr[j]))[0]
         if len(r) >= 300:
             out = max(out, float(np.median(np.abs(r))))
     return out
@@ -96,7 +109,7 @@ def test_loop_scale_drift_is_removed_by_the_global_adjustment() -> None:
     pairs = overlapping(poses)
     assert (0, N - 1) in pairs  # the loop closure
     closing = pair_log_ratio(views[N - 1], views[0])
-    assert closing is not None and closing.log_ratio > 0.1  # 10 %+ disagreement where it closes
+    assert closing is not None and closing > 0.1  # 10 %+ disagreement where it closes
     corr = solve(views, pairs, {0})
     # every keyframe's error is undone (the first one holds the gauge), without a tilt ...
     for d, v, c in zip(true, views, corr, strict=True):
@@ -105,7 +118,7 @@ def test_loop_scale_drift_is_removed_by_the_global_adjustment() -> None:
         assert abs(c.slope) < 0.02
     # ... and the keyframes that close the loop agree with those that opened it
     after = pair_log_ratio(views[N - 1].corrected(corr[N - 1]), views[0])
-    assert after is not None and abs(after.log_ratio) < 0.01
+    assert after is not None and abs(after) < 0.01
 
 
 def test_near_far_errors_are_removed_where_one_scale_cannot() -> None:
@@ -257,7 +270,7 @@ def test_an_update_that_closes_the_loop_re_scales_the_map_too(tmp_path: Path) ->
     first = np.load(tmp_path / frame_file(old[0].name, "depth.npy")).astype(np.float64)
     closing = pair_log_ratio(DepthView(new[-1].depth, KG.K(), poses[-1].matrix()),
                              DepthView(first, KG.K(), poses[0].matrix()))
-    assert closing is not None and abs(closing.log_ratio) < 0.015
+    assert closing is not None and abs(closing) < 0.015
     for nf in new:
         assert "depth_scale_adjusted" in nf.record.stats and "depth_exponent" in nf.record.stats
 

@@ -124,7 +124,7 @@ def test_viewer_only_calls_the_owners_apis() -> None:
 
 def test_viewer_page_has_no_palette_or_randomness() -> None:
     """Colours reach the page only as data (scene JSON, derived clouds); nothing random."""
-    from oh_my_slam.segmentation.colors import PALETTE_HEX, UNSEGMENTED_HEX
+    from oh_my_slam.segmentation.colors import PALETTE_HEX, UNSEGMENTED, rgb_to_hex
 
     static = SRC / "viewer" / "static"
     pages = [p for p in static.rglob("*") if p.suffix in (".js", ".html", ".css")
@@ -132,7 +132,7 @@ def test_viewer_page_has_no_palette_or_randomness() -> None:
     assert pages
     for p in pages:
         text = p.read_text("utf-8").lower()
-        assert not [h for h in (*PALETTE_HEX, UNSEGMENTED_HEX) if h in text], p
+        assert not [h for h in (*PALETTE_HEX, rgb_to_hex(UNSEGMENTED)) if h in text], p
         assert "math.random" not in text, p
 
 

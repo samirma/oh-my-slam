@@ -266,48 +266,6 @@ def _transfer(src: DepthView, dst: DepthView, scale_src: float = 1.0, scale_dst:
     return r[same], log_src[same], log_d[same]
 
 
-def transfer_log_ratios(src: DepthView, dst: DepthView, scale_src: float = 1.0,
-                        scale_dst: float = 1.0) -> NDArray[np.float64]:
-    """log(z / d) of ``src``'s sampled points on the same surface in ``dst`` (``_transfer``)."""
-    return _transfer(src, dst, scale_src, scale_dst)[0]
-
-
-def _robust_centre(r: NDArray[np.float64]) -> tuple[float, float]:
-    """Median and 1.4826 MAD after 3-MAD rejection."""
-    med = float(np.median(r))
-    mad = float(np.median(np.abs(r - med))) * 1.4826 + 1e-9
-    keep = r[np.abs(r - med) <= MAD_K * mad]
-    med = float(np.median(keep))
-    return med, float(np.median(np.abs(keep - med))) * 1.4826
-
-
-@dataclass(frozen=True)
-class PairRatio:
-    """How much deeper keyframe ``a`` places the surfaces both keyframes see than ``b`` does:
-    ``log_ratio`` ≈ log(s_a / s_b) for per-keyframe scale errors s (symmetric: half the
-    difference of the a→b and b→a transfers), the robust spread of the per-pixel log ratios, and
-    the number of transferred points."""
-
-    log_ratio: float
-    spread: float
-    points: int
-
-
-def pair_log_ratio(a: DepthView, b: DepthView, scale_a: float = 1.0, scale_b: float = 1.0,
-                   min_points: int = PAIR_MIN_POINTS) -> PairRatio | None:
-    """``PairRatio`` of two keyframes with their depths multiplied by ``scale_a`` / ``scale_b``;
-    None when neither direction transfers ``min_points`` points onto the same surface."""
-    ab = _transfer(a, b, scale_a, scale_b)[0]
-    ba = _transfer(b, a, scale_b, scale_a)[0]
-    parts = [(r, sign) for r, sign in ((ab, 1.0), (ba, -1.0)) if len(r) >= min_points]
-    if not parts:
-        return None
-    centres = [(sign * m, s) for (r, sign) in parts for m, s in [_robust_centre(r)]]
-    return PairRatio(float(np.mean([m for m, _ in centres])),
-                     float(np.mean([s for _, s in centres])),
-                     int(sum(len(r) for r, _ in parts)))
-
-
 @dataclass(frozen=True)
 class BinRatio:
     """Keyframe ``src``'s sampled points of one depth bin, transferred into keyframe ``dst``:

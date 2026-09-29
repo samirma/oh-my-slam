@@ -58,7 +58,6 @@ class SceneObject:
     pixel_count: int
     point_count: int
     observations: int = 1
-    confirmed: bool = True
     frames: list[int] = field(default_factory=list)
     # every label the object was detected as, most evidence first (a map object whose label
     # flickered between keyframes); empty or one label: just ``label``

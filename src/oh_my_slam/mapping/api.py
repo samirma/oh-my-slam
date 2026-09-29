@@ -1311,6 +1311,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
     stage = timing.stage
     t_start = time.perf_counter()
     spec = ingest.resolve_inputs(inputs)
+    store.refuse_non_map(map_dir)  # before the server: a non-map folder is refused even if it is down
     client = client or connect()
     work = Path(tempfile.mkdtemp(prefix="update-", dir=paths.scratch_dir()))
     try:

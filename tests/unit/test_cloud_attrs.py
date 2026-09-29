@@ -8,7 +8,6 @@ import pytest
 
 from oh_my_slam.core.cloud_attrs import (
     ATTRIBUTES,
-    KEYS,
     CloudAttrs,
     CloudScope,
     help_text,
@@ -17,6 +16,7 @@ from oh_my_slam.core.cloud_attrs import (
 from oh_my_slam.core.errors import ExitCode, UsageError
 
 IMAGE, MAP, SEGMENT = CloudScope.IMAGE, CloudScope.MAP, CloudScope.SEGMENT
+KEYS = tuple(a.key for a in ATTRIBUTES)
 PIXEL_KEYS = ("stride", "min-depth", "max-depth", "edge")
 
 
