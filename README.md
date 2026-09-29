@@ -732,6 +732,9 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * `mapper.sh update` on the sequence, once in one update and once split across `--splits`
   updates (default and minimum 3)
 * `segment.sh -m` and `view.sh -m` on both maps
+* `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
+  ones): the whole sequence in one update, and as an extended map (an update with the early images,
+  then one with the rest)
 
 Video sampling (`-fps`) is not covered, because the examples contain no video. The metric groups
 are:
@@ -741,6 +744,7 @@ are:
 | `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
 | `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); near-duplicate objects (compatible labels, or both horizontal-surface labels at one height; never detected in the same keyframe; boxes within 0.3 m); the largest share of an object's detected mask points (lifted with the detecting keyframe's depth) outside its box grown by the depth noise, max(5 cm, 5 % of the depth), and, as a check of the mapper's attribution gate, of its cloud points outside that gate; and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
+| `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
 | `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
@@ -768,9 +772,6 @@ from the baseline and the tolerance it exceeded.
 To keep a finished run as the baseline, either pass `--set-baseline` to the run itself or store
 it afterwards:
 
-* `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
-  ones): the whole sequence in one update, and as an extended map (an update with the early images,
-  then one with the rest)
 ```sh
 uv run python -m oh_my_slam.tools.evaluate --resummarise latest --set-baseline
 ```
@@ -780,7 +781,6 @@ newest `<UTC>` folder) against the current targets and baseline again, and rewri
 `result.json` and `summary.md`. Use it after editing the targets, or with `--set-baseline` to
 store that run as the baseline.
 
-| `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by default:
 
 * `result.json` (machine-readable)
