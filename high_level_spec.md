@@ -119,6 +119,8 @@ current. "Latest" is the order of addition: a later update wins over an earlier 
 Frames within one update count as one observation of the scene. Capture timestamps are not
 used.
 
+As example is this examples/office_sequence that the first images has a cup and the last one don't, as result the expected map is to no longer have that cup there
+
 Object identity is persistent: an object observed across several frames keeps one `id` and
 one colour for the lifetime of the map, and its OBB is refined as evidence accumulates.
 
@@ -254,6 +256,11 @@ every entry point, using the files in `examples/` as reference inputs. Video sam
   and — on the resulting map — for `segment.sh -m` and `view.sh -m`. File names encode the
   **commanded** head motion as `NNN_<motion>_<tilt>.jpg`:
   * `NNN` — capture order
+* `examples/office_sequence/` — an ordered 13-image sequence (file names are capture
+  timestamps) of an office scene that changes during the capture: a cup visible in the
+  first images is gone in the last ones. Reference input for the map-update behaviour of
+  §2.3: mapping the whole sequence must produce a map that reflects the latest
+  observation — without the cup.
 
 The evaluators must report at least:
 
@@ -266,6 +273,9 @@ The evaluators must report at least:
 * **Map quality** — point-cloud consistency across overlapping frames (e.g. the same-heading
   pairs above), and stability of object `id`s, labels and OBBs when the same sequence is
   mapped in one update versus split across several.
+* **Map update** — on `examples/office_sequence/`, the final map reflects the latest
+  observation: the cup visible in the first images is absent from the map after the full
+  sequence is mapped, while objects that never changed keep their `id`s, labels and OBBs.
 * **Segmentation** — detections, labels and scores per frame (`restaurant.jpg` and each
   `ainex-captures` frame), compared with the map's objects for the frames that observe them.
 * **Contracts**, for every command — colour contract, OpenLABEL validity, stdout purity.
