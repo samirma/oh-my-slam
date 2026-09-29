@@ -38,6 +38,7 @@ from oh_my_slam.segmentation.detect import (
     detect,
     grounding,
     priority,
+    request_floor,
 )
 from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
@@ -186,8 +187,8 @@ def segment_frame(
 ) -> FrameSegmentation:
     """Objects of one image in its camera frame.
 
-    ``detections`` must be every detection down to ``DETECTION_FLOOR`` (as ``detect`` and
-    ``reconstruct_and_detect`` return them), whatever ``min_score``: overlapping pixels are
+    ``detections`` must be every detection down to ``request_floor(min_score)`` (as
+    ``reconstruct_and_detect`` returns them for that ``min_score``): overlapping pixels are
     resolved once among all of them (``pixel_owners``), and only then are the objects below
     ``min_score`` dropped. An object's mask, points and OBB therefore never depend on
     ``min_score``, nor does whether it survives lifting.
@@ -200,7 +201,8 @@ def segment_frame(
     if not DETECTION_FLOOR <= min_score <= 1.0:
         raise ValueError(f"min_score {min_score} is outside [{DETECTION_FLOOR}, 1]")
     if detections is None:
-        detections = detect(frame.image_path, min_score=DETECTION_FLOOR,
+        lowest = request_floor(min_score)
+        detections = detect(frame.image_path, min_score=lowest, floor=lowest,
                             max_side=max(frame.grid_size), client=client)
     instances = sorted(lift_detections(frame, detections, min_score=min_score),
                        key=lambda i: priority(i.detection))
@@ -235,8 +237,9 @@ def detect_alongside(
 ) -> tuple[FrameReconstruction, list[Detection]]:
     """Detections of ``image_path`` requested on a second connection while the caller's
     ``reconstruct(client)`` runs, so the server's queue stays busy while this process decodes and
-    post-processes. ``max_side`` must be the reconstruction's grid; the server is asked for
-    everything above ``floor`` (default: ``min_score``)."""
+    post-processes. ``max_side`` must be the reconstruction's grid (the masks' grid; the
+    detections do not depend on it); the server is asked for everything above ``floor``
+    (default: ``min_score``)."""
     from concurrent.futures import ThreadPoolExecutor
 
     det_client = client.clone()
@@ -256,17 +259,20 @@ def detect_alongside(
 def reconstruct_and_detect(
     image_path: Path,
     client: InferenceClient,
+    min_score: float = DEFAULT_MIN_SCORE,
 ) -> tuple[FrameReconstruction, list[Detection]]:
     """Single-image reconstruction (delegated to ``reconstruction``) and detection, issued
-    concurrently. Returns every detection down to ``DETECTION_FLOOR``: ``segment_frame`` applies
-    ``--min-score`` after resolving overlaps, so the objects kept do not depend on it."""
+    concurrently. Returns every detection down to ``request_floor(min_score)``:
+    ``segment_frame`` applies ``min_score`` after resolving overlaps, so the objects kept do not
+    depend on it."""
 
     def reconstruct(c: InferenceClient) -> FrameReconstruction:
         return reconstruct_image(image_path, want_gravity=True, client=c, max_side=MAX_GRID_SIDE,
                                  num_tokens=SINGLE_IMAGE_TOKENS)
 
+    floor = request_floor(min_score)
     return detect_alongside(image_path, client, reconstruct, max_side=MAX_GRID_SIDE,
-                            min_score=DETECTION_FLOOR, floor=DETECTION_FLOOR)
+                            min_score=floor, floor=floor)
 
 
 @dataclass
