@@ -34,11 +34,25 @@ def preflight_file(path: Path, option: str) -> None:
     path = Path(path)
     if path.is_dir():
         raise UsageError(f"{option} {path} is a folder; give the path of the file to write")
+    if _is_special(path):
+        if not os.access(path, os.W_OK):
+            raise UsageError(f"{option} {path}: cannot write there (permission denied)")
+        return
     preflight_dir(path.parent, option)
+
+
+def _is_special(path: Path) -> bool:
+    """An existing file that is not a regular file (``/dev/null``, a FIFO): written in place, since
+    it cannot be replaced by a rename."""
+    return path.exists() and not path.is_file()
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     path = Path(path)
+    if _is_special(path):
+        with path.open("wb") as f:
+            f.write(data)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     os.fchmod(fd, _FILE_MODE)
