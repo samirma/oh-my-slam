@@ -226,7 +226,12 @@ def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: i
     assert not set(sofa[8]) & set(cushion[8]) and cushion[6] > 500  # the cushion's own pixels
     assert _objects(client, img, 0.5) == runs[0.5]  # re-running gives the same ids and colours
     assert _objects(client, img, 0.5, via_cli_path=True) == runs[0.5]  # same code, same objects
-    assert len(set(confs)) == 1  # the server request does not depend on --min-score
+    # the server request depends on --min-score only by tier (request_floor): below the default
+    # everything down to DETECTION_FLOOR, from the default up nothing below it (the objects at
+    # 0.5 are the same either way: the equality above for 0.3 vs 0.5)
+    assert {round(c, 4) for c in confs} == {detect.DETECTION_FLOOR, detect.TRUSTED_SCORE}
+    assert detect.request_floor(0.3) == detect.DETECTION_FLOOR
+    assert detect.request_floor(0.5) == detect.request_floor(0.85) == detect.TRUSTED_SCORE
     with pytest.raises(ValueError):
         detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR / 2)
     frame = reconstruct_image(img, client=client)
@@ -274,6 +279,103 @@ def test_segment_frame_does_not_depend_on_the_detection_order(overlapping) -> No
 
     client.segment_image = reversed_order  # type: ignore[method-assign]
     assert _objects(client, img, 0.3) == ref
+
+
+class PassDetector:
+    """A detector whose output depends on the image it is shown, like YOLOE: on the fine pass
+    (the image at 1024 px) a dark screen is a 'television' at 0.13 and a window with its frame
+    scores 0.51; on the coarse pass (768 px, upsampled by the detector) the screen is a 'computer
+    monitor' at 0.56, the window without its frame (IoU 0.67) scores 0.7, and a wire appears
+    (small: the coarse pass's small detections are dropped). Regions are fractions of the image."""
+
+    FINE = (("television", 0.13, (0.3, 0.1, 0.8, 0.5)), ("cup", 0.9, (0.05, 0.5, 0.12, 0.6)),
+            ("window", 0.51, (0.0, 0.0, 0.3, 0.45)))
+    COARSE = (("computer monitor", 0.56, (0.3, 0.1, 0.8, 0.5)),
+              ("window", 0.7, (0.0, 0.0, 0.3, 0.3)), ("wire", 0.6, (0.5, 0.6, 0.55, 0.62)))
+
+    def __init__(self, size: tuple[int, int]) -> None:
+        self.size = size
+        self.requests: list[tuple[int, int, float]] = []
+
+    def clone(self) -> PassDetector:
+        return self
+
+    def close(self) -> None:
+        pass
+
+    def segment_image(self, req):  # type: ignore[no-untyped-def]
+        from oh_my_slam.client import protocol as p
+        from oh_my_slam.core import rle
+        from oh_my_slam.core.images import size_at_max_side
+
+        self.requests.append((req.max_side, req.imgsz, req.conf))
+        w, h = size_at_max_side(*self.size, req.max_side)
+        fine = req.max_side >= max(self.size) or req.max_side == detect.DETECT_SIDE
+        inst = []
+        for label, score, (x0, y0, x1, y1) in self.FINE if fine else self.COARSE:
+            if score <= req.conf:
+                continue
+            box = [x0 * w, y0 * h, x1 * w, y1 * h]
+            m = np.zeros((h, w), bool)
+            m[round(box[1]):round(box[3]), round(box[0]):round(box[2])] = True
+            inst.append(p.Instance(label=label, score=score, source="yoloe", box_xyxy=box,
+                                   mask=rle.encode(m)))
+        return p.SegmentResponse(width=w, height=h, instances=inst)
+
+
+def _signature(dets: list[detect.Detection]) -> list[tuple[str, float, float]]:
+    return [(d.label, d.score, round(d.area / d.mask.size, 2)) for d in dets]
+
+
+def test_detections_do_not_depend_on_the_callers_grid(tmp_path: Path) -> None:
+    """``segment.sh -i`` (1024 px grid) and the mapper (768 px keyframe grid, via
+    ``detect_alongside``) get the same detections of one image: the detector is shown the same
+    fine and coarse inputs, and only the masks are resampled onto each grid (critic OI-1: the
+    monitor the mapper found and segment.sh -i missed)."""
+    from oh_my_slam.segmentation.api import detect_alongside
+
+    img = tmp_path / "desk.png"
+    Image.new("RGB", (1600, 1200)).save(img)
+    client = PassDetector((1600, 1200))
+    single = detect.detect(img, client=client, min_score=0.5, floor=0.5)  # type: ignore[arg-type]
+    assert {r[:2] for r in client.requests} == {(1024, 1024), (768, 1024)}
+    client.requests.clear()
+    _, keyframe = detect_alongside(img, client, lambda c: None,  # type: ignore[arg-type,return-value]
+                                   max_side=768)
+    assert {r[:2] for r in client.requests} == {(1024, 1024), (768, 1024)}
+    assert [d.mask.shape for d in single] == [(768, 1024)] * 3
+    assert [d.mask.shape for d in keyframe] == [(576, 768)] * 3
+    # one window (the passes' detections of it are one object), the monitor, no wire
+    assert _signature(single) == _signature(keyframe) == [
+        ("cup", 0.9, 0.01), ("window", 0.7, 0.09), ("computer monitor", 0.56, 0.2)]
+    x0, y0, x1, y1 = keyframe[2].box
+    assert (x0, y0, x1, y1) == pytest.approx((0.3 * 768, 0.1 * 576, 0.8 * 768, 0.5 * 576))
+    # down to the floor: the fine pass's television and 0.51 window are the coarse pass's objects
+    low = detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR,  # type: ignore[arg-type]
+                        max_side=768)
+    assert _signature(low) == _signature(keyframe)
+
+
+def test_small_images_take_one_detection_pass(tmp_path: Path) -> None:
+    img = tmp_path / "small.png"
+    Image.new("RGB", (640, 480)).save(img)
+    client = PassDetector((640, 480))
+    dets = detect.detect(img, client=client, max_side=768)  # type: ignore[arg-type]
+    assert [r[0] for r in client.requests] == [detect.DETECT_SIDE]
+    assert [d.label for d in dets] == ["cup", "window"] and dets[0].mask.shape == (480, 640)
+
+
+def test_fuse_passes_and_resample_mask() -> None:
+    a = detect.Detection("window", 0.51, "yoloe", _rect(0, 6, 0, 10), (0, 0, 10, 6))
+    b = detect.Detection("window", 0.7, "yoloe", _rect(0, 4, 0, 10), (0, 0, 10, 4))  # IoU 0.67
+    c = detect.Detection("cup", 0.6, "yoloe", _rect(0, 4, 0, 10), (0, 0, 10, 4))
+    assert detect.fuse_passes([[a], [b]]) == [b]
+    assert detect.fuse_passes([[a, c], []]) == [c, a]  # one pass: nothing is fused
+    assert detect.fuse_passes([[b], [a]]) == detect.fuse_passes([[a], [b]])  # order-free
+    m = _rect(2, 6, 4, 8)
+    np.testing.assert_array_equal(detect.resample_mask(m, (10, 10)), m)
+    half = detect.resample_mask(m, (5, 5))
+    assert half.shape == (5, 5) and half.sum() == 4 and half[1:3, 2:4].all()
 
 
 def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

@@ -61,12 +61,18 @@ def load_rgb(path: Path, max_side: int | None = None) -> NDArray[np.uint8]:
     return np.asarray(img, dtype=np.uint8)
 
 
-def resize_to_max_side(img: Image.Image, max_side: int) -> Image.Image:
-    w, h = img.size
+def size_at_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
+    """(width, height) of a w x h image downscaled so its long side is <= max_side (never up)."""
     scale = max_side / max(w, h)
     if scale >= 1.0:
+        return w, h
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def resize_to_max_side(img: Image.Image, max_side: int) -> Image.Image:
+    size = size_at_max_side(*img.size, max_side)
+    if size == img.size:
         return img
-    size = (max(1, round(w * scale)), max(1, round(h * scale)))
     return img.resize(size, Image.Resampling.LANCZOS)
 
 

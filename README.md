@@ -132,9 +132,10 @@ Exactly one of `-i` and `-m` is required.
 `--min-score` only adds or removes objects. The objects kept at two thresholds have the same id,
 colour, mask, points and box, for these reasons:
 
-* The detector is always asked for every detection scoring above the fixed floor of 0.05. The
-  floor has no effect on the default output: detections below 0.5 are dropped by the default
-  threshold, never claim pixels from one at or above it, and rank after it in ids.
+* Below 0.5 the detector is asked for every detection scoring above the floor of 0.05; from
+  0.5 up, for those scoring 0.5 or more. The detections between the two floors have no effect
+  on an object scoring 0.5 or more: they never claim pixels from it, never suppress it, and rank
+  after it in ids.
 * Overlapping masks are resolved among all of those detections before the threshold applies.
   Every pixel goes to at most one detection:
   * Detections scoring 0.5 or more claim pixels first, smallest mask first. A nested object
@@ -613,9 +614,17 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
 2. **Depth:** MoGe-2 metric depth on a grid whose long side is at most 1024 px. Point colours
    are the resized pixels.
 3. **Gravity:** GeoCalib, refined by a RANSAC floor plane within 5°.
-4. **Detection:** YOLOE detections above the 0.05 floor. Background labels (wall, floor,
-   ceiling, …) are prompted but never reported. Masks under 64 px are dropped, and duplicates
-   across labels are removed (mask IoU > 0.7, higher priority wins).
+4. **Detection:** YOLOE detections above the floor (0.05 below the default threshold, 0.5 from
+   it up), in two passes over the image: a fine pass on the image at 1024 px, and a coarse pass
+   on the image at 768 px, which the detector upsamples to its 1024 px input. The coarse pass
+   finds large plain objects that fine detail misleads, such as a dark monitor showing a menu
+   bar, and contributes only detections covering at least 5 % of the image. It is skipped for
+   images of 768 px or less. A detection overlapping a higher-scoring one of the other pass
+   (mask IoU > 0.5) is the same object and is dropped. What the detector is shown never depends
+   on the depth grid: the masks are resampled onto it, so the mapper's 768 px keyframes get the
+   same detections as `segment.sh -i`. Background labels (wall, floor, ceiling, …) are prompted
+   but never reported. Masks under 64 px are dropped, and duplicates across labels are removed
+   (mask IoU > 0.7, higher priority wins).
 5. **Exclusive masks and lifting:** the claim order above gives every pixel at most one owner,
    and the masks are lifted to 3D without depth-edge pixels.
 6. **OBBs:** each object gets an upright OBB, then ids and colours are assigned. A box of a
@@ -633,7 +642,7 @@ Geometry and detection requests run concurrently on two connections.
 
 1. **Lock and stage.** Resolve the inputs into keyframes.
 2. **Per-keyframe inference.** Each keyframe gets depth (768 px grid), gravity, a descriptor and
-   detections at the default threshold. Two keyframes are processed at a time.
+   detections at the default threshold (the single-image detection, masks on the 768 px grid). Two keyframes are processed at a time.
 3. **Features and matching.** The Homebrew `colmap` CLI extracts SIFT features by default.
    ALIKED + LightGlue (ONNX/CoreML, Homebrew build only) is used with
    `OH_MY_SLAM_FEATURES=aliked`. Pairs are chosen as follows:
