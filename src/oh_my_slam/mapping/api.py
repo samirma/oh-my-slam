@@ -48,7 +48,7 @@ from oh_my_slam.mapping.sfm import (
     vet,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
-from oh_my_slam.reconstruction.depth import DepthCorrection, fit_frame_scale
+from oh_my_slam.reconstruction.depth import DepthCorrection, ScaleFit, fit_frame_scale
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.api import Detection, detect_alongside
 
@@ -531,16 +531,20 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
        (``trajectory.fix_blocks``: parts hanging on the rest by a bridge or an articulation, whose
        scale and orientation the global mapper cannot pin down), are scaled and levelled about the
        keyframe they hang on, and what hangs on them follows;
-    3. keyframes it does not hold (never registered, or not accepted by ``sfm.vet``) that verified
-       matches connect to the posed ones get anchored multi-view poses (``_multiview_poses``; for
-       video anchored on the posed keyframes next to them in capture order);
+    3. keyframes it does not hold (never registered, or not accepted by ``sfm.vet``; posed against
+       their verified matches or their depth, or left without support by those deregistered) that
+       verified matches connect to the posed ones get anchored multi-view poses
+       (``_multiview_poses``; for video anchored on the posed keyframes next to them in capture
+       order);
     4. the poses of 2 and 3 are refined with every verified match and the monocular depth, the
        rest fixed (``_refine_multiview``; the model is brought to metres first, as the multi-view
        poses and the depth are); realigned blocks are levelled with gravity again, and for video
        a run left floating far from its capture-order neighbours is moved between them;
-    5. the collapse guard (``trajectory.collapsed_keyframes``) rejects poses that coincide with
-       another keyframe's centre while showing different content, unless the matches support them,
-       and re-placed poses that still disagree with their gravity (``trajectory.tilted_keyframes``).
+    5. re-placed poses their verified matches contradict (``validity.pose_contradicted``) are
+       rejected; the collapse guard (``trajectory.collapsed_keyframes``) rejects poses that
+       coincide with another keyframe's centre while showing different content, unless the matches
+       support them, and re-placed poses that still disagree with their gravity
+       (``trajectory.tilted_keyframes``).
 
     Keyframes without a verified connection, and rejected poses, are left out (never guessed)."""
     from oh_my_slam.mapping import trajectory as traj
@@ -568,9 +572,12 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     # a keyframe whose SfM points its own depth contradicts (``_depth_contradicted``) is joined
     # like an unplaced one too, instead of being left out (or, for photos, left unfused as low
     # confidence) by the depth alignment
-    off = _depth_contradicted(ctx, model, set(posed) - set(bad_fit), photos=not is_video)
+    # so is a keyframe that the deregistrations leave without support (its points were tracks
+    # shared with a deregistered keyframe only): its pose, which nothing holds any more, would
+    # anchor the multi-view poses (``_deregister_contradicted``, ``_deregister_cascade``)
+    off, unsupported = _deregister_contradicted(ctx, model, set(posed) - set(bad_fit),
+                                                photos=not is_video)
     if off:
-        model.deregister(set(off))
         posed = {n: T for n, T in posed.items() if n not in off}
         join["depth_contradicted"] = {n: round(v, 3) for n, v in sorted(off.items())}
         log.warning("%s: %d keyframes whose SfM pose their depth contradicts (depth alignment "
@@ -578,7 +585,8 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                     model.method, len(off), ", ".join(sorted(off)))
     rereg: dict[str, Pose] = {}
     if bad_fit:
-        model.deregister(set(bad_fit))
+        weak, _ = _deregister_cascade(model, set(bad_fit), set(posed) - unsupported)
+        unsupported |= weak
         posed = {n: T for n, T in posed.items() if n not in bad_fit}
         rereg = _reregister(ctx, sfm, model, set(bad_fit))
         merged.update(rereg)
@@ -588,6 +596,12 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                     "epipolar distance > %.2f°) are registered again with the others fixed (%d) "
                     "or joined like unplaced ones: %s", model.method, len(bad_fit),
                     MAX_EPIPOLAR_DEG, len(rereg), ", ".join(sorted(bad_fit)))
+    if unsupported:
+        posed = {n: T for n, T in posed.items() if n not in unsupported}
+        join["unsupported_after_join"] = sorted(unsupported)
+        log.warning("%s: %d keyframes left without support (< %d points) by the keyframes "
+                    "deregistered above are joined like unplaced ones: %s", model.method,
+                    len(unsupported), traj.SUPPORT_MIN_POINTS, ", ".join(sorted(unsupported)))
     missing = new_names - set(posed) - set(merged) - set(realigned)
     anchored = set(posed) | set(merged) | set(realigned)
     connected = sfm.connected(anchored, missing) if missing else set()
@@ -625,6 +639,12 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
         else:  # no metric scale to place them with
             connected = set()
     left_out = (missing - connected) | (set(realigned) - set(free))
+    # a re-placed pose its own matches contradict is wrong, not uncertain (the hallway map's
+    # f000000, anchored on a keyframe 11 km off, was 23° off its 367 matches and 3.8 km from the
+    # others): left out, and it takes no part in the guards below
+    contradicted_by_matches = {n for n in (*free, *mv) if _refined_pose_contradicted(ctx, n)}
+    free = {n: T for n, T in free.items() if n not in contradicted_by_matches}
+    mv = {n: T for n, T in mv.items() if n not in contradicted_by_matches}
     final = {**posed, **merged, **free, **mv}
     supported = set(posed) | set(merged) | {
         n for n in (*free, *mv) if _refined_pose_supported(ctx, n)}
@@ -635,8 +655,13 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     free = {n: T for n, T in free.items() if n not in bad | tilted}
     mv = {n: T for n, T in mv.items() if n not in bad | tilted}
     join.update(multiview=sorted(mv), collapsed_rejected=sorted(bad),
-                gravity_rejected=sorted(tilted), no_connection=sorted(left_out))
+                gravity_rejected=sorted(tilted), residual_rejected=sorted(contradicted_by_matches),
+                no_connection=sorted(left_out))
     ctx.notes["sfm_join"] = join
+    if contradicted_by_matches:
+        log.warning("%d re-placed keyframes whose verified matches contradict their pose (median "
+                    "residual > %.0f°) are left out: %s", len(contradicted_by_matches),
+                    validity.POSE_REJECT_RESIDUAL_DEG, ", ".join(sorted(contradicted_by_matches)))
     if bad:
         log.warning("collapse guard: %d keyframes placed onto another keyframe's centre are left "
                     "out: %s", len(bad), ", ".join(sorted(bad)))
@@ -662,21 +687,27 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     return out
 
 
-def _depth_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], photos: bool
-                        ) -> dict[str, float]:
-    """The keyframes of ``names`` whose SfM pose their own depth contradicts, so that the depth
-    alignment (``_align_depths``) would leave them out, or leave a photo unfused: the sparse
-    scale it will measure (``_sparse_scale``, a fit it uses: spread at most
-    ``DENSE_MAX_SPREAD``), in units of the model's metric scale (``frame.metric_scale``), lies
-    outside ``REJECT_SCALE`` and the dense test does not support the pose either (as there:
-    ``dense_scale`` against the keyframes whose sparse scale fits; thin see-through structures in
-    front can make the sparse scale alone disagree), or, for photos, outside
-    ``DEPTH_SCALE_RANGE`` (low confidence: no neighbour covers a photo's view, a video's do). Such
-    a pose is wrong, not the depth: two photos taken walking down a hallway, which the global
-    mapper places on a forward motion it cannot resolve (at 1.3-3.9 m along it and 0.5-1.6 m
-    apart in height from run to run), measure 1.3-4. Blocks of such keyframes large enough to be
-    judged as a whole are rescaled before (``_fix_blocks``). Returns name -> sparse scale in the
-    model's units."""
+def _depth_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], photos: bool,
+                        judge: set[str] | None = None) -> dict[str, float]:
+    """The keyframes of ``judge`` (default: all ``names``, the posed keyframes, which all serve
+    as references) whose SfM pose their own depth contradicts, so that the depth alignment
+    (``_align_depths``) would leave them out, or leave a photo unfused: the sparse scale it will
+    measure (``_sparse_scale``, a fit it uses: spread at most ``DENSE_MAX_SPREAD``), in units of
+    the model's metric scale (``frame.metric_scale``), lies outside ``REJECT_SCALE`` and the dense
+    test does not support the pose either (as there: ``dense_scale`` against the keyframes whose
+    sparse scale fits; thin see-through structures in front can make the sparse scale alone
+    disagree), or, for photos, outside ``DEPTH_SCALE_RANGE`` (low confidence: no neighbour covers
+    a photo's view, a video's do). Such a pose is wrong, not the depth: two photos taken walking
+    down a hallway, which the global mapper places on a forward motion it cannot resolve (at
+    1.3-3.9 m along it and 0.5-1.6 m apart in height from run to run), measure 1.3-4. Blocks of
+    such keyframes large enough to be judged as a whole are rescaled before (``_fix_blocks``).
+
+    A photo without a sparse scale to judge by (too few points, or points that disagree among
+    themselves) is judged by its dense scale where the dense test measures one: outside
+    ``REJECT_SCALE``, the depth alignment would fuse the photo at a scale its pose contradicts,
+    and the pose would anchor others unverified (the hallway map's f000001, which nothing judged,
+    was kept 11 km off and anchored another keyframe's multi-view pose). Returns name -> sparse
+    scale (dense scale for those) in the model's metric units."""
     from oh_my_slam.reconstruction.depth import dense_scale
 
     try:
@@ -692,28 +723,94 @@ def _depth_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], ph
             sparse[n] = float(fit.scale)
     lo, hi = DEPTH_SCALE_RANGE
     fits = [n for n, sc in sparse.items() if lo <= sc * metric <= hi]
-    out: dict[str, float] = {}
-    for n, sc in sparse.items():
-        q = sc * metric
-        if REJECT_SCALE[0] <= q <= REJECT_SCALE[1]:
-            if photos and not lo <= q <= hi:
-                out[n] = q
-            continue
+
+    def dense_fit(n: str) -> ScaleFit | None:
+        """The dense scale of ``n`` against the keyframes whose sparse scale fits (None: no such
+        keyframe)."""
         T = model.pose(n)
         nf = by_name[n]
         ranked = sorted((r for r in fits if r != n), key=lambda r: -float(
             model.pose(r).R[:, 2] @ T.R[:, 2]) + 0.1 * float(np.linalg.norm(model.pose(r).t - T.t))
         )[:DENSE_REFS]
+        if not ranked:
+            return None
         refs = [(sparse[r] * by_name[r].frame.depth,
                  model.intrinsics(r).resized(*by_name[r].frame.grid_size).K(),
                  model.pose(r).matrix()) for r in ranked]
-        dense = dense_scale(nf.frame.depth, model.intrinsics(n).resized(*nf.frame.grid_size).K(),
-                            T.matrix(), refs) if refs else None
-        if dense is not None and dense.ok and dense.spread <= DENSE_MAX_SPREAD and (
-                REJECT_SCALE[0] <= dense.scale * metric <= REJECT_SCALE[1]):
+        return dense_scale(nf.frame.depth, model.intrinsics(n).resized(*nf.frame.grid_size).K(),
+                           T.matrix(), refs)
+
+    def dense_metric(n: str) -> float | None:
+        """The dense scale of ``n`` in metric units where the dense test measures one (fit and
+        spread as the alignment requires), else None."""
+        fit = dense_fit(n)
+        if fit is None or not fit.ok or fit.spread > DENSE_MAX_SPREAD:
+            return None
+        return float(fit.scale * metric)
+
+    out: dict[str, float] = {}
+    for n in sorted(names if judge is None else judge & names):
+        if n not in by_name:
+            continue
+        if n not in sparse:
+            # judged by a dense scale it measures well only: too little overlap with the
+            # references judges nothing (the 13-photo office map has 6-9 such keyframes, rightly
+            # posed); the depth alignment would fuse the photo at that scale
+            d = dense_metric(n) if photos else None
+            if d is not None and not REJECT_SCALE[0] <= d <= REJECT_SCALE[1]:
+                out[n] = d
+            continue
+        q = sparse[n] * metric
+        if REJECT_SCALE[0] <= q <= REJECT_SCALE[1]:
+            if photos and not lo <= q <= hi:
+                out[n] = q
+            continue
+        d = dense_metric(n)
+        if d is not None and REJECT_SCALE[0] <= d <= REJECT_SCALE[1]:
             continue  # the dense test supports the pose: the alignment keeps it
         out[n] = q
     return out
+
+
+def _deregister_cascade(model: SfmModel, drop: set[str], rest: set[str]
+                        ) -> tuple[set[str], set[str]]:
+    """Deregister ``drop``, then the keyframes of ``rest`` that it leaves without support
+    (``trajectory.weakened``: COLMAP drops a track with either of its two views), and so on.
+    Returns those unsupported keyframes and the keyframes of ``rest`` that kept their support but
+    lost points."""
+    from oh_my_slam.mapping.trajectory import weakened
+
+    before = model.point_counts()
+    rest = set(rest) - drop
+    unsupported: set[str] = set()
+    while drop:
+        model.deregister(drop)
+        rest -= drop
+        drop, _ = weakened(before, model.point_counts(), rest)
+        unsupported |= drop
+    _, changed = weakened(before, model.point_counts(), rest)
+    return unsupported, changed
+
+
+def _deregister_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], photos: bool
+                             ) -> tuple[dict[str, float], set[str]]:
+    """Deregister the keyframes of ``names`` whose depth contradicts their SfM pose
+    (``_depth_contradicted``) and those left without support by it (``_deregister_cascade``);
+    the keyframes that lost points to it are judged again, until none is found. Returns the
+    contradicted keyframes (name -> scale) and the unsupported ones."""
+    off: dict[str, float] = {}
+    unsupported: set[str] = set()
+    rest = set(names)
+    judge = set(names)
+    while judge:
+        found = _depth_contradicted(ctx, model, rest, photos, judge)
+        if not found:
+            break
+        off.update(found)
+        weak, judge = _deregister_cascade(model, set(found), rest)
+        unsupported |= weak
+        rest -= set(found) | weak
+    return off, unsupported
 
 
 def _reregister(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: set[str]
@@ -825,6 +922,12 @@ def _refined_pose_supported(ctx: UpdateContext, name: str) -> bool:
     res, matches = ctx.pose_support.get(name, (float("inf"), 0))
     return validity.pose_supported({"pose_matches": matches,
                                     "pose_residual_deg": res if np.isfinite(res) else None})
+
+
+def _refined_pose_contradicted(ctx: UpdateContext, name: str) -> bool:
+    res, matches = ctx.pose_support.get(name, (float("inf"), 0))
+    return validity.pose_contradicted({"pose_matches": matches,
+                                       "pose_residual_deg": res if np.isfinite(res) else None})
 
 
 def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, client: Any,

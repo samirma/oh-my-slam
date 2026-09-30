@@ -205,6 +205,23 @@ def pose_supported(stats: dict[str, Any], max_residual_deg: float = POSE_MAX_RES
             and res <= max_residual_deg)
 
 
+# A re-placed pose that its own matches contradict by this much is wrong, not merely uncertain:
+# over 181 stored maps, 99 % of 5963 refined keyframes are within 0.43° and all but two within
+# 7.6°; those two (a hallway photo at 23°, an office one at 30°) had been placed 3.8 km and 3.9 m
+# from the rest.
+POSE_REJECT_RESIDUAL_DEG = 10.0
+
+
+def pose_contradicted(stats: dict[str, Any], max_residual_deg: float = POSE_REJECT_RESIDUAL_DEG
+                      ) -> bool:
+    """A multi-view pose refined with feature matches (``stats`` has ``pose_matches``) that
+    enough of them (``POSE_MIN_MATCHES``) contradict: median residual above
+    ``max_residual_deg``. Too few matches judge nothing."""
+    res = stats.get("pose_residual_deg")
+    return (stats.get("pose_matches", 0) >= POSE_MIN_MATCHES and res is not None
+            and res > max_residual_deg)
+
+
 def well_registered(stats: dict[str, Any], pose_source: str) -> bool:
     if pose_source in ("identity", "multiview"):
         return pose_supported(stats)

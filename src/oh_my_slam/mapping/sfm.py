@@ -111,6 +111,10 @@ class SfmModel:
         return {im.name for im in self.rec.images.values()
                 if im.has_pose and im.num_points3D >= min_points}
 
+    def point_counts(self) -> dict[str, int]:
+        """Triangulated observations of each registered keyframe."""
+        return {im.name: int(im.num_points3D) for im in self.rec.images.values() if im.has_pose}
+
     def covisibility(self) -> dict[frozenset[str], int]:
         """Triangulated points shared by each pair of registered keyframes."""
         name = {im.image_id: im.name for im in self.rec.images.values() if im.has_pose}

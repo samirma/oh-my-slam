@@ -111,6 +111,17 @@ def collapsed_keyframes(poses: dict[str, Pose], supported: Collection[str], radi
     return out
 
 
+def weakened(before: dict[str, int], after: dict[str, int], names: Collection[str],
+             min_points: int = SUPPORT_MIN_POINTS) -> tuple[set[str], set[str]]:
+    """The keyframes of ``names`` that lost triangulated points between the counts ``before`` and
+    ``after`` (``SfmModel.point_counts``; a deregistered keyframe takes the tracks it shared with
+    one other keyframe along): those left with fewer than ``min_points`` (their pose has lost its
+    support) and the others (their points changed: judge their pose again)."""
+    lost = {n for n in names if n in before and after.get(n, 0) < before[n]}
+    unsupported = {n for n in lost if after.get(n, 0) < min_points}
+    return unsupported, lost - unsupported
+
+
 def merge_by_shared(main: dict[str, Pose], other: dict[str, Pose],
                     min_shared: int = MERGE_MIN_SHARED) -> dict[str, Pose] | None:
     """Poses (in ``main``'s frame) of the keyframes of a secondary reconstruction ``other`` that

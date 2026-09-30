@@ -118,6 +118,7 @@ function resize() {
   closeCluster();
   state.labelsDirty = true;
   invalidate();  // resizing the canvas clears it
+  if (state.homePending && w > 0 && h > 0) resetView();
 }
 window.addEventListener('resize', resize);
 
@@ -586,7 +587,14 @@ function fitDistance(box, target, dir, pad = 1.06) {
   }
   return dist;
 }
+// camera centres further than this many diagonals of the cloud's box from it do not widen the
+// home view (a keyframe posed far off would shrink the whole cloud to a dot); they are still drawn
+const HOME_CAMERA_REACH = 2;
 function homeView(box) {
+  // a page loaded without a size (a hidden tab or pane) has no aspect to fit to: it is framed on
+  // the first resize that gives it one
+  state.homePending = !(host.clientWidth > 0 && host.clientHeight > 0);
+  if (state.homePending) return;
   const pitch = THREE.MathUtils.degToRad(HOME_PITCH);
   const dir = new THREE.Vector3(HOME_AZIMUTH.x * Math.cos(pitch), HOME_AZIMUTH.y * Math.cos(pitch), Math.sin(pitch));
   const target = box.getCenter(new THREE.Vector3());
@@ -1378,7 +1386,12 @@ async function main() {
   const size = state.bbox.isEmpty() ? 1 : state.bbox.getSize(new THREE.Vector3()).length();
   state.sceneSize = size;
   buildFrustums(state.meta.cameras, size);
-  for (const f of state.meta.cameras) state.bbox.expandByPoint(new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]).applyMatrix4(root.matrixWorld));
+  const reach = state.bbox.isEmpty() ? null
+    : state.bbox.clone().expandByScalar(HOME_CAMERA_REACH * state.bbox.getSize(new THREE.Vector3()).length());
+  for (const f of state.meta.cameras) {
+    const c = new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]).applyMatrix4(root.matrixWorld);
+    if (!reach || reach.containsPoint(c)) state.bbox.expandByPoint(c);
+  }
   if (state.meta.has_segmented) {
     $('#tab-image-btn').hidden = false;
     $('#segmented').src = '/api/segmented.png';

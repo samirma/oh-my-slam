@@ -647,6 +647,35 @@ def test_map_overview_looks_down_on_the_scene_and_its_cameras(map_view: View) ->
     assert v.errors == []
 
 
+def test_a_stray_camera_does_not_shrink_the_overview(map_view: View, browser: Any,
+                                                     tmp_path: Path) -> None:
+    """A keyframe posed far off (a failed registration) is drawn, but the overview frames the
+    cloud: framing it too would shrink the whole cloud to a dot."""
+    import json
+
+    root = tmp_path / "stray"
+    shutil.copytree(map_view.root, root)  # type: ignore[attr-defined]
+    doc = json.loads((root / "frames.json").read_text())
+    doc["frames"][0]["T_map_cam"]["translation"] = [10000.0, 0.0, 0.0]
+    (root / "frames.json").write_text(json.dumps(doc))
+    bundle = map_bundle(root)
+    with running(bundle) as url:
+        v = View(browser, bundle, url)
+        v.settle()
+        cams = v.js("() => window.__viewer.meta.cameras.map(f => [f.T[0][3], f.T[1][3], f.T[2][3]])")
+        assert max(abs(c[0]) for c in cams) == pytest.approx(10000.0)  # still there, still drawn
+        map_view.pg.click("#reset-view")
+        map_view.settle()
+        cam, home = viewer_camera(v), viewer_camera(map_view)
+        dist = np.linalg.norm(np.subtract(cam["pos"], v.js(
+            "() => window.__viewerControls.target.toArray()")))
+        assert dist < 100  # the scene is a few metres across: framed, not seen from 10 km
+        assert dist == pytest.approx(np.linalg.norm(np.subtract(home["pos"], map_view.js(
+            "() => window.__viewerControls.target.toArray()"))), rel=0.5)
+        assert v.errors == []
+        v.pg.close()
+
+
 def label_boxes(v: View) -> list[dict[str, Any]]:
     return v.js("""() => {
       const host = document.querySelector('#canvas-host').getBoundingClientRect();
