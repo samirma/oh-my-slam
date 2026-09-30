@@ -340,11 +340,53 @@ def keyframe_depth_cuts(ctx: Any, records: list[store.FrameRecord]) -> dict[int,
     return {rec.index: _depth_cut(medians[rec.index], rec, depth_max) for rec in records}
 
 
+@dataclass
+class _Blocks:
+    """What a fusion of keyframes integrates (``_frame_blocks``)."""
+
+    fused: list[NDArray[np.bool_]]  # per keyframe, the pixels it fuses
+    order: list[int]  # the keyframes in fusion order
+    coords: dict[int, NDArray[np.int32]]  # per keyframe, the voxel blocks it updates
+    n_fused: int  # keyframes with a pixel to fuse
+    block: float  # block edge, metres
+
+
+def _frame_blocks(frames: list[FrameData], voxel: float, depth_max: float,
+                  region: tuple[NDArray[Any], NDArray[Any]] | None = None) -> _Blocks:
+    """The pixels and voxel blocks each keyframe fuses; with ``region``, blocks only of the
+    keyframes whose frustum may reach the box (the others count among the fused keyframes)."""
+    fused = [pixel_mask(fd.depth, fd.valid) & (fd.depth < fusion_depth_max(fd, depth_max))
+             for fd in frames]
+    order = sorted(range(len(frames)), key=lambda i: frames[i].rec.order_key)
+    probe = TsdfFusion(voxel, depth_max, block_count=1, trunc_voxels=CLOUD_TRUNC_VOXELS)
+    bs = probe.block_size
+    reach: _Cells | None = None
+    if region is not None:
+        lo, hi = np.asarray(region[0], np.float64), np.asarray(region[1], np.float64)
+        outer = (np.floor(lo / bs).astype(np.int64) - 1, np.floor(hi / bs).astype(np.int64) + 1)
+        reach = _Cells.ball((outer[0] + outer[1] + 1) * bs / 2,
+                            float(np.linalg.norm((outer[1] - outer[0] + 1) * bs)) / 2)
+    coords: dict[int, NDArray[np.int32]] = {}
+    n_fused = 0
+    for i in order:
+        fd = frames[i]
+        cut = fusion_depth_max(fd, depth_max)
+        if reach is not None and not len(reach.select(fd, cut + probe.trunc)):
+            n_fused += _fuses(fused[i])
+            continue
+        c = probe.block_coords(np.where(fused[i], fd.depth, 0.0), fd.rec.K_grid.K(),
+                               fd.rec.T_map_cam, depth_max=cut)
+        if c is not None:
+            coords[i] = c
+            n_fused += 1
+    return _Blocks(fused, order, coords, n_fused, bs)
+
+
 def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float,
                        vacated: list[Vacated] | None = None,
                        retired: list[FrameData] | None = None,
-                       region: tuple[NDArray[Any], NDArray[Any]] | None = None
-                       ) -> NDArray[np.float64]:
+                       region: tuple[NDArray[Any], NDArray[Any]] | None = None,
+                       blocks: _Blocks | None = None) -> NDArray[np.float64]:
     """Surface points of a fine TSDF of all frames' valid, edge-free depth, each frame up to
     ``depth_max`` as it placed it before its near/far correction (``fusion_depth_max``).
 
@@ -363,58 +405,41 @@ def fused_cloud_points(frames: list[FrameData], voxel: float, depth_max: float,
     ``region`` (lowest, highest corner): only the points inside this box, the same as those of
     the whole fusion there — every step is local (a voxel's values depend only on the frames, a
     surface point on its two voxels, the tests of ``_few_views`` and ``_vacated`` on the point),
-    so only the voxel blocks within a block of the box are fused.
+    so only the voxel blocks within a block of the box are fused. ``blocks``: the keyframes'
+    blocks (``_frame_blocks`` of the same keyframes, computed once for several regions).
     """
-    fused = [pixel_mask(fd.depth, fd.valid) & (fd.depth < fusion_depth_max(fd, depth_max))
-             for fd in frames]  # per frame, the pixels it fuses
-    order = sorted(range(len(frames)), key=lambda i: frames[i].rec.order_key)
-    probe = TsdfFusion(voxel, depth_max, block_count=1, trunc_voxels=CLOUD_TRUNC_VOXELS)
-    bs = probe.block_size
-    reach: _Cells | None = None
+    lo = hi = None
     if region is not None:
         lo, hi = np.asarray(region[0], np.float64), np.asarray(region[1], np.float64)
+    if blocks is None:
+        blocks = _frame_blocks(frames, voxel, depth_max, region)
+    fused, order, coords, bs = blocks.fused, blocks.order, blocks.coords, blocks.block
+    views = max(1, min(CLOUD_MIN_VIEWS, blocks.n_fused))
+    if lo is None or hi is None:
+        tiles: list[_Tile] = _tiles(coords, bs)
+    else:
         outer = (np.floor(lo / bs).astype(np.int64) - 1, np.floor(hi / bs).astype(np.int64) + 1)
-        # the frames whose frustum may reach those blocks (a sphere around them)
-        reach = _Cells.ball((outer[0] + outer[1] + 1) * bs / 2,
-                            float(np.linalg.norm((outer[1] - outer[0] + 1) * bs)) / 2)
-    # the voxel blocks each frame updates (None: nothing to fuse; a frame out of the region's
-    # reach updates none of its blocks but counts among the fused frames)
-    coords: dict[int, NDArray[np.int32]] = {}
-    n_fused = 0
-    for i in order:
-        fd = frames[i]
-        cut = fusion_depth_max(fd, depth_max)
-        if reach is not None and not len(reach.select(fd, cut + probe.trunc)):
-            n_fused += _fuses(fused[i])
-            continue
-        c = probe.block_coords(np.where(fused[i], fd.depth, 0.0), fd.rec.K_grid.K(),
-                               fd.rec.T_map_cam, depth_max=cut)
-        if c is not None:
-            coords[i] = c
-            n_fused += 1
-    views = max(1, min(CLOUD_MIN_VIEWS, n_fused))
-    tiles: list[_Tile] = _tiles(coords, bs) if region is None else [
-        (outer[0], outer[1], lambda p: np.asarray(np.all((p >= lo) & (p <= hi), axis=1)))]
+        tiles = [(outer[0], outer[1], lambda p: np.asarray(np.all((p >= lo) & (p <= hi), axis=1)))]
     parts = []
     for t_lo, t_hi, inside in tiles:
-        blocks: dict[int, NDArray[np.int32]] = {}
+        mine: dict[int, NDArray[np.int32]] = {}
         for i, c in coords.items():
             sel = c if t_lo is None or t_hi is None else c[np.all((c >= t_lo) & (c <= t_hi),
                                                                   axis=1)]
             if len(sel):
-                blocks[i] = sel
-        if not blocks:
+                mine[i] = sel
+        if not mine:
             continue
-        n_blocks = len(_unique_blocks(list(blocks.values())))
+        n_blocks = len(_unique_blocks(list(mine.values())))
         fusion = TsdfFusion(voxel, depth_max, block_count=n_blocks + 1,
                             trunc_voxels=CLOUD_TRUNC_VOXELS)
         for i in order:
-            if i in blocks:
+            if i in mine:
                 fd = frames[i]
                 fusion.integrate(np.where(fused[i], fd.depth, 0.0), fd.rec.K_grid.K(),
                                  fd.rec.T_map_cam, depth_max=fusion_depth_max(fd, depth_max),
-                                 blocks=blocks[i])
-        del blocks
+                                 blocks=mine[i])
+        del mine
         parts.append(_surface(fusion, views, inside, frames, fused, depth_max, vacated,
                               retired))
     pts = np.concatenate(parts) if parts else np.zeros((0, 3), np.float32)
@@ -1027,6 +1052,7 @@ class SurfaceQuery:
         self.ctx = ctx
         self.records = list(records)
         self._setup: _Setup | None = None
+        self._blocks: _Blocks | None = None
         self.calls = 0
         self.seconds = 0.0
 
@@ -1035,8 +1061,11 @@ class SurfaceQuery:
         if self._setup is None:
             self._setup = _setup(self.ctx, self.records)
         st = self._setup
+        if self._blocks is None:  # every keyframe's blocks, once for all the boxes
+            self._blocks = _frame_blocks(st.confident, st.voxel, st.depth_max)
         out = fused_cloud_points(st.confident, st.voxel, st.depth_max, st.vacated, st.frames,
-                                 region=(np.asarray(lo, np.float64), np.asarray(hi, np.float64)))
+                                 region=(np.asarray(lo, np.float64), np.asarray(hi, np.float64)),
+                                 blocks=self._blocks)
         self.calls += 1
         self.seconds += time.perf_counter() - t0
         return out
@@ -1044,6 +1073,7 @@ class SurfaceQuery:
     def release(self) -> None:
         """Drop the keyframes it loaded."""
         self._setup = None
+        self._blocks = None
 
 
 def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:

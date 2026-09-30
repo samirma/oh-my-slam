@@ -599,6 +599,9 @@ def test_fusion_in_slabs_or_a_region_is_the_whole_fusion(monkeypatch: pytest.Mon
     assert len(inside) > 1000
     assert np.array_equal(g.fused_cloud_points(frames, voxel=0.01, depth_max=6.0,
                                                region=(lo, hi)), inside)
+    blocks = g._frame_blocks(frames, 0.01, 6.0)  # every keyframe's blocks, for several boxes
+    assert np.array_equal(g.fused_cloud_points(frames, voxel=0.01, depth_max=6.0,
+                                               region=(lo, hi), blocks=blocks), inside)
 
 
 def test_attribute_points_latest_visible_update_wins() -> None:
