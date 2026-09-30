@@ -74,8 +74,8 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
   - Homebrew `colmap` 4.2.0 includes GLOMAP as `global_mapper`, and ALIKED/LightGlue feature
     extraction and matching through ONNX Runtime with the CoreML provider.
   - The **PyPI pycolmap 4.2 wheel is built without ONNX**. It lists the ALIKED/LightGlue enums but
-    fails when they are used. Run learned features through the Homebrew CLI and mapping through
-    pycolmap, and keep both on the same 4.2.x version.
+    fails when they are used. The mapper extracts and matches SIFT through the Homebrew CLI and
+    maps through pycolmap; keep both on the same 4.2.x version.
   - `patch_match_stereo` (dense MVS) requires CUDA, so it is unavailable on this machine.
 - **PyTorch MPS:**
   - Two threads touching MPS in one process abort the whole process (pytorch#197805; its fix was

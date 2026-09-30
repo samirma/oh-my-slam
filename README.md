@@ -285,7 +285,7 @@ The same source and attributes always give byte-identical files.
 * **Timing summary.** `reconstruct.sh`, `segment.sh` and `mapper.sh update` each log a
   one-line `timings:` summary.
 * **stdout of the other commands.** `view.sh` writes nothing to stdout. `--status` writes the
-  health JSON.
+  health JSON. The help (`-h`) of every command goes to stderr.
 
 | Exit | Meaning |
 |---|---|
