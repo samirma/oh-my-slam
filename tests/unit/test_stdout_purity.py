@@ -198,3 +198,13 @@ def test_usage_errors_exit_2(image: Path, tmp_path: Path) -> None:
         res = sh(script, *args)
         assert res.returncode == 2, (script, args, res.stderr)
         assert res.stdout == b""
+
+
+def test_help_goes_to_stderr() -> None:
+    """The help is human-facing: stderr, never stdout (spec §4), for every entry point."""
+    for script, args in [("reconstruct.sh", ["-h"]), ("segment.sh", ["-h"]), ("view.sh", ["-h"]),
+                         ("start_inference_server.sh", ["-h"]), ("mapper.sh", ["-h"]),
+                         ("mapper.sh", ["update", "-h"])]:
+        res = sh(script, *args)
+        assert res.returncode == 0, (script, res.stderr)
+        assert res.stdout == b"" and b"usage:" in res.stderr, script
