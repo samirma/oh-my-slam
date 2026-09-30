@@ -4,7 +4,6 @@ DINOv2 class-token descriptor for retrieval."""
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +17,7 @@ REPO_ID = "Ruicheng/moge-2-vitl-normal"
 
 
 def _use_fp16(device: str) -> bool:
-    """Gate G2 decides the default; ``OH_MY_SLAM_GEOMETRY_FP16=0/1`` overrides."""
-    env = os.environ.get("OH_MY_SLAM_GEOMETRY_FP16")
-    if env is not None:
-        return env == "1"
+    """fp16 autocast on MPS, as gate G2 decided (``GATE_G2_FP16``)."""
     return device == "mps" and GATE_G2_FP16
 
 

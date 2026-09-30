@@ -201,10 +201,10 @@ def test_view_cli_arguments() -> None:
 
     ap = build_parser()
     a = ap.parse_args(["-m", "map"])
-    assert a.port == 0 and not a.no_browser
+    assert not a.no_browser and not hasattr(a, "port")  # always a free port
     a = ap.parse_args(["-i", "x.jpg", "--no-browser"])
     assert a.no_browser and a.image.name == "x.jpg"
-    for bad in ([], ["-i", "a", "-m", "b"]):
+    for bad in ([], ["-i", "a", "-m", "b"], ["-m", "map", "--port", "8080"]):
         with pytest.raises(SystemExit) as e:
             ap.parse_args(bad)
         assert e.value.code == 2

@@ -1,4 +1,4 @@
-"""Read-only local web server for the viewer (127.0.0.1, any free port unless ``--port``).
+"""Read-only local web server for the viewer (127.0.0.1, any free port).
 
 Routes (GET/HEAD only; anything else is 405):
 
@@ -221,9 +221,10 @@ def make_handler(bundle: ViewBundle) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve(bundle: ViewBundle, port: int = 0) -> ThreadingHTTPServer:
-    """Bind 127.0.0.1 (port 0 = any free port); caller runs ``serve_forever``."""
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(bundle))
+def serve(bundle: ViewBundle) -> ThreadingHTTPServer:
+    """Bind 127.0.0.1 on any free port (a fixed one may be held by another process); the caller
+    runs ``serve_forever``."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(bundle))
     httpd.daemon_threads = True
     return httpd
 

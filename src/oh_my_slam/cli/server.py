@@ -1,9 +1,8 @@
 """``start_inference_server.sh`` — start (idempotent), stop or query the inference server.
 
-    start_inference_server.sh               start in the background, wait until ready
-    start_inference_server.sh --foreground  run in this terminal (Ctrl-C stops)
-    start_inference_server.sh --status      print /health as JSON (exit 3 if not running)
-    start_inference_server.sh --stop        stop it; socket and state file removed
+    start_inference_server.sh           start in the background, wait until ready
+    start_inference_server.sh --status  print /health as JSON (exit 3 if not running)
+    start_inference_server.sh --stop    stop it; socket and state file removed
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from oh_my_slam.core.log import claim_stdout
 from oh_my_slam.server.lifecycle import ServerLock, pid_alive, read_state
 
 PROG = "start_inference_server.sh"
-DEFAULT_TIMEOUT_S = 1200.0
+START_TIMEOUT_S = 1200.0  # the first start downloads the model weights
 STOP_TIMEOUT_S = 12.0
 
 
@@ -164,21 +163,15 @@ def status() -> int:
 def main(argv: list[str]) -> int:
     parser = ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0] if __doc__ else None)
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--foreground", action="store_true", help="run in this terminal")
     group.add_argument("--stop", action="store_true", help="stop the running server")
     group.add_argument("--status", action="store_true", help="print health JSON to stdout")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
-                        help="seconds to wait for the models to load (default %(default)s)")
     parser.add_argument("--stub", action="store_true", help=argparse_suppress())
     args = parser.parse_args(argv)
     if args.stop:
         return stop()
     if args.status:
         return status()
-    if args.foreground:
-        cmd = _server_cmd(args.stub)
-        os.execv(cmd[0], cmd)
-    return start(args.timeout, args.stub)
+    return start(START_TIMEOUT_S, args.stub)
 
 
 def argparse_suppress() -> str:

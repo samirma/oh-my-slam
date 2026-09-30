@@ -9,23 +9,22 @@ the record of decisions). Package `src/oh_my_slam` (uv, Python 3.12); see `READM
 
 Commands:
 
-- Environment: `uv sync`; external tools: `brew install colmap` + `./scripts/install_tools.sh`.
-- Server: `./start_inference_server.sh [--status|--stop|--foreground]` (log in
+- Environment: `uv sync`; external tool: `brew install colmap` (4.2.x, as pycolmap).
+- Server: `./start_inference_server.sh [--status|--stop]` (log in
   `~/Library/Caches/oh-my-slam/server.log`).
 - Offline tests: `uv run pytest -m "not models and not browser and not eval" -q`
   (coverage: add `--cov=oh_my_slam`). Real models: `OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models`
   with the server running. Browser: `uv run pytest -m browser` (Playwright, Edge channel).
 - Lint/types/ownership: `uv run ruff check . && uv run mypy src && uv run lint-imports`.
 - Benchmark evaluator (spec §5): `uv run python -m oh_my_slam.tools.evaluate [--out DIR]
-  [--targets PATH] [--baseline PATH] [--set-baseline] [--splits N]`. It needs the model weights
+  [--targets PATH] [--baseline PATH] [--set-baseline]`. It needs the model weights
   and restarts the server to time the cold start. It writes `result.json` + `summary.md` to
   `~/oh-my-slam-data/evaluations/<UTC>/`. Targets are in `examples/targets.json`, the baseline
   is `~/oh-my-slam-data/evaluations/baseline.json`, and ground truth goes in
   `examples/ground_truth/`. It is a GPU benchmark: run it alone.
 - Per-stage timings of any `mapper.sh update` / `reconstruct.sh` / `segment.sh -i`: `timings:`
   line on stderr, JSON with `OH_MY_SLAM_TIMINGS=path`, and `map.json → updates[].timings`.
-- Mapping features default to SIFT. `OH_MY_SLAM_FEATURES=aliked` selects ALIKED/LightGlue
-  (Homebrew CLI only).
+- Mapping features are SIFT (Homebrew `colmap` CLI).
 
 Never import torch/open3d in the same process (duplicate libomp aborts): torch lives only in the
 server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segment.sh -m` are read-only.

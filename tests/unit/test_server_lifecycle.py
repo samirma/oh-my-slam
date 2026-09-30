@@ -137,3 +137,14 @@ def test_client_fails_fast_when_down() -> None:
         InferenceClient().require_ready()
     assert time.monotonic() - t0 < 2.0
     assert "./start_inference_server.sh" in str(err.value)
+
+
+def test_the_command_starts_stops_or_queries_and_nothing_else() -> None:
+    """Spec §2.1: the command starts the server; ``--stop`` and ``--status`` operate it (the
+    evaluator stops it to time a cold start). No other option exists."""
+    from oh_my_slam.cli.server import main
+
+    for extra in (["--foreground"], ["--timeout", "5"], ["--stop", "--status"]):
+        with pytest.raises(SystemExit) as e:
+            main(extra)
+        assert e.value.code == 2

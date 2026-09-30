@@ -1,8 +1,7 @@
 """Structure from motion with COLMAP 4.2.
 
-Features and matching run through the Homebrew ``colmap`` CLI (its ONNX/CoreML build is needed for
-ALIKED/LightGlue; the PyPI pycolmap wheel has no ONNX); mapping, triangulation and bundle
-adjustment run through pycolmap on the same database. Both must be 4.2.x.
+SIFT features and matching run through the Homebrew ``colmap`` CLI; mapping, triangulation and
+bundle adjustment run through pycolmap on the same database. Both must be 4.2.x.
 
 New map: global mapping (GLOMAP) → incremental if < 60 % placed → multi-view (MapAnything)
 poses refined with the verified matches and monocular depth (``panorama``) + triangulation.
@@ -18,7 +17,6 @@ refined multi-view poses.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from collections import Counter
@@ -35,9 +33,8 @@ from oh_my_slam.core.types import Intrinsics, Pose
 
 log = get_logger("oh_my_slam.sfm")
 
-# Gate G4 (measured on the user's inputs, TUM data blocked on U2): SIFT registers as many frames
-# as ALIKED+LightGlue and is ~30x faster on this CPU/CoreML build.
-FEATURES = os.environ.get("OH_MY_SLAM_FEATURES", "sift").lower()
+# Gate G4 (measured on the user's inputs): SIFT registers as many frames as ALIKED+LightGlue and is
+# ~30x faster on this CPU/CoreML build, so SIFT is the only feature type.
 MIN_PLACED_FRACTION = 0.6
 ROTATION_PAIR_FRACTION = 0.5
 ROTATION_BASELINE_RATIO = 0.02
@@ -52,11 +49,10 @@ class SfmError(OhMySlamError):
 
 
 def colmap_bin() -> str:
-    exe = os.environ.get("OH_MY_SLAM_COLMAP", "colmap")
-    path = shutil.which(exe)
+    path = shutil.which("colmap")
     if path is None:
-        raise SfmError("COLMAP not found — install it with: brew install colmap "
-                       "(then ./scripts/install_tools.sh)")
+        raise SfmError("COLMAP not found — install it with: brew install colmap (4.2.x, as the "
+                       "pycolmap in .venv)")
     return path
 
 
@@ -66,7 +62,8 @@ def check_versions() -> str:
     out = subprocess.run([colmap_bin(), "version"], capture_output=True, text=True).stdout
     cli = out.split()[1] if out.startswith("COLMAP") else "?"
     if not cli.startswith("4.2") or not pycolmap.__version__.startswith("4.2"):
-        raise SfmError(f"COLMAP CLI {cli} and pycolmap {pycolmap.__version__} must both be 4.2.x")
+        raise SfmError(f"COLMAP CLI {cli} and pycolmap {pycolmap.__version__} must both be 4.2.x "
+                       "— run: brew upgrade colmap")
     return cli
 
 
@@ -334,13 +331,11 @@ def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
 
 
 class Sfm:
-    def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
-                 features: str = FEATURES) -> None:
+    def __init__(self, db_path: Path, image_dir: Path, work_dir: Path) -> None:
         self.db = Path(db_path)
         self.image_dir = Path(image_dir)
         self.work = Path(work_dir)
         self.work.mkdir(parents=True, exist_ok=True)
-        self.features = features
         self.log_path = self.work / "colmap.log"
 
     # -- features & matching ---------------------------------------------------------------------
@@ -354,12 +349,9 @@ class Sfm:
             str(self.image_dir), "--image_list_path", str(lst),
             "--ImageReader.camera_model", "SIMPLE_PINHOLE",
             "--FeatureExtraction.use_gpu", "0", "--log_level", "1",
+            "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
+            str(MAX_FEATURES),
         ]
-        if self.features == "aliked":
-            args += ["--FeatureExtraction.type", "ALIKED_N16ROT"]
-        else:
-            args += ["--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
-                     str(MAX_FEATURES)]
         existing = self.existing_camera(prior)
         if existing is not None:
             args += ["--ImageReader.existing_camera_id", str(existing)]
@@ -421,9 +413,7 @@ class Sfm:
         n = write_pair_list(lst, pairs, names)
         args = ["matches_importer", "--database_path", str(self.db), "--match_list_path",
                 str(lst), "--match_type", "pairs", "--FeatureMatching.use_gpu", "0",
-                "--log_level", "1"]
-        args += ["--FeatureMatching.type",
-                 "ALIKED_LIGHTGLUE" if self.features == "aliked" else "SIFT_BRUTEFORCE"]
+                "--log_level", "1", "--FeatureMatching.type", "SIFT_BRUTEFORCE"]
         _run(args, self.log_path)
         return n
 

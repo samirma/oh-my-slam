@@ -11,7 +11,7 @@ import pytest
 
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.tools.evaluate import groundtruth as gt
-from oh_my_slam.tools.evaluate.__main__ import latest_run, load_baseline, main
+from oh_my_slam.tools.evaluate.__main__ import load_baseline, main
 from oh_my_slam.tools.evaluate.metrics import (
     Metrics,
     TargetsError,
@@ -107,8 +107,6 @@ def test_renamed_metrics_of_stored_runs_keep_their_history() -> None:
                        {"id": "seg.map.precision", "value": 0.88}]}
     assert baseline_values(old) == {"seg.map_consistency.map_objects_detected": 0.99,
                                     "seg.map_consistency.detections_in_map": 0.88}
-    assert set(Metrics.from_result(old).items) == {"seg.map_consistency.map_objects_detected",
-                                                   "seg.map_consistency.detections_in_map"}
 
 
 def test_missing_or_broken_baseline_is_reported(tmp_path: Path) -> None:
@@ -283,43 +281,10 @@ def test_per_stage_time_and_memory(tmp_path: Path) -> None:
     assert "| mapper_split_2 | sfm | 22 | 4000 | 16 |" in text
 
 
-def test_resummarise_judges_a_stored_run_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                                               capsys: pytest.CaptureFixture[str]) -> None:
-    """A stored run is judged against the current targets and baseline without running anything,
-    and can then be stored as the baseline."""
-    m = judged(tmp_path, {"perf.a.wall_s": 2.4, "pose.b.fraction": 0.95, "contract.c.x": 0})
-    run = tmp_path / "evaluations" / "20260924T230511Z"
-    write_report(run, result_of(m, [], {"path": "b.json", "status": "missing"}))
-    older = tmp_path / "evaluations" / "20260901T000000Z"
-    write_report(older, result_of(m, [], {"path": "b.json", "status": "missing"}))
-    assert latest_run(tmp_path / "evaluations") == run
-    stricter = targets_file(tmp_path, {"metrics": {"perf.a.wall_s": {"op": "<=", "value": 2,
-                                                                     "unit": "s"}}})
-    baseline = tmp_path / "baseline.json"
-    args = ["--resummarise", str(run), "--targets", str(stricter), "--baseline", str(baseline)]
-    assert main(args) == 1  # 2.4 s now misses 2 s
-    doc = json.loads((run / "result.json").read_text())
-    assert doc["summary"]["failed"] == 1 and doc["summary"]["untargeted"] == 2
-    assert doc["summary"]["regressions"] is None and doc["judged"]
-    assert "2.4 s exceeds the limit 2 s" in (run / "summary.md").read_text()
-    assert not baseline.exists()
-    monkeypatch.setattr("oh_my_slam.tools.evaluate.__main__.DATA", tmp_path / "evaluations")
-    assert main(["--resummarise", "latest", "--targets", str(stricter), "--baseline",
-                 str(baseline), "--set-baseline"]) == 1
-    assert json.loads(baseline.read_text())["started"] == doc["started"]
-    assert main(["--resummarise", str(run), "--targets", str(stricter), "--baseline",
-                 str(baseline)]) == 1
-    doc = json.loads((run / "result.json").read_text())
-    assert doc["summary"]["regressions"] == 0 and doc["baseline"]["status"] == "compared"
-    assert main(["--resummarise", str(tmp_path / "none")]) == 2
-    assert str(run / "summary.md") in capsys.readouterr().out
-
-
 def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     bad = targets_file(tmp_path, {"metrics": {"x": {"op": "==", "value": 1}}})
     assert main(["--targets", str(bad), "--out", str(tmp_path / "o")]) == 2
     assert main(["--out", str(EXAMPLES / "results")]) == 2  # inside the repository
-    assert main(["--splits", "2", "--out", str(tmp_path / "o")]) == 2
     assert not (tmp_path / "o").exists()
     err = capsys.readouterr().err
-    assert "outside the repository" in err and "--splits" in err
+    assert "outside the repository" in err

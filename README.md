@@ -9,26 +9,25 @@ OpenLABEL mapping and the colour palette).
 
 | Entry point | What it does |
 |---|---|
-| `start_inference_server.sh [--foreground\|--status\|--stop] [--timeout S]` | Starts the resident model server, or stops or queries it. |
+| `start_inference_server.sh [--status\|--stop]` | Starts the resident model server, or stops or queries it. |
 | `reconstruct.sh -i IMAGE [-f json\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default) or point cloud, in the camera frame. |
 | `mapper.sh update -i IMAGES\|FOLDERS\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
 | `segment.sh -i IMAGE [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` | Objects of one image: OBBs, colours, and with `-d` five artefact files. |
 | `segment.sh -m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | The persistent objects of a map, read-only and without the server. |
-| `view.sh -i IMAGE \| -m MAP [--port N] [--no-browser]` | Local browser viewer. `-m` needs no server. |
+| `view.sh -i IMAGE \| -m MAP [--no-browser]` | Local browser viewer. `-m` needs no server. |
 
 ## Install
 
 ```sh
 brew install colmap            # COLMAP 4.2.x CLI (feature extraction and matching)
 uv sync                        # Python 3.12 environment in .venv, dev tools included
-./scripts/install_tools.sh     # checks that `colmap` is installed and is 4.2.x
 ./start_inference_server.sh    # the first start downloads the model weights
 ```
 
-`scripts/install_tools.sh` installs nothing. It exits 1 with a hint if `colmap` is missing or not
-4.2.x, because the `pycolmap` wheel in `.venv` is 4.2.x and both must match. Each entry script is
-a thin wrapper that runs `.venv/bin/python -m oh_my_slam.cli.<command>` and exits 2 if `.venv` is
-missing. The scripts never call each other.
+The `pycolmap` wheel in `.venv` is 4.2.x, and the `colmap` CLI must be 4.2.x too: `mapper.sh`
+checks both before it maps and exits 1 with a hint otherwise. Each entry script is a thin wrapper
+that runs `.venv/bin/python -m oh_my_slam.cli.<command>` and exits 2 if `.venv` is missing. The
+scripts never call each other.
 
 Model weights are downloaded on the first server start:
 
@@ -58,12 +57,11 @@ Model weights are downloaded on the first server start:
 ### `start_inference_server.sh`
 
 With no option, the command starts the server in the background and waits until the models are
-loaded. The default timeout is `--timeout 1200` seconds. If a server is already running, the
-command reports it and exits 0.
+loaded, for at most 20 minutes (the first start downloads the weights). If a server is already
+running, the command reports it and exits 0.
 
 | Option | Effect |
 |---|---|
-| `--foreground` | Runs the server in this terminal. Ctrl-C stops it. |
 | `--status` | Prints `/health` as JSON on stdout: status, device, precision, and each model's load state. Exits 3 if the server is not running. |
 | `--stop` | Stops the server and removes its socket and state file. |
 
@@ -157,11 +155,11 @@ The same image with the same options gives the same ids and colours on every run
 
 ### `view.sh`
 
-`view.sh -i IMAGE | -m MAP [--port N] [--no-browser]`
+`view.sh -i IMAGE | -m MAP [--no-browser]`
 
-The viewer binds `127.0.0.1` on a free port (port 0) unless `--port` is given. It opens the
-default browser unless `--no-browser` is given, and serves until Ctrl-C. Nothing is written to
-stdout. Once the server accepts connections, stderr carries exactly one line of this form:
+The viewer binds `127.0.0.1` on a free port (port 0: a fixed port may be held by another
+process). It opens the default browser unless `--no-browser` is given, and serves until Ctrl-C.
+Nothing is written to stdout. Once the server accepts connections, stderr carries exactly one line of this form:
 
 ```
 view.sh: listening on http://127.0.0.1:<port>/
@@ -692,8 +690,7 @@ answers immediately, even while the models load. It loads four models:
 | YOLOE-26x-seg with the MobileCLIP2-B text encoder | Open-vocabulary instance masks over `segmentation/data/default_labels.txt`, a curated list of LVIS and COCO nouns. |
 | MapAnything (Apache-2.0 checkpoint) | Metric multi-view poses, used as a fallback. |
 
-The device is MPS when available (`OH_MY_SLAM_DEVICE=cpu|mps` overrides it), with a per-process
-MPS memory cap of 70 %. MPS is not thread-safe, so every model call runs on one GPU worker
+The device is MPS when available, else the CPU, with a per-process MPS memory cap of 70 %. MPS is not thread-safe, so every model call runs on one GPU worker
 thread. The queue holds 8 jobs; beyond that the server answers HTTP 503 and the client retries.
 torch lives only in the server process. The commands never import it, because loading torch and
 Open3D in one process aborts on a duplicate libomp.
@@ -735,9 +732,8 @@ Geometry and detection requests run concurrently on two connections.
 1. **Lock and stage.** Resolve the inputs into keyframes.
 2. **Per-keyframe inference.** Each keyframe gets depth (768 px grid), gravity, a descriptor and
    detections at the default threshold (the single-image detection, masks on the 768 px grid). Two keyframes are processed at a time.
-3. **Features and matching.** The Homebrew `colmap` CLI extracts SIFT features by default.
-   ALIKED + LightGlue (ONNX/CoreML, Homebrew build only) is used with
-   `OH_MY_SLAM_FEATURES=aliked`. Pairs are chosen as follows:
+3. **Features and matching.** The Homebrew `colmap` CLI extracts and matches SIFT features.
+   Pairs are chosen as follows:
    * Photos: every pair up to 200 images.
    * Otherwise: sequential neighbours plus descriptor retrieval, with loop-closure candidates
      for video.
@@ -864,8 +860,7 @@ at the Python-module level:
 
 ```sh
 uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--targets PATH] [--baseline PATH] \
-                                           [--set-baseline] [--splits N]
-uv run python -m oh_my_slam.tools.evaluate --resummarise DIR|latest [--set-baseline]
+                                           [--set-baseline]
 ```
 
 A single command benchmarks every entry point on `examples/`, strictly one command at a time
@@ -874,8 +869,7 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * the server's cold start and resident memory (it stops and restarts the server)
 * `reconstruct.sh` (JSON and PLY), `segment.sh -i -d` and `view.sh -i` on `restaurant.jpg`
 * `segment.sh -i` on each of the 79 `ainex-captures` frames
-* `mapper.sh update` on the sequence, once in one update and once split across `--splits`
-  updates (default and minimum 3)
+* `mapper.sh update` on the sequence, once in one update and once split across 3 updates
 * `segment.sh -m` and `view.sh -m` on both maps
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
   ones): the whole sequence in one update, and as an extended map (an update with the early images,
@@ -914,17 +908,7 @@ compared`, and `summary.regressions` in `result.json` is `null`. For each failed
 metric, the summary's `why` column gives the error, the value against the target, or the change
 from the baseline and the tolerance it exceeded.
 
-To keep a finished run as the baseline, either pass `--set-baseline` to the run itself or store
-it afterwards:
-
-```sh
-uv run python -m oh_my_slam.tools.evaluate --resummarise latest --set-baseline
-```
-
-`--resummarise DIR|latest` runs nothing. It judges the values of a stored run (`latest` is the
-newest `<UTC>` folder) against the current targets and baseline again, and rewrites its
-`result.json` and `summary.md`. Use it after editing the targets, or with `--set-baseline` to
-store that run as the baseline.
+`--set-baseline` stores the run, once it is judged, as the baseline later runs are compared with.
 
 Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by default:
 
@@ -1023,17 +1007,9 @@ Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `OH_MY_SLAM_DEVICE=cpu\|mps` | Selects the server's device. |
-| `OH_MY_SLAM_FEATURES=sift\|aliked` | COLMAP features for mapping (default `sift`). |
-| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` there: stage times, per-stage peak resident set and stage time windows. Each map update also keeps its record in `map.json → updates[].timings`. |
-| `OH_MY_SLAM_DEBUG=1` | Prints tracebacks for internal errors. |
-| `OH_MY_SLAM_LOG=DEBUG` | Sets the log level. |
-| `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch). |
-| `OH_MY_SLAM_WEIGHTS_DIR` | Replaces the Ultralytics weights folder. |
-| `OH_MY_SLAM_QUEUE` | Server queue length (default 8). |
-| `OH_MY_SLAM_COLMAP` | The COLMAP executable. |
-| `OH_MY_SLAM_GEOMETRY_FP16=0\|1` | Overrides MoGe fp16 autocast on MPS (default on). |
-| `OH_MY_SLAM_MAPANYTHING_REPO` | Overrides the MapAnything checkpoint. |
+| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
+| `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch): the test suite runs its stub server there, beside a running real one. |
+| `OH_MY_SLAM_TEST_REAL_SERVER=1` | Lets the `models` and `eval` tests use the running real server. |
 
 ## Troubleshooting
 
@@ -1042,5 +1018,4 @@ Environment variables:
   `~/Library/Caches/oh-my-slam/server.log`.
 * **Exit 5 on an update.** The new images share no verified feature matches with the map.
 * **Exit 6.** Another `mapper.sh update` is running on the same map.
-* **`COLMAP CLI … and pycolmap … must both be 4.2.x`.** Run `brew upgrade colmap`, then
-  `./scripts/install_tools.sh`.
+* **`COLMAP CLI … and pycolmap … must both be 4.2.x`.** Run `brew upgrade colmap`.

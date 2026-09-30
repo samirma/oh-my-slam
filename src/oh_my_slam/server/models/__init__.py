@@ -6,16 +6,12 @@ put the server in ``error``, optional ones put it in ``degraded``.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
 
 def select_device() -> str:
-    """``OH_MY_SLAM_DEVICE`` (cpu|mps) or MPS when available."""
-    forced = os.environ.get("OH_MY_SLAM_DEVICE", "").strip().lower()
-    if forced in {"cpu", "mps"}:
-        return forced
+    """MPS when available (spec §4: preferred, not mandatory), else the CPU."""
     import torch
 
     return "mps" if torch.backends.mps.is_available() else "cpu"

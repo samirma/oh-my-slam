@@ -31,8 +31,7 @@ def get_logger(name: str = _LOGGER_NAME) -> logging.Logger:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[oh-my-slam] %(message)s"))
         root.addHandler(handler)
-        level = os.environ.get("OH_MY_SLAM_LOG", "INFO").upper()
-        root.setLevel(getattr(logging, level, logging.INFO))
+        root.setLevel(logging.INFO)
         root.propagate = False
     if name == _LOGGER_NAME:
         return root

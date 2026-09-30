@@ -3,9 +3,9 @@
     view.sh -i <image>        reconstruct + segment one image (needs the inference server)
     view.sh -m <map-folder>   open a persisted map read-only (no server needed)
 
-Binds 127.0.0.1 on a free port (or --port), opens the default browser unless --no-browser, and
-serves until Ctrl-C or SIGTERM (both exit 0). Nothing is written to stdout. Once the server accepts connections, stderr
-carries exactly one line of the form (``URL_LINE``)::
+Binds 127.0.0.1 on a free port, opens the default browser unless --no-browser, and serves until
+Ctrl-C or SIGTERM (both exit 0). Nothing is written to stdout. Once the server accepts
+connections, stderr carries exactly one line of the form (``URL_LINE``)::
 
     view.sh: listening on http://127.0.0.1:<port>/
 
@@ -47,7 +47,6 @@ def build_parser() -> ArgumentParser:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("-i", dest="image", type=Path, help="RGB image to reconstruct and segment")
     src.add_argument("-m", dest="map", type=Path, help="map folder (opened read-only)")
-    ap.add_argument("--port", type=int, default=0, help="port (default: any free port)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
     return ap
 
@@ -69,7 +68,7 @@ def main(argv: list[str]) -> int:
     else:
         bundle = map_bundle(args.map)
     _install_stop_handlers()
-    httpd = serve(bundle, args.port)
+    httpd = serve(bundle)
     try:
         url = url_of(httpd)
         print(f"{PROG}: listening on {url}", file=sys.stderr, flush=True)

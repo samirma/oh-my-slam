@@ -3,7 +3,6 @@ on known intrinsics and cam-to-world poses for some views (used to anchor chunks
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +12,7 @@ from oh_my_slam.client.protocol import MultiviewRequest
 from oh_my_slam.core.atomic import atomic_save_npy
 from oh_my_slam.core.images import load_rgb, upright_size
 
-REPO_ID = os.environ.get("OH_MY_SLAM_MAPANYTHING_REPO", "facebook/map-anything-apache")
+REPO_ID = "facebook/map-anything-apache"  # the Apache-2.0 checkpoint (THIRD_PARTY_LICENSES.md)
 _LOAD_SIDE = 1024
 
 

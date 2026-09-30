@@ -39,8 +39,7 @@ that could not be confirmed.
 | GeoCalib pinhole weights | GitHub release `cvg/GeoCalib` v1.0 (`geocalib-pinhole.tar`, torch hub cache) | Gravity direction | CC-BY-4.0 (weights; GeoCalib README) |
 | YOLOE-26x-seg | `yoloe-26x-seg.pt`, downloaded by Ultralytics | Open-vocabulary instance segmentation | AGPL-3.0, or an Ultralytics Enterprise licence |
 | MobileCLIP2-B text encoder | `mobileclip2_b.ts`, the Ultralytics TorchScript export of Apple's MobileCLIP2-B | YOLOE text prompts | Apple Machine Learning Research Model License (`apple-amlr`, HF `apple/MobileCLIP2-B`): research purposes only, no commercial use |
-| MapAnything, Apache variant | HF `facebook/map-anything-apache` | Metric multi-view poses (mapping fallback) | Apache-2.0 (model card). The default `facebook/map-anything` checkpoint is CC-BY-NC-4.0 and is not used unless `OH_MY_SLAM_MAPANYTHING_REPO` selects it. |
-| ALIKED (`ALIKED_N16ROT`) + LightGlue ONNX models | Fetched by COLMAP; used only with `OH_MY_SLAM_FEATURES=aliked` | Learned features and matching | Upstream: ALIKED BSD-3-Clause (`Shiaoming/ALIKED`), LightGlue Apache-2.0 (`cvg/LightGlue`). The licence of COLMAP's ONNX exports is **UNVERIFIED**. |
+| MapAnything, Apache variant | HF `facebook/map-anything-apache` | Metric multi-view poses (mapping fallback) | Apache-2.0 (model card). The default `facebook/map-anything` checkpoint (CC-BY-NC-4.0) is not used. |
 
 ## Python runtime dependencies (`pyproject.toml`)
 
@@ -94,7 +93,7 @@ rows are listed because they are copyleft or otherwise notable:
 
 | Component | Version | Used for | Licence |
 |---|---|---|---|
-| COLMAP (Homebrew `colmap`) | 4.2.0 | Feature extraction and matching CLI (SIFT by default; ALIKED/LightGlue through ONNX Runtime + CoreML); GLOMAP is part of COLMAP 4.2 | BSD-3-Clause (COLMAP, GLOMAP). COLMAP's licence notes that its dependencies may change the licence of the built binary. The Homebrew formula depends on CGAL 6.2.1 (GPL-3.0-or-later), Qt 6 `qtbase` (LGPL-3.0 / GPL), SuiteSparse (mixed, including GPL and LGPL) and ONNX Runtime 1.30.0 (MIT), so the Homebrew binary should be treated as GPL-3.0-or-later. |
+| COLMAP (Homebrew `colmap`) | 4.2.0 | SIFT feature extraction and matching CLI; GLOMAP is part of COLMAP 4.2 | BSD-3-Clause (COLMAP, GLOMAP). COLMAP's licence notes that its dependencies may change the licence of the built binary. The Homebrew formula depends on CGAL 6.2.1 (GPL-3.0-or-later), Qt 6 `qtbase` (LGPL-3.0 / GPL), SuiteSparse (mixed, including GPL and LGPL) and ONNX Runtime 1.30.0 (MIT), so the Homebrew binary should be treated as GPL-3.0-or-later. |
 | Microsoft Edge or Google Chrome | system-installed | Playwright browser tests and the evaluator's page timing | Proprietary; not bundled |
 | uv | 0.9.18 (installed) | Environment and dependency manager | MIT OR Apache-2.0 |
 
@@ -126,12 +125,3 @@ rows are listed because they are copyleft or otherwise notable:
 | import-linter | 2.15 | BSD-2-Clause |
 | playwright | 1.63.0 | Apache-2.0 |
 | hatchling (build backend, `>=1.25`, not locked) | — | MIT |
-
-## Removed since the previous revision
-
-* **OpenMVS.** The surface mesh and texturing are gone, and the map's geometry is a point cloud.
-* **trimesh as a direct dependency.** It remains transitive, through MoGe and MapAnything.
-* **The combined "Ultralytics YOLOE-26x-seg + MobileCLIP2-B text encoder: AGPL-3.0" entry.**
-  YOLOE and the MobileCLIP2-B encoder now have separate rows. The encoder is under Apple's
-  research-only licence.
-* **The catch-all "PyTorch, torchvision, …" row.** Each package now has its own row.

@@ -96,15 +96,6 @@ def build_result(metrics: Metrics, records: list[RunRecord], details: dict[str, 
     }
 
 
-def rejudged(result: dict[str, Any], metrics: Metrics, *, targets: Path,
-             baseline: dict[str, Any], at: str) -> dict[str, Any]:
-    """A stored result with its metric values judged again (``metrics``, already judged against
-    ``targets`` and ``baseline``); runs and details are kept."""
-    return {**result, "targets": str(targets), "baseline": baseline,
-            "summary": summary_counts(metrics, baseline),
-            "metrics": [m.to_dict() for m in metrics.items.values()], "judged": at}
-
-
 def _jsonable(o: Any) -> Any:
     if hasattr(o, "item"):  # NumPy scalars
         return o.item()

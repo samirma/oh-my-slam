@@ -47,7 +47,7 @@ def synthetic_map(folder: Path) -> Path:
 @contextmanager
 def running(bundle: ViewBundle) -> Iterator[str]:
     """Serve ``bundle`` on a free port; yields the URL."""
-    httpd = serve(bundle, 0)
+    httpd = serve(bundle)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

@@ -1,4 +1,4 @@
-"""Deterministic stand-in models (``OH_MY_SLAM_SERVER_STUB=1``) for lifecycle and protocol tests.
+"""Deterministic stand-in models (``--stub``) for lifecycle and protocol tests.
 
 They exercise the real server, worker thread, file hand-off and RLE paths without weights.
 ``OH_MY_SLAM_STUB_DELAY`` (seconds) slows every request down for queueing tests.

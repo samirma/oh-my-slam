@@ -7,7 +7,7 @@ strictly one command at a time.
    ``segment.sh -i`` (artefacts, ``-o`` PLY) and ``view.sh -i``.
 3. Every ``ainex-captures`` frame: ``segment.sh -i``.
 4. ``mapper.sh update``: the sequence in one update (default options: the whole map as JSON),
-   and split across ``splits`` updates into a second map (first update ``-o`` JSON, middle ones
+   and split across ``SPLITS`` updates into a second map (first update ``-o`` JSON, middle ones
    ``-t single -f ply``, last ``-t full``).
 5. On the one-update map: ``segment.sh -m`` (artefacts), ``view.sh -m``; ``segment.sh -m -f ply
    -o`` on the split map.
@@ -86,7 +86,7 @@ SEQUENCE = "ainex-captures"
 GROUND_TRUTH = "ground_truth"
 SERVER = "start_inference_server.sh"
 LABELLED_SEGMENTS = "color=segment,label=on"  # per-point object ids: exact colour checks
-MIN_SPLITS = 3
+SPLITS = 3  # updates of the split map (spec §5: one update versus several)
 MAPS = ("single", "split")
 SERVER_METRICS = ("perf.server.cold_start_s", "perf.server.resident_gb", "perf.server.peak_gb")
 SEG_METRICS = ("seg.restaurant.objects", "seg.frames.with_detections_fraction", "seg.min_score")
@@ -119,7 +119,6 @@ class Evaluation:
     runner: Runner
     probe: BrowserProbe
     examples: Path = EXAMPLES
-    splits: int = MIN_SPLITS
     metrics: Metrics = field(default_factory=Metrics)
     contracts: ContractLog = field(default_factory=ContractLog)
     details: dict[str, Any] = field(default_factory=dict)
@@ -311,7 +310,7 @@ class Evaluation:
         single = self.scene(self.run("mapper_single", "mapper_single", "mapper.sh", "update",
                                      "-i", self.examples / SEQUENCE, "-m", single_dir))
         split = None
-        parts = np.array_split(np.arange(len(captures)), self.splits)
+        parts = np.array_split(np.arange(len(captures)), SPLITS)
         for k, idx in enumerate(parts, start=1):
             tag = f"mapper_split_{k}"
             args: tuple[str | Path, ...] = (

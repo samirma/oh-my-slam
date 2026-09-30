@@ -106,30 +106,12 @@ class Metric:
             "baseline": self.baseline, "regression": self.regression, "detail": self.detail,
         }
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Metric:
-        """A metric of a stored ``result.json`` with its value, detail and error (to judge it
-        again against other targets or another baseline)."""
-        v = d.get("value")
-        return cls(RENAMED.get(str(d["id"]), str(d["id"])),
-                   float(v) if isinstance(v, int | float) else None, d.get("detail"),
-                   d.get("error"))
-
 
 class Metrics:
     """The metrics of one run, by id (a metric is recorded once)."""
 
     def __init__(self) -> None:
         self.items: dict[str, Metric] = {}
-
-    @classmethod
-    def from_result(cls, result: dict[str, Any]) -> Metrics:
-        """The metrics of a stored ``result.json``, not yet judged."""
-        out = cls()
-        for d in result.get("metrics", []):
-            m = Metric.from_dict(d)
-            out.items[m.id] = m
-        return out
 
     def add(self, mid: str, value: float | None, detail: Any = None,
             error: str | None = None) -> None:

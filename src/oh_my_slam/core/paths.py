@@ -41,8 +41,7 @@ def server_log() -> Path:
 
 
 def weights_dir() -> Path:
-    env = os.environ.get("OH_MY_SLAM_WEIGHTS_DIR")
-    base = Path(env) if env else Path.home() / "Library" / "Caches" / "oh-my-slam" / "weights"
+    base = Path.home() / "Library" / "Caches" / "oh-my-slam" / "weights"
     base.mkdir(parents=True, exist_ok=True)
     return base
 

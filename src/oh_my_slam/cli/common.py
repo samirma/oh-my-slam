@@ -6,14 +6,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
 from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, help_text, parse_cloud_attrs
 from oh_my_slam.core.errors import ExitCode, OhMySlamError, UsageError
-from oh_my_slam.core.log import get_logger
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -47,7 +45,6 @@ def cloud_attrs_arg(values: list[str] | None, scope: CloudScope, *, writes_ply: 
 def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None = None) -> NoReturn:
     """Run ``main`` and exit with the mapped code; human-facing text goes to stderr only."""
     args = sys.argv[1:] if argv is None else argv
-    log = get_logger()
     try:
         code = main(args)
     except OhMySlamError as exc:
@@ -59,10 +56,6 @@ def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None
     except BrokenPipeError:
         code = 0
     except Exception as exc:
-        if os.environ.get("OH_MY_SLAM_DEBUG") == "1":
-            traceback.print_exc(file=sys.stderr)
-        else:
-            log.debug("internal error", exc_info=True)
         print(f"{prog}: internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
         code = int(ExitCode.INTERNAL)
     sys.stderr.flush()

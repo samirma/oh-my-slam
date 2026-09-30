@@ -33,6 +33,7 @@ log = logging.getLogger("oh_my_slam.server")
 
 _VERSION_PACKAGES = ("torch", "ultralytics", "transformers", "moge", "geocalib", "mapanything")
 MEMORY_FRACTION = 0.7
+QUEUE_LIMIT = 8  # jobs waiting for the GPU thread; beyond that the server answers 503
 
 
 def _versions() -> dict[str, str]:
@@ -64,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oh_my_slam.server.main")
     parser.add_argument("--stub", action="store_true", help="deterministic stand-in models")
     args = parser.parse_args(argv)
-    stub = args.stub or os.environ.get("OH_MY_SLAM_SERVER_STUB") == "1"
+    stub = args.stub
 
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -80,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_stale_socket(sock_path)
         os.chdir(paths.weights_dir())  # Ultralytics downloads relative assets into the cwd
         registry = build_registry(stub=stub)
-        worker = GpuWorker(max_queue=int(os.environ.get("OH_MY_SLAM_QUEUE", "8")))
+        worker = GpuWorker(max_queue=QUEUE_LIMIT)
         worker.start()
         state = ServerState(registry=registry, worker=worker, versions=_versions())
         app = create_app(state)
