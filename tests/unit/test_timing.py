@@ -35,7 +35,9 @@ def test_nested_stages_are_exclusive_and_add_up() -> None:
     d = t.to_dict()
     assert d["stages_s"]["inner"] == pytest.approx(0.04, abs=0.02)
     assert d["stages_s"]["outer"] == pytest.approx(0.02, abs=0.02)
-    assert sum(d["stages_s"].values()) <= d["total_s"] + 1e-3
+    # every figure is rounded to the millisecond: the rounded stages may exceed the rounded
+    # total by half a millisecond each, and the total by half another
+    assert sum(d["stages_s"].values()) <= d["total_s"] + 5e-4 * (len(d["stages_s"]) + 1) + 1e-9
     assert timing.current() is None  # collection restored
 
 
