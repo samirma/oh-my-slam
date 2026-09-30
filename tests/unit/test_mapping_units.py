@@ -536,6 +536,71 @@ def test_speckle_that_other_keyframes_see_through_needs_the_usual_views() -> Non
     assert (xyz[:, 0] > 2.5).sum() == 0 and (xyz[:, 0] < -2.5).sum() > 5000
 
 
+def test_cell_culling_selects_every_point_a_keyframe_can_see() -> None:
+    """``_Cells`` culls only points a keyframe cannot see: visibility, seeing through and the
+    places of removed objects are the same with and without it, for points all around the
+    camera, near it, beyond its depth and at the image border."""
+    from oh_my_slam.core import rle
+    from oh_my_slam.mapping import geometry as g
+    from oh_my_slam.mapping.objects import Vacated
+
+    _, frames = _wall_frames()
+    rng = np.random.default_rng(3)
+    fd = frames[0]
+    # points on and around the keyframe's surfaces (back-projected pixels, jittered) + anywhere
+    h, w = fd.depth.shape
+    v, u = rng.integers(0, h, 40_000), rng.integers(-20, w + 20, 40_000)
+    z = fd.depth[np.clip(v, 0, h - 1), np.clip(u, 0, w - 1)] * rng.uniform(0.9, 1.1, 40_000)
+    K = fd.rec.K_grid
+    pc = np.stack([(u - K.cx) * z / K.fx, (v - K.cy) * z / K.fy, z], axis=1)
+    pts = np.concatenate([fd.rec.T_map_cam.apply(pc), rng.uniform(-4, 4, (20_000, 3))])
+    cells = g._Cells(pts)
+    for f in frames:
+        a, b = g._visible(f, pts), g._visible(f, pts, cells)
+        assert len(a[0]) > 0 or f is not fd
+        assert set(a[0].tolist()) == set(b[0].tolist())
+        assert np.array_equal(g._seen_through(f, pts), g._seen_through(f, pts, cells))
+    mask = np.zeros((h, w), bool)
+    mask[0:60, 280:320] = True  # at the image corner
+    place = Vacated(1, 7, {fd.rec.name: rle.encode(mask)}, [frames[1].rec.name], None, 3.0)
+    by_name = {f.rec.name: f for f in frames}
+    region = g._vacated_region(pts, place, by_name, cells)
+    assert region.sum() > 100
+    assert np.array_equal(region, g._vacated_region(pts, place, by_name))
+    from oh_my_slam.segmentation.api import OBB
+
+    box = OBB(pts[0], np.eye(3), np.array([0.6, 0.4, 0.8]))  # on the wall keyframe 0 sees
+    place = Vacated(1, 8, {}, [frames[1].rec.name], box, 3.0)
+    region = g._vacated_region(pts, place, by_name, cells)
+    assert region.sum() > 100
+    assert np.array_equal(region, g._vacated_region(pts, place, by_name))
+
+
+def test_fusion_in_slabs_or_a_region_is_the_whole_fusion(monkeypatch: pytest.MonkeyPatch
+                                                         ) -> None:
+    """A large map is fused slab by slab (``TILE_BLOCKS``), and a box of it alone (``region``),
+    with the same points as one fusion of every block: a voxel depends only on the frames, a
+    surface point on its two voxels, the tests of few views on the point."""
+    from oh_my_slam.mapping import geometry as g
+
+    _, frames = _cloud_frames([1.03, 0.97, 1.02, 0.98, 1.01, 0.99])
+    frames[2].depth = np.where(frames[2].depth > 2.5, 0.8 * frames[2].depth,
+                               frames[2].depth).astype(np.float32)  # a surface few frames see
+    whole = g.fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    monkeypatch.setattr(g, "TILE_BLOCKS", 2000)
+    tiles = g._tiles
+    counts = []
+    monkeypatch.setattr(g, "_tiles", lambda *a: counts.append(len(t := tiles(*a))) or t)
+    sliced = g.fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
+    assert counts[0] > 3
+    assert len(whole) > 10_000 and np.array_equal(whole, sliced)
+    lo, hi = np.array([-0.5, -1.0, 0.2]), np.array([1.5, 0.7, 1.4])
+    inside = whole[np.all((whole >= lo) & (whole <= hi), axis=1)]
+    assert len(inside) > 1000
+    assert np.array_equal(g.fused_cloud_points(frames, voxel=0.01, depth_max=6.0,
+                                               region=(lo, hi)), inside)
+
+
 def test_attribute_points_latest_visible_update_wins() -> None:
     from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
 

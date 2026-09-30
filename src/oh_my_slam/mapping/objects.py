@@ -1205,9 +1205,12 @@ def _factor_at(corr: DepthCorrection, T: Pose, p: Any) -> float:
 
 
 def update_objects(ctx: Any, records: list[Any], progress: Any,
-                   surface: NDArray[Any] | None = None) -> ObjectState:
-    """The update's objects (see the module docstring); ``surface``: the map's fused surface
-    (``geometry.fuse_map``), evidence that pieces of a horizontal surface are one object."""
+                   surface: NDArray[Any] | Callable[[NDArray[Any], NDArray[Any]], NDArray[Any]]
+                   | None = None, cuts: dict[int, float] | None = None) -> ObjectState:
+    """The update's objects (see the module docstring); ``surface``: the map's fused surface, or
+    a function giving it within a box (``geometry.SurfaceQuery``), evidence that pieces of a
+    horizontal surface are one object; ``cuts``: per keyframe index, how deep the map fuses it
+    (``geometry.keyframe_depth_cuts``: places beyond are not judged, ``_Places``)."""
     tx = ctx.tx
     state = load_state(tx.current, ctx.meta)
     uid = ctx.update_id
@@ -1296,7 +1299,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     #    object first detected where the update's earlier keyframes saw free space arrived, and
     #    their views through it are retired so that the latest keyframes draw it
     dropped = {o.id for o in state.objects if below_floor(o, state.floor_z)}
-    places = _Places(views, masks, state.objects)
+    places = _Places(views, masks, state.objects, cuts)
     new_idx = sorted(new_views)
     moves = [mv for mv in _moves(state, touched - dropped, places, _Colours(ctx, views, masks))
              if mv.src.id not in dropped and mv.dst.id not in dropped]
@@ -2134,8 +2137,15 @@ class _Surfaces:
     horizontal surface (``joined``; see ``BRIDGE_*``), with the results cached per pair of
     point sets."""
 
-    def __init__(self, cloud: NDArray[Any], floor_z: float | None) -> None:
-        self.cloud = np.asarray(cloud, np.float64).reshape(-1, 3)
+    def __init__(self, cloud: NDArray[Any] | Callable[[NDArray[Any], NDArray[Any]], NDArray[Any]],
+                 floor_z: float | None) -> None:
+        """``cloud``: the surface points, or a function giving those within a box (lowest,
+        highest corner; ``geometry.SurfaceQuery``: fused there only when asked)."""
+        if callable(cloud):
+            self.query = cloud
+        else:
+            pts = np.asarray(cloud, np.float64).reshape(-1, 3)
+            self.query = lambda lo, hi: pts[np.all((pts >= lo) & (pts <= hi), axis=1)]
         self.floor_z = floor_z
         self.cache: dict[tuple[Any, ...], bool] = {}
 
@@ -2161,10 +2171,8 @@ class _Surfaces:
             return False
         both = np.concatenate([a.points, b.points]).astype(np.float64)
         lo, hi = both[:, :2].min(0) - BRIDGE_PAD, both[:, :2].max(0) + BRIDGE_PAD
-        c = self.cloud
-        sel = (np.all((c[:, :2] >= lo) & (c[:, :2] <= hi), axis=1)
-               & (c[:, 2] >= min(ha, hb) - BRIDGE_BAND) & (c[:, 2] <= max(ha, hb) + BRIDGE_BAND))
-        p = c[sel]
+        p = np.asarray(self.query(np.r_[lo, min(ha, hb) - BRIDGE_BAND],
+                                  np.r_[hi, max(ha, hb) + BRIDGE_BAND]), np.float64).reshape(-1, 3)
         if len(p) < 50:
             return False
         p = p[np.sort(voxel_downsample_indices(p, BRIDGE_SAMPLE))]
@@ -2726,10 +2734,15 @@ class _Places:
     differently from one keyframe to the next; a keyframe that sees through no more of it than
     they do is no evidence."""
 
-    def __init__(self, views: _Views, masks: _Masks, objects: list[MapObject]) -> None:
+    def __init__(self, views: _Views, masks: _Masks, objects: list[MapObject],
+                 cuts: dict[int, float] | None = None) -> None:
+        """``cuts``: per keyframe index, how deep the map fuses it (``geometry.
+        keyframe_depth_cuts``); without them every depth is judged."""
         self.views = views
         self.masks = masks
         self.objects = {o.id: o for o in objects}
+        self.cuts = cuts
+        self._fused: dict[int, bool] = {}
         self._rings: dict[tuple[int, int], NDArray[np.float64] | None] = {}
         self._noise: dict[int, float] = {}
         self._edges: dict[int, NDArray[np.bool_]] = {}
@@ -2906,14 +2919,35 @@ class _Places:
                 return rho, float(beyond.mean())
         return None
 
+    def fused(self, o: MapObject) -> bool:
+        """Whether a keyframe that detected the object fused it: one of its sightings lies within
+        that keyframe's fused depth (``cuts``; always, without them). Beyond it the map holds no
+        surface, and monocular depth places the object too loosely (a car 40-100 m down a
+        street, placed metres off) for its place to be judged."""
+        if self.cuts is None:
+            return True
+        if o.id not in self._fused:
+            ok = False
+            for sg in o.sightings:
+                T = self.views.pose(sg.frame)
+                cut = self.cuts.get(sg.frame)
+                if T is not None and cut is not None:
+                    z = float((np.asarray(sg.centroid, np.float64) - T.t) @ T.R[:, 2])
+                    ok = ok or 0.0 < z < cut
+            self._fused[o.id] = ok
+        return self._fused[o.id]
+
     def verdict(self, o: MapObject, j: int, detectable: bool = False) -> Verdict | None:
         """Keyframe ``j``'s verdict on the object's place (see the class docstring); with
         ``detectable``, only from where it could have detected the object too (``PLACE_RANGE``:
-        its silence there is evidence)."""
+        its silence there is evidence). Only a keyframe that fuses the place (most of the
+        object's samples within its fused depth, ``cuts``) judges an object a keyframe that
+        detected it fused (``fused``): what lies beyond the fused depth, the map does not draw."""
         rec = self.views.records.get(j)
         pts, size = self.samples(o)
         if rec is None or rec.low_confidence or not len(pts) or j in o.frames \
-                or not _judges(rec, o, size) or not in_view(pts, rec.K_grid, rec.T_map_cam):
+                or not _judges(rec, o, size) or not in_view(pts, rec.K_grid, rec.T_map_cam) \
+                or not self.fused(o):
             return None
         view = self.views.before(j)  # this update's latest wins may have retired the place
         if view is None:
@@ -2923,6 +2957,8 @@ class _Places:
         with np.errstate(invalid="ignore"):
             framed = (z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
         if framed.mean() < PLACE_FRAMED:
+            return None
+        if self.cuts is not None and float(np.median(z[framed])) >= self.cuts.get(j, np.inf):
             return None
         if detectable and float(np.median(z[framed])) > PLACE_RANGE * self.reach(o):
             return None

@@ -171,3 +171,23 @@ def test_moved(tmp_path: Path, seed: int, split: bool) -> None:
     assert _points_at(res, scene.there) > _dense(scene.there)
     assert _points_at(res, scene.here) == 0
     _furniture_kept(first, res)
+
+
+@pytest.mark.parametrize("beyond", ["detections", "later views"])
+def test_a_place_beyond_the_fused_depth_is_not_judged(tmp_path: Path, beyond: str,
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """The map draws no surface beyond a keyframe's fused depth, and monocular depth places an
+    object there too loosely to judge its place (a car 40-100 m down a street): an object only
+    detected beyond its keyframes' fused depth, or seen by later keyframes only beyond theirs,
+    is kept however they see its place."""
+    from oh_my_slam.mapping import geometry
+
+    def cuts(ctx: object, records: list) -> dict[int, float]:  # type: ignore[type-arg]
+        first = beyond == "detections"
+        return {r.index: (0.3 if (r.index < 4) == first else 100.0) for r in records}
+
+    monkeypatch.setattr(geometry, "keyframe_depth_cuts", cuts)
+    scene = _scene(0)
+    first, res = _map(tmp_path, scene, scene.room(scene.here), scene.room(), False, 0)
+    assert _objects(first) and _objects(res)
+    assert not res.objs.summary["removed"] and not res.objs.summary["withdrawn"]

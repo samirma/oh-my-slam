@@ -469,6 +469,13 @@ point leaves the map untouched. One killed after it is completed by the next upd
     object's samples, or 20 of them when a keyframe detected that object at the object's own
     place (the object under another label, which a keyframe across the room places a little
     apart: a bag seen as a handbag), unless a keyframe detected it beside the object.
+    Only places within the fused depth are judged (the depth to which the map's fusion draws a
+    keyframe, 2.5 times the map's median depth, at most 30 m, see Integration): an object is
+    judged only when a keyframe that detected it has it within its fused depth, and only by
+    keyframes that have most of its samples within theirs. Beyond it the map draws no surface,
+    and monocular depth places a car 40-100 m down a street metres off: on `street.mp4` such
+    distant cars were "removed" or "moved" by later keyframes whose depth looked past the box
+    beside them.
   * **Removing an object.** A sample is seen through when the keyframe sees farther than it by a
     margin: max(0.25 m, 15 % of the depth), but for a small object at most 15 % of its own
     extent (at least the depth noise): a cup on a windowsill is seen through by 5-20 cm. The
@@ -812,13 +819,20 @@ Geometry and detection requests run concurrently on two connections.
       their objects move with them. `frames.json` records each keyframe's `depth_scale` (at its
       median depth) and `stats.depth_exponent` (1 + b).
    4. For a new map, the map is levelled with the floor plane.
-6. **Integration.** The update applies latest wins, fuses the cloud (Open3D TSDF), updates the
-   objects (the fused surface tells pieces of one horizontal surface), gives the cloud's points
-   their object ids, exports the scene and commits. Each keyframe is fused up to 2.5 times the
-   map's median depth (at most 30 m) as it placed that depth before its near/far tilt: the tilt
-   moves surfaces, not which of them the keyframe contributes (outdoors, where it deepens the
-   far field by 15–35 %, a fixed cut dropped the views that make facades 10–20 m from the path
-   reach 3 keyframes).
+6. **Integration.** The update applies latest wins, updates the objects (the fused surface
+   tells pieces of one horizontal surface: it is fused only in the boxes where they ask for it),
+   fuses the cloud once (Open3D TSDF; after the objects this update removed retired their
+   pixels), gives the cloud's points their object ids, exports the scene and commits. Each
+   keyframe is fused up to 2.5 times the map's median depth (at most 30 m) as it placed that
+   depth before its near/far tilt: the tilt moves surfaces, not which of them the keyframe
+   contributes (outdoors, where it deepens the far field by 15–35 %, a fixed cut dropped the
+   views that make facades 10–20 m from the path reach 3 keyframes). Every step of the fusion is
+   local — a voxel depends only on the keyframes, a surface point on its two voxels, the
+   few-views and removed-place tests on the point — so a map of more than 300 000 voxel blocks
+   (a street walk: millions) is fused in slabs of about as many blocks, one at a time, with the
+   same points and the memory of a slab. The per-keyframe projections of the cloud's points
+   (few views, attribution, removed places) cull the points in 25 cm cells outside the
+   keyframe's frustum and run on up to 8 threads over parts of the map.
 
 ### Ownership
 

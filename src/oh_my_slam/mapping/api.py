@@ -1424,20 +1424,30 @@ def integrate(ctx: UpdateContext, progress: Progress
     """Fold the update's placed keyframes into the map (staged): frames, latest wins, objects and
     the cloud. Returns (all frame records, object state, map geometry)."""
     from oh_my_slam.mapping import objects
-    from oh_my_slam.mapping.geometry import build_geometry, fuse_map
+    from oh_my_slam.mapping.geometry import (
+        SurfaceQuery,
+        build_geometry,
+        fuse_map,
+        keyframe_depth_cuts,
+    )
 
     with timing.stage("persist_frames"):
         _stage_frames(ctx)
         records = _frames_json(ctx)
     with timing.stage("validity"):
         validity.apply_latest_wins(ctx, records, progress)
-    fused = fuse_map(ctx, records)  # stage cloud; the objects test surface continuity on it
     with timing.stage("objects"):
-        objs = objects.update_objects(ctx, records, progress, surface=fused.xyz)
-    if objs.invalidated or objs.summary.get("vacated"):
-        # objects removed: their pixels are gone from the keyframes and their places are drawn
-        # from the keyframes that saw through them; fuse again
-        fused = fuse_map(ctx, records)
+        # the objects test surface continuity on the fused surface, fused where they ask for it
+        # (as the keyframes are before the objects' latest wins retire pixels)
+        surface = SurfaceQuery(ctx, records)
+        objs = objects.update_objects(ctx, records, progress, surface=surface,
+                                      cuts=keyframe_depth_cuts(ctx, records))
+        surface.release()
+        ctx.notes["surface_queries"] = {"count": surface.calls,
+                                        "seconds": round(surface.seconds, 2)}
+    # the map fused once, after the objects removed this update retired their pixels (their
+    # places are drawn from the keyframes that saw through them)
+    fused = fuse_map(ctx, records)  # stage cloud
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
     with timing.stage("objects"):
         assert geo.cloud.label is not None
