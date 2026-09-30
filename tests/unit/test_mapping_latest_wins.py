@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping import objects, validity
@@ -173,6 +174,67 @@ def test_a_cup_gone_when_the_camera_comes_back_from_another_side_is_gone(tmp_pat
     assert two.objs.summary["removed"] == [cup.id] and _cup_points(two) == 0
 
 
+def _misplaced(shots: list[Any], label: str, spread: float, rng: np.random.Generator
+               ) -> list[Any]:
+    """``shots`` with each detection of ``label`` placed along its view's rays by its own depth
+    factor within 1 ± ``spread``: monocular depth and pose errors put a small object a few
+    centimetres apart in every keyframe (the ``office_sequence`` cup: 5-15 cm at 0.7 m) while
+    its surroundings agree."""
+    out = []
+    for sh in shots:
+        depth = sh.depth.copy()
+        for lab, mask, _ in sh.dets:
+            if lab == label:
+                depth[mask] *= 1.0 + rng.uniform(-spread, spread)
+        out.append(SimpleNamespace(pose=sh.pose, rgb=sh.rgb, depth=depth, dets=sh.dets))
+    return out
+
+
+SILL_CUP = Box(np.array([0.3, 0.2, 0.05]), np.array([0.09, 0.09, 0.1]), 0.2, (235, 235, 230),
+               "cup")
+
+
+def _along(n: int, start: float, stop: float, rng: np.random.Generator) -> list[Pose]:
+    """Views of the cup's place from 0.6-0.8 m, looking down at it, the camera stepping along
+    a line (as along a windowsill)."""
+    return [look_at(np.array([0.3 + rng.normal(0, 0.02), 0.2 - dist, 0.45 + rng.normal(0, 0.03)])
+                    + np.array([x, 0.0, 0.0]),
+                    SILL_CUP.center + rng.normal(0, 0.01, 3))
+            for x, dist in zip(np.linspace(start, stop, n), rng.uniform(0.45, 0.6, n), strict=True)]
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one-update", "two-updates"])
+@pytest.mark.parametrize("seed", range(4))
+def test_a_cup_its_detections_placed_apart_is_gone_when_two_views_see_its_place_empty(
+        tmp_path: Path, seed: int, split: bool) -> None:
+    """Four views detect a cup, each placing it up to ±12 % of its depth along its own rays (its
+    points spread over twice its size, so its detecting views see through half of them); the
+    two latest views see the floor where it stood. Nothing but the floor at the cup's foot is
+    left within the absence margin there, and the floor at its foot cannot tell whether the cup
+    stands on it: the two views remove the cup, in one update or in two. The same views with
+    the cup still there keep it, without a strike."""
+    rng = np.random.default_rng(seed)
+    with_cup, without = Room(boxes=[SILL_CUP]), Room(boxes=[])
+    early = _misplaced(shoot(with_cup, _along(4, -0.2, 0.2, rng)), "cup", 0.12, rng)
+    late_poses = _along(2, -0.15, 0.15, rng)
+    for after, gone in ((shoot(without, late_poses), True),
+                        (_misplaced(shoot(with_cup, late_poses), "cup", 0.12, rng), False)):
+        tag = f"{'gone' if gone else 'kept'}"
+        if split:
+            first = known_pose_update(tmp_path / tag, early, tmp_path / f"{tag}0")
+            assert [o.label for o in first.objs.exported()] == ["cup"]
+            res = known_pose_update(tmp_path / tag, after, tmp_path / f"{tag}1")
+        else:
+            res = known_pose_update(tmp_path / tag, early + after, tmp_path / f"{tag}1")
+        cups = [o for o in res.objs.objects if o.label == "cup"]
+        if gone:
+            assert not cups and not res.objs.exported(), res.objs.summary
+        else:
+            assert [o.label for o in res.objs.exported()] == ["cup"]
+            assert [o.strikes for o in cups] == [0]
+            assert not res.objs.summary["removed"] and not res.objs.summary["withdrawn"]
+
+
 # --- the pieces -------------------------------------------------------------------------------------
 
 
@@ -253,12 +315,31 @@ def test_a_keyframe_must_see_through_more_than_the_detections_do() -> None:
     sees the cup where they do is no evidence that it is gone, though it sees behind its points
     once its depth is divided by its ratio to those keyframes."""
     places, cup = _places({10: (WITH_CUP, AT[0], 1.0), 11: (WITHOUT, AT[0], 1.0)}, detected=1.15)
-    assert places.transparency(cup) > 0.5
+    assert min(places.transparency(cup)) > 0.5
     here = places.verdict(cup, 10)
     assert here is not None and abs(here.ratio - 1 / 1.15) < 0.03
     assert here.share < objects.REMOVE_FRACTION
     clean, cup = _places({10: (WITH_CUP, AT[0], 1.0)})
-    assert clean.transparency(cup) < 0.05
+    assert max(clean.transparency(cup)) < 0.05
+
+
+def test_the_support_at_an_objects_foot_is_no_evidence() -> None:
+    """The cup's lower band stands on the floor: a view of its empty place sees the floor there
+    within the absence margin, as a view of the cup in place sees the cup there. Those samples
+    tell nothing: the view of the empty place sees through all the others (``share``), while
+    counted as seen in place (``held``) they would dilute it; the view of the cup sees it in
+    place either way."""
+    places, cup = _places({10: (WITHOUT, AT[0], 1.0), 11: (WITH_CUP, AT[0], 1.0)})
+    local = np.random.default_rng(1).uniform(-0.5, 0.5, (3000, 3)) * CUP.size
+    face = np.argmax(np.abs(local) / CUP.size, axis=1)
+    rows = np.arange(len(local))
+    local[rows, face] = np.sign(local[rows, face]) * CUP.size[face] / 2
+    cup.points = (local + CUP.center).astype(np.float32)  # the whole cup, down to the floor
+    places = objects._Places(places.views, places.masks, [cup])
+    gone, here = places.verdict(cup, 10), places.verdict(cup, 11)
+    assert gone is not None and here is not None
+    assert gone.share > 0.95 > gone.held + 0.05 and not gone.in_place
+    assert here.in_place and here.share < 1 - objects.REMOVE_FRACTION
 
 
 def test_a_pose_uncertain_by_a_few_degrees_judges_only_what_is_large_against_the_error() -> None:

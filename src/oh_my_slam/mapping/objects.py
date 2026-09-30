@@ -36,7 +36,8 @@ Semantics (spec §2.3):
   (``_Places``: in view and unoccluded, near enough, their depth divided by the local ratio to
   the detecting keyframes, from any viewpoint and distance); seeing through it by more than the
   depth noise, the object's size-scaled margin (``absence_tau``) and the disagreement of its own
-  detections removes it or gives it a strike, and an update that re-detects it or sees it in
+  detections — where the support at its foot, which looks the same with or without the object,
+  is no evidence (``_evidence``) — removes it or gives it a strike, and an update that re-detects it or sees it in
   place clears its strikes (``_absence``). The removed object's detection masks are invalidated
   in the keyframes that detected it (``retire_pixels``), so the map cloud loses its points too,
   and its place is drawn from the keyframes that saw through it (``Vacated``). An object first
@@ -206,6 +207,10 @@ ABSENCE_POSE_SHARE = 0.15
 # own PLACE_REFS largest detections' keyframes see through (its transparency) is no evidence.
 PLACE_FRAMED = 0.8
 PLACE_RANGE = 1.5
+# ... and where it sees the object's support at the object's foot — the lifted surface within the
+# absence margin of a sample lies in the object's bottom band, FOOT_BAND of its height (the bottom
+# band of segmentation's support trimming) — the sample is no evidence either way (``_evidence``)
+FOOT_BAND = 0.25
 PLACE_MIN_PIXELS = 20
 PLACE_REFS = 3
 RING_WIDTH = 0.5
@@ -1335,7 +1340,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
                 and min(o.frames) in new_views:
             earlier = places.verdicts(o, [f for f in new_idx if f < min(o.frames)])
             if _judgement(o, earlier, few=False) == "gone":  # absent: 3 keyframes or more
-                last = max((v.frame for v in earlier if v.share <= 1.0 - REMOVE_FRACTION),
+                last = max((v.frame for v in earlier if v.in_place),
                            default=-1)
                 arrive(o, [v for v in earlier if v.share >= REMOVE_FRACTION and v.frame > last])
     retired = set(removed) | {mv.src.id for mv in moves}
@@ -2700,12 +2705,25 @@ class Verdict:
     """How one keyframe saw an object's place (``_Places.verdict``): the share of the object's
     judged samples it saw through, whether its pose is well supported (many SfM inliers or feature
     matches: the few-keyframes rule of ``_judgement``), and its depth ratio to the object's
-    detections there (measured on the object's surroundings; its depth is divided by it)."""
+    detections there (measured on the object's surroundings; its depth is divided by it).
+
+    ``share`` leaves out the samples where the keyframe sees the object's support at its foot,
+    which cannot tell whether the object is there (``_evidence``); ``held`` counts them as seen in
+    place. A keyframe sees the object in place (``in_place``) by ``held``, and through it by
+    ``share``: what cannot tell never removes an object, nor keeps a keyframe that saw its place
+    empty from removing it."""
 
     frame: int
     share: float
     supported: bool
     ratio: float = 1.0
+    held: float | None = None  # ``share`` with the object's foot counted as seen in place
+
+    @property
+    def in_place(self) -> bool:
+        """The keyframe saw the object where it was: at most 1 - ``REMOVE_FRACTION`` of it seen
+        through (``held``)."""
+        return (self.share if self.held is None else self.held) <= 1.0 - REMOVE_FRACTION
 
 
 class _Places:
@@ -2744,7 +2762,7 @@ class _Places:
         self.cuts = cuts
         self._fused: dict[int, bool] = {}
         self._rings: dict[tuple[int, int], NDArray[np.float64] | None] = {}
-        self._noise: dict[int, float] = {}
+        self._noise: dict[int, tuple[float, float]] = {}
         self._edges: dict[int, NDArray[np.bool_]] = {}
 
     def _edge(self, f: int, view: View) -> NDArray[np.bool_]:
@@ -2773,27 +2791,40 @@ class _Places:
         size = {s.frame: s.points for s in o.sightings}
         return sorted(o.frames, key=lambda f: (-size.get(f, 0), f))[:n]
 
-    def transparency(self, o: MapObject) -> float:
+    def transparency(self, o: MapObject) -> tuple[float, float]:
         """The share of the object's samples its own detecting keyframes see through (by the
         margin of ``verdict``; the largest over up to ``PLACE_REFS`` of them, the largest
         detections): monocular depth sees between the rungs of a ladder or the leaves of a plant,
         and places a small object differently from one keyframe to the next. A keyframe that
-        judges the object must see through it by more than that (``verdict``)."""
+        judges the object must see through it by more than that (``verdict``). As for the
+        verdict's ``share`` and ``held``: without and with the samples where the keyframes see
+        the object's support at its foot (``_evidence``)."""
         if o.id not in self._noise:
             pts, size = self.samples(o)
-            worst = 0.0
+            worst = [0.0, 0.0]
             for f in self._detecting(o, PLACE_REFS):
                 view = self.views.before(f)
                 if view is None:
                     continue
-                ok, z, d, _, _ = _lookup_valid(view, pts)
-                t = absence_tau(z, size)
-                through = ok & (d - z > t)
-                judged = through | (ok & (np.abs(d - z) <= t))
-                if judged.sum() >= PLACE_MIN_PIXELS:
-                    worst = max(worst, float(through.sum() / judged.sum()))
-            self._noise[o.id] = worst
+                ok, z, d, u, v = _lookup_valid(view, pts)
+                through, judged, held = _evidence(view, ok, z, d, u, v, size, self.foot(o))
+                for k, n in enumerate((judged, held)):
+                    if n.sum() >= PLACE_MIN_PIXELS:
+                        worst[k] = max(worst[k], float(through.sum() / n.sum()))
+            self._noise[o.id] = (worst[0], worst[1])
         return self._noise[o.id]
+
+    def foot(self, o: MapObject) -> tuple[float, float]:
+        """(the height of the object's foot, its height): the 2nd percentile of its samples'
+        heights, and the span to their 98th percentile (``_evidence``)."""
+        def compute() -> tuple[float, float]:
+            pts, _ = self.samples(o)
+            if not len(pts):
+                return 0.0, 0.0
+            lo, hi = np.percentile(pts[:, 2], [2, 98])
+            return float(lo), float(hi - lo)
+        out: tuple[float, float] = o.memo("place_foot", compute)
+        return out
 
     def ring(self, o: MapObject, f: int) -> NDArray[np.float64] | None:
         """Map points of the surface around the object's detection in keyframe ``f``."""
@@ -2971,20 +3002,22 @@ class _Places:
         ok, zz, d, u, v = _lookup_valid(view, pts[framed])
         dn = d / ratio
         t = absence_tau(zz, size)
-        through = ok & (dn - zz > t)
-        judged = through | (ok & (np.abs(dn - zz) <= t))
-        pixels = len(np.unique(v[judged] * w + u[judged]))
-        if judged.sum() < VISIBLE_SHARE * int(framed.sum()) or pixels < PLACE_MIN_PIXELS:
+        visible = ok & (dn - zz >= -t)  # seen through or on: not hidden behind something nearer
+        pixels = len(np.unique(v[visible] * w + u[visible]))
+        if visible.sum() < VISIBLE_SHARE * int(framed.sum()) or pixels < PLACE_MIN_PIXELS:
             return None
+        through, judged, held = _evidence(view, ok, zz, dn, u, v, size, self.foot(o))
         supported = (rec.stats.get("observations", FEW_MIN_INLIERS) >= FEW_MIN_INLIERS
                      or "pose_matches" in rec.stats
                      or rec.pose_source in ("identity", "multiview"))
-        seen = float(through.sum() / judged.sum())
         # what its own detections see through, and what this keyframe sees through around the
         # object where nothing changed, are no evidence
-        s0 = max(self.transparency(o), around)
-        share = max(0.0, (seen - s0) / (1.0 - s0)) if s0 < 1.0 else 0.0
-        return Verdict(j, share, supported, ratio)
+        shares = []
+        for n, s0 in zip((judged, held), self.transparency(o), strict=True):
+            seen = float(through.sum() / n.sum()) if n.any() else 0.0
+            s0 = max(s0, around)
+            shares.append(max(0.0, (seen - s0) / (1.0 - s0)) if s0 < 1.0 else 0.0)
+        return Verdict(j, shares[0], supported, ratio, held=shares[1])
 
     def verdicts(self, o: MapObject, frames: list[int], detectable: bool = False
                  ) -> list[Verdict]:
@@ -3038,9 +3071,40 @@ def _lookup_valid(view: View, pts: NDArray[np.float64]
     return ok, np.where(inside, z, 0.0), d, u, v
 
 
+def _evidence(view: View, ok: NDArray[np.bool_], z: NDArray[np.float64], d: NDArray[np.float64],
+              u: NDArray[np.int64], v: NDArray[np.int64], size: float,
+              foot: tuple[float, float]
+              ) -> tuple[NDArray[np.bool_], NDArray[np.bool_], NDArray[np.bool_]]:
+    """(seen through, judged, held) for an object's samples in a keyframe (``_lookup_valid``, with
+    ``d`` the keyframe's depth there as the verdict uses it): a sample is seen through when the
+    keyframe sees farther than it by the absence margin (``absence_tau``), and judged when it is
+    seen through or on the keyframe's surface within that margin — except where that surface is
+    the object's support at its foot: the surface the keyframe sees there, lifted into the map,
+    lies in the object's bottom band (``FOOT_BAND`` of its ``height``, at most the margin, above
+    its ``base``). A keyframe sees the table, the floor or the windowsill under the foot of a
+    cup whether the cup stands there or not, so those samples are no evidence either way: the
+    cup of ``office_sequence``, gone in the last photos, left 15 % of its samples on the
+    windowsill within the margin, and counted as seen in place they kept both photos that saw
+    the empty sill below a removal. ``held``: seen through or on, the foot included (a keyframe
+    sees the object in place by it: the foot cannot tell, and what cannot tell never removes an
+    object)."""
+    base, height = foot
+    t = absence_tau(z, size)
+    through = ok & (d - z > t)
+    on = ok & (np.abs(d - z) <= t)
+    held = through | on
+    if on.any():
+        idx = np.flatnonzero(on)
+        seen = view.T_map_cam.apply(unproject_pixels(u[idx], v[idx], d[idx], view.K.K()))
+        at_foot = seen[:, 2] <= base + np.minimum(t[idx], FOOT_BAND * height)
+        on[idx[at_foot]] = False
+    return through, through | on, held
+
+
 def _judgement(o: MapObject, verdicts: list[Verdict], few: bool = True) -> str | None:
     """What the verdicts of keyframes say about an object's place, the latest winning: a keyframe
-    that sees the object in place (<= 1 - ``REMOVE_FRACTION`` of its samples seen through) outweighs
+    that sees the object in place (``Verdict.in_place``: <= 1 - ``REMOVE_FRACTION`` of its samples
+    seen through, the support at its foot counted as seen in place) outweighs
     every earlier one, so only the verdicts of the keyframes added after the last such keyframe
     count ("in place" when there are none). Of those: "gone" when most see through it
     (>= ``REMOVE_FRACTION``) and at least ``REMOVE_MIN_FRAMES`` do, or (with ``few``) at least
@@ -3051,7 +3115,7 @@ def _judgement(o: MapObject, verdicts: list[Verdict], few: bool = True) -> str |
     if not verdicts:
         return None
     ordered = sorted(verdicts, key=lambda v: v.frame)
-    last_in_place = max((k for k, v in enumerate(ordered) if v.share <= 1.0 - REMOVE_FRACTION),
+    last_in_place = max((k for k, v in enumerate(ordered) if v.in_place),
                         default=-1)
     after = ordered[last_in_place + 1:]
     if not after:
@@ -3084,7 +3148,7 @@ def _absence(candidates: list[MapObject], verdicts: dict[int, list[Verdict]],
         if verdict == "gone" or (verdict == "strike" and o.strikes >= 2):
             removed.append(o.id)
             if witnesses is not None:
-                last = max((v.frame for v in vs if v.share <= 1.0 - REMOVE_FRACTION), default=-1)
+                last = max((v.frame for v in vs if v.in_place), default=-1)
                 witnesses[o.id] = sorted(v.frame for v in vs
                                          if v.share >= REMOVE_FRACTION and v.frame > last)
     return removed
@@ -3220,7 +3284,7 @@ def _moves(state: ObjectState, touched: set[int], places: _Places, colours: _Col
             continue
         if _judgement(a, dep) != "gone" and _judgement(b, arr, few=False) != "gone":
             continue
-        last = max((v.frame for v in arr if v.share <= 1.0 - REMOVE_FRACTION), default=-1)
+        last = max((v.frame for v in arr if v.in_place), default=-1)
         moves.append(Move(a, b, [v.frame for v in dep],
                           [v for v in arr if v.share >= REMOVE_FRACTION and v.frame > last]))
         used |= {a.id, b.id}

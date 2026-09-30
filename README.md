@@ -484,6 +484,16 @@ point leaves the map untouched. One killed after it is completed by the next upd
     detections: monocular depth sees between a ladder's rungs and a plant's leaves, and places a
     small object differently from one keyframe to the next), or the share of the object's
     surroundings the judging keyframe sees through, where nothing changed, whichever is larger.
+    A sample where the keyframe sees the object's support at its foot (the surface within the
+    margin lies in the object's bottom quarter, at most the margin above its base) tells
+    nothing: the keyframe sees the table or the windowsill there whether the object stands on
+    it or not. The share leaves such samples out; they count as seen in place only for whether
+    the keyframe sees the object in place. In `office_sequence` mapped in two updates the cup's
+    four detections are placed 5-15 cm apart (the first update's four photos have their
+    matches mostly on the trees behind the window, see Known limitations), so its detecting
+    keyframes see through half of its samples themselves, and the sill at its foot held 15 % of
+    them within the margin in the two photos that see its place empty: both saw it gone by
+    0.63-0.70, and it only got a strike.
     The latest keyframe wins: a keyframe that sees the object in place (at most 40 % through)
     outweighs every earlier one, so only the keyframes added after the last such one count. The
     update removes the object when most of those see through at least 60 % of it: three
@@ -972,6 +982,19 @@ runs it end to end as a test.
   fused surface joins them (see Update semantics). At floor height only the first test applies,
   since the floor joins anything: two pieces of one rug that neither overlap nor touch stay two
   objects.
+* **Scenery behind glass.** Monocular depth places what is seen through a window (trees, a
+  street) on the pane. Where most feature matches lie there, poses that lift keypoints with
+  their depth are pulled towards a camera that did not move: the first four photos of
+  `office_sequence` mapped on their own have about 90 % of their matches on the trees behind
+  the window, and the multi-view refinement leaves their cameras 1-6 cm apart where the
+  13-photo map measures 8-25 cm (SfM of the four photos alone is no better: rotations 2.5-4.7°
+  off, 15-37 points per photo). Objects near the camera, the cup and the wallet on the
+  windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
+  longer. In a map of the whole sequence the global mapper's result varies from run to run for
+  the same reason: in some runs the depth check (step 1 of *Weakly linked parts*) rejects
+  photos whose SfM points are mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and
+  their multi-view poses leave them low confidence; a place only such photos see is then not
+  judged, and the cup can stay in that run's map.
 * **Video through several rooms.** Where a walk crosses a doorway in a second or two,
   consecutive keyframes share only a few matches, and the global mapper can leave the stretch
   behind the doorway at any scale or tilt, or shrink it onto one point (see Poses). The mapper
