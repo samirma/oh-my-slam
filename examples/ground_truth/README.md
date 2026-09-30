@@ -9,8 +9,7 @@ These `gt.*` metrics are the evaluator's accuracy measure. Without annotations, 
 measured only against the map built from the same detector (`seg.map_consistency.*`, which
 measures consistency, not accuracy). Poses are measured only against the commanded headings in
 the capture names, and the true headings deviate from those by several degrees. The summary
-says when no annotations were found. New annotations take effect on the next run:
-`--resummarise` only judges a stored run's values again.
+says when no annotations were found. New annotations take effect on the next run.
 
 A file that is malformed, or that describes an image the evaluator did not run, is skipped. The
 evaluator lists skipped files and the reason under `details.ground_truth.skipped` in `result.json`.

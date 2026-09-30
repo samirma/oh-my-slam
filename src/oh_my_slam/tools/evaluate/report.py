@@ -1,5 +1,5 @@
 """``result.json`` (machine-readable) and ``summary.md`` (human-readable, rendered from the result
-alone, so it can be regenerated from any stored result — ``--resummarise``)."""
+alone)."""
 
 from __future__ import annotations
 
