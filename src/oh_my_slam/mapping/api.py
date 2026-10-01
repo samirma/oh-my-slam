@@ -186,24 +186,24 @@ class _EarlyFeatures:
     database is the one extracting after inference writes. Only for keyframes of one size, which
     share one new camera either way."""
 
-    def __init__(self, sfm: Sfm, names: list[str], size: tuple[int, int]) -> None:
+    def __init__(self, sfm: Sfm, names: list[str], size: tuple[int, int], video: bool) -> None:
         self.sfm = sfm
         provisional = CameraPrior(*size, focal=float(max(size)))
         self._pool = ThreadPoolExecutor(1)
-        self._camera = self._pool.submit(self._extract, names, provisional)
+        self._camera = self._pool.submit(self._extract, names, provisional, video)
 
-    def _extract(self, names: list[str], prior: CameraPrior) -> int:
+    def _extract(self, names: list[str], prior: CameraPrior, video: bool) -> int:
         with timing.part("feature_extraction"):
-            return self.sfm.extract(names, prior)
+            return self.sfm.extract(names, prior, video=video)
 
     @staticmethod
-    def start(tx: store.MapTransaction, work: Path, kfs: list[ingest.Keyframe]
+    def start(tx: store.MapTransaction, work: Path, kfs: list[ingest.Keyframe], video: bool
               ) -> _EarlyFeatures | None:
         sizes = {upright_size(kf.path) for kf in kfs}
         if len(kfs) < 2 or len(sizes) != 1:
             return None
         sfm = Sfm(tx.clone_for_edit(store.SFM_DB), tx.stage("frames"), work / "sfm")
-        return _EarlyFeatures(sfm, [f"{kf.name}.jpg" for kf in kfs], sizes.pop())
+        return _EarlyFeatures(sfm, [f"{kf.name}.jpg" for kf in kfs], sizes.pop(), video)
 
     def finish(self, prior: CameraPrior) -> None:
         """Wait for the features and give their camera ``prior``'s parameters."""
@@ -413,7 +413,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
         if ctx.features is not None:
             ctx.features.finish(prior)
         else:
-            sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior)
+            sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior, video=is_video)
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
         n = sfm.match_pairs(pairs, names)
@@ -1671,7 +1671,8 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             early: list[_EarlyFeatures] = []
 
             def ingested(written: list[ingest.Keyframe]) -> None:
-                f = None if old else _EarlyFeatures.start(tx, work, written)
+                f = None if old else _EarlyFeatures.start(tx, work, written,
+                                                          spec.kind == "video")
                 if f is not None:
                     running.callback(f.close)
                     early.append(f)

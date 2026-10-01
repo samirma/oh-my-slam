@@ -744,7 +744,9 @@ pixels, so its results are unchanged.
    this inference; their camera gets its prior focal length (the median of the keyframes'
    estimates) once inference is done, which leaves the database as extracting afterwards does.
 3. **Features and matching.** The Homebrew `colmap` CLI extracts and matches SIFT features.
-   Pairs are chosen as follows:
+   SIFT doubles each photo for its finest scale (COLMAP's default), but not the keyframes of a
+   video of at least 1600 px: for those it was most of the COLMAP time and memory (the lv walk:
+   36 s and 8.7 GB doubled, 10 s and 2.4 GB not). Pairs are chosen as follows:
    * Photos: every pair up to 200 images.
    * Otherwise: sequential neighbours plus descriptor retrieval, with loop-closure candidates
      for video.
