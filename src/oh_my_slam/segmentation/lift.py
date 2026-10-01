@@ -13,7 +13,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
-from oh_my_slam.core.geometry import depth_edge_mask, unproject_pixels
+from oh_my_slam.core.geometry import depth_edge_mask, unique_rows, unproject_pixels
 from oh_my_slam.core.types import Intrinsics, Pose
 
 SHRINK_PX = 3
@@ -53,8 +53,7 @@ def largest_cluster(points: NDArray[Any], eps: float) -> NDArray[np.bool_]:
     if n == 0:
         return np.zeros(0, bool)
     keys = np.floor(np.asarray(points) / eps).astype(np.int64)
-    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
+    uniq, inv = unique_rows(keys)
     m = len(uniq)
     if m == 1:
         return np.ones(n, bool)
@@ -87,7 +86,7 @@ def statistical_outliers(points: NDArray[Any], k: int = SOR_K,
     if n <= k + 1:
         return np.ones(n, bool)
     tree = cKDTree(points)
-    d, _ = tree.query(points, k=k + 1)
+    d, _ = tree.query(points, k=k + 1, workers=-1)  # each point's query on its own: in parallel
     md = d[:, 1:].mean(1)
     return md <= md.mean() + std_ratio * md.std()
 

@@ -541,6 +541,12 @@ class MapObject:
         """Horizontal diagonal of its points (``_extent``)."""
         return float(self.memo("extent", lambda: _extent(self.points)))
 
+    def tree(self) -> cKDTree:
+        """KD-tree of its points, built once per state of its evidence (``memo``): the merge tests
+        query an object against every other one near it, and again after each merge."""
+        t: cKDTree = self.memo("tree", lambda: cKDTree(self.points))
+        return t
+
     def point_sources(self) -> NDArray[np.uint8]:
         """``sources``, every kind (``SRC_ANY``) for points whose sources were not recorded."""
         if self.sources is None or len(self.sources) != len(self.points):
@@ -890,12 +896,19 @@ def projected_iou(view: View, mask: NDArray[np.bool_], pts: NDArray[Any],
 
 def overlap_fraction(a: NDArray[Any], b: NDArray[Any], radius: float,
                      tree: cKDTree | None = None) -> float:
-    """Fraction of points of ``a`` within ``radius`` of ``b`` (``tree``: a KD-tree of ``b``)."""
+    """Fraction of points of ``a`` within ``radius`` of ``b`` (``tree``: a KD-tree of ``b``). Only
+    the points within ``radius`` of ``b``'s bounding box are looked up: the others cannot be (the
+    objects the merge tests compare are near each other, most of their points apart)."""
     if len(a) == 0 or len(b) == 0:
         return 0.0
     sa = a if len(a) <= 4000 else a[np.linspace(0, len(a) - 1, 4000).astype(int)]
-    d, _ = (tree or cKDTree(b)).query(sa, k=1, distance_upper_bound=radius)
-    return float(np.isfinite(d).mean())
+    t = tree or cKDTree(b)
+    pad = radius * (1.0 + 1e-6)  # a point that far from the box along one axis is farther
+    near = np.all((sa >= t.mins - pad) & (sa <= t.maxes + pad), axis=1)
+    if not near.any():
+        return 0.0
+    d, _ = t.query(sa[near], k=1, distance_upper_bound=radius)
+    return float(np.count_nonzero(np.isfinite(d)) / len(sa))
 
 
 def _extent(pts: NDArray[Any]) -> float:
@@ -1750,14 +1763,11 @@ def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier |
     weak link). Returns (existing object id or None, instance indices) per group."""
     n = len(obs)
     objs = list(objects)
-    trees: dict[int, cKDTree] = {}
     to_obj: dict[tuple[int, int], float] = {}
     # (-strength, kind, content key, content key / object id, node a, node b); kind 0 = existing
     edges: list[tuple[float, int, tuple[Any, ...], tuple[Any, ...], int, int]] = []
     for i, j in _candidate_objects(obs, objs):
-        if j not in trees:
-            trees[j] = cKDTree(objs[j].points)
-        s = _object_affinity(obs[i], objs[j], trees[j], earlier)
+        s = _object_affinity(obs[i], objs[j], objs[j].tree(), earlier)
         if s >= IOU_GATE:
             to_obj[(i, j)] = s
             edges.append((-s, 0, obs[i].key, (objs[j].id,), i, n + j))
@@ -2471,7 +2481,8 @@ def _part_of(a: MapObject, b: MapObject, views: _Views, masks: _Masks | None = N
         return 0.0
     inside = float(whole.obb.contains(own, CONSENSUS_MARGIN).mean())
     near = max(POINT_VOXEL, PART_NEAR_REL * part.obs_depth)
-    if inside < PART_INSIDE or overlap_fraction(own, whole.points, near) < PART_SURFACE:
+    if inside < PART_INSIDE or overlap_fraction(own, whole.points, near,
+                                                whole.tree()) < PART_SURFACE:
         return 0.0
     reach = [float(np.linalg.norm(T.t - np.asarray(s.centroid)))
              for s in part.sightings if (T := views.pose(s.frame)) is not None]
@@ -2531,12 +2542,13 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
                 return max(surface, _part_of(a, b, views, parts))
             return surface
         radius = max(0.05, 0.02 * min(a.obs_depth, b.obs_depth))
-        s = max(surface, overlap_fraction(a.points, b.points, radius) / MERGE_OVERLAP,
-                overlap_fraction(b.points, a.points, radius) / MERGE_OVERLAP)
+        s = max(surface, overlap_fraction(a.points, b.points, radius, b.tree()) / MERGE_OVERLAP,
+                overlap_fraction(b.points, a.points, radius, a.tree()) / MERGE_OVERLAP)
         return max(s, _seen_as_one(a, b, masks)) if s < 1.0 and masks is not None else s
     small, big = (a, b) if len(a.points) <= len(b.points) else (b, a)
     radius = max(0.05, 0.02 * small.obs_depth)
-    s = max(surface, overlap_fraction(small.points, big.points, radius) / MERGE_OVERLAP)
+    s = max(surface, overlap_fraction(small.points, big.points, radius, big.tree())
+            / MERGE_OVERLAP)
     if a.obb is not None and b.obb is not None:
         s = max(s, obb_iou_upright(a.obb, b.obb, samples=3000) / MERGE_BOX_IOU,
                 containment(a.obb, b.obb) / MERGE_CONTAINMENT)

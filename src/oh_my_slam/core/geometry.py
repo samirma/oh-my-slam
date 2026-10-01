@@ -7,7 +7,7 @@ Cameras use OpenCV axes. All functions are pure NumPy.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -194,14 +194,37 @@ def depth_edge_mask(depth: NDArray[Any], rel_threshold: float = 0.04, size: int 
     big = np.where(valid, d, np.nan)
     fill_hi = np.where(valid, d, -np.inf)
     fill_lo = np.where(valid, d, np.inf)
-    dmax = ndimage.maximum_filter(fill_hi, size=size, mode="nearest")
-    dmin = ndimage.minimum_filter(fill_lo, size=size, mode="nearest")
+    if size % 2 == 0:  # an even window is off-centre: ndimage's convention
+        dmax = ndimage.maximum_filter(fill_hi, size=size, mode="nearest")
+        dmin = ndimage.minimum_filter(fill_lo, size=size, mode="nearest")
+        touching_invalid = ndimage.binary_dilation(~valid, structure=np.ones((size, size), bool))
+    else:  # the same windows, as shifted views (several times faster)
+        dmax = _window(fill_hi, size, np.maximum, "edge")
+        dmin = _window(fill_lo, size, np.minimum, "edge")
+        touching_invalid = _window(~valid, size, np.logical_or, "constant")
     with np.errstate(invalid="ignore", divide="ignore"):
         rel = (dmax - dmin) / big
     edges = np.asarray(rel > rel_threshold)
     # a valid pixel touching an invalid one is also an edge
-    touching_invalid = ndimage.binary_dilation(~valid, structure=np.ones((size, size), dtype=bool))
     return np.asarray((edges | touching_invalid) & valid)
+
+
+def _window(a: NDArray[Any], size: int, op: Any, mode: Literal["edge", "constant"]
+            ) -> NDArray[Any]:
+    """``op`` (an associative ufunc: maximum, minimum, logical_or) over the ``size`` x ``size``
+    window centred on each element (``size`` odd), beyond the border as ``np.pad``'s ``mode``
+    extends the array ("edge": ndimage's "nearest"; "constant": zeros / False, a binary
+    dilation's border): ndimage's maximum/minimum filter and binary dilation, separably."""
+    r = size // 2
+    p = np.pad(a, r, mode=mode)
+    h, w = a.shape
+    rows = p[0:h]
+    for k in range(1, size):
+        rows = op(rows, p[k:k + h])
+    out = rows[:, 0:w]
+    for k in range(1, size):
+        out = op(out, rows[:, k:k + w])
+    return np.asarray(out)
 
 
 # --- point utilities -----------------------------------------------------------------------------
@@ -227,6 +250,18 @@ def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "la
     else:
         _, out = np.unique(keys, axis=0, return_index=True)
     return np.sort(out)
+
+
+def unique_rows(keys: NDArray[np.int64]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """``np.unique(keys, axis=0, return_inverse=True)`` of (N, 3) integer keys (the rows in
+    lexicographic order, and the row of each key), through one int64 per key (``_packed``)."""
+    keys = np.asarray(keys, np.int64)
+    packed = _packed(keys) if len(keys) else keys
+    if packed.ndim == 2:
+        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+        return uniq, inv.reshape(-1)
+    _, first, inv = np.unique(packed, return_index=True, return_inverse=True)
+    return keys[first], inv.reshape(-1)
 
 
 def _packed(keys: NDArray[np.int64]) -> NDArray[np.int64]:
