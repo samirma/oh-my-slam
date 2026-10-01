@@ -2738,6 +2738,16 @@ class Verdict:
         return (self.share if self.held is None else self.held) <= 1.0 - REMOVE_FRACTION
 
 
+@dataclass(frozen=True)
+class _Footprint:
+    """Detections of an object in a keyframe (``_Places._footprint``)."""
+
+    shape: tuple[int, ...]
+    box: tuple[int, int, int, int]
+    row: float  # centre
+    col: float
+
+
 class _Places:
     """Latest wins for objects: how the map's keyframes saw the places of its objects.
 
@@ -2776,6 +2786,9 @@ class _Places:
         self._rings: dict[tuple[int, int], NDArray[np.float64] | None] = {}
         self._noise: dict[int, tuple[float, float]] = {}
         self._edges: dict[int, NDArray[np.bool_]] = {}
+        # per (object id, keyframe): the shape, bounding box and centre of its detections there
+        # (``_overlap`` compares them for every object a keyframe detected near another one)
+        self._footprints: dict[tuple[int, int], _Footprint | None] = {}
 
     def _edge(self, f: int, view: View) -> NDArray[np.bool_]:
         if f not in self._edges:
@@ -2912,22 +2925,32 @@ class _Places:
                  for oid, m in self.masks.instances(f) if self.masks.owner(oid) == o.id]
         return np.logical_or.reduce(found) if found else None
 
+    def _footprint(self, o: MapObject, f: int) -> _Footprint | None:
+        """The shape, bounding box and centre of ``o``'s detections in keyframe ``f`` (None: none,
+        or no pixel); the masks do not change while the places are judged."""
+        key = (o.id, f)
+        if key not in self._footprints:
+            m = self._mask_of(o, f)
+            box = None if m is None else _bbox(m)
+            fp = None
+            if m is not None and box is not None:
+                v, u = np.nonzero(m)
+                fp = _Footprint(m.shape, box, float(v.mean()), float(u.mean()))
+            self._footprints[key] = fp
+        return self._footprints[key]
+
     def _overlap(self, o: MapObject, p: MapObject, f: int) -> bool:
         """Whether keyframe ``f`` detected ``o`` and ``p`` at one place: the centre of either
         mask inside the other's bounding box (grown by ``MASK_DILATE``). A keyframe's masks are
         exclusive, so one thing detected twice (a bag as a bag and as a handbag) is two masks
         side by side, each over the other's middle; an item beside another is not."""
-        a, b = self._mask_of(o, f), self._mask_of(p, f)
+        a, b = self._footprint(o, f), self._footprint(p, f)
         if a is None or b is None or a.shape != b.shape:
             return False
         for x, y in ((a, b), (b, a)):
-            box = _bbox(y)
-            v, u = np.nonzero(x)
-            if box is None or not len(v):
-                continue
-            cv, cu = float(v.mean()), float(u.mean())
-            if box[0] - MASK_DILATE <= cv <= box[1] + MASK_DILATE \
-                    and box[2] - MASK_DILATE <= cu <= box[3] + MASK_DILATE:
+            box = y.box
+            if box[0] - MASK_DILATE <= x.row <= box[1] + MASK_DILATE \
+                    and box[2] - MASK_DILATE <= x.col <= box[3] + MASK_DILATE:
                 return True
         return False
 
