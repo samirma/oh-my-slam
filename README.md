@@ -737,7 +737,12 @@ pixels, so its results are unchanged.
 
 1. **Lock and stage.** Resolve the inputs into keyframes.
 2. **Per-keyframe inference.** Each keyframe gets depth (768 px grid), gravity, a descriptor and
-   detections at the default threshold (the single-image detection, masks on the 768 px grid). Two keyframes are processed at a time.
+   detections at the default threshold (the single-image detection, masks on the 768 px grid).
+   Two keyframes are processed at a time, each as soon as ingest has written it, so the video
+   is decoded while the first keyframes' inference runs. For a new map whose keyframes have
+   one size, the SIFT features of step 3 are extracted on the CPU while the server's GPU runs
+   this inference; their camera gets its prior focal length (the median of the keyframes'
+   estimates) once inference is done, which leaves the database as extracting afterwards does.
 3. **Features and matching.** The Homebrew `colmap` CLI extracts and matches SIFT features.
    Pairs are chosen as follows:
    * Photos: every pair up to 200 images.
