@@ -315,6 +315,48 @@ def test_a_block_pinned_by_two_keyframes_is_not_moved() -> None:
     assert sorted(fix.poses) == names[10:]
 
 
+def hallway_covis(names: list[str]) -> dict[frozenset[str], int]:
+    """Photos 0 and 1 walking down a hallway: their points are tracks through the two of them and
+    photo 2, the first of the room; photos 2-9 share points among themselves."""
+    room = names[2:]
+    covis = {frozenset((a, b)): 100 for i, a in enumerate(room) for b in room[i + 1:]}
+    return covis | {frozenset((names[0], names[1])): 145, frozenset((names[0], names[2])): 146,
+                    frozenset((names[1], names[2])): 145}
+
+
+def test_photos_hanging_on_one_keyframe_have_no_scale_of_their_own() -> None:
+    poses = walk(10)
+    names = sorted(poses)
+    covis = hallway_covis(names)
+    assert traj.hanging_groups(poses, covis) == [{names[0], names[1]}]
+    assert not traj.pinned(traj.anchoring_keyframes(names[:2], covis), poses, 0.2)
+    # a second keyframe of the room that sees their points ties them to the rest
+    covis[frozenset((names[1], names[5]))] = 40
+    assert traj.hanging_groups(poses, covis) == []
+    # a few shared points do not
+    covis[frozenset((names[1], names[5]))] = 10
+    assert traj.hanging_groups(poses, covis) == [{names[0], names[1]}]
+
+
+def test_larger_parts_and_tiny_maps_are_not_hanging_groups() -> None:
+    poses = walk(20)
+    names = sorted(poses)
+    # tracks through three consecutive keyframes: no keyframe alone holds a part
+    covis = chain(names, 80) | {frozenset((a, c)): 40 for a, c in zip(names, names[2:], strict=False)}
+    assert traj.hanging_groups(poses, covis) == []
+    # three keyframes on one articulation: the depth judges them as a block (``fix_blocks``)
+    covis = hallway_covis(names[:10]) | {frozenset((names[10], names[0])): 50,
+                                         frozenset((names[10], names[1])): 50}
+    assert traj.hanging_groups({n: poses[n] for n in names[:11]}, covis) == []
+    # a keyframe sharing too few points with any other is no group (nothing to hang on)
+    covis = hallway_covis(names[:10]) | {frozenset((names[3], names[10])): 8}
+    assert traj.hanging_groups({n: poses[n] for n in names[:11]}, covis) == [
+        {names[0], names[1]}]
+    # four keyframes in a row: no part is the rest of a reconstruction
+    four = {n: poses[n] for n in names[:4]}
+    assert traj.hanging_groups(four, chain(names[:4], 80)) == []
+
+
 def test_a_floating_run_is_moved_between_its_capture_order_neighbours() -> None:
     """Keyframes 8-13 were placed 11 m away and turned 70° (multi-view poses anchored on
     keyframes they do not overlap): they keep their shape and go back between 7 and 14."""

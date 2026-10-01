@@ -39,6 +39,15 @@ class TrackModel:
     def point_counts(self) -> dict[str, int]:
         return {n: sum(n in t for t in self.tracks) for n in self.reg}
 
+    def covisibility(self) -> dict[frozenset[str], int]:
+        out: dict[frozenset[str], int] = {}
+        for t in self.tracks:
+            for a in t:
+                for b in t:
+                    if a < b:
+                        out[frozenset((a, b))] = out.get(frozenset((a, b)), 0) + 1
+        return out
+
     def deregister(self, names: set[str]) -> None:
         self.reg -= names
         self.tracks = [t - names for t in self.tracks]
@@ -98,6 +107,27 @@ def test_keyframes_that_lost_points_are_judged_again(monkeypatch: pytest.MonkeyP
     assert off == {"f0.jpg": 30.0} and unsupported == {"f1.jpg"}
     # the first pass judges every posed keyframe, the second only f2, which lost f0's points
     assert calls == [{"f0.jpg", "f1.jpg", "f2.jpg", "f3.jpg", "f4.jpg"}, {"f2.jpg"}]
+
+
+def test_photos_hanging_on_one_keyframe_are_joined_like_unplaced_ones() -> None:
+    """Two hallway photos whose points are tracks through them and the first photo of the room
+    only: their SfM scale is free, so they are deregistered whatever their depth check says, and
+    so is a photo whose support they held."""
+    room = tracks({("f2.jpg", "f3.jpg"): 100, ("f3.jpg", "f4.jpg"): 100,
+                   ("f2.jpg", "f4.jpg"): 60, ("f4.jpg", "f5.jpg"): 100,
+                   ("f3.jpg", "f5.jpg"): 60})
+    hall = [{"f0.jpg", "f1.jpg", "f2.jpg"} for _ in range(140)]
+    side = tracks({("f0.jpg", "f6.jpg"): 12, ("f6.jpg", "f3.jpg"): 12})  # f6: 24 points
+    model = TrackModel(room + hall + side)
+    posed = {n: Pose.identity() for n in model.registered}
+    hanging, weak = api._deregister_hanging(model, posed)  # type: ignore[arg-type]
+    assert hanging == {"f0.jpg", "f1.jpg"} and weak == {"f6.jpg"}
+    assert model.registered == ["f2.jpg", "f3.jpg", "f4.jpg", "f5.jpg"]
+    # a model where nothing hangs is left alone
+    model = TrackModel(room)
+    assert api._deregister_hanging(model, {n: Pose.identity() for n in model.registered}) == (  # type: ignore[arg-type]
+        set(), set())
+    assert len(model.registered) == 4
 
 
 # ------------------------------------------------------------------ depth judgement of the poses

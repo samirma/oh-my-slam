@@ -778,7 +778,18 @@ pixels, so its results are unchanged.
         it unfused, and no neighbour covers its view) or 0.5–2 for video (it would be left out).
         Two photos taken walking down a hallway, a forward motion the global mapper cannot
         resolve, were placed 1.3–3.9 m along it and 0.5–1.6 m apart in height from run to run,
-        with ratios of 1.3–4. Such keyframes are joined like unplaced ones (step 3).
+        with ratios of 1.3–4. Such keyframes are joined like unplaced ones (step 3). So are
+        photos that hang on the rest through one keyframe: at most two photos whose triangulated
+        points that keyframe sees and no other (a link is 15 shared points). Nothing in the
+        reconstruction fixes how far from that keyframe they are, and they are too few for step 2
+        to judge by their depth. The two hallway photos are such a pair: over 100 seeds of the
+        global mapper on one set of matches their depth ratios ranged over 0.015–400, and in 6
+        seeds the depth check kept one or both placements (the first photo 0.13–0.92 m from the
+        room's first photo instead of 1.46 m). Joined like unplaced ones, they were at 1.46 m in
+        all 100. Keyframes of a video are not judged this way. The multi-view refinement itself
+        can still go wrong there: in 1 of 10 full runs the global mapper left both photos
+        without support, and their refined poses put the second 2.6 m off and the first 0.4 m
+        too high, against their depth (both low confidence).
      2. Each keyframe's SfM scale is measured against its MoGe depth (median depth ratio at its
         triangulated points), and its tilt against its GeoCalib gravity (1–3° on correctly posed
         keyframes). Co-visible keyframes whose ratios agree within 15 % and gravity within 10°

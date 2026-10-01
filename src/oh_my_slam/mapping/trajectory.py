@@ -19,6 +19,8 @@ keeps both. The checks:
   block's by more than ``SCALE_BLOCK_TOL``, or whose gravity is more than ``TILT_BLOCK_TOL_DEG``
   off, is scaled and levelled about the keyframe it hangs on (``pivot_keyframe``) — the free mode of
   a bridge or an articulation — and the mapper then refines its poses with the matches and depth.
+* hanging groups (``hanging_groups``) — photos too few to judge as a block that hang on the rest
+  through one keyframe have no SfM scale at all; the mapper re-places them like unplaced ones.
 * the collapse guard (``collapsed_keyframes``) — a keyframe whose centre coincides with another
   keyframe's while the two show different content (optical axes apart) is not accepted as posed
   unless its own evidence supports it or the pair's matches say the camera turned in place; and a
@@ -350,6 +352,50 @@ def pinned(anchors: Collection[str], poses: dict[str, Pose], apart: float) -> bo
     if len(C) < 2 or apart <= 0:
         return False
     return bool((np.linalg.norm(C[:, None] - C[None], axis=2) >= apart).any())
+
+
+def hanging_groups(poses: dict[str, Pose], covis: dict[frozenset[str], int],
+                   min_points: int = COVIS_MIN_POINTS, max_size: int = SCALE_BLOCK_MIN - 1
+                   ) -> list[set[str]]:
+    """Groups of at most ``max_size`` keyframes that share triangulated points (``covis``: at
+    least ``min_points``) with one keyframe outside them only — an articulation of the
+    co-visibility graph, with more than ``max_size`` keyframes on its other side. Their points are
+    seen by that keyframe and by them alone, so nothing in the reconstruction fixes how far from it
+    they are: the scale of the link is free (``pinned`` holds for no such group), and
+    ``fix_blocks`` needs ``SCALE_BLOCK_MIN`` depth ratios to judge it. Two photos taken walking
+    down a hallway hang on the first photo of the room like this: over 100 seeds of the global
+    mapper on one feature database, their depth ratios came out 0.015-400 times the room's, and in
+    6 of them the depth check kept one or both placements: the map had the first photo 0.13-0.92 m
+    from that photo instead of 1.46 m."""
+    adj: dict[str, set[str]] = {n: set() for n in poses}
+    for pair, k in covis.items():
+        if k >= min_points and len(pair) == 2 and all(n in adj for n in pair):
+            a, b = sorted(pair)
+            adj[a].add(b)
+            adj[b].add(a)
+    out: list[set[str]] = []
+    for cut in sorted(adj):
+        left = set(adj) - {cut}
+        comps: list[set[str]] = []
+        while left:
+            start = min(left)
+            comp, todo = {start}, [start]
+            while todo:
+                for m in adj[todo.pop()]:
+                    if m in left and m not in comp:
+                        comp.add(m)
+                        todo.append(m)
+            left -= comp
+            comps.append(comp)
+        rest = max(comps, key=len) if comps else set()
+        if len(comps) < 2 or len(rest) <= max_size:
+            continue
+        for comp in comps:
+            if (comp is not rest and len(comp) <= max_size and adj[cut] & comp
+                    and comp not in out):
+                out.append(comp)
+    # a keyframe hanging on one that hangs on the rest belongs to the larger group
+    return sorted((g for g in out if not any(g < h for h in out)), key=min)
 
 
 @dataclass
