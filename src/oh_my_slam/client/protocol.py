@@ -19,6 +19,12 @@ ROUTE_MULTIVIEW = "/v1/multiview"
 
 ServerStatus = Literal["loading", "ready", "degraded", "error", "stopping"]
 
+# Long side at which the server reads a request's image (``core.images.load_rgb``): the request's
+# ``max_side`` for geometry and detection, these for gravity and multi-view (the server's model
+# adapters). The client sends images already at that size (``client.images``).
+GRAVITY_SIDE = 640
+MULTIVIEW_SIDE = 1024
+
 
 class ModelStatus(BaseModel):
     name: str

@@ -725,7 +725,13 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
    grounded. A door behind a kitchen island, or cut off by the bottom of every keyframe that
    detected it, therefore still reaches the floor.
 
-Geometry and detection requests run concurrently on two connections.
+Geometry and detection requests run concurrently on two connections. The server reads each
+request's image from disk and downscales it to the long side its model reads (768 or 1024 px,
+640 for gravity, 1024 for multi-view poses) on its one device thread, where decoding and
+resizing a 12 MP photo cost more than some of the models. The client therefore decodes each
+image once and sends every request the image already at that size, as an uncompressed BMP
+that the server decodes in about a millisecond and does not resize: the model reads the same
+pixels, so its results are unchanged.
 
 ### Mapping (`mapper.sh update`)
 

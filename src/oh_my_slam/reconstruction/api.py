@@ -18,8 +18,9 @@ from numpy.typing import NDArray
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient, connect
+from oh_my_slam.client.images import request_rgb
 from oh_my_slam.core import paths, timing
-from oh_my_slam.core.images import exif_intrinsics, load_rgb
+from oh_my_slam.core.images import exif_intrinsics
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.core.types import Intrinsics
@@ -103,7 +104,7 @@ def reconstruct_image(
         finally:
             if own_dir:
                 shutil.rmtree(out_dir, ignore_errors=True)
-        rgb = load_rgb(image_path, max_side=max_side)
+        rgb = request_rgb(image_path, max_side)  # the pixels the server read
     if intr is None:
         intr = _intrinsics_from_grid(g, "model")
     K_grid = intr.resized(g.width, g.height)
