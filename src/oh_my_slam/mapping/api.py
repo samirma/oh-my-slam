@@ -18,8 +18,9 @@ import json
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -98,6 +99,8 @@ class UpdateContext:
     # stored keyframes whose depth this update corrected (index -> correction; their objects
     # follow)
     rescaled: dict[int, DepthCorrection] = field(default_factory=dict)
+    # a new map's features, extracted while its inference ran
+    features: _EarlyFeatures | None = None
 
 
 Progress = Callable[[str], None]
@@ -111,9 +114,14 @@ def _progress(msg: str) -> None:
 # per-keyframe inference
 
 
-def _infer_frames(kfs: list[ingest.Keyframe], work: Path, client: Any, progress: Progress
+def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client: Any,
+                  progress: Progress,
+                  ingested: Callable[[list[ingest.Keyframe]], None] | None = None
                   ) -> list[NewFrame]:
-    """Geometry, gravity and detections for every keyframe (two frames in flight)."""
+    """Geometry, gravity and detections for every keyframe (two frames in flight), each started as
+    soon as ingest has written it: the stage ``ingest`` decodes the input while the first
+    keyframes' inference runs, ``inference`` waits for the rest. ``ingested`` is called with the
+    keyframes once ingest has written them all, while their inference runs."""
 
     def one(kf: ingest.Keyframe) -> NewFrame:
         frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client)
@@ -121,11 +129,25 @@ def _infer_frames(kfs: list[ingest.Keyframe], work: Path, client: Any, progress:
 
     out: list[NewFrame] = []
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(2) as pool:
-        for i, nf in enumerate(pool.map(one, kfs), start=1):
-            out.append(nf)
-            if i % 10 == 0 or i == len(kfs):
-                progress(f"inference {i}/{len(kfs)} keyframes ({time.perf_counter() - t0:.0f} s)")
+    pool = ThreadPoolExecutor(2)
+    try:
+        written: list[ingest.Keyframe] = []
+        futures: list[Future[NewFrame]] = []
+        with timing.stage("ingest"):
+            for kf in kfs:
+                written.append(kf)
+                futures.append(pool.submit(one, kf))
+        progress(f"{len(futures)} keyframes from {kind}")
+        if ingested is not None:
+            ingested(written)
+        with timing.stage("inference"):
+            for i, fut in enumerate(futures, start=1):
+                out.append(fut.result())
+                if i % 10 == 0 or i == len(futures):
+                    progress(f"inference {i}/{len(futures)} keyframes "
+                             f"({time.perf_counter() - t0:.0f} s)")
+    finally:
+        pool.shutdown(cancel_futures=True)  # on an error, the keyframes not started yet
     return out
 
 
@@ -151,6 +173,45 @@ def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
     finally:
         if own is not client:
             own.close()
+
+
+class _EarlyFeatures:
+    """SIFT features of a new map's keyframes, extracted on the CPU while the server's GPU runs
+    their inference.
+
+    The camera COLMAP creates for the keyframes takes the prior focal length their inference gives
+    (``_camera_prior``: the median of the model's estimates, or of the EXIF ones), the features do
+    not depend on it: they are extracted for a provisional prior as soon as ingest has written the
+    keyframes, and the camera gets its parameters once inference is done (``Sfm.set_prior``). The
+    database is the one extracting after inference writes. Only for keyframes of one size, which
+    share one new camera either way."""
+
+    def __init__(self, sfm: Sfm, names: list[str], size: tuple[int, int]) -> None:
+        self.sfm = sfm
+        provisional = CameraPrior(*size, focal=float(max(size)))
+        self._pool = ThreadPoolExecutor(1)
+        self._camera = self._pool.submit(self._extract, names, provisional)
+
+    def _extract(self, names: list[str], prior: CameraPrior) -> int:
+        with timing.part("feature_extraction"):
+            return self.sfm.extract(names, prior)
+
+    @staticmethod
+    def start(tx: store.MapTransaction, work: Path, kfs: list[ingest.Keyframe]
+              ) -> _EarlyFeatures | None:
+        sizes = {upright_size(kf.path) for kf in kfs}
+        if len(kfs) < 2 or len(sizes) != 1:
+            return None
+        sfm = Sfm(tx.clone_for_edit(store.SFM_DB), tx.stage("frames"), work / "sfm")
+        return _EarlyFeatures(sfm, [f"{kf.name}.jpg" for kf in kfs], sizes.pop())
+
+    def finish(self, prior: CameraPrior) -> None:
+        """Wait for the features and give their camera ``prior``'s parameters."""
+        self.sfm.set_prior(self._camera.result(), prior)
+
+    def close(self) -> None:
+        """Wait for the extraction (an update that fails leaves no COLMAP process behind)."""
+        self._pool.shutdown(wait=True)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -349,7 +410,10 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     prior = _camera_prior(ctx.new, ctx.old_frames)
     t0 = time.perf_counter()
     with timing.stage("features_matching"):
-        sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior)
+        if ctx.features is not None:
+            ctx.features.finish(prior)
+        else:
+            sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior)
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
         n = sfm.match_pairs(pairs, names)
@@ -1596,20 +1660,26 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
     client = client or connect()
     work = Path(tempfile.mkdtemp(prefix="update-", dir=paths.scratch_dir()))
     try:
-        with store.MapTransaction(map_dir) as tx:
+        with store.MapTransaction(map_dir) as tx, ExitStack() as running:
             with stage("setup"):
                 meta = store.read_meta_or_default(tx)
                 old = store.read_frames(tx)
             update_id = int(meta.get("update_count", 0)) + 1
             progress(("creating map " if tx.created else "extending map ") + str(tx.root))
-            with stage("ingest"):
-                kfs = list(ingest.keyframes(spec, fps, tx.stage("frames"),
-                                            int(meta.get("next_frame_index", 0))))
-            progress(f"{len(kfs)} keyframes from {spec.kind}")
-            timing.count(input_kind=spec.kind, keyframes_sampled=len(kfs), map_frames_before=len(old))
-            with stage("inference"):
-                new = _infer_frames(kfs, work, client, progress)
-            ctx = UpdateContext(tx, meta, old, new, update_id, work)
+            kfs = ingest.keyframes(spec, fps, tx.stage("frames"),
+                                   int(meta.get("next_frame_index", 0)))
+            early: list[_EarlyFeatures] = []
+
+            def ingested(written: list[ingest.Keyframe]) -> None:
+                f = None if old else _EarlyFeatures.start(tx, work, written)
+                if f is not None:
+                    running.callback(f.close)
+                    early.append(f)
+
+            new = _infer_frames(kfs, spec.kind, work, client, progress, ingested)
+            timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
+            ctx = UpdateContext(tx, meta, old, new, update_id, work,
+                                features=early[0] if early else None)
             if not old and len(new) == 1:
                 _single_image_map(ctx)
                 model = None

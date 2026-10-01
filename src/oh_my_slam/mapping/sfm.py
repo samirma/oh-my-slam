@@ -91,6 +91,11 @@ class CameraPrior:
     same_focal_ids: tuple[int, ...] = ()
 
 
+def _camera_params(prior: CameraPrior) -> str:
+    """``--ImageReader.camera_params`` of a new SIMPLE_PINHOLE camera for ``prior``."""
+    return f"{prior.focal:.4f},{prior.width / 2:.4f},{prior.height / 2:.4f}"
+
+
 @dataclass
 class SfmModel:
     rec: Any  # pycolmap.Reconstruction
@@ -358,10 +363,25 @@ class Sfm:
         else:
             args += ["--ImageReader.single_camera", "1"]
             if prior.focal is not None:
-                args += ["--ImageReader.camera_params",
-                         f"{prior.focal:.4f},{prior.width / 2:.4f},{prior.height / 2:.4f}"]
+                args += ["--ImageReader.camera_params", _camera_params(prior)]
         _run(args, self.log_path)
         return self._camera_of(names[0])
+
+    def set_prior(self, camera_id: int, prior: CameraPrior) -> None:
+        """Give the new camera that ``extract`` created for a provisional prior (with a focal)
+        the parameters it gives one for ``prior``, parsed from the same text as the CLI parses
+        them: the database is then the one ``extract`` with ``prior`` writes (the features do
+        not depend on the camera), so the features can be extracted before the prior is known."""
+        import pycolmap
+
+        assert prior.focal is not None
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            cam = db.read_camera(camera_id)
+            cam.set_params_from_string(_camera_params(prior))
+            db.update_camera(cam)
+        finally:
+            db.close()
 
     def existing_camera(self, prior: CameraPrior) -> int | None:
         """The database camera the new images share (``CameraPrior``): the map then keeps one

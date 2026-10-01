@@ -725,13 +725,24 @@ These steps serve `reconstruct.sh`, `segment.sh -i` and `view.sh -i`:
    grounded. A door behind a kitchen island, or cut off by the bottom of every keyframe that
    detected it, therefore still reaches the floor.
 
-Geometry and detection requests run concurrently on two connections.
+Geometry and detection requests run concurrently on two connections. The server reads each
+request's image from disk and downscales it to the long side its model reads (768 or 1024 px,
+640 for gravity, 1024 for multi-view poses) on its one device thread, where decoding and
+resizing a 12 MP photo cost more than some of the models. The client therefore decodes each
+image once and sends every request the image already at that size, as an uncompressed BMP
+that the server decodes in about a millisecond and does not resize: the model reads the same
+pixels, so its results are unchanged.
 
 ### Mapping (`mapper.sh update`)
 
 1. **Lock and stage.** Resolve the inputs into keyframes.
 2. **Per-keyframe inference.** Each keyframe gets depth (768 px grid), gravity, a descriptor and
-   detections at the default threshold (the single-image detection, masks on the 768 px grid). Two keyframes are processed at a time.
+   detections at the default threshold (the single-image detection, masks on the 768 px grid).
+   Two keyframes are processed at a time, each as soon as ingest has written it, so the video
+   is decoded while the first keyframes' inference runs. For a new map whose keyframes have
+   one size, the SIFT features of step 3 are extracted on the CPU while the server's GPU runs
+   this inference; their camera gets its prior focal length (the median of the keyframes'
+   estimates) once inference is done, which leaves the database as extracting afterwards does.
 3. **Features and matching.** The Homebrew `colmap` CLI extracts and matches SIFT features.
    Pairs are chosen as follows:
    * Photos: every pair up to 200 images.

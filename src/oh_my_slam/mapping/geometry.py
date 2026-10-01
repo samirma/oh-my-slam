@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import cached_property
 from itertools import pairwise
 from typing import Any
 
@@ -111,6 +112,13 @@ class FrameData:
     rgb: NDArray[np.uint8]
     labels: NDArray[np.int32]
     is_new: bool
+
+    @cached_property
+    def median_depth(self) -> float | None:
+        """Median of its valid depth (None: none), once: ``depth`` and ``valid`` are never
+        modified, and ``fusion_depth_max`` asks for it per part of the map."""
+        d = self.depth[self.valid & (self.depth > 0)]
+        return float(np.median(d)) if len(d) else None
 
 
 def _parallel[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
@@ -304,8 +312,7 @@ def fusion_depth_max(fd: FrameData, depth_max: float) -> float:
     cut at a fixed ``depth_max``, the keyframes that see a facade from 25-30 m no longer counted
     for it, and the facades 10-20 m from a street walk fell below ``CLOUD_MIN_VIEWS`` (street.mp4:
     8.2 M cloud points untilted, 6.9 M tilted)."""
-    d = fd.depth[fd.valid & (fd.depth > 0)]
-    return _depth_cut(float(np.median(d)) if len(d) else None, fd.rec, depth_max)
+    return _depth_cut(fd.median_depth, fd.rec, depth_max)
 
 
 def _depth_cut(median: float | None, rec: store.FrameRecord, depth_max: float) -> float:
@@ -1035,8 +1042,8 @@ def _setup(ctx: Any, records: list[store.FrameRecord]) -> _Setup:
     depth, and the places of removed objects."""
     new_by_name = {nf.kf.name: nf for nf in ctx.new if nf.record is not None}
     frames = [_frame_data(ctx, r, new_by_name) for r in sorted(records, key=lambda r: r.order_key)]
-    voxel, depth_max = _map_depth_max([np.median(fd.depth[fd.valid & (fd.depth > 0)])
-                                       for fd in frames if (fd.valid & (fd.depth > 0)).any()])
+    voxel, depth_max = _map_depth_max([fd.median_depth for fd in frames
+                                       if fd.median_depth is not None])
     return _Setup(frames, [fd for fd in frames if not fd.rec.low_confidence],
                   max(0.005, voxel / 2), depth_max, load_vacated(ctx.tx.current))
 

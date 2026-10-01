@@ -7,13 +7,16 @@ run ``./start_inference_server.sh``). Queue-full responses (503) are retried wit
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TypeVar
 
 import httpx
+import numpy as np
 from pydantic import BaseModel
 
 from oh_my_slam.client import protocol as p
+from oh_my_slam.client.images import request_image
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.errors import (
     InferenceError,
@@ -21,6 +24,7 @@ from oh_my_slam.core.errors import (
     ServerBusyError,
     ServerUnavailableError,
 )
+from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
 
 M = TypeVar("M", bound=BaseModel)
@@ -125,17 +129,56 @@ class InferenceClient:
                 raise InputError(f"{route}: {body}")
             raise InferenceError(f"{route} failed: {body}")
 
+    # The image of a request is sent at the size the server reads it (``client.images``); what
+    # the server computes from the size of the file it reads is converted here, with the server's
+    # own arithmetic, so every response is the one the original image gives.
+
     def geometry(self, req: p.GeometryRequest) -> p.GeometryResponse:
-        return self._post(p.ROUTE_GEOMETRY, req, p.GeometryResponse)
+        with request_image(Path(req.image_path), req.max_side) as sent:
+            res = self._post(p.ROUTE_GEOMETRY, req.model_copy(update={"image_path": str(sent.path)}),
+                             p.GeometryResponse)
+        if sent.downscaled:
+            res.orig_width, res.orig_height = upright_size(Path(req.image_path))
+        return res
 
     def gravity(self, req: p.GravityRequest) -> p.GravityResponse:
-        return self._post(p.ROUTE_GRAVITY, req, p.GravityResponse)
+        with request_image(Path(req.image_path), p.GRAVITY_SIDE) as sent:
+            sx = sent.scale[0]
+            res = self._post(p.ROUTE_GRAVITY, p.GravityRequest(
+                image_path=str(sent.path),
+                focal_px=None if req.focal_px is None or not sent.downscaled
+                else req.focal_px * sx), p.GravityResponse)
+        if sent.downscaled:  # the server's focal lengths are in pixels of the file it read
+            res.focal_px = res.focal_px / sx
+            res.focal_unc_px = res.focal_unc_px / sx
+        return res
 
     def segment_image(self, req: p.SegmentRequest) -> p.SegmentResponse:
-        return self._post(p.ROUTE_SEGMENT, req, p.SegmentResponse)
+        with request_image(Path(req.image_path), req.max_side) as sent:
+            return self._post(p.ROUTE_SEGMENT,
+                              req.model_copy(update={"image_path": str(sent.path)}),
+                              p.SegmentResponse)
 
     def multiview(self, req: p.MultiviewRequest) -> p.MultiviewResponse:
-        return self._post(p.ROUTE_MULTIVIEW, req, p.MultiviewResponse)
+        with ExitStack() as stack:
+            sent = [stack.enter_context(request_image(Path(i), p.MULTIVIEW_SIDE))
+                    for i in req.image_paths]
+            K = req.intrinsics
+            if K is not None:  # the server scales them to the file it reads, in float32
+                K = [k if k is None or not s.downscaled else
+                     _scaled_intrinsics(k, s.scale) for k, s in zip(K, sent, strict=True)]
+            return self._post(p.ROUTE_MULTIVIEW, req.model_copy(update={
+                "image_paths": [str(s.path) for s in sent], "intrinsics": K}),
+                p.MultiviewResponse)
+
+
+def _scaled_intrinsics(K: list[list[float]], scale: tuple[float, float]) -> list[list[float]]:
+    """A full-resolution 3x3 ``K`` in pixels of the downscaled file, as the multi-view server
+    scales it for the image it reads (float32 rows), so that it reads it unchanged."""
+    k = np.asarray(K, dtype=np.float32).copy()
+    k[0] *= scale[0]
+    k[1] *= scale[1]
+    return [[float(v) for v in row] for row in k]
 
 
 def _error_body(r: httpx.Response) -> str:
