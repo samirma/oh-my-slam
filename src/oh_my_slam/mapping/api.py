@@ -531,8 +531,9 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
        (``trajectory.fix_blocks``: parts hanging on the rest by a bridge or an articulation, whose
        scale and orientation the global mapper cannot pin down), are scaled and levelled about the
        keyframe they hang on, and what hangs on them follows;
-    3. keyframes it does not hold (never registered, or not accepted by ``sfm.vet``; posed against
-       their verified matches or their depth, or left without support by those deregistered) that
+    3. keyframes it does not hold (never registered, or not accepted by ``sfm.vet``; photos that
+       hang on the rest through one keyframe, ``trajectory.hanging_groups``; posed against their
+       verified matches or their depth, or left without support by those deregistered) that
        verified matches connect to the posed ones get anchored multi-view poses
        (``_multiview_poses``; for video anchored on the posed keyframes next to them in capture
        order);
@@ -562,6 +563,20 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                             "merged_by_shared_keyframes": sorted(merged)}
     realigned = _fix_blocks(ctx, sfm, model, join)
     posed = {n: model.pose(n) for n in model.registered}
+    # photos that hang on the rest through one keyframe have a free SfM scale and too few
+    # keyframes for ``_fix_blocks`` to judge it: they are joined like unplaced ones (the multi-view
+    # refinement places them with their matches and depth), whether or not their depth check
+    # happens to pass (``_deregister_hanging``)
+    hanging: set[str] = set()
+    weak: set[str] = set()
+    if not is_video:
+        hanging, weak = _deregister_hanging(model, posed)
+    if hanging:
+        posed = {n: T for n, T in posed.items() if n not in hanging | weak}
+        join["hanging"] = sorted(hanging)
+        log.warning("%s: %d photos that hang on the rest through one keyframe (no scale of their "
+                    "own) are joined like unplaced ones: %s", model.method, len(hanging),
+                    ", ".join(sorted(hanging)))
     # a keyframe the SfM model posed against its own verified matches is joined like an unplaced
     # one (the global mapper settled the 6-photo office map's f000005 on its 67 matches to one
     # keyframe against its 931 to two others: 0.43° off them; the next update registered onto it)
@@ -577,6 +592,7 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     # anchor the multi-view poses (``_deregister_contradicted``, ``_deregister_cascade``)
     off, unsupported = _deregister_contradicted(ctx, model, set(posed) - set(bad_fit),
                                                 photos=not is_video)
+    unsupported |= weak
     if off:
         posed = {n: T for n, T in posed.items() if n not in off}
         join["depth_contradicted"] = {n: round(v, 3) for n, v in sorted(off.items())}
@@ -790,6 +806,19 @@ def _deregister_cascade(model: SfmModel, drop: set[str], rest: set[str]
         unsupported |= drop
     _, changed = weakened(before, model.point_counts(), rest)
     return unsupported, changed
+
+
+def _deregister_hanging(model: SfmModel, posed: dict[str, Pose]) -> tuple[set[str], set[str]]:
+    """Deregister the keyframes of groups too small to judge that hang on the rest through one
+    keyframe (``trajectory.hanging_groups``), and those left without support by it
+    (``_deregister_cascade``). Returns both sets."""
+    from oh_my_slam.mapping.trajectory import hanging_groups
+
+    hanging = {n for g in hanging_groups(posed, model.covisibility()) for n in g}
+    if not hanging:
+        return set(), set()
+    weak, _ = _deregister_cascade(model, hanging, set(posed) - hanging)
+    return hanging, weak
 
 
 def _deregister_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], photos: bool
