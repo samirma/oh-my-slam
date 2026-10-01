@@ -85,3 +85,37 @@ def test_fixed_keyframes_anchor_an_extension() -> None:
     assert max(float(np.linalg.norm(fit.poses[n].t - truth[n].t)) for n in set(truth) - old) \
         < 0.02
     np.testing.assert_allclose(fit.poses["lonely"].matrix(), lonely.matrix())
+
+
+def test_normal_equations_match_a_per_match_sum() -> None:
+    """Σ w JᵀJ and Σ w Jᵀr over the free views' parameters equal the plain per-match sum, with
+    fixed views left out and segments of any length (one match, many, views repeated)."""
+    from oh_my_slam.mapping.panorama import _normal_equations, _Problem
+
+    rng = np.random.default_rng(3)
+    seg_views = [(0, 1), (1, 0), (1, 2), (2, 3), (3, 1), (0, 3)]
+    lengths = [1, 40, 7, 300, 2, 55]
+    starts = np.cumsum([0, *lengths[:-1]])
+    n = sum(lengths)
+    src = np.concatenate([[a] * k for (a, _), k in zip(seg_views, lengths, strict=True)])
+    dst = np.concatenate([[b] * k for (_, b), k in zip(seg_views, lengths, strict=True)])
+    pb = _Problem(src, dst, np.zeros((n, 2)), np.zeros((n, 2)), np.ones((n, 2)), np.ones(n),
+                  starts.astype(np.int64), seg_views)
+    J, r, c = rng.normal(size=(n, 2, 13)), rng.normal(size=(n, 2)), 1.7
+    free = {1: 0, 3: 1}  # views 0 and 2 are held fixed
+    npar = 6 * len(free) + 1
+    H, g = _normal_equations(pb, r, J, c, free, npar)
+    Hr, gr = np.zeros((npar, npar)), np.zeros(npar)
+    w = 1.0 / (1.0 + np.sum(r * r, axis=1) / (c * c))
+    for i in range(n):
+        gi, li = [], []
+        for view, off in ((src[i], 0), (dst[i], 6)):
+            if view in free:
+                gi += range(6 * free[view], 6 * free[view] + 6)
+                li += range(off, off + 6)
+        gi.append(npar - 1)
+        li.append(12)
+        Hr[np.ix_(gi, gi)] += w[i] * J[i][:, li].T @ J[i][:, li]
+        gr[gi] += w[i] * J[i][:, li].T @ r[i]
+    np.testing.assert_allclose(H, Hr, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(g, gr, rtol=1e-10, atol=1e-10)

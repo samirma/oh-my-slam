@@ -182,7 +182,6 @@ class _Problem:
 
 
 BEHIND_PX = 1000.0  # residual of a point that projects behind the destination camera
-CHUNK = 20000  # matches per block when accumulating the normal equations
 
 
 def _evaluate(pb: _Problem, R: NDArray[Any], C: NDArray[Any], phi: float, jac: bool
@@ -231,33 +230,26 @@ def _cost(r: NDArray[Any], c: float) -> float:
 def _normal_equations(pb: _Problem, r: NDArray[Any], J: NDArray[Any], c: float,
                       free: dict[int, int], npar: int) -> tuple[NDArray[np.float64],
                                                                 NDArray[np.float64]]:
-    """Σ w JᵀJ and Σ w Jᵀr (Cauchy weights at scale ``c``) over the free views' parameters."""
+    """Σ w JᵀJ and Σ w Jᵀr (Cauchy weights at scale ``c``) over the free views' parameters: one
+    13 x 13 block per segment (its two views' rotations and centres, and the focal length), by a
+    matrix product over the segment's matches, added into the free views' parameters."""
     H = np.zeros((npar, npar))
     g = np.zeros(npar)
     w = 1.0 / (1.0 + np.sum(r * r, axis=1) / (c * c))
+    Jw = J * w[:, None, None]
     ends = np.r_[pb.starts[1:], len(r)]
-    k = 0
-    while k < len(pb.starts):
-        k1 = k + 1
-        while k1 < len(pb.starts) and ends[k1] - pb.starts[k] <= CHUNK:
-            k1 += 1
-        lo, hi = int(pb.starts[k]), int(ends[k1 - 1])
-        Jc, wc = J[lo:hi], w[lo:hi]
-        rel = pb.starts[k:k1] - lo
-        HB = np.add.reduceat(np.einsum("n,nij,nik->njk", wc, Jc, Jc), rel, axis=0)
-        GB = np.add.reduceat(np.einsum("n,nij,ni->nj", wc, Jc, r[lo:hi]), rel, axis=0)
-        for j in range(k, k1):
-            gi: list[int] = []
-            li: list[int] = []
-            for view, off in zip(pb.seg_views[j], (0, 6), strict=True):
-                if view in free:
-                    gi.extend(range(6 * free[view], 6 * free[view] + 6))
-                    li.extend(range(off, off + 6))
-            gi.append(npar - 1)
-            li.append(12)
-            H[np.ix_(gi, gi)] += HB[j - k][np.ix_(li, li)]
-            g[gi] += GB[j - k][li]
-        k = k1
+    for j, (lo, hi) in enumerate(zip(pb.starts.tolist(), ends.tolist(), strict=True)):
+        parts = [(6 * free[view], off, 6)
+                 for view, off in zip(pb.seg_views[j], (0, 6), strict=True) if view in free]
+        parts.append((npar - 1, 12, 1))
+        A = J[lo:hi].reshape(-1, 13)
+        Aw = Jw[lo:hi].reshape(-1, 13)
+        Hs = Aw.T @ A
+        gs = Aw.T @ r[lo:hi].reshape(-1)
+        for ga, la, sa in parts:
+            g[ga:ga + sa] += gs[la:la + sa]
+            for gb, lb, sb in parts:
+                H[ga:ga + sa, gb:gb + sb] += Hs[la:la + sa, lb:lb + sb]
     return H, g
 
 
