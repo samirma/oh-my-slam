@@ -13,7 +13,7 @@ from PIL import Image
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient
-from oh_my_slam.client.images import request_image, request_rgb
+from oh_my_slam.client.images import remember_rgb, request_image, request_rgb
 from oh_my_slam.core import rle
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.server.models.geometry_moge import MoGeGeometry
@@ -55,6 +55,18 @@ def test_server_reads_the_same_pixels(tmp_path: Path, side: int, orientation: in
     np.testing.assert_array_equal(request_rgb(src, side), load_rgb(src, side))
 
 
+def test_remembered_pixels_are_sent_without_decoding_the_image(tmp_path: Path) -> None:
+    """The focal re-run hands over the pixels the first pass read; the image is not decoded again
+    (pixels that are not the image's show it: the file sent carries them)."""
+    src = _photo(tmp_path / "r.jpg", 1500, 1000, seed=5)
+    marked = 255 - load_rgb(src, 768)
+    remember_rgb(src, 768, marked)
+    with request_image(src, 768) as sent:
+        np.testing.assert_array_equal(load_rgb(sent.path, 768), marked)
+    np.testing.assert_array_equal(request_rgb(src, 768), marked)
+    np.testing.assert_array_equal(request_rgb(src, 640), load_rgb(src, 640))  # other sides decode
+
+
 def test_small_or_unreadable_images_are_sent_as_they_are(tmp_path: Path) -> None:
     small = _photo(tmp_path / "small.jpg", 640, 480)
     with request_image(small, 768) as sent:
@@ -71,7 +83,7 @@ class _Server:
         self.seen: list[str] = []
 
         def infer(_: Any, rgb: np.ndarray, fov: float | None, tokens: int,
-                  fp16: bool | None = None) -> dict[str, Any]:
+                  fp16: bool | None = None, keep: bool = False) -> dict[str, Any]:
             h, w = rgb.shape[:2]
             f = 0.8 if fov is None else 0.5 / np.tan(np.radians(fov) / 2)
             return {"depth": 1.0 + rgb.mean(-1) / 100.0, "mask": rgb[..., 0] > 20,

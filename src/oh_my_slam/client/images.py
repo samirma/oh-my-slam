@@ -86,6 +86,15 @@ def request_rgb(path: Path, side: int) -> NDArray[np.uint8]:
     return np.asarray(_decoded.at_side(Path(path), side), dtype=np.uint8)
 
 
+def remember_rgb(path: Path, side: int, rgb: NDArray[np.uint8]) -> None:
+    """``rgb`` is ``request_rgb(path, side)`` as an earlier request read it (the mapper's focal
+    re-run has every keyframe's): requests at that side send it without decoding the image."""
+    e = _decoded._entry(Path(path))
+    with e.lock:
+        if side not in e.sides:
+            e.sides[side] = Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8))
+
+
 @dataclass(frozen=True)
 class Sent:
     """The file a request hands the server for an image, and how its pixels relate to the

@@ -152,13 +152,16 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
 
 
 def _reconstruct_keyframe(path: Path, client: Any, intrinsics: Intrinsics | None,
-                          work_dir: Path | None = None, first: bool = True
-                          ) -> FrameReconstruction:
+                          work_dir: Path | None = None, first: bool = True,
+                          rgb: NDArray[np.uint8] | None = None) -> FrameReconstruction:
     """Keyframe geometry with the mapper's settings (grid, tokens); the first pass also asks for
-    gravity and the retrieval descriptor."""
+    gravity and the retrieval descriptor. Without intrinsics the focal length is the model's, which
+    ``_rerun_focal`` may replace by COLMAP's: the server keeps the network output for that, and the
+    re-run sends the pixels the first pass read (``rgb``)."""
     return reconstruct_image(path, intrinsics=intrinsics, max_side=KEYFRAME_GRID_SIDE,
                              num_tokens=KEYFRAME_TOKENS, want_gravity=first,
-                             want_descriptor=first, work_dir=work_dir, client=client)
+                             want_descriptor=first, work_dir=work_dir, client=client,
+                             keep_forward=first and intrinsics is None, rgb=rgb)
 
 
 def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
@@ -1173,7 +1176,7 @@ def _rerun_focal(ctx: UpdateContext, model: SfmModel, client: Any, progress: Pro
         nf, K = item
         own = client.clone()
         try:
-            fr = _reconstruct_keyframe(nf.kf.path, own, K, first=False)
+            fr = _reconstruct_keyframe(nf.kf.path, own, K, first=False, rgb=nf.frame.rgb)
         finally:
             if own is not client:
                 own.close()

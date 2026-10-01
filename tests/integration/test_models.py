@@ -55,6 +55,27 @@ def test_smoke_geometry(client: InferenceClient, sample: Path, tmp_path: Path) -
     assert g.descriptor is not None and abs(np.linalg.norm(g.descriptor) - 1) < 1e-3
 
 
+def test_geometry_kept_forward_is_resolved_as_the_network_gives(
+        client: InferenceClient, sample: Path, tmp_path: Path) -> None:
+    """The mapper's focal re-run: a kept forward pass re-solved with another focal length gives
+    what running the network again gives, bit for bit, without running it."""
+
+    def geometry(name: str, **kw: object) -> tuple[p.GeometryResponse, np.ndarray, np.ndarray]:
+        g = client.geometry(p.GeometryRequest(
+            image_path=str(sample), out_dir=str(tmp_path / name), max_side=768, num_tokens=1400,
+            want_descriptor=False, **kw))  # type: ignore[arg-type]
+        return g, np.load(g.depth_path), np.load(g.mask_path)
+
+    network = geometry("network", fov_x_deg=55.0)  # nothing kept: the network runs
+    first = geometry("first", keep_forward=True)
+    resolved = geometry("resolved", fov_x_deg=55.0)
+    assert first[0].fov_x_deg != pytest.approx(55.0, abs=0.5)  # the focal changes the result
+    assert resolved[0].intrinsics == network[0].intrinsics
+    np.testing.assert_array_equal(resolved[1], network[1])
+    np.testing.assert_array_equal(resolved[2], network[2])
+    assert resolved[0].timings.compute_s < 0.5 * network[0].timings.compute_s
+
+
 def test_smoke_gravity(client: InferenceClient, sample: Path) -> None:
     gr = client.gravity(p.GravityRequest(image_path=str(sample)))
     assert abs(np.linalg.norm(gr.up_cam) - 1) < 1e-3

@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient, connect
-from oh_my_slam.client.images import request_rgb
+from oh_my_slam.client.images import remember_rgb, request_rgb
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.images import exif_intrinsics
 from oh_my_slam.core.log import get_logger
@@ -76,9 +76,16 @@ def reconstruct_image(
     want_descriptor: bool = False,
     work_dir: Path | None = None,
     client: InferenceClient | None = None,
+    keep_forward: bool = False,
+    rgb: NDArray[np.uint8] | None = None,
 ) -> FrameReconstruction:
-    """Run geometry (and gravity) for one image. ``work_dir`` keeps the server's files."""
+    """Run geometry (and gravity) for one image. ``work_dir`` keeps the server's files.
+    ``keep_forward``: the image will be reconstructed again with other intrinsics
+    (``GeometryRequest.keep_forward``). ``rgb``: the image on the grid as an earlier
+    reconstruction of it read it (its ``rgb``), sent instead of decoding the image again."""
     image_path = Path(image_path).resolve()
+    if rgb is not None:
+        remember_rgb(image_path, max_side, rgb)
     client = client or connect()
     intr = intrinsics or exif_intrinsics(image_path)
     fov_x = intr.fov_x_deg if intr is not None else None
@@ -97,6 +104,7 @@ def reconstruct_image(
                     fov_x_deg=fov_x,
                     num_tokens=num_tokens,
                     want_descriptor=want_descriptor,
+                    keep_forward=keep_forward,
                 )
             )
             depth = np.load(g.depth_path).astype(np.float32)

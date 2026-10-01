@@ -685,7 +685,7 @@ answers immediately, even while the models load. It loads four models:
 
 | Model | Role |
 |---|---|
-| MoGe-2 ViT-L normal | Metric point map, depth and validity, intrinsics, plus a DINOv2 class-token descriptor for retrieval. |
+| MoGe-2 ViT-L normal | Metric point map, depth and validity, intrinsics, plus a DINOv2 class-token descriptor for retrieval. Its normal head is not loaded: nothing reads its normals, and the other outputs are the same without it. |
 | GeoCalib (pinhole) | Gravity direction with uncertainty. |
 | YOLOE-26x-seg with the MobileCLIP2-B text encoder | Open-vocabulary instance masks over `segmentation/data/default_labels.txt`, a curated list of LVIS and COCO nouns. |
 | MapAnything (Apache-2.0 checkpoint) | Metric multi-view poses, used as a fallback. |
@@ -826,6 +826,16 @@ pixels, so its results are unchanged.
    * If no new keyframe overlaps the map, the command exits 5 and the map is unchanged.
 5. **Refinement.**
    1. Geometry is re-run for keyframes whose COLMAP focal length differs by more than 3 %.
+      MoGe-2's network does not depend on the focal length, which enters only its
+      post-processing (the point map's depth shift is solved for that focal length, then depth
+      and intrinsics follow). The first pass therefore asks the server to keep the network
+      output of each keyframe without EXIF (the point map before MoGe's output remap and the
+      binary mask: 2.2 MiB at 768×432), and the re-run sends the pixels the first pass read and
+      gets that output re-solved with the COLMAP focal length: the depth, validity and
+      intrinsics a second forward pass gives, bit for bit, in 7 ms instead of 180 ms (on the
+      office video, 106 keyframes in 1.3 s instead of 18–20 s). The server keeps at most 1 GiB
+      of such outputs, oldest dropped first; it hands each out once, and drops those older than
+      30 minutes at its next geometry request. A re-run that finds none runs the network.
    2. For a new map, the metric scale is the median ratio between MoGe depth and SfM depth, and
       the map frame is defined.
    3. Each keyframe's depth is aligned to the map. The scale comes from its SfM points, or

@@ -62,6 +62,10 @@ class GeometryRequest(BaseModel):
     fov_x_deg: float | None = None
     num_tokens: int = 2500
     want_descriptor: bool = True
+    # Keep the network output: this image will be asked again with another ``fov_x_deg``. A
+    # request for the same pixels and tokens without it re-solves a kept output (only MoGe's
+    # post-processing depends on the focal length) instead of running the network again.
+    keep_forward: bool = False
 
 
 class PixelIntrinsics(BaseModel):
