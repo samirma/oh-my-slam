@@ -547,6 +547,10 @@ class MapObject:
         t: cKDTree = self.memo("tree", lambda: cKDTree(self.points))
         return t
 
+    def forget_tree(self) -> None:
+        """Free ``tree`` (the merge tests are done; the cloud is fused next)."""
+        self._memo.pop("tree", None)
+
     def point_sources(self) -> NDArray[np.uint8]:
         """``sources``, every kind (``SRC_ANY``) for points whose sources were not recorded."""
         if self.sources is None or len(self.sources) != len(self.points):
@@ -1307,6 +1311,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     masks = _Masks(ctx, views, instances, state.merged_into, alias)
     merged = _merge(state, touched, alias, views, surfaces, masks)
     for o in state.objects:
+        o.forget_tree()
         o.views_in_frustum = count_views(o, records)
         confirm(o)
 
