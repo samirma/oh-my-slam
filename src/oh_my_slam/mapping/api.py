@@ -349,7 +349,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     prior = _camera_prior(ctx.new, ctx.old_frames)
     t0 = time.perf_counter()
     with timing.stage("features_matching"):
-        sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior)
+        sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior, video=is_video)
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
         n = sfm.match_pairs(pairs, names)

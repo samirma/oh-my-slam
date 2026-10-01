@@ -39,6 +39,7 @@ MIN_PLACED_FRACTION = 0.6
 ROTATION_PAIR_FRACTION = 0.5
 ROTATION_BASELINE_RATIO = 0.02
 MAX_FEATURES = 4096
+SIFT_UNDOUBLED_VIDEO_SIDE = 1600  # Sfm.extract
 
 # COLMAP TwoViewGeometry configuration codes
 _PLANAR, _PANORAMIC, _PLANAR_OR_PANORAMIC = 4, 5, 6
@@ -340,17 +341,28 @@ class Sfm:
 
     # -- features & matching ---------------------------------------------------------------------
 
-    def extract(self, names: list[str], prior: CameraPrior) -> int:
-        """Extract features for ``names`` (relative to ``image_dir``) sharing one camera."""
+    def extract(self, names: list[str], prior: CameraPrior, video: bool = False) -> int:
+        """Extract features for ``names`` (relative to ``image_dir``) sharing one camera.
+
+        SIFT doubles the image for its finest octave (COLMAP's default), except for the keyframes
+        of a ``video`` of at least ``SIFT_UNDOUBLED_VIDEO_SIDE`` px: they overlap densely and carry
+        compression and motion blur, and their doubled octave was most of the COLMAP stage (the
+        lv walk, 124 keyframes of 1920 x 1080: features and matching 36 s at 8.7 GB doubled, 10 s
+        at 2.4 GB not; global mapping 13 s -> 7 s; every keyframe still posed by SfM, overlapping
+        keyframes' depth agreeing as well or better). Smaller frames would keep few features
+        without it. Photos keep it: downscaled to 2000-2800 px or not doubled, the 13-photo office
+        map fell into a wrong global solution in 2 to 8 of 8 trials, never with COLMAP's
+        features."""
         lst = self.work / "extract_list.txt"
         lst.write_text("\n".join(names) + "\n")
+        doubled = not video or max(prior.width, prior.height) < SIFT_UNDOUBLED_VIDEO_SIDE
         args = [
             "feature_extractor", "--database_path", str(self.db), "--image_path",
             str(self.image_dir), "--image_list_path", str(lst),
             "--ImageReader.camera_model", "SIMPLE_PINHOLE",
             "--FeatureExtraction.use_gpu", "0", "--log_level", "1",
             "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
-            str(MAX_FEATURES),
+            str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
         existing = self.existing_camera(prior)
         if existing is not None:

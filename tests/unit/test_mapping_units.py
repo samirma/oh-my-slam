@@ -751,6 +751,27 @@ def test_incremental_extension_options(tmp_path: Path, monkeypatch: pytest.Monke
     assert set(ext.constant_cameras) == {1}  # type: ignore[attr-defined]
 
 
+def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Photos keep COLMAP's SIFT (the image doubled for the finest octave: the office map's
+    global solution depends on it); the keyframes of an HD video are not doubled (their doubled
+    octave was most of the COLMAP stage), those of a small video are (alone they keep few
+    features). The mapper says which keyframes come from a video."""
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(sfm_mod, "_run", lambda args, log: seen.append(args))
+    monkeypatch.setattr(sfm_mod.Sfm, "_camera_of", lambda self, name: 1)
+    s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
+    s.extract(["a.jpg"], sfm_mod.CameraPrior(4000, 3000, focal=3000.0))
+    s.extract(["b.jpg"], sfm_mod.CameraPrior(1920, 1080), video=True)
+    s.extract(["c.jpg"], sfm_mod.CameraPrior(640, 480), video=True)
+    first = [a[a.index("--SiftExtraction.first_octave") + 1] for a in seen]
+    assert first == ["-1", "0", "-1"]
+    assert all(a.count("--SiftExtraction.first_octave") == 1 for a in seen)
+    assert all("--FeatureExtraction.max_image_size" not in a for a in seen)  # COLMAP's 3200
+
+
 def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None:
     """A street keyframe: the road 8 m ahead (the median depth) and a facade 27 m away, fused
     up to 30 m. Its near/far correction (exponent 1.2 about its median) places the facade at
