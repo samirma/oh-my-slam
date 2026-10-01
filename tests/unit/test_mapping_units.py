@@ -604,6 +604,33 @@ def test_fusion_in_slabs_or_a_region_is_the_whole_fusion(monkeypatch: pytest.Mon
                                                region=(lo, hi), blocks=blocks), inside)
 
 
+def test_border_depth_defers_to_keyframes_that_see_the_surface_centrally() -> None:
+    """A keyframe whose depth is 7 % too deep in its outer 15 % (monocular depth is least reliable
+    at the image border): where its neighbours see those surfaces near their centre, its border
+    takes their depth; its centre, and what no neighbour sees centrally, keep theirs."""
+    from oh_my_slam.mapping.geometry import BORDER_BAND, _central, correct_borders
+
+    room, frames = _cloud_frames([1.0] * 12)
+    truth = [fd.depth.copy() for fd in frames]
+    fd0 = frames[0]
+    h, w = fd0.depth.shape
+    border = ~_central(np.arange(w)[None, :] + 0.5, np.arange(h)[:, None] + 0.5, w, h,
+                       BORDER_BAND)
+    fd0.depth = np.where(border, fd0.depth * 1.07, fd0.depth).astype(np.float32)
+    assert correct_borders(frames) > 0
+    ok = fd0.valid & (truth[0] > 0)
+    ratio = fd0.depth[ok & border] / truth[0][ok & border]
+    fixed = np.abs(ratio - 1.0) < 0.01
+    assert fixed.mean() > 0.5  # most of the border is seen centrally by a neighbour
+    # never pushed past the truth (but for a few pixels where a box edge meets the wall)
+    assert np.mean((ratio > 0.97) & (ratio < 1.0701)) > 0.995
+    np.testing.assert_array_equal(fd0.depth[~border], truth[0][~border])
+    for fd, d in zip(frames[1:], truth[1:], strict=True):  # consistent neighbours barely move
+        np.testing.assert_array_equal(fd.depth[~border], d[~border])
+        change = np.abs(fd.depth[border & (d > 0)] / d[border & (d > 0)] - 1)
+        assert np.percentile(change, 95) < 0.005 and np.percentile(change, 99) < 0.04
+
+
 def test_attribute_points_latest_visible_update_wins() -> None:
     from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
 

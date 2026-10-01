@@ -115,8 +115,9 @@ class FrameData:
 
     @cached_property
     def median_depth(self) -> float | None:
-        """Median of its valid depth (None: none), once: ``depth`` and ``valid`` are never
-        modified, and ``fusion_depth_max`` asks for it per part of the map."""
+        """Median of its valid depth (None: none), once: ``depth`` and ``valid`` are not
+        modified after the fusion's setup (``correct_borders``, which drops this value), and
+        ``fusion_depth_max`` asks for it per part of the map."""
         d = self.depth[self.valid & (self.depth > 0)]
         return float(np.median(d)) if len(d) else None
 
@@ -322,6 +323,105 @@ def _depth_cut(median: float | None, rec: store.FrameRecord, depth_max: float) -
         return depth_max
     return float(np.clip(median * (depth_max / median) ** e, depth_max / MAX_FACTOR,
                          depth_max * MAX_FACTOR))
+
+
+# Monocular depth is least reliable near the image border: on the turning head of
+# ``ainex-captures`` the keyframes that saw a wall in their outer 15 % placed it up to 6 % nearer or
+# farther than those that saw it near their centre (one scale and near/far tilt per keyframe cannot
+# take out an error that varies across the image), and the TSDF, whose band is 4 cm, kept each
+# placement as a layer of its own: a wall 12-15 cm thick, doubled below the light switch. Where
+# another keyframe sees the surface of a border pixel near its own centre, the border pixel takes
+# that keyframe's depth ratio (``correct_borders``).
+BORDER_BAND = 0.15  # the outer share of the image, on each side, whose depth defers to others
+BORDER_STEP = 4  # border pixels are measured every 4th pixel; each corrects its 4x4 cell
+BORDER_NEIGHBOURS = 8  # the keyframes, nearest by viewpoint, that may see a border centrally
+BORDER_SAME = 0.1  # |log ratio| within which the two depths are one surface (else: occlusion)
+BORDER_MAX_ANGLE_DEG = 60.0
+
+
+def _central(u: NDArray[Any], v: NDArray[Any], w: int, h: int, band: float) -> NDArray[np.bool_]:
+    return np.asarray((u >= band * w) & (u < (1 - band) * w) & (v >= band * h)
+                      & (v < (1 - band) * h))
+
+
+def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
+                    step: int = BORDER_STEP) -> int:
+    """Give each keyframe's border pixels (outer ``band`` of the image) the depth of the
+    keyframes that see the same surface near their centre (in place; see ``BORDER_BAND``): each
+    sampled border pixel is lifted, projected into its ``BORDER_NEIGHBOURS`` nearest keyframes by
+    viewpoint and, where it lands in one's central part on the same surface (within
+    ``BORDER_SAME``), its depth is scaled by their mean depth ratio along its ray; the correction
+    covers the pixel's ``step`` x ``step`` cell. Border pixels no other keyframe sees centrally
+    keep their depth. Returns the number of corrected pixels."""
+    if len(frames) < 2:
+        return 0
+    C = np.array([fd.rec.T_map_cam.t for fd in frames])
+    F = np.array([fd.rec.T_map_cam.R[:, 2] for fd in frames])
+    cos = np.clip(F @ F.T, -1.0, 1.0)
+    meds = [m for m in (fd.median_depth for fd in frames) if m is not None]
+    scene = max(0.5, float(np.median(meds))) if meds else 1.0
+    dist = np.linalg.norm(C[:, None] - C[None], axis=2) / scene + (1.0 - cos)
+    near = cos > np.cos(np.radians(BORDER_MAX_ANGLE_DEG))
+    corrected = 0
+    new_depths = []
+    for i, fd in enumerate(frames):
+        d = np.asarray(fd.depth, np.float32)
+        h, w = d.shape
+        vv, uu = np.mgrid[step // 2:h:step, step // 2:w:step]
+        z = d[vv, uu].astype(np.float64)
+        ok = fd.valid[vv, uu] & (z > 0) & ~_central(uu + 0.5, vv + 0.5, w, h, band)
+        # pixel indices as the TSDF reads them: u = fx x / z + cx
+        cand = [j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
+        if not ok.any() or not cand:
+            new_depths.append(d)
+            continue
+        K = fd.rec.K_grid
+        T = fd.rec.T_map_cam
+        zs = z[ok]
+        X = np.column_stack([(uu[ok] - K.cx) / K.fx * zs, (vv[ok] - K.cy) / K.fy * zs,
+                             zs]) @ T.R.T + T.t
+        total = np.zeros(len(zs))
+        count = np.zeros(len(zs))
+        for j in cand[:BORDER_NEIGHBOURS]:
+            g = frames[j]
+            Kg, Tg = g.rec.K_grid, g.rec.T_map_cam
+            Y = (X - Tg.t) @ Tg.R
+            zz = Y[:, 2]
+            front = zz > 0.05
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pu = Kg.fx * Y[:, 0] / zz + Kg.cx
+                pv = Kg.fy * Y[:, 1] / zz + Kg.cy
+            gh, gw = g.depth.shape
+            inside = front & _central(pu + 0.5, pv + 0.5, gw, gh, band)
+            idx = np.flatnonzero(inside)
+            iu = np.clip(np.floor(pu[idx] + 0.5).astype(np.int64), 0, gw - 1)
+            iv = np.clip(np.floor(pv[idx] + 0.5).astype(np.int64), 0, gh - 1)
+            dg = g.depth[iv, iu].astype(np.float64)
+            good = g.valid[iv, iu] & (dg > 0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.log(np.where(good, dg, 1.0) / zz[idx])
+            same = good & (np.abs(r) <= BORDER_SAME)
+            total[idx[same]] += r[same]
+            count[idx[same]] += 1
+        field = np.ones(z.shape)
+        seen = count > 0
+        vals = np.ones(len(zs))
+        vals[seen] = np.exp(total[seen] / count[seen])
+        field[ok] = vals
+        full = np.repeat(np.repeat(field, step, axis=0), step, axis=1)[:h, :w]
+        zcell = np.repeat(np.repeat(z, step, axis=0), step, axis=1)[:h, :w]
+        border = ~_central(np.arange(w)[None, :] + 0.5, np.arange(h)[:, None] + 0.5, w, h, band)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # a cell's pixels on the sampled pixel's surface (not across a depth edge)
+            same = np.abs(np.log(np.where(d > 0, d, 1.0) / np.where(zcell > 0, zcell, 1.0))) \
+                <= BORDER_SAME
+        fix = border & (full != 1.0) & fd.valid & (d > 0) & same
+        corrected += int(fix.sum())
+        new_depths.append(np.where(fix, d * full, d).astype(np.float32))
+    for fd, nd in zip(frames, new_depths, strict=True):
+        fd.depth = nd
+        fd.__dict__.pop("median_depth", None)  # of the corrected depth from now on
+    return corrected
 
 
 def _map_depth_max(medians: list[Any]) -> tuple[float, float]:
@@ -1039,13 +1139,16 @@ class _Setup:
 
 def _setup(ctx: Any, records: list[store.FrameRecord]) -> _Setup:
     """The keyframes (as stored or staged), the fusion's voxel and depth cut from their median
-    depth, and the places of removed objects."""
+    depth, and the places of removed objects. The fused (confident) keyframes' image borders
+    take the depth of the keyframes that see the surface centrally (``correct_borders``)."""
     new_by_name = {nf.kf.name: nf for nf in ctx.new if nf.record is not None}
     frames = [_frame_data(ctx, r, new_by_name) for r in sorted(records, key=lambda r: r.order_key)]
     voxel, depth_max = _map_depth_max([fd.median_depth for fd in frames
                                        if fd.median_depth is not None])
-    return _Setup(frames, [fd for fd in frames if not fd.rec.low_confidence],
-                  max(0.005, voxel / 2), depth_max, load_vacated(ctx.tx.current))
+    confident = [fd for fd in frames if not fd.rec.low_confidence]
+    correct_borders(confident)
+    return _Setup(frames, confident, max(0.005, voxel / 2), depth_max,
+                  load_vacated(ctx.tx.current))
 
 
 class SurfaceQuery:

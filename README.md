@@ -862,7 +862,16 @@ pixels, so its results are unchanged.
    (a street walk: millions) is fused in slabs of about as many blocks, one at a time, with the
    same points and the memory of a slab. The per-keyframe projections of the cloud's points
    (few views, attribution, removed places) cull the points in 25 cm cells outside the
-   keyframe's frustum and run on up to 8 threads over parts of the map.
+   keyframe's frustum and run on up to 8 threads over parts of the map. Monocular depth is
+   least reliable near the image border, and the TSDF (a 4 cm band) keeps each disagreeing
+   placement of a surface as a layer of its own: on `ainex-captures` the keyframes that saw the
+   wall beside door 1 in their outer 15 % placed it up to 6 % nearer or farther than those that
+   saw it near their centre, and the wall came out 12–15 cm thick, doubled below the light
+   switch. Before fusion, each keyframe's border (its outer 15 % on each side) therefore takes
+   the depth of the keyframes that see the same surface near their centre: every 4th border
+   pixel is projected into its 8 nearest keyframes by viewpoint, and where it lands in one's
+   central part on the same surface (within 10 %), its cell of 4×4 pixels is scaled by their
+   mean depth ratio. Border pixels no keyframe sees centrally keep their depth.
 
 ### Ownership
 
