@@ -47,6 +47,7 @@ from oh_my_slam.mapping.sfm import (
     check_versions,
     contradicted,
     vet,
+    weak_link_pairs,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
 from oh_my_slam.reconstruction.depth import DepthCorrection, ScaleFit, fit_frame_scale
@@ -402,6 +403,25 @@ def _depth_consistent(ctx: UpdateContext, model: SfmModel, name: str) -> bool:
     return fit is None or not fit.ok or (REJECT_SCALE[0] <= fit.scale <= REJECT_SCALE[1])
 
 
+def _strengthen_weak_links(ctx: UpdateContext, sfm: Sfm, pairs: set[tuple[int, int]],
+                           names: dict[int, str], progress: Progress) -> None:
+    """LightGlue matches the new keyframes' pairs across the weak cuts of their capture order
+    again (``sfm.weak_link_pairs``); ``notes["weak_links"]`` records the cuts and the pairs."""
+    order = [f"{nf.kf.name}.jpg" for nf in sorted(ctx.new, key=lambda nf: nf.kf.index)]
+    listed = {frozenset((names[a], names[b])) for a, b in pairs}
+    cuts, weak = weak_link_pairs(order, listed, set(sfm.verified_pairs()), SEQ_OVERLAP)
+    if not weak:
+        return
+    t0 = time.perf_counter()
+    with timing.part("lightglue"):
+        res = sfm.rematch_lightglue(weak)
+    timing.count(lightglue_pairs=res["pairs"])
+    ctx.notes["weak_links"] = {"cuts_after": cuts, **res}
+    progress(f"LightGlue on {res['pairs']} pairs across {len(cuts)} weak links "
+             f"({', '.join(cuts)}): {res['verified_after']} verified "
+             f"(SIFT {res['verified_before']}) in {time.perf_counter() - t0:.0f} s")
+
+
 def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) -> SfmModel:
     check_versions()
     tx = ctx.tx
@@ -420,6 +440,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
         n = sfm.match_pairs(pairs, names)
+        if is_video:
+            _strengthen_weak_links(ctx, sfm, pairs, names, progress)
     timing.count(matched_pairs=n)
     progress(f"features + matching: {n} pairs in {time.perf_counter() - t0:.0f} s")
     t0 = time.perf_counter()

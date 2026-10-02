@@ -93,7 +93,8 @@ rows are listed because they are copyleft or otherwise notable:
 
 | Component | Version | Used for | Licence |
 |---|---|---|---|
-| COLMAP (Homebrew `colmap`) | 4.2.0 | SIFT feature extraction and matching CLI; GLOMAP is part of COLMAP 4.2 | BSD-3-Clause (COLMAP, GLOMAP). COLMAP's licence notes that its dependencies may change the licence of the built binary. The Homebrew formula depends on CGAL 6.2.1 (GPL-3.0-or-later), Qt 6 `qtbase` (LGPL-3.0 / GPL), SuiteSparse (mixed, including GPL and LGPL) and ONNX Runtime 1.30.0 (MIT), so the Homebrew binary should be treated as GPL-3.0-or-later. |
+| COLMAP (Homebrew `colmap`) | 4.2.0 | SIFT feature extraction and matching CLI (LightGlue on a video's weak links through its ONNX Runtime); GLOMAP is part of COLMAP 4.2 | BSD-3-Clause (COLMAP, GLOMAP). COLMAP's licence notes that its dependencies may change the licence of the built binary. The Homebrew formula depends on CGAL 6.2.1 (GPL-3.0-or-later), Qt 6 `qtbase` (LGPL-3.0 / GPL), SuiteSparse (mixed, including GPL and LGPL) and ONNX Runtime 1.30.0 (MIT), so the Homebrew binary should be treated as GPL-3.0-or-later. |
+| LightGlue for SIFT (`sift-lightglue.onnx`) | COLMAP release asset 3.13.0, sha256 `e0500228…096e`; the `colmap` CLI downloads it into `~/.cache/colmap` on first use | Matching the SIFT keypoints of a video's weak links again (`mapping/sfm.py`) | Apache-2.0 (code and pre-trained weights, `cvg/LightGlue` README, checked 2026-10-02); the ONNX export is COLMAP's (BSD-3-Clause) |
 | Microsoft Edge or Google Chrome | system-installed | Playwright browser tests and the evaluator's page timing | Proprietary; not bundled |
 | uv | 0.9.18 (installed) | Environment and dependency manager | MIT OR Apache-2.0 |
 

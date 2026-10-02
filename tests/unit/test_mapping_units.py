@@ -852,6 +852,169 @@ def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
     assert all("--FeatureExtraction.max_image_size" not in a for a in seen)  # COLMAP's 3200
 
 
+def test_weak_links_of_a_walk_are_the_cuts_few_sequential_pairs_span() -> None:
+    """A cut of the capture order that fewer than WEAK_CUT_PAIRS verified pairs within the
+    sequential window span is weak (loop closures across it do not count); the listed pairs that
+    span it at most WEAK_CUT_REACH apart, and that SIFT did not verify, are matched again."""
+    from oh_my_slam.mapping.sfm import WEAK_CUT_PAIRS, WEAK_CUT_REACH, weak_link_pairs
+
+    order = [f"k{i:02d}" for i in range(30)]
+
+    def pair(i: int, j: int) -> frozenset[str]:
+        return frozenset((order[i], order[j]))
+
+    window = 4
+    listed = {pair(i, j) for i in range(30) for j in range(i + 1, min(30, i + 1 + window))}
+    listed |= {pair(2, 25), pair(5, 28)}  # loop candidates
+    # every sequential pair verified, except across 14|15, where only (13, 15) is: a weak cut
+    verified = {p for p in listed if len(p) == 2 and not (
+        min(order.index(n) for n in p) <= 14 < max(order.index(n) for n in p))}
+    verified |= {pair(13, 15), pair(2, 25), pair(5, 28)}
+    assert WEAK_CUT_PAIRS > 1 and WEAK_CUT_REACH >= 2
+    cuts, todo = weak_link_pairs(order, listed, verified, window)
+    assert cuts == ["k14"]
+    spanning = {pair(i, j) for i in range(11, 15) for j in range(15, 19) if j - i <= window}
+    assert todo == spanning - {pair(13, 15)}
+    # a shorter reach keeps the nearer pairs only; a strong cut needs nothing
+    _, near = weak_link_pairs(order, listed, verified, window, reach=2)
+    assert near == {pair(14, 15), pair(14, 16)}
+    assert weak_link_pairs(order, listed, verified | {pair(14, 15), pair(12, 16)}, window,
+                           min_pairs=2) == ([], set())
+    # a keyframe matched to nothing leaves both its cuts weak
+    alone = {p for p in verified if order[20] not in p}
+    cuts, todo = weak_link_pairs(order, listed, alone, window, min_pairs=1)
+    assert cuts == [] and todo == set()  # its neighbours' pairs over it still span both cuts
+    cuts, _ = weak_link_pairs(order, listed, alone, 1, min_pairs=1)
+    assert cuts == ["k14", "k19", "k20"]
+
+
+def _colmap_db(path: Path, names: list[str]) -> dict[str, int]:
+    import pycolmap
+
+    db = pycolmap.Database.open(str(path))
+    try:
+        cid = db.write_camera(pycolmap.Camera.create_from_model_name(1, "SIMPLE_PINHOLE", 100.0,
+                                                                     64, 48))
+        return {n: db.write_image(pycolmap.Image(name=n, camera_id=cid)) for n in names}
+    finally:
+        db.close()
+
+
+def _write_pair(path: Path, i: int, j: int, inliers: int, raw: int) -> None:
+    import pycolmap
+
+    db = pycolmap.Database.open(str(path))
+    try:
+        db.write_matches(i, j, np.stack([np.arange(raw)] * 2, 1).astype(np.uint32))
+        g = pycolmap.TwoViewGeometry()
+        g.config = 2  # calibrated
+        g.inlier_matches = np.stack([np.arange(inliers)] * 2, 1).astype(np.uint32)
+        db.write_two_view_geometry(i, j, g)
+    finally:
+        db.close()
+
+
+def _inliers(path: Path, i: int, j: int) -> int:
+    import pycolmap
+
+    db = pycolmap.Database.open(str(path))
+    try:
+        return len(db.read_two_view_geometry(i, j).inlier_matches)
+    finally:
+        db.close()
+
+
+def test_lightglue_rematches_weak_pairs_on_the_sift_keypoints(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch
+                                                              ) -> None:
+    """COLMAP skips a pair the database holds, so SIFT's rows go before LightGlue (on the CPU,
+    on the SIFT keypoints) matches the pairs; a pair where SIFT verified more keeps SIFT's rows,
+    and every pair keeps them when LightGlue fails (no model, no network)."""
+    import pycolmap
+
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    db_path = tmp_path / "db.db"
+    ids = _colmap_db(db_path, ["a.jpg", "b.jpg", "c.jpg"])
+    a, b, c = ids["a.jpg"], ids["b.jpg"], ids["c.jpg"]
+    _write_pair(db_path, a, b, inliers=0, raw=4)
+    _write_pair(db_path, b, c, inliers=12, raw=30)
+    seen: list[list[str]] = []
+
+    def lightglue(args: list[str], log: Path) -> None:
+        seen.append(args)
+        lst = Path(args[args.index("--match_list_path") + 1]).read_text().split()
+        assert sorted(lst) == ["a.jpg", "b.jpg", "b.jpg", "c.jpg"]
+        db = pycolmap.Database.open(str(db_path))
+        try:
+            assert not db.exists_matches(a, b) and not db.exists_two_view_geometry(b, c)
+        finally:
+            db.close()
+        _write_pair(db_path, a, b, inliers=40, raw=50)
+        _write_pair(db_path, b, c, inliers=8, raw=20)
+
+    monkeypatch.setattr(sfm_mod, "_run", lightglue)
+    s = sfm_mod.Sfm(db_path, tmp_path, tmp_path / "work")
+    weak = {frozenset(("a.jpg", "b.jpg")), frozenset(("b.jpg", "c.jpg"))}
+    assert s.rematch_lightglue(weak) == {"pairs": 2, "verified_before": 0, "verified_after": 1}
+    (args,) = seen
+    assert args[0] == "matches_importer"
+    assert args[args.index("--FeatureMatching.type") + 1] == "SIFT_LIGHTGLUE"
+    assert args[args.index("--FeatureMatching.use_gpu") + 1] == "0"
+    assert (_inliers(db_path, a, b), _inliers(db_path, b, c)) == (40, 12)  # SIFT's 12 kept
+    assert set(s.verified_pairs()) == {frozenset(("a.jpg", "b.jpg"))}
+
+    def fails(args: list[str], log: Path) -> None:
+        raise sfm_mod.SfmError("colmap matches_importer failed (1): download failed")
+
+    monkeypatch.setattr(sfm_mod, "_run", fails)
+    _write_pair(db_path, a, c, inliers=5, raw=9)
+    res = s.rematch_lightglue({frozenset(("a.jpg", "c.jpg"))})
+    assert res == {"pairs": 1, "verified_before": 0, "verified_after": 0}
+    assert _inliers(db_path, a, c) == 5
+    assert s.rematch_lightglue(set())["pairs"] == 0
+
+
+def test_the_mapper_rematches_the_weak_links_of_the_new_keyframes() -> None:
+    """The new keyframes' capture order (by index, not by the order they are listed in) gives the
+    cuts; the result goes to the update's notes. Without a weak link nothing is matched again."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.mapping import api
+
+    new = [SimpleNamespace(kf=SimpleNamespace(name=f"f{i:06d}", index=i))
+           for i in (5, 0, 7, 1, 2, 6, 3, 4)]
+    names = {i: f"f{i:06d}.jpg" for i in range(8)}
+    pairs = {(i, j) for i in range(8) for j in range(i + 1, min(8, i + 4))}
+
+    class FakeSfm:
+        def __init__(self, verified: set[tuple[int, int]]) -> None:
+            self.verified = {frozenset((names[a], names[b])): (50, 2) for a, b in verified}
+            self.asked: list[set[frozenset[str]]] = []
+
+        def verified_pairs(self) -> dict[frozenset[str], tuple[int, int]]:
+            return self.verified
+
+        def rematch_lightglue(self, weak: set[frozenset[str]]) -> dict[str, int]:
+            self.asked.append(weak)
+            return {"pairs": len(weak), "verified_before": 0, "verified_after": 1}
+
+    msgs: list[str] = []
+    ctx = SimpleNamespace(new=new, notes={})
+    # every pair verified except across 3|4, which (2, 4) alone spans
+    sfm = FakeSfm({(i, j) for i, j in pairs if not i <= 3 < j} | {(2, 4)})
+    api._strengthen_weak_links(ctx, sfm, pairs, names, msgs.append)  # type: ignore[arg-type]
+    assert sfm.asked == [{frozenset((names[i], names[j]))
+                          for i, j in ((1, 4), (2, 5), (3, 4), (3, 5), (3, 6))}]
+    assert ctx.notes["weak_links"] == {"cuts_after": ["f000003.jpg"], "pairs": 5,
+                                       "verified_before": 0, "verified_after": 1}
+    assert len(msgs) == 1 and "LightGlue" in msgs[0]
+    strong = FakeSfm(pairs)
+    ctx = SimpleNamespace(new=new, notes={})
+    api._strengthen_weak_links(ctx, strong, pairs, names, msgs.append)  # type: ignore[arg-type]
+    assert strong.asked == [] and ctx.notes == {}
+
+
 def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None:
     """A street keyframe: the road 8 m ahead (the median depth) and a facade 27 m away, fused
     up to 30 m. Its near/far correction (exponent 1.2 about its median) places the facade at

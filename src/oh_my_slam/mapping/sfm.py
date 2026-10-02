@@ -34,7 +34,8 @@ from oh_my_slam.core.types import Intrinsics, Pose
 log = get_logger("oh_my_slam.sfm")
 
 # Gate G4 (measured on the user's inputs): SIFT registers as many frames as ALIKED+LightGlue and is
-# ~30x faster on this CPU/CoreML build, so SIFT is the only feature type.
+# ~30x faster on this CPU/CoreML build, so SIFT is the only feature type. LightGlue matches SIFT's
+# own keypoints again where a video walk hangs together by next to nothing (``weak_link_pairs``).
 MIN_PLACED_FRACTION = 0.6
 ROTATION_PAIR_FRACTION = 0.5
 ROTATION_BASELINE_RATIO = 0.02
@@ -199,6 +200,50 @@ class SfmModel:
     def write(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.rec.write(str(path))
+
+
+# A cut in a video's capture order that fewer than WEAK_CUT_PAIRS verified sequential pairs span
+# (at most one: what lies beyond hangs on one link) is a weak link. On the office walk the white
+# wardrobe doors and the door (f000101-f000109, 67-1300 SIFT keypoints each) had no verified pair
+# to the rest at one end and 0-1 at the other; the global mapper left these nine keyframes a
+# reconstruction of their own in 4 of 5 builds, and the fifth joined them on one 15-inlier pair,
+# 5 % off in depth against their neighbours. The listed pairs that span a weak cut, at most
+# WEAK_CUT_REACH keyframes apart, are matched again with LightGlue on the same SIFT keypoints:
+# there 15-16 of 41-42 verified with 15-67 inliers (SIFT: 0-22 raw matches), and every build mapped
+# the walk as one reconstruction, the nine keyframes 1.6-1.8 % off in depth against their
+# neighbours. LightGlue costs about 1 s per pair and CPU thread (COLMAP's CoreML provider cannot
+# compile its dynamic shapes and was 6x slower), so it is kept to these pairs: a normal cut is
+# spanned by ~30 verified pairs (5th percentile 6-8 on officev, lv and livingroom), and the office
+# walk's next weakest cut (2 pairs) cost 4 s more and moved no pose.
+WEAK_CUT_PAIRS = 2
+WEAK_CUT_REACH = 6
+MIN_INLIERS = 15  # COLMAP's TwoViewGeometry.min_num_inliers: a verified pair
+
+
+def weak_link_pairs(order: list[str], listed: set[frozenset[str]],
+                    verified: set[frozenset[str]], window: int,
+                    min_pairs: int = WEAK_CUT_PAIRS, reach: int = WEAK_CUT_REACH
+                    ) -> tuple[list[str], set[frozenset[str]]]:
+    """The weak cuts of a video's capture ``order`` (named by the keyframe before them) and the
+    ``listed`` pairs not ``verified`` that span one at most ``reach`` keyframes apart. A cut is weak
+    when fewer than ``min_pairs`` verified pairs at most ``window`` apart (the sequential pairs)
+    span it; loop closures do not count: they hold the walk together, not the stretch."""
+    pos = {n: i for i, n in enumerate(order)}
+    span = np.zeros(max(len(order) - 1, 0), int)
+    for p in verified:
+        if p <= pos.keys():
+            a, b = sorted(pos[n] for n in p)
+            if b - a <= window:
+                span[a:b] += 1
+    weak = np.flatnonzero(span < min_pairs)
+    out = set()
+    for p in listed - verified:
+        if len(p) == 2 and p <= pos.keys():
+            a, b = sorted(pos[n] for n in p)
+            k = int(np.searchsorted(weak, a))  # the first weak cut at or after a
+            if b - a <= reach and k < len(weak) and weak[k] < b:
+                out.add(p)
+    return [order[c] for c in weak], out
 
 
 FIXED_ROT_TOL_DEG = 2.0
@@ -448,6 +493,74 @@ class Sfm:
                 "--log_level", "1", "--FeatureMatching.type", "SIFT_BRUTEFORCE"]
         _run(args, self.log_path)
         return n
+
+    def rematch_lightglue(self, pairs: set[frozenset[str]]) -> dict[str, int]:
+        """Match ``pairs`` (image names) again with LightGlue on their SIFT keypoints. COLMAP
+        skips a pair the database already holds, so SIFT's matches and two-view geometry are
+        taken out first; they are put back where LightGlue verifies fewer inliers than SIFT did,
+        and for every pair when LightGlue fails (no model: COLMAP downloads it, 46 MB, into
+        ``~/.cache/colmap`` on first use). Runs on the CPU: the CoreML provider cannot compile
+        LightGlue's dynamic shapes and was 6x slower. Returns the pairs matched and verified
+        before and after."""
+        import pycolmap
+
+        from oh_my_slam.mapping.retrieval import write_pair_list
+
+        if not pairs:
+            return {"pairs": 0, "verified_before": 0, "verified_after": 0}
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            ids = {im.name: im.image_id for im in db.read_all_images()}
+            todo = sorted((ids[a], ids[b]) for a, b in (sorted(p) for p in pairs)
+                          if a in ids and b in ids)
+            kept: dict[tuple[int, int], tuple[Any, Any]] = {}
+            for i, j in todo:
+                m: Any = db.read_matches(i, j) if db.exists_matches(i, j) else None
+                g: Any = db.read_two_view_geometry(i, j) if db.exists_two_view_geometry(i, j) \
+                    else None
+                kept[i, j] = (m, g)
+                if m is not None:
+                    db.delete_matches(i, j)
+                if g is not None:
+                    db.delete_two_view_geometry(i, j)
+        finally:
+            db.close()
+        before = sum(g is not None and len(g.inlier_matches) >= MIN_INLIERS
+                     for _, g in kept.values())
+        lst = self.work / "pairs_lightglue.txt"
+        names = {v: k for k, v in ids.items()}
+        write_pair_list(lst, set(todo), names)
+        args = ["matches_importer", "--database_path", str(self.db), "--match_list_path",
+                str(lst), "--match_type", "pairs", "--FeatureMatching.use_gpu", "0",
+                "--log_level", "1", "--FeatureMatching.type", "SIFT_LIGHTGLUE"]
+        try:
+            _run(args, self.log_path)
+            failed = False
+        except SfmError as e:
+            log.warning("LightGlue matching failed, the weak pairs keep SIFT's matches: %s", e)
+            failed = True
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            after = 0
+            for (i, j), (m, g) in kept.items():
+                new = db.read_two_view_geometry(i, j) if db.exists_two_view_geometry(i, j) \
+                    else None
+                n_new = len(new.inlier_matches) if new is not None else 0
+                n_old = len(g.inlier_matches) if g is not None else 0
+                if failed or n_old > n_new:
+                    if db.exists_matches(i, j):
+                        db.delete_matches(i, j)
+                    if new is not None:
+                        db.delete_two_view_geometry(i, j)
+                    if m is not None:
+                        db.write_matches(i, j, m)
+                    if g is not None:
+                        db.write_two_view_geometry(i, j, g)
+                    n_new = n_old
+                after += n_new >= MIN_INLIERS
+        finally:
+            db.close()
+        return {"pairs": len(todo), "verified_before": int(before), "verified_after": int(after)}
 
     def two_view_stats(self, names: set[str] | None = None) -> dict[str, float]:
         import pycolmap

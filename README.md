@@ -752,6 +752,28 @@ pixels, so its results are unchanged.
      for video.
    * Updates: new keyframes are matched against the whole map up to 150 keyframes, and against
      retrieved keyframes beyond that.
+
+   **Weak links of a video** are matched again with LightGlue on the same SIFT keypoints
+   (COLMAP's `SIFT_LIGHTGLUE`, on the CPU). A cut between two consecutive keyframes is weak
+   when at most one verified pair of keyframes at most 12 apart spans it (loop closures do not
+   count): what lies beyond hangs on one link. Every listed pair that spans a weak cut, is at
+   most 6 keyframes apart and was not verified is matched again; SIFT's result stays where it
+   verified more. On the office walk the white wardrobe doors and the door
+   (`f000101`–`f000109`, 67–1300 SIFT keypoints each) had no verified pair to the rest at one
+   end and 0–1 at the other. The global mapper left these nine keyframes a reconstruction of
+   their own in 4 of 5 builds, and the fifth joined them on one 15-inlier pair, 5 % off in
+   depth against their neighbours. LightGlue verifies 15–16 of the 41–42 pairs across those cuts
+   (15–67 inliers; SIFT found 0–22 raw matches), and every build poses all 124 keyframes in one
+   reconstruction, the nine 1.6–1.8 % off in depth against their neighbours. LightGlue costs
+   about 1 s per pair and CPU thread (COLMAP's CoreML provider cannot compile its dynamic shapes
+   and was 6× slower), so it runs on these pairs only: 7 s on the office walk, nothing on a walk
+   without a weak cut (livingroom). The first use downloads COLMAP's `sift-lightglue.onnx`
+   (46 MB) into `~/.cache/colmap`; if that fails, the pairs keep SIFT's matches. `map.json`
+   (`updates[].notes.weak_links`) records the cuts and the pairs. Photos keep SIFT: on a 12 MP
+   photo's ~5000 SIFT keypoints LightGlue took 4.6 s per pair, and the learned features cost
+   more than they gave on the photo sets (ALIKED+LightGlue: features and matching +28 s on
+   office, +14 s on hallway, where 1 of 3 maps broke; LoMa-B: 8 min of extraction for the 13
+   office photos).
 4. **Poses (pycolmap 4.2):**
    * **New map:** global mapping (GLOMAP) runs first. If it places fewer than 60 % of the
      keyframes, incremental mapping runs instead. Rotation-dominant input goes to MapAnything
@@ -1048,10 +1070,13 @@ runs it end to end as a test.
   behind the doorway at any scale or tilt, or shrink it onto one point (see Poses). The mapper
   corrects the scale with the depth and the tilt with gravity, but the stretch's heading and
   position still rest on that one link, or on multi-view poses anchored on its capture-order
-  neighbours, so they can be a few degrees and decimetres off. Keyframes whose gravity still
-  disagrees by more than 25° afterwards are left out: on the user's `livingroom.mp4` at `-fps 1`,
-  the dim corridor at 77–81 s. The global mapper starts from random positions, so two runs on one
-  video can differ in such stretches.
+  neighbours, so they can be a few degrees and decimetres off. LightGlue on the weak links
+  (Mapping, step 3) gives such a cut more matches, but it cannot add keypoints: a keyframe of a
+  blank surface (the office walk's `f000101`, 67 SIFT keypoints) rests on four pairs of about
+  20 inliers, and in 1 of 5 builds its SfM pose was 0.4 m off its neighbours. Keyframes whose
+  gravity still disagrees by more than 25° afterwards are left out: on the user's
+  `livingroom.mp4` at `-fps 1`, the dim corridor at 77–81 s. The global mapper starts from
+  random positions, so two runs on one video can differ in such stretches.
 
 ## Development
 
