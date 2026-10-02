@@ -872,6 +872,27 @@ pixels, so its results are unchanged.
    pixel is projected into its 8 nearest keyframes by viewpoint, and where it lands in one's
    central part on the same surface (within 10 %), its cell of 4×4 pixels is scaled by their
    mean depth ratio. Border pixels no keyframe sees centrally keep their depth.
+   Then the keyframes are made to agree everywhere, as multi-view stereo fuses its depth maps.
+   Neighbouring keyframes still disagree by ~3 % (7–10 % outliers), and on `office.mp4` the
+   desk legs came out fat, doubled or tripled and the monitors as slabs with offset copies.
+   The copies come from keyframes of other passes 40–55° away: the sequence neighbours agree
+   with each other. Every 2nd pixel is therefore projected into every keyframe whose optical
+   axis lies within 60° (up to the 96 nearest by viewpoint). A keyframe that sees the same
+   surface there (within 3 %) gives its depth along the pixel's ray, and the pixel's 2×2 cell
+   takes the median of these depths and its own. A keyframe whose depth there lies more than 3 %
+   beyond the pixel sees through it. Where at least 2 keyframes see through a pixel, more than
+   see it, the cell is left out of the fusion: these free-space violations are the offset
+   copies. A keyframe of an older update never counts as seeing through a newer one's pixel,
+   because what it saw through may have been placed there since (latest wins). Most of the gain
+   comes from leaving those pixels out (about 10 % of the office's pixels). The median alone
+   merges the layers within 3 % (a third fewer cloud points). On the office walk, rendered from
+   8 keyframes against their own depth, leg pixels within max(4 cm, 3 %) went from 0.73–0.75 to
+   0.85, and the ring around them where the map stands in front of the keyframe went from
+   0.39–0.42 to 0.27. For the monitors these went from 0.63 to 0.79 and from 0.40 to 0.22. The
+   price is up to 1 point more of pixels where the map lies behind the keyframe (the nearer of
+   two disagreeing placements is the one left out). It takes about 2 s for 124 keyframes, at
+   every fusion setup, and the fusion of fewer points saves about as much. Both the consensus
+   and the border correction change the depth in memory only: the stored depth is unchanged.
 
 ### Ownership
 

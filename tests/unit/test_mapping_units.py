@@ -631,6 +631,59 @@ def test_border_depth_defers_to_keyframes_that_see_the_surface_centrally() -> No
         assert np.percentile(change, 95) < 0.005 and np.percentile(change, 99) < 0.04
 
 
+def test_consensus_puts_disagreeing_keyframes_on_one_surface() -> None:
+    """Keyframes whose depth disagrees by ±1.2 % (as neighbouring keyframes do after the depth
+    adjustment): each pixel takes the median of the depths the keyframes that see it give along
+    its ray, so every keyframe lands within a fraction of a percent of the others — and the TSDF
+    fuses one surface instead of a layer per placement. The stored depth is not touched."""
+    from oh_my_slam.mapping.geometry import consensus_depths, fused_cloud_points
+
+    scales = [1.012, 0.988, 1.0] * 8
+    room, frames = _cloud_frames(scales)
+    truth = [fd.depth / s for fd, s in zip(frames, scales, strict=True)]
+    box = (np.array([-1.5, -1.5, -0.1]), np.array([1.5, 0.0, 1.0]))  # floor, boxes, sofa
+    # at the map's voxel (5 mm, a 4 cm band), which keeps placements 2.4 % apart at 2 m apart
+    before = fused_cloud_points(frames, voxel=0.005, depth_max=6.0, region=box)
+    moved, dropped = consensus_depths(frames)
+    assert moved > 0
+    errs = []
+    for fd, t in zip(frames, truth, strict=True):
+        ok = fd.valid & (t > 0)
+        errs.append(np.abs(fd.depth[ok] / t[ok] - 1.0))
+    err = np.concatenate(errs)
+    assert np.median(err) < 0.002 and np.percentile(err, 90) < 0.006  # 0.012 for 2/3 before
+    assert dropped < 0.01 * sum(int(fd.valid.sum()) for fd in frames)  # nothing is seen through
+    after = fused_cloud_points(frames, voxel=0.005, depth_max=6.0, region=box)
+    d_before, d_after = _surface_distance(room, before), _surface_distance(room, after)
+    assert np.percentile(d_after, 90) < 0.5 * np.percentile(d_before, 90)
+    assert len(after) < 0.8 * len(before)  # fewer layers
+
+
+def test_consensus_leaves_out_what_other_keyframes_see_through() -> None:
+    """A blob that one keyframe places in front of the -x wall, where two other keyframes of its
+    update see the wall, is left out of the fusion (free-space violation); the rest of its
+    pixels are not. A keyframe of an older update does not carve a newer one's pixels: what it
+    saw through may stand there now (latest wins)."""
+    from oh_my_slam.mapping.geometry import consensus_depths
+
+    for newer in (False, True):
+        _, frames = _wall_frames()
+        blob = np.zeros(frames[1].depth.shape, bool)
+        blob[100:140, 140:180] = True
+        frames[1].depth = np.where(blob, 0.6 * frames[1].depth,
+                                   frames[1].depth).astype(np.float32)
+        if newer:
+            frames[1].rec.update_id = 2
+        consensus_depths(frames)
+        drop = frames[1].drop
+        assert drop is not None
+        if newer:
+            assert not drop[blob].any()
+        else:
+            assert drop[blob].mean() > 0.9
+        assert drop[~blob & frames[1].valid].mean() < 0.01
+
+
 def test_attribute_points_latest_visible_update_wins() -> None:
     from oh_my_slam.mapping.geometry import attribute_points, fused_cloud_points
 

@@ -45,6 +45,14 @@ from oh_my_slam.mapping.objects import (
     label_map_for,
     load_vacated,
 )
+from oh_my_slam.reconstruction.consensus import (
+    Views,
+    free_space,
+    median_ratio,
+    neighbour_views,
+    sample_pixels,
+    spread_cells,
+)
 from oh_my_slam.reconstruction.depth import MAX_FACTOR
 from oh_my_slam.reconstruction.fusion import (
     TsdfFusion,
@@ -112,12 +120,15 @@ class FrameData:
     rgb: NDArray[np.uint8]
     labels: NDArray[np.int32]
     is_new: bool
+    # pixels left out of the fusion although valid: what several keyframes see through
+    # (``consensus_depths``); None: none
+    drop: NDArray[np.bool_] | None = None
 
     @cached_property
     def median_depth(self) -> float | None:
         """Median of its valid depth (None: none), once: ``depth`` and ``valid`` are not
-        modified after the fusion's setup (``correct_borders``, which drops this value), and
-        ``fusion_depth_max`` asks for it per part of the map."""
+        modified after the fusion's setup (``correct_borders`` and ``consensus_depths``, which
+        drop this value), and ``fusion_depth_max`` asks for it per part of the map."""
         d = self.depth[self.valid & (self.depth > 0)]
         return float(np.median(d)) if len(d) else None
 
@@ -279,6 +290,7 @@ class FusedCloud:
     depth_max: float = float("inf")  # the fusion's depth cut (``fusion_depth_max`` per keyframe)
     vacated: list[Vacated] = field(default_factory=list)  # places of removed objects (``_vacated``)
     retired: list[FrameData] = field(default_factory=list)  # every keyframe, fused or not
+    consensus: dict[str, Any] = field(default_factory=dict)  # ``_Setup.consensus``
 
 
 def _frame_data(ctx: Any, rec: store.FrameRecord, new_by_name: dict[str, Any]) -> FrameData:
@@ -344,6 +356,22 @@ def _central(u: NDArray[Any], v: NDArray[Any], w: int, h: int, band: float) -> N
                       & (v < (1 - band) * h))
 
 
+def _viewpoint_order(frames: list[FrameData], max_angle_deg: float = BORDER_MAX_ANGLE_DEG
+                     ) -> list[list[int]]:
+    """Per keyframe, the other keyframes whose optical axis lies within ``max_angle_deg`` of its
+    own, nearest by viewpoint first (centre distance over the scene's median depth, plus
+    1 - the cosine of the axes' angle)."""
+    C = np.array([fd.rec.T_map_cam.t for fd in frames])
+    F = np.array([fd.rec.T_map_cam.R[:, 2] for fd in frames])
+    cos = np.clip(F @ F.T, -1.0, 1.0)
+    meds = [m for m in (fd.median_depth for fd in frames) if m is not None]
+    scene = max(0.5, float(np.median(meds))) if meds else 1.0
+    dist = np.linalg.norm(C[:, None] - C[None], axis=2) / scene + (1.0 - cos)
+    near = cos > np.cos(np.radians(max_angle_deg))
+    return [[j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
+            for i in range(len(frames))]
+
+
 def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
                     step: int = BORDER_STEP) -> int:
     """Give each keyframe's border pixels (outer ``band`` of the image) the depth of the
@@ -355,13 +383,7 @@ def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
     keep their depth. Returns the number of corrected pixels."""
     if len(frames) < 2:
         return 0
-    C = np.array([fd.rec.T_map_cam.t for fd in frames])
-    F = np.array([fd.rec.T_map_cam.R[:, 2] for fd in frames])
-    cos = np.clip(F @ F.T, -1.0, 1.0)
-    meds = [m for m in (fd.median_depth for fd in frames) if m is not None]
-    scene = max(0.5, float(np.median(meds))) if meds else 1.0
-    dist = np.linalg.norm(C[:, None] - C[None], axis=2) / scene + (1.0 - cos)
-    near = cos > np.cos(np.radians(BORDER_MAX_ANGLE_DEG))
+    order = _viewpoint_order(frames)
     corrected = 0
     new_depths = []
     for i, fd in enumerate(frames):
@@ -371,7 +393,7 @@ def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
         z = d[vv, uu].astype(np.float64)
         ok = fd.valid[vv, uu] & (z > 0) & ~_central(uu + 0.5, vv + 0.5, w, h, band)
         # pixel indices as the TSDF reads them: u = fx x / z + cx
-        cand = [j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
+        cand = order[i]
         if not ok.any() or not cand:
             new_depths.append(d)
             continue
@@ -424,6 +446,93 @@ def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
     return corrected
 
 
+# Neighbouring keyframes still disagree by ~3 % in depth after the depth adjustment (p10-p90
+# 0.96-1.03 on the office's desk legs and monitors, outliers 7-10 %), and the TSDF (a 4 cm band)
+# keeps each placement beyond the band as a layer of its own: legs come out fat, doubled or
+# tripled, monitors as slabs with offset copies. Before fusion the keyframes are therefore made to
+# agree, as MVS depth fusion does (``reconstruction.consensus``): every CONSENSUS_STEP-th pixel
+# (its CONSENSUS_STEP x CONSENSUS_STEP cell) is projected into the keyframes whose optical axis
+# lies within CONSENSUS_MAX_ANGLE_DEG, up to CONSENSUS_NEIGHBOURS of them nearest by viewpoint.
+# Where one sees the same surface there (within CONSENSUS_SAME in log ratio), its depth along the
+# pixel's ray is collected, and the cell takes the median of these and its own. Where at least
+# CONSENSUS_FREE_MIN keyframes see beyond the pixel's point (by more than CONSENSUS_FREE: it lies
+# in their free space), more than CONSENSUS_FREE_SHARE of those that see through it or see it, the
+# cell is left out of the fusion (``FrameData.drop``). The nearest keyframes by viewpoint alone
+# (the sequence neighbours) agree with each other: the offset copies come from keyframes of other
+# passes 40-55° away (the office's monitors 9-15 % nearer from the start of the walk than from its
+# middle), so every keyframe in view counts.
+CONSENSUS_STEP = 2
+CONSENSUS_NEIGHBOURS = 96
+CONSENSUS_MAX_ANGLE_DEG = 60.0
+CONSENSUS_SAME = 0.03
+CONSENSUS_FREE = 0.03
+CONSENSUS_FREE_MIN = 2
+CONSENSUS_FREE_SHARE = 0.5
+CONSENSUS_BATCH = 16  # neighbours projected at a time (bounds the temporaries: 16 x samples)
+
+
+def _vouched(fd: FrameData) -> NDArray[np.bool_]:
+    """The pixels whose depth keyframe ``fd`` vouches for to the others: valid, edge-free
+    (``pixel_mask``), not left out (``drop``)."""
+    m = pixel_mask(fd.depth, fd.valid)
+    return m if fd.drop is None else m & ~fd.drop
+
+
+def consensus_depths(frames: list[FrameData], step: int = CONSENSUS_STEP,
+                     neighbours: int = CONSENSUS_NEIGHBOURS) -> tuple[int, int]:
+    """Give each keyframe's pixels the consensus depth of the keyframes that see them, and leave
+    out those that several keyframes see through (in place, in memory: the stored depth is
+    unchanged; see ``CONSENSUS_STEP``). A keyframe vouches for its valid, edge-free pixels that
+    are not left out (``_vouched``); every keyframe is judged against the others' depth as it was
+    before. A keyframe of an older update is not one that sees through a pixel: what it saw
+    through may have been placed there since (latest wins).
+    Returns (pixels whose depth changed, pixels left out)."""
+    if len(frames) < 2:
+        return 0, 0
+    order = _viewpoint_order(frames, CONSENSUS_MAX_ANGLE_DEG)
+    views = Views.of([fd.depth for fd in frames], _parallel(_vouched, frames))
+
+    def judge(i: int) -> tuple[NDArray[np.float32], NDArray[np.bool_]] | None:
+        fd = frames[i]
+        own = fd.valid & (fd.depth > 0)
+        nbs = order[i][:neighbours]
+        if not nbs:
+            return None
+        s = sample_pixels(fd.depth, own, fd.rec.K_grid, step)
+        n = len(s.z)
+        if not n:
+            return None
+        along = np.full((n, len(nbs)), np.nan)
+        support = np.zeros(n, np.int64)
+        through = np.zeros(n, np.int64)
+        for b0 in range(0, len(nbs), CONSENSUS_BATCH):
+            part = nbs[b0:b0 + CONSENSUS_BATCH]
+            # an older update's keyframe does not carve: what it saw through may stand there now
+            carves = np.array([frames[j].rec.update_id >= fd.rec.update_id for j in part])
+            kk, on, depth, thru = neighbour_views(
+                s, fd.rec.T_map_cam, views, part, [frames[j].rec.K_grid for j in part],
+                [frames[j].rec.T_map_cam for j in part], carves, CONSENSUS_SAME, CONSENSUS_FREE)
+            along[on, b0 + kk] = depth
+            support += np.bincount(on, minlength=n)
+            through += np.bincount(thru, minlength=n)
+        ratio = median_ratio(s.z, along)
+        drop = free_space(through, support, CONSENSUS_FREE_MIN, CONSENSUS_FREE_SHARE)
+        return spread_cells(fd.depth, own, s, ratio, drop, step, CONSENSUS_SAME)
+
+    results = _parallel(judge, range(len(frames)))
+    moved = dropped = 0
+    for fd, res in zip(frames, results, strict=True):
+        if res is None:
+            continue
+        depth, drop = res
+        moved += int(np.count_nonzero(depth != fd.depth))
+        dropped += int(np.count_nonzero(drop))
+        fd.depth = depth
+        fd.drop = drop if fd.drop is None else fd.drop | drop
+        fd.__dict__.pop("median_depth", None)  # of the consensus depth from now on
+    return moved, dropped
+
+
 def _map_depth_max(medians: list[Any]) -> tuple[float, float]:
     """(voxel, depth cut) of the map's fusion from its keyframes' median depths."""
     med = float(np.median(medians)) if medians else 2.0
@@ -458,12 +567,18 @@ class _Blocks:
     block: float  # block edge, metres
 
 
+def _fused_pixels(fd: FrameData, depth_max: float) -> NDArray[np.bool_]:
+    """The pixels keyframe ``fd`` fuses: valid and edge-free (``pixel_mask``), within its fused
+    depth (``fusion_depth_max``), not left out (``drop``)."""
+    m = pixel_mask(fd.depth, fd.valid) & (fd.depth < fusion_depth_max(fd, depth_max))
+    return m if fd.drop is None else m & ~fd.drop
+
+
 def _frame_blocks(frames: list[FrameData], voxel: float, depth_max: float,
                   region: tuple[NDArray[Any], NDArray[Any]] | None = None) -> _Blocks:
     """The pixels and voxel blocks each keyframe fuses; with ``region``, blocks only of the
     keyframes whose frustum may reach the box (the others count among the fused keyframes)."""
-    fused = [pixel_mask(fd.depth, fd.valid) & (fd.depth < fusion_depth_max(fd, depth_max))
-             for fd in frames]
+    fused = [_fused_pixels(fd, depth_max) for fd in frames]
     order = sorted(range(len(frames)), key=lambda i: frames[i].rec.order_key)
     probe = TsdfFusion(voxel, depth_max, block_count=1, trunc_voxels=CLOUD_TRUNC_VOXELS)
     bs = probe.block_size
@@ -1135,20 +1250,28 @@ class _Setup:
     voxel: float
     depth_max: float
     vacated: list[Vacated]
+    # ``consensus_depths``: share of the fused keyframes' valid pixels left out, seconds
+    consensus: dict[str, Any] = field(default_factory=dict)
 
 
 def _setup(ctx: Any, records: list[store.FrameRecord]) -> _Setup:
     """The keyframes (as stored or staged), the fusion's voxel and depth cut from their median
     depth, and the places of removed objects. The fused (confident) keyframes' image borders
-    take the depth of the keyframes that see the surface centrally (``correct_borders``)."""
+    take the depth of the keyframes that see the surface centrally (``correct_borders``), then
+    every pixel the consensus of the keyframes that see it (``consensus_depths``)."""
     new_by_name = {nf.kf.name: nf for nf in ctx.new if nf.record is not None}
     frames = [_frame_data(ctx, r, new_by_name) for r in sorted(records, key=lambda r: r.order_key)]
     voxel, depth_max = _map_depth_max([fd.median_depth for fd in frames
                                        if fd.median_depth is not None])
     confident = [fd for fd in frames if not fd.rec.low_confidence]
     correct_borders(confident)
+    t0 = time.perf_counter()
+    _, dropped = consensus_depths(confident)
+    valid = sum(int(np.count_nonzero(fd.valid)) for fd in confident)
+    consensus = {"dropped_share": round(dropped / max(valid, 1), 4),
+                 "seconds": round(time.perf_counter() - t0, 2)}
     return _Setup(frames, confident, max(0.005, voxel / 2), depth_max,
-                  load_vacated(ctx.tx.current))
+                  load_vacated(ctx.tx.current), consensus)
 
 
 class SurfaceQuery:
@@ -1196,7 +1319,7 @@ def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:
         focal = float(np.median([fd.rec.K_grid.fx / fusion_step(fd.depth.shape)
                                  for fd in confident])) if confident else 0.0
     return FusedCloud(confident, xyz, st.voxel, time.perf_counter() - t0, focal, st.depth_max,
-                      st.vacated, st.frames)
+                      st.vacated, st.frames, st.consensus)
 
 
 def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState,
@@ -1223,6 +1346,6 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
     progress(f"cloud: {len(cloud)} points (voxel {fused.voxel * 100:.1f} cm) in "
              f"{fused.seconds + time.perf_counter() - t0:.0f} s")
     stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "focal_px": round(fused.focal, 2),
-             "support_objects": supported}
+             "support_objects": supported, "consensus": fused.consensus}
     ctx.notes["geometry"] = stats
     return MapGeometry(cloud, new_cloud, stats, nearest_detections(objs, fused.frames))
