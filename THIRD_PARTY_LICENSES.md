@@ -1,6 +1,6 @@
 # Third-party components and licences
 
-oh-my-slam is for personal and research use (`high_level_spec.md` §4). Copyleft components
+oh-my-slam is for personal and research use (`specs/high_level_spec.md` §4). Copyleft components
 (AGPL-3.0, GPL, LGPL, MPL) and non-commercial or research-only licences are therefore acceptable
 here. Anyone using the project commercially, or offering it as a network service, would have to
 re-check every row below. These matter most:

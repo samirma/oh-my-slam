@@ -1,6 +1,6 @@
 """The contracts every command must keep: stdout purity, OpenLABEL validity and the colour
-contract (high_level_spec.md §2.4, §3, §4). Each checker returns a list of problems (empty = kept);
-:class:`ContractLog` counts them per contract and entry point."""
+contract (specs/segment.md §2.4, specs/high_level_spec.md §3, §4). Each checker returns a list
+of problems (empty = kept); :class:`ContractLog` counts them per contract and entry point."""
 
 from __future__ import annotations
 

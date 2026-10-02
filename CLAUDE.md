@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-Implementation of `high_level_spec.md` (devtask `~/.dev-workflow/oh-my-slam.md` is the plan and
-the record of decisions). Package `src/oh_my_slam` (uv, Python 3.12); see `README.md`.
+Implementation of `specs/high_level_spec.md` and its one file per entry point in `specs/`
+(devtask `~/.dev-workflow/oh-my-slam.md` is the plan and the record of decisions). Package `src/oh_my_slam` (uv, Python 3.12); see `README.md`.
 
 Commands:
 

@@ -1,4 +1,4 @@
-"""Benchmark evaluator of every entry point on ``examples/`` (high_level_spec.md §5).
+"""Benchmark evaluator of every entry point on ``examples/`` (specs/high_level_spec.md §5).
 
     uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--set-baseline] [--baseline PATH]
                                                [--targets PATH]

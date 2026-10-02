@@ -3,7 +3,7 @@
 Monocular RGB mapping on an Apple-silicon Mac. It reconstructs a single image as a metric point
 cloud, builds and updates persistent maps from photos or video, and describes the scene as
 labelled objects with oriented bounding boxes (OBBs) in ASAM OpenLABEL 1.0.0. Input is RGB only:
-depth, intrinsics and gravity come from models. `high_level_spec.md` holds the requirements;
+depth, intrinsics and gravity come from models. `specs/` holds the requirements;
 this file records the implementation decisions (defaults, conventions, exit codes, the
 OpenLABEL mapping and the colour palette).
 

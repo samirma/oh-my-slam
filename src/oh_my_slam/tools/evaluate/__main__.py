@@ -24,9 +24,10 @@ DATA = Path.home() / "oh-my-slam-data" / "evaluations"
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog="python -m oh_my_slam.tools.evaluate",
-        description="Benchmark every entry point on examples/ (high_level_spec.md §5). Needs the "
-                    "model weights; stops and restarts the inference server to time its cold "
-                    "start. Writes result.json and summary.md; exit 1 if any metric fails.")
+        description="Benchmark every entry point on examples/ (specs/high_level_spec.md §5). "
+                    "Needs the model weights; stops and restarts the inference server to time "
+                    "its cold start. Writes result.json and summary.md; exit 1 if any metric "
+                    "fails.")
     ap.add_argument("--out", type=Path, default=None,
                     help=f"result folder, outside the repository (default {DATA}/<UTC time>/)")
     ap.add_argument("--targets", type=Path, default=EXAMPLES / "targets.json",

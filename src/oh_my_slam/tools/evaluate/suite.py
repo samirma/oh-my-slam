@@ -1,5 +1,5 @@
-"""The evaluation plan (high_level_spec.md §5): every entry point on the files in ``examples/``,
-strictly one command at a time.
+"""The evaluation plan (specs/high_level_spec.md §5): every entry point on the files in
+``examples/``, strictly one command at a time.
 
 1. ``start_inference_server.sh``: stop, cold start, resident memory (the server's initial state is
    restored at the end).

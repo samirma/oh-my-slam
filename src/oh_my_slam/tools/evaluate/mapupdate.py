@@ -1,7 +1,7 @@
-"""Map update (high_level_spec.md §2.3 / §5): mapping ``examples/office_sequence/``, whose scene
-changes during the capture (a cup on the window sill is gone in the last images), must give a map
-that reflects the latest observation. What changed is data: a ``map_update`` file under
-``examples/ground_truth/`` (format: that folder's README.md).
+"""Map update (specs/mapper.md §2.3, specs/high_level_spec.md §5): mapping
+``examples/office_sequence/``, whose scene changes during the capture (a cup on the window sill is
+gone in the last images), must give a map that reflects the latest observation. What changed is
+data: a ``map_update`` file under ``examples/ground_truth/`` (format: that folder's README.md).
 
 Two maps are built. The first takes the whole sequence in one update (the spec's example: the
 map after the full sequence). The second is built the way a map is extended: an update with the
