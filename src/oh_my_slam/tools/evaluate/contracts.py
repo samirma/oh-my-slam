@@ -40,7 +40,6 @@ CONTRACTS: dict[str, tuple[str, ...]] = {
     "artifacts": ("segment",),
     "same_objects": ("image", "map"),
     "readonly": ("map",),
-    "console_errors": ("view",),
 }
 # Brightest channel of the dimmed background of segmented.png; every palette colour is brighter.
 _DIMMED_MAX = int(255 * DIM)

@@ -1,4 +1,4 @@
-"""Deterministic stand-in models (``--stub``) for lifecycle and protocol tests.
+"""Deterministic stand-in models for lifecycle and protocol tests (see ``stub_server``).
 
 They exercise the real server, worker thread, file hand-off and RLE paths without weights.
 ``OH_MY_SLAM_STUB_DELAY`` (seconds) slows every request down for queueing tests.
@@ -23,6 +23,7 @@ from oh_my_slam.client.protocol import (
 from oh_my_slam.core import rle
 from oh_my_slam.core.atomic import atomic_save_npy
 from oh_my_slam.core.images import load_rgb, upright_size
+from oh_my_slam.server.models import Registry
 
 
 def _delay() -> None:
@@ -32,7 +33,6 @@ def _delay() -> None:
 
 
 class _Base:
-    required = True
     precision = "fp32"
 
     def load(self, device: str) -> None:
@@ -126,3 +126,10 @@ class StubMultiview(_Base):
 
 def stub_adapters() -> list[Any]:
     return [StubGeometry(), StubGravity(), StubSegment(), StubMultiview()]
+
+
+def stub_registry() -> Registry:
+    reg = Registry()
+    for a in stub_adapters():
+        reg.add(a)
+    return reg

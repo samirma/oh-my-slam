@@ -1787,7 +1787,6 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             meta.setdefault("updates", []).append(record)
             with stage("export"):
                 scene_full = export.full_scene(tx.root, meta, records, objs.exported())
-                tx.write_json(store.SCENE_JSON, scene_full)
                 if fmt == "ply":
                     payload = export.ply_payload(geo, mode, records, objs, attrs)
                 else:

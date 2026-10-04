@@ -17,7 +17,7 @@ ROUTE_GRAVITY = "/v1/gravity"
 ROUTE_SEGMENT = "/v1/segment"
 ROUTE_MULTIVIEW = "/v1/multiview"
 
-ServerStatus = Literal["loading", "ready", "degraded", "error", "stopping"]
+ServerStatus = Literal["loading", "ready", "error", "stopping"]
 
 # Long side at which the server reads a request's image (``core.images.load_rgb``): the request's
 # ``max_side`` for geometry and detection, these for gravity and multi-view (the server's model

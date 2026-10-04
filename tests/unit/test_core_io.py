@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import os
 from pathlib import Path
 
@@ -268,26 +267,8 @@ def test_image_errors_and_types(tmp_path: Path) -> None:
         images.load_rgb(bad)
     ok = tmp_path / "x.png"
     ok.write_bytes(images.png_bytes(np.zeros((4, 4, 3), np.uint8)))
-    assert images.is_image_file(ok)
-    hidden = tmp_path / ".DS_Store"
-    hidden.write_bytes(b"")
-    assert not images.is_image_file(hidden)
-    assert not images.is_image_file(tmp_path / "x.txt")
     images.save_jpeg(np.zeros((4, 4, 3), np.uint8), tmp_path / "y.jpg")
     assert images.load_rgb(tmp_path / "y.jpg").shape == (4, 4, 3)
     png = images.png_bytes(np.full((2, 2, 3), 7, np.uint8))
     assert b"iCCP" not in png and b"gAMA" not in png and b"sRGB" not in png
     assert images.load_png(ok).shape == (4, 4, 3)
-
-
-def test_heic_roundtrip(tmp_path: Path) -> None:
-    pillow_heif = pytest.importorskip("pillow_heif")
-    pillow_heif.register_heif_opener()
-    p = tmp_path / "x.heic"
-    buf = io.BytesIO()
-    try:
-        Image.new("RGB", (32, 16), (200, 100, 50)).save(buf, format="HEIF")
-    except Exception as exc:  # encoder may be unavailable
-        pytest.skip(f"HEIF encoder unavailable: {exc}")
-    p.write_bytes(buf.getvalue())
-    assert images.load_rgb(p).shape == (16, 32, 3)

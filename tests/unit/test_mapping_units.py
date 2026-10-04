@@ -186,17 +186,15 @@ def test_frame_record_roundtrip() -> None:
 # --- ingest -------------------------------------------------------------------------------------
 
 
-def test_resolve_inputs_folders_files_video(tmp_path: Path) -> None:
+def test_resolve_inputs_images_in_order_or_one_video(tmp_path: Path) -> None:
+    """Spec §2.3: ``-i`` is image(s) or a video; images keep the order given, folders are refused."""
     d = tmp_path / "caps"
     d.mkdir()
     for name in ("b.jpg", "a.jpg", "c.png"):
         Image.new("RGB", (8, 8)).save(d / name)
-    (d / ".DS_Store").write_bytes(b"x")
     (d / "notes.txt").write_text("x")
-    spec = ingest.resolve_inputs([d])
-    assert [p.name for p in spec.images] == ["a.jpg", "b.jpg", "c.png"]
-    spec2 = ingest.resolve_inputs([d / "b.jpg", d])
-    assert spec2.images[0].name == "b.jpg" and len(spec2.images) == 4
+    spec = ingest.resolve_inputs([d / "b.jpg", d / "a.jpg", d / "c.png"])
+    assert spec.kind == "images" and [p.name for p in spec.images] == ["b.jpg", "a.jpg", "c.png"]
     vid = tmp_path / "v.mp4"
     vid.write_bytes(b"x")
     assert ingest.resolve_inputs([vid]).kind == "video"
@@ -208,10 +206,8 @@ def test_resolve_inputs_folders_files_video(tmp_path: Path) -> None:
         ingest.resolve_inputs([tmp_path / "missing"])
     with pytest.raises(InputError):
         ingest.resolve_inputs([d / "notes.txt"])
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    with pytest.raises(InputError):
-        ingest.resolve_inputs([empty])
+    with pytest.raises(InputError, match="is a folder"):
+        ingest.resolve_inputs([d])
 
 
 def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
@@ -222,7 +218,8 @@ def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
     exif[0x0112] = 6  # rotated: must be re-encoded upright
     img.save(d / "r.jpg", exif=exif)
     Image.new("RGB", (40, 30)).save(d / "s.jpg")
-    kfs = list(ingest.keyframes(ingest.resolve_inputs([d]), 2.0, tmp_path / "frames", 5))
+    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "r.jpg", d / "s.jpg"]), 2.0,
+                                tmp_path / "frames", 5))
     assert [k.name for k in kfs] == ["f000005", "f000006"]
     assert Image.open(kfs[0].path).size == (30, 40)
     from tests.unit.test_video import _make_clip
@@ -455,6 +452,47 @@ def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyP
     assert (calls[1]["mode"], calls[1]["fmt"], calls[1]["fps"]) == ("full", "json", 2.0)
     assert cli_mapper.main(base + ["-t", "single"]) == 0
     assert calls[2]["mode"] == "single"
+
+
+def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Spec §2.3: ``-fps`` is ignored for images, so any value (0, negative) only warns; for a
+    video a non-positive value is a usage error. Through the shell with the server down, images
+    with ``-fps 0`` reach the server check (exit 3, not 2) after the warning."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.cli import mapper as cli_mapper
+    from oh_my_slam.core import timing
+    from oh_my_slam.core.log import PayloadWriter
+    from oh_my_slam.mapping import api
+
+    calls: list[dict] = []
+    warnings: list[str] = []
+    monkeypatch.setattr(api, "update", lambda *a, **k: calls.append(k) or SimpleNamespace(
+        payload=b"{}\n", timings=timing.Timings().to_dict()))
+    monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
+        path=tmp_path / "out.json"))
+    monkeypatch.setattr(cli_mapper.log, "warning", lambda msg, *a: warnings.append(msg % a))
+    for fps in ("0", "-1", "3"):
+        assert cli_mapper.main(["update", "-i", "a.jpg", "b.jpg", "-m", str(tmp_path / "m"),
+                                "-fps", fps]) == 0
+        assert warnings.pop() == "-fps applies to video input only; ignored for images"
+    assert len(calls) == 3
+    from oh_my_slam.mapping.ingest import DEFAULT_FPS
+
+    assert [c["fps"] for c in calls] == [DEFAULT_FPS] * 3  # ignored: the default is passed on
+    for fps in ("0", "-1"):
+        with pytest.raises(UsageError, match="-fps must be positive"):
+            cli_mapper.main(["update", "-i", "x.mp4", "-m", str(tmp_path / "m"), "-fps", fps])
+    assert len(calls) == 3 and warnings == []
+
+    img = tmp_path / "a.jpg"
+    Image.new("RGB", (32, 24)).save(img)
+    repo = Path(__file__).resolve().parents[2]
+    res = subprocess.run([str(repo / "mapper.sh"), "update", "-i", str(img), "-m",
+                          str(tmp_path / "m2"), "-fps", "0"], capture_output=True,
+                         env=os.environ.copy(), timeout=60)
+    assert res.returncode == 3 and res.stdout == b"", res.stderr
+    assert b"-fps applies to video input only; ignored for images" in res.stderr
 
 
 # --- map cloud: fused surface + latest-frame attribution ----------------------------------------

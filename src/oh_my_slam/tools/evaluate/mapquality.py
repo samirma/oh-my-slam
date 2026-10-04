@@ -1,6 +1,5 @@
-"""Map quality: point-cloud consistency across overlapping keyframes, duplicated objects, whether
-each object's points in the cloud lie in its box, and the stability of the objects when the same
-sequence is mapped in one update versus split across several.
+"""Map quality (spec §5): point-cloud consistency across overlapping keyframes, and the stability
+of the objects when the same sequence is mapped in one update versus split across several.
 
 Consistency method: keyframe ``i``'s stored depth is back-projected into keyframe ``j`` with the
 map's poses; where it lands on a valid pixel of ``j`` that shows the same surface (relative
@@ -16,30 +15,6 @@ surface (frames merged without agreeing) show up here. Two groups of pairs:
   Reported: the median and the p90 over the pairs of each pair's median disagreement, the share
   of pairs whose median disagreement exceeds ``GROSS_PCT`` and the worst pair; the detail repeats
   them for the neighbours (at most ``FAR_GAP`` keyframes apart) and the far pairs (more).
-
-Duplicates method (``near_duplicates``): pairs of exported objects that no keyframe observed
-together (their ``frame_intervals`` are disjoint: a keyframe that detected both saw two things),
-whose boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M`` of each other (``box_gap``) and whose
-labels are compatible — or are both horizontal-surface labels (desk, counter, bed, rug, …: the
-detector names pieces of one counter top differently) with box tops within
-``NEAR_DUPLICATE_GAP_M`` of each other (one surface at one height, not a rug under a table). An
-object mapped twice — typically by keyframes whose monocular depth disagrees, which places the
-copies along the same viewing rays at different depths — is such a pair.
-
-Out-of-box methods: an object's box and what the map shows as the object must coincide.
-
-* ``mask_out_of_box_share``: for each exported object, its detections' mask pixels in the
-  keyframes that detected it (``per_frame/*/instances.json``, merged ids resolved) are lifted with
-  those keyframes' stored depth and pose (valid pixels off depth edges); the share of them outside
-  its OBB grown by max(``MASK_MARGIN_M``, ``MASK_MARGIN_REL`` · their depth) — the depth noise — is
-  mask that bled onto other surfaces (a "carpet" mask over a counter and the floor beyond it) or
-  sightings that place the object elsewhere. The metric is the largest share over the objects.
-  It does not use the mapper's box fit or its cloud attribution, only what the detector saw.
-* ``cloud_out_of_box_share``: the share of each exported object's map-cloud points
-  (``cloud_objects.npy``, drawn in its colour by ``segments.ply`` and ``color=segment``) outside
-  the mapper's attribution gate (``mapping.geometry.attribution_margin``: its OBB grown by the
-  depth noise at its viewing distance): a check that the gate holds for every path that labels
-  cloud points (votes, the support fallback, later updates), 0 by construction when it does.
 
 Stability method: the split map is brought into the one-update map's frame by the rigid transform
 that best maps the camera poses of the captures registered in both (rotation average + mean
@@ -60,19 +35,17 @@ on cost ``(1 - IoU) + centre distance`` (metres); a pair is admissible when its 
 
 from __future__ import annotations
 
-import itertools
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment
 
 from oh_my_slam.core.geometry import project
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.frame import align_by_poses
 from oh_my_slam.mapping.store import FrameRecord, MapReader
-from oh_my_slam.segmentation.detect import compatible, surface_label
+from oh_my_slam.segmentation.detect import compatible
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import Capture, same_heading_pairs
@@ -92,18 +65,8 @@ PAIRS_MAX_ANGLE_DEG = 45.0
 FAR_GAP = 10  # pairs more than this many keyframes apart are "far" (loop closures) in the detail
 GROSS_PCT = 10.0  # a pair disagreeing by more than this is grossly inconsistent
 WORST_LISTED = 10
-MASK_OUT_OF_BOX_METRIC = "mask_out_of_box_share"
-CLOUD_OUT_OF_BOX_METRIC = "cloud_out_of_box_share"
-OUT_OF_BOX_METRICS = (MASK_OUT_OF_BOX_METRIC, CLOUD_OUT_OF_BOX_METRIC)
-MASK_MARGIN_M = 0.05
-MASK_MARGIN_REL = 0.05
 STABILITY_METRICS = ("matched_fraction", "label_agreement", "id_agreement",
                      "centre_delta_median_m", "extent_delta_median_rel", "obb_iou_median")
-DUPLICATE_METRIC = "near_duplicates"
-# A copy made by monocular depth lies along the same viewing rays as the original, offset by the
-# depth disagreement of the keyframes that saw each: the frame-agreement target allows a p90 of
-# 10 %, i.e. 0.3 m at 3 m, the distance of the farthest objects of the example sequence.
-NEAR_DUPLICATE_GAP_M = 0.3
 
 
 def pair_agreement(reader: MapReader, ri: FrameRecord, rj: FrameRecord
@@ -292,222 +255,3 @@ def stability_metrics(m: Metrics, prefix: str, single: list[DocObject], split: l
         m.add(ids[key], float(np.median([r[col] for r in rows])) if k else None,
               error=None if k else none)
     return rows
-
-
-# ------------------------------------------------------------------------------------------------
-# duplicated objects
-
-# ``OBB.corners`` lists corner k at the signs of bits (4, 2, 1) of k along the box x, y, z axes:
-# the 12 edges join the corners that differ in one bit
-_EDGES = [(i, j) for i in range(8) for j in range(i + 1, 8) if bin(i ^ j).count("1") == 1]
-
-
-def _point_box_distance(p: NDArray[Any], box: OBB) -> NDArray[np.float64]:
-    local = np.abs((np.asarray(p, np.float64) - box.center) @ box.R) - box.size / 2
-    return np.asarray(np.linalg.norm(np.maximum(local, 0.0), axis=1), np.float64)
-
-
-def _segment_distances(p0: NDArray[Any], p1: NDArray[Any], q0: NDArray[Any], q1: NDArray[Any]
-                       ) -> NDArray[np.float64]:
-    """Distance between segments ``p0[i]p1[i]`` and ``q0[j]q1[j]`` for every (i, j) (closest
-    points of two segments, Ericson, Real-Time Collision Detection 5.1.9)."""
-    d1 = (p1 - p0)[:, None, :]
-    d2 = (q1 - q0)[None, :, :]
-    r = p0[:, None, :] - q0[None, :, :]
-    a = np.maximum(np.sum(d1 * d1, axis=2), 1e-12)
-    e = np.maximum(np.sum(d2 * d2, axis=2), 1e-12)
-    f = np.sum(d2 * r, axis=2)
-    c = np.sum(d1 * r, axis=2)
-    b = np.sum(d1 * d2, axis=2)
-    denom = a * e - b * b
-    s = np.where(denom > 1e-12, np.clip((b * f - c * e) / np.maximum(denom, 1e-12), 0, 1), 0.0)
-    t = (b * s + f) / e
-    s = np.where(t < 0, np.clip(-c / a, 0, 1), np.where(t > 1, np.clip((b - c) / a, 0, 1), s))
-    t = np.clip(t, 0, 1)
-    diff = r + d1 * s[..., None] - d2 * t[..., None]
-    return np.asarray(np.linalg.norm(diff, axis=2), np.float64)
-
-
-def _boxes_overlap(a: OBB, b: OBB) -> bool:
-    """Separating-axis test of two oriented boxes (face normals and edge cross products)."""
-    axes = [a.R[:, i] for i in range(3)] + [b.R[:, i] for i in range(3)]
-    axes += [np.cross(a.R[:, i], b.R[:, j]) for i in range(3) for j in range(3)]
-    d = b.center - a.center
-    for ax in axes:
-        n = float(np.linalg.norm(ax))
-        if n < 1e-9:
-            continue
-        ax = ax / n
-        ra = float(np.sum(np.abs(a.R.T @ ax) * a.size / 2))
-        rb = float(np.sum(np.abs(b.R.T @ ax) * b.size / 2))
-        if abs(float(d @ ax)) > ra + rb + 1e-12:
-            return False
-    return True
-
-
-def box_gap(a: OBB, b: OBB) -> float:
-    """Smallest distance between two oriented boxes, 0 when they overlap. Two separate convex
-    polyhedra are closest at a vertex of one and the other (point-to-box distance) or at an edge
-    of each (segment-to-segment distance), so the minimum over those is exact."""
-    if _boxes_overlap(a, b):
-        return 0.0
-    ca, cb = a.corners(), b.corners()
-    ia, ja = np.array(_EDGES).T
-    return float(min(_point_box_distance(ca, b).min(), _point_box_distance(cb, a).min(),
-                     _segment_distances(ca[ia], ca[ja], cb[ia], cb[ja]).min()))
-
-
-def duplicate_candidates(a: DocObject, ba: OBB, b: DocObject, bb: OBB) -> bool:
-    """Labels that may name one object: compatible, or both horizontal-surface labels with box
-    tops (the surface height) within ``NEAR_DUPLICATE_GAP_M``."""
-    if compatible(a.label, b.label):
-        return True
-    if not (surface_label(a.label) and surface_label(b.label)):
-        return False
-    top_a = float(ba.corners()[:, 2].max())
-    top_b = float(bb.corners()[:, 2].max())
-    return abs(top_a - top_b) <= NEAR_DUPLICATE_GAP_M
-
-
-def near_duplicates(objs: list[DocObject]) -> list[dict[str, Any]]:
-    """Pairs of objects that may name one object (``duplicate_candidates``), that no keyframe
-    observed together and whose boxes overlap or lie within ``NEAR_DUPLICATE_GAP_M``
-    (``box_gap``), by ascending ids."""
-    boxes = [(o, box) for o in objs if (box := o.obb()) is not None]
-    out = []
-    for (a, ba), (b, bb) in itertools.combinations(boxes, 2):
-        if a.frames & b.frames or not duplicate_candidates(a, ba, b, bb):
-            continue
-        reach = float(np.linalg.norm(ba.size) + np.linalg.norm(bb.size)) / 2
-        if float(np.linalg.norm(ba.center - bb.center)) > reach + NEAR_DUPLICATE_GAP_M:
-            continue  # the boxes are further apart than the gap
-        gap = box_gap(ba, bb)
-        if gap <= NEAR_DUPLICATE_GAP_M:
-            out.append({"ids": [a.id, b.id], "labels": [a.label, b.label],
-                        "gap_m": round(gap, 3),
-                        "centre_distance_m": round(float(np.linalg.norm(ba.center - bb.center)),
-                                                   3)})
-    return out
-
-
-def duplicate_metrics(m: Metrics, prefix: str, objs: list[DocObject]) -> list[dict[str, Any]]:
-    """``<prefix>.near_duplicates``: the number of ``near_duplicates`` pairs of a map's objects;
-    returns the pairs for the report."""
-    rows = near_duplicates(objs)
-    m.add(f"{prefix}.{DUPLICATE_METRIC}", len(rows),
-          {"objects": len(objs), "gap_m": NEAR_DUPLICATE_GAP_M, "pairs": rows})
-    return rows
-
-
-# ------------------------------------------------------------------------------------------------
-# points outside the box
-
-
-def _share_row(o: DocObject, points: int, outside: int) -> dict[str, Any]:
-    return {"id": o.id, "label": o.label, "points": points,
-            "outside_share": round(outside / points, 4) if points else 0.0}
-
-
-def _merged_into(reader: MapReader) -> dict[int, int]:
-    if not reader.exists("objects.json"):
-        return {}
-    return {int(k): int(v) for k, v in
-            reader.read_json("objects.json").get("merged_into", {}).items()}
-
-
-def _resolve(merged: dict[int, int], oid: int) -> int:
-    seen: set[int] = set()
-    while oid in merged and oid not in seen:
-        seen.add(oid)
-        oid = merged[oid]
-    return oid
-
-
-def mask_out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
-    """Per exported object with detections: its lifted mask pixels and the share outside its
-    OBB grown by max(``MASK_MARGIN_M``, ``MASK_MARGIN_REL`` · depth), worst first."""
-    from oh_my_slam.core import rle
-    from oh_my_slam.core.geometry import depth_edge_mask
-
-    reader = MapReader(map_dir)
-    merged = _merged_into(reader)
-    boxes = {o.id: (o, box) for o in objs if (box := o.obb()) is not None}
-    total: dict[int, int] = {}
-    out: dict[int, int] = {}
-    for fr in reader.frames:
-        insts = [(_resolve(merged, int(i["object_id"])), i) for i in reader.instances(fr)]
-        insts = [(oid, i) for oid, i in insts if oid in boxes]
-        if not insts:
-            continue
-        d = reader.depth(fr)
-        ok = reader.valid(fr) & (d > 0)
-        ok &= ~depth_edge_mask(np.where(ok, d, 0.0))
-        K = fr.K_grid.K()
-        T = fr.T_map_cam
-        for oid, inst in insts:
-            mask = rle.decode(inst["mask"])
-            if mask.shape != d.shape:
-                continue
-            v, u = np.nonzero(mask & ok)
-            if not len(v):
-                continue
-            z = d[v, u].astype(np.float64)
-            pc = np.stack([(u - K[0, 2]) / K[0, 0] * z, (v - K[1, 2]) / K[1, 1] * z, z], 1)
-            box = boxes[oid][1]
-            local = np.abs((pc @ T.R.T + T.t - box.center) @ box.R) - box.size / 2
-            margin = np.maximum(MASK_MARGIN_M, MASK_MARGIN_REL * z)
-            total[oid] = total.get(oid, 0) + len(z)
-            out[oid] = out.get(oid, 0) + int(np.any(local > margin[:, None], axis=1).sum())
-    rows = [_share_row(boxes[k][0], total[k], out[k]) for k in total]
-    return sorted(rows, key=lambda r: (-r["outside_share"], r["id"]))
-
-
-def cloud_out_of_box_rows(map_dir: Path, objs: list[DocObject]) -> list[dict[str, Any]]:
-    """Per exported object with map-cloud points: their number and the share outside the
-    mapper's attribution gate for it, worst first."""
-    from oh_my_slam.mapping.export import map_cloud
-    from oh_my_slam.mapping.geometry import attribution_margin
-
-    reader = MapReader(map_dir)
-    cloud = map_cloud(reader)
-    stored = (reader.read_json("objects.json").get("objects", [])
-              if reader.exists("objects.json") else [])
-    depth = {int(o["id"]): float(o.get("obs_depth", 2.0)) for o in stored}
-    labels = np.asarray(cloud.label, np.int64).reshape(-1)
-    if not len(labels):
-        return []
-    xyz = np.asarray(cloud.xyz, np.float64)
-    order = np.argsort(labels, kind="stable")
-    ids, starts = np.unique(labels[order], return_index=True)
-    ends = np.r_[starts[1:], len(order)]
-    where = {int(i): order[s:e] for i, s, e in zip(ids, starts, ends, strict=True)}
-    rows = []
-    for o in objs:
-        box = o.obb()
-        idx = where.get(o.id)
-        if box is None or idx is None or not len(idx):
-            continue
-        margin = attribution_margin(depth.get(o.id, 2.0))
-        local = np.abs((xyz[idx] - box.center) @ box.R) - box.size / 2
-        rows.append(_share_row(o, len(idx), int(np.any(local > margin + 1e-4, axis=1).sum())))
-    return sorted(rows, key=lambda r: (-r["outside_share"], r["id"]))
-
-
-def out_of_box_metrics(m: Metrics, prefix: str, map_dir: Path, objs: list[DocObject]
-                       ) -> dict[str, list[dict[str, Any]]]:
-    """``<prefix>.mask_out_of_box_share`` and ``<prefix>.cloud_out_of_box_share`` (see the
-    module docstring): the largest share over the exported objects; returns the per-object rows
-    of each for the report."""
-    out: dict[str, list[dict[str, Any]]] = {}
-    for key, rows, margin in (
-            (MASK_OUT_OF_BOX_METRIC, mask_out_of_box_rows(map_dir, objs),
-             f"max({MASK_MARGIN_M:g} m, {MASK_MARGIN_REL:g} x depth)"),
-            (CLOUD_OUT_OF_BOX_METRIC, cloud_out_of_box_rows(map_dir, objs),
-             "the mapper's attribution gate")):
-        shares = [r["outside_share"] for r in rows]
-        m.add(f"{prefix}.{key}", max(shares, default=0.0),
-              {"objects": len(rows), "margin": margin,
-               "median": round(float(np.median(shares)), 4) if shares else None,
-               "worst": rows[:WORST_LISTED]})
-        out[key] = rows
-    return out

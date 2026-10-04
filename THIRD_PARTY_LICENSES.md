@@ -19,8 +19,9 @@ re-check every row below. These matter most:
 
 Every other component is installed by `uv sync`, by Homebrew, or on the first server start.
 
-**Sources.** Versions are those locked in `uv.lock`, or installed, on 2026-09-25. Licences were
-checked online on 2026-09-25 through:
+**Sources.** Versions are those locked in `uv.lock`, or installed, on 2026-10-04. Licences were
+checked online on 2026-09-25, and again on 2026-10-04 for the versions the regenerated lock
+changed, through:
 
 * PyPI JSON (`https://pypi.org/pypi/<pkg>/json`)
 * the Hugging Face model API
@@ -48,20 +49,18 @@ that could not be confirmed.
 | numpy | 2.5.3 | BSD-3-Clause (plus 0BSD, MIT, Zlib, CC0-1.0 for bundled parts) | |
 | scipy | 1.18.1 | BSD-3-Clause | |
 | pillow | 12.3.0 | MIT-CMU | |
-| pillow-heif | 1.8.0 | BSD-3-Clause source; **binary wheel GPL-2.0** | The wheel bundles libheif (LGPL-3.0), libde265 (LGPL-3.0) and x265 (GPL-2.0), per its `LICENSES_bundled.txt`. |
-| av (PyAV) | 18.1.0 | BSD-3-Clause | The macOS wheel bundles FFmpeg 8 with libx264 and libx265 (GPL-2.0-or-later), so the binary is effectively GPL. |
+| av (PyAV) | 19.0.1 | BSD-3-Clause | The macOS wheel bundles FFmpeg 8 with libx264 and libx265 (GPL-2.0-or-later), so the binary is effectively GPL. |
 | opencv-python-headless | 4.14.0.94 | Apache-2.0 (OpenCV) | Wheels ship FFmpeg under LGPL-2.1 (PyPI description). The macOS arm64 wheel also bundles libx264 and libx265 (GPL-2.0-or-later). |
 | jsonschema | 4.26.0 | MIT | |
 | psutil | 7.2.2 | BSD-3-Clause | |
 | open3d | 0.20.0 | MIT | TSDF fusion of the map cloud |
-| pycolmap | 4.2.0 | BSD-3-Clause | Mapping, triangulation, bundle adjustment; the wheel bundles only libomp |
-| fastapi | 0.141.1 | MIT | |
-| uvicorn | 0.53.0 | BSD-3-Clause | |
+| pycolmap | 4.2.1 | BSD-3-Clause | Mapping, triangulation, bundle adjustment; the wheel bundles only libomp |
+| fastapi | 0.142.2 | MIT | |
+| uvicorn | 0.54.0 | BSD-3-Clause | |
 | httpx | 0.28.1 | BSD-3-Clause | |
 | pydantic | 2.13.5 | MIT | |
-| torch | 2.14.0 | BSD-3-Clause (PyTorch). The PyPI expression also lists Apache-2.0, Apache-2.0 WITH LLVM-exception and BSD-2-Clause for bundled parts. | Server process only |
-| torchvision | 0.29.0 | BSD-3-Clause | |
-| transformers | 5.17.0 | Apache-2.0 | |
+| torch | 2.14.1 | BSD-3-Clause (PyTorch). The PyPI expression also lists Apache-2.0, Apache-2.0 WITH LLVM-exception and BSD-2-Clause for bundled parts. | Server process only |
+| torchvision | 0.29.1 | BSD-3-Clause | |
 | ultralytics | 8.4.159 | AGPL-3.0 | YOLOE runtime |
 | clip (`ultralytics/CLIP` @ a13192f) | 1.0 | AGPL-3.0 (`LICENSE` at the pinned commit) | A fork of OpenAI CLIP, which is MIT |
 | moge (`microsoft/MoGe` @ 925b8ed) | 2.0.0 | MIT; `moge/model/dinov2` is Apache-2.0 | The last pre-V3 commit, so MoGe-2 |
@@ -72,7 +71,7 @@ that could not be confirmed.
 
 ### Notable transitive dependencies
 
-Every PyPI package in `uv.lock` (164 of them) was checked on PyPI. Apart from the rows below,
+Every PyPI package in `uv.lock` (161 of them) was checked on PyPI. Apart from the rows below,
 each one reports a permissive licence (MIT, BSD, Apache-2.0, ISC, PSF or similar). The one
 exception is `mypy-extensions` (a mypy dependency), whose PyPI entry reports no licence. These
 rows are listed because they are copyleft or otherwise notable:
@@ -80,13 +79,14 @@ rows are listed because they are copyleft or otherwise notable:
 | Package | Version | Licence | Pulled in by |
 |---|---|---|---|
 | plyfile | 1.1.5 | GPL-3.0-or-later | MapAnything |
-| ultralytics-thop | 2.1.6 | AGPL-3.0 | ultralytics |
-| ultralytics-platform | 0.1.54 | AGPL-3.0-only | ultralytics |
+| pillow-heif | 1.8.0 | BSD-3-Clause source; **binary wheel GPL-2.0** (it bundles libheif and libde265, LGPL-3.0, and x265, GPL-2.0, per its `LICENSES_bundled.txt`) | MapAnything (oh-my-slam itself reads no HEIC/HEIF) |
+| ultralytics-thop | 2.2.2 | AGPL-3.0 | ultralytics |
+| ultralytics-platform | 0.1.79 | AGPL-3.0-only | ultralytics |
 | certifi | 2026.7.22 | MPL-2.0 | httpx, requests |
-| tqdm | 4.70.1 | MPL-2.0 AND MIT | transformers, huggingface-hub, clip, MapAnything |
+| tqdm | 4.70.1 | MPL-2.0 AND MIT | huggingface-hub, clip, MapAnything |
 | orjson | 3.12.0 | MPL-2.0 AND (Apache-2.0 OR MIT) | MapAnything |
 | pathspec | 1.1.1 | MPL-2.0 | mypy (dev) |
-| trimesh | 5.1.0 | MIT | MoGe, MapAnything (no longer a direct dependency) |
+| trimesh | 5.1.1 | MIT | MoGe, MapAnything (no longer a direct dependency) |
 | uniception | 0.1.7 | BSD-3-Clause | MapAnything |
 
 ## External tools (not in `.venv`)
@@ -102,7 +102,7 @@ rows are listed because they are copyleft or otherwise notable:
 
 | Component | Version | Licence |
 |---|---|---|
-| three.js: `three.module.js`, `three.core.js` and the addons `OrbitControls`, `CSS2DRenderer`, `LineSegments2`, `LineMaterial`, `LineSegmentsGeometry` | 0.186.0 (r186), from the npm tarball recorded in `VERSIONS.txt` | MIT (`vendor/three/LICENSE`) |
+| three.js: `three.module.js`, `three.core.js` and the addons `OrbitControls`, `LineSegments2`, `LineMaterial`, `LineSegmentsGeometry` | 0.186.0 (r186), from the npm tarball recorded in `VERSIONS.txt` | MIT (`vendor/three/LICENSE`) |
 
 ## Data, specifications and design assets
 
@@ -120,9 +120,9 @@ rows are listed because they are copyleft or otherwise notable:
 | pytest | 9.1.1 | MIT |
 | pytest-timeout | 2.4.0 | MIT |
 | pytest-cov | 7.1.0 | MIT |
-| coverage | 7.16.1 | Apache-2.0 |
-| ruff | 0.16.8 | MIT |
-| mypy | 2.3.1 | MIT |
+| coverage | 7.16.2 | Apache-2.0 |
+| ruff | 0.16.10 | MIT |
+| mypy | 2.4.0 | MIT |
 | import-linter | 2.15 | BSD-2-Clause |
 | playwright | 1.63.0 | Apache-2.0 |
 | hatchling (build backend, `>=1.25`, not locked) | — | MIT |

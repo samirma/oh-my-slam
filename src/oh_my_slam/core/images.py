@@ -1,4 +1,4 @@
-"""Image loading (EXIF orientation, HEIC) and EXIF-derived intrinsics."""
+"""Image loading (EXIF orientation) and EXIF-derived intrinsics."""
 
 from __future__ import annotations
 
@@ -13,38 +13,17 @@ from PIL import ExifTags, Image, ImageOps
 from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.types import Intrinsics
 
-IMAGE_SUFFIXES = frozenset(
-    {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".heic", ".heif"}
-)
+IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
 # Diagonal of a 36 x 24 mm full-frame sensor.
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)
-
-_heif_registered = False
-
-
-def _register_heif() -> None:
-    global _heif_registered
-    if not _heif_registered:
-        import pillow_heif
-
-        pillow_heif.register_heif_opener()
-        _heif_registered = True
-
-
-def is_image_file(path: Path) -> bool:
-    p = Path(path)
-    return p.is_file() and not p.name.startswith(".") and p.suffix.lower() in IMAGE_SUFFIXES
-
 
 def open_image(path: Path) -> Image.Image:
     """Open an image with EXIF orientation applied (not yet converted to RGB)."""
     path = Path(path)
     if not path.is_file():
         raise InputError(f"image not found: {path}")
-    if path.suffix.lower() in {".heic", ".heif"}:
-        _register_heif()
     try:
         img = Image.open(path)
         img.load()
@@ -79,8 +58,6 @@ def resize_to_max_side(img: Image.Image, max_side: int) -> Image.Image:
 def upright_size(path: Path) -> tuple[int, int]:
     """(width, height) after EXIF orientation, without decoding pixels where possible."""
     path = Path(path)
-    if path.suffix.lower() in {".heic", ".heif"}:
-        _register_heif()
     with Image.open(path) as img:
         w, h = img.size
         orientation = img.getexif().get(ExifTags.Base.Orientation, 1)
@@ -115,8 +92,6 @@ def exif_focal_px(path: Path) -> float | None:
     ``f_px = f35 * diag_px / 43.27``; else FocalLength with FocalPlaneXResolution.
     """
     path = Path(path)
-    if path.suffix.lower() in {".heic", ".heif"}:
-        _register_heif()
     with Image.open(path) as img:
         tags = _exif_dict(img)
         raw_w, raw_h = img.size

@@ -18,49 +18,28 @@
   <div id="app">
     <main id="viewport">
       <div id="canvas-host"></div>
-      <div id="topbar">
-        <div id="info">
-          <span id="title">oh-my-slam</span>
-          <span id="stats" data-testid="stats">loading…</span>
-          <span id="busy" class="pill" role="status" aria-live="polite" hidden><span class="spinner-sm"></span>Updating point cloud…</span>
-        </div>
-        <div id="actions">
-          <button id="reset-view" type="button" title="Reset view (R)">Reset view</button>
-          <button id="toggle-panel" type="button" title="Show/hide the side panel" aria-controls="panel" aria-expanded="true">☰</button>
-        </div>
-      </div>
-      <div id="tooltip" role="tooltip" hidden></div>
-      <div id="help">Drag to orbit · right-drag / two-finger to pan · wheel to zoom · click a box or tag to select · R resets the view</div>
     </main>
     <aside id="panel" aria-label="Controls">
       <nav id="tabs" role="tablist">
         <button type="button" role="tab" data-tab="controls" class="active" aria-selected="true">Controls</button>
-        <button type="button" role="tab" data-tab="catalogue" aria-selected="false">Catalogue <span id="obj-count" class="badge"></span></button>
-        <button type="button" role="tab" data-tab="cameras" aria-selected="false">Cameras <span id="cam-count" class="badge"></span></button>
+        <button type="button" role="tab" data-tab="catalogue" id="tab-catalogue-btn" aria-selected="false" hidden>Catalogue</button>
+        <button type="button" role="tab" data-tab="cameras" aria-selected="false">Cameras</button>
         <button type="button" role="tab" data-tab="image" id="tab-image-btn" aria-selected="false" hidden>Image</button>
       </nav>
       <section id="tab-controls" class="tab active" role="tabpanel">
-        <details class="group" id="group-layers" open>
-          <summary>Layers</summary>
+        <div class="group" id="group-layers">
+          <h2>Layers</h2>
           <div class="rows" id="layers"></div>
-        </details>
-        <details class="group" id="group-cloud" open>
-          <summary>Point cloud <span class="spinner-sm" id="cloud-busy" hidden></span></summary>
+          <p id="labels-note" class="hint" role="status" hidden></p>
+        </div>
+        <div class="group" id="group-cloud">
+          <h2>Point cloud</h2>
           <div class="rows" id="cloud-controls"></div>
           <div id="cloud-error" class="error" role="alert" hidden></div>
-          <div id="cloud-status" class="status" data-testid="cloud-status"></div>
-          <div class="cli-row">
-            <code id="cloud-cli" title="The same attributes on the command line (-p)"></code>
-            <button id="cloud-defaults" type="button" title="Reset every point-cloud attribute to its default">Defaults</button>
-          </div>
-        </details>
-        <details class="group" id="group-display" open>
-          <summary>Display</summary>
-          <div class="rows" id="display"></div>
-        </details>
+          <p id="cloud-note" class="hint" hidden></p>
+        </div>
       </section>
       <section id="tab-catalogue" class="tab" role="tabpanel">
-        <input id="filter" type="search" placeholder="Filter by label…" aria-label="Filter catalogue">
         <div class="table-wrap">
           <table id="catalogue" data-testid="catalogue">
             <thead><tr><th class="c-sw"></th><th class="c-id num">id</th><th class="c-label">label</th><th class="c-score num">score</th><th class="c-dims num" title="width × depth × height">W×D×H m</th><th class="c-vol num">m³</th></tr></thead>
@@ -69,11 +48,6 @@
         </div>
       </section>
       <section id="tab-cameras" class="tab" role="tabpanel">
-        <div class="cam-head">
-          <input id="cam-filter" type="search" placeholder="Filter by name…" aria-label="Filter cameras">
-          <button id="cam-prev" type="button" title="Go to the previous camera ([)" aria-label="Previous camera">◀</button>
-          <button id="cam-next" type="button" title="Go to the next camera (])" aria-label="Next camera">▶</button>
-        </div>
         <p class="hint" id="cam-note"></p>
         <div class="table-wrap">
           <table id="cameras" data-testid="cameras">
@@ -83,23 +57,14 @@
         </div>
       </section>
       <section id="tab-image" class="tab" role="tabpanel">
-        <button id="segmented-open" type="button" title="Enlarge the segmented image" aria-label="Enlarge the segmented image">
-          <img id="segmented" alt="Segmented image">
-          <span class="zoom-hint">⤢ Enlarge</span>
-        </button>
-        <p class="hint">Each instance mask painted opaque in its object's colour over the dimmed photo. Click to enlarge; in the enlarged view, click to switch between fit and actual pixels.</p>
+        <img id="segmented" alt="Segmented image">
       </section>
     </aside>
-  </div>
-  <div id="lightbox" role="dialog" aria-modal="true" aria-label="Segmented image" hidden>
-    <img alt="Segmented image, enlarged">
-    <button id="lightbox-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
   </div>
   <div id="loading" role="status" aria-live="polite">
     <div class="box">
       <div class="spinner"></div>
       <div id="loading-title">Loading scene…</div>
-      <ul id="loading-list"></ul>
     </div>
   </div>
   <script type="module" src="/static/app.js"></script>

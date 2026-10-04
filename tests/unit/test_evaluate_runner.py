@@ -199,7 +199,7 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
             assert m.passed and m.detail["checked"] > 0, mid
             continue
         assert m.passed is False, mid
-        assert m.error or mid == "contract.exit_codes", mid
+        assert m.error, mid
     assert "boom" in (ev.metrics.items["perf.reconstruct_json.wall_s"].error or "")
     assert "boom" in (ev.metrics.items["perf.server.cold_start_s"].error or "")
     tags = [r.tag for r in ev.runner.records]
@@ -208,7 +208,7 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     assert sum(t.startswith("segment_frame_") for t in tags) == 79
     assert sum(t.startswith("mapper_split_") for t in tags) == 3
     failed = [r for r in ev.runner.records if not r.ok]
-    assert ev.metrics.items["contract.exit_codes"].value == len(failed) == len(tags) - 1
+    assert len(failed) == len(tags) - 1
     result = build_result(ev.metrics, ev.runner.records, ev.details, started="s", finished="f",
                           duration_s=1.0, env={}, targets=Path("t"), baseline={"status": "missing"})
     _, md = write_report(out, result)

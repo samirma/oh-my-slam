@@ -22,7 +22,6 @@ UP_SIGN = 1.0
 class GeoCalibGravity:
     key = "gravity"
     name = "GeoCalib pinhole"
-    required = True
 
     def __init__(self) -> None:
         self.model: Any = None

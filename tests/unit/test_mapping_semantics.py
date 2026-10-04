@@ -115,8 +115,6 @@ def known_pose_update(mdir: Path, shots: list[Shot], work: Path) -> Result:
         records, objs, geo = api.integrate(ctx, lambda m: None)
         meta.update(update_count=uid, next_frame_index=start + len(shots),
                     next_object_id=objs.next_id)
-        tx.write_json(store.SCENE_JSON, export.full_scene(tx.root, meta, records,
-                                                          objs.exported()))
         tx.commit(meta)
     return Result(objs, geo.cloud, records, [store.frame_name(start + k)
                                               for k in range(len(shots))])
@@ -388,7 +386,7 @@ def test_identity_colour_and_obb_refinement_across_updates(tmp_path: Path) -> No
     assert np.mean(list(iou3.values())) > np.mean(list(iou1.values())) + 0.05, (iou1, iou3)
     assert min(iou3.values()) > 0.6, iou3
     # the colour contract on the map cloud: each labelled point has its object's colour
-    doc = json.loads((mdir / store.SCENE_JSON).read_text())
+    doc = json.loads(export.scene_bytes(store.MapReader(mdir)))
     for oid, od in doc["openlabel"]["objects"].items():
         assert od["object_data"]["text"][0]["val"] == color_hex_for_id(int(oid))
 
@@ -583,7 +581,8 @@ def test_capture_timestamps_are_not_used(tmp_path: Path) -> None:
         exif.get_ifd(0x8769)[0x9003] = f"2026:01:0{3 - k} 12:00:00"  # DateTimeOriginal
         Image.new("RGB", (16, 12), (40 * k, 0, 0)).save(d / name, exif=exif)
         os.utime(d / name, (1_000_000 - k * 1000, 1_000_000 - k * 1000))  # mtimes reversed
-    kfs = list(ingest.keyframes(ingest.resolve_inputs([d]), 2.0, tmp_path / "frames", 0))
+    kfs = list(ingest.keyframes(ingest.resolve_inputs(sorted(d.iterdir())), 2.0,
+                                tmp_path / "frames", 0))
     assert [Path(k.source).name for k in kfs] == ["a.jpg", "b.jpg", "c.jpg"]
     assert [k.index for k in kfs] == [0, 1, 2]
     pattern = re.compile(r"DateTime|0x9003|0x0132|getmtime|st_mtime|st_ctime|st_birthtime")

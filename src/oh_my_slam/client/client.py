@@ -22,6 +22,7 @@ from oh_my_slam.core.errors import (
     InferenceError,
     InputError,
     ServerBusyError,
+    ServerModelsFailedError,
     ServerUnavailableError,
 )
 from oh_my_slam.core.images import upright_size
@@ -92,10 +93,12 @@ class InferenceClient:
                 announced = True
             time.sleep(1.0)
             h = self.health()
-        if h.status in ("ready", "degraded"):
+        if h.status == "ready":
             return h
-        failed = {k: m.error for k, m in h.models.items() if m.error}
-        raise ServerUnavailableError(f"server status '{h.status}' {failed or ''}".strip())
+        if h.status == "error":
+            failed = "; ".join(f"{m.name}: {m.error}" for m in h.models.values() if m.error)
+            raise ServerModelsFailedError(failed or "no detail", str(paths.server_log()))
+        raise ServerUnavailableError(f"server status '{h.status}'")
 
     # -- requests ----------------------------------------------------------------------------------
 

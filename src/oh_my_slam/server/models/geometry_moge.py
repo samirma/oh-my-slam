@@ -117,7 +117,6 @@ class _Forward:
 class MoGeGeometry:
     key = "geometry"
     name = "MoGe-2 ViT-L normal"
-    required = True
 
     def __init__(self) -> None:
         self.model: Any = None

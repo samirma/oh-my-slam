@@ -3,7 +3,7 @@
 Routes (GET/HEAD only; anything else is 405):
 
 * ``/`` — the page; ``/static/…`` — its scripts, styles and vendored libraries.
-* ``/api/meta`` — JSON: mode, title, stats, display transform, the cameras of the scene JSON (pose
+* ``/api/meta`` — JSON: mode, title, display transform, the cameras of the scene JSON (pose
   ``T``, centre ``position`` in the scene frame, intrinsics, image name), the point-cloud controls
   (from ``core.cloud_attrs``) and their defaults.
 * ``/api/scene`` — the OpenLABEL scene JSON; ``/api/catalog`` — the catalogue rows (JSON);
