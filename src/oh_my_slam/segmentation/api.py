@@ -34,7 +34,6 @@ from oh_my_slam.segmentation.colors import UNSEGMENTED as UNSEGMENTED
 from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
-    DETECTION_FLOOR,
     claim_order,
     detect,
     grounding,
@@ -214,8 +213,6 @@ def segment_frame(
     drops objects from the end: the objects kept at both thresholds have the same id, colour,
     mask, points and OBB. The pixels of a detection below ``min_score`` that a larger object
     would otherwise cover stay unsegmented (they are not that object's surface)."""
-    if not DETECTION_FLOOR <= min_score <= 1.0:
-        raise ValueError(f"min_score {min_score} is outside [{DETECTION_FLOOR}, 1]")
     if detections is None:
         lowest = request_floor(min_score)
         detections = detect(frame.image_path, min_score=lowest, floor=lowest,

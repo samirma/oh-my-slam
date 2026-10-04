@@ -16,6 +16,7 @@ from PIL import Image
 from oh_my_slam.core.atomic import preflight_dir, preflight_file
 from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.log import PayloadWriter
+from tests.fakes.stub_server import start_stub_server
 from tests.unit.test_view_cli import minimal_map, sh
 
 
@@ -35,8 +36,7 @@ def image(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture
 def stub_server() -> Iterator[None]:
-    res = sh("start_inference_server.sh", "--stub")
-    assert res.returncode == 0, res.stderr.decode()
+    start_stub_server()
     try:
         yield
     finally:

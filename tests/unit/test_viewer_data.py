@@ -124,7 +124,7 @@ def test_image_meta_controls_cameras_and_artefacts(image_view: Any) -> None:
     assert code == 200 and Image.open(io.BytesIO(png)).size == (320, 240)
     rows = json.loads(get(url + "api/catalog")[1])
     assert sorted(r["id"] for r in rows) == sorted(int(k) for k in scene["openlabel"]["objects"])
-    assert meta["stats"]["objects"] == len(rows) == 3
+    assert len(rows) == 3
 
 
 def test_image_colours_follow_the_contract(image_view: Any) -> None:
@@ -195,7 +195,7 @@ def test_map_meta_cameras_and_controls(map_view: Any) -> None:
     code, body = get(url + "api/cloud?stride=2")
     assert code == 400 and "pixel-level attribute" in json.loads(body)["error"]
     frames = MapReader(root).frames
-    assert len(meta["cameras"]) == len(frames) == meta["stats"]["frames"] > 0
+    assert len(meta["cameras"]) == len(frames) > 0
     for cam, fr in zip(meta["cameras"], sorted(frames, key=lambda f: f.index), strict=True):
         assert cam["name"] == fr.name and cam["source"] == Path(fr.source).name
         np.testing.assert_allclose(cam["T"], fr.T_map_cam.matrix(), atol=1e-5)

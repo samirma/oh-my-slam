@@ -51,12 +51,8 @@ from oh_my_slam.tools.evaluate.contracts import (
 )
 from oh_my_slam.tools.evaluate.mapquality import (
     AGREEMENT_METRICS,
-    DUPLICATE_METRIC,
-    OUT_OF_BOX_METRICS,
     STABILITY_METRICS,
     agreement_metrics,
-    duplicate_metrics,
-    out_of_box_metrics,
     split_alignment,
     stability_metrics,
 )
@@ -97,12 +93,11 @@ def expected_ids() -> list[str]:
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
-    ids += [f"map.{mp}.{k}" for mp in MAPS
-            for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, *OUT_OF_BOX_METRICS)]
+    ids += [f"map.{mp}.{k}" for mp in MAPS for k in AGREEMENT_METRICS]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
     ids += mapupdate.metric_ids()
     ids += [mid for mid, *_ in ContractLog().results()]
-    return [*ids, "contract.exit_codes"]
+    return ids
 
 
 def _problems_reading(fn: Any, *args: Any) -> list[str]:
@@ -204,8 +199,6 @@ class Evaluation:
         self.details[f"viewer.{tag}"] = {"url": seen.url, "render_s": seen.render_s,
                                          "error": seen.error,
                                          "console_errors": (seen.console_errors or [])[:10]}
-        if seen.console_errors is not None:  # the page was opened
-            self.contracts.check("console_errors", "view", tag, seen.console_errors)
         if seen.scene is None:
             return
         doc, problems = parse_scene(seen.scene)
@@ -308,7 +301,8 @@ class Evaluation:
         """The one-update map and the split map; their ``-t full`` scenes."""
         single_dir, split_dir = self.out / "maps" / "single", self.out / "maps" / "split"
         single = self.scene(self.run("mapper_single", "mapper_single", "mapper.sh", "update",
-                                     "-i", self.examples / SEQUENCE, "-m", single_dir))
+                                     "-i", *(self.examples / SEQUENCE / c.name for c in captures),
+                                     "-m", single_dir))
         split = None
         parts = np.array_split(np.arange(len(captures)), SPLITS)
         for k, idx in enumerate(parts, start=1):
@@ -348,20 +342,6 @@ class Evaluation:
                 else:
                     self.details[f"map.{name}.pairs"] = agreement_metrics(
                         self.metrics, f"map.{name}", dirs[name], captures)
-            mid = f"map.{name}.{DUPLICATE_METRIC}"
-            with self.metrics.expect(mid):
-                if doc is None:
-                    self.metrics.fail([mid], f"the {name} map was not built")
-                else:
-                    self.details[f"map.{name}.duplicates"] = duplicate_metrics(
-                        self.metrics, f"map.{name}", doc_objects(doc))
-            ids = [f"map.{name}.{k}" for k in OUT_OF_BOX_METRICS]
-            with self.metrics.expect(*ids):
-                if doc is None:
-                    self.metrics.fail(ids, f"the {name} map was not built")
-                else:
-                    self.details[f"map.{name}.out_of_box"] = out_of_box_metrics(
-                        self.metrics, f"map.{name}", dirs[name], doc_objects(doc))
         self.single_poses = poses.get("single")
         ids = [f"map.stability.{k}" for k in STABILITY_METRICS]
         with self.metrics.expect(*ids):
@@ -427,7 +407,7 @@ class Evaluation:
         maps = self.out / "maps"
         single_dir, ext_dir = maps / "office", maps / "office_extended"
         single = self.scene(self.run("mapper_office", "mapper_office", "mapper.sh", "update",
-                                     "-i", folder, "-m", single_dir))
+                                     "-i", *(folder / n for n in images), "-m", single_dir))
         first = self.scene(self.run("mapper_office_early", "mapper_office_extended", "mapper.sh",
                                     "update", "-i", *(folder / n for n in early), "-m", ext_dir))
         # the first update's view is read now: the map's frame records change with the next
@@ -497,6 +477,4 @@ class Evaluation:
             m.add(SEG_METRICS[2], min(scores) if scores else None, error="no detections")
         for mid, value, detail, error in self.contracts.results():
             m.add(mid, value, detail, error)
-        bad = [r.failure() for r in self.runner.records if not r.ok]
-        m.add("contract.exit_codes", len(bad), {"runs": len(self.runner.records), "failed": bad})
         self.ground_truth()

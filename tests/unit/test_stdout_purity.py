@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -17,6 +18,7 @@ import pytest
 from PIL import Image
 
 from oh_my_slam.core.ply import parse_ply
+from tests.fakes.stub_server import start_stub_server
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -36,8 +38,7 @@ def image(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def stub_server() -> Iterator[None]:
-    res = sh("start_inference_server.sh", "--stub")
-    assert res.returncode == 0, res.stderr.decode()
+    start_stub_server()
     yield
     sh("start_inference_server.sh", "--stop")
 
@@ -70,10 +71,13 @@ def test_down_server_fails_fast(image: Path, tmp_path: Path) -> None:
         ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
                        "-p", "voxel=0.05"]),
     ]:
-        t0 = time.monotonic()
-        res = sh(script, *args)
-        assert res.returncode == 3, (script, res.stderr)
-        assert time.monotonic() - t0 < 2.0
+        # the first run warms the interpreter and imports (a cold venv takes seconds); the
+        # second one is timed, so the deadline measures the fail-fast path, not start-up
+        for timed in (False, True):
+            t0 = time.monotonic()
+            res = sh(script, *args)
+            assert res.returncode == 3, (script, res.stderr)
+            assert not timed or time.monotonic() - t0 < 2.0
         assert res.stdout == b""
         assert b"./start_inference_server.sh" in res.stderr
     assert not (tmp_path / "x.json").exists() and not (tmp_path / "m").exists()
@@ -149,6 +153,32 @@ def test_output_file_leaves_stdout_empty(stub_server: None, image: Path, tmp_pat
         if script == "segment.sh" and "-d" in args:
             assert (tmp_path / "art" / "segmentation.json").read_bytes() == data
     assert not list((tmp_path / "results").glob(".*.tmp"))  # atomic writes leave no temp files
+
+
+@pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
+def test_mapper_update_stdout_on_a_multi_image_map(stub_server: None, tmp_path: Path) -> None:
+    """``mapper.sh update`` through the shell on several images (COLMAP features and matching,
+    the map's frames registered together): stdout is exactly one JSON document, then, extending
+    the map, exactly one PLY; with ``-o`` stdout stays empty. Progress and timings go to stderr."""
+    frames = sorted((REPO / "examples" / "ainex-captures").glob("*.jpg"))
+    first, second = frames[:4], frames[4:6]
+    mdir = tmp_path / "map"
+    res = sh("mapper.sh", "update", "-i", *map(str, first), "-m", str(mdir), timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    doc = assert_one_json(res.stdout)
+    assert len(doc["openlabel"]["frames"]) >= 2  # a multi-image map
+    assert b"timings: total" in res.stderr
+    res = sh("mapper.sh", "update", "-i", *map(str, second), "-m", str(mdir), "-f", "ply",
+             "-t", "single", timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    assert_one_ply(res.stdout)
+    target = tmp_path / "full.json"
+    res = sh("mapper.sh", "update", "-i", str(frames[6]), "-m", str(mdir), "-o", str(target),
+             timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    assert res.stdout == b""
+    assert len(assert_one_json(target.read_bytes())["openlabel"]["frames"]) >= len(
+        doc["openlabel"]["frames"])
 
 
 def test_timings_go_to_stderr_and_the_env_file_only(stub_server: None, image: Path,

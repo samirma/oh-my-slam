@@ -18,6 +18,7 @@ from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.api import update
+from oh_my_slam.mapping.export import scene_bytes
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.colors import color_hex_for_id, hex_to_rgb
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
@@ -96,12 +97,12 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     mdir = base / "map"
 
     # --- update A: create -----------------------------------------------------------------------
-    res = update(mdir, [base / "a"], mode="full", client=client, progress=quiet)
+    res = update(mdir, sorted((base / "a").glob("*.png")), mode="full", client=client, progress=quiet)
     doc_a = json.loads(res.payload)
     assert validation_errors(doc_a) == []
     assert len(res.new_frames) >= 13  # >= 90 % registered
     assert (mdir / "map.json").exists() and not (mdir / "mesh").exists()
-    for rel in ("frames.json", "cloud.ply", "cloud_objects.npy", "objects.json", "scene.json",
+    for rel in ("frames.json", "cloud.ply", "cloud_objects.npy", "objects.json",
                 "sfm/database.db", "sfm/model"):
         assert (mdir / rel).exists(), rel
     assert len(doc_a["openlabel"]["frames"]) == len(res.new_frames)
@@ -137,12 +138,12 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     ids_a = {label: by[label][0]["id"] for label in ("cabinet", "box", "sofa")}
 
     # --- update B: same room again, -t single -------------------------------------------------
-    res_b = update(mdir, [base / "b"], mode="single", client=client, progress=quiet)
+    res_b = update(mdir, sorted((base / "b").glob("*.png")), mode="single", client=client, progress=quiet)
     doc_b = json.loads(res_b.payload)
     assert validation_errors(doc_b) == []
     names_b = {fr["frame_properties"]["keyframe"] for fr in doc_b["openlabel"]["frames"].values()}
     assert names_b == set(res_b.new_frames)  # -t single lists exactly the new frames
-    full = json.loads((mdir / "scene.json").read_text())
+    full = json.loads(scene_bytes(store.MapReader(mdir)))
     by_b = objects_by_label(full)
     for label, oid in ids_a.items():
         assert [o["id"] for o in by_b[label]] == [oid]  # identity and colour kept
@@ -155,12 +156,12 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
 
     # --- update C: removed / moved / added (PLY payload with point-cloud attributes) ------------
     attrs = parse_cloud_attrs("color=segment,label=on,normals=on,voxel=0.03", CloudScope.MAP)
-    res_c = update(mdir, [base / "c"], mode="full", fmt="ply", attrs=attrs, client=client,
+    res_c = update(mdir, sorted((base / "c").glob("*.png")), mode="full", fmt="ply", attrs=attrs, client=client,
                    progress=quiet)
     cloud_c = parse_ply(res_c.payload)
     assert parse_header(res_c.payload).comments[-1] == \
         f"attributes {attrs.describe(CloudScope.MAP)}"
-    full_c = json.loads((mdir / "scene.json").read_text())
+    full_c = json.loads(scene_bytes(store.MapReader(mdir)))
     by_c = objects_by_label(full_c)
     # colour contract on the map cloud: every labelled point has its object's colour, the others
     # are grey, and only objects of the scene appear; normals are unit vectors
@@ -193,7 +194,7 @@ def test_folder_rules_and_errors(world, tmp_path: Path) -> None:  # type: ignore
     other.mkdir()
     (other / "file.txt").write_text("x")
     with pytest.raises(NotAMapError):
-        update(other, [world["base"] / "a"], client=client, progress=quiet)
+        update(other, sorted((world["base"] / "a").glob("*.png")), client=client, progress=quiet)
     assert sorted(p.name for p in other.iterdir()) == ["file.txt"]
     hidden_only = tmp_path / "hidden"
     hidden_only.mkdir()
@@ -203,7 +204,7 @@ def test_folder_rules_and_errors(world, tmp_path: Path) -> None:  # type: ignore
     locked = tmp_path / "locked"
     with store.MapTransaction(locked):
         with pytest.raises(MapLockedError):
-            update(locked, [world["base"] / "a"], client=client, progress=quiet)
+            update(locked, sorted((world["base"] / "a").glob("*.png")), client=client, progress=quiet)
 
 
 def test_non_overlapping_update_is_rejected(world, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -212,7 +213,7 @@ def test_non_overlapping_update_is_rejected(world, tmp_path: Path) -> None:  # t
 
     client = world["client"]
     mdir = tmp_path / "m"
-    update(mdir, [world["base"] / "a"], client=client, progress=quiet)
+    update(mdir, sorted((world["base"] / "a").glob("*.png")), client=client, progress=quiet)
     before = store.full_tree_hash(mdir)
     other_room = Room(size=(8.0, 7.0, 3.0), boxes=[], floor_color=(40, 90, 160),
                       wall_color=(90, 160, 60))

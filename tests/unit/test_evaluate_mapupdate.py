@@ -352,7 +352,8 @@ def test_the_plan_maps_the_sequence_whole_and_extended_then_judges(tmp_path: Pat
     log = (tmp_path / "mapper.log").read_text().splitlines()
     root = tmp_path / "examples" / "office_sequence"
     out = tmp_path / "out" / "maps"
-    assert log[0] == f"update -i {root} -m {out / 'office'}"  # one update, the folder as given
+    assert log[0] == (f"update -i {' '.join(str(root / n) for n in IMAGES)} "
+                      f"-m {out / 'office'}")  # one update, the sorted files
     assert log[1] == (f"update -i {' '.join(str(root / n) for n in IMAGES[:3])} "
                       f"-m {out / 'office_extended'}")  # the early images, then the rest
     assert log[2] == (f"update -i {' '.join(str(root / n) for n in IMAGES[3:])} "

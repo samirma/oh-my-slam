@@ -1,7 +1,7 @@
 """``mapper.sh update`` — build and update a persistent map; ``mapper.sh locate`` — the camera pose
 of images in an existing map, which it never modifies.
 
-    mapper.sh update -i <image(s)|folder(s)|video> -m <folder> [-f json|ply] [-o <file>]
+    mapper.sh update -i <image(s)|video> -m <folder> [-f json|ply] [-o <file>]
                      [-p <attrs>] [-t full|single] [-fps <n>]
 
 Creates the map if <folder> is missing or empty, extends it if it is a map, refuses any other
@@ -47,7 +47,7 @@ def build_parser() -> ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True, parser_class=ArgumentParser)
     up = sub.add_parser("update", help="create or extend a map")
     up.add_argument("-i", dest="inputs", nargs="+", type=Path, required=True,
-                    help="image files, image folders, or exactly one video")
+                    help="image files, or exactly one video")
     up.add_argument("-m", dest="map", type=Path, required=True, help="map folder")
     up.add_argument("-f", dest="format", choices=("json", "ply"), default="json",
                     help="output format (default: json)")
@@ -85,6 +85,7 @@ def main(argv: list[str]) -> int:
     fps = DEFAULT_FPS if args.fps is None else args.fps
     if args.fps is not None and not is_video:
         log.warning("-fps applies to video input only; ignored for images")
+        fps = DEFAULT_FPS  # ignored (spec §2.3), whatever its value
     if fps <= 0:
         raise UsageError("-fps must be positive")
     from oh_my_slam.core import timing

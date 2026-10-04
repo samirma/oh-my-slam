@@ -92,7 +92,6 @@ class ViewBundle:
     catalog: list[Json]
     segmented_png: bytes | None = None
     display_transform: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
-    stats: Json = field(default_factory=dict)
     camera_sources: dict[str, str] = field(default_factory=dict)  # camera name → input file name
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -176,13 +175,11 @@ class ViewBundle:
         return {
             "mode": self.mode,
             "title": self.title,
-            "stats": self.stats,
             "display_transform": self.display_transform,
             "cameras": self.cameras,
             "has_segmented": self.segmented_png is not None,
             "controls": self.controls,
             "defaults": self.describe(CloudAttrs.defaults(self.scope)),
-            "max_points": MAX_DISPLAY_POINTS,
         }
 
 
@@ -274,7 +271,6 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
         catalog=catalog_rows(seg.objects),
         segmented_png=png_bytes(segmented_image(frame.rgb, seg.label_map)),
         display_transform=upright_transform(up).tolist(),
-        stats={"objects": len(seg.objects), "frames": 1},
     )
 
 
@@ -295,7 +291,6 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         scene=json.loads(scene_bytes(reader)),
         source=source,
         catalog=catalog_rows(objs),
-        stats={"objects": len(objs), "frames": len(reader.frames), "map_points": len(source.xyz)},
         # keyframe images are copies (frames/fNNNNNN.jpg); name the input they came from
         camera_sources={r.name: Path(r.source).name for r in reader.frames if r.source},
     )

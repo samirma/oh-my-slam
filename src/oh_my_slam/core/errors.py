@@ -46,6 +46,17 @@ class ServerUnavailableError(OhMySlamError):
         super().__init__(f"inference server is not running{suffix} — {SERVER_HINT}")
 
 
+class ServerModelsFailedError(ServerUnavailableError):
+    """The server runs but its models failed to load (health status ``error``)."""
+
+    def __init__(self, failed: str, log_path: str) -> None:
+        OhMySlamError.__init__(
+            self,
+            f"inference server models failed to load ({failed}) — see {log_path}, fix the cause, "
+            "then restart with ./start_inference_server.sh --stop && ./start_inference_server.sh",
+        )
+
+
 class ServerBusyError(OhMySlamError):
     """The server queue is full (HTTP 503) and retries were exhausted."""
 

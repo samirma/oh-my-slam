@@ -9,7 +9,6 @@ dependencies = [
     "numpy>=2.1",
     "scipy>=1.14",
     "pillow>=11",
-    "pillow-heif>=1.0",
     "av>=15",
     "opencv-python-headless>=4.12,<5",
     "jsonschema>=4.23",
@@ -21,12 +20,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "httpx>=0.28",
-    "python-multipart>=0.0.20",
     "pydantic>=2.10",
     # models (loaded only inside the inference server). torch 2.13 corrupts attention on macOS 26.
     "torch==2.14.*",
     "torchvision==0.29.*",
-    "transformers>=5.17",
     "ultralytics==8.4.159",
     "clip @ git+https://github.com/ultralytics/CLIP.git@a13192f8cb767260d7dfd98c843b0716593169e7",
     # Gate G1: MoGe pinned to the last pre-V3 commit (MoGe-2); V3 main does not install on macOS.
@@ -129,7 +126,7 @@ root_package = "oh_my_slam"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layered ownership: cli > viewer > mapping > segmentation > reconstruction > client > schema > core"
+name = "Layered ownership: cli > tools > viewer > mapping > segmentation > reconstruction > client > schema > core"
 type = "layers"
 layers = [
     "oh_my_slam.cli",
@@ -144,7 +141,7 @@ layers = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Only the CLI starts the server; nothing else imports it"
+name = "Only the CLI starts the server; the pipeline packages never import it"
 type = "forbidden"
 source_modules = [
     "oh_my_slam.viewer",
@@ -156,6 +153,17 @@ source_modules = [
     "oh_my_slam.core",
 ]
 forbidden_modules = ["oh_my_slam.server"]
+
+[[tool.importlinter.contracts]]
+name = "The evaluator reads the server's lifecycle state only (cold start, resident memory)"
+type = "forbidden"
+source_modules = ["oh_my_slam.tools"]
+forbidden_modules = [
+    "oh_my_slam.server.app",
+    "oh_my_slam.server.main",
+    "oh_my_slam.server.gpu_worker",
+    "oh_my_slam.server.models",
+]
 
 [[tool.importlinter.contracts]]
 name = "The server owns models only (no pipeline logic)"
@@ -174,6 +182,7 @@ name = "Model frameworks stay inside the server process"
 type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
+    "oh_my_slam.tools",
     "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
@@ -185,22 +194,15 @@ source_modules = [
 forbidden_modules = ["torch", "ultralytics", "moge", "geocalib", "mapanything", "transformers"]
 
 [[tool.importlinter.contracts]]
-name = "Mapping and viewer never call the inference client directly (delegation via reconstruction/segmentation)"
-type = "forbidden"
-source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
-forbidden_modules = ["oh_my_slam.client.client"]
-allow_indirect_imports = true
-
-[[tool.importlinter.contracts]]
 name = "Reconstruction never touches segmentation"
 type = "forbidden"
 source_modules = ["oh_my_slam.reconstruction"]
 forbidden_modules = ["oh_my_slam.segmentation", "oh_my_slam.mapping"]
 
 [[tool.importlinter.contracts]]
-name = "Mapping never talks to the inference server: depth through reconstruction, detections through segmentation"
+name = "Mapping and viewer never talk to the inference server: depth through reconstruction, detections through segmentation"
 type = "forbidden"
-source_modules = ["oh_my_slam.mapping"]
+source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
 forbidden_modules = ["oh_my_slam.client"]
 allow_indirect_imports = true
 
@@ -221,6 +223,7 @@ name = "Depth fusion (Open3D) lives in reconstruction; the server never loads it
 type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
+    "oh_my_slam.tools",
     "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",

@@ -14,6 +14,7 @@ or colours. ``-m`` runs no inference, needs no inference server and never modifi
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -35,15 +36,12 @@ log = get_logger("oh_my_slam.cli.segment")
 
 
 def _score(value: str) -> float:
-    from oh_my_slam.segmentation.detect import DETECTION_FLOOR
-
     try:
         s = float(value)
     except ValueError as exc:
         raise UsageError(f"--min-score must be a number, got {value!r}") from exc
-    if not DETECTION_FLOOR <= s <= 1.0:
-        raise UsageError(f"--min-score must be within [{DETECTION_FLOOR}, 1] (the detector "
-                         f"reports no scores below {DETECTION_FLOOR}), got {value}")
+    if not math.isfinite(s):
+        raise UsageError(f"--min-score must be a finite number, got {value!r}")
     return s
 
 

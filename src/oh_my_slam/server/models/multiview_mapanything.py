@@ -19,7 +19,6 @@ _LOAD_SIDE = 1024
 class MapAnythingMultiview:
     key = "multiview"
     name = "MapAnything (apache)"
-    required = True
 
     def __init__(self) -> None:
         self.model: Any = None

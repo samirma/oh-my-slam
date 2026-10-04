@@ -16,11 +16,13 @@ from oh_my_slam.core import paths
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.api import update
+from oh_my_slam.mapping.export import scene_bytes
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES
 from oh_my_slam.segmentation.colors import UNSEGMENTED
 from tests.fakes.client import FakeClient
 from tests.synth.mapping import add_frames, mapping_room, ring
+from tests.unit.test_cli_single import assert_catalogue_colours
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -49,8 +51,9 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
     doc = json.loads(res.stdout)
     assert validation_errors(doc) == [] and len(doc["openlabel"]["objects"]) == 3
     assert doc["openlabel"]["metadata"]["tool"] == "segment"  # not the mapper that stored it
-    stored = store.MapReader(one_image_map).read_json(store.SCENE_JSON)
+    stored = json.loads(scene_bytes(store.MapReader(one_image_map)))
     assert stored["openlabel"]["metadata"]["tool"] == "mapper"
+    assert not (one_image_map / "scene.json").exists()  # the map folder keeps no scene copy
     assert doc["openlabel"]["objects"] == stored["openlabel"]["objects"]
     assert b"timings: total" in res.stderr  # per-stage timings, as for -i
     art = tmp_path / "art"
@@ -58,6 +61,7 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
                   "label=on,voxel=0.02,normals=on")
     assert ply.returncode == 0, ply.stderr.decode()
     assert sorted(p.name for p in art.iterdir()) == sorted(ARTIFACT_NAMES)
+    assert_catalogue_colours(art)  # catalog.csv / catalog.md colours are the scene's
     assert (art / "segments.ply").read_bytes() == ply.stdout  # identical to -f ply
     assert (art / "segmentation.json").read_bytes() == res.stdout  # identical to -f json
     assert parse_header(ply.stdout).comments == [
@@ -79,32 +83,20 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
     assert store.full_tree_hash(one_image_map) == before  # nothing in the map changed
 
 
-def test_map_scene_colours_follow_the_current_palette(one_image_map: Path, tmp_path: Path
-                                                     ) -> None:
-    """A map written with another palette: its scene JSON is rebuilt from the persisted state, so
-    it carries today's colour of each id (as the PLY and catalogue do) and is otherwise the stored
-    scene.json."""
-    import shutil
-
+def test_map_scene_colours_follow_the_current_palette(one_image_map: Path) -> None:
+    """The map folder stores no colour: its scene JSON is rebuilt from the persisted state, so it
+    carries today's colour of each id (as the PLY and catalogue do), even for a map written
+    before a palette change."""
     from oh_my_slam.mapping.export import scene_bytes
     from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 
-    old = tmp_path / "old"
-    shutil.copytree(one_image_map, old)
-    stored = json.loads((old / store.SCENE_JSON).read_text())
-    for o in stored["openlabel"]["objects"].values():
-        o["object_data"]["text"] = [{"name": "color_hex", "val": "#000075"}]
-        o["object_data"]["vec"] = [{"name": "color", "val": [0, 0, 117]}]
-    (old / store.SCENE_JSON).write_text(json.dumps(stored))
-    doc = json.loads(scene_bytes(store.MapReader(old)))
+    stored = [p for p in one_image_map.rglob("*.json") if b"color" in p.read_bytes()]
+    assert stored == []
+    doc = json.loads(scene_bytes(store.MapReader(one_image_map)))
+    assert doc["openlabel"]["objects"]
     for key, o in doc["openlabel"]["objects"].items():
         assert o["object_data"]["text"] == [{"name": "color_hex", "val": color_hex_for_id(int(key))}]
         assert o["object_data"]["vec"] == [{"name": "color", "val": list(color_for_id(int(key)))}]
-        o["object_data"]["text"] = stored["openlabel"]["objects"][key]["object_data"]["text"]
-        o["object_data"]["vec"] = stored["openlabel"]["objects"][key]["object_data"]["vec"]
-    assert doc["openlabel"]["objects"] == stored["openlabel"]["objects"]
-    for k in ("frames", "streams", "coordinate_systems", "frame_intervals"):
-        assert doc["openlabel"].get(k) == stored["openlabel"].get(k), k
 
 
 @pytest.mark.parametrize(("args", "hint"), [

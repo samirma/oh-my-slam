@@ -24,7 +24,6 @@ WEIGHTS = "yoloe-26x-seg.pt"
 class YoloeSegmenter:
     key = "segment_yoloe"
     name = "YOLOE-26x-seg"
-    required = True
 
     def __init__(self) -> None:
         self.model: Any = None

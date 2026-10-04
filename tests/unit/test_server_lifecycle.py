@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -28,6 +27,7 @@ from oh_my_slam.server.lifecycle import (
     read_state,
     socket_is_live,
 )
+from tests.fakes.stub_server import SERVER_CMD, start_stub_server, stub_env
 
 REPO = Path(__file__).resolve().parents[2]
 START = REPO / "start_inference_server.sh"
@@ -41,8 +41,7 @@ def run_start(*args: str, env: dict[str, str] | None = None) -> subprocess.Compl
 
 @pytest.fixture
 def stub_server() -> Iterator[None]:
-    res = run_start("--stub", env={"OH_MY_SLAM_STUB_DELAY": "0.02"})
-    assert res.returncode == 0, res.stderr
+    start_stub_server({"OH_MY_SLAM_STUB_DELAY": "0.02"})
     try:
         yield
     finally:
@@ -55,7 +54,7 @@ def test_start_is_idempotent_and_stop_cleans_up(stub_server: None) -> None:
     state = read_state()
     assert state is not None and pid_alive(state["pid"])
     t0 = time.monotonic()
-    again = run_start("--stub")
+    again = run_start()
     assert again.returncode == 0 and "already running" in again.stderr
     assert time.monotonic() - t0 < 2.0
     status = run_start("--status")
@@ -114,8 +113,8 @@ def test_concurrent_clients_never_crash_the_server(stub_server: None, tmp_path: 
 
 
 def test_second_server_process_refuses_to_start(stub_server: None) -> None:
-    res = subprocess.run([sys.executable, "-m", "oh_my_slam.server.main", "--stub"],
-                         capture_output=True, text=True, timeout=60)
+    res = subprocess.run(SERVER_CMD, cwd=REPO, env=stub_env(), capture_output=True, text=True,
+                         timeout=60)
     assert res.returncode == 1 and "another server" in res.stderr
     assert ServerLock.is_held()
 

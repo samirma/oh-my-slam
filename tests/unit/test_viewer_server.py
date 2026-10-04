@@ -29,7 +29,6 @@ def small_map() -> ViewBundle:
     return ViewBundle(
         mode="map", title="t", scene={"openlabel": {"metadata": {"schema_version": "1.0.0"}}},
         source=source, catalog=[{"id": 1}], segmented_png=b"\x89PNGfake",
-        stats={"objects": 1, "frames": 0},
     )
 
 
@@ -149,10 +148,6 @@ def test_realistic_maps_are_shown_complete() -> None:
     import oh_my_slam.viewer.bundle as vb
 
     assert vb.MAX_DISPLAY_POINTS >= 12_000_000
-    b = ViewBundle(mode="map", title="t", scene={}, catalog=[],
-                   source=map_cloud_source(np.zeros((5, 3)), np.zeros((5, 3), np.uint8), None,
-                                           set(), np.zeros((1, 3))))
-    assert b.meta()["max_points"] == vb.MAX_DISPLAY_POINTS
 
 
 def test_cameras_are_the_poses_of_the_scene_json() -> None:

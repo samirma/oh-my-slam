@@ -18,6 +18,7 @@ from PIL import Image
 
 from oh_my_slam.cli.view import URL_LINE
 from oh_my_slam.viewer.server import parse_cloud_payload
+from tests.fakes.stub_server import start_stub_server
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -83,17 +84,20 @@ def image(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def test_view_image_needs_server(image: Path) -> None:
-    t0 = time.monotonic()
-    res = sh("view.sh", "-i", str(image), "--no-browser")
-    assert res.returncode == 3 and time.monotonic() - t0 < 2.0
+    # the first run warms the interpreter and imports (a cold venv takes seconds); the second
+    # one is timed, so the deadline measures the fail-fast path, not Python start-up
+    for timed in (False, True):
+        t0 = time.monotonic()
+        res = sh("view.sh", "-i", str(image), "--no-browser")
+        assert res.returncode == 3, res.stderr
+        assert not timed or time.monotonic() - t0 < 2.0
     assert b"./start_inference_server.sh" in res.stderr and res.stdout == b""
 
 
 def test_view_image_controls_work_without_the_server(image: Path) -> None:
     """Inference runs once at start-up: with the (stub) server stopped afterwards, every control
     change is still answered from the data in memory."""
-    res = sh("start_inference_server.sh", "--stub")
-    assert res.returncode == 0, res.stderr.decode()
+    start_stub_server()
     try:
         proc, url, _ = start_view("-i", str(image))
     finally:
