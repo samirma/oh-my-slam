@@ -6,6 +6,7 @@ Cameras use OpenCV axes. All functions are pure NumPy.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -273,6 +274,121 @@ def _packed(keys: NDArray[np.int64]) -> NDArray[np.int64]:
         return keys
     k = keys - lo
     return (k[:, 0] * int(span[1] * span[2]) + k[:, 1] * int(span[2]) + k[:, 2]).astype(np.int64)
+
+
+# --- voxel-grid selection within a point budget --------------------------------------------------
+
+# The edge found is within a factor 1 + this of the smallest one that fits. Finer means nothing: at
+# that scale the grid's alignment alone moves the count by about 0.01 % between nearby edges.
+BUDGET_EDGE_REL_TOL = 1e-2
+_BUDGET_CHUNK = 1 << 20  # points whose voxel codes are computed at a time (small temporaries)
+
+
+def _voxel_codes(points: NDArray[Any], edge: float) -> NDArray[np.int64]:
+    """The voxel of every point (``voxel_keys``: the grid of edge ``edge`` anchored at the origin)
+    as one int64 each (equal codes <=> same voxel), computed chunk by chunk; ``(N, 3)`` keys when
+    the grid's extent does not fit one int64."""
+    lo = np.floor(points.min(axis=0).astype(np.float64) / edge).astype(np.int64)
+    hi = np.floor(points.max(axis=0).astype(np.float64) / edge).astype(np.int64)
+    span = [int(s) for s in hi - lo + 1]
+    if span[0] * span[1] * span[2] >= 2**62:
+        return voxel_keys(points, edge)
+    codes = np.empty(len(points), np.int64)
+    for s in range(0, len(points), _BUDGET_CHUNK):
+        k = voxel_keys(points[s:s + _BUDGET_CHUNK], edge) - lo
+        codes[s:s + _BUDGET_CHUNK] = (k[:, 0] * span[1] + k[:, 1]) * span[2] + k[:, 2]
+    return codes
+
+
+def _occupied(points: NDArray[Any], edge: float) -> int:
+    codes = _voxel_codes(points, edge)
+    if codes.ndim == 2:
+        return len(np.unique(codes, axis=0))
+    codes.sort()
+    return 1 + int(np.count_nonzero(codes[1:] != codes[:-1])) if len(codes) else 0
+
+
+def budget_voxel_edge(points: NDArray[Any], max_points: int,
+                      rel_tol: float = BUDGET_EDGE_REL_TOL) -> float:
+    """The smallest voxel edge (metres, to within a factor ``1 + rel_tol``) whose grid
+    (``voxel_keys``) has at most ``max_points`` occupied voxels; 0 when the points need no
+    thinning (at most ``max_points`` of them, or no more distinct places than that).
+
+    Each step counts the occupied voxels of one edge (a sort of the points' voxel codes). The
+    search brackets the edge by factors of 4, closes the bracket by Brent's method on the count
+    against log(edge) — a handful of counts where bisection would take a dozen — and returns the
+    smallest edge counted that fits, with a count above ``max_points`` less than ``rel_tol`` below
+    it."""
+    from scipy.optimize import brentq
+
+    pts = np.asarray(points).reshape(-1, 3)
+    if len(pts) <= max_points:
+        return 0.0
+    if max_points < 1:
+        raise ValueError("max_points must be at least 1")
+    extent = float(np.max(pts.max(axis=0).astype(np.float64) - pts.min(axis=0)))
+    if extent == 0.0:
+        return 0.0  # a single place: one voxel at any edge
+    counted: dict[float, int] = {}  # log(edge) -> occupied voxels
+
+    def f(x: float) -> float:  # > 0: too many voxels
+        if x not in counted:
+            counted[x] = _occupied(pts, math.exp(x))
+        return counted[x] - (max_points + 0.5)
+
+    # bracket by factors of 4 from the edge at which max_points voxels would tile the extent's
+    # square (a scene's points lie on surfaces)
+    x, step = math.log(extent / math.sqrt(max_points)), math.log(4.0)
+    if f(x) > 0:
+        while f(x) > 0:
+            x += step
+    else:
+        floor = math.log(extent * 1e-9)  # below this the points are at no more distinct places
+        while f(x) <= 0:
+            if x < floor:
+                return 0.0
+            x -= step
+    width = math.log1p(rel_tol)
+
+    def bracket() -> tuple[float, float]:
+        """The tightest counted bracket: the smallest fitting edge, the largest one below it
+        that does not fit."""
+        hi = min(k for k, n in counted.items() if n <= max_points)
+        return max(k for k, n in counted.items() if n > max_points and k < hi), hi
+
+    lo, hi = bracket()
+    if hi - lo > width:
+        brentq(f, lo, hi, xtol=width / 4, rtol=4 * np.finfo(float).eps)
+    lo, hi = bracket()
+    while hi - lo > width:  # Brent's last estimate may sit on one side only
+        f((lo + hi) / 2)
+        lo, hi = bracket()
+    return math.exp(hi)
+
+
+def budget_voxel_indices(points: NDArray[Any], max_points: int,
+                         rel_tol: float = BUDGET_EDGE_REL_TOL) -> tuple[NDArray[np.int64], float]:
+    """(indices, edge): one original point per occupied voxel of the grid of edge
+    ``budget_voxel_edge`` — the first in the points' order — in ascending order, so at most
+    ``max_points`` of them; every index and an edge of 0 when no thinning is needed. Points are
+    selected, never merged: each keeps its own attributes."""
+    pts = np.asarray(points).reshape(-1, 3)
+    edge = budget_voxel_edge(pts, max_points, rel_tol)
+    if edge == 0.0:
+        if len(pts) <= max_points:
+            return np.arange(len(pts), dtype=np.int64), 0.0
+        _, first = np.unique(pts, axis=0, return_index=True)  # duplicates only: one per place
+        return np.sort(first).astype(np.int64), 0.0
+    codes = _voxel_codes(pts, edge)
+    if codes.ndim == 2:
+        _, first = np.unique(codes, axis=0, return_index=True)
+        return np.sort(first).astype(np.int64), edge
+    # the first point of each voxel: the smallest index of each run of equal codes (an unstable
+    # argsort and a reduction are several times faster than a stable sort)
+    order = np.argsort(codes)
+    sorted_codes = codes[order]
+    starts = np.flatnonzero(np.r_[True, sorted_codes[1:] != sorted_codes[:-1]])
+    return np.sort(np.minimum.reduceat(order, starts)).astype(np.int64), edge
 
 
 def fit_plane(points: NDArray[Any]) -> tuple[F64, float]:

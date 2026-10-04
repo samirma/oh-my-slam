@@ -3,11 +3,13 @@ an image source and a map source, determinism, the colour contract and the PLY h
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, parse_cloud_attrs
-from oh_my_slam.core.geometry import voxel_downsample_indices, voxel_keys
+from oh_my_slam.core.geometry import budget_voxel_indices, voxel_downsample_indices, voxel_keys
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask
@@ -269,6 +271,9 @@ def test_map_normals_only_for_the_emitted_points(room_map: MapCloudSource) -> No
 
 
 def test_derive_thinned_is_a_subset_of_derive_cloud(room_map: MapCloudSource) -> None:
+    """Spec §2.5 display budget: one original point per occupied voxel of the budget's grid, with
+    exactly the values the complete derivation gives it (normals only for those points); the
+    selection is reused while only colour or normals change."""
     for attrs in (CloudAttrs(color="height", normals=True, label=True),
                   CloudAttrs(color="segment", voxel=0.05, normals=True, label=True)):
         src = map_cloud_source(room_map.xyz, room_map.rgb, room_map.labels, {4},
@@ -276,13 +281,22 @@ def test_derive_thinned_is_a_subset_of_derive_cloud(room_map: MapCloudSource) ->
         t = derive_thinned(src, attrs, 7_000)
         assert src.normals._done.sum() == len(t.cloud)  # normals only for the kept points
         full = derive_cloud(src, attrs)
-        assert t.total == len(full) and t.step == -(-len(full) // 7_000) > 1
-        sel = np.arange(0, len(full), t.step)
-        assert len(t.cloud) == len(sel) <= 7_000
+        xyz = np.asarray(src.xyz)  # the derivation's positions, in the source's dtype
+        if attrs.voxel:
+            xyz = xyz[voxel_downsample_indices(xyz, attrs.voxel, keep="first")]
+        keep, edge = budget_voxel_indices(xyz, 7_000)
+        assert t.total == len(full) > 7_000 and t.voxel == edge > 0
+        assert len(t.cloud) == len(keep) <= 7_000
         for name in ("xyz", "rgb", "label", "normals"):
-            np.testing.assert_array_equal(getattr(t.cloud, name), getattr(full, name)[sel])
+            np.testing.assert_array_equal(getattr(t.cloud, name), getattr(full, name)[keep])
+        (key,) = src.selections
+        again = derive_thinned(src, replace(attrs, color="rgb", normals=False), 7_000)
+        assert list(src.selections) == [key]  # the same selection: positions did not change
+        np.testing.assert_array_equal(again.cloud.xyz, t.cloud.xyz)
     t = derive_thinned(room_map, CloudAttrs(), None)
-    assert (t.total, t.step, len(t.cloud)) == (len(room_map.xyz), 1, len(room_map.xyz))
+    assert (t.total, t.voxel, len(t.cloud)) == (len(room_map.xyz), 0.0, len(room_map.xyz))
+    t = derive_thinned(room_map, CloudAttrs(), len(room_map.xyz))  # within budget: every point
+    assert (t.voxel, len(t.cloud)) == (0.0, len(room_map.xyz))
 
 
 def test_complete_map_cloud_shares_the_source_arrays(monkeypatch: pytest.MonkeyPatch) -> None:

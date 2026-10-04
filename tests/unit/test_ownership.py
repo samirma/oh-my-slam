@@ -116,7 +116,7 @@ VIEWER_FORBIDDEN_IMPORTS = (
 )
 VIEWER_REIMPLEMENTATION = (
     r"unproject|pixel_mask|depth_edge_mask|depth_normals|PointNormals|voxel_keys"
-    r"|voxel_downsample|fit_obb|fit_upright_obb|color_for_id|color_hex_for_id|segment_colors"
+    r"|voxel_downsample|budget_voxel|fit_obb|fit_upright_obb|color_for_id|color_hex_for_id|segment_colors"
     r"|height_colors|PALETTE|np\.random|default_rng|K\.fx|\.K\(\)"
 )
 
