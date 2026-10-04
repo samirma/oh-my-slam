@@ -434,12 +434,17 @@ point leaves the map untouched. One killed after it is completed by the next upd
 
 ### Update semantics
 
-* **One update is one observation.** The keyframes of one update are processed without regard to
-  their order:
+* **The order of addition is "latest".** A later update wins over an earlier one, and within one
+  update a later keyframe wins over an earlier one, in input order (the order of the `-i` images;
+  a video's frame order). A sequence mapped in one update or split across several in the same
+  order gives the same map: `office_sequence`'s cup, on the sill in the first photos and gone in
+  the last ones, is absent either way, its place drawn from the photos that see it empty, and
+  the objects that never changed keep their ids, labels and boxes. Where nothing changed, the
+  keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
-  * Latest wins and the cloud's colours and object ids do not depend on keyframe order either.
-  * Order only affects keyframe names and the numbering of new objects (by their earliest
-    keyframe), and a place that changed during the update (see *Later wins*).
+  * The cloud's colours and object ids do not depend on keyframe order either.
+  * Order affects keyframe names, the numbering of new objects (by their earliest keyframe), and
+    every place that changed (see *Later wins*).
 * **Later wins.** "Latest" is the order of addition. A later update invalidates, per pixel, the
   parts of older keyframes that it contradicts: free space seen behind an old point, or a new
   surface in front of an old ray. It also removes, or gives a strike to, objects that it sees
@@ -507,9 +512,16 @@ point leaves the map untouched. One killed after it is completed by the next upd
     witnesses) are then the only ones that see the surface it stood on or hid, often fewer than
     the 3 keyframes a surface usually needs (the cup is removed by 2 photos). The map records
     the place (`objects.json → vacated`: the retired masks, the object's box and the witnesses)
-    and, in it, draws what a witness sees however few keyframes see it, takes colour and object
-    id from the witnesses (not the cup's shadow in the older photos), and drops points that a
-    witness sees through and no witness or later update sees (what is left of the object). The
+    and, in it, draws what the witnesses see however few keyframes see it, takes colour and object
+    id from the witnesses (not the cup's shadow in the older photos), and drops points that the
+    witnesses see through and no later update sees (what is left of the object). The witnesses
+    are one observation of the place: per point, the median over them of how far beyond it they
+    see decides whether they see it (within the visibility tolerance) or through it. Their
+    monocular depth of the empty place disagrees by a few percent: in `office_sequence` mapped in
+    three updates (4 + 4 + 5 photos) the two photos that see the cup gone placed the sill 3.5 cm
+    in front of and 3.2 cm behind the surface the other photos agree on, and when either witness
+    alone could carve that surface, the one that saw farther left a hole of about 8 × 10 cm where
+    the cup stood. The
     place is its detecting keyframes' retired pixels at or behind the object (up to the depth
     noise, max(5 cm, 8 % of the depth), in front), and its box grown by max(5 cm, 3 % of its
     viewing distance). A later update that sees the place again is fused like any other.
@@ -1060,11 +1072,7 @@ runs it end to end as a test.
   13-photo map measures 8-25 cm (SfM of the four photos alone is no better: rotations 2.5-4.7°
   off, 15-37 points per photo). Objects near the camera, the cup and the wallet on the
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
-  longer. In a map of the whole sequence the global mapper's result varies from run to run for
-  the same reason: in some runs the depth check (step 1 of *Weakly linked parts*) rejects
-  photos whose SfM points are mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and
-  their multi-view poses leave them low confidence; a place only such photos see is then not
-  judged, and the cup can stay in that run's map.
+  longer.
 * **Video through several rooms.** Where a walk crosses a doorway in a second or two,
   consecutive keyframes share only a few matches, and the global mapper can leave the stretch
   behind the doorway at any scale or tilt, or shrink it onto one point (see Poses). The mapper

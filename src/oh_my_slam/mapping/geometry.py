@@ -902,10 +902,10 @@ def _candidates(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None
     return None if cells is None else cells.select(fd, _depth_limit(fd))
 
 
-def _seen_through(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None = None
-                  ) -> NDArray[np.bool_]:
-    """Whether keyframe ``fd`` sees clearly behind each point: it projects onto a valid pixel whose
-    depth lies beyond it by more than the visibility tolerance (``_visible``)."""
+def _residuals(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None = None
+               ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """(how far beyond each point keyframe ``fd`` sees: the depth of the valid pixel it projects
+    onto minus its own depth, NaN where it projects onto none; its depth)."""
     cand = _candidates(fd, pts, cells)
     q = pts if cand is None else pts[cand]
     cam = fd.rec.T_map_cam.inverse()
@@ -916,12 +916,48 @@ def _seen_through(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None 
         v = np.floor(uv[:, 1] + 0.5)
         idx = np.flatnonzero((z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h))
     uu, vv = u[idx].astype(np.int64), v[idx].astype(np.int64)
-    zi = z[idx]
-    hit = fd.valid[vv, uu] & (fd.depth[vv, uu] - zi >= np.maximum(VIS_TOL_MIN, VIS_TOL_REL * zi))
-    out = np.zeros(len(pts), bool)
-    idx = idx[hit]
-    out[idx if cand is None else cand[idx]] = True
-    return out
+    ok = fd.valid[vv, uu]
+    idx, uu, vv = idx[ok], uu[ok], vv[ok]
+    res = np.full(len(pts), np.nan)
+    depth = np.full(len(pts), np.nan)
+    at = idx if cand is None else cand[idx]
+    res[at] = fd.depth[vv, uu] - z[idx]
+    depth[at] = z[idx]
+    return res, depth
+
+
+def _seen_through(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None = None
+                  ) -> NDArray[np.bool_]:
+    """Whether keyframe ``fd`` sees clearly behind each point: it projects onto a valid pixel whose
+    depth lies beyond it by more than the visibility tolerance (``_visible``)."""
+    res, z = _residuals(fd, pts, cells)
+    with np.errstate(invalid="ignore"):
+        return np.asarray(res >= np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z))
+
+
+def _witnessed(witnesses: list[FrameData], q: NDArray[np.float64], cells: _Cells | None = None
+               ) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+    """(which points the witnesses of a removed object see, which they see through), from the
+    witnesses together: per point, the median over the witnesses that project it onto a valid
+    pixel of how far beyond it they see, within the visibility tolerance (``_visible``) or beyond
+    it. The witnesses are the place's latest observation as one: their monocular depth of the
+    empty place disagrees by a few percent (``office_sequence``: the two photos that see the cup
+    gone place the sill 3.5 cm in front of and 3.2 cm behind the surface the other keyframes
+    agree on), so one witness that sees a little farther than the others does not carve the
+    surface they show (a hole where the cup stood), and a surface only one of them places apart
+    is not drawn as a second copy."""
+    res = np.full((len(witnesses), len(q)), np.nan)
+    z = np.full(len(q), np.nan)
+    for k, fd in enumerate(witnesses):
+        res[k], zk = _residuals(fd, q, cells)
+        z = np.where(np.isnan(z), zk, z)
+    viewed = ~np.isnan(res).all(axis=0)
+    med = np.full(len(q), np.nan)
+    if viewed.any():
+        med[viewed] = np.nanmedian(res[:, viewed], axis=0)
+    with np.errstate(invalid="ignore"):
+        tol = np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z)
+        return np.asarray(np.abs(med) < tol), np.asarray(med >= tol)
 
 
 def _vacated(pts: NDArray[Any], few: NDArray[Any], frames: list[FrameData],
@@ -957,11 +993,7 @@ def _vacated(pts: NDArray[Any], few: NDArray[Any], frames: list[FrameData],
                 continue
             q = cloud[region]
             qcells = _Cells(q) if len(q) > 50_000 else None
-            seen = np.zeros(len(q), bool)
-            through = np.zeros(len(q), bool)
-            for fd in witnesses:
-                seen[_visible(fd, q, qcells)[0]] = True
-                through |= _seen_through(fd, q, qcells)
+            seen, through = _witnessed(witnesses, q, qcells)
             if is_few:
                 added = region[seen]
                 continue
