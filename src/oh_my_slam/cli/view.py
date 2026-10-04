@@ -19,13 +19,14 @@ import re
 import signal
 import sys
 import webbrowser
-from pathlib import Path
 
+from oh_my_slam.cli import spec
 from oh_my_slam.cli.common import ArgumentParser, run_main
-from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.log import claim_stdout, get_logger
 
-PROG = "view.sh"
+PROGRAM = spec.VIEW
+COMMAND = PROGRAM.command()
+PROG = PROGRAM.prog
 URL_LINE = re.compile(r"^view\.sh: listening on (http://127\.0\.0\.1:\d+/)$")
 log = get_logger("oh_my_slam.cli.view")
 
@@ -43,23 +44,17 @@ def _install_stop_handlers() -> None:
 
 
 def build_parser() -> ArgumentParser:
-    ap = ArgumentParser(prog=PROG, description="Browser visualisation of an image or a map.")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("-i", dest="image", type=Path, help="RGB image to reconstruct and segment")
-    src.add_argument("-m", dest="map", type=Path, help="map folder (opened read-only)")
-    ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
-    return ap
+    return spec.build_parser(PROGRAM)
 
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
+    spec.validate(COMMAND, args, log.warning)  # -i exists, before the server is contacted
     claim_stdout()  # nothing goes to stdout; the URL is printed on stderr
     from oh_my_slam.viewer.bundle import image_bundle, map_bundle
     from oh_my_slam.viewer.server import serve, url_of
 
     if args.image is not None:
-        if not args.image.is_file():
-            raise InputError(f"image not found: {args.image}")
         from oh_my_slam.reconstruction.api import connect_server
 
         client = connect_server()  # exit 3 with the hint when the server is down

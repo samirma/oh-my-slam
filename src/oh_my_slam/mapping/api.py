@@ -142,8 +142,10 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
         if ingested is not None:
             ingested(written)
         with timing.stage("inference"):
+            timing.progress(0, len(futures))  # spec §2.6 Jobs: progress where the size is known
             for i, fut in enumerate(futures, start=1):
                 out.append(fut.result())
+                timing.progress(i, len(futures))
                 if i % 10 == 0 or i == len(futures):
                     progress(f"inference {i}/{len(futures)} keyframes "
                              f"({time.perf_counter() - t0:.0f} s)")

@@ -39,6 +39,7 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import InputError, NotAMapError, UsageError
 from oh_my_slam.core.images import IMAGE_SUFFIXES, VIDEO_SUFFIXES, exif_intrinsics, upright_size
 from oh_my_slam.core.log import get_logger, json_payload_bytes
+from oh_my_slam.core.timing import Stage
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import retrieval, store
 from oh_my_slam.mapping.sfm import (
@@ -685,29 +686,30 @@ def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: st
     """(payload, or None when no image is located; the result of each image) in the map state
     ``reader`` read."""
     stage = timing.stage
-    with stage("setup"):
+    with stage(Stage.SETUP):
         queries = [_Query(p, k, f"{QUERY_PREFIX}{k:06d}.jpg", upright_size(p), exif_intrinsics(p))
                    for k, p in enumerate(images)]
     progress(f"locating {len(images)} images in map {reader.root} ({len(reader.frames)} "
              "keyframes)")
     work = Path(tempfile.mkdtemp(prefix="locate-", dir=paths.scratch_dir()))
     try:
-        with stage("features_matching"):
+        with stage(Stage.FEATURES_MATCHING):
             sfm, db = _extract(reader, queries, work)
             sfm.match_pairs(_pairs(reader, queries, db, client),
                             {v.image_id: k for k, v in db.items()})
             matches = _query_matches(sfm.db, queries, db)
-        with stage("pose"):
+        with stage(Stage.POSE):
             points = _MapPoints(reader)
             results = []
             for q in queries:
                 K, refine = _query_intrinsics(reader, sfm, q, db)
                 results.append(_locate_one(q, K, refine, matches[q.name], points))
+                timing.progress(len(results), len(queries))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if not any(r.located for r in results):
         return None, results
-    with stage("export"):
+    with stage(Stage.EXPORT):
         payload = ply_payload(reader, results, mode, attrs) if fmt == "ply" else \
             scene_json(reader, results, mode)
     return payload, results

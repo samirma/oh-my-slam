@@ -24,6 +24,17 @@ wall-clock seconds).
 Outside :func:`collect` every call is a no-op. ``mapper.sh update``, ``reconstruct.sh`` and
 ``segment.sh`` log a one-line summary on stderr and, when ``OH_MY_SLAM_TIMINGS=<path>`` is set,
 write the full record there as JSON.
+
+Live progress (spec §2.6 Jobs: a running job reports the command's own stage and its progress
+where the command knows its size): while a collection is open, every stage start and end, every
+:func:`count`, every finished :func:`part` and every :func:`progress` tick is an event (a
+JSON-serialisable dict) passed to the listeners registered with :func:`listen`. When
+``OH_MY_SLAM_PROGRESS=<path>`` is set, :func:`collect` appends each event to that file as one JSON
+line (``/dev/fd/<n>`` reaches a pipe a job runner passed in). stdout and the human stderr output
+are the same whether progress is on or off.
+
+Stage names are the members of :class:`Stage`; ``oh_my_slam.cli.spec`` lists the stages of each
+command.
 """
 
 from __future__ import annotations
@@ -33,13 +44,97 @@ import os
 import resource
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 ENV_PATH = "OH_MY_SLAM_TIMINGS"
+ENV_PROGRESS = "OH_MY_SLAM_PROGRESS"
 MEMORY_SAMPLE_S = 0.05  # resident-set sampling period while a collection is open
+
+
+class Stage(StrEnum):
+    """Every timing stage name a command records (``tests/unit/test_commands.py`` checks that
+    each ``stage("…")`` in the package is one of them)."""
+
+    CONNECT = "connect"
+    SETUP = "setup"
+    INGEST = "ingest"
+    INFERENCE = "inference"
+    SEGMENT = "segment"
+    SFM = "sfm"
+    FEATURES_MATCHING = "features_matching"
+    POSE_REFINEMENT = "pose_refinement"
+    FOCAL_RERUN = "focal_rerun"
+    MAP_FRAME = "map_frame"
+    DEPTH_ALIGNMENT = "depth_alignment"
+    PERSIST_FRAMES = "persist_frames"
+    VALIDITY = "validity"
+    OBJECTS = "objects"
+    CLOUD = "cloud"
+    POSE = "pose"
+    EXPORT = "export"
+    ARTIFACTS = "artifacts"
+    WRITE = "write"
+    COMMIT = "commit"
+
+
+Listener = Callable[[dict[str, Any]], None]
+_listeners: list[Listener] = []
+_listeners_lock = threading.Lock()
+
+
+@contextmanager
+def listen(fn: Listener) -> Iterator[None]:
+    """Pass every progress event to ``fn`` while the block runs (from any thread)."""
+    with _listeners_lock:
+        _listeners.append(fn)
+    try:
+        yield
+    finally:
+        with _listeners_lock:
+            _listeners.remove(fn)
+
+
+def _emit(event: str, **fields: Any) -> None:
+    with _listeners_lock:
+        targets = list(_listeners)
+    if not targets:
+        return
+    record = {"event": event, **fields}
+    for fn in targets:
+        try:
+            fn(record)
+        except Exception:  # instrumentation never fails a command
+            pass
+
+
+@contextmanager
+def _progress_file() -> Iterator[None]:
+    """The ``OH_MY_SLAM_PROGRESS`` sink: one JSON line per event, appended to that path."""
+    target = os.environ.get(ENV_PROGRESS)
+    if not target:
+        yield
+        return
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError:  # instrumentation never fails a command
+        yield
+        return
+    lock = threading.Lock()
+
+    def write(record: dict[str, Any]) -> None:
+        line = (json.dumps(record, default=str) + "\n").encode()
+        with lock:
+            os.write(fd, line)
+
+    try:
+        with listen(write):
+            yield
+    finally:
+        os.close(fd)
 
 
 class Timings:
@@ -100,6 +195,7 @@ class Timings:
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
+        name = str(name)  # a Stage member is recorded as its plain name
         stack = self._stack()
         parent = stack[-1] if stack else None
         stack.append(name)
@@ -109,11 +205,14 @@ class Timings:
             self._observe(rss)
         w0 = time.time()
         t0 = time.perf_counter()
+        _emit("stage_start", stage=name, t=round(t0 - self._t0, 3))
         try:
             yield
         finally:
             dt = time.perf_counter() - t0
             w1 = time.time()
+            _emit("stage_end", stage=name, t=round(t0 + dt - self._t0, 3),
+                  seconds=round(dt, 3))
             stack.pop()
             high1, rss = max_rss_mb(), rss_mb()
             with self._lock:
@@ -141,6 +240,8 @@ class Timings:
             p = self.parts.setdefault(name, {"count": 0, "seconds": 0.0})
             p["count"] += 1
             p["seconds"] += seconds
+            n = int(p["count"])
+        _emit("part", part=name, count=n, seconds=round(seconds, 3))
 
     def request(self, endpoint: str, wall_s: float, queue_s: float, compute_s: float) -> None:
         with self._lock:
@@ -154,6 +255,12 @@ class Timings:
     def count(self, **values: Any) -> None:
         with self._lock:
             self.counts.update(values)
+        _emit("count", **values)
+
+    def progress(self, done: int, total: int) -> None:
+        """``done`` of ``total`` items of the innermost running stage (this thread's)."""
+        stack = self._stack()
+        _emit("progress", stage=stack[-1] if stack else None, done=int(done), total=int(total))
 
     # -- reporting ---------------------------------------------------------------------------------
 
@@ -237,14 +344,17 @@ def collect(sample_every: float | None = MEMORY_SAMPLE_S) -> Iterator[Timings]:
     """Make a fresh collector current for the enclosed block (restores the previous one); its
     resident-set sampler runs while the block does."""
     global _current
-    prev = _current
-    t = _current = Timings(sample_every)
-    t.start_sampling()
-    try:
-        yield t
-    finally:
-        t.stop_sampling()
-        _current = prev
+    with _progress_file():
+        prev = _current
+        t = _current = Timings(sample_every)
+        t.start_sampling()
+        _emit("begin")
+        try:
+            yield t
+        finally:
+            t.stop_sampling()
+            _current = prev
+            _emit("finish", total_s=round(t.elapsed, 3))
 
 
 def current() -> Timings | None:
@@ -281,6 +391,13 @@ def count(**values: Any) -> None:
     t = _current
     if t is not None:
         t.count(**values)
+
+
+def progress(done: int, total: int) -> None:
+    """Report ``done`` of ``total`` items of the running stage (a progress event only)."""
+    t = _current
+    if t is not None:
+        t.progress(done, total)
 
 
 def report(t: Timings | dict[str, Any], logger: Any, **extra: Any) -> dict[str, Any]:

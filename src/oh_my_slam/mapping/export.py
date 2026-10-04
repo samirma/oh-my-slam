@@ -15,6 +15,7 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.ply import PointCloud, read_ply
+from oh_my_slam.core.timing import Stage
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_state
 from oh_my_slam.schema import openlabel as ol
@@ -163,7 +164,7 @@ def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudA
         if want_ply or artifacts_dir is not None else None
     if artifacts_dir is not None:
         assert ply is not None
-        with timing.stage("artifacts"):
+        with timing.stage(Stage.ARTIFACTS):
             sheet = export_map(objs, keyframe_labels(reader, state)).segmented
             write_artifacts(artifacts_dir, scene, sheet, objs, ply,
                             title=f"Objects in map {reader.root.name}")

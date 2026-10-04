@@ -352,6 +352,10 @@ The same source and attributes always give byte-identical files.
 | 6 | Another `mapper.sh update` holds the map lock. |
 | 130 | Interrupted (Ctrl-C). `view.sh` treats Ctrl-C and SIGTERM as its normal stop and exits 0, also when it was started as a shell background job. |
 
+For the web service (spec §2.6), `core/errors.py` maps each exit code to a machine-readable code
+(its lower-case name, e.g. `not_a_map`) and an HTTP status by one rule (`HTTP_STATUS`): 2 → 400,
+4 and 5 → 422, 6 → 409, 3 → 503, 1 and anything else → 500.
+
 ## Coordinate conventions
 
 * **Units** are metres everywhere.
@@ -994,6 +998,12 @@ at the Python-module level:
 * `server` owns the models and nothing else.
 * The layers run `cli` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` >
   `client` > `schema` > `core`.
+* `cli/spec.py` is the commands' single source of truth (spec §2.6): every mode, option (flag,
+  kind, choices, default, help, applicability), validation rule, output, error and timing stage of
+  `reconstruct.sh`, `mapper.sh update` / `locate`, `segment.sh -i` / `-m` and `view.sh -i` / `-m`
+  is declared there once. Each command builds its argparse parser (`spec.build_parser`) and runs
+  its checks (`spec.validate`, in order, before any work) from it, and `spec.describe()` exports
+  it as JSON-serialisable data for the web service. Stage names are `core.timing.Stage`.
 
 ## Benchmark evaluator
 
@@ -1151,6 +1161,7 @@ Environment variables:
 | Variable | Effect |
 |---|---|
 | `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
+| `OH_MY_SLAM_PROGRESS=path` | Appends one JSON line per live progress event of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` to that path (`/dev/fd/<n>` reaches a pipe): `begin`, `stage_start` / `stage_end` (stage names of `core.timing.Stage`), `count` (sizes such as `keyframes_sampled`), `part`, `progress` (`done` of `total` items of the running stage) and `finish`. stdout and the stderr text are unchanged. |
 | `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch): the test suite runs its stub server there, beside a running real one. |
 | `OH_MY_SLAM_TEST_REAL_SERVER=1` | Lets the `models` and `eval` tests use the running real server. |
 
