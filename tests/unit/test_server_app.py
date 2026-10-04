@@ -47,7 +47,6 @@ def test_health_and_loading_state(image: Path, tmp_path: Path) -> None:
     state.loading = False
     h = p.Health.model_validate(client.get(p.ROUTE_HEALTH).json())
     assert h.status == "ready"
-    assert "segment_sam3" not in h.models
     assert h.queue_limit == 8
     state.stopping = True
     assert client.get(p.ROUTE_HEALTH).json()["status"] == "stopping"

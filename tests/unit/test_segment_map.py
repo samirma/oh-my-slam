@@ -22,6 +22,7 @@ from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES
 from oh_my_slam.segmentation.colors import UNSEGMENTED
 from tests.fakes.client import FakeClient
 from tests.synth.mapping import add_frames, mapping_room, ring
+from tests.unit.test_cli_single import assert_catalogue_colours
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -60,6 +61,7 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
                   "label=on,voxel=0.02,normals=on")
     assert ply.returncode == 0, ply.stderr.decode()
     assert sorted(p.name for p in art.iterdir()) == sorted(ARTIFACT_NAMES)
+    assert_catalogue_colours(art)  # catalog.csv / catalog.md colours are the scene's
     assert (art / "segments.ply").read_bytes() == ply.stdout  # identical to -f ply
     assert (art / "segmentation.json").read_bytes() == res.stdout  # identical to -f json
     assert parse_header(ply.stdout).comments == [

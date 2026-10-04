@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -163,6 +164,46 @@ def test_segment_artifacts_are_the_outputs_of_the_same_run(env, tmp_path: Path) 
     assert (out / "segmentation.json").read_bytes() == payload  # identical to -f json
     assert cli_segment.main(["-i", str(img), "-f", "ply"]) == 0
     assert (out / "segments.ply").read_bytes() == cap.take()
+
+
+# the catalog.csv header, literally as specs/segment.md states it
+SPEC_CSV_HEADER = ("id,label,score,color_hex,width_m,height_m,depth_m,volume_m3,center_x,center_y,"
+                   "center_z,pixel_count,point_count")
+MD_ROW = re.compile(r'^\| <span style="color:(#[0-9a-f]{6})">&#9632;</span> \| (\d+) \| .*? \| '
+                    r"`(#[0-9a-f]{6})` \|")
+
+
+def assert_catalogue_colours(folder: Path) -> None:
+    """The colour contract across the files ``segment.sh -d`` wrote: for every object of
+    ``segmentation.json``, its ``color_hex`` there, the ``color_hex`` column of ``catalog.csv``
+    and both the swatch colour and the hex of its ``catalog.md`` row are one value; the CSV header
+    is the spec's literal and neither catalogue has an object the scene lacks."""
+    import csv
+
+    objects = json.loads((folder / "segmentation.json").read_text())["openlabel"]["objects"]
+    scene = {}
+    for key, o in objects.items():
+        text = {t["name"]: t["val"] for t in o["object_data"]["text"]}
+        vec = {v["name"]: v["val"] for v in o["object_data"]["vec"]}
+        assert hex_to_rgb(text["color_hex"]) == tuple(vec["color"]), key
+        scene[int(key)] = text["color_hex"]
+    assert scene
+    lines = (folder / "catalog.csv").read_text().splitlines()
+    assert lines[0] == SPEC_CSV_HEADER
+    rows = list(csv.DictReader(lines))
+    assert {int(r["id"]): r["color_hex"] for r in rows} == scene
+    md = [m.groups() for line in (folder / "catalog.md").read_text().splitlines()
+          if (m := MD_ROW.match(line))]
+    assert {int(i): swatch for swatch, i, _ in md} == scene
+    assert {int(i): code for _, i, code in md} == scene
+
+
+def test_catalogue_colours_are_the_scene_colours(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    img, cap, _ = env
+    out = tmp_path / "seg"
+    assert cli_segment.main(["-i", str(img), "-d", str(out)]) == 0
+    cap.take()
+    assert_catalogue_colours(out)
 
 
 def test_attributes_never_change_objects_ids_or_colours(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

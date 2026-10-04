@@ -31,7 +31,7 @@ from oh_my_slam.version import __version__
 
 log = logging.getLogger("oh_my_slam.server")
 
-_VERSION_PACKAGES = ("torch", "ultralytics", "transformers", "moge", "geocalib", "mapanything")
+_VERSION_PACKAGES = ("torch", "ultralytics", "moge", "geocalib", "mapanything")
 MEMORY_FRACTION = 0.7
 QUEUE_LIMIT = 8  # jobs waiting for the GPU thread; beyond that the server answers 503
 

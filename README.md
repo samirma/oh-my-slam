@@ -62,7 +62,7 @@ running, the command reports it and exits 0.
 
 | Option | Effect |
 |---|---|
-| `--status` | Prints `/health` as JSON on stdout: status, device, precision, and each model's load state. Exits 3 if the server is not running. |
+| `--status` | Prints `/health` as JSON on stdout: status (`loading`, `ready`, `error` when a model failed to load, or `stopping`), device, precision, and each model's load state. Exits 3 if the server is not running. |
 | `--stop` | Stops the server and removes its socket and state file. |
 
 The server log is `~/Library/Caches/oh-my-slam/server.log`. [Inference server](#inference-server)
@@ -86,10 +86,10 @@ describes what runs inside it.
 Only `-i` and `-m` are required. With no other option, the command writes the whole map as JSON
 to stdout.
 
-* **`-i`** takes image files, folders of images, or exactly one video:
-  * Images keep the order given; the files in a folder are sorted by name.
-  * Hidden and non-image files in a folder are skipped.
-  * Image types: jpg, jpeg, png, bmp, tif, tiff, webp, heic, heif.
+* **`-i`** takes image files or exactly one video (spec §2.3); a folder is refused (pass its
+  files, e.g. `dir/*.jpg`, which the shell sorts by name):
+  * Images keep the order given.
+  * Image types: jpg, jpeg, png, bmp, tif, tiff, webp.
   * Video types: mp4, mov, m4v, avi, mkv, webm.
 * **`-m`** is the map folder:
   * A folder that is missing or empty becomes a new map. A folder holding nothing but a
@@ -102,8 +102,9 @@ to stdout.
     object of the map) and every keyframe pose. With `-f ply` it returns the whole map cloud.
   * `single` returns only the keyframes added by this update and the objects they observe. With
     `-f ply` it returns the points those keyframes see.
-* **`-fps`** applies to video only (default `2`). The command keeps the sharpest frame in each
-  1/fps time slot. For images, `-fps` is ignored with a warning.
+* **`-fps`** applies to video only (default `2`; it must be positive). The command keeps the
+  sharpest frame in each 1/fps time slot. For images, `-fps` is ignored with a warning, whatever
+  its value.
 * **`-p`** requires `-f ply`. Pixel-level keys are refused, because a map's points are already
   3D.
 
@@ -124,8 +125,9 @@ Exactly one of `-i` and `-m` is required.
 * **`-p`** shapes both the `-f ply` output and `segments.ply`, so it needs `-f ply` or `-d`.
   `color` is fixed to `segment`, and any other value is refused. With `-m`, the pixel-level keys
   are refused.
-* **`--min-score S`** applies to `-i` only (default `0.5`). Allowed values are `[0.05, 1]`. The spec sets no
-  bound; 0.05 is the lowest score the detector is asked for.
+* **`--min-score S`** applies to `-i` only (default `0.5`). Any number is accepted, as the spec
+  sets no bound; below 0.05, the lowest score the detector is asked for, it keeps what 0.05
+  keeps, and above 1 it keeps no object.
 
 `--min-score` only adds or removes objects. The objects kept at two thresholds have the same id,
 colour, mask, points and box, for these reasons:
@@ -173,43 +175,30 @@ The two modes differ:
 * **`-m`** opens the map read-only, without the server. It shows the map's complete cloud, every
   keyframe camera and the labelled OBBs.
 
-The first view of an image is from just behind the photo's viewpoint. The first view of a map
-looks down 60° on the whole scene and all its cameras, so that the walls of a room hide little
-of its floor, objects and camera cluster. *Reset view* (`R`) returns to it.
+The first view looks down 60° on the whole scene and its cameras, so that the walls of a room
+hide little of its floor, objects and camera cluster.
 
 The page has four tabs:
 
 * **Controls**
-  * *Layers* has one independent switch each for the point cloud, the segmentation overlay, the
-    camera poses, the labels and the oriented boxes. The segmentation overlay draws only the
-    points of each object, in its colour, over the cloud. It is not the `color=segment`
-    attribute, which recolours the whole cloud (unsegmented points grey); the layer's note says
-    when that attribute is on as well.
+  * *Layers* has one independent switch each for the point cloud, the segmentation, the camera
+    poses, the labels and the oriented boxes. The segmentation layer draws only the points of
+    each object, in its colour, over the cloud. It is not the `color=segment` attribute, which
+    recolours the whole cloud (unsegmented points grey).
   * *Point cloud* has live controls for the point-cloud attributes that affect the display. For
     an image these are `color`, `stride`, `min-depth`, `max-depth`, `edge`, `voxel` and
-    `normals`. For a map they are `color`, `voxel` and `normals`. The panel also shows the
-    equivalent `-p …` string and a *Defaults* button.
-  * *Display* sets the point size, the normals shading, the labels (*id tags + names that fit*,
-    or *id tags only*) and the background.
-* **Catalogue** lists the objects, with a label filter.
+    `normals`. For a map they are `color`, `voxel` and `normals`. With `normals=on` the points
+    are shaded by their normals. An invalid combination is reported under the controls and the
+    last good cloud stays.
+* **Catalogue** lists the objects (`-i`: the image's; `-m`: the map's), largest first.
 * **Cameras** lists every displayed camera's centre (x, y, z in metres, in the scene frame), with
-  a *Go to* button that moves the viewpoint to that camera, looking where it looked. `[` and `]`
-  step through the cameras.
-* **Image** shows the segmented image (`-i` only). A click enlarges it to the window; in the
-  enlarged view a click switches between fit and actual pixels, and `Esc` closes it.
+  a *Go to* button that moves the viewpoint to that camera, looking where it looked.
+* **Image** shows the segmented image (`-i` only).
 
-Other keys: `R` resets the view, and `Esc` clears the selection.
-
-Every box whose top is in view carries a label: its id on a tag in the object's colour, next to
-the box or, when that spot is taken, a little farther out with a leader line to it. No label
-covers another label, the header or the help line, and labels never leave the view. Tags that
-still do not fit are counted on a `+N` chip near their boxes: hovering or clicking the chip lists
-them (id and name), and clicking an entry selects that box. Names are added wherever they fit,
-larger boxes on screen first. The selected box always shows its name, and hovering a box or its
-tag shows its id and name. Camera frustums fade out as the viewpoint comes
-near them. The camera being looked through and its neighbours, for example the rest of a capture
-that turns in place, therefore never draw lines across the view. Boxes that enclose the viewpoint
-fade the same way, except the selected one.
+Every box whose top is in view carries a label next to its top face: its id on a tag in the
+object's colour, then its name, on a dark plate so that it reads over any cloud. Larger boxes on
+screen are labelled first; a label that would cover another moves to a free place close by, then
+drops its name, and labels never leave the view.
 
 The viewer contains no geometry, segmentation or colour logic of its own:
 
@@ -217,11 +206,11 @@ The viewer contains no geometry, segmentation or colour logic of its own:
   that writes PLY files. A control therefore never re-runs inference.
 * The page shows the complete cloud up to 12,000,000 points. In Edge on the M4 Max, a cloud of
   that size loads in about 2 s and orbits at 60 frames per second. Larger clouds are thinned for
-  display only, keeping every k-th point, and the page says so.
+  display only, keeping every k-th point, and the page says so under the point-cloud controls.
 * `encoding` and `label` concern PLY files only and have no control.
 
 The page draws a frame only when something visible changes: the viewpoint, a layer, a control,
-the selection, the window size. An idle page therefore leaves the GPU to the inference server; with
+the window size. An idle page therefore leaves the GPU to the inference server; with
 the 8.9-million-point living-room map open, it draws no frames in 10 s, where it used to draw 600.
 
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.
@@ -292,7 +281,7 @@ The same source and attributes always give byte-identical files.
 | 0 | Success. A consumer closing the pipe early (`\| head`) also exits 0. |
 | 1 | Internal error. Also used when the server stays busy after retries, when inference fails, or when COLMAP is missing or the wrong version. |
 | 2 | Usage or input error: bad option, bad `-p`, missing or unsupported input file, `.venv` missing. |
-| 3 | The inference server is not running. The message says to run `./start_inference_server.sh`. |
+| 3 | The inference server is not running, or its models failed to load. The message says what to run (`./start_inference_server.sh`, or a restart after fixing the cause the log names). |
 | 4 | `-m` folder is not empty and not a map (`mapper.sh`), or is not a map (`segment.sh -m`, `view.sh -m`). |
 | 5 | Nothing could be registered, for example because the new images do not overlap the map. The map is unchanged. |
 | 6 | Another `mapper.sh update` holds the map lock. |
@@ -424,7 +413,6 @@ produces it. The `color=height` ramp is viridis.
 | `sfm/database.db`, `sfm/model/` | The COLMAP database, and the COLMAP model in map coordinates. |
 | `cloud.ply`, `cloud_objects.npy` | The map cloud, and the object id of each of its points. |
 | `objects.json`, `objects/points_NNNNNN.npy` | Object state (evidence, strikes, merges) and each object's canonical points. |
-| `scene.json` | The full scene as of the last update. `segment.sh -m` and `view.sh -m` rebuild the scene from the persisted state instead, so that object colours follow the current palette. |
 | `.lock`, `.staging/` | The update lock, and the staging area of an update in progress. |
 
 An update writes everything into `.staging/`, then records the list of staged files (the commit
@@ -968,11 +956,11 @@ are:
 |---|---|
 | `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
-| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); near-duplicate objects (compatible labels, or both horizontal-surface labels at one height; never detected in the same keyframe; boxes within 0.3 m); the largest share of an object's detected mask points (lifted with the detecting keyframe's depth) outside its box grown by the depth noise, max(5 cm, 5 % of the depth), and, as a check of the mapper's attribution gate, of its cloud points outside that gate; and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
+| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
 | `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
-| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, exit codes, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
 | `gt.*` | Accuracy against ground truth, when annotations exist. |
 
 Per-stage memory comes from two sources. Each command records its stages (`core.timing`), and
@@ -1081,14 +1069,15 @@ runs it end to end as a test.
 ## Development
 
 ```sh
-uv run pytest -m "not models and not browser and not eval" -q         # offline suite (stub server)
+uv run pytest -m "not models and not browser and not eval" -q         # offline suite (stub models)
 uv run pytest --cov=oh_my_slam -m "not models and not browser and not eval"
 OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models                 # real models; server running
 uv run pytest -m browser                                              # viewer in Edge/Chrome (Playwright)
 uv run ruff check . && uv run mypy src && uv run lint-imports         # lint, types, ownership
 ```
 
-The offline suite runs against a deterministic stub server. The mapping end-to-end tests are
+The offline suite runs the shipped server process with deterministic stub models
+(`tests/fakes/stub_models.py`, started by `tests/fakes/stub_server.py`). The mapping end-to-end tests are
 skipped when `colmap` is not installed. The `eval` marker selects the evaluator's end-to-end run
 (see [Benchmark evaluator](#benchmark-evaluator)).
 
@@ -1102,6 +1091,9 @@ Environment variables:
 
 ## Troubleshooting
 
+* **`inference server models failed to load (…)` (exit 3).** The server runs but a model did
+  not load; the message names it and the log. Fix the cause, then restart the server with
+  `./start_inference_server.sh --stop && ./start_inference_server.sh`.
 * **`inference server is not running — start it with ./start_inference_server.sh` (exit 3).**
   Start the server. `--status` shows which models loaded, and the log is
   `~/Library/Caches/oh-my-slam/server.log`.

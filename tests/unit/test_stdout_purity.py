@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -148,6 +149,32 @@ def test_output_file_leaves_stdout_empty(stub_server: None, image: Path, tmp_pat
         if script == "segment.sh" and "-d" in args:
             assert (tmp_path / "art" / "segmentation.json").read_bytes() == data
     assert not list((tmp_path / "results").glob(".*.tmp"))  # atomic writes leave no temp files
+
+
+@pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
+def test_mapper_update_stdout_on_a_multi_image_map(stub_server: None, tmp_path: Path) -> None:
+    """``mapper.sh update`` through the shell on several images (COLMAP features and matching,
+    the map's frames registered together): stdout is exactly one JSON document, then, extending
+    the map, exactly one PLY; with ``-o`` stdout stays empty. Progress and timings go to stderr."""
+    frames = sorted((REPO / "examples" / "ainex-captures").glob("*.jpg"))
+    first, second = frames[:4], frames[4:6]
+    mdir = tmp_path / "map"
+    res = sh("mapper.sh", "update", "-i", *map(str, first), "-m", str(mdir), timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    doc = assert_one_json(res.stdout)
+    assert len(doc["openlabel"]["frames"]) >= 2  # a multi-image map
+    assert b"timings: total" in res.stderr
+    res = sh("mapper.sh", "update", "-i", *map(str, second), "-m", str(mdir), "-f", "ply",
+             "-t", "single", timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    assert_one_ply(res.stdout)
+    target = tmp_path / "full.json"
+    res = sh("mapper.sh", "update", "-i", str(frames[6]), "-m", str(mdir), "-o", str(target),
+             timeout=600)
+    assert res.returncode == 0, res.stderr.decode()
+    assert res.stdout == b""
+    assert len(assert_one_json(target.read_bytes())["openlabel"]["frames"]) >= len(
+        doc["openlabel"]["frames"])
 
 
 def test_timings_go_to_stderr_and_the_env_file_only(stub_server: None, image: Path,
