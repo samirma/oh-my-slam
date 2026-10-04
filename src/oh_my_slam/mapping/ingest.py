@@ -62,7 +62,7 @@ def resolve_inputs(args: list[Path]) -> InputSpec:
     return InputSpec("images", images)
 
 
-def _write_image_keyframe(src: Path, dst: Path) -> None:
+def write_upright_jpeg(src: Path, dst: Path) -> None:
     """Upright JPEG copy: byte copy for upright JPEGs (keeps EXIF), re-encode otherwise."""
     with Image.open(src) as img:
         orientation = img.getexif().get(ExifTags.Base.Orientation, 1)
@@ -92,6 +92,6 @@ def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int
     for src in spec.images:
         name = frame_name(idx)
         path = frames_dir / f"{name}.jpg"
-        _write_image_keyframe(src, path)
+        write_upright_jpeg(src, path)
         yield Keyframe(name, idx, path, str(src), exif_intrinsics(src))
         idx += 1

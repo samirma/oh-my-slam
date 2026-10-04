@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,14 @@ def _is_special(path: Path) -> bool:
     """An existing file that is not a regular file (``/dev/null``, a FIFO): written in place, since
     it cannot be replaced by a rename."""
     return path.exists() and not path.is_file()
+
+
+def clone_file(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst`` as an APFS clone (``cp -c``: instant, no extra space) when the
+    filesystem allows it, else as a plain copy."""
+    res = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
+    if res.returncode != 0:
+        shutil.copyfile(src, dst)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:

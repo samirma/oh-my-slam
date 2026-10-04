@@ -91,7 +91,8 @@ def test_mapping_delegates_depth_and_segmentation() -> None:
     """Mapping gets keyframe depth from ``reconstruction.api`` and detections, lifting, boxes and
     colours from ``segmentation.api``; it never fits, lifts, detects or colours by itself."""
     files = _py_files("mapping")
-    assert _grep(r"reconstruct_image\(", files) == {"mapping/api.py"}
+    # api: keyframes; locate: the retrieval descriptor of a query image (large maps)
+    assert _grep(r"reconstruct_image\(", files) == {"mapping/api.py", "mapping/locate.py"}
     assert _grep(r"detect_alongside\(", files) == {"mapping/api.py"}
     assert _grep(r"lift_detections\(", files) == {"mapping/objects.py"}
     assert _grep(r"fit_object_obb\(", files) == {"mapping/objects.py"}
