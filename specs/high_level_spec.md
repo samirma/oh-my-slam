@@ -7,15 +7,16 @@ video, incrementally assembles them into a persistent map that can be inspected 
 browser, and describes that map as a set of **labelled objects with oriented bounding
 boxes (OBBs)**.
 
-The system is exposed through five shell entry points:
+The system is exposed through six shell entry points:
 
 | Entry point | Responsibility |
 | --- | --- |
 | `start_inference_server.sh` | Start the depth- and segmentation-inference server and any other long-lived services required for mapping. |
 | `reconstruct.sh` | Single-frame reconstruction: image → scene description (JSON + OBBs) or point cloud. |
-| `mapper.sh` | Multi-frame mapping: build and update a persistent map. |
+| `mapper.sh` | Multi-frame mapping: build and update a persistent map, and locate an image's camera in it. |
 | `segment.sh` | Instance segmentation: image or map → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
 | `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
+| `server.sh` | Web service: an HTTP API and a browser application giving access to every feature of `reconstruct.sh`, `mapper.sh`, `segment.sh` and `view.sh`. |
 
 This document states requirements only. Detailed decisions — defaults, coordinate
 conventions, exit codes, the OpenLABEL field mapping, the colour palette — are recorded in
@@ -33,6 +34,7 @@ Each entry point is specified in its own file:
 | §2.3 | `mapper.sh` | [Mapping](mapper.md) |
 | §2.4 | `segment.sh` | [Segmentation](segment.md) |
 | §2.5 | `view.sh` | [Visualisation](view.md) |
+| §2.6 | `server.sh` | [Web service](http_server.md) |
 
 ## 3. Scene description (JSON) returned by the tools
 

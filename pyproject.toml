@@ -21,6 +21,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "httpx>=0.28",
+    "python-multipart>=0.0.20",
     "pydantic>=2.10",
     # models (loaded only inside the inference server). torch 2.13 corrupts attention on macOS 26.
     "torch==2.14.*",

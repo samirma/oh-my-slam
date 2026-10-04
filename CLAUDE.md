@@ -31,7 +31,9 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
 
 ## Spec invariants that span several sections
 
-- **Five entry points:** `start_inference_server.sh`, `reconstruct.sh`, `mapper.sh`, `segment.sh`, `view.sh`.
+- **Six entry points:** `start_inference_server.sh`, `reconstruct.sh`, `mapper.sh` (`update`, `locate`), `segment.sh`,
+  `view.sh`, `server.sh` (web service, `specs/http_server.md`: derives everything from the commands' shared
+  definitions; its package is `oh_my_slam.web`, since `oh_my_slam.server` is the inference server).
 - **Ownership:**
   - Segmentation code (`oh_my_slam.segmentation`, behind `segment.sh`) is the only owner of
     segmentation, OBB fitting, colour assignment and the derivation of every emitted point cloud.
@@ -86,6 +88,7 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
 
 - **Never bind a fixed port.** Orphaned processes from earlier work hold ports such as 8080, 8081
   and 8088.
-- Run benchmarks one at a time; concurrent GPU work invalidates timings.
+- Run benchmarks one at a time; concurrent GPU work invalidates timings. Every colmap, mapper, inference or
+  `-m models` command goes through one machine lock: `flock ~/Library/Caches/oh-my-slam/heavy.lock <cmd>`.
 - Research subagents verify claims online only: no installs, weight downloads or local benchmarks.
   This machine is the user's daily driver.

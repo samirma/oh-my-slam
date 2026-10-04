@@ -3,12 +3,13 @@
 Part of the [high-level specification](high_level_spec.md) (§2 Components).
 
 ```sh
-view.sh -i <image>
-view.sh -m <map-folder>
+view.sh -i <image> [--no-browser]
+view.sh -m <map-folder> [--no-browser]
 ```
 
 Starts a local web server for interactive browser visualisation. Exactly one input is
-required: `-i` and `-m` are mutually exclusive.
+required: `-i` and `-m` are mutually exclusive. Once the server accepts connections it opens
+the default browser on its page; `--no-browser` only prints the URL on stderr.
 
 * `-i <image>` — reconstruct and segment one RGB image, then show its colour point cloud,
   segmented image, object catalogue, labelled OBBs, and the camera at its estimated pose.
