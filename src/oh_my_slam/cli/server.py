@@ -30,20 +30,12 @@ def _say(msg: str) -> None:
     print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
 
 
-def _server_cmd(stub: bool) -> list[str]:
-    cmd = [sys.executable, "-m", "oh_my_slam.server.main"]
-    if stub:
-        cmd.append("--stub")
-    return cmd
+def _server_cmd() -> list[str]:
+    return [sys.executable, "-m", "oh_my_slam.server.main"]
 
 
 def _describe(h: object) -> str:
-    status = getattr(h, "status", "?")
-    device = getattr(h, "device", "?")
-    models = getattr(h, "models", {})
-    missing = [m.name for m in models.values() if not m.loaded]
-    extra = f"; unavailable: {', '.join(missing)}" if missing else ""
-    return f"{status} on {device}{extra}"
+    return f"{getattr(h, 'status', '?')} on {getattr(h, 'device', '?')}"
 
 
 def _tail(path: Path, n: int = 25) -> str:
@@ -54,11 +46,11 @@ def _tail(path: Path, n: int = 25) -> str:
     return "\n".join(lines[-n:])
 
 
-def start(timeout: float, stub: bool) -> int:
+def start(timeout: float) -> int:
     client = InferenceClient()
     try:
         h = client.health()
-        if h.status in ("ready", "degraded"):
+        if h.status == "ready":
             _say(f"already running ({_describe(h)})")
             return 0
         if h.status == "loading":
@@ -74,7 +66,7 @@ def start(timeout: float, stub: bool) -> int:
         logf.write(f"\n=== start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
         logf.flush()
         proc = subprocess.Popen(
-            _server_cmd(stub),
+            _server_cmd(),
             stdin=subprocess.DEVNULL,
             stdout=logf,
             stderr=logf,
@@ -96,7 +88,7 @@ def _wait_ready(client: InferenceClient, proc: subprocess.Popen[bytes] | None, t
             return 1
         try:
             h = client.health(timeout=1.0)
-            if h.status in ("ready", "degraded"):
+            if h.status == "ready":
                 _say(f"ready after {elapsed:.1f} s ({_describe(h)})")
                 return 0
             if h.status == "error":
@@ -165,19 +157,12 @@ def main(argv: list[str]) -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--stop", action="store_true", help="stop the running server")
     group.add_argument("--status", action="store_true", help="print health JSON to stdout")
-    parser.add_argument("--stub", action="store_true", help=argparse_suppress())
     args = parser.parse_args(argv)
     if args.stop:
         return stop()
     if args.status:
         return status()
-    return start(START_TIMEOUT_S, args.stub)
-
-
-def argparse_suppress() -> str:
-    import argparse
-
-    return argparse.SUPPRESS
+    return start(START_TIMEOUT_S)
 
 
 def entry() -> None:

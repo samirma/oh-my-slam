@@ -48,7 +48,6 @@ that could not be confirmed.
 | numpy | 2.5.3 | BSD-3-Clause (plus 0BSD, MIT, Zlib, CC0-1.0 for bundled parts) | |
 | scipy | 1.18.1 | BSD-3-Clause | |
 | pillow | 12.3.0 | MIT-CMU | |
-| pillow-heif | 1.8.0 | BSD-3-Clause source; **binary wheel GPL-2.0** | The wheel bundles libheif (LGPL-3.0), libde265 (LGPL-3.0) and x265 (GPL-2.0), per its `LICENSES_bundled.txt`. |
 | av (PyAV) | 18.1.0 | BSD-3-Clause | The macOS wheel bundles FFmpeg 8 with libx264 and libx265 (GPL-2.0-or-later), so the binary is effectively GPL. |
 | opencv-python-headless | 4.14.0.94 | Apache-2.0 (OpenCV) | Wheels ship FFmpeg under LGPL-2.1 (PyPI description). The macOS arm64 wheel also bundles libx264 and libx265 (GPL-2.0-or-later). |
 | jsonschema | 4.26.0 | MIT | |
@@ -80,6 +79,7 @@ rows are listed because they are copyleft or otherwise notable:
 | Package | Version | Licence | Pulled in by |
 |---|---|---|---|
 | plyfile | 1.1.5 | GPL-3.0-or-later | MapAnything |
+| pillow-heif | 1.8.0 | BSD-3-Clause source; **binary wheel GPL-2.0** (it bundles libheif and libde265, LGPL-3.0, and x265, GPL-2.0, per its `LICENSES_bundled.txt`) | MapAnything (oh-my-slam itself reads no HEIC/HEIF) |
 | ultralytics-thop | 2.1.6 | AGPL-3.0 | ultralytics |
 | ultralytics-platform | 0.1.54 | AGPL-3.0-only | ultralytics |
 | certifi | 2026.7.22 | MPL-2.0 | httpx, requests |

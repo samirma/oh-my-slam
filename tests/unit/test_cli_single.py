@@ -190,6 +190,11 @@ def test_segment_min_score_keeps_ids_and_colours(env) -> None:  # type: ignore[n
     assert cli_segment.main(["-i", str(img), "--min-score", "0.1"]) == 0
     low = json.loads(cap.take())["openlabel"]["objects"]
     assert {k: low[k] for k in full} == full
+    # nor any bound at all: below the detector's own floor, or above 1 (no object left)
+    assert cli_segment.main(["-i", str(img), "--min-score", "0.01"]) == 0
+    assert set(json.loads(cap.take())["openlabel"]["objects"]) >= set(full)
+    assert cli_segment.main(["-i", str(img), "--min-score", "1.5"]) == 0
+    assert not json.loads(cap.take())["openlabel"].get("objects")
 
 
 def test_segment_output_file_and_no_files_by_default(env, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -208,8 +213,7 @@ def test_segment_usage_errors(env, tmp_path: Path) -> None:  # type: ignore[no-u
     img, _cap, client = env
     for args in (["-m", str(tmp_path), "--min-score", "0.6"],
                  ["-i", str(img), "--min-score", "abc"],
-                 ["-i", str(img), "--min-score", "1.5"],
-                 ["-i", str(img), "--min-score", "0.01"],  # below the detection floor
+                 ["-i", str(img), "--min-score", "nan"],
                  ["-i", str(img), "-p", "voxel=0.1"],  # -p needs -f ply or -d
                  ["-i", str(img), "-f", "ply", "-p", "color=rgb"],  # colour fixed to segment
                  ["-m", str(tmp_path), "-f", "ply", "-p", "stride=2"]):  # pixel-level on a map

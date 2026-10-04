@@ -45,7 +45,7 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
     add_frames(client, room, second, tmp_path / "b", "b", depth_noise=0.03, seed=5)
     mdir = tmp_path / "map"
     msgs: list[str] = []
-    res = update(mdir, [tmp_path / "a"], client=client, progress=msgs.append)
+    res = update(mdir, sorted((tmp_path / "a").glob("*.png")), client=client, progress=msgs.append)
     assert any("multi-view fallback (rotation-dominant" in m for m in msgs), msgs
     assert client.calls["multiview"] >= 2  # chunked
     r = MapReader(mdir)
@@ -59,7 +59,7 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
     old_poses = {f.name: f.T_map_cam.matrix() for f in r.frames}
 
     # anchored update, -t single -f ply
-    res2 = update(mdir, [tmp_path / "b"], mode="single", fmt="ply", client=client,
+    res2 = update(mdir, sorted((tmp_path / "b").glob("*.png")), mode="single", fmt="ply", client=client,
                   progress=msgs.append)
     assert len(res2.new_frames) == 8
     cloud = parse_ply(res2.payload)
@@ -88,8 +88,8 @@ def test_noisy_multiview_poses_are_refined_and_updates_stay_consistent(tmp_path:
     add_frames(client, room, second, tmp_path / "b", "b", depth_noise=0.03, seed=5)
     mdir = tmp_path / "map"
     msgs: list[str] = []
-    update(mdir, [tmp_path / "a"], client=client, progress=msgs.append)
-    update(mdir, [tmp_path / "b"], client=client, progress=msgs.append)
+    update(mdir, sorted((tmp_path / "a").glob("*.png")), client=client, progress=msgs.append)
+    update(mdir, sorted((tmp_path / "b").glob("*.png")), client=client, progress=msgs.append)
     r = MapReader(mdir)
     assert len(r.frames) == 36
     truth = first + second

@@ -1,5 +1,5 @@
-"""Mapper inputs: ``-i`` expansion (image files, image folders, or exactly one video), keyframe
-sampling and naming."""
+"""Mapper inputs: ``-i`` resolution (image files, or exactly one video), keyframe sampling and
+naming."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from oh_my_slam.core.images import (
     IMAGE_SUFFIXES,
     VIDEO_SUFFIXES,
     exif_intrinsics,
-    is_image_file,
     load_rgb,
     save_jpeg,
 )
@@ -41,30 +40,22 @@ class Keyframe:
     exif: Intrinsics | None  # intrinsics from the original file's EXIF, if any
 
 
-def _expand_dir(d: Path) -> list[Path]:
-    return sorted((p for p in d.iterdir() if is_image_file(p)), key=lambda p: p.name)
-
-
 def resolve_inputs(args: list[Path]) -> InputSpec:
-    """Files and folders of images (folders sorted by name, hidden/non-image skipped), or
-    exactly one video."""
+    """Image files, in the order given, or exactly one video (spec §2.3: image(s) or a video)."""
     if not args:
-        raise UsageError("-i needs at least one image, image folder or video")
+        raise UsageError("-i needs at least one image or a video")
     videos = [a for a in args if a.is_file() and a.suffix.lower() in VIDEO_SUFFIXES]
     if videos:
         if len(args) != 1:
-            raise UsageError("-i takes exactly one video, or images/folders (not both)")
+            raise UsageError("-i takes exactly one video, or images (not both)")
         return InputSpec("video", [], videos[0])
     images: list[Path] = []
     for a in args:
         if not a.exists():
             raise InputError(f"input not found: {a}")
         if a.is_dir():
-            found = _expand_dir(a)
-            if not found:
-                raise InputError(f"no images in folder {a}")
-            images.extend(found)
-        elif a.suffix.lower() in IMAGE_SUFFIXES and not a.name.startswith("."):
+            raise InputError(f"{a} is a folder; -i takes image files (e.g. {a}/*.jpg) or a video")
+        if a.suffix.lower() in IMAGE_SUFFIXES and not a.name.startswith("."):
             images.append(a)
         else:
             raise InputError(f"unsupported input (not an image or video): {a}")

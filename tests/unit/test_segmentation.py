@@ -234,9 +234,9 @@ def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: i
     assert detect.request_floor(0.5) == detect.request_floor(0.85) == detect.TRUSTED_SCORE
     with pytest.raises(ValueError):
         detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR / 2)
-    frame = reconstruct_image(img, client=client)
-    with pytest.raises(ValueError):
-        segment_frame(frame, client=client, min_score=detect.DETECTION_FLOOR / 2)
+    # the spec bounds --min-score nowhere: below the detector's floor it keeps what the floor keeps
+    assert (_objects(client, img, detect.DETECTION_FLOOR / 2)
+            == _objects(client, img, detect.DETECTION_FLOOR))
 
 
 def test_low_scoring_detections_never_change_the_default_objects(overlapping) -> None:  # type: ignore[no-untyped-def]

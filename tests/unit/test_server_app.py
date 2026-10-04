@@ -13,7 +13,8 @@ from oh_my_slam.client import protocol as p
 from oh_my_slam.core import rle
 from oh_my_slam.server.app import ServerState, create_app
 from oh_my_slam.server.gpu_worker import GpuWorker
-from oh_my_slam.server.models import Registry, build_registry
+from oh_my_slam.server.models import Registry
+from tests.fakes.stub_models import stub_registry
 
 
 @pytest.fixture
@@ -25,7 +26,7 @@ def image(tmp_path: Path) -> Path:
 
 
 def make_state(loaded: bool = True, max_queue: int = 8) -> ServerState:
-    reg = build_registry(stub=True)
+    reg = stub_registry()
     worker = GpuWorker(max_queue=max_queue)
     worker.start()
     state = ServerState(registry=reg, worker=worker)
@@ -126,7 +127,7 @@ def test_registry_status_rules() -> None:
     reg = Registry()
 
     class A:
-        key, name, required = "a", "A", True
+        key, name = "a", "A"
 
         def load(self, device: str) -> None:
             raise RuntimeError("no weights")
@@ -137,3 +138,21 @@ def test_registry_status_rules() -> None:
     reg.add(A())
     reg.load_all("cpu")
     assert reg.status() == "error" and reg.get("a") is None
+
+
+def test_failed_models_give_an_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server whose models failed to load is not "not running": the message says the models
+    failed, where the log is and how to restart; the exit code stays 3 (server unavailable)."""
+    from oh_my_slam.client.client import InferenceClient
+    from oh_my_slam.core import paths
+    from oh_my_slam.core.errors import ExitCode, ServerModelsFailedError
+
+    health = p.Health(status="error", models={
+        "geometry": p.ModelStatus(name="MoGe", error="OSError: no weights")})
+    monkeypatch.setattr(InferenceClient, "health", lambda self, timeout=0: health)
+    with pytest.raises(ServerModelsFailedError) as exc:
+        InferenceClient().require_ready()
+    msg = str(exc.value)
+    assert "models failed to load" in msg and "MoGe: OSError: no weights" in msg
+    assert str(paths.server_log()) in msg and "./start_inference_server.sh" in msg
+    assert "not running" not in msg and exc.value.exit_code == ExitCode.SERVER_UNAVAILABLE

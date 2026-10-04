@@ -583,7 +583,8 @@ def test_capture_timestamps_are_not_used(tmp_path: Path) -> None:
         exif.get_ifd(0x8769)[0x9003] = f"2026:01:0{3 - k} 12:00:00"  # DateTimeOriginal
         Image.new("RGB", (16, 12), (40 * k, 0, 0)).save(d / name, exif=exif)
         os.utime(d / name, (1_000_000 - k * 1000, 1_000_000 - k * 1000))  # mtimes reversed
-    kfs = list(ingest.keyframes(ingest.resolve_inputs([d]), 2.0, tmp_path / "frames", 0))
+    kfs = list(ingest.keyframes(ingest.resolve_inputs(sorted(d.iterdir())), 2.0,
+                                tmp_path / "frames", 0))
     assert [Path(k.source).name for k in kfs] == ["a.jpg", "b.jpg", "c.jpg"]
     assert [k.index for k in kfs] == [0, 1, 2]
     pattern = re.compile(r"DateTime|0x9003|0x0132|getmtime|st_mtime|st_ctime|st_birthtime")

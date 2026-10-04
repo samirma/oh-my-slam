@@ -74,8 +74,17 @@ def test_import_contracts_express_the_ownership_rules() -> None:
     assert "oh_my_slam.client" in by_source["oh_my_slam.mapping"]
     assert {"oh_my_slam.segmentation", "oh_my_slam.mapping"} <= by_source[
         "oh_my_slam.reconstruction"]
-    for pkg in ("mapping", "segmentation", "viewer", "server"):
+    for pkg in ("mapping", "segmentation", "viewer", "server", "cli", "tools"):
         assert "open3d" in by_source[f"oh_my_slam.{pkg}"], pkg
+    for pkg in ("cli", "tools", "viewer", "mapping", "segmentation", "reconstruction", "client"):
+        assert {"torch", "ultralytics"} <= by_source[f"oh_my_slam.{pkg}"], pkg
+    assert "oh_my_slam.client" in by_source["oh_my_slam.viewer"]
+    # only the CLI starts the server; the evaluator reads its lifecycle state and nothing else
+    for pkg in ("viewer", "mapping", "segmentation", "reconstruction", "client", "schema", "core"):
+        assert "oh_my_slam.server" in by_source[f"oh_my_slam.{pkg}"], pkg
+    server_internals = {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")}
+    assert server_internals <= by_source["oh_my_slam.tools"]
+    assert "oh_my_slam.server.lifecycle" not in by_source["oh_my_slam.tools"]
 
 
 def test_mapping_delegates_depth_and_segmentation() -> None:

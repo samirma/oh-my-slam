@@ -1,7 +1,7 @@
 """Model adapters loaded by the inference server.
 
-Every adapter method runs on the single GPU worker thread. ``load`` may raise; required adapters
-put the server in ``error``, optional ones put it in ``degraded``.
+Every adapter method runs on the single GPU worker thread. ``load`` may raise; every adapter is
+required, so one failure puts the server in ``error``.
 """
 
 from __future__ import annotations
@@ -62,24 +62,11 @@ class Registry:
         self.precision = next((p for p in precision if p), "fp32")
 
     def status(self) -> str:
-        required_ok = all(
-            self.state[k].loaded for k, a in self.adapters.items() if getattr(a, "required", True)
-        )
-        if not required_ok:
-            return "error"
-        if all(st.loaded for st in self.state.values()):
-            return "ready"
-        return "degraded"
+        return "ready" if all(st.loaded for st in self.state.values()) else "error"
 
 
-def build_registry(stub: bool = False) -> Registry:
+def build_registry() -> Registry:
     reg = Registry()
-    if stub:
-        from oh_my_slam.server.models.stub import stub_adapters
-
-        for a in stub_adapters():
-            reg.add(a)
-        return reg
     from oh_my_slam.server.models.geometry_moge import MoGeGeometry
     from oh_my_slam.server.models.gravity_geocalib import GeoCalibGravity
     from oh_my_slam.server.models.multiview_mapanything import MapAnythingMultiview

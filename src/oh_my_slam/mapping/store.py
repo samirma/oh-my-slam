@@ -9,7 +9,6 @@ Layout (all paths relative to the map folder)::
                         instances.json (RLE masks, labels, scores, object ids), descriptor.npy
     sfm/database.db     COLMAP database;  sfm/model/  COLMAP model in map coordinates
     cloud.ply  cloud_objects.npy  objects.json  objects/points_NNNNNN.npy
-    scene.json          cached full scene
 
 Updates write every new or changed file into ``.staging/`` first. ``commit`` writes the list of
 staged files to ``.staging/COMMIT`` (the commit point), moves them into place and writes
@@ -43,7 +42,6 @@ from oh_my_slam.version import MAP_FORMAT_VERSION
 MAP_JSON = "map.json"
 FRAMES_JSON = "frames.json"
 OBJECTS_JSON = "objects.json"
-SCENE_JSON = "scene.json"
 CLOUD_PLY = "cloud.ply"
 CLOUD_OBJECTS = "cloud_objects.npy"
 SFM_DB = "sfm/database.db"

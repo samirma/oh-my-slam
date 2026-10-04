@@ -308,7 +308,8 @@ class Evaluation:
         """The one-update map and the split map; their ``-t full`` scenes."""
         single_dir, split_dir = self.out / "maps" / "single", self.out / "maps" / "split"
         single = self.scene(self.run("mapper_single", "mapper_single", "mapper.sh", "update",
-                                     "-i", self.examples / SEQUENCE, "-m", single_dir))
+                                     "-i", *(self.examples / SEQUENCE / c.name for c in captures),
+                                     "-m", single_dir))
         split = None
         parts = np.array_split(np.arange(len(captures)), SPLITS)
         for k, idx in enumerate(parts, start=1):
@@ -427,7 +428,7 @@ class Evaluation:
         maps = self.out / "maps"
         single_dir, ext_dir = maps / "office", maps / "office_extended"
         single = self.scene(self.run("mapper_office", "mapper_office", "mapper.sh", "update",
-                                     "-i", folder, "-m", single_dir))
+                                     "-i", *(folder / n for n in images), "-m", single_dir))
         first = self.scene(self.run("mapper_office_early", "mapper_office_extended", "mapper.sh",
                                     "update", "-i", *(folder / n for n in early), "-m", ext_dir))
         # the first update's view is read now: the map's frame records change with the next

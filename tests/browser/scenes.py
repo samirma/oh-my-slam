@@ -40,7 +40,7 @@ def synthetic_map(folder: Path) -> Path:
 
     client = FakeClient()
     add_frames(client, mapping_room(), ring(12), folder / "in", "v", seed=11)
-    update(folder / "map", [folder / "in"], client=client, progress=lambda m: None)
+    update(folder / "map", sorted((folder / "in").glob("*.png")), client=client, progress=lambda m: None)
     return folder / "map"
 
 
