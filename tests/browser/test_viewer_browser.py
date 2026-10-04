@@ -706,18 +706,18 @@ def test_segment_colours_stay_exact_with_normals(view: View) -> None:
     v = view
     set_only(v, {"points"})
     v.pg.select_option("#attr-color", "segment")
+    v.settle()
+    pre = [rgb for rgb in object_colours(v) if rgb in canvas_pixels(v)]
     v.pg.click("#attr-normals")
     v.settle()
     attrs = v.js("() => window.__viewer.cloud.attrs")
     assert "color=segment" in attrs and "normals=on" in attrs
     assert v.js("() => !!window.__viewerGroups.points.children[0].geometry.attributes.normal")
+    assert v.js("() => window.__viewerGroups.points.children[0].material.uniforms.shade.value") == 0
     px = canvas_pixels(v)
     assert (128, 128, 128) in px
     seen = [rgb for rgb in object_colours(v) if rgb in px]
-    dbg = v.js("() => { const m = window.__viewerGroups.points.children[0].material; return [m.defines, window.__viewer.cloud.attrs]; }")
-    import collections
-    near = collections.Counter(p for p in canvas_image(v).reshape(-1, 3).tolist().__iter__() if True).most_common(12) if False else None
-    assert seen, ("no object colour drawn exactly", dbg, object_colours(v), sorted(px)[:5], len(px))
+    assert seen and seen == pre, (seen, pre)  # every object colour seen without normals
     restore_defaults(v)
     assert v.errors == []
 

@@ -149,11 +149,12 @@ function parseCloud(buffer) {
 function pointMaterial({ color, normal, exact }) {
   const defines = {};
   if (color) defines.HAS_COLOR = '';
-  if (normal && !exact) defines.HAS_NORMAL = '';
+  if (normal) defines.HAS_NORMAL = '';
   return new THREE.ShaderMaterial({
     defines,
     uniforms: {
       size: { value: POINT_SIZE_CM },               // point diameter in centimetres
+      shade: { value: exact ? 0 : 1 },              // 0: colours exactly as sent
       focal: { value: focalPx() },                  // viewport focal length in pixels
       base: { value: new THREE.Vector3(0.80, 0.82, 0.86) },  // color=none
     },
@@ -161,7 +162,7 @@ function pointMaterial({ color, normal, exact }) {
       #ifdef HAS_COLOR
       attribute vec3 rgb;
       #endif
-      uniform float size; uniform float focal; uniform vec3 base;
+      uniform float size; uniform float focal; uniform int shade; uniform vec3 base;
       varying vec3 vColor;
       void main() {
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
@@ -171,8 +172,10 @@ function pointMaterial({ color, normal, exact }) {
         vec3 c = base;
         #endif
         #ifdef HAS_NORMAL
-        vec3 n = normalize(normalMatrix * normal);
-        c *= 0.3 + 0.7 * abs(dot(n, normalize(-mv.xyz)));
+        if (shade == 1) {
+          vec3 n = normalize(normalMatrix * normal);
+          c *= 0.3 + 0.7 * abs(dot(n, normalize(-mv.xyz)));
+        }
         #endif
         vColor = c;
         gl_PointSize = clamp(size * 0.01 * focal / max(-mv.z, 0.05), 1.0, 24.0);
