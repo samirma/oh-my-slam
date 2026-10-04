@@ -240,6 +240,18 @@ def test_spec_usage_lines_parse_with_defaults() -> None:
     s = cli_segment.build_parser().parse_args(
         ["-m", "map", "-f", "json", "-o", "o.json", "-d", "d", "-p", "label=on"])
     assert s.map == Path("map") and s.artifacts == Path("d")
+    from oh_my_slam.cli import mapper as cli_mapper
+
+    m = cli_mapper.build_parser().parse_args(["locate", "-i", "x.jpg", "-m", "map"])
+    assert (m.command, m.inputs, m.map, m.format, m.output, m.attrs, m.mode) == (
+        "locate", [Path("x.jpg")], Path("map"), "json", None, None, "single")
+    m = cli_mapper.build_parser().parse_args(
+        ["locate", "-i", "x.jpg", "y.jpg", "-m", "map", "-f", "ply", "-o", "o.ply", "-p",
+         "voxel=0.1", "-t", "full"])
+    assert (m.inputs, m.format, m.output, m.attrs, m.mode) == (
+        [Path("x.jpg"), Path("y.jpg")], "ply", Path("o.ply"), ["voxel=0.1"], "full")
+    u = cli_mapper.build_parser().parse_args(["update", "-i", "x.jpg", "-m", "map"])
+    assert (u.command, u.format, u.mode, u.fps) == ("update", "json", "full", None)
     with pytest.raises(SystemExit) as e:
         ArgumentParser(prog="x").parse_args(["--bad"])
     assert e.value.code == 2

@@ -25,7 +25,6 @@ import fcntl
 import json
 import os
 import shutil
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -35,7 +34,13 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.atomic import atomic_save_npy, atomic_write_bytes, atomic_write_json, fsync_dir
+from oh_my_slam.core.atomic import (
+    atomic_save_npy,
+    atomic_write_bytes,
+    atomic_write_json,
+    clone_file,
+    fsync_dir,
+)
 from oh_my_slam.core.errors import MapLockedError, NotAMapError
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.version import MAP_FORMAT_VERSION
@@ -208,8 +213,13 @@ class MapReader:
     # -- paths ---------------------------------------------------------------------------------
 
     def path(self, rel: str) -> Path:
+        """Where ``rel`` is read: its staged copy when a committed update lists it, unless that
+        copy is gone (an update killed partway through applying its commit had moved it in
+        place already), else the map's own file."""
         if rel in self._overlay:
-            return self.root / STAGING / rel
+            staged = self.root / STAGING / rel
+            if staged.exists():
+                return staged
         return self.root / rel
 
     def exists(self, rel: str) -> bool:
@@ -324,9 +334,7 @@ class MapTransaction:
         src = self.root / rel
         if dst.exists() or not src.exists():
             return dst
-        res = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
-        if res.returncode != 0:
-            shutil.copyfile(src, dst)
+        clone_file(src, dst)
         return dst
 
     def delete(self, rel: str) -> None:
