@@ -178,7 +178,7 @@ The two modes differ:
 The first view looks down 60° on the whole scene and its cameras, so that the walls of a room
 hide little of its floor, objects and camera cluster.
 
-The page has four tabs:
+The page has up to four tabs:
 
 * **Controls**
   * *Layers* has one independent switch each for the point cloud, the segmentation, the camera
@@ -188,17 +188,21 @@ The page has four tabs:
   * *Point cloud* has live controls for the point-cloud attributes that affect the display. For
     an image these are `color`, `stride`, `min-depth`, `max-depth`, `edge`, `voxel` and
     `normals`. For a map they are `color`, `voxel` and `normals`. With `normals=on` the points
-    are shaded by their normals. An invalid combination is reported under the controls and the
+    are shaded by their normals, except with `color=segment`, whose object colours and
+    unsegmented grey are always drawn exactly (§2.4 colour contract). An invalid combination is reported under the controls and the
     last good cloud stays.
-* **Catalogue** lists the objects (`-i`: the image's; `-m`: the map's), largest first.
+* **Catalogue** lists the image's objects, largest first (`-i` only, as §2.5 asks).
 * **Cameras** lists every displayed camera's centre (x, y, z in metres, in the scene frame), with
   a *Go to* button that moves the viewpoint to that camera, looking where it looked.
 * **Image** shows the segmented image (`-i` only).
 
-Every box whose top is in view carries a label next to its top face: its id on a tag in the
-object's colour, then its name, on a dark plate so that it reads over any cloud. Larger boxes on
-screen are labelled first; a label that would cover another moves to a free place close by, then
-drops its name, and labels never leave the view.
+Every box whose top is in view is labelled next to its top face: its id on a tag in the object's
+colour, then its name, on a dark plate so that it reads over any cloud. No label ever covers
+another or leaves the view. Larger boxes on screen are labelled first; a tag that would cover
+another moves to a free place on rings farther out, and a name is added only where it covers
+nothing. Where boxes are so crowded that a tag finds no free place, that box shows no tag; its
+id and label are listed under the Labels layer ("No room for: …"), and its tag appears once the
+view is zoomed in.
 
 The viewer contains no geometry, segmentation or colour logic of its own:
 

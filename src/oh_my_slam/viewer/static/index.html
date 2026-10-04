@@ -22,7 +22,7 @@
     <aside id="panel" aria-label="Controls">
       <nav id="tabs" role="tablist">
         <button type="button" role="tab" data-tab="controls" class="active" aria-selected="true">Controls</button>
-        <button type="button" role="tab" data-tab="catalogue" aria-selected="false">Catalogue</button>
+        <button type="button" role="tab" data-tab="catalogue" id="tab-catalogue-btn" aria-selected="false" hidden>Catalogue</button>
         <button type="button" role="tab" data-tab="cameras" aria-selected="false">Cameras</button>
         <button type="button" role="tab" data-tab="image" id="tab-image-btn" aria-selected="false" hidden>Image</button>
       </nav>
@@ -30,6 +30,7 @@
         <div class="group" id="group-layers">
           <h2>Layers</h2>
           <div class="rows" id="layers"></div>
+          <p id="labels-note" class="hint" role="status" hidden></p>
         </div>
         <div class="group" id="group-cloud">
           <h2>Point cloud</h2>
@@ -64,7 +65,6 @@
     <div class="box">
       <div class="spinner"></div>
       <div id="loading-title">Loading scene…</div>
-      <ul id="loading-list"></ul>
     </div>
   </div>
   <script type="module" src="/static/app.js"></script>

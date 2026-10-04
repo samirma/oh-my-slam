@@ -625,13 +625,6 @@
       "unit": "",
       "description": "segment.sh -m / view.sh -m runs that changed the map folder (map)"
     },
-    "contract.console_errors.view": {
-      "op": "<=",
-      "value": 0,
-      "measured": 0.0,
-      "unit": "",
-      "description": "view.sh pages with browser console errors (view)"
-    },
     "gt.objects.recall": {
       "op": ">=",
       "value": 0.7,

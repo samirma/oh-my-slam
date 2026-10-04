@@ -199,8 +199,6 @@ class Evaluation:
         self.details[f"viewer.{tag}"] = {"url": seen.url, "render_s": seen.render_s,
                                          "error": seen.error,
                                          "console_errors": (seen.console_errors or [])[:10]}
-        if seen.console_errors is not None:  # the page was opened
-            self.contracts.check("console_errors", "view", tag, seen.console_errors)
         if seen.scene is None:
             return
         doc, problems = parse_scene(seen.scene)

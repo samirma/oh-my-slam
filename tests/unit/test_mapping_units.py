@@ -457,6 +457,9 @@ def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path
                                 "-fps", fps]) == 0
         assert warnings.pop() == "-fps applies to video input only; ignored for images"
     assert len(calls) == 3
+    from oh_my_slam.mapping.ingest import DEFAULT_FPS
+
+    assert [c["fps"] for c in calls] == [DEFAULT_FPS] * 3  # ignored: the default is passed on
     for fps in ("0", "-1"):
         with pytest.raises(UsageError, match="-fps must be positive"):
             cli_mapper.main(["update", "-i", "x.mp4", "-m", str(tmp_path / "m"), "-fps", fps])

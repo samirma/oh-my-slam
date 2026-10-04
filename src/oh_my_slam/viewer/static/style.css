@@ -103,7 +103,7 @@ input.switch:checked::after { left: 15px; }
 #segmented { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border);
   border-radius: 4px; flex: none; }
 .hint { color: var(--muted); font-size: 11px; }
-#cloud-note { margin: 0 12px 8px; }
+#cloud-note, #labels-note { margin: 0 12px 8px; }
 
 /* ---- loading overlay */
 #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -111,10 +111,6 @@ input.switch:checked::after { left: 15px; }
 #loading.done { display: none; }
 #loading .box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   padding: 18px 22px; min-width: min(300px, 90vw); }
-#loading ul { list-style: none; padding: 0; margin: 10px 0 0; color: var(--muted); }
-#loading li { display: flex; justify-content: space-between; gap: 16px; }
-#loading li.ok { color: var(--text); }
-#loading li.err { color: var(--danger); }
 .spinner { width: 22px; height: 22px; border: 3px solid var(--border); border-top-color: var(--accent);
   border-radius: 50%; animation: spin 0.8s linear infinite; float: right; }
 @keyframes spin { to { transform: rotate(360deg); } }

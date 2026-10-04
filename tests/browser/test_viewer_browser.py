@@ -145,9 +145,11 @@ def reset_view(v: View) -> None:
 
 
 def restore_defaults(v: View) -> None:
-    v.js("() => window.__viewerDefaults()")
+    """A reload: the page comes back with every attribute and layer at its default (the bundle is
+    in memory, so nothing is inferred again)."""
+    v.pg.reload()
+    v.pg.wait_for_selector('body[data-rendered="true"]', timeout=120000)
     v.settle()
-    set_only(v, {"points", "cameras", "labels", "obbs"})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -160,9 +162,12 @@ def test_rendered_signal_and_page_contents(view: View) -> None:
     assert v.js("() => window.__viewerGroups.points.children[0].geometry"
                 ".attributes.position.count") == v.js("() => window.__viewer.cloud.count") > 0
     assert v.pg.is_hidden("#loading") and v.pg.is_hidden("#cloud-error")
-    n = len(v.bundle.catalog)
-    assert v.pg.locator("#catalogue tbody tr[data-id]").count() == n
-    assert v.pg.is_visible("#tab-image-btn") == (v.bundle.mode == "image")
+    image = v.bundle.mode == "image"
+    # spec §2.5: the catalogue and the segmented image are shown for an image only
+    assert v.pg.locator("#catalogue tbody tr[data-id]").count() == (
+        len(v.bundle.catalog) if image else 0)
+    assert v.pg.is_visible("#tab-catalogue-btn") == image
+    assert v.pg.is_visible("#tab-image-btn") == image
     assert v.errors == []
 
 
@@ -356,8 +361,8 @@ def test_camera_frustums_at_the_scene_poses(view: View) -> None:
     assert visibility(v)["cameras"]
 
 
-def test_catalogue_lists_every_object_in_its_colour(view: View) -> None:
-    v = view
+def test_catalogue_lists_every_object_in_its_colour(image_view: View) -> None:
+    v = image_view
     v.pg.click('#tabs button[data-tab="catalogue"]')
     rows = v.js("""() => [...document.querySelectorAll('#catalogue tbody tr[data-id]')].map(tr => ({
       id: Number(tr.dataset.id), label: tr.children[2].textContent,
@@ -385,15 +390,16 @@ def test_layouts(view: View, tmp_path: Path) -> None:
         assert box["canvas"]["width"] > 0.3 * w and box["canvas"]["height"] > 0.3 * h, name
         assert box["panel"]["right"] <= w + 1 and box["panel"]["width"] > 0, name
         # every catalogue column fits the panel: no sideways scrolling, numbers not clipped
-        v.pg.click('#tabs button[data-tab="catalogue"]')
-        cat = v.js("""() => {
-          const w = document.querySelector('#tab-catalogue .table-wrap');
-          const cells = [...document.querySelectorAll('#catalogue td.num')];
-          return {scroll: w.scrollWidth, client: w.clientWidth,
-                  clipped: cells.filter(c => c.offsetParent && c.scrollWidth > c.clientWidth + 1).length};
-        }""")
-        assert cat["scroll"] <= cat["client"] and cat["clipped"] == 0, (name, cat)
-        v.pg.click('#tabs button[data-tab="controls"]')
+        if v.bundle.mode == "image":
+            v.pg.click('#tabs button[data-tab="catalogue"]')
+            cat = v.js("""() => {
+              const w = document.querySelector('#tab-catalogue .table-wrap');
+              const cells = [...document.querySelectorAll('#catalogue td.num')];
+              return {scroll: w.scrollWidth, client: w.clientWidth,
+                      clipped: cells.filter(c => c.offsetParent && c.scrollWidth > c.clientWidth + 1).length};
+            }""")
+            assert cat["scroll"] <= cat["client"] and cat["clipped"] == 0, (name, cat)
+            v.pg.click('#tabs button[data-tab="controls"]')
         v.pg.screenshot(path=str(out / f"{v.bundle.mode}-{name}.png"))
     v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
@@ -669,9 +675,9 @@ def dense_view(browser: Any) -> Iterator[View]:
 
 
 def test_dense_labels_stay_legible(dense_view: View) -> None:
-    """More boxes than room for their full labels (120 boxes, desktop and phone): every box whose
-    top is in view still shows its id inside the view; a label with its name never covers another
-    label (names are dropped first), so whatever overlaps is an id tag that found no free place."""
+    """More boxes than room for their labels (120 boxes, desktop and phone): no shown label
+    intersects another or leaves the view; every box whose top is in view either shows its id or,
+    when no free place was left near it, is listed (id and label) under the Labels layer."""
     v = dense_view
     for w, h in ((1440, 900), (390, 844)):
         v.pg.set_viewport_size({"width": w, "height": h})
@@ -679,16 +685,40 @@ def test_dense_labels_stay_legible(dense_view: View) -> None:
         boxes = label_boxes(v)
         in_view = [b for b in boxes if b["inView"]]
         assert len(boxes) == 120 and len(in_view) >= 100, (w, len(in_view))
-        for b in boxes:
-            assert b["shown"] == b["inView"], b
-            if b["shown"]:
-                assert b["inside"] and b["text"].split()[0] == str(b["id"]), b
-        assert {b["mode"] for b in in_view} == {"full", "compact"}, w
-        full = [b for b in in_view if b["mode"] == "full"]
-        for a in full:
-            assert not any(intersects(a["rect"], b["rect"]) for b in in_view if b is not a), (w, a)
+        shown = [b for b in boxes if b["shown"]]
+        assert len(shown) >= 20 and all(b["inView"] for b in shown), w
+        for i, a in enumerate(shown):
+            assert a["inside"] and a["text"].split()[0] == str(a["id"]), a
+            assert not any(intersects(a["rect"], b["rect"]) for b in shown[i + 1:]), (w, a)
+        hidden = sorted(b["id"] for b in in_view if not b["shown"])
+        note = v.pg.inner_text("#labels-note") if hidden else ""
+        assert bool(hidden) == v.pg.is_visible("#labels-note"), w
+        for oid in hidden:
+            assert f" {oid} " in f" {note.removeprefix('No room for:')} ".replace(",", " "), oid
     v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
+    assert v.errors == []
+
+
+def test_segment_colours_stay_exact_with_normals(view: View) -> None:
+    """color=segment with normals=on: the object colours and the unsegmented grey reach the
+    canvas exactly (normals shade the other colourings only)."""
+    v = view
+    set_only(v, {"points"})
+    v.pg.select_option("#attr-color", "segment")
+    v.pg.click("#attr-normals")
+    v.settle()
+    attrs = v.js("() => window.__viewer.cloud.attrs")
+    assert "color=segment" in attrs and "normals=on" in attrs
+    assert v.js("() => !!window.__viewerGroups.points.children[0].geometry.attributes.normal")
+    px = canvas_pixels(v)
+    assert (128, 128, 128) in px
+    seen = [rgb for rgb in object_colours(v) if rgb in px]
+    dbg = v.js("() => { const m = window.__viewerGroups.points.children[0].material; return [m.defines, window.__viewer.cloud.attrs]; }")
+    import collections
+    near = collections.Counter(p for p in canvas_image(v).reshape(-1, 3).tolist().__iter__() if True).most_common(12) if False else None
+    assert seen, ("no object colour drawn exactly", dbg, object_colours(v), sorted(px)[:5], len(px))
+    restore_defaults(v)
     assert v.errors == []
 
 

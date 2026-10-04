@@ -117,44 +117,16 @@ function resize() {
 window.addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- loading
-const loadingList = $('#loading-list');
-function loadRow(name) {
-  const li = el('li', {}, el('span', {}, name), el('span', { class: 'pct' }, '…'));
-  loadingList.appendChild(li);
-  const pct = li.querySelector('.pct');
-  return {
-    progress(p) { pct.textContent = `${Math.round(p * 100)}%`; },
-    ok(msg = 'done') { li.classList.add('ok'); pct.textContent = msg; },
-    fail(msg) { li.classList.add('err'); pct.textContent = msg; },
-  };
-}
 async function errorOf(res) {
   try { return (await res.json()).error || `HTTP ${res.status}`; } catch { return `HTTP ${res.status}`; }
 }
-async function fetchWithProgress(url, row, signal) {
+async function fetchBuffer(url, signal) {
   const res = await fetch(url, { signal });
-  if (!res.ok) { const msg = await errorOf(res); row?.fail(`HTTP ${res.status}`); throw new Error(msg); }
-  const total = Number(res.headers.get('Content-Length')) || 0;
-  const reader = res.body.getReader();
-  const buf = new Uint8Array(total || 0);
-  const chunks = []; let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (total && got + value.length <= total) buf.set(value, got); else chunks.push(value);
-    got += value.length;
-    if (total) row?.progress(got / total);
-  }
-  row?.ok(got > 1e6 ? `${(got / 1e6).toFixed(1)} MB` : 'done');
-  if (!chunks.length && got === total) return buf.buffer;
-  const all = new Uint8Array(got); let off = 0;  // no or wrong Content-Length
-  if (total) { all.set(buf.subarray(0, Math.min(total, got))); off = Math.min(total, got); }
-  for (const c of chunks) { all.set(c, off); off += c.length; }
-  return all.buffer;
+  if (!res.ok) throw new Error(await errorOf(res));
+  return res.arrayBuffer();
 }
-async function fetchJSON(url, name) {
-  const buf = await fetchWithProgress(url, loadRow(name));
-  return JSON.parse(new TextDecoder().decode(buf));
+async function fetchJSON(url) {
+  return JSON.parse(new TextDecoder().decode(await fetchBuffer(url)));
 }
 
 // ---------------------------------------------------------------- point clouds (raw sRGB)
@@ -172,7 +144,8 @@ function parseCloud(buffer) {
   return { header, arrays };
 }
 // Points are drawn in their sRGB bytes as they are; with normals (normals=on) they are shaded by
-// them (headlight), so that the attribute shows.
+// them (headlight), so that the attribute shows, except with color=segment, whose object colours
+// and unsegmented grey must reach the screen exactly (§2.4 colour contract).
 function pointMaterial({ color, normal, exact }) {
   const defines = {};
   if (color) defines.HAS_COLOR = '';
@@ -224,7 +197,8 @@ function showCloud({ header, arrays }) {
   g.setAttribute('position', position);
   if (arrays.color) g.setAttribute('rgb', new THREE.BufferAttribute(arrays.color, 3, true));
   if (arrays.normal) g.setAttribute('normal', new THREE.BufferAttribute(arrays.normal, 3));
-  const pts = new THREE.Points(g, pointMaterial({ color: !!arrays.color, normal: !!arrays.normal }));
+  const exact = (header.attrs || '').split(',').includes('color=segment');
+  const pts = new THREE.Points(g, pointMaterial({ color: !!arrays.color, normal: !!arrays.normal, exact }));
   pts.name = 'points';
   pts.frustumCulled = false;
   groups.points.add(pts);
@@ -320,12 +294,13 @@ function buildObjects(doc) {
   }
 }
 
-// Labels (spec §2.5: labelled OBBs), kept legible: each box whose top is in view gets its id tag
-// next to the top face's centre (or on a ring close by), larger boxes on screen first; only when
-// no free place is left near the box does a tag overlap another tag. Then the names are added,
-// in the same order, wherever the longer label covers no other label, so a name is never hidden.
+// Labels (spec §2.5: labelled OBBs), kept legible: no label ever covers another. Each box whose
+// top is in view gets its id tag next to the top face's centre, or on a ring farther out, larger
+// boxes on screen first. A box whose tag finds no free place keeps no tag on screen; its id and
+// label are listed under the Labels layer ("No room for: …"), and appear once the view is zoomed
+// in. Then the names are added, in the same order, wherever the longer label covers nothing.
 const LABEL_GAP = 2;          // px between two labels, and between a label and the view's edge
-const RINGS = [22, 34];       // px from the anchor to the label's centre
+const RINGS = [22, 34, 48, 64, 84];  // px from the anchor to the label's centre
 const DIRS = [0, 1, 11, 2, 10, 3, 9, 4, 8, 5, 7, 6].map((k) => {  // from straight up, both ways
   const a = -Math.PI / 2 + (k * Math.PI) / 6;
   return [Math.cos(a), Math.sin(a)];
@@ -343,6 +318,7 @@ function layoutLabels() {
   const show = state.layers.labels;
   groups.labels.visible = show;
   labelLayer.hidden = !show;
+  if (!show) $('#labels-note').hidden = true;
   if (!show || !state.objects.length) return;
   if (!state.measured) measureLabels();
   const W = host.clientWidth, H = host.clientHeight;
@@ -371,13 +347,21 @@ function layoutLabels() {
     boxes.push(o);
   }
   boxes.sort((a, b) => (b.rank - a.rank) || (a.id - b.id));
+  const placed = [], crowded = [];
   for (const o of boxes) {
-    const at = spot(o.sx, o.sy, o.wTag, o.h) || candidates(o.sx, o.sy, o.wTag, o.h)[0];
+    const at = spot(o.sx, o.sy, o.wTag, o.h);
+    if (!at) { crowded.push(o); continue; }
     o.mode = 'compact';
     o.rect = [at[0], at[1], at[0] + o.wTag, at[1] + o.h];
     taken.push(o.rect);
+    placed.push(o);
   }
-  for (const o of boxes) {  // names: the tag grows rightwards, else leftwards, where that is free
+  const note = $('#labels-note');
+  crowded.sort((a, b) => a.id - b.id);
+  note.hidden = !crowded.length;
+  note.textContent = crowded.length
+    ? `No room for: ${crowded.map((o) => `${o.id} ${o.label}`).join(', ')} (zoom in to show)` : '';
+  for (const o of placed) {  // names: the tag grows rightwards, else leftwards, where that is free
     const r = o.rect;
     for (const x of [r[0], r[2] - o.w]) {
       if (x >= LABEL_GAP && x + o.w <= W - LABEL_GAP && free(x, r[1], o.w, o.h, r)) {
@@ -647,7 +631,7 @@ async function reloadCloud() {
   const ctl = new AbortController();
   state.abort = ctl;
   try {
-    const buffer = await fetchWithProgress(`/api/cloud?${attrQuery()}`, null, ctl.signal);
+    const buffer = await fetchBuffer(`/api/cloud?${attrQuery()}`, ctl.signal);
     if (seq !== state.cloudSeq) return;
     showCloud(parseCloud(buffer));
     showError(null);
@@ -678,8 +662,8 @@ function buildCatalogue() {
 // ---------------------------------------------------------------- main
 async function main() {
   resize();
-  state.meta = await fetchJSON('/api/meta', 'metadata');
-  state.scene = await fetchJSON('/api/scene', 'scene description');
+  state.meta = await fetchJSON('/api/meta');
+  state.scene = await fetchJSON('/api/scene');
   document.title = `${state.meta.title} — oh-my-slam`;
   const T = new THREE.Matrix4().fromArray(state.meta.display_transform.flat()).transpose();
   root.matrixAutoUpdate = false;
@@ -687,7 +671,7 @@ async function main() {
   root.updateMatrixWorld(true);
   buildObjects(state.scene);
   for (const c of state.meta.controls) state.attrs[c.key] = c.default;
-  const buffer = await fetchWithProgress(`/api/cloud?${attrQuery()}`, loadRow('point cloud'));
+  const buffer = await fetchBuffer(`/api/cloud?${attrQuery()}`);
   showCloud(parseCloud(buffer));
   const size = state.bbox.isEmpty() ? 1 : state.bbox.getSize(new THREE.Vector3()).length();
   buildFrustums(state.meta.cameras, size);
@@ -697,6 +681,7 @@ async function main() {
     const c = new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]).applyMatrix4(root.matrixWorld);
     if (!reach || reach.containsPoint(c)) state.bbox.expandByPoint(c);
   }
+  if (state.meta.mode === 'image') $('#tab-catalogue-btn').hidden = false;
   if (state.meta.has_segmented) {
     $('#tab-image-btn').hidden = false;
     $('#segmented').src = '/api/segmented.png';
@@ -704,7 +689,7 @@ async function main() {
   state.layers.cameras = state.meta.cameras.length > 0;
   buildLayers();
   buildCloudControls();
-  buildCatalogue();
+  if (state.meta.mode === 'image') buildCatalogue();
   buildCameraList();
   applyLayers();
   resize();
