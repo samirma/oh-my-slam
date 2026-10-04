@@ -639,20 +639,34 @@ def locate(reader: store.MapReader, images: Sequence[Path], *, mode: str = "sing
 
 def _locate(reader: store.MapReader, images: list[Path], mode: str, fmt: str, attrs: CloudAttrs,
             client: Any, progress: Progress) -> tuple[bytes, list[Located]]:
+    """``_locate_once`` until one attempt saw a single state of the map; only that attempt's
+    results are reported (its unlocated images, or the failure when none is located)."""
     root = reader.root
     for attempt in range(MAX_ATTEMPTS):
+        timing.count(attempts=attempt + 1)
         ident = map_identity(root)
         if attempt or _stale(reader):
             progress("the map changed during locate (a concurrent update); starting again")
             reader = open_map(root)
         try:
-            out = _locate_once(reader, images, mode, fmt, attrs, client, progress)
+            payload, results = _locate_once(reader, images, mode, fmt, attrs, client, progress)
         except FileNotFoundError:
             if map_identity(root) == ident:
                 raise
             continue
-        if map_identity(root) == ident:
-            return out
+        if map_identity(root) != ident:
+            continue
+        for r in results:
+            if not r.located:
+                log.warning("%s: not located — %s; take it closer to where the map's images "
+                            "were taken, of the same surroundings", r.image, r.reason)
+        n = sum(r.located for r in results)
+        timing.count(images=len(results), located=n, map_frames=len(reader.frames))
+        if payload is None:
+            raise InputError("none of the images could be located in the map (not enough "
+                             "overlap with it); the map is unchanged")
+        progress(f"located {n} of {len(results)} images")
+        return payload, results
     raise InputError(f"the map {root} kept changing during locate (a concurrent mapper.sh "
                      "update); retry once the update is done")
 
@@ -667,7 +681,9 @@ def _stale(reader: store.MapReader) -> bool:
 
 def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: str,
                  attrs: CloudAttrs, client: Any, progress: Progress
-                 ) -> tuple[bytes, list[Located]]:
+                 ) -> tuple[bytes | None, list[Located]]:
+    """(payload, or None when no image is located; the result of each image) in the map state
+    ``reader`` read."""
     stage = timing.stage
     with stage("setup"):
         queries = [_Query(p, k, f"{QUERY_PREFIX}{k:06d}.jpg", upright_size(p), exif_intrinsics(p))
@@ -689,16 +705,8 @@ def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: st
                 results.append(_locate_one(q, K, refine, matches[q.name], points))
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    for r in results:
-        if not r.located:
-            log.warning("%s: not located — %s; take it closer to where the map's images were "
-                        "taken, of the same surroundings", r.image, r.reason)
-    n = sum(r.located for r in results)
-    timing.count(images=len(results), located=n, map_frames=len(reader.frames))
-    if n == 0:
-        raise InputError("none of the images could be located in the map (not enough overlap "
-                         "with it); the map is unchanged")
-    progress(f"located {n} of {len(results)} images")
+    if not any(r.located for r in results):
+        return None, results
     with stage("export"):
         payload = ply_payload(reader, results, mode, attrs) if fmt == "ply" else \
             scene_json(reader, results, mode)

@@ -418,6 +418,48 @@ def _fake_reader(n: int, tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(frames=frames, descriptor=lambda fr: desc[fr.name])
 
 
+def test_a_vanished_file_retries_only_when_the_map_changed(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_locate``: a FileNotFoundError while the map changed (a commit moved the file) starts
+    again and the next attempt's result is returned, its warnings and counts once; with the map
+    unchanged the error is a real one and propagates."""
+    from oh_my_slam.core import timing
+    from oh_my_slam.mapping import locate as lmod
+
+    reader = SimpleNamespace(root=tmp_path, frames=[], meta={})
+    ok = [lmod.Located(Path("a.jpg"), 0, Pose.identity(), Intrinsics(1, 1, 0, 0, 2, 2)),
+          lmod.Located(Path("b.jpg"), 1, reason="far away")]
+    attempts: list[int] = []
+    identity = iter([b"1", b"2", b"2", b"2"])
+
+    def once(*args: object) -> tuple[bytes, list]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise FileNotFoundError("sfm/model/images.bin")
+        return b"doc", ok
+
+    monkeypatch.setattr(lmod, "_locate_once", once)
+    monkeypatch.setattr(lmod, "_stale", lambda r: False)
+    monkeypatch.setattr(lmod, "open_map", lambda root: reader)
+    monkeypatch.setattr(lmod, "map_identity", lambda root: (next(identity), None))
+    with timing.collect() as tm:
+        out = lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
+    assert out == (b"doc", ok) and len(attempts) == 2
+    counts = tm.to_dict()["counts"]
+    assert counts["attempts"] == 2 and counts["located"] == 1 and counts["images"] == 2
+
+    attempts.clear()
+    monkeypatch.setattr(lmod, "map_identity", lambda root: (b"same", None))
+    with pytest.raises(FileNotFoundError):
+        lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
+    assert len(attempts) == 1
+
+    # an attempt that located nothing fails only once its map state is confirmed
+    monkeypatch.setattr(lmod, "_locate_once", lambda *a: (None, ok[1:]))
+    with pytest.raises(InputError, match="none of the images"):
+        lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
+
+
 def test_pairs_exhaustive_for_small_maps_retrieval_for_large(tmp_path: Path) -> None:
     from oh_my_slam.mapping import locate as lmod
     from oh_my_slam.mapping.api import RETRIEVAL_TOP_K, UPDATE_EXHAUSTIVE_MAX

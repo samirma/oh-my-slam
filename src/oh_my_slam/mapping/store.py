@@ -213,8 +213,13 @@ class MapReader:
     # -- paths ---------------------------------------------------------------------------------
 
     def path(self, rel: str) -> Path:
+        """Where ``rel`` is read: its staged copy when a committed update lists it, unless that
+        copy is gone (an update killed partway through applying its commit had moved it in
+        place already), else the map's own file."""
         if rel in self._overlay:
-            return self.root / STAGING / rel
+            staged = self.root / STAGING / rel
+            if staged.exists():
+                return staged
         return self.root / rel
 
     def exists(self, rel: str) -> bool:

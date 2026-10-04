@@ -19,7 +19,7 @@ camera poses only (PLY: the map points visible from them); -t full: the map's sc
 full`` returns it plus the located poses (PLY: the whole map cloud). A video, a missing or empty
 -m folder, and an -o inside the map are refused (exit 2); a non-empty folder that is not a map exit
 4; no image located exit 2. The inference server is needed only for retrieval in maps of more than
-150 keyframes (exit 3 when it is down).
+``UPDATE_EXHAUSTIVE_MAX`` keyframes (exit 3 when it is down).
 """
 
 from __future__ import annotations
