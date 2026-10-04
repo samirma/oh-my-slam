@@ -89,6 +89,6 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
 - **Never bind a fixed port.** Orphaned processes from earlier work hold ports such as 8080, 8081
   and 8088.
 - Run benchmarks one at a time; concurrent GPU work invalidates timings. Every colmap, mapper, inference or
-  `-m models` command goes through one machine lock: `flock ~/Library/Caches/oh-my-slam/heavy.lock <cmd>`.
+  `-m models` command goes through one machine lock: `~/oh-my-slam-data/bin/heavy <cmd>` (Python `fcntl.flock` wrapper; macOS has no `flock`).
 - Research subagents verify claims online only: no installs, weight downloads or local benchmarks.
   This machine is the user's daily driver.
