@@ -1,5 +1,6 @@
-"""Viewer HTTP server: read-only routes, the /api/cloud document and its validation, static files,
-127.0.0.1 binding, display thinning, camera poses from the scene, the display frame."""
+"""Viewer HTTP server: read-only routes (framework-neutral, also mounted under a prefix), the
+/api/cloud document and its validation, static files, 127.0.0.1 binding, the display budget, camera
+poses from the scene, the display frame."""
 
 from __future__ import annotations
 
@@ -17,7 +18,12 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.cloud import derive_cloud, map_cloud_source
 from oh_my_slam.viewer.bundle import ViewBundle, scene_cameras, upright_transform
-from oh_my_slam.viewer.server import cloud_document, cloud_payload, parse_cloud_payload
+from oh_my_slam.viewer.routes import (
+    ViewerRoutes,
+    cloud_document,
+    cloud_payload,
+    parse_cloud_payload,
+)
 from tests.browser.scenes import running
 
 RGB = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], np.uint8)
@@ -74,7 +80,7 @@ def test_cloud_document(server: str) -> None:
     code, ctype, body = get(server + "api/cloud")
     assert code == 200 and ctype == "application/octet-stream"
     head, arrays = parse_cloud_payload(body)
-    assert head["count"] == head["total"] == 4 and head["step"] == 1
+    assert head["count"] == head["total"] == 4 and head["voxel"] == 0
     assert head["attrs"] == "color=rgb,voxel=0,normals=off"
     assert {b["offset"] % 4 for b in head["buffers"]} == {0}
     assert arrays["position"].shape == (4, 3)
@@ -126,28 +132,57 @@ def test_invalid_attributes_are_400_with_the_message(server: str, query: str,
     assert message in json.loads(body)["error"]
 
 
-def test_display_thinning_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_display_budget() -> None:
+    """Spec §2.5: every point up to the budget (16 000 000, one constant); above it, the voxel-grid
+    selection of the shared derivation, with the edge in the cloud document. A bundle's budget is
+    injectable (tests use a small one)."""
     import oh_my_slam.viewer.bundle as vb
+    from oh_my_slam.segmentation.cloud import derive_thinned
 
+    assert vb.DISPLAY_POINT_BUDGET == 16_000_000
     rng = np.random.default_rng(0)
-    source = map_cloud_source(rng.normal(size=(10, 3)), rng.integers(0, 255, (10, 3), np.uint8),
+    source = map_cloud_source(rng.normal(size=(500, 3)), rng.integers(0, 255, (500, 3), np.uint8),
                               None, set(), np.zeros((1, 3)))
     b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[])
-    monkeypatch.setattr(vb, "MAX_DISPLAY_POINTS", 3)
+    assert b.point_budget == vb.DISPLAY_POINT_BUDGET
     dc = b.cloud(CloudAttrs())
-    full = derive_cloud(source, CloudAttrs())
-    assert (dc.total, dc.step, len(dc.cloud)) == (10, 4, 3)  # every 4th: 0, 4, 8
-    np.testing.assert_array_equal(dc.cloud.xyz, full.xyz[[0, 4, 8]])
-    np.testing.assert_array_equal(b.cloud(CloudAttrs()).cloud.xyz, dc.cloud.xyz)
+    assert (dc.total, dc.voxel, len(dc.cloud)) == (500, 0.0, 500)
+    b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[], point_budget=120)
+    dc = b.cloud(CloudAttrs())
+    thin = derive_thinned(source, CloudAttrs(), 120)
+    assert dc.total == 500 and dc.voxel == thin.voxel > 0 and len(dc.cloud) <= 120
+    np.testing.assert_array_equal(dc.cloud.xyz, thin.cloud.xyz)
     assert dc.cloud.label is None  # an unsegmented source has no object ids
+    head, arrays = parse_cloud_payload(cloud_payload(dc, b.describe(CloudAttrs())))
+    assert (head["count"], head["total"], head["voxel"]) == (len(dc.cloud), 500, dc.voxel)
+    full = derive_cloud(source, CloudAttrs())
+    assert {r.tobytes() for r in arrays["position"]} <= {r.tobytes() for r in full.xyz}
 
 
-def test_realistic_maps_are_shown_complete() -> None:
-    """Spec §2.5 "complete point cloud": the 5.4 M-point evaluation map (and anything up to 12 M
-    points, 60 frames/s in Edge on the M4 Max) is served unthinned."""
-    import oh_my_slam.viewer.bundle as vb
+def test_routes_are_framework_neutral_and_relative() -> None:
+    """``ViewerRoutes.handle`` answers without any server (what another server mounts under its
+    own prefix), and the page refers to nothing by an absolute path."""
+    routes = ViewerRoutes(small_map())
+    r = routes.handle("GET", "/api/meta")
+    assert r.status == 200 and dict(r.headers)["Content-Type"] == "application/json"
+    assert int(dict(r.headers)["Content-Length"]) == len(r.tobytes())
+    assert json.loads(r.tobytes())["mode"] == "map"
+    r = routes.handle("GET", "/api/cloud", "color=none")
+    head, _ = parse_cloud_payload(r.tobytes())
+    assert head["attrs"] == "color=none,voxel=0,normals=off"
+    assert routes.handle("GET", "/api/cloud", "color=purple").status == 400
+    assert routes.handle("HEAD", "/static/lib/viewer.js").status == 200
+    assert routes.handle("GET", "/static/%2e%2e/server.py").status == 404
+    assert routes.handle("POST", "/api/meta").status == 405
+    page = routes.handle("GET", "/").tobytes().decode()
+    assert '"/' not in page and "'/" not in page  # relative URLs only: mountable under a prefix
+    from oh_my_slam.viewer.routes import STATIC
 
-    assert vb.MAX_DISPLAY_POINTS >= 12_000_000
+    for js in STATIC.glob("**/*.js"):
+        if "vendor" in js.parts:
+            continue
+        text = js.read_text("utf-8")
+        assert "'/api" not in text and "`/api" not in text and "'/static" not in text, js
 
 
 def test_cameras_are_the_poses_of_the_scene_json() -> None:
@@ -160,6 +195,7 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
     np.testing.assert_array_equal(cam["T"], np.eye(4))
     assert cam["position"] == [0.0, 0.0, 0.0] and cam["source"] == "x.jpg"
     assert cam["K"] == [500.0, 510.0, 320.0, 240.0] and cam["size"] == [640, 480]
+    assert cam["located"] is False
     # a map: one camera per frame, at the frame's camera-to-map transform
     poses = [Pose(rot_z(0.3 * k), np.array([k, 2.0 * k, 0.5])) for k in range(3)]
     frames = {str(k): ol.frame(float(k), stream_uris={"camera_0": f"f{k}.jpg"},

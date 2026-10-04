@@ -262,16 +262,28 @@ colour, then its name, on a dark plate so that it reads over any cloud. No label
 another or leaves the view. Larger boxes on screen are labelled first; a tag that would cover
 another moves to a free place on rings farther out, and a name is added only where it covers
 nothing. Where boxes are so crowded that a tag finds no free place, that box shows no tag; its
-id and label are listed under the Labels layer ("No room for: …"), and its tag appears once the
-view is zoomed in.
+id and label are listed under the Labels layer ("No room for: …", the first 20 and how many more;
+not a live region, so moving the view announces nothing), and its tag appears once the view is
+zoomed in.
 
 The viewer contains no geometry, segmentation or colour logic of its own:
 
 * Every displayed cloud is derived on request from data already in memory, by the same code
   that writes PLY files. A control therefore never re-runs inference.
-* The page shows the complete cloud up to 12,000,000 points. In Edge on the M4 Max, a cloud of
-  that size loads in about 2 s and orbits at 60 frames per second. Larger clouds are thinned for
-  display only, keeping every k-th point, and the page says so under the point-cloud controls.
+* **Display budget (§2.5).** The page draws every point of a cloud of at most 16,000,000 points
+  (`DISPLAY_POINT_BUDGET` in `viewer/bundle.py`). Above that it draws a voxel-grid selection: the
+  first point (in derivation order) of each occupied voxel, for the smallest voxel edge whose grid
+  has at most 16,000,000 occupied voxels. The edge is found to within 1 % by Brent's method on the
+  occupancy count (`core.geometry.budget_voxel_indices`). Points are selected, never averaged, so
+  each keeps its own position, colour, normal and object id, and the segmentation layer draws the
+  same subset. Under the point-cloud controls the page then says "Showing X of Y points: one per
+  voxel of E edge". The selection belongs to the shared derivation
+  (`segmentation.cloud.derive_thinned`), which computes normals only for the selected points and
+  reuses the selection while only `color` or `normals` change. PLY outputs and the map are never
+  thinned. On the 16.15-million-point `street2` map, measured in headless Edge (ANGLE Metal) on
+  the M4 Max, the selection keeps 15,999,816 points, one per 0.67 mm voxel. The first `/api/cloud`
+  takes 7.7 s, almost all of it the edge search; a repeated request is served from the cache. The
+  view orbits at 55 frames per second.
 * `encoding` and `label` concern PLY files only and have no control.
 
 The page draws a frame only when something visible changes: the viewpoint, a layer, a control,
@@ -280,6 +292,32 @@ the 8.9-million-point living-room map open, it draws no frames in 10 s, where it
 
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.
 The evaluator waits for this attribute.
+
+The viewer is built to be reused by another server (the `server.sh` web application embeds it and
+draws PLY and scene files with it):
+
+* **Server side.** `viewer.routes.ViewerRoutes(bundle).handle(method, path, query)` answers every
+  route (`/`, `/static/…`, `/api/meta`, `/api/scene`, `/api/catalog`, `/api/segmented.png`,
+  `/api/cloud`) as a framework-neutral `Response(status, headers, body pieces)`. `view.sh`'s
+  stdlib server (`viewer/server.py`) is a thin adapter over it, and another server mounts the same
+  object under a prefix of its own. The page uses relative URLs only, so it works at `/` and under
+  any prefix ending in `/`.
+* **Browser side.** `static/app.js` is `view.sh`'s page. It composes ES modules in `static/lib/`:
+  * `data.js`: `DataSource(base)`, the routes under a base URL, and the cloud structure every
+    drawing function takes.
+  * `viewer.js`: the `Viewer` class. It holds the renderer, the layers, on-demand drawing,
+    framing and *Go to*. Its `select(id)` / `onSelect(cb)` API highlights an object, so a host
+    page can highlight it in its other views. `view.sh` itself has no selection UI.
+  * `cloud.js`: the points and segmentation materials.
+  * `obbs.js`: objects and boxes from OpenLABEL cuboids.
+  * `cameras.js`: cameras from a scene document (`sceneCameras`, mirroring
+    `bundle.scene_cameras`, `located` frames included) or from a `mapper.sh locate` PLY header
+    (`plyCameras`), frustums, and the camera table. Located cameras are drawn dashed, in their own
+    colour, and labelled "located", so colour is never the only cue.
+  * `labels.js`: the non-overlapping label layout.
+  * `layers.js` and `controls.js`: the layer and attribute controls, and the display-budget notice.
+  * `ply.js`: an in-browser PLY reader (ASCII and binary little-endian; x y z, normals, colour,
+    label; the header comments).
 
 ## Point-cloud attributes
 

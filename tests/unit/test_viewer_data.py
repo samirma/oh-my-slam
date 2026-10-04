@@ -22,7 +22,7 @@ from oh_my_slam.core.cloud_attrs import CloudScope, applicable, parse_cloud_attr
 from oh_my_slam.core.ply import parse_ply
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id
 from oh_my_slam.viewer.bundle import image_bundle, map_bundle
-from oh_my_slam.viewer.server import parse_cloud_payload
+from oh_my_slam.viewer.routes import parse_cloud_payload
 from tests.browser.scenes import running, synthetic_image, synthetic_map
 
 IMAGE_KEYS = ["color", "stride", "min-depth", "max-depth", "edge", "voxel", "normals"]

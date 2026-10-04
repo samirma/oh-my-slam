@@ -27,8 +27,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 
 /* ---- object labels: an id tag in the object's colour, then the name, on a dark plate (legible
    over any cloud); the name is left out where it would cover another label */
-#labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
-#labels[hidden] { display: none; }
+.labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.labels[hidden] { display: none; }
 .obj-label { position: absolute; left: 0; top: 0; display: flex; align-items: stretch;
   font-size: 11px; line-height: 15px; border-radius: 3px; overflow: hidden; white-space: nowrap;
   background: #0d0f13d9; color: #fff; box-shadow: 0 1px 3px #0009; will-change: transform; }
@@ -36,6 +36,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .obj-label .tag { padding: 0 4px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .obj-label .name { padding: 0 5px 0 4px; }
 .obj-label.compact .name { display: none; }
+/* the object a host page selected (Viewer.select): outlined, over the others */
+.obj-label.selected { outline: 2px solid #fff; outline-offset: 1px; z-index: 1; }
 
 /* ---- side panel */
 #panel { width: var(--panel-width); flex: none; background: var(--panel); border-left: 1px solid var(--border);
@@ -99,6 +101,7 @@ input.switch:checked::after { left: 15px; }
 #cameras .cam-name small { display: block; color: var(--muted); font-size: 10px; overflow: hidden;
   text-overflow: ellipsis; }
 #cameras button.goto { padding: 2px 7px; font-size: 12px; }
+#cameras .cam-name small.located { color: #ffb02e; font-weight: 600; }
 #cam-note { margin: 0 0 6px; }
 #segmented { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border);
   border-radius: 4px; flex: none; }
