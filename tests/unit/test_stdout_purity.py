@@ -93,6 +93,10 @@ def test_bad_attributes_exit_2_before_the_server_is_contacted(image: Path, tmp_p
                        "-p", "stride=2"], b"pixel-level attribute"),
         ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-p", "voxel=0.1"],
          b"-f ply"),
+        ("mapper.sh", ["locate", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
+                       "-p", "stride=2"], b"pixel-level attribute"),
+        ("mapper.sh", ["locate", "-i", str(image), "-m", str(tmp_path / "m"), "-p", "voxel=0.1"],
+         b"-f ply"),
     ]:
         res = sh(script, *args)
         assert res.returncode == 2, (script, args, res.stderr)
@@ -194,17 +198,23 @@ def test_usage_errors_exit_2(image: Path, tmp_path: Path) -> None:
                        "-p", "min-depth=1"]),
         ("mapper.sh", ["update", "-a", str(image), "-m", str(tmp_path / "m2")]),  # -i, not -a
         ("mapper.sh", ["update", "-i", str(image)]),
+        ("mapper.sh", ["locate", "-i", str(image)]),  # -m is required
+        ("mapper.sh", ["locate", "-i", str(tmp_path / "walk.mp4"), "-m", str(tmp_path)]),  # video
+        ("mapper.sh", ["locate", "-i", str(image), "-m", str(tmp_path / "m3")]),  # no map there
+        ("mapper.sh", ["locate", "-i", str(image), "-m", str(tmp_path / "m3"), "-t", "all"]),
+        ("mapper.sh", ["locate", "-i", str(image), "-m", str(tmp_path / "m3"), "-fps", "2"]),
     ]:
         res = sh(script, *args)
         assert res.returncode == 2, (script, args, res.stderr)
         assert res.stdout == b""
+    assert not (tmp_path / "m3").exists()  # locate never creates the map folder
 
 
 def test_help_goes_to_stderr() -> None:
     """The help is human-facing: stderr, never stdout (spec §4), for every entry point."""
     for script, args in [("reconstruct.sh", ["-h"]), ("segment.sh", ["-h"]), ("view.sh", ["-h"]),
                          ("start_inference_server.sh", ["-h"]), ("mapper.sh", ["-h"]),
-                         ("mapper.sh", ["update", "-h"])]:
+                         ("mapper.sh", ["update", "-h"]), ("mapper.sh", ["locate", "-h"])]:
         res = sh(script, *args)
         assert res.returncode == 0, (script, res.stderr)
         assert res.stdout == b"" and b"usage:" in res.stderr, script

@@ -24,6 +24,7 @@ and label arrays through read-only views instead of copying them.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -196,10 +197,12 @@ def _readonly(a: NDArray[Any]) -> NDArray[Any]:
     return v
 
 
-def cloud_ply(source: CloudSource, attrs: CloudAttrs) -> bytes:
+def cloud_ply(source: CloudSource, attrs: CloudAttrs, extra_comments: Sequence[str] = ()
+              ) -> bytes:
     """``derive_cloud`` as a PLY whose header names the frame and records the effective
-    attributes (defaults included; for a map only those that apply)."""
+    attributes (defaults included; for a map only those that apply), then ``extra_comments``
+    (one header line each: the located cameras of ``mapper.sh locate``)."""
     scope = scope_of(source)
     frame = IMAGE_FRAME if scope == CloudScope.IMAGE else MAP_FRAME
     return ply_bytes(derive_cloud(source, attrs), encoding=attrs.encoding,
-                     comments=[frame, f"attributes {attrs.describe(scope)}"])
+                     comments=[frame, f"attributes {attrs.describe(scope)}", *extra_comments])

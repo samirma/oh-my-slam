@@ -105,6 +105,26 @@ def test_store_committed_staging_rolls_forward_and_overlays(tmp_path: Path) -> N
     assert json.loads((root / store.MAP_JSON).read_text())["update_count"] == 2
 
 
+def test_store_overlay_falls_back_to_the_applied_file(tmp_path: Path) -> None:
+    """An update killed partway through applying its commit: the files it already moved into
+    place are no longer staged, so a reader takes them from the map itself."""
+    root = tmp_path / "m"
+    _make_map(root)
+    tx = store.MapTransaction(root).__enter__()
+    tx.write_bytes("per_frame/f000000/x.bin", b"new")
+    tx.write_bytes("per_frame/f000000/y.bin", b"staged")
+    tx.write_json(store.MAP_JSON, {"update_count": 2})
+    files = ["per_frame/f000000/x.bin", "per_frame/f000000/y.bin", store.MAP_JSON]
+    (tx.staging / store.COMMIT).write_text(json.dumps({"files": files, "delete": []}))
+    tx.__exit__(None, None, None)
+    (tx.staging / "per_frame/f000000/x.bin").replace(root / "per_frame/f000000/x.bin")  # applied
+    reader = store.MapReader(root)
+    assert reader.path("per_frame/f000000/x.bin") == root / "per_frame/f000000/x.bin"
+    assert reader.path("per_frame/f000000/x.bin").read_bytes() == b"new"
+    assert reader.path("per_frame/f000000/y.bin").read_bytes() == b"staged"  # still staged
+    assert reader.meta["update_count"] == 2
+
+
 def test_store_lock_delete_and_folder_rules(tmp_path: Path) -> None:
     root = tmp_path / "m"
     _make_map(root)

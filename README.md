@@ -12,6 +12,7 @@ OpenLABEL mapping and the colour palette).
 | `start_inference_server.sh [--status\|--stop]` | Starts the resident model server, or stops or queries it. |
 | `reconstruct.sh -i IMAGE [-f json\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default) or point cloud, in the camera frame. |
 | `mapper.sh update -i IMAGES\|FOLDERS\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
+| `mapper.sh locate -i IMAGES -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single]` | Camera pose of each image in an existing map, which stays untouched. |
 | `segment.sh -i IMAGE [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` | Objects of one image: OBBs, colours, and with `-d` five artefact files. |
 | `segment.sh -m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | The persistent objects of a map, read-only and without the server. |
 | `view.sh -i IMAGE \| -m MAP [--no-browser]` | Local browser viewer. `-m` needs no server. |
@@ -47,6 +48,7 @@ Model weights are downloaded on the first server start:
 ./segment.sh -i photo.jpg -d out/ --min-score 0.6
 ./mapper.sh update -i walk.mp4 -m maps/home > map.json
 ./mapper.sh update -i more_photos/ -m maps/home -t single -f ply -o new_part.ply
+./mapper.sh locate -i where_am_i.jpg -m maps/home > pose.json
 ./segment.sh -m maps/home -d out_map/
 ./view.sh -m maps/home
 ./start_inference_server.sh --stop
@@ -108,6 +110,65 @@ to stdout.
   3D.
 
 The result is always in map coordinates. Every option is checked before the server is contacted.
+
+### `mapper.sh locate`
+
+`mapper.sh locate -i IMAGES… -m MAP [-f json|ply] [-o FILE] [-p ATTRS] [-t full|single]`
+
+Only `-i` and `-m` are required. With no other option, the command writes the located camera
+poses as JSON to stdout. The map is read-only: nothing in its folder changes (no `.lock`, no
+`.staging/`), and the images are not added.
+
+* **`-i`** takes one or more image files (the types of `update`). A video is refused (exit 2), and
+  so is a folder.
+* **`-m`** must be an existing map. A missing or empty folder is an input error (exit 2) and is not
+  created; any other folder that is not a map exits 4.
+* **`-t`** sets the scope of the result (default `single`):
+  * `single` returns the located camera of each image, with no objects. With `-f ply` it returns
+    the map points visible from the located cameras: inside a camera's frustum and not hidden
+    behind nearer map points (a coarse z-buffer, 96 cells on the long side; the image has no depth
+    of its own).
+  * `full` returns the map exactly as `update -t full` returns it, plus the located cameras. With
+    `-f ply` it returns the whole map cloud.
+* **`-o`** may not point inside the map folder (exit 2).
+* **`-p`** requires `-f ply`, with the map-scope keys of `update`.
+
+An image the map cannot localise is named on stderr with the reason (too few matches with map
+points, no consistent pose, or a pose that contradicts its matches); the others are still
+returned. If no image is located, the command exits 2.
+
+*How an image is located.* The map's COLMAP database is cloned (`cp -c`) into a scratch folder;
+the images get their SIFT features there (a camera the map already has when the image size
+matches and no EXIF focal says otherwise, as for `update`) and are matched against **every
+keyframe** of a map of at most `UPDATE_EXHAUSTIVE_MAX` (150) keyframes, with no inference
+server — the bound `update` uses. In a larger map they are matched against the
+`RETRIEVAL_TOP_K` (30) keyframes most similar by the retrieval descriptor, which the inference
+server computes for the image: that case needs the server and exits 3 when it is down. Each
+verified match to a keyframe keypoint with a triangulated point in `sfm/model` gives a 2D–3D
+correspondence; a keyframe without a model (a one-keyframe map has no `sfm/`) gives its stored
+metric depth at the keypoint instead. COLMAP's LO-RANSAC absolute pose with refinement solves
+them; the focal length is estimated too unless the image shares a map camera. A pose needs 15
+inliers, and its median epipolar distance to its verified matches, under the stored keyframe
+poses, must stay within 0.25° (the check the map's own keyframes pass).
+
+*A concurrent update.* `locate` reads one state of the map. If an update commits while it runs
+(`map.json` or the commit marker changes, or a file it read disappears), it opens the map again
+and starts over, up to 3 times; after that it exits 2 with "retry once the update is done".
+
+*Representation of a located camera.* Image `k` (its position in `-i`, from 0) gets its own
+`sensor_cs` and camera stream `located_<k>` (its intrinsics, `uri` the image path), so it is never
+confused with the map's `camera_<id>`. Its frame is keyed past every keyframe index the map has
+used (`next_frame_index + k`) and holds `timestamp` (the key, as for a keyframe), `located:
+true`, `image`, `inliers`, the stream `uri` and
+the transform `located_<k>_to_map`, the camera-to-map pose in the form of a keyframe's
+`camera_<id>_to_map`. In a PLY the header carries one comment per input image after the frame and
+attribute lines, in the JSON result's representation: `located_<k> {"image": …, "located": true,
+"transform_src_to_dst": {"quaternion": [qx, qy, qz, qw], "translation": [x, y, z]},
+"stream_properties": {"intrinsics_pinhole": {…}, "intrinsics_source": …}}` — the frame's
+`located_<k>_to_map` transform and the stream's properties — or `{"image": …, "located": false}`
+for an image that could not be located. The `-t single` document's metadata holds the map's base fields
+(`tool` `"mapper"`, `map_frame`) and `scope: "single"`; the `map` coordinate system lists the
+`located_<k>` children.
 
 ### `segment.sh`
 
@@ -282,8 +343,8 @@ The same source and attributes always give byte-identical files.
   before the server is contacted or any work starts.
 * **stderr** gets everything human-facing. Log lines start with `[oh-my-slam]`, and errors look
   like `<command>: error: …`.
-* **Timing summary.** `reconstruct.sh`, `segment.sh` and `mapper.sh update` each log a
-  one-line `timings:` summary.
+* **Timing summary.** `reconstruct.sh`, `segment.sh`, `mapper.sh update` and `mapper.sh locate`
+  each log a one-line `timings:` summary.
 * **stdout of the other commands.** `view.sh` writes nothing to stdout. `--status` writes the
   health JSON. The help (`-h`) of every command goes to stderr.
 
@@ -291,7 +352,7 @@ The same source and attributes always give byte-identical files.
 |---|---|
 | 0 | Success. A consumer closing the pipe early (`\| head`) also exits 0. |
 | 1 | Internal error. Also used when the server stays busy after retries, when inference fails, or when COLMAP is missing or the wrong version. |
-| 2 | Usage or input error: bad option, bad `-p`, missing or unsupported input file, `.venv` missing. |
+| 2 | Usage or input error: bad option, bad `-p`, missing or unsupported input file, `.venv` missing; for `mapper.sh locate` also a missing or empty map folder, an `-o` inside the map, or no image located. |
 | 3 | The inference server is not running. The message says to run `./start_inference_server.sh`. |
 | 4 | `-m` folder is not empty and not a map (`mapper.sh`), or is not a map (`segment.sh -m`, `view.sh -m`). |
 | 5 | Nothing could be registered, for example because the new images do not overlap the map. The map is unchanged. |
@@ -1104,7 +1165,7 @@ Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
+| `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
 | `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch): the test suite runs its stub server there, beside a running real one. |
 | `OH_MY_SLAM_TEST_REAL_SERVER=1` | Lets the `models` and `eval` tests use the running real server. |
 
