@@ -604,11 +604,6 @@ function buildCloudControls() {
     $('#cloud-controls').append(row);
   }
 }
-// for tests: every attribute back to its default, as the page loaded
-window.__viewerDefaults = () => {
-  for (const c of state.meta.controls) { state.attrs[c.key] = c.default; cloudControls.get(c.key).set(c.default); }
-  attrsChanged();
-};
 function attrQuery() {
   return new URLSearchParams(state.meta.controls.map((c) => [c.key, state.attrs[c.key]])).toString();
 }
