@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -35,6 +34,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
+from oh_my_slam.core.atomic import clone_file
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import InputError, NotAMapError, UsageError
 from oh_my_slam.core.images import IMAGE_SUFFIXES, VIDEO_SUFFIXES, exif_intrinsics, upright_size
@@ -144,12 +144,6 @@ def check_output(map_dir: Path, output: Path | None) -> None:
 # features and matches in a scratch copy of the map's database
 
 
-def _clone(src: Path, dst: Path) -> None:
-    """APFS clone when possible (``store.MapTransaction.clone_for_edit``), else a copy."""
-    if subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True).returncode != 0:
-        shutil.copyfile(src, dst)
-
-
 @dataclass
 class _DbImage:
     image_id: int
@@ -186,24 +180,24 @@ def _extract(reader: store.MapReader, queries: list[_Query], work: Path
              ) -> tuple[Sfm, dict[str, _DbImage]]:
     """Scratch database (the map's, cloned) with the queries' features; keyframes the map's
     database lacks (a one-keyframe map has none) are extracted too, from their stored images."""
-    from oh_my_slam.mapping.ingest import _write_image_keyframe
+    from oh_my_slam.mapping.ingest import write_upright_jpeg
 
     db, images = work / "database.db", work / "images"
     images.mkdir(parents=True)
     if reader.exists(store.SFM_DB):
-        _clone(reader.path(store.SFM_DB), db)
+        clone_file(reader.path(store.SFM_DB), db)
     sfm = Sfm(db, images, work / "sfm")
     known = _db_images(db)
     missing: dict[tuple[int, int, float], list[str]] = {}
     for fr in reader.frames:
         if _kf_file(fr) not in known:
-            _clone(reader.image_path(fr), images / _kf_file(fr))
+            clone_file(reader.image_path(fr), images / _kf_file(fr))
             missing.setdefault((fr.width, fr.height, fr.K.fx), []).append(_kf_file(fr))
     for (w, h, f), names in sorted(missing.items()):
         sfm.extract(names, CameraPrior(w, h, focal=f))
     known = _db_images(db)
     for q in queries:
-        _write_image_keyframe(q.image, images / q.name)
+        write_upright_jpeg(q.image, images / q.name)
     groups: dict[tuple[int, int, float | None], list[_Query]] = {}
     for q in queries:
         groups.setdefault((*q.size, None if q.exif is None else q.exif.fx), []).append(q)
@@ -498,6 +492,7 @@ def located_blocks(results: Sequence[Located], base: int
         css[r.key] = ol.sensor_cs("map")
         streams[r.key] = ol.camera_stream(r.K, uri=str(r.image), description=f"located {r.image}")
         frames[str(base + r.index)] = ol.frame(
+            timestamp=float(base + r.index),
             stream_uris={r.key: str(r.image)},
             transforms={f"{r.key}_to_map": ol.transform(r.key, "map", r.T_map_cam)},
             located=True, image=str(r.image), inliers=r.inliers)
@@ -529,14 +524,15 @@ def scene_json(reader: store.MapReader, results: Sequence[Located], mode: str) -
 
 
 def pose_comment(r: Located) -> str:
-    """The PLY header line of one input image: ``located_<k> {json}``."""
+    """The PLY header line of one input image: ``located_<k> {json}`` with, for a located image,
+    the camera-to-map ``transform_src_to_dst`` and the ``stream_properties`` (intrinsics) of its
+    OpenLABEL frame and stream; ``"located": false`` for one the map could not localise."""
+    from oh_my_slam.schema import openlabel as ol
+
     d: dict[str, Any] = {"image": str(r.image), "located": r.located}
     if r.T_map_cam is not None and r.K is not None:
-        d["T_map_cam"] = {"quaternion_xyzw": [round(float(v), 8) for v in
-                                              r.T_map_cam.to_dict()["quaternion_xyzw"]],
-                          "translation": [round(float(v), 6) for v in r.T_map_cam.t]}
-        d["K"] = {k: round(float(v), 4) if isinstance(v, float) else v
-                  for k, v in r.K.to_dict().items()}
+        d["transform_src_to_dst"] = ol.transform_data(r.T_map_cam)
+        d["stream_properties"] = ol.camera_stream(r.K)["stream_properties"]
     return f"{r.key} {json.dumps(d, separators=(',', ':'), ensure_ascii=True)}"
 
 
@@ -608,26 +604,72 @@ def ply_payload(reader: store.MapReader, results: Sequence[Located], mode: str,
 # entry point
 
 
-def locate(map_dir: Path, inputs: Sequence[Path], *, mode: str = "single", fmt: str = "json",
-           attrs: CloudAttrs | None = None, client: Any = None,
+MAX_ATTEMPTS = 3  # a concurrent update committing during locate: start again on the new map
+
+
+def map_identity(root: Path) -> tuple[bytes, bytes | None]:
+    """What changes with every commit of an update: ``map.json`` (written last) and the staged
+    commit marker (present while a commit is being applied)."""
+    def read(p: Path) -> bytes | None:
+        try:
+            return p.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    return read(root / store.MAP_JSON) or b"", read(root / store.STAGING / store.COMMIT)
+
+
+def locate(reader: store.MapReader, images: Sequence[Path], *, mode: str = "single",
+           fmt: str = "json", attrs: CloudAttrs | None = None, client: Any = None,
            progress: Progress = _progress) -> LocateResult:
-    """Camera pose of each image in the map at ``map_dir`` (never modified). ``client``: the
-    inference client, needed only for retrieval on a map of more than ``UPDATE_EXHAUSTIVE_MAX``
-    keyframes (connected on demand)."""
+    """Camera pose of each of ``images`` (``resolve_images``) in the map ``reader`` reads
+    (``open_map``); the map is never modified. ``client``: the inference client, needed only for
+    retrieval on a map of more than ``UPDATE_EXHAUSTIVE_MAX`` keyframes (connected on demand).
+
+    Every result comes from one state of the map: when a concurrent ``mapper.sh update`` commits
+    while it runs (``map_identity`` changed, or a file it read vanished), the map is opened again
+    and the images located again, at most ``MAX_ATTEMPTS`` times."""
     if mode not in ("single", "full") or fmt not in ("json", "ply"):
         raise UsageError(f"locate: unknown mode {mode!r} or format {fmt!r}")
     with timing.collect() as tm:
-        payload, results = _locate(map_dir, inputs, mode, fmt, attrs or CloudAttrs(), client,
+        payload, results = _locate(reader, list(images), mode, fmt, attrs or CloudAttrs(), client,
                                    progress)
         return LocateResult(payload, results, tm.to_dict())
 
 
-def _locate(map_dir: Path, inputs: Sequence[Path], mode: str, fmt: str, attrs: CloudAttrs,
+def _locate(reader: store.MapReader, images: list[Path], mode: str, fmt: str, attrs: CloudAttrs,
             client: Any, progress: Progress) -> tuple[bytes, list[Located]]:
+    root = reader.root
+    for attempt in range(MAX_ATTEMPTS):
+        ident = map_identity(root)
+        if attempt or _stale(reader):
+            progress("the map changed during locate (a concurrent update); starting again")
+            reader = open_map(root)
+        try:
+            out = _locate_once(reader, images, mode, fmt, attrs, client, progress)
+        except FileNotFoundError:
+            if map_identity(root) == ident:
+                raise
+            continue
+        if map_identity(root) == ident:
+            return out
+    raise InputError(f"the map {root} kept changing during locate (a concurrent mapper.sh "
+                     "update); retry once the update is done")
+
+
+def _stale(reader: store.MapReader) -> bool:
+    """The map has committed an update since ``reader`` opened it."""
+    try:
+        return bool(reader.read_json(store.MAP_JSON) != reader.meta)
+    except FileNotFoundError:
+        return True
+
+
+def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: str,
+                 attrs: CloudAttrs, client: Any, progress: Progress
+                 ) -> tuple[bytes, list[Located]]:
     stage = timing.stage
-    images = resolve_images(inputs)
     with stage("setup"):
-        reader = open_map(map_dir)
         queries = [_Query(p, k, f"{QUERY_PREFIX}{k:06d}.jpg", upright_size(p), exif_intrinsics(p))
                    for k, p in enumerate(images)]
     progress(f"locating {len(images)} images in map {reader.root} ({len(reader.frames)} "

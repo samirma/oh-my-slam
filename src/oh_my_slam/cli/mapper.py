@@ -102,11 +102,11 @@ def _locate(args: argparse.Namespace, attrs: CloudAttrs) -> int:
     from oh_my_slam.mapping.locate import check_output, locate, open_map, resolve_images
 
     # inputs, map and -o are checked before -o is prepared (which creates its folder)
-    resolve_images(args.inputs)
-    open_map(args.map)
+    images = resolve_images(args.inputs)
+    reader = open_map(args.map)
     check_output(args.map, args.output)
     out = claim_stdout(args.output)
-    res = locate(args.map, args.inputs, mode=args.mode, fmt=args.format, attrs=attrs)
+    res = locate(reader, images, mode=args.mode, fmt=args.format, attrs=attrs)
     out.write_bytes(res.payload)
     timing.report(res.timings, log, command="mapper.sh locate", mode=args.mode,
                   format=args.format, map=str(args.map))

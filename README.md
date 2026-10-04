@@ -140,8 +140,9 @@ returned. If no image is located, the command exits 2.
 *How an image is located.* The map's COLMAP database is cloned (`cp -c`) into a scratch folder;
 the images get their SIFT features there (a camera the map already has when the image size
 matches and no EXIF focal says otherwise, as for `update`) and are matched against **every
-keyframe** of a map of at most 150 keyframes, with no inference server. In a larger map they are
-matched against the 30 keyframes most similar by the retrieval descriptor, which the inference
+keyframe** of a map of at most `UPDATE_EXHAUSTIVE_MAX` (150) keyframes, with no inference
+server — the bound `update` uses. In a larger map they are matched against the
+`RETRIEVAL_TOP_K` (30) keyframes most similar by the retrieval descriptor, which the inference
 server computes for the image: that case needs the server and exits 3 when it is down. Each
 verified match to a keyframe keypoint with a triangulated point in `sfm/model` gives a 2D–3D
 correspondence; a keyframe without a model (a one-keyframe map has no `sfm/`) gives its stored
@@ -150,15 +151,22 @@ them; the focal length is estimated too unless the image shares a map camera. A 
 inliers, and its median epipolar distance to its verified matches, under the stored keyframe
 poses, must stay within 0.25° (the check the map's own keyframes pass).
 
+*A concurrent update.* `locate` reads one state of the map. If an update commits while it runs
+(`map.json` or the commit marker changes, or a file it read disappears), it opens the map again
+and starts over, up to 3 times; after that it exits 2 with "retry once the update is done".
+
 *Representation of a located camera.* Image `k` (its position in `-i`, from 0) gets its own
 `sensor_cs` and camera stream `located_<k>` (its intrinsics, `uri` the image path), so it is never
 confused with the map's `camera_<id>`. Its frame is keyed past every keyframe index the map has
-used (`next_frame_index + k`) and holds `located: true`, `image`, `inliers`, the stream `uri` and
+used (`next_frame_index + k`) and holds `timestamp` (the key, as for a keyframe), `located:
+true`, `image`, `inliers`, the stream `uri` and
 the transform `located_<k>_to_map`, the camera-to-map pose in the form of a keyframe's
 `camera_<id>_to_map`. In a PLY the header carries one comment per input image after the frame and
-attribute lines: `located_<k> {"image": …, "located": true, "T_map_cam": {"quaternion_xyzw": […],
-"translation": […]}, "K": {fx, fy, cx, cy, width, height, source}}`, or `"located": false` for an
-image that could not be located. The `-t single` document's metadata holds the map's base fields
+attribute lines, in the JSON result's representation: `located_<k> {"image": …, "located": true,
+"transform_src_to_dst": {"quaternion": [qx, qy, qz, qw], "translation": [x, y, z]},
+"stream_properties": {"intrinsics_pinhole": {…}, "intrinsics_source": …}}` — the frame's
+`located_<k>_to_map` transform and the stream's properties — or `{"image": …, "located": false}`
+for an image that could not be located. The `-t single` document's metadata holds the map's base fields
 (`tool` `"mapper"`, `map_frame`) and `scope: "single"`; the `map` coordinate system lists the
 `located_<k>` children.
 

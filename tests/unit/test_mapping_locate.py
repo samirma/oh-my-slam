@@ -26,6 +26,7 @@ from oh_my_slam.mapping.export import map_cloud, scene_bytes
 from oh_my_slam.mapping.frame import similarity_by_poses, transform_pose
 from oh_my_slam.mapping.locate import (
     LOCATED_CS,
+    LocateResult,
     check_output,
     locate,
     open_map,
@@ -73,6 +74,11 @@ def pose_of(props: dict, key: str) -> Pose:
     return Pose(quat_to_rot(np.array(tr["quaternion"])), np.array(tr["translation"]))
 
 
+def run(mdir: Path, images: list[Path], **kw: object) -> LocateResult:
+    """``locate`` as the CLI calls it: resolved images, opened map."""
+    return locate(open_map(mdir), resolve_images(images), progress=quiet, **kw)  # type: ignore[arg-type]
+
+
 def sh(*args: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run([str(REPO / "mapper.sh"), *args], capture_output=True, timeout=300,
                           env=os.environ.copy())
@@ -106,7 +112,7 @@ def world(tmp_path_factory: pytest.TempPathFactory):  # type: ignore[no-untyped-
 @needs_colmap
 def test_located_poses_match_the_truth_and_the_map_is_untouched(world) -> None:  # type: ignore[no-untyped-def]
     before, hashed = snapshot(world.map), store.full_tree_hash(world.map)
-    res = locate(world.map, world.imgs_b, progress=quiet)  # defaults: json, single
+    res = run(world.map, world.imgs_b)  # defaults: json, single
     assert snapshot(world.map) == before and store.full_tree_hash(world.map) == hashed
     assert not (world.map / store.STAGING).exists()
     assert [r.located for r in res.results] == [True] * len(world.imgs_b), \
@@ -123,6 +129,7 @@ def test_located_poses_match_the_truth_and_the_map_is_untouched(world) -> None: 
         props = frames[str(base + k)]
         key = f"{LOCATED_CS}{k}"
         assert props["image"] == str(img) and props["streams"][key]["uri"] == str(img)
+        assert props["timestamp"] == float(base + k)  # as a keyframe's: its frame key
         T = pose_of(props, key)
         r = res.results[k]
         np.testing.assert_allclose(T.t, r.T_map_cam.t, atol=1e-5)  # type: ignore[union-attr]
@@ -148,7 +155,7 @@ def test_another_camera_gets_its_focal_length_estimated(world, tmp_path: Path) -
     truth = ring(1, start=1.0)[0]
     img = tmp_path / "other_camera.png"
     img.write_bytes(png_bytes(render(mapping_room(), truth, K2).rgb))
-    (r,) = locate(world.map, [img], progress=quiet).results
+    (r,) = run(world.map, [img]).results
     assert r.located, r.reason
     assert r.K is not None and abs(r.K.fx - 360.0) < 0.03 * 360.0 and r.K.source == "colmap"
     W = transform_pose(world.sim, r.T_map_cam)  # type: ignore[arg-type]
@@ -159,7 +166,7 @@ def test_another_camera_gets_its_focal_length_estimated(world, tmp_path: Path) -
 @needs_colmap
 def test_full_scope_is_the_update_document_plus_the_located_cameras(world) -> None:  # type: ignore[no-untyped-def]
     imgs = [world.imgs_b[0], world.other, world.imgs_b[5]]
-    res = locate(world.map, imgs, mode="full", progress=quiet)
+    res = run(world.map, imgs, mode="full")
     assert [r.located for r in res.results] == [True, False, True]
     assert "not enough overlap" in res.results[1].reason
     doc = json.loads(res.payload)
@@ -187,10 +194,13 @@ def test_full_scope_is_the_update_document_plus_the_located_cameras(world) -> No
 
 @needs_colmap
 def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ignore[no-untyped-def]
-    imgs = world.imgs_b[:2]
-    js = locate(world.map, imgs, progress=quiet)
-    single = locate(world.map, imgs, fmt="ply", progress=quiet)
-    full = locate(world.map, imgs, fmt="ply", mode="full", progress=quiet)
+    from oh_my_slam.schema import openlabel as ol
+
+    imgs = [world.imgs_b[0], world.other, world.imgs_b[1]]  # the second cannot be located
+    js = run(world.map, imgs)
+    doc = json.loads(js.payload)
+    single = run(world.map, imgs, fmt="ply")
+    full = run(world.map, imgs, fmt="ply", mode="full")
     attrs = CloudAttrs()
     for res in (single, full):
         comments = parse_header(res.payload).comments
@@ -199,10 +209,18 @@ def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ign
         for k, line in enumerate(comments[2:]):
             key, payload = line.split(" ", 1)
             d = json.loads(payload)
-            assert key == f"{LOCATED_CS}{k}" and d["image"] == str(imgs[k]) and d["located"]
+            assert key == f"{LOCATED_CS}{k}" and d["image"] == str(imgs[k])
+            if k == 1:
+                assert d == {"image": str(world.other), "located": False}  # no pose
+                continue
             r = js.results[k]
-            np.testing.assert_allclose(d["T_map_cam"]["translation"], r.T_map_cam.t, atol=1e-5)  # type: ignore[union-attr]
-            assert d["K"]["width"] == 400 and d["K"]["height"] == 300
+            assert d["located"] and d["transform_src_to_dst"] == ol.transform_data(r.T_map_cam)  # type: ignore[arg-type]
+            # the representation of the JSON result: its frame transform and stream properties
+            frame = next(f["frame_properties"] for f in doc["openlabel"]["frames"].values()
+                         if f["frame_properties"]["image"] == str(imgs[k]))
+            assert d["transform_src_to_dst"] == frame["transforms"][f"{key}_to_map"][
+                "transform_src_to_dst"]
+            assert d["stream_properties"] == doc["openlabel"]["streams"][key]["stream_properties"]
     whole = map_cloud(store.MapReader(world.map))
     c_full, c_single = parse_ply(full.payload), parse_ply(single.payload)
     assert len(c_full) == len(whole)
@@ -212,7 +230,7 @@ def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ign
     assert all(tuple(p) in rows for p in np.round(c_single.xyz, 5))
     # -p applies to the map-scope attributes
     seg = parse_cloud_attrs("color=segment,label=on,voxel=0.05", CloudScope.MAP)
-    voxel = parse_ply(locate(world.map, imgs, fmt="ply", attrs=seg, progress=quiet).payload)
+    voxel = parse_ply(run(world.map, imgs, fmt="ply", attrs=seg).payload)
     assert voxel.label is not None and len(voxel) < len(c_single)
 
 
@@ -220,7 +238,7 @@ def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ign
 def test_only_unlocalisable_images_are_an_input_error(world) -> None:  # type: ignore[no-untyped-def]
     before = snapshot(world.map)
     with pytest.raises(InputError, match="none of the images"):
-        locate(world.map, [world.other], progress=quiet)
+        run(world.map, [world.other])
     res = sh("locate", "-i", str(world.other), "-m", str(world.map))
     assert res.returncode == 2 and res.stdout == b""
     assert str(world.other).encode() in res.stderr and b"not located" in res.stderr
@@ -250,6 +268,62 @@ def test_cli_stdout_output_file_and_errors(world, tmp_path: Path) -> None:  # ty
     assert snapshot(world.map) == before
 
 
+@needs_colmap
+def test_an_update_committing_during_locate_gives_a_consistent_result(world, tmp_path: Path,  # type: ignore[no-untyped-def]
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """An update commits between feature matching and pose: locate starts again on the new map,
+    and its -t full result is the new map's scene (plus the located cameras), never a mix."""
+    from oh_my_slam.mapping import locate as lmod
+
+    mdir = tmp_path / "map"
+    shutil.copytree(world.map, mdir)
+    before = json.loads(scene_bytes(store.MapReader(mdir)))
+    real = lmod._MapPoints
+    commits = []
+
+    class CommitFirst(real):  # type: ignore[misc, valid-type]
+        def __init__(self, reader: store.MapReader) -> None:
+            if not commits:  # the first attempt: a concurrent update commits now
+                commits.append(update(mdir, world.imgs_b[6:8], client=world.client,
+                                      progress=quiet))
+            super().__init__(reader)
+
+    monkeypatch.setattr(lmod, "_MapPoints", CommitFirst)
+    res = run(mdir, world.imgs_b[:2], mode="full")
+    assert len(commits) == 1 and all(r.located for r in res.results)
+    doc = json.loads(res.payload)
+    after = json.loads(scene_bytes(store.MapReader(mdir)))
+    assert after != before
+    root = doc["openlabel"]
+    for k in located_frames(doc):
+        del root["frames"][k]
+    for key in (f"{LOCATED_CS}0", f"{LOCATED_CS}1"):
+        del root["coordinate_systems"][key]
+        del root["streams"][key]
+        root["coordinate_systems"]["map"]["children"].remove(key)
+    from oh_my_slam.schema.openlabel import frame_intervals
+
+    root["frame_intervals"] = frame_intervals([int(k) for k in root["frames"]])
+    assert doc == after
+    # located frames are keyed past the keyframes the update added
+    assert min(int(k) for k in located_frames(json.loads(res.payload))) > max(
+        int(k) for k in after["openlabel"]["frames"])
+
+
+@needs_colmap
+def test_a_map_that_keeps_changing_is_an_input_error(world, tmp_path: Path,  # type: ignore[no-untyped-def]
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.mapping import locate as lmod
+
+    mdir = tmp_path / "map"
+    shutil.copytree(world.map, mdir)
+    reader = open_map(mdir)
+    calls = iter(range(100))
+    monkeypatch.setattr(lmod, "map_identity", lambda root: (b"", bytes([next(calls)])))
+    with pytest.raises(InputError, match="kept changing"):
+        locate(reader, world.imgs_b[:1], progress=quiet)
+
+
 # ------------------------------------------------------------------------------------------------
 # a one-keyframe map: no sfm/, 2D-3D from the keyframe's stored depth
 
@@ -268,7 +342,7 @@ def test_one_keyframe_map(tmp_path: Path) -> None:
     poses = ring(2, start=0.08, span=0.16)
     imgs = add_frames(client, room, poses, tmp_path / "q", "q")
     before = snapshot(mdir)
-    res = locate(mdir, imgs, mode="full", progress=quiet)
+    res = run(mdir, imgs, mode="full")
     assert snapshot(mdir) == before
     assert all(r.located for r in res.results), [r.reason for r in res.results]
     assert validation_errors(json.loads(res.payload)) == []
@@ -314,7 +388,7 @@ def test_inputs_map_folder_and_output_rules(tmp_path: Path) -> None:
     check_output(other, tmp_path / "r.json")
     check_output(other, None)
     with pytest.raises(UsageError):
-        locate(other, [img], mode="both")
+        locate(None, [img], mode="both")  # type: ignore[arg-type]
 
 
 def test_visible_points_frustum_and_occlusion() -> None:
