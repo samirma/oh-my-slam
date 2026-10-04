@@ -115,8 +115,6 @@ def known_pose_update(mdir: Path, shots: list[Shot], work: Path) -> Result:
         records, objs, geo = api.integrate(ctx, lambda m: None)
         meta.update(update_count=uid, next_frame_index=start + len(shots),
                     next_object_id=objs.next_id)
-        tx.write_json(store.SCENE_JSON, export.full_scene(tx.root, meta, records,
-                                                          objs.exported()))
         tx.commit(meta)
     return Result(objs, geo.cloud, records, [store.frame_name(start + k)
                                               for k in range(len(shots))])
@@ -388,7 +386,7 @@ def test_identity_colour_and_obb_refinement_across_updates(tmp_path: Path) -> No
     assert np.mean(list(iou3.values())) > np.mean(list(iou1.values())) + 0.05, (iou1, iou3)
     assert min(iou3.values()) > 0.6, iou3
     # the colour contract on the map cloud: each labelled point has its object's colour
-    doc = json.loads((mdir / store.SCENE_JSON).read_text())
+    doc = json.loads(export.scene_bytes(store.MapReader(mdir)))
     for oid, od in doc["openlabel"]["objects"].items():
         assert od["object_data"]["text"][0]["val"] == color_hex_for_id(int(oid))
 
