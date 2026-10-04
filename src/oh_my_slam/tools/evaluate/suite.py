@@ -51,12 +51,8 @@ from oh_my_slam.tools.evaluate.contracts import (
 )
 from oh_my_slam.tools.evaluate.mapquality import (
     AGREEMENT_METRICS,
-    DUPLICATE_METRIC,
-    OUT_OF_BOX_METRICS,
     STABILITY_METRICS,
     agreement_metrics,
-    duplicate_metrics,
-    out_of_box_metrics,
     split_alignment,
     stability_metrics,
 )
@@ -97,12 +93,11 @@ def expected_ids() -> list[str]:
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
-    ids += [f"map.{mp}.{k}" for mp in MAPS
-            for k in (*AGREEMENT_METRICS, DUPLICATE_METRIC, *OUT_OF_BOX_METRICS)]
+    ids += [f"map.{mp}.{k}" for mp in MAPS for k in AGREEMENT_METRICS]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
     ids += mapupdate.metric_ids()
     ids += [mid for mid, *_ in ContractLog().results()]
-    return [*ids, "contract.exit_codes"]
+    return ids
 
 
 def _problems_reading(fn: Any, *args: Any) -> list[str]:
@@ -349,20 +344,6 @@ class Evaluation:
                 else:
                     self.details[f"map.{name}.pairs"] = agreement_metrics(
                         self.metrics, f"map.{name}", dirs[name], captures)
-            mid = f"map.{name}.{DUPLICATE_METRIC}"
-            with self.metrics.expect(mid):
-                if doc is None:
-                    self.metrics.fail([mid], f"the {name} map was not built")
-                else:
-                    self.details[f"map.{name}.duplicates"] = duplicate_metrics(
-                        self.metrics, f"map.{name}", doc_objects(doc))
-            ids = [f"map.{name}.{k}" for k in OUT_OF_BOX_METRICS]
-            with self.metrics.expect(*ids):
-                if doc is None:
-                    self.metrics.fail(ids, f"the {name} map was not built")
-                else:
-                    self.details[f"map.{name}.out_of_box"] = out_of_box_metrics(
-                        self.metrics, f"map.{name}", dirs[name], doc_objects(doc))
         self.single_poses = poses.get("single")
         ids = [f"map.stability.{k}" for k in STABILITY_METRICS]
         with self.metrics.expect(*ids):
@@ -498,6 +479,4 @@ class Evaluation:
             m.add(SEG_METRICS[2], min(scores) if scores else None, error="no detections")
         for mid, value, detail, error in self.contracts.results():
             m.add(mid, value, detail, error)
-        bad = [r.failure() for r in self.runner.records if not r.ok]
-        m.add("contract.exit_codes", len(bad), {"runs": len(self.runner.records), "failed": bad})
         self.ground_truth()

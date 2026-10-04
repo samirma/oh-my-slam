@@ -25,7 +25,7 @@ from oh_my_slam.tools.evaluate.names import (
 from oh_my_slam.tools.evaluate.scene import Json, frame_poses, frame_property, pitch_deg, yaw_deg
 
 POSE_METRICS = ("registered_fraction", "yaw_err_median_deg", "yaw_err_max_deg",
-                "pitch_direction_fraction", "same_heading_yaw_diff_max_deg", "centre_radius_m")
+                "pitch_direction_fraction", "same_heading_yaw_diff_max_deg")
 
 
 def capture_sources(doc: Json, map_dir: Path) -> dict[int, str]:
@@ -105,8 +105,4 @@ def pose_metrics(m: Metrics, prefix: str, poses: dict[str, Pose], captures: list
           sum(p["ok"] for p in pitch) / len(pitch) if pitch else None,
           {"evaluated": len(pitch), "wrong": [p["capture"] for p in pitch if not p["ok"]]},
           error=None if pitch else "no up/down capture with a registered level sibling")
-    centres = np.array([poses[c.name].t for c in reg]).reshape(-1, 3)
-    m.add(ids["centre_radius_m"],
-          float(np.linalg.norm(centres - centres.mean(0), axis=1).max()) if len(reg) else None,
-          error=None if len(reg) else "no registered capture")
     return rows

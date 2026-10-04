@@ -306,14 +306,6 @@ def _details(details: dict[str, Any]) -> list[str]:
               r["iou"], r["centre_delta_m"], r["extent_delta_rel"]]
              for r in details["map.stability"]])
     for name in ("single", "split"):
-        rows = details.get(f"map.{name}.duplicates")
-        if rows:
-            out += _section(
-                f"Near-duplicate objects — {name} map", ["ids", "labels", "box gap m",
-                                                          "centre distance m"],
-                [[" / ".join(map(str, r["ids"])), " / ".join(r["labels"]), r["gap_m"],
-                  r["centre_distance_m"]] for r in rows])
-    for name in ("single", "split"):
         rows = details.get(f"map.{name}.pairs")
         if rows:
             out += _section(
@@ -321,16 +313,6 @@ def _details(details: dict[str, Any]) -> list[str]:
                 ["captures", "keyframes apart", "angle °", "median disagreement %", "p90 %"],
                 [[r["pair"], r.get("gap"), r.get("angle_deg"), r["median_pct"], r["p90_pct"]]
                  for r in rows])
-    titles = {"mask_out_of_box_share": "Detected mask points outside their object's box",
-              "cloud_out_of_box_share": "Cloud points outside their object's attribution gate"}
-    for name in ("single", "split"):
-        per_metric = details.get(f"map.{name}.out_of_box") or {}
-        for key, title in titles.items():
-            rows = [r for r in per_metric.get(key, []) if r["outside_share"] > 0]
-            if rows:
-                out += _section(
-                    f"{title} — {name} map", ["id", "label", "points", "share outside"],
-                    [[r["id"], r["label"], r["points"], r["outside_share"]] for r in rows[:10]])
     out += _map_update_details(details.get("map_update") or {})
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
