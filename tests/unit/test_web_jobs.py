@@ -191,6 +191,11 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
     assert both["viewer_progress"] is None
     viewer_events = (ws.jobs / both["id"] / "viewer_progress.jsonl").read_text().splitlines()
     assert any(json.loads(e).get("event") == "stage_start" for e in viewer_events)
+    # its stderr is kept apart too: the job's log is the command's own
+    assert (ws.jobs / both["id"] / "viewer_stderr.log").is_file()
+    log = client.get(f"/api/jobs/{both['id']}/log").text
+    assert log == (ws.jobs / both["id"] / "stderr.log").read_text()
+    assert sum("timings: total " in line for line in log.splitlines()) == 1
 
     # after a restart (a new runner and service on the same workspace) the viewer is still there
     again = Runner(ws)

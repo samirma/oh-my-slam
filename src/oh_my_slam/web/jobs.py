@@ -214,6 +214,8 @@ class Runner:
                              "job finished; re-submit it"}
             if job.pgid is not None or job.leader_ctime is not None:
                 job.pgid, job.leader_ctime, changed = None, None, True
+            if job.viewer_progress is not None:  # no step runs any more
+                job.viewer_progress, changed = None, True
             self.jobs[job.id] = job
             self._touch(job, save=changed)
 
@@ -404,8 +406,9 @@ class Runner:
             self._touch(job, save=True)
             if job.cancel_requested:
                 self._signal(proc, signal.SIGINT)
-        reader = threading.Thread(target=self._read_stderr, args=(job, proc, d / "stderr.log"),
-                                  daemon=True)
+        # the command's stderr is the job's log; a viewer step after it keeps its own
+        log = d / ("stderr.log" if own else "viewer_stderr.log")
+        reader = threading.Thread(target=self._read_stderr, args=(job, proc, log), daemon=True)
         reader.start()
         with progress.open("rb") as events:
             events.seek(offset)

@@ -570,6 +570,35 @@ def test_map_viewer_is_served_by_the_viewers_own_routes(svc: Svc,
     assert svc.client.get("/api/jobs/none/viewer/").status_code == 404
 
 
+def test_a_restart_clears_a_viewer_steps_progress(ws: Workspace) -> None:
+    """A service killed during a viewer step: after the restart no step runs, so the job shows
+    no viewer progress."""
+    import json
+
+    runner = Runner(ws)
+    job = runner.submit(slow_op(), {}, slow(0, inference=False), runner.new_id())
+    runner.wait(job.id, 60)
+    runner.shutdown()
+    record = ws.job_dir(job.id) / "job.json"
+    saved = json.loads(record.read_text())
+    record.write_text(json.dumps({**saved, "state": "running",
+                                  "viewer_progress": {"stage": "inference"}}))
+    again = Runner(ws)
+    again.load()
+    assert again.get(job.id).viewer_progress is None
+    assert json.loads(record.read_text())["viewer_progress"] is None
+    again.shutdown()
+
+
+def test_viewer_build_locks_are_pruned_with_their_bundles() -> None:
+    lru = web_app._LRU(2)
+    for name in ("a", "b", "c"):
+        for version in (1, 2):  # a newer version of the same map evicts the older one first
+            assert lru.get((name, version), lambda: object(), owner=name) is not None
+    assert list(lru.items) == [("c", 1), ("c", 2)]
+    assert set(lru.owners) == {"c"}  # a's and b's locks went with their last bundle
+
+
 def test_viewer_bundles_build_under_a_per_map_lock(svc: Svc) -> None:
     """Building one map's viewer never waits for another map's build; concurrent requests for
     the same map build it once."""

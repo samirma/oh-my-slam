@@ -181,7 +181,11 @@ async function renderResult(box, job, selection) {
   if (job.viewer) box.append(embeddedViewer(job.viewer, `Viewer of job ${job.id}`, selection));
   else {
     const map = mapOf(job);
-    if (map) box.append(embeddedViewer(`/viewer/map/${enc(map)}/`, `Viewer of map ${map}`, selection));
+    if (map) {
+      box.append(el('p', { class: 'muted viewer-note', 'data-testid': 'map-viewer-note' },
+        `The viewer shows map ${map} as it is now, including any update made after this job.`),
+      embeddedViewer(`/viewer/map/${enc(map)}/`, `Viewer of map ${map}`, selection));
+    }
   }
   if (rendered.children.length) box.append(rendered);
   box.append(el('h3', {}, 'Downloads'), entries.length ? downloads : el('p', { class: 'muted' }, 'This job wrote no file.'));

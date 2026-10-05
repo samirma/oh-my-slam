@@ -358,7 +358,10 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
   output goes to each job's log, and right after the listening line the service's own logging
   (the `uvicorn*` and `oh_my_slam` loggers, the root logger, Python warnings) and anything else
   written to its file descriptors 1 and 2 go to `<data>/server.log`, so a malformed request's
-  warning or a traceback never reaches stderr. stdout is empty except for `--status`.
+  warning or a traceback never reaches stderr. A non-zero exit after the listening line (an
+  internal error, or a second Ctrl-C / SIGTERM during the stop) adds exactly one line on the
+  original stderr, `server.sh: error: <what> (see <data>/server.log)`. stdout is empty except for
+  `--status`.
 * **Browser.** The browser is opened on `http://127.0.0.1:<port>/` only once the service accepts
   connections (right after the listening line), and never with `--no-browser` (a test replaces
   `webbrowser.open` with a probe that connects to the URL).
@@ -406,7 +409,7 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
 | `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service never deletes a map and changes one only through `mapper-update`. |
 | `uploads/<id>/<file>` | Raw-body uploads (`POST /api/uploads?name=<file>`, `application/octet-stream`). A job refers to one by its path `uploads/<id>/<file>`. Each upload belongs to at most one queued or running job and is deleted when that job ends, whatever its state. An interrupted upload is deleted at once, and every upload is deleted at start and stop. An upload may hold at most 8 GiB (long phone videos fit) and must leave 1 GiB free on the workspace's disk; otherwise it gets 413. |
 | `server.log` | The running service's own log, after its listening line (see Output). |
-| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS` of the command), `viewer_progress.jsonl` (that of a viewer step after the command), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, `out/` (everything the command wrote), `viewer/` (a saved viewer) and `display/` (its PLY files as the 3D scene viewer draws them). |
+| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS` of the command), `viewer_progress.jsonl` (that of a viewer step after the command), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `viewer_stderr.log` (that of a viewer step after the command, kept out of the job's log), `stdout`, `out/` (everything the command wrote), `viewer/` (a saved viewer) and `display/` (its PLY files as the 3D scene viewer draws them). |
 
 Any other workspace path is accepted as an input, relative to the workspace or absolute. A path
 that resolves outside the workspace (through `..`, `~` or a symlink), or that goes through a
@@ -596,7 +599,8 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
   viewer. A single-image job is submitted with `?viewer=true` where the operation offers it, and
   its `viewer_error` (including `cancelled`) is shown above the result, which still stands.
   The result page of a map operation (`mapper.sh update` / `locate`, `segment.sh -m`) embeds that
-  map's viewer (`/viewer/map/<name>/`).
+  map's viewer (`/viewer/map/<name>/`), captioned as showing the map as it is now (later
+  updates included).
 * **Command output.** Every job page shows what the command printed on stderr
   (`/api/jobs/<id>/log`): its warnings and messages in its own words, and its `timings:` line on
   its own. It is read again as the job's lines change.

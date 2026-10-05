@@ -160,6 +160,7 @@ class _LRU:
         self.items: OrderedDict[Any, Any] = OrderedDict()
         self.lock = threading.Lock()  # guards ``items`` and ``owners`` only (never held to build)
         self.owners: dict[Any, threading.Lock] = {}
+        self.owner_of: dict[Any, Any] = {}  # each cached key's owner
 
     def _cached(self, key: Any) -> tuple[bool, Any]:
         with self.lock:
@@ -174,9 +175,9 @@ class _LRU:
         found, value = self._cached(key)
         if found:
             return value
+        owner = key if owner is None else owner
         with self.lock:
-            build_lock = self.owners.setdefault(key if owner is None else owner,
-                                                threading.Lock())
+            build_lock = self.owners.setdefault(owner, threading.Lock())
         with build_lock:
             found, value = self._cached(key)  # built meanwhile by another request
             if found:
@@ -184,9 +185,18 @@ class _LRU:
             value = make()
             with self.lock:
                 self.items[key] = value
+                self.owner_of[key] = owner
                 while len(self.items) > self.size:
-                    self.items.popitem(last=False)
+                    old, _ = self.items.popitem(last=False)
+                    self._prune(self.owner_of.pop(old))
             return value
+
+    def _prune(self, owner: Any) -> None:
+        """Forget ``owner``'s lock once it caches nothing and no build holds it (under
+        ``self.lock``), so the locks stay as few as the cached bundles."""
+        lock = self.owners.get(owner)
+        if lock is not None and not lock.locked() and owner not in self.owner_of.values():
+            del self.owners[owner]
 
 
 @dataclass

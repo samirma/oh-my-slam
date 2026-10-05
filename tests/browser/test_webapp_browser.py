@@ -418,6 +418,7 @@ def test_map_update_job_page_embeds_the_map_viewer_and_its_log(
     wait_job(pg)
     pg.wait_for_selector(".viewer-box[data-ready=true]", timeout=60000)
     assert pg.get_attribute(".job-result iframe.viewer-frame", "src") == "/viewer/map/room/"
+    assert "as it is now" in pg.inner_text("[data-testid=map-viewer-note]")
     assert_job_log(pg, service, jid)
     tab.a11y()
     assert tab.errors == []
@@ -1027,4 +1028,18 @@ def test_resubmit_asks_only_for_the_uploads(mapped: dict[str, Any], tab: Tab, ap
                      [FRAMES[1].name, "choose this file again"]]
     pg.click("#confirm-no")
     assert len(service.runner.all_jobs()) == jobs_before
+    # choosing the upload again re-submits: the workspace path in its place, then the new upload
+    pg.click("section.job button[data-action=resubmit]")
+    pg.locator("dialog#confirm[open]").wait_for()
+    pg.set_input_files("dialog#confirm input[type=file]", str(FRAMES[1]))
+    pg.wait_for_function("() => document.querySelectorAll('dialog#confirm li.ready').length === 1")
+    pg.click("#confirm-yes")
+    pg.wait_for_function(f"() => location.hash.startsWith('#/jobs/') && !location.hash.endsWith('{jid}')")
+    pg.wait_for_selector("section.job[data-job]")
+    new = service.runner.get(pg.get_attribute("section.job", "data-job"))
+    inputs = new.params["inputs"]
+    assert inputs[0] == f"kept/{FRAMES[0].name}"
+    assert inputs[1].startswith("uploads/") and inputs[1].endswith(f"/{FRAMES[1].name}")
+    assert inputs[1] != up["path"]
+    service.runner.wait(new.id, 300)
     assert tab.errors == []
