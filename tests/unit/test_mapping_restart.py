@@ -187,7 +187,11 @@ def test_a_published_object_stays_published_through_rebuilds(
     colour, and nothing is reported removed. Objects only the new views saw are not published."""
     from oh_my_slam.mapping import objects as mo
 
-    client, first, rest = views
+    shared, first, rest = views
+    # a client of its own: the shared one's call count seeds the multi-view noise of the tests
+    # that follow
+    client = FakeClient(mv_noise=shared.mv_noise)
+    client.frames = dict(shared.frames)
     m = tmp_path / "m"
     published = json.loads(update(m, first, client=client, progress=_quiet).payload)
     before = {int(k): o["type"] for k, o in published["openlabel"]["objects"].items()}

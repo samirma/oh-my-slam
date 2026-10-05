@@ -844,13 +844,23 @@ which replaces most files, widens that window.
   order gives the same objects, labels and boxes, within the evaluator's stability targets (spec
   §2.3 and §5; not to the centimetre: the threaded global mapper is not deterministic, and two
   runs of one update differ too); only ids may differ, where an earlier update had already
-  published one, since a published id persists. An object is judged by the keyframes added
+  published one, since a published id persists. Identity persistence takes precedence in one
+  more way: published objects stay published (see *Every object of the map is a confirmed
+  one*), so an object an early update published stays in a split map until later keyframes see
+  through its place, even where the one-update map, judging all the evidence at once, never
+  confirms it. An object is judged by the keyframes added
   after its last detection wherever the updates are cut, and a map of photos with a keyframe SfM
   did not pose is rebuilt with the next update's photos (see *Rebuilding a weakly posed map*
-  under Mapping, step 4): `office_sequence` in one update, 6 + 7 and 4 + 4 + 5 photos gives the
-  same 8 objects and labels, box centres 1-2 cm apart (median box IoU 0.63-0.73 against the
-  one-update map; a second one-update run: 0.81-0.93), 7 of the 8 ids, and no cup, its place
-  drawn from the photos that see it empty. Where nothing changed, the
+  under Mapping, step 4): `office_sequence` split 6 + 7 and 4 + 4 + 5 photos has the one-update
+  map's 8 objects with their labels, box centres 1.5-1.8 cm apart (median box IoU 0.59-0.65
+  against the one-update map), 7 of the 8 ids, and no cup, its place drawn from the photos that
+  see it empty (2026-10-05). It also keeps what an earlier update published that the one-update
+  map does not confirm: 6 + 7 a comb (30) its first update published; 4 + 4 + 5 a tree behind the
+  glass (24) the four window photos published and a car (20) the second update's rebuild
+  published; no later photo sees through their places. 8 of the split map's 9 or 10 objects
+  therefore pair with the one-update map's (the evaluator's `map.stability.matched_fraction`
+  0.89 and 0.80, below its target of 0.9). `ainex-captures` split 40 + 39 has the one-update
+  map's 33 objects, ids and labels (median IoU 0.85, centres 1 cm apart). Where nothing changed, the
   keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
   * The cloud's colours and object ids do not depend on keyframe order either.
@@ -1571,7 +1581,9 @@ runs it end to end as a test.
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
   longer. A later update rebuilds such a map with its photos (Mapping, step 4), so the whole
   sequence split as 4 + 4 + 5 or 6 + 7 photos ends with the one-update map's objects, labels
-  and boxes (one window keeps a different id, see there). In a map of the
+  and boxes (one window keeps a different id, see there), and with the objects its first
+  updates published that the one-update map does not have (a tree behind the glass, see
+  *Update semantics*): published objects stay published. In a map of the
   whole sequence the global mapper's result varies from run to run for the same reason: in some
   runs the depth check (step 1 of *Weakly linked parts*) rejects photos whose SfM points are
   mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and their multi-view poses leave them
