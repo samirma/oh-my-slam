@@ -6,6 +6,8 @@ Cameras use OpenCV axes. All functions are pure NumPy.
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -273,6 +275,257 @@ def _packed(keys: NDArray[np.int64]) -> NDArray[np.int64]:
         return keys
     k = keys - lo
     return (k[:, 0] * int(span[1] * span[2]) + k[:, 1] * int(span[2]) + k[:, 2]).astype(np.int64)
+
+
+# --- voxel-grid selection within a point budget --------------------------------------------------
+
+# The edge returned is the smallest that fits to within this factor: the search ends with a counted
+# edge that does not fit less than 2 % below it (finer is meaningless: at that scale the grid's
+# alignment alone moves the count non-monotonically).
+BUDGET_EDGE_TOL = 0.02
+# While unbracketed, the secant aims this fraction past the budget, so that it lands on the far side.
+_BUDGET_AIM = 0.0025
+_BUDGET_CHUNK = 1 << 20  # points whose voxel codes are computed at a time (small temporaries)
+_BUDGET_MAX_STEPS = 64
+_MIN_EDGE_BITS = 60  # no grid finer than extent / 2**60: at that scale only distinct places count
+
+
+@dataclass(frozen=True)
+class BudgetGrid:
+    """The grid ``budget_voxel_grid`` chose: voxel ``edge`` (metres; 0 = no grid, every finite
+    point or every distinct place fits), the ``count`` of points it keeps, the tightest counted
+    edge below it that did not fit (``finer``, with ``finer_count`` voxels; None when none was
+    counted), and how many occupancy ``counts`` the search took."""
+
+    edge: float
+    count: int
+    finer: float | None
+    finer_count: int | None
+    counts: int
+
+
+def _voxel_codes(points: NDArray[Any], edge: float,
+                 bounds: tuple[NDArray[Any], NDArray[Any]] | None = None) -> NDArray[np.int64]:
+    """The voxel of every point (``voxel_keys``: the grid of edge ``edge`` anchored at the origin)
+    as one int64 each (equal codes <=> same voxel), computed chunk by chunk on a few threads
+    (NumPy releases the GIL); ``(N, 3)`` keys when the grid's extent does not fit one int64.
+    ``bounds``: the points' (min, max), when already known."""
+    mn, mx = bounds if bounds is not None else (points.min(axis=0), points.max(axis=0))
+    lo = np.floor(np.asarray(mn, np.float64) / edge).astype(np.int64)
+    hi = np.floor(np.asarray(mx, np.float64) / edge).astype(np.int64)
+    span = [int(s) for s in hi - lo + 1]
+    if span[0] * span[1] * span[2] >= 2**62:
+        return voxel_keys(points, edge)
+    codes = np.empty(len(points), np.int64)
+
+    def chunk(s: int) -> None:
+        k = voxel_keys(points[s:s + _BUDGET_CHUNK], edge) - lo
+        codes[s:s + _BUDGET_CHUNK] = (k[:, 0] * span[1] + k[:, 1]) * span[2] + k[:, 2]
+
+    starts = range(0, len(points), _BUDGET_CHUNK)
+    if len(starts) > 2:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            list(pool.map(chunk, starts))
+    else:
+        for s in starts:
+            chunk(s)
+    return codes
+
+
+def _runs(codes: NDArray[np.int64]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """(order, starts): an unstable argsort of 1-D codes (faster than a sort on a map's codes, and
+    reused for the selection) and where each run of equal codes begins in it."""
+    order = np.argsort(codes)
+    sorted_codes = codes[order]
+    return order, np.flatnonzero(np.r_[True, sorted_codes[1:] != sorted_codes[:-1]])
+
+
+def _occupied(points: NDArray[Any], edge: float) -> int:
+    """Occupied voxels of the grid of edge ``edge``."""
+    codes = _voxel_codes(np.asarray(points).reshape(-1, 3), edge)
+    if codes.ndim == 2:
+        return len(np.unique(codes, axis=0))
+    return len(_runs(codes)[1]) if len(codes) else 0
+
+
+def _first_per_voxel(codes: NDArray[np.int64],
+                     runs: tuple[NDArray[np.int64], NDArray[np.int64]] | None = None
+                     ) -> NDArray[np.int64]:
+    """Index of the first point of each voxel, ascending: the smallest index of each run of equal
+    codes (``runs``: ``_runs(codes)`` when already known)."""
+    if codes.ndim == 2:
+        _, first = np.unique(codes, axis=0, return_index=True)
+        return np.sort(first).astype(np.int64)
+    if not len(codes):
+        return np.zeros(0, np.int64)
+    order, starts = runs if runs is not None else _runs(codes)
+    keep = np.zeros(len(codes), bool)
+    keep[np.minimum.reduceat(order, starts)] = True
+    return np.flatnonzero(keep).astype(np.int64)
+
+
+def _distinct_places(points: NDArray[Any]) -> NDArray[np.int64]:
+    """Index of the first point at each distinct position, ascending."""
+    _, first = np.unique(points, axis=0, return_index=True)
+    return np.sort(first).astype(np.int64)
+
+
+def _finite(points: NDArray[Any]) -> tuple[NDArray[Any], NDArray[np.int64] | None]:
+    """The points with finite coordinates, and their rows (None: all of them)."""
+    ok = np.isfinite(points).all(axis=1)
+    if ok.all():
+        return points, None
+    rows = np.flatnonzero(ok)
+    return points[rows], rows
+
+
+def budget_voxel_grid(points: NDArray[Any], max_points: int,
+                      edge_tol: float = BUDGET_EDGE_TOL) -> tuple[BudgetGrid, NDArray[np.int64]]:
+    """(grid, indices): the selection that draws at most ``max_points`` of ``points`` — one
+    original point per occupied voxel (the first in the points' order), ascending — for the
+    smallest voxel edge whose grid has at most ``max_points`` occupied voxels. Points with a
+    non-finite coordinate are never selected (they cannot be drawn).
+
+    * Every finite point when there are at most ``max_points`` of them (edge 0).
+    * Otherwise the grid is searched: each step counts the occupied voxels of one edge (an
+      argsort of the points' voxel codes, reused for the selection itself). Steps are secants of
+      logit(count / points) against log(edge) — nearly straight both far from and close to every
+      point having its own voxel — aimed just past the budget until both sides are counted, then
+      regula falsi (Illinois) inside the counted bracket.
+    * The search ends when the bracket is tight: the returned edge was counted with at most
+      ``max_points`` voxels, and ``grid.finer``, less than ``edge_tol`` (2 %) below it, was counted
+      with more (the count is not strictly monotonic at that scale, so an edge in between may
+      still fit). The result never exceeds ``max_points``.
+    * When the points are at no more than ``max_points`` distinct places (duplicates), no grid
+      thins them further: one point per place, edge 0 (``finer`` None)."""
+    if max_points < 1:
+        raise ValueError("max_points must be at least 1")
+    pts, rows = _finite(np.asarray(points).reshape(-1, 3))
+
+    def out(idx: NDArray[np.int64]) -> NDArray[np.int64]:
+        return idx if rows is None else rows[idx]
+
+    n = len(pts)
+    if n <= max_points:
+        return BudgetGrid(0.0, n, None, None, 0), out(np.arange(n, dtype=np.int64))
+    extent = float(np.max(pts.max(axis=0).astype(np.float64) - pts.min(axis=0)))
+    floor = math.log(extent) - _MIN_EDGE_BITS * math.log(2.0) if extent > 0 else math.inf
+
+    counted: dict[float, int] = {}  # log(edge) -> occupied voxels
+    last: list[Any] = [None, None, None]  # log(edge), codes, runs of the latest count
+    bounds = (pts.min(axis=0), pts.max(axis=0))
+
+    def count(x: float) -> int:
+        if x not in counted:
+            last[:] = [None, None, None]  # free the previous count's arrays first
+            codes = _voxel_codes(pts, math.exp(x), bounds)
+            runs = _runs(codes) if codes.ndim == 1 else None
+            counted[x] = len(runs[1]) if runs is not None else len(np.unique(codes, axis=0))
+            last[:] = [x, codes, runs]
+        return counted[x]
+
+    tight = math.log1p(edge_tol)
+
+    def y(c: float) -> float:  # logit of the kept fraction: straight-ish in log(edge)
+        return math.log(c) - math.log(n + 0.5 - c)
+
+    def places() -> tuple[BudgetGrid, NDArray[np.int64]]:
+        idx = _distinct_places(pts)
+        if len(idx) <= max_points:
+            return BudgetGrid(0.0, len(idx), None, None, len(counted)), out(idx)
+        return result(*fitting())
+
+    def fitting() -> tuple[float, int]:
+        x = min(k for k, c in counted.items() if c <= max_points)
+        return x, counted[x]
+
+    def result(x: float, c: int) -> tuple[BudgetGrid, NDArray[np.int64]]:
+        fail = [k for k, v in counted.items() if v > max_points and k < x]
+        finer = max(fail) if fail else None
+        if last[0] == x:
+            idx = _first_per_voxel(last[1], last[2])
+        else:
+            idx = _first_per_voxel(_voxel_codes(pts, math.exp(x), bounds))
+        last[:] = [None, None, None]
+        return (BudgetGrid(math.exp(x), c, None if finer is None else math.exp(finer),
+                           None if finer is None else counted[finer], len(counted)), out(idx))
+
+    if extent == 0.0:
+        return places()
+    x = math.log(extent / math.sqrt(max_points))  # max_points voxels tiling the extent's square
+    side = 0  # Illinois: which end the last step moved
+    tried_places = False
+    for _ in range(_BUDGET_MAX_STEPS):
+        c = count(x)
+        fits = [k for k, v in counted.items() if v <= max_points]
+        fails = [k for k, v in counted.items() if v > max_points]
+        hi = min(fits) if fits else None  # finest edge that fits
+        lo = max((k for k in fails if hi is None or k < hi), default=None)  # coarsest that fails
+        if hi is not None and lo is None:
+            finest = sorted(fits)[:2]
+            if x <= floor or (not tried_places and len(finest) == 2
+                              and counted[finest[0]] == counted[finest[1]]):
+                # finer grids keep no more points: perhaps duplicates only
+                tried_places = True
+                idx = _distinct_places(pts)
+                if len(idx) <= max_points:
+                    return BudgetGrid(0.0, len(idx), None, None, len(counted)), out(idx)
+                if x <= floor:
+                    return result(*fitting())
+        if hi is not None and lo is not None:
+            width = hi - lo
+            if width <= tight:
+                return result(*fitting())
+            f_hi, f_lo = y(counted[hi]) - y(max_points), y(counted[lo]) - y(max_points)
+            moved = 1 if c <= max_points else -1
+            if moved == side:  # the same end moved twice: halve the other end's weight
+                if moved == 1:
+                    f_lo /= 2
+                else:
+                    f_hi /= 2
+            side = moved
+            nx = lo + width * f_lo / (f_lo - f_hi) if f_lo != f_hi else (lo + hi) / 2
+            nx = min(max(nx, lo + 0.01 * width), hi - 0.01 * width)
+            # close to an end: step just inside the tolerance from it, so that one count closes it
+            if hi - nx < 0.9 * tight:
+                nx = hi - 0.9 * tight
+            elif nx - lo < 0.9 * tight:
+                nx = lo + 0.9 * tight
+        else:
+            # one side only: a secant through the last two counts (slope -2 to begin with)
+            ks = sorted(counted)
+            slope = -2.0
+            if len(ks) >= 2:
+                a, b = sorted(ks, key=lambda k: abs(k - x))[:2]  # the two counts nearest
+                if counted[a] != counted[b] and a != b:
+                    slope = min((y(counted[a]) - y(counted[b])) / (a - b), -0.25)
+            aim = (min(max_points * (1 + _BUDGET_AIM), (max_points + n) / 2) if c <= max_points
+                   else max_points * (1 - _BUDGET_AIM))
+            nx = x + (y(aim) - y(c)) / slope
+            if c <= max_points:  # at least a tolerance finer, to find a finer edge that fails
+                nx = min(nx, x - 0.9 * tight)
+            step = math.log(64.0)
+            nx = min(max(nx, x - step), x + step)  # at most 64 x per step while unbracketed
+            nx = max(nx, floor)
+        x = nx
+    return result(*fitting()) if any(v <= max_points for v in counted.values()) else places()
+
+
+def budget_voxel_indices(points: NDArray[Any], max_points: int, edge: float | None = None
+                         ) -> tuple[NDArray[np.int64], float]:
+    """(indices, edge) of ``budget_voxel_grid``; with ``edge`` (one it found before for the same
+    points and budget) the selection at that edge, without a search."""
+    if edge is None:
+        grid, idx = budget_voxel_grid(points, max_points)
+        return idx, grid.edge
+    pts, rows = _finite(np.asarray(points).reshape(-1, 3))
+    if edge == 0.0:
+        idx = np.arange(len(pts), dtype=np.int64) if len(pts) <= max_points else _distinct_places(pts)
+    else:
+        idx = _first_per_voxel(_voxel_codes(pts, edge))
+    return (idx if rows is None else rows[idx]), edge
 
 
 def fit_plane(points: NDArray[Any]) -> tuple[F64, float]:

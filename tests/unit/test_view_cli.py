@@ -17,7 +17,7 @@ import pytest
 from PIL import Image
 
 from oh_my_slam.cli.view import URL_LINE
-from oh_my_slam.viewer.server import parse_cloud_payload
+from oh_my_slam.viewer.routes import parse_cloud_payload
 from tests.fakes.stub_server import start_stub_server
 
 REPO = Path(__file__).resolve().parents[2]

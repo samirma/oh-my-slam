@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -35,17 +35,22 @@ from oh_my_slam.core.cloud_attrs import (
 )
 from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.geometry import quat_to_rot, rotation_between
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
 
-Json = dict[str, Any]
+if TYPE_CHECKING:
+    from oh_my_slam.mapping.store import MapReader
 
-# The page shows the complete derived cloud up to this many points: measured in Edge (ANGLE Metal)
-# on the M4 Max, 12 M points load in ~2 s and orbit at 60 frames/s (16 M drop frames, 24 M run at
-# 30 frames/s). A larger cloud is thinned for display only, deterministically (every k-th point in
-# derivation order, ``derive_thinned``), and the page says so.
-MAX_DISPLAY_POINTS = 12_000_000
+Json = dict[str, Any]
+log = get_logger("oh_my_slam.viewer")
+
+# Spec §2.5 display budget: the page draws every point of a cloud of at most this many points. A
+# larger cloud is shown as a voxel-grid selection — one original point per occupied voxel of the
+# smallest edge that fits (``derive_thinned``, the shared derivation) — and the page states
+# "showing X of Y points" with the edge. PLY outputs and the map are never thinned.
+DISPLAY_POINT_BUDGET = 16_000_000
 
 # Spec §2.5: these attributes concern PLY files only and have no control in the viewer.
 PLY_ONLY = frozenset({"label", "encoding"})
@@ -68,7 +73,7 @@ class DisplayCloud:
 
     cloud: PointCloud
     total: int  # points of the derived cloud before display thinning
-    step: int  # display thinning: every ``step``-th point (1 = none)
+    voxel: float  # display thinning: one point per voxel of this edge, metres (0 = every point)
     seconds: float  # derivation time
     owned_bytes: int | None = None  # memory of its arrays not shared with the source (None: all)
 
@@ -93,6 +98,7 @@ class ViewBundle:
     segmented_png: bytes | None = None
     display_transform: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     camera_sources: dict[str, str] = field(default_factory=dict)  # camera name → input file name
+    point_budget: int = DISPLAY_POINT_BUDGET  # points drawn at most (tests set a small one)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -160,16 +166,23 @@ class ViewBundle:
 
     def cloud(self, attrs: CloudAttrs) -> DisplayCloud:
         """The cloud ``attrs`` describe, derived from the in-memory source (no inference), with
-        each point's object id; beyond ``MAX_DISPLAY_POINTS`` every ``step``-th point of it
+        each point's object id; beyond ``point_budget`` points its voxel-grid selection
         (``derive_thinned``: normals only for those). Raises ``ValueError`` when the source cannot
         provide ``attrs`` (e.g. ``color=height`` without an estimated gravity)."""
         with self._lock:  # one derivation at a time; sources keep their normals
             t0 = time.perf_counter()
             thin = derive_thinned(self.source, replace(attrs, label=self.source.labels is not None),
-                                  MAX_DISPLAY_POINTS)
+                                  self.point_budget)
             seconds = time.perf_counter() - t0
-        return DisplayCloud(thin.cloud, thin.total, thin.step, seconds,
+        return DisplayCloud(thin.cloud, thin.total, thin.voxel, seconds,
                             owned_bytes(thin.cloud, self.source))
+
+    def prepare(self) -> None:
+        """Derive the default cloud once (its display selection is then kept by the source)."""
+        try:
+            self.cloud(CloudAttrs.defaults(self.scope))
+        except Exception as exc:  # the page's own request reports it
+            log.warning("viewer: preparing the default cloud failed: %s", exc)
 
     def meta(self) -> Json:
         return {
@@ -200,7 +213,9 @@ def scene_cameras(scene: Json) -> list[Json]:
     sensor frame is itself a root coordinate system (a single image, whose scene is in its camera
     frame). ``T`` is camera-to-scene (4 x 4, row-major) and ``position`` its translation, the
     camera centre in the scene frame (metres); ``K`` is ``fx, fy, cx, cy`` of the stream's pinhole
-    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image."""
+    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image;
+    ``located`` true for a frame ``mapper.sh locate`` marks as a located input image. The page's
+    ``cameras.js`` ``sceneCameras`` mirrors this for scene files opened in the browser."""
     root = scene.get("openlabel", {})
     streams: Json = root.get("streams", {})
     systems: Json = root.get("coordinate_systems", {})
@@ -225,6 +240,8 @@ def scene_cameras(scene: Json) -> list[Json]:
                 "K": [m[0], m[5], m[2], m[6]], "size": [pin["width_px"], pin["height_px"]],
                 "update": props.get("update_id"),
                 "source": Path(str(stream.get("uri", ""))).name,
+                # a camera ``mapper.sh locate`` placed (not one of the map's own frames)
+                "located": props.get("located") is True,
             })
     return out
 
@@ -274,18 +291,20 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
     )
 
 
-def map_bundle(map_dir: Path) -> ViewBundle:
-    """Open a persisted map read-only (no inference server, nothing written)."""
+def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
+    """Open a persisted map read-only (no inference server, nothing written); ``reader``: the
+    ``mapping.store.MapReader`` of ``map_dir`` when already opened (view.sh's map rule)."""
     import json
 
     from oh_my_slam.mapping import store
     from oh_my_slam.mapping.export import map_objects, reader_source, scene_bytes
     from oh_my_slam.segmentation.catalog import catalog_rows
 
-    reader = store.MapReader(Path(map_dir))
+    if reader is None:
+        reader = store.MapReader(Path(map_dir))
     _, objs = map_objects(reader)
     source = reader_source(reader, objs)
-    return ViewBundle(
+    bundle = ViewBundle(
         mode="map",
         title=reader.root.name,
         scene=json.loads(scene_bytes(reader)),
@@ -294,3 +313,8 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         # keyframe images are copies (frames/fNNNNNN.jpg); name the input they came from
         camera_sources={r.name: Path(r.source).name for r in reader.frames if r.source},
     )
+    if len(source.xyz) > bundle.point_budget:
+        # a cloud above the display budget: find its selection while the browser starts, so that
+        # the page's first cloud request finds it ready (the request waits for it otherwise)
+        threading.Thread(target=bundle.prepare, name="display-selection", daemon=True).start()
+    return bundle

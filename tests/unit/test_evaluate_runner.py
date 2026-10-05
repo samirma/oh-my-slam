@@ -23,7 +23,7 @@ from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe, ViewOutcome, served_url
 from oh_my_slam.viewer.bundle import DisplayCloud
-from oh_my_slam.viewer.server import cloud_payload
+from oh_my_slam.viewer.routes import cloud_payload
 from tests.unit.test_evaluate_contracts import labelled_cloud, scene_bytes
 
 ENTRY_POINTS = ("start_inference_server.sh", "reconstruct.sh", "mapper.sh", "segment.sh",
@@ -251,7 +251,7 @@ def view_runner(tmp_path: Path, page_script: str = RENDERS, cloud: PointCloud | 
     (tmp_path / "scene.json").write_bytes(scene_bytes())
     cloud = labelled_cloud() if cloud is None else cloud
     (tmp_path / "cloud.bin").write_bytes(
-        cloud_payload(DisplayCloud(cloud, len(cloud), 1, 0.0), "color=segment"))
+        cloud_payload(DisplayCloud(cloud, len(cloud), 0.0, 0.0), "color=segment"))
     env = {**os.environ, "FAKE_SCENE": str(tmp_path / "scene.json"),
            "FAKE_CLOUD": str(tmp_path / "cloud.bin"),
            "FAKE_PAGE": f"<!doctype html><html><body><script>{page_script}</script></body></html>"}

@@ -24,53 +24,16 @@ import pytest
 
 from oh_my_slam.mapping.store import full_tree_hash
 from oh_my_slam.viewer.bundle import ViewBundle, image_bundle, map_bundle
+from tests.browser.conftest import View
 from tests.browser.scenes import running, synthetic_image, synthetic_map
 
 pytestmark = [pytest.mark.browser]
 
-CHANNELS = ("msedge", "chrome")
 LAYERS = ("points", "segments", "cameras", "labels", "obbs")
 IMAGE_KEYS = ["color", "stride", "min-depth", "max-depth", "edge", "voxel", "normals"]
 MAP_KEYS = ["color", "voxel", "normals"]
 # Chromium logs every non-2xx fetch as a console error; only the invalid-input test causes one
 BAD_REQUEST = "the server responded with a status of 400"
-
-
-@pytest.fixture(scope="module")
-def browser() -> Iterator[Any]:
-    sync_api = pytest.importorskip("playwright.sync_api")
-    with sync_api.sync_playwright() as p:
-        b = None
-        for ch in CHANNELS:
-            try:
-                b = p.chromium.launch(channel=ch, headless=True)
-                break
-            except Exception:
-                continue
-        if b is None:
-            pytest.skip("no Chromium-based browser (Edge/Chrome) available")
-        yield b
-        b.close()
-
-
-class View:
-    """A page showing one bundle, with the console errors it logged."""
-
-    def __init__(self, browser: Any, bundle: ViewBundle, url: str) -> None:
-        self.bundle, self.url, self.errors = bundle, url, []
-        self.pg = browser.new_page(viewport={"width": 1280, "height": 800})
-        self.pg.on("console", lambda m: self.errors.append(m.text) if m.type == "error" else None)
-        self.pg.on("pageerror", lambda e: self.errors.append(str(e)))
-        self.pg.goto(url)
-        self.pg.wait_for_selector('body[data-rendered="true"]', timeout=120000)
-
-    def js(self, expr: str) -> Any:
-        return self.pg.evaluate(expr)
-
-    def settle(self) -> None:
-        """Wait for any pending re-derivation and two drawn frames."""
-        self.pg.wait_for_function("() => !window.__viewer.busy", timeout=60000)
-        self.js("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
 
 
 @pytest.fixture(scope="module")
@@ -162,6 +125,8 @@ def test_rendered_signal_and_page_contents(view: View) -> None:
     assert v.js("() => window.__viewerGroups.points.children[0].geometry"
                 ".attributes.position.count") == v.js("() => window.__viewer.cloud.count") > 0
     assert v.pg.is_hidden("#loading") and v.pg.is_hidden("#cloud-error")
+    assert v.pg.is_hidden("#cloud-note")  # within the display budget: every point, no notice
+    assert v.js("() => window.__viewer.cloud.count") == v.js("() => window.__viewer.cloud.total")
     image = v.bundle.mode == "image"
     # spec §2.5: the catalogue and the segmented image are shown for an image only
     assert v.pg.locator("#catalogue tbody tr[data-id]").count() == (
@@ -693,8 +658,15 @@ def test_dense_labels_stay_legible(dense_view: View) -> None:
         hidden = sorted(b["id"] for b in in_view if not b["shown"])
         note = v.pg.inner_text("#labels-note") if hidden else ""
         assert bool(hidden) == v.pg.is_visible("#labels-note"), w
-        for oid in hidden:
-            assert f" {oid} " in f" {note.removeprefix('No room for:')} ".replace(",", " "), oid
+        listed = f" {note.removeprefix('No room for:')} ".replace(",", " ")
+        for oid in hidden[:20]:  # the first 20, then how many more
+            assert f" {oid} " in listed, oid
+        for oid in hidden[20:]:
+            assert f" {oid} " not in listed, oid
+        assert (f"…and {len(hidden) - 20} more" in note) == (len(hidden) > 20), note
+        # not a live region: re-placing labels on every orbit announces nothing
+        assert v.pg.get_attribute("#labels-note", "aria-live") == "off"
+        assert v.pg.get_attribute("#labels-note", "role") is None
     v.pg.set_viewport_size({"width": 1280, "height": 800})
     v.settle()
     assert v.errors == []
