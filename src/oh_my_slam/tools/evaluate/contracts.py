@@ -29,7 +29,7 @@ from oh_my_slam.segmentation.colors import (
 )
 from oh_my_slam.segmentation.render import DIM
 from oh_my_slam.tools.evaluate.scene import DocObject
-from oh_my_slam.viewer.server import parse_cloud_payload
+from oh_my_slam.viewer.routes import parse_cloud_payload
 
 MAX_LISTED = 5
 # Contract → the subjects (entry points, or the pair of outputs compared) it is reported for.

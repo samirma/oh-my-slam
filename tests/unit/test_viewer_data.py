@@ -22,7 +22,7 @@ from oh_my_slam.core.cloud_attrs import CloudScope, applicable, parse_cloud_attr
 from oh_my_slam.core.ply import parse_ply
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id
 from oh_my_slam.viewer.bundle import image_bundle, map_bundle
-from oh_my_slam.viewer.server import parse_cloud_payload
+from oh_my_slam.viewer.routes import parse_cloud_payload
 from tests.browser.scenes import running, synthetic_image, synthetic_map
 
 IMAGE_KEYS = ["color", "stride", "min-depth", "max-depth", "edge", "voxel", "normals"]
@@ -239,3 +239,18 @@ def test_map_cloud_is_the_segment_m_ply(map_view: Any) -> None:
     assert int((arrays["label"] > 0).sum()) > 0
     assert set(np.unique(arrays["label"]).tolist()) - {0} <= {
         int(k) for k in scene["openlabel"]["objects"]}
+
+
+@needs_colmap
+def test_map_bundle_uses_the_reader_it_is_given(map_view: Any,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """view.sh -m passes the reader its map rule opened, so map.json is read once."""
+    from oh_my_slam.mapping import store
+
+    _, root, _ = map_view
+    reader = store.MapReader(root)
+    opened: list[Path] = []
+    real = store.MapReader
+    monkeypatch.setattr(store, "MapReader", lambda p: opened.append(p) or real(p))
+    bundle = map_bundle(root, reader=reader)
+    assert opened == [] and bundle.title == root.name
