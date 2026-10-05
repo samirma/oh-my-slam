@@ -48,6 +48,6 @@ def test_single_image_map_then_extension(tmp_path: Path) -> None:
     d_true = np.linalg.norm(poses[1].t - poses[0].t)
     assert d_est == pytest.approx(d_true, rel=0.15)
     notes = json.loads((mdir / "map.json").read_text())["updates"][-1]["notes"]
-    assert notes["restarted"] == {"stored_keyframes": 1}
+    assert notes["restarted"] == {"stored_keyframes": 1, "weak": []}
     assert res2.new_frames == [f"f{k:06d}" for k in range(1, len(r2.frames))]
     assert res2.rejected == []
