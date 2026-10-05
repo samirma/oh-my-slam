@@ -30,12 +30,11 @@ def test_at_most_the_budget_with_the_smallest_edge(budget: int) -> None:
     pts = surface_cloud(60_000)
     grid, idx = g.budget_voxel_grid(pts, budget)
     assert grid.edge > 0 and len(idx) == grid.count == g._occupied(pts, grid.edge)
-    # the guarantee: never more than the budget, and within the count tolerance of it
-    assert budget * (1 - g.BUDGET_COUNT_TOL) <= len(idx) <= budget
-    assert len(idx) >= 0.97 * budget
-    # the bracket: a counted finer edge, when the search counted one, did not fit
-    if grid.finer is not None:
-        assert grid.finer < grid.edge and grid.finer_count == g._occupied(pts, grid.finer) > budget
+    # never more than the budget, and close to it (a coarse grid's count moves in larger steps)
+    assert (0.97 if budget >= 10_000 else 0.9) * budget <= len(idx) <= budget
+    # minimal: a finer edge less than 2 % below was counted and does not fit
+    assert grid.finer is not None and grid.edge / grid.finer <= 1 + g.BUDGET_EDGE_TOL
+    assert grid.finer_count == g._occupied(pts, grid.finer) > budget
     # the edge found once gives the same selection without a search (the per-source cache)
     again, edge = g.budget_voxel_indices(pts, budget, grid.edge)
     assert edge == grid.edge and np.array_equal(again, idx)
@@ -47,9 +46,11 @@ def test_the_budget_holds_for_any_layout() -> None:
     tiny = np.r_[rng.uniform(0, 1e-10, (200, 3)), [[100.0, 0.0, 0.0]]]
     grid, idx = g.budget_voxel_grid(tiny, 50)
     assert 0 < len(idx) <= 50 and grid.edge > 0
+    assert grid.finer is not None and grid.edge / grid.finer <= 1 + g.BUDGET_EDGE_TOL
     far = np.r_[rng.uniform(0, 1, (1000, 3)), [[1e12, 0.0, 0.0]]]
     grid, idx = g.budget_voxel_grid(far, 100)
     assert 0 < len(idx) <= 100 and 1000 in idx  # the outlier keeps its own voxel
+    assert grid.finer is not None and grid.edge / grid.finer <= 1 + g.BUDGET_EDGE_TOL
 
 
 def test_non_finite_points_are_never_selected() -> None:

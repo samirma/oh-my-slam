@@ -275,8 +275,11 @@ The viewer contains no geometry, segmentation or colour logic of its own:
   first point (in derivation order) of each occupied voxel, for the smallest voxel edge whose grid
   has at most 16,000,000 occupied voxels. The search (`core.geometry.budget_voxel_grid`) counts
   the occupied voxels of one edge per step. Its steps are secants of logit(count / points) against
-  log(edge), kept inside the counted bracket. It stops at the first counted edge that keeps
-  between 99.75 % and 100 % of the budget, and it never returns more than the budget. Points
+  log(edge), aimed just past the budget until both sides are counted, then regula falsi inside
+  the counted bracket. It stops when the bracket is within 2 %: the returned edge was counted with
+  at most 16,000,000 voxels, and an edge less than 2 % finer was counted with more. It never
+  returns more than the budget. The count is not strictly monotonic at that scale, so an edge
+  in between may still fit. Points
   with a non-finite coordinate are never selected. Points at no more distinct places than the
   budget keep one point per place.
   Points are selected, never averaged, so each keeps its own position, colour, normal and object
@@ -287,13 +290,13 @@ The viewer contains no geometry, segmentation or colour logic of its own:
   position attributes, and the latest selection's indices, so a colour or normals change reuses
   them. PLY outputs and the map are never thinned.
 * **Cost of the budget.** Measured on the 16.15-million-point `street2` map on the M4 Max:
-  * The edge search plus the selection takes 2.0 s (4 counts). The selection keeps 15,980,584
-    points, one per 0.76 mm voxel.
+  * The edge search plus the selection takes 2.8 s (6 counts). The selection keeps 15,999,725
+    points, one per 0.670 mm voxel; 0.658 mm was counted and does not fit.
   * A later request with the same position attributes costs 0.2 to 0.7 s (colours included). A
     known edge without its indices costs 0.8 s.
-  * `view.sh -m` starts this work in a background thread when it opens a map above the budget,
-    so the page's first `/api/cloud` arrives 2.4 s after the map was opened, not 2.4 s after the
-    request.
+  * `view.sh -m` starts this work in a background thread when it opens a map above the budget.
+    The page's first `/api/cloud` therefore completes 3.2 s after the map was opened, not 3.2 s
+    after the request.
   * In headless Edge (ANGLE Metal) the view orbits at 55 frames per second.
 * `encoding` and `label` concern PLY files only and have no control.
 

@@ -54,11 +54,14 @@ export function buildAttributeControls(container, controls, values, onChange) {
 }
 
 // The display-budget notice (spec §2.5): "Showing X of Y points" with the voxel edge whenever the
-// cloud on screen omits points; '' when it shows them all.
+// cloud on screen omits points; '' when it shows them all. With no grid (edge 0) the omitted points
+// are duplicates (one per distinct position is shown) or have non-finite coordinates.
 export function budgetNote(header) {
   if (!(header.count < header.total)) return '';
+  const shown = `Showing ${header.count.toLocaleString('en-US')} of ${header.total.toLocaleString('en-US')} points`;
+  const complete = '(display budget; PLY outputs and the map stay complete).';
   const e = header.voxel;
+  if (!(e > 0)) return `${shown}: one per distinct position, non-finite points omitted ${complete}`;
   const edge = e >= 1 ? `${e.toFixed(2)} m` : e >= 0.01 ? `${(e * 100).toFixed(1)} cm` : `${(e * 1000).toFixed(2)} mm`;
-  return `Showing ${header.count.toLocaleString('en-US')} of ${header.total.toLocaleString('en-US')} points: `
-    + `one per voxel of ${edge} edge (display budget; PLY outputs and the map stay complete).`;
+  return `${shown}: one per voxel of ${edge} edge ${complete}`;
 }

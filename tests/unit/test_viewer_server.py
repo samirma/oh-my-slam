@@ -159,6 +159,33 @@ def test_display_budget() -> None:
     assert {r.tobytes() for r in arrays["position"]} <= {r.tobytes() for r in full.xyz}
 
 
+def test_prepare_finds_the_selection_ahead(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``prepare`` (run on a thread when view.sh opens a map above the budget) derives the default
+    cloud; the page's first request then reuses its selection without another search."""
+    import oh_my_slam.core.geometry as geometry
+    import oh_my_slam.viewer.bundle as vb
+
+    rng = np.random.default_rng(2)
+    source = map_cloud_source(rng.normal(size=(2_000, 3)), rng.integers(0, 255, (2_000, 3), np.uint8),
+                              None, set(), np.zeros((1, 3)))
+    b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[], point_budget=300)
+    searches: list[int] = []
+    search = geometry.budget_voxel_grid
+    monkeypatch.setattr(geometry, "budget_voxel_grid",
+                        lambda *a, **k: searches.append(1) or search(*a, **k))
+    import threading
+
+    t = threading.Thread(target=b.prepare)
+    t.start()
+    t.join()
+    assert len(searches) == 1 and source.selections.latest is not None
+    latest = source.selections.latest
+    dc = b.cloud(CloudAttrs.defaults(b.scope))
+    assert len(searches) == 1 and source.selections.latest is latest  # reused, not searched again
+    assert 0 < len(dc.cloud) <= 300 and dc.voxel == next(iter(source.selections.edges.values()))
+    assert vb.DISPLAY_POINT_BUDGET > 300
+
+
 def test_routes_are_framework_neutral_and_relative() -> None:
     """``ViewerRoutes.handle`` answers without any server (what another server mounts under its
     own prefix), and the page refers to nothing by an absolute path."""

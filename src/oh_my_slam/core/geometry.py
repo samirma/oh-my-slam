@@ -279,10 +279,12 @@ def _packed(keys: NDArray[np.int64]) -> NDArray[np.int64]:
 
 # --- voxel-grid selection within a point budget --------------------------------------------------
 
-# A grid is accepted once its occupied voxels are within this fraction below the budget: the count
-# is what the budget is about, and an edge tolerance would cost several more counts for a few
-# hundred points more (at that scale the grid's alignment alone moves the count non-monotonically).
-BUDGET_COUNT_TOL = 0.0025
+# The edge returned is the smallest that fits to within this factor: the search ends with a counted
+# edge that does not fit less than 2 % below it (finer is meaningless: at that scale the grid's
+# alignment alone moves the count non-monotonically).
+BUDGET_EDGE_TOL = 0.02
+# While unbracketed, the secant aims this fraction past the budget, so that it lands on the far side.
+_BUDGET_AIM = 0.0025
 _BUDGET_CHUNK = 1 << 20  # points whose voxel codes are computed at a time (small temporaries)
 _BUDGET_MAX_STEPS = 64
 _MIN_EDGE_BITS = 60  # no grid finer than extent / 2**60: at that scale only distinct places count
@@ -380,21 +382,24 @@ def _finite(points: NDArray[Any]) -> tuple[NDArray[Any], NDArray[np.int64] | Non
 
 
 def budget_voxel_grid(points: NDArray[Any], max_points: int,
-                      count_tol: float = BUDGET_COUNT_TOL) -> tuple[BudgetGrid, NDArray[np.int64]]:
+                      edge_tol: float = BUDGET_EDGE_TOL) -> tuple[BudgetGrid, NDArray[np.int64]]:
     """(grid, indices): the selection that draws at most ``max_points`` of ``points`` — one
     original point per occupied voxel (the first in the points' order), ascending — for the
-    smallest voxel edge, to within ``count_tol``, whose grid has at most ``max_points`` occupied
-    voxels. Points with a non-finite coordinate are never selected (they cannot be drawn).
+    smallest voxel edge whose grid has at most ``max_points`` occupied voxels. Points with a
+    non-finite coordinate are never selected (they cannot be drawn).
 
     * Every finite point when there are at most ``max_points`` of them (edge 0).
     * Otherwise the grid is searched: each step counts the occupied voxels of one edge (an
       argsort of the points' voxel codes, reused for the selection itself). Steps are secants of
       logit(count / points) against log(edge) — nearly straight both far from and close to every
-      point having its own voxel — kept inside the counted bracket (Illinois, bisection when it
-      stalls). The search stops at a counted edge with ``max_points * (1 - count_tol) <= count
-      <= max_points``; the result never exceeds ``max_points``.
+      point having its own voxel — aimed just past the budget until both sides are counted, then
+      regula falsi (Illinois) inside the counted bracket.
+    * The search ends when the bracket is tight: the returned edge was counted with at most
+      ``max_points`` voxels, and ``grid.finer``, less than ``edge_tol`` (2 %) below it, was counted
+      with more (the count is not strictly monotonic at that scale, so an edge in between may
+      still fit). The result never exceeds ``max_points``.
     * When the points are at no more than ``max_points`` distinct places (duplicates), no grid
-      thins them further: one point per place, edge 0."""
+      thins them further: one point per place, edge 0 (``finer`` None)."""
     if max_points < 1:
         raise ValueError("max_points must be at least 1")
     pts, rows = _finite(np.asarray(points).reshape(-1, 3))
@@ -421,8 +426,7 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
             last[:] = [x, codes, runs]
         return counted[x]
 
-    lo_ok = max_points * (1.0 - count_tol)
-    target = max_points * (1.0 - count_tol / 2)
+    tight = math.log1p(edge_tol)
 
     def y(c: float) -> float:  # logit of the kept fraction: straight-ish in log(edge)
         return math.log(c) - math.log(n + 0.5 - c)
@@ -455,8 +459,6 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
     tried_places = False
     for _ in range(_BUDGET_MAX_STEPS):
         c = count(x)
-        if lo_ok <= c <= max_points:
-            return result(x, c)
         fits = [k for k, v in counted.items() if v <= max_points]
         fails = [k for k, v in counted.items() if v > max_points]
         hi = min(fits) if fits else None  # finest edge that fits
@@ -473,9 +475,10 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
                 if x <= floor:
                     return result(*fitting())
         if hi is not None and lo is not None:
-            if hi - lo < 1e-12:
+            width = hi - lo
+            if width <= tight:
                 return result(*fitting())
-            f_hi, f_lo = y(counted[hi]) - y(target), y(counted[lo]) - y(target)
+            f_hi, f_lo = y(counted[hi]) - y(max_points), y(counted[lo]) - y(max_points)
             moved = 1 if c <= max_points else -1
             if moved == side:  # the same end moved twice: halve the other end's weight
                 if moved == 1:
@@ -483,9 +486,13 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
                 else:
                     f_hi /= 2
             side = moved
-            nx = lo + (hi - lo) * f_lo / (f_lo - f_hi) if f_lo != f_hi else (lo + hi) / 2
-            width = hi - lo
+            nx = lo + width * f_lo / (f_lo - f_hi) if f_lo != f_hi else (lo + hi) / 2
             nx = min(max(nx, lo + 0.01 * width), hi - 0.01 * width)
+            # close to an end: step just inside the tolerance from it, so that one count closes it
+            if hi - nx < 0.9 * tight:
+                nx = hi - 0.9 * tight
+            elif nx - lo < 0.9 * tight:
+                nx = lo + 0.9 * tight
         else:
             # one side only: a secant through the last two counts (slope -2 to begin with)
             ks = sorted(counted)
@@ -494,7 +501,11 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
                 a, b = sorted(ks, key=lambda k: abs(k - x))[:2]  # the two counts nearest
                 if counted[a] != counted[b] and a != b:
                     slope = min((y(counted[a]) - y(counted[b])) / (a - b), -0.25)
-            nx = x + (y(target) - y(c)) / slope
+            aim = (min(max_points * (1 + _BUDGET_AIM), (max_points + n) / 2) if c <= max_points
+                   else max_points * (1 - _BUDGET_AIM))
+            nx = x + (y(aim) - y(c)) / slope
+            if c <= max_points:  # at least a tolerance finer, to find a finer edge that fails
+                nx = min(nx, x - 0.9 * tight)
             step = math.log(64.0)
             nx = min(max(nx, x - step), x + step)  # at most 64 x per step while unbracketed
             nx = max(nx, floor)

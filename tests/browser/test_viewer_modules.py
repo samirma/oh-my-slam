@@ -136,6 +136,15 @@ def test_display_budget_notice(mounted: View) -> None:
     assert v.errors == []
 
 
+def test_budget_note_without_a_grid(mounted: View) -> None:
+    """Points omitted with no grid (edge 0: duplicates or non-finite points) are not described
+    as a "0.00 mm" voxel; a complete cloud has no notice."""
+    v = mounted
+    note = module(v, "controls.js", "return m.budgetNote({count: 5, total: 7, voxel: 0});")
+    assert note.startswith("Showing 5 of 7 points: one per distinct position") and "mm" not in note
+    assert module(v, "controls.js", "return m.budgetNote({count: 7, total: 7, voxel: 0});") == ""
+
+
 def ply_fixture(encoding: str) -> tuple[bytes, PointCloud]:
     rng = np.random.default_rng(1)
     n = 40
