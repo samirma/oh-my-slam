@@ -1328,7 +1328,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
              if mv.src.id not in dropped and mv.dst.id not in dropped]
 
     def later(o: MapObject) -> list[Verdict]:
-        return places.verdicts(o, [f for f in new_idx if f > max(o.frames)])
+        return places.verdicts(o, [f for f in new_idx if f > max(o.frames)], occluded=True)
 
     src_ids = {mv.src.id for mv in moves}
     # only the map's objects: a candidate (unconfirmed) that later keyframes see through is one
@@ -2735,6 +2735,10 @@ class Verdict:
     supported: bool
     ratio: float = 1.0
     held: float | None = None  # ``share`` with the object's foot counted as seen in place
+    # the object's samples (``_Places.samples``) the keyframe sees unoccluded, and whether they are
+    # fewer than ``VISIBLE_SHARE`` of those in its image (``_Places.verdicts``: partly occluded)
+    seen: frozenset[int] = frozenset()
+    partial: bool = False
 
     @property
     def in_place(self) -> bool:
@@ -3008,12 +3012,15 @@ class _Places:
             self._fused[o.id] = ok
         return self._fused[o.id]
 
-    def verdict(self, o: MapObject, j: int, detectable: bool = False) -> Verdict | None:
+    def verdict(self, o: MapObject, j: int, detectable: bool = False, occluded: bool = False
+                ) -> Verdict | None:
         """Keyframe ``j``'s verdict on the object's place (see the class docstring); with
         ``detectable``, only from where it could have detected the object too (``PLACE_RANGE``:
         its silence there is evidence). Only a keyframe that fuses the place (most of the
         object's samples within its fused depth, ``cuts``) judges an object a keyframe that
-        detected it fused (``fused``): what lies beyond the fused depth, the map does not draw."""
+        detected it fused (``fused``): what lies beyond the fused depth, the map does not draw.
+        With ``occluded``, a keyframe that sees less than ``VISIBLE_SHARE`` of the place
+        unoccluded judges too, its verdict marked ``partial`` (``verdicts``)."""
         rec = self.views.records.get(j)
         pts, size = self.samples(o)
         if rec is None or rec.low_confidence or not len(pts) or j in o.frames \
@@ -3044,7 +3051,8 @@ class _Places:
         t = absence_tau(zz, size)
         visible = ok & (dn - zz >= -t)  # seen through or on: not hidden behind something nearer
         pixels = len(np.unique(v[visible] * w + u[visible]))
-        if visible.sum() < VISIBLE_SHARE * int(framed.sum()) or pixels < PLACE_MIN_PIXELS:
+        partial = bool(visible.sum() < VISIBLE_SHARE * int(framed.sum()))
+        if (partial and not occluded) or pixels < PLACE_MIN_PIXELS:
             return None
         through, judged, held = _evidence(view, ok, zz, dn, u, v, size, self.foot(o))
         supported = (rec.stats.get("observations", FEW_MIN_INLIERS) >= FEW_MIN_INLIERS
@@ -3057,15 +3065,27 @@ class _Places:
             seen = float(through.sum() / n.sum()) if n.any() else 0.0
             s0 = max(s0, around)
             shares.append(max(0.0, (seen - s0) / (1.0 - s0)) if s0 < 1.0 else 0.0)
-        return Verdict(j, shares[0], supported, ratio, held=shares[1])
+        seen_idx = frozenset(np.flatnonzero(framed)[visible].tolist())
+        return Verdict(j, shares[0], supported, ratio, held=shares[1], seen=seen_idx,
+                       partial=partial)
 
-    def verdicts(self, o: MapObject, frames: list[int], detectable: bool = False
-                 ) -> list[Verdict]:
+    def verdicts(self, o: MapObject, frames: list[int], detectable: bool = False,
+                 occluded: bool = False) -> list[Verdict]:
+        """The verdicts of the keyframes ``frames`` (``verdict``). With ``occluded``, keyframes
+        that see less than ``VISIBLE_SHARE`` of the object's place unoccluded (a vase in front of
+        a cup) judge too, by what they see, when together with the others they see that share of
+        its samples: a place half hidden from the latest keyframe is judged by it and the
+        keyframes before it, as one judges it whole."""
         out = []
         for f in frames:
-            v = self.verdict(o, f, detectable)
+            v = self.verdict(o, f, detectable, occluded=occluded)
             if v is not None:
                 out.append(v)
+        if any(v.partial for v in out):
+            n = len(self.samples(o)[0])
+            covered = frozenset().union(*(v.seen for v in out))
+            if len(covered) < VISIBLE_SHARE * n:
+                out = [v for v in out if not v.partial]
         return out
 
     def through_pixels(self, o: MapObject, v: Verdict) -> NDArray[np.bool_]:

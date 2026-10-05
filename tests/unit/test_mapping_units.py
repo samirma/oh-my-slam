@@ -904,7 +904,7 @@ def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
 
     seen: list[list[str]] = []
     monkeypatch.setattr(sfm_mod, "_run", lambda args, log: seen.append(args))
-    monkeypatch.setattr(sfm_mod.Sfm, "_camera_of", lambda self, name: 1)
+    monkeypatch.setattr(sfm_mod.Sfm, "_register", lambda self, names, prior: 1)
     s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
     s.extract(["a.jpg"], sfm_mod.CameraPrior(4000, 3000, focal=3000.0))
     s.extract(["b.jpg"], sfm_mod.CameraPrior(1920, 1080), video=True)
@@ -913,6 +913,36 @@ def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
     assert first == ["-1", "0", "-1"]
     assert all(a.count("--SiftExtraction.first_octave") == 1 for a in seen)
     assert all("--FeatureExtraction.max_image_size" not in a for a in seen)  # COLMAP's 3200
+
+
+def test_images_are_registered_in_keyframe_order_before_extraction(tmp_path: Path) -> None:
+    """COLMAP's threaded extraction gives the images it registers ids in the order it finishes
+    them (the global mapper's result follows the ids): the mapper registers them first, in the
+    keyframes' order, with the camera COLMAP's single_camera would create, and a later batch of
+    the same size and focal shares it."""
+    import pycolmap
+
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
+    names = [f"f{k:06d}.jpg" for k in (0, 1, 2, 10)]
+    cam = s._register(names, sfm_mod.CameraPrior(4000, 3000))
+    db = pycolmap.Database.open(str(tmp_path / "db.db"))
+    try:
+        assert [(im.image_id, im.name) for im in sorted(db.read_all_images(),
+                                                         key=lambda im: im.image_id)] \
+            == list(enumerate(names, start=1))
+        c = db.read_camera(cam)
+        assert list(c.params) == [4800.0, 2000.0, 1500.0] and not c.has_prior_focal_length
+    finally:
+        db.close()
+    assert s._register(names[:2] + ["f000011.jpg"], sfm_mod.CameraPrior(4000, 3000,
+                                                                       existing_id=cam)) == cam
+    db = pycolmap.Database.open(str(tmp_path / "db.db"))
+    try:
+        assert db.num_images() == 5
+    finally:
+        db.close()
 
 
 def test_weak_links_of_a_walk_are_the_cuts_few_sequential_pairs_span() -> None:
