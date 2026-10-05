@@ -264,6 +264,7 @@ class MapTransaction:
         self.staging = self.root / STAGING
         self.created = False
         self._deleted: set[str] = set()
+        self._fresh = False  # ``start_over``: nothing committed is read or kept but map.json
 
     # -- lifecycle -------------------------------------------------------------------------------
 
@@ -313,9 +314,20 @@ class MapTransaction:
         return p
 
     def current(self, rel: str) -> Path:
-        """Latest version of a file: staged if written in this update, else committed."""
+        """Latest version of a file: staged if written in this update, else committed (after
+        ``start_over``: staged only)."""
         staged = self.staging / rel
-        return staged if staged.exists() else self.root / rel
+        return staged if staged.exists() or self._fresh else self.root / rel
+
+    def start_over(self) -> None:
+        """Rebuild the map in this update: every committed file but ``map.json`` is deleted at
+        commit unless staged again, and none is read (``current``, ``clone_for_edit``) — what the
+        update needs of the old map (its keyframe images) it stages first."""
+        self._fresh = True
+        for p in self.root.rglob("*"):
+            rel = p.relative_to(self.root)
+            if p.is_file() and rel.parts[0] not in (STAGING, LOCK) and str(rel) != MAP_JSON:
+                self._deleted.add(str(rel))
 
     def write_json(self, rel: str, obj: Any) -> None:
         atomic_write_json(self.stage(rel), obj)
@@ -330,7 +342,7 @@ class MapTransaction:
         """Staged copy of a committed file (APFS clone when possible) to be modified in place."""
         dst = self.stage(rel)
         src = self.root / rel
-        if dst.exists() or not src.exists():
+        if dst.exists() or not src.exists() or self._fresh:
             return dst
         clone_file(src, dst)
         return dst

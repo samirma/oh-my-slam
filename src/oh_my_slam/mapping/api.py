@@ -14,6 +14,7 @@ and the cloud's colours and labels do not depend on their order (``validity``, `
 
 from __future__ import annotations
 
+import itertools
 import json
 import shutil
 import tempfile
@@ -40,6 +41,7 @@ from oh_my_slam.mapping import frame as mframe
 from oh_my_slam.mapping import ingest, retrieval, store, validity
 from oh_my_slam.mapping.sfm import (
     MAX_EPIPOLAR_DEG,
+    MIN_INLIERS,
     MIN_PLACED_FRACTION,
     ROTATION_BASELINE_RATIO,
     ROTATION_PAIR_FRACTION,
@@ -72,6 +74,9 @@ PHOTO_EXHAUSTIVE_MAX = 200
 MV_CHUNK = 24  # gate G6
 MV_ANCHORS = 4
 REJECT_SCALE = (0.5, 2.0)
+# a map of photos that some keyframe holds without SfM support (``_weak_keyframe``) is rebuilt
+# with the new photos, as one update of them all, up to this many stored keyframes
+RESTART_MAX_KEYFRAMES = 60
 
 
 @dataclass
@@ -1722,8 +1727,12 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 old = store.read_frames(tx)
             update_id = int(meta.get("update_count", 0)) + 1
             progress(("creating map " if tx.created else "extending map ") + str(tx.root))
-            kfs = ingest.keyframes(spec, fps, tx.stage("frames"),
-                                   int(meta.get("next_frame_index", 0)))
+            kfs: Iterable[ingest.Keyframe] = ingest.keyframes(
+                spec, fps, tx.stage("frames"), int(meta.get("next_frame_index", 0)))
+            restarted = _restart_weak_map(tx, meta, old, spec, progress)
+            if restarted:
+                kfs = itertools.chain(restarted, kfs)
+                stored, old = len(old), []
             early: list[_EarlyFeatures] = []
 
             def ingested(written: list[ingest.Keyframe]) -> None:
@@ -1737,6 +1746,8 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
             ctx = UpdateContext(tx, meta, old, new, update_id, work,
                                 features=early[0] if early else None)
+            if restarted:
+                ctx.notes["restarted"] = {"stored_keyframes": stored}
             if not old and len(new) == 1:
                 _single_image_map(ctx)
                 model = None
@@ -1803,6 +1814,53 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             return UpdateResult(payload, new_names, ctx.rejected, elapsed, tm.to_dict())
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _weak_keyframe(rec: store.FrameRecord) -> bool:
+    """A stored keyframe that SfM did not pose: posed by the multi-view fallback or its feature-
+    match refinement (no SfM scale, a pan from one spot, matches mostly on scenery behind glass:
+    ``stats`` has ``pose_matches``), or holding fewer SfM points than a verified pair has inliers
+    (``MIN_INLIERS``; the multi-view gauge keyframe holds one)."""
+    return "pose_matches" in rec.stats or float(rec.stats.get("observations", 0)) < MIN_INLIERS
+
+
+def _restart_weak_map(tx: store.MapTransaction, meta: dict[str, Any],
+                      old: list[store.FrameRecord], spec: ingest.InputSpec, progress: Progress
+                      ) -> list[ingest.Keyframe]:
+    """When the map's keyframes are photos, at most ``RESTART_MAX_KEYFRAMES``, and some of them
+    are weakly posed (``_weak_keyframe``): the stored keyframes, staged again, for this update to
+    map with the new photos from scratch (``MapTransaction.start_over``), as one update of them
+    all in the order they were added. Otherwise nothing (the new keyframes extend the map).
+
+    An update extends a map with the stored keyframes held fixed: the poses of a weak first update
+    (the four window photos of ``office_sequence``, posed by multi-view on the trees behind the
+    glass) would be frozen for good, and the sequence mapped in several updates would differ from
+    the sequence mapped in one (spec §2.3: the result is the same). Rebuilt, it is the same: the
+    keyframes keep their names and order, the objects their ids (an id is the number of the
+    object's first detection, counted over the keyframes in order), and the latest keyframes win
+    as within one update. The stored keyframes' inference runs again, from their images."""
+    updates = meta.get("updates", [])
+    if (not old or spec.kind != "images" or len(old) > RESTART_MAX_KEYFRAMES
+            or any(u.get("kind") != "images" for u in updates)
+            or not any(_weak_keyframe(r) for r in old)):
+        return []
+    from oh_my_slam.core.images import exif_intrinsics
+
+    kfs = []
+    for rec in sorted(old, key=lambda r: r.index):
+        src = tx.root / rec.image
+        dst = tx.stage(rec.image)
+        shutil.copyfile(src, dst)
+        original = Path(rec.source)
+        exif = exif_intrinsics(original if original.is_file() else dst)
+        kfs.append(ingest.Keyframe(rec.name, rec.index, dst, rec.source, exif))
+    tx.start_over()
+    for key in ("floor_z", "scale", "map_frame"):
+        meta.pop(key, None)
+    meta["next_object_id"] = 1
+    progress(f"rebuilding the map: {sum(_weak_keyframe(r) for r in old)} of its {len(old)} "
+             "keyframes were not posed by SfM; mapping them again with the new input")
+    return kfs
 
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
