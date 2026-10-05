@@ -599,9 +599,12 @@ class ServiceEvaluation:
                                "params": case.params}
         first, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell")
         self._set_map_aside(case, f"parity_{n:02d}_shell")
-        # the control: the same command again, with the same (replayed) inference
-        second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
-        self._set_map_aside(case, f"parity_{n:02d}_shell_again")
+        # the control: the same command again, with the same (replayed) inference; a browser
+        # mode's viewer data must simply be identical (no control)
+        second: Outcome | None = None
+        if not case.browser:
+            second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
+            self._set_map_aside(case, f"parity_{n:02d}_shell_again")
         job = self.job_outcome(case)
         if not first.ok or not job.ok:
             row.update(status="mismatch", why=first.error if not first.ok else
@@ -610,12 +613,12 @@ class ServiceEvaluation:
         diffs = differences(first, job)
         if not diffs:
             row["status"] = "identical"
-        elif second.ok and differences(first, second):
+        elif second is not None and second.ok and differences(first, second):
             row.update(status="unverifiable", why="the command's own two runs differ: "
                        + "; ".join(differences(first, second)[:3]), job=diffs[:5])
         else:
             row.update(status="mismatch", why="; ".join(diffs[:5]))
-        if second.ok and job.wall_s is not None \
+        if second is not None and second.ok and job.wall_s is not None \
                 and second.wall_s is not None and case.op not in self.overheads:
             self.overheads[case.op] = {"job_s": round(job.wall_s, 3),
                                        "shell_s": round(second.wall_s, 3),

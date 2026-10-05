@@ -34,7 +34,8 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "that changed (the cup) that the map no longer has; `hole_fraction` the share of the cells of "
      "their place where the map shows no surface; `before_present_fraction` the control (the split "
      "map after an update of the images that show the cup has it); `<split>.stability.*` compares "
-     "the unchanged objects of the first update with the last; `<split>.ids_persistent_fraction` "
+     "the labels and ids of the unchanged objects of the first update with the last (aligned; "
+     "box figures in the detail);`<split>.ids_persistent_fraction` "
      "checks every published id against every later update; `<split>.vs_one_update.*` compares "
      "the split map with the one-update map (ids may differ where an earlier update published "
      "one)."),

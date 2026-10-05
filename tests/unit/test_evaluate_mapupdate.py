@@ -21,6 +21,7 @@ from oh_my_slam.tools.evaluate.mapupdate import (
     SplitMaps,
     hole_cells,
     map_update_metrics,
+    merges,
     metric_ids,
     parts_of,
     region_coverage,
@@ -210,7 +211,7 @@ def surface(hole: bool = False, behind: bool = False) -> np.ndarray:
 
 
 def with_cloud(v: MapView, cloud: np.ndarray | None) -> MapView:
-    return MapView(v.objects, v.poses, v.sources, v.camera, cloud)
+    return MapView(v.objects, v.poses, v.sources, v.camera, cloud, v.merged_into)
 
 
 def judged(tmp_path: Path, final: MapView, before: MapView, last: MapView | None = None,
@@ -238,10 +239,14 @@ def test_a_map_without_the_cup_that_kept_the_rest_passes(tmp_path: Path) -> None
     assert v["map_update.hole_fraction"] == v[f"{S}.hole_fraction"] == 0.0
     assert v["map_update.before_present_fraction"] == 1.0
     assert v[f"{S}.ids_persistent_fraction"] == 1.0
-    for part in ("stability", "vs_one_update"):
-        assert v[f"{S}.{part}.matched_fraction"] == 1.0, part
-        assert v[f"{S}.{part}.id_agreement"] == 1.0, part
-        assert v[f"{S}.{part}.obb_iou_median"] == pytest.approx(1.0), part
+    assert v[f"{S}.stability.id_agreement"] == v[f"{S}.stability.label_agreement"] == 1.0
+    assert v[f"{S}.vs_one_update.matched_fraction"] == 1.0
+    assert v[f"{S}.vs_one_update.id_agreement"] == 1.0
+    assert v[f"{S}.vs_one_update.obb_iou_median"] == pytest.approx(1.0)
+    # first vs last update: labels and ids only; the box figures are detail
+    boxes = m.items[f"{S}.stability.id_agreement"].detail["boxes_after_alignment"]
+    assert boxes["obb_iou_median"] == pytest.approx(1.0)
+    assert f"{S}.stability.obb_iou_median" not in m.items
     assert all(x.passed for x in m.items.values()), [k for k, x in m.items.items() if not x.passed]
     # the backpack (only seen late) and the cup are not compared: two objects in the stability rows
     rows = details["splits"]["split_3_3"]["stability"]
@@ -302,7 +307,7 @@ def test_an_empty_map_does_not_count_as_a_map_without_the_cup(tmp_path: Path) ->
     assert m.items["map_update.absent_fraction"].passed is True
     absent = m.items[f"{S}.absent_fraction"]
     assert absent.value is None and absent.passed is False and "no objects at all" in absent.error
-    assert m.items[f"{S}.stability.matched_fraction"].passed is False  # nothing kept
+    assert m.items[f"{S}.stability.id_agreement"].passed is False  # nothing kept
     m, _ = judged(tmp_path, empty, early_map())
     assert m.items["map_update.absent_fraction"].passed is False
 
@@ -326,7 +331,8 @@ def test_unchanged_objects_that_lost_their_id_label_or_box_are_flagged(tmp_path:
     v = {k.removeprefix(f"{S}.stability."): x for k, x in m.items.items()
          if k.startswith(f"{S}.stability.")}
     assert v["id_agreement"].value < 1.0 and v["id_agreement"].passed is False
-    assert v["centre_delta_median_m"].value > 0.1 and v["centre_delta_median_m"].passed is False
+    assert set(v) == {"id_agreement", "label_agreement"}  # a moved box is not judged here
+    assert v["id_agreement"].detail["boxes_after_alignment"]["centre_delta_median_m"] > 0.1
     rows = details["splits"]["split_3_3"]["stability"]
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(9, 1), (2, 2)}
     # the monitor's published id 1 is gone after the last update
@@ -368,15 +374,54 @@ def test_stable_labels_restrict_the_comparison(tmp_path: Path) -> None:
     m, details = judged(tmp_path, final_map(False), early_map(), stable=["monitor"])
     rows = details["splits"]["split_3_3"]["stability"]
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1)}
-    assert m.items[f"{S}.stability.matched_fraction"].value == 1.0
+    assert m.items[f"{S}.stability.id_agreement"].value == 1.0
 
 
-def test_the_updates_of_one_map_are_compared_in_their_common_frame(tmp_path: Path) -> None:
-    other = view([obj(1, "monitor", MONITOR), obj(2, "keyboard", KEYBOARD)],
-                 [f"other{k}.jpg" for k in range(3)])  # registers other images, same frame
-    m, _ = judged(tmp_path, final_map(False), other)
-    assert m.items["map_update.absent_fraction"].value == 1.0
-    assert m.items[f"{S}.stability.id_agreement"].value == 1.0  # one map frame: no alignment
+def regauged(v: MapView, yaw_deg: float = 6.3, t: tuple[float, float, float] = (0.09, 0, 0)
+             ) -> MapView:
+    """The whole map (cameras and objects) in another gauge, as a rebuild may leave it."""
+    a = np.radians(yaw_deg)
+    R = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1.0]])
+    T = Pose(R, np.asarray(t, float))
+    objs = [DocObject(o.id, o.label, o.score, None, None,
+                      tuple(ol.cuboid_val(T.apply(np.array([o.cuboid[:3]]))[0],
+                                          R @ np.asarray(OBB(np.zeros(3), np.eye(3),
+                                                             np.ones(3)).R),
+                                          np.array(o.cuboid[7:]))), o.frames, o.labels)
+            for o in v.objects]
+    return MapView(objs, {n: T.compose(p) for n, p in v.poses.items()}, v.sources, v.camera,
+                   v.cloud, v.merged_into)
+
+
+def test_a_rebuild_that_regauges_the_frame_keeps_ids_and_labels(tmp_path: Path) -> None:
+    """A later update may re-gauge the map frame (6.3 deg and 9 cm here): the updates are
+    aligned by their common captures before boxes are paired."""
+    m, _ = judged(tmp_path, final_map(False), early_map(), last=regauged(final_map(False)))
+    assert m.items[f"{S}.stability.id_agreement"].value == 1.0
+    assert m.items[f"{S}.ids_persistent_fraction"].value == 1.0
+    assert m.items[f"{S}.vs_one_update.obb_iou_median"].value == pytest.approx(1.0, abs=0.05)
+
+
+def test_a_lasting_merge_resolves_a_published_id(tmp_path: Path) -> None:
+    """An id the later map merged into another (objects.json merged_into) resolves to it; an id
+    that is simply gone stays broken."""
+    early = view([obj(1, "monitor", MONITOR, (0.6, 0.2, 0.4)), obj(2, "keyboard", KEYBOARD),
+                  obj(5, "monitor", MONITOR, (0.6, 0.2, 0.4))], IMAGES[:3])
+    last = final_map(False)
+    merged = MapView(last.objects, last.poses, last.sources, CAMERA, None, {5: 1})
+    m, _ = judged(tmp_path, final_map(False), early, last=merged)
+    assert m.items[f"{S}.ids_persistent_fraction"].value == 1.0
+    m, _ = judged(tmp_path, final_map(False), early, last=last)
+    persist = m.items[f"{S}.ids_persistent_fraction"]
+    assert persist.value == pytest.approx(2 / 3)
+    assert [b["id"] for b in persist.detail["broken"]] == [5]
+
+
+def test_merges_are_read_from_the_map(tmp_path: Path) -> None:
+    (tmp_path / "objects.json").write_text(json.dumps({"merged_into": {"5": 1, "7": 5}}))
+    v = MapView([], {}, {}, None, None, merges(tmp_path))
+    assert v.merged_into == {5: 1, 7: 5} and v.resolve(7) == 1 and v.resolve(3) == 3
+    assert merges(tmp_path / "missing") == {}
 
 
 def test_splits_come_from_the_annotation(tmp_path: Path) -> None:

@@ -118,12 +118,13 @@ each update's `-t full` scene. Files about the same sequence are merged. Metrics
 * `map_update.before_present_fraction` is the same test as `absent_fraction` on the split map whose
   first update is exactly the early part, after that update. It is the control: an object that was
   never detected early cannot be seen to disappear.
-* `map_update.<split>.stability.*` are the metrics of `map.stability.*` for the objects that never
-  changed: the objects the first update's images observe, after the last update against after the
-  first (ids, labels, OBBs; one map frame, no alignment).
+* `map_update.<split>.stability.label_agreement` and `.id_agreement`: the objects the first
+  update's images observe and that never changed keep their labels and ids from the first update
+  to the last. The two updates are aligned by their common captures' poses first (a rebuild may
+  re-gauge the frame); OBBs may be refined, so the box figures are detail only.
 * `map_update.<split>.ids_persistent_fraction`: every id an update published for an unchanged object
-  is, in every later update, still an object with a compatible label whose box overlaps or nearly
-  coincides with it.
+  is, in every later update (aligned, and after following the map's lasting `merged_into`
+  merges), still an object with a compatible label whose box overlaps or nearly coincides with it.
 * `map_update.<split>.vs_one_update.*`: the split map against the one-update map, as `map.stability.*`
   (an id may differ where an earlier update of the split had published one).
 

@@ -24,12 +24,17 @@ update's ``-t full`` scene is kept, since a later update changes the map's frame
 * ``before_present_fraction``: the remnant test on the map after the first update of the split
   whose first part is exactly the images that show the absent object — the control that makes the
   absence mean something.
-* ``<s>.stability.*`` (``mapquality.stability_metrics``): the objects the first update's images
-  observe and that never changed keep their ``id``s, labels and OBBs from the first update to the
-  last (one map, one frame: no alignment).
+* ``<s>.stability.label_agreement`` / ``.id_agreement`` (``mapquality.stability_metrics``): the
+  objects the first update's images observe and that never changed keep their labels and ``id``s
+  from the first update to the last. A later update may re-gauge the map frame (a rebuild) and
+  refine OBBs (mapper.md), so the two updates are first aligned by their common captures' camera
+  poses (``split_alignment``) and the box figures stay in the detail: the OBB requirement is
+  ``<s>.vs_one_update``'s.
 * ``<s>.ids_persistent_fraction``: every id an update published (its ``-t full`` scene) for an
   object that never changed is, in every later update, still an object of a compatible label whose
-  box overlaps or nearly coincides with it (``mapquality.MATCH_IOU`` / ``MATCH_CENTRE_M``).
+  box, once the two updates are aligned, overlaps or nearly coincides with it
+  (``mapquality.MATCH_IOU`` / ``MATCH_CENTRE_M``). An id the later map merged into another (its
+  ``objects.json`` ``merged_into``, a lasting merge) resolves to that object first.
 * ``<s>.vs_one_update.*``: one update versus that split, after the rigid alignment of the two
   maps' camera poses; ids may differ only where an earlier update of the split had published one
   (mapper.md), which ``id_agreement`` allows.
@@ -37,7 +42,7 @@ update's ``-t full`` scene is kept, since a later update changes the map's frame
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -69,6 +74,8 @@ HOLE_GRID = 8  # cells per side of the annotated region
 HOLE_RING = 0.5  # the ring around the region, as a share of its size on each side
 HOLE_DEPTH_REL = 0.25  # a region cell seeing this much farther than the ring sees through a hole
 IMAGE_SUFFIXES = (".jpg", ".jpeg")
+# first vs last update of a split: labels and ids only (boxes are refined, the frame re-gauged)
+SPLIT_STABILITY = ("label_agreement", "id_agreement")
 Camera = tuple[float, float, float, float, int, int]  # fx, fy, cx, cy, width, height
 
 
@@ -79,7 +86,7 @@ def split_name(sizes: tuple[int, ...] | list[int]) -> str:
 def split_metric_ids(name: str) -> list[str]:
     return [f"{PREFIX}.{name}.{k}" for k in ("absent_fraction", "hole_fraction",
                                               "ids_persistent_fraction")] + \
-        [f"{PREFIX}.{name}.stability.{k}" for k in STABILITY_METRICS] + \
+        [f"{PREFIX}.{name}.stability.{k}" for k in SPLIT_STABILITY] + \
         [f"{PREFIX}.{name}.vs_one_update.{k}" for k in STABILITY_METRICS]
 
 
@@ -107,14 +114,35 @@ class MapView:
     sources: dict[int, str]  # frame key → capture file name
     camera: Camera | None
     cloud: NDArray[np.float64] | None = None  # map points (N, 3), map coordinates
+    merged_into: dict[int, int] = field(default_factory=dict)  # lasting merges, old id → id
 
     @classmethod
     def of(cls, doc: Json, map_dir: Path, cloud: bool = False) -> MapView:
         return cls(doc_objects(doc), capture_poses(doc, map_dir), capture_sources(doc, map_dir),
-                   _camera(doc), map_points(map_dir) if cloud else None)
+                   _camera(doc), map_points(map_dir) if cloud else None, merges(map_dir))
+
+    def resolve(self, oid: int) -> int:
+        """``oid`` followed through the map's lasting merges."""
+        seen: set[int] = set()
+        while oid in self.merged_into and oid not in seen:
+            seen.add(oid)
+            oid = self.merged_into[oid]
+        return oid
 
     def ids(self) -> set[int]:
         return {o.id for o in self.objects}
+
+
+def merges(map_dir: Path) -> dict[int, int]:
+    """The map's lasting merges (``objects.json`` → ``merged_into``), read as the update left
+    them; provisional rebuild absorptions are not lasting and are not read."""
+    import json
+
+    try:
+        data = json.loads((Path(map_dir) / "objects.json").read_text())
+        return {int(k): int(v) for k, v in (data.get("merged_into") or {}).items()}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
 
 
 def map_points(map_dir: Path) -> NDArray[np.float64] | None:
@@ -259,14 +287,16 @@ def unchanged(plan: MapUpdatePlan) -> Any:
     return keep
 
 
-def _same_object(a: DocObject, b: DocObject) -> bool:
+def _same_object(a: DocObject, b: DocObject, T_b_a: Pose) -> bool:
     """``b`` is the object ``a`` was: a compatible label and a box that overlaps or nearly
-    coincides with ``a``'s (the stability pairing's admissibility)."""
+    coincides with ``a``'s carried into ``b``'s map frame by ``T_b_a`` (the stability pairing's
+    admissibility)."""
     if not compatible(a.label, b.label):
         return False
-    ba, bb = a.obb(), b.obb()
-    if ba is None or bb is None:
+    box_a, bb = a.obb(), b.obb()
+    if box_a is None or bb is None:
         return True
+    ba = box_a.transformed(T_b_a)
     d = float(np.linalg.norm(ba.center - bb.center))
     return d <= MATCH_CENTRE_M or obb_iou_upright(ba, bb, samples=4000) >= MATCH_IOU
 
@@ -282,14 +312,24 @@ def ids_persistent(m: Metrics, mid: str, plan: MapUpdatePlan, views: list[MapVie
                 continue
             for j, later in enumerate(views[k + 1:], start=k + 2):
                 checks += 1
-                now = next((x for x in later.objects if x.id == o.id), None)
-                if now is None or not _same_object(o, now):
+                oid = later.resolve(o.id)
+                now = next((x for x in later.objects if x.id == oid), None)
+                if now is None or not _same_object(o, now, _aligned(later, view)):
                     broken.append({"id": o.id, "label": o.label, "published_by_update": k + 1,
-                                   "update": j, "now": None if now is None else now.label})
+                                   "update": j, "now": None if now is None else now.label,
+                                   **({"merged_into": oid} if oid != o.id else {})})
     m.add(mid, 1.0 - len(broken) / checks if checks else None,
           {"checks": checks, "broken": broken[:20]},
           error="no update published an unchanged object")
     return broken
+
+
+def _aligned(to: MapView, frm: MapView) -> Pose:
+    """``T_to_from`` from the captures registered in both updates (identity when none is)."""
+    try:
+        return split_alignment(to.poses, frm.poses)
+    except ValueError:
+        return Pose.identity()
 
 
 @dataclass
@@ -354,9 +394,16 @@ def map_update_metrics(m: Metrics, plan: MapUpdatePlan, images: list[str], singl
             first_images = set(s.parts[0])
             kept = [o for o in final.objects
                     if keep(o) and any(final.sources.get(f) in first_images for f in o.frames)]
+            scratch = Metrics()  # the box figures of an update-to-update comparison: detail only
             row["stability"] = stability_metrics(
-                m, f"{PREFIX}.{s.name}.stability", kept,
-                [o for o in s.views[0].objects if keep(o)], Pose.identity())
+                scratch, "x", kept, [o for o in s.views[0].objects if keep(o)],
+                _aligned(final, s.views[0]))
+            boxes = {k: scratch.items[f"x.{k}"].value for k in STABILITY_METRICS
+                     if k not in SPLIT_STABILITY}
+            for k in SPLIT_STABILITY:
+                x = scratch.items[f"x.{k}"]
+                m.add(f"{PREFIX}.{s.name}.stability.{k}", x.value,
+                      {**(x.detail or {}), "boxes_after_alignment": boxes}, error=x.error)
             published = set().union(*(v.ids() for v in s.views[:-1]))
             row["vs_one_update"] = stability_metrics(
                 m, f"{PREFIX}.{s.name}.vs_one_update", single.objects, final.objects,
