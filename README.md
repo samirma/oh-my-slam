@@ -1065,6 +1065,14 @@ which replaces most files, widens that window.
     fused depth and do not meet the cloud; it is then still a candidate.
   * Unconfirmed candidates are kept in the map's state, so that a later update can still confirm
     them; they are never emitted, in any format or scope.
+  * **Published objects stay published.** An object the map has exported (`objects.json →
+    published`) stays confirmed and exported, with its id, label and colour, whatever later
+    evidence says of its confirmation: keyframes that have it in view without detecting it (two
+    detections are then needed where one sufficed), a cloud that draws fewer of its points, a
+    floor a rebuild places higher, or a rebuild's own evidence (*Rebuilding a weakly posed map*).
+    Its box is refitted as evidence accumulates. Only latest wins removes it (evidence of
+    absence: *Later wins*), and a merge may join it with another object (the lower or published
+    id stays).
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
@@ -1295,8 +1303,10 @@ pixels, so its results are unchanged.
        was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
        object takes the ids of the stored detections it owns that were the first to carry
        them (an id's founding detection): the published ones before a candidate's, then the
-       lowest. A published id whose founding detection the rebuild groups with an object that
-       keeps another published id goes instead to a rebuilt object that holds none, has a
+       lowest. A rebuilt object that takes a published id is published whatever the rebuild's
+       evidence says of its confirmation (published objects stay published), and latest wins
+       judges it as any object of the map. A published id whose founding detection the rebuild
+       groups with an object that keeps another published id goes instead to a rebuilt object that holds none, has a
        compatible label and stands where the map last published it (their boxes overlap, or
        their centres lie within the attribution gate, max(5 cm, 3 % of the viewing distance)).
        Only when no such object exists does it resolve to the object that took its detection,
@@ -1305,8 +1315,7 @@ pixels, so its results are unchanged.
        being rebuilt keeps its last provisional merges. The map's other merges (`merged_into`)
        are permanent, and when the extension merges two objects the published id stays before a
        lower candidate's. A published id that no object takes is listed in the update's
-       `objects.removed`, and one whose object is kept only as a candidate in
-       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
+       `objects.removed`; none vanishes unreported. Objects first seen by the new photos are
        numbered on from the map's count, as an extension numbers them. So ids can differ from
        the one-update map's where an earlier update had published one (spec §2.3). In
        `office_sequence` split 4 + 4 + 5 the four window photos publish two windows, 9 and 22
@@ -1317,7 +1326,8 @@ pixels, so its results are unchanged.
        Both runs ended with 22 on the second window (26 resolving to 22) after the third update.
        With the rule, in three runs: 22 stayed on the second window after every update in one;
        in another the second update's rebuild kept the second window as a candidate only (22
-       listed `unpublished`); in the third it mapped both windows as one object, so no object
+       left the output for one update, which published objects staying published now rules
+       out); in the third it mapped both windows as one object, so no object
        stood apart for 22 and it resolved to 9 provisionally. After the third update 22 was on
        the second window in all three.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3

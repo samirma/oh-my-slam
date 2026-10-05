@@ -17,7 +17,10 @@ Semantics (spec §2.3):
   keyframes — or in the one keyframe that had the object in view, when no other keyframe of the
   map did (``views_in_frustum``; occlusion is ignored, so a detection whose depth puts it behind
   another surface cannot confirm itself). Unconfirmed objects are kept, never exported, so a later
-  update can still confirm them.
+  update can still confirm them. **Published objects stay published:** an object the map exported
+  (``MapObject.published``) stays confirmed and exported whatever later evidence, or a rebuild's
+  evidence, says of its confirmation (and is not dropped as below the floor), until latest wins
+  removes it; a rebuilt object that takes a published id is published too.
 * **Boxes** are fitted (by segmentation) to the points of the sightings that agree with each
   other (``fit_points``): monocular depth of small objects varies between keyframes, and the union
   of inconsistent sightings is a streak along the viewing rays, not the object. Only the best
@@ -485,6 +488,9 @@ class MapObject:
     obb: OBB | None = None
     frames: list[int] = field(default_factory=list)  # keyframes that detected it (sorted)
     confirmed: bool = False
+    # exported by an earlier update: it stays confirmed and exported until latest wins removes
+    # it (``confirm``, ``ObjectState.exported``)
+    published: bool = False
     strikes: int = 0
     views_in_frustum: int = 0  # keyframes of the map that have it in view (or detected it)
     created_update: int = 0
@@ -597,6 +603,7 @@ class MapObject:
             self.obs_depth = (self.obs_depth * n_a + gone.obs_depth * n_b) / (n_a + n_b)
         self.frames = sorted(set(self.frames) | set(gone.frames))
         self.views_in_frustum = max(self.views_in_frustum, gone.views_in_frustum)
+        self.published = self.published or gone.published
         self.strikes = min(self.strikes, gone.strikes)
         self.created_update = min(self.created_update, gone.created_update)
         self.last_seen_update = max(self.last_seen_update, gone.last_seen_update)
@@ -609,7 +616,7 @@ class MapObject:
             "scores": self.scores, "score": self.score,
             "obb": None if self.obb is None else self.obb.to_dict(),
             "observations": self.observations, "frames": self.frames,
-            "confirmed": self.confirmed, "strikes": self.strikes,
+            "confirmed": self.confirmed, "published": self.published, "strikes": self.strikes,
             "views_in_frustum": self.views_in_frustum, "created_update": self.created_update,
             "last_seen_update": self.last_seen_update, "obs_depth": self.obs_depth,
             "pixel_count": self.pixel_count, "point_count": self.point_count,
@@ -622,12 +629,18 @@ class MapObject:
     def from_dict(d: dict[str, Any], points: NDArray[np.float32]) -> MapObject:
         cloud = d.get("cloud_points")
         least = d.get("cloud_min_points")
+        confirmed = bool(d.get("confirmed", False))
+        # a map written before the flag: what it exported then
+        published = d.get("published")
+        if published is None:
+            published = confirmed and d.get("obb") is not None and _enough_cloud(cloud, least)
         return MapObject(
             id=int(d["id"]), label=d["label"], label_votes=dict(d.get("label_votes", {})),
             scores=list(d.get("scores", [])), points=points,
             obb=None if d.get("obb") is None else OBB.from_dict(d["obb"]),
             frames=sorted({int(f) for f in d.get("frames", [])}),
-            confirmed=bool(d.get("confirmed", False)), strikes=int(d.get("strikes", 0)),
+            confirmed=confirmed or bool(published), published=bool(published),
+            strikes=int(d.get("strikes", 0)),
             views_in_frustum=int(d.get("views_in_frustum", 0)),
             created_update=int(d.get("created_update", 0)),
             last_seen_update=int(d.get("last_seen_update", 0)),
@@ -799,13 +812,17 @@ class ObjectState:
         return oid if oid in self.by_id() else None
 
     def exported(self) -> list[SceneObject]:
-        """The confirmed objects with a box and enough points in the map cloud
-        (``min_cloud_points``; not yet counted: maps written before cloud counts were
-        recorded)."""
+        """The objects with a box that an earlier update published, and the other confirmed
+        ones with enough points in the map cloud (``min_cloud_points``; not yet counted: maps
+        written before cloud counts were recorded). A published object stays published until
+        latest wins removes it."""
         return [o.scene_object() for o in sorted(self.objects, key=lambda o: o.id)
-                if o.confirmed and o.obb is not None
-                and (o.cloud_points is None or o.cloud_points >= (
-                    EXPORT_MIN_CLOUD_POINTS if o.cloud_min is None else o.cloud_min))]
+                if o.obb is not None and (o.published or (
+                    o.confirmed and _enough_cloud(o.cloud_points, o.cloud_min)))]
+
+
+def _enough_cloud(cloud: int | None, least: int | None) -> bool:
+    return cloud is None or cloud >= (EXPORT_MIN_CLOUD_POINTS if least is None else least)
 
 
 def sample_spacing(voxel: float, obs_depth: float = 0.0, focal: float = 0.0) -> float:
@@ -1148,9 +1165,10 @@ def refit(obj: MapObject, floor_z: float | None) -> None:
 def confirm(obj: MapObject) -> None:
     """Confirmed when reliable detections (``MapObject.reliable_frames``) come from at least
     ``CONFIRM_DETECTIONS`` keyframes, or from one when no other keyframe of the map has the object
-    in view (``views_in_frustum`` <= 1: a single image, or a place only one keyframe saw)."""
+    in view (``views_in_frustum`` <= 1: a single image, or a place only one keyframe saw). A
+    published object stays confirmed whatever the evidence (only latest wins removes it)."""
     need = CONFIRM_DETECTIONS if obj.views_in_frustum > 1 else 1
-    obj.confirmed = len(obj.reliable_frames()) >= need
+    obj.confirmed = obj.published or len(obj.reliable_frames()) >= need
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1336,6 +1354,29 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         instances.setdefault(ob.frame, []).append((owner[i], ob.inst.mask))
     masks = _Masks(ctx, views, instances, state.merges(), alias)
     merged = _merge(state, touched, alias, views, surfaces, masks)
+
+    # the final ids of the new objects (step 5) are known now: the number of their first
+    # detection, or in a rebuild the id the map published (``_published_ids``); a rebuilt object
+    # that takes a published id is published, whatever the rebuild's evidence says (it stays
+    # published until latest wins removes it)
+    def resolved(oid: int) -> int:
+        while oid in alias:
+            oid = alias[oid]
+        return oid
+
+    first_detection: dict[int, int] = {}
+    for i, oid in enumerate(owner):
+        k = resolved(oid)
+        first_detection[k] = min(first_detection.get(k, number[i]), number[i])
+    final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
+                                           floor, count, set(rb.created) if rb is not None else None)
+    if rb is not None and absorbed:
+        _published_places(final_of, absorbed, [o for o in state.objects if o.id >= first_new],
+                          rb.boxes)
+    if rb is not None:
+        for o in state.objects:
+            if o.id >= first_new and final_of.get(o.id) in rb.published:
+                o.published = True
     for o in state.objects:
         o.forget_tree()
         o.views_in_frustum = count_views(o, records)
@@ -1347,7 +1388,8 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     #    keeps the id of where it was, and that place is vacated like a removed object's); an
     #    object first detected where the update's earlier keyframes saw free space arrived, and
     #    their views through it are retired so that the latest keyframes draw it
-    dropped = {o.id for o in state.objects if below_floor(o, state.floor_z)}
+    dropped = {o.id for o in state.objects
+               if not o.published and below_floor(o, state.floor_z)}
     places = _Places(views, masks, state.objects, cuts)
     new_idx = sorted(new_views)
     moves = [mv for mv in _moves(state, touched - dropped, places, _Colours(ctx, views, masks))
@@ -1402,21 +1444,8 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
             tx.delete(sources_file(oid))
     state.objects = [o for o in state.objects if o.id not in gone]
 
-    # 5. final ids of the new objects: the number of their first detection (bookkeeping)
-    def resolved(oid: int) -> int:
-        while oid in alias:
-            oid = alias[oid]
-        return oid
-
-    first_detection: dict[int, int] = {}
-    for i, oid in enumerate(owner):
-        k = resolved(oid)
-        first_detection[k] = min(first_detection.get(k, number[i]), number[i])
+    # 5. final ids of the new objects (computed in step 3)
     fresh = [o for o in state.objects if o.id >= first_new]
-    final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
-                                           floor, count, set(rb.created) if rb is not None else None)
-    if rb is not None and absorbed:
-        _published_places(final_of, absorbed, fresh, rb.boxes)
     count = max([count] + [v + 1 for v in final_of.values()])
     rename = {o.id: final_of[o.id] for o in fresh}
     moved_ids: list[int] = []
@@ -1470,7 +1499,6 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     state.summary = {
         "instances": len(obs), "touched": len(touched), "new": len(fresh), "merged": merged,
         "removed": sorted({oid for oid in removed if oid < first_new} | set(removed_published)),
-        "unpublished": _unpublished(state, rb) if rb is not None else [],
         "withdrawn": sum(oid >= first_new and final_of.get(oid, oid) not in published
                          for oid in removed),
         "moved": sorted(moved_ids),
@@ -1593,6 +1621,9 @@ def set_cloud_counts(tx: Any, state: ObjectState, labels: NDArray[Any],
         seen_from = (nearest or {}).get(o.id, o.obs_depth)
         o.cloud_min = (None if voxel is None or o.obb is None
                        else min_cloud_points(o.obb, voxel, seen_from, focal))
+    for o in state.objects:  # what the map exports now is published for good
+        o.published = o.published or (o.confirmed and o.obb is not None
+                                       and _enough_cloud(o.cloud_points, o.cloud_min))
     save_state(tx, state)
 
 
@@ -3364,12 +3395,6 @@ def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
         if o.id in rb.created:
             o.created_update = min(o.created_update, rb.created[o.id])
     return sorted(set(rb.created) - finals - set(state.merged_into) - set(state.rebuild_merged))
-
-
-def _unpublished(state: ObjectState, rb: Any) -> list[int]:
-    """Published ids whose object a rebuild keeps as a candidate only (not confirmed again: the
-    map no longer exports it, though a later update may confirm it)."""
-    return sorted(o.id for o in state.objects if o.id in rb.created and not o.confirmed)
 
 
 # ------------------------------------------------------------------------------------------------

@@ -304,6 +304,34 @@ def test_later_update_wins_over_an_earlier_one(tmp_path: Path) -> None:
     assert again.id > cab.id
 
 
+def test_a_published_object_stays_published_until_latest_wins_removes_it(
+        tmp_path: Path) -> None:
+    """Published objects stay published (user ruling 2026-10-05): one keyframe publishes a
+    cabinet (the only keyframe that has it in view); the next update's keyframes see it in place
+    without detecting it, which alone would leave it a candidate (one detection of the two that
+    confirm an object more keyframes see). It stays exported with its id, label and colour,
+    over another such update, until an update sees through its place: then it is removed."""
+    box = Box(np.array([0.0, 0.2, 0.4]), np.array([0.7, 0.6, 0.8]), 0.2, (220, 40, 40), "cabinet")
+    room = Room(boxes=[box])
+    poses = ring(10)
+    mdir = tmp_path / "m"
+    r1 = known_pose_update(mdir, shoot(room, poses[:1]), tmp_path / "w1")
+    (cab,) = r1.objs.exported()
+    blind = shoot(room, poses[1:4], detect=lambda k, label, m: None)
+    for k, shots in enumerate([blind, shoot(room, poses[5:7], detect=lambda k, label, m: None)]):
+        r = known_pose_update(mdir, shots, tmp_path / f"w{k + 2}")
+        (o,) = r.objs.objects
+        assert len(o.reliable_frames()) < objects.CONFIRM_DETECTIONS < o.views_in_frustum
+        (now,) = r.objs.exported()
+        assert (now.id, now.label, now.color) == (cab.id, cab.label, cab.color)
+        assert r.objs.summary["removed"] == []
+        persisted = json.loads((mdir / objects.OBJECTS_JSON).read_text())["objects"]
+        assert [(d["id"], d["published"], d["confirmed"]) for d in persisted] == [
+            (cab.id, True, True)]
+    r4 = known_pose_update(mdir, shoot(Room(boxes=[]), poses[6:9]), tmp_path / "w4")
+    assert r4.objs.exported() == [] and r4.objs.summary["removed"] == [cab.id]
+
+
 def test_removal_needs_the_update_as_a_whole() -> None:
     """Keyframes that see through an object do not remove it when a later keyframe of the update
     sees it in place (the latest wins; monocular depth errors); an update that sees it in place
