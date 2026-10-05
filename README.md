@@ -11,7 +11,7 @@ OpenLABEL mapping and the colour palette).
 |---|---|
 | `start_inference_server.sh [--status\|--stop]` | Starts the resident model server, or stops or queries it. |
 | `reconstruct.sh -i IMAGE [-f json\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default) or point cloud, in the camera frame. |
-| `mapper.sh update -i IMAGES\|FOLDERS\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
+| `mapper.sh update -i IMAGES\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
 | `mapper.sh locate -i IMAGES -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single]` | Camera pose of each image in an existing map, which stays untouched. |
 | `segment.sh -i IMAGE [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` | Objects of one image: OBBs, colours, and with `-d` five artefact files. |
 | `segment.sh -m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | The persistent objects of a map, read-only and without the server. |
@@ -48,7 +48,7 @@ Model weights are downloaded on the first server start:
 ./reconstruct.sh -i photo.jpg -f ply -p color=segment,voxel=0.01,normals=on -o objects.ply
 ./segment.sh -i photo.jpg -d out/ --min-score 0.6
 ./mapper.sh update -i walk.mp4 -m maps/home > map.json
-./mapper.sh update -i more_photos/ -m maps/home -t single -f ply -o new_part.ply
+./mapper.sh update -i more_photos/*.jpg -m maps/home -t single -f ply -o new_part.ply
 ./mapper.sh locate -i where_am_i.jpg -m maps/home > pose.json
 ./segment.sh -m maps/home -d out_map/
 ./view.sh -m maps/home
@@ -234,8 +234,9 @@ The two modes differ:
 * **`-i`** reconstructs and segments the image once, through the inference server. It shows the
   cloud, the segmented image, the catalogue, the labelled OBBs and the camera at its estimated
   pose. The display rotates the camera frame so that the estimated up direction is +z.
-* **`-m`** opens the map read-only, without the server. It shows the map's complete cloud, every
-  keyframe camera and the labelled OBBs.
+* **`-m`** opens the map read-only, without the server. It shows the map's cloud within the
+  display budget (every point up to 16,000,000; above that a voxel-grid subsample, with a
+  "showing X of Y points" notice), every keyframe camera and the labelled OBBs.
 
 The first view looks down 60° on the whole scene and its cameras, so that the walls of a room
 hide little of its floor, objects and camera cluster.
@@ -253,7 +254,9 @@ The page has up to four tabs:
     are shaded by their normals, except with `color=segment`, whose object colours and
     unsegmented grey are always drawn exactly (§2.4 colour contract). An invalid combination is reported under the controls and the
     last good cloud stays.
-* **Catalogue** lists the image's objects, largest first (`-i` only, as §2.5 asks).
+* **Catalogue** is segmentation's own catalogue (`-i` only, as §2.5 asks): the rows of
+  `catalog.csv` from `api/catalog`, in the order and with the columns segmentation serves (by
+  id), each id with its colour swatch. The table scrolls sideways inside the panel.
 * **Cameras** lists every displayed camera's centre (x, y, z in metres, in the scene frame), with
   a *Go to* button that moves the viewpoint to that camera, looking where it looked.
 * **Image** shows the segmented image (`-i` only).
@@ -352,7 +355,13 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
   `--no-browser` with them is a usage error.
 * **Output.** Once accepting connections, stderr carries exactly one line
   `server.sh: listening on http://0.0.0.0:<port>/`. Nothing else is printed while it runs: job
-  output goes to each job's log. stdout is empty except for `--status`.
+  output goes to each job's log, and right after the listening line the service's own logging
+  (the `uvicorn*` and `oh_my_slam` loggers, the root logger, Python warnings) and anything else
+  written to its file descriptors 1 and 2 go to `<data>/server.log`, so a malformed request's
+  warning or a traceback never reaches stderr. stdout is empty except for `--status`.
+* **Browser.** The browser is opened on `http://127.0.0.1:<port>/` only once the service accepts
+  connections (right after the listening line), and never with `--no-browser` (a test replaces
+  `webbrowser.open` with a probe that connects to the URL).
 * **Stopping.** Ctrl-C, SIGTERM and `--stop` are the same normal stop (exit 0): queued jobs are
   cancelled, and running ones are interrupted and waited for, up to 120 s before they are killed.
   * A second Ctrl-C or SIGTERM during the stop SIGKILLs every job's process group, records those
@@ -396,7 +405,8 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
 |---|---|
 | `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service never deletes a map and changes one only through `mapper-update`. |
 | `uploads/<id>/<file>` | Raw-body uploads (`POST /api/uploads?name=<file>`, `application/octet-stream`). A job refers to one by its path `uploads/<id>/<file>`. Each upload belongs to at most one queued or running job and is deleted when that job ends, whatever its state. An interrupted upload is deleted at once, and every upload is deleted at start and stop. An upload may hold at most 8 GiB (long phone videos fit) and must leave 1 GiB free on the workspace's disk; otherwise it gets 413. |
-| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS`), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, `out/` (everything the command wrote), `viewer/` (a saved viewer) and `display/` (its PLY files as the 3D scene viewer draws them). |
+| `server.log` | The running service's own log, after its listening line (see Output). |
+| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS` of the command), `viewer_progress.jsonl` (that of a viewer step after the command), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, `out/` (everything the command wrote), `viewer/` (a saved viewer) and `display/` (its PLY files as the 3D scene viewer draws them). |
 
 Any other workspace path is accepted as an input, relative to the workspace or absolute. A path
 that resolves outside the workspace (through `..`, `~` or a symlink), or that goes through a
@@ -422,7 +432,7 @@ option.
   queued for an invalid request. `POST /api/ops/<op>/validate` runs the same checks without
   queuing anything.
 * `/api/openapi.json` is generated from `spec.describe()`. Each operation and parameter carries
-  its whole registry entry under `x-oms`. `/api/operations` returns `spec.describe()` itself.
+  its whole registry entry under `x-oms`, which is how a client reads the commands' definitions.
 
 **Jobs.**
 
@@ -441,7 +451,9 @@ option.
   (`core.errors.job_state`). A failure carries the command's `<prog>: error:` message, the code
   of its exit status (`usage`, `server_unavailable`, …) and that code's HTTP status.
 * **Progress.** The current stage is the command's own timing stage, with `done`/`total` where the
-  command reports it, plus per-stage seconds and counts. Changes are pushed as server-sent events
+  command reports it, plus per-stage seconds and counts. A viewer step after the command
+  (`?viewer=true`) reports apart, in `viewer_progress` (`{stage, done, total}` while it runs), so
+  `stage`, `progress`, `stages` and `counts` stay the command's own. Changes are pushed as server-sent events
   (`/api/jobs/events` for every job, `/api/jobs/<id>/events` for one until it ends) and are also
   available by polling.
 * **Order.**
@@ -457,10 +469,18 @@ option.
   * After a restart, a job that was queued or running shows as `cancelled`.
 * **Results.** The result is the command's `-o` file, and `-d` artefacts are its files in `out/`,
   so both are byte-identical to a direct run (tested against the CLI with the stub server).
-  Download them with `/api/jobs/<id>/result` and `/api/jobs/<id>/files/<path>`.
+  Download them with `/api/jobs/<id>/result` and `/api/jobs/<id>/files/<path>`, also after a
+  restart.
+  * **What byte-identical means** (user ruling, 2026-10-05): the same command, with the same
+    options and the same **absolute** input paths. A job passes the command the absolute path of
+    each workspace input (an upload is `<data>/uploads/<id>/<file>`), and a result that records
+    its inputs (for example a frame's stream `uri` or a map's frame `source`) names them by that
+    path, so a direct run on another path to the same bytes differs exactly there. Saved results
+    reference inputs by the path the job used, even after the upload is deleted.
 * **Re-submit.** `POST /api/jobs/<id>/resubmit` runs the same parameters again, with the viewer
   step if the original had one. Its body may replace some parameters, for example a new upload in
-  place of one that was discarded.
+  place of one that was discarded. A job whose operation the commands no longer offer gets
+  410 `gone`.
 
 **Viewer.** The viewer's data is always served in-process by the viewer's own routes
 (`viewer.routes.ViewerRoutes`). No viewer process stays alive.
@@ -513,7 +533,7 @@ option.
 | `GET /api/health` | Service and inference health. When the inference server is down, the response includes `start_command`. |
 | `POST /api/ops/<op>[?viewer=true]` | Submit a job. |
 | `POST /api/ops/<op>/validate` | Check a request without queuing it. |
-| `GET\|POST /api/uploads` | List or create uploads. |
+| `POST /api/uploads` | Create an upload. |
 | `DELETE /api/uploads/<id>` | Discard an unconsumed upload. |
 | `GET /api/maps` | List maps, with summaries from `map.json` and the frame/object records. |
 | `GET /api/maps/<name>` | One map's summary and its full `map.json`. |
@@ -575,6 +595,11 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
   tables, and a scene JSON's objects are listed. A `.ply` or scene `.json` opens in the 3D scene
   viewer. A single-image job is submitted with `?viewer=true` where the operation offers it, and
   its `viewer_error` (including `cancelled`) is shown above the result, which still stands.
+  The result page of a map operation (`mapper.sh update` / `locate`, `segment.sh -m`) embeds that
+  map's viewer (`/viewer/map/<name>/`).
+* **Command output.** Every job page shows what the command printed on stderr
+  (`/api/jobs/<id>/log`): its warnings and messages in its own words, and its `timings:` line on
+  its own. It is read again as the job's lines change.
 * **The embedded viewer** is view.sh's own page in an iframe at its stable URL
   (`/viewer/map/<name>/`, `/viewer/job/<id>/`), which also opens it full screen. Selecting an
   object highlights it everywhere on the page: in the tables, in the image regions, and on a box
@@ -583,7 +608,8 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
 * **Jobs.** A cancel first says what it does: the command is interrupted as Ctrl-C would, there is
   no result, a map update leaves the map as it was, and the uploads are deleted. Re-submit runs
   the same options again, and asks for the files again when the inputs were uploads (deleted when
-  the job ended): they are listed in their previous order, and each file chosen takes its place. Starting a map creation or update states its consequence in a confirmation.
+  the job ended): they are listed in their previous order, and each file chosen takes its place.
+  Inputs that were workspace paths are still there: they keep their place and are not asked for. Starting a map creation or update states its consequence in a confirmation.
 * **Inference server down.** Actions of a mode that always needs the server are disabled, with
   the reason and the start command. A conditional need (`mapper.sh locate` on a large map) is
   decided by the service's own check when the form is validated. Everything else stays available.
@@ -1420,7 +1446,7 @@ at the Python-module level:
 * `web` (`server.sh`) owns the HTTP layer and the job runner. It runs the commands' entry points
   as subprocesses and never imports torch, Open3D or the inference server's internals.
 * `server` owns the models and nothing else.
-* The layers run `cli` | `web` (independent siblings; `web` is the coming web service) >
+* The layers run `cli` | `web` (independent siblings; `web` is `server.sh`) >
   `commands` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` > `client` >
   `schema` > `core`.
 * `commands/spec.py` is the commands' single source of truth (spec §2.6): every mode, option
@@ -1449,15 +1475,34 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 
 * the server's cold start and resident memory (it stops and restarts the server)
 * `reconstruct.sh` (JSON and PLY), `segment.sh -i -d` and `view.sh -i` on `restaurant.jpg`
-* `segment.sh -i` on each of the 79 `ainex-captures` frames
+* `segment.sh -i` on each of the 79 `ainex-captures` frames (file names below)
 * `mapper.sh update` on the sequence, once in one update and once split across 3 updates
 * `segment.sh -m` and `view.sh -m` on both maps
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
   ones): the whole sequence in one update, and as an extended map (an update with the early images,
   then one with the rest)
 
-Video sampling (`-fps`) is not covered, because the examples contain no video. The metric groups
-are:
+Video sampling (`-fps`) is not covered, because the examples contain no video.
+
+**`ainex-captures` file names** encode the commanded head motion as `NNN_<motion>_<tilt>.jpg`
+(parsed by `tools/evaluate/names.py`; a name outside this grammar is an error):
+
+| Part | Values | Meaning |
+|---|---|---|
+| `NNN` | `001` … `079` | Capture order. |
+| `<motion>` | `bootstrap`, `bootstrap_side1`, `bootstrap_side2` | Yaw 0° (the side variants after a small sideways step). |
+| | `bootstrap_leftYYY`, `bootstrap_leftYYY_side` | Yaw +YYY°. |
+| | `left_YYY` | Yaw +YYY°. |
+| | `right_to_YYY` | Yaw +YYY°, turning back towards 0°. |
+| | `right_YYY` | Yaw −YYY°. |
+| `<tilt>` | `level`, `up`, `down` | Pitch: `up` / `down` relative to the `level` frame of the same motion (the nearest in capture order). |
+
+Yaw is relative to frame 001, positive to the left, in degrees (`YYY` has three digits). The
+same-heading pairs are 001 / 053 (053 returns to 001's heading) and 026 / 078 (`left_210` = +210°
+meets `right_150` = −150°, closing the 360° loop). Hidden files and non-images in the folder are
+ignored.
+
+The metric groups are:
 
 | Group | Measures |
 |---|---|
@@ -1507,10 +1552,11 @@ runs it end to end as a test.
 
 ## Known limitations
 
-* **Files opened from disk in the future 3D scene viewer are not budgeted yet.** `static/lib/ply.js`
-  draws every point of a PLY read in the browser. Applying the §2.5 display budget there would
-  mean porting the selection, which segmentation's derivation owns, to JavaScript. This will be
-  decided when `server.sh`'s scene viewer is built.
+* **A PLY from disk above the display budget is refused in `server.sh`'s 3D scene viewer**
+  (user ruling, 2026-10-05). A file opened from disk is read in the browser and never uploaded,
+  and the §2.5 voxel-grid selection is segmentation's, on the server. So a disk PLY of more than
+  16,000,000 points is refused with a message that says to open it as a map or as a job's file,
+  where the service draws the budgeted selection.
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the
   mislabelled instances shows that the detector itself prefers the wrong label. A kettle scores
@@ -1600,6 +1646,9 @@ Environment variables:
 |---|---|
 | `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
 | `OH_MY_SLAM_PROGRESS=path` | Appends one JSON line per live progress event of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` to that path (`/dev/fd/<n>` reaches a pipe): `begin`, `stage_start` / `stage_end` (stage names of `core.timing.Stage`), `count` (sizes such as `keyframes_sampled`), `part`, `progress` (`done` of `total` items of the running stage) and `finish` (with the outcome: `ok`, `exit_code` and its `code`). stdout and the stderr text are unchanged. This is how the web service follows the jobs it runs as subprocesses. |
+| `OH_MY_SLAM_INFERENCE_RECORD=dir` | Records every inference response of the command (with its depth and validity files) in `dir` (`client.replay`). `server.sh` sets it on the command step of a `?viewer=true` job (`jobs/<id>/inference/`). |
+| `OH_MY_SLAM_INFERENCE_REPLAY=dir` | Answers inference requests from a recording made with `OH_MY_SLAM_INFERENCE_RECORD` (matched by route and request, path fields aside); a request it does not hold goes to the server. `server.sh` sets it on that job's viewer step, so the viewer shows the result's own detections and ids. |
+| `OH_MY_SLAM_JOB=<id>` | Set by `server.sh` in the environment of every step of job `<id>`; a later start kills a process group a killed service left behind only when its leader carries this id and the recorded start time. Not meant to be set by hand. |
 | `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch): the test suite runs its stub server there, beside a running real one. |
 | `OH_MY_SLAM_TEST_REAL_SERVER=1` | Lets the `models` and `eval` tests use the running real server. |
 

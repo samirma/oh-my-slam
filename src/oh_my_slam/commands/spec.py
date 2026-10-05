@@ -731,13 +731,32 @@ def validate(cmd: Command, args: argparse.Namespace,
     uses: ``args`` with ``attrs`` parsed to :class:`CloudAttrs`, ``fps`` / ``min_score`` resolved,
     and whatever a rule prepared (the input spec of ``update``, the images and map reader of
     ``locate``). ``warn`` receives the warnings (ignored options)."""
+    return validate_deferring(cmd, args, warn)[0]
+
+
+def validate_deferring(cmd: Command, args: argparse.Namespace,
+                       warn: Callable[[str], None] | None = None, defer: tuple[Rule, ...] = ()
+                       ) -> tuple[argparse.Namespace, Callable[[], None]]:
+    """:func:`validate`, with the preparation of the rules in ``defer`` (e.g. creating the ``-d``
+    folder) left to the returned callable, which the command calls once it may write — after its
+    inference-server check — so a run refused for that reason leaves nothing behind. Every check
+    still runs first, in order."""
     mode = cmd.mode_of(args)
     ctx = Context(args, argparse.Namespace(**vars(args)), mode, warn or (lambda _msg: None))
+    later: list[Callable[[Context], None]] = []
     for rule in mode.rules:
         rule.check(ctx)
         if rule.prepare is not None:
-            rule.prepare(ctx)
-    return ctx.values
+            if rule in defer:
+                later.append(rule.prepare)
+            else:
+                rule.prepare(ctx)
+
+    def prepare() -> None:
+        for p in later:
+            p(ctx)
+
+    return ctx.values, prepare
 
 
 def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem]:
