@@ -402,6 +402,45 @@ def test_map_viewer_embedded_and_full_screen(mapped: dict[str, Any], tab: Tab, a
     link.click()
     wait_job(pg)
     pg.wait_for_selector("figure.segmented[data-ready=true]")
+    # a map operation's result page embeds the map's viewer
+    pg.wait_for_selector(".viewer-box[data-ready=true]", timeout=60000)
+    assert pg.get_attribute(".job-result iframe.viewer-frame", "src") == "/viewer/map/room/"
+    assert tab.errors == []
+
+
+def test_map_update_job_page_embeds_the_map_viewer_and_its_log(
+        mapped: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
+    """The result page of a map update embeds /viewer/map/<name>/, and shows the command's stderr
+    (its warnings and messages) and its timings: line, from /api/jobs/<id>/log."""
+    service, _ = app
+    jid = mapped["jobs"][-1]
+    pg = tab.go(f"#/jobs/{jid}")
+    wait_job(pg)
+    pg.wait_for_selector(".viewer-box[data-ready=true]", timeout=60000)
+    assert pg.get_attribute(".job-result iframe.viewer-frame", "src") == "/viewer/map/room/"
+    assert_job_log(pg, service, jid)
+    tab.a11y()
+    assert tab.errors == []
+
+
+def assert_job_log(pg: Any, service: Any, jid: str) -> None:
+    log = (service.workspace.job_dir(jid) / "stderr.log").read_text()
+    timing = [ln for ln in log.splitlines() if "timings: total " in ln]
+    assert timing, log
+    pg.wait_for_selector("[data-testid=timings-line]")
+    assert pg.inner_text("[data-testid=timings-line]").strip() == "\n".join(timing)
+    others = [ln for ln in log.splitlines() if ln and "timings: total " not in ln]
+    shown = pg.inner_text("[data-testid=job-log]")
+    for ln in others:
+        assert ln.strip() in shown, ln
+
+
+def test_image_job_shows_the_commands_stderr(image_job: dict[str, Any], tab: Tab,
+                                            app: tuple[Any, str]) -> None:
+    service, _ = app
+    pg = tab.go(f"#/jobs/{image_job['id']}")
+    wait_job(pg)
+    assert_job_log(pg, service, image_job["id"])
     assert tab.errors == []
 
 
