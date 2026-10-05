@@ -5,7 +5,10 @@ data is served in-process by the viewer's own code (``viewer.routes.ViewerRoutes
 ``/api/maps/<name>/viewer/…`` over a workspace map's read-only bundle, ``/api/jobs/<id>/viewer/…``
 over the bundle a job saved (``viewer.bundle.load_bundle``); ``/viewer/map/<name>/`` and
 ``/viewer/job/<id>/`` are the same routes as stable page URLs (the page's own URLs are relative).
-``/`` is the web application's placeholder page.
+``/`` is the web application (``web/static``: plain ES modules built only on the public API);
+``/static/…`` serves its files, ``/static/viewer/…`` the viewer's own modules and vendored
+libraries (which the 3D scene viewer reuses), and ``/static/openlabel_json_schema.json`` the
+vendored scene schema that the browser validates scene documents against.
 
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
 come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
@@ -17,6 +20,7 @@ type a cross-site page cannot send without a CORS preflight, which this service 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -27,6 +31,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -70,9 +75,16 @@ HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at mo
 SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
                         "multipart/form-data"})  # what a cross-site form sends without a preflight
 VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
+DISPLAY_DIR = "display"  # a job's PLY files as the viewer draws them (cloud documents)
 _MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
           ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 Json = dict[str, Any]
+WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
+VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
+SCHEMA_FILE = Path(str(resources.files("oh_my_slam.schema") / "openlabel_json_schema.json"))
+_STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
+                 ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
+                 ".txt": "text/plain"}
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -172,6 +184,8 @@ class Service:
     _hosts_at: float = 0.0
     _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
     _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
+    _building: dict[Path, Any] = field(default_factory=dict)  # display_cloud builds in flight
+    _building_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         if self.runner.reevaluate is None:  # a conditional job's inference need, at its start
@@ -274,6 +288,53 @@ class Service:
 
         return self._job_views.get(jid, make)
 
+    def display_cloud(self, jid: str, path: Path) -> Path:
+        """A PLY file of a job as the viewer draws it (the 3D scene viewer): the viewer's cloud
+        document, within the display budget (spec §2.5), with the file's header comments.
+
+        The document is kept as a file in the job's own folder (``display/``, deleted with the
+        job), never in memory, and built once per file version: concurrent requests for the same
+        file wait for the one build (its future), others build in parallel."""
+        from concurrent.futures import Future
+
+        from oh_my_slam.viewer import bundle
+
+        st = path.stat()
+        key = f"{path.name}|{st.st_mtime_ns}|{st.st_size}|{bundle.DISPLAY_POINT_BUDGET}"
+        target = self.workspace.job_dir(jid) / DISPLAY_DIR / (
+            hashlib.sha256(f"{path}|{key}".encode()).hexdigest()[:32] + ".cloud")
+        if target.is_file():
+            return target
+        with self._building_lock:
+            fut = self._building.get(target)
+            mine = fut is None
+            if mine:
+                fut = self._building[target] = Future()
+        assert fut is not None
+        if not mine:
+            return fut.result()
+        try:
+            from oh_my_slam.viewer.routes import cloud_document
+
+            dc, comments = bundle.ply_display(path)
+            attrs = next((c.removeprefix("attributes ") for c in comments
+                          if c.startswith("attributes ")), "")
+            doc = cloud_document(dc, attrs, {"comments": comments})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            part = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+            with part.open("wb") as f:
+                for piece in doc.pieces:
+                    f.write(piece)
+            part.replace(target)
+            fut.set_result(target)
+            return target
+        except BaseException as exc:
+            fut.set_exception(exc)
+            raise
+        finally:
+            with self._building_lock:
+                self._building.pop(target, None)
+
 
 def _viewer_response(r: Any, method: str) -> Response:
     """A ``viewer.routes.Response`` as a Starlette response (its pieces streamed in order)."""
@@ -347,7 +408,26 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             return None  # refused by prepare as not an object
 
     async def index(request: Request) -> Response:
-        return Response(PLACEHOLDER, media_type="text/html")
+        return FileResponse(WEB_STATIC / "index.html", media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": "no-cache"})
+
+    async def static(request: Request) -> Response:
+        """The web application's files; ``viewer/…`` the viewer's (its modules and vendored
+        libraries); ``openlabel_json_schema.json`` the scene schema."""
+        rel = request.path_params["path"]
+        if rel == SCHEMA_FILE.name:
+            return FileResponse(SCHEMA_FILE, media_type="application/json")
+        root = WEB_STATIC
+        if rel.startswith("viewer/"):
+            root, rel = VIEWER_STATIC, rel.removeprefix("viewer/")
+        try:
+            target = (root / rel).resolve()
+        except (ValueError, OSError):  # e.g. an embedded NUL byte
+            target = root
+        if root.resolve() not in target.parents or not target.is_file():
+            raise NotFoundError(f"no file {request.path_params['path']}")
+        media = _STATIC_TYPES.get(target.suffix) or mimetypes.guess_type(target.name)[0]
+        return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     async def health(request: Request) -> Response:
         return JSONResponse(await run_in_threadpool(service.health))
@@ -492,6 +572,49 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             raise NotFoundError(f"no file {request.path_params['path']} in job {jid}")
         return FileResponse(p, media_type=media_of(jid, p), filename=p.name)
 
+    async def display_cloud(request: Request) -> Response:
+        """A job's PLY (``?file=<path>``, else its result) as the viewer draws it."""
+        from oh_my_slam.web.workspace import inside
+
+        j = runner.get(request.path_params["id"])
+        rel = request.query_params.get("file")
+        if rel is None:
+            if j.state != "succeeded" or j.result_name is None:
+                return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
+            rel = j.result_name
+        p = inside(out_dir(j.id), rel)
+        if not p.is_file():
+            raise NotFoundError(f"no file {rel} in job {j.id}")
+        try:
+            doc = await run_in_threadpool(service.display_cloud, j.id, p)
+        except (ValueError, KeyError, UnicodeDecodeError) as exc:
+            return _error(400, "usage", f"{rel} is not a PLY file the viewer can draw: {exc}")
+        return FileResponse(doc, media_type="application/octet-stream")
+
+    async def display_transform(request: Request) -> Response:
+        """The viewer's display transform of a scene: identity for map coordinates; for a single
+        image's camera frame view.sh's upright transform, with the estimated ``up=x,y,z`` when the
+        scene states one. The frame is decided by the viewer's one rule (``is_camera_frame``),
+        from a scene JSON's coordinate-system types (``cs_types=a,b``) or a PLY's header
+        ``comment``s; ``camera=true`` states it outright."""
+        from oh_my_slam.viewer.bundle import display_transform as transform
+        from oh_my_slam.viewer.bundle import is_camera_frame
+
+        q = request.query_params
+        up: list[float] | None = None
+        if q.get("up"):
+            try:
+                up = [float(x) for x in q["up"].split(",")]
+            except ValueError:
+                up = []
+            if len(up) != 3:
+                return _error(400, "usage", "up must be x,y,z: three numbers")
+        cs_types = None if "cs_types" not in q else [t for t in q["cs_types"].split(",") if t]
+        camera = q.get("camera", "").lower() in ("1", "true", "yes") or \
+            await run_in_threadpool(is_camera_frame, q.getlist("comment"), cs_types)
+        matrix = await run_in_threadpool(transform, camera, up)
+        return JSONResponse({"camera_frame": camera, "display_transform": matrix})
+
     async def log(request: Request) -> Response:
         p = ws.job_dir(runner.get(request.path_params["id"]).id) / "stderr.log"
         return PlainTextResponse(p.read_text("utf-8", "replace") if p.is_file() else "")
@@ -541,6 +664,7 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
 
     routes = [
         Route("/", index),
+        Route("/static/{path:path}", static),
         Route("/api/health", health),
         Route("/api/openapi.json", openapi_doc),
         Route("/api/operations", describe),
@@ -563,6 +687,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         Route("/api/jobs/{id}/result", result),
         Route("/api/jobs/{id}/files", files),
         Route("/api/jobs/{id}/files/{path:path}", job_file),
+        Route("/api/jobs/{id}/display-cloud", display_cloud),
+        Route("/api/display-transform", display_transform),
         Route("/api/jobs/{id}/log", log),
         Route("/api/jobs/{id}/timings", timings),
         Route("/api/jobs/{id}/viewer", job_viewer),
@@ -592,16 +718,3 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         NotFoundError: not_found, JobError: job_error, OhMySlamError: command_error,
         ClientDisconnect: disconnect})
     return guard(app, service)
-
-
-PLACEHOLDER = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport"
-content="width=device-width, initial-scale=1"><title>oh-my-slam</title>
-<style>:root{color-scheme:light dark}body{font:16px/1.5 system-ui,sans-serif;margin:2rem;
-max-width:48rem}</style></head>
-<body><h1>oh-my-slam</h1>
-<p>The web service is running. Its API is described at
-<a href="/api/openapi.json">/api/openapi.json</a>; health at <a href="/api/health">/api/health</a>,
-jobs at <a href="/api/jobs">/api/jobs</a>, maps at <a href="/api/maps">/api/maps</a>.</p>
-</body></html>
-"""

@@ -128,7 +128,11 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     update = {x["name"]: x for x in ops["mapper.sh update"]["parameters"]}
     assert update["fps"]["default"] == 2.0 and update["fps"]["exclusive_minimum"] == 0
     assert update["fps"]["omit_if_default"] is True
-    assert update["fps"]["applies"] == [{"option": "inputs", "is": "video"}]
+    (video,) = update["fps"]["applies"]
+    assert video["option"] == "inputs" and video["is"] == "video" and ".mp4" in video["suffixes"]
+    assert set(video["suffixes"]) <= set(update["inputs"]["accepts"])
+    seg_d = {o["name"]: o for o in ops["segment.sh -i"]["outputs"]}
+    assert seg_d["segmented.png"]["object_regions"] and not seg_d["catalog.csv"]["object_regions"]
     assert update["inputs"]["ordered"] is True and ".mp4" in update["inputs"]["accepts"]
     assert update["map"]["must_exist"] is False
     assert ops["mapper.sh locate"]["inference"] == "conditional"

@@ -13,6 +13,7 @@ re-check every row below. These matter most:
 **Redistributed in this repository:**
 
 * three.js (vendored browser library)
+* axe-core (vendored for the browser tests only; MPL-2.0)
 * the ASAM OpenLABEL JSON schema
 * 10 of the 19 palette colours and the 11 viridis samples in `segmentation/colors.py`
 * the label list in `segmentation/data/default_labels.txt`
@@ -103,6 +104,16 @@ rows are listed because they are copyleft or otherwise notable:
 | Component | Version | Licence |
 |---|---|---|
 | three.js: `three.module.js`, `three.core.js` and the addons `OrbitControls`, `LineSegments2`, `LineMaterial`, `LineSegmentsGeometry` | 0.186.0 (r186), from the npm tarball recorded in `VERSIONS.txt` | MIT (`vendor/three/LICENSE`) |
+
+The `server.sh` web application (`src/oh_my_slam/web/static/`) vendors nothing more: it reuses the
+viewer's modules and three.js above, and validates scene documents in the browser with its own
+small draft-07 validator (`js/scene/jsonschema.js`, this project's code).
+
+## Test-only browser libraries (vendored in `tests/browser/vendor/`, never served)
+
+| Component | Version | Used for | Licence |
+|---|---|---|---|
+| axe-core: `axe.min.js` | 4.13.0, from the npm package `axe-core@4.13.0` (sha256 `c24f097b…a0c1`, which matches its published SRI `sha256-wk8Je9L0…RwoME=`) | The browser tests' automatic accessibility check of every page (WCAG 2.1 A and AA rules) | MPL-2.0 (`vendor/axe-core/LICENSE`; its bundled third-party notices in `LICENSE-3RD-PARTY.txt`) |
 
 ## Data, specifications and design assets
 
