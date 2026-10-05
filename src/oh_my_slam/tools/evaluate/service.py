@@ -73,6 +73,8 @@ APP_PAGES = ("#/image", "#/maps", "#/maps/{map}", "#/jobs", "#/jobs/{job}", "#/s
 READY_JS = ("() => document.readyState === 'complete' && document.body !== null && "
             "(document.body.dataset.ready === 'true' || "
             "document.querySelector('script') === null)")
+ROUTED_JS = ("(where) => !window.__app || !window.__app.lastRoute || "
+             "window.__app.lastRoute.where === where")  # the app's own route timing
 RENDER_TIMEOUT_MS = 60_000
 AXE = REPO / "tests" / "browser" / "vendor" / "axe-core" / "axe.min.js"
 UI_TESTS = "tests/browser/test_webapp*.py"
@@ -81,6 +83,13 @@ PERF_METRICS = ("start_s", "resident_mb", "app_render_s", "read_latency_median_m
                 "read_latency_p95_ms", "read_latency_busy_p95_ms", "job_overhead_median_s")
 PARITY_METRICS = ("mismatched", "unverifiable", "operations_covered_fraction")
 UI_METRICS = ("tests_failed", "tests_run", "a11y_violations")
+
+
+def app_urls(base: str, map_name: str | None, job: str | None) -> list[str]:
+    """The web application's pages checked by axe-core, as absolute URLs (the map and job pages
+    only when there is a map and a job to show)."""
+    pages = [p for p in APP_PAGES if ("{map}" not in p or map_name) and ("{job}" not in p or job)]
+    return [base.rstrip("/") + "/" + p.format(map=map_name or "", job=job or "") for p in pages]
 
 
 def metric_ids() -> list[str]:
@@ -590,10 +599,9 @@ class ServiceEvaluation:
                                "params": case.params}
         first, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell")
         self._set_map_aside(case, f"parity_{n:02d}_shell")
-        second = None
-        if not case.browser:
-            second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
-            self._set_map_aside(case, f"parity_{n:02d}_shell_again")
+        # the control: the same command again, with the same (replayed) inference
+        second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
+        self._set_map_aside(case, f"parity_{n:02d}_shell_again")
         job = self.job_outcome(case)
         if not first.ok or not job.ok:
             row.update(status="mismatch", why=first.error if not first.ok else
@@ -602,12 +610,12 @@ class ServiceEvaluation:
         diffs = differences(first, job)
         if not diffs:
             row["status"] = "identical"
-        elif second is not None and second.ok and differences(first, second):
+        elif second.ok and differences(first, second):
             row.update(status="unverifiable", why="the command's own two runs differ: "
                        + "; ".join(differences(first, second)[:3]), job=diffs[:5])
         else:
             row.update(status="mismatch", why="; ".join(diffs[:5]))
-        if second is not None and second.ok and job.wall_s is not None \
+        if second.ok and job.wall_s is not None \
                 and second.wall_s is not None and case.op not in self.overheads:
             self.overheads[case.op] = {"job_s": round(job.wall_s, 3),
                                        "shell_s": round(second.wall_s, 3),
@@ -695,8 +703,7 @@ class ServiceEvaluation:
                 return
             render, error = self.render(browser, self.api.base)
             m.add(ids[0], render, error=error)
-            pages = [p.format(map=inputs.map or "", job=self.first_job or "")
-                     for p in APP_PAGES]
+            pages = app_urls(self.api.base, inputs.map, self.first_job)
             found, error = self.a11y(browser, pages)
             m.add(ids[1], None if found is None else sum(len(v) for v in found.values()),
                   {"pages": found}, error=error)
@@ -725,6 +732,9 @@ class ServiceEvaluation:
             for url in urls:
                 page.goto(url, timeout=RENDER_TIMEOUT_MS)
                 page.wait_for_function(READY_JS, timeout=RENDER_TIMEOUT_MS)
+                # a hash route renders in place: wait for the app to have routed to this page
+                where = url.split("#/", 1)[1].split("?")[0] if "#/" in url else ""
+                page.wait_for_function(ROUTED_JS, arg=where, timeout=RENDER_TIMEOUT_MS)
                 for frame in page.frames:
                     if frame.url.startswith("http") and not frame.evaluate("() => !!window.axe"):
                         frame.add_script_tag(path=str(AXE))

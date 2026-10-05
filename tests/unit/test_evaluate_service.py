@@ -107,6 +107,17 @@ def test_the_command_line_of_a_case_is_the_services() -> None:
     assert sv.operation_id(ops["mapper.sh locate"]) == "mapper-locate"
 
 
+def test_the_accessibility_check_visits_absolute_page_urls() -> None:
+    base = "http://127.0.0.1:5000/"
+    assert sv.app_urls(base, "reference", "j1") == [
+        "http://127.0.0.1:5000/#/image", "http://127.0.0.1:5000/#/maps",
+        "http://127.0.0.1:5000/#/maps/reference", "http://127.0.0.1:5000/#/jobs",
+        "http://127.0.0.1:5000/#/jobs/j1", "http://127.0.0.1:5000/#/scene"]
+    assert sv.app_urls(base, None, None) == [
+        "http://127.0.0.1:5000/#/image", "http://127.0.0.1:5000/#/maps",
+        "http://127.0.0.1:5000/#/jobs", "http://127.0.0.1:5000/#/scene"]
+
+
 def test_differences_name_what_differs() -> None:
     a = sv.Outcome(True, result=b"abcdef", files={"f/x.json": b"1", "f/y.png": b"2"})
     assert sv.differences(a, a) == []
