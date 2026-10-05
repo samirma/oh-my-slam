@@ -657,14 +657,15 @@ def _value(value: Any) -> str:
     return f"./{text}" if text.startswith("-") else text
 
 
-def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Namespace:
-    """The command's parsed arguments for API parameters (option name → value; a list for an
-    option that takes several values): the argv the command would get, parsed by its own parser,
-    so a bad value is a :class:`ParameterError` with argparse's message and the parameters it
-    concerns. Parameters that are None, and those equal to the default of an ``omit_if_default``
-    option, are not passed."""
+def argv_of(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[str]:
+    """The command line (after the program name) for API parameters (option name → value; a list
+    for an option that takes several values): what :func:`parse` parses, and what the web service
+    runs the command with. Parameters that are None, and those equal to the default of an
+    ``omit_if_default`` option, are not passed. An unknown parameter is a
+    :class:`ParameterError`."""
     opts = cmd.mode_options(mode)
-    unknown = sorted(set(params) - {o.name for o in opts})
+    names = {o.name for o in opts}
+    unknown = sorted(n for n, v in params.items() if v is not None and n not in names)
     if unknown:
         raise ParameterError(f"unrecognized parameters for {cmd.label(mode)}: "
                              f"{', '.join(unknown)}", tuple(unknown))
@@ -681,7 +682,14 @@ def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Names
             argv += [o.flag, *map(_value, values)]
         else:  # flag=value: a value that starts with "-" stays a value
             argv += [f"{o.flag}={_text(x)}" for x in values]
-    return build_parser(program_of(cmd), RaisingParser).parse_args(argv)
+    return argv
+
+
+def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Namespace:
+    """The command's parsed arguments for API parameters: the argv the command would get
+    (:func:`argv_of`), parsed by its own parser, so a bad value is a :class:`ParameterError` with
+    argparse's message and the parameters it concerns."""
+    return build_parser(program_of(cmd), RaisingParser).parse_args(argv_of(cmd, mode, params))
 
 
 def validate(cmd: Command, args: argparse.Namespace,
