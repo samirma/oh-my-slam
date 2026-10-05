@@ -11,6 +11,12 @@ kept in memory, by ``segmentation.cloud.derive_cloud`` with the §2.2 attributes
 (validated by ``core.cloud_attrs``), so changing a control never re-runs inference. Camera poses are
 read from the scene description, so the viewer shows exactly the poses the JSON states. No
 inference, point-cloud generation, OBB fitting, identity or colour logic lives here.
+
+A bundle can be saved and loaded again (:func:`save_bundle`, :func:`load_bundle`): what the page
+shows plus the cloud source as computed, so a saved image bundle serves the same viewer — every
+live control included — without re-running inference. ``python -m oh_my_slam.viewer.bundle save
+<dir> image|map <path>`` is the entry point the ``server.sh`` web service runs as a job for
+``view.sh -i`` / ``-m``; a map is saved as a reference to the map folder (it is persisted already).
 """
 
 from __future__ import annotations
@@ -318,3 +324,126 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
         # the page's first cloud request finds it ready (the request waits for it otherwise)
         threading.Thread(target=bundle.prepare, name="display-selection", daemon=True).start()
     return bundle
+
+
+# ------------------------------------------------------------------------------------------------
+# saving and loading
+
+BUNDLE_JSON = "bundle.json"
+ARRAYS = "source.npz"
+SEGMENTED_PNG = "segmented.png"
+
+
+def save_bundle(bundle: ViewBundle, folder: Path) -> None:
+    """Write ``bundle`` into ``folder`` (replaced atomically): its page data as JSON, the cloud
+    source's arrays as ``.npz`` and the segmented image."""
+    import dataclasses
+    import json
+    import shutil
+
+    from oh_my_slam.segmentation.cloud import MapCloudSource
+
+    folder = Path(folder)
+    tmp = folder.with_name(f".{folder.name}.tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    src = bundle.source
+    fields = [f.name for f in dataclasses.fields(src)]
+    arrays = {n: getattr(src, n) for n in fields if isinstance(getattr(src, n), np.ndarray)}
+    np.savez(tmp / ARRAYS, **arrays)
+    meta = {
+        "mode": bundle.mode, "title": bundle.title, "scene": bundle.scene,
+        "catalog": bundle.catalog, "display_transform": bundle.display_transform,
+        "camera_sources": bundle.camera_sources, "point_budget": bundle.point_budget,
+        "source": {"kind": "map" if isinstance(src, MapCloudSource) else "image",
+                   "values": {n: dataclasses.asdict(v) for n in fields
+                              if dataclasses.is_dataclass(v := getattr(src, n))}},
+    }
+    (tmp / BUNDLE_JSON).write_text(json.dumps(meta))
+    if bundle.segmented_png is not None:
+        (tmp / SEGMENTED_PNG).write_bytes(bundle.segmented_png)
+    shutil.rmtree(folder, ignore_errors=True)
+    tmp.replace(folder)
+
+
+def save_map_reference(map_dir: Path, folder: Path) -> None:
+    """A map bundle is the map itself: record which map (opened read-only, so it is one)."""
+    import json
+
+    from oh_my_slam.mapping.store import MapReader
+
+    root = MapReader(Path(map_dir)).root
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / BUNDLE_JSON).write_text(json.dumps({"mode": "map", "map": str(root)}))
+
+
+def saved_map(folder: Path) -> Path | None:
+    """The map a saved bundle refers to, or None for a saved image bundle."""
+    import json
+
+    meta = json.loads((Path(folder) / BUNDLE_JSON).read_text())
+    return Path(meta["map"]) if "map" in meta else None
+
+
+def load_bundle(folder: Path) -> ViewBundle:
+    """The bundle :func:`save_bundle` wrote (a map reference opens the map: :func:`map_bundle`)."""
+    import json
+
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.segmentation.cloud import MapCloudSource
+
+    folder = Path(folder)
+    meta = json.loads((folder / BUNDLE_JSON).read_text())
+    if "map" in meta:
+        return map_bundle(Path(meta["map"]))
+    with np.load(folder / ARRAYS) as npz:
+        values: dict[str, Any] = {k: npz[k] for k in npz.files}
+    for name, v in meta["source"]["values"].items():
+        values[name] = Intrinsics(**v)
+    cls = MapCloudSource if meta["source"]["kind"] == "map" else ImageCloudSource
+    png = folder / SEGMENTED_PNG
+    return ViewBundle(
+        mode=meta["mode"], title=meta["title"], scene=meta["scene"], source=cls(**values),
+        catalog=meta["catalog"], segmented_png=png.read_bytes() if png.is_file() else None,
+        display_transform=meta["display_transform"], camera_sources=meta["camera_sources"],
+        point_budget=meta["point_budget"])
+
+
+def _save_main(argv: list[str]) -> int:
+    """``save <dir> image <image>``: reconstruct and segment once (view.sh -i's stages) and save
+    the bundle; ``save <dir> map <map>``: record the map."""
+    import argparse
+
+    from oh_my_slam.core import timing
+    from oh_my_slam.core.log import claim_stdout
+    from oh_my_slam.core.timing import Stage
+
+    ap = argparse.ArgumentParser(prog="oh_my_slam.viewer.bundle")
+    ap.add_argument("action", choices=["save"])
+    ap.add_argument("folder", type=Path)
+    ap.add_argument("kind", choices=["image", "map"])
+    ap.add_argument("path", type=Path)
+    args = ap.parse_args(argv)
+    claim_stdout()  # nothing reaches stdout
+    if args.kind == "map":
+        save_map_reference(args.path, args.folder)
+        return 0
+    from oh_my_slam.reconstruction.api import connect_server
+
+    with timing.collect():
+        with timing.stage(Stage.CONNECT):
+            client = connect_server()  # exit 3 with the hint when the server is down
+        log.info("reconstructing and segmenting %s …", args.path.name)
+        with timing.stage(Stage.INFERENCE):
+            bundle = image_bundle(args.path, client)
+        save_bundle(bundle, args.folder)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    from oh_my_slam.core.process import run_main
+
+    run_main("view.sh", _save_main, _sys.argv[1:])

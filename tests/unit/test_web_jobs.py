@@ -43,15 +43,15 @@ def svc(tmp_path: Path) -> Iterator[tuple[Service, TestClient]]:
     ws = Workspace(tmp_path / "data")
     ws.create()
     runner = Runner(ws, stop_grace_s=60)
-    service = Service(ws, runner, url="http://0.0.0.0:0/")
+    service = Service(ws, runner, url="http://0.0.0.0:0/", extra_hosts={"testserver"})
     with TestClient(create_app(service)) as client:
         yield service, client
     runner.shutdown()
 
 
-def run_job(service: Service, client: TestClient, op: str, params: dict, timeout: float = 300
-            ) -> dict:
-    r = client.post(f"/api/ops/{op}", json=params)
+def run_job(service: Service, client: TestClient, op: str, params: dict, timeout: float = 300,
+            query: str = "") -> dict:
+    r = client.post(f"/api/ops/{op}{query}", json=params)
     assert r.status_code == 202, r.json()
     job = service.runner.wait(r.json()["id"], timeout)
     assert job.state == "succeeded", (job.error, job.log_tail)
@@ -135,30 +135,56 @@ def test_cancelled_map_update_leaves_the_map_unchanged(stub_server: None,
             and time.monotonic() < deadline:
         time.sleep(0.05)  # well inside the update: inference or reconstruction running
     assert service.runner.get(jid).state == "running"
-    assert client.post(f"/api/jobs/{jid}/cancel").status_code == 200
+    assert client.post(f"/api/jobs/{jid}/cancel", json={}).status_code == 200
     job = service.runner.wait(jid, 120)
     assert job.state == "cancelled", job.log_tail
     assert store.full_tree_hash(ws.maps / "m") == before
     assert json.loads((ws.maps / "m" / "map.json").read_text())["update_count"] == 1
 
 
-def test_map_viewer_and_view_job_viewer(svc: tuple[Service, TestClient]) -> None:
+def test_map_viewer_and_saved_job_viewers(stub_server: None,
+                                          svc: tuple[Service, TestClient]) -> None:
+    """The viewer of a map, of a view.sh -i / -m job and of an image job that asked for it, all
+    served in-process by the viewer's own routes; a job's saved viewer survives a restart."""
     service, client = svc
-    minimal_map(service.workspace.maps / "m")
+    ws = service.workspace
+    minimal_map(ws.maps / "m")
     page = client.get("/viewer/map/m/")
     assert page.status_code == 200 and b"<html" in page.content.lower()
     assert client.get("/viewer/map/m/api/meta").json()["mode"] == "map"
+    assert client.get("/api/maps/m/viewer/api/meta").json()["mode"] == "map"
     assert client.get("/viewer/map/m/api/cloud?label=on").status_code == 400  # the viewer's own
     assert client.head("/viewer/map/m/api/meta").status_code == 200
 
-    r = client.post("/api/ops/view-map", json={"map": "m"})
-    assert r.status_code == 202, r.json()
-    assert "--no-browser" in r.json()["command"]  # the service shows the viewer itself
-    job = service.runner.wait(r.json()["id"], 120)
-    assert job.state == "succeeded" and job.viewer == f"/viewer/job/{job.id}/"
-    meta = client.get(f"/viewer/job/{job.id}/api/meta")
-    assert meta.status_code == 200 and meta.json()["mode"] == "map"
-    assert client.get(f"/viewer/job/{job.id}/").status_code == 200
-    service.runner.shutdown()  # the viewer process closes with the service
-    assert service.runner.get(job.id).viewer is None
-    assert client.get(f"/viewer/job/{job.id}/api/meta").status_code == 410
+    job = run_job(service, client, "view-map", {"map": "m"})
+    assert client.get(f"/viewer/job/{job['id']}/api/meta").json()["mode"] == "map"
+
+    image = jpeg(ws.root / "inputs" / "photo.jpg").read_bytes()
+    octet = {"content-type": "application/octet-stream"}
+    up = client.post("/api/uploads?name=photo.jpg", headers=octet, content=image).json()
+    job = run_job(service, client, "view-image", {"image": up["path"]})
+    assert job["viewer"] == f"/viewer/job/{job['id']}/"
+    assert not (ws.uploads / up["id"]).exists()  # the viewer keeps what it needs, not the upload
+    meta = client.get(f"/api/jobs/{job['id']}/viewer/api/meta").json()
+    assert meta["mode"] == "image" and meta["title"] == "photo.jpg"
+    cloud = client.get(f"/viewer/job/{job['id']}/api/cloud?stride=2&normals=on")
+    assert cloud.status_code == 200  # the live controls re-derive from the saved source
+    seg_png = client.get(f"/viewer/job/{job['id']}/api/segmented.png")
+    assert seg_png.status_code == 200 and seg_png.content[:4] == b"\x89PNG"
+
+    # one upload, one job: the command's result and the image's viewer
+    up = client.post("/api/uploads?name=photo.jpg", headers=octet, content=image).json()
+    both = run_job(service, client, "segment-image", {"image": up["path"]}, query="?viewer=true")
+    assert both["result"]["name"] == "result.json" and both["viewer"]
+    assert client.get(f"/viewer/job/{both['id']}/api/meta").json()["mode"] == "image"
+    assert not (ws.uploads / up["id"]).exists()
+
+    # after a restart (a new runner and service on the same workspace) the viewer is still there
+    again = Runner(ws)
+    again.load()
+    fresh = Service(ws, again, extra_hosts={"testserver"})
+    with TestClient(create_app(fresh)) as c2:
+        r = c2.get(f"/viewer/job/{job['id']}/api/catalog")
+        assert r.status_code == 200
+        assert r.json() == client.get(f"/viewer/job/{job['id']}/api/catalog").json()
+    again.shutdown()

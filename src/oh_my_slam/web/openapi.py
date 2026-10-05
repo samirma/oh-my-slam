@@ -65,6 +65,10 @@ def _body(d: Json) -> Json:
     }}}}
 
 
+_VIEWER_PARAM = [{"name": "viewer", "in": "query", "required": False,
+                  "schema": {"type": "boolean", "default": False},
+                  "description": "also save the viewer of the request's image (one more step of "
+                                 "the same job, which runs inference for it once more)"}]
 _ERROR = {"$ref": "#/components/responses/Error"}
 _JOB = {"description": "the job", "content": {"application/json": {
     "schema": {"$ref": "#/components/schemas/Job"}}}}
@@ -93,7 +97,7 @@ def _fixed() -> Json:
                                      "description": "the file name (its suffix tells its type)"}],
                      "requestBody": {"content": {"application/octet-stream": {}}},
                      "responses": {"201": {"description": "the upload: use its path as an input"},
-                                   "4XX": _ERROR}}},
+                                   "413": _ERROR, "4XX": _ERROR}}},
         "/api/uploads/{id}": {"delete": {"summary": "discard an unconsumed upload",
                                          "parameters": job_id,
                                          "responses": {"204": {"description": "deleted"},
@@ -105,6 +109,14 @@ def _fixed() -> Json:
         "/api/maps/{name}/files/{path}": {"get": {"summary": "a file of a map (read-only)",
                                                   "parameters": [*name, *path],
                                                   "responses": _ok("the file", "*/*")}},
+        "/api/maps/{name}/viewer/{path}": {"get": {
+            "summary": "the viewer (spec 2.5) of a map: its page, scripts and data, served by the "
+                       "viewer's own routes; also at /viewer/map/{name}/",
+            "parameters": [*name, *path], "responses": _ok("viewer page or data", "*/*")}},
+        "/api/jobs/{id}/viewer/{path}": {"get": {
+            "summary": "the viewer a job saved (view.sh jobs, or ?viewer=true); also at "
+                       "/viewer/job/{id}/",
+            "parameters": [*job_id, *path], "responses": _ok("viewer page or data", "*/*")}},
         "/api/jobs": {"get": {"summary": "every job, oldest first", "responses": _ok("jobs")}},
         "/api/jobs/events": {"get": {"summary": "server-sent events: every job change",
                                      "responses": _ok("events", "text/event-stream")}},
@@ -147,6 +159,7 @@ def document(ops: dict[str, Operation]) -> Json:
             "operationId": op.id, "summary": summary, "tags": [d["prog"]],
             "description": f"Runs `{d['id']}` as a job. Inference: {d['inference']} "
                            f"({d['inference_text']}).",
+            "parameters": _VIEWER_PARAM if op.viewer_input is not None and not op.browser else [],
             "requestBody": _body(d),
             "responses": {"202": _JOB, "4XX": _ERROR, "503": _ERROR},
             "x-oms": d,

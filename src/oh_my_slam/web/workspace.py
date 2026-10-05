@@ -89,6 +89,10 @@ class Workspace:
             raise OutsideWorkspaceError(
                 f"{value} resolves outside the workspace {self.root}; upload the file or use a "
                 "path inside the workspace")
+        if any(part.startswith(".") for part in real.relative_to(self.root).parts):
+            raise OutsideWorkspaceError(
+                f"{value}: hidden entries of the workspace (an upload still arriving, a map's "
+                ".staging) are not inputs")
         return real
 
     def map_path(self, value: str) -> Path:

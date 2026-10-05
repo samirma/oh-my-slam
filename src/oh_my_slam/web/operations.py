@@ -1,16 +1,23 @@
 """One API operation per command mode, derived from ``oh_my_slam.commands.spec`` (spec §2.6
 "Single source of truth"): nothing here names a command, a mode or an option. A request — option
-name → value — becomes the command's own command line in four generic steps, by option kind:
+name → value — becomes the command's own command line in generic steps, by option kind:
 
 * path inputs (``Kind.IMAGE`` …, ``Kind.MAP``) are workspace paths, resolved and confined to the
   workspace (an upload is ``uploads/<id>/<file>``; a map is ``<name>`` or ``maps/<name>``);
 * the result file (``Kind.FILE_OUT``, ``-o``) and the artefact folder (``Kind.FOLDER_OUT``,
   ``-d``) are plain names inside the job's ``out/`` folder (the result defaults to
   ``result.<ext>`` of the result's format), so every result is a file of the job;
-* a mode whose output is the browser (``view.sh``) never opens one on the service's machine: its
-  viewer is served by the service (``BROWSER_FLAG``);
 * the command's own parser and rules then check the request (``spec.dry_run``), so the messages
-  are the command's and nothing is queued for an invalid request.
+  are the command's and nothing is queued for an invalid request; ``spec.needs_inference`` says
+  whether the job joins the inference queue.
+
+A job is a list of steps, each a Python entry point run as a subprocess: the command itself
+(``oh_my_slam.cli.<command>``), and — for a mode whose output is the browser (``view.sh``), or a
+single-image request that asks for its viewer — the viewer's own bundle writer
+(``python -m oh_my_slam.viewer.bundle save``), which saves the viewer's data in the job's
+``viewer/`` folder, so that the service serves that viewer in-process, after a page reload or a
+service restart too. A browser mode runs only that step: opening a browser and serving the page
+are the service's part.
 """
 
 from __future__ import annotations
@@ -26,9 +33,10 @@ from oh_my_slam.core.errors import HTTP_STATUS, ExitCode, OhMySlamError, UsageEr
 
 PATH_IN = frozenset({Kind.IMAGE, Kind.IMAGES, Kind.IMAGES_OR_VIDEO, Kind.MAP})
 OUT_DIR = "out"  # the job's folder for everything the command writes
-# The option that keeps a command whose output is the browser from opening one (view.sh): the
-# service shows that viewer itself, under /viewer/job/<id>/.
-BROWSER_FLAG = "no_browser"
+VIEWER_DIR = "viewer"  # the job's saved viewer bundle
+VIEWER_MODULE = "oh_my_slam.viewer.bundle"
+VIEWER_PROG = "view.sh"  # the viewer step reports its errors as view.sh does
+VIEWER_KINDS = {Kind.IMAGE: "image", Kind.MAP: "map"}
 EXTENSIONS = {"json": ".json", "ply": ".ply", "png": ".png", "csv": ".csv", "markdown": ".md",
               "html": ".html"}
 
@@ -64,9 +72,15 @@ class Operation:
         return any(o.via == "browser" for o in self.mode.outputs)
 
     @property
-    def uses_inference(self) -> bool:
-        """Runs in the inference queue: the mode needs the inference server, or may need it."""
-        return self.mode.inference != "never"
+    def viewer_input(self) -> spec.Option | None:
+        """The input a viewer of a request shows: a browser mode's selector (else its first image
+        or map input); for any other mode its single image, if it takes one."""
+        opts = self.options
+        if self.browser:
+            found = [o for o in opts if o.name == self.mode.selector and o.kind in VIEWER_KINDS]
+            found += [o for o in opts if o.kind in VIEWER_KINDS]
+            return found[0] if found else None
+        return next((o for o in opts if o.kind is Kind.IMAGE), None)
 
     def writes_map(self) -> spec.Option | None:
         """The option naming the map the mode writes (an output written ``via`` that option)."""
@@ -84,16 +98,28 @@ def problem(parameters: tuple[str, ...], message: str, code: ExitCode = ExitCode
 
 
 @dataclass
+class Step:
+    """One subprocess of a job: ``python -m <module> <argv>``; ``prog`` names its error lines."""
+
+    prog: str
+    module: str
+    argv: list[str]
+    timings: bool = True  # records OH_MY_SLAM_TIMINGS (the command's own record)
+
+
+@dataclass
 class Prepared:
-    """A request turned into the command's command line, or the problems that refuse it."""
+    """A request turned into the job's steps, or the problems that refuse it."""
 
     problems: list[Problem] = field(default_factory=list)
-    argv: list[str] = field(default_factory=list)  # after ``python -m <module>``
+    steps: list[Step] = field(default_factory=list)
     command: list[str] = field(default_factory=list)  # as typed, with workspace paths
     uploads: list[str] = field(default_factory=list)
     writes: str | None = None  # the map folder the job writes
     result: str | None = None  # the -o file name in out/
     result_format: str | None = None
+    inference: bool = True  # the job uses the inference server
+    viewer: bool = False  # the job saves a viewer
 
 
 def _values(v: Any) -> list[Any]:
@@ -113,9 +139,10 @@ def _result_format(op: Operation, params: Mapping[str, Any]) -> str | None:
     return None
 
 
-def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path) -> Prepared:
-    """Translate an API request into the command's command line and check it with the command's
-    own parser and rules (nothing is written)."""
+def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path, viewer: bool = False
+            ) -> Prepared:
+    """Translate an API request into the job's steps and check it with the command's own parser
+    and rules (nothing is written). ``viewer``: also save the viewer of the request's image."""
     from oh_my_slam.web.workspace import plain_name
 
     prep = Prepared()
@@ -161,8 +188,9 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path) -> Prepared:
                 actual[name] = shown[name] = value
         except OhMySlamError as exc:
             prep.problems.append(problem((name,), str(exc), exc.exit_code))
-    if op.browser and BROWSER_FLAG in by_name:
-        actual[BROWSER_FLAG] = shown[BROWSER_FLAG] = True
+    viewed = op.viewer_input
+    if viewer and not op.browser and (viewed is None or actual.get(viewed.name) is None):
+        prep.problems.append(problem((), f"{op.label} has no single image to show in a viewer"))
     if prep.problems:
         return prep
     file_out = next((o for o in op.options if o.kind is Kind.FILE_OUT), None)
@@ -173,10 +201,29 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path) -> Prepared:
             actual[file_out.name] = str(out / name)
             shown[file_out.name] = name
         prep.result = Path(actual[file_out.name]).name
+        for o in op.options:  # the result file and a -d folder never share a name
+            if o.kind is Kind.FOLDER_OUT and actual.get(o.name) is not None \
+                    and Path(actual[o.name]).name == prep.result:
+                prep.problems.append(problem((o.name,), f"{o.flag} {shown[o.name]} is the name of "
+                                             "the result file; give the folder another name"))
+        if prep.problems:
+            return prep
     prep.problems = spec.dry_run(op.command, op.mode, actual)
-    if not prep.problems:
-        prep.argv = spec.argv_of(op.command, op.mode, actual)
-        prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown)]
+    if prep.problems:
+        return prep
+    args = spec.parse(op.command, op.mode, actual)
+    prep.inference = spec.needs_inference(op.mode, args)
+    prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown)]
+    if not op.browser:
+        prep.steps.append(Step(op.program.prog, op.module,
+                               spec.argv_of(op.command, op.mode, actual)))
+    if (op.browser or viewer) and viewed is not None:
+        kind = VIEWER_KINDS[viewed.kind]
+        prep.steps.append(Step(VIEWER_PROG, VIEWER_MODULE,
+                               ["save", str(job_dir / VIEWER_DIR), kind, str(actual[viewed.name])],
+                               timings=op.browser))
+        prep.viewer = True
+        prep.inference = prep.inference or kind == "image"
     return prep
 
 

@@ -1,6 +1,7 @@
 """Jobs (spec §2.6 "Jobs"): each runs the command's own Python entry point
 (``python -m oh_my_slam.cli.<command>``, what ``scripts/_common.sh`` execs) as a subprocess in its
-own process group, so the web process never loads the pipeline, a model or torch.
+own process group, so the web process never loads the pipeline, a model or torch. A job that shows
+a viewer has a second step, the viewer's bundle writer (``web.operations``).
 
 * **States** are those of ``core.errors.job_state``: ``queued`` → ``running`` → ``succeeded`` |
   ``failed`` | ``cancelled``; a failure carries the command's own message (its ``<prog>: error:``
@@ -10,16 +11,18 @@ own process group, so the web process never loads the pipeline, a model or torch
   and ``done``/``total`` come from the command where it knows its size.
 * **Timings and logs**: ``OH_MY_SLAM_TIMINGS`` (``timings.json``) and every stderr line
   (``stderr.log``), in the command's own form.
-* **Order**: jobs that use (or may use) the inference server run one at a time, in submission
-  order; the others start at once. Two jobs never write the same map at once.
+* **Order**: jobs that use the inference server (``spec.needs_inference``) run one at a time, in
+  submission order; the others start at once, at most ``max_parallel`` together. Two jobs never
+  write the same map at once.
 * **Cancel**: SIGINT to the job's process group — Ctrl-C in a terminal — so a cancelled map update
-  is the command's own interrupted, uncommitted transaction.
+  is the command's own interrupted, uncommitted transaction; a command that ignores it gets
+  SIGTERM after ``cancel_grace_s`` and SIGKILL after as long again (its atomic commit still keeps
+  the map whole).
 * **Results**: the command writes its result with ``-o`` and its artefacts with ``-d`` into the
-  job's ``out/`` folder, so they are the command's bytes. A command whose output is the browser
-  (``view.sh``) succeeds once its viewer listens; that viewer process stays open (the latest
-  ``MAX_VIEWERS``) and the service proxies it.
-* **Persistence**: ``jobs/<id>/job.json`` per job; the list survives a restart, and a job that was
-  queued or running when the service stopped is ``cancelled``.
+  job's ``out/`` folder, so they are the command's bytes; a viewer is saved in ``viewer/``.
+* **Persistence**: ``jobs/<id>/job.json`` per job, with the process group of its running step; the
+  list survives a restart, and a job that was queued or running when the service stopped is
+  ``cancelled`` (a process group left behind by a crash is killed).
 * **Uploads** a job consumes are deleted when it ends, whatever its state.
 """
 
@@ -28,14 +31,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import secrets
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -43,14 +44,18 @@ from typing import Any
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.errors import error_code, http_status, job_state
 from oh_my_slam.core.timing import ENV_PATH, ENV_PROGRESS
-from oh_my_slam.web.operations import OUT_DIR, Operation, Prepared
+from oh_my_slam.web.operations import OUT_DIR, VIEWER_DIR, Operation, Prepared
 from oh_my_slam.web.workspace import Workspace
 
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-MAX_VIEWERS = 4  # viewer processes kept open (the oldest closes first)
 LOG_TAIL = 40  # stderr lines kept in the job record (all of them in stderr.log)
 POLL_S = 0.1
-_LISTENING = re.compile(r"listening on (http://\S+/)")
+LOG_TOUCH_S = 0.25  # stderr lines mark a job changed at most this often
+CANCEL_GRACE_S = 30.0
+
+
+def default_parallel() -> int:
+    return max(1, (os.cpu_count() or 2) // 2)
 
 
 @dataclass
@@ -60,15 +65,13 @@ class Job:
     label: str  # the command as typed (segment.sh -i)
     params: dict[str, Any]  # as submitted
     command: list[str]  # the command line, with workspace paths
-    argv: list[str]  # what the subprocess runs after ``python -m <module>``
-    module: str
-    prog: str
+    steps: list[dict[str, Any]]  # web.operations.Step as data
     inference: bool
-    browser: bool
     uploads: list[str] = field(default_factory=list)
     writes: str | None = None
     result_name: str | None = None
     result_format: str | None = None
+    saves_viewer: bool = False
     state: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -83,11 +86,12 @@ class Job:
     log_tail: list[str] = field(default_factory=list)
     resubmitted_from: str | None = None
     cancel_requested: bool = False
+    pgid: int | None = None  # process group of the running step
     version: int = 0
 
     def public(self) -> dict[str, Any]:
         d = asdict(self)
-        for k in ("argv", "module", "version"):
+        for k in ("steps", "version", "pgid"):
             d.pop(k)
         d["result"] = None
         if self.state == "succeeded" and self.result_name is not None:
@@ -110,24 +114,26 @@ class JobError(Exception):
         self.code = code
 
 
-def _new_id() -> str:
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
+def _killpg(pgid: int, sig: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, sig)
 
 
 class Runner:
     def __init__(self, workspace: Workspace, python: str = sys.executable,
-                 stop_grace_s: float = 120.0, max_viewers: int = MAX_VIEWERS) -> None:
+                 stop_grace_s: float = 120.0, cancel_grace_s: float = CANCEL_GRACE_S,
+                 max_parallel: int | None = None) -> None:
         self.ws = workspace
         self.python = python
         self.stop_grace_s = stop_grace_s
-        self.max_viewers = max_viewers
+        self.cancel_grace_s = cancel_grace_s
+        self.max_parallel = max_parallel or default_parallel()
         self.jobs: dict[str, Job] = {}
         self.version = 0
         self.stopping = False
         self._lock = threading.RLock()
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._threads: dict[str, threading.Thread] = {}
-        self._viewers: OrderedDict[str, str] = OrderedDict()  # job id → local viewer URL
 
     # -- records -----------------------------------------------------------------------------------
 
@@ -142,8 +148,8 @@ class Runner:
                 atomic_write_json(d / "job.json", asdict(job))
 
     def load(self) -> None:
-        """Read the persisted job list; a job that was queued or running when the service stopped
-        is cancelled, and a viewer that was open is closed."""
+        """Read the persisted job list. A job that was queued or running when the service stopped
+        is cancelled; a process group it left behind (the service was killed) is killed."""
         for f in sorted(self.ws.jobs.glob("*/job.json")):
             try:
                 job = Job.from_dict(json.loads(f.read_text()))
@@ -151,11 +157,13 @@ class Runner:
                 continue
             changed = False
             if job.state not in TERMINAL:
+                if job.pgid is not None:
+                    _killpg(job.pgid, signal.SIGKILL)
                 job.state, job.ended_at, changed = "cancelled", job.ended_at or time.time(), True
                 job.error = {"code": "interrupted", "message": "the service stopped before the "
                              "job finished; re-submit it"}
-            if job.viewer is not None:
-                job.viewer, changed = None, True
+            if job.pgid is not None:
+                job.pgid, changed = None, True
             self.jobs[job.id] = job
             self._touch(job, save=changed)
 
@@ -180,11 +188,17 @@ class Runner:
             jobs = [j for j in self.jobs.values() if j.version > seen and (jid in (None, j.id))]
             return self.version, [j.public() for j in sorted(jobs, key=lambda j: j.version)]
 
-    def viewer_url(self, jid: str) -> str | None:
-        with self._lock:
-            return self._viewers.get(jid)
+    def viewer_dir(self, jid: str) -> Path | None:
+        """The saved viewer of a succeeded job."""
+        job = self.get(jid)
+        d = self.ws.job_dir(job.id) / VIEWER_DIR
+        return d if job.viewer is not None and d.is_dir() else None
 
     # -- submission and scheduling -------------------------------------------------------------------
+
+    @staticmethod
+    def new_id() -> str:
+        return time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
 
     def submit(self, op: Operation, params: dict[str, Any], prep: Prepared, jid: str,
                resubmitted_from: str | None = None) -> Job:
@@ -198,28 +212,26 @@ class Runner:
                 raise JobError(409, f"upload {taken[0]} is already the input of job "
                                f"{busy[taken[0]]}; upload the file again", "upload_in_use")
             job = Job(id=jid, operation=op.id, label=op.label, params=params,
-                      command=prep.command, argv=prep.argv, module=op.module,
-                      prog=op.program.prog, inference=op.uses_inference, browser=op.browser,
-                      uploads=list(dict.fromkeys(prep.uploads)), writes=prep.writes,
-                      result_name=prep.result, result_format=prep.result_format,
+                      command=prep.command, steps=[asdict(s) for s in prep.steps],
+                      inference=prep.inference, uploads=list(dict.fromkeys(prep.uploads)),
+                      writes=prep.writes, result_name=prep.result,
+                      result_format=prep.result_format, saves_viewer=prep.viewer,
                       resubmitted_from=resubmitted_from)
             self.jobs[jid] = job
             self._touch(job, save=True)
             self._schedule()
             return job
 
-    @staticmethod
-    def new_id() -> str:
-        return _new_id()
-
     def _schedule(self) -> None:
         """Start every queued job that may start: inference jobs one at a time in submission
-        order (none overtakes an earlier one), the others at once; never two writers of a map."""
+        order (none overtakes an earlier one), the others at once up to ``max_parallel``; never
+        two writers of a map."""
         with self._lock:
             if self.stopping:
                 return
             running = [j for j in self.jobs.values() if j.state == "running"]
             inference_busy = any(j.inference for j in running)
+            others = sum(not j.inference for j in running)
             writing = {j.writes for j in running if j.writes}
             for job in self.all_jobs():
                 if job.state != "queued":
@@ -231,6 +243,10 @@ class Runner:
                     if inference_busy:
                         continue
                     inference_busy = True
+                elif others >= self.max_parallel:
+                    continue
+                else:
+                    others += 1
                 if job.writes:
                     writing.add(job.writes)
                 self._start(job)
@@ -245,32 +261,53 @@ class Runner:
     # -- one job -----------------------------------------------------------------------------------
 
     def _run(self, job: Job) -> None:
+        try:
+            code, message = 0, None
+            for step in job.steps:
+                if job.cancel_requested:
+                    code = -int(signal.SIGINT)
+                    break
+                code, message = self._step(job, step)
+                if code != 0:
+                    break
+            self._finish(job, code, message)
+        finally:
+            with self._lock:
+                self._threads.pop(job.id, None)
+
+    def _step(self, job: Job, step: dict[str, Any]) -> tuple[int, str | None]:
         d = self.ws.job_dir(job.id)
         (d / OUT_DIR).mkdir(parents=True, exist_ok=True)
         progress = d / "progress.jsonl"
-        progress.write_bytes(b"")
-        env = {**os.environ, ENV_PROGRESS: str(progress), ENV_PATH: str(d / "timings.json"),
-               "PYTHONUNBUFFERED": "1"}
+        progress.touch()
+        offset = progress.stat().st_size  # this step's events start here
+        env = {**os.environ, ENV_PROGRESS: str(progress), "PYTHONUNBUFFERED": "1"}
+        env.pop(ENV_PATH, None)
+        if step.get("timings", True):
+            env[ENV_PATH] = str(d / "timings.json")
         try:
-            with (d / "stdout").open("wb") as out:
-                proc = subprocess.Popen([self.python, "-m", job.module, *job.argv],
+            with (d / "stdout").open("ab") as out:
+                proc = subprocess.Popen([self.python, "-m", step["module"], *step["argv"]],
                                         stdin=subprocess.DEVNULL, stdout=out,
                                         stderr=subprocess.PIPE, cwd=self.ws.root, env=env,
                                         start_new_session=True)
         except OSError as exc:
-            self._finish(job, 1, f"could not start the command: {exc}")
-            return
+            return 1, f"could not start the command: {exc}"
         with self._lock:
             self._procs[job.id] = proc
+            job.pgid = proc.pid
+            self._touch(job, save=True)
             if job.cancel_requested:
-                self._interrupt(proc)
+                self._signal(proc, signal.SIGINT)
         reader = threading.Thread(target=self._read_stderr, args=(job, proc, d / "stderr.log"),
                                   daemon=True)
         reader.start()
         with progress.open("rb") as events:
+            events.seek(offset)
             pending = b""
             while True:
-                done = proc.poll() is not None
+                with self._lock:  # reaped under the lock (see _signal)
+                    done = proc.poll() is not None
                 chunk = events.read()
                 if chunk:
                     pending += chunk
@@ -284,14 +321,8 @@ class Runner:
         reader.join()
         with self._lock:
             self._procs.pop(job.id, None)
-            self._viewers.pop(job.id, None)
-        code = proc.returncode
-        if job.state in TERMINAL:  # a viewer that closed after it had succeeded
-            if job.viewer is not None:
-                job.viewer = None
-                self._touch(job, save=True)
-            return
-        self._finish(job, code)
+            job.pgid = None
+        return proc.returncode, None
 
     def _event(self, job: Job, line: bytes) -> None:
         try:
@@ -314,6 +345,7 @@ class Runner:
 
     def _read_stderr(self, job: Job, proc: subprocess.Popen[bytes], path: Path) -> None:
         assert proc.stderr is not None
+        last = 0.0
         with path.open("ab") as log:
             for raw in proc.stderr:
                 log.write(raw)
@@ -321,31 +353,14 @@ class Runner:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 with self._lock:
                     job.log_tail = [*job.log_tail[-(LOG_TAIL - 1):], line]
-                    self._touch(job)
-                m = _LISTENING.search(line) if job.browser else None
-                if m and job.state == "running" and line.startswith(f"{job.prog}: "):
-                    self._listening(job, m.group(1))
-
-    def _listening(self, job: Job, url: str) -> None:
-        """A viewer job's command listens: its result (the viewer) is ready."""
-        with self._lock:
-            self._viewers[job.id] = url
-            job.viewer = f"/viewer/job/{job.id}/"
-            job.state, job.ended_at, job.exit_code = "succeeded", time.time(), None
-            self._end(job)
-            while len(self._viewers) > self.max_viewers:
-                oldest, _ = self._viewers.popitem(last=False)
-                proc = self._procs.get(oldest)
-                if proc is not None:
-                    self._interrupt(proc)
+                    if time.monotonic() - last >= LOG_TOUCH_S:
+                        last = time.monotonic()
+                        self._touch(job)
 
     def _finish(self, job: Job, code: int, message: str | None = None) -> None:
         state = job_state(code)
         if job.cancel_requested and state != "succeeded":
             state = "cancelled"
-        if job.browser and state == "succeeded":  # exited without ever listening
-            state = "cancelled" if job.cancel_requested else "failed"
-            message = message or "the viewer stopped before it was ready"
         d = self.ws.job_dir(job.id)
         with self._lock:
             job.state, job.exit_code, job.ended_at = state, code, time.time()
@@ -356,9 +371,11 @@ class Runner:
             elif state == "cancelled":
                 job.error = {"code": "interrupted", "exit_code": code,
                              "http_status": http_status(130), "message": "cancelled"}
-            if state == "succeeded" and job.result_name is not None \
-                    and not (d / OUT_DIR / job.result_name).is_file():
-                job.result_name = None
+            if state == "succeeded":
+                if job.result_name is not None and not (d / OUT_DIR / job.result_name).is_file():
+                    job.result_name = None
+                if job.saves_viewer and (d / VIEWER_DIR).is_dir():
+                    job.viewer = f"/viewer/job/{job.id}/"
             self._end(job)
 
     def _end(self, job: Job) -> None:
@@ -371,10 +388,12 @@ class Runner:
     @staticmethod
     def _message(job: Job, code: int) -> str:
         """The command's own error line (``<prog>: error: …``), else the last stderr line."""
+        progs = {s["prog"] for s in job.steps}
         for line in reversed(job.log_tail):
-            for tag in (f"{job.prog}: error: ", f"{job.prog}: internal error: "):
-                if line.startswith(tag):
-                    return line[len(tag):]
+            for prog in progs:
+                for tag in (f"{prog}: error: ", f"{prog}: internal error: "):
+                    if line.startswith(tag):
+                        return line[len(tag):]
         if code < 0:
             return f"the command was stopped by signal {-code}"
         return job.log_tail[-1] if job.log_tail else f"the command exited with status {code}"
@@ -385,10 +404,23 @@ class Runner:
 
     # -- cancellation and stop ---------------------------------------------------------------------
 
-    @staticmethod
-    def _interrupt(proc: subprocess.Popen[bytes], sig: int = signal.SIGINT) -> None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, sig)
+    def _signal(self, proc: subprocess.Popen[bytes], sig: int) -> None:
+        """Signal ``proc``'s process group while it runs (checked under the lock, so a reaped
+        process group id is never signalled)."""
+        with self._lock:
+            if proc.poll() is None:
+                _killpg(proc.pid, sig)
+
+    def _escalate(self, proc: subprocess.Popen[bytes]) -> None:
+        """A command that ignores SIGINT gets SIGTERM, then SIGKILL, ``cancel_grace_s`` apart."""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            deadline = time.monotonic() + self.cancel_grace_s
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if proc.poll() is not None:
+                        return
+                time.sleep(POLL_S)
+            self._signal(proc, sig)
 
     def cancel(self, jid: str) -> Job:
         with self._lock:
@@ -401,7 +433,8 @@ class Runner:
                 job.cancel_requested = True
                 proc = self._procs.get(jid)
                 if proc is not None:
-                    self._interrupt(proc)
+                    self._signal(proc, signal.SIGINT)
+                    threading.Thread(target=self._escalate, args=(proc,), daemon=True).start()
                 self._touch(job, save=True)
             else:
                 raise JobError(409, f"job {jid} is {job.state}; only a queued or running job can "
@@ -417,9 +450,20 @@ class Runner:
             time.sleep(0.05)
         return self.get(jid)
 
+    def kill_all(self) -> None:
+        """SIGKILL every running job's process group (a second stop signal)."""
+        with self._lock:
+            self.stopping = True
+            for job in self.jobs.values():
+                if job.state == "running":
+                    job.cancel_requested = True
+            procs = list(self._procs.values())
+        for proc in procs:
+            self._signal(proc, signal.SIGKILL)
+
     def shutdown(self) -> None:
         """Stop: queued jobs are cancelled, running ones interrupted (SIGINT, as Ctrl-C) and
-        waited for — killed only after ``stop_grace_s`` — viewers closed, uploads deleted."""
+        waited for — killed only after ``stop_grace_s`` — and uploads deleted."""
         with self._lock:
             self.stopping = True
             for job in self.all_jobs():
@@ -429,17 +473,14 @@ class Runner:
                     self._end(job)
                 elif job.state == "running":
                     job.cancel_requested = True
-            procs = dict(self._procs)
+            procs = list(self._procs.values())
             threads = list(self._threads.values())
-        for proc in procs.values():
-            self._interrupt(proc)
+        for proc in procs:
+            self._signal(proc, signal.SIGINT)
         deadline = time.monotonic() + self.stop_grace_s
         for t in threads:
             t.join(max(0.0, deadline - time.monotonic()))
-        with self._lock:
-            left = dict(self._procs)
-        for proc in left.values():
-            self._interrupt(proc, signal.SIGKILL)
+        self.kill_all()
         for t in threads:
             t.join(5.0)
         self.ws.clear_uploads()

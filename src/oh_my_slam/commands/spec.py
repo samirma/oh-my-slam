@@ -738,6 +738,30 @@ def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem
     return problems
 
 
+def _map_keyframes_greater_than(args: argparse.Namespace, limit: Any) -> bool:
+    from oh_my_slam.mapping.store import MapReader
+
+    return len(MapReader(args.map).frames) > int(limit)
+
+
+# How each ``Mode.inference_condition`` key is evaluated on the parsed arguments (read-only).
+CONDITIONS: dict[str, Callable[[argparse.Namespace, Any], bool]] = {
+    "map_keyframes_greater_than": _map_keyframes_greater_than,
+}
+
+
+def needs_inference(mode: Mode, args: argparse.Namespace) -> bool:
+    """Whether a run of ``mode`` with ``args`` uses the inference server: always, never, or —
+    "conditional" — when its condition holds (any condition that cannot be evaluated counts as
+    needing it)."""
+    if mode.inference != "conditional":
+        return mode.inference == "required"
+    try:
+        return any(CONDITIONS[k](args, v) for k, v in (mode.inference_condition or {}).items())
+    except (KeyError, OhMySlamError, OSError, ValueError):
+        return True
+
+
 def by_parameter(problems: list[Problem]) -> dict[str, list[str]]:
     """The messages of ``problems`` per parameter: each under the first one it concerns (the
     field a form flags), or under "" when it concerns none."""

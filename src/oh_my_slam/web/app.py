@@ -1,10 +1,16 @@
 """The HTTP routes of ``server.sh`` (spec §2.6 "API"), on Starlette (served by uvicorn).
 
 Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi``). The viewer's
-data is served by the viewer's own code: ``/viewer/map/<name>/`` mounts ``viewer.routes.
-ViewerRoutes`` over the map's read-only bundle in this process, and ``/viewer/job/<id>/`` is the
-viewer a ``view.sh`` job opened (its own process, proxied). ``/`` is the web application's
-placeholder page.
+data is served in-process by the viewer's own code (``viewer.routes.ViewerRoutes``):
+``/api/maps/<name>/viewer/…`` over a workspace map's read-only bundle, ``/api/jobs/<id>/viewer/…``
+over the bundle a job saved (``viewer.bundle.load_bundle``); ``/viewer/map/<name>/`` and
+``/viewer/job/<id>/`` are the same routes as stable page URLs (the page's own URLs are relative).
+``/`` is the web application's placeholder page.
+
+Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
+come from no foreign ``Origin`` and carry a non-form content type (``application/json``;
+``application/octet-stream`` for uploads), which a cross-site page cannot send without a CORS
+preflight that this service never grants.
 """
 
 from __future__ import annotations
@@ -13,12 +19,16 @@ import asyncio
 import json
 import mimetypes
 import os
+import shutil
+import socket
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -44,8 +54,13 @@ from oh_my_slam.web.workspace import NotFoundError, Workspace
 START_COMMAND = "./start_inference_server.sh"
 SSE_POLL_S = 0.2
 SSE_HEARTBEAT_S = 15.0
+MAX_UPLOAD_BYTES = 8 << 30  # 8 GiB: room for a long phone video
+MIN_FREE_BYTES = 1 << 30  # an upload never leaves less than this free on the workspace's disk
+UPLOAD_CHECK_BYTES = 64 << 20  # free space is re-checked as an undeclared upload grows
+VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
 _MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
           ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+Json = dict[str, Any]
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -53,7 +68,7 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
                         status)
 
 
-def inference_health() -> dict[str, Any]:
+def inference_health() -> Json:
     """The inference server's health, or why it is down and the command that starts it."""
     from oh_my_slam.client.client import InferenceClient
 
@@ -66,14 +81,65 @@ def inference_health() -> dict[str, Any]:
 
 
 def inference_problem() -> spec.Problem | None:
-    """The commands' own check of the inference server (exit 3 when it is down)."""
+    """The commands' own check of the inference server (exit 3 when it is down or its models
+    failed); a server still loading is fine — the command waits for it itself."""
     from oh_my_slam.client.client import InferenceClient
 
+    client = InferenceClient()
     try:
-        InferenceClient().require_ready(wait_loading_s=0.0)
+        if client.health(timeout=1.0).status in ("ready", "loading"):
+            return None
+        client.require_ready(wait_loading_s=0.0)
     except OhMySlamError as exc:
         return problem((), str(exc), exc.exit_code, "inference_server")
     return None
+
+
+def machine_hosts() -> set[str]:
+    """The names and addresses this machine answers to (``Host`` / ``Origin`` check)."""
+    names = {"localhost", "127.0.0.1", "::1"}
+    host = socket.gethostname().lower()
+    names |= {host, host.split(".")[0], f"{host.split('.')[0]}.local"}
+    try:
+        names.add(socket.getfqdn().lower())
+    except OSError:
+        pass
+    try:
+        import psutil
+
+        for addrs in psutil.net_if_addrs().values():
+            names |= {a.address.split("%")[0].lower() for a in addrs
+                      if a.family in (socket.AF_INET, socket.AF_INET6)}
+    except Exception:  # the loopback names still work
+        pass
+    return names
+
+
+def _hostname(value: str) -> str:
+    """The host part of a ``Host`` header (``[::1]:80`` → ``::1``)."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]")[0]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+class _LRU:
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.items: OrderedDict[Any, Any] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key: Any, make: Callable[[], Any]) -> Any:
+        """The cached value of ``key``, else ``make()`` (built under the lock: one at a time)."""
+        with self.lock:
+            if key in self.items:
+                self.items.move_to_end(key)
+                return self.items[key]
+            value = make()
+            self.items[key] = value
+            while len(self.items) > self.size:
+                self.items.popitem(last=False)
+            return value
 
 
 @dataclass
@@ -85,27 +151,38 @@ class Service:
     url: str = ""
     started_at: float = field(default_factory=time.time)
     inference_check: Callable[[], spec.Problem | None] = inference_problem
-    inference_health: Callable[[], dict[str, Any]] = inference_health
+    inference_health: Callable[[], Json] = inference_health
     ops: dict[str, Operation] = field(default_factory=operations)
-    _map_views: dict[str, tuple[Any, Any]] = field(default_factory=dict)
-    _map_lock: threading.Lock = field(default_factory=threading.Lock)
+    extra_hosts: set[str] = field(default_factory=set)  # e.g. the test client's
+    max_upload_bytes: int = MAX_UPLOAD_BYTES
+    min_free_bytes: int = MIN_FREE_BYTES
+    _hosts: set[str] | None = None
+    _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
+    _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
 
-    def health(self) -> dict[str, Any]:
+    @property
+    def hosts(self) -> set[str]:
+        if self._hosts is None:
+            self._hosts = machine_hosts() | {h.lower() for h in self.extra_hosts}
+        return self._hosts
+
+    def health(self) -> Json:
         return {
             "status": "ok",
             "service": {"version": __version__, "url": self.url, "pid": os.getpid(),
                         "workspace": self.workspace.root.name, "data": str(self.workspace.root),
-                        "started_at": self.started_at, "jobs": self.runner.counts()},
+                        "started_at": self.started_at, "jobs": self.runner.counts(),
+                        "max_upload_bytes": self.max_upload_bytes},
             "inference": self.inference_health(),
         }
 
     # -- submission --------------------------------------------------------------------------------
 
-    def submit(self, op: Operation, params: Any, resubmitted_from: str | None = None
-               ) -> JSONResponse:
+    def submit(self, op: Operation, params: Any, resubmitted_from: str | None = None,
+               viewer: bool = False) -> JSONResponse:
         jid = self.runner.new_id()
-        prep = prepare(op, params, self.workspace, self.workspace.job_dir(jid))
-        if not prep.problems and op.mode.inference == "required":
+        prep = prepare(op, params, self.workspace, self.workspace.job_dir(jid), viewer)
+        if not prep.problems and prep.inference:
             p = self.inference_check()
             if p is not None:
                 prep.problems.append(p)
@@ -118,32 +195,49 @@ class Service:
             return _error(exc.status, exc.code, str(exc))
         return JSONResponse(job.public(), 202, headers={"Location": f"/api/jobs/{job.id}"})
 
-    def validate(self, op: Operation, params: Any) -> dict[str, Any]:
-        prep = prepare(op, params, self.workspace, self.workspace.job_dir("validate"))
-        if op.mode.inference == "required":
+    def validate(self, op: Operation, params: Any, viewer: bool = False) -> Json:
+        prep = prepare(op, params, self.workspace, self.workspace.job_dir("validate"), viewer)
+        if not prep.problems and prep.inference:
             p = self.inference_check()
             if p is not None:
                 prep.problems.append(p)
         return {"valid": not prep.problems, "command": prep.command,
+                "inference": prep.inference if not prep.problems else None,
                 "problems": [p.describe() for p in prep.problems],
                 "by_parameter": spec.by_parameter(prep.problems)}
 
-    # -- viewer of a map ---------------------------------------------------------------------------
+    # -- viewers -----------------------------------------------------------------------------------
 
     def map_routes(self, name: str) -> Any:
         """The viewer's routes over a map's read-only bundle, rebuilt when the map changed."""
         root = self.workspace.map_dir(name)
         stamp = (root / "map.json").stat().st_mtime_ns
-        with self._map_lock:
-            cached = self._map_views.get(name)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
+
+        def make() -> Any:
             from oh_my_slam.viewer.bundle import map_bundle
             from oh_my_slam.viewer.routes import ViewerRoutes
 
-            routes = ViewerRoutes(map_bundle(root))
-            self._map_views[name] = (stamp, routes)
-            return routes
+            return ViewerRoutes(map_bundle(root))
+
+        return self._map_views.get((name, stamp), make)
+
+    def job_routes(self, jid: str) -> Any:
+        """The viewer's routes over the bundle a job saved (a map's: that map's routes)."""
+        from oh_my_slam.viewer.bundle import load_bundle, saved_map
+
+        folder = self.runner.viewer_dir(jid)
+        if folder is None:
+            raise NotFoundError(f"job {jid} has no viewer")
+        m = saved_map(folder)
+        if m is not None:
+            return self.map_routes(m.name)
+
+        def make() -> Any:
+            from oh_my_slam.viewer.routes import ViewerRoutes
+
+            return ViewerRoutes(load_bundle(folder))
+
+        return self._job_views.get(jid, make)
 
 
 def _viewer_response(r: Any, method: str) -> Response:
@@ -159,7 +253,41 @@ def _viewer_response(r: Any, method: str) -> Response:
     return StreamingResponse(body(), r.status, headers=headers)
 
 
-def create_app(service: Service) -> Starlette:
+_STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def guard(app: Any, service: Service) -> Callable[..., Awaitable[None]]:
+    """``Host``, ``Origin`` and content-type checks (CSRF and DNS rebinding) around ``app``."""
+
+    async def asgi(scope: Json, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        reason, status = None, 403
+        if _hostname(headers.get("host", "")) not in service.hosts:
+            reason = "the Host header does not name this machine"
+        elif scope["method"] in _STATE_CHANGING:
+            origin = headers.get("origin")
+            if origin is not None and (urlsplit(origin).hostname or "").lower() \
+                    not in service.hosts:
+                reason = f"requests from {origin} are not accepted"
+            elif scope["method"] != "DELETE":
+                ctype = headers.get("content-type", "").split(";")[0].strip().lower()
+                want = "application/octet-stream" if scope["path"] == "/api/uploads" \
+                    else "application/json"
+                if ctype != want:
+                    reason, status = f"send the request body as {want}", 415
+        if reason is None:
+            await app(scope, receive, send)
+            return
+        await _error(status, "forbidden" if status == 403 else "unsupported_media_type",
+                     reason)(scope, receive, send)
+
+    return asgi
+
+
+def create_app(service: Service) -> Callable[..., Awaitable[None]]:
     ws, runner = service.workspace, service.runner
 
     def op_of(request: Request) -> Operation:
@@ -167,6 +295,9 @@ def create_app(service: Service) -> Starlette:
         if op is None:
             raise NotFoundError(f"no operation {request.path_params['op']}; see /api/openapi.json")
         return op
+
+    def wants_viewer(request: Request) -> bool:
+        return request.query_params.get("viewer", "").lower() in ("1", "true", "yes")
 
     async def body_json(request: Request) -> Any:
         raw = await request.body()
@@ -178,7 +309,7 @@ def create_app(service: Service) -> Starlette:
             return None  # refused by prepare as not an object
 
     async def index(request: Request) -> Response:
-        return Response(PLACEHOLDER.format(url=service.url), media_type="text/html")
+        return Response(PLACEHOLDER, media_type="text/html")
 
     async def health(request: Request) -> Response:
         return JSONResponse(await run_in_threadpool(service.health))
@@ -192,16 +323,33 @@ def create_app(service: Service) -> Starlette:
     async def submit(request: Request) -> Response:
         op = op_of(request)
         params = await body_json(request)
-        return await run_in_threadpool(service.submit, op, params)
+        return await run_in_threadpool(service.submit, op, params, None, wants_viewer(request))
 
     async def validate(request: Request) -> Response:
         op = op_of(request)
         params = await body_json(request)
-        return JSONResponse(await run_in_threadpool(service.validate, op, params))
+        return JSONResponse(await run_in_threadpool(service.validate, op, params,
+                                                    wants_viewer(request)))
 
     # -- uploads -----------------------------------------------------------------------------------
 
+    def too_large(size: int) -> Response | None:
+        if size > service.max_upload_bytes:
+            return _error(413, "too_large", f"an upload may hold at most "
+                          f"{service.max_upload_bytes / 2**30:g} GiB")
+        if shutil.disk_usage(ws.uploads).free - size < service.min_free_bytes:
+            return _error(413, "insufficient_storage", f"not enough free space in {ws.root} for "
+                          "this upload; free some space or use a path inside the workspace")
+        return None
+
     async def upload(request: Request) -> Response:
+        try:
+            declared = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        refused = too_large(declared)
+        if refused is not None:
+            return refused
         name = request.query_params.get("name", "")
         uid, target = ws.new_upload(name)
         part = target.with_name(f".{target.name}.part")
@@ -209,8 +357,14 @@ def create_app(service: Service) -> Starlette:
         try:
             with part.open("wb") as f:
                 async for chunk in request.stream():
-                    f.write(chunk)
                     size += len(chunk)
+                    step = UPLOAD_CHECK_BYTES
+                    checked = size > service.max_upload_bytes or (
+                        size > declared and size // step != (size - len(chunk)) // step)
+                    if checked and (refused := too_large(size)) is not None:
+                        ws.delete_upload(uid)
+                        return refused
+                    f.write(chunk)
             part.replace(target)
         except BaseException:  # interrupted (client gone, service stopping): deleted at once
             ws.delete_upload(uid)
@@ -260,7 +414,8 @@ def create_app(service: Service) -> Starlette:
             return _error(400, "usage", "the request body must be a JSON object of parameters")
         op = service.ops[old.operation]
         params = {**old.params, **override}
-        return await run_in_threadpool(service.submit, op, params, old.id)
+        return await run_in_threadpool(service.submit, op, params, old.id,
+                                       old.saves_viewer and not op.browser)
 
     def out_dir(jid: str) -> Path:
         return ws.job_dir(runner.get(jid).id) / OUT_DIR
@@ -277,9 +432,9 @@ def create_app(service: Service) -> Starlette:
         if j.state != "succeeded" or j.result_name is None:
             return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
         p = out_dir(j.id) / j.result_name
-        return FileResponse(p, media_type=media_of(j.id, p) if j.result_format is None else
-                            spec.Output("result", "stdout", j.result_format, "").describe()[
-                                "media_type"], filename=j.result_name)
+        media = media_of(j.id, p) if j.result_format is None else spec.Output(
+            "result", "stdout", j.result_format, "").describe()["media_type"]
+        return FileResponse(p, media_type=media, filename=j.result_name)
 
     async def files(request: Request) -> Response:
         jid = request.path_params["id"]
@@ -330,26 +485,21 @@ def create_app(service: Service) -> Starlette:
 
     # -- viewer ------------------------------------------------------------------------------------
 
-    async def map_viewer(request: Request) -> Response:
-        name, rest = request.path_params["name"], request.path_params.get("path", "")
-        if "path" not in request.path_params:
-            return RedirectResponse(f"/viewer/map/{name}/")
-        routes = await run_in_threadpool(service.map_routes, name)
-        r = await run_in_threadpool(routes.handle, request.method, "/" + rest,
-                                    request.url.query)
-        return _viewer_response(r, request.method)
+    def viewer(kind: str, key: str, routes: Callable[[str], Any]) -> Callable[..., Any]:
+        async def endpoint(request: Request) -> Response:
+            ident = request.path_params[key]
+            if "path" not in request.path_params:  # the page needs its trailing slash
+                return RedirectResponse(f"{request.url.path}/")
+            if kind == "job":
+                runner.get(ident)
+            r = await run_in_threadpool(routes(ident).handle, request.method,
+                                        "/" + request.path_params["path"], request.url.query)
+            return _viewer_response(r, request.method)
 
-    async def job_viewer(request: Request) -> Response:
-        jid, rest = request.path_params["id"], request.path_params.get("path", "")
-        j = runner.get(jid)
-        if "path" not in request.path_params:
-            return RedirectResponse(f"/viewer/job/{jid}/")
-        base = runner.viewer_url(jid)
-        if base is None:
-            return _error(410 if j.state in TERMINAL else 409, "viewer_closed",
-                          f"job {jid} has no open viewer ({j.state}); re-submit the job to "
-                          "open it again")
-        return await _proxy(request, base + rest)
+        return endpoint
+
+    map_viewer = viewer("map", "name", service.map_routes)
+    job_viewer = viewer("job", "id", service.job_routes)
 
     routes = [
         Route("/", index),
@@ -364,6 +514,8 @@ def create_app(service: Service) -> Starlette:
         Route("/api/maps", maps),
         Route("/api/maps/{name}", map_detail),
         Route("/api/maps/{name}/files/{path:path}", map_file),
+        Route("/api/maps/{name}/viewer", map_viewer),
+        Route("/api/maps/{name}/viewer/{path:path}", map_viewer),
         Route("/api/jobs", jobs),
         Route("/api/jobs/events", events),
         Route("/api/jobs/{id}", job),
@@ -375,10 +527,12 @@ def create_app(service: Service) -> Starlette:
         Route("/api/jobs/{id}/files/{path:path}", job_file),
         Route("/api/jobs/{id}/log", log),
         Route("/api/jobs/{id}/timings", timings),
-        Route("/viewer/map/{name}", map_viewer, methods=["GET", "HEAD"]),
-        Route("/viewer/map/{name}/{path:path}", map_viewer, methods=["GET", "HEAD", "POST"]),
-        Route("/viewer/job/{id}", job_viewer, methods=["GET", "HEAD"]),
-        Route("/viewer/job/{id}/{path:path}", job_viewer, methods=["GET", "HEAD", "POST"]),
+        Route("/api/jobs/{id}/viewer", job_viewer),
+        Route("/api/jobs/{id}/viewer/{path:path}", job_viewer),
+        Route("/viewer/map/{name}", map_viewer),
+        Route("/viewer/map/{name}/{path:path}", map_viewer),
+        Route("/viewer/job/{id}", job_viewer),
+        Route("/viewer/job/{id}/{path:path}", job_viewer),
     ]
 
     async def not_found(request: Request, exc: Exception) -> Response:
@@ -396,45 +550,17 @@ def create_app(service: Service) -> Starlette:
     async def disconnect(request: Request, exc: Exception) -> Response:
         return Response(status_code=499)
 
-    return Starlette(routes=routes, exception_handlers={
+    app = Starlette(routes=routes, exception_handlers={
         NotFoundError: not_found, JobError: job_error, OhMySlamError: command_error,
         ClientDisconnect: disconnect})
-
-
-async def _proxy(request: Request, url: str) -> Response:
-    """Forward a viewer request to the job's own viewer process (local, read-only)."""
-    import httpx
-
-    client = httpx.AsyncClient(timeout=None)
-    try:
-        upstream = await client.send(client.build_request(
-            request.method, url, params=request.url.query or None), stream=True)
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        return _error(502, "viewer_unavailable", f"the job's viewer does not answer ({exc})")
-    keep = {"content-type", "content-length", "cache-control", "allow"}
-    headers = {k: v for k, v in upstream.headers.items() if k.lower() in keep}
-
-    async def body() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in upstream.aiter_raw():
-                yield chunk
-        finally:
-            await upstream.aclose()
-            await client.aclose()
-
-    if request.method == "HEAD":
-        await upstream.aclose()
-        await client.aclose()
-        return Response(b"", upstream.status_code, headers=headers)
-    return StreamingResponse(body(), upstream.status_code, headers=headers)
+    return guard(app, service)
 
 
 PLACEHOLDER = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport"
 content="width=device-width, initial-scale=1"><title>oh-my-slam</title>
-<style>:root{{color-scheme:light dark}}body{{font:16px/1.5 system-ui,sans-serif;margin:2rem;
-max-width:48rem}}</style></head>
+<style>:root{color-scheme:light dark}body{font:16px/1.5 system-ui,sans-serif;margin:2rem;
+max-width:48rem}</style></head>
 <body><h1>oh-my-slam</h1>
 <p>The web service is running. Its API is described at
 <a href="/api/openapi.json">/api/openapi.json</a>; health at <a href="/api/health">/api/health</a>,

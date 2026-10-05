@@ -11,7 +11,9 @@ Ctrl-C or SIGTERM, and once it accepts connections writes exactly one stderr lin
 Nothing goes to stdout except ``--status``'s health JSON. One service runs per workspace (a lock
 and a state file in ``<data>``): a second ``server.sh`` on the same ``--data`` reports the running
 one's URL and exits 0. ``--stop`` stops it the way SIGTERM does: queued jobs are cancelled and
-running ones interrupted (SIGINT, as Ctrl-C) and waited for.
+running ones interrupted (SIGINT, as Ctrl-C) and waited for. A second Ctrl-C or SIGTERM while it
+stops kills every job's process group and exits at once (130); ``--stop`` sends it after waiting
+``STOP_TIMEOUT_S``.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ PROG = "server.sh"
 LOCK = "server.lock"
 STATE = "server.json"
 STOP_TIMEOUT_S = 180.0  # running jobs get the runner's grace period to stop
+FORCE_TIMEOUT_S = 10.0
 
 
 class ServiceNotRunningError(OhMySlamError):
@@ -57,7 +60,7 @@ def _say(msg: str) -> None:
 def build_parser() -> ArgumentParser:
     ap = ArgumentParser(prog=PROG, description="Local web service: the commands as an HTTP API "
                         "and a browser application.")
-    ap.add_argument("--port", type=int, default=0,
+    ap.add_argument("--port", type=int, default=None,
                     help="port to bind on 0.0.0.0 (default: 0, a free port)")
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA,
                     help=f"workspace folder for maps, uploads and results (default: "
@@ -114,14 +117,26 @@ def stop(ws: Workspace) -> int:
         _say(f"not running for {ws.root}")
         return 0
     os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + STOP_TIMEOUT_S
+    if _released(ws, STOP_TIMEOUT_S):
+        _say(f"stopped (pid {pid})")
+        return 0
+    # a second signal kills the jobs' process groups and exits at once; SIGKILL as the last resort
+    _say(f"pid {pid} did not stop within {STOP_TIMEOUT_S:.0f} s; killing its jobs")
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    if not _released(ws, FORCE_TIMEOUT_S):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        _released(ws, FORCE_TIMEOUT_S)
+    _say(f"stopped (pid {pid}, forced)")
+    return 0
+
+
+def _released(ws: Workspace, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
     while ServerLock.is_held(ws.root / LOCK) and time.monotonic() < deadline:
         time.sleep(0.1)
-    if ServerLock.is_held(ws.root / LOCK):
-        _say(f"pid {pid} did not stop within {STOP_TIMEOUT_S:.0f} s")
-        return 1
-    _say(f"stopped (pid {pid})")
-    return 0
+    return not ServerLock.is_held(ws.root / LOCK)
 
 
 # -- serving ----------------------------------------------------------------------------------------
@@ -167,6 +182,15 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         service = Service(ws, runner, url=url)
         app = create_app(service)
 
+        def hard_stop(signum: int = 0, frame: object = None) -> None:
+            """A second Ctrl-C or SIGTERM: kill every job's process group and exit now."""
+            runner.kill_all()
+            ws.clear_uploads()
+            with contextlib.suppress(OSError):
+                (ws.root / STATE).unlink()
+            lock.release()
+            os._exit(int(ExitCode.INTERRUPTED))
+
         class _Server(uvicorn.Server):
             async def startup(self, sockets: list[socket.socket] | None = None) -> None:
                 await super().startup(sockets)
@@ -183,13 +207,18 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
             def capture_signals(self) -> Iterator[None]:
                 """Ctrl-C and SIGTERM stop the service normally (uvicorn would re-raise them
                 after its shutdown, skipping the jobs' and the workspace's clean-up)."""
-                saved = {s: signal.signal(s, self.handle_exit)
+                saved = {s: signal.signal(s, self.stop_signal)
                          for s in (signal.SIGINT, signal.SIGTERM)}
                 try:
                     yield
                 finally:
                     for s, handler in saved.items():
                         signal.signal(s, handler)
+
+            def stop_signal(self, signum: int, frame: Any) -> None:
+                if self.should_exit:
+                    hard_stop()
+                self.should_exit = True
 
             async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
                 runner.stopping = True  # event streams end, so connections can close
@@ -201,6 +230,8 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         try:
             server.run(sockets=[sock])
         finally:
+            for s in (signal.SIGINT, signal.SIGTERM):  # a second signal while jobs stop
+                signal.signal(s, hard_stop)
             runner.shutdown()
             sock.close()
     finally:
@@ -212,17 +243,18 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
 
 def main(argv: list[str]) -> int:
     args: argparse.Namespace = build_parser().parse_args(argv)
-    if (args.status or args.stop) and (args.port or args.no_browser):
+    if (args.status or args.stop) and (args.port is not None or args.no_browser):
         raise UsageError("--status and --stop take only --data")
-    if not 0 <= args.port <= 65535:
-        raise UsageError(f"--port must be between 0 and 65535, got {args.port}")
+    port = 0 if args.port is None else args.port
+    if not 0 <= port <= 65535:
+        raise UsageError(f"--port must be between 0 and 65535, got {port}")
     ws = Workspace(args.data)
     if args.status:
         return status(ws)
     if args.stop:
         return stop(ws)
     ws.create()
-    return serve(ws, args.port, not args.no_browser)
+    return serve(ws, port, not args.no_browser)
 
 
 def entry() -> None:

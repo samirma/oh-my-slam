@@ -10,6 +10,8 @@ import os
 import re
 import signal
 import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -79,7 +81,8 @@ def test_server_sh_lifecycle(data: Path) -> None:
     assert r.status_code == 202
     assert httpx.get(url).status_code == 200
     assert httpx.get(url + "api/openapi.json").json()["openapi"].startswith("3.")
-    up = httpx.post(url + "api/uploads?name=b.jpg", content=b"x").json()
+    up = httpx.post(url + "api/uploads?name=b.jpg", content=b"x",
+                    headers={"content-type": "application/octet-stream"}).json()
     assert (data / up["path"]).is_file()
 
     stop = server("--data", str(data), "--stop")
@@ -104,7 +107,53 @@ def test_ctrl_c_and_sigterm_are_the_normal_stop(data: Path, sig: signal.Signals)
 
 def test_bad_options_are_usage_errors(tmp_path: Path) -> None:
     for args in (["--port", "-1"], ["--status", "--stop"], ["--status", "--port", "8"],
-                 ["--bogus"]):
+                 ["--stop", "--port", "0"], ["--status", "--no-browser"], ["--bogus"]):
         res = server("--data", str(tmp_path / "d"), *args)
         assert res.returncode == 2, args
         assert res.stdout == b""
+
+
+SLOW_SERVER = """
+import sys
+from oh_my_slam.commands import spec
+from oh_my_slam.web import operations
+from tests.fakes import slow_command
+spec.PROGRAMS = (*spec.PROGRAMS, slow_command.registry_program())
+operations.Operation.module = property(
+    lambda op: slow_command.MODULE if op.program.prog == "slow.sh"
+    else f"oh_my_slam.cli.{op.program.prog.removesuffix('.sh')}")
+from oh_my_slam.web.main import entry
+sys.argv = ["server.sh", *sys.argv[1:]]
+entry()
+"""
+
+
+def test_a_second_signal_kills_the_jobs_and_exits(data: Path) -> None:
+    """The first SIGTERM waits for a running job (here one deaf to SIGINT); a second one kills
+    every job's process group and exits at once."""
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    proc = subprocess.Popen([sys.executable, "-c", SLOW_SERVER, "--data", str(data),
+                             "--no-browser"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env, cwd=REPO)
+    assert proc.stderr is not None
+    m = LINE.match(proc.stderr.readline().decode().rstrip("\n"))
+    assert m, "no listening line"
+    url = f"http://127.0.0.1:{m.group(1)}/"
+    r = httpx.post(url + "api/ops/slow", json={"seconds": 120, "ignore_sigint": True})
+    assert r.status_code == 202, r.text
+    record = data / "jobs" / r.json()["id"] / "job.json"
+    deadline = time.monotonic() + 60
+    while json.loads(record.read_text()).get("pgid") is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    pgid = json.loads(record.read_text())["pgid"]
+    assert pgid is not None
+    proc.send_signal(signal.SIGTERM)
+    time.sleep(1.5)
+    assert proc.poll() is None  # still waiting for the job
+    t0 = time.monotonic()
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=30)
+    assert proc.returncode == 130 and time.monotonic() - t0 < 10
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
+    assert server("--data", str(data), "--status").returncode == 3
