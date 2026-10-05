@@ -106,8 +106,8 @@ class When:
         return v is not None
 
     def describe(self) -> dict[str, Any]:
-        if self.video:
-            return {"option": self.option, "is": "video"}
+        if self.video:  # with the suffixes that make a file a video
+            return {"option": self.option, "is": "video", "suffixes": sorted(VIDEO_SUFFIXES)}
         if self.values:
             return {"option": self.option, "in": list(self.values)}
         return {"option": self.option, "is": "given"}
@@ -210,11 +210,14 @@ class Output:
     format: str  # json | ply | png | csv | markdown | map | html
     text: str
     when: tuple[When, ...] = ()  # produced when any holds (empty: always)
+    # an image whose pixels are painted in the objects' colours (the §2.4 colour contract): the
+    # object under a pixel is the one of that colour
+    object_regions: bool = False
 
     def describe(self) -> dict[str, Any]:
         return {"name": self.name, "via": self.via, "format": self.format,
                 "media_type": _MEDIA[self.format], "text": self.text,
-                "when": [w.describe() for w in self.when]}
+                "when": [w.describe() for w in self.when], "object_regions": self.object_regions}
 
 
 @dataclass(frozen=True)
@@ -561,7 +564,7 @@ _SEGMENT_PLY = "shape the PLY output: use -f ply or -d <folder>"
 _ARTEFACTS = (
     Output("segmentation.json", "-d", "json", f"{_SCENE}, identical to -f json", (_D,)),
     Output("segmented.png", "-d", "png", "the image (for a map, keyframes) with each instance "
-           "mask painted in its object's colour", (_D,)),
+           "mask painted in its object's colour", (_D,), object_regions=True),
     Output("catalog.csv", "-d", "csv", "one row per object", (_D,)),
     Output("catalog.md", "-d", "markdown", "the catalogue as a table by descending volume",
            (_D,)),

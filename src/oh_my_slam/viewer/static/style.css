@@ -1,3 +1,4 @@
+@import url("lib/labels.css");  /* the label layer (lib/labels.js), shared with host pages */
 :root {
   --bg: #15171c;
   --panel: #1d2027;
@@ -24,20 +25,6 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px; }
 .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px;
   border: 1px solid #0006; flex: none; vertical-align: middle; }
-
-/* ---- object labels: an id tag in the object's colour, then the name, on a dark plate (legible
-   over any cloud); the name is left out where it would cover another label */
-.labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
-.labels[hidden] { display: none; }
-.obj-label { position: absolute; left: 0; top: 0; display: flex; align-items: stretch;
-  font-size: 11px; line-height: 15px; border-radius: 3px; overflow: hidden; white-space: nowrap;
-  background: #0d0f13d9; color: #fff; box-shadow: 0 1px 3px #0009; will-change: transform; }
-.obj-label[hidden] { display: none; }
-.obj-label .tag { padding: 0 4px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.obj-label .name { padding: 0 5px 0 4px; }
-.obj-label.compact .name { display: none; }
-/* the object a host page selected (Viewer.select): outlined, over the others */
-.obj-label.selected { outline: 2px solid #fff; outline-offset: 1px; z-index: 1; }
 
 /* ---- side panel */
 #panel { width: var(--panel-width); flex: none; background: var(--panel); border-left: 1px solid var(--border);

@@ -252,6 +252,60 @@ def scene_cameras(scene: Json) -> list[Json]:
     return out
 
 
+def display_transform(camera_frame: bool, up_cam: Any = None) -> list[list[float]]:
+    """The display transform of a scene drawn on its own (the 3D scene viewer of server.sh): the
+    identity for map coordinates (z up); for a single image's camera frame the transform
+    ``view.sh -i`` uses (:func:`upright_transform`), with the estimated up direction when the
+    scene states one, else a level camera."""
+    if not camera_frame:
+        return np.eye(4).tolist()
+    up = DEFAULT_UP_CAM if up_cam is None else np.asarray(up_cam, np.float64).reshape(3)
+    if not np.all(np.isfinite(up)) or np.linalg.norm(up) < 1e-9:
+        raise UsageError("the up direction must be 3 finite numbers, not all 0")
+    return upright_transform(up / np.linalg.norm(up)).tolist()
+
+
+def ply_comments(path: Path) -> list[str]:
+    """The header comments of a PLY file (its frame, attributes and located cameras)."""
+    from oh_my_slam.core.ply import read_header
+
+    return read_header(path).comments
+
+
+def ply_display(path: Path, max_points: int | None = None) -> tuple[DisplayCloud, list[str]]:
+    """A PLY file the commands wrote, as the viewer draws it: every point up to the display
+    budget, above it the voxel-grid selection of ``segmentation.cloud.display_selection`` (each
+    kept point with exactly its values); and the file's header comments. A binary file is read
+    through a memory map: only its positions and the kept points' other values are loaded.
+    Raises ``ValueError`` for a file that is not such a PLY."""
+    from oh_my_slam.core.ply import cloud_of_rows, memmap_ply, read_ply
+    from oh_my_slam.segmentation.cloud import display_selection, thin_cloud
+
+    budget = DISPLAY_POINT_BUDGET if max_points is None else max_points
+    t0 = time.perf_counter()
+    header, rows = memmap_ply(path)
+    if rows is None:  # ASCII: parsed whole
+        thinned = thin_cloud(read_ply(path), budget)
+        return DisplayCloud(thinned.cloud, thinned.total, thinned.voxel,
+                            time.perf_counter() - t0), header.comments
+    xyz = np.stack([rows["x"], rows["y"], rows["z"]], axis=1).astype(np.float32, copy=False)
+    keep, edge = display_selection(xyz, budget)
+    cloud = cloud_of_rows(rows if keep is None else rows[keep])
+    del rows  # the map is closed with its last reference
+    return DisplayCloud(cloud, len(xyz), edge, time.perf_counter() - t0), header.comments
+
+
+def is_camera_frame(comments: Iterable[str] = (), cs_types: Iterable[str] | None = None) -> bool:
+    """Whether a scene is in a single image's camera frame: for a scene JSON (``cs_types``, the
+    types of its coordinate systems), when it has no scene coordinate system (``scene_cs``, the
+    map frame); for a PLY (its header ``comments``), when its header names that frame."""
+    from oh_my_slam.segmentation.cloud import IMAGE_FRAME
+
+    if cs_types is not None:
+        return "scene_cs" not in set(cs_types)
+    return IMAGE_FRAME in comments
+
+
 def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
     """Display frame of a single image: its camera frame rotated so that the estimated up is +z
     and the camera looks along +y."""
