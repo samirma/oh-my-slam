@@ -83,13 +83,29 @@ def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
     monkeypatch.setattr(spec, "PROGRAMS", (spec.Program(spec.RECONSTRUCT.prog,
                                                         spec.RECONSTRUCT.description, (rec2,)),
                                            *spec.PROGRAMS[1:]))
-    variants = [c.variant for c in cases_by_op(spec.describe())["reconstruct"]]
+    from oh_my_slam.web import openapi, operations
+
+    # through the service's OpenAPI document, as the evaluator reads it
+    served, _ = sv.operations_of(openapi.document(operations.operations()))
+    variants = [c.variant for c in cases_by_op(served)["reconstruct"]]
     assert variants == ["default", "format=ply", "format=glb", "attrs=color=segment",
                         "quality=best"]
     # an operation whose input kind has no reference input is reported, not dropped silently
     cases, uncovered = sv.parity_cases(spec.describe(), sv.Inputs(image="inputs/a.jpg"))
     assert {c.op for c in cases} == {"reconstruct", "segment-image", "view-image"}
     assert "mapper.sh update" in uncovered and "inputs" in uncovered["mapper.sh update"]
+
+
+def test_the_operations_are_read_from_the_openapi_document() -> None:
+    """The service's own /api/openapi.json carries each job operation's registry entry under
+    x-oms: the evaluator's operations are exactly the registry's, a new mode included."""
+    from oh_my_slam.web import openapi, operations
+
+    got, problems = sv.operations_of(openapi.document(operations.operations()))
+    assert problems == [] and got == {"operations": spec.describe()["operations"]}
+    doc = openapi.document(operations.operations())
+    doc["paths"]["/api/ops/stray"] = {"post": {}}  # a job path without its registry entry
+    assert sv.operations_of(doc)[1] == ["/api/ops/stray"]
 
 
 def test_the_command_line_of_a_case_is_the_services() -> None:
@@ -254,8 +270,9 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         p = self.path
-        if p == "/api/operations": return self.reply(200, DESCRIBE)
-        if p == "/api/openapi.json": return self.reply(200, {"paths": {"/api/ops/reconstruct": {}}})
+        if p == "/api/openapi.json": return self.reply(200, {"paths": {
+            "/api/ops/reconstruct": {"post": {"x-oms": DESCRIBE["operations"][0]}},
+            "/api/ops/reconstruct/validate": {"post": {}}, "/api/health": {"get": {}}}})
         if p.startswith("/api/jobs/") and p.endswith("/result"):
             j = jobs[p.split("/")[3]]
             fmt = j["params"].get("format", "json")

@@ -14,7 +14,7 @@ operations of job wall time — submission to the end state seen by polling — 
 of the same command with the same, replayed, inference).
 
 **Parity** (``server_sh.parity.*``): the operations come from the service's own description of
-the commands (``/api/operations``, ``commands.spec.describe()``) — nothing here names a command or
+the commands (``/api/openapi.json``: each job operation's ``x-oms`` entry, ``commands.spec.describe()``) — nothing here names a command or
 an option. Each operation gets a default case (its required parameters on the reference inputs)
 and one case per non-default value of each choice, per artefact folder and per point-cloud
 attribute (a non-default choice of its first enumerated attribute), with the options a case
@@ -126,6 +126,24 @@ class Case:
     writes_map: str | None = None  # the parameter naming the map the case creates
     folders: tuple[str, ...] = ()  # artefact folder parameters given
     result_format: str | None = None  # "json" | "ply" | None (browser)
+
+
+def operations_of(openapi: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The operations of the service's ``/api/openapi.json``: each ``POST /api/ops/<id>`` carries
+    its ``commands.spec.describe()`` entry under ``x-oms``. Returns ``{"operations": [...]}`` (the
+    shape of ``describe()``) and the job paths whose entry is missing or whose id does not match
+    their path."""
+    ops, problems = [], []
+    for path, item in (openapi.get("paths") or {}).items():  # the registry's order
+        if not path.startswith("/api/ops/") or path.endswith("/validate"):
+            continue
+        entry = ((item or {}).get("post") or {}).get("x-oms")
+        if not isinstance(entry, dict) or "parameters" not in entry \
+                or f"/api/ops/{operation_id(entry)}" != path:
+            problems.append(path)
+            continue
+        ops.append(entry)
+    return {"operations": ops}, problems
 
 
 def operation_id(op: dict[str, Any]) -> str:
@@ -629,20 +647,17 @@ class ServiceEvaluation:
         m = self.ev.metrics
         ids = [f"{PREFIX}.parity.{k}" for k in PARITY_METRICS]
         assert self.api is not None
-        reply = self.api.get("api/operations")
+        reply = self.api.get("api/openapi.json")
         if reply.status != 200:
-            m.fail(ids, f"/api/operations answered HTTP {reply.status}")
+            m.fail(ids, f"/api/openapi.json answered HTTP {reply.status}")
             return
-        describe = reply.json()
-        listed = set((self.api.get("api/openapi.json").json().get("paths") or {}).keys())
+        describe, problems = operations_of(reply.json())
         cases, uncovered = parity_cases(describe, inputs)
         ops = {o["id"]: o for o in describe.get("operations", [])}
-        rows = []
+        rows: list[dict[str, Any]] = [{"case": p, "status": "mismatch",
+                                       "why": "not an operation of commands.spec"}
+                                      for p in problems]
         for n, case in enumerate(cases, start=1):
-            if listed and f"/api/ops/{case.op}" not in listed:
-                rows.append({"case": f"{case.label} [{case.variant}]", "status": "mismatch",
-                             "why": f"/api/ops/{case.op} is not in /api/openapi.json"})
-                continue
             rows.append(self.run_case(ops[case.label], case, n))
         self.details["parity"] = {"cases": rows, "uncovered": uncovered}
         ran = {r["case"].split(" [")[0] for r in rows}
@@ -660,7 +675,7 @@ class ServiceEvaluation:
 
     def latency(self, inputs: Inputs) -> None:
         assert self.api is not None
-        paths = ["", "api/health", "api/openapi.json", "api/operations", "api/maps", "api/jobs"]
+        paths = ["", "api/health", "api/openapi.json", "api/maps", "api/jobs"]
         if inputs.map:
             paths.append(f"api/maps/{inputs.map}")
         if self.first_job:

@@ -35,7 +35,7 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "their place where the map shows no surface; `before_present_fraction` the control (the split "
      "map after an update of the images that show the cup has it); `<split>.stability.*` compares "
      "the labels and ids of the unchanged objects of the first update with the last (aligned; "
-     "box figures in the detail);`<split>.ids_persistent_fraction` "
+     "box figures in the detail); `<split>.ids_persistent_fraction` "
      "checks every published id against every later update; `<split>.vs_one_update.*` compares "
      "the split map with the one-update map (ids may differ where an earlier update published "
      "one)."),
@@ -47,7 +47,7 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "detections the map keeps. The accuracy measure is the ground-truth section (`gt.*`)."),
     ("contract", "Contracts", ""),
     ("server_sh", "Web service (server.sh)",
-     "Performance, parity with the commands (each operation of `/api/operations`, run as a job and "
+     "Performance, parity with the commands (each operation of `/api/openapi.json`, run as a job and "
      "from the shell with the same recorded inference) and the web application's UI."),
     ("gt", "Ground truth: accuracy", ""),
 )
