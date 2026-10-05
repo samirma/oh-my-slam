@@ -327,6 +327,15 @@ def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_a
     first = _add(client, room, _steps(), tmp_path / "a", "a")
     rest = _add(client, room, ring(12, start=0.2), tmp_path / "b", "b")
     real = objs._group
+    moved: list[int] = []  # the frames of the detections the hook moved
+    placed: list[dict[int, int]] = []  # the ids _published_places gave back (id -> object)
+    real_places = objs._published_places
+
+    def spy(final_of, absorbed, fresh, boxes):  # type: ignore[no-untyped-def]
+        before = dict(absorbed)
+        real_places(final_of, absorbed, fresh, boxes)
+        placed.append({p: final_of_k for p in before if p not in absorbed
+                       for final_of_k in [next(k for k, v in final_of.items() if v == p)]})
 
     def misgrouped(obs, objects, earlier=None):  # type: ignore[no-untyped-def]
         groups = real(obs, objects, earlier)
@@ -337,10 +346,12 @@ def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_a
         if len(cab) != 2:
             return groups
         a, b = cab  # the first cabinet's and the second one's detection in the first keyframe
+        moved.append(obs[b].frame)
         out = [(oid, [i for i in m if i != b]) for oid, m in groups]
         return [(oid, [*m, b] if a in m else m) for oid, m in out if m]
 
     monkeypatch.setattr(objs, "_group", misgrouped)
+    monkeypatch.setattr(objs, "_published_places", spy)
     m = tmp_path / "m"
     docs: list[dict] = []  # type: ignore[type-arg]
     for part in (first, rest[:6], rest[6:]):
@@ -348,5 +359,10 @@ def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_a
         for before in docs:
             _ids_persist(m, before, doc)
         docs.append(doc)
-    assert [o["type"] for o in docs[0]["openlabel"]["objects"].values()].count("cabinet") == 2
+    cabinets = sorted(int(k) for k, o in docs[0]["openlabel"]["objects"].items()
+                      if o["type"] == "cabinet")
+    assert len(cabinets) == 2
     assert "restarted" in json.loads((m / "map.json").read_text())["updates"][1]["notes"]
+    # the hook did move the second cabinet's founding detection, and the rule gave its id back
+    assert moved and moved[0] == 0, moved
+    assert any(cabinets[1] in given for given in placed), placed

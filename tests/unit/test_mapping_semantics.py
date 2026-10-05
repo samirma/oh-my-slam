@@ -680,3 +680,26 @@ def test_a_published_id_outranks_a_lower_candidate_id() -> None:
         [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
         published={7})
     assert final == {100: 7} and absorbed == {5: 100}
+
+
+def test_a_merge_keeps_the_published_id_before_a_lower_candidates(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the extension merges a stored candidate (id 5, never exported) with a stored
+    published object (id 7), the published id survives and the candidate's resolves to it: the
+    lower id is kept only between two published or two unpublished objects."""
+    rng = np.random.default_rng(0)
+
+    def stored(oid: int, confirmed: bool) -> MapObject:
+        pts = (rng.uniform(-0.2, 0.2, (200, 3)) + [0.0, 0.0, 0.3]).astype(np.float32)
+        return MapObject(oid, "box", {"box": 1.0}, [0.9], pts, frames=[0, 1],
+                         confirmed=confirmed)
+
+    candidate, published = stored(5, False), stored(7, True)
+    state = ObjectState([candidate, published], 10)
+    monkeypatch.setattr(objects, "_merge_strength", lambda a, b, *rest: 2.0)
+    alias: dict[int, int] = {}
+    assert objects._merge(state, {5, 7}, alias) == 1
+    assert alias == {5: 7} and [o.id for o in state.objects] == [7]
+    # update_objects records a stored id's merge (``merged_into``): 5 resolves to 7
+    state.merged_into.update({old: keeper for old, keeper in alias.items() if old < 10})
+    assert state.resolve(5) == 7
