@@ -352,3 +352,15 @@ def test_a_stored_run_is_judged_again_with_new_targets(
     assert "judged again" in (run / "summary.md").read_text()
     assert main(["--rejudge", str(tmp_path / "nothing")]) == 2
     capsys.readouterr()
+
+
+def test_a_stored_run_judged_again_can_become_the_baseline(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """``--rejudge --set-baseline`` stores the judged run, so no second full run is needed."""
+    m = judged(tmp_path, {"perf.a.wall_s": 1.0})
+    run = tmp_path / "run"
+    write_report(run, result_of(m, [], {"status": "missing"}))
+    baseline = tmp_path / "baseline.json"
+    assert main(["--rejudge", str(run), "--baseline", str(baseline), "--set-baseline"]) == 0
+    assert baseline.read_bytes() == (run / "result.json").read_bytes()
+    capsys.readouterr()

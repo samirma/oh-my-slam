@@ -112,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"evaluate: cannot judge {folder} again: {exc}", file=sys.stderr)
             return 2
         res, md = write_report(folder, result)
+        if args.set_baseline:
+            store_baseline(res, args.baseline.expanduser())
         print(f"evaluate: {report_line(result['summary'])} — {md}", file=sys.stderr)
         print(md)
         return 1 if result["summary"]["failed"] else 0
