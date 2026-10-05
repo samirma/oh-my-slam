@@ -3,10 +3,10 @@
 * ``OH_MY_SLAM_INFERENCE_RECORD=<dir>``: every response the client receives is appended to
   ``<dir>/responses.jsonl``, with the files it names (``*_path`` fields: depth, validity masks)
   copied into ``<dir>``.
-* ``OH_MY_SLAM_INFERENCE_REPLAY=<dir>``: the client answers each request from that recording
-  instead of the server (which may then be down): the next recorded response to the same route
-  and the same request (path fields aside), its files copied out afresh. A request the recording
-  does not hold is an :class:`~oh_my_slam.core.errors.InferenceError` naming it.
+* ``OH_MY_SLAM_INFERENCE_REPLAY=<dir>``: replay or forward. The client answers each request
+  the recording holds from it — the next recorded response to the same route and the same request
+  (path fields aside), its files copied out afresh — without the server; any other request (the
+  recording is missing, or another run made other requests) goes to the live server as usual.
 
 The web service (spec §2.6) records a job's command step and replays it for the job's viewer step,
 so the viewer shows exactly the detections and ids of the result, with no second inference pass.
@@ -22,8 +22,6 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any
-
-from oh_my_slam.core.errors import InferenceError
 
 ENV_RECORD = "OH_MY_SLAM_INFERENCE_RECORD"
 ENV_REPLAY = "OH_MY_SLAM_INFERENCE_REPLAY"
@@ -85,9 +83,9 @@ def record(route: str, request: dict[str, Any], response: dict[str, Any]) -> Non
         f.write(line + "\n")
 
 
-def replay(route: str, request: dict[str, Any], out_dir: str | None) -> dict[str, Any]:
+def replay(route: str, request: dict[str, Any], out_dir: str | None) -> dict[str, Any] | None:
     """The recorded response to this request (files copied into ``out_dir``, else a temporary
-    folder), consumed once."""
+    folder), consumed once; None when the recording does not hold it (the caller forwards it)."""
     folder = replaying()
     assert folder is not None
     with _lock:
@@ -95,17 +93,15 @@ def replay(route: str, request: dict[str, Any], out_dir: str | None) -> dict[str
             index: dict[str, list[Any]] = {}
             try:
                 lines = (folder / INDEX).read_text().splitlines()
-            except OSError as exc:
-                raise InferenceError(f"no inference recording in {folder} ({exc.strerror})"
-                                     ) from exc
+            except OSError:
+                lines = []  # no recording: every request is forwarded
             for line in lines:
                 rec = json.loads(line)
                 index.setdefault(rec["key"], []).append(rec["response"])
             _replay[str(folder)] = index
         left = _replay[str(folder)].get(request_key(route, request))
         if not left:
-            raise InferenceError(f"{route}: the inference recording in {folder} holds no response "
-                                 "to this request (it records another run)")
+            return None
         response = left.pop(0)
     dest = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="oms-replay-"))
     dest.mkdir(parents=True, exist_ok=True)

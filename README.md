@@ -427,8 +427,11 @@ option.
 **Jobs.**
 
 * **Process.** A job is a list of steps. Each step is a Python entry point run as a subprocess in
-  its own process group, with `OH_MY_SLAM_PROGRESS` and `OH_MY_SLAM_TIMINGS` pointing into the job
-  folder.
+  its own process group, with:
+  * `OH_MY_SLAM_PROGRESS` and `OH_MY_SLAM_TIMINGS` pointing into the job folder;
+  * SIGINT reset to its default, so a cancel works even when the service was started with SIGINT
+    ignored;
+  * no recording or replay variable inherited from the service's environment.
   * The command step is `python -m oh_my_slam.cli.<command> <argv>`, the same module the shell
     script execs.
   * A viewer step is `python -m oh_my_slam.cli.view_save <dir> <prog> <argv>`, given the
@@ -486,14 +489,20 @@ option.
     (its `--min-score` included). It runs before the job ends and its upload is deleted.
   * So there is one upload, one job, the command's byte-identical result, and a saved viewer.
     Uploads stay transient, and an upload still has exactly one consumer.
-  * There is no second inference pass. The command step records every inference response
-    (`OH_MY_SLAM_INFERENCE_RECORD=jobs/<id>/inference/`, `client.replay`, with the depth and
-    validity files), and the viewer step replays them (`OH_MY_SLAM_INFERENCE_REPLAY`), without the
-    server.
+  * There is no second inference pass for what the command already asked. The command step records
+    every inference response (`OH_MY_SLAM_INFERENCE_RECORD=jobs/<id>/inference/`,
+    `client.replay`, with the depth and validity files). The viewer step replays or forwards them
+    (`OH_MY_SLAM_INFERENCE_REPLAY`).
+    * Responses are matched by route and request, path fields aside.
+    * A request the recording does not hold goes to the server. For example, `reconstruct -f ply`
+      asks no segmentation.
+    * The recording is deleted once the viewer step ends.
   * As a result, the viewer's objects, ids and colours are exactly the result's, and selecting an
     object highlights the same object everywhere.
-  * Responses are matched by route and request, path fields aside. A request the recording does
-    not hold is an error naming it.
+  * That viewer step is optional. If it fails, for instance because it needs the server and the
+    server is down, the job still `succeeded`, its result stays downloadable, and the failure is
+    the job's `viewer_error`, with the message and code. Cancelling during that step does the
+    same.
 
 **API overview.**
 

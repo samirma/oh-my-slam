@@ -107,8 +107,10 @@ class InferenceClient:
     def _post(self, route: str, req: BaseModel, model: type[M]) -> M:
         t0 = time.perf_counter()
         data = req.model_dump()
-        if replay.replaying() is not None:  # answered from a recording (client.replay)
-            return model.model_validate(replay.replay(route, data, data.get("out_dir")))
+        if replay.replaying() is not None:  # answered from a recording, else forwarded
+            recorded = replay.replay(route, data, data.get("out_dir"))
+            if recorded is not None:
+                return model.model_validate(recorded)
         deadline = time.monotonic() + BUSY_RETRY_S
         delay = 0.2
         while True:
@@ -209,6 +211,6 @@ def connect(require: bool = True) -> InferenceClient:
     global _shared
     if _shared is None:
         _shared = InferenceClient()
-    if require and replay.replaying() is None:  # a replay needs no server
-        _shared.require_ready()
+    if require and replay.replaying() is None:  # a replay asks the server only for what it
+        _shared.require_ready()  # does not hold (and fails then, exit 3, if it is down)
     return _shared

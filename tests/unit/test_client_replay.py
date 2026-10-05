@@ -1,5 +1,5 @@
 """``client.replay``: responses recorded with their files, replayed by request (path fields aside),
-each once, with fresh copies of the files; anything not recorded is a clear error."""
+each once, with fresh copies of the files; anything not recorded is forwarded (None here)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from oh_my_slam.client import replay
-from oh_my_slam.core.errors import InferenceError
 
 
 def test_record_then_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,11 +27,10 @@ def test_record_then_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     first = replay.replay("/v1/geometry", other_paths, other_paths["out_dir"])
     assert first["width"] == 4 and Path(first["depth_path"]).read_bytes() == b"depth bytes"
     assert Path(first["depth_path"]).parent == tmp_path / "out"
-    assert replay.replay("/v1/geometry", other_paths, None)["width"] == 5  # in order, once each
-    with pytest.raises(InferenceError, match="holds no response"):
-        replay.replay("/v1/geometry", other_paths, None)
-    with pytest.raises(InferenceError, match="holds no response"):
-        replay.replay("/v1/geometry", {**other_paths, "max_side": 512}, None)
+    second = replay.replay("/v1/geometry", other_paths, None)
+    assert second is not None and second["width"] == 5  # in order, once each
+    assert replay.replay("/v1/geometry", other_paths, None) is None  # used up: forwarded
+    assert replay.replay("/v1/geometry", {**other_paths, "max_side": 512}, None) is None
+    assert replay.replay("/v1/gravity", {"image_path": "x"}, None) is None
     monkeypatch.setenv(replay.ENV_REPLAY, str(tmp_path / "absent"))
-    with pytest.raises(InferenceError, match="no inference recording"):
-        replay.replay("/v1/segment", {}, None)
+    assert replay.replay("/v1/segment", {}, None) is None  # no recording: all forwarded

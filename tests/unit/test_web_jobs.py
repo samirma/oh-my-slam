@@ -185,8 +185,7 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
     objects = {int(k): o["type"] for k, o in scene["openlabel"].get("objects", {}).items()}
     catalog = client.get(f"/viewer/job/{both['id']}/api/catalog").json()
     assert {r["id"]: r["label"] for r in catalog} == objects
-    recorded = (ws.jobs / both["id"] / "inference" / "responses.jsonl").read_text().splitlines()
-    assert sum(json.loads(r)["route"].endswith("segment") for r in recorded) == 1
+    assert not (ws.jobs / both["id"] / "inference").exists()  # deleted once the viewer is saved
 
     # after a restart (a new runner and service on the same workspace) the viewer is still there
     again = Runner(ws)
@@ -201,7 +200,7 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
 
 def test_recorded_inference_replays_identically(stub_server: None, tmp_path: Path) -> None:
     """``client.replay``: a command run on a recording gives the same bytes without the server;
-    a missing recording is a clear error."""
+    without a recording the requests go to the server (exit 3 when there is none)."""
     image = jpeg(tmp_path / "photo.jpg")
     rec = tmp_path / "rec"
     first = subprocess.run([str(REPO / "segment.sh"), "-i", str(image), "--min-score", "0.3"],
@@ -220,8 +219,8 @@ def test_recorded_inference_replays_identically(stub_server: None, tmp_path: Pat
     missing = subprocess.run([str(REPO / "segment.sh"), "-i", str(image)], capture_output=True,
                              timeout=300, env={**env, "OH_MY_SLAM_INFERENCE_REPLAY":
                                                str(tmp_path / "absent")})
-    assert missing.returncode == 1
-    assert b"no inference recording in" in missing.stderr
+    assert missing.returncode == 3, missing.stderr.decode()
+    assert b"./start_inference_server.sh" in missing.stderr
 
 
 def test_a_saved_image_bundle_serves_the_same_viewer(tmp_path: Path) -> None:
@@ -246,3 +245,22 @@ def test_a_saved_image_bundle_serves_the_same_viewer(tmp_path: Path) -> None:
         ha.pop("seconds"), hb.pop("seconds")
         assert ha == hb, query
         assert xa.keys() == xb.keys() and all(np.array_equal(xa[k], xb[k]) for k in xa), query
+
+
+@pytest.mark.parametrize("attrs", [None, "color=height,voxel=0.02"])
+def test_a_ply_reconstruction_with_its_viewer(stub_server: None, svc: tuple[Service, TestClient],
+                                              tmp_path: Path, attrs: str | None) -> None:
+    """``reconstruct -f ply ?viewer=true``: the command asks no segmentation, so the viewer step
+    replays what it recorded and forwards the rest; the result is the command's bytes."""
+    service, client = svc
+    ws = service.workspace
+    image = jpeg(ws.root / "inputs" / "photo.jpg")
+    params = {"image": "inputs/photo.jpg", "format": "ply"} | ({"attrs": attrs} if attrs else {})
+    job = run_job(service, client, "reconstruct", params, query="?viewer=true")
+    assert job["viewer_error"] is None and job["viewer"] == f"/viewer/job/{job['id']}/"
+    res = cli("reconstruct.sh", "-i", str(image.resolve()), "-f", "ply",
+              *(["-p", attrs] if attrs else []))
+    assert client.get(job["result"]["url"]).content == res.stdout
+    assert client.get(f"/viewer/job/{job['id']}/api/meta").json()["mode"] == "image"
+    assert client.get(f"/viewer/job/{job['id']}/api/cloud?color=height").status_code == 200
+    assert not (ws.jobs / job["id"] / "inference").exists()  # the recording is gone

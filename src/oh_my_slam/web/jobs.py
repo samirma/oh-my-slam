@@ -34,6 +34,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,7 +48,15 @@ from typing import Any
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.errors import error_code, http_status, job_state
 from oh_my_slam.core.timing import ENV_PATH, ENV_PROGRESS
-from oh_my_slam.web.operations import OUT_DIR, VIEWER_DIR, Operation, Prepared
+from oh_my_slam.web.operations import (
+    ENV_RECORD,
+    ENV_REPLAY,
+    INFERENCE_DIR,
+    OUT_DIR,
+    VIEWER_DIR,
+    Operation,
+    Prepared,
+)
 from oh_my_slam.web.workspace import Workspace
 
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
@@ -70,6 +79,12 @@ def leader_matches(pgid: int, ctime: float | None, jid: str) -> bool:
         return abs(proc.create_time() - ctime) < 1e-3 and proc.environ().get(ENV_JOB) == jid
     except Exception:  # gone, another user's, unreadable
         return False
+
+
+def _default_sigint() -> None:
+    """In the child before exec: Ctrl-C (a cancel) works even when this service was started with
+    SIGINT ignored (a shell ``&`` job), since an ignored signal stays ignored across exec."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def _ctime(pid: int) -> float | None:
@@ -112,6 +127,7 @@ class Job:
     exit_code: int | None = None
     error: dict[str, Any] | None = None
     viewer: str | None = None
+    viewer_error: dict[str, Any] | None = None  # an optional viewer step failed; result stands
     log_tail: list[str] = field(default_factory=list)
     resubmitted_from: str | None = None
     cancel_requested: bool = False
@@ -166,6 +182,8 @@ class Runner:
         self._lock = threading.RLock()
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._threads: dict[str, threading.Thread] = {}
+        self._checking: set[str] = set()  # conditional jobs whose need is being re-read
+        self._checked: set[str] = set()  # ... and those re-read, ready to start
 
     # -- records -----------------------------------------------------------------------------------
 
@@ -269,8 +287,15 @@ class Runner:
             for job in self.all_jobs():
                 if job.state != "queued":
                     continue
-                if job.conditional and self.reevaluate is not None:
-                    job.inference = self.reevaluate(job)  # what it reads may have changed
+                if job.conditional and self.reevaluate is not None \
+                        and job.id not in self._checked:
+                    # what it reads may have changed: re-read it off the lock, then come back;
+                    # meanwhile it holds its place in the inference order
+                    if job.id not in self._checking:
+                        self._checking.add(job.id)
+                        threading.Thread(target=self._recheck, args=(job,), daemon=True).start()
+                    inference_busy = inference_busy or job.inference
+                    continue
                 if job.writes and job.writes in writing:
                     inference_busy = inference_busy or job.inference  # keeps the order
                     continue
@@ -284,7 +309,22 @@ class Runner:
                     others += 1
                 if job.writes:
                     writing.add(job.writes)
+                self._checked.discard(job.id)
                 self._start(job)
+
+    def _recheck(self, job: Job) -> None:
+        """A conditional job's inference need, read without the lock (it reads e.g. a map)."""
+        assert self.reevaluate is not None
+        try:
+            need = self.reevaluate(job)
+        except Exception:
+            need = True
+        with self._lock:
+            job.inference = need
+            self._checking.discard(job.id)
+            self._checked.add(job.id)
+            self._touch(job)
+            self._schedule()
 
     def _start(self, job: Job) -> None:
         job.state, job.started_at = "running", time.time()
@@ -299,16 +339,34 @@ class Runner:
         try:
             code, message = 0, None
             for step in job.steps:
-                if job.cancel_requested:
+                if job.cancel_requested and not step.get("optional"):
                     code = -int(signal.SIGINT)
                     break
+                if step.get("optional"):  # the result stands whatever this step does
+                    self._optional(job, step)
+                    continue
                 code, message = self._step(job, step)
                 if code != 0:
                     break
+            shutil.rmtree(self.ws.job_dir(job.id) / INFERENCE_DIR, ignore_errors=True)
             self._finish(job, code, message)
         finally:
             with self._lock:
                 self._threads.pop(job.id, None)
+
+    def _optional(self, job: Job, step: dict[str, Any]) -> None:
+        """Run a step whose failure (or cancellation) becomes the job's ``viewer_error``."""
+        code, message = (-int(signal.SIGINT), None) if job.cancel_requested \
+            else self._step(job, step)
+        if code != 0:
+            with self._lock:
+                job.viewer_error = {
+                    "code": error_code(code) if code >= 0 else "interrupted",
+                    "exit_code": code, "http_status": http_status(code),
+                    "message": "cancelled" if job.cancel_requested
+                    else message or self._message(job, code)}
+                self._touch(job, save=True)
+            shutil.rmtree(self.ws.job_dir(job.id) / VIEWER_DIR, ignore_errors=True)
 
     def _step(self, job: Job, step: dict[str, Any]) -> tuple[int, str | None]:
         d = self.ws.job_dir(job.id)
@@ -316,7 +374,8 @@ class Runner:
         progress = d / "progress.jsonl"
         progress.touch()
         offset = progress.stat().st_size  # this step's events start here
-        env = {**os.environ, **step.get("env", {}), ENV_PROGRESS: str(progress),
+        inherited = {k: v for k, v in os.environ.items() if k not in (ENV_RECORD, ENV_REPLAY)}
+        env = {**inherited, **step.get("env", {}), ENV_PROGRESS: str(progress),
                ENV_JOB: job.id, "PYTHONUNBUFFERED": "1"}
         env.pop(ENV_PATH, None)
         if step.get("timings", True):
@@ -326,7 +385,7 @@ class Runner:
                 proc = subprocess.Popen([self.python, "-m", step["module"], *step["argv"]],
                                         stdin=subprocess.DEVNULL, stdout=out,
                                         stderr=subprocess.PIPE, cwd=self.ws.root, env=env,
-                                        start_new_session=True)
+                                        start_new_session=True, preexec_fn=_default_sigint)
         except OSError as exc:
             return 1, f"could not start the command: {exc}"
         with self._lock:

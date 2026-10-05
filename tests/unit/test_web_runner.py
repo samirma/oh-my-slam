@@ -233,9 +233,73 @@ def test_service_shutdown_cancels_running_and_queued_jobs(ws: Workspace) -> None
 def test_a_conditional_jobs_inference_need_is_rechecked_when_it_starts(ws: Workspace) -> None:
     """Queued behind an inference job, a job whose need depends on what it reads is re-checked
     when it may start: no longer needing inference, it runs at once."""
-    runner = Runner(ws, reevaluate=lambda job: False)
-    first = runner.submit(slow_op(), {}, slow(2), runner.new_id())
+    import threading
+
+    reads: list[str] = []
+
+    def reevaluate(job: Job) -> bool:  # read on its own thread, never the scheduling caller's
+        reads.append(threading.current_thread().name)
+        return False
+
+    runner = Runner(ws, reevaluate=reevaluate)
+    first = runner.submit(slow_op(), {}, slow(3), runner.new_id())
     cond = runner.submit(slow_op(), {}, slow(0, conditional=True), runner.new_id())
-    assert runner.get(cond.id).state == "running" and not runner.get(cond.id).inference
-    assert runner.get(first.id).state == "running"
+    wait_for(lambda: runner.get(cond.id).state != "queued")
+    assert not runner.get(cond.id).inference
+    assert reads and threading.main_thread().name not in reads
+    assert runner.get(first.id).state == "running"  # it ran beside the inference job
+    runner.shutdown()
+
+
+def test_a_failed_viewer_step_leaves_the_result(ws: Workspace, tmp_path: Path) -> None:
+    """An optional viewer step that fails — here it must forward a request and no inference
+    server is reachable — becomes the job's ``viewer_error``; the job succeeded."""
+    from oh_my_slam.web.operations import Step
+    from tests.unit.test_web_api import jpeg
+
+    image = jpeg(ws.root / "in" / "a.jpg")
+    nowhere = tmp_path / "no-server"
+    nowhere.mkdir()
+    runner = Runner(ws)
+    jid = runner.new_id()
+    viewer = Step("view.sh", "oh_my_slam.cli.view_save",
+                  [str(ws.job_dir(jid) / "viewer"), "view.sh", f"-i={image}"], timings=False,
+                  optional=True, env={"OH_MY_SLAM_INFERENCE_REPLAY": str(tmp_path / "none"),
+                                      "OH_MY_SLAM_RUNTIME_DIR": str(nowhere)})
+    prep = slow(0, inference=False)
+    prep.steps.append(viewer)
+    prep.viewer = True
+    job = runner.wait(runner.submit(slow_op(), {}, prep, jid).id, 120)
+    assert job.state == "succeeded" and job.viewer is None
+    assert job.viewer_error is not None and job.viewer_error["code"] == "server_unavailable"
+    assert "./start_inference_server.sh" in job.viewer_error["message"]
+    runner.shutdown()
+
+
+def test_cancel_works_when_the_service_ignores_sigint(ws: Workspace) -> None:
+    """Started as a shell ``&`` job, the service has SIGINT ignored; its jobs still get Ctrl-C."""
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        runner = Runner(ws)
+        job = runner.submit(slow_op(), {}, slow(30), runner.new_id())
+        wait_for(lambda: runner.get(job.id).progress is not None)
+        runner.cancel(job.id)
+        job = runner.wait(job.id, 20)
+        assert job.state == "cancelled" and job.exit_code == 130
+        runner.shutdown()
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+def test_steps_do_not_inherit_a_recording(ws: Workspace, monkeypatch: pytest.MonkeyPatch,
+                                          tmp_path: Path) -> None:
+    monkeypatch.setenv("OH_MY_SLAM_INFERENCE_REPLAY", str(tmp_path / "stale"))
+    monkeypatch.setenv("OH_MY_SLAM_INFERENCE_RECORD", str(tmp_path / "stale"))
+    runner = Runner(ws)
+    job = runner.submit(slow_op(), {}, slow(5), runner.new_id())
+    wait_for(lambda: runner.get(job.id).pgid is not None)
+    import psutil
+
+    env = psutil.Process(runner.get(job.id).pgid).environ()
+    assert "OH_MY_SLAM_INFERENCE_REPLAY" not in env and "OH_MY_SLAM_INFERENCE_RECORD" not in env
     runner.shutdown()

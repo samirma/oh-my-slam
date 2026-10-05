@@ -21,7 +21,9 @@ given the command's own command line, which saves the bundle view.sh would serve
 ``viewer/`` folder, so that the service serves that viewer in-process, after a page reload or a
 service restart too. A browser mode runs only that step. After a command step, the viewer step
 replays the command's recorded inference (``client.replay``): no second pass, the same
-detections and ids.
+detections and ids; what the command did not ask (e.g. ``reconstruct.sh -f ply`` runs no
+segmentation) goes to the server. Such a viewer step is optional: its failure is the job's
+``viewer_error``, and the command's result stands.
 """
 
 from __future__ import annotations
@@ -114,6 +116,8 @@ class Step:
     argv: list[str]
     timings: bool = True  # records OH_MY_SLAM_TIMINGS (the command's own record)
     env: dict[str, str] = field(default_factory=dict)
+    # a step whose failure leaves the job's result standing (the viewer after a command)
+    optional: bool = False
 
 
 @dataclass
@@ -239,7 +243,7 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path, viewer: bool
     if (op.browser or viewer) and viewed is not None:
         prep.steps.append(Step(VIEWER_PROG, VIEWER_MODULE,
                                [str(job_dir / VIEWER_DIR), op.program.prog, *argv],
-                               timings=op.browser,
+                               timings=op.browser, optional=not op.browser,
                                env={} if op.browser else {ENV_REPLAY: recording}))
         prep.viewer = True
     return prep
