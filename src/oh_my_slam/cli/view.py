@@ -51,7 +51,7 @@ def build_parser() -> ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    spec.validate(COMMAND, args, log.warning)  # -i exists or -m is a map, before any work
+    v = spec.validate(COMMAND, args, log.warning)  # -i exists or -m is a map, before any work
     claim_stdout()  # nothing goes to stdout; the URL is printed on stderr
     from oh_my_slam.viewer.bundle import image_bundle, map_bundle
     from oh_my_slam.viewer.server import serve, url_of
@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
             with timing.stage(Stage.INFERENCE):
                 bundle = image_bundle(args.image, client)
     else:
-        bundle = map_bundle(args.map)
+        bundle = map_bundle(args.map, reader=v.reader)  # the reader the map rule opened
     _install_stop_handlers()
     httpd = serve(bundle)
     try:

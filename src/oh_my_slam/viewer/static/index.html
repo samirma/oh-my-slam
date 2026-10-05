@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>oh-my-slam viewer</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="static/style.css">
   <script type="importmap">
     {
       "imports": {
-        "three": "/static/vendor/three/build/three.module.js",
-        "three/addons/": "/static/vendor/three/addons/"
+        "three": "./static/vendor/three/build/three.module.js",
+        "three/addons/": "./static/vendor/three/addons/"
       }
     }
   </script>
@@ -30,7 +30,7 @@
         <div class="group" id="group-layers">
           <h2>Layers</h2>
           <div class="rows" id="layers"></div>
-          <p id="labels-note" class="hint" role="status" hidden></p>
+          <p id="labels-note" class="hint" aria-live="off" hidden></p>
         </div>
         <div class="group" id="group-cloud">
           <h2>Point cloud</h2>
@@ -67,6 +67,6 @@
       <div id="loading-title">Loading scene…</div>
     </div>
   </div>
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="static/app.js"></script>
 </body>
 </html>
