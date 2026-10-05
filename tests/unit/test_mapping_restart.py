@@ -95,7 +95,7 @@ def test_a_weak_first_update_is_rebuilt_with_the_next(
     assert all(api._weak_keyframe(api.store.FrameRecord.from_dict(f)) for f in frames)
     two = json.loads(update(split, rest, client=client, progress=_quiet).payload)
     meta = json.loads((split / "map.json").read_text())
-    assert meta["updates"][-1]["notes"]["restarted"] == {"stored_keyframes": len(first)}
+    assert meta["updates"][-1]["notes"]["restarted"]["stored_keyframes"] == len(first)
     assert meta["updates"][0]["frames_added"] == [f"f{k:06d}" for k in range(4)]
     a, b = objects_by_label(one), objects_by_label(two)
     assert sorted(a) == sorted(b) == ["box", "cabinet", "sofa"], (a.keys(), b.keys())
@@ -123,27 +123,37 @@ def test_a_map_posed_by_sfm_is_extended(
 
 
 def _resolve(mdir: Path, oid: int) -> int:
+    """``oid`` through the map's merges, permanent and provisional (``rebuild_merged``)."""
+    d = json.loads((mdir / "objects.json").read_text())
     merged = {int(k): int(v) for k, v in
-              json.loads((mdir / "objects.json").read_text()).get("merged_into", {}).items()}
-    while oid in merged:
+              {**d.get("rebuild_merged", {}), **d.get("merged_into", {})}.items()}
+    seen = set()
+    while oid in merged and oid not in seen:
+        seen.add(oid)
         oid = merged[oid]
     return oid
 
 
 def _ids_persist(mdir: Path, before: dict, after: dict) -> None:  # type: ignore[type-arg]
-    """Every id ``before`` published resolves (itself, or through ``merged_into``) to an object of
-    ``after`` with a compatible label, or an update reported it removed (or kept as a candidate
-    only: ``unpublished``)."""
+    """Every id ``before`` published resolves (itself, or through the merges) to an object of
+    ``after`` with a compatible label, the one of that label nearest the published box (the same
+    object, not another one the id moved to: a weakly posed map placed it decimetres off, but
+    not nearer another), or an update reported it removed (or kept as a candidate only:
+    ``unpublished``)."""
     from oh_my_slam.segmentation.detect import compatible
 
-    now = {int(k): o["type"] for k, o in after["openlabel"]["objects"].items()}
+    now = {int(k): o for k, o in after["openlabel"]["objects"].items()}
     removed = {oid for u in json.loads((mdir / "map.json").read_text())["updates"]
                for oid in u["objects"]["removed"] + u["objects"].get("unpublished", [])}
     for k, o in before["openlabel"]["objects"].items():
         oid = _resolve(mdir, int(k))
         assert oid in now or int(k) in removed, (k, o["type"], sorted(now))
         if oid in now:
-            assert compatible(o["type"], now[oid]), (k, o["type"], now[oid])
+            assert compatible(o["type"], now[oid]["type"]), (k, o["type"], now[oid]["type"])
+            c = cuboid_obb(o).center
+            near = min((j for j, x in now.items() if compatible(o["type"], x["type"])),
+                       key=lambda j: float(np.linalg.norm(cuboid_obb(now[j]).center - c)))
+            assert near == oid, (k, o["type"], oid, near)
 
 
 def test_published_ids_survive_a_rebuild_whatever_the_server_says_again(
@@ -243,3 +253,56 @@ def test_an_object_an_update_removed_does_not_come_back_with_a_rebuild(
     assert "chair" not in {o["type"] for o in doc["openlabel"]["objects"].values()}
     assert _resolve(m, chair_id) not in {int(k) for k in doc["openlabel"]["objects"]}
     _ids_persist(m, one, doc)
+
+
+def test_no_rebuild_when_the_last_two_left_the_same_keyframes_weak(
+        views: tuple[FakeClient, list[Path], list[Path]], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rebuilt twice, a map whose same keyframes stay weak (here the first one, taken as weak
+    whatever its pose) is extended by the next update, which says why."""
+    monkeypatch.setattr(api, "_weak_keyframe", lambda rec: rec.name == "f000000")
+    client, first, rest = views
+    m = tmp_path / "m"
+    for part in (first, rest[:4], rest[4:8], rest[8:]):
+        update(m, part, client=client, progress=_quiet)
+    notes = [u["notes"] for u in json.loads((m / "map.json").read_text())["updates"]]
+    assert ["restarted" in n for n in notes] == [False, True, True, False]
+    assert notes[1]["restarted"]["weak"] == notes[2]["restarted"]["weak"] == ["f000000"]
+    assert "no progress" in notes[3]["restart_skipped"]
+
+
+def test_an_abandoned_rebuild_extends_the_map_as_an_extension_does(
+        views: tuple[FakeClient, list[Path], list[Path]], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rebuild's focal re-run and alignment of the new keyframes are undone when it is
+    abandoned: the map is extended exactly as without a rebuild (one thread: COLMAP repeats)."""
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    monkeypatch.setattr(sfm_mod, "SFM_THREADS", 1)
+    client, first, rest = views
+    base = tmp_path / "base"
+    update(base, first, client=client, progress=_quiet)
+    plain, abandoned = tmp_path / "plain", tmp_path / "abandoned"
+    shutil.copytree(base, plain)
+    shutil.copytree(base, abandoned)
+    with monkeypatch.context() as mp:
+        mp.setattr(api, "RESTART_MAX_KEYFRAMES", 0)
+        update(plain, rest, client=client, progress=_quiet)
+    real = api._place
+
+    def losing_one(ctx, *a, **k):  # type: ignore[no-untyped-def]
+        model = real(ctx, *a, **k)
+        if ctx.rebuild is not None:
+            next(nf for nf in ctx.new if nf.kf.name in ctx.rebuild.uids).record = None
+        return model
+
+    monkeypatch.setattr(api, "_place", losing_one)
+    update(abandoned, rest, client=client, progress=_quiet)
+    a = json.loads((plain / "frames.json").read_text())["frames"]
+    b = json.loads((abandoned / "frames.json").read_text())["frames"]
+    assert [f["name"] for f in a] == [f["name"] for f in b]
+    for fa, fb in zip(a, b, strict=True):  # up to floating-point noise
+        ta, tb = fa["T_map_cam"], fb["T_map_cam"]
+        assert np.allclose(ta["translation"], tb["translation"], atol=1e-4), fa["name"]
+        assert np.allclose(ta["quaternion_xyzw"], tb["quaternion_xyzw"], atol=1e-4), fa["name"]
+        assert fa["K"] == fb["K"], fa["name"]

@@ -778,15 +778,24 @@ class ObjectState:
     invalidated: dict[int, int] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     vacated: list[Vacated] = field(default_factory=list)  # places of removed objects (all updates)
+    # the published ids the last rebuild found on detections of another object (id -> that
+    # object's id): provisional, each rebuild recomputes them, so that an id returns to its
+    # founder when a later rebuild separates the objects again (``_published_ids``)
+    rebuild_merged: dict[int, int] = field(default_factory=dict)
 
     def by_id(self) -> dict[int, MapObject]:
         return {o.id: o for o in self.objects}
 
+    def merges(self) -> dict[int, int]:
+        """Every id -> the id it resolves to in one step: the permanent merges first."""
+        return {**self.rebuild_merged, **self.merged_into}
+
     def resolve(self, oid: int) -> int | None:
         seen = set()
-        while oid in self.merged_into and oid not in seen:
+        merges = self.merges()
+        while oid in merges and oid not in seen:
             seen.add(oid)
-            oid = self.merged_into[oid]
+            oid = merges[oid]
         return oid if oid in self.by_id() else None
 
     def exported(self) -> list[SceneObject]:
@@ -836,7 +845,9 @@ def load_state(current: Any, meta: dict[str, Any]) -> ObjectState:
     return ObjectState(objs, int(d.get("next_id", meta.get("next_object_id", 1))),
                        {int(k): int(v) for k, v in d.get("merged_into", {}).items()},
                        floor_z=d.get("floor_z", meta.get("floor_z")),
-                       vacated=[Vacated.from_dict(v) for v in d.get("vacated", [])])
+                       vacated=[Vacated.from_dict(v) for v in d.get("vacated", [])],
+                       rebuild_merged={int(k): int(v)
+                                       for k, v in d.get("rebuild_merged", {}).items()})
 
 
 def load_vacated(current: Any) -> list[Vacated]:
@@ -1164,11 +1175,15 @@ def map_floor(ctx: Any, per_frame: int | None = None) -> tuple[NDArray[np.float6
     return allp, floor_candidate_height(allp[:, 2], max_below=MAP_FLOOR_MAX_BELOW)
 
 
-def _instances_json(frame_items: list[tuple[int, LiftedInstance]]) -> dict[str, Any]:
+def _instances_json(frame_items: list[tuple[int, int, LiftedInstance]]) -> dict[str, Any]:
+    """A keyframe's ``instances.json``: per detection the id of its object now (``object_id``)
+    and the id it was first published with (``first_id``, never rewritten: a rebuild gives a
+    published id back to the object of its founding detection, ``_published_ids``)."""
     return {"instances": [
-        {"object_id": oid, "label": inst.detection.label, "score": inst.detection.score,
-         "source": inst.detection.source, "mask": rle.encode(inst.mask)}
-        for oid, inst in frame_items
+        {"object_id": oid, "first_id": first, "label": inst.detection.label,
+         "score": inst.detection.score, "source": inst.detection.source,
+         "mask": rle.encode(inst.mask)}
+        for oid, first, inst in frame_items
     ]}
 
 
@@ -1254,6 +1269,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     # are numbered on from the map's count (``prior_floor``), as an update that extends it does
     rb = getattr(ctx, "rebuild", None)
     prior: dict[int, int] = rb.prior if rb is not None else {}
+    first: dict[int, int] = rb.first if rb is not None else {}
     floor = rb.next_id if rb is not None else 0
     if rb is not None:
         state.vacated = list(rb.vacated)
@@ -1318,7 +1334,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     instances: dict[int, list[tuple[int, Any]]] = {}
     for i, ob in enumerate(obs):
         instances.setdefault(ob.frame, []).append((owner[i], ob.inst.mask))
-    masks = _Masks(ctx, views, instances, state.merged_into, alias)
+    masks = _Masks(ctx, views, instances, state.merges(), alias)
     merged = _merge(state, touched, alias, views, surfaces, masks)
     for o in state.objects:
         o.forget_tree()
@@ -1439,7 +1455,8 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
 
     for f, idxs in per_frame.items():
         nf, _ = new_views[f]
-        items = [(final_id(owner[i]), m) for i in idxs for m in obs[i].members]
+        items = [(final_id(owner[i]), first.get(id(m.detection), final_id(owner[i])), m)
+                 for i in idxs for m in obs[i].members]
         tx.write_json(frame_file(nf.record.name, "instances.json"), _instances_json(items))
     state.observed = touched
     for o in state.objects:
@@ -1553,6 +1570,7 @@ def save_state(tx: Any, state: ObjectState) -> None:
         "next_id": state.next_id,
         "floor_z": state.floor_z,
         "merged_into": {str(k): v for k, v in sorted(state.merged_into.items())},
+        "rebuild_merged": {str(k): v for k, v in sorted(state.rebuild_merged.items())},
         "objects": [o.to_dict() for o in sorted(state.objects, key=lambda o: o.id)],
         "vacated": [v.to_dict() for v in state.vacated],
     })
@@ -3290,23 +3308,21 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
 
 def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
                     absorbed: dict[int, int], gone: set[int]) -> list[int]:
-    """After a rebuild: the ids the map published live on. A published id another object took
-    the detections of resolves to it (``merged_into``), as do the map's earlier merges; an object
+    """After a rebuild: the ids the map published live on. A published id another object owns
+    the founding detection of resolves to it, provisionally (``rebuild_merged``: the next rebuild
+    decides again), and the map's merges (``merged_into``) carry over; an object
     that keeps a published id keeps its creation update; a published id nothing took is returned
     (the update's ``removed``): none vanishes unreported."""
     finals = {o.id for o in state.objects}
-    for p, k in absorbed.items():
-        if k not in gone and final_of.get(k) in finals:
-            state.merged_into[p] = final_of[k]
+    state.rebuild_merged = {p: final_of[k] for p, k in absorbed.items()
+                            if k not in gone and final_of.get(k) in finals}
     for a, b in sorted(rb.merged_into.items()):
-        while b in state.merged_into and state.merged_into[b] != b:
-            b = state.merged_into[b]
-        if b in finals and a not in finals:
+        if a not in finals:
             state.merged_into[a] = b
     for o in state.objects:
         if o.id in rb.created:
             o.created_update = min(o.created_update, rb.created[o.id])
-    return sorted(set(rb.created) - finals - set(state.merged_into))
+    return sorted(set(rb.created) - finals - set(state.merged_into) - set(state.rebuild_merged))
 
 
 def _unpublished(state: ObjectState, rb: Any) -> list[int]:

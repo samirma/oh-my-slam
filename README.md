@@ -740,7 +740,10 @@ produces it. The `color=height` ramp is viridis.
 An update writes everything into `.staging/`, then records the list of staged files (the commit
 point), moves them into place, and writes `map.json` last. An update killed before the commit
 point leaves the map untouched. One killed after it is completed by the next update. Readers
-(`segment.sh -m`, `view.sh -m`) never lock or write. Do not edit files in `.staging/`.
+(`segment.sh -m`, `view.sh -m`) never lock or write. Do not edit files in `.staging/`. A reader
+that starts while an update applies its commit can read a mix of old and new files: it reads a
+file that vanishes in between once more, but it has no snapshot of the whole map, and a rebuild,
+which replaces most files, widens that window.
 
 ### Update semantics
 
@@ -1197,18 +1200,21 @@ pixels, so its results are unchanged.
        the update that added it: latest wins judges the rebuild's verdicts update by update (an
        object's strikes as those updates gave them), and the places of removed objects carry
        over.
-     * *Ids.* An id the map published stays: a rebuilt object takes the id of the earliest
-       stored detection it owns (the detection the id was first given with), and the lowest of
-       several; the other published ids it owns resolve to it (`objects.json → merged_into`),
-       as do the map's earlier merges. A published id that no object takes is listed in the
-       update's `objects.removed`, and one whose object is kept only as a candidate in
-       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
-       numbered on from the map's count, as an extension numbers them. So ids can differ from
-       the one-update map's where an earlier update had published one (spec §2.3): in
-       `office_sequence` split 4 + 4 + 5 or 6 + 7, the four window photos alone place the two
-       windows together as one object (id 9), a rebuild separates them, and the second window
-       gets a new id (65, or 26 when the second update published that one) where the one-update
-       map numbers it 21.
+     * *Ids.* An id the map published stays with its object. Each detection records the id it
+       was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
+       object takes the ids of the stored detections it owns that were the first to carry
+       them (an id's founding detection), the lowest of several. The other ids it got resolve to
+       it provisionally (`objects.json → rebuild_merged`): each rebuild decides again, so an id
+       returns to its founder when a later rebuild separates two objects an earlier one merged.
+       The map's other merges (`merged_into`) are permanent. A published id that no object takes
+       is listed in the update's `objects.removed`, and one whose object is kept only as a
+       candidate in `objects.unpublished`; none vanishes unreported. Objects first seen by the
+       new photos are numbered on from the map's count, as an extension numbers them. So ids can
+       differ from the one-update map's where an earlier update had published one (spec §2.3):
+       in `office_sequence` split 4 + 4 + 5, the four window photos publish two windows (9 and
+       22), the rebuild of the next update merges them into one (22 resolves to 9 meanwhile),
+       and the rebuild after separates them again: 22 is the second window's again, where the
+       one-update map numbers it 21.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
        took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
        (extending: 84 s; the whole sequence in one update: 158 s).

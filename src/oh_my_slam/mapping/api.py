@@ -113,14 +113,16 @@ class UpdateContext:
 @dataclass
 class Rebuild:
     """What a rebuild keeps of the map it replaces: the update that added each stored keyframe
-    (``uids``, by name), the id the map published for each stored detection (``prior``: the
-    ``id()`` of the stored keyframes' ``Detection`` -> id, its merges resolved), the map's object
+    (``uids``, by name), the id each stored detection was first published with (``first``: the
+    ``id()`` of the stored keyframes' ``Detection`` -> id; ``prior``: the same through the map's
+    permanent merges, not the provisional ones a rebuild made), the map's object
     count (``next_id``: the new keyframes' detections are numbered on from it), its merges, the
     creation update of each published (confirmed) object (``created``) and the places of the objects its
     updates removed (``vacated``; their pixels stay retired in the stored keyframes)."""
 
     uids: dict[str, int]
     prior: dict[int, int]
+    first: dict[int, int]  # the ``id()`` of a stored ``Detection`` -> the id it was first given
     next_id: int
     merged_into: dict[int, int]
     created: dict[int, int]
@@ -1861,8 +1863,10 @@ def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: inge
     map is not rebuilt (the update's ``restart_skipped`` note), else None.
 
     A map is rebuilt when its keyframes are photos (every update), at most
-    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``), unless its last
-    update already rebuilt it and left it rotation-dominant (``ROTATION_PAIR_FRACTION`` of the
+    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``), unless the last two
+    rebuilds left the same keyframes weak and those are still the weak ones
+    (``notes.restarted.weak``: more photos did not help, and a rebuild costs more each time), or
+    its last update already rebuilt it and left it rotation-dominant (``ROTATION_PAIR_FRACTION`` of the
     verified pairs panoramic): a pan from one spot, which the photos added did not give the
     parallax to triangulate; rebuilt on every update, it would cost more each time."""
     updates = meta.get("updates", [])
@@ -1871,6 +1875,10 @@ def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: inge
         return [], None
     if len(old) > RESTART_MAX_KEYFRAMES:
         return [], f"more than {RESTART_MAX_KEYFRAMES} keyframes"
+    rebuilt = [u["notes"]["restarted"] for u in updates if "restarted" in u.get("notes", {})]
+    weak = sorted(r.name for r in old if _weak_keyframe(r))
+    if len(rebuilt) >= 2 and rebuilt[-1].get("weak") == rebuilt[-2].get("weak") == weak:
+        return [], "the last two rebuilds left the same keyframes weak: no progress"
     last = updates[-1].get("notes", {}) if updates else {}
     if ("restarted" in last
             and float(last.get("two_view", {}).get("rotation_fraction", 0.0))
@@ -1880,12 +1888,13 @@ def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: inge
 
 
 def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[int, int],
-                  resolve: Callable[[int], int]) -> NewFrame:
+                  first: dict[int, int], resolve: Callable[[int], int]) -> NewFrame:
     """A stored keyframe as a new one for a rebuild, from what the map holds of it, without the
     inference server: its image (staged again), aligned depth and validity (retired pixels
     stay retired: the objects the map's updates removed do not come back), refined intrinsics,
-    gravity, descriptor, and detections (``instances.json``; each records the id it got, which
-    ``prior`` keeps, resolved by ``resolve``)."""
+    gravity, descriptor, and detections (``instances.json``; each records the id it was first
+    published with, ``first_id``, which ``first`` keeps, and ``prior`` resolved by ``resolve``;
+    a map written before ``first_id`` gives its ``object_id``)."""
     from oh_my_slam.core.images import load_rgb
     from oh_my_slam.core.rle import decode
     from oh_my_slam.reconstruction.gravity import GravityEstimate
@@ -1912,8 +1921,10 @@ def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[
                         (float(xs.min()), float(ys.min()), float(xs.max() + 1),
                          float(ys.max() + 1)))
         dets.append(det)
-        if int(it.get("object_id", 0)) > 0:
-            prior[id(det)] = resolve(int(it["object_id"]))
+        fid = int(it.get("first_id", it.get("object_id", 0)))
+        if fid > 0:
+            first[id(det)] = fid
+            prior[id(det)] = resolve(fid)
     kf = ingest.Keyframe(rec.name, rec.index, dst, rec.source, rec.K)
     return NewFrame(kf, frame, dets, (rec.width, rec.height))
 
@@ -1936,6 +1947,10 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
     from oh_my_slam.mapping.objects import load_state
 
     saved = json.loads(json.dumps(meta))
+    # the new keyframes as inference gave them: an abandoned rebuild extends the map with them
+    # exactly as a plain extension would (the rebuild's focal re-run and alignment are undone)
+    frames = [replace(nf.frame, depth=nf.frame.depth.copy(), valid=nf.frame.valid.copy())
+              for nf in new]
     state = load_state(tx.current, meta)
 
     def resolve(oid: int) -> int:
@@ -1946,8 +1961,9 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
         return oid
 
     prior: dict[int, int] = {}
-    stored = [_stored_frame(tx, r, prior, resolve) for r in plan]
-    rb = Rebuild({r.name: r.update_id for r in plan}, prior, int(state.next_id),
+    first: dict[int, int] = {}
+    stored = [_stored_frame(tx, r, prior, first, resolve) for r in plan]
+    rb = Rebuild({r.name: r.update_id for r in plan}, prior, first, int(state.next_id),
                  dict(state.merged_into),
                  {o.id: o.created_update for o in state.objects if o.confirmed},
                  list(state.vacated),
@@ -1969,7 +1985,9 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
     except RegistrationError as e:
         left, model = [f"({e})"], None
     if model is not None and not left:
-        ctx.notes["restarted"] = {"stored_keyframes": len(plan)}
+        weak = sorted(nf.kf.name for nf in ctx.new
+                      if nf.record is not None and _weak_keyframe(nf.record))
+        ctx.notes["restarted"] = {"stored_keyframes": len(plan), "weak": weak}
         ctx.rejected = [n for n in ctx.rejected if n not in names]
         return ctx, model
     progress("rebuild abandoned (it would leave out stored keyframes: " + ", ".join(left[:10])
@@ -1977,8 +1995,8 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
     tx.resume()
     meta.clear()
     meta.update(saved)
-    for nf in new:
-        nf.record, nf.depth = None, None
+    for nf, frame in zip(new, frames, strict=True):
+        nf.frame, nf.record, nf.depth = frame, None, None
     ctx = UpdateContext(tx, meta, old, new, update_id, work)
     ctx.notes["restart_abandoned"] = {"left_out": left}
     return ctx, None
