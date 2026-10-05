@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -39,6 +39,9 @@ from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
+
+if TYPE_CHECKING:
+    from oh_my_slam.mapping.store import MapReader
 
 Json = dict[str, Any]
 log = get_logger("oh_my_slam.viewer")
@@ -288,15 +291,17 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
     )
 
 
-def map_bundle(map_dir: Path) -> ViewBundle:
-    """Open a persisted map read-only (no inference server, nothing written)."""
+def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
+    """Open a persisted map read-only (no inference server, nothing written); ``reader``: the
+    ``mapping.store.MapReader`` of ``map_dir`` when already opened (view.sh's map rule)."""
     import json
 
     from oh_my_slam.mapping import store
     from oh_my_slam.mapping.export import map_objects, reader_source, scene_bytes
     from oh_my_slam.segmentation.catalog import catalog_rows
 
-    reader = store.MapReader(Path(map_dir))
+    if reader is None:
+        reader = store.MapReader(Path(map_dir))
     _, objs = map_objects(reader)
     source = reader_source(reader, objs)
     bundle = ViewBundle(

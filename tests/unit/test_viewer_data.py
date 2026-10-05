@@ -239,3 +239,18 @@ def test_map_cloud_is_the_segment_m_ply(map_view: Any) -> None:
     assert int((arrays["label"] > 0).sum()) > 0
     assert set(np.unique(arrays["label"]).tolist()) - {0} <= {
         int(k) for k in scene["openlabel"]["objects"]}
+
+
+@needs_colmap
+def test_map_bundle_uses_the_reader_it_is_given(map_view: Any,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """view.sh -m passes the reader its map rule opened, so map.json is read once."""
+    from oh_my_slam.mapping import store
+
+    _, root, _ = map_view
+    reader = store.MapReader(root)
+    opened: list[Path] = []
+    real = store.MapReader
+    monkeypatch.setattr(store, "MapReader", lambda p: opened.append(p) or real(p))
+    bundle = map_bundle(root, reader=reader)
+    assert opened == [] and bundle.title == root.name
