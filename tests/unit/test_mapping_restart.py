@@ -138,13 +138,12 @@ def _ids_persist(mdir: Path, before: dict, after: dict) -> None:  # type: ignore
     """Every id ``before`` published resolves (itself, or through the merges) to an object of
     ``after`` with a compatible label, the one of that label nearest the published box (the same
     object, not another one the id moved to: a weakly posed map placed it decimetres off, but
-    not nearer another), or an update reported it removed (or kept as a candidate only:
-    ``unpublished``)."""
+    not nearer another), or an update reported it removed."""
     from oh_my_slam.segmentation.detect import compatible
 
     now = {int(k): o for k, o in after["openlabel"]["objects"].items()}
     removed = {oid for u in json.loads((mdir / "map.json").read_text())["updates"]
-               for oid in u["objects"]["removed"] + u["objects"].get("unpublished", [])}
+               for oid in u["objects"]["removed"]}
     for k, o in before["openlabel"]["objects"].items():
         oid = _resolve(mdir, int(k))
         assert oid in now or int(k) in removed, (k, o["type"], sorted(now))
@@ -177,6 +176,53 @@ def test_published_ids_survive_a_rebuild_whatever_the_server_says_again(
     after = json.loads(update(m, rest, client=forgetful, progress=_quiet).payload)
     assert json.loads((m / "map.json").read_text())["updates"][-1]["notes"]["restarted"]
     _ids_persist(m, published, after)
+
+
+def test_a_published_object_stays_published_through_rebuilds(
+        views: tuple[FakeClient, list[Path], list[Path]], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Published objects stay published (user ruling 2026-10-05): the rebuilds of updates 2 and
+    3 confirm nothing on their evidence alone (an object needs more detections than there are
+    keyframes), yet every object update 1 published stays exported with its id, label and
+    colour, and nothing is reported removed. Objects only the new views saw are not published."""
+    from oh_my_slam.mapping import objects as mo
+
+    shared, first, rest = views
+    # a client of its own: the shared one's call count seeds the multi-view noise of the tests
+    # that follow
+    client = FakeClient(mv_noise=shared.mv_noise)
+    client.frames = dict(shared.frames)
+    m = tmp_path / "m"
+    published = json.loads(update(m, first, client=client, progress=_quiet).payload)
+    before = {int(k): o["type"] for k, o in published["openlabel"]["objects"].items()}
+    assert before
+    monkeypatch.setattr(api, "_weak_keyframe", lambda rec: True)  # every update rebuilds
+    monkeypatch.setattr(mo, "CONFIRM_DETECTIONS", 1000)
+    ranked: list[set[int] | None] = []  # the ids a rebuild ranks first: the exported ones
+    real_ids = mo._published_ids
+
+    def spy(*a, **k):  # type: ignore[no-untyped-def]
+        ranked.append(a[8] if len(a) > 8 else k.get("published"))
+        return real_ids(*a, **k)
+
+    monkeypatch.setattr(mo, "_published_ids", spy)
+    exported_before = set(before)
+    for k, part in enumerate([rest[:6], rest[6:]]):
+        after = json.loads(update(m, part, client=client, progress=_quiet).payload)
+        meta = json.loads((m / "map.json").read_text())
+        assert meta["updates"][-1]["notes"]["restarted"], k
+        assert meta["updates"][-1]["objects"]["removed"] == [], k
+        assert "unpublished" not in meta["updates"][-1]["objects"]
+        now = {int(i): o for i, o in after["openlabel"]["objects"].items()}
+        for oid, label in before.items():
+            r = _resolve(m, oid)
+            assert r in now and now[r]["type"] == label, (k, oid, label, r, sorted(now))
+        state = mo.load_state(lambda name: m / name, meta)
+        assert {o.id for o in state.objects if o.confirmed} == set(now)
+        assert all(o.published for o in state.objects if o.id in now)
+        assert ranked[-1] == exported_before, (ranked[-1], k)
+        exported_before = set(now)
+        _ids_persist(m, published, after)
 
 
 def test_a_rebuild_that_would_leave_out_a_stored_keyframe_extends_the_map(

@@ -181,8 +181,14 @@ def test_a_thin_object_with_a_token_vote_takes_its_surface() -> None:
     state = ObjectState([o], 200)
     mo.set_cloud_counts(tx, state, label, VOXEL)
     assert o.cloud_min == need and [x.id for x in state.exported()] == [74]
-    # with only the token point it would not be exported
-    mo.set_cloud_counts(tx, state, np.where(np.arange(len(pts)) == 0, o.id, 0), VOXEL)
+    # with only the token point it would not be exported, unless an update had published it
+    # (published objects stay published)
+    token = np.where(np.arange(len(pts)) == 0, o.id, 0)
+    assert o.published
+    mo.set_cloud_counts(tx, state, token, VOXEL)
+    assert [x.id for x in state.exported()] == [74]
+    o.published = False
+    mo.set_cloud_counts(tx, state, token, VOXEL)
     assert state.exported() == []
     stored = written[mo.OBJECTS_JSON]["objects"][0]  # type: ignore[index]
     assert stored["cloud_min_points"] == need
@@ -221,8 +227,11 @@ def parked_car(distance: float, oid: int = 58) -> MapObject:
 
 
 def _counts(objs: list[MapObject], label: np.ndarray, focal: float = 0.0) -> list[int]:
-    """Export ids after recording ``label`` as the cloud's object ids."""
+    """Export ids after recording ``label`` as the cloud's object ids (of objects no update
+    published before)."""
     from types import SimpleNamespace
+    for o in objs:
+        o.published = False
     state = ObjectState(objs, 600)
     tx = SimpleNamespace(write_json=lambda rel, obj: None)
     mo.set_cloud_counts(tx, state, label, STREET_VOXEL, focal)
@@ -323,6 +332,7 @@ def test_the_sampling_is_that_of_the_nearest_detection() -> None:
     from types import SimpleNamespace
     state = ObjectState([o], 600)
     tx = SimpleNamespace(write_json=lambda rel, obj: None)
+    o.published = False  # judged afresh, not as the object the line above published
     mo.set_cloud_counts(tx, state, label, STREET_VOXEL, STREET_FOCAL, {o.id: 11.0})
     assert o.cloud_min == near and state.exported() == []
     # the nearest detection: the depth of its sighting's centre in the detecting keyframe

@@ -29,6 +29,19 @@ def _r(x: float, nd: int = 6) -> float:
     return float(round(float(x), nd))
 
 
+def rounded(x: Any) -> Any:
+    """``x`` with every float rounded as poses and cuboids are (``_r``), through dicts and
+    lists: values that threaded SfM makes differ by ~1e-12 between identical runs are written
+    identically."""
+    if isinstance(x, float):
+        return _r(x)
+    if isinstance(x, dict):
+        return {k: rounded(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [rounded(v) for v in x]
+    return x
+
+
 def metadata(name: str, tagged_file: str | None = None, **extra: Any) -> Json:
     md: Json = {
         "schema_version": SCHEMA_VERSION,

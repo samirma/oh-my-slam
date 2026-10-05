@@ -844,14 +844,23 @@ which replaces most files, widens that window.
   order gives the same objects, labels and boxes, within the evaluator's stability targets (spec
   §2.3 and §5; not to the centimetre: the threaded global mapper is not deterministic, and two
   runs of one update differ too); only ids may differ, where an earlier update had already
-  published one, since a published id persists. An object is judged by the keyframes added
+  published one, since a published id persists; and the split map may keep an object that an
+  earlier update published and that no later image contradicts, since published objects stay
+  published (see *Every object of the map is a confirmed one*), even where the one-update map,
+  judging all the evidence at once, never confirms it. An object is judged by the keyframes added
   after its last detection wherever the updates are cut, and a map of photos with a keyframe SfM
   did not pose is rebuilt with the next update's photos (see *Rebuilding a weakly posed map*
-  under Mapping, step 4): `office_sequence` in one update, 6 + 7 and 4 + 4 + 5 photos gives the
-  same 8 objects and labels, box centres 1-2 cm apart (median box IoU 0.63-0.73 against the
-  one-update map; a second one-update run: 0.81-0.93), 7 of the 8 ids, and no cup, its place
-  drawn from the photos that see it empty. Where nothing changed, the
-  keyframes of an update agree and their order does not matter:
+  under Mapping, step 4): `office_sequence` split 6 + 7 and 4 + 4 + 5 photos has the one-update
+  map's 8 objects with their labels, box centres 1.5-1.8 cm apart (median box IoU 0.59-0.65
+  against the one-update map), 7 of the 8 ids, and no cup, its place drawn from the photos that
+  see it empty (2026-10-05). It also keeps what an earlier update published that the one-update
+  map does not confirm: 6 + 7 a comb (30) its first update published; 4 + 4 + 5 a tree behind the
+  glass (24) the four window photos published and a car (20) the second update's rebuild
+  published; no later photo sees through their places. All 8 of the one-update map's objects
+  pair with the split map's; of the split map's 9 and 10 objects, these 1 and 2 do not (the
+  evaluator's `map.stability.matched_fraction`, over the larger count, was 0.89 and 0.80).
+  `ainex-captures` split 40 + 39 has the one-update map's 33 objects, ids and labels (median IoU
+  0.85, centres 1 cm apart). Where nothing changed, the keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
   * The cloud's colours and object ids do not depend on keyframe order either.
   * Order affects keyframe names, the numbering of new objects (by their earliest keyframe), and
@@ -1065,6 +1074,19 @@ which replaces most files, widens that window.
     fused depth and do not meet the cloud; it is then still a candidate.
   * Unconfirmed candidates are kept in the map's state, so that a later update can still confirm
     them; they are never emitted, in any format or scope.
+  * **Published objects stay published.** An object the map has exported (`objects.json →
+    published`) stays confirmed and exported, with its id, label and colour, whatever later
+    evidence says of its confirmation: keyframes that have it in view without detecting it (two
+    detections are then needed where one sufficed), a cloud that draws fewer of its points, a
+    floor a rebuild places higher, or a rebuild's own evidence (*Rebuilding a weakly posed map*).
+    Its box is refitted as evidence accumulates. Only latest wins removes it (evidence of
+    absence: *Later wins*), and a merge may join it with another object (the lower or published
+    id stays; a rebuild's merges are provisional, see *Rebuilding a weakly posed map*). An object
+    that moved keeps its published state at its new place. The consequence: a false detection
+    lying on a real surface (the comb, 30, that the first 6 photos of `office_sequence`
+    publish) is seen in place by every later view, since the surface is where its depth puts it, so once
+    published it stays for the life of the map; only a later view that sees through its place
+    removes it.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
@@ -1295,8 +1317,10 @@ pixels, so its results are unchanged.
        was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
        object takes the ids of the stored detections it owns that were the first to carry
        them (an id's founding detection): the published ones before a candidate's, then the
-       lowest. A published id whose founding detection the rebuild groups with an object that
-       keeps another published id goes instead to a rebuilt object that holds none, has a
+       lowest. A rebuilt object that takes a published id is published whatever the rebuild's
+       evidence says of its confirmation (published objects stay published), and latest wins
+       judges it as any object of the map. A published id whose founding detection the rebuild
+       groups with an object that keeps another published id goes instead to a rebuilt object that holds none, has a
        compatible label and stands where the map last published it (their boxes overlap, or
        their centres lie within the attribution gate, max(5 cm, 3 % of the viewing distance)).
        Only when no such object exists does it resolve to the object that took its detection,
@@ -1305,8 +1329,7 @@ pixels, so its results are unchanged.
        being rebuilt keeps its last provisional merges. The map's other merges (`merged_into`)
        are permanent, and when the extension merges two objects the published id stays before a
        lower candidate's. A published id that no object takes is listed in the update's
-       `objects.removed`, and one whose object is kept only as a candidate in
-       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
+       `objects.removed`; none vanishes unreported. Objects first seen by the new photos are
        numbered on from the map's count, as an extension numbers them. So ids can differ from
        the one-update map's where an earlier update had published one (spec §2.3). In
        `office_sequence` split 4 + 4 + 5 the four window photos publish two windows, 9 and 22
@@ -1317,9 +1340,14 @@ pixels, so its results are unchanged.
        Both runs ended with 22 on the second window (26 resolving to 22) after the third update.
        With the rule, in three runs: 22 stayed on the second window after every update in one;
        in another the second update's rebuild kept the second window as a candidate only (22
-       listed `unpublished`); in the third it mapped both windows as one object, so no object
-       stood apart for 22 and it resolved to 9 provisionally. After the third update 22 was on
-       the second window in all three.
+       left the output for one update; published objects staying published now keeps it); in
+       the third it mapped both windows as one object, so no object stood apart for 22 and it
+       resolved to 9 provisionally. After the third update 22 was on the second window in all
+       three. A rebuild may thus still merge two published objects into one box for an update:
+       the absorbed id leaves the output and resolves through `rebuild_merged` to the published
+       object that holds the box, which stays in the output, until a later rebuild separates
+       them. On 2026-10-05 the second update's rebuild did so (9 and 22 in one box, 22 resolving
+       to 9); the third gave 22 back to the second window.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
        took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
        (extending: 84 s; the whole sequence in one update: 158 s).
@@ -1618,7 +1646,9 @@ runs it end to end as a test.
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
   longer. A later update rebuilds such a map with its photos (Mapping, step 4), so the whole
   sequence split as 4 + 4 + 5 or 6 + 7 photos ends with the one-update map's objects, labels
-  and boxes (one window keeps a different id, see there). In a map of the
+  and boxes (one window keeps a different id, see there), and with the objects its first
+  updates published that the one-update map does not have (a tree behind the glass, see
+  *Update semantics*): published objects stay published. In a map of the
   whole sequence the global mapper's result varies from run to run for the same reason: in some
   runs the depth check (step 1 of *Weakly linked parts*) rejects photos whose SfM points are
   mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and their multi-view poses leave them
