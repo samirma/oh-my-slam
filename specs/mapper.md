@@ -59,8 +59,10 @@ Since an image captures a specific point in time for a map section, any new imag
 contradicts the current data should update the map with the latest information to keep it
 current. "Latest" is the order of addition: a later update wins over an earlier one, and
 within one update a later frame wins over an earlier one, in input order (the order of the
-`-i` images; a video's frame order). Capture timestamps are not used. The result is the same
-whether a sequence is mapped in one update or split across several in the same order.
+`-i` images; a video's frame order). Capture timestamps are not used. Mapping a sequence
+in one update or split across several in the same order gives the same objects, labels
+and OBBs (within the evaluator's stability targets, §5). Only `id`s may differ, where an
+earlier update had already published one: identity persistence (below) takes precedence.
 
 Example: in `examples/office_sequence/` a cup is visible in the first images and gone in the
 last ones. Mapping the whole sequence, in one update or in several, must produce a map
