@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import ExifTags, Image
 
+from oh_my_slam.core.constants import DEFAULT_FPS as DEFAULT_FPS
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.images import (
     IMAGE_SUFFIXES,
@@ -20,8 +21,6 @@ from oh_my_slam.core.images import (
 )
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping.store import frame_name
-
-DEFAULT_FPS = 2.0
 
 
 @dataclass

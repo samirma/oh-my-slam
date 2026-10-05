@@ -17,8 +17,8 @@ import argparse
 import time
 from pathlib import Path
 
-from oh_my_slam.cli import spec
 from oh_my_slam.cli.common import ArgumentParser, run_main
+from oh_my_slam.commands import spec
 from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.log import claim_stdout, get_logger, json_payload_bytes
@@ -75,8 +75,8 @@ def _result(fmt: str, scene: bytes, ply: bytes | None) -> bytes:
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     mode = COMMAND.mode_of(args)
-    on_map = mode.name == "map"
-    # --min-score, -p, -o, -d and -i are checked (and -d created) before any work
+    on_map = mode is spec.SEGMENT_MAP
+    # --min-score, -p, -o, -d (created) and -i or -m are checked before any work
     v = spec.validate(COMMAND, args, log.warning)
     attrs: CloudAttrs = v.attrs
     out = claim_stdout(args.output)

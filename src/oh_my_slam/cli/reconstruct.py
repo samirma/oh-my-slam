@@ -14,11 +14,11 @@ from __future__ import annotations
 import argparse
 import time
 
-from oh_my_slam.cli import spec
 from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.client.client import connect
+from oh_my_slam.commands import spec
 from oh_my_slam.core import timing
-from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope
+from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.log import PayloadWriter, claim_stdout, get_logger, json_payload_bytes
 from oh_my_slam.core.timing import Stage
 from oh_my_slam.reconstruction.api import reconstruct_image
@@ -28,8 +28,9 @@ from oh_my_slam.segmentation.scene import single_image_scene
 
 PROGRAM = spec.RECONSTRUCT
 COMMAND = PROGRAM.command()
+MODE = COMMAND.modes[0]
 PROG = PROGRAM.prog
-SCOPE = CloudScope.IMAGE
+SCOPE = MODE.scope()
 log = get_logger("oh_my_slam.cli.reconstruct")
 
 
@@ -43,7 +44,7 @@ def main(argv: list[str]) -> int:
     out = claim_stdout(args.output)
     with timing.collect() as tm:
         what = _run(args, v.attrs, out)
-    timing.report(tm, log, command=COMMAND.label(COMMAND.modes[0]), format=args.format,
+    timing.report(tm, log, command=COMMAND.label(MODE), format=args.format,
                   image=str(args.image), **what)
     return 0
 

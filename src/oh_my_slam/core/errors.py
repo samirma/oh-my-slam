@@ -17,11 +17,13 @@ class ExitCode(IntEnum):
     NOT_A_MAP = 4
     NOT_REGISTERED = 5
     MAP_LOCKED = 6
+    INTERRUPTED = 130  # Ctrl-C / SIGINT (a cancelled job)
 
 
 # The one generic exit status → HTTP status rule of the web service (spec §2.6 "Errors": input
 # errors → 4xx, inference server unavailable → 503, internal → 500). The machine-readable error
-# code is the exit code's lower-case name (``error_code``).
+# code is the exit code's lower-case name (``error_code``); ``JOB_STATE`` is the state of a job
+# whose command ended with that status (an interrupted command is a cancelled job).
 HTTP_STATUS: dict[ExitCode, int] = {
     ExitCode.OK: 200,
     ExitCode.INTERNAL: 500,
@@ -30,7 +32,11 @@ HTTP_STATUS: dict[ExitCode, int] = {
     ExitCode.NOT_A_MAP: 422,  # the folder exists but is not a map
     ExitCode.NOT_REGISTERED: 422,  # valid request, nothing could be placed in the map
     ExitCode.MAP_LOCKED: 409,  # another update holds the map
+    ExitCode.INTERRUPTED: 499,  # the request was withdrawn (cancelled), not a failure
 }
+JOB_STATE: dict[ExitCode, str] = {code: "succeeded" if code is ExitCode.OK else
+                                  "cancelled" if code is ExitCode.INTERRUPTED else "failed"
+                                  for code in ExitCode}
 
 
 def http_status(exit_code: int) -> int:

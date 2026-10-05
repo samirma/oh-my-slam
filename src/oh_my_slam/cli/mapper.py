@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import argparse
 
-from oh_my_slam.cli import spec
 from oh_my_slam.cli.common import ArgumentParser, run_main
+from oh_my_slam.commands import spec
 from oh_my_slam.core.log import claim_stdout, get_logger
 
 PROGRAM = spec.MAPPER
@@ -44,7 +44,7 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "locate":
         return _locate(args)
-    # -p, -o and -fps are checked before the map or the server is touched
+    # -p, -o, -fps, the inputs and the map are checked before the server is contacted
     v = spec.validate(UPDATE, args, log.warning)
     out = claim_stdout(args.output)
     from oh_my_slam.core import timing
@@ -52,7 +52,7 @@ def main(argv: list[str]) -> int:
 
     res = update(args.map, args.inputs, fps=v.fps, mode=args.mode, fmt=args.format, attrs=v.attrs)
     out.write_bytes(res.payload)
-    timing.report(res.timings, log, command=UPDATE.label(UPDATE.modes[0]), mode=args.mode,
+    timing.report(res.timings, log, command=UPDATE.label(UPDATE.mode(None)), mode=args.mode,
                   format=args.format, fps=v.fps if v.is_video else None, map=str(args.map))
     return 0
 
@@ -66,7 +66,7 @@ def _locate(args: argparse.Namespace) -> int:
     out = claim_stdout(args.output)
     res = locate(v.reader, v.images, mode=args.mode, fmt=args.format, attrs=v.attrs)
     out.write_bytes(res.payload)
-    timing.report(res.timings, log, command=LOCATE.label(LOCATE.modes[0]), mode=args.mode,
+    timing.report(res.timings, log, command=LOCATE.label(LOCATE.mode(None)), mode=args.mode,
                   format=args.format, map=str(args.map))
     return 0
 

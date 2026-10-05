@@ -10,11 +10,10 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import ExifTags, Image, ImageOps
 
+from oh_my_slam.core.constants import IMAGE_SUFFIXES as IMAGE_SUFFIXES
+from oh_my_slam.core.constants import VIDEO_SUFFIXES as VIDEO_SUFFIXES
 from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.types import Intrinsics
-
-IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
-VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
 # Diagonal of a 36 x 24 mm full-frame sensor.
 FULL_FRAME_DIAGONAL_MM = math.hypot(36.0, 24.0)

@@ -1,30 +1,35 @@
-"""The commands' single source of truth (``cli/spec.py``, spec §2.6 "Single source of truth"):
-every argparse parser is built from the registry and its export covers every option; the
-validation rules raise the commands' own errors; stage names are registered; the exit-code →
-HTTP rule; live progress events (``core.timing``)."""
+"""The commands' single source of truth (``commands/spec.py``, spec §2.6 "Single source of truth"):
+every argparse parser is built from the registry and its export covers every option; API
+parameters parse through the same parser; the validation rules raise the commands' own errors,
+and a dry run reports them all per parameter; stage names are registered and the stages the
+commands record are the declared ones; the exit-code → HTTP rule; live progress events."""
 
 from __future__ import annotations
 
 import argparse
 import ast
 import dataclasses
+import io
 import json
+import math
 import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from oh_my_slam.cli import mapper as cli_mapper
 from oh_my_slam.cli import reconstruct as cli_reconstruct
 from oh_my_slam.cli import segment as cli_segment
-from oh_my_slam.cli import spec
 from oh_my_slam.cli import view as cli_view
+from oh_my_slam.commands import spec
 from oh_my_slam.core import timing
-from oh_my_slam.core.cloud_attrs import CloudAttrs
+from oh_my_slam.core.cloud_attrs import ATTRIBUTES, CloudAttrs
 from oh_my_slam.core.errors import (
     HTTP_STATUS,
+    JOB_STATE,
     ExitCode,
     InputError,
     NotAMapError,
@@ -32,12 +37,15 @@ from oh_my_slam.core.errors import (
     error_code,
     http_status,
 )
+from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.timing import Stage
+from tests.unit.test_cli_single import env  # noqa: F401  (the fake-server fixture)
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "src" / "oh_my_slam"
 CLIS = {"reconstruct.sh": cli_reconstruct, "mapper.sh": cli_mapper, "segment.sh": cli_segment,
         "view.sh": cli_view}
+R, M, S, V = spec.RECONSTRUCT, spec.MAPPER, spec.SEGMENT, spec.VIEW
 
 
 def _leaf_parsers(ap: argparse.ArgumentParser) -> dict[str | None, argparse.ArgumentParser]:
@@ -49,6 +57,9 @@ def _leaf_parsers(ap: argparse.ArgumentParser) -> dict[str | None, argparse.Argu
 
 def _options(ap: argparse.ArgumentParser) -> list[argparse.Action]:
     return [a for a in ap._actions if a.option_strings and a.dest != "help"]
+
+
+# --- the parsers and the export -------------------------------------------------------------------
 
 
 def test_every_command_parser_is_the_registry() -> None:
@@ -84,7 +95,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                 others = {cmd.option(m.selector).flag for m in cmd.modes
                           if m is not mode and m.selector}
                 expected = {f for f in flags if f not in others}
-                if mode.name == "map":
+                if mode is spec.SEGMENT_MAP:
                     expected.discard("--min-score")
                 assert {p["flag"] for p in op["parameters"]} == expected, op["id"]
                 for p in op["parameters"]:
@@ -92,78 +103,163 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                     assert (p["name"], p["help"]) == (a.dest, a.help)
                     assert p["required"] == (a.required or p["name"] == mode.selector)
                 assert op["stages"] == [str(s) for s in mode.stages]
-                assert all(s in d["stages"] for s in op["stages"])
                 codes = {e["code"] for e in op["errors"]}
                 assert "usage" in codes
                 assert ("server_unavailable" in codes) == (op["inference"] != "never"), op["id"]
-    seg_i = ops["segment.sh -i"]
-    p = {x["name"]: x for x in seg_i["parameters"]}
-    assert p["min_score"]["default"] == 0.5 and p["format"]["choices"] == ["json", "ply"]
-    assert p["attrs"]["default"].startswith("color=segment,stride=1")
-    assert p["attrs"]["applies"] == [{"option": "format", "in": ["ply"]},
-                                     {"option": "artifacts", "is": "given"}]
-    assert {x["key"] for x in p["attrs"]["attributes"]} >= {"stride", "edge"}
+    seg_i = {x["name"]: x for x in ops["segment.sh -i"]["parameters"]}
+    assert seg_i["min_score"]["default"] == 0.5 and seg_i["min_score"]["finite"] is True
+    assert seg_i["format"]["choices"] == ["json", "ply"]
+    assert seg_i["image"]["accepts"] == sorted([".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff",
+                                                ".webp"])
+    assert seg_i["image"]["must_exist"] is True and seg_i["artifacts"]["must_exist"] is False
+    attrs = seg_i["attrs"]
+    assert attrs["default"].startswith("color=segment,stride=1")
+    assert attrs["applies"] == [{"option": "format", "in": ["ply"]},
+                                {"option": "artifacts", "is": "given"}]
+    schema = {x["key"]: x["schema"] for x in attrs["attributes"]}
+    assert schema["color"] == {"type": "enum", "choices": ["segment"]}
+    assert schema["stride"] == {"type": "integer", "minimum": 1}
     seg_m = {x["name"]: x for x in ops["segment.sh -m"]["parameters"]}
     assert "stride" not in {x["key"] for x in seg_m["attrs"]["attributes"]}
+    assert seg_m["map"]["must_exist"] is True
     update = {x["name"]: x for x in ops["mapper.sh update"]["parameters"]}
-    assert update["fps"]["default"] == 2.0 and update["fps"]["applies"] == [
-        {"option": "inputs", "is": "video"}]
-    assert {o["name"] for o in seg_i["outputs"]} == {
+    assert update["fps"]["default"] == 2.0 and update["fps"]["exclusive_minimum"] == 0
+    assert update["fps"]["omit_if_default"] is True
+    assert update["fps"]["applies"] == [{"option": "inputs", "is": "video"}]
+    assert update["inputs"]["ordered"] is True and ".mp4" in update["inputs"]["accepts"]
+    assert update["map"]["must_exist"] is False
+    assert ops["mapper.sh locate"]["inference"] == "conditional"
+    from oh_my_slam.mapping.api import UPDATE_EXHAUSTIVE_MAX
+
+    assert ops["mapper.sh locate"]["inference_condition"] == {
+        "map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
+    assert {o["name"] for o in ops["segment.sh -i"]["outputs"]} == {
         "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md",
         "segments.ply"}
+    assert {"code": "interrupted", "exit_code": 130, "http_status": 499,
+            "job_state": "cancelled"} in d["exit_codes"]
 
 
 def test_an_option_added_to_the_registry_reaches_parser_and_export(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    cmd = spec.RECONSTRUCT.commands[0]
+    cmd = R.commands[0]
     extra = spec.Option("--gain", "gain", spec.Kind.NUMBER, "a new option", type=float,
-                        default=1.0)
-    program = dataclasses.replace(spec.RECONSTRUCT, commands=(
+                        default=1.0, minimum=0)
+    program = dataclasses.replace(R, commands=(
         dataclasses.replace(cmd, options=(*cmd.options, extra)),))
     monkeypatch.setattr(spec, "PROGRAMS", (program,))
     assert spec.build_parser(program).parse_args(["-i", "x", "--gain", "2"]).gain == 2.0
+    new_cmd = program.commands[0]
+    assert spec.parse(new_cmd, new_cmd.modes[0], {"image": "x", "gain": 3}).gain == 3.0
     (op,) = spec.describe()["operations"]
-    assert op["parameters"][-1] == {
+    assert {
         "name": "gain", "flag": "--gain", "kind": "number", "help": "a new option",
-        "required": False, "default": 1.0, "choices": None, "multiple": False,
-        "repeatable": False, "applies": [], "applies_text": ""}
+        "required": False, "default": 1.0, "minimum": 0}.items() <= op["parameters"][-1].items()
 
 
-def _validate(program: spec.Program, argv: list[str], **kw):  # type: ignore[no-untyped-def]
+def test_cloud_attribute_schemas_match_their_parsers() -> None:
+    """The typed attribute schema the API publishes accepts and refuses what ``-p`` does."""
+    for a in ATTRIBUTES:
+        sc = a.schema
+        if sc["type"] == "enum":
+            for choice in sc["choices"]:
+                a.parse(choice)
+            with pytest.raises(ValueError):
+                a.parse("bogus")
+            continue
+        if "minimum" in sc:
+            a.parse(str(sc["minimum"]))
+            with pytest.raises(ValueError):
+                a.parse(str(sc["minimum"] - 0.5))
+        if "exclusive_minimum" in sc:
+            with pytest.raises(ValueError):
+                a.parse(str(sc["exclusive_minimum"]))
+        if sc["type"] == "integer":
+            with pytest.raises(ValueError):
+                a.parse("2.5")
+        else:
+            finite = sc.get("finite", True)
+            if finite:
+                with pytest.raises(ValueError):
+                    a.parse("inf")
+            else:
+                assert math.isinf(a.parse("inf"))
+
+
+# --- parameters → arguments, validation, dry run --------------------------------------------------
+
+
+def _validate(program: spec.Program, argv: list[str], **kw: Any) -> argparse.Namespace:
     args = spec.build_parser(program).parse_args(argv)
     cmd = program.command(args.command if program.subcommands else None)
     return spec.validate(cmd, args, **kw)
 
 
+def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
+    seg = S.command()
+    params = {"image": tmp_path / "a.jpg", "format": "ply", "attrs": ["voxel=0.1", "normals=on"],
+              "min_score": 0.3, "output": "-odd.ply"}
+    args = spec.parse(seg, spec.SEGMENT_IMAGE, params)
+    cli = cli_segment.build_parser().parse_args(
+        ["-i", str(tmp_path / "a.jpg"), "-f", "ply", "-p", "voxel=0.1", "-p", "normals=on",
+         "--min-score", "0.3", "-o=-odd.ply"])
+    assert args == cli and args.output == Path("-odd.ply")
+    with pytest.raises(UsageError, match=re.escape(
+            "argument -f: invalid choice: 'xml' (choose from json, ply)")):
+        spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "xml"})
+    with pytest.raises(UsageError, match="the following arguments are required: -m"):
+        spec.parse(M.command("update"), M.command("update").modes[0], {"inputs": ["a.jpg"]})
+    with pytest.raises(UsageError, match=re.escape("unrecognized parameters for segment.sh -m: min_score")):
+        spec.parse(seg, spec.SEGMENT_MAP, {"map": "m", "min_score": 0.4})
+    up = M.command("update")
+    args = spec.parse(up, up.modes[0], {"inputs": ["a.jpg", "b.jpg"], "map": "m", "fps": 2.0})
+    assert args.fps is None and args.inputs == [Path("a.jpg"), Path("b.jpg")]  # default omitted
+    with pytest.raises(UsageError, match="invalid float value: 'abc'"):
+        spec.parse(up, up.modes[0], {"inputs": ["v.mp4"], "map": "m", "fps": "abc"})
+    view = V.command()
+    assert spec.parse(view, view.mode("map"), {"map": "m", "no_browser": True}).no_browser
+    with pytest.raises(UsageError, match=re.escape("one of the arguments -i -m is required")):
+        S.command().mode_of(argparse.Namespace(image=None, map=None))
+
+
 def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
     img = tmp_path / "a.jpg"
     img.write_bytes(b"x")
-    R, M, S, V = spec.RECONSTRUCT, spec.MAPPER, spec.SEGMENT, spec.VIEW
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "f").write_text("x")
+    other = str(tmp_path / "other")
     cases = [
         (R, ["-i", str(img), "-p", "voxel=1"], UsageError, "only the PLY output has"),
         (R, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (R, ["-i", str(img), "-o", str(tmp_path)], UsageError, "is a folder"),
+        (R, ["-i", str(img), "-o", str(img / "x.json")], UsageError,
+         f"-o {img}: cannot write there (File exists)"),
         (M, ["update", "-i", "v.mp4", "-m", "m", "-fps", "0"], UsageError, "-fps must be"),
         (M, ["update", "-i", "a.jpg", "-m", "m", "-f", "ply", "-p", "stride=2"], UsageError,
          "pixel-level"),
+        (M, ["update", "-i", str(tmp_path / "no.jpg"), "-m", "m"], InputError, "input not found"),
+        (M, ["update", "-i", str(tmp_path), "-m", "m"], InputError, "is a folder"),
+        (M, ["update", "-i", str(img), "-m", other], NotAMapError, "is not empty and not a map"),
         (M, ["locate", "-i", "v.mp4", "-m", "m"], UsageError, "not a video"),
         (M, ["locate", "-i", str(img), "-m", str(tmp_path / "none")], InputError, "no map in"),
+        (M, ["locate", "-i", str(img), "-m", other], NotAMapError, "is not a map"),
         (S, ["-m", "m", "--min-score", "0.4"], UsageError, "applies to -i only"),
         (S, ["-i", str(img), "--min-score", "nan"], UsageError, "finite number"),
         (S, ["-i", str(img), "-p", "voxel=1"], UsageError, "use -f ply or -d"),
+        (S, ["-m", other], NotAMapError, "not a map folder"),
+        (S, ["-m", str(tmp_path / "none")], NotAMapError, "not a map folder"),
         (V, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
+        (V, ["-m", other], NotAMapError, "not a map folder"),
     ]
-    (tmp_path / "other").mkdir()
-    (tmp_path / "other" / "f").write_text("x")
-    cases.append((M, ["locate", "-i", str(img), "-m", str(tmp_path / "other")], NotAMapError,
-                  "is not a map"))
     for program, argv, exc, message in cases:
         with pytest.raises(exc, match=re.escape(message)):
             _validate(program, argv)
+    assert not (tmp_path / "m").exists()  # the map is never created by validation
     warnings: list[str] = []
-    v = _validate(M, ["update", "-i", "a.jpg", "-m", "m", "-fps", "-3"], warn=warnings.append)
-    assert v.fps == 2.0 and not v.is_video and warnings == [
-        "-fps applies to video input only; ignored for images"]
+    v = _validate(M, ["update", "-i", str(img), "-m", str(tmp_path / "new"), "-fps", "-3"],
+                  warn=warnings.append)
+    assert v.fps == 2.0 and not v.is_video and v.input_spec.images == [img]
+    assert warnings == ["-fps applies to video input only; ignored for images"]
     v = _validate(S, ["-i", str(img), "-d", str(tmp_path / "d"), "-p", "voxel=0.1",
                       "--min-score", "0.3"])
     assert v.min_score == 0.3 and v.attrs == CloudAttrs(color="segment", voxel=0.1)
@@ -171,16 +267,43 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
     assert _validate(R, ["-i", str(img)]).attrs == CloudAttrs()
 
 
+def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
+        tmp_path: Path) -> None:
+    seg = S.command()
+    args = spec.parse(seg, spec.SEGMENT_IMAGE, {
+        "image": tmp_path / "none.jpg", "min_score": "abc", "attrs": ["stride=0"],
+        "artifacts": tmp_path / "new" / "d", "output": tmp_path})
+    problems = {p.rule: p for p in spec.dry_run(seg, args)}
+    assert set(problems) == {"min_score", "attrs", "output_writable", "image_exists"}
+    assert problems["attrs"].parameters[0] == "attrs"
+    assert problems["image_exists"].describe() == {
+        "rule": "image_exists", "parameters": ["image"],
+        "message": f"image not found: {tmp_path / 'none.jpg'}", "code": "usage",
+        "exit_code": 2, "http_status": 400}
+    assert not (tmp_path / "new").exists()  # the -d folder is only checked
+    afile = tmp_path / "afile"
+    afile.write_text("x")
+    args = spec.parse(seg, spec.SEGMENT_IMAGE, {"image": afile, "artifacts": afile})
+    (p,) = spec.dry_run(seg, args)
+    assert p.message == f"-d {afile}: cannot write there (File exists)"
+
+
 def test_exit_codes_map_to_http_statuses() -> None:
-    assert set(HTTP_STATUS) == set(ExitCode)
+    assert set(HTTP_STATUS) == set(ExitCode) == set(JOB_STATE)
     assert http_status(ExitCode.USAGE) == 400
     assert http_status(ExitCode.SERVER_UNAVAILABLE) == 503
-    assert http_status(ExitCode.INTERNAL) == 500 and http_status(130) == 500
+    assert http_status(ExitCode.INTERNAL) == 500 and http_status(77) == 500
     for code in (ExitCode.NOT_A_MAP, ExitCode.NOT_REGISTERED, ExitCode.MAP_LOCKED):
         assert 400 <= http_status(code) < 500
-    assert error_code(4) == "not_a_map" and error_code(130) == "internal"
+    assert http_status(130) == 499 and error_code(130) == "interrupted"
+    assert JOB_STATE[ExitCode.INTERRUPTED] == "cancelled" and JOB_STATE[ExitCode.OK] == "succeeded"
+    assert JOB_STATE[ExitCode.NOT_A_MAP] == "failed"
+    assert error_code(4) == "not_a_map" and error_code(77) == "internal"
     exported = {e["code"]: e["http_status"] for e in spec.describe()["exit_codes"]}
     assert exported["map_locked"] == 409 and exported["usage"] == 400
+
+
+# --- stages and progress --------------------------------------------------------------------------
 
 
 def _stage_literals() -> dict[str, set[str]]:
@@ -200,13 +323,68 @@ def _stage_literals() -> dict[str, set[str]]:
 
 
 def test_every_timing_stage_is_registered() -> None:
-    """Every stage a command records is a ``Stage`` and listed for some operation; the commands
-    and ``mapping/locate.py`` use the constants."""
-    literals = _stage_literals()
-    assert set().union(*literals.values()) <= {str(s) for s in Stage}, literals
-    assert not any(f.startswith("cli/") or f == "mapping/locate.py" for f in literals), literals
+    """No stage is named by a string literal (``Stage`` is typed, so mypy checks the rest), and
+    every ``Stage`` belongs to some operation."""
+    assert _stage_literals() == {}
     listed = {s for _p, _c, m in spec.operations() for s in m.stages}
     assert listed == set(Stage)
+
+
+class _Stages:
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        if event["event"] == "stage_start":
+            self.seen.append(event["stage"])
+
+
+def _declared(cmd: spec.Command, mode: spec.Mode) -> set[str]:
+    return {str(s) for s in mode.stages}
+
+
+def test_recorded_stages_are_the_declared_ones(env, tmp_path: Path,  # type: ignore[no-untyped-def]  # noqa: F811
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """reconstruct.sh, segment.sh -i / -m and mapper.sh update / locate (fake server) record only
+    stages their operation declares."""
+    import shutil
+
+    from oh_my_slam.mapping.api import update
+    from oh_my_slam.mapping.locate import locate, open_map, resolve_images
+    from tests.fakes.client import FakeClient
+    from tests.synth.mapping import add_frames, mapping_room, ring
+
+    img, cap, _client = env
+    runs = [
+        (R.command(), R.command().modes[0], lambda: cli_reconstruct.main(["-i", str(img)])),
+        (R.command(), R.command().modes[0], lambda: cli_reconstruct.main(
+            ["-i", str(img), "-f", "ply", "-p", "color=segment"])),
+        (S.command(), spec.SEGMENT_IMAGE, lambda: cli_segment.main(
+            ["-i", str(img), "-d", str(tmp_path / "art")])),
+    ]
+    client = FakeClient()
+    room = mapping_room()
+    keys = add_frames(client, room, ring(1), tmp_path / "k", "k")
+    mdir = tmp_path / "map"
+    queries = add_frames(client, room, ring(2, start=0.08, span=0.16), tmp_path / "q", "q")
+    monkeypatch.setattr(cli_segment, "claim_stdout", lambda output=None: PayloadWriter(
+        io.BytesIO()))
+    up = M.command("update")
+    runs += [
+        (up, up.modes[0], lambda: update(mdir, keys, client=client, progress=lambda m: None)),
+        (S.command(), spec.SEGMENT_MAP, lambda: cli_segment.main(
+            ["-m", str(mdir), "-f", "ply", "-d", str(tmp_path / "mart")])),
+    ]
+    if shutil.which("colmap"):
+        lo = M.command("locate")
+        runs.append((lo, lo.modes[0], lambda: locate(open_map(mdir), resolve_images(queries),
+                                                     mode="full", progress=lambda m: None)))
+    for cmd, mode, run in runs:
+        rec = _Stages()
+        with timing.listen(rec):
+            run()
+        cap.take()  # the fake stdout takes one payload per run
+        assert rec.seen and set(rec.seen) <= _declared(cmd, mode), (cmd.label(mode), rec.seen)
 
 
 def test_progress_events_reach_listeners() -> None:
@@ -221,8 +399,16 @@ def test_progress_events_reach_listeners() -> None:
         "begin", "stage_start", "progress", "count", "part", "stage_end", "finish"]
     assert events[2] == {"event": "progress", "stage": "export", "done": 1, "total": 2}
     assert events[3] == {"event": "count", "keyframes_sampled": 2}
+    assert events[-1] | {"total_s": 0} == {"event": "finish", "total_s": 0, "ok": True,
+                                           "exit_code": 0, "code": "ok"}
     timing.progress(1, 1)  # outside a collection: nothing
     assert len(events) == 7
+    events.clear()
+    with timing.listen(events.append), pytest.raises(NotAMapError):
+        with timing.collect(sample_every=None):
+            raise NotAMapError("x")
+    assert events[-1]["ok"] is False and events[-1]["exit_code"] == 4
+    assert events[-1]["code"] == "not_a_map"
 
 
 def test_progress_file_keeps_stdout_and_stderr_unchanged(tmp_path: Path) -> None:
@@ -240,9 +426,9 @@ def test_progress_file_keeps_stdout_and_stderr_unchanged(tmp_path: Path) -> None
     assert {"event": "progress", "stage": "inference", "done": 1, "total": 1} in events
     assert any(e["event"] == "count" and e.get("keyframes_sampled") == 1 for e in events)
 
-    def run(env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    def run(extra: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run([str(REPO / "segment.sh"), "-m", str(tmp_path / "map")],
-                              capture_output=True, timeout=120, env={**os.environ, **env})
+                              capture_output=True, timeout=120, env={**os.environ, **extra})
 
     def human(err: bytes) -> list[str]:  # the timing figures change from run to run
         return [ln for ln in err.decode().splitlines()
@@ -255,4 +441,5 @@ def test_progress_file_keeps_stdout_and_stderr_unchanged(tmp_path: Path) -> None
     assert live.stdout == plain.stdout and human(live.stderr) == human(plain.stderr)
     lines = [json.loads(ln) for ln in sink.read_text().splitlines()]
     assert lines[0] == {"event": "begin"} and lines[-1]["event"] == "finish"
+    assert lines[-1]["ok"] is True and lines[-1]["exit_code"] == 0
     assert [e["stage"] for e in lines if e["event"] == "stage_start"] == ["export", "write"]

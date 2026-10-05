@@ -20,9 +20,11 @@ import signal
 import sys
 import webbrowser
 
-from oh_my_slam.cli import spec
 from oh_my_slam.cli.common import ArgumentParser, run_main
+from oh_my_slam.commands import spec
+from oh_my_slam.core import timing
 from oh_my_slam.core.log import claim_stdout, get_logger
+from oh_my_slam.core.timing import Stage
 
 PROGRAM = spec.VIEW
 COMMAND = PROGRAM.command()
@@ -49,7 +51,7 @@ def build_parser() -> ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    spec.validate(COMMAND, args, log.warning)  # -i exists, before the server is contacted
+    spec.validate(COMMAND, args, log.warning)  # -i exists or -m is a map, before any work
     claim_stdout()  # nothing goes to stdout; the URL is printed on stderr
     from oh_my_slam.viewer.bundle import image_bundle, map_bundle
     from oh_my_slam.viewer.server import serve, url_of
@@ -57,9 +59,13 @@ def main(argv: list[str]) -> int:
     if args.image is not None:
         from oh_my_slam.reconstruction.api import connect_server
 
-        client = connect_server()  # exit 3 with the hint when the server is down
-        log.info("reconstructing and segmenting %s …", args.image.name)
-        bundle = image_bundle(args.image, client)
+        # timed as view.sh -i's stages (progress events only: no summary line, stderr unchanged)
+        with timing.collect():
+            with timing.stage(Stage.CONNECT):
+                client = connect_server()  # exit 3 with the hint when the server is down
+            log.info("reconstructing and segmenting %s …", args.image.name)
+            with timing.stage(Stage.INFERENCE):
+                bundle = image_bundle(args.image, client)
     else:
         bundle = map_bundle(args.map)
     _install_stop_handlers()

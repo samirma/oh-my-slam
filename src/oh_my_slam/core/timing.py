@@ -31,9 +31,15 @@ where the command knows its size): while a collection is open, every stage start
 JSON-serialisable dict) passed to the listeners registered with :func:`listen`. When
 ``OH_MY_SLAM_PROGRESS=<path>`` is set, :func:`collect` appends each event to that file as one JSON
 line (``/dev/fd/<n>`` reaches a pipe a job runner passed in). stdout and the human stderr output
-are the same whether progress is on or off.
+are the same whether progress is on or off. The ``finish`` event carries the outcome (``ok``,
+``exit_code`` and its ``code``, ``core.errors``).
 
-Stage names are the members of :class:`Stage`; ``oh_my_slam.cli.spec`` lists the stages of each
+This is how the web service (spec §2.6) follows a job: it runs each job as a subprocess
+(``python -m oh_my_slam.cli.<command>``) with ``OH_MY_SLAM_PROGRESS`` set, never in its own
+process, so the collector and the listeners here are per process and need no isolation between
+jobs.
+
+Stage names are the members of :class:`Stage`; ``oh_my_slam.commands.spec`` lists the stages of each
 command.
 """
 
@@ -49,6 +55,8 @@ from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from oh_my_slam.core.errors import ExitCode, OhMySlamError, error_code
 
 ENV_PATH = "OH_MY_SLAM_TIMINGS"
 ENV_PROGRESS = "OH_MY_SLAM_PROGRESS"
@@ -194,8 +202,8 @@ class Timings:
         return st
 
     @contextmanager
-    def stage(self, name: str) -> Iterator[None]:
-        name = str(name)  # a Stage member is recorded as its plain name
+    def stage(self, stage: Stage) -> Iterator[None]:
+        name = str(stage)  # recorded as its plain name
         stack = self._stack()
         parent = stack[-1] if stack else None
         stack.append(name)
@@ -349,12 +357,23 @@ def collect(sample_every: float | None = MEMORY_SAMPLE_S) -> Iterator[Timings]:
         t = _current = Timings(sample_every)
         t.start_sampling()
         _emit("begin")
+        code = ExitCode.OK
         try:
             yield t
+        except OhMySlamError as exc:
+            code = exc.exit_code
+            raise
+        except KeyboardInterrupt:
+            code = ExitCode.INTERRUPTED
+            raise
+        except BaseException:
+            code = ExitCode.INTERNAL
+            raise
         finally:
             t.stop_sampling()
             _current = prev
-            _emit("finish", total_s=round(t.elapsed, 3))
+            _emit("finish", total_s=round(t.elapsed, 3), ok=code is ExitCode.OK,
+                  exit_code=int(code), code=error_code(code))
 
 
 def current() -> Timings | None:
@@ -362,7 +381,7 @@ def current() -> Timings | None:
 
 
 @contextmanager
-def stage(name: str) -> Iterator[None]:
+def stage(name: Stage) -> Iterator[None]:
     t = _current
     if t is None:
         yield
