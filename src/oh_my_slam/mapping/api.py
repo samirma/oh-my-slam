@@ -132,6 +132,9 @@ class Rebuild:
     # whose founding detection the rebuild groups elsewhere goes where it stands,
     # ``objects._published_places``)
     boxes: dict[int, tuple[str, Any]] = field(default_factory=dict)
+    # the ids the map exported (``MapObject.published``): the rebuilt object that takes one is
+    # published whatever the rebuild's evidence says, until latest wins removes it
+    published: set[int] = field(default_factory=set)
 
 
 Progress = Callable[[str], None]
@@ -1975,6 +1978,7 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
                  and all((nf.full_size == (plan[0].width, plan[0].height)) for nf in new)
                  else None)
     rb.boxes = {o.id: (o.label, o.obb) for o in state.objects if o.confirmed}
+    rb.published = {o.id for o in state.objects if o.published}
     tx.start_over(keep=(store.SFM_DB,))  # the stored keyframes' features and matches
     for key in ("floor_z", "scale", "map_frame"):
         meta.pop(key, None)

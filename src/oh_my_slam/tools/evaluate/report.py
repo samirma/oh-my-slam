@@ -20,17 +20,25 @@ SCHEMA = "oh-my-slam-evaluation/1"
 # (metric id prefix, section title, note under the title); a metric goes to its longest prefix
 SECTIONS: tuple[tuple[str, str, str], ...] = (
     ("perf", "Performance", ""),
+    ("perf.stage", "Performance per stage",
+     "`perf.<group>.stage.<stage>.*`: seconds (the median over the frames of a per-frame group, "
+     "else the slowest run: per image and per mapping update) and the peak client / server memory "
+     "while the stage ran."),
     ("pose", "Pose accuracy",
      "Reference: the commanded headings in the capture names. The actual headings deviate from "
      "them by several degrees, and these errors include that deviation."),
     ("map", "Map quality", ""),
     ("map_update", "Map update",
-     "`examples/office_sequence/` is mapped in one update, and as an extended map (an update with "
-     "the early images, then one with the rest). `absent_fraction` and `incremental.absent_fraction`"
-     " are the share of the annotated objects that changed (the cup) that those two maps no longer "
-     "have; `before_present_fraction` is the same test on the extended map after its first update "
-     "(the control: an object never seen early cannot be seen to disappear); `stability.*` "
-     "compares the objects that never changed between the two updates of the extended map."),
+     "`examples/office_sequence/` is mapped in one update, and split across updates as its "
+     "annotation says (`split_<sizes>`). `absent_fraction` is the share of the annotated objects "
+     "that changed (the cup) that the map no longer has; `hole_fraction` the share of the cells of "
+     "their place where the map shows no surface; `before_present_fraction` the control (the split "
+     "map after an update of the images that show the cup has it); `<split>.stability.*` compares "
+     "the labels and ids of the unchanged objects of the first update with the last (aligned; "
+     "box figures in the detail); `<split>.ids_persistent_fraction` "
+     "checks every published id against every later update; `<split>.vs_one_update.*` compares "
+     "the split map with the one-update map (ids may differ where an earlier update published "
+     "one)."),
     ("seg", "Segmentation", ""),
     ("seg.map_consistency", "Segmentation vs map: consistency, not accuracy",
      "The map's objects come from the same detector on the same keyframes, so these metrics "
@@ -38,6 +46,9 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "detection in the frames it claims to observe. `detections_in_map` is how many per-frame "
      "detections the map keeps. The accuracy measure is the ground-truth section (`gt.*`)."),
     ("contract", "Contracts", ""),
+    ("server_sh", "Web service (server.sh)",
+     "Performance, parity with the commands (each operation of `/api/openapi.json`, run as a job and "
+     "from the shell with the same recorded inference) and the web application's UI."),
     ("gt", "Ground truth: accuracy", ""),
 )
 NO_GROUND_TRUTH = ("No ground-truth annotations were found in `examples/ground_truth/`. Segmentation "
@@ -183,7 +194,9 @@ def _section(title: str, head: list[str], rows: list[list[Any]], note: str = "")
 
 
 def _section_of(mid: str) -> str:
-    """The longest ``SECTIONS`` prefix of a metric id."""
+    """The longest ``SECTIONS`` prefix of a metric id (per-stage metrics: ``perf.stage``)."""
+    if mid.startswith("perf.") and ".stage." in mid:
+        return "perf.stage"
     fits = [p for p, _, _ in SECTIONS if mid == p or mid.startswith(p + ".")]
     return max(fits, key=len) if fits else mid.split(".", 1)[0]
 
@@ -313,34 +326,62 @@ def _details(details: dict[str, Any]) -> list[str]:
                 ["captures", "keyframes apart", "angle °", "median disagreement %", "p90 %"],
                 [[r["pair"], r.get("gap"), r.get("angle_deg"), r["median_pct"], r["p90_pct"]]
                  for r in rows])
+    rows = details.get("poses.locate")
+    if rows:
+        out += _section(
+            "Poses — held-out captures located by mapper.sh locate",
+            ["capture", "commanded yaw °", "located yaw °", "error °", "vs mapped °", "vs mapped m"],
+            [[r["capture"], r["commanded_yaw_deg"], r.get("yaw_deg"), r.get("yaw_err_deg"),
+              r.get("vs_mapped_rot_deg"), r.get("vs_mapped_m")] for r in rows])
     out += _map_update_details(details.get("map_update") or {})
+    out += _parity_details((details.get("server_sh") or {}).get("parity") or {})
     if details.get("errors"):
         out += ["## Evaluator errors", "", *(f"* {e}" for e in details["errors"]), ""]
     return out
 
 
+def _absent_rows(d: dict[str, Any], key: str = "final") -> list[list[Any]]:
+    return [[a["label"], o["id"], o["label"], ", ".join(o.get("detected_as") or []),
+             o.get("coverage") if o.get("localised") else "label only",
+             o.get("image"), ", ".join(o.get("frames") or [])]
+            for a in d.get("absent", []) for o in a.get(key, [])]
+
+
 def _map_update_details(d: dict[str, Any]) -> list[str]:
     out: list[str] = []
-    for key, title in (("final", "map of the whole sequence (one update)"),
-                       ("incremental", "extended map (second update)"),
-                       ("before", "extended map after its first update (early images)")):
-        rows = [[a["label"], o["id"], o["label"], ", ".join(o.get("detected_as") or []),
-                 o.get("coverage") if o.get("localised") else "label only",
-                 o.get("image"), ", ".join(o.get("frames") or [])]
-                for a in d.get("absent", []) for o in a[key]]
-        if rows or d.get("absent"):
+    head = ["absent", "object id", "label", "detected as", "covers region", "in image",
+            "observed in"]
+    none: list[list[Any]] = [["none", None, None, None, None, None, None]]
+    maps = [("map of the whole sequence (one update)", d)]
+    maps += [(f"{name} map after its last update", row)
+             for name, row in (d.get("splits") or {}).items()]
+    for title, row in maps:
+        if row.get("absent"):
+            out += _section(f"Map update: objects of the absent labels in the {title}", head,
+                            _absent_rows(row) or none)
+    if d.get("before"):
+        out += _section("Map update: the control, after an update of the images that show it",
+                        head, _absent_rows({"absent": d["before"]}, "before") or none)
+    for name, row in (d.get("splits") or {}).items():
+        if row.get("stability"):
             out += _section(
-                f"Map update: objects of the absent labels in the {title}",
-                ["absent", "object id", "label", "detected as", "covers region", "in image",
-                 "observed in"],
-                rows or [["none", None, None, None, None, None, None]])
-    if d.get("stability"):
-        out += _section(
-            "Map update: objects that never changed, first update vs second update",
-            ["second update id", "first update id", "labels", "IoU", "centre Δ m", "extent Δ"],
-            [[r["single_id"], r["split_id"], f"{r['single_label']} / {r['split_label']}",
-              r["iou"], r["centre_delta_m"], r["extent_delta_rel"]] for r in d["stability"]])
+                f"Map update: {name}, objects that never changed, first update vs last",
+                ["last update id", "first update id", "labels", "IoU", "centre Δ m", "extent Δ"],
+                [[r["single_id"], r["split_id"], f"{r['single_label']} / {r['split_label']}",
+                  r["iou"], r["centre_delta_m"], r["extent_delta_rel"]] for r in row["stability"]])
+        if row.get("ids_broken"):
+            out += _section(f"Map update: {name}, published ids that did not persist",
+                            ["id", "label", "published by update", "missing in update", "now"],
+                            [[r["id"], r["label"], r["published_by_update"], r["update"],
+                              r["now"]] for r in row["ids_broken"]])
     return out
+
+
+def _parity_details(d: dict[str, Any]) -> list[str]:
+    rows = [[r["case"], r["status"], r.get("why")] for r in d.get("cases", [])]
+    rows += [[op, "not covered", why] for op, why in (d.get("uncovered") or {}).items()]
+    return _section("server.sh parity: every operation and variant",
+                    ["case", "result", "why"], rows) if rows else []
 
 
 def _tails(runs: list[dict[str, Any]]) -> list[str]:

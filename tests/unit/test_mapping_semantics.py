@@ -304,6 +304,34 @@ def test_later_update_wins_over_an_earlier_one(tmp_path: Path) -> None:
     assert again.id > cab.id
 
 
+def test_a_published_object_stays_published_until_latest_wins_removes_it(
+        tmp_path: Path) -> None:
+    """Published objects stay published (user ruling 2026-10-05): one keyframe publishes a
+    cabinet (the only keyframe that has it in view); the next update's keyframes see it in place
+    without detecting it, which alone would leave it a candidate (one detection of the two that
+    confirm an object more keyframes see). It stays exported with its id, label and colour,
+    over another such update, until an update sees through its place: then it is removed."""
+    box = Box(np.array([0.0, 0.2, 0.4]), np.array([0.7, 0.6, 0.8]), 0.2, (220, 40, 40), "cabinet")
+    room = Room(boxes=[box])
+    poses = ring(10)
+    mdir = tmp_path / "m"
+    r1 = known_pose_update(mdir, shoot(room, poses[:1]), tmp_path / "w1")
+    (cab,) = r1.objs.exported()
+    blind = shoot(room, poses[1:4], detect=lambda k, label, m: None)
+    for k, shots in enumerate([blind, shoot(room, poses[5:7], detect=lambda k, label, m: None)]):
+        r = known_pose_update(mdir, shots, tmp_path / f"w{k + 2}")
+        (o,) = r.objs.objects
+        assert len(o.reliable_frames()) < objects.CONFIRM_DETECTIONS < o.views_in_frustum
+        (now,) = r.objs.exported()
+        assert (now.id, now.label, now.color) == (cab.id, cab.label, cab.color)
+        assert r.objs.summary["removed"] == []
+        persisted = json.loads((mdir / objects.OBJECTS_JSON).read_text())["objects"]
+        assert [(d["id"], d["published"], d["confirmed"]) for d in persisted] == [
+            (cab.id, True, True)]
+    r4 = known_pose_update(mdir, shoot(Room(boxes=[]), poses[6:9]), tmp_path / "w4")
+    assert r4.objs.exported() == [] and r4.objs.summary["removed"] == [cab.id]
+
+
 def test_removal_needs_the_update_as_a_whole() -> None:
     """Keyframes that see through an object do not remove it when a later keyframe of the update
     sees it in place (the latest wins; monocular depth errors); an update that sees it in place
@@ -680,6 +708,53 @@ def test_a_published_id_outranks_a_lower_candidate_id() -> None:
         [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
         published={7})
     assert final == {100: 7} and absorbed == {5: 100}
+
+
+def test_an_exported_id_outranks_a_lower_confirmed_unexported_one() -> None:
+    """A rebuild ranks ids by what the map exported (``Rebuild.published``), not by what it
+    confirmed: an object holding a confirmed id that was never exported (5, below the cloud
+    gate) and an exported one (7) keeps 7, and is published; an object that absorbs an exported
+    id (``rebuild_merged``) is published too, whatever the id it keeps."""
+    from types import SimpleNamespace as Ns
+
+    d5, d7 = object(), object()
+    final, _, absorbed = objects._published_ids(
+        [100, 100], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d7)])],  # type: ignore[list-item]
+        [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
+        published={7})
+    assert final == {100: 7} and absorbed == {5: 100}
+    assert objects._rebuilt_published(final, absorbed, {7}) == {100}
+    # 101 keeps 3 (exported) and absorbs 9 (exported); 102 keeps 4 (never exported) and
+    # absorbs 8 (exported); 103 keeps 6 and absorbs 2, neither exported
+    held = objects._rebuilt_published({101: 3, 102: 4, 103: 6}, {9: 101, 8: 102, 2: 103},
+                                      {3, 8, 9})
+    assert held == {101, 102}
+
+
+def test_a_legacy_objects_json_infers_published_from_what_it_exported() -> None:
+    """An objects.json written before the ``published`` flag: an object is published when the
+    old ``exported()`` rule held (confirmed, a box, enough map-cloud points or not yet
+    counted); the flag then round-trips."""
+    box = OBB(np.zeros(3), np.eye(3), np.array([0.3, 0.3, 0.3])).to_dict()
+    pts = np.zeros((0, 3), np.float32)
+
+    def legacy(confirmed: bool, obb: Any, cloud: Any, least: Any) -> MapObject:
+        d = MapObject(1, "cup", {"cup": 1.0}, [0.9], pts).to_dict()
+        del d["published"]
+        d.update(confirmed=confirmed, obb=obb, cloud_points=cloud, cloud_min_points=least)
+        return MapObject.from_dict(d, pts)
+
+    cases = [((True, box, 50, 20), True), ((True, box, None, None), True),
+             ((True, box, 5, 20), False), ((True, None, 50, 20), False),
+             ((False, box, 50, 20), False),
+             ((True, box, objects.EXPORT_MIN_CLOUD_POINTS, None), True),
+             ((True, box, objects.EXPORT_MIN_CLOUD_POINTS - 1, None), False)]
+    for args, want in cases:
+        o = legacy(*args)
+        assert o.published is want, args
+        assert o.confirmed is args[0], args
+        back = MapObject.from_dict(json.loads(json.dumps(o.to_dict())), pts)
+        assert (back.published, back.confirmed) == (want, args[0]), args
 
 
 def test_a_merge_keeps_the_published_id_before_a_lower_candidates(

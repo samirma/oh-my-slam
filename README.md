@@ -870,14 +870,23 @@ which replaces most files, widens that window.
   order gives the same objects, labels and boxes, within the evaluator's stability targets (spec
   §2.3 and §5; not to the centimetre: the threaded global mapper is not deterministic, and two
   runs of one update differ too); only ids may differ, where an earlier update had already
-  published one, since a published id persists. An object is judged by the keyframes added
+  published one, since a published id persists; and the split map may keep an object that an
+  earlier update published and that no later image contradicts, since published objects stay
+  published (see *Every object of the map is a confirmed one*), even where the one-update map,
+  judging all the evidence at once, never confirms it. An object is judged by the keyframes added
   after its last detection wherever the updates are cut, and a map of photos with a keyframe SfM
   did not pose is rebuilt with the next update's photos (see *Rebuilding a weakly posed map*
-  under Mapping, step 4): `office_sequence` in one update, 6 + 7 and 4 + 4 + 5 photos gives the
-  same 8 objects and labels, box centres 1-2 cm apart (median box IoU 0.63-0.73 against the
-  one-update map; a second one-update run: 0.81-0.93), 7 of the 8 ids, and no cup, its place
-  drawn from the photos that see it empty. Where nothing changed, the
-  keyframes of an update agree and their order does not matter:
+  under Mapping, step 4): `office_sequence` split 6 + 7 and 4 + 4 + 5 photos has the one-update
+  map's 8 objects with their labels, box centres 1.5-1.8 cm apart (median box IoU 0.59-0.65
+  against the one-update map), 7 of the 8 ids, and no cup, its place drawn from the photos that
+  see it empty (2026-10-05). It also keeps what an earlier update published that the one-update
+  map does not confirm: 6 + 7 a comb (30) its first update published; 4 + 4 + 5 a tree behind the
+  glass (24) the four window photos published and a car (20) the second update's rebuild
+  published; no later photo sees through their places. All 8 of the one-update map's objects
+  pair with the split map's; of the split map's 9 and 10 objects, these 1 and 2 do not (the
+  evaluator's `map.stability.matched_fraction`, over the larger count, was 0.89 and 0.80).
+  `ainex-captures` split 40 + 39 has the one-update map's 33 objects, ids and labels (median IoU
+  0.85, centres 1 cm apart). Where nothing changed, the keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
   * The cloud's colours and object ids do not depend on keyframe order either.
   * Order affects keyframe names, the numbering of new objects (by their earliest keyframe), and
@@ -1091,6 +1100,19 @@ which replaces most files, widens that window.
     fused depth and do not meet the cloud; it is then still a candidate.
   * Unconfirmed candidates are kept in the map's state, so that a later update can still confirm
     them; they are never emitted, in any format or scope.
+  * **Published objects stay published.** An object the map has exported (`objects.json →
+    published`) stays confirmed and exported, with its id, label and colour, whatever later
+    evidence says of its confirmation: keyframes that have it in view without detecting it (two
+    detections are then needed where one sufficed), a cloud that draws fewer of its points, a
+    floor a rebuild places higher, or a rebuild's own evidence (*Rebuilding a weakly posed map*).
+    Its box is refitted as evidence accumulates. Only latest wins removes it (evidence of
+    absence: *Later wins*), and a merge may join it with another object (the lower or published
+    id stays; a rebuild's merges are provisional, see *Rebuilding a weakly posed map*). An object
+    that moved keeps its published state at its new place. The consequence: a false detection
+    lying on a real surface (the comb, 30, that the first 6 photos of `office_sequence`
+    publish) is seen in place by every later view, since the surface is where its depth puts it, so once
+    published it stays for the life of the map; only a later view that sees through its place
+    removes it.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
@@ -1321,8 +1343,10 @@ pixels, so its results are unchanged.
        was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
        object takes the ids of the stored detections it owns that were the first to carry
        them (an id's founding detection): the published ones before a candidate's, then the
-       lowest. A published id whose founding detection the rebuild groups with an object that
-       keeps another published id goes instead to a rebuilt object that holds none, has a
+       lowest. A rebuilt object that takes a published id is published whatever the rebuild's
+       evidence says of its confirmation (published objects stay published), and latest wins
+       judges it as any object of the map. A published id whose founding detection the rebuild
+       groups with an object that keeps another published id goes instead to a rebuilt object that holds none, has a
        compatible label and stands where the map last published it (their boxes overlap, or
        their centres lie within the attribution gate, max(5 cm, 3 % of the viewing distance)).
        Only when no such object exists does it resolve to the object that took its detection,
@@ -1331,8 +1355,7 @@ pixels, so its results are unchanged.
        being rebuilt keeps its last provisional merges. The map's other merges (`merged_into`)
        are permanent, and when the extension merges two objects the published id stays before a
        lower candidate's. A published id that no object takes is listed in the update's
-       `objects.removed`, and one whose object is kept only as a candidate in
-       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
+       `objects.removed`; none vanishes unreported. Objects first seen by the new photos are
        numbered on from the map's count, as an extension numbers them. So ids can differ from
        the one-update map's where an earlier update had published one (spec §2.3). In
        `office_sequence` split 4 + 4 + 5 the four window photos publish two windows, 9 and 22
@@ -1343,9 +1366,14 @@ pixels, so its results are unchanged.
        Both runs ended with 22 on the second window (26 resolving to 22) after the third update.
        With the rule, in three runs: 22 stayed on the second window after every update in one;
        in another the second update's rebuild kept the second window as a candidate only (22
-       listed `unpublished`); in the third it mapped both windows as one object, so no object
-       stood apart for 22 and it resolved to 9 provisionally. After the third update 22 was on
-       the second window in all three.
+       left the output for one update; published objects staying published now keeps it); in
+       the third it mapped both windows as one object, so no object stood apart for 22 and it
+       resolved to 9 provisionally. After the third update 22 was on the second window in all
+       three. A rebuild may thus still merge two published objects into one box for an update:
+       the absorbed id leaves the output and resolves through `rebuild_merged` to the published
+       object that holds the box, which stays in the output, until a later rebuild separates
+       them. On 2026-10-05 the second update's rebuild did so (9 and 22 in one box, 22 resolving
+       to 9); the third gave 22 back to the second window.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
        took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
        (extending: 84 s; the whole sequence in one update: 158 s).
@@ -1469,7 +1497,8 @@ at the Python-module level:
 
 ```sh
 uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--targets PATH] [--baseline PATH] \
-                                           [--set-baseline]
+                                           [--street2 PATH] [--set-baseline]
+uv run python -m oh_my_slam.tools.evaluate --rejudge RESULT_DIR [--targets PATH] [--baseline PATH]
 ```
 
 A single command benchmarks every entry point on `examples/`, strictly one command at a time
@@ -1477,45 +1506,76 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 
 * the server's cold start and resident memory (it stops and restarts the server)
 * `reconstruct.sh` (JSON and PLY), `segment.sh -i -d` and `view.sh -i` on `restaurant.jpg`
-* `segment.sh -i` on each of the 79 `ainex-captures` frames (file names below)
-* `mapper.sh update` on the sequence, once in one update and once split across 3 updates
-* `segment.sh -m` and `view.sh -m` on both maps
+* `segment.sh -i` on each of the 79 `ainex-captures` frames
+* `mapper.sh update` on the sequence, once in one update and once split across 3 updates; between
+  the split map's first and second update, `mapper.sh locate` of the second update's captures
+  (held out of the map so far)
+* `segment.sh -m -d` and `view.sh -m` on the one-update map, and `segment.sh -m -f ply -o` on the
+  split map
+* `mapper.sh locate` on the one-update map (the reference map): `-t single` JSON, `-t full` JSON
+  and `-f ply -o`; the map folder, hidden entries (`.staging/`, `.lock`) included, must not change
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
-  ones): the whole sequence in one update, and as an extended map (an update with the early images,
-  then one with the rest)
+  ones): the whole sequence in one update, and split as its annotation says (4+4+5 and 6+7)
+* `mapper.sh update` on `street2.mp4` (150 s of street video) at the default `-fps`. It lives
+  outside the repository, by default in `~/oh-my-slam-data/loop/inputs/street2.mp4`; `--street2`
+  names another place. Without it the street2 metric fails and says where it looked.
+* `server.sh` over a scratch workspace with copies of the reference inputs and map (see below)
 
-Video sampling (`-fps`) is not covered, because the examples contain no video.
+### The `ainex-captures` file names
 
-**`ainex-captures` file names** encode the commanded head motion as `NNN_<motion>_<tilt>.jpg`
-(parsed by `tools/evaluate/names.py`; a name outside this grammar is an error):
+The spec no longer spells out the capture names, which encode the **commanded** head motion as
+`NNN_<motion>_<tilt>.jpg` (`tools/evaluate/names.py`; a name that does not follow it is an error):
 
-| Part | Values | Meaning |
-|---|---|---|
-| `NNN` | `001` … `079` | Capture order. |
-| `<motion>` | `bootstrap`, `bootstrap_side1`, `bootstrap_side2` | Yaw 0° (the side variants after a small sideways step). |
-| | `bootstrap_leftYYY`, `bootstrap_leftYYY_side` | Yaw +YYY°. |
-| | `left_YYY` | Yaw +YYY°. |
-| | `right_to_YYY` | Yaw +YYY°, turning back towards 0°. |
-| | `right_YYY` | Yaw −YYY°. |
-| `<tilt>` | `level`, `up`, `down` | Pitch: `up` / `down` relative to the `level` frame of the same motion (the nearest in capture order). |
+* `NNN` is the capture order.
+* `<motion>` is the commanded yaw relative to frame 001, positive to the left: `bootstrap` (0°),
+  `bootstrap_side1` / `bootstrap_side2` (0°, after a small sideways step), `bootstrap_leftYYY` and
+  `bootstrap_leftYYY_side` (+YYY°), `left_YYY` (+YYY°), `right_to_YYY` (+YYY°, turning back
+  towards 0°) and `right_YYY` (−YYY°).
+* `<tilt>` is `level`, or `up` / `down` relative to the `level` frame of the same motion.
 
-Yaw is relative to frame 001, positive to the left, in degrees (`YYY` has three digits). The
-same-heading pairs are 001 / 053 (053 returns to 001's heading) and 026 / 078 (`left_210` = +210°
-meets `right_150` = −150°, closing the 360° loop). Hidden files and non-images in the folder are
-ignored.
+The same-heading pairs are 001/053 (053 returns to 001's heading) and 026/078 (`left_210` meets
+`right_150`, which closes the 360° loop).
 
-The metric groups are:
+### Metrics
 
 | Group | Measures |
 |---|---|
-| `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
-| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
-| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
-| `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
+| `perf.*` | Per image and per mapping update: end-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page; for a map built in several updates also its slowest update (`per_update_wall_s`). Groups: the single-image commands, one `ainex-captures` frame (median), the two `ainex` maps, `segment.sh -m`, `view.sh -m`, `mapper.sh locate`, the office maps (one update, and the slowest update of the splits) and street2. |
+| `perf.<group>.stage.<stage>.*` | Per stage, every stage the commands record: seconds (`.s`: median over the frames of a per-frame group, else the slowest run, so per image and per mapping update), client (`.client_peak_mb`) and server (`.server_peak_gb`) peak memory while it ran. |
+| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs, for both `ainex` maps; `pose.locate.*` the same for the held-out captures `mapper.sh locate` placed (located fraction, yaw error relative to the map's capture 001; the detail compares each with the pose the map gives it once added); `pose.street2.registered_fraction` the share of the video's sampled frames the map registered. |
+| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. `matched_fraction` is the share of the one-update map's objects the split map has: the split map may keep an object an earlier update published that no later image contradicts (`mapper.md`), so its extra objects are listed in the detail (`extra_published`, id and label) and not counted against it. As `mapper.md` allows, an id may differ from the one-update map's where an earlier update of the split map had published it: `id_agreement` counts such a pair as agreeing (its detail keeps the strict share, `same_id`). |
+| `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids and labels of the unchanged objects from the first update to the last, after aligning the two updates by their common captures (`stability.label_agreement`, `stability.id_agreement`; a rebuild may re-gauge the frame and OBBs are refined, so box figures are detail only); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, are annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
-| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `contract.*` | Colour contract, OpenLABEL validity (and `mapper.sh locate`'s located cameras marked as such), stdout purity (including `server.sh`, and `locate -f ply`'s one pose line per input image), artefacts, same objects (`locate -t full` gives the map as `update -t full` does), and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `server_sh.*` | `server.sh` (http_server.md "Evaluation"); see below. |
 | `gt.*` | Accuracy against ground truth, when annotations exist. |
+
+### `server.sh`
+
+The evaluator starts `server.sh --data <out>/server_sh/ws --no-browser` (port 0), with copies of
+the reference inputs and of the one-update `ainex` map in that workspace.
+
+* **Performance:** start-up time (to the `listening on` line), resident memory of its process tree
+  once listening, time from opening the web application to `body[data-ready=true]`, latency of
+  read-only requests (median and p95 when idle; p95 of the requests made while a job runs), and the
+  median overhead of a job over the same command run from the shell.
+* **Parity:** the operations come from the service's own `/api/openapi.json` (each job
+  operation's `x-oms` entry, the commands' `commands.spec.describe()`), so a new mode or option is covered without changing the evaluator.
+  Each operation gets a default case on the reference inputs and one case per non-default choice,
+  per artefact folder and per point-cloud attribute. Each case runs the command from the shell
+  twice and then as a job, and the job's result and every file of its artefact folder must be
+  byte-identical to the command's; for `view.sh`, what its viewer serves (`VIEWER_ROUTES`). The
+  models are not bit-reproducible from one request to the next, so the service and the shell
+  runs share an **inference proxy** (`tools/evaluate/proxy.py`): it forwards the first request of
+  a kind to the inference server and answers identical requests (same route, fields and input
+  file contents) with the recorded response. A difference is a mismatch, unless the command's
+  own two runs differ too (`unverifiable`).
+* **UI:** the web application's browser tests (`tests/browser/test_webapp*.py`, `-m browser`,
+  with the stub inference server in an isolated runtime folder), and the vendored axe-core
+  (WCAG 2.0/2.1 A and AA) on the live service's pages over the reference data.
+
+### Targets, baseline and results
 
 Per-stage memory comes from two sources. Each command records its stages (`core.timing`), and
 the peak resident set of its own process during each stage, sampled every 50 ms. It writes these
@@ -1524,11 +1584,15 @@ server reports no memory of its own, so the evaluator samples two figures every 
 command's process tree, which includes COLMAP, and the server's physical footprint. It
 attributes each sample to the stage whose time window it falls in.
 
-Targets are data in `examples/targets.json`. Each target is an `op`/`value` pair with regression
-tolerances, and a target can be edited without changing code. The file's `rationale` explains
-each group of targets. Each metric's `measured` value is the reference run the targets were
-derived from, and the evaluator ignores it. Ground-truth files dropped into
-`examples/ground_truth/` are picked up without code changes (see its `README.md`).
+Targets are data in `examples/targets.json`, and every metric has one. Each target is an
+`op`/`value` pair with regression tolerances, and a target can be edited without changing code.
+A key with `*` is a pattern that targets every metric it matches without a target of its own (the
+most specific pattern wins): the per-stage metrics and the office splits, whose names are data,
+are targeted that way. The file's `rationale` explains each group of targets. Each metric's
+`measured` value is the reference run the targets were derived from, and the evaluator ignores
+it. Ground-truth files dropped into `examples/ground_truth/` are picked up without code changes
+(see its `README.md`). `--rejudge RESULT_DIR` runs nothing: it judges a stored run again with the
+current targets and baseline and rewrites its `result.json` and `summary.md`.
 
 Each run is compared with the stored baseline `~/oh-my-slam-data/evaluations/baseline.json`,
 and regressions are flagged. Without a baseline the report says `baseline missing — not
@@ -1545,6 +1609,8 @@ Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by 
 * `runs/` (stdout, stderr and timings per command)
 * `outputs/`
 * `maps/`
+* `server_sh/` (the service's workspace, the shell side of the parity cases, the browser tests'
+  report)
 
 The command prints the path of `summary.md` on stdout. It exits 0 when every metric passes, 1
 when one fails, and 2 on a usage error. It needs the model weights. It also needs Microsoft Edge
@@ -1609,7 +1675,9 @@ runs it end to end as a test.
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
   longer. A later update rebuilds such a map with its photos (Mapping, step 4), so the whole
   sequence split as 4 + 4 + 5 or 6 + 7 photos ends with the one-update map's objects, labels
-  and boxes (one window keeps a different id, see there). In a map of the
+  and boxes (one window keeps a different id, see there), and with the objects its first
+  updates published that the one-update map does not have (a tree behind the glass, see
+  *Update semantics*): published objects stay published. In a map of the
   whole sequence the global mapper's result varies from run to run for the same reason: in some
   runs the depth check (step 1 of *Weakly linked parts*) rejects photos whose SfM points are
   mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and their multi-view poses leave them
