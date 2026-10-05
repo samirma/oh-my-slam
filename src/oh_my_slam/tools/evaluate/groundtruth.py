@@ -94,6 +94,15 @@ class MapUpdatePlan:
     absent: list[Absent]
     stable: list[str]  # labels the stability comparison is restricted to (empty: every object)
     files: list[Path]
+    splits: tuple[tuple[int, ...], ...] = ()  # sizes of the consecutive updates of a split map
+
+    def split_sizes(self, images: list[str]) -> list[tuple[int, ...]]:
+        """How the sequence is split across updates: the annotated ``splits``, else one split,
+        the early part (``before_images``) then the rest."""
+        if self.splits:
+            return list(self.splits)
+        early = len(self.before_images(images))
+        return [(early, len(images) - early)] if 0 < early < len(images) else []
 
     def before_images(self, images: list[str]) -> list[str]:
         """The images up to the last one that shows an absent object (``images``: in capture
@@ -102,7 +111,8 @@ class MapUpdatePlan:
         return images[:max(seen) + 1] if seen else []
 
 
-def _map_update_parts(data: dict[str, Any]) -> tuple[str, list[Absent], list[str]]:
+def _map_update_parts(data: dict[str, Any]
+                      ) -> tuple[str, list[Absent], list[str], list[tuple[int, ...]]]:
     seq, absent = data.get("sequence"), data.get("absent")
     if not isinstance(seq, str) or not isinstance(absent, list) or not absent:
         raise ValueError("a 'map_update' file needs 'sequence' and a non-empty 'absent' list")
@@ -124,7 +134,13 @@ def _map_update_parts(data: dict[str, Any]) -> tuple[str, list[Absent], list[str
     stable = data.get("stable", [])
     if not isinstance(stable, list) or not all(isinstance(v, str) for v in stable):
         raise ValueError("'stable' is a list of labels")
-    return seq, items, list(stable)
+    splits = data.get("splits", [])
+    if not isinstance(splits, list) or not all(
+            isinstance(sp, list) and len(sp) >= 2 and all(isinstance(n, int) and n > 0 for n in sp)
+            for sp in splits):
+        raise ValueError("'splits' is a list of splits, each the sizes (at least two positive "
+                         "integers) of consecutive updates")
+    return seq, items, list(stable), [tuple(sp) for sp in splits]
 
 
 def map_update_plan(files: list[GroundTruth], skipped: list[dict[str, str]]
@@ -133,19 +149,22 @@ def map_update_plan(files: list[GroundTruth], skipped: list[dict[str, str]]
     stable labels are merged); files about another sequence are skipped with a reason."""
     absent: list[Absent] = []
     stable: list[str] = []
+    splits: list[tuple[int, ...]] = []
     used: list[Path] = []
     for f in files:
         if f.kind != "map_update":
             continue
-        seq, items, labels = _map_update_parts(f.data)
+        seq, items, labels, sizes = _map_update_parts(f.data)
         if seq != MAP_UPDATE_SEQUENCE:
             skipped.append({"file": str(f.path), "reason": f"{seq} is not evaluated "
                                                            f"(only {MAP_UPDATE_SEQUENCE})"})
             continue
         absent += items
         stable += [v for v in labels if v not in stable]
+        splits += [sp for sp in sizes if sp not in splits]
         used.append(f.path)
-    return MapUpdatePlan(MAP_UPDATE_SEQUENCE, absent, stable, used) if used else None
+    return MapUpdatePlan(MAP_UPDATE_SEQUENCE, absent, stable, used, tuple(splits)) \
+        if used else None
 
 
 def _gt_objects(data: dict[str, Any]) -> list[DocObject]:

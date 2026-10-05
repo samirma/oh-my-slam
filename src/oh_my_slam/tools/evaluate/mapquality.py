@@ -221,16 +221,27 @@ def match_objects(a: list[tuple[DocObject, OBB]], b: list[tuple[DocObject, OBB]]
 
 
 def stability_metrics(m: Metrics, prefix: str, single: list[DocObject], split: list[DocObject],
-                      T_single_split: Pose) -> list[dict[str, Any]]:
-    """``<prefix>.*`` (see ``STABILITY_METRICS``); returns the matched pairs for the report."""
+                      T_single_split: Pose, published: set[int] | None = None
+                      ) -> list[dict[str, Any]]:
+    """``<prefix>.*`` (see ``STABILITY_METRICS``); returns the matched pairs for the report.
+
+    ``published``: the ids an earlier update of the split map had already published. mapper.md
+    lets an id differ from the one-update map exactly there (identity persistence takes
+    precedence), so a pair whose split id is one of them agrees on ids; the detail keeps the
+    strict share (``same_id``) too."""
     ids = {k: f"{prefix}.{k}" for k in STABILITY_METRICS}
     a = [(o, box) for o in single if (box := o.obb()) is not None]
     b = [(o, box.transformed(T_single_split)) for o in split if (box := o.obb()) is not None]
     pairs = match_objects(a, b)
-    n = max(len(a), len(b))
+    # the share of the one-update map's objects the split map has: an extra object of the split
+    # map (one an earlier update published and no later image contradicted, which mapper.md lets
+    # it keep) is reported, not counted against it
+    n = len(a)
+    paired = {j for _, j, _, _ in pairs}
+    extra = [{"id": o.id, "label": o.label} for j, (o, _) in enumerate(b) if j not in paired]
     m.add(ids["matched_fraction"], len(pairs) / n if n else None,
-          {"single": len(a), "split": len(b), "matched": len(pairs)},
-          error=None if n else "neither map has objects")
+          {"single": len(a), "split": len(b), "matched": len(pairs), "extra_published": extra},
+          error=None if n else "the one-update map has no objects")
     rows: list[dict[str, Any]] = []
     for i, j, iou, d in pairs:
         (oa, ba), (ob, bb) = a[i], b[j]
@@ -248,8 +259,13 @@ def stability_metrics(m: Metrics, prefix: str, single: list[DocObject], split: l
            "disagreeing": [[a[i][0].id, a[i][0].label, b[j][0].id, b[j][0].label]
                            for (i, j, *_), ok in zip(blind, agree, strict=True) if not ok]},
           error=None if agree else none)
-    m.add(ids["id_agreement"], sum(r["single_id"] == r["split_id"] for r in rows) / k
-          if k else None, error=None if k else none)
+    same = sum(r["single_id"] == r["split_id"] for r in rows)
+    kept = [r for r in rows if r["single_id"] != r["split_id"] and published
+            and r["split_id"] in published]
+    m.add(ids["id_agreement"], (same + len(kept)) / k if k else None,
+          {"same_id": round(same / k, 4) if k else None,
+           "published_earlier": [[r["single_id"], r["split_id"]] for r in kept]}
+          if published is not None else None, error=None if k else none)
     for key, col in (("centre_delta_median_m", "centre_delta_m"),
                      ("extent_delta_median_rel", "extent_delta_rel"), ("obb_iou_median", "iou")):
         m.add(ids[key], float(np.median([r[col] for r in rows])) if k else None,

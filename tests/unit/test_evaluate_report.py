@@ -17,6 +17,7 @@ from oh_my_slam.tools.evaluate.metrics import (
     TargetsError,
     baseline_values,
     load_targets,
+    target_for,
 )
 from oh_my_slam.tools.evaluate.performance import perf_metrics
 from oh_my_slam.tools.evaluate.report import build_result, summary_md, write_report
@@ -43,12 +44,47 @@ def targets_file(tmp_path: Path, doc: dict | None = None) -> Path:
 
 def test_shipped_targets_cover_every_metric() -> None:
     targets = load_targets(EXAMPLES / "targets.json")
-    assert set(expected_ids()) <= set(targets)
     gt_ids = {"gt.objects.recall", "gt.objects.precision", "gt.objects.obb_iou_median",
               "gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg",
               "gt.poses.pitch_err_median_deg"}
     assert gt_ids <= set(targets)
-    assert set(targets) == set(expected_ids()) | gt_ids  # no stale targets
+    # no stale targets: besides those, only per-stage targets (explicit, or patterns)
+    # (a split of the office sequence is named after its sizes: its targets are patterns too)
+    named = {k for k in targets if "*" not in k and ".stage." not in k}
+    patterns = {k for k in targets if "*" in k}
+    expected = set(expected_ids())
+    assert named == {k for k in expected if target_for(targets, k) is targets.get(k)} | gt_ids
+    assert all(target_for(targets, k) is not None for k in expected)
+    assert all(k.startswith(("perf.", "map_update.split_*.")) for k in patterns)
+    # every performance group's stages have a target, whatever stage a command adds
+    for mid in expected_ids():
+        parts = mid.split(".")
+        if parts[0] == "perf" and parts[1] != "server":
+            for key in ("s", "client_peak_mb", "server_peak_gb"):
+                assert target_for(targets, f"perf.{parts[1]}.stage.new_stage.{key}") is not None
+
+
+def test_pattern_targets_cover_metrics_named_after_data(tmp_path: Path) -> None:
+    """A key with ``*`` targets every metric it matches; a metric's own target, then the most
+    specific pattern, win."""
+    doc = {"metrics": {
+        "perf.*.stage.*.s": {"op": "<=", "value": 60, "unit": "s"},
+        "perf.mapper_single.stage.*.s": {"op": "<=", "value": 30, "unit": "s"},
+        "perf.mapper_single.stage.sfm.s": {"op": "<=", "value": 9, "unit": "s"},
+    }}
+    t = load_targets(targets_file(tmp_path, doc))
+    assert target_for(t, "perf.mapper_single.stage.sfm.s").value == 9  # its own
+    assert target_for(t, "perf.mapper_single.stage.cloud.s").value == 30  # the group's pattern
+    assert target_for(t, "perf.segment_map.stage.export.s").value == 60  # the generic pattern
+    assert target_for(t, "perf.segment_map.wall_s") is None
+    m = Metrics()
+    m.add("perf.mapper_single.stage.cloud.s", 31.0)
+    m.add("perf.segment_map.stage.export.s", 1.0)
+    m.add("perf.segment_map.wall_s", 1.0)
+    m.judge(t, None)
+    assert m.items["perf.mapper_single.stage.cloud.s"].passed is False
+    assert m.items["perf.segment_map.stage.export.s"].passed is True
+    assert m.items["perf.segment_map.wall_s"].passed is None  # untargeted
 
 
 def test_targets_file_is_validated(tmp_path: Path) -> None:
@@ -271,7 +307,15 @@ def test_per_stage_time_and_memory(tmp_path: Path) -> None:
     perf_metrics(m, runs)
     stages = m.items["perf.reconstruct_json.wall_s"].detail["stages"]
     assert stages == {"inference": st(0.9, 500.0, 11.3), "export": st(0.1, 510.0, None)}
-    assert m.items["perf.mapper_split.wall_s"].detail["stages"] == {"sfm": st(21.5, 4000.0, 16.0)}
+    # per mapping update: the slowest update's stage time, the peak memory over the updates
+    assert m.items["perf.mapper_split.wall_s"].detail["stages"] == {"sfm": st(22.0, 4000.0, 16.0)}
+    assert m.items["perf.mapper_split.per_update_wall_s"].value == max(r.wall_s for r in runs[1:])
+    # every stage is a metric of its own (time, client and server memory)
+    assert m.items["perf.reconstruct_json.stage.inference.s"].value == 0.9
+    assert m.items["perf.reconstruct_json.stage.inference.client_peak_mb"].value == 500.0
+    assert m.items["perf.mapper_split.stage.sfm.server_peak_gb"].value == 16.0
+    export = m.items["perf.reconstruct_json.stage.export.server_peak_gb"]
+    assert export.value is None and "not sampled" in (export.error or "")
     text = summary_md(result_of(m, runs, {"status": "missing"}))
     assert "## Per-stage time and peak memory" in text
     assert "| reconstruct_json | inference | 0.9 | 500 | 11.3 |" in text
@@ -288,3 +332,23 @@ def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert not (tmp_path / "o").exists()
     err = capsys.readouterr().err
     assert "outside the repository" in err
+
+
+def test_a_stored_run_is_judged_again_with_new_targets(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Targets are data: ``--rejudge`` judges a stored run again without running anything."""
+    m = judged(tmp_path, {"perf.a.wall_s": 2.4, "pose.b.fraction": 0.95, "contract.c.x": 0})
+    run = tmp_path / "run"
+    write_report(run, result_of(m, [], {"status": "missing"}))
+    strict = targets_file(tmp_path, {"metrics": {"perf.a.wall_s": {"op": "<=", "value": 2.0},
+                                                 "pose.b.fraction": {"op": ">=", "value": 0.9}}})
+    assert main(["--rejudge", str(run), "--targets", str(strict),
+                 "--baseline", str(tmp_path / "none.json")]) == 1
+    result = json.loads((run / "result.json").read_text())
+    by_id = {x["id"]: x for x in result["metrics"]}
+    assert by_id["perf.a.wall_s"]["passed"] is False and by_id["pose.b.fraction"]["passed"]
+    assert by_id["contract.c.x"]["passed"] is None  # no target any more
+    assert result["judged"] and result["summary"]["failed"] == 1
+    assert "judged again" in (run / "summary.md").read_text()
+    assert main(["--rejudge", str(tmp_path / "nothing")]) == 2
+    capsys.readouterr()

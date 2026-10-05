@@ -183,6 +183,31 @@ def test_frame_record_roundtrip() -> None:
     assert back.K_grid.width == 320 and back.K_grid.fx == pytest.approx(250)
 
 
+def test_scene_metadata_floats_are_rounded_for_byte_parity(tmp_path: Path) -> None:
+    """Threaded SfM makes the map's scale and floor height differ by ~1e-12 between identical
+    runs: the scene JSON rounds them as it rounds poses and cuboids, so the two runs' documents
+    are byte-identical."""
+    from oh_my_slam.mapping import export
+
+    rec = store.FrameRecord(0, "f000000", "frames/f000000.jpg", "x.jpg", 1, 640, 480,
+                            Intrinsics(500, 500, 320, 240, 640, 480, "colmap"),
+                            Pose(rot_z(0.3), np.array([1.0, 2.0, 3.0])), 320, 240)
+
+    def doc(eps: float) -> bytes:
+        meta = {"scale": {"sfm_to_metric": 0.123456789 + eps, "spread": 0.0421 + eps,
+                          "frames": 13, "method": "sfm"},
+                "floor_z": np.float64(-1.2345678912 + eps), "update_count": 1,
+                "map_frame": {"units": "m", "gravity_aligned": True}}
+        return json.dumps(export.full_scene(tmp_path, meta, [rec], [])).encode()
+
+    a, b = doc(0.0), doc(3e-12)
+    assert a == b
+    md = json.loads(a)["openlabel"]["metadata"]
+    assert md["scale"] == {"sfm_to_metric": 0.123457, "spread": 0.0421, "frames": 13,
+                           "method": "sfm"}
+    assert md["floor_z"] == -1.234568 and md["map_frame"]["gravity_aligned"] is True
+
+
 # --- ingest -------------------------------------------------------------------------------------
 
 

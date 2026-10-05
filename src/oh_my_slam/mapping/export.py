@@ -57,9 +57,9 @@ def full_scene(root: Path, meta: dict[str, Any], records: list[store.FrameRecord
         )
     md = ol.metadata(
         Path(root).name, tagged_file=str(root), tool="mapper",
-        map_frame=meta.get("map_frame"), scale=meta.get("scale"),
+        map_frame=ol.rounded(meta.get("map_frame")), scale=ol.rounded(meta.get("scale")),
         update_count=meta.get("update_count"), keyframes=len(records),
-        floor_z=meta.get("floor_z"),
+        floor_z=ol.rounded(meta.get("floor_z")),
     )
     return ol.document(md, objects_block(objects, "map"), coordinate_systems=css,
                        streams=streams, frames=frames,
