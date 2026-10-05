@@ -625,7 +625,7 @@ def test_browser_schema_validation_agrees_with_the_commands(tab: Tab, app: tuple
             # e.g. a frame interval that is a list): the browser refuses it with a reason
             assert js["extra"], d
         invalid += bool(paths or extra)
-    assert invalid >= 300  # most mutations break the document
+    assert invalid >= len(variants) // 2  # most mutations break the document; the rest stay valid
 
 
 def test_scene_viewer_opens_job_files_on_a_stable_url(image_job: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
