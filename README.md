@@ -1454,7 +1454,9 @@ at the Python-module level:
   output and timing stage of `reconstruct.sh`, `mapper.sh update` / `locate`, `segment.sh -i` /
   `-m` and `view.sh -i` / `-m` is declared there once. Each command builds its argparse parser
   (`spec.build_parser`) and runs its checks (`spec.validate`: each rule's pure check, then its
-  preparation such as creating `-d`, in order, before any work) from it. For the web service,
+  preparation such as creating `-d`, in order, before any work; `spec.validate_deferring` leaves
+  a preparation to the command, as `segment.sh -i` does with `-d` until its inference-server check
+  has passed, so a run refused with exit 3 leaves no folder behind) from it. For the web service,
   `spec.parse` turns API parameters into the command's arguments through the same parser (an
   argument error names its parameters), `spec.dry_run` reports argparse's and every rule's
   problems per parameter without touching the filesystem, and
