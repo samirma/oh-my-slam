@@ -1249,7 +1249,17 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     first_new = state.next_id
     first_number: dict[int, int] = {}
     count = first_new
+    # a rebuild (``mapping.api._restart_weak_map``): the detections of the stored keyframes carry
+    # the ids the map published (``prior``: detection -> id), and the new keyframes' detections
+    # are numbered on from the map's count (``prior_floor``), as an update that extends it does
+    rb = getattr(ctx, "rebuild", None)
+    prior: dict[int, int] = rb.prior if rb is not None else {}
+    floor = rb.next_id if rb is not None else 0
+    if rb is not None:
+        state.vacated = list(rb.vacated)
     for nf in sorted(ctx.new, key=lambda nf: nf.kf.index):
+        if rb is not None and nf.kf.name not in rb.uids:
+            count = max(count, floor)
         first_number[nf.kf.index] = count
         count += len(nf.dets)
     new_views: dict[int, tuple[Any, View]] = {}
@@ -1336,11 +1346,12 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     candidates = [o for o in state.objects
                   if o.confirmed and o.id not in dropped and o.id not in src_ids]
     witnesses: dict[int, list[int]] = {}
-    removed = _absence(candidates, {o.id: later(o) for o in candidates}, witnesses)
+    uids = {r.index: r.update_id for r in records}
+    removed = _absence(candidates, {o.id: later(o) for o in candidates}, witnesses, uids)
     kept = [mv for mv in moves if mv.dst.id not in removed]
     if len(kept) < len(moves):  # moved to a place the update then saw empty: judged as before
         back = [mv.src for mv in moves if mv not in kept]
-        removed += _absence(back, {o.id: later(o) for o in back}, witnesses)
+        removed += _absence(back, {o.id: later(o) for o in back}, witnesses, uids)
     moves = kept
     arrived: dict[int, NDArray[np.bool_]] = {}
 
@@ -1386,12 +1397,15 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         k = resolved(oid)
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     fresh = [o for o in state.objects if o.id >= first_new]
-    rename = {o.id: first_detection[o.id] for o in fresh}
+    final_of, _, absorbed = _published_ids(owner, obs, resolved, first_detection, prior,
+                                           floor, count)
+    count = max([count] + [v + 1 for v in final_of.values()])
+    rename = {o.id: final_of[o.id] for o in fresh}
     moved_ids: list[int] = []
     for src_id, dst in sorted(moved_from.items()):
         # a moved object keeps the id of where it was; an id of its own that the map stored
         # resolves to it
-        src_final = src_id if src_id < first_new else first_detection[src_id]
+        src_final = src_id if src_id < first_new else final_of[src_id]
         if dst.id < first_new:
             state.merged_into[dst.id] = src_final
             tx.delete(points_file(dst.id))
@@ -1409,7 +1423,11 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     touched = {rename.get(t, t) for t in touched if t not in alias and t not in gone}
     for v in vacated:  # the places of this update record the objects' final ids
         if v.object >= first_new:
-            v.object = first_detection.get(v.object, v.object)
+            v.object = final_of.get(v.object, v.object)
+    removed_published: list[int] = []
+    published = set(rb.created) if rb is not None else set()
+    if rb is not None:
+        removed_published = _carry_identity(state, rb, final_of, absorbed, gone)
 
     def final_id(oid: int) -> int:
         oid = resolved(oid)
@@ -1432,8 +1450,9 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     confirmed = sum(o.confirmed for o in state.objects)
     state.summary = {
         "instances": len(obs), "touched": len(touched), "new": len(fresh), "merged": merged,
-        "removed": sorted(oid for oid in removed if oid < first_new),
-        "withdrawn": sum(oid >= first_new for oid in removed),
+        "removed": sorted({oid for oid in removed if oid < first_new} | set(removed_published)),
+        "withdrawn": sum(oid >= first_new and final_of.get(oid, oid) not in published
+                         for oid in removed),
         "moved": sorted(moved_ids),
         "pixels_invalidated": sum(state.invalidated.values()),
         "vacated": len(vacated),
@@ -1481,7 +1500,11 @@ def retire_pixels(ctx: Any, views: _Views, masks: _Masks, gone: list[MapObject],
         seen_through = [views.records[f].name for f in (witnesses or {}).get(o.id, [])
                         if f in views.records]
         if retired and seen_through:
-            places.append(Vacated(int(ctx.update_id), o.id, retired, seen_through, o.obb,
+            # a rebuild's witnesses keep the update that added them (``Vacated.update``: a later
+            # update's keyframes see the place again)
+            uid = max([views.records[f].update_id for f in (witnesses or {}).get(o.id, [])
+                       if f in views.records] or [int(ctx.update_id)])
+            places.append(Vacated(int(uid), o.id, retired, seen_through, o.obb,
                                   float(o.obs_depth)))
     out: dict[int, int] = {}
     for f, m in kill.items():
@@ -2739,6 +2762,9 @@ class Verdict:
     # fewer than ``VISIBLE_SHARE`` of those in its image (``_Places.verdicts``: partly occluded)
     seen: frozenset[int] = frozenset()
     partial: bool = False
+    # its weight in the majority of ``_judgement``: what it sees of the share a whole verdict
+    # sees (a partial verdict's unoccluded samples over ``VISIBLE_SHARE`` of those framed)
+    weight: float = 1.0
 
     @property
     def in_place(self) -> bool:
@@ -3066,8 +3092,9 @@ class _Places:
             s0 = max(s0, around)
             shares.append(max(0.0, (seen - s0) / (1.0 - s0)) if s0 < 1.0 else 0.0)
         seen_idx = frozenset(np.flatnonzero(framed)[visible].tolist())
+        weight = float(visible.sum()) / (VISIBLE_SHARE * int(framed.sum())) if partial else 1.0
         return Verdict(j, shares[0], supported, ratio, held=shares[1], seen=seen_idx,
-                       partial=partial)
+                       partial=partial, weight=min(1.0, weight))
 
     def verdicts(self, o: MapObject, frames: list[int], detectable: bool = False,
                  occluded: bool = False) -> list[Verdict]:
@@ -3181,7 +3208,7 @@ def _judgement(o: MapObject, verdicts: list[Verdict], few: bool = True) -> str |
     if not after:
         return "in place"
     strong = [v for v in after if v.share >= REMOVE_FRACTION]
-    if 2 * len(strong) <= len(after):
+    if 2 * sum(v.weight for v in strong) <= sum(v.weight for v in after):  # partly occluded: less
         return None
     established = (few and len(strong) >= CONFIRM_DETECTIONS
                    and all(v.share >= REMOVE_FRACTION_FEW and v.supported for v in strong)
@@ -3190,28 +3217,97 @@ def _judgement(o: MapObject, verdicts: list[Verdict], few: bool = True) -> str |
 
 
 def _absence(candidates: list[MapObject], verdicts: dict[int, list[Verdict]],
-             witnesses: dict[int, list[int]] | None = None) -> list[int]:
+             witnesses: dict[int, list[int]] | None = None,
+             uids: dict[int, int] | None = None) -> list[int]:
     """Objects that this update, as a whole, shows to be gone (``_judgement`` of the verdicts of
     its keyframes added after each object's last detection, ``_Places``): "gone" removes the
     object; a "strike" is remembered, and a second strike (from a later update) removes it; "in
     place" clears the strikes (latest wins). An update counts once, however many of its keyframes
-    judge. ``witnesses``, when given, receives the keyframes that saw through each removed object
-    (object id -> indices)."""
+    judge. ``uids`` (keyframe index -> the update that added it): a rebuild maps keyframes of
+    several updates at once, and their verdicts are judged update by update, in order, as those
+    updates judged them. ``witnesses``, when given, receives the keyframes that saw through each
+    removed object (object id -> indices)."""
     removed = []
     for o in candidates:
-        vs = verdicts.get(o.id, [])
-        verdict = _judgement(o, vs)
-        if verdict == "in place":
-            o.strikes = 0
-        elif verdict == "strike":
-            o.strikes += 1
-        if verdict == "gone" or (verdict == "strike" and o.strikes >= 2):
-            removed.append(o.id)
-            if witnesses is not None:
-                last = max((v.frame for v in vs if v.in_place), default=-1)
-                witnesses[o.id] = sorted(v.frame for v in vs
-                                         if v.share >= REMOVE_FRACTION and v.frame > last)
+        vs = sorted(verdicts.get(o.id, []), key=lambda v: v.frame)
+        groups: dict[int, list[Verdict]] = {}
+        for v in vs:
+            groups.setdefault((uids or {}).get(v.frame, 0), []).append(v)
+        for _, group in sorted(groups.items()):
+            verdict = _judgement(o, group)
+            if verdict == "in place":
+                o.strikes = 0
+            elif verdict == "strike":
+                o.strikes += 1
+            if verdict == "gone" or (verdict == "strike" and o.strikes >= 2):
+                removed.append(o.id)
+                if witnesses is not None:
+                    last = max((v.frame for v in group if v.in_place), default=-1)
+                    witnesses[o.id] = sorted(v.frame for v in group
+                                             if v.share >= REMOVE_FRACTION and v.frame > last)
+                break
     return removed
+
+
+def _published_ids(owner: list[int], obs: list[Observation], resolved: Callable[[int], int],
+                   first_detection: dict[int, int], prior: dict[int, int], floor: int, count: int
+                   ) -> tuple[dict[int, int], set[int], dict[int, int]]:
+    """The final id of each new object of the update (provisional id -> id): the number of its
+    first detection, except in a rebuild, where an object takes the lowest id the map published
+    for a stored detection it owns (``prior``), unless an object owning more of those took it, and
+    an object without one whose number falls among the published ones (below ``floor``) takes a
+    new one (from ``count`` on). Returns (final ids, the published ids taken, the published ids
+    other objects own detections of: id -> the provisional object that absorbed them)."""
+    claims: dict[int, dict[int, int]] = {}
+    for i, oid in enumerate(owner):
+        k = resolved(oid)
+        for m in obs[i].members:
+            pid = prior.get(id(m.detection))
+            if pid:
+                c = claims.setdefault(k, {})
+                c[pid] = c.get(pid, 0) + 1
+    final: dict[int, int] = {}
+    taken: set[int] = set()
+    for k in sorted(claims, key=lambda k: (-sum(claims[k].values()), first_detection.get(k, 0), k)):
+        free = sorted(p for p in claims[k] if p not in taken)
+        if free:
+            final[k] = free[0]
+            taken.add(free[0])
+    absorbed: dict[int, int] = {}
+    for k, c in claims.items():
+        for p in c:
+            if p not in taken and k in final:
+                absorbed.setdefault(p, k)
+    nxt = count
+    for k in sorted(first_detection, key=lambda k: (first_detection[k], k)):
+        if k in final:
+            continue
+        n = first_detection[k]
+        if floor and n < floor:
+            n, nxt = nxt, nxt + 1
+        final[k] = n
+    return final, taken, absorbed
+
+
+def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
+                    absorbed: dict[int, int], gone: set[int]) -> list[int]:
+    """After a rebuild: the ids the map published live on. A published id another object took
+    the detections of resolves to it (``merged_into``), as do the map's earlier merges; an object
+    that keeps a published id keeps its creation update; a published id nothing took is returned
+    (the update's ``removed``): none vanishes unreported."""
+    finals = {o.id for o in state.objects}
+    for p, k in absorbed.items():
+        if k not in gone and final_of.get(k) in finals:
+            state.merged_into[p] = final_of[k]
+    for a, b in sorted(rb.merged_into.items()):
+        while b in state.merged_into and state.merged_into[b] != b:
+            b = state.merged_into[b]
+        if b in finals and a not in finals:
+            state.merged_into[a] = b
+    for o in state.objects:
+        if o.id in rb.created:
+            o.created_update = min(o.created_update, rb.created[o.id])
+    return sorted(set(rb.created) - finals - set(state.merged_into))
 
 
 # ------------------------------------------------------------------------------------------------
