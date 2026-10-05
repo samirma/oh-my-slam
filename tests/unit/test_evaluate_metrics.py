@@ -274,6 +274,27 @@ def test_split_map_objects_are_matched_after_pose_alignment() -> None:
     assert v["s.extent_delta_median_rel"] == pytest.approx(0.0, abs=1e-6)
     assert v["s.obb_iou_median"] > 0.95
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1), (2, 7), (3, 3)}
+    assert m.items["s.matched_fraction"].detail["extra_published"] == []
+
+
+def test_extra_objects_of_the_split_map_are_reported_not_counted() -> None:
+    """mapper.md: the split map may keep an object an earlier update published that no later
+    image contradicts. matched_fraction is the share of the one-update map's objects the split
+    map has; the split map's extra objects are listed, not held against it."""
+    single = [box(1, "chair", (2, 0, 0.45)), box(2, "lamp", (-2, -2, 1.0))]
+    split = [box(1, "chair", (2, 0, 0.45)), box(2, "lamp", (-2, -2, 1.0)),
+             box(9, "box", (4, 4, 0.2)), box(10, "bag", (-4, 3, 0.2))]
+    m = Metrics()
+    stability_metrics(m, "s", single, split, Pose.identity())
+    mf = m.items["s.matched_fraction"]
+    assert mf.value == 1.0
+    assert mf.detail["extra_published"] == [{"id": 9, "label": "box"}, {"id": 10, "label": "bag"}]
+    m = Metrics()
+    stability_metrics(m, "s", single, split[:1], Pose.identity())  # one of its objects is missing
+    assert m.items["s.matched_fraction"].value == 0.5
+    m = Metrics()
+    stability_metrics(m, "s", [], split, Pose.identity())
+    assert m.items["s.matched_fraction"].value is None
 
 
 def test_overlapping_objects_of_different_labels_are_not_swapped() -> None:

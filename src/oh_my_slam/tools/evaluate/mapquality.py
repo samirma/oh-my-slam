@@ -233,10 +233,15 @@ def stability_metrics(m: Metrics, prefix: str, single: list[DocObject], split: l
     a = [(o, box) for o in single if (box := o.obb()) is not None]
     b = [(o, box.transformed(T_single_split)) for o in split if (box := o.obb()) is not None]
     pairs = match_objects(a, b)
-    n = max(len(a), len(b))
+    # the share of the one-update map's objects the split map has: an extra object of the split
+    # map (one an earlier update published and no later image contradicted, which mapper.md lets
+    # it keep) is reported, not counted against it
+    n = len(a)
+    paired = {j for _, j, _, _ in pairs}
+    extra = [{"id": o.id, "label": o.label} for j, (o, _) in enumerate(b) if j not in paired]
     m.add(ids["matched_fraction"], len(pairs) / n if n else None,
-          {"single": len(a), "split": len(b), "matched": len(pairs)},
-          error=None if n else "neither map has objects")
+          {"single": len(a), "split": len(b), "matched": len(pairs), "extra_published": extra},
+          error=None if n else "the one-update map has no objects")
     rows: list[dict[str, Any]] = []
     for i, j, iou, d in pairs:
         (oa, ba), (ob, bb) = a[i], b[j]
