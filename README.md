@@ -986,8 +986,9 @@ pixels, so its results are unchanged.
      keyframes keep their names and order, the objects their ids (an id is the number of the
      object's first detection, counted over the keyframes in order), and the latest keyframes
      win as within one update; `map.json` records `updates[].notes.restarted`. The extra cost is
-     the stored keyframes' inference and mapping (office 4 + 4 + 5: +3 s and +13 s; ainex 40 +
-     39: see the benchmark notes). Maps posed by SfM, videos and larger maps are extended.
+     the stored keyframes' inference and mapping: office 4 + 4 + 5, updates 2 and 3 took 18-19 s
+     and 29-33 s instead of 17 s each; ainex 40 + 39, update 2 took 141 s instead of 84 s (the
+     one-update map: 158 s). Maps posed by SfM, videos and larger maps are extended.
    * If no new keyframe overlaps the map, the command exits 5 and the map is unchanged.
 5. **Refinement.**
    1. Geometry is re-run for keyframes whose COLMAP focal length differs by more than 3 %.
