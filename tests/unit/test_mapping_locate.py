@@ -342,6 +342,138 @@ def test_one_keyframe_map(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------------------------------------------
+# an SfM map: model points first, the scaled depth for the rest
+
+
+def _model_only(lmod):  # type: ignore[no-untyped-def]
+    """``_MapPoints`` as before the depth fill: model points only for a keyframe the model
+    holds."""
+    class ModelOnly(lmod._MapPoints):  # type: ignore[misc, name-defined]
+        def lookup_split(self, m):  # type: ignore[no-untyped-def]
+            model = self._model_points(m.keyframe)
+            if model is None:
+                return super().lookup_split(m)
+            xyz, has, _ = model
+            ok = m.idx_k < len(has)
+            idx = np.where(ok, m.idx_k, 0)
+            return xyz[idx], ok & has[idx], np.zeros(len(ok), bool)
+    return ModelOnly
+
+
+@needs_colmap
+def test_the_depth_fill_locates_no_worse_than_the_model_points(world,  # type: ignore[no-untyped-def]
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """On an SfM-posed ring map the union (model points, then depth) locates every held-out view
+    the model points alone locate, as accurately: a pose the model points alone give with
+    ``MODEL_FIRST_MIN_INLIERS`` inliers is kept as it is, the others stay within the accuracy
+    target, and the median errors are no worse."""
+    from oh_my_slam.mapping import locate as lmod
+
+    union = run(world.map, world.imgs_b).results
+    monkeypatch.setattr(lmod, "_MapPoints", _model_only(lmod))
+    alone = run(world.map, world.imgs_b).results
+    assert all(r.located for r in union), [r.reason for r in union]
+
+    def err(r: object) -> tuple[float, float]:
+        W = transform_pose(world.sim, r.T_map_cam)  # type: ignore[attr-defined]
+        return float(np.linalg.norm(W.t - world.poses_b[r.index].t)), \
+            rot_deg(W.R, world.poses_b[r.index].R)  # type: ignore[attr-defined]
+
+    same = 0
+    for u, a in zip(union, alone, strict=True):
+        assert err(u)[0] < 0.03 and err(u)[1] < 0.5, (u.image.name, err(u))
+        if a.located and a.inliers >= lmod.MODEL_FIRST_MIN_INLIERS:
+            np.testing.assert_allclose(u.T_map_cam.matrix(), a.T_map_cam.matrix())  # type: ignore[union-attr]
+            same += 1
+    assert same > 0
+    both = [(err(u), err(a)) for u, a in zip(union, alone, strict=True) if a.located]
+    assert np.median([e[0][0] for e in both]) <= np.median([e[1][0] for e in both]) + 0.005
+    assert np.median([e[0][1] for e in both]) <= np.median([e[1][1] for e in both]) + 0.05
+
+
+@needs_colmap
+def test_depth_fill_is_scaled_to_the_sfm_points(world, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """A keyframe's depth points take the median model/depth ratio of its keypoints with both; a
+    keyframe whose depth is off by more than 2x gives none."""
+    from oh_my_slam.mapping import locate as lmod
+
+    mdir = tmp_path / "map"
+    shutil.copytree(world.map, mdir)
+    before = lmod._MapPoints(store.MapReader(mdir))
+    fr0, fr1 = before.reader.frames[:2]
+    s0 = before.depth_scale(fr0)
+    assert s0 is not None and abs(s0 - 1.0) < 0.06  # the map's depth fits its SfM points
+
+    def no_model_match(points, fr):  # type: ignore[no-untyped-def]
+        model = points._model_points(f"{fr.name}.jpg")
+        assert model is not None
+        _, has, uv = model
+        idx = np.flatnonzero(~has)[:200]
+        assert len(idx) > 50
+        return lmod._Match(f"{fr.name}.jpg", idx, idx, uv[idx], uv[idx])
+
+    xyz0, ok0 = before.lookup(no_model_match(before, fr0))
+    assert ok0.sum() > 50
+    for fr, f in ((fr0, 0.8), (fr1, 0.24)):
+        p = mdir / store.frame_file(fr.name, "depth.npy")
+        np.save(p, (np.load(p).astype(np.float32) * f).astype(np.float16))
+    after = lmod._MapPoints(store.MapReader(mdir))
+    s = after.depth_scale(fr0)
+    assert s is not None and abs(s - s0 / 0.8) < 0.01 * s0 / 0.8
+    xyz, ok = after.lookup(no_model_match(after, fr0))
+    np.testing.assert_array_equal(ok, ok0)
+    np.testing.assert_allclose(xyz[ok], xyz0[ok0], atol=0.01)  # the same points as before
+    assert after.depth_scale(fr1) is None
+    m1 = no_model_match(after, fr1)
+    assert not after.lookup(m1)[1].any()  # no depth points
+    _, has1, uv1 = after._model_points(f"{fr1.name}.jpg")  # type: ignore[misc]
+    idx = np.flatnonzero(has1)[:50]
+    assert after.lookup(lmod._Match(m1.keyframe, idx, idx, uv1[idx], uv1[idx]))[1].all()
+
+
+# ------------------------------------------------------------------------------------------------
+# a rotation-dominant map (multi-view poses): 2D-3D from the keyframes' stored depth
+
+
+@needs_colmap
+def test_held_out_views_of_a_rotation_dominant_map(tmp_path: Path) -> None:
+    """A head turning in place is posed by the multi-view fallback, whose ``sfm/model`` points are
+    triangulated from near-zero baselines without bundle adjustment: held-out headings between the
+    keyframes are located from the keyframes' stored depth (``model_points_trusted``), not from
+    those few unreliable points."""
+    from oh_my_slam.mapping import locate as lmod
+    from tests.unit.test_mapping_e2e_rotation import turning, yaw
+
+    client = FakeClient(mv_noise=(3.0, 0.15))
+    room = mapping_room()
+    first = turning(20, 0.0, 12.0)
+    add_frames(client, room, first, tmp_path / "a", "a", depth_noise=0.03, seed=4)
+    held = turning(19, 6.0, 12.0)  # half-way between consecutive keyframes
+    imgs = add_frames(client, room, held, tmp_path / "q", "q", depth_noise=0.03, seed=6)
+    mdir = tmp_path / "map"
+    msgs: list[str] = []
+    update(mdir, sorted((tmp_path / "a").glob("*.png")), client=client, progress=msgs.append)
+    assert any("multi-view fallback (rotation-dominant" in m for m in msgs), msgs
+    reader = store.MapReader(mdir)
+    assert {fr.pose_source for fr in reader.frames} == {"multiview"}
+    assert not any(lmod.model_points_trusted(fr) for fr in reader.frames)
+    before = snapshot(mdir)
+    res = run(mdir, imgs)
+    assert snapshot(mdir) == before
+    assert [r.located for r in res.results] == [True] * len(imgs), [r.reason for r in res.results]
+    # truth: the map frame is the first keyframe's up to a rigid transform (metric depth)
+    sim = similarity_by_poses([fr.T_map_cam for fr in reader.frames], first, with_scale=False)
+    centre = np.mean([transform_pose(sim, fr.T_map_cam).t for fr in reader.frames], axis=0)
+    y0 = yaw(reader.frames[0].T_map_cam)
+    for r, truth in zip(res.results, held, strict=True):
+        assert r.T_map_cam is not None
+        W = transform_pose(sim, r.T_map_cam)
+        dyaw = (yaw(r.T_map_cam) - y0 - (yaw(truth) - yaw(first[0])) + 180) % 360 - 180
+        assert abs(dyaw) < 1.0 and rot_deg(W.R, truth.R) < 1.5, (r.image.name, dyaw)
+        assert np.linalg.norm(W.t - centre) < 0.15, (r.image.name, W.t - centre)
+
+
+# ------------------------------------------------------------------------------------------------
 # offline rules (no COLMAP)
 
 
@@ -477,3 +609,138 @@ def test_pairs_exhaustive_for_small_maps_retrieval_for_large(tmp_path: Path) -> 
     assert client.calls["geometry"] == 1 and client.calls["gravity"] == 0
     with pytest.raises(ServerUnavailableError):  # no server in the test session: exit 3
         lmod._pairs(large, [q], db(n), None)
+
+
+# ------------------------------------------------------------------------------------------------
+# the epipolar gate in both regimes (analytic head, no COLMAP)
+
+
+def _gate_world(steps: dict[str, np.ndarray], pose_source: str):  # type: ignore[no-untyped-def]
+    """Keyframes of an analytic head (``tests.synth.turning``) at 15° steps, each moved by
+    ``steps`` (none: turning in place), the query half-way between two of them; matches, the
+    keyframes' true depth as ``_MapPoints`` would give them, and the 2D-3D correspondences of
+    the query (``uv``, ``xyz``) with the inliers of its true pose."""
+    from oh_my_slam.mapping import locate as lmod
+    from tests.synth.turning import K, head_pose, turning_rig
+
+    poses = {f"f{k:06d}": head_pose(15.0 * k, step=steps.get(f"f{k:06d}")) for k in range(7)}
+    truth = head_pose(37.5)
+    rig = turning_rig({**poses, "q": truth}, seed=7)
+    frames = {f"{n}.jpg": store.FrameRecord(k, n, f"frames/{n}.jpg", "", 1, K.width, K.height, K,
+                                            T, K.width, K.height, pose_source=pose_source)
+              for k, (n, T) in enumerate(poses.items())}
+    matches = []
+    for p in rig.pairs:
+        if "q" in (p.a, p.b):
+            kf, uq, uk = (p.b, p.uv_a, p.uv_b) if p.a == "q" else (p.a, p.uv_b, p.uv_a)
+            idx = np.arange(len(uq))
+            matches.append(lmod._Match(f"{kf}.jpg", idx, idx, uq, uk))
+    depth = {f"{n}.jpg": rig.depth[n] for n in poses}
+
+    def depth_pts(fr: store.FrameRecord, uv: np.ndarray):  # type: ignore[no-untyped-def]
+        d = depth[f"{fr.name}.jpg"]
+        return lmod.depth_points(d, np.ones(d.shape, bool), fr, uv)
+
+    points = SimpleNamespace(frames=frames, _depth_points=depth_pts)
+    uv = np.vstack([m.uv_q for m in matches])
+    xyz = np.vstack([depth_pts(frames[m.keyframe], m.uv_k)[0] for m in matches])
+    w = SimpleNamespace(lmod=lmod, K=K, truth=truth, matches=matches, points=points, uv=uv,
+                        xyz=xyz, inliers=lmod.count_inliers(truth, K, uv, xyz))
+    assert w.inliers > 0.9 * len(uv)
+    return w
+
+
+def _gate(w, T: Pose, inliers: int | None = None):  # type: ignore[no-untyped-def]
+    """``epipolar_gate`` of pose ``T``, solved from ``w``'s correspondences with ``inliers``
+    (default: as many as ``T`` reprojects)."""
+    n = w.lmod.count_inliers(T, w.K, w.uv, w.xyz) if inliers is None else inliers
+    return w.lmod.epipolar_gate(T, w.K, w.matches, w.points, w.uv, w.xyz, n)
+
+
+def _worst_shift(lmod, K, truth, matches, frames, size: float) -> Pose:  # type: ignore[no-untyped-def]
+    """``truth`` moved by ``size`` along the axis that contradicts the matches most."""
+    cands = [Pose(truth.R, truth.t + size * d) for d in np.vstack([np.eye(3), -np.eye(3)])]
+    return max(cands, key=lambda T: lmod.match_residual_deg(T, K, matches, frames)[0])
+
+
+def test_gate_refines_a_centre_error_seen_from_the_keyframes_spot() -> None:
+    """Turning in place (multi-view keyframes): a centre 3 cm off — the depth's scale error —
+    contradicts the matches by more than the limit; refined against the keyframe poses it is
+    accepted, as accurate as the truth allows. A rotation 3° off is never accepted as such."""
+    from scipy.spatial.transform import Rotation
+
+    from tests.synth.turning import rot_err_deg
+
+    w = _gate_world({}, "multiview")
+    lmod, K, truth, matches, points = w.lmod, w.K, w.truth, w.matches, w.points
+    T = _worst_shift(lmod, K, truth, matches, points.frames, 0.03)
+    med, n = lmod.match_residual_deg(T, K, matches, points.frames)
+    assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
+    assert lmod.rotation_dominant(T, matches, points)
+    T2, med2, ok = _gate(w, T)
+    assert ok and med2 <= lmod.MAX_EPIPOLAR_DEG, med2
+    assert rot_err_deg(T2, truth) < 0.15 and np.linalg.norm(T2.t - truth.t) < 0.03
+    # the truth itself passes untouched
+    assert _gate(w, truth)[0] is truth
+    # a rotation error the limit rejects is not made acceptable by the refinement (a turn about
+    # the vertical, along a horizontal baseline, barely moves the epipolar lines: the limit
+    # itself cannot see it there)
+    rejected = 0
+    for axis in np.eye(3):
+        wrong = Pose(Rotation.from_rotvec(np.radians(3.0) * axis).as_matrix() @ truth.R, truth.t)
+        if lmod.match_residual_deg(wrong, K, matches, points.frames)[0] <= lmod.MAX_EPIPOLAR_DEG:
+            continue
+        rejected += 1
+        T3, med3, ok3 = _gate(w, wrong, w.inliers)
+        assert not ok3 or rot_err_deg(T3, truth) < 0.25, (axis, med3, rot_err_deg(T3, truth))
+    assert rejected >= 2
+
+
+def test_gate_rejects_a_centre_far_off_seen_from_the_keyframes_spot(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turning in place: a centre 0.5 or 1 m off is not a depth scale error. Where the limit
+    rejects it (along some directions the epipolar lines barely move: the limit itself cannot
+    see it there, and only the 2D-3D fit that produced the pose can), the refinement may bring
+    its epipolar distance under the limit, but the pose stays rejected by the bound on the
+    centre's move; that bound lifted, a refined pose is accepted only where it went back to the
+    truth, the others by the 2D-3D inliers they lose."""
+    w = _gate_world({}, "multiview")
+    lmod = w.lmod
+    dirs = [np.subtract(d, 1.0) for d in np.ndindex(3, 3, 3) if d != (1, 1, 1)]  # 26 directions
+    far = [Pose(w.truth.R, w.truth.t + size * d / np.linalg.norm(d))
+           for size in (0.5, 1.0) for d in dirs]
+    far = [T for T in far
+           if lmod.match_residual_deg(T, w.K, w.matches, w.points.frames)[0] > lmod.MAX_EPIPOLAR_DEG]
+    assert len(far) >= 10
+    for T in far:
+        T2, _, ok = _gate(w, T, w.inliers)
+        assert not ok and T2 is T, T.t - w.truth.t
+    # that bound lifted: a refined pose that went back to the truth is right; any other loses the
+    # 2D-3D inliers of the pose's own fit
+    from tests.synth.turning import rot_err_deg
+
+    monkeypatch.setattr(lmod, "REFINE_MAX_MOVE_M", 10.0)
+    lost = 0
+    for T in far:
+        T2, _, ok = _gate(w, T, w.inliers)
+        if ok:
+            assert np.linalg.norm(T2.t - w.truth.t) < 0.05 and rot_err_deg(T2, w.truth) < 0.5
+        else:
+            lost += 1
+    assert lost >= 1
+    assert _gate(w, w.truth, w.inliers)[2]
+
+
+def test_gate_keeps_the_limit_for_well_baselined_keyframes() -> None:
+    """SfM keyframes metres apart: a pose above the limit is rejected as it is, not refined."""
+    rng = np.random.default_rng(3)
+    steps = {f"f{k:06d}": np.array([*rng.uniform(-1.2, 1.2, 2), 0.0]) for k in range(7)}
+    w = _gate_world(steps, "sfm-global")
+    lmod, K, truth, matches, points = w.lmod, w.K, w.truth, w.matches, w.points
+    T = _worst_shift(lmod, K, truth, matches, points.frames, 0.15)
+    med, n = lmod.match_residual_deg(T, K, matches, points.frames)
+    assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
+    assert not lmod.rotation_dominant(T, matches, points)
+    T2, med2, ok = _gate(w, T)
+    assert not ok and T2 is T and med2 == med
+    assert _gate(w, truth)[2]
