@@ -1504,8 +1504,8 @@ the reference inputs and of the one-update `ainex` map in that workspace.
   once listening, time from opening the web application to `body[data-ready=true]`, latency of
   read-only requests (median and p95 when idle; p95 of the requests made while a job runs), and the
   median overhead of a job over the same command run from the shell.
-* **Parity:** the operations come from the service's own `/api/operations` (the commands'
-  `commands.spec.describe()`), so a new mode or option is covered without changing the evaluator.
+* **Parity:** the operations come from the service's own `/api/openapi.json` (each job
+  operation's `x-oms` entry, the commands' `commands.spec.describe()`), so a new mode or option is covered without changing the evaluator.
   Each operation gets a default case on the reference inputs and one case per non-default choice,
   per artefact folder and per point-cloud attribute. Each case runs the command from the shell
   twice and then as a job, and the job's result and every file of its artefact folder must be

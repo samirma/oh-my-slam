@@ -47,7 +47,7 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "detections the map keeps. The accuracy measure is the ground-truth section (`gt.*`)."),
     ("contract", "Contracts", ""),
     ("server_sh", "Web service (server.sh)",
-     "Performance, parity with the commands (each operation of `/api/operations`, run as a job and "
+     "Performance, parity with the commands (each operation of `/api/openapi.json`, run as a job and "
      "from the shell with the same recorded inference) and the web application's UI."),
     ("gt", "Ground truth: accuracy", ""),
 )
