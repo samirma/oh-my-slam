@@ -93,6 +93,22 @@ def test_cloud_document(server: str) -> None:
     np.testing.assert_allclose(np.linalg.norm(arrays["normal"], axis=1), 1.0, atol=1e-5)
 
 
+def test_identical_cloud_requests_get_identical_bytes() -> None:
+    """The document carries no timing (spec §2.6 byte-identical results): two identical requests,
+    each derived afresh, give byte-identical bodies; the derivation time is the
+    ``Server-Timing`` header."""
+    bundle = small_map()
+    for query in ("", "color=segment&voxel=0.5&normals=on"):
+        answers = [ViewerRoutes(bundle).handle("GET", "/api/cloud", query) for _ in range(2)]
+        bodies = [r.tobytes() for r in answers]
+        assert bodies[0] == bodies[1]
+        head, _ = parse_cloud_payload(bodies[0])
+        assert "seconds" not in head
+        for r in answers:
+            timing = dict(r.headers)["Server-Timing"]
+            assert timing.startswith("derive;dur=") and float(timing.split("=")[1]) >= 0
+
+
 def test_cloud_is_sent_from_the_cloud_arrays(server: str) -> None:
     """The response is the document of :func:`cloud_payload`, sent piece by piece from the
     cloud's arrays; a complete map cloud shares them with the source, so it costs nothing."""
