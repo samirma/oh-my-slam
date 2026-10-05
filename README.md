@@ -1203,18 +1203,28 @@ pixels, so its results are unchanged.
      * *Ids.* An id the map published stays with its object. Each detection records the id it
        was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
        object takes the ids of the stored detections it owns that were the first to carry
-       them (an id's founding detection), the lowest of several. The other ids it got resolve to
-       it provisionally (`objects.json → rebuild_merged`): each rebuild decides again, so an id
-       returns to its founder when a later rebuild separates two objects an earlier one merged.
-       The map's other merges (`merged_into`) are permanent. A published id that no object takes
-       is listed in the update's `objects.removed`, and one whose object is kept only as a
-       candidate in `objects.unpublished`; none vanishes unreported. Objects first seen by the
-       new photos are numbered on from the map's count, as an extension numbers them. So ids can
-       differ from the one-update map's where an earlier update had published one (spec §2.3):
-       in `office_sequence` split 4 + 4 + 5, the four window photos publish two windows (9 and
-       22), the rebuild of the next update merges them into one (22 resolves to 9 meanwhile),
-       and the rebuild after separates them again: 22 is the second window's again, where the
-       one-update map numbers it 21.
+       them (an id's founding detection): the published ones before a candidate's, then the
+       lowest. A published id whose founding detection the rebuild groups with an object that
+       keeps another published id goes instead to a rebuilt object that holds none, has a
+       compatible label and stands where the map last published it (their boxes overlap, or
+       their centres lie within the attribution gate, max(5 cm, 3 % of the viewing distance)).
+       Only when no such object exists does it resolve to the object that took its detection,
+       provisionally (`objects.json → rebuild_merged`): each rebuild decides again, so the id
+       returns to its founder when a later rebuild separates the objects; a map that stops
+       being rebuilt keeps its last provisional merges. The map's other merges (`merged_into`)
+       are permanent, and when the extension merges two objects the published id stays before a
+       lower candidate's. A published id that no object takes is listed in the update's
+       `objects.removed`, and one whose object is kept only as a candidate in
+       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
+       numbered on from the map's count, as an extension numbers them. So ids can differ from
+       the one-update map's where an earlier update had published one (spec §2.3). In
+       `office_sequence` split 4 + 4 + 5 the four window photos publish two windows, 9 and 22
+       (the one-update map numbers the second 21). Before the geometric rule, the next update's
+       rebuild could leave the second window's ids out of place for one update: in one run it
+       grouped both windows into one object (22 resolved to 9 meanwhile); in another it grouped
+       22's founding detection with window 9 and published the rest of the second window as 26.
+       Both runs ended with 22 on the second window (26 resolving to 22) after the third update;
+       with the rule, 22 stays on the second window after every update.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
        took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
        (extending: 84 s; the whole sequence in one update: 158 s).

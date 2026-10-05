@@ -306,3 +306,47 @@ def test_an_abandoned_rebuild_extends_the_map_as_an_extension_does(
         assert np.allclose(ta["translation"], tb["translation"], atol=1e-4), fa["name"]
         assert np.allclose(ta["quaternion_xyzw"], tb["quaternion_xyzw"], atol=1e-4), fa["name"]
         assert fa["K"] == fb["K"], fa["name"]
+
+
+def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_along(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two cabinets the weak first update publishes apart; the next update's rebuild groups the
+    second one's founding detection (its detection in the first keyframe) with the first
+    cabinet, while the rest of the second cabinet's detections stand apart, as an object of
+    their own. The second cabinet's id does not resolve to the first one meanwhile: it goes to
+    the object that stands where it was published (``objects._published_places``). After every
+    update, every id published before resolves to the object nearest its published box."""
+    from oh_my_slam.mapping import objects as objs
+    from tests.synth.scene import Box
+
+    client = FakeClient(mv_noise=(1.0, 0.03))
+    base = mapping_room()
+    second = Box(np.array([0.0, 0.1, 0.35]), np.array([0.45, 0.45, 0.7]), 0.2, (220, 40, 40),
+                 "cabinet")
+    room = Room(boxes=[*base.boxes, second])
+    first = _add(client, room, _steps(), tmp_path / "a", "a")
+    rest = _add(client, room, ring(12, start=0.2), tmp_path / "b", "b")
+    real = objs._group
+
+    def misgrouped(obs, objects, earlier=None):  # type: ignore[no-untyped-def]
+        groups = real(obs, objects, earlier)
+        frames = {ob.frame for ob in obs}
+        if not (min(frames) == 0 and max(frames) >= len(first)):  # only in a rebuild
+            return groups
+        cab = [i for i, ob in enumerate(obs) if ob.frame == 0 and ob.label == "cabinet"]
+        if len(cab) != 2:
+            return groups
+        a, b = cab  # the first cabinet's and the second one's detection in the first keyframe
+        out = [(oid, [i for i in m if i != b]) for oid, m in groups]
+        return [(oid, [*m, b] if a in m else m) for oid, m in out if m]
+
+    monkeypatch.setattr(objs, "_group", misgrouped)
+    m = tmp_path / "m"
+    docs: list[dict] = []  # type: ignore[type-arg]
+    for part in (first, rest[:6], rest[6:]):
+        doc = json.loads(update(m, part, client=client, progress=_quiet).payload)
+        for before in docs:
+            _ids_persist(m, before, doc)
+        docs.append(doc)
+    assert [o["type"] for o in docs[0]["openlabel"]["objects"].values()].count("cabinet") == 2
+    assert "restarted" in json.loads((m / "map.json").read_text())["updates"][1]["notes"]

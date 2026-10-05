@@ -667,3 +667,16 @@ def test_a_published_id_returns_to_its_founder() -> None:
          for i in (9, 22)], 45)
     assert objects._carry_identity(state, rb, final, absorbed, set()) == []
     assert state.rebuild_merged == {} and state.resolve(22) == 22
+
+
+def test_a_published_id_outranks_a_lower_candidate_id() -> None:
+    """An object a rebuild finds both a candidate's id (5, never exported) and a published one
+    (7) on keeps the published one."""
+    from types import SimpleNamespace as Ns
+
+    d5, d7 = object(), object()
+    final, _, absorbed = objects._published_ids(
+        [100, 100], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d7)])],  # type: ignore[list-item]
+        [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
+        published={7})
+    assert final == {100: 7} and absorbed == {5: 100}

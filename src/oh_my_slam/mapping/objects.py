@@ -1414,7 +1414,9 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     fresh = [o for o in state.objects if o.id >= first_new]
     final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
-                                           floor, count)
+                                           floor, count, set(rb.created) if rb is not None else None)
+    if rb is not None and absorbed:
+        _published_places(final_of, absorbed, fresh, rb.boxes)
     count = max([count] + [v + 1 for v in final_of.values()])
     rename = {o.id: final_of[o.id] for o in fresh}
     moved_ids: list[int] = []
@@ -2678,7 +2680,9 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
     while strength:
         (ka, kb), _ = min(strength.items(), key=lambda kv: (
             -kv[1], sorted([_content_key(by[kv[0][0]]), _content_key(by[kv[0][1]])])))
-        keep, gone = by[ka], by[kb]  # ka < kb: the lower id is kept
+        keep, gone = by[ka], by[kb]  # ka < kb: the lower id is kept, a published one first
+        if gone.confirmed and not keep.confirmed:  # a stored candidate does not outrank it
+            keep, gone = gone, keep
         _weigh_part(keep, gone, views, surfaces, masks)
         keep.absorb(gone)
         refit(keep, state.floor_z)
@@ -3270,12 +3274,14 @@ def _absence(candidates: list[MapObject], verdicts: dict[int, list[Verdict]],
 
 def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
                    resolved: Callable[[int], int], first_detection: dict[int, int],
-                   prior: dict[int, int], floor: int, count: int
+                   prior: dict[int, int], floor: int, count: int,
+                   published: set[int] | None = None
                    ) -> tuple[dict[int, int], set[int], dict[int, int]]:
     """The final id of each new object of the update (provisional id -> id): the number of its
     first detection, except in a rebuild: each id the map published goes to the object that owns
     the earliest stored detection that carried it (``prior``; by detection number: the one the
-    id was first given with), and an object takes the lowest of the ids it got; an object without
+    id was first given with), and an object takes the first of the ids it got, the ``published``
+    ones (exported by the map) before the others, each by value; an object without
     one whose number falls among the published ones (below ``floor``) takes a new one (from
     ``count`` on). Returns (final ids, the published ids taken, the other published ids an
     object got: id -> that object, which absorbed them).
@@ -3290,7 +3296,7 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
             if pid and (pid not in founder or (number[i], k) < founder[pid]):
                 founder[pid] = (number[i], k)
     got: dict[int, list[int]] = {}
-    for pid in sorted(founder):
+    for pid in sorted(founder, key=lambda q: (published is not None and q not in published, q)):
         got.setdefault(founder[pid][1], []).append(pid)
     final: dict[int, int] = {k: ids[0] for k, ids in got.items()}
     taken = set(final.values())
@@ -3304,6 +3310,41 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
             n, nxt = nxt, nxt + 1
         final[k] = n
     return final, taken, absorbed
+
+
+IDENTITY_MARGIN_M = 0.05  # the attribution gate (``geometry.attribution_margin``): max(5 cm,
+IDENTITY_MARGIN_REL = 0.03  # 3 % of the viewing distance)
+
+
+def _published_places(final_of: dict[int, int], absorbed: dict[int, int],
+                      fresh: list[MapObject], boxes: dict[int, tuple[str, OBB | None]]) -> None:
+    """A rebuild's geometric fallback (``_published_ids``): a published id whose founding
+    detection the rebuild gave an object that holds another, lower, published id (the second
+    window's first detection grouped with the first window) goes, rather than being absorbed,
+    to a rebuilt object that holds no published id, has a compatible label and stands where the
+    map last published it (``boxes``: its label and box): their boxes overlap, or their centres
+    lie within the attribution gate. Updates ``final_of`` and ``absorbed`` in place."""
+    holders = {k for k, v in final_of.items() if v in boxes}
+    by = {o.id: o for o in fresh}
+    for pid in sorted(absorbed):
+        label, box = boxes.get(pid, ("", None))
+        if box is None:
+            continue
+        best: tuple[float, float, int] | None = None
+        for k, o in sorted(by.items()):
+            if k in holders or o.obb is None or not compatible(label, o.label):
+                continue
+            iou = obb_iou_upright(box, o.obb)
+            d = float(np.linalg.norm(np.asarray(box.center) - np.asarray(o.obb.center)))
+            gate = max(IDENTITY_MARGIN_M, IDENTITY_MARGIN_REL * float(o.obs_depth))
+            if iou > 0.0 or d <= gate:
+                cand = (-iou, d, k)
+                best = cand if best is None or cand < best else best
+        if best is not None:
+            k = best[2]
+            final_of[k] = pid
+            holders.add(k)
+            del absorbed[pid]
 
 
 def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
