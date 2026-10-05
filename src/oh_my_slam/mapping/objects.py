@@ -1369,13 +1369,14 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         k = resolved(oid)
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
-                                           floor, count, set(rb.created) if rb is not None else None)
+                                           floor, count, rb.published if rb is not None else None)
     if rb is not None and absorbed:
         _published_places(final_of, absorbed, [o for o in state.objects if o.id >= first_new],
                           rb.boxes)
     if rb is not None:
+        holders = _rebuilt_published(final_of, absorbed, rb.published)
         for o in state.objects:
-            if o.id >= first_new and final_of.get(o.id) in rb.published:
+            if o.id >= first_new and o.id in holders:
                 o.published = True
     for o in state.objects:
         o.forget_tree()
@@ -1458,8 +1459,11 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
             tx.delete(points_file(dst.id))
             tx.delete(sources_file(dst.id))
         rename[dst.id] = src_final
-        dst.created_update = min(dst.created_update, next(mv.src.created_update for mv in moves
-                                                          if mv.src.id == src_id))
+        src = next(mv.src for mv in moves if mv.src.id == src_id)
+        dst.created_update = min(dst.created_update, src.created_update)
+        # the object keeps its identity at its new place: published there if it was here
+        dst.published = dst.published or src.published
+        dst.confirmed = dst.confirmed or src.confirmed or dst.published
         moved_ids.append(src_final)
     for o in state.objects:
         o.id = rename.get(o.id, o.id)
@@ -3341,6 +3345,14 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
             n, nxt = nxt, nxt + 1
         final[k] = n
     return final, taken, absorbed
+
+
+def _rebuilt_published(final_of: dict[int, int], absorbed: dict[int, int],
+                       published: set[int]) -> set[int]:
+    """The rebuilt objects (provisional ids) that are published: the id they take, or one they
+    absorb (``rebuild_merged``), is one the map published (exported)."""
+    return ({k for k, v in final_of.items() if v in published}
+            | {k for p, k in absorbed.items() if p in published})
 
 
 IDENTITY_MARGIN_M = 0.05  # the attribution gate (``geometry.attribution_margin``): max(5 cm,

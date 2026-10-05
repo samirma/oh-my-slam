@@ -710,6 +710,53 @@ def test_a_published_id_outranks_a_lower_candidate_id() -> None:
     assert final == {100: 7} and absorbed == {5: 100}
 
 
+def test_an_exported_id_outranks_a_lower_confirmed_unexported_one() -> None:
+    """A rebuild ranks ids by what the map exported (``Rebuild.published``), not by what it
+    confirmed: an object holding a confirmed id that was never exported (5, below the cloud
+    gate) and an exported one (7) keeps 7, and is published; an object that absorbs an exported
+    id (``rebuild_merged``) is published too, whatever the id it keeps."""
+    from types import SimpleNamespace as Ns
+
+    d5, d7 = object(), object()
+    final, _, absorbed = objects._published_ids(
+        [100, 100], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d7)])],  # type: ignore[list-item]
+        [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
+        published={7})
+    assert final == {100: 7} and absorbed == {5: 100}
+    assert objects._rebuilt_published(final, absorbed, {7}) == {100}
+    # 101 keeps 3 (exported) and absorbs 9 (exported); 102 keeps 4 (never exported) and
+    # absorbs 8 (exported); 103 keeps 6 and absorbs 2, neither exported
+    held = objects._rebuilt_published({101: 3, 102: 4, 103: 6}, {9: 101, 8: 102, 2: 103},
+                                      {3, 8, 9})
+    assert held == {101, 102}
+
+
+def test_a_legacy_objects_json_infers_published_from_what_it_exported() -> None:
+    """An objects.json written before the ``published`` flag: an object is published when the
+    old ``exported()`` rule held (confirmed, a box, enough map-cloud points or not yet
+    counted); the flag then round-trips."""
+    box = OBB(np.zeros(3), np.eye(3), np.array([0.3, 0.3, 0.3])).to_dict()
+    pts = np.zeros((0, 3), np.float32)
+
+    def legacy(confirmed: bool, obb: Any, cloud: Any, least: Any) -> MapObject:
+        d = MapObject(1, "cup", {"cup": 1.0}, [0.9], pts).to_dict()
+        del d["published"]
+        d.update(confirmed=confirmed, obb=obb, cloud_points=cloud, cloud_min_points=least)
+        return MapObject.from_dict(d, pts)
+
+    cases = [((True, box, 50, 20), True), ((True, box, None, None), True),
+             ((True, box, 5, 20), False), ((True, None, 50, 20), False),
+             ((False, box, 50, 20), False),
+             ((True, box, objects.EXPORT_MIN_CLOUD_POINTS, None), True),
+             ((True, box, objects.EXPORT_MIN_CLOUD_POINTS - 1, None), False)]
+    for args, want in cases:
+        o = legacy(*args)
+        assert o.published is want, args
+        assert o.confirmed is args[0], args
+        back = MapObject.from_dict(json.loads(json.dumps(o.to_dict())), pts)
+        assert (back.published, back.confirmed) == (want, args[0]), args
+
+
 def test_a_merge_keeps_the_published_id_before_a_lower_candidates(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """When the extension merges a stored candidate (id 5, never exported) with a stored

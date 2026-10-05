@@ -14,6 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tests.synth.scene import Box, Room, look_at
 from tests.unit.test_mapping_latest_wins import CABINET, EYE, _same_object
@@ -60,6 +61,25 @@ def test_a_cup_moved_within_one_update_is_mapped_once_where_the_last_views_see_i
     assert not one.objs.summary["removed"] and not one.objs.summary["withdrawn"]
     _at_its_latest_place(one, was.id)  # the id its first detection gave it
     _same_object(cabinet, exported(one)[cabinet.id])
+
+
+def test_a_published_cup_stays_published_at_its_new_place(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Published objects stay published, wherever they move: the cup update 1 published moves in
+    update 2, whose cloud draws too few points at its new place for a new object to be exported
+    there; the cup keeps its id, published and exported, at its new place."""
+    from oh_my_slam.mapping import objects as mo
+
+    mdir = tmp_path / "m"
+    r1 = known_pose_update(mdir, shoot(Room(boxes=[CABINET, CUP]), FIRST), tmp_path / "w1")
+    (was,) = _cups(r1)
+    monkeypatch.setattr(mo, "_enough_cloud", lambda cloud, least: False)
+    r2 = known_pose_update(mdir, shoot(Room(boxes=[CABINET, MOVED]), LATER), tmp_path / "w2")
+    assert r2.objs.summary["moved"] == [was.id] and not r2.objs.summary["removed"]
+    (cup,) = [o for o in r2.objs.objects if o.id == was.id]
+    assert cup.published and cup.confirmed
+    (now,) = _cups(r2)
+    assert now.id == was.id and np.linalg.norm(now.obb.center[:2] - THERE[:2]) < 0.05
 
 
 def test_a_cup_moved_between_updates_keeps_its_id_at_its_new_place(tmp_path: Path) -> None:

@@ -198,6 +198,15 @@ def test_a_published_object_stays_published_through_rebuilds(
     assert before
     monkeypatch.setattr(api, "_weak_keyframe", lambda rec: True)  # every update rebuilds
     monkeypatch.setattr(mo, "CONFIRM_DETECTIONS", 1000)
+    ranked: list[set[int] | None] = []  # the ids a rebuild ranks first: the exported ones
+    real_ids = mo._published_ids
+
+    def spy(*a, **k):  # type: ignore[no-untyped-def]
+        ranked.append(a[8] if len(a) > 8 else k.get("published"))
+        return real_ids(*a, **k)
+
+    monkeypatch.setattr(mo, "_published_ids", spy)
+    exported_before = set(before)
     for k, part in enumerate([rest[:6], rest[6:]]):
         after = json.loads(update(m, part, client=client, progress=_quiet).payload)
         meta = json.loads((m / "map.json").read_text())
@@ -211,6 +220,8 @@ def test_a_published_object_stays_published_through_rebuilds(
         state = mo.load_state(lambda name: m / name, meta)
         assert {o.id for o in state.objects if o.confirmed} == set(now)
         assert all(o.published for o in state.objects if o.id in now)
+        assert ranked[-1] == exported_before, (ranked[-1], k)
+        exported_before = set(now)
         _ids_persist(m, published, after)
 
 
