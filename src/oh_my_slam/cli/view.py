@@ -19,12 +19,16 @@ import re
 import signal
 import sys
 import webbrowser
+from typing import TYPE_CHECKING, Any
 
 from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.commands import spec
 from oh_my_slam.core import timing
 from oh_my_slam.core.log import claim_stdout, get_logger
 from oh_my_slam.core.timing import Stage
+
+if TYPE_CHECKING:
+    from oh_my_slam.viewer.bundle import ViewBundle
 
 PROGRAM = spec.VIEW
 COMMAND = PROGRAM.command()
@@ -49,25 +53,33 @@ def build_parser() -> ArgumentParser:
     return spec.build_parser(PROGRAM)
 
 
+def make_bundle(values: Any) -> ViewBundle:
+    """The viewer's bundle of validated arguments (``spec.validate``) of view.sh — or of another
+    image command, whose own segmentation options (``--min-score``) it then follows: an image is
+    reconstructed and segmented once, timed as view.sh -i's stages (progress events only: no
+    summary line, stderr unchanged); a map is opened read-only, through the reader its rule
+    opened."""
+    from oh_my_slam.viewer.bundle import bundle_of
+
+    if getattr(values, "map", None) is not None:
+        return bundle_of(values)
+    from oh_my_slam.reconstruction.api import connect_server
+
+    with timing.collect():
+        with timing.stage(Stage.CONNECT):
+            client = connect_server()  # exit 3 with the hint when the server is down
+        log.info("reconstructing and segmenting %s …", values.image.name)
+        with timing.stage(Stage.INFERENCE):
+            return bundle_of(values, client)
+
+
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     v = spec.validate(COMMAND, args, log.warning)  # -i exists or -m is a map, before any work
     claim_stdout()  # nothing goes to stdout; the URL is printed on stderr
-    from oh_my_slam.viewer.bundle import image_bundle, map_bundle
     from oh_my_slam.viewer.server import serve, url_of
 
-    if args.image is not None:
-        from oh_my_slam.reconstruction.api import connect_server
-
-        # timed as view.sh -i's stages (progress events only: no summary line, stderr unchanged)
-        with timing.collect():
-            with timing.stage(Stage.CONNECT):
-                client = connect_server()  # exit 3 with the hint when the server is down
-            log.info("reconstructing and segmenting %s …", args.image.name)
-            with timing.stage(Stage.INFERENCE):
-                bundle = image_bundle(args.image, client)
-    else:
-        bundle = map_bundle(args.map, reader=v.reader)  # the reader the map rule opened
+    bundle = make_bundle(v)
     _install_stop_handlers()
     httpd = serve(bundle)
     try:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Shared by the five entry points: locate the repository, check the uv environment and exec the
-# Python command-line module. The entry scripts never call each other (delegation happens at the
+# Shared by the six entry points: locate the repository, check the uv environment and exec the
+# Python command-line module (oh_my_slam.cli.<name>, or a full oh_my_slam.* module path). The entry scripts never call each other (delegation happens at the
 # Python API level, see README "Ownership").
 set -euo pipefail
 
@@ -15,5 +15,8 @@ oms_exec() {
     exit 2
   fi
   export PYTHONUNBUFFERED=1
-  exec "${OMS_PY}" -m "oh_my_slam.cli.${module}" "$@"
+  if [[ "${module}" != oh_my_slam.* ]]; then
+    module="oh_my_slam.cli.${module}"
+  fi
+  exec "${OMS_PY}" -m "${module}" "$@"
 }

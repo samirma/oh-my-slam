@@ -129,8 +129,8 @@ include_external_packages = true
 name = "Layered ownership: cli | web > commands > tools > viewer > mapping > segmentation > reconstruction > client > schema > core"
 type = "layers"
 layers = [
-    # the command line and the web service (spec §2.6; optional until it lands) are independent
-    # siblings over the commands' shared definitions
+    # the command line and the web service (spec §2.6) are independent siblings over the
+    # commands' shared definitions
     "oh_my_slam.cli | (oh_my_slam.web)",
     "oh_my_slam.commands",
     "oh_my_slam.tools",
@@ -170,6 +170,17 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "The web service is a client of the inference server: it reuses only the lifecycle helpers (lock, pid)"
+type = "forbidden"
+source_modules = ["oh_my_slam.web"]
+forbidden_modules = [
+    "oh_my_slam.server.app",
+    "oh_my_slam.server.main",
+    "oh_my_slam.server.gpu_worker",
+    "oh_my_slam.server.models",
+]
+
+[[tool.importlinter.contracts]]
 name = "The server owns models only (no pipeline logic)"
 type = "forbidden"
 source_modules = ["oh_my_slam.server"]
@@ -187,6 +198,7 @@ name = "Model frameworks stay inside the server process"
 type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
+    "oh_my_slam.web",
     "oh_my_slam.commands",
     "oh_my_slam.tools",
     "oh_my_slam.viewer",
@@ -229,6 +241,7 @@ name = "Depth fusion (Open3D) lives in reconstruction; the server never loads it
 type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
+    "oh_my_slam.web",
     "oh_my_slam.commands",
     "oh_my_slam.tools",
     "oh_my_slam.viewer",
