@@ -11,6 +11,12 @@ kept in memory, by ``segmentation.cloud.derive_cloud`` with the §2.2 attributes
 (validated by ``core.cloud_attrs``), so changing a control never re-runs inference. Camera poses are
 read from the scene description, so the viewer shows exactly the poses the JSON states. No
 inference, point-cloud generation, OBB fitting, identity or colour logic lives here.
+
+A bundle can be saved and loaded again (:func:`save_bundle`, :func:`load_bundle`): what the page
+shows plus the cloud source as computed, so a saved image bundle serves the same viewer — every
+live control included — without re-running inference; a map is saved as a reference to the map
+folder (it is persisted already). :func:`bundle_of` builds the bundle of a command's arguments, for
+``view.sh`` and for the web service's bundle writer (``oh_my_slam.cli.view_save``).
 """
 
 from __future__ import annotations
@@ -263,8 +269,9 @@ def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
 # bundles
 
 
-def image_bundle(image: Path, client: Any = None) -> ViewBundle:
-    """Reconstruct and segment ``image`` once (inference server); keep its cloud source."""
+def image_bundle(image: Path, client: Any = None, min_score: float | None = None) -> ViewBundle:
+    """Reconstruct and segment ``image`` once (inference server), keeping detections of at least
+    ``min_score`` (default: segmentation's); keep its cloud source."""
     from oh_my_slam.core.images import png_bytes
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.catalog import catalog_rows
@@ -276,8 +283,9 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
         from oh_my_slam.reconstruction.api import connect_server
 
         client = connect_server()
-    frame, dets = reconstruct_and_detect(Path(image), client)
-    seg = segment_frame(frame, client=client, detections=dets)
+    score = {} if min_score is None else {"min_score": min_score}
+    frame, dets = reconstruct_and_detect(Path(image), client, **score)
+    seg = segment_frame(frame, client=client, detections=dets, **score)
     source = image_cloud_source(frame, seg)
     up = source.up if source.up is not None else DEFAULT_UP_CAM
     return ViewBundle(
@@ -318,3 +326,96 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
         # the page's first cloud request finds it ready (the request waits for it otherwise)
         threading.Thread(target=bundle.prepare, name="display-selection", daemon=True).start()
     return bundle
+
+
+# ------------------------------------------------------------------------------------------------
+# saving and loading
+
+BUNDLE_JSON = "bundle.json"
+ARRAYS = "source.npz"
+SEGMENTED_PNG = "segmented.png"
+
+
+def save_bundle(bundle: ViewBundle, folder: Path) -> None:
+    """Write ``bundle`` into ``folder`` (replaced atomically): its page data as JSON, the cloud
+    source's arrays as ``.npz`` and the segmented image."""
+    import dataclasses
+    import json
+    import shutil
+
+    from oh_my_slam.segmentation.cloud import MapCloudSource
+
+    folder = Path(folder)
+    tmp = folder.with_name(f".{folder.name}.tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    src = bundle.source
+    fields = [f.name for f in dataclasses.fields(src)]
+    arrays = {n: getattr(src, n) for n in fields if isinstance(getattr(src, n), np.ndarray)}
+    np.savez(tmp / ARRAYS, **arrays)
+    meta = {
+        "mode": bundle.mode, "title": bundle.title, "scene": bundle.scene,
+        "catalog": bundle.catalog, "display_transform": bundle.display_transform,
+        "camera_sources": bundle.camera_sources, "point_budget": bundle.point_budget,
+        "source": {"kind": "map" if isinstance(src, MapCloudSource) else "image",
+                   "values": {n: dataclasses.asdict(v) for n in fields
+                              if dataclasses.is_dataclass(v := getattr(src, n))}},
+    }
+    (tmp / BUNDLE_JSON).write_text(json.dumps(meta))
+    if bundle.segmented_png is not None:
+        (tmp / SEGMENTED_PNG).write_bytes(bundle.segmented_png)
+    shutil.rmtree(folder, ignore_errors=True)
+    tmp.replace(folder)
+
+
+def save_map_reference(map_dir: Path, folder: Path) -> None:
+    """A map bundle is the map itself: record which map (opened read-only, so it is one)."""
+    import json
+
+    from oh_my_slam.mapping.store import MapReader
+
+    root = MapReader(Path(map_dir)).root
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / BUNDLE_JSON).write_text(json.dumps({"mode": "map", "map": str(root)}))
+
+
+def saved_map(folder: Path) -> Path | None:
+    """The map a saved bundle refers to, or None for a saved image bundle."""
+    import json
+
+    meta = json.loads((Path(folder) / BUNDLE_JSON).read_text())
+    return Path(meta["map"]) if "map" in meta else None
+
+
+def load_bundle(folder: Path) -> ViewBundle:
+    """The bundle :func:`save_bundle` wrote (a map reference opens the map: :func:`map_bundle`)."""
+    import json
+
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.segmentation.cloud import MapCloudSource
+
+    folder = Path(folder)
+    meta = json.loads((folder / BUNDLE_JSON).read_text())
+    if "map" in meta:
+        return map_bundle(Path(meta["map"]))
+    with np.load(folder / ARRAYS) as npz:
+        values: dict[str, Any] = {k: npz[k] for k in npz.files}
+    for name, v in meta["source"]["values"].items():
+        values[name] = Intrinsics(**v)
+    cls = MapCloudSource if meta["source"]["kind"] == "map" else ImageCloudSource
+    png = folder / SEGMENTED_PNG
+    return ViewBundle(
+        mode=meta["mode"], title=meta["title"], scene=meta["scene"], source=cls(**values),
+        catalog=meta["catalog"], segmented_png=png.read_bytes() if png.is_file() else None,
+        display_transform=meta["display_transform"], camera_sources=meta["camera_sources"],
+        point_budget=meta["point_budget"])
+
+
+def bundle_of(values: Any, client: Any = None) -> ViewBundle:
+    """The bundle of a command's validated arguments (``commands.spec.validate``): ``map`` (and
+    its opened ``reader``) gives the map's, else ``image`` the image's, with ``min_score`` when the
+    command has one. ``view.sh`` serves it; the web service's bundle writer saves it."""
+    if getattr(values, "map", None) is not None:
+        return map_bundle(values.map, getattr(values, "reader", None))
+    return image_bundle(values.image, client, getattr(values, "min_score", None))

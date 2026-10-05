@@ -1,4 +1,5 @@
-"""The argparse parser classes the commands' definitions (``commands/spec.py``) are built with."""
+"""The argparse parser classes the commands' definitions (``commands/spec.py``) are built with.
+:func:`run_main` (``core/process.py``) is re-exported for the entry points."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from oh_my_slam.core.errors import ExitCode, UsageError
+from oh_my_slam.core.process import run_main as run_main
 
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
@@ -66,3 +68,4 @@ class RaisingParser(ArgumentParser):
         except argparse.ArgumentError as err:  # a bad value, two exclusive options, a missing one
             flags = err.argument_name.split("/") if err.argument_name else _FLAG.findall(str(err))
             raise ParameterError(str(err), self._names(flags)) from None
+

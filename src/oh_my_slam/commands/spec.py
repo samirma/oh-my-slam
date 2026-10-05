@@ -138,6 +138,10 @@ class Option:
     applies: tuple[When, ...] = ()  # applies when any of these holds (empty: always)
     applies_text: str = ""  # the same, in the command's words
     group: str | None = None  # mutually exclusive group (the modes' selectors)
+    # False: the option concerns the command line only and means nothing to the web service
+    # (spec §2.6), whose API and forms leave it out (view.sh --no-browser: the service shows the
+    # viewer itself)
+    service: bool = True
 
     def add_to(self, ap: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup) -> None:
         kw: dict[str, Any] = {"dest": self.name, "help": self.help}
@@ -602,7 +606,8 @@ VIEW = Program("view.sh", "Browser visualisation of an image or a map.", (
     Command("view.sh", None, "Browser visualisation of an image or a map.", (
         _image("RGB image to reconstruct and segment", group="source"),
         _map("map folder (opened read-only)", True, group="source"),
-        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False),
+        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False,
+               service=False),
     ), (
         Mode("image", "image", (IMAGE_RULE,), "required",
              "reconstructs and segments the image with the inference server",
@@ -657,14 +662,15 @@ def _value(value: Any) -> str:
     return f"./{text}" if text.startswith("-") else text
 
 
-def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Namespace:
-    """The command's parsed arguments for API parameters (option name → value; a list for an
-    option that takes several values): the argv the command would get, parsed by its own parser,
-    so a bad value is a :class:`ParameterError` with argparse's message and the parameters it
-    concerns. Parameters that are None, and those equal to the default of an ``omit_if_default``
-    option, are not passed."""
+def argv_of(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[str]:
+    """The command line (after the program name) for API parameters (option name → value; a list
+    for an option that takes several values): what :func:`parse` parses, and what the web service
+    runs the command with. Parameters that are None, and those equal to the default of an
+    ``omit_if_default`` option, are not passed. An unknown parameter is a
+    :class:`ParameterError`."""
     opts = cmd.mode_options(mode)
-    unknown = sorted(set(params) - {o.name for o in opts})
+    names = {o.name for o in opts}
+    unknown = sorted(n for n, v in params.items() if v is not None and n not in names)
     if unknown:
         raise ParameterError(f"unrecognized parameters for {cmd.label(mode)}: "
                              f"{', '.join(unknown)}", tuple(unknown))
@@ -681,7 +687,14 @@ def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Names
             argv += [o.flag, *map(_value, values)]
         else:  # flag=value: a value that starts with "-" stays a value
             argv += [f"{o.flag}={_text(x)}" for x in values]
-    return build_parser(program_of(cmd), RaisingParser).parse_args(argv)
+    return argv
+
+
+def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Namespace:
+    """The command's parsed arguments for API parameters: the argv the command would get
+    (:func:`argv_of`), parsed by its own parser, so a bad value is a :class:`ParameterError` with
+    argparse's message and the parameters it concerns."""
+    return build_parser(program_of(cmd), RaisingParser).parse_args(argv_of(cmd, mode, params))
 
 
 def validate(cmd: Command, args: argparse.Namespace,
@@ -728,6 +741,30 @@ def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem
         except OhMySlamError as exc:
             problems.append(Problem(rule.name, rule.options, str(exc), exc.exit_code))
     return problems
+
+
+def _map_keyframes_greater_than(args: argparse.Namespace, limit: Any) -> bool:
+    from oh_my_slam.mapping.store import MapReader
+
+    return len(MapReader(args.map).frames) > int(limit)
+
+
+# How each ``Mode.inference_condition`` key is evaluated on the parsed arguments (read-only).
+CONDITIONS: dict[str, Callable[[argparse.Namespace, Any], bool]] = {
+    "map_keyframes_greater_than": _map_keyframes_greater_than,
+}
+
+
+def needs_inference(mode: Mode, args: argparse.Namespace) -> bool:
+    """Whether a run of ``mode`` with ``args`` uses the inference server: always, never, or —
+    "conditional" — when its condition holds (any condition that cannot be evaluated counts as
+    needing it)."""
+    if mode.inference != "conditional":
+        return mode.inference == "required"
+    try:
+        return any(CONDITIONS[k](args, v) for k, v in (mode.inference_condition or {}).items())
+    except (KeyError, OhMySlamError, OSError, ValueError):
+        return True
 
 
 def by_parameter(problems: list[Problem]) -> dict[str, list[str]]:
@@ -783,6 +820,7 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
         "minimum": o.minimum, "exclusive_minimum": o.exclusive_minimum, "finite": o.finite,
         "omit_if_default": o.omit_if_default,
         "applies": [w.describe() for w in o.applies], "applies_text": o.applies_text,
+        "service": o.service,
     }
     if o.kind is Kind.ATTRS:
         out["attributes"] = _attributes(mode.scope())

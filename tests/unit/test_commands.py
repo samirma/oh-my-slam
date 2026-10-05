@@ -491,3 +491,14 @@ def test_progress_file_keeps_stdout_and_stderr_unchanged(tmp_path: Path) -> None
     assert lines[0] == {"event": "begin"} and lines[-1]["event"] == "finish"
     assert lines[-1]["ok"] is True and lines[-1]["exit_code"] == 0
     assert [e["stage"] for e in lines if e["event"] == "stage_start"] == ["export", "write"]
+
+
+def test_dry_run_reports_a_bad_value_after_an_unknown_parameter(tmp_path: Path) -> None:
+    """An unknown parameter is dropped, then the next parse still reports the others; argv_of is
+    the command line parse parses (the web service runs the command with it)."""
+    seg = spec.SEGMENT.command()
+    problems = spec.dry_run(seg, spec.SEGMENT_MAP, {"map": str(tmp_path), "min_score": 0.4,
+                                                    "format": "xml"})
+    assert [p.parameters for p in problems][:2] == [("min_score",), ("format",)]
+    assert spec.argv_of(seg, spec.SEGMENT_MAP, {"map": "m", "format": "ply", "min_score": None}) \
+        == ["-m=m", "-f=ply"]
