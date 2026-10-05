@@ -94,6 +94,15 @@ def angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
     return traj.rotation_deg(Ra, Rb)
 
 
+@pytest.fixture(autouse=True)
+def _one_sfm_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """COLMAP's random steps are seeded, but with several threads the database's image ids follow
+    the order feature extraction finishes in, and the global mapper's result follows the ids: in
+    about 1 run of 5 the misscaled block was not found again (``fixed_blocks`` missing). One
+    thread makes the runs repeat bit for bit."""
+    monkeypatch.setattr(sfm_mod, "SFM_THREADS", 1)
+
+
 def video_world(tmp_path: Path) -> tuple[FakeClient, list[Any], Path]:
     """A walk around a rendered room, filmed at one frame per second (fake inference)."""
     client = FakeClient(mv_noise=(2.0, 0.1))

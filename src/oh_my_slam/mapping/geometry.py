@@ -264,7 +264,7 @@ def _in_frustum(centres: NDArray[Any], rad: float, fd: FrameData, zmax: float,
 
 def _depth_limit(fd: FrameData) -> float:
     """A depth beyond which keyframe ``fd`` sees no point (its deepest pixel, plus the visibility
-    tolerance): the ``_Cells.select`` limit of ``_visible`` and ``_seen_through``."""
+    tolerance): the ``_Cells.select`` limit of ``_visible`` and ``_residuals``."""
     d = float(fd.depth.max()) if fd.depth.size else 0.0
     return d * (1.0 + VIS_TOL_REL) + VIS_TOL_MIN if np.isfinite(d) else float("inf")
 
@@ -902,10 +902,11 @@ def _candidates(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None
     return None if cells is None else cells.select(fd, _depth_limit(fd))
 
 
-def _seen_through(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None = None
-                  ) -> NDArray[np.bool_]:
-    """Whether keyframe ``fd`` sees clearly behind each point: it projects onto a valid pixel whose
-    depth lies beyond it by more than the visibility tolerance (``_visible``)."""
+def _residuals(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None = None
+               ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """(how far beyond each point keyframe ``fd`` sees: the depth of the valid pixel it projects
+    onto minus its own depth, NaN where it projects onto none or lies beyond ``_depth_limit``;
+    its depth)."""
     cand = _candidates(fd, pts, cells)
     q = pts if cand is None else pts[cand]
     cam = fd.rec.T_map_cam.inverse()
@@ -916,12 +917,51 @@ def _seen_through(fd: FrameData, pts: NDArray[np.float64], cells: _Cells | None 
         v = np.floor(uv[:, 1] + 0.5)
         idx = np.flatnonzero((z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h))
     uu, vv = u[idx].astype(np.int64), v[idx].astype(np.int64)
-    zi = z[idx]
-    hit = fd.valid[vv, uu] & (fd.depth[vv, uu] - zi >= np.maximum(VIS_TOL_MIN, VIS_TOL_REL * zi))
-    out = np.zeros(len(pts), bool)
-    idx = idx[hit]
-    out[idx if cand is None else cand[idx]] = True
-    return out
+    ok = fd.valid[vv, uu] & (z[idx] <= _depth_limit(fd))  # beyond it: as with ``cells``
+    idx, uu, vv = idx[ok], uu[ok], vv[ok]
+    res = np.full(len(pts), np.nan)
+    depth = np.full(len(pts), np.nan)
+    at = idx if cand is None else cand[idx]
+    res[at] = fd.depth[vv, uu] - z[idx]
+    depth[at] = z[idx]
+    return res, depth
+
+
+def _witnessed(witnesses: list[FrameData], q: NDArray[np.float64], cells: _Cells | None = None
+               ) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+    """(which points the witnesses of a removed object draw, which they show to be what is left of
+    the object), from the witnesses together.
+
+    Per point and witness, the residual is how far beyond the point the witness sees
+    (``_residuals``). A witness that sees a nearer surface by more than twice the depth noise of
+    the place, max(VACATED_MARGIN_M, VACATED_MARGIN_REL · depth) — two witnesses each off by
+    the noise, on either side, disagree by twice it — is occluded there (another object stands
+    in front) and says nothing about the point. The others vote, and their median residual is
+    the latest observation of the place as one: their monocular depth of the empty place
+    disagrees by a few percent (``office_sequence``: the two photos that see the cup gone place
+    the sill 3.5 cm in front of and 3.2 cm behind the surface the other keyframes agree on).
+
+    * A point is left of the object when the voters see beyond it (median >= the visibility
+      tolerance of ``_visible``) and none of them sees it: one witness that sees a little
+      farther than another, or much farther than one that sees the point, does not carve a hole.
+    * A point is drawn when the voters see it (|median| within the tolerance): the surface the
+      witnesses show together, not a copy that one of them places in front of or behind it."""
+    res = np.full((len(witnesses), len(q)), np.nan)
+    z = np.full(len(q), np.nan)
+    for k, fd in enumerate(witnesses):
+        res[k], zk = _residuals(fd, q, cells)
+        z = np.where(np.isnan(z), zk, z)
+    with np.errstate(invalid="ignore"):
+        noise = np.maximum(VACATED_MARGIN_M, VACATED_MARGIN_REL * z)
+        tol = np.maximum(VIS_TOL_MIN, VIS_TOL_REL * z)
+        res[res < -2 * noise] = np.nan  # occluded: no vote
+        voted = ~np.isnan(res).all(axis=0)
+        med = np.full(len(q), np.nan)
+        if voted.any():
+            med[voted] = np.nanmedian(res[:, voted], axis=0)
+        sees = (np.abs(res) < tol).any(axis=0)
+        beyond = med >= tol
+        return np.asarray(np.abs(med) < tol), np.asarray(beyond & ~sees)
 
 
 def _vacated(pts: NDArray[Any], few: NDArray[Any], frames: list[FrameData],
@@ -934,8 +974,8 @@ def _vacated(pts: NDArray[Any], few: NDArray[Any], frames: list[FrameData],
 
     The pixels of the keyframes that detected the object are retired, so the surface it stood on
     or hid is seen only by its witnesses, where a surface usually needs ``CLOUD_MIN_VIEWS``
-    views. In the place, a point that a witness sees is kept however few frames fused it, and a
-    point that a witness sees through, which neither a witness nor a keyframe of a later update
+    views. In the place, a point the witnesses draw (``_witnessed``) is kept however few frames
+    fused it, and a point they show to be left of the object, which no keyframe of a later update
     sees, is dropped: what is left of the object, drawn by keyframes that did not detect it or by
     pixels beside its masks. A later update that sees the place again is fused like any other."""
     by_name = {fd.rec.name: fd for fd in retired}
@@ -957,18 +997,14 @@ def _vacated(pts: NDArray[Any], few: NDArray[Any], frames: list[FrameData],
                 continue
             q = cloud[region]
             qcells = _Cells(q) if len(q) > 50_000 else None
-            seen = np.zeros(len(q), bool)
-            through = np.zeros(len(q), bool)
-            for fd in witnesses:
-                seen[_visible(fd, q, qcells)[0]] = True
-                through |= _seen_through(fd, q, qcells)
+            drawn, left = _witnessed(witnesses, q, qcells)
             if is_few:
-                added = region[seen]
+                added = region[drawn]
                 continue
             again = np.zeros(len(q), bool)
             for fd in later:
                 again[_visible(fd, q, qcells)[0]] = True
-            drop = region[through & ~seen & ~again]
+            drop = region[left & ~again]
         return drop, added
 
     for drop, added in _parallel(judge, vacated):  # the places are judged independently
