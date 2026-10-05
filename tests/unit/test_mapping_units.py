@@ -1142,3 +1142,28 @@ def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None
     assert (np.abs(far[:, 2] - 34.4) < 0.3).sum() > 50  # the facade, where the correction put it
     beyond = fused_cloud_points(frames(tilted, 1.0), voxel=0.1, depth_max=30.0)
     assert not (beyond[:, 2] > 30.0).any()  # the same depth uncorrected: beyond the cut
+
+
+def test_a_reader_reads_again_once_while_a_commit_is_applied(tmp_path: Path) -> None:
+    """A file can move from the staging folder into place between ``MapReader.path`` and the
+    read while an update applies its commit (a rebuild replaces most files): the reader reads once
+    more, and only then."""
+    from oh_my_slam.mapping import store
+
+    reader = object.__new__(store.MapReader)
+    reader.root = tmp_path
+    reader._overlay = set()
+    calls: list[int] = []
+
+    def flaky() -> int:
+        calls.append(1)
+        if len(calls) == 1:
+            raise FileNotFoundError("moved")
+        return 7
+
+    with pytest.raises(FileNotFoundError):
+        reader._again(flaky)  # no commit in progress: the error stands
+    (tmp_path / store.STAGING).mkdir()
+    (tmp_path / store.STAGING / store.COMMIT).write_text("{}")
+    calls.clear()
+    assert reader._again(flaky) == 7 and len(calls) == 2
