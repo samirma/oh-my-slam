@@ -70,13 +70,20 @@ VIS_NEAR = 0.05
 VIS_CHUNK = 1 << 20
 # Epipolar gate of a camera that sees the map from the keyframes' spot (rotation_dominant: most
 # matches with multi-view keyframes, or a baseline below ROTATION_BASELINE of the scene depth):
-# a pose above MAX_EPIPOLAR_DEG is refined against the keyframe poses (centre prior
-# REFINE_CENTRE_PRIOR_M, at most REFINE_MAX_PER_KEYFRAME matches each) and judged again; the
-# refined pose is kept when it passes and turned at most REFINE_MAX_ROT_DEG.
+# a pose above MAX_EPIPOLAR_DEG is refined against the keyframe poses (IRLS Cauchy on the
+# epipolar distances, REFINE_IRLS_ROUNDS rounds, quadratic centre prior REFINE_CENTRE_PRIOR_M, at
+# most REFINE_MAX_PER_KEYFRAME matches each) and judged again. The refined pose is kept only when
+# it passes, its centre moved at most REFINE_MAX_MOVE_M (the depth's scale error: centimetres),
+# it turned at most the angle that move subtends at the median scene depth, and it keeps
+# REFINE_KEEP_INLIERS of the pose's 2D-3D inliers (POSE_MAX_ERROR_PX, as the absolute pose
+# estimation counts them).
 ROTATION_BASELINE = 0.02
 REFINE_CENTRE_PRIOR_M = 0.05
+REFINE_MAX_MOVE_M = 2 * REFINE_CENTRE_PRIOR_M
 REFINE_MAX_PER_KEYFRAME = 250
-REFINE_MAX_ROT_DEG = 2.0
+REFINE_IRLS_ROUNDS = 5
+REFINE_KEEP_INLIERS = 0.9
+POSE_MAX_ERROR_PX = 12.0  # pycolmap AbsolutePoseEstimationOptions().ransac.max_error
 # A pose from the SfM model points alone is kept when that many of them agree (and it passes the
 # epipolar gate); else the model points and the keyframes' depth together
 MODEL_FIRST_MIN_INLIERS = 50
@@ -415,6 +422,9 @@ class _MapPoints:
                     ratio = float(np.median(z_model[both] / z_depth[both]))
             if ratio is None:
                 self._scale[name] = 1.0
+                if model is not None:
+                    log.info("%s: too few keypoints with both an SfM point and depth to scale its "
+                             "depth; using it unscaled", fr.name)
             elif 1.0 / DEPTH_SCALE_MAX_FACTOR <= ratio <= DEPTH_SCALE_MAX_FACTOR:
                 self._scale[name] = ratio
             else:
@@ -551,7 +561,8 @@ def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
     uv, xyz = correspondences(matches, points, depth=False)
     sol = solve_pose(uv, xyz, K, refine) if len(uv) >= MODEL_FIRST_MIN_INLIERS else None
     if sol is not None and sol[2] >= MODEL_FIRST_MIN_INLIERS:
-        T, med, ok = epipolar_gate(sol[0], sol[1], matches, points)
+        T, med, ok = epipolar_gate(sol[0], sol[1], matches, points, uv, xyz, sol[2],
+                                   name=str(q.image))
         if ok:
             out.T_map_cam, out.K, out.inliers = T, sol[1], sol[2]
             return out
@@ -566,7 +577,7 @@ def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
                       f"matches agree; needs {MIN_INLIERS}): not enough overlap with the map")
         return out
     T, Kq, inliers = sol
-    T, med, ok = epipolar_gate(T, Kq, matches, points)
+    T, med, ok = epipolar_gate(T, Kq, matches, points, uv, xyz, inliers, name=str(q.image))
     if not ok:
         out.reason = (f"its pose contradicts its matches with the map's keyframes (median "
                       f"epipolar distance {med:.2f}° > {MAX_EPIPOLAR_DEG}°)")
@@ -575,32 +586,77 @@ def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
     return out
 
 
-def epipolar_gate(T: Pose, K: Intrinsics, matches: list[_Match], points: _MapPoints
+def epipolar_gate(T: Pose, K: Intrinsics, matches: list[_Match], points: _MapPoints,
+                  uv: NDArray[Any], xyz: NDArray[Any], inliers: int, name: str = ""
                   ) -> tuple[Pose, float, bool]:
     """(pose, median epipolar distance, accepted) of a located pose judged against its verified
     matches to the stored keyframe poses (``match_residual_deg``, ``MAX_EPIPOLAR_DEG`` from
     ``EPIPOLAR_MIN_MATCHES`` matches). Seen from the keyframes' spot (``rotation_dominant``), a
     few centimetres of centre error — the depth's scale error — become tenths of a degree of
     epipolar distance: a pose above the limit is refined against the keyframe poses
-    (``refine_to_keyframes``) and the refined pose judged instead, when it turned at most
-    ``REFINE_MAX_ROT_DEG``."""
+    (``refine_to_keyframes``), and the refined pose is accepted only within the bounds of that
+    explanation — its centre moved at most ``REFINE_MAX_MOVE_M``, it turned at most the angle
+    that move subtends at the median scene depth, and it still agrees with
+    ``REFINE_KEEP_INLIERS`` of the ``inliers`` of the 2D-3D correspondences ``uv``, ``xyz`` the
+    pose was solved from."""
     med, n = match_residual_deg(T, K, matches, points.frames)
     if n < EPIPOLAR_MIN_MATCHES or med <= MAX_EPIPOLAR_DEG:
         return T, med, True
-    if not rotation_dominant(T, matches, points):
+    dominant, depth = _viewpoint(T, matches, points)
+    if not dominant:
         return T, med, False
     T2 = refine_to_keyframes(T, K, matches, points.frames)
     med2, _ = match_residual_deg(T2, K, matches, points.frames)
+    moved = float(np.linalg.norm(T2.t - T.t))
     turned = _rot_deg(T.R, T2.R)
-    log.debug("epipolar %.3f° -> %.3f° after refinement (turned %.2f°, moved %.1f cm)", med,
-              med2, turned, 100 * float(np.linalg.norm(T2.t - T.t)))
-    if med2 <= MAX_EPIPOLAR_DEG and turned <= REFINE_MAX_ROT_DEG:
-        return T2, med2, True
-    return T, med, False
+    max_turn = float(np.degrees(np.arctan2(REFINE_MAX_MOVE_M, depth)))
+    kept = count_inliers(T2, K, uv, xyz)
+    accept = (med2 <= MAX_EPIPOLAR_DEG and moved <= REFINE_MAX_MOVE_M and turned <= max_turn
+              and kept >= REFINE_KEEP_INLIERS * inliers)
+    log.info("%s: epipolar %.3f° > %.2f°, refined against the keyframe poses: %.3f°, moved %.1f cm "
+             "(max %.0f), turned %.2f° (max %.2f°), %d of %d inliers kept: %s", name or "pose", med,
+             MAX_EPIPOLAR_DEG, med2, 100 * moved, 100 * REFINE_MAX_MOVE_M, turned, max_turn, kept,
+             inliers, "accepted" if accept else "rejected")
+    return (T2, med2, True) if accept else (T, med, False)
+
+
+def count_inliers(T: Pose, K: Intrinsics, uv: NDArray[Any], xyz: NDArray[Any],
+                  max_error_px: float = POSE_MAX_ERROR_PX) -> int:
+    """2D-3D correspondences the camera ``T`` (camera-to-map), ``K`` reprojects within
+    ``max_error_px``."""
+    c = (np.asarray(xyz, np.float64).reshape(-1, 3) - T.t) @ T.R
+    z = c[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = K.fx * c[:, 0] / z + K.cx
+        v = K.fy * c[:, 1] / z + K.cy
+    err = np.hypot(u - np.asarray(uv)[:, 0], v - np.asarray(uv)[:, 1])
+    return int(np.sum((z > 0) & (err <= max_error_px)))
 
 
 def _rot_deg(A: NDArray[Any], B: NDArray[Any]) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(A.T @ B) - 1) / 2, -1.0, 1.0))))
+
+
+def _viewpoint(T: Pose, matches: list[_Match], points: _MapPoints) -> tuple[bool, float]:
+    """(``rotation_dominant``, median scene depth of the matched keyframes in metres, by match
+    count)."""
+    w, mv, ratio, depth = [], 0, [], []
+    for m in matches:
+        fr = points.frames.get(m.keyframe)
+        if fr is None:
+            continue
+        xyz, ok = points._depth_points(fr, m.uv_k)
+        z = ((xyz[ok] - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
+        if not len(z) or np.median(z) <= 0:
+            continue
+        w.append(len(m.idx_k))
+        mv += 0 if model_points_trusted(fr) else len(m.idx_k)
+        depth.append(float(np.median(z)))
+        ratio.append(float(np.linalg.norm(T.t - fr.T_map_cam.t)) / depth[-1])
+    if not w:
+        return False, float("inf")
+    z_med = float(np.median(np.repeat(depth, w)))
+    return 2 * mv > sum(w) or float(np.median(np.repeat(ratio, w))) < ROTATION_BASELINE, z_med
 
 
 def rotation_dominant(T: Pose, matches: list[_Match], points: _MapPoints) -> bool:
@@ -608,22 +664,7 @@ def rotation_dominant(T: Pose, matches: list[_Match], points: _MapPoints) -> boo
     matches, by match count: most matches are with multi-view keyframes (a map of a camera
     turning in place), or the median baseline to the matched keyframes is below
     ``ROTATION_BASELINE`` of their median scene depth."""
-    w, mv, ratio = [], 0, []
-    for m in matches:
-        fr = points.frames.get(m.keyframe)
-        if fr is None:
-            continue
-        w.append(len(m.idx_k))
-        mv += 0 if model_points_trusted(fr) else len(m.idx_k)
-        xyz, ok = points._depth_points(fr, m.uv_k)
-        z = ((xyz[ok] - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
-        b = float(np.linalg.norm(T.t - fr.T_map_cam.t))
-        ratio.append(b / float(np.median(z)) if len(z) and np.median(z) > 0 else np.inf)
-    if not w:
-        return False
-    if 2 * mv > sum(w):
-        return True
-    return float(np.median(np.repeat(ratio, w))) < ROTATION_BASELINE
+    return _viewpoint(T, matches, points)[0]
 
 
 def _signed_epipolar_deg(R: NDArray[Any], C: NDArray[Any], K: Intrinsics, fr: store.FrameRecord,
@@ -647,10 +688,11 @@ def _signed_epipolar_deg(R: NDArray[Any], C: NDArray[Any], K: Intrinsics, fr: st
 
 def refine_to_keyframes(T: Pose, K: Intrinsics, matches: list[_Match],
                         frames: dict[str, store.FrameRecord]) -> Pose:
-    """The located pose refined against its verified matches to the stored keyframe poses: robust
-    (Cauchy) least squares of their epipolar distances over the rotation and the centre, the
-    centre held near its starting point (``REFINE_CENTRE_PRIOR_M``), which the matches of a
-    near-zero baseline barely constrain."""
+    """The located pose refined against its verified matches to the stored keyframe poses:
+    iteratively reweighted (Cauchy) least squares of their epipolar distances over the rotation
+    and the centre, with a quadratic prior (outside the robust weights) holding the centre near
+    its starting point (``REFINE_CENTRE_PRIOR_M``), which the matches of a near-zero baseline
+    barely constrain."""
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
 
@@ -659,14 +701,22 @@ def refine_to_keyframes(T: Pose, K: Intrinsics, matches: list[_Match],
             for sel in [np.linspace(0, len(uq) - 1, min(len(uq), REFINE_MAX_PER_KEYFRAME)).astype(int)]]
     f_scale = MAX_EPIPOLAR_DEG / 2
 
-    def residuals(p: NDArray[np.float64]) -> NDArray[np.float64]:
+    def epipolar(p: NDArray[np.float64]) -> NDArray[np.float64]:
         R = Rotation.from_rotvec(p[:3]).as_matrix() @ T.R
-        r = [_signed_epipolar_deg(R, p[3:], K, fr, uq, uk) for fr, uq, uk in used]
-        return np.concatenate([*r, (p[3:] - T.t) / REFINE_CENTRE_PRIOR_M * f_scale])
+        return np.concatenate([_signed_epipolar_deg(R, p[3:], K, fr, uq, uk)
+                               for fr, uq, uk in used])
 
-    sol = least_squares(residuals, np.concatenate([np.zeros(3), T.t]), loss="cauchy",
-                        f_scale=f_scale, max_nfev=200)
-    return Pose(Rotation.from_rotvec(sol.x[:3]).as_matrix() @ T.R, sol.x[3:])
+    p = np.concatenate([np.zeros(3), T.t])
+    for _ in range(REFINE_IRLS_ROUNDS):
+        sw = 1.0 / np.sqrt(1.0 + (epipolar(p) / f_scale) ** 2)  # sqrt of the Cauchy weights
+
+        def residuals(q: NDArray[np.float64], sw: NDArray[np.float64] = sw
+                      ) -> NDArray[np.float64]:
+            return np.concatenate([sw * epipolar(q), (q[3:] - T.t) / REFINE_CENTRE_PRIOR_M
+                                   * f_scale])
+
+        p = least_squares(residuals, p, max_nfev=50).x
+    return Pose(Rotation.from_rotvec(p[:3]).as_matrix() @ T.R, p[3:])
 
 
 # ------------------------------------------------------------------------------------------------

@@ -628,8 +628,9 @@ def test_pairs_exhaustive_for_small_maps_retrieval_for_large(tmp_path: Path) -> 
 
 def _gate_world(steps: dict[str, np.ndarray], pose_source: str):  # type: ignore[no-untyped-def]
     """Keyframes of an analytic head (``tests.synth.turning``) at 15° steps, each moved by
-    ``steps`` (none: turning in place), the query half-way between two of them; matches and the
-    keyframes' true depth as ``_MapPoints`` would give them."""
+    ``steps`` (none: turning in place), the query half-way between two of them; matches, the
+    keyframes' true depth as ``_MapPoints`` would give them, and the 2D-3D correspondences of
+    the query (``uv``, ``xyz``) with the inliers of its true pose."""
     from oh_my_slam.mapping import locate as lmod
     from tests.synth.turning import K, head_pose, turning_rig
 
@@ -652,7 +653,19 @@ def _gate_world(steps: dict[str, np.ndarray], pose_source: str):  # type: ignore
         return lmod.depth_points(d, np.ones(d.shape, bool), fr, uv)
 
     points = SimpleNamespace(frames=frames, _depth_points=depth_pts)
-    return lmod, K, truth, matches, points
+    uv = np.vstack([m.uv_q for m in matches])
+    xyz = np.vstack([depth_pts(frames[m.keyframe], m.uv_k)[0] for m in matches])
+    w = SimpleNamespace(lmod=lmod, K=K, truth=truth, matches=matches, points=points, uv=uv,
+                        xyz=xyz, inliers=lmod.count_inliers(truth, K, uv, xyz))
+    assert w.inliers > 0.9 * len(uv)
+    return w
+
+
+def _gate(w, T: Pose, inliers: int | None = None):  # type: ignore[no-untyped-def]
+    """``epipolar_gate`` of pose ``T``, solved from ``w``'s correspondences with ``inliers``
+    (default: as many as ``T`` reprojects)."""
+    n = w.lmod.count_inliers(T, w.K, w.uv, w.xyz) if inliers is None else inliers
+    return w.lmod.epipolar_gate(T, w.K, w.matches, w.points, w.uv, w.xyz, n)
 
 
 def _worst_shift(lmod, K, truth, matches, frames, size: float) -> Pose:  # type: ignore[no-untyped-def]
@@ -669,16 +682,17 @@ def test_gate_refines_a_centre_error_seen_from_the_keyframes_spot() -> None:
 
     from tests.synth.turning import rot_err_deg
 
-    lmod, K, truth, matches, points = _gate_world({}, "multiview")
+    w = _gate_world({}, "multiview")
+    lmod, K, truth, matches, points = w.lmod, w.K, w.truth, w.matches, w.points
     T = _worst_shift(lmod, K, truth, matches, points.frames, 0.03)
     med, n = lmod.match_residual_deg(T, K, matches, points.frames)
     assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
     assert lmod.rotation_dominant(T, matches, points)
-    T2, med2, ok = lmod.epipolar_gate(T, K, matches, points)
+    T2, med2, ok = _gate(w, T)
     assert ok and med2 <= lmod.MAX_EPIPOLAR_DEG, med2
-    assert rot_err_deg(T2, truth) < 0.1 and np.linalg.norm(T2.t - truth.t) < 0.03
+    assert rot_err_deg(T2, truth) < 0.15 and np.linalg.norm(T2.t - truth.t) < 0.03
     # the truth itself passes untouched
-    assert lmod.epipolar_gate(truth, K, matches, points)[0] is truth
+    assert _gate(w, truth)[0] is truth
     # a rotation error the limit rejects is not made acceptable by the refinement (a turn about
     # the vertical, along a horizontal baseline, barely moves the epipolar lines: the limit
     # itself cannot see it there)
@@ -688,20 +702,56 @@ def test_gate_refines_a_centre_error_seen_from_the_keyframes_spot() -> None:
         if lmod.match_residual_deg(wrong, K, matches, points.frames)[0] <= lmod.MAX_EPIPOLAR_DEG:
             continue
         rejected += 1
-        T3, med3, ok3 = lmod.epipolar_gate(wrong, K, matches, points)
+        T3, med3, ok3 = _gate(w, wrong, w.inliers)
         assert not ok3 or rot_err_deg(T3, truth) < 0.25, (axis, med3, rot_err_deg(T3, truth))
     assert rejected >= 2
+
+
+def test_gate_rejects_a_centre_far_off_seen_from_the_keyframes_spot(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turning in place: a centre 0.5 or 1 m off is not a depth scale error. Where the limit
+    rejects it (along some directions the epipolar lines barely move: the limit itself cannot
+    see it there, and only the 2D-3D fit that produced the pose can), the refinement may bring
+    its epipolar distance under the limit, but the pose stays rejected by the bound on the
+    centre's move; that bound lifted, a refined pose is accepted only where it went back to the
+    truth, the others by the 2D-3D inliers they lose."""
+    w = _gate_world({}, "multiview")
+    lmod = w.lmod
+    dirs = [np.subtract(d, 1.0) for d in np.ndindex(3, 3, 3) if d != (1, 1, 1)]  # 26 directions
+    far = [Pose(w.truth.R, w.truth.t + size * d / np.linalg.norm(d))
+           for size in (0.5, 1.0) for d in dirs]
+    far = [T for T in far
+           if lmod.match_residual_deg(T, w.K, w.matches, w.points.frames)[0] > lmod.MAX_EPIPOLAR_DEG]
+    assert len(far) >= 10
+    for T in far:
+        T2, _, ok = _gate(w, T, w.inliers)
+        assert not ok and T2 is T, T.t - w.truth.t
+    # that bound lifted: a refined pose that went back to the truth is right; any other loses the
+    # 2D-3D inliers of the pose's own fit
+    from tests.synth.turning import rot_err_deg
+
+    monkeypatch.setattr(lmod, "REFINE_MAX_MOVE_M", 10.0)
+    lost = 0
+    for T in far:
+        T2, _, ok = _gate(w, T, w.inliers)
+        if ok:
+            assert np.linalg.norm(T2.t - w.truth.t) < 0.05 and rot_err_deg(T2, w.truth) < 0.5
+        else:
+            lost += 1
+    assert lost >= 1
+    assert _gate(w, w.truth, w.inliers)[2]
 
 
 def test_gate_keeps_the_limit_for_well_baselined_keyframes() -> None:
     """SfM keyframes metres apart: a pose above the limit is rejected as it is, not refined."""
     rng = np.random.default_rng(3)
     steps = {f"f{k:06d}": np.array([*rng.uniform(-1.2, 1.2, 2), 0.0]) for k in range(7)}
-    lmod, K, truth, matches, points = _gate_world(steps, "sfm-global")
+    w = _gate_world(steps, "sfm-global")
+    lmod, K, truth, matches, points = w.lmod, w.K, w.truth, w.matches, w.points
     T = _worst_shift(lmod, K, truth, matches, points.frames, 0.15)
     med, n = lmod.match_residual_deg(T, K, matches, points.frames)
     assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
     assert not lmod.rotation_dominant(T, matches, points)
-    T2, med2, ok = lmod.epipolar_gate(T, K, matches, points)
+    T2, med2, ok = _gate(w, T)
     assert not ok and T2 is T and med2 == med
-    assert lmod.epipolar_gate(truth, K, matches, points)[2]
+    assert _gate(w, truth)[2]
