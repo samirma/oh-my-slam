@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:,">
+  <title>oh-my-slam</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/viewer/vendor/three/build/three.module.js",
+        "three/addons/": "/static/viewer/vendor/three/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header id="topbar">
+    <div class="brand"><a href="#/image">oh-my-slam</a></div>
+    <nav aria-label="Pages">
+      <ul id="nav">
+        <li><a href="#/image" data-page="image">Image</a></li>
+        <li><a href="#/maps" data-page="maps">Maps</a></li>
+        <li><a href="#/jobs" data-page="jobs">Jobs</a></li>
+        <li><a href="#/scene" data-page="scene">3D scene viewer</a></li>
+      </ul>
+    </nav>
+    <dl class="status" aria-label="Service status">
+      <div><dt>Workspace</dt><dd id="workspace">…</dd></div>
+      <div><dt>Inference server</dt><dd id="inference" aria-live="polite">…</dd></div>
+      <div><dt>Jobs</dt><dd><a id="job-counts" href="#/jobs">…</a></dd></div>
+    </dl>
+  </header>
+  <main id="main" tabindex="-1"></main>
+  <dialog id="confirm" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <div id="confirm-body"></div>
+      <div class="actions">
+        <button value="cancel" id="confirm-no" type="submit"></button>
+        <button value="ok" id="confirm-yes" class="primary" type="submit"></button>
+      </div>
+    </form>
+  </dialog>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

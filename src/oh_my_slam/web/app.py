@@ -5,7 +5,10 @@ data is served in-process by the viewer's own code (``viewer.routes.ViewerRoutes
 ``/api/maps/<name>/viewer/…`` over a workspace map's read-only bundle, ``/api/jobs/<id>/viewer/…``
 over the bundle a job saved (``viewer.bundle.load_bundle``); ``/viewer/map/<name>/`` and
 ``/viewer/job/<id>/`` are the same routes as stable page URLs (the page's own URLs are relative).
-``/`` is the web application's placeholder page.
+``/`` is the web application (``web/static``: plain ES modules built only on the public API);
+``/static/…`` serves its files, ``/static/viewer/…`` the viewer's own modules and vendored
+libraries (which the 3D scene viewer reuses), and ``/static/openlabel_json_schema.json`` the
+vendored scene schema that the browser validates scene documents against.
 
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
 come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
@@ -27,6 +30,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -73,6 +77,12 @@ VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
 _MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
           ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 Json = dict[str, Any]
+WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
+VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
+SCHEMA_FILE = Path(str(resources.files("oh_my_slam.schema") / "openlabel_json_schema.json"))
+_STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
+                 ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
+                 ".txt": "text/plain"}
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -347,7 +357,26 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             return None  # refused by prepare as not an object
 
     async def index(request: Request) -> Response:
-        return Response(PLACEHOLDER, media_type="text/html")
+        return FileResponse(WEB_STATIC / "index.html", media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": "no-cache"})
+
+    async def static(request: Request) -> Response:
+        """The web application's files; ``viewer/…`` the viewer's (its modules and vendored
+        libraries); ``openlabel_json_schema.json`` the scene schema."""
+        rel = request.path_params["path"]
+        if rel == SCHEMA_FILE.name:
+            return FileResponse(SCHEMA_FILE, media_type="application/json")
+        root = WEB_STATIC
+        if rel.startswith("viewer/"):
+            root, rel = VIEWER_STATIC, rel.removeprefix("viewer/")
+        try:
+            target = (root / rel).resolve()
+        except (ValueError, OSError):  # e.g. an embedded NUL byte
+            target = root
+        if root.resolve() not in target.parents or not target.is_file():
+            raise NotFoundError(f"no file {request.path_params['path']}")
+        media = _STATIC_TYPES.get(target.suffix) or mimetypes.guess_type(target.name)[0]
+        return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     async def health(request: Request) -> Response:
         return JSONResponse(await run_in_threadpool(service.health))
@@ -541,6 +570,7 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
 
     routes = [
         Route("/", index),
+        Route("/static/{path:path}", static),
         Route("/api/health", health),
         Route("/api/openapi.json", openapi_doc),
         Route("/api/operations", describe),
@@ -592,16 +622,3 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         NotFoundError: not_found, JobError: job_error, OhMySlamError: command_error,
         ClientDisconnect: disconnect})
     return guard(app, service)
-
-
-PLACEHOLDER = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport"
-content="width=device-width, initial-scale=1"><title>oh-my-slam</title>
-<style>:root{color-scheme:light dark}body{font:16px/1.5 system-ui,sans-serif;margin:2rem;
-max-width:48rem}</style></head>
-<body><h1>oh-my-slam</h1>
-<p>The web service is running. Its API is described at
-<a href="/api/openapi.json">/api/openapi.json</a>; health at <a href="/api/health">/api/health</a>,
-jobs at <a href="/api/jobs">/api/jobs</a>, maps at <a href="/api/maps">/api/maps</a>.</p>
-</body></html>
-"""

@@ -530,7 +530,76 @@ option.
 | `/api/jobs/<id>/timings` | The job's timings. |
 | `/api/jobs/<id>/viewer/<path>` | The job's saved viewer. |
 
-`/` serves a placeholder page until the web application lands.
+**Web application** (spec §2.6 "Web application"). `/` serves a browser application in
+`web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
+CDN). It talks only to the public API above, so everything it does can be scripted. `/static/…`
+serves its files, `/static/viewer/…` the viewer's modules and vendored three.js (which it reuses),
+and `/static/openlabel_json_schema.json` the vendored scene schema.
+
+* **Rendered from the API description.** The operations, their parameters and their outputs are
+  read from `/api/openapi.json` (each one's `x-oms` registry entry). Nothing in the app names a
+  command or an option (a unit test checks this). A new option becomes a new field, a new mode a
+  new form, a new output file a new download, and a new error a new message; a browser test adds
+  all of these to the registry and finds them in the pages.
+* **Forms** have one field per parameter, chosen by its kind:
+  * path inputs get a drop zone and file picker that upload at once, or take a workspace path;
+    ordered inputs (`mapper.sh update -i`) are numbered and can be reordered;
+  * a map is chosen from the workspace's maps (the mapping mode also takes a new name);
+  * `-o` is a name in the job's folder; `-d` is a checkbox plus a folder name;
+  * `-p` gets one control per attribute of the mode;
+  * enums, numbers and flags get the matching control.
+
+  Each field shows its flag, help and default. Fields whose `applies` condition fails are hidden
+  and not sent. Each change is checked by `POST /api/ops/<op>/validate`, and each message appears
+  next to the field it names (`by_parameter`), with the command line the job will run.
+* **Pages.** Each has a stable hash URL, so a reload or a shared link returns to the same state:
+  * `#/image` (`?op=` picks the mode, `/<job>` shows its job): a mode that takes one image, a
+    drop zone with a preview, the form, then the job's progress and result.
+  * `#/maps`, `#/maps/new`, `#/maps/<name>`, `#/maps/<name>/update`. A map's page has the
+    embedded viewer, the objects (from the map viewer's `api/scene`), the update history with
+    per-stage timings (`map.json → updates[]`), and one form per operation that takes a map.
+  * `#/jobs` and `#/jobs/<id>`: the job list and a single job.
+  * `#/scene?ply=<url>&json=<url>`: the 3D scene viewer.
+* **Top bar.** Workspace name, inference-server status (with `start_command` when it is down),
+  and the number of queued and running jobs, kept current by `/api/jobs/events`.
+* **Results.** Every file a job wrote can be downloaded. Images are drawn: in `segmented.png`, the
+  object under a pixel is the one whose colour that pixel has (colour contract). CSV files are
+  tables, and a scene JSON's objects are listed. A `.ply` or scene `.json` opens in the 3D scene
+  viewer. A single-image job is submitted with `?viewer=true` where the operation offers it, and
+  its `viewer_error` (including `cancelled`) is shown above the result, which still stands.
+* **The embedded viewer** is view.sh's own page in an iframe at its stable URL
+  (`/viewer/map/<name>/`, `/viewer/job/<id>/`), which also opens it full screen. Selecting an
+  object highlights it everywhere on the page: in the tables, in the image regions, and on a box
+  in the viewer (the viewer's `select` / `onSelect`; a click on a box picks the smallest box on
+  screen under the pointer).
+* **Jobs.** A cancel first says what it does: the command is interrupted as Ctrl-C would, there is
+  no result, a map update leaves the map as it was, and the uploads are deleted. Re-submit runs
+  the same options again, and asks for the files again when the inputs were uploads (deleted when
+  the job ended). Starting a map creation or update states its consequence in a confirmation.
+* **Inference server down.** Actions of a mode that always needs the server are disabled, with
+  the reason and the start command. A conditional need (`mapper.sh locate` on a large map) is
+  decided by the service's own check when the form is validated. Everything else stays available.
+* **3D scene viewer.** It opens a PLY, a scene JSON, or both, from a job (by URL) or from disk.
+  Files from disk are read in the browser and never uploaded. Both files are drawn in the same map
+  coordinates by the viewer's own modules (`Viewer`, `parsePly`, `sceneObjects`, `sceneCameras`,
+  `plyCameras`, layers, labels, the camera table with *Go to*). Each layer toggle names its file.
+  * The point-cloud controls offer what the file allows: its colours or none, and shading by its
+    normals. The segmentation layer is available when the PLY has labels and the JSON has colours.
+  * A file that is not a PLY the viewer can draw is refused with the parser's reason.
+  * A JSON that fails the vendored OpenLABEL schema is refused with the reasons. The app checks it
+    with its own draft-07 validator (`js/scene/jsonschema.js`, kept in agreement with `jsonschema`
+    by a browser test), plus the checks of `schema/validate.py`.
+  * A PLY with more than 16,000,000 points is refused, because the viewer would draw it whole
+    above its display budget (§2.5). The refusal says to view the cloud as a map or as a job's
+    viewer, where the service shows a budgeted selection of its points.
+* **Accessibility and layout.**
+  * Everything is reachable from the keyboard, focus is always visible, and every control has a
+    label. Object colours always appear with their id or label.
+  * Light and dark themes follow the system and meet WCAG 2.1 AA contrast. Object colours are the
+    colour contract's in both themes.
+  * Pages work from desktop down to tablet width (768 px).
+  * The browser tests run the vendored axe-core (`tests/browser/vendor/`) on every page in both
+    themes and at both widths, and fail on any serious or critical violation.
 
 ## Point-cloud attributes
 

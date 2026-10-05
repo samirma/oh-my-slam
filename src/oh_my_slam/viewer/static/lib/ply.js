@@ -114,3 +114,10 @@ export function parsePly(buffer) {
   const attrs = recorded ? recorded.slice('attributes '.length) : '';
   return { header: { count: n, total: n, voxel: 0, attrs, format: h.format, comments: h.comments }, arrays };
 }
+
+// The header of a PLY file (ArrayBuffer) without reading its body: { format, count (vertices),
+// comments, props }. Throws as parsePly does for a file that is not a PLY this viewer can draw.
+export function plyHeader(buffer) {
+  const { format, count, comments, props } = parseHeader(new Uint8Array(buffer));
+  return { format, count, comments, props };
+}

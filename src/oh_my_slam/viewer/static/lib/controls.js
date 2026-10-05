@@ -65,3 +65,7 @@ export function budgetNote(header) {
   const edge = e >= 1 ? `${e.toFixed(2)} m` : e >= 0.01 ? `${(e * 100).toFixed(1)} cm` : `${(e * 1000).toFixed(2)} mm`;
   return `${shown}: one per voxel of ${edge} edge ${complete}`;
 }
+
+// The display budget of spec §2.5: the viewer draws every point of a cloud of at most this many
+// points (viewer/bundle.py DISPLAY_POINT_BUDGET, which the service's clouds are thinned to).
+export const DISPLAY_POINT_BUDGET = 16_000_000;
