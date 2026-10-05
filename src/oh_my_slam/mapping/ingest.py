@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import ExifTags, Image
+from PIL import ExifTags
 
 from oh_my_slam.core.constants import DEFAULT_FPS as DEFAULT_FPS
 from oh_my_slam.core.errors import InputError, UsageError
@@ -17,6 +17,7 @@ from oh_my_slam.core.images import (
     VIDEO_SUFFIXES,
     exif_intrinsics,
     load_rgb,
+    open_header,
     save_jpeg,
 )
 from oh_my_slam.core.types import Intrinsics
@@ -63,7 +64,7 @@ def resolve_inputs(args: list[Path]) -> InputSpec:
 
 def write_upright_jpeg(src: Path, dst: Path) -> None:
     """Upright JPEG copy: byte copy for upright JPEGs (keeps EXIF), re-encode otherwise."""
-    with Image.open(src) as img:
+    with open_header(src) as img:
         orientation = img.getexif().get(ExifTags.Base.Orientation, 1)
         fmt = img.format
     dst.parent.mkdir(parents=True, exist_ok=True)

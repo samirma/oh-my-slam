@@ -6,6 +6,7 @@ human-readable line to stderr. Anything else is an internal error (exit 1).
 
 from __future__ import annotations
 
+import signal
 from enum import IntEnum
 
 
@@ -45,6 +46,22 @@ def http_status(exit_code: int) -> int:
         return HTTP_STATUS[ExitCode(exit_code)]
     except ValueError:
         return 500
+
+
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def job_state(exit_code: int) -> str:
+    """State of a job whose command process ended with ``exit_code`` (a ``returncode``): a process
+    stopped by SIGINT or SIGTERM (negative status, or 128 + signal from a shell) was cancelled;
+    any other status not in ``JOB_STATE`` failed."""
+    if exit_code < 0 or exit_code > 128:
+        stopped = -exit_code if exit_code < 0 else exit_code - 128
+        return "cancelled" if stopped in _STOP_SIGNALS else "failed"
+    try:
+        return JOB_STATE[ExitCode(exit_code)]
+    except ValueError:
+        return "failed"
 
 
 def error_code(exit_code: int) -> str:

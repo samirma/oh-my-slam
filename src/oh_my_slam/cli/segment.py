@@ -86,7 +86,7 @@ def main(argv: list[str]) -> int:
 
         with timing.collect() as tm:
             with timing.stage(Stage.EXPORT):
-                scene, ply = map_segment_outputs(args.map, args.artifacts, attrs,
+                scene, ply = map_segment_outputs(args.map, args.artifacts, attrs, reader=v.reader,
                                                  want_ply=args.format == "ply")
             with timing.stage(Stage.WRITE):
                 out.write_bytes(_result(args.format, scene, ply))

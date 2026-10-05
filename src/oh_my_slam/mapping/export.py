@@ -151,13 +151,14 @@ def scene_bytes(reader: store.MapReader, tool: str | None = None) -> bytes:
 
 
 def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudAttrs,
-                        want_ply: bool = True) -> tuple[bytes, bytes | None]:
+                        want_ply: bool = True, reader: store.MapReader | None = None
+                        ) -> tuple[bytes, bytes | None]:
     """``segment.sh -m``: (scene JSON, segments PLY — also when ``artifacts_dir`` is given, else
     only if ``want_ply``); writes the artefacts into ``artifacts_dir``. Read-only: no inference,
-    the map is never modified."""
+    the map is never modified. ``reader``: the map already opened (by the command's checks)."""
     from oh_my_slam.segmentation.artifacts import write_artifacts
 
-    reader = store.MapReader(map_dir)
+    reader = reader or store.MapReader(map_dir)
     state, objs = map_objects(reader)
     scene = scene_bytes(reader, tool="segment")
     ply = cloud_ply(reader_source(reader, objs), attrs) \

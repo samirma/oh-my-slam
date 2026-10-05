@@ -224,7 +224,7 @@ def _pairs(reader: store.MapReader, queries: list[_Query], db: dict[str, _DbImag
     """Query-keyframe pairs (database image ids): all keyframes for a map of at most
     ``UPDATE_EXHAUSTIVE_MAX``, else the ``RETRIEVAL_TOP_K`` most similar ones by the retrieval
     descriptor (inference server, through reconstruction)."""
-    from oh_my_slam.mapping.api import RETRIEVAL_TOP_K, UPDATE_EXHAUSTIVE_MAX
+    from oh_my_slam.core.constants import RETRIEVAL_TOP_K, UPDATE_EXHAUSTIVE_MAX
 
     kfs = [fr for fr in reader.frames if _kf_file(fr) in db]
     q_ids = [db[q.name].image_id for q in queries]

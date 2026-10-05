@@ -36,7 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from oh_my_slam.commands.parser import ArgumentParser, RaisingParser
+from oh_my_slam.commands.parser import ArgumentParser, ParameterError, RaisingParser
 from oh_my_slam.core.cloud_attrs import (
     CloudAttrs,
     CloudScope,
@@ -48,6 +48,7 @@ from oh_my_slam.core.constants import (
     DEFAULT_FPS,
     DEFAULT_MIN_SCORE,
     IMAGE_SUFFIXES,
+    UPDATE_EXHAUSTIVE_MAX,
     VIDEO_SUFFIXES,
 )
 from oh_my_slam.core.errors import (
@@ -222,7 +223,7 @@ class Mode:
     stages: tuple[Stage, ...]
     outputs: tuple[Output, ...]
     attrs_scope: CloudScope | None = None  # the -p scope
-    inference_condition: Callable[[], dict[str, Any]] | None = None  # when "conditional"
+    inference_condition: Mapping[str, Any] | None = None  # when "conditional"
 
     def scope(self) -> CloudScope:
         assert self.attrs_scope is not None, "this mode writes no point cloud"
@@ -338,7 +339,7 @@ IMAGE_RULE = Rule("image_exists", ("image",), "the -i image exists", _image_chec
 def _map_check(ctx: Context) -> None:
     from oh_my_slam.mapping.store import MapReader
 
-    MapReader(ctx.args.map)
+    ctx.values.reader = MapReader(ctx.args.map)  # the command reads the map through it
 
 
 MAP_RULE = Rule("existing_map", ("map",), "-m is a map (it is opened read-only)", _map_check,
@@ -439,12 +440,6 @@ LOCATE_RULES = (
     Rule("output_outside_map", ("output", "map"),
          "-o is not inside the map folder, which locate never writes", _locate_output_check),
 )
-
-
-def _locate_inference() -> dict[str, Any]:
-    from oh_my_slam.mapping.api import UPDATE_EXHAUSTIVE_MAX
-
-    return {"map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
 
 
 # --- the commands ---------------------------------------------------------------------------------
@@ -552,7 +547,7 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
                      "them (-t full)",
                      "the map points visible from the located cameras (-t single) or the whole "
                      "map cloud (-t full); the located poses in the header"),
-             CloudScope.MAP, _locate_inference),
+             CloudScope.MAP, {"map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}),
     )),
 ))
 
@@ -655,15 +650,24 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _value(value: Any) -> str:
+    """One of several values (``-i a b``): a relative path starting with "-" gets "./", so argparse
+    never reads it as an option."""
+    text = _text(value)
+    return f"./{text}" if text.startswith("-") else text
+
+
 def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Namespace:
     """The command's parsed arguments for API parameters (option name → value; a list for an
     option that takes several values): the argv the command would get, parsed by its own parser,
-    so a bad value is a :class:`UsageError` with argparse's message. Parameters that are None,
-    and those equal to the default of an ``omit_if_default`` option, are not passed."""
+    so a bad value is a :class:`ParameterError` with argparse's message and the parameters it
+    concerns. Parameters that are None, and those equal to the default of an ``omit_if_default``
+    option, are not passed."""
     opts = cmd.mode_options(mode)
     unknown = sorted(set(params) - {o.name for o in opts})
     if unknown:
-        raise UsageError(f"unrecognized parameters for {cmd.label(mode)}: {', '.join(unknown)}")
+        raise ParameterError(f"unrecognized parameters for {cmd.label(mode)}: "
+                             f"{', '.join(unknown)}", tuple(unknown))
     argv = [cmd.name] if cmd.name else []
     for o in opts:
         v = params.get(o.name)
@@ -674,7 +678,7 @@ def parse(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> argparse.Names
             continue
         values = list(v) if isinstance(v, list | tuple) else [v]
         if o.multiple:
-            argv += [o.flag, *map(_text, values)]
+            argv += [o.flag, *map(_value, values)]
         else:  # flag=value: a value that starts with "-" stays a value
             argv += [f"{o.flag}={_text(x)}" for x in values]
     return build_parser(program_of(cmd), RaisingParser).parse_args(argv)
@@ -696,18 +700,43 @@ def validate(cmd: Command, args: argparse.Namespace,
     return ctx.values
 
 
-def dry_run(cmd: Command, args: argparse.Namespace) -> list[Problem]:
-    """Every rule's check of the mode (none prepares anything), each failure kept with the
-    parameters it concerns, so a form can flag all of them next to their fields at once."""
-    mode = cmd.mode_of(args)
+def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem]:
+    """Every problem of an API request, without touching anything: argparse's (a bad value, a
+    missing parameter) and every rule's check (none prepares anything), each with the parameters
+    it concerns, so a form flags them all next to their fields at once (:func:`by_parameter`).
+    A parameter argparse refuses is left out of the following parses and rules."""
+    problems: list[Problem] = []
+    current = dict(params)
+    while True:
+        try:
+            args = parse(cmd, mode, current)
+            break
+        except ParameterError as exc:
+            problems.append(Problem("arguments", exc.parameters, str(exc), exc.exit_code))
+            dropped = [n for n in exc.parameters if current.get(n) is not None]
+            if not dropped:  # a missing parameter: no complete arguments to check further
+                return problems
+            for n in dropped:
+                current[n] = None
+    refused = {n for p in problems for n in p.parameters}
     ctx = Context(args, argparse.Namespace(**vars(args)), mode, lambda _msg: None)
-    problems = []
     for rule in mode.rules:
+        if refused & set(rule.options):
+            continue
         try:
             rule.check(ctx)
         except OhMySlamError as exc:
             problems.append(Problem(rule.name, rule.options, str(exc), exc.exit_code))
     return problems
+
+
+def by_parameter(problems: list[Problem]) -> dict[str, list[str]]:
+    """The messages of ``problems`` per parameter: each under the first one it concerns (the
+    field a form flags), or under "" when it concerns none."""
+    out: dict[str, list[str]] = {}
+    for p in problems:
+        out.setdefault(p.parameters[0] if p.parameters else "", []).append(p.message)
+    return out
 
 
 # --- export as data -------------------------------------------------------------------------------
@@ -781,7 +810,7 @@ def describe() -> dict[str, Any]:
             "description": cmd.help,
             "inference": mode.inference,
             "inference_text": mode.inference_text,
-            "inference_condition": mode.inference_condition() if mode.inference_condition
+            "inference_condition": dict(mode.inference_condition) if mode.inference_condition
             else None,
             "parameters": [_option(mode, o) for o in cmd.mode_options(mode)],
             "rules": [{"name": r.name, "parameters": list(r.options), "text": r.text,

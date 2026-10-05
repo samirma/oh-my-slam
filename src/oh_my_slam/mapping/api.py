@@ -30,6 +30,8 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
+from oh_my_slam.core.constants import RETRIEVAL_TOP_K as RETRIEVAL_TOP_K
+from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX as UPDATE_EXHAUSTIVE_MAX
 from oh_my_slam.core.errors import RegistrationError
 from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
@@ -67,8 +69,6 @@ SEQ_OVERLAP = 12
 LOOP_TOP_K = 10
 LOOP_MIN_GAP = 30
 PHOTO_EXHAUSTIVE_MAX = 200
-UPDATE_EXHAUSTIVE_MAX = 150
-RETRIEVAL_TOP_K = 30
 MV_CHUNK = 24  # gate G6
 MV_ANCHORS = 4
 REJECT_SCALE = (0.5, 2.0)

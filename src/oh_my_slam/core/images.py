@@ -31,6 +31,17 @@ def open_image(path: Path) -> Image.Image:
     return ImageOps.exif_transpose(img) or img
 
 
+def open_header(path: Path) -> Image.Image:
+    """``Image.open`` (header only, pixels not decoded) as a context manager; a file that is not a
+    readable image is an input error naming it (exit 2), as in ``open_image``."""
+    try:
+        return Image.open(path)
+    except FileNotFoundError:
+        raise InputError(f"image not found: {path}") from None
+    except Exception as exc:  # PIL raises many types
+        raise InputError(f"cannot read image {path}: {exc}") from exc
+
+
 def load_rgb(path: Path, max_side: int | None = None) -> NDArray[np.uint8]:
     """RGB uint8 (H, W, 3), upright, optionally downscaled so the long side is <= max_side."""
     img = open_image(path).convert("RGB")
@@ -57,7 +68,7 @@ def resize_to_max_side(img: Image.Image, max_side: int) -> Image.Image:
 def upright_size(path: Path) -> tuple[int, int]:
     """(width, height) after EXIF orientation, without decoding pixels where possible."""
     path = Path(path)
-    with Image.open(path) as img:
+    with open_header(path) as img:
         w, h = img.size
         orientation = img.getexif().get(ExifTags.Base.Orientation, 1)
     if orientation in (5, 6, 7, 8):
@@ -91,7 +102,7 @@ def exif_focal_px(path: Path) -> float | None:
     ``f_px = f35 * diag_px / 43.27``; else FocalLength with FocalPlaneXResolution.
     """
     path = Path(path)
-    with Image.open(path) as img:
+    with open_header(path) as img:
         tags = _exif_dict(img)
         raw_w, raw_h = img.size
     diag_px = math.hypot(raw_w, raw_h)

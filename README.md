@@ -355,7 +355,8 @@ The same source and attributes always give byte-identical files.
 For the web service (spec §2.6), `core/errors.py` maps each exit code to a machine-readable code
 (its lower-case name, e.g. `not_a_map`), an HTTP status by one rule (`HTTP_STATUS`: 2 → 400, 4
 and 5 → 422, 6 → 409, 3 → 503, 130 → 499, 1 and anything else → 500) and a job state
-(`JOB_STATE`: 0 → `succeeded`, 130 → `cancelled`, any other → `failed`).
+(`job_state()`: 0 → `succeeded`; 130, or a process stopped by SIGINT or SIGTERM → `cancelled`;
+any other → `failed`).
 
 ## Coordinate conventions
 
@@ -1006,8 +1007,9 @@ at the Python-module level:
   `-m` and `view.sh -i` / `-m` is declared there once. Each command builds its argparse parser
   (`spec.build_parser`) and runs its checks (`spec.validate`: each rule's pure check, then its
   preparation such as creating `-d`, in order, before any work) from it. For the web service,
-  `spec.parse` turns API parameters into the command's arguments through the same parser,
-  `spec.dry_run` reports every failed check per parameter without touching the filesystem, and
+  `spec.parse` turns API parameters into the command's arguments through the same parser (an
+  argument error names its parameters), `spec.dry_run` reports argparse's and every rule's
+  problems per parameter without touching the filesystem, and
   `spec.describe()` exports everything as JSON-serialisable data. Stage names are
   `core.timing.Stage`; shared defaults and input suffixes are in `core/constants.py`.
 * The web service runs each job as a subprocess (`python -m oh_my_slam.cli.<command>`) with

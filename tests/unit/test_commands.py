@@ -15,6 +15,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from oh_my_slam.cli import reconstruct as cli_reconstruct
 from oh_my_slam.cli import segment as cli_segment
 from oh_my_slam.cli import view as cli_view
 from oh_my_slam.commands import spec
+from oh_my_slam.commands.parser import ParameterError
 from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import ATTRIBUTES, CloudAttrs
 from oh_my_slam.core.errors import (
@@ -36,6 +38,7 @@ from oh_my_slam.core.errors import (
     UsageError,
     error_code,
     http_status,
+    job_state,
 )
 from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.timing import Stage
@@ -270,10 +273,9 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
 def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
         tmp_path: Path) -> None:
     seg = S.command()
-    args = spec.parse(seg, spec.SEGMENT_IMAGE, {
+    problems = {p.rule: p for p in spec.dry_run(seg, spec.SEGMENT_IMAGE, {
         "image": tmp_path / "none.jpg", "min_score": "abc", "attrs": ["stride=0"],
-        "artifacts": tmp_path / "new" / "d", "output": tmp_path})
-    problems = {p.rule: p for p in spec.dry_run(seg, args)}
+        "artifacts": tmp_path / "new" / "d", "output": tmp_path})}
     assert set(problems) == {"min_score", "attrs", "output_writable", "image_exists"}
     assert problems["attrs"].parameters[0] == "attrs"
     assert problems["image_exists"].describe() == {
@@ -283,9 +285,52 @@ def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
     assert not (tmp_path / "new").exists()  # the -d folder is only checked
     afile = tmp_path / "afile"
     afile.write_text("x")
-    args = spec.parse(seg, spec.SEGMENT_IMAGE, {"image": afile, "artifacts": afile})
-    (p,) = spec.dry_run(seg, args)
+    (p,) = spec.dry_run(seg, spec.SEGMENT_IMAGE, {"image": afile, "artifacts": afile})
     assert p.message == f"-d {afile}: cannot write there (File exists)"
+    # argparse's problems and the rules' together, per field
+    up = M.command("update")
+    found = spec.dry_run(up, up.modes[0], {"inputs": [tmp_path / "none.jpg"], "map": afile,
+                                           "format": "xml", "fps": "abc", "attrs": ["voxel=1"]})
+    assert spec.by_parameter(found) == {
+        "format": ["argument -f: invalid choice: 'xml' (choose from json, ply)"],
+        "fps": ["argument -fps: invalid float value: 'abc'"],
+        "inputs": [f"input not found: {tmp_path / 'none.jpg'}"],
+        "map": [f"{afile.resolve()} is not empty and not a map; use a new or empty folder"]}
+    # (-p is not checked: it concerns -f, which argparse refused)
+    missing = spec.dry_run(up, up.modes[0], {"inputs": ["a.jpg"], "format": "xml"})
+    assert [(p.rule, p.parameters) for p in missing] == [("arguments", ("format",)),
+                                                         ("arguments", ("map",))]
+
+
+def test_argument_errors_name_their_parameters() -> None:
+    seg, up = S.command(), M.command("update")
+    cases = [
+        (seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "xml"}, ("format",)),
+        (up, up.modes[0], {"inputs": ["v.mp4"], "map": "m", "fps": "abc"}, ("fps",)),
+        (up, up.modes[0], {"inputs": ["a.jpg"]}, ("map",)),
+        (up, up.modes[0], {}, ("inputs", "map")),
+        (seg, spec.SEGMENT_MAP, {"map": "m", "min_score": 0.4}, ("min_score",)),
+    ]
+    for cmd, mode, params, names in cases:
+        with pytest.raises(ParameterError) as e:
+            spec.parse(cmd, mode, params)
+        assert e.value.parameters == names, (params, e.value)
+        assert e.value.exit_code is ExitCode.USAGE
+    # a relative path starting with "-" among several values stays a path
+    args = spec.parse(up, up.modes[0], {"inputs": ["-a.jpg", "b.jpg"], "map": "m"})
+    assert args.inputs == [Path("./-a.jpg"), Path("b.jpg")]
+
+
+def test_describe_is_cheap() -> None:
+    """Reading the definitions loads none of the pipeline (the web service's start-up)."""
+    code = ("import sys, time; t = time.perf_counter(); from oh_my_slam.commands import spec; "
+            "spec.describe(); print(time.perf_counter() - t); "
+            "print(sorted(m for m in sys.modules if m.startswith('oh_my_slam.') and "
+            "m.split('.')[1] not in ('commands', 'core')))")
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         timeout=60, cwd=REPO)
+    seconds, loaded = res.stdout.splitlines()
+    assert loaded == "[]" and float(seconds) < 0.5, res.stdout
 
 
 def test_exit_codes_map_to_http_statuses() -> None:
@@ -299,6 +344,9 @@ def test_exit_codes_map_to_http_statuses() -> None:
     assert JOB_STATE[ExitCode.INTERRUPTED] == "cancelled" and JOB_STATE[ExitCode.OK] == "succeeded"
     assert JOB_STATE[ExitCode.NOT_A_MAP] == "failed"
     assert error_code(4) == "not_a_map" and error_code(77) == "internal"
+    assert job_state(0) == "succeeded" and job_state(130) == "cancelled" and job_state(2) == "failed"
+    assert job_state(-2) == job_state(-15) == job_state(143) == "cancelled"
+    assert job_state(-9) == job_state(77) == job_state(137) == "failed"
     exported = {e["code"]: e["http_status"] for e in spec.describe()["exit_codes"]}
     assert exported["map_locked"] == 409 and exported["usage"] == 400
 
