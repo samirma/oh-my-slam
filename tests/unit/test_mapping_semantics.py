@@ -603,3 +603,103 @@ def test_canonical_points_compose() -> None:
                                   whole)
     keys = np.floor(whole.astype(np.float64) / objects.POINT_VOXEL)
     assert len(np.unique(keys, axis=0)) == len(whole)
+
+
+def test_a_rebuild_judges_its_keyframes_update_by_update() -> None:
+    """A rebuild maps the keyframes of several updates at once (``mapping.api._try_rebuild``):
+    their verdicts are judged update by update, as those updates judged them. Two keyframes
+    that saw through a weakly established object gave a strike in each of two updates: the
+    second strike removes it. Judged as one update, the two keyframes give one strike only."""
+    def obj() -> MapObject:
+        return MapObject(4, "box", {"box": 4.0}, [0.9] * 4, np.zeros((10, 3), np.float32),
+                         frames=[0, 1], confirmed=True)
+
+    two = [objects.Verdict(10, 0.95, True), objects.Verdict(20, 0.95, True)]
+    together = obj()
+    assert objects._absence([together], {4: two}, uids={10: 2, 20: 2}) == []
+    assert together.strikes == 1
+    apart = obj()
+    assert objects._absence([apart], {4: two}, uids={10: 2, 20: 3}) == [4]
+
+
+def test_a_partly_occluded_verdict_weighs_by_what_it_sees() -> None:
+    """In the majority of ``_judgement`` a keyframe that sees only part of a place (a vase in
+    front of it) counts by what it sees: two partial verdicts that see through it, at a fifth of
+    a whole one each, do not outweigh one whole verdict that is not sure."""
+    o = MapObject(4, "box", {"box": 4.0}, [0.9] * 4, np.zeros((10, 3), np.float32),
+                  frames=[0, 1, 2, 3], confirmed=True)
+    partial = [objects.Verdict(f, 0.95, True, partial=True, weight=0.2) for f in (10, 11)]
+    unsure = objects.Verdict(12, 0.5, True)  # neither in place nor through
+    assert objects._judgement(o, [*partial, unsure]) is None
+    whole = [objects.Verdict(f, 0.95, True) for f in (10, 11)]
+    assert objects._judgement(o, [*whole, unsure]) == "gone"
+
+
+def test_a_published_id_returns_to_its_founder() -> None:
+    """A weak first update published two windows, 9 and 22; a rebuild merged them into one
+    object, which keeps 9 while 22 resolves to it provisionally (``rebuild_merged``); a later
+    rebuild separates them again: 22 goes back to the window of the detection it was first
+    given with, though that window now also owns detections published as 9."""
+    from types import SimpleNamespace as Ns
+
+    def ob(*dets: object) -> object:
+        return Ns(members=[Ns(detection=d) for d in dets])
+
+    d9, d22, d9_later, new = object(), object(), object(), object()
+    prior = {id(d9): 9, id(d22): 22, id(d9_later): 9}
+    # the first rebuild: one object (provisional id 100) owns all three
+    final, taken, absorbed = objects._published_ids(
+        [100, 100, 100], [ob(d9), ob(d22), ob(d9_later)], [1, 5, 30],  # type: ignore[list-item]
+        lambda k: k, {100: 1}, prior, floor=26, count=40)
+    assert final == {100: 9} and taken == {9} and absorbed == {22: 100}
+    state = objects.ObjectState(
+        [MapObject(9, "window", {"window": 1.0}, [0.9], np.zeros((0, 3), np.float32))], 40)
+    rb = Ns(merged_into={}, created={9: 1, 22: 1})
+    assert objects._carry_identity(state, rb, final, absorbed, set()) == []
+    assert state.rebuild_merged == {22: 9} and state.resolve(22) == 9
+    # the next rebuild: two objects; 9 was first given to d9 (A), 22 to d22 (B)
+    final, taken, absorbed = objects._published_ids(
+        [100, 101, 101, 100], [ob(d9), ob(d22), ob(d9_later), ob(new)],  # type: ignore[list-item]
+        [1, 5, 30, 41], lambda k: k, {100: 1, 101: 5}, prior, floor=26, count=45)
+    assert final == {100: 9, 101: 22} and absorbed == {}
+    state = objects.ObjectState(
+        [MapObject(i, "window", {"window": 1.0}, [0.9], np.zeros((0, 3), np.float32))
+         for i in (9, 22)], 45)
+    assert objects._carry_identity(state, rb, final, absorbed, set()) == []
+    assert state.rebuild_merged == {} and state.resolve(22) == 22
+
+
+def test_a_published_id_outranks_a_lower_candidate_id() -> None:
+    """An object a rebuild finds both a candidate's id (5, never exported) and a published one
+    (7) on keeps the published one."""
+    from types import SimpleNamespace as Ns
+
+    d5, d7 = object(), object()
+    final, _, absorbed = objects._published_ids(
+        [100, 100], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d7)])],  # type: ignore[list-item]
+        [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
+        published={7})
+    assert final == {100: 7} and absorbed == {5: 100}
+
+
+def test_a_merge_keeps_the_published_id_before_a_lower_candidates(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the extension merges a stored candidate (id 5, never exported) with a stored
+    published object (id 7), the published id survives and the candidate's resolves to it: the
+    lower id is kept only between two published or two unpublished objects."""
+    rng = np.random.default_rng(0)
+
+    def stored(oid: int, confirmed: bool) -> MapObject:
+        pts = (rng.uniform(-0.2, 0.2, (200, 3)) + [0.0, 0.0, 0.3]).astype(np.float32)
+        return MapObject(oid, "box", {"box": 1.0}, [0.9], pts, frames=[0, 1],
+                         confirmed=confirmed)
+
+    candidate, published = stored(5, False), stored(7, True)
+    state = ObjectState([candidate, published], 10)
+    monkeypatch.setattr(objects, "_merge_strength", lambda a, b, *rest: 2.0)
+    alias: dict[int, int] = {}
+    assert objects._merge(state, {5, 7}, alias) == 1
+    assert alias == {5: 7} and [o.id for o in state.objects] == [7]
+    # update_objects records a stored id's merge (``merged_into``): 5 resolves to 7
+    state.merged_into.update({old: keeper for old, keeper in alias.items() if old < 10})
+    assert state.resolve(5) == 7

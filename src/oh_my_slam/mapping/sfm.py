@@ -20,7 +20,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -406,6 +406,10 @@ class Sfm:
         without it. Photos keep it: downscaled to 2000-2800 px or not doubled, the 13-photo office
         map fell into a wrong global solution in 2 to 8 of 8 trials, never with COLMAP's
         features."""
+        camera = self._register(names, prior)
+        names = self._without_features(names)  # a rebuild keeps the stored keyframes' features
+        if not names:
+            return camera
         lst = self.work / "extract_list.txt"
         lst.write_text("\n".join(names) + "\n")
         doubled = not video or max(prior.width, prior.height) < SIFT_UNDOUBLED_VIDEO_SIDE
@@ -418,15 +422,49 @@ class Sfm:
             "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
-        existing = self.existing_camera(prior)
-        if existing is not None:
-            args += ["--ImageReader.existing_camera_id", str(existing)]
-        else:
-            args += ["--ImageReader.single_camera", "1"]
-            if prior.focal is not None:
-                args += ["--ImageReader.camera_params", _camera_params(prior)]
+        args += ["--ImageReader.existing_camera_id", str(camera)]
         _run(args, self.log_path)
-        return self._camera_of(names[0])
+        return camera
+
+    def _without_features(self, names: list[str]) -> list[str]:
+        """``names`` whose features the database does not hold yet."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            ids = {im.name: im.image_id for im in db.read_all_images()}
+            return [n for n in names if n not in ids or not db.exists_keypoints(ids[n])]
+        finally:
+            db.close()
+
+    def _register(self, names: list[str], prior: CameraPrior) -> int:
+        """Write ``names`` into the database in their order, before their features, with the
+        camera they share (``existing_camera``, else a new one for ``prior`` as COLMAP's
+        ``single_camera`` creates it: the prior focal, or 1.2 times the larger side without one).
+        COLMAP's threaded extraction writes the images it registers itself in the order they
+        finish, and the global mapper's result follows the image ids: registered first, the ids
+        follow the keyframes' order and the same input maps the same way."""
+        import pycolmap
+
+        camera = self.existing_camera(prior)
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            if camera is None:
+                focal = prior.focal if prior.focal is not None else 1.2 * max(prior.width,
+                                                                           prior.height)
+                cam = pycolmap.Camera.create(0, pycolmap.CameraModelId.SIMPLE_PINHOLE, focal,
+                                             prior.width, prior.height)
+                # the parameters as COLMAP parses them from text (``set_prior`` does the same)
+                cam.set_params_from_string(_camera_params(replace(prior, focal=focal)))
+                cam.has_prior_focal_length = prior.focal is not None
+                camera = int(db.write_camera(cam))
+            known = {im.name for im in db.read_all_images()}
+            for name in names:
+                if name not in known:
+                    db.write_image(pycolmap.Image(name=name, camera_id=camera))
+        finally:
+            db.close()
+        return camera
 
     def set_prior(self, camera_id: int, prior: CameraPrior) -> None:
         """Give the new camera that ``extract`` created for a provisional prior (with a focal)
@@ -473,15 +511,6 @@ class Sfm:
                 return False
             f = float(np.mean(np.asarray(cam.params)[list(cam.focal_length_idxs())]))
             return abs(f - prior.focal) <= FOCAL_MATCH_REL * prior.focal
-        finally:
-            db.close()
-
-    def _camera_of(self, name: str) -> int:
-        import pycolmap
-
-        db = pycolmap.Database.open(str(self.db))
-        try:
-            return int(db.read_image_with_name(name).camera_id)
         finally:
             db.close()
 

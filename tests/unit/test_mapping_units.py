@@ -904,7 +904,7 @@ def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
 
     seen: list[list[str]] = []
     monkeypatch.setattr(sfm_mod, "_run", lambda args, log: seen.append(args))
-    monkeypatch.setattr(sfm_mod.Sfm, "_camera_of", lambda self, name: 1)
+    monkeypatch.setattr(sfm_mod.Sfm, "_register", lambda self, names, prior: 1)
     s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
     s.extract(["a.jpg"], sfm_mod.CameraPrior(4000, 3000, focal=3000.0))
     s.extract(["b.jpg"], sfm_mod.CameraPrior(1920, 1080), video=True)
@@ -913,6 +913,36 @@ def test_sift_doubles_photos_but_not_hd_video_keyframes(tmp_path: Path,
     assert first == ["-1", "0", "-1"]
     assert all(a.count("--SiftExtraction.first_octave") == 1 for a in seen)
     assert all("--FeatureExtraction.max_image_size" not in a for a in seen)  # COLMAP's 3200
+
+
+def test_images_are_registered_in_keyframe_order_before_extraction(tmp_path: Path) -> None:
+    """COLMAP's threaded extraction gives the images it registers ids in the order it finishes
+    them (the global mapper's result follows the ids): the mapper registers them first, in the
+    keyframes' order, with the camera COLMAP's single_camera would create, and a later batch of
+    the same size and focal shares it."""
+    import pycolmap
+
+    from oh_my_slam.mapping import sfm as sfm_mod
+
+    s = sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "work")
+    names = [f"f{k:06d}.jpg" for k in (0, 1, 2, 10)]
+    cam = s._register(names, sfm_mod.CameraPrior(4000, 3000))
+    db = pycolmap.Database.open(str(tmp_path / "db.db"))
+    try:
+        assert [(im.image_id, im.name) for im in sorted(db.read_all_images(),
+                                                         key=lambda im: im.image_id)] \
+            == list(enumerate(names, start=1))
+        c = db.read_camera(cam)
+        assert list(c.params) == [4800.0, 2000.0, 1500.0] and not c.has_prior_focal_length
+    finally:
+        db.close()
+    assert s._register(names[:2] + ["f000011.jpg"], sfm_mod.CameraPrior(4000, 3000,
+                                                                       existing_id=cam)) == cam
+    db = pycolmap.Database.open(str(tmp_path / "db.db"))
+    try:
+        assert db.num_images() == 5
+    finally:
+        db.close()
 
 
 def test_weak_links_of_a_walk_are_the_cuts_few_sequential_pairs_span() -> None:
@@ -1112,3 +1142,28 @@ def test_the_near_far_correction_does_not_change_what_a_keyframe_fuses() -> None
     assert (np.abs(far[:, 2] - 34.4) < 0.3).sum() > 50  # the facade, where the correction put it
     beyond = fused_cloud_points(frames(tilted, 1.0), voxel=0.1, depth_max=30.0)
     assert not (beyond[:, 2] > 30.0).any()  # the same depth uncorrected: beyond the cut
+
+
+def test_a_reader_reads_again_once_while_a_commit_is_applied(tmp_path: Path) -> None:
+    """A file can move from the staging folder into place between ``MapReader.path`` and the
+    read while an update applies its commit (a rebuild replaces most files): the reader reads once
+    more, and only then."""
+    from oh_my_slam.mapping import store
+
+    reader = object.__new__(store.MapReader)
+    reader.root = tmp_path
+    reader._overlay = set()
+    calls: list[int] = []
+
+    def flaky() -> int:
+        calls.append(1)
+        if len(calls) == 1:
+            raise FileNotFoundError("moved")
+        return 7
+
+    with pytest.raises(FileNotFoundError):
+        reader._again(flaky)  # no commit in progress: the error stands
+    (tmp_path / store.STAGING).mkdir()
+    (tmp_path / store.STAGING / store.COMMIT).write_text("{}")
+    calls.clear()
+    assert reader._again(flaky) == 7 and len(calls) == 2

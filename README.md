@@ -826,21 +826,26 @@ produces it. The `color=height` ramp is viridis.
 An update writes everything into `.staging/`, then records the list of staged files (the commit
 point), moves them into place, and writes `map.json` last. An update killed before the commit
 point leaves the map untouched. One killed after it is completed by the next update. Readers
-(`segment.sh -m`, `view.sh -m`) never lock or write. Do not edit files in `.staging/`.
+(`segment.sh -m`, `view.sh -m`) never lock or write. Do not edit files in `.staging/`. A reader
+that starts while an update applies its commit can read a mix of old and new files: it reads a
+file that vanishes in between once more, but it has no snapshot of the whole map, and a rebuild,
+which replaces most files, widens that window.
 
 ### Update semantics
 
 * **The order of addition is "latest".** A later update wins over an earlier one, and within one
   update a later keyframe wins over an earlier one, in input order (the order of the `-i` images;
-  a video's frame order). The specification requires a sequence mapped in one update or split
-  across several in the same order to give the same map. The update rules do: an object is
-  judged by the keyframes added after its last detection wherever the updates are cut, and
-  `office_sequence`'s cup, on the sill in the first photos and gone in the last ones, is absent
-  either way (one update, 6 + 7 and 4 + 4 + 5 photos), its place drawn from the photos that see
-  it empty. The maps are not yet the same: the objects keep their ids and labels, but a first
-  update of the four window photos alone poses them by multi-view on the trees behind the glass,
-  so objects near the camera (the wallet, the wine glass) get boxes up to 3 times longer, and a
-  few extra objects are confirmed (see *Scenery behind glass* under Known limitations). Where nothing changed, the
+  a video's frame order). A sequence mapped in one update or split across several in the same
+  order gives the same objects, labels and boxes, within the evaluator's stability targets (spec
+  §2.3 and §5; not to the centimetre: the threaded global mapper is not deterministic, and two
+  runs of one update differ too); only ids may differ, where an earlier update had already
+  published one, since a published id persists. An object is judged by the keyframes added
+  after its last detection wherever the updates are cut, and a map of photos with a keyframe SfM
+  did not pose is rebuilt with the next update's photos (see *Rebuilding a weakly posed map*
+  under Mapping, step 4): `office_sequence` in one update, 6 + 7 and 4 + 4 + 5 photos gives the
+  same 8 objects and labels, box centres 1-2 cm apart (median box IoU 0.63-0.73 against the
+  one-update map; a second one-update run: 0.81-0.93), 7 of the 8 ids, and no cup, its place
+  drawn from the photos that see it empty. Where nothing changed, the
   keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
   * The cloud's colours and object ids do not depend on keyframe order either.
@@ -1261,6 +1266,59 @@ pixels, so its results are unchanged.
      (as above) are posed by anchored MapAnything and refined with the matches and depth.
    * **Maps with fewer than 3 keyframes:** SfM is re-run over all keyframes and aligned to the
      stored poses.
+   * **Rebuilding a weakly posed map.** An update holds the stored keyframes fixed, so a pose SfM
+     did not give would be frozen for good: the four window photos of `office_sequence` mapped
+     first are posed by the multi-view fallback (no SfM scale, matches mostly on the trees behind
+     the glass, see Known limitations), and the 4 + 4 + 5 map kept boxes up to 3 times longer
+     near the camera, two extra objects and one window fewer than the one-update map.
+     * *When.* A map of photos (every update) with at most 60 keyframes, one of which SfM did not
+       pose (refined by feature matches, or holding fewer than 15 SfM points), is mapped again
+       with the new photos, as one update of them all. Not when the last update already rebuilt
+       it and left it rotation-dominant (a head turning in place: more photos from the same spot
+       give no parallax, and it would be rebuilt every time at a cost growing with the map);
+       `updates[].notes.restart_skipped` says why. A rebuild that would leave out any stored
+       keyframe is abandoned in the same update and the map is extended instead
+       (`notes.restart_abandoned`); one that succeeds is recorded in `notes.restarted`.
+     * *What it keeps.* The stored keyframes are mapped from what the map holds of them: their
+       images, depth and validity (pixels earlier updates retired stay retired, so an object
+       they removed does not come back), intrinsics, gravity, descriptors and detections — no
+       inference runs again — and the SfM database keeps their features and matches. Each keeps
+       the update that added it: latest wins judges the rebuild's verdicts update by update (an
+       object's strikes as those updates gave them), and the places of removed objects carry
+       over.
+     * *Ids.* An id the map published stays with its object. Each detection records the id it
+       was first published with (`instances.json → first_id`, never rewritten), and a rebuilt
+       object takes the ids of the stored detections it owns that were the first to carry
+       them (an id's founding detection): the published ones before a candidate's, then the
+       lowest. A published id whose founding detection the rebuild groups with an object that
+       keeps another published id goes instead to a rebuilt object that holds none, has a
+       compatible label and stands where the map last published it (their boxes overlap, or
+       their centres lie within the attribution gate, max(5 cm, 3 % of the viewing distance)).
+       Only when no such object exists does it resolve to the object that took its detection,
+       provisionally (`objects.json → rebuild_merged`): each rebuild decides again, so the id
+       returns to its founder when a later rebuild separates the objects; a map that stops
+       being rebuilt keeps its last provisional merges. The map's other merges (`merged_into`)
+       are permanent, and when the extension merges two objects the published id stays before a
+       lower candidate's. A published id that no object takes is listed in the update's
+       `objects.removed`, and one whose object is kept only as a candidate in
+       `objects.unpublished`; none vanishes unreported. Objects first seen by the new photos are
+       numbered on from the map's count, as an extension numbers them. So ids can differ from
+       the one-update map's where an earlier update had published one (spec §2.3). In
+       `office_sequence` split 4 + 4 + 5 the four window photos publish two windows, 9 and 22
+       (the one-update map numbers the second 21). Before the geometric rule, the next update's
+       rebuild could leave the second window's ids out of place for one update: in one run it
+       grouped both windows into one object (22 resolved to 9 meanwhile); in another it grouped
+       22's founding detection with window 9 and published the rest of the second window as 26.
+       Both runs ended with 22 on the second window (26 resolving to 22) after the third update.
+       With the rule, in three runs: 22 stayed on the second window after every update in one;
+       in another the second update's rebuild kept the second window as a candidate only (22
+       listed `unpublished`); in the third it mapped both windows as one object, so no object
+       stood apart for 22 and it resolved to 9 provisionally. After the third update 22 was on
+       the second window in all three.
+     * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
+       took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
+       (extending: 84 s; the whole sequence in one update: 158 s).
+     Maps posed by SfM, videos and larger maps are extended.
    * If no new keyframe overlaps the map, the command exits 5 and the map is unchanged.
 5. **Refinement.**
    1. Geometry is re-run for keyframes whose COLMAP focal length differs by more than 3 %.
@@ -1496,8 +1554,9 @@ runs it end to end as a test.
   13-photo map measures 8-25 cm (SfM of the four photos alone is no better: rotations 2.5-4.7°
   off, 15-37 points per photo). Objects near the camera, the cup and the wallet on the
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
-  longer; the whole sequence split as 4 + 4 + 5 or 6 + 7 photos keeps those longer boxes, so its
-  map differs from the one-update map near the camera (see Update semantics). In a map of the
+  longer. A later update rebuilds such a map with its photos (Mapping, step 4), so the whole
+  sequence split as 4 + 4 + 5 or 6 + 7 photos ends with the one-update map's objects, labels
+  and boxes (one window keeps a different id, see there). In a map of the
   whole sequence the global mapper's result varies from run to run for the same reason: in some
   runs the depth check (step 1 of *Weakly linked parts*) rejects photos whose SfM points are
   mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and their multi-view poses leave them

@@ -415,6 +415,8 @@ def _sill_place(res: Result) -> tuple[float, float, float]:
     return place, ring_, float((near & (h >= 0.012)).sum() / max(1, near.sum()))
 
 
+SILL_WALLET = Box(np.array([0.37, 0.13, 0.02]), np.array([0.05, 0.05, 0.04]), 0.0, (30, 60, 160),
+                  "wallet")
 SILL_VASE = Box(np.array([0.36, 0.04, 0.12]), np.array([0.04, 0.04, 0.24]), 0.0, (30, 160, 60),
                 "vase")
 # the latest two views: their depth of the cup's empty place (a factor each), and what else stands
@@ -424,8 +426,11 @@ SCENES = {
     "straddling": ([1.04, 0.96], []),
     # one sees the floor where it is, the other 12 % (8 cm) farther
     "one-farther": ([1.0, 1.12], []),
-    # a vase in front of the cup's place hides part of it from the latest views
+    # a vase in front of the cup's place hides part of it (up to 53 %) from the latest views
     "occluded": ([1.0, 1.0], [SILL_VASE]),
+    # a wallet beside the cup, lower than the depth noise: a witness that sees it a little in
+    # front of the floor still votes there (``geometry._witnessed``: occluded beyond 2x the noise)
+    "low-neighbour": ([1.0, 1.0], [SILL_WALLET]),
 }
 
 
@@ -437,16 +442,13 @@ def test_the_latest_views_fill_the_place_of_a_removed_cup_when_their_depth_disag
     (its witnesses), which agree only roughly about its empty place: one sees the floor there in
     front of the other (``straddling``), one sees much farther than the other, which sees the
     floor (``one-farther``), or a vase in front of the place hides part of it from them
-    (``occluded``: a witness that sees the vase says nothing about the floor behind it). The place
+    (``occluded``: a witness that sees the vase says nothing about the floor behind it, and the
+    witnesses judge the cup together by the parts each sees), or a wallet lower than the depth
+    noise stands beside it (``low-neighbour``). The place
     is the floor, drawn as densely as around it: no hole, and with straddling witnesses no
     second copy of the floor. The same holds in one update or in two, and the book beside the
     cup, which never changed, keeps its id, label and box."""
     factors, extra = SCENES[scene]
-    if scene == "occluded" and seed != 1:
-        # known limitation: with these poses the vase hides 51-53 % of the cup's samples from the
-        # latest view (a keyframe judges a place it sees at least VISIBLE_SHARE of), so only one
-        # keyframe judges the cup: a strike, and it stays
-        pytest.skip("the vase hides more than half of the place from the latest view")
     rng = np.random.default_rng(seed)
     with_cup, without = Room(boxes=[SILL_BOOK, *extra, SILL_CUP]), Room(boxes=[SILL_BOOK, *extra])
     early = shoot(with_cup, _along(4, -0.2, 0.2, rng))
