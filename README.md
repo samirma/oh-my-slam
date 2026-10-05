@@ -1223,8 +1223,12 @@ pixels, so its results are unchanged.
        rebuild could leave the second window's ids out of place for one update: in one run it
        grouped both windows into one object (22 resolved to 9 meanwhile); in another it grouped
        22's founding detection with window 9 and published the rest of the second window as 26.
-       Both runs ended with 22 on the second window (26 resolving to 22) after the third update;
-       with the rule, 22 stays on the second window after every update.
+       Both runs ended with 22 on the second window (26 resolving to 22) after the third update.
+       With the rule, in three runs: 22 stayed on the second window after every update in one;
+       in another the second update's rebuild kept the second window as a candidate only (22
+       listed `unpublished`); in the third it mapped both windows as one object, so no object
+       stood apart for 22 and it resolved to 9 provisionally. After the third update 22 was on
+       the second window in all three.
      * *Cost.* The rebuild re-poses and re-fuses every keyframe: office 4 + 4 + 5, updates 2 and 3
        took 18 s and 17 s (extending: 17 s each); ainex 40 + 39, update 2 took 127 s
        (extending: 84 s; the whole sequence in one update: 158 s).
