@@ -74,6 +74,19 @@ class Store {
 
   _events() {
     const es = new EventSource('/api/jobs/events');
+    // A stream that broke (service restarted, network) starts again from scratch: the events in
+    // between are lost, so the whole list is read again once it reopens.
+    let broken = false;
+    es.addEventListener('error', () => { broken = true; });
+    es.addEventListener('open', async () => {
+      if (!broken) return;
+      broken = false;
+      try {
+        const jobs = await getJson('/api/jobs');
+        for (const j of jobs) { this.jobs.set(j.id, j); this.emit('job', j); }
+        this.emit('jobs');
+      } catch { broken = true; }
+    });
     es.addEventListener('job', (e) => {
       const j = JSON.parse(e.data);
       this.jobs.set(j.id, j);

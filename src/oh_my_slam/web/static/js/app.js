@@ -47,7 +47,21 @@ function route() {
     main.append(notice('error', `This page failed: ${err.message}`));
   }
   document.body.dataset.page = page;
+  // a new page: its title, focus on its heading, and an announcement for screen readers
+  const h1 = main.querySelector('h1');
+  const title = h1 ? h1.textContent.trim() : 'oh-my-slam';
+  document.title = `${title} — oh-my-slam`;
+  const where = parts.join('/');
+  if (h1 && navigated && where !== lastPage) {
+    h1.tabIndex = -1;
+    h1.focus({ preventScroll: false });
+    document.getElementById('announce').textContent = `${title} page`;
+  }
+  lastPage = where;
+  navigated = true;
 }
+let navigated = false;  // the first page of a visit keeps the browser's own focus
+let lastPage = null;  // a change within a page (its query) keeps the focus where it is
 
 // ------------------------------------------------------------------------------------- the top bar
 function drawHealth() {

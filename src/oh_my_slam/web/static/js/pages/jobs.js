@@ -38,8 +38,8 @@ export function jobsPage(main) {
   const rows = new Map();
   const draw = (job) => {
     const old = rows.get(job.id);
-    if (old && old.dataset.state === job.state && old.contains(document.activeElement)) {
-      // keep the focused buttons; refresh the live cells only
+    if (old && old.dataset.state === job.state) {
+      // the same state: refresh the live cells only, so its buttons (and their focus) stay
       old.children[3].replaceChildren(stateBadge(job.state), TERMINAL.includes(job.state) ? '' : progressBar(job));
       old.children[5].replaceChildren(stagesList(job));
       return;

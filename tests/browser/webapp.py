@@ -46,18 +46,19 @@ def running_service(data: Path, **service_kw: Any) -> Iterator[tuple[Service, st
         thread.join(timeout=30)
 
 
-def axe_violations(page: Any, impacts: tuple[str, ...] = ("serious", "critical")) -> list[str]:
-    """Run the vendored axe-core on the page (WCAG 2.0/2.1 A and AA rules); the violations of
-    those impacts, one line each."""
-    if not page.evaluate("() => !!window.axe"):
-        page.add_script_tag(path=str(AXE))
+def axe_violations(page: Any) -> list[str]:
+    """Run the vendored axe-core on the page and its frames (the embedded viewer included), with
+    the WCAG 2.0 / 2.1 A and AA rules; every violation, whatever its impact, one line each."""
+    for frame in page.frames:
+        if frame.url.startswith("http") and not frame.evaluate("() => !!window.axe"):
+            frame.add_script_tag(path=str(AXE))
     result = page.evaluate("""async () => {
         const r = await axe.run(document, {
             runOnly: {type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']},
-            iframes: false,
+            iframes: true,
+            preload: false,  // its CSSOM preload resolves a frame's @import against the page: a false 404
         });
         return r.violations.map(v => ({id: v.id, impact: v.impact, help: v.help,
             nodes: v.nodes.slice(0, 5).map(n => n.target.join(' ') + ': ' + (n.failureSummary || ''))}));
     }""")
-    return [f"{v['id']} ({v['impact']}): {v['help']} — {v['nodes']}" for v in result
-            if v["impact"] in impacts]
+    return [f"{v['id']} ({v['impact']}): {v['help']} — {v['nodes']}" for v in result]

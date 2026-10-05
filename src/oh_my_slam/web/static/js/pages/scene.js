@@ -5,20 +5,24 @@
 // modules): the cloud with the attributes its PLY carries and the controls the file allows; each
 // object's OBB from its cuboid in its colour with its label and id; every camera of the JSON or of
 // a `mapper.sh locate` PLY header, with its coordinates and a go-to, located cameras drawn apart
-// from a map's frames. Both files share map coordinates; each layer has its toggle; the list of the
-// JSON's objects is linked to their boxes. An invalid PLY, a document that does not validate
-// against the scene schema, or a PLY above the display budget is refused with the reason.
+// from a map's frames. Both files share map coordinates; a single image's camera frame is shown
+// upright by the viewer's own display transform (/api/display-transform). Each layer has its
+// toggle; the list of the JSON's objects is linked to their boxes. The layers on, the point-cloud
+// controls and the selected object are in the URL. An invalid PLY, a document that does not
+// validate against the scene schema, or a disk PLY above the display budget is refused with the
+// reason (scene/files.js reads the files, in a worker).
 import * as THREE from 'three';
 import { el, clear, notice, fmtBytes } from '../dom.js';
+import { getJson } from '../api.js';
 import { Viewer } from '/static/viewer/lib/viewer.js';
-import { parsePly, plyHeader } from '/static/viewer/lib/ply.js';
 import { sceneObjects, obbCorners } from '/static/viewer/lib/obbs.js';
 import { sceneCameras, plyCameras, fillCameraTable } from '/static/viewer/lib/cameras.js';
 import { buildLayerControls, LAYERS } from '/static/viewer/lib/layers.js';
-import { buildAttributeControls, budgetNote, DISPLAY_POINT_BUDGET } from '/static/viewer/lib/controls.js';
+import { buildAttributeControls, budgetNote } from '/static/viewer/lib/controls.js';
 import { crowdedNote } from '/static/viewer/lib/labels.js';
-import { sceneErrors } from '../scene/openlabel.js';
+import { plyFromDisk, plyFromService, sceneFromBytes, fetchBuffer } from '../scene/files.js';
 import { Selection } from '../selection.js';
+import { urlSelection, setQuery, queryParams } from '../url.js';
 import { objectsTable } from '../jobview.js';
 import { clickToSelect } from '../pick.js';
 
@@ -51,24 +55,12 @@ function shownCloud(cloud, attrs) {
   return { header: { ...cloud.header, attrs: parts.join(',') }, arrays };
 }
 
-// A PLY file's bytes as { cloud, cameras, unlocated }, or throws why it cannot be shown.
-export function readPly(name, buffer) {
-  const h = plyHeader(buffer);
-  if (h.count > DISPLAY_POINT_BUDGET) {
-    throw new Error(`${name} has ${fmtN(h.count)} points, more than the viewer's display budget of `
-      + `${fmtN(DISPLAY_POINT_BUDGET)} points (view.sh, §2.5). A file opened here is drawn whole, so it is refused. `
-      + 'View that cloud as a map in its viewer (Maps) or as the viewer of a job, where the service shows a budgeted selection of its points.');
-  }
-  const cloud = parsePly(buffer);
+function plyEntry(name, cloud) {
   const { cameras, unlocated } = plyCameras(cloud.header.comments || []);
   return { name, cloud, cameras, unlocated };
 }
 
-// A scene document's text as { doc, objects, cameras }, or throws why it is refused.
-export async function readScene(name, text) {
-  let doc;
-  try { doc = JSON.parse(text); } catch (err) { throw new Error(`${name} is not JSON: ${err.message}`); }
-  const errors = await sceneErrors(doc);
+function sceneEntry(name, doc, errors) {
   if (errors.length) {
     const head = errors.slice(0, 8).join('; ');
     throw new Error(`${name} does not validate against the scene schema (ASAM OpenLABEL 1.0.0, spec §3): ${head}`
@@ -77,24 +69,44 @@ export async function readScene(name, text) {
   return { name, doc, objects: sceneObjects(doc), cameras: sceneCameras(doc) };
 }
 
+// The display transform of what is open: a scene in a single image's camera frame (no scene
+// coordinate system; or a PLY whose header names that frame) is shown upright, by the viewer's own
+// transform, asked of the service.
+async function displayTransform(state) {
+  const q = new URLSearchParams();
+  if (state.json) {
+    const ol = state.json.doc.openlabel;
+    const scene = Object.values(ol.coordinate_systems || {}).some((c) => c && c.type === 'scene_cs');
+    if (scene) return null;
+    q.set('camera', 'true');
+    const up = ol.metadata?.gravity?.up_cam;
+    if (Array.isArray(up) && up.length === 3 && up.every(Number.isFinite)) q.set('up', up.join(','));
+  } else if (state.ply) {
+    for (const c of state.ply.cloud.header.comments || []) if (!/^located_\d+ /.test(c)) q.append('comment', c);
+  } else return null;
+  const r = await getJson(`/api/display-transform?${q}`);
+  return r.camera_frame ? r.display_transform : null;
+}
+
 export function scenePage(main, { query }) {
-  const selection = new Selection();
+  const selection = urlSelection(new Selection());
   const state = { ply: null, json: null, attrs: {} };
   const errors = el('div', { class: 'scene-errors', 'aria-live': 'assertive', 'data-testid': 'scene-errors' });
   const file = el('input', { type: 'file', id: 'scene-files', multiple: true, accept: '.ply,.json,application/json' });
   const sources = el('ul', { class: 'sources', 'data-testid': 'sources' });
   const host = el('div', { class: 'scene-canvas' });
-  const empty = el('p', { class: 'scene-empty muted' }, 'Open a PLY file, a scene JSON, or both.');
+  const empty = el('p', { class: 'scene-empty' }, 'Open a PLY file, a scene JSON, or both.');
   const view = el('div', { class: 'scene-view', 'data-testid': 'scene-view' }, host, empty);
   const layersBox = el('div', { class: 'rows', id: 'scene-layers' });
   const labelsNote = el('p', { class: 'hint', 'aria-live': 'off', hidden: true });
   const cloudBox = el('div', { class: 'rows', id: 'scene-cloud' });
   const cloudNote = el('p', { class: 'hint' });
+  const frameNote = el('p', { class: 'hint' });
   const objectsBox = el('div', {});
   const camerasBody = el('tbody', {});
   const camNote = el('p', { class: 'hint' });
   const panel = el('aside', { class: 'scene-panel', 'aria-label': 'Scene' },
-    el('section', {}, el('h2', {}, 'Files'), sources),
+    el('section', {}, el('h2', {}, 'Files'), sources, frameNote),
     el('section', {}, el('h2', {}, 'Layers'), layersBox, labelsNote),
     el('section', {}, el('h2', {}, 'Point cloud'), cloudBox, cloudNote),
     el('section', {}, el('h2', {}, 'Objects'), objectsBox),
@@ -127,9 +139,10 @@ export function scenePage(main, { query }) {
       const s = state[kind];
       if (!s) continue;
       const rm = el('button', { type: 'button', class: 'icon', 'aria-label': `Close ${s.name}` }, '✕');
-      rm.addEventListener('click', () => { state[kind] = null; rebuild(); });
+      rm.addEventListener('click', () => { state[kind] = null; setQuery({ [kind]: null }); rebuild(); });
+      const h = s.cloud?.header;
       const what = kind === 'ply'
-        ? `${fmtN(s.cloud.header.count)} points; ${['color', 'normal', 'label'].filter((k) => s.cloud.arrays[k]).join(', ') || 'positions only'}${s.cameras.length ? `; ${s.cameras.length} located camera(s)` : ''}`
+        ? `${fmtN(h.count)}${h.count < h.total ? ` of ${fmtN(h.total)}` : ''} points; ${['color', 'normal', 'label'].filter((k) => s.cloud.arrays[k]).join(', ') || 'positions only'}${s.cameras.length ? `; ${s.cameras.length} located camera(s)` : ''}`
         : `${s.objects.length} objects, ${s.cameras.length} cameras`;
       sources.append(el('li', { 'data-kind': kind }, el('strong', {}, s.name), el('span', { class: 'muted' }, ` ${kind.toUpperCase()}: ${what}${s.size ? `, ${fmtBytes(s.size)}` : ''}`), rm));
     }
@@ -142,21 +155,44 @@ export function scenePage(main, { query }) {
     cloudNote.textContent = budgetNote(c.header) || `All ${fmtN(c.header.count)} points of ${state.ply.name}.`;
   }
 
-  function rebuild() {
+  const layersOn = (v) => Object.keys(v.layers).filter((k) => v.layers[k]).join(',');
+
+  let building = 0;
+  async function rebuild() {
+    const seq = ++building;
     drawSources();
-    clear(layersBox); clear(cloudBox); clear(objectsBox); clear(camerasBody);
     const any = state.ply || state.json;
+    let matrix = null;
+    if (any) {
+      try { matrix = await displayTransform(state); } catch (err) { errors.append(notice('error', `The display transform could not be read: ${err.message}`)); }
+      if (seq !== building) return;
+    }
+    clear(layersBox); clear(cloudBox); clear(objectsBox); clear(camerasBody);
     empty.hidden = !!any;
     view.dataset.loaded = any ? 'true' : 'false';
-    if (!any) { if (viewer) { viewer.setObjects([]); viewer.setCameras([]); viewer.groups.points.clear(); viewer.groups.segments.clear(); viewer.invalidate(); } return; }
+    if (!any) {
+      if (viewer) { viewer.setObjects([]); viewer.setCameras([]); viewer.groups.points.clear(); viewer.groups.segments.clear(); viewer.invalidate(); }
+      frameNote.textContent = '';
+      return;
+    }
     const v = ensureViewer();
+    v.setDisplayTransform(matrix || [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]);
+    view.dataset.upright = matrix ? 'true' : 'false';
+    frameNote.textContent = matrix
+      ? 'A single image\'s camera frame, shown upright as view.sh shows it.'
+      : 'Map coordinates (z up).';
     v.cloudBox.makeEmpty();
     v.setObjects(state.json ? state.json.objects : []);
+    const q = queryParams();
     if (state.ply) {
       const controls = plyControls(state.ply.cloud);
-      state.attrs = Object.fromEntries(controls.map((c) => [c.key, c.default]));
+      state.attrs = Object.fromEntries(controls.map((c) => {
+        const wanted = q.get(c.key);
+        const ok = wanted !== null && (c.kind === 'choice' ? c.options.includes(wanted) : ['on', 'off'].includes(wanted));
+        return [c.key, ok ? wanted : c.default];
+      }));
       applyCloud();
-      buildAttributeControls(cloudBox, controls, state.attrs, (k, val) => { state.attrs[k] = val; applyCloud(); });
+      buildAttributeControls(cloudBox, controls, state.attrs, (k, val) => { state.attrs[k] = val; setQuery({ [k]: val }); applyCloud(); });
       if (!controls.length) cloudBox.append(el('p', { class: 'hint' }, 'The file carries no colours or normals to choose from.'));
     } else {
       v.groups.points.clear(); v.groups.segments.clear(); v.cloud = null;
@@ -177,8 +213,10 @@ export function scenePage(main, { query }) {
     };
     const canSegment = !!(state.ply?.cloud.arrays.label && state.json?.objects.some((o) => o.rgb));
     const disabled = new Set(LAYERS.map(([k]) => k).filter((k) => !(k === 'segments' ? canSegment : source[k])));
-    for (const k of Object.keys(v.layers)) v.layers[k] = !disabled.has(k) && k !== 'segments';
-    buildLayerControls(layersBox, v.layers, (k, on) => v.setLayer(k, on), disabled);
+    const wanted = q.get('layers');
+    const on = wanted === null ? null : new Set(wanted.split(','));
+    for (const k of Object.keys(v.layers)) v.layers[k] = !disabled.has(k) && (on ? on.has(k) : k !== 'segments');
+    buildLayerControls(layersBox, v.layers, (k, isOn) => { v.setLayer(k, isOn); setQuery({ layers: layersOn(v) }); }, disabled);
     for (const row of layersBox.querySelectorAll('[data-layer]')) {
       const s = source[row.dataset.layer];
       row.append(el('small', { class: 'muted' }, s ? ` ${s}` : ' (nothing to show)'));
@@ -188,18 +226,24 @@ export function scenePage(main, { query }) {
     else objectsBox.append(el('p', { class: 'hint' }, 'No scene JSON: open one to list its objects.'));
     fillCameraTable(camerasBody, cams, (i) => v.goToCamera(i));
     const unlocated = state.ply?.unlocated || [];
-    camNote.textContent = (cams.length ? 'Camera centres in the files\' common frame (map coordinates), metres. Located cameras are dashed and marked "located".' : '')
+    camNote.textContent = (cams.length ? 'Camera centres in the files\' common frame, metres. Located cameras are dashed and marked "located".' : '')
       + (unlocated.length ? ` Not located: ${unlocated.join(', ')}.` : '');
+    v.select(selection.id);
     v.resize();
     v.resetView();
     v.invalidate();
     view.dataset.objects = String(v.objects.length);
+    view.dataset.built = String(seq);
   }
 
-  async function open(name, kind, getBuffer, size) {
+  // read one file: `kind` 'ply' | 'json'; `read` gives the cloud, or the JSON's bytes
+  async function open(name, kind, read, size) {
     try {
-      if (kind === 'ply') state.ply = { ...readPly(name, await getBuffer()), size };
-      else state.json = { ...(await readScene(name, new TextDecoder().decode(await getBuffer()))), size };
+      if (kind === 'ply') state.ply = { ...plyEntry(name, await read()), size };
+      else {
+        const { doc, errors: problems } = await sceneFromBytes(await read());
+        state.json = { ...sceneEntry(name, doc, problems), size };
+      }
       return true;
     } catch (err) {
       errors.append(notice('error', el('strong', {}, `${name} was refused. `), err.message));
@@ -213,12 +257,14 @@ export function scenePage(main, { query }) {
     clear(errors);
     const files = [...file.files];
     file.value = '';
+    empty.textContent = 'Reading…';
     for (const f of files) {
       const kind = kindOf(f.name, f.type);
       if (!kind) { errors.append(notice('error', el('strong', {}, `${f.name} was refused. `), 'Open a .ply point cloud or a .json scene description.')); continue; }
-      await open(f.name, kind, () => f.arrayBuffer(), f.size);
+      await open(f.name, kind, () => (kind === 'ply' ? plyFromDisk(f) : f.arrayBuffer()), f.size);
     }
-    history.replaceState(null, '', '#/scene');  // files from disk cannot come back on a reload
+    empty.textContent = 'Open a PLY file, a scene JSON, or both.';
+    setQuery({ ply: null, json: null });  // files from disk cannot come back on a reload
     rebuild();
   });
   for (const t of ['dragenter', 'dragover']) view.addEventListener(t, (e) => { e.preventDefault(); view.classList.add('over'); });
@@ -239,12 +285,9 @@ export function scenePage(main, { query }) {
     empty.textContent = 'Loading…';
     for (const [kind, url] of wanted) {
       if (!url.startsWith('/api/')) { errors.append(notice('error', `${url} is not a file of this service.`)); continue; }
-      const name = decodeURIComponent(url.split('/').pop());
-      await open(name === 'result' ? `${url.split('/').slice(-2, -1)[0]} result` : name, kind, async () => {
-        const r = await fetch(url);
-        if (!r.ok) throw new Error(`the service answered ${r.status}: ${(await r.text()).slice(0, 300)}`);
-        return r.arrayBuffer();
-      });
+      const last = decodeURIComponent(url.split('/').pop());
+      const name = last === 'result' ? `${url.split('/').slice(-2, -1)[0]} result` : last;
+      await open(name, kind, () => (kind === 'ply' ? plyFromService(url) : fetchBuffer(url)));
     }
     rebuild();
   })();

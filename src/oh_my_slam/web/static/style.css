@@ -158,7 +158,7 @@ table.data tr.selected, table.data tr.selected:hover { background: var(--row-sel
 .row-actions { white-space: nowrap; }
 
 /* ---- objects: a swatch always next to the id and label */
-.obj { display: inline-flex; gap: 0.35rem; align-items: center; }
+.obj-badge { display: inline-flex; gap: 0.35rem; align-items: center; }
 .swatch { display: inline-block; width: 0.9rem; height: 0.9rem; border-radius: 3px; border: 1px solid #0008; flex: none; }
 .obj-id { font-weight: 600; font-variant-numeric: tabular-nums; }
 
@@ -249,3 +249,8 @@ dialog h2 { margin-top: 0; }
   fieldset.attrs .attr { grid-template-columns: 6rem 1fr; }
   fieldset.attrs .attr .help { grid-column: 1 / -1; }
 }
+
+/* ---- map update history: one card per update, every figure it records */
+.history { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+.history h3 { margin: 0 0 0.3rem; }
+.result-image { max-width: 100%; height: auto; display: block; border-radius: 6px; }

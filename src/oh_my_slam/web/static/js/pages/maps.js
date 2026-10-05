@@ -3,29 +3,40 @@
 // viewer, the map's objects, its update history with timings, and every export the commands offer
 // for a map: one generated form per operation that takes a map (the mode that writes maps is the
 // guided update flow; a mode whose output is the browser is the embedded viewer itself).
-import { el, clear, notice, fmtTime, fmtSeconds, humanize, objectBadge } from '../dom.js';
+import { el, clear, notice, fmtSeconds, humanize, objectBadge } from '../dom.js';
 import { getJson, enc } from '../api.js';
 import { store } from '../store.js';
 import { opCard } from '../opcard.js';
 import { Selection } from '../selection.js';
+import { urlSelection, setQuery } from '../url.js';
 import { embeddedViewer } from '../embed.js';
 import { objectsTable } from '../jobview.js';
 import { sceneObjects } from '/static/viewer/lib/obbs.js';
 
 const HIDDEN = new Set(['name', 'path', 'thumbnail', 'meta']);
 
-function figure(k, v) {
-  if (v && typeof v === 'object') {
-    return Object.entries(v).filter(([, x]) => x !== null && typeof x !== 'object')
-      .map(([kk, x]) => [`${humanize(k)} ${humanize(kk)}`, kk === 'at' && typeof x === 'number' ? fmtTime(x) : kk.endsWith('_s') ? fmtSeconds(x) : String(x)]);
+// A record's figures, flattened: nested objects give "parent child" names, a list gives its length
+// (or its values when they are a few scalars), and a name ending in _s is a duration in seconds.
+function figure(k, v, depth = 0) {
+  if (v === null || v === undefined) return [];
+  if (Array.isArray(v)) {
+    const scalars = v.every((x) => x === null || typeof x !== 'object');
+    return [[humanize(k), scalars && v.length <= 4 ? v.join(', ') : `${v.length} item${v.length === 1 ? '' : 's'}`]];
   }
-  return [[humanize(k), typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(3) : String(v)]];
+  if (typeof v === 'object') {
+    if (depth > 3) return [];
+    return Object.entries(v).flatMap(([kk, x]) => figure(`${k} ${kk}`, x, depth + 1));
+  }
+  if (typeof v === 'number') {
+    return [[humanize(k), /_s$/.test(k) ? fmtSeconds(v) : Number.isInteger(v) ? String(v) : v.toFixed(3)]];
+  }
+  return [[humanize(k), String(v)]];
 }
 
 // the summary figures of a map: every field of its summary, as the service reads it from map.json
 export function figures(summary) {
   const out = [];
-  for (const [k, v] of Object.entries(summary)) if (!HIDDEN.has(k) && v !== null && v !== undefined) out.push(...figure(k, v));
+  for (const [k, v] of Object.entries(summary)) if (!HIDDEN.has(k)) out.push(...figure(k, v));
   return out;
 }
 
@@ -55,7 +66,7 @@ export function mapsPage(main, { filter }) {
         el('a', { href: `#/maps/${enc(m.name)}`, class: 'card-link' }, thumb, el('h2', {}, m.name)), figureList(m)));
     }
     count.textContent = maps.length ? `${shown.length} of ${maps.length} maps` : 'No maps yet: create one with New map.';
-    history.replaceState(null, '', q ? `#/maps?filter=${enc(input.value.trim())}` : '#/maps');
+    setQuery({ filter: input.value.trim() });
   };
   input.addEventListener('input', draw);
   getJson('/api/maps').then((m) => { maps = m; grid.setAttribute('aria-busy', 'false'); draw(); })
@@ -63,26 +74,17 @@ export function mapsPage(main, { filter }) {
   return null;
 }
 
-function historyTable(updates) {
+// The map's update history (map.json's list of updates, latest last): each update record with every
+// figure it holds, its per-stage timings included, whatever fields the mapper records.
+function historyList(updates) {
   if (!updates || !updates.length) return el('p', { class: 'muted' }, 'No update recorded.');
-  const stageNames = [];
-  for (const u of updates) for (const k of Object.keys(u.timings?.stages_s || {})) if (!stageNames.includes(k)) stageNames.push(k);
-  const rows = updates.map((u, i) => el('tr', {},
-    el('th', { scope: 'row' }, String(u.id ?? i + 1)),
-    el('td', {}, typeof u.at === 'number' ? fmtTime(u.at) : String(u.at ?? '')),
-    el('td', {}, String(u.kind ?? '')),
-    el('td', { class: 'num' }, String((u.inputs || []).length || '')),
-    el('td', { class: 'num' }, String((u.frames_added || []).length)),
-    el('td', { class: 'num' }, fmtSeconds(u.timings?.total_s)),
-    el('td', {}, el('ul', { class: 'stages' }, ...Object.entries(u.timings?.stages_s || {}).map(([k, s]) => el('li', {}, el('span', { class: 'stage-name' }, k), ' ', fmtSeconds(s)))))));
-  return el('div', { class: 'table-wrap' }, el('table', { class: 'data', 'data-testid': 'history' },
-    el('caption', {}, 'Update history (latest last), with each update\'s per-stage timings'),
-    el('thead', {}, el('tr', {}, ...['update', 'at', 'kind', 'inputs', 'frames added', 'total', 'stages'].map((h) => el('th', { scope: 'col' }, h)))),
-    el('tbody', {}, ...rows)));
+  return el('ol', { class: 'history', 'data-testid': 'history' }, ...updates.map((u, i) => el('li', { class: 'card' },
+    el('h3', {}, `Update ${i + 1}`),
+    el('dl', { class: 'figures' }, ...figures(u).map(([k, v]) => el('div', {}, el('dt', {}, k), el('dd', {}, v)))))));
 }
 
 export function mapPage(main, { name }) {
-  const selection = new Selection();
+  const selection = urlSelection(new Selection());
   const head = el('div', { class: 'page-head' }, el('h1', {}, `Map ${name}`));
   const summary = el('div', {});
   const objectsBox = el('section', { 'aria-labelledby': 'objects-h' }, el('h2', { id: 'objects-h' }, 'Objects'));
@@ -106,7 +108,7 @@ export function mapPage(main, { name }) {
   }
   getJson(`/api/maps/${enc(name)}`).then((m) => {
     summary.append(figureList(m));
-    historyBox.append(historyTable(m.meta?.updates));
+    historyBox.append(historyList(m.meta?.updates));
   }).catch((err) => summary.append(notice('error', err.message)));
   getJson(`/api/maps/${enc(name)}/viewer/api/scene`).then((doc) => {
     objectsBox.append(objectsTable(sceneObjects(doc), `The objects of ${name}`, selection));

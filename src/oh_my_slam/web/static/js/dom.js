@@ -31,11 +31,16 @@ export function fmtBytes(n) {
 export function humanize(name) { return String(name).replaceAll('_', ' '); }
 
 // A colour swatch that always comes with the object's id and label (colour is never the only cue).
+// (Its class names stay clear of the viewer's label layer, lib/labels.css: .obj-label is a
+// positioned 3D label there.)
 export function objectBadge(id, label, hex) {
-  return el('span', { class: 'obj' },
-    el('span', { class: 'swatch', style: hex ? `background:${hex}` : null, 'aria-hidden': 'true' }),
-    el('span', { class: 'obj-id' }, String(id)), label ? el('span', { class: 'obj-label' }, label) : '');
+  return el('span', { class: 'obj-badge' },
+    el('span', { class: 'swatch', style: hexColor(hex) ? `background:${hex}` : null, 'aria-hidden': 'true' }),
+    el('span', { class: 'obj-id' }, String(id)), label ? el('span', { class: 'obj-name' }, label) : '');
 }
+
+// `hex` when it is an sRGB colour #rrggbb (the only form put in a style attribute), else null.
+export function hexColor(hex) { return typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex : null; }
 
 // A status message area: kind is 'error' | 'info' | 'warn'.
 export function notice(kind, ...children) {

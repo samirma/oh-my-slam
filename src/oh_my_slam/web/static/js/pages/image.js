@@ -8,6 +8,7 @@ import { store, blockedReason } from '../store.js';
 import { OpForm } from '../form.js';
 import { renderJob } from '../jobview.js';
 import { consequence } from '../opcard.js';
+import { setQuery } from '../url.js';
 
 // The image input as a drop zone with a preview; the form's field for the image parameter.
 class DropImage {
@@ -25,12 +26,20 @@ class DropImage {
     this.err = el('div', { class: 'field-error', id: 'image-err', 'aria-live': 'polite' });
     this.zone = el('div', { class: 'dropzone big', 'data-testid': 'dropzone' },
       el('p', {}, 'Drop an image here, or'), this.button, this.input,
-      el('p', { class: 'help', id: 'image-help' }, el('code', {}, p.flag), ` ${p.help}. Accepted: ${(p.accepts || []).join(' ')}`),
+      this.helpEl = el('p', { class: 'help', id: 'image-help' }),
       this.preview, this.status);
     for (const t of ['dragenter', 'dragover']) this.zone.addEventListener(t, (e) => { e.preventDefault(); this.zone.classList.add('over'); });
     for (const t of ['dragleave', 'drop']) this.zone.addEventListener(t, () => this.zone.classList.remove('over'));
     this.zone.addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) this.take(f); });
     this.el = el('div', { class: 'field', 'data-param': p.name }, this.zone, this.err);
+  }
+
+  // the image parameter of the chosen mode: its accepted types and help
+  setParam(p) {
+    this.p = p;
+    const accept = (p.accepts || []).join(',');
+    if (accept) this.input.setAttribute('accept', accept); else this.input.removeAttribute('accept');
+    this.helpEl.replaceChildren(el('code', {}, p.flag), ` ${p.help}.${accept ? ` Accepted: ${(p.accepts || []).join(' ')}` : ''}`);
   }
 
   take(file) {
@@ -101,13 +110,12 @@ export function imagePage(main, { job, op: wanted }) {
 
   function choose(o) {
     op = o;
-    drop.p = o.singleImage;
+    drop.setParam(o.singleImage);
     form?.root.remove();
     form = new OpForm(formBox, o, { omit: [o.singleImage.name], external: { [o.singleImage.name]: drop }, viewer: o.viewerQuery });
     what.textContent = consequence(o) + (o.viewerQuery ? ' It also prepares the viewer of this image.' : '');
     submit.textContent = `Run ${o.label}`;
-    const q = new URLSearchParams({ op: o.id });
-    history.replaceState(null, '', `#/image${job ? `/${job}` : ''}?${q}`);
+    setQuery({ op: o.id });
     refreshBlocked();
     if (drop.value()) form.changed();
   }

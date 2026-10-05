@@ -13,13 +13,6 @@ const VALIDATE_DEBOUNCE_MS = 250;
 
 function suffix(name) { const m = /\.[^./\\]+$/.exec(name); return m ? m[0].toLowerCase() : ''; }
 
-// The suffixes of a video: those an images-or-video input takes beyond any single-image input's.
-function videoSuffixes(p) {
-  const images = new Set();
-  for (const op of store.ops.values()) for (const q of op.ofKind('image')) for (const s of q.accepts || []) images.add(s);
-  return new Set((p.accepts || []).filter((s) => !images.has(s)));
-}
-
 function defaultText(p) {
   if (p.default === null || p.default === undefined || p.kind === 'attrs') return null;
   if (p.kind === 'flag') return p.default ? 'on' : 'off';
@@ -292,12 +285,22 @@ export class FilesField extends Field {
       this.list, this.help(), this.err);
   }
 
+  // Files expected again (a re-submission): listed in their order, each filled in place by the
+  // file of the same name, so the order stays the previous one.
+  expect(names) {
+    this.removeAll();
+    this.items = names.map((name) => ({ name, state: 'needed' }));
+    this.render();
+  }
+
   addFiles(files) {
     if (!files.length) return;
-    if (!this.multiple) { this.removeAll(); files = files.slice(0, 1); }
+    const needed = (f) => this.items.find((x) => x.state === 'needed' && x.name === f.name);
+    if (!this.multiple && !needed(files[0])) { this.removeAll(); files = files.slice(0, 1); }
     for (const f of files) {
-      const it = { name: f.name, file: f, size: f.size, state: 'uploading', progress: 0 };
-      this.items.push(it);
+      let it = needed(f);
+      if (it) Object.assign(it, { file: f, size: f.size, state: 'uploading', progress: 0 });
+      else { it = { name: f.name, file: f, size: f.size, state: 'uploading', progress: 0 }; this.items.push(it); }
       it.promise = upload(f, (x) => { it.progress = x; this.renderItem(it); })
         .then((u) => { it.upload = u; it.path = u.path; it.state = 'ready'; })
         .catch((err) => { it.state = 'failed'; it.error = err.message; })
@@ -334,6 +337,7 @@ export class FilesField extends Field {
     if (it.state === 'uploading') return `uploading ${Math.round(it.progress * 100)} %`;
     if (it.state === 'failed') return `upload failed: ${it.error}`;
     if (it.state === 'path') return 'workspace path';
+    if (it.state === 'needed') return 'choose this file again';
     return `uploaded${it.size != null ? `, ${fmtBytes(it.size)}` : ''}`;
   }
 
@@ -359,6 +363,8 @@ export class FilesField extends Field {
   }
 
   pending() { return this.items.some((it) => it.state === 'uploading'); }
+  missing() { return this.items.filter((it) => it.state === 'needed').map((it) => it.name); }
+  settled() { return Promise.all(this.items.map((it) => it.promise).filter(Boolean)); }
   names() { return this.items.map((it) => it.name); }
 
   value() {
@@ -449,9 +455,8 @@ export class OpForm {
       if (w.in) return w.in.includes(this.current(w.option));
       if (w.is === 'given') { const v = this.current(w.option); return v !== undefined && v !== null && v !== '' && v !== false; }
       if (w.is === 'video') {
-        const names = this.names(w.option);
-        const op = this.op.param(w.option);
-        return names.length === 1 && videoSuffixes(op || {}).has(suffix(names[0]));
+        const names = this.names(w.option);  // the suffixes of a video come with the condition
+        return names.length === 1 && (w.suffixes || []).includes(suffix(names[0]));
       }
       return true;
     });

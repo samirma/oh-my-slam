@@ -529,6 +529,8 @@ option.
 | `/api/jobs/<id>/log` | The job's stderr log. |
 | `/api/jobs/<id>/timings` | The job's timings. |
 | `/api/jobs/<id>/viewer/<path>` | The job's saved viewer. |
+| `/api/jobs/<id>/display-cloud[?file=<path>]` | A job's PLY as the viewer draws it, within the display budget (3D scene viewer). |
+| `GET /api/display-transform` | The viewer's display transform of a scene (`camera`, `comment`, `up`). |
 
 **Web application** (spec §2.6 "Web application"). `/` serves a browser application in
 `web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
@@ -539,8 +541,11 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
 * **Rendered from the API description.** The operations, their parameters and their outputs are
   read from `/api/openapi.json` (each one's `x-oms` registry entry). Nothing in the app names a
   command or an option (a unit test checks this). A new option becomes a new field, a new mode a
-  new form, a new output file a new download, and a new error a new message; a browser test adds
-  all of these to the registry and finds them in the pages.
+  new form (on the page its inputs belong to), an option of a kind the app does not know a text
+  field, a new output file a new download, and a new error a new message; a browser test adds all
+  of these to the registry and finds them in the pages. Output entries say how to render a file
+  (`object_regions`: an image painted in the objects' colours), and a video condition carries the
+  suffixes of a video.
 * **Forms** have one field per parameter, chosen by its kind:
   * path inputs get a drop zone and file picker that upload at once, or take a workspace path;
     ordered inputs (`mapper.sh update -i`) are numbered and can be reordered;
@@ -552,18 +557,21 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
   Each field shows its flag, help and default. Fields whose `applies` condition fails are hidden
   and not sent. Each change is checked by `POST /api/ops/<op>/validate`, and each message appears
   next to the field it names (`by_parameter`), with the command line the job will run.
-* **Pages.** Each has a stable hash URL, so a reload or a shared link returns to the same state:
+* **Pages.** Each has a stable hash URL, so a reload or a shared link returns to the same state
+  (the selected object is `?sel=<id>`). A new page moves the focus to its heading and is announced:
   * `#/image` (`?op=` picks the mode, `/<job>` shows its job): a mode that takes one image, a
     drop zone with a preview, the form, then the job's progress and result.
   * `#/maps`, `#/maps/new`, `#/maps/<name>`, `#/maps/<name>/update`. A map's page has the
-    embedded viewer, the objects (from the map viewer's `api/scene`), the update history with
-    per-stage timings (`map.json → updates[]`), and one form per operation that takes a map.
+    embedded viewer, the objects (from the map viewer's `api/scene`), the update history (each
+    record of `map.json → updates[]` with every figure it holds, per-stage timings included), and
+    one form per operation that takes a map.
   * `#/jobs` and `#/jobs/<id>`: the job list and a single job.
-  * `#/scene?ply=<url>&json=<url>`: the 3D scene viewer.
+  * `#/scene?ply=<url>&json=<url>`: the 3D scene viewer (also `layers=`, `color=`, `normals=`).
 * **Top bar.** Workspace name, inference-server status (with `start_command` when it is down),
   and the number of queued and running jobs, kept current by `/api/jobs/events`.
-* **Results.** Every file a job wrote can be downloaded. Images are drawn: in `segmented.png`, the
-  object under a pixel is the one whose colour that pixel has (colour contract). CSV files are
+* **Results.** Every file a job wrote can be downloaded. Images are drawn; in one the API marks
+  with `object_regions` (`segmented.png`), the object under a pixel is the one whose colour that
+  pixel has (colour contract). CSV files are
   tables, and a scene JSON's objects are listed. A `.ply` or scene `.json` opens in the 3D scene
   viewer. A single-image job is submitted with `?viewer=true` where the operation offers it, and
   its `viewer_error` (including `cancelled`) is shown above the result, which still stands.
@@ -575,7 +583,7 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
 * **Jobs.** A cancel first says what it does: the command is interrupted as Ctrl-C would, there is
   no result, a map update leaves the map as it was, and the uploads are deleted. Re-submit runs
   the same options again, and asks for the files again when the inputs were uploads (deleted when
-  the job ended). Starting a map creation or update states its consequence in a confirmation.
+  the job ended): they are listed in their previous order, and each file chosen takes its place. Starting a map creation or update states its consequence in a confirmation.
 * **Inference server down.** Actions of a mode that always needs the server are disabled, with
   the reason and the start command. A conditional need (`mapper.sh locate` on a large map) is
   decided by the service's own check when the form is validated. Everything else stays available.
@@ -583,23 +591,32 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
   Files from disk are read in the browser and never uploaded. Both files are drawn in the same map
   coordinates by the viewer's own modules (`Viewer`, `parsePly`, `sceneObjects`, `sceneCameras`,
   `plyCameras`, layers, labels, the camera table with *Go to*). Each layer toggle names its file.
+  A scene in a single image's camera frame (no `scene_cs`, or a PLY whose header names that frame)
+  is shown upright with the viewer's own transform, from `GET /api/display-transform` (view.sh -i's
+  `upright_transform`, with the scene's estimated up direction). Files are parsed and validated in
+  a Web Worker, and a PLY's header is read first (the first bytes of a disk file, a `Range`
+  request for a job's).
   * The point-cloud controls offer what the file allows: its colours or none, and shading by its
     normals. The segmentation layer is available when the PLY has labels and the JSON has colours.
   * A file that is not a PLY the viewer can draw is refused with the parser's reason.
   * A JSON that fails the vendored OpenLABEL schema is refused with the reasons. The app checks it
     with its own draft-07 validator (`js/scene/jsonschema.js`, kept in agreement with `jsonschema`
     by a browser test), plus the checks of `schema/validate.py`.
-  * A PLY with more than 16,000,000 points is refused, because the viewer would draw it whole
-    above its display budget (§2.5). The refusal says to view the cloud as a map or as a job's
-    viewer, where the service shows a budgeted selection of its points.
+  * A PLY from disk with more than 16,000,000 points is refused, because the browser would draw
+    it whole above the display budget (§2.5); the refusal says to view it as a map or as a job's
+    file. A job's PLY above the budget is drawn from `GET /api/jobs/<id>/display-cloud[?file=]`:
+    the viewer's cloud document of the file, thinned by the shared voxel-grid selection
+    (`segmentation.cloud.thin_cloud`, each kept point with exactly its values), with the file's
+    header comments (its located cameras).
 * **Accessibility and layout.**
   * Everything is reachable from the keyboard, focus is always visible, and every control has a
     label. Object colours always appear with their id or label.
   * Light and dark themes follow the system and meet WCAG 2.1 AA contrast. Object colours are the
     colour contract's in both themes.
   * Pages work from desktop down to tablet width (768 px).
-  * The browser tests run the vendored axe-core (`tests/browser/vendor/`) on every page in both
-    themes and at both widths, and fail on any serious or critical violation.
+  * The browser tests run the vendored axe-core (`tests/browser/vendor/`) on every page, its
+    embedded viewer included, in both themes and at both widths, and fail on any violation of the
+    WCAG 2.0/2.1 A and AA rules.
 
 ## Point-cloud attributes
 

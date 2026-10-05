@@ -22,7 +22,8 @@ export function loadSchema() {
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
-const isInt = (v) => Number.isInteger(v);
+// Python's isinstance(v, int), which a bool passes (bool is an int there); its value as a number
+const isInt = (v) => Number.isInteger(v) || typeof v === 'boolean';
 
 function checkQuat(q, where, errors) {
   if (!(Array.isArray(q) && q.length === 4 && q.every(isNum))) { errors.push(`${where}: quaternion must be 4 numbers`); return; }
@@ -61,15 +62,23 @@ export function extraErrors(doc) {
   if (intervals !== undefined && intervals !== null) {
     if (!Array.isArray(intervals)) errors.push('frame_intervals must be a list');
     else {
+      // The intervals must cover exactly the frame keys. They are never enumerated beyond the
+      // number of frames: a range longer than that cannot match, whatever its size (a document
+      // claiming billions of frames is refused at once, not counted).
+      const keys = frames != null ? new Set(Object.keys(frames).map(Number)) : null;
       const covered = new Set();
+      let tooMany = false;
       intervals.forEach((fi, i) => {
-        const s = (fi || {}).frame_start, e = (fi || {}).frame_end;
+        let s = (fi || {}).frame_start, e = (fi || {}).frame_end;
         if (!(isInt(s) && isInt(e) && s <= e)) { errors.push(`frame_intervals[${i}]: needs integer frame_start <= frame_end`); return; }
+        s = Number(s); e = Number(e);
+        if (!keys || tooMany) return;
+        if (e - s + 1 > keys.size) { tooMany = true; return; }
         for (let k = s; k <= e; k++) covered.add(k);
+        if (covered.size > keys.size) tooMany = true;
       });
-      if (frames != null) {
-        const keys = new Set(Object.keys(frames).map(Number));
-        if (keys.size !== covered.size || [...keys].some((k) => !covered.has(k))) errors.push('frame_intervals do not match the frame keys');
+      if (keys && (tooMany || keys.size !== covered.size || [...keys].some((k) => !covered.has(k)))) {
+        errors.push('frame_intervals do not match the frame keys');
       }
     }
   } else if (frames && Object.keys(frames).length) {
@@ -100,9 +109,18 @@ export function extraErrors(doc) {
   return errors;
 }
 
+// The problems of `doc`: { schema: [{path, message}], extra: [text] }; `extra` is null when the
+// checks beyond the schema cannot read the document (its shape is wrong: the schema says why).
+export async function sceneProblems(doc) {
+  const schema = validate(await loadSchema(), doc);
+  let extra;
+  try { extra = extraErrors(doc); } catch { extra = null; }
+  return { schema, extra };
+}
+
 // Every problem of `doc` as text (empty: a valid scene description).
 export async function sceneErrors(doc) {
-  const schema = await loadSchema();
-  const fromSchema = validate(schema, doc).map((e) => `schema: ${e.path || '<root>'}: ${e.message}`);
-  return [...fromSchema, ...extraErrors(doc)];
+  const p = await sceneProblems(doc);
+  const extra = p.extra ?? (p.schema.length ? [] : ['the document cannot be read as a scene description']);
+  return [...p.schema.map((e) => `schema: ${e.path || '<root>'}: ${e.message}`), ...extra];
 }

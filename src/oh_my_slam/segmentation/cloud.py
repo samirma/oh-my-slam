@@ -225,6 +225,24 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     return ThinnedCloud(cloud, total, edge)
 
 
+def thin_cloud(cloud: PointCloud, max_points: int) -> ThinnedCloud:
+    """A cloud already derived (e.g. read from a PLY file the commands wrote) within the display
+    budget, by the selection ``derive_thinned`` makes: with more than ``max_points`` points, the
+    first point of each occupied voxel of the smallest edge whose grid has at most ``max_points``
+    of them (``budget_voxel_indices``). Each kept point keeps exactly its values (position,
+    colour, label, normal)."""
+    total = len(cloud)
+    if total <= max_points:
+        return ThinnedCloud(cloud, total, 0.0)
+    keep, edge = budget_voxel_indices(cloud.xyz, max_points)
+
+    def pick(a: NDArray[Any] | None) -> NDArray[Any] | None:
+        return None if a is None else a[keep]
+
+    thinned = PointCloud(cloud.xyz[keep], pick(cloud.rgb), pick(cloud.label), pick(cloud.normals))
+    return ThinnedCloud(thinned, total, edge)
+
+
 def _position_key(attrs: CloudAttrs) -> CloudAttrs:
     """``attrs`` with what does not move or drop points (colour, normals, PLY-only keys) reset."""
     return replace(attrs, color="rgb", normals=False, label=False, encoding="binary")

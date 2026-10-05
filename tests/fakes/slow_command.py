@@ -34,6 +34,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--ignore-sigint", action="store_true")
     ap.add_argument("-m", dest="map")
     ap.add_argument("-d", dest="folder")
+    ap.add_argument("-i", dest="image")
+    ap.add_argument("--mood")
     args = ap.parse_args(argv)
     if args.ignore_sigint:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -62,6 +64,34 @@ def registry_program() -> object:
                     default=False),
     ), (mode,))
     return spec.Program("slow.sh", "sleep", (cmd,))
+
+
+MOOD = "mood"  # an option kind the web application has never seen
+NAP_LIMIT = "--seconds must be at most 100 for a nap over an image"
+
+
+def image_registry_program() -> object:
+    """``nap.sh -i IMAGE [--seconds S] [--code N] [--mood M]`` (run by this module): a mode
+    that takes a single image,
+    with an option of a kind no command has (``MOOD``) and a rule with its own message
+    (``NAP_LIMIT``); never inference."""
+    from oh_my_slam.commands import spec
+
+    def nap(ctx: spec.Context) -> None:
+        if (ctx.args.seconds or 0) > 100:
+            raise UsageError(NAP_LIMIT)
+
+    mode = spec.Mode(None, None, (spec.Rule("nap_limit", ("seconds",), "a nap lasts 100 s at most",
+                                            nap),),
+                     "never", "needs nothing", (Stage.SETUP,), ())
+    cmd = spec.Command("nap.sh", None, "sleep over an image", (
+        spec.Option("-i", "image", spec.Kind.IMAGE, "the image to sleep over", required=True,
+                    must_exist=True),
+        spec.Option("--seconds", "seconds", spec.Kind.NUMBER, "how long", type=float),
+        spec.Option("--code", "code", spec.Kind.NUMBER, "the exit status", type=int),
+        spec.Option("--mood", "mood", MOOD, "how the nap feels"),  # type: ignore[arg-type]
+    ), (mode,))
+    return spec.Program("nap.sh", "sleep over an image", (cmd,))
 
 
 def map_registry_program() -> object:

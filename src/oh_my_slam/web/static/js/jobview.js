@@ -8,6 +8,7 @@ import { getJson, enc } from './api.js';
 import { store, PATH_IN } from './store.js';
 import { actionButtons, TERMINAL } from './jobactions.js';
 import { Selection, linkRows } from './selection.js';
+import { urlSelection } from './url.js';
 import { segmentedImage } from './segimage.js';
 import { embeddedViewer } from './embed.js';
 import { sceneObjects } from '/static/viewer/lib/obbs.js';
@@ -137,9 +138,15 @@ async function renderResult(box, job, selection) {
     if (!objects.length) objects = t.objects;
     tables.push(t.el);
   }
+  // an image whose output the API marks as painted in the objects' colours has per-object regions
+  const outputs = store.ops.get(job.operation)?.x.outputs || [];
+  const regions = (name) => outputs.some((o) => o.object_regions && o.name === name.split('/').pop());
   for (const e of entries.filter((x) => x.kind === 'image')) {
+    const out = outputs.find((o) => o.name === e.name.split('/').pop());
     rendered.append(el('div', { class: 'card' }, el('h3', {}, e.name),
-      segmentedImage(e.url, objects, selection, `${e.name}: each object painted in its colour`)));
+      regions(e.name)
+        ? segmentedImage(e.url, objects, selection, `${e.name}: ${out.text}`)
+        : el('img', { src: e.url, alt: out ? `${e.name}: ${out.text}` : e.name, class: 'result-image' })));
   }
   if (!tables.length && sceneDoc) tables.push(objectsTable(objects, 'Objects of the scene', selection));
   for (const t of tables) rendered.append(el('div', { class: 'card wide' }, t));
@@ -165,7 +172,7 @@ async function renderResult(box, job, selection) {
 
 // The job's live view into `container`; returns a function that stops it.
 export function renderJob(container, jobId, { heading = 'h2', compact = false } = {}) {
-  const selection = new Selection();
+  const selection = urlSelection(new Selection());
   const head = el('div', { class: 'job-head' });
   const body = el('div', { class: 'job-body' });
   const result = el('div', { class: 'job-result', 'data-testid': 'result' });

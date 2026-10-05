@@ -2,7 +2,7 @@
 // consequence first; a re-submission runs the same options again and asks for an uploaded input
 // again, since uploads are deleted when their job ends.
 import { el } from './dom.js';
-import { postJson, upload, enc } from './api.js';
+import { postJson, enc } from './api.js';
 import { store, PATH_IN, blockedReason } from './store.js';
 import { confirmAction, askFiles } from './dialog.js';
 
@@ -32,19 +32,13 @@ export async function resubmitJob(job) {
   const gone = discardedUploads(job);
   const override = {};
   if (gone.length) {
-    const files = await askFiles({
+    const values = await askFiles({
       title: `Re-submit job ${job.id}`,
-      body: 'The uploaded inputs of this job were deleted when it ended. Choose the files again; every other option stays as it was.',
-      params: gone.map((p) => ({ ...p, was: [].concat(job.params[p.name]).map((v) => String(v).split('/').pop()).join(', ') })),
+      body: 'The uploaded inputs of this job were deleted when it ended. Choose the files again (listed in their previous order); every other option stays as it was.',
+      params: gone.map((p) => ({ ...p, previous: [].concat(job.params[p.name]).map((v) => String(v).split('/').pop()) })),
     });
-    if (!files) return null;
-    for (const p of gone) {
-      const chosen = files[p.name] || [];
-      if (!chosen.length) throw new Error(`choose a file for ${p.name} (${p.flag})`);
-      const ups = [];
-      for (const f of chosen) ups.push((await upload(f)).path);
-      override[p.name] = p.multiple ? ups : ups[0];
-    }
+    if (!values) return null;
+    Object.assign(override, values);
   }
   return postJson(`/api/jobs/${enc(job.id)}/resubmit`, override);
 }

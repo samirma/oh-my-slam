@@ -182,6 +182,7 @@ class Service:
     _hosts_at: float = 0.0
     _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
     _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
+    _clouds: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))  # display_cloud
 
     def __post_init__(self) -> None:
         if self.runner.reevaluate is None:  # a conditional job's inference need, at its start
@@ -283,6 +284,22 @@ class Service:
             return ViewerRoutes(load_bundle(folder))
 
         return self._job_views.get(jid, make)
+
+    def display_cloud(self, path: Path) -> Any:
+        """A PLY file of a job as the viewer draws it (the 3D scene viewer): the viewer's cloud
+        document, within the display budget (spec §2.5), with the file's header comments."""
+        stamp = path.stat().st_mtime_ns
+
+        def make() -> Any:
+            from oh_my_slam.viewer.bundle import ply_display
+            from oh_my_slam.viewer.routes import cloud_document
+
+            dc, comments = ply_display(path)
+            attrs = next((c.removeprefix("attributes ") for c in comments
+                          if c.startswith("attributes ")), "")
+            return cloud_document(dc, attrs, {"comments": comments})
+
+        return self._clouds.get((str(path), stamp), make)
 
 
 def _viewer_response(r: Any, method: str) -> Response:
@@ -521,6 +538,52 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             raise NotFoundError(f"no file {request.path_params['path']} in job {jid}")
         return FileResponse(p, media_type=media_of(jid, p), filename=p.name)
 
+    async def display_cloud(request: Request) -> Response:
+        """A job's PLY (``?file=<path>``, else its result) as the viewer draws it."""
+        from oh_my_slam.web.workspace import inside
+
+        j = runner.get(request.path_params["id"])
+        rel = request.query_params.get("file")
+        if rel is None:
+            if j.state != "succeeded" or j.result_name is None:
+                return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
+            rel = j.result_name
+        p = inside(out_dir(j.id), rel)
+        if not p.is_file():
+            raise NotFoundError(f"no file {rel} in job {j.id}")
+        try:
+            doc = await run_in_threadpool(service.display_cloud, p)
+        except (ValueError, KeyError, UnicodeDecodeError) as exc:
+            return _error(400, "usage", f"{rel} is not a PLY file the viewer can draw: {exc}")
+
+        async def body() -> AsyncIterator[bytes | memoryview]:
+            for piece in doc.pieces:
+                yield piece
+
+        return StreamingResponse(body(), media_type="application/octet-stream",
+                                 headers={"Content-Length": str(doc.size)})
+
+    async def display_transform(request: Request) -> Response:
+        """The viewer's display transform of a scene: identity for map coordinates; for a single
+        image's camera frame (``camera=true``, or a PLY header ``comment`` naming it) view.sh's
+        upright transform, with the estimated ``up=x,y,z`` when the scene states one."""
+        from oh_my_slam.viewer.bundle import display_transform as transform
+        from oh_my_slam.viewer.bundle import is_camera_frame
+
+        q = request.query_params
+        up: list[float] | None = None
+        if q.get("up"):
+            try:
+                up = [float(x) for x in q["up"].split(",")]
+            except ValueError:
+                up = []
+            if len(up) != 3:
+                return _error(400, "usage", "up must be x,y,z: three numbers")
+        camera = q.get("camera", "").lower() in ("1", "true", "yes") or \
+            await run_in_threadpool(is_camera_frame, q.getlist("comment"))
+        matrix = await run_in_threadpool(transform, camera, up)
+        return JSONResponse({"camera_frame": camera, "display_transform": matrix})
+
     async def log(request: Request) -> Response:
         p = ws.job_dir(runner.get(request.path_params["id"]).id) / "stderr.log"
         return PlainTextResponse(p.read_text("utf-8", "replace") if p.is_file() else "")
@@ -593,6 +656,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         Route("/api/jobs/{id}/result", result),
         Route("/api/jobs/{id}/files", files),
         Route("/api/jobs/{id}/files/{path:path}", job_file),
+        Route("/api/jobs/{id}/display-cloud", display_cloud),
+        Route("/api/display-transform", display_transform),
         Route("/api/jobs/{id}/log", log),
         Route("/api/jobs/{id}/timings", timings),
         Route("/api/jobs/{id}/viewer", job_viewer),

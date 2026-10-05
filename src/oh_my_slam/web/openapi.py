@@ -142,6 +142,27 @@ def _fixed() -> Json:
         "/api/jobs/{id}/files/{path}": {"get": {"summary": "one file the job wrote",
                                                 "parameters": [*job_id, *path],
                                                 "responses": _ok("the file", "*/*")}},
+        "/api/jobs/{id}/display-cloud": {"get": {
+            "summary": "a PLY file of the job (?file=<path>, else its result) as the viewer draws "
+                       "it: the viewer's binary cloud document, within the display budget of spec "
+                       "2.5 (a voxel-grid selection above it), with the file's header comments",
+            "parameters": [*job_id, {"name": "file", "in": "query", "required": False,
+                                     "schema": {"type": "string"}}],
+            "responses": {"200": {"description": "the cloud document", "content": {
+                "application/octet-stream": {}}}, "4XX": _ERROR}}},
+        "/api/display-transform": {"get": {
+            "summary": "the viewer's display transform of a scene: identity for map coordinates, "
+                       "view.sh -i's upright transform for a single image's camera frame",
+            "parameters": [
+                {"name": "camera", "in": "query", "required": False,
+                 "schema": {"type": "boolean"}, "description": "the scene is in a camera frame"},
+                {"name": "comment", "in": "query", "required": False,
+                 "schema": {"type": "array", "items": {"type": "string"}},
+                 "description": "a PLY's header comments (they name its frame)"},
+                {"name": "up", "in": "query", "required": False, "schema": {"type": "string"},
+                 "description": "x,y,z: the estimated up direction in the camera frame"}],
+            "responses": {**_ok("{camera_frame, display_transform (4 x 4, rows)}"),
+                          "4XX": _ERROR}}},
         "/api/jobs/{id}/log": {"get": {"summary": "the lines the command printed to stderr",
                                        "parameters": job_id,
                                        "responses": _ok("the log", "text/plain")}},

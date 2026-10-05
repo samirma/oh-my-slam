@@ -252,6 +252,55 @@ def scene_cameras(scene: Json) -> list[Json]:
     return out
 
 
+def display_transform(camera_frame: bool, up_cam: Any = None) -> list[list[float]]:
+    """The display transform of a scene drawn on its own (the 3D scene viewer of server.sh): the
+    identity for map coordinates (z up); for a single image's camera frame the transform
+    ``view.sh -i`` uses (:func:`upright_transform`), with the estimated up direction when the
+    scene states one, else a level camera."""
+    if not camera_frame:
+        return np.eye(4).tolist()
+    up = DEFAULT_UP_CAM if up_cam is None else np.asarray(up_cam, np.float64).reshape(3)
+    if not np.all(np.isfinite(up)) or np.linalg.norm(up) < 1e-9:
+        raise UsageError("the up direction must be 3 finite numbers, not all 0")
+    return upright_transform(up / np.linalg.norm(up)).tolist()
+
+
+def ply_comments(path: Path) -> list[str]:
+    """The header comments of a PLY file (its frame, attributes and located cameras)."""
+    from oh_my_slam.core.ply import parse_header
+
+    with Path(path).open("rb") as f:
+        head = b""
+        while b"end_header\n" not in head and len(head) < (1 << 24):
+            more = f.read(1 << 16)
+            if not more:
+                break
+            head += more
+    return parse_header(head).comments
+
+
+def ply_display(path: Path, max_points: int | None = None) -> tuple[DisplayCloud, list[str]]:
+    """A PLY file the commands wrote, as the viewer draws it: every point up to the display
+    budget, above it the voxel-grid selection of ``segmentation.cloud.thin_cloud`` (each kept point
+    with exactly its values); and the file's header comments. Raises ``ValueError`` for a file
+    that is not such a PLY."""
+    from oh_my_slam.core.ply import read_ply
+    from oh_my_slam.segmentation.cloud import thin_cloud
+
+    t0 = time.perf_counter()
+    comments = ply_comments(path)
+    thinned = thin_cloud(read_ply(path), DISPLAY_POINT_BUDGET if max_points is None else max_points)
+    return DisplayCloud(thinned.cloud, thinned.total, thinned.voxel,
+                        time.perf_counter() - t0), comments
+
+
+def is_camera_frame(comments: Iterable[str]) -> bool:
+    """Whether a PLY's header says its points are in a single image's camera frame."""
+    from oh_my_slam.segmentation.cloud import IMAGE_FRAME
+
+    return IMAGE_FRAME in comments
+
+
 def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
     """Display frame of a single image: its camera frame rotated so that the estimated up is +z
     and the camera looks along +y."""
