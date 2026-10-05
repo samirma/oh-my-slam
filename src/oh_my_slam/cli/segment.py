@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from oh_my_slam.cli.common import ArgumentParser, run_main
@@ -34,8 +35,8 @@ def build_parser() -> ArgumentParser:
     return spec.build_parser(PROGRAM)
 
 
-def _segment_image(args: argparse.Namespace, attrs: CloudAttrs, min_score: float
-                   ) -> tuple[bytes, bytes | None]:
+def _segment_image(args: argparse.Namespace, attrs: CloudAttrs, min_score: float,
+                   prepare: Callable[[], None]) -> tuple[bytes, bytes | None]:
     from oh_my_slam.client.client import connect
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.artifacts import write_artifacts
@@ -46,7 +47,8 @@ def _segment_image(args: argparse.Namespace, attrs: CloudAttrs, min_score: float
     image: Path = args.image  # validated: it exists
     stage = timing.stage
     with stage(Stage.CONNECT):
-        client = connect()
+        client = connect()  # exit 3 when the server is down: nothing written, no -d folder
+        prepare()  # creates the -d folder
     with stage(Stage.INFERENCE):
         frame, dets = reconstruct_and_detect(image, client, min_score)
     with stage(Stage.SEGMENT):
@@ -76,8 +78,10 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     mode = COMMAND.mode_of(args)
     on_map = mode is spec.SEGMENT_MAP
-    # --min-score, -p, -o, -d (created) and -i or -m are checked before any work
-    v = spec.validate(COMMAND, args, log.warning)
+    # --min-score, -p, -o, -d and -i or -m are checked before any work; for -i the -d folder is
+    # created once the inference server is known to be up
+    v, prepare = spec.validate_deferring(COMMAND, args, log.warning,
+                                         defer=() if on_map else (spec.ARTIFACTS_RULE,))
     attrs: CloudAttrs = v.attrs
     out = claim_stdout(args.output)
     t0 = time.perf_counter()
@@ -95,7 +99,7 @@ def main(argv: list[str]) -> int:
                       artifacts=args.artifacts is not None)
         return 0
     with timing.collect() as tm:
-        scene, ply = _segment_image(args, attrs, v.min_score)
+        scene, ply = _segment_image(args, attrs, v.min_score, prepare)
         with timing.stage(Stage.WRITE):
             out.write_bytes(_result(args.format, scene, ply))
     log.info("done in %.2f s", time.perf_counter() - t0)

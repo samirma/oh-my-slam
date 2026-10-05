@@ -45,4 +45,7 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    run_main("view.sh", main)
+    # its errors carry view.sh's label: for a view-image / view-map job this step *is* the
+    # command's work, so its message must be view.sh's own (spec §2.6 "Errors"); after another
+    # command (?viewer=true) the label is stripped into the job's ``viewer_error``
+    run_main(spec.viewer_program().prog, main)

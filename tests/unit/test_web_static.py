@@ -78,3 +78,11 @@ def test_constants_shared_with_python_agree() -> None:
     ol = (WEB_STATIC / "js" / "scene" / "openlabel.js").read_text()
     assert f"SCHEMA_VERSION = '{openlabel.SCHEMA_VERSION}'" in ol
     assert f"SCHEMA_URL = '{openlabel.SCHEMA_URL}'" in ol
+    # the job page picks the command's timings line out of its stderr by its opening words
+    from oh_my_slam.core.timing import summary_line
+
+    line = summary_line({"stages_s": {"x": 1.0}, "total_s": 1.0, "server": {},
+                         "peak_rss_mb": {"self": 1.0}})
+    jobview = (WEB_STATIC / "js" / "jobview.js").read_text()
+    assert "const TIMINGS_LINE = /\\btimings: total /;" in jobview
+    assert line.startswith("timings: total ")

@@ -123,11 +123,21 @@ def test_one_operation_per_command_mode_with_the_commands_parameters() -> None:
         # single-image modes may ask for their viewer
         takes_image = any(p["kind"] == "image" for p in d["parameters"])
         assert bool(post["parameters"]) == (takes_image and op.label.split()[0] != "view.sh")
+        # ?viewer is documented on /validate too, which takes it as the submission does
+        assert doc["paths"][f"/api/ops/{op.id}/validate"]["post"]["parameters"] == \
+            post["parameters"]
+        for p in post["parameters"]:  # the viewer step replays the command's inference
+            assert "replays" in p["description"] and "once more" not in p["description"]
     assert doc["x-oms"]["exit_codes"] == spec.describe()["exit_codes"]
     view_props = doc["paths"]["/api/ops/view-map"]["post"]["requestBody"]["content"][
         "application/json"]["schema"]["properties"]
     assert "no_browser" not in view_props  # spec marks it as meaning nothing to the service
-    assert {"/api/maps/{name}/viewer/{path}", "/api/jobs/{id}/viewer/{path}"} <= set(doc["paths"])
+    assert {"/api/maps/{name}/viewer/{path}", "/api/jobs/{id}/viewer/{path}",
+            "/viewer/map/{name}/{path}", "/viewer/job/{id}/{path}"} <= set(doc["paths"])
+    # nothing the spec does not ask for: the operations are in x-oms, uploads are only created
+    # (and discarded)
+    assert "/api/operations" not in doc["paths"]
+    assert set(doc["paths"]["/api/uploads"]) == {"post"}
     assert {op.id for op in ops.values()} == {"reconstruct", "mapper-update", "mapper-locate",
                                               "segment-image", "segment-map", "view-image",
                                               "view-map"}
@@ -406,7 +416,7 @@ def test_upload_is_deleted_when_its_job_ends(svc: Svc) -> None:
     up = r.json()
     assert up["path"] == f"uploads/{up['id']}/photo.jpg" and up["size"] == 17
     assert (svc.ws.root / up["path"]).read_bytes() == b"not really a jpeg"
-    assert [u["id"] for u in svc.client.get("/api/uploads").json()] == [up["id"]]
+    assert [p.name for p in svc.ws.uploads.iterdir()] == [up["id"]]
     op = web_ops.operations()["segment-image"]
     prep = web_ops.prepare(op, {"image": up["path"]}, svc.ws, svc.ws.job_dir("x"))
     assert prep.uploads == [up["id"]] and not prep.problems
@@ -437,7 +447,7 @@ def test_upload_is_deleted_when_its_job_ends(svc: Svc) -> None:
         r = svc.client.post(f"/api/uploads?name={name}", content=b"x", headers=OCTET)
         assert r.status_code == 400, name
     runner.wait(blocker.id, 30)
-    assert svc.client.get("/api/uploads").json() == []
+    assert list(svc.ws.uploads.iterdir()) == []
 
 
 def test_uploads_are_capped_and_need_free_space(ws: Workspace) -> None:
@@ -457,7 +467,7 @@ def test_uploads_are_capped_and_need_free_space(ws: Workspace) -> None:
         service.min_free_bytes = 1 << 62  # more than any disk has free
         r = c.post("/api/uploads?name=d.mp4", content=b"x", headers=OCTET)
         assert r.status_code == 413 and r.json()["error"]["code"] == "insufficient_storage"
-    assert [u.name for u in ws.list_uploads()] == ["a.mp4"]
+    assert [p.name for p in ws.uploads.glob("*/*")] == ["a.mp4"]
     service.runner.shutdown()
 
 
@@ -558,3 +568,159 @@ def test_map_viewer_is_served_by_the_viewers_own_routes(svc: Svc,
     assert svc.client.get("/viewer/map/absent/").status_code == 404
     assert svc.client.get("/viewer/job/none/").status_code == 404
     assert svc.client.get("/api/jobs/none/viewer/").status_code == 404
+
+
+def test_a_restart_clears_a_viewer_steps_progress(ws: Workspace) -> None:
+    """A service killed during a viewer step: after the restart no step runs, so the job shows
+    no viewer progress."""
+    import json
+
+    runner = Runner(ws)
+    job = runner.submit(slow_op(), {}, slow(0, inference=False), runner.new_id())
+    runner.wait(job.id, 60)
+    runner.shutdown()
+    record = ws.job_dir(job.id) / "job.json"
+    saved = json.loads(record.read_text())
+    record.write_text(json.dumps({**saved, "state": "running",
+                                  "viewer_progress": {"stage": "inference"}}))
+    again = Runner(ws)
+    again.load()
+    assert again.get(job.id).viewer_progress is None
+    assert json.loads(record.read_text())["viewer_progress"] is None
+    again.shutdown()
+
+
+def test_viewer_build_locks_are_pruned_with_their_bundles() -> None:
+    lru = web_app._LRU(2)
+    for name in ("a", "b", "c"):
+        for version in (1, 2):  # a newer version of the same map evicts the older one first
+            assert lru.get((name, version), lambda: object(), owner=name) is not None
+    assert list(lru.items) == [("c", 1), ("c", 2)]
+    assert set(lru.owners) == {"c"}  # a's and b's locks went with their last bundle
+
+
+def test_viewer_bundles_build_under_a_per_map_lock(svc: Svc) -> None:
+    """Building one map's viewer never waits for another map's build; concurrent requests for
+    the same map build it once."""
+    import threading
+
+    minimal_map(svc.ws.maps / "a")
+    minimal_map(svc.ws.maps / "b")
+    from oh_my_slam.viewer import bundle as vb
+
+    real = vb.map_bundle
+    release, entered = threading.Event(), threading.Event()
+    builds: list[str] = []
+
+    def slow_bundle(root: Path, *a: Any, **k: Any) -> Any:
+        builds.append(Path(root).name)
+        if Path(root).name == "a":
+            entered.set()
+            assert release.wait(30)
+        return real(root, *a, **k)
+
+    vb.map_bundle = slow_bundle  # type: ignore[assignment]
+    try:
+        a = [threading.Thread(target=svc.service.map_routes, args=("a",)) for _ in range(2)]
+        for t in a:
+            t.start()
+        assert entered.wait(30)
+        done = threading.Thread(target=svc.service.map_routes, args=("b",))
+        done.start()
+        done.join(10)
+        assert not done.is_alive()  # b was built while a's build was still running
+        release.set()
+        for t in a:
+            t.join(30)
+    finally:
+        vb.map_bundle = real  # type: ignore[assignment]
+    assert sorted(builds) == ["a", "b"]  # a once, although asked twice
+
+
+# -- workspace guarantees ----------------------------------------------------------------------------
+
+
+def test_a_vanished_operation_cannot_be_resubmitted(svc: Svc) -> None:
+    """A job of an operation the commands no longer offer (here: not in the registry) is answered
+    410 Gone with a message on re-submission, never a 500."""
+    job = svc.runner.submit(slow_op(), {}, slow(0, inference=False), svc.runner.new_id())
+    svc.runner.wait(job.id, 60)
+    r = svc.client.post(f"/api/jobs/{job.id}/resubmit", json={})
+    assert r.status_code == 410 and r.json()["error"]["code"] == "gone"
+    assert "no longer exists" in r.json()["error"]["message"]
+
+
+def test_results_download_again_after_a_restart(ws: Workspace) -> None:
+    """A job's result and files are kept under jobs/<id>/: after a service restart (a new runner
+    and service on the same workspace) they download byte for byte as before."""
+    minimal_map(ws.maps / "m")
+    first = make_svc(ws)
+    with TestClient(create_app(first)) as c:
+        r = c.post("/api/ops/segment-map", json={"map": "m", "artifacts": "files"})
+        assert r.status_code == 202, r.json()
+        jid = r.json()["id"]
+        assert first.runner.wait(jid, 120).state == "succeeded"
+        before = {f["path"]: c.get(f["url"]).content for f in c.get(f"/api/jobs/{jid}/files").json()}
+        result = c.get(f"/api/jobs/{jid}/result").content
+    first.runner.shutdown()
+    assert result and len(before) > 1
+    again = make_svc(ws)
+    again.runner.load()
+    with TestClient(create_app(again)) as c:
+        assert c.get(f"/api/jobs/{jid}").json()["state"] == "succeeded"
+        assert c.get(f"/api/jobs/{jid}/result").content == result
+        after = {f["path"]: c.get(f["url"]).content for f in c.get(f"/api/jobs/{jid}/files").json()}
+        assert after == before
+    again.runner.shutdown()
+
+
+def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
+    """No request deletes or changes a map outside the mapping operation: no route deletes one,
+    read-only jobs and a failing update leave it as it was, and so do a stop and a restart."""
+    from tests.mapsnap import snapshot
+
+    root = minimal_map(ws.maps / "m")
+    before = snapshot(root)
+    service = make_svc(ws)
+    with TestClient(create_app(service)) as c:
+        for path in ("/api/maps/m", "/api/maps/m/files/map.json", "/viewer/map/m/",
+                     "/api/maps/m/viewer/api/meta"):
+            assert c.delete(path).status_code in (404, 405), path
+        assert c.delete("/api/uploads/m").status_code == 404
+        for op, params in (("segment-map", {"map": "m"}), ("view-map", {"map": "m"}),
+                           ("segment-map", {"map": "maps/m", "format": "ply"})):
+            r = c.post(f"/api/ops/{op}", json=params)
+            assert r.status_code == 202, r.json()
+            assert service.runner.wait(r.json()["id"], 120).state == "succeeded"
+        (ws.root / "bad.jpg").write_bytes(b"not an image")
+        r = c.post("/api/ops/mapper-update", json={"inputs": ["bad.jpg"], "map": "m"})
+        if r.status_code == 202:  # refused by the command rather than at submission
+            assert service.runner.wait(r.json()["id"], 120).state == "failed"
+        assert c.get("/api/maps").json()[0]["name"] == "m"
+    service.runner.shutdown()
+    restarted = make_svc(ws)
+    restarted.runner.load()
+    ws.clear_uploads()
+    restarted.runner.shutdown()
+    assert snapshot(root) == before
+
+
+def test_read_only_requests_are_served_while_a_job_runs(svc: Svc) -> None:
+    """While an inference job runs, health, maps, jobs, the API description and a map's viewer
+    answer at once."""
+    import time
+
+    minimal_map(svc.ws.maps / "m")
+    job = svc.runner.submit(slow_op(), {}, slow(6), svc.runner.new_id())
+    deadline = time.monotonic() + 30
+    while svc.runner.get(job.id).state != "running" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    for path in ("/api/health", "/api/maps", "/api/maps/m", "/api/jobs", f"/api/jobs/{job.id}",
+                 "/api/openapi.json", "/viewer/map/m/api/meta", "/"):
+        t0 = time.monotonic()
+        r = svc.client.get(path)
+        assert r.status_code == 200, path
+        assert time.monotonic() - t0 < 2.0, path
+    assert svc.runner.get(job.id).state == "running"  # all of it while the job ran
+    svc.client.post(f"/api/jobs/{job.id}/cancel", json={})
+    svc.runner.wait(job.id, 60)

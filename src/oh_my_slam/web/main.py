@@ -43,6 +43,9 @@ from oh_my_slam.web.workspace import DEFAULT_DATA, Workspace
 PROG = "server.sh"
 LOCK = "server.lock"
 STATE = "server.json"
+LOG = "server.log"
+LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "oh_my_slam", "")  # "" is the root
+_terminal: int | None = None  # the original stderr, kept once logging went to server.log
 STOP_TIMEOUT_S = 180.0  # running jobs get the runner's grace period to stop
 FORCE_TIMEOUT_S = 10.0
 
@@ -143,6 +146,46 @@ def _released(ws: Workspace, timeout: float) -> bool:
 # -- serving ----------------------------------------------------------------------------------------
 
 
+def _log_to(path: Path) -> None:
+    """After the listening line nothing more reaches stderr (spec §2.6: exactly one line): the
+    uvicorn and oh_my_slam loggers (and the root, for asyncio and the rest) write to ``path``, and
+    so does anything else written to file descriptors 1 and 2 — warnings, a thread's traceback,
+    a library's own output. Jobs are unaffected: their stderr is a pipe to the job's log."""
+    import logging
+
+    global _terminal
+    stream = path.open("a", buffering=1, encoding="utf-8", errors="backslashreplace")
+    _terminal = os.dup(2)  # for the one line of a failed exit (``_tell_terminal``)
+    os.dup2(stream.fileno(), 2)
+    os.dup2(stream.fileno(), 1)
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    for name in LOGGERS:
+        logger = logging.getLogger(name)
+        logger.handlers = [handler]
+        logger.propagate = False
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.captureWarnings(True)  # py.warnings → the root logger → the file
+
+
+def _tell_terminal(ws: Workspace, what: str) -> None:
+    """A non-zero exit after the listening line: one ``server.sh: error:`` line on the original
+    stderr, pointing at the log that has the details."""
+    if _terminal is None:
+        return
+    line = f"{PROG}: error: {what} (see {ws.root / LOG})\n"
+    with contextlib.suppress(OSError):
+        os.write(_terminal, line.encode("utf-8", "backslashreplace"))
+
+
+def _failure(exc: BaseException) -> str:
+    if isinstance(exc, OhMySlamError):
+        return str(exc)
+    if isinstance(exc, KeyboardInterrupt):
+        return "interrupted"
+    return f"internal error: {type(exc).__name__}: {exc}"
+
+
 def _bind(port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -191,6 +234,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
             with contextlib.suppress(OSError):
                 (ws.root / STATE).unlink()
             lock.release()
+            _tell_terminal(ws, "stopped by a second signal; every job's processes were killed")
             os._exit(int(ExitCode.INTERRUPTED))
 
         class _Server(uvicorn.Server):
@@ -202,6 +246,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
                         "data": str(ws.root), "version": __version__,
                         "started_at": service.started_at})
                     _say(f"listening on {url}")
+                    _log_to(ws.root / LOG)
                     if open_browser:
                         webbrowser.open(_local(url))
 
@@ -256,7 +301,12 @@ def main(argv: list[str]) -> int:
     if args.stop:
         return stop(ws)
     ws.create()
-    return serve(ws, port, not args.no_browser)
+    try:
+        return serve(ws, port, not args.no_browser)
+    except BaseException as exc:  # run_main logs the details (to server.log once listening)
+        if not (isinstance(exc, SystemExit) and exc.code in (0, None)):
+            _tell_terminal(ws, _failure(exc))
+        raise
 
 
 def entry() -> None:

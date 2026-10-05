@@ -286,10 +286,12 @@ export class FilesField extends Field {
   }
 
   // Files expected again (a re-submission): listed in their order, each filled in place by the
-  // file of the same name, so the order stays the previous one.
-  expect(names) {
+  // file of the same name, so the order stays the previous one. An entry {path} is a workspace
+  // path, still there: kept in its place, never asked for.
+  expect(entries) {
     this.removeAll();
-    this.items = names.map((name) => ({ name, state: 'needed' }));
+    this.items = entries.map((e) => (typeof e === 'string' ? { name: e, state: 'needed' }
+      : { name: e.path, path: e.path, state: 'path' }));
     this.render();
   }
 

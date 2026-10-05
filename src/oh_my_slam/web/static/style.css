@@ -258,3 +258,8 @@ dialog h2 { margin-top: 0; }
 /* a focused page heading (route change) stays clear of the sticky top bar */
 main h1, main h2, main h3 { scroll-margin-top: 7rem; }
 @media (max-width: 1024px) { main h1, main h2, main h3 { scroll-margin-top: 10rem; } }
+
+/* a job's command output (its stderr) and its timings line */
+.job-log pre.log { max-height: 16rem; overflow: auto; padding: 0.5rem 0.7rem; border: 1px solid var(--border);
+  border-radius: 6px; font-size: 0.8rem; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.3rem 0; }
+.job-log .timings-line code { display: block; font-size: 0.8rem; overflow-wrap: anywhere; }

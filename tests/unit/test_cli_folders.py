@@ -115,6 +115,28 @@ def test_unwritable_output_is_a_usage_error_before_any_work(
     assert snapshot(map_dir) == before
 
 
+def test_segment_image_creates_no_folder_with_the_server_down(tmp_path: Path, image: Path
+                                                              ) -> None:
+    """No server runs here: ``segment.sh -i -d <new folder>`` fails with exit 3 and leaves no
+    folder behind (it is created once the server is known to be up); ``-m`` still creates it."""
+    new = tmp_path / "new" / "artefacts"
+    res = sh("segment.sh", "-i", str(image), "-d", str(new))
+    assert res.returncode == 3, res.stderr.decode()
+    assert res.stdout == b"" and not (tmp_path / "new").exists()
+    made = tmp_path / "from_map"
+    res = sh("segment.sh", "-m", str(minimal_map(tmp_path / "map")), "-d", str(made))
+    assert res.returncode == 0, res.stderr.decode()
+    assert made.is_dir()
+
+
+def test_segment_image_creates_its_folder_with_the_server_up(stub_server: None, tmp_path: Path,
+                                                             image: Path) -> None:
+    new = tmp_path / "new" / "artefacts"
+    res = sh("segment.sh", "-i", str(image), "-d", str(new))
+    assert res.returncode == 0, res.stderr.decode()
+    assert (new / "segmentation.json").read_bytes() == res.stdout
+
+
 def test_preflight_creates_missing_parents_and_names_the_path(tmp_path: Path,
                                                               not_a_folder: Path) -> None:
     target = tmp_path / "a" / "b" / "scene.json"

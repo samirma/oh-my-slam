@@ -25,9 +25,12 @@ export function inputsText(job) {
 }
 
 export function progressBar(job) {
-  const pr = job.progress;
+  // the viewer step after a command reports apart from the command's own stages
+  const vp = job.viewer_progress;
+  const pr = vp || job.progress;
   const wrap = el('div', { class: 'progress' });
-  const stage = job.stage || (job.state === 'queued' ? 'waiting for its turn' : 'starting');
+  const stage = vp ? `preparing the viewer${vp.stage ? ` (${vp.stage})` : ''}`
+    : job.stage || (job.state === 'queued' ? 'waiting for its turn' : 'starting');
   if (pr && pr.total) {
     const pct = Math.round((100 * pr.done) / pr.total);
     wrap.append(el('progress', { max: pr.total, value: pr.done, 'aria-label': `Stage ${stage}: ${pr.done} of ${pr.total}` }),
@@ -113,6 +116,16 @@ function kindOf(name, media) {
   return 'other';
 }
 
+// The map a job of a map operation (mapper.sh update / locate, segment.sh -m) worked on, by the
+// operation's map parameter (`<name>` or `maps/<name>`), when the service offers a map viewer (a
+// mode whose output is the browser takes a map); else null.
+function mapOf(job) {
+  const p = store.ops.get(job.operation)?.mapParam;
+  const value = p ? job.params[p.name] : null;
+  if (value == null || ![...store.ops.values()].some((o) => o.browser && o.mapParam)) return null;
+  return String(value).replace(/^maps\//, '').replace(/\/+$/, '');
+}
+
 // The result section of a succeeded job.
 async function renderResult(box, job, selection) {
   const files = await getJson(`/api/jobs/${enc(job.id)}/files`).catch(() => []);
@@ -166,8 +179,32 @@ async function renderResult(box, job, selection) {
       v.code === 'cancelled' ? 'The job was cancelled while it prepared the viewer; the result below stands.' : `${v.message} (${v.code}). The result below stands.`));
   }
   if (job.viewer) box.append(embeddedViewer(job.viewer, `Viewer of job ${job.id}`, selection));
+  else {
+    const map = mapOf(job);
+    if (map) {
+      box.append(el('p', { class: 'muted viewer-note', 'data-testid': 'map-viewer-note' },
+        `The viewer shows map ${map} as it is now, including any update made after this job.`),
+      embeddedViewer(`/viewer/map/${enc(map)}/`, `Viewer of map ${map}`, selection));
+    }
+  }
   if (rendered.children.length) box.append(rendered);
   box.append(el('h3', {}, 'Downloads'), entries.length ? downloads : el('p', { class: 'muted' }, 'This job wrote no file.'));
+}
+
+// What the command printed on stderr (/api/jobs/<id>/log), in its own words: its warnings and
+// messages, and its `timings:` line (per-stage timings) shown on its own.
+const TIMINGS_LINE = /\btimings: total /;
+export function jobLog(text) {
+  const lines = text.split('\n').filter((l) => l !== '');
+  const timing = lines.filter((l) => TIMINGS_LINE.test(l));
+  const other = lines.filter((l) => !TIMINGS_LINE.test(l));
+  const box = el('section', { class: 'job-log', 'data-testid': 'job-log', 'aria-label': 'Command output' });
+  box.append(el('h3', {}, 'Command output'));
+  if (timing.length) box.append(el('p', { class: 'timings-line', 'data-testid': 'timings-line' }, ...timing.map((l) => el('code', {}, l))));
+  box.append(other.length
+    ? el('pre', { class: 'log', tabindex: '0', 'aria-label': 'stderr of the command' }, other.join('\n'))
+    : el('p', { class: 'muted' }, lines.length ? 'No other message.' : 'The command printed nothing.'));
+  return box;
 }
 
 // The job's live view into `container`; returns a function that stops it.
@@ -176,11 +213,21 @@ export function renderJob(container, jobId, { heading = 'h2', compact = false } 
   const head = el('div', { class: 'job-head' });
   const body = el('div', { class: 'job-body' });
   const result = el('div', { class: 'job-result', 'data-testid': 'result' });
+  const logBox = el('div', { class: 'job-log-box' });
   const errors = el('div', { 'aria-live': 'assertive' });
-  const section = el('section', { class: 'job', 'data-job': jobId, 'aria-label': `Job ${jobId}` }, head, errors, body, result);
+  const section = el('section', { class: 'job', 'data-job': jobId, 'aria-label': `Job ${jobId}` }, head, errors, body, result, logBox);
   container.append(section);
   let shownResult = false;
   let lastState = null;
+  let logKey = null;  // the log is read again when the job's lines or state change
+  function drawLog(job) {
+    const key = `${job.state}|${(job.log_tail || []).length}|${(job.log_tail || []).at(-1) || ''}`;
+    if (key === logKey || job.state === 'queued') return;
+    logKey = key;
+    fetch(`/api/jobs/${enc(job.id)}/log`).then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.statusText))))
+      .then((text) => { if (logKey === key) logBox.replaceChildren(jobLog(text)); })
+      .catch(() => { /* the job's page still shows the rest */ });
+  }
 
   function draw(job) {
     section.dataset.state = job.state;
@@ -213,6 +260,7 @@ export function renderJob(container, jobId, { heading = 'h2', compact = false } 
       result.replaceChildren(el('p', { class: 'muted' }, 'Loading the result…'));
       renderResult(result, job, selection).catch((err) => result.replaceChildren(notice('error', `The result could not be shown: ${err.message}`)));
     }
+    drawLog(job);
     if (job.state !== lastState) { lastState = job.state; container.dispatchEvent(new CustomEvent('jobstate', { detail: job })); }
   }
 

@@ -87,6 +87,9 @@ class CloudDocument:
     pieces: tuple[bytes | memoryview, ...]
     size: int  # bytes of the whole document
     owned_bytes: int  # memory it keeps beyond the cloud source (see ``DisplayCloud.owned_bytes``)
+    # how long the derivation took: sent as a ``Server-Timing`` header, never in the body, so two
+    # identical requests get byte-identical documents
+    seconds: float = 0.0
 
     def tobytes(self) -> bytes:
         return b"".join(self.pieces)
@@ -114,12 +117,11 @@ def cloud_document(dc: DisplayCloud, attrs: str, extra: dict[str, Any] | None = 
         pieces += [view, b"\0" * pad] if pad else [view]
         offset += view.nbytes + pad
     header = json.dumps({"count": len(c), "total": dc.total, "voxel": dc.voxel, "attrs": attrs,
-                         "seconds": round(dc.seconds, 4), "buffers": buffers, **(extra or {})}
-                        ).encode()
+                         "buffers": buffers, **(extra or {})}).encode()
     header += b" " * (-(4 + len(header)) % 4)
     head = struct.pack("<I", len(header)) + header
     return CloudDocument((head, *pieces), len(head) + offset,
-                         offset if dc.owned_bytes is None else dc.owned_bytes)
+                         offset if dc.owned_bytes is None else dc.owned_bytes, dc.seconds)
 
 
 def cloud_payload(dc: DisplayCloud, attrs: str) -> bytes:
@@ -127,15 +129,17 @@ def cloud_payload(dc: DisplayCloud, attrs: str) -> bytes:
     header (space-padded so that ``4 + J`` is a multiple of 4), then the buffers, each starting on
     a 4-byte boundary at ``4 + J + offset``. The header::
 
-        {"count": n, "total": n0, "voxel": e, "attrs": "color=rgb,…", "seconds": s,
+        {"count": n, "total": n0, "voxel": e, "attrs": "color=rgb,…",
          "buffers": [{"name", "type", "size", "offset", "bytes"}, …]}
 
     ``count`` points are shown out of ``total`` derived: all of them when ``voxel`` is 0, else one
     per occupied voxel of edge ``voxel`` metres (the §2.5 display budget). Buffers, little-endian,
     ``size`` components per point: ``position`` float32 x 3 (always), ``color`` uint8 x 3 (sRGB;
     absent for ``color=none``), ``label`` int32 x 1 (object id, 0 = unsegmented), ``normal``
-    float32 x 3 (``normals=on``). The server sends the same bytes piece by piece
-    (:func:`cloud_document`)."""
+    float32 x 3 (``normals=on``). The document depends only on the cloud and its attributes, so
+    identical requests get identical bytes; ``/api/cloud`` sends the derivation time in its
+    ``Server-Timing`` header (``derive;dur=<ms>``). The server sends the same bytes piece by
+    piece (:func:`cloud_document`)."""
     return cloud_document(dc, attrs).tobytes()
 
 
@@ -220,7 +224,9 @@ class ViewerRoutes:
                     doc = self.cloud(query)
                 except (UsageError, ValueError) as exc:  # bad attributes, or not derivable
                     return _error(400, str(exc))
-                return Response.of(200, "application/octet-stream", doc.pieces, doc.size)
+                r = Response.of(200, "application/octet-stream", doc.pieces, doc.size)
+                timing = ("Server-Timing", f"derive;dur={doc.seconds * 1000:.1f}")
+                return Response(r.status, (*r.headers, timing), r.body)
             if path == "/api/segmented.png" and self.bundle.segmented_png is not None:
                 return Response.of(200, "image/png", (self.bundle.segmented_png,))
             if path.startswith("/static/"):

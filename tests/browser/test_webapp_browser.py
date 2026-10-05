@@ -402,6 +402,46 @@ def test_map_viewer_embedded_and_full_screen(mapped: dict[str, Any], tab: Tab, a
     link.click()
     wait_job(pg)
     pg.wait_for_selector("figure.segmented[data-ready=true]")
+    # a map operation's result page embeds the map's viewer
+    pg.wait_for_selector(".viewer-box[data-ready=true]", timeout=60000)
+    assert pg.get_attribute(".job-result iframe.viewer-frame", "src") == "/viewer/map/room/"
+    assert tab.errors == []
+
+
+def test_map_update_job_page_embeds_the_map_viewer_and_its_log(
+        mapped: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
+    """The result page of a map update embeds /viewer/map/<name>/, and shows the command's stderr
+    (its warnings and messages) and its timings: line, from /api/jobs/<id>/log."""
+    service, _ = app
+    jid = mapped["jobs"][-1]
+    pg = tab.go(f"#/jobs/{jid}")
+    wait_job(pg)
+    pg.wait_for_selector(".viewer-box[data-ready=true]", timeout=60000)
+    assert pg.get_attribute(".job-result iframe.viewer-frame", "src") == "/viewer/map/room/"
+    assert "as it is now" in pg.inner_text("[data-testid=map-viewer-note]")
+    assert_job_log(pg, service, jid)
+    tab.a11y()
+    assert tab.errors == []
+
+
+def assert_job_log(pg: Any, service: Any, jid: str) -> None:
+    log = (service.workspace.job_dir(jid) / "stderr.log").read_text()
+    timing = [ln for ln in log.splitlines() if "timings: total " in ln]
+    assert timing, log
+    pg.wait_for_selector("[data-testid=timings-line]")
+    assert pg.inner_text("[data-testid=timings-line]").strip() == "\n".join(timing)
+    others = [ln for ln in log.splitlines() if ln and "timings: total " not in ln]
+    shown = pg.inner_text("[data-testid=job-log]")
+    for ln in others:
+        assert ln.strip() in shown, ln
+
+
+def test_image_job_shows_the_commands_stderr(image_job: dict[str, Any], tab: Tab,
+                                            app: tuple[Any, str]) -> None:
+    service, _ = app
+    pg = tab.go(f"#/jobs/{image_job['id']}")
+    wait_job(pg)
+    assert_job_log(pg, service, image_job["id"])
     assert tab.errors == []
 
 
@@ -959,3 +999,47 @@ def test_keyboard_reaches_every_control_with_visible_focus(tab: Tab) -> None:
         assert info[2], f"no visible focus on {info}"
     assert "Choose an image…" in seen and any(s.startswith("Run ") for s in seen)
 
+
+
+def test_resubmit_asks_only_for_the_uploads(mapped: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
+    """A job whose inputs mix a workspace path and an upload: re-submitting asks for the upload
+    only; the workspace path keeps its place, in the previous order."""
+    import httpx
+
+    service, url = app
+    folder = service.workspace.root / "kept"
+    folder.mkdir(exist_ok=True)
+    shutil.copy(FRAMES[0], folder / FRAMES[0].name)
+    up = httpx.post(f"{url}api/uploads?name={FRAMES[1].name}", content=FRAMES[1].read_bytes(),
+                    headers={"content-type": "application/octet-stream"}).json()
+    r = httpx.post(f"{url}api/ops/mapper-locate",
+                   json={"inputs": [f"kept/{FRAMES[0].name}", up["path"]], "map": mapped["name"]})
+    assert r.status_code == 202, r.json()
+    jid = r.json()["id"]
+    service.runner.wait(jid, 300)
+    pg = tab.go(f"#/jobs/{jid}")
+    wait_job(pg)
+    jobs_before = len(service.runner.all_jobs())
+    pg.click("section.job button[data-action=resubmit]")
+    pg.locator("dialog#confirm[open]").wait_for()
+    items = pg.locator("dialog#confirm .files li").evaluate_all(
+        "els => els.map(e => [e.dataset.name, e.querySelector('.file-state').textContent])")
+    assert items == [[f"kept/{FRAMES[0].name}", "workspace path"],
+                     [FRAMES[1].name, "choose this file again"]]
+    pg.click("#confirm-no")
+    assert len(service.runner.all_jobs()) == jobs_before
+    # choosing the upload again re-submits: the workspace path in its place, then the new upload
+    pg.click("section.job button[data-action=resubmit]")
+    pg.locator("dialog#confirm[open]").wait_for()
+    pg.set_input_files("dialog#confirm input[type=file]", str(FRAMES[1]))
+    pg.wait_for_function("() => document.querySelectorAll('dialog#confirm li.ready').length === 1")
+    pg.click("#confirm-yes")
+    pg.wait_for_function(f"() => location.hash.startsWith('#/jobs/') && !location.hash.endsWith('{jid}')")
+    pg.wait_for_selector("section.job[data-job]")
+    new = service.runner.get(pg.get_attribute("section.job", "data-job"))
+    inputs = new.params["inputs"]
+    assert inputs[0] == f"kept/{FRAMES[0].name}"
+    assert inputs[1].startswith("uploads/") and inputs[1].endswith(f"/{FRAMES[1].name}")
+    assert inputs[1] != up["path"]
+    service.runner.wait(new.id, 300)
+    assert tab.errors == []

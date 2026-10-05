@@ -13,7 +13,6 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
@@ -186,6 +185,17 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
     catalog = client.get(f"/viewer/job/{both['id']}/api/catalog").json()
     assert {r["id"]: r["label"] for r in catalog} == objects
     assert not (ws.jobs / both["id"] / "inference").exists()  # deleted once the viewer is saved
+    # the job's stages are the command's own (its timings record); the viewer step's are not
+    timings = client.get(f"/api/jobs/{both['id']}/timings").json()
+    assert sorted(s["stage"] for s in both["stages"]) == sorted(timings["stages_s"])
+    assert both["viewer_progress"] is None
+    viewer_events = (ws.jobs / both["id"] / "viewer_progress.jsonl").read_text().splitlines()
+    assert any(json.loads(e).get("event") == "stage_start" for e in viewer_events)
+    # its stderr is kept apart too: the job's log is the command's own
+    assert (ws.jobs / both["id"] / "viewer_stderr.log").is_file()
+    log = client.get(f"/api/jobs/{both['id']}/log").text
+    assert log == (ws.jobs / both["id"] / "stderr.log").read_text()
+    assert sum("timings: total " in line for line in log.splitlines()) == 1
 
     # after a restart (a new runner and service on the same workspace) the viewer is still there
     again = Runner(ws)
@@ -241,10 +251,9 @@ def test_a_saved_image_bundle_serves_the_same_viewer(tmp_path: Path) -> None:
                   "min-depth=0.5&max-depth=3&edge=0", "color=none"):
         ra, rb = a.handle("GET", "/api/cloud", query), b.handle("GET", "/api/cloud", query)
         assert ra.status == rb.status == 200, query
-        (ha, xa), (hb, xb) = (parse_cloud_payload(r.tobytes()) for r in (ra, rb))
-        ha.pop("seconds"), hb.pop("seconds")
-        assert ha == hb, query
-        assert xa.keys() == xb.keys() and all(np.array_equal(xa[k], xb[k]) for k in xa), query
+        assert ra.tobytes() == rb.tobytes(), query  # no timing in the document: byte-identical
+        (_, xa) = parse_cloud_payload(ra.tobytes())
+        assert xa["position"].size > 0, query
 
 
 @pytest.mark.parametrize("attrs", [None, "color=height,voxel=0.02"])

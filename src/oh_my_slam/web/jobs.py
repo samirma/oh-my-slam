@@ -123,6 +123,9 @@ class Job:
     error: dict[str, Any] | None = None
     viewer: str | None = None
     viewer_error: dict[str, Any] | None = None  # an optional viewer step failed; result stands
+    # the stage of a viewer step that follows the command (its events are not the command's, so
+    # they never enter ``stage``/``progress``/``stages``/``counts``); None when not running
+    viewer_progress: dict[str, Any] | None = None
     log_tail: list[str] = field(default_factory=list)
     resubmitted_from: str | None = None
     cancel_requested: bool = False
@@ -211,6 +214,8 @@ class Runner:
                              "job finished; re-submit it"}
             if job.pgid is not None or job.leader_ctime is not None:
                 job.pgid, job.leader_ctime, changed = None, None, True
+            if job.viewer_progress is not None:  # no step runs any more
+                job.viewer_progress, changed = None, True
             self.jobs[job.id] = job
             self._touch(job, save=changed)
 
@@ -376,7 +381,9 @@ class Runner:
     def _step(self, job: Job, step: dict[str, Any]) -> tuple[int, str | None]:
         d = self.ws.job_dir(job.id)
         (d / OUT_DIR).mkdir(parents=True, exist_ok=True)
-        progress = d / "progress.jsonl"
+        # the command's own record (a viewer step after a command records its own elsewhere)
+        own = step.get("timings", True)
+        progress = d / ("progress.jsonl" if own else "viewer_progress.jsonl")
         progress.touch()
         offset = progress.stat().st_size  # this step's events start here
         inherited = {k: v for k, v in os.environ.items() if k not in (ENV_RECORD, ENV_REPLAY)}
@@ -399,8 +406,9 @@ class Runner:
             self._touch(job, save=True)
             if job.cancel_requested:
                 self._signal(proc, signal.SIGINT)
-        reader = threading.Thread(target=self._read_stderr, args=(job, proc, d / "stderr.log"),
-                                  daemon=True)
+        # the command's stderr is the job's log; a viewer step after it keeps its own
+        log = d / ("stderr.log" if own else "viewer_stderr.log")
+        reader = threading.Thread(target=self._read_stderr, args=(job, proc, log), daemon=True)
         reader.start()
         with progress.open("rb") as events:
             events.seek(offset)
@@ -413,7 +421,7 @@ class Runner:
                     pending += chunk
                     *lines, pending = pending.split(b"\n")
                     for line in lines:
-                        self._event(job, line)
+                        self._event(job, line, own)
                 elif done:
                     break
                 else:
@@ -422,16 +430,26 @@ class Runner:
         with self._lock:
             self._procs.pop(job.id, None)
             job.pgid = job.leader_ctime = None
+            if not own and job.viewer_progress is not None:
+                job.viewer_progress = None
+                self._touch(job)
         return proc.returncode, None
 
-    def _event(self, job: Job, line: bytes) -> None:
+    def _event(self, job: Job, line: bytes, own: bool = True) -> None:
+        """A timing event of the running step: the command's own feed the job's stage, progress,
+        stages and counts; a following viewer step's only ``viewer_progress``."""
         try:
             ev = json.loads(line)
         except ValueError:
             return
         kind = ev.get("event")
         with self._lock:
-            if kind == "stage_start":
+            if not own:
+                if kind not in ("stage_start", "progress"):
+                    return
+                job.viewer_progress = {"stage": ev.get("stage"), "done": ev.get("done"),
+                                       "total": ev.get("total")}
+            elif kind == "stage_start":
                 job.stage, job.progress = ev.get("stage"), None
             elif kind == "stage_end":
                 job.stages.append({"stage": ev.get("stage"), "seconds": ev.get("seconds")})

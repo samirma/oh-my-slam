@@ -105,7 +105,7 @@ addopts = "-ra --strict-markers"
 timeout = 600
 markers = [
     "models: needs the real inference server and model weights",
-    "browser: needs Chrome through Playwright",
+    "browser: needs Microsoft Edge (msedge channel; Chrome as a fallback) through Playwright",
     "eval: runs the spec §5 evaluator end to end (real server and weights, ~10 min on the GPU)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]

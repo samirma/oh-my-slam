@@ -24,6 +24,7 @@ from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id
 from oh_my_slam.viewer.bundle import image_bundle, map_bundle
 from oh_my_slam.viewer.routes import parse_cloud_payload
 from tests.browser.scenes import running, synthetic_image, synthetic_map
+from tests.mapsnap import Snapshot, snapshot, with_committed_overlay
 
 IMAGE_KEYS = ["color", "stride", "min-depth", "max-depth", "edge", "voxel", "normals"]
 MAP_KEYS = ["color", "voxel", "normals"]
@@ -158,11 +159,9 @@ needs_colmap = pytest.mark.skipif(shutil.which("colmap") is None, reason="needs 
 
 
 @pytest.fixture(scope="module")
-def map_view(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, Path, str]]:
-    from oh_my_slam.mapping.store import full_tree_hash
-
+def map_view(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, Path, Snapshot]]:
     root = synthetic_map(tmp_path_factory.mktemp("viewmap"))
-    before = full_tree_hash(root)
+    before = snapshot(root)  # hidden entries included
     with running(map_bundle(root)) as url:
         yield url, root, before
 
@@ -171,16 +170,31 @@ def map_view(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, Pa
 def test_map_view_is_read_only_and_needs_no_server(map_view: Any) -> None:
     from oh_my_slam.client.client import connect
     from oh_my_slam.core.errors import ServerUnavailableError
-    from oh_my_slam.mapping.store import full_tree_hash
 
     url, root, before = map_view
     with pytest.raises(ServerUnavailableError):
         connect()  # no inference server in this test session
+    view_everything(url)
+    assert snapshot(root) == before
+
+
+def view_everything(url: str) -> None:
     for query in ("", "voxel=0.05", "normals=on", "color=segment", "color=height", "color=none"):
         cloud(url, query)
     for path in ("api/meta", "api/scene", "api/catalog"):
         assert get(url + path)[0] == 200
-    assert full_tree_hash(root) == before
+
+
+@needs_colmap
+def test_map_view_leaves_a_committed_staging_overlay_alone(map_view: Any, tmp_path: Path
+                                                           ) -> None:
+    """A map whose last update was killed after its commit point is viewed through the overlay;
+    the viewer neither rolls the update forward nor discards ``.staging/``."""
+    root = with_committed_overlay(map_view[1], tmp_path / "overlaid")
+    before = snapshot(root)
+    with running(map_bundle(root)) as url:
+        view_everything(url)
+    assert snapshot(root) == before
 
 
 @needs_colmap

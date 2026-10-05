@@ -201,6 +201,24 @@ class Problem:
 _MEDIA = {"json": "application/json", "ply": "application/octet-stream", "png": "image/png",
           "csv": "text/csv", "markdown": "text/markdown", "html": "text/html",
           "map": "inode/directory"}
+_SUFFIX = {"json": ".json", "ply": ".ply", "png": ".png", "csv": ".csv", "markdown": ".md",
+           "html": ".html"}  # the file suffix of each output format written as a file
+
+
+def media_type(fmt: str) -> str:
+    """The media type of an output format (``Output.format``)."""
+    return _MEDIA[fmt]
+
+
+def suffix_of(fmt: str) -> str:
+    """The file suffix of an output format ('' for one that is not a file, e.g. a map)."""
+    return _SUFFIX.get(fmt, "")
+
+
+def media_of_file(name: str | Path) -> str | None:
+    """The media type of a file of an output format, by its suffix; None for any other file."""
+    suffix = Path(name).suffix.lower()
+    return next((_MEDIA[f] for f, s in _SUFFIX.items() if s == suffix), None)
 
 
 @dataclass(frozen=True)
@@ -654,6 +672,12 @@ def program_of(cmd: Command) -> Program:
     return next(p for p in PROGRAMS if cmd in p.commands)
 
 
+def viewer_program() -> Program:
+    """The program whose output is the browser (view.sh): the viewer's own command."""
+    return next(p for p in PROGRAMS if any(o.via == "browser" for c in p.commands
+                                           for m in c.modes for o in m.outputs))
+
+
 def _text(value: Any) -> str:
     return str(value)
 
@@ -707,13 +731,32 @@ def validate(cmd: Command, args: argparse.Namespace,
     uses: ``args`` with ``attrs`` parsed to :class:`CloudAttrs`, ``fps`` / ``min_score`` resolved,
     and whatever a rule prepared (the input spec of ``update``, the images and map reader of
     ``locate``). ``warn`` receives the warnings (ignored options)."""
+    return validate_deferring(cmd, args, warn)[0]
+
+
+def validate_deferring(cmd: Command, args: argparse.Namespace,
+                       warn: Callable[[str], None] | None = None, defer: tuple[Rule, ...] = ()
+                       ) -> tuple[argparse.Namespace, Callable[[], None]]:
+    """:func:`validate`, with the preparation of the rules in ``defer`` (e.g. creating the ``-d``
+    folder) left to the returned callable, which the command calls once it may write — after its
+    inference-server check — so a run refused for that reason leaves nothing behind. Every check
+    still runs first, in order."""
     mode = cmd.mode_of(args)
     ctx = Context(args, argparse.Namespace(**vars(args)), mode, warn or (lambda _msg: None))
+    later: list[Callable[[Context], None]] = []
     for rule in mode.rules:
         rule.check(ctx)
         if rule.prepare is not None:
-            rule.prepare(ctx)
-    return ctx.values
+            if rule in defer:
+                later.append(rule.prepare)
+            else:
+                rule.prepare(ctx)
+
+    def prepare() -> None:
+        for p in later:
+            p(ctx)
+
+    return ctx.values, prepare
 
 
 def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem]:
