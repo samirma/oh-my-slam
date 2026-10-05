@@ -843,205 +843,106 @@
     },
     "server_sh.ui.tests_run": {
       "op": ">=",
-      "value": 20,
+      "value": 23,
       "tolerance_abs": 0.0
     },
     "server_sh.ui.a11y_violations": {
       "op": "<=",
       "value": 0
     },
-    "map_update.split_4_4_5.absent_fraction": {
+    "map_update.split_*.absent_fraction": {
       "op": ">=",
       "value": 1.0,
       "tolerance_abs": 0.0
     },
-    "map_update.split_4_4_5.hole_fraction": {
+    "map_update.split_*.hole_fraction": {
       "op": "<=",
       "value": 0.2,
       "tolerance_abs": 0.05
     },
-    "map_update.split_4_4_5.ids_persistent_fraction": {
+    "map_update.split_*.ids_persistent_fraction": {
       "op": ">=",
       "value": 0.95,
       "tolerance_abs": 0.03
     },
-    "map_update.split_4_4_5.stability.matched_fraction": {
+    "map_update.split_*.stability.matched_fraction": {
       "op": ">=",
       "value": 0.9,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "objects paired between the one-update and the split map / the larger object count"
     },
-    "map_update.split_4_4_5.vs_one_update.matched_fraction": {
+    "map_update.split_*.vs_one_update.matched_fraction": {
       "op": ">=",
       "value": 0.9,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "objects paired between the one-update and the split map / the larger object count"
     },
-    "map_update.split_4_4_5.stability.label_agreement": {
+    "map_update.split_*.stability.label_agreement": {
       "op": ">=",
       "value": 0.95,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
     },
-    "map_update.split_4_4_5.vs_one_update.label_agreement": {
+    "map_update.split_*.vs_one_update.label_agreement": {
       "op": ">=",
       "value": 0.95,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
     },
-    "map_update.split_4_4_5.stability.id_agreement": {
+    "map_update.split_*.stability.id_agreement": {
       "op": ">=",
       "value": 0.8,
       "unit": "",
       "tolerance_abs": 0.1,
       "description": "paired objects with the same id in both maps"
     },
-    "map_update.split_4_4_5.vs_one_update.id_agreement": {
+    "map_update.split_*.vs_one_update.id_agreement": {
       "op": ">=",
       "value": 0.8,
       "unit": "",
       "tolerance_abs": 0.1,
       "description": "paired objects with the same id in both maps"
     },
-    "map_update.split_4_4_5.stability.centre_delta_median_m": {
+    "map_update.split_*.stability.centre_delta_median_m": {
       "op": "<=",
       "value": 0.1,
       "unit": "m",
       "tolerance_abs": 0.03,
       "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
     },
-    "map_update.split_4_4_5.vs_one_update.centre_delta_median_m": {
+    "map_update.split_*.vs_one_update.centre_delta_median_m": {
       "op": "<=",
       "value": 0.1,
       "unit": "m",
       "tolerance_abs": 0.03,
       "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
     },
-    "map_update.split_4_4_5.stability.extent_delta_median_rel": {
+    "map_update.split_*.stability.extent_delta_median_rel": {
       "op": "<=",
       "value": 0.2,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "median relative OBB size difference of paired objects"
     },
-    "map_update.split_4_4_5.vs_one_update.extent_delta_median_rel": {
+    "map_update.split_*.vs_one_update.extent_delta_median_rel": {
       "op": "<=",
       "value": 0.2,
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "median relative OBB size difference of paired objects"
     },
-    "map_update.split_4_4_5.stability.obb_iou_median": {
+    "map_update.split_*.stability.obb_iou_median": {
       "op": ">=",
       "value": 0.5,
       "unit": "",
       "tolerance_abs": 0.08,
       "description": "median 3D IoU of paired OBBs"
     },
-    "map_update.split_4_4_5.vs_one_update.obb_iou_median": {
-      "op": ">=",
-      "value": 0.5,
-      "unit": "",
-      "tolerance_abs": 0.08,
-      "description": "median 3D IoU of paired OBBs"
-    },
-    "map_update.split_6_7.absent_fraction": {
-      "op": ">=",
-      "value": 1.0,
-      "tolerance_abs": 0.0
-    },
-    "map_update.split_6_7.hole_fraction": {
-      "op": "<=",
-      "value": 0.2,
-      "tolerance_abs": 0.05
-    },
-    "map_update.split_6_7.ids_persistent_fraction": {
-      "op": ">=",
-      "value": 0.95,
-      "tolerance_abs": 0.03
-    },
-    "map_update.split_6_7.stability.matched_fraction": {
-      "op": ">=",
-      "value": 0.9,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "objects paired between the one-update and the split map / the larger object count"
-    },
-    "map_update.split_6_7.vs_one_update.matched_fraction": {
-      "op": ">=",
-      "value": 0.9,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "objects paired between the one-update and the split map / the larger object count"
-    },
-    "map_update.split_6_7.stability.label_agreement": {
-      "op": ">=",
-      "value": 0.95,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
-    },
-    "map_update.split_6_7.vs_one_update.label_agreement": {
-      "op": ">=",
-      "value": 0.95,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
-    },
-    "map_update.split_6_7.stability.id_agreement": {
-      "op": ">=",
-      "value": 0.8,
-      "unit": "",
-      "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in both maps"
-    },
-    "map_update.split_6_7.vs_one_update.id_agreement": {
-      "op": ">=",
-      "value": 0.8,
-      "unit": "",
-      "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in both maps"
-    },
-    "map_update.split_6_7.stability.centre_delta_median_m": {
-      "op": "<=",
-      "value": 0.1,
-      "unit": "m",
-      "tolerance_abs": 0.03,
-      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
-    },
-    "map_update.split_6_7.vs_one_update.centre_delta_median_m": {
-      "op": "<=",
-      "value": 0.1,
-      "unit": "m",
-      "tolerance_abs": 0.03,
-      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
-    },
-    "map_update.split_6_7.stability.extent_delta_median_rel": {
-      "op": "<=",
-      "value": 0.2,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "median relative OBB size difference of paired objects"
-    },
-    "map_update.split_6_7.vs_one_update.extent_delta_median_rel": {
-      "op": "<=",
-      "value": 0.2,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "median relative OBB size difference of paired objects"
-    },
-    "map_update.split_6_7.stability.obb_iou_median": {
-      "op": ">=",
-      "value": 0.5,
-      "unit": "",
-      "tolerance_abs": 0.08,
-      "description": "median 3D IoU of paired OBBs"
-    },
-    "map_update.split_6_7.vs_one_update.obb_iou_median": {
+    "map_update.split_*.vs_one_update.obb_iou_median": {
       "op": ">=",
       "value": 0.5,
       "unit": "",

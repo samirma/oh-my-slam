@@ -82,7 +82,8 @@ The evaluator compares these values with the camera poses of the map built in on
      "seen_in": {"20260929_122226.jpg": [0.29, 0.42, 0.42, 0.59],
                  "20260929_122229.jpg": [0.81, 0.43, 0.95, 0.66]}}
   ],
-  "stable": ["monitor", "keyboard"]
+  "stable": ["monitor", "keyboard"],
+  "splits": [[4, 4, 5], [6, 7]]
 }
 ```
 
@@ -96,21 +97,35 @@ The evaluator compares these values with the camera poses of the map built in on
   default every object the early images observe, except the absent ones, is compared.
 * The images are in name order. The **early part** of the sequence is the images up to the last one
   named in any `seen_in`.
+* `splits` is optional: the ways the sequence is mapped across several updates, each the sizes of
+  consecutive updates (at least two positive integers adding up to the number of images). By
+  default one split: the early part, then the rest.
 
-The evaluator builds two maps of the sequence, outside the repository. The first takes the whole
-sequence in one `mapper.sh update`. The second is an extended map: an update with the early part,
-then a second update of the same map with the rest of the images (the second update keeps the first
-one's map frame, so the two compare without alignment). Files about the same sequence are merged.
-Metrics:
+The evaluator builds, outside the repository, a map of the whole sequence in one `mapper.sh
+update`, and one map per split (`split_<sizes>`, e.g. `split_4_4_5`), an update per part, keeping
+each update's `-t full` scene. Files about the same sequence are merged. Metrics:
 
-* `map_update.absent_fraction` and `map_update.incremental.absent_fraction` are the share of the
-  `absent` objects that the whole-sequence map, and the extended map, no longer have. A remnant is
-  a map object with a compatible label (its own or one of its `detected_as`) whose box, projected
-  into the `seen_in` images, covers at least a quarter of the region in one of them. If none of
-  those images is registered in the map, the label alone decides.
-* `map_update.before_present_fraction` is the same test on the extended map after its first update.
-  It is the control: an object that was never detected early cannot be seen to disappear.
-* `map_update.stability.*` are the metrics of `map.stability.*` for the objects that never
-  changed: the objects of the extended map after its second update that the early images observe
-  against the objects after its first update (ids, labels, OBBs). Their targets are the
-  `map_update.*` entries of `examples/targets.json`.
+* `map_update.absent_fraction` and `map_update.<split>.absent_fraction` are the share of the
+  `absent` objects that the whole-sequence map, and each split map after its last update, no longer
+  have. A remnant is a map object with a compatible label (its own or one of its `detected_as`)
+  whose box, projected into the `seen_in` images, covers at least a quarter of the region in one of
+  them. If none of those images is registered in the map, the label alone decides.
+* `map_update.hole_fraction` and `map_update.<split>.hole_fraction`: no hole where an absent object
+  stood. The map cloud is projected, with the map's own poses, into each registered `seen_in`
+  image; the region (8 x 8 cells) and a ring around it are compared: a region cell with no map
+  point, or whose nearest point lies more than 25 % behind the ring's median nearest depth, is a
+  hole.
+* `map_update.before_present_fraction` is the same test as `absent_fraction` on the split map whose
+  first update is exactly the early part, after that update. It is the control: an object that was
+  never detected early cannot be seen to disappear.
+* `map_update.<split>.stability.*` are the metrics of `map.stability.*` for the objects that never
+  changed: the objects the first update's images observe, after the last update against after the
+  first (ids, labels, OBBs; one map frame, no alignment).
+* `map_update.<split>.ids_persistent_fraction`: every id an update published for an unchanged object
+  is, in every later update, still an object with a compatible label whose box overlaps or nearly
+  coincides with it.
+* `map_update.<split>.vs_one_update.*`: the split map against the one-update map, as `map.stability.*`
+  (an id may differ where an earlier update of the split had published one).
+
+Their targets are the `map_update.*` entries of `examples/targets.json` (`map_update.split_*.…`
+patterns for the splits).

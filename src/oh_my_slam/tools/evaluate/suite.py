@@ -499,6 +499,7 @@ class Evaluation:
                                  same_objects_problems(doc_objects(single), doc_objects(doc),
                                                        geometry=True))
         target = self.out / "outputs" / "locate.ply"
+        target.parent.mkdir(parents=True, exist_ok=True)
         rec = self.run("locate_ply", "locate_ply", "mapper.sh", *args, "-f", "ply", "-o", target,
                        stdout="empty", output=target)
         if rec.ok:
@@ -552,6 +553,8 @@ class Evaluation:
                 views.append(mapupdate.MapView.of(doc, d, cloud=k == len(parts)))
             else:
                 splits.append(mapupdate.SplitMaps(s, parts, views))
+        for name, why in failed.items():
+            self.metrics.fail(mapupdate.split_metric_ids(name), why)
         with self.metrics.expect(*ids):
             if single is None:
                 self.metrics.fail(ids, "the map of the whole sequence was not built")

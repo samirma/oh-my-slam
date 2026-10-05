@@ -12,8 +12,18 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.core.atomic import atomic_write_bytes
-from oh_my_slam.tools.evaluate.metrics import TargetsError, baseline_values, load_targets
-from oh_my_slam.tools.evaluate.report import build_result, environment, write_report
+from oh_my_slam.tools.evaluate.metrics import (
+    Metrics,
+    TargetsError,
+    baseline_values,
+    load_targets,
+)
+from oh_my_slam.tools.evaluate.report import (
+    build_result,
+    environment,
+    summary_counts,
+    write_report,
+)
 from oh_my_slam.tools.evaluate.runner import REPO, Runner
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, STREET2, Evaluation
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
@@ -36,6 +46,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="stored baseline run to compare with (default: %(default)s)")
     ap.add_argument("--street2", type=Path, default=STREET2,
                     help="the street2 video every benchmark maps (default: %(default)s)")
+    ap.add_argument("--rejudge", type=Path, default=None, metavar="RESULT_DIR",
+                    help="run nothing: judge a stored run's result.json again with --targets and "
+                         "--baseline (targets are data) and rewrite its result.json and "
+                         "summary.md")
     ap.add_argument("--set-baseline", action="store_true",
                     help="store this run's result as the baseline, after comparing it with the "
                          "previous one")
@@ -66,6 +80,23 @@ def report_line(s: dict[str, Any]) -> str:
             f"{regressions}")
 
 
+def rejudge(folder: Path, targets: dict[str, Any], baseline_path: Path, targets_path: Path
+            ) -> dict[str, Any]:
+    """A stored run judged again: its metric values with the current targets and baseline."""
+    result = json.loads((folder / "result.json").read_text())
+    metrics = Metrics()
+    for row in result.get("metrics", []):
+        metrics.add(row["id"], row.get("value"), row.get("detail"), row.get("error"))
+    baseline, about = load_baseline(baseline_path)
+    metrics.judge(targets, None if baseline is None else baseline_values(baseline))
+    result["metrics"] = [m.to_dict() for m in metrics.items.values()]
+    result["baseline"] = about
+    result["targets"] = str(targets_path)
+    result["summary"] = summary_counts(metrics, about)
+    result["judged"] = datetime.now(UTC).isoformat(timespec="seconds")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -73,6 +104,17 @@ def main(argv: list[str] | None = None) -> int:
     except TargetsError as exc:
         print(f"evaluate: {exc}", file=sys.stderr)
         return 2
+    if args.rejudge is not None:
+        folder = args.rejudge.expanduser().resolve()
+        try:
+            result = rejudge(folder, targets, args.baseline.expanduser(), args.targets)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"evaluate: cannot judge {folder} again: {exc}", file=sys.stderr)
+            return 2
+        res, md = write_report(folder, result)
+        print(f"evaluate: {report_line(result['summary'])} — {md}", file=sys.stderr)
+        print(md)
+        return 1 if result["summary"]["failed"] else 0
     start = datetime.now(UTC)
     out = (args.out or DATA / start.strftime("%Y%m%dT%H%M%SZ")).expanduser().resolve()
     if out == REPO or REPO in out.parents:

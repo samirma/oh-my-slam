@@ -119,11 +119,12 @@ class MapView:
 
 def map_points(map_dir: Path) -> NDArray[np.float64] | None:
     """The stored map cloud's points (read-only), None when the map has none."""
+    from oh_my_slam.core.errors import OhMySlamError
     from oh_my_slam.mapping import export, store
 
     try:
         xyz = export.map_cloud(store.MapReader(map_dir)).xyz
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, OhMySlamError):
         return None
     return np.asarray(xyz, np.float64) if len(xyz) else None
 

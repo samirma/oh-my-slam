@@ -44,16 +44,18 @@ def targets_file(tmp_path: Path, doc: dict | None = None) -> Path:
 
 def test_shipped_targets_cover_every_metric() -> None:
     targets = load_targets(EXAMPLES / "targets.json")
-    assert set(expected_ids()) <= set(targets)
     gt_ids = {"gt.objects.recall", "gt.objects.precision", "gt.objects.obb_iou_median",
               "gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg",
               "gt.poses.pitch_err_median_deg"}
     assert gt_ids <= set(targets)
     # no stale targets: besides those, only per-stage targets (explicit, or patterns)
+    # (a split of the office sequence is named after its sizes: its targets are patterns too)
     named = {k for k in targets if "*" not in k and ".stage." not in k}
-    assert named == set(expected_ids()) | gt_ids
     patterns = {k for k in targets if "*" in k}
-    assert all(k.startswith("perf.") and ".stage." in k for k in patterns)
+    expected = set(expected_ids())
+    assert named == {k for k in expected if target_for(targets, k) is targets.get(k)} | gt_ids
+    assert all(target_for(targets, k) is not None for k in expected)
+    assert all(k.startswith(("perf.", "map_update.split_*.")) for k in patterns)
     # every performance group's stages have a target, whatever stage a command adds
     for mid in expected_ids():
         parts = mid.split(".")
@@ -330,3 +332,23 @@ def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert not (tmp_path / "o").exists()
     err = capsys.readouterr().err
     assert "outside the repository" in err
+
+
+def test_a_stored_run_is_judged_again_with_new_targets(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Targets are data: ``--rejudge`` judges a stored run again without running anything."""
+    m = judged(tmp_path, {"perf.a.wall_s": 2.4, "pose.b.fraction": 0.95, "contract.c.x": 0})
+    run = tmp_path / "run"
+    write_report(run, result_of(m, [], {"status": "missing"}))
+    strict = targets_file(tmp_path, {"metrics": {"perf.a.wall_s": {"op": "<=", "value": 2.0},
+                                                 "pose.b.fraction": {"op": ">=", "value": 0.9}}})
+    assert main(["--rejudge", str(run), "--targets", str(strict),
+                 "--baseline", str(tmp_path / "none.json")]) == 1
+    result = json.loads((run / "result.json").read_text())
+    by_id = {x["id"]: x for x in result["metrics"]}
+    assert by_id["perf.a.wall_s"]["passed"] is False and by_id["pose.b.fraction"]["passed"]
+    assert by_id["contract.c.x"]["passed"] is None  # no target any more
+    assert result["judged"] and result["summary"]["failed"] == 1
+    assert "judged again" in (run / "summary.md").read_text()
+    assert main(["--rejudge", str(tmp_path / "nothing")]) == 2
+    capsys.readouterr()

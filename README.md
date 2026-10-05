@@ -1441,7 +1441,8 @@ at the Python-module level:
 
 ```sh
 uv run python -m oh_my_slam.tools.evaluate [--out DIR] [--targets PATH] [--baseline PATH] \
-                                           [--set-baseline]
+                                           [--street2 PATH] [--set-baseline]
+uv run python -m oh_my_slam.tools.evaluate --rejudge RESULT_DIR [--targets PATH] [--baseline PATH]
 ```
 
 A single command benchmarks every entry point on `examples/`, strictly one command at a time
@@ -1450,25 +1451,75 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * the server's cold start and resident memory (it stops and restarts the server)
 * `reconstruct.sh` (JSON and PLY), `segment.sh -i -d` and `view.sh -i` on `restaurant.jpg`
 * `segment.sh -i` on each of the 79 `ainex-captures` frames
-* `mapper.sh update` on the sequence, once in one update and once split across 3 updates
-* `segment.sh -m` and `view.sh -m` on both maps
+* `mapper.sh update` on the sequence, once in one update and once split across 3 updates; between
+  the split map's first and second update, `mapper.sh locate` of the second update's captures
+  (held out of the map so far)
+* `segment.sh -m -d` and `view.sh -m` on the one-update map, and `segment.sh -m -f ply -o` on the
+  split map
+* `mapper.sh locate` on the one-update map (the reference map): `-t single` JSON, `-t full` JSON
+  and `-f ply -o`; the map folder, hidden entries (`.staging/`, `.lock`) included, must not change
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
-  ones): the whole sequence in one update, and as an extended map (an update with the early images,
-  then one with the rest)
+  ones): the whole sequence in one update, and split as its annotation says (4+4+5 and 6+7)
+* `mapper.sh update` on `street2.mp4` (150 s of street video) at the default `-fps`. It lives
+  outside the repository, by default in `~/oh-my-slam-data/loop/inputs/street2.mp4`; `--street2`
+  names another place. Without it the street2 metric fails and says where it looked.
+* `server.sh` over a scratch workspace with copies of the reference inputs and map (see below)
 
-Video sampling (`-fps`) is not covered, because the examples contain no video. The metric groups
-are:
+### The `ainex-captures` file names
+
+The spec no longer spells out the capture names, which encode the **commanded** head motion as
+`NNN_<motion>_<tilt>.jpg` (`tools/evaluate/names.py`; a name that does not follow it is an error):
+
+* `NNN` is the capture order.
+* `<motion>` is the commanded yaw relative to frame 001, positive to the left: `bootstrap` (0°),
+  `bootstrap_side1` / `bootstrap_side2` (0°, after a small sideways step), `bootstrap_leftYYY` and
+  `bootstrap_leftYYY_side` (+YYY°), `left_YYY` (+YYY°), `right_to_YYY` (+YYY°, turning back
+  towards 0°) and `right_YYY` (−YYY°).
+* `<tilt>` is `level`, or `up` / `down` relative to the `level` frame of the same motion.
+
+The same-heading pairs are 001/053 (053 returns to 001's heading) and 026/078 (`left_210` meets
+`right_150`, which closes the 360° loop).
+
+### Metrics
 
 | Group | Measures |
 |---|---|
-| `perf.*` | End-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page. The report also breaks each command down per stage: time, and client and server peak memory. |
-| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs. |
-| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. |
-| `map_update.*` | Map update on `office_sequence`: the share of the annotated absent objects (the cup) that the map of the whole sequence (`absent_fraction`) and the extended map (`incremental.absent_fraction`) no longer have; the same test on the extended map after its first update as the control (`before_present_fraction`); and the stability of ids, labels and OBBs (`stability.*`, as in `map.*`) of the objects that never changed between the first and the second update of the extended map. A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed is annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
+| `perf.*` | Per image and per mapping update: end-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page; for a map built in several updates also its slowest update (`per_update_wall_s`). Groups: the single-image commands, one `ainex-captures` frame (median), the two `ainex` maps, `segment.sh -m`, `view.sh -m`, `mapper.sh locate`, the office maps (one update, and the slowest update of the splits) and street2. |
+| `perf.<group>.stage.<stage>.*` | Per stage, every stage the commands record: seconds (`.s`: median over the frames of a per-frame group, else the slowest run, so per image and per mapping update), client (`.client_peak_mb`) and server (`.server_peak_gb`) peak memory while it ran. |
+| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs, for both `ainex` maps; `pose.locate.*` the same for the held-out captures `mapper.sh locate` placed (located fraction, yaw error relative to the map's capture 001; the detail compares each with the pose the map gives it once added); `pose.street2.registered_fraction` the share of the video's sampled frames the map registered. |
+| `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. As `mapper.md` allows, an id may differ from the one-update map's where an earlier update of the split map had published it: `id_agreement` counts such a pair as agreeing (its detail keeps the strict share, `same_id`). |
+| `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids, labels and OBBs of the unchanged objects from the first update to the last (`stability.*`); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, are annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
-| `contract.*` | Colour contract, OpenLABEL validity, stdout purity, artefacts, same objects, and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `contract.*` | Colour contract, OpenLABEL validity (and `mapper.sh locate`'s located cameras marked as such), stdout purity (including `server.sh`, and `locate -f ply`'s one pose line per input image), artefacts, same objects (`locate -t full` gives the map as `update -t full` does), and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
+| `server_sh.*` | `server.sh` (http_server.md "Evaluation"); see below. |
 | `gt.*` | Accuracy against ground truth, when annotations exist. |
+
+### `server.sh`
+
+The evaluator starts `server.sh --data <out>/server_sh/ws --no-browser` (port 0), with copies of
+the reference inputs and of the one-update `ainex` map in that workspace.
+
+* **Performance:** start-up time (to the `listening on` line), resident memory of its process tree
+  once listening, time from opening the web application to `body[data-ready=true]`, latency of
+  read-only requests (median and p95 when idle; p95 of the requests made while a job runs), and the
+  median overhead of a job over the same command run from the shell.
+* **Parity:** the operations come from the service's own `/api/operations` (the commands'
+  `commands.spec.describe()`), so a new mode or option is covered without changing the evaluator.
+  Each operation gets a default case on the reference inputs and one case per non-default choice,
+  per artefact folder and per point-cloud attribute. Each case runs the command from the shell
+  twice and then as a job, and the job's result and every file of its artefact folder must be
+  byte-identical to the command's; for `view.sh`, what its viewer serves (`VIEWER_ROUTES`). The
+  models are not bit-reproducible from one request to the next, so the service and the shell
+  runs share an **inference proxy** (`tools/evaluate/proxy.py`): it forwards the first request of
+  a kind to the inference server and answers identical requests (same route, fields and input
+  file contents) with the recorded response. A difference is a mismatch, unless the command's
+  own two runs differ too (`unverifiable`).
+* **UI:** the web application's browser tests (`tests/browser/test_webapp*.py`, `-m browser`,
+  with the stub inference server in an isolated runtime folder), and the vendored axe-core
+  (WCAG 2.0/2.1 A and AA) on the live service's pages over the reference data.
+
+### Targets, baseline and results
 
 Per-stage memory comes from two sources. Each command records its stages (`core.timing`), and
 the peak resident set of its own process during each stage, sampled every 50 ms. It writes these
@@ -1477,11 +1528,15 @@ server reports no memory of its own, so the evaluator samples two figures every 
 command's process tree, which includes COLMAP, and the server's physical footprint. It
 attributes each sample to the stage whose time window it falls in.
 
-Targets are data in `examples/targets.json`. Each target is an `op`/`value` pair with regression
-tolerances, and a target can be edited without changing code. The file's `rationale` explains
-each group of targets. Each metric's `measured` value is the reference run the targets were
-derived from, and the evaluator ignores it. Ground-truth files dropped into
-`examples/ground_truth/` are picked up without code changes (see its `README.md`).
+Targets are data in `examples/targets.json`, and every metric has one. Each target is an
+`op`/`value` pair with regression tolerances, and a target can be edited without changing code.
+A key with `*` is a pattern that targets every metric it matches without a target of its own (the
+most specific pattern wins): the per-stage metrics and the office splits, whose names are data,
+are targeted that way. The file's `rationale` explains each group of targets. Each metric's
+`measured` value is the reference run the targets were derived from, and the evaluator ignores
+it. Ground-truth files dropped into `examples/ground_truth/` are picked up without code changes
+(see its `README.md`). `--rejudge RESULT_DIR` runs nothing: it judges a stored run again with the
+current targets and baseline and rewrites its `result.json` and `summary.md`.
 
 Each run is compared with the stored baseline `~/oh-my-slam-data/evaluations/baseline.json`,
 and regressions are flagged. Without a baseline the report says `baseline missing — not
@@ -1498,6 +1553,8 @@ Results go outside the repository, to `~/oh-my-slam-data/evaluations/<UTC>/` by 
 * `runs/` (stdout, stderr and timings per command)
 * `outputs/`
 * `maps/`
+* `server_sh/` (the service's workspace, the shell side of the parity cases, the browser tests'
+  report)
 
 The command prints the path of `summary.md` on stdout. It exits 0 when every metric passes, 1
 when one fails, and 2 on a usage error. It needs the model weights. It also needs Microsoft Edge
