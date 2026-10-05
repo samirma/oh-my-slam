@@ -435,7 +435,8 @@ def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(api, "update", fake_update)
     monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
         stdout) if output is None else PayloadWriter(path=output))
-    base = ["update", "-i", "x.jpg", "-m", str(tmp_path / "m")]
+    (tmp_path / "x.jpg").write_bytes(b"")  # the inputs are checked before update() runs
+    base = ["update", "-i", str(tmp_path / "x.jpg"), "-m", str(tmp_path / "m")]
     for bad in (["-p", "voxel=0.1"], ["-f", "ply", "-p", "stride=2"],
                 ["-f", "ply", "-p", "max-depth=3"], ["-f", "ply", "-p", "voxel=-1"]):
         with pytest.raises(UsageError):
@@ -473,7 +474,10 @@ def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path
         path=tmp_path / "out.json"))
     monkeypatch.setattr(cli_mapper.log, "warning", lambda msg, *a: warnings.append(msg % a))
     for fps in ("0", "-1", "3"):
-        assert cli_mapper.main(["update", "-i", "a.jpg", "b.jpg", "-m", str(tmp_path / "m"),
+        for name in ("a.jpg", "b.jpg"):  # the inputs are checked before update() runs
+            (tmp_path / name).write_bytes(b"")
+        assert cli_mapper.main(["update", "-i", str(tmp_path / "a.jpg"), str(tmp_path / "b.jpg"),
+                                "-m", str(tmp_path / "m"),
                                 "-fps", fps]) == 0
         assert warnings.pop() == "-fps applies to video input only; ignored for images"
     assert len(calls) == 3

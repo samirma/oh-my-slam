@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -33,14 +34,40 @@ def preflight_dir(folder: Path, option: str) -> None:
 def preflight_file(path: Path, option: str) -> None:
     """``preflight_dir`` for the folder of a file the command will write, which must not be a
     folder itself."""
-    path = Path(path)
+    if _check_file(Path(path), option):
+        preflight_dir(Path(path).parent, option)
+
+
+def check_dir(folder: Path, option: str) -> None:
+    """``preflight_dir`` without touching the filesystem: the same usage errors for the cases it
+    can see (a file in the way, a folder it may not write); ``preflight_dir`` still has the last
+    word when the command runs."""
+    folder = Path(folder)
+    probe = folder
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if probe.exists() and not probe.is_dir():
+        code = errno.EEXIST if probe == folder else errno.ENOTDIR
+        raise UsageError(f"{option} {folder}: cannot write there ({os.strerror(code)})")
+    if not os.access(probe, os.W_OK | os.X_OK):
+        raise UsageError(f"{option} {folder}: cannot write there ({os.strerror(errno.EACCES)})")
+
+
+def check_file(path: Path, option: str) -> None:
+    """``preflight_file`` without touching the filesystem (see ``check_dir``)."""
+    if _check_file(Path(path), option):
+        check_dir(Path(path).parent, option)
+
+
+def _check_file(path: Path, option: str) -> bool:
+    """The checks of a file target itself; True when its folder must still be checked."""
     if path.is_dir():
         raise UsageError(f"{option} {path} is a folder; give the path of the file to write")
     if _is_special(path):
         if not os.access(path, os.W_OK):
             raise UsageError(f"{option} {path}: cannot write there (permission denied)")
-        return
-    preflight_dir(path.parent, option)
+        return False
+    return True
 
 
 def _is_special(path: Path) -> bool:

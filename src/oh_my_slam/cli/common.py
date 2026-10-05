@@ -1,56 +1,15 @@
-"""Shared command-line plumbing: argument errors → exit 2, exceptions → exit codes, one payload,
-and the ``-o <file>`` / ``-p <attrs>`` options of the commands that write a result."""
+"""Shared command-line plumbing: argument errors → exit 2, exceptions → exit codes, one payload.
+The commands' options and validation are defined in ``commands/spec.py``."""
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from collections.abc import Callable
-from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import NoReturn
 
-from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, help_text, parse_cloud_attrs
-from oh_my_slam.core.errors import ExitCode, OhMySlamError, UsageError
-
-if TYPE_CHECKING:
-    from _typeshed import SupportsWrite
-
-
-class ArgumentParser(argparse.ArgumentParser):
-    """argparse with single-dash long options kept (``-fps``), errors routed to exit 2, and the
-    help on stderr: it is human-facing, and stdout carries the result only (spec §4; ``view.sh``
-    never writes to stdout)."""
-
-    def error(self, message: str) -> NoReturn:
-        self.print_usage(sys.stderr)
-        self.exit(int(ExitCode.USAGE), f"{self.prog}: error: {message}\n")
-
-    def print_help(self, file: SupportsWrite[str] | None = None) -> None:
-        super().print_help(sys.stderr if file is None else file)
-
-    def print_usage(self, file: SupportsWrite[str] | None = None) -> None:
-        super().print_usage(sys.stderr if file is None else file)
-
-
-def add_result_options(ap: argparse.ArgumentParser, attrs_help: str) -> None:
-    """``-o <file>`` (the result goes there, stdout stays empty) and ``-p <attrs>``."""
-    ap.add_argument("-o", dest="output", type=Path, metavar="FILE",
-                    help="write the result to FILE instead of stdout (stdout then stays empty)")
-    ap.add_argument("-p", dest="attrs", action="append", metavar="ATTRS", help=attrs_help)
-
-
-def attrs_help(scope: CloudScope, requires: str) -> str:
-    return f"{help_text(scope)}; {requires}"
-
-
-def cloud_attrs_arg(values: list[str] | None, scope: CloudScope, *, writes_ply: bool,
-                    requires: str) -> CloudAttrs:
-    """The validated ``-p`` attributes, checked before any server connection or inference; ``-p``
-    without a PLY output is a usage error."""
-    if values and not writes_ply:
-        raise UsageError(f"-p sets point-cloud attributes, which {requires}")
-    return parse_cloud_attrs(values, scope)
+from oh_my_slam.commands.parser import ArgumentParser as ArgumentParser
+from oh_my_slam.core.errors import ExitCode, OhMySlamError
 
 
 def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None = None) -> NoReturn:
@@ -63,7 +22,7 @@ def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None
         code = int(exc.exit_code)
     except KeyboardInterrupt:
         print(f"{prog}: interrupted", file=sys.stderr)
-        code = 130
+        code = int(ExitCode.INTERRUPTED)
     except BrokenPipeError:
         code = 0
     except Exception as exc:
