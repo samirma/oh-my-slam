@@ -11,13 +11,17 @@ name → value — becomes the command's own command line in generic steps, by o
   are the command's and nothing is queued for an invalid request; ``spec.needs_inference`` says
   whether the job joins the inference queue.
 
+Options that mean nothing to the service (``Option.service``: view.sh ``--no-browser``) are not
+API parameters.
+
 A job is a list of steps, each a Python entry point run as a subprocess: the command itself
 (``oh_my_slam.cli.<command>``), and — for a mode whose output is the browser (``view.sh``), or a
-single-image request that asks for its viewer — the viewer's own bundle writer
-(``python -m oh_my_slam.viewer.bundle save``), which saves the viewer's data in the job's
+single-image request that asks for its viewer — the viewer step (``oh_my_slam.cli.view_save``),
+given the command's own command line, which saves the bundle view.sh would serve in the job's
 ``viewer/`` folder, so that the service serves that viewer in-process, after a page reload or a
-service restart too. A browser mode runs only that step: opening a browser and serving the page
-are the service's part.
+service restart too. A browser mode runs only that step. After a command step, the viewer step
+replays the command's recorded inference (``client.replay``): no second pass, the same
+detections and ids.
 """
 
 from __future__ import annotations
@@ -34,9 +38,12 @@ from oh_my_slam.core.errors import HTTP_STATUS, ExitCode, OhMySlamError, UsageEr
 PATH_IN = frozenset({Kind.IMAGE, Kind.IMAGES, Kind.IMAGES_OR_VIDEO, Kind.MAP})
 OUT_DIR = "out"  # the job's folder for everything the command writes
 VIEWER_DIR = "viewer"  # the job's saved viewer bundle
-VIEWER_MODULE = "oh_my_slam.viewer.bundle"
+INFERENCE_DIR = "inference"  # the command step's recorded inference
+VIEWER_MODULE = "oh_my_slam.cli.view_save"
 VIEWER_PROG = "view.sh"  # the viewer step reports its errors as view.sh does
 VIEWER_KINDS = {Kind.IMAGE: "image", Kind.MAP: "map"}
+ENV_RECORD = "OH_MY_SLAM_INFERENCE_RECORD"  # client.replay
+ENV_REPLAY = "OH_MY_SLAM_INFERENCE_REPLAY"
 EXTENSIONS = {"json": ".json", "ply": ".ply", "png": ".png", "csv": ".csv", "markdown": ".md",
               "html": ".html"}
 
@@ -65,7 +72,8 @@ class Operation:
 
     @property
     def options(self) -> list[spec.Option]:
-        return self.command.mode_options(self.mode)
+        """The mode's API parameters: its options that mean something to the service."""
+        return [o for o in self.command.mode_options(self.mode) if o.service]
 
     @property
     def browser(self) -> bool:
@@ -105,6 +113,7 @@ class Step:
     module: str
     argv: list[str]
     timings: bool = True  # records OH_MY_SLAM_TIMINGS (the command's own record)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -119,7 +128,9 @@ class Prepared:
     result: str | None = None  # the -o file name in out/
     result_format: str | None = None
     inference: bool = True  # the job uses the inference server
+    conditional: bool = False  # ... depending on what it reads (re-evaluated when it starts)
     viewer: bool = False  # the job saves a viewer
+    actual: dict[str, Any] = field(default_factory=dict)  # the parameters as the command gets them
 
 
 def _values(v: Any) -> list[Any]:
@@ -150,10 +161,15 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path, viewer: bool
         prep.problems.append(problem((), "the request body must be a JSON object of parameters"))
         return prep
     by_name = {o.name: o for o in op.options}
+    hidden = {o.name for o in op.command.mode_options(op.mode)} - set(by_name)
     actual: dict[str, Any] = {}
     shown: dict[str, Any] = {}
     out = job_dir / OUT_DIR
     for name, value in raw.items():
+        if name in hidden:
+            prep.problems.append(problem((name,), f"unrecognized parameters for {op.label}: "
+                                         f"{name} (it concerns the command line only)"))
+            continue
         o = by_name.get(name)
         if o is None or value is None:  # unknown ones: the command's parser names them
             actual[name] = shown[name] = value
@@ -211,20 +227,31 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path, viewer: bool
     prep.problems = spec.dry_run(op.command, op.mode, actual)
     if prep.problems:
         return prep
-    args = spec.parse(op.command, op.mode, actual)
-    prep.inference = spec.needs_inference(op.mode, args)
+    prep.actual = actual
+    prep.conditional = op.mode.inference == "conditional"
+    prep.inference = inference_of(op, actual)
     prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown)]
+    argv = spec.argv_of(op.command, op.mode, actual)
+    recording = str(job_dir / INFERENCE_DIR)
     if not op.browser:
-        prep.steps.append(Step(op.program.prog, op.module,
-                               spec.argv_of(op.command, op.mode, actual)))
+        prep.steps.append(Step(op.program.prog, op.module, argv,
+                               env={ENV_RECORD: recording} if viewer else {}))
     if (op.browser or viewer) and viewed is not None:
-        kind = VIEWER_KINDS[viewed.kind]
         prep.steps.append(Step(VIEWER_PROG, VIEWER_MODULE,
-                               ["save", str(job_dir / VIEWER_DIR), kind, str(actual[viewed.name])],
-                               timings=op.browser))
+                               [str(job_dir / VIEWER_DIR), op.program.prog, *argv],
+                               timings=op.browser,
+                               env={} if op.browser else {ENV_REPLAY: recording}))
         prep.viewer = True
-        prep.inference = prep.inference or kind == "image"
     return prep
+
+
+def inference_of(op: Operation, actual: Mapping[str, Any]) -> bool:
+    """Whether a job of ``op`` with these parameters uses the inference server now (a
+    conditional mode's condition is read from what it reads, e.g. the map's keyframes)."""
+    try:
+        return spec.needs_inference(op.mode, spec.parse(op.command, op.mode, actual))
+    except OhMySlamError:
+        return op.mode.inference != "never"
 
 
 def error_body(problems: list[Problem]) -> tuple[int, dict[str, Any]]:

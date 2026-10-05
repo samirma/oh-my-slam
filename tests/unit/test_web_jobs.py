@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
@@ -174,10 +175,18 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
 
     # one upload, one job: the command's result and the image's viewer
     up = client.post("/api/uploads?name=photo.jpg", headers=octet, content=image).json()
-    both = run_job(service, client, "segment-image", {"image": up["path"]}, query="?viewer=true")
+    both = run_job(service, client, "segment-image", {"image": up["path"], "min_score": 0.2},
+                   query="?viewer=true")
     assert both["result"]["name"] == "result.json" and both["viewer"]
     assert client.get(f"/viewer/job/{both['id']}/api/meta").json()["mode"] == "image"
     assert not (ws.uploads / up["id"]).exists()
+    # the viewer replays the command's inference: the same objects and ids as the result
+    scene = json.loads(client.get(both["result"]["url"]).content)
+    objects = {int(k): o["type"] for k, o in scene["openlabel"].get("objects", {}).items()}
+    catalog = client.get(f"/viewer/job/{both['id']}/api/catalog").json()
+    assert {r["id"]: r["label"] for r in catalog} == objects
+    recorded = (ws.jobs / both["id"] / "inference" / "responses.jsonl").read_text().splitlines()
+    assert sum(json.loads(r)["route"].endswith("segment") for r in recorded) == 1
 
     # after a restart (a new runner and service on the same workspace) the viewer is still there
     again = Runner(ws)
@@ -188,3 +197,52 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
         assert r.status_code == 200
         assert r.json() == client.get(f"/viewer/job/{job['id']}/api/catalog").json()
     again.shutdown()
+
+
+def test_recorded_inference_replays_identically(stub_server: None, tmp_path: Path) -> None:
+    """``client.replay``: a command run on a recording gives the same bytes without the server;
+    a missing recording is a clear error."""
+    image = jpeg(tmp_path / "photo.jpg")
+    rec = tmp_path / "rec"
+    first = subprocess.run([str(REPO / "segment.sh"), "-i", str(image), "--min-score", "0.3"],
+                           capture_output=True, timeout=300,
+                           env={**os.environ, "OH_MY_SLAM_INFERENCE_RECORD": str(rec)})
+    assert first.returncode == 0, first.stderr.decode()
+    assert (rec / "responses.jsonl").is_file()
+    nowhere = tmp_path / "no-server"  # a runtime dir with no inference server in it
+    nowhere.mkdir()
+    env = {**os.environ, "OH_MY_SLAM_INFERENCE_REPLAY": str(rec),
+           "OH_MY_SLAM_RUNTIME_DIR": str(nowhere)}
+    again = subprocess.run([str(REPO / "segment.sh"), "-i", str(image), "--min-score", "0.3"],
+                           capture_output=True, timeout=300, env=env)
+    assert again.returncode == 0, again.stderr.decode()
+    assert again.stdout == first.stdout
+    missing = subprocess.run([str(REPO / "segment.sh"), "-i", str(image)], capture_output=True,
+                             timeout=300, env={**env, "OH_MY_SLAM_INFERENCE_REPLAY":
+                                               str(tmp_path / "absent")})
+    assert missing.returncode == 1
+    assert b"no inference recording in" in missing.stderr
+
+
+def test_a_saved_image_bundle_serves_the_same_viewer(tmp_path: Path) -> None:
+    """save_bundle / load_bundle: /api/meta byte-identical, and every -i control's cloud the same
+    points, colours, labels and normals."""
+    from oh_my_slam.viewer.bundle import image_bundle, load_bundle, save_bundle
+    from oh_my_slam.viewer.routes import ViewerRoutes, parse_cloud_payload
+    from tests.browser.scenes import synthetic_image
+
+    (tmp_path / "img").mkdir()
+    img, client = synthetic_image(tmp_path / "img")
+    live = image_bundle(img, client)
+    save_bundle(live, tmp_path / "saved")
+    a, b = ViewerRoutes(live), ViewerRoutes(load_bundle(tmp_path / "saved"))
+    for path in ("/api/meta", "/api/scene", "/api/catalog", "/api/segmented.png", "/"):
+        assert a.handle("GET", path).tobytes() == b.handle("GET", path).tobytes(), path
+    for query in ("", "color=segment&normals=on", "color=height&voxel=0.05", "stride=3",
+                  "min-depth=0.5&max-depth=3&edge=0", "color=none"):
+        ra, rb = a.handle("GET", "/api/cloud", query), b.handle("GET", "/api/cloud", query)
+        assert ra.status == rb.status == 200, query
+        (ha, xa), (hb, xb) = (parse_cloud_payload(r.tobytes()) for r in (ra, rb))
+        ha.pop("seconds"), hb.pop("seconds")
+        assert ha == hb, query
+        assert xa.keys() == xb.keys() and all(np.array_equal(xa[k], xb[k]) for k in xa), query

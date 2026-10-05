@@ -138,6 +138,10 @@ class Option:
     applies: tuple[When, ...] = ()  # applies when any of these holds (empty: always)
     applies_text: str = ""  # the same, in the command's words
     group: str | None = None  # mutually exclusive group (the modes' selectors)
+    # False: the option concerns the command line only and means nothing to the web service
+    # (spec §2.6), whose API and forms leave it out (view.sh --no-browser: the service shows the
+    # viewer itself)
+    service: bool = True
 
     def add_to(self, ap: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup) -> None:
         kw: dict[str, Any] = {"dest": self.name, "help": self.help}
@@ -602,7 +606,8 @@ VIEW = Program("view.sh", "Browser visualisation of an image or a map.", (
     Command("view.sh", None, "Browser visualisation of an image or a map.", (
         _image("RGB image to reconstruct and segment", group="source"),
         _map("map folder (opened read-only)", True, group="source"),
-        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False),
+        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False,
+               service=False),
     ), (
         Mode("image", "image", (IMAGE_RULE,), "required",
              "reconstructs and segments the image with the inference server",
@@ -815,6 +820,7 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
         "minimum": o.minimum, "exclusive_minimum": o.exclusive_minimum, "finite": o.finite,
         "omit_if_default": o.omit_if_default,
         "applies": [w.describe() for w in o.applies], "applies_text": o.applies_text,
+        "service": o.service,
     }
     if o.kind is Kind.ATTRS:
         out["attributes"] = _attributes(mode.scope())

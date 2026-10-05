@@ -156,4 +156,6 @@ def test_a_second_signal_kills_the_jobs_and_exits(data: Path) -> None:
     assert proc.returncode == 130 and time.monotonic() - t0 < 10
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
+    saved = json.loads(record.read_text())  # final before the exit: nothing left to recover
+    assert saved["state"] == "cancelled" and saved["pgid"] is None
     assert server("--data", str(data), "--status").returncode == 3

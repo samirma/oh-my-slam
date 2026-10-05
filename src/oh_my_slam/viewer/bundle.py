@@ -14,9 +14,9 @@ inference, point-cloud generation, OBB fitting, identity or colour logic lives h
 
 A bundle can be saved and loaded again (:func:`save_bundle`, :func:`load_bundle`): what the page
 shows plus the cloud source as computed, so a saved image bundle serves the same viewer — every
-live control included — without re-running inference. ``python -m oh_my_slam.viewer.bundle save
-<dir> image|map <path>`` is the entry point the ``server.sh`` web service runs as a job for
-``view.sh -i`` / ``-m``; a map is saved as a reference to the map folder (it is persisted already).
+live control included — without re-running inference; a map is saved as a reference to the map
+folder (it is persisted already). :func:`bundle_of` builds the bundle of a command's arguments, for
+``view.sh`` and for the web service's bundle writer (``oh_my_slam.cli.view_save``).
 """
 
 from __future__ import annotations
@@ -269,8 +269,9 @@ def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
 # bundles
 
 
-def image_bundle(image: Path, client: Any = None) -> ViewBundle:
-    """Reconstruct and segment ``image`` once (inference server); keep its cloud source."""
+def image_bundle(image: Path, client: Any = None, min_score: float | None = None) -> ViewBundle:
+    """Reconstruct and segment ``image`` once (inference server), keeping detections of at least
+    ``min_score`` (default: segmentation's); keep its cloud source."""
     from oh_my_slam.core.images import png_bytes
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.catalog import catalog_rows
@@ -282,8 +283,9 @@ def image_bundle(image: Path, client: Any = None) -> ViewBundle:
         from oh_my_slam.reconstruction.api import connect_server
 
         client = connect_server()
-    frame, dets = reconstruct_and_detect(Path(image), client)
-    seg = segment_frame(frame, client=client, detections=dets)
+    score = {} if min_score is None else {"min_score": min_score}
+    frame, dets = reconstruct_and_detect(Path(image), client, **score)
+    seg = segment_frame(frame, client=client, detections=dets, **score)
     source = image_cloud_source(frame, seg)
     up = source.up if source.up is not None else DEFAULT_UP_CAM
     return ViewBundle(
@@ -410,40 +412,10 @@ def load_bundle(folder: Path) -> ViewBundle:
         point_budget=meta["point_budget"])
 
 
-def _save_main(argv: list[str]) -> int:
-    """``save <dir> image <image>``: reconstruct and segment once (view.sh -i's stages) and save
-    the bundle; ``save <dir> map <map>``: record the map."""
-    import argparse
-
-    from oh_my_slam.core import timing
-    from oh_my_slam.core.log import claim_stdout
-    from oh_my_slam.core.timing import Stage
-
-    ap = argparse.ArgumentParser(prog="oh_my_slam.viewer.bundle")
-    ap.add_argument("action", choices=["save"])
-    ap.add_argument("folder", type=Path)
-    ap.add_argument("kind", choices=["image", "map"])
-    ap.add_argument("path", type=Path)
-    args = ap.parse_args(argv)
-    claim_stdout()  # nothing reaches stdout
-    if args.kind == "map":
-        save_map_reference(args.path, args.folder)
-        return 0
-    from oh_my_slam.reconstruction.api import connect_server
-
-    with timing.collect():
-        with timing.stage(Stage.CONNECT):
-            client = connect_server()  # exit 3 with the hint when the server is down
-        log.info("reconstructing and segmenting %s …", args.path.name)
-        with timing.stage(Stage.INFERENCE):
-            bundle = image_bundle(args.path, client)
-        save_bundle(bundle, args.folder)
-    return 0
-
-
-if __name__ == "__main__":
-    import sys as _sys
-
-    from oh_my_slam.core.process import run_main
-
-    run_main("view.sh", _save_main, _sys.argv[1:])
+def bundle_of(values: Any, client: Any = None) -> ViewBundle:
+    """The bundle of a command's validated arguments (``commands.spec.validate``): ``map`` (and
+    its opened ``reader``) gives the map's, else ``image`` the image's, with ``min_score`` when the
+    command has one. ``view.sh`` serves it; the web service's bundle writer saves it."""
+    if getattr(values, "map", None) is not None:
+        return map_bundle(values.map, getattr(values, "reader", None))
+    return image_bundle(values.image, client, getattr(values, "min_score", None))

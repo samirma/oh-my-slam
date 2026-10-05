@@ -8,9 +8,10 @@ over the bundle a job saved (``viewer.bundle.load_bundle``); ``/viewer/map/<name
 ``/`` is the web application's placeholder page.
 
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
-come from no foreign ``Origin`` and carry a non-form content type (``application/json``;
-``application/octet-stream`` for uploads), which a cross-site page cannot send without a CORS
-preflight that this service never grants.
+come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
+type a cross-site page cannot send without a CORS preflight, which this service never grants:
+``application/json``, or for an upload any type but the CORS-safelisted ``text/plain``,
+``application/x-www-form-urlencoded`` and ``multipart/form-data``.
 """
 
 from __future__ import annotations
@@ -48,7 +49,15 @@ from oh_my_slam.core.errors import HTTP_STATUS, ExitCode, OhMySlamError, ServerU
 from oh_my_slam.version import __version__
 from oh_my_slam.web import openapi
 from oh_my_slam.web.jobs import TERMINAL, JobError, Runner
-from oh_my_slam.web.operations import OUT_DIR, Operation, error_body, operations, prepare, problem
+from oh_my_slam.web.operations import (
+    OUT_DIR,
+    Operation,
+    error_body,
+    inference_of,
+    operations,
+    prepare,
+    problem,
+)
 from oh_my_slam.web.workspace import NotFoundError, Workspace
 
 START_COMMAND = "./start_inference_server.sh"
@@ -57,6 +66,9 @@ SSE_HEARTBEAT_S = 15.0
 MAX_UPLOAD_BYTES = 8 << 30  # 8 GiB: room for a long phone video
 MIN_FREE_BYTES = 1 << 30  # an upload never leaves less than this free on the workspace's disk
 UPLOAD_CHECK_BYTES = 64 << 20  # free space is re-checked as an undeclared upload grows
+HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at most this often
+SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
+                        "multipart/form-data"})  # what a cross-site form sends without a preflight
 VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
 _MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
           ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
@@ -157,14 +169,37 @@ class Service:
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     min_free_bytes: int = MIN_FREE_BYTES
     _hosts: set[str] | None = None
+    _hosts_at: float = 0.0
     _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
     _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
 
+    def __post_init__(self) -> None:
+        if self.runner.reevaluate is None:  # a conditional job's inference need, at its start
+            self.runner.reevaluate = lambda job: inference_of(self.ops[job.operation], job.actual)
+
     @property
-    def hosts(self) -> set[str]:
-        if self._hosts is None:
+    def port(self) -> int | None:
+        return urlsplit(self.url).port if self.url else None
+
+    def knows_host(self, host: str) -> bool:
+        """Whether ``host`` names this machine; an unknown one re-reads its addresses (a new
+        network), at most every ``HOSTS_REFRESH_S``."""
+        now = time.monotonic()
+        if self._hosts is None or (host not in self._hosts
+                                   and now - self._hosts_at > HOSTS_REFRESH_S):
             self._hosts = machine_hosts() | {h.lower() for h in self.extra_hosts}
-        return self._hosts
+            self._hosts_at = now
+        return host in self._hosts
+
+    def same_origin(self, origin: str, host_header: str) -> bool:
+        """Whether ``origin`` is this service: the request's own ``Host``, or one of the machine's
+        names on the service's port, over http."""
+        parts = urlsplit(origin)
+        if parts.scheme != "http" or not parts.hostname:
+            return False
+        if parts.netloc.lower() == host_header.strip().lower():
+            return True
+        return self.knows_host(parts.hostname.lower()) and parts.port == self.port
 
     def health(self) -> Json:
         return {
@@ -265,19 +300,22 @@ def guard(app: Any, service: Service) -> Callable[..., Awaitable[None]]:
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
         reason, status = None, 403
-        if _hostname(headers.get("host", "")) not in service.hosts:
+        host = headers.get("host", "")
+        if not service.knows_host(_hostname(host)):
             reason = "the Host header does not name this machine"
         elif scope["method"] in _STATE_CHANGING:
             origin = headers.get("origin")
-            if origin is not None and (urlsplit(origin).hostname or "").lower() \
-                    not in service.hosts:
+            ctype = headers.get("content-type", "").split(";")[0].strip().lower()
+            if origin is not None and not service.same_origin(origin, host):
                 reason = f"requests from {origin} are not accepted"
-            elif scope["method"] != "DELETE":
-                ctype = headers.get("content-type", "").split(";")[0].strip().lower()
-                want = "application/octet-stream" if scope["path"] == "/api/uploads" \
-                    else "application/json"
-                if ctype != want:
-                    reason, status = f"send the request body as {want}", 415
+            elif scope["method"] == "DELETE":
+                pass
+            elif scope["path"] == "/api/uploads":
+                if ctype in SAFELISTED:
+                    reason, status = "send the file with its own media type (e.g. image/jpeg " \
+                        "or application/octet-stream)", 415
+            elif ctype != "application/json":
+                reason, status = "send the request body as application/json", 415
         if reason is None:
             await app(scope, receive, send)
             return

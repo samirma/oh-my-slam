@@ -207,13 +207,13 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
             def capture_signals(self) -> Iterator[None]:
                 """Ctrl-C and SIGTERM stop the service normally (uvicorn would re-raise them
                 after its shutdown, skipping the jobs' and the workspace's clean-up)."""
-                saved = {s: signal.signal(s, self.stop_signal)
-                         for s in (signal.SIGINT, signal.SIGTERM)}
+                for s in (signal.SIGINT, signal.SIGTERM):
+                    signal.signal(s, self.stop_signal)
                 try:
                     yield
-                finally:
-                    for s, handler in saved.items():
-                        signal.signal(s, handler)
+                finally:  # straight to the hard stop: no default handler in between
+                    for s in (signal.SIGINT, signal.SIGTERM):
+                        signal.signal(s, hard_stop)
 
             def stop_signal(self, signum: int, frame: Any) -> None:
                 if self.should_exit:
@@ -230,7 +230,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         try:
             server.run(sockets=[sock])
         finally:
-            for s in (signal.SIGINT, signal.SIGTERM):  # a second signal while jobs stop
+            for s in (signal.SIGINT, signal.SIGTERM):  # a signal while the jobs stop: hard stop
                 signal.signal(s, hard_stop)
             runner.shutdown()
             sock.close()

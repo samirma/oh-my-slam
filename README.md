@@ -355,11 +355,14 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
   output goes to each job's log. stdout is empty except for `--status`.
 * **Stopping.** Ctrl-C, SIGTERM and `--stop` are the same normal stop (exit 0): queued jobs are
   cancelled, and running ones are interrupted and waited for, up to 120 s before they are killed.
-  * A second Ctrl-C or SIGTERM during the stop SIGKILLs every job's process group and exits at
-    once (exit 130).
+  * A second Ctrl-C or SIGTERM during the stop SIGKILLs every job's process group, records those
+    jobs as `cancelled` (with no process group left), and exits at once (exit 130).
   * `--stop` sends that second signal itself after 180 s, then SIGKILL after 10 s more.
-  * Each running job's process group is recorded in its `job.json`. If the service was killed,
-    the next start kills any group still alive and marks the job `cancelled`.
+  * Each running step's `job.json` records its process group, the leader's start time, and the job
+    id, which is also in the leader's environment (`OH_MY_SLAM_JOB`).
+  * If the service itself was killed, the next start SIGKILLs a group still alive only when its
+    leader matches both the start time and the job id, so a recycled process id is never
+    signalled. The job is then marked `cancelled`.
   * There is no lifeline in the children: the commands would have to watch for one.
 * **One service per workspace.** `<data>/server.lock` (flock) and `<data>/server.json` (pid, URL,
   port). A second `server.sh` on the same `--data` prints `already running … at <url>` on stderr,
@@ -372,15 +375,20 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
     when the server is down or its models failed to load. A server that is still loading is
     accepted, because the command waits for it.
   * "Will use inference" is decided by `commands.spec.needs_inference`, which evaluates the mode's
-    inference condition. `mapper locate` on a map of at most `UPDATE_EXHAUSTIVE_MAX` (150) keyframes needs none, so it runs
-    without the server and outside the inference queue.
+    inference condition, at submission and again when a queued job may start. `mapper locate` on
+    a map of at most `UPDATE_EXHAUSTIVE_MAX` (150) keyframes needs none, so it runs without the
+    server and outside the inference queue.
   * `segment -m` and `view -m` also run without the server.
 * **Request guard** (CSRF and DNS rebinding; the 0.0.0.0 binding is required by the spec):
   * every request's `Host` must name this machine: localhost, its host name, or one of its
-    addresses. Anything else gets 403.
-  * a state-changing request must not carry a foreign `Origin` (403).
-  * its body must be `application/json`, or `application/octet-stream` for uploads (415), so a
-    cross-site form cannot submit, upload or cancel.
+    addresses. Anything else gets 403. The addresses are re-read on an unknown name, at most every
+    30 s, for example after the machine joins another network.
+  * a state-changing request must carry no `Origin`, or this service's own: the request's `Host`,
+    or one of the machine's names on the service's port, over `http`. Scheme, host and port all
+    count; anything else gets 403.
+  * a JSON request's body must be `application/json`. An upload may carry any media type except
+    the CORS-safelisted `text/plain`, `application/x-www-form-urlencoded` and
+    `multipart/form-data` (415). A cross-site form therefore cannot submit, upload or cancel.
 
 **Workspace.**
 
@@ -423,8 +431,8 @@ option.
   folder.
   * The command step is `python -m oh_my_slam.cli.<command> <argv>`, the same module the shell
     script execs.
-  * A viewer step is the viewer's own bundle writer, `python -m oh_my_slam.viewer.bundle save`
-    (see Viewer).
+  * A viewer step is `python -m oh_my_slam.cli.view_save <dir> <prog> <argv>`, given the
+    command's own command line (see Viewer).
 * **States.** States are `queued`, `running`, `succeeded`, `failed` and `cancelled`
   (`core.errors.job_state`). A failure carries the command's `<prog>: error:` message, the code
   of its exit status (`usage`, `server_unavailable`, …) and that code's HTTP status.
@@ -456,24 +464,36 @@ option.
 * **Maps.** `/api/maps/<name>/viewer/…`, with the page URL `/viewer/map/<name>/`, serves the map's
   read-only bundle (`viewer.bundle.map_bundle`). It is rebuilt when `map.json` changes, and the 2
   most recent bundles are kept.
-* **`view-image` jobs.** The job runs the viewer's bundle writer, which calls `image_bundle` once
-  through the inference server and saves the bundle in `jobs/<id>/viewer/` (`save_bundle`).
+* **`view-image` jobs.** The job runs the viewer step on view.sh's own command line:
+  * it parses that line with `spec.build_parser` and `spec.validate`;
+  * it builds the bundle view.sh would serve, with the same `cli.view.make_bundle` and
+    `viewer.bundle.bundle_of`;
+  * it saves that bundle in `jobs/<id>/viewer/` (`save_bundle`).
+
+  A new view.sh option reaches it with no web change. View options that mean nothing to the
+  service (`Option.service = False`: `--no-browser`) are not API parameters.
   * The saved bundle holds the scene, the catalogue, the segmented image, the display transform,
     and the cloud source with its depth grid, validity, colours, labels, intrinsics and up
     direction. The live controls re-derive every cloud from that source with the shared code,
     with no inference.
   * `/api/jobs/<id>/viewer/…` (page `/viewer/job/<id>/`) serves it with `load_bundle`. The 2 most
     recent bundles are kept, and the viewer returns unchanged after a reload or a restart.
-* **`view-map` jobs.** The bundle writer saves a reference to the map, and the viewer is that map's
+* **`view-map` jobs.** The viewer step saves a reference to the map, and the viewer is that map's
   viewer.
 * **The Image page's viewer.** A single-image submission can ask for its viewer with
-  `?viewer=true` (`POST /api/ops/reconstruct?viewer=true`, `segment-image?viewer=true`). The
-  bundle writer is then one more step of the same job, run before the job ends and its upload is
-  deleted.
+  `?viewer=true` (`POST /api/ops/reconstruct?viewer=true`, `segment-image?viewer=true`).
+  * The viewer step is then one more step of the same job, given the command's own command line
+    (its `--min-score` included). It runs before the job ends and its upload is deleted.
   * So there is one upload, one job, the command's byte-identical result, and a saved viewer.
     Uploads stay transient, and an upload still has exactly one consumer.
-  * The viewer step runs inference once more. That is unavoidable, because the command writes no
-    depth grid and its results must be exactly the command's.
+  * There is no second inference pass. The command step records every inference response
+    (`OH_MY_SLAM_INFERENCE_RECORD=jobs/<id>/inference/`, `client.replay`, with the depth and
+    validity files), and the viewer step replays them (`OH_MY_SLAM_INFERENCE_REPLAY`), without the
+    server.
+  * As a result, the viewer's objects, ids and colours are exactly the result's, and selecting an
+    object highlights the same object everywhere.
+  * Responses are matched by route and request, path fields aside. A request the recording does
+    not hold is an error naming it.
 
 **API overview.**
 

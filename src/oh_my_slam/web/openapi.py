@@ -58,10 +58,12 @@ def _schema(p: Json) -> Json:
 
 
 def _body(d: Json) -> Json:
+    """The request body: one property per parameter that means something to the service."""
+    params = [p for p in d["parameters"] if p.get("service", True)]
     return {"required": True, "content": {"application/json": {"schema": {
         "type": "object", "additionalProperties": False,
-        "properties": {p["name"]: _schema(p) for p in d["parameters"]},
-        "required": [p["name"] for p in d["parameters"] if p["required"]],
+        "properties": {p["name"]: _schema(p) for p in params},
+        "required": [p["name"] for p in params if p["required"]],
     }}}}
 
 

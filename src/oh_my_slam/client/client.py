@@ -2,6 +2,7 @@
 
 Any failure to reach the server becomes :class:`ServerUnavailableError` (exit 3, with the hint to
 run ``./start_inference_server.sh``). Queue-full responses (503) are retried with back-off.
+Responses can be recorded and replayed (``client.replay``, set by the environment).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from oh_my_slam.client import protocol as p
+from oh_my_slam.client import replay
 from oh_my_slam.client.images import request_image
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.errors import (
@@ -104,19 +106,24 @@ class InferenceClient:
 
     def _post(self, route: str, req: BaseModel, model: type[M]) -> M:
         t0 = time.perf_counter()
+        data = req.model_dump()
+        if replay.replaying() is not None:  # answered from a recording (client.replay)
+            return model.model_validate(replay.replay(route, data, data.get("out_dir")))
         deadline = time.monotonic() + BUSY_RETRY_S
         delay = 0.2
         while True:
             if not self.socket_path.exists():
                 raise ServerUnavailableError("no socket")
             try:
-                r = self._http().post(route, json=req.model_dump())
+                r = self._http().post(route, json=data)
             except httpx.TimeoutException as exc:
                 raise InferenceError(f"{route} timed out after {self.timeout:.0f} s") from exc
             except httpx.HTTPError as exc:
                 raise ServerUnavailableError(type(exc).__name__) from exc
             if r.status_code == 200:
-                out = model.model_validate(r.json())
+                raw = r.json()
+                replay.record(route, data, raw)
+                out = model.model_validate(raw)
                 t = getattr(out, "timings", None)
                 timing.record_request(route, time.perf_counter() - t0,
                                       getattr(t, "queue_s", 0.0), getattr(t, "compute_s", 0.0))
@@ -202,6 +209,6 @@ def connect(require: bool = True) -> InferenceClient:
     global _shared
     if _shared is None:
         _shared = InferenceClient()
-    if require:
+    if require and replay.replaying() is None:  # a replay needs no server
         _shared.require_ready()
     return _shared

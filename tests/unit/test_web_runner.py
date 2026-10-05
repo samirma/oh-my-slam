@@ -140,25 +140,52 @@ def test_progress_events_stream_until_the_job_ends(svc: Svc) -> None:
     assert svc.client.get("/api/jobs/missing").status_code == 404
 
 
+def _orphan(jid: str | None) -> subprocess.Popen[bytes]:
+    """A process group a killed service could have left: its leader carries ``jid`` (if any)."""
+    env = {**os.environ, "OH_MY_SLAM_JOB": jid} if jid else dict(os.environ)
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                            start_new_session=True, env=env)
+
+
+def _stale(ws: Workspace, jid: str, pgid: int, ctime: float | None) -> None:
+    job = Job(id=jid, operation="slow", label="slow", params={}, command=[], steps=[],
+              inference=True, state="running", pgid=pgid, leader_ctime=ctime)
+    (ws.jobs / jid).mkdir()
+    (ws.jobs / jid / "job.json").write_text(json.dumps(dataclasses.asdict(job)))
+
+
 def test_job_list_survives_a_restart(ws: Workspace) -> None:
+    import psutil
+
     runner = Runner(ws)
     done = runner.submit(slow_op(), {"x": 1}, slow(0), runner.new_id())
     runner.wait(done.id, 30)
     runner.shutdown()
-    # a job the killed service left running, with its process group still alive
-    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                              start_new_session=True)
-    stale = Job(id="20000101-000000-abcdef", operation="slow", label="slow", params={},
-                command=[], steps=[], inference=True, state="running", pgid=orphan.pid)
-    (ws.jobs / stale.id).mkdir()
-    (ws.jobs / stale.id / "job.json").write_text(json.dumps(dataclasses.asdict(stale)))
-    again = Runner(ws)
-    again.load()
-    assert orphan.wait(10) == -signal.SIGKILL
-    assert again.get(done.id).state == "succeeded" and again.get(done.id).params == {"x": 1}
-    assert again.get(stale.id).state == "cancelled"
-    saved = json.loads((ws.jobs / stale.id / "job.json").read_text())
-    assert saved["state"] == "cancelled" and saved["pgid"] is None
+    # a job the killed service left running, its process group still alive and still its own
+    mine = _orphan("20000101-000000-aaaaaa")
+    wait_for(lambda: "OH_MY_SLAM_JOB" in psutil.Process(mine.pid).environ())
+    _stale(ws, "20000101-000000-aaaaaa", mine.pid, psutil.Process(mine.pid).create_time())
+    # recycled numbers: a group whose leader started at another time, or belongs to no job
+    other_time = _orphan("20000101-000000-bbbbbb")
+    _stale(ws, "20000101-000000-bbbbbb", other_time.pid,
+           psutil.Process(other_time.pid).create_time() - 5.0)
+    stranger = _orphan(None)
+    _stale(ws, "20000101-000000-cccccc", stranger.pid, psutil.Process(stranger.pid).create_time())
+    try:
+        again = Runner(ws)
+        again.load()
+        assert mine.wait(10) == -signal.SIGKILL
+        time.sleep(0.5)
+        assert other_time.poll() is None and stranger.poll() is None  # never signalled
+        assert again.get(done.id).state == "succeeded" and again.get(done.id).params == {"x": 1}
+        for jid in ("20000101-000000-aaaaaa", "20000101-000000-bbbbbb", "20000101-000000-cccccc"):
+            assert again.get(jid).state == "cancelled"
+            saved = json.loads((ws.jobs / jid / "job.json").read_text())
+            assert saved["state"] == "cancelled" and saved["pgid"] is None
+    finally:
+        for p in (mine, other_time, stranger):
+            p.kill()
+            p.wait()
 
 
 def test_the_running_steps_process_group_is_recorded(ws: Workspace) -> None:
@@ -166,10 +193,19 @@ def test_the_running_steps_process_group_is_recorded(ws: Workspace) -> None:
     job = runner.submit(slow_op(), {}, slow(30), runner.new_id())
     wait_for(lambda: runner.get(job.id).pgid is not None)
     saved = json.loads((ws.jobs / job.id / "job.json").read_text())
-    assert saved["pgid"] == runner.get(job.id).pgid and alive(saved["pgid"])
-    runner.kill_all()  # the second stop signal
+    saved_pgid = saved["pgid"]
+    assert saved_pgid == runner.get(job.id).pgid and alive(saved_pgid)
+    import psutil
+
+    assert saved["leader_ctime"] == psutil.Process(saved["pgid"]).create_time()
+    assert psutil.Process(saved["pgid"]).environ()["OH_MY_SLAM_JOB"] == job.id
+    runner.kill_all()  # the second stop signal: the record is final before the process exits
+    saved = json.loads((ws.jobs / job.id / "job.json").read_text())
+    assert saved["state"] == "cancelled" and saved["pgid"] is None
+    assert saved["leader_ctime"] is None
+    wait_for(lambda: not alive(runner.get(job.id).pgid or saved_pgid))
     job = runner.wait(job.id, 30)
-    assert job.state == "cancelled" and not alive(saved["pgid"])
+    assert job.state == "cancelled"
 
 
 def test_resubmit_uses_the_same_parameters(svc: Svc) -> None:
@@ -192,3 +228,14 @@ def test_service_shutdown_cancels_running_and_queued_jobs(ws: Workspace) -> None
     runner.shutdown()
     assert runner.get(running.id).state == "cancelled"
     assert runner.get(queued.id).state == "cancelled"
+
+
+def test_a_conditional_jobs_inference_need_is_rechecked_when_it_starts(ws: Workspace) -> None:
+    """Queued behind an inference job, a job whose need depends on what it reads is re-checked
+    when it may start: no longer needing inference, it runs at once."""
+    runner = Runner(ws, reevaluate=lambda job: False)
+    first = runner.submit(slow_op(), {}, slow(2), runner.new_id())
+    cond = runner.submit(slow_op(), {}, slow(0, conditional=True), runner.new_id())
+    assert runner.get(cond.id).state == "running" and not runner.get(cond.id).inference
+    assert runner.get(first.id).state == "running"
+    runner.shutdown()

@@ -20,9 +20,11 @@ a viewer has a second step, the viewer's bundle writer (``web.operations``).
   the map whole).
 * **Results**: the command writes its result with ``-o`` and its artefacts with ``-d`` into the
   job's ``out/`` folder, so they are the command's bytes; a viewer is saved in ``viewer/``.
-* **Persistence**: ``jobs/<id>/job.json`` per job, with the process group of its running step; the
-  list survives a restart, and a job that was queued or running when the service stopped is
-  ``cancelled`` (a process group left behind by a crash is killed).
+* **Persistence**: ``jobs/<id>/job.json`` per job; the list survives a restart, and a job that was
+  queued or running when the service stopped is ``cancelled``. The record names the running
+  step's process group with its leader's start time, and the leader carries the job id in its
+  environment (``ENV_JOB``): a group left behind by a crash is killed at the next start only when
+  its leader still matches both, so a recycled process id is never signalled.
 * **Uploads** a job consumes are deleted when it ends, whatever its state.
 """
 
@@ -37,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -52,6 +55,30 @@ LOG_TAIL = 40  # stderr lines kept in the job record (all of them in stderr.log)
 POLL_S = 0.1
 LOG_TOUCH_S = 0.25  # stderr lines mark a job changed at most this often
 CANCEL_GRACE_S = 30.0
+ENV_JOB = "OH_MY_SLAM_JOB"  # the job id, in the environment of its steps
+
+
+def leader_matches(pgid: int, ctime: float | None, jid: str) -> bool:
+    """Whether process ``pgid`` is still the leader a job started: same start time, and the job's
+    id in its environment. Anything that cannot be checked does not match."""
+    if ctime is None:
+        return False
+    try:
+        import psutil
+
+        proc = psutil.Process(pgid)
+        return abs(proc.create_time() - ctime) < 1e-3 and proc.environ().get(ENV_JOB) == jid
+    except Exception:  # gone, another user's, unreadable
+        return False
+
+
+def _ctime(pid: int) -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
 
 
 def default_parallel() -> int:
@@ -67,6 +94,8 @@ class Job:
     command: list[str]  # the command line, with workspace paths
     steps: list[dict[str, Any]]  # web.operations.Step as data
     inference: bool
+    conditional: bool = False  # inference depends on what the job reads (re-checked at start)
+    actual: dict[str, Any] = field(default_factory=dict)  # the parameters the command gets
     uploads: list[str] = field(default_factory=list)
     writes: str | None = None
     result_name: str | None = None
@@ -87,11 +116,12 @@ class Job:
     resubmitted_from: str | None = None
     cancel_requested: bool = False
     pgid: int | None = None  # process group of the running step
+    leader_ctime: float | None = None  # its leader's start time (psutil create_time)
     version: int = 0
 
     def public(self) -> dict[str, Any]:
         d = asdict(self)
-        for k in ("steps", "version", "pgid"):
+        for k in ("steps", "version", "pgid", "leader_ctime", "actual"):
             d.pop(k)
         d["result"] = None
         if self.state == "succeeded" and self.result_name is not None:
@@ -122,12 +152,14 @@ def _killpg(pgid: int, sig: int) -> None:
 class Runner:
     def __init__(self, workspace: Workspace, python: str = sys.executable,
                  stop_grace_s: float = 120.0, cancel_grace_s: float = CANCEL_GRACE_S,
-                 max_parallel: int | None = None) -> None:
+                 max_parallel: int | None = None,
+                 reevaluate: Callable[[Job], bool] | None = None) -> None:
         self.ws = workspace
         self.python = python
         self.stop_grace_s = stop_grace_s
         self.cancel_grace_s = cancel_grace_s
         self.max_parallel = max_parallel or default_parallel()
+        self.reevaluate = reevaluate  # a conditional job's inference need, when it may start
         self.jobs: dict[str, Job] = {}
         self.version = 0
         self.stopping = False
@@ -157,13 +189,13 @@ class Runner:
                 continue
             changed = False
             if job.state not in TERMINAL:
-                if job.pgid is not None:
+                if job.pgid is not None and leader_matches(job.pgid, job.leader_ctime, job.id):
                     _killpg(job.pgid, signal.SIGKILL)
                 job.state, job.ended_at, changed = "cancelled", job.ended_at or time.time(), True
                 job.error = {"code": "interrupted", "message": "the service stopped before the "
                              "job finished; re-submit it"}
-            if job.pgid is not None:
-                job.pgid, changed = None, True
+            if job.pgid is not None or job.leader_ctime is not None:
+                job.pgid, job.leader_ctime, changed = None, None, True
             self.jobs[job.id] = job
             self._touch(job, save=changed)
 
@@ -213,7 +245,8 @@ class Runner:
                                f"{busy[taken[0]]}; upload the file again", "upload_in_use")
             job = Job(id=jid, operation=op.id, label=op.label, params=params,
                       command=prep.command, steps=[asdict(s) for s in prep.steps],
-                      inference=prep.inference, uploads=list(dict.fromkeys(prep.uploads)),
+                      inference=prep.inference, conditional=prep.conditional,
+                      actual=prep.actual, uploads=list(dict.fromkeys(prep.uploads)),
                       writes=prep.writes, result_name=prep.result,
                       result_format=prep.result_format, saves_viewer=prep.viewer,
                       resubmitted_from=resubmitted_from)
@@ -236,6 +269,8 @@ class Runner:
             for job in self.all_jobs():
                 if job.state != "queued":
                     continue
+                if job.conditional and self.reevaluate is not None:
+                    job.inference = self.reevaluate(job)  # what it reads may have changed
                 if job.writes and job.writes in writing:
                     inference_busy = inference_busy or job.inference  # keeps the order
                     continue
@@ -281,7 +316,8 @@ class Runner:
         progress = d / "progress.jsonl"
         progress.touch()
         offset = progress.stat().st_size  # this step's events start here
-        env = {**os.environ, ENV_PROGRESS: str(progress), "PYTHONUNBUFFERED": "1"}
+        env = {**os.environ, **step.get("env", {}), ENV_PROGRESS: str(progress),
+               ENV_JOB: job.id, "PYTHONUNBUFFERED": "1"}
         env.pop(ENV_PATH, None)
         if step.get("timings", True):
             env[ENV_PATH] = str(d / "timings.json")
@@ -295,7 +331,7 @@ class Runner:
             return 1, f"could not start the command: {exc}"
         with self._lock:
             self._procs[job.id] = proc
-            job.pgid = proc.pid
+            job.pgid, job.leader_ctime = proc.pid, _ctime(proc.pid)
             self._touch(job, save=True)
             if job.cancel_requested:
                 self._signal(proc, signal.SIGINT)
@@ -321,7 +357,7 @@ class Runner:
         reader.join()
         with self._lock:
             self._procs.pop(job.id, None)
-            job.pgid = None
+            job.pgid = job.leader_ctime = None
         return proc.returncode, None
 
     def _event(self, job: Job, line: bytes) -> None:
@@ -451,15 +487,22 @@ class Runner:
         return self.get(jid)
 
     def kill_all(self) -> None:
-        """SIGKILL every running job's process group (a second stop signal)."""
+        """SIGKILL every running job's process group (a second stop signal) and record those jobs
+        as cancelled, with no process group left to recover, before the process may exit."""
         with self._lock:
             self.stopping = True
+            for proc in self._procs.values():
+                self._signal(proc, signal.SIGKILL)
             for job in self.jobs.values():
                 if job.state == "running":
                     job.cancel_requested = True
-            procs = list(self._procs.values())
-        for proc in procs:
-            self._signal(proc, signal.SIGKILL)
+                    job.state, job.ended_at = "cancelled", time.time()
+                    job.pgid = job.leader_ctime = None
+                    job.error = {"code": "interrupted", "message": "killed: the service was "
+                                 "stopped twice"}
+                    for uid in job.uploads:
+                        self.ws.delete_upload(uid)
+                    self._touch(job, save=True)
 
     def shutdown(self) -> None:
         """Stop: queued jobs are cancelled, running ones interrupted (SIGINT, as Ctrl-C) and

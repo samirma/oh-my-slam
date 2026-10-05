@@ -110,9 +110,10 @@ def test_one_operation_per_command_mode_with_the_commands_parameters() -> None:
         op = next(o for o in ops.values() if o.label == d["id"])
         post = doc["paths"][f"/api/ops/{op.id}"]["post"]
         schema = post["requestBody"]["content"]["application/json"]["schema"]
-        assert list(schema["properties"]) == [p["name"] for p in d["parameters"]]
-        assert schema["required"] == [p["name"] for p in d["parameters"] if p["required"]]
-        for p in d["parameters"]:
+        params = [p for p in d["parameters"] if p["service"]]  # command-line-only ones left out
+        assert list(schema["properties"]) == [p["name"] for p in params]
+        assert schema["required"] == [p["name"] for p in params if p["required"]]
+        for p in params:
             prop = schema["properties"][p["name"]]
             assert prop["x-oms"] == p  # names, kinds, defaults, help, bounds: the registry's
             if p["choices"]:
@@ -123,6 +124,9 @@ def test_one_operation_per_command_mode_with_the_commands_parameters() -> None:
         takes_image = any(p["kind"] == "image" for p in d["parameters"])
         assert bool(post["parameters"]) == (takes_image and op.label.split()[0] != "view.sh")
     assert doc["x-oms"]["exit_codes"] == spec.describe()["exit_codes"]
+    view_props = doc["paths"]["/api/ops/view-map"]["post"]["requestBody"]["content"][
+        "application/json"]["schema"]["properties"]
+    assert "no_browser" not in view_props  # spec marks it as meaning nothing to the service
     assert {"/api/maps/{name}/viewer/{path}", "/api/jobs/{id}/viewer/{path}"} <= set(doc["paths"])
     assert {op.id for op in ops.values()} == {"reconstruct", "mapper-update", "mapper-locate",
                                               "segment-image", "segment-map", "view-image",
@@ -142,17 +146,26 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
     assert [s.module for s in seg.steps] == ["oh_my_slam.cli.segment"]
     assert seg.steps[0].argv == [f"-i={(ws.root / 'in' / 'a.jpg')}",
                                  f"-o={ws.job_dir('j') / 'out' / 'result.json'}"]
-    # a browser mode runs the viewer's bundle writer, which saves into the job's viewer/
+    # a browser mode runs the viewer step on view.sh's own command line; it saves into viewer/
     view = web_ops.prepare(web_ops.operations()["view-map"], {"map": "m"}, ws, ws.job_dir("j"))
-    assert [s.module for s in view.steps] == ["oh_my_slam.viewer.bundle"]
-    assert view.steps[0].argv == ["save", str(ws.job_dir("j") / "viewer"), "map",
-                                  str(ws.maps / "m")]
-    assert view.viewer and not view.inference
-    both = web_ops.prepare(web_ops.operations()["reconstruct"], {"image": "in/a.jpg"}, ws,
-                           ws.job_dir("j"), viewer=True)
-    assert [s.module for s in both.steps] == ["oh_my_slam.cli.reconstruct",
-                                              "oh_my_slam.viewer.bundle"]
-    assert both.steps[1].argv[2:] == ["image", str(ws.root / "in" / "a.jpg")]
+    assert [s.module for s in view.steps] == ["oh_my_slam.cli.view_save"]
+    assert view.steps[0].argv == [str(ws.job_dir("j") / "viewer"), "view.sh",
+                                  f"-m={ws.maps / 'm'}"]
+    assert view.viewer and not view.inference and view.steps[0].env == {}
+    refused = web_ops.prepare(web_ops.operations()["view-map"], {"map": "m", "no_browser": True},
+                              ws, ws.job_dir("j"))
+    assert [p.parameters for p in refused.problems] == [("no_browser",)]
+    # an image request with its viewer: the command records its inference, the viewer replays it
+    both = web_ops.prepare(web_ops.operations()["segment-image"],
+                           {"image": "in/a.jpg", "min_score": 0.7}, ws, ws.job_dir("j"),
+                           viewer=True)
+    assert [s.module for s in both.steps] == ["oh_my_slam.cli.segment", "oh_my_slam.cli.view_save"]
+    rec = str(ws.job_dir("j") / "inference")
+    assert both.steps[0].env == {"OH_MY_SLAM_INFERENCE_RECORD": rec}
+    assert both.steps[1].env == {"OH_MY_SLAM_INFERENCE_REPLAY": rec}
+    assert both.steps[1].argv == [str(ws.job_dir("j") / "viewer"), "segment.sh",
+                                  *both.steps[0].argv]  # the command's own options, --min-score
+    assert "--min-score=0.7" in both.steps[1].argv
     none = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m"}, ws,
                            ws.job_dir("j"), viewer=True)
     assert none.problems and "no single image" in none.problems[0].message
@@ -292,12 +305,34 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
             assert r.status_code == 415, ctype
         assert c.post("/api/jobs/x/cancel").status_code == 415
         assert not list(ws.uploads.iterdir()) and not list(ws.jobs.iterdir())
+        assert c.post("/api/uploads?name=a.jpg", content=b"x").status_code == 415  # no type
         # the same origin is fine
         r = c.post("/api/ops/segment-map/validate", json={"map": "m"},
-                   headers={"origin": "http://127.0.0.1:8000"})
+                   headers={"origin": "http://testserver"})
         assert r.status_code == 200
+        # the full origin counts: another port or scheme of this machine is another site
+        for other in ("http://testserver:9999", "https://testserver", "http://127.0.0.1:8000"):
+            r = c.post("/api/ops/segment-map/validate", json={"map": "m"},
+                       headers={"origin": other})
+            assert r.status_code == 403, other
+        # an upload may carry the file's own media type
+        r = c.post("/api/uploads?name=a.jpg", content=b"x", headers={"content-type": "image/jpeg"})
+        assert r.status_code == 201
     service.runner.shutdown()
     assert {"localhost", "127.0.0.1", "::1"} <= web_app.machine_hosts()
+
+
+def test_an_unknown_host_refreshes_the_machines_names(ws: Workspace,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    names = {"localhost"}
+    monkeypatch.setattr(web_app, "machine_hosts", lambda: set(names))
+    service = make_svc(ws)
+    assert service.knows_host("localhost") and not service.knows_host("new.local")
+    names.add("new.local")  # e.g. joined another network
+    assert not service.knows_host("new.local")  # rate-limited
+    service._hosts_at -= web_app.HOSTS_REFRESH_S + 1
+    assert service.knows_host("new.local")
+    service.runner.shutdown()
 
 
 def test_inference_operations_get_503_while_read_only_ones_work(svc: Svc) -> None:
