@@ -13,12 +13,15 @@ matches, that keypoint's triangulated point in the map's ``sfm/model`` (already 
 coordinates) when SfM posed the keyframe; otherwise — a keypoint without a model point, a
 keyframe the model lacks (a one-keyframe map has no ``sfm/`` at all), or one posed by multi-view
 (rotation-dominant input, whose model points are unreliable) — the point is the keyframe's stored
-metric depth at that keypoint, placed with its stored pose. LO-RANSAC
+metric depth at that keypoint (off depth edges), placed with its stored pose and scaled to the
+keyframe's model points (``_MapPoints.depth_scale``). The model points alone are tried first
+(``MODEL_FIRST_MIN_INLIERS``), then model and depth points together. LO-RANSAC
 absolute pose plus refinement (``pycolmap.estimate_and_refine_absolute_pose``) solves them; the
 focal length is refined unless the query shares a map camera. A result with fewer than
 ``MIN_INLIERS`` inliers, or whose pose contradicts its verified matches to the stored keyframe poses
-(median epipolar distance above ``MAX_EPIPOLAR_DEG``, as for the map's own keyframes), leaves the
-image unlocated: it is reported on stderr, naming the image; with no image located the command
+(median epipolar distance above ``MAX_EPIPOLAR_DEG``, as for the map's own keyframes;
+``epipolar_gate``, which refines the pose of a camera seen from the keyframes' spot first), leaves
+the image unlocated: it is reported on stderr, naming the image; with no image located the command
 fails with an input error.
 """
 
@@ -65,6 +68,18 @@ VIS_GRID_SIDE = 96
 VIS_REL_TOL = 0.05
 VIS_NEAR = 0.05
 VIS_CHUNK = 1 << 20
+# Epipolar gate of a camera that sees the map from the keyframes' spot (rotation_dominant: most
+# matches with multi-view keyframes, or a baseline below ROTATION_BASELINE of the scene depth):
+# a pose above MAX_EPIPOLAR_DEG is refined against the keyframe poses (centre prior
+# REFINE_CENTRE_PRIOR_M, at most REFINE_MAX_PER_KEYFRAME matches each) and judged again; the
+# refined pose is kept when it passes and turned at most REFINE_MAX_ROT_DEG.
+ROTATION_BASELINE = 0.02
+REFINE_CENTRE_PRIOR_M = 0.05
+REFINE_MAX_PER_KEYFRAME = 250
+REFINE_MAX_ROT_DEG = 2.0
+# A pose from the SfM model points alone is kept when that many of them agree (and it passes the
+# epipolar gate); else the model points and the keyframes' depth together
+MODEL_FIRST_MIN_INLIERS = 50
 
 Progress = Callable[[str], None]
 
@@ -324,11 +339,20 @@ def model_points_trusted(fr: store.FrameRecord) -> bool:
     return fr.pose_source.startswith("sfm") and "multiview" not in fr.pose_source
 
 
+# Depth fill of an SfM keyframe: its stored depth is rescaled by the median model/depth z ratio
+# over its keypoints that have both (at least DEPTH_SCALE_MIN_POINTS of them); a keyframe whose
+# median ratio is off by more than DEPTH_SCALE_MAX_FACTOR (depth seen through a window, say)
+# gives no depth points at all.
+DEPTH_SCALE_MIN_POINTS = 20
+DEPTH_SCALE_MAX_FACTOR = 2.0
+
+
 class _MapPoints:
     """Map coordinates of keyframe keypoints: their triangulated point in ``sfm/model`` for a
     keyframe SfM posed (``model_points_trusted``), and for every keypoint without one — all of
     them for a multi-view keyframe, or one the model does not hold — the keyframe's stored metric
-    depth at the keypoint, placed with its stored pose."""
+    depth at the keypoint, placed with its stored pose (and scaled to the model's points,
+    ``depth_scale``)."""
 
     def __init__(self, reader: store.MapReader) -> None:
         import pycolmap
@@ -338,11 +362,15 @@ class _MapPoints:
         model_dir = reader.path(f"{store.SFM_MODEL}/images.bin").parent  # committed overlay too
         self.rec = pycolmap.Reconstruction(str(model_dir)) \
             if (model_dir / "images.bin").exists() else None
-        self._cache: dict[str, tuple[NDArray[np.float64], NDArray[np.bool_]] | None] = {}
+        self._cache: dict[str, tuple[NDArray[np.float64], NDArray[np.bool_],
+                                     NDArray[np.float64]] | None] = {}
         self._depth: dict[str, tuple[NDArray[Any], NDArray[Any]]] = {}
+        self._scale: dict[str, float | None] = {}
 
-    def _model_points(self, name: str) -> tuple[NDArray[np.float64], NDArray[np.bool_]] | None:
-        """(xyz per keypoint, has a point) of a keyframe the model has posed, else None."""
+    def _model_points(self, name: str
+                      ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.float64]] | None:
+        """(xyz per keypoint, has a point, keypoint pixels) of a keyframe the model has posed,
+        else None."""
         if name not in self._cache:
             im = None if self.rec is None else self.rec.find_image_with_name(name)
             if im is None or not im.has_pose:
@@ -350,39 +378,78 @@ class _MapPoints:
             else:
                 xyz = np.zeros((len(im.points2D), 3))
                 has = np.zeros(len(im.points2D), bool)
+                uv = np.zeros((len(im.points2D), 2))
                 for i, p in enumerate(im.points2D):
+                    uv[i] = p.xy
                     if p.has_point3D():
                         xyz[i] = self.rec.points3D[p.point3D_id].xyz  # type: ignore[union-attr]
                         has[i] = True
-                self._cache[name] = (xyz, has)
+                self._cache[name] = (xyz, has, uv)
         return self._cache[name]
 
     def _depth_points(self, fr: store.FrameRecord, uv: NDArray[np.float64]
                       ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
         if fr.name not in self._depth:
-            self._depth[fr.name] = (self.reader.depth(fr), self.reader.valid(fr))
+            from oh_my_slam.core.geometry import depth_edge_mask
+
+            depth = self.reader.depth(fr)  # depth edges: a keypoint there may be either surface
+            self._depth[fr.name] = (depth, self.reader.valid(fr) & ~depth_edge_mask(depth))
         return depth_points(*self._depth[fr.name], fr, uv)
+
+    def depth_scale(self, fr: store.FrameRecord) -> float | None:
+        """Factor of keyframe ``fr``'s depth points: the median model/depth z ratio (camera
+        frame) over its keypoints with both, 1 without enough of them (a multi-view keyframe,
+        whose depth is the map's scale), None when that ratio is off by more than
+        ``DEPTH_SCALE_MAX_FACTOR`` (its depth gives no points)."""
+        name = _kf_file(fr)
+        if name not in self._scale:
+            model = self._model_points(name) if model_points_trusted(fr) else None
+            ratio = None
+            if model is not None and int(model[1].sum()) >= DEPTH_SCALE_MIN_POINTS:
+                xyz, has, uv = model
+                d_xyz, d_ok = self._depth_points(fr, uv[has])
+                z_model = ((xyz[has] - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
+                z_depth = ((d_xyz - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
+                both = d_ok & (z_model > 0) & (z_depth > 0)
+                if int(both.sum()) >= DEPTH_SCALE_MIN_POINTS:
+                    ratio = float(np.median(z_model[both] / z_depth[both]))
+            if ratio is None:
+                self._scale[name] = 1.0
+            elif 1.0 / DEPTH_SCALE_MAX_FACTOR <= ratio <= DEPTH_SCALE_MAX_FACTOR:
+                self._scale[name] = ratio
+            else:
+                self._scale[name] = None
+                log.info("%s: depth disagrees with the SfM points (scale %.2f); its depth gives "
+                         "no points", fr.name, ratio)
+        return self._scale[name]
 
     def lookup(self, m: _Match) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
         """(xyz (N, 3), valid (N,)) of the keyframe side of the matches ``m``."""
+        xyz, model, depth = self.lookup_split(m)
+        return xyz, model | depth
+
+    def lookup_split(self, m: _Match
+                     ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.bool_]]:
+        """(xyz (N, 3), from the model (N,), from the depth (N,)) of the keyframe side of the
+        matches ``m``: the model point where there is a trusted one, else the scaled depth."""
         n = len(m.idx_k)
-        xyz, ok = np.zeros((n, 3)), np.zeros(n, bool)
+        xyz, ok, fill = np.zeros((n, 3)), np.zeros(n, bool), np.zeros(n, bool)
         fr = self.frames.get(m.keyframe)
         if fr is None:
-            return xyz, ok
+            return xyz, ok, fill
         model = self._model_points(m.keyframe) if model_points_trusted(fr) else None
         if model is not None:
-            pts, has = model
+            pts, has, _ = model
             inside = m.idx_k < len(has)
             idx = np.where(inside, m.idx_k, 0)
             ok = inside & has[idx]
             xyz[ok] = pts[idx[ok]]
-        if not ok.all():
+        scale = self.depth_scale(fr)
+        if not ok.all() and scale is not None:
             d_xyz, d_ok = self._depth_points(fr, m.uv_k)
             fill = ~ok & d_ok
-            xyz[fill] = d_xyz[fill]
-            ok = ok | fill
-        return xyz, ok
+            xyz[fill] = fr.T_map_cam.t + scale * (d_xyz[fill] - fr.T_map_cam.t)
+        return xyz, ok, fill
 
 
 def depth_points(depth: NDArray[Any], valid: NDArray[Any], fr: store.FrameRecord,
@@ -399,20 +466,23 @@ def depth_points(depth: NDArray[Any], valid: NDArray[Any], fr: store.FrameRecord
     return fr.T_map_cam.apply(cam), ok
 
 
-def correspondences(matches: list[_Match], points: _MapPoints
+def correspondences(matches: list[_Match], points: _MapPoints, depth: bool = True
                     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """(query pixels (N, 2), map points (N, 3)): one per query keypoint (the first keyframe, in
-    name order, that gives it a point)."""
+    """(query pixels (N, 2), map points (N, 3)): one per query keypoint — a model point when any
+    keyframe it matches gives one, else (with ``depth``) a depth point; among those, the first
+    keyframe in name order."""
     seen: set[int] = set()
     uv, xyz = [], []
-    for m in matches:
-        pts, ok = points.lookup(m)
-        for j in np.flatnonzero(ok):
-            iq = int(m.idx_q[j])
-            if iq not in seen:
-                seen.add(iq)
-                uv.append(m.uv_q[j])
-                xyz.append(pts[j])
+    looked = [(m, points.lookup_split(m)) for m in matches]
+    for kind in (1, 2) if depth else (1,):  # model points first, then depth points
+        for m, split in looked:
+            pts, ok = split[0], split[kind]
+            for j in np.flatnonzero(ok):
+                iq = int(m.idx_q[j])
+                if iq not in seen:
+                    seen.add(iq)
+                    uv.append(m.uv_q[j])
+                    xyz.append(pts[j])
     return np.asarray(uv, np.float64).reshape(-1, 2), np.asarray(xyz, np.float64).reshape(-1, 3)
 
 
@@ -476,6 +546,15 @@ def _query_intrinsics(reader: store.MapReader, sfm: Sfm, q: _Query, db: dict[str
 def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
                 points: _MapPoints) -> Located:
     out = Located(q.image, q.index)
+    # SfM model points alone first: bundle-adjusted with the keyframe poses, they place a camera
+    # more precisely than depth points do; the depth fills in when they are too few
+    uv, xyz = correspondences(matches, points, depth=False)
+    sol = solve_pose(uv, xyz, K, refine) if len(uv) >= MODEL_FIRST_MIN_INLIERS else None
+    if sol is not None and sol[2] >= MODEL_FIRST_MIN_INLIERS:
+        T, med, ok = epipolar_gate(sol[0], sol[1], matches, points)
+        if ok:
+            out.T_map_cam, out.K, out.inliers = T, sol[1], sol[2]
+            return out
     uv, xyz = correspondences(matches, points)
     if len(uv) < MIN_INLIERS:
         out.reason = (f"only {len(uv)} feature matches with map points (needs {MIN_INLIERS}): "
@@ -487,13 +566,107 @@ def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
                       f"matches agree; needs {MIN_INLIERS}): not enough overlap with the map")
         return out
     T, Kq, inliers = sol
-    med, n = match_residual_deg(T, Kq, matches, points.frames)
-    if n >= EPIPOLAR_MIN_MATCHES and med > MAX_EPIPOLAR_DEG:
+    T, med, ok = epipolar_gate(T, Kq, matches, points)
+    if not ok:
         out.reason = (f"its pose contradicts its matches with the map's keyframes (median "
                       f"epipolar distance {med:.2f}° > {MAX_EPIPOLAR_DEG}°)")
         return out
     out.T_map_cam, out.K, out.inliers = T, Kq, inliers
     return out
+
+
+def epipolar_gate(T: Pose, K: Intrinsics, matches: list[_Match], points: _MapPoints
+                  ) -> tuple[Pose, float, bool]:
+    """(pose, median epipolar distance, accepted) of a located pose judged against its verified
+    matches to the stored keyframe poses (``match_residual_deg``, ``MAX_EPIPOLAR_DEG`` from
+    ``EPIPOLAR_MIN_MATCHES`` matches). Seen from the keyframes' spot (``rotation_dominant``), a
+    few centimetres of centre error — the depth's scale error — become tenths of a degree of
+    epipolar distance: a pose above the limit is refined against the keyframe poses
+    (``refine_to_keyframes``) and the refined pose judged instead, when it turned at most
+    ``REFINE_MAX_ROT_DEG``."""
+    med, n = match_residual_deg(T, K, matches, points.frames)
+    if n < EPIPOLAR_MIN_MATCHES or med <= MAX_EPIPOLAR_DEG:
+        return T, med, True
+    if not rotation_dominant(T, matches, points):
+        return T, med, False
+    T2 = refine_to_keyframes(T, K, matches, points.frames)
+    med2, _ = match_residual_deg(T2, K, matches, points.frames)
+    turned = _rot_deg(T.R, T2.R)
+    log.debug("epipolar %.3f° -> %.3f° after refinement (turned %.2f°, moved %.1f cm)", med,
+              med2, turned, 100 * float(np.linalg.norm(T2.t - T.t)))
+    if med2 <= MAX_EPIPOLAR_DEG and turned <= REFINE_MAX_ROT_DEG:
+        return T2, med2, True
+    return T, med, False
+
+
+def _rot_deg(A: NDArray[Any], B: NDArray[Any]) -> float:
+    return float(np.degrees(np.arccos(np.clip((np.trace(A.T @ B) - 1) / 2, -1.0, 1.0))))
+
+
+def rotation_dominant(T: Pose, matches: list[_Match], points: _MapPoints) -> bool:
+    """Whether the located camera sees the map from (almost) the same spot as the keyframes it
+    matches, by match count: most matches are with multi-view keyframes (a map of a camera
+    turning in place), or the median baseline to the matched keyframes is below
+    ``ROTATION_BASELINE`` of their median scene depth."""
+    w, mv, ratio = [], 0, []
+    for m in matches:
+        fr = points.frames.get(m.keyframe)
+        if fr is None:
+            continue
+        w.append(len(m.idx_k))
+        mv += 0 if model_points_trusted(fr) else len(m.idx_k)
+        xyz, ok = points._depth_points(fr, m.uv_k)
+        z = ((xyz[ok] - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
+        b = float(np.linalg.norm(T.t - fr.T_map_cam.t))
+        ratio.append(b / float(np.median(z)) if len(z) and np.median(z) > 0 else np.inf)
+    if not w:
+        return False
+    if 2 * mv > sum(w):
+        return True
+    return float(np.median(np.repeat(ratio, w))) < ROTATION_BASELINE
+
+
+def _signed_epipolar_deg(R: NDArray[Any], C: NDArray[Any], K: Intrinsics, fr: store.FrameRecord,
+                         uv_q: NDArray[Any], uv_k: NDArray[Any]) -> NDArray[np.float64]:
+    """``sfm.epipolar_deg`` of the query (camera-to-map ``R``, ``C``) and keyframe ``fr``,
+    signed (a least-squares residual)."""
+    Rk, Ck = fr.T_map_cam.R, fr.T_map_cam.t
+    t = Rk.T @ (C - Ck)
+    t = t / max(float(np.linalg.norm(t)), 1e-12)
+    tx = np.array([[0.0, -t[2], t[1]], [t[2], 0.0, -t[0]], [-t[1], t[0], 0.0]])
+    F = np.linalg.inv(fr.K.K()).T @ tx @ (Rk.T @ R) @ np.linalg.inv(K.K())
+    xa = np.column_stack([uv_q, np.ones(len(uv_q))])
+    xb = np.column_stack([uv_k, np.ones(len(uv_k))])
+    la, lb = xa @ F.T, xb @ F
+    num = np.sum(xb * la, axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = 0.5 * (num / np.hypot(la[:, 0], la[:, 1]) / fr.K.fx
+                   + num / np.hypot(lb[:, 0], lb[:, 1]) / K.fx)
+    return np.degrees(np.nan_to_num(d, nan=0.0))
+
+
+def refine_to_keyframes(T: Pose, K: Intrinsics, matches: list[_Match],
+                        frames: dict[str, store.FrameRecord]) -> Pose:
+    """The located pose refined against its verified matches to the stored keyframe poses: robust
+    (Cauchy) least squares of their epipolar distances over the rotation and the centre, the
+    centre held near its starting point (``REFINE_CENTRE_PRIOR_M``), which the matches of a
+    near-zero baseline barely constrain."""
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+
+    used = [(frames[m.keyframe], m.uv_q, m.uv_k) for m in matches if m.keyframe in frames]
+    used = [(fr, uq[sel], uk[sel]) for fr, uq, uk in used
+            for sel in [np.linspace(0, len(uq) - 1, min(len(uq), REFINE_MAX_PER_KEYFRAME)).astype(int)]]
+    f_scale = MAX_EPIPOLAR_DEG / 2
+
+    def residuals(p: NDArray[np.float64]) -> NDArray[np.float64]:
+        R = Rotation.from_rotvec(p[:3]).as_matrix() @ T.R
+        r = [_signed_epipolar_deg(R, p[3:], K, fr, uq, uk) for fr, uq, uk in used]
+        return np.concatenate([*r, (p[3:] - T.t) / REFINE_CENTRE_PRIOR_M * f_scale])
+
+    sol = least_squares(residuals, np.concatenate([np.zeros(3), T.t]), loss="cauchy",
+                        f_scale=f_scale, max_nfev=200)
+    return Pose(Rotation.from_rotvec(sol.x[:3]).as_matrix() @ T.R, sol.x[3:])
 
 
 # ------------------------------------------------------------------------------------------------
