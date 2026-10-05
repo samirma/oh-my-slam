@@ -2,7 +2,10 @@
 
 A target is ``{"op": "<=" | ">=", "value": x}`` plus an optional regression tolerance
 (``tolerance_abs``, ``tolerance_rel``; a metric without either uses those under ``"defaults"``).
-A metric passes when its value
+A key with ``*`` is a pattern (``fnmatch``) that
+targets every metric it matches without a target of its own (the most specific pattern — the most
+characters besides ``*`` — wins), so metrics named after data, such as the per-stage metrics
+``perf.<group>.stage.<stage>.*``, all have one. A metric passes when its value
 meets the target; it regresses when it is worse than the baseline's value by more than
 ``max(tolerance_abs, tolerance_rel * |baseline|)`` ("worse" follows the target's direction). A metric
 without a value (its command failed) fails; one without a target is reported as untargeted.
@@ -17,6 +20,7 @@ import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +70,14 @@ def load_targets(path: Path) -> dict[str, Target]:
                           float(tol.get("tolerance_rel", 0.0)), str(t.get("unit", "")),
                           str(t.get("description", "")))
     return out
+
+
+def target_for(targets: dict[str, Target], mid: str) -> Target | None:
+    """The target of metric ``mid``: its own, else that of the most specific matching pattern."""
+    if mid in targets:
+        return targets[mid]
+    fits = [k for k in targets if "*" in k and fnmatchcase(mid, k)]
+    return targets[max(fits, key=lambda k: (len(k.replace("*", "")), k))] if fits else None
 
 
 @dataclass
@@ -140,7 +152,7 @@ class Metrics:
 
     def judge(self, targets: dict[str, Target], baseline: dict[str, float] | None) -> None:
         for m in self.items.values():
-            m.judge(targets.get(m.id))
+            m.judge(target_for(targets, m.id))
             m.compare(None if baseline is None else baseline.get(m.id))
 
 

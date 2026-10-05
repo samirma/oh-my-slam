@@ -18,13 +18,17 @@ from oh_my_slam.tools.evaluate import groundtruth as gt
 from oh_my_slam.tools.evaluate.mapupdate import (
     REGION_COVERAGE,
     MapView,
+    SplitMaps,
+    hole_cells,
     map_update_metrics,
+    merges,
     metric_ids,
+    parts_of,
     region_coverage,
     remnants,
     sequence_images,
 )
-from oh_my_slam.tools.evaluate.metrics import Metrics, load_targets
+from oh_my_slam.tools.evaluate.metrics import Metrics, load_targets, target_for
 from oh_my_slam.tools.evaluate.report import build_result, summary_md
 from oh_my_slam.tools.evaluate.runner import Runner
 from oh_my_slam.tools.evaluate.scene import DocObject
@@ -85,17 +89,6 @@ def plan(tmp_path: Path, **extra: Any) -> gt.MapUpdatePlan:
     return found
 
 
-def judged(tmp_path: Path, final: MapView, before: MapView, extended: MapView | None = None,
-           **extra: Any) -> tuple[Metrics, Any]:
-    """``final``: the whole sequence in one update; ``before``: the extended map after its first
-    update; ``extended``: after its second (default: the same as ``final``)."""
-    m = Metrics()
-    details = map_update_metrics(m, plan(tmp_path, **extra), IMAGES, final, before,
-                                 final if extended is None else extended)
-    m.judge(load_targets(EXAMPLES / "targets.json"), None)
-    return m, details
-
-
 # -- the annotation kind -------------------------------------------------------------------------------
 
 
@@ -135,11 +128,14 @@ def test_the_shipped_annotation_is_valid_and_names_images_of_the_sequence() -> N
     assert len(images) == 13
     assert all(n in images for a in found.absent for n in a.seen_in)
     assert found.before_images(images) == images[:4]  # the cup is gone from the fifth image on
+    assert found.split_sizes(images) == [(4, 4, 5), (6, 7)]
 
 
 def test_every_map_update_metric_has_a_target() -> None:
     targets = load_targets(EXAMPLES / "targets.json")
-    assert set(metric_ids()) <= set(targets) and set(metric_ids()) <= set(expected_ids())
+    ids = metric_ids(["split_4_4_5", "split_6_7"])
+    assert all(target_for(targets, k) is not None for k in ids)
+    assert set(ids) <= set(expected_ids())
     assert targets["map_update.absent_fraction"].op == ">="
     assert targets["map_update.absent_fraction"].value == 1.0
 
@@ -202,19 +198,59 @@ def test_without_a_registered_image_the_label_alone_decides() -> None:
 # -- the metrics ---------------------------------------------------------------------------------------
 
 
+def surface(hole: bool = False, behind: bool = False) -> np.ndarray:
+    """The window sill seen by every camera: a dense plane 3.2 m ahead (x = 3.2), with a hole
+    where the cup stood (``hole``), and a far wall seen through it (``behind``)."""
+    y, z = np.meshgrid(np.arange(-1.0, 1.0, 0.01), np.arange(-1.0, 1.0, 0.01))
+    pts = np.stack([np.full(y.size, 3.2), y.ravel(), z.ravel()], axis=1)
+    if hole:
+        pts = pts[~((np.abs(pts[:, 1]) < 0.35) & (np.abs(pts[:, 2]) < 0.35))]
+    if behind:
+        pts = np.concatenate([pts, pts * [2.0, 1.0, 1.0]])
+    return pts
+
+
+def with_cloud(v: MapView, cloud: np.ndarray | None) -> MapView:
+    return MapView(v.objects, v.poses, v.sources, v.camera, cloud, v.merged_into)
+
+
+def judged(tmp_path: Path, final: MapView, before: MapView, last: MapView | None = None,
+           cloud: np.ndarray | None = None, **extra: Any) -> tuple[Metrics, Any]:
+    """``final``: the whole sequence in one update; the split map (3 + 3) after its first update
+    (``before``) and its last (``last``, default: the same as ``final``)."""
+    m = Metrics()
+    p = plan(tmp_path, **extra)
+    cloud = surface() if cloud is None else cloud
+    split = SplitMaps((3, 3), [IMAGES[:3], IMAGES[3:]],
+                      [before, with_cloud(final if last is None else last, cloud)])
+    details = map_update_metrics(m, p, IMAGES, with_cloud(final, cloud), [split])
+    m.judge(load_targets(EXAMPLES / "targets.json"), None)
+    return m, details
+
+
+S = "map_update.split_3_3"
+
+
 def test_a_map_without_the_cup_that_kept_the_rest_passes(tmp_path: Path) -> None:
     m, details = judged(tmp_path, final_map(False), early_map())
-    assert {k: v.value for k, v in m.items.items() if not k.startswith("map_update.stability")} == {
-        "map_update.absent_fraction": 1.0, "map_update.incremental.absent_fraction": 1.0,
-        "map_update.before_present_fraction": 1.0}
-    s = {k.split(".")[-1]: v.value for k, v in m.items.items() if ".stability." in k}
-    assert s["matched_fraction"] == 1.0 and s["label_agreement"] == 1.0
-    assert s["id_agreement"] == 1.0 and s["centre_delta_median_m"] == pytest.approx(0.0)
-    assert s["obb_iou_median"] == pytest.approx(1.0)
-    assert set(m.items) == set(metric_ids())
-    assert all(v.passed for v in m.items.values())
+    assert set(m.items) == set(metric_ids(["split_3_3"]))
+    v = {k: x.value for k, x in m.items.items()}
+    assert v["map_update.absent_fraction"] == v[f"{S}.absent_fraction"] == 1.0
+    assert v["map_update.hole_fraction"] == v[f"{S}.hole_fraction"] == 0.0
+    assert v["map_update.before_present_fraction"] == 1.0
+    assert v[f"{S}.ids_persistent_fraction"] == 1.0
+    assert v[f"{S}.stability.id_agreement"] == v[f"{S}.stability.label_agreement"] == 1.0
+    assert v[f"{S}.vs_one_update.matched_fraction"] == 1.0
+    assert v[f"{S}.vs_one_update.id_agreement"] == 1.0
+    assert v[f"{S}.vs_one_update.obb_iou_median"] == pytest.approx(1.0)
+    # first vs last update: labels and ids only; the box figures are detail
+    boxes = m.items[f"{S}.stability.id_agreement"].detail["boxes_after_alignment"]
+    assert boxes["obb_iou_median"] == pytest.approx(1.0)
+    assert f"{S}.stability.obb_iou_median" not in m.items
+    assert all(x.passed for x in m.items.values()), [k for k, x in m.items.items() if not x.passed]
     # the backpack (only seen late) and the cup are not compared: two objects in the stability rows
-    assert {(r["single_id"], r["split_id"]) for r in details["stability"]} == {(1, 1), (2, 2)}
+    rows = details["splits"]["split_3_3"]["stability"]
+    assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1), (2, 2)}
     assert details["before_images"] == IMAGES[:3]
 
 
@@ -225,29 +261,53 @@ def test_a_map_that_still_has_the_cup_fails_with_the_object_to_look_at(tmp_path:
     (left,) = absent.detail["present_in_the_map"]
     assert left["label"] == "cup" and left["objects"][0]["id"] == 3
     assert left["objects"][0]["image"] == IMAGES[0]
-    assert m.items["map_update.incremental.absent_fraction"].passed is False
+    assert m.items[f"{S}.absent_fraction"].passed is False
     assert m.items["map_update.before_present_fraction"].passed is True
     # the stale cup is left out of the stability comparison: the unchanged objects still pass
-    assert m.items["map_update.stability.id_agreement"].passed is True
+    assert m.items[f"{S}.stability.id_agreement"].passed is True
     assert details["absent"][0]["final"][0]["id"] == 3
 
 
-def test_the_extended_map_is_judged_apart_from_the_one_update_map(tmp_path: Path) -> None:
+def test_the_split_map_is_judged_apart_from_the_one_update_map(tmp_path: Path) -> None:
     """The update that adds the later images has to drop the cup too, not only the map that
     saw the whole sequence at once."""
-    m, details = judged(tmp_path, final_map(False), early_map(), extended=final_map(True))
+    m, details = judged(tmp_path, final_map(False), early_map(), last=final_map(True))
     assert m.items["map_update.absent_fraction"].passed is True
-    assert m.items["map_update.incremental.absent_fraction"].value == 0.0
-    assert details["absent"][0]["final"] == [] and details["absent"][0]["incremental"][0]["id"] == 3
+    assert m.items[f"{S}.absent_fraction"].value == 0.0
+    assert details["absent"][0]["final"] == []
+    assert details["splits"]["split_3_3"]["absent"][0]["final"][0]["id"] == 3
+
+
+def test_a_hole_where_the_cup_stood_is_found(tmp_path: Path) -> None:
+    for cloud, holes in ((surface(hole=True), 1.0), (surface(hole=True, behind=True), 1.0),
+                         (surface(), 0.0)):
+        m, _ = judged(tmp_path, final_map(False), early_map(), cloud=cloud)
+        h = m.items["map_update.hole_fraction"]
+        assert h.value == pytest.approx(holes), h.detail
+        assert h.passed is (holes == 0.0)
+        assert m.items[f"{S}.hole_fraction"].value == pytest.approx(holes)
+    # each image that showed the cup is judged with the map's own pose of it
+    detail = m.items["map_update.hole_fraction"].detail
+    assert set(detail) == {f"cup in {n}" for n in IMAGES[:3]}
+    assert detail[f"cup in {IMAGES[0]}"]["cells"] == 64
+    assert detail[f"cup in {IMAGES[0]}"]["ring_depth_m"] == pytest.approx(3.2, abs=0.01)
+
+
+def test_hole_cells_of_one_image() -> None:
+    region = (0.43, 0.40, 0.57, 0.60)
+    full = hole_cells(surface(), cam(0.0), CAMERA, region)
+    assert full == {"cells": 64, "holes": 0, "ring_depth_m": pytest.approx(3.2, abs=0.01)}
+    assert hole_cells(surface(hole=True), cam(0.0), CAMERA, region)["holes"] == 64
+    assert hole_cells(surface(), cam(180.0), CAMERA, region) is None  # nothing in view
 
 
 def test_an_empty_map_does_not_count_as_a_map_without_the_cup(tmp_path: Path) -> None:
     empty = view([], IMAGES)
-    m, _ = judged(tmp_path, final_map(False), early_map(), extended=empty)
+    m, _ = judged(tmp_path, final_map(False), early_map(), last=empty)
     assert m.items["map_update.absent_fraction"].passed is True
-    absent = m.items["map_update.incremental.absent_fraction"]
+    absent = m.items[f"{S}.absent_fraction"]
     assert absent.value is None and absent.passed is False and "no objects at all" in absent.error
-    assert m.items["map_update.stability.matched_fraction"].passed is False  # nothing kept
+    assert m.items[f"{S}.stability.id_agreement"].passed is False  # nothing kept
     m, _ = judged(tmp_path, empty, early_map())
     assert m.items["map_update.absent_fraction"].passed is False
 
@@ -256,7 +316,8 @@ def test_a_control_map_without_the_cup_makes_the_absence_meaningless(tmp_path: P
     m, _ = judged(tmp_path, final_map(False), early_map(with_cup=False))
     assert m.items["map_update.absent_fraction"].passed is True
     control = m.items["map_update.before_present_fraction"]
-    assert control.passed is False and control.detail == {"missing_before": ["cup"]}
+    assert control.passed is False
+    assert control.detail == {"split": "split_3_3", "missing_before": ["cup"]}
 
 
 def test_unchanged_objects_that_lost_their_id_label_or_box_are_flagged(tmp_path: Path) -> None:
@@ -265,26 +326,123 @@ def test_unchanged_objects_that_lost_their_id_label_or_box_are_flagged(tmp_path:
                    frames=(0, 1, 2)),  # new id, new label, moved by 0.2 m
                obj(2, "keyboard", (KEYBOARD[0] + 0.2, KEYBOARD[1], KEYBOARD[2]),
                    frames=(0, 5))]  # the box moved by 0.2 m
-    final = MapView(changed, final.poses, final.sources, CAMERA)
-    m, details = judged(tmp_path, final, early_map(with_cup=False))
-    v = {k.split(".")[-1]: x for k, x in m.items.items() if ".stability." in k}
+    last = MapView(changed, final.poses, final.sources, CAMERA)
+    m, details = judged(tmp_path, final, early_map(with_cup=False), last=last)
+    v = {k.removeprefix(f"{S}.stability."): x for k, x in m.items.items()
+         if k.startswith(f"{S}.stability.")}
     assert v["id_agreement"].value < 1.0 and v["id_agreement"].passed is False
-    assert v["centre_delta_median_m"].value > 0.1 and v["centre_delta_median_m"].passed is False
-    assert {(r["single_id"], r["split_id"]) for r in details["stability"]} == {(9, 1), (2, 2)}
+    assert set(v) == {"id_agreement", "label_agreement"}  # a moved box is not judged here
+    assert v["id_agreement"].detail["boxes_after_alignment"]["centre_delta_median_m"] > 0.1
+    rows = details["splits"]["split_3_3"]["stability"]
+    assert {(r["single_id"], r["split_id"]) for r in rows} == {(9, 1), (2, 2)}
+    # the monitor's published id 1 is gone after the last update
+    persist = m.items[f"{S}.ids_persistent_fraction"]
+    assert persist.value == 0.5 and persist.passed is False
+    assert persist.detail["broken"] == [{"id": 1, "label": "monitor", "published_by_update": 1,
+                                         "update": 2, "now": None}]
+
+
+def test_a_published_id_resolving_to_another_object_is_broken(tmp_path: Path) -> None:
+    final = final_map(False)
+    swapped = [obj(2, "monitor", MONITOR, (0.6, 0.2, 0.4), frames=(0, 1, 2, 5)),
+               obj(1, "keyboard", KEYBOARD, frames=(0, 5))]
+    m, _ = judged(tmp_path, final, early_map(with_cup=False),
+                  last=MapView(swapped, final.poses, final.sources, CAMERA))
+    assert m.items[f"{S}.ids_persistent_fraction"].value == 0.0
+
+
+def test_one_update_vs_split_ids_may_differ_where_an_earlier_update_published_one(
+        tmp_path: Path) -> None:
+    """mapper.md: the split map keeps the id its first update published (identity persistence
+    takes precedence), so an id that differs from the one-update map's there still agrees."""
+    renumbered = view([obj(7, "monitor", MONITOR, (0.6, 0.2, 0.4), frames=(0, 1, 2, 5)),
+                       obj(8, "keyboard", KEYBOARD, frames=(0, 5)),
+                       obj(4, "backpack", (-2.0, 1.0, 0.0), frames=(4, 5))], IMAGES)
+    m, _ = judged(tmp_path, renumbered, early_map(with_cup=False), last=final_map(False))
+    ids = m.items[f"{S}.vs_one_update.id_agreement"]
+    assert ids.value == 1.0 and ids.detail["same_id"] == pytest.approx(1 / 3, abs=1e-3)
+    assert sorted(ids.detail["published_earlier"]) == [[7, 1], [8, 2]]
+    # an id the split map never published before does not get that allowance
+    late = view([obj(1, "monitor", MONITOR, (0.6, 0.2, 0.4), frames=(0, 1, 2, 5)),
+                 obj(2, "keyboard", KEYBOARD, frames=(0, 5)),
+                 obj(9, "backpack", (-2.0, 1.0, 0.0), frames=(4, 5))], IMAGES)
+    m, _ = judged(tmp_path, late, early_map(with_cup=False), last=final_map(False))
+    assert m.items[f"{S}.vs_one_update.id_agreement"].value == pytest.approx(2 / 3)
 
 
 def test_stable_labels_restrict_the_comparison(tmp_path: Path) -> None:
     m, details = judged(tmp_path, final_map(False), early_map(), stable=["monitor"])
-    assert {(r["single_id"], r["split_id"]) for r in details["stability"]} == {(1, 1)}
-    assert m.items["map_update.stability.matched_fraction"].value == 1.0
+    rows = details["splits"]["split_3_3"]["stability"]
+    assert {(r["single_id"], r["split_id"]) for r in rows} == {(1, 1)}
+    assert m.items[f"{S}.stability.id_agreement"].value == 1.0
 
 
-def test_the_two_updates_of_one_map_are_compared_in_their_common_frame(tmp_path: Path) -> None:
-    other = view([obj(1, "monitor", MONITOR), obj(2, "keyboard", KEYBOARD)],
-                 [f"other{k}.jpg" for k in range(3)])  # registers other images, same frame
-    m, _ = judged(tmp_path, final_map(False), other)
-    assert m.items["map_update.absent_fraction"].value == 1.0
-    assert m.items["map_update.stability.id_agreement"].value == 1.0  # one map frame: no alignment
+def regauged(v: MapView, yaw_deg: float = 6.3, t: tuple[float, float, float] = (0.09, 0, 0)
+             ) -> MapView:
+    """The whole map (cameras and objects) in another gauge, as a rebuild may leave it."""
+    a = np.radians(yaw_deg)
+    R = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1.0]])
+    T = Pose(R, np.asarray(t, float))
+    objs = [DocObject(o.id, o.label, o.score, None, None,
+                      tuple(ol.cuboid_val(T.apply(np.array([o.cuboid[:3]]))[0],
+                                          R @ np.asarray(OBB(np.zeros(3), np.eye(3),
+                                                             np.ones(3)).R),
+                                          np.array(o.cuboid[7:]))), o.frames, o.labels)
+            for o in v.objects]
+    return MapView(objs, {n: T.compose(p) for n, p in v.poses.items()}, v.sources, v.camera,
+                   v.cloud, v.merged_into)
+
+
+def test_a_rebuild_that_regauges_the_frame_keeps_ids_and_labels(tmp_path: Path) -> None:
+    """A later update may re-gauge the map frame (6.3 deg and 9 cm here): the updates are
+    aligned by their common captures before boxes are paired."""
+    m, _ = judged(tmp_path, final_map(False), early_map(), last=regauged(final_map(False)))
+    assert m.items[f"{S}.stability.id_agreement"].value == 1.0
+    assert m.items[f"{S}.ids_persistent_fraction"].value == 1.0
+    assert m.items[f"{S}.vs_one_update.obb_iou_median"].value == pytest.approx(1.0, abs=0.05)
+
+
+def test_a_lasting_merge_resolves_a_published_id(tmp_path: Path) -> None:
+    """An id the later map merged into another (objects.json merged_into) resolves to it; an id
+    that is simply gone stays broken."""
+    early = view([obj(1, "monitor", MONITOR, (0.6, 0.2, 0.4)), obj(2, "keyboard", KEYBOARD),
+                  obj(5, "monitor", MONITOR, (0.6, 0.2, 0.4))], IMAGES[:3])
+    last = final_map(False)
+    merged = MapView(last.objects, last.poses, last.sources, CAMERA, None, {5: 1})
+    m, _ = judged(tmp_path, final_map(False), early, last=merged)
+    assert m.items[f"{S}.ids_persistent_fraction"].value == 1.0
+    m, _ = judged(tmp_path, final_map(False), early, last=last)
+    persist = m.items[f"{S}.ids_persistent_fraction"]
+    assert persist.value == pytest.approx(2 / 3)
+    assert [b["id"] for b in persist.detail["broken"]] == [5]
+
+
+def test_merges_are_read_from_the_map(tmp_path: Path) -> None:
+    (tmp_path / "objects.json").write_text(json.dumps({"merged_into": {"5": 1, "7": 5}}))
+    v = MapView([], {}, {}, None, None, merges(tmp_path))
+    assert v.merged_into == {5: 1, 7: 5} and v.resolve(7) == 1 and v.resolve(3) == 3
+    assert merges(tmp_path / "missing") == {}
+
+
+def test_splits_come_from_the_annotation(tmp_path: Path) -> None:
+    p = plan(tmp_path, splits=[[2, 2, 2], [4, 2]])
+    assert p.split_sizes(IMAGES) == [(2, 2, 2), (4, 2)]
+    assert plan(tmp_path).split_sizes(IMAGES) == [(3, 3)]  # default: the early part, the rest
+    assert parts_of(IMAGES, (4, 2)) == [IMAGES[:4], IMAGES[4:]]
+    with pytest.raises(ValueError, match="does not cover"):
+        parts_of(IMAGES, (4, 4))
+    (tmp_path / "gt" / "a.json").write_text(json.dumps({**ANNOTATION, "splits": [[3, 0]]}))
+    _, skipped = gt.discover(tmp_path / "gt")
+    assert "'splits'" in skipped[0]["reason"]
+
+
+def test_a_split_that_could_not_be_built_fails_its_metrics(tmp_path: Path) -> None:
+    m = Metrics()
+    map_update_metrics(m, plan(tmp_path), IMAGES, with_cloud(final_map(False), surface()), [],
+                       {"split_2_4": "update 1 of split_2_4 failed"})
+    assert m.items["map_update.split_2_4.absent_fraction"].error == "update 1 of split_2_4 failed"
+    control = m.items["map_update.before_present_fraction"]
+    assert control.value is None and "no split map's first update" in (control.error or "")
 
 
 # -- the plan with fake entry points ---------------------------------------------------------------------
@@ -333,7 +491,7 @@ def office_repo(tmp_path: Path, final: MapView, early: MapView) -> Path:
     (docs / "early.json").write_text(json.dumps(scene_doc(early, "early")))
     repo = fake_repo(tmp_path)
     script(repo, "mapper.sh", f"""echo "$@" >> "{tmp_path}/mapper.log"
-case "$*" in *img03*) cat "{docs}/final.json";; *office_extended*) cat "{docs}/early.json";;
+case "$*" in *img03*) cat "{docs}/final.json";; *office_split*) cat "{docs}/early.json";;
 *) cat "{docs}/final.json";; esac""")
     return repo
 
@@ -347,7 +505,7 @@ def run_plan(tmp_path: Path, final: MapView, early: MapView) -> Evaluation:
     return ev
 
 
-def test_the_plan_maps_the_sequence_whole_and_extended_then_judges(tmp_path: Path) -> None:
+def test_the_plan_maps_the_sequence_whole_and_split_then_judges(tmp_path: Path) -> None:
     ev = run_plan(tmp_path, final_map(False), early_map())
     log = (tmp_path / "mapper.log").read_text().splitlines()
     root = tmp_path / "examples" / "office_sequence"
@@ -355,14 +513,17 @@ def test_the_plan_maps_the_sequence_whole_and_extended_then_judges(tmp_path: Pat
     assert log[0] == (f"update -i {' '.join(str(root / n) for n in IMAGES)} "
                       f"-m {out / 'office'}")  # one update, the sorted files
     assert log[1] == (f"update -i {' '.join(str(root / n) for n in IMAGES[:3])} "
-                      f"-m {out / 'office_extended'}")  # the early images, then the rest
+                      f"-m {out / 'office_split_3_3'}")  # the early images, then the rest
     assert log[2] == (f"update -i {' '.join(str(root / n) for n in IMAGES[3:])} "
-                      f"-m {out / 'office_extended'}")
-    assert set(ev.metrics.items) == set(metric_ids())
-    assert all(m.passed for m in ev.metrics.items.values())
+                      f"-m {out / 'office_split_3_3'}")
+    assert set(ev.metrics.items) == set(metric_ids(["split_3_3"]))
+    # the fake maps have no cloud on disk: the hole test says so, everything else passes
+    holes = [k for k, m in ev.metrics.items.items() if not m.passed]
+    assert sorted(holes) == ["map_update.hole_fraction", f"{S}.hole_fraction"]
+    assert "no cloud" in (ev.metrics.items["map_update.hole_fraction"].error or "")
     assert ev.details["map_update"]["before_images"] == IMAGES[:3]
     assert [r.spec.tag for r in ev.runner.records] == [
-        "mapper_office", "mapper_office_early", "mapper_office_rest"]
+        "mapper_office", "mapper_office_split_3_3_1", "mapper_office_split_3_3_2"]
 
 
 def test_the_plan_reports_the_cup_left_in_the_map(tmp_path: Path) -> None:
@@ -374,9 +535,9 @@ def test_the_plan_reports_the_cup_left_in_the_map(tmp_path: Path) -> None:
     text = summary_md(result)
     assert "## Map update\n" in text and "map_update.absent_fraction | 0 | >= 1" in text
     assert "Map update: objects of the absent labels in the map of the whole sequence" in text
-    assert "Map update: objects of the absent labels in the extended map (second update)" in text
+    assert "Map update: objects of the absent labels in the split_3_3 map after its last" in text
     assert "| cup | 3 | cup |" in text and IMAGES[0] in text
-    assert "Map update: objects that never changed" in text
+    assert "Map update: split_3_3, objects that never changed" in text
 
 
 def test_without_an_annotation_or_maps_the_metrics_fail_with_the_reason(tmp_path: Path) -> None:
@@ -393,4 +554,6 @@ def test_without_an_annotation_or_maps_the_metrics_fail_with_the_reason(tmp_path
     ev = Evaluation(out / "2", Runner(out / "2", repo), BrowserProbe(None), examples=root)
     ev.map_update()  # the mapper fails
     assert [r.ok for r in ev.runner.records] == [False, False]  # no second update after a failure
-    assert "was not built" in (ev.metrics.items["map_update.stability.id_agreement"].error or "")
+    assert "update 1 of split_3_3 failed" in (
+        ev.metrics.items[f"{S}.stability.id_agreement"].error or "")
+    assert "was not built" in (ev.metrics.items["map_update.absent_fraction"].error or "")
