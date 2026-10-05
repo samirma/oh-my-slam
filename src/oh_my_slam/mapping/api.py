@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -116,7 +116,7 @@ class Rebuild:
     (``uids``, by name), the id the map published for each stored detection (``prior``: the
     ``id()`` of the stored keyframes' ``Detection`` -> id, its merges resolved), the map's object
     count (``next_id``: the new keyframes' detections are numbered on from it), its merges, the
-    creation update of each published object (``created``) and the places of the objects its
+    creation update of each published (confirmed) object (``created``) and the places of the objects its
     updates removed (``vacated``; their pixels stay retired in the stored keyframes)."""
 
     uids: dict[str, int]
@@ -125,6 +125,7 @@ class Rebuild:
     merged_into: dict[int, int]
     created: dict[int, int]
     vacated: list[Any]
+    camera: int | None = None  # the database camera the stored keyframes share, if one
 
 
 Progress = Callable[[str], None]
@@ -456,6 +457,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     names = {nf.kf.index: f"{nf.kf.name}.jpg" for nf in ctx.new}
     names.update({f.index: Path(f.image).name for f in ctx.old_frames})
     prior = _camera_prior(ctx.new, ctx.old_frames)
+    if ctx.rebuild is not None and ctx.rebuild.camera is not None:
+        prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
     t0 = time.perf_counter()
     with timing.stage(timing.Stage.FEATURES_MATCHING):
         if ctx.features is not None:
@@ -1945,9 +1948,13 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
     prior: dict[int, int] = {}
     stored = [_stored_frame(tx, r, prior, resolve) for r in plan]
     rb = Rebuild({r.name: r.update_id for r in plan}, prior, int(state.next_id),
-                 dict(state.merged_into), {o.id: o.created_update for o in state.objects},
-                 list(state.vacated))
-    tx.start_over()
+                 dict(state.merged_into),
+                 {o.id: o.created_update for o in state.objects if o.confirmed},
+                 list(state.vacated),
+                 plan[0].camera_id if len({(r.camera_id, r.width, r.height) for r in plan}) == 1
+                 and all((nf.full_size == (plan[0].width, plan[0].height)) for nf in new)
+                 else None)
+    tx.start_over(keep=(store.SFM_DB,))  # the stored keyframes' features and matches
     for key in ("floor_z", "scale", "map_frame"):
         meta.pop(key, None)
     meta["next_object_id"] = 1

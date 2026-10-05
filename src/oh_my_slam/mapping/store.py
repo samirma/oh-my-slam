@@ -283,6 +283,7 @@ class MapTransaction:
         self._deleted: set[str] = set()
         self._fresh = False  # ``start_over``: nothing committed is read or kept but map.json
         self._started_over: set[str] = set()
+        self._kept: set[str] = set()
 
     # -- lifecycle -------------------------------------------------------------------------------
 
@@ -335,17 +336,23 @@ class MapTransaction:
         """Latest version of a file: staged if written in this update, else committed (after
         ``start_over``: staged only)."""
         staged = self.staging / rel
-        return staged if staged.exists() or self._fresh else self.root / rel
+        return staged if staged.exists() or self._dropped(rel) else self.root / rel
 
-    def start_over(self) -> None:
-        """Rebuild the map in this update: every committed file but ``map.json`` is deleted at
-        commit unless staged again, and none is read (``current``, ``clone_for_edit``) — what the
-        update needs of the old map (its keyframe images) it stages first."""
+    def _dropped(self, rel: str) -> bool:
+        return self._fresh and rel not in self._kept
+
+    def start_over(self, keep: tuple[str, ...] = ()) -> None:
+        """Rebuild the map in this update: every committed file but ``map.json`` and ``keep``
+        is deleted at commit unless staged again, and none is read (``current``,
+        ``clone_for_edit``) — what the update needs of the old map (its keyframe images) it
+        stages first."""
         self._fresh = True
+        self._kept = set(keep)
         self._started_over = set()
         for p in self.root.rglob("*"):
             rel = p.relative_to(self.root)
-            if p.is_file() and rel.parts[0] not in (STAGING, LOCK) and str(rel) != MAP_JSON:
+            if (p.is_file() and rel.parts[0] not in (STAGING, LOCK) and str(rel) != MAP_JSON
+                    and str(rel) not in self._kept):
                 self._started_over.add(str(rel))
         self._deleted |= self._started_over
 
@@ -378,7 +385,7 @@ class MapTransaction:
         """Staged copy of a committed file (APFS clone when possible) to be modified in place."""
         dst = self.stage(rel)
         src = self.root / rel
-        if dst.exists() or not src.exists() or self._fresh:
+        if dst.exists() or not src.exists() or self._dropped(rel):
             return dst
         clone_file(src, dst)
         return dst

@@ -1397,7 +1397,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         k = resolved(oid)
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     fresh = [o for o in state.objects if o.id >= first_new]
-    final_of, _, absorbed = _published_ids(owner, obs, resolved, first_detection, prior,
+    final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
                                            floor, count)
     count = max([count] + [v + 1 for v in final_of.values()])
     rename = {o.id: final_of[o.id] for o in fresh}
@@ -1451,6 +1451,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     state.summary = {
         "instances": len(obs), "touched": len(touched), "new": len(fresh), "merged": merged,
         "removed": sorted({oid for oid in removed if oid < first_new} | set(removed_published)),
+        "unpublished": _unpublished(state, rb) if rb is not None else [],
         "withdrawn": sum(oid >= first_new and final_of.get(oid, oid) not in published
                          for oid in removed),
         "moved": sorted(moved_ids),
@@ -3249,35 +3250,33 @@ def _absence(candidates: list[MapObject], verdicts: dict[int, list[Verdict]],
     return removed
 
 
-def _published_ids(owner: list[int], obs: list[Observation], resolved: Callable[[int], int],
-                   first_detection: dict[int, int], prior: dict[int, int], floor: int, count: int
+def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
+                   resolved: Callable[[int], int], first_detection: dict[int, int],
+                   prior: dict[int, int], floor: int, count: int
                    ) -> tuple[dict[int, int], set[int], dict[int, int]]:
     """The final id of each new object of the update (provisional id -> id): the number of its
-    first detection, except in a rebuild, where an object takes the lowest id the map published
-    for a stored detection it owns (``prior``), unless an object owning more of those took it, and
-    an object without one whose number falls among the published ones (below ``floor``) takes a
-    new one (from ``count`` on). Returns (final ids, the published ids taken, the published ids
-    other objects own detections of: id -> the provisional object that absorbed them)."""
-    claims: dict[int, dict[int, int]] = {}
+    first detection, except in a rebuild: each id the map published goes to the object that owns
+    the earliest stored detection that carried it (``prior``; by detection number: the one the
+    id was first given with), and an object takes the lowest of the ids it got; an object without
+    one whose number falls among the published ones (below ``floor``) takes a new one (from
+    ``count`` on). Returns (final ids, the published ids taken, the other published ids an
+    object got: id -> that object, which absorbed them).
+
+    Two objects the map had merged (two windows a weakly posed first update placed together)
+    can come apart: the id stays with the one it was first given to."""
+    founder: dict[int, tuple[int, int]] = {}  # published id -> (detection number, object)
     for i, oid in enumerate(owner):
         k = resolved(oid)
         for m in obs[i].members:
             pid = prior.get(id(m.detection))
-            if pid:
-                c = claims.setdefault(k, {})
-                c[pid] = c.get(pid, 0) + 1
-    final: dict[int, int] = {}
-    taken: set[int] = set()
-    for k in sorted(claims, key=lambda k: (-sum(claims[k].values()), first_detection.get(k, 0), k)):
-        free = sorted(p for p in claims[k] if p not in taken)
-        if free:
-            final[k] = free[0]
-            taken.add(free[0])
-    absorbed: dict[int, int] = {}
-    for k, c in claims.items():
-        for p in c:
-            if p not in taken and k in final:
-                absorbed.setdefault(p, k)
+            if pid and (pid not in founder or (number[i], k) < founder[pid]):
+                founder[pid] = (number[i], k)
+    got: dict[int, list[int]] = {}
+    for pid in sorted(founder):
+        got.setdefault(founder[pid][1], []).append(pid)
+    final: dict[int, int] = {k: ids[0] for k, ids in got.items()}
+    taken = set(final.values())
+    absorbed = {p: k for k, ids in got.items() for p in ids[1:]}
     nxt = count
     for k in sorted(first_detection, key=lambda k: (first_detection[k], k)):
         if k in final:
@@ -3308,6 +3307,12 @@ def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
         if o.id in rb.created:
             o.created_update = min(o.created_update, rb.created[o.id])
     return sorted(set(rb.created) - finals - set(state.merged_into))
+
+
+def _unpublished(state: ObjectState, rb: Any) -> list[int]:
+    """Published ids whose object a rebuild keeps as a candidate only (not confirmed again: the
+    map no longer exports it, though a later update may confirm it)."""
+    return sorted(o.id for o in state.objects if o.id in rb.created and not o.confirmed)
 
 
 # ------------------------------------------------------------------------------------------------

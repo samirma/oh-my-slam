@@ -132,12 +132,13 @@ def _resolve(mdir: Path, oid: int) -> int:
 
 def _ids_persist(mdir: Path, before: dict, after: dict) -> None:  # type: ignore[type-arg]
     """Every id ``before`` published resolves (itself, or through ``merged_into``) to an object of
-    ``after`` with a compatible label, or an update reported it removed."""
+    ``after`` with a compatible label, or an update reported it removed (or kept as a candidate
+    only: ``unpublished``)."""
     from oh_my_slam.segmentation.detect import compatible
 
     now = {int(k): o["type"] for k, o in after["openlabel"]["objects"].items()}
     removed = {oid for u in json.loads((mdir / "map.json").read_text())["updates"]
-               for oid in u["objects"]["removed"]}
+               for oid in u["objects"]["removed"] + u["objects"].get("unpublished", [])}
     for k, o in before["openlabel"]["objects"].items():
         oid = _resolve(mdir, int(k))
         assert oid in now or int(k) in removed, (k, o["type"], sorted(now))

@@ -406,6 +406,10 @@ class Sfm:
         without it. Photos keep it: downscaled to 2000-2800 px or not doubled, the 13-photo office
         map fell into a wrong global solution in 2 to 8 of 8 trials, never with COLMAP's
         features."""
+        camera = self._register(names, prior)
+        names = self._without_features(names)  # a rebuild keeps the stored keyframes' features
+        if not names:
+            return camera
         lst = self.work / "extract_list.txt"
         lst.write_text("\n".join(names) + "\n")
         doubled = not video or max(prior.width, prior.height) < SIFT_UNDOUBLED_VIDEO_SIDE
@@ -418,10 +422,20 @@ class Sfm:
             "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
-        camera = self._register(names, prior)
         args += ["--ImageReader.existing_camera_id", str(camera)]
         _run(args, self.log_path)
         return camera
+
+    def _without_features(self, names: list[str]) -> list[str]:
+        """``names`` whose features the database does not hold yet."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            ids = {im.name: im.image_id for im in db.read_all_images()}
+            return [n for n in names if n not in ids or not db.exists_keypoints(ids[n])]
+        finally:
+            db.close()
 
     def _register(self, names: list[str], prior: CameraPrior) -> int:
         """Write ``names`` into the database in their order, before their features, with the
