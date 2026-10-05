@@ -225,6 +225,17 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     return ThinnedCloud(cloud, total, edge)
 
 
+def display_selection(xyz: NDArray[Any], max_points: int
+                      ) -> tuple[NDArray[np.int64] | None, float]:
+    """(indices, edge) of the points of ``xyz`` drawn within the display budget: ``None`` (every
+    point) when there are at most ``max_points``, else ``budget_voxel_indices``'s selection — the
+    one ``derive_thinned`` makes. Only positions are needed, so a caller can pick the other
+    attributes of the kept points alone (e.g. from a memory-mapped file)."""
+    if len(xyz) <= max_points:
+        return None, 0.0
+    return budget_voxel_indices(xyz, max_points)
+
+
 def thin_cloud(cloud: PointCloud, max_points: int) -> ThinnedCloud:
     """A cloud already derived (e.g. read from a PLY file the commands wrote) within the display
     budget, by the selection ``derive_thinned`` makes: with more than ``max_points`` points, the
@@ -232,9 +243,9 @@ def thin_cloud(cloud: PointCloud, max_points: int) -> ThinnedCloud:
     of them (``budget_voxel_indices``). Each kept point keeps exactly its values (position,
     colour, label, normal)."""
     total = len(cloud)
-    if total <= max_points:
+    keep, edge = display_selection(cloud.xyz, max_points)
+    if keep is None:
         return ThinnedCloud(cloud, total, 0.0)
-    keep, edge = budget_voxel_indices(cloud.xyz, max_points)
 
     def pick(a: NDArray[Any] | None) -> NDArray[Any] | None:
         return None if a is None else a[keep]

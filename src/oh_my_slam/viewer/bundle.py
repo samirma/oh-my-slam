@@ -267,37 +267,42 @@ def display_transform(camera_frame: bool, up_cam: Any = None) -> list[list[float
 
 def ply_comments(path: Path) -> list[str]:
     """The header comments of a PLY file (its frame, attributes and located cameras)."""
-    from oh_my_slam.core.ply import parse_header
+    from oh_my_slam.core.ply import read_header
 
-    with Path(path).open("rb") as f:
-        head = b""
-        while b"end_header\n" not in head and len(head) < (1 << 24):
-            more = f.read(1 << 16)
-            if not more:
-                break
-            head += more
-    return parse_header(head).comments
+    return read_header(path).comments
 
 
 def ply_display(path: Path, max_points: int | None = None) -> tuple[DisplayCloud, list[str]]:
     """A PLY file the commands wrote, as the viewer draws it: every point up to the display
-    budget, above it the voxel-grid selection of ``segmentation.cloud.thin_cloud`` (each kept point
-    with exactly its values); and the file's header comments. Raises ``ValueError`` for a file
-    that is not such a PLY."""
-    from oh_my_slam.core.ply import read_ply
-    from oh_my_slam.segmentation.cloud import thin_cloud
+    budget, above it the voxel-grid selection of ``segmentation.cloud.display_selection`` (each
+    kept point with exactly its values); and the file's header comments. A binary file is read
+    through a memory map: only its positions and the kept points' other values are loaded.
+    Raises ``ValueError`` for a file that is not such a PLY."""
+    from oh_my_slam.core.ply import cloud_of_rows, memmap_ply, read_ply
+    from oh_my_slam.segmentation.cloud import display_selection, thin_cloud
 
+    budget = DISPLAY_POINT_BUDGET if max_points is None else max_points
     t0 = time.perf_counter()
-    comments = ply_comments(path)
-    thinned = thin_cloud(read_ply(path), DISPLAY_POINT_BUDGET if max_points is None else max_points)
-    return DisplayCloud(thinned.cloud, thinned.total, thinned.voxel,
-                        time.perf_counter() - t0), comments
+    header, rows = memmap_ply(path)
+    if rows is None:  # ASCII: parsed whole
+        thinned = thin_cloud(read_ply(path), budget)
+        return DisplayCloud(thinned.cloud, thinned.total, thinned.voxel,
+                            time.perf_counter() - t0), header.comments
+    xyz = np.stack([rows["x"], rows["y"], rows["z"]], axis=1).astype(np.float32, copy=False)
+    keep, edge = display_selection(xyz, budget)
+    cloud = cloud_of_rows(rows if keep is None else rows[keep])
+    del rows  # the map is closed with its last reference
+    return DisplayCloud(cloud, len(xyz), edge, time.perf_counter() - t0), header.comments
 
 
-def is_camera_frame(comments: Iterable[str]) -> bool:
-    """Whether a PLY's header says its points are in a single image's camera frame."""
+def is_camera_frame(comments: Iterable[str] = (), cs_types: Iterable[str] | None = None) -> bool:
+    """Whether a scene is in a single image's camera frame: for a scene JSON (``cs_types``, the
+    types of its coordinate systems), when it has no scene coordinate system (``scene_cs``, the
+    map frame); for a PLY (its header ``comments``), when its header names that frame."""
     from oh_my_slam.segmentation.cloud import IMAGE_FRAME
 
+    if cs_types is not None:
+        return "scene_cs" not in set(cs_types)
     return IMAGE_FRAME in comments
 
 

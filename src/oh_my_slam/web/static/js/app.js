@@ -22,7 +22,9 @@ function parse() {
   return { parts, query: new URLSearchParams(query) };
 }
 
-function route() {
+// `event`: the hashchange that navigated (its timeStamp starts the in-page timing of the route)
+function route(event) {
+  const start = event && event.timeStamp ? event.timeStamp : performance.now();
   const { parts, query } = parse();
   const [page = 'image', a, b] = parts;
   if (cleanup) { try { cleanup(); } catch (err) { console.error(err); } cleanup = null; }
@@ -58,6 +60,8 @@ function route() {
     document.getElementById('announce').textContent = `${title} page`;
   }
   lastPage = where;
+  // how long this navigation took in the page, from the hash change to the rendered page
+  window.__app.lastRoute = { where, start, end: performance.now() };
   navigated = true;
 }
 let navigated = false;  // the first page of a visit keeps the browser's own focus

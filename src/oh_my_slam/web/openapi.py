@@ -156,6 +156,10 @@ def _fixed() -> Json:
             "parameters": [
                 {"name": "camera", "in": "query", "required": False,
                  "schema": {"type": "boolean"}, "description": "the scene is in a camera frame"},
+                {"name": "cs_types", "in": "query", "required": False,
+                 "schema": {"type": "string"},
+                 "description": "a scene JSON's coordinate-system types, comma-separated: a camera "
+                                "frame when none is a scene_cs"},
                 {"name": "comment", "in": "query", "required": False,
                  "schema": {"type": "array", "items": {"type": "string"}},
                  "description": "a PLY's header comments (they name its frame)"},

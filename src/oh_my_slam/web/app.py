@@ -20,6 +20,7 @@ type a cross-site page cannot send without a CORS preflight, which this service 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -74,6 +75,7 @@ HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at mo
 SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
                         "multipart/form-data"})  # what a cross-site form sends without a preflight
 VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
+DISPLAY_DIR = "display"  # a job's PLY files as the viewer draws them (cloud documents)
 _MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
           ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 Json = dict[str, Any]
@@ -182,7 +184,8 @@ class Service:
     _hosts_at: float = 0.0
     _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
     _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
-    _clouds: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))  # display_cloud
+    _building: dict[Path, Any] = field(default_factory=dict)  # display_cloud builds in flight
+    _building_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         if self.runner.reevaluate is None:  # a conditional job's inference need, at its start
@@ -285,21 +288,52 @@ class Service:
 
         return self._job_views.get(jid, make)
 
-    def display_cloud(self, path: Path) -> Any:
+    def display_cloud(self, jid: str, path: Path) -> Path:
         """A PLY file of a job as the viewer draws it (the 3D scene viewer): the viewer's cloud
-        document, within the display budget (spec §2.5), with the file's header comments."""
-        stamp = path.stat().st_mtime_ns
+        document, within the display budget (spec §2.5), with the file's header comments.
 
-        def make() -> Any:
-            from oh_my_slam.viewer.bundle import ply_display
+        The document is kept as a file in the job's own folder (``display/``, deleted with the
+        job), never in memory, and built once per file version: concurrent requests for the same
+        file wait for the one build (its future), others build in parallel."""
+        from concurrent.futures import Future
+
+        from oh_my_slam.viewer import bundle
+
+        st = path.stat()
+        key = f"{path.name}|{st.st_mtime_ns}|{st.st_size}|{bundle.DISPLAY_POINT_BUDGET}"
+        target = self.workspace.job_dir(jid) / DISPLAY_DIR / (
+            hashlib.sha256(f"{path}|{key}".encode()).hexdigest()[:32] + ".cloud")
+        if target.is_file():
+            return target
+        with self._building_lock:
+            fut = self._building.get(target)
+            mine = fut is None
+            if mine:
+                fut = self._building[target] = Future()
+        assert fut is not None
+        if not mine:
+            return fut.result()
+        try:
             from oh_my_slam.viewer.routes import cloud_document
 
-            dc, comments = ply_display(path)
+            dc, comments = bundle.ply_display(path)
             attrs = next((c.removeprefix("attributes ") for c in comments
                           if c.startswith("attributes ")), "")
-            return cloud_document(dc, attrs, {"comments": comments})
-
-        return self._clouds.get((str(path), stamp), make)
+            doc = cloud_document(dc, attrs, {"comments": comments})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            part = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+            with part.open("wb") as f:
+                for piece in doc.pieces:
+                    f.write(piece)
+            part.replace(target)
+            fut.set_result(target)
+            return target
+        except BaseException as exc:
+            fut.set_exception(exc)
+            raise
+        finally:
+            with self._building_lock:
+                self._building.pop(target, None)
 
 
 def _viewer_response(r: Any, method: str) -> Response:
@@ -552,21 +586,17 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         if not p.is_file():
             raise NotFoundError(f"no file {rel} in job {j.id}")
         try:
-            doc = await run_in_threadpool(service.display_cloud, p)
+            doc = await run_in_threadpool(service.display_cloud, j.id, p)
         except (ValueError, KeyError, UnicodeDecodeError) as exc:
             return _error(400, "usage", f"{rel} is not a PLY file the viewer can draw: {exc}")
-
-        async def body() -> AsyncIterator[bytes | memoryview]:
-            for piece in doc.pieces:
-                yield piece
-
-        return StreamingResponse(body(), media_type="application/octet-stream",
-                                 headers={"Content-Length": str(doc.size)})
+        return FileResponse(doc, media_type="application/octet-stream")
 
     async def display_transform(request: Request) -> Response:
         """The viewer's display transform of a scene: identity for map coordinates; for a single
-        image's camera frame (``camera=true``, or a PLY header ``comment`` naming it) view.sh's
-        upright transform, with the estimated ``up=x,y,z`` when the scene states one."""
+        image's camera frame view.sh's upright transform, with the estimated ``up=x,y,z`` when the
+        scene states one. The frame is decided by the viewer's one rule (``is_camera_frame``),
+        from a scene JSON's coordinate-system types (``cs_types=a,b``) or a PLY's header
+        ``comment``s; ``camera=true`` states it outright."""
         from oh_my_slam.viewer.bundle import display_transform as transform
         from oh_my_slam.viewer.bundle import is_camera_frame
 
@@ -579,8 +609,9 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
                 up = []
             if len(up) != 3:
                 return _error(400, "usage", "up must be x,y,z: three numbers")
+        cs_types = None if "cs_types" not in q else [t for t in q["cs_types"].split(",") if t]
         camera = q.get("camera", "").lower() in ("1", "true", "yes") or \
-            await run_in_threadpool(is_camera_frame, q.getlist("comment"))
+            await run_in_threadpool(is_camera_frame, q.getlist("comment"), cs_types)
         matrix = await run_in_threadpool(transform, camera, up)
         return JSONResponse({"camera_frame": camera, "display_transform": matrix})
 

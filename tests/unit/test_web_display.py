@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -101,6 +104,34 @@ def test_a_job_ply_above_the_budget_is_served_thinned(svc: tuple[Service, TestCl
     assert r.status_code == 206 and len(r.content) == 100
 
 
+def test_display_documents_are_files_built_once(svc: tuple[Service, TestClient, Path],
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """The document is kept as a file in the job's folder (never resident); concurrent requests
+    for one file wait for a single build; a changed file is built again."""
+    service, client, out = svc
+    (out / "result.ply").write_bytes(ply_bytes(cloud(), comments=[MAP_FRAME]))
+    builds: list[Path] = []
+    real = bundle.ply_display
+
+    def slow(path: Path, max_points: int | None = None) -> Any:
+        builds.append(path)
+        time.sleep(0.3)
+        return real(path, max_points)
+
+    monkeypatch.setattr(bundle, "ply_display", slow)
+    with ThreadPoolExecutor(4) as pool:
+        docs = list(pool.map(lambda _: service.display_cloud("j1", out / "result.ply"), range(4)))
+    assert len(builds) == 1 and len(set(docs)) == 1
+    doc = docs[0]
+    assert doc.parent == service.workspace.job_dir("j1") / "display" and doc.is_file()
+    assert client.get("/api/jobs/j1/display-cloud").content == doc.read_bytes()
+    assert len(builds) == 1  # served from the file
+    (out / "result.ply").write_bytes(ply_bytes(cloud(), comments=[IMAGE_FRAME]))
+    head, _ = parse_cloud_payload(client.get("/api/jobs/j1/display-cloud").content)
+    assert len(builds) == 2 and head["comments"] == [IMAGE_FRAME]
+    assert not [p for p in doc.parent.iterdir() if p.name.endswith(".part")]
+
+
 def test_display_transform_is_the_viewers_own(svc: tuple[Service, TestClient, Path]) -> None:
     _, client, _ = svc
     eye = np.eye(4).tolist()
@@ -116,6 +147,13 @@ def test_display_transform_is_the_viewers_own(svc: tuple[Service, TestClient, Pa
     assert r["camera_frame"]
     r = client.get("/api/display-transform", params=[("comment", MAP_FRAME)]).json()
     assert not r["camera_frame"]
+    # a scene JSON: its coordinate-system types decide, by the same rule (no scene_cs: camera)
+    r = client.get("/api/display-transform", params={"cs_types": "sensor_cs"}).json()
+    assert r["camera_frame"] and np.allclose(r["display_transform"], bundle.upright_transform(DEFAULT_UP_CAM))
+    assert client.get("/api/display-transform", params={"cs_types": ""}).json()["camera_frame"]
+    r = client.get("/api/display-transform", params={"cs_types": "scene_cs,sensor_cs"}).json()
+    assert r == {"camera_frame": False, "display_transform": eye}
+    assert bundle.is_camera_frame(cs_types=["sensor_cs"]) and not bundle.is_camera_frame([MAP_FRAME])
     assert client.get("/api/display-transform", params={"camera": "1", "up": "1,2"}).status_code == 400
     assert client.get("/api/display-transform", params={"camera": "1", "up": "0,0,0"}).status_code == 400
     assert "/api/display-transform" in client.get("/api/openapi.json").json()["paths"]

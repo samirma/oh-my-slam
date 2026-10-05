@@ -396,7 +396,7 @@ A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under u
 |---|---|
 | `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service never deletes a map and changes one only through `mapper-update`. |
 | `uploads/<id>/<file>` | Raw-body uploads (`POST /api/uploads?name=<file>`, `application/octet-stream`). A job refers to one by its path `uploads/<id>/<file>`. Each upload belongs to at most one queued or running job and is deleted when that job ends, whatever its state. An interrupted upload is deleted at once, and every upload is deleted at start and stop. An upload may hold at most 8 GiB (long phone videos fit) and must leave 1 GiB free on the workspace's disk; otherwise it gets 413. |
-| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS`), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, `out/` (everything the command wrote) and `viewer/` (a saved viewer). |
+| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS`), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, `out/` (everything the command wrote), `viewer/` (a saved viewer) and `display/` (its PLY files as the 3D scene viewer draws them). |
 
 Any other workspace path is accepted as an input, relative to the workspace or absolute. A path
 that resolves outside the workspace (through `..`, `~` or a symlink), or that goes through a
@@ -530,7 +530,7 @@ option.
 | `/api/jobs/<id>/timings` | The job's timings. |
 | `/api/jobs/<id>/viewer/<path>` | The job's saved viewer. |
 | `/api/jobs/<id>/display-cloud[?file=<path>]` | A job's PLY as the viewer draws it, within the display budget (3D scene viewer). |
-| `GET /api/display-transform` | The viewer's display transform of a scene (`camera`, `comment`, `up`). |
+| `GET /api/display-transform` | The viewer's display transform of a scene (`cs_types`, `comment`, `camera`, `up`). |
 
 **Web application** (spec §2.6 "Web application"). `/` serves a browser application in
 `web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
@@ -591,9 +591,11 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
   Files from disk are read in the browser and never uploaded. Both files are drawn in the same map
   coordinates by the viewer's own modules (`Viewer`, `parsePly`, `sceneObjects`, `sceneCameras`,
   `plyCameras`, layers, labels, the camera table with *Go to*). Each layer toggle names its file.
-  A scene in a single image's camera frame (no `scene_cs`, or a PLY whose header names that frame)
-  is shown upright with the viewer's own transform, from `GET /api/display-transform` (view.sh -i's
-  `upright_transform`, with the scene's estimated up direction). Files are parsed and validated in
+  A scene in a single image's camera frame is shown upright with the viewer's own transform, from
+  `GET /api/display-transform` (view.sh -i's `upright_transform`, with the scene's estimated up
+  direction). The service decides the frame by one rule (`viewer.bundle.is_camera_frame`): a JSON's
+  coordinate-system types (`cs_types=`) with no `scene_cs`, or a PLY whose header names that frame
+  (`comment=`). Files are parsed and validated in
   a Web Worker, and a PLY's header is read first (the first bytes of a disk file, a `Range`
   request for a job's).
   * The point-cloud controls offer what the file allows: its colours or none, and shading by its
@@ -606,8 +608,11 @@ and `/static/openlabel_json_schema.json` the vendored scene schema.
     it whole above the display budget (§2.5); the refusal says to view it as a map or as a job's
     file. A job's PLY above the budget is drawn from `GET /api/jobs/<id>/display-cloud[?file=]`:
     the viewer's cloud document of the file, thinned by the shared voxel-grid selection
-    (`segmentation.cloud.thin_cloud`, each kept point with exactly its values), with the file's
-    header comments (its located cameras).
+    (`segmentation.cloud.display_selection`, each kept point with exactly its values), with the
+    file's header comments (its located cameras). A binary file is read through a memory map (its
+    positions, then the kept points only). The document is built once per file version, while
+    other requests wait for that build, and is kept as a file in the job's folder
+    (`jobs/<id>/display/`), never in memory.
 * **Accessibility and layout.**
   * Everything is reachable from the keyboard, focus is always visible, and every control has a
     label. Object colours always appear with their id or label.

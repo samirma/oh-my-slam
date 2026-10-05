@@ -74,11 +74,9 @@ function sceneEntry(name, doc, errors) {
 // transform, asked of the service.
 async function displayTransform(state) {
   const q = new URLSearchParams();
-  if (state.json) {
+  if (state.json) {  // the service decides the frame from the coordinate systems' types
     const ol = state.json.doc.openlabel;
-    const scene = Object.values(ol.coordinate_systems || {}).some((c) => c && c.type === 'scene_cs');
-    if (scene) return null;
-    q.set('camera', 'true');
+    q.set('cs_types', Object.values(ol.coordinate_systems || {}).map((c) => (c && c.type) || '').join(','));
     const up = ol.metadata?.gravity?.up_cam;
     if (Array.isArray(up) && up.length === 3 && up.every(Number.isFinite)) q.set('up', up.join(','));
   } else if (state.ply) {

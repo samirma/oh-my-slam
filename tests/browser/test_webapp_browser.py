@@ -908,25 +908,26 @@ def test_every_page_is_accessible_and_fits_a_tablet(image_job: dict[str, Any], b
 
 
 def test_pages_respond_within_100_ms_and_keep_their_url(tab: Tab, app: tuple[Any, str]) -> None:
-    """Navigation renders at once (no request in the way: the median of 5 navigations per page is
-    under 100 ms); the new page's heading gets the focus and is announced; each page's URL brings it
-    back."""
+    """Navigation renders at once (no request in the way): the page's own timing of a route, from
+    the hash change to the rendered page, has a median under 100 ms over 5 navigations per page —
+    measured in the page, so a loaded machine's delays around the test's calls do not count. The
+    new page's heading gets the focus and is announced; each page's URL brings it back."""
     pg = tab.go("#/image")
     for page, heading in (("maps", "Maps"), ("jobs", "Jobs"), ("scene", "3D scene viewer"), ("image", "Image")):
         times = []
         for _ in range(5):
             pg.evaluate("() => { location.hash = '#/nowhere'; }")
-            pg.wait_for_function("() => document.querySelector('main h1')?.textContent === 'Not found'")
-            times.append(pg.evaluate("""([page, heading]) => new Promise((resolve) => {
-              const t0 = performance.now();
-              document.querySelector(`#nav a[data-page=${page}]`).click();
-              const check = () => (document.querySelector('main h1')?.textContent === heading
-                ? resolve(performance.now() - t0) : requestAnimationFrame(check));
-              check();
-            })""", [page, heading]))
+            pg.wait_for_function("() => window.__app.lastRoute?.where === 'nowhere'")
+            pg.click(f"#nav a[data-page={page}]")
+            pg.wait_for_function("(p) => window.__app.lastRoute?.where === p", arg=page)
+            assert pg.inner_text("main h1") == heading
+            times.append(pg.evaluate("() => window.__app.lastRoute.end - window.__app.lastRoute.start"))
         assert sorted(times)[2] < 100, (page, times)
         assert pg.get_attribute(f"#nav a[data-page={page}]", "aria-current") == "page"
         assert pg.evaluate("() => document.activeElement.tagName") == "H1"
+        assert pg.evaluate("""() => getComputedStyle(document.querySelector('main h1')).scrollMarginTop
+            !== '0px' && document.querySelector('main h1').getBoundingClientRect().top
+            >= document.getElementById('topbar').getBoundingClientRect().bottom""")  # not under the bar
         assert pg.inner_text("#announce") == f"{heading} page"
         url = pg.url
         pg.reload()
