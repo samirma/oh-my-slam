@@ -34,7 +34,7 @@ from oh_my_slam.viewer.routes import parse_cloud_payload
 MAX_LISTED = 5
 # Contract → the subjects (entry points, or the pair of outputs compared) it is reported for.
 CONTRACTS: dict[str, tuple[str, ...]] = {
-    "stdout": ("server", "reconstruct", "mapper", "segment", "view"),
+    "stdout": ("server", "reconstruct", "mapper", "segment", "view", "server_sh"),
     "openlabel": ("reconstruct", "mapper", "segment", "view"),
     "colour": ("reconstruct", "mapper", "segment", "view"),
     "artifacts": ("segment",),
@@ -46,9 +46,10 @@ _DIMMED_MAX = int(255 * DIM)
 
 
 def subject_of(entry: str) -> str:
-    """``reconstruct.sh`` → ``reconstruct``; ``start_inference_server.sh`` → ``server``."""
+    """``reconstruct.sh`` → ``reconstruct``; ``start_inference_server.sh`` → ``server``;
+    ``server.sh`` (the web service) → ``server_sh``."""
     name = Path(entry).name.removesuffix(".sh")
-    return "server" if name == "start_inference_server" else name
+    return {"start_inference_server": "server", "server": "server_sh"}.get(name, name)
 
 
 def _rgb(c: Any) -> str:
@@ -262,6 +263,24 @@ def artifact_problems(folder: Path, stdout: bytes | None) -> list[str]:
     if stdout is not None and (Path(folder) / "segmentation.json").read_bytes() != stdout:
         out.append("segmentation.json differs from the JSON on stdout")
     return out
+
+
+def tree_digest(root: Path) -> str:
+    """Every entry under ``root`` — hidden ones (``.staging/``, ``.lock``) included: its path,
+    type, size, modification time and contents. Equal digests: nothing in the folder changed."""
+    import hashlib
+
+    h = hashlib.sha256()
+    root = Path(root)
+    for p in sorted(root.rglob("*")):
+        st = p.lstat()
+        kind = "l" if p.is_symlink() else "d" if p.is_dir() else "f"
+        h.update(f"{p.relative_to(root)}\0{kind}\0{st.st_size}\0{st.st_mtime_ns}\0".encode())
+        if kind == "f":
+            with p.open("rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return h.hexdigest()
 
 
 # ------------------------------------------------------------------------------------------------

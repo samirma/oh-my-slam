@@ -37,6 +37,7 @@ class RunSpec:
     output_kind: str | None = None  # its expected payload: "json" | "ply"
     ok_exit: tuple[int, ...] = (0,)
     timeout_s: float = 3600.0
+    env: tuple[tuple[str, str], ...] = ()  # set for this run only (e.g. the inference proxy)
 
 
 @dataclass
@@ -107,7 +108,7 @@ class Live:
         self.error: str | None = None
         self.proc: subprocess.Popen[bytes] | None = None
         self.sampler: PeakSampler | None = None
-        env = {**runner.env, TIMINGS_ENV: str(self.timings_path)}
+        env = {**runner.env, **dict(spec.env), TIMINGS_ENV: str(self.timings_path)}
         self.t0 = time.perf_counter()
         with self.stdout_path.open("wb") as out, self.stderr_path.open("wb") as err:
             try:

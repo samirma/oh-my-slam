@@ -1,7 +1,7 @@
 {
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (specs/high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
   "rationale": {
-    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description.",
+    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T102325Z (commit 2432547, Apple M4 Max 36 GB, after the merge of the web application); their 'measured' is that run.",
     "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), segment.sh -m 60 -> 2.5 s (1.2 s), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), segment.sh -m 2.5 -> 2.0 s (1.27 s), view.sh -m 4 -> 3 s (1.99 s).",
     "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; segment.sh -m 1.2 GB -> 2 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), segment.sh -m 2 GB -> 1100 MB (710 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
     "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and segment.sh -m / view.sh -m, which do not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
@@ -10,9 +10,13 @@
     "map.*.frame_agreement_pairs_*": "Spec intent: the map is one consistent cloud wherever keyframes overlap, not only at the two same-heading pairs of §5. Every pair of keyframes whose optical axes are less than 45 deg apart and that share at least 500 pixels is compared, whatever their distance in capture order: sequence neighbours (where keyframe-by-keyframe depth disagrees locally: a scale-only adjustment left keyframes 2 apart at 21 %) and loop closures (where a depth scale that drifted along the sequence shows) alike; the detail reports both subsets (<= 10 and > 10 keyframes apart). Each pair's median disagreement |z_i->j / z_j - 1| measures how differently its two keyframes place the surfaces both see. Targets: the median pair within monocular depth noise, <= 3 % (as for the same-heading pairs); 90 % of the pairs within 5 % (0.1-0.15 m at 2-3 m); at most 1 % of the pairs grossly inconsistent, above 10 % (0.3 m at 3 m: the depth disagreement the object merges tolerate; 1 % leaves room for a few pairs at the edge of the angular range, which overlap only in their image borders where monocular depth is least reliable); and no pair above 15 % (1.5x the gross threshold: a pair disagreeing by 15-20 % draws its shared surfaces twice, 7-10 cm apart at 0.5 m). Measured on maps built 2026-09-25 (one-update / split): keyframe-by-keyframe alignment only (commit 521f1e1): median 1.75 / 1.78 %, p90 7.60 / 7.59 %, above 10 % 6.3 / 6.0 %, worst 20.6 / 21.1 %; one scale per keyframe adjusted over the pairs (commit 385e963): 1.93 / 1.93 %, 5.54 / 5.73 %, 2.7 / 2.7 %, 21.6 / 20.9 % (neighbours alone: worst 20.9 %, 3.5 % above 10 %); a scale and a near/far tilt per keyframe (commit 447f39c, run 20260925T070615Z): 1.78 / 1.81 %, 3.36 / 3.25 %, 0 / 0.13 %, 9.1 / 11.0 % (neighbours alone: worst 9.1 / 11.0 %, 0 / 0.2 % above 10 %; the worst pairs are 42-45 deg apart and overlap only in their image borders).",
     "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing.",
     "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. The seg.map_consistency metrics (formerly seg.map.recall / precision) compare the map's objects with per-frame detections of the same detector: they measure consistency, not accuracy. A map object pairs with a per-frame detection under its label or any of its detected_as labels (the labels its detections carried when the detector's label flickered between keyframes and the map merged them). A map object is built from detections in the frames it observes, so map_objects_detected must be ~1 (>= 0.95; measured 0.997); detections_in_map >= 0.8 (measured 0.88) allows the map to drop small or unstable detections. Accuracy is gt.*.",
-    "contract.*": "Every contract is a count of violations: 0.",
+    "contract.*": "Every contract is a count of violations: 0 (including contract.stdout.server_sh).",
     "gt.*": "Accuracy against annotations in examples/ground_truth/ (none yet, so never measured). Set from typical monocular performance: object recall >= 0.7, precision >= 0.6, OBB IoU >= 0.3 (monocular boxes of partially visible objects), yaw error median <= 3 deg / max <= 8 deg after the best common offset, pitch error median <= 3 deg. Review them when the first annotations land.",
-    "map_update.*": "Spec §2.3/§5: mapping examples/office_sequence/ (a cup on the window sill is visible in the first four images and gone in the rest) gives a map that reflects the latest observation, while what never changed keeps its ids, labels and OBBs. absent_fraction >= 1 (the whole sequence in one update), incremental.absent_fraction >= 1 (an update with the first four images, then one with the other nine: the case the spec's 'later update wins' describes) and before_present_fraction >= 1 are exact properties of a working mapper (with the cup annotated in examples/ground_truth/office_sequence.json): neither map has an object that is, or stands where, the cup was, and the extended map after its first update does have it (otherwise the absence proves nothing). The stability targets are those of map.stability (one update vs split), the same intent, for the objects the early images observe compared between the first and the second update of the extended map, which share one map frame; ids follow the order of first observation, which a later update does not change."
+    "map_update.*": "Spec §2.3/§5 and mapper.md: mapping examples/office_sequence/ (a cup on the window sill is visible in the first four images and gone in the rest) in one update or split across several (the annotation's splits 4+4+5 and 6+7) gives a map without the cup and with no hole where it stood, while every unchanged object keeps its id, label and OBB. absent_fraction >= 1 and before_present_fraction >= 1 are exact properties of a working mapper. hole_fraction <= 0.2: up to a fifth of the place's cells may look through (thin monocular depth at the region's edges, cells half off the sill); measured 0 on every map. <split>.stability.{label_agreement,id_agreement} (first vs last update of a split, aligned by their common captures' poses: a rebuild may re-gauge the frame and OBBs are refined, so the box figures are detail only) and <split>.vs_one_update.* are the map.stability targets (the same spec intent: ids, labels and OBBs stay the same; one-update vs split ids may differ only where an earlier update published one). <split>.ids_persistent_fraction >= 0.95: identity persistence is exact in the spec, 0.05 absorbs a box refined beyond the same-object test (0.25 m or IoU 0.05). The split targets are patterns (map_update.split_*.…) because a split's name is data.",
+    "perf.<group>.stage.<stage>.*": "Spec §5 'per-stage … wall time and peak memory, per image and per mapping update'. Seconds (.s): explicit targets max(1.75 x measured, measured + 0.5 s) rounded up to two digits, regression tolerance 35 % / 0.25 s (stage times are noisier than totals: GPU queueing between the frames' requests). A stage a command adds later falls back to its group's pattern perf.<group>.stage.*.s = the group's end-to-end target, since a stage never outlasts its run. Memory (.client_peak_mb, .server_peak_gb): the group's end-to-end memory targets as patterns, for the same reason. The explicit stage times were first derived from run 20261005T102325Z, which ran while other agents loaded the machine; they are to be re-derived with the same rule from the final solo run.",
+    "perf.locate, perf.mapper_office*, perf.mapper_street2, perf.mapper_split.per_update_wall_s": "Wall time ~1.6 x measured (locate 3 images on the 79-keyframe map 2.6 s -> 4.2 s; the office map in one update 48.7 s; the slowest update of the office splits 28.2 s; street2 402 s at -fps 2; the split ainex map's slowest update), client memory max(1.5 x, +200 MB) (the office maps peak at 9.2 / 13.2 GB in COLMAP's features and SfM stages: far above the 6 GB first guessed), server footprint max(+3 GB, 1.2 x).",
+    "pose.locate.*, pose.street2.*": "Spec §5 pose accuracy for mapper.sh locate: the held-out captures (the split map's second update, located against the map after its first) use the targets of the map's own captures (registered/located >= 0.9 with 0.05 regression tolerance, yaw error median <= 7 deg, max <= 15 deg); measured 0.58 located, a finding, not a reason to lower it. street2: the share of sampled video frames registered, >= min(0.9, measured - 0.05).",
+    "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 while a job runs), job overhead over the shell max(2 x, +1 s); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (byte-identical results and files), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 23 tests of tests/browser/test_webapp*.py run (24 measured), and no axe-core violation (WCAG 2.0/2.1 A, AA)."
   },
   "defaults": {
     "tolerance_rel": 0.1,
@@ -674,13 +678,6 @@
       "tolerance_abs": 0.0,
       "description": "office_sequence: share of the annotated absent objects (the cup) that the map of the whole sequence in one update no longer has"
     },
-    "map_update.incremental.absent_fraction": {
-      "op": ">=",
-      "value": 1.0,
-      "unit": "",
-      "tolerance_abs": 0.0,
-      "description": "office_sequence: share of the annotated absent objects (the cup) that the map of the extended map (an update with the early images, then one with the rest) no longer has"
-    },
     "map_update.before_present_fraction": {
       "op": ">=",
       "value": 1.0,
@@ -688,47 +685,1340 @@
       "tolerance_abs": 0.0,
       "description": "office_sequence: share of the annotated absent objects that the extended map has after its first update, the early images (control: makes the absence meaningful)"
     },
-    "map_update.stability.matched_fraction": {
+    "perf.mapper_split.per_update_wall_s": {
+      "op": "<=",
+      "value": 130,
+      "measured": 81.239,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.locate.wall_s": {
+      "op": "<=",
+      "value": 4.2,
+      "measured": 2.5922,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.locate.client_peak_mb": {
+      "op": "<=",
+      "value": 690,
+      "measured": 458.9486,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.locate.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "measured": 10.9315,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office.wall_s": {
+      "op": "<=",
+      "value": 78,
+      "measured": 48.6839,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_office.client_peak_mb": {
+      "op": "<=",
+      "value": 14000,
+      "measured": 9209.1843,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office.server_peak_gb": {
+      "op": "<=",
+      "value": 15,
+      "measured": 11.1721,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office_split.wall_s": {
+      "op": "<=",
+      "value": 46,
+      "measured": 28.2405,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_office_split.client_peak_mb": {
+      "op": "<=",
+      "value": 20000,
+      "measured": 13173.5716,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office_split.server_peak_gb": {
+      "op": "<=",
+      "value": 19,
+      "measured": 15.4031,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_street2.wall_s": {
+      "op": "<=",
+      "value": 650,
+      "measured": 402.179,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_street2.client_peak_mb": {
+      "op": "<=",
+      "value": 15000,
+      "measured": 9606.3,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_street2.server_peak_gb": {
+      "op": "<=",
+      "value": 15,
+      "measured": 11.8519,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "pose.locate.located_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "tolerance_abs": 0.05
+    },
+    "pose.locate.yaw_err_median_deg": {
+      "op": "<=",
+      "value": 7,
+      "unit": "deg",
+      "tolerance_abs": 1.0
+    },
+    "pose.locate.yaw_err_max_deg": {
+      "op": "<=",
+      "value": 15,
+      "unit": "deg",
+      "tolerance_abs": 2.0
+    },
+    "pose.street2.registered_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "measured": 1.0,
+      "tolerance_abs": 0.03
+    },
+    "map_update.hole_fraction": {
+      "op": "<=",
+      "value": 0.2,
+      "tolerance_abs": 0.05
+    },
+    "contract.stdout.server_sh": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.start_s": {
+      "op": "<=",
+      "value": 2.4,
+      "measured": 0.3866,
+      "unit": "s",
+      "tolerance_rel": 0.3
+    },
+    "server_sh.resident_mb": {
+      "op": "<=",
+      "value": 180,
+      "measured": 76.4477,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "server_sh.app_render_s": {
+      "op": "<=",
+      "value": 1.2,
+      "measured": 0.1192,
+      "unit": "s",
+      "tolerance_rel": 0.3
+    },
+    "server_sh.read_latency_median_ms": {
+      "op": "<=",
+      "value": 20,
+      "measured": 0.7862,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.read_latency_p95_ms": {
+      "op": "<=",
+      "value": 50,
+      "measured": 3.9961,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.read_latency_busy_p95_ms": {
+      "op": "<=",
+      "value": 100,
+      "measured": 1.3874,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.job_overhead_median_s": {
+      "op": "<=",
+      "value": 1.1,
+      "measured": 0.089,
+      "unit": "s",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.parity.mismatched": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.parity.unverifiable": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.parity.operations_covered_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "tolerance_abs": 0.0
+    },
+    "server_sh.ui.tests_failed": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.ui.tests_run": {
+      "op": ">=",
+      "value": 23,
+      "tolerance_abs": 0.0
+    },
+    "server_sh.ui.a11y_violations": {
+      "op": "<=",
+      "value": 0
+    },
+    "map_update.split_*.absent_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "tolerance_abs": 0.0
+    },
+    "map_update.split_*.hole_fraction": {
+      "op": "<=",
+      "value": 0.2,
+      "tolerance_abs": 0.05
+    },
+    "map_update.split_*.ids_persistent_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "tolerance_abs": 0.03
+    },
+    "map_update.split_*.vs_one_update.matched_fraction": {
       "op": ">=",
       "value": 0.9,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "objects of the early images paired between the first and the second update of the extended map / the larger object count"
+      "description": "objects paired between the one-update and the split map / the larger object count"
     },
-    "map_update.stability.label_agreement": {
+    "map_update.split_*.stability.label_agreement": {
       "op": ">=",
       "value": 0.95,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "paired objects (by geometry alone) whose labels are the same or compatible, first update vs second update of the extended map"
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
     },
-    "map_update.stability.id_agreement": {
+    "map_update.split_*.vs_one_update.label_agreement": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
+    },
+    "map_update.split_*.stability.id_agreement": {
       "op": ">=",
       "value": 0.8,
       "unit": "",
       "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in the first and the second update of the extended map"
+      "description": "paired objects with the same id in both maps"
     },
-    "map_update.stability.centre_delta_median_m": {
+    "map_update.split_*.vs_one_update.id_agreement": {
+      "op": ">=",
+      "value": 0.8,
+      "unit": "",
+      "tolerance_abs": 0.1,
+      "description": "paired objects with the same id in both maps"
+    },
+    "map_update.split_*.vs_one_update.centre_delta_median_m": {
       "op": "<=",
       "value": 0.1,
       "unit": "m",
       "tolerance_abs": 0.03,
-      "description": "median OBB centre distance of paired objects, first update vs second update of the extended map"
+      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
     },
-    "map_update.stability.extent_delta_median_rel": {
+    "map_update.split_*.vs_one_update.extent_delta_median_rel": {
       "op": "<=",
       "value": 0.2,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "median relative OBB size difference of paired objects, first update vs second update of the extended map"
+      "description": "median relative OBB size difference of paired objects"
     },
-    "map_update.stability.obb_iou_median": {
+    "map_update.split_*.vs_one_update.obb_iou_median": {
       "op": ">=",
       "value": 0.5,
       "unit": "",
       "tolerance_abs": 0.08,
-      "description": "median 3D IoU of paired OBBs, first update vs second update of the extended map"
+      "description": "median 3D IoU of paired OBBs"
+    },
+    "perf.reconstruct_json.stage.*.s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.reconstruct_json.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.reconstruct_json.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.reconstruct_ply.stage.*.s": {
+      "op": "<=",
+      "value": 1.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.reconstruct_ply.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 450,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.reconstruct_ply.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_image.stage.*.s": {
+      "op": "<=",
+      "value": 3.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_image.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_image.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_frames.stage.*.s": {
+      "op": "<=",
+      "value": 1.6,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_frames.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 250,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_frames.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.view_image.stage.*.s": {
+      "op": "<=",
+      "value": 5.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.view_image.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.view_image.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_single.stage.*.s": {
+      "op": "<=",
+      "value": 270,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_single.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_single.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_split.stage.*.s": {
+      "op": "<=",
+      "value": 130,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_split.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_split.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_map.stage.*.s": {
+      "op": "<=",
+      "value": 2.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_map.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 1100,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_map.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.view_map.stage.*.s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.view_map.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.view_map.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.locate.stage.*.s": {
+      "op": "<=",
+      "value": 4.2,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.locate.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 690,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.locate.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office.stage.*.s": {
+      "op": "<=",
+      "value": 78,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_office.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 14000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 15,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office_split.stage.*.s": {
+      "op": "<=",
+      "value": 46,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_office_split.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 20000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office_split.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 19,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_street2.stage.*.s": {
+      "op": "<=",
+      "value": 650,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_street2.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 15000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_street2.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 15,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.*.stage.*.s": {
+      "op": "<=",
+      "value": 60,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.*.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.*.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.reconstruct_json.stage.connect.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.034,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_json.stage.inference.s": {
+      "op": "<=",
+      "value": 2.3,
+      "measured": 1.307,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_json.stage.segment.s": {
+      "op": "<=",
+      "value": 0.84,
+      "measured": 0.333,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_json.stage.export.s": {
+      "op": "<=",
+      "value": 0.55,
+      "measured": 0.046,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_json.stage.write.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_ply.stage.connect.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.036,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_ply.stage.inference.s": {
+      "op": "<=",
+      "value": 1.1,
+      "measured": 0.584,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_ply.stage.export.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.029,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.reconstruct_ply.stage.write.s": {
+      "op": "<=",
+      "value": 0.51,
+      "measured": 0.001,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.connect.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.034,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.inference.s": {
+      "op": "<=",
+      "value": 2.3,
+      "measured": 1.307,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.segment.s": {
+      "op": "<=",
+      "value": 0.81,
+      "measured": 0.307,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.export.s": {
+      "op": "<=",
+      "value": 0.58,
+      "measured": 0.07,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.artifacts.s": {
+      "op": "<=",
+      "value": 0.71,
+      "measured": 0.21,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_image.stage.write.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_frames.stage.connect.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.034,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_frames.stage.inference.s": {
+      "op": "<=",
+      "value": 1.2,
+      "measured": 0.621,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_frames.stage.segment.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.038,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_frames.stage.export.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_frames.stage.write.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.setup.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.ingest.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.026,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.inference.s": {
+      "op": "<=",
+      "value": 63,
+      "measured": 35.827,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.sfm.s": {
+      "op": "<=",
+      "value": 200,
+      "measured": 109.485,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.features_matching.s": {
+      "op": "<=",
+      "value": 13,
+      "measured": 7.09,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.pose_refinement.s": {
+      "op": "<=",
+      "value": 25,
+      "measured": 13.972,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.focal_rerun.s": {
+      "op": "<=",
+      "value": 1.3,
+      "measured": 0.705,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.map_frame.s": {
+      "op": "<=",
+      "value": 0.71,
+      "measured": 0.205,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.depth_alignment.s": {
+      "op": "<=",
+      "value": 3.5,
+      "measured": 1.997,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.persist_frames.s": {
+      "op": "<=",
+      "value": 0.65,
+      "measured": 0.147,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.validity.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.objects.s": {
+      "op": "<=",
+      "value": 33,
+      "measured": 18.402,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.cloud.s": {
+      "op": "<=",
+      "value": 16,
+      "measured": 9.079,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.export.s": {
+      "op": "<=",
+      "value": 0.58,
+      "measured": 0.075,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_single.stage.commit.s": {
+      "op": "<=",
+      "value": 0.57,
+      "measured": 0.06,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.setup.s": {
+      "op": "<=",
+      "value": 0.51,
+      "measured": 0.001,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.ingest.s": {
+      "op": "<=",
+      "value": 0.52,
+      "measured": 0.015,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.inference.s": {
+      "op": "<=",
+      "value": 23,
+      "measured": 12.731,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.sfm.s": {
+      "op": "<=",
+      "value": 80,
+      "measured": 45.56,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.features_matching.s": {
+      "op": "<=",
+      "value": 8.6,
+      "measured": 4.882,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.pose_refinement.s": {
+      "op": "<=",
+      "value": 13,
+      "measured": 7.183,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.focal_rerun.s": {
+      "op": "<=",
+      "value": 0.83,
+      "measured": 0.321,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.map_frame.s": {
+      "op": "<=",
+      "value": 0.64,
+      "measured": 0.14,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.depth_alignment.s": {
+      "op": "<=",
+      "value": 3.3,
+      "measured": 1.843,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.persist_frames.s": {
+      "op": "<=",
+      "value": 0.59,
+      "measured": 0.089,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.validity.s": {
+      "op": "<=",
+      "value": 2.4,
+      "measured": 1.368,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.objects.s": {
+      "op": "<=",
+      "value": 18,
+      "measured": 9.979,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.cloud.s": {
+      "op": "<=",
+      "value": 16,
+      "measured": 9.142,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.export.s": {
+      "op": "<=",
+      "value": 0.6,
+      "measured": 0.093,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_split.stage.commit.s": {
+      "op": "<=",
+      "value": 0.55,
+      "measured": 0.044,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_map.stage.export.s": {
+      "op": "<=",
+      "value": 0.7,
+      "measured": 0.199,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_map.stage.artifacts.s": {
+      "op": "<=",
+      "value": 0.9,
+      "measured": 0.392,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.segment_map.stage.write.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.locate.stage.setup.s": {
+      "op": "<=",
+      "value": 0.51,
+      "measured": 0.01,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.locate.stage.features_matching.s": {
+      "op": "<=",
+      "value": 2.7,
+      "measured": 1.518,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.locate.stage.pose.s": {
+      "op": "<=",
+      "value": 0.65,
+      "measured": 0.148,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.locate.stage.export.s": {
+      "op": "<=",
+      "value": 0.9,
+      "measured": 0.392,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.setup.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.ingest.s": {
+      "op": "<=",
+      "value": 0.57,
+      "measured": 0.064,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.inference.s": {
+      "op": "<=",
+      "value": 31,
+      "measured": 17.337,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.sfm.s": {
+      "op": "<=",
+      "value": 2.3,
+      "measured": 1.275,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.features_matching.s": {
+      "op": "<=",
+      "value": 42,
+      "measured": 23.61,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.focal_rerun.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.map_frame.s": {
+      "op": "<=",
+      "value": 0.6,
+      "measured": 0.098,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.depth_alignment.s": {
+      "op": "<=",
+      "value": 0.89,
+      "measured": 0.389,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.persist_frames.s": {
+      "op": "<=",
+      "value": 0.54,
+      "measured": 0.033,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.validity.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.objects.s": {
+      "op": "<=",
+      "value": 5.7,
+      "measured": 3.221,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.cloud.s": {
+      "op": "<=",
+      "value": 2.9,
+      "measured": 1.613,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.export.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.021,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office.stage.commit.s": {
+      "op": "<=",
+      "value": 0.52,
+      "measured": 0.013,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.setup.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.ingest.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.027,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.inference.s": {
+      "op": "<=",
+      "value": 27,
+      "measured": 14.943,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.sfm.s": {
+      "op": "<=",
+      "value": 18,
+      "measured": 9.875,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.features_matching.s": {
+      "op": "<=",
+      "value": 18,
+      "measured": 9.734,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.pose_refinement.s": {
+      "op": "<=",
+      "value": 0.62,
+      "measured": 0.119,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.focal_rerun.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.map_frame.s": {
+      "op": "<=",
+      "value": 0.59,
+      "measured": 0.087,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.depth_alignment.s": {
+      "op": "<=",
+      "value": 0.83,
+      "measured": 0.329,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.persist_frames.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.03,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.validity.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.objects.s": {
+      "op": "<=",
+      "value": 5.5,
+      "measured": 3.128,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.cloud.s": {
+      "op": "<=",
+      "value": 2.7,
+      "measured": 1.527,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.export.s": {
+      "op": "<=",
+      "value": 0.53,
+      "measured": 0.021,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_office_split.stage.commit.s": {
+      "op": "<=",
+      "value": 0.52,
+      "measured": 0.017,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.setup.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.ingest.s": {
+      "op": "<=",
+      "value": 29,
+      "measured": 16.397,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.inference.s": {
+      "op": "<=",
+      "value": 310,
+      "measured": 171.542,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.sfm.s": {
+      "op": "<=",
+      "value": 110,
+      "measured": 57.818,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.features_matching.s": {
+      "op": "<=",
+      "value": 83,
+      "measured": 47.198,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.focal_rerun.s": {
+      "op": "<=",
+      "value": 5.4,
+      "measured": 3.06,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.map_frame.s": {
+      "op": "<=",
+      "value": 3.6,
+      "measured": 2.011,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.depth_alignment.s": {
+      "op": "<=",
+      "value": 21,
+      "measured": 11.762,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.persist_frames.s": {
+      "op": "<=",
+      "value": 0.98,
+      "measured": 0.479,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.validity.s": {
+      "op": "<=",
+      "value": 0.5,
+      "measured": 0.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.objects.s": {
+      "op": "<=",
+      "value": 54,
+      "measured": 30.799,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.cloud.s": {
+      "op": "<=",
+      "value": 110,
+      "measured": 59.171,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.export.s": {
+      "op": "<=",
+      "value": 0.85,
+      "measured": 0.342,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
+    },
+    "perf.mapper_street2.stage.commit.s": {
+      "op": "<=",
+      "value": 0.74,
+      "measured": 0.236,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.25
     }
   }
 }
