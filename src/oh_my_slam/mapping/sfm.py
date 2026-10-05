@@ -248,7 +248,10 @@ def weak_link_pairs(order: list[str], listed: set[frozenset[str]],
 
 FIXED_ROT_TOL_DEG = 2.0
 FIXED_POS_TOL = 0.05  # of the fixed frames' spread
-EXTEND_SEED = 0  # random seed of incremental extensions (COLMAP's default -1 is time-seeded)
+EXTEND_SEED = 0  # random seed of incremental extensions and the global mapper (COLMAP: -1, by time)
+# threads of the SfM pipelines (-1: all cores; seeded, they still differ between runs only by
+# the order threads finish in, which tests pin with 1)
+SFM_THREADS = -1
 
 
 def vet(model: SfmModel, rotation_pairs: set[frozenset[str]]) -> dict[str, list[str]]:
@@ -411,6 +414,7 @@ class Sfm:
             str(self.image_dir), "--image_list_path", str(lst),
             "--ImageReader.camera_model", "SIMPLE_PINHOLE",
             "--FeatureExtraction.use_gpu", "0", "--log_level", "1",
+            "--FeatureExtraction.num_threads", str(SFM_THREADS),
             "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
@@ -490,7 +494,9 @@ class Sfm:
         n = write_pair_list(lst, pairs, names)
         args = ["matches_importer", "--database_path", str(self.db), "--match_list_path",
                 str(lst), "--match_type", "pairs", "--FeatureMatching.use_gpu", "0",
-                "--log_level", "1", "--FeatureMatching.type", "SIFT_BRUTEFORCE"]
+                "--log_level", "1", "--FeatureMatching.type", "SIFT_BRUTEFORCE",
+                "--TwoViewGeometry.random_seed", str(EXTEND_SEED),
+                "--FeatureMatching.num_threads", str(SFM_THREADS)]
         _run(args, self.log_path)
         return n
 
@@ -532,7 +538,9 @@ class Sfm:
         write_pair_list(lst, set(todo), names)
         args = ["matches_importer", "--database_path", str(self.db), "--match_list_path",
                 str(lst), "--match_type", "pairs", "--FeatureMatching.use_gpu", "0",
-                "--log_level", "1", "--FeatureMatching.type", "SIFT_LIGHTGLUE"]
+                "--log_level", "1", "--FeatureMatching.type", "SIFT_LIGHTGLUE",
+                "--TwoViewGeometry.random_seed", str(EXTEND_SEED),
+                "--FeatureMatching.num_threads", str(SFM_THREADS)]
         try:
             _run(args, self.log_path)
             failed = False
@@ -681,7 +689,13 @@ class Sfm:
         import pycolmap
 
         opts = pycolmap.GlobalPipelineOptions()
-        opts.num_threads = -1
+        opts.num_threads = SFM_THREADS
+        # seeded like the incremental extensions: the global positioner starts from random
+        # positions, and COLMAP's default seed (-1) is time-seeded
+        mapper = opts.mapper
+        for o in (opts, mapper, mapper.rotation_averaging, mapper.global_positioning):
+            o.random_seed = EXTEND_SEED
+        mapper.num_threads = SFM_THREADS
         recs = pycolmap.global_mapping(str(self.db), str(self.image_dir), str(out), opts)
         rec = self._largest(recs)
         return None if rec is None else self._with_others(SfmModel(rec, "sfm-global"), recs)
@@ -705,7 +719,7 @@ class Sfm:
         opts.extract_colors = False
         opts.fix_existing_frames = fix_existing
         opts.structure_less_registration_fallback = True
-        opts.num_threads = -1
+        opts.num_threads = SFM_THREADS
         if input_path:
             # only the input's continuation: with several models COLMAP goes on to start fresh
             # ones from the images left, the input's own images included, in an unrelated frame —

@@ -617,7 +617,8 @@ def test_cell_culling_selects_every_point_a_keyframe_can_see() -> None:
         a, b = g._visible(f, pts), g._visible(f, pts, cells)
         assert len(a[0]) > 0 or f is not fd
         assert set(a[0].tolist()) == set(b[0].tolist())
-        assert np.array_equal(g._seen_through(f, pts), g._seen_through(f, pts, cells))
+        assert np.array_equal(g._residuals(f, pts)[0], g._residuals(f, pts, cells)[0],
+                              equal_nan=True)
     mask = np.zeros((h, w), bool)
     mask[0:60, 280:320] = True  # at the image corner
     place = Vacated(1, 7, {fd.rec.name: rle.encode(mask)}, [frames[1].rec.name], None, 3.0)
