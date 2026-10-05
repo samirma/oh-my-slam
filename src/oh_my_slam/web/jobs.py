@@ -47,6 +47,7 @@ from typing import Any
 
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.errors import error_code, http_status, job_state
+from oh_my_slam.core.process import default_sigint
 from oh_my_slam.core.timing import ENV_PATH, ENV_PROGRESS
 from oh_my_slam.web.operations import (
     ENV_RECORD,
@@ -79,12 +80,6 @@ def leader_matches(pgid: int, ctime: float | None, jid: str) -> bool:
         return abs(proc.create_time() - ctime) < 1e-3 and proc.environ().get(ENV_JOB) == jid
     except Exception:  # gone, another user's, unreadable
         return False
-
-
-def _default_sigint() -> None:
-    """In the child before exec: Ctrl-C (a cancel) works even when this service was started with
-    SIGINT ignored (a shell ``&`` job), since an ignored signal stays ignored across exec."""
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def _ctime(pid: int) -> float | None:
@@ -176,6 +171,8 @@ class Runner:
         self.cancel_grace_s = cancel_grace_s
         self.max_parallel = max_parallel or default_parallel()
         self.reevaluate = reevaluate  # a conditional job's inference need, when it may start
+        if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+            default_sigint()  # an ignored SIGINT would stay ignored in the jobs: no Ctrl-C cancel
         self.jobs: dict[str, Job] = {}
         self.version = 0
         self.stopping = False
@@ -273,7 +270,7 @@ class Runner:
             self._schedule()
             return job
 
-    def _schedule(self) -> None:
+    def _schedule(self, own: str | None = None) -> None:
         """Start every queued job that may start: inference jobs one at a time in submission
         order (none overtakes an earlier one), the others at once up to ``max_parallel``; never
         two writers of a map."""
@@ -290,11 +287,11 @@ class Runner:
                 if job.conditional and self.reevaluate is not None \
                         and job.id not in self._checked:
                     # what it reads may have changed: re-read it off the lock, then come back;
-                    # meanwhile it holds its place in the inference order
+                    # meanwhile nothing later overtakes it in the inference order
                     if job.id not in self._checking:
                         self._checking.add(job.id)
                         threading.Thread(target=self._recheck, args=(job,), daemon=True).start()
-                    inference_busy = inference_busy or job.inference
+                    inference_busy = True
                     continue
                 if job.writes and job.writes in writing:
                     inference_busy = inference_busy or job.inference  # keeps the order
@@ -311,6 +308,11 @@ class Runner:
                     writing.add(job.writes)
                 self._checked.discard(job.id)
                 self._start(job)
+            # a conditional job that could not start re-reads its need before the next try (its
+            # own check's pass aside, so that one check serves one try)
+            for jid in list(self._checked):
+                if jid != own:
+                    self._checked.discard(jid)
 
     def _recheck(self, job: Job) -> None:
         """A conditional job's inference need, read without the lock (it reads e.g. a map)."""
@@ -320,11 +322,13 @@ class Runner:
         except Exception:
             need = True
         with self._lock:
-            job.inference = need
             self._checking.discard(job.id)
+            if job.state != "queued":  # cancelled meanwhile
+                return
+            job.inference = need
             self._checked.add(job.id)
             self._touch(job)
-            self._schedule()
+            self._schedule(own=job.id)
 
     def _start(self, job: Job) -> None:
         job.state, job.started_at = "running", time.time()
@@ -360,8 +364,9 @@ class Runner:
             else self._step(job, step)
         if code != 0:
             with self._lock:
-                job.viewer_error = {
-                    "code": error_code(code) if code >= 0 else "interrupted",
+                job.viewer_error = {  # "cancelled": the job was cancelled during this step
+                    "code": "cancelled" if job.cancel_requested
+                    else error_code(code) if code >= 0 else "interrupted",
                     "exit_code": code, "http_status": http_status(code),
                     "message": "cancelled" if job.cancel_requested
                     else message or self._message(job, code)}
@@ -385,7 +390,7 @@ class Runner:
                 proc = subprocess.Popen([self.python, "-m", step["module"], *step["argv"]],
                                         stdin=subprocess.DEVNULL, stdout=out,
                                         stderr=subprocess.PIPE, cwd=self.ws.root, env=env,
-                                        start_new_session=True, preexec_fn=_default_sigint)
+                                        start_new_session=True)
         except OSError as exc:
             return 1, f"could not start the command: {exc}"
         with self._lock:
@@ -523,6 +528,8 @@ class Runner:
             if job.state == "queued":
                 job.state, job.ended_at = "cancelled", time.time()
                 job.error = {"code": "interrupted", "message": "cancelled before it started"}
+                self._checking.discard(jid)
+                self._checked.discard(jid)
                 self._end(job)
             elif job.state == "running":
                 job.cancel_requested = True

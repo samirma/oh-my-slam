@@ -303,3 +303,20 @@ def test_steps_do_not_inherit_a_recording(ws: Workspace, monkeypatch: pytest.Mon
     env = psutil.Process(runner.get(job.id).pgid).environ()
     assert "OH_MY_SLAM_INFERENCE_REPLAY" not in env and "OH_MY_SLAM_INFERENCE_RECORD" not in env
     runner.shutdown()
+
+
+def test_a_conditional_job_being_checked_keeps_its_place(ws: Workspace) -> None:
+    """While a queued conditional job's need is read, no later inference job overtakes it."""
+
+    def reevaluate(job: Job) -> bool:
+        time.sleep(1.0)
+        return True
+
+    runner = Runner(ws, reevaluate=reevaluate)
+    cond = runner.submit(slow_op(), {}, slow(0.5, conditional=True), runner.new_id())
+    later = runner.submit(slow_op(), {}, slow(0.1), runner.new_id())
+    assert runner.get(later.id).state == "queued"  # the check is in flight
+    later = runner.wait(later.id, 60)
+    cond = runner.wait(cond.id, 60)
+    assert cond.inference and later.started_at >= cond.ended_at
+    runner.shutdown()

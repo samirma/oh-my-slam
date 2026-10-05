@@ -429,8 +429,9 @@ option.
 * **Process.** A job is a list of steps. Each step is a Python entry point run as a subprocess in
   its own process group, with:
   * `OH_MY_SLAM_PROGRESS` and `OH_MY_SLAM_TIMINGS` pointing into the job folder;
-  * SIGINT reset to its default, so a cancel works even when the service was started with SIGINT
-    ignored;
+  * a default SIGINT, so a cancel works even when the service was started with SIGINT ignored.
+    Every entry point's `run_main` installs Python's `default_int_handler`, and so do `serve()` and
+    the runner when they find SIGINT ignored, so that exec hands the children a default SIGINT;
   * no recording or replay variable inherited from the service's environment.
   * The command step is `python -m oh_my_slam.cli.<command> <argv>`, the same module the shell
     script execs.
@@ -501,8 +502,9 @@ option.
     object highlights the same object everywhere.
   * That viewer step is optional. If it fails, for instance because it needs the server and the
     server is down, the job still `succeeded`, its result stays downloadable, and the failure is
-    the job's `viewer_error`, with the message and code. Cancelling during that step does the
-    same.
+    the job's `viewer_error`, with the message and code (for example `server_unavailable`).
+    Cancelling during that step does the same, with `viewer_error.code == "cancelled"`. The OpenAPI
+    `Job` schema describes both fields.
 
 **API overview.**
 

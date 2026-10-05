@@ -183,6 +183,13 @@ def document(ops: dict[str, Operation]) -> Json:
                 "id": {"type": "string"}, "operation": {"type": "string"},
                 "state": {"enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
                 "stage": {"type": ["string", "null"]}, "progress": {"type": ["object", "null"]},
+                "viewer": {"type": ["string", "null"],
+                           "description": "the page of the job's saved viewer"},
+                "viewer_error": {"type": ["object", "null"], "description": (
+                    "why a ?viewer=true job has no viewer although its result stands: "
+                    "{code, exit_code, http_status, message}; code 'cancelled' when the job "
+                    "was cancelled during the viewer step, else the code of its exit status "
+                    "(e.g. 'server_unavailable')")},
             }}},
             "responses": {"Error": {"description": "the command's message and the code of its "
                                                    "exit status", "content": {

@@ -35,6 +35,7 @@ from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.errors import ExitCode, OhMySlamError, UsageError
 from oh_my_slam.core.log import claim_stdout
+from oh_my_slam.core.process import default_sigint
 from oh_my_slam.server.lifecycle import AlreadyRunningError, ServerLock, pid_alive
 from oh_my_slam.version import __version__
 from oh_my_slam.web.workspace import DEFAULT_DATA, Workspace
@@ -162,6 +163,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
     from oh_my_slam.web.app import Service, create_app
     from oh_my_slam.web.jobs import Runner
 
+    default_sigint()  # jobs inherit a default SIGINT even if this process was started ignoring it
     lock = ServerLock(ws.root / LOCK)
     try:
         lock.acquire()
