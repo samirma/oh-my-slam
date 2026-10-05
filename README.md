@@ -16,6 +16,7 @@ OpenLABEL mapping and the colour palette).
 | `segment.sh -i IMAGE [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS] [--min-score S]` | Objects of one image: OBBs, colours, and with `-d` five artefact files. |
 | `segment.sh -m MAP [-f json\|ply] [-o FILE] [-d DIR] [-p ATTRS]` | The persistent objects of a map, read-only and without the server. |
 | `view.sh -i IMAGE \| -m MAP [--no-browser]` | Local browser viewer. `-m` needs no server. |
+| `server.sh [--port N] [--data DIR] [--no-browser]` / `--status` / `--stop` | Local web service: every command mode as an HTTP API job, maps and results in a workspace. |
 
 ## Install
 
@@ -332,6 +333,128 @@ draws PLY and scene files with it):
   * `layers.js` and `controls.js`: the layer and attribute controls, and the display-budget notice.
   * `ply.js`: an in-browser PLY reader (ASCII and binary little-endian; x y z, normals, colour,
     label; the header comments).
+
+### `server.sh`
+
+```sh
+./server.sh                          # workspace ~/oh-my-slam-data/, a free port, opens the browser
+./server.sh --port 8765 --data ~/ws --no-browser
+./server.sh --status                 # health JSON on stdout; exit 3 if no service runs for --data
+./server.sh --stop                   # cancels queued jobs, interrupts running ones, then exits
+```
+
+A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under uvicorn.
+
+* **Options.** `--port` binds `0.0.0.0` (default `0`: the OS picks a free port). `--data` is the
+  workspace (default `~/oh-my-slam-data/`). `--no-browser` skips opening
+  `http://127.0.0.1:<port>/` (the browser gets the loopback address; the stderr line names the
+  bound address). `--status` and `--stop` take only `--data`.
+* **Output.** Once accepting connections, stderr carries exactly one line
+  `server.sh: listening on http://0.0.0.0:<port>/`. Nothing else is printed while it runs (job
+  output goes to each job's log). stdout is empty except for `--status`. Ctrl-C, SIGTERM and
+  `--stop` are the same normal stop (exit 0).
+* **One service per workspace.** `<data>/server.lock` (flock) and `<data>/server.json` (pid, URL,
+  port). A second `server.sh` on the same `--data` prints `already running … at <url>` on stderr,
+  opens the browser on it unless `--no-browser`, and exits 0. `--status` without a running service
+  exits 3, like `start_inference_server.sh --status`.
+* **Inference.** The service is a client of the inference server and never loads a model, torch or
+  Open3D (import-linter contracts, plus a test that checks `sys.modules`). It runs while the
+  inference server is down. A request for a mode that requires inference then gets the commands'
+  own exit-3 message as a 503. `segment -m`, `view -m` and `mapper locate` (which needs inference
+  only for large maps) still run.
+
+**Workspace.**
+
+| Path | Contents |
+|---|---|
+| `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service never deletes a map and changes one only through `mapper-update`. |
+| `uploads/<id>/<file>` | Raw-body uploads (`POST /api/uploads?name=<file>`). A job refers to one by its path `uploads/<id>/<file>`. Each upload belongs to at most one queued or running job and is deleted when that job ends, whatever its state. An interrupted upload is deleted at once, and every upload is deleted at start and stop. |
+| `jobs/<id>/` | `job.json` (the record, which survives restarts), `progress.jsonl` (`OH_MY_SLAM_PROGRESS`), `timings.json` (`OH_MY_SLAM_TIMINGS`), `stderr.log` (every line the command printed), `stdout`, and `out/` (everything the command wrote). |
+
+Any other workspace path is accepted as an input, relative to the workspace or absolute. A path
+that resolves outside the workspace, through `..`, `~` or a symlink, is refused as an input error
+(400) on that parameter.
+
+**Single source of truth.** Every operation, parameter, default, validation rule, output and
+error comes from `oh_my_slam.commands.spec`. Nothing in `oh_my_slam.web` names a command or an
+option.
+
+* There is one operation per command mode: `reconstruct`, `mapper-update`, `mapper-locate`,
+  `segment-image`, `segment-map`, `view-image` and `view-map` (program, subcommand and mode
+  joined). Each has one parameter per option, under the option's `dest` name.
+* A request is a JSON object of parameters. Generic rules apply by option kind:
+  * path inputs are workspace paths;
+  * `output` (`-o`) and `artifacts` (`-d`) are plain names inside the job's `out/`. The result
+    always goes through `-o` and defaults to `result.<ext>` for the result's format.
+  * a mode whose output is the browser (`view.sh`) always gets `--no-browser`. The service shows
+    that viewer itself.
+* The command's own parser and rules (`spec.dry_run`) then check the request synchronously.
+  Problems come back per parameter with the command's messages, and the HTTP status of the first
+  one follows the generic rule of `core.errors.HTTP_STATUS`: input errors 400 (`not_a_map` and
+  `not_registered` 422, `map_locked` 409), inference server down 503, internal 500. Nothing is
+  queued for an invalid request. `POST /api/ops/<op>/validate` runs the same checks without
+  queuing anything.
+* `/api/openapi.json` is generated from `spec.describe()`. Each operation and parameter carries
+  its whole registry entry under `x-oms`. `/api/operations` returns `spec.describe()` itself.
+
+**Jobs.**
+
+* **Process.** Each job runs the command's Python entry point,
+  `python -m oh_my_slam.cli.<command> <argv>`, as a subprocess in its own process group, with
+  `OH_MY_SLAM_PROGRESS` and `OH_MY_SLAM_TIMINGS` pointing into the job folder.
+* **States.** States are `queued`, `running`, `succeeded`, `failed` and `cancelled`
+  (`core.errors.job_state`). A failure carries the command's `<prog>: error:` message, the code
+  of its exit status (`usage`, `server_unavailable`, …) and that code's HTTP status.
+* **Progress.** The current stage is the command's own timing stage, with `done`/`total` where the
+  command reports it, plus per-stage seconds and counts. Changes are pushed as server-sent events
+  (`/api/jobs/events` for every job, `/api/jobs/<id>/events` for one until it ends) and are also
+  available by polling.
+* **Order.** Jobs whose mode needs the inference server, or may need it (`mapper locate`), run one
+  at a time in submission order. The other jobs start at once. Two jobs never write the same map
+  at once.
+* **Cancel.** Cancelling sends SIGINT to the job's process group, the same as Ctrl-C. An
+  interrupted map update does not commit, so the map is left as it was. A queued job is simply
+  dropped. Stopping the service cancels queued jobs, interrupts running ones and waits up to
+  120 s before killing them. After a restart, a job that was queued or running shows as
+  `cancelled`.
+* **Results.** The result is the command's `-o` file, and `-d` artefacts are its files in `out/`,
+  so both are byte-identical to a direct run (tested against the CLI with the stub server).
+  Download them with `/api/jobs/<id>/result` and `/api/jobs/<id>/files/<path>`.
+* **Re-submit.** `POST /api/jobs/<id>/resubmit` runs the same parameters again. Its body may
+  replace some of them, for example a new upload in place of one that was discarded.
+
+**Viewer.**
+
+* `/viewer/map/<name>/` mounts `viewer.routes.ViewerRoutes` over the map's read-only bundle,
+  in-process. It needs no inference and is rebuilt when `map.json` changes.
+* A `view-image` / `view-map` job succeeds as soon as its `view.sh` process listens. The service
+  then proxies that process at `/viewer/job/<id>/`, where it keeps serving its in-memory bundle.
+  The latest 4 viewer processes stay open, and the oldest closes first. All of them close when
+  the service stops, and a closed viewer answers 410 (re-submit the job to reopen it).
+
+**API overview.**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/health` | Service and inference health. When the inference server is down, the response includes `start_command`. |
+| `POST /api/ops/<op>` | Submit a job. |
+| `POST /api/ops/<op>/validate` | Check a request without queuing it. |
+| `GET\|POST /api/uploads` | List or create uploads. |
+| `DELETE /api/uploads/<id>` | Discard an unconsumed upload. |
+| `GET /api/maps` | List maps, with summaries from `map.json` and the frame/object records. |
+| `GET /api/maps/<name>` | One map's summary and its full `map.json`. |
+| `GET /api/maps/<name>/files/<path>` | A file of the map, read-only. Hidden entries are never served. |
+| `GET /api/jobs` | List jobs. |
+| `GET /api/jobs/<id>` | Inspect one job. |
+| `/api/jobs/<id>/events` | Server-sent progress events. |
+| `POST /api/jobs/<id>/cancel` | Cancel a job. |
+| `POST /api/jobs/<id>/resubmit` | Run the job again. |
+| `/api/jobs/<id>/result` | Download the result. |
+| `/api/jobs/<id>/files[/<path>]` | List or download the files the job wrote. |
+| `/api/jobs/<id>/log` | The job's stderr log. |
+| `/api/jobs/<id>/timings` | The job's timings. |
+
+`/` serves a placeholder page until the web application lands.
 
 ## Point-cloud attributes
 
@@ -1069,6 +1192,8 @@ at the Python-module level:
 * `mapping` owns inputs, SfM, the map frame, identity and the store. It reaches the server only
   through `reconstruction` and `segmentation`.
 * `viewer` only serves data.
+* `web` (`server.sh`) owns the HTTP layer and the job runner. It runs the commands' entry points
+  as subprocesses and never imports torch, Open3D or the inference server's internals.
 * `server` owns the models and nothing else.
 * The layers run `cli` | `web` (independent siblings; `web` is the coming web service) >
   `commands` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` > `client` >

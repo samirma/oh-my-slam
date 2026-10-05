@@ -70,6 +70,11 @@ def svc(ws: Workspace) -> Iterator[Svc]:
     runner.shutdown()
 
 
+def fields(body: dict[str, Any]) -> list[str]:
+    """The parameters a validation flags (the inference server's state concerns none)."""
+    return [k for k in body["by_parameter"] if k]
+
+
 def jpeg(path: Path, seed: int = 5) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -189,14 +194,14 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
         r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
         body = r.json()
         assert not body["valid"], image
-        assert list(body["by_parameter"]) == ["image"], (image, body)
+        assert fields(body) == ["image"], (image, body)
         assert "outside the workspace" in body["by_parameter"]["image"][0], image
     for m in ("../m", "evil", "inputs", "/tmp"):
         r = svc.client.post("/api/ops/segment-map/validate", json={"map": m})
-        assert list(r.json()["by_parameter"]) == ["map"], m
+        assert fields(r.json()) == ["map"], m
     r = svc.client.post("/api/ops/mapper-update/validate",
                         json={"inputs": ["inputs/ok.jpg", "inputs/link.jpg"], "map": "new"})
-    assert list(r.json()["by_parameter"]) == ["inputs"]
+    assert fields(r.json()) == ["inputs"]
     # inside the workspace, absolute or relative, is fine
     for image in ("inputs/ok.jpg", str(svc.ws.root / "inputs" / "ok.jpg")):
         r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})

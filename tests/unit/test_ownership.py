@@ -152,13 +152,35 @@ def test_viewer_page_has_no_palette_or_randomness() -> None:
         assert "math.random" not in text, p
 
 
-@pytest.mark.parametrize("script", ["reconstruct.sh", "mapper.sh", "segment.sh", "view.sh",
-                                    "start_inference_server.sh"])
+ENTRY_SCRIPTS = ("reconstruct.sh", "mapper.sh", "segment.sh", "view.sh",
+                 "start_inference_server.sh", "server.sh")
+
+
+@pytest.mark.parametrize("script", ENTRY_SCRIPTS)
 def test_entry_scripts_are_thin_and_never_call_each_other(script: str) -> None:
     root = SRC.parents[1]
     text = (root / script).read_text()
     assert "oms_exec" in text
-    for other in ("reconstruct.sh", "mapper.sh", "segment.sh", "view.sh"):
+    for other in ENTRY_SCRIPTS:
         if other != script:
-            assert other not in text
+            assert not re.search(rf"(?<![\w]){re.escape(other)}", text), other
     assert (root / script).stat().st_mode & 0o111
+
+
+def test_web_service_is_a_client_without_models_or_open3d() -> None:
+    """server.sh (oh_my_slam.web, spec 2.6) is covered by the ownership contracts: no model
+    framework, no Open3D, no inference-server internals; it reuses only the lifecycle helpers."""
+    import tomllib
+
+    cfg = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    forbidden: set[str] = set()
+    for c in cfg["tool"]["importlinter"]["contracts"]:
+        if c["type"] == "forbidden" and "oh_my_slam.web" in c["source_modules"]:
+            forbidden.update(c["forbidden_modules"])
+    assert {"torch", "ultralytics", "open3d"} <= forbidden
+    assert {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")} <= forbidden
+    # it runs the commands' Python entry points as subprocesses, never the shell scripts
+    jobs = (SRC / "web" / "jobs.py").read_text("utf-8")
+    assert '[self.python, "-m", job.module, *job.argv]' in jobs
+    assert 'return f"oh_my_slam.cli.{' in (SRC / "web" / "operations.py").read_text("utf-8")
+    assert not _grep(r"subprocess\.\w+\(\s*\[?[^\]]*\.sh", _py_files("web"))

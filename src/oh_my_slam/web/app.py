@@ -139,7 +139,7 @@ class Service:
             if cached is not None and cached[0] == stamp:
                 return cached[1]
             from oh_my_slam.viewer.bundle import map_bundle
-            from oh_my_slam.viewer.routes import ViewerRoutes  # type: ignore[import-not-found]
+            from oh_my_slam.viewer.routes import ViewerRoutes
 
             routes = ViewerRoutes(map_bundle(root))
             self._map_views[name] = (stamp, routes)
