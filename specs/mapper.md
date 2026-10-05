@@ -61,8 +61,10 @@ current. "Latest" is the order of addition: a later update wins over an earlier 
 within one update a later frame wins over an earlier one, in input order (the order of the
 `-i` images; a video's frame order). Capture timestamps are not used. Mapping a sequence
 in one update or split across several in the same order gives the same objects, labels
-and OBBs (within the evaluator's stability targets, §5). Only `id`s may differ, where an
-earlier update had already published one: identity persistence (below) takes precedence.
+and OBBs (within the evaluator's stability targets, §5). Two differences are allowed,
+because identity persistence (below) takes precedence: an `id` may differ where an earlier
+update had already published one, and the split map may keep an object that an earlier
+update published and that no later image contradicts.
 
 Example: in `examples/office_sequence/` a cup is visible in the first images and gone in the
 last ones. Mapping the whole sequence, in one update or in several, must produce a map
