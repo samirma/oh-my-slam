@@ -1,5 +1,5 @@
 """``python -m oh_my_slam.tools.evaluate [--out DIR] [--set-baseline] [--baseline PATH]
-[--targets PATH]`` — see the package docstring."""
+[--targets PATH] [--street2 PATH]`` — see the package docstring."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from oh_my_slam.core.atomic import atomic_write_bytes
 from oh_my_slam.tools.evaluate.metrics import TargetsError, baseline_values, load_targets
 from oh_my_slam.tools.evaluate.report import build_result, environment, write_report
 from oh_my_slam.tools.evaluate.runner import REPO, Runner
-from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation
+from oh_my_slam.tools.evaluate.suite import EXAMPLES, STREET2, Evaluation
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 
 DATA = Path.home() / "oh-my-slam-data" / "evaluations"
@@ -34,6 +34,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="metric targets (default: %(default)s)")
     ap.add_argument("--baseline", type=Path, default=DATA / "baseline.json",
                     help="stored baseline run to compare with (default: %(default)s)")
+    ap.add_argument("--street2", type=Path, default=STREET2,
+                    help="the street2 video every benchmark maps (default: %(default)s)")
     ap.add_argument("--set-baseline", action="store_true",
                     help="store this run's result as the baseline, after comparing it with the "
                          "previous one")
@@ -80,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     print(f"evaluate: results in {out}", file=sys.stderr, flush=True)
     t0 = time.perf_counter()
-    ev = Evaluation(out, Runner(out), BrowserProbe())
+    ev = Evaluation(out, Runner(out), BrowserProbe(), street2=args.street2.expanduser())
     ev.run_all()
     baseline, about = load_baseline(args.baseline.expanduser())
     ev.metrics.judge(targets, None if baseline is None else baseline_values(baseline))

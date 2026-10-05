@@ -8,12 +8,17 @@
 3. Every ``ainex-captures`` frame: ``segment.sh -i``.
 4. ``mapper.sh update``: the sequence in one update (default options: the whole map as JSON),
    and split across ``SPLITS`` updates into a second map (first update ``-o`` JSON, middle ones
-   ``-t single -f ply``, last ``-t full``).
-5. On the one-update map: ``segment.sh -m`` (artefacts), ``view.sh -m``; ``segment.sh -m -f ply
-   -o`` on the split map.
-6. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and of an
-   extended map (an update with its early part, then one with the rest), judged by ``mapupdate``
-   (the ``map_update.*`` metrics).
+   ``-t single -f ply``, last ``-t full``). Between the first and the second update, ``mapper.sh
+   locate`` of the second update's images (held out of the map): ``pose.locate.*``.
+5. On the one-update map (the reference map): ``segment.sh -m`` (artefacts), ``view.sh -m`` and
+   ``mapper.sh locate`` (``-t single`` JSON, ``-t full`` JSON, ``-f ply -o``), which must leave it
+   unchanged, hidden entries included; ``segment.sh -m -f ply -o`` on the split map.
+6. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and split as
+   its annotation says (4+4+5 and 6+7), judged by ``mapupdate`` (the ``map_update.*`` metrics).
+7. ``street2.mp4`` (outside the repository, ``--street2``): ``mapper.sh update`` of the video at
+   the default sampling rate (performance, contracts, ``pose.street2.registered_fraction``).
+8. ``server.sh`` over a scratch workspace (``service``): performance, parity with the commands
+   and the UI (``server_sh.*``).
 
 Every output is checked against the contracts; the metrics are computed from the outputs.
 """
@@ -29,12 +34,12 @@ from typing import Any
 
 import numpy as np
 
+from oh_my_slam.core import paths
 from oh_my_slam.core.images import load_rgb
-from oh_my_slam.core.ply import parse_ply, read_ply
+from oh_my_slam.core.ply import parse_header, parse_ply, read_ply
 from oh_my_slam.core.types import Pose
-from oh_my_slam.mapping.store import full_tree_hash
 from oh_my_slam.tools.evaluate import groundtruth as gt
-from oh_my_slam.tools.evaluate import mapupdate
+from oh_my_slam.tools.evaluate import mapupdate, service
 from oh_my_slam.tools.evaluate.contracts import (
     ContractLog,
     artifact_problems,
@@ -48,6 +53,13 @@ from oh_my_slam.tools.evaluate.contracts import (
     scene_colour_problems,
     served_cloud_problems,
     subject_of,
+    tree_digest,
+)
+from oh_my_slam.tools.evaluate.locate import (
+    LOCATE_METRICS,
+    held_out_metrics,
+    located_poses,
+    located_problems,
 )
 from oh_my_slam.tools.evaluate.mapquality import (
     AGREEMENT_METRICS,
@@ -81,21 +93,41 @@ RESTAURANT = "restaurant.jpg"
 SEQUENCE = "ainex-captures"
 GROUND_TRUTH = "ground_truth"
 SERVER = "start_inference_server.sh"
+# street2.mp4: every benchmark maps it (the user's rule, 2026-10-02); it lives outside examples/
+STREET2 = Path.home() / "oh-my-slam-data" / "loop" / "inputs" / "street2.mp4"
 LABELLED_SEGMENTS = "color=segment,label=on"  # per-point object ids: exact colour checks
 SPLITS = 3  # updates of the split map (spec §5: one update versus several)
 MAPS = ("single", "split")
 SERVER_METRICS = ("perf.server.cold_start_s", "perf.server.resident_gb", "perf.server.peak_gb")
 SEG_METRICS = ("seg.restaurant.objects", "seg.frames.with_detections_fraction", "seg.min_score")
+LOCATE_REFERENCE = (1, 40, 60)  # captures located on the reference map (each in it)
+PARITY_SEQUENCE = 3  # the first captures, mapped by the parity cases of mapper.sh update
+PARITY_LOCATE = (40, 60)  # captures the parity cases of mapper.sh locate locate
+STREET2_METRIC = "pose.street2.registered_fraction"
 
 
-def expected_ids() -> list[str]:
-    """Every metric a run records (ground-truth metrics come on top when annotations exist)."""
+def office_splits(examples: Path = EXAMPLES) -> list[str]:
+    """The names of the office sequence's splits its annotation asks for."""
+    files, skipped = gt.discover(examples / GROUND_TRUTH)
+    plan = gt.map_update_plan(files, skipped)
+    if plan is None or not (examples / plan.sequence).is_dir():
+        return []
+    images = mapupdate.sequence_images(examples / plan.sequence)
+    return [mapupdate.split_name(s) for s in plan.split_sizes(images)]
+
+
+def expected_ids(examples: Path = EXAMPLES) -> list[str]:
+    """Every metric a run records (ground-truth metrics come on top when annotations exist, and
+    per-stage metrics for every stage the commands record)."""
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
+    ids += [f"pose.locate.{k}" for k in LOCATE_METRICS]
+    ids += [STREET2_METRIC]
     ids += [f"map.{mp}.{k}" for mp in MAPS for k in AGREEMENT_METRICS]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
-    ids += mapupdate.metric_ids()
+    ids += mapupdate.metric_ids(office_splits(examples))
+    ids += service.metric_ids()
     ids += [mid for mid, *_ in ContractLog().results()]
     return ids
 
@@ -106,6 +138,22 @@ def _problems_reading(fn: Any, *args: Any) -> list[str]:
         return list(fn(*args))
     except (OSError, ValueError, KeyError) as exc:
         return [f"{type(exc).__name__}: {exc}"]
+
+
+def _pose_lines(ply: bytes, asked: int) -> list[str]:
+    """``mapper.sh locate -f ply``: one ``located_<k> {json}`` header line per input image."""
+    lines = [c for c in parse_header(ply).comments if c.startswith("located_")]
+    out = [] if len(lines) == asked else [f"{len(lines)} located_ header lines for {asked} "
+                                          "input images"]
+    for line in lines:
+        try:
+            d = json.loads(line.split(" ", 1)[1])
+        except (IndexError, ValueError):
+            out.append(f"not a pose line: {line[:80]}")
+            continue
+        if d.get("located") and "transform_src_to_dst" not in d:
+            out.append(f"{line.split(' ', 1)[0]}: located but no transform")
+    return out
 
 
 @dataclass
@@ -120,15 +168,20 @@ class Evaluation:
     images: dict[str, list[DocObject]] = field(default_factory=dict)  # segment.sh -i objects
     single_poses: dict[str, Pose] | None = None
     was_running: bool = False
+    street2: Path | None = STREET2
+    published: set[int] = field(default_factory=set)  # ids the split map's earlier updates gave
+    held_out: dict[str, Any] = field(default_factory=dict)  # the held-out locate's results
+    ui: Any = None  # the web application's browser tests (None: service.run_ui_tests)
 
     # -- running and checking one command ------------------------------------------------------------
 
     def run(self, tag: str, group: str, entry: str, *args: str | Path, stdout: str = "json",
             output: Path | None = None, ok_exit: tuple[int, ...] = (0,),
-            timeout_s: float = 3600.0) -> RunRecord:
+            timeout_s: float = 3600.0, env: dict[str, str] | None = None) -> RunRecord:
         kind = None if output is None else output.suffix.lstrip(".")
         rec = self.runner.run(RunSpec(tag, group, entry, tuple(str(a) for a in args), stdout,
-                                      output, kind, ok_exit, timeout_s))
+                                      output, kind, ok_exit, timeout_s,
+                                      tuple((env or {}).items())))
         self.check_payloads(rec)
         return rec
 
@@ -312,15 +365,51 @@ class Evaluation:
                 "-m", split_dir)
             if k == 1:
                 target = self.out / "outputs" / f"{tag}.json"
-                self.scene(self.run(tag, "mapper_split", "mapper.sh", *args, "-o", target,
-                                    stdout="empty", output=target))
+                first = self.scene(self.run(tag, "mapper_split", "mapper.sh", *args, "-o", target,
+                                            stdout="empty", output=target))
+                if first is not None:
+                    self.published |= {o.id for o in doc_objects(first)}
+                    if len(parts) > 1:
+                        self.locate_held_out(first, split_dir,
+                                             [captures[i] for i in parts[1]], captures)
             elif k < len(parts):
-                self.cloud_colours(self.run(tag, "mapper_split", "mapper.sh", *args, "-t",
-                                            "single", "-f", "ply", "-p", LABELLED_SEGMENTS,
-                                            stdout="ply"), None)
+                rec = self.run(tag, "mapper_split", "mapper.sh", *args, "-t", "single", "-f",
+                               "ply", "-p", LABELLED_SEGMENTS, stdout="ply")
+                self.cloud_colours(rec, None)
+                if rec.ok:  # the objects this update published: the labels of its points
+                    try:
+                        labels = parse_ply(rec.stdout_bytes()).label
+                    except ValueError:
+                        labels = None
+                    if labels is not None:
+                        self.published |= {int(v) for v in np.unique(labels) if v > 0}
             else:
                 split = self.scene(self.run(tag, "mapper_split", "mapper.sh", *args, "-t", "full"))
         return single, split
+
+    def locate_held_out(self, first: Json, split_dir: Path, held_out: list[Capture],
+                        captures: list[Capture]) -> None:
+        """``mapper.sh locate`` of captures the split map has not seen yet (read-only)."""
+        before = tree_digest(split_dir)
+        rec = self.run("locate_held_out", "locate_held_out", "mapper.sh", "locate", "-i",
+                       *(self.examples / SEQUENCE / c.name for c in held_out), "-m", split_dir)
+        doc = self.scene(rec)
+        self.contracts.check("readonly", "map", "mapper.sh locate (held out)",
+                             [] if tree_digest(split_dir) == before else
+                             ["mapper.sh locate changed the map folder"])
+        reference = capture_poses(first, split_dir).get(captures[0].name) if captures else None
+        self.held_out = {"located": None if doc is None else located_poses(doc),
+                         "reference": reference, "captures": held_out}
+        if doc is not None:
+            self.contracts.check("openlabel", "mapper", "locate_held_out/located frames",
+                                 located_problems(doc, len(held_out)))
+
+    def held_out_metrics(self, split: Json | None) -> None:
+        later = None if split is None else capture_poses(split, self.out / "maps" / "split")
+        h = self.held_out
+        self.details["poses.locate"] = held_out_metrics(
+            self.metrics, "pose.locate", h.get("located"), h.get("reference"),
+            h.get("captures") or [], later)
 
     def map_metrics(self, captures: list[Capture], single: Json | None, split: Json | None
                     ) -> None:
@@ -350,7 +439,9 @@ class Evaluation:
             else:
                 self.details["map.stability"] = stability_metrics(
                     self.metrics, "map.stability", doc_objects(single), doc_objects(split),
-                    split_alignment(poses["single"], poses["split"]))
+                    split_alignment(poses["single"], poses["split"]), self.published)
+        with self.metrics.expect(*(f"pose.locate.{k}" for k in LOCATE_METRICS)):
+            self.held_out_metrics(split)
         ids = [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
         with self.metrics.expect(*ids):
             if single is None:
@@ -364,7 +455,7 @@ class Evaluation:
 
     def map_commands(self, single: Json | None, split: Json | None) -> None:
         single_dir, split_dir = self.out / "maps" / "single", self.out / "maps" / "split"
-        before = full_tree_hash(single_dir) if single is not None else None
+        before = tree_digest(single_dir) if single is not None else None
         folder = self.out / "outputs" / "segment_map"
         rec = self.run("segment_map", "segment_map", "segment.sh", "-m", single_dir, "-d", folder,
                        "-p", "label=on")
@@ -380,55 +471,129 @@ class Evaluation:
                        "-o", target, stdout="empty", output=target)
         self.cloud_colours(rec, None if split is None else {o.id for o in doc_objects(split)})
         self.view("view_map", ("map", "mapper.sh -t full", single), "-m", single_dir)
+        self.locate_reference(single, single_dir)
         if before is not None:
-            same = full_tree_hash(single_dir) == before
-            self.contracts.check("readonly", "map", "segment.sh -m, view.sh -m",
+            same = tree_digest(single_dir) == before
+            self.contracts.check("readonly", "map", "segment.sh -m, view.sh -m, mapper.sh locate",
                                  [] if same else ["the map folder changed"])
 
+    def locate_reference(self, single: Json | None, single_dir: Path) -> None:
+        """``mapper.sh locate`` on the reference map: ``-t single`` JSON (the default), ``-t
+        full`` JSON (the map exactly as ``update -t full`` gave it, plus the located cameras) and
+        ``-f ply -o`` (map points, one header line per input image)."""
+        if single is None:
+            return
+        by_index = {c.index: c for c in captures_in(self.examples / SEQUENCE)}
+        images = [self.examples / SEQUENCE / by_index[i].name for i in LOCATE_REFERENCE
+                  if i in by_index]
+        args: tuple[str | Path, ...] = ("locate", "-i", *images, "-m", single_dir)
+        doc = self.scene(self.run("locate_single", "locate", "mapper.sh", *args))
+        if doc is not None:
+            self.contracts.check("openlabel", "mapper", "locate_single/located frames",
+                                 located_problems(doc, len(images)))
+        doc = self.scene(self.run("locate_full", "locate_full", "mapper.sh", *args, "-t", "full"))
+        if doc is not None:
+            self.contracts.check("openlabel", "mapper", "locate_full/located frames",
+                                 located_problems(doc, len(images)))
+            self.contracts.check("same_objects", "map", "mapper.sh locate -t full vs update -t full",
+                                 same_objects_problems(doc_objects(single), doc_objects(doc),
+                                                       geometry=True))
+        target = self.out / "outputs" / "locate.ply"
+        rec = self.run("locate_ply", "locate_ply", "mapper.sh", *args, "-f", "ply", "-o", target,
+                       stdout="empty", output=target)
+        if rec.ok:
+            problems = _problems_reading(lambda: _pose_lines(target.read_bytes(), len(images)))
+            self.contracts.check("stdout", "mapper", "locate_ply/pose header lines", problems)
+
     def map_update(self) -> None:
-        """The office sequence mapped whole in one update, and mapped as an extended map (its
-        early part, then the rest); the ``map_update`` files of the ground truth say what changed
-        (no file: the metrics fail, nothing is mapped)."""
-        ids = mapupdate.metric_ids()
+        """The office sequence mapped whole in one update, and split across updates as its
+        annotation says; the ``map_update`` files of the ground truth say what changed (no file:
+        the metrics fail, nothing is mapped)."""
         files, skipped = gt.discover(self.examples / GROUND_TRUTH)
         plan = gt.map_update_plan(files, skipped)
         if plan is None:
-            self.metrics.fail(ids, "no 'map_update' file in examples/ground_truth/ (see its "
-                                   "README.md): what changed in the sequence is not annotated")
+            self.metrics.fail(mapupdate.metric_ids(), "no 'map_update' file in "
+                              "examples/ground_truth/ (see its README.md): what changed in the "
+                              "sequence is not annotated")
             return
         folder = self.examples / plan.sequence
         images = mapupdate.sequence_images(folder)
         early = plan.before_images(images)
+        sizes = plan.split_sizes(images)
+        ids = mapupdate.metric_ids([mapupdate.split_name(s) for s in sizes])
         self.details["map_update"] = {"annotation": [str(p) for p in plan.files],
-                                      "images": images, "before_images": early}
+                                      "images": images, "before_images": early,
+                                      "split_sizes": [list(s) for s in sizes]}
         if not early:
             self.metrics.fail(ids, f"no annotated image is in {folder}")
             return
         maps = self.out / "maps"
-        single_dir, ext_dir = maps / "office", maps / "office_extended"
+        single_dir = maps / "office"
         single = self.scene(self.run("mapper_office", "mapper_office", "mapper.sh", "update",
                                      "-i", *(folder / n for n in images), "-m", single_dir))
-        first = self.scene(self.run("mapper_office_early", "mapper_office_extended", "mapper.sh",
-                                    "update", "-i", *(folder / n for n in early), "-m", ext_dir))
-        # the first update's view is read now: the map's frame records change with the next
-        view_first = None if first is None else mapupdate.MapView.of(first, ext_dir)
-        later = images[len(early):]
-        rest = None
-        if first is not None and later:
-            rest = self.scene(self.run("mapper_office_rest", "mapper_office_extended", "mapper.sh",
-                                       "update", "-i", *(folder / n for n in later), "-m",
-                                       ext_dir))
+        splits: list[mapupdate.SplitMaps] = []
+        failed: dict[str, str] = {}
+        for s in sizes:
+            name = mapupdate.split_name(s)
+            try:
+                parts = mapupdate.parts_of(images, s)
+            except ValueError as exc:
+                failed[name] = str(exc)
+                continue
+            views, d = [], maps / f"office_{name}"
+            for k, part in enumerate(parts, start=1):
+                doc = self.scene(self.run(f"mapper_office_{name}_{k}", "mapper_office_split",
+                                          "mapper.sh", "update", "-i", *(folder / n for n in part),
+                                          "-m", d))
+                if doc is None:
+                    failed[name] = f"update {k} of {name} failed"
+                    break
+                # each update's view is read now: the map's frame records change with the next
+                views.append(mapupdate.MapView.of(doc, d, cloud=k == len(parts)))
+            else:
+                splits.append(mapupdate.SplitMaps(s, parts, views))
         with self.metrics.expect(*ids):
-            built = {"the whole sequence": single, "the early images": first,
-                     "the rest of the images": rest}
-            missing = [name for name, doc in built.items() if doc is None]
-            if missing or view_first is None or single is None or rest is None:
-                self.metrics.fail(ids, f"the map of {missing[0]} was not built"
-                                  if missing else "the map was not built")
+            if single is None:
+                self.metrics.fail(ids, "the map of the whole sequence was not built")
             else:
                 self.details["map_update"].update(mapupdate.map_update_metrics(
-                    self.metrics, plan, images, mapupdate.MapView.of(single, single_dir),
-                    view_first, mapupdate.MapView.of(rest, ext_dir)))
+                    self.metrics, plan, images, mapupdate.MapView.of(single, single_dir, True),
+                    splits, failed))
+
+    def street2_video(self) -> None:
+        """``mapper.sh update`` of the street2 video (the user's benchmark rule): performance,
+        contracts and the share of sampled frames the map registered."""
+        video = self.street2
+        if video is None or not Path(video).is_file():
+            self.metrics.fail([STREET2_METRIC], f"street2.mp4 not found at {video} (pass "
+                              "--street2 PATH)")
+            self.details["street2"] = {"video": str(video), "error": "not found"}
+            return
+        rec = self.run("mapper_street2", "mapper_street2", "mapper.sh", "update", "-i", video,
+                       "-m", self.out / "maps" / "street2", timeout_s=5400.0)
+        self.scene(rec)
+        counts = (rec.timings or {}).get("counts") or {}
+        sampled, registered = counts.get("keyframes_sampled"), counts.get("keyframes_registered")
+        self.details["street2"] = {"video": str(video), "counts": counts}
+        self.metrics.add(STREET2_METRIC, registered / sampled if rec.ok and sampled else None,
+                         {"sampled": sampled, "registered": registered},
+                         error=rec.failure() if not rec.ok else "the run recorded no counts")
+
+    def server_sh(self) -> None:
+        """``server.sh`` (http_server.md "Evaluation"), through the inference proxy."""
+        from oh_my_slam.tools.evaluate.proxy import InferenceProxy, short_runtime
+
+        by_index = {c.index: c for c in captures_in(self.examples / SEQUENCE)}
+        seq = self.examples / SEQUENCE
+        single_dir = self.out / "maps" / "single"
+        inputs = {"image": self.examples / RESTAURANT,
+                  "images": [seq / by_index[i].name for i in PARITY_LOCATE if i in by_index],
+                  "sequence": [seq / c.name for c in list(by_index.values())[:PARITY_SEQUENCE]],
+                  "map": single_dir if (single_dir / "map.json").is_file() else None}
+        with InferenceProxy(short_runtime(), paths.socket_path()) as proxy:
+            kw = {} if self.ui is None else {"ui": self.ui}
+            service.ServiceEvaluation(self, inputs, proxy.env(), **kw).run()
+            self.details.setdefault("server_sh", {})["proxy"] = proxy.stats()
 
     def ground_truth(self) -> None:
         files, skipped = gt.discover(self.examples / GROUND_TRUTH)
@@ -460,12 +625,16 @@ class Evaluation:
             maps = self.section(f"{SEQUENCE}: mapper.sh update", self.build_maps, captures)
             single, split = maps or (None, None)
             self.section("pose accuracy, map quality", self.map_metrics, captures, single, split)
-            self.section("segment.sh -m, view.sh -m", self.map_commands, single, split)
+            self.section("segment.sh -m, view.sh -m, mapper.sh locate", self.map_commands,
+                         single, split)
             self.section("office_sequence: mapper.sh update (map update)", self.map_update)
+            self.section("street2.mp4: mapper.sh update", self.street2_video)
+            self.section("server.sh", self.server_sh)
         finally:
             self.section("restore the inference server", self.server_restore)
         self.section("summary", self.summarise)
-        self.metrics.fail(expected_ids(), "not computed (an earlier step failed; see errors)")
+        self.metrics.fail(expected_ids(self.examples),
+                          "not computed (an earlier step failed; see errors)")
 
     def summarise(self) -> None:
         m = self.metrics

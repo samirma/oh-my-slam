@@ -674,13 +674,6 @@
       "tolerance_abs": 0.0,
       "description": "office_sequence: share of the annotated absent objects (the cup) that the map of the whole sequence in one update no longer has"
     },
-    "map_update.incremental.absent_fraction": {
-      "op": ">=",
-      "value": 1.0,
-      "unit": "",
-      "tolerance_abs": 0.0,
-      "description": "office_sequence: share of the annotated absent objects (the cup) that the map of the extended map (an update with the early images, then one with the rest) no longer has"
-    },
     "map_update.before_present_fraction": {
       "op": ">=",
       "value": 1.0,
@@ -688,47 +681,638 @@
       "tolerance_abs": 0.0,
       "description": "office_sequence: share of the annotated absent objects that the extended map has after its first update, the early images (control: makes the absence meaningful)"
     },
-    "map_update.stability.matched_fraction": {
+    "perf.mapper_split.per_update_wall_s": {
+      "op": "<=",
+      "value": 150,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.locate.wall_s": {
+      "op": "<=",
+      "value": 30,
+      "unit": "s",
+      "tolerance_rel": 0.2
+    },
+    "perf.locate.client_peak_mb": {
+      "op": "<=",
+      "value": 2000,
+      "unit": "MB"
+    },
+    "perf.locate.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB"
+    },
+    "perf.mapper_office.wall_s": {
+      "op": "<=",
+      "value": 180,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_office.client_peak_mb": {
+      "op": "<=",
+      "value": 6000,
+      "unit": "MB"
+    },
+    "perf.mapper_office.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB"
+    },
+    "perf.mapper_office_split.wall_s": {
+      "op": "<=",
+      "value": 120,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_office_split.client_peak_mb": {
+      "op": "<=",
+      "value": 6000,
+      "unit": "MB"
+    },
+    "perf.mapper_office_split.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB"
+    },
+    "perf.mapper_street2.wall_s": {
+      "op": "<=",
+      "value": 900,
+      "unit": "s",
+      "tolerance_rel": 0.35
+    },
+    "perf.mapper_street2.client_peak_mb": {
+      "op": "<=",
+      "value": 12000,
+      "unit": "MB"
+    },
+    "perf.mapper_street2.server_peak_gb": {
+      "op": "<=",
+      "value": 22,
+      "unit": "GB"
+    },
+    "pose.locate.located_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "tolerance_abs": 0.05
+    },
+    "pose.locate.yaw_err_median_deg": {
+      "op": "<=",
+      "value": 7,
+      "unit": "deg",
+      "tolerance_abs": 1.0
+    },
+    "pose.locate.yaw_err_max_deg": {
+      "op": "<=",
+      "value": 15,
+      "unit": "deg",
+      "tolerance_abs": 2.0
+    },
+    "pose.street2.registered_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "tolerance_abs": 0.03
+    },
+    "map_update.hole_fraction": {
+      "op": "<=",
+      "value": 0.2,
+      "tolerance_abs": 0.05
+    },
+    "contract.stdout.server_sh": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.start_s": {
+      "op": "<=",
+      "value": 10,
+      "unit": "s",
+      "tolerance_rel": 0.3
+    },
+    "server_sh.resident_mb": {
+      "op": "<=",
+      "value": 400,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "server_sh.app_render_s": {
+      "op": "<=",
+      "value": 3,
+      "unit": "s",
+      "tolerance_rel": 0.3
+    },
+    "server_sh.read_latency_median_ms": {
+      "op": "<=",
+      "value": 50,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.read_latency_p95_ms": {
+      "op": "<=",
+      "value": 250,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.read_latency_busy_p95_ms": {
+      "op": "<=",
+      "value": 500,
+      "unit": "ms",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.job_overhead_median_s": {
+      "op": "<=",
+      "value": 3,
+      "unit": "s",
+      "tolerance_rel": 0.5
+    },
+    "server_sh.parity.mismatched": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.parity.unverifiable": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.parity.operations_covered_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "tolerance_abs": 0.0
+    },
+    "server_sh.ui.tests_failed": {
+      "op": "<=",
+      "value": 0
+    },
+    "server_sh.ui.tests_run": {
+      "op": ">=",
+      "value": 20,
+      "tolerance_abs": 0.0
+    },
+    "server_sh.ui.a11y_violations": {
+      "op": "<=",
+      "value": 0
+    },
+    "map_update.split_4_4_5.absent_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "tolerance_abs": 0.0
+    },
+    "map_update.split_4_4_5.hole_fraction": {
+      "op": "<=",
+      "value": 0.2,
+      "tolerance_abs": 0.05
+    },
+    "map_update.split_4_4_5.ids_persistent_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "tolerance_abs": 0.03
+    },
+    "map_update.split_4_4_5.stability.matched_fraction": {
       "op": ">=",
       "value": 0.9,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "objects of the early images paired between the first and the second update of the extended map / the larger object count"
+      "description": "objects paired between the one-update and the split map / the larger object count"
     },
-    "map_update.stability.label_agreement": {
+    "map_update.split_4_4_5.vs_one_update.matched_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired between the one-update and the split map / the larger object count"
+    },
+    "map_update.split_4_4_5.stability.label_agreement": {
       "op": ">=",
       "value": 0.95,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "paired objects (by geometry alone) whose labels are the same or compatible, first update vs second update of the extended map"
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
     },
-    "map_update.stability.id_agreement": {
+    "map_update.split_4_4_5.vs_one_update.label_agreement": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
+    },
+    "map_update.split_4_4_5.stability.id_agreement": {
       "op": ">=",
       "value": 0.8,
       "unit": "",
       "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in the first and the second update of the extended map"
+      "description": "paired objects with the same id in both maps"
     },
-    "map_update.stability.centre_delta_median_m": {
+    "map_update.split_4_4_5.vs_one_update.id_agreement": {
+      "op": ">=",
+      "value": 0.8,
+      "unit": "",
+      "tolerance_abs": 0.1,
+      "description": "paired objects with the same id in both maps"
+    },
+    "map_update.split_4_4_5.stability.centre_delta_median_m": {
       "op": "<=",
       "value": 0.1,
       "unit": "m",
       "tolerance_abs": 0.03,
-      "description": "median OBB centre distance of paired objects, first update vs second update of the extended map"
+      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
     },
-    "map_update.stability.extent_delta_median_rel": {
+    "map_update.split_4_4_5.vs_one_update.centre_delta_median_m": {
+      "op": "<=",
+      "value": 0.1,
+      "unit": "m",
+      "tolerance_abs": 0.03,
+      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
+    },
+    "map_update.split_4_4_5.stability.extent_delta_median_rel": {
       "op": "<=",
       "value": 0.2,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "median relative OBB size difference of paired objects, first update vs second update of the extended map"
+      "description": "median relative OBB size difference of paired objects"
     },
-    "map_update.stability.obb_iou_median": {
+    "map_update.split_4_4_5.vs_one_update.extent_delta_median_rel": {
+      "op": "<=",
+      "value": 0.2,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "median relative OBB size difference of paired objects"
+    },
+    "map_update.split_4_4_5.stability.obb_iou_median": {
       "op": ">=",
       "value": 0.5,
       "unit": "",
       "tolerance_abs": 0.08,
-      "description": "median 3D IoU of paired OBBs, first update vs second update of the extended map"
+      "description": "median 3D IoU of paired OBBs"
+    },
+    "map_update.split_4_4_5.vs_one_update.obb_iou_median": {
+      "op": ">=",
+      "value": 0.5,
+      "unit": "",
+      "tolerance_abs": 0.08,
+      "description": "median 3D IoU of paired OBBs"
+    },
+    "map_update.split_6_7.absent_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "tolerance_abs": 0.0
+    },
+    "map_update.split_6_7.hole_fraction": {
+      "op": "<=",
+      "value": 0.2,
+      "tolerance_abs": 0.05
+    },
+    "map_update.split_6_7.ids_persistent_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "tolerance_abs": 0.03
+    },
+    "map_update.split_6_7.stability.matched_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired between the one-update and the split map / the larger object count"
+    },
+    "map_update.split_6_7.vs_one_update.matched_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired between the one-update and the split map / the larger object count"
+    },
+    "map_update.split_6_7.stability.label_agreement": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
+    },
+    "map_update.split_6_7.vs_one_update.label_agreement": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "objects paired by geometry alone (label-blind) whose labels are the same or compatible"
+    },
+    "map_update.split_6_7.stability.id_agreement": {
+      "op": ">=",
+      "value": 0.8,
+      "unit": "",
+      "tolerance_abs": 0.1,
+      "description": "paired objects with the same id in both maps"
+    },
+    "map_update.split_6_7.vs_one_update.id_agreement": {
+      "op": ">=",
+      "value": 0.8,
+      "unit": "",
+      "tolerance_abs": 0.1,
+      "description": "paired objects with the same id in both maps"
+    },
+    "map_update.split_6_7.stability.centre_delta_median_m": {
+      "op": "<=",
+      "value": 0.1,
+      "unit": "m",
+      "tolerance_abs": 0.03,
+      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
+    },
+    "map_update.split_6_7.vs_one_update.centre_delta_median_m": {
+      "op": "<=",
+      "value": 0.1,
+      "unit": "m",
+      "tolerance_abs": 0.03,
+      "description": "median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
+    },
+    "map_update.split_6_7.stability.extent_delta_median_rel": {
+      "op": "<=",
+      "value": 0.2,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "median relative OBB size difference of paired objects"
+    },
+    "map_update.split_6_7.vs_one_update.extent_delta_median_rel": {
+      "op": "<=",
+      "value": 0.2,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "median relative OBB size difference of paired objects"
+    },
+    "map_update.split_6_7.stability.obb_iou_median": {
+      "op": ">=",
+      "value": 0.5,
+      "unit": "",
+      "tolerance_abs": 0.08,
+      "description": "median 3D IoU of paired OBBs"
+    },
+    "map_update.split_6_7.vs_one_update.obb_iou_median": {
+      "op": ">=",
+      "value": 0.5,
+      "unit": "",
+      "tolerance_abs": 0.08,
+      "description": "median 3D IoU of paired OBBs"
+    },
+    "perf.reconstruct_json.stage.*.s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.reconstruct_json.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.reconstruct_json.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.reconstruct_ply.stage.*.s": {
+      "op": "<=",
+      "value": 1.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.reconstruct_ply.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 450,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.reconstruct_ply.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_image.stage.*.s": {
+      "op": "<=",
+      "value": 3.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_image.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_image.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_frames.stage.*.s": {
+      "op": "<=",
+      "value": 1.6,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_frames.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 250,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_frames.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.view_image.stage.*.s": {
+      "op": "<=",
+      "value": 5.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.view_image.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.view_image.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_single.stage.*.s": {
+      "op": "<=",
+      "value": 270,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_single.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_single.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_split.stage.*.s": {
+      "op": "<=",
+      "value": 150,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_split.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_split.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_map.stage.*.s": {
+      "op": "<=",
+      "value": 2.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_map.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 1100,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_map.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.view_map.stage.*.s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.view_map.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.view_map.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.locate.stage.*.s": {
+      "op": "<=",
+      "value": 30,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.locate.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 2000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.locate.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office.stage.*.s": {
+      "op": "<=",
+      "value": 180,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_office.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 6000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_office_split.stage.*.s": {
+      "op": "<=",
+      "value": 120,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_office_split.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 6000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_office_split.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_street2.stage.*.s": {
+      "op": "<=",
+      "value": 900,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_street2.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 12000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_street2.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 22,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.*.stage.*.s": {
+      "op": "<=",
+      "value": 60,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.*.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.*.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
     }
   }
 }

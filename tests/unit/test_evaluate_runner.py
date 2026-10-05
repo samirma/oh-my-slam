@@ -20,6 +20,7 @@ from oh_my_slam.tools.evaluate.metrics import load_targets
 from oh_my_slam.tools.evaluate.names import captures_in
 from oh_my_slam.tools.evaluate.report import build_result, write_report
 from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
+from oh_my_slam.tools.evaluate.service import UiOutcome
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe, ViewOutcome, served_url
 from oh_my_slam.viewer.bundle import DisplayCloud
@@ -27,7 +28,7 @@ from oh_my_slam.viewer.routes import cloud_payload
 from tests.unit.test_evaluate_contracts import labelled_cloud, scene_bytes
 
 ENTRY_POINTS = ("start_inference_server.sh", "reconstruct.sh", "mapper.sh", "segment.sh",
-                "view.sh")
+                "view.sh", "server.sh")
 
 
 def script(folder: Path, name: str, body: str, shebang: str = "#!/bin/bash") -> Path:
@@ -186,7 +187,10 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     repo = fake_repo(tmp_path, start_inference_server='[ "$1" = "--status" ] && exit 3\n'
                                                       'echo "server: error: boom" >&2\nexit 1')
     out = tmp_path / "out"
-    ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES)
+    video = tmp_path / "street2.mp4"
+    video.write_bytes(b"")
+    ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES, street2=video,
+                    ui=lambda folder: UiOutcome(None, None, "no web application tests"))
     ev.run_all()
     targets = load_targets(EXAMPLES / "targets.json")
     ev.metrics.judge(targets, None)
@@ -207,6 +211,9 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     assert tags[-1] == "server_stop_final"  # the server was down at the start
     assert sum(t.startswith("segment_frame_") for t in tags) == 79
     assert sum(t.startswith("mapper_split_") for t in tags) == 3
+    assert "mapper_street2" in tags and "server_sh" in tags
+    assert "boom" in (ev.metrics.items["pose.street2.registered_fraction"].error or "")
+    assert "listening" in (ev.metrics.items["server_sh.start_s"].error or "")
     failed = [r for r in ev.runner.records if not r.ok]
     assert len(failed) == len(tags) - 1
     result = build_result(ev.metrics, ev.runner.records, ev.details, started="s", finished="f",
