@@ -26,7 +26,10 @@ Json = dict[str, Any]
 
 
 def _r(x: float, nd: int = 6) -> float:
-    return float(round(float(x), nd))
+    """``x`` rounded to ``nd`` decimals, with signed zero normalised (``-0.0`` -> ``0.0``): a value
+    that jitters around zero between identical runs (the anchor frame's translation) would
+    otherwise be written as ``-0.0`` in one and ``0.0`` in the other."""
+    return float(round(float(x), nd)) + 0.0
 
 
 def rounded(x: Any) -> Any:
