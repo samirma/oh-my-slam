@@ -207,7 +207,13 @@ def document(ops: dict[str, Operation]) -> Json:
             "schemas": {"Job": {"type": "object", "properties": {
                 "id": {"type": "string"}, "operation": {"type": "string"},
                 "state": {"enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
-                "stage": {"type": ["string", "null"]}, "progress": {"type": ["object", "null"]},
+                "stage": {"type": ["string", "null"], "description": "the command's own stage"},
+                "progress": {"type": ["object", "null"]},
+                "stages": {"type": "array", "description": "the command's own stages with "
+                           "their seconds (never those of a viewer step)"},
+                "viewer_progress": {"type": ["object", "null"], "description": (
+                    "{stage, done, total} of the viewer step that follows the command of a "
+                    "?viewer=true job, while it runs; null otherwise")},
                 "viewer": {"type": ["string", "null"],
                            "description": "the page of the job's saved viewer"},
                 "viewer_error": {"type": ["object", "null"], "description": (

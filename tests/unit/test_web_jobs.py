@@ -186,6 +186,12 @@ def test_map_viewer_and_saved_job_viewers(stub_server: None,
     catalog = client.get(f"/viewer/job/{both['id']}/api/catalog").json()
     assert {r["id"]: r["label"] for r in catalog} == objects
     assert not (ws.jobs / both["id"] / "inference").exists()  # deleted once the viewer is saved
+    # the job's stages are the command's own (its timings record); the viewer step's are not
+    timings = client.get(f"/api/jobs/{both['id']}/timings").json()
+    assert sorted(s["stage"] for s in both["stages"]) == sorted(timings["stages_s"])
+    assert both["viewer_progress"] is None
+    viewer_events = (ws.jobs / both["id"] / "viewer_progress.jsonl").read_text().splitlines()
+    assert any(json.loads(e).get("event") == "stage_start" for e in viewer_events)
 
     # after a restart (a new runner and service on the same workspace) the viewer is still there
     again = Runner(ws)

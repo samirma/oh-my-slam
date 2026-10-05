@@ -25,9 +25,12 @@ export function inputsText(job) {
 }
 
 export function progressBar(job) {
-  const pr = job.progress;
+  // the viewer step after a command reports apart from the command's own stages
+  const vp = job.viewer_progress;
+  const pr = vp || job.progress;
   const wrap = el('div', { class: 'progress' });
-  const stage = job.stage || (job.state === 'queued' ? 'waiting for its turn' : 'starting');
+  const stage = vp ? `preparing the viewer${vp.stage ? ` (${vp.stage})` : ''}`
+    : job.stage || (job.state === 'queued' ? 'waiting for its turn' : 'starting');
   if (pr && pr.total) {
     const pct = Math.round((100 * pr.done) / pr.total);
     wrap.append(el('progress', { max: pr.total, value: pr.done, 'aria-label': `Stage ${stage}: ${pr.done} of ${pr.total}` }),
