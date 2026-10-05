@@ -69,8 +69,10 @@ def _body(d: Json) -> Json:
 
 _VIEWER_PARAM = [{"name": "viewer", "in": "query", "required": False,
                   "schema": {"type": "boolean", "default": False},
-                  "description": "also save the viewer of the request's image (one more step of "
-                                 "the same job, which runs inference for it once more)"}]
+                  "description": "also save the viewer of the request's image: one more step "
+                                 "of the same job, which replays the command's recorded "
+                                 "inference (no second pass; only what the command did not ask, "
+                                 "e.g. segmentation for reconstruct -f ply, goes to the server)"}]
 _ERROR = {"$ref": "#/components/responses/Error"}
 _JOB = {"description": "the job", "content": {"application/json": {
     "schema": {"$ref": "#/components/schemas/Job"}}}}
@@ -88,11 +90,7 @@ def _fixed() -> Json:
     return {
         "/api/health": {"get": {"summary": "service and inference-server health",
                                 "responses": _ok("health")}},
-        "/api/operations": {"get": {"summary": "the commands' definitions (spec.describe())",
-                                    "responses": _ok("every operation as data")}},
         "/api/uploads": {
-            "get": {"summary": "uploads not yet consumed by a finished job",
-                    "responses": _ok("uploads")},
             "post": {"summary": "upload one input file (raw request body)",
                      "parameters": [{"name": "name", "in": "query", "required": True,
                                      "schema": {"type": "string"},
@@ -118,6 +116,14 @@ def _fixed() -> Json:
         "/api/jobs/{id}/viewer/{path}": {"get": {
             "summary": "the viewer a job saved (view.sh jobs, or ?viewer=true); also at "
                        "/viewer/job/{id}/",
+            "parameters": [*job_id, *path], "responses": _ok("viewer page or data", "*/*")}},
+        "/viewer/map/{name}/{path}": {"get": {
+            "summary": "the stable page URL of a map's viewer (the same routes as "
+                       "/api/maps/{name}/viewer/{path}); /viewer/map/{name} redirects to it",
+            "parameters": [*name, *path], "responses": _ok("viewer page or data", "*/*")}},
+        "/viewer/job/{id}/{path}": {"get": {
+            "summary": "the stable page URL of a job's saved viewer (the same routes as "
+                       "/api/jobs/{id}/viewer/{path}); /viewer/job/{id} redirects to it",
             "parameters": [*job_id, *path], "responses": _ok("viewer page or data", "*/*")}},
         "/api/jobs": {"get": {"summary": "every job, oldest first", "responses": _ok("jobs")}},
         "/api/jobs/events": {"get": {"summary": "server-sent events: every job change",
@@ -193,6 +199,9 @@ def document(ops: dict[str, Operation]) -> Json:
         }}
         paths[f"/api/ops/{op.id}/validate"] = {"post": {
             "operationId": f"{op.id}-validate", "summary": f"check a {d['id']} request",
+            "description": "The submission's checks, nothing queued; with ?viewer=true those of "
+                           "the request with its viewer step.",
+            "parameters": _VIEWER_PARAM if op.viewer_input is not None and not op.browser else [],
             "tags": [d["prog"]], "requestBody": _body(d),
             "responses": {"200": {"description": "the problems (empty: valid)"}},
         }}

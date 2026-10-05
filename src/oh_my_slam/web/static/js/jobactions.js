@@ -19,12 +19,14 @@ export async function cancelJob(job) {
   return postJson(`/api/jobs/${enc(job.id)}/cancel`);
 }
 
+const isUpload = (v) => String(v).startsWith('uploads/');
+
 // The path parameters of a job that named uploads (gone once the job ended).
 export function discardedUploads(job) {
   const op = store.ops.get(job.operation);
   if (!op || !TERMINAL.includes(job.state)) return [];
   return op.params.filter((p) => PATH_IN.includes(p.kind)
-    && [].concat(job.params[p.name] ?? []).some((v) => String(v).startsWith('uploads/')));
+    && [].concat(job.params[p.name] ?? []).some(isUpload));
 }
 
 // Re-submit with the same options; resolves to the new job, or null when the user cancelled.
@@ -34,8 +36,9 @@ export async function resubmitJob(job) {
   if (gone.length) {
     const values = await askFiles({
       title: `Re-submit job ${job.id}`,
-      body: 'The uploaded inputs of this job were deleted when it ended. Choose the files again (listed in their previous order); every other option stays as it was.',
-      params: gone.map((p) => ({ ...p, previous: [].concat(job.params[p.name]).map((v) => String(v).split('/').pop()) })),
+      body: 'The uploaded inputs of this job were deleted when it ended. Choose those files again (listed in their previous order); workspace paths and every other option stay as they were.',
+      // only the uploads are asked for; a workspace path keeps its place
+      params: gone.map((p) => ({ ...p, previous: [].concat(job.params[p.name]).map((v) => (isUpload(v) ? String(v).split('/').pop() : { path: String(v) })) })),
     });
     if (!values) return null;
     Object.assign(override, values);

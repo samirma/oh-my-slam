@@ -42,12 +42,10 @@ OUT_DIR = "out"  # the job's folder for everything the command writes
 VIEWER_DIR = "viewer"  # the job's saved viewer bundle
 INFERENCE_DIR = "inference"  # the command step's recorded inference
 VIEWER_MODULE = "oh_my_slam.cli.view_save"
-VIEWER_PROG = "view.sh"  # the viewer step reports its errors as view.sh does
+VIEWER_PROG = spec.viewer_program().prog  # the viewer step reports its errors as view.sh does
 VIEWER_KINDS = {Kind.IMAGE: "image", Kind.MAP: "map"}
 ENV_RECORD = "OH_MY_SLAM_INFERENCE_RECORD"  # client.replay
 ENV_REPLAY = "OH_MY_SLAM_INFERENCE_REPLAY"
-EXTENSIONS = {"json": ".json", "ply": ".ply", "png": ".png", "csv": ".csv", "markdown": ".md",
-              "html": ".html"}
 
 
 @dataclass(frozen=True)
@@ -217,7 +215,7 @@ def prepare(op: Operation, raw: Any, workspace: Any, job_dir: Path, viewer: bool
     prep.result_format = _result_format(op, actual)
     if file_out is not None:
         if actual.get(file_out.name) is None:
-            name = "result" + EXTENSIONS.get(prep.result_format or "", "")
+            name = "result" + spec.suffix_of(prep.result_format or "")
             actual[file_out.name] = str(out / name)
             shown[file_out.name] = name
         prep.result = Path(actual[file_out.name]).name

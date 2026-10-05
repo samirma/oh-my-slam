@@ -998,3 +998,33 @@ def test_keyboard_reaches_every_control_with_visible_focus(tab: Tab) -> None:
         assert info[2], f"no visible focus on {info}"
     assert "Choose an image…" in seen and any(s.startswith("Run ") for s in seen)
 
+
+
+def test_resubmit_asks_only_for_the_uploads(mapped: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
+    """A job whose inputs mix a workspace path and an upload: re-submitting asks for the upload
+    only; the workspace path keeps its place, in the previous order."""
+    import httpx
+
+    service, url = app
+    folder = service.workspace.root / "kept"
+    folder.mkdir(exist_ok=True)
+    shutil.copy(FRAMES[0], folder / FRAMES[0].name)
+    up = httpx.post(f"{url}api/uploads?name={FRAMES[1].name}", content=FRAMES[1].read_bytes(),
+                    headers={"content-type": "application/octet-stream"}).json()
+    r = httpx.post(f"{url}api/ops/mapper-locate",
+                   json={"inputs": [f"kept/{FRAMES[0].name}", up["path"]], "map": mapped["name"]})
+    assert r.status_code == 202, r.json()
+    jid = r.json()["id"]
+    service.runner.wait(jid, 300)
+    pg = tab.go(f"#/jobs/{jid}")
+    wait_job(pg)
+    jobs_before = len(service.runner.all_jobs())
+    pg.click("section.job button[data-action=resubmit]")
+    pg.locator("dialog#confirm[open]").wait_for()
+    items = pg.locator("dialog#confirm .files li").evaluate_all(
+        "els => els.map(e => [e.dataset.name, e.querySelector('.file-state').textContent])")
+    assert items == [[f"kept/{FRAMES[0].name}", "workspace path"],
+                     [FRAMES[1].name, "choose this file again"]]
+    pg.click("#confirm-no")
+    assert len(service.runner.all_jobs()) == jobs_before
+    assert tab.errors == []

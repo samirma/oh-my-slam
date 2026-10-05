@@ -137,15 +137,6 @@ class Workspace:
             raise NotFoundError(f"no upload {uid} (uploads are deleted when their job ends)")
         return Upload(uid, files[0].name, files[0], files[0].stat().st_size)
 
-    def list_uploads(self) -> list[Upload]:
-        out = []
-        for d in sorted(self.uploads.iterdir()) if self.uploads.is_dir() else []:
-            try:
-                out.append(self.upload(d.name))
-            except UsageError:
-                continue
-        return out
-
     def delete_upload(self, uid: str) -> None:
         shutil.rmtree(self.uploads / uid, ignore_errors=True)
 

@@ -76,8 +76,6 @@ SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
                         "multipart/form-data"})  # what a cross-site form sends without a preflight
 VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
 DISPLAY_DIR = "display"  # a job's PLY files as the viewer draws them (cloud documents)
-_MEDIA = {".json": "application/json", ".ply": "application/octet-stream", ".png": "image/png",
-          ".csv": "text/csv", ".md": "text/markdown", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
 VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
@@ -85,6 +83,12 @@ SCHEMA_FILE = Path(str(resources.files("oh_my_slam.schema") / "openlabel_json_sc
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
                  ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
                  ".txt": "text/plain"}
+
+
+def media_of_file(path: Path) -> str | None:
+    """A file's media type: the commands' own for their output formats (``commands.spec``),
+    else the standard guess (e.g. a map's keyframe JPEGs)."""
+    return spec.media_of_file(path) or mimetypes.guess_type(path.name)[0]
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -148,21 +152,40 @@ def _hostname(value: str) -> str:
 
 
 class _LRU:
+    """The ``size`` most recent viewer bundles. A bundle is built under its owner's lock (a map's
+    name, a job's id), so one map's build never waits for another's and a map is built once."""
+
     def __init__(self, size: int) -> None:
         self.size = size
         self.items: OrderedDict[Any, Any] = OrderedDict()
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # guards ``items`` and ``owners`` only (never held to build)
+        self.owners: dict[Any, threading.Lock] = {}
 
-    def get(self, key: Any, make: Callable[[], Any]) -> Any:
-        """The cached value of ``key``, else ``make()`` (built under the lock: one at a time)."""
+    def _cached(self, key: Any) -> tuple[bool, Any]:
         with self.lock:
             if key in self.items:
                 self.items.move_to_end(key)
-                return self.items[key]
+                return True, self.items[key]
+            return False, None
+
+    def get(self, key: Any, make: Callable[[], Any], owner: Any = None) -> Any:
+        """The cached value of ``key``, else ``make()``, built under the lock of ``owner``
+        (default: ``key``)."""
+        found, value = self._cached(key)
+        if found:
+            return value
+        with self.lock:
+            build_lock = self.owners.setdefault(key if owner is None else owner,
+                                                threading.Lock())
+        with build_lock:
+            found, value = self._cached(key)  # built meanwhile by another request
+            if found:
+                return value
             value = make()
-            self.items[key] = value
-            while len(self.items) > self.size:
-                self.items.popitem(last=False)
+            with self.lock:
+                self.items[key] = value
+                while len(self.items) > self.size:
+                    self.items.popitem(last=False)
             return value
 
 
@@ -220,8 +243,7 @@ class Service:
             "status": "ok",
             "service": {"version": __version__, "url": self.url, "pid": os.getpid(),
                         "workspace": self.workspace.root.name, "data": str(self.workspace.root),
-                        "started_at": self.started_at, "jobs": self.runner.counts(),
-                        "max_upload_bytes": self.max_upload_bytes},
+                        "started_at": self.started_at, "jobs": self.runner.counts()},
             "inference": self.inference_health(),
         }
 
@@ -268,7 +290,7 @@ class Service:
 
             return ViewerRoutes(map_bundle(root))
 
-        return self._map_views.get((name, stamp), make)
+        return self._map_views.get((name, stamp), make, owner=name)
 
     def job_routes(self, jid: str) -> Any:
         """The viewer's routes over the bundle a job saved (a map's: that map's routes)."""
@@ -435,9 +457,6 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
     async def openapi_doc(request: Request) -> Response:
         return JSONResponse(openapi.document(service.ops))
 
-    async def describe(request: Request) -> Response:
-        return JSONResponse(spec.describe())
-
     async def submit(request: Request) -> Response:
         op = op_of(request)
         params = await body_json(request)
@@ -489,9 +508,6 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             raise
         return JSONResponse(ws.upload(uid).describe(ws.root), 201)
 
-    async def uploads(request: Request) -> Response:
-        return JSONResponse([u.describe(ws.root) for u in ws.list_uploads()])
-
     async def delete_upload(request: Request) -> Response:
         uid = request.path_params["id"]
         ws.upload(uid)
@@ -512,7 +528,7 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
 
     async def map_file(request: Request) -> Response:
         p = ws.map_file(request.path_params["name"], request.path_params["path"])
-        return FileResponse(p, media_type=_MEDIA.get(p.suffix.lower()))
+        return FileResponse(p, media_type=media_of_file(p))
 
     # -- jobs --------------------------------------------------------------------------------------
 
@@ -530,7 +546,10 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         override = await body_json(request)
         if not isinstance(override, dict):
             return _error(400, "usage", "the request body must be a JSON object of parameters")
-        op = service.ops[old.operation]
+        op = service.ops.get(old.operation)
+        if op is None:  # the commands no longer offer it (a registry change since the job ran)
+            return _error(410, "gone", f"operation {old.operation} no longer exists; see "
+                          "/api/openapi.json for the current ones")
         params = {**old.params, **override}
         return await run_in_threadpool(service.submit, op, params, old.id,
                                        old.saves_viewer and not op.browser)
@@ -543,15 +562,15 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         for o in op.mode.outputs if op else ():
             if o.name == path.name:
                 return o.describe()["media_type"]
-        return _MEDIA.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
+        return media_of_file(path)
 
     async def result(request: Request) -> Response:
         j = runner.get(request.path_params["id"])
         if j.state != "succeeded" or j.result_name is None:
             return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
         p = out_dir(j.id) / j.result_name
-        media = media_of(j.id, p) if j.result_format is None else spec.Output(
-            "result", "stdout", j.result_format, "").describe()["media_type"]
+        media = media_of(j.id, p) if j.result_format is None else spec.media_type(
+            j.result_format)
         return FileResponse(p, media_type=media, filename=j.result_name)
 
     async def files(request: Request) -> Response:
@@ -667,11 +686,9 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         Route("/static/{path:path}", static),
         Route("/api/health", health),
         Route("/api/openapi.json", openapi_doc),
-        Route("/api/operations", describe),
         Route("/api/ops/{op}", submit, methods=["POST"]),
         Route("/api/ops/{op}/validate", validate, methods=["POST"]),
         Route("/api/uploads", upload, methods=["POST"]),
-        Route("/api/uploads", uploads, methods=["GET"]),
         Route("/api/uploads/{id}", delete_upload, methods=["DELETE"]),
         Route("/api/maps", maps),
         Route("/api/maps/{name}", map_detail),
