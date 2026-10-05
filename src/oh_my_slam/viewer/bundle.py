@@ -35,11 +35,13 @@ from oh_my_slam.core.cloud_attrs import (
 )
 from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.geometry import quat_to_rot, rotation_between
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
 
 Json = dict[str, Any]
+log = get_logger("oh_my_slam.viewer")
 
 # Spec §2.5 display budget: the page draws every point of a cloud of at most this many points. A
 # larger cloud is shown as a voxel-grid selection — one original point per occupied voxel of the
@@ -172,6 +174,13 @@ class ViewBundle:
         return DisplayCloud(thin.cloud, thin.total, thin.voxel, seconds,
                             owned_bytes(thin.cloud, self.source))
 
+    def prepare(self) -> None:
+        """Derive the default cloud once (its display selection is then kept by the source)."""
+        try:
+            self.cloud(CloudAttrs.defaults(self.scope))
+        except Exception as exc:  # the page's own request reports it
+            log.warning("viewer: preparing the default cloud failed: %s", exc)
+
     def meta(self) -> Json:
         return {
             "mode": self.mode,
@@ -290,7 +299,7 @@ def map_bundle(map_dir: Path) -> ViewBundle:
     reader = store.MapReader(Path(map_dir))
     _, objs = map_objects(reader)
     source = reader_source(reader, objs)
-    return ViewBundle(
+    bundle = ViewBundle(
         mode="map",
         title=reader.root.name,
         scene=json.loads(scene_bytes(reader)),
@@ -299,3 +308,8 @@ def map_bundle(map_dir: Path) -> ViewBundle:
         # keyframe images are copies (frames/fNNNNNN.jpg); name the input they came from
         camera_sources={r.name: Path(r.source).name for r in reader.frames if r.source},
     )
+    if len(source.xyz) > bundle.point_budget:
+        # a cloud above the display budget: find its selection while the browser starts, so that
+        # the page's first cloud request finds it ready (the request waits for it otherwise)
+        threading.Thread(target=bundle.prepare, name="display-selection", daemon=True).start()
+    return bundle

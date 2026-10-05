@@ -25,19 +25,42 @@ def keys(points: np.ndarray, edge: float) -> np.ndarray:
     return g.voxel_keys(points, edge)
 
 
-@pytest.mark.parametrize("budget", [1_000, 25_000, 59_000])
+@pytest.mark.parametrize("budget", [1_000, 25_000, 59_000, 59_990])
 def test_at_most_the_budget_with_the_smallest_edge(budget: int) -> None:
     pts = surface_cloud(60_000)
-    idx, edge = g.budget_voxel_indices(pts, budget)
-    assert edge > 0 and 0 < len(idx) <= budget
-    assert g._occupied(pts, edge) == len(idx)
-    # minimal to within the tolerance: some edge less than 1 % smaller does not fit (the count is
-    # not strictly monotonic at that scale: the grid's alignment moves it slightly), and a clearly
-    # finer grid never does
-    tol = g.BUDGET_EDGE_REL_TOL
-    assert any(g._occupied(pts, edge / (1 + tol) ** (k / 10)) > budget for k in range(1, 11))
-    assert g._occupied(pts, edge / 1.1) > budget
-    assert g.budget_voxel_edge(pts, budget) == edge
+    grid, idx = g.budget_voxel_grid(pts, budget)
+    assert grid.edge > 0 and len(idx) == grid.count == g._occupied(pts, grid.edge)
+    # the guarantee: never more than the budget, and within the count tolerance of it
+    assert budget * (1 - g.BUDGET_COUNT_TOL) <= len(idx) <= budget
+    assert len(idx) >= 0.97 * budget
+    # the bracket: a counted finer edge, when the search counted one, did not fit
+    if grid.finer is not None:
+        assert grid.finer < grid.edge and grid.finer_count == g._occupied(pts, grid.finer) > budget
+    # the edge found once gives the same selection without a search (the per-source cache)
+    again, edge = g.budget_voxel_indices(pts, budget, grid.edge)
+    assert edge == grid.edge and np.array_equal(again, idx)
+
+
+def test_the_budget_holds_for_any_layout() -> None:
+    """Points packed far below a far outlier's scale: never more than the budget."""
+    rng = np.random.default_rng(0)
+    tiny = np.r_[rng.uniform(0, 1e-10, (200, 3)), [[100.0, 0.0, 0.0]]]
+    grid, idx = g.budget_voxel_grid(tiny, 50)
+    assert 0 < len(idx) <= 50 and grid.edge > 0
+    far = np.r_[rng.uniform(0, 1, (1000, 3)), [[1e12, 0.0, 0.0]]]
+    grid, idx = g.budget_voxel_grid(far, 100)
+    assert 0 < len(idx) <= 100 and 1000 in idx  # the outlier keeps its own voxel
+
+
+def test_non_finite_points_are_never_selected() -> None:
+    pts = surface_cloud(5_000).astype(np.float64)
+    pts[[3, 70]] = np.nan
+    pts[99, 1] = np.inf
+    grid, idx = g.budget_voxel_grid(pts, 1_000)  # terminates (a NaN extent once looped forever)
+    assert 0 < len(idx) <= 1_000 and not {3, 70, 99} & set(idx.tolist())
+    assert np.isfinite(pts[idx]).all()
+    idx, edge = g.budget_voxel_indices(pts[:1_001], 1_000)  # 998 finite points: all of them
+    assert edge == 0.0 and len(idx) == 998 and not {3, 70, 99} & set(idx.tolist())
 
 
 def test_one_original_point_per_occupied_voxel_the_first() -> None:
@@ -88,5 +111,7 @@ def test_no_thinning_needed() -> None:
     dup = np.repeat(pts[:8], 5, axis=0)  # 40 points at 8 places, budget 10: one per place
     idx, edge = g.budget_voxel_indices(dup, 10)
     assert edge == 0.0 and idx.tolist() == [5 * k for k in range(8)]
+    idx, edge = g.budget_voxel_indices(np.repeat(pts[:200], 2, axis=0), 50)  # 200 places > 50
+    assert edge > 0 and 0 < len(idx) <= 50
     with pytest.raises(ValueError, match="at least 1"):
         g.budget_voxel_indices(pts, 0)

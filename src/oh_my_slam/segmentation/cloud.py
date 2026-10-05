@@ -26,7 +26,7 @@ and label arrays through read-only views instead of copying them.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +55,24 @@ IMAGE_FRAME = "oh-my-slam camera frame (OpenCV axes: x right, y down, z forward)
 MAP_FRAME = "oh-my-slam map frame (z up), metres"
 
 
+@dataclass(eq=False)
+class DisplaySelections:
+    """A source's display selections (``derive_thinned``), by what decides the positions and the
+    budget: the voxel edge of each one found (a few bytes; it saves the search when a control comes
+    back), and the indices of the latest only (they can be 100 MB)."""
+
+    edges: dict[Any, float] = field(default_factory=dict)
+    latest: tuple[Any, NDArray[np.int64]] | None = None
+
+    def indices(self, key: Any, xyz: NDArray[Any], max_points: int) -> tuple[NDArray[np.int64], float]:
+        if self.latest is not None and self.latest[0] == key:
+            return self.latest[1], self.edges[key]
+        self.latest = None  # free the old indices first
+        keep, edge = budget_voxel_indices(xyz, max_points, self.edges.get(key))
+        self.edges[key], self.latest = edge, (key, keep)
+        return keep, edge
+
+
 @dataclass(frozen=True, eq=False)
 class ImageCloudSource:
     """One image on its depth grid; points are in the camera frame (OpenCV axes, metres)."""
@@ -72,9 +90,9 @@ class ImageCloudSource:
         return depth_normals(self.depth, self.K, self.valid)
 
     @cached_property
-    def selections(self) -> dict[Any, tuple[NDArray[np.int64], float]]:
-        """The latest display selection (``derive_thinned``), by what decides the positions."""
-        return {}
+    def selections(self) -> DisplaySelections:
+        """Display selections found so far (``derive_thinned``)."""
+        return DisplaySelections()
 
 
 @dataclass(frozen=True, eq=False)
@@ -92,9 +110,9 @@ class MapCloudSource:
         return PointNormals(self.xyz, self.viewpoints)
 
     @cached_property
-    def selections(self) -> dict[Any, tuple[NDArray[np.int64], float]]:
-        """The latest display selection (``derive_thinned``), by what decides the positions."""
-        return {}
+    def selections(self) -> DisplaySelections:
+        """Display selections found so far (``derive_thinned``)."""
+        return DisplaySelections()
 
 
 CloudSource = ImageCloudSource | MapCloudSource
@@ -151,8 +169,8 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     occupied voxel of the smallest edge whose grid has at most ``max_points`` of them
     (``budget_voxel_indices``; deterministic, kept in derivation order). Colours are those of the
     whole cloud (the height ramp's range included); normals are computed for the kept points
-    only. The selection depends on the positions only, so it is kept per source and reused while
-    only colour or normals change."""
+    only. The selection depends on the positions only: its edge is kept per source and attributes,
+    and its indices are reused while only colour or normals change."""
     if (attrs.color == "segment" or attrs.label) and source.labels is None:
         raise ValueError("color=segment and label=on need a segmented source")
     # xyz[i] is the point of source row rows[i] (a flat pixel index, or a map point index);
@@ -190,10 +208,7 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     total, edge = len(xyz), 0.0
     if max_points is not None and total > max_points:
         key = (_position_key(attrs), max_points)
-        if key not in source.selections:
-            source.selections.clear()  # one selection kept: its indices can be 100 MB
-            source.selections[key] = budget_voxel_indices(xyz, max_points)
-        keep, edge = source.selections[key]
+        keep, edge = source.selections.indices(key, xyz, max_points)
         if len(keep) < total:
             xyz = xyz[keep]
             rows = keep if rows is None else rows[keep]

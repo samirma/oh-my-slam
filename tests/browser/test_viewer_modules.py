@@ -186,7 +186,9 @@ def test_ply_parser_refuses_what_it_cannot_draw(mounted: View) -> None:
            "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nend_header\n1\n": "no x y z",
            "ply\nformat ascii 1.0\nelement face 1\nend_header\n": "first PLY element",
            "ply\nformat ascii 1.0\nelement vertex 2\nproperty float x\nproperty float y\n"
-           "property float z\nend_header\n1 2 3\n": "1 vertices, not 2"}
+           "property float z\nend_header\n1 2 3\n": "1 vertices, not 2",
+           "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\n"
+           "property float z\nend_header\n1 two 3\n": '"two" is not a number'}
     for text, message in bad.items():
         err = module(v, "ply.js", "try { m.parsePly(new TextEncoder().encode(arg).buffer); return null; }"
                      " catch (e) { return e.message; }", text)
@@ -200,7 +202,9 @@ def test_scene_cameras_mirror_the_server(mounted: View) -> None:
     single = ol.document(ol.metadata("x"), {}, coordinate_systems={"camera": ol.sensor_cs()},
                          streams={"camera": ol.camera_stream(K)},
                          frames={"0": ol.frame(0.0, stream_uris={"camera": "dir/x.jpg"})})
-    for doc in (scene_doc(), single):
+    odd = scene_doc()  # present-but-null values, as Python's dict.get reads them
+    odd["openlabel"]["frames"]["0"]["frame_properties"]["keyframe"] = None
+    for doc in (scene_doc(), single, odd):
         js = module(v, "cameras.js", "return m.sceneCameras(arg);", doc)
         py = scene_cameras(doc)
         assert len(js) == len(py) > 0

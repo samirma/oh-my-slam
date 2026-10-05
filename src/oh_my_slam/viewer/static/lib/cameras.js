@@ -50,10 +50,12 @@ export function sceneCameras(doc) {
     for (const [name, stream] of Object.entries(props.streams || {})) {
       const pin = ((streams[name] || {}).stream_properties || {}).intrinsics_pinhole;
       if (!pin) continue;
+      // as Python's dict.get: a key that is present keeps its value, even null
       let transform = null;
+      const system = systems[name] || {};
       if (bySrc[name]) transform = bySrc[name].transform_src_to_dst;
-      else if (((systems[name] || {}).parent ?? '') !== '') continue;
-      out.push(camera(props.keyframe ?? name, Number(fid), transform, pin, {
+      else if (('parent' in system ? system.parent : '') !== '') continue;
+      out.push(camera('keyframe' in props ? props.keyframe : name, Number(fid), transform, pin, {
         update: props.update_id ?? null, source: baseName(stream.uri), located: props.located === true,
       }));
     }

@@ -153,7 +153,10 @@ def parse_cloud_payload(body: bytes) -> tuple[dict[str, Any], dict[str, np.ndarr
 def static_file(rel: str) -> Response:
     """A file of the page's ``static`` folder (scripts, styles, vendored libraries); 404 for
     anything outside it."""
-    target = (STATIC / Path(rel)).resolve()
+    try:
+        target = (STATIC / Path(rel)).resolve()
+    except (ValueError, OSError):  # e.g. an embedded NUL byte
+        return _text(404, b"not found")
     if STATIC.resolve() not in target.parents or not target.is_file():
         return _text(404, b"not found")
     ctype = _TYPES.get(target.suffix) or mimetypes.guess_type(target.name)[0] \
@@ -198,7 +201,8 @@ class ViewerRoutes:
         with ``/``) and may still be percent-encoded. A HEAD answer has the headers of the GET
         one; the caller leaves its body out."""
         if method not in ("GET", "HEAD"):
-            return _text(405, b"read-only")
+            r = _text(405, b"read-only")
+            return Response(r.status, (*r.headers, ("Allow", "GET, HEAD")), r.body)
         path = unquote(path)
         try:
             if path in ("/", "/index.html"):

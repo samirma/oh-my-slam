@@ -273,17 +273,28 @@ The viewer contains no geometry, segmentation or colour logic of its own:
 * **Display budget (§2.5).** The page draws every point of a cloud of at most 16,000,000 points
   (`DISPLAY_POINT_BUDGET` in `viewer/bundle.py`). Above that it draws a voxel-grid selection: the
   first point (in derivation order) of each occupied voxel, for the smallest voxel edge whose grid
-  has at most 16,000,000 occupied voxels. The edge is found to within 1 % by Brent's method on the
-  occupancy count (`core.geometry.budget_voxel_indices`). Points are selected, never averaged, so
-  each keeps its own position, colour, normal and object id, and the segmentation layer draws the
-  same subset. Under the point-cloud controls the page then says "Showing X of Y points: one per
-  voxel of E edge". The selection belongs to the shared derivation
-  (`segmentation.cloud.derive_thinned`), which computes normals only for the selected points and
-  reuses the selection while only `color` or `normals` change. PLY outputs and the map are never
-  thinned. On the 16.15-million-point `street2` map, measured in headless Edge (ANGLE Metal) on
-  the M4 Max, the selection keeps 15,999,816 points, one per 0.67 mm voxel. The first `/api/cloud`
-  takes 7.7 s, almost all of it the edge search; a repeated request is served from the cache. The
-  view orbits at 55 frames per second.
+  has at most 16,000,000 occupied voxels. The search (`core.geometry.budget_voxel_grid`) counts
+  the occupied voxels of one edge per step. Its steps are secants of logit(count / points) against
+  log(edge), kept inside the counted bracket. It stops at the first counted edge that keeps
+  between 99.75 % and 100 % of the budget, and it never returns more than the budget. Points
+  with a non-finite coordinate are never selected. Points at no more distinct places than the
+  budget keep one point per place.
+  Points are selected, never averaged, so each keeps its own position, colour, normal and object
+  id, and the segmentation layer draws the same subset. Under the point-cloud controls the page
+  then says "Showing X of Y points: one per voxel of E edge".
+  The selection belongs to the shared derivation (`segmentation.cloud.derive_thinned`). It
+  computes normals only for the selected points. It keeps the edge found for each set of
+  position attributes, and the latest selection's indices, so a colour or normals change reuses
+  them. PLY outputs and the map are never thinned.
+* **Cost of the budget.** Measured on the 16.15-million-point `street2` map on the M4 Max:
+  * The edge search plus the selection takes 2.0 s (4 counts). The selection keeps 15,980,584
+    points, one per 0.76 mm voxel.
+  * A later request with the same position attributes costs 0.2 to 0.7 s (colours included). A
+    known edge without its indices costs 0.8 s.
+  * `view.sh -m` starts this work in a background thread when it opens a map above the budget,
+    so the page's first `/api/cloud` arrives 2.4 s after the map was opened, not 2.4 s after the
+    request.
+  * In headless Edge (ANGLE Metal) the view orbits at 55 frames per second.
 * `encoding` and `label` concern PLY files only and have no control.
 
 The page draws a frame only when something visible changes: the viewpoint, a layer, a control,
@@ -1103,6 +1114,10 @@ runs it end to end as a test.
 
 ## Known limitations
 
+* **Files opened from disk in the future 3D scene viewer are not budgeted yet.** `static/lib/ply.js`
+  draws every point of a PLY read in the browser. Applying the §2.5 display budget there would
+  mean porting the selection, which segmentation's derivation owns, to JavaScript. This will be
+  decided when `server.sh`'s scene viewer is built.
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the
   mislabelled instances shows that the detector itself prefers the wrong label. A kettle scores

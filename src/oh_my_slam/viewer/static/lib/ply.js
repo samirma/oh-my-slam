@@ -99,7 +99,12 @@ export function parsePly(buffer) {
       if (v.length < h.props.length) throw new Error(`PLY vertex ${i} has ${v.length} values, not ${h.props.length}`);
       for (let j = 0; j < h.props.length; j++) {
         const s = sinks[j];
-        if (s) s[0][i * s[2] + s[1]] = Number(v[j]);
+        if (!s) continue;
+        const x = Number(v[j]);
+        if (Number.isNaN(x) && !/^[-+]?nan$/i.test(v[j])) {
+          throw new Error(`PLY vertex ${i}: "${v[j]}" is not a number (property ${h.props[j].name})`);
+        }
+        s[0][i * s[2] + s[1]] = x;
       }
       i++;
     }

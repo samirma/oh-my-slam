@@ -173,7 +173,9 @@ def test_routes_are_framework_neutral_and_relative() -> None:
     assert routes.handle("GET", "/api/cloud", "color=purple").status == 400
     assert routes.handle("HEAD", "/static/lib/viewer.js").status == 200
     assert routes.handle("GET", "/static/%2e%2e/server.py").status == 404
-    assert routes.handle("POST", "/api/meta").status == 405
+    assert routes.handle("GET", "/static/%00x").status == 404
+    r = routes.handle("POST", "/api/meta")
+    assert r.status == 405 and dict(r.headers)["Allow"] == "GET, HEAD"
     page = routes.handle("GET", "/").tobytes().decode()
     assert '"/' not in page and "'/" not in page  # relative URLs only: mountable under a prefix
     from oh_my_slam.viewer.routes import STATIC

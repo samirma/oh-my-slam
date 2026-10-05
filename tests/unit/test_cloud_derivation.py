@@ -289,9 +289,11 @@ def test_derive_thinned_is_a_subset_of_derive_cloud(room_map: MapCloudSource) ->
         assert len(t.cloud) == len(keep) <= 7_000
         for name in ("xyz", "rgb", "label", "normals"):
             np.testing.assert_array_equal(getattr(t.cloud, name), getattr(full, name)[keep])
-        (key,) = src.selections
+        (key,) = src.selections.edges
+        latest = src.selections.latest
         again = derive_thinned(src, replace(attrs, color="rgb", normals=False), 7_000)
-        assert list(src.selections) == [key]  # the same selection: positions did not change
+        assert list(src.selections.edges) == [key]  # the same selection: positions did not change
+        assert src.selections.latest is latest
         np.testing.assert_array_equal(again.cloud.xyz, t.cloud.xyz)
     t = derive_thinned(room_map, CloudAttrs(), None)
     assert (t.total, t.voxel, len(t.cloud)) == (len(room_map.xyz), 0.0, len(room_map.xyz))
