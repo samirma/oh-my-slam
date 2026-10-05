@@ -13,7 +13,6 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
@@ -247,10 +246,9 @@ def test_a_saved_image_bundle_serves_the_same_viewer(tmp_path: Path) -> None:
                   "min-depth=0.5&max-depth=3&edge=0", "color=none"):
         ra, rb = a.handle("GET", "/api/cloud", query), b.handle("GET", "/api/cloud", query)
         assert ra.status == rb.status == 200, query
-        (ha, xa), (hb, xb) = (parse_cloud_payload(r.tobytes()) for r in (ra, rb))
-        ha.pop("seconds"), hb.pop("seconds")
-        assert ha == hb, query
-        assert xa.keys() == xb.keys() and all(np.array_equal(xa[k], xb[k]) for k in xa), query
+        assert ra.tobytes() == rb.tobytes(), query  # no timing in the document: byte-identical
+        (_, xa) = parse_cloud_payload(ra.tobytes())
+        assert xa["position"].size > 0, query
 
 
 @pytest.mark.parametrize("attrs", [None, "color=height,voxel=0.02"])
