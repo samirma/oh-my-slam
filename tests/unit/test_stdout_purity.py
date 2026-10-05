@@ -248,3 +248,24 @@ def test_help_goes_to_stderr() -> None:
         res = sh(script, *args)
         assert res.returncode == 0, (script, res.stderr)
         assert res.stdout == b"" and b"usage:" in res.stderr, script
+
+
+def test_an_undecodable_image_is_an_input_error(stub_server: None, tmp_path: Path) -> None:
+    """A file with an image suffix that is not an image is an input error naming it (exit 2), not
+    an internal error, for every command that reads images."""
+    from oh_my_slam.mapping.api import update
+    from tests.fakes.client import FakeClient
+    from tests.synth.mapping import add_frames, mapping_room, ring
+
+    bad = tmp_path / "bad.jpg"
+    bad.write_text("not an image")
+    client = FakeClient()
+    keys = add_frames(client, mapping_room(), ring(1), tmp_path / "k", "k")
+    update(tmp_path / "map", keys, client=client, progress=lambda m: None)
+    for script, *args in (("reconstruct.sh", "-i", str(bad)),
+                          ("segment.sh", "-i", str(bad)),
+                          ("mapper.sh", "update", "-i", str(bad), "-m", str(tmp_path / "new")),
+                          ("mapper.sh", "locate", "-i", str(bad), "-m", str(tmp_path / "map"))):
+        res = sh(script, *args)
+        assert res.returncode == 2 and res.stdout == b"", (script, res.stderr.decode())
+        assert f"cannot read image {bad}".encode() in res.stderr, (script, res.stderr.decode())

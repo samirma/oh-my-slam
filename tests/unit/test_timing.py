@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -89,7 +91,17 @@ def test_report_logs_one_line_and_writes_the_env_file(tmp_path: Path,
 
 def test_peak_memory_per_stage_and_the_stage_windows() -> None:
     """Each stage's peak resident set comes from the sampler (and the boundary readings); peaks
-    include nested stages; every stage has its wall-clock window after ``t0_unix``."""
+    include nested stages; every stage has its wall-clock window after ``t0_unix``. Run in a fresh
+    process: after earlier tests the process keeps freed pages resident and reuses them, so the
+    200 MB of the "big" stage would not show in its resident set."""
+    repo = Path(__file__).resolve().parents[2]
+    res = subprocess.run([sys.executable, "-c", "from tests.unit.test_timing import "
+                          "check_peak_memory_per_stage; check_peak_memory_per_stage()"],
+                         cwd=repo, capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+
+
+def check_peak_memory_per_stage() -> None:
     t_start = time.time()
     with timing.collect(sample_every=0.01) as t:
         with timing.stage("small"):

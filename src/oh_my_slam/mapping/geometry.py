@@ -1312,7 +1312,7 @@ class SurfaceQuery:
 def fuse_map(ctx: Any, records: list[store.FrameRecord]) -> FusedCloud:
     """The fused surface of the map's confident keyframes (timed as the stage ``cloud``)."""
     t0 = time.perf_counter()
-    with timing.stage("cloud"):
+    with timing.stage(timing.Stage.CLOUD):
         st = _setup(ctx, records)
         confident = st.confident
         xyz = fused_cloud_points(confident, st.voxel, st.depth_max, st.vacated, st.frames)
@@ -1329,7 +1329,7 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
     tx = ctx.tx
     fused = fused if fused is not None else fuse_map(ctx, records)
     t0 = time.perf_counter()
-    with timing.stage("cloud"):
+    with timing.stage(timing.Stage.CLOUD):
         for fd in fused.frames:
             fd.labels = _frame_labels(ctx, fd.rec, fd.depth.shape, objs)
         xyz = fused.xyz

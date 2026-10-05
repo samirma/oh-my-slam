@@ -32,9 +32,9 @@ from numpy.typing import NDArray
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient, connect
 from oh_my_slam.core import rle, timing
+from oh_my_slam.core.constants import DEFAULT_MIN_SCORE as DEFAULT_MIN_SCORE
 from oh_my_slam.core.images import size_at_max_side, upright_size
 
-DEFAULT_MIN_SCORE = 0.5
 # Score floor requested from the server, and so the lowest accepted --min-score (the spec sets no
 # bound). Lowering it never changes an object at or above TRUSTED_SCORE: detections are ordered
 # and de-duplicated by score first, those below TRUSTED_SCORE claim only pixels no trusted one

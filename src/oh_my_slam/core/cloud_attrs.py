@@ -117,31 +117,39 @@ class AttrSpec:
     pixel_level: bool  # applies before unprojection, so single images only
     parse: Callable[[str], Any]  # raises ValueError on a bad value
     format: Callable[[Any], str]
+    schema: Mapping[str, Any]  # the accepted values as data (type, choices, bounds) for the API
 
+
+ON_OFF = ["on", "off"]
 
 ATTRIBUTES: tuple[AttrSpec, ...] = (
     AttrSpec("color", "color", "rgb|segment|height|none", "rgb|segment|height|none",
              "per-point colour: image colour, object colour, height ramp, or no colour",
-             False, _choice(COLOR_MODES), str),
+             False, _choice(COLOR_MODES), str, {"type": "enum", "choices": list(COLOR_MODES)}),
     AttrSpec("stride", "stride", "N", "an integer >= 1",
-             "keep every n-th pixel along each image axis", True, _stride, str),
+             "keep every n-th pixel along each image axis", True, _stride, str,
+             {"type": "integer", "minimum": 1}),
     AttrSpec("min-depth", "min_depth", "METRES", "metres >= 0",
-             "drop pixels closer than this depth", True, _metres(0.0), _num),
+             "drop pixels closer than this depth", True, _metres(0.0), _num,
+             {"type": "number", "minimum": 0, "finite": True, "less_than": "max-depth"}),
     AttrSpec("max-depth", "max_depth", "METRES|inf", "metres > 0 (or inf)",
              "drop pixels farther than this depth", True,
-             _metres(0.0, allow_inf=True, strict=True), _num),
+             _metres(0.0, allow_inf=True, strict=True), _num,
+             {"type": "number", "exclusive_minimum": 0, "finite": False}),
     AttrSpec("edge", "edge", "JUMP", "a relative depth jump >= 0",
-             "drop flying pixels on depth discontinuities (0 disables)", True, _metres(0.0), _num),
+             "drop flying pixels on depth discontinuities (0 disables)", True, _metres(0.0), _num,
+             {"type": "number", "minimum": 0, "finite": True}),
     AttrSpec("voxel", "voxel", "METRES", "metres >= 0",
              "keep one point per voxel of this size (0 = off; colours are not averaged)",
-             False, _metres(0.0), _num),
+             False, _metres(0.0), _num, {"type": "number", "minimum": 0, "finite": True}),
     AttrSpec("normals", "normals", "on|off", "on|off", "add nx ny nz float properties",
-             False, _on_off, lambda b: "on" if b else "off"),
+             False, _on_off, lambda b: "on" if b else "off", {"type": "enum", "choices": ON_OFF}),
     AttrSpec("label", "label", "on|off", "on|off",
              "add an int label property (object id, 0 = unsegmented)",
-             False, _on_off, lambda b: "on" if b else "off"),
+             False, _on_off, lambda b: "on" if b else "off", {"type": "enum", "choices": ON_OFF}),
     AttrSpec("encoding", "encoding", "binary|ascii", "binary|ascii",
-             "binary_little_endian 1.0 or ASCII PLY", False, _choice(ENCODINGS), str),
+             "binary_little_endian 1.0 or ASCII PLY", False, _choice(ENCODINGS), str,
+             {"type": "enum", "choices": list(ENCODINGS)}),
 )
 _BY_KEY = {a.key: a for a in ATTRIBUTES}
 

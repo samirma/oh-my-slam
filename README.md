@@ -402,7 +402,13 @@ The same source and attributes always give byte-identical files.
 | 4 | `-m` folder is not empty and not a map (`mapper.sh`), or is not a map (`segment.sh -m`, `view.sh -m`). |
 | 5 | Nothing could be registered, for example because the new images do not overlap the map. The map is unchanged. |
 | 6 | Another `mapper.sh update` holds the map lock. |
-| 130 | Interrupted (Ctrl-C). `view.sh` treats Ctrl-C and SIGTERM as its normal stop and exits 0, also when it was started as a shell background job. |
+| 130 | Interrupted (Ctrl-C; a cancelled job). `view.sh` treats Ctrl-C and SIGTERM as its normal stop and exits 0, also when it was started as a shell background job. |
+
+For the web service (spec §2.6), `core/errors.py` maps each exit code to a machine-readable code
+(its lower-case name, e.g. `not_a_map`), an HTTP status by one rule (`HTTP_STATUS`: 2 → 400, 4
+and 5 → 422, 6 → 409, 3 → 503, 130 → 499, 1 and anything else → 500) and a job state
+(`job_state()`: 0 → `succeeded`; 130, or a process stopped by SIGINT or SIGTERM → `cancelled`;
+any other → `failed`).
 
 ## Coordinate conventions
 
@@ -1044,8 +1050,22 @@ at the Python-module level:
   through `reconstruction` and `segmentation`.
 * `viewer` only serves data.
 * `server` owns the models and nothing else.
-* The layers run `cli` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` >
-  `client` > `schema` > `core`.
+* The layers run `cli` | `web` (independent siblings; `web` is the coming web service) >
+  `commands` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` > `client` >
+  `schema` > `core`.
+* `commands/spec.py` is the commands' single source of truth (spec §2.6): every mode, option
+  (flag, kind, choices, default, accepted files, bounds, help, applicability), validation rule,
+  output and timing stage of `reconstruct.sh`, `mapper.sh update` / `locate`, `segment.sh -i` /
+  `-m` and `view.sh -i` / `-m` is declared there once. Each command builds its argparse parser
+  (`spec.build_parser`) and runs its checks (`spec.validate`: each rule's pure check, then its
+  preparation such as creating `-d`, in order, before any work) from it. For the web service,
+  `spec.parse` turns API parameters into the command's arguments through the same parser (an
+  argument error names its parameters), `spec.dry_run` reports argparse's and every rule's
+  problems per parameter without touching the filesystem, and
+  `spec.describe()` exports everything as JSON-serialisable data. Stage names are
+  `core.timing.Stage`; shared defaults and input suffixes are in `core/constants.py`.
+* The web service runs each job as a subprocess (`python -m oh_my_slam.cli.<command>`) with
+  `OH_MY_SLAM_PROGRESS` set, never in its own process.
 
 ## Benchmark evaluator
 
@@ -1207,6 +1227,7 @@ Environment variables:
 | Variable | Effect |
 |---|---|
 | `OH_MY_SLAM_TIMINGS=path.json` | Writes the full per-stage timing record of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` there: stage times, per-stage peak resident set and stage time windows (the evaluator's per-stage figures, spec §5). Each map update also keeps its record in `map.json → updates[].timings`. |
+| `OH_MY_SLAM_PROGRESS=path` | Appends one JSON line per live progress event of `reconstruct.sh`, `segment.sh` or `mapper.sh update` / `locate` to that path (`/dev/fd/<n>` reaches a pipe): `begin`, `stage_start` / `stage_end` (stage names of `core.timing.Stage`), `count` (sizes such as `keyframes_sampled`), `part`, `progress` (`done` of `total` items of the running stage) and `finish` (with the outcome: `ok`, `exit_code` and its `code`). stdout and the stderr text are unchanged. This is how the web service follows the jobs it runs as subprocesses. |
 | `OH_MY_SLAM_RUNTIME_DIR` | Replaces `~/Library/Caches/oh-my-slam` (socket, log, state, scratch): the test suite runs its stub server there, beside a running real one. |
 | `OH_MY_SLAM_TEST_REAL_SERVER=1` | Lets the `models` and `eval` tests use the running real server. |
 

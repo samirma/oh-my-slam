@@ -19,13 +19,16 @@ import re
 import signal
 import sys
 import webbrowser
-from pathlib import Path
 
 from oh_my_slam.cli.common import ArgumentParser, run_main
-from oh_my_slam.core.errors import InputError
+from oh_my_slam.commands import spec
+from oh_my_slam.core import timing
 from oh_my_slam.core.log import claim_stdout, get_logger
+from oh_my_slam.core.timing import Stage
 
-PROG = "view.sh"
+PROGRAM = spec.VIEW
+COMMAND = PROGRAM.command()
+PROG = PROGRAM.prog
 URL_LINE = re.compile(r"^view\.sh: listening on (http://127\.0\.0\.1:\d+/)$")
 log = get_logger("oh_my_slam.cli.view")
 
@@ -43,28 +46,26 @@ def _install_stop_handlers() -> None:
 
 
 def build_parser() -> ArgumentParser:
-    ap = ArgumentParser(prog=PROG, description="Browser visualisation of an image or a map.")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("-i", dest="image", type=Path, help="RGB image to reconstruct and segment")
-    src.add_argument("-m", dest="map", type=Path, help="map folder (opened read-only)")
-    ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
-    return ap
+    return spec.build_parser(PROGRAM)
 
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
+    spec.validate(COMMAND, args, log.warning)  # -i exists or -m is a map, before any work
     claim_stdout()  # nothing goes to stdout; the URL is printed on stderr
     from oh_my_slam.viewer.bundle import image_bundle, map_bundle
     from oh_my_slam.viewer.server import serve, url_of
 
     if args.image is not None:
-        if not args.image.is_file():
-            raise InputError(f"image not found: {args.image}")
         from oh_my_slam.reconstruction.api import connect_server
 
-        client = connect_server()  # exit 3 with the hint when the server is down
-        log.info("reconstructing and segmenting %s …", args.image.name)
-        bundle = image_bundle(args.image, client)
+        # timed as view.sh -i's stages (progress events only: no summary line, stderr unchanged)
+        with timing.collect():
+            with timing.stage(Stage.CONNECT):
+                client = connect_server()  # exit 3 with the hint when the server is down
+            log.info("reconstructing and segmenting %s …", args.image.name)
+            with timing.stage(Stage.INFERENCE):
+                bundle = image_bundle(args.image, client)
     else:
         bundle = map_bundle(args.map)
     _install_stop_handlers()

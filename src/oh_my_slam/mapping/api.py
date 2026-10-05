@@ -30,6 +30,8 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
+from oh_my_slam.core.constants import RETRIEVAL_TOP_K as RETRIEVAL_TOP_K
+from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX as UPDATE_EXHAUSTIVE_MAX
 from oh_my_slam.core.errors import RegistrationError
 from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
@@ -67,8 +69,6 @@ SEQ_OVERLAP = 12
 LOOP_TOP_K = 10
 LOOP_MIN_GAP = 30
 PHOTO_EXHAUSTIVE_MAX = 200
-UPDATE_EXHAUSTIVE_MAX = 150
-RETRIEVAL_TOP_K = 30
 MV_CHUNK = 24  # gate G6
 MV_ANCHORS = 4
 REJECT_SCALE = (0.5, 2.0)
@@ -134,16 +134,18 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
     try:
         written: list[ingest.Keyframe] = []
         futures: list[Future[NewFrame]] = []
-        with timing.stage("ingest"):
+        with timing.stage(timing.Stage.INGEST):
             for kf in kfs:
                 written.append(kf)
                 futures.append(pool.submit(one, kf))
         progress(f"{len(futures)} keyframes from {kind}")
         if ingested is not None:
             ingested(written)
-        with timing.stage("inference"):
+        with timing.stage(timing.Stage.INFERENCE):
+            timing.progress(0, len(futures))  # spec §2.6 Jobs: progress where the size is known
             for i, fut in enumerate(futures, start=1):
                 out.append(fut.result())
+                timing.progress(i, len(futures))
                 if i % 10 == 0 or i == len(futures):
                     progress(f"inference {i}/{len(futures)} keyframes "
                              f"({time.perf_counter() - t0:.0f} s)")
@@ -432,7 +434,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     names.update({f.index: Path(f.image).name for f in ctx.old_frames})
     prior = _camera_prior(ctx.new, ctx.old_frames)
     t0 = time.perf_counter()
-    with timing.stage("features_matching"):
+    with timing.stage(timing.Stage.FEATURES_MATCHING):
         if ctx.features is not None:
             ctx.features.finish(prior)
         else:
@@ -526,7 +528,7 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
 
     new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
     old = {Path(f.image).name: f for f in ctx.old_frames}
-    with timing.stage("pose_refinement"):
+    with timing.stage(timing.Stage.POSE_REFINEMENT):
         pairs = panorama.verified_matches(sfm.db, (set(poses) & set(new)) | set(old))
         linked = {n for p in pairs if p.a in free or p.b in free for n in (p.a, p.b)}
         K = (_keyframe_intrinsics(ctx, sfm, linked & set(new)) if model is None
@@ -1652,12 +1654,12 @@ def integrate(ctx: UpdateContext, progress: Progress
         keyframe_depth_cuts,
     )
 
-    with timing.stage("persist_frames"):
+    with timing.stage(timing.Stage.PERSIST_FRAMES):
         _stage_frames(ctx)
         records = _frames_json(ctx)
-    with timing.stage("validity"):
+    with timing.stage(timing.Stage.VALIDITY):
         validity.apply_latest_wins(ctx, records, progress)
-    with timing.stage("objects"):
+    with timing.stage(timing.Stage.OBJECTS):
         # the objects test surface continuity on the fused surface, fused where they ask for it
         # (as the keyframes are before the objects' latest wins retire pixels)
         surface = SurfaceQuery(ctx, records)
@@ -1670,7 +1672,7 @@ def integrate(ctx: UpdateContext, progress: Progress
     # places are drawn from the keyframes that saw through them)
     fused = fuse_map(ctx, records)  # stage cloud
     geo = build_geometry(ctx, records, objs, progress, fused)  # stage cloud
-    with timing.stage("objects"):
+    with timing.stage(timing.Stage.OBJECTS):
         assert geo.cloud.label is not None
         objects.set_cloud_counts(ctx.tx, objs, geo.cloud.label, geo.stats["voxel"],
                                  geo.stats["focal_px"], geo.nearest)
@@ -1715,7 +1717,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
     work = Path(tempfile.mkdtemp(prefix="update-", dir=paths.scratch_dir()))
     try:
         with store.MapTransaction(map_dir) as tx, ExitStack() as running:
-            with stage("setup"):
+            with stage(timing.Stage.SETUP):
                 meta = store.read_meta_or_default(tx)
                 old = store.read_frames(tx)
             update_id = int(meta.get("update_count", 0)) + 1
@@ -1739,7 +1741,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 _single_image_map(ctx)
                 model = None
             else:
-                with stage("sfm"):
+                with stage(timing.Stage.SFM):
                     model = _run_sfm(ctx, spec.kind == "video", client, progress)
                 registered = set(model.registered)
                 ctx.rejected = [nf.kf.name for nf in new if f"{nf.kf.name}.jpg" not in registered]
@@ -1747,16 +1749,16 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                     raise RegistrationError(
                         "none of the input frames overlaps the map (nothing registered); "
                         "the map is unchanged")
-                with stage("focal_rerun"):
+                with stage(timing.Stage.FOCAL_RERUN):
                     _rerun_focal(ctx, model, client, progress)
                 if not old:
-                    with stage("map_frame"):
+                    with stage(timing.Stage.MAP_FRAME):
                         _define_map_frame(ctx, model, progress)
-                with stage("depth_alignment"):
+                with stage(timing.Stage.DEPTH_ALIGNMENT):
                     _align_depths(ctx, model)
                     _adjust_depth_scales(ctx, progress)
                 if not old:
-                    with stage("map_frame"):
+                    with stage(timing.Stage.MAP_FRAME):
                         _level_with_floor(ctx, model, progress)
                 if not any(nf.record is not None for nf in new):
                     raise RegistrationError(
@@ -1765,7 +1767,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 if ctx.rejected:
                     progress(f"left out {len(ctx.rejected)} unplaceable keyframes: "
                              + ", ".join(sorted(ctx.rejected)[:30]))
-                with stage("persist_frames"):
+                with stage(timing.Stage.PERSIST_FRAMES):
                     model.write(tx.stage(store.SFM_MODEL))
             records, objs, geo = integrate(ctx, progress)
             new_names = [nf.kf.name for nf in new if nf.record is not None]
@@ -1785,7 +1787,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 "objects": objs.summary,
             }
             meta.setdefault("updates", []).append(record)
-            with stage("export"):
+            with stage(timing.Stage.EXPORT):
                 scene_full = export.full_scene(tx.root, meta, records, objs.exported())
                 if fmt == "ply":
                     payload = export.ply_payload(geo, mode, records, objs, attrs)
@@ -1793,7 +1795,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                     payload = export.scene_payload(scene_full, mode, new_names, records, objs)
             # timings up to the commit (map.json is written by the commit itself)
             record["timings"] = _jsonable(tm.to_dict())
-            with stage("commit"):
+            with stage(timing.Stage.COMMIT):
                 tx.commit(meta)
             elapsed = time.perf_counter() - t_start
             progress(f"committed update {update_id}: {len(new_names)} keyframes added, "
