@@ -353,6 +353,48 @@ def test_one_keyframe_map(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------------------------------------------
+# a rotation-dominant map (multi-view poses): 2D-3D from the keyframes' stored depth
+
+
+@needs_colmap
+def test_held_out_views_of_a_rotation_dominant_map(tmp_path: Path) -> None:
+    """A head turning in place is posed by the multi-view fallback, whose ``sfm/model`` points are
+    triangulated from near-zero baselines without bundle adjustment: held-out headings between the
+    keyframes are located from the keyframes' stored depth (``model_points_trusted``), not from
+    those few unreliable points."""
+    from oh_my_slam.mapping import locate as lmod
+    from tests.unit.test_mapping_e2e_rotation import turning, yaw
+
+    client = FakeClient(mv_noise=(3.0, 0.15))
+    room = mapping_room()
+    first = turning(20, 0.0, 12.0)
+    add_frames(client, room, first, tmp_path / "a", "a", depth_noise=0.03, seed=4)
+    held = turning(19, 6.0, 12.0)  # half-way between consecutive keyframes
+    imgs = add_frames(client, room, held, tmp_path / "q", "q", depth_noise=0.03, seed=6)
+    mdir = tmp_path / "map"
+    msgs: list[str] = []
+    update(mdir, sorted((tmp_path / "a").glob("*.png")), client=client, progress=msgs.append)
+    assert any("multi-view fallback (rotation-dominant" in m for m in msgs), msgs
+    reader = store.MapReader(mdir)
+    assert {fr.pose_source for fr in reader.frames} == {"multiview"}
+    assert not any(lmod.model_points_trusted(fr) for fr in reader.frames)
+    before = snapshot(mdir)
+    res = run(mdir, imgs)
+    assert snapshot(mdir) == before
+    assert [r.located for r in res.results] == [True] * len(imgs), [r.reason for r in res.results]
+    # truth: the map frame is the first keyframe's up to a rigid transform (metric depth)
+    sim = similarity_by_poses([fr.T_map_cam for fr in reader.frames], first, with_scale=False)
+    centre = np.mean([transform_pose(sim, fr.T_map_cam).t for fr in reader.frames], axis=0)
+    y0 = yaw(reader.frames[0].T_map_cam)
+    for r, truth in zip(res.results, held, strict=True):
+        assert r.T_map_cam is not None
+        W = transform_pose(sim, r.T_map_cam)
+        dyaw = (yaw(r.T_map_cam) - y0 - (yaw(truth) - yaw(first[0])) + 180) % 360 - 180
+        assert abs(dyaw) < 1.0 and rot_deg(W.R, truth.R) < 1.5, (r.image.name, dyaw)
+        assert np.linalg.norm(W.t - centre) < 0.15, (r.image.name, W.t - centre)
+
+
+# ------------------------------------------------------------------------------------------------
 # offline rules (no COLMAP)
 
 

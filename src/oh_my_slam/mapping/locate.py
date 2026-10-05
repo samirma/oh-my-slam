@@ -10,8 +10,10 @@ through reconstruction (exit 3 when it is down).
 
 Pose: the verified matches give 2D-3D correspondences — a query keypoint, the keyframe keypoint it
 matches, that keypoint's triangulated point in the map's ``sfm/model`` (already in map
-coordinates); for a keyframe the model lacks (a one-keyframe map has no ``sfm/`` at all) the point
-is the keyframe's stored metric depth at that keypoint, placed with its stored pose. LO-RANSAC
+coordinates) when SfM posed the keyframe; otherwise — a keypoint without a model point, a
+keyframe the model lacks (a one-keyframe map has no ``sfm/`` at all), or one posed by multi-view
+(rotation-dominant input, whose model points are unreliable) — the point is the keyframe's stored
+metric depth at that keypoint, placed with its stored pose. LO-RANSAC
 absolute pose plus refinement (``pycolmap.estimate_and_refine_absolute_pose``) solves them; the
 focal length is refined unless the query shares a map camera. A result with fewer than
 ``MIN_INLIERS`` inliers, or whose pose contradicts its verified matches to the stored keyframe poses
@@ -314,9 +316,19 @@ def _query_matches(db_path: Path, queries: list[_Query], db: dict[str, _DbImage]
 # 2D-3D correspondences and pose
 
 
+def model_points_trusted(fr: store.FrameRecord) -> bool:
+    """Whether the ``sfm/model`` points of keyframe ``fr`` place its keypoints: only for a pose SfM
+    estimated. The points of multi-view (rotation-dominant) poses are triangulated without bundle
+    adjustment from near-zero baselines — the mapper itself never fits depth to them — and an
+    identity pose has none."""
+    return fr.pose_source.startswith("sfm") and "multiview" not in fr.pose_source
+
+
 class _MapPoints:
-    """Map coordinates of keyframe keypoints: their triangulated point in ``sfm/model``, or for a
-    keyframe the model does not hold, its stored depth at the keypoint, placed with its pose."""
+    """Map coordinates of keyframe keypoints: their triangulated point in ``sfm/model`` for a
+    keyframe SfM posed (``model_points_trusted``), and for every keypoint without one — all of
+    them for a multi-view keyframe, or one the model does not hold — the keyframe's stored metric
+    depth at the keypoint, placed with its stored pose."""
 
     def __init__(self, reader: store.MapReader) -> None:
         import pycolmap
@@ -327,6 +339,7 @@ class _MapPoints:
         self.rec = pycolmap.Reconstruction(str(model_dir)) \
             if (model_dir / "images.bin").exists() else None
         self._cache: dict[str, tuple[NDArray[np.float64], NDArray[np.bool_]] | None] = {}
+        self._depth: dict[str, tuple[NDArray[Any], NDArray[Any]]] = {}
 
     def _model_points(self, name: str) -> tuple[NDArray[np.float64], NDArray[np.bool_]] | None:
         """(xyz per keypoint, has a point) of a keyframe the model has posed, else None."""
@@ -344,18 +357,32 @@ class _MapPoints:
                 self._cache[name] = (xyz, has)
         return self._cache[name]
 
+    def _depth_points(self, fr: store.FrameRecord, uv: NDArray[np.float64]
+                      ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+        if fr.name not in self._depth:
+            self._depth[fr.name] = (self.reader.depth(fr), self.reader.valid(fr))
+        return depth_points(*self._depth[fr.name], fr, uv)
+
     def lookup(self, m: _Match) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
         """(xyz (N, 3), valid (N,)) of the keyframe side of the matches ``m``."""
-        model = self._model_points(m.keyframe)
-        if model is not None:
-            xyz, has = model
-            ok = m.idx_k < len(has)
-            idx = np.where(ok, m.idx_k, 0)
-            return xyz[idx], ok & has[idx]
+        n = len(m.idx_k)
+        xyz, ok = np.zeros((n, 3)), np.zeros(n, bool)
         fr = self.frames.get(m.keyframe)
         if fr is None:
-            return np.zeros((len(m.idx_k), 3)), np.zeros(len(m.idx_k), bool)
-        return depth_points(self.reader.depth(fr), self.reader.valid(fr), fr, m.uv_k)
+            return xyz, ok
+        model = self._model_points(m.keyframe) if model_points_trusted(fr) else None
+        if model is not None:
+            pts, has = model
+            inside = m.idx_k < len(has)
+            idx = np.where(inside, m.idx_k, 0)
+            ok = inside & has[idx]
+            xyz[ok] = pts[idx[ok]]
+        if not ok.all():
+            d_xyz, d_ok = self._depth_points(fr, m.uv_k)
+            fill = ~ok & d_ok
+            xyz[fill] = d_xyz[fill]
+            ok = ok | fill
+        return xyz, ok
 
 
 def depth_points(depth: NDArray[Any], valid: NDArray[Any], fr: store.FrameRecord,
