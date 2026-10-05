@@ -547,15 +547,13 @@ point leaves the map untouched. One killed after it is completed by the next upd
 
 * **The order of addition is "latest".** A later update wins over an earlier one, and within one
   update a later keyframe wins over an earlier one, in input order (the order of the `-i` images;
-  a video's frame order). The specification requires a sequence mapped in one update or split
-  across several in the same order to give the same map. The update rules do: an object is
-  judged by the keyframes added after its last detection wherever the updates are cut, and
-  `office_sequence`'s cup, on the sill in the first photos and gone in the last ones, is absent
-  either way (one update, 6 + 7 and 4 + 4 + 5 photos), its place drawn from the photos that see
-  it empty. The maps are not yet the same: the objects keep their ids and labels, but a first
-  update of the four window photos alone poses them by multi-view on the trees behind the glass,
-  so objects near the camera (the wallet, the wine glass) get boxes up to 3 times longer, and a
-  few extra objects are confirmed (see *Scenery behind glass* under Known limitations). Where nothing changed, the
+  a video's frame order). A sequence mapped in one update or split across several in the same
+  order gives the same map (spec §2.3). An object is judged by the keyframes added after its last
+  detection wherever the updates are cut, and a map of photos with a keyframe SfM did not pose
+  is rebuilt with the next update's photos (see *Rebuilding a weakly posed map* under Mapping,
+  step 4): `office_sequence` in one update, 6 + 7 and 4 + 4 + 5 photos gives the same 8 objects,
+  ids and labels, boxes within 1 cm, and no cup, its place drawn from the photos that see it
+  empty. Where nothing changed, the
   keyframes of an update agree and their order does not matter:
   * Object association groups all of the update's instances at once, strongest agreement first.
   * The cloud's colours and object ids do not depend on keyframe order either.
@@ -976,6 +974,20 @@ pixels, so its results are unchanged.
      (as above) are posed by anchored MapAnything and refined with the matches and depth.
    * **Maps with fewer than 3 keyframes:** SfM is re-run over all keyframes and aligned to the
      stored poses.
+   * **Rebuilding a weakly posed map.** An update holds the stored keyframes fixed, so a pose SfM
+     did not give would be frozen for good: the four window photos of `office_sequence` mapped
+     first are posed by the multi-view fallback (no SfM scale, matches mostly on the trees behind
+     the glass, see Known limitations), and the 4 + 4 + 5 map kept boxes up to 3 times longer
+     near the camera, two extra objects and one window fewer than the one-update map. A map of
+     photos (every update) with at most 60 keyframes, one of which SfM did not pose (refined by
+     feature matches, or holding fewer than 15 SfM points), is therefore mapped again with the
+     new photos, as one update of them all: the stored keyframes are staged again from their
+     images, their inference runs again, and every other file of the map is replaced. The
+     keyframes keep their names and order, the objects their ids (an id is the number of the
+     object's first detection, counted over the keyframes in order), and the latest keyframes
+     win as within one update; `map.json` records `updates[].notes.restarted`. The extra cost is
+     the stored keyframes' inference and mapping (office 4 + 4 + 5: +3 s and +13 s; ainex 40 +
+     39: see the benchmark notes). Maps posed by SfM, videos and larger maps are extended.
    * If no new keyframe overlaps the map, the command exits 5 and the map is unchanged.
 5. **Refinement.**
    1. Geometry is re-run for keyframes whose COLMAP focal length differs by more than 3 %.
@@ -1209,8 +1221,8 @@ runs it end to end as a test.
   13-photo map measures 8-25 cm (SfM of the four photos alone is no better: rotations 2.5-4.7°
   off, 15-37 points per photo). Objects near the camera, the cup and the wallet on the
   windowsill, are then placed 5-15 cm apart by each photo, and their boxes are that much
-  longer; the whole sequence split as 4 + 4 + 5 or 6 + 7 photos keeps those longer boxes, so its
-  map differs from the one-update map near the camera (see Update semantics). In a map of the
+  longer. A later update rebuilds such a map with its photos (Mapping, step 4), so the whole
+  sequence split as 4 + 4 + 5 or 6 + 7 photos ends as the one-update map does. In a map of the
   whole sequence the global mapper's result varies from run to run for the same reason: in some
   runs the depth check (step 1 of *Weakly linked parts*) rejects photos whose SfM points are
   mostly those trees (depth ratios of 0.25-0.3 and 1.8-2), and their multi-view poses leave them

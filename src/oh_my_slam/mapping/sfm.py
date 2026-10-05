@@ -20,7 +20,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -440,6 +440,8 @@ class Sfm:
                                                                            prior.height)
                 cam = pycolmap.Camera.create(0, pycolmap.CameraModelId.SIMPLE_PINHOLE, focal,
                                              prior.width, prior.height)
+                # the parameters as COLMAP parses them from text (``set_prior`` does the same)
+                cam.set_params_from_string(_camera_params(replace(prior, focal=focal)))
                 cam.has_prior_focal_length = prior.focal is not None
                 camera = int(db.write_camera(cam))
             known = {im.name for im in db.read_all_images()}

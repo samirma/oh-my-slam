@@ -1730,9 +1730,10 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             kfs: Iterable[ingest.Keyframe] = ingest.keyframes(
                 spec, fps, tx.stage("frames"), int(meta.get("next_frame_index", 0)))
             restarted = _restart_weak_map(tx, meta, old, spec, progress)
+            stored = {kf.name for kf in restarted}
             if restarted:
                 kfs = itertools.chain(restarted, kfs)
-                stored, old = len(old), []
+                old = []
             early: list[_EarlyFeatures] = []
 
             def ingested(written: list[ingest.Keyframe]) -> None:
@@ -1747,7 +1748,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             ctx = UpdateContext(tx, meta, old, new, update_id, work,
                                 features=early[0] if early else None)
             if restarted:
-                ctx.notes["restarted"] = {"stored_keyframes": stored}
+                ctx.notes["restarted"] = {"stored_keyframes": len(stored)}
             if not old and len(new) == 1:
                 _single_image_map(ctx)
                 model = None
@@ -1756,7 +1757,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                     model = _run_sfm(ctx, spec.kind == "video", client, progress)
                 registered = set(model.registered)
                 ctx.rejected = [nf.kf.name for nf in new if f"{nf.kf.name}.jpg" not in registered]
-                if len(ctx.rejected) == len(new):
+                if len(ctx.rejected) == len(new) or (stored and stored <= set(ctx.rejected)):
                     raise RegistrationError(
                         "none of the input frames overlaps the map (nothing registered); "
                         "the map is unchanged")
@@ -1781,7 +1782,8 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 with stage(timing.Stage.PERSIST_FRAMES):
                     model.write(tx.stage(store.SFM_MODEL))
             records, objs, geo = integrate(ctx, progress)
-            new_names = [nf.kf.name for nf in new if nf.record is not None]
+            new_names = [nf.kf.name for nf in new
+                         if nf.record is not None and nf.kf.name not in stored]
             timing.count(keyframes_registered=len(new_names), keyframes_rejected=len(ctx.rejected),
                          map_frames_after=len(records), objects=len(objs.objects),
                          sfm=None if model is None else model.method, **geo.stats)

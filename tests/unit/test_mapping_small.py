@@ -36,13 +36,18 @@ def test_single_image_map_then_extension(tmp_path: Path) -> None:
     assert angle_between_deg(up_map, [0, 0, 1]) < 2.0
     T0 = r.frames[0].T_map_cam.matrix()
 
+    # the single image has no SfM pose: the map is rebuilt with the next photos, as one update
+    # of them all, in the map frame of the same first keyframe (origin at its camera, z up)
     res2 = update(mdir, imgs[1:], client=client, progress=lambda m: None)
     r2 = MapReader(mdir)
     assert len(r2.frames) >= 9
-    np.testing.assert_allclose(r2.frames[0].T_map_cam.matrix(), T0, atol=1e-9)
+    np.testing.assert_allclose(r2.frames[0].T_map_cam.t, 0, atol=1e-9)
+    assert angle_between_deg(r2.frames[0].T_map_cam.R[:, 2], T0[:3, 2]) < 2.0
     # relative geometry: distance between the first two cameras matches the synthetic truth
     d_est = np.linalg.norm(r2.frames[1].T_map_cam.t - r2.frames[0].T_map_cam.t)
     d_true = np.linalg.norm(poses[1].t - poses[0].t)
     assert d_est == pytest.approx(d_true, rel=0.15)
-    assert json.loads((mdir / "map.json").read_text())["updates"][-1]["notes"]["remap_small"]
+    notes = json.loads((mdir / "map.json").read_text())["updates"][-1]["notes"]
+    assert notes["restarted"] == {"stored_keyframes": 1}
+    assert res2.new_frames == [f"f{k:06d}" for k in range(1, len(r2.frames))]
     assert res2.rejected == []
