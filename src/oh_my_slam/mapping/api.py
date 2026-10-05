@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +40,7 @@ from oh_my_slam.mapping import frame as mframe
 from oh_my_slam.mapping import ingest, retrieval, store, validity
 from oh_my_slam.mapping.sfm import (
     MAX_EPIPOLAR_DEG,
+    MIN_INLIERS,
     MIN_PLACED_FRACTION,
     ROTATION_BASELINE_RATIO,
     ROTATION_PAIR_FRACTION,
@@ -72,6 +73,9 @@ PHOTO_EXHAUSTIVE_MAX = 200
 MV_CHUNK = 24  # gate G6
 MV_ANCHORS = 4
 REJECT_SCALE = (0.5, 2.0)
+# a map of photos that some keyframe holds without SfM support (``_weak_keyframe``) is rebuilt
+# with the new photos, as one update of them all, up to this many stored keyframes
+RESTART_MAX_KEYFRAMES = 60
 
 
 @dataclass
@@ -102,6 +106,32 @@ class UpdateContext:
     rescaled: dict[int, DepthCorrection] = field(default_factory=dict)
     # a new map's features, extracted while its inference ran
     features: _EarlyFeatures | None = None
+    # a rebuild of the map with this update's keyframes (``_restart_weak_map``)
+    rebuild: Rebuild | None = None
+
+
+@dataclass
+class Rebuild:
+    """What a rebuild keeps of the map it replaces: the update that added each stored keyframe
+    (``uids``, by name), the id each stored detection was first published with (``first``: the
+    ``id()`` of the stored keyframes' ``Detection`` -> id; ``prior``: the same through the map's
+    permanent merges, not the provisional ones a rebuild made), the map's object
+    count (``next_id``: the new keyframes' detections are numbered on from it), its merges, the
+    creation update of each published (confirmed) object (``created``) and the places of the objects its
+    updates removed (``vacated``; their pixels stay retired in the stored keyframes)."""
+
+    uids: dict[str, int]
+    prior: dict[int, int]
+    first: dict[int, int]  # the ``id()`` of a stored ``Detection`` -> the id it was first given
+    next_id: int
+    merged_into: dict[int, int]
+    created: dict[int, int]
+    vacated: list[Any]
+    camera: int | None = None  # the database camera the stored keyframes share, if one
+    # each published object's label and box, as the map last published them (a published id
+    # whose founding detection the rebuild groups elsewhere goes where it stands,
+    # ``objects._published_places``)
+    boxes: dict[int, tuple[str, Any]] = field(default_factory=dict)
 
 
 Progress = Callable[[str], None]
@@ -433,6 +463,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     names = {nf.kf.index: f"{nf.kf.name}.jpg" for nf in ctx.new}
     names.update({f.index: Path(f.image).name for f in ctx.old_frames})
     prior = _camera_prior(ctx.new, ctx.old_frames)
+    if ctx.rebuild is not None and ctx.rebuild.camera is not None:
+        prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
     t0 = time.perf_counter()
     with timing.stage(timing.Stage.FEATURES_MATCHING):
         if ctx.features is not None:
@@ -1274,7 +1306,8 @@ def _record(ctx: UpdateContext, nf: NewFrame, T: Pose, source: str, K: Intrinsic
         index=nf.kf.index, name=nf.kf.name, image=f"frames/{nf.kf.name}.jpg",
         source=nf.kf.source, camera_id=camera_id, width=w, height=h,
         K=K, T_map_cam=T, grid_width=gw, grid_height=gh, pose_source=source,
-        update_id=ctx.update_id, stats=stats,
+        update_id=ctx.rebuild.uids.get(nf.kf.name, ctx.update_id) if ctx.rebuild
+        else ctx.update_id, stats=stats,
         up_cam=None if g is None else [float(v) for v in g.up_cam],
     )
 
@@ -1724,6 +1757,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             progress(("creating map " if tx.created else "extending map ") + str(tx.root))
             kfs = ingest.keyframes(spec, fps, tx.stage("frames"),
                                    int(meta.get("next_frame_index", 0)))
+            plan, skipped = _restart_plan(meta, old, spec)
             early: list[_EarlyFeatures] = []
 
             def ingested(written: list[ingest.Keyframe]) -> None:
@@ -1735,38 +1769,20 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
 
             new = _infer_frames(kfs, spec.kind, work, client, progress, ingested)
             timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
+            is_video = spec.kind == "video"
             ctx = UpdateContext(tx, meta, old, new, update_id, work,
                                 features=early[0] if early else None)
+            if skipped:
+                ctx.notes["restart_skipped"] = skipped
+            model: SfmModel | None = None
+            if plan:
+                ctx, model = _try_rebuild(tx, meta, old, new, plan, update_id, work, is_video,
+                                          client, progress)
             if not old and len(new) == 1:
                 _single_image_map(ctx)
-                model = None
-            else:
-                with stage(timing.Stage.SFM):
-                    model = _run_sfm(ctx, spec.kind == "video", client, progress)
-                registered = set(model.registered)
-                ctx.rejected = [nf.kf.name for nf in new if f"{nf.kf.name}.jpg" not in registered]
-                if len(ctx.rejected) == len(new):
-                    raise RegistrationError(
-                        "none of the input frames overlaps the map (nothing registered); "
-                        "the map is unchanged")
-                with stage(timing.Stage.FOCAL_RERUN):
-                    _rerun_focal(ctx, model, client, progress)
-                if not old:
-                    with stage(timing.Stage.MAP_FRAME):
-                        _define_map_frame(ctx, model, progress)
-                with stage(timing.Stage.DEPTH_ALIGNMENT):
-                    _align_depths(ctx, model)
-                    _adjust_depth_scales(ctx, progress)
-                if not old:
-                    with stage(timing.Stage.MAP_FRAME):
-                        _level_with_floor(ctx, model, progress)
-                if not any(nf.record is not None for nf in new):
-                    raise RegistrationError(
-                        "no input frame could be placed consistently in the map; "
-                        "the map is unchanged")
-                if ctx.rejected:
-                    progress(f"left out {len(ctx.rejected)} unplaceable keyframes: "
-                             + ", ".join(sorted(ctx.rejected)[:30]))
+            elif model is None:
+                model = _place(ctx, is_video, client, progress)
+            if model is not None:
                 with stage(timing.Stage.PERSIST_FRAMES):
                     model.write(tx.stage(store.SFM_MODEL))
             records, objs, geo = integrate(ctx, progress)
@@ -1804,6 +1820,191 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+
+def _place(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) -> SfmModel:
+    """Pose, scale and align the update's keyframes (SfM, focal re-run, map frame, depth
+    alignment); raises ``RegistrationError`` when none is placed."""
+    stage = timing.stage
+    new, old = ctx.new, ctx.old_frames
+    with stage(timing.Stage.SFM):
+        model = _run_sfm(ctx, is_video, client, progress)
+    registered = set(model.registered)
+    ctx.rejected = [nf.kf.name for nf in new if f"{nf.kf.name}.jpg" not in registered]
+    if len(ctx.rejected) == len(new):
+        raise RegistrationError("none of the input frames overlaps the map (nothing registered); "
+                                "the map is unchanged")
+    with stage(timing.Stage.FOCAL_RERUN):
+        _rerun_focal(ctx, model, client, progress)
+    if not old:
+        with stage(timing.Stage.MAP_FRAME):
+            _define_map_frame(ctx, model, progress)
+    with stage(timing.Stage.DEPTH_ALIGNMENT):
+        _align_depths(ctx, model)
+        _adjust_depth_scales(ctx, progress)
+    if not old:
+        with stage(timing.Stage.MAP_FRAME):
+            _level_with_floor(ctx, model, progress)
+    if not any(nf.record is not None for nf in new):
+        raise RegistrationError("no input frame could be placed consistently in the map; "
+                                "the map is unchanged")
+    if ctx.rejected:
+        progress(f"left out {len(ctx.rejected)} unplaceable keyframes: "
+                 + ", ".join(sorted(ctx.rejected)[:30]))
+    return model
+
+
+def _weak_keyframe(rec: store.FrameRecord) -> bool:
+    """A stored keyframe that SfM did not pose: posed by the multi-view fallback or its feature-
+    match refinement (no SfM scale, a pan from one spot, matches mostly on scenery behind glass:
+    ``stats`` has ``pose_matches``), or holding fewer SfM points than a verified pair has inliers
+    (``MIN_INLIERS``; the multi-view gauge keyframe holds one)."""
+    return "pose_matches" in rec.stats or float(rec.stats.get("observations", 0)) < MIN_INLIERS
+
+
+def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: ingest.InputSpec
+                  ) -> tuple[list[store.FrameRecord], str | None]:
+    """The stored keyframes to map again with the new input (``_try_rebuild``), and why a weak
+    map is not rebuilt (the update's ``restart_skipped`` note), else None.
+
+    A map is rebuilt when its keyframes are photos (every update), at most
+    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``), unless the last two
+    rebuilds left the same keyframes weak and those are still the weak ones
+    (``notes.restarted.weak``: more photos did not help, and a rebuild costs more each time), or
+    its last update already rebuilt it and left it rotation-dominant (``ROTATION_PAIR_FRACTION`` of the
+    verified pairs panoramic): a pan from one spot, which the photos added did not give the
+    parallax to triangulate; rebuilt on every update, it would cost more each time."""
+    updates = meta.get("updates", [])
+    if (not old or spec.kind != "images" or any(u.get("kind") != "images" for u in updates)
+            or not any(_weak_keyframe(r) for r in old)):
+        return [], None
+    if len(old) > RESTART_MAX_KEYFRAMES:
+        return [], f"more than {RESTART_MAX_KEYFRAMES} keyframes"
+    rebuilt = [u["notes"]["restarted"] for u in updates if "restarted" in u.get("notes", {})]
+    weak = sorted(r.name for r in old if _weak_keyframe(r))
+    if len(rebuilt) >= 2 and rebuilt[-1].get("weak") == rebuilt[-2].get("weak") == weak:
+        return [], "the last two rebuilds left the same keyframes weak: no progress"
+    last = updates[-1].get("notes", {}) if updates else {}
+    if ("restarted" in last
+            and float(last.get("two_view", {}).get("rotation_fraction", 0.0))
+            > ROTATION_PAIR_FRACTION):
+        return [], "rebuilt by the last update and still rotation-dominant: a pan from one spot"
+    return sorted(old, key=lambda r: r.index), None
+
+
+def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[int, int],
+                  first: dict[int, int], resolve: Callable[[int], int]) -> NewFrame:
+    """A stored keyframe as a new one for a rebuild, from what the map holds of it, without the
+    inference server: its image (staged again), aligned depth and validity (retired pixels
+    stay retired: the objects the map's updates removed do not come back), refined intrinsics,
+    gravity, descriptor, and detections (``instances.json``; each records the id it was first
+    published with, ``first_id``, which ``first`` keeps, and ``prior`` resolved by ``resolve``;
+    a map written before ``first_id`` gives its ``object_id``)."""
+    from oh_my_slam.core.images import load_rgb
+    from oh_my_slam.core.rle import decode
+    from oh_my_slam.reconstruction.gravity import GravityEstimate
+
+    dst = tx.stage(rec.image)
+    shutil.copyfile(tx.root / rec.image, dst)
+    depth = store.load_depth(tx.current, rec.name)
+    valid = store.load_valid(tx.current, rec.name, depth) & (depth > 0)
+    rgb = load_rgb(dst, max_side=max(rec.grid_width, rec.grid_height))
+    d = tx.current(store.frame_file(rec.name, "descriptor.npy"))
+    desc = np.load(d).astype(np.float32) if d.exists() else None
+    grav = None if rec.up_cam is None else GravityEstimate(
+        np.asarray(rec.up_cam, np.float64), "stored", roll_unc_deg=3.0, pitch_unc_deg=3.0)
+    frame = FrameReconstruction(dst, rgb, np.where(valid, depth, 0.0).astype(np.float32), valid,
+                                rec.K_grid, rec.K, desc, grav)
+    dets: list[Detection] = []
+    inst = tx.current(store.frame_file(rec.name, "instances.json"))
+    for it in (json.loads(inst.read_text()).get("instances", []) if inst.exists() else []):
+        mask = decode(it["mask"])
+        if mask.shape != depth.shape or not mask.any():
+            continue
+        ys, xs = np.nonzero(mask)
+        det = Detection(it["label"], float(it["score"]), it.get("source", "stored"), mask,
+                        (float(xs.min()), float(ys.min()), float(xs.max() + 1),
+                         float(ys.max() + 1)))
+        dets.append(det)
+        fid = int(it.get("first_id", it.get("object_id", 0)))
+        if fid > 0:
+            first[id(det)] = fid
+            prior[id(det)] = resolve(fid)
+    kf = ingest.Keyframe(rec.name, rec.index, dst, rec.source, rec.K)
+    return NewFrame(kf, frame, dets, (rec.width, rec.height))
+
+
+def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store.FrameRecord],
+                 new: list[NewFrame], plan: list[store.FrameRecord], update_id: int, work: Path,
+                 is_video: bool, client: Any, progress: Progress
+                 ) -> tuple[UpdateContext, SfmModel | None]:
+    """Map the stored keyframes ``plan`` again with the new ones, as one update of them all
+    (``MapTransaction.start_over``), when every stored keyframe is placed again. Otherwise the
+    rebuild is abandoned in the same transaction (the map is extended as before) and no model is
+    returned.
+
+    An update extends a map with the stored keyframes held fixed: the poses of a weak first update
+    (the four window photos of ``office_sequence``, posed by multi-view on the trees behind the
+    glass) would be frozen for good, and the sequence mapped in several updates would differ from
+    the sequence mapped in one (spec §2.3). The stored keyframes keep their names, order, update,
+    detections and depth (no inference runs again), and the objects the ids the map published
+    (``Rebuild``, ``objects._published_ids``)."""
+    from oh_my_slam.mapping.objects import load_state
+
+    saved = json.loads(json.dumps(meta))
+    # the new keyframes as inference gave them: an abandoned rebuild extends the map with them
+    # exactly as a plain extension would (the rebuild's focal re-run and alignment are undone)
+    frames = [replace(nf.frame, depth=nf.frame.depth.copy(), valid=nf.frame.valid.copy())
+              for nf in new]
+    state = load_state(tx.current, meta)
+
+    def resolve(oid: int) -> int:
+        seen = set()
+        while oid in state.merged_into and oid not in seen:
+            seen.add(oid)
+            oid = state.merged_into[oid]
+        return oid
+
+    prior: dict[int, int] = {}
+    first: dict[int, int] = {}
+    stored = [_stored_frame(tx, r, prior, first, resolve) for r in plan]
+    rb = Rebuild({r.name: r.update_id for r in plan}, prior, first, int(state.next_id),
+                 dict(state.merged_into),
+                 {o.id: o.created_update for o in state.objects if o.confirmed},
+                 list(state.vacated),
+                 plan[0].camera_id if len({(r.camera_id, r.width, r.height) for r in plan}) == 1
+                 and all((nf.full_size == (plan[0].width, plan[0].height)) for nf in new)
+                 else None)
+    rb.boxes = {o.id: (o.label, o.obb) for o in state.objects if o.confirmed}
+    tx.start_over(keep=(store.SFM_DB,))  # the stored keyframes' features and matches
+    for key in ("floor_z", "scale", "map_frame"):
+        meta.pop(key, None)
+    meta["next_object_id"] = 1
+    progress(f"rebuilding the map: {sum(_weak_keyframe(r) for r in plan)} of its {len(plan)} "
+             "keyframes were not posed by SfM; mapping them again with the new input")
+    ctx = UpdateContext(tx, meta, [], stored + new, update_id, work, rebuild=rb)
+    names = set(rb.uids)
+    left: list[str] = []
+    try:
+        model = _place(ctx, is_video, client, progress)
+        left = sorted(nf.kf.name for nf in stored if nf.record is None)
+    except RegistrationError as e:
+        left, model = [f"({e})"], None
+    if model is not None and not left:
+        weak = sorted(nf.kf.name for nf in ctx.new
+                      if nf.record is not None and _weak_keyframe(nf.record))
+        ctx.notes["restarted"] = {"stored_keyframes": len(plan), "weak": weak}
+        ctx.rejected = [n for n in ctx.rejected if n not in names]
+        return ctx, model
+    progress("rebuild abandoned (it would leave out stored keyframes: " + ", ".join(left[:10])
+             + "); extending the map instead")
+    tx.resume()
+    meta.clear()
+    meta.update(saved)
+    for nf, frame in zip(new, frames, strict=True):
+        nf.frame, nf.record, nf.depth = frame, None, None
+    ctx = UpdateContext(tx, meta, old, new, update_id, work)
+    ctx.notes["restart_abandoned"] = {"left_out": left}
+    return ctx, None
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(d, default=float))

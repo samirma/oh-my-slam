@@ -223,8 +223,20 @@ class MapReader:
     def exists(self, rel: str) -> bool:
         return self.path(rel).exists()
 
+    def _again(self, read: Callable[[], Any]) -> Any:
+        """``read()``, once more if a file it needs vanished while an update applied its commit
+        (``COMMIT`` in the staging folder: the staged copy moved into place between ``path`` and
+        the read; a rebuild replaces most of the map's files, so the window is wider)."""
+        try:
+            return read()
+        except FileNotFoundError:
+            if not (self.root / STAGING / COMMIT).exists():
+                raise
+            self._overlay = set(_committed_manifest(self.root) or [])
+            return read()
+
     def read_json(self, rel: str) -> Any:
-        return json.loads(self.path(rel).read_text())
+        return self._again(lambda: json.loads(self.path(rel).read_text()))
 
     # -- per-frame data --------------------------------------------------------------------------
 
@@ -232,10 +244,12 @@ class MapReader:
         return f"per_frame/{name}"
 
     def depth(self, fr: FrameRecord) -> NDArray[np.float32]:
-        return load_depth(self.path, fr.name)
+        out: NDArray[np.float32] = self._again(lambda: load_depth(self.path, fr.name))
+        return out
 
     def valid(self, fr: FrameRecord) -> NDArray[np.bool_]:
-        return load_valid(self.path, fr.name)
+        out: NDArray[np.bool_] = self._again(lambda: load_valid(self.path, fr.name))
+        return out
 
     def instances(self, fr: FrameRecord) -> list[dict[str, Any]]:
         rel = f"{self.frame_dir(fr.name)}/instances.json"
@@ -244,8 +258,11 @@ class MapReader:
         return list(self.read_json(rel).get("instances", []))
 
     def descriptor(self, fr: FrameRecord) -> NDArray[np.float32] | None:
-        p = self.path(f"{self.frame_dir(fr.name)}/descriptor.npy")
-        return np.load(p) if p.exists() else None
+        def read() -> NDArray[np.float32] | None:
+            p = self.path(f"{self.frame_dir(fr.name)}/descriptor.npy")
+            return np.load(p) if p.exists() else None
+        out: NDArray[np.float32] | None = self._again(read)
+        return out
 
     def image_path(self, fr: FrameRecord) -> Path:
         return self.path(fr.image)
@@ -264,6 +281,9 @@ class MapTransaction:
         self.staging = self.root / STAGING
         self.created = False
         self._deleted: set[str] = set()
+        self._fresh = False  # ``start_over``: nothing committed is read or kept but map.json
+        self._started_over: set[str] = set()
+        self._kept: set[str] = set()
 
     # -- lifecycle -------------------------------------------------------------------------------
 
@@ -313,9 +333,44 @@ class MapTransaction:
         return p
 
     def current(self, rel: str) -> Path:
-        """Latest version of a file: staged if written in this update, else committed."""
+        """Latest version of a file: staged if written in this update, else committed (after
+        ``start_over``: staged only)."""
         staged = self.staging / rel
-        return staged if staged.exists() else self.root / rel
+        return staged if staged.exists() or self._dropped(rel) else self.root / rel
+
+    def _dropped(self, rel: str) -> bool:
+        return self._fresh and rel not in self._kept
+
+    def start_over(self, keep: tuple[str, ...] = ()) -> None:
+        """Rebuild the map in this update: every committed file but ``map.json`` and ``keep``
+        is deleted at commit unless staged again, and none is read (``current``,
+        ``clone_for_edit``) — what the update needs of the old map (its keyframe images) it
+        stages first."""
+        self._fresh = True
+        self._kept = set(keep)
+        self._started_over = set()
+        for p in self.root.rglob("*"):
+            rel = p.relative_to(self.root)
+            if (p.is_file() and rel.parts[0] not in (STAGING, LOCK) and str(rel) != MAP_JSON
+                    and str(rel) not in self._kept):
+                self._started_over.add(str(rel))
+        self._deleted |= self._started_over
+
+    def resume(self) -> None:
+        """Undo ``start_over``: the committed files are read and kept again, and what the rebuild
+        staged of the derived files (the SfM database and model, the keyframes' files but their
+        images, the objects) is discarded."""
+        self._fresh = False
+        self._deleted -= self._started_over
+        self._started_over = set()
+        for rel in (SFM_DB, SFM_MODEL, "per_frame", "objects"):
+            p = self.staging / rel
+            if p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                p.unlink()
+        for p in self.staging.glob(SFM_DB + "-*"):  # SQLite's side files
+            p.unlink()
 
     def write_json(self, rel: str, obj: Any) -> None:
         atomic_write_json(self.stage(rel), obj)
@@ -330,7 +385,7 @@ class MapTransaction:
         """Staged copy of a committed file (APFS clone when possible) to be modified in place."""
         dst = self.stage(rel)
         src = self.root / rel
-        if dst.exists() or not src.exists():
+        if dst.exists() or not src.exists() or self._dropped(rel):
             return dst
         clone_file(src, dst)
         return dst

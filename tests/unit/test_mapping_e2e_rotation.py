@@ -36,7 +36,14 @@ def yaw(T: Pose) -> float:
     return float(np.degrees(np.arctan2(f[1], f[0])))
 
 
-def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
+def test_rotation_only_map_and_anchored_update(tmp_path: Path,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """A map larger than the rebuild limit (``mapping.api.RESTART_MAX_KEYFRAMES``; its
+    multi-view poses are not SfM's, ``test_mapping_restart.py``) is extended by an update anchored
+    on it, its keyframes held fixed."""
+    from oh_my_slam.mapping import api
+
+    monkeypatch.setattr(api, "RESTART_MAX_KEYFRAMES", 20)
     client = FakeClient()
     room = mapping_room()
     first = turning(28, 0.0, 12.0)  # > one multi-view chunk (24)
@@ -76,10 +83,15 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path) -> None:
     assert meta["updates"][-1]["frames_added"] == res2.new_frames
 
 
-def test_noisy_multiview_poses_are_refined_and_updates_stay_consistent(tmp_path: Path) -> None:
+def test_noisy_multiview_poses_are_refined_and_updates_stay_consistent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Multi-view poses off by degrees and decimetres (like MapAnything's on a turning head) are
     refined with the matches and depth: headings within a fraction of a degree, one camera centre
-    for the head, and an anchored update that agrees with the map where it revisits it."""
+    for the head, and an anchored update (a map above the rebuild limit) that agrees with the map
+    where it revisits it."""
+    from oh_my_slam.mapping import api
+
+    monkeypatch.setattr(api, "RESTART_MAX_KEYFRAMES", 20)
     client = FakeClient(mv_noise=(3.0, 0.15))
     room = mapping_room()
     first = turning(28, 0.0, 12.0)
