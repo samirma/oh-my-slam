@@ -159,3 +159,28 @@ def test_frame_intervals_merge() -> None:
         {"frame_start": 10, "frame_end": 10},
     ]
     assert ol.frame_intervals([]) == []
+
+
+def test_signed_zero_serialises_as_zero() -> None:
+    """Two documents differing only in the sign of a zero (or of a value that rounds to zero)
+    serialise to identical bytes: identical runs must be byte-identical (server.sh parity)."""
+    from oh_my_slam.core.log import json_payload_bytes
+    from oh_my_slam.segmentation.catalog import _r as catalog_r
+
+    def doc(z: float) -> bytes:
+        pose = Pose(np.eye(3), np.array([0.0, z, z]))
+        d = ol.document(
+            ol.metadata("t", scale=ol.rounded({"z": z}), floor_z=ol.rounded([z])),
+            {"0": {"name": "o", "type": "chair", "object_data": {
+                "cuboid": [{"name": "box", "val": ol.cuboid_val(
+                    np.array([z, 0.0, 1.0]), np.eye(3), np.array([1.0, 1.0, 1.0]))}],
+                "num": [ol.num("n", z)]}}},
+            coordinate_systems={"map": ol.map_cs([])},
+            frames={"0": ol.frame(transforms={"c_to_map": ol.transform("c", "map", pose)})},
+        )
+        return json_payload_bytes(d)
+
+    for neg in (-0.0, -1e-9):
+        assert doc(neg) == doc(0.0)
+        assert b"-0.0" not in doc(neg)
+        assert str(catalog_r(neg, 3)) == "0.0"

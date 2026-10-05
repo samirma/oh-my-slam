@@ -14,16 +14,21 @@ CSV_HEADER = (
 )
 
 
+def _r(x: float, nd: int) -> float:
+    """``round`` with signed zero normalised: ``-0.0`` and ``0.0`` print differently."""
+    return round(x, nd) + 0.0
+
+
 def catalog_rows(objects: list[SceneObject]) -> list[dict[str, Any]]:
     rows = []
     for o in sorted(objects, key=lambda x: x.id):
         w, d, h = (float(v) for v in o.obb.size)
         cx, cy, cz = (float(v) for v in o.obb.center)
         rows.append({
-            "id": o.id, "label": o.label, "score": round(o.score, 4), "color_hex": o.color_hex,
-            "width_m": round(w, 3), "height_m": round(h, 3), "depth_m": round(d, 3),
-            "volume_m3": round(w * d * h, 4),
-            "center_x": round(cx, 3), "center_y": round(cy, 3), "center_z": round(cz, 3),
+            "id": o.id, "label": o.label, "score": _r(o.score, 4), "color_hex": o.color_hex,
+            "width_m": _r(w, 3), "height_m": _r(h, 3), "depth_m": _r(d, 3),
+            "volume_m3": _r(w * d * h, 4),
+            "center_x": _r(cx, 3), "center_y": _r(cy, 3), "center_z": _r(cz, 3),
             "pixel_count": o.pixel_count, "point_count": o.point_count,
         })
     return rows
