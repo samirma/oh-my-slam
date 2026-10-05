@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -19,8 +20,10 @@ from PIL import Image
 from oh_my_slam.cli.view import URL_LINE
 from oh_my_slam.viewer.routes import parse_cloud_payload
 from tests.fakes.stub_server import start_stub_server
+from tests.mapsnap import snapshot, with_committed_overlay
 
 REPO = Path(__file__).resolve().parents[2]
+PROBE = REPO / "tests" / "fakes" / "browser_probe.py"
 
 
 def sh(script: str, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -32,11 +35,16 @@ def _ignore_sigint() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # what a shell `&` job starts with
 
 
-def start_view(*args: str, background_job: bool = False
+def start_view(*args: str, background_job: bool = False, probe: Path | None = None
                ) -> tuple[subprocess.Popen[bytes], str, list[str]]:
     """Start view.sh; returns the process, its URL and the stderr lines up to the URL line.
-    ``background_job`` starts it with SIGINT ignored, as a shell ``&`` job would."""
-    proc = subprocess.Popen([str(REPO / "view.sh"), *args, "--no-browser"],
+    ``background_job`` starts it with SIGINT ignored, as a shell ``&`` job would. With ``probe``,
+    the command runs with ``webbrowser.open`` replaced by ``tests/fakes/browser_probe.py``
+    (recording into ``probe``) and ``args`` are passed as given; otherwise ``--no-browser`` is
+    added."""
+    cmd = ([str(REPO / "view.sh"), *args, "--no-browser"] if probe is None else
+           [sys.executable, str(PROBE), str(probe), "oh_my_slam.cli.view", *args])
+    proc = subprocess.Popen(cmd,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy(),
                             preexec_fn=_ignore_sigint if background_job else None)
     assert proc.stderr is not None
@@ -123,22 +131,54 @@ def minimal_map(root: Path) -> Path:
     return root
 
 
-def test_view_map_serves_without_server(tmp_path: Path) -> None:
-    """A minimal map folder is served read-only; the URL goes to stderr, stdout stays empty."""
-    from oh_my_slam.mapping import store
-
+@pytest.mark.parametrize("overlay", [False, True], ids=["map", "committed-staging"])
+def test_view_map_serves_without_server(tmp_path: Path, overlay: bool) -> None:
+    """A minimal map folder is served read-only (hidden entries included: a committed
+    ``.staging`` overlay is neither rolled forward nor discarded); the URL goes to stderr,
+    stdout stays empty."""
     root = minimal_map(tmp_path / "m")
-    before = store.full_tree_hash(root)
+    if overlay:
+        root = with_committed_overlay(root, tmp_path / "overlaid")
+    before = snapshot(root)
     proc, url, lines = start_view("-m", str(root))
     try:
         assert all(line.startswith("view.sh: ") for line in lines)
         assert json.loads(fetch(url + "api/meta"))["mode"] == "map"
         head, arrays = parse_cloud_payload(fetch(url + "api/cloud?voxel=0.1&normals=on"))
         assert head["count"] == 0 and arrays["position"].shape == (0, 3)
+        for path in ("api/scene", "api/catalog"):
+            fetch(url + path)
     finally:
         out = stop_view(proc)
     assert out == b""
-    assert store.full_tree_hash(root) == before
+    assert snapshot(root) == before
+
+
+def probe_records(record: Path, wait_s: float) -> list[dict[str, object]]:
+    """The browser probe's records, once one is there (or after ``wait_s``)."""
+    deadline = time.monotonic() + wait_s
+    while not record.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not record.exists():
+        return []
+    return [json.loads(line) for line in record.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("no_browser", [False, True], ids=["browser", "no-browser"])
+def test_view_opens_the_browser_once_it_accepts_connections(tmp_path: Path,
+                                                             no_browser: bool) -> None:
+    """spec §2.5: once the server accepts connections it opens the default browser on its page
+    (exactly once, on the URL of stderr's line); ``--no-browser`` only prints the URL."""
+    record = tmp_path / "browser.jsonl"
+    flags = ("--no-browser",) if no_browser else ()
+    proc, url, _ = start_view("-m", str(minimal_map(tmp_path / "m")), *flags, probe=record)
+    try:
+        opened = probe_records(record, 1.0 if no_browser else 10.0)
+        assert b"<html" in fetch(url).lower()
+    finally:
+        out = stop_view(proc)
+    assert out == b""
+    assert opened == ([] if no_browser else [{"url": url, "connected": True}])
 
 
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])

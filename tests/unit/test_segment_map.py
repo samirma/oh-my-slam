@@ -21,6 +21,7 @@ from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES
 from oh_my_slam.segmentation.colors import UNSEGMENTED
 from tests.fakes.client import FakeClient
+from tests.mapsnap import snapshot, with_committed_overlay
 from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.unit.test_cli_single import assert_catalogue_colours
 
@@ -45,7 +46,7 @@ def one_image_map(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def test_segment_map_works_with_the_server_down_and_never_modifies_it(
         one_image_map: Path, tmp_path: Path) -> None:
     assert not paths.socket_path().exists()  # no inference server in this test session
-    before = store.full_tree_hash(one_image_map)
+    before = snapshot(one_image_map)  # hidden entries included
     res = segment("-m", str(one_image_map))
     assert res.returncode == 0, res.stderr.decode()
     doc = json.loads(res.stdout)
@@ -80,7 +81,19 @@ def test_segment_map_works_with_the_server_down_and_never_modifies_it(
     assert quiet.returncode == 0 and quiet.stdout == b"" and out.read_bytes() == res.stdout
     default_ply = segment("-m", str(one_image_map), "-f", "ply")
     assert parse_ply(default_ply.stdout).label is None  # label property off by default
-    assert store.full_tree_hash(one_image_map) == before  # nothing in the map changed
+    assert snapshot(one_image_map) == before  # nothing in the map changed
+
+
+def test_segment_map_leaves_a_committed_staging_overlay_alone(one_image_map: Path,
+                                                               tmp_path: Path) -> None:
+    """A map whose last update was killed after its commit point: ``segment.sh -m`` reads it
+    through the overlay, and neither rolls the update forward nor discards ``.staging/``."""
+    mdir = with_committed_overlay(one_image_map, tmp_path / "map")
+    before = snapshot(mdir)
+    res = segment("-m", str(mdir), "-f", "ply", "-d", str(tmp_path / "art"))
+    assert res.returncode == 0, res.stderr.decode()
+    assert segment("-m", str(one_image_map), "-f", "ply").stdout == res.stdout
+    assert snapshot(mdir) == before
 
 
 def test_map_scene_colours_follow_the_current_palette(one_image_map: Path) -> None:

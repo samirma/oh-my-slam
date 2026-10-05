@@ -72,16 +72,13 @@ input.switch:checked::after { left: 15px; }
   text-align: left; color: var(--muted); font-weight: 500; padding: 4px;
   border-bottom: 1px solid var(--border); }
 #catalogue td, #cameras td { padding: 4px; border-bottom: 1px solid #2a2f3a; white-space: nowrap; }
-/* fixed columns: every number fits, the label takes what is left and ends in an ellipsis */
-#catalogue { table-layout: fixed; font-size: 12px; }
+/* segmentation's catalogue, every column as served: the table scrolls sideways inside its panel
+   (never the page), with the id and its swatch kept in view */
+#catalogue { width: max-content; min-width: 100%; font-size: 12px; }
 #catalogue th.num, #catalogue td.num { text-align: right; }
-#catalogue .c-sw { width: 22px; }
-#catalogue .c-id { width: 34px; }
-#catalogue .c-score { width: 40px; }
-#catalogue .c-dims { width: 106px; }
-#catalogue .c-vol { width: 48px; }
-#catalogue td.label { overflow: hidden; text-overflow: ellipsis; }
-#catalogue td.dims { letter-spacing: -0.2px; }
+#catalogue .c-id { position: sticky; left: 0; z-index: 1; background: var(--panel); text-align: left; }
+#catalogue th.c-id { z-index: 2; }
+#catalogue td.c-label { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
 #cameras th.num, #cameras td.num { text-align: right; }
 #cameras td.num { font-size: 12px; }
 #cameras .cam-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
@@ -109,10 +106,8 @@ input.switch:checked::after { left: 15px; }
 @media (min-width: 1280px) { :root { --panel-width: 380px; } }
 @media (max-width: 900px) {
   :root { --panel-width: 300px; }
-  #catalogue .c-score, #catalogue td:nth-child(4) { display: none; }
 }
 @media (max-width: 700px) {
   #app { flex-direction: column; }
   #panel { width: 100%; height: 46%; border-left: none; border-top: 1px solid var(--border); }
-  #catalogue .c-score, #catalogue td:nth-child(4) { display: table-cell; }
 }

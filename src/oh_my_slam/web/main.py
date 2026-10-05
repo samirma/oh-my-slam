@@ -43,6 +43,8 @@ from oh_my_slam.web.workspace import DEFAULT_DATA, Workspace
 PROG = "server.sh"
 LOCK = "server.lock"
 STATE = "server.json"
+LOG = "server.log"
+LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "oh_my_slam", "")  # "" is the root
 STOP_TIMEOUT_S = 180.0  # running jobs get the runner's grace period to stop
 FORCE_TIMEOUT_S = 10.0
 
@@ -143,6 +145,26 @@ def _released(ws: Workspace, timeout: float) -> bool:
 # -- serving ----------------------------------------------------------------------------------------
 
 
+def _log_to(path: Path) -> None:
+    """After the listening line nothing more reaches stderr (spec §2.6: exactly one line): the
+    uvicorn and oh_my_slam loggers (and the root, for asyncio and the rest) write to ``path``, and
+    so does anything else written to file descriptors 1 and 2 — warnings, a thread's traceback,
+    a library's own output. Jobs are unaffected: their stderr is a pipe to the job's log."""
+    import logging
+
+    stream = path.open("a", buffering=1, encoding="utf-8", errors="backslashreplace")
+    os.dup2(stream.fileno(), 2)
+    os.dup2(stream.fileno(), 1)
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    for name in LOGGERS:
+        logger = logging.getLogger(name)
+        logger.handlers = [handler]
+        logger.propagate = False
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.captureWarnings(True)  # py.warnings → the root logger → the file
+
+
 def _bind(port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -202,6 +224,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
                         "data": str(ws.root), "version": __version__,
                         "started_at": service.started_at})
                     _say(f"listening on {url}")
+                    _log_to(ws.root / LOG)
                     if open_browser:
                         webbrowser.open(_local(url))
 

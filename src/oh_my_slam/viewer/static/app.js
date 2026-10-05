@@ -99,19 +99,27 @@ async function reloadCloud() {
 }
 
 // ---------------------------------------------------------------- catalogue (an image only)
-function buildCatalogue() {
+// segmentation's own catalogue (api/catalog: the rows of catalog.csv), shown as served: the
+// server's row order and its columns, values unchanged. Only a colour swatch is added, next to the
+// id, so colour is never the only cue.
+function buildCatalogue(rows) {
+  const columns = rows.length ? Object.keys(rows[0]) : [];
+  const thead = $('#catalogue thead');
   const tbody = $('#catalogue tbody');
-  const rows = [...viewer.objects].sort((a, b) => b.volume - a.volume);
-  for (const o of rows) {
-    const [w, d, h] = o.dims;
-    tbody.appendChild(el('tr', { 'data-id': o.id },
-      el('td', {}, el('span', { class: 'swatch', style: `background:${o.hex}`, title: o.hex })),
-      el('td', { class: 'num' }, String(o.id)), el('td', { class: 'label', title: o.label }, o.label),
-      el('td', { class: 'num' }, o.score != null ? o.score.toFixed(2) : ''),
-      el('td', { class: 'num dims' }, `${w.toFixed(2)}×${d.toFixed(2)}×${h.toFixed(2)}`),
-      el('td', { class: 'num' }, o.volume.toFixed(3))));
+  thead.replaceChildren(el('tr', {}, ...columns.map((c) =>
+    el('th', { scope: 'col', class: typeof rows[0][c] === 'number' ? `num c-${c}` : `c-${c}` }, c))));
+  for (const row of rows) {
+    tbody.appendChild(el('tr', { 'data-id': row.id }, ...columns.map((c) => {
+      const v = row[c];
+      const cell = el('td', { class: typeof v === 'number' ? `num c-${c}` : `c-${c}` });
+      if (c === 'id') cell.append(el('span', { class: 'swatch', style: `background:${row.color_hex}`,
+        title: row.color_hex, 'aria-hidden': 'true' }), ' ');
+      cell.append(v == null ? '' : String(v));
+      if (c === 'label') cell.title = String(v);
+      return cell;
+    })));
   }
-  if (!rows.length) tbody.append(el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'No objects.')));
+  if (!rows.length) tbody.append(el('tr', {}, el('td', { class: 'muted' }, 'No objects.')));
 }
 
 // ---------------------------------------------------------------- main
@@ -134,7 +142,7 @@ async function main() {
   buildLayerControls($('#layers'), viewer.layers, (k, on) => viewer.setLayer(k, on),
     new Set(meta.cameras.length ? [] : ['cameras']));
   attrControls = buildAttributeControls($('#cloud-controls'), meta.controls, state.attrs, attrsChanged);
-  if (meta.mode === 'image') buildCatalogue();
+  if (meta.mode === 'image') buildCatalogue(await data.catalog());
   const cs = state.scene.openlabel.coordinate_systems || {};
   const axes = cs.map?.axes?.replaceAll(',', ', ');
   $('#cam-note').textContent = meta.mode === 'map'

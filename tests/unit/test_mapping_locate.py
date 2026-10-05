@@ -5,7 +5,6 @@ an image of another room is reported as unlocalisable; the map folder never chan
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -36,6 +35,7 @@ from oh_my_slam.mapping.locate import (
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.cloud import MAP_FRAME
 from tests.fakes.client import FakeClient, FakeFrame
+from tests.mapsnap import snapshot
 from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.synth.scene import Room
 
@@ -45,17 +45,6 @@ needs_colmap = pytest.mark.skipif(shutil.which("colmap") is None, reason="needs 
 
 def quiet(msg: str) -> None:
     pass
-
-
-def snapshot(root: Path) -> dict[str, tuple[bool, int, int, str]]:
-    """Every entry under ``root``, hidden ones included (``.lock``, ``.staging``): kind, size,
-    mtime and content hash — ``store.full_tree_hash`` skips hidden entries."""
-    out = {}
-    for p in sorted(root.rglob("*")):
-        st = p.stat()
-        digest = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
-        out[str(p.relative_to(root))] = (p.is_dir(), st.st_size, st.st_mtime_ns, digest)
-    return out
 
 
 def rot_deg(A: np.ndarray, B: np.ndarray) -> float:

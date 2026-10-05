@@ -22,10 +22,10 @@ from typing import Any
 import numpy as np
 import pytest
 
-from oh_my_slam.mapping.store import full_tree_hash
 from oh_my_slam.viewer.bundle import ViewBundle, image_bundle, map_bundle
 from tests.browser.conftest import View
 from tests.browser.scenes import running, synthetic_image, synthetic_map
+from tests.mapsnap import snapshot
 
 pytestmark = [pytest.mark.browser]
 
@@ -53,7 +53,7 @@ def map_view(browser: Any, tmp_path_factory: pytest.TempPathFactory) -> Iterator
     if shutil.which("colmap") is None:
         pytest.skip("needs Homebrew colmap")
     root = synthetic_map(tmp_path_factory.mktemp("viewmap"))
-    before = full_tree_hash(root)
+    before = snapshot(root)  # hidden entries included
     bundle = map_bundle(root)
     with running(bundle) as url:
         v = View(browser, bundle, url)
@@ -326,14 +326,26 @@ def test_camera_frustums_at_the_scene_poses(view: View) -> None:
     assert visibility(v)["cameras"]
 
 
-def test_catalogue_lists_every_object_in_its_colour(image_view: View) -> None:
+def test_catalogue_is_segmentations_own(image_view: View) -> None:
+    """The catalogue is segmentation's (``bundle.catalog``, the rows of ``catalog.csv``) shown as
+    served: same row order, same columns, same values; each id with its colour swatch."""
     v = image_view
     v.pg.click('#tabs button[data-tab="catalogue"]')
-    rows = v.js("""() => [...document.querySelectorAll('#catalogue tbody tr[data-id]')].map(tr => ({
-      id: Number(tr.dataset.id), label: tr.children[2].textContent,
-      hex: tr.querySelector('.swatch').title}))""")
-    objects = v.js("() => window.__viewer.objects.map(o => ({id: o.id, label: o.label, hex: o.hex}))")
-    assert sorted(rows, key=lambda r: r["id"]) == sorted(objects, key=lambda r: r["id"])
+    shown = v.js("""() => ({
+      head: [...document.querySelectorAll('#catalogue thead th')].map(th => th.textContent),
+      rows: [...document.querySelectorAll('#catalogue tbody tr[data-id]')].map(tr => ({
+        id: Number(tr.dataset.id), hex: tr.querySelector('.swatch').title,
+        cells: [...tr.children].map(td => td.textContent.trim())}))})""")
+    catalog = v.bundle.catalog
+    assert catalog and shown["head"] == list(catalog[0])
+    assert [r["id"] for r in shown["rows"]] == [r["id"] for r in catalog]  # the server's order
+    for row, served in zip(shown["rows"], catalog, strict=True):
+        assert row["hex"] == served["color_hex"]
+        assert [float(c) if isinstance(x, (int, float)) else c
+                for c, x in zip(row["cells"], served.values(), strict=True)] == list(served.values())
+    objects = v.js("() => window.__viewer.objects.map(o => ({id: o.id, hex: o.hex}))")
+    assert sorted((r["id"], r["hex"]) for r in shown["rows"]) == sorted(
+        (o["id"], o["hex"]) for o in objects)  # the colour of the OBBs
     v.pg.click('#tabs button[data-tab="controls"]')
     assert v.errors == []
 
@@ -354,16 +366,15 @@ def test_layouts(view: View, tmp_path: Path) -> None:
         assert box["scroll"] <= w, name  # no horizontal overflow
         assert box["canvas"]["width"] > 0.3 * w and box["canvas"]["height"] > 0.3 * h, name
         assert box["panel"]["right"] <= w + 1 and box["panel"]["width"] > 0, name
-        # every catalogue column fits the panel: no sideways scrolling, numbers not clipped
+        # the catalogue's columns scroll inside the panel, never the page; numbers not clipped
         if v.bundle.mode == "image":
             v.pg.click('#tabs button[data-tab="catalogue"]')
             cat = v.js("""() => {
-              const w = document.querySelector('#tab-catalogue .table-wrap');
               const cells = [...document.querySelectorAll('#catalogue td.num')];
-              return {scroll: w.scrollWidth, client: w.clientWidth,
+              return {page: document.documentElement.scrollWidth,
                       clipped: cells.filter(c => c.offsetParent && c.scrollWidth > c.clientWidth + 1).length};
             }""")
-            assert cat["scroll"] <= cat["client"] and cat["clipped"] == 0, (name, cat)
+            assert cat["page"] <= w and cat["clipped"] == 0, (name, cat)
             v.pg.click('#tabs button[data-tab="controls"]')
         v.pg.screenshot(path=str(out / f"{v.bundle.mode}-{name}.png"))
     v.pg.set_viewport_size({"width": 1280, "height": 800})
@@ -493,7 +504,7 @@ def test_long_camera_list(ring_view: View) -> None:
 
 
 def test_map_unchanged_after_viewing(map_view: View) -> None:
-    assert full_tree_hash(map_view.root) == map_view.before  # type: ignore[attr-defined]
+    assert snapshot(map_view.root) == map_view.before  # type: ignore[attr-defined]
 
 
 def test_empty_map_still_renders(browser: Any, tmp_path: Path) -> None:
