@@ -17,9 +17,10 @@ Part of the [high-level specification](high_level_spec.md) (§2 Components).
   wins where the two disagree (an older or newer service).
 * **It describes every endpoint:** each route under `/api/`, with its method, parameters or
   body, what it does (read-only, writes a map, needs the inference server), a ready-to-run
-  `curl` command (`-F` for uploads, `-N` for the event streams, `-o` for results and files), a
-  sample response, and the API's error shape (the command's message and machine-readable
-  code, with the HTTP status of the generic rule).
+  `curl` command (`-T` for uploads, sending the raw file as the request body, since the service
+  refuses `-F` forms; `-N` for the event streams; `-o` for results and files), a sample
+  response, and the API's error shape (the command's message and machine-readable code, with
+  the HTTP status of the generic rule).
 * **Job workflow.** The skill walks the agent through a whole job: upload the inputs (or name
   paths inside the workspace), validate and submit the operation, follow the job by polling
   or by its event stream until it ends, then download the result and each produced file.
