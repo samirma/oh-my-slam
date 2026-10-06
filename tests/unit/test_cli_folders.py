@@ -95,9 +95,9 @@ def test_mapper_refuses_a_non_map_folder_with_the_server_down(tmp_path: Path,
 @pytest.mark.parametrize("args", [
     ["segment.sh", "-i", "{image}", "-o", "{bad}/out.json"],
     ["segment.sh", "-i", "{image}", "-d", "{bad}/out"],
-    ["segment.sh", "-m", "{map}", "-o", "{bad}/out.json"],
-    ["segment.sh", "-m", "{map}", "-d", "{bad}/out"],
+    ["segment.sh", "-i", "{image}", "-f", "png", "-o", "{bad}/out.png"],
     ["reconstruct.sh", "-i", "{image}", "-o", "{bad}/out.json"],
+    ["reconstruct.sh", "-i", "{image}", "-f", "depth", "-o", "{bad}/depth.png"],
     ["mapper.sh", "update", "-i", "{image}", "-m", "{fresh}", "-o", "{bad}/out.json"],
 ])
 def test_unwritable_output_is_a_usage_error_before_any_work(
@@ -118,15 +118,12 @@ def test_unwritable_output_is_a_usage_error_before_any_work(
 def test_segment_image_creates_no_folder_with_the_server_down(tmp_path: Path, image: Path
                                                               ) -> None:
     """No server runs here: ``segment.sh -i -d <new folder>`` fails with exit 3 and leaves no
-    folder behind (it is created once the server is known to be up); ``-m`` still creates it."""
+    folder behind (it is created once the server is known to be up), whatever ``-f`` says."""
     new = tmp_path / "new" / "artefacts"
-    res = sh("segment.sh", "-i", str(image), "-d", str(new))
-    assert res.returncode == 3, res.stderr.decode()
-    assert res.stdout == b"" and not (tmp_path / "new").exists()
-    made = tmp_path / "from_map"
-    res = sh("segment.sh", "-m", str(minimal_map(tmp_path / "map")), "-d", str(made))
-    assert res.returncode == 0, res.stderr.decode()
-    assert made.is_dir()
+    for fmt in ("json", "png"):
+        res = sh("segment.sh", "-i", str(image), "-f", fmt, "-d", str(new))
+        assert res.returncode == 3, res.stderr.decode()
+        assert res.stdout == b"" and not (tmp_path / "new").exists()
 
 
 def test_segment_image_creates_its_folder_with_the_server_up(stub_server: None, tmp_path: Path,
@@ -135,6 +132,11 @@ def test_segment_image_creates_its_folder_with_the_server_up(stub_server: None, 
     res = sh("segment.sh", "-i", str(image), "-d", str(new))
     assert res.returncode == 0, res.stderr.decode()
     assert (new / "segmentation.json").read_bytes() == res.stdout
+    res = sh("segment.sh", "-i", str(image), "-f", "png", "-d", str(new))
+    assert res.returncode == 0, res.stderr.decode()
+    assert (new / "segmented.png").read_bytes() == res.stdout
+    assert sorted(p.name for p in new.iterdir()) == ["catalog.csv", "catalog.md",
+                                                     "segmentation.json", "segmented.png"]
 
 
 def test_preflight_creates_missing_parents_and_names_the_path(tmp_path: Path,

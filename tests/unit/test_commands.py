@@ -165,6 +165,22 @@ def test_an_option_added_to_the_registry_reaches_parser_and_export(
         "required": False, "default": 1.0, "minimum": 0}.items() <= op["parameters"][-1].items()
 
 
+def test_applicability_conditions_read_the_parsed_arguments() -> None:
+    """``When``: an option given (the -d artefacts), a value among some (-f png: the segmented
+    image), or exactly one video (-fps)."""
+    given, png = spec.When("artifacts"), spec.When("format", ("png",))
+    video = spec.When("inputs", video=True)
+    args = argparse.Namespace(artifacts=Path("d"), format="png", inputs=[Path("a.MP4")])
+    assert given.holds(args) and png.holds(args) and video.holds(args)
+    args = argparse.Namespace(artifacts=None, format="json", inputs=[Path("a.jpg")])
+    assert not (given.holds(args) or png.holds(args) or video.holds(args))
+    assert not video.holds(argparse.Namespace(inputs=[Path("a.mp4"), Path("b.mp4")]))
+    seg = {o["name"]: o for o in spec.describe()["operations"][3]["outputs"]
+           if o["via"] == "-d"}
+    assert seg["segmented.png"]["when"] == [given.describe()] == [{"option": "artifacts",
+                                                                   "is": "given"}]
+
+
 def test_cloud_attribute_schemas_match_their_parsers() -> None:
     """The typed attribute schema the API publishes accepts and refuses what ``-p`` does."""
     for a in ATTRIBUTES:
