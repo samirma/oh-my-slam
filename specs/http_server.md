@@ -1,6 +1,6 @@
 # 2.6 Web service — `server.sh`
 
-Part of the [high-level specification](high_level_spec.md) (§2 Components).
+Part of the [high-level specification](../high_level_spec.md) (§2 Components).
 
 ```sh
 server.sh [--port <n>] [--data <folder>] [--no-browser]
@@ -51,7 +51,7 @@ Concretely:
 * **Results.** For the same inputs and options, a successful response's body is
   **byte-identical** to what the command writes to stdout or to `-o`. Every contract the
   commands guarantee — the scene format
-  ([§3](high_level_spec.md#3-scene-description-json-returned-by-the-tools)), the colour
+  ([§3](../high_level_spec.md#3-scene-description-json-returned-by-the-tools)), the colour
   contract, read-only maps, the map-update semantics — therefore holds for the service
   without being restated here.
 * **Errors.** Every error a command can report reaches the client with the command's message
@@ -113,7 +113,7 @@ operation in the same way.
 
 ### `reconstruct.sh` ([§2.2](reconstruct.md))
 
-* **Reconstruct an image.** One image in; the response is the scene description (JSON) or
+* **Reconstruct an image.** One image in; the response is the scene description (JSON), the depth image (PNG) or
   the point cloud (PLY), as the command's format option selects. Needs the inference server.
 
 ### `mapper.sh` ([§2.3](mapper.md))
@@ -129,9 +129,7 @@ operation in the same way.
 ### `segment.sh` ([§2.4](segment.md))
 
 * **Segment an image.** One image in; the response is the scene description (JSON) or the
-  object-coloured point cloud (PLY). Needs the inference server.
-* **Segment a map.** The same for a persisted map's objects, read-only and without the
-  inference server.
+  segmented image (PNG). Needs the inference server.
 
 The artefacts that `segment.sh -d` writes to a folder are not offered by the API.
 
@@ -167,7 +165,7 @@ page (see Structure).
   metadata), with a filter. Creating or updating a map is a guided flow over the mapping
   operation's options, with the input order visible and editable. A map's page shows its
   summary and its update history with timings, from the map's metadata, and runs the
-  operations that take a map (locating images in it, segmenting it), with the same result
+  operations that take a map (locating images in it), with the same result
   display and download.
 
 Every page has a stable URL, so a map's page can be bookmarked, reloaded or shared on this
@@ -199,7 +197,7 @@ machine.
 
 ## Evaluation
 
-The benchmark evaluators of [§5](high_level_spec.md#5-benchmark-evaluators) cover `server.sh`
+The benchmark evaluators of [§5](../high_level_spec.md#5-benchmark-evaluators) cover `server.sh`
 on the same reference inputs as the commands:
 
 * **Performance** — start-up time and resident memory, time until the web application has
@@ -210,5 +208,5 @@ on the same reference inputs as the commands:
   the commands' definitions, so a new option or mode is covered without changing the
   evaluator.
 * **UI** — browser tests run the main flows (single-image request, a point-cloud result drawn
-  in the page, map creation and update, locating images in a map, segmenting a map, download,
+  in the page, map creation and update, locating images in a map, download,
   interruption, inference server down) and check accessibility automatically.

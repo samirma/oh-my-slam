@@ -1,6 +1,6 @@
 # 2.3 Mapping — `mapper.sh`
 
-Part of the [high-level specification](high_level_spec.md) (§2 Components).
+Part of the [high-level specification](../high_level_spec.md) (§2 Components).
 
 ```sh
 mapper.sh update -i <image(s)|video> -m <map-folder>   # whole map as JSON (default) to stdout
@@ -15,7 +15,7 @@ and left untouched. Only `-i` and `-m` are required; every other option has a de
 
 * `-i <image(s)|video>` — one or more images, or a video file.
 * `-m <map-folder>` — map directory; holds the persisted map and its metadata.
-* `-f json|ply` — output format, **default `json`**: the scene description of [§3](high_level_spec.md#3-scene-description-json-returned-by-the-tools), or the
+* `-f json|ply` — output format, **default `json`**: the scene description of [§3](../high_level_spec.md#3-scene-description-json-returned-by-the-tools), or the
   point cloud, in map coordinates. `-t` selects what either format covers.
 * `-t full|single` — scope of the result, **default `full`**:
   * `full` — the **entire** map: every object, and the estimated camera pose of each

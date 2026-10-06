@@ -1,6 +1,6 @@
 # 2.5 Visualisation — `view.sh`
 
-Part of the [high-level specification](high_level_spec.md) (§2 Components).
+Part of the [high-level specification](../high_level_spec.md) (§2 Components).
 
 ```sh
 view.sh -i <image> [--no-browser]
