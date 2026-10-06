@@ -4,7 +4,10 @@ Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi`
 health, uploads (create and discard), the workspace's maps (as a list and one by one), and per
 operation ``POST /api/ops/<op>`` — which runs the command within the request and answers when it
 ends (``web.runner``) — and ``POST /api/ops/<op>/validate``. ``/`` is the web application
-(``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files.
+(``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files,
+and ``/static/viewer/lib/…`` and ``/static/viewer/vendor/…`` the §2.5 viewer's own ES modules and
+vendored libraries, from the viewer's package (not copied), with which the application draws a
+point-cloud result.
 
 An operation's answer is the command's: on success its stdout, byte for byte, in the result's media
 type, with the command's per-stage timings in a ``Server-Timing`` header (its own stage names, in
@@ -72,6 +75,10 @@ SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
 CLIENT_GONE = 499  # what an interrupted request is logged with (nobody reads it)
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
+# the viewer's modules and vendored libraries (spec §2.6 "Image": a point-cloud result is drawn with
+# the §2.5 viewer's own rendering); its page (index.html, app.js, style.css) is view.sh's alone
+VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
+VIEWER_PARTS = ("lib", "vendor")
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
                  ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
                  ".txt": "text/plain"}
@@ -327,9 +334,14 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
                             headers={"Cache-Control": "no-cache"})
 
     async def static(request: Request) -> Response:
-        """The web application's files."""
+        """The web application's files; ``viewer/lib/…`` and ``viewer/vendor/…`` the viewer's."""
         rel = request.path_params["path"]
         root = WEB_STATIC
+        if rel.startswith("viewer/"):
+            part, _, rel = rel.removeprefix("viewer/").partition("/")
+            if part not in VIEWER_PARTS:
+                raise NotFoundError(f"no file {request.path_params['path']}")
+            root = VIEWER_STATIC / part
         try:
             target = (root / rel).resolve()
         except (ValueError, OSError):  # e.g. an embedded NUL byte

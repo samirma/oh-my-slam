@@ -1,9 +1,12 @@
-// A result as the response carried it (http_server.md "Image": "a scene description shown with its
-// objects listed (label, id, colour, score), any result shown in full, and a download of it"). The
-// download is the response body itself, byte for byte (the command's own output); the text shown is
-// that body as received. What is shown follows the result's format and content, never the command:
-// a JSON document that is a scene description (OpenLABEL) has its objects listed; a PLY its header.
+// A result as the response carried it (http_server.md "Image": a scene description (JSON) "is shown
+// in full, with its objects listed (label, id, colour, score)"; a point cloud (PLY) "is loaded in the
+// page and drawn in 3D"; "every result can be downloaded byte for byte"). The download is the
+// response body itself, byte for byte (the command's own output); the text shown is that body as
+// received. What is shown follows the result's format and content, never the command: a JSON
+// document that is a scene description (OpenLABEL) has its objects listed; a PLY is drawn in 3D by
+// the viewer's rendering (cloudresult.js), with its header below.
 import { el, fmtBytes, fmtSeconds, hexColor } from './dom.js';
+import { cloudSection } from './cloudresult.js';
 
 const SHOW_TEXT_MAX = 8 << 20;  // a text body larger than this is offered as a download only
 
@@ -98,6 +101,7 @@ export async function resultView({ blob, mediaType, stages, format, downloadName
   if (stages.length) box.append(el('details', { class: 'stages-box' }, el('summary', {}, 'Per-stage timings'), stagesTable(stages, 'The command\'s stages (Server-Timing)')));
 
   let text = null;
+  let cloud = null;  // a point cloud's 3D view
   if (/json|text/.test(mediaType) || format === 'json') text = blob.size <= SHOW_TEXT_MAX ? await blob.text() : null;
   if (text !== null) {
     let doc = null;
@@ -109,16 +113,14 @@ export async function resultView({ blob, mediaType, stages, format, downloadName
     content.append(...fullText(text, doc));
   } else {
     const ply = await plyHeader(blob);
-    if (ply) {
-      const counts = ply.elements.map((e) => `${e.count.toLocaleString()} ${e.name}${e.count === 1 ? '' : 's'}`).join(', ');
-      content.append(el('p', {}, `A PLY point cloud (${ply.format}): ${counts || 'no element'}.`));
-      if (ply.format === 'ascii' && blob.size <= SHOW_TEXT_MAX) {
-        content.append(el('h3', {}, 'The result in full'),
-          el('pre', { class: 'result-text', tabindex: '0', 'aria-label': 'The result in full', 'data-testid': 'result-text' }, await blob.text()));
-      } else {
-        content.append(el('h3', {}, 'Its header'),
+    if (ply || format === 'ply') {
+      cloud = cloudSection(blob);
+      content.append(cloud.el);
+      if (ply) {
+        const counts = ply.elements.map((e) => `element ${e.name} ${e.count.toLocaleString()}`).join(', ');
+        content.append(el('details', { class: 'ply-header' }, el('summary', {}, `Its PLY header (${ply.format}: ${counts || 'no element'})`),
           el('pre', { class: 'result-text', tabindex: '0', 'aria-label': 'The PLY header', 'data-testid': 'result-text' }, ply.header),
-          el('p', { class: 'muted' }, `The ${fmtBytes(blob.size - ply.header.length)} of ${ply.format.replaceAll('_', ' ')} point data after the header are in the download.`));
+          el('p', { class: 'muted' }, `The ${fmtBytes(blob.size - ply.header.length)} of ${ply.format.replaceAll('_', ' ')} point data after the header are in the download.`)));
       }
     } else {
       content.append(el('p', { class: 'muted' }, blob.size > SHOW_TEXT_MAX
@@ -126,5 +128,5 @@ export async function resultView({ blob, mediaType, stages, format, downloadName
         : 'A binary result: download it.'));
     }
   }
-  return { el: box, dispose: () => URL.revokeObjectURL(url) };
+  return { el: box, cloud, dispose: () => { cloud?.dispose(); URL.revokeObjectURL(url); } };
 }

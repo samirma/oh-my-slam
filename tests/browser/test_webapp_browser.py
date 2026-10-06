@@ -1,6 +1,7 @@
 """The server.sh web application in a real browser (``-m browser``; http_server.md "Evaluation → UI"):
-a single-image request, map creation and update, locating images in a map, segmenting a map, the
-download of a result, interruption (and a request waiting for its turn), and an automatic
+a single-image request, a point-cloud result drawn in the page (on the Image page and on a map's
+page), map creation and update, locating images in a map, segmenting a map, the download of a
+result, interruption (and a request waiting for its turn), and an automatic
 accessibility check of every page; plus the registry-driven forms, stable URLs, responsiveness, the
 keyboard and the layout down to tablet width in both themes.
 
@@ -10,7 +11,9 @@ is ``test_webapp_down.py``."""
 
 from __future__ import annotations
 
+import base64
 import dataclasses
+import io
 import json
 import os
 import shutil
@@ -20,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 import pytest
 
 from oh_my_slam.commands import spec
@@ -174,21 +178,251 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     assert tab.errors == []
 
 
-def test_a_point_cloud_result_shows_its_header(tab: Tab, image: Path) -> None:
+# ------------------------------------------------------------------ a point-cloud result in 3D
+
+BACKGROUND = (0x15, 0x17, 0x1C)  # the viewer's (lib/viewer.js), as view.sh draws it
+CLOUD = "[data-testid=cloud]"
+CANVAS = "[data-testid=cloud-canvas]"
+
+
+def cloud_image(pg: Any) -> np.ndarray:
+    """The 3D view's WebGL canvas as last drawn (RGB)."""
+    from PIL import Image
+
+    url = pg.eval_on_selector(f"{CANVAS} canvas", "c => c.toDataURL('image/png')")
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB"))
+
+
+def cloud_state(pg: Any) -> dict[str, Any]:
+    """The 3D view's viewpoint: camera position, the point it turns around, frames drawn."""
+    return pg.eval_on_selector(CLOUD, """e => { const v = e.cloudView.viewer;
+      return {pos: v.camera.position.toArray(), target: v.controls.target.toArray(), frames: v.frames,
+              shown: v.groups.points.children[0].geometry.attributes.position.count}; }""")
+
+
+def settle(pg: Any) -> dict[str, Any]:
+    """Wait until the view stops moving (orbit damping) and nothing is drawn for 300 ms."""
+    last = cloud_state(pg)
+    for _ in range(100):
+        pg.wait_for_timeout(300)
+        now = cloud_state(pg)
+        if now["frames"] == last["frames"]:
+            return now
+        last = now
+    raise AssertionError("the 3D view keeps drawing")
+
+
+def distance(st: dict[str, Any]) -> float:
+    return float(np.linalg.norm(np.subtract(st["pos"], st["target"])))
+
+
+def turned(a: dict[str, Any], b: dict[str, Any]) -> float:
+    """Degrees the viewpoint turned around the vertical (z) axis from ``b`` to ``a``."""
+    da, db = np.subtract(a["pos"], a["target"]), np.subtract(b["pos"], b["target"])
+    d = np.degrees(np.arctan2(da[1], da[0]) - np.arctan2(db[1], db[0]))
+    return float(abs((d + 180) % 360 - 180))
+
+
+def ply_body(pg: Any, op: str) -> bytes:
+    """Run the page's operation ``op`` with ``-f ply``; the response body once the 3D view is
+    drawn."""
+    pg.select_option(".field[data-param=format] select", "ply")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f=ply')")
+    with operation_response(pg, op) as answer:
+        pg.click("button[data-action=run]")
+    pg.wait_for_selector("[data-testid=request][data-state=done]", timeout=180_000)
+    pg.wait_for_selector(f"{CLOUD}[data-state=drawn]", timeout=60_000)
+    return answer.body
+
+
+def check_drawn(pg: Any, body: bytes) -> None:
+    """The 3D view of a PLY result: its point count is the file's (all drawn, within the budget),
+    the canvas shows the points in the colours the file carries (exactly, as view.sh writes them),
+    and its text alternative states the count and what each point carries."""
+    from oh_my_slam.core.ply import parse_header, parse_ply
+
+    n = parse_header(body).count
+    cloud = parse_ply(body)
+    assert n > 0 and cloud.rgb is not None
+    assert pg.inner_text(f"{CLOUD} [data-fact=Points]") == f"{n:,}"
+    assert cloud_state(pg)["shown"] == n
+    carries = pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
+    assert carries.startswith("position") and "colour (color=" in carries
+    label = pg.get_attribute(CANVAS, "aria-label")
+    assert f"{n:,} points" in label and "colour" in label
+    img = cloud_image(pg)
+    drawn = np.any(img != BACKGROUND, axis=2)
+    assert drawn.mean() > 0.01, f"{drawn.mean():.4f} of the canvas drawn"
+    colours = {tuple(c) for c in np.unique(cloud.rgb, axis=0).tolist()}
+    exact = {tuple(c) for c in np.unique(img[drawn], axis=0).tolist()} & colours
+    assert len(exact) >= min(10, max(1, len(colours) - 1)), f"{len(exact)} of the file's colours on screen"
+
+
+def test_a_point_cloud_result_is_drawn_in_3d(tab: Tab, image: Path) -> None:
+    """reconstruct -f ply on the Image page: the PLY in the response is read in the page (no other
+    request) and drawn by the viewer's rendering with the colours it carries; buttons, the keyboard,
+    a drag and the wheel rotate, pan and zoom it; its header is shown, the download is the body
+    byte for byte, and the page passes axe."""
     pg = tab.go("#/image?op=reconstruct")
     assert pg.is_checked("#op-reconstruct")
     pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
     pg.wait_for_selector(".field[data-param=image] li.ready")
-    pg.select_option(".field[data-param=format] select", "ply")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f=ply')")
-    with operation_response(pg, "reconstruct") as answer:
-        pg.click("button[data-action=run]")
-    tab.wait_request()
-    body = answer.body
+    requests: list[str] = []
+    pg.on("request", lambda r: requests.append(f"{r.method} {r.url}"))
+    body = ply_body(pg, "reconstruct")
+    check_drawn(pg, body)
+    # read from the bytes the page held: no request but the operation's and the viewer's modules
+    # (besides the health polls and the image uploaded again for the next run)
+    others = [r for r in requests if not any(p in r for p in (
+        "/api/ops/reconstruct", "/static/viewer/", "/api/health", "/api/uploads"))]
+    assert others == [], others
+    assert pg.inner_text(f"{CLOUD} [data-fact=Frame]").endswith("shown upright, as view.sh shows an image (level camera)")
     header = body[:body.index(b"end_header\n") + len(b"end_header\n")].decode("latin1")
     assert pg.text_content("[data-testid=result-text]") == header
+    first = settle(pg)
+    # the buttons
+    pg.click("[data-move='Rotate left']")
+    st = settle(pg)
+    assert turned(st, first) > 10 and distance(st) == pytest.approx(distance(first), rel=1e-3)
+    before = cloud_image(pg)
+    pg.click("[data-move='Zoom in']")
+    st2 = settle(pg)
+    assert distance(st2) == pytest.approx(distance(st) / 1.25, rel=1e-3)
+    assert not np.array_equal(cloud_image(pg), before)
+    pg.click("[data-move='Pan left']")
+    st3 = settle(pg)
+    assert np.linalg.norm(np.subtract(st3["target"], st2["target"])) > 1e-3
+    pg.click("[data-move='Reset view']")
+    st = settle(pg)
+    np.testing.assert_allclose(st["pos"], first["pos"], atol=1e-4)
+    # the keyboard: the view is focusable, arrows rotate, + and - zoom, 0 resets
+    pg.focus(CANVAS)
+    pg.keyboard.press("ArrowRight")
+    st = settle(pg)
+    assert turned(st, first) > 10
+    pg.keyboard.press("-")
+    st2 = settle(pg)
+    assert distance(st2) == pytest.approx(distance(st) * 1.25, rel=1e-3)
+    pg.keyboard.press("Shift+ArrowUp")
+    st3 = settle(pg)
+    assert st3["target"][2] > st2["target"][2]  # the viewpoint moved up (z is up)
+    pg.keyboard.press("0")
+    np.testing.assert_allclose(settle(pg)["pos"], first["pos"], atol=1e-4)
+    # Tab goes from the view to its buttons, with a visible focus
+    pg.keyboard.press("Tab")
+    focused = pg.evaluate("""() => { const e = document.activeElement, s = getComputedStyle(e);
+      return [e.getAttribute('aria-label'), s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) >= 2]; }""")
+    assert focused == ["Rotate left", True]
+    # the pointer: a drag rotates, the wheel zooms
+    box = pg.locator(CANVAS).bounding_box()
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    pg.mouse.move(x, y)
+    pg.mouse.down()
+    for i in range(1, 11):
+        pg.mouse.move(x + 8 * i, y)
+    pg.mouse.up()
+    st = settle(pg)
+    assert turned(st, first) > 10
+    pg.mouse.wheel(0, -400)
+    assert distance(settle(pg)) < distance(st) * 0.95
+    # an idle view draws nothing (it would keep the GPU busy next to the inference server)
+    frames = cloud_state(pg)["frames"]
+    pg.wait_for_timeout(1000)
+    assert cloud_state(pg)["frames"] == frames
     assert check_download(pg, body) == "reconstruct-photo.ply"
+    tab.a11y()
+    # a new result replaces the view: the previous one is disposed (its canvas and WebGL context)
+    pg.wait_for_selector(".field[data-param=image] li.ready")
+    pg.eval_on_selector(CLOUD, "e => { e.dataset.old = 'true'; window.__oldView = e.cloudView; }")
+    pg.click("button[data-action=run]")
+    pg.wait_for_selector(f"{CLOUD}[data-state=drawn]:not([data-old])", timeout=180_000)
+    assert pg.locator(f"{CANVAS} canvas").count() == 1
+    assert pg.evaluate("() => window.__oldView.viewer.renderer.getContext().isContextLost()")
+    old = pg.evaluate("() => window.__oldView.frames")
+    pg.click("[data-move='Zoom in']")  # moves the new view; the old one draws no more
+    pg.wait_for_timeout(300)
+    assert pg.evaluate("() => window.__oldView.frames") == old
     assert tab.errors == []
+
+
+def test_a_large_point_cloud_respects_the_display_budget(browser: Any, app: tuple[Any, str], image: Path) -> None:
+    """Above the viewer's display budget (here a test's 1,000 points) that many points, evenly spaced
+    in the file, are drawn and the page says so; the download stays complete."""
+    t = Tab(browser, app[1])
+    try:
+        t.ctx.add_init_script("window.__cloudBudget = 1000")
+        pg = t.go("#/image?op=reconstruct")
+        pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
+        pg.wait_for_selector(".field[data-param=image] li.ready")
+        body = ply_body(pg, "reconstruct")
+        from oh_my_slam.core.ply import parse_header
+
+        n = parse_header(body).count
+        assert n > 1000
+        assert cloud_state(pg)["shown"] == 1000
+        assert pg.inner_text(f"{CLOUD} [data-fact=Points]") == f"1,000 drawn of {n:,}"
+        note = pg.inner_text(f"{CLOUD} .cloud-note")
+        assert f"Showing 1,000 of {n:,} points: evenly spaced in the file's order, read in this page" in note
+        assert "PLY outputs and the map stay complete" in note
+        assert check_download(pg, body) == "reconstruct-photo.ply"
+        t.a11y()
+        assert t.errors == []
+    finally:
+        t.close()
+
+
+def test_a_point_cloud_that_does_not_parse(tab: Tab, image: Path) -> None:
+    """A PLY that cannot be read (here the service's answer cut short) says why in the page; its
+    download stays available, byte for byte as received."""
+    pg = tab.go("#/image?op=reconstruct")
+    pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
+    pg.wait_for_selector(".field[data-param=image] li.ready")
+    pg.select_option(".field[data-param=format] select", "ply")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f=ply')")
+    cut: dict[str, Any] = {}
+
+    def truncate(route: Any) -> None:
+        if route.request.method != "POST":
+            route.continue_()
+            return
+        res = route.fetch(timeout=0)
+        body = res.body()
+        cut["n"] = int(body.split(b"element vertex ")[1].split(b"\n")[0])
+        cut["body"] = body[:body.index(b"end_header\n") + len(b"end_header\n") + 100]
+        route.fulfill(status=res.status, headers=res.headers, body=cut["body"])
+
+    pg.route("**/api/ops/reconstruct", truncate)
+    pg.click("button[data-action=run]")
+    tab.wait_request()
+    pg.wait_for_selector(f"{CLOUD}[data-state=error]", timeout=60_000)
+    msg = pg.inner_text(f"{CLOUD} .notice.error .notice-body")
+    assert msg.startswith("This point cloud cannot be drawn: ")
+    assert f"the PLY body is too short for {cut['n']} vertices" in msg and "download above" in msg
+    assert pg.locator(f"{CLOUD} figure").is_hidden() and pg.locator(f"{CLOUD} [data-testid=cloud-tools]").is_hidden()
+    assert check_download(pg, cut["body"]) == "reconstruct-photo.ply"
+    tab.a11y()
+    assert tab.errors == []
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("width", [1280, 768])
+def test_a_point_cloud_result_in_both_themes_down_to_tablet_width(browser: Any, app: tuple[Any, str], image: Path,
+                                                                  scheme: str, width: int) -> None:
+    t = Tab(browser, app[1], width=width, height=1000, scheme=scheme)
+    try:
+        pg = t.go("#/image?op=segment-image")
+        pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
+        pg.wait_for_selector(".field[data-param=image] li.ready")
+        body = ply_body(pg, "segment-image")
+        check_drawn(pg, body)
+        assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
+        bad = axe_violations(pg)
+        assert not bad, f"a point-cloud result at {width}px ({scheme}):\n" + "\n".join(bad)
+        over = t.js("() => document.documentElement.scrollWidth - window.innerWidth")
+        assert over <= 0, f"a point-cloud result scrolls sideways by {over}px at {width}px"
+        assert t.errors == []
+    finally:
+        t.close()
 
 
 # ----------------------------------------------------------------- maps: create, update, locate, segment
@@ -317,6 +551,25 @@ def test_segmenting_a_map(mapped: dict[str, Any], tab: Tab) -> None:
     pg.reload()
     pg.wait_for_selector("body[data-ready=true]")
     assert pg.is_checked("#op-segment-map")
+    assert tab.errors == []
+
+
+def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -> None:
+    """segment.sh -m -f ply on a map's page: the map's cloud in its objects' colours (unsegmented
+    points grey), drawn in 3D as it is (map frame, z up)."""
+    pg = tab.go("#/maps/room?op=segment-map")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('segment.sh -m=maps/room')")
+    body = ply_body(pg, "segment-map")
+    check_drawn(pg, body)
+    assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
+    assert "z up" in pg.inner_text(f"{CLOUD} [data-fact=Frame]") and "upright" not in pg.inner_text(f"{CLOUD} [data-fact=Frame]")
+    first = settle(pg)
+    pg.click("[data-move='Rotate right']")
+    assert turned(settle(pg), first) > 10
+    pg.click("[data-move='Zoom out']")
+    assert distance(settle(pg)) > distance(first) * 1.2
+    assert check_download(pg, body) == "segment-map-room.ply"
+    tab.a11y()
     assert tab.errors == []
 
 

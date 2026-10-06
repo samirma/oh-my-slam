@@ -207,6 +207,27 @@ ul.files li { list-style: square; }
 .result-text { max-height: 28rem; overflow: auto; padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 6px;
   background: var(--code-bg); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.4rem 0; font-size: 0.8rem; }
 .stages-box { margin: 0.8rem 0; }
+.ply-header { margin: 0.8rem 0; }
+.ply-header > summary { cursor: pointer; font-weight: 600; padding: 0.2rem 0; }
+
+/* ---- a point-cloud result in 3D: the §2.5 viewer's canvas (its own dark background, as in
+   view.sh, in both themes), its text alternative and the buttons that move it */
+.cloud-status { margin: 0.3rem 0; }
+.cloud-figure { margin: 0.4rem 0; }
+.cloud-canvas { position: relative; height: min(62vh, 560px); min-height: 300px; border-radius: 8px; overflow: hidden;
+  background: #15171c; border: 1px solid var(--border-strong); }
+.cloud-canvas canvas { display: block; }
+.cloud-canvas:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.cloud-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.15rem 1rem; margin: 0.5rem 0 0;
+  font-size: 0.88rem; }
+.cloud-facts > div { display: contents; }
+.cloud-facts dt { color: var(--muted); }
+.cloud-facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.cloud-tools { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; align-items: center; margin: 0.5rem 0 0.2rem; }
+.cloud-figure > .help { margin: 0 0 0.4rem; }
+.tool-group { display: flex; flex-wrap: wrap; gap: 0.25rem; align-items: center; }
+.tool-name { font-weight: 600; font-size: 0.88rem; margin-right: 0.15rem; }
+.cloud-tools button.icon { min-width: 2.2rem; padding: 0.25rem 0.5rem; }
 .stages-box > summary { cursor: pointer; font-weight: 600; padding: 0.2rem 0; }
 .flow-done:empty { display: none; }
 

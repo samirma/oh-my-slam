@@ -7,6 +7,15 @@
   <link rel="icon" href="data:,">
   <title>oh-my-slam</title>
   <link rel="stylesheet" href="/static/style.css">
+  <!-- the §2.5 viewer's modules, which draw a point-cloud result, import its vendored three.js -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/viewer/vendor/three/build/three.module.js",
+        "three/addons/": "/static/viewer/vendor/three/addons/"
+      }
+    }
+  </script>
 </head>
 <body>
   <a class="skip" href="#main" data-skip>Skip to content</a>
