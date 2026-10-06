@@ -149,6 +149,31 @@ case "$*" in *-f\\ ply*) cp "{docs}/out.ply" "${{@: -1}}";; *-t\\ full*) cat "{d
     assert (tmp_path / "log").read_text().splitlines()[0].startswith("locate -i ")
 
 
+@pytest.mark.parametrize("writes", [False, True])
+def test_the_reference_map_stays_read_only(tmp_path: Path, writes: bool) -> None:
+    """view.sh -m and mapper.sh locate on the reference map must leave its folder as it was,
+    hidden entries included (contract.readonly.map)."""
+    doc = locate_doc({"001_bootstrap_level.jpg": cam(0.0)})
+    (tmp_path / "doc.json").write_text(json.dumps(doc))
+    touch = 'touch "${@: -1}/.lock"' if writes else "true"
+    repo = fake_repo(tmp_path, mapper=f'''{touch}; cat "{tmp_path}/doc.json"''')
+    out = tmp_path / "out"
+    single = out / "maps" / "single"
+    single.mkdir(parents=True)
+    (single / "map.json").write_text("{}")
+    ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES)
+    ev.map_commands(doc)
+    assert [r.spec.tag for r in ev.runner.records] == ["view_map", "locate_single",
+                                                       "locate_full", "locate_ply"]
+    assert ev.contracts.checks[("readonly", "map")] == {
+        "view.sh -m, mapper.sh locate": ["the map folder changed"] if writes else []}
+    ev = Evaluation(tmp_path / "none", Runner(tmp_path / "none", repo), BrowserProbe(None),
+                    examples=EXAMPLES)
+    ev.map_commands(None)  # no reference map: view.sh -m runs (and fails), nothing to compare
+    assert [r.spec.tag for r in ev.runner.records] == ["view_map"]
+    assert ("readonly", "map") not in ev.contracts.checks
+
+
 def test_street2_is_mapped_from_where_it_is(tmp_path: Path) -> None:
     timings = json.dumps({"stages_s": {"inference": 1.0}, "counts": {
         "keyframes_sampled": 10, "keyframes_registered": 9}})

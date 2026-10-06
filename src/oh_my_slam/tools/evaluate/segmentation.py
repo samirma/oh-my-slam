@@ -1,19 +1,5 @@
-"""Segmentation: detections, labels and scores per image, and their consistency with the map.
-
-The map's objects are built from the same detector's detections on the same keyframes, so this
-comparison measures consistency (is every map object backed by the detections of the frames it
-observes, and how many detections does the map keep), not accuracy — accuracy needs ground truth
-(``groundtruth``, ``gt.objects.*``).
-
-Method: the map exports, for each object, the keyframes that observed it (the object's
-``frame_intervals``, keyframe indices). For every registered capture, the labels of the map objects
-observed in its keyframe are compared with the labels ``segment.sh -i`` detects in the same capture:
-labels are paired one-to-one, identical labels first, then compatible ones (e.g. sofa / couch). A
-map object whose detections carried several labels (the detector's label flickered between
-keyframes and the map merged them: its ``detected_as`` labels) pairs with any of them.
-``map_objects_detected`` = paired map objects / map objects observed; ``detections_in_map`` =
-paired detections / detections (the rest were dropped or merged away by the map); both are summed
-over the frames."""
+"""Segmentation (spec §5): detections, labels and scores per image, and the one-to-one pairing of
+two lists of labels that the ground-truth comparison (``groundtruth``) uses."""
 
 from __future__ import annotations
 
@@ -24,11 +10,7 @@ from typing import Any
 import numpy as np
 
 from oh_my_slam.segmentation.detect import compatible, normalize_label
-from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.scene import DocObject
-
-MAP_CONSISTENCY = "seg.map_consistency"
-MAP_CONSISTENCY_METRICS = ("map_objects_detected", "detections_in_map")
 
 
 def detection_row(name: str, objs: list[DocObject]) -> dict[str, Any]:
@@ -58,27 +40,3 @@ def paired_labels(a: Sequence[str | Collection[str]], b: Sequence[str]) -> int:
                 right.pop(j)
                 n += 1
     return n
-
-
-def map_consistency(m: Metrics, prefix: str, frames: dict[str, list[DocObject]],
-                    map_objs: list[DocObject], sources: dict[int, str]) -> list[dict[str, Any]]:
-    """``<prefix>.map_objects_detected`` / ``.detections_in_map``: per-frame detections against
-    the map objects that observed each frame; ``frames``: capture name → its ``segment.sh -i``
-    objects."""
-    rows = []
-    seen = pairs = dets = 0
-    for key, capture in sorted(sources.items()):
-        if capture not in frames:
-            continue
-        observed = [o.labels or (o.label,) for o in map_objs if key in o.frames]
-        detected = [o.label for o in frames[capture]]
-        k = paired_labels(observed, detected)
-        rows.append({"image": capture, "keyframe": key, "map_objects": len(observed),
-                     "detections": len(detected), "paired": k})
-        seen, pairs, dets = seen + len(observed), pairs + k, dets + len(detected)
-    detail = {"frames": len(rows), "map_observations": seen, "detections": dets, "paired": pairs}
-    m.add(f"{prefix}.map_objects_detected", pairs / seen if seen else None, detail,
-          error=None if seen else "no map object is linked to an evaluated frame")
-    m.add(f"{prefix}.detections_in_map", pairs / dets if dets else None, detail,
-          error=None if dets else "no detections in the registered frames")
-    return rows

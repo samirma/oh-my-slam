@@ -25,7 +25,7 @@ from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe, ViewOutcome, served_url
 from oh_my_slam.viewer.bundle import DisplayCloud
 from oh_my_slam.viewer.routes import cloud_payload
-from tests.unit.test_evaluate_contracts import labelled_cloud, scene_bytes
+from tests.unit.test_evaluate_contracts import label_map, labelled_cloud, objects, scene_bytes
 
 ENTRY_POINTS = ("start_inference_server.sh", "reconstruct.sh", "mapper.sh", "segment.sh",
                 "view.sh", "server.sh")
@@ -166,6 +166,69 @@ cat {payload}""")
     assert checks["banner"] and "does not start with a JSON object" in checks["banner"][0]
     assert ev.contracts.checks[("openlabel", "reconstruct")] == {"json": [], "file": []}
     assert ev.contracts.checks[("stdout", "segment")]["failed"] == []  # failed, but silent
+
+
+# the result of each -f, by the stand-in commands of test_the_image_outputs_keep_their_contracts
+FORMATS = """fmt=json; out=""; dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in -f) fmt="$2"; shift;; -o) out="$2"; shift;; -d) dir="$2"; shift;; esac
+  shift
+done
+"""
+
+
+def test_the_image_outputs_keep_their_contracts(tmp_path: Path) -> None:
+    """restaurant.jpg's runs of the new outputs: reconstruct.sh -f depth (one 16-bit PNG of the
+    input's pixel size on stdout) and segment.sh -f png -d (one PNG, identical to the segmented.png
+    of the same run, its masks in the object colours of its segmentation.json); then the same
+    with broken stand-ins."""
+    from oh_my_slam.core.images import png_bytes, upright_size
+    from oh_my_slam.core.ply import ply_bytes
+    from oh_my_slam.segmentation.artifacts import write_artifacts
+    from oh_my_slam.segmentation.render import segmented_png
+
+    data = tmp_path / "data"
+    write_artifacts(data, scene_bytes(), segmented_png(np.zeros((60, 80, 3), np.uint8),
+                                                       label_map()), objects(), title="t")
+    (data / "cloud.ply").write_bytes(ply_bytes(labelled_cloud()))
+    w, h = upright_size(EXAMPLES / "restaurant.jpg")
+    (data / "depth.png").write_bytes(png_bytes(np.zeros((h, w), np.uint16)))
+    (data / "small.png").write_bytes(png_bytes(np.zeros((3, 4), np.uint16)))
+
+    def evaluation(name: str, depth: str, extra: str = "") -> Evaluation:
+        (tmp_path / name).mkdir()
+        repo = fake_repo(tmp_path / name, reconstruct=FORMATS + f"""
+case "$fmt" in json) f={data}/segmentation.json;; ply) f={data}/cloud.ply;;
+  depth) f={data}/{depth};; esac
+if [ -n "$out" ]; then mkdir -p "$(dirname "$out")"; cp "$f" "$out"; else cat "$f"; fi""",
+            segment=FORMATS + f"""
+mkdir -p "$dir"
+cp {data}/segmentation.json {data}/segmented.png {data}/catalog.csv {data}/catalog.md "$dir"/
+{extra}
+case "$fmt" in json) cat {data}/segmentation.json;; png) cat {data}/segmented.png;; esac""")
+        ev = Evaluation(tmp_path / name / "out", Runner(tmp_path / name / "out", repo),
+                        BrowserProbe(None))
+        ev.restaurant()
+        return ev
+
+    ev = evaluation("good", "depth.png")
+    checks = ev.contracts.checks
+    assert checks[("stdout", "reconstruct")]["reconstruct_depth"] == []
+    assert checks[("stdout", "reconstruct")]["reconstruct_depth/depth image"] == []
+    assert checks[("stdout", "segment")]["segment_image_png"] == []
+    assert checks[("artifacts", "segment")] == {"segment_image": [], "segment_image_png": []}
+    assert checks[("colour", "segment")] == {"segment_image": [], "segment_image/artefacts": [],
+                                            "segment_image_png/segmented image": []}
+    assert checks[("colour", "reconstruct")]["reconstruct_segment_ply"] == []
+    assert ev.metrics.items["seg.restaurant.objects"].value == 4
+    # a depth image of another size; a segmented.png that is not the image on stdout
+    ev = evaluation("bad", "small.png", extra='[ "$fmt" = png ] && echo x >> "$dir/segmented.png"')
+    checks = ev.contracts.checks
+    assert checks[("stdout", "reconstruct")]["reconstruct_depth/depth image"] == [
+        f"4x3 pixels; the input has {w}x{h}"]
+    assert checks[("artifacts", "segment")]["segment_image_png"] == [
+        "segmented.png differs from the -f png result on stdout"]
+    assert checks[("colour", "segment")]["segment_image_png/segmented image"] == []
 
 
 def test_frames_are_segmented_one_by_one(tmp_path: Path) -> None:

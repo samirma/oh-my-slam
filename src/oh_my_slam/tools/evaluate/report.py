@@ -40,11 +40,6 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "the split map with the one-update map (ids may differ where an earlier update published "
      "one)."),
     ("seg", "Segmentation", ""),
-    ("seg.map_consistency", "Segmentation vs map: consistency, not accuracy",
-     "The map's objects come from the same detector on the same keyframes, so these metrics "
-     "measure consistency. `map_objects_detected` is whether each map object is backed by a "
-     "detection in the frames it claims to observe. `detections_in_map` is how many per-frame "
-     "detections the map keeps. The accuracy measure is the ground-truth section (`gt.*`)."),
     ("contract", "Contracts", ""),
     ("server_sh", "Web service (server.sh)",
      "Performance, parity with the commands (each operation of `/api/openapi.json`, run within its "

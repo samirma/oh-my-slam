@@ -1,14 +1,18 @@
-"""Contract checkers of the evaluator on synthetic artefacts: stdout purity, OpenLABEL validity and
-the colour contract (JSON, segmented.png, catalogue, PLY)."""
+"""Contract checkers of the evaluator on synthetic artefacts: stdout purity (JSON, PLY, PNG, the
+depth image), OpenLABEL validity and the colour contract (JSON, segmented image, catalogue,
+PLY)."""
 
 from __future__ import annotations
 
 import json
+import struct
+import zlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from oh_my_slam.core.images import png_bytes
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.api import SceneObject
@@ -16,7 +20,7 @@ from oh_my_slam.segmentation.artifacts import write_artifacts
 from oh_my_slam.segmentation.catalog import catalog_csv, catalog_md
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, color_hex_for_id
 from oh_my_slam.segmentation.obb import OBB
-from oh_my_slam.segmentation.render import contact_sheet, segmented_image
+from oh_my_slam.segmentation.render import segmented_image, segmented_png
 from oh_my_slam.segmentation.scene import objects_block
 from oh_my_slam.tools.evaluate.contracts import (
     ContractLog,
@@ -24,6 +28,7 @@ from oh_my_slam.tools.evaluate.contracts import (
     catalog_csv_problems,
     catalog_md_problems,
     cloud_colour_problems,
+    depth_image_problems,
     parse_scene,
     payload_problems,
     png_colour_problems,
@@ -82,6 +87,44 @@ def test_one_ply_binary_or_ascii() -> None:
     assert payload_problems(binary[:-5], "ply")  # truncated
     assert payload_problems(ascii_ + b"1 2 3 0 0 0 0\n", "ply")  # one row too many
     assert payload_problems(b"[info] start\n" + binary, "ply")  # banner before the header
+
+
+def chunk(kind: bytes, data: bytes, crc: int | None = None) -> bytes:
+    """One PNG chunk (its CRC, unless one is given)."""
+    crc = zlib.crc32(kind + data) if crc is None else crc
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+
+def test_one_png() -> None:
+    png = png_bytes(np.zeros((4, 5, 3), np.uint8))
+    assert payload_problems(png, "png") == []
+    assert payload_problems(png_bytes(np.zeros((4, 5), np.uint16)), "png") == []
+    assert payload_problems(b"", "png") == ["expected one PNG payload, got nothing"]
+    assert "signature" in payload_problems(b"[info] start\n" + png, "png")[0]  # a banner first
+    assert "after the PNG's IEND" in payload_problems(png + b"done\n", "png")[0]  # progress after
+    assert "after the PNG's IEND" in payload_problems(png + png, "png")[0]  # two images
+    assert "cut short" in payload_problems(png[:-6], "png")[0]  # truncated in the IEND chunk
+    assert "cut short" in payload_problems(png[:20], "png")[0]  # truncated in the IHDR chunk
+    signature, ihdr = png[:8], png[8:33]
+    assert payload_problems(signature, "png") == [
+        "the chunks run [] … [], not IHDR … IEND (cut short?)"]
+    assert "not IHDR … IEND" in payload_problems(signature + ihdr, "png")[0]  # no IEND at all
+    iend = chunk(b"IEND", b"")
+    assert "not IHDR … IEND" in payload_problems(signature + iend, "png")[0]  # no IHDR
+    bad = bytearray(png)
+    bad[30] ^= 0xFF  # a byte of the IHDR chunk's data
+    assert "fails its CRC" in payload_problems(bytes(bad), "png")[0]
+    garbage = chunk(b"IDAT", b"not zlib data")  # a well-formed chunk that does not decode
+    assert "does not decode" in payload_problems(signature + ihdr + garbage + iend, "png")[0]
+
+
+def test_the_depth_image_is_16_bit_greyscale_of_the_inputs_size() -> None:
+    depth = png_bytes(np.zeros((3, 4), np.uint16))
+    assert depth_image_problems(depth, (4, 3)) == []
+    assert depth_image_problems(depth, (8, 6)) == ["4x3 pixels; the input has 8x6"]
+    assert depth_image_problems(png_bytes(np.zeros((3, 4, 3), np.uint8)), (4, 3)) == [
+        "bit depth 8 and colour type 2: not a 16-bit single-channel (greyscale) image"]
+    assert "signature" in depth_image_problems(b"not a png", (4, 3))[0]
 
 
 def test_empty_stdout_with_an_output_file() -> None:
@@ -168,22 +211,18 @@ def test_segmented_png_exact_masks() -> None:
     rgb = np.random.default_rng(1).integers(0, 256, (60, 80, 3), dtype=np.uint8)
     objs = doc_objects(scene_doc())
     good = segmented_image(rgb, label_map())
-    assert png_colour_problems(good, objs, sheet=False) == []
+    assert png_colour_problems(good, objs) == []
     blended = good.copy()
     mask = label_map() == 7
     blended[mask] = (0.6 * np.asarray(color_for_id(7)) + 0.4 * rgb[mask]).astype(np.uint8)
-    problems = png_colour_problems(blended, objs, sheet=False)
+    problems = png_colour_problems(blended, objs)
     assert any("not object colours" in p for p in problems)
     missing = segmented_image(rgb, np.where(label_map() >= 7, 0, label_map()))
-    assert png_colour_problems(missing, objs, sheet=False) == [
+    assert png_colour_problems(missing, objs) == [
         "only 2 of 4 object colours appear in the image"]
-
-
-def test_map_contact_sheet_headers_are_not_mask_colours() -> None:
-    rgb = np.random.default_rng(2).integers(0, 256, (60, 80, 3), dtype=np.uint8)
-    lab = np.where(label_map() == 1, 1, 0)
-    sheet = contact_sheet([("f000001", rgb, lab), ("f000002", rgb, np.zeros_like(lab))])
-    assert png_colour_problems(sheet, doc_objects(scene_doc()), sheet=True) == []
+    grey = good.copy()
+    grey[mask] = (200, 200, 200)  # a grey is no object colour either
+    assert any("not object colours" in p for p in png_colour_problems(grey, objs))
 
 
 def test_catalogue_colours() -> None:
@@ -212,13 +251,17 @@ def test_same_objects() -> None:
 
 def test_artefact_folder(tmp_path: Path) -> None:
     data = scene_bytes()
-    ply = ply_bytes(labelled_cloud())
-    write_artifacts(tmp_path, data, segmented_image(np.zeros((60, 80, 3), np.uint8),
-                                                    label_map()), objects(), ply, title="t")
+    png = segmented_png(np.zeros((60, 80, 3), np.uint8), label_map())
+    write_artifacts(tmp_path, data, png, objects(), title="t")
     assert artifact_problems(tmp_path, data) == []
-    assert artifact_problems(tmp_path, data + b" ")
-    (tmp_path / "extra.txt").write_text("x")
-    assert artifact_problems(tmp_path, data)
+    assert artifact_problems(tmp_path, png, "png") == []  # the segmented image of -f png
+    assert artifact_problems(tmp_path, None) == []
+    assert artifact_problems(tmp_path, data + b" ") == [
+        "segmentation.json differs from the -f json result on stdout"]
+    assert artifact_problems(tmp_path, data, "png") == [
+        "segmented.png differs from the -f png result on stdout"]
+    (tmp_path / "segments.ply").write_bytes(ply_bytes(labelled_cloud()))  # no longer an artefact
+    assert artifact_problems(tmp_path, data)[0].startswith("artefacts ['catalog.csv'")
 
 
 def test_contract_log_counts_failed_checks() -> None:

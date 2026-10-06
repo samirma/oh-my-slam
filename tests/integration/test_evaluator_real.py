@@ -44,7 +44,7 @@ def test_the_evaluator_measures_every_entry_point(tmp_path: Path) -> None:
     assert not broken, broken
     assert result["summary"]["regressions"] is None  # no baseline: nothing was compared
     # per stage: time and the peak memory of the command and of the server
-    for group in ("reconstruct_json", "segment_image", "mapper_single", "segment_map"):
+    for group in ("reconstruct_json", "segment_image", "mapper_single", "locate"):
         stages = by_id[f"perf.{group}.wall_s"]["detail"]["stages"]
         assert stages, group
         assert all(s["client_peak_mb"] and s["server_peak_gb"] for s in stages.values()), stages

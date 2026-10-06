@@ -34,7 +34,7 @@ class RunSpec:
     args: tuple[str, ...] = ()
     stdout: str = "json"  # expected stdout of a successful run: "json" | "ply" | "empty"
     output: Path | None = None  # the ``-o`` file, if any
-    output_kind: str | None = None  # its expected payload: "json" | "ply"
+    output_kind: str | None = None  # its expected payload: "json" | "ply" | "png"
     ok_exit: tuple[int, ...] = (0,)
     timeout_s: float = 3600.0
     env: tuple[tuple[str, str], ...] = ()  # set for this run only (e.g. the inference proxy)

@@ -30,7 +30,6 @@ PERF_GROUPS: dict[str, tuple[str, str]] = {
     "view_image": ("render_s", "single"),
     "mapper_single": ("wall_s", "single"),
     "mapper_split": ("wall_s", "sum"),  # the whole sequence over all updates
-    "segment_map": ("wall_s", "single"),
     "view_map": ("render_s", "single"),
     "locate": ("wall_s", "single"),  # mapper.sh locate on the reference map
     "mapper_office": ("wall_s", "single"),

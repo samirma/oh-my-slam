@@ -26,9 +26,7 @@ from typing import Any
 
 OPS = ("<=", ">=")
 # Metric ids renamed since earlier runs: stored results and baselines are read under the new id.
-RENAMED = {"seg.map.recall": "seg.map_consistency.map_objects_detected",
-           "seg.map.precision": "seg.map_consistency.detections_in_map",
-           "server_sh.job_overhead_median_s": "server_sh.request_overhead_median_s"}
+RENAMED = {"server_sh.job_overhead_median_s": "server_sh.request_overhead_median_s"}
 
 
 @dataclass(frozen=True)

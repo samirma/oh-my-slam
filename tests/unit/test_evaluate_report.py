@@ -75,16 +75,16 @@ def test_pattern_targets_cover_metrics_named_after_data(tmp_path: Path) -> None:
     t = load_targets(targets_file(tmp_path, doc))
     assert target_for(t, "perf.mapper_single.stage.sfm.s").value == 9  # its own
     assert target_for(t, "perf.mapper_single.stage.cloud.s").value == 30  # the group's pattern
-    assert target_for(t, "perf.segment_map.stage.export.s").value == 60  # the generic pattern
-    assert target_for(t, "perf.segment_map.wall_s") is None
+    assert target_for(t, "perf.other_group.stage.export.s").value == 60  # the generic pattern
+    assert target_for(t, "perf.other_group.wall_s") is None
     m = Metrics()
     m.add("perf.mapper_single.stage.cloud.s", 31.0)
-    m.add("perf.segment_map.stage.export.s", 1.0)
-    m.add("perf.segment_map.wall_s", 1.0)
+    m.add("perf.other_group.stage.export.s", 1.0)
+    m.add("perf.other_group.wall_s", 1.0)
     m.judge(t, None)
     assert m.items["perf.mapper_single.stage.cloud.s"].passed is False
-    assert m.items["perf.segment_map.stage.export.s"].passed is True
-    assert m.items["perf.segment_map.wall_s"].passed is None  # untargeted
+    assert m.items["perf.other_group.stage.export.s"].passed is True
+    assert m.items["perf.other_group.wall_s"].passed is None  # untargeted
 
 
 def test_targets_file_is_validated(tmp_path: Path) -> None:
@@ -139,10 +139,10 @@ def test_regressions_against_a_stored_baseline(tmp_path: Path) -> None:
 
 
 def test_renamed_metrics_of_stored_runs_keep_their_history() -> None:
-    old = {"metrics": [{"id": "seg.map.recall", "value": 0.99, "detail": None, "error": None},
-                       {"id": "seg.map.precision", "value": 0.88}]}
-    assert baseline_values(old) == {"seg.map_consistency.map_objects_detected": 0.99,
-                                    "seg.map_consistency.detections_in_map": 0.88}
+    old = {"metrics": [{"id": "server_sh.job_overhead_median_s", "value": 0.4, "detail": None,
+                        "error": None}, {"id": "seg.restaurant.objects", "value": 115}]}
+    assert baseline_values(old) == {"server_sh.request_overhead_median_s": 0.4,
+                                    "seg.restaurant.objects": 115}
 
 
 def test_missing_or_broken_baseline_is_reported(tmp_path: Path) -> None:

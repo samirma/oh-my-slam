@@ -2,15 +2,15 @@
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (specs/high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
   "rationale": {
     "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T152742Z (commit 51f168a, Apple M4 Max 36 GB, the final code, run alone under the machine-wide lock); their 'measured' is that run.",
-    "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), segment.sh -m 60 -> 2.5 s (1.2 s), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), segment.sh -m 2.5 -> 2.0 s (1.27 s), view.sh -m 4 -> 3 s (1.99 s).",
-    "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; segment.sh -m 1.2 GB -> 2 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), segment.sh -m 2 GB -> 1100 MB (710 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
-    "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and segment.sh -m / view.sh -m, which do not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
+    "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), view.sh -m 4 -> 3 s (1.99 s).",
+    "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
+    "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and view.sh -m, which does not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
     "pose.*": "The references are the commanded headings in the capture names, and the true heading deviates from them: SIFT homographies between the images themselves (pure rotation, measured 2026-09-25) give ~8 deg between 001 and 053 and ~9 deg between 026 and 078, which the names call the same heading, and 004 (commanded +15) at ~15-18 deg. A perfect estimator therefore scores a few degrees of median yaw error and ~9 deg on the same-heading pairs, so yaw_err_median <= 7, yaw_err_max <= 15 and same_heading_yaw_diff_max <= 10 stay: tighter targets would fail a correct map. Registration and pitch direction are exact properties of a working mapper on 79 rendered frames: >= 0.95 (at most 3 of 79 frames unregistered, 1 of 31 tilted frames with the wrong sign), up from 0.9.",
     "map.*.frame_agreement_*": "Spec intent: the map is one consistent cloud. The same-heading pairs see the same surfaces from nearly the same pose, so their stored depths must agree to within monocular depth noise once aligned: median <= 3 % (was 5 %) and p90 <= 10 % (was 15 %), i.e. ~6-9 cm / 20-30 cm at 2-3 m. The one-update map meets this (1.1 % / 6.0 %); the split map (6.8 % / 15.6 %) does not, which is the defect these targets are meant to show.",
     "map.*.frame_agreement_pairs_*": "Spec intent: the map is one consistent cloud wherever keyframes overlap, not only at the two same-heading pairs of §5. Every pair of keyframes whose optical axes are less than 45 deg apart and that share at least 500 pixels is compared, whatever their distance in capture order: sequence neighbours (where keyframe-by-keyframe depth disagrees locally: a scale-only adjustment left keyframes 2 apart at 21 %) and loop closures (where a depth scale that drifted along the sequence shows) alike; the detail reports both subsets (<= 10 and > 10 keyframes apart). Each pair's median disagreement |z_i->j / z_j - 1| measures how differently its two keyframes place the surfaces both see. Targets: the median pair within monocular depth noise, <= 3 % (as for the same-heading pairs); 90 % of the pairs within 5 % (0.1-0.15 m at 2-3 m); at most 1 % of the pairs grossly inconsistent, above 10 % (0.3 m at 3 m: the depth disagreement the object merges tolerate; 1 % leaves room for a few pairs at the edge of the angular range, which overlap only in their image borders where monocular depth is least reliable); and no pair above 15 % (1.5x the gross threshold: a pair disagreeing by 15-20 % draws its shared surfaces twice, 7-10 cm apart at 0.5 m). Measured on maps built 2026-09-25 (one-update / split): keyframe-by-keyframe alignment only (commit 521f1e1): median 1.75 / 1.78 %, p90 7.60 / 7.59 %, above 10 % 6.3 / 6.0 %, worst 20.6 / 21.1 %; one scale per keyframe adjusted over the pairs (commit 385e963): 1.93 / 1.93 %, 5.54 / 5.73 %, 2.7 / 2.7 %, 21.6 / 20.9 % (neighbours alone: worst 20.9 %, 3.5 % above 10 %); a scale and a near/far tilt per keyframe (commit 447f39c, run 20260925T070615Z): 1.78 / 1.81 %, 3.36 / 3.25 %, 0 / 0.13 %, 9.1 / 11.0 % (neighbours alone: worst 9.1 / 11.0 %, 0 / 0.2 % above 10 %; the worst pairs are 42-45 deg apart and overlap only in their image borders).",
     "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing. matched_fraction is the share of the one-update map's objects found in the split map (user ruling 2026-10-05, mapper.md 83ee7a9: the split map may keep an object an earlier update published that no later image contradicts); the split map's extra objects are listed in the detail as extra_published, not counted against it.",
-    "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. The seg.map_consistency metrics (formerly seg.map.recall / precision) compare the map's objects with per-frame detections of the same detector: they measure consistency, not accuracy. A map object pairs with a per-frame detection under its label or any of its detected_as labels (the labels its detections carried when the detector's label flickered between keyframes and the map merged them). A map object is built from detections in the frames it observes, so map_objects_detected must be ~1 (>= 0.95; measured 0.997); detections_in_map >= 0.8 (measured 0.88) allows the map to drop small or unstable detections. Accuracy is gt.*.",
-    "contract.*": "Every contract is a count of violations: 0 (including contract.stdout.server_sh).",
+    "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. Accuracy is gt.*.",
+    "contract.*": "Every contract is a count of violations: 0 (including contract.stdout.server_sh). Since the specs of 2026-10-06 (segment.sh -i only, -f json|png; reconstruct.sh -f json|depth|ply): stdout purity also covers reconstruct.sh -f depth (one PNG, checked as a 16-bit single-channel image of the input's pixel size) and segment.sh -f png (one PNG, identical to the segmented.png of the same run, its masks in the object colours); segment.sh -m, segments.ply and -p of segment.sh are gone with their runs and metrics (perf.segment_map.*), and so is seg.map_consistency.*, which the spec's segmentation metric no longer asks for (per-frame detections are no longer compared with the map's objects). Both new runs are contract checks only: -f depth runs the inference of -f ply (geometry alone), -f png that of -f json.",
     "gt.*": "Accuracy against annotations in examples/ground_truth/ (none yet, so never measured). Set from typical monocular performance: object recall >= 0.7, precision >= 0.6, OBB IoU >= 0.3 (monocular boxes of partially visible objects), yaw error median <= 3 deg / max <= 8 deg after the best common offset, pitch error median <= 3 deg. Review them when the first annotations land.",
     "map_update.*": "Spec §2.3/§5 and mapper.md: mapping examples/office_sequence/ (a cup on the window sill is visible in the first four images and gone in the rest) in one update or split across several (the annotation's splits 4+4+5 and 6+7) gives a map without the cup and with no hole where it stood, while every unchanged object keeps its id, label and OBB. absent_fraction >= 1 and before_present_fraction >= 1 are exact properties of a working mapper. hole_fraction <= 0.2: up to a fifth of the place's cells may look through (thin monocular depth at the region's edges, cells half off the sill); measured 0 on every map. <split>.stability.{label_agreement,id_agreement} (first vs last update of a split, aligned by their common captures' poses: a rebuild may re-gauge the frame and OBBs are refined, so the box figures are detail only) and <split>.vs_one_update.* are the map.stability targets (the same spec intent: ids, labels and OBBs stay the same; one-update vs split ids may differ only where an earlier update published one). <split>.ids_persistent_fraction >= 0.95: identity persistence is exact in the spec, 0.05 absorbs a box refined beyond the same-object test (0.25 m or IoU 0.05). The split targets are patterns (map_update.split_*.…) because a split's name is data.",
     "perf.<group>.stage.<stage>.*": "Spec §5 'per-stage … wall time and peak memory, per image and per mapping update'. Seconds (.s): explicit targets max(1.75 x measured, measured + 0.5 s) rounded up to two digits, regression tolerance 35 % / 0.25 s (stage times are noisier than totals: GPU queueing between the frames' requests). A stage a command adds later falls back to its group's pattern perf.<group>.stage.*.s = the group's end-to-end target, since a stage never outlasts its run. Memory (.client_peak_mb, .server_peak_gb): the group's end-to-end memory targets as patterns, for the same reason. The explicit stage times (and the end-to-end targets of the locate, office, street2 and server.sh groups) were first derived from run 20261005T102325Z, which ran while other agents loaded the machine, and re-derived with the same rule from the solo run 20261005T152742Z.",
@@ -95,21 +95,21 @@
       "measured": 2.1545,
       "unit": "s",
       "tolerance_rel": 0.2,
-      "description": "segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
+      "description": "segment.sh -i restaurant.jpg -d DIR (JSON, with the four artefacts)"
     },
     "perf.segment_image.client_peak_mb": {
       "op": "<=",
       "value": 800,
       "measured": 533.4,
       "unit": "MB",
-      "description": "peak resident set of the command's process tree: segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
+      "description": "peak resident set of the command's process tree: segment.sh -i restaurant.jpg -d DIR (JSON, with the four artefacts)"
     },
     "perf.segment_image.server_peak_gb": {
       "op": "<=",
       "value": 14,
       "measured": 11.3656,
       "unit": "GB",
-      "description": "peak server footprint during: segment.sh -i restaurant.jpg -d DIR (with the five artefacts)"
+      "description": "peak server footprint during: segment.sh -i restaurant.jpg -d DIR (JSON, with the four artefacts)"
     },
     "perf.segment_frames.wall_s": {
       "op": "<=",
@@ -201,28 +201,6 @@
       "unit": "GB",
       "description": "peak server footprint during: mapper.sh update of the same frames split across the updates (sum)"
     },
-    "perf.segment_map.wall_s": {
-      "op": "<=",
-      "value": 2.0,
-      "measured": 1.2726,
-      "unit": "s",
-      "tolerance_rel": 0.2,
-      "description": "segment.sh -m on the one-update map with -d DIR (no inference)"
-    },
-    "perf.segment_map.client_peak_mb": {
-      "op": "<=",
-      "value": 1100,
-      "measured": 710.0,
-      "unit": "MB",
-      "description": "peak resident set of the command's process tree: segment.sh -m on the one-update map with -d DIR (no inference)"
-    },
-    "perf.segment_map.server_peak_gb": {
-      "op": "<=",
-      "value": 14,
-      "measured": 10.7318,
-      "unit": "GB",
-      "description": "peak server footprint during: segment.sh -m on the one-update map with -d DIR (no inference)"
-    },
     "perf.view_map.render_s": {
       "op": "<=",
       "value": 3.0,
@@ -268,22 +246,6 @@
       "measured": 0.5002,
       "unit": "",
       "description": "lowest score over every segment.sh -i output (default --min-score 0.5)"
-    },
-    "seg.map_consistency.map_objects_detected": {
-      "op": ">=",
-      "value": 0.95,
-      "measured": 0.9967,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "consistency, not accuracy: (frame, map object) observations whose label, or any of its detected_as labels, segment.sh -i also detects in that frame (the map object is backed by the frame's detections)"
-    },
-    "seg.map_consistency.detections_in_map": {
-      "op": ">=",
-      "value": 0.8,
-      "measured": 0.8791,
-      "unit": "",
-      "tolerance_abs": 0.05,
-      "description": "consistency, not accuracy: per-frame segment.sh -i detections whose label matches a map object observing that frame (detections the map keeps)"
     },
     "pose.single.registered_fraction": {
       "op": ">=",
@@ -515,35 +477,35 @@
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (server)"
+      "description": "outputs whose stdout is not exactly one JSON document, one PLY or one PNG (or not empty with -o, whose file must hold exactly the payload) (server)"
     },
     "contract.stdout.reconstruct": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (reconstruct)"
+      "description": "outputs whose stdout is not exactly one JSON document, one PLY or one PNG (or not empty with -o, whose file must hold exactly the payload) (reconstruct)"
     },
     "contract.stdout.mapper": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (mapper)"
+      "description": "outputs whose stdout is not exactly one JSON document, one PLY or one PNG (or not empty with -o, whose file must hold exactly the payload) (mapper)"
     },
     "contract.stdout.segment": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (segment)"
+      "description": "outputs whose stdout is not exactly one JSON document, one PLY or one PNG (or not empty with -o, whose file must hold exactly the payload) (segment)"
     },
     "contract.stdout.view": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs whose stdout is not exactly one JSON document or one PLY (or not empty with -o, whose file must hold exactly the payload) (view)"
+      "description": "outputs whose stdout is not exactly one JSON document, one PLY or one PNG (or not empty with -o, whose file must hold exactly the payload) (view)"
     },
     "contract.openlabel.reconstruct": {
       "op": "<=",
@@ -578,56 +540,56 @@
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (reconstruct)"
+      "description": "outputs breaking the colour contract (JSON, segmented.png and segment.sh -f png, catalog.csv/md, color=segment PLYs, the viewer's OBBs and segment colours) (reconstruct)"
     },
     "contract.colour.mapper": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (mapper)"
+      "description": "outputs breaking the colour contract (JSON, segmented.png and segment.sh -f png, catalog.csv/md, color=segment PLYs, the viewer's OBBs and segment colours) (mapper)"
     },
     "contract.colour.segment": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (segment)"
+      "description": "outputs breaking the colour contract (JSON, segmented.png and segment.sh -f png, catalog.csv/md, color=segment PLYs, the viewer's OBBs and segment colours) (segment)"
     },
     "contract.colour.view": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "outputs breaking the colour contract (JSON, segmented.png, catalog.csv/md, segments.ply, color=segment PLYs, the viewer's OBBs and segment colours) (view)"
+      "description": "outputs breaking the colour contract (JSON, segmented.png and segment.sh -f png, catalog.csv/md, color=segment PLYs, the viewer's OBBs and segment colours) (view)"
     },
     "contract.artifacts.segment": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "segment.sh -d folders without exactly the five artefacts or whose segmentation.json differs from stdout (segment)"
+      "description": "segment.sh -d folders without exactly the four artefacts, or whose segmentation.json (-f json) or segmented.png (-f png) differs from stdout (segment)"
     },
     "contract.same_objects.image": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "reconstruct.sh vs segment.sh -i (image), segment.sh -m vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (image)"
+      "description": "reconstruct.sh vs segment.sh -i, and view.sh -i vs segment.sh -i (image); view.sh -m and mapper.sh locate -t full vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (image)"
     },
     "contract.same_objects.map": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "reconstruct.sh vs segment.sh -i (image), segment.sh -m vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (map)"
+      "description": "reconstruct.sh vs segment.sh -i, and view.sh -i vs segment.sh -i (image); view.sh -m and mapper.sh locate -t full vs mapper.sh -t full (map): outputs disagreeing on objects, ids or colours (map)"
     },
     "contract.readonly.map": {
       "op": "<=",
       "value": 0,
       "measured": 0.0,
       "unit": "",
-      "description": "segment.sh -m / view.sh -m runs that changed the map folder (map)"
+      "description": "view.sh -m / mapper.sh locate runs that changed the map folder (map)"
     },
     "gt.objects.recall": {
       "op": ">=",
@@ -1084,25 +1046,6 @@
     "perf.mapper_split.stage.*.server_peak_gb": {
       "op": "<=",
       "value": 20,
-      "unit": "GB",
-      "tolerance_rel": 0.1
-    },
-    "perf.segment_map.stage.*.s": {
-      "op": "<=",
-      "value": 2.0,
-      "unit": "s",
-      "tolerance_rel": 0.35,
-      "tolerance_abs": 0.2
-    },
-    "perf.segment_map.stage.*.client_peak_mb": {
-      "op": "<=",
-      "value": 1100,
-      "unit": "MB",
-      "tolerance_rel": 0.15
-    },
-    "perf.segment_map.stage.*.server_peak_gb": {
-      "op": "<=",
-      "value": 14,
       "unit": "GB",
       "tolerance_rel": 0.1
     },
@@ -1616,30 +1559,6 @@
       "op": "<=",
       "value": 0.55,
       "measured": 0.047,
-      "unit": "s",
-      "tolerance_rel": 0.35,
-      "tolerance_abs": 0.25
-    },
-    "perf.segment_map.stage.export.s": {
-      "op": "<=",
-      "value": 0.7,
-      "measured": 0.194,
-      "unit": "s",
-      "tolerance_rel": 0.35,
-      "tolerance_abs": 0.25
-    },
-    "perf.segment_map.stage.artifacts.s": {
-      "op": "<=",
-      "value": 0.88,
-      "measured": 0.379,
-      "unit": "s",
-      "tolerance_rel": 0.35,
-      "tolerance_abs": 0.25
-    },
-    "perf.segment_map.stage.write.s": {
-      "op": "<=",
-      "value": 0.5,
-      "measured": 0.0,
       "unit": "s",
       "tolerance_rel": 0.35,
       "tolerance_abs": 0.25

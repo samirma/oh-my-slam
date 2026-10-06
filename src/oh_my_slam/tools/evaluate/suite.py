@@ -1,18 +1,19 @@
-"""The evaluation plan (specs/high_level_spec.md §5): every entry point on the files in
-``examples/``, strictly one command at a time.
+"""The evaluation plan (high_level_spec.md §5): every entry point on the files in ``examples/``,
+strictly one command at a time.
 
 1. ``start_inference_server.sh``: stop, cold start, resident memory (the server's initial state is
    restored at the end).
-2. ``restaurant.jpg``: ``reconstruct.sh`` (JSON, PLY, ``-o`` PLY coloured by segment),
-   ``segment.sh -i`` (artefacts, ``-o`` PLY) and ``view.sh -i``.
+2. ``restaurant.jpg``: ``reconstruct.sh`` (JSON, PLY, ``-o`` PLY coloured by segment, the depth
+   image), ``segment.sh -i`` (JSON with the artefacts, the segmented image with the artefacts)
+   and ``view.sh -i``.
 3. Every ``ainex-captures`` frame: ``segment.sh -i``.
 4. ``mapper.sh update``: the sequence in one update (default options: the whole map as JSON),
    and split across ``SPLITS`` updates into a second map (first update ``-o`` JSON, middle ones
    ``-t single -f ply``, last ``-t full``). Between the first and the second update, ``mapper.sh
    locate`` of the second update's images (held out of the map): ``pose.locate.*``.
-5. On the one-update map (the reference map): ``segment.sh -m`` (artefacts), ``view.sh -m`` and
-   ``mapper.sh locate`` (``-t single`` JSON, ``-t full`` JSON, ``-f ply -o``), which must leave it
-   unchanged, hidden entries included; ``segment.sh -m -f ply -o`` on the split map.
+5. On the one-update map (the reference map): ``view.sh -m`` and ``mapper.sh locate`` (``-t
+   single`` JSON, ``-t full`` JSON, ``-f ply -o``), which must leave it unchanged, hidden entries
+   included.
 6. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and split as
    its annotation says (4+4+5 and 6+7), judged by ``mapupdate`` (the ``map_update.*`` metrics).
 7. ``street2.mp4`` (outside the repository, ``--street2``): ``mapper.sh update`` of the video at
@@ -25,6 +26,7 @@ Every output is checked against the contracts; the metrics are computed from the
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import traceback
@@ -33,10 +35,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from oh_my_slam.core import paths
-from oh_my_slam.core.images import load_rgb
-from oh_my_slam.core.ply import parse_header, parse_ply, read_ply
+from oh_my_slam.core.images import load_rgb, upright_size
+from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.core.types import Pose
 from oh_my_slam.tools.evaluate import groundtruth as gt
 from oh_my_slam.tools.evaluate import mapupdate, service
@@ -46,6 +49,7 @@ from oh_my_slam.tools.evaluate.contracts import (
     catalog_csv_problems,
     catalog_md_problems,
     cloud_colour_problems,
+    depth_image_problems,
     parse_scene,
     payload_problems,
     png_colour_problems,
@@ -72,20 +76,10 @@ from oh_my_slam.tools.evaluate.memory import phys_footprint_gb, server_pid
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import Capture, captures_in
 from oh_my_slam.tools.evaluate.performance import perf_ids, perf_metrics
-from oh_my_slam.tools.evaluate.poses import (
-    POSE_METRICS,
-    capture_poses,
-    capture_sources,
-    pose_metrics,
-)
+from oh_my_slam.tools.evaluate.poses import POSE_METRICS, capture_poses, pose_metrics
 from oh_my_slam.tools.evaluate.runner import REPO, Runner, RunRecord, RunSpec
 from oh_my_slam.tools.evaluate.scene import DocObject, Json, doc_objects
-from oh_my_slam.tools.evaluate.segmentation import (
-    MAP_CONSISTENCY,
-    MAP_CONSISTENCY_METRICS,
-    detection_row,
-    map_consistency,
-)
+from oh_my_slam.tools.evaluate.segmentation import detection_row
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 
 EXAMPLES = REPO / "examples"
@@ -120,7 +114,6 @@ def expected_ids(examples: Path = EXAMPLES) -> list[str]:
     """Every metric a run records (ground-truth metrics come on top when annotations exist, and
     per-stage metrics for every stage the commands record)."""
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
-    ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
     ids += [f"pose.locate.{k}" for k in LOCATE_METRICS]
     ids += [STREET2_METRIC]
@@ -221,22 +214,38 @@ class Evaluation:
             self.contracts.check("colour", subject_of(rec.spec.entry), rec.tag, _problems_reading(
                 lambda: cloud_colour_problems(parse_ply(self.result_bytes(rec)), ids)))
 
-    def artefacts(self, rec: RunRecord, folder: Path, doc: Json, sheet: bool) -> None:
-        """The five ``-d`` artefacts: exactly those files, the JSON identical to stdout, and every
-        colour in them the object colours of ``doc``."""
+    def artefacts(self, rec: RunRecord, folder: Path, doc: Json) -> None:
+        """The four ``-d`` artefacts of a ``-f json`` run: exactly those files, the JSON identical
+        to stdout, and every colour in them the object colours of ``doc``."""
         objs = doc_objects(doc)
-        ids = {o.id for o in objs}
         self.contracts.check("artifacts", "segment", rec.tag,
                              _problems_reading(artifact_problems, folder, rec.stdout_bytes()))
         problems = _problems_reading(
-            lambda: png_colour_problems(load_rgb(folder / "segmented.png"), objs, sheet))
+            lambda: png_colour_problems(load_rgb(folder / "segmented.png"), objs))
         problems += _problems_reading(
             lambda: catalog_csv_problems((folder / "catalog.csv").read_text(), objs))
         problems += _problems_reading(
             lambda: catalog_md_problems((folder / "catalog.md").read_text(), objs))
-        problems += _problems_reading(
-            lambda: cloud_colour_problems(read_ply(folder / "segments.ply"), ids))
         self.contracts.check("colour", "segment", f"{rec.tag}/artefacts", problems)
+
+    def segmented_image(self, rec: RunRecord, folder: Path) -> None:
+        """A ``segment.sh -f png -d`` run: its ``segmented.png`` is the PNG on stdout, byte for
+        byte, and that image's mask colours are those of the objects its ``segmentation.json``
+        lists (the same run)."""
+        if not rec.ok:
+            return
+        data = rec.stdout_bytes()
+        self.contracts.check("artifacts", "segment", rec.tag,
+                             _problems_reading(artifact_problems, folder, data, "png"))
+
+        def colours() -> list[str]:
+            doc = json.loads((folder / "segmentation.json").read_bytes())
+            with Image.open(io.BytesIO(data)) as img:
+                rgb = np.asarray(img.convert("RGB"))
+            return png_colour_problems(rgb, doc_objects(doc))
+
+        self.contracts.check("colour", "segment", f"{rec.tag}/segmented image",
+                             _problems_reading(colours))
 
     def view(self, tag: str, source: tuple[str, str, Json | None], *args: str | Path) -> None:
         """``view.sh`` with ``args``: time to the rendered page, and the scene it draws (OBB
@@ -310,15 +319,20 @@ class Evaluation:
                        outputs / "reconstruct_segment.ply", stdout="empty",
                        output=outputs / "reconstruct_segment.ply")
         self.cloud_colours(rec, None if recon is None else {o.id for o in doc_objects(recon)})
+        rec = self.run("reconstruct_depth", "contracts", "reconstruct.sh", "-i", img, "-f",
+                       "depth", stdout="png")
+        if rec.ok:
+            self.contracts.check("stdout", "reconstruct", f"{rec.tag}/depth image",
+                                 _problems_reading(depth_image_problems, rec.stdout_bytes(),
+                                                   upright_size(img)))
         folder = outputs / "segment_image"
-        rec = self.run("segment_image", "segment_image", "segment.sh", "-i", img, "-d", folder,
-                       "-p", "label=on")
+        rec = self.run("segment_image", "segment_image", "segment.sh", "-i", img, "-d", folder)
         seg = self.scene(rec)
         with self.metrics.expect(SEG_METRICS[0]):
             if seg is None:
                 self.metrics.fail(SEG_METRICS[:1], rec.failure())
             else:
-                self.artefacts(rec, folder, seg, sheet=False)
+                self.artefacts(rec, folder, seg)
                 objs = self.images[RESTAURANT] = doc_objects(seg)
                 self.details["segmentation.restaurant"] = detection_row(RESTAURANT, objs)
                 self.metrics.add(SEG_METRICS[0], len(objs))
@@ -326,10 +340,9 @@ class Evaluation:
             self.contracts.check("same_objects", "image", "reconstruct.sh vs segment.sh -i",
                                  same_objects_problems(doc_objects(recon), doc_objects(seg),
                                                        geometry=False))
-        rec = self.run("segment_image_ply", "contracts", "segment.sh", "-i", img, "-f", "ply",
-                       "-o", outputs / "segment_image.ply", stdout="empty",
-                       output=outputs / "segment_image.ply")
-        self.cloud_colours(rec, None if seg is None else {o.id for o in doc_objects(seg)})
+        folder = outputs / "segment_image_png"
+        self.segmented_image(self.run("segment_image_png", "contracts", "segment.sh", "-i", img,
+                                      "-f", "png", "-d", folder, stdout="png"), folder)
         self.view("view_image", ("image", "segment.sh -i", seg), "-i", img)
 
     def frames(self, captures: list[Capture]) -> None:
@@ -442,39 +455,15 @@ class Evaluation:
                     split_alignment(poses["single"], poses["split"]), self.published)
         with self.metrics.expect(*(f"pose.locate.{k}" for k in LOCATE_METRICS)):
             self.held_out_metrics(split)
-        ids = [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
-        with self.metrics.expect(*ids):
-            if single is None:
-                self.metrics.fail(ids, "the single map was not built")
-            else:
-                frames = {c.name: self.images[f"{SEQUENCE}/{c.name}"] for c in captures
-                          if f"{SEQUENCE}/{c.name}" in self.images}
-                self.details["segmentation.map"] = map_consistency(
-                    self.metrics, MAP_CONSISTENCY, frames, doc_objects(single),
-                    capture_sources(single, dirs["single"]))
 
-    def map_commands(self, single: Json | None, split: Json | None) -> None:
-        single_dir, split_dir = self.out / "maps" / "single", self.out / "maps" / "split"
+    def map_commands(self, single: Json | None) -> None:
+        single_dir = self.out / "maps" / "single"
         before = tree_digest(single_dir) if single is not None else None
-        folder = self.out / "outputs" / "segment_map"
-        rec = self.run("segment_map", "segment_map", "segment.sh", "-m", single_dir, "-d", folder,
-                       "-p", "label=on")
-        doc = self.scene(rec)
-        if doc is not None:
-            self.artefacts(rec, folder, doc, sheet=True)
-            if single is not None:
-                self.contracts.check("same_objects", "map", "segment.sh -m vs mapper.sh -t full",
-                                     same_objects_problems(doc_objects(single), doc_objects(doc),
-                                                           geometry=True))
-        target = self.out / "outputs" / "segment_map_split.ply"
-        rec = self.run("segment_map_ply", "contracts", "segment.sh", "-m", split_dir, "-f", "ply",
-                       "-o", target, stdout="empty", output=target)
-        self.cloud_colours(rec, None if split is None else {o.id for o in doc_objects(split)})
         self.view("view_map", ("map", "mapper.sh -t full", single), "-m", single_dir)
         self.locate_reference(single, single_dir)
         if before is not None:
             same = tree_digest(single_dir) == before
-            self.contracts.check("readonly", "map", "segment.sh -m, view.sh -m, mapper.sh locate",
+            self.contracts.check("readonly", "map", "view.sh -m, mapper.sh locate",
                                  [] if same else ["the map folder changed"])
 
     def locate_reference(self, single: Json | None, single_dir: Path) -> None:
@@ -628,8 +617,7 @@ class Evaluation:
             maps = self.section(f"{SEQUENCE}: mapper.sh update", self.build_maps, captures)
             single, split = maps or (None, None)
             self.section("pose accuracy, map quality", self.map_metrics, captures, single, split)
-            self.section("segment.sh -m, view.sh -m, mapper.sh locate", self.map_commands,
-                         single, split)
+            self.section("view.sh -m, mapper.sh locate", self.map_commands, single)
             self.section("office_sequence: mapper.sh update (map update)", self.map_update)
             self.section("street2.mp4: mapper.sh update", self.street2_video)
             self.section("server.sh", self.server_sh)

@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from oh_my_slam.commands import spec
+from oh_my_slam.core.images import png_bytes
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.tools.evaluate import proxy as px
 from oh_my_slam.tools.evaluate import service as sv
@@ -55,26 +56,29 @@ def cases_by_op(describe: dict[str, Any]) -> dict[str, list[sv.Case]]:
 
 def test_every_operation_of_the_service_gets_its_cases() -> None:
     by_op = cases_by_op(served())
-    assert set(by_op) == {"reconstruct", "mapper-update", "mapper-locate", "segment-image",
-                          "segment-map"}  # view.sh stays a command only
+    assert set(by_op) == {"reconstruct", "mapper-update", "mapper-locate",
+                          "segment-image"}  # view.sh stays a command only
     variants = {op: [c.variant for c in cs] for op, cs in by_op.items()}
-    assert variants["reconstruct"] == ["default", "format=ply", "attrs=color=segment"]
+    assert variants["reconstruct"] == ["default", "format=depth", "format=ply",
+                                       "attrs=color=segment"]
     assert variants["mapper-update"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=single"]
     assert variants["mapper-locate"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=full"]
-    assert variants["segment-image"] == ["default", "format=ply", "attrs=normals=on"]
-    assert variants["segment-map"] == ["default", "format=ply", "attrs=normals=on"]
+    assert variants["segment-image"] == ["default", "format=png"]
     # inputs by kind; -p applies with -f ply only, so its case asks for -f ply
-    attrs = by_op["reconstruct"][2]
+    attrs = by_op["reconstruct"][3]
     assert attrs.params == {"image": "inputs/a.jpg", "attrs": "color=segment", "format": "ply"}
     assert attrs.result_format == "ply" and by_op["reconstruct"][0].result_format == "json"
+    # the images are PNG results: the depth image and the segmented image
+    assert by_op["reconstruct"][1].result_format == "png"
+    assert [c.result_format for c in by_op["segment-image"]] == ["json", "png"]
     assert by_op["mapper-locate"][0].params == {"inputs": ["inputs/b.jpg"], "map": "reference"}
     # a mapping case creates a map of its own, whose name it carries
     update = by_op["mapper-update"]
     assert {c.params["map"] for c in update} == {f"parity-{k}" for k in range(1, 5)}
     assert all(c.writes_map == "map" for c in update)
-    assert by_op["segment-map"][0].writes_map is None
+    assert by_op["mapper-locate"][0].writes_map is None
     # no case names where the command writes (-o, -d): the response is the result
     assert not any({"output", "artifacts"} & set(c.params) for cs in by_op.values() for c in cs)
 
@@ -96,7 +100,7 @@ def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
     # through the service's OpenAPI document, as the evaluator reads it
     variants = [c.variant for c in cases_by_op(served())["reconstruct"]]
     assert variants == ["default", "format=ply", "format=glb", "attrs=color=segment",
-                        "quality=best"]
+                        "quality=best"]  # the choices given above replace json, depth, ply
     # an operation whose input kind has no reference input is reported, not dropped silently
     cases, uncovered = sv.parity_cases(served(), sv.Inputs(image="inputs/a.jpg"))
     assert {c.op for c in cases} == {"reconstruct", "segment-image"}
@@ -322,11 +326,12 @@ def fake_service(tmp_path: Path, differ: bool) -> Evaluation:
     (payloads / "json.out").write_bytes(b'{"openlabel": {"metadata": {"schema_version": "1.0.0"}}}')
     (payloads / "ply.out").write_bytes(ply_bytes(PointCloud(
         __import__("numpy").zeros((2, 3), "float32"))))
+    (payloads / "depth.out").write_bytes(png_bytes(__import__("numpy").zeros((2, 3), "uint16")))
     rec = next(o for o in served()["operations"] if o["id"] == "reconstruct.sh")
     rec = {**rec, "parameters": [p for p in rec["parameters"] if p["name"] != "attrs"]}
     (tmp_path / "describe.json").write_text(json.dumps({"operations": [rec]}))
     repo = fake_repo(tmp_path, reconstruct=f'''case "$*" in *-f=ply*) cat "{payloads}/ply.out";;
-*) cat "{payloads}/json.out";; esac''')
+*-f=depth*) cat "{payloads}/depth.out";; *) cat "{payloads}/json.out";; esac''')
     script(repo, "server.sh", FAKE_SERVER, shebang=f"#!{__import__('sys').executable}")
     out = tmp_path / "out"
     runner = Runner(out, repo)
@@ -356,7 +361,9 @@ def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) 
     assert m["server_sh.ui.tests_failed"].passed and m["server_sh.ui.tests_run"].passed
     assert m["server_sh.parity.operations_covered_fraction"].value == 1.0
     cases = ev.details["server_sh"]["parity"]["cases"]
-    assert [c["case"] for c in cases] == ["reconstruct.sh [default]", "reconstruct.sh [format=ply]"]
+    assert [c["case"] for c in cases] == ["reconstruct.sh [default]",
+                                          "reconstruct.sh [format=depth]",
+                                          "reconstruct.sh [format=ply]"]
     assert cases[0]["stages"] == ["inference", "export", "total"]  # from Server-Timing
     mism = m["server_sh.parity.mismatched"]
     if differ:
@@ -367,5 +374,7 @@ def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) 
     tags = [r.tag for r in ev.runner.records]
     assert tags[0] == "server_sh" or "server_sh" in tags
     assert {"parity_01_shell", "parity_01_shell_again", "parity_02_shell"} <= set(tags)
+    # the depth image's shell runs wrote one PNG to stdout, as the contract wants
+    assert ev.contracts.checks[("stdout", "reconstruct")]["parity_02_shell"] == []
     # server.sh kept stdout empty while serving, and --status gave one JSON document
     assert ev.contracts.checks[("stdout", "server_sh")] == {"server_sh": [], "server_sh_status": []}
