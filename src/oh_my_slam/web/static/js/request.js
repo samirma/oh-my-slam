@@ -97,7 +97,7 @@ export class RequestView {
       if (err.name === 'AbortError' || this.interruptedBy) {
         this.end('interrupted');
         this.outcome.replaceChildren(notice('warn', el('strong', {}, 'Interrupted. '), interruptConsequence(this.op),
-          ' Its uploaded inputs were deleted; run it again when you are ready.'));
+          ' Run it again when you are ready.'));
       } else {
         this.end('failed');
         this.showError(err);
