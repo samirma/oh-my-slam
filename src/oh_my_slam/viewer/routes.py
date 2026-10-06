@@ -93,10 +93,9 @@ class CloudDocument:
         return b"".join(self.pieces)
 
 
-def cloud_document(dc: DisplayCloud, attrs: str, extra: dict[str, Any] | None = None
-                   ) -> CloudDocument:
+def cloud_document(dc: DisplayCloud, attrs: str) -> CloudDocument:
     """The binary cloud document of ``dc`` (see :func:`cloud_payload`), without copying its
-    arrays; ``extra`` adds fields to its header (a PLY file's ``comments``)."""
+    arrays."""
     c = dc.cloud
     parts: list[tuple[str, str, int, Any]] = [("position", "float32", 3, c.xyz)]
     if c.rgb is not None:
@@ -115,7 +114,7 @@ def cloud_document(dc: DisplayCloud, attrs: str, extra: dict[str, Any] | None = 
         pieces += [view, b"\0" * pad] if pad else [view]
         offset += view.nbytes + pad
     header = json.dumps({"count": len(c), "total": dc.total, "voxel": dc.voxel, "attrs": attrs,
-                         "buffers": buffers, **(extra or {})}).encode()
+                         "buffers": buffers}).encode()
     header += b" " * (-(4 + len(header)) % 4)
     head = struct.pack("<I", len(header)) + header
     return CloudDocument((head, *pieces), len(head) + offset,
