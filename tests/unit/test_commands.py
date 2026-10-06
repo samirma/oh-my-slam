@@ -2,7 +2,7 @@
 every argparse parser is built from the registry and its export covers every option; API
 parameters parse through the same parser; the validation rules raise the commands' own errors,
 and a dry run reports them all per parameter; stage names are registered and the stages the
-commands record are the declared ones; the exit-code → HTTP rule; live progress events."""
+commands record are the declared ones; the exit-code → HTTP rule."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import dataclasses
 import io
 import json
 import math
-import os
 import re
 import subprocess
 import sys
@@ -31,14 +30,12 @@ from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import ATTRIBUTES, CloudAttrs
 from oh_my_slam.core.errors import (
     HTTP_STATUS,
-    JOB_STATE,
     ExitCode,
     InputError,
     NotAMapError,
     UsageError,
     error_code,
     http_status,
-    job_state,
 )
 from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.timing import Stage
@@ -143,8 +140,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     assert {o["name"] for o in ops["segment.sh -i"]["outputs"]} == {
         "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md",
         "segments.ply"}
-    assert {"code": "interrupted", "exit_code": 130, "http_status": 499,
-            "job_state": "cancelled"} in d["exit_codes"]
+    assert {"code": "interrupted", "exit_code": 130, "http_status": 499} in d["exit_codes"]
 
 
 def test_an_option_added_to_the_registry_reaches_parser_and_export(
@@ -338,24 +334,20 @@ def test_describe_is_cheap() -> None:
 
 
 def test_exit_codes_map_to_http_statuses() -> None:
-    assert set(HTTP_STATUS) == set(ExitCode) == set(JOB_STATE)
+    assert set(HTTP_STATUS) == set(ExitCode)
     assert http_status(ExitCode.USAGE) == 400
     assert http_status(ExitCode.SERVER_UNAVAILABLE) == 503
     assert http_status(ExitCode.INTERNAL) == 500 and http_status(77) == 500
+    assert http_status(-9) == 500  # a command stopped by a signal
     for code in (ExitCode.NOT_A_MAP, ExitCode.NOT_REGISTERED, ExitCode.MAP_LOCKED):
         assert 400 <= http_status(code) < 500
     assert http_status(130) == 499 and error_code(130) == "interrupted"
-    assert JOB_STATE[ExitCode.INTERRUPTED] == "cancelled" and JOB_STATE[ExitCode.OK] == "succeeded"
-    assert JOB_STATE[ExitCode.NOT_A_MAP] == "failed"
     assert error_code(4) == "not_a_map" and error_code(77) == "internal"
-    assert job_state(0) == "succeeded" and job_state(130) == "cancelled" and job_state(2) == "failed"
-    assert job_state(-2) == job_state(-15) == job_state(143) == "cancelled"
-    assert job_state(-9) == job_state(77) == job_state(137) == "failed"
     exported = {e["code"]: e["http_status"] for e in spec.describe()["exit_codes"]}
     assert exported["map_locked"] == 409 and exported["usage"] == 400
 
 
-# --- stages and progress --------------------------------------------------------------------------
+# --- stages -------------------------------------------------------------------------------------
 
 
 def _stage_literals() -> dict[str, set[str]]:
@@ -380,15 +372,6 @@ def test_every_timing_stage_is_registered() -> None:
     assert _stage_literals() == {}
     listed = {s for _p, _c, m in spec.operations() for s in m.stages}
     assert listed == set(Stage)
-
-
-class _Stages:
-    def __init__(self) -> None:
-        self.seen: list[str] = []
-
-    def __call__(self, event: dict[str, Any]) -> None:
-        if event["event"] == "stage_start":
-            self.seen.append(event["stage"])
 
 
 def _declared(cmd: spec.Command, mode: spec.Mode) -> set[str]:
@@ -431,70 +414,19 @@ def test_recorded_stages_are_the_declared_ones(env, tmp_path: Path,  # type: ign
         lo = M.command("locate")
         runs.append((lo, lo.modes[0], lambda: locate(open_map(mdir), resolve_images(queries),
                                                      mode="full", progress=lambda m: None)))
+    seen: list[str] = []
+    stage = timing.Timings.stage
+
+    def spy(self: timing.Timings, name: Stage) -> Any:
+        seen.append(str(name))
+        return stage(self, name)
+
+    monkeypatch.setattr(timing.Timings, "stage", spy)
     for cmd, mode, run in runs:
-        rec = _Stages()
-        with timing.listen(rec):
-            run()
+        seen.clear()
+        run()
         cap.take()  # the fake stdout takes one payload per run
-        assert rec.seen and set(rec.seen) <= _declared(cmd, mode), (cmd.label(mode), rec.seen)
-
-
-def test_progress_events_reach_listeners() -> None:
-    events: list[dict] = []
-    with timing.listen(events.append), timing.collect(sample_every=None):
-        with timing.stage(Stage.EXPORT):
-            timing.progress(1, 2)
-            timing.count(keyframes_sampled=2)
-            with timing.part("lift"):
-                pass
-    assert [e["event"] for e in events] == [
-        "begin", "stage_start", "progress", "count", "part", "stage_end", "finish"]
-    assert events[2] == {"event": "progress", "stage": "export", "done": 1, "total": 2}
-    assert events[3] == {"event": "count", "keyframes_sampled": 2}
-    assert events[-1] | {"total_s": 0} == {"event": "finish", "total_s": 0, "ok": True,
-                                           "exit_code": 0, "code": "ok"}
-    timing.progress(1, 1)  # outside a collection: nothing
-    assert len(events) == 7
-    events.clear()
-    with timing.listen(events.append), pytest.raises(NotAMapError):
-        with timing.collect(sample_every=None):
-            raise NotAMapError("x")
-    assert events[-1]["ok"] is False and events[-1]["exit_code"] == 4
-    assert events[-1]["code"] == "not_a_map"
-
-
-def test_progress_file_keeps_stdout_and_stderr_unchanged(tmp_path: Path) -> None:
-    """``OH_MY_SLAM_PROGRESS=<path>``: one JSON line per event in that file, and the command's
-    stdout and human stderr are those of a run without it; mapping reports its sizes."""
-    from oh_my_slam.mapping.api import update
-    from tests.fakes.client import FakeClient
-    from tests.synth.mapping import add_frames, mapping_room, ring
-
-    client = FakeClient()
-    imgs = add_frames(client, mapping_room(), ring(1), tmp_path / "in", "s")
-    events: list[dict] = []
-    with timing.listen(events.append):
-        update(tmp_path / "map", imgs, client=client, progress=lambda m: None)
-    assert {"event": "progress", "stage": "inference", "done": 1, "total": 1} in events
-    assert any(e["event"] == "count" and e.get("keyframes_sampled") == 1 for e in events)
-
-    def run(extra: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.run([str(REPO / "segment.sh"), "-m", str(tmp_path / "map")],
-                              capture_output=True, timeout=120, env={**os.environ, **extra})
-
-    def human(err: bytes) -> list[str]:  # the timing figures change from run to run
-        return [ln for ln in err.decode().splitlines()
-                if "timings:" not in ln and "done in" not in ln]
-
-    plain = run({})
-    sink = tmp_path / "progress.jsonl"
-    live = run({timing.ENV_PROGRESS: str(sink)})
-    assert plain.returncode == live.returncode == 0, live.stderr.decode()
-    assert live.stdout == plain.stdout and human(live.stderr) == human(plain.stderr)
-    lines = [json.loads(ln) for ln in sink.read_text().splitlines()]
-    assert lines[0] == {"event": "begin"} and lines[-1]["event"] == "finish"
-    assert lines[-1]["ok"] is True and lines[-1]["exit_code"] == 0
-    assert [e["stage"] for e in lines if e["event"] == "stage_start"] == ["export", "write"]
+        assert seen and set(seen) <= _declared(cmd, mode), (cmd.label(mode), seen)
 
 
 def test_dry_run_reports_a_bad_value_after_an_unknown_parameter(tmp_path: Path) -> None:

@@ -168,7 +168,7 @@ def parse_ply(data: bytes) -> PointCloud:
 
 
 def cloud_of_rows(arr: Any) -> PointCloud:
-    """The cloud of PLY vertex rows (a structured array, e.g. a part of :func:`memmap_ply`'s)."""
+    """The cloud of PLY vertex rows (a structured array)."""
     names = set(arr.dtype.names or ())
 
     def stack(*cols: str) -> Any:
@@ -182,34 +182,6 @@ def cloud_of_rows(arr: Any) -> PointCloud:
 READ_CHUNK_BYTES = 1 << 22  # binary PLY body read per step (``read_ply``)
 _HEADER_READ = 1 << 16
 _HEADER_MAX = 1 << 24
-
-
-def read_header(path: Path) -> PlyHeader:
-    """The header of a PLY file, reading only the header's bytes."""
-    with Path(path).open("rb") as f:
-        head = b""
-        while b"end_header\n" not in head:
-            more = f.read(_HEADER_READ)
-            if not more or len(head) > _HEADER_MAX:
-                break
-            head += more
-    return parse_header(head)
-
-
-def memmap_ply(path: Path) -> tuple[PlyHeader, Any]:
-    """The header of a PLY file and, for a binary body, its vertex rows as a read-only structured
-    memory map (nothing is read until a row is used); ``None`` for an ASCII body."""
-    h = read_header(path)
-    if h.encoding != "binary":
-        return h, None
-    dtype = np.dtype(h.fields)
-    if not {"x", "y", "z"} <= set(dtype.names or ()):
-        raise ValueError("PLY vertices have no x y z")
-    if Path(path).stat().st_size < h.body_offset + dtype.itemsize * h.count:
-        raise ValueError(f"PLY body is shorter than its {h.count} vertices")
-    if h.count == 0:
-        return h, np.zeros(0, dtype)
-    return h, np.memmap(path, dtype=dtype, mode="r", offset=h.body_offset, shape=(h.count,))
 
 
 def read_ply(path: Path) -> PointCloud:

@@ -6,7 +6,6 @@ human-readable line to stderr. Anything else is an internal error (exit 1).
 
 from __future__ import annotations
 
-import signal
 from enum import IntEnum
 
 
@@ -18,13 +17,12 @@ class ExitCode(IntEnum):
     NOT_A_MAP = 4
     NOT_REGISTERED = 5
     MAP_LOCKED = 6
-    INTERRUPTED = 130  # Ctrl-C / SIGINT (a cancelled job)
+    INTERRUPTED = 130  # Ctrl-C / SIGINT
 
 
 # The one generic exit status → HTTP status rule of the web service (spec §2.6 "Errors": input
 # errors → 4xx, inference server unavailable → 503, internal → 500). The machine-readable error
-# code is the exit code's lower-case name (``error_code``); ``JOB_STATE`` is the state of a job
-# whose command ended with that status (an interrupted command is a cancelled job).
+# code is the exit code's lower-case name (``error_code``).
 HTTP_STATUS: dict[ExitCode, int] = {
     ExitCode.OK: 200,
     ExitCode.INTERNAL: 500,
@@ -33,11 +31,8 @@ HTTP_STATUS: dict[ExitCode, int] = {
     ExitCode.NOT_A_MAP: 422,  # the folder exists but is not a map
     ExitCode.NOT_REGISTERED: 422,  # valid request, nothing could be placed in the map
     ExitCode.MAP_LOCKED: 409,  # another update holds the map
-    ExitCode.INTERRUPTED: 499,  # the request was withdrawn (cancelled), not a failure
+    ExitCode.INTERRUPTED: 499,  # the request was withdrawn (Ctrl-C, a client that left)
 }
-JOB_STATE: dict[ExitCode, str] = {code: "succeeded" if code is ExitCode.OK else
-                                  "cancelled" if code is ExitCode.INTERRUPTED else "failed"
-                                  for code in ExitCode}
 
 
 def http_status(exit_code: int) -> int:
@@ -46,22 +41,6 @@ def http_status(exit_code: int) -> int:
         return HTTP_STATUS[ExitCode(exit_code)]
     except ValueError:
         return 500
-
-
-_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
-
-
-def job_state(exit_code: int) -> str:
-    """State of a job whose command process ended with ``exit_code`` (a ``returncode``): a process
-    stopped by SIGINT or SIGTERM (negative status, or 128 + signal from a shell) was cancelled;
-    any other status not in ``JOB_STATE`` failed."""
-    if exit_code < 0 or exit_code > 128:
-        stopped = -exit_code if exit_code < 0 else exit_code - 128
-        return "cancelled" if stopped in _STOP_SIGNALS else "failed"
-    try:
-        return JOB_STATE[ExitCode(exit_code)]
-    except ValueError:
-        return "failed"
 
 
 def error_code(exit_code: int) -> str:

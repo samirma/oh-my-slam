@@ -954,7 +954,6 @@ def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: st
             for q in queries:
                 K, refine = _query_intrinsics(reader, sfm, q, db)
                 results.append(_locate_one(q, K, refine, matches[q.name], points))
-                timing.progress(len(results), len(queries))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if not any(r.located for r in results):

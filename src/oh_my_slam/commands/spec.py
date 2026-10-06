@@ -53,7 +53,6 @@ from oh_my_slam.core.constants import (
 )
 from oh_my_slam.core.errors import (
     HTTP_STATUS,
-    JOB_STATE,
     ExitCode,
     InputError,
     NotAMapError,
@@ -671,12 +670,6 @@ def program_of(cmd: Command) -> Program:
     return next(p for p in PROGRAMS if cmd in p.commands)
 
 
-def viewer_program() -> Program:
-    """The program whose output is the browser (view.sh): the viewer's own command."""
-    return next(p for p in PROGRAMS if any(o.via == "browser" for c in p.commands
-                                           for m in c.modes for o in m.outputs))
-
-
 def _text(value: Any) -> str:
     return str(value)
 
@@ -825,8 +818,7 @@ def by_parameter(problems: list[Problem]) -> dict[str, list[str]]:
 
 
 def _code(code: ExitCode) -> dict[str, Any]:
-    return {"code": error_code(code), "exit_code": int(code), "http_status": HTTP_STATUS[code],
-            "job_state": JOB_STATE[code]}
+    return {"code": error_code(code), "exit_code": int(code), "http_status": HTTP_STATUS[code]}
 
 
 def _errors(mode: Mode) -> list[dict[str, Any]]:
@@ -880,8 +872,8 @@ def describe() -> dict[str, Any]:
     """Every operation (command mode) as JSON-serialisable data: its parameters (names, kinds,
     defaults, help, choices, accepted files, bounds, applicability), validation rules, inference
     need, outputs, the errors validation can raise and the timing stages; plus the exit-code table
-    (every code a run can end with, its HTTP status and job state). The web service generates its
-    OpenAPI document and forms from it."""
+    (every code a run can end with and its HTTP status). The web service generates its OpenAPI
+    document and forms from it."""
     ops = []
     for prog, cmd, mode in operations():
         ops.append({

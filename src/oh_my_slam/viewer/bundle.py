@@ -12,11 +12,7 @@ kept in memory, by ``segmentation.cloud.derive_cloud`` with the §2.2 attributes
 read from the scene description, so the viewer shows exactly the poses the JSON states. No
 inference, point-cloud generation, OBB fitting, identity or colour logic lives here.
 
-A bundle can be saved and loaded again (:func:`save_bundle`, :func:`load_bundle`): what the page
-shows plus the cloud source as computed, so a saved image bundle serves the same viewer — every
-live control included — without re-running inference; a map is saved as a reference to the map
-folder (it is persisted already). :func:`bundle_of` builds the bundle of a command's arguments, for
-``view.sh`` and for the web service's bundle writer (``oh_my_slam.cli.view_save``).
+:func:`bundle_of` builds the bundle of ``view.sh``'s validated arguments.
 """
 
 from __future__ import annotations
@@ -252,60 +248,6 @@ def scene_cameras(scene: Json) -> list[Json]:
     return out
 
 
-def display_transform(camera_frame: bool, up_cam: Any = None) -> list[list[float]]:
-    """The display transform of a scene drawn on its own (the 3D scene viewer of server.sh): the
-    identity for map coordinates (z up); for a single image's camera frame the transform
-    ``view.sh -i`` uses (:func:`upright_transform`), with the estimated up direction when the
-    scene states one, else a level camera."""
-    if not camera_frame:
-        return np.eye(4).tolist()
-    up = DEFAULT_UP_CAM if up_cam is None else np.asarray(up_cam, np.float64).reshape(3)
-    if not np.all(np.isfinite(up)) or np.linalg.norm(up) < 1e-9:
-        raise UsageError("the up direction must be 3 finite numbers, not all 0")
-    return upright_transform(up / np.linalg.norm(up)).tolist()
-
-
-def ply_comments(path: Path) -> list[str]:
-    """The header comments of a PLY file (its frame, attributes and located cameras)."""
-    from oh_my_slam.core.ply import read_header
-
-    return read_header(path).comments
-
-
-def ply_display(path: Path, max_points: int | None = None) -> tuple[DisplayCloud, list[str]]:
-    """A PLY file the commands wrote, as the viewer draws it: every point up to the display
-    budget, above it the voxel-grid selection of ``segmentation.cloud.display_selection`` (each
-    kept point with exactly its values); and the file's header comments. A binary file is read
-    through a memory map: only its positions and the kept points' other values are loaded.
-    Raises ``ValueError`` for a file that is not such a PLY."""
-    from oh_my_slam.core.ply import cloud_of_rows, memmap_ply, read_ply
-    from oh_my_slam.segmentation.cloud import display_selection, thin_cloud
-
-    budget = DISPLAY_POINT_BUDGET if max_points is None else max_points
-    t0 = time.perf_counter()
-    header, rows = memmap_ply(path)
-    if rows is None:  # ASCII: parsed whole
-        thinned = thin_cloud(read_ply(path), budget)
-        return DisplayCloud(thinned.cloud, thinned.total, thinned.voxel,
-                            time.perf_counter() - t0), header.comments
-    xyz = np.stack([rows["x"], rows["y"], rows["z"]], axis=1).astype(np.float32, copy=False)
-    keep, edge = display_selection(xyz, budget)
-    cloud = cloud_of_rows(rows if keep is None else rows[keep])
-    del rows  # the map is closed with its last reference
-    return DisplayCloud(cloud, len(xyz), edge, time.perf_counter() - t0), header.comments
-
-
-def is_camera_frame(comments: Iterable[str] = (), cs_types: Iterable[str] | None = None) -> bool:
-    """Whether a scene is in a single image's camera frame: for a scene JSON (``cs_types``, the
-    types of its coordinate systems), when it has no scene coordinate system (``scene_cs``, the
-    map frame); for a PLY (its header ``comments``), when its header names that frame."""
-    from oh_my_slam.segmentation.cloud import IMAGE_FRAME
-
-    if cs_types is not None:
-        return "scene_cs" not in set(cs_types)
-    return IMAGE_FRAME in comments
-
-
 def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
     """Display frame of a single image: its camera frame rotated so that the estimated up is +z
     and the camera looks along +y."""
@@ -382,94 +324,10 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
     return bundle
 
 
-# ------------------------------------------------------------------------------------------------
-# saving and loading
-
-BUNDLE_JSON = "bundle.json"
-ARRAYS = "source.npz"
-SEGMENTED_PNG = "segmented.png"
-
-
-def save_bundle(bundle: ViewBundle, folder: Path) -> None:
-    """Write ``bundle`` into ``folder`` (replaced atomically): its page data as JSON, the cloud
-    source's arrays as ``.npz`` and the segmented image."""
-    import dataclasses
-    import json
-    import shutil
-
-    from oh_my_slam.segmentation.cloud import MapCloudSource
-
-    folder = Path(folder)
-    tmp = folder.with_name(f".{folder.name}.tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    src = bundle.source
-    fields = [f.name for f in dataclasses.fields(src)]
-    arrays = {n: getattr(src, n) for n in fields if isinstance(getattr(src, n), np.ndarray)}
-    np.savez(tmp / ARRAYS, **arrays)
-    meta = {
-        "mode": bundle.mode, "title": bundle.title, "scene": bundle.scene,
-        "catalog": bundle.catalog, "display_transform": bundle.display_transform,
-        "camera_sources": bundle.camera_sources, "point_budget": bundle.point_budget,
-        "source": {"kind": "map" if isinstance(src, MapCloudSource) else "image",
-                   "values": {n: dataclasses.asdict(v) for n in fields
-                              if dataclasses.is_dataclass(v := getattr(src, n))}},
-    }
-    (tmp / BUNDLE_JSON).write_text(json.dumps(meta))
-    if bundle.segmented_png is not None:
-        (tmp / SEGMENTED_PNG).write_bytes(bundle.segmented_png)
-    shutil.rmtree(folder, ignore_errors=True)
-    tmp.replace(folder)
-
-
-def save_map_reference(map_dir: Path, folder: Path) -> None:
-    """A map bundle is the map itself: record which map (opened read-only, so it is one)."""
-    import json
-
-    from oh_my_slam.mapping.store import MapReader
-
-    root = MapReader(Path(map_dir)).root
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / BUNDLE_JSON).write_text(json.dumps({"mode": "map", "map": str(root)}))
-
-
-def saved_map(folder: Path) -> Path | None:
-    """The map a saved bundle refers to, or None for a saved image bundle."""
-    import json
-
-    meta = json.loads((Path(folder) / BUNDLE_JSON).read_text())
-    return Path(meta["map"]) if "map" in meta else None
-
-
-def load_bundle(folder: Path) -> ViewBundle:
-    """The bundle :func:`save_bundle` wrote (a map reference opens the map: :func:`map_bundle`)."""
-    import json
-
-    from oh_my_slam.core.types import Intrinsics
-    from oh_my_slam.segmentation.cloud import MapCloudSource
-
-    folder = Path(folder)
-    meta = json.loads((folder / BUNDLE_JSON).read_text())
-    if "map" in meta:
-        return map_bundle(Path(meta["map"]))
-    with np.load(folder / ARRAYS) as npz:
-        values: dict[str, Any] = {k: npz[k] for k in npz.files}
-    for name, v in meta["source"]["values"].items():
-        values[name] = Intrinsics(**v)
-    cls = MapCloudSource if meta["source"]["kind"] == "map" else ImageCloudSource
-    png = folder / SEGMENTED_PNG
-    return ViewBundle(
-        mode=meta["mode"], title=meta["title"], scene=meta["scene"], source=cls(**values),
-        catalog=meta["catalog"], segmented_png=png.read_bytes() if png.is_file() else None,
-        display_transform=meta["display_transform"], camera_sources=meta["camera_sources"],
-        point_budget=meta["point_budget"])
-
-
 def bundle_of(values: Any, client: Any = None) -> ViewBundle:
     """The bundle of a command's validated arguments (``commands.spec.validate``): ``map`` (and
     its opened ``reader``) gives the map's, else ``image`` the image's, with ``min_score`` when the
-    command has one. ``view.sh`` serves it; the web service's bundle writer saves it."""
+    command has one. ``view.sh`` serves it."""
     if getattr(values, "map", None) is not None:
         return map_bundle(values.map, getattr(values, "reader", None))
     return image_bundle(values.image, client, getattr(values, "min_score", None))

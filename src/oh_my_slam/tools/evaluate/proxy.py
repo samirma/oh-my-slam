@@ -12,8 +12,7 @@ its route, its fields without paths, and the contents of the files it names (``*
 ``*_paths``: the image as sent), so different images never share a response and concurrent
 requests (a mapping update's frames) cannot be swapped. Response files (``*_path``: depth maps,
 masks) are copied into the store when recorded and back into the request's ``out_dir`` (else a
-temporary folder) when replayed, as ``client.replay`` does. Anything else (``/health``) is
-forwarded unchanged.
+temporary folder) when replayed. Anything else (``/health``) is forwarded unchanged.
 """
 
 from __future__ import annotations
