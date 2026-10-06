@@ -1,8 +1,8 @@
 // Maps (http_server.md "Structure"): the workspace's maps as cards (name and summary figures from
 // the map's metadata) with a filter (#/maps?filter=<text>); a map's page (#/maps/<name>) with its
 // summary, its update history with timings (map.json's `updates`), and the operations that take a
-// map without writing it (#/maps/<name>?op=<id>: locating images in it, segmenting it), each with
-// its generated form, the running request and the result. The operation that writes maps is the
+// map without writing it (#/maps/<name>?op=<id>, e.g. locating images in it), each with its
+// generated form, the running request and the result. The operation that writes maps is the
 // guided flow (mapflow.js).
 import { el, clear, notice, facts, fmtDate, fmtSeconds, fmtNumber, humanize } from '../dom.js';
 import { getJson, enc } from '../api.js';
@@ -66,7 +66,7 @@ export function mapsPage(main, { filter }) {
   const count = el('p', { class: 'muted', id: 'map-count', role: 'status' }, 'Loading the maps…');
   main.append(el('div', { class: 'page-head' }, el('h1', {}, 'Maps'),
     writer ? el('a', { href: '#/maps/new', class: 'button primary', 'data-action': 'new-map' }, 'New map') : null),
-  el('p', { class: 'lead' }, 'The maps of this workspace. Open one to see its update history, locate images in it or segment it.'),
+  el('p', { class: 'lead' }, 'The maps of this workspace. Open one to see its summary and update history, and to run the operations that take a map.'),
   el('div', { class: 'filter' }, el('label', { for: 'map-filter' }, 'Filter by name or figure'), input), count, grid);
   let maps = [];
   const draw = () => {

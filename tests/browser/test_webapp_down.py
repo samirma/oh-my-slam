@@ -1,17 +1,20 @@
 """The web application with the inference server down (``-m browser``; http_server.md "Actionable
 errors"): the top bar says so with the command that starts it; the actions that need it are
-disabled with the explanation; everything else stays available — a map is segmented without it."""
+disabled with the explanation; everything else stays available — images are located in a small
+map without it, answered by the command itself."""
 
 from __future__ import annotations
 
-import json
+import shutil
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.browser.webapp import Tab, operation_response, running_service
 from tests.unit.test_view_cli import minimal_map, sh
+from tests.unit.test_web_api import jpeg
 
 pytestmark = [pytest.mark.browser]
 
@@ -62,19 +65,26 @@ def test_actions_that_need_it_are_disabled_with_the_reason(browser: Any, down: t
         tab.close()
 
 
-def test_the_rest_stays_available(tab: Tab) -> None:
+def test_the_rest_stays_available(tab: Tab, tmp_path: Path) -> None:
     pg = tab.go("#/maps")
     pg.wait_for_selector("li.map-card[data-map=m]")
-    pg = tab.go("#/maps/m?op=segment-map")
+    # mapper.sh locate needs the server only for a large map: the service's own check decides
+    pg = tab.go("#/maps/m?op=mapper-locate")
     pg.wait_for_function("() => document.body.dataset.inference === 'down'")
     assert pg.locator("button[data-action=run]").is_enabled()
     assert pg.locator(".run-panel .notice.warn").count() == 0
-    with operation_response(pg, "segment-map") as answer:
+    pg.set_input_files(".field[data-param=inputs] input[type=file]", str(jpeg(tmp_path / "q.jpg")))
+    pg.wait_for_selector(".field[data-param=inputs] li.ready")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-m=maps/m')")
+    with operation_response(pg, "mapper-locate") as answer:
         pg.click("button[data-action=run]")
-    tab.wait_request()
-    assert json.loads(answer.body)["openlabel"]
-    # mapper.sh locate needs the server only for a large map: the service's own check decides
-    pg.check("#op-mapper-locate")
-    assert pg.locator("button[data-action=run]").is_enabled()
+    tab.wait_request("failed")
+    # it ran: the answer is the command's own (an empty map locates nothing), not the server's 503
+    text = pg.inner_text("[data-testid=request] .notice.error")
+    assert answer.status != 503 and "HTTP 503" not in text and "server_unavailable" not in text
+    if shutil.which("colmap"):  # without COLMAP the command fails before matching
+        assert answer.status == 400 and "none of the images could be located" in text
     tab.a11y()
-    assert tab.errors == []
+    # its refusal is the only failed response
+    assert [e for e in tab.errors
+            if "/api/ops/mapper-locate" not in e and "Failed to load resource" not in e] == []

@@ -1,7 +1,8 @@
 """The server.sh web application in a real browser (``-m browser``; http_server.md "Evaluation → UI"):
 a single-image request, a point-cloud result drawn in the page (on the Image page and on a map's
-page), map creation and update, locating images in a map, segmenting a map, the download of a
-result, interruption (and a request waiting for its turn), and an automatic
+page), an image result (the depth image, the segmented image), map creation and update, locating
+images in a map, the download of a result, interruption (and a request waiting for its turn), and
+an automatic
 accessibility check of every page; plus the registry-driven forms, stable URLs, responsiveness, the
 keyboard and the layout down to tablet width in both themes.
 
@@ -120,26 +121,31 @@ def check_download(pg: Any, body: bytes) -> str:
 
 
 def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> None:
-    """segment.sh -i through the Image page: drop zone with preview, generated form (a field shown
-    once it applies, a value flagged with the command's message before submission), the request
-    running, then the scene's objects listed, the result in full, its stage timings and its
-    download."""
+    """reconstruct.sh then segment.sh -i through the Image page: drop zone with preview, generated
+    form (a field shown once it applies, a value flagged with the command's message before
+    submission), the request running, then the scene's objects listed, the result in full, its
+    stage timings and its download."""
     service, _ = app
-    pg = tab.go("#/image")
-    pg.check("#op-segment-image")
-    assert "op=segment-image" in pg.url
+    pg = tab.go("#/image?op=reconstruct")
     pg.wait_for_timeout(400)  # the first validation: nothing flagged before the user acts
     assert pg.locator(".field-error:not(:empty)").count() == 0
     pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
     pg.wait_for_selector("img.preview:not([hidden])")
     pg.wait_for_selector(".field[data-param=image] li.ready")
-    # -p applies to -f ply only: hidden until then
+    # -p applies to -f ply only: hidden until then, and again for the depth image
     attrs = pg.locator(".field[data-param=attrs]")
     assert attrs.is_hidden()
     pg.select_option(".field[data-param=format] select", "ply")
     attrs.wait_for(state="visible")
-    pg.select_option(".field[data-param=format] select", "json")
+    pg.select_option(".field[data-param=format] select", "depth")
     attrs.wait_for(state="hidden")
+    # segment.sh -i, the image kept
+    pg.check("#op-segment-image")
+    assert "op=segment-image" in pg.url
+    pg.wait_for_selector(".field[data-param=image] li.ready")
+    assert pg.locator(".field[data-param=attrs]").count() == 0  # segment.sh has no -p
+    assert pg.locator(".field[data-param=format] select option").all_inner_texts() == [
+        "json (default)", "png"]
     # an invalid value is flagged next to its field, in the command's words, before submission
     score = pg.locator(".field[data-param=min_score] input")
     assert "default 0.5" in pg.inner_text(".field[data-param=min_score] .help")  # its default and help
@@ -408,12 +414,16 @@ def test_a_point_cloud_that_does_not_parse(tab: Tab, image: Path) -> None:
 @pytest.mark.parametrize("width", [1280, 768])
 def test_a_point_cloud_result_in_both_themes_down_to_tablet_width(browser: Any, app: tuple[Any, str], image: Path,
                                                                   scheme: str, width: int) -> None:
+    """reconstruct -f ply -p color=segment: the objects' colours exactly, unsegmented points grey."""
     t = Tab(browser, app[1], width=width, height=1000, scheme=scheme)
     try:
-        pg = t.go("#/image?op=segment-image")
+        pg = t.go("#/image?op=reconstruct")
         pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
         pg.wait_for_selector(".field[data-param=image] li.ready")
-        body = ply_body(pg, "segment-image")
+        pg.select_option(".field[data-param=format] select", "ply")
+        pg.select_option(".field[data-param=attrs] .attr[data-attr=color] select", "segment")
+        pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p=color=segment')")
+        body = ply_body(pg, "reconstruct")
         check_drawn(pg, body)
         assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
         bad = axe_violations(pg)
@@ -425,7 +435,34 @@ def test_a_point_cloud_result_in_both_themes_down_to_tablet_width(browser: Any, 
         t.close()
 
 
-# ----------------------------------------------------------------- maps: create, update, locate, segment
+# --------------------------------------------------------------------------------- an image result
+
+
+def test_an_image_result_is_offered_byte_for_byte(tab: Tab, image: Path) -> None:
+    """A PNG result — the segmented image of segment.sh -f png, the depth image of reconstruct.sh
+    -f depth — is the response body, in its media type, offered as a download byte for byte."""
+    pg = tab.go("#/image?op=segment-image")
+    pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
+    pg.wait_for_selector(".field[data-param=image] li.ready")
+    for op, fmt, name in (("segment-image", "png", "segment-image-photo.png"),
+                          ("reconstruct", "depth", "reconstruct-photo.png")):
+        pg.check(f"#op-{op}")
+        pg.wait_for_selector(".field[data-param=image] li.ready")
+        pg.select_option(".field[data-param=format] select", fmt)
+        pg.wait_for_function(f"() => document.querySelector('[data-testid=command]').textContent.includes('-f={fmt}')")
+        with operation_response(pg, op) as answer:
+            pg.click("button[data-action=run]")
+        tab.wait_request()
+        assert answer.headers["content-type"] == "image/png"
+        assert answer.body.startswith(b"\x89PNG\r\n\x1a\n")
+        assert pg.get_attribute("[data-testid=result]", "data-format") == "png"
+        assert "image/png" in pg.inner_text("[data-testid=result] .result-head")
+        assert check_download(pg, answer.body) == name
+        tab.a11y()
+    assert tab.errors == []
+
+
+# ----------------------------------------------------------------------- maps: create, update, locate
 
 
 @pytest.fixture(scope="module")
@@ -529,37 +566,29 @@ def test_locating_images_in_a_map(mapped: dict[str, Any], tab: Tab) -> None:
         pg.click("button[data-action=run]")
     tab.wait_request()
     body = answer.body
-    assert json.loads(body)["openlabel"]
+    doc = json.loads(body)
+    assert doc["openlabel"]
+    assert listed_objects(pg) == scene_objects(doc)
     assert check_download(pg, body) == "mapper-locate-room.json"
     tab.a11y()
-    assert tab.errors == []
-
-
-def test_segmenting_a_map(mapped: dict[str, Any], tab: Tab) -> None:
-    pg = tab.go("#/maps/room")
-    pg.check("#op-segment-map")
-    assert "op=segment-map" in pg.url
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('segment.sh -m=maps/room')")
-    with operation_response(pg, "segment-map") as answer:
-        pg.click("button[data-action=run]")
-    tab.wait_request()
-    body = answer.body
-    doc = json.loads(body)
-    assert listed_objects(pg) == scene_objects(doc)
-    assert check_download(pg, body) == "segment-map-room.json"
     # the page returns on its URL with the same operation chosen
     pg.reload()
     pg.wait_for_selector("body[data-ready=true]")
-    assert pg.is_checked("#op-segment-map")
+    assert pg.is_checked("#op-mapper-locate")
     assert tab.errors == []
 
 
 def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -> None:
-    """segment.sh -m -f ply on a map's page: the map's cloud in its objects' colours (unsegmented
-    points grey), drawn in 3D as it is (map frame, z up)."""
-    pg = tab.go("#/maps/room?op=segment-map")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('segment.sh -m=maps/room')")
-    body = ply_body(pg, "segment-map")
+    """mapper.sh locate -f ply -p color=segment on a map's page: the map points the located camera
+    sees in their objects' colours (unsegmented points grey), drawn in 3D as they are (map frame,
+    z up)."""
+    pg = tab.go("#/maps/room?op=mapper-locate")
+    pg.set_input_files(".field[data-param=inputs] input[type=file]", str(FRAMES[1]))
+    pg.wait_for_selector(".field[data-param=inputs] li.ready")
+    pg.select_option(".field[data-param=format] select", "ply")
+    pg.select_option(".field[data-param=attrs] .attr[data-attr=color] select", "segment")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p=color=segment')")
+    body = ply_body(pg, "mapper-locate")
     check_drawn(pg, body)
     assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
     assert "z up" in pg.inner_text(f"{CLOUD} [data-fact=Frame]") and "upright" not in pg.inner_text(f"{CLOUD} [data-fact=Frame]")
@@ -568,7 +597,7 @@ def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -
     assert turned(settle(pg), first) > 10
     pg.click("[data-move='Zoom out']")
     assert distance(settle(pg)) > distance(first) * 1.2
-    assert check_download(pg, body) == "segment-map-room.ply"
+    assert check_download(pg, body) == "mapper-locate-room.ply"
     tab.a11y()
     assert tab.errors == []
 
@@ -580,15 +609,15 @@ def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -
 def extended(app: tuple[Any, str]) -> Iterator[Any]:
     """The registry with new modes — slow.sh -m MAP (reads a map, as long as asked), nap.sh -i
     IMAGE (needs the inference server, an option of a kind never seen, a rule with its own
-    message) — and a new option on segment.sh -m (--shade): no change to the web application."""
+    message) — and a new option on mapper.sh locate (--shade): no change to the web application."""
     service, _ = app
-    seg = spec.SEGMENT.command()
+    loc = spec.MAPPER.command("locate")
     extra = spec.Option("--shade", "shade", spec.Kind.ENUM, "a new option of the export", default="dark",
-                        choices=("dark", "light"), modes=("map",))
-    seg2 = dataclasses.replace(seg, options=(*seg.options, extra))
-    programs = (*[p for p in spec.PROGRAMS if p is not spec.SEGMENT],
-                dataclasses.replace(spec.SEGMENT, commands=(seg2,)), slow_command.map_registry_program(),
-                slow_command.image_registry_program("required"))
+                        choices=("dark", "light"))
+    mapper = dataclasses.replace(spec.MAPPER, commands=(
+        spec.MAPPER.command("update"), dataclasses.replace(loc, options=(*loc.options, extra))))
+    programs = (*[p if p is not spec.MAPPER else mapper for p in spec.PROGRAMS],
+                slow_command.map_registry_program(), slow_command.image_registry_program("required"))
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(spec, "PROGRAMS", programs)
         mp.setattr(web_ops.Operation, "module", property(
@@ -711,7 +740,9 @@ def test_a_registry_change_reaches_the_ui(extended: Any, tab: Tab, image: Path) 
     """A new option is a new field, a new mode a new form on the page its inputs belong to, a new
     kind of option still a field, a new rule's message is flagged before submission, and a new
     error is shown in the command's words."""
-    pg = tab.go("#/maps/empty?op=segment-map")
+    pg = tab.go("#/maps/empty?op=mapper-locate")
+    pg.set_input_files(".field[data-param=inputs] input[type=file]", str(image))
+    pg.wait_for_selector(".field[data-param=inputs] li.ready")
     shade = pg.locator(".field[data-param=shade] select")
     shade.wait_for()
     assert shade.input_value() == "dark" and "a new option of the export" in pg.inner_text(".field[data-param=shade]")

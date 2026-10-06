@@ -36,7 +36,7 @@ from tests.unit.test_view_cli import minimal_map, sh
 
 REPO = Path(__file__).resolve().parents[2]
 OCTET = {"content-type": "application/octet-stream"}
-OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment-image", "segment-map"}
+OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment-image"}
 API_ROUTES = {"GET /api/health", "GET /api/openapi.json", "POST /api/ops/{op}",
               "POST /api/ops/{op}/validate", "POST /api/uploads", "DELETE /api/uploads/{id}",
               "GET /api/maps", "GET /api/maps/{name}"}
@@ -173,24 +173,43 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
     for op in web_ops.operations().values():
         assert importlib.util.find_spec(op.module) is not None, op.module
         assert f"oms_exec {op.module.rsplit('.', 1)[1]}" in (REPO / op.program.prog).read_text()
-    seg = web_ops.prepare(web_ops.operations()["segment-image"], {"image": "in/a.jpg"}, ws)
+    ops = web_ops.operations()
+    seg = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg"}, ws)
     assert seg.argv == [f"-i={(ws.root / 'in' / 'a.jpg')}"]  # the result is its stdout: no -o
     assert seg.command == ["segment.sh", "-i=in/a.jpg"] and seg.result_format == "json"
-    ply = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m", "format": "ply"}, ws)
-    assert ply.argv == [f"-m={ws.maps / 'm'}", "-f=ply"] and ply.result_format == "ply"
-    assert not ply.inference and web_ops.media_of(ply.result_format) == \
-        "application/octet-stream"
+    # each result in the media type of its format: the segmented image and the depth image are
+    # PNGs, the point cloud a PLY
+    for op, params, fmt, media in (
+            ("segment-image", {"format": "png"}, "png", "image/png"),
+            ("reconstruct", {"format": "depth"}, "png", "image/png"),
+            ("reconstruct", {"format": "ply", "attrs": "normals=on"}, "ply",
+             "application/octet-stream"),
+            ("reconstruct", {}, "json", "application/json")):
+        prep = web_ops.prepare(ops[op], {"image": "in/a.jpg", **params}, ws)
+        assert prep.problems == [] and prep.inference, (op, params)
+        assert (prep.result_format, web_ops.media_of(prep.result_format)) == (fmt, media)
+    loc = web_ops.prepare(ops["mapper-locate"], {"inputs": ["in/a.jpg"], "map": "m"}, ws)
+    assert loc.argv[-1] == f"-m={ws.maps / 'm'}" and loc.result_format == "json"
+    assert not loc.inference  # a small map is matched exhaustively
     for name, value in (("output", "x.json"), ("artifacts", "files")):
-        refused = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m", name: value},
-                                  ws)
+        refused = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg", name: value}, ws)
         assert [p.parameters for p in refused.problems] == [(name,)]
         assert "chooses where the command writes" in refused.problems[0].message
+    # segment.sh has no -m and no -p any more: the command's parser refuses them
+    gone = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg", "map": "m",
+                                                  "attrs": "voxel=1"}, ws)
+    assert [p.parameters for p in gone.problems] == [("attrs", "map")]
+    refused = web_ops.prepare(ops["reconstruct"], {"image": "in/a.jpg", "format": "depth",
+                                                   "attrs": "voxel=1"}, ws)
+    assert refused.problems[0].message == ("-p sets point-cloud attributes, which only the PLY "
+                                           "output has: use -f ply")
 
 
 def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
         monkeypatch: pytest.MonkeyPatch, svc: Svc) -> None:
     """Monkeypatch the registry: an extra option on segment.sh and a whole new command appear in
-    the OpenAPI document and are accepted by the API, with no change to oh_my_slam.web."""
+    the OpenAPI document and are accepted by the API, with no change to oh_my_slam.web (the
+    inference server counts as up: the check concerns the request)."""
     seg = spec.SEGMENT.command()
     extra = spec.Option("--shade", "shade", spec.Kind.ENUM, "a new option", default="dark",
                         choices=("dark", "light"))
@@ -199,18 +218,20 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
         *[p for p in spec.PROGRAMS if p is not spec.SEGMENT],
         dataclasses.replace(spec.SEGMENT, commands=(seg2,))))
     with_programs(monkeypatch, svc.service, slow_command.registry_program())
+    monkeypatch.setattr(svc.service, "inference_check", lambda: None)
 
     doc = svc.client.get("/api/openapi.json").json()
-    props = doc["paths"]["/api/ops/segment-map"]["post"]["requestBody"]["content"][
+    props = doc["paths"]["/api/ops/segment-image"]["post"]["requestBody"]["content"][
         "application/json"]["schema"]["properties"]
     assert props["shade"]["enum"] == ["dark", "light"] and props["shade"]["default"] == "dark"
     assert "/api/ops/slow" in doc["paths"]
 
-    minimal_map(svc.ws.maps / "m")
-    r = svc.client.post("/api/ops/segment-map/validate", json={"map": "m", "shade": "light"})
+    jpeg(svc.ws.root / "inputs" / "a.jpg")
+    image = {"image": "inputs/a.jpg"}
+    r = svc.client.post("/api/ops/segment-image/validate", json={**image, "shade": "light"})
     assert r.json()["valid"], r.json()
     assert "--shade=light" in r.json()["command"]
-    bad = svc.client.post("/api/ops/segment-map/validate", json={"map": "m", "shade": "blue"})
+    bad = svc.client.post("/api/ops/segment-image/validate", json={**image, "shade": "blue"})
     assert fields(bad.json()) == ["shade"]
     v = svc.client.post("/api/ops/slow/validate", json={"seconds": 0.2}).json()
     assert v["command"] == ["slow.sh", "--seconds=0.2"] and v["inference"] is False
@@ -224,23 +245,27 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
 
 
 def test_invalid_requests_get_per_field_errors_and_run_nothing(svc: Svc) -> None:
-    minimal_map(svc.ws.maps / "m")
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m", "min_score": 0.2,
-                                                      "attrs": "color=rgb", "format": "xml"})
+    jpeg(svc.ws.root / "inputs" / "ok.jpg")
+    image = {"image": "inputs/ok.jpg"}
+    r = svc.client.post("/api/ops/segment-image", json={**image, "min_score": "abc",
+                                                        "format": "xml"})
     assert r.status_code == 400
     err = r.json()["error"]
     assert err["code"] == "usage" and err["exit_code"] == 2
     assert set(err["by_parameter"]) >= {"format", "min_score"}
     assert "invalid choice: 'xml'" in err["by_parameter"]["format"][0]  # argparse's message
     r = svc.client.post("/api/ops/segment-image", json={})
-    assert r.status_code == 400 and "one of the arguments -i -m is required" in r.json()[
+    assert r.status_code == 400 and "the following arguments are required: -i" in r.json()[
         "error"]["message"]
-    r = svc.client.post("/api/ops/segment-map", json={"map": "absent"})
+    (svc.ws.maps / "junk").mkdir()
+    (svc.ws.maps / "junk" / "notes.txt").write_text("x")
+    r = svc.client.post("/api/ops/mapper-update", json={"inputs": ["inputs/ok.jpg"],
+                                                        "map": "junk"})
     assert r.status_code == 422 and r.json()["error"]["code"] == "not_a_map"
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m", "artifacts": "x",
-                                                      "output": "x"})
+    r = svc.client.post("/api/ops/segment-image", json={**image, "artifacts": "x",
+                                                        "output": "x"})
     assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts", "output"]
-    r = svc.client.post("/api/ops/segment-map", content=b"[1, 2]",
+    r = svc.client.post("/api/ops/segment-image", content=b"[1, 2]",
                         headers={"content-type": "application/json"})
     assert r.status_code == 400
     r = svc.client.post("/api/ops/nope", json={})
@@ -270,7 +295,8 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
         r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
         assert "hidden entries" in r.json()["by_parameter"]["image"][0], image
     for m in ("../m", "evil", "inputs", "/tmp", ".staging"):
-        r = svc.client.post("/api/ops/segment-map/validate", json={"map": m})
+        r = svc.client.post("/api/ops/mapper-locate/validate",
+                            json={"inputs": ["inputs/ok.jpg"], "map": m})
         assert fields(r.json()) == ["map"], m
     r = svc.client.post("/api/ops/mapper-update/validate",
                         json={"inputs": ["inputs/ok.jpg", "inputs/link.jpg"], "map": "new"})
@@ -294,14 +320,15 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
         assert c.get("/api/health", headers={"host": "[::1]:1234"}).status_code == 200
         assert c.get("/api/health", headers={"host": "localhost"}).status_code == 200
         foreign = {"origin": "http://evil.example"}
-        r = c.post("/api/ops/segment-map", json={"map": "m"}, headers=foreign)
+        locate = {"inputs": ["a.jpg"], "map": "m"}
+        r = c.post("/api/ops/mapper-locate", json=locate, headers=foreign)
         assert r.status_code == 403
         assert c.post("/api/uploads?name=a.jpg", content=b"x",
                       headers={**OCTET, **foreign}).status_code == 403
         assert c.delete("/api/uploads/x", headers=foreign).status_code == 403
         # a form post (what a cross-site page can send without a preflight) is refused
         for ctype in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
-            r = c.post("/api/ops/segment-map", content=b'{"map": "m"}',
+            r = c.post("/api/ops/mapper-locate", content=json.dumps(locate).encode(),
                        headers={"content-type": ctype})
             assert r.status_code == 415, ctype
             r = c.post("/api/uploads?name=a.jpg", content=b"x", headers={"content-type": ctype})
@@ -309,12 +336,12 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
         assert not list(ws.uploads.iterdir())
         assert c.post("/api/uploads?name=a.jpg", content=b"x").status_code == 415  # no type
         # the same origin is fine
-        r = c.post("/api/ops/segment-map/validate", json={"map": "m"},
+        r = c.post("/api/ops/mapper-locate/validate", json=locate,
                    headers={"origin": "http://testserver"})
         assert r.status_code == 200
         # the full origin counts: another port or scheme of this machine is another site
         for other in ("http://testserver:9999", "https://testserver", "http://127.0.0.1:8000"):
-            r = c.post("/api/ops/segment-map/validate", json={"map": "m"},
+            r = c.post("/api/ops/mapper-locate/validate", json=locate,
                        headers={"origin": other})
             assert r.status_code == 403, other
         # an upload may carry the file's own media type
@@ -337,7 +364,8 @@ def test_an_unknown_host_refreshes_the_machines_names(ws: Workspace,
     service.runner.shutdown()
 
 
-def test_inference_operations_get_503_while_the_others_work(svc: Svc) -> None:
+def test_inference_operations_get_503_while_the_others_work(
+        monkeypatch: pytest.MonkeyPatch, svc: Svc) -> None:
     sh("start_inference_server.sh", "--stop")  # no inference server in this test
     jpeg(svc.ws.root / "inputs" / "ok.jpg")
     health = svc.client.get("/api/health").json()
@@ -347,7 +375,9 @@ def test_inference_operations_get_503_while_the_others_work(svc: Svc) -> None:
     assert health["inference"]["start_command"] == "./start_inference_server.sh"
     up = svc.client.post("/api/uploads?name=b.jpg", content=b"x", headers=OCTET).json()
     for op, params in (("reconstruct", {"image": "inputs/ok.jpg"}),
+                       ("reconstruct", {"image": "inputs/ok.jpg", "format": "depth"}),
                        ("segment-image", {"image": up["path"]}),
+                       ("segment-image", {"image": "inputs/ok.jpg", "format": "png"}),
                        ("mapper-update", {"inputs": ["inputs/ok.jpg"], "map": "new"})):
         r = svc.client.post(f"/api/ops/{op}", json=params)
         assert r.status_code == 503, (op, r.json())
@@ -357,11 +387,16 @@ def test_inference_operations_get_503_while_the_others_work(svc: Svc) -> None:
     assert not (svc.ws.maps / "new").exists()
     assert not (svc.ws.uploads / up["id"]).exists()  # the refused request consumed its upload
     minimal_map(svc.ws.maps / "m")
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m"})
+    # mapper.sh locate on a small map needs no inference server: it is not refused
+    v = svc.client.post("/api/ops/mapper-locate/validate",
+                        json={"inputs": ["inputs/ok.jpg"], "map": "m"}).json()
+    assert v["valid"] and v["inference"] is False, v
+    # an operation that needs none runs, and answers with its result
+    with_programs(monkeypatch, svc.service, slow_command.map_registry_program())
+    r = svc.client.post("/api/ops/slow", json={"map": "m"})
     assert r.status_code == 200, r.text
-    assert r.headers["content-type"] == "application/json"
-    assert r.json()["openlabel"]["metadata"]["schema_version"] == "1.0.0"
-    assert "export;dur=" in r.headers["server-timing"]
+    assert r.headers["content-type"] == "application/json" and r.json()["slept"] == 0
+    assert "setup;dur=" in r.headers["server-timing"]
     maps = svc.client.get("/api/maps").json()
     assert [m["name"] for m in maps] == ["m"] and maps[0]["update_count"] == 1
     assert "thumbnail" not in maps[0]  # no map-file download to show it with
@@ -391,7 +426,8 @@ def test_a_locate_that_needs_no_inference_skips_the_inference_queue(ws: Workspac
     assert spec.needs_inference(big, args) is True
     odd = dataclasses.replace(loc.modes[0], inference_condition={"unknown_condition": 1})
     assert spec.needs_inference(odd, args) is True  # what cannot be evaluated needs it
-    assert spec.needs_inference(spec.SEGMENT_MAP, args) is False
+    never = slow_command.registry_program().commands[0].modes[0]  # type: ignore[attr-defined]
+    assert spec.needs_inference(never, args) is False
     assert spec.needs_inference(spec.SEGMENT_IMAGE, args) is True
     jpeg(ws.root / "q.jpg")
     op = web_ops.operations()["mapper-locate"]
@@ -513,8 +549,11 @@ def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
         "c = TestClient(create_app(Service(ws, Runner(ws), extra_hosts={'testserver'})))\n"
         "for u in ('/api/health', '/api/openapi.json', '/api/maps', '/api/maps/m'):\n"
         "    assert c.get(u).status_code == 200, u\n"
-        "c.post('/api/ops/segment-map/validate', json={'map': 'm'})\n"
-        "assert c.post('/api/ops/segment-map', json={'map': 'm'}).status_code == 200\n"
+        "(ws.root / 'a.jpg').write_bytes(b'x')\n"
+        "locate = {'inputs': ['a.jpg'], 'map': 'm'}\n"
+        "assert c.post('/api/ops/mapper-locate/validate', json=locate).json()['valid']\n"
+        "c.post('/api/ops/segment-image/validate', json={'image': 'a.jpg', 'format': 'png'})\n"
+        "c.post('/api/ops/reconstruct', json={'image': 'a.jpg', 'format': 'depth'})\n"
         "print(sorted(m for m in ('torch', 'open3d', 'pycolmap') if m in sys.modules))\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO,
                          timeout=120)
@@ -524,7 +563,8 @@ def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
 
 def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
     """No request deletes or changes a map outside the mapping operation: no route deletes one,
-    read-only requests and a failing update leave it as it was, and so do a stop and a restart."""
+    read-only requests (whatever their outcome) and a failing update leave it as it was, and so
+    do a stop and a restart."""
     from tests.mapsnap import snapshot
 
     root = minimal_map(ws.maps / "m")
@@ -533,10 +573,11 @@ def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
     with TestClient(create_app(service)) as c:
         assert c.delete("/api/maps/m").status_code == 405
         assert c.delete("/api/uploads/m").status_code == 404
-        for params in ({"map": "m"}, {"map": "maps/m", "format": "ply"}):
-            r = c.post("/api/ops/segment-map", json=params)
-            assert r.status_code == 200, r.text
         (ws.root / "bad.jpg").write_bytes(b"not an image")
+        for params in ({"map": "m"}, {"map": "maps/m", "format": "ply"}):
+            r = c.post("/api/ops/mapper-locate", json={"inputs": ["bad.jpg"], **params})
+            assert r.status_code == 400, r.text  # the command's own refusal (an unreadable image)
+            assert "cannot read image" in r.json()["error"]["message"]
         r = c.post("/api/ops/mapper-update", json={"inputs": ["bad.jpg"], "map": "m"})
         assert r.status_code >= 400
         assert c.get("/api/maps").json()[0]["name"] == "m"

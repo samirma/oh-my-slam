@@ -86,17 +86,23 @@ def test_responses_are_byte_identical_to_the_commands(
     assert r.content == cli("reconstruct.sh", "-i", real, "-f", "ply", "-p", "normals=on").stdout
     stages(r.headers["server-timing"], "reconstruct.sh")
 
-    # a map made by the service is a mapper.sh map: the commands read it, and the same
-    # read-only export through the service is byte-identical
+    # the images: the depth image and the segmented image, PNGs byte for byte
+    r = client.post("/api/ops/reconstruct", json={"image": "inputs/photo.jpg", "format": "depth"})
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    assert r.content == cli("reconstruct.sh", "-i", real, "-f", "depth").stdout
+    assert "segment" not in stages(r.headers["server-timing"], "reconstruct.sh")
+    r = client.post("/api/ops/segment-image", json={"image": "inputs/photo.jpg", "format": "png"})
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    assert r.content == cli("segment.sh", "-i", real, "-f", "png").stdout
+    stages(r.headers["server-timing"], "segment.sh -i")
+
+    # a map made by the service is a mapper.sh map
     r = client.post("/api/ops/mapper-update", json={"inputs": ["inputs/photo.jpg"], "map": "m"})
     assert r.status_code == 200, r.text
     assert "commit" in stages(r.headers["server-timing"], "mapper.sh update")
     assert store.classify(ws.maps / "m") == "map"
     summary = client.get("/api/maps").json()[0]
     assert summary["name"] == "m" and summary["frames"] == 1 and summary["update_count"] == 1
-    r = client.post("/api/ops/segment-map", json={"map": "m", "format": "ply"})
-    assert r.status_code == 200
-    assert r.content == cli("segment.sh", "-m", str((ws.maps / "m").resolve()), "-f", "ply").stdout
     assert list(ws.requests.iterdir()) == []  # the service keeps no result
 
 

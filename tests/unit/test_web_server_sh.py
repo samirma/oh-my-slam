@@ -90,9 +90,10 @@ def test_server_sh_lifecycle(data: Path) -> None:
     assert r.status_code == 503 and r.json()["error"]["code"] == "server_unavailable"
     minimal_map(data / "maps" / "m")
     assert httpx.get(url + "api/maps").json()[0]["name"] == "m"
-    r = httpx.post(url + "api/ops/segment-map", json={"map": "m"}, timeout=60)
-    assert r.status_code == 200 and r.json()["openlabel"]
-    assert r.headers["server-timing"].startswith("export;dur=")
+    # mapper.sh locate on a small map needs no inference server: valid, and not refused
+    r = httpx.post(url + "api/ops/mapper-locate/validate",
+                   json={"inputs": ["inputs/a.jpg"], "map": "m"}, timeout=60)
+    assert r.status_code == 200 and r.json()["valid"] and r.json()["inference"] is False
     assert httpx.get(url).status_code == 200
     assert httpx.get(url + "api/openapi.json").json()["openapi"].startswith("3.")
     up = httpx.post(url + "api/uploads?name=b.jpg", content=b"x",
