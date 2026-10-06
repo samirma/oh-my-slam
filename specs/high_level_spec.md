@@ -7,7 +7,7 @@ video, incrementally assembles them into a persistent map that can be inspected 
 browser, and describes that map as a set of **labelled objects with oriented bounding
 boxes (OBBs)**.
 
-The system is exposed through six shell entry points:
+The system is exposed through six shell entry points and an agent skill:
 
 | Entry point | Responsibility |
 | --- | --- |
@@ -17,6 +17,7 @@ The system is exposed through six shell entry points:
 | `segment.sh` | Instance segmentation: image or map → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
 | `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
 | `server.sh` | Web service: an HTTP API and a browser application giving access to every feature of `reconstruct.sh`, `mapper.sh`, `segment.sh` and `view.sh`. |
+| `SKILL.md` agent skill (`oh-my-slam-api`) | Lets an AI agent use every endpoint of the `server.sh` API with `curl`, from this Mac or any machine on the LAN (§2.7). |
 
 This document states requirements only. Detailed decisions — defaults, coordinate
 conventions, exit codes, the OpenLABEL field mapping, the colour palette — are recorded in
@@ -35,6 +36,7 @@ Each entry point is specified in its own file:
 | §2.4 | `segment.sh` | [Segmentation](segment.md) |
 | §2.5 | `view.sh` | [Visualisation](view.md) |
 | §2.6 | `server.sh` | [Web service](http_server.md) |
+| §2.7 | `SKILL.md` | [Agent skill](agent_skill.md) |
 
 ## 3. Scene description (JSON) returned by the tools
 
