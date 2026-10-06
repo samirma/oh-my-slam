@@ -831,23 +831,16 @@ class Sfm:
         return rec
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
-                               refine_intrinsics: bool = True, bundle: bool = True,
                                focal_scale: float = 1.0) -> SfmModel:
-        """Reconstruction from known camera-to-world poses: triangulate the database matches,
-        then (``bundle``) bundle-adjust (intrinsics shared per camera). The cameras' focal lengths
-        are the database's times ``focal_scale``."""
+        """Reconstruction from known camera-to-world poses: the database matches triangulated,
+        poses and intrinsics held (no bundle adjustment: the refined multi-view poses are kept).
+        The cameras' focal lengths are the database's times ``focal_scale``."""
         import pycolmap
 
         rec = self._posed_reconstruction(poses, focal_scale=focal_scale)
         out.mkdir(parents=True, exist_ok=True)
         rec = pycolmap.triangulate_points(rec, str(self.db), str(self.image_dir), str(out),
                                           clear_points=True, refine_intrinsics=False)
-        if bundle:
-            ba = pycolmap.BundleAdjustmentOptions()
-            ba.refine_focal_length = refine_intrinsics
-            ba.refine_principal_point = False
-            ba.refine_extra_params = False
-            pycolmap.bundle_adjustment(rec, ba)
         return SfmModel(rec, "multiview")
 
     def extend_with_poses(self, base_path: Path, poses: dict[str, Pose], out: Path,

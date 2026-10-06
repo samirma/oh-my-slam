@@ -520,8 +520,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     # the first keyframe holds the gauge; the depth fixes the scale, the matches the focal length
     poses, focal = _refine_multiview(ctx, sfm, poses, set(poses) - {todo[0].name},
                                      refine_focal=True, rotation=rotation)
-    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", bundle=False,
-                                          focal_scale=focal)
+    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", focal_scale=focal)
     mv_model.notes.update(reason=reason, metric=True)
     progress(f"multi-view + refinement: {len(mv_model.registered)} keyframes in "
              f"{time.perf_counter() - t0:.0f} s")
