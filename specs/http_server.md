@@ -149,16 +149,20 @@ download or viewer endpoints.
 The web application is served at `/` by the same process and uses only the public API, so
 everything it does can also be scripted. Its forms and result pages are **rendered from the
 API description**, not written per command: a new option appears as a new field, a new error
-as a new message. It has no viewer.
+as a new message. It has no map or scene viewer. A point-cloud result is still drawn in the
+page (see Structure).
 
 ### Structure
 
 * **Top bar** — workspace name, inference-server status (with the command to start it when it
   is down), and whether a request is running or waiting for its turn.
 * **Image** — one image in, any operation that takes a single image. A drop zone with a
-  preview, the generated option form, then the running request and, on success, the result:
-  a scene description shown with its objects listed (label, `id`, colour, score), any result
-  shown in full, and a download of it.
+  preview, the generated option form, then the running request and, on success, the result.
+  A scene description (JSON) is shown in full, with its objects listed (label, `id`, colour,
+  score). A point cloud (PLY) is loaded in the page and drawn in 3D with the colours and
+  attributes it carries, and the user can rotate, pan and zoom it. The drawing reuses the
+  [§2.5](view.md) viewer's own rendering of clouds, so a cloud looks the same as in `view.sh`.
+  Every result can be downloaded byte for byte.
 * **Maps** — the workspace's maps as cards (name and summary figures from the map's
   metadata), with a filter. Creating or updating a map is a guided flow over the mapping
   operation's options, with the input order visible and editable. A map's page shows its
@@ -205,6 +209,6 @@ on the same reference inputs as the commands:
   body is byte-identical to the command's result. The check enumerates the operations from
   the commands' definitions, so a new option or mode is covered without changing the
   evaluator.
-* **UI** — browser tests run the main flows (single-image request, map creation and update,
-  locating images in a map, segmenting a map, download, interruption, inference server down)
-  and check accessibility automatically.
+* **UI** — browser tests run the main flows (single-image request, a point-cloud result drawn
+  in the page, map creation and update, locating images in a map, segmenting a map, download,
+  interruption, inference server down) and check accessibility automatically.
