@@ -14,7 +14,8 @@ one's URL and exits 0. ``--stop`` stops it the way SIGTERM does: every request i
 interrupted — a waiting one never starts, a running command gets SIGINT, as Ctrl-C — and the
 running ones are waited for, so each still gets its answer. A second Ctrl-C or SIGTERM while it
 stops kills every command's process group and exits at once (130); ``--stop`` sends it after
-waiting ``STOP_TIMEOUT_S``.
+waiting ``STOP_TIMEOUT_S``. Its options and modes are defined in ``commands.entry_points``
+(``WEB_SERVICE``).
 """
 
 from __future__ import annotations
@@ -32,16 +33,18 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from oh_my_slam.commands import spec
+from oh_my_slam.commands.entry_points import WEB_SERVICE
 from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.errors import ExitCode, OhMySlamError, UsageError
+from oh_my_slam.core.errors import ExitCode, OhMySlamError, ServiceNotRunningError, UsageError
 from oh_my_slam.core.log import claim_stdout
 from oh_my_slam.core.process import default_sigint
 from oh_my_slam.server.lifecycle import AlreadyRunningError, ServerLock, pid_alive
 from oh_my_slam.version import __version__
 from oh_my_slam.web.workspace import DEFAULT_DATA, Workspace
 
-PROG = "server.sh"
+PROG = WEB_SERVICE.prog
 LOCK = "server.lock"
 STATE = "server.json"
 LOG = "server.log"
@@ -51,31 +54,12 @@ STOP_TIMEOUT_S = 180.0  # interrupted commands get the runner's grace periods to
 FORCE_TIMEOUT_S = 10.0
 
 
-class ServiceNotRunningError(OhMySlamError):
-    """``--status`` without a running service: exit 3, like ``start_inference_server.sh
-    --status``."""
-
-    exit_code = ExitCode.SERVER_UNAVAILABLE
-
-
 def _say(msg: str) -> None:
     print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
 
 
 def build_parser() -> ArgumentParser:
-    ap = ArgumentParser(prog=PROG, description="Local web service: the commands as an HTTP API "
-                        "and a browser application.")
-    ap.add_argument("--port", type=int, default=None,
-                    help="port to bind on 0.0.0.0 (default: 0, a free port)")
-    ap.add_argument("--data", type=Path, default=DEFAULT_DATA,
-                    help=f"workspace folder for maps and uploads (default: {DEFAULT_DATA}/)")
-    ap.add_argument("--no-browser", action="store_true",
-                    help="do not open the default browser once listening")
-    group = ap.add_mutually_exclusive_group()
-    group.add_argument("--status", action="store_true",
-                       help="print the running service's health JSON on stdout")
-    group.add_argument("--stop", action="store_true", help="stop the running service")
-    return ap
+    return spec.build_parser(WEB_SERVICE)
 
 
 # -- state of the running service -------------------------------------------------------------------
@@ -302,7 +286,7 @@ def main(argv: list[str]) -> int:
     port = 0 if args.port is None else args.port
     if not 0 <= port <= 65535:
         raise UsageError(f"--port must be between 0 and 65535, got {port}")
-    ws = Workspace(args.data)
+    ws = Workspace(args.data or DEFAULT_DATA)
     if args.status:
         return status(ws)
     if args.stop:

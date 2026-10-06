@@ -14,12 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from oh_my_slam.core import constants
 from oh_my_slam.core.errors import InputError, UsageError
 
 MAPS = "maps"
 UPLOADS = "uploads"
 REQUESTS = ".requests"
-DEFAULT_DATA = Path("~/oh-my-slam-data")
+DEFAULT_DATA = Path(constants.DEFAULT_DATA)  # server.sh --data (commands.entry_points)
 
 _NAME = re.compile(r"^[^/\\\0]+$")
 

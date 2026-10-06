@@ -3,6 +3,8 @@
     start_inference_server.sh           start in the background, wait until ready
     start_inference_server.sh --status  print /health as JSON (exit 3 if not running)
     start_inference_server.sh --stop    stop it; socket and state file removed
+
+Its options and modes are defined in ``commands.entry_points`` (``INFERENCE_SERVER``).
 """
 
 from __future__ import annotations
@@ -16,12 +18,14 @@ from pathlib import Path
 
 from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.client.client import InferenceClient
+from oh_my_slam.commands import spec
+from oh_my_slam.commands.entry_points import INFERENCE_SERVER
 from oh_my_slam.core import paths
 from oh_my_slam.core.errors import ServerUnavailableError
 from oh_my_slam.core.log import claim_stdout
 from oh_my_slam.server.lifecycle import ServerLock, pid_alive, read_state
 
-PROG = "start_inference_server.sh"
+PROG = INFERENCE_SERVER.prog
 START_TIMEOUT_S = 1200.0  # the first start downloads the model weights
 STOP_TIMEOUT_S = 12.0
 
@@ -152,12 +156,12 @@ def status() -> int:
     return 0
 
 
+def build_parser() -> ArgumentParser:
+    return spec.build_parser(INFERENCE_SERVER)
+
+
 def main(argv: list[str]) -> int:
-    parser = ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0] if __doc__ else None)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--stop", action="store_true", help="stop the running server")
-    group.add_argument("--status", action="store_true", help="print health JSON to stdout")
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     if args.stop:
         return stop()
     if args.status:

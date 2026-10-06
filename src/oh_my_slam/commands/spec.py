@@ -239,6 +239,11 @@ class Mode:
     outputs: tuple[Output, ...]
     attrs_scope: CloudScope | None = None  # the -p scope
     inference_condition: Mapping[str, Any] | None = None  # when "conditional"
+    # errors a run can end with besides its rules' and the inference server's (--status of a
+    # service that does not run: exit 3)
+    errors: tuple[type[OhMySlamError], ...] = ()
+    # "starts" or "stops" a long-lived server (commands.entry_points): the user runs it
+    lifecycle: str | None = None
 
     def scope(self) -> CloudScope:
         assert self.attrs_scope is not None, "this mode writes no point cloud"
@@ -255,9 +260,12 @@ class Command:
     exclusive_required: tuple[str, ...] = ()  # one of these is required (the mode selectors)
 
     def mode_of(self, args: argparse.Namespace) -> Mode:
-        for m in self.modes:
-            if m.selector is None or getattr(args, m.selector, None) is not None:
-                return m
+        """The mode whose selector is given (a flag selector is given when set), else the mode
+        without one."""
+        given = [m for m in self.modes if m.selector is not None
+                 and getattr(args, m.selector, None) not in (None, False)]
+        for m in (*given, *(m for m in self.modes if m.selector is None)):
+            return m
         flags = " ".join(self.option(n).flag for n in self.exclusive_required)
         raise UsageError(f"one of the arguments {flags} is required")
 
@@ -815,12 +823,14 @@ def _code(code: ExitCode) -> dict[str, Any]:
     return {"code": error_code(code), "exit_code": int(code), "http_status": HTTP_STATUS[code]}
 
 
-def _errors(mode: Mode) -> list[dict[str, Any]]:
-    """The errors validation can raise, per exit code (argparse's usage errors included)."""
+def errors_of(mode: Mode) -> list[dict[str, Any]]:
+    """The errors validation can raise, per exit code (argparse's usage errors included), and
+    those the mode declares (``Mode.errors``)."""
     classes: list[type[OhMySlamError]] = [UsageError]
     classes += [e for r in mode.rules for e in r.errors]
     if mode.inference != "never":
         classes.append(ServerUnavailableError)
+    classes += mode.errors
     by_code: dict[ExitCode, list[str]] = {}
     for c in classes:
         names = by_code.setdefault(c.exit_code, [])
@@ -885,7 +895,7 @@ def describe() -> dict[str, Any]:
                        "codes": sorted({error_code(e.exit_code) for e in r.errors})}
                       for r in mode.rules],
             "outputs": [out.describe() for out in mode.outputs],
-            "errors": _errors(mode),
+            "errors": errors_of(mode),
             "stages": [str(s) for s in mode.stages],
         })
     return {

@@ -35,6 +35,25 @@ HTTP_STATUS: dict[ExitCode, int] = {
 }
 
 
+# What each exit status means, for the people and agents that read it (README "Output contract and
+# exit codes", the agent skill).
+MEANING: dict[ExitCode, str] = {
+    ExitCode.OK: "success",
+    ExitCode.INTERNAL: "internal error (also: inference failed, or COLMAP is missing or the "
+                       "wrong version)",
+    ExitCode.USAGE: "usage or input error: a bad option or value, a missing or unsupported input "
+                    "file",
+    ExitCode.SERVER_UNAVAILABLE: "a server it needs does not answer: the inference server (not "
+                                 "running, or its models failed to load), or for --status the "
+                                 "server it queries",
+    ExitCode.NOT_A_MAP: "the map folder is not a map (and not empty, for an update)",
+    ExitCode.NOT_REGISTERED: "nothing could be placed in the map (no overlap); the map is "
+                             "unchanged",
+    ExitCode.MAP_LOCKED: "another update holds the map",
+    ExitCode.INTERRUPTED: "interrupted (Ctrl-C, or a server.sh request whose client left)",
+}
+
+
 def http_status(exit_code: int) -> int:
     """HTTP status of a command's exit status; any other status (a crash, a signal) is 500."""
     try:
@@ -87,6 +106,13 @@ class ServerModelsFailedError(ServerUnavailableError):
             f"inference server models failed to load ({failed}) — see {log_path}, fix the cause, "
             "then restart with ./start_inference_server.sh --stop && ./start_inference_server.sh",
         )
+
+
+class ServiceNotRunningError(OhMySlamError):
+    """``server.sh --status`` without a running service: exit 3, like ``start_inference_server.sh
+    --status``."""
+
+    exit_code = ExitCode.SERVER_UNAVAILABLE
 
 
 class ServerBusyError(OhMySlamError):
