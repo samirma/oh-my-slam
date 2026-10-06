@@ -91,9 +91,8 @@ FEATURES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("GET /api/health",), "service and inference-server health"),
     (("GET /api/openapi.json",), "the OpenAPI document"),
 )
-# The description's words for the commands' output formats (another format is named as is).
-FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG", "csv": "CSV", "markdown": "Markdown",
-           "map": "map", "html": "viewer page"}
+# The description's words for the operations' output formats (another format is named as is).
+FORMATS = {"json": "JSON", "ply": "PLY", "map": "map"}
 DESCRIPTION_MAX = 1024  # the Agent Skills limit
 
 # The address snippet (spec §2.7 "Server address"): POSIX sh and curl only, no scan. It prints

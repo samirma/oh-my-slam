@@ -62,14 +62,6 @@ export function humanize(name) {
 // `hex` when it is an sRGB colour #rrggbb (the only form put in a style attribute), else null.
 export function hexColor(hex) { return typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex : null; }
 
-// An object's colour always comes with its id and label (colour is never the only cue).
-export function objectBadge(id, label, hex) {
-  const c = hexColor(hex);
-  return el('span', { class: 'obj-badge' },
-    el('span', { class: 'swatch', style: c ? `background:${c}` : null, 'aria-hidden': 'true' }),
-    el('span', { class: 'obj-id' }, `#${id}`), label ? el('span', { class: 'obj-name' }, label) : null);
-}
-
 // A message area: kind is 'error' | 'warn' | 'info' | 'ok'. Errors are alerts; the rest status.
 export function notice(kind, ...children) {
   const icon = { error: '✕', warn: '!', info: 'i', ok: '✓' }[kind] || 'i';

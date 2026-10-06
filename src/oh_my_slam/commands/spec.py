@@ -211,12 +211,6 @@ def suffix_of(fmt: str) -> str:
     return _SUFFIX.get(fmt, "")
 
 
-def media_of_file(name: str | Path) -> str | None:
-    """The media type of a file of an output format, by its suffix; None for any other file."""
-    suffix = Path(name).suffix.lower()
-    return next((_MEDIA[f] for f, s in _SUFFIX.items() if s == suffix), None)
-
-
 @dataclass(frozen=True)
 class Output:
     name: str  # "result" (stdout or -o), a file name, or the folder written

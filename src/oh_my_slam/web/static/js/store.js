@@ -60,10 +60,8 @@ class Store {
 
   async pollHealth() {
     clearTimeout(this._healthTimer);
-    const asked = performance.now();
     try {
       this.health = await getJson('/api/health');
-      this.health.askedAt = asked;
     } catch (err) {
       this.health = { status: 'unreachable', message: err.message };
     }

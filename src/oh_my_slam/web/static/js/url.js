@@ -1,12 +1,6 @@
 // A page's state in its URL (http_server.md "Every page has a stable URL"): the query of the hash
 // route (#/page?key=value&…), changed in place (history.replaceState: no new page, no reload).
 
-export function queryParams() {
-  const raw = location.hash;
-  const i = raw.indexOf('?');
-  return new URLSearchParams(i < 0 ? '' : raw.slice(i + 1));
-}
-
 // Set (or, for null / '', remove) these keys of the current route's query.
 export function setQuery(changes) {
   const raw = location.hash || '#/';

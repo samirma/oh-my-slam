@@ -224,7 +224,7 @@ table.stages td.share { width: 45%; color: var(--muted); white-space: nowrap; }
 .bar { display: inline-block; height: 0.6rem; background: var(--bar); border-radius: 2px; vertical-align: middle; min-width: 1px; max-width: calc(100% - 3.5rem); }
 
 /* ---- objects: a swatch always next to the id and label */
-.obj-badge, .hex { display: inline-flex; gap: 0.4rem; align-items: center; }
+.hex { display: inline-flex; gap: 0.4rem; align-items: center; }
 .swatch { display: inline-block; width: 0.95rem; height: 0.95rem; border-radius: 3px; border: 1px solid rgb(0 0 0 / 55%); flex: none; }
 .obj-id { font-weight: 700; font-variant-numeric: tabular-nums; }
 .hex { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }

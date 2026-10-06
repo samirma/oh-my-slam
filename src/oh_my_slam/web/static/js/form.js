@@ -60,7 +60,6 @@ class Field {
 
   // the API value; undefined: not given
   value() { return undefined; }
-  pending() { return false; }
   names() { return [].concat(this.value() ?? []).map(String); }
 
   setError(msgs) {
@@ -359,7 +358,6 @@ export class FilesField extends Field {
     this.sort.hidden = !(this.ordered && this.items.length > 1);
   }
 
-  pending() { return this.items.some((it) => it.state === 'uploading'); }
   settled() { return Promise.all(this.items.map((it) => it.promise).filter(Boolean)); }
   names() { return this.items.map((it) => it.name); }
   failed() { return this.items.filter((it) => it.state === 'failed'); }
@@ -423,7 +421,6 @@ export class OpForm {
     this.op = op;
     this.fixed = { ...fixed };
     this.fields = [];
-    this._listeners = new Map();
     this.seq = 0;
     this.lastResult = null;
     this.touched = new Set();  // the fields the user changed: only their messages show, until a run
@@ -443,9 +440,6 @@ export class OpForm {
     this.applyApplies();
     this.command.textContent = '(complete the required fields)';
   }
-
-  on(what, cb) { if (!this._listeners.has(what)) this._listeners.set(what, new Set()); this._listeners.get(what).add(cb); }
-  emit(what, ...args) { for (const cb of this._listeners.get(what) || []) cb(...args); }
 
   field(name) { return this.fields.find((f) => f.p.name === name) || null; }
 
@@ -489,13 +483,11 @@ export class OpForm {
     return out;
   }
 
-  pending() { return this.fields.some((f) => f.pending()); }
   failedUploads() { return this.fields.flatMap((f) => (f.failed ? f.failed() : [])); }
 
   changed(field) {
     if (field) this.touched.add(field.p.name);
     this.applyApplies();
-    this.emit('change');
     clearTimeout(this._t);
     this._t = setTimeout(() => this.validate(), VALIDATE_DEBOUNCE_MS);
   }
@@ -514,7 +506,6 @@ export class OpForm {
     this.lastResult = r;
     this.show(r.by_parameter || {}, r.problems || []);
     this.command.textContent = (r.command || []).join(' ') || '(complete the required fields)';
-    this.emit('validated', r);
     return r;
   }
 
