@@ -4,12 +4,12 @@ and ``view.sh -i`` / ``-m``, declared once as data.
 
 Each command builds its argparse parser (:func:`build_parser`) and runs its validation
 (:func:`validate`) from these definitions. The web service of spec §2.6 ("Single source of
-truth") uses the same ones: :func:`parse` turns API parameters into the command's arguments
-through the same parser (so its messages are argparse's), :func:`dry_run` reports every problem
-of a request per parameter without touching the filesystem, :func:`validate` is the command's own
-check before a job is queued, and :func:`describe` exports everything as JSON-serialisable data
-for the OpenAPI document and the forms. A new or changed option here reaches the commands and the
-API alike.
+truth") uses the same ones for the programs it offers (``Program.service``: every mode of
+``reconstruct.sh``, ``mapper.sh`` and ``segment.sh``): :func:`parse` turns API parameters into
+the command's arguments through the same parser (so its messages are argparse's), :func:`dry_run`
+reports every problem of a request per parameter without touching the filesystem before the
+request runs, and :func:`describe` exports everything as JSON-serialisable data for the OpenAPI
+document and the forms. A new or changed option here reaches the commands and the API alike.
 
 * An :class:`Option` records its flag, name, :class:`Kind`, choices, default, bounds, required-ness,
   help text and where it applies (:class:`When`).
@@ -66,7 +66,8 @@ from oh_my_slam.core.timing import Stage
 
 
 class Kind(StrEnum):
-    """What an option's value is (the web service picks the form field and the upload from it)."""
+    """What an option's value is (the web service picks the form field and the upload from it; the
+    path-out kinds only choose where the command writes, so they are no API parameters)."""
 
     IMAGE = "image"  # path in: one RGB image
     IMAGES = "images"  # path in: one or more images
@@ -138,10 +139,6 @@ class Option:
     applies: tuple[When, ...] = ()  # applies when any of these holds (empty: always)
     applies_text: str = ""  # the same, in the command's words
     group: str | None = None  # mutually exclusive group (the modes' selectors)
-    # False: the option concerns the command line only and means nothing to the web service
-    # (spec §2.6), whose API and forms leave it out (view.sh --no-browser: the service shows the
-    # viewer itself)
-    service: bool = True
 
     def add_to(self, ap: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup) -> None:
         kw: dict[str, Any] = {"dest": self.name, "help": self.help}
@@ -295,6 +292,9 @@ class Program:
     prog: str
     description: str
     commands: tuple[Command, ...]  # one, or the subcommands
+    # True: the web service (spec §2.6) offers every mode as an API operation; False: a command
+    # only (view.sh, whose output is the browser)
+    service: bool = True
 
     @property
     def subcommands(self) -> bool:
@@ -627,8 +627,7 @@ VIEW = Program("view.sh", "Browser visualisation of an image or a map.", (
     Command("view.sh", None, "Browser visualisation of an image or a map.", (
         _image("RGB image to reconstruct and segment", group="source"),
         _map("map folder (opened read-only)", True, group="source"),
-        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False,
-               service=False),
+        Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False),
     ), (
         Mode("image", "image", (IMAGE_RULE,), "required",
              "reconstructs and segments the image with the inference server",
@@ -636,7 +635,7 @@ VIEW = Program("view.sh", "Browser visualisation of an image or a map.", (
         Mode("map", "map", (MAP_RULE,), "never", "opens the persisted map read-only", (),
              _VIEWER),
     ), exclusive_required=("image", "map")),
-))
+), service=False)
 
 PROGRAMS: tuple[Program, ...] = (RECONSTRUCT, MAPPER, SEGMENT, VIEW)
 
@@ -866,7 +865,6 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
         "minimum": o.minimum, "exclusive_minimum": o.exclusive_minimum, "finite": o.finite,
         "omit_if_default": o.omit_if_default,
         "applies": [w.describe() for w in o.applies], "applies_text": o.applies_text,
-        "service": o.service,
     }
     if o.kind is Kind.ATTRS:
         out["attributes"] = _attributes(mode.scope())

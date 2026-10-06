@@ -1,17 +1,23 @@
-"""A stand-in command for the web service's job runner tests:
+"""A stand-in command for the web service's request tests:
 ``python -m tests.fakes.slow_command --seconds=S [--code=N] [--ignore-sigint]`` runs one ``setup``
-stage for ``S`` seconds with progress ticks (the real ``core.timing`` events), prints a line on
-stderr and exits with ``N`` (2: a usage error with a message) — or 130 when interrupted, as every
-command does through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C.
+stage for ``S`` seconds (the real ``core.timing`` record, written to ``OH_MY_SLAM_TIMINGS`` with
+its summary line), prints a line on stderr and its result on stdout — one JSON line with its pid
+and the ``time.monotonic()`` (system-wide) of its start and end, so a test can order runs — and
+exits with ``N`` (2: a usage error with a message) — or 130 when interrupted, as every command does
+through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C.
 
-``registry_program()`` is the same command as a registry entry (``slow.sh``, no inference), for
-tests that add it to ``commands.spec.PROGRAMS``; ``map_registry_program()`` a mode of it that takes a
-map (``-m``, read only) and writes ``note.md`` into a ``-d`` folder, for the web application's
-registry-change test (a new mode, a new option, a new output)."""
+``registry_program()`` is the same command as a registry entry (``slow.sh``, no inference unless
+asked, a JSON result on stdout), for tests that add it to ``commands.spec.PROGRAMS``;
+``map_registry_program()`` a mode of it that takes a map (``-m``, read only) and writes ``note.md``
+into a ``-d`` folder, for the web application's registry-change test (a new mode, a new option, a
+new output)."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import os
 import signal
 import sys
 import time
@@ -39,12 +45,15 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     if args.ignore_sigint:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-    with timing.collect():
+    start = time.monotonic()
+    with timing.collect() as tm:
         with timing.stage(Stage.SETUP):
-            for i in range(STEPS):
+            for _ in range(STEPS):
                 time.sleep(args.seconds / STEPS)
-                timing.progress(i + 1, STEPS)
+    timing.report(tm, logging.getLogger("slow.sh"), command="slow.sh")
     print(f"slow.sh: slept {args.seconds:g} s", file=sys.stderr, flush=True)
+    print(json.dumps({"slept": args.seconds, "pid": os.getpid(), "start": start,
+                      "end": time.monotonic()}), flush=True)
     if args.folder:
         Path(args.folder).mkdir(parents=True, exist_ok=True)
         (Path(args.folder) / NOTE).write_text(f"slept {args.seconds:g} s over {args.map}\n")
@@ -53,17 +62,26 @@ def main(argv: list[str]) -> int:
     return args.code
 
 
-def registry_program() -> object:
-    """``slow.sh`` as a ``commands.spec.Program`` (one mode, never inference)."""
+def registry_program(prog: str = "slow.sh", inference: str = "never") -> object:
+    """``slow.sh`` as a ``commands.spec.Program`` (one mode, its result a JSON line on stdout);
+    ``prog`` and ``inference`` name another such program (e.g. one that needs the inference
+    server: ``"required"``)."""
     from oh_my_slam.commands import spec
 
-    mode = spec.Mode(None, None, (), "never", "needs nothing", (Stage.SETUP,), ())
-    cmd = spec.Command("slow.sh", None, "sleep", (
+    mode = spec.Mode(None, None, (), inference, "needs nothing", (Stage.SETUP,), (
+        spec.Output("result", "stdout", "json", f"what {prog} says it did"),
+        spec.Output("map", "-m", "map", "the map it names (left as it is)", (spec.When("map"),))))
+    cmd = spec.Command(prog, None, "sleep", (
         spec.Option("--seconds", "seconds", spec.Kind.NUMBER, "how long", type=float),
+        spec.Option("--code", "code", spec.Kind.NUMBER, "the exit status", type=int),
         spec.Option("--ignore-sigint", "ignore_sigint", spec.Kind.FLAG, "deaf to Ctrl-C",
                     default=False),
+        spec.Option("-m", "map", spec.Kind.MAP, "a map it writes (it does not)",
+                    must_exist=False),
+        spec.Option("-i", "image", spec.Kind.IMAGE, "an image it reads (it does not)",
+                    must_exist=True),
     ), (mode,))
-    return spec.Program("slow.sh", "sleep", (cmd,))
+    return spec.Program(prog, "sleep", (cmd,))
 
 
 MOOD = "mood"  # an option kind the web application has never seen

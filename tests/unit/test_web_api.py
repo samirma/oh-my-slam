@@ -1,15 +1,19 @@
-"""``server.sh`` API without inference (spec §2.6): operations and OpenAPI derived from the commands'
-registry (a new option or mode appears with no web change), synchronous per-field validation,
-workspace confinement (path escapes, symlinks and hidden entries refused), the Host / Origin /
-content-type guard, uploads (lifecycle, size cap), the inference server down or loading, and the
-viewer routes."""
+"""``server.sh`` API without inference (spec §2.6): the operations and the OpenAPI document derived
+from the commands' registry — every mode of the programs it offers (reconstruct.sh, mapper.sh,
+segment.sh; not view.sh), without the options that only choose where the command writes — so a new
+option or mode appears with no web change; exactly the routes the spec lists; synchronous
+per-field validation; workspace confinement (path escapes, symlinks and hidden entries refused);
+the Host / Origin / content-type guard; uploads (lifecycle, size cap); the inference server down
+or loading."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
+import json
 import os
-import sys
+import re
 import types
 from collections.abc import Iterator
 from pathlib import Path
@@ -24,20 +28,23 @@ from oh_my_slam.commands import spec
 from oh_my_slam.web import app as web_app
 from oh_my_slam.web import operations as web_ops
 from oh_my_slam.web.app import Service, create_app
-from oh_my_slam.web.jobs import Runner
 from oh_my_slam.web.openapi import document
-from oh_my_slam.web.operations import Prepared, Step
+from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
 from tests.fakes import slow_command
 from tests.unit.test_view_cli import minimal_map, sh
 
 REPO = Path(__file__).resolve().parents[2]
 OCTET = {"content-type": "application/octet-stream"}
+OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment-image", "segment-map"}
+API_ROUTES = {"GET /api/health", "GET /api/openapi.json", "POST /api/ops/{op}",
+              "POST /api/ops/{op}/validate", "POST /api/uploads", "DELETE /api/uploads/{id}",
+              "GET /api/maps", "GET /api/maps/{name}"}
 
 
 @pytest.fixture(autouse=True)
 def _repo_importable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Job subprocesses run in the workspace; the test helpers (tests.fakes) must import there."""
+    """Commands run in the workspace; the test helpers (tests.fakes) must import there."""
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
         filter(None, [str(REPO), os.environ.get("PYTHONPATH")])))
 
@@ -64,7 +71,7 @@ class Svc:
 
 
 def make_svc(ws: Workspace, **kw: Any) -> Service:
-    return Service(ws, Runner(ws, stop_grace_s=30), url="http://0.0.0.0:0/",
+    return Service(ws, Runner(ws, interrupt_grace_s=5), url="http://0.0.0.0:0/",
                    extra_hosts={"testserver"}, **kw)
 
 
@@ -88,59 +95,74 @@ def jpeg(path: Path, seed: int = 5) -> Path:
     return path
 
 
-def slow_op(inference: bool = True) -> Any:
-    return types.SimpleNamespace(id="slow", label="slow.sh")
+def with_programs(monkeypatch: pytest.MonkeyPatch, service: Service, *programs: Any) -> None:
+    """Add stand-in programs (``tests.fakes.slow_command``) to the registry and the service."""
+    monkeypatch.setattr(spec, "PROGRAMS", (*spec.PROGRAMS, *programs))
+    fakes = {p.prog for p in programs}
+    monkeypatch.setattr(web_ops.Operation, "module", property(
+        lambda op: slow_command.MODULE if op.program.prog in fakes
+        else f"oh_my_slam.cli.{op.program.prog.removesuffix('.sh')}"))
+    service.ops = web_ops.operations()
 
 
-def slow(seconds: float, *flags: str, inference: bool = True, **kw: Any) -> Prepared:
-    """A job of the stand-in command (``tests.fakes.slow_command``)."""
-    return Prepared(steps=[Step("slow.sh", slow_command.MODULE, [f"--seconds={seconds}", *flags])],
-                    command=["slow.sh"], inference=inference, **kw)
+def api_routes(service: Service) -> set[str]:
+    """``METHOD /path`` of every route of the app under ``/api/`` (HEAD aside)."""
+    app = inspect.getclosurevars(create_app(service)).nonlocals["app"]  # inside the guard
+    return {f"{m} " + re.sub(r"\{(\w+):\w+\}", r"{\1}", r.path)
+            for r in app.routes for m in r.methods - {"HEAD"} if r.path.startswith("/api/")}
 
 
 # -- single source of truth --------------------------------------------------------------------------
 
 
-def test_one_operation_per_command_mode_with_the_commands_parameters() -> None:
+def test_the_routes_are_exactly_the_specs(svc: Svc) -> None:
+    """Spec §2.6 "API": health, the OpenAPI document, uploads (create, discard), maps (list, one)
+    and the operations with their validation — no job, download or viewer endpoint."""
+    assert api_routes(svc.service) == API_ROUTES
+    doc = svc.client.get("/api/openapi.json").json()
+    fixed = {p for p in doc["paths"] if not p.startswith("/api/ops/")}
+    assert fixed == {"/api/health", "/api/uploads", "/api/uploads/{id}", "/api/maps",
+                     "/api/maps/{name}"}
+    for gone in ("/api/jobs", "/api/jobs/x", "/viewer/map/m/", "/api/maps/m/files/map.json",
+                 "/api/maps/m/viewer/api/meta", "/api/display-transform"):
+        assert svc.client.get(gone).status_code == 404, gone
+
+
+def test_one_operation_per_mode_of_the_offered_commands() -> None:
     ops = web_ops.operations()
-    described = spec.describe()["operations"]
-    assert sorted(op.label for op in ops.values()) == sorted(d["id"] for d in described)
+    assert set(ops) == OFFERED  # view.sh is a command only
+    assert {p.prog for p in spec.PROGRAMS if not p.service} == {"view.sh"}
+    described = {d["id"]: d for d in spec.describe()["operations"]}
     doc = document(ops)
-    for d in described:
-        op = next(o for o in ops.values() if o.label == d["id"])
+    assert {p.removeprefix("/api/ops/").removesuffix("/validate") for p in doc["paths"]
+            if p.startswith("/api/ops/")} == OFFERED
+    for op in ops.values():
+        d = described[op.label]
         post = doc["paths"][f"/api/ops/{op.id}"]["post"]
         schema = post["requestBody"]["content"]["application/json"]["schema"]
-        params = [p for p in d["parameters"] if p["service"]]  # command-line-only ones left out
+        # every option but those that only choose where the command writes (-o, -d)
+        params = [p for p in d["parameters"] if p["kind"] not in ("file_out", "folder_out")]
         assert list(schema["properties"]) == [p["name"] for p in params]
+        assert not {"output", "artifacts"} & set(schema["properties"])
         assert schema["required"] == [p["name"] for p in params if p["required"]]
         for p in params:
             prop = schema["properties"][p["name"]]
-            assert prop["x-oms"] == p  # names, kinds, defaults, help, bounds: the registry's
+            assert prop["x-oms"]["name"] == p["name"] and prop["x-oms"]["help"] == p["help"]
             if p["choices"]:
                 assert prop["enum"] == p["choices"]
-        assert post["x-oms"] == d  # outputs, stages, rules, errors, inference need
+        oms = post["x-oms"]
+        assert oms == op.entry(d) and oms["stages"] == d["stages"]
+        assert {o["via"] for o in oms["outputs"]} <= {"stdout", "-m"}  # no -d artefacts
+        assert all(r["parameters"] and set(r["parameters"]) <= set(schema["properties"])
+                   for r in oms["rules"])
+        ok = post["responses"]["200"]
+        assert "Server-Timing" in ok["headers"]
+        assert set(ok["content"]) == {o["media_type"] for o in d["outputs"]
+                                      if o["via"] == "stdout"}
         assert f"/api/ops/{op.id}/validate" in doc["paths"]
-        # single-image modes may ask for their viewer
-        takes_image = any(p["kind"] == "image" for p in d["parameters"])
-        assert bool(post["parameters"]) == (takes_image and op.label.split()[0] != "view.sh")
-        # ?viewer is documented on /validate too, which takes it as the submission does
-        assert doc["paths"][f"/api/ops/{op.id}/validate"]["post"]["parameters"] == \
-            post["parameters"]
-        for p in post["parameters"]:  # the viewer step replays the command's inference
-            assert "replays" in p["description"] and "once more" not in p["description"]
+        assert "parameters" not in post  # no ?viewer
     assert doc["x-oms"]["exit_codes"] == spec.describe()["exit_codes"]
-    view_props = doc["paths"]["/api/ops/view-map"]["post"]["requestBody"]["content"][
-        "application/json"]["schema"]["properties"]
-    assert "no_browser" not in view_props  # spec marks it as meaning nothing to the service
-    assert {"/api/maps/{name}/viewer/{path}", "/api/jobs/{id}/viewer/{path}",
-            "/viewer/map/{name}/{path}", "/viewer/job/{id}/{path}"} <= set(doc["paths"])
-    # nothing the spec does not ask for: the operations are in x-oms, uploads are only created
-    # (and discarded)
-    assert "/api/operations" not in doc["paths"]
     assert set(doc["paths"]["/api/uploads"]) == {"post"}
-    assert {op.id for op in ops.values()} == {"reconstruct", "mapper-update", "mapper-locate",
-                                              "segment-image", "segment-map", "view-image",
-                                              "view-map"}
 
 
 def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None:
@@ -151,34 +173,18 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
     for op in web_ops.operations().values():
         assert importlib.util.find_spec(op.module) is not None, op.module
         assert f"oms_exec {op.module.rsplit('.', 1)[1]}" in (REPO / op.program.prog).read_text()
-    seg = web_ops.prepare(web_ops.operations()["segment-image"], {"image": "in/a.jpg"}, ws,
-                          ws.job_dir("j"))
-    assert [s.module for s in seg.steps] == ["oh_my_slam.cli.segment"]
-    assert seg.steps[0].argv == [f"-i={(ws.root / 'in' / 'a.jpg')}",
-                                 f"-o={ws.job_dir('j') / 'out' / 'result.json'}"]
-    # a browser mode runs the viewer step on view.sh's own command line; it saves into viewer/
-    view = web_ops.prepare(web_ops.operations()["view-map"], {"map": "m"}, ws, ws.job_dir("j"))
-    assert [s.module for s in view.steps] == ["oh_my_slam.cli.view_save"]
-    assert view.steps[0].argv == [str(ws.job_dir("j") / "viewer"), "view.sh",
-                                  f"-m={ws.maps / 'm'}"]
-    assert view.viewer and not view.inference and view.steps[0].env == {}
-    refused = web_ops.prepare(web_ops.operations()["view-map"], {"map": "m", "no_browser": True},
-                              ws, ws.job_dir("j"))
-    assert [p.parameters for p in refused.problems] == [("no_browser",)]
-    # an image request with its viewer: the command records its inference, the viewer replays it
-    both = web_ops.prepare(web_ops.operations()["segment-image"],
-                           {"image": "in/a.jpg", "min_score": 0.7}, ws, ws.job_dir("j"),
-                           viewer=True)
-    assert [s.module for s in both.steps] == ["oh_my_slam.cli.segment", "oh_my_slam.cli.view_save"]
-    rec = str(ws.job_dir("j") / "inference")
-    assert both.steps[0].env == {"OH_MY_SLAM_INFERENCE_RECORD": rec}
-    assert both.steps[1].env == {"OH_MY_SLAM_INFERENCE_REPLAY": rec}
-    assert both.steps[1].argv == [str(ws.job_dir("j") / "viewer"), "segment.sh",
-                                  *both.steps[0].argv]  # the command's own options, --min-score
-    assert "--min-score=0.7" in both.steps[1].argv
-    none = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m"}, ws,
-                           ws.job_dir("j"), viewer=True)
-    assert none.problems and "no single image" in none.problems[0].message
+    seg = web_ops.prepare(web_ops.operations()["segment-image"], {"image": "in/a.jpg"}, ws)
+    assert seg.argv == [f"-i={(ws.root / 'in' / 'a.jpg')}"]  # the result is its stdout: no -o
+    assert seg.command == ["segment.sh", "-i=in/a.jpg"] and seg.result_format == "json"
+    ply = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m", "format": "ply"}, ws)
+    assert ply.argv == [f"-m={ws.maps / 'm'}", "-f=ply"] and ply.result_format == "ply"
+    assert not ply.inference and web_ops.media_of(ply.result_format) == \
+        "application/octet-stream"
+    for name, value in (("output", "x.json"), ("artifacts", "files")):
+        refused = web_ops.prepare(web_ops.operations()["segment-map"], {"map": "m", name: value},
+                                  ws)
+        assert [p.parameters for p in refused.problems] == [(name,)]
+        assert "chooses where the command writes" in refused.problems[0].message
 
 
 def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
@@ -189,14 +195,10 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
     extra = spec.Option("--shade", "shade", spec.Kind.ENUM, "a new option", default="dark",
                         choices=("dark", "light"))
     seg2 = dataclasses.replace(seg, options=(*seg.options, extra))
-    programs = (*[p for p in spec.PROGRAMS if p is not spec.SEGMENT],
-                dataclasses.replace(spec.SEGMENT, commands=(seg2,)),
-                slow_command.registry_program())
-    monkeypatch.setattr(spec, "PROGRAMS", programs)
-    monkeypatch.setattr(web_ops.Operation, "module", property(
-        lambda op: slow_command.MODULE if op.program.prog == "slow.sh"
-        else f"oh_my_slam.cli.{op.program.prog.removesuffix('.sh')}"))
-    svc.service.ops = web_ops.operations()
+    monkeypatch.setattr(spec, "PROGRAMS", (
+        *[p for p in spec.PROGRAMS if p is not spec.SEGMENT],
+        dataclasses.replace(spec.SEGMENT, commands=(seg2,))))
+    with_programs(monkeypatch, svc.service, slow_command.registry_program())
 
     doc = svc.client.get("/api/openapi.json").json()
     props = doc["paths"]["/api/ops/segment-map"]["post"]["requestBody"]["content"][
@@ -210,17 +212,18 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
     assert "--shade=light" in r.json()["command"]
     bad = svc.client.post("/api/ops/segment-map/validate", json={"map": "m", "shade": "blue"})
     assert fields(bad.json()) == ["shade"]
+    v = svc.client.post("/api/ops/slow/validate", json={"seconds": 0.2}).json()
+    assert v["command"] == ["slow.sh", "--seconds=0.2"] and v["inference"] is False
     r = svc.client.post("/api/ops/slow", json={"seconds": 0.2})
-    assert r.status_code == 202, r.json()
-    assert r.json()["command"] == ["slow.sh", "--seconds=0.2"] and not r.json()["inference"]
-    job = svc.runner.wait(r.json()["id"], 60)
-    assert job.state == "succeeded" and job.stages[0]["stage"] == "setup"
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/json" and r.json()["slept"] == 0.2
+    assert re.fullmatch(r"setup;dur=\d+\.\d, total;dur=\d+\.\d", r.headers["server-timing"])
 
 
 # -- validation and the workspace --------------------------------------------------------------------
 
 
-def test_invalid_requests_get_per_field_errors_and_queue_nothing(svc: Svc) -> None:
+def test_invalid_requests_get_per_field_errors_and_run_nothing(svc: Svc) -> None:
     minimal_map(svc.ws.maps / "m")
     r = svc.client.post("/api/ops/segment-map", json={"map": "m", "min_score": 0.2,
                                                       "attrs": "color=rgb", "format": "xml"})
@@ -234,21 +237,17 @@ def test_invalid_requests_get_per_field_errors_and_queue_nothing(svc: Svc) -> No
         "error"]["message"]
     r = svc.client.post("/api/ops/segment-map", json={"map": "absent"})
     assert r.status_code == 422 and r.json()["error"]["code"] == "not_a_map"
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m", "artifacts": "../x"})
-    assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts"]
-    # the result file and the -d folder never share a name
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m", "artifacts": "result.json"})
-    assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts"]
     r = svc.client.post("/api/ops/segment-map", json={"map": "m", "artifacts": "x",
                                                       "output": "x"})
-    assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts"]
+    assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts", "output"]
     r = svc.client.post("/api/ops/segment-map", content=b"[1, 2]",
                         headers={"content-type": "application/json"})
     assert r.status_code == 400
     r = svc.client.post("/api/ops/nope", json={})
     assert r.status_code == 404
-    assert svc.client.get("/api/jobs").json() == []
-    assert not list(svc.ws.jobs.iterdir())
+    r = svc.client.post("/api/ops/view-map", json={"map": "m"})
+    assert r.status_code == 404 and "no operation view-map" in r.json()["error"]["message"]
+    assert not svc.ws.requests.exists() or not list(svc.ws.requests.iterdir())
 
 
 def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> None:
@@ -267,7 +266,7 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
         assert not body["valid"], image
         assert fields(body) == ["image"], (image, body)
         assert "outside the workspace" in body["by_parameter"]["image"][0], image
-    for image in ("inputs/.hidden/h.jpg", "uploads/abc/.x.jpg.part"):
+    for image in ("inputs/.hidden/h.jpg", "uploads/abc/.x.jpg.part", ".requests/x/stdout"):
         r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
         assert "hidden entries" in r.json()["by_parameter"]["image"][0], image
     for m in ("../m", "evil", "inputs", "/tmp", ".staging"):
@@ -280,17 +279,12 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
     for image in ("inputs/ok.jpg", str(svc.ws.root / "inputs" / "ok.jpg")):
         r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
         assert r.json()["by_parameter"].get("image") is None, r.json()
-    # map files never leave the map, nor show its hidden entries
-    minimal_map(svc.ws.maps / "m")
-    assert svc.client.get("/api/maps/m/files/map.json").status_code == 200
-    for rel in ("../evil/photo.jpg", ".staging/x", "%2e%2e/%2e%2e/server.lock"):
-        assert svc.client.get(f"/api/maps/m/files/{rel}").status_code == 404, rel
     assert svc.client.get("/api/maps/evil").status_code == 404
 
 
 def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
     """CSRF and DNS rebinding: a foreign Host is refused for every request; a state-changing one
-    needs no foreign Origin and a non-form content type (uploads and cancel included)."""
+    needs no foreign Origin and a non-form content type (uploads included)."""
     service = make_svc(ws)
     minimal_map(ws.maps / "m")
     with TestClient(create_app(service)) as c:
@@ -304,7 +298,6 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
         assert r.status_code == 403
         assert c.post("/api/uploads?name=a.jpg", content=b"x",
                       headers={**OCTET, **foreign}).status_code == 403
-        assert c.post("/api/jobs/x/cancel", json={}, headers=foreign).status_code == 403
         assert c.delete("/api/uploads/x", headers=foreign).status_code == 403
         # a form post (what a cross-site page can send without a preflight) is refused
         for ctype in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
@@ -313,8 +306,7 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
             assert r.status_code == 415, ctype
             r = c.post("/api/uploads?name=a.jpg", content=b"x", headers={"content-type": ctype})
             assert r.status_code == 415, ctype
-        assert c.post("/api/jobs/x/cancel").status_code == 415
-        assert not list(ws.uploads.iterdir()) and not list(ws.jobs.iterdir())
+        assert not list(ws.uploads.iterdir())
         assert c.post("/api/uploads?name=a.jpg", content=b"x").status_code == 415  # no type
         # the same origin is fine
         r = c.post("/api/ops/segment-map/validate", json={"map": "m"},
@@ -345,16 +337,17 @@ def test_an_unknown_host_refreshes_the_machines_names(ws: Workspace,
     service.runner.shutdown()
 
 
-def test_inference_operations_get_503_while_read_only_ones_work(svc: Svc) -> None:
+def test_inference_operations_get_503_while_the_others_work(svc: Svc) -> None:
     sh("start_inference_server.sh", "--stop")  # no inference server in this test
     jpeg(svc.ws.root / "inputs" / "ok.jpg")
     health = svc.client.get("/api/health").json()
-    assert health["status"] == "ok"
+    assert health["status"] == "ok" and health["service"]["requests"] == {"running": 0,
+                                                                          "waiting": 0}
     assert health["inference"]["status"] == "down"
     assert health["inference"]["start_command"] == "./start_inference_server.sh"
+    up = svc.client.post("/api/uploads?name=b.jpg", content=b"x", headers=OCTET).json()
     for op, params in (("reconstruct", {"image": "inputs/ok.jpg"}),
-                       ("segment-image", {"image": "inputs/ok.jpg"}),
-                       ("view-image", {"image": "inputs/ok.jpg"}),
+                       ("segment-image", {"image": up["path"]}),
                        ("mapper-update", {"inputs": ["inputs/ok.jpg"], "map": "new"})):
         r = svc.client.post(f"/api/ops/{op}", json=params)
         assert r.status_code == 503, (op, r.json())
@@ -362,24 +355,20 @@ def test_inference_operations_get_503_while_read_only_ones_work(svc: Svc) -> Non
         assert err["code"] == "server_unavailable" and err["exit_code"] == 3
         assert "./start_inference_server.sh" in err["message"]
     assert not (svc.ws.maps / "new").exists()
+    assert not (svc.ws.uploads / up["id"]).exists()  # the refused request consumed its upload
     minimal_map(svc.ws.maps / "m")
-    r = svc.client.post("/api/ops/segment-map", json={"map": "m", "artifacts": "files"})
-    assert r.status_code == 202, r.json()
-    job = svc.runner.wait(r.json()["id"], 120)
-    assert job.state == "succeeded", job.log_tail
-    assert svc.client.get(f"/api/jobs/{job.id}/result").status_code == 200
-    names = {f["path"] for f in svc.client.get(f"/api/jobs/{job.id}/files").json()}
-    assert {"files/segmentation.json", "files/catalog.csv", "result.json"} <= names
+    r = svc.client.post("/api/ops/segment-map", json={"map": "m"})
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/json"
+    assert r.json()["openlabel"]["metadata"]["schema_version"] == "1.0.0"
+    assert "export;dur=" in r.headers["server-timing"]
     maps = svc.client.get("/api/maps").json()
     assert [m["name"] for m in maps] == ["m"] and maps[0]["update_count"] == 1
-    # view.sh -m saves its viewer without inference, served in-process from the map
-    r = svc.client.post("/api/ops/view-map", json={"map": "m"})
-    assert r.status_code == 202, r.json()
-    job = svc.runner.wait(r.json()["id"], 120)
-    assert job.state == "succeeded" and job.viewer == f"/viewer/job/{job.id}/", job.log_tail
+    assert "thumbnail" not in maps[0]  # no map-file download to show it with
+    assert svc.client.get("/api/maps/m").json()["meta"]["update_count"] == 1
 
 
-def test_submissions_wait_for_a_loading_inference_server(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_requests_wait_for_a_loading_inference_server(monkeypatch: pytest.MonkeyPatch) -> None:
     from oh_my_slam.client.client import InferenceClient
 
     state = {"status": "loading"}
@@ -404,50 +393,51 @@ def test_a_locate_that_needs_no_inference_skips_the_inference_queue(ws: Workspac
     assert spec.needs_inference(odd, args) is True  # what cannot be evaluated needs it
     assert spec.needs_inference(spec.SEGMENT_MAP, args) is False
     assert spec.needs_inference(spec.SEGMENT_IMAGE, args) is True
+    jpeg(ws.root / "q.jpg")
+    op = web_ops.operations()["mapper-locate"]
+    assert web_ops.prepare(op, {"inputs": ["q.jpg"], "map": "m"}, ws).inference is False
 
 
 # -- uploads -----------------------------------------------------------------------------------------
 
 
-def test_upload_is_deleted_when_its_job_ends(svc: Svc) -> None:
-    r = svc.client.post("/api/uploads?name=photo.jpg", content=b"not really a jpeg",
-                        headers=OCTET)
-    assert r.status_code == 201
-    up = r.json()
+def test_an_upload_is_consumed_by_the_request_it_is_given_to(
+        monkeypatch: pytest.MonkeyPatch, svc: Svc) -> None:
+    """Deleted when that request ends, whatever its outcome — done, failed, refused — but not by
+    a validation; an unconsumed one can be discarded."""
+    with_programs(monkeypatch, svc.service, slow_command.registry_program())
+    c = svc.client
+
+    def upload(name: str = "photo.jpg") -> dict[str, Any]:
+        r = c.post(f"/api/uploads?name={name}", content=b"not really a jpeg", headers=OCTET)
+        assert r.status_code == 201
+        return dict(r.json())
+
+    up = upload()
     assert up["path"] == f"uploads/{up['id']}/photo.jpg" and up["size"] == 17
     assert (svc.ws.root / up["path"]).read_bytes() == b"not really a jpeg"
-    assert [p.name for p in svc.ws.uploads.iterdir()] == [up["id"]]
-    op = web_ops.operations()["segment-image"]
-    prep = web_ops.prepare(op, {"image": up["path"]}, svc.ws, svc.ws.job_dir("x"))
-    assert prep.uploads == [up["id"]] and not prep.problems
-    runner = svc.runner
-    job = runner.submit(slow_op(), {}, slow(0.2, "--code=2", uploads=[up["id"]]),
-                        runner.new_id())
-    # a second job may not consume the same upload
-    with pytest.raises(Exception, match="already the input of job"):
-        runner.submit(slow_op(), {}, slow(0, uploads=[up["id"]]), runner.new_id())
-    job = runner.wait(job.id, 60)
-    assert job.state == "failed" and job.error["message"] == "asked to fail"
-    assert not (svc.ws.uploads / up["id"]).exists()  # a failed job's upload goes too
-    r = svc.client.post("/api/ops/segment-image/validate", json={"image": up["path"]})
+    assert c.post("/api/ops/slow/validate", json={"image": up["path"]}).json()["valid"]
+    assert (svc.ws.root / up["path"]).is_file()  # validating consumes nothing
+    r = c.post("/api/ops/slow", json={"image": up["path"], "seconds": 0})
+    assert r.status_code == 200 and not (svc.ws.uploads / up["id"]).exists()
+    r = c.post("/api/ops/slow/validate", json={"image": up["path"]})
     assert "upload the file again" in r.json()["by_parameter"]["image"][0]
-    # a queued job that is cancelled releases its upload too
-    up2 = svc.client.post("/api/uploads?name=b.jpg", content=b"x", headers=OCTET).json()
-    blocker = runner.submit(slow_op(), {}, slow(3), runner.new_id())
-    queued = runner.submit(slow_op(), {}, slow(0, uploads=[up2["id"]]), runner.new_id())
-    assert runner.get(queued.id).state == "queued"
-    assert svc.client.post(f"/api/jobs/{queued.id}/cancel", json={}).json()["state"] \
-        == "cancelled"
-    assert not (svc.ws.uploads / up2["id"]).exists()
-    svc.client.post(f"/api/jobs/{blocker.id}/cancel", json={})
-    # unconsumed uploads can be discarded; bad names are refused
-    up3 = svc.client.post("/api/uploads?name=c.jpg", content=b"x", headers=OCTET).json()
-    assert svc.client.delete(f"/api/uploads/{up3['id']}").status_code == 204
+    up = upload()
+    r = c.post("/api/ops/slow", json={"image": up["path"], "code": 2})
+    assert r.status_code == 400 and r.json()["error"] == {
+        "code": "usage", "exit_code": 2, "message": "asked to fail", "http_status": 400}
+    assert not (svc.ws.uploads / up["id"]).exists()  # a failed request's upload goes too
+    up = upload()
+    r = c.post("/api/ops/slow", json={"image": up["path"], "seconds": "soon"})
+    assert r.status_code == 400 and not (svc.ws.uploads / up["id"]).exists()  # and a refused one
+    up = upload()
+    assert c.delete(f"/api/uploads/{up['id']}").status_code == 204
+    assert c.delete(f"/api/uploads/{up['id']}").status_code == 404
     for name in ("", "../x.jpg", ".hidden.jpg", "a/b.jpg"):
-        r = svc.client.post(f"/api/uploads?name={name}", content=b"x", headers=OCTET)
+        r = c.post(f"/api/uploads?name={name}", content=b"x", headers=OCTET)
         assert r.status_code == 400, name
-    runner.wait(blocker.id, 30)
     assert list(svc.ws.uploads.iterdir()) == []
+    assert list(svc.ws.requests.iterdir()) == []  # nor is any result kept
 
 
 def test_uploads_are_capped_and_need_free_space(ws: Workspace) -> None:
@@ -491,11 +481,13 @@ def test_an_interrupted_upload_is_deleted_at_once(svc: Svc) -> None:
     assert list(svc.ws.uploads.iterdir()) == []
 
 
-def test_uploads_are_cleared_at_start_and_stop(ws: Workspace) -> None:
+def test_uploads_and_request_folders_are_cleared_at_start_and_stop(ws: Workspace) -> None:
     uid, target = ws.new_upload("left.jpg")
     target.write_bytes(b"x")
+    ws.request_dir("r1").mkdir(parents=True)
     ws.clear_uploads()
-    assert list(ws.uploads.iterdir()) == []
+    ws.clear_requests()
+    assert list(ws.uploads.iterdir()) == [] and list(ws.requests.iterdir()) == []
     runner = Runner(ws)
     uid, target = ws.new_upload("left.jpg")
     target.write_bytes(b"x")
@@ -505,23 +497,24 @@ def test_uploads_are_cleared_at_start_and_stop(ws: Workspace) -> None:
 
 def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
     import subprocess
+    import sys
 
     code = (
         "import sys\n"
         "from pathlib import Path\n"
         "from starlette.testclient import TestClient\n"
         "from oh_my_slam.web.app import Service, create_app\n"
-        "from oh_my_slam.web.jobs import Runner\n"
+        "from oh_my_slam.web.runner import Runner\n"
         "from oh_my_slam.web.workspace import Workspace\n"
         "from tests.unit.test_view_cli import minimal_map\n"
         f"ws = Workspace(Path({str(tmp_path)!r}))\n"
         "ws.create()\n"
         "minimal_map(ws.maps / 'm')\n"
         "c = TestClient(create_app(Service(ws, Runner(ws), extra_hosts={'testserver'})))\n"
-        "for u in ('/api/health', '/api/openapi.json', '/api/maps', '/api/maps/m',\n"
-        "          '/viewer/map/m/', '/api/maps/m/viewer/api/meta'):\n"
+        "for u in ('/api/health', '/api/openapi.json', '/api/maps', '/api/maps/m'):\n"
         "    assert c.get(u).status_code == 200, u\n"
         "c.post('/api/ops/segment-map/validate', json={'map': 'm'})\n"
+        "assert c.post('/api/ops/segment-map', json={'map': 'm'}).status_code == 200\n"
         "print(sorted(m for m in ('torch', 'open3d', 'pycolmap') if m in sys.modules))\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO,
                          timeout=120)
@@ -529,198 +522,25 @@ def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
     assert out.stdout.strip() == "[]"
 
 
-# -- viewer of a map ---------------------------------------------------------------------------------
-
-
-def test_map_viewer_is_served_by_the_viewers_own_routes(svc: Svc,
-                                                        monkeypatch: pytest.MonkeyPatch) -> None:
-    """``/viewer/map/<name>/…`` and ``/api/maps/<name>/viewer/…`` hand the path below the prefix
-    and the query to ``viewer.routes.ViewerRoutes`` over the map's bundle; loaded bundles are
-    kept in a small LRU."""
-    calls: list[tuple[str, str, str]] = []
-    built: list[Any] = []
-
-    class FakeRoutes:
-        def __init__(self, bundle: Any) -> None:
-            built.append(bundle)
-
-        def handle(self, method: str, path: str, query: str = "") -> Any:
-            calls.append((method, path, query))
-            body = (b"<html>", memoryview(b"page</html>"))
-            return types.SimpleNamespace(status=200, headers=(("Content-Type", "text/html"),),
-                                         body=body)
-
-    monkeypatch.setitem(sys.modules, "oh_my_slam.viewer.routes",
-                        types.SimpleNamespace(ViewerRoutes=FakeRoutes))
-    monkeypatch.setattr("oh_my_slam.viewer.bundle.map_bundle", lambda root: root)
-    for n in ("a", "b", "c"):
-        minimal_map(svc.ws.maps / n)
-    r = svc.client.get("/viewer/map/a", follow_redirects=False)
-    assert r.status_code in (302, 307) and r.headers["location"] == "/viewer/map/a/"
-    r = svc.client.get("/viewer/map/a/api/cloud?voxel=0.1")
-    assert r.status_code == 200 and r.content == b"<html>page</html>"
-    assert svc.client.get("/api/maps/a/viewer/api/meta").status_code == 200
-    assert calls == [("GET", "/api/cloud", "voxel=0.1"), ("GET", "/api/meta", "")]
-    assert len(built) == 1  # one bundle for both URLs
-    for n in ("b", "c", "a"):
-        svc.client.get(f"/viewer/map/{n}/")
-    assert len(built) == 4  # at most two kept: a was evicted by b and c
-    assert svc.client.get("/viewer/map/absent/").status_code == 404
-    assert svc.client.get("/viewer/job/none/").status_code == 404
-    assert svc.client.get("/api/jobs/none/viewer/").status_code == 404
-
-
-def test_a_restart_clears_a_viewer_steps_progress(ws: Workspace) -> None:
-    """A service killed during a viewer step: after the restart no step runs, so the job shows
-    no viewer progress."""
-    import json
-
-    runner = Runner(ws)
-    job = runner.submit(slow_op(), {}, slow(0, inference=False), runner.new_id())
-    runner.wait(job.id, 60)
-    runner.shutdown()
-    record = ws.job_dir(job.id) / "job.json"
-    saved = json.loads(record.read_text())
-    record.write_text(json.dumps({**saved, "state": "running",
-                                  "viewer_progress": {"stage": "inference"}}))
-    again = Runner(ws)
-    again.load()
-    assert again.get(job.id).viewer_progress is None
-    assert json.loads(record.read_text())["viewer_progress"] is None
-    again.shutdown()
-
-
-def test_viewer_build_locks_are_pruned_with_their_bundles() -> None:
-    lru = web_app._LRU(2)
-    for name in ("a", "b", "c"):
-        for version in (1, 2):  # a newer version of the same map evicts the older one first
-            assert lru.get((name, version), lambda: object(), owner=name) is not None
-    assert list(lru.items) == [("c", 1), ("c", 2)]
-    assert set(lru.owners) == {"c"}  # a's and b's locks went with their last bundle
-
-
-def test_viewer_bundles_build_under_a_per_map_lock(svc: Svc) -> None:
-    """Building one map's viewer never waits for another map's build; concurrent requests for
-    the same map build it once."""
-    import threading
-
-    minimal_map(svc.ws.maps / "a")
-    minimal_map(svc.ws.maps / "b")
-    from oh_my_slam.viewer import bundle as vb
-
-    real = vb.map_bundle
-    release, entered = threading.Event(), threading.Event()
-    builds: list[str] = []
-
-    def slow_bundle(root: Path, *a: Any, **k: Any) -> Any:
-        builds.append(Path(root).name)
-        if Path(root).name == "a":
-            entered.set()
-            assert release.wait(30)
-        return real(root, *a, **k)
-
-    vb.map_bundle = slow_bundle  # type: ignore[assignment]
-    try:
-        a = [threading.Thread(target=svc.service.map_routes, args=("a",)) for _ in range(2)]
-        for t in a:
-            t.start()
-        assert entered.wait(30)
-        done = threading.Thread(target=svc.service.map_routes, args=("b",))
-        done.start()
-        done.join(10)
-        assert not done.is_alive()  # b was built while a's build was still running
-        release.set()
-        for t in a:
-            t.join(30)
-    finally:
-        vb.map_bundle = real  # type: ignore[assignment]
-    assert sorted(builds) == ["a", "b"]  # a once, although asked twice
-
-
-# -- workspace guarantees ----------------------------------------------------------------------------
-
-
-def test_a_vanished_operation_cannot_be_resubmitted(svc: Svc) -> None:
-    """A job of an operation the commands no longer offer (here: not in the registry) is answered
-    410 Gone with a message on re-submission, never a 500."""
-    job = svc.runner.submit(slow_op(), {}, slow(0, inference=False), svc.runner.new_id())
-    svc.runner.wait(job.id, 60)
-    r = svc.client.post(f"/api/jobs/{job.id}/resubmit", json={})
-    assert r.status_code == 410 and r.json()["error"]["code"] == "gone"
-    assert "no longer exists" in r.json()["error"]["message"]
-
-
-def test_results_download_again_after_a_restart(ws: Workspace) -> None:
-    """A job's result and files are kept under jobs/<id>/: after a service restart (a new runner
-    and service on the same workspace) they download byte for byte as before."""
-    minimal_map(ws.maps / "m")
-    first = make_svc(ws)
-    with TestClient(create_app(first)) as c:
-        r = c.post("/api/ops/segment-map", json={"map": "m", "artifacts": "files"})
-        assert r.status_code == 202, r.json()
-        jid = r.json()["id"]
-        assert first.runner.wait(jid, 120).state == "succeeded"
-        before = {f["path"]: c.get(f["url"]).content for f in c.get(f"/api/jobs/{jid}/files").json()}
-        result = c.get(f"/api/jobs/{jid}/result").content
-    first.runner.shutdown()
-    assert result and len(before) > 1
-    again = make_svc(ws)
-    again.runner.load()
-    with TestClient(create_app(again)) as c:
-        assert c.get(f"/api/jobs/{jid}").json()["state"] == "succeeded"
-        assert c.get(f"/api/jobs/{jid}/result").content == result
-        after = {f["path"]: c.get(f["url"]).content for f in c.get(f"/api/jobs/{jid}/files").json()}
-        assert after == before
-    again.runner.shutdown()
-
-
 def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
     """No request deletes or changes a map outside the mapping operation: no route deletes one,
-    read-only jobs and a failing update leave it as it was, and so do a stop and a restart."""
+    read-only requests and a failing update leave it as it was, and so do a stop and a restart."""
     from tests.mapsnap import snapshot
 
     root = minimal_map(ws.maps / "m")
     before = snapshot(root)
     service = make_svc(ws)
     with TestClient(create_app(service)) as c:
-        for path in ("/api/maps/m", "/api/maps/m/files/map.json", "/viewer/map/m/",
-                     "/api/maps/m/viewer/api/meta"):
-            assert c.delete(path).status_code in (404, 405), path
+        assert c.delete("/api/maps/m").status_code == 405
         assert c.delete("/api/uploads/m").status_code == 404
-        for op, params in (("segment-map", {"map": "m"}), ("view-map", {"map": "m"}),
-                           ("segment-map", {"map": "maps/m", "format": "ply"})):
-            r = c.post(f"/api/ops/{op}", json=params)
-            assert r.status_code == 202, r.json()
-            assert service.runner.wait(r.json()["id"], 120).state == "succeeded"
+        for params in ({"map": "m"}, {"map": "maps/m", "format": "ply"}):
+            r = c.post("/api/ops/segment-map", json=params)
+            assert r.status_code == 200, r.text
         (ws.root / "bad.jpg").write_bytes(b"not an image")
         r = c.post("/api/ops/mapper-update", json={"inputs": ["bad.jpg"], "map": "m"})
-        if r.status_code == 202:  # refused by the command rather than at submission
-            assert service.runner.wait(r.json()["id"], 120).state == "failed"
+        assert r.status_code >= 400
         assert c.get("/api/maps").json()[0]["name"] == "m"
     service.runner.shutdown()
-    restarted = make_svc(ws)
-    restarted.runner.load()
-    ws.clear_uploads()
-    restarted.runner.shutdown()
+    make_svc(ws).runner.shutdown()
     assert snapshot(root) == before
-
-
-def test_read_only_requests_are_served_while_a_job_runs(svc: Svc) -> None:
-    """While an inference job runs, health, maps, jobs, the API description and a map's viewer
-    answer at once."""
-    import time
-
-    minimal_map(svc.ws.maps / "m")
-    job = svc.runner.submit(slow_op(), {}, slow(6), svc.runner.new_id())
-    deadline = time.monotonic() + 30
-    while svc.runner.get(job.id).state != "running" and time.monotonic() < deadline:
-        time.sleep(0.02)
-    for path in ("/api/health", "/api/maps", "/api/maps/m", "/api/jobs", f"/api/jobs/{job.id}",
-                 "/api/openapi.json", "/viewer/map/m/api/meta", "/"):
-        t0 = time.monotonic()
-        r = svc.client.get(path)
-        assert r.status_code == 200, path
-        assert time.monotonic() - t0 < 2.0, path
-    assert svc.runner.get(job.id).state == "running"  # all of it while the job ran
-    svc.client.post(f"/api/jobs/{job.id}/cancel", json={})
-    svc.runner.wait(job.id, 60)
+    assert json.loads((root / "map.json").read_text())["update_count"] == 1

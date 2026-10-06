@@ -1,7 +1,9 @@
 """The service's workspace (spec §2.6 "Workspace"): ``<data>/maps/<name>/`` (maps in exactly the
 format ``mapper.sh`` writes), ``<data>/uploads/<id>/<file>`` (transient inputs) and
-``<data>/jobs/<id>/`` (each job's record, logs and files). Every path a request names is resolved
-— symlinks included — and refused when it lands outside the workspace."""
+``<data>/.requests/<id>/`` (what a running request's command writes — its stdout, the result, and
+its timing record — deleted once the response is sent: the service keeps no results). Every path a
+request names is resolved — symlinks included — and refused when it lands outside the workspace or
+goes through a hidden entry."""
 
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ from oh_my_slam.core.errors import InputError, UsageError
 
 MAPS = "maps"
 UPLOADS = "uploads"
-JOBS = "jobs"
+REQUESTS = ".requests"
 DEFAULT_DATA = Path("~/oh-my-slam-data")
 
 _NAME = re.compile(r"^[^/\\\0]+$")
@@ -27,7 +29,7 @@ class OutsideWorkspaceError(InputError):
 
 
 class NotFoundError(UsageError):
-    """A workspace object (map, upload, job, file) that does not exist (HTTP 404)."""
+    """A workspace object (map, upload, operation) that does not exist (HTTP 404)."""
 
 
 def plain_name(name: str, what: str) -> str:
@@ -70,10 +72,10 @@ class Workspace:
         self.root = Path(root).expanduser().resolve()
         self.maps = self.root / MAPS
         self.uploads = self.root / UPLOADS
-        self.jobs = self.root / JOBS
+        self.requests = self.root / REQUESTS
 
     def create(self) -> None:
-        for d in (self.root, self.maps, self.uploads, self.jobs):
+        for d in (self.root, self.maps, self.uploads):
             d.mkdir(parents=True, exist_ok=True)
 
     # -- paths -------------------------------------------------------------------------------------
@@ -134,20 +136,26 @@ class Workspace:
         files = [p for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")] \
             if folder.is_dir() else []
         if len(files) != 1:
-            raise NotFoundError(f"no upload {uid} (uploads are deleted when their job ends)")
+            raise NotFoundError(f"no upload {uid} (an upload is deleted when the request it was "
+                                "given to ends)")
         return Upload(uid, files[0].name, files[0], files[0].stat().st_size)
 
     def delete_upload(self, uid: str) -> None:
         shutil.rmtree(self.uploads / uid, ignore_errors=True)
 
     def clear_uploads(self) -> None:
-        """Delete every upload (at start and stop no job can consume them any more)."""
-        if self.uploads.is_dir():
-            for d in self.uploads.iterdir():
-                if d.is_dir() and not d.is_symlink():
-                    shutil.rmtree(d, ignore_errors=True)
-                else:
-                    d.unlink(missing_ok=True)
+        """Delete every upload (at start and stop no request can consume them any more)."""
+        _clear(self.uploads)
+
+    # -- requests ----------------------------------------------------------------------------------
+
+    def request_dir(self, rid: str) -> Path:
+        """The folder of what a running request's command writes (created when it starts)."""
+        return self.requests / plain_name(rid, "a request id")
+
+    def clear_requests(self) -> None:
+        """Delete what requests left (at start and stop none runs: a crash, a lost response)."""
+        _clear(self.requests)
 
     # -- maps (read-only) --------------------------------------------------------------------------
 
@@ -197,20 +205,16 @@ class Workspace:
             summary["last_update"] = {k: last.get(k) for k in ("id", "at", "kind")} | {
                 "frames_added": len(last.get("frames_added") or []),
                 "total_s": (last.get("timings") or {}).get("total_s")}
-        summary["thumbnail"] = reader.frames[0].image if reader.frames else None
         if full:
             summary["meta"] = meta
         return summary
 
-    def map_file(self, name: str, rel: str) -> Path:
-        """A file of a map (read-only download); hidden entries (``.staging``, ``.lock``) are
-        never served."""
-        target = inside(self.map_dir(name), rel)
-        if not target.is_file():
-            raise NotFoundError(f"no file {rel} in map {name}")
-        return target
 
-    # -- jobs --------------------------------------------------------------------------------------
-
-    def job_dir(self, jid: str) -> Path:
-        return self.jobs / plain_name(jid, "a job id")
+def _clear(folder: Path) -> None:
+    """Delete everything in ``folder`` (the folder stays)."""
+    if folder.is_dir():
+        for d in folder.iterdir():
+            if d.is_dir() and not d.is_symlink():
+                shutil.rmtree(d, ignore_errors=True)
+            else:
+                d.unlink(missing_ok=True)

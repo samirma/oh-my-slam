@@ -1,14 +1,17 @@
 """The HTTP routes of ``server.sh`` (spec §2.6 "API"), on Starlette (served by uvicorn).
 
-Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi``). The viewer's
-data is served in-process by the viewer's own code (``viewer.routes.ViewerRoutes``):
-``/api/maps/<name>/viewer/…`` over a workspace map's read-only bundle, ``/api/jobs/<id>/viewer/…``
-over the bundle a job saved (``viewer.bundle.load_bundle``); ``/viewer/map/<name>/`` and
-``/viewer/job/<id>/`` are the same routes as stable page URLs (the page's own URLs are relative).
-``/`` is the web application (``web/static``: plain ES modules built only on the public API);
-``/static/…`` serves its files, ``/static/viewer/…`` the viewer's own modules and vendored
-libraries (which the 3D scene viewer reuses), and ``/static/openlabel_json_schema.json`` the
-vendored scene schema that the browser validates scene documents against.
+Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi``): the service's
+health, uploads (create and discard), the workspace's maps (as a list and one by one), and per
+operation ``POST /api/ops/<op>`` — which runs the command within the request and answers when it
+ends (``web.runner``) — and ``POST /api/ops/<op>/validate``. ``/`` is the web application
+(``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files,
+``/static/viewer/…`` the viewer's own modules and vendored libraries, and
+``/static/openlabel_json_schema.json`` the vendored scene schema.
+
+An operation's answer is the command's: on success its stdout, byte for byte, in the result's media
+type, with the command's per-stage timings in a ``Server-Timing`` header (its own stage names, in
+milliseconds, and ``total``); otherwise the command's message and the code of its exit status, by
+the generic exit status → HTTP status rule.
 
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
 come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
@@ -19,17 +22,13 @@ type a cross-site page cannot send without a CORS preflight, which this service 
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
 import mimetypes
 import os
 import shutil
 import socket
-import threading
 import time
-from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -39,43 +38,40 @@ from urllib.parse import urlsplit
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import (
-    FileResponse,
-    JSONResponse,
-    PlainTextResponse,
-    RedirectResponse,
-    Response,
-    StreamingResponse,
-)
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from oh_my_slam.commands import spec
-from oh_my_slam.core.errors import HTTP_STATUS, ExitCode, OhMySlamError, ServerUnavailableError
+from oh_my_slam.core.errors import (
+    HTTP_STATUS,
+    ExitCode,
+    OhMySlamError,
+    ServerUnavailableError,
+    error_code,
+    http_status,
+)
 from oh_my_slam.version import __version__
 from oh_my_slam.web import openapi
-from oh_my_slam.web.jobs import TERMINAL, JobError, Runner
 from oh_my_slam.web.operations import (
-    OUT_DIR,
     Operation,
+    Prepared,
     error_body,
-    inference_of,
+    media_of,
     operations,
     prepare,
     problem,
 )
+from oh_my_slam.web.runner import STDOUT, STOPPING, TIMINGS, Outcome, Run, RunError, Runner
 from oh_my_slam.web.workspace import NotFoundError, Workspace
 
 START_COMMAND = "./start_inference_server.sh"
-SSE_POLL_S = 0.2
-SSE_HEARTBEAT_S = 15.0
 MAX_UPLOAD_BYTES = 8 << 30  # 8 GiB: room for a long phone video
 MIN_FREE_BYTES = 1 << 30  # an upload never leaves less than this free on the workspace's disk
 UPLOAD_CHECK_BYTES = 64 << 20  # free space is re-checked as an undeclared upload grows
 HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at most this often
 SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
                         "multipart/form-data"})  # what a cross-site form sends without a preflight
-VIEWER_CACHE = 2  # loaded viewer bundles kept per kind (maps, jobs)
-DISPLAY_DIR = "display"  # a job's PLY files as the viewer draws them (cloud documents)
+CLIENT_GONE = 499  # what an interrupted request is logged with (nobody reads it)
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
 VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
@@ -83,12 +79,6 @@ SCHEMA_FILE = Path(str(resources.files("oh_my_slam.schema") / "openlabel_json_sc
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
                  ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
                  ".txt": "text/plain"}
-
-
-def media_of_file(path: Path) -> str | None:
-    """A file's media type: the commands' own for their output formats (``commands.spec``),
-    else the standard guess (e.g. a map's keyframe JPEGs)."""
-    return spec.media_of_file(path) or mimetypes.guess_type(path.name)[0]
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -151,57 +141,52 @@ def _hostname(value: str) -> str:
     return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
 
 
-class _LRU:
-    """The ``size`` most recent viewer bundles. A bundle is built under its owner's lock (a map's
-    name, a job's id), so one map's build never waits for another's and a map is built once."""
+def timing_header(record: Json) -> str:
+    """A command's timing record (``core.timing``) as a ``Server-Timing`` header value: each stage
+    under its own name, then ``total``, in milliseconds."""
+    stages = [*record["stages_s"].items(), ("total", record["total_s"])]
+    return ", ".join(f"{name};dur={float(s) * 1000:.1f}" for name, s in stages)
 
-    def __init__(self, size: int) -> None:
-        self.size = size
-        self.items: OrderedDict[Any, Any] = OrderedDict()
-        self.lock = threading.Lock()  # guards ``items`` and ``owners`` only (never held to build)
-        self.owners: dict[Any, threading.Lock] = {}
-        self.owner_of: dict[Any, Any] = {}  # each cached key's owner
 
-    def _cached(self, key: Any) -> tuple[bool, Any]:
-        with self.lock:
-            if key in self.items:
-                self.items.move_to_end(key)
-                return True, self.items[key]
-            return False, None
+def server_timing(folder: Path) -> str | None:
+    """The ``Server-Timing`` value of the timing record a request's command wrote, if any."""
+    try:
+        return timing_header(json.loads((folder / TIMINGS).read_text()))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
-    def get(self, key: Any, make: Callable[[], Any], owner: Any = None) -> Any:
-        """The cached value of ``key``, else ``make()``, built under the lock of ``owner``
-        (default: ``key``)."""
-        found, value = self._cached(key)
-        if found:
-            return value
-        owner = key if owner is None else owner
-        with self.lock:
-            build_lock = self.owners.setdefault(owner, threading.Lock())
-        with build_lock:
-            found, value = self._cached(key)  # built meanwhile by another request
-            if found:
-                return value
-            value = make()
-            with self.lock:
-                self.items[key] = value
-                self.owner_of[key] = owner
-                while len(self.items) > self.size:
-                    old, _ = self.items.popitem(last=False)
-                    self._prune(self.owner_of.pop(old))
-            return value
 
-    def _prune(self, owner: Any) -> None:
-        """Forget ``owner``'s lock once it caches nothing and no build holds it (under
-        ``self.lock``), so the locks stay as few as the cached bundles."""
-        lock = self.owners.get(owner)
-        if lock is not None and not lock.locked() and owner not in self.owner_of.values():
-            del self.owners[owner]
+def failure(outcome: Outcome) -> tuple[int, Json]:
+    """HTTP status and body of a request whose command did not succeed: its message and the code
+    of its exit status, by the generic rule; a service that stopped under it says so."""
+    if outcome.interrupted == STOPPING:
+        return 503, {"error": {"code": STOPPING, "message": "the service stopped: the command was "
+                               "interrupted, as Ctrl-C would (a map update leaves the map as it "
+                               "was); send the request again once the service runs",
+                               "http_status": 503}}
+    status = http_status(outcome.code)
+    return status, {"error": {"code": error_code(outcome.code), "exit_code": outcome.code,
+                              "message": outcome.message or "", "http_status": status}}
+
+
+class _ResultResponse(FileResponse):
+    """The command's stdout, sent once: the request's folder is deleted when the response ends,
+    whether it was sent in full or not (the service keeps no results)."""
+
+    def __init__(self, folder: Path, media_type: str, headers: dict[str, str]) -> None:
+        super().__init__(folder / STDOUT, media_type=media_type, headers=headers)
+        self.folder = folder
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await run_in_threadpool(shutil.rmtree, self.folder, True)
 
 
 @dataclass
 class Service:
-    """What the routes share: the workspace, the job runner and the service's own facts."""
+    """What the routes share: the workspace, the request runner and the service's own facts."""
 
     workspace: Workspace
     runner: Runner
@@ -215,14 +200,6 @@ class Service:
     min_free_bytes: int = MIN_FREE_BYTES
     _hosts: set[str] | None = None
     _hosts_at: float = 0.0
-    _map_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
-    _job_views: _LRU = field(default_factory=lambda: _LRU(VIEWER_CACHE))
-    _building: dict[Path, Any] = field(default_factory=dict)  # display_cloud builds in flight
-    _building_lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def __post_init__(self) -> None:
-        if self.runner.reevaluate is None:  # a conditional job's inference need, at its start
-            self.runner.reevaluate = lambda job: inference_of(self.ops[job.operation], job.actual)
 
     @property
     def port(self) -> int | None:
@@ -248,137 +225,49 @@ class Service:
             return True
         return self.knows_host(parts.hostname.lower()) and parts.port == self.port
 
-    def health(self) -> Json:
+    def health(self, requests: dict[str, int]) -> Json:
         return {
             "status": "ok",
             "service": {"version": __version__, "url": self.url, "pid": os.getpid(),
                         "workspace": self.workspace.root.name, "data": str(self.workspace.root),
-                        "started_at": self.started_at, "jobs": self.runner.counts()},
+                        "started_at": self.started_at, "requests": requests},
             "inference": self.inference_health(),
         }
 
-    # -- submission --------------------------------------------------------------------------------
-
-    def submit(self, op: Operation, params: Any, resubmitted_from: str | None = None,
-               viewer: bool = False) -> JSONResponse:
-        jid = self.runner.new_id()
-        prep = prepare(op, params, self.workspace, self.workspace.job_dir(jid), viewer)
+    def prepare(self, op: Operation, params: Any) -> Prepared:
+        """The request checked as the command checks it, then — when it will use the inference
+        server — the commands' own check of that server."""
+        prep = prepare(op, params, self.workspace)
         if not prep.problems and prep.inference:
             p = self.inference_check()
             if p is not None:
                 prep.problems.append(p)
-        if prep.problems:
-            status, body = error_body(prep.problems)
-            return JSONResponse(body, status)
-        try:
-            job = self.runner.submit(op, dict(params), prep, jid, resubmitted_from)
-        except JobError as exc:
-            return _error(exc.status, exc.code, str(exc))
-        return JSONResponse(job.public(), 202, headers={"Location": f"/api/jobs/{job.id}"})
+        return prep
 
-    def validate(self, op: Operation, params: Any, viewer: bool = False) -> Json:
-        prep = prepare(op, params, self.workspace, self.workspace.job_dir("validate"), viewer)
-        if not prep.problems and prep.inference:
-            p = self.inference_check()
-            if p is not None:
-                prep.problems.append(p)
+    def validate(self, op: Operation, params: Any) -> Json:
+        prep = self.prepare(op, params)
         return {"valid": not prep.problems, "command": prep.command,
                 "inference": prep.inference if not prep.problems else None,
                 "problems": [p.describe() for p in prep.problems],
                 "by_parameter": spec.by_parameter(prep.problems)}
 
-    # -- viewers -----------------------------------------------------------------------------------
 
-    def map_routes(self, name: str) -> Any:
-        """The viewer's routes over a map's read-only bundle, rebuilt when the map changed."""
-        root = self.workspace.map_dir(name)
-        stamp = (root / "map.json").stat().st_mtime_ns
-
-        def make() -> Any:
-            from oh_my_slam.viewer.bundle import map_bundle
-            from oh_my_slam.viewer.routes import ViewerRoutes
-
-            return ViewerRoutes(map_bundle(root))
-
-        return self._map_views.get((name, stamp), make, owner=name)
-
-    def job_routes(self, jid: str) -> Any:
-        """The viewer's routes over the bundle a job saved (a map's: that map's routes)."""
-        from oh_my_slam.viewer.bundle import load_bundle, saved_map
-
-        folder = self.runner.viewer_dir(jid)
-        if folder is None:
-            raise NotFoundError(f"job {jid} has no viewer")
-        m = saved_map(folder)
-        if m is not None:
-            return self.map_routes(m.name)
-
-        def make() -> Any:
-            from oh_my_slam.viewer.routes import ViewerRoutes
-
-            return ViewerRoutes(load_bundle(folder))
-
-        return self._job_views.get(jid, make)
-
-    def display_cloud(self, jid: str, path: Path) -> Path:
-        """A PLY file of a job as the viewer draws it (the 3D scene viewer): the viewer's cloud
-        document, within the display budget (spec §2.5), with the file's header comments.
-
-        The document is kept as a file in the job's own folder (``display/``, deleted with the
-        job), never in memory, and built once per file version: concurrent requests for the same
-        file wait for the one build (its future), others build in parallel."""
-        from concurrent.futures import Future
-
-        from oh_my_slam.viewer import bundle
-
-        st = path.stat()
-        key = f"{path.name}|{st.st_mtime_ns}|{st.st_size}|{bundle.DISPLAY_POINT_BUDGET}"
-        target = self.workspace.job_dir(jid) / DISPLAY_DIR / (
-            hashlib.sha256(f"{path}|{key}".encode()).hexdigest()[:32] + ".cloud")
-        if target.is_file():
-            return target
-        with self._building_lock:
-            fut = self._building.get(target)
-            mine = fut is None
-            if mine:
-                fut = self._building[target] = Future()
-        assert fut is not None
-        if not mine:
-            return fut.result()
-        try:
-            from oh_my_slam.viewer.routes import cloud_document
-
-            dc, comments = bundle.ply_display(path)
-            attrs = next((c.removeprefix("attributes ") for c in comments
-                          if c.startswith("attributes ")), "")
-            doc = cloud_document(dc, attrs, {"comments": comments})
-            target.parent.mkdir(parents=True, exist_ok=True)
-            part = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.part")
-            with part.open("wb") as f:
-                for piece in doc.pieces:
-                    f.write(piece)
-            part.replace(target)
-            fut.set_result(target)
-            return target
-        except BaseException as exc:
-            fut.set_exception(exc)
-            raise
-        finally:
-            with self._building_lock:
-                self._building.pop(target, None)
+async def disconnected(request: Request) -> None:
+    """Return once the client has gone (its request body was read in full before)."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
-def _viewer_response(r: Any, method: str) -> Response:
-    """A ``viewer.routes.Response`` as a Starlette response (its pieces streamed in order)."""
-    headers = dict(r.headers)
-    if method == "HEAD":
-        return Response(b"", r.status, headers=headers)
-
-    async def body() -> AsyncIterator[bytes | memoryview]:
-        for piece in r.body:
-            yield piece
-
-    return StreamingResponse(body(), r.status, headers=headers)
+def answer(outcome: Outcome, prep: Prepared, folder: Path) -> Response:
+    """An operation's response: the command's stdout and its timings on success, else its
+    error."""
+    if outcome.code == 0:
+        timing = server_timing(folder)
+        return _ResultResponse(folder, media_of(prep.result_format),
+                               {"Server-Timing": timing} if timing else {})
+    shutil.rmtree(folder, ignore_errors=True)
+    status, body = failure(outcome)
+    return JSONResponse(body, status)
 
 
 _STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -427,9 +316,6 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             raise NotFoundError(f"no operation {request.path_params['op']}; see /api/openapi.json")
         return op
 
-    def wants_viewer(request: Request) -> bool:
-        return request.query_params.get("viewer", "").lower() in ("1", "true", "yes")
-
     async def body_json(request: Request) -> Any:
         raw = await request.body()
         if not raw:
@@ -462,21 +348,43 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     async def health(request: Request) -> Response:
-        return JSONResponse(await run_in_threadpool(service.health))
+        return JSONResponse(await run_in_threadpool(service.health, runner.counts()))
 
     async def openapi_doc(request: Request) -> Response:
         return JSONResponse(openapi.document(service.ops))
 
-    async def submit(request: Request) -> Response:
+    async def run_op(request: Request) -> Response:
+        """Validate, wait for the request's turn, run the command, answer when it ends."""
+        ticket = runner.ticket()
         op = op_of(request)
         params = await body_json(request)
-        return await run_in_threadpool(service.submit, op, params, None, wants_viewer(request))
+        if runner.stopping:
+            return _error(503, STOPPING, "the service is stopping; send the request again once "
+                          "it runs")
+        prep = await run_in_threadpool(service.prepare, op, params)
+        if prep.problems:  # refused: the uploads it was given are consumed all the same
+            runner.discard(prep.uploads)
+            status, body = error_body(prep.problems)
+            return JSONResponse(body, status)
+        run = Run(ticket, op.program.prog, op.module, prep.argv, prep.inference, prep.writes,
+                  prep.uploads)
+        try:
+            runner.admit(run)
+        except RunError as exc:
+            if exc.code != "upload_in_use":
+                runner.discard(prep.uploads)
+            return _error(exc.status, exc.code, str(exc))
+        outcome = await runner.wait(run, disconnected(request))
+        folder = ws.request_dir(run.id)
+        if outcome.interrupted is not None and outcome.interrupted != STOPPING:
+            shutil.rmtree(folder, ignore_errors=True)
+            return Response(status_code=CLIENT_GONE)  # the client left: nobody reads it
+        return answer(outcome, prep, folder)
 
     async def validate(request: Request) -> Response:
         op = op_of(request)
         params = await body_json(request)
-        return JSONResponse(await run_in_threadpool(service.validate, op, params,
-                                                    wants_viewer(request)))
+        return JSONResponse(await run_in_threadpool(service.validate, op, params))
 
     # -- uploads -----------------------------------------------------------------------------------
 
@@ -521,9 +429,9 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
     async def delete_upload(request: Request) -> Response:
         uid = request.path_params["id"]
         ws.upload(uid)
-        if any(uid in j.uploads and j.state not in TERMINAL for j in runner.all_jobs()):
-            return _error(409, "upload_in_use", f"upload {uid} is the input of a queued or "
-                          "running job; cancel the job instead")
+        if runner.in_use(uid):
+            return _error(409, "upload_in_use", f"upload {uid} is the input of a request in "
+                          "progress; it is deleted when that request ends")
         ws.delete_upload(uid)
         return Response(status_code=204)
 
@@ -536,202 +444,21 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         return JSONResponse(await run_in_threadpool(ws.map_summary, request.path_params["name"],
                                                     True))
 
-    async def map_file(request: Request) -> Response:
-        p = ws.map_file(request.path_params["name"], request.path_params["path"])
-        return FileResponse(p, media_type=media_of_file(p))
-
-    # -- jobs --------------------------------------------------------------------------------------
-
-    async def jobs(request: Request) -> Response:
-        return JSONResponse([j.public() for j in runner.all_jobs()])
-
-    async def job(request: Request) -> Response:
-        return JSONResponse(runner.get(request.path_params["id"]).public())
-
-    async def cancel(request: Request) -> Response:
-        return JSONResponse(runner.cancel(request.path_params["id"]).public())
-
-    async def resubmit(request: Request) -> Response:
-        old = runner.get(request.path_params["id"])
-        override = await body_json(request)
-        if not isinstance(override, dict):
-            return _error(400, "usage", "the request body must be a JSON object of parameters")
-        op = service.ops.get(old.operation)
-        if op is None:  # the commands no longer offer it (a registry change since the job ran)
-            return _error(410, "gone", f"operation {old.operation} no longer exists; see "
-                          "/api/openapi.json for the current ones")
-        params = {**old.params, **override}
-        return await run_in_threadpool(service.submit, op, params, old.id,
-                                       old.saves_viewer and not op.browser)
-
-    def out_dir(jid: str) -> Path:
-        return ws.job_dir(runner.get(jid).id) / OUT_DIR
-
-    def media_of(jid: str, path: Path) -> str | None:
-        op = service.ops.get(runner.get(jid).operation)
-        for o in op.mode.outputs if op else ():
-            if o.name == path.name:
-                return o.describe()["media_type"]
-        return media_of_file(path)
-
-    async def result(request: Request) -> Response:
-        j = runner.get(request.path_params["id"])
-        if j.state != "succeeded" or j.result_name is None:
-            return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
-        p = out_dir(j.id) / j.result_name
-        media = media_of(j.id, p) if j.result_format is None else spec.media_type(
-            j.result_format)
-        return FileResponse(p, media_type=media, filename=j.result_name)
-
-    async def files(request: Request) -> Response:
-        jid = request.path_params["id"]
-        root = out_dir(jid)
-        out = [{"path": str(p.relative_to(root)), "size": p.stat().st_size,
-                "media_type": media_of(jid, p), "url": f"/api/jobs/{jid}/files/"
-                f"{p.relative_to(root)}"}
-               for p in sorted(root.rglob("*")) if p.is_file() and not p.name.startswith(".")]
-        return JSONResponse(out)
-
-    async def job_file(request: Request) -> Response:
-        from oh_my_slam.web.workspace import inside
-
-        jid = request.path_params["id"]
-        p = inside(out_dir(jid), request.path_params["path"])
-        if not p.is_file():
-            raise NotFoundError(f"no file {request.path_params['path']} in job {jid}")
-        return FileResponse(p, media_type=media_of(jid, p), filename=p.name)
-
-    async def display_cloud(request: Request) -> Response:
-        """A job's PLY (``?file=<path>``, else its result) as the viewer draws it."""
-        from oh_my_slam.web.workspace import inside
-
-        j = runner.get(request.path_params["id"])
-        rel = request.query_params.get("file")
-        if rel is None:
-            if j.state != "succeeded" or j.result_name is None:
-                return _error(404, "not_found", f"job {j.id} has no result ({j.state})")
-            rel = j.result_name
-        p = inside(out_dir(j.id), rel)
-        if not p.is_file():
-            raise NotFoundError(f"no file {rel} in job {j.id}")
-        try:
-            doc = await run_in_threadpool(service.display_cloud, j.id, p)
-        except (ValueError, KeyError, UnicodeDecodeError) as exc:
-            return _error(400, "usage", f"{rel} is not a PLY file the viewer can draw: {exc}")
-        return FileResponse(doc, media_type="application/octet-stream")
-
-    async def display_transform(request: Request) -> Response:
-        """The viewer's display transform of a scene: identity for map coordinates; for a single
-        image's camera frame view.sh's upright transform, with the estimated ``up=x,y,z`` when the
-        scene states one. The frame is decided by the viewer's one rule (``is_camera_frame``),
-        from a scene JSON's coordinate-system types (``cs_types=a,b``) or a PLY's header
-        ``comment``s; ``camera=true`` states it outright."""
-        from oh_my_slam.viewer.bundle import display_transform as transform
-        from oh_my_slam.viewer.bundle import is_camera_frame
-
-        q = request.query_params
-        up: list[float] | None = None
-        if q.get("up"):
-            try:
-                up = [float(x) for x in q["up"].split(",")]
-            except ValueError:
-                up = []
-            if len(up) != 3:
-                return _error(400, "usage", "up must be x,y,z: three numbers")
-        cs_types = None if "cs_types" not in q else [t for t in q["cs_types"].split(",") if t]
-        camera = q.get("camera", "").lower() in ("1", "true", "yes") or \
-            await run_in_threadpool(is_camera_frame, q.getlist("comment"), cs_types)
-        matrix = await run_in_threadpool(transform, camera, up)
-        return JSONResponse({"camera_frame": camera, "display_transform": matrix})
-
-    async def log(request: Request) -> Response:
-        p = ws.job_dir(runner.get(request.path_params["id"]).id) / "stderr.log"
-        return PlainTextResponse(p.read_text("utf-8", "replace") if p.is_file() else "")
-
-    async def timings(request: Request) -> Response:
-        return JSONResponse(runner.timings(request.path_params["id"]))
-
-    async def events(request: Request) -> Response:
-        jid = request.path_params.get("id")
-        if jid is not None:
-            runner.get(jid)
-
-        async def stream() -> AsyncIterator[str]:
-            seen, beat = 0, time.monotonic()
-            yield "retry: 1000\n\n"
-            while not runner.stopping and not await request.is_disconnected():
-                seen, changed = runner.changed_since(seen, jid)
-                for j in changed:
-                    yield f"event: job\nid: {seen}\ndata: {json.dumps(j)}\n\n"
-                if jid is not None and runner.get(jid).state in TERMINAL and not changed:
-                    break
-                if time.monotonic() - beat > SSE_HEARTBEAT_S:
-                    beat = time.monotonic()
-                    yield ": keep-alive\n\n"
-                await asyncio.sleep(SSE_POLL_S)
-
-        return StreamingResponse(stream(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-store"})
-
-    # -- viewer ------------------------------------------------------------------------------------
-
-    def viewer(kind: str, key: str, routes: Callable[[str], Any]) -> Callable[..., Any]:
-        async def endpoint(request: Request) -> Response:
-            ident = request.path_params[key]
-            if "path" not in request.path_params:  # the page needs its trailing slash
-                return RedirectResponse(f"{request.url.path}/")
-            if kind == "job":
-                runner.get(ident)
-            r = await run_in_threadpool(routes(ident).handle, request.method,
-                                        "/" + request.path_params["path"], request.url.query)
-            return _viewer_response(r, request.method)
-
-        return endpoint
-
-    map_viewer = viewer("map", "name", service.map_routes)
-    job_viewer = viewer("job", "id", service.job_routes)
-
     routes = [
         Route("/", index),
         Route("/static/{path:path}", static),
         Route("/api/health", health),
         Route("/api/openapi.json", openapi_doc),
-        Route("/api/ops/{op}", submit, methods=["POST"]),
+        Route("/api/ops/{op}", run_op, methods=["POST"]),
         Route("/api/ops/{op}/validate", validate, methods=["POST"]),
         Route("/api/uploads", upload, methods=["POST"]),
         Route("/api/uploads/{id}", delete_upload, methods=["DELETE"]),
         Route("/api/maps", maps),
         Route("/api/maps/{name}", map_detail),
-        Route("/api/maps/{name}/files/{path:path}", map_file),
-        Route("/api/maps/{name}/viewer", map_viewer),
-        Route("/api/maps/{name}/viewer/{path:path}", map_viewer),
-        Route("/api/jobs", jobs),
-        Route("/api/jobs/events", events),
-        Route("/api/jobs/{id}", job),
-        Route("/api/jobs/{id}/events", events),
-        Route("/api/jobs/{id}/cancel", cancel, methods=["POST"]),
-        Route("/api/jobs/{id}/resubmit", resubmit, methods=["POST"]),
-        Route("/api/jobs/{id}/result", result),
-        Route("/api/jobs/{id}/files", files),
-        Route("/api/jobs/{id}/files/{path:path}", job_file),
-        Route("/api/jobs/{id}/display-cloud", display_cloud),
-        Route("/api/display-transform", display_transform),
-        Route("/api/jobs/{id}/log", log),
-        Route("/api/jobs/{id}/timings", timings),
-        Route("/api/jobs/{id}/viewer", job_viewer),
-        Route("/api/jobs/{id}/viewer/{path:path}", job_viewer),
-        Route("/viewer/map/{name}", map_viewer),
-        Route("/viewer/map/{name}/{path:path}", map_viewer),
-        Route("/viewer/job/{id}", job_viewer),
-        Route("/viewer/job/{id}/{path:path}", job_viewer),
     ]
 
     async def not_found(request: Request, exc: Exception) -> Response:
         return _error(404, "not_found", str(exc))
-
-    async def job_error(request: Request, exc: Exception) -> Response:
-        assert isinstance(exc, JobError)
-        return _error(exc.status, exc.code, str(exc))
 
     async def command_error(request: Request, exc: Exception) -> Response:
         assert isinstance(exc, OhMySlamError)
@@ -739,9 +466,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         return _error(HTTP_STATUS[code], code.name.lower(), str(exc))
 
     async def disconnect(request: Request, exc: Exception) -> Response:
-        return Response(status_code=499)
+        return Response(status_code=CLIENT_GONE)
 
     app = Starlette(routes=routes, exception_handlers={
-        NotFoundError: not_found, JobError: job_error, OhMySlamError: command_error,
-        ClientDisconnect: disconnect})
+        NotFoundError: not_found, OhMySlamError: command_error, ClientDisconnect: disconnect})
     return guard(app, service)

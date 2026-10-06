@@ -1,9 +1,10 @@
 """The OpenAPI 3.1 document at ``/api/openapi.json`` (spec §2.6 "API"): one ``POST
-/api/ops/<operation>`` (submit a job) and one ``POST /api/ops/<operation>/validate`` (check
-without queuing) per command mode, their parameters generated from ``spec.describe()`` — names,
-kinds, defaults, choices, bounds and help — plus the service's fixed endpoints. Each operation
-also carries its whole ``describe()`` entry under ``x-oms`` (outputs, stages, rules, errors,
-inference need), so a client can render forms and result pages from this document alone."""
+/api/ops/<operation>`` (run it within the request) and one ``POST /api/ops/<operation>/validate``
+(check it, nothing runs) per mode of the commands the service offers, their parameters generated
+from ``spec.describe()`` — names, kinds, defaults, choices, bounds and help — plus the service's
+fixed endpoints. Each operation also carries its ``describe()`` entry as the API offers it
+(``Operation.entry``: outputs, stages, rules, errors, inference need) under ``x-oms``, so a client
+can render forms and result pages from this document alone."""
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from typing import Any
 
 from oh_my_slam.commands import spec
 from oh_my_slam.version import __version__
-from oh_my_slam.web.operations import OUT_DIR, Operation
+from oh_my_slam.web.operations import RESULT, Operation
 
 Json = dict[str, Any]
 
@@ -37,9 +38,6 @@ def _schema(p: Json) -> Json:
     elif kind == str(spec.Kind.MAP):
         s = {"type": "string", "format": "map-name",
              "description": "a map of the workspace: <name> or maps/<name>"}
-    elif kind in (str(spec.Kind.FILE_OUT), str(spec.Kind.FOLDER_OUT)):
-        s = {"type": "string", "format": "file-name",
-             "description": f"a plain name in the job's {OUT_DIR}/ folder"}
     else:  # a path input
         s = {"type": "string", "format": "workspace-path",
              "description": "a path inside the workspace (an upload is uploads/<id>/<file>)"}
@@ -58,8 +56,8 @@ def _schema(p: Json) -> Json:
 
 
 def _body(d: Json) -> Json:
-    """The request body: one property per parameter that means something to the service."""
-    params = [p for p in d["parameters"] if p.get("service", True)]
+    """The request body: one property per API parameter."""
+    params = d["parameters"]
     return {"required": True, "content": {"application/json": {"schema": {
         "type": "object", "additionalProperties": False,
         "properties": {p["name"]: _schema(p) for p in params},
@@ -67,28 +65,34 @@ def _body(d: Json) -> Json:
     }}}}
 
 
-_VIEWER_PARAM = [{"name": "viewer", "in": "query", "required": False,
-                  "schema": {"type": "boolean", "default": False},
-                  "description": "also save the viewer of the request's image: one more step "
-                                 "of the same job, which replays the command's recorded "
-                                 "inference (no second pass; only what the command did not ask "
-                                 "for goes to the server)"}]
 _ERROR = {"$ref": "#/components/responses/Error"}
-_JOB = {"description": "the job", "content": {"application/json": {
-    "schema": {"$ref": "#/components/schemas/Job"}}}}
+_SERVER_TIMING = {"Server-Timing": {
+    "description": "the command's per-stage timings: each stage under the command's own name, "
+                   "then total, in milliseconds (name;dur=<ms>, comma-separated)",
+    "schema": {"type": "string"}}}
 
 
 def _ok(description: str, media: str = "application/json") -> Json:
     return {"200": {"description": description, "content": {media: {}}}}
 
 
+def _result(d: Json) -> Json:
+    """The response of a successful run: the command's stdout in the result's media type."""
+    media = dict.fromkeys(o["media_type"] for o in d["outputs"] if o["via"] == RESULT)
+    return {"description": "the command's result, byte-identical to what it writes to stdout or "
+                           "to -o: " + "; ".join(o["text"] for o in d["outputs"]
+                                                 if o["via"] == RESULT),
+            "headers": _SERVER_TIMING,
+            "content": {m: {} for m in media} or {"application/octet-stream": {}}}
+
+
 def _fixed() -> Json:
     """The service's own endpoints (not per command)."""
-    job_id = [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}]
+    upload_id = [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}]
     name = [{"name": "name", "in": "path", "required": True, "schema": {"type": "string"}}]
-    path = [{"name": "path", "in": "path", "required": True, "schema": {"type": "string"}}]
     return {
-        "/api/health": {"get": {"summary": "service and inference-server health",
+        "/api/health": {"get": {"summary": "service and inference-server health, and the requests "
+                                           "running or waiting for their turn",
                                 "responses": _ok("health")}},
         "/api/uploads": {
             "post": {"summary": "upload one input file (raw request body)",
@@ -96,90 +100,18 @@ def _fixed() -> Json:
                                      "schema": {"type": "string"},
                                      "description": "the file name (its suffix tells its type)"}],
                      "requestBody": {"content": {"application/octet-stream": {}}},
-                     "responses": {"201": {"description": "the upload: use its path as an input"},
+                     "responses": {"201": {"description": "the upload: use its path as an input "
+                                                          "of one request"},
                                    "413": _ERROR, "4XX": _ERROR}}},
-        "/api/uploads/{id}": {"delete": {"summary": "discard an unconsumed upload",
-                                         "parameters": job_id,
+        "/api/uploads/{id}": {"delete": {"summary": "discard an upload no request was given",
+                                         "parameters": upload_id,
                                          "responses": {"204": {"description": "deleted"},
                                                        "4XX": _ERROR}}},
         "/api/maps": {"get": {"summary": "the workspace's maps with their summaries",
                               "responses": _ok("maps")}},
         "/api/maps/{name}": {"get": {"summary": "a map's summary and metadata (map.json)",
-                                     "parameters": name, "responses": _ok("the map")}},
-        "/api/maps/{name}/files/{path}": {"get": {"summary": "a file of a map (read-only)",
-                                                  "parameters": [*name, *path],
-                                                  "responses": _ok("the file", "*/*")}},
-        "/api/maps/{name}/viewer/{path}": {"get": {
-            "summary": "the viewer (spec 2.5) of a map: its page, scripts and data, served by the "
-                       "viewer's own routes; also at /viewer/map/{name}/",
-            "parameters": [*name, *path], "responses": _ok("viewer page or data", "*/*")}},
-        "/api/jobs/{id}/viewer/{path}": {"get": {
-            "summary": "the viewer a job saved (view.sh jobs, or ?viewer=true); also at "
-                       "/viewer/job/{id}/",
-            "parameters": [*job_id, *path], "responses": _ok("viewer page or data", "*/*")}},
-        "/viewer/map/{name}/{path}": {"get": {
-            "summary": "the stable page URL of a map's viewer (the same routes as "
-                       "/api/maps/{name}/viewer/{path}); /viewer/map/{name} redirects to it",
-            "parameters": [*name, *path], "responses": _ok("viewer page or data", "*/*")}},
-        "/viewer/job/{id}/{path}": {"get": {
-            "summary": "the stable page URL of a job's saved viewer (the same routes as "
-                       "/api/jobs/{id}/viewer/{path}); /viewer/job/{id} redirects to it",
-            "parameters": [*job_id, *path], "responses": _ok("viewer page or data", "*/*")}},
-        "/api/jobs": {"get": {"summary": "every job, oldest first", "responses": _ok("jobs")}},
-        "/api/jobs/events": {"get": {"summary": "server-sent events: every job change",
-                                     "responses": _ok("events", "text/event-stream")}},
-        "/api/jobs/{id}": {"get": {"summary": "a job", "parameters": job_id,
-                                   "responses": {"200": _JOB, "4XX": _ERROR}}},
-        "/api/jobs/{id}/events": {"get": {"summary": "server-sent events of one job until it ends",
-                                          "parameters": job_id,
-                                          "responses": _ok("events", "text/event-stream")}},
-        "/api/jobs/{id}/cancel": {"post": {"summary": "cancel a queued or running job (the effect "
-                                                      "of interrupting the command)",
-                                           "parameters": job_id,
-                                           "responses": {"200": _JOB, "4XX": _ERROR}}},
-        "/api/jobs/{id}/resubmit": {"post": {
-            "summary": "submit a new job with the same parameters (body: parameters to replace)",
-            "parameters": job_id, "responses": {"202": _JOB, "4XX": _ERROR, "503": _ERROR}}},
-        "/api/jobs/{id}/result": {"get": {"summary": "the result: the command's stdout / -o file",
-                                          "parameters": job_id,
-                                          "responses": _ok("the result", "*/*")}},
-        "/api/jobs/{id}/files": {"get": {"summary": "every file the job wrote",
-                                         "parameters": job_id, "responses": _ok("files")}},
-        "/api/jobs/{id}/files/{path}": {"get": {"summary": "one file the job wrote",
-                                                "parameters": [*job_id, *path],
-                                                "responses": _ok("the file", "*/*")}},
-        "/api/jobs/{id}/display-cloud": {"get": {
-            "summary": "a PLY file of the job (?file=<path>, else its result) as the viewer draws "
-                       "it: the viewer's binary cloud document, within the display budget of spec "
-                       "2.5 (a voxel-grid selection above it), with the file's header comments",
-            "parameters": [*job_id, {"name": "file", "in": "query", "required": False,
-                                     "schema": {"type": "string"},
-                                     "description": "the `path` of a PLY in the job's files "
-                                                    "(default: its result)"}],
-            "responses": {"200": {"description": "the cloud document", "content": {
-                "application/octet-stream": {}}}, "4XX": _ERROR}}},
-        "/api/display-transform": {"get": {
-            "summary": "the viewer's display transform of a scene: identity for map coordinates, "
-                       "view.sh -i's upright transform for a single image's camera frame",
-            "parameters": [
-                {"name": "camera", "in": "query", "required": False,
-                 "schema": {"type": "boolean"}, "description": "the scene is in a camera frame"},
-                {"name": "cs_types", "in": "query", "required": False,
-                 "schema": {"type": "string"},
-                 "description": "a scene JSON's coordinate-system types, comma-separated: a camera "
-                                "frame when none is a scene_cs"},
-                {"name": "comment", "in": "query", "required": False,
-                 "schema": {"type": "array", "items": {"type": "string"}},
-                 "description": "a PLY's header comments (they name its frame)"},
-                {"name": "up", "in": "query", "required": False, "schema": {"type": "string"},
-                 "description": "x,y,z: the estimated up direction in the camera frame"}],
-            "responses": {**_ok("{camera_frame, display_transform (4 x 4, rows)}"),
-                          "4XX": _ERROR}}},
-        "/api/jobs/{id}/log": {"get": {"summary": "the lines the command printed to stderr",
-                                       "parameters": job_id,
-                                       "responses": _ok("the log", "text/plain")}},
-        "/api/jobs/{id}/timings": {"get": {"summary": "the command's timings record",
-                                           "parameters": job_id, "responses": _ok("timings")}},
+                                     "parameters": name,
+                                     "responses": {**_ok("the map"), "4XX": _ERROR}}},
     }
 
 
@@ -187,23 +119,27 @@ def document(ops: dict[str, Operation]) -> Json:
     described = spec.describe()
     by_label = {op.label: op for op in ops.values()}
     paths: Json = {}
-    for d in described["operations"]:
-        op = by_label[d["id"]]
+    for raw in described["operations"]:
+        op = by_label.get(raw["id"])
+        if op is None:  # a command the service does not offer (view.sh)
+            continue
+        d = op.entry(raw)
         summary = f"{d['id']} — {d['description']}"
         paths[f"/api/ops/{op.id}"] = {"post": {
             "operationId": op.id, "summary": summary, "tags": [d["prog"]],
-            "description": f"Runs `{d['id']}` as a job. Inference: {d['inference']} "
-                           f"({d['inference_text']}).",
-            "parameters": _VIEWER_PARAM if op.viewer_input is not None and not op.browser else [],
+            "description": f"Runs `{d['id']}` within this request and answers when it ends. "
+                           f"Inference: {d['inference']} ({d['inference_text']}); requests that "
+                           "use the inference server run one at a time, in arrival order, each "
+                           "waiting for its turn with its connection open. Disconnecting "
+                           "interrupts the command as Ctrl-C would.",
             "requestBody": _body(d),
-            "responses": {"202": _JOB, "4XX": _ERROR, "503": _ERROR},
+            "responses": {"200": _result(d), "4XX": _ERROR, "500": _ERROR, "503": _ERROR},
             "x-oms": d,
         }}
         paths[f"/api/ops/{op.id}/validate"] = {"post": {
             "operationId": f"{op.id}-validate", "summary": f"check a {d['id']} request",
-            "description": "The submission's checks, nothing queued; with ?viewer=true those of "
-                           "the request with its viewer step.",
-            "parameters": _VIEWER_PARAM if op.viewer_input is not None and not op.browser else [],
+            "description": "The request's checks (the command's own, and the inference server's "
+                           "when the request needs it); nothing runs.",
             "tags": [d["prog"]], "requestBody": _body(d),
             "responses": {"200": {"description": "the problems (empty: valid)"}},
         }}
@@ -211,28 +147,11 @@ def document(ops: dict[str, Operation]) -> Json:
     return {
         "openapi": "3.1.0",
         "info": {"title": "oh-my-slam server.sh", "version": __version__,
-                 "description": "Every mode of reconstruct.sh, mapper.sh, segment.sh and view.sh "
-                                "as a job (spec §2.6)."},
+                 "description": "Every mode of " + ", ".join(
+                     dict.fromkeys(op.program.prog for op in ops.values()))
+                 + ", run within its own request (spec §2.6)."},
         "paths": paths,
         "components": {
-            "schemas": {"Job": {"type": "object", "properties": {
-                "id": {"type": "string"}, "operation": {"type": "string"},
-                "state": {"enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
-                "stage": {"type": ["string", "null"], "description": "the command's own stage"},
-                "progress": {"type": ["object", "null"]},
-                "stages": {"type": "array", "description": "the command's own stages with "
-                           "their seconds (never those of a viewer step)"},
-                "viewer_progress": {"type": ["object", "null"], "description": (
-                    "{stage, done, total} of the viewer step that follows the command of a "
-                    "?viewer=true job, while it runs; null otherwise")},
-                "viewer": {"type": ["string", "null"],
-                           "description": "the page of the job's saved viewer"},
-                "viewer_error": {"type": ["object", "null"], "description": (
-                    "why a ?viewer=true job has no viewer although its result stands: "
-                    "{code, exit_code, http_status, message}; code 'cancelled' when the job "
-                    "was cancelled during the viewer step, else the code of its exit status "
-                    "(e.g. 'server_unavailable')")},
-            }}},
             "responses": {"Error": {"description": "the command's message and the code of its "
                                                    "exit status", "content": {
                 "application/json": {}}}},

@@ -10,10 +10,11 @@ Ctrl-C or SIGTERM, and once it accepts connections writes exactly one stderr lin
 
 Nothing goes to stdout except ``--status``'s health JSON. One service runs per workspace (a lock
 and a state file in ``<data>``): a second ``server.sh`` on the same ``--data`` reports the running
-one's URL and exits 0. ``--stop`` stops it the way SIGTERM does: queued jobs are cancelled and
-running ones interrupted (SIGINT, as Ctrl-C) and waited for. A second Ctrl-C or SIGTERM while it
-stops kills every job's process group and exits at once (130); ``--stop`` sends it after waiting
-``STOP_TIMEOUT_S``.
+one's URL and exits 0. ``--stop`` stops it the way SIGTERM does: every request in progress is
+interrupted — a waiting one never starts, a running command gets SIGINT, as Ctrl-C — and the
+running ones are waited for, so each still gets its answer. A second Ctrl-C or SIGTERM while it
+stops kills every command's process group and exits at once (130); ``--stop`` sends it after
+waiting ``STOP_TIMEOUT_S``.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ STATE = "server.json"
 LOG = "server.log"
 LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "oh_my_slam", "")  # "" is the root
 _terminal: int | None = None  # the original stderr, kept once logging went to server.log
-STOP_TIMEOUT_S = 180.0  # running jobs get the runner's grace period to stop
+STOP_TIMEOUT_S = 180.0  # interrupted commands get the runner's grace periods to stop
 FORCE_TIMEOUT_S = 10.0
 
 
@@ -67,8 +68,7 @@ def build_parser() -> ArgumentParser:
     ap.add_argument("--port", type=int, default=None,
                     help="port to bind on 0.0.0.0 (default: 0, a free port)")
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA,
-                    help=f"workspace folder for maps, uploads and results (default: "
-                         f"{DEFAULT_DATA}/)")
+                    help=f"workspace folder for maps and uploads (default: {DEFAULT_DATA}/)")
     ap.add_argument("--no-browser", action="store_true",
                     help="do not open the default browser once listening")
     group = ap.add_mutually_exclusive_group()
@@ -124,8 +124,9 @@ def stop(ws: Workspace) -> int:
     if _released(ws, STOP_TIMEOUT_S):
         _say(f"stopped (pid {pid})")
         return 0
-    # a second signal kills the jobs' process groups and exits at once; SIGKILL as the last resort
-    _say(f"pid {pid} did not stop within {STOP_TIMEOUT_S:.0f} s; killing its jobs")
+    # a second signal kills the commands' process groups and exits at once; SIGKILL as the last
+    # resort
+    _say(f"pid {pid} did not stop within {STOP_TIMEOUT_S:.0f} s; killing its commands")
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGTERM)
     if not _released(ws, FORCE_TIMEOUT_S):
@@ -150,7 +151,8 @@ def _log_to(path: Path) -> None:
     """After the listening line nothing more reaches stderr (spec §2.6: exactly one line): the
     uvicorn and oh_my_slam loggers (and the root, for asyncio and the rest) write to ``path``, and
     so does anything else written to file descriptors 1 and 2 — warnings, a thread's traceback,
-    a library's own output. Jobs are unaffected: their stderr is a pipe to the job's log."""
+    a library's own output. The commands are unaffected: their stderr is a pipe the service
+    reads."""
     import logging
 
     global _terminal
@@ -204,9 +206,9 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
     import uvicorn
 
     from oh_my_slam.web.app import Service, create_app
-    from oh_my_slam.web.jobs import Runner
+    from oh_my_slam.web.runner import Runner
 
-    default_sigint()  # jobs inherit a default SIGINT even if this process was started ignoring it
+    default_sigint()  # commands inherit a default SIGINT even if this was started ignoring it
     lock = ServerLock(ws.root / LOCK)
     try:
         lock.acquire()
@@ -221,20 +223,22 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         claim_stdout()  # nothing reaches stdout while serving
         sock = _bind(port)
         url = f"http://0.0.0.0:{sock.getsockname()[1]}/"
-        ws.clear_uploads()  # no job can consume what an earlier run left
+        ws.clear_uploads()  # no request can consume what an earlier run left
+        ws.clear_requests()
         runner = Runner(ws)
-        runner.load()
         service = Service(ws, runner, url=url)
         app = create_app(service)
 
         def hard_stop(signum: int = 0, frame: object = None) -> None:
-            """A second Ctrl-C or SIGTERM: kill every job's process group and exit now."""
+            """A second Ctrl-C or SIGTERM: kill every command's process group and exit now."""
             runner.kill_all()
             ws.clear_uploads()
+            ws.clear_requests()
             with contextlib.suppress(OSError):
                 (ws.root / STATE).unlink()
             lock.release()
-            _tell_terminal(ws, "stopped by a second signal; every job's processes were killed")
+            _tell_terminal(ws, "stopped by a second signal; every command's processes were "
+                           "killed")
             os._exit(int(ExitCode.INTERRUPTED))
 
         class _Server(uvicorn.Server):
@@ -253,7 +257,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
             @contextlib.contextmanager
             def capture_signals(self) -> Iterator[None]:
                 """Ctrl-C and SIGTERM stop the service normally (uvicorn would re-raise them
-                after its shutdown, skipping the jobs' and the workspace's clean-up)."""
+                after its shutdown, skipping the requests' and the workspace's clean-up)."""
                 for s in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(s, self.stop_signal)
                 try:
@@ -268,16 +272,19 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
                 self.should_exit = True
 
             async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
-                runner.stopping = True  # event streams end, so connections can close
+                runner.stop()  # every request in progress is interrupted, then answered
                 await super().shutdown(sockets)
 
+        # the open requests get their answer once their interrupted commands end (SIGTERM and
+        # SIGKILL follow a command that ignores SIGINT); a task still open after that is cancelled
         config = uvicorn.Config(app, log_config=None, log_level="warning", access_log=False,
-                                lifespan="off", timeout_graceful_shutdown=5)
+                                lifespan="off",
+                                timeout_graceful_shutdown=int(2 * runner.interrupt_grace_s) + 5)
         server = _Server(config)
         try:
             server.run(sockets=[sock])
         finally:
-            for s in (signal.SIGINT, signal.SIGTERM):  # a signal while the jobs stop: hard stop
+            for s in (signal.SIGINT, signal.SIGTERM):  # a signal while requests stop: hard stop
                 signal.signal(s, hard_stop)
             runner.shutdown()
             sock.close()

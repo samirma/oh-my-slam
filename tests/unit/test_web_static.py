@@ -4,6 +4,8 @@ option named in its code; and the constants it shares with the Python side agree
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
 from pathlib import Path
 
@@ -11,10 +13,10 @@ import pytest
 from starlette.testclient import TestClient
 
 from oh_my_slam.commands import spec
-from oh_my_slam.schema import openlabel
+from oh_my_slam.schema import openlabel, validate
 from oh_my_slam.viewer import bundle
 from oh_my_slam.web.app import VIEWER_STATIC, WEB_STATIC, Service, create_app
-from oh_my_slam.web.jobs import Runner
+from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
 
 JS = sorted(WEB_STATIC.rglob("*.js"))
@@ -86,3 +88,16 @@ def test_constants_shared_with_python_agree() -> None:
     jobview = (WEB_STATIC / "js" / "jobview.js").read_text()
     assert "const TIMINGS_LINE = /\\btimings: total /;" in jobview
     assert line.startswith("timings: total ")
+
+
+# The browser's port of these checks (web/static/js/scene/openlabel.js extraErrors) must be revisited
+# whenever they change: update the port, then this hash.
+EXTRA_CHECKS_SHA256 = "78e5d44ce722bfdc942020edfd1452f861a19529c673c54b9dcc90b34082ec75"
+
+
+def test_the_browser_port_of_the_extra_checks_is_in_step() -> None:
+    src = "".join(inspect.getsource(f) for f in (validate.extra_errors, validate._check_quat,
+                                                 validate._check_intrinsics, validate._is_num))
+    assert hashlib.sha256(src.encode()).hexdigest() == EXTRA_CHECKS_SHA256, (
+        "schema/validate.py's checks beyond the schema changed: port the change to "
+        "web/static/js/scene/openlabel.js, then update EXTRA_CHECKS_SHA256")

@@ -1,7 +1,9 @@
 """``server.sh`` as a process (spec §2.6): exactly one stderr line once listening, nothing on
 stdout, ``--status`` health JSON (exit 3 when not running), one service per workspace, ``--stop``
-and SIGINT/SIGTERM as the normal stop, unconsumed uploads cleared at start and stop, and with the
-inference server down a 503 for inference operations while the read-only ones work."""
+and SIGINT/SIGTERM as the normal stop — interrupting the requests in progress, which still get
+their answer — a client that disconnects interrupting its request, unconsumed uploads cleared at
+start and stop, and with the inference server down a 503 for inference operations while the
+others work."""
 
 from __future__ import annotations
 
@@ -12,11 +14,14 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
+import psutil
 import pytest
 
 from tests.unit.test_view_cli import PROBE, minimal_map, probe_records, sh
@@ -85,8 +90,9 @@ def test_server_sh_lifecycle(data: Path) -> None:
     assert r.status_code == 503 and r.json()["error"]["code"] == "server_unavailable"
     minimal_map(data / "maps" / "m")
     assert httpx.get(url + "api/maps").json()[0]["name"] == "m"
-    r = httpx.post(url + "api/ops/segment-map", json={"map": "m"})
-    assert r.status_code == 202
+    r = httpx.post(url + "api/ops/segment-map", json={"map": "m"}, timeout=60)
+    assert r.status_code == 200 and r.json()["openlabel"]
+    assert r.headers["server-timing"].startswith("export;dur=")
     assert httpx.get(url).status_code == 200
     assert httpx.get(url + "api/openapi.json").json()["openapi"].startswith("3.")
     up = httpx.post(url + "api/uploads?name=b.jpg", content=b"x",
@@ -157,10 +163,10 @@ def test_malformed_requests_never_reach_stderr(data: Path) -> None:
 
 FAILING_STOP = """
 import sys
-from oh_my_slam.web import jobs
+from oh_my_slam.web import runner
 def boom(self):
     raise RuntimeError("boom at shutdown")
-jobs.Runner.shutdown = boom
+runner.Runner.shutdown = boom
 from oh_my_slam.web.main import entry
 sys.argv = ["server.sh", *sys.argv[1:]]
 entry()
@@ -208,9 +214,9 @@ entry()
 """
 
 
-def test_a_second_signal_kills_the_jobs_and_exits(data: Path) -> None:
-    """The first SIGTERM waits for a running job (here one deaf to SIGINT); a second one kills
-    every job's process group and exits at once."""
+def slow_server(data: Path) -> tuple[subprocess.Popen[bytes], str]:
+    """server.sh with the stand-in command ``slow.sh`` (tests.fakes.slow_command) in its
+    registry."""
     env = {**os.environ, "PYTHONPATH": str(REPO)}
     proc = subprocess.Popen([sys.executable, "-c", SLOW_SERVER, "--data", str(data),
                              "--no-browser"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -218,28 +224,91 @@ def test_a_second_signal_kills_the_jobs_and_exits(data: Path) -> None:
     assert proc.stderr is not None
     m = LINE.match(proc.stderr.readline().decode().rstrip("\n"))
     assert m, "no listening line"
-    url = f"http://127.0.0.1:{m.group(1)}/"
-    r = httpx.post(url + "api/ops/slow", json={"seconds": 120, "ignore_sigint": True})
-    assert r.status_code == 202, r.text
-    record = data / "jobs" / r.json()["id"] / "job.json"
-    deadline = time.monotonic() + 60
-    while json.loads(record.read_text()).get("pgid") is None and time.monotonic() < deadline:
-        time.sleep(0.1)
-    pgid = json.loads(record.read_text())["pgid"]
-    assert pgid is not None
+    return proc, f"http://127.0.0.1:{m.group(1)}/"
+
+
+def in_background(fn: Any) -> tuple[threading.Thread, dict[str, Any]]:
+    out: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            out["value"] = fn()
+        except Exception as exc:
+            out["error"] = exc
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    return t, out
+
+
+def command_of(proc: subprocess.Popen[bytes], timeout: float = 60) -> Any:
+    """The command the service runs for a request (its child process)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        children = psutil.Process(proc.pid).children()
+        if children:
+            return children[0]
+        time.sleep(0.05)
+    raise AssertionError("no command started")
+
+
+def test_a_client_that_disconnects_interrupts_its_command(data: Path) -> None:
+    proc, url = slow_server(data)
+    try:
+        t, out = in_background(lambda: httpx.post(url + "api/ops/slow", json={"seconds": 120},
+                                                  timeout=None))
+        child = command_of(proc)
+        assert httpx.get(url + "api/health").json()["service"]["requests"]["running"] == 1
+        with pytest.raises(httpx.ReadTimeout):  # a client that gives up after 1 s
+            httpx.post(url + "api/ops/slow", json={"seconds": 120}, timeout=1)
+        deadline = time.monotonic() + 15
+        while httpx.get(url + "api/health").json()["service"]["requests"]["running"] != 1:
+            assert time.monotonic() < deadline, "the request was not interrupted"
+            time.sleep(0.1)
+        assert psutil.Process(proc.pid).children() == [child]  # its command is gone
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        out_, err = proc.communicate(timeout=60)
+    t.join(30)
+    assert proc.returncode == 0 and err == b""
+    assert out["value"].status_code == 503 and out["value"].json()["error"]["code"] == "stopping"
+    assert not child.is_running()
+
+
+def test_stop_interrupts_the_requests_in_progress(data: Path) -> None:
+    """``--stop``: the running command gets Ctrl-C, its client the answer 503 ``stopping``."""
+    proc, url = slow_server(data)
+    t, out = in_background(lambda: httpx.post(url + "api/ops/slow", json={"seconds": 120},
+                                              timeout=None))
+    child = command_of(proc)
+    stop = server("--data", str(data), "--stop")
+    assert stop.returncode == 0, stop.stderr
+    t.join(30)
+    _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0 and err == b""
+    r = out["value"]
+    assert r.status_code == 503 and r.json()["error"]["code"] == "stopping"
+    assert "interrupted" in r.json()["error"]["message"]
+    assert not child.is_running()
+
+
+def test_a_second_signal_kills_the_commands_and_exits(data: Path) -> None:
+    """The first SIGTERM waits for a running command (here one deaf to SIGINT); a second one kills
+    every command's process group and exits at once."""
+    proc, url = slow_server(data)
+    in_background(lambda: httpx.post(url + "api/ops/slow",
+                                     json={"seconds": 120, "ignore_sigint": True}, timeout=None))
+    child = command_of(proc)
+    time.sleep(0.5)  # its SIGINT is ignored by now
     proc.send_signal(signal.SIGTERM)
     time.sleep(1.5)
-    assert proc.poll() is None  # still waiting for the job
+    assert proc.poll() is None  # still waiting for the command
     t0 = time.monotonic()
     proc.send_signal(signal.SIGTERM)
     _, err = proc.communicate(timeout=30)
     assert proc.returncode == 130 and time.monotonic() - t0 < 10
     # after the listening line, the non-zero exit says so in one line pointing at the log
     assert err.decode().splitlines() == [
-        f"server.sh: error: stopped by a second signal; every job's processes were killed "
+        f"server.sh: error: stopped by a second signal; every command's processes were killed "
         f"(see {data.resolve() / 'server.log'})"]
-    with pytest.raises(ProcessLookupError):
-        os.killpg(pgid, 0)
-    saved = json.loads(record.read_text())  # final before the exit: nothing left to recover
-    assert saved["state"] == "cancelled" and saved["pgid"] is None
-    assert server("--data", str(data), "--status").returncode == 3
+    child.wait(10)

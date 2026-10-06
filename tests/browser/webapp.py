@@ -1,5 +1,5 @@
-"""The server.sh service for the web application's browser tests: the real Starlette app and job
-runner on a free loopback port (uvicorn in a thread), over a scratch workspace."""
+"""The server.sh service for the web application's browser tests: the real Starlette app and
+request runner on a free loopback port (uvicorn in a thread), over a scratch workspace."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.web.app import Service, create_app
-from oh_my_slam.web.jobs import Runner
+from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
 
 AXE = Path(__file__).parent / "vendor" / "axe-core" / "axe.min.js"
@@ -24,7 +24,7 @@ def running_service(data: Path, **service_kw: Any) -> Iterator[tuple[Service, st
 
     ws = Workspace(data)
     ws.create()
-    runner = Runner(ws, stop_grace_s=30, cancel_grace_s=10)
+    runner = Runner(ws, interrupt_grace_s=10)
     service = Service(ws, runner, **service_kw)
     config = uvicorn.Config(create_app(service), host="127.0.0.1", port=0, log_config=None,
                             log_level="warning", access_log=False, lifespan="off")

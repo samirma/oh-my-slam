@@ -180,7 +180,7 @@ def test_web_service_is_a_client_without_models_or_open3d() -> None:
     assert {"torch", "ultralytics", "open3d"} <= forbidden
     assert {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")} <= forbidden
     # it runs the commands' Python entry points as subprocesses, never the shell scripts
-    jobs = (SRC / "web" / "jobs.py").read_text("utf-8")
-    assert '[self.python, "-m", step["module"], *step["argv"]]' in jobs
+    runner = (SRC / "web" / "runner.py").read_text("utf-8")
+    assert '[self.python, "-m", run.module, *run.argv]' in runner
     assert 'return f"oh_my_slam.cli.{' in (SRC / "web" / "operations.py").read_text("utf-8")
     assert not _grep(r"subprocess\.\w+\(\s*\[?[^\]]*\.sh", _py_files("web"))
