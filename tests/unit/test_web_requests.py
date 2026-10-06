@@ -137,6 +137,17 @@ def test_inference_requests_run_one_at_a_time_in_arrival_order_others_at_once(
         assert svc.runner.counts() == {"running": 1, "waiting": 2}
         health = await Call(app, "/api/health", method="GET")()
         assert health.json()["service"]["requests"] == {"running": 1, "waiting": 2}
+        # each request in progress, in arrival order, with the command line its validation gave
+        # (how a page tells whether its own request runs or waits for its turn)
+        listed = health.json()["service"]["in_progress"]
+        assert [(r["operation"], r["state"]) for r in listed] == [
+            ("infer", "running"), ("infer", "waiting"), ("infer", "waiting")]
+        assert [r["command"] for r in listed] == [
+            ["infer.sh", f"--seconds={s:g}"] for s in (1.5, 0.2, 0.2)]
+        assert listed[0]["started_at"] >= listed[0]["arrived_at"] and listed[1]["started_at"] is None
+        assert listed[0]["arrived_at"] <= listed[1]["arrived_at"] <= listed[2]["arrived_at"]
+        checked = await Call(app, "/api/ops/infer/validate", {"seconds": 0.2})()
+        assert checked.json()["command"] == listed[1]["command"]
         d, td = await send(app, "/api/ops/slow", {"seconds": 0.2})  # answered at once
         await td
         assert d.status == 200 and not ta.done()  # while the first inference request runs

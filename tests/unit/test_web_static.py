@@ -1,11 +1,9 @@
 """The web application's files (http_server.md "Web application", "Self-contained"): served by the
 service itself, nothing loaded from elsewhere, built on the public API only, with no command or
-option named in its code; and the constants it shares with the Python side agree."""
+option named in its code; it has no viewer, so nothing of the viewer is served."""
 
 from __future__ import annotations
 
-import hashlib
-import inspect
 import re
 from pathlib import Path
 
@@ -13,9 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from oh_my_slam.commands import spec
-from oh_my_slam.schema import openlabel, validate
-from oh_my_slam.viewer import bundle
-from oh_my_slam.web.app import VIEWER_STATIC, WEB_STATIC, Service, create_app
+from oh_my_slam.web.app import WEB_STATIC, Service, create_app
 from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
 
@@ -34,32 +30,32 @@ def test_the_app_and_its_files_are_served(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
     assert 'src="/static/js/app.js"' in r.text
-    for path in ["/static/js/app.js", "/static/style.css", "/static/viewer/lib/viewer.js",
-                 "/static/viewer/lib/labels.css",
-                 "/static/viewer/vendor/three/build/three.module.js"]:
+    for path in ["/static/js/app.js", "/static/style.css", "/static/js/pages/maps.js"]:
         r = client.get(path)
         assert r.status_code == 200, path
     assert client.get("/static/js/app.js").headers["content-type"].startswith("text/javascript")
-    schema = client.get("/static/openlabel_json_schema.json")
-    assert schema.status_code == 200 and schema.json()["$schema"].startswith("http://json-schema.org/draft-07")
-    for bad in ["/static/../app.py", "/static/viewer/../routes.py", "/static/nope.js",
-                "/static/%2e%2e/app.py"]:
+    for bad in ["/static/../app.py", "/static/nope.js", "/static/%2e%2e/app.py",
+                # no viewer: neither its modules nor the scene schema the 3D scene viewer read
+                "/static/viewer/lib/viewer.js", "/static/viewer/vendor/three/build/three.module.js",
+                "/static/openlabel_json_schema.json"]:
         assert client.get(bad).status_code == 404, bad
 
 
 def test_nothing_is_loaded_from_elsewhere() -> None:
-    """Self-contained: no URL to another host in a script, style or page of the app."""
+    """Self-contained: no URL to another host in a script, style or page of the app, and every
+    module it imports is its own."""
     for f in [*JS, *WEB_STATIC.rglob("*.css"), *WEB_STATIC.rglob("*.html")]:
         text = f.read_text()
         for url in re.findall(r"""(?:src|href|import|url)\s*\(?\s*['"](https?:)?//[^'"]+""", text):
             pytest.fail(f"{f.name} loads {url}")
         for m in re.findall(r"""from\s+['"]([^'"]+)['"]""", text):
-            assert m.startswith(("./", "../", "/static/", "three")), (f.name, m)
+            assert m.startswith(("./", "../")), (f.name, m)
+            assert (f.parent / m).resolve().is_file(), (f.name, m)
 
 
 def test_the_app_uses_the_public_api_and_names_no_command() -> None:
-    """Forms, results and downloads come from the API description: no command, mode or option of
-    the registry is named in the app's code."""
+    """Forms and results come from the API description: no command, mode or option of the registry
+    is named in the app's code, and it requests only the API and its own files."""
     names: set[str] = set()
     for prog in spec.PROGRAMS:
         names.add(prog.prog)
@@ -70,34 +66,6 @@ def test_the_app_uses_the_public_api_and_names_no_command() -> None:
     for n in names:
         assert not re.search(rf"""['"`]{re.escape(n)}['"`]""", code), n
     for url in re.findall(r"""['"`](/[a-z][^'"`$]*)""", code):
-        assert url.startswith(("/api/", "/static/", "/viewer/")), url
-
-
-def test_constants_shared_with_python_agree() -> None:
-    controls = (VIEWER_STATIC / "lib" / "controls.js").read_text()
-    m = re.search(r"DISPLAY_POINT_BUDGET = ([\d_]+);", controls)
-    assert m and int(m[1].replace("_", "")) == bundle.DISPLAY_POINT_BUDGET
-    ol = (WEB_STATIC / "js" / "scene" / "openlabel.js").read_text()
-    assert f"SCHEMA_VERSION = '{openlabel.SCHEMA_VERSION}'" in ol
-    assert f"SCHEMA_URL = '{openlabel.SCHEMA_URL}'" in ol
-    # the job page picks the command's timings line out of its stderr by its opening words
-    from oh_my_slam.core.timing import summary_line
-
-    line = summary_line({"stages_s": {"x": 1.0}, "total_s": 1.0, "server": {},
-                         "peak_rss_mb": {"self": 1.0}})
-    jobview = (WEB_STATIC / "js" / "jobview.js").read_text()
-    assert "const TIMINGS_LINE = /\\btimings: total /;" in jobview
-    assert line.startswith("timings: total ")
-
-
-# The browser's port of these checks (web/static/js/scene/openlabel.js extraErrors) must be revisited
-# whenever they change: update the port, then this hash.
-EXTRA_CHECKS_SHA256 = "78e5d44ce722bfdc942020edfd1452f861a19529c673c54b9dcc90b34082ec75"
-
-
-def test_the_browser_port_of_the_extra_checks_is_in_step() -> None:
-    src = "".join(inspect.getsource(f) for f in (validate.extra_errors, validate._check_quat,
-                                                 validate._check_intrinsics, validate._is_num))
-    assert hashlib.sha256(src.encode()).hexdigest() == EXTRA_CHECKS_SHA256, (
-        "schema/validate.py's checks beyond the schema changed: port the change to "
-        "web/static/js/scene/openlabel.js, then update EXTRA_CHECKS_SHA256")
+        assert url.startswith(("/api/", "/static/")), url
+    routes = set(re.findall(r"""['"`]/api/([a-z]+)""", code))
+    assert routes <= {"health", "openapi", "ops", "uploads", "maps"}, routes

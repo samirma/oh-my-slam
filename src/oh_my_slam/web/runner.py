@@ -10,7 +10,10 @@ within its own HTTP request, and this module runs the command for it.
   takes a ticket when it arrives), and wait for their turn with their connection open; the
   others start at once. Two requests never write the same map at once: a writer waits for the
   one before it. The scheduling state lives in the event loop's thread; a running command is
-  waited for in a thread of its own, which hands the outcome back to the loop.
+  waited for in a thread of its own, which hands the outcome back to the loop. ``GET
+  /api/health`` counts the requests running and waiting, and lists each one (``in_progress``:
+  operation, command line as typed, state, times), so a client tells whether its own request
+  runs or waits for its turn.
 * **Interruption.** A client that disconnects, and a stopping service, interrupt a request: a
   waiting one never starts; a running one gets SIGINT on its process group — Ctrl-C in a terminal
   — so an interrupted map update is the command's own uncommitted transaction. A command that
@@ -35,6 +38,7 @@ from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from oh_my_slam.core.process import default_sigint
 from oh_my_slam.core.timing import ENV_PATH
@@ -79,6 +83,10 @@ class Run:
     inference: bool
     writes: str | None = None  # the map folder it writes
     uploads: list[str] = field(default_factory=list)
+    operation: str = ""  # the API operation id
+    command: list[str] = field(default_factory=list)  # as typed, with workspace paths
+    arrived_at: float = field(default_factory=time.time)
+    started_at: float | None = None
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     state: str = "waiting"  # waiting → running → ended
     interrupted: str | None = None
@@ -117,6 +125,14 @@ class Runner:
 
     def counts(self) -> dict[str, int]:
         return {"running": len(self.running), "waiting": len(self.waiting)}
+
+    def in_progress(self) -> list[dict[str, Any]]:
+        """The requests in progress in arrival order: each one's operation, command line (as
+        typed, with workspace paths: what its validation answered), state and times, so a client
+        can tell whether its own request runs or waits for its turn."""
+        runs = sorted([*self.running, *self.waiting], key=lambda r: r.ticket)
+        return [{"operation": r.operation, "command": r.command, "state": r.state,
+                 "arrived_at": r.arrived_at, "started_at": r.started_at} for r in runs]
 
     def in_use(self, uid: str) -> bool:
         return uid in self._in_use
@@ -165,6 +181,7 @@ class Runner:
         self.waiting.remove(run)
         self.running.append(run)
         run.state = "running"
+        run.started_at = time.time()
         t = threading.Thread(target=self._execute, args=(run,), name=f"request-{run.id}",
                              daemon=True)
         self._threads[run.id] = t

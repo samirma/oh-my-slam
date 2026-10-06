@@ -8,9 +8,9 @@ through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C.
 
 ``registry_program()`` is the same command as a registry entry (``slow.sh``, no inference unless
 asked, a JSON result on stdout), for tests that add it to ``commands.spec.PROGRAMS``;
-``map_registry_program()`` a mode of it that takes a map (``-m``, read only) and writes ``note.md``
-into a ``-d`` folder, for the web application's registry-change test (a new mode, a new option, a
-new output)."""
+``map_registry_program()`` a mode of it that takes a map (``-m``, read only) and answers its JSON
+line, for the web application's tests (a new operation on a map's page; a request that runs long
+enough to be interrupted); ``image_registry_program()`` a mode over a single image (``nap.sh``)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ import os
 import signal
 import sys
 import time
-from pathlib import Path
 
 from oh_my_slam.core import timing
 from oh_my_slam.core.errors import UsageError
@@ -30,7 +29,6 @@ from oh_my_slam.core.timing import Stage
 
 STEPS = 10
 MODULE = "tests.fakes.slow_command"
-NOTE = "note.md"
 
 
 def main(argv: list[str]) -> int:
@@ -39,7 +37,6 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--code", type=int, default=0)
     ap.add_argument("--ignore-sigint", action="store_true")
     ap.add_argument("-m", dest="map")
-    ap.add_argument("-d", dest="folder")
     ap.add_argument("-i", dest="image")
     ap.add_argument("--mood")
     args = ap.parse_args(argv)
@@ -54,9 +51,6 @@ def main(argv: list[str]) -> int:
     print(f"slow.sh: slept {args.seconds:g} s", file=sys.stderr, flush=True)
     print(json.dumps({"slept": args.seconds, "pid": os.getpid(), "start": start,
                       "end": time.monotonic()}), flush=True)
-    if args.folder:
-        Path(args.folder).mkdir(parents=True, exist_ok=True)
-        (Path(args.folder) / NOTE).write_text(f"slept {args.seconds:g} s over {args.map}\n")
     if args.code == 2:
         raise UsageError("asked to fail")
     return args.code
@@ -88,11 +82,11 @@ MOOD = "mood"  # an option kind the web application has never seen
 NAP_LIMIT = "--seconds must be at most 100 for a nap over an image"
 
 
-def image_registry_program() -> object:
+def image_registry_program(inference: str = "never") -> object:
     """``nap.sh -i IMAGE [--seconds S] [--code N] [--mood M]`` (run by this module): a mode
-    that takes a single image,
-    with an option of a kind no command has (``MOOD``) and a rule with its own message
-    (``NAP_LIMIT``); never inference."""
+    that takes a single image, with an option of a kind no command has (``MOOD``) and a rule with
+    its own message (``NAP_LIMIT``); no inference unless asked (``"required"``: it then waits for
+    its turn at the inference server like the commands that use it)."""
     from oh_my_slam.commands import spec
 
     def nap(ctx: spec.Context) -> None:
@@ -101,7 +95,9 @@ def image_registry_program() -> object:
 
     mode = spec.Mode(None, None, (spec.Rule("nap_limit", ("seconds",), "a nap lasts 100 s at most",
                                             nap),),
-                     "never", "needs nothing", (Stage.SETUP,), ())
+                     inference, "needs nothing" if inference == "never" else
+                     "naps with the inference server", (Stage.SETUP,), (
+                         spec.Output("result", "stdout", "json", "what nap.sh says it did"),))
     cmd = spec.Command("nap.sh", None, "sleep over an image", (
         spec.Option("-i", "image", spec.Kind.IMAGE, "the image to sleep over", required=True,
                     must_exist=True),
@@ -113,18 +109,16 @@ def image_registry_program() -> object:
 
 
 def map_registry_program() -> object:
-    """``slow.sh -m MAP [--seconds S] [-d DIR]`` as a ``commands.spec.Program``: one mode that takes
-    a map and writes ``note.md`` into ``-d`` (never inference)."""
+    """``slow.sh -m MAP [--seconds S]`` as a ``commands.spec.Program``: one mode that takes a map,
+    reads it only and answers a JSON line on stdout (never inference)."""
     from oh_my_slam.commands import spec
 
-    folder = spec.When("folder")
     mode = spec.Mode(None, None, (), "never", "needs nothing", (Stage.SETUP,), (
-        spec.Output(NOTE, "-d", "markdown", "a note on the nap", (folder,)),))
+        spec.Output("result", "stdout", "json", "what slow.sh says it did over the map"),))
     cmd = spec.Command("slow.sh", None, "sleep over a map", (
         spec.Option("-m", "map", spec.Kind.MAP, "the map to sleep over", required=True,
                     must_exist=True),
         spec.Option("--seconds", "seconds", spec.Kind.NUMBER, "how long", type=float),
-        spec.Option("-d", "folder", spec.Kind.FOLDER_OUT, "also write a note into this folder"),
     ), (mode,))
     return spec.Program("slow.sh", "sleep", (cmd,))
 

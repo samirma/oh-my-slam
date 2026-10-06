@@ -20,11 +20,3 @@ export function setQuery(changes) {
   const next = path + (s ? `?${s}` : '');
   if (next !== location.hash) history.replaceState(null, '', next);
 }
-
-// The page's selected object as ?sel=<id>: restored on load, kept current.
-export function urlSelection(selection) {
-  const v = queryParams().get('sel');
-  if (v !== null && v !== '') selection.set(v);
-  selection.join((id) => setQuery({ sel: id }));
-  return selection;
-}

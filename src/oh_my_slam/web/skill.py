@@ -638,12 +638,17 @@ def fixed_endpoints() -> list[Json]:
     health = {"status": "ok", "service": {
         "version": "<version>", "url": "http://0.0.0.0:52026/", "pid": 4321,
         "workspace": "oh-my-slam-data", "data": "/Users/<user>/oh-my-slam-data",
-        "started_at": CREATED, "requests": {"running": 1, "waiting": 0}},
+        "started_at": CREATED, "requests": {"running": 1, "waiting": 0},
+        "in_progress": [{"operation": "segment-image",
+                         "command": ["segment.sh", "-i=uploads/9f2c4e1a7b3d5f60/photo.jpg"],
+                         "state": "running", "arrived_at": CREATED + 2.0,
+                         "started_at": CREATED + 2.0}]},
         "inference": {"status": "down", "message": "<why>", "start_command": START_COMMAND}}
     return [
         endpoint("GET", "/api/health", "Read-only.",
-                 "The service (version, URL, workspace, and the requests `running` and `waiting` "
-                 "for their turn) and the inference server: `inference.status` is one of "
+                 "The service (version, URL, workspace, the requests `running` and `waiting` "
+                 "for their turn, and `in_progress`: each one's operation, command line, state "
+                 "and times, in arrival order) and the inference server: `inference.status` is one of "
                  f"{statuses()}; `start_command` is the command that starts it when it is not "
                  "`ready` (report it, never run it), and `health` its own health when it answers.",
                  'curl -sS "$BASE/api/health"', compact(health)),

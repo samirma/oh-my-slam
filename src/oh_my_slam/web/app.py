@@ -4,9 +4,7 @@ Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi`
 health, uploads (create and discard), the workspace's maps (as a list and one by one), and per
 operation ``POST /api/ops/<op>`` — which runs the command within the request and answers when it
 ends (``web.runner``) — and ``POST /api/ops/<op>/validate``. ``/`` is the web application
-(``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files,
-``/static/viewer/…`` the viewer's own modules and vendored libraries, and
-``/static/openlabel_json_schema.json`` the vendored scene schema.
+(``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files.
 
 An operation's answer is the command's: on success its stdout, byte for byte, in the result's media
 type, with the command's per-stage timings in a ``Server-Timing`` header (its own stage names, in
@@ -74,8 +72,6 @@ SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
 CLIENT_GONE = 499  # what an interrupted request is logged with (nobody reads it)
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
-VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
-SCHEMA_FILE = Path(str(resources.files("oh_my_slam.schema") / "openlabel_json_schema.json"))
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
                  ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
                  ".txt": "text/plain"}
@@ -225,12 +221,13 @@ class Service:
             return True
         return self.knows_host(parts.hostname.lower()) and parts.port == self.port
 
-    def health(self, requests: dict[str, int]) -> Json:
+    def health(self, requests: dict[str, int], in_progress: list[Json]) -> Json:
         return {
             "status": "ok",
             "service": {"version": __version__, "url": self.url, "pid": os.getpid(),
                         "workspace": self.workspace.root.name, "data": str(self.workspace.root),
-                        "started_at": self.started_at, "requests": requests},
+                        "started_at": self.started_at, "requests": requests,
+                        "in_progress": in_progress},
             "inference": self.inference_health(),
         }
 
@@ -330,14 +327,9 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
                             headers={"Cache-Control": "no-cache"})
 
     async def static(request: Request) -> Response:
-        """The web application's files; ``viewer/…`` the viewer's (its modules and vendored
-        libraries); ``openlabel_json_schema.json`` the scene schema."""
+        """The web application's files."""
         rel = request.path_params["path"]
-        if rel == SCHEMA_FILE.name:
-            return FileResponse(SCHEMA_FILE, media_type="application/json")
         root = WEB_STATIC
-        if rel.startswith("viewer/"):
-            root, rel = VIEWER_STATIC, rel.removeprefix("viewer/")
         try:
             target = (root / rel).resolve()
         except (ValueError, OSError):  # e.g. an embedded NUL byte
@@ -348,14 +340,15 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     async def health(request: Request) -> Response:
-        return JSONResponse(await run_in_threadpool(service.health, runner.counts()))
+        return JSONResponse(await run_in_threadpool(service.health, runner.counts(),
+                                                    runner.in_progress()))
 
     async def openapi_doc(request: Request) -> Response:
         return JSONResponse(openapi.document(service.ops))
 
     async def run_op(request: Request) -> Response:
         """Validate, wait for the request's turn, run the command, answer when it ends."""
-        ticket = runner.ticket()
+        ticket, arrived = runner.ticket(), time.time()
         op = op_of(request)
         params = await body_json(request)
         if runner.stopping:
@@ -367,7 +360,7 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             status, body = error_body(prep.problems)
             return JSONResponse(body, status)
         run = Run(ticket, op.program.prog, op.module, prep.argv, prep.inference, prep.writes,
-                  prep.uploads)
+                  prep.uploads, op.id, prep.command, arrived)
         try:
             runner.admit(run)
         except RunError as exc:

@@ -1,150 +1,59 @@
-// Image (http_server.md "Structure"): one image in, any command mode that takes a single image (the
-// operations with one `image` parameter, read from the API description). A drop zone with a
-// preview, the generated option form, then the job's live progress and, on success, its result
-// with the embedded viewer (asked with ?viewer=true where the operation offers it).
-import { el, clear, notice } from '../dom.js';
-import { upload, discardUpload } from '../api.js';
-import { store, blockedReason } from '../store.js';
+// Image (http_server.md "Structure"): one image in, any operation that takes a single image (the
+// operations with one `image` parameter and no map, read from the API description). A drop zone
+// with a preview, the generated option form, then the running request and, on success, the result
+// with its download. The operation is in the URL (#/image?op=<id>).
+import { el, notice } from '../dom.js';
+import { store } from '../store.js';
 import { OpForm } from '../form.js';
-import { renderJob } from '../jobview.js';
-import { consequence } from '../opcard.js';
+import { runPanel } from '../runpanel.js';
 import { setQuery } from '../url.js';
 
-// The image input as a drop zone with a preview; the form's field for the image parameter.
-class DropImage {
-  constructor(p, onChange) {
-    this.p = p;
-    this.onChange = onChange;
-    this.item = null;
-    const accept = (p.accepts || []).join(',');
-    this.input = el('input', { type: 'file', id: 'image-file', accept: accept || null, hidden: true, 'aria-label': 'Image file' });
-    this.input.addEventListener('change', () => { if (this.input.files[0]) this.take(this.input.files[0]); this.input.value = ''; });
-    this.button = el('button', { type: 'button', class: 'primary', 'aria-describedby': 'image-help image-err' }, 'Choose an image…');
-    this.button.addEventListener('click', () => this.input.click());
-    this.preview = el('img', { class: 'preview', alt: '', hidden: true });
-    this.status = el('p', { class: 'file-state', 'aria-live': 'polite' });
-    this.err = el('div', { class: 'field-error', id: 'image-err', 'aria-live': 'polite' });
-    this.zone = el('div', { class: 'dropzone big', 'data-testid': 'dropzone' },
-      el('p', {}, 'Drop an image here, or'), this.button, this.input,
-      this.helpEl = el('p', { class: 'help', id: 'image-help' }),
-      this.preview, this.status);
-    for (const t of ['dragenter', 'dragover']) this.zone.addEventListener(t, (e) => { e.preventDefault(); this.zone.classList.add('over'); });
-    for (const t of ['dragleave', 'drop']) this.zone.addEventListener(t, () => this.zone.classList.remove('over'));
-    this.zone.addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) this.take(f); });
-    this.el = el('div', { class: 'field', 'data-param': p.name }, this.zone, this.err);
-  }
+function stem(name) { return String(name || '').split('/').pop().replace(/\.[^.]+$/, ''); }
 
-  // the image parameter of the chosen mode: its accepted types and help
-  setParam(p) {
-    this.p = p;
-    const accept = (p.accepts || []).join(',');
-    if (accept) this.input.setAttribute('accept', accept); else this.input.removeAttribute('accept');
-    this.helpEl.replaceChildren(el('code', {}, p.flag), ` ${p.help}.${accept ? ` Accepted: ${(p.accepts || []).join(' ')}` : ''}`);
-  }
-
-  take(file) {
-    this.discard();
-    const it = { name: file.name, state: 'uploading', progress: 0 };
-    this.item = it;
-    this.preview.src = URL.createObjectURL(file);
-    this.preview.alt = `Preview of ${file.name}`;
-    this.preview.hidden = false;
-    this.status.textContent = `${file.name}: uploading…`;
-    this.onChange();
-    upload(file, (x) => { if (this.item === it) this.status.textContent = `${file.name}: uploading ${Math.round(x * 100)} %`; })
-      .then((u) => {
-        it.upload = u;
-        if (this.item !== it) { discardUpload(u.id); return; }
-        it.state = 'ready';
-        this.status.textContent = `${file.name}: uploaded`;
-      })
-      .catch((err) => { it.state = 'failed'; this.status.textContent = `${file.name}: the upload failed: ${err.message}`; })
-      .finally(() => this.onChange());
-  }
-
-  discard() { if (this.item?.upload && !this.item.consumed) discardUpload(this.item.upload.id); this.item = null; }
-  value() { return this.item?.state === 'ready' ? this.item.upload.path : undefined; }
-  pending() { return this.item?.state === 'uploading'; }
-  names() { return this.item ? [this.item.name] : []; }
-  consumed() { if (this.item) this.item.consumed = true; }
-  destroy() { this.discard(); }
-  setError(msgs) {
-    const on = !!(msgs && msgs.length);
-    this.err.textContent = on ? msgs.join(' ') : '';
-    this.el.classList.toggle('invalid', on);
-    if (on) this.button.setAttribute('aria-invalid', 'true'); else this.button.removeAttribute('aria-invalid');
-  }
-}
-
-export function imagePage(main, { job, op: wanted }) {
+export function imagePage(main, { op: wanted }) {
   const ops = [...store.ops.values()].filter((o) => o.singleImage);
   let op = ops.find((o) => o.id === wanted) || ops[0];
-  main.append(el('h1', {}, 'Image'));
-  if (!op) { main.append(notice('info', 'No command takes a single image.')); return null; }
-  const choices = el('fieldset', { class: 'modes' }, el('legend', {}, 'Command'),
+  main.append(el('h1', {}, 'Image'),
+    el('p', { class: 'lead' }, 'One image in: choose what to run on it. The result is the command\'s own output, shown here and downloadable.'));
+  if (!op) { main.append(notice('info', 'No operation of this service takes a single image.')); return null; }
+  const choices = el('fieldset', { class: 'modes', 'data-testid': 'operations' }, el('legend', {}, 'Operation'),
     ...ops.map((o) => {
-      const id = `mode-${o.id}`;
-      const r = el('input', { type: 'radio', name: 'mode', id, value: o.id });
+      const id = `op-${o.id}`;
+      const r = el('input', { type: 'radio', name: 'op', id, value: o.id, 'aria-describedby': `${id}-desc` });
       r.checked = o === op;
       r.addEventListener('change', () => { if (r.checked) choose(o); });
-      return el('div', { class: 'mode' }, r, el('label', { for: id }, el('strong', {}, o.label), el('span', { class: 'muted' }, ` ${o.description}`)));
+      return el('div', { class: 'mode' }, r, el('label', { for: id }, el('code', {}, o.label)),
+        el('span', { class: 'muted', id: `${id}-desc` }, ` ${o.description} · ${o.x.inference_text}`));
     }));
-  const formBox = el('div', { class: 'form-box' });
-  const blocked = el('div', { 'aria-live': 'polite' });
-  const what = el('p', { class: 'consequence' });
-  const submit = el('button', { type: 'submit', class: 'primary' }, 'Run');
-  const submitErr = el('div', { 'aria-live': 'assertive' });
+  const imageBox = el('section', { class: 'step', 'aria-labelledby': 'image-h' }, el('h2', { id: 'image-h' }, 'Image'));
+  const optionsBox = el('section', { class: 'step', 'aria-labelledby': 'options-h' }, el('h2', { id: 'options-h' }, 'Options'));
+  const runBox = el('div', {});
+  main.append(choices, imageBox, optionsBox, runBox);
   let form = null;
-  const drop = new DropImage(op.singleImage, () => form?.changed());
-  const formEl = el('form', { class: 'image-form', novalidate: true, 'aria-label': 'Image job' },
-    choices, el('h2', {}, 'Image'), drop.el, el('h2', {}, 'Options'), formBox, blocked, what,
-    el('div', { class: 'actions' }, submit), submitErr);
-  const jobBox = el('div', { class: 'job-box' });
-  main.append(formEl, jobBox);
-
-  function refreshBlocked() {
-    const why = blockedReason(op);
-    submit.disabled = !!why;
-    blocked.replaceChildren(...(why ? [notice('warn', why)] : []));
-  }
+  let panel = null;
 
   function choose(o) {
+    const previous = form?.field(op.singleImage.name);
+    const kept = previous ? previous.release() : [];
+    form?.destroy();
+    panel?.dispose();
     op = o;
-    drop.setParam(o.singleImage);
-    form?.root.remove();
-    form = new OpForm(formBox, o, { omit: [o.singleImage.name], external: { [o.singleImage.name]: drop }, viewer: o.viewerQuery });
-    what.textContent = consequence(o) + (o.viewerQuery ? ' It also prepares the viewer of this image.' : '');
-    submit.textContent = `Run ${o.label}`;
+    imageBox.querySelector('.field')?.remove();
+    optionsBox.replaceChildren(optionsBox.firstChild);
+    form = new OpForm(optionsBox, o, { files: { [o.singleImage.name]: { big: true, preview: true } } });
+    const image = form.field(o.singleImage.name);
+    imageBox.append(image.el);
+    image.adopt(kept);
+    const otherFields = form.fields.filter((f) => f !== image);
+    if (!otherFields.length) optionsBox.insertBefore(el('p', { class: 'muted' }, 'No other option.'), form.root);
+    panel = runPanel({
+      op: o, form, label: `Run ${o.label}`,
+      downloadName: (fmt) => `${o.id}-${stem(image.names()[0]) || 'result'}${fmt ? `.${fmt}` : ''}`,
+    });
+    runBox.replaceChildren(panel.el);
     setQuery({ op: o.id });
-    refreshBlocked();
-    if (drop.value()) form.changed();
+    form.changed();
   }
   choose(op);
-
-  formEl.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    submitErr.replaceChildren();
-    if (!drop.item) { drop.setError(['Choose an image first.']); drop.button.focus(); return; }
-    submit.disabled = true;
-    submit.textContent = 'Submitting…';
-    try {
-      const j = await form.submit();
-      store.jobs.set(j.id, j);
-      location.hash = `#/image/${j.id}?op=${op.id}`;
-    } catch (err) {
-      submitErr.replaceChildren(notice('error', err.message));
-      form.focusFirstError();
-    } finally {
-      submit.textContent = `Run ${op.label}`;
-      refreshBlocked();
-    }
-  });
-
-  const offHealth = store.on((w) => { if (w === 'health') refreshBlocked(); });
-  let stopJob = null;
-  if (job) {
-    jobBox.append(el('h2', {}, 'Job'));
-    stopJob = renderJob(jobBox, job, { heading: 'h3' });
-  }
-  return () => { offHealth(); stopJob?.(); form?.destroy(); drop.destroy(); };
+  return () => { panel?.dispose(); form?.destroy(); };
 }

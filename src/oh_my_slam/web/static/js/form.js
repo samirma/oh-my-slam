@@ -1,22 +1,33 @@
 // Forms generated from the API description (http_server.md "Web application", "Forms"): one field
 // per parameter of an operation, from its registry entry (`x-oms`: kind, flag, help, default,
 // choices, bounds, multiple/ordered, accepts, applies, the -p attributes). Nothing here names a
-// command or an option: a new option is a new field. Fields that do not apply to the current
-// choices (`applies`) are hidden and not sent; every change is checked by the command's own rules
-// (POST /api/ops/<op>/validate) and each message is shown next to the field it names
-// (`by_parameter`), before submission.
+// command or an option: a new option is a new field, and a kind this file does not know still gets
+// a text field. Fields that do not apply to the current choices (`applies`) are hidden and not
+// sent; every change is checked by the command's own rules (POST /api/ops/<op>/validate) and each
+// message is shown next to the field it names (`by_parameter`), before submission.
 import { el, clear, nextId, humanize, fmtBytes } from './dom.js';
-import { getJson, postJson, upload, discardUpload, ApiError, enc } from './api.js';
-import { store } from './store.js';
+import { getJson, postJson, upload, discardUpload, enc } from './api.js';
 
 const VALIDATE_DEBOUNCE_MS = 250;
 
 function suffix(name) { const m = /\.[^./\\]+$/.exec(name); return m ? m[0].toLowerCase() : ''; }
 
-function defaultText(p) {
+export function defaultText(p) {
   if (p.default === null || p.default === undefined || p.kind === 'attrs') return null;
   if (p.kind === 'flag') return p.default ? 'on' : 'off';
   return String(p.default);
+}
+
+// Whether one applicability condition (`applies` / an output's `when`) holds for `current(name)`
+// (a parameter's value, else its default) and `names(name)` (the files a path parameter holds).
+export function holds(w, current, names) {
+  if (w.in) return w.in.includes(current(w.option));
+  if (w.is === 'given') { const v = current(w.option); return v !== undefined && v !== null && v !== '' && v !== false; }
+  if (w.is === 'video') {
+    const n = names(w.option);  // the suffixes of a video come with the condition
+    return n.length === 1 && (w.suffixes || []).includes(suffix(n[0]));
+  }
+  return true;
 }
 
 // ------------------------------------------------------------------------------------------- fields
@@ -28,18 +39,19 @@ class Field {
     this.id = nextId(`f-${p.name}`);
     this.errId = `${this.id}-err`;
     this.helpId = `${this.id}-help`;
+    this.active = true;
     this.el = el('div', { class: 'field', 'data-param': p.name, 'data-kind': p.kind });
-    this.err = el('div', { class: 'field-error', id: this.errId, 'aria-live': 'polite' });
+    this.err = el('div', { class: 'field-error', id: this.errId, role: 'alert' });
   }
 
   labelText() { return humanize(this.p.name) + (this.p.required ? ' (required)' : ''); }
 
   help(extra = '') {
     const p = this.p;
-    const parts = [el('code', {}, p.flag), ` ${p.help}`];
-    if (p.applies_text) parts.push(` (${p.applies_text})`);
+    const parts = [el('code', { class: 'flag' }, p.flag), ` ${p.help}`];
+    if (p.applies_text && !p.help.includes(p.applies_text)) parts.push(` (${p.applies_text})`);
     const d = defaultText(p);
-    if (d !== null && !/\bdefault\b/i.test(p.help)) parts.push(el('span', { class: 'default' }, ` Default: ${d}.`));
+    if (d !== null && !/\(default/i.test(p.help)) parts.push(' ', el('span', { class: 'default' }, `Default: ${d}.`));
     if (extra) parts.push(` ${extra}`);
     return el('p', { class: 'help', id: this.helpId }, ...parts);
   }
@@ -48,8 +60,8 @@ class Field {
 
   // the API value; undefined: not given
   value() { return undefined; }
-  given() { const v = this.value(); return v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length); }
   pending() { return false; }
+  names() { return [].concat(this.value() ?? []).map(String); }
 
   setError(msgs) {
     const on = !!(msgs && msgs.length);
@@ -60,8 +72,10 @@ class Field {
     }
   }
 
-  controls() { return [...this.el.querySelectorAll('input, select, textarea')]; }
+  controls() { return [...this.el.querySelectorAll('input:not([type=file]), select, textarea, button.choose')]; }
   changed() { this.form.changed(this); }
+  consumed() {}
+  renew() {}
   destroy() {}
 }
 
@@ -76,28 +90,26 @@ class EnumField extends Field {
     this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.help(), this.err);
   }
 
-  value() { return this.input.value === '' ? undefined : this.input.value; }
-  set(v) { this.input.value = v; }
+  value() { return this.input.value === '' || this.input.value === this.p.default ? undefined : this.input.value; }
+  current() { return this.input.value === '' ? undefined : this.input.value; }
 }
 
 class NumberField extends Field {
   constructor(form, p) {
     super(form, p);
-    this.input = el('input', { type: 'number', id: this.id, step: 'any', inputmode: 'decimal',
-      min: p.minimum ?? (p.exclusive_minimum ?? null), placeholder: defaultText(p) ?? '',
-      'aria-describedby': this.describedBy(), required: p.required || null });
+    this.input = el('input', { type: 'text', id: this.id, inputmode: 'decimal', autocomplete: 'off',
+      spellcheck: 'false', placeholder: defaultText(p) ?? '', 'aria-describedby': this.describedBy(),
+      required: p.required || null });
     this.input.addEventListener('input', () => this.changed());
     this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.help(), this.err);
   }
 
   value() {
     const t = this.input.value.trim();
-    if (t === '') return this.input.validity.badInput ? 'not a number' : undefined;
+    if (t === '') return undefined;
     const x = Number(t);
-    return Number.isFinite(x) ? x : t;
+    return Number.isFinite(x) && /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t) ? x : t;
   }
-
-  set(v) { this.input.value = v; }
 }
 
 class FlagField extends Field {
@@ -111,48 +123,18 @@ class FlagField extends Field {
   }
 
   value() { return this.input.checked === !!this.p.default ? undefined : this.input.checked; }
-  set(v) { this.input.checked = !!v; }
 }
 
 class TextField extends Field {
-  constructor(form, p, placeholder = '') {
+  constructor(form, p) {
     super(form, p);
     this.input = el('input', { type: 'text', id: this.id, autocomplete: 'off', spellcheck: 'false',
-      placeholder: placeholder || defaultText(p) || '', 'aria-describedby': this.describedBy(),
-      required: p.required || null });
+      placeholder: defaultText(p) || '', 'aria-describedby': this.describedBy(), required: p.required || null });
     this.input.addEventListener('input', () => this.changed());
     this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.help(), this.err);
   }
 
   value() { const t = this.input.value.trim(); return t === '' ? undefined : t; }
-  set(v) { this.input.value = v ?? ''; }
-}
-
-// -o: a plain name in the job's folder; the service names the result after its format by default
-class FileOutField extends TextField {
-  constructor(form, p) {
-    super(form, p, 'result');
-    this.el.querySelector('.help').append(' The service keeps the result in the job\'s folder; leave empty for result.<format>.');
-  }
-}
-
-// -d: written only when asked; then a plain name in the job's folder
-class FolderOutField extends Field {
-  constructor(form, p) {
-    super(form, p);
-    const cbId = `${this.id}-on`;
-    this.on = el('input', { type: 'checkbox', id: cbId, 'aria-describedby': this.describedBy() });
-    this.input = el('input', { type: 'text', id: this.id, value: p.name, autocomplete: 'off',
-      spellcheck: 'false', 'aria-describedby': this.describedBy(), disabled: true });
-    this.on.addEventListener('change', () => { this.input.disabled = !this.on.checked; this.changed(); });
-    this.input.addEventListener('input', () => this.changed());
-    this.el.append(
-      el('div', { class: 'check' }, this.on, el('label', { for: cbId }, `Write ${humanize(p.name)}`)),
-      el('label', { for: this.id, class: 'sub' }, 'Folder name'), this.input, this.help(), this.err);
-  }
-
-  value() { return this.on.checked ? (this.input.value.trim() || undefined) : undefined; }
-  set(v) { this.on.checked = v != null; this.input.disabled = !this.on.checked; if (v != null) this.input.value = v; }
 }
 
 // -p: one control per point-cloud attribute of the mode (x-oms `attributes`), sent as key=value,…
@@ -168,17 +150,17 @@ class AttrsField extends Field {
       const s = a.schema || {};
       let input;
       if (s.type === 'enum') {
-        input = el('select', { id }, ...s.choices.map((c) => el('option', { value: c }, c + (c === a.default ? ' (default)' : ''))));
+        input = el('select', { id, 'aria-describedby': `${id}-help` },
+          ...s.choices.map((c) => el('option', { value: c }, c + (String(c) === String(a.default) ? ' (default)' : ''))));
         input.value = a.default;
-      } else if (s.type === 'integer' || s.type === 'number') {
-        input = el('input', { type: 'text', id, inputmode: 'decimal', placeholder: a.default, autocomplete: 'off' });
       } else {
-        input = el('input', { type: 'text', id, placeholder: a.default ?? '', autocomplete: 'off' });
+        input = el('input', { type: 'text', id, inputmode: s.type === 'integer' || s.type === 'number' ? 'decimal' : null,
+          placeholder: a.default ?? '', autocomplete: 'off', spellcheck: 'false', 'aria-describedby': `${id}-help` });
       }
       input.addEventListener(input.tagName === 'SELECT' ? 'change' : 'input', () => this.changed());
       this.inputs.set(a.key, { input, a });
-      fs.append(el('div', { class: 'attr' }, el('label', { for: id }, el('code', {}, a.key)), input,
-        el('span', { class: 'help' }, `${a.effect}. Default: ${a.default}.`)));
+      fs.append(el('div', { class: 'attr', 'data-attr': a.key }, el('label', { for: id }, el('code', {}, a.key)), input,
+        el('span', { class: 'help', id: `${id}-help` }, `${a.effect}. Default: ${a.default}.`)));
     }
     this.el.append(fs, this.help(), this.err);
   }
@@ -191,14 +173,6 @@ class AttrsField extends Field {
     }
     return parts.length ? parts.join(',') : undefined;
   }
-
-  set(v) {
-    for (const kv of String(v || '').split(',')) {
-      const [k, x] = kv.split('=');
-      const it = this.inputs.get(k);
-      if (it) it.input.value = x;
-    }
-  }
 }
 
 // A map of the workspace: one of the maps, or (for the mode that writes maps) a new name too
@@ -206,14 +180,16 @@ class MapField extends Field {
   constructor(form, p, writes) {
     super(form, p);
     this.writes = writes;
+    this.maps = [];
     if (writes) {
       const list = nextId('maps');
       this.input = el('input', { type: 'text', id: this.id, list, autocomplete: 'off', spellcheck: 'false',
-        'aria-describedby': this.describedBy(), required: p.required || null });
+        'aria-describedby': `${this.describedBy()} ${this.id}-note`, required: p.required || null });
       this.datalist = el('datalist', { id: list });
-      this.input.addEventListener('input', () => this.changed());
+      this.note = el('p', { class: 'help map-note', id: `${this.id}-note`, 'aria-live': 'polite' });
+      this.input.addEventListener('input', () => { this.drawNote(); this.changed(); });
       this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.datalist,
-        this.help('Pick an existing map to extend it, or type a new name to create one.'), this.err);
+        this.help('Type a new name to create a map, or an existing one to extend it.'), this.note, this.err);
     } else {
       this.input = el('select', { id: this.id, 'aria-describedby': this.describedBy() },
         el('option', { value: '' }, 'Loading maps…'));
@@ -224,47 +200,57 @@ class MapField extends Field {
   }
 
   async load() {
-    let maps = [];
-    try { maps = await getJson('/api/maps'); } catch { /* shown by validation */ }
-    const keep = this.input.value || this.wanted;
+    try { this.maps = await getJson('/api/maps'); } catch { this.maps = []; }
+    const keep = this.input.value;
     if (this.writes) {
-      this.datalist.replaceChildren(...maps.map((m) => el('option', { value: m.name })));
+      this.datalist.replaceChildren(...this.maps.map((m) => el('option', { value: m.name })));
+      this.drawNote();
     } else {
-      this.input.replaceChildren(el('option', { value: '' }, maps.length ? 'Choose a map' : 'No maps yet'),
-        ...maps.map((m) => el('option', { value: m.name }, m.name)));
+      this.input.replaceChildren(el('option', { value: '' }, this.maps.length ? 'Choose a map' : 'No maps yet'),
+        ...this.maps.map((m) => el('option', { value: m.name }, m.name)));
       if (keep) this.input.value = keep;
     }
   }
 
+  drawNote() {
+    const v = this.input.value.trim();
+    const known = this.maps.some((m) => m.name === v);
+    this.note.textContent = !v ? '' : known ? `Map ${v} exists: the inputs extend it.` : `A new map ${v} will be created.`;
+  }
+
   value() { const v = (this.input.value || '').trim(); return v === '' ? undefined : v; }
-  set(v) { this.wanted = v; this.input.value = v; }
 }
 
-// Path inputs: files uploaded from this computer, or paths inside the workspace. Several values
-// keep their order, which is visible and editable when the order matters (`ordered`).
+// Path inputs: files uploaded from this computer (at once, so they can be checked), or paths inside
+// the workspace. Several values keep their order, which is visible and editable when the order
+// matters (`ordered`). An upload is consumed by the one request it is given to: the chosen files are
+// kept in the page and uploaded again for the next request (`renew`).
 export class FilesField extends Field {
-  constructor(form, p, { label } = {}) {
+  constructor(form, p, { big = false, preview = false } = {}) {
     super(form, p);
     this.items = [];
     this.multiple = !!p.multiple;
     this.ordered = !!p.ordered;
+    this.previewOn = preview;
     const accept = (p.accepts || []).join(',');
-    this.file = el('input', { type: 'file', id: this.id, accept: accept || null, multiple: this.multiple || null,
-      hidden: true, 'aria-label': humanize(p.name) });
+    this.file = el('input', { type: 'file', id: `${this.id}-file`, accept: accept || null, multiple: this.multiple || null,
+      class: 'file-input', tabindex: '-1', 'aria-hidden': 'true' });
     this.file.addEventListener('change', () => { this.addFiles([...this.file.files]); this.file.value = ''; });
-    const choose = el('button', { type: 'button', class: 'secondary', 'aria-describedby': this.describedBy() },
-      this.multiple ? 'Choose files…' : 'Choose a file…');
-    choose.addEventListener('click', () => this.file.click());
-    this.choose = choose;
-    this.drop = el('div', { class: 'dropzone', 'data-drop': p.name },
-      el('p', {}, this.multiple ? 'Drop files here, or ' : 'Drop a file here, or '), choose, this.file,
-      accept ? el('p', { class: 'help' }, `Accepted: ${(p.accepts || []).join(' ')}`) : '');
+    this.choose = el('button', { type: 'button', class: `choose ${big ? 'primary' : 'secondary'}`, id: this.id,
+      'aria-describedby': this.describedBy() },
+    this.multiple ? 'Choose files…' : 'Choose a file…');
+    this.choose.addEventListener('click', () => this.file.click());
+    this.preview = el('img', { class: 'preview', alt: '', hidden: true, 'data-testid': 'preview' });
+    this.drop = el('div', { class: `dropzone${big ? ' big' : ''}`, 'data-drop': p.name, 'data-testid': 'dropzone' },
+      el('p', {}, this.multiple ? 'Drop files here, or ' : 'Drop a file here, or '), this.choose, this.file,
+      accept ? el('p', { class: 'help' }, `Accepted: ${(p.accepts || []).join(' ')}`) : null,
+      preview ? this.preview : null);
     for (const t of ['dragenter', 'dragover']) this.drop.addEventListener(t, (e) => { e.preventDefault(); this.drop.classList.add('over'); });
     for (const t of ['dragleave', 'drop']) this.drop.addEventListener(t, () => this.drop.classList.remove('over'));
     this.drop.addEventListener('drop', (e) => { e.preventDefault(); this.addFiles([...e.dataTransfer.files]); });
     const pathId = `${this.id}-path`;
     this.path = el('input', { type: 'text', id: pathId, autocomplete: 'off', spellcheck: 'false',
-      placeholder: this.multiple ? 'e.g. inputs/a.jpg' : 'e.g. inputs/photo.jpg' });
+      placeholder: 'e.g. inputs/photo.jpg' });
     const addPath = el('button', { type: 'button', class: 'secondary' }, 'Add path');
     const add = () => {
       const v = this.path.value.trim();
@@ -276,47 +262,56 @@ export class FilesField extends Field {
     };
     addPath.addEventListener('click', add);
     this.path.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
-    this.list = el(this.ordered ? 'ol' : 'ul', { class: 'files', 'aria-label': `${humanize(p.name)}${this.ordered ? ' in order' : ''}` });
-    this.el.append(
-      el('div', { class: 'label', id: `${this.id}-label` }, label || this.labelText()),
+    this.list = el(this.ordered ? 'ol' : 'ul', { class: 'files', 'aria-label': `${humanize(p.name)}${this.ordered ? ', in the order they are used' : ''}` });
+    this.sort = el('button', { type: 'button', class: 'secondary small', hidden: true }, 'Sort by name');
+    this.sort.addEventListener('click', () => {
+      this.items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      this.render(); this.changed();
+    });
+    this.el.append(el('fieldset', { class: 'files-group', 'aria-describedby': this.describedBy() },
+      el('legend', {}, this.labelText()),
       this.drop,
       el('div', { class: 'path-row' }, el('label', { for: pathId, class: 'sub' }, 'or a path in the workspace'), this.path, addPath),
-      this.ordered ? el('p', { class: 'help order-note' }, 'The inputs are used in this order, first to last; reorder them with the arrows.') : '',
-      this.list, this.help(), this.err);
-  }
-
-  // Files expected again (a re-submission): listed in their order, each filled in place by the
-  // file of the same name, so the order stays the previous one. An entry {path} is a workspace
-  // path, still there: kept in its place, never asked for.
-  expect(entries) {
-    this.removeAll();
-    this.items = entries.map((e) => (typeof e === 'string' ? { name: e, state: 'needed' }
-      : { name: e.path, path: e.path, state: 'path' }));
-    this.render();
+      this.ordered ? el('p', { class: 'help order-note' }, 'Used in this order, first to last (the latest observation wins). Reorder with the arrow buttons.') : null,
+      this.list, this.ordered ? this.sort : null, this.help(), this.err));
   }
 
   addFiles(files) {
     if (!files.length) return;
-    const needed = (f) => this.items.find((x) => x.state === 'needed' && x.name === f.name);
-    if (!this.multiple && !needed(files[0])) { this.removeAll(); files = files.slice(0, 1); }
+    if (!this.multiple) { this.removeAll(); files = files.slice(0, 1); }
     for (const f of files) {
-      let it = needed(f);
-      if (it) Object.assign(it, { file: f, size: f.size, state: 'uploading', progress: 0 });
-      else { it = { name: f.name, file: f, size: f.size, state: 'uploading', progress: 0 }; this.items.push(it); }
-      it.promise = upload(f, (x) => { it.progress = x; this.renderItem(it); })
-        .then((u) => { it.upload = u; it.path = u.path; it.state = 'ready'; })
-        .catch((err) => { it.state = 'failed'; it.error = err.message; })
-        .finally(() => { this.render(); this.changed(); });
+      const it = { name: f.name, file: f, size: f.size };
+      this.items.push(it);
+      this.send(it);
+    }
+    if (this.previewOn && files[0] && /^image\//.test(files[0].type || '')) {
+      if (this.preview.src) URL.revokeObjectURL(this.preview.src);
+      this.preview.src = URL.createObjectURL(files[0]);
+      this.preview.alt = `Preview of ${files[0].name}`;
+      this.preview.hidden = false;
     }
     this.render(); this.changed();
-    this.form.emit('files', this, files);
+  }
+
+  // upload a chosen file (its field is `it.owner`, which changes when another form adopts it)
+  send(it) {
+    Object.assign(it, { owner: this, state: 'uploading', progress: 0, upload: null, path: null, consumed: false, error: null });
+    const req = upload(it.file, (x) => { it.progress = x; it.owner.renderItem(it); });
+    it.request = req;
+    it.promise = req.then((u) => {
+      if (!it.owner.items.includes(it)) { discardUpload(u.id); return; }
+      it.upload = u; it.path = u.path; it.state = 'ready';
+    }).catch((err) => { it.state = 'failed'; it.error = err.message; })
+      .finally(() => { it.request = null; it.owner.render(); it.owner.changed(); });
   }
 
   removeAll() { for (const it of [...this.items]) this.remove(it, false); }
 
   remove(it, notify = true) {
+    it.request?.abort();
     if (it.upload && !it.consumed) discardUpload(it.upload.id);
     this.items = this.items.filter((x) => x !== it);
+    if (!this.items.some((x) => x.file) && this.previewOn) { this.preview.hidden = true; this.preview.removeAttribute('src'); }
     if (notify) { this.render(); this.changed(); }
   }
 
@@ -326,21 +321,20 @@ export class FilesField extends Field {
     if (j < 0 || j >= this.items.length) return;
     [this.items[i], this.items[j]] = [this.items[j], this.items[i]];
     this.render(); this.changed();
-    this.list.children[j]?.querySelector(d < 0 ? '.up' : '.down')?.focus();
-  }
-
-  renderItem(it) {
-    if (!it.row) return;
-    const st = it.row.querySelector('.file-state');
-    if (st) st.textContent = this.stateText(it);
+    const row = this.list.children[j];
+    (row?.querySelector(d < 0 ? '.up' : '.down:not([disabled])') || row?.querySelector('.up:not([disabled]), .down:not([disabled])'))?.focus();
   }
 
   stateText(it) {
-    if (it.state === 'uploading') return `uploading ${Math.round(it.progress * 100)} %`;
+    if (it.state === 'uploading') return `uploading ${Math.round((it.progress || 0) * 100)} %`;
     if (it.state === 'failed') return `upload failed: ${it.error}`;
     if (it.state === 'path') return 'workspace path';
-    if (it.state === 'needed') return 'choose this file again';
     return `uploaded${it.size != null ? `, ${fmtBytes(it.size)}` : ''}`;
+  }
+
+  renderItem(it) {
+    const st = it.row?.querySelector('.file-state');
+    if (st) st.textContent = this.stateText(it);
   }
 
   render() {
@@ -362,12 +356,13 @@ export class FilesField extends Field {
       it.row = row;
       this.list.append(row);
     });
+    this.sort.hidden = !(this.ordered && this.items.length > 1);
   }
 
   pending() { return this.items.some((it) => it.state === 'uploading'); }
-  missing() { return this.items.filter((it) => it.state === 'needed').map((it) => it.name); }
   settled() { return Promise.all(this.items.map((it) => it.promise).filter(Boolean)); }
   names() { return this.items.map((it) => it.name); }
+  failed() { return this.items.filter((it) => it.state === 'failed'); }
 
   value() {
     const paths = this.items.filter((it) => it.path).map((it) => it.path);
@@ -375,106 +370,117 @@ export class FilesField extends Field {
     return this.multiple ? paths : paths[0];
   }
 
-  set(v) {
-    this.removeAll();
-    for (const x of [].concat(v ?? [])) this.items.push({ name: x, path: x, state: 'path' });
-    this.render();
+  // the request consumed the uploads (the service deletes them when it ends)
+  consumed() { for (const it of this.items) if (it.upload) it.consumed = true; }
+  // upload the consumed files again, for the next request
+  renew() {
+    let any = false;
+    for (const it of this.items) if (it.consumed && it.file) { this.send(it); any = true; }
+    if (any) { this.render(); this.form.changed(); }
   }
-
-  // the job consumed the uploads (they are deleted when it ends): never discard them from here
-  consumed() { for (const it of this.items) it.consumed = true; }
-  destroy() { for (const it of this.items) if (it.upload && !it.consumed) discardUpload(it.upload.id); }
+  clearAll() { this.removeAll(); this.render(); this.form.changed(); }
+  // hand the chosen files to another field of the same parameter (another operation's form)
+  release() { const items = this.items; this.items = []; return items; }
+  adopt(items) {
+    const keep = this.multiple ? items : items.slice(0, 1);
+    for (const it of items) if (!keep.includes(it) && it.upload && !it.consumed) discardUpload(it.upload.id);
+    this.items = keep;
+    const first = keep.find((it) => it.file);
+    if (this.previewOn && first && /^image\//.test(first.file.type || '')) {
+      this.preview.src = URL.createObjectURL(first.file);
+      this.preview.alt = `Preview of ${first.name}`;
+      this.preview.hidden = false;
+    }
+    for (const it of keep) it.owner = this;
+    this.render();
+    this.renew();
+  }
+  destroy() {
+    for (const it of this.items) { it.request?.abort(); if (it.upload && !it.consumed) discardUpload(it.upload.id); }
+    if (this.preview.src) URL.revokeObjectURL(this.preview.src);
+  }
 }
 
-function makeField(form, p, op) {
+function makeField(form, p, op, options) {
   switch (p.kind) {
     case 'enum': return new EnumField(form, p);
     case 'number': return new NumberField(form, p);
     case 'flag': return new FlagField(form, p);
     case 'attrs': return new AttrsField(form, p);
     case 'map': return new MapField(form, p, op.writesMap === p);
-    case 'file_out': return new FileOutField(form, p);
-    case 'folder_out': return new FolderOutField(form, p);
-    case 'image': case 'images': case 'images_or_video': return new FilesField(form, p);
+    case 'image': case 'images': case 'images_or_video':
+      return new FilesField(form, p, options.files?.[p.name] || {});
     default: return new TextField(form, p);  // a kind this page does not know yet still gets a field
   }
 }
 
 // ---------------------------------------------------------------------------------------- the form
 
-// A form for `op`. `fixed`: values set by the page (not rendered); `omit`: parameters the page
-// renders itself (`external` fields, e.g. the Image page's drop zone); `viewer`: the submission asks
-// for the viewer (?viewer=true).
+// A form for `op` into `container`. `fixed`: values set by the page (not rendered); `files`:
+// options of a path field by parameter name ({big, preview}).
 export class OpForm {
-  constructor(container, op, { fixed = {}, omit = [], external = {}, viewer = false, only = null } = {}) {
+  constructor(container, op, { fixed = {}, files = {} } = {}) {
     this.op = op;
     this.fixed = { ...fixed };
-    this.viewer = viewer;
     this.fields = [];
-    this.external = external;
     this._listeners = new Map();
     this.seq = 0;
     this.lastResult = null;
-    this.general = el('div', { class: 'form-problems', 'aria-live': 'polite' });
-    this.command = el('p', { class: 'command' });
+    this.touched = new Set();  // the fields the user changed: only their messages show, until a run
+    this.reveal = false;  // a run was asked for: every message shows
+    this.general = el('div', { class: 'form-problems' });
+    this.command = el('code', { class: 'command', 'data-testid': 'command' });
     this.root = el('div', { class: 'op-form', 'data-op': op.id });
     for (const p of op.params) {
-      if (p.name in this.fixed || omit.includes(p.name)) continue;
-      if (only && !only.includes(p.name)) continue;
-      const f = makeField(this, p, op);
+      if (p.name in this.fixed) continue;
+      const f = makeField(this, p, op, { files });
       this.fields.push(f);
       this.root.append(f.el);
     }
-    this.root.append(this.general, el('div', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), this.command));
+    this.commandRow = el('p', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), this.command);
+    this.root.append(this.general, this.commandRow);
     container.append(this.root);
     this.applyApplies();
+    this.command.textContent = '(complete the required fields)';
   }
 
   on(what, cb) { if (!this._listeners.has(what)) this._listeners.set(what, new Set()); this._listeners.get(what).add(cb); }
   emit(what, ...args) { for (const cb of this._listeners.get(what) || []) cb(...args); }
 
-  field(name) { return this.fields.find((f) => f.p.name === name) || this.external[name] || null; }
+  field(name) { return this.fields.find((f) => f.p.name === name) || null; }
 
   // the current value of a parameter for `applies`: its value, else its default
   current(name) {
     if (name in this.fixed) return this.fixed[name];
     const f = this.field(name);
-    const v = f ? f.value() : undefined;
+    const v = f ? (f.current ? f.current() : f.value()) : undefined;
     if (v !== undefined) return v;
     return this.op.param(name)?.default ?? undefined;
   }
 
-  // the names of the files a path parameter holds (to tell a video by its suffix)
   names(name) {
     const f = this.field(name);
-    if (f && f.names) return f.names();
-    return [].concat(this.current(name) ?? []);
+    return f ? f.names() : [].concat(this.current(name) ?? []).map(String);
   }
 
-  applies(p) {
-    if (!p.applies || !p.applies.length) return true;
-    return p.applies.some((w) => {
-      if (w.in) return w.in.includes(this.current(w.option));
-      if (w.is === 'given') { const v = this.current(w.option); return v !== undefined && v !== null && v !== '' && v !== false; }
-      if (w.is === 'video') {
-        const names = this.names(w.option);  // the suffixes of a video come with the condition
-        return names.length === 1 && (w.suffixes || []).includes(suffix(names[0]));
-      }
-      return true;
-    });
+  holdsAny(conditions) {
+    if (!conditions || !conditions.length) return true;
+    return conditions.some((w) => holds(w, (n) => this.current(n), (n) => this.names(n)));
   }
 
   applyApplies() {
     for (const f of this.fields) {
-      const on = this.applies(f.p);
+      const on = this.holdsAny(f.p.applies);
       f.el.hidden = !on;
       f.active = on;
     }
   }
 
+  // the output the response will carry for the current values (its format names the download)
+  result() { return this.op.results.find((o) => this.holdsAny(o.when)) || this.op.results[0] || null; }
+
   values() {
     const out = { ...this.fixed };
-    for (const [name, f] of Object.entries(this.external)) { const v = f.value(); if (v !== undefined) out[name] = v; }
     for (const f of this.fields) {
       if (!f.active) continue;
       const v = f.value();
@@ -483,62 +489,71 @@ export class OpForm {
     return out;
   }
 
-  pending() { return this.fields.some((f) => f.pending()) || Object.values(this.external).some((f) => f.pending()); }
+  pending() { return this.fields.some((f) => f.pending()); }
+  failedUploads() { return this.fields.flatMap((f) => (f.failed ? f.failed() : [])); }
 
-  setFixed(name, v) { if (v === undefined) delete this.fixed[name]; else this.fixed[name] = v; this.changed(); }
-
-  changed() {
+  changed(field) {
+    if (field) this.touched.add(field.p.name);
     this.applyApplies();
     this.emit('change');
     clearTimeout(this._t);
     this._t = setTimeout(() => this.validate(), VALIDATE_DEBOUNCE_MS);
   }
 
-  query() { return this.viewer ? '?viewer=true' : ''; }
-
-  // the command's own checks, without queuing anything; messages go next to their fields
+  // the command's own checks, without running anything; messages go next to their fields
   async validate() {
+    clearTimeout(this._t);
     const seq = ++this.seq;
     let r;
     try {
-      r = await postJson(`/api/ops/${enc(this.op.id)}/validate${this.query()}`, this.values());
+      r = await postJson(`/api/ops/${enc(this.op.id)}/validate`, this.values());
     } catch (err) {
       r = { valid: false, problems: [{ message: err.message, parameters: [] }], by_parameter: {}, command: [] };
     }
     if (seq !== this.seq) return this.lastResult;
     this.lastResult = r;
     this.show(r.by_parameter || {}, r.problems || []);
-    this.command.textContent = (r.command || []).join(' ');
+    this.command.textContent = (r.command || []).join(' ') || '(complete the required fields)';
     this.emit('validated', r);
     return r;
   }
 
   show(byParameter, problems) {
     const shown = new Set();
-    for (const f of [...this.fields, ...Object.values(this.external)]) {
+    const quiet = new Set();  // fields the user has not changed yet: no message before a run
+    for (const f of this.fields) {
       const msgs = byParameter[f.p.name];
-      f.setError(f.el.hidden ? null : msgs);
-      if (msgs && !f.el.hidden) shown.add(f.p.name);
+      const on = !f.el.hidden && (this.reveal || this.touched.has(f.p.name));
+      f.setError(on ? msgs : null);
+      if (msgs && on) shown.add(f.p.name);
+      else if (msgs && !f.el.hidden) quiet.add(f.p.name);
     }
-    // by_parameter files a problem under the first parameter it concerns; the others go on top
-    const rest = problems.filter((p) => !shown.has((p.parameters || [])[0]));
+    // by_parameter files a problem under the first parameter it concerns; the others go here
+    const rest = problems.filter((p) => !shown.has((p.parameters || [])[0]) && !quiet.has((p.parameters || [])[0]));
     clear(this.general);
     for (const p of rest) this.general.append(el('p', { class: 'problem', role: 'alert' }, p.message));
   }
 
-  // Submit as a job: resolves to the job, or throws ApiError (its messages shown on the fields)
-  async submit() {
-    if (this.pending()) throw new ApiError(0, { error: { message: 'wait for the uploads to finish' } });
-    try {
-      const job = await postJson(`/api/ops/${enc(this.op.id)}${this.query()}`, this.values());
-      for (const f of [...this.fields, ...Object.values(this.external)]) f.consumed?.();
-      return job;
-    } catch (err) {
-      if (err instanceof ApiError) this.show(err.byParameter, err.problems.length ? err.problems : [{ message: err.message, parameters: [] }]);
-      throw err;
+  // Ready to run: the uploads finished and the command's checks pass. Resolves to the validation
+  // ({valid, command, inference, problems}); the messages are on the fields.
+  async check() {
+    this.reveal = true;
+    await Promise.all(this.fields.map((f) => f.settled?.()));
+    const failed = this.failedUploads();
+    if (failed.length) {
+      return { valid: false, problems: failed.map((it) => ({ message: `${it.name}: ${it.error}. Remove it and choose it again.`, parameters: [] })) };
     }
+    return this.validate();
   }
 
-  focusFirstError() { this.root.querySelector('[aria-invalid="true"]')?.focus(); }
-  destroy() { for (const f of [...this.fields, ...Object.values(this.external)]) f.destroy(); }
+  focusFirstError() {
+    const bad = this.root.querySelector('[aria-invalid="true"]') || this.general.querySelector('.problem');
+    if (bad) { if (!bad.matches('input, select, button, textarea')) bad.tabIndex = -1; bad.focus(); }
+  }
+
+  // start afresh: no message until the user changes a field again or asks for a run
+  quiet() { this.reveal = false; this.touched.clear(); }
+  consumed() { for (const f of this.fields) f.consumed(); }
+  renew() { for (const f of this.fields) f.renew(); }
+  destroy() { clearTimeout(this._t); for (const f of this.fields) f.destroy(); }
 }
