@@ -215,9 +215,7 @@ def scene_cameras(scene: Json) -> list[Json]:
     sensor frame is itself a root coordinate system (a single image, whose scene is in its camera
     frame). ``T`` is camera-to-scene (4 x 4, row-major) and ``position`` its translation, the
     camera centre in the scene frame (metres); ``K`` is ``fx, fy, cx, cy`` of the stream's pinhole
-    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image;
-    ``located`` true for a frame ``mapper.sh locate`` marks as a located input image. The page's
-    ``cameras.js`` ``sceneCameras`` mirrors this for scene files opened in the browser."""
+    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image."""
     root = scene.get("openlabel", {})
     streams: Json = root.get("streams", {})
     systems: Json = root.get("coordinate_systems", {})
@@ -242,8 +240,6 @@ def scene_cameras(scene: Json) -> list[Json]:
                 "K": [m[0], m[5], m[2], m[6]], "size": [pin["width_px"], pin["height_px"]],
                 "update": props.get("update_id"),
                 "source": Path(str(stream.get("uri", ""))).name,
-                # a camera ``mapper.sh locate`` placed (not one of the map's own frames)
-                "located": props.get("located") is True,
             })
     return out
 

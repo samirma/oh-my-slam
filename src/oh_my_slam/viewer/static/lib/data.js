@@ -1,9 +1,7 @@
-// Where the viewer's data comes from: the routes of viewer/routes.py under a base URL. view.sh
-// serves them at "/"; a host page (the server.sh web application) mounts them under a prefix of its
-// own, e.g. new DataSource('/viewer/<id>/'). Every URL is resolved against that base, never
-// absolute, so the same page and modules work under any prefix.
+// Where the viewer's data comes from: the routes of viewer/routes.py, which view.sh serves, resolved
+// against the page's own URL.
 //
-// A cloud, as every drawing function takes it (from /api/cloud or from a PLY file, ply.js):
+// A cloud, as every drawing function takes it (from api/cloud):
 //   { header: { count, total, voxel, attrs }, arrays: { position, color?, label?, normal? } }
 // position Float32Array (x, y, z per point), color Uint8Array (sRGB), label Int32Array (object id,
 // 0 = unsegmented), normal Float32Array; `total` points were derived and `count` are shown, one per

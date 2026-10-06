@@ -6,8 +6,7 @@
 // label and OBB layers; live controls for the applicable point-cloud attributes, with the
 // display-budget notice; the position of every camera with a "Go to" that moves the viewpoint
 // there; and, for an image, the segmented image and the object catalogue. The drawing is the
-// reusable Viewer of lib/viewer.js; data comes through lib/data.js relative to the page's URL, so
-// the page also works mounted under another server's prefix.
+// Viewer of lib/viewer.js; data comes through lib/data.js relative to the page's URL.
 import { DataSource } from './lib/data.js';
 import { el } from './lib/dom.js';
 import { Viewer } from './lib/viewer.js';
@@ -33,7 +32,6 @@ const state = {
 };
 // for tests and debugging
 window.__viewer = state;
-window.__viewerApp = viewer;
 window.__viewerGroups = viewer.groups;
 window.__viewerCamera = viewer.camera;
 window.__viewerControls = viewer.controls;

@@ -312,30 +312,23 @@ the 8.9-million-point living-room map open, it draws no frames in 10 s, where it
 The page sets `<body data-rendered="true">` after its first frame with the cloud has rendered.
 The evaluator waits for this attribute.
 
-The viewer is built to be reused by another server:
+The viewer's code:
 
 * **Server side.** `viewer.routes.ViewerRoutes(bundle).handle(method, path, query)` answers every
   route (`/`, `/static/…`, `/api/meta`, `/api/scene`, `/api/catalog`, `/api/segmented.png`,
   `/api/cloud`) as a framework-neutral `Response(status, headers, body pieces)`. `view.sh`'s
-  stdlib server (`viewer/server.py`) is a thin adapter over it, and another server mounts the same
-  object under a prefix of its own. The page uses relative URLs only, so it works at `/` and under
-  any prefix ending in `/`.
+  stdlib server (`viewer/server.py`) is a thin adapter over it. The page uses relative URLs only.
 * **Browser side.** `static/app.js` is `view.sh`'s page. It composes ES modules in `static/lib/`:
-  * `data.js`: `DataSource(base)`, the routes under a base URL, and the cloud structure every
+  * `data.js`: `DataSource`, the routes relative to the page's URL, and the cloud structure every
     drawing function takes.
   * `viewer.js`: the `Viewer` class. It holds the renderer, the layers, on-demand drawing,
-    framing and *Go to*. Its `select(id)` / `onSelect(cb)` API highlights an object, so a host
-    page can highlight it in its other views. `view.sh` itself has no selection UI.
+    framing and *Go to*.
   * `cloud.js`: the points and segmentation materials.
   * `obbs.js`: objects and boxes from OpenLABEL cuboids.
-  * `cameras.js`: cameras from a scene document (`sceneCameras`, mirroring
-    `bundle.scene_cameras`, `located` frames included) or from a `mapper.sh locate` PLY header
-    (`plyCameras`), frustums, and the camera table. Located cameras are drawn dashed, in their own
-    colour, and labelled "located", so colour is never the only cue.
+  * `cameras.js`: the frustums of the cameras `/api/meta` lists (`bundle.scene_cameras`), and the
+    camera table.
   * `labels.js`: the non-overlapping label layout.
   * `layers.js` and `controls.js`: the layer and attribute controls, and the display-budget notice.
-  * `ply.js`: an in-browser PLY reader (ASCII and binary little-endian; x y z, normals, colour,
-    label; the header comments).
 
 ### `server.sh`
 

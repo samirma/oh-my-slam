@@ -1,4 +1,4 @@
-// Labels anchored at 3D points (spec §2.5 "labelled OBBs"; also the located cameras), kept
+// Labels anchored at 3D points (spec §2.5 "labelled OBBs"), kept
 // legible: no label ever covers another. Each item whose anchor is in view gets its tag next to the
 // anchor, or on a ring farther out, larger items on screen first. An item whose tag finds no free
 // place keeps no tag on screen and is returned as crowded (the page lists it, and it appears once

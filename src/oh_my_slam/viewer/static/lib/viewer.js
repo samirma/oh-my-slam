@@ -1,7 +1,6 @@
-// The 3D view (spec §2.5), independent of any page: put it in a host element, give it a cloud
-// (cloud.js), the objects of a scene (obbs.js) and cameras (cameras.js). It draws the point-cloud,
-// segmentation, camera, label and OBB layers, frames the scene, moves to a camera, and highlights a
-// selected object. view.sh's page (app.js) and the server.sh web application use it alike.
+// The 3D view of view.sh's page (spec §2.5): put it in a host element, give it a cloud (cloud.js),
+// the objects of a scene (obbs.js) and cameras (cameras.js). It draws the point-cloud,
+// segmentation, camera, label and OBB layers, frames the scene and moves to a camera.
 //
 // Frames are drawn on demand: an idle view draws nothing, so that a large cloud does not keep the
 // GPU busy next to the inference server. Whatever changes the canvas calls invalidate(); the loop
@@ -9,8 +8,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { buildCloud, robustBox } from './cloud.js';
-import { buildObb, inkFor, OBB_WIDTH_PX } from './obbs.js';
-import { buildFrustums, cameraView, LOCATED_COLOR } from './cameras.js';
+import { buildObb, inkFor } from './obbs.js';
+import { buildFrustums, cameraView } from './cameras.js';
 import { LabelLayer } from './labels.js';
 
 const BACKGROUND = '#15171c';
@@ -26,7 +25,6 @@ const HOME_CAMERA_REACH = 2;
 // A viewpoint change beyond VIEW_EPS (1 µm, 1 µrad: far below a pixel) moves the labels and draws.
 // Orbit damping's last creep stays below it, so a settled view stops drawing.
 const VIEW_EPS = 1e-6;
-const SELECTED_WIDTH_PX = 2.5 * OBB_WIDTH_PX;
 export const GROUPS = ['points', 'segments', 'cameras', 'obbs', 'labels'];
 
 function differs(a, b) {
@@ -45,10 +43,8 @@ export class Viewer {
     this.cloud = null;          // header of the cloud on screen
     this.bbox = new THREE.Box3();
     this.cloudBox = new THREE.Box3();
-    this.selected = null;
     this.frames = 0;            // frames drawn so far
     this.cloudDrawn = false;    // a frame showing a cloud has been drawn
-    this._selectListeners = new Set();
     this._crowdedListeners = new Set();
     this._redraw = 1;           // the first frame: the empty view's background
     this._labelsDirty = true;
@@ -184,27 +180,16 @@ export class Viewer {
       }));
       this.objects.push(o);
     }
-    this._applySelection();
     this._labelsDirty = true;
     this.invalidate();
   }
 
-  // The cameras' frustums (map frames solid, located cameras dashed, in their own colour and
-  // labelled "located" with their image name).
+  // The cameras' frustums.
   setCameras(cams) {
     this._clear(this.groups.cameras);
-    this.labels.remove('cameras');
     this.cameras = cams;
     const size = this.cloudBox.isEmpty() ? 1 : this.cloudBox.getSize(new THREE.Vector3()).length();
-    for (const lines of [...buildFrustums(cams, size).children]) this.groups.cameras.add(lines);  // frames, then located
-    const ink = inkFor([255, 176, 46]);
-    cams.forEach((f, i) => {
-      if (!f.located) return;
-      const c = new THREE.Vector3(f.T[0][3], f.T[1][3], f.T[2][3]).applyMatrix4(this.root.matrixWorld);
-      this.labels.add({ id: 1e9 + i, tag: 'located', name: f.source || f.name, background: LOCATED_COLOR,
-        ink, anchor: c, size: size * 0.05, title: `located camera ${f.name}`, note: `located ${f.source || f.name}`,
-        group: 'cameras' });
-    });
+    for (const lines of [...buildFrustums(cams, size).children]) this.groups.cameras.add(lines);
     this._updateBox();
     this._labelsDirty = true;
     this.invalidate();
@@ -224,29 +209,6 @@ export class Viewer {
     this.layers[key] = on;
     for (const k of GROUPS) this.groups[k].visible = this.layers[k];
     this._labelsDirty = true;
-    this.invalidate();
-  }
-
-  // ------------------------------------------------------------ selection (API only)
-  // select(id) highlights that object's box and label (null: none) and tells every onSelect
-  // listener, so that a host page can highlight it in its other views too.
-  select(id) {
-    const next = id == null ? null : Number(id);
-    if (next === this.selected) return;
-    this.selected = next;
-    this._applySelection();
-    for (const cb of this._selectListeners) cb(next);
-  }
-
-  onSelect(cb) { this._selectListeners.add(cb); return () => this._selectListeners.delete(cb); }
-
-  _applySelection() {
-    for (const o of this.objects) {
-      const on = o.id === this.selected;
-      o.line.material.linewidth = on ? SELECTED_WIDTH_PX : OBB_WIDTH_PX;
-      o.line.renderOrder = on ? 2 : 0;
-      o.div.classList.toggle('selected', on);
-    }
     this.invalidate();
   }
 

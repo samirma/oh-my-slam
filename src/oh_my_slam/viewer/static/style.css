@@ -85,7 +85,6 @@ input.switch:checked::after { left: 15px; }
 #cameras .cam-name small { display: block; color: var(--muted); font-size: 10px; overflow: hidden;
   text-overflow: ellipsis; }
 #cameras button.goto { padding: 2px 7px; font-size: 12px; }
-#cameras .cam-name small.located { color: #ffb02e; font-weight: 600; }
 #cam-note { margin: 0 0 6px; }
 #segmented { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border);
   border-radius: 4px; flex: none; }

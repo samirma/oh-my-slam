@@ -240,7 +240,6 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
     np.testing.assert_array_equal(cam["T"], np.eye(4))
     assert cam["position"] == [0.0, 0.0, 0.0] and cam["source"] == "x.jpg"
     assert cam["K"] == [500.0, 510.0, 320.0, 240.0] and cam["size"] == [640, 480]
-    assert cam["located"] is False
     # a map: one camera per frame, at the frame's camera-to-map transform
     poses = [Pose(rot_z(0.3 * k), np.array([k, 2.0 * k, 0.5])) for k in range(3)]
     frames = {str(k): ol.frame(float(k), stream_uris={"camera_0": f"f{k}.jpg"},

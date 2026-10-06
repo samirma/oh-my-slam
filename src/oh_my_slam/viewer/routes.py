@@ -1,10 +1,8 @@
 """The viewer's routes, independent of any HTTP framework: ``ViewerRoutes(bundle).handle(method,
 path, query)`` returns a :class:`Response`. ``view.sh`` serves them with the standard library
-(``viewer.server``); another server (the ``server.sh`` web application, which embeds this viewer)
-mounts the same object under a prefix of its own and passes the path below that prefix. The page
-uses relative URLs only, so it works at ``/`` and under any prefix that ends in ``/``.
+(``viewer.server``). The page uses relative URLs only.
 
-Routes (GET/HEAD only; anything else is 405), relative to the mount point:
+Routes (GET/HEAD only; anything else is 405):
 
 * ``/`` — the page; ``/static/…`` — its scripts, styles and vendored libraries.
 * ``/api/meta`` — JSON: mode, title, display transform, the cameras of the scene JSON (pose
