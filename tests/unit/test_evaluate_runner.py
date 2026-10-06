@@ -65,7 +65,9 @@ with timing.collect() as tm:
     with timing.stage("load"):
         time.sleep(0.5)
     with timing.stage("inference"):
-        a = np.ones(40_000_000)  # 320 MB, touched
+        # 320 MB, touched and incompressible: under memory pressure macOS compresses resident
+        # pages, and pages of ones would shrink the resident set this test measures
+        a = np.random.default_rng(0).random(40_000_000)
         time.sleep(0.8)
         del a
     with timing.stage("write"):
@@ -84,7 +86,8 @@ def test_per_stage_peak_memory_of_a_run(tmp_path: Path) -> None:
     assert rec.ok and rec.stages is not None
     assert list(rec.stages) == ["load", "inference", "write"]  # in the order they ran
     load, inference = rec.stages["load"], rec.stages["inference"]
-    assert inference["s"] == pytest.approx(0.8, abs=0.3)
+    assert rec.timings is not None  # the command's own stage times, whatever the load
+    assert inference["s"] == round(rec.timings["stages_s"]["inference"], 3) >= 0.8
     assert load["client_peak_mb"] and inference["client_peak_mb"]
     assert inference["client_peak_mb"] >= load["client_peak_mb"] + 250
     assert inference["client_peak_mb"] <= rec.client_peak_mb + 1

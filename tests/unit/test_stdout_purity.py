@@ -10,9 +10,10 @@ import json
 import os
 import shutil
 import subprocess
-import time
+import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -69,7 +70,37 @@ def assert_one_png(out: bytes) -> np.ndarray:
         return np.asarray(im)
 
 
+# The command's own failure path, timed in a process of its own once the interpreter has started
+# and loaded the command's module (that start-up is no part of failing fast, and under load it
+# alone can take seconds): from ``main(argv)`` to the error ``run_main`` turns into the exit status.
+FAILURE_PATH = r"""
+import importlib, json, sys, time
+from oh_my_slam.core.errors import OhMySlamError
+record, module, *argv = sys.argv[1:]
+main = importlib.import_module(module).main
+t0 = time.perf_counter()
+try:
+    code = main(argv)
+except OhMySlamError as exc:
+    code = int(exc.exit_code)
+with open(record, "w") as f:
+    json.dump({"code": code, "seconds": time.perf_counter() - t0}, f)
+"""
+FAIL_FAST_S = 2.0  # what failing fast means: no wait for the server (a health timeout, a retry)
+
+
+def failure_path(script: str, args: list[str], record: Path) -> dict[str, Any]:
+    """The exit status and the seconds of ``script``'s own path from its ``main`` to its error."""
+    module = f"oh_my_slam.cli.{script.removesuffix('.sh')}"  # what the script execs
+    res = subprocess.run([sys.executable, "-c", FAILURE_PATH, str(record), module, *args],
+                         capture_output=True, timeout=120, env=os.environ.copy(), cwd=REPO)
+    assert res.returncode == 0, res.stderr
+    return json.loads(record.read_text())  # type: ignore[no-any-return]
+
+
 def test_down_server_fails_fast(image: Path, tmp_path: Path) -> None:
+    """Exit 3 with the start command on stderr, nothing on stdout and no file or folder written;
+    and the command's failure path takes no time (``failure_path``)."""
     for script, args in [
         ("reconstruct.sh", ["-i", str(image)]),
         ("reconstruct.sh", ["-i", str(image), "-f", "ply", "-p", "voxel=0.01"]),
@@ -81,15 +112,12 @@ def test_down_server_fails_fast(image: Path, tmp_path: Path) -> None:
         ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
                        "-p", "voxel=0.05"]),
     ]:
-        # the first run warms the interpreter and imports (a cold venv takes seconds); the
-        # second one is timed, so the deadline measures the fail-fast path, not start-up
-        for timed in (False, True):
-            t0 = time.monotonic()
-            res = sh(script, *args)
-            assert res.returncode == 3, (script, res.stderr)
-            assert not timed or time.monotonic() - t0 < 2.0
+        res = sh(script, *args)
+        assert res.returncode == 3, (script, res.stderr)
         assert res.stdout == b""
         assert b"./start_inference_server.sh" in res.stderr
+        timed = failure_path(script, args, tmp_path / "failure.json")
+        assert timed["code"] == 3 and timed["seconds"] < FAIL_FAST_S, (script, args, timed)
     assert not (tmp_path / "x.json").exists() and not (tmp_path / "m").exists()
     assert not (tmp_path / "d").exists()  # nor the -d folder
 
