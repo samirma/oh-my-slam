@@ -102,7 +102,7 @@ def table_rows(section: str) -> dict[str, list[str]]:
 
 def expected_default(m: spec.Mode, o: spec.Option) -> str:
     if o.kind is spec.Kind.ATTRS:
-        return f"`{CloudAttrs.defaults(m.scope()).describe(m.scope())}`"
+        return f"`{CloudAttrs().describe(m.scope())}`"
     if o.default is None or o.kind is spec.Kind.FLAG or o.name == m.selector:
         return ""
     return f"`{o.default:g}`" if isinstance(o.default, float) else f"`{o.default}`"
@@ -172,12 +172,25 @@ def test_the_description_states_every_capability_and_when_to_use_it(
     for op in skill.operations().values():
         assert re.search(rf"(?<![\w-]){re.escape(op.id)}(?![\w-])", text), op.id
     assert "checkout on this machine" in text and "server.sh reachable from this machine" in text
-    need = [c.label(m) for p, c, m in skill.covered()
-            if skill.is_command(p) and m.inference == "required"]
-    assert f"The inference server is needed by {', '.join(need)} (" in text
-    for _, c, m in skill.covered():
-        if m.inference == "conditional":
-            assert f"{c.label(m)}: {skill.condition(m)}" in text
+    stdout = {o.format for _, _, m in skill.covered() for o in m.outputs if o.via == "stdout"}
+    assert stdout == {"json", "png", "ply"}  # each result format is glossed
+    assert "JSON = OpenLABEL scene" in text and "PLY = point cloud" in text
+    assert "PNG = depth image or segmented image" in text  # the names of the PNG results
+
+    def labels(inference: str) -> list[str]:
+        return [c.label(m) for p, c, m in skill.covered()
+                if skill.is_command(p) and m.inference == inference]
+
+    need = text.split("Inference server needed by ", 1)[1].split(". ", 1)[0]
+    required, rest = need.split(", and by ", 1)
+    sometimes, without = rest.split("; ", 1)
+    assert required == skill.listing(labels("required"))
+    assert sometimes == skill.listing([f"{c.label(m)} for {skill.condition(m)}"
+                                       for _, c, m in skill.covered()
+                                       if m.inference == "conditional"])
+    assert sometimes == f"mapper.sh locate for maps over {constants.UPDATE_EXHAUSTIVE_MAX} keyframes"
+    assert without == f"{skill.listing(labels('never'))} works without it"  # persisted maps
+    assert labels("never") == ["view.sh -m"]
     assert "job" not in text.lower()
     monkeypatch.setattr(skill, "DESCRIPTION_MAX", 100)  # one that would not fit is refused
     with pytest.raises(ValueError, match="Agent Skills: at most 100"):
@@ -406,10 +419,12 @@ def test_every_limit_the_skill_states_is_the_codes() -> None:
     assert stated["fps"] == f"`{constants.DEFAULT_FPS:g}`"
     assert stated["min_score"] == f"`{constants.DEFAULT_MIN_SCORE:g}`"
     assert stated["data"] == f"`{constants.DEFAULT_DATA}`"
+    assert set(skill.CONDITION_WORDS) == set(spec.CONDITIONS)  # every condition has its words
     for _, c, m in skill.covered():
         for k, v in (m.inference_condition or {}).items():
             assert k != "map_keyframes_greater_than" or v == constants.UPDATE_EXHAUSTIVE_MAX
-            assert f"{k.replace('_', ' ')} {v}" in sections[c.label(m)]
+            assert skill.CONDITION_WORDS[k].format(v) in sections[c.label(m)]
+            assert f"over {v} keyframes" in skill.condition(m)
     errors = part(text, "Errors")
     assert f"| `too_large` | 413 | an upload over {web_app.MAX_UPLOAD_BYTES / 2**30:g} GiB |" \
         in errors
@@ -423,6 +438,11 @@ def test_every_limit_the_skill_states_is_the_codes() -> None:
     down = ExitCode.SERVER_UNAVAILABLE
     assert f"fail with exit {int(down)}," in rules
     assert f"with HTTP {HTTP_STATUS[down]} `{error_code(down)}`" in rules
+    # what works without it (persisted maps): the modes that never need it, and those that need
+    # it only at times
+    assert ("offer what works without it: the script `view.sh -m`; `mapper.sh locate` and "
+            "`mapper-locate` except for maps over "
+            f"{constants.UPDATE_EXHAUSTIVE_MAX} keyframes.") in rules
     (writer,) = [m for p, c, m in skill.covered() if skill.map_written(c, m) is not None]
     stages = [str(s) for s in writer.stages]
     assert f"run {len(stages)} stages, from `{stages[0]}` to `{stages[-1]}`" in rules
@@ -449,7 +469,7 @@ def test_a_changed_limit_changes_the_skill(monkeypatch: pytest.MonkeyPatch) -> N
     assert "--max-time 5 " in text and "within 5 s" in text and "--max-time 3 " not in text
     rows = table_rows(script_sections(text)["mapper.sh update"])
     assert rows["-fps"][2] == "`3`"
-    assert "map keyframes greater than 300" in text and "greater than 150" not in text
+    assert "maps over 300 keyframes" in text and "over 150" not in text
     assert f"run {len(updating.stages) - 1} stages" in text
 
 
@@ -479,6 +499,10 @@ def test_the_samples_follow_the_code(tmp_path: Path) -> None:
     assert (named["x"], named["y"], named["z"], named["qw"], named["sx"], named["sz"]) == (
         1, 2, 3, 1, 4, 6)
     assert f"`val` is `{','.join(skill.CUBOID)}`" in text
+    # a PNG result is named by the outputs in that format, with the option that gives each
+    assert ("PNG is the depth image (`reconstruct.sh` with `-f depth`) or the segmented image "
+            "(`segment.sh -i` with `-f png`)") in text
+    assert "(JSON, PNG, PLY)" in part(text, "Scripts")  # what the scripts write on stdout
     for block in SH_BLOCK.findall(text):  # the sample inputs are the checkout's own
         for _, argv in invocations(block):
             for arg in argv:
@@ -514,6 +538,36 @@ def test_the_generator_renders_every_kind_of_option_and_output() -> None:
         mode, rules=(), attrs_scope=None),))
     op = Operation(spec.Program("pick.sh", "pick", (cmd,)), cmd, cmd.modes[0])
     assert skill.sample_params(op) == {"pick": "a"}
+    shot = dataclasses.replace(mode, outputs=(png,))  # a result in a format with no gloss
+    assert skill.formats_text([(spec.RECONSTRUCT, spec.RECONSTRUCT.commands[0], shot)]) == \
+        "Results: PNG is an image (`reconstruct.sh`)."
+    assert skill.title(png) == "an image" and skill.title(spec.Output(
+        "result", "stdout", "png", "the depth image: 16 bits")) == "the depth image"
+
+
+def test_lists_read_as_sentences() -> None:
+    assert [skill.listing(list(items)) for items in ("", "a", "ab", "abc")] == [
+        "", "a", "a and b", "a, b and c"]
+    assert skill.listed("script", ["`a`"]) == "the script `a`"
+    assert skill.listed("operation", ["`a`", "`b`"]) == "the operations `a` and `b`"
+
+
+def test_the_inference_need_reads_right_whatever_the_modes_need(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The description and the rules follow the modes' inference need: with no mode that needs
+    it at times, none is named so; several modes that never need it are listed together."""
+    locate = spec.MAPPER.command("locate")
+    (mode,) = locate.modes
+    mapper = replaced(spec.MAPPER, "locate", modes=(dataclasses.replace(
+        mode, inference="never", inference_condition=None),))
+    monkeypatch.setattr(spec, "PROGRAMS", tuple(mapper if p is spec.MAPPER else p
+                                                for p in spec.PROGRAMS))  # in place
+    text = skill.render()
+    front = yaml.safe_load(text.split("---\n", 2)[1])["description"]
+    assert ("Inference server needed by reconstruct.sh, mapper.sh update, segment.sh -i "
+            "and view.sh -i; mapper.sh locate and view.sh -m work without it.") in front
+    assert "offer what works without it: the scripts `mapper.sh locate` and `view.sh -m`; " \
+        "the operation `mapper-locate`." in " ".join(part(text, "Rules").split())
 
 
 def test_main_writes_the_skill(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -567,6 +621,7 @@ def test_a_registry_change_reaches_the_skill(monkeypatch: pytest.MonkeyPatch) ->
     assert "| `slow` | `slow.sh` |" in text
     front = text.split("---\n", 2)[1]
     assert "slow.sh → JSON + map" in front and ", slow run those modes" in front
+    assert "; view.sh -m and slow.sh work without it." in front  # a new mode without inference
     assert "**Starts a server:** restarts the inference server" in \
         sections["start_inference_server.sh --restart"]
     assert "`start_inference_server.sh --restart`" in part(text, "Rules")

@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "oh-my-slam monocular RGB 3D mapping on a Mac. Scripts, with its checkout on this machine: start_inference_server.sh start, --status → JSON, --stop; reconstruct.sh: image → JSON/PLY; mapper.sh update: images/video + map → JSON/PLY + map, locate: images + map → JSON/PLY; segment.sh -i: image → JSON/PLY + files, -m: map → JSON/PLY + files; view.sh -i: image → browser viewer, -m: map → browser viewer; server.sh --status → JSON. API, with a server.sh reachable from this machine (LAN too), sh + curl: operations reconstruct, mapper-update, mapper-locate, segment-image, segment-map run those modes; also uploads, validation, maps, health. JSON = OpenLABEL scene (labelled objects, oriented bounding boxes), PLY = point cloud. The inference server is needed by reconstruct.sh, mapper.sh update, segment.sh -i, view.sh -i (mapper.sh locate: map keyframes greater than 150). Use it to reconstruct, map, locate, segment or view images and video in 3D."
+description: "oh-my-slam monocular RGB 3D mapping on a Mac. Scripts, with its checkout on this machine: start_inference_server.sh start, --status → JSON, --stop; reconstruct.sh: image → JSON/PNG/PLY; mapper.sh update: images/video + map → JSON/PLY + map, locate: images + map → JSON/PLY; segment.sh -i: image → JSON/PNG + files; view.sh -i: image → web viewer, -m: map → web viewer; server.sh --status → JSON. API, with curl and a server.sh reachable from this machine (LAN too): operations reconstruct, mapper-update, mapper-locate, segment-image run those modes; also uploads, validation, maps, health. JSON = OpenLABEL scene (labelled objects, oriented bounding boxes), PNG = depth image or segmented image, PLY = point cloud. Inference server needed by reconstruct.sh, mapper.sh update, segment.sh -i and view.sh -i, and by mapper.sh locate for maps over 150 keyframes; view.sh -m works without it. Use it to reconstruct, map, locate, segment or view images/video in 3D."
 ---
 
 # oh-my-slam
@@ -11,7 +11,7 @@ Two kinds of entry point give the same results, byte for byte:
 
 * **[Scripts](#scripts)**: the shell scripts at the root of the oh-my-slam checkout, on the Mac
   that holds it.
-* **[API](#api)**: `server.sh`, a web service that runs every mode of `reconstruct.sh`, `mapper.sh`, `segment.sh` within an
+* **[API](#api)**: `server.sh`, a web service that runs every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` within an
   HTTP request, for this Mac or any machine on the LAN, with `curl`.
 
 Use the scripts when the checkout is on this machine, else the API, and follow the
@@ -24,19 +24,19 @@ oh_my_slam.web.skill` in the checkout): offer only what it, or the running servi
 | `start_inference_server.sh` | `start_inference_server.sh`, `start_inference_server.sh --status`, `start_inference_server.sh --stop` | Start (idempotent), stop or query the inference server. |
 | `reconstruct.sh` | `reconstruct.sh` | Single-image reconstruction (stdout or -o file). |
 | `mapper.sh` | `mapper.sh update`, `mapper.sh locate` | Multi-frame mapping (persistent map). |
-| `segment.sh` | `segment.sh -i`, `segment.sh -m` | Instance segmentation → JSON + OBBs, artefacts. |
+| `segment.sh` | `segment.sh -i` | Instance segmentation → JSON + OBBs or segmented image, artefacts. |
 | `view.sh` | `view.sh -i`, `view.sh -m` | Browser visualisation of an image or a map. |
 | `server.sh` | `server.sh --status` | Local web service: the commands as an HTTP API and a browser application. |
 
-Results: JSON is an ASAM OpenLABEL 1.0.0 scene description (or a server's health, for `--status`): each object has a label (`type`), a score, a colour that is the same in every output, and an oriented bounding box `cuboid` whose `val` is `x,y,z,qx,qy,qz,qw,sx,sy,sz` (metres, quaternion scalar last), e.g. `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair","ontology_uid":"0","coordinate_system":"camera","object_data":{"cuboid":[{"name":"obb","val":[0.41,0.18,2.35,0.0,0.0,0.0,1.0,0.48,0.51,0.92],"coordinate_system":"camera"}],"num":[{"name":"score","val":0.91}]},…},…},…}}`; PLY is a point cloud in metres whose header records its attributes (`-p`).
+Results: JSON is an ASAM OpenLABEL 1.0.0 scene description (or a server's health, for `--status`): each object has a label (`type`), a score, a colour that is the same in every output, and an oriented bounding box `cuboid` whose `val` is `x,y,z,qx,qy,qz,qw,sx,sy,sz` (metres, quaternion scalar last), e.g. `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair","ontology_uid":"0","coordinate_system":"camera","object_data":{"cuboid":[{"name":"obb","val":[0.41,0.18,2.35,0.0,0.0,0.0,1.0,0.48,0.51,0.92],"coordinate_system":"camera"}],"num":[{"name":"score","val":0.91}]},…},…},…}}`; PNG is the depth image (`reconstruct.sh` with `-f depth`) or the segmented image (`segment.sh -i` with `-f png`); PLY is a point cloud in metres whose header records its attributes (`-p`).
 
 ## Rules
 
-* **The inference server may be down.** Then the scripts `reconstruct.sh`, `mapper.sh update`, `segment.sh -i`, `view.sh -i` fail with exit
-  3, and the operations `reconstruct`, `mapper-update`, `segment-image` with HTTP 503 `server_unavailable`, each with
+* **The inference server may be down.** Then the scripts `reconstruct.sh`, `mapper.sh update`, `segment.sh -i` and `view.sh -i` fail with exit
+  3, and the operations `reconstruct`, `mapper-update` and `segment-image` with HTTP 503 `server_unavailable`, each with
   a message that names the start command `./start_inference_server.sh` (`GET /api/health` gives it as
   `inference.start_command`). Report the message and that command to the user instead of
-  retrying, and offer what works without it: the scripts `segment.sh -m`, `view.sh -m`; the operations `segment-map`; `mapper.sh locate` and `mapper-locate` (needed only for map keyframes greater than 150).
+  retrying, and offer what works without it: the script `view.sh -m`; `mapper.sh locate` and `mapper-locate` except for maps over 150 keyframes.
 * **Never start or stop `server.sh` or the inference server**, and never kill their processes:
   the user runs `start_inference_server.sh`, `start_inference_server.sh --stop` and `server.sh`. Only `start_inference_server.sh --status` and `server.sh --status` are yours to run.
 * **Never write into a map's folder** (`<data>/maps/<name>/`, or any folder a script takes as a
@@ -112,7 +112,7 @@ checkout needs `uv sync` once (a script whose Python environment is missing says
 to run it there), and the scripts that use the inference server need it running (see
 [Rules](#rules)).
 
-Every script writes at most one result on stdout (JSON, PLY), or with `-o` to that file instead;
+Every script writes at most one result on stdout (JSON, PNG, PLY), or with `-o` to that file instead;
 everything else goes to stderr: progress, and on failure what went wrong, with the exit status of
 [Errors](#errors).
 
@@ -167,11 +167,11 @@ Exit statuses on failure: 2 (`usage`), or another of [Errors](#errors).
 | Option | Value | Default | Meaning |
 |---|---|---|---|
 | `-i IMAGE` (required) | file: .bmp .jpeg .jpg .png .tif .tiff .webp |  | input RGB image |
-| `-f` | `json`, `ply` | `json` | output format (default: json) |
+| `-f` | `json`, `depth`, `ply` | `json` | output format: json = the scene description, depth = the depth image (16-bit PNG), ply = the point cloud (default: json) |
 | `-o FILE` | file |  | write the result to FILE instead of stdout (stdout then stays empty) |
 | `-p ATTRS` | `key=value,…`, repeatable | `color=rgb,stride=1,min-depth=0,max-depth=inf,edge=0.04,voxel=0,normals=off,label=off,encoding=binary` | point-cloud attributes key=value[,key=value...], defaults in brackets: color=rgb\|segment\|height\|none [rgb], stride=N [1], min-depth=METRES [0], max-depth=METRES\|inf [inf], edge=JUMP [0.04], voxel=METRES [0], normals=on\|off [off], label=on\|off [off], encoding=binary\|ascii [binary]; requires -f ply (only with -f ply) |
 
-Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene description (spec §3): objects, labels, scores, colours and OBBs in the camera frame; with `-f ply`, the point cloud (camera frame, metres) shaped by -p.
+Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene description (spec §3): objects, labels, scores, colours and OBBs in the camera frame; with `-f depth`, the depth image: one 16-bit single-channel PNG of the input's pixel size, each pixel the metric depth along the optical axis in units of 1/256 m, 0 where the model gives no valid depth; with `-f ply`, the point cloud (camera frame, metres) shaped by -p.
 
 ```sh
 "$REPO/reconstruct.sh" -i "$REPO/examples/restaurant.jpg" -o "$PWD/result.json"
@@ -207,7 +207,7 @@ Exit statuses on failure: 2 (`usage`), 3 (`server_unavailable`), 4 (`not_a_map`)
 
 ### `mapper.sh locate`
 
-`"$REPO/mapper.sh" locate`: Camera pose of images in an existing map (read-only). **Needs the inference server** only for retrieval in maps of more keyframes than are matched exhaustively (map keyframes greater than 150). Read-only; it writes only to `-o`.
+`"$REPO/mapper.sh" locate`: Camera pose of images in an existing map (read-only). **Needs the inference server** only for retrieval in maps of more keyframes than are matched exhaustively (maps over 150 keyframes). Read-only; it writes only to `-o`.
 
 | Option | Value | Default | Meaning |
 |---|---|---|---|
@@ -230,18 +230,17 @@ Exit statuses on failure: 2 (`usage`), 3 (`server_unavailable`), 4 (`not_a_map`)
 
 ### `segment.sh -i`
 
-`"$REPO/segment.sh"`: Instance segmentation → JSON + OBBs, artefacts. **Needs the inference server** (segments the image with the inference server). Read-only; it writes only to `-o` and `-d`.
+`"$REPO/segment.sh"`: Instance segmentation → JSON + OBBs or segmented image, artefacts. **Needs the inference server** (segments the image with the inference server). Read-only; it writes only to `-o` and `-d`.
 
 | Option | Value | Default | Meaning |
 |---|---|---|---|
 | `-i IMAGE` (required) | file: .bmp .jpeg .jpg .png .tif .tiff .webp |  | input RGB image |
-| `-f` | `json`, `ply` | `json` | output format (default: json) |
+| `-f` | `json`, `png` | `json` | output format: json = the scene description, png = the segmented image (default: json) |
 | `-o FILE` | file |  | write the result to FILE instead of stdout (stdout then stays empty) |
-| `-p ATTRS` | `key=value,…`, repeatable | `color=segment,stride=1,min-depth=0,max-depth=inf,edge=0.04,voxel=0,normals=off,label=off,encoding=binary` | point-cloud attributes key=value[,key=value...], defaults in brackets: color=segment (fixed) [segment], stride=N [1], min-depth=METRES [0], max-depth=METRES\|inf [inf], edge=JUMP [0.04], voxel=METRES [0], normals=on\|off [off], label=on\|off [off], encoding=binary\|ascii [binary]; shapes the -f ply output and segments.ply, so it needs -f ply or -d; with -m the pixel-level keys (stride, min-depth, max-depth, edge) are refused (only with -f ply or -d) |
-| `-d FOLDER` | folder |  | also write segmentation.json, segmented.png, catalog.csv, catalog.md and segments.ply into FOLDER |
-| `--min-score MIN_SCORE` | finite number | `0.5` | drop detections below this score (default 0.5; -i only) (-i only) |
+| `-d FOLDER` | folder |  | also write segmentation.json, segmented.png, catalog.csv and catalog.md into FOLDER |
+| `--min-score MIN_SCORE` | finite number | `0.5` | drop detections below this score (default 0.5) |
 
-Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene description (spec §3) (camera frame); with `-f ply`, the object-coloured point cloud. With `-d FOLDER` it also writes there: `segmentation.json`, the OpenLABEL 1.0.0 scene description (spec §3), identical to -f json; `segmented.png`, the image (for a map, keyframes) with each instance mask painted in its object's colour; `catalog.csv`, one row per object; `catalog.md`, the catalogue as a table by descending volume; `segments.ply`, the object-coloured cloud, identical to -f ply.
+Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene description (spec §3) (camera frame); with `-f png`, the segmented image: the input image dimmed, each instance mask painted opaque in its object's colour. With `-d FOLDER` it also writes there: `segmentation.json`, the OpenLABEL 1.0.0 scene description (spec §3), identical to -f json; `segmented.png`, the segmented image, identical to -f png; `catalog.csv`, one row per object; `catalog.md`, the catalogue as a table by descending volume.
 
 ```sh
 "$REPO/segment.sh" -i "$REPO/examples/restaurant.jpg" -o "$PWD/result.json"
@@ -250,28 +249,6 @@ Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene
 → `result.json` (stdout stays empty): `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair",…},…},…}}`
 
 Exit statuses on failure: 2 (`usage`), 3 (`server_unavailable`), or another of [Errors](#errors); e.g. `segment.sh: error: inference server is not running — start it with ./start_inference_server.sh`.
-
-### `segment.sh -m`
-
-`"$REPO/segment.sh"`: Instance segmentation → JSON + OBBs, artefacts. Works without the inference server (exports the map's persistent objects without inference). Read-only; it writes only to `-o` and `-d`.
-
-| Option | Value | Default | Meaning |
-|---|---|---|---|
-| `-m MAP` (required) | map folder: an existing map |  | existing map folder (read-only) |
-| `-f` | `json`, `ply` | `json` | output format (default: json) |
-| `-o FILE` | file |  | write the result to FILE instead of stdout (stdout then stays empty) |
-| `-p ATTRS` | `key=value,…`, repeatable | `color=segment,voxel=0,normals=off,label=off,encoding=binary` | point-cloud attributes key=value[,key=value...], defaults in brackets: color=segment (fixed) [segment], stride=N [1], min-depth=METRES [0], max-depth=METRES\|inf [inf], edge=JUMP [0.04], voxel=METRES [0], normals=on\|off [off], label=on\|off [off], encoding=binary\|ascii [binary]; shapes the -f ply output and segments.ply, so it needs -f ply or -d; with -m the pixel-level keys (stride, min-depth, max-depth, edge) are refused (only with -f ply or -d) |
-| `-d FOLDER` | folder |  | also write segmentation.json, segmented.png, catalog.csv, catalog.md and segments.ply into FOLDER |
-
-Result on stdout, or in the `-o` file: with `-f json`, the OpenLABEL 1.0.0 scene description (spec §3) of the map's objects (map coordinates); with `-f ply`, the object-coloured map cloud. With `-d FOLDER` it also writes there: `segmentation.json`, the OpenLABEL 1.0.0 scene description (spec §3), identical to -f json; `segmented.png`, the image (for a map, keyframes) with each instance mask painted in its object's colour; `catalog.csv`, one row per object; `catalog.md`, the catalogue as a table by descending volume; `segments.ply`, the object-coloured cloud, identical to -f ply.
-
-```sh
-"$REPO/segment.sh" -m "$HOME/oh-my-slam-data/maps/office" -o "$PWD/result.json"
-```
-
-→ `result.json` (stdout stays empty): `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair",…},…},…}}`
-
-Exit statuses on failure: 2 (`usage`), 4 (`not_a_map`), or another of [Errors](#errors); e.g. `segment.sh: error: one of the arguments -i -m is required`.
 
 ### `view.sh -i`
 
@@ -331,7 +308,7 @@ Exit statuses on failure: 2 (`usage`), 3 (`server_unavailable`), or another of [
 
 ## API
 
-`server.sh` is the web service: it runs every mode of `reconstruct.sh`, `mapper.sh`, `segment.sh` as an operation within one HTTP
+`server.sh` is the web service: it runs every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` as an operation within one HTTP
 request. There are no jobs: the service answers when the command ends, with its result, byte for
 byte, or its error. It keeps maps and uploads in its workspace (`~/oh-my-slam-data/` unless it was started
 with `--data <folder>`), keeps no results, and binds `0.0.0.0`, so it serves this Mac and any
@@ -347,9 +324,8 @@ and this file disagree (an older or newer service), **the running service's docu
 |---|---|---|
 | `reconstruct` | `reconstruct.sh` | needed |
 | `mapper-update` | `mapper.sh update` | needed; **writes the map** |
-| `mapper-locate` | `mapper.sh locate` | only for map keyframes greater than 150 |
+| `mapper-locate` | `mapper.sh locate` | only for maps over 150 keyframes |
 | `segment-image` | `segment.sh -i` | needed |
-| `segment-map` | `segment.sh -m` | not needed |
 
 The routes:
 
@@ -468,8 +444,6 @@ curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/op
 curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/mapper-locate" -H 'Content-Type: application/json' -d '{"inputs":["uploads/<upload>/query.jpg"],"map":"<map>"}'
 # segment.sh -i
 curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/segment-image" -H 'Content-Type: application/json' -d '{"image":"uploads/<upload>/photo.jpg"}'
-# segment.sh -m
-curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/segment-map" -H 'Content-Type: application/json' -d '{"map":"<map>"}'
 ```
 
 ## Errors

@@ -91,7 +91,13 @@ SAMPLE_IN: dict[Kind, str] = {
 # The description's words for the inputs and what a mode produces (another is named as it is).
 INPUTS = {Kind.IMAGE: "image", Kind.IMAGES: "images", Kind.IMAGES_OR_VIDEO: "images/video",
           Kind.MAP: "map"}
-FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG", "map": "map", "html": "browser viewer"}
+FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG", "map": "map", "html": "web viewer"}
+# The description's gloss of a result format; another is glossed by the names of the results in
+# it (``title``: "PNG = depth image or segmented image").
+GLOSS = {"json": "OpenLABEL scene (labelled objects, oriented bounding boxes)",
+         "ply": "point cloud"}
+# Each inference condition of the registry (``spec.CONDITIONS``) in words, its value for ``{}``.
+CONDITION_WORDS = {"map_keyframes_greater_than": "maps over {} keyframes"}
 # The 10 values of an OBB cuboid as schema.openlabel writes them (cuboid_val: quaternion scalar
 # last); tests/unit/test_agent_skill.py checks them against the builder.
 CUBOID = ("x", "y", "z", "qx", "qy", "qz", "qw", "sx", "sy", "sz")
@@ -140,8 +146,25 @@ def statuses() -> str:
     return ", ".join(code(s) for s in ("down", *get_args(ServerStatus)))
 
 
+def listing(items: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return " and ".join([", ".join(items[:-1]), items[-1]] if len(items) > 2 else items)
+
+
+def listed(noun: str, items: list[str]) -> str:
+    """``the script a``, ``the scripts a and b``."""
+    return f"the {noun}{'s' if len(items) > 1 else ''} {listing(items)}"
+
+
 def condition(mode: Mode) -> str:
-    return ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in (mode.inference_condition or {}).items())
+    """When a "conditional" mode needs the inference server, in words (any of its conditions)."""
+    return " or ".join(CONDITION_WORDS[k].format(v)
+                       for k, v in (mode.inference_condition or {}).items())
+
+
+def title(out: Output) -> str:
+    """An output's name: its text up to the first colon (``the depth image: one 16-bit …``)."""
+    return out.text.split(":", 1)[0]
 
 
 # -- the scripts: everything here comes from the commands' and the servers' definitions -----------
@@ -203,7 +226,7 @@ def value_text(o: Option) -> str:
 
 def default_text(m: Mode, o: Option) -> str:
     if o.kind is Kind.ATTRS:  # the keys that apply to the mode's cloud, with their defaults
-        return code(CloudAttrs.defaults(m.scope()).describe(m.scope()))
+        return code(CloudAttrs().describe(m.scope()))
     if o.default is None or o.kind is Kind.FLAG or o.name == m.selector:
         return ""
     return code(num(o.default))
@@ -394,7 +417,7 @@ def output_sample(p: Program, m: Mode, out: Output) -> str:
     if out.format == "json":
         return code(json_sample(p))
     if out.format == "ply":
-        attrs = f", `comment attributes {CloudAttrs.defaults(m.scope()).describe(m.scope())}`" \
+        attrs = f", `comment attributes {CloudAttrs().describe(m.scope())}`" \
             if m.attrs_scope is not None else ""
         return f"`ply`, `format {ply.BINARY}`{attrs}, …, `end_header`, then the points"
     return f"{spec.media_type(out.format)} bytes"
@@ -618,21 +641,31 @@ def description(scripts: list[Script], ops: dict[str, Operation]) -> str:
         body = ", ".join(mode_word(c, m) + produces(c, m) for _, c, m in group)
         return group[0][0].prog + ("" if body.startswith((":", " ")) else " ") + body
 
-    need = [label(c, m) for p, c, m in scripts if is_command(p) and m.inference == "required"]
-    sometimes = [f"{label(c, m)}: {condition(m)}" for p, c, m in scripts
-                 if is_command(p) and m.inference == "conditional"]
+    def gloss(fmt: str) -> str:
+        names = dict.fromkeys(title(o).removeprefix("the ") for _, _, m in scripts
+                              for o in m.outputs if o.via == RESULT and o.format == fmt)
+        return f"{FORMATS.get(fmt, fmt)} = {GLOSS.get(fmt) or ' or '.join(names)}"
+
+    def commands(inference: str) -> list[Script]:
+        return [s for s in scripts if is_command(s[0]) and s[2].inference == inference]
+
+    need = [label(c, m) for _, c, m in commands("required")]
+    sometimes = [f"{label(c, m)} for {condition(m)}" for _, c, m in commands("conditional")]
+    never = [label(c, m) for _, c, m in commands("never")]
     text = ("oh-my-slam monocular RGB 3D mapping on a Mac. Scripts, with its checkout on this "
             "machine: " + "; ".join(clause(g) for g in grouped(scripts))
-            + ". API, with a server.sh reachable from this machine (LAN too), sh + curl: "
+            + ". API, with curl and a server.sh reachable from this machine (LAN too): "
             "operations " + ", ".join(ops) + " run those modes; also uploads, validation, maps, "
-            "health. JSON = OpenLABEL scene (labelled objects, oriented bounding boxes), PLY = "
-            "point cloud. The inference server is needed by " + ", ".join(need)
-            + (f" ({'; '.join(sometimes)})" if sometimes else "") + ". Use it to reconstruct, "
-            "map, locate, segment or view images and video in 3D.")
+            "health. " + ", ".join(map(gloss, result_formats(scripts)))
+            + ". Inference server needed by " + listing(need)
+            + (f", and by {listing(sometimes)}" if sometimes else "")
+            + (f"; {listing(never)} work{'s' if len(never) == 1 else ''} without it"
+               if never else "")
+            + ". Use it to reconstruct, map, locate, segment or view images/video in 3D.")
     if len(text) > DESCRIPTION_MAX:
         raise ValueError(f"the description has {len(text)} characters (Agent Skills: at most "
                          f"{DESCRIPTION_MAX}); shorten the template or the words of "
-                         "skill.INPUTS / skill.FORMATS")
+                         "skill.INPUTS / FORMATS / GLOSS / CONDITION_WORDS")
     return text
 
 
@@ -912,19 +945,28 @@ The service's own refusals have the same shape:
 """
 
 
-def formats_text(scripts: list[Script]) -> str:
-    """What the results are: the formats the scripts write on stdout."""
-    fmts = list(dict.fromkeys(o.format for _, _, m in scripts for o in m.outputs
+def result_formats(scripts: list[Script]) -> list[str]:
+    """The formats the scripts write on stdout (or ``-o``), in the order they first appear."""
+    return list(dict.fromkeys(o.format for _, _, m in scripts for o in m.outputs
                               if o.via == RESULT))
+
+
+def formats_text(scripts: list[Script]) -> str:
+    """What the results are: the formats the scripts write on stdout; one without a gloss of its
+    own is named by its results, each with the mode and the option that give it."""
     gloss = {"json": f"JSON is an ASAM OpenLABEL {openlabel.SCHEMA_VERSION} scene description (or "
                      "a server's health, for `--status`): each object has a label (`type`), a "
                      "score, a colour that is the same in every output, and an oriented bounding "
                      f"box `cuboid` whose `val` is `{','.join(CUBOID)}` (metres, quaternion "
                      f"scalar last), e.g. `{scene_sample(full=True)}`",
-             "ply": "PLY is a point cloud in metres whose header records its attributes (`-p`)",
-             "png": "PNG is an image"}
-    return "Results: " + "; ".join(gloss.get(f, f"{FORMATS.get(f, f)} is "
-                                   f"{spec.media_type(f)}") for f in fmts) + "."
+             "ply": "PLY is a point cloud in metres whose header records its attributes (`-p`)"}
+
+    def named(fmt: str) -> str:
+        return f"{FORMATS.get(fmt, fmt)} is " + " or ".join(
+            f"{title(o)} ({code(label(c, m))}" + (f" {when_text(c, o.when)}" if o.when else "")
+            + ")" for _, c, m in scripts for o in m.outputs if o.via == RESULT and o.format == fmt)
+
+    return "Results: " + "; ".join(gloss.get(f) or named(f) for f in result_formats(scripts)) + "."
 
 
 def render(ops: dict[str, Operation] | None = None) -> str:
@@ -947,13 +989,13 @@ def render(ops: dict[str, Operation] | None = None) -> str:
     need_ops = op_ids(lambda op: op.mode.inference == "required")
     never_scripts = labels(lambda p, m: is_command(p) and m.inference == "never")
     never_ops = op_ids(lambda op: op.mode.inference == "never")
-    without = ([f"the scripts {', '.join(never_scripts)}"] if never_scripts else []) \
-        + ([f"the operations {', '.join(never_ops)}"] if never_ops else [])
+    without = ([listed("script", never_scripts)] if never_scripts else []) \
+        + ([listed("operation", never_ops)] if never_ops else [])
     for p, c, m in scripts:
         if is_command(p) and m.inference == "conditional":
-            without.append(" and ".join([code(label(c, m)), *(code(op.id) for op in ops.values()
-                                                              if op.mode is m)])
-                           + f" (needed only for {condition(m)})")
+            without.append(listing([code(label(c, m)), *(code(op.id) for op in ops.values()
+                                                         if op.mode is m)])
+                           + f" except for {condition(m)}")
     writers_s = [(p, c, m) for p, c, m in scripts if map_written(c, m) is not None]
     writers = [code(label(c, m)) for _, c, m in writers_s] + op_ids(
         lambda op: op.writes_map() is not None)
@@ -978,10 +1020,10 @@ def render(ops: dict[str, Operation] | None = None) -> str:
 
     parts = [
         front_matter(scripts, ops),
-        fill(INTRO, service_progs=", ".join(code(p) for p in service_progs), table="\n".join(table),
-             formats=formats_text(scripts)),
-        fill(RULES, need_scripts=", ".join(need_scripts) or "none",
-             need_ops=", ".join(need_ops) or "none", start=app.START_COMMAND,
+        fill(INTRO, service_progs=listing([code(p) for p in service_progs]),
+             table="\n".join(table), formats=formats_text(scripts)),
+        fill(RULES, need_scripts=listing(need_scripts) or "none",
+             need_ops=listing(need_ops) or "none", start=app.START_COMMAND,
              down_exit=str(int(down)), down_http=str(HTTP_STATUS[down]), down_code=error_code(down),
              without="; ".join(without) or "nothing",
              lifecycle=", ".join(labels(lambda p, m: m.lifecycle is not None)) + " and "
@@ -998,11 +1040,9 @@ def render(ops: dict[str, Operation] | None = None) -> str:
             [f'"$REPO/{first[0].prog}"', *sample_command(*first)[0]]), snippet=fill(
             REPO_SNIPPET, cache=REPO_CACHE,
             scripts=" ".join(p.prog for p in entry_points.scripts())),
-            stdout=", ".join(dict.fromkeys(FORMATS.get(o.format, o.format)
-                                           for _, _, m in scripts for o in m.outputs
-                                           if o.via == RESULT))),
+            stdout=", ".join(FORMATS.get(f, f) for f in result_formats(scripts))),
         *("\n".join(script_section(p, c, m)) for p, c, m in scripts),
-        fill(API, progs=", ".join(code(p) for p in service_progs),
+        fill(API, progs=listing([code(p) for p in service_progs]),
              data=constants.DEFAULT_DATA, ops="\n".join(
                  f"| `{op.id}` | `{op.label}` | {inference_cell(op)} |" for op in ops.values()),
              routes="\n".join(routes(doc))),
