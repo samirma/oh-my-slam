@@ -358,8 +358,6 @@ def _first_per_voxel(codes: NDArray[np.int64],
     if codes.ndim == 2:
         _, first = np.unique(codes, axis=0, return_index=True)
         return np.sort(first).astype(np.int64)
-    if not len(codes):
-        return np.zeros(0, np.int64)
     order, starts = runs if runs is not None else _runs(codes)
     keep = np.zeros(len(codes), bool)
     keep[np.minimum.reduceat(order, starts)] = True
@@ -399,7 +397,9 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
       with more (the count is not strictly monotonic at that scale, so an edge in between may
       still fit). The result never exceeds ``max_points``.
     * When the points are at no more than ``max_points`` distinct places (duplicates), no grid
-      thins them further: one point per place, edge 0 (``finer`` None)."""
+      thins them further: one point per place, edge 0 (``finer`` None).
+    * A ``ValueError`` when no grid holds them in ``max_points`` voxels: points around the origin
+      occupy up to 8 voxels of every grid (the grids are anchored there)."""
     if max_points < 1:
         raise ValueError("max_points must be at least 1")
     pts, rows = _finite(np.asarray(points).reshape(-1, 3))
@@ -417,13 +417,12 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
     last: list[Any] = [None, None, None]  # log(edge), codes, runs of the latest count
     bounds = (pts.min(axis=0), pts.max(axis=0))
 
-    def count(x: float) -> int:
-        if x not in counted:
-            last[:] = [None, None, None]  # free the previous count's arrays first
-            codes = _voxel_codes(pts, math.exp(x), bounds)
-            runs = _runs(codes) if codes.ndim == 1 else None
-            counted[x] = len(runs[1]) if runs is not None else len(np.unique(codes, axis=0))
-            last[:] = [x, codes, runs]
+    def count(x: float) -> int:  # each edge is counted once: every step is a new one
+        last[:] = [None, None, None]  # free the previous count's arrays first
+        codes = _voxel_codes(pts, math.exp(x), bounds)
+        runs = _runs(codes) if codes.ndim == 1 else None
+        counted[x] = len(runs[1]) if runs is not None else len(np.unique(codes, axis=0))
+        last[:] = [x, codes, runs]
         return counted[x]
 
     tight = math.log1p(edge_tol)
@@ -432,10 +431,11 @@ def budget_voxel_grid(points: NDArray[Any], max_points: int,
         return math.log(c) - math.log(n + 0.5 - c)
 
     def places() -> tuple[BudgetGrid, NDArray[np.int64]]:
+        """One point per distinct place: all points at one place, or no grid fit at all."""
         idx = _distinct_places(pts)
-        if len(idx) <= max_points:
-            return BudgetGrid(0.0, len(idx), None, None, len(counted)), out(idx)
-        return result(*fitting())
+        if len(idx) > max_points:  # points around the origin occupy up to 8 voxels of any grid
+            raise ValueError(f"no voxel grid holds these points in {max_points} voxels")
+        return BudgetGrid(0.0, len(idx), None, None, len(counted)), out(idx)
 
     def fitting() -> tuple[float, int]:
         x = min(k for k, c in counted.items() if c <= max_points)
