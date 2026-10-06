@@ -329,6 +329,10 @@ The viewer's code:
     camera table.
   * `labels.js`: the non-overlapping label layout.
   * `layers.js` and `controls.js`: the layer and attribute controls, and the display-budget notice.
+  * `ply.js`, `plyworker.js` and `cloudview.js`: a PLY's bytes read in the browser (off the page's
+    thread, within the display budget) and drawn by the `Viewer` with the same materials, colours
+    and initial view. `view.sh`'s page does not use them; `server.sh`'s web application draws its
+    point-cloud results with them (see below).
 
 ### `server.sh`
 
@@ -481,8 +485,10 @@ option.
 
 **Web application** (spec §2.6 "Web application"). `/` serves a simple browser application in
 `web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
-CDN). It talks only to the public API above, so everything it does can be scripted, and it has no
-viewer: `view.sh` stays the way to look at a reconstruction or a map in 3D.
+CDN). It talks only to the public API above, so everything it does can be scripted. It has no map
+or scene viewer (`view.sh` stays the way to explore a reconstruction or a map with its layers,
+objects and cameras), but a point-cloud result is drawn in 3D in the page with the §2.5 viewer's
+own rendering (see Results).
 
 * **Rendered from the API description.** The operations, their parameters and their results are
   read from `/api/openapi.json` (each operation's `x-oms` registry entry). Nothing in the app names
@@ -524,11 +530,41 @@ viewer: `view.sh` stays the way to look at a reconstruction or a map in 3D.
   clears its inputs once they are in the map); a page that goes away discards the uploads no
   request consumed.
 * **Results.** The response body is the result. The page offers it as a download, byte for byte
-  (`<op>-<input or map>.<format>`), and shows it: a scene description (OpenLABEL) with its objects
-  listed (id, label, colour as a swatch and its `#rrggbb`, score), the JSON in full (formatted, or
-  exactly as received), a PLY's header and point count (an ASCII PLY in full), and the command's
-  per-stage timings from `Server-Timing`. A failure shows the command's message and code; a
-  refused request also marks its fields.
+  (`<op>-<input or map>.<format>`), and shows it, by its format and content, never by the
+  operation: a scene description (OpenLABEL) with its objects listed (id, label, colour as a
+  swatch and its `#rrggbb`, score), the JSON in full (formatted, or exactly as received), a point
+  cloud (PLY: `reconstruct` and `segment-image` with `-f ply` on the Image page, `segment-map` and
+  `mapper-locate` on a map's page) drawn in 3D, and the command's per-stage timings from
+  `Server-Timing`. A failure shows the command's message and code; a refused request also marks
+  its fields.
+* **A point cloud in 3D** (`web/static/js/cloudresult.js`). The drawing is the §2.5 viewer's own:
+  the service serves the viewer package's `static/lib/` and `static/vendor/` (its ES modules and
+  three.js) at `/static/viewer/lib/…` and `/static/viewer/vendor/…`, not copies, and loads them
+  only when a result needs them. `lib/cloudview.js` reads the response bytes the page already holds
+  (no other request, no upload) in a worker (`lib/ply.js`, `lib/plyworker.js`) and draws them with
+  the `Viewer` of `view.sh`: the colours the file carries (rgb, height or segment colours,
+  `color=segment` written exactly), shading by its normals where it has them, the same point size,
+  background and initial view. A cloud in a single image's camera frame (its header says so) is
+  shown upright as `view.sh -i` shows one, for a level camera (a PLY does not carry the estimated
+  up direction); a map's cloud is drawn as it is (z up).
+  * Drag to rotate, right-drag or Shift-drag to pan, scroll to zoom; buttons rotate, pan, zoom and
+    reset the view; with the view focused, the arrow keys rotate, Shift + arrows pan, + and −
+    zoom, 0 resets. The view draws only when it moves.
+  * Its text alternative (the canvas's label and the facts under it) states the points drawn and
+    in the file, what each point carries (position, colour and its `color` attribute, normal,
+    object id), the attributes the writer recorded, the frame and the PLY format. Its PLY header
+    is in a collapsible section below it.
+  * **Display budget.** Up to the viewer's 16,000,000 points (`DISPLAY_POINT_BUDGET`) every point
+    is drawn. Above it the page reads 16,000,000 of them, evenly spaced in the file's order (vertex
+    ⌊i · Y / 16,000,000⌋), each with exactly its values, and says "Showing X of Y points: evenly
+    spaced in the file's order, read in this page"; the download stays complete. (`view.sh` selects
+    one point per voxel on its server; a result the page already holds has no server-side
+    derivation, so the page subsamples it itself.) Measured in headless Edge on the M4 Max: a
+    5,000,000-point result is read (in a worker) and drawn 0.36 s after it is shown, a
+    17,000,000-point one (243 MiB, 16,000,000 drawn) in 0.9 s; the page's main thread never stalls
+    more than 17 ms meanwhile, and the view orbits at 58 and 53 frames per second respectively.
+  * A PLY that cannot be read shows why ("This point cloud cannot be drawn: …"), and its download
+    stays available.
 * **Top bar.** Workspace name, inference-server status (with `start_command` when it is down),
   and the requests running and waiting on the service.
 * **Inference server down.** Actions of a mode that always needs the server are disabled, with
@@ -546,8 +582,12 @@ viewer: `view.sh` stays the way to look at a reconstruction or a map in 3D.
     included, in both themes and at both widths, and fail on any violation of the WCAG 2.0/2.1 A
     and AA rules.
 * **Browser tests** (`tests/browser/test_webapp_browser.py`, `test_webapp_down.py`, `-m browser`,
-  Playwright with Edge or Chrome): a single-image request, map creation and update (COLMAP),
-  locating images in a map, segmenting a map, the downloads (compared with the response body),
+  Playwright with Edge or Chrome): a single-image request, a point-cloud result drawn in 3D (on
+  the Image page and on a map's page: the canvas shows the file's own colours, the point count is
+  the file's, buttons, keys, drag and wheel move it, the display budget with a test's smaller
+  budget, a PLY that does not parse, both themes down to tablet width), map creation and update
+  (COLMAP), locating images in a map, segmenting a map, the downloads (compared with the response
+  body),
   interruption (button, leaving, reloading), a request waiting for its turn, the inference server
   down, registry changes, URLs and the 100 ms rendering of a page, the keyboard, and axe-core. They
   use the real service and request runner with the stub inference server.
@@ -1419,7 +1459,10 @@ at the Python-module level:
   the artefacts, and the derivation of every emitted cloud (`segmentation/cloud.py`).
 * `mapping` owns inputs, SfM, the map frame, identity and the store. It reaches the server only
   through `reconstruction` and `segmentation`.
-* `viewer` only serves data.
+* `viewer` only serves data and draws it: its browser modules are the only rendering code. `web`
+  serves them (`/static/viewer/lib/…`, `/static/viewer/vendor/…`, from the viewer's package) and
+  embeds its cloud view for a PLY result; the app imports nothing of three.js itself
+  (`tests/unit/test_web_static.py`).
 * `web` (`server.sh`) owns the HTTP layer, the order in which requests run (`web/runner.py`) and
   the generator of `SKILL.md` (`web/skill.py`). It runs the commands' entry points as
   subprocesses and never imports torch, Open3D or the inference server's internals.
