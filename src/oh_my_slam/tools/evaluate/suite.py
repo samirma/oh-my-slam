@@ -14,7 +14,9 @@
    ``mapper.sh locate`` (``-t single`` JSON, ``-t full`` JSON, ``-f ply -o``), which must leave it
    unchanged, hidden entries included; ``segment.sh -m -f ply -o`` on the split map.
 6. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and split as
-   its annotation says (4+4+5 and 6+7), judged by ``mapupdate`` (the ``map_update.*`` metrics).
+   its ``map_update`` annotation says (else in two halves), judged by ``mapupdate`` (the
+   ``map_update.*`` metrics) when an annotation says what changed (``groundtruth``: annotations
+   are optional data, picked up when added).
 7. ``street2.mp4`` (outside the repository, ``--street2``): ``mapper.sh update`` of the video at
    the default sampling rate (performance, contracts, ``pose.street2.registered_fraction``).
 8. ``server.sh`` over a scratch workspace (``service``): performance, parity with the commands
@@ -104,21 +106,28 @@ LOCATE_REFERENCE = (1, 40, 60)  # captures located on the reference map (each in
 PARITY_SEQUENCE = 3  # the first captures, mapped by the parity cases of mapper.sh update
 PARITY_LOCATE = (40, 60)  # captures the parity cases of mapper.sh locate locate
 STREET2_METRIC = "pose.street2.registered_fraction"
+NO_MAP_UPDATE_ANNOTATION = (
+    "no 'map_update' annotation in examples/ground_truth/ says what changed during the "
+    "sequence, so the maps were built (performance, contracts) but the map update was not "
+    "judged; add one (format: oh_my_slam.tools.evaluate.groundtruth) to judge it")
 
 
-def office_splits(examples: Path = EXAMPLES) -> list[str]:
-    """The names of the office sequence's splits its annotation asks for."""
+def office_splits(examples: Path = EXAMPLES) -> list[str] | None:
+    """The names of the office sequence's splits its ``map_update`` annotation asks for; None when
+    no annotation says what changed (the map update is then mapped but not judged)."""
     files, skipped = gt.discover(examples / GROUND_TRUTH)
     plan = gt.map_update_plan(files, skipped)
-    if plan is None or not (examples / plan.sequence).is_dir():
+    if plan is None:
+        return None
+    if not (examples / plan.sequence).is_dir():
         return []
     images = mapupdate.sequence_images(examples / plan.sequence)
     return [mapupdate.split_name(s) for s in plan.split_sizes(images)]
 
 
 def expected_ids(examples: Path = EXAMPLES) -> list[str]:
-    """Every metric a run records (ground-truth metrics come on top when annotations exist, and
-    per-stage metrics for every stage the commands record)."""
+    """Every metric a run records (ground-truth metrics, the map update's included, come on top
+    when annotations exist, and per-stage metrics for every stage the commands record)."""
     ids = [*SERVER_METRICS, *perf_ids(), *SEG_METRICS]
     ids += [f"{MAP_CONSISTENCY}.{k}" for k in MAP_CONSISTENCY_METRICS]
     ids += [f"pose.{mp}.{k}" for mp in MAPS for k in POSE_METRICS]
@@ -126,7 +135,9 @@ def expected_ids(examples: Path = EXAMPLES) -> list[str]:
     ids += [STREET2_METRIC]
     ids += [f"map.{mp}.{k}" for mp in MAPS for k in AGREEMENT_METRICS]
     ids += [f"map.stability.{k}" for k in STABILITY_METRICS]
-    ids += mapupdate.metric_ids(office_splits(examples))
+    splits = office_splits(examples)
+    if splits is not None:
+        ids += mapupdate.metric_ids(splits)
     ids += service.metric_ids()
     ids += [mid for mid, *_ in ContractLog().results()]
     return ids
@@ -508,25 +519,27 @@ class Evaluation:
 
     def map_update(self) -> None:
         """The office sequence mapped whole in one update, and split across updates as its
-        annotation says; the ``map_update`` files of the ground truth say what changed (no file:
-        the metrics fail, nothing is mapped)."""
+        annotation says; the ``map_update`` files of the ground truth say what changed and the
+        maps are judged against them. Without such a file the sequence is still mapped (one
+        update, and two halves: performance and contracts) but not judged: its ``map_update.*``
+        metrics are not recorded, and the report says why."""
         files, skipped = gt.discover(self.examples / GROUND_TRUTH)
         plan = gt.map_update_plan(files, skipped)
-        if plan is None:
-            self.metrics.fail(mapupdate.metric_ids(), "no 'map_update' file in "
-                              "examples/ground_truth/ (see its README.md): what changed in the "
-                              "sequence is not annotated")
-            return
-        folder = self.examples / plan.sequence
-        images = mapupdate.sequence_images(folder)
-        early = plan.before_images(images)
-        sizes = plan.split_sizes(images)
-        ids = mapupdate.metric_ids([mapupdate.split_name(s) for s in sizes])
-        self.details["map_update"] = {"annotation": [str(p) for p in plan.files],
+        folder = self.examples / (plan.sequence if plan else gt.MAP_UPDATE_SEQUENCE)
+        images = mapupdate.sequence_images(folder) if folder.is_dir() else []
+        early = plan.before_images(images) if plan else []
+        sizes = plan.split_sizes(images) if plan else mapupdate.halves(images)
+        ids = mapupdate.metric_ids([mapupdate.split_name(s) for s in sizes]) if plan else []
+        self.details["map_update"] = {"annotation": [str(p) for p in plan.files] if plan else [],
                                       "images": images, "before_images": early,
                                       "split_sizes": [list(s) for s in sizes]}
-        if not early:
+        if plan is None:
+            self.details["map_update"]["not_judged"] = NO_MAP_UPDATE_ANNOTATION
+        elif not early:
             self.metrics.fail(ids, f"no annotated image is in {folder}")
+            return
+        if not images:
+            self.details["map_update"]["not_judged"] = f"no image in {folder}"
             return
         maps = self.out / "maps"
         single_dir = maps / "office"
@@ -550,9 +563,12 @@ class Evaluation:
                     failed[name] = f"update {k} of {name} failed"
                     break
                 # each update's view is read now: the map's frame records change with the next
-                views.append(mapupdate.MapView.of(doc, d, cloud=k == len(parts)))
+                if plan is not None:
+                    views.append(mapupdate.MapView.of(doc, d, cloud=k == len(parts)))
             else:
                 splits.append(mapupdate.SplitMaps(s, parts, views))
+        if plan is None:
+            return
         for name, why in failed.items():
             self.metrics.fail(mapupdate.split_metric_ids(name), why)
         with self.metrics.expect(*ids):

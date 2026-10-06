@@ -54,7 +54,9 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
 )
 NO_GROUND_TRUTH = ("No ground-truth annotations were found in `examples/ground_truth/`. Segmentation "
                    "accuracy is not measured, and pose accuracy is measured only against the "
-                   "commanded headings.")
+                   "commanded headings. Annotations are optional: their format is documented in "
+                   "`oh_my_slam.tools.evaluate.groundtruth`, and files added there are picked up "
+                   "on the next run.")
 STAGE_NOTE = ("Stage times are exclusive: they add up to the run's time. Peaks include nested "
               "stages. The client figure is the command's process tree: the command's own "
               "sampled peak plus the evaluator's 0.2 s samples, which also cover child processes "
@@ -241,7 +243,10 @@ def summary_md(result: dict[str, Any]) -> str:
              for m in regress])
     for prefix, title, note in SECTIONS:
         rows = [m for m in metrics if _section_of(m["id"]) == prefix]
-        if prefix == "gt" and not rows:
+        not_judged = (result["details"].get("map_update") or {}).get("not_judged")
+        if prefix == "map_update" and not rows and not_judged:
+            lines += [f"## {title}", "", f"Not judged: {not_judged}.", ""]
+        elif prefix == "gt" and not rows:
             found = (result["details"].get("ground_truth") or {}).get("files")
             lines += [f"## {title}", "", NO_GROUND_TRUTH if not found else
                       f"{len(found)} ground-truth files were found, but none applied (see "

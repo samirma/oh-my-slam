@@ -47,13 +47,17 @@ def test_shipped_targets_cover_every_metric() -> None:
     gt_ids = {"gt.objects.recall", "gt.objects.precision", "gt.objects.obb_iou_median",
               "gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg",
               "gt.poses.pitch_err_median_deg"}
-    assert gt_ids <= set(targets)
+    # the map update is judged against an annotation too (none ships: annotations are optional)
+    from oh_my_slam.tools.evaluate.mapupdate import metric_ids
+
+    annotated = gt_ids | set(metric_ids([]))
+    assert annotated <= set(targets)
     # no stale targets: besides those, only per-stage targets (explicit, or patterns)
     # (a split of the office sequence is named after its sizes: its targets are patterns too)
     named = {k for k in targets if "*" not in k and ".stage." not in k}
     patterns = {k for k in targets if "*" in k}
     expected = set(expected_ids())
-    assert named == {k for k in expected if target_for(targets, k) is targets.get(k)} | gt_ids
+    assert named == {k for k in expected if target_for(targets, k) is targets.get(k)} | annotated
     assert all(target_for(targets, k) is not None for k in expected)
     assert all(k.startswith(("perf.", "map_update.split_*.")) for k in patterns)
     # every performance group's stages have a target, whatever stage a command adds

@@ -119,25 +119,56 @@ def test_map_update_files_are_discovered_and_merged(tmp_path: Path) -> None:
     assert gt.map_update_plan([], []) is None
 
 
-def test_the_shipped_annotation_is_valid_and_names_images_of_the_sequence() -> None:
-    files, skipped = gt.discover(EXAMPLES / "ground_truth")
-    assert skipped == []
-    found = gt.map_update_plan(files, skipped)
-    assert found is not None and [a.label for a in found.absent] == ["cup"]
-    images = sequence_images(EXAMPLES / found.sequence)
-    assert len(images) == 13
-    assert all(n in images for a in found.absent for n in a.seen_in)
-    assert found.before_images(images) == images[:4]  # the cup is gone from the fifth image on
-    assert found.split_sizes(images) == [(4, 4, 5), (6, 7)]
+def documented_examples() -> dict[str, dict[str, Any]]:
+    """The annotation examples of groundtruth's docstring (the format's documentation), by kind."""
+    doc = gt.__doc__ or ""
+    out = {}
+    for block in doc.split("::\n\n")[1:]:
+        lines = []
+        for line in block.splitlines():
+            if line and not line.startswith("    "):
+                break
+            lines.append(line)
+        example = json.loads("\n".join(lines))
+        out[example["kind"]] = example
+    return out
 
 
-def test_every_map_update_metric_has_a_target() -> None:
+def test_annotations_are_optional_and_their_format_is_documented(tmp_path: Path) -> None:
+    """Annotations are optional (none ships; examples/ground_truth/ may be absent): a missing
+    folder gives nothing and no map-update plan. The format lives in groundtruth's docstring,
+    whose examples are valid annotations of every kind, naming images of the sequences they are
+    about."""
+    assert gt.discover(tmp_path / "missing") == ([], [])
+    assert gt.map_update_plan([], []) is None
+    examples = documented_examples()
+    assert set(examples) == set(gt.KINDS)
+    folder = tmp_path / "gt"
+    folder.mkdir()
+    for kind, example in examples.items():
+        (folder / f"{kind}.json").write_text(json.dumps(example))
+    found, skipped = gt.discover(folder)
+    assert skipped == [] and sorted(f.kind for f in found) == sorted(gt.KINDS)
+    plan = gt.map_update_plan(found, skipped)
+    assert plan is not None and [a.label for a in plan.absent] == ["cup"]
+    images = sequence_images(EXAMPLES / plan.sequence)
+    assert len(images) == 13 and all(n in images for a in plan.absent for n in a.seen_in)
+    assert plan.split_sizes(images) == [(4, 4, 5), (6, 7)]
+    captures = {p.name for p in (EXAMPLES / "ainex-captures").glob("*.jpg")}
+    assert set(examples["poses"]["frames"]) <= captures
+    assert (EXAMPLES / examples["objects"]["image"]).is_file()
+
+
+def test_every_map_update_metric_has_a_target(tmp_path: Path) -> None:
     targets = load_targets(EXAMPLES / "targets.json")
     ids = metric_ids(["split_4_4_5", "split_6_7"])
     assert all(target_for(targets, k) is not None for k in ids)
-    assert set(ids) <= set(expected_ids())
     assert targets["map_update.absent_fraction"].op == ">="
     assert targets["map_update.absent_fraction"].value == 1.0
+    # the map update's metrics are expected when an annotation says what changed, and not before
+    assert set(metric_ids(["split_3_3"])) <= set(expected_ids(office_examples(tmp_path)))
+    (tmp_path / "examples" / "ground_truth" / "office.json").unlink()
+    assert not [k for k in expected_ids(tmp_path / "examples") if k.startswith("map_update.")]
 
 
 # -- the remnant test ----------------------------------------------------------------------------------
@@ -540,18 +571,30 @@ def test_the_plan_reports_the_cup_left_in_the_map(tmp_path: Path) -> None:
     assert "Map update: split_3_3, objects that never changed" in text
 
 
-def test_without_an_annotation_or_maps_the_metrics_fail_with_the_reason(tmp_path: Path) -> None:
+def test_without_an_annotation_the_sequence_is_mapped_but_not_judged(tmp_path: Path) -> None:
+    """No annotation: the sequence is mapped in one update and in its two halves (performance,
+    contracts), no map_update metric is recorded, and the report says why; with one, a mapper that
+    fails makes the metrics fail with the reason."""
     out = tmp_path / "out"
     root = office_examples(tmp_path)
     (root / "ground_truth" / "office.json").unlink()
-    repo = fake_repo(tmp_path)
+    (tmp_path / "a").mkdir()
+    repo = office_repo(tmp_path / "a", final_map(False), early_map())
     ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=root)
     ev.map_update()
-    assert ev.runner.records == []  # nothing is mapped without an annotation
-    m = ev.metrics.items["map_update.absent_fraction"]
-    assert m.value is None and "no 'map_update' file" in (m.error or "")
+    assert [r.spec.tag for r in ev.runner.records] == [
+        "mapper_office", "mapper_office_split_3_3_1", "mapper_office_split_3_3_2"]
+    assert all(r.ok for r in ev.runner.records)
+    assert not [k for k in ev.metrics.items if k.startswith("map_update.")]
+    why = ev.details["map_update"]["not_judged"]
+    assert "no 'map_update' annotation" in why and "groundtruth" in why
+    result = build_result(ev.metrics, ev.runner.records, ev.details, started="s", finished="f",
+                          duration_s=1.0, env={}, targets=EXAMPLES / "targets.json",
+                          baseline={"status": "missing", "path": "b"})
+    assert f"## Map update\n\nNot judged: {why}." in summary_md(result)
     (root / "ground_truth" / "office.json").write_text(json.dumps(ANNOTATION))
-    ev = Evaluation(out / "2", Runner(out / "2", repo), BrowserProbe(None), examples=root)
+    ev = Evaluation(out / "2", Runner(out / "2", fake_repo(tmp_path)), BrowserProbe(None),
+                    examples=root)
     ev.map_update()  # the mapper fails
     assert [r.ok for r in ev.runner.records] == [False, False]  # no second update after a failure
     assert "update 1 of split_3_3 failed" in (
