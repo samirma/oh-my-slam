@@ -111,15 +111,21 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
+# spec §4: the offline unit tests cover the whole package, models and evaluator included
 source = ["oh_my_slam"]
+branch = true
 # measure the CLI and server processes the tests start (os._exit paths save data explicitly)
 patch = ["subprocess"]
 parallel = true
 sigterm = true
-omit = [
-    "src/oh_my_slam/server/models/*",
-    "src/oh_my_slam/tools/*",
-]
+
+[tool.coverage.report]
+# spec §4: the build fails below 100 % line and branch coverage
+fail_under = 100
+show_missing = true
+skip_covered = true
+# type-checking-only imports never run
+exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.importlinter]
 root_package = "oh_my_slam"
