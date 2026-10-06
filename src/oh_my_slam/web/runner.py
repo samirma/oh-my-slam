@@ -17,8 +17,11 @@ within its own HTTP request, and this module runs the command for it.
   runs or waits for its turn.
 * **Interruption.** A client that disconnects, and a stopping service, interrupt a request: a
   waiting one never starts; a running one gets SIGINT on its process group — Ctrl-C in a terminal
-  — so an interrupted map update is the command's own uncommitted transaction. A command that
-  ignores it gets SIGTERM after ``interrupt_grace_s`` and SIGKILL after as long again.
+  — so an interrupted map update is the command's own uncommitted transaction. The command starts
+  with SIGINT blocked until its ``run_main`` handles it (``core.process.sigint_blocked``), so even
+  an interrupt that arrives while its interpreter starts ends as the command's interrupt (exit
+  130), never as a process killed by the signal. A command that ignores it gets SIGTERM after
+  ``interrupt_grace_s`` and SIGKILL after as long again.
 * **Uploads.** A request consumes the uploads it names: they are deleted when it ends, whatever its
   outcome, and an upload another request in progress uses is refused (``upload_in_use``).
 """
@@ -41,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from oh_my_slam.core.process import default_sigint
+from oh_my_slam.core.process import default_sigint, sigint_blocked
 from oh_my_slam.core.timing import ENV_PATH
 from oh_my_slam.web.workspace import Workspace
 
@@ -285,8 +288,8 @@ class Runner:
         with run.lock:
             if run.interrupted is not None:  # interrupted before its command started
                 return Outcome(130, "interrupted before it started", run.interrupted)
-            try:
-                with (folder / STDOUT).open("wb") as out:
+            try:  # an interrupt during its start-up waits for its run_main (sigint_blocked)
+                with (folder / STDOUT).open("wb") as out, sigint_blocked():
                     run.proc = subprocess.Popen(
                         [self.python, "-m", run.module, *run.argv], stdin=subprocess.DEVNULL,
                         stdout=out, stderr=subprocess.PIPE, cwd=self.ws.root, env=env,

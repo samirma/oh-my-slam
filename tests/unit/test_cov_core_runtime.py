@@ -152,6 +152,28 @@ def test_the_arguments_default_to_the_command_line(exits: list[str],
     assert int(ExitCode.INTERRUPTED) == 130
 
 
+def _sigint_blocked_now() -> bool:
+    return signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+
+def test_a_ctrl_c_held_while_the_process_started_is_its_interrupt(exits: list[str]) -> None:
+    """A process started with SIGINT blocked (``sigint_blocked``): ``run_main`` unblocks it inside
+    its handler, so a SIGINT that arrived before is a ``KeyboardInterrupt`` there (exit 130), and
+    the thread's mask is restored after a ``sigint_blocked`` block."""
+    assert not _sigint_blocked_now()
+    with process.sigint_blocked():
+        assert _sigint_blocked_now()
+        # to this thread, where it is blocked, so it stays pending (another thread of the test
+        # process that does not block SIGINT would take one sent to the process)
+        signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+        ran: list[list[str]] = []
+        assert _run(lambda args: ran.append(args) or 0, ["x"]) == 130  # before main ran
+        assert ran == [] and not _sigint_blocked_now()  # run_main unblocked it
+    assert not _sigint_blocked_now()  # restored
+    with process.sigint_blocked():  # nothing pending: main runs, SIGINT is unblocked
+        assert _run(lambda args: 0) == 0 and not _sigint_blocked_now()
+
+
 def test_ctrl_c_is_restored_only_on_the_main_thread() -> None:
     old = signal.signal(signal.SIGINT, signal.SIG_IGN)  # e.g. a shell ``&`` job
     try:

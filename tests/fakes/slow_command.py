@@ -4,7 +4,9 @@ stage for ``S`` seconds (the real ``core.timing`` record, written to ``OH_MY_SLA
 its summary line), prints a line on stderr and its result on stdout — one JSON line with its pid
 and the ``time.monotonic()`` (system-wide) of its start and end, so a test can order runs — and
 exits with ``N`` (2: a usage error with a message) — or 130 when interrupted, as every command does
-through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C.
+through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C from its start, and
+``--interrupt-at-start`` sends it a Ctrl-C while it starts, before ``run_main`` (the moment a
+request interrupted as soon as its command started reaches it).
 
 ``registry_program()`` is the same command as a registry entry (``slow.sh``, no inference unless
 asked, a JSON result on stdout), for tests that add it to ``commands.spec.PROGRAMS``;
@@ -36,6 +38,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--seconds", type=float, default=0.0)
     ap.add_argument("--code", type=int, default=0)
     ap.add_argument("--ignore-sigint", action="store_true")
+    ap.add_argument("--interrupt-at-start", action="store_true")  # (before main: see the end)
     ap.add_argument("-m", dest="map")
     ap.add_argument("-i", dest="image")
     ap.add_argument("--mood")
@@ -124,4 +127,13 @@ def map_registry_program() -> object:
 
 
 if __name__ == "__main__":
+    if "--interrupt-at-start" in sys.argv[1:]:
+        os.kill(os.getpid(), signal.SIGINT)
+    if "--ignore-sigint" in sys.argv[1:]:
+        # deaf from the start: the web service starts it with SIGINT blocked
+        # (core.process.sigint_blocked), and ignoring it discards one that is pending, so a test
+        # may interrupt it at once; run_main would make SIGINT Ctrl-C again
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+        sys.exit(main(sys.argv[1:]))
     run_main("slow.sh", main)

@@ -461,7 +461,10 @@ option.
 * **Process.** A request's command is its Python entry point, `python -m
   oh_my_slam.cli.<command> <argv>` (the module the shell script execs), run as a subprocess in its
   own process group, in the workspace, with a default SIGINT (so an interrupt works even when the
-  service was started with SIGINT ignored), its stdout to `.requests/<id>/stdout` and
+  service was started with SIGINT ignored) blocked until the command's `run_main` handles it
+  (`core.process.sigint_blocked`: an interrupt that arrives while its interpreter starts ends as
+  the command's interrupt, exit 130, not as a process killed by the signal), its stdout to
+  `.requests/<id>/stdout` and
   `OH_MY_SLAM_TIMINGS` to `.requests/<id>/timings.json`.
 * **Answer.** The service answers when the command ends. On success the body is the command's
   stdout, byte for byte — what the command writes to stdout or to `-o` (tested against the shell

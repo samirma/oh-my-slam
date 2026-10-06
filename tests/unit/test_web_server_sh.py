@@ -299,8 +299,7 @@ def test_a_second_signal_kills_the_commands_and_exits(data: Path) -> None:
     proc, url = slow_server(data)
     in_background(lambda: httpx.post(url + "api/ops/slow",
                                      json={"seconds": 120, "ignore_sigint": True}, timeout=None))
-    child = command_of(proc)
-    time.sleep(0.5)  # its SIGINT is ignored by now
+    child = command_of(proc)  # deaf from its start (tests.fakes.slow_command)
     proc.send_signal(signal.SIGTERM)
     time.sleep(1.5)
     assert proc.poll() is None  # still waiting for the command

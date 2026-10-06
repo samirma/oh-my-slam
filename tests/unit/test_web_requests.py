@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
+import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -240,8 +243,7 @@ def test_a_command_deaf_to_ctrl_c_is_terminated(ws: Workspace,
         a, ta = await send(app, "/api/ops/slow", {"seconds": 60, "ignore_sigint": True})
         await until(started(service.runner, 1))
         running = service.runner.running[0]
-        await asyncio.sleep(0.5)  # its SIGINT handler is set
-        a.leave()
+        a.leave()  # at once: deaf from its start (tests.fakes.slow_command)
         await ta
         assert running.proc is not None and running.proc.returncode == -15  # SIGTERM
 
@@ -271,6 +273,24 @@ def test_stopping_the_service_interrupts_every_request(svc: Service) -> None:
     upload(ws, "left.jpg")  # given to no request
     run(svc, scenario)
     assert list(ws.uploads.iterdir()) == []
+
+
+def test_an_interrupt_while_its_command_starts_is_the_commands_interrupt(ws: Workspace) -> None:
+    """A request interrupted as soon as its command started: the SIGINT may reach the command
+    before Python handles it, which kills a process started as usual (-2). The runner starts it
+    with SIGINT blocked (``core.process.sigint_blocked``), so the interrupt waits for the
+    command's ``run_main`` and ends as the command's own (130). Here the command sends itself the
+    SIGINT before ``run_main``, so the moment is certain."""
+    argv = ["--seconds=30", "--interrupt-at-start"]
+    plain = subprocess.run([sys.executable, "-m", slow_command.MODULE, *argv],
+                           capture_output=True, timeout=60)
+    assert plain.returncode == -signal.SIGINT  # started as usual: killed by the signal
+    runner = Runner(ws)
+    run_ = Run(1, "slow.sh", slow_command.MODULE, argv, inference=False)
+    t0 = time.monotonic()
+    outcome = runner._command(run_, ws.request_dir(run_.id))
+    assert (outcome.code, outcome.message) == (130, "slow.sh: interrupted")
+    assert time.monotonic() - t0 < 30  # interrupted, not slept
 
 
 def test_an_upload_in_use_is_neither_given_twice_nor_deleted(svc: Service) -> None:
