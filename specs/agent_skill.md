@@ -16,7 +16,7 @@ Part of the [high-level specification](high_level_spec.md) (§2 Components).
   stays within the Agent Skills limit of 1024 characters.
 * **Generated, not hand-written.** Like the API, the skill follows the
   [single source of truth](http_server.md#single-source-of-truth): its operations,
-  parameters, defaults, allowed values, result files and error codes are generated from the
+  parameters, defaults, allowed values, results and error codes are generated from the
   same shared definitions as `/api/openapi.json`, so a command that gains, changes or loses an
   option, an output or an error changes the skill without a hand-written edit. A test fails
   when the committed `SKILL.md` differs from the generated one or when an API route is
@@ -25,14 +25,16 @@ Part of the [high-level specification](high_level_spec.md) (§2 Components).
 * **It describes every endpoint:** each route under `/api/`, with its method, parameters or
   body, what it does (read-only, writes a map, needs the inference server), a ready-to-run
   `curl` command (`-T` for uploads, sending the raw file as the request body, since the service
-  refuses `-F` forms; `-N` for the event streams; `-o` for results and files), a sample
+  refuses `-F` forms; `-o` for results), a sample
   response, and the API's error shape (the command's message and machine-readable code, with
   the HTTP status of the generic rule).
-* **Job workflow.** The skill walks the agent through a whole job: upload the inputs (or name
-  paths inside the workspace), validate and submit the operation, follow the job by polling
-  or by its event stream until it ends, then download the result and each produced file.
-  Results are byte-identical to the command's output, so the agent saves them with `-o` and
-  never rewrites them; stage names and timings are read from the job.
+* **Request workflow.** The skill walks the agent through a whole request: upload the inputs
+  (or name paths inside the workspace), validate the request, then run the operation and
+  wait for its answer. A mapping request can take many minutes and the service runs
+  inference requests one at a time, so the agent keeps the connection open with no client
+  timeout: disconnecting interrupts the command. Results are byte-identical to the
+  command's output, so the agent saves them with `-o` and never rewrites them; stage names
+  and timings are read from the response's `Server-Timing` header.
 * **Server address.** `server.sh` binds a free port by default, so the URL changes from run to
   run. A shell snippet in the skill resolves the service's base URL and caches it in
   `${XDG_CACHE_HOME:-~/.cache}/oh-my-slam-api/server_url`, outside the repository. It uses, in
@@ -49,6 +51,6 @@ Part of the [high-level specification](high_level_spec.md) (§2 Components).
   health response instead of retrying, and still offers what works without it (persisted
   maps). The agent never starts or stops `server.sh` or the inference server, and never writes
   into a map's folder: maps change only through the mapping operation. It asks the user before
-  updating an existing map, before starting a long mapping job, and before cancelling a job
-  it did not submit. Inputs are uploads or paths inside the workspace, never paths outside it,
-  and an upload is consumed by one job, so re-submitting means uploading again.
+  updating an existing map and before starting a long mapping request. Inputs are uploads or
+  paths inside the workspace, never paths outside it, and an upload is consumed by one
+  request, so repeating a request means uploading again.

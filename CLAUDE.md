@@ -96,3 +96,4 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` / `segmen
   `-m models` command goes through one machine lock: `~/oh-my-slam-data/bin/heavy <cmd>` (Python `fcntl.flock` wrapper; macOS has no `flock`).
 - Research subagents verify claims online only: no installs, weight downloads or local benchmarks.
   This machine is the user's daily driver.
+- Only commit when the user requeres to

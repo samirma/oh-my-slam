@@ -16,7 +16,7 @@ The system is exposed through six shell entry points and an agent skill:
 | `mapper.sh` | Multi-frame mapping: build and update a persistent map, and locate an image's camera in it. |
 | `segment.sh` | Instance segmentation: image or map → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
 | `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
-| `server.sh` | Web service: an HTTP API and a browser application giving access to every feature of `reconstruct.sh`, `mapper.sh`, `segment.sh` and `view.sh`. |
+| `server.sh` | Web service: an HTTP API and a simple browser application that run every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` (§2.6). |
 | `SKILL.md` agent skill (`oh-my-slam-api`) | Lets an AI agent use every endpoint of the `server.sh` API with `curl`, from this Mac or any machine on the LAN (§2.7). |
 
 This document states requirements only. Detailed decisions — defaults, coordinate
