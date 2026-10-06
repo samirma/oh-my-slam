@@ -372,7 +372,9 @@ own HTTP request, and the response is the command's result.
   workspace (default `~/oh-my-slam-data/`). `--no-browser` skips opening
   `http://127.0.0.1:<port>/`: the browser gets the loopback address, and the stderr line names the
   bound address. `--status` and `--stop` take only `--data`; any `--port` (even `0`) or
-  `--no-browser` with them is a usage error.
+  `--no-browser` with them is a usage error: those two belong to the serve mode only
+  (`Option.modes` in `commands/entry_points.py`), and `spec.validate` refuses an option given to a
+  mode it does not belong to.
 * **Output.** Once accepting connections, stderr carries exactly one line
   `server.sh: listening on http://0.0.0.0:<port>/`. Nothing else is printed while it runs: the
   commands' stderr is a pipe the service reads, and right after the listening line the service's
@@ -1512,7 +1514,8 @@ at the Python-module level:
   `commands` > `tools` > `viewer` > `mapping` > `segmentation` > `reconstruction` > `client` >
   `schema` > `core`.
 * `commands/spec.py` is the commands' single source of truth (spec §2.6): every mode, option
-  (flag, kind, choices, default, accepted files, bounds, help, applicability), validation rule,
+  (flag, kind, choices, default, accepted files, bounds, help, applicability, the modes it
+  belongs to), validation rule,
   output and timing stage of `reconstruct.sh`, `mapper.sh update` / `locate`, `segment.sh -i`
   and `view.sh -i` / `-m` is declared there once. Each command builds its argparse parser
   (`spec.build_parser`) and runs its checks (`spec.validate`: each rule's pure check, then its

@@ -281,8 +281,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
 
 def main(argv: list[str]) -> int:
     args: argparse.Namespace = build_parser().parse_args(argv)
-    if (args.status or args.stop) and (args.port is not None or args.no_browser):
-        raise UsageError("--status and --stop take only --data")
+    spec.validate(WEB_SERVICE.command(), args)  # --port and --no-browser: the serve mode's only
     port = 0 if args.port is None else args.port
     if not 0 <= port <= 65535:
         raise UsageError(f"--port must be between 0 and 65535, got {port}")

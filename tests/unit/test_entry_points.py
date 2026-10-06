@@ -6,6 +6,7 @@ order, every exit status has a meaning, and the workspace default is one value."
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,18 @@ def test_what_the_servers_modes_do_and_how_they_fail() -> None:
     (cmd,) = WEB_SERVICE.commands
     assert [o.flag for o in cmd.mode_options(w_status)] == ["--data", "--status"]
     assert [o.flag for o in cmd.mode_options(serve)] == ["--port", "--data", "--no-browser"]
+
+
+@pytest.mark.parametrize(("argv", "message"), [
+    (["--status", "--port", "8"], "--port does not apply to server.sh --status"),
+    (["--stop", "--no-browser"], "--no-browser does not apply to server.sh --stop"),
+    (["--stop", "--port", "0", "--no-browser"],
+     "--port, --no-browser do not apply to server.sh --stop")])
+def test_the_serve_options_belong_to_the_serve_mode(argv: list[str], message: str) -> None:
+    """``--port`` and ``--no-browser`` are the serve mode's (``Option.modes``): the registry's
+    validation refuses them with ``--status`` and ``--stop`` before anything runs."""
+    with pytest.raises(UsageError, match=f"^{re.escape(message)}$"):
+        web_main.main(argv)
 
 
 def test_every_entry_point_is_listed_once_in_the_specs_order() -> None:

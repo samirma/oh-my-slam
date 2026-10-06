@@ -300,6 +300,47 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
         voxel=0.1)
 
 
+def test_an_option_belongs_to_the_modes_it_names() -> None:
+    """``Option.modes``: an option of some modes only is an option, an API parameter and a field
+    of those modes alone, and the validation refuses it with another mode (an enum left at its
+    default, which argparse sets, is not given)."""
+    serve = spec.Mode("serve", None, (), "never", "serves", (), ())
+    status = spec.Mode("status", "status", (), "never", "reports", (), ())
+    cmd = spec.Command("srv.sh", None, "a server", (
+        spec.Option("--port", "port", spec.Kind.NUMBER, "port", type=int, modes=("serve",)),
+        spec.Option("--tone", "tone", spec.Kind.ENUM, "tone", default="low",
+                    choices=("low", "high"), modes=("serve",)),
+        spec.Option("--data", "data", spec.Kind.FOLDER_OUT, "workspace"),
+        spec.Option("--status", "status", spec.Kind.FLAG, "report", default=False,
+                    group="action"),
+    ), (serve, status))
+    program = spec.Program("srv.sh", "a server", (cmd,), service=False)
+    assert [o.name for o in cmd.mode_options(serve)] == ["port", "tone", "data"]
+    assert [o.name for o in cmd.mode_options(status)] == ["data", "status"]
+    assert [p["name"] for p in (spec._option(status, o) for o in cmd.mode_options(status))] == [
+        "data", "status"]
+
+    def parsed(*argv: str) -> argparse.Namespace:
+        return spec.build_parser(program).parse_args(list(argv))
+
+    assert spec.validate(cmd, parsed("--port", "8", "--tone", "high")).port == 8
+    assert spec.validate(cmd, parsed("--status", "--data", "d")).status
+    assert cmd.foreign(status, parsed("--status", "--tone", "low")) == []  # the enum's default
+    def refused(message: str) -> str:
+        return f"^{re.escape(message)}$"
+
+    for port in ("8", "0"):  # 0 is a value given
+        with pytest.raises(UsageError, match=refused("--port does not apply to srv.sh --status")):
+            spec.validate(cmd, parsed("--status", "--port", port))
+    with pytest.raises(UsageError,
+                       match=refused("--port, --tone do not apply to srv.sh --status")):
+        spec.validate(cmd, parsed("--status", "--port", "8", "--tone", "high"))
+    with pytest.raises(ParameterError,
+                       match=re.escape("unrecognized parameters for srv.sh --status: port")):
+        spec.argv_of(cmd, status, {"port": 8, "data": "d"})
+    assert spec.argv_of(cmd, serve, {"port": 8}) == ["--port=8"]
+
+
 def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
         tmp_path: Path) -> None:
     seg = S.command()

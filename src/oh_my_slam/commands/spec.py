@@ -12,7 +12,8 @@ request runs, and :func:`describe` exports everything as JSON-serialisable data 
 document and the forms. A new or changed option here reaches the commands and the API alike.
 
 * An :class:`Option` records its flag, name, :class:`Kind`, choices, default, bounds, required-ness,
-  help text and where it applies (:class:`When`).
+  help text, where it applies (:class:`When`) and the modes it belongs to (all by default; an
+  option given to another mode is refused by :func:`validate`).
 * A :class:`Rule` is one validation step, run in order before any work starts: a pure ``check``
   (reads only) that raises the commands' own errors (``core/errors.py``) with their own messages,
   and an optional ``prepare`` with the side effect the command needs before it starts (``-d`` is
@@ -136,6 +137,7 @@ class Option:
     omit_if_default: bool = False  # giving the default is not the same as not giving it (-fps)
     metavar: str | None = None
     type: Callable[[str], Any] | None = None  # argparse conversion (None: the text)
+    modes: tuple[str, ...] | None = None  # the modes it belongs to (None: all)
     applies: tuple[When, ...] = ()  # applies when any of these holds (empty: always)
     applies_text: str = ""  # the same, in the command's words
     group: str | None = None  # mutually exclusive group (the modes' selectors)
@@ -284,8 +286,20 @@ class Command:
         return " ".join(parts)
 
     def mode_options(self, mode: Mode) -> list[Option]:
+        """The options of ``mode``: all but the other modes' selectors and the options that
+        belong to other modes only (``Option.modes``)."""
         others = {m.selector for m in self.modes if m is not mode and m.selector}
-        return [o for o in self.options if o.name not in others]
+        return [o for o in self.options if o.name not in others
+                and (o.modes is None or mode.name in o.modes)]
+
+    def foreign(self, mode: Mode, args: argparse.Namespace) -> list[Option]:
+        """The options given in ``args`` that are not options of ``mode`` (argparse leaves an
+        option that was not given None, a flag False and an enum its default)."""
+        own = self.mode_options(mode)
+        values = {o.name: getattr(args, o.name, None) for o in self.options}
+        return [o for o in self.options if o not in own
+                and values[o.name] is not None and values[o.name] is not False  # (0 is given)
+                and not (o.kind is Kind.ENUM and values[o.name] == o.default)]
 
 
 @dataclass(frozen=True)
@@ -723,8 +737,13 @@ def validate_deferring(cmd: Command, args: argparse.Namespace,
     """:func:`validate`, with the preparation of the rules in ``defer`` (e.g. creating the ``-d``
     folder) left to the returned callable, which the command calls once it may write — after its
     inference-server check — so a run refused for that reason leaves nothing behind. Every check
-    still runs first, in order."""
+    still runs first, in order, after the refusal of an option that belongs to another mode
+    (``Option.modes``: ``server.sh --status --port 8``)."""
     mode = cmd.mode_of(args)
+    foreign = [o.flag for o in cmd.foreign(mode, args)]
+    if foreign:
+        raise UsageError(f"{', '.join(foreign)} {'does' if len(foreign) == 1 else 'do'} not "
+                         f"apply to {cmd.label(mode)}")
     ctx = Context(args, argparse.Namespace(**vars(args)), mode, warn or (lambda _msg: None))
     later: list[Callable[[Context], None]] = []
     for rule in mode.rules:
