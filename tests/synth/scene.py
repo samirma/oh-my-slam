@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.geometry import rot_z, rotation_between
+from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.types import Intrinsics, Pose
 
 
@@ -152,8 +152,3 @@ def default_room() -> Room:
             "box"),
         Box(np.array([0.2, -1.5, 0.45]), np.array([1.6, 0.4, 0.9]), 0.0, (50, 70, 210), "sofa"),
     ])
-
-
-def gravity_rotation(up_cam: NDArray) -> NDArray:
-    """Rotation taking a camera-frame up vector onto map +z (helper for tests)."""
-    return rotation_between(up_cam, np.array([0.0, 0.0, 1.0]))

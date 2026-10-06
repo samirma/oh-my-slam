@@ -553,13 +553,6 @@ def test_split_ids_do_not_depend_on_earlier_updates_bookkeeping(tmp_path: Path) 
 # --- inputs ----------------------------------------------------------------------------------------
 
 
-def _png(path: Path, rgb: np.ndarray) -> Path:
-    from oh_my_slam.core.images import png_bytes
-
-    path.write_bytes(png_bytes(rgb))
-    return path
-
-
 @pytest.mark.parametrize("kind", ["missing", "empty", "hidden-only"])
 def test_update_creates_a_map_in_a_missing_or_empty_folder(tmp_path: Path, kind: str) -> None:
     from oh_my_slam.mapping.api import update
