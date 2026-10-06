@@ -130,22 +130,21 @@ class ViewBundle:
                 c["kind"] = "toggle"
             elif isinstance(value, str):
                 c.update(kind="choice", options=a.values.split("|"))
-            elif isinstance(value, int | float) and a.key in _SLIDERS:
+            else:  # a number: every numeric attribute has a slider
                 lo, hi, step, unit, off = _SLIDERS[a.key]
                 c.update(kind="int" if isinstance(value, int) else "float", min=lo,
                          max=self._depth_extent() if hi is None else hi, step=step, unit=unit,
                          off=None if off is None else a.format(off))
-            else:
-                c["kind"] = "text"
             out.append(c)
         return out
 
     def _depth_extent(self) -> float:
-        """Slider maximum for the depth range: the farthest valid depth, rounded up."""
-        if not isinstance(self.source, ImageCloudSource):
-            return 10.0
-        depth = np.asarray(self.source.depth)
-        d = depth[np.asarray(self.source.valid) & (depth > 0) & np.isfinite(depth)]
+        """Slider maximum for the depth range: the farthest valid depth, rounded up. The depth
+        range is pixel-level, so only an image (an ``ImageCloudSource``) has these controls."""
+        source = self.source
+        assert isinstance(source, ImageCloudSource)
+        depth = np.asarray(source.depth)
+        d = depth[np.asarray(source.valid) & (depth > 0) & np.isfinite(depth)]
         top = float(d.max()) if d.size else 10.0
         return max(0.1, math.ceil(top * 10.0) / 10.0)
 
