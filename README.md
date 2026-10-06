@@ -463,7 +463,9 @@ option.
     turn with its connection open.
   * All the others start at once, even while one runs.
   * Two requests never write the same map at once: a second writer waits for the first.
-  * `GET /api/health` counts the requests `running` and `waiting`.
+  * `GET /api/health` counts the requests `running` and `waiting`, and lists them
+    (`in_progress`, in arrival order: operation, command line as typed, state, arrival and start
+    times), so a client tells whether its own request runs or waits.
 * **Interruption.** A client that disconnects (uvicorn's `http.disconnect`) interrupts its
   request: a waiting one never starts; a running one gets SIGINT on its process group, the same as
   Ctrl-C, so an interrupted map update is the command's own uncommitted transaction and the map is
@@ -474,7 +476,7 @@ option.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/health` | Service and inference health, and the requests running and waiting. When the inference server is down, the response includes `start_command`. |
+| `GET /api/health` | Service and inference health, and the requests running and waiting (counts, and each one in `in_progress`). When the inference server is down, the response includes `start_command`. |
 | `GET /api/openapi.json` | The OpenAPI document. |
 | `POST /api/ops/<op>` | Run an operation; the answer is its result, with `Server-Timing`. |
 | `POST /api/ops/<op>/validate` | Check a request; nothing runs. |
@@ -483,78 +485,78 @@ option.
 | `GET /api/maps` | List maps, with summaries from `map.json` and the frame/object records. |
 | `GET /api/maps/<name>` | One map's summary and its full `map.json`. |
 
-**Web application** (spec §2.6 "Web application"). `/` serves a browser application in
+**Web application** (spec §2.6 "Web application"). `/` serves a simple browser application in
 `web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
-CDN). It talks only to the public API above, so everything it does can be scripted. `/static/…`
-serves its files, `/static/viewer/…` the viewer's modules and vendored three.js (which it reuses),
-and `/static/openlabel_json_schema.json` the vendored scene schema.
+CDN). It talks only to the public API above, so everything it does can be scripted, and it has no
+viewer: `view.sh` stays the way to look at a reconstruction or a map in 3D.
 
-The application described below predates the request API (spec §2.6: no jobs, no viewer, no
-downloads but the response) and is being reworked to it; the job, viewer and file endpoints it
-used are gone.
-
-* **Rendered from the API description.** The operations, their parameters and their outputs are
-  read from `/api/openapi.json` (each one's `x-oms` registry entry). Nothing in the app names a
-  command or an option (a unit test checks this). A new option becomes a new field, a new mode a
-  new form (on the page its inputs belong to), an option of a kind the app does not know a text
-  field, a new output file a new download, and a new error a new message; a browser test adds all
-  of these to the registry and finds them in the pages. Output entries say how to render a file
-  (`object_regions`: an image painted in the objects' colours), and a video condition carries the
-  suffixes of a video.
-* **Forms** have one field per parameter, chosen by its kind:
-  * path inputs get a drop zone and file picker that upload at once, or take a workspace path;
-    ordered inputs (`mapper.sh update -i`) are numbered and can be reordered;
-  * a map is chosen from the workspace's maps (the mapping mode also takes a new name);
-  * `-o` is a name in the job's folder; `-d` is a checkbox plus a folder name;
-  * `-p` gets one control per attribute of the mode;
-  * enums, numbers and flags get the matching control.
-
-  Each field shows its flag, help and default. Fields whose `applies` condition fails are hidden
-  and not sent. Each change is checked by `POST /api/ops/<op>/validate`, and each message appears
-  next to the field it names (`by_parameter`), with the command line the job will run.
-* **Pages.** Each has a stable hash URL, so a reload or a shared link returns to the same state
-  (the selected object is `?sel=<id>`). A new page moves the focus to its heading and is announced:
-  * `#/image` (`?op=` picks the mode, `/<job>` shows its job): a mode that takes one image, a
-    drop zone with a preview, the form, then the job's progress and result.
-  * `#/maps`, `#/maps/new`, `#/maps/<name>`, `#/maps/<name>/update`. A map's page has the
-    update history (each record of `map.json → updates[]` with every figure it holds, per-stage
-    timings included), and one form per operation that takes a map.
-  * `#/jobs` and `#/jobs/<id>`: the job list and a single job.
-  * `#/scene?ply=<url>&json=<url>`: the 3D scene viewer (also `layers=`, `color=`, `normals=`).
-* **Top bar.** Workspace name and inference-server status (with `start_command` when it is
-  down).
-* **Results.** Every file a job wrote can be downloaded. Images are drawn; in one the API marks
-  with `object_regions` (`segmented.png`), the object under a pixel is the one whose colour that
-  pixel has (colour contract). CSV files are
-  tables, and a scene JSON's objects are listed. A `.ply` or scene `.json` opens in the 3D scene
-  viewer.
-* **Confirmation.** Starting a map creation or update states its consequence in a
-  confirmation.
+* **Rendered from the API description.** The operations, their parameters and their results are
+  read from `/api/openapi.json` (each operation's `x-oms` registry entry). Nothing in the app names
+  a command or an option (a unit test checks this). A new option becomes a new field, a new mode
+  a new choice on the page its inputs belong to (one image: the Image page; a map: the map's
+  page), an option of a kind the app does not know a text field, and a new error a new message; a
+  browser test adds all of these to the registry and finds them in the pages.
+* **Pages.** Each has a stable hash URL, so a reload or a shared link returns to it, and a new
+  page moves the focus to its heading and is announced:
+  * `#/image?op=<op>`: the operations that take a single image (`reconstruct`, `segment-image`).
+    A drop zone with a preview, the generated form, the request, then the result.
+  * `#/maps?filter=<text>`: the workspace's maps as cards (frames, objects, updates, last update
+    and how long it took, from `/api/maps`), with a filter.
+  * `#/maps/<name>?op=<op>`: a map's summary (`/api/maps/<name>`), the operations that take a map
+    without writing it (`mapper-locate`, `segment-map`), and its update history: one row per
+    `map.json → updates[]` entry (when, input kind, files, frames added and rejected, objects,
+    time) with its per-stage timings and its other figures.
+  * `#/maps/new` and `#/maps/<name>/update`: the guided flow over the mapping operation: 1 the
+    inputs, numbered in the order they are used (arrow buttons and *Sort by name* reorder them;
+    the latest observation wins), 2 the map (a new name, or the map being updated), 3 the other
+    options, 4 the command line and what starting it does.
+* **Forms** have one field per parameter, chosen by its kind: path inputs upload at once (or take
+  a workspace path), a map is chosen from the workspace's maps (the mapping operation also takes
+  a new name and says whether it creates or extends a map), `-p` gets one control per attribute of
+  the mode, and enums, numbers and flags the matching control. Each field shows its flag, help and
+  default. Fields whose `applies` condition fails are hidden and not sent. Each change is checked
+  by `POST /api/ops/<op>/validate`, and its message appears next to the field it names
+  (`by_parameter`), with the command line the request will run; a field shows messages once it was
+  changed, every field once a run was asked for.
+* **A request runs in its page.** *Run* checks the request (a long operation, a map update, first
+  states its consequence in a confirmation), then sends it and shows it in progress: *Waiting for
+  its turn* or *Running*, with the elapsed time (and the time it waited). The page tells its own
+  request apart in `GET /api/health → service.in_progress`, which lists the requests in progress
+  with the command line their validation gave. The request belongs to the page: *Interrupt…*,
+  leaving the page (another page of the app asks in its own dialog) and reloading or closing it
+  (the browser's question) all ask first, since closing the connection interrupts the command as
+  Ctrl-C would (a map update leaves the map as it was). An upload is consumed by the one request
+  it is given to, so the page uploads the chosen files again for the next run (the mapping flow
+  clears its inputs once they are in the map); a page that goes away discards the uploads no
+  request consumed.
+* **Results.** The response body is the result. The page offers it as a download, byte for byte
+  (`<op>-<input or map>.<format>`), and shows it: a scene description (OpenLABEL) with its objects
+  listed (id, label, colour as a swatch and its `#rrggbb`, score), the JSON in full (formatted, or
+  exactly as received), a PLY's header and point count (an ASCII PLY in full), and the command's
+  per-stage timings from `Server-Timing`. A failure shows the command's message and code; a
+  refused request also marks its fields.
+* **Top bar.** Workspace name, inference-server status (with `start_command` when it is down),
+  and the requests running and waiting on the service.
 * **Inference server down.** Actions of a mode that always needs the server are disabled, with
-  the reason and the start command. A conditional need (`mapper.sh locate` on a large map) is
-  decided by the service's own check when the form is validated. Everything else stays available.
-* **3D scene viewer.** It opens a PLY, a scene JSON, or both, from a job (by URL) or from disk.
-  Files from disk are read in the browser and never uploaded. Both files are drawn in the same map
-  coordinates by the viewer's own modules (`Viewer`, `parsePly`, `sceneObjects`, `sceneCameras`,
-  `plyCameras`, layers, labels, the camera table with *Go to*). Each layer toggle names its file.
-  Files are parsed and validated in a Web Worker, and a PLY's header is read first.
-  * The point-cloud controls offer what the file allows: its colours or none, and shading by its
-    normals. The segmentation layer is available when the PLY has labels and the JSON has colours.
-  * A file that is not a PLY the viewer can draw is refused with the parser's reason.
-  * A JSON that fails the vendored OpenLABEL schema is refused with the reasons. The app checks it
-    with its own draft-07 validator (`js/scene/jsonschema.js`, kept in agreement with `jsonschema`
-    by a browser test), plus the checks of `schema/validate.py`.
-  * A PLY from disk with more than 16,000,000 points is refused, because the browser would draw
-    it whole above the display budget (§2.5).
+  the reason and the start command. A conditional need (`mapper-locate` on a large map) is decided
+  by the service's own check when the form is validated. Everything else stays available
+  (`segment-map` runs without the server).
 * **Accessibility and layout.**
   * Everything is reachable from the keyboard, focus is always visible, and every control has a
-    label. Object colours always appear with their id or label.
+    label. Object colours always appear with their id and label, and states carry a symbol and a
+    word besides their colour.
   * Light and dark themes follow the system and meet WCAG 2.1 AA contrast. Object colours are the
     colour contract's in both themes.
-  * Pages work from desktop down to tablet width (768 px).
-  * The browser tests run the vendored axe-core (`tests/browser/vendor/`) on every page, its
-    embedded viewer included, in both themes and at both widths, and fail on any violation of the
-    WCAG 2.0/2.1 A and AA rules.
+  * Pages work from desktop down to tablet width (768 px), without sideways scrolling.
+  * The browser tests run the vendored axe-core (`tests/browser/vendor/`) on every page, a result
+    included, in both themes and at both widths, and fail on any violation of the WCAG 2.0/2.1 A
+    and AA rules.
+* **Browser tests** (`tests/browser/test_webapp_browser.py`, `test_webapp_down.py`, `-m browser`,
+  Playwright with Edge or Chrome): a single-image request, map creation and update (COLMAP),
+  locating images in a map, segmenting a map, the downloads (compared with the response body),
+  interruption (button, leaving, reloading), a request waiting for its turn, the inference server
+  down, registry changes, URLs and the 100 ms rendering of a page, the keyboard, and axe-core. They
+  use the real service and request runner with the stub inference server.
 
 ### `SKILL.md` (agent skill)
 
@@ -1469,7 +1471,9 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * `mapper.sh locate` on the one-update map (the reference map): `-t single` JSON, `-t full` JSON
   and `-f ply -o`; the map folder, hidden entries (`.staging/`, `.lock`) included, must not change
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
-  ones): the whole sequence in one update, and split as its annotation says (4+4+5 and 6+7)
+  ones): the whole sequence in one update, and split as a `map_update` annotation says (for
+  example 4+4+5 and 6+7), else in two halves; the map update is judged only against such an
+  annotation (see Targets, baseline and results)
 * `mapper.sh update` on `street2.mp4` (150 s of street video) at the default `-fps`. It lives
   outside the repository, by default in `~/oh-my-slam-data/loop/inputs/street2.mp4`; `--street2`
   names another place. Without it the street2 metric fails and says where it looked.
@@ -1498,12 +1502,12 @@ The same-heading pairs are 001/053 (053 returns to 001's heading) and 026/078 (`
 | `perf.<group>.stage.<stage>.*` | Per stage, every stage the commands record: seconds (`.s`: median over the frames of a per-frame group, else the slowest run, so per image and per mapping update), client (`.client_peak_mb`) and server (`.server_peak_gb`) peak memory while it ran. |
 | `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs, for both `ainex` maps; `pose.locate.*` the same for the held-out captures `mapper.sh locate` placed (located fraction, yaw error relative to the map's capture 001; the detail compares each with the pose the map gives it once added); `pose.street2.registered_fraction` the share of the video's sampled frames the map registered. |
 | `map.*` | Frame agreement of the same-heading pairs and of every overlapping keyframe pair (optical axes < 45° apart, any distance in capture order: median and p90 over the pairs, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures); and the stability of ids, labels and OBBs between the one-update and the split map. Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. `matched_fraction` is the share of the one-update map's objects the split map has: the split map may keep an object an earlier update published that no later image contradicts (`mapper.md`), so its extra objects are listed in the detail (`extra_published`, id and label) and not counted against it. As `mapper.md` allows, an id may differ from the one-update map's where an earlier update of the split map had published it: `id_agreement` counts such a pair as agreeing (its detail keeps the strict share, `same_id`). |
-| `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids and labels of the unchanged objects from the first update to the last, after aligning the two updates by their common captures (`stability.label_agreement`, `stability.id_agreement`; a rebuild may re-gauge the frame and OBBs are refined, so box figures are detail only); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, are annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
+| `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids and labels of the unchanged objects from the first update to the last, after aligning the two updates by their common captures (`stability.label_agreement`, `stability.id_agreement`; a rebuild may re-gauge the frame and OBBs are refined, so box figures are detail only); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, come from a `kind: "map_update"` annotation in `examples/ground_truth/`; without one (none ships) the sequence is mapped but these metrics are not recorded, and the summary says so. |
 | `seg.*` | Detections per frame. |
 | `seg.map_consistency.*` | Per-frame detections compared with the map's objects. The map is built from the same detector, so these measure consistency, not accuracy. |
 | `contract.*` | Colour contract, OpenLABEL validity (and `mapper.sh locate`'s located cameras marked as such), stdout purity (including `server.sh`, and `locate -f ply`'s one pose line per input image), artefacts, same objects (`locate -t full` gives the map as `update -t full` does), and read-only maps. The colour contract covers the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). |
 | `server_sh.*` | `server.sh` (http_server.md "Evaluation"); see below. |
-| `gt.*` | Accuracy against ground truth, when annotations exist. |
+| `gt.*` | Accuracy against ground truth, when annotations exist (none ships). |
 
 ### `server.sh`
 
@@ -1512,22 +1516,26 @@ the reference inputs and of the one-update `ainex` map in that workspace.
 
 * **Performance:** start-up time (to the `listening on` line), resident memory of its process tree
   once listening, time from opening the web application to `body[data-ready=true]`, latency of
-  read-only requests (median and p95 when idle; p95 of the requests made while a job runs), and the
-  median overhead of a job over the same command run from the shell.
-* **Parity:** the operations come from the service's own `/api/openapi.json` (each job
-  operation's `x-oms` entry, the commands' `commands.spec.describe()`), so a new mode or option is covered without changing the evaluator.
-  Each operation gets a default case on the reference inputs and one case per non-default choice,
-  per artefact folder and per point-cloud attribute. Each case runs the command from the shell
-  twice and then as a job, and the job's result and every file of its artefact folder must be
-  byte-identical to the command's; for `view.sh`, what its viewer serves (`VIEWER_ROUTES`). The
-  models are not bit-reproducible from one request to the next, so the service and the shell
-  runs share an **inference proxy** (`tools/evaluate/proxy.py`): it forwards the first request of
-  a kind to the inference server and answers identical requests (same route, fields and input
-  file contents) with the recorded response. A difference is a mismatch, unless the command's
-  own two runs differ too (`unverifiable`).
+  read-only requests (the app, health, `openapi.json`, the maps and a map: median and p95 when
+  idle; p95 of the reads made while an operation's request runs), and the median overhead of an
+  operation's request over the same command run from the shell
+  (`server_sh.request_overhead_median_s`).
+* **Parity:** the operations come from the service's own `/api/openapi.json` (each operation's
+  `x-oms` entry, `commands.spec.describe()` as the API offers it), so a new mode or option is
+  covered without changing the evaluator. Each operation gets a default case on the reference
+  inputs and one case per non-default choice and per point-cloud attribute. Each case runs the
+  command from the shell twice and then as a request, with the same absolute workspace paths, and
+  the response body must be byte-identical to the command's stdout (the stages its `Server-Timing`
+  names are kept in the detail). The models are not bit-reproducible from one request to the
+  next, so the service and the shell runs share an **inference proxy**
+  (`tools/evaluate/proxy.py`): it forwards the first request of a kind to the inference server and
+  answers identical requests (same route, fields and input file contents) with the recorded
+  response. A difference is a mismatch, unless the command's own two runs differ too
+  (`unverifiable`).
 * **UI:** the web application's browser tests (`tests/browser/test_webapp*.py`, `-m browser`,
   with the stub inference server in an isolated runtime folder), and the vendored axe-core
-  (WCAG 2.0/2.1 A and AA) on the live service's pages over the reference data.
+  (WCAG 2.0/2.1 A and AA) on the live service's pages (Image, Maps, a map's page, the create and
+  update flows) over the reference data.
 
 ### Targets, baseline and results
 
@@ -1544,8 +1552,10 @@ A key with `*` is a pattern that targets every metric it matches without a targe
 most specific pattern wins): the per-stage metrics and the office splits, whose names are data,
 are targeted that way. The file's `rationale` explains each group of targets. Each metric's
 `measured` value is the reference run the targets were derived from, and the evaluator ignores
-it. Ground-truth files dropped into `examples/ground_truth/` are picked up without code changes
-(see its `README.md`). `--rejudge RESULT_DIR` runs nothing: it judges a stored run again with the
+it. Ground-truth annotations are optional and none ships: files dropped into
+`examples/ground_truth/` are picked up on the next run without code changes, and their format
+(`kind` `objects`, `poses`, `map_update`, with examples) is documented in
+`oh_my_slam.tools.evaluate.groundtruth`. `--rejudge RESULT_DIR` runs nothing: it judges a stored run again with the
 current targets and baseline and rewrites its `result.json` and `summary.md`.
 
 Each run is compared with the stored baseline `~/oh-my-slam-data/evaluations/baseline.json`,
@@ -1650,7 +1660,7 @@ runs it end to end as a test.
 uv run pytest -m "not models and not browser and not eval" -q         # offline suite (stub models)
 uv run pytest --cov=oh_my_slam -m "not models and not browser and not eval"
 OH_MY_SLAM_TEST_REAL_SERVER=1 uv run pytest -m models                 # real models; server running
-uv run pytest -m browser                                              # viewer in Edge/Chrome (Playwright)
+uv run pytest -m browser                                              # viewer and web app in Edge/Chrome (Playwright)
 uv run ruff check . && uv run mypy src && uv run lint-imports         # lint, types, ownership
 uv run python -m oh_my_slam.web.skill                                 # regenerate SKILL.md
 ```
