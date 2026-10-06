@@ -87,7 +87,8 @@ export function buildCloud({ header, arrays }, objectRgb, focal) {
 }
 
 // 2nd-98th percentile bounds of a sample of the positions, in the frame `matrix` maps them to: far
-// outliers (windows, sky) do not shrink the view.
+// outliers (windows, sky) do not shrink the view. Points with a non-finite coordinate are left out
+// (a PLY read in the page may hold some); with none left the box is empty.
 export function robustBox(positions, matrix) {
   const n = positions.length / 3;
   const step = Math.max(1, Math.floor(n / 50000));
@@ -95,8 +96,10 @@ export function robustBox(positions, matrix) {
   const v = new THREE.Vector3();
   for (let i = 0; i < n; i += step) {
     v.set(positions[3 * i], positions[3 * i + 1], positions[3 * i + 2]).applyMatrix4(matrix);
+    if (!Number.isFinite(v.x + v.y + v.z)) continue;
     xs.push(v.x); ys.push(v.y); zs.push(v.z);
   }
+  if (!xs.length) return new THREE.Box3();
   const q = (a, f) => { a.sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(f * a.length))]; };
   return new THREE.Box3(new THREE.Vector3(q(xs, 0.02), q(ys, 0.02), q(zs, 0.02)),
     new THREE.Vector3(q(xs, 0.98), q(ys, 0.98), q(zs, 0.98)));

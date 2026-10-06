@@ -1,8 +1,10 @@
 """The viewer's modules in a real browser (``-m browser``): the §2.5 display-budget notice over a map
-above the point budget, and its wording when points are omitted with no voxel grid."""
+above the point budget, and its wording when points are omitted with no voxel grid; the PLY reader
+a page that holds a PLY draws it with (``lib/ply.js``), against the writer of ``core.ply``."""
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -10,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.cloud import map_cloud_source
@@ -115,3 +118,44 @@ def test_budget_note_without_a_grid(over_budget: View) -> None:
     note = module(v, "controls.js", "return m.budgetNote({count: 5, total: 7, voxel: 0});")
     assert note.startswith("Showing 5 of 7 points: one per distinct position") and "mm" not in note
     assert module(v, "controls.js", "return m.budgetNote({count: 7, total: 7, voxel: 0});") == ""
+
+
+@pytest.mark.parametrize("encoding", ["binary", "ascii"])
+def test_ply_reader_reads_what_the_writer_wrote(over_budget: View, encoding: str) -> None:
+    """lib/ply.js reads core.ply's PLY exactly (positions, normals, colours, object ids, the recorded
+    attributes and the header's comments), in the page or in its worker; within a budget it keeps
+    that many points evenly spaced in the file's order, each with exactly its values; a damaged PLY
+    is refused with the reason."""
+    rng = np.random.default_rng(3)
+    n = 2503
+    cloud = PointCloud(rng.normal(size=(n, 3)).astype(np.float32), rng.integers(0, 256, (n, 3), np.uint8),
+                       rng.integers(0, 4, n).astype(np.int32), rng.normal(size=(n, 3)).astype(np.float32))
+    comments = ["oh-my-slam map frame (z up), metres", "attributes color=segment,normals=on"]
+    data = ply_bytes(cloud, encoding=encoding, comments=comments)
+    body = """const bytes = Uint8Array.from(atob(arg.b64), (c) => c.charCodeAt(0));
+      const out = (c) => ({header: c.header, position: [...c.arrays.position], normal: [...c.arrays.normal],
+                           color: [...c.arrays.color], label: [...c.arrays.label]});
+      const all = m.parsePly(bytes.buffer.slice(0));
+      const some = await m.loadPly(bytes.buffer.slice(0), 1000);
+      let error = null;
+      try { m.parsePly(bytes.buffer.slice(0, bytes.length - 40)); } catch (e) { error = e.message; }
+      return {all: out(all), some: out(some), error};"""
+    r = module(over_budget, "ply.js", body, {"b64": base64.b64encode(data).decode()})
+    spaced = np.floor(np.arange(1000) * (n / 1000)).astype(int)  # vertex floor(i * step)
+    for got, keep in ((r["all"], slice(None)), (r["some"], spaced)):
+        np.testing.assert_array_equal(np.array(got["position"], np.float32).reshape(-1, 3), cloud.xyz[keep])
+        np.testing.assert_array_equal(np.array(got["normal"], np.float32).reshape(-1, 3), cloud.normals[keep])
+        np.testing.assert_array_equal(np.array(got["color"]).reshape(-1, 3), cloud.rgb[keep])
+        np.testing.assert_array_equal(got["label"], cloud.label[keep])
+    assert r["all"]["header"] == {"count": n, "total": n, "voxel": 0, "step": 1, "attrs": "color=segment,normals=on",
+                                  "format": f"{'binary_little_endian' if encoding == 'binary' else 'ascii'} 1.0",
+                                  "comments": comments}
+    assert (r["some"]["header"]["count"], r["some"]["header"]["total"], r["some"]["header"]["step"]) == (1000, n, n / 1000)
+    assert len(set(spaced)) == 1000 and spaced[-1] < n
+    if encoding == "binary":
+        assert r["error"] == f"the PLY body is too short for {n} vertices"
+    else:  # the last line cut short
+        assert re.fullmatch(rf"PLY vertex {n - 1} has \d values, not 10", r["error"]), r["error"]
+    note = module(over_budget, "controls.js", "return m.budgetNote({count: 1000, total: 2503, voxel: 0, step: 2.503});")
+    assert note == ("Showing 1,000 of 2,503 points: evenly spaced in the file's order, read in this page "
+                    "(display budget; PLY outputs and the map stay complete).")

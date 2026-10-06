@@ -271,6 +271,24 @@ def test_upright_display_frame() -> None:
     np.testing.assert_allclose(T[:3, :3] @ tilted, [0, 0, 1], atol=1e-9)
 
 
+def test_a_ply_read_in_a_page_is_framed_as_view_sh_frames_it() -> None:
+    """lib/cloudview.js (a PLY a page holds, drawn by this viewer) shows a cloud whose header names
+    the single image's camera frame upright with view.sh's own transform for a level camera (a PLY
+    does not carry the estimated up): its constants are the Python ones."""
+    import re
+
+    from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
+    from oh_my_slam.segmentation.cloud import IMAGE_FRAME
+    from oh_my_slam.viewer.routes import STATIC
+
+    js = (STATIC / "lib" / "cloudview.js").read_text()
+    frame = re.search(r"export const IMAGE_FRAME = '([^']+)';", js)
+    level = re.search(r"export const LEVEL_UPRIGHT = (\[\[.*?\]\]);", js)
+    assert frame and level
+    assert frame[1] == IMAGE_FRAME
+    np.testing.assert_array_equal(json.loads(level[1]), upright_transform(DEFAULT_UP_CAM).round(12) + 0.0)
+
+
 def test_view_cli_arguments() -> None:
     from oh_my_slam.cli.view import URL_LINE, build_parser
 

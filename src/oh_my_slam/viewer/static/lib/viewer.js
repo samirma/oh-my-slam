@@ -1,6 +1,7 @@
 // The 3D view of view.sh's page (spec §2.5): put it in a host element, give it a cloud (cloud.js),
 // the objects of a scene (obbs.js) and cameras (cameras.js). It draws the point-cloud,
-// segmentation, camera, label and OBB layers, frames the scene and moves to a camera.
+// segmentation, camera, label and OBB layers, frames the scene and moves to a camera. cloudview.js
+// draws a PLY a page holds with it (the server.sh web application's point-cloud results).
 //
 // Frames are drawn on demand: an idle view draws nothing, so that a large cloud does not keep the
 // GPU busy next to the inference server. Whatever changes the canvas calls invalidate(); the loop
@@ -70,11 +71,13 @@ export class Viewer {
     controls.screenSpacePanning = true;
     this.controls = controls;
     controls.addEventListener('change', () => this.invalidate());
-    for (const type of ['pointerdown', 'pointerup', 'wheel', 'keydown', 'input', 'change', 'click']) {
-      window.addEventListener(type, () => this.invalidate(), { capture: true, passive: true });
+    this._onEvent = () => this.invalidate();
+    this._windowEvents = ['pointerdown', 'pointerup', 'wheel', 'keydown', 'input', 'change', 'click'];
+    for (const type of this._windowEvents) {
+      window.addEventListener(type, this._onEvent, { capture: true, passive: true });
     }
-    document.addEventListener('visibilitychange', () => this.invalidate());
-    renderer.domElement.addEventListener('webglcontextrestored', () => this.invalidate());
+    document.addEventListener('visibilitychange', this._onEvent);
+    renderer.domElement.addEventListener('webglcontextrestored', this._onEvent);
 
     this.root = new THREE.Group();  // display transform (an image: camera frame -> z-up)
     this.root.matrixAutoUpdate = false;
@@ -87,13 +90,29 @@ export class Viewer {
     }
     this._lastView = new THREE.Matrix4();
     this._lastProj = new THREE.Matrix4();
-    new ResizeObserver(() => this.resize()).observe(host);
+    this._resizes = new ResizeObserver(() => this.resize());
+    this._resizes.observe(host);
     this.resize();
-    const loop = () => { requestAnimationFrame(loop); this._frame(); };
-    requestAnimationFrame(loop);
+    const loop = () => { this._raf = requestAnimationFrame(loop); this._frame(); };
+    this._raf = requestAnimationFrame(loop);
   }
 
   invalidate(frames = REDRAW_FRAMES) { this._redraw = Math.max(this._redraw, frames); }
+
+  // Stop drawing and release everything: the loop, the listeners, the GPU resources and the WebGL
+  // context (a page that shows one view after another never runs out of contexts), the canvas.
+  dispose() {
+    cancelAnimationFrame(this._raf);
+    this._resizes.disconnect();
+    for (const type of this._windowEvents) window.removeEventListener(type, this._onEvent, { capture: true });
+    document.removeEventListener('visibilitychange', this._onEvent);
+    this.controls.dispose();
+    for (const k of GROUPS) this._clear(this.groups[k]);
+    this.renderer.dispose();
+    this.renderer.forceContextLoss();
+    this.renderer.domElement.remove();
+    this.labels.root.remove();
+  }
 
   // ------------------------------------------------------------ frame
   setDisplayTransform(rowsMajor) {
