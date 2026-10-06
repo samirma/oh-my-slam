@@ -267,10 +267,6 @@ class MapReader:
     def image_path(self, fr: FrameRecord) -> Path:
         return self.path(fr.image)
 
-    @property
-    def update_id(self) -> int:
-        return int(self.meta.get("update_count", 0))
-
 
 class MapTransaction:
     """Exclusive, staged update of a map folder (created if missing or empty)."""

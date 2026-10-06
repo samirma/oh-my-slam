@@ -245,9 +245,8 @@ def apply_latest_wins(ctx: Any, records: list[Any], progress: Any) -> None:
         cells = contradicted_cells(old, new_views)
         if not cells.any():
             continue
+        # every contradicted cell holds the usable (so valid) pixel that voted for it
         kill = cells_to_pixels(cells, old.depth.shape) & old.valid
-        if not kill.any():
-            continue
         tx.write_bytes(store.frame_file(rec.name, "valid.png"),
                        png_bytes((old.valid & ~kill).astype(np.uint8) * 255))
         changed += 1

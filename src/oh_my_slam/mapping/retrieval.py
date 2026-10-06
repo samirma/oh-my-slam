@@ -28,7 +28,7 @@ def top_k_pairs(desc_query: NDArray[Any], desc_db: NDArray[Any], k: int,
     sim = similarity(desc_query, desc_db)
     qa = np.asarray(query_ids)[:, None]
     da = np.asarray(db_ids)[None, :]
-    sim[np.abs(qa - da) <= min_gap] = -np.inf
+    sim[np.abs(qa - da) <= max(min_gap, 0)] = -np.inf  # the item itself never pairs
     pairs: set[tuple[int, int]] = set()
     kk = min(k, sim.shape[1])
     order = np.argsort(-sim, axis=1)[:, :kk]
@@ -36,8 +36,7 @@ def top_k_pairs(desc_query: NDArray[Any], desc_db: NDArray[Any], k: int,
         for j in row:
             if np.isfinite(sim[qi, j]):
                 a, b = query_ids[qi], db_ids[j]
-                if a != b:
-                    pairs.add((min(a, b), max(a, b)))
+                pairs.add((min(a, b), max(a, b)))
     return pairs
 
 
