@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam-api
-description: "Use the oh-my-slam web service (server.sh) with sh and curl, from its Mac or any machine on the LAN. Jobs (JSON = OpenLABEL scene): reconstruct.sh Single-image reconstruction (stdout or -o file): reconstruct → JSON/PLY; mapper.sh Multi-frame mapping (persistent map): mapper-update (create or extend a map), mapper-locate (camera pose of images in an existing map (read-only)) → JSON/PLY/map; segment.sh Instance segmentation → JSON + OBBs, artefacts: segment-image, segment-map → JSON/PLY/PNG/CSV/Markdown; view.sh Browser visualisation of an image or a map: view-image, view-map → viewer page. Also: upload inputs; list maps, download map files; follow, cancel and resubmit jobs, get their log, stage timings, results and files; open 3D viewers of maps and jobs; service and inference-server health; the OpenAPI document. Use when the user asks for any of these and a server.sh is running (its URL, else ask). Inference server needed except for segment-map, view-map (mapper-locate: at times)."
+description: "Use the oh-my-slam web service (server.sh) with sh and curl, from its Mac or the LAN. Jobs (JSON = OpenLABEL scene): reconstruct.sh Single-image reconstruction (stdout or -o file): reconstruct → JSON/PLY; mapper.sh Multi-frame mapping (persistent map): mapper-update (create or extend a map) → JSON/PLY/map, mapper-locate (camera pose of images in an existing map (read-only)) → JSON/PLY; segment.sh Instance segmentation → JSON + OBBs, artefacts: segment-image, segment-map → JSON/PLY/PNG/CSV/Markdown; view.sh Browser visualisation of an image or a map: view-image, view-map → viewer page. Also: validate requests; upload and discard inputs; list maps, download map files; follow, cancel, resubmit jobs; get their log, stage timings, results, files; open 3D viewers of maps and jobs; service and inference-server health; the OpenAPI document. Use when the user asks for any of these and a server.sh is running (its URL, else ask). Inference server needed except for segment-map, view-map (mapper-locate: at times)."
 ---
 
 # oh-my-slam API
@@ -100,10 +100,10 @@ snippet again: it searches again only when the cached URL stops answering.
   the user runs them.
 * **Never write into a map's folder** (`<data>/maps/<name>/`, not even through the shell on the
   Mac): maps change only through `mapper-update`. Map files are download-only.
-* **Ask the user first** before updating an existing map (`mapper-update` with the name of a map that
-  `GET /api/maps/<name>` finds), before starting a long mapping job (`mapper-update` on new inputs
-  runs 15 stages, from `setup` to `commit`, and can take many minutes), and before cancelling a job you did not
-  submit. Say what follows when you ask: an update changes the map for good; a cancelled job
+* **Ask the user first** before updating an existing map (`mapper-update`, or the `resubmit` of such
+  a job, with the name of a map that `GET /api/maps/<name>` finds), before starting a long mapping
+  job (`mapper-update` on new inputs runs 15 stages, from `setup` to `commit`, and can take many minutes), and before
+  cancelling a job you did not submit. Say what follows when you ask: an update changes the map for good; a cancelled job
   leaves no result.
 * **Inputs are uploads or paths inside the workspace** (relative to it, such as
   `uploads/<upload>/photo.jpg`), never paths outside it, which are refused (400). A file on your
@@ -126,8 +126,9 @@ Every error is
 A refused operation (and validate's `problems`) adds `rule`, `parameters` (those it concerns),
 `exit_code`, `problems` (every problem) and `by_parameter` (the messages per parameter). For
 example, `POST /api/ops/segment-image` with the body `{}` answers 400 `{"error":{"rule":"arguments","parameters":["image","map"],"message":"one of the arguments -i -m is required","code":"usage","exit_code":2,"http_status":400,"problems":[…],"by_parameter":{"image":["one of the arguments -i -m is required"]}}}`. A job that failed or was
-cancelled carries `code`, `exit_code`, `http_status` and `message` in its `error`. The code is the
-name of the command's exit status, mapped to an HTTP status by one rule (input errors 4xx,
+cancelled carries `code` and `message` in its `error`, plus `exit_code` and `http_status` once
+its command ran (not for a job cancelled before it started, or ended by a service stop). The code
+is the name of the command's exit status, mapped to an HTTP status by one rule (input errors 4xx,
 inference server unavailable 503, internal 500):
 
 | Code | Exit status | HTTP | Job state |
@@ -205,8 +206,10 @@ Operations works the same way.
    ```
    or by polling it every few seconds:
    ```sh
-   BASE=<url>; JOB=<job>; while :; do s=$(curl -sS "$BASE/api/jobs/$JOB" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p'); echo "$s"; case $s in queued|running) sleep 5 ;; *) break ;; esac; done
+   BASE=<url>; JOB=<job>; while :; do s=$(curl -sS "$BASE/api/jobs/$JOB" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p'); [ -n "$s" ] || { curl -sS "$BASE/api/jobs/$JOB" >&2; break; }; echo "$s"; case $s in queued|running) sleep 5 ;; *) break ;; esac; done
    ```
+   (no state: the error it answers, such as 404 `not_found` for a mistyped job id, goes to
+   stderr).
    While it runs, `stage` is the command's own timing stage (here `connect` → `inference` → `segment` → `export` → `artifacts` → `write`) and `progress` is
    `{"stage","done","total"}` where the command knows its size. Jobs that use the inference
    server run one at a time in submission order, so a job may stay `queued` for a while.
@@ -282,7 +285,7 @@ Produces:
 
 Stages: `connect` → `inference` → `segment` → `export` → `write`. Checks: -p sets point-cloud attributes, which only the PLY output has: use -f ply; every key and value is valid for the command (spec §2.2); the -o file can be written (it is not a folder), checked before any work; the -i image exists. Refused with: `usage` (400), `server_unavailable` (503); a job can end with any code of the table in Errors.
 
-`POST /api/ops/reconstruct?viewer=true`: also save the viewer of the request's image: one more step of the same job, which replays the command's recorded inference (no second pass; only what the command did not ask, e.g. segmentation for reconstruct -f ply, goes to the server).
+`POST /api/ops/reconstruct?viewer=true`: also save the viewer of the request's image: one more step of the same job, which replays the command's recorded inference (no second pass; only what the command did not ask for goes to the server).
 
 ```sh
 curl -sS -X POST "$BASE/api/ops/reconstruct/validate" -H 'Content-Type: application/json' -d '{"image":"uploads/<upload>/photo.jpg"}'
@@ -297,7 +300,7 @@ curl -sS -X POST "$BASE/api/ops/reconstruct" -H 'Content-Type: application/json'
 
 ### `mapper-update` — `mapper.sh update`
 
-`POST /api/ops/mapper-update` · `POST /api/ops/mapper-update/validate`. Create or extend a map. **Needs the inference server** (infers depth and objects of every new keyframe). **Writes the map** named by `map` (creates or extends it): ask the user first (see Safety).
+`POST /api/ops/mapper-update` · `POST /api/ops/mapper-update/validate`. Create or extend a map. **Needs the inference server** (infers depth and objects of every new keyframe). **Writes the map** named by `map` (the map folder, created or extended): ask the user first (see Safety).
 
 | Parameter | Flag | Value | Default | Meaning |
 |---|---|---|---|---|
@@ -418,7 +421,7 @@ Produces:
 
 Stages: `connect` → `inference` → `segment` → `export` → `artifacts` → `write`. Checks: --min-score is a finite number; -p sets point-cloud attributes, which shape the PLY output: use -f ply or -d <folder>; every key and value is valid for the command (spec §2.2); the -o file can be written (it is not a folder), checked before any work; the -d folder can be created and written, checked before any work; the -i image exists. Refused with: `usage` (400), `server_unavailable` (503); a job can end with any code of the table in Errors.
 
-`POST /api/ops/segment-image?viewer=true`: also save the viewer of the request's image: one more step of the same job, which replays the command's recorded inference (no second pass; only what the command did not ask, e.g. segmentation for reconstruct -f ply, goes to the server).
+`POST /api/ops/segment-image?viewer=true`: also save the viewer of the request's image: one more step of the same job, which replays the command's recorded inference (no second pass; only what the command did not ask for goes to the server).
 
 ```sh
 curl -sS -X POST "$BASE/api/ops/segment-image/validate" -H 'Content-Type: application/json' -d '{"image":"uploads/<upload>/photo.jpg"}'
@@ -528,7 +531,7 @@ curl -sS -X POST "$BASE/api/ops/view-map" -H 'Content-Type: application/json' -d
 
 ## Endpoints
 
-The service's own endpoints, besides the operations. In paths, `{id}` is a job's or an upload's id, `{name}` a map's name and `{path}` a file's path. Any of them answers an error of Errors when it fails.
+The service's own endpoints, besides the operations. In paths, `{id}` is a job's or an upload's id, `{name}` a map's name and `{path}` a file's path. They answer an error of Errors when they fail, except a viewer's data paths (`…/viewer/api/…`), which answer the viewer's own `{"error": "<message>"}` (400, 500) or a plain-text 404, and a path or method the service does not have, which answers plain text (404 `Not Found`, 405 `Method Not Allowed`).
 
 ### Service
 
@@ -676,7 +679,7 @@ curl -sS -X POST -H 'Content-Type: application/json' "$BASE/api/jobs/<job>/cance
 
 #### `POST /api/jobs/{id}/resubmit`
 
-Submits a new job (it needs the inference server when its operation does). The same operation and parameters again; the body (a JSON object, `{}` for none) replaces some. The old job's uploads were deleted when it ended: upload the files again and pass their new paths. Answers 202 and the new job, or the refusal of a submission; 410 `gone` when the operation no longer exists.
+Submits a new job: it needs the inference server when its operation does, and writes the map when its operation does (`mapper-update`): then ask the user first (see Safety). The same operation and parameters again; the body (a JSON object, `{}` for none) replaces some. The old job's uploads were deleted when it ended: upload the files again and pass their new paths. Answers 202 and the new job, or the refusal of a submission; 410 `gone` when the operation no longer exists.
 
 ```sh
 curl -sS -X POST "$BASE/api/jobs/<job>/resubmit" -H 'Content-Type: application/json' -d '{"image":"uploads/<upload>/photo.jpg"}'
@@ -741,7 +744,7 @@ curl -sS "$BASE/api/jobs/<job>/timings"
 
 #### `GET /api/maps/{name}/viewer/{path}` · `GET /api/maps/{name}/viewer`
 
-Read-only. The map's viewer: give the user `$BASE/viewer/map/<map>/`, the same viewer at its page URL (`/api/maps/{name}/viewer` redirects to `…/viewer/`). Its data is the viewer's own: `api/meta`, `api/scene` (the scene JSON), `api/catalog` and `api/cloud?<attributes>` (binary).
+Read-only. The map's viewer: give the user `$BASE/viewer/map/<map>/`, the same viewer at its page URL (`/api/maps/{name}/viewer` redirects to `…/viewer/`). Its data paths, such as `api/meta`, are the viewer's own (spec 2.5).
 
 ```sh
 curl -sS "$BASE/api/maps/<map>/viewer/api/meta"
@@ -781,7 +784,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/viewer/job/<job>/"
 
 #### `GET /api/jobs/{id}/display-cloud`
 
-Read-only. For the browser's 3D scene viewer, not for saving: a PLY file of the job as the viewer draws it, the viewer's binary cloud document within its display budget. Download the PLY itself from `result` or `files`. Query: `file` (optional).
+Read-only. For the browser's 3D scene viewer, not for saving: a PLY file of the job as the viewer draws it, the viewer's binary cloud document within its display budget. Download the PLY itself from `result` or `files`. Query: `file` (optional): the `path` of a PLY in the job's files (default: its result).
 
 ```sh
 curl -sS -o cloud.bin -w '%{http_code}\n' "$BASE/api/jobs/<job>/display-cloud?file=<path>"

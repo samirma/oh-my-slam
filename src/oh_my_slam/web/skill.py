@@ -73,17 +73,26 @@ SERVICE_ERRORS: dict[str, tuple[int, str]] = {
     "stopping": (503, "a submission while the service shuts down"),
 }
 
-# The service's own features (not the operations), as the description names them: path parts →
-# words. tests/unit/test_agent_skill.py checks that every route of the app outside /api/ops/
-# contains one of these path parts, so a new kind of endpoint needs its words here.
+# The service's own features (every route but an operation's submission), as the description
+# names them: routes → words. tests/unit/test_agent_skill.py checks that these routes are exactly
+# the app's, so an endpoint that is added or removed needs its words changed here.
 FEATURES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("/api/uploads",), "upload inputs"),
-    (("/api/maps",), "list maps, download map files"),
-    (("/api/jobs",), "follow, cancel and resubmit jobs, get their log, stage timings, results "
-                     "and files"),
-    (("viewer", "/api/display-"), "open 3D viewers of maps and jobs"),
-    (("/api/health",), "service and inference-server health"),
-    (("/api/openapi.json",), "the OpenAPI document"),
+    (("POST /api/ops/{op}/validate",), "validate requests"),
+    (("POST /api/uploads", "DELETE /api/uploads/{id}"), "upload and discard inputs"),
+    (("GET /api/maps", "GET /api/maps/{name}", "GET /api/maps/{name}/files/{path}"),
+     "list maps, download map files"),
+    (("GET /api/jobs", "GET /api/jobs/events", "GET /api/jobs/{id}", "GET /api/jobs/{id}/events",
+      "POST /api/jobs/{id}/cancel", "POST /api/jobs/{id}/resubmit", "GET /api/jobs/{id}/log",
+      "GET /api/jobs/{id}/timings", "GET /api/jobs/{id}/result", "GET /api/jobs/{id}/files",
+      "GET /api/jobs/{id}/files/{path}"),
+     "follow, cancel, resubmit jobs; get their log, stage timings, results, files"),
+    (("GET /api/maps/{name}/viewer", "GET /api/maps/{name}/viewer/{path}",
+      "GET /api/jobs/{id}/viewer", "GET /api/jobs/{id}/viewer/{path}", "GET /viewer/map/{name}",
+      "GET /viewer/map/{name}/{path}", "GET /viewer/job/{id}", "GET /viewer/job/{id}/{path}",
+      "GET /api/jobs/{id}/display-cloud", "GET /api/display-transform"),
+     "open 3D viewers of maps and jobs"),
+    (("GET /api/health",), "service and inference-server health"),
+    (("GET /api/openapi.json",), "the OpenAPI document"),
 )
 # The description's words for the commands' output formats (another format is named as is).
 FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG", "csv": "CSV", "markdown": "Markdown",
@@ -400,8 +409,9 @@ def inference_text(d: Json) -> str:
 def effect_text(op: Operation) -> str:
     writes = op.writes_map()
     if writes is not None:
-        return (f"**Writes the map** named by {code(writes.name)} (creates or extends it): ask the "
-                "user first (see Safety).")
+        what = next(o.text for o in op.mode.outputs if o.via == writes.flag)
+        return (f"**Writes the map** named by {code(writes.name)} ({what}): ask the user first "
+                "(see Safety).")
     if op.browser:
         return "Read-only: saves a viewer in the job's own folder."
     return "Read-only: writes only the job's own files."
@@ -444,13 +454,19 @@ def description(ops: dict[str, Operation]) -> str:
     what it produces, the service's other features, and the conditions (a running service; the
     operations that need the inference server). Within the Agent Skills limit: when more
     commands would not fit, the subcommands' help and then the formats are left out."""
+    def made(op: Operation) -> str:
+        return "/".join(dict.fromkeys(FORMATS.get(o.format, o.format) for o in op.mode.outputs))
+
     def clause(p: spec.Program, helps: bool, formats: bool) -> str:
+        """The command's operations, each run of those that produce the same formats followed
+        by them."""
         mine = [op for op in ops.values() if op.program is p]
-        made = dict.fromkeys(FORMATS.get(o.format, o.format) for op in mine for o in op.mode.outputs)
-        ids = ", ".join(op.id + (f" ({op.command.help})" if helps and op.command.name else "")
-                        for op in mine)
-        return f"{p.prog} {p.description.rstrip('.')}: {ids}" + (
-            f" → {'/'.join(made)}" if formats else "")
+        parts = []
+        for i, op in enumerate(mine):
+            parts.append(op.id + (f" ({op.command.help})" if helps and op.command.name else ""))
+            if formats and (i + 1 == len(mine) or made(mine[i + 1]) != made(op)):
+                parts[-1] += f" → {made(op)}"
+        return f"{p.prog} {p.description.rstrip('.')}: {', '.join(parts)}"
 
     def ids(inference: str) -> str:
         return ", ".join(op.id for op in ops.values() if op.mode.inference == inference)
@@ -462,8 +478,8 @@ def description(ops: dict[str, Operation]) -> str:
     for helps, formats in ((True, True), (False, True), (False, False)):
         programs = "; ".join(clause(p, helps, formats) for p in spec.PROGRAMS
                              if any(op.program is p for op in ops.values()))
-        text = ("Use the oh-my-slam web service (server.sh) with sh and curl, from its Mac or any "
-                f"machine on the LAN. Jobs (JSON = OpenLABEL scene): {programs}. Also: "
+        text = ("Use the oh-my-slam web service (server.sh) with sh and curl, from its Mac or the "
+                f"LAN. Jobs (JSON = OpenLABEL scene): {programs}. Also: "
                 + "; ".join(words for _, words in FEATURES) + ". Use when the user asks for any "
                 f"of these and a server.sh is running (its URL, else ask). {inference}")
         if len(text) <= DESCRIPTION_MAX:
@@ -540,10 +556,10 @@ SAFETY = """## Safety
   the user runs them.
 * **Never write into a map's folder** (`<data>/maps/<name>/`, not even through the shell on the
   Mac): maps change only through {{writers}}. Map files are download-only.
-* **Ask the user first** before updating an existing map ({{writers}} with the name of a map that
-  `GET /api/maps/<name>` finds), before starting a long mapping job ({{writers}} on new inputs
-  runs {{writer_stages}} and can take many minutes), and before cancelling a job you did not
-  submit. Say what follows when you ask: an update changes the map for good; a cancelled job
+* **Ask the user first** before updating an existing map ({{writers}}, or the `resubmit` of such
+  a job, with the name of a map that `GET /api/maps/<name>` finds), before starting a long mapping
+  job ({{writers}} on new inputs runs {{writer_stages}} and can take many minutes), and before
+  cancelling a job you did not submit. Say what follows when you ask: an update changes the map for good; a cancelled job
   leaves no result.
 * **Inputs are uploads or paths inside the workspace** (relative to it, such as
   `uploads/<upload>/photo.jpg`), never paths outside it, which are refused (400). A file on your
@@ -567,8 +583,9 @@ Every error is
 A refused operation (and validate's `problems`) adds `rule`, `parameters` (those it concerns),
 `exit_code`, `problems` (every problem) and `by_parameter` (the messages per parameter). For
 example, `POST /api/ops/{{op}}` with the body `{}` answers {{refusal}}. A job that failed or was
-cancelled carries `code`, `exit_code`, `http_status` and `message` in its `error`. The code is the
-name of the command's exit status, mapped to an HTTP status by one rule (input errors 4xx,
+cancelled carries `code` and `message` in its `error`, plus `exit_code` and `http_status` once
+its command ran (not for a job cancelled before it started, or ended by a service stop). The code
+is the name of the command's exit status, mapped to an HTTP status by one rule (input errors 4xx,
 inference server unavailable 503, internal 500):
 
 | Code | Exit status | HTTP | Job state |
@@ -632,8 +649,10 @@ Operations works the same way.
    ```
    or by polling it every few seconds:
    ```sh
-   BASE=<url>; JOB=<job>; while :; do s=$(curl -sS "$BASE/api/jobs/$JOB" | sed -n 's/.*"state":"\\([a-z]*\\)".*/\\1/p'); echo "$s"; case $s in queued|running) sleep 5 ;; *) break ;; esac; done
+   BASE=<url>; JOB=<job>; while :; do s=$(curl -sS "$BASE/api/jobs/$JOB" | sed -n 's/.*"state":"\\([a-z]*\\)".*/\\1/p'); [ -n "$s" ] || { curl -sS "$BASE/api/jobs/$JOB" >&2; break; }; echo "$s"; case $s in queued|running) sleep 5 ;; *) break ;; esac; done
    ```
+   (no state: the error it answers, such as 404 `not_found` for a mistyped job id, goes to
+   stderr).
    While it runs, `stage` is the command's own timing stage (here {{stages}}) and `progress` is
    `{"stage","done","total"}` where the command knows its size. Jobs that use the inference
    server run one at a time in submission order, so a job may stay `queued` for a while.
@@ -691,7 +710,7 @@ def endpoint(method: str, path: str, effect: str, text: str, curl: str | None = 
             "sample": sample, "also": also}
 
 
-def fixed_endpoints(ex: Operation, d: Json) -> list[Json]:
+def fixed_endpoints(ex: Operation, d: Json, writers: str) -> list[Json]:
     """The service's own endpoints (not per command), with samples from its own records and
     constants and from the example operation ``ex``."""
     from oh_my_slam.viewer.bundle import display_transform
@@ -783,7 +802,9 @@ def fixed_endpoints(ex: Operation, d: Json) -> list[Json]:
                  brief({**queued, "state": "running", "cancel_requested": True}, "id", "state",
                        "cancel_requested")),
         endpoint("POST", "/api/jobs/{id}/resubmit",
-                 "Submits a new job (it needs the inference server when its operation does).",
+                 "Submits a new job: it needs the inference server when its operation does, "
+                 f"and writes the map when its operation does ({writers}): then ask the user "
+                 "first (see Safety).",
                  "The same operation and parameters again; the body (a JSON object, `{}` for "
                  "none) replaces some. The old job's uploads were deleted when it ended: upload "
                  "the files again and pass their new paths. Answers 202 and the new job, or the "
@@ -814,9 +835,8 @@ def fixed_endpoints(ex: Operation, d: Json) -> list[Json]:
                  'curl -sS "$BASE/api/jobs/<job>/timings"', record),
         endpoint("GET", "/api/maps/{name}/viewer/{path}", "Read-only.",
                  "The map's viewer: give the user `$BASE/viewer/map/<map>/`, the same viewer at "
-                 "its page URL (`/api/maps/{name}/viewer` redirects to `…/viewer/`). Its data is "
-                 "the viewer's own: `api/meta`, `api/scene` (the scene JSON), `api/catalog` and "
-                 "`api/cloud?<attributes>` (binary).",
+                 "its page URL (`/api/maps/{name}/viewer` redirects to `…/viewer/`). Its data "
+                 "paths, such as `api/meta`, are the viewer's own (spec 2.5).",
                  'curl -sS "$BASE/api/maps/<map>/viewer/api/meta"',
                  '{"mode": "map", "title": "<map>", …}', also=("GET /api/maps/{name}/viewer",)),
         endpoint("GET", "/api/jobs/{id}/viewer/{path}", "Read-only.",
@@ -857,10 +877,10 @@ GROUPS: tuple[tuple[str, Callable[[str], bool]], ...] = (  # the rest: "Service"
 )
 
 
-def endpoints_section(doc: Json, ex: Operation, d: Json) -> list[str]:
+def endpoints_section(doc: Json, ex: Operation, d: Json, writers: str) -> list[str]:
     """Every endpoint of the OpenAPI document besides the operations (and the document itself),
     from its template entry, or a generic one built from the document."""
-    template = {f"{e['method']} {e['path']}": e for e in fixed_endpoints(ex, d)}
+    template = {f"{e['method']} {e['path']}": e for e in fixed_endpoints(ex, d, writers)}
     found: dict[str, Json] = {}
     for path, item in doc["paths"].items():
         if path.startswith("/api/ops/"):
@@ -876,8 +896,11 @@ def endpoints_section(doc: Json, ex: Operation, d: Json) -> list[str]:
     found["GET /api/openapi.json"] = {**template["GET /api/openapi.json"], "parameters": []}
     lines = ["## Endpoints", "",
              "The service's own endpoints, besides the operations. In paths, `{id}` is a job's or "
-             "an upload's id, `{name}` a map's name and `{path}` a file's path. Any of them "
-             "answers an error of Errors when it fails."]
+             "an upload's id, `{name}` a map's name and `{path}` a file's path. They answer "
+             "an error of Errors when they fail, except a viewer's data paths (`…/viewer/api/…`), "
+             "which answer the viewer's own `{\"error\": \"<message>\"}` (400, 500) or a "
+             "plain-text 404, and a path or method the service does not have, which answers "
+             "plain text (404 `Not Found`, 405 `Method Not Allowed`)."]
     group = {key: next((t for t, member in GROUPS if member(e["path"])), "Service")
              for key, e in found.items()}
     for title in ("Service", *(t for t, _ in GROUPS)):
@@ -970,7 +993,8 @@ def render(ops: dict[str, Operation] | None = None) -> str:
              viewers=viewers),
         OPERATIONS,
         *("\n".join(operation_section(doc, op)) for op in ops.values()),
-        "\n".join(endpoints_section(doc, ex, d)),
+        "\n".join(endpoints_section(doc, ex, d, ids(lambda op: op in writers)
+                                     or "the mapping operation")),
     ]
     return "\n".join(parts).rstrip() + "\n"
 

@@ -62,21 +62,24 @@ def test_the_description_states_every_capability_and_when_to_use_it(tmp_path: Pa
     for p in spec.PROGRAMS:  # generated from the commands' own descriptions
         assert p.prog in text and p.description.rstrip(".") in text
     ops = skill.operations()
-    for op in ops.values():
-        assert re.search(rf"\b{re.escape(op.id)}\b", text), op.id
-        for out in op.mode.outputs:
-            assert skill.FORMATS.get(out.format, out.format) in text, (op.id, out.format)
+    for op in ops.values():  # each operation, then (after its run) exactly the formats it makes
+        m = re.search(rf"(?<![\w.-]){re.escape(op.id)}(?![\w.-])[^→]*→ ([^;.,]*)", text)
+        assert m, op.id
+        assert m.group(1).split("/") == list(dict.fromkeys(
+            skill.FORMATS.get(o.format, o.format) for o in op.mode.outputs)), (op.id, m.group(1))
+        if op.command.name:
+            assert f"{op.id} ({op.command.help})" in text
     never = [op.id for op in ops.values() if op.mode.inference == "never"]
     sometimes = [op.id for op in ops.values() if op.mode.inference == "conditional"]
     assert f"Inference server needed except for {', '.join(never)} " \
            f"({', '.join(sometimes)}: at times)." in text
     assert "a server.sh is running" in text and "Use when the user asks" in text
-    # every route outside the operations is one of the service's features the description names
-    paths = {r.split(" ", 1)[1] for r in api_routes(tmp_path)
-             if r.split(" ", 1)[1].startswith(("/api/", "/viewer/"))}
-    unnamed = [p for p in paths if not p.startswith("/api/ops/")
-               and not any(part in p for parts, _ in skill.FEATURES for part in parts)]
-    assert not unnamed, f"routes without words in skill.FEATURES: {unnamed}"
+    # the features name exactly the app's routes besides an operation's submission
+    routes = {r for r in api_routes(tmp_path) if r.split(" ", 1)[1].startswith(("/api/", "/viewer/"))}
+    named = [r for routes_, _ in skill.FEATURES for r in routes_]
+    assert len(named) == len(set(named)), "a route in two features"
+    assert set(named) == routes - {"POST /api/ops/{op}"}, \
+        f"skill.FEATURES does not name exactly the app's routes: {set(named) ^ (routes - {'POST /api/ops/{op}'})}"
     assert all(words in text for _, words in skill.FEATURES)
 
 

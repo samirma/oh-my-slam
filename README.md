@@ -680,8 +680,10 @@ or macOS machine on the LAN.
   generator's output, or when a route of the app (its Starlette routes, `METHOD /path`) or a code
   the service answers with is missing. It also checks that each endpoint has a `curl` command and
   a sample, and that a registry change (a new option, output, error or mode) reaches the file. It
-  checks that the description names every operation, every output format and the inference
-  conditions, and that every route outside `/api/ops/` falls under one of `skill.FEATURES`.
+  checks that the description names each operation followed by exactly the formats it
+  produces, and names the inference conditions. It also checks that `skill.FEATURES` names
+  exactly the app's routes besides an operation's submission, so adding or removing an
+  endpoint means updating the description's words.
 * **Server address.** The skill's snippet is POSIX `sh`, tested with `sh` and `dash` against a
   running `server.sh`. It tries, in order:
   * `OMS_URL`, a URL the user gives;

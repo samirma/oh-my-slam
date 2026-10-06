@@ -71,8 +71,8 @@ _VIEWER_PARAM = [{"name": "viewer", "in": "query", "required": False,
                   "schema": {"type": "boolean", "default": False},
                   "description": "also save the viewer of the request's image: one more step "
                                  "of the same job, which replays the command's recorded "
-                                 "inference (no second pass; only what the command did not ask, "
-                                 "e.g. segmentation for reconstruct -f ply, goes to the server)"}]
+                                 "inference (no second pass; only what the command did not ask "
+                                 "for goes to the server)"}]
 _ERROR = {"$ref": "#/components/responses/Error"}
 _JOB = {"description": "the job", "content": {"application/json": {
     "schema": {"$ref": "#/components/schemas/Job"}}}}
@@ -153,7 +153,9 @@ def _fixed() -> Json:
                        "it: the viewer's binary cloud document, within the display budget of spec "
                        "2.5 (a voxel-grid selection above it), with the file's header comments",
             "parameters": [*job_id, {"name": "file", "in": "query", "required": False,
-                                     "schema": {"type": "string"}}],
+                                     "schema": {"type": "string"},
+                                     "description": "the `path` of a PLY in the job's files "
+                                                    "(default: its result)"}],
             "responses": {"200": {"description": "the cloud document", "content": {
                 "application/octet-stream": {}}}, "4XX": _ERROR}}},
         "/api/display-transform": {"get": {
