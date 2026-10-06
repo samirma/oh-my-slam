@@ -3,9 +3,8 @@
 gone in the last images), must give a map that reflects the latest observation — without the cup
 and with no hole where it stood — in one update or split across several, while every object that
 never changed keeps its ``id``, label and OBB. What changed is data: a ``map_update`` file under
-``examples/ground_truth/`` (its format is documented in ``groundtruth``), which also says how the
-sequence is split (``splits``: the sizes of consecutive updates, e.g. 4+4+5 and 6+7). Without such
-a file the sequence is mapped (one update, and its two halves) but not judged.
+``examples/ground_truth/`` (format: that folder's README.md), which also says how the sequence is
+split (``splits``: the sizes of consecutive updates, e.g. 4+4+5 and 6+7).
 
 Maps: the whole sequence in one update, and one map per split (an update per part, in order). Each
 update's ``-t full`` scene is kept, since a later update changes the map's frame records. Metrics
@@ -344,12 +343,6 @@ class SplitMaps:
     @property
     def name(self) -> str:
         return split_name(self.sizes)
-
-
-def halves(images: list[str]) -> list[tuple[int, ...]]:
-    """The split of a sequence no annotation describes: its first half, then the rest."""
-    n = len(images)
-    return [(n // 2, n - n // 2)] if n >= 2 else []
 
 
 def parts_of(images: list[str], sizes: tuple[int, ...]) -> list[list[str]]:

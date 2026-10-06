@@ -1,70 +1,18 @@
-"""Optional ground truth under ``examples/ground_truth/``: annotations of the example files, read by
-the evaluator when they exist and picked up on the next run without a code change (spec §5). None
-ships with the repository; without them segmentation accuracy is not measured (only the
-consistency of the map with the detector, ``seg.map_consistency.*``), poses are measured only
-against the commanded headings of the capture names, and the map update of
-``examples/office_sequence/`` is mapped but not judged. This docstring is the annotation format.
+"""Optional ground truth under ``examples/ground_truth/`` (format: that folder's README.md).
 
-Every ``*.json`` file in that folder and its subfolders is read; its ``kind`` selects the metrics
-it adds, whose targets are the ``gt.*`` and ``map_update.*`` entries of ``examples/targets.json``.
-A file that is malformed, or that is about an image the evaluator did not run, is skipped with the
-reason (``details.ground_truth.skipped`` in ``result.json``).
+Every ``*.json`` file below the folder is discovered; its ``kind`` selects the metrics:
 
-``kind: "objects"`` — the objects in one example image::
+* ``objects`` — the objects of one example image (labels, optional camera-frame cuboids), compared
+  with that image's ``segment.sh -i`` output: ``gt.objects.recall`` / ``.precision`` (and
+  ``.obb_iou_median`` when cuboids are annotated).
+* ``poses`` — per-capture yaw / pitch of ``ainex-captures``, compared with the one-update map:
+  ``gt.poses.yaw_err_median_deg`` / ``.yaw_err_max_deg`` (after the best common yaw offset) and
+  ``gt.poses.pitch_err_median_deg``.
+* ``map_update`` — what changed during ``examples/office_sequence/`` (objects that must be absent
+  from the final map, where they were seen) and, optionally, which objects never changed; judged by
+  ``mapupdate`` into the ``map_update.*`` metrics (``MapUpdatePlan`` below).
 
-    {"kind": "objects", "image": "restaurant.jpg",
-     "objects": [{"label": "chair", "cuboid": [0.4, 0.9, 6.2, 0, 0, 0, 1, 0.5, 0.5, 0.9]},
-                 {"label": "person"}]}
-
-* ``image``: the image path relative to ``examples/`` (``restaurant.jpg``,
-  ``ainex-captures/001_bootstrap_level.jpg``).
-* ``label``: the detector's vocabulary; compatible labels (sofa / couch) count as the same.
-* ``cuboid`` (optional): an OpenLABEL 10-value cuboid ``x, y, z, qx, qy, qz, qw, sx, sy, sz``
-  (quaternion scalar last), in metres in the image's camera frame (OpenCV axes: x right, y down,
-  z forward), the frame ``segment.sh -i`` reports its boxes in.
-
-  Compared with that image's ``segment.sh -i`` output: when every annotated object has a cuboid,
-  objects are paired by box overlap (a pair counts only with compatible labels); otherwise labels
-  are paired one to one, identical ones first. ``gt.objects.recall`` (the share of annotated
-  objects found), ``gt.objects.precision`` (the share of detections that match one) and, with
-  cuboids, ``gt.objects.obb_iou_median``.
-
-``kind: "poses"`` — the true head orientation per capture::
-
-    {"kind": "poses", "frames": {"001_bootstrap_level.jpg": {"yaw_deg": -11.8, "pitch_deg": 0.0},
-                                 "005_bootstrap_left015_up.jpg": {"yaw_deg": 3.4}}}
-
-* Keys: capture file names of ``examples/ainex-captures/``. ``yaw_deg``: heading in degrees,
-  positive to the left, from any fixed zero; ``pitch_deg``: elevation above the horizon, positive
-  upwards; either may be left out.
-
-  Compared with the one-update map's poses: ``gt.poses.yaw_err_median_deg`` and
-  ``gt.poses.yaw_err_max_deg`` after the single yaw offset that best aligns the headings;
-  ``gt.poses.pitch_err_median_deg`` directly (the map frame is gravity-aligned).
-
-``kind: "map_update"`` — what changed during ``examples/office_sequence/``::
-
-    {"kind": "map_update", "sequence": "office_sequence",
-     "absent": [{"label": "cup", "seen_in": {"20260929_122226.jpg": [0.29, 0.42, 0.42, 0.59]}}],
-     "stable": ["monitor", "keyboard"], "splits": [[4, 4, 5], [6, 7]]}
-
-* ``sequence``: the example folder (only ``office_sequence`` is evaluated).
-* ``absent``: objects in the scene early in the sequence and gone later. ``label`` in the
-  detector's vocabulary (compatible labels count); ``seen_in`` maps each image that shows the
-  object to its region ``[x0, y0, x1, y1]`` as shares of the image width and height (y down). The
-  images are in name order; the sequence's **early part** runs up to the last image named in any
-  ``seen_in``.
-* ``stable`` (optional): labels the comparison of the unchanged objects is restricted to (by
-  default every object the early images observe, except the absent ones).
-* ``splits`` (optional): ways to map the sequence across several updates, each the sizes of
-  consecutive updates (at least two positive integers adding up to the number of images); by
-  default one split, the early part then the rest.
-
-  Judged by ``mapupdate`` on a map of the whole sequence in one ``mapper.sh update`` and one map
-  per split (``split_<sizes>``): ``map_update.absent_fraction`` / ``.hole_fraction`` /
-  ``.before_present_fraction`` and, per split, its ``absent_fraction``, ``hole_fraction``,
-  ``stability.*``, ``ids_persistent_fraction`` and ``vs_one_update.*`` (see ``mapupdate``). Files
-  about the same sequence are merged (``MapUpdatePlan`` below).
+Malformed files and files about images that were not evaluated are skipped with a reason.
 """
 
 from __future__ import annotations

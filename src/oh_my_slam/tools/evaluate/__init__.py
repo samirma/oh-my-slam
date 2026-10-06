@@ -8,12 +8,11 @@ Runs, strictly one at a time, ``start_inference_server.sh`` (cold start, residen
 every ``ainex-captures`` frame, ``mapper.sh update`` on the sequence in one update and split across
 3 updates, ``mapper.sh locate`` (held-out captures, and the reference map), ``segment.sh -m`` /
 ``view.sh -m`` on the resulting maps, ``mapper.sh update`` on ``office_sequence`` (one update and
-its annotated splits, else its two halves) and on the street2 video, and ``server.sh``
-(performance, parity with the commands, UI). Metrics: performance (end to end and per stage: time,
-client and server peak memory), pose accuracy, map quality, segmentation (and its consistency with
-the map), contracts, the web service, and — when annotations exist under
-``examples/ground_truth/`` (optional; format in ``groundtruth``) — ground truth and the map
-update. Each has a target in ``examples/targets.json`` (data) and is
+its annotated splits) and on the street2 video, and ``server.sh`` (performance, parity with the
+commands, UI). Metrics: performance (end to end and per stage: time, client and server peak
+memory), pose accuracy, map quality, map update, segmentation (and its consistency with the map),
+contracts, the web service, and ground truth when annotations exist under
+``examples/ground_truth/``. Each has a target in ``examples/targets.json`` (data) and is
 compared with the stored baseline run (``~/oh-my-slam-data/evaluations/baseline.json``); without a
 baseline the report says so instead of counting regressions.
 
