@@ -16,7 +16,7 @@
     "perf.<group>.stage.<stage>.*": "Spec §5 'per-stage … wall time and peak memory, per image and per mapping update'. Seconds (.s): explicit targets max(1.75 x measured, measured + 0.5 s) rounded up to two digits, regression tolerance 35 % / 0.25 s (stage times are noisier than totals: GPU queueing between the frames' requests). A stage a command adds later falls back to its group's pattern perf.<group>.stage.*.s = the group's end-to-end target, since a stage never outlasts its run. Memory (.client_peak_mb, .server_peak_gb): the group's end-to-end memory targets as patterns, for the same reason. The explicit stage times (and the end-to-end targets of the locate, office, street2 and server.sh groups) were first derived from run 20261005T102325Z, which ran while other agents loaded the machine, and re-derived with the same rule from the solo run 20261005T152742Z.",
     "perf.locate, perf.mapper_office*, perf.mapper_street2, perf.mapper_split.per_update_wall_s": "Wall time ~1.6 x measured (locate 3 images on the 79-keyframe map 2.24 s -> 3.6 s, from run 20261005T161937Z: run 20261005T152742Z's 2.6 s included ~0.4 s of bytecode recompilation (PYTHONDONTWRITEBYTECODE, fixed in 4c957f2); the office map in one update 48.7 s; the slowest update of the office splits 28.2 s; street2 402 s at -fps 2; the split ainex map's slowest update), client memory max(1.5 x, +200 MB) (the office maps peak at 9.2 / 13.2 GB in COLMAP's features and SfM stages: far above the 6 GB first guessed), server footprint max(+3 GB, 1.2 x).",
     "pose.locate.*, pose.street2.*": "Spec §5 pose accuracy for mapper.sh locate: the held-out captures (the split map's second update, located against the map after its first) use the targets of the map's own captures (registered/located >= 0.9 with 0.05 regression tolerance, yaw error median <= 7 deg, max <= 15 deg); measured 0.58 located, a finding, not a reason to lower it. street2: the share of sampled video frames registered, >= min(0.9, measured - 0.05).",
-    "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 while a job runs), job overhead over the shell max(2 x, +1 s); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (byte-identical results and files), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 23 tests of tests/browser/test_webapp*.py run (24 measured), and no axe-core violation (WCAG 2.0/2.1 A, AA)."
+    "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 of the reads made while an operation's request runs), the overhead of an operation's request over the same command from the shell max(2 x, +1 s) (first measured as the overhead of a job, before requests replaced jobs); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (response bodies byte-identical to the command's result), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 17 tests of tests/browser/test_webapp*.py run (17 since the request-based application), and no axe-core violation (WCAG 2.0/2.1 A, AA)."
   },
   "defaults": {
     "tolerance_rel": 0.1,
@@ -850,7 +850,7 @@
       "unit": "ms",
       "tolerance_rel": 0.5
     },
-    "server_sh.job_overhead_median_s": {
+    "server_sh.request_overhead_median_s": {
       "op": "<=",
       "value": 1.1,
       "measured": 0.052,
@@ -876,7 +876,7 @@
     },
     "server_sh.ui.tests_run": {
       "op": ">=",
-      "value": 23,
+      "value": 17,
       "tolerance_abs": 0.0
     },
     "server_sh.ui.a11y_violations": {

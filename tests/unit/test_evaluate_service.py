@@ -1,7 +1,8 @@
 """The ``server.sh`` evaluation (http_server.md "Evaluation") offline, with fakes: the parity cases
-enumerated from the commands' definitions (a new option or mode is covered with no evaluator
-change), the command lines, the record-or-replay inference proxy, the browser-test report, and the
-whole section against a fake ``server.sh`` (performance, parity and UI metrics)."""
+enumerated from the service's description of the commands (a new option or mode is covered with no
+evaluator change), the command lines, the record-or-replay inference proxy, the browser-test
+report, and the whole section against a fake ``server.sh`` whose operations answer within their
+request (performance, parity and UI metrics)."""
 
 from __future__ import annotations
 
@@ -25,9 +26,19 @@ from oh_my_slam.tools.evaluate.runner import Runner
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 from tests.unit.test_evaluate_runner import fake_repo, script
+from tests.unit.test_view_cli import minimal_map
 
 INPUTS = sv.Inputs(image="inputs/a.jpg", images=("inputs/b.jpg",),
                    sequence=("inputs/c.jpg", "inputs/d.jpg"), map="reference")
+
+
+def served() -> dict[str, Any]:
+    """The operations as the service's /api/openapi.json describes them."""
+    from oh_my_slam.web import openapi, operations
+
+    got, problems = sv.operations_of(openapi.document(operations.operations()))
+    assert problems == []
+    return got
 
 
 def cases_by_op(describe: dict[str, Any]) -> dict[str, list[sv.Case]]:
@@ -42,31 +53,30 @@ def cases_by_op(describe: dict[str, Any]) -> dict[str, list[sv.Case]]:
 # -- the cases, from the definitions ---------------------------------------------------------------
 
 
-def test_every_operation_of_the_registry_gets_its_cases() -> None:
-    by_op = cases_by_op(spec.describe())
+def test_every_operation_of_the_service_gets_its_cases() -> None:
+    by_op = cases_by_op(served())
     assert set(by_op) == {"reconstruct", "mapper-update", "mapper-locate", "segment-image",
-                          "segment-map", "view-image", "view-map"}
+                          "segment-map"}  # view.sh stays a command only
     variants = {op: [c.variant for c in cs] for op, cs in by_op.items()}
     assert variants["reconstruct"] == ["default", "format=ply", "attrs=color=segment"]
     assert variants["mapper-update"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=single"]
     assert variants["mapper-locate"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=full"]
-    assert variants["segment-image"][:3] == ["default", "format=ply", "attrs=normals=on"]
-    assert "artifacts" in variants["segment-image"] and "artifacts" in variants["segment-map"]
-    assert variants["view-image"] == variants["view-map"] == ["default"]
+    assert variants["segment-image"] == ["default", "format=ply", "attrs=normals=on"]
+    assert variants["segment-map"] == ["default", "format=ply", "attrs=normals=on"]
     # inputs by kind; -p applies with -f ply only, so its case asks for -f ply
     attrs = by_op["reconstruct"][2]
     assert attrs.params == {"image": "inputs/a.jpg", "attrs": "color=segment", "format": "ply"}
-    assert attrs.result_format == "ply"
+    assert attrs.result_format == "ply" and by_op["reconstruct"][0].result_format == "json"
     assert by_op["mapper-locate"][0].params == {"inputs": ["inputs/b.jpg"], "map": "reference"}
     # a mapping case creates a map of its own, whose name it carries
     update = by_op["mapper-update"]
     assert {c.params["map"] for c in update} == {f"parity-{k}" for k in range(1, 5)}
     assert all(c.writes_map == "map" for c in update)
     assert by_op["segment-map"][0].writes_map is None
-    assert by_op["segment-image"][-1].folders == ("artifacts",)
-    assert by_op["view-map"][0].browser and by_op["view-map"][0].result_format is None
+    # no case names where the command writes (-o, -d): the response is the result
+    assert not any({"output", "artifacts"} & set(c.params) for cs in by_op.values() for c in cs)
 
 
 def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
@@ -83,63 +93,80 @@ def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
     monkeypatch.setattr(spec, "PROGRAMS", (spec.Program(spec.RECONSTRUCT.prog,
                                                         spec.RECONSTRUCT.description, (rec2,)),
                                            *spec.PROGRAMS[1:]))
-    from oh_my_slam.web import openapi, operations
-
     # through the service's OpenAPI document, as the evaluator reads it
-    served, _ = sv.operations_of(openapi.document(operations.operations()))
-    variants = [c.variant for c in cases_by_op(served)["reconstruct"]]
+    variants = [c.variant for c in cases_by_op(served())["reconstruct"]]
     assert variants == ["default", "format=ply", "format=glb", "attrs=color=segment",
                         "quality=best"]
     # an operation whose input kind has no reference input is reported, not dropped silently
-    cases, uncovered = sv.parity_cases(spec.describe(), sv.Inputs(image="inputs/a.jpg"))
-    assert {c.op for c in cases} == {"reconstruct", "segment-image", "view-image"}
+    cases, uncovered = sv.parity_cases(served(), sv.Inputs(image="inputs/a.jpg"))
+    assert {c.op for c in cases} == {"reconstruct", "segment-image"}
     assert "mapper.sh update" in uncovered and "inputs" in uncovered["mapper.sh update"]
 
 
 def test_the_operations_are_read_from_the_openapi_document() -> None:
-    """The service's own /api/openapi.json carries each job operation's registry entry under
-    x-oms: the evaluator's operations are exactly the registry's, a new mode included."""
+    """The service's own /api/openapi.json carries each operation's registry entry, as the API
+    offers it, under x-oms: the evaluator's operations are exactly the service's — every mode of
+    the programs it offers, without the options that only choose where the command writes."""
     from oh_my_slam.web import openapi, operations
 
-    got, problems = sv.operations_of(openapi.document(operations.operations()))
-    assert problems == [] and got == {"operations": spec.describe()["operations"]}
-    doc = openapi.document(operations.operations())
-    doc["paths"]["/api/ops/stray"] = {"post": {}}  # a job path without its registry entry
+    ops = operations.operations()
+    by_label = {op.label: op for op in ops.values()}
+    expected = [by_label[d["id"]].entry(d) for d in spec.describe()["operations"]
+                if d["id"] in by_label]
+    got, problems = sv.operations_of(openapi.document(ops))
+    assert problems == [] and got == {"operations": expected}
+    assert {o["prog"] for o in got["operations"]} == {p.prog for p in spec.PROGRAMS if p.service}
+    assert not [p for o in got["operations"] for p in o["parameters"]
+                if p["kind"] in ("file_out", "folder_out")]
+    doc = openapi.document(ops)
+    doc["paths"]["/api/ops/stray"] = {"post": {}}  # an operation path without its entry
     assert sv.operations_of(doc)[1] == ["/api/ops/stray"]
 
 
-def test_the_command_line_of_a_case_is_the_services() -> None:
-    ops = {o["id"]: o for o in spec.describe()["operations"]}
-    for op in ops.values():  # the service's own argv for the same parameters
+def test_the_command_line_of_a_case_is_the_services(tmp_path: Path) -> None:
+    """The shell side runs the command line the service runs for the same request: the same
+    options, the same absolute workspace paths."""
+    from oh_my_slam.web import operations
+    from oh_my_slam.web.workspace import Workspace
+
+    ws = Workspace(tmp_path / "ws")
+    ws.create()
+    for rel in ("inputs/a.jpg", "inputs/b.jpg", "inputs/c.jpg", "inputs/d.jpg"):
+        (ws.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (ws.root / rel).write_bytes(b"x")
+    minimal_map(ws.maps / "reference")
+    service_ops = operations.operations()
+    ops = {o["id"]: o for o in served()["operations"]}
+    ev = sv.ServiceEvaluation.__new__(sv.ServiceEvaluation)
+    ev.ws = ws.root
+    for op in ops.values():
         for case in cases_by_op({"operations": [op]})[sv.operation_id(op)]:
-            params = {k: v for k, v in case.params.items()}
-            command, mode = next((c, m) for _, c, m in spec.operations()
-                                 if c.label(m) == op["id"])
-            expected = spec.argv_of(command, mode, params)
-            got = sv.shell_argv(op, params)
-            assert [a for a in got if a != "--no-browser"] == expected, op["id"]
-    view = ops["view.sh -m"]
-    assert sv.shell_argv(view, {"map": "/w/maps/m"}) == ["-m=/w/maps/m", "--no-browser"]
+            service_op = service_ops[case.op]
+            prep = operations.prepare(service_op, case.params, ws)
+            assert prep.problems == [], (case, prep.problems)
+            assert sv.shell_argv(op, ev.absolute(op, case)) == prep.argv, op["id"]
     assert sv.operation_id(ops["mapper.sh locate"]) == "mapper-locate"
 
 
 def test_the_accessibility_check_visits_absolute_page_urls() -> None:
     base = "http://127.0.0.1:5000/"
-    assert sv.app_urls(base, "reference", "j1") == [
+    assert sv.app_urls(base, "reference") == [
         "http://127.0.0.1:5000/#/image", "http://127.0.0.1:5000/#/maps",
-        "http://127.0.0.1:5000/#/maps/reference", "http://127.0.0.1:5000/#/jobs",
-        "http://127.0.0.1:5000/#/jobs/j1", "http://127.0.0.1:5000/#/scene"]
-    assert sv.app_urls(base, None, None) == [
+        "http://127.0.0.1:5000/#/maps/new", "http://127.0.0.1:5000/#/maps/reference",
+        "http://127.0.0.1:5000/#/maps/reference/update"]
+    assert sv.app_urls(base, None) == [
         "http://127.0.0.1:5000/#/image", "http://127.0.0.1:5000/#/maps",
-        "http://127.0.0.1:5000/#/jobs", "http://127.0.0.1:5000/#/scene"]
+        "http://127.0.0.1:5000/#/maps/new"]
 
 
 def test_differences_name_what_differs() -> None:
-    a = sv.Outcome(True, result=b"abcdef", files={"f/x.json": b"1", "f/y.png": b"2"})
+    a = sv.Outcome(True, result=b"abcdef")
     assert sv.differences(a, a) == []
-    b = sv.Outcome(True, result=b"abcXef", files={"f/x.json": b"1"})
-    assert sv.differences(a, b) == ["result: 6 vs 6 bytes, first difference at byte 3",
-                                    "f/y.png: missing on one side"]
+    b = sv.Outcome(True, result=b"abcXef")
+    assert sv.differences(a, b) == ["result: 6 vs 6 bytes, first difference at byte 3"]
+    assert sv.timing_stages("connect;dur=12.3, inference;dur=830.1, total;dur=842.4") == [
+        "connect", "inference", "total"]
+    assert sv.timing_stages(None) == []
 
 
 def test_the_browser_tests_report_is_read(tmp_path: Path) -> None:
@@ -252,7 +279,7 @@ def test_request_keys_follow_contents_not_paths(tmp_path: Path) -> None:
 
 # -- the section, against a fake server.sh ------------------------------------------------------------
 
-FAKE_SERVER = r'''import json, os, signal, sys, http.server, threading
+FAKE_SERVER = r'''import json, os, signal, sys, time, http.server, threading
 from pathlib import Path
 signal.signal(signal.SIGINT, lambda *a: os._exit(0))
 args = sys.argv[1:]
@@ -261,36 +288,28 @@ if "--status" in args:
     sys.exit(0)
 DESCRIBE = json.loads(Path(os.environ["FAKE_DESCRIBE"]).read_text())
 PAYLOADS = Path(os.environ["FAKE_PAYLOADS"])
-jobs = {}
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
-    def reply(self, status, body, ctype="application/json"):
+    def reply(self, status, body, ctype="application/json", headers=()):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status); self.send_header("Content-Type", ctype)
+        for k, v in headers: self.send_header(k, v)
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         p = self.path
         if p == "/api/openapi.json": return self.reply(200, {"paths": {
             "/api/ops/reconstruct": {"post": {"x-oms": DESCRIBE["operations"][0]}},
             "/api/ops/reconstruct/validate": {"post": {}}, "/api/health": {"get": {}}}})
-        if p.startswith("/api/jobs/") and p.endswith("/result"):
-            j = jobs[p.split("/")[3]]
-            fmt = j["params"].get("format", "json")
-            data = (PAYLOADS / f"{fmt}.out").read_bytes()
-            if fmt == "ply" and os.environ.get("FAKE_DIFFER"): data += b"x"
-            return self.reply(200, data, "application/octet-stream")
-        if p.endswith("/files"): return self.reply(200, [])
-        if p.startswith("/api/jobs/"):
-            j = jobs[p.split("/")[3]]
-            return self.reply(200, {**j, "state": "succeeded",
-                                    "result": {"url": f"/api/jobs/{j['id']}/result"}})
         return self.reply(200, b"<html></html>" if p == "/" else {}, "text/html" if p == "/" else "application/json")
     def do_POST(self):
         assert self.headers["Content-Type"] == "application/json"
         params = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        jid = f"j{len(jobs) + 1}"
-        jobs[jid] = {"id": jid, "params": params}
-        self.reply(202, {"id": jid, "state": "queued"})
+        time.sleep(0.4)  # the command runs within the request
+        fmt = params.get("format", "json")
+        data = (PAYLOADS / f"{fmt}.out").read_bytes()
+        if fmt == "ply" and os.environ.get("FAKE_DIFFER"): data += b"x"
+        self.reply(200, data, "application/json" if fmt == "json" else "application/octet-stream",
+                   [("Server-Timing", "inference;dur=300.0, export;dur=1.0, total;dur=301.0")])
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
 print(f"server.sh: listening on http://0.0.0.0:{srv.server_address[1]}/", file=sys.stderr, flush=True)
 srv.serve_forever()
@@ -303,7 +322,7 @@ def fake_service(tmp_path: Path, differ: bool) -> Evaluation:
     (payloads / "json.out").write_bytes(b'{"openlabel": {"metadata": {"schema_version": "1.0.0"}}}')
     (payloads / "ply.out").write_bytes(ply_bytes(PointCloud(
         __import__("numpy").zeros((2, 3), "float32"))))
-    rec = next(o for o in spec.describe()["operations"] if o["id"] == "reconstruct.sh")
+    rec = next(o for o in served()["operations"] if o["id"] == "reconstruct.sh")
     rec = {**rec, "parameters": [p for p in rec["parameters"] if p["name"] != "attrs"]}
     (tmp_path / "describe.json").write_text(json.dumps({"operations": [rec]}))
     repo = fake_repo(tmp_path, reconstruct=f'''case "$*" in *-f=ply*) cat "{payloads}/ply.out";;
@@ -328,14 +347,17 @@ def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) 
     assert m["server_sh.resident_mb"].value is not None and m["server_sh.resident_mb"].value > 0
     assert m["server_sh.read_latency_median_ms"].value is not None
     assert m["server_sh.read_latency_p95_ms"].passed is True
-    assert m["server_sh.job_overhead_median_s"].value is not None
-    assert set(m["server_sh.job_overhead_median_s"].detail) == {"reconstruct"}
+    assert m["server_sh.request_overhead_median_s"].value is not None
+    assert set(m["server_sh.request_overhead_median_s"].detail) == {"reconstruct"}
+    # read while the requests ran (the fake answers after 0.4 s)
+    assert m["server_sh.read_latency_busy_p95_ms"].value is not None
     # no browser in this test: the render time and the axe check fail with the reason
     assert "no browser" in (m["server_sh.app_render_s"].error or "")
     assert m["server_sh.ui.tests_failed"].passed and m["server_sh.ui.tests_run"].passed
     assert m["server_sh.parity.operations_covered_fraction"].value == 1.0
     cases = ev.details["server_sh"]["parity"]["cases"]
     assert [c["case"] for c in cases] == ["reconstruct.sh [default]", "reconstruct.sh [format=ply]"]
+    assert cases[0]["stages"] == ["inference", "export", "total"]  # from Server-Timing
     mism = m["server_sh.parity.mismatched"]
     if differ:
         assert mism.value == 1 and mism.passed is False

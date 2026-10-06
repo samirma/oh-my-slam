@@ -47,8 +47,9 @@ SECTIONS: tuple[tuple[str, str, str], ...] = (
      "detections the map keeps. The accuracy measure is the ground-truth section (`gt.*`)."),
     ("contract", "Contracts", ""),
     ("server_sh", "Web service (server.sh)",
-     "Performance, parity with the commands (each operation of `/api/openapi.json`, run as a job and "
-     "from the shell with the same recorded inference) and the web application's UI."),
+     "Performance, parity with the commands (each operation of `/api/openapi.json`, run within its "
+     "request and from the shell with the same recorded inference; the response body against the "
+     "command's stdout) and the web application's UI."),
     ("gt", "Ground truth: accuracy", ""),
 )
 NO_GROUND_TRUTH = ("No ground-truth annotations were found in `examples/ground_truth/`. Segmentation "

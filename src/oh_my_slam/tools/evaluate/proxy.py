@@ -1,11 +1,11 @@
 """A record-or-replay proxy of the inference server, so that a command and the same command run as
-a ``server.sh`` job get the same inference (http_server.md "Evaluation → Parity": results and files
-byte-identical to the command's).
+a ``server.sh`` request get the same inference (http_server.md "Evaluation → Parity": response
+bodies byte-identical to the command's result).
 
 The models are not bit-reproducible from one request to the next (GeoCalib's gravity, for one,
 differs in the last digits between two runs of the same image), so two runs of one command differ
 by themselves. The proxy listens on its own Unix socket, in a runtime folder of its own
-(``OH_MY_SLAM_RUNTIME_DIR``, the variable every command and the service's jobs read to find the
+(``OH_MY_SLAM_RUNTIME_DIR``, the variable every command and the service's requests read to find the
 inference server): the first request of a kind is forwarded to the real server and its response
 recorded; every later identical request is answered from the record. A request is identified by
 its route, its fields without paths, and the contents of the files it names (``*_path`` /

@@ -3,28 +3,29 @@ commands, and the web application's UI.
 
 The service runs over a scratch workspace (``<out>/server_sh/ws``) holding copies of the reference
 inputs and of the reference map, with the inference proxy (``proxy``) as its inference server, and
-so do the shell runs it is compared with.
+so do the shell runs it is compared with. There are no jobs: an operation runs within its own HTTP
+request, and the response is its result.
 
 **Performance** (``server_sh.*``): start-up time (process start → the ``listening on`` line),
 resident memory once listening (the process tree, idle), time from opening the web application
 to its having rendered (``body[data-ready=true]``; a page without scripts: its ``load``), latency
-of read-only requests (median and p95 idle, after the parity jobs; p95 of the polls made while a
-job runs), and the overhead of a job over the same command run from the shell (median over the
-operations of job wall time — submission to the end state seen by polling — minus the wall time
-of the same command with the same, replayed, inference).
+of read-only requests (median and p95 idle, after the parity requests; p95 of the reads made
+while an operation's request runs), and the overhead of an operation's request over the same
+command run from the shell (median over the operations of the request's wall time — sent to
+answered — minus the wall time of the same command with the same, replayed, inference).
 
 **Parity** (``server_sh.parity.*``): the operations come from the service's own description of
-the commands (``/api/openapi.json``: each job operation's ``x-oms`` entry, ``commands.spec.describe()``) — nothing here names a command or
-an option. Each operation gets a default case (its required parameters on the reference inputs)
-and one case per non-default value of each choice, per artefact folder and per point-cloud
-attribute (a non-default choice of its first enumerated attribute), with the options a case
-needs to apply set as the definitions say (``applies``). Each case runs the command from the
-shell twice (the first run records the inference, the second replays it) and then as a job, and
-compares the job's result with the command's stdout and the files of each artefact folder
-byte for byte; a browser mode (``view.sh``) compares what its viewer serves (``VIEWER_ROUTES``).
-A difference is a mismatch, unless the command's own two runs differ too (``unverifiable``: the
-command is not byte-reproducible). A case that mapped writes the map at the same workspace path
-each time, so the map's path in the result is the same.
+the commands (``/api/openapi.json``: each operation's ``x-oms`` entry, ``commands.spec.describe()``
+as the API offers it) — nothing here names a command or an option. Each operation gets a default
+case (its required parameters on the reference inputs) and one case per non-default value of each
+choice and per point-cloud attribute (a non-default choice of its first enumerated attribute),
+with the options a case needs to apply set as the definitions say (``applies``). Each case runs
+the command from the shell twice (the first run records the inference, the second replays it) and
+then as a request, and compares the response body with the command's stdout byte for byte. A
+difference is a mismatch, unless the command's own two runs differ too (``unverifiable``: the
+command is not byte-reproducible). A case that maps writes the map at the same workspace path
+each time, so the map's path in the result is the same; inputs are the same absolute workspace
+paths on both sides.
 
 **UI** (``server_sh.ui.*``): the web application's browser tests (``tests/browser/test_webapp*.py``,
 ``-m browser``: the main flows, the inference server down, and an axe-core check of each page),
@@ -39,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -61,15 +63,14 @@ ENTRY = "server.sh"
 GROUP = "server_sh"
 PREFIX = "server_sh"
 LISTEN = re.compile(r"^server\.sh: listening on http://[^:/\s]+:(\d+)/$", re.MULTILINE)
-FOLDER = "files"  # the artefact folder's name in a case
-TERMINAL = ("succeeded", "failed", "cancelled")
 POLL_S = 0.05
-JOB_TIMEOUT_S = 1800.0
+BUSY_POLL_S = 0.1  # reads made while an operation's request runs
+REQUEST_TIMEOUT_S = 1800.0  # one operation's request (a mapping one takes minutes)
+SERVICE_TIMEOUT_S = 7200.0  # the service's whole run: every parity case, latency, browser
 START_TIMEOUT_S = 120.0
 LATENCY_REPS = 10
-VIEWER_ROUTES = ("api/scene", "api/catalog", "api/cloud", "api/cloud?color=segment",
-                 "api/segmented.png")
-APP_PAGES = ("#/image", "#/maps", "#/maps/{map}", "#/jobs", "#/jobs/{job}", "#/scene")
+READS = ("", "api/health", "api/openapi.json", "api/maps")  # read-only requests (and a map's)
+APP_PAGES = ("#/image", "#/maps", "#/maps/new", "#/maps/{map}", "#/maps/{map}/update")
 READY_JS = ("() => document.readyState === 'complete' && document.body !== null && "
             "(document.body.dataset.ready === 'true' || "
             "document.querySelector('script') === null)")
@@ -80,16 +81,16 @@ AXE = REPO / "tests" / "browser" / "vendor" / "axe-core" / "axe.min.js"
 UI_TESTS = "tests/browser/test_webapp*.py"
 UI_TIMEOUT_S = 3600.0
 PERF_METRICS = ("start_s", "resident_mb", "app_render_s", "read_latency_median_ms",
-                "read_latency_p95_ms", "read_latency_busy_p95_ms", "job_overhead_median_s")
+                "read_latency_p95_ms", "read_latency_busy_p95_ms", "request_overhead_median_s")
 PARITY_METRICS = ("mismatched", "unverifiable", "operations_covered_fraction")
 UI_METRICS = ("tests_failed", "tests_run", "a11y_violations")
 
 
-def app_urls(base: str, map_name: str | None, job: str | None) -> list[str]:
-    """The web application's pages checked by axe-core, as absolute URLs (the map and job pages
-    only when there is a map and a job to show)."""
-    pages = [p for p in APP_PAGES if ("{map}" not in p or map_name) and ("{job}" not in p or job)]
-    return [base.rstrip("/") + "/" + p.format(map=map_name or "", job=job or "") for p in pages]
+def app_urls(base: str, map_name: str | None) -> list[str]:
+    """The web application's pages checked by axe-core, as absolute URLs (a map's pages only when
+    there is a map to show)."""
+    pages = [p for p in APP_PAGES if "{map}" not in p or map_name]
+    return [base.rstrip("/") + "/" + p.format(map=map_name or "") for p in pages]
 
 
 def metric_ids() -> list[str]:
@@ -121,18 +122,16 @@ class Case:
     op: str  # the API operation id (``segment-image``)
     label: str  # the command as typed (``segment.sh -i``)
     variant: str
-    params: dict[str, Any]  # API parameters: workspace paths, map names, folder names
-    browser: bool  # the mode's output is the viewer
+    params: dict[str, Any]  # API parameters: workspace paths and map names
     writes_map: str | None = None  # the parameter naming the map the case creates
-    folders: tuple[str, ...] = ()  # artefact folder parameters given
-    result_format: str | None = None  # "json" | "ply" | None (browser)
+    result_format: str = "json"  # the format of the result (the response body / stdout)
 
 
 def operations_of(openapi: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """The operations of the service's ``/api/openapi.json``: each ``POST /api/ops/<id>`` carries
-    its ``commands.spec.describe()`` entry under ``x-oms``. Returns ``{"operations": [...]}`` (the
-    shape of ``describe()``) and the job paths whose entry is missing or whose id does not match
-    their path."""
+    its ``commands.spec.describe()`` entry as the API offers it under ``x-oms``. Returns
+    ``{"operations": [...]}`` (the shape of ``describe()``) and the operation paths whose entry is
+    missing or whose id does not match their path."""
     ops, problems = [], []
     for path, item in (openapi.get("paths") or {}).items():  # the registry's order
         if not path.startswith("/api/ops/") or path.endswith("/validate"):
@@ -153,7 +152,7 @@ def operation_id(op: dict[str, Any]) -> str:
 
 
 def _api_params(op: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {p["name"]: p for p in op["parameters"] if p.get("service", True)}
+    return {p["name"]: p for p in op["parameters"]}
 
 
 def _attrs_value(p: dict[str, Any]) -> str | None:
@@ -187,9 +186,6 @@ def _satisfy(applies: list[dict[str, Any]], given: dict[str, Any],
         if w.get("in"):
             given[w["option"]] = w["in"][0]
             return True
-        if w.get("is") == "given" and opt["kind"] == "folder_out":
-            given[w["option"]] = FOLDER
-            return True
     return False
 
 
@@ -200,8 +196,6 @@ def _variants(op: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], lis
         if p["kind"] == "enum":
             out += [(f"{p['name']}={c}", {p["name"]: c}) for c in p.get("choices") or []
                     if c != p.get("default")]
-        elif p["kind"] == "folder_out":
-            out.append((p["name"], {p["name"]: FOLDER}))
         elif p["kind"] == "attrs" and (v := _attrs_value(p)) is not None:
             out.append((f"{p['name']}={v}", {p["name"]: v}))
     done, skipped, seen = [], [], set()
@@ -220,19 +214,28 @@ def _variants(op: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], lis
     return done, skipped
 
 
+def _result_format(op: dict[str, Any], given: dict[str, Any]) -> str:
+    """The format of the operation's result for these parameters: its stdout output whose
+    condition holds (the first one when none says)."""
+    params = _api_params(op)
+    results = [o for o in op.get("outputs") or [] if o.get("via") == "stdout"]
+    for o in results:
+        if not o.get("when") or any(_holds(w, given, params) for w in o["when"]):
+            return str(o["format"])
+    return str(results[0]["format"]) if results else "json"
+
+
 def parity_cases(describe: dict[str, Any], inputs: Inputs
                  ) -> tuple[list[Case], dict[str, str]]:
-    """Every case of every operation of ``describe`` (``spec.describe()``), and the operations
-    that have none, with the reason."""
+    """Every case of every operation of ``describe`` (the service's operations, as
+    :func:`operations_of` reads them), and the operations that have none, with the reason."""
     cases: list[Case] = []
     uncovered: dict[str, str] = {}
     fresh = 0
     for op in describe.get("operations", []):
         oid = operation_id(op)
         params = _api_params(op)
-        outputs = op.get("outputs") or []
-        browser = any(o.get("via") == "browser" for o in outputs)
-        written = {o.get("via") for o in outputs}
+        written = {o.get("via") for o in op.get("outputs") or []}
         map_out = next((n for n, p in params.items()
                         if p["kind"] == "map" and p["flag"] in written), None)
         required = [n for n, p in params.items() if p.get("required")]
@@ -248,23 +251,17 @@ def parity_cases(describe: dict[str, Any], inputs: Inputs
                 fresh += 1
                 case_params[map_out] = f"parity-{fresh}"
             case_params.update(given)
-            fmt = case_params.get("format", (params.get("format") or {}).get("default"))
-            cases.append(Case(oid, op["id"], name, case_params, browser, map_out,
-                              tuple(n for n in given if params[n]["kind"] == "folder_out"),
-                              None if browser else str(fmt or "json")))
+            cases.append(Case(oid, op["id"], name, case_params, map_out,
+                              _result_format(op, case_params)))
     return cases, uncovered
 
 
 def shell_argv(op: dict[str, Any], params: dict[str, Any]) -> list[str]:
     """The command line of an operation for parameters (paths already absolute), as the service
-    builds it (``spec.argv_of``); command-line-only flags (``--no-browser``) are given."""
+    builds it (``spec.argv_of``)."""
     argv = [op["command"]] if op.get("command") else []
     for p in op["parameters"]:
         flag, name = p["flag"], p["name"]
-        if not p.get("service", True):
-            if p["kind"] == "flag":
-                argv.append(flag)
-            continue
         v = params.get(name)
         if v is None:
             continue
@@ -288,6 +285,7 @@ class Reply:
     status: int
     body: bytes
     seconds: float
+    headers: dict[str, str] = field(default_factory=dict)
 
     def json(self) -> Any:
         return json.loads(self.body)
@@ -300,16 +298,17 @@ class Api:
     def __init__(self, base: str, timeout: float = 120.0) -> None:
         self.base, self.timeout = base.rstrip("/") + "/", timeout
 
-    def request(self, method: str, path: str, body: Any = None) -> Reply:
+    def request(self, method: str, path: str, body: Any = None,
+                timeout: float | None = None) -> Reply:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path.lstrip("/"), data=data, method=method,
                                      headers={"Content-Type": "application/json"} if data else {})
         t0 = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return Reply(r.status, r.read(), time.perf_counter() - t0)
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return Reply(r.status, r.read(), time.perf_counter() - t0, dict(r.headers))
         except urllib.error.HTTPError as exc:
-            return Reply(exc.code, exc.read(), time.perf_counter() - t0)
+            return Reply(exc.code, exc.read(), time.perf_counter() - t0, dict(exc.headers))
         except (urllib.error.URLError, OSError) as exc:
             return Reply(0, str(exc).encode(), time.perf_counter() - t0)
 
@@ -323,38 +322,33 @@ class Api:
 
 @dataclass
 class Outcome:
-    """What one side of a case produced: the result bytes and the files by relative path (a
-    browser mode: what its viewer serves, by route)."""
+    """What one side of a case produced: the result bytes (the command's stdout, or the response
+    body), and for a request the stages its ``Server-Timing`` header named."""
 
     ok: bool
     error: str | None = None
     result: bytes | None = None
-    files: dict[str, bytes] = field(default_factory=dict)
     wall_s: float | None = None
+    stages: list[str] = field(default_factory=list)
 
 
 def differences(a: Outcome, b: Outcome) -> list[str]:
-    out = []
-    if a.result != b.result:
-        out.append(f"result: {len(a.result or b'')} vs {len(b.result or b'')} bytes"
-                   + ("" if a.result is None or b.result is None
-                      else f", first difference at byte {_first_diff(a.result, b.result)}"))
-    for name in sorted(a.files.keys() | b.files.keys()):
-        if a.files.get(name) != b.files.get(name):
-            out.append(f"{name}: " + ("missing on one side" if name not in a.files
-                                      or name not in b.files else "differs"))
-    return out
+    if a.result == b.result:
+        return []
+    return [f"result: {len(a.result or b'')} vs {len(b.result or b'')} bytes"
+            + ("" if a.result is None or b.result is None
+               else f", first difference at byte {_first_diff(a.result, b.result)}")]
+
+
+def timing_stages(header: str | None) -> list[str]:
+    """The stage names of a ``Server-Timing`` header value (``name;dur=<ms>, …``)."""
+    return [part.split(";")[0].strip() for part in (header or "").split(",") if part.strip()]
 
 
 def _first_diff(a: bytes, b: bytes) -> int:
     n = min(len(a), len(b))
     diff = np.flatnonzero(np.frombuffer(a[:n], np.uint8) != np.frombuffer(b[:n], np.uint8))
     return int(diff[0]) if len(diff) else n
-
-
-def _folder_files(root: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*"))
-            if p.is_file() and not p.name.startswith(".")}
 
 
 @dataclass
@@ -419,7 +413,6 @@ class ServiceEvaluation:
         self.details: dict[str, Any] = {}
         self.busy_ms: list[float] = []
         self.overheads: dict[str, dict[str, float]] = {}
-        self.first_job: str | None = None
         self.api: Api | None = None
 
     # -- set-up ------------------------------------------------------------------------------------
@@ -457,7 +450,7 @@ class ServiceEvaluation:
         m = self.ev.metrics
         live = self.ev.runner.start(self.spec("server_sh", "--data", self.ws, "--no-browser",
                                               stdout="empty", ok_exit=(0, 130, -2),
-                                              timeout_s=JOB_TIMEOUT_S))
+                                              timeout_s=SERVICE_TIMEOUT_S))
         deadline = live.t0 + START_TIMEOUT_S
         port = None
         while live.proc is not None and live.poll() is None and time.perf_counter() < deadline:
@@ -491,55 +484,38 @@ class ServiceEvaluation:
         self.ev.check_payloads(rec)
         return rec
 
-    # -- jobs --------------------------------------------------------------------------------------
+    # -- requests ----------------------------------------------------------------------------------
 
-    def submit(self, case: Case) -> tuple[dict[str, Any] | None, float, str | None]:
-        """Run ``case`` as a job: (its final record, wall time from submission, error)."""
+    def request_outcome(self, case: Case) -> Outcome:
+        """Run ``case`` as a request (it answers when the command ended), reading the service
+        while it runs: the read-only latency under load."""
         assert self.api is not None
-        t0 = time.perf_counter()
-        r = self.api.request("POST", f"api/ops/{case.op}", case.params)
-        if r.status != 202:
-            return None, time.perf_counter() - t0, f"HTTP {r.status}: {r.body[:300]!r}"
-        jid = r.json()["id"]
-        self.first_job = self.first_job or jid
-        state = "queued"
-        while time.perf_counter() - t0 < JOB_TIMEOUT_S:
-            poll = self.api.get(f"api/jobs/{jid}")
-            if state == "running":
-                self.busy_ms.append(poll.seconds * 1000)
-            job = poll.json() if poll.status == 200 else {}
-            state = job.get("state", state)
-            if state in TERMINAL:
-                return job, time.perf_counter() - t0, None
-            time.sleep(POLL_S)
-        self.api.request("POST", f"api/jobs/{jid}/cancel", {})
-        return None, time.perf_counter() - t0, f"job {jid} did not end in {JOB_TIMEOUT_S:.0f} s"
+        api = self.api
+        done = threading.Event()
+        busy: list[float] = []
 
-    def job_outcome(self, case: Case) -> Outcome:
-        assert self.api is not None
-        job, wall, error = self.submit(case)
-        if job is None or job.get("state") != "succeeded":
-            why = error or f"job {job and job.get('id')} {job and job.get('state')}: " \
-                           f"{(job or {}).get('error')}"
-            return Outcome(False, why, wall_s=wall)
-        jid = job["id"]
-        out = Outcome(True, wall_s=wall)
-        if case.browser:
-            for route in VIEWER_ROUTES:
-                r = self.api.get(f"api/jobs/{jid}/viewer/{route}")
-                out.files[route] = f"{r.status} ".encode() + r.body
-            return out
-        if job.get("result"):
-            out.result = self.api.get(job["result"]["url"]).body
-        listing = self.api.get(f"api/jobs/{jid}/files").json()
-        for f in listing:
-            if any(f["path"].startswith(d + "/") for d in (case.params[n] for n in case.folders)):
-                out.files[f["path"]] = self.api.get(f["url"]).body
-        return out
+        def reads() -> None:
+            while not done.wait(BUSY_POLL_S):
+                busy.append(api.get("api/health").seconds * 1000)
+
+        watcher = threading.Thread(target=reads, daemon=True)
+        watcher.start()
+        try:
+            r = api.request("POST", f"api/ops/{case.op}", case.params, timeout=REQUEST_TIMEOUT_S)
+        finally:
+            done.set()
+            watcher.join()
+        self.busy_ms += busy
+        if r.status != 200:
+            return Outcome(False, f"HTTP {r.status}: {r.body[:300]!r}", wall_s=r.seconds)
+        timing = next((v for k, v in r.headers.items() if k.lower() == "server-timing"), None)
+        return Outcome(True, result=r.body, wall_s=r.seconds, stages=timing_stages(timing))
 
     # -- the shell side ------------------------------------------------------------------------------
 
-    def absolute(self, op: dict[str, Any], case: Case, folder: Path) -> dict[str, Any]:
+    def absolute(self, op: dict[str, Any], case: Case) -> dict[str, Any]:
+        """The case's parameters with the absolute workspace paths the service gives the
+        command."""
         params = _api_params(op)
         out: dict[str, Any] = {}
         for name, v in case.params.items():
@@ -549,57 +525,18 @@ class ServiceEvaluation:
             elif kind in ("image", "images", "images_or_video"):
                 out[name] = [str(self.ws / x) for x in v] if isinstance(v, list) \
                     else str(self.ws / v)
-            elif kind == "folder_out":
-                out[name] = str(folder / v)
             else:
                 out[name] = v
         return out
 
     def shell_outcome(self, op: dict[str, Any], case: Case, tag: str) -> tuple[Outcome, RunRecord]:
-        folder = self.root / "shell" / tag
-        folder.mkdir(parents=True, exist_ok=True)
-        argv = shell_argv(op, self.absolute(op, case, folder))
-        if case.browser:
-            return self.viewer_outcome(tag, argv)
-        rec = self.ev.run(tag, "parity", op["prog"], *argv, stdout=case.result_format or "json",
+        argv = shell_argv(op, self.absolute(op, case))
+        rec = self.ev.run(tag, "parity", op["prog"], *argv, stdout=case.result_format,
                           env=self.env)
         if case.result_format == "json":
             self.ev.scene(rec)
-        out = Outcome(rec.ok, None if rec.ok else rec.failure(), rec.stdout_bytes(),
-                      wall_s=rec.wall_s)
-        for name in case.folders:
-            d = folder / case.params[name]
-            out.files.update({f"{case.params[name]}/{k}": v
-                              for k, v in (_folder_files(d) if d.is_dir() else {}).items()})
-        return out, rec
-
-    def viewer_outcome(self, tag: str, argv: list[str]) -> tuple[Outcome, RunRecord]:
-        from oh_my_slam.tools.evaluate.viewer import served_url
-
-        live = self.ev.runner.start(RunSpec(tag, "parity", "view.sh", tuple(argv), "empty",
-                                            ok_exit=(0, 130, -2), timeout_s=900.0,
-                                            env=tuple(self.env.items())))
-        url = None
-        try:
-            deadline = live.t0 + 900.0
-            while live.proc is not None and live.poll() is None \
-                    and time.perf_counter() < deadline and url is None:
-                url = served_url(live.stderr_text())
-                time.sleep(POLL_S)
-            url = url or served_url(live.stderr_text())
-            out = Outcome(url is not None, None if url else "no URL on stderr")
-            if url is not None:
-                api = Api(url)
-                for route in VIEWER_ROUTES:
-                    r = api.get(route)
-                    out.files[route] = f"{r.status} ".encode() + r.body
-        finally:
-            live.stop()
-        rec = live.finish(error=None if url else "no URL on stderr")
-        self.ev.check_payloads(rec)
-        if not rec.ok:
-            out.ok, out.error = False, rec.failure()
-        return out, rec
+        return Outcome(rec.ok, None if rec.ok else rec.failure(), rec.stdout_bytes(),
+                       wall_s=rec.wall_s), rec
 
     def _set_map_aside(self, case: Case, tag: str) -> None:
         """Move the map a shell run created out of the workspace, so the next run (the same
@@ -617,30 +554,28 @@ class ServiceEvaluation:
                                "params": case.params}
         first, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell")
         self._set_map_aside(case, f"parity_{n:02d}_shell")
-        # the control: the same command again, with the same (replayed) inference; a browser
-        # mode's viewer data must simply be identical (no control)
-        second: Outcome | None = None
-        if not case.browser:
-            second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
-            self._set_map_aside(case, f"parity_{n:02d}_shell_again")
-        job = self.job_outcome(case)
-        if not first.ok or not job.ok:
+        # the control: the same command again, with the same (replayed) inference
+        second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
+        self._set_map_aside(case, f"parity_{n:02d}_shell_again")
+        req = self.request_outcome(case)
+        row["stages"] = req.stages
+        if not first.ok or not req.ok:
             row.update(status="mismatch", why=first.error if not first.ok else
-                       f"the job failed: {job.error}")
+                       f"the request failed: {req.error}")
             return row
-        diffs = differences(first, job)
+        diffs = differences(first, req)
         if not diffs:
             row["status"] = "identical"
-        elif second is not None and second.ok and differences(first, second):
+        elif second.ok and differences(first, second):
             row.update(status="unverifiable", why="the command's own two runs differ: "
-                       + "; ".join(differences(first, second)[:3]), job=diffs[:5])
+                       + "; ".join(differences(first, second)[:3]), request=diffs[:5])
         else:
             row.update(status="mismatch", why="; ".join(diffs[:5]))
-        if second is not None and second.ok and job.wall_s is not None \
-                and second.wall_s is not None and case.op not in self.overheads:
-            self.overheads[case.op] = {"job_s": round(job.wall_s, 3),
+        if second.ok and req.wall_s is not None and second.wall_s is not None \
+                and case.op not in self.overheads:
+            self.overheads[case.op] = {"request_s": round(req.wall_s, 3),
                                        "shell_s": round(second.wall_s, 3),
-                                       "overhead_s": round(job.wall_s - second.wall_s, 3)}
+                                       "overhead_s": round(req.wall_s - second.wall_s, 3)}
         return row
 
     def parity(self, inputs: Inputs) -> None:
@@ -675,12 +610,9 @@ class ServiceEvaluation:
 
     def latency(self, inputs: Inputs) -> None:
         assert self.api is not None
-        paths = ["", "api/health", "api/openapi.json", "api/maps", "api/jobs"]
+        paths = list(READS)
         if inputs.map:
             paths.append(f"api/maps/{inputs.map}")
-        if self.first_job:
-            paths += [f"api/jobs/{self.first_job}", f"api/jobs/{self.first_job}/files",
-                      f"api/jobs/{self.first_job}/timings"]
         samples: dict[str, list[float]] = {}
         failed = []
         for _ in range(LATENCY_REPS):
@@ -698,11 +630,12 @@ class ServiceEvaluation:
         m.add(f"{PREFIX}.read_latency_p95_ms", float(np.percentile(every, 95)), detail)
         m.add(f"{PREFIX}.read_latency_busy_p95_ms",
               float(np.percentile(self.busy_ms, 95)) if self.busy_ms else None,
-              {"requests": len(self.busy_ms)}, error="no request was made while a job ran")
+              {"requests": len(self.busy_ms)},
+              error="no read was made while an operation's request ran")
         over = self.overheads
-        m.add(f"{PREFIX}.job_overhead_median_s",
+        m.add(f"{PREFIX}.request_overhead_median_s",
               float(np.median([v["overhead_s"] for v in over.values()])) if over else None,
-              over, error="no job could be compared with its command")
+              over, error="no request could be compared with its command")
 
     def browser_checks(self, inputs: Inputs) -> None:
         """Time until the web application has rendered, and axe-core on its pages."""
@@ -721,7 +654,7 @@ class ServiceEvaluation:
                 return
             render, error = self.render(browser, self.api.base)
             m.add(ids[0], render, error=error)
-            pages = app_urls(self.api.base, inputs.map, self.first_job)
+            pages = app_urls(self.api.base, inputs.map)
             found, error = self.a11y(browser, pages)
             m.add(ids[1], None if found is None else sum(len(v) for v in found.values()),
                   {"pages": found}, error=error)
@@ -753,13 +686,11 @@ class ServiceEvaluation:
                 # a hash route renders in place: wait for the app to have routed to this page
                 where = url.split("#/", 1)[1].split("?")[0] if "#/" in url else ""
                 page.wait_for_function(ROUTED_JS, arg=where, timeout=RENDER_TIMEOUT_MS)
-                for frame in page.frames:
-                    if frame.url.startswith("http") and not frame.evaluate("() => !!window.axe"):
-                        frame.add_script_tag(path=str(AXE))
+                if not page.evaluate("() => !!window.axe"):
+                    page.add_script_tag(path=str(AXE))
                 found[url] = page.evaluate("""async () => {
                     const r = await axe.run(document, {runOnly: {type: 'tag',
-                        values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']},
-                        iframes: true, preload: false});
+                        values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']}});
                     return r.violations.map(v => `${v.id} (${v.impact}): ${v.help}`);
                 }""")
         except Exception as exc:
