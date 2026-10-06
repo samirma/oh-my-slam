@@ -45,9 +45,6 @@ class Target:
         worse = value - baseline if self.op == "<=" else baseline - value
         return worse > max(self.tolerance_abs, self.tolerance_rel * abs(baseline)) + 1e-12
 
-    def text(self) -> str:
-        return f"{self.op} {self.value:g}" + (f" {self.unit}" if self.unit else "")
-
 
 class TargetsError(ValueError):
     """The targets file is malformed."""

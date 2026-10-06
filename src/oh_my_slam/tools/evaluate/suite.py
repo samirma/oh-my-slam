@@ -370,7 +370,7 @@ class Evaluation:
                                      "-i", *(self.examples / SEQUENCE / c.name for c in captures),
                                      "-m", single_dir))
         split = None
-        parts = np.array_split(np.arange(len(captures)), SPLITS)
+        parts = np.array_split(np.arange(len(captures)), SPLITS)  # always SPLITS (3) parts
         for k, idx in enumerate(parts, start=1):
             tag = f"mapper_split_{k}"
             args: tuple[str | Path, ...] = (
@@ -382,9 +382,8 @@ class Evaluation:
                                             stdout="empty", output=target))
                 if first is not None:
                     self.published |= {o.id for o in doc_objects(first)}
-                    if len(parts) > 1:
-                        self.locate_held_out(first, split_dir,
-                                             [captures[i] for i in parts[1]], captures)
+                    self.locate_held_out(first, split_dir, [captures[i] for i in parts[1]],
+                                         captures)
             elif k < len(parts):
                 rec = self.run(tag, "mapper_split", "mapper.sh", *args, "-t", "single", "-f",
                                "ply", "-p", LABELLED_SEGMENTS, stdout="ply")

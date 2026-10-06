@@ -181,11 +181,8 @@ class InferenceProxy:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
-            def address_string(self) -> str:
-                return "proxy"
-
             def log_message(self, format: str, *args: Any) -> None:
-                pass
+                pass  # silent; also the only caller of address_string (no AF_UNIX peer address)
 
             def _serve(self) -> None:
                 n = int(self.headers.get("Content-Length") or 0)
