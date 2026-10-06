@@ -596,8 +596,8 @@ or macOS machine on the LAN.
   When none answers, it tells the agent to ask the user for the URL that `server.sh` printed or
   that `--status` reports. It caches the URL it finds and never scans. It keeps only a URL's
   scheme, host and port, and only when they consist of URL characters.
-* **Uploads use `curl -T`** (the raw body), not the `-F` that spec §2.7 names: the request guard
-  refuses multipart forms with 415, because a cross-site page can send them without a preflight.
+* **Uploads use `curl -T`** (the raw body), as spec §2.7 says: the request guard refuses
+  multipart forms (`-F`) with 415, because a cross-site page can send them without a preflight.
 
 ## Point-cloud attributes
 
