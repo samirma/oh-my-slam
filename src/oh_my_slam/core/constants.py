@@ -8,8 +8,14 @@ IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
 DEFAULT_FPS = 2.0  # mapper.sh update -fps: video frames sampled per second (spec §2.3)
-DEFAULT_MIN_SCORE = 0.5  # segment.sh -i --min-score: detection confidence threshold (spec §2.4)
+DEFAULT_MIN_SCORE = 0.5  # segment.sh --min-score: detection confidence threshold (spec §2.4)
 DEFAULT_DATA = "~/oh-my-slam-data"  # server.sh --data: the workspace of maps and uploads (§2.6)
+
+# reconstruct.sh -f depth (spec §2.2): a 16-bit PNG whose pixel value is the metric depth along the
+# optical axis times DEPTH_UNITS_PER_METRE (1/256 m ≈ 3.9 mm steps, up to 255.996 m), NO_DEPTH
+# where the model gives no valid depth
+DEPTH_UNITS_PER_METRE = 256
+NO_DEPTH = 0
 
 # Map registration: a map of up to UPDATE_EXHAUSTIVE_MAX keyframes is matched exhaustively (no
 # inference server needed); a larger one through the RETRIEVAL_TOP_K most similar keyframes by the

@@ -141,12 +141,19 @@ def save_jpeg(rgb: NDArray[np.uint8], path: Path, quality: int = 95) -> None:
     atomic_write_bytes(path, buf.getvalue())
 
 
-def png_bytes(array: NDArray[Any]) -> bytes:
-    """Lossless PNG without colour profile or gamma chunk."""
+def png_bytes(array: NDArray[Any], text: dict[str, str] | None = None) -> bytes:
+    """Lossless PNG without colour profile or gamma chunk: 8-bit RGB for an (H, W, 3) uint8 array,
+    16-bit greyscale for an (H, W) uint16 one. ``text``: ``tEXt`` chunks (keyword → text)."""
     import io
 
+    from PIL import PngImagePlugin
+
+    info = PngImagePlugin.PngInfo()
+    for key, value in (text or {}).items():
+        info.add_text(key, value)
     buf = io.BytesIO()
-    Image.fromarray(np.ascontiguousarray(array)).save(buf, format="PNG", optimize=False)
+    Image.fromarray(np.ascontiguousarray(array)).save(buf, format="PNG", optimize=False,
+                                                      pnginfo=info)
     return buf.getvalue()
 
 
