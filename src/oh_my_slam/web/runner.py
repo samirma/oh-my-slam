@@ -7,8 +7,9 @@ within its own HTTP request, and this module runs the command for it.
   result — goes to a file of the request's folder (``Workspace.request_dir``), its timing record
   there too (``OH_MY_SLAM_TIMINGS``), and its stderr is read for the command's own error line.
 * **Order.** Requests that use the inference server run one at a time, in arrival order (each
-  takes a ticket when it arrives), and wait for their turn with their connection open; the
-  others start at once. Two requests never write the same map at once: a writer waits for the
+  takes a ticket once its body has arrived, and none overtakes an earlier one still being
+  validated, which may need the inference server too), and wait for their turn with their
+  connection open; the others start at once. Two requests never write the same map at once: a writer waits for the
   one before it. The scheduling state lives in the event loop's thread; a running command is
   waited for in a thread of its own, which hands the outcome back to the loop. ``GET
   /api/health`` counts the requests running and waiting, and lists each one (``in_progress``:
@@ -112,6 +113,7 @@ class Runner:
         self.waiting: list[Run] = []  # by ticket
         self.running: list[Run] = []
         self._tickets = 0
+        self._arriving: set[int] = set()  # tickets of requests still being validated
         self._in_use: dict[str, Run] = {}  # upload id → the request that consumes it
         self._threads: dict[str, threading.Thread] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -119,9 +121,17 @@ class Runner:
     # -- state (the event loop's thread) -------------------------------------------------------------
 
     def ticket(self) -> int:
-        """A request's place in the arrival order, taken when it arrives."""
+        """A request's place in the arrival order, taken when it arrives; :meth:`arrived` once it
+        was validated (admitted or refused)."""
         self._tickets += 1
+        self._arriving.add(self._tickets)
         return self._tickets
+
+    def arrived(self, ticket: int) -> None:
+        """A request's validation ended: the inference requests after it no longer wait for it."""
+        if ticket in self._arriving:
+            self._arriving.discard(ticket)
+            self._schedule()
 
     def counts(self) -> dict[str, int]:
         return {"running": len(self.running), "waiting": len(self.waiting)}
@@ -157,6 +167,7 @@ class Runner:
         self._loop = asyncio.get_running_loop()
         run.done = self._loop.create_future()
         self._in_use.update(dict.fromkeys(run.uploads, run))
+        self._arriving.discard(run.ticket)
         at = next((i for i, r in enumerate(self.waiting) if r.ticket > run.ticket),
                   len(self.waiting))
         self.waiting.insert(at, run)
@@ -164,13 +175,16 @@ class Runner:
 
     def _schedule(self) -> None:
         """Start every waiting request that may start: inference requests one at a time in ticket
-        order (none overtakes an earlier one), the others at once; never two writers of a map."""
+        order (none overtakes an earlier one, waiting or still being validated), the others at
+        once; never two writers of a map."""
         if self.stopping:
             return
         inference_busy = any(r.inference for r in self.running)
+        validating = min(self._arriving, default=None)
         writing = {r.writes for r in self.running if r.writes}
         for run in list(self.waiting):
-            blocked = (run.inference and inference_busy) or (run.writes in writing)
+            earlier = validating is not None and validating < run.ticket
+            blocked = (run.inference and (inference_busy or earlier)) or (run.writes in writing)
             inference_busy = inference_busy or run.inference  # nothing later overtakes it
             if run.writes:
                 writing.add(run.writes)

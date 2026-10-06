@@ -451,9 +451,10 @@ option.
     of each workspace input (an upload is `<data>/uploads/<id>/<file>`), and a result that records
     its inputs (for example a frame's stream `uri` or a map's frame `source`) names them by that
     path, so a direct run on another path to the same bytes differs exactly there.
-* **Order.** Each request takes a ticket when it arrives.
+* **Order.** Each request takes a ticket when it has arrived (its body received).
   * Requests that use the inference server run one at a time, in ticket order; each waits for its
-    turn with its connection open.
+    turn with its connection open. None overtakes an earlier request that is still being
+    validated, since that one may need the inference server too.
   * All the others start at once, even while one runs.
   * Two requests never write the same map at once: a second writer waits for the first.
   * `GET /api/health` counts the requests `running` and `waiting`, and lists them

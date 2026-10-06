@@ -162,6 +162,31 @@ def test_inference_requests_run_one_at_a_time_in_arrival_order_others_at_once(
     run(svc, scenario)
 
 
+def test_arrival_order_holds_while_an_earlier_request_is_still_validated(
+        ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request that arrived first runs first even when its validation (the inference server's
+    check) takes longer than that of one that arrived after it."""
+    checks: list[float] = []
+
+    def slow_first_check() -> None:
+        checks.append(time.monotonic())
+        if len(checks) == 1:
+            time.sleep(0.8)  # the first arrival's check is slow; the second's is not
+
+    service = make_svc(ws, inference_check=slow_first_check, inference_health=lambda: {})
+    with_programs(monkeypatch, service, slow_command.registry_program(INFER, "required"))
+
+    async def scenario(app: Callable[..., Awaitable[None]]) -> None:
+        a, ta = await send(app, "/api/ops/infer", {"seconds": 0.2})
+        b, tb = await send(app, "/api/ops/infer", {"seconds": 0.2})
+        await asyncio.gather(ta, tb)
+        assert a.status == b.status == 200, (a.body, b.body)
+        assert len(checks) == 2 and checks[0] < checks[1]
+        assert a.json()["end"] <= b.json()["start"]  # in arrival order
+
+    run(service, scenario)
+
+
 def test_two_requests_never_write_the_same_map_at_once(svc: Service) -> None:
     async def scenario(app: Callable[..., Awaitable[None]]) -> None:
         a, ta = await send(app, "/api/ops/slow", {"seconds": 1.0, "map": "m"})

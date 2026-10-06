@@ -348,25 +348,28 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
 
     async def run_op(request: Request) -> Response:
         """Validate, wait for the request's turn, run the command, answer when it ends."""
-        ticket, arrived = runner.ticket(), time.time()
         op = op_of(request)
         params = await body_json(request)
-        if runner.stopping:
-            return _error(503, STOPPING, "the service is stopping; send the request again once "
-                          "it runs")
-        prep = await run_in_threadpool(service.prepare, op, params)
-        if prep.problems:  # refused: the uploads it was given are consumed all the same
-            runner.discard(prep.uploads)
-            status, body = error_body(prep.problems)
-            return JSONResponse(body, status)
-        run = Run(ticket, op.program.prog, op.module, prep.argv, prep.inference, prep.writes,
-                  prep.uploads, op.id, prep.command, arrived)
+        ticket, arrived = runner.ticket(), time.time()  # its place in the arrival order
         try:
-            runner.admit(run)
-        except RunError as exc:
-            if exc.code != "upload_in_use":
+            if runner.stopping:
+                return _error(503, STOPPING, "the service is stopping; send the request again "
+                              "once it runs")
+            prep = await run_in_threadpool(service.prepare, op, params)
+            if prep.problems:  # refused: the uploads it was given are consumed all the same
                 runner.discard(prep.uploads)
-            return _error(exc.status, exc.code, str(exc))
+                status, body = error_body(prep.problems)
+                return JSONResponse(body, status)
+            run = Run(ticket, op.program.prog, op.module, prep.argv, prep.inference, prep.writes,
+                      prep.uploads, op.id, prep.command, arrived)
+            try:
+                runner.admit(run)
+            except RunError as exc:
+                if exc.code != "upload_in_use":
+                    runner.discard(prep.uploads)
+                return _error(exc.status, exc.code, str(exc))
+        finally:
+            runner.arrived(ticket)  # validated: the requests after it no longer wait for it
         outcome = await runner.wait(run, disconnected(request))
         folder = ws.request_dir(run.id)
         if outcome.interrupted is not None and outcome.interrupted != STOPPING:
