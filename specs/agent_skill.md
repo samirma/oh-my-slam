@@ -7,6 +7,13 @@ Part of the [high-level specification](high_level_spec.md) (§2 Components).
   alone. It is one self-contained file needing only `sh` and `curl`; importing it means
   copying it to `<skills dir>/oh-my-slam-api/SKILL.md` on the Mac that runs `server.sh` or on
   any Linux or macOS machine on the LAN (the service binds `0.0.0.0`).
+* **Description.** The front matter's `description` is what an agent reads to decide whether
+  to use the skill, so it states all of the skill's capabilities and when it can be used. The
+  capabilities are every operation, with what it produces, and every other feature of the API.
+  When it can be used covers the requests it serves, the need for a `server.sh` reachable from
+  the agent's machine, and which operations need the inference server. It is generated like
+  the rest of the file, so a capability that is added, changed or removed changes it, and it
+  stays within the Agent Skills limit of 1024 characters.
 * **Generated, not hand-written.** Like the API, the skill follows the
   [single source of truth](http_server.md#single-source-of-truth): its operations,
   parameters, defaults, allowed values, result files and error codes are generated from the

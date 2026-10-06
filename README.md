@@ -669,10 +669,19 @@ or macOS machine on the LAN.
   concerns no single command: finding the service, the job workflow, safety, and the service's own
   endpoints and refusals. Regenerate it after any change to the registry or the API:
   `uv run python -m oh_my_slam.web.skill`.
+* **Description.** The front matter's `description` is what an agent reads to decide whether to
+  use the skill, so it states all the skill's capabilities and when it can be used. It names every
+  operation, grouped by command with the command's own description, the formats it produces, and
+  each subcommand's help. It names the service's other features (`skill.FEATURES`), says the skill
+  needs a running `server.sh`, and lists which operations work without the inference server. To
+  stay within the Agent Skills limit of 1024 characters, the generator drops the subcommands' help
+  and then the formats if more commands would not fit.
 * **Test.** `tests/unit/test_agent_skill.py` fails when the committed file differs from the
   generator's output, or when a route of the app (its Starlette routes, `METHOD /path`) or a code
   the service answers with is missing. It also checks that each endpoint has a `curl` command and
-  a sample, and that a registry change (a new option, output, error or mode) reaches the file.
+  a sample, and that a registry change (a new option, output, error or mode) reaches the file. It
+  checks that the description names every operation, every output format and the inference
+  conditions, and that every route outside `/api/ops/` falls under one of `skill.FEATURES`.
 * **Server address.** The skill's snippet is POSIX `sh`, tested with `sh` and `dash` against a
   running `server.sh`. It tries, in order:
   * `OMS_URL`, a URL the user gives;

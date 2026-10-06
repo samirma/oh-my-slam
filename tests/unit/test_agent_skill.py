@@ -51,10 +51,33 @@ def test_front_matter() -> None:
     _, front, body = committed().split("---\n", 2)
     meta = yaml.safe_load(front)
     assert meta["name"] == "oh-my-slam-api" and set(meta) == {"name", "description"}
-    assert 0 < len(meta["description"]) <= 1024
-    for p in spec.PROGRAMS:  # generated from the commands' own descriptions
-        assert p.prog in meta["description"] and p.description.rstrip(".") in meta["description"]
+    assert 0 < len(meta["description"]) <= skill.DESCRIPTION_MAX == 1024
     assert "openapi.json" in body and "the service's document wins" in body
+
+
+def test_the_description_states_every_capability_and_when_to_use_it(tmp_path: Path) -> None:
+    """Spec §2.7 "Description": every operation with what it produces, every other feature of
+    the API, a running service, and the operations that need the inference server."""
+    text = yaml.safe_load(committed().split("---\n", 2)[1])["description"]
+    for p in spec.PROGRAMS:  # generated from the commands' own descriptions
+        assert p.prog in text and p.description.rstrip(".") in text
+    ops = skill.operations()
+    for op in ops.values():
+        assert re.search(rf"\b{re.escape(op.id)}\b", text), op.id
+        for out in op.mode.outputs:
+            assert skill.FORMATS.get(out.format, out.format) in text, (op.id, out.format)
+    never = [op.id for op in ops.values() if op.mode.inference == "never"]
+    sometimes = [op.id for op in ops.values() if op.mode.inference == "conditional"]
+    assert f"Inference server needed except for {', '.join(never)} " \
+           f"({', '.join(sometimes)}: at times)." in text
+    assert "a server.sh is running" in text and "Use when the user asks" in text
+    # every route outside the operations is one of the service's features the description names
+    paths = {r.split(" ", 1)[1] for r in api_routes(tmp_path)
+             if r.split(" ", 1)[1].startswith(("/api/", "/viewer/"))}
+    unnamed = [p for p in paths if not p.startswith("/api/ops/")
+               and not any(part in p for parts, _ in skill.FEATURES for part in parts)]
+    assert not unnamed, f"routes without words in skill.FEATURES: {unnamed}"
+    assert all(words in text for _, words in skill.FEATURES)
 
 
 def api_routes(tmp_path: Path) -> list[str]:
@@ -141,7 +164,8 @@ def test_a_registry_change_reaches_the_skill(monkeypatch: pytest.MonkeyPatch) ->
     assert "--shade suits the overlay" in section and "`map_locked` (409)" in section
     assert "art/overlay.png" in text  # the workflow example's files
     assert "### `slow` — `slow.sh`" in text and "`POST /api/ops/slow`" in text
-    assert "slow.sh (slow)" in text.split("---\n", 2)[1]
+    front = text.split("---\n", 2)[1]
+    assert "slow.sh " in front and ": slow → " in front
 
 
 SHELLS = [s for s in ("sh", "dash") if shutil.which(s)]

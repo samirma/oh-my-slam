@@ -73,6 +73,23 @@ SERVICE_ERRORS: dict[str, tuple[int, str]] = {
     "stopping": (503, "a submission while the service shuts down"),
 }
 
+# The service's own features (not the operations), as the description names them: path parts →
+# words. tests/unit/test_agent_skill.py checks that every route of the app outside /api/ops/
+# contains one of these path parts, so a new kind of endpoint needs its words here.
+FEATURES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("/api/uploads",), "upload inputs"),
+    (("/api/maps",), "list maps, download map files"),
+    (("/api/jobs",), "follow, cancel and resubmit jobs, get their log, stage timings, results "
+                     "and files"),
+    (("viewer", "/api/display-"), "open 3D viewers of maps and jobs"),
+    (("/api/health",), "service and inference-server health"),
+    (("/api/openapi.json",), "the OpenAPI document"),
+)
+# The description's words for the commands' output formats (another format is named as is).
+FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG", "csv": "CSV", "markdown": "Markdown",
+           "map": "map", "html": "viewer page"}
+DESCRIPTION_MAX = 1024  # the Agent Skills limit
+
 # The address snippet (spec §2.7 "Server address"): POSIX sh and curl only, no scan. It prints
 # the base URL (scheme, host and port) and caches it; a URL is used only when it is made of URL
 # characters, since the agent pastes it into its commands.
@@ -422,18 +439,43 @@ def operation_section(doc: Json, op: Operation) -> list[str]:
 # -- the template ------------------------------------------------------------------------------------
 
 
+def description(ops: dict[str, Operation]) -> str:
+    """What the skill can do and when to use it (spec §2.7 "Description"): every operation with
+    what it produces, the service's other features, and the conditions (a running service; the
+    operations that need the inference server). Within the Agent Skills limit: when more
+    commands would not fit, the subcommands' help and then the formats are left out."""
+    def clause(p: spec.Program, helps: bool, formats: bool) -> str:
+        mine = [op for op in ops.values() if op.program is p]
+        made = dict.fromkeys(FORMATS.get(o.format, o.format) for op in mine for o in op.mode.outputs)
+        ids = ", ".join(op.id + (f" ({op.command.help})" if helps and op.command.name else "")
+                        for op in mine)
+        return f"{p.prog} {p.description.rstrip('.')}: {ids}" + (
+            f" → {'/'.join(made)}" if formats else "")
+
+    def ids(inference: str) -> str:
+        return ", ".join(op.id for op in ops.values() if op.mode.inference == inference)
+
+    never, sometimes = ids("never"), ids("conditional")
+    inference = (f"Inference server needed except for {never}" if never
+                 else "Every operation needs the inference server") + (
+        f" ({sometimes}: at times)." if sometimes else ".")
+    for helps, formats in ((True, True), (False, True), (False, False)):
+        programs = "; ".join(clause(p, helps, formats) for p in spec.PROGRAMS
+                             if any(op.program is p for op in ops.values()))
+        text = ("Use the oh-my-slam web service (server.sh) with sh and curl, from its Mac or any "
+                f"machine on the LAN. Jobs (JSON = OpenLABEL scene): {programs}. Also: "
+                + "; ".join(words for _, words in FEATURES) + ". Use when the user asks for any "
+                f"of these and a server.sh is running (its URL, else ask). {inference}")
+        if len(text) <= DESCRIPTION_MAX:
+            return text
+    raise ValueError(f"the description has {len(text)} characters (Agent Skills: at most "
+                     f"{DESCRIPTION_MAX}); shorten FEATURES or the commands' descriptions")
+
+
 def front_matter(ops: dict[str, Operation]) -> str:
     """The skill's name and description (a YAML double-quoted scalar: JSON is valid YAML)."""
-    programs = "; ".join(
-        f"{p.prog} ({', '.join(op.id for op in ops.values() if op.program is p)}): "
-        f"{p.description.rstrip('.')}" for p in spec.PROGRAMS
-        if any(op.program is p for op in ops.values()))
-    description = (
-        "Use the oh-my-slam web service (server.sh) through its HTTP API with sh and curl only, "
-        "from the Mac that runs it or another machine on the LAN. Every mode of its commands is "
-        f"an operation run as a job. {programs}. Use when the user asks to run these through "
-        "the service, or to list, inspect or download its maps, jobs and results.")
-    return f"---\nname: {NAME}\ndescription: {json.dumps(description, ensure_ascii=False)}\n---\n"
+    return (f"---\nname: {NAME}\ndescription: {json.dumps(description(ops), ensure_ascii=False)}"
+            "\n---\n")
 
 
 INTRO = """# oh-my-slam API
