@@ -694,7 +694,37 @@ def test_new_keyframes_posed_against_their_matches_are_noted(
     assert ctx.notes["sfm_contradicted"] == {jpg(10): 0.412}
 
 
-# --- map frame, depth alignment, levelling ------------------------------------------------------
+# --- focal re-run, map frame, depth alignment, levelling ----------------------------------------
+
+
+def test_keyframes_whose_sfm_focal_differs_are_reconstructed_again_with_it(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only registered keyframes without EXIF whose SfM focal length differs by more than 3 %
+    are re-run, with the SfM intrinsics; a client that is its own clone is shared, not
+    closed."""
+    sfm_K = Intrinsics(560.0, 560.0, 320.0, 240.0, 640, 480, "colmap")  # 12 % off
+    model = FakeModel(line([jpg(0), jpg(1), jpg(2)]))
+    monkeypatch.setattr(model, "intrinsics", lambda n: K if n == jpg(1) else sfm_K)
+    seen: list[tuple[str, Intrinsics, bool]] = []
+
+    def again(path: Path, client: Any, intrinsics: Intrinsics, work_dir: Any = None,
+              first: bool = True, rgb: Any = None) -> SimpleNamespace:
+        seen.append((path.name, intrinsics, first))
+        return SimpleNamespace(depth=np.full((48, 64), 3.0, np.float32),
+                               valid=np.ones((48, 64), bool), intrinsics=intrinsics,
+                               K_grid=intrinsics.resized(64, 48))
+
+    monkeypatch.setattr(api, "_reconstruct_keyframe", again)
+    closed: list[int] = []
+    client = SimpleNamespace(close=lambda: closed.append(1))
+    client.clone = lambda: client
+    new = [nf(0), nf(1), nf(2, exif=K), nf(3)]  # f1: within 3 %, f2: EXIF, f3: not registered
+    msgs: list[str] = []
+    api._rerun_focal(ctx_of(new), model, client, msgs.append)  # type: ignore[arg-type]
+    assert seen == [("f000000.jpg", sfm_K, False)] and closed == []
+    assert new[0].frame.intrinsics == sfm_K and float(new[0].frame.depth[0, 0]) == 3.0
+    assert new[1].frame.intrinsics == K
+    assert msgs == ["re-running geometry for 1 keyframes with the SfM focal length"]
 
 
 def test_the_map_frame_without_metric_scale_keeps_the_sfm_units(
