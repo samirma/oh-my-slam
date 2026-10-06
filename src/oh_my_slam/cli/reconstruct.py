@@ -1,12 +1,16 @@
-"""``reconstruct.sh -i <image> [-f json|ply] [-o <file>] [-p <attrs>]`` — one-image reconstruction.
+"""``reconstruct.sh -i <image> [-f json|depth|ply] [-o <file>] [-p <attrs>]`` — one-image
+reconstruction.
 
     json (default)  ASAM OpenLABEL scene: objects, labels, scores, colours, OBBs (camera frame);
-                    the same objects, ids and colours as ``segment.sh -i`` with default options
+                    the segmentation code's objects, as ``segment.sh -i`` gives them by default
+    depth           the depth image: a 16-bit PNG of the input's pixel size, metric depth along
+                    the optical axis (``reconstruction.depthimage``)
     ply             point cloud (camera frame, metres) shaped by the ``-p`` point-cloud attributes
 
 The result goes to stdout, or to ``-o <file>`` (stdout then stays empty). ``-p`` needs ``-f ply``
-and is validated before the server is contacted. The PLY path runs only the inference its
-attributes need: segmentation for ``color=segment`` or ``label=on``, gravity for ``color=height``.
+and is validated before the server is contacted. Each format runs only the inference it needs:
+depth alone for ``-f depth``; for ``-f ply`` segmentation with ``color=segment`` or ``label=on``
+and gravity with ``color=height``.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.log import PayloadWriter, claim_stdout, get_logger, json_payload_bytes
 from oh_my_slam.core.timing import Stage
 from oh_my_slam.reconstruction.api import reconstruct_image
+from oh_my_slam.reconstruction.depthimage import depth_png
 from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
 from oh_my_slam.segmentation.cloud import cloud_ply, image_cloud_source
 from oh_my_slam.segmentation.scene import single_image_scene
@@ -55,6 +60,16 @@ def _run(args: argparse.Namespace, attrs: CloudAttrs, out: PayloadWriter) -> dic
     t0 = time.perf_counter()
     with stage(Stage.CONNECT):
         client = connect()
+    if args.format == "depth":
+        with stage(Stage.INFERENCE):
+            frame = reconstruct_image(args.image, want_gravity=False, client=client)
+        with stage(Stage.EXPORT):
+            data = depth_png(frame)
+        with stage(Stage.WRITE):
+            out.write_bytes(data)
+        log.info("depth image (%dx%d) in %.2f s", frame.intrinsics.width, frame.intrinsics.height,
+                 time.perf_counter() - t0)
+        return {"png_bytes": len(data)}
     if args.format == "ply":
         segmented = attrs.color == "segment" or attrs.label
         with stage(Stage.INFERENCE):

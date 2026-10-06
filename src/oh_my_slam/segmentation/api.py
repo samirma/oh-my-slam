@@ -1,12 +1,12 @@
 """Segmentation API: detections → exclusive masks → 3D points → upright OBBs → ids and colours.
 
-``segment_frame`` serves ``segment.sh -i``, ``reconstruct.sh`` (JSON) and ``view.sh -i``;
-``detect_alongside``, ``lift_detections`` and ``trim_support`` serve the mapper (detections of a
-keyframe while the mapper's own reconstruction call runs; instances in map coordinates, without
-the support their masks bled onto), ``fit_object_obb`` fits the
-boxes of both; ``export_map`` draws a map's persistent objects on its keyframes. Emitted clouds are
-derived in ``segmentation.cloud``. Other packages use segmentation through this module (and
-``cloud``, ``scene``, ``artifacts``), never its internals (import-linter contract).
+``segment_frame`` serves ``segment.sh``, ``reconstruct.sh`` (JSON and ``color=segment`` /
+``label`` PLYs) and ``view.sh -i``; ``detect_alongside``, ``lift_detections`` and ``trim_support``
+serve the mapper (detections of a keyframe while the mapper's own reconstruction call runs;
+instances in map coordinates, without the support their masks bled onto), ``fit_object_obb`` fits
+the boxes of both. Emitted clouds are derived in ``segmentation.cloud``, the segmented image in
+``segmentation.render``. Other packages use segmentation through this module (and ``cloud``,
+``scene``, ``render``, ``artifacts``), never its internals (import-linter contract).
 """
 
 from __future__ import annotations
@@ -286,37 +286,3 @@ def reconstruct_and_detect(
     floor = request_floor(min_score)
     return detect_alongside(image_path, client, reconstruct, max_side=MAX_GRID_SIDE,
                             min_score=floor, floor=floor)
-
-
-@dataclass
-class KeyframeLabels:
-    """A keyframe image (grid) with its stored per-pixel persistent object ids."""
-
-    name: str
-    rgb: NDArray[np.uint8]
-    label_map: NDArray[np.int32]
-
-
-@dataclass
-class MapSegmentation:
-    segmented: NDArray[np.uint8]  # contact sheet of <= 6 keyframes
-    tiles: list[str]  # keyframe names on the sheet
-
-
-def export_map(objects: list[SceneObject], keyframes: list[KeyframeLabels]) -> MapSegmentation:
-    """``segmented.png`` of a persisted map (objects keep their ids and colours); the segments
-    cloud is derived by ``segmentation.cloud``."""
-    from oh_my_slam.segmentation.render import choose_contact_frames, contact_sheet
-
-    ids = {o.id for o in objects}
-    id_list = sorted(ids)
-    sets = [set(np.unique(k.label_map).tolist()) & ids for k in keyframes]
-    chosen = choose_contact_frames(sets)
-    if not chosen and keyframes:
-        chosen = [0]
-    tiles = [
-        (keyframes[i].name, keyframes[i].rgb,
-         np.where(np.isin(keyframes[i].label_map, id_list), keyframes[i].label_map, 0))
-        for i in chosen
-    ]
-    return MapSegmentation(contact_sheet(tiles), [keyframes[i].name for i in chosen])

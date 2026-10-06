@@ -8,8 +8,8 @@ Object ids come from the keyframes' instance masks, which a detector draws gener
 mask that covers a counter top and the floor beyond it, of which only the counter was lifted into
 the object (lifting keeps a mask's largest spatial cluster). A keyframe's vote for an object
 therefore counts only for points inside the object's box grown by the depth noise at its viewing
-distance (``attribution_margin``), so an object's points in the cloud (``segments.ply``,
-``color=segment``, its ``point_count``) coincide with its box. The vote needs a third of the
+distance (``attribution_margin``), so an object's points in the cloud (a ``color=segment`` or
+``label=on`` PLY, its ``point_count``) coincide with its box. The vote needs a third of the
 keyframes that see a point, and an object detected in fewer of them wins only part of its
 surface — a refrigerator detected in 7 of the ~15 keyframes that see its front, half of it — or
 nothing — a dishwasher detected in 2 of ~13, a light switch on a wall. Each confirmed object

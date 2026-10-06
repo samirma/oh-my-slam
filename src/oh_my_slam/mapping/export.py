@@ -1,6 +1,6 @@
 """Map scene export (OpenLABEL, map frame) for ``-t full`` / ``-t single``, the PLY payloads
-(derived with the point-cloud attributes by ``segmentation.cloud``), and the read-only outputs of
-``segment.sh -m``."""
+(derived with the point-cloud attributes by ``segmentation.cloud``), and the read-only access of
+``mapper.sh locate`` and ``view.sh -m`` to a persisted map."""
 
 from __future__ import annotations
 
@@ -10,16 +10,13 @@ from typing import Any
 
 import numpy as np
 
-from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
-from oh_my_slam.core.images import load_rgb
 from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.ply import PointCloud, read_ply
-from oh_my_slam.core.timing import Stage
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.objects import ObjectState, label_map_for, load_state
+from oh_my_slam.mapping.objects import ObjectState, load_state
 from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.api import KeyframeLabels, SceneObject, export_map
+from oh_my_slam.segmentation.api import SceneObject
 from oh_my_slam.segmentation.cloud import MapCloudSource, cloud_ply, map_cloud_source
 from oh_my_slam.segmentation.scene import objects_block, ontology_labels
 
@@ -105,7 +102,7 @@ def ply_payload(geo: Any, mode: str, records: list[store.FrameRecord], objs: Obj
 
 
 # ------------------------------------------------------------------------------------------------
-# read-only map access (segment -m, view -m)
+# read-only map access (mapper.sh locate, view.sh -m)
 
 
 def map_objects(reader: store.MapReader) -> tuple[ObjectState, list[SceneObject]]:
@@ -124,49 +121,14 @@ def map_cloud(reader: store.MapReader) -> PointCloud:
 
 
 def reader_source(reader: store.MapReader, objects: list[SceneObject]) -> MapCloudSource:
-    """Cloud source of a persisted map (``segment.sh -m``, ``view.sh -m``)."""
+    """Cloud source of a persisted map (``view.sh -m``)."""
     return map_source(map_cloud(reader), objects, reader.frames)
 
 
-def keyframe_labels(reader: store.MapReader, state: ObjectState) -> list[KeyframeLabels]:
-    out = []
-    for r in reader.frames:
-        rgb = load_rgb(reader.image_path(r), max_side=max(r.grid_width, r.grid_height))
-        lab = label_map_for(reader.instances(r), rgb.shape[:2], state)
-        out.append(KeyframeLabels(r.name, rgb, lab))
-    return out
-
-
-def scene_bytes(reader: store.MapReader, tool: str | None = None) -> bytes:
-    """The map's scene JSON (``segment.sh -m``, ``view.sh -m``), built from its persisted state by
-    the code that builds ``mapper.sh update``'s result: the object colours are a pure function of
-    the ids *now* (§2.4), so they agree with the PLY, ``segmented.png`` and catalogue derived in
-    the same run even for a map written before a palette change. ``tool``
-    replaces the ``metadata.tool`` of the producing command (``mapper``)."""
+def scene_bytes(reader: store.MapReader) -> bytes:
+    """The map's scene JSON (``mapper.sh locate -t full``, ``view.sh -m``), built from its
+    persisted state by the code that builds ``mapper.sh update``'s result: the object colours are
+    a pure function of the ids *now* (§2.4), so they agree with the clouds derived from the map
+    even for a map written before a palette change."""
     _, objs = map_objects(reader)
-    doc = full_scene(reader.root, reader.meta, reader.frames, objs)
-    if tool is not None:
-        doc["openlabel"]["metadata"]["tool"] = tool
-    return json_payload_bytes(doc)
-
-
-def map_segment_outputs(map_dir: Path, artifacts_dir: Path | None, attrs: CloudAttrs,
-                        want_ply: bool = True, reader: store.MapReader | None = None
-                        ) -> tuple[bytes, bytes | None]:
-    """``segment.sh -m``: (scene JSON, segments PLY — also when ``artifacts_dir`` is given, else
-    only if ``want_ply``); writes the artefacts into ``artifacts_dir``. Read-only: no inference,
-    the map is never modified. ``reader``: the map already opened (by the command's checks)."""
-    from oh_my_slam.segmentation.artifacts import write_artifacts
-
-    reader = reader or store.MapReader(map_dir)
-    state, objs = map_objects(reader)
-    scene = scene_bytes(reader, tool="segment")
-    ply = cloud_ply(reader_source(reader, objs), attrs) \
-        if want_ply or artifacts_dir is not None else None
-    if artifacts_dir is not None:
-        assert ply is not None
-        with timing.stage(Stage.ARTIFACTS):
-            sheet = export_map(objs, keyframe_labels(reader, state)).segmented
-            write_artifacts(artifacts_dir, scene, sheet, objs, ply,
-                            title=f"Objects in map {reader.root.name}")
-    return scene, ply
+    return json_payload_bytes(full_scene(reader.root, reader.meta, reader.frames, objs))

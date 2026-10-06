@@ -1,6 +1,6 @@
 """The commands' single source of truth: every mode, option, default, validation rule, output and
-timing stage of ``reconstruct.sh``, ``mapper.sh update`` / ``locate``, ``segment.sh -i`` / ``-m``
-and ``view.sh -i`` / ``-m``, declared once as data.
+timing stage of ``reconstruct.sh``, ``mapper.sh update`` / ``locate``, ``segment.sh -i`` and
+``view.sh -i`` / ``-m``, declared once as data.
 
 Each command builds its argparse parser (:func:`build_parser`) and runs its validation
 (:func:`validate`) from these definitions. The web service of spec §2.6 ("Single source of
@@ -17,7 +17,7 @@ document and the forms. A new or changed option here reaches the commands and th
   (reads only) that raises the commands' own errors (``core/errors.py``) with their own messages,
   and an optional ``prepare`` with the side effect the command needs before it starts (``-d`` is
   created).
-* A :class:`Mode` (``segment.sh -i`` / ``-m``, …) is one API operation: its rules, inference need,
+* A :class:`Mode` (``view.sh -i`` / ``-m``, …) is one API operation: its rules, inference need,
   outputs and timing stages (``core.timing.Stage``). Errors at run time are those of the exit-code
   table (``core.errors.HTTP_STATUS``).
 
@@ -47,7 +47,9 @@ from oh_my_slam.core.cloud_attrs import (
 from oh_my_slam.core.constants import (
     DEFAULT_FPS,
     DEFAULT_MIN_SCORE,
+    DEPTH_UNITS_PER_METRE,
     IMAGE_SUFFIXES,
+    NO_DEPTH,
     UPDATE_EXHAUSTIVE_MAX,
     VIDEO_SUFFIXES,
 )
@@ -134,7 +136,6 @@ class Option:
     omit_if_default: bool = False  # giving the default is not the same as not giving it (-fps)
     metavar: str | None = None
     type: Callable[[str], Any] | None = None  # argparse conversion (None: the text)
-    modes: tuple[str, ...] | None = None  # the modes it belongs to (None: all)
     applies: tuple[When, ...] = ()  # applies when any of these holds (empty: always)
     applies_text: str = ""  # the same, in the command's words
     group: str | None = None  # mutually exclusive group (the modes' selectors)
@@ -284,8 +285,7 @@ class Command:
 
     def mode_options(self, mode: Mode) -> list[Option]:
         others = {m.selector for m in self.modes if m is not mode and m.selector}
-        return [o for o in self.options if o.name not in others
-                and (o.modes is None or mode.name in o.modes)]
+        return [o for o in self.options if o.name not in others]
 
 
 @dataclass(frozen=True)
@@ -308,18 +308,26 @@ class Program:
 # --- rules ----------------------------------------------------------------------------------------
 
 
-def _attrs_rule(writes_ply: tuple[When, ...], requires: str) -> Rule:
-    """``-p``: refused without a PLY output, then parsed for the mode's scope (spec §2.2)."""
+_PLY = When("format", ("ply",))
+_JSON = When("format", ("json",))
+_DEPTH = When("format", ("depth",))
+_PNG = When("format", ("png",))
+_D = When("artifacts")
+_PLY_ONLY = "only the PLY output has: use -f ply"
 
-    def check(ctx: Context) -> None:
-        values = ctx.args.attrs
-        if values and not any(w.holds(ctx.args) for w in writes_ply):
-            raise UsageError(f"-p sets point-cloud attributes, which {requires}")
-        ctx.values.attrs = parse_cloud_attrs(values, ctx.mode.scope())
 
-    return Rule("attrs", ("attrs", *(w.option for w in writes_ply)),
-                f"-p sets point-cloud attributes, which {requires}; every key and value is "
-                "valid for the command (spec §2.2)", check)
+def _attrs_check(ctx: Context) -> None:
+    """``-p``: refused without a PLY output (``-f json``, ``-f depth``), then parsed for the
+    mode's scope (spec §2.2); both before any inference."""
+    values = ctx.args.attrs
+    if values and not _PLY.holds(ctx.args):
+        raise UsageError(f"-p sets point-cloud attributes, which {_PLY_ONLY}")
+    ctx.values.attrs = parse_cloud_attrs(values, ctx.mode.scope())
+
+
+ATTRS_RULE = Rule("attrs", ("attrs", "format"),
+                  f"-p sets point-cloud attributes, which {_PLY_ONLY}; every key and value is "
+                  "valid for the command (spec §2.2)", _attrs_check)
 
 
 def _output_check(ctx: Context) -> None:
@@ -430,15 +438,6 @@ MIN_SCORE_RULE = Rule("min_score", ("min_score",), "--min-score is a finite numb
                       _min_score_check)
 
 
-def _no_min_score_check(ctx: Context) -> None:
-    if ctx.args.min_score is not None:
-        raise UsageError("-m exports the map's persistent objects; --min-score applies to -i only")
-
-
-NO_MIN_SCORE_RULE = Rule("min_score_image_only", ("min_score", "map"),
-                         "--min-score applies to -i only", _no_min_score_check)
-
-
 def _locate_images_check(ctx: Context) -> None:
     from oh_my_slam.mapping.locate import resolve_images
 
@@ -470,15 +469,13 @@ LOCATE_RULES = (
 
 # --- the commands ---------------------------------------------------------------------------------
 
-_PLY = When("format", ("ply",))
-_JSON = When("format", ("json",))
-_D = When("artifacts")
 _g = "{:g}".format
 
 
-def _format() -> Option:
-    return Option("-f", "format", Kind.ENUM, "output format (default: json)", default="json",
-                  choices=("json", "ply"))
+def _format(choices: tuple[str, ...] = ("json", "ply"), what: str = "") -> Option:
+    return Option("-f", "format", Kind.ENUM,
+                  f"output format{f': {what}' if what else ''} (default: json)", default="json",
+                  choices=choices)
 
 
 def _output() -> Option:
@@ -487,10 +484,9 @@ def _output() -> Option:
                   metavar="FILE", type=Path, must_exist=False)
 
 
-def _attrs(scope: CloudScope, requires: str, applies: tuple[When, ...], applies_text: str
-           ) -> Option:
-    return Option("-p", "attrs", Kind.ATTRS, f"{help_text(scope)}; {requires}", repeatable=True,
-                  metavar="ATTRS", applies=applies, applies_text=applies_text)
+def _attrs(scope: CloudScope) -> Option:
+    return Option("-p", "attrs", Kind.ATTRS, f"{help_text(scope)}; requires -f ply",
+                  repeatable=True, metavar="ATTRS", applies=(_PLY,), applies_text="only with -f ply")
 
 
 def _image(help: str, **kw: Any) -> Option:
@@ -501,26 +497,35 @@ def _map(help: str, must_exist: bool, **kw: Any) -> Option:
     return Option("-m", "map", Kind.MAP, help, type=Path, must_exist=must_exist, **kw)
 
 
-def _result(scene: str, cloud: str) -> tuple[Output, Output]:
-    return (Output("result", "stdout", "json", scene, (_JSON,)),
-            Output("result", "stdout", "ply", cloud, (_PLY,)))
+def _scene(text: str) -> Output:
+    return Output("result", "stdout", "json", text, (_JSON,))
 
 
-_PLY_ONLY = "only the PLY output has: use -f ply"
+def _cloud(text: str) -> Output:
+    return Output("result", "stdout", "ply", text, (_PLY,))
+
+
 _SCENE = "the OpenLABEL 1.0.0 scene description (spec §3)"
+_DEPTH_IMAGE = ("the depth image: one 16-bit single-channel PNG of the input's pixel size, each "
+                "pixel the metric depth along the optical axis in units of "
+                f"1/{DEPTH_UNITS_PER_METRE} m, {NO_DEPTH} where the model gives no valid depth")
+_SEGMENTED = ("the segmented image: the input image dimmed, each instance mask painted opaque in "
+              "its object's colour")
 
 RECONSTRUCT = Program("reconstruct.sh", "Single-image reconstruction (stdout or -o file).", (
     Command("reconstruct.sh", None, "Single-image reconstruction (stdout or -o file).", (
         _image("input RGB image", required=True),
-        _format(),
+        _format(("json", "depth", "ply"), "json = the scene description, depth = the depth "
+                "image (16-bit PNG), ply = the point cloud"),
         _output(),
-        _attrs(CloudScope.IMAGE, "requires -f ply", (_PLY,), "only with -f ply"),
+        _attrs(CloudScope.IMAGE),
     ), (
-        Mode(None, None, (_attrs_rule((_PLY,), _PLY_ONLY), OUTPUT_RULE, IMAGE_RULE),
+        Mode(None, None, (ATTRS_RULE, OUTPUT_RULE, IMAGE_RULE),
              "required", "reconstructs the image with the inference server",
              (Stage.CONNECT, Stage.INFERENCE, Stage.SEGMENT, Stage.EXPORT, Stage.WRITE),
-             _result(f"{_SCENE}: objects, labels, scores, colours and OBBs in the camera frame",
-                     "the point cloud (camera frame, metres) shaped by -p"),
+             (_scene(f"{_SCENE}: objects, labels, scores, colours and OBBs in the camera frame"),
+              Output("result", "stdout", "png", _DEPTH_IMAGE, (_DEPTH,)),
+              _cloud("the point cloud (camera frame, metres) shaped by -p")),
              CloudScope.IMAGE),
     )),
 ))
@@ -532,7 +537,7 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
         _map("map folder", False, required=True),
         _format(),
         _output(),
-        _attrs(CloudScope.MAP, "requires -f ply", (_PLY,), "only with -f ply"),
+        _attrs(CloudScope.MAP),
         Option("-t", "mode", Kind.ENUM,
                "full = whole map with all keyframe poses; single = new input only "
                "(default: full)", default="full", choices=("full", "single")),
@@ -542,15 +547,15 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
                type=float, applies=(When("inputs", video=True),),
                applies_text="video input only; ignored for images"),
     ), (
-        Mode(None, None, (_attrs_rule((_PLY,), _PLY_ONLY), OUTPUT_RULE, FPS_RULE, *UPDATE_RULES),
+        Mode(None, None, (ATTRS_RULE, OUTPUT_RULE, FPS_RULE, *UPDATE_RULES),
              "required", "infers depth and objects of every new keyframe",
              (Stage.SETUP, Stage.INGEST, Stage.INFERENCE, Stage.SFM, Stage.FEATURES_MATCHING,
               Stage.POSE_REFINEMENT, Stage.FOCAL_RERUN, Stage.MAP_FRAME, Stage.DEPTH_ALIGNMENT,
               Stage.PERSIST_FRAMES, Stage.VALIDITY, Stage.OBJECTS, Stage.CLOUD, Stage.EXPORT,
               Stage.COMMIT),
-             (*_result(f"{_SCENE} of the whole map (-t full) or of the new input (-t single), "
-                       "map coordinates",
-                       "the map cloud (-t full) or the new frames' points (-t single)"),
+             (_scene(f"{_SCENE} of the whole map (-t full) or of the new input (-t single), map "
+                     "coordinates"),
+              _cloud("the map cloud (-t full) or the new frames' points (-t single)"),
               Output("map", "-m", "map", "the map folder, created or extended")),
              CloudScope.MAP),
     )),
@@ -560,66 +565,50 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
         _map("existing map folder", True, required=True),
         _format(),
         _output(),
-        _attrs(CloudScope.MAP, "requires -f ply", (_PLY,), "only with -f ply"),
+        _attrs(CloudScope.MAP),
         Option("-t", "mode", Kind.ENUM,
                "single = the located camera poses only; full = the whole map plus the "
                "located poses (default: single)", default="single", choices=("full", "single")),
     ), (
-        Mode(None, None, (_attrs_rule((_PLY,), _PLY_ONLY), *LOCATE_RULES, OUTPUT_RULE),
+        Mode(None, None, (ATTRS_RULE, *LOCATE_RULES, OUTPUT_RULE),
              "conditional", "only for retrieval in maps of more keyframes than are matched "
              "exhaustively",
              (Stage.SETUP, Stage.FEATURES_MATCHING, Stage.POSE, Stage.EXPORT),
-             _result(f"{_SCENE}: the located camera poses (-t single), or the whole map plus "
-                     "them (-t full)",
-                     "the map points visible from the located cameras (-t single) or the whole "
-                     "map cloud (-t full); the located poses in the header"),
+             (_scene(f"{_SCENE}: the located camera poses (-t single), or the whole map plus "
+                     "them (-t full)"),
+              _cloud("the map points visible from the located cameras (-t single) or the whole "
+                     "map cloud (-t full); the located poses in the header")),
              CloudScope.MAP, {"map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}),
     )),
 ))
 
-_SEGMENT_ATTRS_HELP = ("shapes the -f ply output and segments.ply, so it needs -f ply or -d; with "
-                       "-m the pixel-level keys (stride, min-depth, max-depth, edge) are refused")
-_SEGMENT_PLY = "shape the PLY output: use -f ply or -d <folder>"
-_ARTEFACTS = (
-    Output("segmentation.json", "-d", "json", f"{_SCENE}, identical to -f json", (_D,)),
-    Output("segmented.png", "-d", "png", "the image (for a map, keyframes) with each instance "
-           "mask painted in its object's colour", (_D,), object_regions=True),
-    Output("catalog.csv", "-d", "csv", "one row per object", (_D,)),
-    Output("catalog.md", "-d", "markdown", "the catalogue as a table by descending volume",
-           (_D,)),
-    Output("segments.ply", "-d", "ply", "the object-coloured cloud, identical to -f ply", (_D,)),
-)
-_SEGMENT_RULES = (_attrs_rule((_PLY, _D), _SEGMENT_PLY), OUTPUT_RULE, ARTIFACTS_RULE)
+SEGMENT_IMAGE = Mode(
+    "image", "image", (MIN_SCORE_RULE, OUTPUT_RULE, ARTIFACTS_RULE, IMAGE_RULE),
+    "required", "segments the image with the inference server",
+    (Stage.CONNECT, Stage.INFERENCE, Stage.SEGMENT, Stage.EXPORT, Stage.ARTIFACTS, Stage.WRITE),
+    (_scene(f"{_SCENE} (camera frame)"),
+     Output("result", "stdout", "png", _SEGMENTED, (_PNG,), object_regions=True),
+     Output("segmentation.json", "-d", "json", f"{_SCENE}, identical to -f json", (_D,)),
+     Output("segmented.png", "-d", "png", "the segmented image, identical to -f png", (_D,),
+            object_regions=True),
+     Output("catalog.csv", "-d", "csv", "one row per object", (_D,)),
+     Output("catalog.md", "-d", "markdown", "the catalogue as a table by descending volume",
+            (_D,))))
 
-SEGMENT_IMAGE = Mode("image", "image", (MIN_SCORE_RULE, *_SEGMENT_RULES, IMAGE_RULE),
-                     "required", "segments the image with the inference server",
-                     (Stage.CONNECT, Stage.INFERENCE, Stage.SEGMENT, Stage.EXPORT,
-                      Stage.ARTIFACTS, Stage.WRITE),
-                     (*_result(f"{_SCENE} (camera frame)", "the object-coloured point cloud"),
-                      *_ARTEFACTS),
-                     CloudScope.IMAGE | CloudScope.SEGMENT)
-SEGMENT_MAP = Mode("map", "map", (NO_MIN_SCORE_RULE, *_SEGMENT_RULES, MAP_RULE),
-                   "never", "exports the map's persistent objects without inference",
-                   (Stage.EXPORT, Stage.ARTIFACTS, Stage.WRITE),
-                   (*_result(f"{_SCENE} of the map's objects (map coordinates)",
-                             "the object-coloured map cloud"), *_ARTEFACTS),
-                   CloudScope.MAP | CloudScope.SEGMENT)
-
-SEGMENT = Program("segment.sh", "Instance segmentation → JSON + OBBs, artefacts.", (
-    Command("segment.sh", None, "Instance segmentation → JSON + OBBs, artefacts.", (
-        _image("input RGB image", group="source"),
-        _map("existing map folder (read-only)", True, group="source"),
-        _format(),
+SEGMENT = Program("segment.sh", "Instance segmentation → JSON + OBBs or segmented image, "
+                  "artefacts.", (
+    Command("segment.sh", None, "Instance segmentation → JSON + OBBs or segmented image, "
+            "artefacts.", (
+        _image("input RGB image", required=True),
+        _format(("json", "png"), "json = the scene description, png = the segmented image"),
         _output(),
-        _attrs(CloudScope.IMAGE | CloudScope.SEGMENT, _SEGMENT_ATTRS_HELP, (_PLY, _D),
-               "only with -f ply or -d"),
         Option("-d", "artifacts", Kind.FOLDER_OUT,
-               "also write segmentation.json, segmented.png, catalog.csv, catalog.md and "
-               "segments.ply into FOLDER", metavar="FOLDER", type=Path, must_exist=False),
+               "also write segmentation.json, segmented.png, catalog.csv and catalog.md into "
+               "FOLDER", metavar="FOLDER", type=Path, must_exist=False),
         Option("--min-score", "min_score", Kind.NUMBER,
-               f"drop detections below this score (default {_g(DEFAULT_MIN_SCORE)}; -i only)",
-               default=DEFAULT_MIN_SCORE, finite=True, modes=("image",), applies_text="-i only"),
-    ), (SEGMENT_IMAGE, SEGMENT_MAP), exclusive_required=("image", "map")),
+               f"drop detections below this score (default {_g(DEFAULT_MIN_SCORE)})",
+               default=DEFAULT_MIN_SCORE, finite=True),
+    ), (SEGMENT_IMAGE,)),
 ))
 
 _VIEWER = (Output("viewer", "browser", "html", "the viewer page (URL on stderr)"),)
@@ -840,12 +829,9 @@ def errors_of(mode: Mode) -> list[dict[str, Any]]:
 
 
 def _attributes(scope: CloudScope) -> list[dict[str, Any]]:
-    d = CloudAttrs.defaults(scope)
-    fixed = CloudScope.SEGMENT in scope
-    return [{"key": a.key,
-             "schema": {"type": "enum", "choices": ["segment"]} if fixed and a.key == "color"
-             else dict(a.schema),
-             "default": a.format(getattr(d, a.field)), "effect": a.effect}
+    d = CloudAttrs()
+    return [{"key": a.key, "schema": dict(a.schema), "default": a.format(getattr(d, a.field)),
+             "effect": a.effect}
             for a in applicable(scope)]
 
 
@@ -864,7 +850,7 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
     }
     if o.kind is Kind.ATTRS:
         out["attributes"] = _attributes(mode.scope())
-        out["default"] = CloudAttrs.defaults(mode.scope()).describe(mode.scope())
+        out["default"] = CloudAttrs().describe(mode.scope())
     return out
 
 

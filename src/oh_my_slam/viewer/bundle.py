@@ -118,7 +118,7 @@ class ViewBundle:
     @cached_property
     def controls(self) -> list[Json]:
         """One control per attribute that applies to this scope and affects the display."""
-        defaults = CloudAttrs.defaults(self.scope)
+        defaults = CloudAttrs()
         out = []
         for a in applicable(self.scope):
             if a.key in PLY_ONLY:
@@ -181,7 +181,7 @@ class ViewBundle:
     def prepare(self) -> None:
         """Derive the default cloud once (its display selection is then kept by the source)."""
         try:
-            self.cloud(CloudAttrs.defaults(self.scope))
+            self.cloud(CloudAttrs())
         except Exception as exc:  # the page's own request reports it
             log.warning("viewer: preparing the default cloud failed: %s", exc)
 
@@ -193,7 +193,7 @@ class ViewBundle:
             "cameras": self.cameras,
             "has_segmented": self.segmented_png is not None,
             "controls": self.controls,
-            "defaults": self.describe(CloudAttrs.defaults(self.scope)),
+            "defaults": self.describe(CloudAttrs()),
         }
 
 
@@ -263,11 +263,10 @@ def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
 def image_bundle(image: Path, client: Any = None, min_score: float | None = None) -> ViewBundle:
     """Reconstruct and segment ``image`` once (inference server), keeping detections of at least
     ``min_score`` (default: segmentation's); keep its cloud source."""
-    from oh_my_slam.core.images import png_bytes
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.catalog import catalog_rows
     from oh_my_slam.segmentation.cloud import image_cloud_source
-    from oh_my_slam.segmentation.render import segmented_image
+    from oh_my_slam.segmentation.render import segmented_png
     from oh_my_slam.segmentation.scene import single_image_scene
 
     if client is None:
@@ -285,7 +284,7 @@ def image_bundle(image: Path, client: Any = None, min_score: float | None = None
         scene=single_image_scene(seg, tool="view"),
         source=source,
         catalog=catalog_rows(seg.objects),
-        segmented_png=png_bytes(segmented_image(frame.rgb, seg.label_map)),
+        segmented_png=segmented_png(frame.rgb, seg.label_map),
         display_transform=upright_transform(up).tolist(),
     )
 

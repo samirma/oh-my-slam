@@ -196,7 +196,7 @@ def test_prepare_finds_the_selection_ahead(monkeypatch: pytest.MonkeyPatch) -> N
     t.join()
     assert len(searches) == 1 and source.selections.latest is not None
     latest = source.selections.latest
-    dc = b.cloud(CloudAttrs.defaults(b.scope))
+    dc = b.cloud(CloudAttrs())
     assert len(searches) == 1 and source.selections.latest is latest  # reused, not searched again
     assert 0 < len(dc.cloud) <= 300 and dc.voxel == next(iter(source.selections.edges.values()))
     assert vb.DISPLAY_POINT_BUDGET > 300

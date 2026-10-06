@@ -407,6 +407,6 @@ def test_objects_without_map_cloud_points_are_not_exported() -> None:
         o.confirmed, o.cloud_points, o.cloud_min = True, cloud, least
         objs.append(o)
     # a pendant lamp whose surface did not survive the fusion has no point in the cloud: its box
-    # would have no points in segments.ply; an object needs the points its size calls for
+    # would have no points in a color=segment cloud; an object needs the points its size calls for
     # (cloud_min); a map written before the counts keeps its objects
     assert [o.id for o in ObjectState(objs, 10).exported()] == [1, 3, 4, 6]

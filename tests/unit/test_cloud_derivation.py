@@ -247,7 +247,7 @@ def all_normals(xyz: np.ndarray, viewpoints: np.ndarray) -> np.ndarray:
 def test_map_normals_only_for_the_emitted_points(room_map: MapCloudSource) -> None:
     """Normals are computed for the points a derivation emits, and a point's normal does not
     depend on ``voxel``, on which other points are asked for, or on their order (the same values
-    ``segment.sh -m`` / ``mapper.sh -f ply`` / the viewer emit)."""
+    ``mapper.sh -f ply`` / the viewer emit)."""
     thin = derive_cloud(room_map, CloudAttrs(voxel=0.1, normals=True))
     assert room_map.normals._done.sum() == len(thin) < len(room_map.xyz) / 5
     full = derive_cloud(room_map, CloudAttrs(normals=True))

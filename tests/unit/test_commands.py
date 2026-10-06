@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
-import io
 import json
 import math
 import re
@@ -37,7 +36,6 @@ from oh_my_slam.core.errors import (
     error_code,
     http_status,
 )
-from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.timing import Stage
 from tests.unit.test_cli_single import env  # noqa: F401  (the fake-server fixture)
 
@@ -85,7 +83,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     d = json.loads(json.dumps(spec.describe()))
     ops = {o["id"]: o for o in d["operations"]}
     assert set(ops) == {"reconstruct.sh", "mapper.sh update", "mapper.sh locate",
-                        "segment.sh -i", "segment.sh -m", "view.sh -i", "view.sh -m"}
+                        "segment.sh -i", "view.sh -i", "view.sh -m"}
     for program in spec.PROGRAMS:
         leaves = _leaf_parsers(CLIS[program.prog].build_parser())
         for cmd in program.commands:
@@ -95,8 +93,6 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                 others = {cmd.option(m.selector).flag for m in cmd.modes
                           if m is not mode and m.selector}
                 expected = {f for f in flags if f not in others}
-                if mode is spec.SEGMENT_MAP:
-                    expected.discard("--min-score")
                 assert {p["flag"] for p in op["parameters"]} == expected, op["id"]
                 for p in op["parameters"]:
                     a = flags[p["flag"]]
@@ -108,20 +104,30 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                 assert ("server_unavailable" in codes) == (op["inference"] != "never"), op["id"]
     seg_i = {x["name"]: x for x in ops["segment.sh -i"]["parameters"]}
     assert seg_i["min_score"]["default"] == 0.5 and seg_i["min_score"]["finite"] is True
-    assert seg_i["format"]["choices"] == ["json", "ply"]
+    assert seg_i["min_score"]["applies"] == [] and seg_i["min_score"]["applies_text"] == ""
+    assert seg_i["format"]["choices"] == ["json", "png"] and seg_i["format"]["default"] == "json"
     assert seg_i["image"]["accepts"] == sorted([".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff",
                                                 ".webp"])
-    assert seg_i["image"]["must_exist"] is True and seg_i["artifacts"]["must_exist"] is False
-    attrs = seg_i["attrs"]
-    assert attrs["default"].startswith("color=segment,stride=1")
-    assert attrs["applies"] == [{"option": "format", "in": ["ply"]},
-                                {"option": "artifacts", "is": "given"}]
+    assert seg_i["image"]["must_exist"] is True and seg_i["image"]["required"] is True
+    assert seg_i["artifacts"]["must_exist"] is False
+    assert "attrs" not in seg_i  # segment.sh writes no point cloud (spec §2.4)
+    rec = {x["name"]: x for x in ops["reconstruct.sh"]["parameters"]}
+    assert rec["format"]["choices"] == ["json", "depth", "ply"]
+    attrs = rec["attrs"]
+    assert attrs["default"].startswith("color=rgb,stride=1")
+    assert attrs["applies"] == [{"option": "format", "in": ["ply"]}]
     schema = {x["key"]: x["schema"] for x in attrs["attributes"]}
-    assert schema["color"] == {"type": "enum", "choices": ["segment"]}
+    assert schema["color"] == {"type": "enum", "choices": ["rgb", "segment", "height", "none"]}
     assert schema["stride"] == {"type": "integer", "minimum": 1}
-    seg_m = {x["name"]: x for x in ops["segment.sh -m"]["parameters"]}
-    assert "stride" not in {x["key"] for x in seg_m["attrs"]["attributes"]}
-    assert seg_m["map"]["must_exist"] is True
+    by_format = {o["format"]: o for o in ops["reconstruct.sh"]["outputs"]}
+    assert set(by_format) == {"json", "png", "ply"}
+    depth = by_format["png"]
+    assert depth["when"] == [{"option": "format", "in": ["depth"]}] and not depth["object_regions"]
+    assert depth["media_type"] == "image/png" and "16-bit" in depth["text"]
+    seg_out = [o for o in ops["segment.sh -i"]["outputs"] if o["via"] == "stdout"]
+    assert [(o["format"], o["when"], o["object_regions"]) for o in seg_out] == [
+        ("json", [{"option": "format", "in": ["json"]}], False),
+        ("png", [{"option": "format", "in": ["png"]}], True)]
     update = {x["name"]: x for x in ops["mapper.sh update"]["parameters"]}
     assert update["fps"]["default"] == 2.0 and update["fps"]["exclusive_minimum"] == 0
     assert update["fps"]["omit_if_default"] is True
@@ -138,8 +144,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     assert ops["mapper.sh locate"]["inference_condition"] == {
         "map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
     assert {o["name"] for o in ops["segment.sh -i"]["outputs"]} == {
-        "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md",
-        "segments.ply"}
+        "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"}
     assert {"code": "interrupted", "exit_code": 130, "http_status": 499} in d["exit_codes"]
 
 
@@ -200,20 +205,26 @@ def _validate(program: spec.Program, argv: list[str], **kw: Any) -> argparse.Nam
 
 def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
     seg = S.command()
-    params = {"image": tmp_path / "a.jpg", "format": "ply", "attrs": ["voxel=0.1", "normals=on"],
-              "min_score": 0.3, "output": "-odd.ply"}
+    params = {"image": tmp_path / "a.jpg", "format": "png", "min_score": 0.3,
+              "output": "-odd.png"}
     args = spec.parse(seg, spec.SEGMENT_IMAGE, params)
     cli = cli_segment.build_parser().parse_args(
-        ["-i", str(tmp_path / "a.jpg"), "-f", "ply", "-p", "voxel=0.1", "-p", "normals=on",
-         "--min-score", "0.3", "-o=-odd.ply"])
-    assert args == cli and args.output == Path("-odd.ply")
+        ["-i", str(tmp_path / "a.jpg"), "-f", "png", "--min-score", "0.3", "-o=-odd.png"])
+    assert args == cli and args.output == Path("-odd.png")
+    rec = R.command()
+    args = spec.parse(rec, rec.modes[0], {"image": "a.jpg", "format": "ply",
+                                          "attrs": ["voxel=0.1", "normals=on"]})
+    assert args.attrs == ["voxel=0.1", "normals=on"]
     with pytest.raises(UsageError, match=re.escape(
-            "argument -f: invalid choice: 'xml' (choose from json, ply)")):
-        spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "xml"})
+            "argument -f: invalid choice: 'ply' (choose from json, png)")):
+        spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "ply"})
     with pytest.raises(UsageError, match="the following arguments are required: -m"):
         spec.parse(M.command("update"), M.command("update").modes[0], {"inputs": ["a.jpg"]})
-    with pytest.raises(UsageError, match=re.escape("unrecognized parameters for segment.sh -m: min_score")):
-        spec.parse(seg, spec.SEGMENT_MAP, {"map": "m", "min_score": 0.4})
+    with pytest.raises(UsageError, match="the following arguments are required: -i"):
+        spec.parse(seg, spec.SEGMENT_IMAGE, {"format": "png"})
+    with pytest.raises(UsageError, match=re.escape(
+            "unrecognized parameters for segment.sh -i: attrs, map")):
+        spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "map": "m", "attrs": "voxel=1"})
     up = M.command("update")
     args = spec.parse(up, up.modes[0], {"inputs": ["a.jpg", "b.jpg"], "map": "m", "fps": 2.0})
     assert args.fps is None and args.inputs == [Path("a.jpg"), Path("b.jpg")]  # default omitted
@@ -222,7 +233,7 @@ def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
     view = V.command()
     assert spec.parse(view, view.mode("map"), {"map": "m", "no_browser": True}).no_browser
     with pytest.raises(UsageError, match=re.escape("one of the arguments -i -m is required")):
-        S.command().mode_of(argparse.Namespace(image=None, map=None))
+        V.command().mode_of(argparse.Namespace(image=None, map=None))
 
 
 def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
@@ -233,6 +244,8 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
     other = str(tmp_path / "other")
     cases = [
         (R, ["-i", str(img), "-p", "voxel=1"], UsageError, "only the PLY output has"),
+        (R, ["-i", str(img), "-f", "depth", "-p", "voxel=1"], UsageError,
+         "-p sets point-cloud attributes, which only the PLY output has: use -f ply"),
         (R, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (R, ["-i", str(img), "-o", str(tmp_path)], UsageError, "is a folder"),
         (R, ["-i", str(img), "-o", str(img / "x.json")], UsageError,
@@ -246,11 +259,9 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
         (M, ["locate", "-i", "v.mp4", "-m", "m"], UsageError, "not a video"),
         (M, ["locate", "-i", str(img), "-m", str(tmp_path / "none")], InputError, "no map in"),
         (M, ["locate", "-i", str(img), "-m", other], NotAMapError, "is not a map"),
-        (S, ["-m", "m", "--min-score", "0.4"], UsageError, "applies to -i only"),
         (S, ["-i", str(img), "--min-score", "nan"], UsageError, "finite number"),
-        (S, ["-i", str(img), "-p", "voxel=1"], UsageError, "use -f ply or -d"),
-        (S, ["-m", other], NotAMapError, "not a map folder"),
-        (S, ["-m", str(tmp_path / "none")], NotAMapError, "not a map folder"),
+        (S, ["-i", str(img), "-o", str(tmp_path)], UsageError, "is a folder"),
+        (S, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (V, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (V, ["-m", other], NotAMapError, "not a map folder"),
     ]
@@ -263,21 +274,24 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
                   warn=warnings.append)
     assert v.fps == 2.0 and not v.is_video and v.input_spec.images == [img]
     assert warnings == ["-fps applies to video input only; ignored for images"]
-    v = _validate(S, ["-i", str(img), "-d", str(tmp_path / "d"), "-p", "voxel=0.1",
+    v = _validate(S, ["-i", str(img), "-d", str(tmp_path / "d"), "-f", "png",
                       "--min-score", "0.3"])
-    assert v.min_score == 0.3 and v.attrs == CloudAttrs(color="segment", voxel=0.1)
+    assert v.min_score == 0.3 and v.format == "png" and not hasattr(v, "attrs")
     assert (tmp_path / "d").is_dir()  # -d is prepared before any work
     assert _validate(R, ["-i", str(img)]).attrs == CloudAttrs()
+    assert _validate(R, ["-i", str(img), "-f", "depth"]).attrs == CloudAttrs()
+    assert _validate(R, ["-i", str(img), "-f", "ply", "-p", "voxel=0.1"]).attrs == CloudAttrs(
+        voxel=0.1)
 
 
 def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
         tmp_path: Path) -> None:
     seg = S.command()
     problems = {p.rule: p for p in spec.dry_run(seg, spec.SEGMENT_IMAGE, {
-        "image": tmp_path / "none.jpg", "min_score": "abc", "attrs": ["stride=0"],
+        "image": tmp_path / "none.jpg", "min_score": "abc",
         "artifacts": tmp_path / "new" / "d", "output": tmp_path})}
-    assert set(problems) == {"min_score", "attrs", "output_writable", "image_exists"}
-    assert problems["attrs"].parameters[0] == "attrs"
+    assert set(problems) == {"min_score", "output_writable", "image_exists"}
+    assert problems["min_score"].parameters[0] == "min_score"
     assert problems["image_exists"].describe() == {
         "rule": "image_exists", "parameters": ["image"],
         "message": f"image not found: {tmp_path / 'none.jpg'}", "code": "usage",
@@ -309,7 +323,7 @@ def test_argument_errors_name_their_parameters() -> None:
         (up, up.modes[0], {"inputs": ["v.mp4"], "map": "m", "fps": "abc"}, ("fps",)),
         (up, up.modes[0], {"inputs": ["a.jpg"]}, ("map",)),
         (up, up.modes[0], {}, ("inputs", "map")),
-        (seg, spec.SEGMENT_MAP, {"map": "m", "min_score": 0.4}, ("min_score",)),
+        (seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "attrs": "voxel=1"}, ("attrs",)),
     ]
     for cmd, mode, params, names in cases:
         with pytest.raises(ParameterError) as e:
@@ -380,8 +394,8 @@ def _declared(cmd: spec.Command, mode: spec.Mode) -> set[str]:
 
 def test_recorded_stages_are_the_declared_ones(env, tmp_path: Path,  # type: ignore[no-untyped-def]  # noqa: F811
                                                monkeypatch: pytest.MonkeyPatch) -> None:
-    """reconstruct.sh, segment.sh -i / -m and mapper.sh update / locate (fake server) record only
-    stages their operation declares."""
+    """reconstruct.sh (each format), segment.sh and mapper.sh update / locate (fake server) record
+    only stages their operation declares."""
     import shutil
 
     from oh_my_slam.mapping.api import update
@@ -394,21 +408,20 @@ def test_recorded_stages_are_the_declared_ones(env, tmp_path: Path,  # type: ign
         (R.command(), R.command().modes[0], lambda: cli_reconstruct.main(["-i", str(img)])),
         (R.command(), R.command().modes[0], lambda: cli_reconstruct.main(
             ["-i", str(img), "-f", "ply", "-p", "color=segment"])),
+        (R.command(), R.command().modes[0], lambda: cli_reconstruct.main(
+            ["-i", str(img), "-f", "depth"])),
         (S.command(), spec.SEGMENT_IMAGE, lambda: cli_segment.main(
             ["-i", str(img), "-d", str(tmp_path / "art")])),
+        (S.command(), spec.SEGMENT_IMAGE, lambda: cli_segment.main(["-i", str(img), "-f", "png"])),
     ]
     client = FakeClient()
     room = mapping_room()
     keys = add_frames(client, room, ring(1), tmp_path / "k", "k")
     mdir = tmp_path / "map"
     queries = add_frames(client, room, ring(2, start=0.08, span=0.16), tmp_path / "q", "q")
-    monkeypatch.setattr(cli_segment, "claim_stdout", lambda output=None: PayloadWriter(
-        io.BytesIO()))
     up = M.command("update")
     runs += [
         (up, up.modes[0], lambda: update(mdir, keys, client=client, progress=lambda m: None)),
-        (S.command(), spec.SEGMENT_MAP, lambda: cli_segment.main(
-            ["-m", str(mdir), "-f", "ply", "-d", str(tmp_path / "mart")])),
     ]
     if shutil.which("colmap"):
         lo = M.command("locate")
@@ -433,8 +446,8 @@ def test_dry_run_reports_a_bad_value_after_an_unknown_parameter(tmp_path: Path) 
     """An unknown parameter is dropped, then the next parse still reports the others; argv_of is
     the command line parse parses (the web service runs the command with it)."""
     seg = spec.SEGMENT.command()
-    problems = spec.dry_run(seg, spec.SEGMENT_MAP, {"map": str(tmp_path), "min_score": 0.4,
-                                                    "format": "xml"})
-    assert [p.parameters for p in problems][:2] == [("min_score",), ("format",)]
-    assert spec.argv_of(seg, spec.SEGMENT_MAP, {"map": "m", "format": "ply", "min_score": None}) \
-        == ["-m=m", "-f=ply"]
+    problems = spec.dry_run(seg, spec.SEGMENT_IMAGE, {"image": str(tmp_path / "a.jpg"),
+                                                      "map": "m", "format": "xml"})
+    assert [p.parameters for p in problems][:2] == [("map",), ("format",)]
+    assert spec.argv_of(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "png",
+                                                  "min_score": None}) == ["-i=a.jpg", "-f=png"]

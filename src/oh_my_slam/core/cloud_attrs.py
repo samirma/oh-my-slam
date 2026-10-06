@@ -1,14 +1,12 @@
 """The point-cloud attributes of every emitted PLY (spec §2.2): definition, defaults, validation.
 
-One definition shared by ``reconstruct.sh -f ply``, ``mapper.sh -f ply``, ``segment.sh`` (``-f ply``
-and ``segments.ply``) and the ``view.sh`` controls. ``-p key=value[,key=value…]`` is parsed here;
-keys that are not given keep their defaults, and every problem is a :class:`UsageError` (exit 2)
-raised before any inference runs.
+One definition shared by ``reconstruct.sh -f ply``, ``mapper.sh -f ply`` and the ``view.sh``
+controls. ``-p key=value[,key=value…]`` is parsed here; keys that are not given keep their defaults
+(``CloudAttrs()``), and every problem is a :class:`UsageError` (exit 2) raised before any inference
+runs.
 
 Scopes: ``IMAGE`` (a single image: every key) or ``MAP`` (a persisted map: the pixel-level keys
-``stride``, ``min-depth``, ``max-depth`` and ``edge`` apply before unprojection and are refused),
-optionally combined with ``SEGMENT`` (``segment.sh``: ``color`` defaults to ``segment`` and any
-other value is refused).
+``stride``, ``min-depth``, ``max-depth`` and ``edge`` apply before unprojection and are refused).
 """
 
 from __future__ import annotations
@@ -33,12 +31,12 @@ DEFAULT_EDGE = 0.04  # relative depth jump that marks a flying pixel
 class CloudScope(Flag):
     IMAGE = auto()
     MAP = auto()
-    SEGMENT = auto()
 
 
 @dataclass(frozen=True)
 class CloudAttrs:
-    """Effective attributes (field names are the keys with ``-`` → ``_``)."""
+    """Effective attributes (field names are the keys with ``-`` → ``_``); the defaults are the
+    spec's, in every scope."""
 
     color: ColorMode = "rgb"
     stride: int = 1
@@ -49,10 +47,6 @@ class CloudAttrs:
     normals: bool = False
     label: bool = False
     encoding: Encoding = "binary"
-
-    @staticmethod
-    def defaults(scope: CloudScope) -> CloudAttrs:
-        return CloudAttrs(color="segment") if CloudScope.SEGMENT in scope else CloudAttrs()
 
     def items(self, scope: CloudScope) -> list[tuple[str, str]]:
         """``(key, value)`` of every attribute that applies to ``scope``, in table order."""
@@ -155,18 +149,14 @@ _BY_KEY = {a.key: a for a in ATTRIBUTES}
 
 
 def applicable(scope: CloudScope) -> tuple[AttrSpec, ...]:
-    """The attributes that may be set in ``scope`` (``color`` is listed but fixed for SEGMENT)."""
+    """The attributes that may be set in ``scope``."""
     return tuple(a for a in ATTRIBUTES if CloudScope.MAP not in scope or not a.pixel_level)
 
 
 def help_text(scope: CloudScope) -> str:
     """One-line description of ``-p`` for ``scope``, with its defaults."""
-    d = CloudAttrs.defaults(scope)
-    parts = []
-    for a in applicable(scope):
-        values = "segment (fixed)" if a.key == "color" and CloudScope.SEGMENT in scope \
-            else a.metavar
-        parts.append(f"{a.key}={values} [{a.format(getattr(d, a.field))}]")
+    d = CloudAttrs()
+    parts = [f"{a.key}={a.metavar} [{a.format(getattr(d, a.field))}]" for a in applicable(scope)]
     return "point-cloud attributes key=value[,key=value...], defaults in brackets: " \
         + ", ".join(parts)
 
@@ -198,7 +188,7 @@ def parse_cloud_attrs(spec: str | Iterable[str] | Mapping[str, str] | None,
     """Validated attributes for ``scope`` from ``-p`` text(s) or a key → value mapping."""
     if (CloudScope.IMAGE in scope) == (CloudScope.MAP in scope):
         raise ValueError("scope must contain exactly one of IMAGE and MAP")
-    attrs = CloudAttrs.defaults(scope)
+    attrs = CloudAttrs()
     seen: set[str] = set()
     for key, value in _pairs(spec):
         a = _BY_KEY.get(key)
@@ -210,15 +200,12 @@ def parse_cloud_attrs(spec: str | Iterable[str] | Mapping[str, str] | None,
         seen.add(key)
         if a.pixel_level and CloudScope.MAP in scope:
             raise UsageError(f"{key} is a pixel-level attribute: it applies before unprojection, "
-                             "to single images only (reconstruct.sh, segment.sh -i); a map's "
-                             "points are already 3D — use voxel to thin them")
+                             "to single images only (reconstruct.sh); a map's points are already "
+                             "3D — use voxel to thin them")
         try:
             parsed = a.parse(value)
         except ValueError:
             raise UsageError(f"{key} must be {a.values}, got {value!r}") from None
-        if key == "color" and CloudScope.SEGMENT in scope and parsed != "segment":
-            raise UsageError(f"segment.sh colours points by object: color is fixed to segment "
-                             f"(got {value!r})")
         attrs = replace(attrs, **{a.field: parsed})
     if attrs.min_depth >= attrs.max_depth:
         raise UsageError(f"min-depth ({_num(attrs.min_depth)}) must be smaller than max-depth "

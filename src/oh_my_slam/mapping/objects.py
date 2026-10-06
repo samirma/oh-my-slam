@@ -97,8 +97,8 @@ Semantics (spec §2.3):
   ``point_count`` of a single image counts its cloud's points. An object is exported only with
   ``min_cloud_points`` of them — a share of the cells of its box's largest face at the map's
   sampling at its nearest detection (a cloud voxel, or a depth pixel's footprint where coarser) —
-  so every exported object is visibly drawn in the cloud (``segments.ply``, ``color=segment``) in
-  its colour.
+  so every exported object is visibly drawn in the cloud (every ``color=segment`` PLY) in its
+  colour.
 * **Boxes cover the observed surface.** A box is fitted to the points the keyframes saw: an
   object seen only from the front (a refrigerator against a wall) has the depth of its visible
   surface, not its physical depth; no class-typical size is assumed.
@@ -357,8 +357,8 @@ PART_SURFACE = 0.8
 PART_NEAR_REL = 0.02
 # An object is exported only with at least ``min_cloud_points`` map-cloud points: EXPORT_MIN_SUPPORT
 # of the cells of its box's largest face at the resolution its keyframes sampled it, and at least
-# EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (segments.ply,
-# color=segment) in its colour. A cell is a cloud voxel, or the footprint of one pixel of the
+# EXPORT_MIN_CLOUD_POINTS: every exported object is then visibly drawn in the cloud (every
+# color=segment PLY) in its colour. A cell is a cloud voxel, or the footprint of one pixel of the
 # fused depth grid at the depth of its nearest detection where that is larger: an object's points
 # come from its detections (the votes of the keyframes that detected it, and the unlabelled cloud
 # points nearest its own lifted points, ``geometry.support_labels``: at most a few per depth pixel

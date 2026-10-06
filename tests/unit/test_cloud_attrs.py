@@ -15,7 +15,7 @@ from oh_my_slam.core.cloud_attrs import (
 )
 from oh_my_slam.core.errors import ExitCode, UsageError
 
-IMAGE, MAP, SEGMENT = CloudScope.IMAGE, CloudScope.MAP, CloudScope.SEGMENT
+IMAGE, MAP = CloudScope.IMAGE, CloudScope.MAP
 KEYS = tuple(a.key for a in ATTRIBUTES)
 PIXEL_KEYS = ("stride", "min-depth", "max-depth", "edge")
 
@@ -26,14 +26,12 @@ def test_attribute_table_matches_the_spec() -> None:
     assert tuple(a.key for a in ATTRIBUTES if a.pixel_level) == PIXEL_KEYS
 
 
-def test_defaults_per_scope() -> None:
-    d = CloudAttrs.defaults(IMAGE)
-    assert d == CloudAttrs() == parse_cloud_attrs(None, IMAGE) == parse_cloud_attrs("", IMAGE)
+def test_defaults_are_the_same_in_every_scope() -> None:
+    d = CloudAttrs()
+    assert d == parse_cloud_attrs(None, IMAGE) == parse_cloud_attrs("", IMAGE)
     assert (d.color, d.stride, d.min_depth, d.max_depth, d.edge, d.voxel, d.normals, d.label,
             d.encoding) == ("rgb", 1, 0.0, math.inf, 0.04, 0.0, False, False, "binary")
-    assert CloudAttrs.defaults(MAP) == d
-    assert parse_cloud_attrs(None, IMAGE | SEGMENT) == CloudAttrs(color="segment")
-    assert parse_cloud_attrs(None, MAP | SEGMENT) == CloudAttrs(color="segment")
+    assert parse_cloud_attrs(None, MAP) == d
 
 
 def test_parse_spec_example_and_every_key() -> None:
@@ -81,20 +79,18 @@ def test_bad_values_are_actionable_usage_errors(spec: str, message: str) -> None
 def test_map_scope_refuses_pixel_level_attributes(key: str) -> None:
     value = {"stride": "2", "min-depth": "1", "max-depth": "3", "edge": "0"}[key]
     parse_cloud_attrs(f"{key}={value}", IMAGE)  # fine for a single image
-    for scope in (MAP, MAP | SEGMENT):
-        with pytest.raises(UsageError, match="pixel-level attribute"):
-            parse_cloud_attrs(f"{key}={value}", scope)
+    with pytest.raises(UsageError, match="pixel-level attribute"):
+        parse_cloud_attrs(f"{key}={value}", MAP)
     # the unknown-key hint for a map lists only the keys that apply
     with pytest.raises(UsageError) as e:
         parse_cloud_attrs("nope=1", MAP)
     assert "stride" not in str(e.value) and "voxel" in str(e.value)
 
 
-def test_segment_scope_fixes_color() -> None:
-    assert parse_cloud_attrs("color=segment,voxel=0.05", IMAGE | SEGMENT).voxel == 0.05
-    for other in ("rgb", "height", "none"):
-        with pytest.raises(UsageError, match="color is fixed to segment"):
-            parse_cloud_attrs(f"color={other}", IMAGE | SEGMENT)
+def test_every_colour_is_valid_in_every_scope() -> None:
+    for color in ("rgb", "segment", "height", "none"):
+        for scope in (IMAGE, MAP):
+            assert parse_cloud_attrs(f"color={color}", scope).color == color
 
 
 def test_describe_records_every_applicable_attribute_and_reads_back() -> None:
@@ -112,12 +108,12 @@ def test_describe_records_every_applicable_attribute_and_reads_back() -> None:
 def test_help_text_lists_keys_and_defaults() -> None:
     h = help_text(IMAGE)
     assert all(k in h for k in KEYS) and "edge=" in h and "[0.04]" in h and "[rgb]" in h
-    hm = help_text(MAP | SEGMENT)
-    assert "stride" not in hm and "segment (fixed)" in hm and "[segment]" in hm
+    hm = help_text(MAP)
+    assert "stride" not in hm and "color=rgb|segment|height|none [rgb]" in hm
 
 
 def test_scope_needs_exactly_one_source_kind() -> None:
     with pytest.raises(ValueError):
-        parse_cloud_attrs(None, SEGMENT)
+        parse_cloud_attrs(None, CloudScope(0))
     with pytest.raises(ValueError):
         parse_cloud_attrs(None, IMAGE | MAP)

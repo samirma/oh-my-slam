@@ -235,17 +235,20 @@ def test_map_camera_positions_are_the_scene_translations(map_view: Any) -> None:
 
 
 @needs_colmap
-def test_map_cloud_is_the_segment_m_ply(map_view: Any) -> None:
-    """The complete map cloud, coloured by object exactly as ``segment.sh -m -f ply``."""
-    from oh_my_slam.mapping.export import map_segment_outputs
+def test_map_cloud_is_the_shared_derivation(map_view: Any) -> None:
+    """The complete map cloud, coloured by object exactly as the PLY the shared derivation writes
+    for the map's objects (``color=segment``)."""
+    from oh_my_slam.mapping import store
+    from oh_my_slam.mapping.export import map_objects, reader_source
+    from oh_my_slam.segmentation.cloud import cloud_ply
 
     url, root, _ = map_view
+    reader = store.MapReader(root)
+    source = reader_source(reader, map_objects(reader)[1])
     for query in ("", "voxel=0.05&normals=on"):
         head, arrays = cloud(url, "color=segment&" + query)
-        attrs = parse_cloud_attrs(spec(query), CloudScope.MAP | CloudScope.SEGMENT)
-        _, ply_bytes = map_segment_outputs(root, None, attrs)
-        assert ply_bytes is not None
-        ply = parse_ply(ply_bytes)
+        attrs = parse_cloud_attrs(spec(query + "&color=segment"), CloudScope.MAP)
+        ply = parse_ply(cloud_ply(source, attrs))
         assert head["count"] == head["total"] == len(ply) > 1000
         np.testing.assert_array_equal(arrays["position"], ply.xyz)
         np.testing.assert_array_equal(arrays["color"], ply.rgb)
@@ -268,3 +271,28 @@ def test_map_bundle_uses_the_reader_it_is_given(map_view: Any,
     monkeypatch.setattr(store, "MapReader", lambda p: opened.append(p) or real(p))
     bundle = map_bundle(root, reader=reader)
     assert opened == [] and bundle.title == root.name
+
+
+def test_map_scene_colours_follow_the_current_palette(tmp_path: Path) -> None:
+    """The map folder stores no colour: the scene JSON of a map (what ``view.sh -m`` serves and
+    ``mapper.sh locate -t full`` answers) is rebuilt from its persisted state, so it carries today's
+    colour of each id, as the clouds derived from it do, even for a map written before a palette
+    change."""
+    from oh_my_slam.mapping import store
+    from oh_my_slam.mapping.api import update
+    from oh_my_slam.mapping.export import scene_bytes
+    from oh_my_slam.segmentation.colors import color_hex_for_id
+    from tests.fakes.client import FakeClient
+    from tests.synth.mapping import add_frames, mapping_room, ring
+
+    client = FakeClient()  # a one-keyframe map (identity pose): no COLMAP needed
+    imgs = add_frames(client, mapping_room(), ring(1), tmp_path / "in", "s")
+    root = tmp_path / "map"
+    update(root, imgs, client=client, progress=lambda m: None)
+    stored = [p for p in root.rglob("*.json") if b"color" in p.read_bytes()]
+    assert stored == []
+    doc = json.loads(scene_bytes(store.MapReader(root)))
+    assert doc["openlabel"]["metadata"]["tool"] == "mapper" and doc["openlabel"]["objects"]
+    for key, o in doc["openlabel"]["objects"].items():
+        assert o["object_data"]["text"] == [{"name": "color_hex", "val": color_hex_for_id(int(key))}]
+        assert o["object_data"]["vec"] == [{"name": "color", "val": list(color_for_id(int(key)))}]
