@@ -116,4 +116,4 @@ def test_an_ingest_error_stops_the_inference(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr(api, "reconstruct_and_detect_keyframe", fake)
     with pytest.raises(RuntimeError, match="bad video"):
         api._infer_frames(_keyframes(tmp_path, 5, fail_at=3), "video", tmp_path, None,
-                          lambda m: None)
+                          lambda m: None, lambda w: None)

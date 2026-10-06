@@ -149,8 +149,7 @@ def _progress(msg: str) -> None:
 
 
 def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client: Any,
-                  progress: Progress,
-                  ingested: Callable[[list[ingest.Keyframe]], None] | None = None
+                  progress: Progress, ingested: Callable[[list[ingest.Keyframe]], None]
                   ) -> list[NewFrame]:
     """Geometry, gravity and detections for every keyframe (two frames in flight), each started as
     soon as ingest has written it: the stage ``ingest`` decodes the input while the first
@@ -172,8 +171,7 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
                 written.append(kf)
                 futures.append(pool.submit(one, kf))
         progress(f"{len(futures)} keyframes from {kind}")
-        if ingested is not None:
-            ingested(written)
+        ingested(written)
         with timing.stage(timing.Stage.INFERENCE):
             for i, fut in enumerate(futures, start=1):
                 out.append(fut.result())
