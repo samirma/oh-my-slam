@@ -208,12 +208,12 @@ def derive_thinned(source: CloudSource, attrs: CloudAttrs, max_points: int | Non
     total, edge = len(xyz), 0.0
     if max_points is not None and total > max_points:
         key = (_position_key(attrs), max_points)
+        # at most max_points indices (budget_voxel_indices), so fewer than the points
         keep, edge = source.selections.indices(key, xyz, max_points)
-        if len(keep) < total:
-            xyz = xyz[keep]
-            rows = keep if rows is None else rows[keep]
-            lab = None if lab is None else lab[keep]
-            colour = None if colour is None else colour[keep]
+        xyz = xyz[keep]
+        rows = keep if rows is None else rows[keep]
+        lab = None if lab is None else lab[keep]
+        colour = None if colour is None else colour[keep]
     normals: NDArray[np.float32] | None = None
     if attrs.normals:
         if isinstance(source, ImageCloudSource):
