@@ -100,7 +100,9 @@ def test_stop_forces_a_service_that_does_not_stop(ws: Workspace, monkeypatch: py
     """``--stop`` waits ``STOP_TIMEOUT_S``, then sends a second SIGTERM (which kills the commands'
     process groups and exits), and SIGKILL as the last resort."""
     monkeypatch.setattr(web_main, "STOP_TIMEOUT_S", 0.4)
-    monkeypatch.setattr(web_main, "FORCE_TIMEOUT_S", 0.4)
+    # a service that obeys the second SIGTERM gets all the time it needs to exit (the wait ends
+    # as soon as it released the workspace); one that never obeys is killed after a short wait
+    monkeypatch.setattr(web_main, "FORCE_TIMEOUT_S", 30.0 if how == "a second SIGTERM" else 0.4)
     proc = holder(ws, ignore)
     try:
         assert web_main.stop(ws) == 0
