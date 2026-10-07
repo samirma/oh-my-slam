@@ -39,7 +39,7 @@ from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.errors import ExitCode, OhMySlamError, ServiceNotRunningError, UsageError
 from oh_my_slam.core.log import claim_stdout
-from oh_my_slam.core.process import default_sigint
+from oh_my_slam.core.process import default_sigint, exit_now
 from oh_my_slam.server.lifecycle import AlreadyRunningError, ServerLock, pid_alive
 from oh_my_slam.version import __version__
 from oh_my_slam.web.workspace import DEFAULT_DATA, Workspace
@@ -223,20 +223,19 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
             lock.release()
             _tell_terminal(ws, "stopped by a second signal; every command's processes were "
                            "killed")
-            os._exit(int(ExitCode.INTERRUPTED))
+            exit_now(int(ExitCode.INTERRUPTED))
 
         class _Server(uvicorn.Server):
             async def startup(self, sockets: list[socket.socket] | None = None) -> None:
-                await super().startup(sockets)
-                if self.started:
-                    atomic_write_json(ws.root / STATE, {
-                        "pid": os.getpid(), "url": url, "port": sock.getsockname()[1],
-                        "data": str(ws.root), "version": __version__,
-                        "started_at": service.started_at})
-                    _say(f"listening on {url}")
-                    _log_to(ws.root / LOG)
-                    if open_browser:
-                        webbrowser.open(_local(url))
+                await super().startup(sockets)  # returns once started (else it raises)
+                atomic_write_json(ws.root / STATE, {
+                    "pid": os.getpid(), "url": url, "port": sock.getsockname()[1],
+                    "data": str(ws.root), "version": __version__,
+                    "started_at": service.started_at})
+                _say(f"listening on {url}")
+                _log_to(ws.root / LOG)
+                if open_browser:
+                    webbrowser.open(_local(url))
 
             @contextlib.contextmanager
             def capture_signals(self) -> Iterator[None]:
