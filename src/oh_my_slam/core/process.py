@@ -36,14 +36,15 @@ def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None
     except Exception as exc:
         print(f"{prog}: internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
         code = int(ExitCode.INTERNAL)
+    sys.stderr.flush()
     exit_now(code)
 
 
 def exit_now(code: int) -> NoReturn:
-    """End the process at once with ``code``: stderr flushed, coverage data saved when running
-    under pytest-cov (``os._exit`` skips atexit hooks), and no interpreter teardown, whose native
-    libraries write noise on stdout/stderr."""
-    sys.stderr.flush()
+    """End the process at once with ``code``, without interpreter teardown (whose native
+    libraries write noise on stdout/stderr); coverage data is saved first when running under
+    pytest-cov, since ``os._exit`` skips atexit hooks. It flushes no stream, so a signal handler
+    may call it (``server.sh``'s hard stop) whatever the interrupted code was writing."""
     _save_coverage()
     os._exit(code)
 
