@@ -392,6 +392,26 @@ def test_argument_errors_name_their_parameters() -> None:
     assert args.inputs == [Path("./-a.jpg"), Path("b.jpg")]
 
 
+def test_an_error_argparse_reports_through_error_names_its_parameters(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """argparse releases of Python 3.12 before 3.12.5 report some errors (missing required
+    arguments) through ``error()`` even with ``exit_on_error=False``: the web service's parser
+    still raises them as a ``ParameterError`` with argparse's message and the parameters it names,
+    and prints nothing."""
+    from oh_my_slam.commands.parser import RaisingParser
+
+    view = spec.build_parser(spec.VIEW, RaisingParser)
+    with pytest.raises(ParameterError) as e:
+        view.error("one of the arguments -i -m is required")
+    assert e.value.parameters == ("image", "map") and e.value.exit_code is ExitCode.USAGE
+    assert str(e.value) == "one of the arguments -i -m is required"
+    with pytest.raises(ParameterError) as e:
+        spec.build_parser(spec.SEGMENT, RaisingParser).error(
+            "the following arguments are required: -i, --nope")
+    assert e.value.parameters == ("image",)  # a flag no option has names nothing
+    assert capsys.readouterr() == ("", "")
+
+
 def test_describe_is_cheap() -> None:
     """Reading the definitions loads none of the pipeline (the web service's start-up)."""
     code = ("import sys, time; t = time.perf_counter(); from oh_my_slam.commands import spec; "
