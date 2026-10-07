@@ -193,7 +193,7 @@ class Workspace:
         for k, v in meta.items():
             if isinstance(v, str | int | float | bool) or v is None:
                 summary[k] = v
-            elif isinstance(v, list | dict):
+            else:  # the only other JSON values: a list or an object
                 summary[f"{k}_count"] = len(v)
         summary["frames"] = len(reader.frames)
         if reader.exists(store.OBJECTS_JSON):
