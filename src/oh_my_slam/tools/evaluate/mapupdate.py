@@ -1,4 +1,4 @@
-"""Map update (specs/mapper.md §2.3, specs/high_level_spec.md §5): mapping
+"""Map update (specs/mapper.md §2.3, high_level_spec.md §5): mapping
 ``examples/office_sequence/``, whose scene changes during the capture (a cup on the window sill is
 gone in the last images), must give a map that reflects the latest observation — without the cup
 and with no hole where it stood — in one update or split across several, while every object that

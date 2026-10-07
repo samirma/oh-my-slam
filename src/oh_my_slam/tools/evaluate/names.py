@@ -1,4 +1,4 @@
-"""The capture file-name grammar of ``examples/ainex-captures`` (specs/high_level_spec.md §5).
+"""The capture file-name grammar of ``examples/ainex-captures`` (high_level_spec.md §5).
 
 ``NNN_<motion>_<tilt>.jpg`` — ``NNN`` is the capture order; ``<motion>`` the commanded yaw relative
 to frame 001, positive to the left:
