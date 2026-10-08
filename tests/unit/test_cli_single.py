@@ -15,7 +15,7 @@ import pytest
 
 from oh_my_slam.cli import reconstruct as cli_reconstruct
 from oh_my_slam.cli import segment as cli_segment
-from oh_my_slam.cli.common import ArgumentParser
+from oh_my_slam.commands.parser import ArgumentParser
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.log import PayloadWriter
 from oh_my_slam.core.ply import parse_header, parse_ply
@@ -58,10 +58,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-unt
     depth = r.depth.copy()
     depth[:4, :6] = 0  # no valid depth there (the fake's mask: depth > 0)
     img = client.add(tmp_path / "room.png", r.rgb, FakeFrame(depth, K, up, inst, pose=pose))
-    import oh_my_slam.client.client as cc
+    from oh_my_slam.reconstruction import api as rapi
 
-    monkeypatch.setattr(cc, "connect", lambda require=True: client)
-    monkeypatch.setattr(cli_reconstruct, "connect", lambda require=True: client)
+    monkeypatch.setattr(rapi, "connect_server", lambda: client)  # segment.sh's, at run time
+    monkeypatch.setattr(cli_reconstruct, "connect_server", lambda: client)
     cap = Capture()
     monkeypatch.setattr(cli_reconstruct, "claim_stdout", cap)
     monkeypatch.setattr(cli_segment, "claim_stdout", cap)
@@ -326,7 +326,7 @@ def test_spec_usage_lines_parse_with_defaults() -> None:
     r = cli_reconstruct.build_parser().parse_args(
         ["-i", "x.jpg", "-f", "ply", "-p", "color=height,voxel=0.01,normals=on", "-o", "c.ply"])
     assert (r.format, r.output, r.attrs) == ("ply", Path("c.ply"),
-                                             ["color=height,voxel=0.01,normals=on"])
+                                             "color=height,voxel=0.01,normals=on")
     r = cli_reconstruct.build_parser().parse_args(["-i", "x.jpg", "-f", "depth", "-o", "d.png"])
     assert (r.format, r.output, r.attrs) == ("depth", Path("d.png"), None)
     s = cli_segment.build_parser().parse_args(["-i", "x.jpg"])
@@ -345,7 +345,7 @@ def test_spec_usage_lines_parse_with_defaults() -> None:
         ["locate", "-i", "x.jpg", "y.jpg", "-m", "map", "-f", "ply", "-o", "o.ply", "-p",
          "voxel=0.1", "-t", "full"])
     assert (m.inputs, m.format, m.output, m.attrs, m.mode) == (
-        [Path("x.jpg"), Path("y.jpg")], "ply", Path("o.ply"), ["voxel=0.1"], "full")
+        [Path("x.jpg"), Path("y.jpg")], "ply", Path("o.ply"), "voxel=0.1", "full")
     u = cli_mapper.build_parser().parse_args(["update", "-i", "x.jpg", "-m", "map"])
     assert (u.command, u.format, u.mode, u.fps) == ("update", "json", "full", None)
     with pytest.raises(SystemExit) as e:

@@ -102,7 +102,6 @@ def test_lift_mask_with_bleeding() -> None:
     lifted = lift_mask(mask, depth, K)
     z = lifted.points[:, 2]
     assert np.all(np.abs(z - 2.0) < 1e-6)
-    assert lifted.mask_pixels == mask.sum()
     moved = lift_mask(mask, depth, K, T_parent_cam=Pose(np.eye(3), np.array([0, 0, 1.0])))
     assert np.allclose(moved.points[:, 2], 3.0)
     empty = lift_mask(np.zeros((100, 100), bool), depth, K)

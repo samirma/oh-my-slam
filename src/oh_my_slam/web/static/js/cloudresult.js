@@ -10,22 +10,41 @@ import { el, nextId, notice } from './dom.js';
 const fmtN = (n) => Number(n).toLocaleString('en-US');
 
 // The display budget: the viewer's, or a smaller one a test sets (window.__cloudBudget).
-function budgetOf(m) {
+export function budgetOf(m) {
   const test = Number(window.__cloudBudget);
   return test > 0 ? test : m.DISPLAY_POINT_BUDGET;
 }
 
-function points(f) {
+// The points of a cloud (cloudview.js cloudFacts): those drawn, of those in the file when fewer.
+export function points(f) {
   return f.count < f.total ? `${fmtN(f.count)} drawn of ${fmtN(f.total)}` : fmtN(f.count);
 }
 
-function joinWords(words) {
+export function joinWords(words) {
   return words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+// The facts of the cloud's caption, [term, description] pairs, from its cloudFacts.
+export function factRows(f) {
+  return [
+    ['Points', points(f)],
+    ['Each point carries', joinWords(f.carries)],
+    f.attrs ? ['Recorded attributes', f.attrs.replaceAll(',', ', ')] : null,
+    f.frame ? ['Frame', f.upright ? `${f.frame}; shown upright, as view.sh shows an image (level camera)` : f.frame] : null,
+    f.format ? ['PLY format', f.format] : null,
+  ].filter(Boolean);
+}
+
+// The status once the cloud is drawn.
+export function drawnText(f) {
+  return f.count < f.total
+    ? `Drawn: ${fmtN(f.count)} of its ${fmtN(f.total)} points (see below).`
+    : `Drawn: all ${fmtN(f.count)} points.`;
 }
 
 // The buttons that move the view, in labelled groups: [group, [[symbol, name, move(view, m)], …]],
 // `m` the viewer's module (its step sizes are the arrow keys').
-const TOOLS = [
+export const TOOLS = [
   ['Rotate', [['◀', 'Rotate left', (v, m) => v.rotate(m.ROTATE_STEP_DEG)], ['▶', 'Rotate right', (v, m) => v.rotate(-m.ROTATE_STEP_DEG)],
     ['▲', 'Rotate up', (v, m) => v.rotate(0, m.ROTATE_STEP_DEG)], ['▼', 'Rotate down', (v, m) => v.rotate(0, -m.ROTATE_STEP_DEG)]]],
   ['Pan', [['←', 'Pan left', (v, m) => v.pan(-m.PAN_STEP)], ['→', 'Pan right', (v, m) => v.pan(m.PAN_STEP)],
@@ -73,13 +92,7 @@ export function cloudSection(blob) {
       view.show(cloud);
       box.cloudView = view;  // for tests and debugging
       const f = m.cloudFacts(cloud);
-      facts.replaceChildren(...[
-        ['Points', points(f)],
-        ['Each point carries', joinWords(f.carries)],
-        f.attrs ? ['Recorded attributes', f.attrs.replaceAll(',', ', ')] : null,
-        f.frame ? ['Frame', f.upright ? `${f.frame}; shown upright, as view.sh shows an image (level camera)` : f.frame] : null,
-        f.format ? ['PLY format', f.format] : null,
-      ].filter(Boolean).map(([k, v]) => el('div', {}, el('dt', {}, k), el('dd', { 'data-fact': k }, v))));
+      facts.replaceChildren(...factRows(f).map(([k, v]) => el('div', {}, el('dt', {}, k), el('dd', { 'data-fact': k }, v))));
       host.setAttribute('aria-label', `The point cloud in 3D: ${points(f)} points, each with ${joinWords(f.carries)}`);
       if (f.note) note.replaceChildren(notice('info', f.note));
       for (const [name, buttons] of TOOLS) {
@@ -103,9 +116,7 @@ export function cloudSection(blob) {
       });
       if (disposed || !view) return;
       box.dataset.state = 'drawn';
-      status.textContent = f.count < f.total
-        ? `Drawn: ${fmtN(f.count)} of its ${fmtN(f.total)} points (see below).`
-        : `Drawn: all ${fmtN(f.count)} points.`;
+      status.textContent = drawnText(f);
     } catch (err) {
       if (!disposed) failed(err);
     }

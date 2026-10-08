@@ -24,20 +24,21 @@ update's ``-t full`` scene is kept, since a later update changes the map's frame
 * ``before_present_fraction``: the remnant test on the map after the first update of the split
   whose first part is exactly the images that show the absent object — the control that makes the
   absence mean something.
-* ``<s>.stability.label_agreement`` / ``.id_agreement`` (``mapquality.stability_metrics``): the
-  objects the first update's images observe and that never changed keep their labels and ``id``s
-  from the first update to the last. A later update may re-gauge the map frame (a rebuild) and
-  refine OBBs (mapper.md), so the two updates are first aligned by their common captures' camera
-  poses (``split_alignment``) and the box figures stay in the detail: the OBB requirement is
-  ``<s>.vs_one_update``'s.
+* ``<s>.stability.*`` (``SPLIT_STABILITY``, ``mapquality.stability_metrics``): the objects the
+  first update's images observe and that never changed keep their labels, ``id``s and OBBs from
+  the first update to the last. A later update may re-gauge the map frame (a rebuild), so the two
+  updates are first aligned by their common captures' camera poses (``update_alignment``); it may
+  also refine the OBBs as evidence accumulates (mapper.md), which the box targets of
+  ``examples/targets.json`` allow for.
 * ``<s>.ids_persistent_fraction``: every id an update published (its ``-t full`` scene) for an
   object that never changed is, in every later update, still an object of a compatible label whose
   box, once the two updates are aligned, overlaps or nearly coincides with it
   (``mapquality.MATCH_IOU`` / ``MATCH_CENTRE_M``). An id the later map merged into another (its
   ``objects.json`` ``merged_into``, a lasting merge) resolves to that object first.
 * ``<s>.vs_one_update.*``: one update versus that split, after the rigid alignment of the two
-  maps' camera poses; ids may differ only where an earlier update of the split had published one
-  (mapper.md), which ``id_agreement`` allows.
+  maps' camera poses; an id may differ only where an earlier update of the split had published it
+  for that object, and the split map may keep only objects an earlier update published (mapper.md;
+  ``mapquality.Published``: each earlier update's ``-t full`` objects).
 """
 
 from __future__ import annotations
@@ -51,16 +52,18 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.geometry import project
-from oh_my_slam.core.types import Pose
+from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.schema.openlabel import stream_intrinsics
 from oh_my_slam.segmentation.detect import compatible
-from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
+from oh_my_slam.segmentation.obb import OBB
 from oh_my_slam.tools.evaluate.groundtruth import Absent, MapUpdatePlan
 from oh_my_slam.tools.evaluate.mapquality import (
-    MATCH_CENTRE_M,
-    MATCH_IOU,
     STABILITY_METRICS,
+    Published,
+    same_object,
     split_alignment,
     stability_metrics,
+    update_alignment,
 )
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.poses import capture_poses, capture_sources
@@ -74,9 +77,9 @@ HOLE_GRID = 8  # cells per side of the annotated region
 HOLE_RING = 0.5  # the ring around the region, as a share of its size on each side
 HOLE_DEPTH_REL = 0.25  # a region cell seeing this much farther than the ring sees through a hole
 IMAGE_SUFFIXES = (".jpg", ".jpeg")
-# first vs last update of a split: labels and ids only (boxes are refined, the frame re-gauged)
-SPLIT_STABILITY = ("label_agreement", "id_agreement")
-Camera = tuple[float, float, float, float, int, int]  # fx, fy, cx, cy, width, height
+# first vs last update of a split: labels, ids and boxes (after aligning the two updates)
+SPLIT_STABILITY = ("label_agreement", "id_agreement", "centre_delta_median_m",
+                   "extent_delta_median_rel", "obb_iou_median")
 
 
 def split_name(sizes: tuple[int, ...] | list[int]) -> str:
@@ -112,7 +115,7 @@ class MapView:
     objects: list[DocObject]
     poses: dict[str, Pose]  # camera-to-map, by capture file name
     sources: dict[int, str]  # frame key → capture file name
-    camera: Camera | None
+    camera: Intrinsics | None  # the map's camera (its pinhole and lens)
     cloud: NDArray[np.float64] | None = None  # map points (N, 3), map coordinates
     merged_into: dict[int, int] = field(default_factory=dict)  # lasting merges, old id → id
 
@@ -128,9 +131,6 @@ class MapView:
             seen.add(oid)
             oid = self.merged_into[oid]
         return oid
-
-    def ids(self) -> set[int]:
-        return {o.id for o in self.objects}
 
 
 def merges(map_dir: Path) -> dict[int, int]:
@@ -157,48 +157,60 @@ def map_points(map_dir: Path) -> NDArray[np.float64] | None:
     return np.asarray(xyz, np.float64) if len(xyz) else None
 
 
-def _camera(doc: Json) -> Camera | None:
-    """The pinhole intrinsics of the first stream that has them (the mapper has one camera)."""
+def _camera(doc: Json) -> Intrinsics | None:
+    """The camera of the first stream that has one (the mapper has one camera): its pinhole and,
+    from ``intrinsics_custom``, its lens (``openlabel.stream_intrinsics``); None if malformed."""
     for stream in (doc.get("openlabel", {}).get("streams") or {}).values():
-        pin = (stream.get("stream_properties") or {}).get("intrinsics_pinhole")
-        if pin and len(pin.get("camera_matrix", ())) >= 7:
-            k = pin["camera_matrix"]  # 3 x 4, row-major
-            return (float(k[0]), float(k[5]), float(k[2]), float(k[6]),
-                    int(pin["width_px"]), int(pin["height_px"]))
+        props = stream.get("stream_properties") or {}
+        if props.get("intrinsics_pinhole"):
+            try:
+                return stream_intrinsics(props)
+            except (KeyError, IndexError, TypeError, ValueError):
+                return None
     return None
 
 
-def region_coverage(box: OBB, pose: Pose, camera: Camera,
+def image_pixels(cam: NDArray[np.float64], camera: Intrinsics) -> NDArray[np.float64]:
+    """Where the image shows camera-frame points in front of the camera (N, 2): projected into
+    its undistorted image (``Intrinsics.pinhole``), then through its lens
+    (``Intrinsics.image_pixels``: nan beyond the lens's reach)."""
+    uv, _ = project(cam, camera.pinhole().K())
+    return camera.image_pixels(uv)
+
+
+def region_coverage(box: OBB, pose: Pose, camera: Intrinsics,
                     region: tuple[float, float, float, float]) -> float | None:
     """The share of ``region`` (shares of the image size) that ``box``' image footprint (the
     bounding rectangle of its projected corners) covers; None when a corner is not in front of
-    the camera (no footprint)."""
-    fx, fy, cx, cy, w, h = camera
+    the camera or beyond its lens's reach (no footprint)."""
+    w, h = camera.width, camera.height
     cam = pose.inverse().apply(box.corners())
     if np.any(cam[:, 2] <= MIN_DEPTH_M):
         return None
-    uv, _ = project(cam, np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]))
+    uv = image_pixels(cam, camera)
+    if not np.isfinite(uv).all():
+        return None
     (u0, v0), (u1, v1) = uv.min(axis=0), uv.max(axis=0)
     r0, s0, r1, s1 = region[0] * w, region[1] * h, region[2] * w, region[3] * h
     inter = max(0.0, min(u1, r1) - max(u0, r0)) * max(0.0, min(v1, s1) - max(v0, s0))
     return float(inter / ((r1 - r0) * (s1 - s0)))
 
 
-def hole_cells(xyz: NDArray[np.float64], pose: Pose, camera: Camera,
+def hole_cells(xyz: NDArray[np.float64], pose: Pose, camera: Intrinsics,
                region: tuple[float, float, float, float]) -> dict[str, Any] | None:
     """The hole test of one image (see the module docstring): {"cells", "holes", "ring_depth_m"},
     None when no region cell is in the image or the ring sees no surface."""
-    fx, fy, cx, cy, w, h = camera
+    w, h = camera.width, camera.height
     x0, y0, x1, y1 = region[0] * w, region[1] * h, region[2] * w, region[3] * h
     cw, ch = (x1 - x0) / HOLE_GRID, (y1 - y0) / HOLE_GRID
     ring = int(np.ceil(HOLE_GRID * HOLE_RING))
     n = HOLE_GRID + 2 * ring
     ox, oy = x0 - ring * cw, y0 - ring * ch
     cam = pose.inverse().apply(xyz)
-    front = cam[:, 2] > MIN_DEPTH_M
-    cam = cam[front]
-    u = fx * cam[:, 0] / cam[:, 2] + cx
-    v = fy * cam[:, 1] / cam[:, 2] + cy
+    cam = cam[cam[:, 2] > MIN_DEPTH_M]
+    uv = image_pixels(cam, camera)
+    shown = np.isfinite(uv).all(axis=1)  # within the lens's reach
+    cam, u, v = cam[shown], uv[shown, 0], uv[shown, 1]
     i = np.floor((u - ox) / cw).astype(np.int64)
     j = np.floor((v - oy) / ch).astype(np.int64)
     inside = (i >= 0) & (i < n) & (j >= 0) & (j < n) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
@@ -287,20 +299,6 @@ def unchanged(plan: MapUpdatePlan) -> Any:
     return keep
 
 
-def _same_object(a: DocObject, b: DocObject, T_b_a: Pose) -> bool:
-    """``b`` is the object ``a`` was: a compatible label and a box that overlaps or nearly
-    coincides with ``a``'s carried into ``b``'s map frame by ``T_b_a`` (the stability pairing's
-    admissibility)."""
-    if not compatible(a.label, b.label):
-        return False
-    box_a, bb = a.obb(), b.obb()
-    if box_a is None or bb is None:
-        return True
-    ba = box_a.transformed(T_b_a)
-    d = float(np.linalg.norm(ba.center - bb.center))
-    return d <= MATCH_CENTRE_M or obb_iou_upright(ba, bb, samples=4000) >= MATCH_IOU
-
-
 def ids_persistent(m: Metrics, mid: str, plan: MapUpdatePlan, views: list[MapView]
                    ) -> list[dict[str, Any]]:
     """``<s>.ids_persistent_fraction`` (see the module docstring); returns the broken ids."""
@@ -314,7 +312,7 @@ def ids_persistent(m: Metrics, mid: str, plan: MapUpdatePlan, views: list[MapVie
                 checks += 1
                 oid = later.resolve(o.id)
                 now = next((x for x in later.objects if x.id == oid), None)
-                if now is None or not _same_object(o, now, _aligned(later, view)):
+                if now is None or not same_object(o, now, _aligned(later, view)):
                     broken.append({"id": o.id, "label": o.label, "published_by_update": k + 1,
                                    "update": j, "now": None if now is None else now.label,
                                    **({"merged_into": oid} if oid != o.id else {})})
@@ -326,10 +324,7 @@ def ids_persistent(m: Metrics, mid: str, plan: MapUpdatePlan, views: list[MapVie
 
 def _aligned(to: MapView, frm: MapView) -> Pose:
     """``T_to_from`` from the captures registered in both updates (identity when none is)."""
-    try:
-        return split_alignment(to.poses, frm.poses)
-    except ValueError:
-        return Pose.identity()
+    return update_alignment(to.poses, frm.poses)
 
 
 @dataclass
@@ -394,17 +389,14 @@ def map_update_metrics(m: Metrics, plan: MapUpdatePlan, images: list[str], singl
             first_images = set(s.parts[0])
             kept = [o for o in final.objects
                     if keep(o) and any(final.sources.get(f) in first_images for f in o.frames)]
-            scratch = Metrics()  # the box figures of an update-to-update comparison: detail only
+            scratch = Metrics()  # an update-to-update comparison: SPLIT_STABILITY of it
             row["stability"] = stability_metrics(
                 scratch, "x", kept, [o for o in s.views[0].objects if keep(o)],
                 _aligned(final, s.views[0]))
-            boxes = {k: scratch.items[f"x.{k}"].value for k in STABILITY_METRICS
-                     if k not in SPLIT_STABILITY}
             for k in SPLIT_STABILITY:
                 x = scratch.items[f"x.{k}"]
-                m.add(f"{PREFIX}.{s.name}.stability.{k}", x.value,
-                      {**(x.detail or {}), "boxes_after_alignment": boxes}, error=x.error)
-            published = set().union(*(v.ids() for v in s.views[:-1]))
+                m.add(f"{PREFIX}.{s.name}.stability.{k}", x.value, x.detail, error=x.error)
+            published = [Published(v.objects, _aligned(final, v)) for v in s.views[:-1]]
             row["vs_one_update"] = stability_metrics(
                 m, f"{PREFIX}.{s.name}.vs_one_update", single.objects, final.objects,
                 split_alignment(single.poses, final.poses), published)

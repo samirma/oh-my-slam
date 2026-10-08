@@ -23,6 +23,7 @@ from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.colors import color_hex_for_id, hex_to_rgb
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
 from tests.fakes.client import FakeClient
+from tests.mapsnap import full_tree_hash
 from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.synth.scene import Box, Room
 
@@ -152,7 +153,10 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
         est_w = OBB(sim.apply(est.center[None])[0], sim.R @ est.R, est.size * sim.s)
         assert obb_iou_upright(est_w, truth_obb(box)) >= min(0.5, ious_a[label] - 0.05)
     single_ids = {int(k) for k in doc_b["openlabel"]["objects"]}
-    assert single_ids <= {o["id"] for v in by_b.values() for o in v}
+    observed = {int(it["object_id"]) for n in res_b.new_frames for it in json.loads(
+        (mdir / store.frame_file(n, "instances.json")).read_text())["instances"]}
+    # exactly the map's objects the new frames observed
+    assert single_ids == observed & {o["id"] for v in by_b.values() for o in v} != set()
 
     # --- update C: removed / moved / added (PLY payload with point-cloud attributes) ------------
     attrs = parse_cloud_attrs("color=segment,label=on,normals=on,voxel=0.03", CloudScope.MAP)
@@ -214,13 +218,13 @@ def test_non_overlapping_update_is_rejected(world, tmp_path: Path) -> None:  # t
     client = world["client"]
     mdir = tmp_path / "m"
     update(mdir, sorted((world["base"] / "a").glob("*.png")), client=client, progress=quiet)
-    before = store.full_tree_hash(mdir)
+    before = full_tree_hash(mdir)
     other_room = Room(size=(8.0, 7.0, 3.0), boxes=[], floor_color=(40, 90, 160),
                       wall_color=(90, 160, 60))
     imgs = add(client, other_room, ring(1, radius=3.0), tmp_path / "x", "x")
     with pytest.raises(RegistrationError):
         update(mdir, imgs, client=client, progress=quiet)
-    assert store.full_tree_hash(mdir) == before
+    assert full_tree_hash(mdir) == before
 
 
 @pytest.mark.parametrize("f35_later", [28, 27])

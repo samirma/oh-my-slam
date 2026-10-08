@@ -34,17 +34,24 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import rle, timing
-from oh_my_slam.core.geometry import project
-from oh_my_slam.core.images import load_rgb
+from oh_my_slam.core.geometry import project, voxel_keys
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import (
     ObjectState,
     Vacated,
     fit_points,
+    is_input,
     label_map_for,
     load_vacated,
 )
+from oh_my_slam.reconstruction.borders import (
+    BORDER_BAND,
+    BORDER_STEP,
+    DepthView,
+    viewpoint_order,
+)
+from oh_my_slam.reconstruction.borders import correct_borders as border_depths
 from oh_my_slam.reconstruction.consensus import (
     Views,
     free_space,
@@ -88,6 +95,14 @@ TILE_BLOCKS = 300_000
 VIS_TOL_MIN = 0.02
 VIS_TOL_REL = 0.03
 LABEL_SHARE_DIVISOR = 3  # an object id needs the votes of >= 1/3 of the views that see a point
+# Within an update a later keyframe wins over an earlier one where they contradict each other
+# (spec §2.3): two views of a point agree on its colour when no channel of their local colour (the
+# mean over COLOUR_WINDOW x COLOUR_WINDOW pixels: a pixel or two of misregistration on a texture
+# changes a single pixel's colour entirely) differs by more than COLOUR_SAME (of 255) — exposure
+# and white balance move a surface's colour between frames by less — and the finest of the views
+# that agree with the latest one colours the point.
+COLOUR_SAME = 64
+COLOUR_WINDOW = 5
 ATTRIBUTE_CHUNK = 1_000_000  # points attributed at a time (bounds the vote's memory)
 # A vote for an object counts only within its box grown by max(ATTRIBUTE_MARGIN_M,
 # ATTRIBUTE_MARGIN_REL · its viewing distance): the fused surface lies within a few centimetres of
@@ -132,6 +147,16 @@ class FrameData:
         d = self.depth[self.valid & (self.depth > 0)]
         return float(np.median(d)) if len(d) else None
 
+    @cached_property
+    def tone(self) -> NDArray[np.uint8]:
+        """Its local colour: the image's mean over ``COLOUR_WINDOW`` x ``COLOUR_WINDOW`` pixels,
+        on which two views of one surface agree whatever texture lies between the pixels they
+        sample (``_attribute_update``)."""
+        from scipy import ndimage
+
+        return np.asarray(ndimage.uniform_filter(self.rgb, size=(COLOUR_WINDOW, COLOUR_WINDOW, 1),
+                                                 mode="nearest"), np.uint8)
+
 
 def _parallel[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
     """``[fn(x) for x in items]`` on ``WORKERS`` threads (in order)."""
@@ -165,11 +190,11 @@ class _Cells:
         step = 4_000_000  # points at a time: bounded temporaries
 
         def keys(s: int) -> NDArray[np.int64]:
-            return np.floor(np.asarray(pts[s:s + step], np.float64) / cell).astype(np.int64)
+            return voxel_keys(pts[s:s + step], cell)
 
         # floor is monotonic: the lowest and highest cells are those of the extreme coordinates
-        base = np.floor(np.asarray(pts.min(axis=0), np.float64) / cell).astype(np.int64)
-        span = np.floor(np.asarray(pts.max(axis=0), np.float64) / cell).astype(np.int64) - base + 1
+        base = voxel_keys(pts.min(axis=0), cell)
+        span = voxel_keys(pts.max(axis=0), cell) - base + 1
         ck = np.empty(len(pts), np.int64)
         for s in range(0, len(pts), step):
             k = keys(s) - base
@@ -302,9 +327,11 @@ def _frame_data(ctx: Any, rec: store.FrameRecord, new_by_name: dict[str, Any]) -
         rgb = nf.frame.rgb
     else:
         depth = store.load_depth(tx.current, rec.name)
-        rgb = load_rgb(tx.current(rec.image), max_side=max(rec.grid_width, rec.grid_height))
+        rgb = store.keyframe_rgb(tx.current(rec.image), rec, max(rec.grid_width, rec.grid_height))
     valid = store.load_valid(tx.current, rec.name, depth)
-    return FrameData(rec, depth, valid, rgb, np.zeros(depth.shape, np.int32), nf is not None)
+    # new: the update's input (``-t single``), not a stored keyframe a rebuild maps again
+    return FrameData(rec, depth, valid, rgb, np.zeros(depth.shape, np.int32),
+                     nf is not None and is_input(ctx, rec.name))
 
 
 def _frame_labels(ctx: Any, rec: store.FrameRecord, shape: tuple[int, ...], objs: ObjectState
@@ -337,113 +364,22 @@ def _depth_cut(median: float | None, rec: store.FrameRecord, depth_max: float) -
                          depth_max * MAX_FACTOR))
 
 
-# Monocular depth is least reliable near the image border: on the turning head of
-# ``ainex-captures`` the keyframes that saw a wall in their outer 15 % placed it up to 6 % nearer or
-# farther than those that saw it near their centre (one scale and near/far tilt per keyframe cannot
-# take out an error that varies across the image), and the TSDF, whose band is 4 cm, kept each
-# placement as a layer of its own: a wall 12-15 cm thick, doubled below the light switch. Where
-# another keyframe sees the surface of a border pixel near its own centre, the border pixel takes
-# that keyframe's depth ratio (``correct_borders``).
-BORDER_BAND = 0.15  # the outer share of the image, on each side, whose depth defers to others
-BORDER_STEP = 4  # border pixels are measured every 4th pixel; each corrects its 4x4 cell
-BORDER_NEIGHBOURS = 8  # the keyframes, nearest by viewpoint, that may see a border centrally
-BORDER_SAME = 0.1  # |log ratio| within which the two depths are one surface (else: occlusion)
-BORDER_MAX_ANGLE_DEG = 60.0
-
-
-def _central(u: NDArray[Any], v: NDArray[Any], w: int, h: int, band: float) -> NDArray[np.bool_]:
-    return np.asarray((u >= band * w) & (u < (1 - band) * w) & (v >= band * h)
-                      & (v < (1 - band) * h))
-
-
-def _viewpoint_order(frames: list[FrameData], max_angle_deg: float = BORDER_MAX_ANGLE_DEG
-                     ) -> list[list[int]]:
-    """Per keyframe, the other keyframes whose optical axis lies within ``max_angle_deg`` of its
-    own, nearest by viewpoint first (centre distance over the scene's median depth, plus
-    1 - the cosine of the axes' angle)."""
-    C = np.array([fd.rec.T_map_cam.t for fd in frames])
-    F = np.array([fd.rec.T_map_cam.R[:, 2] for fd in frames])
-    cos = np.clip(F @ F.T, -1.0, 1.0)
-    meds = [m for m in (fd.median_depth for fd in frames) if m is not None]
-    scene = max(0.5, float(np.median(meds))) if meds else 1.0
-    dist = np.linalg.norm(C[:, None] - C[None], axis=2) / scene + (1.0 - cos)
-    near = cos > np.cos(np.radians(max_angle_deg))
-    return [[j for j in np.argsort(dist[i], kind="stable").tolist() if j != i and near[i, j]]
-            for i in range(len(frames))]
-
-
 def correct_borders(frames: list[FrameData], band: float = BORDER_BAND,
                     step: int = BORDER_STEP) -> int:
-    """Give each keyframe's border pixels (outer ``band`` of the image) the depth of the
-    keyframes that see the same surface near their centre (in place; see ``BORDER_BAND``): each
-    sampled border pixel is lifted, projected into its ``BORDER_NEIGHBOURS`` nearest keyframes by
-    viewpoint and, where it lands in one's central part on the same surface (within
-    ``BORDER_SAME``), its depth is scaled by their mean depth ratio along its ray; the correction
-    covers the pixel's ``step`` x ``step`` cell. Border pixels no other keyframe sees centrally
-    keep their depth. Returns the number of corrected pixels."""
-    if len(frames) < 2:
-        return 0
-    order = _viewpoint_order(frames)
-    corrected = 0
-    new_depths = []
-    for i, fd in enumerate(frames):
-        d = np.asarray(fd.depth, np.float32)
-        h, w = d.shape
-        vv, uu = np.mgrid[step // 2:h:step, step // 2:w:step]
-        z = d[vv, uu].astype(np.float64)
-        ok = fd.valid[vv, uu] & (z > 0) & ~_central(uu + 0.5, vv + 0.5, w, h, band)
-        # pixel indices as the TSDF reads them: u = fx x / z + cx
-        cand = order[i]
-        if not ok.any() or not cand:
-            new_depths.append(d)
-            continue
-        K = fd.rec.K_grid
-        T = fd.rec.T_map_cam
-        zs = z[ok]
-        X = np.column_stack([(uu[ok] - K.cx) / K.fx * zs, (vv[ok] - K.cy) / K.fy * zs,
-                             zs]) @ T.R.T + T.t
-        total = np.zeros(len(zs))
-        count = np.zeros(len(zs))
-        for j in cand[:BORDER_NEIGHBOURS]:
-            g = frames[j]
-            Kg, Tg = g.rec.K_grid, g.rec.T_map_cam
-            Y = (X - Tg.t) @ Tg.R
-            zz = Y[:, 2]
-            front = zz > 0.05
-            with np.errstate(divide="ignore", invalid="ignore"):
-                pu = Kg.fx * Y[:, 0] / zz + Kg.cx
-                pv = Kg.fy * Y[:, 1] / zz + Kg.cy
-            gh, gw = g.depth.shape
-            inside = front & _central(pu + 0.5, pv + 0.5, gw, gh, band)
-            idx = np.flatnonzero(inside)
-            iu = np.clip(np.floor(pu[idx] + 0.5).astype(np.int64), 0, gw - 1)
-            iv = np.clip(np.floor(pv[idx] + 0.5).astype(np.int64), 0, gh - 1)
-            dg = g.depth[iv, iu].astype(np.float64)
-            good = g.valid[iv, iu] & (dg > 0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                r = np.log(np.where(good, dg, 1.0) / zz[idx])
-            same = good & (np.abs(r) <= BORDER_SAME)
-            total[idx[same]] += r[same]
-            count[idx[same]] += 1
-        field = np.ones(z.shape)
-        seen = count > 0
-        vals = np.ones(len(zs))
-        vals[seen] = np.exp(total[seen] / count[seen])
-        field[ok] = vals
-        full = np.repeat(np.repeat(field, step, axis=0), step, axis=1)[:h, :w]
-        zcell = np.repeat(np.repeat(z, step, axis=0), step, axis=1)[:h, :w]
-        border = ~_central(np.arange(w)[None, :] + 0.5, np.arange(h)[:, None] + 0.5, w, h, band)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            # a cell's pixels on the sampled pixel's surface (not across a depth edge)
-            same = np.abs(np.log(np.where(d > 0, d, 1.0) / np.where(zcell > 0, zcell, 1.0))) \
-                <= BORDER_SAME
-        fix = border & (full != 1.0) & fd.valid & (d > 0) & same
-        corrected += int(fix.sum())
-        new_depths.append(np.where(fix, d * full, d).astype(np.float32))
-    for fd, nd in zip(frames, new_depths, strict=True):
+    """Give each keyframe's border pixels the depth of the keyframes that see the same surface
+    near their centre (in place, in memory: ``reconstruction.borders.correct_borders``, which owns
+    the correction). Returns the number of corrected pixels."""
+    depths, corrected = border_depths(_depth_views(frames), band, step)
+    for fd, nd in zip(frames, depths, strict=True):
         fd.depth = nd
         fd.__dict__.pop("median_depth", None)  # of the corrected depth from now on
     return corrected
+
+
+def _depth_views(frames: list[FrameData]) -> list[DepthView]:
+    """The keyframes as reconstruction's posed depth views (grid intrinsics)."""
+    return [DepthView(fd.depth, fd.valid, fd.rec.K_grid, fd.rec.T_map_cam, fd.median_depth)
+            for fd in frames]
 
 
 # Neighbouring keyframes still disagree by ~3 % in depth after the depth adjustment (p10-p90
@@ -489,7 +425,7 @@ def consensus_depths(frames: list[FrameData], step: int = CONSENSUS_STEP,
     Returns (pixels whose depth changed, pixels left out)."""
     if len(frames) < 2:
         return 0, 0
-    order = _viewpoint_order(frames, CONSENSUS_MAX_ANGLE_DEG)
+    order = viewpoint_order(_depth_views(frames), CONSENSUS_MAX_ANGLE_DEG)
     views = Views.of([fd.depth for fd in frames], _parallel(_vouched, frames))
 
     def judge(i: int) -> tuple[NDArray[np.float32], NDArray[np.bool_]] | None:
@@ -1070,25 +1006,33 @@ def _in_boxes(pts: NDArray[np.float64], lab: NDArray[Any], gates: Gates) -> NDAr
 def _attribute_update(pts: NDArray[np.float64], frames: list[FrameData],
                       boxes: Gates | None = None, cells: _Cells | None = None
                       ) -> tuple[NDArray[np.bool_], NDArray[np.uint8], NDArray[np.int32]]:
-    """(seen, colour, object id) of each point from the keyframes of one update, whatever their
-    order: the colour of the finest view (smallest footprint; ties: larger colour, then larger id)
-    and the object id with most votes among the views that see the point (ties: finest view),
-    kept only if at least a third of those views give it. With ``boxes`` (object id → box and
-    margin), a vote counts only for a point inside the voted object's gate (``_in_boxes``)."""
+    """(seen, colour, object id) of each point from the keyframes of one update. Its colour is
+    that of the finest view (smallest footprint; ties: larger colour, then larger id) among the
+    views whose local colour (``FrameData.tone``) agrees with the latest view's (input order;
+    within ``COLOUR_SAME``): a later keyframe wins over an earlier one that it contradicts, and
+    where they agree their order does not matter. Its object id is the one with most votes among the views that see the point
+    (ties: finest view), kept only if at least a third of those views give it, whatever their
+    order. With ``boxes`` (object id → box and margin), a vote counts only for a point inside the
+    voted object's gate (``_in_boxes``)."""
     n = len(pts)
     views = np.zeros(n, np.int32)
     best = np.full(n, np.inf)
     best_key = np.full(n, -1, np.int64)
     rgb = np.zeros((n, 3), np.uint8)
+    latest = np.zeros((n, 3), np.int16)  # the local colour of the latest view that sees a point
     p_idx, p_lab, p_fp = [], [], []
-    for fd in frames:
+    for fd in sorted(frames, key=lambda fd: fd.rec.index, reverse=True):  # latest first
         idx, vv, uu, fp = _visible(fd, pts, cells)
-        views[idx] += 1
         col = fd.rgb[vv, uu]
+        tone = fd.tone[vv, uu].astype(np.int16)
+        first = views[idx] == 0
+        latest[idx[first]] = tone[first]
+        views[idx] += 1
+        agree = np.abs(tone - latest[idx]).max(axis=1) <= COLOUR_SAME
         lab = fd.labels[vv, uu]
         key = ((col[:, 0].astype(np.int64) << 16) | (col[:, 1].astype(np.int64) << 8)
                | col[:, 2].astype(np.int64)) * (1 << 31) + lab
-        better = (fp < best[idx]) | ((fp == best[idx]) & (key > best_key[idx]))
+        better = agree & ((fp < best[idx]) | ((fp == best[idx]) & (key > best_key[idx])))
         sel = idx[better]
         best[sel], best_key[sel], rgb[sel] = fp[better], key[better], col[better]
         on = lab > 0
@@ -1121,9 +1065,9 @@ def attribute_points(xyz: NDArray[Any], frames: list[FrameData],
                      ) -> tuple[NDArray[np.uint8], NDArray[np.int32], NDArray[np.bool_]]:
     """Colour and object id of each point from the latest update whose keyframes see it.
 
-    Updates are applied oldest → newest, so a later update wins wherever it sees a point. The
-    keyframes of one update are one observation: within it, their order never matters
-    (``_attribute_update``; ``boxes`` gate the votes). In the place of an object an update
+    Updates are applied oldest → newest, so a later update wins wherever it sees a point. Within
+    an update a later keyframe wins where its colour contradicts an earlier one's, and the finest
+    view colours the point where they agree (``_attribute_update``; ``boxes`` gate the votes). In the place of an object an update
     removed (``vacated``; ``retired``: the keyframes whose pixels were retired), the keyframes
     that saw through it are the latest observation: they colour what they see there, unless a
     later update sees it too (what its detecting keyframes still see beside their retired masks,

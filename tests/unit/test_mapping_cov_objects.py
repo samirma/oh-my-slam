@@ -464,17 +464,6 @@ def test_a_keyframe_that_does_not_see_the_object_sees_through_none_of_it() -> No
 # --- rebuilt ids ----------------------------------------------------------------------------------
 
 
-def test_published_places_need_a_box_and_a_rebuilt_object_where_it_stood() -> None:
-    near = OBB(np.array([0.0, 0.0, 0.5]), np.eye(3), np.array([0.2, 0.2, 0.2]))
-    away = OBB(np.array([5.0, 0.0, 0.5]), np.eye(3), np.array([0.2, 0.2, 0.2]))
-    holder = obj(100, "cup", np.zeros((3, 3)), [0], obb=near)
-    elsewhere = obj(101, "cup", np.zeros((3, 3)), [0], obb=away)
-    final_of, absorbed = {100: 5}, {7: 100, 8: 100}
-    boxes = {5: ("cup", near), 7: ("cup", None), 8: ("cup", near)}
-    ob._published_places(final_of, absorbed, [holder, elsewhere], boxes)
-    assert final_of == {100: 5} and absorbed == {7: 100, 8: 100}  # nothing stands at 8's place
-
-
 def test_identity_carried_over_keeps_the_maps_merges_of_ids_now_gone() -> None:
     state = ObjectState([obj(5, "cup", np.zeros((3, 3)), [0]),
                          obj(6, "vase", np.zeros((3, 3)), [0])], 10)
@@ -484,6 +473,15 @@ def test_identity_carried_over_keeps_the_maps_merges_of_ids_now_gone() -> None:
 
 
 # --- moved objects ------------------------------------------------------------------------------
+
+
+def test_objects_of_very_different_sizes_are_no_move() -> None:
+    rng = np.random.default_rng(4)
+    box = OBB(np.array([0.0, 0.0, 0.5]), np.eye(3), np.array([0.3, 0.3, 0.3]))
+    big = obj(1, "cup", rng.uniform(-0.15, 0.15, (400, 3)) + (0.0, 0.0, 0.5), [0], obb=box)
+    small = obj(2, "cup", rng.uniform(-0.02, 0.02, (400, 3)) + (2.0, 0.0, 0.5), [5], obb=box)
+    places = SimpleNamespace(views=SimpleNamespace(records={}))
+    assert ob._moves(ObjectState([big, small], 10), {2}, places, None) == []  # type: ignore[arg-type]
 
 
 def test_colours_of_detections_without_a_record_image_or_pixel(tmp_path: Path) -> None:
@@ -548,3 +546,8 @@ def test_an_object_moves_once_to_the_best_coloured_place_seen_empty_before() -> 
     assert ob._moves(state, {2, 3}, places, _FakeColours({3: grey})) == []  # type: ignore[arg-type]
     still = _FakePlaces(list(range(10)), share=0.1)  # both places seen as they were
     assert ob._moves(state, {2, 3}, still, colours) == []  # type: ignore[arg-type]
+
+
+def test_centroids_too_far_apart_pair_nothing() -> None:
+    far = ob._near(np.zeros((1, 3)), np.full(1, 0.1), np.array([[5.0, 0.0, 0.0]]), np.full(1, 0.1))
+    assert all(len(x) == 0 for x in far)

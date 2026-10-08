@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import os
 import signal
@@ -37,7 +38,14 @@ from oh_my_slam.commands import spec
 from oh_my_slam.commands.entry_points import WEB_SERVICE
 from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.errors import ExitCode, OhMySlamError, ServiceNotRunningError, UsageError
+from oh_my_slam.core.constants import CHECKOUT
+from oh_my_slam.core.errors import (
+    ExitCode,
+    OhMySlamError,
+    ServiceNotRunningError,
+    UsageError,
+    internal_message,
+)
 from oh_my_slam.core.log import claim_stdout
 from oh_my_slam.core.process import default_sigint, exit_now
 from oh_my_slam.server.lifecycle import AlreadyRunningError, ServerLock, pid_alive
@@ -52,6 +60,7 @@ LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "oh_my_slam", "")  # ""
 _terminal: int | None = None  # the original stderr, kept once logging went to server.log
 STOP_TIMEOUT_S = 180.0  # interrupted commands get the runner's grace periods to stop
 FORCE_TIMEOUT_S = 10.0
+PROBE_TIMEOUT_S = 0.5  # a connection to one of this machine's own addresses answers within this
 
 
 def _say(msg: str) -> None:
@@ -87,7 +96,7 @@ def status(ws: Workspace) -> int:
     state = _state(ws)
     if state is None:
         raise ServiceNotRunningError(f"no service is running for {ws.root} — start it with "
-                                     f"./server.sh --data {ws.root}")
+                                     f"{CHECKOUT}{PROG} --data {ws.root}")
     try:
         r = httpx.get(_local(state["url"]) + "api/health", timeout=5.0)
         r.raise_for_status()
@@ -169,10 +178,66 @@ def _failure(exc: BaseException) -> str:
         return str(exc)
     if isinstance(exc, KeyboardInterrupt):
         return "interrupted"
-    return f"internal error: {type(exc).__name__}: {exc}"
+    return f"internal error: {internal_message(exc)}"
+
+
+def _binds(family: int, port: int) -> bool:
+    """Whether ``port`` binds on every address of ``family`` without ``SO_REUSEADDR``: nothing
+    holds it on any of them, not even the closed connections of a service that just stopped."""
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:  # no IPv6 on this machine: nothing listens there
+        return True
+    with sock:
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            sock.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _listener(port: int) -> str | None:
+    """The first of this machine's addresses (loopback first) at which another process accepts
+    connections on ``port``, if any."""
+    from oh_my_slam.web.app import machine_hosts
+
+    addresses = []
+    for host in machine_hosts():
+        with contextlib.suppress(ValueError):  # a name, not an address
+            addresses.append(ipaddress.ip_address(host))
+    for ip in sorted(addresses, key=lambda a: (not a.is_loopback, a.version, str(a))):
+        if ip.is_unspecified:
+            continue
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(PROBE_TIMEOUT_S)
+            if probe.connect_ex((str(ip), port)) == 0:
+                return str(ip)
+    return None
+
+
+def _in_use(port: int) -> str | None:
+    """The address at which another process listens on ``port``, IPv4 or IPv6 (a browser's
+    ``localhost`` may be either), else None. A port that binds without ``SO_REUSEADDR`` in both
+    families is free; one that does not may hold only the closed connections of a service that
+    just stopped (TIME_WAIT), so each address of the machine is then asked whether it accepts."""
+    if _binds(socket.AF_INET, port) and _binds(socket.AF_INET6, port):
+        return None
+    return _listener(port)
 
 
 def _bind(port: int) -> socket.socket:
+    """The service's socket on ``0.0.0.0:<port>``, with ``SO_REUSEADDR`` so that a service that
+    just stopped can be started again on its port at once. macOS then binds it even while another
+    process listens on one of the machine's addresses, which would get the connections to that
+    address (the browser's and ``--status``'s ``127.0.0.1``): an explicit port another process
+    listens on, on any address, is refused."""
+    where = _in_use(port) if port else None
+    if where is not None:
+        raise UsageError(f"--port {port}: cannot bind (another process listens on it at {where}); "
+                         "use another port or --port 0")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -197,11 +262,8 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
     try:
         lock.acquire()
     except AlreadyRunningError:
-        state = _state(ws) or {}
-        url = state.get("url", "(starting)")
+        url = (_state(ws) or {}).get("url", "(starting)")
         _say(f"already running for {ws.root} at {url}")
-        if open_browser and "url" in state:
-            webbrowser.open(_local(url))
         return 0
     try:
         claim_stdout()  # nothing reaches stdout while serving

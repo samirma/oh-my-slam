@@ -12,6 +12,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -35,12 +36,12 @@ def server(*args: str, timeout: float = 60) -> subprocess.CompletedProcess[bytes
                           env=os.environ.copy())
 
 
-def start(data: Path, probe: Path | None = None, browser: bool = False
+def start(data: Path, probe: Path | None = None, browser: bool = False, extra: tuple[str, ...] = ()
           ) -> tuple[subprocess.Popen[bytes], str]:
-    """Start server.sh on ``data``. With ``probe``, it runs with ``webbrowser.open`` replaced by
-    ``tests/fakes/browser_probe.py`` (recording into ``probe``), opening the browser if
-    ``browser``."""
-    args = ["--data", str(data), *(() if browser else ("--no-browser",))]
+    """Start server.sh on ``data`` (with the options ``extra``). With ``probe``, it runs with
+    ``webbrowser.open`` replaced by ``tests/fakes/browser_probe.py`` (recording into ``probe``),
+    opening the browser if ``browser``."""
+    args = ["--data", str(data), *(() if browser else ("--no-browser",)), *extra]
     cmd = ([str(REPO / "server.sh"), *args] if probe is None else
            [sys.executable, str(PROBE), str(probe), "oh_my_slam.web.main", *args])
     proc = subprocess.Popen(cmd,
@@ -83,9 +84,11 @@ def test_server_sh_lifecycle(data: Path) -> None:
     assert b"already running" in second.stderr
     assert health["service"]["url"].encode() in second.stderr
 
+    from PIL import Image
+
     image = data / "inputs" / "a.jpg"
     image.parent.mkdir()
-    image.write_bytes(b"\xff\xd8\xff")
+    Image.new("RGB", (8, 8)).save(image)  # readable: refused for the server, not for the image
     r = httpx.post(url + "api/ops/reconstruct", json={"image": "inputs/a.jpg"})
     assert r.status_code == 503 and r.json()["error"]["code"] == "server_unavailable"
     minimal_map(data / "maps" / "m")
@@ -117,6 +120,31 @@ def test_ctrl_c_and_sigterm_are_the_normal_stop(data: Path, sig: signal.Signals)
     assert httpx.get(url + "api/health").status_code == 200
     proc.send_signal(sig)
     out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0 and out == b"" and err == b""
+
+
+def test_an_explicit_port_is_bound(data: Path) -> None:
+    """``--port <n>`` binds that port on 0.0.0.0, so the URL stays the same from run to run (a
+    port found free at run time: never a fixed one)."""
+    with socket.socket() as free:
+        free.bind(("0.0.0.0", 0))
+        port = free.getsockname()[1]
+    proc, url = start(data, extra=("--port", str(port)))
+    try:
+        assert url == f"http://127.0.0.1:{port}/"
+        health = httpx.get(url + "api/health").json()
+        assert health["service"]["url"] == f"http://0.0.0.0:{port}/"
+        assert json.loads((data / "server.json").read_text())["port"] == port
+        # the agent skill's upload, as curl -T sends it: a PUT of the raw file, with no type
+        photo = data.parent / "photo.jpg"
+        photo.write_bytes(b"\xff\xd8\xff" * 1000)
+        up = subprocess.run(["curl", "-sS", "-T", str(photo), url + "api/uploads?name=photo.jpg"],
+                            capture_output=True, timeout=60, check=True)
+        record = json.loads(up.stdout)
+        assert record["size"] == 3000 and (data / record["path"]).read_bytes() == photo.read_bytes()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
     assert proc.returncode == 0 and out == b"" and err == b""
 
 
@@ -272,12 +300,14 @@ def test_a_client_that_disconnects_interrupts_its_command(data: Path) -> None:
         out_, err = proc.communicate(timeout=60)
     t.join(30)
     assert proc.returncode == 0 and err == b""
-    assert out["value"].status_code == 503 and out["value"].json()["error"]["code"] == "stopping"
+    assert out["value"].status_code == 499
+    assert out["value"].json()["error"]["code"] == "interrupted"
     assert not child.is_running()
 
 
 def test_stop_interrupts_the_requests_in_progress(data: Path) -> None:
-    """``--stop``: the running command gets Ctrl-C, its client the answer 503 ``stopping``."""
+    """``--stop``: the running command gets Ctrl-C, its client the command's own answer (exit
+    130: 499 ``interrupted``)."""
     proc, url = slow_server(data)
     t, out = in_background(lambda: httpx.post(url + "api/ops/slow", json={"seconds": 120},
                                               timeout=None))
@@ -288,8 +318,8 @@ def test_stop_interrupts_the_requests_in_progress(data: Path) -> None:
     _, err = proc.communicate(timeout=60)
     assert proc.returncode == 0 and err == b""
     r = out["value"]
-    assert r.status_code == 503 and r.json()["error"]["code"] == "stopping"
-    assert "interrupted" in r.json()["error"]["message"]
+    assert r.status_code == 499 and r.json()["error"]["code"] == "interrupted"
+    assert r.json()["error"]["exit_code"] == 130 and "interrupted" in r.json()["error"]["message"]
     assert not child.is_running()
 
 

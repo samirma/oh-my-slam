@@ -7,10 +7,12 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -52,9 +54,8 @@ def test_the_payload_writer_takes_exactly_one_target_and_one_payload(tmp_path: P
             log.PayloadWriter(**kwargs)  # type: ignore[arg-type]
     stream = io.BytesIO()
     w = log.PayloadWriter(stream)
-    assert not w.written
     w.write_json({"a": "é"})
-    assert w.written and stream.getvalue() == '{"a":"é"}\n'.encode()
+    assert stream.getvalue() == '{"a":"é"}\n'.encode()
     with pytest.raises(RuntimeError, match="payload already written"):
         w.write_bytes(b"second")
 
@@ -66,7 +67,31 @@ def test_a_consumer_that_closed_the_pipe_is_not_an_error() -> None:
 
     w = log.PayloadWriter(ClosedPipe())  # e.g. ``reconstruct.sh … | head -c 10``
     w.write_bytes(b"ply\n")
-    assert w.written
+    with pytest.raises(RuntimeError, match="payload already written"):  # it counted as written
+        w.write_bytes(b"ply\n")
+
+
+def test_the_whole_payload_reaches_a_non_blocking_stdout() -> None:
+    """The real stdout is a raw stream, whose write may take only part of the payload: a full
+    non-blocking pipe takes 64 KiB, then nothing (None) until it is read. Every byte arrives (once,
+    65 536 of 1 MiB did, and the command exited 0)."""
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    payload = bytes(range(256)) * 4096  # 1 MiB
+    got = bytearray()
+
+    def read() -> None:
+        time.sleep(0.2)  # the pipe fills first
+        while chunk := os.read(r, 1 << 16):
+            got.extend(chunk)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    with os.fdopen(w, "wb", buffering=0) as stream:
+        log.PayloadWriter(stream).write_bytes(payload)
+    reader.join(60)
+    os.close(r)
+    assert bytes(got) == payload
 
 
 def test_the_package_logger_writes_to_stderr_without_propagating() -> None:
@@ -75,24 +100,6 @@ def test_the_package_logger_writes_to_stderr_without_propagating() -> None:
     assert any(isinstance(h, logging.StreamHandler) for h in root.handlers)
     assert log.get_logger("oh_my_slam.viewer") is root.getChild("viewer")
     assert log.get_logger("plain") is root.getChild("plain")
-
-
-def test_timed_logs_the_wall_time_of_a_block_at_debug_level() -> None:
-    logger = logging.getLogger("oh_my_slam.test_timed")
-    logger.setLevel(logging.DEBUG)
-    records: list[str] = []
-    handler = logging.Handler()
-    handler.emit = lambda r: records.append(r.getMessage())  # type: ignore[method-assign]
-    logger.addHandler(handler)
-    try:
-        with pytest.raises(KeyError), log.timed("lookup", logger):
-            raise KeyError("x")  # timed even when the block fails
-        with log.timed("default logger"):  # the package logger (INFO: dropped)
-            pass
-    finally:
-        logger.removeHandler(handler)
-    (line,) = records
-    assert line.startswith("lookup: ") and line.endswith(" s")
 
 
 # --- exit codes ----------------------------------------------------------------------------------

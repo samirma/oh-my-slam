@@ -1,10 +1,12 @@
 """stderr logging and the single payload writer.
 
-Commands call :func:`claim_stdout` first. It duplicates the real stdout file descriptor for the
-payload and points fd 1 (and ``sys.stdout``) at stderr, so banners and progress printed by any
+Commands call :func:`claim_stdout` once their arguments are parsed and checked, before any
+inference, mapping or serving. It duplicates the real stdout file descriptor for the payload and
+points fd 1 (and ``sys.stdout``) at stderr, so banners and progress printed from then on by any
 library — including C++ code in Open3D or COLMAP — land on stderr. The returned
-:class:`PayloadWriter` accepts exactly one payload (one JSON document or one PLY) and writes it to
-the real stdout, or — for ``-o <file>`` — atomically to that file, leaving stdout empty.
+:class:`PayloadWriter` accepts exactly one payload (one JSON document, one PLY or one PNG) and
+writes it to the real stdout, or — for ``-o <file>`` — atomically to that file, leaving stdout
+empty.
 """
 
 from __future__ import annotations
@@ -12,10 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import sys
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -47,8 +47,9 @@ def json_payload_bytes(obj: Any) -> bytes:
 
 class PayloadWriter:
     """Writes the single payload: to a stream (the saved real stdout) or, when ``path`` is given,
-    atomically to that file (created with its parent folders, replaced if it exists). A file that
-    cannot be written is a usage error, raised when the writer is made."""
+    atomically to that file (replaced if it exists; its missing parent folders are created only
+    then, so a command that fails first leaves none behind). A file that cannot be written is a
+    usage error, raised when the writer is made, which creates nothing."""
 
     def __init__(self, stream: BinaryIO | None = None, path: Path | None = None) -> None:
         if (stream is None) == (path is None):
@@ -59,10 +60,6 @@ class PayloadWriter:
         self._path = None if path is None else Path(path)
         self._written = False
 
-    @property
-    def written(self) -> bool:
-        return self._written
-
     def write_bytes(self, data: bytes) -> None:
         if self._written:
             raise RuntimeError("payload already written")
@@ -72,14 +69,27 @@ class PayloadWriter:
             return
         assert self._stream is not None
         try:
-            self._stream.write(data)
-            self._stream.flush()
+            _write_all(self._stream, data)
         except BrokenPipeError:
             # Consumer closed the pipe (e.g. `| head`); nothing more to do.
             pass
 
     def write_json(self, obj: Any) -> None:
         self.write_bytes(json_payload_bytes(obj))
+
+
+def _write_all(stream: BinaryIO, data: bytes) -> None:
+    """Write every byte of ``data``. The real stdout is a raw stream, whose write may take only
+    part of it (a signal; a non-blocking stdout that is full takes none and returns None, and is
+    waited for until it can take more)."""
+    view = memoryview(data)
+    while view:
+        n: int | None = stream.write(view)
+        if n is None:
+            select.select([], [stream], [])
+        else:
+            view = view[n:]
+    stream.flush()
 
 
 _claimed: PayloadWriter | None = None
@@ -96,13 +106,3 @@ def claim_stdout(output: Path | None = None) -> PayloadWriter:
         sys.stdout = sys.stderr
         _claimed = PayloadWriter(os.fdopen(saved_fd, "wb", buffering=0))
     return _claimed if output is None else PayloadWriter(path=output)
-
-
-@contextmanager
-def timed(label: str, logger: logging.Logger | None = None) -> Iterator[None]:
-    """Log the wall time of a block at DEBUG level."""
-    start = time.perf_counter()
-    try:
-        yield
-    finally:
-        (logger or get_logger()).debug("%s: %.3f s", label, time.perf_counter() - start)

@@ -34,11 +34,12 @@ from oh_my_slam.tools.evaluate.scene import DocObject
 from oh_my_slam.viewer.routes import parse_cloud_payload
 
 MAX_LISTED = 5
-# Contract → the subjects (entry points, or the pair of outputs compared) it is reported for.
+# Contract → the subjects (entry points, or the pair of outputs compared) it is reported for;
+# ``server_sh``: the web service's own stdout and its operations' response bodies (the result).
 CONTRACTS: dict[str, tuple[str, ...]] = {
     "stdout": ("server", "reconstruct", "mapper", "segment", "view", "server_sh"),
-    "openlabel": ("reconstruct", "mapper", "segment", "view"),
-    "colour": ("reconstruct", "mapper", "segment", "view"),
+    "openlabel": ("reconstruct", "mapper", "segment", "view", "server_sh"),
+    "colour": ("reconstruct", "mapper", "segment", "view", "server_sh"),
     "artifacts": ("segment",),
     "same_objects": ("image", "map"),
     "readonly": ("map",),
@@ -217,7 +218,7 @@ def cloud_colour_problems(cloud: PointCloud, ids: set[int] | None) -> list[str]:
 
 
 def served_cloud_problems(body: bytes | None, ids: set[int] | None) -> list[str]:
-    """The viewer's ``/api/cloud?color=segment`` payload (``viewer.server.cloud_payload``) holds
+    """The viewer's ``/api/cloud?color=segment`` payload (``viewer.routes.cloud_document``) holds
     exactly the object colours of its points (the object ids of ``ids``; unsegmented grey)."""
     if body is None:
         return ["the viewer served no color=segment cloud"]

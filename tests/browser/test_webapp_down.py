@@ -48,7 +48,7 @@ def test_actions_that_need_it_are_disabled_with_the_reason(browser: Any, down: t
     try:
         pg = tab.go("#/image")
         pg.wait_for_function("() => document.body.dataset.inference === 'down'")
-        for op in ("reconstruct", "segment-image"):
+        for op in ("reconstruct", "segment"):
             pg.check(f"#op-{op}")
             btn = pg.locator("button[data-action=run]")
             assert btn.is_disabled()

@@ -20,6 +20,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from numpy.typing import NDArray
 from oh_my_slam.core.errors import OhMySlamError
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.mapping.store import FrameRecord
 
 log = get_logger("oh_my_slam.sfm")
 
@@ -69,6 +71,22 @@ def check_versions() -> str:
     return cli
 
 
+def _colmap_logs_to(log_path: Path) -> None:
+    """pycolmap's own log (glog: the in-process mapping, triangulation and verification) into
+    ``log_path``, beside the CLI's; stderr gets only its fatal errors. Its warnings and errors
+    are those of SfM attempts the mapper judges itself (a rejected global model logged a hundred
+    linear-solver warnings), and its progress is the mapper's to report."""
+    import pycolmap
+
+    log = pycolmap.logging
+    log.logtostderr = False
+    log.alsologtostderr = False
+    log.stderrthreshold = 3  # FATAL
+    log.set_log_destination(log.INFO, f"{log_path}.")
+    log.set_log_destination(log.WARNING, "")
+    log.set_log_destination(log.ERROR, "")
+
+
 def _run(args: list[str], log_path: Path) -> None:
     with log_path.open("a") as f:
         res = subprocess.run([colmap_bin(), *args], stdout=f, stderr=subprocess.STDOUT)
@@ -82,6 +100,14 @@ def _run(args: list[str], log_path: Path) -> None:
 FOCAL_MATCH_REL = 0.01  # EXIF focal priors this close are the same camera (device and zoom)
 
 
+def camera_intrinsics(cam: Any) -> Intrinsics:
+    """The full-resolution intrinsics of a COLMAP camera: its pinhole and, for a
+    ``SIMPLE_DIVISION`` camera, its distortion (``Intrinsics.k``)."""
+    K = np.asarray(cam.calibration_matrix())
+    k = float(cam.params[3]) if cam.model.name == "SIMPLE_DIVISION" else 0.0
+    return Intrinsics(K[0, 0], K[1, 1], K[0, 2], K[1, 2], cam.width, cam.height, "colmap", k)
+
+
 @dataclass
 class CameraPrior:
     width: int
@@ -91,6 +117,26 @@ class CameraPrior:
     # else the first of these database cameras of the same image size whose focal prior is
     # ``focal`` (within ``FOCAL_MATCH_REL``): photos of the same device, with EXIF, in a later update
     same_focal_ids: tuple[int, ...] = ()
+
+
+def shared_camera(frames: Iterable[FrameRecord], size: tuple[int, int], exif: bool | None,
+                  focal: float | None = None,
+                  camera_id: Callable[[FrameRecord], int] = lambda f: f.camera_id
+                  ) -> tuple[CameraPrior, FrameRecord | None]:
+    """The camera that images of ``size`` share with the map's stored keyframes ``frames`` (their
+    database camera: ``camera_id``), with the keyframe it comes from when there is one. Without
+    EXIF (``exif`` False): the camera of the latest keyframe of that size (more frames of the same
+    video, more photos of the device that took the map). With EXIF: the cameras of that size,
+    latest first, of which ``Sfm.existing_camera`` takes the first whose EXIF focal prior is
+    ``focal`` (more photos of the same device and zoom). Else, and for images with and without
+    EXIF together (``exif`` None), a new camera."""
+    same = sorted((f for f in frames if (f.width, f.height) == size), key=lambda f: -f.index)
+    if exif is None or (exif is False and not same):
+        return CameraPrior(*size, focal=focal), None
+    if exif:
+        return CameraPrior(*size, focal=focal,
+                           same_focal_ids=tuple(dict.fromkeys(map(camera_id, same)))), None
+    return CameraPrior(*size, focal=focal, existing_id=camera_id(same[0])), same[0]
 
 
 def _camera_params(prior: CameraPrior) -> str:
@@ -144,16 +190,16 @@ class SfmModel:
 
     def intrinsics(self, name: str) -> Intrinsics:
         im = self.rec.find_image_with_name(name)
-        cam = self.rec.cameras[im.camera_id]
-        K = np.asarray(cam.calibration_matrix())
-        return Intrinsics(K[0, 0], K[1, 1], K[0, 2], K[1, 2], cam.width, cam.height, "colmap")
+        return camera_intrinsics(self.rec.cameras[im.camera_id])
 
     def camera_id(self, name: str) -> int:
         return int(self.rec.find_image_with_name(name).camera_id)
 
     def observations(self, name: str, max_error: float = 2.0, min_track: int = 3
                      ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """(uv (M, 2) in full-res pixels, world xyz (M, 3)) of well-triangulated points."""
+        """(uv (M, 2) in full-res pixels, world xyz (M, 3)) of well-triangulated points; for a
+        camera with distortion, where its pinhole sees them (its keyframes' depth is on the
+        pinhole's grid)."""
         im = self.rec.find_image_with_name(name)
         uv, xyz = [], []
         for p2 in im.points2D:
@@ -164,7 +210,8 @@ class SfmModel:
                 continue
             uv.append(p2.xy)
             xyz.append(p3.xyz)
-        return np.asarray(uv, np.float64).reshape(-1, 2), np.asarray(xyz, np.float64).reshape(-1, 3)
+        pix = self.intrinsics(name).pinhole_pixels(np.asarray(uv, np.float64).reshape(-1, 2))
+        return pix, np.asarray(xyz, np.float64).reshape(-1, 3)
 
     def image_stats(self, name: str) -> dict[str, float]:
         im = self.rec.find_image_with_name(name)
@@ -391,6 +438,7 @@ class Sfm:
         self.work = Path(work_dir)
         self.work.mkdir(parents=True, exist_ok=True)
         self.log_path = self.work / "colmap.log"
+        _colmap_logs_to(self.log_path)
 
     # -- features & matching ---------------------------------------------------------------------
 
@@ -785,10 +833,7 @@ class Sfm:
             out = {}
             for im in db.read_all_images():
                 if im.name in names:
-                    cam = cams[im.camera_id]
-                    K = np.asarray(cam.calibration_matrix())
-                    out[im.name] = (int(im.camera_id), Intrinsics(
-                        K[0, 0], K[1, 1], K[0, 2], K[1, 2], cam.width, cam.height, "colmap"))
+                    out[im.name] = (int(im.camera_id), camera_intrinsics(cams[im.camera_id]))
             return out
         finally:
             db.close()
@@ -831,17 +876,63 @@ class Sfm:
         return rec
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
-                               focal_scale: float = 1.0) -> SfmModel:
+                               focal_scale: float = 1.0, distortion: float = 0.0) -> SfmModel:
         """Reconstruction from known camera-to-world poses: the database matches triangulated,
         poses and intrinsics held (no bundle adjustment: the refined multi-view poses are kept).
-        The cameras' focal lengths are the database's times ``focal_scale``."""
+        The cameras' focal lengths are the database's times ``focal_scale``; with a
+        ``distortion`` (``panorama``'s division coefficient) the database's cameras become
+        ``SIMPLE_DIVISION`` cameras with these intrinsics, so that later matching and updates see
+        the lens (``set_distortion``)."""
         import pycolmap
 
+        if distortion:
+            self.set_distortion(set(poses), focal_scale, distortion)
+            focal_scale = 1.0
         rec = self._posed_reconstruction(poses, focal_scale=focal_scale)
         out.mkdir(parents=True, exist_ok=True)
         rec = pycolmap.triangulate_points(rec, str(self.db), str(self.image_dir), str(out),
                                           clear_points=True, refine_intrinsics=False)
         return SfmModel(rec, "multiview")
+
+    def set_distortion(self, names: set[str], focal_scale: float, distortion: float) -> None:
+        """Make the database cameras of the images ``names`` ``SIMPLE_DIVISION`` cameras with
+        their focal length times ``focal_scale`` and the division coefficient ``distortion``."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            ids = {im.camera_id for im in db.read_all_images() if im.name in names}
+            for c in db.read_all_cameras():
+                if c.camera_id not in ids:
+                    continue
+                f = float(np.mean(np.asarray(c.params)[list(c.focal_length_idxs())]))
+                K = np.asarray(c.calibration_matrix())
+                new = pycolmap.Camera.create_from_model_id(
+                    c.camera_id, pycolmap.CameraModelId.SIMPLE_DIVISION, f * focal_scale,
+                    c.width, c.height)
+                new.params = [f * focal_scale, float(K[0, 2]), float(K[1, 2]), distortion]
+                new.has_prior_focal_length = c.has_prior_focal_length
+                db.update_camera(new)
+        finally:
+            db.close()
+
+    def drop_distortion(self, camera_id: int) -> None:
+        """Make a ``SIMPLE_DIVISION`` database camera the ``SIMPLE_PINHOLE`` of its focal length
+        and principal point (a rebuild fits its lens again, from all its keyframes)."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            c = db.read_camera(camera_id)
+            if c.model.name == "SIMPLE_DIVISION":
+                new = pycolmap.Camera.create_from_model_id(
+                    c.camera_id, pycolmap.CameraModelId.SIMPLE_PINHOLE, float(c.params[0]),
+                    c.width, c.height)
+                new.params = [float(c.params[0]), float(c.params[1]), float(c.params[2])]
+                new.has_prior_focal_length = c.has_prior_focal_length
+                db.update_camera(new)
+        finally:
+            db.close()
 
     def extend_with_poses(self, base_path: Path, poses: dict[str, Pose], out: Path,
                           method: str, cameras: dict[int, Any] | None = None) -> SfmModel:

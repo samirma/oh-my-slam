@@ -49,13 +49,25 @@ export function figures(record, hidden = HIDDEN) {
 // The figures a card shows first, when the summary has them
 const CARD = [['frames', 'Frames'], ['objects', 'Objects'], ['update_count', 'Updates'], ['updated_at', 'Updated']];
 
-function card(m) {
+// A map card's figures: those of CARD the summary has, and how long its last update took; else
+// its first four figures.
+export function cardFigures(m) {
   const shown = CARD.filter(([k]) => k in m).map(([k, label]) => [label, figureValue(k, m[k])]);
   const last = m.last_update;
   if (last && last.total_s != null) shown.push(['Last update took', fmtSeconds(last.total_s)]);
+  return shown.length ? shown : figures(m).slice(0, 4);
+}
+
+function card(m) {
   return el('li', { class: 'card map-card', 'data-map': m.name },
     el('h2', {}, el('a', { href: `#/maps/${enc(m.name)}`, class: 'card-link' }, m.name)),
-    facts(shown.length ? shown : figures(m).slice(0, 4)));
+    facts(cardFigures(m)));
+}
+
+// Whether a map's card shows for the filter `q` (lower case; '' shows every map): its name or one
+// of its figures ("name value") contains it.
+export function mapMatches(m, q) {
+  return !q || m.name.toLowerCase().includes(q) || figures(m).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(q));
 }
 
 export function mapsPage(main, { filter }) {
@@ -71,8 +83,7 @@ export function mapsPage(main, { filter }) {
   let maps = [];
   const draw = () => {
     const q = input.value.trim().toLowerCase();
-    const shown = maps.filter((m) => !q || m.name.toLowerCase().includes(q)
-      || figures(m).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(q)));
+    const shown = maps.filter((m) => mapMatches(m, q));
     clear(grid).append(...shown.map(card));
     count.textContent = maps.length
       ? `${shown.length} of ${maps.length} map${maps.length === 1 ? '' : 's'}${q ? ` match “${input.value.trim()}”` : ''}.`
@@ -91,7 +102,15 @@ export function mapsPage(main, { filter }) {
 const UPDATE_COLUMNS = [['kind', 'Input'], ['inputs', 'Files'], ['frames_added', 'Frames added'],
   ['frames_rejected', 'Rejected'], ['sfm', 'Registration']];
 
-function count(v) { return Array.isArray(v) ? String(v.length) : figureValue('', v); }
+// An update's figure in the history table: a list counts its entries.
+export function count(v) { return Array.isArray(v) ? String(v.length) : figureValue('', v); }
+
+// The per-stage timings of an update's timing record (map.json updates[].timings), `total` last.
+export function updateStages(t) {
+  const stages = Object.entries(t.stages_s || {}).map(([name, sec]) => ({ name, ms: sec * 1000 }));
+  if (t.total_s != null) stages.push({ name: 'total', ms: t.total_s * 1000 });
+  return stages;
+}
 
 function history(updates) {
   if (!updates || !updates.length) return el('p', { class: 'muted' }, 'No update recorded.');
@@ -101,8 +120,7 @@ function history(updates) {
   updates.forEach((u, i) => {
     const n = u.id ?? i + 1;
     const t = u.timings || {};
-    const stages = Object.entries(t.stages_s || {}).map(([name, sec]) => ({ name, ms: sec * 1000 }));
-    if (t.total_s != null) stages.push({ name: 'total', ms: t.total_s * 1000 });
+    const stages = updateStages(t);
     rows.push(el('tr', { 'data-update': n },
       el('th', { scope: 'row' }, `Update ${n}`),
       el('td', {}, u.at ? fmtDate(u.at) : '—'),

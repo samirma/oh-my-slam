@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable, Iterator
 from typing import NoReturn
 
-from oh_my_slam.core.errors import ExitCode, OhMySlamError
+from oh_my_slam.core.errors import ExitCode, OhMySlamError, internal_message
 
 
 def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None = None) -> NoReturn:
@@ -34,7 +34,7 @@ def run_main(prog: str, main: Callable[[list[str]], int], argv: list[str] | None
     except BrokenPipeError:
         code = 0
     except Exception as exc:
-        print(f"{prog}: internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"{prog}: internal error: {internal_message(exc)}", file=sys.stderr)
         code = int(ExitCode.INTERNAL)
     sys.stderr.flush()
     exit_now(code)

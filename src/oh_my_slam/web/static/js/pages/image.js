@@ -8,7 +8,8 @@ import { OpForm } from '../form.js';
 import { runPanel } from '../runpanel.js';
 import { setQuery } from '../url.js';
 
-function stem(name) { return String(name || '').split('/').pop().replace(/\.[^.]+$/, ''); }
+// A file name without its folders and its suffix (the result's download name starts with it).
+export function stem(name) { return String(name || '').split('/').pop().replace(/\.[^.]+$/, ''); }
 
 export function imagePage(main, { op: wanted }) {
   const ops = [...store.ops.values()].filter((o) => o.singleImage);

@@ -25,8 +25,6 @@ from pathlib import Path
 from typing import Any
 
 OPS = ("<=", ">=")
-# Metric ids renamed since earlier runs: stored results and baselines are read under the new id.
-RENAMED = {"server_sh.job_overhead_median_s": "server_sh.request_overhead_median_s"}
 
 
 @dataclass(frozen=True)
@@ -153,6 +151,6 @@ class Metrics:
 
 
 def baseline_values(result: dict[str, Any]) -> dict[str, float]:
-    """Metric values of a stored ``result.json`` (the baseline run), by current metric id."""
-    return {RENAMED.get(m["id"], m["id"]): float(m["value"]) for m in result.get("metrics", [])
+    """Metric values of a stored ``result.json`` (the baseline run), by metric id."""
+    return {m["id"]: float(m["value"]) for m in result.get("metrics", [])
             if isinstance(m.get("value"), int | float)}

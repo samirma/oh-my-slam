@@ -31,7 +31,7 @@ def make_state(loaded: bool = True, max_queue: int = 8) -> ServerState:
     worker.start()
     state = ServerState(registry=reg, worker=worker)
     if loaded:
-        worker.call(reg.load_all, "cpu")
+        worker.submit(reg.load_all, "cpu").result()
         state.loading = False
     return state
 
@@ -43,7 +43,7 @@ def test_health_and_loading_state(image: Path, tmp_path: Path) -> None:
     assert h["status"] == "loading"
     req = p.GeometryRequest(image_path=str(image), out_dir=str(tmp_path / "o"))
     assert client.post(p.ROUTE_GEOMETRY, json=req.model_dump()).status_code == 503
-    state.worker.call(state.registry.load_all, "cpu")
+    state.worker.submit(state.registry.load_all, "cpu").result()
     state.loading = False
     h = p.Health.model_validate(client.get(p.ROUTE_HEALTH).json())
     assert h.status == "ready"

@@ -14,7 +14,6 @@ import inspect
 import json
 import os
 import re
-import types
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -36,10 +35,10 @@ from tests.unit.test_view_cli import minimal_map, sh
 
 REPO = Path(__file__).resolve().parents[2]
 OCTET = {"content-type": "application/octet-stream"}
-OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment-image"}
+OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment"}
 API_ROUTES = {"GET /api/health", "GET /api/openapi.json", "POST /api/ops/{op}",
-              "POST /api/ops/{op}/validate", "POST /api/uploads", "DELETE /api/uploads/{id}",
-              "GET /api/maps", "GET /api/maps/{name}"}
+              "POST /api/ops/{op}/validate", "POST /api/uploads", "PUT /api/uploads",
+              "DELETE /api/uploads/{id}", "GET /api/maps", "GET /api/maps/{name}"}
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +46,13 @@ def _repo_importable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Commands run in the workspace; the test helpers (tests.fakes) must import there."""
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
         filter(None, [str(REPO), os.environ.get("PYTHONPATH")])))
+
+
+@pytest.fixture(autouse=True)
+def _test_client_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test client's ``Host`` (``testserver``) names this machine, as a browser's would."""
+    names = web_app.machine_hosts
+    monkeypatch.setattr(web_app, "machine_hosts", lambda: names() | {"testserver"})
 
 
 @pytest.fixture
@@ -71,8 +77,7 @@ class Svc:
 
 
 def make_svc(ws: Workspace, **kw: Any) -> Service:
-    return Service(ws, Runner(ws, interrupt_grace_s=5), url="http://0.0.0.0:0/",
-                   extra_hosts={"testserver"}, **kw)
+    return Service(ws, Runner(ws, interrupt_grace_s=5), url="http://0.0.0.0:0/", **kw)
 
 
 @pytest.fixture
@@ -162,7 +167,11 @@ def test_one_operation_per_mode_of_the_offered_commands() -> None:
         assert f"/api/ops/{op.id}/validate" in doc["paths"]
         assert "parameters" not in post  # no ?viewer
     assert doc["x-oms"]["exit_codes"] == spec.describe()["exit_codes"]
-    assert set(doc["paths"]["/api/uploads"]) == {"post"}
+    assert set(doc["paths"]["/api/uploads"]) == {"post", "put"}  # put: curl -T
+    for op in ("reconstruct", "mapper-update", "mapper-locate"):  # one -p: a string, no list
+        attrs = doc["paths"][f"/api/ops/{op}"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"]["properties"]["attrs"]
+        assert attrs["type"] == "string" and "oneOf" not in attrs and "items" not in attrs
 
 
 def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None:
@@ -174,13 +183,13 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
         assert importlib.util.find_spec(op.module) is not None, op.module
         assert f"oms_exec {op.module.rsplit('.', 1)[1]}" in (REPO / op.program.prog).read_text()
     ops = web_ops.operations()
-    seg = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg"}, ws)
+    seg = web_ops.prepare(ops["segment"], {"image": "in/a.jpg"}, ws)
     assert seg.argv == [f"-i={(ws.root / 'in' / 'a.jpg')}"]  # the result is its stdout: no -o
     assert seg.command == ["segment.sh", "-i=in/a.jpg"] and seg.result_format == "json"
     # each result in the media type of its format: the segmented image and the depth image are
     # PNGs, the point cloud a PLY
     for op, params, fmt, media in (
-            ("segment-image", {"format": "png"}, "png", "image/png"),
+            ("segment", {"format": "png"}, "png", "image/png"),
             ("reconstruct", {"format": "depth"}, "png", "image/png"),
             ("reconstruct", {"format": "ply", "attrs": "normals=on"}, "ply",
              "application/octet-stream"),
@@ -192,17 +201,22 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
     assert loc.argv[-1] == f"-m={ws.maps / 'm'}" and loc.result_format == "json"
     assert not loc.inference  # a small map is matched exhaustively
     for name, value in (("output", "x.json"), ("artifacts", "files")):
-        refused = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg", name: value}, ws)
+        refused = web_ops.prepare(ops["segment"], {"image": "in/a.jpg", name: value}, ws)
         assert [p.parameters for p in refused.problems] == [(name,)]
         assert "chooses where the command writes" in refused.problems[0].message
     # segment.sh has no -m and no -p any more: the command's parser refuses them
-    gone = web_ops.prepare(ops["segment-image"], {"image": "in/a.jpg", "map": "m",
+    gone = web_ops.prepare(ops["segment"], {"image": "in/a.jpg", "map": "m",
                                                   "attrs": "voxel=1"}, ws)
     assert [p.parameters for p in gone.problems] == [("attrs", "map")]
     refused = web_ops.prepare(ops["reconstruct"], {"image": "in/a.jpg", "format": "depth",
                                                    "attrs": "voxel=1"}, ws)
     assert refused.problems[0].message == ("-p sets point-cloud attributes, which only the PLY "
                                            "output has: use -f ply")
+    # one -p (spec §2.2): its key=value[,key=value…] text, never a list
+    listed = web_ops.prepare(ops["reconstruct"], {"image": "in/a.jpg", "format": "ply",
+                                                  "attrs": ["voxel=1", "normals=on"]}, ws)
+    assert [(p.parameters, p.message) for p in listed.problems] == [
+        (("attrs",), "-p takes one value")]
 
 
 def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
@@ -221,17 +235,17 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
     monkeypatch.setattr(svc.service, "inference_check", lambda: None)
 
     doc = svc.client.get("/api/openapi.json").json()
-    props = doc["paths"]["/api/ops/segment-image"]["post"]["requestBody"]["content"][
+    props = doc["paths"]["/api/ops/segment"]["post"]["requestBody"]["content"][
         "application/json"]["schema"]["properties"]
     assert props["shade"]["enum"] == ["dark", "light"] and props["shade"]["default"] == "dark"
     assert "/api/ops/slow" in doc["paths"]
 
     jpeg(svc.ws.root / "inputs" / "a.jpg")
     image = {"image": "inputs/a.jpg"}
-    r = svc.client.post("/api/ops/segment-image/validate", json={**image, "shade": "light"})
+    r = svc.client.post("/api/ops/segment/validate", json={**image, "shade": "light"})
     assert r.json()["valid"], r.json()
     assert "--shade=light" in r.json()["command"]
-    bad = svc.client.post("/api/ops/segment-image/validate", json={**image, "shade": "blue"})
+    bad = svc.client.post("/api/ops/segment/validate", json={**image, "shade": "blue"})
     assert fields(bad.json()) == ["shade"]
     v = svc.client.post("/api/ops/slow/validate", json={"seconds": 0.2}).json()
     assert v["command"] == ["slow.sh", "--seconds=0.2"] and v["inference"] is False
@@ -247,14 +261,14 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
 def test_invalid_requests_get_per_field_errors_and_run_nothing(svc: Svc) -> None:
     jpeg(svc.ws.root / "inputs" / "ok.jpg")
     image = {"image": "inputs/ok.jpg"}
-    r = svc.client.post("/api/ops/segment-image", json={**image, "min_score": "abc",
+    r = svc.client.post("/api/ops/segment", json={**image, "min_score": "abc",
                                                         "format": "xml"})
     assert r.status_code == 400
     err = r.json()["error"]
     assert err["code"] == "usage" and err["exit_code"] == 2
     assert set(err["by_parameter"]) >= {"format", "min_score"}
     assert "invalid choice: 'xml'" in err["by_parameter"]["format"][0]  # argparse's message
-    r = svc.client.post("/api/ops/segment-image", json={})
+    r = svc.client.post("/api/ops/segment", json={})
     assert r.status_code == 400 and "the following arguments are required: -i" in r.json()[
         "error"]["message"]
     (svc.ws.maps / "junk").mkdir()
@@ -262,10 +276,10 @@ def test_invalid_requests_get_per_field_errors_and_run_nothing(svc: Svc) -> None
     r = svc.client.post("/api/ops/mapper-update", json={"inputs": ["inputs/ok.jpg"],
                                                         "map": "junk"})
     assert r.status_code == 422 and r.json()["error"]["code"] == "not_a_map"
-    r = svc.client.post("/api/ops/segment-image", json={**image, "artifacts": "x",
+    r = svc.client.post("/api/ops/segment", json={**image, "artifacts": "x",
                                                         "output": "x"})
     assert r.status_code == 400 and fields(r.json()["error"]) == ["artifacts", "output"]
-    r = svc.client.post("/api/ops/segment-image", content=b"[1, 2]",
+    r = svc.client.post("/api/ops/segment", content=b"[1, 2]",
                         headers={"content-type": "application/json"})
     assert r.status_code == 400
     r = svc.client.post("/api/ops/nope", json={})
@@ -286,13 +300,13 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
     (svc.ws.maps / "evil").symlink_to(tmp_path / "outside")
     for image in (str(outside), "../outside/photo.jpg", "inputs/../../outside/photo.jpg",
                   "inputs/link.jpg", "inputs/dirlink/photo.jpg", "~/photo.jpg"):
-        r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
+        r = svc.client.post("/api/ops/segment/validate", json={"image": image})
         body = r.json()
         assert not body["valid"], image
         assert fields(body) == ["image"], (image, body)
         assert "outside the workspace" in body["by_parameter"]["image"][0], image
     for image in ("inputs/.hidden/h.jpg", "uploads/abc/.x.jpg.part", ".requests/x/stdout"):
-        r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
+        r = svc.client.post("/api/ops/segment/validate", json={"image": image})
         assert "hidden entries" in r.json()["by_parameter"]["image"][0], image
     for m in ("../m", "evil", "inputs", "/tmp", ".staging"):
         r = svc.client.post("/api/ops/mapper-locate/validate",
@@ -303,7 +317,7 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
     assert fields(r.json()) == ["inputs"]
     # inside the workspace, absolute or relative, is fine
     for image in ("inputs/ok.jpg", str(svc.ws.root / "inputs" / "ok.jpg")):
-        r = svc.client.post("/api/ops/segment-image/validate", json={"image": image})
+        r = svc.client.post("/api/ops/segment/validate", json={"image": image})
         assert r.json()["by_parameter"].get("image") is None, r.json()
     assert svc.client.get("/api/maps/evil").status_code == 404
 
@@ -319,6 +333,12 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
         assert c.get("/api/health", headers={"host": "127.0.0.1:1234"}).status_code == 200
         assert c.get("/api/health", headers={"host": "[::1]:1234"}).status_code == 200
         assert c.get("/api/health", headers={"host": "localhost"}).status_code == 200
+        # the address of the listening line, used as printed, and a page loaded from it
+        printed = {"host": "0.0.0.0:1234"}
+        assert c.get("/api/health", headers=printed).status_code == 200
+        r = c.post("/api/ops/mapper-locate/validate", json={"inputs": ["a.jpg"], "map": "m"},
+                   headers={**printed, "origin": "http://0.0.0.0:1234"})
+        assert r.status_code == 200, r.text
         foreign = {"origin": "http://evil.example"}
         locate = {"inputs": ["a.jpg"], "map": "m"}
         r = c.post("/api/ops/mapper-locate", json=locate, headers=foreign)
@@ -347,8 +367,18 @@ def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
         # an upload may carry the file's own media type
         r = c.post("/api/uploads?name=a.jpg", content=b"x", headers={"content-type": "image/jpeg"})
         assert r.status_code == 201
+        # curl -T: a PUT of the raw file, with no type of its own (a PUT always needs a CORS
+        # preflight, which is never granted); a form is still no raw file
+        r = c.put("/api/uploads?name=b.jpg", content=b"xy")
+        assert r.status_code == 201 and r.json()["size"] == 2, r.text
+        assert (ws.root / r.json()["path"]).read_bytes() == b"xy"
+        for ctype in ("multipart/form-data", "application/x-www-form-urlencoded"):
+            r = c.put("/api/uploads?name=c.jpg", content=b"x", headers={"content-type": ctype})
+            assert r.status_code == 415 and r.json()["error"]["code"] == "unsupported_media_type"
+        assert c.put("/api/uploads?name=d.jpg", content=b"x", headers=foreign).status_code == 403
+        assert sorted(p.name for p in ws.uploads.glob("*/*")) == ["a.jpg", "b.jpg"]
     service.runner.shutdown()
-    assert {"localhost", "127.0.0.1", "::1"} <= web_app.machine_hosts()
+    assert {"localhost", "127.0.0.1", "::1", "0.0.0.0"} <= web_app.machine_hosts()
 
 
 def test_an_unknown_host_refreshes_the_machines_names(ws: Workspace,
@@ -373,11 +403,12 @@ def test_inference_operations_get_503_while_the_others_work(
                                                                           "waiting": 0}
     assert health["inference"]["status"] == "down"
     assert health["inference"]["start_command"] == "./start_inference_server.sh"
-    up = svc.client.post("/api/uploads?name=b.jpg", content=b"x", headers=OCTET).json()
+    up = svc.client.post("/api/uploads?name=b.jpg", headers=OCTET,  # a readable image
+                         content=(svc.ws.root / "inputs" / "ok.jpg").read_bytes()).json()
     for op, params in (("reconstruct", {"image": "inputs/ok.jpg"}),
                        ("reconstruct", {"image": "inputs/ok.jpg", "format": "depth"}),
-                       ("segment-image", {"image": up["path"]}),
-                       ("segment-image", {"image": "inputs/ok.jpg", "format": "png"}),
+                       ("segment", {"image": up["path"]}),
+                       ("segment", {"image": "inputs/ok.jpg", "format": "png"}),
                        ("mapper-update", {"inputs": ["inputs/ok.jpg"], "map": "new"})):
         r = svc.client.post(f"/api/ops/{op}", json=params)
         assert r.status_code == 503, (op, r.json())
@@ -405,10 +436,11 @@ def test_inference_operations_get_503_while_the_others_work(
 
 def test_requests_wait_for_a_loading_inference_server(monkeypatch: pytest.MonkeyPatch) -> None:
     from oh_my_slam.client.client import InferenceClient
+    from oh_my_slam.client.protocol import Health
 
     state = {"status": "loading"}
-    monkeypatch.setattr(InferenceClient, "health", lambda self, timeout=1.0: types.SimpleNamespace(
-        status=state["status"], models={}))
+    monkeypatch.setattr(InferenceClient, "health", lambda self, timeout=1.0: Health(
+        status=state["status"]))  # type: ignore[arg-type]
     assert web_app.inference_problem() is None  # the command waits for the models itself
     state["status"] = "ready"
     assert web_app.inference_problem() is None
@@ -546,13 +578,13 @@ def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
         f"ws = Workspace(Path({str(tmp_path)!r}))\n"
         "ws.create()\n"
         "minimal_map(ws.maps / 'm')\n"
-        "c = TestClient(create_app(Service(ws, Runner(ws), extra_hosts={'testserver'})))\n"
+        "c = TestClient(create_app(Service(ws, Runner(ws))), base_url='http://localhost')\n"
         "for u in ('/api/health', '/api/openapi.json', '/api/maps', '/api/maps/m'):\n"
         "    assert c.get(u).status_code == 200, u\n"
         "(ws.root / 'a.jpg').write_bytes(b'x')\n"
         "locate = {'inputs': ['a.jpg'], 'map': 'm'}\n"
         "assert c.post('/api/ops/mapper-locate/validate', json=locate).json()['valid']\n"
-        "c.post('/api/ops/segment-image/validate', json={'image': 'a.jpg', 'format': 'png'})\n"
+        "c.post('/api/ops/segment/validate', json={'image': 'a.jpg', 'format': 'png'})\n"
         "c.post('/api/ops/reconstruct', json={'image': 'a.jpg', 'format': 'depth'})\n"
         "print(sorted(m for m in ('torch', 'open3d', 'pycolmap') if m in sys.modules))\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO,
@@ -585,3 +617,162 @@ def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
     make_svc(ws).runner.shutdown()
     assert snapshot(root) == before
     assert json.loads((root / "map.json").read_text())["update_count"] == 1
+
+
+# -- the answers' shape ------------------------------------------------------------------------------
+
+
+def test_an_unknown_route_or_method_answers_the_error_shape(svc: Svc) -> None:
+    r = svc.client.get("/api/nope")
+    assert r.status_code == 404 and r.json() == {"error": {
+        "code": "not_found", "message": "no route GET /api/nope; see /api/openapi.json",
+        "http_status": 404}}
+    r = svc.client.get("/api/uploads")
+    assert r.status_code == 405 and r.json()["error"]["code"] == "method_not_allowed"
+    assert set(r.headers["allow"].split(", ")) == {"POST", "PUT"}
+    assert "GET /api/uploads: the route takes" in r.json()["error"]["message"]
+
+
+def test_a_crash_answers_the_internal_error_and_consumes_the_uploads(ws: Workspace) -> None:
+    """Spec §2.6 "Errors", "Workspace": a check or a route that crashes — here on a corrupt
+    ``map.json`` — answers the command's internal error (exit 1: 500 ``internal``, with its
+    message as the command tells it) in the error shape of every other answer, and the request's
+    uploads go all the same."""
+    from jsonschema import Draft202012Validator
+
+    bad = ws.maps / "bad"
+    bad.mkdir()
+    (bad / "map.json").write_text("{not json")
+    photo = jpeg(ws.root / "inputs" / "q.jpg").read_bytes()
+    service = make_svc(ws, inference_check=lambda: None)
+    with TestClient(create_app(service), raise_server_exceptions=False) as c:
+        doc = c.get("/api/openapi.json").json()
+        error = Draft202012Validator({**doc, "$ref": "#/components/schemas/Error"})
+        assert all("500" in route["responses"] for item in doc["paths"].values()
+                   for route in item.values())
+
+        def internal(r: Any) -> dict[str, Any]:
+            assert r.status_code == 500 and r.headers["content-type"] == "application/json", r.text
+            error.validate(r.json())
+            err: dict[str, Any] = r.json()["error"]
+            assert err["code"] == "internal" and err["http_status"] == 500, err
+            return err
+
+        up = c.put("/api/uploads?name=q.jpg", content=photo).json()
+        locate = {"inputs": [up["path"]], "map": "bad"}
+        v = c.post("/api/ops/mapper-locate/validate", json=locate).json()
+        (p,) = v["problems"]
+        assert not v["valid"] and p["rule"] == "existing_map" and p["exit_code"] == 1, v
+        assert p["code"] == "internal" and p["message"].startswith("JSONDecodeError: ")
+        assert v["by_parameter"] == {"map": [p["message"]]}
+        assert (ws.root / up["path"]).is_file()  # validating consumes nothing
+        err = internal(c.post("/api/ops/mapper-locate", json=locate))
+        assert err["exit_code"] == 1 and err["message"] == p["message"]
+        assert not (ws.uploads / up["id"]).exists()  # the refused request consumed its upload
+        err = internal(c.get("/api/maps/bad"))
+        assert err["message"].startswith("JSONDecodeError: ")
+        assert c.get("/api/maps").json() == []  # the list leaves it out
+
+        # a check that crashes outside the command's rules (here the inference server's)
+        def crashes() -> None:
+            raise RuntimeError("boom")
+
+        service.inference_check = crashes  # type: ignore[assignment]
+        up = c.put("/api/uploads?name=q.jpg", content=photo).json()
+        v = c.post("/api/ops/segment/validate", json={"image": up["path"]}).json()
+        assert v["problems"] == [{"rule": "internal", "parameters": [], "code": "internal",
+                                  "message": "RuntimeError: boom", "exit_code": 1,
+                                  "http_status": 500}]
+        err = internal(c.post("/api/ops/segment", json={"image": up["path"]}))
+        assert err["message"] == "RuntimeError: boom"
+        assert list(ws.uploads.iterdir()) == []
+    service.runner.shutdown()
+
+
+def test_the_services_own_refusals_are_one_table(ws: Workspace,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every refusal that is no command's error answers with the code and HTTP status of
+    ``web.app.refusals()`` (no status is written anywhere else), and the OpenAPI document exports
+    that table and the upload limits."""
+
+    service = make_svc(ws, max_upload_bytes=10)
+    uid, target = ws.new_upload("a.jpg")
+    target.write_bytes(b"x")
+    got: dict[str, int] = {}
+    octet = {"content-type": "application/octet-stream"}
+    with TestClient(create_app(service)) as c:
+        for r in (c.get("/api/maps/nope"), c.get("/api/uploads"),
+                  c.get("/api/maps", headers={"host": "elsewhere.example"}),
+                  c.post("/api/ops/reconstruct/validate", content=b"{}",
+                         headers={"content-type": "text/plain"}),
+                  c.post("/api/uploads?name=a.jpg", content=b"x" * 100, headers=octet)):
+            got[r.json()["error"]["code"]] = r.status_code
+        service.max_upload_bytes, service.min_free_bytes = 1 << 40, 1 << 62
+        r = c.post("/api/uploads?name=a.jpg", content=b"x", headers=octet)
+        got[r.json()["error"]["code"]] = r.status_code
+        monkeypatch.setattr(service.runner, "in_use", lambda _uid: True)
+        r = c.delete(f"/api/uploads/{uid}")
+        got[r.json()["error"]["code"]] = r.status_code
+        service.runner.stopping = True
+        r = c.post("/api/ops/reconstruct", json={})
+        got[r.json()["error"]["code"]] = r.status_code
+        doc = c.get("/api/openapi.json").json()
+    service.runner.shutdown()
+    table = web_app.refusals()
+    assert got == {code: r.http_status for code, r in table.items()}
+    assert doc["x-oms"]["refusals"] == [dataclasses.asdict(r) for r in table.values()]
+    assert doc["x-oms"]["limits"] == {"max_upload_bytes": web_app.MAX_UPLOAD_BYTES,
+                                      "min_free_bytes": web_app.MIN_FREE_BYTES}
+    assert f"an upload over {web_app.MAX_UPLOAD_BYTES / 2**30:g} GiB" == table["too_large"].when
+    source = (REPO / "src" / "oh_my_slam" / "web" / "app.py").read_text()
+    assert not re.search(r"_error\(\d", source)  # every status of a refusal is the table's
+
+
+def test_every_json_answer_follows_its_schema_in_the_document(
+        ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``/api/openapi.json`` gives the schema of every JSON answer — health (the inference server
+    up or down), an upload, validation, the maps, and every error — and the service's answers
+    follow them."""
+    from jsonschema import Draft202012Validator
+
+    from oh_my_slam.client.protocol import Health
+    from oh_my_slam.web.runner import STOPPING, Outcome
+
+    minimal_map(ws.maps / "m")
+    health = {"status": "ready", "health": Health(status="ready").model_dump(),
+              "start_command": None}
+    service = make_svc(ws, inference_check=lambda: None, inference_health=lambda: health,
+                       max_upload_bytes=10)
+    with TestClient(create_app(service)) as c:
+        doc = c.get("/api/openapi.json").json()
+
+        def check(path: str, method: str, r: Any) -> None:
+            responses = doc["paths"][path][method]["responses"]
+            declared = responses.get(str(r.status_code)) or responses[f"{r.status_code // 100}XX"]
+            if "$ref" in declared:
+                declared = doc["components"]["responses"][declared["$ref"].rsplit("/", 1)[1]]
+            schema = declared["content"]["application/json"]["schema"]
+            Draft202012Validator({**doc, **schema}).validate(r.json())
+
+        check("/api/health", "get", c.get("/api/health"))
+        health = {"status": "down", "message": "not running", "start_command": "./x.sh"}
+        check("/api/health", "get", c.get("/api/health"))
+        put = c.put("/api/uploads?name=a.jpg", content=b"x")
+        check("/api/uploads", "put", put)
+        check("/api/uploads", "post", c.post("/api/uploads?name=a.jpg", content=b"x" * 11,
+                                             headers=OCTET))
+        image = {"image": put.json()["path"]}
+        for body in (image, {}, {"image": "../x.jpg", "format": "xml"}):
+            check("/api/ops/segment/validate", "post",
+                  c.post("/api/ops/segment/validate", json=body))
+        check("/api/ops/segment", "post", c.post("/api/ops/segment", json={}))
+        check("/api/maps", "get", c.get("/api/maps"))
+        check("/api/maps/{name}", "get", c.get("/api/maps/m"))
+        check("/api/maps/{name}", "get", c.get("/api/maps/nope"))
+        check("/api/uploads/{id}", "delete", c.delete("/api/uploads/nope"))
+    service.runner.shutdown()
+    error = Draft202012Validator({**doc, "$ref": "#/components/schemas/Error"})
+    for outcome in (Outcome(5, "no overlap"), Outcome(130, None, STOPPING)):
+        error.validate(web_app.failure(outcome)[1])
+    for schema in doc["components"]["schemas"].values():
+        Draft202012Validator.check_schema(schema)

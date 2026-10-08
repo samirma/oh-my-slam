@@ -13,7 +13,9 @@ import numpy as np
 import pytest
 
 from oh_my_slam.core.ply import PointCloud, ply_bytes
+from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import store
+from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.catalog import catalog_csv
 from oh_my_slam.tools.evaluate import groundtruth as gt
 from oh_my_slam.tools.evaluate import mapupdate as mu
@@ -132,14 +134,41 @@ def test_annotated_poses_without_a_map_or_a_registered_capture_fail(tmp_path: Pa
     files = poses_file(tmp_path)
     ids = ["gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg",
            "gt.poses.pitch_err_median_deg"]
+    for maps in ({}, {"ainex-captures": None, "camera": None}):
+        m = Metrics()
+        gt.pose_metrics(m, files, maps)
+        assert [m.items[k].error for k in ids] == ["no one-update map was built"] * 3
     m = Metrics()
-    gt.pose_metrics(m, files, None)
-    assert [m.items[k].error for k in ids] == ["the one-update map was not built"] * 3
-    m = Metrics()
-    gt.pose_metrics(m, files, {"002_bootstrap_side1_level.jpg": cam(0.0)})
+    gt.pose_metrics(m, files, {"ainex-captures": {"002_bootstrap_side1_level.jpg": cam(0.0)}})
     assert [m.items[k].error for k in ids] == [
-        "no annotated capture is registered in the map"] * 3
+        "no annotated capture is registered in a one-update map"] * 3
     assert all(m.items[k].value is None for k in ids)
+    m = Metrics()
+    gt.pose_metrics(m, files, {"ainex-captures": {}, "camera": None})
+    assert m.items[ids[0]].error == ("no annotated capture is registered in a one-update map "
+                                     "(not built: camera)")
+
+
+def test_each_capture_sequence_has_its_own_yaw_zero(tmp_path: Path) -> None:
+    """Annotations of both capture sequences, each against its own one-update map: the maps'
+    frames differ, so each gets its own best yaw offset."""
+    (tmp_path / "poses.json").write_text(json.dumps({"kind": "poses", "frames": {
+        "001_bootstrap_level.jpg": {"yaw_deg": 10.0}, "004_bootstrap_left015_level.jpg": {
+            "yaw_deg": 25.0},
+        "img_008_p03_mid.jpg": {"yaw_deg": 0.0, "pitch_deg": 0.0},
+        "img_011_p04_mid.jpg": {"yaw_deg": 30.0}, "img_009_p03_up.jpg": {"pitch_deg": 20.0}}}))
+    maps = {"ainex-captures": {"001_bootstrap_level.jpg": cam(-50.0),
+                               "004_bootstrap_left015_level.jpg": cam(-35.0)},
+            "camera": {"img_008_p03_mid.jpg": cam(100.0), "img_011_p04_mid.jpg": cam(131.0),
+                       "img_009_p03_up.jpg": cam(100.0, 18.0)}}
+    m = Metrics()
+    gt.pose_metrics(m, gt.discover(tmp_path)[0], maps)
+    yaw = m.items["gt.poses.yaw_err_median_deg"]
+    assert yaw.detail == {"frames": 4, "offset_deg": {"ainex-captures": -60.0, "camera": 100.5}}
+    assert yaw.value == pytest.approx(0.25) and m.items[
+        "gt.poses.yaw_err_max_deg"].value == pytest.approx(0.5)
+    pitch = m.items["gt.poses.pitch_err_median_deg"]
+    assert pitch.value == pytest.approx(1.0) and pitch.detail == {"frames": 2}
 
 
 def test_only_the_annotated_angles_are_measured(tmp_path: Path) -> None:
@@ -147,7 +176,8 @@ def test_only_the_annotated_angles_are_measured(tmp_path: Path) -> None:
     (tmp_path / "yaw" / "poses.json").write_text(json.dumps({"kind": "poses", "frames": {
         "001_bootstrap_level.jpg": {"yaw_deg": 10.0}}}))
     m = Metrics()
-    gt.pose_metrics(m, gt.discover(tmp_path / "yaw")[0], {"001_bootstrap_level.jpg": cam(-5.0)})
+    gt.pose_metrics(m, gt.discover(tmp_path / "yaw")[0],
+                    {"ainex-captures": {"001_bootstrap_level.jpg": cam(-5.0)}})
     assert set(m.items) == {"gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg"}
     assert m.items["gt.poses.yaw_err_max_deg"].value == pytest.approx(0.0, abs=1e-9)  # offset
     (tmp_path / "pitch" / "poses.json").parent.mkdir()
@@ -155,7 +185,7 @@ def test_only_the_annotated_angles_are_measured(tmp_path: Path) -> None:
         "005_bootstrap_left015_up.jpg": {"pitch_deg": 12.0}}}))
     m = Metrics()
     gt.pose_metrics(m, gt.discover(tmp_path / "pitch")[0],
-                    {"005_bootstrap_left015_up.jpg": cam(15.0, 10.0)})
+                    {"ainex-captures": {"005_bootstrap_left015_up.jpg": cam(15.0, 10.0)}})
     assert set(m.items) == {"gt.poses.pitch_err_median_deg"}
     assert m.items["gt.poses.pitch_err_median_deg"].value == pytest.approx(2.0)
 
@@ -171,7 +201,7 @@ def test_located_captures_without_the_maps_reference_frame_have_no_yaw() -> None
     assert rows == [{"capture": held[0].name, "commanded_yaw_deg": 60.0}]
     for k in ("yaw_err_median_deg", "yaw_err_max_deg"):
         x = m.items[f"pose.locate.{k}"]
-        assert x.value is None and x.error == "the map has no pose of capture 001"
+        assert x.value is None and x.error == "the map has no pose of the sequence's first capture"
 
 
 def test_a_keyframe_pair_without_enough_shared_pixels_is_not_compared(tmp_path: Path) -> None:
@@ -179,7 +209,7 @@ def test_a_keyframe_pair_without_enough_shared_pixels_is_not_compared(tmp_path: 
     recs = [record(0, caps[0].name, cam(0.0)), record(1, caps[1].name, cam(20.0))]
     write_map(tmp_path, recs, {"f000001": np.zeros((K.height, K.width))})  # no valid depth
     m = Metrics()
-    assert agreement_metrics(m, "map.t", tmp_path, caps) == []
+    assert agreement_metrics(m, "map.t", tmp_path, same_heading_pairs(caps)) == []
     pairs = m.items["map.t.frame_agreement_pairs_median_pct"]
     assert pairs.value is None
     assert pairs.error == "no overlapping keyframe pair to compare (1 candidates)"
@@ -219,6 +249,13 @@ def test_the_camera_comes_from_the_first_stream_with_intrinsics(tmp_path: Path) 
     v = mu.MapView.of(doc, tmp_path)
     assert v.camera == CAMERA and set(v.poses) == set(IMAGES) and v.cloud is None
     doc["openlabel"]["streams"] = {"camera_0": {"type": "camera"}}
+    assert mu.MapView.of(doc, tmp_path).camera is None
+    # a lens: its division model (intrinsics_custom), as the map's readers take it
+    lens = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap", -0.3)
+    doc["openlabel"]["streams"] = {"camera_1": ol.camera_stream(lens)}
+    assert mu.MapView.of(doc, tmp_path).camera == lens
+    doc["openlabel"]["streams"]["camera_1"]["stream_properties"]["intrinsics_pinhole"][
+        "camera_matrix"] = [500.0]  # malformed: no camera
     assert mu.MapView.of(doc, tmp_path).camera is None
 
 

@@ -2,9 +2,9 @@
 of ``commands.spec`` and the two long-lived servers' own, ``start_inference_server.sh`` (§2.1) and
 ``server.sh`` (§2.6), declared here once as data with the same types (options, defaults, modes). Each
 server builds its parser from here (``spec.build_parser``), and the agent skill
-(``oh_my_slam.web.skill``) describes every script from :func:`scripts`. The servers are no API
-operations (``Program.service`` is False) and stay out of ``spec.PROGRAMS``, the commands whose
-parsers, rules and stages the web service runs.
+(``oh_my_slam.web.skill``) takes from :func:`scripts` the servers it tells the user to start.
+The servers are no API operations (``Program.service`` is False) and stay out of
+``spec.PROGRAMS``, the commands whose parsers, rules and stages the web service runs.
 
 A server's modes are selected by a flag (``--status``, ``--stop``), the mode without a selector
 being its start; ``Mode.lifecycle`` marks the modes that start or stop it, which the user runs."""
@@ -15,14 +15,14 @@ from pathlib import Path
 
 from oh_my_slam.commands import spec
 from oh_my_slam.commands.spec import Command, Kind, Mode, Option, Output, Program
-from oh_my_slam.core.constants import DEFAULT_DATA
+from oh_my_slam.core.constants import DEFAULT_DATA, INFERENCE_SERVER_PROG
 from oh_my_slam.core.errors import ExitCode, ServiceNotRunningError
 
 _DOWN = f"exit {int(ExitCode.SERVER_UNAVAILABLE)}"  # --status of a server that does not run
 _INFERENCE_HELP = "Start (idempotent), stop or query the inference server."
 
-INFERENCE_SERVER = Program("start_inference_server.sh", _INFERENCE_HELP, (
-    Command("start_inference_server.sh", None, _INFERENCE_HELP, (
+INFERENCE_SERVER = Program(INFERENCE_SERVER_PROG, _INFERENCE_HELP, (
+    Command(INFERENCE_SERVER_PROG, None, _INFERENCE_HELP, (
         Option("--stop", "stop", Kind.FLAG, "stop the running server", default=False,
                group="action"),
         Option("--status", "status", Kind.FLAG, "print health JSON to stdout", default=False,

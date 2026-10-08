@@ -90,7 +90,8 @@ def test_inference_starts_while_ingest_writes(tmp_path: Path, monkeypatch: pytes
     first_done = threading.Event()
     seen_written: list[list[str]] = []
 
-    def fake(kf: ingest.Keyframe, work: Path, client: Any) -> tuple[Any, list[Any]]:
+    def fake(kf: ingest.Keyframe, work: Path, client: Any, lens: Any = None
+             ) -> tuple[Any, list[Any]]:
         started.append(kf.index)
         first_done.set()
         return kf.index, []
@@ -110,7 +111,8 @@ def test_inference_starts_while_ingest_writes(tmp_path: Path, monkeypatch: pytes
 
 def test_an_ingest_error_stops_the_inference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                              ) -> None:
-    def fake(kf: ingest.Keyframe, work: Path, client: Any) -> tuple[Any, list[Any]]:
+    def fake(kf: ingest.Keyframe, work: Path, client: Any, lens: Any = None
+             ) -> tuple[Any, list[Any]]:
         return kf.index, []
 
     monkeypatch.setattr(api, "reconstruct_and_detect_keyframe", fake)

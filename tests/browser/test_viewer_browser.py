@@ -464,7 +464,7 @@ def ring_view(browser: Any) -> Iterator[View]:
     """100 cameras on a circle around a small cloud (no objects), to exercise a long list."""
     from oh_my_slam.core.types import Intrinsics
     from oh_my_slam.schema import openlabel as ol
-    from oh_my_slam.segmentation.cloud import map_cloud_source
+    from oh_my_slam.segmentation.api import map_cloud_source
     from tests.synth.scene import look_at
 
     K = Intrinsics(320.0, 320.0, 320.0, 240.0, 640, 480)
@@ -483,7 +483,7 @@ def ring_view(browser: Any) -> Iterator[View]:
     xyz = rng.normal(size=(5000, 3)) * [1.0, 1.0, 0.4] + [0.0, 0.0, 0.8]
     source = map_cloud_source(xyz, rng.integers(0, 255, (5000, 3), np.uint8), None, set(),
                               np.zeros((1, 3)))
-    bundle = ViewBundle(mode="map", title="ring", scene=scene, source=source, catalog=[])
+    bundle = ViewBundle(mode="map", title="ring", scene=scene, source=source)
     with running(bundle) as url:
         v = View(browser, bundle, url)
         yield v
@@ -622,7 +622,7 @@ def dense_view(browser: Any) -> Iterator[View]:
     """120 small boxes crowded in the middle of a 6 x 6 m floor: more labels than fit next to
     their boxes at desktop and at phone width."""
     from oh_my_slam.schema import openlabel as ol
-    from oh_my_slam.segmentation.cloud import map_cloud_source
+    from oh_my_slam.segmentation.api import map_cloud_source
     from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 
     rng = np.random.default_rng(5)
@@ -643,7 +643,7 @@ def dense_view(browser: Any) -> Iterator[View]:
     xyz = np.c_[rng.uniform(-3, 3, 40_000), rng.uniform(-3, 3, 40_000), rng.normal(0, 0.005, 40_000)]
     source = map_cloud_source(xyz, rng.integers(60, 200, (len(xyz), 3), np.uint8), None, set(),
                               np.array([[0.0, -4.0, 1.5]]))
-    bundle = ViewBundle(mode="map", title="dense", scene=scene, source=source, catalog=[])
+    bundle = ViewBundle(mode="map", title="dense", scene=scene, source=source)
     with running(bundle) as url:
         v = View(browser, bundle, url)
         yield v

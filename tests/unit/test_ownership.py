@@ -71,9 +71,11 @@ def test_import_contracts_express_the_ownership_rules() -> None:
     seg_internals = {f"oh_my_slam.segmentation.{m}" for m in ("detect", "lift", "obb", "colors")}
     assert seg_internals <= by_source["oh_my_slam.mapping"]
     assert seg_internals <= by_source["oh_my_slam.viewer"]
+    assert seg_internals <= by_source["oh_my_slam.cli"]
     assert "oh_my_slam.client" in by_source["oh_my_slam.mapping"]
     assert {"oh_my_slam.segmentation", "oh_my_slam.mapping"} <= by_source[
         "oh_my_slam.reconstruction"]
+    assert "oh_my_slam.core.ply" in by_source["oh_my_slam.segmentation"]  # it writes no PLY
     for pkg in ("mapping", "segmentation", "viewer", "server", "cli", "commands", "tools"):
         assert "open3d" in by_source[f"oh_my_slam.{pkg}"], pkg
     for pkg in ("cli", "commands", "tools", "viewer", "mapping", "segmentation", "reconstruction",
@@ -85,12 +87,36 @@ def test_import_contracts_express_the_ownership_rules() -> None:
                 "schema", "core"):
         assert "oh_my_slam.server" in by_source[f"oh_my_slam.{pkg}"], pkg
     assert "oh_my_slam.commands" in by_source["oh_my_slam.server"]
-    # the commands' definitions sit right under the command line and the web service (spec 2.6)
+    # the commands' definitions sit right under the command line, the web service (spec 2.6) and
+    # the evaluators (spec 5), which never import one another
     (layers,) = [c["layers"] for c in contracts.values() if c["type"] == "layers"]
-    assert layers[:2] == ["oh_my_slam.cli | (oh_my_slam.web)", "oh_my_slam.commands"]
+    assert layers[:2] == ["oh_my_slam.cli | (oh_my_slam.web) | oh_my_slam.tools",
+                          "oh_my_slam.commands"]
     server_internals = {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")}
     assert server_internals <= by_source["oh_my_slam.tools"]
     assert "oh_my_slam.server.lifecycle" not in by_source["oh_my_slam.tools"]
+
+
+def test_point_clouds_are_reconstructions_and_colours_segmentations() -> None:
+    """§4: the reconstruction code alone derives every emitted cloud (pixel selection, voxel
+    thinning, normals, PLY), which segmentation, mapping and the viewer reuse; the segmentation
+    code alone assigns colours, which the derivation receives as data and never names."""
+    defs = _grep(r"def (derive_cloud|derive_thinned|cloud_ply)\(|"
+                 r"class (ImageCloudSource|MapCloudSource|PointColors)\b", _py_files())
+    assert defs == {"reconstruction/cloud.py"}, defs
+    users = _py_files("segmentation") + _py_files("viewer") + _py_files("cli")
+    assert not _grep(r"\b(pixel_mask|pixel_points|depth_normals|PointNormals|"
+                     r"voxel_downsample_indices|budget_voxel_indices|ply_bytes)\(", users)
+    assert _grep(r"def (segment_colors|height_colors|color_for_id)\(", _py_files()) == {
+        "segmentation/colors.py"}
+    assert not _grep(r"segment_colors|height_colors|color_for_id|UNSEGMENTED|PALETTE|VIRIDIS|"
+                     r"#808080", _py_files("reconstruction"))
+    # segmentation hands its colour assignment to the derivation, as data
+    api = (SRC / "segmentation" / "api.py").read_text("utf-8")
+    assert "POINT_COLORS = PointColors(segment=segment_colors, height=height_colors)" in api
+    rec = (SRC / "cli" / "reconstruct.py").read_text("utf-8")
+    assert "from oh_my_slam.reconstruction.cloud import" in rec
+    assert "cloud_ply(image_cloud_source(" in rec  # segmentation's colours, as data
 
 
 def test_mapping_delegates_depth_and_segmentation() -> None:
@@ -109,10 +135,42 @@ def test_mapping_delegates_depth_and_segmentation() -> None:
     assert not _grep(r"KEYFRAME_TOKENS|KEYFRAME_GRID_SIDE|want_descriptor", seg)
 
 
+# Mapping re-implements none of the shared geometry (spec §4, "Neither reconstruction, mapping nor
+# the viewer re-implements that logic"): pixels are unprojected and points projected by
+# ``core.geometry`` (``unproject_pixels``, ``project``), voxel keys come from ``voxel_keys``,
+# normals from ``reconstruction.pointcloud.PointNormals``, and the depth correction of the image
+# borders is reconstruction's (``reconstruction.borders``).
+MAPPING_REIMPLEMENTATION = (
+    r"\(\s*[\w\[\]:, ]+-\s*\w+\.c[xy]\s*\)\s*/\s*\w+\.f[xy]"  # (u - K.cx) / K.fx
+    r"|-\s*\w*K\w*\[[01], 2\]\s*\)\s*/\s*\w*K\w*\[[01], [01]\]"  # (u - K[0, 2]) / K[0, 0]
+    r"|\.f[xy]\s*\*\s*[\w\[\]:, ]+/\s*\w+\s*\+\s*\w+\.c[xy]"  # K.fx * x / z + K.cx
+    r"|K\w*\[[01], [01]\]\s*\*\s*[\w\[\]:, ]+/\s*\w+\s*\+\s*\w*K\w*\[[01], 2\]"
+    r"|linalg\.(eigh|eigvalsh)\(|einsum\(\"nki,nkj"  # normals by a local PCA
+    r"|np\.floor\([^\n]*/\s*(cell|voxel|\w*VOXEL\w*)\)"  # voxel keys
+    r"|BORDER_(SAME|NEIGHBOURS)\s*="  # the border depth correction
+)
+
+
+def test_mapping_reimplements_no_shared_geometry() -> None:
+    assert not _grep(MAPPING_REIMPLEMENTATION, _py_files("mapping"))
+    # the patterns find the formulas they forbid (as mapping wrote them before)
+    for formula in ("(uv[:, 0] - K.cx) / K.fx * z", "(uu[ok] - K.cx) / K.fx * zs",
+                    "Kg.fx * Y[:, 0] / zz + Kg.cx", "K.fy * pc[:, 1] / z + K.cy",
+                    "(u - K[0, 2]) / K[0, 0] * z", "K[1, 1] * p[:, 1] / z + K[1, 2]",
+                    'np.linalg.eigh(np.einsum("nki,nkj->nij", q, q))',
+                    "np.floor(flat / BRIDGE_VOXEL)", "np.floor(np.asarray(p, np.float64) / cell)",
+                    "BORDER_SAME = 0.1"):
+        assert re.search(MAPPING_REIMPLEMENTATION, formula), formula
+    # mapping applies reconstruction's border correction to its keyframes, nothing more
+    geometry = (SRC / "mapping" / "geometry.py").read_text("utf-8")
+    assert "border_depths(" in geometry
+    assert "def correct_borders(" in (SRC / "reconstruction" / "borders.py").read_text("utf-8")
+
+
 
 # view.sh owns only the web server and UI (spec §2.5). It may call the owners' public APIs — one
 # reconstruction + segmentation run (segmentation.api), the read-only map export, the shared
-# point-cloud derivation (segmentation.cloud) and attribute definition (core.cloud_attrs) — but never
+# point-cloud derivation (reconstruction.cloud) and attribute definition (core.cloud_attrs) — but never
 # the internals behind them, and it re-implements none of their logic.
 VIEWER_FORBIDDEN_IMPORTS = (
     r"import torch|oh_my_slam\.client|oh_my_slam\.server"

@@ -16,7 +16,7 @@ import { budgetNote, DISPLAY_POINT_BUDGET } from './controls.js';
 
 export { budgetNote, DISPLAY_POINT_BUDGET, plyHeader };
 
-// segmentation.cloud.IMAGE_FRAME: the header comment of a cloud in a single image's camera frame
+// reconstruction.cloud.IMAGE_FRAME: the header comment of a cloud in a single image's camera frame
 export const IMAGE_FRAME = 'oh-my-slam camera frame (OpenCV axes: x right, y down, z forward), metres';
 // viewer/bundle.py upright_transform(reconstruction.gravity.DEFAULT_UP_CAM), row-major: a level
 // camera's frame shown upright (x right; z forward becomes +y; y down becomes -z, so up is +z)
@@ -46,6 +46,20 @@ export function cloudFacts({ header, arrays }) {
     frame: (header.comments || []).find((c) => / frame\b|, metres/.test(c)) || '',
     format: header.format || '', upright: isUpright(header), note: budgetNote(header),
   };
+}
+
+// The move a key asks of a focused view, as [CloudView method, ...its arguments]: arrows rotate,
+// Shift + arrows pan, + and - zoom, 0 or Home resets; null for any other key or a modifier.
+export function keyMove(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return null;
+  const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] };
+  const a = arrows[e.key];
+  if (a && e.shiftKey) return ['pan', a[0] * PAN_STEP, a[1] * PAN_STEP];
+  if (a) return ['rotate', -a[0] * ROTATE_STEP_DEG, a[1] * ROTATE_STEP_DEG];
+  if (e.key === '+' || e.key === '=') return ['zoom', ZOOM_STEP];
+  if (e.key === '-' || e.key === '_') return ['zoom', 1 / ZOOM_STEP];
+  if (e.key === '0' || e.key === 'Home') return ['reset'];
+  return null;
 }
 
 export class CloudView {
@@ -87,18 +101,12 @@ export class CloudView {
 
   reset() { this.viewer.resetView(); }
 
-  // The keys of a focused host: arrows rotate, Shift + arrows pan, + and - zoom, 0 or Home resets.
-  // Returns true when the key moved the view.
+  // The keys of a focused host (keyMove). Returns true when the key moved the view.
   key(e) {
-    if (e.altKey || e.ctrlKey || e.metaKey) return false;
-    const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] };
-    const a = arrows[e.key];
-    if (a && e.shiftKey) this.pan(a[0] * PAN_STEP, a[1] * PAN_STEP);
-    else if (a) this.rotate(-a[0] * ROTATE_STEP_DEG, a[1] * ROTATE_STEP_DEG);
-    else if (e.key === '+' || e.key === '=') this.zoom(ZOOM_STEP);
-    else if (e.key === '-' || e.key === '_') this.zoom(1 / ZOOM_STEP);
-    else if (e.key === '0' || e.key === 'Home') this.reset();
-    else return false;
+    const move = keyMove(e);
+    if (!move) return false;
+    const [name, ...args] = move;
+    this[name](...args);
     return true;
   }
 

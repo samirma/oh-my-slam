@@ -42,6 +42,7 @@ from oh_my_slam.core import paths, timing
 from oh_my_slam.core.atomic import clone_file
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import InputError, NotAMapError, UsageError
+from oh_my_slam.core.geometry import project, unproject_pixels
 from oh_my_slam.core.images import IMAGE_SUFFIXES, VIDEO_SUFFIXES, exif_intrinsics, upright_size
 from oh_my_slam.core.log import get_logger, json_payload_bytes
 from oh_my_slam.core.timing import Stage
@@ -54,6 +55,7 @@ from oh_my_slam.mapping.sfm import (
     CameraPrior,
     Sfm,
     epipolar_deg,
+    shared_camera,
 )
 
 log = get_logger("oh_my_slam.locate")
@@ -68,7 +70,7 @@ VIS_GRID_SIDE = 96
 VIS_REL_TOL = 0.05
 VIS_NEAR = 0.05
 VIS_CHUNK = 1 << 20
-# Epipolar gate of a camera that sees the map from the keyframes' spot (rotation_dominant: most
+# Epipolar gate of a camera that sees the map from the keyframes' spot (_viewpoint: most
 # matches with multi-view keyframes, or a baseline below ROTATION_BASELINE of the scene depth):
 # a pose above MAX_EPIPOLAR_DEG is refined against the keyframe poses (IRLS Cauchy on the
 # epipolar distances, REFINE_IRLS_ROUNDS rounds, quadratic centre prior REFINE_CENTRE_PRIOR_M, at
@@ -136,7 +138,7 @@ def resolve_images(inputs: Sequence[Path]) -> list[Path]:
             raise UsageError(f"locate takes images, not a video: {p}")
         if not p.exists():
             raise InputError(f"input not found: {p}")
-        if not p.is_file() or p.name.startswith(".") or p.suffix.lower() not in IMAGE_SUFFIXES:
+        if not p.is_file() or p.suffix.lower() not in IMAGE_SUFFIXES:
             raise InputError(f"not an image file: {p} (locate takes one or more images)")
         out.append(p)
     return out
@@ -227,20 +229,10 @@ def _extract(reader: store.MapReader, queries: list[_Query], work: Path
     for q in queries:
         groups.setdefault((*q.size, None if q.exif is None else q.exif.fx), []).append(q)
     for (w, h, focal), qs in groups.items():
-        sfm.extract([q.name for q in qs], _camera_prior(reader, known, w, h, focal))
+        prior, _ = shared_camera([fr for fr in reader.frames if _kf_file(fr) in known], (w, h),
+                                 focal is not None, focal, lambda fr: known[_kf_file(fr)].camera_id)
+        sfm.extract([q.name for q in qs], prior)
     return sfm, _db_images(db)
-
-
-def _camera_prior(reader: store.MapReader, known: dict[str, _DbImage], w: int, h: int,
-                  focal: float | None) -> CameraPrior:
-    """As for an update's photos: without EXIF, the camera of the latest keyframe of the same size
-    (more photos of the device that took the map); with EXIF, a camera of that size with the same
-    EXIF focal prior — else a new camera."""
-    same = [known[_kf_file(fr)].camera_id for fr in sorted(reader.frames, key=lambda r: r.index)
-            if (fr.width, fr.height) == (w, h) and _kf_file(fr) in known]
-    if focal is None:
-        return CameraPrior(w, h, existing_id=same[-1] if same else None)
-    return CameraPrior(w, h, focal=focal, same_focal_ids=tuple(dict.fromkeys(reversed(same))))
 
 
 def _pairs(reader: store.MapReader, queries: list[_Query], db: dict[str, _DbImage],
@@ -285,7 +277,8 @@ def query_descriptors(queries: Sequence[_Query], client: Any) -> NDArray[np.floa
 
 @dataclass
 class _Match:
-    """Verified inlier matches of a query with one keyframe (keypoint indices and pixels)."""
+    """Verified inlier matches of a query with one keyframe (keypoint indices and pixels; for a
+    camera with distortion, where its pinhole sees them: ``panorama.PairMatches``)."""
 
     keyframe: str  # database image name
     idx_q: NDArray[np.int64]
@@ -300,18 +293,22 @@ def _query_matches(db_path: Path, queries: list[_Query], db: dict[str, _DbImage]
     keeping the keypoint indices."""
     import pycolmap
 
-    from oh_my_slam.mapping.panorama import USED_CONFIGS
+    from oh_my_slam.mapping.panorama import USED_CONFIGS, distorted, pinhole_pixels
 
     names = {v.image_id: k for k, v in db.items()}
     qset = {q.name for q in queries}
     out: dict[str, list[_Match]] = {q.name: [] for q in queries}
     d = pycolmap.Database.open(str(db_path))
     try:
+        cameras = {c.camera_id: c for c in d.read_all_cameras()}
         kps: dict[int, NDArray[np.float64]] = {}
 
         def keypoints(i: int) -> NDArray[np.float64]:
+            """The image's keypoints, where its camera's pinhole sees them."""
             if i not in kps:
-                kps[i] = np.asarray(d.read_keypoints(i), np.float64)[:, :2]
+                px = np.asarray(d.read_keypoints(i), np.float64)[:, :2]
+                cam = cameras[db[names[i]].camera_id]
+                kps[i] = pinhole_pixels(cam, px) if distorted(cam) else px
             return kps[i]
 
         pair_ids, geoms = d.read_two_view_geometries()
@@ -414,7 +411,8 @@ class _MapPoints:
             ratio = None
             if model is not None and int(model[1].sum()) >= DEPTH_SCALE_MIN_POINTS:
                 xyz, has, uv = model
-                d_xyz, d_ok = self._depth_points(fr, uv[has])
+                at = fr.K.rays(uv[has]) * [fr.K.fx, fr.K.fy] + [fr.K.cx, fr.K.cy]
+                d_xyz, d_ok = self._depth_points(fr, at)
                 z_model = ((xyz[has] - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
                 z_depth = ((d_xyz - fr.T_map_cam.t) @ fr.T_map_cam.R)[:, 2]
                 both = d_ok & (z_model > 0) & (z_depth > 0)
@@ -465,15 +463,19 @@ class _MapPoints:
 def depth_points(depth: NDArray[Any], valid: NDArray[Any], fr: store.FrameRecord,
                  uv: NDArray[Any]) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     """Map points of full-resolution keypoints ``uv`` of keyframe ``fr`` from its stored depth
-    grid (nearest cell), unprojected with its full-resolution intrinsics and stored pose."""
+    grid (nearest cell; none beyond it), unprojected with its full-resolution intrinsics and
+    stored pose. ``uv`` is where the camera's pinhole at its own focal length sees the keypoints
+    (``panorama.pinhole_pixels``); the grid is its undistorted image's (``Intrinsics.pinhole``)."""
     gh, gw = depth.shape
-    col = np.clip((uv[:, 0] * gw / fr.width).astype(int), 0, gw - 1)
-    row = np.clip((uv[:, 1] * gh / fr.height).astype(int), 0, gh - 1)
+    K, P = fr.K, fr.K.pinhole()
+    at = (uv - [K.cx, K.cy]) / [K.fx, K.fy] * [P.fx, P.fy] + [P.cx, P.cy]
+    col = np.floor(at[:, 0] * gw / fr.width).astype(int)
+    row = np.floor(at[:, 1] * gh / fr.height).astype(int)
+    inside = (col >= 0) & (col < gw) & (row >= 0) & (row < gh)
+    col, row = np.clip(col, 0, gw - 1), np.clip(row, 0, gh - 1)
     z = np.asarray(depth, np.float64)[row, col]
-    ok = np.asarray(valid, bool)[row, col] & (z > 0)
-    K = fr.K
-    cam = np.column_stack([(uv[:, 0] - K.cx) / K.fx * z, (uv[:, 1] - K.cy) / K.fy * z, z])
-    return fr.T_map_cam.apply(cam), ok
+    ok = inside & np.asarray(valid, bool)[row, col] & (z > 0)
+    return fr.T_map_cam.apply(unproject_pixels(uv[:, 0], uv[:, 1], z, K.K())), ok
 
 
 def correspondences(matches: list[_Match], points: _MapPoints, depth: bool = True
@@ -499,7 +501,9 @@ def correspondences(matches: list[_Match], points: _MapPoints, depth: bool = Tru
 def solve_pose(uv: NDArray[Any], xyz: NDArray[Any], K: Intrinsics, refine_focal: bool
                ) -> tuple[Pose, Intrinsics, int] | None:
     """LO-RANSAC absolute pose + refinement: (``T_map_cam``, intrinsics, inliers), or None. With
-    ``refine_focal`` the focal length is estimated too (``K`` is only the starting point)."""
+    ``refine_focal`` the focal length is estimated too (``K`` is only the starting point), else
+    the intrinsics are ``K``'s, with its distortion (``uv`` is where its pinhole sees the
+    keypoints)."""
     import pycolmap
 
     if len(uv) < 4:
@@ -524,7 +528,8 @@ def solve_pose(uv: NDArray[Any], xyz: NDArray[Any], K: Intrinsics, refine_focal:
     T[:3, :] = np.asarray(res["cam_from_world"].matrix())
     Kc = np.asarray(cam.calibration_matrix())
     intr = Intrinsics(float(Kc[0, 0]), float(Kc[1, 1]), float(Kc[0, 2]), float(Kc[1, 2]),
-                      K.width, K.height, "colmap" if refine_focal else K.source)
+                      K.width, K.height, "colmap" if refine_focal else K.source,
+                      0.0 if refine_focal else K.k)
     return Pose.from_matrix(np.linalg.inv(T)), intr, int(res["num_inliers"])
 
 
@@ -591,7 +596,7 @@ def epipolar_gate(T: Pose, K: Intrinsics, matches: list[_Match], points: _MapPoi
                   ) -> tuple[Pose, float, bool]:
     """(pose, median epipolar distance, accepted) of a located pose judged against its verified
     matches to the stored keyframe poses (``match_residual_deg``, ``MAX_EPIPOLAR_DEG`` from
-    ``EPIPOLAR_MIN_MATCHES`` matches). Seen from the keyframes' spot (``rotation_dominant``), a
+    ``EPIPOLAR_MIN_MATCHES`` matches). Seen from the keyframes' spot (``_viewpoint``), a
     few centimetres of centre error — the depth's scale error — become tenths of a degree of
     epipolar distance: a pose above the limit is refined against the keyframe poses
     (``refine_to_keyframes``), and the refined pose is accepted only within the bounds of that
@@ -624,13 +629,10 @@ def count_inliers(T: Pose, K: Intrinsics, uv: NDArray[Any], xyz: NDArray[Any],
                   max_error_px: float = POSE_MAX_ERROR_PX) -> int:
     """2D-3D correspondences the camera ``T`` (camera-to-map), ``K`` reprojects within
     ``max_error_px``."""
-    c = (np.asarray(xyz, np.float64).reshape(-1, 3) - T.t) @ T.R
-    z = c[:, 2]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        u = K.fx * c[:, 0] / z + K.cx
-        v = K.fy * c[:, 1] / z + K.cy
-    err = np.hypot(u - np.asarray(uv)[:, 0], v - np.asarray(uv)[:, 1])
-    return int(np.sum((z > 0) & (err <= max_error_px)))
+    proj, z = project((np.asarray(xyz, np.float64).reshape(-1, 3) - T.t) @ T.R, K.K())
+    err = np.hypot(proj[:, 0] - np.asarray(uv)[:, 0], proj[:, 1] - np.asarray(uv)[:, 1])
+    with np.errstate(invalid="ignore"):
+        return int(np.sum((z > 0) & (err <= max_error_px)))
 
 
 def _rot_deg(A: NDArray[Any], B: NDArray[Any]) -> float:
@@ -638,8 +640,12 @@ def _rot_deg(A: NDArray[Any], B: NDArray[Any]) -> float:
 
 
 def _viewpoint(T: Pose, matches: list[_Match], points: _MapPoints) -> tuple[bool, float]:
-    """(``rotation_dominant``, median scene depth of the matched keyframes in metres, by match
-    count)."""
+    """(rotation dominant, median scene depth of the matched keyframes in metres, by match count).
+
+    Rotation dominant: the located camera sees the map from (almost) the same spot as the
+    keyframes it matches, by match count — most matches are with multi-view keyframes (a map of a
+    camera turning in place), or the median baseline to the matched keyframes is below
+    ``ROTATION_BASELINE`` of their median scene depth."""
     w, mv, ratio, depth = [], 0, [], []
     for m in matches:
         fr = points.frames.get(m.keyframe)
@@ -657,14 +663,6 @@ def _viewpoint(T: Pose, matches: list[_Match], points: _MapPoints) -> tuple[bool
         return False, float("inf")
     z_med = float(np.median(np.repeat(depth, w)))
     return 2 * mv > sum(w) or float(np.median(np.repeat(ratio, w))) < ROTATION_BASELINE, z_med
-
-
-def rotation_dominant(T: Pose, matches: list[_Match], points: _MapPoints) -> bool:
-    """Whether the located camera sees the map from (almost) the same spot as the keyframes it
-    matches, by match count: most matches are with multi-view keyframes (a map of a camera
-    turning in place), or the median baseline to the matched keyframes is below
-    ``ROTATION_BASELINE`` of their median scene depth."""
-    return _viewpoint(T, matches, points)[0]
 
 
 def _signed_epipolar_deg(R: NDArray[Any], C: NDArray[Any], K: Intrinsics, fr: store.FrameRecord,
@@ -789,20 +787,25 @@ def pose_comment(r: Located) -> str:
 
 def visible_points(xyz: NDArray[Any], cams: Sequence[tuple[Pose, Intrinsics]]) -> NDArray[np.bool_]:
     """Points seen by any of the cameras (``T_map_cam``, full-resolution intrinsics): in the
-    frustum and not hidden behind nearer points (coarse z-buffer, ``VIS_*``)."""
+    frustum and not hidden behind nearer points (coarse z-buffer, ``VIS_*``). A lens with
+    distortion is judged on its undistorted image (``Intrinsics.pinhole``, which holds the whole
+    lens): a point is in view where the lens shows it inside the image."""
     xyz = np.asarray(xyz).reshape(-1, 3)
     keep = np.zeros(len(xyz), bool)
     for T, K in cams:
         s = VIS_GRID_SIDE / max(K.width, K.height)
         gw, gh = max(1, int(np.ceil(K.width * s))), max(1, int(np.ceil(K.height * s)))
 
-        def project(sl: slice, T: Pose = T, K: Intrinsics = K, s: float = s, gw: int = gw,
-                    gh: int = gh) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
-            c = (np.asarray(xyz[sl], np.float64) - T.t) @ T.R  # map -> camera
-            z = c[:, 2]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                u, v = K.fx * c[:, 0] / z + K.cx, K.fy * c[:, 1] / z + K.cy
-            inside = (z > VIS_NEAR) & (u >= 0) & (u < K.width) & (v >= 0) & (v < K.height)
+        def cells(sl: slice, T: Pose = T, K: Intrinsics = K, s: float = s, gw: int = gw,
+                  gh: int = gh) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+            pin = K.pinhole()
+            uv, z = project((np.asarray(xyz[sl], np.float64) - T.t) @ T.R, pin.K())
+            u, v = uv[:, 0], uv[:, 1]
+            img = K.image_pixels(np.nan_to_num(uv))  # where the lens shows them (itself: none)
+            with np.errstate(invalid="ignore"):
+                inside = ((z > VIS_NEAR) & (u >= 0) & (u < K.width) & (v >= 0) & (v < K.height)
+                          & (img[:, 0] >= 0) & (img[:, 0] < K.width) & (img[:, 1] >= 0)
+                          & (img[:, 1] < K.height))
             cell = np.full(len(z), -1, np.int64)
             cell[inside] = (np.minimum((v[inside] * s).astype(np.int64), gh - 1) * gw
                             + np.minimum((u[inside] * s).astype(np.int64), gw - 1))
@@ -811,12 +814,12 @@ def visible_points(xyz: NDArray[Any], cams: Sequence[tuple[Pose, Intrinsics]]) -
         zmin = np.full(gw * gh, np.inf)
         chunks = [slice(i, i + VIS_CHUNK) for i in range(0, len(xyz), VIS_CHUNK)]
         for sl in chunks:
-            cell, z = project(sl)
+            cell, z = cells(sl)
             ok = cell >= 0
             np.minimum.at(zmin, cell[ok], z[ok])
         zmin = _min3x3(zmin.reshape(gh, gw)).reshape(-1)
         for sl in chunks:
-            cell, z = project(sl)
+            cell, z = cells(sl)
             ok = cell >= 0
             vis = np.zeros(len(z), bool)
             vis[ok] = z[ok] <= zmin[cell[ok]] * (1.0 + VIS_REL_TOL)
@@ -840,7 +843,7 @@ def ply_payload(reader: store.MapReader, results: Sequence[Located], mode: str,
     """``-f ply``: the map points visible from the located cameras (single) or the whole map cloud
     (full), with one header line per input image (``pose_comment``)."""
     from oh_my_slam.mapping import export
-    from oh_my_slam.segmentation.cloud import cloud_ply
+    from oh_my_slam.reconstruction.cloud import cloud_ply
 
     _, objs = export.map_objects(reader)
     cloud = export.map_cloud(reader)

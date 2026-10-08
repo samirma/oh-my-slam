@@ -83,7 +83,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     d = json.loads(json.dumps(spec.describe()))
     ops = {o["id"]: o for o in d["operations"]}
     assert set(ops) == {"reconstruct.sh", "mapper.sh update", "mapper.sh locate",
-                        "segment.sh -i", "view.sh -i", "view.sh -m"}
+                        "segment.sh", "view.sh -i", "view.sh -m"}
     for program in spec.PROGRAMS:
         leaves = _leaf_parsers(CLIS[program.prog].build_parser())
         for cmd in program.commands:
@@ -102,7 +102,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                 codes = {e["code"] for e in op["errors"]}
                 assert "usage" in codes
                 assert ("server_unavailable" in codes) == (op["inference"] != "never"), op["id"]
-    seg_i = {x["name"]: x for x in ops["segment.sh -i"]["parameters"]}
+    seg_i = {x["name"]: x for x in ops["segment.sh"]["parameters"]}
     assert seg_i["min_score"]["default"] == 0.5 and seg_i["min_score"]["finite"] is True
     assert seg_i["min_score"]["applies"] == [] and seg_i["min_score"]["applies_text"] == ""
     assert seg_i["format"]["choices"] == ["json", "png"] and seg_i["format"]["default"] == "json"
@@ -124,7 +124,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     depth = by_format["png"]
     assert depth["when"] == [{"option": "format", "in": ["depth"]}] and not depth["object_regions"]
     assert depth["media_type"] == "image/png" and "16-bit" in depth["text"]
-    seg_out = [o for o in ops["segment.sh -i"]["outputs"] if o["via"] == "stdout"]
+    seg_out = [o for o in ops["segment.sh"]["outputs"] if o["via"] == "stdout"]
     assert [(o["format"], o["when"], o["object_regions"]) for o in seg_out] == [
         ("json", [{"option": "format", "in": ["json"]}], False),
         ("png", [{"option": "format", "in": ["png"]}], True)]
@@ -134,7 +134,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     (video,) = update["fps"]["applies"]
     assert video["option"] == "inputs" and video["is"] == "video" and ".mp4" in video["suffixes"]
     assert set(video["suffixes"]) <= set(update["inputs"]["accepts"])
-    seg_d = {o["name"]: o for o in ops["segment.sh -i"]["outputs"]}
+    seg_d = {o["name"]: o for o in ops["segment.sh"]["outputs"]}
     assert seg_d["segmented.png"]["object_regions"] and not seg_d["catalog.csv"]["object_regions"]
     assert update["inputs"]["ordered"] is True and ".mp4" in update["inputs"]["accepts"]
     assert update["map"]["must_exist"] is False
@@ -143,7 +143,7 @@ def test_describe_covers_every_option_of_every_parser() -> None:
 
     assert ops["mapper.sh locate"]["inference_condition"] == {
         "map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
-    assert {o["name"] for o in ops["segment.sh -i"]["outputs"]} == {
+    assert {o["name"] for o in ops["segment.sh"]["outputs"]} == {
         "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"}
     assert {"code": "interrupted", "exit_code": 130, "http_status": 499} in d["exit_codes"]
 
@@ -229,8 +229,8 @@ def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
     assert args == cli and args.output == Path("-odd.png")
     rec = R.command()
     args = spec.parse(rec, rec.modes[0], {"image": "a.jpg", "format": "ply",
-                                          "attrs": ["voxel=0.1", "normals=on"]})
-    assert args.attrs == ["voxel=0.1", "normals=on"]
+                                          "attrs": "voxel=0.1,normals=on"})
+    assert args.attrs == "voxel=0.1,normals=on"
     with pytest.raises(UsageError, match=re.escape(
             "argument -f: invalid choice: 'ply' (choose from json, png)")):
         spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "ply"})
@@ -239,7 +239,7 @@ def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
     with pytest.raises(UsageError, match="the following arguments are required: -i"):
         spec.parse(seg, spec.SEGMENT_IMAGE, {"format": "png"})
     with pytest.raises(UsageError, match=re.escape(
-            "unrecognized parameters for segment.sh -i: attrs, map")):
+            "unrecognized parameters for segment.sh: attrs, map")):
         spec.parse(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "map": "m", "attrs": "voxel=1"})
     up = M.command("update")
     args = spec.parse(up, up.modes[0], {"inputs": ["a.jpg", "b.jpg"], "map": "m", "fps": 2.0})
@@ -253,8 +253,13 @@ def test_parameters_parse_through_the_commands_parser(tmp_path: Path) -> None:
 
 
 def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
+    from PIL import Image
+
     img = tmp_path / "a.jpg"
-    img.write_bytes(b"x")
+    Image.new("RGB", (4, 4)).save(img)
+    notes, bad = tmp_path / "notes.txt", tmp_path / "bad.jpg"
+    notes.write_text("x")
+    bad.write_bytes(b"x")
     (tmp_path / "other").mkdir()
     (tmp_path / "other" / "f").write_text("x")
     other = str(tmp_path / "other")
@@ -280,6 +285,11 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
         (S, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (V, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
         (V, ["-m", other], NotAMapError, "not a map folder"),
+        # -i is an image of an accepted suffix that can be read, for every command that takes one
+        *[(prog, ["-i", str(notes)], InputError,
+           f"unsupported input (not an image): {notes}; -i takes .bmp, .jpeg, .jpg, .png, "
+           ".tif, .tiff, .webp") for prog in (R, S, V)],
+        *[(prog, ["-i", str(bad)], InputError, f"cannot read image {bad}") for prog in (R, S, V)],
     ]
     for program, argv, exc, message in cases:
         with pytest.raises(exc, match=re.escape(message)):
@@ -356,12 +366,17 @@ def test_a_dry_run_reports_every_problem_per_parameter_and_changes_nothing(
     assert not (tmp_path / "new").exists()  # the -d folder is only checked
     afile = tmp_path / "afile"
     afile.write_text("x")
-    (p,) = spec.dry_run(seg, spec.SEGMENT_IMAGE, {"image": afile, "artifacts": afile})
+    (p,) = spec.dry_run(seg, spec.SEGMENT_IMAGE, {"image": afile})
+    assert p.message.startswith(f"unsupported input (not an image): {afile}")
+    from PIL import Image
+
+    Image.new("RGB", (4, 4)).save(img := tmp_path / "a.png")
+    (p,) = spec.dry_run(seg, spec.SEGMENT_IMAGE, {"image": img, "artifacts": afile})
     assert p.message == f"-d {afile}: cannot write there (File exists)"
     # argparse's problems and the rules' together, per field
     up = M.command("update")
     found = spec.dry_run(up, up.modes[0], {"inputs": [tmp_path / "none.jpg"], "map": afile,
-                                           "format": "xml", "fps": "abc", "attrs": ["voxel=1"]})
+                                           "format": "xml", "fps": "abc", "attrs": "voxel=1"})
     assert spec.by_parameter(found) == {
         "format": ["argument -f: invalid choice: 'xml' (choose from json, ply)"],
         "fps": ["argument -fps: invalid float value: 'abc'"],

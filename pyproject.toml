@@ -18,6 +18,7 @@ dependencies = [
     "pycolmap==4.2.*",
     # inference server
     "fastapi>=0.115",
+    "starlette>=1.7",  # also imported directly by the web service (server.sh)
     "uvicorn>=0.34",
     "httpx>=0.28",
     "pydantic>=2.10",
@@ -132,14 +133,14 @@ root_package = "oh_my_slam"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layered ownership: cli | web > commands > tools > viewer > mapping > segmentation > reconstruction > client > schema > core"
+name = "Layered ownership: cli | web | tools > commands > viewer > mapping > segmentation > reconstruction > client > schema > core"
 type = "layers"
 layers = [
-    # the command line and the web service (spec §2.6) are independent siblings over the
-    # commands' shared definitions
-    "oh_my_slam.cli | (oh_my_slam.web)",
+    # the command line, the web service (spec §2.6) and the evaluators (spec §5) are independent
+    # siblings over the commands' shared definitions: the evaluators run the commands and the
+    # service as their users do, and derive what they compare from the same definitions
+    "oh_my_slam.cli | (oh_my_slam.web) | oh_my_slam.tools",
     "oh_my_slam.commands",
-    "oh_my_slam.tools",
     "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
@@ -218,10 +219,17 @@ source_modules = [
 forbidden_modules = ["torch", "ultralytics", "moge", "geocalib", "mapanything", "transformers"]
 
 [[tool.importlinter.contracts]]
-name = "Reconstruction never touches segmentation"
+name = "Reconstruction never touches segmentation: the cloud derivation gets point labels and colours as data"
 type = "forbidden"
 source_modules = ["oh_my_slam.reconstruction"]
 forbidden_modules = ["oh_my_slam.segmentation", "oh_my_slam.mapping"]
+
+[[tool.importlinter.contracts]]
+name = "Reconstruction alone derives and writes the emitted point clouds (reconstruction.cloud): segmentation writes no PLY"
+type = "forbidden"
+source_modules = ["oh_my_slam.segmentation"]
+forbidden_modules = ["oh_my_slam.core.ply"]
+allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Mapping and viewer never talk to the inference server: depth through reconstruction, detections through segmentation"
@@ -231,9 +239,9 @@ forbidden_modules = ["oh_my_slam.client"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
-name = "Segmentation alone detects, lifts, fits OBBs and assigns colours: mapping and viewer use it through its API"
+name = "Segmentation alone detects, lifts, fits OBBs and assigns colours: mapping, viewer and the command line use it through its API"
 type = "forbidden"
-source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
+source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer", "oh_my_slam.cli"]
 forbidden_modules = [
     "oh_my_slam.segmentation.detect",
     "oh_my_slam.segmentation.lift",

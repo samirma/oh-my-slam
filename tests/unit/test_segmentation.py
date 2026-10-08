@@ -17,20 +17,20 @@ from oh_my_slam.core.images import load_png
 from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.api import reconstruct_image
+from oh_my_slam.reconstruction.cloud import derive_cloud
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import detect
 from oh_my_slam.segmentation.api import (
+    OBB,
+    SceneObject,
+    image_cloud_source,
+    map_cloud_source,
     pixel_owners,
     reconstruct_and_detect,
     segment_frame,
 )
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES, write_artifacts
 from oh_my_slam.segmentation.catalog import CSV_HEADER, catalog_csv, catalog_md
-from oh_my_slam.segmentation.cloud import (
-    derive_cloud,
-    image_cloud_source,
-    map_cloud_source,
-)
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, segment_colors
 from oh_my_slam.segmentation.render import segmented_image, segmented_png
 from oh_my_slam.segmentation.scene import single_image_scene
@@ -72,12 +72,72 @@ def test_detect_filters_and_orders(synth) -> None:  # type: ignore[no-untyped-de
     assert {d.label for d in hi} <= {"cabinet"}
 
 
+def test_detect_shows_the_prompts_and_reports_the_labels(tmp_path: Path) -> None:
+    """The detector is asked for each label's prompt ('mouse' for 'computer mouse'), never for
+    the label it replaces, and its detections are reported under the label."""
+    m = np.zeros((48, 64), bool)
+    m[10:30, 10:40] = True
+    inst = [FakeInstance("mouse", 0.8, m), FakeInstance("computer mouse", 0.95, m),
+            FakeInstance("tv", 0.7, ~m)]
+    client = FakeClient()
+    img = client.add(tmp_path / "desk.png", np.zeros((48, 64, 3), np.uint8),
+                     FakeFrame(np.ones((48, 64), np.float32), Intrinsics(50, 50, 32, 24, 64, 48),
+                               np.array([0.0, -1.0, 0.0]), inst))
+    dets = detect.detect(img, client=client)  # type: ignore[arg-type]
+    assert [(d.label, d.score) for d in dets] == [("computer mouse", 0.8), ("tv", 0.7)]
+
+
+class BoxDetector:
+    """A detector reporting fixed (label, score, box) rectangles on a 100 x 60 image."""
+
+    def __init__(self, dets: list[tuple[str, float, tuple[int, int, int, int]]]) -> None:
+        self.dets = dets
+
+    def segment_image(self, req):  # type: ignore[no-untyped-def]
+        from oh_my_slam.client import protocol as p
+        from oh_my_slam.core import rle
+
+        inst = []
+        for label, score, (x0, y0, x1, y1) in self.dets:
+            m = np.zeros((60, 100), bool)
+            m[y0:y1, x0:x1] = True
+            inst.append(p.Instance(label=label, score=score, source="yoloe",
+                                   box_xyxy=[x0, y0, x1, y1], mask=rle.encode(m)))
+        return p.SegmentResponse(width=100, height=60, instances=inst)
+
+
+def test_edge_on_screens_are_dropped(tmp_path: Path) -> None:
+    """A 'tv' or 'computer monitor' box narrower than half its height is no screen (a picture
+    frame seen edge-on), unless the image's left or right border cuts it; other classes and
+    wider screens are kept."""
+    img = tmp_path / "shelf.png"
+    Image.new("RGB", (100, 60)).save(img)
+    client = BoxDetector([("tv", 0.9, (40, 5, 55, 55)), ("tv", 0.8, (0, 5, 15, 55)),
+                          ("tv", 0.7, (85, 5, 100, 55)), ("computer monitor", 0.65, (60, 10, 70, 50)),
+                          ("chair", 0.6, (20, 5, 30, 55)), ("tv", 0.55, (20, 0, 80, 4))])
+    dets = detect.detect(img, client=client, max_side=100)  # type: ignore[arg-type]
+    assert [(d.label, d.score) for d in dets] == [("tv", 0.8), ("tv", 0.7), ("chair", 0.6),
+                                                  ("tv", 0.55)]
+    assert detect.edge_on_screen("tv", (40, 5, 55, 55), 100)
+    assert not detect.edge_on_screen("tv", (40, 5, 66, 55), 100)  # just wide enough
+    assert not detect.edge_on_screen("person", (40, 5, 55, 55), 100)
+
+
 def test_vocabulary_and_label_rules() -> None:
     vocab = detect.default_vocabulary()
     assert 250 <= len(vocab) <= 320 and len(set(vocab)) == len(vocab)
-    for needed in ("chair", "dining table", "person", "potted plant", "bottle", "television",
-                   "sofa", "coffee table", "door", "window", "balcony", "street light"):
+    for needed in ("chair", "dining table", "person", "potted plant", "bottle", "tv",
+                   "computer monitor", "computer mouse", "microwave oven", "sofa", "coffee table",
+                   "door", "window", "balcony", "street light"):
         assert needed in vocab
+    # the detector is shown the wording it scores highest; detections keep the label
+    prompts = detect.default_prompts()
+    assert len(prompts) == len(vocab) and len(set(prompts)) == len(prompts)
+    aliases = {(v, q) for v, q in zip(vocab, prompts, strict=True) if v != q}
+    assert aliases == {("computer mouse", "mouse"), ("microwave oven", "microwave")}
+    assert not {q for _, q in aliases} & set(vocab)  # a prompt never names another label
+    assert detect.label_of(" Mouse") == "computer mouse" and detect.label_of("tv") == "tv"
+    assert detect.label_of("Dining_Table") == "dining table"  # not a prompt: itself
     assert detect.normalize_label("  Dining_Table ") == "dining table"
     assert detect.compatible("sofa", "couch") and not detect.compatible("sofa", "person")
     # a pile of magazines is a book in some keyframes and a magazine in others
@@ -106,7 +166,7 @@ def test_segment_frame_objects(synth) -> None:  # type: ignore[no-untyped-def]
     # exclusive masks: every labelled pixel belongs to exactly one object
     for o in seg.objects:
         assert o.pixel_count == int((seg.label_map == o.id).sum())
-        assert o.point_count == len(seg.points[o.id])
+        assert o.point_count == len(seg.point_pixels[o.id])
     cloud = derive_cloud(image_cloud_source(frame, seg), CloudAttrs(color="segment", label=True))
     assert cloud.label is not None and cloud.rgb is not None
     for o in seg.objects:  # colour contract: the object colour on exactly its lifted points
@@ -191,7 +251,7 @@ def _objects(client: FakeClient, img: Path, min_score: float, via_cli_path: bool
     pixels = {o.id: np.flatnonzero(seg.label_map == o.id).tolist() for o in seg.objects}
     return {o.id: (o.label, o.score, o.color, o.obb.center.tolist(), o.obb.size.tolist(),
                    o.obb.R.tolist(), o.pixel_count, o.point_count, pixels[o.id],
-                   seg.points[o.id].tolist()) for o in seg.objects}
+                   seg.point_pixels[o.id].tolist()) for o in seg.objects}
 
 
 def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: ignore[no-untyped-def]
@@ -222,15 +282,53 @@ def test_min_score_only_adds_or_removes_objects(overlapping) -> None:  # type: i
     assert _objects(client, img, 0.5, via_cli_path=True) == runs[0.5]  # same code, same objects
     # the server request depends on --min-score only by tier (request_floor): below the default
     # everything down to DETECTION_FLOOR, from the default up nothing below it (the objects at
-    # 0.5 are the same either way: the equality above for 0.3 vs 0.5)
+    # 0.5 are the same either way: the equality above for 0.3 vs 0.5), below DETECTION_FLOOR
+    # everything down to --min-score itself (test_min_score_below_the_detection_floor)
     assert {round(c, 4) for c in confs} == {detect.DETECTION_FLOOR, detect.TRUSTED_SCORE}
     assert detect.request_floor(0.3) == detect.DETECTION_FLOOR
     assert detect.request_floor(0.5) == detect.request_floor(0.85) == detect.TRUSTED_SCORE
-    with pytest.raises(ValueError):
+    assert detect.request_floor(0.01) == 0.01 and detect.request_floor(-1.0) == 0.0
+    with pytest.raises(ValueError):  # the default floor lies above it: those would be missing
         detect.detect(img, client=client, min_score=detect.DETECTION_FLOOR / 2)
-    # the spec bounds --min-score nowhere: below the detector's floor it keeps what the floor keeps
-    assert (_objects(client, img, detect.DETECTION_FLOOR / 2)
-            == _objects(client, img, detect.DETECTION_FLOOR))
+    with pytest.raises(ValueError):
+        detect.detect(img, client=client, min_score=0.3, floor=-0.1)
+
+
+def test_min_score_below_the_detection_floor(overlapping) -> None:  # type: ignore[no-untyped-def]
+    """Spec §2.4: --min-score drops the detections below it and only those, also below
+    DETECTION_FLOOR (0.05): the detector is then asked for every score down to --min-score
+    itself (0 at least). The detections below the floor claim pixels last, highest score first,
+    so the objects at 0.05 keep their ids, colours, pixels and points."""
+    client, img = overlapping
+    frame = client.frames[str(img.resolve())]
+    shape = frame.depth.shape
+    vase = np.zeros(shape, bool)
+    vase[180:220, 230:290] = True  # floor that no other detection covers
+    cup = np.zeros(shape, bool)
+    cup[130:150, 10:30] = True  # inside the 0.45 'chair' blob
+    frame.instances += [FakeInstance("vase", 0.02, vase), FakeInstance("cup", 0.03, cup)]
+    confs: list[float] = []
+    real = client.segment_image
+
+    def spy(req):  # type: ignore[no-untyped-def]
+        confs.append(req.conf)
+        return real(req)
+
+    client.segment_image = spy  # type: ignore[method-assign]
+    floor = _objects(client, img, detect.DETECTION_FLOOR)
+    low = _objects(client, img, 0.01)
+    assert confs[-1] == pytest.approx(0.01, abs=1e-5)  # asked down to --min-score
+    assert {oid: low[oid] for oid in floor} == floor  # same ids, colours, OBBs, pixels, points
+    assert [v[0] for v in low.values()][len(floor):] == ["vase"]  # the cup has no pixel left
+    assert _objects(client, img, 0.025) == floor  # 0.02 is below it: dropped
+    everything = _objects(client, img, -1.0)
+    assert everything == low and confs[-1] == 0.0  # every score the detector gives
+    # below the floor the higher score claims first, whatever the mask sizes
+    rug = detect.Detection("rug", 0.03, "yoloe", _rect(0, 10, 0, 10), (0, 0, 10, 10))
+    plate = detect.Detection("plate", 0.02, "yoloe", _rect(2, 4, 2, 4), (2, 2, 4, 4))
+    assert [m.sum() for m in exclusive_masks([plate, rug], (10, 10))] == [0, 100]
+    table = detect.Detection("table", 0.3, "yoloe", _rect(0, 10, 0, 10), (0, 0, 10, 10))
+    assert [m.sum() for m in exclusive_masks([plate, table], (10, 10))] == [0, 100]
 
 
 def test_low_scoring_detections_never_change_the_default_objects(overlapping) -> None:  # type: ignore[no-untyped-def]
@@ -253,7 +351,7 @@ def test_low_scoring_detections_never_change_the_default_objects(overlapping) ->
         seg = segment_frame(frame, client=client, detections=detections, min_score=min_score)
         return {o.id: (o.label, o.score, o.color, o.obb.center.tolist(), o.obb.size.tolist(),
                        np.flatnonzero(seg.label_map == o.id).tolist(),
-                       seg.points[o.id].tolist()) for o in seg.objects}
+                       seg.point_pixels[o.id].tolist()) for o in seg.objects}
 
     plain = signature(dets, 0.5)
     assert plain and signature(dets + low, 0.5) == plain
@@ -359,6 +457,31 @@ def test_small_images_take_one_detection_pass(tmp_path: Path) -> None:
     assert [d.label for d in dets] == ["cup", "window"] and dets[0].mask.shape == (480, 640)
 
 
+class ScreenDetector(PassDetector):
+    """Two narrow 'tv' boxes (0.375 as wide as tall): the fine pass's ends inside the image, the
+    coarse pass's is cut by the right border of the image the detector was shown."""
+
+    FINE = (("tv", 0.8, (0.75, 0.1, 0.9, 0.9)),)  # type: ignore[assignment]
+    COARSE = (("tv", 0.7, (0.85, 0.1, 1.0, 0.9)),)  # type: ignore[assignment]
+
+
+def test_the_edge_on_rule_measures_the_pass_image(tmp_path: Path) -> None:
+    """The edge-on screen rule compares a box with the width of the pass image it lies on (1024
+    or 768 px), neither the input's (2000 px) nor the caller's grid: on either grid the coarse
+    pass's border-cut 'tv' is kept and the fine pass's dropped."""
+    from oh_my_slam.core.images import size_at_max_side
+
+    img = tmp_path / "wall.png"
+    Image.new("RGB", (2000, 1000)).save(img)
+    for side in (detect.DETECT_SIDE, detect.COARSE_SIDE):  # segment.sh's grid, the mapper's
+        client = ScreenDetector((2000, 1000))
+        dets = detect.detect(img, client=client, max_side=side)  # type: ignore[arg-type]
+        assert [r[0] for r in client.requests] == [detect.DETECT_SIDE, detect.COARSE_SIDE]
+        assert [(d.label, d.score) for d in dets] == [("tv", 0.7)]
+        gw, gh = size_at_max_side(2000, 1000, side)
+        assert dets[0].box == pytest.approx((0.85 * gw, 0.1 * gh, gw, 0.9 * gh))
+
+
 def test_fuse_passes_and_resample_mask() -> None:
     a = detect.Detection("window", 0.51, "yoloe", _rect(0, 6, 0, 10), (0, 0, 10, 6))
     b = detect.Detection("window", 0.7, "yoloe", _rect(0, 4, 0, 10), (0, 0, 10, 4))  # IoU 0.67
@@ -392,7 +515,7 @@ def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  #
     assert csv_text.splitlines()[0] == ",".join(CSV_HEADER)
     rows = list(csv.DictReader(io.StringIO(csv_text)))
     assert [int(r["id"]) for r in rows] == [o.id for o in seg.objects]
-    md_text = catalog_md(seg.objects)
+    md_text = catalog_md(seg.objects, "Objects in room.png")
     vols = [float(line.split("|")[9]) for line in md_text.splitlines() if line.startswith("| <span")]
     assert vols == sorted(vols, reverse=True)
 
@@ -405,16 +528,31 @@ def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  #
     payload = json_payload_bytes(scene)
     out = tmp_path / "out"
     png_payload = segmented_png(frame.rgb, seg.label_map)
-    files = write_artifacts(out, payload, png_payload, seg.objects, "t")
+    write_artifacts(out, payload, png_payload, seg.objects, "t")
     assert sorted(p.name for p in out.iterdir()) == sorted(ARTIFACT_NAMES)
-    assert [f.name for f in files] == list(ARTIFACT_NAMES) == [
+    assert list(ARTIFACT_NAMES) == [
         "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"]
+    assert (out / "catalog.md").read_text().startswith("# t\n")
     assert (out / "segmentation.json").read_bytes() == payload
     assert json.loads(payload)["openlabel"]["objects"]
     assert (out / "segmented.png").read_bytes() == png_payload  # the bytes of -f png
     img_back = load_png(out / "segmented.png")
     np.testing.assert_array_equal(img_back, png)
     assert "icc_profile" not in Image.open(out / "segmented.png").info
+
+
+def test_catalogue_md_orders_tiny_objects_by_their_volume() -> None:
+    """catalog.md is ordered by the unrounded volume, then id: objects under 5e-5 m³, all
+    printed as 0.0000, still come by descending volume."""
+    def obj(oid: int, size: tuple[float, float, float]) -> SceneObject:
+        return SceneObject(oid, "pen", 0.8, OBB(np.zeros(3), np.eye(3), np.array(size)), 10, 5)
+
+    objs = [obj(1, (0.01, 0.01, 0.02)), obj(2, (0.02, 0.04, 0.06)), obj(3, (0.5, 0.5, 0.5)),
+            obj(4, (0.01, 0.01, 0.02))]  # 2e-6, 4.8e-5, 0.125 and 2e-6 m³
+    rows = [line.split("|") for line in catalog_md(objs, "t").splitlines()
+            if line.startswith("| <span")]
+    assert [int(r[2]) for r in rows] == [3, 2, 1, 4]
+    assert [r[9].strip() for r in rows] == ["0.1250", "0.0000", "0.0000", "0.0000"]
 
 
 def test_map_source_keeps_only_exported_objects() -> None:

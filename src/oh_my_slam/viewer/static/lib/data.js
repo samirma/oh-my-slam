@@ -39,7 +39,7 @@ async function errorOf(res) {
   try { return (await res.json()).error || `HTTP ${res.status}`; } catch { return `HTTP ${res.status}`; }
 }
 
-// The binary document of /api/cloud (viewer/routes.py cloud_payload): uint32 LE header length J,
+// The binary document of /api/cloud (viewer/routes.py cloud_document): uint32 LE header length J,
 // the JSON header, then 4-byte aligned buffers.
 const TYPED = { float32: Float32Array, uint8: Uint8Array, int32: Int32Array };
 export function parseCloudDocument(buffer) {

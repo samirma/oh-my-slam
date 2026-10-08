@@ -3,11 +3,13 @@
 Every ``*.json`` file below the folder is discovered; its ``kind`` selects the metrics:
 
 * ``objects`` — the objects of one example image (labels, optional camera-frame cuboids), compared
-  with that image's ``segment.sh -i`` output: ``gt.objects.recall`` / ``.precision`` (and
-  ``.obb_iou_median`` when cuboids are annotated).
-* ``poses`` — per-capture yaw / pitch of ``ainex-captures``, compared with the one-update map:
-  ``gt.poses.yaw_err_median_deg`` / ``.yaw_err_max_deg`` (after the best common yaw offset) and
-  ``gt.poses.pitch_err_median_deg``.
+  with that image's ``segment.sh -i`` output (any example image: the evaluator segments the
+  annotated images it does not segment anyway, ``annotated_images``): ``gt.objects.recall`` /
+  ``.precision`` (and ``.obb_iou_median`` when cuboids are annotated).
+* ``poses`` — per-image yaw / pitch of the example sequences (``ainex-captures``, ``camera``,
+  ``office_sequence``), compared with the map of the image's sequence built in one update:
+  ``gt.poses.yaw_err_median_deg`` / ``.yaw_err_max_deg`` (after the best common yaw offset of each
+  map) and ``gt.poses.pitch_err_median_deg``.
 * ``map_update`` — what changed during ``examples/office_sequence/`` (objects that must be absent
   from the final map, where they were seen) and, optionally, which objects never changed; judged by
   ``mapupdate`` into the ``map_update.*`` metrics (``MapUpdatePlan`` below).
@@ -29,6 +31,7 @@ from oh_my_slam.segmentation.detect import compatible
 from oh_my_slam.tools.evaluate.mapquality import match_objects
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import wrap_deg
+from oh_my_slam.tools.evaluate.poses import circular_mean_deg
 from oh_my_slam.tools.evaluate.scene import DocObject, pitch_deg, yaw_deg
 from oh_my_slam.tools.evaluate.segmentation import paired_labels
 
@@ -167,6 +170,11 @@ def map_update_plan(files: list[GroundTruth], skipped: list[dict[str, str]]
         if used else None
 
 
+def annotated_images(files: list[GroundTruth]) -> list[str]:
+    """The example images (paths relative to ``examples/``) the ``objects`` files describe."""
+    return list(dict.fromkeys(f.data["image"] for f in files if f.kind == "objects"))
+
+
 def _gt_objects(data: dict[str, Any]) -> list[DocObject]:
     return [DocObject(i + 1, o["label"], None, None, None,
                       None if o.get("cuboid") is None else tuple(float(v) for v in o["cuboid"]))
@@ -182,7 +190,9 @@ def object_metrics(m: Metrics, files: list[GroundTruth], evaluated: dict[str, li
     for f in files:
         image = f.data["image"]
         if image not in evaluated:
-            skipped.append({"file": str(f.path), "reason": f"{image} was not evaluated"})
+            skipped.append({"file": str(f.path), "reason": f"{image} was not evaluated (not an "
+                                                           "example image, or segment.sh -i "
+                                                           "failed on it)"})
             continue
         gt, det = _gt_objects(f.data), evaluated[image]
         boxes_gt = [(o, b) for o in gt if (b := o.obb()) is not None]
@@ -206,9 +216,12 @@ def object_metrics(m: Metrics, files: list[GroundTruth], evaluated: dict[str, li
         m.add("gt.objects.obb_iou_median", float(np.median(ious)))
 
 
-def pose_metrics(m: Metrics, files: list[GroundTruth], poses: dict[str, Pose] | None) -> None:
-    """Per-capture annotated yaw (any zero, left positive) and pitch (up positive, from the
-    horizon) against the one-update map's poses."""
+def pose_metrics(m: Metrics, files: list[GroundTruth],
+                 maps: dict[str, dict[str, Pose] | None]) -> None:
+    """Per-image annotated yaw (any zero per sequence, left positive) and pitch (up positive,
+    from the horizon) against the poses of the one-update map that registered the image.
+    ``maps``: each example sequence's one-update map, its poses by image name (None: not built);
+    the yaw offset is fitted per map, since each has a frame of its own."""
     frames: dict[str, dict[str, Any]] = {}
     for f in files:
         frames.update(f.data["frames"])
@@ -216,23 +229,31 @@ def pose_metrics(m: Metrics, files: list[GroundTruth], poses: dict[str, Pose] | 
         return
     ids = ("gt.poses.yaw_err_median_deg", "gt.poses.yaw_err_max_deg",
            "gt.poses.pitch_err_median_deg")
-    if poses is None:
-        m.fail(ids, "the one-update map was not built")
+    built = {k: p for k, p in maps.items() if p is not None}
+    if not built:
+        m.fail(ids, "no one-update map was built")
         return
-    unregistered = "no annotated capture is registered in the map"
+    unbuilt = sorted(maps.keys() - built.keys())
+    unregistered = "no annotated capture is registered in a one-update map" + (
+        f" (not built: {', '.join(unbuilt)})" if unbuilt else "")
     yaw_truth = {n: float(v["yaw_deg"]) for n, v in frames.items() if v.get("yaw_deg") is not None}
-    yaw = [(yaw_deg(poses[n].R), g) for n, g in yaw_truth.items() if n in poses]
-    if yaw:
-        d = np.radians([e - g for e, g in yaw])
-        offset = float(np.degrees(np.angle(np.mean(np.exp(1j * d)))))
-        errs = [abs(wrap_deg(e - g - offset)) for e, g in yaw]
-        m.add(ids[0], float(np.median(errs)), {"frames": len(errs), "offset_deg": round(offset, 2)})
+    errs: list[float] = []
+    offsets: dict[str, float] = {}
+    for seq, poses in built.items():
+        yaw = [(yaw_deg(poses[n].R), g) for n, g in yaw_truth.items() if n in poses]
+        if yaw:
+            offset = circular_mean_deg([e - g for e, g in yaw])
+            errs += [abs(wrap_deg(e - g - offset)) for e, g in yaw]
+            offsets[seq] = round(offset, 2)
+    if errs:
+        m.add(ids[0], float(np.median(errs)), {"frames": len(errs), "offset_deg": offsets})
         m.add(ids[1], float(np.max(errs)))
     elif yaw_truth:
         m.fail(ids[:2], unregistered)
     pitch_truth = {n: float(v["pitch_deg"]) for n, v in frames.items()
                    if v.get("pitch_deg") is not None}
-    pitch = [abs(pitch_deg(poses[n].R) - g) for n, g in pitch_truth.items() if n in poses]
+    pitch = [abs(pitch_deg(poses[n].R) - g) for n, g in pitch_truth.items()
+             for poses in built.values() if n in poses]
     if pitch:
         m.add(ids[2], float(np.median(pitch)), {"frames": len(pitch)})
     elif pitch_truth:

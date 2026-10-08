@@ -1,4 +1,5 @@
-"""The capture file-name grammar of examples/ainex-captures (spec §5), on the real 79 names."""
+"""The capture file-name grammars of the capture sequences (spec §5), on the real names: the 79
+of examples/ainex-captures and the 27 of examples/camera."""
 
 from __future__ import annotations
 
@@ -8,14 +9,21 @@ from pathlib import Path
 import pytest
 
 from oh_my_slam.tools.evaluate.names import (
+    PanCapture,
     captures_in,
     level_siblings,
+    mid_siblings,
+    pan_captures_in,
+    pan_positions,
     parse_capture,
+    parse_pan_capture,
     same_heading_pairs,
+    tilt_pairs,
     wrap_deg,
 )
 
 SEQUENCE = Path(__file__).resolve().parents[2] / "examples" / "ainex-captures"
+CAMERA = Path(__file__).resolve().parents[2] / "examples" / "camera"
 
 
 @pytest.fixture(scope="module")
@@ -93,3 +101,68 @@ def test_same_heading_pairs_of_the_spec(captures: list) -> None:
 ])
 def test_wrap(angle: float, wrapped: float) -> None:
     assert wrap_deg(angle) == pytest.approx(wrapped)
+
+
+# -- examples/camera ---------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def pan_captures() -> list:
+    return pan_captures_in(CAMERA)
+
+
+def test_all_27_real_camera_names_parse(pan_captures: list) -> None:
+    """img_NNN_pPP_<tilt>.jpg: 9 pan positions in pan order, the three tilts of each consecutive
+    in capture order (the folder's .DS_Store, when the Finder left one, is not a frame)."""
+    assert len(pan_captures) == 27
+    assert [c.index for c in pan_captures] == list(range(7, 34))
+    groups = pan_positions(pan_captures)
+    assert list(groups) == list(range(3, 12))
+    for pan, group in groups.items():
+        assert sorted(c.tilt for c in group) == ["down", "mid", "up"], pan
+        first = group[0].index
+        assert [c.index for c in group] == [first, first + 1, first + 2], pan
+    assert [c.pan for c in pan_captures] == sorted(c.pan for c in pan_captures)
+    assert Counter(c.tilt for c in pan_captures) == {"down": 9, "mid": 9, "up": 9}
+
+
+def test_camera_name_forms() -> None:
+    assert parse_pan_capture("img_007_p03_down.jpg") == PanCapture("img_007_p03_down.jpg", 7, 3,
+                                                                   "down")
+    c = parse_pan_capture("IMG_021_P07_UP.JPEG")
+    assert (c.name, c.index, c.pan, c.tilt) == ("IMG_021_P07_UP.JPEG", 21, 7, "up")
+
+
+@pytest.mark.parametrize("name", [
+    "img_007_p03_level.jpg", "007_p03_mid.jpg", "img_7_p03_mid.jpg", "img_007_p3_mid.jpg",
+    "img_007_03_mid.jpg", "img_007_p03_mid.png", "001_bootstrap_level.jpg",
+])
+def test_camera_names_outside_the_grammar_are_refused(name: str) -> None:
+    with pytest.raises(ValueError, match="not a pan-tilt capture name"):
+        parse_pan_capture(name)
+
+
+def test_camera_hidden_files_and_non_images_are_ignored(tmp_path: Path) -> None:
+    for name in ("img_002_p01_up.jpg", "img_001_p01_mid.jpg", ".DS_Store", "notes.txt"):
+        (tmp_path / name).write_bytes(b"x")
+    assert [c.index for c in pan_captures_in(tmp_path)] == [1, 2]
+    (tmp_path / "001_bootstrap_level.jpg").write_bytes(b"x")  # the other sequence's grammar
+    with pytest.raises(ValueError, match="not a pan-tilt capture name"):
+        pan_captures_in(tmp_path)
+
+
+def test_tilted_frames_pair_with_the_mid_frame_of_their_pan_position(pan_captures: list) -> None:
+    sib = {k: v.name for k, v in mid_siblings(pan_captures).items()}
+    assert len(sib) == 18  # every up/down frame has one
+    assert sib["img_007_p03_down.jpg"] == "img_008_p03_mid.jpg"
+    assert sib["img_010_p04_up.jpg"] == "img_011_p04_mid.jpg"  # the tilts run up-mid-down here
+    assert sib["img_033_p11_up.jpg"] == "img_032_p11_mid.jpg"
+    lone = [parse_pan_capture("img_001_p01_up.jpg"), parse_pan_capture("img_002_p02_mid.jpg")]
+    assert mid_siblings(lone) == {}  # no mid frame at p01
+
+
+def test_the_tilts_of_a_pan_position_are_its_same_heading_pairs(pan_captures: list) -> None:
+    pairs = [(a.index, b.index) for a, b in tilt_pairs(pan_captures)]
+    assert len(pairs) == 27  # three per pan position
+    assert pairs[:3] == [(7, 8), (7, 9), (8, 9)]
+    assert all(a < b and b - a <= 2 for a, b in pairs)

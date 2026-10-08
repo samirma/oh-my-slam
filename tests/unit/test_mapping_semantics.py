@@ -1,8 +1,9 @@
 """Mapping semantics (spec §2.3) on rendered rooms with known poses (no SfM, no server):
 
-* the keyframes of one update are one observation — permuting them changes nothing but
-  bookkeeping (keyframe names, and the ids that follow capture order) as long as they agree; a
-  place that changed during the update is ``test_mapping_latest_wins.py``;
+* where the keyframes of one update agree they are one observation — permuting them changes
+  nothing but bookkeeping (keyframe names, and the ids that follow capture order); where they
+  contradict each other the later one wins, in input order (a place that changed during the
+  update is ``test_mapping_latest_wins.py``);
 * a later update wins over an earlier one;
 * persistent identity: one id and one colour per object for the map's lifetime, OBBs refined as
   evidence accumulates, merges keep the lower id;
@@ -28,7 +29,7 @@ import pytest
 from oh_my_slam.core.images import load_rgb, save_jpeg
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import api, export, ingest, objects, store, validity
-from oh_my_slam.mapping.objects import MapObject, ObjectState, canonical_points
+from oh_my_slam.mapping.objects import MapObject, ObjectState, canonical_sources
 from oh_my_slam.reconstruction.api import FrameReconstruction
 from oh_my_slam.segmentation.api import OBB, Detection, obb_iou_upright
 from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
@@ -165,16 +166,26 @@ def _noisy_shots() -> tuple[Room, list[Shot]]:
 
 
 def test_keyframe_order_within_an_update_does_not_matter(tmp_path: Path) -> None:
+    from scipy.spatial import cKDTree
+
     room, shots = _noisy_shots()
     perm = [6, 2, 13, 9, 0, 11, 4, 7, 1, 12, 8, 5, 10, 3]
     a = known_pose_update(tmp_path / "a", shots, tmp_path / "wa")
     b = known_pose_update(tmp_path / "b", [shots[i] for i in perm], tmp_path / "wb")
-    # the same cloud, colours and object membership (ids follow capture order: bookkeeping)
-    np.testing.assert_array_equal(a.cloud.xyz, b.cloud.xyz)
-    np.testing.assert_array_equal(a.cloud.rgb, b.cloud.rgb)
-    ids = match_ids(a, b)
-    relabel = np.vectorize(lambda x: ids.get(int(x), 0) if x else 0)
-    np.testing.assert_array_equal(relabel(a.cloud.label), b.cloud.label)
+    ids = match_ids(a, b)  # ids follow capture order: bookkeeping
+    # the same cloud, colours and object membership where the keyframes agree (depth as rendered):
+    # the order decides only where a keyframe contradicts an earlier one, and the later one wins
+    # (spec §2.3; with ±3 % depth noise, bands along some silhouettes seen from far apart)
+    clean = shoot(room, ring(14))
+    c1 = known_pose_update(tmp_path / "c1", clean, tmp_path / "wc1")
+    c2 = known_pose_update(tmp_path / "c2", [clean[i] for i in perm], tmp_path / "wc2")
+    cids = match_ids(c1, c2)
+    relabel = np.vectorize(lambda x: cids.get(int(x), 0) if x else 0, otypes=[np.int64])
+    dist, j = cKDTree(c2.cloud.xyz).query(c1.cloud.xyz)
+    same = dist == 0
+    assert same.mean() > 0.999 and abs(len(c1.cloud) - len(c2.cloud)) < 0.001 * len(c1.cloud)
+    assert np.mean(relabel(c1.cloud.label[same]) == c2.cloud.label[j[same]]) > 0.999
+    assert np.mean((c1.cloud.rgb[same] == c2.cloud.rgb[j[same]]).all(axis=1)) > 0.99
     # the same objects: labels, evidence, confirmation, points and boxes
     ob = b.objs.by_id()
     for o in a.objs.objects:
@@ -207,10 +218,12 @@ def test_keyframe_order_within_an_update_does_not_matter(tmp_path: Path) -> None
             assert before[o.frames[0]] < o.id <= before[o.frames[0] + 1], (o.id, o.frames)
 
 
-def test_attribution_latest_update_wins_and_finest_view_within_an_update() -> None:
-    """Colour and id of a point come from the latest update that sees it; within that update the
-    finest view gives the colour and a vote gives the id, whatever the keyframes' order."""
-    from oh_my_slam.mapping.geometry import FrameData, attribute_points, fused_cloud_points
+def _attribution_frames(repaint: set[int], uids: list[int],
+                        paint: tuple[int, int, int] = (10, 200, 30)) -> list[Any]:
+    """Eight keyframes orbiting the default room (``FrameData``: rendered colour, depth and box
+    ids), keyframe k of update ``uids[k]``; those in ``repaint`` see everything painted
+    ``paint``."""
+    from oh_my_slam.mapping.geometry import FrameData
     from tests.synth.scene import default_room, orbit_poses
 
     room = default_room()
@@ -218,12 +231,28 @@ def test_attribution_latest_update_wins_and_finest_view_within_an_update() -> No
     frames = []
     for i, pose in enumerate(orbit_poses(8)):
         r = render(room, pose, Kc)
-        uid = 1 if i < 7 else 2
         rec = store.FrameRecord(i, store.frame_name(i), "", "", 1, 320, 240, Kc, pose, 320, 240,
-                                update_id=uid)
-        rgb = r.rgb if uid == 1 else np.full_like(r.rgb, (10, 200, 30))  # update 2: repainted
+                                update_id=uids[i])
+        rgb = np.full_like(r.rgb, paint) if i in repaint else r.rgb
         frames.append(FrameData(rec, r.depth.astype(np.float32), r.depth > 0, rgb,
-                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32), uid == 2))
+                                np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32),
+                                uids[i] == max(uids)))
+    return frames
+
+
+def test_attribution_latest_update_wins_and_finest_agreeing_view_within_an_update() -> None:
+    """Colour and id of a point come from the latest update that sees it; within that update the
+    latest keyframe (input order) decides which views are current — the finest of the views
+    whose colour agrees with it gives the colour, whatever the order of the list — and a vote
+    gives the id."""
+    from oh_my_slam.mapping.geometry import (
+        COLOUR_SAME,
+        _visible,
+        attribute_points,
+        fused_cloud_points,
+    )
+
+    frames = _attribution_frames({7}, [1] * 7 + [2])  # update 2: repainted
     xyz = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
     rgb, label, seen_new = attribute_points(xyz, frames)
     assert set(np.unique(label)) <= {0, 1, 2, 3} and (label > 0).mean() > 0.05
@@ -233,27 +262,72 @@ def test_attribution_latest_update_wins_and_finest_view_within_an_update() -> No
     assert not (rgb[~seen_new] == (10, 200, 30)).all(axis=1).any()
     # ...and nowhere else: points it cannot see keep the older update's colours
     assert (rgb[~seen_new] != 128).any(axis=1).mean() > 0.9
-    # within update 1 the keyframes' order is irrelevant
+    # the order of the list is irrelevant: input order is the keyframes' own (their index)
     rev = frames[:7][::-1] + frames[7:]
     rgb2, label2, seen2 = attribute_points(xyz, rev)
     np.testing.assert_array_equal(rgb, rgb2)
     np.testing.assert_array_equal(label, label2)
     np.testing.assert_array_equal(seen_new, seen2)
-    # the finest view (smallest footprint) gives the colour (symmetric views may tie exactly)
-    from oh_my_slam.mapping.geometry import _visible
-
+    # the finest view (smallest footprint) of those that agree with the latest gives the colour
+    # (symmetric views may tie exactly)
     old = frames[:7]
     rgb1, _, _ = attribute_points(xyz, old)
     seen_by = [_visible(fd, xyz) for fd in old]
+    latest = np.zeros((len(xyz), 3), np.int64)
+    for fd, (idx, vv, uu, _) in zip(old, seen_by, strict=True):  # in input order: later wins
+        latest[idx] = fd.tone[vv, uu]
     best = np.full(len(xyz), np.inf)
-    for idx, _, _, fp in seen_by:
-        best[idx] = np.minimum(best[idx], fp)
-    hit = np.zeros(len(xyz), bool)
+    best_all = np.full(len(xyz), np.inf)
+    agreeing = []
     for fd, (idx, vv, uu, fp) in zip(old, seen_by, strict=True):
-        finest = fp == best[idx]
+        ok = np.abs(fd.tone[vv, uu].astype(np.int64) - latest[idx]).max(axis=1) <= COLOUR_SAME
+        agreeing.append(ok)
+        best[idx[ok]] = np.minimum(best[idx[ok]], fp[ok])
+        best_all[idx] = np.minimum(best_all[idx], fp)
+    hit = np.zeros(len(xyz), bool)
+    for fd, (idx, vv, uu, fp), ok in zip(old, seen_by, agreeing, strict=True):
+        finest = ok & (fp == best[idx])
         i = idx[finest]
         hit[i] |= (fd.rgb[vv[finest], uu[finest]] == rgb1[i]).all(axis=1)
     assert hit[np.isfinite(best)].all()
+    # where the views agree (a static, evenly lit room: nearly everywhere), that is the finest
+    # view of all, as before
+    assert np.mean(best[np.isfinite(best)] == best_all[np.isfinite(best)]) > 0.95
+
+
+def test_within_an_update_a_later_keyframe_wins_where_it_contradicts_an_earlier_one() -> None:
+    """Spec §2.3: within one update a later frame wins over an earlier one, in input order. The
+    room is repainted while one update's keyframes are taken: the keyframes taken after the
+    repaint colour every point they see, though finer views taken before see it too; with the
+    same views in the other input order, the earlier colours are the latest and win wherever a
+    keyframe taken after the repaint does not see alone."""
+    from oh_my_slam.mapping.geometry import _visible, attribute_points, fused_cloud_points
+
+    paint = (230, 20, 230)
+    before = _attribution_frames(set(), [1] * 8)
+    xyz = fused_cloud_points(before, voxel=0.01, depth_max=6.0)
+    unchanged, _, _ = attribute_points(xyz, before)
+    assert not np.all(unchanged == paint, axis=1).any()
+
+    def seen(frames: list[Any]) -> np.ndarray:
+        out = np.zeros(len(xyz), bool)
+        for fd in frames:
+            out[_visible(fd, xyz)[0]] = True
+        return out
+
+    later = _attribution_frames({5, 6, 7}, [1] * 8, paint)  # the last three see the repaint
+    rgb, _, _ = attribute_points(xyz, later)
+    late = seen(later[5:])
+    assert 0.2 < late.mean() < 0.95
+    np.testing.assert_array_equal(np.all(rgb == paint, axis=1), late)  # wherever they see it
+    np.testing.assert_array_equal(rgb[~late], unchanged[~late])  # and only there
+    # the same views, input order reversed: the repainted views are now the earliest
+    for fd in later:
+        fd.rec.index = 7 - fd.rec.index
+    rgb2, _, _ = attribute_points(xyz, later)
+    alone = late & ~seen(later[:5])  # what only the repainted views see
+    assert alone.any() and not alone.all()
+    np.testing.assert_array_equal(np.all(rgb2 == paint, axis=1), alone)
 
 
 def test_object_id_vote_needs_a_third_of_the_views() -> None:
@@ -615,13 +689,18 @@ def test_canonical_points_compose() -> None:
     rng = np.random.default_rng(3)
     a = rng.uniform(-1, 1, (40000, 3)).astype(np.float32)
     b = rng.uniform(-1, 1, (30000, 3)).astype(np.float32)
-    whole = canonical_points(np.concatenate([a, b]))
+    sa = rng.integers(0, 4, len(a)).astype(np.uint8)
+    sb = rng.integers(0, 4, len(b)).astype(np.uint8)
+    whole, sources = canonical_sources(np.concatenate([a, b]), np.concatenate([sa, sb]))
     assert len(whole) == objects.POINT_CAP
-    np.testing.assert_array_equal(canonical_points(np.concatenate([canonical_points(a), b])),
-                                  whole)
-    np.testing.assert_array_equal(canonical_points(np.concatenate([b, a])), whole)
-    np.testing.assert_array_equal(canonical_points(rng.permutation(np.concatenate([a, b]))),
-                                  whole)
+    ca, csa = canonical_sources(a, sa)
+    perm = rng.permutation(len(a) + len(b))
+    for p, s in ((np.concatenate([ca, b]), np.concatenate([csa, sb])),
+                 (np.concatenate([b, a]), np.concatenate([sb, sa])),
+                 (np.concatenate([a, b])[perm], np.concatenate([sa, sb])[perm])):
+        got, got_sources = canonical_sources(p, s)
+        np.testing.assert_array_equal(got, whole)
+        np.testing.assert_array_equal(got_sources, sources)
     keys = np.floor(whole.astype(np.float64) / objects.POINT_VOXEL)
     assert len(np.unique(keys, axis=0)) == len(whole)
 
@@ -703,25 +782,16 @@ def test_a_published_id_outranks_a_lower_candidate_id() -> None:
     assert final == {100: 7} and absorbed == {5: 100}
 
 
-def test_an_exported_id_outranks_a_lower_confirmed_unexported_one() -> None:
-    """A rebuild ranks ids by what the map exported (``Rebuild.published``), not by what it
-    confirmed: an object holding a confirmed id that was never exported (5, below the cloud
-    gate) and an exported one (7) keeps 7, and is published; an object that absorbs an exported
-    id (``rebuild_merged``) is published too, whatever the id it keeps."""
+def test_a_rebuilt_object_without_an_id_is_numbered_on_from_the_map_s_count() -> None:
+    """A rebuilt object that got no id from its stored detections, and whose first detection's
+    number falls among the map's (below the floor), takes the next number from the count."""
     from types import SimpleNamespace as Ns
 
-    d5, d7 = object(), object()
-    final, _, absorbed = objects._published_ids(
-        [100, 100], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d7)])],  # type: ignore[list-item]
-        [1, 2], lambda k: k, {100: 1}, {id(d5): 5, id(d7): 7}, floor=10, count=10,
-        published={7})
-    assert final == {100: 7} and absorbed == {5: 100}
-    assert objects._rebuilt_published(final, absorbed, {7}) == {100}
-    # 101 keeps 3 (exported) and absorbs 9 (exported); 102 keeps 4 (never exported) and
-    # absorbs 8 (exported); 103 keeps 6 and absorbs 2, neither exported
-    held = objects._rebuilt_published({101: 3, 102: 4, 103: 6}, {9: 101, 8: 102, 2: 103},
-                                      {3, 8, 9})
-    assert held == {101, 102}
+    d5, d9 = object(), object()
+    final, _, _ = objects._published_ids(
+        [100, 101], [Ns(members=[Ns(detection=d5)]), Ns(members=[Ns(detection=d9)])],  # type: ignore[list-item]
+        [1, 4], lambda k: k, {100: 1, 101: 4}, {id(d5): 5}, floor=10, count=12, published={5})
+    assert final == {100: 5, 101: 12}
 
 
 def test_a_legacy_objects_json_infers_published_from_what_it_exported() -> None:

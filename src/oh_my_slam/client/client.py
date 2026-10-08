@@ -22,11 +22,15 @@ from oh_my_slam.core.errors import (
     InferenceError,
     InputError,
     ServerBusyError,
+    ServerLoadingError,
     ServerModelsFailedError,
+    ServerProtocolError,
+    ServerStoppingError,
     ServerUnavailableError,
 )
 from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
+from oh_my_slam.version import PROTOCOL_VERSION
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -63,12 +67,6 @@ class InferenceClient:
             self._client.close()
             self._client = None
 
-    def __enter__(self) -> InferenceClient:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
     # -- health ------------------------------------------------------------------------------------
 
     def health(self, timeout: float = HEALTH_TIMEOUT_S) -> p.Health:
@@ -83,8 +81,13 @@ class InferenceClient:
         return p.Health.model_validate(r.json())
 
     def require_ready(self, wait_loading_s: float = LOADING_WAIT_S) -> p.Health:
-        """Fail fast if the server is down; wait (bounded) while it is still loading."""
+        """Fail fast if the server is down or speaks another protocol (started before an
+        upgrade); wait (bounded) while it is still loading. Each status but ``ready`` has its own
+        actionable error (exit 3): down, other protocol, models failed, still loading after the
+        wait, stopping."""
         h = self.health()
+        if h.protocol != PROTOCOL_VERSION:
+            raise ServerProtocolError(h.protocol, PROTOCOL_VERSION)
         deadline = time.monotonic() + wait_loading_s
         announced = False
         while h.status == "loading" and time.monotonic() < deadline:
@@ -96,9 +99,10 @@ class InferenceClient:
         if h.status == "ready":
             return h
         if h.status == "error":
-            failed = "; ".join(f"{m.name}: {m.error}" for m in h.models.values() if m.error)
-            raise ServerModelsFailedError(failed or "no detail", str(paths.server_log()))
-        raise ServerUnavailableError(f"server status '{h.status}'")
+            raise ServerModelsFailedError(h.failures() or "no detail", str(paths.server_log()))
+        if h.status == "loading":
+            raise ServerLoadingError(wait_loading_s, str(paths.server_log()))
+        raise ServerStoppingError()
 
     # -- requests ----------------------------------------------------------------------------------
 
@@ -198,11 +202,10 @@ def _error_body(r: httpx.Response) -> str:
 _shared: InferenceClient | None = None
 
 
-def connect(require: bool = True) -> InferenceClient:
-    """Process-wide client; checks the server first (exit 3 path) when ``require``."""
+def connect() -> InferenceClient:
+    """The process-wide client, once the server is checked ready (exit 3 otherwise)."""
     global _shared
     if _shared is None:
         _shared = InferenceClient()
-    if require:
-        _shared.require_ready()
+    _shared.require_ready()
     return _shared

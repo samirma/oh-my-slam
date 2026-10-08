@@ -235,8 +235,7 @@ def test_a_client_that_disconnects_interrupts_its_request(svc: Service) -> None:
 
 def test_a_command_deaf_to_ctrl_c_is_terminated(ws: Workspace,
                                                monkeypatch: pytest.MonkeyPatch) -> None:
-    service = Service(ws, Runner(ws, interrupt_grace_s=0.5), extra_hosts={"testserver"},
-                      inference_check=lambda: None)
+    service = Service(ws, Runner(ws, interrupt_grace_s=0.5), inference_check=lambda: None)
     with_programs(monkeypatch, service, slow_command.registry_program())
 
     async def scenario(app: Callable[..., Awaitable[None]]) -> None:
@@ -251,8 +250,9 @@ def test_a_command_deaf_to_ctrl_c_is_terminated(ws: Workspace,
 
 
 def test_stopping_the_service_interrupts_every_request(svc: Service) -> None:
-    """Each request still gets its answer: 503 ``stopping``; its upload is deleted, and so is
-    every other one when the runner shuts down."""
+    """Each request still gets its answer, its command's own (exit 130: 499 ``interrupted``,
+    running or still waiting); its upload is deleted, and so is every other one when the runner
+    shuts down. A request that arrives while the service stops is refused: 503 ``stopping``."""
     ws = svc.workspace
 
     async def scenario(app: Callable[..., Awaitable[None]]) -> None:
@@ -263,8 +263,10 @@ def test_stopping_the_service_interrupts_every_request(svc: Service) -> None:
         running = svc.runner.running[0]
         svc.runner.stop()
         await asyncio.gather(ta, tb)
-        for call in (a, b):
-            assert call.status == 503 and call.json()["error"]["code"] == "stopping"
+        for call, message in ((a, ": interrupted"), (b, "interrupted before it started")):
+            err = call.json()["error"]
+            assert call.status == 499 and (err["code"], err["exit_code"]) == ("interrupted", 130)
+            assert err["message"].endswith(message), err
         assert running.proc is not None and running.proc.returncode == 130
         assert not (ws.root / up).exists()
         late = await Call(app, "/api/ops/slow", {"seconds": 0})()
@@ -311,6 +313,35 @@ def test_an_upload_in_use_is_neither_given_twice_nor_deleted(svc: Service) -> No
         assert a.status == 200 and not (ws.root / up).exists()
 
     run(svc, scenario)
+
+
+def test_a_request_refused_for_an_upload_in_use_still_consumes_its_own(
+        ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec §2.6 "Workspace": an upload is consumed by the one request it is given to, whatever
+    its outcome. A request refused because one of its two uploads is another request's (409)
+    deletes the other one, never the one in use."""
+    from oh_my_slam.commands import spec
+    from oh_my_slam.core.timing import Stage
+
+    mode = spec.Mode(None, None, (), "never", "needs nothing", (Stage.SETUP,),
+                     (spec.Output("result", "stdout", "json", "what it says"),))
+    pair = spec.Program("pair.sh", "two images", (spec.Command("pair.sh", None, "two images", (
+        spec.Option("-i", "inputs", spec.Kind.IMAGES, "images", required=True, multiple=True,
+                    must_exist=True, type=Path),), (mode,)),))
+    service = make_svc(ws, inference_check=lambda: None, inference_health=lambda: {})
+    with_programs(monkeypatch, service, slow_command.registry_program(), pair)
+
+    async def scenario(app: Callable[..., Awaitable[None]]) -> None:
+        mine, theirs = upload(ws, "a.jpg"), upload(ws, "b.jpg")
+        a, ta = await send(app, "/api/ops/slow", {"seconds": 1, "image": theirs})
+        await until(started(service.runner, 1))
+        b = await Call(app, "/api/ops/pair", {"inputs": [theirs, mine]})()
+        assert b.status == 409 and b.json()["error"]["code"] == "upload_in_use"
+        assert not (ws.root / mine).exists() and (ws.root / theirs).exists()
+        await ta
+        assert a.status == 200 and not (ws.root / theirs).exists()
+
+    run(service, scenario)
 
 
 def test_the_response_is_the_commands_stdout_with_its_timings(svc: Service) -> None:

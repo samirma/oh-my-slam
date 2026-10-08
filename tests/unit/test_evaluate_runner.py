@@ -17,14 +17,14 @@ import pytest
 from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.tools.evaluate.memory import stage_peaks
 from oh_my_slam.tools.evaluate.metrics import load_targets
-from oh_my_slam.tools.evaluate.names import captures_in
+from oh_my_slam.tools.evaluate.names import captures_in, pan_captures_in
 from oh_my_slam.tools.evaluate.report import build_result, write_report
 from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
 from oh_my_slam.tools.evaluate.service import UiOutcome
-from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
+from oh_my_slam.tools.evaluate.suite import AINEX, CAMERA, EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe, ViewOutcome, served_url
 from oh_my_slam.viewer.bundle import DisplayCloud
-from oh_my_slam.viewer.routes import cloud_payload
+from oh_my_slam.viewer.routes import cloud_document
 from tests.unit.test_evaluate_contracts import label_map, labelled_cloud, objects, scene_bytes
 
 ENTRY_POINTS = ("start_inference_server.sh", "reconstruct.sh", "mapper.sh", "segment.sh",
@@ -240,13 +240,42 @@ def test_frames_are_segmented_one_by_one(tmp_path: Path) -> None:
     repo = fake_repo(tmp_path, segment=f'case "$2" in *002_*) echo boom >&2; exit 1;; esac\n'
                                        f"cat {payload}")
     ev = Evaluation(tmp_path / "out", Runner(tmp_path / "out", repo), BrowserProbe(None))
-    ev.frames(captures_in(EXAMPLES / "ainex-captures")[:3])
+    ev.frames(AINEX, captures_in(EXAMPLES / "ainex-captures")[:3])
     m = ev.metrics.items["seg.frames.with_detections_fraction"]
     assert m.value == 1.0 and m.detail == {"segmented": 2, "frames": 3}
     assert sorted(ev.images) == ["ainex-captures/001_bootstrap_level.jpg",
                                  "ainex-captures/003_bootstrap_side2_level.jpg"]
     rows = ev.details["segmentation.frames"]
     assert rows[0]["objects"] == 4 and "boom" in rows[1]["error"]
+
+
+def test_camera_frames_are_segmented_and_annotations_of_them_apply(tmp_path: Path) -> None:
+    """examples/camera frame by frame (spec §5: the same uses as ainex-captures), under names of
+    their own; a ground-truth file about a camera frame is picked up like any other."""
+    payload = tmp_path / "scene.json"
+    payload.write_bytes(scene_bytes())
+    examples = tmp_path / "examples"
+    (examples / "ground_truth").mkdir(parents=True)
+    (examples / "ground_truth" / "desk.json").write_text(json.dumps({
+        "kind": "objects", "image": "camera/img_007_p03_down.jpg",
+        "objects": [{"label": "chair"}, {"label": "monitor"}]}))
+    repo = fake_repo(tmp_path, segment=f'case "$2" in *_p04_*) echo boom >&2; exit 1;; esac\n'
+                                       f"cat {payload}")
+    ev = Evaluation(tmp_path / "out", Runner(tmp_path / "out", repo), BrowserProbe(None),
+                    examples=examples)
+    ev.frames(CAMERA, pan_captures_in(EXAMPLES / "camera")[:4])
+    m = ev.metrics.items["seg.camera_frames.with_detections_fraction"]
+    assert m.value == 1.0 and m.detail == {"segmented": 3, "frames": 4}
+    assert [(r.tag, r.spec.group) for r in ev.runner.records][:1] == [
+        ("segment_camera_frame_007", "segment_camera_frames")]
+    assert sorted(ev.images) == ["camera/img_007_p03_down.jpg", "camera/img_008_p03_mid.jpg",
+                                 "camera/img_009_p03_up.jpg"]
+    rows = ev.details["segmentation.camera_frames"]
+    assert rows[0]["image"] == "img_007_p03_down.jpg" and "boom" in rows[3]["error"]
+    assert ev.runner.records[0].argv[-1] == str(examples / "camera" / "img_007_p03_down.jpg")
+    ev.ground_truth()
+    assert ev.metrics.items["gt.objects.recall"].detail == {
+        "camera/img_007_p03_down.jpg": {"truth": 2, "detections": 4, "paired": 1}}
 
 
 def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path) -> None:
@@ -277,6 +306,10 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     assert tags[-1] == "server_stop_final"  # the server was down at the start
     assert sum(t.startswith("segment_frame_") for t in tags) == 79
     assert sum(t.startswith("mapper_split_") for t in tags) == 3
+    # examples/camera: every frame, both maps and view.sh -m on the one-update map
+    assert sum(t.startswith("segment_camera_frame_") for t in tags) == 27
+    assert sum(t.startswith("mapper_camera_split_") for t in tags) == 3
+    assert {"mapper_camera_single", "view_camera_map"} <= set(tags)
     assert "mapper_street2" in tags and "server_sh" in tags
     assert "boom" in (ev.metrics.items["pose.street2.registered_fraction"].error or "")
     assert "listening" in (ev.metrics.items["server_sh.start_s"].error or "")
@@ -324,7 +357,7 @@ def view_runner(tmp_path: Path, page_script: str = RENDERS, cloud: PointCloud | 
     (tmp_path / "scene.json").write_bytes(scene_bytes())
     cloud = labelled_cloud() if cloud is None else cloud
     (tmp_path / "cloud.bin").write_bytes(
-        cloud_payload(DisplayCloud(cloud, len(cloud), 0.0, 0.0), "color=segment"))
+        cloud_document(DisplayCloud(cloud, len(cloud), 0.0, 0), "color=segment").tobytes())
     env = {**os.environ, "FAKE_SCENE": str(tmp_path / "scene.json"),
            "FAKE_CLOUD": str(tmp_path / "cloud.bin"),
            "FAKE_PAGE": f"<!doctype html><html><body><script>{page_script}</script></body></html>"}

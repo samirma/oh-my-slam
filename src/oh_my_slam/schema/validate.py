@@ -15,6 +15,9 @@ from oh_my_slam.schema.openlabel import SCHEMA_URL, SCHEMA_VERSION
 
 SCHEMA_SHA256 = "22879dd20878d4fec02f96eccd401896e40988c3a77ded269b18505854bcdaa8"
 _QUAT_TOL = 1e-3
+# the schema's 5 to 14 items, in the lengths OpenCV takes (its plain, rational, thin-prism and
+# tilted models)
+_DISTORTION_LENGTHS = (5, 8, 12, 14)
 
 
 def schema_bytes() -> bytes:
@@ -56,6 +59,8 @@ def _check_quat(q: Any, where: str, errors: list[str]) -> None:
 def _check_intrinsics(name: str, stream: dict[str, Any], errors: list[str]) -> None:
     props = stream.get("stream_properties", {})
     pin = props.get("intrinsics_pinhole")
+    if "intrinsics_custom" in props:
+        _check_custom(name, props["intrinsics_custom"], pin or {}, errors)
     if stream.get("type") == "camera" and pin is None:
         errors.append(f"streams/{name}: camera stream without intrinsics_pinhole")
         return
@@ -75,9 +80,38 @@ def _check_intrinsics(name: str, stream: dict[str, Any], errors: list[str]) -> N
             errors.append(f"streams/{name}: camera_matrix last row must be [0, 0, 1, 0]")
     dist = pin.get("distortion_coeffs")
     if dist is not None and not (
-        isinstance(dist, list) and len(dist) in (4, 5, 8, 12, 14) and all(_is_num(v) for v in dist)
+        isinstance(dist, list) and len(dist) in _DISTORTION_LENGTHS
+        and all(_is_num(v) for v in dist)
     ):
-        errors.append(f"streams/{name}: distortion_coeffs must be a list of numbers")
+        errors.append(f"streams/{name}: distortion_coeffs must be a list of 5, 8, 12 or 14 "
+                      "numbers")
+
+
+def _check_custom(name: str, custom: Any, pin: dict[str, Any], errors: list[str]) -> None:
+    """``intrinsics_custom``: an object (the schema's type, in a part of it the validator never
+    applies); the division model this project writes (``openlabel.camera_stream``) and reads
+    (``openlabel.stream_intrinsics``) has a finite ``k``, the pinhole's focal length and centre,
+    and OpenCV coefficients that bend the rays as it does."""
+    where = f"streams/{name}: intrinsics_custom"
+    if not isinstance(custom, dict):
+        errors.append(f"{where} must be an object")
+        return
+    if custom.get("model") != "division":
+        return  # another camera model: the schema lets the stream define it freely
+    if not _is_num(custom.get("k")):
+        errors.append(f"{where}: the division model needs a finite number k")
+        return
+    cm = pin.get("camera_matrix")
+    if isinstance(cm, list) and len(cm) == 12 and all(_is_num(v) for v in cm):
+        for key, value in (("focal_length_px", cm[0]), ("center_x_px", cm[2]),
+                           ("center_y_px", cm[6])):
+            v: Any = custom.get(key)
+            if not (_is_num(v) and math.isclose(v, value, rel_tol=1e-6, abs_tol=1e-5)):
+                errors.append(f"{where}: {key} must be the camera_matrix's ({value:g})")
+    dist = pin.get("distortion_coeffs")
+    if custom["k"] and not (isinstance(dist, list) and any(_is_num(v) and v for v in dist)):
+        errors.append(f"{where}: a division model with k != 0 needs the OpenCV "
+                      "distortion_coeffs that approximate it")
 
 
 def extra_errors(doc: Any) -> list[str]:

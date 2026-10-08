@@ -2,8 +2,8 @@
 commands, and the web application's UI.
 
 The service runs over a scratch workspace (``<out>/server_sh/ws``) holding copies of the reference
-inputs and of the reference map, with the inference proxy (``proxy``) as its inference server, and
-so do the shell runs it is compared with. There are no jobs: an operation runs within its own HTTP
+inputs and of their maps, with the inference proxy (``proxy``) as its inference server, and so do
+the shell runs it is compared with. There are no jobs: an operation runs within its own HTTP
 request, and the response is its result.
 
 **Performance** (``server_sh.*``): start-up time (process start → the ``listening on`` line),
@@ -14,18 +14,30 @@ while an operation's request runs), and the overhead of an operation's request o
 command run from the shell (median over the operations of the request's wall time — sent to
 answered — minus the wall time of the same command with the same, replayed, inference).
 
-**Parity** (``server_sh.parity.*``): the operations come from the service's own description of
-the commands (``/api/openapi.json``: each operation's ``x-oms`` entry, ``commands.spec.describe()``
-as the API offers it) — nothing here names a command or an option. Each operation gets a default
-case (its required parameters on the reference inputs) and one case per non-default value of each
-choice and per point-cloud attribute (a non-default choice of its first enumerated attribute),
-with the options a case needs to apply set as the definitions say (``applies``). Each case runs
-the command from the shell twice (the first run records the inference, the second replays it) and
-then as a request, and compares the response body with the command's stdout byte for byte. A
-difference is a mismatch, unless the command's own two runs differ too (``unverifiable``: the
-command is not byte-reproducible). A case that maps writes the map at the same workspace path
-each time, so the map's path in the result is the same; inputs are the same absolute workspace
-paths on both sides.
+**Parity** (``server_sh.parity.*``), for every mode of the commands and every reference input: the
+operations come from the service's own description of the commands (``/api/openapi.json``: each
+operation's ``x-oms`` entry, ``commands.spec.describe()`` as the API offers it), matched to their
+definitions in ``commands.spec``, which give each case's command line (``spec.argv_of``, as the
+service builds it), applicability (``When.holds``), result format (``spec.result_format``) and the
+map it writes (``spec.writes_map``) — nothing here names a command or an option. The reference
+inputs (``Inputs``, in the suite's order: restaurant.jpg, each example sequence with its
+one-update map, street2.mp4) each give a value to every kind of path parameter they can. Each
+operation runs on every reference input that has a value for each of its required parameters:
+its default case there, and on the first such input one case per non-default value of each choice
+and per point-cloud attribute (a non-default choice of its first enumerated attribute), with the
+options a case needs to apply set as the definitions say. Each case runs the command from the
+shell twice (the first run records the inference, the second replays it) and then as a request,
+and compares the response body with the command's stdout byte for byte. A difference is a
+mismatch, unless the command's own two runs differ too (``unverifiable``: the command is not
+byte-reproducible). street2.mp4 is not mapped again: the suite's own ``mapper.sh update`` of it,
+made through the recording proxy into the workspace (``Ran``), is the command's result its
+request is compared with, without a control run. A case that maps writes the map at the same
+workspace path each time, so the map's path in the result is the same; inputs are the same
+absolute workspace paths on both sides.
+
+**Contracts** (``contract.*.server_sh``): every response body is the command's result, so it keeps
+the contracts of every command: exactly one payload of the result's format (stdout purity), and a
+JSON result is a valid OpenLABEL scene whose object colours are those of their ids.
 
 **UI** (``server_sh.ui.*``): the web application's browser tests (``tests/browser/test_webapp*.py``,
 ``-m browser``: the main flows, the inference server down, and an axe-core check of each page),
@@ -45,7 +57,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,8 +65,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from oh_my_slam.commands import spec
+from oh_my_slam.core.errors import OhMySlamError
+from oh_my_slam.tools.evaluate.contracts import (
+    parse_scene,
+    payload_problems,
+    scene_colour_problems,
+)
 from oh_my_slam.tools.evaluate.memory import tree_rss_mb
 from oh_my_slam.tools.evaluate.runner import REPO, Live, RunRecord, RunSpec
+from oh_my_slam.tools.evaluate.scene import doc_objects
 
 if TYPE_CHECKING:
     from oh_my_slam.tools.evaluate.suite import Evaluation
@@ -83,7 +103,8 @@ UI_TIMEOUT_S = 3600.0
 PERF_METRICS = ("start_s", "resident_mb", "app_render_s", "read_latency_median_ms",
                 "read_latency_p95_ms", "read_latency_busy_p95_ms", "request_overhead_median_s")
 PARITY_METRICS = ("mismatched", "unverifiable", "operations_covered_fraction")
-UI_METRICS = ("tests_failed", "tests_run", "a11y_violations")
+UI_TEST_METRICS = ("tests_failed", "tests_run")  # the browser tests: they start their own service
+UI_METRICS = (*UI_TEST_METRICS, "a11y_violations")
 
 
 def app_urls(base: str, map_name: str | None) -> list[str]:
@@ -103,14 +124,55 @@ def metric_ids() -> list[str]:
 # the cases, from the commands' definitions
 
 
+def workspace_root(out: Path) -> Path:
+    """The service's scratch workspace under the evaluation's output folder, resolved: the paths
+    the service gives the commands, which a run compared with a request must use too."""
+    return (Path(out) / GROUP / "ws").resolve()
+
+
+def input_folder(ws: Path, name: str) -> Path:
+    """Where the files of the reference input ``name`` go in the workspace."""
+    return Path(ws) / "inputs" / (Path(name).stem or "input")
+
+
+def place(path: Path, folder: Path) -> Path:
+    """``path`` put into ``folder`` (a hard link where the file system allows it, else a copy:
+    a long video is not copied); the placed file."""
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / Path(path).name
+    if target.exists() and target.samefile(path):
+        return target  # already there
+    target.unlink(missing_ok=True)
+    try:
+        os.link(path, target)
+    except OSError:
+        shutil.copyfile(path, target)
+    return target
+
+
+@dataclass(frozen=True)
+class Ran:
+    """A command run the suite already made on a reference input (``argv``: after the program, as
+    ``commands.spec.argv_of`` gives it), compared with instead of being run again: street2.mp4 is
+    mapped once, by its own section, through the recording inference proxy."""
+
+    argv: tuple[str, ...]
+    record: RunRecord
+
+
 @dataclass(frozen=True)
 class Inputs:
-    """Reference inputs inside the workspace (paths relative to it; ``map``: a map's name)."""
+    """One reference input inside the workspace (paths relative to it; ``map``: a map's name): the
+    value it gives each kind of path parameter. An input the suite already ran (``ran``, which
+    wrote the map ``writes``) has only that case."""
 
+    name: str = ""  # the reference input (restaurant.jpg, ainex-captures, ..., street2.mp4)
     image: str | None = None  # one image (Kind "image")
     images: tuple[str, ...] = ()  # images to locate (Kind "images")
-    sequence: tuple[str, ...] = ()  # images to map (Kind "images_or_video")
+    sequence: tuple[str, ...] = ()  # images, or one video, to map (Kind "images_or_video")
     map: str | None = None  # an existing map (read-only modes)
+    ran: Ran | None = None
+    writes: str | None = None
 
     def of(self, kind: str) -> Any:
         return {"image": self.image, "images": list(self.images) or None,
@@ -119,40 +181,62 @@ class Inputs:
 
 @dataclass
 class Case:
-    op: str  # the API operation id (``segment-image``)
-    label: str  # the command as typed (``segment.sh -i``)
+    op: str  # the API operation id (``mapper-update``)
+    label: str  # the command as typed (``mapper.sh update``)
     variant: str
     params: dict[str, Any]  # API parameters: workspace paths and map names
     writes_map: str | None = None  # the parameter naming the map the case creates
     result_format: str = "json"  # the format of the result (the response body / stdout)
+    input: str = ""  # the reference input (``Inputs.name``)
+    ran: Ran | None = None  # the run the suite already made of it (``Inputs.ran``)
+
+    @property
+    def name(self) -> str:
+        return f"{self.label} [{self.variant}]" + (f" on {self.input}" if self.input else "")
 
 
-def operations_of(openapi: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """The operations of the service's ``/api/openapi.json``: each ``POST /api/ops/<id>`` carries
-    its ``commands.spec.describe()`` entry as the API offers it under ``x-oms``. Returns
-    ``{"operations": [...]}`` (the shape of ``describe()``) and the operation paths whose entry is
-    missing or whose id does not match their path."""
+@dataclass(frozen=True)
+class Op:
+    """An operation the service offers: its URL id, its ``x-oms`` entry (its
+    ``commands.spec.describe()`` entry as the API offers it: the parameters) and its definitions
+    (``commands.spec``), from which its command lines, applicability and result formats come."""
+
+    id: str
+    entry: dict[str, Any]
+    command: spec.Command
+    mode: spec.Mode
+
+    @property
+    def label(self) -> str:
+        return self.command.label(self.mode)
+
+    @property
+    def prog(self) -> str:
+        return spec.program_of(self.command).prog
+
+    def params(self) -> dict[str, dict[str, Any]]:
+        return {p["name"]: p for p in self.entry["parameters"]}
+
+
+def operations_of(openapi: dict[str, Any]) -> tuple[list[Op], list[str]]:
+    """The operations of the service's ``/api/openapi.json``: each ``POST /api/ops/<id>`` with its
+    ``x-oms`` entry, matched to the mode of ``commands.spec`` whose operation id it is
+    (``spec.operation_id``), in the service's order; and the operation paths whose entry is
+    missing or names another mode."""
+    modes = {spec.operation_id(p, c, m): (c, m) for p, c, m in spec.operations()}
     ops, problems = [], []
-    for path, item in (openapi.get("paths") or {}).items():  # the registry's order
+    for path, item in (openapi.get("paths") or {}).items():
         if not path.startswith("/api/ops/") or path.endswith("/validate"):
             continue
+        oid = path.removeprefix("/api/ops/")
         entry = ((item or {}).get("post") or {}).get("x-oms")
-        if not isinstance(entry, dict) or "parameters" not in entry \
-                or f"/api/ops/{operation_id(entry)}" != path:
+        found = modes.get(oid)
+        if found is None or not isinstance(entry, dict) or "parameters" not in entry \
+                or entry.get("id") != found[0].label(found[1]):
             problems.append(path)
             continue
-        ops.append(entry)
-    return {"operations": ops}, problems
-
-
-def operation_id(op: dict[str, Any]) -> str:
-    """The service's URL id of an operation (``web.operations.Operation.id``)."""
-    parts = [str(op["prog"]).removesuffix(".sh"), op.get("command"), op.get("mode")]
-    return "-".join(p for p in parts if p)
-
-
-def _api_params(op: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {p["name"]: p for p in op["parameters"]}
+        ops.append(Op(oid, entry, *found))
+    return ops, problems
 
 
 def _attrs_value(p: dict[str, Any]) -> str | None:
@@ -166,33 +250,40 @@ def _attrs_value(p: dict[str, Any]) -> str | None:
     return None
 
 
-def _holds(when: dict[str, Any], given: dict[str, Any], params: dict[str, dict[str, Any]]) -> bool:
-    opt = when["option"]
-    if "in" in when:
-        value = given.get(opt, (params.get(opt) or {}).get("default"))
-        return value in when["in"]
-    if when.get("is") == "given":
-        return given.get(opt) is not None
-    return False  # "video": the parity inputs are images
+def _inapplicable(op: Op, params: dict[str, Any], names: list[str]) -> list[str] | None:
+    """The parameters of ``names`` whose option does not apply to ``params``: none of its
+    conditions (``Option.applies``) holds (``When.holds``) on the arguments the command's own
+    parser makes of them; None when they do not parse."""
+    try:
+        args = spec.parse(op.command, op.mode, params)
+    except OhMySlamError:
+        return None
+    return [n for n in names if (o := op.command.option(n)).applies
+            and not any(w.holds(args) for w in o.applies)]
 
 
-def _satisfy(applies: list[dict[str, Any]], given: dict[str, Any],
-             params: dict[str, dict[str, Any]]) -> bool:
-    """Set the first condition of ``applies`` that a case can meet; False if none."""
-    for w in applies:
-        opt = params.get(w["option"])
-        if opt is None:
+def _applied(op: Op, base: dict[str, Any], given: dict[str, Any]) -> str | None:
+    """Make every parameter of ``given`` (a variant) apply on ``base`` (a reference input's
+    parameters): one that does not gets the first of its conditions a case can meet set — another
+    parameter's value. Returns why it cannot, else None."""
+    params = op.params()
+    for name in list(given):
+        applies = op.command.option(name).applies
+        if not applies or _inapplicable(op, {**base, **given}, [name]) == []:
             continue
-        if w.get("in"):
-            given[w["option"]] = w["in"][0]
-            return True
-    return False
+        settable = next((w for w in applies if w.option in params and w.values), None)
+        if settable is not None:
+            given[settable.option] = settable.values[0]
+        if settable is None or _inapplicable(op, {**base, **given}, [name]) != []:
+            return f"no reference input meets {[w.describe() for w in applies]}"
+    return None
 
 
-def _variants(op: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
-    params = _api_params(op)
+def _variants(op: Op, base: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    """The default case and one per non-default value of each choice and per point-cloud
+    attribute, made applicable on ``base``; and the variants that cannot be, with the reason."""
     out: list[tuple[str, dict[str, Any]]] = [("default", {})]
-    for p in params.values():
+    for p in op.params().values():
         if p["kind"] == "enum":
             out += [(f"{p['name']}={c}", {p["name"]: c}) for c in p.get("choices") or []
                     if c != p.get("default")]
@@ -200,80 +291,61 @@ def _variants(op: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], lis
             out.append((f"{p['name']}={v}", {p["name"]: v}))
     done, skipped, seen = [], [], set()
     for name, given in out:
-        for pname in list(given):
-            applies = params[pname].get("applies") or []
-            if applies and not any(_holds(w, given, params) for w in applies) \
-                    and not _satisfy(applies, given, params):
-                skipped.append(f"{name}: no reference input meets {applies}")
-                break
-        else:
-            key = json.dumps(given, sort_keys=True)
-            if key not in seen:
-                seen.add(key)
-                done.append((name, given))
+        why = _applied(op, base, given)
+        if why is not None:
+            skipped.append(f"{name}: {why}")
+            continue
+        key = json.dumps(given, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            done.append((name, given))
     return done, skipped
 
 
-def _result_format(op: dict[str, Any], given: dict[str, Any]) -> str:
-    """The format of the operation's result for these parameters: its stdout output whose
-    condition holds (the first one when none says)."""
-    params = _api_params(op)
-    results = [o for o in op.get("outputs") or [] if o.get("via") == "stdout"]
-    for o in results:
-        if not o.get("when") or any(_holds(w, given, params) for w in o["when"]):
-            return str(o["format"])
-    return str(results[0]["format"]) if results else "json"
-
-
-def parity_cases(describe: dict[str, Any], inputs: Inputs
+def parity_cases(ops: Sequence[Op], inputs: Sequence[Inputs]
                  ) -> tuple[list[Case], dict[str, str]]:
-    """Every case of every operation of ``describe`` (the service's operations, as
-    :func:`operations_of` reads them), and the operations that have none, with the reason."""
+    """The cases of every operation of ``ops`` on the reference inputs (in order), and the
+    operations no reference input can run, with the reason. An operation runs on every input that
+    has a value for each of its required parameters: its default case there, and on the first
+    such input also one case per variant (``_variants``); an input the suite already ran gets only
+    the case that run is (``Inputs.ran``). A case that maps creates a map of its own."""
     cases: list[Case] = []
     uncovered: dict[str, str] = {}
     fresh = 0
-    for op in describe.get("operations", []):
-        oid = operation_id(op)
-        params = _api_params(op)
-        written = {o.get("via") for o in op.get("outputs") or []}
-        map_out = next((n for n, p in params.items()
-                        if p["kind"] == "map" and p["flag"] in written), None)
-        required = [n for n, p in params.items() if p.get("required")]
-        missing = [n for n in required if n != map_out and inputs.of(params[n]["kind"]) is None]
-        if missing:
-            uncovered[op["id"]] = (f"no reference input for {', '.join(missing)} "
-                                   f"({', '.join(params[n]['kind'] for n in missing)})")
-            continue
-        variants, _ = _variants(op)
-        for name, given in variants:
-            case_params = {n: inputs.of(params[n]["kind"]) for n in required}
-            if map_out is not None:
-                fresh += 1
-                case_params[map_out] = f"parity-{fresh}"
-            case_params.update(given)
-            cases.append(Case(oid, op["id"], name, case_params, map_out,
-                              _result_format(op, case_params)))
+    for op in ops:
+        params = op.params()
+        out = spec.writes_map(op.command, op.mode)
+        map_out = out.name if out is not None and out.name in params else None
+        required = [n for n, p in params.items() if p.get("required") and n != map_out]
+        lacking: list[list[str]] = []
+        first = True
+        for inp in inputs:
+            missing = [n for n in required if inp.of(params[n]["kind"]) is None]
+            if missing:
+                lacking.append(missing)
+                continue
+            base = {n: inp.of(params[n]["kind"]) for n in required}
+            todo: list[tuple[str, dict[str, Any]]] = [("default", {})]
+            if inp.ran is None and first:
+                parsed = {**base, **({map_out: "parity"} if map_out is not None else {})}
+                todo, first = _variants(op, parsed)[0], False
+            for name, given in todo:
+                case_params = dict(base)
+                if map_out is not None and inp.ran is not None and inp.writes:
+                    case_params[map_out] = inp.writes
+                elif map_out is not None:
+                    fresh += 1
+                    case_params[map_out] = f"parity-{fresh}"
+                case_params.update(given)
+                fmt = spec.result_format(op.command, op.mode, case_params) or "json"
+                cases.append(Case(op.id, op.label, name, case_params, map_out, fmt, inp.name,
+                                  inp.ran))
+        if not any(c.op == op.id for c in cases):
+            least = min(lacking, key=len) if lacking else []
+            uncovered[op.label] = "no reference input" + (
+                f" for {', '.join(least)} ({', '.join(params[n]['kind'] for n in least)})"
+                if least else "")
     return cases, uncovered
-
-
-def shell_argv(op: dict[str, Any], params: dict[str, Any]) -> list[str]:
-    """The command line of an operation for parameters (paths already absolute), as the service
-    builds it (``spec.argv_of``)."""
-    argv = [op["command"]] if op.get("command") else []
-    for p in op["parameters"]:
-        flag, name = p["flag"], p["name"]
-        v = params.get(name)
-        if v is None:
-            continue
-        if p["kind"] == "flag":
-            argv += [flag] if v else []
-            continue
-        values = list(v) if isinstance(v, list | tuple) else [v]
-        if p.get("multiple"):
-            argv += [flag, *(f"./{x}" if str(x).startswith("-") else str(x) for x in values)]
-        else:
-            argv += [f"{flag}={x}" for x in values]
-    return argv
 
 
 # ------------------------------------------------------------------------------------------------
@@ -404,10 +476,10 @@ def parse_junit(path: Path, files: list[str]) -> UiOutcome:
 class ServiceEvaluation:
     """``server.sh`` evaluated through an :class:`Evaluation` (its runner, contracts, metrics)."""
 
-    def __init__(self, ev: Evaluation, inputs_from: dict[str, Any], env: dict[str, str],
-                 ui: Callable[[Path], UiOutcome] = run_ui_tests) -> None:
+    def __init__(self, ev: Evaluation, inputs_from: Sequence[dict[str, Any]],
+                 env: dict[str, str], ui: Callable[[Path], UiOutcome] = run_ui_tests) -> None:
         self.ev, self.env, self.ui = ev, env, ui
-        self.root = ev.out / "server_sh"
+        self.root = ev.out / GROUP
         self.ws = self.root / "ws"
         self.inputs_from = inputs_from
         self.details: dict[str, Any] = {}
@@ -417,29 +489,40 @@ class ServiceEvaluation:
 
     # -- set-up ------------------------------------------------------------------------------------
 
-    def workspace(self) -> Inputs:
-        """Copy the reference inputs (and map) into the workspace; the cases' inputs."""
-        src = self.inputs_from
+    def workspace(self) -> list[Inputs]:
+        """Put the reference inputs into the workspace (``input_folder``; a file the suite
+        already put there stays) and copy their maps (named after the input); the cases' inputs,
+        in order."""
         (self.ws / "inputs").mkdir(parents=True, exist_ok=True)
         (self.ws / "maps").mkdir(parents=True, exist_ok=True)
         self.ws = self.ws.resolve()
+        out = []
+        for src in self.inputs_from:
+            name = str(src.get("name") or "")
+            folder = input_folder(self.ws, name)
+            image = self._put(src.get("image"), folder)
+            images = tuple(x for p in src.get("images", []) if (x := self._put(p, folder)))
+            sequence = tuple(x for p in src.get("sequence", []) if (x := self._put(p, folder)))
+            map_name = None
+            ref = src.get("map")
+            if ref is not None and Path(ref).is_dir():
+                map_name = folder.name
+                shutil.copytree(ref, self.ws / "maps" / map_name, symlinks=True)
+            out.append(Inputs(name, image, images, sequence, map_name, src.get("ran"),
+                              src.get("writes")))
+        return out
 
-        def put(path: Path | None) -> str | None:
-            if path is None or not Path(path).is_file():
-                return None
-            target = self.ws / "inputs" / Path(path).name
-            shutil.copyfile(path, target)
-            return str(target.relative_to(self.ws))
-
-        image = put(src.get("image"))
-        images = tuple(x for p in src.get("images", []) if (x := put(p)) is not None)
-        sequence = tuple(x for p in src.get("sequence", []) if (x := put(p)) is not None)
-        name = None
-        ref = src.get("map")
-        if ref is not None and Path(ref).is_dir():
-            name = "reference"
-            shutil.copytree(ref, self.ws / "maps" / name, symlinks=True)
-        return Inputs(image, images, sequence, name)
+    def _put(self, path: Path | None, folder: Path) -> str | None:
+        """``path`` copied into ``folder`` of the workspace (a file already in the workspace, as
+        the suite put street2.mp4 there, stays); its workspace path, None if it is no file."""
+        if path is None or not Path(path).is_file():
+            return None
+        real = Path(path).resolve()
+        if self.ws in real.parents:
+            return str(real.relative_to(self.ws))
+        folder.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, folder / real.name)
+        return str((folder / real.name).relative_to(self.ws))
 
     def spec(self, tag: str, *args: str | Path, stdout: str = "json",
              ok_exit: tuple[int, ...] = (0,), timeout_s: float = 3600.0) -> RunSpec:
@@ -513,10 +596,10 @@ class ServiceEvaluation:
 
     # -- the shell side ------------------------------------------------------------------------------
 
-    def absolute(self, op: dict[str, Any], case: Case) -> dict[str, Any]:
+    def absolute(self, op: Op, case: Case) -> dict[str, Any]:
         """The case's parameters with the absolute workspace paths the service gives the
         command."""
-        params = _api_params(op)
+        params = op.params()
         out: dict[str, Any] = {}
         for name, v in case.params.items():
             kind = params[name]["kind"]
@@ -529,14 +612,29 @@ class ServiceEvaluation:
                 out[name] = v
         return out
 
-    def shell_outcome(self, op: dict[str, Any], case: Case, tag: str) -> tuple[Outcome, RunRecord]:
-        argv = shell_argv(op, self.absolute(op, case))
-        rec = self.ev.run(tag, "parity", op["prog"], *argv, stdout=case.result_format,
-                          env=self.env)
+    def argv(self, op: Op, case: Case) -> list[str]:
+        """The case's command line (after the program), as the service builds it for the same
+        request: ``commands.spec.argv_of`` on the absolute workspace paths."""
+        return spec.argv_of(op.command, op.mode, self.absolute(op, case))
+
+    def shell_outcome(self, op: Op, case: Case, tag: str) -> tuple[Outcome, RunRecord]:
+        rec = self.ev.run(tag, "parity", op.prog, *self.argv(op, case),
+                          stdout=case.result_format, env=self.env)
         if case.result_format == "json":
             self.ev.scene(rec)
         return Outcome(rec.ok, None if rec.ok else rec.failure(), rec.stdout_bytes(),
                        wall_s=rec.wall_s), rec
+
+    def ran_outcome(self, op: Op, case: Case) -> Outcome:
+        """The run the suite already made of ``case`` (``Case.ran``; its contracts were checked
+        then), when it is the case's command line."""
+        assert case.ran is not None
+        rec, argv = case.ran.record, self.argv(op, case)
+        if list(case.ran.argv) != argv:
+            return Outcome(False, f"the suite's run {rec.tag} is not the case's command line "
+                                  f"({' '.join(case.ran.argv)} != {' '.join(argv)})")
+        return Outcome(rec.ok, None if rec.ok else rec.failure(), rec.stdout_bytes(),
+                       wall_s=rec.wall_s)
 
     def _set_map_aside(self, case: Case, tag: str) -> None:
         """Move the map a shell run created out of the workspace, so the next run (the same
@@ -549,16 +647,25 @@ class ServiceEvaluation:
             aside.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(made), str(aside))
 
-    def run_case(self, op: dict[str, Any], case: Case, n: int) -> dict[str, Any]:
-        row: dict[str, Any] = {"case": f"{case.label} [{case.variant}]", "op": case.op,
-                               "params": case.params}
-        first, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell")
-        self._set_map_aside(case, f"parity_{n:02d}_shell")
-        # the control: the same command again, with the same (replayed) inference
-        second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
-        self._set_map_aside(case, f"parity_{n:02d}_shell_again")
+    def run_case(self, op: Op, case: Case, n: int) -> dict[str, Any]:
+        row: dict[str, Any] = {"case": case.name, "op": case.op, "params": case.params}
+        second: Outcome | None = None
+        if case.ran is not None:  # the suite's run is the command's result: no control run
+            first = self.ran_outcome(op, case)
+            self._set_map_aside(case, f"parity_{n:02d}_shell")
+            if not first.ok:  # nothing to compare a request with
+                row.update(status="mismatch", why=first.error)
+                return row
+        else:
+            first, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell")
+            self._set_map_aside(case, f"parity_{n:02d}_shell")
+            # the control: the same command again, with the same (replayed) inference
+            second, _ = self.shell_outcome(op, case, f"parity_{n:02d}_shell_again")
+            self._set_map_aside(case, f"parity_{n:02d}_shell_again")
         req = self.request_outcome(case)
         row["stages"] = req.stages
+        if req.ok:
+            self.response_contracts(case, f"parity_{n:02d}_request", req.result or b"")
         if not first.ok or not req.ok:
             row.update(status="mismatch", why=first.error if not first.ok else
                        f"the request failed: {req.error}")
@@ -566,19 +673,33 @@ class ServiceEvaluation:
         diffs = differences(first, req)
         if not diffs:
             row["status"] = "identical"
-        elif second.ok and differences(first, second):
+        elif second is not None and second.ok and differences(first, second):
             row.update(status="unverifiable", why="the command's own two runs differ: "
                        + "; ".join(differences(first, second)[:3]), request=diffs[:5])
         else:
-            row.update(status="mismatch", why="; ".join(diffs[:5]))
-        if second.ok and req.wall_s is not None and second.wall_s is not None \
-                and case.op not in self.overheads:
+            row.update(status="mismatch", why="; ".join(diffs[:5]) + (
+                " (no control run: the suite's run is the command's result)"
+                if second is None else ""))
+        if second is not None and second.ok and req.wall_s is not None \
+                and second.wall_s is not None and case.op not in self.overheads:
             self.overheads[case.op] = {"request_s": round(req.wall_s, 3),
                                        "shell_s": round(second.wall_s, 3),
                                        "overhead_s": round(req.wall_s - second.wall_s, 3)}
         return row
 
-    def parity(self, inputs: Inputs) -> None:
+    def response_contracts(self, case: Case, tag: str, body: bytes) -> None:
+        """The contracts of every command on a response body (the command's result): one payload
+        of the result's format, and a scene that is valid OpenLABEL with its ids' colours."""
+        log = self.ev.contracts
+        log.check("stdout", "server_sh", tag, payload_problems(body, case.result_format))
+        if case.result_format != "json":
+            return
+        doc, problems = parse_scene(body)
+        log.check("openlabel", "server_sh", tag, problems)
+        if doc is not None:
+            log.check("colour", "server_sh", tag, scene_colour_problems(doc_objects(doc)))
+
+    def parity(self, inputs: Sequence[Inputs]) -> None:
         m = self.ev.metrics
         ids = [f"{PREFIX}.parity.{k}" for k in PARITY_METRICS]
         assert self.api is not None
@@ -586,33 +707,35 @@ class ServiceEvaluation:
         if reply.status != 200:
             m.fail(ids, f"/api/openapi.json answered HTTP {reply.status}")
             return
-        describe, problems = operations_of(reply.json())
-        cases, uncovered = parity_cases(describe, inputs)
-        ops = {o["id"]: o for o in describe.get("operations", [])}
+        found, problems = operations_of(reply.json())
+        cases, uncovered = parity_cases(found, inputs)
+        ops = {o.id: o for o in found}
         rows: list[dict[str, Any]] = [{"case": p, "status": "mismatch",
                                        "why": "not an operation of commands.spec"}
                                       for p in problems]
         for n, case in enumerate(cases, start=1):
-            rows.append(self.run_case(ops[case.label], case, n))
-        self.details["parity"] = {"cases": rows, "uncovered": uncovered}
-        ran = {r["case"].split(" [")[0] for r in rows}
+            rows.append(self.run_case(ops[case.op], case, n))
+        by_input = {i.name: sorted({c.label for c in cases if c.input == i.name})
+                    for i in inputs}
+        self.details["parity"] = {"cases": rows, "uncovered": uncovered, "inputs": by_input}
         bad = [r for r in rows if r["status"] == "mismatch"]
         unver = [r for r in rows if r["status"] == "unverifiable"]
         m.add(ids[0], len(bad), {"cases": len(rows), "mismatched": [
             {"case": r["case"], "why": r.get("why")} for r in bad]})
         m.add(ids[1], len(unver), {"unverifiable": [
             {"case": r["case"], "why": r.get("why")} for r in unver]})
-        m.add(ids[2], len(ran) / len(ops) if ops else None,
-              {"operations": sorted(ops), "uncovered": uncovered},
+        m.add(ids[2], len({c.op for c in cases}) / len(ops) if ops else None,
+              {"operations": sorted(o.label for o in found), "uncovered": uncovered},
               error="the service describes no operation")
 
     # -- performance and UI ------------------------------------------------------------------------------
 
-    def latency(self, inputs: Inputs) -> None:
+    def latency(self, map_name: str | None) -> None:
+        """The read-only requests' latency (``READS``, and the page of the map ``map_name``)."""
         assert self.api is not None
         paths = list(READS)
-        if inputs.map:
-            paths.append(f"api/maps/{inputs.map}")
+        if map_name:
+            paths.append(f"api/maps/{map_name}")
         samples: dict[str, list[float]] = {}
         failed = []
         for _ in range(LATENCY_REPS):
@@ -637,7 +760,7 @@ class ServiceEvaluation:
               float(np.median([v["overhead_s"] for v in over.values()])) if over else None,
               over, error="no request could be compared with its command")
 
-    def browser_checks(self, inputs: Inputs) -> None:
+    def browser_checks(self, map_name: str | None) -> None:
         """Time until the web application has rendered, and axe-core on its pages."""
         m = self.ev.metrics
         ids = (f"{PREFIX}.app_render_s", f"{PREFIX}.ui.a11y_violations")
@@ -654,7 +777,7 @@ class ServiceEvaluation:
                 return
             render, error = self.render(browser, self.api.base)
             m.add(ids[0], render, error=error)
-            pages = app_urls(self.api.base, inputs.map)
+            pages = app_urls(self.api.base, map_name)
             found, error = self.a11y(browser, pages)
             m.add(ids[1], None if found is None else sum(len(v) for v in found.values()),
                   {"pages": found}, error=error)
@@ -700,6 +823,9 @@ class ServiceEvaluation:
         return found, None
 
     def ui_tests(self) -> None:
+        """The web application's browser tests (``UI_TEST_METRICS``). They start a service of
+        their own, with the stub inference server, so they run whether or not the evaluated
+        service started."""
         m = self.ev.metrics
         res = self.ui(self.root / "ui")
         m.add(f"{PREFIX}.ui.tests_failed", res.failed, res.detail, error=res.error)
@@ -708,20 +834,25 @@ class ServiceEvaluation:
     # -- all ---------------------------------------------------------------------------------------
 
     def run(self) -> None:
+        """Every metric of ``metric_ids`` is recorded once: a service that does not start fails
+        each metric that needs it, with the reason, and the browser tests run in any case."""
         m = self.ev.metrics
+        own = {f"{PREFIX}.ui.{k}" for k in UI_TEST_METRICS}  # ui_tests records them
         with m.expect(*metric_ids()):
             inputs = self.workspace()
+            map_name = next((i.map for i in inputs if i.map), None)
             live = self.start()
             if live is None:
-                m.fail(metric_ids(), self.details.get("start_error", "server.sh did not start"))
+                m.fail([k for k in metric_ids() if k not in own],
+                       self.details.get("start_error", "server.sh did not start"))
             else:
                 try:
                     with m.expect(*(f"{PREFIX}.parity.{k}" for k in PARITY_METRICS)):
                         self.parity(inputs)
                     with m.expect(*(f"{PREFIX}.{k}" for k in PERF_METRICS[3:])):
-                        self.latency(inputs)
+                        self.latency(map_name)
                     with m.expect(f"{PREFIX}.app_render_s", f"{PREFIX}.ui.a11y_violations"):
-                        self.browser_checks(inputs)
+                        self.browser_checks(map_name)
                 finally:
                     self.details["stop"] = self.stop(live).to_dict()
             self.ui_tests()

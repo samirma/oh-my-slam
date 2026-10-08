@@ -10,7 +10,7 @@ Semantics (spec §2.3):
   the group's instances match it directly. A group without such an object becomes a new object.
 * **Evidence is order-free.** An object's evidence — label votes, scores, the keyframes that
   detected it, one ``Sighting`` per detection, its mean viewing distance and a canonical point set
-  (``canonical_points``) — is a pure function of the instances it received, so its label and OBB
+  (``canonical_sources``) — is a pure function of the instances it received, so its label and OBB
   do not depend on the order or the grouping into updates in which that evidence arrived.
 * **Confirmation** is recomputed from all evidence (``confirm``): detections with a reliable mask
   (not mostly in the image-border band, where monocular depth is unreliable) in >= 2 distinct
@@ -69,8 +69,9 @@ Semantics (spec §2.3):
   ``_one_surface``).
 * **Merging** joins duplicates: objects with compatible labels that overlap, and — whatever their
   labels — objects of comparable size that occupy the same space (most of either one's points on
-  the other's surface) and that no keyframe detected as two instances: the detector's label
-  flickered between keyframes (a door seen as a wardrobe); and a part the detector named on its
+  the other's surface), that no keyframe detected as two instances and one of which at least 2
+  keyframes detected: the detector's label flickered between keyframes (a door seen as a
+  wardrobe); and a part the detector named on its
   own in the keyframes that did not name the whole (a figurine's top as a bottle opener:
   ``_part_of``). The merged object's label is the one
   with the most evidence (score-weighted votes); the others are exported as ``detected_as``.
@@ -255,8 +256,9 @@ SURFACE_HEIGHT_TOL = 0.1
 # between keyframes by 20-30 % (a counter top 0.5 m below the camera placed 10 cm lower and
 # further by the keyframes that close a loop). The fused surface averages every keyframe that
 # sees the gap between the pieces, so a horizontal patch of it that reaches both is their surface:
-# points whose local normal is within ~30° of vertical (|n_z| >= BRIDGE_NORMAL_Z, from the cloud
-# thinned to BRIDGE_SAMPLE voxels), joined through BRIDGE_VOXEL voxels, inside the pieces' plan
+# points whose local normal is within ~30° of vertical (|n_z| >= BRIDGE_NORMAL_Z; the plane of its
+# BRIDGE_NORMAL_NEIGHBOURS nearest points, ``PointNormals``, in the cloud thinned to BRIDGE_SAMPLE
+# voxels), joined through BRIDGE_VOXEL voxels, inside the pieces' plan
 # extent grown by BRIDGE_PAD and their median heights ± BRIDGE_BAND; at least BRIDGE_SHARE of
 # each piece's points near the patches (within BRIDGE_NEAR) lie on one patch. The pieces' median
 # heights are at most BRIDGE_HEIGHT_TOL apart and their points at most BRIDGE_GAP_M apart in plan;
@@ -268,6 +270,7 @@ BRIDGE_BAND = 0.05
 BRIDGE_SAMPLE = 0.01
 BRIDGE_VOXEL = 0.02
 BRIDGE_NORMAL_Z = 0.85
+BRIDGE_NORMAL_NEIGHBOURS = 10
 BRIDGE_NEAR = 0.03
 BRIDGE_SHARE = 0.5
 BRIDGE_MIN_POINTS = 20
@@ -391,20 +394,16 @@ def _voxel_hash(keys: NDArray[np.int64]) -> NDArray[np.uint64]:
     return h
 
 
-def canonical_points(points: NDArray[Any]) -> NDArray[np.float32]:
-    """One point per ``POINT_VOXEL`` voxel (the one nearest the voxel centre) and at most
-    ``POINT_CAP`` of them (the voxels with the smallest hash), sorted by voxel.
-
-    A pure function of the point *set* that composes — ``canonical(canonical(a) ∪ b) ==
-    canonical(a ∪ b)`` — so an object's points, and the OBB fitted to them, do not depend on the
-    order in which its instances arrived or on how they were split into updates."""
-    return canonical_sources(points, np.zeros(len(np.asarray(points).reshape(-1, 3)), np.uint8))[0]
-
-
 def canonical_sources(points: NDArray[Any], sources: NDArray[Any]
                       ) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
-    """``canonical_points`` with each point's sources (``SRC_*`` bits): a kept point carries the
-    union of the sources of its voxel's points, so it composes as the points do."""
+    """One point per ``POINT_VOXEL`` voxel (the one nearest the voxel centre) and at most
+    ``POINT_CAP`` of them (the voxels with the smallest hash), sorted by voxel, with each kept
+    point's sources (``SRC_*`` bits): the union of the sources of its voxel's points.
+
+    A pure function of the point *set* that composes — ``canonical(canonical(a) ∪ b) ==
+    canonical(a ∪ b)``, sources included — so an object's points, and the OBB fitted to them, do
+    not depend on the order in which its instances arrived or on how they were split into
+    updates."""
     p = np.asarray(points, np.float32).reshape(-1, 3)
     src = np.asarray(sources, np.uint8).reshape(-1)
     if len(p) == 0:
@@ -786,14 +785,14 @@ class ObjectState:
     next_id: int
     merged_into: dict[int, int] = field(default_factory=dict)
     floor_z: float | None = None
-    observed: set[int] = field(default_factory=set)  # ids observed in this update
+    observed: set[int] = field(default_factory=set)  # ids the update's input observed
     # keyframe index -> pixels this update invalidated in it: the masks of the objects it removed
     invalidated: dict[int, int] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     vacated: list[Vacated] = field(default_factory=list)  # places of removed objects (all updates)
-    # the published ids the last rebuild found on detections of another object (id -> that
-    # object's id): provisional, each rebuild recomputes them, so that an id returns to its
-    # founder when a later rebuild separates the objects again (``_published_ids``)
+    # the ids the last rebuild found on detections of another object (id -> that object's id):
+    # only ids of candidates, never exported (a rebuild keeps the exported ones apart, ``_group``,
+    # ``_merge``); provisional, each rebuild recomputes them (``_published_ids``)
     rebuild_merged: dict[int, int] = field(default_factory=dict)
 
     def by_id(self) -> dict[int, MapObject]:
@@ -890,20 +889,11 @@ def _visible_pixels(view: View, pts: NDArray[Any]) -> tuple[NDArray[np.int64], N
     return u[vis], v[vis]
 
 
-def projected_mask(view: View, pts: NDArray[Any], dilate: int = MASK_DILATE) -> NDArray[np.bool_]:
-    """Pixels of ``view`` covered by the visible (unoccluded) points of an object."""
-    mask = np.zeros(view.depth.shape, bool)
-    u, v = _visible_pixels(view, pts)
-    if len(u) == 0:
-        return mask
-    mask[v, u] = True
-    return ndimage.binary_dilation(mask, iterations=dilate) if dilate else mask
-
-
 def projected_iou(view: View, mask: NDArray[np.bool_], pts: NDArray[Any],
                   dilate: int = MASK_DILATE) -> float:
-    """IoU of ``mask`` with the pixels ``pts`` cover in ``view`` (``projected_mask``), computed on
-    the bounding box of both (same result as on the whole image, much cheaper)."""
+    """IoU of ``mask`` with the pixels of ``view`` covered by the visible (unoccluded) points
+    ``pts`` (``_visible_pixels``, dilated ``dilate`` times), computed on the bounding box of both
+    (same result as on the whole image, much cheaper)."""
     u, v = _visible_pixels(view, pts)
     if len(u) == 0:
         return 0.0
@@ -1059,12 +1049,10 @@ def in_view(pts: NDArray[Any], K: Any, T_map_cam: Any) -> bool:
     hide from every other keyframe."""
     if len(pts) == 0:
         return False
-    pc = T_map_cam.inverse().apply(np.asarray(pts, np.float64))
-    z = pc[:, 2]
+    uv, z = project(T_map_cam.inverse().apply(np.asarray(pts, np.float64)), K.K())
+    u, v = uv[:, 0], uv[:, 1]
     w, h = K.width, K.height
-    with np.errstate(divide="ignore", invalid="ignore"):
-        u = K.fx * pc[:, 0] / z + K.cx
-        v = K.fy * pc[:, 1] / z + K.cy
+    with np.errstate(invalid="ignore"):
         inside = (z > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
     return bool(inside.mean() >= IN_VIEW_SHARE)
 
@@ -1218,6 +1206,7 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
     if not rescaled:
         return moved
     poses = {r.index: r.T_map_cam for r in records}
+    grids = {r.index: r.K_grid for r in records}
     for o in state.objects:
         if not any(s.frame in rescaled and s.frame in poses for s in o.sightings):
             continue
@@ -1227,7 +1216,7 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
             corr = rescaled.get(s.frame) if T is not None else None
             if T is not None:
                 centres.append(T.t)
-                c = 1.0 if corr is None else _factor_at(corr, T, s.centroid)
+                c = 1.0 if corr is None else _factor_at(corr, T, grids[s.frame], s.centroid)
                 logs.append(np.log(c))
                 weights.append(float(max(s.points, 1)))
             if corr is None or T is None:
@@ -1235,8 +1224,9 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
                 continue
 
             def moved_to(v: tuple[float, float, float], T: Pose = T,
-                         corr: DepthCorrection = corr) -> tuple[float, float, float]:
-                w = T.t + _factor_at(corr, T, v) * (np.asarray(v, np.float64) - T.t)
+                         corr: DepthCorrection = corr, K: Any = grids[s.frame]
+                         ) -> tuple[float, float, float]:
+                w = T.t + _factor_at(corr, T, K, v) * (np.asarray(v, np.float64) - T.t)
                 return (float(w[0]), float(w[1]), float(w[2]))
             out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
                                 moved_to(s.lo), moved_to(s.hi), s.confident))
@@ -1253,10 +1243,21 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
     return moved
 
 
-def _factor_at(corr: DepthCorrection, T: Pose, p: Any) -> float:
-    """``corr``'s depth factor at map point ``p`` seen from camera ``T`` (its z-depth there)."""
-    z = float((np.asarray(p, np.float64) - T.t) @ T.R[:, 2])
-    return float(corr.factor(np.array([z]))[0])
+def _factor_at(corr: DepthCorrection, T: Pose, K_grid: Any, p: Any) -> float:
+    """``corr``'s depth factor at map point ``p`` seen from camera ``T`` (its z-depth and its
+    place on the grid ``K_grid`` there)."""
+    pc = ((np.asarray(p, np.float64) - T.t) @ T.R)[None]
+    uv, z = project(pc, K_grid.K())  # behind the camera: no depth there, the factor is 1
+    at = (np.nan_to_num(uv) + 0.5) / [K_grid.width, K_grid.height]
+    return float(corr.factor(z, at)[0])
+
+
+def is_input(ctx: Any, name: str) -> bool:
+    """Whether keyframe ``name`` of the update ``ctx`` comes from the update's input, not from
+    the stored keyframes a rebuild maps again (``mapping.api.Rebuild.uids``): what ``-t single``
+    covers."""
+    rb = getattr(ctx, "rebuild", None)
+    return rb is None or name not in rb.uids
 
 
 def update_objects(ctx: Any, records: list[Any], progress: Any,
@@ -1324,7 +1325,10 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     #    objects get provisional ids >= first_new (content order) until their final numbering
     owner: list[int] = [0] * len(obs)  # object id per observation
     touched: set[int] = set()
-    groups = _group(obs, state.objects, _Earlier(ctx, state, views))
+    kept_ids: list[frozenset[int]] | None = None if rb is None else [
+        frozenset(q for m in ob.members if (q := prior.get(id(m.detection), 0)) in rb.published)
+        for ob in obs]
+    groups = _group(obs, state.objects, _Earlier(ctx, state, views), kept_ids)
     existing = state.by_id()
     fresh_groups = sorted((m for oid, m in groups if oid is None),
                           key=lambda m: min(obs[i].key for i in m))
@@ -1353,7 +1357,16 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     for i, ob in enumerate(obs):
         instances.setdefault(ob.frame, []).append((owner[i], ob.inst.mask))
     masks = _Masks(ctx, views, instances, state.merges(), alias)
-    merged = _merge(state, touched, alias, views, surfaces, masks)
+    apart: dict[int, frozenset[int]] | None = None
+    if kept_ids is not None:  # a rebuild: the published ids whose founding detection each holds
+        founding: dict[int, tuple[int, int]] = {}  # id -> (detection number, observation)
+        for i, ids in enumerate(kept_ids):
+            for q in ids:
+                founding[q] = min(founding.get(q, (number[i], i)), (number[i], i))
+        apart = {}
+        for q, (_, i) in founding.items():
+            apart[owner[i]] = apart.get(owner[i], frozenset()) | {q}
+    merged = _merge(state, touched, alias, views, surfaces, masks, apart)
 
     # the final ids of the new objects (step 5) are known now: the number of their first
     # detection, or in a rebuild the id the map published (``_published_ids``); a rebuilt object
@@ -1370,13 +1383,9 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         first_detection[k] = min(first_detection.get(k, number[i]), number[i])
     final_of, _, absorbed = _published_ids(owner, obs, number, resolved, first_detection, prior,
                                            floor, count, rb.published if rb is not None else None)
-    if rb is not None and absorbed:
-        _published_places(final_of, absorbed, [o for o in state.objects if o.id >= first_new],
-                          rb.boxes)
     if rb is not None:
-        holders = _rebuilt_published(final_of, absorbed, rb.published)
         for o in state.objects:
-            if o.id >= first_new and o.id in holders:
+            if o.id >= first_new and final_of.get(o.id) in rb.published:
                 o.published = True
     for o in state.objects:
         o.forget_tree()
@@ -1493,7 +1502,11 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         items = [(final_id(owner[i]), first.get(id(m.detection), final_id(owner[i])), m)
                  for i in idxs for m in obs[i].members]
         tx.write_json(frame_file(nf.record.name, "instances.json"), _instances_json(items))
-    state.observed = touched
+    # observed: the objects the update's input saw (``-t single``), not the stored keyframes a
+    # rebuild maps again
+    state.observed = {final_id(owner[i]) for i, ob in enumerate(obs)
+                      if is_input(ctx, new_views[ob.frame][0].kf.name)
+                      } & {o.id for o in state.objects}
     for o in state.objects:
         if o.id in touched or o.id in moved:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
@@ -1512,7 +1525,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         "total": len(state.objects), "confirmed": confirmed,
         "unconfirmed": len(state.objects) - confirmed,
     }
-    progress(f"objects: {confirmed} confirmed of {len(state.objects)}; "
+    progress(f"objects: {confirmed} of {len(state.objects)} candidates confirmed; "
              f"{len(removed)} removed, {len(moved_ids)} moved, {merged} merged")
     return state
 
@@ -1836,15 +1849,18 @@ def _candidate_objects(obs: list[Observation], objs: list[MapObject]
     return sorted(zip(i[ok].tolist(), [have[x] for x in k[ok].tolist()], strict=True))
 
 
-def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier | None = None
-           ) -> list[tuple[int | None, list[int]]]:
+def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier | None = None,
+           published: list[frozenset[int]] | None = None) -> list[tuple[int | None, list[int]]]:
     """Group this update's instances into objects without regard to the keyframes' order.
 
     Edges — instance/instance and instance/existing object — are taken strongest first (ties
     by content) and join two groups unless that would put two instances of one keyframe or two
     existing objects in one group, or give an existing object a group most of whose instances do
     not match it directly (a group that grew around a new object is not absorbed through one
-    weak link). Returns (existing object id or None, instance indices) per group."""
+    weak link). ``published``: the ids the map published that each instance's detections carry
+    (a rebuild, ``Rebuild.prior``): two groups carrying different ones stay apart, as two existing
+    objects do, so a rebuild never gives one object two published ids. Returns (existing object
+    id or None, instance indices) per group."""
     n = len(obs)
     objs = list(objects)
     to_obj: dict[tuple[int, int], float] = {}
@@ -1870,6 +1886,9 @@ def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier |
     members.update({n + j: [] for j in range(len(objs))})
     anchor: dict[int, int | None] = {i: None for i in range(n)}
     anchor.update({n + j: j for j in range(len(objs))})
+    carried: dict[int, frozenset[int]] = {i: (published[i] if published else frozenset())
+                                          for i in range(n)}
+    carried.update({n + j: frozenset() for j in range(len(objs))})
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -1893,7 +1912,10 @@ def _group(obs: list[Observation], objects: list[MapObject], earlier: _Earlier |
             continue
         if jb is not None and not absorbs(jb, members[ra]):
             continue
+        if carried[ra] and carried[rb] and carried[ra] != carried[rb]:
+            continue  # two objects the map published
         parent[rb] = ra
+        carried[ra] = carried[ra] | carried.pop(rb)
         frames[ra] |= frames.pop(rb)
         members[ra] += members.pop(rb)
         anchor[ra] = ja if ja is not None else jb
@@ -2260,6 +2282,7 @@ class _Surfaces:
         from scipy.sparse.csgraph import connected_components
 
         from oh_my_slam.core.geometry import voxel_downsample_indices
+        from oh_my_slam.reconstruction.pointcloud import PointNormals
 
         ha, hb = float(np.median(a.points[:, 2])), float(np.median(b.points[:, 2]))
         if self.floor_z is not None and max(ha, hb) < self.floor_z + BRIDGE_FLOOR_M:
@@ -2277,13 +2300,11 @@ class _Surfaces:
         p = p[np.sort(voxel_downsample_indices(p, BRIDGE_SAMPLE))]
         if len(p) < 50:
             return False
-        _, nn = cKDTree(p).query(p, k=10)
-        q = p[nn] - p[nn].mean(axis=1, keepdims=True)
-        _, vec = np.linalg.eigh(np.einsum("nki,nkj->nij", q, q))
-        flat = p[np.abs(vec[:, 2, 0]) >= BRIDGE_NORMAL_Z]
+        normals = PointNormals(p, np.zeros((0, 3)), k=BRIDGE_NORMAL_NEIGHBOURS)
+        flat = p[np.abs(normals.at(np.arange(len(p)))[:, 2]) >= BRIDGE_NORMAL_Z]
         if len(flat) < 50:
             return False
-        keys = np.unique(np.floor(flat / BRIDGE_VOXEL).astype(np.int64), axis=0)
+        keys = np.unique(voxel_keys(flat, BRIDGE_VOXEL), axis=0)
         links = cKDTree(keys).query_pairs(1.8, output_type="ndarray")  # 26-neighbourhood
         graph = coo_matrix((np.ones(len(links)), (links[:, 0], links[:, 1])),
                            shape=(len(keys), len(keys)))
@@ -2596,6 +2617,14 @@ def _part_of(a: MapObject, b: MapObject, views: _Views, masks: _Masks | None = N
     return inside / PART_INSIDE
 
 
+# FLICKER: objects of different labels merge as one object whose label flickered only when one
+# of them was detected by CONFIRM_DETECTIONS keyframes. The size of a single sighting of a few
+# centimetres is noise: on examples/camera's desk a speaker and a stapler 2 cm apart (25 and 40
+# points) measured 0.43-0.50 of each other's size, on either side of MERGE_SCALE, and a pair of
+# headphones and a lamp 0.39 in the one-update map and 0.92-0.95 in the split ones; the speaker
+# and the stapler merged in the 9 + 9 + 9 map only, and the merge's two keyframes confirmed and
+# published the object. The cost: a wall lamp also seen as a thermostat (one keyframe each)
+# stays a candidate.
 def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
                     surfaces: _Surfaces | None = None,
                     loops: set[frozenset[int]] | None = None,
@@ -2606,8 +2635,9 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
     (``_depth_explained``), or copies of a loop whose keyframes are misaligned (``loops``: pairs
     of ids from ``_loop_copies``; still never detected together). Incompatible labels (the
     detector's label flickered between keyframes): no keyframe detected both (it would have seen
-    two things there), their sizes are comparable (``MERGE_SCALE``: neither is a part of the other
-    or an item resting on it) and >= 50 % of either one's points lie on the other's surface, or
+    two things there), one of them was detected by >= 2 keyframes (FLICKER), their sizes
+    are comparable (``MERGE_SCALE``: neither is a part of the other or an item resting on it) and
+    >= 50 % of either one's points lie on the other's surface, or
     (with ``views``) the smaller is a part of the larger that the detector named on its own
     (``_part_of``). Whatever the labels: pieces of one horizontal surface (``_one_surface``, with ``surfaces``:
     the map's fused surface); with ``masks`` (the detections of the objects in their keyframes),
@@ -2621,6 +2651,8 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
         return 0.0
     surface = _one_surface(a, b, surfaces)
     if not same_kind:
+        if len(a.frames) < CONFIRM_DETECTIONS and len(b.frames) < CONFIRM_DETECTIONS:
+            return surface  # two single sightings: no label is seen to flicker (FLICKER)
         if _part_whole(a, b) is not None:
             if surface < 1.0 and views is not None:
                 return max(surface, _part_of(a, b, views, parts))
@@ -2667,9 +2699,15 @@ def _content_key(o: MapObject) -> tuple[Any, ...]:
 
 def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
            views: _Views | None = None, surfaces: _Surfaces | None = None,
-           masks: _Masks | None = None) -> int:
+           masks: _Masks | None = None, apart: dict[int, frozenset[int]] | None = None) -> int:
     """Merge duplicates among the objects (at least one of each pair touched by this update),
     strongest pair first; the lower id is kept and ``alias`` maps each merged id to its keeper.
+    In a rebuild, ``apart`` holds the ids the map published whose founding detection (the one
+    each id goes with, ``_published_ids``) each object holds: two objects holding different ones
+    are never merged, so every published id keeps an object of its own (published objects stay
+    published). An object that holds other detections of a published object may join another
+    (a duplicate: ``office_sequence`` 6 + 7 kept a third window apart when every detection that
+    carried a published id counted).
     ``views`` (the map's keyframes) enables the depth-explained test (``_depth_explained``) and
     the loop copies (``_loop_copies``: sought among the objects once no other merge is left —
     the copies of a group are recognised on whole objects, not on the pieces the other tests
@@ -2681,9 +2719,15 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
     loops: set[frozenset[int]] = set()
     seen: _Masks | None = None
 
+    def joinable(a: int, b: int) -> bool:
+        x, y = (frozenset(), frozenset()) if apart is None else (apart.get(a, frozenset()),
+                                                                 apart.get(b, frozenset()))
+        return not (x and y and x != y)
+
     def pairs_of(o: MapObject) -> None:
         for p in state.objects:
-            if p.id == o.id or not (o.id in touched or p.id in touched):
+            if p.id == o.id or not (o.id in touched or p.id in touched) \
+                    or not joinable(o.id, p.id):
                 continue
             a, b = (o, p) if o.id < p.id else (p, o)
             s = _merge_strength(a, b, views, surfaces, loops, seen, masks)
@@ -2703,7 +2747,8 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         if strength or masks is None or seen is not None:
             return
         seen = masks
-        strength.update(_seen_pairs(state.objects, touched, seen))
+        strength.update({k: s for k, s in _seen_pairs(state.objects, touched, seen).items()
+                         if joinable(*k)})
 
     by = state.by_id()
     for o in sorted(state.objects, key=lambda o: o.id):
@@ -2722,6 +2767,8 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         keep.absorb(gone)
         refit(keep, state.floor_z)
         alias[gone.id] = keep.id
+        if apart is not None:
+            apart[keep.id] = apart.get(keep.id, frozenset()) | apart.pop(gone.id, frozenset())
         if masks is not None:
             masks.forget(keep.id, gone.id)
         state.objects = [o for o in state.objects if o.id != gone.id]
@@ -3318,8 +3365,9 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
     id was first given with), and an object takes the first of the ids it got, the ``published``
     ones (exported by the map) before the others, each by value; an object without
     one whose number falls among the published ones (below ``floor``) takes a new one (from
-    ``count`` on). Returns (final ids, the published ids taken, the other published ids an
-    object got: id -> that object, which absorbed them).
+    ``count`` on). Returns (final ids, the published ids taken, the other ids an object got:
+    id -> that object, which absorbed them; never an exported one, which ``_group`` and
+    ``_merge`` keep on an object of its own).
 
     Two objects the map had merged (two windows a weakly posed first update placed together)
     can come apart: the id stays with the one it was first given to."""
@@ -3347,52 +3395,9 @@ def _published_ids(owner: list[int], obs: list[Observation], number: list[int],
     return final, taken, absorbed
 
 
-def _rebuilt_published(final_of: dict[int, int], absorbed: dict[int, int],
-                       published: set[int]) -> set[int]:
-    """The rebuilt objects (provisional ids) that are published: the id they take, or one they
-    absorb (``rebuild_merged``), is one the map published (exported)."""
-    return ({k for k, v in final_of.items() if v in published}
-            | {k for p, k in absorbed.items() if p in published})
-
-
-IDENTITY_MARGIN_M = 0.05  # the attribution gate (``geometry.attribution_margin``): max(5 cm,
-IDENTITY_MARGIN_REL = 0.03  # 3 % of the viewing distance)
-
-
-def _published_places(final_of: dict[int, int], absorbed: dict[int, int],
-                      fresh: list[MapObject], boxes: dict[int, tuple[str, OBB | None]]) -> None:
-    """A rebuild's geometric fallback (``_published_ids``): a published id whose founding
-    detection the rebuild gave an object that holds another, lower, published id (the second
-    window's first detection grouped with the first window) goes, rather than being absorbed,
-    to a rebuilt object that holds no published id, has a compatible label and stands where the
-    map last published it (``boxes``: its label and box): their boxes overlap, or their centres
-    lie within the attribution gate. Updates ``final_of`` and ``absorbed`` in place."""
-    holders = {k for k, v in final_of.items() if v in boxes}
-    by = {o.id: o for o in fresh}
-    for pid in sorted(absorbed):
-        label, box = boxes.get(pid, ("", None))
-        if box is None:
-            continue
-        best: tuple[float, float, int] | None = None
-        for k, o in sorted(by.items()):
-            if k in holders or o.obb is None or not compatible(label, o.label):
-                continue
-            iou = obb_iou_upright(box, o.obb)
-            d = float(np.linalg.norm(np.asarray(box.center) - np.asarray(o.obb.center)))
-            gate = max(IDENTITY_MARGIN_M, IDENTITY_MARGIN_REL * float(o.obs_depth))
-            if iou > 0.0 or d <= gate:
-                cand = (-iou, d, k)
-                best = cand if best is None or cand < best else best
-        if best is not None:
-            k = best[2]
-            final_of[k] = pid
-            holders.add(k)
-            del absorbed[pid]
-
-
 def _carry_identity(state: ObjectState, rb: Any, final_of: dict[int, int],
                     absorbed: dict[int, int], gone: set[int]) -> list[int]:
-    """After a rebuild: the ids the map published live on. A published id another object owns
+    """After a rebuild: the ids the map published live on. A candidate's id another object owns
     the founding detection of resolves to it, provisionally (``rebuild_merged``: the next rebuild
     decides again), and the map's merges (``merged_into``) carry over; an object
     that keeps a published id keeps its creation update; a published id nothing took is returned
@@ -3445,7 +3450,7 @@ class _Colours:
     def _image(self, f: int, shape: tuple[int, int]) -> NDArray[np.uint8] | None:
         img = self.rgb.get(f)
         if img is None:
-            from oh_my_slam.core.images import load_rgb
+            from oh_my_slam.mapping.store import keyframe_rgb
 
             rec = self.views.records.get(f)
             if rec is None or self.ctx is None:
@@ -3453,7 +3458,7 @@ class _Colours:
             p = self.ctx.tx.current(rec.image)
             if not p.exists():
                 return None
-            img = load_rgb(p, max_side=max(shape))
+            img = keyframe_rgb(p, rec, max(shape))
         return img if img.shape[:2] == shape else None
 
     def of(self, o: MapObject) -> NDArray[np.float64] | None:

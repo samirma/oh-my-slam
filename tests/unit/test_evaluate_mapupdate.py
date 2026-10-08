@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from oh_my_slam.core.types import Pose
+from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.obb import OBB
 from oh_my_slam.tools.evaluate import groundtruth as gt
@@ -20,6 +20,7 @@ from oh_my_slam.tools.evaluate.mapupdate import (
     MapView,
     SplitMaps,
     hole_cells,
+    image_pixels,
     map_update_metrics,
     merges,
     metric_ids,
@@ -34,11 +35,12 @@ from oh_my_slam.tools.evaluate.runner import Runner
 from oh_my_slam.tools.evaluate.scene import DocObject
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, expected_ids
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
+from tests.unit.test_evaluate_contracts import scene_bytes
 from tests.unit.test_evaluate_metrics import cam
 from tests.unit.test_evaluate_runner import fake_repo, script
 
 IMAGES = [f"img{k:02d}.jpg" for k in range(6)]  # the cup is in img00..img02
-CAMERA = (500.0, 500.0, 320.0, 240.0, 640, 480)
+CAMERA = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480)
 CUP_REGION = [0.43, 0.40, 0.57, 0.60]  # a 0.4 m box 3 m ahead covers ~60 % of it
 ANNOTATION = {"kind": "map_update", "sequence": "office_sequence",
               "absent": [{"label": "cup", "seen_in": {n: CUP_REGION for n in IMAGES[:3]}}]}
@@ -155,6 +157,30 @@ def test_region_coverage_of_a_projected_box() -> None:
     assert region_coverage(box, cam(0.0, t=(2.9, 0.0, 0.0)), CAMERA, region) is None  # inside
 
 
+def test_a_lens_moves_the_footprint_as_the_image_shows_it() -> None:
+    """The map's camera with a lens (``intrinsics_custom``): points are projected into its
+    undistorted image, then through the lens, so barrel distortion pulls an off-centre box towards
+    the centre; a pincushion lens cannot show a ray beyond its reach (no footprint)."""
+    region = (0.62, 0.40, 0.80, 0.60)
+    box = OBB(np.array([3.0, -0.8, 0.0]), np.eye(3), np.array([0.4, 0.4, 0.4]))  # right of centre
+    barrel = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap", -0.3)
+    plain, bent = region_coverage(box, cam(0.0), CAMERA, region), \
+        region_coverage(box, cam(0.0), barrel, region)
+    assert plain is not None and bent is not None and bent < plain
+    corners = cam(0.0).inverse().apply(box.corners())
+    np.testing.assert_allclose(barrel.rays(image_pixels(corners, barrel)),
+                               corners[:, :2] / corners[:, 2:], atol=1e-9)
+    pincushion = Intrinsics(100.0, 100.0, 50.0, 50.0, 100, 100, "colmap", 0.5)
+    wide = OBB(np.array([3.0, 0.0, 0.0]), np.eye(3), np.array([0.4, 30.0, 0.4]))
+    assert region_coverage(wide, cam(0.0), pincushion, (0.4, 0.4, 0.6, 0.6)) is None
+    # the hole test projects the cloud the same way, and leaves out what the lens cannot show
+    assert hole_cells(surface(), cam(0.0), barrel, (0.43, 0.40, 0.57, 0.60))["holes"] == 0
+    beyond = np.array([[3.2, 100.0, 0.0]])  # a ray the pincushion lens cannot show
+    assert np.isnan(image_pixels(cam(0.0).inverse().apply(beyond), pincushion)).all()
+    assert hole_cells(np.r_[surface(), beyond], cam(0.0), pincushion, (0.4, 0.4, 0.6, 0.6)) \
+        == {"cells": 64, "holes": 0, "ring_depth_m": pytest.approx(3.2)}
+
+
 def test_a_cup_still_in_the_final_map_is_a_remnant_with_the_image_it_covers() -> None:
     item = gt.Absent("cup", {IMAGES[0]: (0.43, 0.40, 0.57, 0.60)})
     rows = remnants(final_map(True), item)
@@ -243,10 +269,10 @@ def test_a_map_without_the_cup_that_kept_the_rest_passes(tmp_path: Path) -> None
     assert v[f"{S}.vs_one_update.matched_fraction"] == 1.0
     assert v[f"{S}.vs_one_update.id_agreement"] == 1.0
     assert v[f"{S}.vs_one_update.obb_iou_median"] == pytest.approx(1.0)
-    # first vs last update: labels and ids only; the box figures are detail
-    boxes = m.items[f"{S}.stability.id_agreement"].detail["boxes_after_alignment"]
-    assert boxes["obb_iou_median"] == pytest.approx(1.0)
-    assert f"{S}.stability.obb_iou_median" not in m.items
+    assert v[f"{S}.vs_one_update.unexcused_extra"] == 0
+    # first vs last update: labels, ids and boxes
+    assert v[f"{S}.stability.obb_iou_median"] == pytest.approx(1.0)
+    assert v[f"{S}.stability.centre_delta_median_m"] == pytest.approx(0.0, abs=1e-6)
     assert all(x.passed for x in m.items.values()), [k for k, x in m.items.items() if not x.passed]
     # the backpack (only seen late) and the cup are not compared: two objects in the stability rows
     rows = details["splits"]["split_3_3"]["stability"]
@@ -331,8 +357,11 @@ def test_unchanged_objects_that_lost_their_id_label_or_box_are_flagged(tmp_path:
     v = {k.removeprefix(f"{S}.stability."): x for k, x in m.items.items()
          if k.startswith(f"{S}.stability.")}
     assert v["id_agreement"].value < 1.0 and v["id_agreement"].passed is False
-    assert set(v) == {"id_agreement", "label_agreement"}  # a moved box is not judged here
-    assert v["id_agreement"].detail["boxes_after_alignment"]["centre_delta_median_m"] > 0.1
+    assert set(v) == {"id_agreement", "label_agreement", "centre_delta_median_m",
+                      "extent_delta_median_rel", "obb_iou_median"}
+    # both boxes moved by 0.2 m: beyond what refining an OBB allows
+    assert v["centre_delta_median_m"].value == pytest.approx(0.2, abs=1e-3)
+    assert v["centre_delta_median_m"].passed is False
     rows = details["splits"]["split_3_3"]["stability"]
     assert {(r["single_id"], r["split_id"]) for r in rows} == {(9, 1), (2, 2)}
     # the monitor's published id 1 is gone after the last update
@@ -368,6 +397,32 @@ def test_one_update_vs_split_ids_may_differ_where_an_earlier_update_published_on
                  obj(9, "backpack", (-2.0, 1.0, 0.0), frames=(4, 5))], IMAGES)
     m, _ = judged(tmp_path, late, early_map(with_cup=False), last=final_map(False))
     assert m.items[f"{S}.vs_one_update.id_agreement"].value == pytest.approx(2 / 3)
+    # ids the split map swapped after its first update published them: no allowance
+    final = final_map(False)
+    swapped = MapView([obj(2, "monitor", MONITOR, (0.6, 0.2, 0.4), frames=(0, 1, 2, 5)),
+                       obj(1, "keyboard", KEYBOARD, frames=(0, 5)), final.objects[2]],
+                      final.poses, final.sources, CAMERA)
+    m, _ = judged(tmp_path, renumbered, early_map(with_cup=False), last=swapped)
+    ids = m.items[f"{S}.vs_one_update.id_agreement"]
+    assert ids.value == pytest.approx(1 / 3) and ids.detail["published_earlier"] == []
+
+
+def test_an_extra_object_of_the_split_map_counts_unless_an_earlier_update_published_it(
+        tmp_path: Path) -> None:
+    """mapper.md: the split map may keep an object an earlier update published (here a mouse its
+    first update saw); a box no update published before the last is not excused."""
+    mouse = obj(6, "mouse", (2.0, -0.5, -0.4), (0.1, 0.1, 0.1), frames=(0,))
+    early = early_map(with_cup=False)
+    early = view([*early.objects, mouse], IMAGES[:3])
+    final = final_map(False)
+    last = MapView([*final.objects, mouse, obj(8, "bag", (-2.0, -2.0, 0.0), frames=(5,))],
+                   final.poses, final.sources, CAMERA)
+    m, _ = judged(tmp_path, final, early, last=last)
+    extra = m.items[f"{S}.vs_one_update.unexcused_extra"]
+    assert extra.value == 1 and extra.passed is False
+    assert extra.detail == {"extra_unexcused": [{"id": 8, "label": "bag"}]}
+    matched = m.items[f"{S}.vs_one_update.matched_fraction"]
+    assert matched.detail["extra_published"] == [{"id": 6, "label": "mouse"}]
 
 
 def test_stable_labels_restrict_the_comparison(tmp_path: Path) -> None:
@@ -457,9 +512,7 @@ def scene_doc(v: MapView, name: str) -> dict[str, Any]:
             "source": image, "transforms": {"camera_1_to_map": {
                 "src": "camera_1", "dst": "map",
                 "transform_src_to_dst": {"matrix4x4": T.reshape(-1).tolist()}}}}}
-    fx, fy, cx, cy, w, h = CAMERA
-    streams = {"camera_1": {"type": "camera", "stream_properties": {"intrinsics_pinhole": {
-        "width_px": w, "height_px": h, "camera_matrix": [fx, 0, cx, 0, 0, fy, cy, 0, 0, 0, 1, 0]}}}}
+    streams = {"camera_1": ol.camera_stream(v.camera or CAMERA)}
     objects = {}
     for o in v.objects:
         data: dict[str, Any] = {"cuboid": [{"name": "obb", "val": list(o.cuboid or ())}]}
@@ -540,6 +593,47 @@ def test_the_plan_reports_the_cup_left_in_the_map(tmp_path: Path) -> None:
     assert "Map update: split_3_3, objects that never changed" in text
 
 
+def test_ground_truth_of_the_office_images_is_picked_up(tmp_path: Path) -> None:
+    """spec §5: annotations added later for any example file are judged with no code change. A
+    'poses' file about office images is judged against the map of the whole office sequence (its
+    own yaw offset); an 'objects' file about an office image gets that image segmented; a file
+    about a file that is not an example image is skipped with the reason."""
+    root = office_examples(tmp_path)
+    truth = root / "ground_truth"
+    (truth / "poses.json").write_text(json.dumps({"kind": "poses", "frames": {
+        IMAGES[0]: {"yaw_deg": 10.0, "pitch_deg": 2.0}, IMAGES[4]: {"yaw_deg": 13.0}}}))
+    (truth / "desk.json").write_text(json.dumps({
+        "kind": "objects", "image": f"office_sequence/{IMAGES[1]}", "objects": [{"label": "cup"}]}))
+    (truth / "far.json").write_text(json.dumps({
+        "kind": "objects", "image": "../outside.jpg", "objects": [{"label": "cup"}]}))
+    (truth / "gone.json").write_text(json.dumps({
+        "kind": "objects", "image": "office_sequence/gone.jpg", "objects": [{"label": "cup"}]}))
+    payload = tmp_path / "scene.json"
+    payload.write_bytes(scene_bytes())
+    repo = office_repo(tmp_path, final_map(False), early_map())
+    script(repo, "segment.sh", f'echo "$@" >> "{tmp_path}/segment.log"; cat {payload}')
+    out = tmp_path / "out"
+    ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=root)
+    ev.map_update()
+    assert set(ev.single_poses["office_sequence"] or {}) == set(IMAGES)
+    ev.annotated_images()
+    assert [r.tag for r in ev.runner.records][-1:] == ["segment_annotated_01"]
+    assert (tmp_path / "segment.log").read_text().split() == [
+        "-i", str((root / "office_sequence" / IMAGES[1]).resolve())]
+    ev.ground_truth()
+    m = ev.metrics.items
+    # every office camera looks along the map's x axis: one offset, then no error
+    assert m["gt.poses.yaw_err_median_deg"].value == pytest.approx(1.5)
+    assert m["gt.poses.yaw_err_median_deg"].detail["offset_deg"] == {"office_sequence": -11.5}
+    assert m["gt.poses.pitch_err_median_deg"].value == pytest.approx(2.0)
+    assert list(m["gt.objects.recall"].detail) == [f"office_sequence/{IMAGES[1]}"]
+    skipped = {Path(x["file"]).name: x["reason"] for x in ev.details["ground_truth"]["skipped"]}
+    assert set(skipped) == {"far.json", "gone.json"}
+    assert skipped["gone.json"].startswith("office_sequence/gone.jpg was not evaluated")
+    ev.annotated_images()  # already segmented: not again
+    assert [r.tag for r in ev.runner.records].count("segment_annotated_01") == 1
+
+
 def test_without_an_annotation_or_maps_the_metrics_fail_with_the_reason(tmp_path: Path) -> None:
     out = tmp_path / "out"
     root = office_examples(tmp_path)
@@ -548,6 +642,7 @@ def test_without_an_annotation_or_maps_the_metrics_fail_with_the_reason(tmp_path
     ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=root)
     ev.map_update()
     assert ev.runner.records == []  # nothing is mapped without an annotation
+    assert ev.single_poses == {"office_sequence": None}  # its poses' ground truth: not built
     m = ev.metrics.items["map_update.absent_fraction"]
     assert m.value is None and "no 'map_update' file" in (m.error or "")
     (root / "ground_truth" / "office.json").write_text(json.dumps(ANNOTATION))

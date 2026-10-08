@@ -25,7 +25,13 @@ from typing import Any
 
 from oh_my_slam.commands import spec
 from oh_my_slam.commands.spec import Command, Kind, Mode, Problem, Program
-from oh_my_slam.core.errors import HTTP_STATUS, ExitCode, OhMySlamError, UsageError
+from oh_my_slam.core.errors import (
+    HTTP_STATUS,
+    ExitCode,
+    OhMySlamError,
+    UsageError,
+    internal_message,
+)
 
 PATH_IN = frozenset({Kind.IMAGE, Kind.IMAGES, Kind.IMAGES_OR_VIDEO, Kind.MAP})
 WHERE = frozenset({Kind.FILE_OUT, Kind.FOLDER_OUT})  # options that only choose where it writes
@@ -40,13 +46,12 @@ class Operation:
 
     @property
     def id(self) -> str:
-        """URL-safe id: program, subcommand and mode joined (``segment-image``)."""
-        parts = [self.program.prog.removesuffix(".sh"), self.command.name, self.mode.name]
-        return "-".join(p for p in parts if p)
+        """URL-safe id: program, subcommand and mode joined (``mapper-update``)."""
+        return spec.operation_id(self.program, self.command, self.mode)
 
     @property
     def label(self) -> str:
-        """The command as typed (``segment.sh -i``), the id of ``spec.describe()``."""
+        """The command as typed (``mapper.sh update``), the id of ``spec.describe()``."""
         return self.command.label(self.mode)
 
     @property
@@ -61,8 +66,7 @@ class Operation:
 
     def writes_map(self) -> spec.Option | None:
         """The option naming the map the mode writes (an output written ``via`` that option)."""
-        flags = {o.via for o in self.mode.outputs}
-        return next((o for o in self.options if o.flag in flags and o.kind is Kind.MAP), None)
+        return spec.writes_map(self.command, self.mode)
 
     def entry(self, d: Mapping[str, Any]) -> dict[str, Any]:
         """The mode's ``spec.describe()`` entry as the API offers it: its parameters, their
@@ -88,6 +92,12 @@ def problem(parameters: tuple[str, ...], message: str, code: ExitCode = ExitCode
     return Problem(rule, parameters, message, code)
 
 
+def internal(exc: Exception) -> Problem:
+    """A check that crashed: the command's internal error (exit 1), told as the command tells
+    it."""
+    return problem((), internal_message(exc), ExitCode.INTERNAL, "internal")
+
+
 @dataclass
 class Prepared:
     """A request turned into the command's argv, or the problems that refuse it."""
@@ -108,14 +118,7 @@ def _values(v: Any) -> list[Any]:
 def result_format(op: Operation, params: Mapping[str, Any]) -> str | None:
     """Format of the mode's result for these parameters (its stdout output whose condition holds),
     read through the command's own parser; None if they do not parse."""
-    try:
-        args = spec.parse(op.command, op.mode, params)
-    except OhMySlamError:
-        return None
-    for out in op.mode.outputs:
-        if out.via == RESULT and (not out.when or any(w.holds(args) for w in out.when)):
-            return out.format
-    return None
+    return spec.result_format(op.command, op.mode, params)
 
 
 def media_of(fmt: str | None) -> str:
@@ -123,11 +126,12 @@ def media_of(fmt: str | None) -> str:
     return spec.media_type(fmt) if fmt else "application/octet-stream"
 
 
-def prepare(op: Operation, raw: Any, workspace: Any) -> Prepared:
+def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = None) -> Prepared:
     """Translate an API request into the command's argv and check it with the command's own
     parser and rules (nothing is written). The uploads a request names are listed even when it is
-    refused: it consumes them all the same."""
-    prep = Prepared()
+    refused: it consumes them all the same. ``prep`` is filled as the request is read, so its
+    caller knows them even when a check crashes."""
+    prep = Prepared() if prep is None else prep
     if not isinstance(raw, Mapping):
         prep.problems.append(problem((), "the request body must be a JSON object of parameters"))
         return prep
@@ -148,7 +152,7 @@ def prepare(op: Operation, raw: Any, workspace: Any) -> Prepared:
         try:
             if o.kind is Kind.FLAG and not isinstance(value, bool):
                 raise UsageError(f"{o.flag} is a flag: give true or false")
-            if not (o.multiple or o.repeatable) and isinstance(value, list | tuple):
+            if not o.multiple and isinstance(value, list | tuple):
                 raise UsageError(f"{o.flag} takes one value")
             if o.kind in PATH_IN:
                 paths = []

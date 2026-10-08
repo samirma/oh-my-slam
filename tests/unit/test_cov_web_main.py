@@ -14,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -139,7 +140,7 @@ def test_a_failure_is_told_in_the_commands_words() -> None:
     assert web_main._failure(ValueError("bad")) == "internal error: ValueError: bad"
 
 
-def test_a_port_that_cannot_be_bound_is_a_usage_error() -> None:
+def test_a_port_that_cannot_be_bound_is_a_usage_error(monkeypatch: pytest.MonkeyPatch) -> None:
     with socket.socket() as taken:
         taken.bind(("0.0.0.0", 0))
         taken.listen(1)
@@ -147,20 +148,85 @@ def test_a_port_that_cannot_be_bound_is_a_usage_error() -> None:
         with pytest.raises(UsageError, match=f"--port {port}: cannot bind .*use another port or "
                                              "--port 0"):
             web_main._bind(port)
+        # taken after the check (or where it cannot look): the bind's own error, in those words
+        monkeypatch.setattr(web_main, "_in_use", lambda port: None)
+        with pytest.raises(UsageError, match=f"--port {port}: cannot bind \\(Address already in "
+                                             "use\\); use another port or --port 0"):
+            web_main._bind(port)
 
 
-def test_a_second_server_sh_opens_the_browser_on_the_running_one(
+@pytest.mark.parametrize("family, address", [(socket.AF_INET, "127.0.0.1"),
+                                             (socket.AF_INET6, "::1")])
+def test_a_port_another_process_listens_on_at_any_address_is_refused(family: int,
+                                                                     address: str) -> None:
+    """With SO_REUSEADDR, macOS binds 0.0.0.0:<n> even while another process listens on
+    127.0.0.1:<n>, which then gets the browser's and --status's connections; and a browser's
+    ``localhost`` may be ::1. Either is refused, naming the address."""
+    with socket.socket(family) as taken:
+        taken.bind((address, 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        with pytest.raises(UsageError, match=f"--port {port}: cannot bind \\(another process "
+                                             f"listens on it at {address}\\); use another port "
+                                             "or --port 0"):
+            web_main._bind(port)
+
+
+def test_a_port_that_only_closed_connections_hold_is_bound_again_at_once(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A service that just stopped leaves its port in TIME_WAIT, which only SO_REUSEADDR binds
+    over: it is no other process, so the port binds at once; so does a free one."""
+    from oh_my_slam.web import app as web_app
+
+    # the unit tests run offline: the machine's own addresses are its loopback ones (and names)
+    monkeypatch.setattr(web_app, "machine_hosts",
+                        lambda: {"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+    with socket.socket() as server:
+        server.bind(("0.0.0.0", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            accepted, _ = server.accept()
+            accepted.close()  # the server closes first: its side is left in TIME_WAIT
+            client.recv(1)
+    assert not web_main._binds(socket.AF_INET, port)
+    assert web_main._in_use(port) is None
+    with web_main._bind(port) as sock:
+        assert sock.getsockname()[1] == port
+    with socket.socket() as probe:  # a free port
+        probe.bind(("0.0.0.0", 0))
+        port = probe.getsockname()[1]
+    assert web_main._binds(socket.AF_INET, port) and web_main._binds(socket.AF_INET6, port)
+    with web_main._bind(port) as sock:
+        assert sock.getsockname()[1] == port
+
+
+def test_a_machine_without_ipv6_has_nothing_listening_there(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    real = socket.socket
+
+    def no_ipv6(family: int = socket.AF_INET, *args: Any) -> socket.socket:
+        if family == socket.AF_INET6:
+            raise OSError("Address family not supported by protocol")
+        return real(family, *args)
+
+    monkeypatch.setattr(web_main.socket, "socket", no_ipv6)
+    assert web_main._binds(socket.AF_INET6, 0)
+
+
+def test_a_second_server_sh_reports_the_running_one_and_exits(
         ws: Workspace, held: ServerLock, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str]) -> None:
+    """Spec §2.6: a second server.sh on the same --data reports the running one's URL and exits
+    (it opens no browser)."""
     opened: list[str] = []
     monkeypatch.setattr(web_main.webbrowser, "open", opened.append)
     (ws.root / web_main.STATE).write_text(json.dumps({"pid": os.getpid(),
                                                       "url": "http://0.0.0.0:5555/"}))
     assert web_main.serve(ws, 0, True) == 0
-    assert opened == ["http://127.0.0.1:5555/"]
     assert f"already running for {ws.root} at http://0.0.0.0:5555/" in capsys.readouterr().err
-    (ws.root / web_main.STATE).unlink()  # still starting: no URL to open yet
-    assert web_main.serve(ws, 0, True) == 0 and opened == ["http://127.0.0.1:5555/"]
+    (ws.root / web_main.STATE).unlink()  # still starting: no URL yet
+    assert web_main.serve(ws, 0, True) == 0 and opened == []
     assert "at (starting)" in capsys.readouterr().err
 
 

@@ -233,7 +233,11 @@ def _window(a: NDArray[Any], size: int, op: Any, mode: Literal["edge", "constant
 
 
 def voxel_keys(points: NDArray[Any], voxel: float) -> NDArray[np.int64]:
-    return np.floor(np.asarray(points, dtype=np.float64) / voxel).astype(np.int64)
+    return _voxel_index(points, voxel).astype(np.int64)
+
+
+def _voxel_index(points: NDArray[Any], voxel: float) -> NDArray[np.float64]:
+    return np.floor(np.asarray(points, dtype=np.float64) / voxel)
 
 
 def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "last") -> NDArray[Any]:
@@ -244,7 +248,7 @@ def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "la
     """
     if len(points) == 0:
         return np.zeros(0, dtype=np.int64)
-    keys = _packed(voxel_keys(points, voxel))
+    keys = _voxel_rows(points, voxel)
     if keep == "last":
         rev = keys[::-1]
         _, idx = np.unique(rev, axis=0, return_index=True)
@@ -252,6 +256,25 @@ def voxel_downsample_indices(points: NDArray[Any], voxel: float, keep: str = "la
     else:
         _, out = np.unique(keys, axis=0, return_index=True)
     return np.sort(out)
+
+
+_INT_KEY_LIMIT = 2.0**62  # a voxel index at least this large does not fit an int64 key
+
+
+def _voxel_rows(points: NDArray[Any], voxel: float) -> NDArray[Any]:
+    """The voxel of every point (equal keys <=> same voxel): ``voxel_keys``, packed (``_packed``).
+    Where a coordinate's voxel index does not fit an int64 (the voxel is then finer than the
+    float64 spacing of that coordinate, so each distinct value is a voxel of its own: e.g. ``-p
+    voxel=1e-300``), the keys are float rows, with that coordinate's value in place of its index
+    and a flag column per axis, so a value never equals an index; points never merge for want of
+    key bits."""
+    p = np.asarray(points, dtype=np.float64)
+    with np.errstate(over="ignore"):  # a subnormal voxel: the index is inf
+        q = _voxel_index(p, voxel)
+    fine = ~(np.abs(q) < _INT_KEY_LIMIT)
+    if not fine.any():
+        return _packed(q.astype(np.int64))
+    return np.concatenate([np.where(fine, p, q) + 0.0, fine], axis=1)  # + 0.0: -0.0 is 0.0
 
 
 def unique_rows(keys: NDArray[np.int64]) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
@@ -340,14 +363,6 @@ def _runs(codes: NDArray[np.int64]) -> tuple[NDArray[np.int64], NDArray[np.int64
     order = np.argsort(codes)
     sorted_codes = codes[order]
     return order, np.flatnonzero(np.r_[True, sorted_codes[1:] != sorted_codes[:-1]])
-
-
-def _occupied(points: NDArray[Any], edge: float) -> int:
-    """Occupied voxels of the grid of edge ``edge``."""
-    codes = _voxel_codes(np.asarray(points).reshape(-1, 3), edge)
-    if codes.ndim == 2:
-        return len(np.unique(codes, axis=0))
-    return len(_runs(codes)[1]) if len(codes) else 0
 
 
 def _first_per_voxel(codes: NDArray[np.int64],

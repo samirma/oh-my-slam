@@ -32,10 +32,28 @@ def preflight_dir(folder: Path, option: str) -> None:
 
 
 def preflight_file(path: Path, option: str) -> None:
-    """``preflight_dir`` for the folder of a file the command will write, which must not be a
-    folder itself."""
-    if _check_file(Path(path), option):
-        preflight_dir(Path(path).parent, option)
+    """Prove that the file a command will write at ``path`` can be written, before any work and
+    without creating anything: the checks of ``check_file``, then a temporary file made and
+    removed in the nearest folder of its path that exists. The folders still missing are created
+    only when the file is written (``atomic_write_bytes``), so a command that fails before (e.g.
+    the inference server is down) leaves none behind."""
+    path = Path(path)
+    if not _check_file(path, option):
+        return
+    check_dir(path.parent, option)
+    try:
+        with tempfile.TemporaryFile(dir=_nearest_existing(path.parent)):
+            pass
+    except OSError as exc:
+        raise UsageError(f"{option} {path.parent}: cannot write there ({exc.strerror or exc})"
+                         ) from exc
+
+
+def _nearest_existing(folder: Path) -> Path:
+    """``folder``, or the nearest of its parents that exists."""
+    while not folder.exists() and folder != folder.parent:
+        folder = folder.parent
+    return folder
 
 
 def check_dir(folder: Path, option: str) -> None:
@@ -43,9 +61,7 @@ def check_dir(folder: Path, option: str) -> None:
     can see (a file in the way, a folder it may not write); ``preflight_dir`` still has the last
     word when the command runs."""
     folder = Path(folder)
-    probe = folder
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
+    probe = _nearest_existing(folder)
     if probe.exists() and not probe.is_dir():
         code = errno.EEXIST if probe == folder else errno.ENOTDIR
         raise UsageError(f"{option} {folder}: cannot write there ({os.strerror(code)})")

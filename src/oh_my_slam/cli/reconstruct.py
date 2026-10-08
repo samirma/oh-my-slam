@@ -9,8 +9,8 @@ reconstruction.
 
 The result goes to stdout, or to ``-o <file>`` (stdout then stays empty). ``-p`` needs ``-f ply``
 and is validated before the server is contacted. Each format runs only the inference it needs:
-depth alone for ``-f depth``; for ``-f ply`` segmentation with ``color=segment`` or ``label=on``
-and gravity with ``color=height``.
+depth alone for ``-f depth``; for ``-f ply`` segmentation (with gravity, which its OBB fits need)
+with ``color=segment`` or ``label=on``, gravity alone with ``color=height``.
 """
 
 from __future__ import annotations
@@ -18,17 +18,16 @@ from __future__ import annotations
 import argparse
 import time
 
-from oh_my_slam.cli.common import ArgumentParser, run_main
-from oh_my_slam.client.client import connect
 from oh_my_slam.commands import spec
+from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core import timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.log import PayloadWriter, claim_stdout, get_logger, json_payload_bytes
 from oh_my_slam.core.timing import Stage
-from oh_my_slam.reconstruction.api import reconstruct_image
+from oh_my_slam.reconstruction.api import connect_server, reconstruct_image
+from oh_my_slam.reconstruction.cloud import cloud_ply
 from oh_my_slam.reconstruction.depthimage import depth_png
-from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
-from oh_my_slam.segmentation.cloud import cloud_ply, image_cloud_source
+from oh_my_slam.segmentation.api import image_cloud_source, reconstruct_and_detect, segment_frame
 from oh_my_slam.segmentation.scene import single_image_scene
 
 PROGRAM = spec.RECONSTRUCT
@@ -59,7 +58,7 @@ def _run(args: argparse.Namespace, attrs: CloudAttrs, out: PayloadWriter) -> dic
     stage = timing.stage
     t0 = time.perf_counter()
     with stage(Stage.CONNECT):
-        client = connect()
+        client = connect_server()
     if args.format == "depth":
         with stage(Stage.INFERENCE):
             frame = reconstruct_image(args.image, want_gravity=False, client=client)
@@ -83,6 +82,8 @@ def _run(args: argparse.Namespace, attrs: CloudAttrs, out: PayloadWriter) -> dic
             with stage(Stage.SEGMENT):
                 seg = segment_frame(frame, client=client, detections=dets)
         with stage(Stage.EXPORT):
+            # the reconstruction code derives the cloud; segmentation gives the point labels
+            # (when it ran) and the colour assignment, as data
             data = cloud_ply(image_cloud_source(frame, seg), attrs)
         with stage(Stage.WRITE):
             out.write_bytes(data)

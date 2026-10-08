@@ -18,7 +18,8 @@ from oh_my_slam.core.geometry import angle_between_deg, rot_z, rotation_between
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import frame as mframe
 from oh_my_slam.mapping import ingest, retrieval, store, validity
-from oh_my_slam.mapping.objects import MapObject, ObjectState, overlap_fraction, projected_mask
+from oh_my_slam.mapping.objects import MapObject, ObjectState, overlap_fraction, projected_iou
+from tests.mapsnap import full_tree_hash
 from tests.synth.scene import Box, Room, look_at, render
 
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
@@ -50,12 +51,12 @@ def test_store_create_commit_and_read(tmp_path: Path) -> None:
 def test_store_uncommitted_update_leaves_map_untouched(tmp_path: Path) -> None:
     root = tmp_path / "m"
     _make_map(root)
-    before = store.full_tree_hash(root)
+    before = full_tree_hash(root)
     with pytest.raises(RuntimeError), store.MapTransaction(root) as tx:
         tx.write_bytes("per_frame/f000000/x.bin", b"two")
         tx.write_json(store.MAP_JSON, {"update_count": 99})
         raise RuntimeError("killed mid-update")
-    assert store.full_tree_hash(root) == before
+    assert full_tree_hash(root) == before
     assert not (root / store.STAGING).exists()
 
 
@@ -63,7 +64,7 @@ def test_store_killed_process_leaves_map_untouched(tmp_path: Path) -> None:
     """A real process killed (SIGKILL) during staging: map.json unchanged, next update cleans."""
     root = tmp_path / "m"
     _make_map(root)
-    before = store.full_tree_hash(root)
+    before = full_tree_hash(root)
     code = (
         "import os, time, sys\n"
         "from pathlib import Path\n"
@@ -77,7 +78,7 @@ def test_store_killed_process_leaves_map_untouched(tmp_path: Path) -> None:
     assert proc.stdout is not None and proc.stdout.readline().strip() == "staged"
     proc.kill()
     proc.wait()
-    assert store.full_tree_hash(root) == before
+    assert full_tree_hash(root) == before
     assert (root / "per_frame/f000000/x.bin").read_bytes() == b"one"
     with store.MapTransaction(root) as tx:  # lock released by the kernel; staging discarded
         assert not (root / store.STAGING / "per_frame").exists()
@@ -123,6 +124,36 @@ def test_store_overlay_falls_back_to_the_applied_file(tmp_path: Path) -> None:
     assert reader.path("per_frame/f000000/x.bin").read_bytes() == b"new"
     assert reader.path("per_frame/f000000/y.bin").read_bytes() == b"staged"  # still staged
     assert reader.meta["update_count"] == 2
+
+
+def test_a_first_update_killed_while_applying_its_commit_is_recovered(tmp_path: Path) -> None:
+    """A new map's first update killed after its commit point, partway through moving its files
+    into place: ``map.json`` (moved last) is not there yet, but the folder is a map — readers see
+    it through the overlay, and the next update rolls it forward instead of refusing the folder
+    as not a map."""
+    from oh_my_slam.mapping.locate import open_map
+
+    root = tmp_path / "m"
+    tx = store.MapTransaction(root).__enter__()  # from a missing folder
+    assert tx.created
+    tx.write_json(store.FRAMES_JSON, {"frames": []})
+    tx.write_bytes("per_frame/f000000/x.bin", b"one")
+    tx.write_json(store.MAP_JSON, {"update_count": 1})
+    files = [store.FRAMES_JSON, "per_frame/f000000/x.bin", store.MAP_JSON]
+    (tx.staging / store.COMMIT).write_text(json.dumps({"files": files, "delete": []}))
+    tx.__exit__(None, None, None)
+    (root / "per_frame/f000000").mkdir(parents=True)
+    (tx.staging / "per_frame/f000000/x.bin").replace(root / "per_frame/f000000/x.bin")  # applied
+    assert not (root / store.MAP_JSON).exists()
+    assert store.classify(root) == "map" and store.refuse_non_map(root) == "map"
+    reader = open_map(root)  # ``locate`` reads it (through the overlay) and writes nothing
+    assert reader.meta["update_count"] == 1 and reader.frames == []
+    assert not (root / store.MAP_JSON).exists() and (tx.staging / store.COMMIT).exists()
+    with store.MapTransaction(root) as again:  # the next update rolls it forward
+        assert not again.created
+    assert json.loads((root / store.MAP_JSON).read_text())["update_count"] == 1
+    assert (root / store.FRAMES_JSON).exists() and not (root / store.STAGING).exists()
+    assert store.MapReader(root).meta["update_count"] == 1
 
 
 def test_store_lock_delete_and_folder_rules(tmp_path: Path) -> None:
@@ -233,6 +264,16 @@ def test_resolve_inputs_images_in_order_or_one_video(tmp_path: Path) -> None:
         ingest.resolve_inputs([d / "notes.txt"])
     with pytest.raises(InputError, match="is a folder"):
         ingest.resolve_inputs([d])
+    # hidden files are skipped only where a folder is expanded (the shell's glob): one named
+    # explicitly is an input like any other, and an AppleDouble companion is no image (exit 2)
+    Image.new("RGB", (8, 8)).save(d / ".hidden.jpg", format="JPEG")
+    (d / "._a.jpg").write_bytes(b"\x00\x05\x16\x07AppleDouble")
+    spec = ingest.resolve_inputs([d / ".hidden.jpg", d / "._a.jpg"])
+    assert [p.name for p in spec.images] == [".hidden.jpg", "._a.jpg"]
+    kfs = ingest.keyframes(spec, 2.0, tmp_path / "frames", 0)
+    assert next(kfs).source == str(d / ".hidden.jpg")
+    with pytest.raises(InputError, match="cannot read image"):
+        next(kfs)
 
 
 def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
@@ -377,6 +418,70 @@ def test_latest_wins_removed_box_and_no_false_hits() -> None:
     assert validity.well_registered({}, "multiview")
 
 
+def test_latest_wins_within_an_update_follows_input_order(tmp_path: Path) -> None:
+    """Spec §2.3: within one update a later keyframe wins over an earlier one, in input order
+    (``validity.apply_input_order``): a box seen first and then gone loses its pixels in the
+    keyframe that saw it; a box that appears in the last keyframe keeps them, and the earlier
+    keyframes lose the wall it now hides. Keyframes the cloud is not drawn from (low confidence)
+    judge nothing, and a keyframe whose image no later one overlaps is not judged."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.core.images import png_bytes
+
+    box = Box(np.array([0.0, 0.0, 0.4]), np.array([0.6, 0.6, 0.8]))
+    with_box, without = Room(boxes=[box]), Room(boxes=[])
+    at = look_at(np.array([2.2, 0.3, 1.4]), np.array([0.0, 0.0, 0.4]))
+    later = [look_at(np.array([2.1, y, 1.5]), np.array([0.0, 0.0, 0.4])) for y in (-0.3, 0.5)]
+    away = look_at(np.array([2.2, 0.3, 1.4]), np.array([4.0, 0.3, 1.4]))  # the wall behind
+
+    def run(shots: list[tuple[Room | None, Pose]], low: frozenset[int] = frozenset()
+            ) -> tuple[list[np.ndarray], list[np.ndarray], dict]:
+        root = tmp_path / f"m{len(list(tmp_path.iterdir()))}"
+        with store.MapTransaction(root) as tx:
+            new = []
+            for k, (room, pose) in enumerate(shots):
+                depth = (render(room, pose, K).depth if room is not None
+                         else np.zeros((K.height, K.width), np.float32)).astype(np.float32)
+                name = store.frame_name(k)
+                rec = store.FrameRecord(k, name, "", "", 1, K.width, K.height, K, pose, K.width,
+                                        K.height, pose_source="sfm-global", update_id=1,
+                                        stats={"observations": 500.0, "reproj_error": 0.5},
+                                        low_confidence=k in low)
+                tx.write_bytes(store.frame_file(name, "valid.png"),
+                               png_bytes((depth > 0).astype(np.uint8) * 255))
+                new.append(SimpleNamespace(record=rec, depth=depth))
+            ctx = SimpleNamespace(tx=tx, new=new, notes={})
+            validity.apply_input_order(ctx, lambda m: None)
+            valid = [store.load_valid(tx.current, nf.record.name) for nf in new]
+        return valid, [nf.depth > 0 for nf in new], ctx.notes
+
+    # gone: the first keyframe saw the box, the later ones see the floor and wall behind it
+    valid, had, notes = run([(with_box, at), (without, later[0]), (without, later[1])])
+    box_px = render(with_box, at, K).ids == 2
+    lost = had[0] & ~valid[0]
+    assert lost[box_px].mean() > 0.6 and lost[~box_px & had[0]].mean() < 0.02
+    for v, h in zip(valid[1:], had[1:], strict=True):
+        np.testing.assert_array_equal(v, h)  # nothing later judges the later ones' view
+    assert notes["latest_wins_within"]["frames_changed"] == 1
+    # arrived: the box stands in the last keyframe; the earlier ones lose what it hides
+    valid, had, _ = run([(without, later[0]), (without, later[1]), (with_box, at)])
+    np.testing.assert_array_equal(valid[2], had[2])
+    for k, pose in enumerate(later):
+        hidden = render(with_box, pose, K).ids == 2  # where the box stands in this view
+        lost = had[k] & ~valid[k]
+        assert lost[hidden].mean() > 0.3 and lost[~hidden & had[k]].mean() < 0.02, k
+    # low-confidence keyframes do not vote: the box seen first stays
+    valid, had, notes = run([(with_box, at), (without, later[0]), (without, later[1])],
+                            low=frozenset({1, 2}))
+    np.testing.assert_array_equal(valid[0], had[0])
+    assert "latest_wins_within" not in notes
+    # a keyframe looking away, and one without depth, overlap no later keyframe's points
+    valid, had, notes = run([(with_box, away), (None, at), (with_box, at), (without, later[0])])
+    np.testing.assert_array_equal(valid[0], had[0])
+    np.testing.assert_array_equal(valid[1], had[1])
+    assert notes["latest_wins_within"]["pairs"] == 2 + 1  # (blank: 2 later), (box view: 1)
+
+
 # --- objects ------------------------------------------------------------------------------------
 
 
@@ -394,11 +499,11 @@ def test_object_bookkeeping_and_projection() -> None:
     assert overlap_fraction(pts, pts, 0.01) == 1.0
     assert overlap_fraction(pts, pts + 5.0, 0.1) == 0.0
     assert overlap_fraction(np.zeros((0, 3)), pts, 0.1) == 0.0
-    view = _view(Room(boxes=[Box(np.zeros(3) + [0, 0, 0.4], np.array([0.6, 0.6, 0.8]))]),
-                 look_at(np.array([2.0, 0.0, 1.2]), np.array([0.0, 0.0, 0.4])))
-    m = projected_mask(view, o.points)
-    assert m.sum() > 500
-    assert not projected_mask(view, np.zeros((0, 3))).any()
+    room = Room(boxes=[Box(np.zeros(3) + [0, 0, 0.4], np.array([0.6, 0.6, 0.8]))])
+    pose = look_at(np.array([2.0, 0.0, 1.2]), np.array([0.0, 0.0, 0.4]))
+    view, box = _view(room, pose), render(room, pose, K).ids == 2
+    assert projected_iou(view, box, o.points) > 0.5
+    assert projected_iou(view, box, np.zeros((0, 3))) == 0.0
     st = ObjectState([o], 6, {9: 5, 12: 9})
     assert st.resolve(12) == 5 and st.resolve(77) is None
     assert st.exported() == []  # unconfirmed, no OBB yet
@@ -418,7 +523,7 @@ def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path,
     a = ap.parse_args(["update", "-i", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-o", "c.ply",
                        "-p", "voxel=0.05,normals=on", "-t", "single", "-fps", "3"])
     assert a.inputs == [Path("a.jpg"), Path("b.jpg")] and (a.mode, a.fps) == ("single", 3.0)
-    assert (a.output, a.attrs) == (Path("c.ply"), ["voxel=0.05,normals=on"])
+    assert (a.output, a.attrs) == (Path("c.ply"), "voxel=0.05,normals=on")
     for bad, message in ((["update", "-m", "m"], "required: -i"),
                          (["update", "-i", "x.mp4"], "required: -m"),
                          (["update", "-a", "x.mp4", "-m", "m"], "required: -i"),
@@ -482,8 +587,9 @@ def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyP
 
 def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Spec §2.3: ``-fps`` is ignored for images, so any value (0, negative) only warns; for a
-    video a non-positive value is a usage error. Through the shell with the server down, images
-    with ``-fps 0`` reach the server check (exit 3, not 2) after the warning."""
+    video a non-positive or non-finite value (nan, inf) is a usage error. Through the shell with
+    the server down, images with ``-fps 0`` reach the server check (exit 3, not 2) after the
+    warning."""
     from types import SimpleNamespace
 
     from oh_my_slam.cli import mapper as cli_mapper
@@ -509,8 +615,8 @@ def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path
     from oh_my_slam.mapping.ingest import DEFAULT_FPS
 
     assert [c["fps"] for c in calls] == [DEFAULT_FPS] * 3  # ignored: the default is passed on
-    for fps in ("0", "-1"):
-        with pytest.raises(UsageError, match="-fps must be positive"):
+    for fps in ("0", "-1", "nan", "inf"):  # refused before the server is contacted
+        with pytest.raises(UsageError, match="-fps must be a positive finite number"):
             cli_mapper.main(["update", "-i", "x.mp4", "-m", str(tmp_path / "m"), "-fps", fps])
     assert len(calls) == 3 and warnings == []
 
@@ -557,12 +663,12 @@ def _surface_distance(room: Room, xyz: np.ndarray) -> np.ndarray:
 def test_fused_cloud_collapses_per_frame_depth_disagreement() -> None:
     """Frames whose depth disagrees by ±3 % give one surface, not one offset copy per frame."""
     from oh_my_slam.mapping.geometry import fused_cloud_points
-    from oh_my_slam.reconstruction.pointcloud import frame_cloud
+    from oh_my_slam.reconstruction.pointcloud import pixel_points
 
     scales = [1.03, 0.97, 1.02, 0.98, 1.03, 0.97, 1.01, 0.99, 1.03, 0.97, 1.02, 0.98]
     room, frames = _cloud_frames(scales)
-    stacked = np.concatenate([frame_cloud(fd.depth, fd.rgb, fd.rec.K_grid, fd.valid,
-                                          fd.rec.T_map_cam)[0].xyz for fd in frames])
+    stacked = np.concatenate([fd.rec.T_map_cam.apply(pixel_points(fd.depth, fd.rec.K_grid,
+                                                                  fd.valid)[0]) for fd in frames])
     fused = fused_cloud_points(frames, voxel=0.01, depth_max=6.0)
     assert len(fused) > 10_000
     d_old = _surface_distance(room, stacked)
@@ -696,14 +802,15 @@ def test_border_depth_defers_to_keyframes_that_see_the_surface_centrally() -> No
     """A keyframe whose depth is 7 % too deep in its outer 15 % (monocular depth is least reliable
     at the image border): where its neighbours see those surfaces near their centre, its border
     takes their depth; its centre, and what no neighbour sees centrally, keep theirs."""
-    from oh_my_slam.mapping.geometry import BORDER_BAND, _central, correct_borders
+    from oh_my_slam.mapping.geometry import correct_borders
+    from oh_my_slam.reconstruction.borders import BORDER_BAND, central
 
     room, frames = _cloud_frames([1.0] * 12)
     truth = [fd.depth.copy() for fd in frames]
     fd0 = frames[0]
     h, w = fd0.depth.shape
-    border = ~_central(np.arange(w)[None, :] + 0.5, np.arange(h)[:, None] + 0.5, w, h,
-                       BORDER_BAND)
+    border = ~central(np.arange(w)[None, :] + 0.5, np.arange(h)[:, None] + 0.5, w, h,
+                      BORDER_BAND)
     fd0.depth = np.where(border, fd0.depth * 1.07, fd0.depth).astype(np.float32)
     assert correct_borders(frames) > 0
     ok = fd0.valid & (truth[0] > 0)

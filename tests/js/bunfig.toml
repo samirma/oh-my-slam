@@ -1,0 +1,10 @@
+# bun test configuration of the browser modules' unit tests (tests/unit/test_js_units.py runs them
+# with coverage, from this folder).
+[test]
+preload = ["./setup.js"]
+# vendored third-party libraries (three.js) and the test helpers are not measured
+coveragePathIgnorePatterns = ["**/vendor/**", "setup.js", "helpers.js"]
+
+[install]
+# never install a package on import: the tests import nothing from a registry
+auto = "disable"

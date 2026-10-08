@@ -39,7 +39,7 @@ from oh_my_slam.tools.evaluate.contracts import (
 )
 from oh_my_slam.tools.evaluate.scene import doc_objects
 from oh_my_slam.viewer.bundle import DisplayCloud
-from oh_my_slam.viewer.routes import cloud_payload
+from oh_my_slam.viewer.routes import cloud_document
 
 IDS = (1, 2, 7, 23)  # 23: a hue-rotated palette colour
 
@@ -186,7 +186,7 @@ def test_cloud_colours_without_labels() -> None:
 def test_viewer_cloud_colours() -> None:
     """The viewer's /api/cloud?color=segment payload, decoded with the viewer's own parser."""
     def served(cloud: PointCloud) -> bytes:
-        return cloud_payload(DisplayCloud(cloud, len(cloud), 0.0, 0.0), "color=segment")
+        return cloud_document(DisplayCloud(cloud, len(cloud), 0.0, 0), "color=segment").tobytes()
 
     cloud = labelled_cloud()
     assert served_cloud_problems(served(cloud), set(IDS)) == []
@@ -227,7 +227,7 @@ def test_segmented_png_exact_masks() -> None:
 
 def test_catalogue_colours() -> None:
     objs = doc_objects(scene_doc())
-    csv_text, md_text = catalog_csv(objects()), catalog_md(objects())
+    csv_text, md_text = catalog_csv(objects()), catalog_md(objects(), "t")
     assert catalog_csv_problems(csv_text, objs) == []
     assert catalog_md_problems(md_text, objs) == []
     wrong = color_hex_for_id(3)

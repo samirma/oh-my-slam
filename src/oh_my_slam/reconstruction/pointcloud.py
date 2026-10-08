@@ -1,6 +1,6 @@
 """Points from a depth grid: the pixel selection of the §2.2 point-cloud attributes (validity,
-depth range, flying pixels, stride), unprojection with per-pixel colours from the resized image,
-normals from the depth map, and normals of an unordered (map) cloud."""
+depth range, flying pixels, stride), the unprojection of the selected pixels, normals from the
+depth map, and normals of an unordered (map) cloud."""
 
 from __future__ import annotations
 
@@ -14,11 +14,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.cloud_attrs import CloudAttrs
+from oh_my_slam.core.constants import MAX_GRID_SIDE as MAX_GRID_SIDE
 from oh_my_slam.core.geometry import depth_edge_mask, unproject_pixels
-from oh_my_slam.core.ply import PointCloud
-from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.core.types import Intrinsics
 
-MAX_GRID_SIDE = 1024
 NORMAL_NEIGHBOURS = 16  # k of the k-NN plane fit for map normals
 _NORMAL_CHUNK = 65_536  # points per worker task
 
@@ -54,23 +53,6 @@ def pixel_points(depth: NDArray[Any], K: Intrinsics, mask: NDArray[Any]) -> tupl
     z = np.asarray(depth)[v, u].astype(np.float64)
     pts = unproject_pixels(u, v, z, K.K())
     return pts, v * mask.shape[1] + u
-
-
-def frame_cloud(
-    depth: NDArray[Any],
-    rgb: NDArray[np.uint8],
-    K: Intrinsics,
-    mask: NDArray[Any],
-    T_parent_cam: Pose | None = None,
-) -> tuple[PointCloud, NDArray[Any]]:
-    """Coloured cloud for ``mask`` pixels, optionally transformed; also returns pixel indices."""
-    if rgb.shape[:2] != depth.shape:
-        raise ValueError(f"image {rgb.shape[:2]} and depth {depth.shape} grids differ")
-    pts, idx = pixel_points(depth, K, mask)
-    if T_parent_cam is not None:
-        pts = T_parent_cam.apply(pts)
-    colors = rgb.reshape(-1, 3)[idx]
-    return PointCloud(pts.astype(np.float32), colors), idx
 
 
 # --- normals --------------------------------------------------------------------------------------

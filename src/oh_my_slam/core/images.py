@@ -50,6 +50,52 @@ def load_rgb(path: Path, max_side: int | None = None) -> NDArray[np.uint8]:
     return np.asarray(img, dtype=np.uint8)
 
 
+def undistort_rgb(rgb: NDArray[np.uint8], intr: Intrinsics) -> NDArray[np.uint8]:
+    """The image ``rgb`` as its camera's undistorted image shows it (``Intrinsics.pinhole``: same
+    size and principal point): each pixel takes the colour the lens shows for its ray (bilinear;
+    COLMAP's pixel convention, centres at half-integers). Where the lens shows nothing, the
+    colour of its nearest edge: a black border made the depth network misjudge the surfaces next
+    to it (on ``examples/camera``, keyframes of one pan position then disagreed by 22 % instead of
+    5 %); what it infers there is invalid (``grid_index``). ``intr`` is the camera at ``rgb``'s
+    size. The lens's own image is returned when it has no distortion."""
+    if not intr.k:
+        return rgb
+    import cv2
+
+    h, w = rgb.shape[:2]
+    if (intr.width, intr.height) != (w, h):
+        raise ValueError(f"intrinsics of {intr.width}x{intr.height} for an image of {w}x{h}")
+    v, u = np.mgrid[0:h, 0:w].astype(np.float64) + 0.5
+    src = intr.image_pixels(np.column_stack([u.ravel(), v.ravel()])) - 0.5
+    mx = np.nan_to_num(src[:, 0], nan=-1.0).reshape(h, w).astype(np.float32)
+    my = np.nan_to_num(src[:, 1], nan=-1.0).reshape(h, w).astype(np.float32)
+    return np.asarray(cv2.remap(rgb, mx, my, cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE), np.uint8)
+
+
+def grid_index(dst: Intrinsics, dst_grid: tuple[int, int], src_grid: tuple[int, int],
+               src: Intrinsics | None = None) -> NDArray[np.intp]:
+    """For each pixel of a ``dst_grid`` (width, height) over the undistorted image of the camera
+    ``dst`` (``Intrinsics.pinhole``; the image itself without distortion), the flat index of the
+    ``src_grid`` pixel that shows the same point of the image: a grid over the undistorted image
+    of ``src``, or over the image itself (``src`` None). -1 where the image (beyond the lens) or
+    ``src_grid`` does not show it. Both cameras are the image's, at its full resolution; nearest
+    pixel centres."""
+    gw, gh = dst_grid
+    sw, sh = src_grid
+    v, u = np.mgrid[0:gh, 0:gw].astype(np.float64) + 0.5
+    full = np.column_stack([u.ravel() * dst.width / gw, v.ravel() * dst.height / gh])
+    img = dst.image_pixels(full)
+    at = img if src is None else src.pinhole_pixels(img)
+    with np.errstate(invalid="ignore"):
+        col = np.floor(at[:, 0] * sw / dst.width)
+        row = np.floor(at[:, 1] * sh / dst.height)
+        ok = ((col >= 0) & (col < sw) & (row >= 0) & (row < sh) & (img[:, 0] >= 0)
+              & (img[:, 0] <= dst.width) & (img[:, 1] >= 0) & (img[:, 1] <= dst.height))
+    idx = np.where(ok, np.nan_to_num(row) * sw + np.nan_to_num(col), -1).astype(np.intp)
+    return idx.reshape(gh, gw)
+
+
 def size_at_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
     """(width, height) of a w x h image downscaled so its long side is <= max_side (never up)."""
     scale = max_side / max(w, h)

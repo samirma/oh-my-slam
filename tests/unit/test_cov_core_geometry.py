@@ -64,7 +64,7 @@ def test_grids_too_fine_for_one_code_per_voxel_use_the_keys() -> None:
     pts = np.r_[corners, rng.uniform(0, 1e-9, (1000, 3))]
     grid, idx = g.budget_voxel_grid(pts, 500)
     assert g._voxel_codes(pts, grid.edge).ndim == 2  # (N, 3) keys
-    assert len(idx) == grid.count == g._occupied(pts, grid.edge) <= 500
+    assert len(idx) == grid.count == len(np.unique(g.voxel_keys(pts, grid.edge), axis=0)) <= 500
     assert grid.finer is not None and grid.edge / grid.finer <= 1 + g.BUDGET_EDGE_TOL
     assert set(range(8)) <= set(idx.tolist())  # every corner keeps its own voxel
     keys = g.voxel_keys(pts, grid.edge)

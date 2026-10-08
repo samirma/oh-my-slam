@@ -46,7 +46,7 @@ def nf(i: int, desc: np.ndarray | None = None, up_cam: np.ndarray | None = None,
     kf = SimpleNamespace(index=i, name=f"f{i:06d}", path=Path(f"/x/f{i:06d}.jpg"), exif=exif,
                          source=f"in{i}.jpg")
     return SimpleNamespace(kf=kf, frame=frame, full_size=(640, 480), record=None, depth=None,
-                           dets=[], pose=pose)
+                           dets=[], pose=pose, lens=None, field=())
 
 
 def jpg(i: int) -> str:
@@ -241,9 +241,9 @@ class FakeSfm:
         return self.incremental_model
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
-                               focal_scale: float = 1.0) -> FakeModel:
+                               focal_scale: float = 1.0, distortion: float = 0.0) -> FakeModel:
         m = FakeModel(poses, method="multiview")
-        m.notes["focal_scale"] = focal_scale
+        m.notes.update(focal_scale=focal_scale, distortion=distortion)
         return m
 
 
@@ -259,12 +259,13 @@ def sfm_chain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         return {v.name: Pose.identity() for v in todo}
 
     def refine(ctx: Any, sfm: Any, poses: dict[str, Pose], free: set[str], refine_focal: bool,
-               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float]:
+               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float, float]:
         seen["free"], seen["rotation"] = free, rotation
-        return poses, 1.02
+        return poses, 1.02, -0.3
 
     monkeypatch.setattr(api, "_multiview_poses", multiview)
     monkeypatch.setattr(api, "_refine_multiview", refine)
+    monkeypatch.setattr(api, "_turns_through_lens", lambda ctx, sfm, model, names: False)
     tx = SimpleNamespace(clone_for_edit=lambda rel: tmp_path / rel,
                          stage=lambda rel: tmp_path / "staging" / rel)
     ctx = ctx_of([nf(i, np.ones(8)) for i in range(4)], tmp=tmp_path, tx=tx)
@@ -279,11 +280,113 @@ def test_too_few_keyframes_placed_by_global_and_incremental_fall_back_to_multivi
     msgs: list[str] = []
     model = api._run_sfm(sfm_chain.ctx, False, None, msgs.append)
     assert model.method == "multiview"
-    assert model.notes == {"focal_scale": 1.02, "reason": "SfM placed too few frames",
-                           "metric": True}
+    # the refined camera: its focal length and lens distortion
+    assert model.notes == {"focal_scale": 1.02, "distortion": -0.3,
+                           "reason": "SfM placed too few frames", "metric": True}
     assert sfm_chain.seen["todo"] == [jpg(i) for i in range(4)]  # every keyframe
     assert sfm_chain.seen["free"] == {jpg(1), jpg(2), jpg(3)}  # the first holds the gauge
     assert any("multi-view fallback (SfM placed too few frames); 4 connected" in m for m in msgs)
+
+
+def test_sfm_of_a_lens_turning_in_place_is_a_pan_from_one_spot(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SfM places every keyframe, but rotations alone with a lens explain its matches
+    (``_turns_through_lens``): the multi-view fallback poses them, staged for rotation."""
+    monkeypatch.setattr(FakeSfm, "global_model", FakeModel(line([jpg(i) for i in range(4)])))
+    monkeypatch.setattr(FakeSfm, "component", {jpg(i) for i in range(4)})
+
+    def turns(ctx: Any, sfm: Any, model: Any, names: set[str]) -> bool:
+        ctx.notes["sfm_turning_rejected"] = {"median_deg": 0.2}
+        return True
+
+    monkeypatch.setattr(api, "_turns_through_lens", turns)
+    msgs: list[str] = []
+    model = api._run_sfm(sfm_chain.ctx, False, None, msgs.append)
+    assert model.method == "multiview" and sfm_chain.seen["rotation"] is True
+    assert model.notes["reason"] == "a pan from one spot through a lens with distortion"
+
+
+def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_turns_through_lens``: the rotation-only fit from SfM's rotations within
+    ``TURN_FIT_DEG`` with a lens (found, or the camera's known one) is a pan from one spot; a fit
+    that leaves more, or a pinhole, is not."""
+    from oh_my_slam.mapping import panorama
+    from oh_my_slam.mapping.panorama import PoseFit
+
+    lens = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap", -0.3)
+    names = {jpg(i) for i in range(3)}
+    model = FakeModel(line(sorted(names)))
+    seen: dict[str, Any] = {}
+
+    def run(cam: Intrinsics, median: float, distortion: float, scale: float = 1.0
+            ) -> tuple[bool, Any]:
+        sfm = SimpleNamespace(db=Path("db"), image_intrinsics=lambda ns: {n: (1, cam)
+                                                                         for n in ns})
+
+        def refine(pairs: Any, views: Any, free: Any, refine_focal: bool,
+                   hold_distortion: bool) -> PoseFit:
+            seen.update(free=set(free), refine_focal=refine_focal, hold=hold_distortion,
+                        views=views)
+            return PoseFit({}, scale, pairs=3, median_after_deg=median, distortion=distortion)
+
+        monkeypatch.setattr(panorama, "verified_matches", lambda db, ns, max_per_pair: ["m"])
+        monkeypatch.setattr(panorama, "refine_turning", refine)
+        ctx = ctx_of([])
+        return api._turns_through_lens(ctx, sfm, model, names), ctx.notes  # type: ignore[arg-type]
+
+    assert run(K, 0.2, -0.45)[0] and seen["refine_focal"] and not seen["hold"]
+    assert seen["free"] == {jpg(1), jpg(2)}  # the first holds the gauge
+    assert all(not v.pose.t.any() for v in seen["views"].values())  # rotations alone
+    ok, notes = run(lens, 0.3, 0.0)  # a known lens: held
+    assert ok and seen["hold"] and not seen["refine_focal"]
+    assert notes["sfm_turning_rejected"]["median_deg"] == 0.3
+    assert notes["sfm_turning_rejected"]["distortion"] == -0.3
+    assert not run(K, 2.5, -0.45)[0]  # a camera that moves
+    assert not run(K, 0.2, 0.0)[0]  # a pinhole turning in place: SfM's
+    ok, notes = run(K, 0.2, 0.05)  # a lens term that moves the corners a little: parallax
+    assert not ok and "sfm_turning_rejected" not in notes
+    assert notes["sfm_turning_fit"]["corner_shift"] < api.TURN_LENS_SHIFT
+    # the corners are measured at the focal length the lens was fitted with: at twice the
+    # prior's, the same coefficient moves them a quarter as much
+    ok, notes = run(K, 0.2, -0.3, scale=2.0)
+    assert not ok and notes["sfm_turning_fit"]["corner_shift"] < api.TURN_LENS_SHIFT
+    assert run(K, 0.2, -0.3)[0]
+
+
+def _with_camera(model: FakeModel, focal: float, size: tuple[int, int] = (640, 480)
+                 ) -> FakeModel:
+    model.rec.cameras[len(model.rec.cameras) + 1] = SimpleNamespace(
+        width=size[0], height=size[1], params=[focal, size[0] / 2, size[1] / 2],
+        focal_length_idxs=lambda: [0])
+    return model
+
+
+def test_an_sfm_focal_length_far_off_the_prior_is_a_wrong_model(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The keyframes' prior is 500 px: the global mapper's 1100 px (and a camera of another size
+    at 9000 px, not theirs) is not accepted, nor is incremental mapping's 240 px; the multi-view
+    fallback says why."""
+    names = [jpg(i) for i in range(4)]
+    glob = _with_camera(_with_camera(FakeModel(line(names)), 9000.0, (800, 600)), 1100.0)
+    monkeypatch.setattr(FakeSfm, "global_model", glob)
+    monkeypatch.setattr(FakeSfm, "incremental_model", _with_camera(
+        FakeModel(line(names), method="sfm-incremental"), 240.0))
+    model = api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    assert model.notes["reason"] == "SfM's focal length is off the camera's prior"
+    assert sfm_chain.ctx.notes["sfm_focal_rejected"] == {
+        "sfm-global": {"focal_px": 1100.0, "prior_px": 500.0},
+        "sfm-incremental": {"focal_px": 240.0, "prior_px": 500.0}}
+
+
+def test_an_sfm_focal_length_near_the_prior_or_without_one_is_accepted() -> None:
+    ctx = ctx_of([])
+    near = _with_camera(FakeModel({}), 900.0)
+    assert api._plausible_focal(ctx, near, api.CameraPrior(640, 480, focal=500.0)) is near  # type: ignore[arg-type]
+    far = _with_camera(FakeModel({}), 5000.0)
+    assert api._plausible_focal(ctx, far, api.CameraPrior(640, 480)) is far  # type: ignore[arg-type]
+    assert api._plausible_focal(ctx, None, api.CameraPrior(640, 480, focal=500.0)) is None  # type: ignore[arg-type]
+    assert ctx.notes == {}
 
 
 def test_sfm_points_without_metric_scale_fall_back_to_multiview(
@@ -313,8 +416,10 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     monkeypatch.setattr(panorama, "verified_matches", lambda db, names: pairs)
     seen: dict[str, Any] = {}
 
-    def refine(p: Any, views: dict[str, Any], free: Any, refine_focal: bool = False) -> PoseFit:
+    def refine(p: Any, views: dict[str, Any], free: Any, refine_focal: bool = False,
+               hold_distortion: bool = False) -> PoseFit:
         seen["views"] = sorted(views)
+        seen["hold_distortion"] = hold_distortion
         return PoseFit({jpg(1): Pose.identity()}, 1.0, 2, 40, 1.0, 0.1, {jpg(1): 0.1},
                        {jpg(1): 40})
 
@@ -323,9 +428,10 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
         n: (1, K) for n in names if n != "stray.jpg"})
     ctx = ctx_of([nf(0), nf(1)])
     poses = {jpg(0): Pose.identity(), jpg(1): Pose.identity()}
-    out, focal = api._refine_multiview(ctx, sfm, poses, {jpg(1)}, False, False)  # type: ignore[arg-type]
+    out, focal, distortion = api._refine_multiview(ctx, sfm, poses, {jpg(1)}, False, False)  # type: ignore[arg-type]
     assert seen["views"] == [jpg(0), jpg(1)]  # stray.jpg: no intrinsics, not stored
-    assert focal == 1.0 and ctx.pose_support == {jpg(1): (0.1, 40)}
+    assert seen["hold_distortion"] is False  # pinhole cameras: nothing known to hold
+    assert focal == 1.0 and distortion == 0.0 and ctx.pose_support == {jpg(1): (0.1, 40)}
     assert ctx.notes["pose_refinement"]["pairs"] == 2
 
 
@@ -458,10 +564,10 @@ def test_joining_a_video_merges_another_reconstruction_and_guards_the_re_placed(
         return {v.name: placed[v.name] for v in todo}
 
     def refine(ctx: Any, sfm: Any, p: dict[str, Pose], free: set[str], refine_focal: bool,
-               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float]:
+               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float, float]:
         ctx.pose_support.update({jpg(6): (23.0, 300), jpg(7): (float("inf"), 0),
                                  jpg(2): (0.2, 300)})
-        return p, 1.0
+        return p, 1.0, 0.0
 
     monkeypatch.setattr(api, "_multiview_poses", multiview)
     monkeypatch.setattr(api, "_refine_multiview", refine)
@@ -656,7 +762,7 @@ def extension(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(api, "_multiview_poses", multiview)
     monkeypatch.setattr(api, "_refine_multiview",
-                        lambda ctx, sfm, p, free, refine_focal, rotation, model=None: (p, 1.0))
+                        lambda ctx, sfm, p, free, refine_focal, rotation, model=None: (p, 1.0, 0.0))
     monkeypatch.setattr(api, "_contradicting", lambda s, p, k, judged: {})
     return seen
 
@@ -750,7 +856,9 @@ def test_a_keyframe_neither_sparse_nor_dense_scale_supports_is_rejected(
     fits = {jpg(1): GOOD, jpg(2): ScaleFit(3.0, 200, 0.05)}
     monkeypatch.setattr(api, "_sparse_scale", lambda n, m, name: fits[name])
     monkeypatch.setattr(rdepth, "dense_scale", lambda *a, **k: ScaleFit(3.1, 5000, 0.05))
-    ctx = ctx_of([nf(0), nf(1), nf(2)])  # f0 is not registered
+    low = store.FrameRecord(9, "f000009", "", "", 1, 640, 480, K, Pose.identity(), 64, 48,
+                            low_confidence=True)  # a stored keyframe no dense fit refers to
+    ctx = ctx_of([nf(0), nf(1), nf(2)], [low])  # f0 is not registered
     api._align_depths(ctx, model)  # type: ignore[arg-type]
     assert ctx.new[0].record is None
     assert ctx.new[1].record.stats["depth_scale_method"] == "sparse"
@@ -763,7 +871,9 @@ def test_depth_nodes_skip_unplaced_keyframes_and_one_holds_the_gauge() -> None:
     placed.record = store.FrameRecord(1, "f000001", "", "", 1, 640, 480, K, Pose.identity(),
                                       64, 48, stats={"depth_scale_method": "dense"})
     placed.depth = placed.frame.depth
-    ctx = ctx_of([nf(0), placed])
+    low = store.FrameRecord(9, "f000009", "", "", 1, 640, 480, K, Pose.identity(), 64, 48,
+                            low_confidence=True)  # a stored keyframe of low confidence: none
+    ctx = ctx_of([nf(0), placed], [low])
     nodes = api._scale_nodes(ctx)  # type: ignore[arg-type]
     assert [n.name for n in nodes] == ["f000001"] and not nodes[0].free
     msgs: list[str] = []
@@ -929,3 +1039,30 @@ def test_an_abandoned_rebuild_extends_the_map_as_before(monkeypatch: pytest.Monk
         assert tx.current(store.FRAMES_JSON) == root / store.FRAMES_JSON  # read again
     assert seen["prior"] == [2, 4]  # 7 resolved through the map's merges: 7 -> 3 -> 2
     assert any("rebuild abandoned" in m for m in msgs)
+
+
+def test_an_abandoned_rebuild_gives_the_new_keyframes_back_as_inference_gave_them(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The rebuild inferred a new keyframe again (another lens: its detections moved, its lens
+    changed) before it was abandoned: the extension gets its frame, detections and lens back."""
+    root = tmp_path / "map"
+    plan = _weak_map(root)
+    new = nf(9)
+    new.dets, new.lens = ["det"], None
+    original = new.frame
+
+    def fails(ctx: Any, is_video: bool, client: Any, progress: Any) -> Any:
+        mine = next(n for n in ctx.new if n is new)
+        mine.frame = SimpleNamespace(depth=np.zeros(1), valid=np.zeros(1, bool))
+        mine.dets, mine.lens = ["moved"], Intrinsics(1.0, 1.0, 0.5, 0.5, 2, 2, "colmap", -0.2)
+        raise RegistrationError("none of the input frames overlaps the map")
+
+    monkeypatch.setattr(api, "_place", fails)
+    monkeypatch.setattr(api, "replace", lambda frame, **kw: SimpleNamespace(**{**vars(frame),
+                                                                             **kw}))
+    with store.MapTransaction(root) as tx:
+        meta = store.read_meta_or_default(tx)
+        api._try_rebuild(tx, meta, plan, [new], plan, 2, tmp_path / "work", False, None,
+                         lambda m: None)
+    assert new.dets == ["det"] and new.lens is None and new.record is None
+    np.testing.assert_array_equal(new.frame.depth, original.depth)

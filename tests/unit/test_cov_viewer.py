@@ -21,8 +21,9 @@ from oh_my_slam.core.cloud_attrs import ATTRIBUTES, CloudAttrs, CloudScope, appl
 from oh_my_slam.core.errors import ExitCode, ServerUnavailableError
 from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.reconstruction.cloud import ImageCloudSource
 from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.cloud import ImageCloudSource, map_cloud_source
+from oh_my_slam.segmentation.api import POINT_COLORS, map_cloud_source
 from oh_my_slam.viewer import bundle as vb
 from oh_my_slam.viewer.bundle import ViewBundle, scene_cameras
 from oh_my_slam.viewer.routes import ViewerRoutes
@@ -45,13 +46,13 @@ def logged(logger: logging.Logger) -> Iterator[list[str]]:
 
 def image_source(depth: np.ndarray) -> ImageCloudSource:
     return ImageCloudSource(depth=depth.astype(np.float32), valid=np.ones(depth.shape, bool),
-                            rgb=np.zeros((*depth.shape, 3), np.uint8), K=K)
+                            rgb=np.zeros((*depth.shape, 3), np.uint8), K=K, colors=POINT_COLORS)
 
 
 def small_map(n: int = 4) -> ViewBundle:
     source = map_cloud_source(np.arange(3 * n, dtype=np.float32).reshape(n, 3),
                               np.zeros((n, 3), np.uint8), None, set(), np.zeros((1, 3)))
-    return ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[{"id": 1}])
+    return ViewBundle(mode="map", title="t", scene={}, source=source)
 
 
 # --- controls ------------------------------------------------------------------------------------
@@ -117,7 +118,7 @@ def test_a_map_above_the_budget_finds_its_selection_while_the_browser_starts(
         if t.name == "display-selection":
             t.join(10)
     assert opened_maps == ["display-selection"]  # on its own thread, started by map_bundle
-    assert b.mode == "map" and b.title == "office" and b.catalog == []
+    assert b.mode == "map" and b.title == "office" and b.catalog is None  # an image's only
     assert b.camera_sources == {"f000000": "IMG_1.jpg"}  # keyframe copies name their input
     assert b.scene["openlabel"]["metadata"]["name"] == "m"
 
@@ -150,7 +151,7 @@ def test_a_failed_preparation_is_logged_and_the_page_gets_the_error(
     assert r.status == 500 and json.loads(r.tobytes()) == {
         "error": "MemoryError: cannot allocate 3.2 GB"}
     assert lines[1] == "viewer: /api/cloud failed: cannot allocate 3.2 GB"
-    assert routes.handle("GET", "/api/catalog").status == 200  # the server keeps serving
+    assert routes.handle("GET", "/api/scene").status == 200  # the server keeps serving
 
 
 # --- cameras -------------------------------------------------------------------------------------
@@ -179,12 +180,16 @@ def test_cameras_the_scene_does_not_place_are_not_shown() -> None:
 
 
 def test_an_image_without_the_inference_server_fails_with_exit_3(tmp_path: Path) -> None:
+    from argparse import Namespace
+
     from PIL import Image
+
+    from oh_my_slam.cli.view import make_bundle
 
     img = tmp_path / "room.png"
     Image.fromarray(np.zeros((24, 32, 3), np.uint8)).save(img)
     with pytest.raises(ServerUnavailableError) as err:  # no server in this test session
-        vb.image_bundle(img)
+        make_bundle(Namespace(map=None, image=img))
     assert err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
     assert "./start_inference_server.sh" in str(err.value)
 

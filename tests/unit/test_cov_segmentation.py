@@ -14,10 +14,10 @@ import pytest
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.api import reconstruct_image
+from oh_my_slam.reconstruction.cloud import derive_cloud, derive_thinned
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import colors
-from oh_my_slam.segmentation.api import Detection, pixel_owners, segment_frame
-from oh_my_slam.segmentation.cloud import derive_cloud, derive_thinned, image_cloud_source
+from oh_my_slam.segmentation.api import Detection, image_cloud_source, pixel_owners, segment_frame
 from oh_my_slam.segmentation.lift import MIN_POINTS, lift_mask, support_fringe
 from oh_my_slam.segmentation.obb import fit_upright_obb
 from oh_my_slam.segmentation.scene import single_image_scene
@@ -49,7 +49,6 @@ def test_a_mask_lifted_with_the_models_validity_mask_only() -> None:
     lifted = lift_mask(mask, depth, K, valid)
     cols = lifted.pixels % 80
     assert len(lifted.points) >= MIN_POINTS and (cols >= 40).all()
-    assert lifted.mask_pixels == int(mask.sum())
     assert np.allclose(lifted.points[:, 2], 2.0)
 
 

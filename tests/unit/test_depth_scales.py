@@ -132,10 +132,11 @@ def test_near_far_errors_are_removed_where_one_scale_cannot() -> None:
              zip(true, err, tilt, poses, strict=True)]
     pairs = overlapping(poses)
     corr = solve(views, pairs, {0})
-    # the pairs agree: within 2.5 % where one scale per keyframe leaves 6 % and more
+    # the pairs agree: within 2.5 % where the scales alone leave 4 % and more (the near/far error
+    # is a tilt, which each keyframe's field over its image takes up in part: its floor is near)
     scale_only = [DepthCorrection(c.log_scale, 0.0, c.pivot) for c in corr]
     assert worst_pair(views, [DepthCorrection() for _ in views], pairs) > 0.1
-    assert worst_pair(views, scale_only, pairs) > 0.05
+    assert worst_pair(views, scale_only, pairs) > 0.035
     assert worst_pair(views, corr, pairs) < 0.025
     # and each keyframe is closer to the true depth (the prior "no tilt" holds back part of the
     # tilts, which the pairs observe only as differences between keyframes)
@@ -216,7 +217,8 @@ def record(k: int, T: Pose, method: str, low: bool = False, update: int = 1) -> 
 def new_frame(rec: FrameRecord, raw: np.ndarray, scale: float) -> Any:
     rec.depth_scale = scale
     frame = SimpleNamespace(depth=raw.astype(np.float32), valid=raw > 0)
-    return SimpleNamespace(record=rec, frame=frame, depth=(raw * scale).astype(np.float32))
+    return SimpleNamespace(record=rec, frame=frame, depth=(raw * scale).astype(np.float32),
+                           field=())
 
 
 class _Tx:
@@ -291,6 +293,21 @@ def test_mapper_holds_the_seed_of_a_new_map() -> None:
         assert float(np.median(np.abs(np.log(nf.depth[ok] / d[ok])))) < 0.012
 
 
+def test_a_keyframe_no_other_overlaps_keeps_its_depth() -> None:
+    """A keyframe facing away from the others has no pair: its correction is the identity, its
+    depth and record stay as aligned."""
+    poses = [head_pose(0.0), head_pose(10.0), head_pose(180.0)]
+    raw = [depth_grid(T, KG).astype(np.float64) for T in poses]
+    new = [new_frame(record(k, poses[k], "seed" if k == 0 else "dense"), raw[k] * (1.0 + 0.1 * k),
+                     1.0) for k in range(3)]
+    before = new[2].depth.copy()
+    ctx = SimpleNamespace(old_frames=[], new=new, notes={}, rescaled={}, tx=None)
+    api._adjust_depth_scales(ctx, lambda m: None)  # type: ignore[arg-type]
+    np.testing.assert_array_equal(new[2].depth, before)
+    assert "depth_scale_adjusted" not in new[2].record.stats
+    assert "depth_scale_adjusted" in new[1].record.stats
+
+
 def test_held_keyframes_of_a_large_scene_keep_their_median_depth() -> None:
     """A street-sized scene (the room scaled 5×: median depths 7-12 m) in which every keyframe
     holds its scale (sparse-scaled, as in an outdoor video) and has a near/far error about its
@@ -311,10 +328,12 @@ def test_held_keyframes_of_a_large_scene_keep_their_median_depth() -> None:
     api._adjust_depth_scales(ctx, lambda m: None)  # type: ignore[arg-type]
     assert ctx.notes["depth_scale_adjustment"]["fixed"] == N
     exps = ctx.notes["depth_scale_adjustment"]["exponent_range"]
-    assert exps[1] - exps[0] > 0.05  # the keyframes were tilted
+    bend = ctx.notes["depth_scale_adjustment"]["largest_bend"]
+    assert exps[1] - exps[0] > 0.03 and bend > 0.02  # the keyframes were tilted and bent
     medians = [float(np.median(nf.depth[d > 0]) / np.median(r[d > 0]))
                for nf, r, d in zip(new, raw, true, strict=True)]
-    np.testing.assert_allclose(medians, 1.0, atol=2e-3)
+    # (the field over the image has mean 0 over the image, not at the median depth: 0.2 % at most)
+    np.testing.assert_allclose(medians, 1.0, atol=3e-3)
     for nf, r, d in zip(new, raw, true, strict=True):
         ok = d > 0
         err = np.abs(np.log(nf.depth[ok] / d[ok]))
@@ -325,12 +344,15 @@ def test_held_keyframes_of_a_large_scene_keep_their_median_depth() -> None:
 def test_stored_objects_move_with_their_rescaled_keyframes() -> None:
     from oh_my_slam.mapping import objects as mo
 
+    def canonical(points: np.ndarray) -> np.ndarray:
+        return mo.canonical_sources(points, np.zeros(len(points), np.uint8))[0]
+
     T0, T1 = head_pose(0.0), head_pose(10.0)
     recs = [record(0, T0, "seed"), record(1, T1, "dense"), record(2, head_pose(20.0), "dense")]
     rng = np.random.default_rng(0)
     centre = T0.t + 2.0 * T0.R[:, 2]
     pts = rng.uniform(-0.1, 0.1, (400, 3)) + centre
-    o = mo.MapObject(7, "cup", {"cup": 1.6}, [0.8, 0.8], mo.canonical_points(pts), frames=[0, 1],
+    o = mo.MapObject(7, "cup", {"cup": 1.6}, [0.8, 0.8], canonical(pts), frames=[0, 1],
                      obs_depth=2.0)
 
     def sighting(frame: int, p: np.ndarray) -> mo.Sighting:
@@ -338,7 +360,7 @@ def test_stored_objects_move_with_their_rescaled_keyframes() -> None:
         return mo.Sighting(frame, len(p), 0.0, tuple(p.mean(0)), tuple(lo), tuple(hi))
     o.sightings = sorted([sighting(0, pts[:200]), sighting(1, pts[200:])], key=mo.Sighting.key)
     mo.refit(o, None)
-    other = mo.MapObject(9, "lamp", {"lamp": 0.8}, [0.8], mo.canonical_points(pts + 1.0),
+    other = mo.MapObject(9, "lamp", {"lamp": 0.8}, [0.8], canonical(pts + 1.0),
                          frames=[2], obs_depth=2.0)
     other.sightings = [sighting(2, pts + 1.0)]
     state = mo.ObjectState([o, other], 20)

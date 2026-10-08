@@ -171,6 +171,47 @@ def test_views_without_usable_pixels_contradict_nothing() -> None:
     assert px[22:38, 28:52].all() and not px[:10].any()
 
 
+K_DOOR = Intrinsics(160.0, 160.0, 80.0, 60.0, 160, 120)
+
+
+def _door(far: float | None, slope: float = 0.0, patch: bool = False) -> validity.View:
+    """A wall 2 m in front of the camera with a door on the right, through which a corridor is
+    seen ``far`` m away (its depth ``slope`` times steeper per row from the middle), and an
+    object 1.5 m away on the left (``patch``)."""
+    depth = np.full((120, 160), 2.0, np.float32)
+    if far is not None:
+        rows = np.arange(20, 100, dtype=np.float32)[:, None]
+        depth[20:100, 100:140] = far * (1.0 + slope * (rows - 60.0) / 40.0)
+    if patch:
+        depth[40:80, 20:60] = 1.5
+    return validity.View(depth, np.ones(depth.shape, bool), K_DOOR, Pose.identity())
+
+
+def test_the_far_field_of_a_static_scene_is_not_a_change(monkeypatch: pytest.MonkeyPatch
+                                                          ) -> None:
+    """Later keyframes that see the corridor through the door at a third of its depth
+    (monocular depth of the far field) do not invalidate it: on the old keyframe's far cells the
+    margin is at least the disagreement the pair shows there. Where the object stood, which
+    they see empty, is still free space now."""
+    old = _door(8.0, patch=True)
+    later = [_door(8.0 / 3, slope=0.1), _door(8.0 / 3, slope=-0.1)]
+    px = validity.cells_to_pixels(validity.contradicted_cells(old, later), (120, 160))
+    assert px[44:76, 24:56].all()  # the object's place
+    assert not px[24:96, 104:136].any()  # the corridor
+    # with no far field, both later keyframes contradict the corridor
+    monkeypatch.setattr(validity, "FAR_REL", 100.0)
+    px = validity.cells_to_pixels(validity.contradicted_cells(old, later), (120, 160))
+    assert px[44:76, 24:56].all() and px[24:96, 104:136].all()
+    assert validity.far_tolerance(np.ones(validity.FAR_MIN_SAMPLES - 1)) == 0.0  # too few
+    assert validity.far_tolerance(np.full(validity.FAR_MIN_SAMPLES, -1.0)) == 1.0
+
+
+def test_a_keyframe_without_usable_depth_has_no_far_field() -> None:
+    blind = _door(8.0)
+    blind.valid[:] = False
+    assert not validity.contradicted_cells(blind, [_door(8.0 / 3)]).any()
+
+
 class _Tx:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -260,6 +301,23 @@ def test_resume_discards_what_a_rebuild_staged_of_the_derived_files(tmp_path: Pa
         assert tx.current(store.FRAMES_JSON) == root / store.FRAMES_JSON  # read again
 
 
+def test_a_rebuild_replaces_the_map_layout_only(tmp_path: Path) -> None:
+    """``start_over``: the files the map layout owns go unless staged again; an earlier ``-o``
+    result and the user's own files in the folder stay."""
+    root = tmp_path / "m"
+    _map(root)
+    (root / "r.json").write_text("{}")
+    (root / "notes").mkdir()
+    (root / "notes" / "todo.txt").write_text("x")
+    (root / "objects").mkdir(exist_ok=True)
+    (root / "objects" / "points_000001.npy").write_bytes(b"p")
+    with store.MapTransaction(root) as tx:
+        tx.start_over(keep=(store.SFM_DB,))
+        tx.commit({"update_count": 2})
+    assert (root / "r.json").exists() and (root / "notes" / "todo.txt").exists()
+    assert not (root / "objects" / "points_000001.npy").exists()
+
+
 def test_deleting_a_staged_file_drops_the_staged_copy(tmp_path: Path) -> None:
     root = tmp_path / "m"
     _map(root)
@@ -286,3 +344,12 @@ def test_roll_forward_skips_files_applied_before_an_interruption(tmp_path: Path)
         pass
     assert (root / "a.bin").read_bytes() == b"a" and (root / "b.bin").read_bytes() == b"b"
     assert json.loads((root / store.MAP_JSON).read_text())["update_count"] == 2
+
+
+def test_a_map_without_a_cloud_reads_as_an_empty_one() -> None:
+    from types import SimpleNamespace
+
+    from oh_my_slam.mapping.export import map_cloud
+
+    cloud = map_cloud(SimpleNamespace(exists=lambda rel: False))  # type: ignore[arg-type]
+    assert cloud.xyz.shape == (0, 3) and cloud.label is not None and len(cloud.label) == 0

@@ -40,9 +40,7 @@ def test_parse_spec_example_and_every_key() -> None:
     b = parse_cloud_attrs("color=height, stride=3,min-depth=0.5,max-depth=4,edge=0,voxel=0.02,"
                           "normals=on,label=on,encoding=ascii", IMAGE)
     assert b == CloudAttrs("height", 3, 0.5, 4.0, 0.0, 0.02, True, True, "ascii")
-    # several -p options and a mapping (the viewer's controls) are merged the same way
-    assert parse_cloud_attrs(["color=none", "label=on"], IMAGE) == CloudAttrs(color="none",
-                                                                              label=True)
+    # a mapping (the viewer's controls) parses the same way as the -p text
     assert parse_cloud_attrs({"voxel": "0.1", "max-depth": "inf"}, IMAGE) == CloudAttrs(voxel=0.1)
     assert parse_cloud_attrs({"voxel": "0.1"}, MAP) == CloudAttrs(voxel=0.1)
 
@@ -73,6 +71,28 @@ def test_bad_values_are_actionable_usage_errors(spec: str, message: str) -> None
         parse_cloud_attrs(spec, IMAGE)
     assert message in str(e.value)
     assert e.value.exit_code == ExitCode.USAGE
+
+
+def test_a_repeated_p_is_an_argument_error(capsys: pytest.CaptureFixture[str]) -> None:
+    """Spec §2.2 defines one ``-p key=value[,key=value…]``: a second ``-p`` is an argument error
+    (exit 2) before any inference, never merged with the first nor silently replacing it."""
+    from oh_my_slam.commands import spec
+    from oh_my_slam.commands.parser import ParameterError, RaisingParser
+
+    twice = ["-f", "ply", "-p", "voxel=0.1", "-p", "normals=on"]
+    message = ("argument -p: given more than once: give every point-cloud attribute in one -p "
+               "key=value[,key=value...] (e.g. -p color=rgb,voxel=0.01)")
+    for program, argv in ((spec.RECONSTRUCT, ["-i", "a.jpg", *twice]),
+                          (spec.MAPPER, ["update", "-i", "a.jpg", "-m", "m", *twice])):
+        with pytest.raises(SystemExit) as e:
+            spec.build_parser(program).parse_args(argv)
+        assert e.value.code == ExitCode.USAGE and message in capsys.readouterr().err
+        with pytest.raises(ParameterError) as p:  # the web service's parser
+            spec.build_parser(program, RaisingParser).parse_args(argv)
+        assert str(p.value) == message and p.value.parameters == ("attrs",)
+        assert p.value.exit_code == ExitCode.USAGE
+    one = spec.build_parser(spec.RECONSTRUCT).parse_args(["-i", "a.jpg", *twice[:4]])
+    assert one.attrs == "voxel=0.1"  # one -p is its text
 
 
 @pytest.mark.parametrize("key", PIXEL_KEYS)

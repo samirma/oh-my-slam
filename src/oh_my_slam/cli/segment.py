@@ -15,8 +15,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.commands import spec
+from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core import timing
 from oh_my_slam.core.log import claim_stdout, get_logger, json_payload_bytes
 from oh_my_slam.core.timing import Stage
@@ -34,7 +34,7 @@ def build_parser() -> ArgumentParser:
 def _segment_image(args: argparse.Namespace, min_score: float, prepare: Callable[[], None]
                    ) -> bytes:
     """The result (``-f``) of segmenting ``args.image``; the ``-d`` artefacts written."""
-    from oh_my_slam.client.client import connect
+    from oh_my_slam.reconstruction.api import connect_server
     from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
     from oh_my_slam.segmentation.artifacts import write_artifacts
     from oh_my_slam.segmentation.render import segmented_png
@@ -44,7 +44,7 @@ def _segment_image(args: argparse.Namespace, min_score: float, prepare: Callable
     folder: Path | None = args.artifacts
     stage = timing.stage
     with stage(Stage.CONNECT):
-        client = connect()  # exit 3 when the server is down: nothing written, no -d folder
+        client = connect_server()  # exit 3 when the server is down: nothing written, no -d folder
         prepare()  # creates the -d folder
     with stage(Stage.INFERENCE):
         frame, dets = reconstruct_and_detect(image, client, min_score)

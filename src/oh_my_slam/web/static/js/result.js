@@ -4,11 +4,12 @@
 // response body itself, byte for byte (the command's own output); the text shown is that body as
 // received. What is shown follows the result's format and content, never the command: a JSON
 // document that is a scene description (OpenLABEL) has its objects listed; a PLY is drawn in 3D by
-// the viewer's rendering (cloudresult.js), with its header below.
+// the viewer's rendering (cloudresult.js), with its header below; an image (PNG: a depth image, a
+// segmented image) is shown as received.
 import { el, fmtBytes, fmtSeconds, hexColor } from './dom.js';
 import { cloudSection } from './cloudresult.js';
 
-const SHOW_TEXT_MAX = 8 << 20;  // a text body larger than this is offered as a download only
+export const SHOW_TEXT_MAX = 8 << 20;  // a text body larger than this is offered as a download only
 
 // The objects of an OpenLABEL scene description: {id, label, hex, score}, by id.
 export function sceneObjects(doc) {
@@ -39,26 +40,32 @@ export function objectsTable(objects, caption) {
     el('tbody', {}, ...body)));
 }
 
-// Per-stage timings ([{name, ms}], the command's own stage names; `total` last) as a table with a
-// bar per stage (its share of the total, also given as text).
-export function stagesTable(stages, caption = 'Stages') {
+// The rows of a stages table: { total (the `total` stage, if any), parts: every other stage with its
+// `share` of the total (of their sum when there is no total), between 0 and 1 }.
+export function stageShares(stages) {
   const total = stages.find((s) => s.name === 'total');
   const parts = stages.filter((s) => s.name !== 'total');
   const sum = total?.ms || parts.reduce((a, s) => a + (s.ms || 0), 0) || 1;
+  return { total, parts: parts.map((s) => ({ ...s, share: Math.max(0, Math.min(1, (s.ms || 0) / sum)) })) };
+}
+
+// Per-stage timings ([{name, ms}], the command's own stage names; `total` last) as a table with a
+// bar per stage (its share of the total, also given as text).
+export function stagesTable(stages, caption = 'Stages') {
+  const { total, parts } = stageShares(stages);
   return el('div', { class: 'table-wrap' }, el('table', { class: 'data stages', 'data-testid': 'stages' },
     el('caption', {}, caption),
     el('thead', {}, el('tr', {}, el('th', { scope: 'col' }, 'Stage'), el('th', { scope: 'col', class: 'num' }, 'Time'),
       el('th', { scope: 'col' }, 'Share'))),
-    el('tbody', {}, ...parts.map((s) => {
-      const share = Math.max(0, Math.min(1, (s.ms || 0) / sum));
-      return el('tr', {}, el('th', { scope: 'row' }, el('code', {}, s.name)), el('td', { class: 'num' }, fmtSeconds((s.ms || 0) / 1000)),
-        el('td', { class: 'share' }, el('span', { class: 'bar', style: `width:${(share * 100).toFixed(1)}%` }), ` ${Math.round(share * 100)} %`));
-    })),
+    el('tbody', {}, ...parts.map((s) => el('tr', {}, el('th', { scope: 'row' }, el('code', {}, s.name)),
+      el('td', { class: 'num' }, fmtSeconds((s.ms || 0) / 1000)),
+      el('td', { class: 'share' }, el('span', { class: 'bar', style: `width:${(s.share * 100).toFixed(1)}%` }), ` ${Math.round(s.share * 100)} %`)))),
     total ? el('tfoot', {}, el('tr', {}, el('th', { scope: 'row' }, 'Total'), el('td', { class: 'num' }, fmtSeconds(total.ms / 1000)), el('td', {}))) : null));
 }
 
-// A PLY's header (its text up to end_header) and what it declares.
-async function plyHeader(blob) {
+// A PLY's header (its text up to end_header) and what it declares: { header, format, elements:
+// [{name, count}] }, or null when `blob` is no PLY.
+export async function plyHeader(blob) {
   const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 1 << 20)).arrayBuffer());
   const text = new TextDecoder('latin1').decode(head);
   const end = text.indexOf('end_header');
@@ -68,6 +75,23 @@ async function plyHeader(blob) {
   const format = (lines.find((l) => l.startsWith('format ')) || '').split(' ')[1] || '';
   const elements = lines.filter((l) => l.startsWith('element ')).map((l) => { const [, n, c] = l.split(/\s+/); return { name: n, count: Number(c) }; });
   return { header, format, elements };
+}
+
+// What the result says of a PLY's header (plyHeader) in a body of `size` bytes: the summary of its
+// details, and the note on the point data after it.
+export function plyHeaderText(ply, size) {
+  const counts = ply.elements.map((e) => `element ${e.name} ${e.count.toLocaleString()}`).join(', ');
+  return {
+    summary: `Its PLY header (${ply.format}: ${counts || 'no element'})`,
+    note: `The ${fmtBytes(size - ply.header.length)} of ${ply.format.replaceAll('_', ' ')} point data after the header are in the download.`,
+  };
+}
+
+// How a result is shown: 'text' (a JSON or text body, in full, up to SHOW_TEXT_MAX), 'image', or
+// 'other' (a PLY drawn in 3D, else a download only).
+export function resultKind(mediaType, format, size) {
+  if ((/json|text/.test(mediaType) || format === 'json') && size <= SHOW_TEXT_MAX) return 'text';
+  return mediaType.startsWith('image/') ? 'image' : 'other';
 }
 
 // A text result in full: a JSON document formatted for reading (a switch shows it as received;
@@ -100,10 +124,10 @@ export async function resultView({ blob, mediaType, stages, format, downloadName
   box.append(content);
   if (stages.length) box.append(el('details', { class: 'stages-box' }, el('summary', {}, 'Per-stage timings'), stagesTable(stages, 'The command\'s stages (Server-Timing)')));
 
-  let text = null;
   let cloud = null;  // a point cloud's 3D view
-  if (/json|text/.test(mediaType) || format === 'json') text = blob.size <= SHOW_TEXT_MAX ? await blob.text() : null;
-  if (text !== null) {
+  const kind = resultKind(mediaType, format, blob.size);
+  if (kind === 'text') {
+    const text = await blob.text();
     let doc = null;
     try { doc = JSON.parse(text); } catch { /* shown as text */ }
     if (isScene(doc)) {
@@ -111,16 +135,20 @@ export async function resultView({ blob, mediaType, stages, format, downloadName
       content.append(objectsTable(objs, `Objects of the scene (${objs.length})`));
     }
     content.append(...fullText(text, doc));
+  } else if (kind === 'image') {
+    content.append(el('figure', { class: 'result-image', 'data-testid': 'result-image' },
+      el('img', { src: url, alt: `The result: a ${mediaType} image of ${fmtBytes(blob.size)}` }),
+      el('figcaption', { class: 'muted' }, 'The image as received; the download holds the same bytes.')));
   } else {
     const ply = await plyHeader(blob);
     if (ply || format === 'ply') {
       cloud = cloudSection(blob);
       content.append(cloud.el);
       if (ply) {
-        const counts = ply.elements.map((e) => `element ${e.name} ${e.count.toLocaleString()}`).join(', ');
-        content.append(el('details', { class: 'ply-header' }, el('summary', {}, `Its PLY header (${ply.format}: ${counts || 'no element'})`),
+        const { summary, note } = plyHeaderText(ply, blob.size);
+        content.append(el('details', { class: 'ply-header' }, el('summary', {}, summary),
           el('pre', { class: 'result-text', tabindex: '0', 'aria-label': 'The PLY header', 'data-testid': 'result-text' }, ply.header),
-          el('p', { class: 'muted' }, `The ${fmtBytes(blob.size - ply.header.length)} of ${ply.format.replaceAll('_', ' ')} point data after the header are in the download.`)));
+          el('p', { class: 'muted' }, note)));
       }
     } else {
       content.append(el('p', { class: 'muted' }, blob.size > SHOW_TEXT_MAX

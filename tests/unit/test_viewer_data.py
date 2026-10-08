@@ -73,8 +73,12 @@ def test_image_is_reconstructed_and_segmented_once(image_view: Any) -> None:
 
 def test_image_cloud_is_the_reconstruct_ply(image_view: Any, tmp_path: Path) -> None:
     """For every attribute set the served cloud equals ``reconstruct.sh -f ply -p …``."""
-    from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
-    from oh_my_slam.segmentation.cloud import cloud_ply, image_cloud_source
+    from oh_my_slam.reconstruction.cloud import cloud_ply
+    from oh_my_slam.segmentation.api import (
+        image_cloud_source,
+        reconstruct_and_detect,
+        segment_frame,
+    )
 
     url, _, _, _ = image_view
     img, client = synthetic_image(tmp_path)
@@ -181,8 +185,10 @@ def test_map_view_is_read_only_and_needs_no_server(map_view: Any) -> None:
 def view_everything(url: str) -> None:
     for query in ("", "voxel=0.05", "normals=on", "color=segment", "color=height", "color=none"):
         cloud(url, query)
-    for path in ("api/meta", "api/scene", "api/catalog"):
+    for path in ("api/meta", "api/scene"):
         assert get(url + path)[0] == 200
+    for path in ("api/catalog", "api/segmented.png"):  # an image's only (spec §2.5)
+        assert get(url + path)[0] == 404
 
 
 @needs_colmap
@@ -223,14 +229,14 @@ def test_map_camera_positions_are_the_scene_translations(map_view: Any) -> None:
     meta = json.loads(get(url + "api/meta")[1])
     scene = json.loads(get(url + "api/scene")[1])["openlabel"]
     translations = {}
-    for fid, fr in scene["frames"].items():
+    for fr in scene["frames"].values():
         props = fr["frame_properties"]
         (tr,) = props["transforms"].values()
         assert tr["dst"] == "map"
-        translations[int(fid)] = (props["keyframe"], tr["transform_src_to_dst"]["translation"])
+        translations[props["keyframe"]] = tr["transform_src_to_dst"]["translation"]
     assert len(translations) == len(meta["cameras"])
     for cam in meta["cameras"]:
-        assert (cam["name"], cam["position"]) == translations[cam["frame"]]
+        assert cam["position"] == translations[cam["name"]]
         assert np.asarray(cam["T"])[:3, 3].tolist() == cam["position"]
 
 
@@ -240,7 +246,7 @@ def test_map_cloud_is_the_shared_derivation(map_view: Any) -> None:
     for the map's objects (``color=segment``)."""
     from oh_my_slam.mapping import store
     from oh_my_slam.mapping.export import map_objects, reader_source
-    from oh_my_slam.segmentation.cloud import cloud_ply
+    from oh_my_slam.reconstruction.cloud import cloud_ply
 
     url, root, _ = map_view
     reader = store.MapReader(root)

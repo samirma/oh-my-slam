@@ -54,6 +54,10 @@ SFM_MODEL = "sfm/model"
 STAGING = ".staging"
 LOCK = ".lock"
 COMMIT = "COMMIT"
+# what the map layout owns (README "Map folder"): a rebuild replaces these, nothing else in the
+# folder (an earlier ``-o`` result, the user's own files)
+OWNED_DIRS = ("frames", "per_frame", "sfm", "objects")
+OWNED_FILES = (FRAMES_JSON, OBJECTS_JSON, CLOUD_PLY, CLOUD_OBJECTS)
 
 
 def frame_name(index: int) -> str:
@@ -68,6 +72,17 @@ def frame_file(name: str, file: str) -> str:
 def load_depth(path_of: Callable[[str], Path], name: str) -> NDArray[np.float32]:
     """A keyframe's aligned metric depth (``path_of`` resolves map-relative paths)."""
     return np.load(path_of(frame_file(name, "depth.npy"))).astype(np.float32)
+
+
+def keyframe_rgb(path: Path, rec: FrameRecord, max_side: int) -> NDArray[np.uint8]:
+    """A stored keyframe's image at ``max_side`` on the grid of its depth: undistorted for a
+    camera with distortion (``FrameRecord.K_grid``, ``core.images.undistort_rgb``)."""
+    from oh_my_slam.core.images import load_rgb, undistort_rgb
+
+    rgb = load_rgb(path, max_side=max_side)
+    if not rec.K.k:
+        return rgb
+    return undistort_rgb(rgb, rec.K.resized(rgb.shape[1], rgb.shape[0]))
 
 
 def load_valid(path_of: Callable[[str], Path], name: str,
@@ -104,7 +119,9 @@ class FrameRecord:
 
     @property
     def K_grid(self) -> Intrinsics:
-        return self.K.resized(self.grid_width, self.grid_height)
+        """The camera of the keyframe's depth, validity and masks: its pinhole on the grid (the
+        keyframes of a camera with distortion are inferred undistorted)."""
+        return self.K.pinhole().resized(self.grid_width, self.grid_height)
 
     @property
     def order_key(self) -> tuple[float, ...]:
@@ -164,13 +181,16 @@ TOOL_ENTRIES = frozenset({".DS_Store", LOCK, STAGING})
 
 
 def classify(root: Path) -> str:
-    """'missing', 'empty' (no entry, or only ``TOOL_ENTRIES``), 'map' or 'other'."""
+    """'missing', 'empty' (no entry, or only ``TOOL_ENTRIES``), 'map' or 'other'. A folder whose
+    staging holds a committed update is a map even before its ``map.json`` is in place (a first
+    update killed while applying its commit): the next update rolls it forward, and readers see
+    it through the overlay."""
     root = Path(root)
     if not root.exists():
         return "missing"
     if not root.is_dir():
         return "other"
-    if (root / MAP_JSON).is_file():
+    if (root / MAP_JSON).is_file() or _committed_manifest(root) is not None:
         return "map"
     return "other" if any(p.name not in TOOL_ENTRIES for p in root.iterdir()) else "empty"
 
@@ -200,7 +220,7 @@ class MapReader:
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
-        if classify(self.root) != "map" and _committed_manifest(self.root) is None:
+        if classify(self.root) != "map":
             raise NotAMapError(f"not a map folder: {self.root}")
         manifest = _committed_manifest(self.root)
         self._overlay = set(manifest or [])
@@ -338,16 +358,16 @@ class MapTransaction:
         return self._fresh and rel not in self._kept
 
     def start_over(self, keep: tuple[str, ...] = ()) -> None:
-        """Rebuild the map in this update: every committed file but ``map.json`` and ``keep``
-        is deleted at commit unless staged again, and none is read (``current``,
+        """Rebuild the map in this update: every committed file of the map layout (``OWNED_*``)
+        but ``keep`` is deleted at commit unless staged again, and none is read (``current``,
         ``clone_for_edit``) — what the update needs of the old map (its keyframe images) it
-        stages first."""
+        stages first. Other files in the folder (an earlier ``-o`` result) stay."""
         self._fresh = True
         self._kept = set(keep)
         self._started_over = set()
         for p in self.root.rglob("*"):
             rel = p.relative_to(self.root)
-            if (p.is_file() and rel.parts[0] not in (STAGING, LOCK) and str(rel) != MAP_JSON
+            if (p.is_file() and (rel.parts[0] in OWNED_DIRS or str(rel) in OWNED_FILES)
                     and str(rel) not in self._kept):
                 self._started_over.add(str(rel))
         self._deleted |= self._started_over
@@ -447,20 +467,3 @@ def read_frames(tx: MapTransaction) -> list[FrameRecord]:
     if not p.exists():
         return []
     return [FrameRecord.from_dict(f) for f in json.loads(p.read_text()).get("frames", [])]
-
-
-def full_tree_hash(root: Path) -> str:
-    """Hash of every visible file (paths + contents); hidden entries are ignored."""
-    import hashlib
-
-    h = hashlib.sha256()
-    root = Path(root)
-    for p in sorted(root.rglob("*")):
-        rel = p.relative_to(root)
-        if any(part.startswith(".") for part in rel.parts) or not p.is_file():
-            continue
-        h.update(str(rel).encode())
-        with p.open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-    return h.hexdigest()

@@ -1,9 +1,9 @@
 // Cameras: the cameras of the scene as the server lists them (api/meta, viewer/bundle.py
 // scene_cameras), drawn as frustums and listed with their centres and a "Go to".
 //
-// A camera is { name, frame, T (camera-to-scene, 4 x 4 row-major, OpenCV axes: x right, y down,
+// A camera is { name, T (camera-to-scene, 4 x 4 row-major, OpenCV axes: x right, y down,
 // z forward), position (its centre, metres), K: [fx, fy, cx, cy], size: [width, height],
-// update, source (image file name) }.
+// source (image file name) }.
 import * as THREE from 'three';
 import { el } from './dom.js';
 import { srgb } from './obbs.js';
@@ -56,19 +56,27 @@ export function cameraView(f, matrix, bbox, aspect) {
 
 export function fmtCoord(v) { return (Math.abs(v) < 5e-4 ? 0 : v).toFixed(3); }
 
+// What the camera table shows of each camera: { name, source (its image file name when that is
+// not its name, else null), coords: its centre's x, y, z as shown }.
+export function cameraRows(cams) {
+  return cams.map((f) => {
+    const [x, y, z] = f.position;
+    return { name: f.name, source: f.source && f.source !== f.name ? f.source : null,
+      coords: [fmtCoord(x), fmtCoord(y), fmtCoord(z)] };
+  });
+}
+
 // Rows of a camera table (camera, x, y, z, Go to) into `tbody`; `onGo(i)` moves the viewpoint.
 export function fillCameraTable(tbody, cams, onGo) {
   tbody.replaceChildren();
-  cams.forEach((f, i) => {
-    const [x, y, z] = f.position;
+  cameraRows(cams).forEach((r, i) => {
     const go = el('button', { type: 'button', class: 'goto', title: 'Move the viewpoint to this camera',
-      'aria-label': `Go to camera ${f.name}` }, 'Go to');
+      'aria-label': `Go to camera ${r.name}` }, 'Go to');
     go.addEventListener('click', () => onGo(i));
-    const name = el('td', { class: 'cam-name' }, el('span', {}, f.name));
-    if (f.source && f.source !== f.name) name.append(el('small', {}, f.source));
+    const name = el('td', { class: 'cam-name' }, el('span', {}, r.name));
+    if (r.source) name.append(el('small', {}, r.source));
     tbody.appendChild(el('tr', { 'data-index': i }, name,
-      el('td', { class: 'num' }, fmtCoord(x)), el('td', { class: 'num' }, fmtCoord(y)),
-      el('td', { class: 'num' }, fmtCoord(z)), el('td', {}, go)));
+      ...r.coords.map((c) => el('td', { class: 'num' }, c)), el('td', {}, go)));
   });
   if (!cams.length) tbody.append(el('tr', {}, el('td', { colspan: 5, class: 'muted' }, 'No cameras.')));
 }

@@ -214,7 +214,7 @@ def _ready_state() -> ServerState:
     reg = stub_registry()
     worker = GpuWorker()
     worker.start()
-    worker.call(reg.load_all, "cpu")
+    worker.submit(reg.load_all, "cpu").result()
     state = ServerState(registry=reg, worker=worker)
     state.loading = False
     return state

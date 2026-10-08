@@ -3,11 +3,12 @@
 * ``view.sh -i``: one reconstruction + segmentation run (``segmentation.api``, through the
   inference server) gives the OpenLABEL scene, the catalogue, the segmented image and the cloud
   *source* of the image.
-* ``view.sh -m``: the read-only map store (``mapping.export``) gives the same for a map; no
-  inference server is involved and nothing is written.
+* ``view.sh -m``: the read-only map store (``mapping.export``) gives the scene and the cloud
+  source of a map (§2.5: no catalogue, no segmented image); no inference server is involved and
+  nothing is written.
 
 No point cloud is stored here: every cloud the page asks for is derived on request from the source
-kept in memory, by ``segmentation.cloud.derive_cloud`` with the §2.2 attributes the page sends
+kept in memory, by ``reconstruction.cloud.derive_cloud`` with the §2.2 attributes the page sends
 (validated by ``core.cloud_attrs``), so changing a control never re-runs inference. Camera poses are
 read from the scene description, so the viewer shows exactly the poses the JSON states. No
 inference, point-cloud generation, OBB fitting, identity or colour logic lives here.
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import math
 import threading
-import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -36,11 +36,12 @@ from oh_my_slam.core.cloud_attrs import (
     parse_cloud_attrs,
 )
 from oh_my_slam.core.errors import UsageError
-from oh_my_slam.core.geometry import quat_to_rot, rotation_between
+from oh_my_slam.core.geometry import rotation_between
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.ply import PointCloud
+from oh_my_slam.reconstruction.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-from oh_my_slam.segmentation.cloud import CloudSource, ImageCloudSource, derive_thinned, scope_of
+from oh_my_slam.schema.openlabel import stream_intrinsics, transform_pose
 
 if TYPE_CHECKING:
     from oh_my_slam.mapping.store import MapReader
@@ -76,8 +77,7 @@ class DisplayCloud:
     cloud: PointCloud
     total: int  # points of the derived cloud before display thinning
     voxel: float  # display thinning: one point per voxel of this edge, metres (0 = every point)
-    seconds: float  # derivation time
-    owned_bytes: int | None = None  # memory of its arrays not shared with the source (None: all)
+    owned_bytes: int  # memory of its arrays not shared with the source (see :func:`owned_bytes`)
 
 
 def owned_bytes(cloud: PointCloud, source: CloudSource) -> int:
@@ -96,7 +96,7 @@ class ViewBundle:
     title: str
     scene: Json  # the OpenLABEL document, as the commands emit it
     source: CloudSource  # data already computed; every displayed cloud is derived from it
-    catalog: list[Json]
+    catalog: list[Json] | None = None  # an image's catalogue rows (a map has none, §2.5)
     segmented_png: bytes | None = None
     display_transform: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     camera_sources: dict[str, str] = field(default_factory=dict)  # camera name → input file name
@@ -171,11 +171,9 @@ class ViewBundle:
         (``derive_thinned``: normals only for those). Raises ``ValueError`` when the source cannot
         provide ``attrs`` (e.g. ``color=height`` without an estimated gravity)."""
         with self._lock:  # one derivation at a time; sources keep their normals
-            t0 = time.perf_counter()
             thin = derive_thinned(self.source, replace(attrs, label=self.source.labels is not None),
                                   self.point_budget)
-            seconds = time.perf_counter() - t0
-        return DisplayCloud(thin.cloud, thin.total, thin.voxel, seconds,
+        return DisplayCloud(thin.cloud, thin.total, thin.voxel,
                             owned_bytes(thin.cloud, self.source))
 
     def prepare(self) -> None:
@@ -201,43 +199,37 @@ class ViewBundle:
 # camera poses and display frame
 
 
-def _pose_matrix(transform: Json) -> NDArray[np.float64]:
-    T = np.eye(4)
-    T[:3, :3] = quat_to_rot(np.asarray(transform["quaternion"], np.float64))
-    T[:3, 3] = np.asarray(transform["translation"], np.float64)
-    return T
-
-
 def scene_cameras(scene: Json) -> list[Json]:
     """The camera of every frame of an OpenLABEL scene, in the objects' coordinate system: the
     frame's ``<stream> → <cs>`` transform (a map keyframe), or the identity for a stream whose
     sensor frame is itself a root coordinate system (a single image, whose scene is in its camera
     frame). ``T`` is camera-to-scene (4 x 4, row-major) and ``position`` its translation, the
-    camera centre in the scene frame (metres); ``K`` is ``fx, fy, cx, cy`` of the stream's pinhole
-    intrinsics at ``size`` (width, height); ``source`` the file name of the frame's image."""
+    camera centre in the scene frame (metres); ``K`` is ``fx, fy, cx, cy`` at ``size`` (width,
+    height) of the stream camera's undistorted image (``Intrinsics.pinhole``: for a lens with
+    distortion, the pinhole that holds its whole image; else the stream's pinhole); ``source`` the
+    file name of the frame's image."""
     root = scene.get("openlabel", {})
     streams: Json = root.get("streams", {})
     systems: Json = root.get("coordinate_systems", {})
     out: list[Json] = []
-    for fid, fr in sorted(root.get("frames", {}).items(), key=lambda kv: int(kv[0])):
+    for _fid, fr in sorted(root.get("frames", {}).items(), key=lambda kv: int(kv[0])):
         props = fr.get("frame_properties", {})
         by_src = {t["src"]: t for t in props.get("transforms", {}).values()}
         for name, stream in props.get("streams", {}).items():
-            pin = streams.get(name, {}).get("stream_properties", {}).get("intrinsics_pinhole")
-            if pin is None:
+            sp = streams.get(name, {}).get("stream_properties", {})
+            if "intrinsics_pinhole" not in sp:
                 continue
             if name in by_src:
-                T = _pose_matrix(by_src[name]["transform_src_to_dst"])
+                T = transform_pose(by_src[name]["transform_src_to_dst"]).matrix()
             elif systems.get(name, {}).get("parent", "") == "":
                 T = np.eye(4)
             else:
                 continue
-            m = pin["camera_matrix"]
+            cam = stream_intrinsics(sp).pinhole()
             out.append({
-                "name": props.get("keyframe", name), "frame": int(fid), "T": T.tolist(),
+                "name": props.get("keyframe", name), "T": T.tolist(),
                 "position": T[:3, 3].tolist(),
-                "K": [m[0], m[5], m[2], m[6]], "size": [pin["width_px"], pin["height_px"]],
-                "update": props.get("update_id"),
+                "K": [cam.fx, cam.fy, cam.cx, cam.cy], "size": [cam.width, cam.height],
                 "source": Path(str(stream.get("uri", ""))).name,
             })
     return out
@@ -260,22 +252,20 @@ def upright_transform(up_cam: NDArray[Any]) -> NDArray[np.float64]:
 # bundles
 
 
-def image_bundle(image: Path, client: Any = None, min_score: float | None = None) -> ViewBundle:
-    """Reconstruct and segment ``image`` once (inference server), keeping detections of at least
-    ``min_score`` (default: segmentation's); keep its cloud source."""
-    from oh_my_slam.segmentation.api import reconstruct_and_detect, segment_frame
+def image_bundle(image: Path, client: Any) -> ViewBundle:
+    """Reconstruct and segment ``image`` once through ``client`` (the inference server); keep its
+    cloud source."""
+    from oh_my_slam.segmentation.api import (
+        image_cloud_source,
+        reconstruct_and_detect,
+        segment_frame,
+    )
     from oh_my_slam.segmentation.catalog import catalog_rows
-    from oh_my_slam.segmentation.cloud import image_cloud_source
     from oh_my_slam.segmentation.render import segmented_png
     from oh_my_slam.segmentation.scene import single_image_scene
 
-    if client is None:
-        from oh_my_slam.reconstruction.api import connect_server
-
-        client = connect_server()
-    score = {} if min_score is None else {"min_score": min_score}
-    frame, dets = reconstruct_and_detect(Path(image), client, **score)
-    seg = segment_frame(frame, client=client, detections=dets, **score)
+    frame, dets = reconstruct_and_detect(Path(image), client)
+    seg = segment_frame(frame, client=client, detections=dets)
     source = image_cloud_source(frame, seg)
     up = source.up if source.up is not None else DEFAULT_UP_CAM
     return ViewBundle(
@@ -296,7 +286,6 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
 
     from oh_my_slam.mapping import store
     from oh_my_slam.mapping.export import map_objects, reader_source, scene_bytes
-    from oh_my_slam.segmentation.catalog import catalog_rows
 
     if reader is None:
         reader = store.MapReader(Path(map_dir))
@@ -307,7 +296,6 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
         title=reader.root.name,
         scene=json.loads(scene_bytes(reader)),
         source=source,
-        catalog=catalog_rows(objs),
         # keyframe images are copies (frames/fNNNNNN.jpg); name the input they came from
         camera_sources={r.name: Path(r.source).name for r in reader.frames if r.source},
     )
@@ -319,9 +307,9 @@ def map_bundle(map_dir: Path, reader: MapReader | None = None) -> ViewBundle:
 
 
 def bundle_of(values: Any, client: Any = None) -> ViewBundle:
-    """The bundle of a command's validated arguments (``commands.spec.validate``): ``map`` (and
-    its opened ``reader``) gives the map's, else ``image`` the image's, with ``min_score`` when the
-    command has one. ``view.sh`` serves it."""
-    if getattr(values, "map", None) is not None:
-        return map_bundle(values.map, getattr(values, "reader", None))
-    return image_bundle(values.image, client, getattr(values, "min_score", None))
+    """The bundle of ``view.sh``'s validated arguments (``commands.spec.validate``): ``map`` (and
+    its opened ``reader``) gives the map's, else ``image`` the image's, through ``client`` (the
+    inference server)."""
+    if values.map is not None:
+        return map_bundle(values.map, values.reader)
+    return image_bundle(values.image, client)

@@ -1,5 +1,5 @@
 """Reconstruction (the single owner of depth and point-cloud generation, spec §4) at its edges: a
-server whose depth grid is not the image's, gravity without the floor refinement, a floor
+server whose depth grid is not the image's, gravity of an image without a floor, a floor
 refinement that keeps the prior (too little floor, two floor levels, a "floor" above the camera),
 pixel selection and normals without a validity mask, depth pairs that overlap too little, an
 iteration cap on the depth adjustment, the fusion's subsampled grid, a frame with no voxel block
@@ -17,7 +17,7 @@ import pytest
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction import depth as rdepth
 from oh_my_slam.reconstruction import fusion
-from oh_my_slam.reconstruction.api import estimate_gravity, reconstruct_image
+from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.reconstruction.gravity import GravityEstimate, refine_with_floor
 from oh_my_slam.reconstruction.pointcloud import depth_normals, pixel_mask
 from tests.fakes.client import FakeClient, FakeFrame
@@ -42,12 +42,13 @@ def test_a_depth_grid_that_is_not_the_images_is_refused(tmp_path: Path) -> None:
         reconstruct_image(img, client=client, want_gravity=False)
 
 
-def test_gravity_without_the_floor_refinement_is_geocalibs(tmp_path: Path) -> None:
+def test_gravity_of_an_image_without_a_floor_is_geocalibs(tmp_path: Path) -> None:
     client = FakeClient()
-    img = image(tmp_path, client, np.full((120, 160), 2.0))
-    frame = reconstruct_image(img, client=client, want_gravity=False)
-    g = estimate_gravity(frame, client, refine=False)
-    assert g.source == "geocalib" and np.allclose(g.up_cam, UP) and g.floor_height is None
+    img = image(tmp_path, client, np.full((120, 160), 2.0))  # a wall facing the camera
+    frame = reconstruct_image(img, client=client)
+    g = frame.gravity
+    assert g is not None and g.source == "geocalib" and np.allclose(g.up_cam, UP)
+    assert g.floor_height is None
     assert frame.meta["geocalib_focal_px"] == K.fx
 
 

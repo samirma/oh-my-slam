@@ -139,7 +139,7 @@ def depth_fixture(monkeypatch: pytest.MonkeyPatch, sparse: dict[str, ScaleFit],
              for i, n in enumerate(names)}
     ctx = SimpleNamespace(new=[SimpleNamespace(
         kf=SimpleNamespace(name=n.removesuffix(".jpg")),
-        frame=SimpleNamespace(depth=np.ones((4, 4), np.float32), grid_size=(4, 4)))
+        frame=SimpleNamespace(depth=np.ones((4, 4), np.float32), grid_size=(4, 4)), lens=None)
         for n in names])
     model = TrackModel([set(names)], poses)
     monkeypatch.setattr(api, "_frame_depths", lambda c: [])

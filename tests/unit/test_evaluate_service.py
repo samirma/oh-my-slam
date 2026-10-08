@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 import pytest
+from PIL import Image
 
 from oh_my_slam.commands import spec
 from oh_my_slam.core.images import png_bytes
@@ -29,11 +30,11 @@ from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 from tests.unit.test_evaluate_runner import fake_repo, script
 from tests.unit.test_view_cli import minimal_map
 
-INPUTS = sv.Inputs(image="inputs/a.jpg", images=("inputs/b.jpg",),
+INPUTS = sv.Inputs("ref", image="inputs/a.jpg", images=("inputs/b.jpg",),
                    sequence=("inputs/c.jpg", "inputs/d.jpg"), map="reference")
 
 
-def served() -> dict[str, Any]:
+def served() -> list[sv.Op]:
     """The operations as the service's /api/openapi.json describes them."""
     from oh_my_slam.web import openapi, operations
 
@@ -42,8 +43,8 @@ def served() -> dict[str, Any]:
     return got
 
 
-def cases_by_op(describe: dict[str, Any]) -> dict[str, list[sv.Case]]:
-    cases, uncovered = sv.parity_cases(describe, INPUTS)
+def cases_by_op(ops: list[sv.Op]) -> dict[str, list[sv.Case]]:
+    cases, uncovered = sv.parity_cases(ops, [INPUTS])
     assert uncovered == {}
     out: dict[str, list[sv.Case]] = {}
     for c in cases:
@@ -57,7 +58,7 @@ def cases_by_op(describe: dict[str, Any]) -> dict[str, list[sv.Case]]:
 def test_every_operation_of_the_service_gets_its_cases() -> None:
     by_op = cases_by_op(served())
     assert set(by_op) == {"reconstruct", "mapper-update", "mapper-locate",
-                          "segment-image"}  # view.sh stays a command only
+                          "segment"}  # view.sh stays a command only
     variants = {op: [c.variant for c in cs] for op, cs in by_op.items()}
     assert variants["reconstruct"] == ["default", "format=depth", "format=ply",
                                        "attrs=color=segment"]
@@ -65,14 +66,14 @@ def test_every_operation_of_the_service_gets_its_cases() -> None:
                                          "mode=single"]
     assert variants["mapper-locate"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=full"]
-    assert variants["segment-image"] == ["default", "format=png"]
+    assert variants["segment"] == ["default", "format=png"]
     # inputs by kind; -p applies with -f ply only, so its case asks for -f ply
     attrs = by_op["reconstruct"][3]
     assert attrs.params == {"image": "inputs/a.jpg", "attrs": "color=segment", "format": "ply"}
     assert attrs.result_format == "ply" and by_op["reconstruct"][0].result_format == "json"
     # the images are PNG results: the depth image and the segmented image
     assert by_op["reconstruct"][1].result_format == "png"
-    assert [c.result_format for c in by_op["segment-image"]] == ["json", "png"]
+    assert [c.result_format for c in by_op["segment"]] == ["json", "png"]
     assert by_op["mapper-locate"][0].params == {"inputs": ["inputs/b.jpg"], "map": "reference"}
     # a mapping case creates a map of its own, whose name it carries
     update = by_op["mapper-update"]
@@ -102,9 +103,38 @@ def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
     assert variants == ["default", "format=ply", "format=glb", "attrs=color=segment",
                         "quality=best"]  # the choices given above replace json, depth, ply
     # an operation whose input kind has no reference input is reported, not dropped silently
-    cases, uncovered = sv.parity_cases(served(), sv.Inputs(image="inputs/a.jpg"))
-    assert {c.op for c in cases} == {"reconstruct", "segment-image"}
-    assert "mapper.sh update" in uncovered and "inputs" in uncovered["mapper.sh update"]
+    cases, uncovered = sv.parity_cases(served(), [sv.Inputs("a", image="inputs/a.jpg")])
+    assert {c.op for c in cases} == {"reconstruct", "segment"}
+    assert uncovered["mapper.sh update"] == "no reference input for inputs (images_or_video)"
+    assert uncovered["mapper.sh locate"] == "no reference input for inputs, map (images, map)"
+    assert sv.parity_cases(served()[:1], [])[1] == {"reconstruct.sh": "no reference input"}
+
+
+def test_every_reference_input_gets_the_default_case_of_each_mode_it_can_run() -> None:
+    """http_server.md: every mode of the three commands on every reference input. The first
+    input that can run an operation gets its variants; the others its default case; an input the
+    suite already ran (street2.mp4) only the case that run is, writing the map it wrote."""
+    ran = sv.Ran(("update", "-i", "x"), None)  # type: ignore[arg-type]
+    inputs = [sv.Inputs("restaurant.jpg", image="inputs/r.jpg"), INPUTS,
+              sv.Inputs("camera", image="inputs/k.jpg", images=("inputs/l.jpg",),
+                        sequence=("inputs/k.jpg",), map="camera"),
+              sv.Inputs("street2.mp4", sequence=("inputs/street2/street2.mp4",), ran=ran,
+                        writes="street2")]
+    cases, uncovered = sv.parity_cases(served(), inputs)
+    assert uncovered == {}
+    on: dict[tuple[str, str], list[sv.Case]] = {}
+    for c in cases:
+        on.setdefault((c.label, c.input), []).append(c)
+    assert len(on[("reconstruct.sh", "restaurant.jpg")]) == 4  # every variant on the first
+    assert [c.variant for c in on[("reconstruct.sh", "ref")]] == ["default"]
+    assert [c.variant for c in on[("reconstruct.sh", "camera")]] == ["default"]
+    assert len(on[("mapper.sh update", "ref")]) == 4 and len(on[("mapper.sh locate", "ref")]) == 4
+    assert [c.variant for c in on[("mapper.sh locate", "camera")]] == ["default"]
+    (video,) = on[("mapper.sh update", "street2.mp4")]
+    assert video.params == {"inputs": ["inputs/street2/street2.mp4"], "map": "street2"}
+    assert video.ran is ran and video.name == "mapper.sh update [default] on street2.mp4"
+    assert ("mapper.sh locate", "street2.mp4") not in on
+    assert not any(c.ran for c in cases if c.input != "street2.mp4")
 
 
 def test_the_operations_are_read_from_the_openapi_document() -> None:
@@ -118,13 +148,19 @@ def test_the_operations_are_read_from_the_openapi_document() -> None:
     expected = [by_label[d["id"]].entry(d) for d in spec.describe()["operations"]
                 if d["id"] in by_label]
     got, problems = sv.operations_of(openapi.document(ops))
-    assert problems == [] and got == {"operations": expected}
-    assert {o["prog"] for o in got["operations"]} == {p.prog for p in spec.PROGRAMS if p.service}
-    assert not [p for o in got["operations"] for p in o["parameters"]
+    assert problems == [] and [o.entry for o in got] == expected
+    # each matched to its definitions: the service's operation id is the shared one
+    assert [(o.id, o.command, o.mode) for o in got] == [
+        (op.id, op.command, op.mode) for op in ops.values()]
+    assert [o.label for o in got] == [e["id"] for e in expected]
+    assert {o.prog for o in got} == {p.prog for p in spec.PROGRAMS if p.service}
+    assert not [p for o in got for p in o.entry["parameters"]
                 if p["kind"] in ("file_out", "folder_out")]
     doc = openapi.document(ops)
     doc["paths"]["/api/ops/stray"] = {"post": {}}  # an operation path without its entry
-    assert sv.operations_of(doc)[1] == ["/api/ops/stray"]
+    entry = doc["paths"]["/api/ops/reconstruct"]["post"]["x-oms"]
+    doc["paths"]["/api/ops/segment"]["post"]["x-oms"] = entry  # another mode's entry
+    assert sv.operations_of(doc)[1] == ["/api/ops/segment", "/api/ops/stray"]
 
 
 def test_the_command_line_of_a_case_is_the_services(tmp_path: Path) -> None:
@@ -137,19 +173,19 @@ def test_the_command_line_of_a_case_is_the_services(tmp_path: Path) -> None:
     ws.create()
     for rel in ("inputs/a.jpg", "inputs/b.jpg", "inputs/c.jpg", "inputs/d.jpg"):
         (ws.root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (ws.root / rel).write_bytes(b"x")
+        Image.new("RGB", (8, 6)).save(ws.root / rel)
     minimal_map(ws.maps / "reference")
     service_ops = operations.operations()
-    ops = {o["id"]: o for o in served()["operations"]}
     ev = sv.ServiceEvaluation.__new__(sv.ServiceEvaluation)
     ev.ws = ws.root
-    for op in ops.values():
-        for case in cases_by_op({"operations": [op]})[sv.operation_id(op)]:
+    for op in served():
+        for case in cases_by_op([op])[op.id]:
             service_op = service_ops[case.op]
             prep = operations.prepare(service_op, case.params, ws)
             assert prep.problems == [], (case, prep.problems)
-            assert sv.shell_argv(op, ev.absolute(op, case)) == prep.argv, op["id"]
-    assert sv.operation_id(ops["mapper.sh locate"]) == "mapper-locate"
+            assert ev.argv(op, case) == prep.argv, op.label
+            assert case.result_format == prep.result_format, case.name
+    assert [op.id for op in served()] == list(service_ops)
 
 
 def test_the_accessibility_check_visits_absolute_page_urls() -> None:
@@ -327,7 +363,7 @@ def fake_service(tmp_path: Path, differ: bool) -> Evaluation:
     (payloads / "ply.out").write_bytes(ply_bytes(PointCloud(
         __import__("numpy").zeros((2, 3), "float32"))))
     (payloads / "depth.out").write_bytes(png_bytes(__import__("numpy").zeros((2, 3), "uint16")))
-    rec = next(o for o in served()["operations"] if o["id"] == "reconstruct.sh")
+    rec = next(o for o in served() if o.label == "reconstruct.sh").entry
     rec = {**rec, "parameters": [p for p in rec["parameters"] if p["name"] != "attrs"]}
     (tmp_path / "describe.json").write_text(json.dumps({"operations": [rec]}))
     repo = fake_repo(tmp_path, reconstruct=f'''case "$*" in *-f=ply*) cat "{payloads}/ply.out";;
@@ -343,8 +379,8 @@ def fake_service(tmp_path: Path, differ: bool) -> Evaluation:
 @pytest.mark.parametrize("differ", [False, True])
 def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) -> None:
     ev = fake_service(tmp_path, differ)
-    sv.ServiceEvaluation(ev, {"image": EXAMPLES / "restaurant.jpg"}, {},
-                         ui=lambda folder: sv.UiOutcome(23, 0)).run()
+    sv.ServiceEvaluation(ev, [{"name": "restaurant.jpg", "image": EXAMPLES / "restaurant.jpg"}],
+                         {}, ui=lambda folder: sv.UiOutcome(23, 0)).run()
     m = ev.metrics.items
     ev.metrics.judge(load_targets(EXAMPLES / "targets.json"), None)
     assert set(sv.metric_ids()) <= set(m)
@@ -361,9 +397,10 @@ def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) 
     assert m["server_sh.ui.tests_failed"].passed and m["server_sh.ui.tests_run"].passed
     assert m["server_sh.parity.operations_covered_fraction"].value == 1.0
     cases = ev.details["server_sh"]["parity"]["cases"]
-    assert [c["case"] for c in cases] == ["reconstruct.sh [default]",
-                                          "reconstruct.sh [format=depth]",
-                                          "reconstruct.sh [format=ply]"]
+    assert [c["case"] for c in cases] == ["reconstruct.sh [default] on restaurant.jpg",
+                                          "reconstruct.sh [format=depth] on restaurant.jpg",
+                                          "reconstruct.sh [format=ply] on restaurant.jpg"]
+    assert ev.details["server_sh"]["parity"]["inputs"] == {"restaurant.jpg": ["reconstruct.sh"]}
     assert cases[0]["stages"] == ["inference", "export", "total"]  # from Server-Timing
     mism = m["server_sh.parity.mismatched"]
     if differ:
@@ -376,5 +413,13 @@ def test_the_section_measures_compares_and_judges(tmp_path: Path, differ: bool) 
     assert {"parity_01_shell", "parity_01_shell_again", "parity_02_shell"} <= set(tags)
     # the depth image's shell runs wrote one PNG to stdout, as the contract wants
     assert ev.contracts.checks[("stdout", "reconstruct")]["parity_02_shell"] == []
-    # server.sh kept stdout empty while serving, and --status gave one JSON document
-    assert ev.contracts.checks[("stdout", "server_sh")] == {"server_sh": [], "server_sh_status": []}
+    # server.sh kept stdout empty while serving, and --status gave one JSON document; every
+    # response body is one payload of its format (a PLY with a byte too many is not), and the
+    # JSON one is checked as OpenLABEL and for its colours, as the command's stdout is
+    stdout = ev.contracts.checks[("stdout", "server_sh")]
+    assert set(stdout) == {"server_sh", "server_sh_status", "parity_01_request",
+                           "parity_02_request", "parity_03_request"}
+    assert [k for k, v in stdout.items() if v] == (["parity_03_request"] if differ else [])
+    assert ev.contracts.checks[("openlabel", "server_sh")] == {
+        "parity_01_request": ev.contracts.checks[("openlabel", "reconstruct")]["parity_01_shell"]}
+    assert ev.contracts.checks[("colour", "server_sh")] == {"parity_01_request": []}

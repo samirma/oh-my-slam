@@ -15,13 +15,13 @@ import pytest
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.reconstruction.cloud import derive_cloud
 from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.cloud import derive_cloud, map_cloud_source
+from oh_my_slam.segmentation.api import map_cloud_source
 from oh_my_slam.viewer.bundle import ViewBundle, scene_cameras, upright_transform
 from oh_my_slam.viewer.routes import (
     ViewerRoutes,
     cloud_document,
-    cloud_payload,
     parse_cloud_payload,
 )
 from tests.browser.scenes import running
@@ -61,6 +61,9 @@ def test_routes(server: str) -> None:
     assert json.loads(get(server + "api/scene")[2])["openlabel"]["metadata"]
     assert get(server + "api/catalog")[2] == b'[{"id": 1}]'
     assert get(server + "api/segmented.png")[1] == "image/png"
+    bare = ViewerRoutes(ViewBundle(mode="map", title="t", scene={}, source=small_map().source))
+    for path in ("/api/catalog", "/api/segmented.png"):  # an image's only (spec §2.5)
+        assert bare.handle("GET", path).status == 404
     code, ctype, _ = get(server + "static/app.js")
     assert code == 200 and ctype == "text/javascript"
     assert get(server + "static/vendor/three/build/three.module.js")[0] == 200
@@ -95,8 +98,7 @@ def test_cloud_document(server: str) -> None:
 
 def test_identical_cloud_requests_get_identical_bytes() -> None:
     """The document carries no timing (spec §2.6 byte-identical results): two identical requests,
-    each derived afresh, give byte-identical bodies; the derivation time is the
-    ``Server-Timing`` header."""
+    each derived afresh, give byte-identical bodies."""
     bundle = small_map()
     for query in ("", "color=segment&voxel=0.5&normals=on"):
         answers = [ViewerRoutes(bundle).handle("GET", "/api/cloud", query) for _ in range(2)]
@@ -104,13 +106,10 @@ def test_identical_cloud_requests_get_identical_bytes() -> None:
         assert bodies[0] == bodies[1]
         head, _ = parse_cloud_payload(bodies[0])
         assert "seconds" not in head
-        for r in answers:
-            timing = dict(r.headers)["Server-Timing"]
-            assert timing.startswith("derive;dur=") and float(timing.split("=")[1]) >= 0
 
 
 def test_cloud_is_sent_from_the_cloud_arrays(server: str) -> None:
-    """The response is the document of :func:`cloud_payload`, sent piece by piece from the
+    """The response is the document of :func:`cloud_document`, sent piece by piece from the
     cloud's arrays; a complete map cloud shares them with the source, so it costs nothing."""
     bundle = small_map()
     for attrs, owned in ((CloudAttrs(), 0), (CloudAttrs(color="segment"), 12)):
@@ -118,10 +117,11 @@ def test_cloud_is_sent_from_the_cloud_arrays(server: str) -> None:
         assert dc.owned_bytes == owned  # segment: its own colours (4 points x 3 bytes)
         doc = cloud_document(dc, bundle.describe(attrs))
         body = doc.tobytes()
-        assert body == cloud_payload(dc, bundle.describe(attrs)) and doc.size == len(body)
+        assert doc.size == len(body)
         assert doc.owned_bytes == owned
         assert not any(isinstance(p, memoryview) and not p.readonly for p in doc.pieces)
     served = get(server + "api/cloud?color=segment")[2]
+    assert served == body  # the color=segment document
     head = urllib.request.urlopen(urllib.request.Request(server + "api/cloud?color=segment",
                                                          method="HEAD"))
     assert int(head.headers["Content-Length"]) == len(served)
@@ -153,23 +153,23 @@ def test_display_budget() -> None:
     selection of the shared derivation, with the edge in the cloud document. A bundle's budget is
     injectable (tests use a small one)."""
     import oh_my_slam.viewer.bundle as vb
-    from oh_my_slam.segmentation.cloud import derive_thinned
+    from oh_my_slam.reconstruction.cloud import derive_thinned
 
     assert vb.DISPLAY_POINT_BUDGET == 16_000_000
     rng = np.random.default_rng(0)
     source = map_cloud_source(rng.normal(size=(500, 3)), rng.integers(0, 255, (500, 3), np.uint8),
                               None, set(), np.zeros((1, 3)))
-    b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[])
+    b = ViewBundle(mode="map", title="t", scene={}, source=source)
     assert b.point_budget == vb.DISPLAY_POINT_BUDGET
     dc = b.cloud(CloudAttrs())
     assert (dc.total, dc.voxel, len(dc.cloud)) == (500, 0.0, 500)
-    b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[], point_budget=120)
+    b = ViewBundle(mode="map", title="t", scene={}, source=source, point_budget=120)
     dc = b.cloud(CloudAttrs())
     thin = derive_thinned(source, CloudAttrs(), 120)
     assert dc.total == 500 and dc.voxel == thin.voxel > 0 and len(dc.cloud) <= 120
     np.testing.assert_array_equal(dc.cloud.xyz, thin.cloud.xyz)
     assert dc.cloud.label is None  # an unsegmented source has no object ids
-    head, arrays = parse_cloud_payload(cloud_payload(dc, b.describe(CloudAttrs())))
+    head, arrays = parse_cloud_payload(cloud_document(dc, b.describe(CloudAttrs())).tobytes())
     assert (head["count"], head["total"], head["voxel"]) == (len(dc.cloud), 500, dc.voxel)
     full = derive_cloud(source, CloudAttrs())
     assert {r.tobytes() for r in arrays["position"]} <= {r.tobytes() for r in full.xyz}
@@ -184,7 +184,7 @@ def test_prepare_finds_the_selection_ahead(monkeypatch: pytest.MonkeyPatch) -> N
     rng = np.random.default_rng(2)
     source = map_cloud_source(rng.normal(size=(2_000, 3)), rng.integers(0, 255, (2_000, 3), np.uint8),
                               None, set(), np.zeros((1, 3)))
-    b = ViewBundle(mode="map", title="t", scene={}, source=source, catalog=[], point_budget=300)
+    b = ViewBundle(mode="map", title="t", scene={}, source=source, point_budget=300)
     searches: list[int] = []
     search = geometry.budget_voxel_grid
     monkeypatch.setattr(geometry, "budget_voxel_grid",
@@ -252,7 +252,7 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
                         streams={"camera_0": ol.camera_stream(K)}, frames=frames)
     cams = scene_cameras(scene)
     assert [c["name"] for c in cams] == ["f000000", "f000001", "f000002"]
-    assert [c["update"] for c in cams] == [1, 1, 2]
+    assert set(cams[0]) == {"name", "T", "position", "K", "size", "source"}  # what the page reads
     assert [c["source"] for c in cams] == ["f0.jpg", "f1.jpg", "f2.jpg"]
     for c, p, fr in zip(cams, poses, frames.values(), strict=True):
         np.testing.assert_allclose(c["T"], p.matrix(), atol=1e-6)
@@ -260,6 +260,20 @@ def test_cameras_are_the_poses_of_the_scene_json() -> None:
         tr = fr["frame_properties"]["transforms"]["camera_0_to_map"]["transform_src_to_dst"]
         assert c["position"] == tr["translation"] == [float(round(v, 6)) for v in p.t]
         assert np.asarray(c["T"])[:3, 3].tolist() == c["position"]
+
+
+def test_a_camera_with_lens_distortion_shows_its_undistorted_image() -> None:
+    """A map camera with distortion (the division model in ``intrinsics_custom``): its frustum and
+    "Go to" take the undistorted image's pinhole, which holds the whole lens (a wider field of
+    view than the stream's pinhole of the lens's focal length)."""
+    lens = Intrinsics(1392.0, 1392.0, 960.0, 444.0, 1920, 888, "colmap", -0.524)
+    image = ol.document(ol.metadata("x"), {}, coordinate_systems={"camera": ol.sensor_cs()},
+                        streams={"camera": ol.camera_stream(lens)},
+                        frames={"0": ol.frame(0.0, stream_uris={"camera": "x.jpg"})})
+    (cam,) = scene_cameras(image)
+    pin = lens.pinhole()
+    np.testing.assert_allclose(cam["K"], [pin.fx, pin.fy, pin.cx, pin.cy], rtol=1e-6)
+    assert cam["size"] == [1920, 888] and cam["K"][0] < 0.75 * 1392
 
 
 def test_upright_display_frame() -> None:
@@ -277,8 +291,8 @@ def test_a_ply_read_in_a_page_is_framed_as_view_sh_frames_it() -> None:
     does not carry the estimated up): its constants are the Python ones."""
     import re
 
+    from oh_my_slam.reconstruction.cloud import IMAGE_FRAME
     from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
-    from oh_my_slam.segmentation.cloud import IMAGE_FRAME
     from oh_my_slam.viewer.routes import STATIC
 
     js = (STATIC / "lib" / "cloudview.js").read_text()
@@ -287,6 +301,19 @@ def test_a_ply_read_in_a_page_is_framed_as_view_sh_frames_it() -> None:
     assert frame and level
     assert frame[1] == IMAGE_FRAME
     np.testing.assert_array_equal(json.loads(level[1]), upright_transform(DEFAULT_UP_CAM).round(12) + 0.0)
+
+
+def test_the_pages_display_budget_is_the_servers() -> None:
+    """lib/controls.js's DISPLAY_POINT_BUDGET (what a page draws of a PLY it reads, lib/ply.js) is
+    the viewer's own display budget (spec §2.5), defined in viewer/bundle.py."""
+    import re
+
+    from oh_my_slam.viewer.bundle import DISPLAY_POINT_BUDGET
+    from oh_my_slam.viewer.routes import STATIC
+
+    js = (STATIC / "lib" / "controls.js").read_text()
+    budget = re.findall(r"^export const DISPLAY_POINT_BUDGET = ([0-9_]+);$", js, re.MULTILINE)
+    assert [int(b) for b in budget] == [DISPLAY_POINT_BUDGET]
 
 
 def test_view_cli_arguments() -> None:

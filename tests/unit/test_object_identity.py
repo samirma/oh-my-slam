@@ -19,6 +19,11 @@ from oh_my_slam.mapping.validity import View
 from oh_my_slam.segmentation.api import Detection, LiftedInstance, join_instances
 from oh_my_slam.segmentation.lift import Lifted
 
+
+def canonical(points: np.ndarray) -> np.ndarray:
+    """An object's canonical points (``canonical_sources``) when one kind of detection gave them."""
+    return mo.canonical_sources(points, np.zeros(len(points), np.uint8))[0]
+
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
 SHAPE = (240, 320)
 
@@ -56,7 +61,7 @@ def obj(oid: int, label: str, parts: dict[int, np.ndarray], depth: float,
     """An object detected in the keyframes ``parts`` (keyframe -> its lifted points)."""
     pts = np.concatenate(list(parts.values()))
     o = MapObject(oid, label, votes or {label: 0.8 * len(parts)}, [0.8] * len(parts),
-                  mo.canonical_points(pts), frames=sorted(parts), obs_depth=depth)
+                  canonical(pts), frames=sorted(parts), obs_depth=depth)
     o.sightings = sorted((sighting(f, p) for f, p in parts.items()), key=Sighting.key)
     mo.refit(o, None)
     return o
@@ -158,6 +163,10 @@ def test_an_object_seen_from_two_sides_is_one_object() -> None:
     state = ObjectState([a, b], 400)
     assert mo._merge(state, {60, 257}, alias, masks.views, masks=masks) == 1
     assert alias == {257: 60} and state.objects[0].frames == [0, 1, 2, 3, 4, 5]
+    # in a rebuild, copies whose detections carry different published ids stay two objects
+    (a, b), masks = seen_twice(("lamp", "lamp"), None)
+    assert mo._merge(ObjectState([a, b], 400), {60, 257}, {}, masks.views, masks=masks,
+                     apart={60: frozenset({60}), 257: frozenset({257})}) == 0
     # without the detections the copies stay two objects
     (a, b), _ = seen_twice(("lamp", "lamp"), None)
     assert mo._merge(ObjectState([a, b], 400), {60, 257}, {}, masks.views) == 0
@@ -205,7 +214,7 @@ def piece(label: str, mask: np.ndarray, depth: np.ndarray, score: float = 0.7) -
     pts = np.stack([(u - K.cx) / K.fx * z, (v - K.cy) / K.fy * z, z], 1)
     box = (float(u.min()), float(v.min()), float(u.max()), float(v.max()))
     return LiftedInstance(Detection(label, score, "yoloe", mask, box), mask,
-                          Lifted(pts, (v * SHAPE[1] + u).astype(np.int64), int(mask.sum())))
+                          Lifted(pts, (v * SHAPE[1] + u).astype(np.int64)))
 
 
 def halves(gap: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -269,6 +278,19 @@ def test_pieces_of_one_surface_seen_from_different_keyframes_are_merged() -> Non
     assert merge(obj(2, "desk", {0: front}, 1.0), top) == {}
 
 
+def test_two_single_sightings_of_different_labels_are_not_a_flicker() -> None:
+    """A speaker in one keyframe and a stapler in another, 2 cm apart: no label is seen to
+    flicker until one of them was detected by two keyframes."""
+    rng = np.random.default_rng(5)
+    pts = rng.uniform(-0.03, 0.03, (400, 3)) + (1.0, 0.5, 0.2)
+    speaker = obj(73, "speaker", {18: pts[:200]}, 1.3)
+    stapler = obj(97, "stapler", {22: pts[200:] + (0.02, 0.0, 0.0)}, 1.3)
+    assert mo._merge_strength(speaker, stapler) == 0.0
+    twice = obj(97, "stapler", {22: pts[200:300] + (0.02, 0.0, 0.0),
+                                25: pts[300:] + (0.02, 0.0, 0.0)}, 1.3)
+    assert mo._merge_strength(speaker, twice) >= 1.0
+
+
 def test_a_counter_corner_labelled_rug_joins_the_counter() -> None:
     """The kitchen island: a desk (detected as desk, bed, kitchen island) and, from the keyframes
     that close the loop, its marble corner labelled rug. They continue one surface at one height
@@ -280,9 +302,14 @@ def test_a_counter_corner_labelled_rug_joins_the_counter() -> None:
     desk = obj(2, "desk", {0: top[:4000], 51: top[4000:]}, 1.0,
                {"desk": 7.5, "bed": 3.6, "kitchen island": 1.1})
     rug = obj(79, "rug", {27: corner[:700], 72: corner[700:]}, 1.2, {"rug": 1.1, "carpet": 0.8})
+    # in a rebuild, two objects whose detections carry different published ids stay two
+    apart = {2: frozenset({2}), 79: frozenset({79})}
+    assert mo._merge(ObjectState([desk, rug], 400), {2, 79}, {}, apart=apart) == 0
     alias: dict[int, int] = {}
     state = ObjectState([desk, rug], 400)
-    assert mo._merge(state, {2, 79}, alias) == 1 and alias == {79: 2}
+    apart = {2: frozenset({2})}  # the rug carries none: it joins the desk, which keeps its id
+    assert mo._merge(state, {2, 79}, alias, apart=apart) == 1 and alias == {79: 2}
+    assert apart == {2: frozenset({2})}
     (kept,) = state.objects
     assert kept.label == "desk" and "rug" in kept.label_votes
     floor = obj(81, "carpet", {27: corner - (0, 0, 1.0), 74: corner - (0, 0, 1.0)}, 1.5)

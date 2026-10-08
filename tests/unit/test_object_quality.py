@@ -22,6 +22,11 @@ from oh_my_slam.segmentation.scene import object_entry
 from oh_my_slam.tools.evaluate.scene import doc_objects
 from oh_my_slam.tools.evaluate.segmentation import paired_labels
 
+
+def canonical(points: np.ndarray) -> np.ndarray:
+    """An object's canonical points (``canonical_sources``) when one kind of detection gave them."""
+    return mo.canonical_sources(points, np.zeros(len(points), np.uint8))[0]
+
 UP = np.array([0.0, 0.0, 1.0])
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
 
@@ -43,7 +48,7 @@ def sighting(frame: int, pts: np.ndarray, border: float = 0.0) -> Sighting:
 def map_object(oid: int, label: str, pts: np.ndarray, frames: list[int], score: float = 0.7,
                sightings: list[Sighting] | None = None) -> MapObject:
     o = MapObject(oid, label, {label: score * len(frames)}, [score] * len(frames),
-                  mo.canonical_points(pts), frames=sorted(frames), obs_depth=2.0)
+                  canonical(pts), frames=sorted(frames), obs_depth=2.0)
     o.sightings = sorted(sightings or [], key=Sighting.key)
     mo.refit(o, None)
     return o

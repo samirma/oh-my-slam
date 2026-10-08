@@ -23,7 +23,12 @@ from oh_my_slam.web import app as web_app
 from oh_my_slam.web.app import Service, create_app
 from oh_my_slam.web.workspace import Workspace
 from tests.fakes import slow_command
-from tests.unit.test_web_api import _repo_importable, make_svc, with_programs  # noqa: F401
+from tests.unit.test_web_api import (  # noqa: F401
+    _repo_importable,
+    _test_client_host,
+    make_svc,
+    with_programs,
+)
 from tests.unit.test_web_requests import Call
 
 
@@ -125,13 +130,13 @@ def test_an_empty_body_is_no_parameters_and_a_body_that_is_not_json_is_refused(
         svc: tuple[Service, TestClient]) -> None:
     _, c = svc
     json_type = {"content-type": "application/json"}
-    r = c.post("/api/ops/segment-image/validate", content=b"", headers=json_type)
+    r = c.post("/api/ops/segment/validate", content=b"", headers=json_type)
     assert r.status_code == 200 and not r.json()["valid"]
     assert "the following arguments are required: -i" in r.json()["problems"][0]["message"]
-    r = c.post("/api/ops/segment-image/validate", content=b"{not json", headers=json_type)
+    r = c.post("/api/ops/segment/validate", content=b"{not json", headers=json_type)
     assert r.json()["problems"][0]["message"] == ("the request body must be a JSON object of "
                                                   "parameters")
-    r = c.post("/api/ops/segment-image", content=b"{not json", headers=json_type)
+    r = c.post("/api/ops/segment", content=b"{not json", headers=json_type)
     assert r.status_code == 400 and r.json()["error"]["code"] == "usage"
 
 
@@ -187,3 +192,19 @@ def test_an_upload_whose_declared_length_is_not_a_number_is_measured_as_it_arriv
     assert sent[0]["status"] == 201
     body = json.loads(b"".join(m.get("body", b"") for m in sent[1:]))
     assert body["size"] == 3 and (service.workspace.root / body["path"]).read_bytes() == b"abc"
+
+
+def test_a_request_the_stop_interrupted_answers_the_commands_own_error() -> None:
+    """Spec §2.6 "Requests", "Errors": a request ends with the command's own error by the generic
+    rule, also when the service's stop interrupted it (exit 130: 499 ``interrupted``) or it ended
+    otherwise while the service stopped."""
+    from oh_my_slam.web.runner import STOPPING, Outcome
+
+    for code, name, http in ((130, "interrupted", 499), (5, "not_registered", 422),
+                             (1, "internal", 500), (2, "usage", 400)):
+        status, body = web_app.failure(Outcome(code, "its own message", STOPPING))
+        assert (status, body) == (http, {"error": {"code": name, "exit_code": code,
+                                                   "message": "its own message",
+                                                   "http_status": http}})
+    status, body = web_app.failure(Outcome(130, "slow.sh: interrupted"))  # its client left
+    assert (status, body["error"]["code"]) == (499, "interrupted")

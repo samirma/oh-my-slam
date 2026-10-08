@@ -4,6 +4,7 @@ the small pose / similarity helpers."""
 
 from __future__ import annotations
 
+import errno
 import os
 import struct
 import subprocess
@@ -65,6 +66,22 @@ def test_a_folder_that_may_not_be_written_is_a_usage_error(tmp_path: Path) -> No
             atomic.check_file(locked / "x.ply", "-o")
     finally:
         locked.chmod(0o700)
+
+
+def test_an_output_file_is_proven_writable_without_creating_its_folders(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``preflight_file`` probes the nearest existing folder and creates nothing; a folder the
+    permissions allow but the filesystem refuses (read-only) is still a usage error."""
+    target = tmp_path / "new" / "deeper" / "out.json"
+    atomic.preflight_file(target, "-o")
+    assert list(tmp_path.iterdir()) == []
+
+    def read_only(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(atomic.tempfile, "TemporaryFile", read_only)
+    with pytest.raises(UsageError, match=r"-o .*deeper: cannot write there \(Read-only file"):
+        atomic.preflight_file(target, "-o")
 
 
 def test_a_special_file_is_written_in_place_unless_read_only(tmp_path: Path) -> None:

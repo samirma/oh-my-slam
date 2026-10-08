@@ -47,8 +47,10 @@ from oh_my_slam.mapping.sfm import (
     CameraPrior,
     Sfm,
     SfmModel,
+    camera_intrinsics,
     check_versions,
     contradicted,
+    shared_camera,
     vet,
     weak_link_pairs,
 )
@@ -86,6 +88,11 @@ class NewFrame:
     full_size: tuple[int, int]
     record: store.FrameRecord | None = None
     depth: NDArray[np.float32] | None = None  # aligned metric depth (grid)
+    # the camera with distortion whose pinhole the keyframe was inferred with (its undistorted
+    # image, ``_undistorted``), None: the keyframe's own image
+    lens: Intrinsics | None = None
+    # the depth field its depth already carries (a stored keyframe in a rebuild, ``_carried``)
+    field: tuple[float, ...] = ()
 
 
 @dataclass
@@ -128,10 +135,6 @@ class Rebuild:
     created: dict[int, int]
     vacated: list[Any]
     camera: int | None = None  # the database camera the stored keyframes share, if one
-    # each published object's label and box, as the map last published them (a published id
-    # whose founding detection the rebuild groups elsewhere goes where it stands,
-    # ``objects._published_places``)
-    boxes: dict[int, tuple[str, Any]] = field(default_factory=dict)
     # the ids the map exported (``MapObject.published``): the rebuilt object that takes one is
     # published whatever the rebuild's evidence says, until latest wins removes it
     published: set[int] = field(default_factory=set)
@@ -149,16 +152,19 @@ def _progress(msg: str) -> None:
 
 
 def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client: Any,
-                  progress: Progress, ingested: Callable[[list[ingest.Keyframe]], None]
+                  progress: Progress, ingested: Callable[[list[ingest.Keyframe]], None],
+                  lens_of: Callable[[ingest.Keyframe], Intrinsics | None] = lambda kf: None
                   ) -> list[NewFrame]:
     """Geometry, gravity and detections for every keyframe (two frames in flight), each started as
     soon as ingest has written it: the stage ``ingest`` decodes the input while the first
     keyframes' inference runs, ``inference`` waits for the rest. ``ingested`` is called with the
-    keyframes once ingest has written them all, while their inference runs."""
+    keyframes once ingest has written them all, while their inference runs. A keyframe whose
+    camera ``lens_of`` knows to have distortion is inferred undistorted (``_undistorted``)."""
 
     def one(kf: ingest.Keyframe) -> NewFrame:
-        frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client)
-        return NewFrame(kf, frame, dets, upright_size(kf.path))
+        lens = lens_of(kf)
+        frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client, lens)
+        return NewFrame(kf, frame, dets, upright_size(kf.path), lens=lens)
 
     out: list[NewFrame] = []
     t0 = time.perf_counter()
@@ -183,6 +189,83 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
     return out
 
 
+def _undistorted(kf: ingest.Keyframe, lens: Intrinsics, work: Path) -> ingest.Keyframe:
+    """The keyframe as the undistorted image of its camera ``lens`` (full resolution, with
+    distortion) shows it: a copy in ``work`` (``core.images.undistort_rgb``), with that image's
+    pinhole intrinsics (``Intrinsics.pinhole``). Depth and gravity inferred on it lie on the
+    pinhole's grid."""
+    from oh_my_slam.core.images import load_rgb, save_jpeg, undistort_rgb
+
+    path = work / kf.name / "undistorted.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_jpeg(undistort_rgb(load_rgb(kf.path), lens), path, quality=95)
+    return replace(kf, path=path, exif=lens.pinhole())
+
+
+def _onto_undistorted(frame: FrameReconstruction, dets: list[Detection], lens: Intrinsics,
+                      seen_with: Intrinsics | None) -> list[Detection]:
+    """The keyframe's detections moved onto the grid of ``frame``, inferred on the undistorted
+    image of ``lens`` (``_undistorted``), and that grid's pixels the lens does not show made
+    invalid. The detections were made on the keyframe's own image — the detector sees what the
+    camera saw, neither cropped nor resampled — or on the undistorted image of ``seen_with``:
+    each mask is resampled through the lens model (nearest, ``core.images.grid_index``), each box
+    is its outline's."""
+    from oh_my_slam.core.images import grid_index
+
+    grid = frame.grid_size
+    shown = grid_index(lens, grid, (lens.width, lens.height)) >= 0
+    frame.valid = frame.valid & shown
+    frame.depth = np.where(shown, frame.depth, 0.0).astype(frame.depth.dtype)
+    index: dict[tuple[int, int], NDArray[np.intp]] = {}
+    out = []
+    for det in dets:
+        shape = (det.mask.shape[1], det.mask.shape[0])
+        if shape not in index:
+            index[shape] = grid_index(lens, grid, shape, seen_with)
+        idx = index[shape]
+        mask = np.where(idx >= 0, det.mask.ravel()[np.maximum(idx, 0)], False)
+        out.append(replace(det, mask=mask, box=_box_onto(det.box, shape, lens, grid, seen_with)))
+    return out
+
+
+def _box_onto(box: tuple[float, float, float, float], shape: tuple[int, int], lens: Intrinsics,
+              grid: tuple[int, int], seen_with: Intrinsics | None
+              ) -> tuple[float, float, float, float]:
+    """A detection box on a ``shape`` grid of the image (or of the undistorted image of
+    ``seen_with``) as a box on the ``grid`` of ``lens``'s undistorted image: its outline's
+    bounding box there, clipped to the grid (empty when none of the outline is in view)."""
+    x0, y0, x1, y1 = box
+    t = np.linspace(0.0, 1.0, 17)
+    xs = np.concatenate([x0 + (x1 - x0) * t, np.full(17, x1), x0 + (x1 - x0) * t, np.full(17, x0)])
+    ys = np.concatenate([np.full(17, y0), y0 + (y1 - y0) * t, np.full(17, y1), y0 + (y1 - y0) * t])
+    full = np.column_stack([xs * lens.width / shape[0], ys * lens.height / shape[1]])
+    img = full if seen_with is None else seen_with.image_pixels(full)
+    at = lens.pinhole_pixels(img) * [grid[0] / lens.width, grid[1] / lens.height]
+    at = np.clip(at[np.isfinite(at).all(axis=1)], 0.0, grid)
+    if not len(at):
+        return (0.0, 0.0, 0.0, 0.0)
+    lo, hi = at.min(axis=0), at.max(axis=0)
+    return (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
+
+
+def _grid_intrinsics(nf: NewFrame, K: Intrinsics) -> Intrinsics:
+    """The intrinsics of a new keyframe's depth grid for its camera ``K`` (full resolution): the
+    undistorted image's (``Intrinsics.pinhole``) when it was inferred undistorted, else the
+    image's own."""
+    return (K if nf.lens is None else K.pinhole()).resized(*nf.frame.grid_size)
+
+
+def _lens_of(old: list[store.FrameRecord]) -> Callable[[ingest.Keyframe], Intrinsics | None]:
+    """For an update: the map's camera with distortion that a new keyframe will share
+    (``shared_camera``), if any."""
+
+    def of(kf: ingest.Keyframe) -> Intrinsics | None:
+        _, shared = shared_camera(old, upright_size(kf.path), kf.exif is not None)
+        return shared.K if shared is not None and shared.K.k else None
+
+    return of
+
+
 def _reconstruct_keyframe(path: Path, client: Any, intrinsics: Intrinsics | None,
                           work_dir: Path | None = None, first: bool = True,
                           rgb: NDArray[np.uint8] | None = None) -> FrameReconstruction:
@@ -196,18 +279,37 @@ def _reconstruct_keyframe(path: Path, client: Any, intrinsics: Intrinsics | None
                              keep_forward=first and intrinsics is None, rgb=rgb)
 
 
-def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
+def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any,
+                                    lens: Intrinsics | None = None
                                     ) -> tuple[FrameReconstruction, list[Detection]]:
     """Depth, gravity and descriptor from reconstruction, detections from segmentation (at the
-    default threshold, requested while the reconstruction runs)."""
+    default threshold, requested while the reconstruction runs). With the keyframe's camera
+    ``lens`` (with distortion), the reconstruction is the undistorted image's (``_undistorted``)
+    and the detections are the keyframe's own image's, moved onto its grid
+    (``_onto_undistorted``)."""
+    src = kf if lens is None else _undistorted(kf, lens, work)
     own = client.clone()
     try:
-        return detect_alongside(
-            kf.path, own, lambda c: _reconstruct_keyframe(kf.path, c, kf.exif, work),
+        frame, dets = detect_alongside(
+            kf.path, own, lambda c: _reconstruct_keyframe(src.path, c, src.exif, work),
             max_side=KEYFRAME_GRID_SIDE)
     finally:
         if own is not client:
             own.close()
+    if lens is not None:
+        dets = _onto_undistorted(frame, dets, lens, None)
+    _without_defocus(frame)
+    return frame, dets
+
+
+def _without_defocus(frame: Any) -> None:
+    """The keyframe's out-of-focus near field (``reconstruction.defocus``) has no depth: the
+    network places such a blur anywhere from the lens to the wall behind it."""
+    from oh_my_slam.reconstruction.defocus import defocused_near_field
+
+    blur = defocused_near_field(frame.rgb, frame.depth, frame.valid)
+    frame.valid = frame.valid & ~blur
+    frame.depth = np.where(blur, 0.0, frame.depth).astype(frame.depth.dtype)
 
 
 class _EarlyFeatures:
@@ -254,19 +356,13 @@ class _EarlyFeatures:
 
 
 def _camera_prior(new: list[NewFrame], old: list[store.FrameRecord]) -> CameraPrior:
-    """The camera of the new keyframes: without EXIF, an existing camera of the same image size
-    (e.g. more frames of the same video); with EXIF, an existing camera of the same image size
-    whose EXIF focal prior is the same (more photos of the same device and zoom,
-    ``Sfm.existing_camera``) — else a new one."""
-    w, h = new[0].full_size
-    focals = [nf.frame.intrinsics.fx for nf in new if nf.full_size == (w, h)]
-    same = [f for f in old if (f.width, f.height) == (w, h)]
-    existing = same[-1].camera_id if same and all(nf.kf.exif is None for nf in new) else None
-    same_focal: tuple[int, ...] = ()
-    if same and all(nf.kf.exif is not None for nf in new):
-        same_focal = tuple(dict.fromkeys(f.camera_id for f in reversed(same)))
-    return CameraPrior(w, h, focal=float(np.median(focals)), existing_id=existing,
-                       same_focal_ids=same_focal)
+    """The camera of the new keyframes (``shared_camera``), its prior focal length the median of
+    the model's estimates, or of the EXIF ones."""
+    size = new[0].full_size
+    focals = [nf.frame.intrinsics.fx for nf in new if nf.full_size == size]
+    exif = {nf.kf.exif is not None for nf in new}
+    return shared_camera(old, size, exif.pop() if len(exif) == 1 else None,
+                         float(np.median(focals)))[0]
 
 
 def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
@@ -464,6 +560,10 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     prior = _camera_prior(ctx.new, ctx.old_frames)
     if ctx.rebuild is not None and ctx.rebuild.camera is not None:
         prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
+        # its lens is fitted again from all the keyframes: held from an update of a few of them,
+        # it bent the rebuilt map (examples/camera mapped 9 + 9 + 9: k -0.45 from the first 9
+        # frames against -0.52 from all 27, the rotations 4° off the one-update map's)
+        sfm.drop_distortion(ctx.rebuild.camera)
     t0 = time.perf_counter()
     with timing.stage(timing.Stage.FEATURES_MATCHING):
         if ctx.features is not None:
@@ -491,10 +591,16 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     scaleless = False
     if not rotation:
         turns = sfm.rotation_pairs()
-        model = _vetted(ctx, sfm.map_global(ctx.work / "sfm_global"), turns)
+        model = _vetted(ctx, _plausible_focal(ctx, sfm.map_global(ctx.work / "sfm_global"),
+                                              prior), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is None or placed < MIN_PLACED_FRACTION:
-            model = _vetted(ctx, sfm.map_incremental(ctx.work / "sfm_incr"), turns)
+            model = _vetted(ctx, _plausible_focal(ctx, sfm.map_incremental(ctx.work / "sfm_incr"),
+                                                  prior), turns)
+        placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
+        if model is not None and placed >= MIN_PLACED_FRACTION and _turns_through_lens(
+                ctx, sfm, model, new_names):
+            model, rotation = None, True  # its translation is the lens's distortion
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is not None and placed >= MIN_PLACED_FRACTION:
             ratio = model.baseline_ratio()
@@ -510,19 +616,99 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                 model = _join_unplaced(ctx, sfm, model, new_names, turns, is_video, client,
                                        progress)
                 return model
-    reason = ("no metric scale from the SfM points" if scaleless else "rotation-dominant input"
-              if rotation else "SfM placed too few frames")
+    reason = ("no metric scale from the SfM points" if scaleless
+              else "a pan from one spot through a lens with distortion"
+              if ctx.notes.get("sfm_turning_rejected") else "rotation-dominant input"
+              if rotation else "SfM's focal length is off the camera's prior"
+              if ctx.notes.get("sfm_focal_rejected") else "SfM placed too few frames")
     progress(f"multi-view fallback ({reason}); {len(component)} connected keyframes")
     todo = [v for v in _new_pool(ctx) if v.name in component]
     poses = _multiview_poses(ctx, todo, [], client)
     # the first keyframe holds the gauge; the depth fixes the scale, the matches the focal length
-    poses, focal = _refine_multiview(ctx, sfm, poses, set(poses) - {todo[0].name},
-                                     refine_focal=True, rotation=rotation)
-    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", focal_scale=focal)
+    poses, focal, distortion = _refine_multiview(ctx, sfm, poses, set(poses) - {todo[0].name},
+                                                 refine_focal=True, rotation=rotation)
+    mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", focal_scale=focal,
+                                          distortion=distortion)
     mv_model.notes.update(reason=reason, metric=True)
     progress(f"multi-view + refinement: {len(mv_model.registered)} keyframes in "
              f"{time.perf_counter() - t0:.0f} s")
     return mv_model
+
+
+# SfM poses a camera that turns in place through a lens with distortion as one that moves: its
+# pinhole cannot bend the rays, so it spreads the keyframes apart instead (examples/camera's first
+# 9 frames: sfm-global with a plausible focal length, the centres of a camera turning in place
+# 8 m apart, the rotations 20-30° off). Rotations alone, with one shared lens, explain those
+# matches to 0.24° (median) from SfM's own rotations, with a division coefficient of -0.47 that
+# moves the image corners by 37 %: a lens no pinhole stands in for. Such a model is the
+# multi-view fallback's. A camera that moves (a walk) leaves degrees; the office photos, taken
+# from about one spot, 0.49° with a coefficient of +0.11 (8.5 % at the corners), parallax that
+# the lens term absorbs (their own refinement fits no distortion): SfM poses them, as it does a
+# turning pinhole (the rendered robot head of ainex-captures).
+TURN_FIT_DEG = 0.5  # rotations alone explain the matches within this (median): a pan from one spot
+TURN_LENS_SHIFT = 0.15  # ... through a lens that moves the image corners by at least this share
+TURN_MATCHES = 200  # matches per verified pair the test fits (evenly subsampled)
+
+
+def _turns_through_lens(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: set[str]) -> bool:
+    """Whether a new map's SfM ``model`` poses a camera that turns in place through a lens with
+    distortion (see ``TURN_FIT_DEG``): the rotation-only refinement (``panorama.refine_turning``,
+    the shared camera's focal length and distortion refined unless its lens is known) from SfM's
+    rotations fits the verified matches of its keyframes within ``TURN_FIT_DEG``, and the camera's
+    lens (a known one, or the one the fit found) moves the image corners by at least
+    ``TURN_LENS_SHIFT``. Noted as ``sfm_turning_rejected``."""
+    from oh_my_slam.mapping import panorama
+
+    posed = sorted(n for n in model.registered if n in names)
+    K = {n: c for n, (_, c) in sfm.image_intrinsics(set(posed)).items()}
+    known = any(c.k for c in K.values())
+    pairs = panorama.verified_matches(sfm.db, set(posed), max_per_pair=TURN_MATCHES)
+    views = {n: panorama.View(Pose(model.pose(n).R, np.zeros(3)), K[n]) for n in posed}
+    fit = panorama.refine_turning(pairs, views, set(posed[1:]), refine_focal=not known,
+                                  hold_distortion=known)
+    cam = K[posed[0]]
+    k = next((c.k for c in K.values() if c.k), fit.distortion)
+    # the lens the fit found, at the focal length it fitted with it
+    shift = panorama.corner_shift((cam.width, cam.height),
+                                  cam.fx * (1.0 if known else fit.focal_scale), k)
+    turning = fit.pairs > 0 and fit.median_after_deg <= TURN_FIT_DEG and shift >= TURN_LENS_SHIFT
+    ctx.notes["sfm_turning_fit"] = {"method": model.method,
+                                    "median_deg": round(fit.median_after_deg, 4),
+                                    "distortion": round(k, 4), "corner_shift": round(shift, 4)}
+    if turning:
+        ctx.notes["sfm_turning_rejected"] = ctx.notes["sfm_turning_fit"]
+    return turning
+
+
+# A new map's SfM model whose focal length is off the camera's prior (EXIF, or the median of the
+# keyframes' monocular estimates) by more than ``panorama.FOCAL_MAX_FACTOR`` explains the matches
+# with a wrong camera: the pinhole of ``examples/camera``'s wide-angle lens turning in place ran to
+# 253-294 px (global) and 28,800-271,000 px (incremental) for a 1370 px prior, and to 7.5 times
+# its prior on 9 of its first, uncropped frames; the office photos and the street2 video stay
+# within 1.1 of theirs.
+
+
+def _plausible_focal(ctx: UpdateContext, model: SfmModel | None, prior: CameraPrior
+                     ) -> SfmModel | None:
+    """``model``, or None (not accepted, ``notes["sfm_focal_rejected"]``) when the focal length
+    of its camera of the prior's image size is off the prior by more than
+    ``panorama.FOCAL_MAX_FACTOR``."""
+    from oh_my_slam.mapping.panorama import FOCAL_MAX_FACTOR
+
+    if model is None or prior.focal is None:
+        return model
+    for cam in model.rec.cameras.values():
+        if (cam.width, cam.height) != (prior.width, prior.height):
+            continue
+        f = float(np.mean(np.asarray(cam.params)[list(cam.focal_length_idxs())]))
+        if max(f / prior.focal, prior.focal / f) > FOCAL_MAX_FACTOR:
+            ctx.notes.setdefault("sfm_focal_rejected", {})[model.method] = {
+                "focal_px": round(f, 1), "prior_px": round(prior.focal, 1)}
+            log.warning("%s: its focal length %.0f px is off the camera's prior %.0f px by more "
+                        "than %g times: a wrong camera model, not accepted", model.method, f,
+                        prior.focal, FOCAL_MAX_FACTOR)
+            return None
+    return model
 
 
 def _metric_scale_known(model: SfmModel, ctx: UpdateContext) -> bool:
@@ -547,13 +733,13 @@ def _keyframe_intrinsics(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> dict[
 
 def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free: set[str],
                       refine_focal: bool, rotation: bool, model: SfmModel | None = None
-                      ) -> tuple[dict[str, Pose], float]:
+                      ) -> tuple[dict[str, Pose], float, float]:
     """Refine the multi-view poses of the keyframes ``free`` with every verified feature match
     and the keyframes' monocular depth (``mapping.panorama``; staged for ``rotation``-dominant
     input); every other keyframe — this update's other posed keyframes and the map's — holds
-    still. Returns all poses and the factor of the shared focal length (1 unless
-    ``refine_focal``). With the SfM ``model`` the poses are in, its cameras (refined focal
-    length) are used."""
+    still. Returns all poses, the factor of the shared focal length and the shared camera's
+    division coefficient (1 and 0 unless ``refine_focal``: ``panorama``). With the SfM ``model``
+    the poses are in, its cameras (refined focal length) are used."""
     from oh_my_slam.mapping import panorama
 
     new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
@@ -568,19 +754,21 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
             if n in new and n in K:
                 nf = new[n]
                 views[n] = panorama.View(poses[n], K[n], nf.frame.depth, nf.frame.K_grid,
-                                         nf.full_size)
+                                         nf.full_size, nf.lens)
             elif n in old:
                 f = old[n]
                 views[n] = panorama.View(f.T_map_cam, f.K, store.load_depth(ctx.tx.current, f.name),
-                                         f.K_grid, (f.width, f.height))
+                                         f.K_grid, (f.width, f.height), f.K if f.K.k else None)
         refine = panorama.refine_turning if rotation else panorama.refine_poses
-        fit = refine(pairs, views, free, refine_focal=refine_focal)
+        # a camera whose lens is known keeps it: its matches are where its pinhole sees them
+        fit = refine(pairs, views, free, refine_focal=refine_focal,
+                     hold_distortion=any(v.K.k for v in views.values()))
     ctx.notes["pose_refinement"] = fit.summary()
     ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
                                  fit.per_frame_matches.get(n, 0)) for n in fit.poses})
     log.info("pose refinement of %d keyframes: median residual %.3f° -> %.3f° (%d pairs)",
              len(fit.poses), fit.median_before_deg, fit.median_after_deg, fit.pairs)
-    return {**poses, **fit.poses}, fit.focal_scale
+    return {**poses, **fit.poses}, fit.focal_scale, fit.distortion
 
 
 def _complete_registration(sfm: Sfm, model: SfmModel, names: set[str], work: Path) -> SfmModel:
@@ -632,10 +820,7 @@ def _model_intrinsics(sfm: Sfm, model: SfmModel, names: set[str]) -> dict[str, I
     out = {}
     for n, (cid, K) in sfm.image_intrinsics(names).items():
         if model.rec.exists_camera(cid):
-            cam = model.rec.cameras[cid]
-            Km = np.asarray(cam.calibration_matrix())
-            K = Intrinsics(Km[0, 0], Km[1, 1], Km[0, 2], Km[1, 2], cam.width, cam.height,
-                           "colmap")
+            K = camera_intrinsics(model.rec.cameras[cid])
         out[n] = K
     return out
 
@@ -765,9 +950,9 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                          "hold" + (" (anchored in capture order)" if is_video else ""))
                 mv = _multiview_poses(ctx, todo, [v for v in pool if v.pose is not None], client,
                                       temporal=is_video)
-            allp, _ = _refine_multiview(ctx, sfm, {**posed, **merged, **free, **mv},
-                                        set(free) | set(mv), refine_focal=False, rotation=False,
-                                        model=model)
+            allp, _, _ = _refine_multiview(ctx, sfm, {**posed, **merged, **free, **mv},
+                                           set(free) | set(mv), refine_focal=False,
+                                           rotation=False, model=model)
             free = {n: allp[n] for n in free}
             mv = {n: allp[n] for n in mv}
             _relevel_blocks(ctx, {**posed, **merged}, free, join)
@@ -872,9 +1057,9 @@ def _depth_contradicted(ctx: UpdateContext, model: SfmModel, names: set[str], ph
         if not ranked:
             return None
         refs = [(sparse[r] * by_name[r].frame.depth,
-                 model.intrinsics(r).resized(*by_name[r].frame.grid_size).K(),
+                 _grid_intrinsics(by_name[r], model.intrinsics(r)).K(),
                  model.pose(r).matrix()) for r in ranked]
-        return dense_scale(nf.frame.depth, model.intrinsics(n).resized(*nf.frame.grid_size).K(),
+        return dense_scale(nf.frame.depth, _grid_intrinsics(nf, model.intrinsics(n)).K(),
                            T.matrix(), refs)
 
     def dense_metric(n: str) -> float | None:
@@ -1122,8 +1307,8 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
                  + (" (rotation-dominant input)" if rotation else ""))
         mv = _multiview_poses(ctx, todo, pool, client)
         poses.update(mv)
-        poses, _ = _refine_multiview(ctx, sfm, poses, set(mv), refine_focal=False,
-                                     rotation=rotation, model=inc)
+        poses, _, _ = _refine_multiview(ctx, sfm, poses, set(mv), refine_focal=False,
+                                        rotation=rotation, model=inc)
         ctx.notes["mv_names"] = sorted(mv)
     # new cameras keep the intrinsics the incremental extension refined the poses with
     model = sfm.extend_with_poses(
@@ -1213,15 +1398,31 @@ def _remap_small(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,
 
 
 def _rerun_focal(ctx: UpdateContext, model: SfmModel, client: Any, progress: Progress) -> None:
-    """Re-run geometry with the COLMAP focal where it differs > 3 % from the one used."""
-    redo = []
+    """Re-run geometry with the COLMAP focal where it differs > 3 % from the one used; a keyframe
+    whose camera turned out to have distortion (a new map's multi-view fit, ``sfm.
+    set_distortion``) is inferred again undistorted (``_rerun_undistorted``), one inferred
+    undistorted whose camera ends without distortion (a rebuild's SfM camera, a photo sharing
+    another camera) again on its own image."""
+    redo, lens, plain = [], [], []
     for nf in ctx.new:
         name = f"{nf.kf.name}.jpg"
-        if name not in model.registered or nf.kf.exif is not None:
+        if name not in model.registered:
             continue
         colmap_K = model.intrinsics(name)
+        if colmap_K.k:
+            if not _same_lens(nf.lens, colmap_K):
+                lens.append((nf, colmap_K))
+            continue
+        if nf.lens is not None:
+            plain.append((nf, colmap_K))
+            continue
+        if nf.kf.exif is not None:
+            continue
         if abs(colmap_K.fx - nf.frame.intrinsics.fx) / nf.frame.intrinsics.fx > FOCAL_RERUN_REL:
             redo.append((nf, colmap_K))
+    for todo in (lens, plain):
+        if todo:
+            _rerun_undistorted(ctx, todo, client, progress)
     if not redo:
         return
     progress(f"re-running geometry for {len(redo)} keyframes with the SfM focal length")
@@ -1236,9 +1437,62 @@ def _rerun_focal(ctx: UpdateContext, model: SfmModel, client: Any, progress: Pro
                 own.close()
         nf.frame.depth, nf.frame.valid = fr.depth, fr.valid
         nf.frame.intrinsics, nf.frame.K_grid = fr.intrinsics, fr.K_grid
+        _without_defocus(nf.frame)
 
     with ThreadPoolExecutor(2) as pool:
         list(pool.map(one, redo))
+
+
+def _carry_ids(rebuild: Rebuild | None, was: list[Detection], now: list[Detection]) -> None:
+    """A rebuild's stored detections ``was``, moved onto a new grid as ``now`` (same order): the
+    ids the map published with them (``Rebuild.prior``, ``Rebuild.first``: by detection) go with
+    them, or the objects they founded would be numbered again."""
+    if rebuild is None:
+        return
+    for old, new in zip(was, now, strict=True):
+        for table in (rebuild.prior, rebuild.first):
+            if id(old) in table:
+                table[id(new)] = table.pop(id(old))
+
+
+def _same_lens(a: Intrinsics | None, b: Intrinsics) -> bool:
+    """Whether a keyframe inferred undistorted with ``a`` is on the pinhole grid of ``b``."""
+    return a is not None and abs(a.fx - b.fx) <= FOCAL_RERUN_REL * b.fx and abs(a.k - b.k) < 0.01
+
+
+def _rerun_undistorted(ctx: UpdateContext, todo: list[tuple[NewFrame, Intrinsics]], client: Any,
+                       progress: Progress) -> None:
+    """Depth, gravity and descriptor of keyframes inferred again on their undistorted image
+    (``_undistorted``): their camera's lens became known after their first inference; or, for a
+    camera ``K`` without distortion, on their own image (they were inferred undistorted with a
+    lens their camera turned out not to have). Their detections stay those of the image the
+    detector saw, moved onto the new grid (``_onto_undistorted``). The rest of the update (depth
+    alignment, fusion, objects) then works on that grid."""
+    lens = todo[0][1].k
+    progress(f"re-running inference for {len(todo)} keyframes on their undistorted images "
+             f"(lens distortion {lens:.3f})" if lens else
+             f"re-running inference for {len(todo)} keyframes on their own images (their camera "
+             "has no lens distortion)")
+
+    def one(item: tuple[NewFrame, Intrinsics]) -> None:
+        nf, K = item
+        work = ctx.work / "undistorted"
+        path, intrinsics = (nf.kf.path, K) if not K.k else (
+            (src := _undistorted(nf.kf, K, work)).path, src.exif)
+        own = client.clone()
+        try:
+            frame = _reconstruct_keyframe(path, own, intrinsics, work / nf.kf.name)
+        finally:
+            if own is not client:
+                own.close()
+        moved = _onto_undistorted(frame, nf.dets, K, nf.lens)
+        _carry_ids(ctx.rebuild, nf.dets, moved)
+        nf.dets = moved
+        _without_defocus(frame)
+        nf.frame, nf.lens = frame, (K if K.k else None)
+
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(one, todo))
 
 
 def _frame_depths(ctx: UpdateContext) -> list[mframe.FrameDepth]:
@@ -1327,7 +1581,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     from oh_my_slam.reconstruction.depth import dense_scale
 
     lo, hi = DEPTH_SCALE_RANGE
-    pool: list[tuple[str, Any, Pose, Intrinsics]] = []  # (name, depth loader, pose, K_grid)
+    # (name, depth loader, pose, K_grid, depth scale)
+    pool: list[tuple[str, Any, Pose, Intrinsics, float]] = []
     cache: dict[str, NDArray[np.float32]] = {}
 
     def old_depth(name: str) -> Any:
@@ -1339,7 +1594,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
 
     for f in ctx.old_frames:
         if not f.low_confidence:
-            pool.append((f.name, old_depth(f.name), f.T_map_cam, f.K_grid))
+            pool.append((f.name, old_depth(f.name), f.T_map_cam, f.K_grid, f.depth_scale))
     # Points triangulated from multi-view (rotation-dominant) poses have no reliable depth.
     dense_only: set[str] = set(ctx.notes.get("mv_names", []))
     if model.method == "multiview":
@@ -1368,7 +1623,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             stats.update({"depth_scale_method": "sparse", "depth_scale_points": fit.inliers,
                           "depth_scale_spread": fit.spread})
             _set_aligned(ctx, nf, T, K, model, name, stats, s, not (lo <= s <= hi))
-            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid))
+            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid, s))
         else:
             pending.append((nf, T, K, name, stats))
     for nf, T, K, name, stats in pending:
@@ -1376,23 +1631,27 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             # first keyframe of a map without usable sparse depth: MoGe's metric depth as is
             stats.update({"depth_scale_method": "seed"})
             _set_aligned(ctx, nf, T, K, model, name, stats, 1.0, False)
-            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid))
+            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid, 1.0))
             continue
         fwd = T.R[:, 2]
         ranked = sorted(pool, key=lambda r: -float(r[2].R[:, 2] @ fwd)
                         + 0.1 * float(np.linalg.norm(r[2].t - T.t)))[:DENSE_REFS]
-        K_grid = K.resized(*nf.frame.grid_size)
+        K_grid = _grid_intrinsics(nf, K)
         fit = dense_scale(nf.frame.depth, K_grid.K(), T.matrix(),
-                          [(ld(), Kg.K(), Tr.matrix()) for _, ld, Tr, Kg in ranked])
-        if fit.ok:
+                          [(ld(), Kg.K(), Tr.matrix()) for _, ld, Tr, Kg, _ in ranked])
+        refs = [r[0] for r in ranked]
+        low = not fit.ok or fit.spread > DENSE_MAX_SPREAD
+        if not low:
             s = fit.scale
-            low = fit.spread > DENSE_MAX_SPREAD
             stats.update({"depth_scale_method": "dense", "depth_scale_points": fit.inliers,
-                          "depth_scale_spread": fit.spread,
-                          "depth_scale_refs": [r[0] for r in ranked]})
+                          "depth_scale_spread": fit.spread, "depth_scale_refs": refs})
         else:
-            s, low = 1.0, True
-            stats.update({"depth_scale_method": "none"})
+            # a failed or inconsistent fit is never stored: the keyframe takes the scale its
+            # neighbours' depth took (low confidence; the global adjustment then fits it to them)
+            s = float(np.median([r[4] for r in ranked]))
+            stats.update({"depth_scale_method": "neighbours", "depth_scale_refs": refs,
+                          "dense_fit": None if not fit.ok else {
+                              "scale": round(fit.scale, 4), "spread": round(fit.spread, 4)}})
         if "sparse_scale_rejected" in stats and (not fit.ok or low or not (
                 REJECT_SCALE[0] <= s <= REJECT_SCALE[1])):
             # neither the sparse nor the dense test supports this pose: misregistered
@@ -1401,7 +1660,50 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
             continue
         _set_aligned(ctx, nf, T, K, model, name, stats, s, low)
         if not nf.record.low_confidence:
-            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid))
+            pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid, s))
+    _realign_dense(ctx, pool)
+
+
+# Each keyframe is first aligned to keyframes before it in capture order: where the depth of a few
+# disagrees with the rest (examples/camera's p06-p07 frames see an out-of-focus ring 0.2 m from the
+# lens, whose depth MoGe places anywhere from 0.2 to 2 m), the order decides which agreement a fit
+# finds: p07_down was scaled x2.0 against the p06 frames, whose ring it shares, where p07_mid and
+# the p08 frames, which see the same desk and chair, agree with it at x1.05. Once every keyframe
+# is aligned, the densely aligned ones are fitted again (REALIGN_SWEEPS times, in capture order)
+# against the REALIGN_REFS aligned keyframes nearest in viewing direction on either side.
+REALIGN_SWEEPS = 2
+REALIGN_REFS = 8
+
+
+def _realign_dense(ctx: UpdateContext, pool: list[tuple[str, Any, Pose, Intrinsics, float]]
+                   ) -> None:
+    """``_align_depths``' second pass over this update's densely aligned confident keyframes
+    (see ``REALIGN_SWEEPS``); a fit that fails or is inconsistent leaves the scale as it was."""
+    from oh_my_slam.reconstruction.depth import dense_scale
+
+    dense = [nf for nf in sorted(ctx.new, key=lambda nf: nf.kf.index)
+             if nf.record is not None and not nf.record.low_confidence
+             and nf.record.stats.get("depth_scale_method") == "dense"]
+    if not dense:
+        return
+    entries = {p[0]: list(p) for p in pool}
+    for _ in range(REALIGN_SWEEPS):
+        for nf in dense:
+            rec = nf.record
+            assert rec is not None
+            fwd = rec.T_map_cam.R[:, 2]
+            ranked = sorted((e for n, e in entries.items() if n != nf.kf.name),
+                            key=lambda e: -float(e[2].R[:, 2] @ fwd))[:REALIGN_REFS]
+            fit = dense_scale(nf.frame.depth, rec.K_grid.K(), rec.T_map_cam.matrix(),
+                              [(e[1](), e[3].K(), e[2].matrix()) for e in ranked])
+            if not fit.ok or fit.spread > DENSE_MAX_SPREAD:
+                continue
+            rec.depth_scale = float(fit.scale)
+            rec.stats.update(depth_scale_spread=fit.spread, depth_scale_points=fit.inliers,
+                             depth_scale_refs=[e[0] for e in ranked])
+            nf.depth = (nf.frame.depth * fit.scale).astype(np.float32)
+            entries[nf.kf.name][1] = (lambda d=nf.depth: d)  # a confident keyframe of the pool
+            entries[nf.kf.name][4] = float(fit.scale)
 
 
 SCALE_PAIR_MAX_ANGLE_DEG = 45.0  # keyframes whose optical axes differ more share little surface
@@ -1423,6 +1725,14 @@ class _ScaleNode:
     low: bool  # low confidence: adjusted after the others, without pulling on them
     nf: NewFrame | None = None
     rec: store.FrameRecord | None = None
+    carried: tuple[float, ...] = ()  # the depth field its depth already carries (``_carried``)
+    multiview: bool = False  # posed by the multi-view fallback (``_bends``)
+
+
+def _carried(stats: dict[str, Any]) -> tuple[float, ...]:
+    """The depth field a stored keyframe's depth carries (``stats.depth_field``: every global
+    adjustment's, composed; none before any)."""
+    return tuple(float(v) for v in stats.get("depth_field", ()))
 
 
 def _depth_view(depth: NDArray[Any], valid: NDArray[Any], K_grid: Intrinsics, T: Pose) -> Any:
@@ -1433,6 +1743,31 @@ def _depth_view(depth: NDArray[Any], valid: NDArray[Any], K_grid: Intrinsics, T:
     ok = np.asarray(valid, bool) & np.isfinite(d) & (d > 0)
     ok &= ~depth_edge_mask(np.where(ok, d, 0.0))
     return DepthView(np.where(ok, d, 0.0).astype(np.float32), K_grid.K(), T.matrix())
+
+
+def _total_field(carried: tuple[float, ...], c: DepthCorrection) -> tuple[float, ...]:
+    """The depth field of a keyframe whose depth carried ``carried`` once ``c`` is applied."""
+    return DepthCorrection(field=carried).then(c).field
+
+
+def _record_field(stats: dict[str, Any], field: tuple[float, ...]) -> None:
+    """``stats.depth_field`` (the keyframe's depth field, every adjustment's composed) and
+    ``stats.depth_bend`` (its largest factor away from 1)."""
+    stats["depth_field"] = [round(v, 5) for v in field]
+    stats["depth_bend"] = round(DepthCorrection(field=field).bend, 5)
+
+
+# The depth field (``reconstruction.depth``) bends the keyframes of maps the multi-view fallback
+# poses: a pan from one spot (examples/camera, ainex-captures), its scale and shape from the depth
+# of overlapping keyframes only. A map that SfM poses (photos from several spots) takes none:
+# there the field fitted the overlaps' clutter, and the same photos mapped in one update and in
+# several (office_sequence 4 + 4 + 5 and 6 + 7) gave boxes agreeing at IoU 0.41-0.47 (0.57-0.62
+# without it, 0.5 required). The first update of the 6 + 7 split, SfM's with one keyframe joined
+# by multi-view (centres 3 cm apart, scaled by their depth), bent with it, and what it decided on
+# that depth (latest wins, merges) stayed when the next update's rebuild unbent it.
+def _bends(rec: store.FrameRecord) -> bool:
+    """Whether a keyframe was posed by the multi-view fallback (its map may take a depth field)."""
+    return rec.pose_source == "multiview"
 
 
 def _anchored(stats: dict[str, Any]) -> bool:
@@ -1454,7 +1789,7 @@ def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
             return _depth_view(d, store.load_valid(ctx.tx.current, f.name, d), f.K_grid,
                                f.T_map_cam)
         nodes.append(_ScaleNode(f.name, f.T_map_cam, load, not _anchored(f.stats), False,
-                                rec=f))
+                                rec=f, carried=_carried(f.stats), multiview=_bends(f)))
     for nf in ctx.new:
         rec = nf.record
         if rec is None or nf.depth is None:
@@ -1464,7 +1799,8 @@ def _scale_nodes(ctx: UpdateContext) -> list[_ScaleNode]:
             assert nf.record is not None and nf.depth is not None
             return _depth_view(nf.depth, nf.frame.valid, nf.record.K_grid, nf.record.T_map_cam)
         nodes.append(_ScaleNode(rec.name, rec.T_map_cam, load_new, not _anchored(rec.stats),
-                                rec.low_confidence, nf))
+                                rec.low_confidence, nf, carried=nf.field,
+                                multiview=_bends(rec)))
     if nodes and all(n.free for n in nodes):  # nothing holds the gauge: the first keyframe does
         nodes[0].free = False
     return nodes
@@ -1524,8 +1860,13 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     # first correction's pivot), so that a held scale — log_scale 0 — is the factor 1 at that
     # median. Composed onto a pivot of 0 (1 m), zeroing the scale turned a tilt b about the median
     # into d ** b: an outdoor keyframe of median depth 11 m with b = 0.14 was placed 40 % too deep.
-    corr = [DepthCorrection(0.0, 0.0, base[k].log_median() if k in base else 0.0)
-            for k in range(len(nodes))]
+    # a map that SfM poses (``_bends``) takes no field, and a keyframe loses the one its depth
+    # carries (an earlier update placed it by the multi-view fallback): it ends as one update of
+    # everything leaves it
+    flat = set() if all(n.multiview for n in nodes) else set(range(len(nodes)))
+    corr = [DepthCorrection(0.0, 0.0, base[k].log_median() if k in base else 0.0,
+                            tuple(-v for v in n.carried) if k in flat else ())
+            for k, n in enumerate(nodes)]
     first: list[float] = []
     last: list[float] = []
     measured = 0
@@ -1546,11 +1887,11 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
                    and (b.src in active or b.dst in active)]
             adj = adjust_depth_corrections(
                 len(nodes), sub, pivots, set(range(len(nodes))) - active,
-                scale_fixed={k for k in active if not nodes[k].free})
+                scale_fixed={k for k in active if not nodes[k].free}, flat=flat)
             for k in active:
                 c = corr[k].then(adj.corrections[k])
                 # a held scale stays exactly held (composing about shifted pivots rounds it)
-                corr[k] = c if nodes[k].free else DepthCorrection(0.0, c.slope, c.pivot)
+                corr[k] = c if nodes[k].free else replace(c, log_scale=0.0)
             if not low:
                 if rnd == 0:
                     first = adj.residuals_before.tolist()
@@ -1559,13 +1900,15 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
         c = corr[k]
         if c.identity:
             continue
+        total = _total_field(n.carried, c)
         if n.nf is not None and n.nf.record is not None and n.nf.depth is not None:
             rec = n.nf.record
             n.nf.depth = c.apply(n.nf.depth).astype(np.float32)
             rec.depth_scale = float(rec.depth_scale * c.scale)
             rec.stats["depth_scale_adjusted"] = round(c.scale, 5)
             rec.stats["depth_exponent"] = round(c.exponent, 5)
-        elif n.rec is not None and max(abs(c.log_scale), abs(c.slope)) > RESCALE_MIN:
+            _record_field(rec.stats, total)
+        elif n.rec is not None and max(abs(c.log_scale), abs(c.slope), c.bend) > RESCALE_MIN:
             rec = n.rec
             d = store.load_depth(ctx.tx.current, rec.name)
             ctx.tx.save_npy(store.frame_file(rec.name, "depth.npy"),
@@ -1575,11 +1918,13 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
                 float(rec.stats.get("depth_scale_adjusted", 1.0)) * c.scale, 5)
             rec.stats["depth_exponent"] = round(
                 float(rec.stats.get("depth_exponent", 1.0)) * c.exponent, 5)
+            _record_field(rec.stats, total)
             ctx.rescaled[rec.index] = c
     free = [k for k, n in enumerate(nodes) if n.free]
     scale_dev = np.abs([corr[k].scale - 1.0 for k in free])
     exps = [c.exponent for c in corr]
     largest = float(scale_dev.max()) if len(scale_dev) else 0.0
+    bends = [c.bend for c in corr]
     summary: dict[str, Any] = {
         "pairs": measured, "adjusted": len(free), "fixed": len(nodes) - len(free),
         "stored_rescaled": len(ctx.rescaled), "depth_bins": len(last),
@@ -1589,13 +1934,15 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
         "pair_ratio_p90_after": round(float(np.percentile(last, 90)), 5) if last else None,
         "max_correction": round(largest, 5),
         "exponent_range": [round(min(exps), 4), round(max(exps), 4)] if exps else None,
+        "largest_bend": round(max(bends), 5) if bends else None,
     }
     ctx.notes["depth_scale_adjustment"] = summary
     timing.count(depth_scale_pairs=measured)
     progress(f"depth scales adjusted over {measured} keyframe pairs: |log ratio| p90 "
              f"{summary['pair_ratio_p90_before']} -> {summary['pair_ratio_p90_after']} "
              f"(largest correction {100 * largest:.1f} %"
-             + (f", exponents {min(exps):.3f}-{max(exps):.3f}" if exps else "")
+             + (f", exponents {min(exps):.3f}-{max(exps):.3f}, bends up to "
+                f"{100 * max(bends):.1f} %" if exps else "")
              + (f"; {len(ctx.rescaled)} stored keyframes re-scaled" if ctx.rescaled else "")
              + ")")
 
@@ -1699,6 +2046,10 @@ def integrate(ctx: UpdateContext, progress: Progress
         surface.release()
         ctx.notes["surface_queries"] = {"count": surface.calls,
                                         "seconds": round(surface.seconds, 2)}
+    with timing.stage(timing.Stage.VALIDITY):
+        # within the update a later keyframe wins over an earlier one, in input order, wherever
+        # it contradicts it (the objects judged their own changes above)
+        validity.apply_input_order(ctx, progress)
     # the map fused once, after the objects removed this update retired their pixels (their
     # places are drawn from the keyframes that saw through them)
     fused = fuse_map(ctx, records)  # stage cloud
@@ -1765,7 +2116,8 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                     running.callback(f.close)
                     early.append(f)
 
-            new = _infer_frames(kfs, spec.kind, work, client, progress, ingested)
+            new = _infer_frames(kfs, spec.kind, work, client, progress, ingested,
+                                _lens_of(old))
             timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
             is_video = spec.kind == "video"
             ctx = UpdateContext(tx, meta, old, new, update_id, work,
@@ -1813,7 +2165,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 tx.commit(meta)
             elapsed = time.perf_counter() - t_start
             progress(f"committed update {update_id}: {len(new_names)} keyframes added, "
-                     f"{len(objs.objects)} objects, {elapsed:.0f} s")
+                     f"{len(objs.exported())} objects, {elapsed:.0f} s")
             return UpdateResult(payload, new_names, ctx.rejected, elapsed, tm.to_dict())
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -1838,10 +2190,14 @@ def _place(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) 
             _define_map_frame(ctx, model, progress)
     with stage(timing.Stage.DEPTH_ALIGNMENT):
         _align_depths(ctx, model)
-        _adjust_depth_scales(ctx, progress)
     if not old:
+        # levelled on the depth as aligned: the global adjustment bends the keyframes to agree
+        # with each other, it does not know where up is (on examples/camera its floor leaned
+        # 2.5° against the walls, and levelled with it, so did the walls)
         with stage(timing.Stage.MAP_FRAME):
             _level_with_floor(ctx, model, progress)
+    with stage(timing.Stage.DEPTH_ALIGNMENT):
+        _adjust_depth_scales(ctx, progress)
     if not any(nf.record is not None for nf in new):
         raise RegistrationError("no input frame could be placed consistently in the map; "
                                 "the map is unchanged")
@@ -1897,7 +2253,6 @@ def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[
     gravity, descriptor, and detections (``instances.json``; each records the id it was first
     published with, ``first_id``, which ``first`` keeps, and ``prior`` resolved by ``resolve``;
     a map written before ``first_id`` gives its ``object_id``)."""
-    from oh_my_slam.core.images import load_rgb
     from oh_my_slam.core.rle import decode
     from oh_my_slam.reconstruction.gravity import GravityEstimate
 
@@ -1905,7 +2260,7 @@ def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[
     shutil.copyfile(tx.root / rec.image, dst)
     depth = store.load_depth(tx.current, rec.name)
     valid = store.load_valid(tx.current, rec.name, depth) & (depth > 0)
-    rgb = load_rgb(dst, max_side=max(rec.grid_width, rec.grid_height))
+    rgb = store.keyframe_rgb(dst, rec, max(rec.grid_width, rec.grid_height))
     d = tx.current(store.frame_file(rec.name, "descriptor.npy"))
     desc = np.load(d).astype(np.float32) if d.exists() else None
     grav = None if rec.up_cam is None else GravityEstimate(
@@ -1928,7 +2283,8 @@ def _stored_frame(tx: store.MapTransaction, rec: store.FrameRecord, prior: dict[
             first[id(det)] = fid
             prior[id(det)] = resolve(fid)
     kf = ingest.Keyframe(rec.name, rec.index, dst, rec.source, rec.K)
-    return NewFrame(kf, frame, dets, (rec.width, rec.height))
+    return NewFrame(kf, frame, dets, (rec.width, rec.height), lens=rec.K if rec.K.k else None,
+                    field=_carried(rec.stats))
 
 
 def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store.FrameRecord],
@@ -1950,9 +2306,10 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
 
     saved = json.loads(json.dumps(meta))
     # the new keyframes as inference gave them: an abandoned rebuild extends the map with them
-    # exactly as a plain extension would (the rebuild's focal re-run and alignment are undone)
-    frames = [replace(nf.frame, depth=nf.frame.depth.copy(), valid=nf.frame.valid.copy())
-              for nf in new]
+    # exactly as a plain extension would (the rebuild's focal re-run and alignment are undone,
+    # and the detections and lens of a keyframe it inferred again undistorted)
+    frames = [(replace(nf.frame, depth=nf.frame.depth.copy(), valid=nf.frame.valid.copy()),
+               list(nf.dets), nf.lens) for nf in new]
     state = load_state(tx.current, meta)
 
     def resolve(oid: int) -> int:
@@ -1972,7 +2329,6 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
                  plan[0].camera_id if len({(r.camera_id, r.width, r.height) for r in plan}) == 1
                  and all((nf.full_size == (plan[0].width, plan[0].height)) for nf in new)
                  else None)
-    rb.boxes = {o.id: (o.label, o.obb) for o in state.objects if o.confirmed}
     rb.published = {o.id for o in state.objects if o.published}
     tx.start_over(keep=(store.SFM_DB,))  # the stored keyframes' features and matches
     for key in ("floor_z", "scale", "map_frame"):
@@ -1999,8 +2355,8 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
     tx.resume()
     meta.clear()
     meta.update(saved)
-    for nf, frame in zip(new, frames, strict=True):
-        nf.frame, nf.record, nf.depth = frame, None, None
+    for nf, (frame, dets, lens) in zip(new, frames, strict=True):
+        nf.frame, nf.record, nf.depth, nf.dets, nf.lens = frame, None, None, dets, lens
     ctx = UpdateContext(tx, meta, old, new, update_id, work)
     ctx.notes["restart_abandoned"] = {"left_out": left}
     return ctx, None

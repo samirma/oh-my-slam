@@ -19,8 +19,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX
 from oh_my_slam.core.ply import parse_ply
-from tests.fakes.stub_server import start_stub_server
+from tests.fakes.stub_server import start_stub_server, stub_env
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -98,34 +99,143 @@ def failure_path(script: str, args: list[str], record: Path) -> dict[str, Any]:
     return json.loads(record.read_text())  # type: ignore[no-any-return]
 
 
+def make_clip(path: Path) -> Path:
+    """A short real video (one second of noise frames)."""
+    import av
+
+    with av.open(str(path), "w") as out:
+        stream = out.add_stream("mpeg4", rate=10)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        rng = np.random.default_rng(0)
+        for _ in range(10):
+            frame = av.VideoFrame.from_ndarray(rng.integers(0, 256, (48, 64, 3), np.uint8),
+                                               format="rgb24")
+            for pkt in stream.encode(frame):
+                out.mux(pkt)
+        for pkt in stream.encode():
+            out.mux(pkt)
+    return path
+
+
 def test_down_server_fails_fast(image: Path, tmp_path: Path) -> None:
-    """Exit 3 with the start command on stderr, nothing on stdout and no file or folder written;
-    and the command's failure path takes no time (``failure_path``)."""
+    """Exit 3 with the start command on stderr, nothing on stdout and no file or folder written
+    — not even the missing folders of an ``-o`` file, nor a new map holding it; and the command's
+    failure path takes no time (``failure_path``)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    clip = make_clip(tmp_path / "walk.mp4")
     for script, args in [
         ("reconstruct.sh", ["-i", str(image)]),
         ("reconstruct.sh", ["-i", str(image), "-f", "ply", "-p", "voxel=0.01"]),
         ("reconstruct.sh", ["-i", str(image), "-f", "depth"]),
+        ("reconstruct.sh", ["-i", str(image), "-o", str(work / "new" / "dir" / "x.json")]),
         ("segment.sh", ["-i", str(image)]),
-        ("segment.sh", ["-i", str(image), "-o", str(tmp_path / "x.json")]),
-        ("segment.sh", ["-i", str(image), "-f", "png", "-d", str(tmp_path / "d")]),
-        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m")]),
-        ("mapper.sh", ["update", "-i", str(image), "-m", str(tmp_path / "m"), "-f", "ply",
+        ("segment.sh", ["-i", str(image), "-o", str(work / "x.json")]),
+        ("segment.sh", ["-i", str(image), "-f", "png", "-o", str(work / "new2" / "x.png")]),
+        ("segment.sh", ["-i", str(image), "-f", "png", "-d", str(work / "d")]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(work / "m")]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(work / "m"), "-f", "ply",
                        "-p", "voxel=0.05"]),
+        ("mapper.sh", ["update", "-i", str(image), "-m", str(work / "m"),
+                       "-o", str(work / "m" / "sub" / "r.json")]),
+        ("mapper.sh", ["update", "-i", str(clip), "-m", str(work / "m")]),  # a video
+        ("mapper.sh", ["update", "-i", str(clip), "-m", str(work / "m"), "-fps", "1",
+                       "-o", str(work / "new3" / "r.json")]),
     ]:
         res = sh(script, *args)
-        assert res.returncode == 3, (script, res.stderr)
+        assert res.returncode == 3, (script, args, res.stderr)
         assert res.stdout == b""
         assert b"./start_inference_server.sh" in res.stderr
         timed = failure_path(script, args, tmp_path / "failure.json")
         assert timed["code"] == 3 and timed["seconds"] < FAIL_FAST_S, (script, args, timed)
-    assert not (tmp_path / "x.json").exists() and not (tmp_path / "m").exists()
-    assert not (tmp_path / "d").exists()  # nor the -d folder
+        assert list(work.iterdir()) == [], (script, args)  # no file, no folder, no map
+
+
+# ``mapper.sh locate`` on a map of more keyframes than are matched exhaustively, through the
+# command: the map is a stand-in (its keyframes' features and descriptors), and retrieval needs
+# the query's descriptor from the inference server.
+LOCATE_LARGE_MAP = r"""
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+import numpy as np
+from oh_my_slam.cli import mapper
+from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX
+from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.mapping import locate, store
+
+root, *argv = sys.argv[1:]
+K = Intrinsics(300.0, 300.0, 200.0, 150.0, 400, 300)
+frames = [store.FrameRecord(i, f"f{i:06d}", f"frames/f{i:06d}.jpg", "", 1, 400, 300, K,
+                            Pose.identity(), 400, 300) for i in range(UPDATE_EXHAUSTIVE_MAX + 1)]
+reader = SimpleNamespace(root=Path(root), frames=frames, meta={}, read_json=lambda name: {},
+                         descriptor=lambda fr: np.eye(8)[fr.index % 8])
+locate.open_map = lambda map_dir: reader
+db = {f"{fr.name}.jpg": locate._DbImage(fr.index + 1, 1) for fr in frames}
+locate._extract = lambda reader, queries, work: (
+    SimpleNamespace(match_pairs=lambda pairs, names: None),
+    {**db, **{q.name: locate._DbImage(len(frames) + 1 + q.index, 2) for q in queries}})
+sys.argv = ["mapper.sh", *argv]
+mapper.entry()
+"""
+
+
+def test_locate_in_a_large_map_needs_the_server(image: Path, tmp_path: Path) -> None:
+    """``mapper.sh locate`` in a map of more than ``UPDATE_EXHAUSTIVE_MAX`` keyframes retrieves
+    candidate keyframes with the query's descriptor: with the server down, exit 3 and the start
+    command on stderr, nothing on stdout."""
+    res = subprocess.run([sys.executable, "-c", LOCATE_LARGE_MAP, str(tmp_path),
+                          "locate", "-i", str(image), "-m", str(tmp_path)],
+                         capture_output=True, timeout=120, env=os.environ.copy(), cwd=REPO)
+    assert res.returncode == 3, res.stderr.decode()
+    assert res.stdout == b"" and b"./start_inference_server.sh" in res.stderr
+    keyframes = f"({UPDATE_EXHAUSTIVE_MAX + 1} keyframes)".encode()
+    assert keyframes in res.stderr  # the stand-in map was the one located in
+
+
+# ``start_inference_server.sh`` with no option, launching the stub server instead of the models
+START_WITH_STUB = r"""
+from oh_my_slam.cli import server
+from tests.fakes.stub_server import SERVER_CMD
+server._server_cmd = lambda: SERVER_CMD
+server.entry()
+"""
+
+
+def test_the_server_command_writes_stdout_for_status_only() -> None:
+    """``start_inference_server.sh``: with the server down, ``--status`` (exit 3) and ``--stop``
+    (exit 0) write nothing on stdout, and neither does a start; once it runs, ``--status`` writes
+    exactly its health JSON, and ``--stop`` nothing."""
+    for args, code in ((["--status"], 3), (["--stop"], 0)):
+        res = sh("start_inference_server.sh", *args)
+        assert (res.returncode, res.stdout) == (code, b""), (args, res.stderr)
+    try:
+        res = subprocess.run([sys.executable, "-c", START_WITH_STUB], capture_output=True,
+                             timeout=120, env=stub_env(), cwd=REPO)
+        assert (res.returncode, res.stdout) == (0, b""), res.stderr.decode()
+        assert b"ready after" in res.stderr
+        res = sh("start_inference_server.sh", "--status")
+        assert res.returncode == 0 and assert_one_json(res.stdout)["status"] == "ready"
+    finally:
+        res = sh("start_inference_server.sh", "--stop")
+    assert (res.returncode, res.stdout) == (0, b"") and b"stopped (pid" in res.stderr
 
 
 def test_bad_attributes_exit_2_before_the_server_is_contacted(image: Path, tmp_path: Path
                                                               ) -> None:
-    """The server is down here: exit 2 (not 3) shows the options were checked first."""
+    """The server is down here: exit 2 (not 3) shows the options and the input image were checked
+    first."""
+    notes, bad, gif = tmp_path / "notes.txt", tmp_path / "bad.jpg", tmp_path / "real.gif"
+    notes.write_text("not an image")
+    bad.write_text("not an image")
+    Image.new("RGB", (8, 8)).save(gif)  # a readable image of a suffix -i does not take
     for script, args, hint in [
+        *[(s, ["-i", str(f), *more], b"unsupported input (not an image)")
+          for s, more in (("reconstruct.sh", []), ("segment.sh", []), ("view.sh", ["--no-browser"]))
+          for f in (notes, gif)],
+        *[(s, ["-i", str(bad), *more], b"cannot read image")
+          for s, more in (("reconstruct.sh", ["-f", "ply"]), ("segment.sh", ["-f", "png"]),
+                          ("view.sh", ["--no-browser"]))],
         ("reconstruct.sh", ["-i", str(image), "-f", "ply", "-p", "colour=rgb"],
          b"unknown point-cloud attribute"),
         ("reconstruct.sh", ["-i", str(image), "-p", "voxel=0.1"], b"-f ply"),
@@ -226,6 +336,18 @@ def test_mapper_update_stdout_on_a_multi_image_map(stub_server: None, tmp_path: 
     assert res.stdout == b""
     assert len(assert_one_json(target.read_bytes())["openlabel"]["frames"]) >= len(
         doc["openlabel"]["frames"])
+
+
+def test_an_output_file_inside_a_new_map(stub_server: None, image: Path, tmp_path: Path) -> None:
+    """``mapper.sh update -m new -o new/sub/r.json``: the ``-o`` folders are created with the
+    result, once the new map exists — not before, when they would make the folder a non-empty
+    one that is not a map (exit 4)."""
+    new = tmp_path / "new"
+    target = new / "sub" / "r.json"
+    res = sh("mapper.sh", "update", "-i", str(image), "-m", str(new), "-o", str(target))
+    assert res.returncode == 0, res.stderr.decode()
+    assert res.stdout == b"" and "openlabel" in assert_one_json(target.read_bytes())
+    assert (new / "map.json").is_file()
 
 
 def test_timings_go_to_stderr_and_the_env_file_only(stub_server: None, image: Path,

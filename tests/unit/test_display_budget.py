@@ -25,16 +25,21 @@ def keys(points: np.ndarray, edge: float) -> np.ndarray:
     return g.voxel_keys(points, edge)
 
 
+def occupied(points: np.ndarray, edge: float) -> int:
+    """Occupied voxels of the grid of edge ``edge`` (its distinct keys)."""
+    return len(np.unique(keys(points, edge), axis=0))
+
+
 @pytest.mark.parametrize("budget", [1_000, 25_000, 59_000, 59_990])
 def test_at_most_the_budget_with_the_smallest_edge(budget: int) -> None:
     pts = surface_cloud(60_000)
     grid, idx = g.budget_voxel_grid(pts, budget)
-    assert grid.edge > 0 and len(idx) == grid.count == g._occupied(pts, grid.edge)
+    assert grid.edge > 0 and len(idx) == grid.count == occupied(pts, grid.edge)
     # never more than the budget, and close to it (a coarse grid's count moves in larger steps)
     assert (0.97 if budget >= 10_000 else 0.9) * budget <= len(idx) <= budget
     # minimal: a finer edge less than 2 % below was counted and does not fit
     assert grid.finer is not None and grid.edge / grid.finer <= 1 + g.BUDGET_EDGE_TOL
-    assert grid.finer_count == g._occupied(pts, grid.finer) > budget
+    assert grid.finer_count == occupied(pts, grid.finer) > budget
     # the edge found once gives the same selection without a search (the per-source cache)
     again, edge = g.budget_voxel_indices(pts, budget, grid.edge)
     assert edge == grid.edge and np.array_equal(again, idx)

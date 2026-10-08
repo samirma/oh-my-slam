@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from enum import IntEnum
 
+from oh_my_slam.core.constants import START_INFERENCE_SERVER
+
 
 class ExitCode(IntEnum):
     OK = 0
@@ -35,6 +37,8 @@ HTTP_STATUS: dict[ExitCode, int] = {
 }
 
 
+_DOWN = "not running, or its models failed to load"
+
 # What each exit status means, for the people and agents that read it (README "Output contract and
 # exit codes", the agent skill).
 MEANING: dict[ExitCode, str] = {
@@ -43,14 +47,23 @@ MEANING: dict[ExitCode, str] = {
                        "wrong version)",
     ExitCode.USAGE: "usage or input error: a bad option or value, a missing or unsupported input "
                     "file",
-    ExitCode.SERVER_UNAVAILABLE: "a server it needs does not answer: the inference server (not "
-                                 "running, or its models failed to load), or for --status the "
-                                 "server it queries",
+    ExitCode.SERVER_UNAVAILABLE: "a server it needs does not answer: the inference server "
+                                 f"({_DOWN}), or for --status the server it queries",
     ExitCode.NOT_A_MAP: "the map folder is not a map (and not empty, for an update)",
     ExitCode.NOT_REGISTERED: "nothing could be placed in the map (no overlap); the map is "
                              "unchanged",
     ExitCode.MAP_LOCKED: "another update holds the map",
     ExitCode.INTERRUPTED: "interrupted (Ctrl-C, or a server.sh request whose client left)",
+}
+
+# What each exit status means to a client of the web service's API (the agent skill): the meanings
+# above without what only a local run sees (``--status``, Ctrl-C) or no client reads (the answer
+# to a client that left): a client reads 130 only when the service's stop interrupted its request.
+API_MEANING: dict[ExitCode, str] = {
+    **MEANING,
+    ExitCode.SERVER_UNAVAILABLE: f"the inference server does not answer ({_DOWN})",
+    ExitCode.INTERRUPTED: "interrupted: the service stopped while the request waited or ran; send "
+                          "it again once the service runs",
 }
 
 
@@ -70,7 +83,13 @@ def error_code(exit_code: int) -> str:
         return ExitCode.INTERNAL.name.lower()
 
 
-SERVER_HINT = "start it with ./start_inference_server.sh"
+def internal_message(exc: BaseException) -> str:
+    """How an internal error (an unexpected exception, exit 1) is told: its type and message, what
+    follows ``<prog>: internal error:`` on a command's stderr."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+SERVER_HINT = f"start it with {START_INFERENCE_SERVER}"
 
 
 class OhMySlamError(Exception):
@@ -104,7 +123,44 @@ class ServerModelsFailedError(ServerUnavailableError):
         OhMySlamError.__init__(
             self,
             f"inference server models failed to load ({failed}) — see {log_path}, fix the cause, "
-            "then restart with ./start_inference_server.sh --stop && ./start_inference_server.sh",
+            f"then restart with {START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}",
+        )
+
+
+class ServerLoadingError(ServerUnavailableError):
+    """The server runs but is still loading its models after the command's bounded wait (health
+    status ``loading``)."""
+
+    def __init__(self, waited_s: float, log_path: str) -> None:
+        OhMySlamError.__init__(
+            self,
+            f"inference server is still loading its models after {waited_s:.0f} s — run "
+            f"{START_INFERENCE_SERVER}, which waits until they are loaded (progress in "
+            f"{log_path}), then retry",
+        )
+
+
+class ServerStoppingError(ServerUnavailableError):
+    """The server is shutting down (health status ``stopping``)."""
+
+    def __init__(self) -> None:
+        OhMySlamError.__init__(
+            self,
+            f"inference server is stopping — start it again with {START_INFERENCE_SERVER} "
+            "(it waits until the old one has exited), then retry",
+        )
+
+
+class ServerProtocolError(ServerUnavailableError):
+    """The running server speaks another protocol version than this code (health ``protocol``):
+    it was started before an upgrade."""
+
+    def __init__(self, server: int, client: int) -> None:
+        OhMySlamError.__init__(
+            self,
+            f"the running inference server speaks protocol {server}, this version needs "
+            f"{client} (it was started before an upgrade) — restart it with "
+            f"{START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}",
         )
 
 

@@ -123,6 +123,23 @@ def _reconstruction(centres: list[float], points: bool = True) -> Any:
     return rec
 
 
+def test_a_division_camera_keeps_its_lens_and_its_observations_are_the_pinholes() -> None:
+    import pycolmap
+
+    rec = _reconstruction([0.0, 0.5, 1.0])
+    cam = pycolmap.Camera.create_from_model_id(1, pycolmap.CameraModelId.SIMPLE_DIVISION, 100.0,
+                                               64, 48)
+    cam.params = [100.0, 32.0, 24.0, -0.3]
+    rec.cameras[1].model = cam.model
+    rec.cameras[1].params = cam.params
+    model = SfmModel(rec, "multiview")
+    K = model.intrinsics("f0.jpg")
+    assert K.k == pytest.approx(-0.3) and K.fx == 100.0
+    assert sfm_mod.camera_intrinsics(_reconstruction([0.0]).cameras[1]).k == 0.0
+    uv, _ = model.observations("f0.jpg", max_error=1e9)
+    np.testing.assert_allclose(uv, K.pinhole_pixels(np.array([[10.0, 20.0]])))
+
+
 def test_model_points_and_deregistering_an_unknown_keyframe() -> None:
     model = SfmModel(_reconstruction([0.0, 0.5, 1.0]), "sfm-global")
     np.testing.assert_allclose(model.points(), [[0.0, 0.0, 5.0]])
@@ -310,6 +327,77 @@ def test_verified_matches_keep_used_configurations_with_enough_inliers(tmp_path:
     (m,) = panorama.verified_matches(db, ["a.jpg", "b.jpg", "c.jpg"])
     assert (m.a, m.b, len(m.uv_a)) == ("a.jpg", "b.jpg", 20)
     np.testing.assert_array_equal(m.uv_a[1], [2.0 + 100 * 0, 3.0])  # a's keypoint 1
+
+
+def test_a_lens_keypoints_are_matched_where_its_pinhole_sees_them(tmp_path: Path) -> None:
+    """A camera with distortion (a multi-view map's refined lens, ``Sfm.set_distortion``): the
+    matches are where its pinhole sees the keypoints (its keyframes' depth is on its grid)."""
+    import pycolmap
+
+    db = tmp_path / "db.db"
+    ids = _db(db, ["a.jpg", "b.jpg"])
+    _keypoints(db, ids)
+    _pair(db, ids["b.jpg"], ids["a.jpg"], 20)
+    other = _db(db, ["c.jpg"], size=(80, 60))  # another camera, not of the images named
+    s = Sfm(db, tmp_path, tmp_path / "work")
+    s.set_distortion({"a.jpg"}, 1.1, -0.2)
+    d = pycolmap.Database.open(str(db))
+    try:
+        cam, kept = d.read_all_cameras()
+        raw = np.asarray(d.read_keypoints(ids["b.jpg"]), np.float64)[:20, :2]
+    finally:
+        d.close()
+    assert other and kept.model.name == "SIMPLE_PINHOLE" and kept.width == 80
+    assert cam.model.name == "SIMPLE_DIVISION" and cam.has_prior_focal_length is False
+    np.testing.assert_allclose(cam.params, [110.0, 32.0, 24.0, -0.2])
+    assert panorama.distorted(cam)
+    (m,) = panorama.verified_matches(db, ["a.jpg", "b.jpg"])
+    d_ = (raw - [32.0, 24.0]) / 110.0
+    pin = d_ / (1 - 0.2 * np.sum(d_ * d_, axis=1, keepdims=True)) * 110.0 + [32.0, 24.0]
+    np.testing.assert_allclose(m.uv_b, pin)
+    np.testing.assert_allclose(panorama.pinhole_pixels(cam, raw), pin)
+
+
+def test_a_rebuild_fits_the_lens_again_from_a_pinhole(tmp_path: Path) -> None:
+    """``Sfm.drop_distortion``: the lens camera becomes the pinhole of its focal length and
+    principal point; a pinhole camera stays as it is."""
+    import pycolmap
+
+    db = tmp_path / "db.db"
+    _db(db, ["a.jpg"])
+    s = Sfm(db, tmp_path, tmp_path / "work")
+    s.set_distortion({"a.jpg"}, 1.1, -0.2)
+    s.drop_distortion(1)
+    s.drop_distortion(1)  # a pinhole already
+    d = pycolmap.Database.open(str(db))
+    try:
+        (cam,) = d.read_all_cameras()
+    finally:
+        d.close()
+    assert cam.model.name == "SIMPLE_PINHOLE" and not panorama.distorted(cam)
+    np.testing.assert_allclose(cam.params, [110.0, 32.0, 24.0])
+
+
+def test_corner_shift_is_the_share_of_the_half_diagonal() -> None:
+    assert panorama.corner_shift((640, 480), 400.0, 0.0) == 0.0
+    # half-diagonal 400 px = 1 at f 400: k = -0.2 sees it at 1 / 0.8
+    assert panorama.corner_shift((640, 480), 400.0, -0.2) == pytest.approx(0.25)
+
+
+def test_a_multiview_model_takes_the_refined_camera(tmp_path: Path) -> None:
+    db = tmp_path / "db.db"
+    ids = _db(db, ["f0.jpg", "f1.jpg"])
+    _keypoints(db, ids)
+    poses = {"f0.jpg": Pose.identity(), "f1.jpg": Pose(np.eye(3), np.array([0.1, 0.0, 0.0]))}
+    s = Sfm(db, tmp_path, tmp_path / "work")
+    pin = s.triangulate_with_poses(poses, tmp_path / "pin", focal_scale=1.1)
+    cam = pin.rec.cameras[1]
+    assert cam.model.name == "SIMPLE_PINHOLE"
+    np.testing.assert_allclose(cam.params, [110.0, 32.0, 24.0])
+    lens = s.triangulate_with_poses(poses, tmp_path / "lens", focal_scale=1.1, distortion=-0.2)
+    cam = lens.rec.cameras[1]
+    assert cam.model.name == "SIMPLE_DIVISION"  # the database camera too (verified_matches)
+    np.testing.assert_allclose(cam.params, [110.0, 32.0, 24.0, -0.2])
 
 
 def test_refinement_without_matches_keeps_the_poses() -> None:

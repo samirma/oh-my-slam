@@ -1,5 +1,6 @@
-"""The shared cloud derivation (segmentation.cloud): the effect of every point-cloud attribute on
-an image source and a map source, determinism, the colour contract and the PLY header."""
+"""The shared cloud derivation (reconstruction.cloud): the effect of every point-cloud attribute on
+an image source and a map source, determinism, the colour contract (segmentation's colours,
+supplied as data) and the PLY header."""
 
 from __future__ import annotations
 
@@ -12,15 +13,16 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs, CloudScope, parse_cloud_attr
 from oh_my_slam.core.geometry import budget_voxel_indices, voxel_downsample_indices, voxel_keys
 from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask
-from oh_my_slam.segmentation.cloud import (
+from oh_my_slam.reconstruction.cloud import (
     ImageCloudSource,
     MapCloudSource,
+    PointColors,
     cloud_ply,
     derive_cloud,
     derive_thinned,
-    map_cloud_source,
 )
+from oh_my_slam.reconstruction.pointcloud import PointNormals, pixel_mask
+from oh_my_slam.segmentation.api import POINT_COLORS, map_cloud_source
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, height_colors
 from tests.synth.scene import default_room, look_at, render
 
@@ -35,7 +37,7 @@ def image() -> ImageCloudSource:
     depth = r.depth.copy()
     depth[100:130, 40:80] = 0.0
     labels = np.where(r.ids >= 2, r.ids - 1, 0).astype(np.int32)
-    return ImageCloudSource(depth, depth > 0, r.rgb, K, labels,
+    return ImageCloudSource(depth, depth > 0, r.rgb, K, POINT_COLORS, labels,
                             pose.R.T @ np.array([0.0, 0.0, 1.0]))
 
 
@@ -106,6 +108,15 @@ def test_voxel_one_exact_point_per_voxel_deterministic(image: ImageCloudSource) 
     np.testing.assert_array_equal(rgb_image, image.rgb[v, u])
 
 
+@pytest.mark.parametrize("voxel", ["1e-19", "1e-300", "1e-320"])
+def test_a_tiny_voxel_keeps_every_distinct_point(image: ImageCloudSource, voxel: str) -> None:
+    """A voxel finer than the coordinates' float spacing is a valid ``-p`` value: every point is
+    its own voxel, so the cloud is the unthinned one (no merge from an overflowing voxel key)."""
+    attrs = parse_cloud_attrs(f"voxel={voxel}", CloudScope.IMAGE)
+    full = derive_cloud(image, CloudAttrs())
+    np.testing.assert_array_equal(derive_cloud(image, attrs).xyz, full.xyz)
+
+
 def test_label_property(image: ImageCloudSource) -> None:
     on = derive_cloud(image, CloudAttrs(label=True))
     assert on.label is not None
@@ -131,8 +142,36 @@ def test_colour_modes(image: ImageCloudSource) -> None:
     assert none.rgb is None and len(none) == len(height)
 
 
+def test_colours_are_the_suppliers_data(image: ImageCloudSource,
+                                        plane_map: MapCloudSource) -> None:
+    """Spec §4: the derivation assigns no colour itself. color=segment and color=height are the
+    supplier's functions (segmentation's colour assignment), applied to the emitted points' ids
+    and heights; the same points and labels whatever they return."""
+    seen: dict[str, np.ndarray] = {}
+
+    def by_id(ids: np.ndarray) -> np.ndarray:
+        seen["segment"] = np.asarray(ids).copy()
+        return np.repeat(np.asarray(ids, np.uint8)[:, None], 3, axis=1)
+
+    def by_height(h: np.ndarray) -> np.ndarray:
+        seen["height"] = np.asarray(h).copy()
+        return np.full((len(h), 3), 9, np.uint8)
+
+    mine = PointColors(segment=by_id, height=by_height)
+    for source in (image, plane_map):
+        other = replace(source, colors=mine)
+        seg = derive_cloud(other, CloudAttrs(color="segment", label=True, voxel=0.05))
+        ref = derive_cloud(source, CloudAttrs(color="segment", label=True, voxel=0.05))
+        np.testing.assert_array_equal(seg.xyz, ref.xyz)
+        np.testing.assert_array_equal(seen["segment"], ref.label)
+        np.testing.assert_array_equal(seg.rgb, np.repeat(ref.label.astype(np.uint8)[:, None], 3, 1))
+        h = derive_cloud(other, CloudAttrs(color="height"))
+        assert len(seen["height"]) == len(h) and (h.rgb == 9).all()
+    np.testing.assert_allclose(seen["height"], plane_map.xyz[:, 2])  # a map's up is +z
+
+
 def test_missing_inputs_are_programming_errors(image: ImageCloudSource) -> None:
-    bare = ImageCloudSource(image.depth, image.valid, image.rgb, K)
+    bare = ImageCloudSource(image.depth, image.valid, image.rgb, K, POINT_COLORS)
     with pytest.raises(ValueError):
         derive_cloud(bare, CloudAttrs(color="segment"))
     with pytest.raises(ValueError):
@@ -148,7 +187,8 @@ def test_image_normals_from_depth() -> None:
     v, u = np.mgrid[0:K.height, 0:K.width]
     rays = np.stack([(u - K.cx) / K.fx, (v - K.cy) / K.fy, np.ones(u.shape)], -1)
     depth = (-2.0 / (rays @ n_true)).astype(np.float32)
-    src = ImageCloudSource(depth, depth > 0, np.zeros((*depth.shape, 3), np.uint8), K)
+    src = ImageCloudSource(depth, depth > 0, np.zeros((*depth.shape, 3), np.uint8), K,
+                           POINT_COLORS)
     cloud = derive_cloud(src, CloudAttrs(normals=True, edge=0))
     assert cloud.normals is not None and len(cloud) == depth.size
     np.testing.assert_allclose(np.linalg.norm(cloud.normals, axis=1), 1.0, atol=1e-5)
@@ -305,10 +345,10 @@ def test_complete_map_cloud_shares_the_source_arrays(monkeypatch: pytest.MonkeyP
     """A map cloud with every point costs no copy of the map: positions, colours and labels are
     read-only views of the source's arrays; any selection of points copies (and colours are
     derived per chunk with exactly the values of a single pass)."""
-    import oh_my_slam.segmentation.cloud as sc
+    import oh_my_slam.segmentation.api as sa
     import oh_my_slam.segmentation.colors as colors
 
-    monkeypatch.setattr(sc, "CHUNK_POINTS", 7)
+    monkeypatch.setattr(sa, "LABEL_CHUNK", 7)
     monkeypatch.setattr(colors, "SEGMENT_CHUNK", 5)
     rng = np.random.default_rng(2)
     xyz = rng.normal(size=(40, 3)).astype(np.float32)

@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.geometry import rot_to_quat
+from oh_my_slam.core.geometry import quat_to_rot, rot_to_quat
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.version import __version__
 
@@ -25,7 +25,7 @@ ONTOLOGY_UID = "0"
 Json = dict[str, Any]
 
 
-def _r(x: float, nd: int = 6) -> float:
+def round_float(x: float, nd: int = 6) -> float:
     """``x`` rounded to ``nd`` decimals, with signed zero normalised (``-0.0`` -> ``0.0``): a value
     that jitters around zero between identical runs (the anchor frame's translation) would
     otherwise be written as ``-0.0`` in one and ``0.0`` in the other."""
@@ -33,11 +33,11 @@ def _r(x: float, nd: int = 6) -> float:
 
 
 def rounded(x: Any) -> Any:
-    """``x`` with every float rounded as poses and cuboids are (``_r``), through dicts and
+    """``x`` with every float rounded as poses and cuboids are (``round_float``), through dicts and
     lists: values that threaded SfM makes differ by ~1e-12 between identical runs are written
     identically."""
     if isinstance(x, float):
-        return _r(x)
+        return round_float(x)
     if isinstance(x, dict):
         return {k: rounded(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
@@ -71,27 +71,47 @@ def ontology(labels: Sequence[str]) -> Json:
 def camera_matrix_3x4(K: NDArray[Any]) -> list[float]:
     P = np.zeros((3, 4))
     P[:, :3] = K
-    return [_r(v) for v in P.ravel()]
+    return [round_float(v) for v in P.ravel()]
 
 
 def camera_stream(intr: Intrinsics, uri: str | None = None, description: str | None = None) -> Json:
-    stream: Json = {
-        "type": "camera",
-        "stream_properties": {
-            "intrinsics_pinhole": {
-                "width_px": int(intr.width),
-                "height_px": int(intr.height),
-                "camera_matrix": camera_matrix_3x4(intr.K()),
-                "distortion_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-            },
-            "intrinsics_source": intr.source,
+    """A camera stream: its pinhole and distortion (``Intrinsics.opencv_distortion``: five zeros
+    for a pinhole). A lens with distortion (``Intrinsics.k``,
+    COLMAP's division model) gives OpenCV's rational coefficients that bend the rays as it does
+    (``Intrinsics.opencv_distortion``: k1, k2, p1, p2, k3, k4, k5, k6), and the exact model as
+    ``intrinsics_custom``."""
+    props: Json = {
+        "intrinsics_pinhole": {
+            "width_px": int(intr.width),
+            "height_px": int(intr.height),
+            "camera_matrix": camera_matrix_3x4(intr.K()),
+            "distortion_coeffs": intr.opencv_distortion(),
         },
+        "intrinsics_source": intr.source,
     }
+    if intr.k:
+        props["intrinsics_custom"] = {
+            "model": "division", "focal_length_px": float(intr.fx),
+            "center_x_px": float(intr.cx), "center_y_px": float(intr.cy), "k": float(intr.k),
+            "description": "a pixel d (from the centre, over the focal length) is the ray "
+                           "(d / (1 + k |d|^2), 1): COLMAP's SIMPLE_DIVISION"}
+    stream: Json = {"type": "camera", "stream_properties": props}
     if uri is not None:
         stream["uri"] = uri
     if description is not None:
         stream["description"] = description
     return stream
+
+
+def stream_intrinsics(props: Json) -> Intrinsics:
+    """The camera a ``camera_stream``'s properties describe: its pinhole and, from
+    ``intrinsics_custom``, the division model's distortion."""
+    pin = props["intrinsics_pinhole"]
+    m = pin["camera_matrix"]
+    custom = props.get("intrinsics_custom") or {}
+    k = float(custom["k"]) if custom.get("model") == "division" else 0.0
+    return Intrinsics(float(m[0]), float(m[5]), float(m[2]), float(m[6]), int(pin["width_px"]),
+                      int(pin["height_px"]), props.get("intrinsics_source", "model"), k)
 
 
 def sensor_cs(parent: str = "", pose: Pose | None = None) -> Json:
@@ -114,9 +134,19 @@ def map_cs(children: Sequence[str]) -> Json:
 
 def transform_data(pose: Pose) -> Json:
     return {
-        "quaternion": [_r(v, 8) for v in rot_to_quat(pose.R)],
-        "translation": [_r(v) for v in pose.t],
+        "quaternion": [round_float(v, 8) for v in rot_to_quat(pose.R)],
+        "translation": [round_float(v) for v in pose.t],
     }
+
+
+def transform_pose(data: Json) -> Pose:
+    """The pose a ``transform_src_to_dst`` holds (what ``transform_data`` writes): its
+    scalar-last quaternion and translation, or the ``matrix4x4`` (row-major) the schema also
+    allows."""
+    if "matrix4x4" in data:
+        return Pose.from_matrix(np.asarray(data["matrix4x4"], dtype=np.float64).reshape(4, 4))
+    return Pose(quat_to_rot(np.asarray(data["quaternion"], dtype=np.float64)),
+                np.asarray(data["translation"], dtype=np.float64))
 
 
 def transform(src: str, dst: str, pose_src_to_dst: Pose) -> Json:
@@ -155,14 +185,14 @@ def frame_intervals(frame_ids: Sequence[int]) -> list[Json]:
 def cuboid_val(center: NDArray[Any], R: NDArray[Any], size: NDArray[Any]) -> list[float]:
     q = rot_to_quat(R)
     return (
-        [_r(v) for v in center]
-        + [_r(v, 8) for v in q]
-        + [_r(max(float(v), 0.0)) for v in size]
+        [round_float(v) for v in center]
+        + [round_float(v, 8) for v in q]
+        + [round_float(max(float(v), 0.0)) for v in size]
     )
 
 
 def num(name: str, val: float) -> Json:
-    return {"name": name, "val": _r(val)}
+    return {"name": name, "val": round_float(val)}
 
 
 def text(name: str, val: str) -> Json:

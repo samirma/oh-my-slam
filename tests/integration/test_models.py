@@ -91,10 +91,14 @@ def test_smoke_segment(client: InferenceClient, sample: Path) -> None:
         assert inst.label in ("chair", "person")
 
 
-def test_multiview(client: InferenceClient, tmp_path: Path) -> None:
-    frames = sorted(Path("/Users/U124317/robot_view/ainex-captures").glob("00[1-4]_*.jpg"))
+@pytest.mark.parametrize("folder,pattern", [
+    (Path("/Users/U124317/robot_view/ainex-captures"), "00[1-4]_*.jpg"),
+    (SAMPLE.parent / "camera", "img_*_p0[89]_*.jpg"),  # full HD: two pan positions, three tilts
+], ids=["ainex", "camera"])
+def test_multiview(client: InferenceClient, folder: Path, pattern: str, tmp_path: Path) -> None:
+    frames = sorted(folder.glob(pattern))
     if len(frames) < 3:
-        pytest.skip("ainex frames missing")
+        pytest.skip(f"{folder.name} frames missing")
     mv = client.multiview(p.MultiviewRequest(image_paths=[str(f) for f in frames],
                                              out_dir=str(tmp_path)))
     assert len(mv.views) == len(frames)

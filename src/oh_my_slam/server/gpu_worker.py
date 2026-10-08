@@ -3,6 +3,9 @@
 PyTorch's MPS backend aborts the process when two threads touch the device (pytorch#197805), so
 every model operation — loading, ``.to()``, forward passes, read-back and cache clearing — runs on
 this one thread. Requests queue up to ``max_queue``; beyond that :class:`QueueFullError` (HTTP 503).
+A job that fails has its traceback's frames (and those of the exceptions chained to it) cleared
+here before its exception leaves the thread, so the device tensors they held are freed on this
+thread, not on the event loop's.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any, TypeVar
@@ -17,6 +21,19 @@ from typing import Any, TypeVar
 T = TypeVar("T")
 
 _STOP = object()
+
+
+def _clear_frames(exc: BaseException) -> None:
+    """Free the locals of every frame of ``exc``'s traceback, and of the exceptions it was raised
+    from or while handling, on the calling thread."""
+    todo: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while todo:
+        e = todo.pop()
+        if e is not None and id(e) not in seen:
+            seen.add(id(e))
+            traceback.clear_frames(e.__traceback__)
+            todo += [e.__cause__, e.__context__]
 
 
 class QueueFullError(RuntimeError):
@@ -54,10 +71,6 @@ class GpuWorker:
             raise QueueFullError(f"queue full ({self.max_queue} jobs)") from exc
         return fut
 
-    def call(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """Submit and wait (for use from non-async code)."""
-        return self.submit(fn, *args, **kwargs).result()
-
     def stop(self, timeout: float = 10.0) -> None:
         self._stopped.set()
         try:
@@ -86,6 +99,7 @@ class GpuWorker:
                     }
                 fut.set_result(result)
             except BaseException as exc:
+                _clear_frames(exc)
                 fut.set_exception(exc)
             finally:
                 self._busy.clear()

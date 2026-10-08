@@ -24,8 +24,9 @@ from oh_my_slam.web.app import Service, create_app
 from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
 from tests.fakes.stub_server import start_stub_server
+from tests.mapsnap import full_tree_hash
 from tests.unit.test_view_cli import sh
-from tests.unit.test_web_api import jpeg
+from tests.unit.test_web_api import _test_client_host, jpeg  # noqa: F401
 from tests.unit.test_web_requests import Call, send, started, until
 
 REPO = Path(__file__).resolve().parents[2]
@@ -46,7 +47,7 @@ def stub_server() -> Iterator[None]:
 def svc(tmp_path: Path) -> Iterator[tuple[Service, TestClient]]:
     ws = Workspace(tmp_path / "data")
     ws.create()
-    service = Service(ws, Runner(ws), url="http://0.0.0.0:0/", extra_hosts={"testserver"})
+    service = Service(ws, Runner(ws), url="http://0.0.0.0:0/")
     with TestClient(create_app(service)) as client:
         yield service, client
     service.runner.shutdown()
@@ -74,11 +75,11 @@ def test_responses_are_byte_identical_to_the_commands(
     image = jpeg(ws.root / "inputs" / "photo.jpg")
     real = str(image.resolve())
 
-    r = client.post("/api/ops/segment-image", json={"image": "inputs/photo.jpg"})
+    r = client.post("/api/ops/segment", json={"image": "inputs/photo.jpg"})
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/json"
     assert r.content == cli("segment.sh", "-i", real).stdout
-    stages(r.headers["server-timing"], "segment.sh -i")
+    stages(r.headers["server-timing"], "segment.sh")
 
     r = client.post("/api/ops/reconstruct", json={"image": "inputs/photo.jpg", "format": "ply",
                                                   "attrs": "normals=on"})
@@ -91,10 +92,10 @@ def test_responses_are_byte_identical_to_the_commands(
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert r.content == cli("reconstruct.sh", "-i", real, "-f", "depth").stdout
     assert "segment" not in stages(r.headers["server-timing"], "reconstruct.sh")
-    r = client.post("/api/ops/segment-image", json={"image": "inputs/photo.jpg", "format": "png"})
+    r = client.post("/api/ops/segment", json={"image": "inputs/photo.jpg", "format": "png"})
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert r.content == cli("segment.sh", "-i", real, "-f", "png").stdout
-    stages(r.headers["server-timing"], "segment.sh -i")
+    stages(r.headers["server-timing"], "segment.sh")
 
     # a map made by the service is a mapper.sh map
     r = client.post("/api/ops/mapper-update", json={"inputs": ["inputs/photo.jpg"], "map": "m"})
@@ -106,6 +107,32 @@ def test_responses_are_byte_identical_to_the_commands(
     assert list(ws.requests.iterdir()) == []  # the service keeps no result
 
 
+def test_the_default_scene_and_the_mapper_bodies_are_the_commands(
+        stub_server: None, svc: tuple[Service, TestClient]) -> None:
+    """Byte for byte what the command writes for the same arguments: reconstruct's scene
+    description (its default JSON), the body of a map update, and that of locating an image in
+    the map. A map's scene names the map's folder, so the command runs on the same folder: the
+    map the service made is moved aside and the command makes it again."""
+    service, client = svc
+    ws = service.workspace
+    real = str(jpeg(ws.root / "inputs" / "photo.jpg").resolve())
+
+    r = client.post("/api/ops/reconstruct", json={"image": "inputs/photo.jpg"})
+    assert r.status_code == 200 and r.headers["content-type"] == "application/json"
+    assert r.content == cli("reconstruct.sh", "-i", real).stdout
+
+    folder = ws.maps / "m"
+    r = client.post("/api/ops/mapper-update", json={"inputs": ["inputs/photo.jpg"], "map": "m"})
+    assert r.status_code == 200 and r.headers["content-type"] == "application/json", r.text
+    folder.rename(ws.root / "made-by-the-service")
+    assert r.content == cli("mapper.sh", "update", "-i", real, "-m", str(folder)).stdout
+
+    r = client.post("/api/ops/mapper-locate", json={"inputs": ["inputs/photo.jpg"], "map": "m"})
+    assert r.status_code == 200 and r.headers["content-type"] == "application/json", r.text
+    assert r.content == cli("mapper.sh", "locate", "-i", real, "-m", str(folder)).stdout
+    assert json.loads(r.content)["openlabel"]["metadata"]["tagged_file"] == str(folder)
+
+
 @needs_colmap
 def test_an_interrupted_map_update_leaves_the_map_unchanged(stub_server: None,
                                                             tmp_path: Path) -> None:
@@ -113,7 +140,7 @@ def test_an_interrupted_map_update_leaves_the_map_unchanged(stub_server: None,
     as Ctrl-C would, and the map is the one before the update."""
     ws = Workspace(tmp_path / "data")
     ws.create()
-    service = Service(ws, Runner(ws), url="http://0.0.0.0:0/", extra_hosts={"testserver"})
+    service = Service(ws, Runner(ws), url="http://0.0.0.0:0/")
     inputs = ws.root / "inputs"
     inputs.mkdir()
     for f in FRAMES[:6]:
@@ -123,7 +150,7 @@ def test_an_interrupted_map_update_leaves_the_map_unchanged(stub_server: None,
         first = await Call(app, "/api/ops/mapper-update",
                            {"inputs": [f"inputs/{FRAMES[0].name}"], "map": "m"})()
         assert first.status == 200, first.body
-        before = store.full_tree_hash(ws.maps / "m")
+        before = full_tree_hash(ws.maps / "m")
         update, task = await send(app, "/api/ops/mapper-update",
                                   {"inputs": [f"inputs/{f.name}" for f in FRAMES[1:6]],
                                    "map": "m"})
@@ -135,7 +162,7 @@ def test_an_interrupted_map_update_leaves_the_map_unchanged(stub_server: None,
         await task
         assert update.status == 499
         assert running.proc is not None and running.proc.returncode == 130
-        assert store.full_tree_hash(ws.maps / "m") == before
+        assert full_tree_hash(ws.maps / "m") == before
         assert json.loads((ws.maps / "m" / "map.json").read_text())["update_count"] == 1
         assert not (ws.maps / "m" / store.STAGING).exists()
 

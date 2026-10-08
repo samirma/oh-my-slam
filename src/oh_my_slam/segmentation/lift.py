@@ -34,7 +34,6 @@ _OFFSETS = np.array(
 class Lifted:
     points: NDArray[np.float64]  # (N, 3) in the parent frame (camera frame if no pose)
     pixels: NDArray[np.int64]  # flat pixel indices on the depth grid
-    mask_pixels: int  # pixels of the (unshrunk) mask
 
 
 def shrink_mask(mask: NDArray[Any], px: int = SHRINK_PX) -> NDArray[np.bool_]:
@@ -110,7 +109,7 @@ def lift_mask(
     rows = np.flatnonzero(mask.any(1))
     cols = np.flatnonzero(mask.any(0))
     if len(rows) == 0:
-        return Lifted(np.zeros((0, 3)), np.zeros(0, np.int64), 0)
+        return Lifted(np.zeros((0, 3)), np.zeros(0, np.int64))
     # work on the mask's bounding box (plus a margin for the erosion)
     r0, r1 = max(0, rows[0] - shrink_px - 1), min(mask.shape[0], rows[-1] + shrink_px + 2)
     c0, c1 = max(0, cols[0] - shrink_px - 1), min(mask.shape[1], cols[-1] + shrink_px + 2)
@@ -127,7 +126,7 @@ def lift_mask(
     u = u + c0
     pix = (v * mask.shape[1] + u).astype(np.int64)
     if len(pix) == 0:
-        return Lifted(np.zeros((0, 3)), pix, int(mask.sum()))
+        return Lifted(np.zeros((0, 3)), pix)
     z = d[v, u].astype(np.float64)
     pts = unproject_pixels(u, v, z, K.K())
     eps = max(MIN_EPS, EPS_FRACTION * float(np.median(z)))
@@ -137,7 +136,7 @@ def lift_mask(
     pts, pix = pts[keep], pix[keep]
     if T_parent_cam is not None:
         pts = T_parent_cam.apply(pts)
-    return Lifted(pts, pix, int(mask.sum()))
+    return Lifted(pts, pix)
 
 
 # Support bleed: a detector's mask of an upright object often runs onto the surface it stands on or

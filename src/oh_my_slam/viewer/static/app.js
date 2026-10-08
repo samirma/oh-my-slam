@@ -1,5 +1,5 @@
 // view.sh's page (spec §2.5): display only. Every point cloud is derived by the server (api/cloud,
-// the shared derivation of segmentation.cloud); objects, OBBs, colours and camera poses come from
+// the shared derivation of reconstruction.cloud); objects, OBBs, colours and camera poses come from
 // the scene JSON and api/meta. Nothing is recomputed here.
 //
 // What the page offers is what §2.5 asks for: independent point-cloud, camera-pose, segmentation,

@@ -354,14 +354,14 @@ def test_an_abandoned_rebuild_extends_the_map_as_an_extension_does(
         assert fa["K"] == fb["K"], fa["name"]
 
 
-def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_along(
+def test_a_rebuild_never_gives_one_object_two_published_ids(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two cabinets the weak first update publishes apart; the next update's rebuild groups the
-    second one's founding detection (its detection in the first keyframe) with the first
-    cabinet, while the rest of the second cabinet's detections stand apart, as an object of
-    their own. The second cabinet's id does not resolve to the first one meanwhile: it goes to
-    the object that stands where it was published (``objects._published_places``). After every
-    update, every id published before resolves to the object nearest its published box."""
+    """Two cabinets the weak first update publishes apart; the next update's rebuild would join
+    the second one's founding detection (its detection in the first keyframe) to the first
+    cabinet's stored detections: the hook makes those their strongest edges. The stored
+    detections carry the ids the map published, so the grouping keeps the two apart (``objects._group``) and no published id
+    resolves to another object meanwhile. After every update, every id published before resolves
+    to the object nearest its published box."""
     from oh_my_slam.mapping import objects as objs
     from tests.synth.scene import Box
 
@@ -372,32 +372,40 @@ def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_a
     room = Room(boxes=[*base.boxes, second])
     first = _add(client, room, _steps(), tmp_path / "a", "a")
     rest = _add(client, room, ring(12, start=0.2), tmp_path / "b", "b")
-    real = objs._group
-    moved: list[int] = []  # the frames of the detections the hook moved
-    placed: list[dict[int, int]] = []  # the ids _published_places gave back (id -> object)
-    real_places = objs._published_places
+    real_group, real_pairs, real_affinity = (objs._group, objs._candidate_pairs,
+                                             objs._pair_affinity)
+    tempted: list[tuple[int, int]] = []
+    apart: list[bool] = []
 
-    def spy(final_of, absorbed, fresh, boxes):  # type: ignore[no-untyped-def]
-        before = dict(absorbed)
-        real_places(final_of, absorbed, fresh, boxes)
-        placed.append({p: final_of_k for p in before if p not in absorbed
-                       for final_of_k in [next(k for k, v in final_of.items() if v == p)]})
-
-    def misgrouped(obs, objects, earlier=None):  # type: ignore[no-untyped-def]
-        groups = real(obs, objects, earlier)
-        frames = {ob.frame for ob in obs}
-        if not (min(frames) == 0 and max(frames) >= len(first)):  # only in a rebuild
-            return groups
+    def grouping(obs, objects, earlier=None, published=None):  # type: ignore[no-untyped-def]
         cab = [i for i, ob in enumerate(obs) if ob.frame == 0 and ob.label == "cabinet"]
-        if len(cab) != 2:
-            return groups
+        if published is None or len(cab) != 2:  # only in a rebuild
+            return real_group(obs, objects, earlier, published)
         a, b = cab  # the first cabinet's and the second one's detection in the first keyframe
-        moved.append(obs[b].frame)
-        out = [(oid, [i for i in m if i != b]) for oid, m in groups]
-        return [(oid, [*m, b] if a in m else m) for oid, m in out if m]
+        assert published[a] and published[b] and published[a] != published[b]
+        first_cabinet = next(m for _, m in real_group(obs, objects, earlier, published) if a in m)
+        bait = {(min(b, i), max(b, i)) for i in first_cabinet
+                if obs[i].frame != obs[b].frame and published[i]}  # its stored detections
+        index = {id(ob): i for i, ob in enumerate(obs)}
 
-    monkeypatch.setattr(objs, "_group", misgrouped)
-    monkeypatch.setattr(objs, "_published_places", spy)
+        def pairs(o, frames=None):  # type: ignore[no-untyped-def]
+            return sorted(set(real_pairs(o, frames)) | bait)
+
+        def affinity(x, y):  # type: ignore[no-untyped-def]
+            pair = tuple(sorted((index[id(x)], index[id(y)])))
+            if pair in bait:
+                tempted.append(pair)  # type: ignore[arg-type]
+                return 1.0
+            return real_affinity(x, y)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(objs, "_candidate_pairs", pairs)
+            mp.setattr(objs, "_pair_affinity", affinity)
+            groups = real_group(obs, objects, earlier, published)
+        apart.append(not any(a in m and b in m for _, m in groups))
+        return groups
+
+    monkeypatch.setattr(objs, "_group", grouping)
     m = tmp_path / "m"
     docs: list[dict] = []  # type: ignore[type-arg]
     for part in (first, rest[:6], rest[6:]):
@@ -405,10 +413,10 @@ def test_a_founding_detection_grouped_with_another_object_does_not_take_the_id_a
         for before in docs:
             _ids_persist(m, before, doc)
         docs.append(doc)
-    cabinets = sorted(int(k) for k, o in docs[0]["openlabel"]["objects"].items()
-                      if o["type"] == "cabinet")
+        assert not json.loads((m / "objects.json").read_text()).get("rebuild_merged")
+    cabinets = [k for k, o in docs[0]["openlabel"]["objects"].items() if o["type"] == "cabinet"]
     assert len(cabinets) == 2
+    assert all(c in d["openlabel"]["objects"] for d in docs for c in cabinets)
     assert "restarted" in json.loads((m / "map.json").read_text())["updates"][1]["notes"]
-    # the hook did move the second cabinet's founding detection, and the rule gave its id back
-    assert moved and moved[0] == 0, moved
-    assert any(cabinets[1] in given for given in placed), placed
+    # the rebuild was tempted, and kept the two cabinets apart
+    assert tempted and apart and all(apart), (len(tempted), apart)

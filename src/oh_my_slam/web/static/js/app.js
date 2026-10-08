@@ -8,6 +8,7 @@ import { el, clear, notice } from './dom.js';
 import { store } from './store.js';
 import { confirmAction } from './dialog.js';
 import { interruptConsequence } from './request.js';
+import { parseRoute } from './url.js';
 import { imagePage } from './pages/image.js';
 import { mapsPage, mapPage } from './pages/maps.js';
 import { mapFlowPage } from './pages/mapflow.js';
@@ -17,17 +18,10 @@ let cleanup = null;
 let current = null;  // the route shown
 let navigated = false;  // the first page of a visit keeps the browser's own focus
 
-function parse(hash) {
-  const raw = hash.replace(/^#\/?/, '');
-  const [path, query = ''] = raw.split('?');
-  const parts = path.split('/').filter(Boolean).map((p) => { try { return decodeURIComponent(p); } catch { return p; } });
-  return { parts, path: parts.join('/'), query: new URLSearchParams(query) };
-}
-
 // `event`: the hashchange that navigated (its timeStamp starts the in-page timing of the route)
 function route(event) {
   const start = event && event.timeStamp ? event.timeStamp : performance.now();
-  const { parts, path, query } = parse(location.hash);
+  const { parts, path, query } = parseRoute(location.hash);
   const [page = 'image', a, b] = parts;
   if (cleanup) { try { cleanup(); } catch (err) { console.error(err); } cleanup = null; }
   clear(main);

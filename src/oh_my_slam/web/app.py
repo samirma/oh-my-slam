@@ -17,19 +17,25 @@ the generic exit status → HTTP status rule.
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
 come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
 type a cross-site page cannot send without a CORS preflight, which this service never grants:
-``application/json``, or for an upload any type but the CORS-safelisted ``text/plain``,
-``application/x-www-form-urlencoded`` and ``multipart/form-data``.
+``application/json``, or for a ``POST`` upload any type but the CORS-safelisted ``text/plain``,
+``application/x-www-form-urlencoded`` and ``multipart/form-data``. A ``PUT`` upload (``curl -T``:
+the raw file, often with no type) always needs a preflight, so it takes any type but a form's.
+
+The service's own refusals — the errors that are no command's — are one table (:func:`refusals`:
+code, HTTP status and when), which the OpenAPI document exports (``x-oms.refusals``) and the agent
+skill states. Every error, an unknown route or method included, has the same JSON shape; anything
+that crashes — a check, a route — is the internal error (exit 1: 500 ``internal``), told as a
+command tells it, and the uploads its request names are consumed all the same.
 """
 
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
 import shutil
 import socket
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -38,11 +44,13 @@ from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from oh_my_slam.commands import spec
+from oh_my_slam.core.constants import START_INFERENCE_SERVER
 from oh_my_slam.core.errors import (
     HTTP_STATUS,
     ExitCode,
@@ -50,13 +58,16 @@ from oh_my_slam.core.errors import (
     ServerUnavailableError,
     error_code,
     http_status,
+    internal_message,
 )
+from oh_my_slam.core.static import find_static
 from oh_my_slam.version import __version__
 from oh_my_slam.web import openapi
 from oh_my_slam.web.operations import (
     Operation,
     Prepared,
     error_body,
+    internal,
     media_of,
     operations,
     prepare,
@@ -65,13 +76,13 @@ from oh_my_slam.web.operations import (
 from oh_my_slam.web.runner import STDOUT, STOPPING, TIMINGS, Outcome, Run, RunError, Runner
 from oh_my_slam.web.workspace import NotFoundError, Workspace
 
-START_COMMAND = "./start_inference_server.sh"
+START_COMMAND = START_INFERENCE_SERVER  # what the health names while the server is not ready
 MAX_UPLOAD_BYTES = 8 << 30  # 8 GiB: room for a long phone video
 MIN_FREE_BYTES = 1 << 30  # an upload never leaves less than this free on the workspace's disk
 UPLOAD_CHECK_BYTES = 64 << 20  # free space is re-checked as an undeclared upload grows
 HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at most this often
-SAFELISTED = frozenset({"", "text/plain", "application/x-www-form-urlencoded",
-                        "multipart/form-data"})  # what a cross-site form sends without a preflight
+FORMS = frozenset({"application/x-www-form-urlencoded", "multipart/form-data"})  # never a raw file
+SAFELISTED = FORMS | {"", "text/plain"}  # what a cross-site form sends without a preflight
 CLIENT_GONE = 499  # what an interrupted request is logged with (nobody reads it)
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
@@ -79,14 +90,50 @@ WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
 # the §2.5 viewer's own rendering); its page (index.html, app.js, style.css) is view.sh's alone
 VIEWER_STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
 VIEWER_PARTS = ("lib", "vendor")
-_STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
-                 ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
-                 ".txt": "text/plain"}
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
+@dataclass(frozen=True)
+class Refusal:
+    """One of the service's own refusals: its code, HTTP status and when it is answered."""
+
+    code: str
+    http_status: int
+    when: str
+
+
+def _gib(n: int) -> str:
+    return f"{n / 2**30:g} GiB"
+
+
+def refusals() -> dict[str, Refusal]:
+    """The service's own refusals, by code (the commands' errors are those of the exit-code
+    table). Read when called, so the texts follow the limits."""
+    return {r.code: r for r in (
+        Refusal("not_found", 404, "no such route, map, upload or operation"),
+        Refusal("method_not_allowed", 405, "a method the route does not take"),
+        Refusal("forbidden", 403, "a `Host` that does not name the service's machine, or a "
+                                  "foreign `Origin`"),
+        Refusal("unsupported_media_type", 415, "a `POST` whose body is not `application/json` "
+                                               "(an operation) or that has no type of its own (an "
+                                               "upload), or an upload sent as a form (`curl -F`)"),
+        Refusal("too_large", 413, f"an upload over {_gib(MAX_UPLOAD_BYTES)}"),
+        Refusal("insufficient_storage", 413, "an upload that would leave less than "
+                                             f"{_gib(MIN_FREE_BYTES)} free on the workspace's "
+                                             "disk"),
+        Refusal("upload_in_use", 409, "an upload that another request in progress was given"),
+        Refusal(STOPPING, 503, "a request that arrives while the service stops"),
+    )}
+
+
+def _error(status: int, code: str, message: str,
+           headers: Mapping[str, str] | None = None) -> JSONResponse:
     return JSONResponse({"error": {"code": code, "message": message, "http_status": status}},
-                        status)
+                        status, headers)
+
+
+def refuse(code: str, message: str, headers: Mapping[str, str] | None = None) -> JSONResponse:
+    """The answer of one of the service's own refusals (:func:`refusals`)."""
+    return _error(refusals()[code].http_status, code, message, headers)
 
 
 def inference_health() -> Json:
@@ -117,8 +164,9 @@ def inference_problem() -> spec.Problem | None:
 
 
 def machine_hosts() -> set[str]:
-    """The names and addresses this machine answers to (``Host`` / ``Origin`` check)."""
-    names = {"localhost", "127.0.0.1", "::1"}
+    """The names and addresses this machine answers to (``Host`` / ``Origin`` check), with
+    ``0.0.0.0``, the address the service binds, which its listening line prints."""
+    names = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
     host = socket.gethostname().lower()
     names |= {host, host.split(".")[0], f"{host.split('.')[0]}.local"}
     try:
@@ -161,12 +209,8 @@ def server_timing(folder: Path) -> str | None:
 
 def failure(outcome: Outcome) -> tuple[int, Json]:
     """HTTP status and body of a request whose command did not succeed: its message and the code
-    of its exit status, by the generic rule; a service that stopped under it says so."""
-    if outcome.interrupted == STOPPING:
-        return 503, {"error": {"code": STOPPING, "message": "the service stopped: the command was "
-                               "interrupted, as Ctrl-C would (a map update leaves the map as it "
-                               "was); send the request again once the service runs",
-                               "http_status": 503}}
+    of its exit status, by the generic rule — also when the service's stop interrupted it (exit
+    130: 499 ``interrupted``, as for a client that left)."""
     status = http_status(outcome.code)
     return status, {"error": {"code": error_code(outcome.code), "exit_code": outcome.code,
                               "message": outcome.message or "", "http_status": status}}
@@ -198,7 +242,6 @@ class Service:
     inference_check: Callable[[], spec.Problem | None] = inference_problem
     inference_health: Callable[[], Json] = inference_health
     ops: dict[str, Operation] = field(default_factory=operations)
-    extra_hosts: set[str] = field(default_factory=set)  # e.g. the test client's
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     min_free_bytes: int = MIN_FREE_BYTES
     _hosts: set[str] | None = None
@@ -214,7 +257,7 @@ class Service:
         now = time.monotonic()
         if self._hosts is None or (host not in self._hosts
                                    and now - self._hosts_at > HOSTS_REFRESH_S):
-            self._hosts = machine_hosts() | {h.lower() for h in self.extra_hosts}
+            self._hosts = machine_hosts()
             self._hosts_at = now
         return host in self._hosts
 
@@ -240,12 +283,17 @@ class Service:
 
     def prepare(self, op: Operation, params: Any) -> Prepared:
         """The request checked as the command checks it, then — when it will use the inference
-        server — the commands' own check of that server."""
-        prep = prepare(op, params, self.workspace)
-        if not prep.problems and prep.inference:
-            p = self.inference_check()
-            if p is not None:
-                prep.problems.append(p)
+        server — the commands' own check of that server. A check that crashes refuses it with
+        the command's internal error (exit 1); the uploads it names are known all the same."""
+        prep = Prepared()
+        try:
+            prepare(op, params, self.workspace, prep)
+            if not prep.problems and prep.inference:
+                p = self.inference_check()
+                if p is not None:
+                    prep.problems.append(p)
+        except Exception as exc:
+            prep.problems.append(internal(exc))
         return prep
 
     def validate(self, op: Operation, params: Any) -> Json:
@@ -275,6 +323,7 @@ def answer(outcome: Outcome, prep: Prepared, folder: Path) -> Response:
 
 
 _STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+UPLOADS = "/api/uploads"  # POST (the web application) or PUT (curl -T) the raw file
 
 
 def guard(app: Any, service: Service) -> Callable[..., Awaitable[None]]:
@@ -285,28 +334,31 @@ def guard(app: Any, service: Service) -> Callable[..., Awaitable[None]]:
             await app(scope, receive, send)
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        reason, status = None, 403
+        reason, code = None, "forbidden"
         host = headers.get("host", "")
+        method = scope["method"]
         if not service.knows_host(_hostname(host)):
             reason = "the Host header does not name this machine"
-        elif scope["method"] in _STATE_CHANGING:
+        elif method in _STATE_CHANGING:
             origin = headers.get("origin")
             ctype = headers.get("content-type", "").split(";")[0].strip().lower()
             if origin is not None and not service.same_origin(origin, host):
                 reason = f"requests from {origin} are not accepted"
-            elif scope["method"] == "DELETE":
+            elif method == "DELETE":
                 pass
-            elif scope["path"] == "/api/uploads":
-                if ctype in SAFELISTED:
-                    reason, status = "send the file with its own media type (e.g. image/jpeg " \
-                        "or application/octet-stream)", 415
+            elif scope["path"] == UPLOADS:
+                if ctype in (SAFELISTED if method == "POST" else FORMS):
+                    reason, code = "send the raw file as the body (curl -T <file>), not a " \
+                        "form; a POST needs the file's own media type (e.g. image/jpeg or " \
+                        "application/octet-stream)", "unsupported_media_type"
             elif ctype != "application/json":
-                reason, status = "send the request body as application/json", 415
+                reason, code = "send the request body as application/json (curl -H " \
+                    "'Content-Type: application/json' -d …, or curl --json …)", \
+                    "unsupported_media_type"
         if reason is None:
             await app(scope, receive, send)
             return
-        await _error(status, "forbidden" if status == 403 else "unsupported_media_type",
-                     reason)(scope, receive, send)
+        await refuse(code, reason)(scope, receive, send)
 
     return asgi
 
@@ -342,13 +394,10 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
             if part not in VIEWER_PARTS:
                 raise NotFoundError(f"no file {request.path_params['path']}")
             root = VIEWER_STATIC / part
-        try:
-            target = (root / rel).resolve()
-        except (ValueError, OSError):  # e.g. an embedded NUL byte
-            target = root
-        if root.resolve() not in target.parents or not target.is_file():
+        found = find_static(root, rel)
+        if found is None:
             raise NotFoundError(f"no file {request.path_params['path']}")
-        media = _STATIC_TYPES.get(target.suffix) or mimetypes.guess_type(target.name)[0]
+        target, media = found
         return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     async def health(request: Request) -> Response:
@@ -365,8 +414,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         ticket, arrived = runner.ticket(), time.time()  # its place in the arrival order
         try:
             if runner.stopping:
-                return _error(503, STOPPING, "the service is stopping; send the request again "
-                              "once it runs")
+                return refuse(STOPPING, "the service is stopping; send the request again once it "
+                              "runs")
             prep = await run_in_threadpool(service.prepare, op, params)
             if prep.problems:  # refused: the uploads it was given are consumed all the same
                 runner.discard(prep.uploads)
@@ -376,10 +425,9 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
                       prep.uploads, op.id, prep.command, arrived)
             try:
                 runner.admit(run)
-            except RunError as exc:
-                if exc.code != "upload_in_use":
-                    runner.discard(prep.uploads)
-                return _error(exc.status, exc.code, str(exc))
+            except RunError as exc:  # its uploads are consumed, but those another request uses
+                runner.discard(prep.uploads)
+                return refuse(exc.code, str(exc))
         finally:
             runner.arrived(ticket)  # validated: the requests after it no longer wait for it
         outcome = await runner.wait(run, disconnected(request))
@@ -398,11 +446,11 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
 
     def too_large(size: int) -> Response | None:
         if size > service.max_upload_bytes:
-            return _error(413, "too_large", f"an upload may hold at most "
-                          f"{service.max_upload_bytes / 2**30:g} GiB")
+            return refuse("too_large", f"an upload may hold at most "
+                          f"{_gib(service.max_upload_bytes)}")
         if shutil.disk_usage(ws.uploads).free - size < service.min_free_bytes:
-            return _error(413, "insufficient_storage", f"not enough free space in {ws.root} for "
-                          "this upload; free some space or use a path inside the workspace")
+            return refuse("insufficient_storage", f"not enough free space in {ws.root} for this "
+                          "upload; free some space or use a path inside the workspace")
         return None
 
     async def upload(request: Request) -> Response:
@@ -438,8 +486,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         uid = request.path_params["id"]
         ws.upload(uid)
         if runner.in_use(uid):
-            return _error(409, "upload_in_use", f"upload {uid} is the input of a request in "
-                          "progress; it is deleted when that request ends")
+            return refuse("upload_in_use", f"upload {uid} is the input of a request in progress; "
+                          "it is deleted when that request ends")
         ws.delete_upload(uid)
         return Response(status_code=204)
 
@@ -459,23 +507,40 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         Route("/api/openapi.json", openapi_doc),
         Route("/api/ops/{op}", run_op, methods=["POST"]),
         Route("/api/ops/{op}/validate", validate, methods=["POST"]),
-        Route("/api/uploads", upload, methods=["POST"]),
+        Route(UPLOADS, upload, methods=["POST", "PUT"]),
         Route("/api/uploads/{id}", delete_upload, methods=["DELETE"]),
         Route("/api/maps", maps),
         Route("/api/maps/{name}", map_detail),
     ]
 
     async def not_found(request: Request, exc: Exception) -> Response:
-        return _error(404, "not_found", str(exc))
+        return refuse("not_found", str(exc))
+
+    async def no_route(request: Request, exc: Exception) -> Response:
+        """No route has this path (404), or it does not take this method (405, with ``Allow``):
+        the error shape of every other answer."""
+        assert isinstance(exc, HTTPException)
+        what = f"{request.method} {request.url.path}"
+        if exc.status_code == 405:
+            return refuse("method_not_allowed", f"{what}: the route takes "
+                          f"{(exc.headers or {}).get('Allow', '')}; see /api/openapi.json",
+                          exc.headers)
+        return refuse("not_found", f"no route {what}; see /api/openapi.json")
 
     async def command_error(request: Request, exc: Exception) -> Response:
-        assert isinstance(exc, OhMySlamError)
-        code = ExitCode(exc.exit_code)
-        return _error(HTTP_STATUS[code], code.name.lower(), str(exc))
+        """A command's error, by the generic exit status → HTTP status rule; anything else that
+        fails (a corrupt ``map.json`` a map's route reads) is the internal error, told as a
+        command tells it."""
+        if isinstance(exc, OhMySlamError):
+            code, message = ExitCode(exc.exit_code), str(exc)
+        else:
+            code, message = ExitCode.INTERNAL, internal_message(exc)
+        return _error(HTTP_STATUS[code], error_code(code), message)
 
     async def disconnect(request: Request, exc: Exception) -> Response:
         return Response(status_code=CLIENT_GONE)
 
     app = Starlette(routes=routes, exception_handlers={
-        NotFoundError: not_found, OhMySlamError: command_error, ClientDisconnect: disconnect})
+        NotFoundError: not_found, OhMySlamError: command_error, ClientDisconnect: disconnect,
+        HTTPException: no_route, Exception: command_error})
     return guard(app, service)

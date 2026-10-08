@@ -16,6 +16,8 @@ from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import locate as lmod
 from oh_my_slam.mapping import store
+from oh_my_slam.mapping.sfm import shared_camera
+from oh_my_slam.schema import openlabel as ol
 from tests.synth.scene import look_at
 
 K = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap")
@@ -28,13 +30,20 @@ def frame(i: int, size: tuple[int, int] = (640, 480), source: str = "sfm-global"
 
 
 def test_a_query_with_exif_takes_a_map_camera_of_its_focal_prior() -> None:
-    reader = SimpleNamespace(frames=[frame(0), frame(1), frame(2, (800, 600))])
-    known = {"f000000.jpg": lmod._DbImage(1, 3), "f000001.jpg": lmod._DbImage(2, 5),
-             "f000002.jpg": lmod._DbImage(3, 9)}
-    prior = lmod._camera_prior(reader, known, 640, 480, 510.0)  # type: ignore[arg-type]
+    frames = [frame(0), frame(1), frame(2, (800, 600))]
+    db = {0: 3, 1: 5, 2: 9}  # keyframe -> its camera in the scratch database
+
+    def camera(fr: store.FrameRecord) -> int:
+        return db[fr.index]
+
+    prior, _ = shared_camera(frames, (640, 480), True, 510.0, camera)
     assert (prior.focal, prior.existing_id, prior.same_focal_ids) == (510.0, None, (5, 3))
-    plain = lmod._camera_prior(reader, known, 640, 480, None)  # type: ignore[arg-type]
-    assert (plain.focal, plain.existing_id) == (None, 5)  # the latest keyframe's camera
+    plain, latest = shared_camera(frames, (640, 480), False, None, camera)
+    assert (plain.focal, plain.existing_id, latest) == (None, 5, frames[1])  # the latest one's
+    mixed, _ = shared_camera(frames, (640, 480), None, 500.0, camera)
+    assert (mixed.existing_id, mixed.same_focal_ids) == (None, ())  # with and without EXIF
+    alone, none = shared_camera(frames, (320, 240), False)
+    assert (alone.existing_id, none) == (None, None)  # no keyframe of that size
 
 
 def test_retrieval_pairs_only_keyframes_with_a_descriptor(monkeypatch: pytest.MonkeyPatch
@@ -104,6 +113,51 @@ def test_query_matches_keep_verified_pairs_with_keyframes_whichever_id_is_first(
     np.testing.assert_array_equal(m0.uv_q[0], [1000 + 38.0, 1000 + 39.0])
     assert m1.idx_q[0] == 0 and m1.idx_k[0] == 24
     np.testing.assert_array_equal(m1.uv_k[0], [2000 + 48.0, 2000 + 49.0])
+
+
+def test_query_matches_of_a_lens_are_where_its_pinhole_sees_them(tmp_path: Path) -> None:
+    """A map camera with distortion (``panorama.PairMatches``): the matches where its pinhole
+    sees the keypoints, where the keyframe's depth (on the pinhole's grid) is read and unprojected
+    along the pinhole's rays."""
+    import pycolmap
+
+    from oh_my_slam.mapping.panorama import pinhole_pixels
+
+    path = tmp_path / "db.db"
+    d = pycolmap.Database.open(str(path))
+    try:
+        lens = pycolmap.Camera.create_from_model_id(
+            0, pycolmap.CameraModelId.SIMPLE_DIVISION, 500.0, 640, 480)
+        lens.params = [500.0, 320.0, 240.0, -0.3]
+        cam = d.write_camera(lens)
+        ids = {n: d.write_image(pycolmap.Image(name=n, camera_id=cam))
+               for n in ("f000000.jpg", "locate_000000.jpg")}
+        kp = np.stack([np.linspace(10, 630, 30), np.linspace(10, 470, 30)], 1)
+        for i in ids.values():
+            d.write_keypoints(i, kp.astype(np.float32))
+        g = pycolmap.TwoViewGeometry()
+        g.config = 2
+        g.inlier_matches = np.stack([np.arange(30)] * 2, 1).astype(np.uint32)
+        d.write_two_view_geometry(ids["f000000.jpg"], ids["locate_000000.jpg"], g)
+        (lens,) = d.read_all_cameras()
+    finally:
+        d.close()
+    q = lmod._Query(Path("q.jpg"), 0, "locate_000000.jpg", (640, 480), None)
+    db = {n: lmod._DbImage(i, cam) for n, i in ids.items()}
+    (m,) = lmod._query_matches(path, [q], db)[q.name]
+    pin = pinhole_pixels(lens, kp)
+    np.testing.assert_allclose(m.uv_q, pin, rtol=1e-6)
+    np.testing.assert_allclose(m.uv_k, pin, rtol=1e-6)
+    K = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap", -0.3)
+    fr = store.FrameRecord(0, "f000000", "frames/f000000.jpg", "", cam, 640, 480, K,
+                           Pose.identity(), 64, 48)
+    depth = np.full((48, 64), 2.0, np.float32)
+    xyz, ok = lmod.depth_points(depth, np.ones((48, 64), bool), fr, m.uv_k)
+    # the grid is the undistorted image's, which holds the whole lens: every keypoint is on it
+    at = K.pinhole_pixels(kp)
+    inside = (at >= 0).all(axis=1) & (at < [640, 480]).all(axis=1)
+    assert inside.all() and np.array_equal(ok, inside)
+    np.testing.assert_allclose(xyz[ok, :2], (pin[ok] - [320.0, 240.0]) / 500.0 * 2.0, atol=1e-6)
 
 
 # --- 2D-3D correspondences ----------------------------------------------------------------------
@@ -247,8 +301,8 @@ def test_the_viewpoint_of_matches_without_usable_keyframe_depth_is_unknown() -> 
     m_blind = lmod._Match("f000000.jpg", np.arange(2), np.arange(2), np.zeros((2, 2)),
                           np.full((2, 2), 100.0))
     points = SimpleNamespace(frames={"f000000.jpg": fr},
-                             _depth_points=lambda f, uv: (np.zeros((len(uv), 3)),
-                                                          np.zeros(len(uv), bool)))
+                             _depth_points=lambda f, uv: (
+                                 np.zeros((len(uv), 3)), np.zeros(len(uv), bool)))
     assert lmod._viewpoint(Pose.identity(), [m_unknown, m_blind], points) == (False, np.inf)  # type: ignore[arg-type]
 
 
@@ -260,3 +314,22 @@ def test_a_reader_whose_map_json_vanished_is_stale(tmp_path: Path) -> None:
     assert not lmod._stale(reader)
     (root / store.MAP_JSON).unlink()
     assert lmod._stale(reader)
+
+
+def test_a_camera_located_with_the_map_s_lens_keeps_its_distortion() -> None:
+    """``solve_pose``: the matches are where the lens's pinhole sees them, so a camera that
+    shares the map's (held) intrinsics is that lens; one whose focal length is estimated is a
+    pinhole."""
+    from oh_my_slam.core.geometry import project
+
+    lens = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap", -0.3)
+    rng = np.random.default_rng(1)
+    xyz = np.column_stack([rng.uniform(-2, 2, 60), rng.uniform(-1.5, 1.5, 60),
+                           rng.uniform(3, 6, 60)])
+    uv, _ = project(xyz, lens.K())
+    held = lmod.solve_pose(uv, xyz, lens, False)
+    assert held is not None and held[1].k == lens.k and held[1].fx == lens.fx
+    free = lmod.solve_pose(uv, xyz, lens, True)
+    assert free is not None and free[1].k == 0.0
+    stream = ol.camera_stream(held[1])["stream_properties"]
+    assert stream["intrinsics_custom"]["k"] == lens.k

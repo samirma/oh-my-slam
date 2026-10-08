@@ -117,6 +117,26 @@ def test_pass_fail_and_missing_values(tmp_path: Path) -> None:
     assert "exit 3" in (m.items["contract.c.x"].error or "")
 
 
+def test_a_metric_has_one_result_and_a_failing_block_fails_what_it_left(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """Spec §5: each metric has one pass/fail result. A second recording is an evaluator bug; a
+    block that raises fails, with its exception, the metrics it had not recorded yet."""
+    m = Metrics()
+    m.add("a.x", 1.0)
+    with pytest.raises(ValueError, match=r"metric a\.x recorded twice"):
+        m.add("a.x", 2.0)
+    assert m.items["a.x"].value == 1.0
+    with m.expect("b.y", "b.z"):
+        m.add("b.y", 3.0)
+        raise RuntimeError("no b.z")
+    assert m.items["b.y"].value == 3.0 and m.items["b.z"].error == "RuntimeError: no b.z"
+    err = capsys.readouterr().err
+    assert "error while computing b.y, b.z: RuntimeError: no b.z" in err and "Traceback" in err
+    with m.expect("c.w"):
+        pass
+    assert m.items["c.w"].error == "not computed"
+
+
 def test_regressions_against_a_stored_baseline(tmp_path: Path) -> None:
     base_result = {"metrics": [{"id": "perf.a.wall_s", "value": 2.0},
                                {"id": "pose.b.fraction", "value": 1.0},
@@ -136,13 +156,6 @@ def test_regressions_against_a_stored_baseline(tmp_path: Path) -> None:
     assert m.items["perf.a.wall_s"].passed  # a regression still within target passes
     m = judged(tmp_path, {"perf.a.wall_s": 1.0, "pose.b.fraction": 1.0}, base)  # improvements
     assert not any(x.regression for x in m.items.values())
-
-
-def test_renamed_metrics_of_stored_runs_keep_their_history() -> None:
-    old = {"metrics": [{"id": "server_sh.job_overhead_median_s", "value": 0.4, "detail": None,
-                        "error": None}, {"id": "seg.restaurant.objects", "value": 115}]}
-    assert baseline_values(old) == {"server_sh.request_overhead_median_s": 0.4,
-                                    "seg.restaurant.objects": 115}
 
 
 def test_missing_or_broken_baseline_is_reported(tmp_path: Path) -> None:
@@ -212,7 +225,7 @@ def test_ground_truth_metrics(tmp_path: Path) -> None:
     poses = {"001_bootstrap_level.jpg": cam(-20.0, 0.0),
              "004_bootstrap_left015_level.jpg": cam(-4.0, 0.0),
              "005_bootstrap_left015_up.jpg": cam(-5.0, 10.0)}
-    gt.pose_metrics(m, [f for f in files if f.kind == "poses"], poses)
+    gt.pose_metrics(m, [f for f in files if f.kind == "poses"], {"ainex-captures": poses})
     assert m.items["gt.poses.yaw_err_median_deg"].value == pytest.approx(0.5, abs=1e-6)
     assert m.items["gt.poses.yaw_err_max_deg"].value == pytest.approx(0.5, abs=1e-6)
     assert m.items["gt.poses.pitch_err_median_deg"].value == pytest.approx(1.0, abs=1e-6)
@@ -221,7 +234,7 @@ def test_ground_truth_metrics(tmp_path: Path) -> None:
 def test_no_ground_truth_adds_no_metrics() -> None:
     m = Metrics()
     gt.object_metrics(m, [], {}, [])
-    gt.pose_metrics(m, [], None)
+    gt.pose_metrics(m, [], {})
     assert m.items == {}
 
 
@@ -257,14 +270,19 @@ def test_result_and_summary_are_written(tmp_path: Path) -> None:
     res, md = write_report(tmp_path / "out", result)
     doc = json.loads(res.read_text())
     assert doc["summary"] == {"metrics": 3, "passed": 2, "failed": 1, "untargeted": 0,
-                              "baseline": "compared", "regressions": 1}
+                              "baseline": "compared", "regressions": 1, "without_baseline": 2}
+    # the baseline has no value for two of them: listed, not implied to have been compared
+    assert doc["baseline"]["not_compared"] == ["pose.b.fraction", "contract.c.x"]
     by_id = {x["id"]: x for x in doc["metrics"]}
     assert by_id["perf.a.wall_s"]["baseline"] == 2.0 and by_id["perf.a.wall_s"]["regression"]
     assert by_id["perf.a.wall_s"]["target"]["tolerance_rel"] == 0.1
     assert [r["ok"] for r in doc["runs"]] == [True, False]
     assert doc["runs"][1]["stderr_tail"].endswith("hint: start it")
     text = md.read_text()
-    assert "**Result: FAIL**" in text and "1 regressions against the baseline" in text
+    assert "**Result: FAIL**" in text and "1 regressions against the baseline; 2 metrics not " \
+        "compared: the baseline has no value for them" in text
+    assert "## Not compared with the baseline" in text
+    assert "| contract.c.x | 0 |" in text
     # the why column: the error of a metric without a value, the baseline delta of a regression
     assert "| pose.b.fraction | — | >= 0.9 | reconstruct_json failed (exit 3): down |" in text
     assert ("| perf.a.wall_s | 2.4 | 2 | <= 3 s | worse than the baseline 2 s by 0.4 "
@@ -289,9 +307,12 @@ def test_without_a_baseline_nothing_is_compared(tmp_path: Path, status: str) -> 
     result = result_of(m, [], {"path": "b.json", "status": status})
     word = status.split(":")[0]
     assert result["summary"]["regressions"] is None and result["summary"]["baseline"] == word
+    assert result["summary"]["without_baseline"] is None
+    assert "not_compared" not in result["baseline"]
     text = summary_md(result)
     assert f"baseline {word} — not compared" in text
     assert "regressions against the baseline" not in text
+    assert "## Not compared with the baseline" not in text
     assert "**Result: PASS**" in text
 
 
@@ -332,35 +353,3 @@ def test_cli_usage_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert not (tmp_path / "o").exists()
     err = capsys.readouterr().err
     assert "outside the repository" in err
-
-
-def test_a_stored_run_is_judged_again_with_new_targets(
-        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Targets are data: ``--rejudge`` judges a stored run again without running anything."""
-    m = judged(tmp_path, {"perf.a.wall_s": 2.4, "pose.b.fraction": 0.95, "contract.c.x": 0})
-    run = tmp_path / "run"
-    write_report(run, result_of(m, [], {"status": "missing"}))
-    strict = targets_file(tmp_path, {"metrics": {"perf.a.wall_s": {"op": "<=", "value": 2.0},
-                                                 "pose.b.fraction": {"op": ">=", "value": 0.9}}})
-    assert main(["--rejudge", str(run), "--targets", str(strict),
-                 "--baseline", str(tmp_path / "none.json")]) == 1
-    result = json.loads((run / "result.json").read_text())
-    by_id = {x["id"]: x for x in result["metrics"]}
-    assert by_id["perf.a.wall_s"]["passed"] is False and by_id["pose.b.fraction"]["passed"]
-    assert by_id["contract.c.x"]["passed"] is None  # no target any more
-    assert result["judged"] and result["summary"]["failed"] == 1
-    assert "judged again" in (run / "summary.md").read_text()
-    assert main(["--rejudge", str(tmp_path / "nothing")]) == 2
-    capsys.readouterr()
-
-
-def test_a_stored_run_judged_again_can_become_the_baseline(
-        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """``--rejudge --set-baseline`` stores the judged run, so no second full run is needed."""
-    m = judged(tmp_path, {"perf.a.wall_s": 1.0})
-    run = tmp_path / "run"
-    write_report(run, result_of(m, [], {"status": "missing"}))
-    baseline = tmp_path / "baseline.json"
-    assert main(["--rejudge", str(run), "--baseline", str(baseline), "--set-baseline"]) == 0
-    assert baseline.read_bytes() == (run / "result.json").read_bytes()
-    capsys.readouterr()

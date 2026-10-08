@@ -140,8 +140,8 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     pg.select_option(".field[data-param=format] select", "depth")
     attrs.wait_for(state="hidden")
     # segment.sh -i, the image kept
-    pg.check("#op-segment-image")
-    assert "op=segment-image" in pg.url
+    pg.check("#op-segment")
+    assert "op=segment" in pg.url
     pg.wait_for_selector(".field[data-param=image] li.ready")
     assert pg.locator(".field[data-param=attrs]").count() == 0  # segment.sh has no -p
     assert pg.locator(".field[data-param=format] select option").all_inner_texts() == [
@@ -157,7 +157,7 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     score.fill("")
     pg.wait_for_function("() => !document.querySelector('.field[data-param=min_score] .field-error').textContent")
     pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.startsWith('segment.sh -i=uploads/')")
-    with operation_response(pg, "segment-image") as answer:
+    with operation_response(pg, "segment") as answer:
         pg.click("button[data-action=run]")
         pg.wait_for_selector("[data-testid=request]", timeout=5000)
         assert pg.get_attribute("[data-testid=request]", "data-state") in ("sending", "waiting", "running", "done")
@@ -176,7 +176,7 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     pg.click("[data-testid=result] .stages-box summary")
     shown_stages = pg.locator("[data-testid=stages] tbody th code").all_inner_texts()
     assert shown_stages == [s for s in stages if s != "total"]
-    assert check_download(pg, body) == "segment-image-photo.json"
+    assert check_download(pg, body) == "segment-photo.json"
     # the upload was consumed; the page has uploaded the image again for the next run
     pg.wait_for_selector(".field[data-param=image] li.ready")
     assert uploads(service) == ["photo.jpg"]
@@ -440,11 +440,12 @@ def test_a_point_cloud_result_in_both_themes_down_to_tablet_width(browser: Any, 
 
 def test_an_image_result_is_offered_byte_for_byte(tab: Tab, image: Path) -> None:
     """A PNG result — the segmented image of segment.sh -f png, the depth image of reconstruct.sh
-    -f depth — is the response body, in its media type, offered as a download byte for byte."""
-    pg = tab.go("#/image?op=segment-image")
+    -f depth — is the response body, in its media type, shown in the page as received and offered
+    as a download byte for byte."""
+    pg = tab.go("#/image?op=segment")
     pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
     pg.wait_for_selector(".field[data-param=image] li.ready")
-    for op, fmt, name in (("segment-image", "png", "segment-image-photo.png"),
+    for op, fmt, name in (("segment", "png", "segment-photo.png"),
                           ("reconstruct", "depth", "reconstruct-photo.png")):
         pg.check(f"#op-{op}")
         pg.wait_for_selector(".field[data-param=image] li.ready")
@@ -457,6 +458,9 @@ def test_an_image_result_is_offered_byte_for_byte(tab: Tab, image: Path) -> None
         assert answer.body.startswith(b"\x89PNG\r\n\x1a\n")
         assert pg.get_attribute("[data-testid=result]", "data-format") == "png"
         assert "image/png" in pg.inner_text("[data-testid=result] .result-head")
+        pg.wait_for_function("() => { const i = document.querySelector("
+                             "'[data-testid=result-image] img'); return i && i.complete "
+                             "&& i.naturalWidth > 0; }")
         assert check_download(pg, answer.body) == name
         tab.a11y()
     assert tab.errors == []
@@ -793,7 +797,7 @@ def test_every_page_is_accessible_and_fits_a_tablet(browser: Any, app: tuple[Any
                 over = t.js("() => document.documentElement.scrollWidth - window.innerWidth")
                 assert over <= 0, f"{r} scrolls sideways by {over}px at {width}px"
             # a page with a result and a flagged field
-            pg = t.go("#/image?op=segment-image")
+            pg = t.go("#/image?op=segment")
             pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
             pg.wait_for_selector(".field[data-param=image] li.ready")
             pg.click("button[data-action=run]")

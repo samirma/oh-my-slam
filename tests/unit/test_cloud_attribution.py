@@ -25,6 +25,11 @@ from oh_my_slam.mapping.objects import MapObject, ObjectState
 from oh_my_slam.mapping.store import FrameRecord
 from oh_my_slam.segmentation.obb import OBB
 
+
+def canonical(points: np.ndarray) -> np.ndarray:
+    """An object's canonical points (``canonical_sources``) when one kind of detection gave them."""
+    return mo.canonical_sources(points, np.zeros(len(points), np.uint8))[0]
+
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
 SHAPE = (240, 320)
 WALL = 2.0
@@ -81,7 +86,7 @@ def switch(confirmed: bool = True, offset: float = 0.04) -> MapObject:
     rng = np.random.default_rng(0)
     pts = rng.uniform(-0.5, 0.5, (300, 3)) * (0.005, 0.06, 0.1) + (WALL - offset, -0.3, 0.1)
     o = MapObject(106, "power outlet", {"power outlet": 1.6}, [0.6] * 4,
-                  mo.canonical_points(pts), frames=[35, 37, 40, 44], confirmed=confirmed,
+                  canonical(pts), frames=[35, 37, 40, 44], confirmed=confirmed,
                   obs_depth=WALL)
     mo.refit(o, None)
     return o
@@ -152,7 +157,7 @@ def dishwasher(seen_from: float = 3.0) -> MapObject:
     in front of the fused wall, seen from ``seen_from`` metres."""
     rng = np.random.default_rng(1)
     pts = rng.uniform(-0.5, 0.5, (6000, 3)) * (0.06, 0.54, 0.4) + (WALL - 0.03, 0.0, 0.0)
-    o = MapObject(74, "dishwasher", {"dishwasher": 1.2}, [0.7, 0.6], mo.canonical_points(pts),
+    o = MapObject(74, "dishwasher", {"dishwasher": 1.2}, [0.7, 0.6], canonical(pts),
                   frames=[40, 44], confirmed=True, obs_depth=seen_from)
     mo.refit(o, None)
     return o
@@ -220,7 +225,7 @@ def parked_car(distance: float, oid: int = 58) -> MapObject:
     """A parked car's side (4 m long, 1.4 m high, its box 1.5 m deep) seen from ``distance``."""
     rng = np.random.default_rng(2)
     pts = rng.uniform(-0.5, 0.5, (4000, 3)) * (1.5, 4.0, 1.4) + (distance, 0.0, 0.0)
-    o = MapObject(oid, "car", {"car": 1.6}, [0.7, 0.7], mo.canonical_points(pts),
+    o = MapObject(oid, "car", {"car": 1.6}, [0.7, 0.7], canonical(pts),
                   frames=[3, 9], confirmed=True, obs_depth=distance)
     mo.refit(o, None)
     return o
@@ -269,7 +274,7 @@ def test_a_tiny_or_unsupported_object_is_not_exported() -> None:
     rng = np.random.default_rng(3)
     pts = rng.uniform(-0.5, 0.5, (500, 3)) * (0.05, 0.6, 0.6) + (40.0, 3.0, 2.0)
     sign = MapObject(61, "traffic sign", {"traffic sign": 1.6}, [0.7, 0.7],
-                     mo.canonical_points(pts), frames=[3, 9], confirmed=True, obs_depth=40.0)
+                     canonical(pts), frames=[3, 9], confirmed=True, obs_depth=40.0)
     mo.refit(sign, None)
     assert sign.obb is not None
     assert mo.min_cloud_points(sign.obb, STREET_VOXEL, 40.0, STREET_FOCAL) == \

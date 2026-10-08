@@ -16,6 +16,7 @@ from oh_my_slam.commands import spec
 from oh_my_slam.web.app import VIEWER_STATIC, WEB_STATIC, Service, create_app
 from oh_my_slam.web.runner import Runner
 from oh_my_slam.web.workspace import Workspace
+from tests.unit.test_web_api import _test_client_host  # noqa: F401
 
 JS = sorted(WEB_STATIC.rglob("*.js"))
 
@@ -24,8 +25,7 @@ JS = sorted(WEB_STATIC.rglob("*.js"))
 def client(tmp_path: Path) -> TestClient:
     ws = Workspace(tmp_path / "data")
     ws.create()
-    return TestClient(create_app(Service(ws, Runner(ws), url="http://0.0.0.0:0/",
-                                         extra_hosts={"testserver"})))
+    return TestClient(create_app(Service(ws, Runner(ws), url="http://0.0.0.0:0/")))
 
 
 def test_the_app_and_its_files_are_served(client: TestClient) -> None:

@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.geometry import quat_to_rot
 from oh_my_slam.core.types import Pose
+from oh_my_slam.schema.openlabel import transform_pose
 from oh_my_slam.segmentation.obb import OBB
 
 Json = dict[str, Any]
@@ -64,20 +65,13 @@ def doc_objects(doc: Json) -> list[DocObject]:
     return sorted(out, key=lambda o: o.id)
 
 
-def _pose(data: Json) -> Pose:
-    if "matrix4x4" in data:
-        return Pose.from_matrix(np.asarray(data["matrix4x4"], dtype=np.float64).reshape(4, 4))
-    return Pose(quat_to_rot(np.asarray(data["quaternion"], dtype=np.float64)),
-                np.asarray(data["translation"], dtype=np.float64))
-
-
 def frame_poses(doc: Json, target: str = "map") -> dict[int, Pose]:
     """Camera-to-``target`` pose of every frame that carries one, by frame key."""
     out = {}
     for key, fr in (doc.get("openlabel", {}).get("frames") or {}).items():
         for tr in ((fr.get("frame_properties") or {}).get("transforms") or {}).values():
             if tr.get("dst") == target and "transform_src_to_dst" in tr:
-                out[int(key)] = _pose(tr["transform_src_to_dst"])
+                out[int(key)] = transform_pose(tr["transform_src_to_dst"])
                 break
     return out
 

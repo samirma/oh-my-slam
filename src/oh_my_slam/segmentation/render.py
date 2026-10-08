@@ -15,9 +15,8 @@ from oh_my_slam.segmentation.colors import color_for_id
 DIM = 0.35
 
 
-def segmented_image(rgb: NDArray[np.uint8], label_map: NDArray[Any], dim: float = DIM
-                    ) -> NDArray[np.uint8]:
-    out = (rgb.astype(np.float32) * dim).astype(np.uint8)
+def segmented_image(rgb: NDArray[np.uint8], label_map: NDArray[Any]) -> NDArray[np.uint8]:
+    out = (rgb.astype(np.float32) * DIM).astype(np.uint8)
     for oid in np.unique(label_map):
         if oid > 0:
             out[label_map == oid] = color_for_id(int(oid))

@@ -1,22 +1,29 @@
 {
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
   "rationale": {
-    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T152742Z (commit 51f168a, Apple M4 Max 36 GB, the final code, run alone under the machine-wide lock); their 'measured' is that run.",
+    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T152742Z (commit 51f168a, Apple M4 Max 36 GB, the final code, run alone under the machine-wide lock); their 'measured' is that run. The targets of examples/camera (perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map, seg.camera_frames, pose.camera_*, map.camera_*; added 2026-10-07) are not measured yet, except seg.camera_frames (set from a measurement on 2026-10-07) and map.camera_*.frame_agreement_tilt_* (set by user decision on 2026-10-08): see their groups below. The targets of mapper.sh locate on examples/camera (pose.camera_locate.*, perf.camera_locate.*; added 2026-10-08) are the ainex locate targets, not measured yet.",
     "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), view.sh -m 4 -> 3 s (1.99 s).",
     "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
     "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and view.sh -m, which does not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
     "pose.*": "The references are the commanded headings in the capture names, and the true heading deviates from them: SIFT homographies between the images themselves (pure rotation, measured 2026-09-25) give ~8 deg between 001 and 053 and ~9 deg between 026 and 078, which the names call the same heading, and 004 (commanded +15) at ~15-18 deg. A perfect estimator therefore scores a few degrees of median yaw error and ~9 deg on the same-heading pairs, so yaw_err_median <= 7, yaw_err_max <= 15 and same_heading_yaw_diff_max <= 10 stay: tighter targets would fail a correct map. Registration and pitch direction are exact properties of a working mapper on 79 rendered frames: >= 0.95 (at most 3 of 79 frames unregistered, 1 of 31 tilted frames with the wrong sign), up from 0.9.",
     "map.*.frame_agreement_*": "Spec intent: the map is one consistent cloud. The same-heading pairs see the same surfaces from nearly the same pose, so their stored depths must agree to within monocular depth noise once aligned: median <= 3 % (was 5 %) and p90 <= 10 % (was 15 %), i.e. ~6-9 cm / 20-30 cm at 2-3 m. The one-update map meets this (1.1 % / 6.0 %); the split map (6.8 % / 15.6 %) does not, which is the defect these targets are meant to show.",
     "map.*.frame_agreement_pairs_*": "Spec intent: the map is one consistent cloud wherever keyframes overlap, not only at the two same-heading pairs of §5. Every pair of keyframes whose optical axes are less than 45 deg apart and that share at least 500 pixels is compared, whatever their distance in capture order: sequence neighbours (where keyframe-by-keyframe depth disagrees locally: a scale-only adjustment left keyframes 2 apart at 21 %) and loop closures (where a depth scale that drifted along the sequence shows) alike; the detail reports both subsets (<= 10 and > 10 keyframes apart). Each pair's median disagreement |z_i->j / z_j - 1| measures how differently its two keyframes place the surfaces both see. Targets: the median pair within monocular depth noise, <= 3 % (as for the same-heading pairs); 90 % of the pairs within 5 % (0.1-0.15 m at 2-3 m); at most 1 % of the pairs grossly inconsistent, above 10 % (0.3 m at 3 m: the depth disagreement the object merges tolerate; 1 % leaves room for a few pairs at the edge of the angular range, which overlap only in their image borders where monocular depth is least reliable); and no pair above 15 % (1.5x the gross threshold: a pair disagreeing by 15-20 % draws its shared surfaces twice, 7-10 cm apart at 0.5 m). Measured on maps built 2026-09-25 (one-update / split): keyframe-by-keyframe alignment only (commit 521f1e1): median 1.75 / 1.78 %, p90 7.60 / 7.59 %, above 10 % 6.3 / 6.0 %, worst 20.6 / 21.1 %; one scale per keyframe adjusted over the pairs (commit 385e963): 1.93 / 1.93 %, 5.54 / 5.73 %, 2.7 / 2.7 %, 21.6 / 20.9 % (neighbours alone: worst 20.9 %, 3.5 % above 10 %); a scale and a near/far tilt per keyframe (commit 447f39c, run 20260925T070615Z): 1.78 / 1.81 %, 3.36 / 3.25 %, 0 / 0.13 %, 9.1 / 11.0 % (neighbours alone: worst 9.1 / 11.0 %, 0 / 0.2 % above 10 %; the worst pairs are 42-45 deg apart and overlap only in their image borders).",
-    "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing. matched_fraction is the share of the one-update map's objects found in the split map (user ruling 2026-10-05, mapper.md 83ee7a9: the split map may keep an object an earlier update published that no later image contradicts); the split map's extra objects are listed in the detail as extra_published, not counted against it.",
+    "map.stability.*": "Spec intent: mapping the same sequence in one update or split across several gives the same objects, ids, labels and OBBs. Targets are set at that intent, not at the current values: >= 90 % of the objects paired (was 70 %), >= 95 % of the pairs with a compatible label (was 90 %), >= 80 % with the same id (was 50 %; ids follow the order of first observation, which splitting does not change), median centre shift <= 0.10 m (was 0.15), median size change <= 20 % (was 25 %) and median 3D IoU >= 0.5 (was 0.4; 0.5 is the usual threshold for 'the same box' in 3D detection). label_agreement is measured on a label-blind pairing (geometry alone chooses the pairs whose labels it compares); it used to reuse the pairing of ids and boxes, which adds 1.0 (the whole IoU range) for incompatible labels and so made agreement nearly true by construction. Its detail also gives the agreement over that label-aware pairing. matched_fraction is the share of the one-update map's objects found in the split map (user ruling 2026-10-05, mapper.md 83ee7a9: the split map may keep an object an earlier update published that no later image contradicts); the split map's extra objects that an earlier update of the split map published (the same id, a compatible label and an overlapping or nearly coinciding box once that update is aligned with the split map's last) are listed in the detail as extra_published, not counted against it; any other extra object counts in unexcused_extra <= 0. In the same way, id_agreement accepts an id that differs from the one-update map's only when an earlier update published that id for this object: an id another object had (a swap) is no allowance.",
     "seg.*": "restaurant.jpg gave 115 objects at the default --min-score 0.5: >= 100 (was 10, which could not notice losing 90 % of the detections). 74 of 79 capture frames have detections: >= 0.9 (was 0.8). seg.min_score >= 0.5 is the --min-score contract. Accuracy is gt.*.",
-    "contract.*": "Every contract is a count of violations: 0 (including contract.stdout.server_sh). Since the specs of 2026-10-06 (segment.sh -i only, -f json|png; reconstruct.sh -f json|depth|ply): stdout purity also covers reconstruct.sh -f depth (one PNG, checked as a 16-bit single-channel image of the input's pixel size) and segment.sh -f png (one PNG, identical to the segmented.png of the same run, its masks in the object colours); segment.sh -m, segments.ply and -p of segment.sh are gone with their runs and metrics (perf.segment_map.*), and so is seg.map_consistency.*, which the spec's segmentation metric no longer asks for (per-frame detections are no longer compared with the map's objects). Both new runs are contract checks only: -f depth runs the inference of -f ply (geometry alone), -f png that of -f json.",
+    "contract.*": "Every contract is a count of violations: 0. server.sh is covered as every command is (spec §5 'for every command'): its response body is the command's result, so contract.stdout.server_sh checks each operation's response body (exactly one payload of the result's format) besides server.sh's own stdout, and contract.openlabel.server_sh / contract.colour.server_sh check every JSON response body as OpenLABEL and against the colours of its ids (the parity cases' byte comparison with the command's stdout does not judge a contract on its own: the command's output may break it too). Since the specs of 2026-10-06 (segment.sh -i only, -f json|png; reconstruct.sh -f json|depth|ply): stdout purity also covers reconstruct.sh -f depth (one PNG, checked as a 16-bit single-channel image of the input's pixel size) and segment.sh -f png (one PNG, identical to the segmented.png of the same run, its masks in the object colours); segment.sh -m, segments.ply and -p of segment.sh are gone with their runs and metrics (perf.segment_map.*), and so is seg.map_consistency.*, which the spec's segmentation metric no longer asks for (per-frame detections are no longer compared with the map's objects). Both runs are also performance groups (perf.reconstruct_depth.*, perf.segment_image_png.*: see their rationale).",
     "gt.*": "Accuracy against annotations in examples/ground_truth/ (none yet, so never measured). Set from typical monocular performance: object recall >= 0.7, precision >= 0.6, OBB IoU >= 0.3 (monocular boxes of partially visible objects), yaw error median <= 3 deg / max <= 8 deg after the best common offset, pitch error median <= 3 deg. Review them when the first annotations land.",
-    "map_update.*": "Spec §2.3/§5 and mapper.md: mapping examples/office_sequence/ (a cup on the window sill is visible in the first four images and gone in the rest) in one update or split across several (the annotation's splits 4+4+5 and 6+7) gives a map without the cup and with no hole where it stood, while every unchanged object keeps its id, label and OBB. absent_fraction >= 1 and before_present_fraction >= 1 are exact properties of a working mapper. hole_fraction <= 0.2: up to a fifth of the place's cells may look through (thin monocular depth at the region's edges, cells half off the sill); measured 0 on every map. <split>.stability.{label_agreement,id_agreement} (first vs last update of a split, aligned by their common captures' poses: a rebuild may re-gauge the frame and OBBs are refined, so the box figures are detail only) and <split>.vs_one_update.* are the map.stability targets (the same spec intent: ids, labels and OBBs stay the same; one-update vs split ids may differ only where an earlier update published one). <split>.ids_persistent_fraction >= 0.95: identity persistence is exact in the spec, 0.05 absorbs a box refined beyond the same-object test (0.25 m or IoU 0.05). The split targets are patterns (map_update.split_*.…) because a split's name is data.",
+    "map_update.*": "Spec §2.3/§5 and mapper.md: mapping examples/office_sequence/ (a cup on the window sill is visible in the first four images and gone in the rest) in one update or split across several (the annotation's splits 4+4+5 and 6+7) gives a map without the cup and with no hole where it stood, while every unchanged object keeps its id, label and OBB. absent_fraction >= 1 and before_present_fraction >= 1 are exact properties of a working mapper. hole_fraction <= 0.2: up to a fifth of the place's cells may look through (thin monocular depth at the region's edges, cells half off the sill); measured 0 on every map. <split>.stability.{label_agreement,id_agreement} (first vs last update of a split, aligned by their common captures' poses since a rebuild may re-gauge the frame) and <split>.vs_one_update.* are the map.stability targets (the same spec intent: ids, labels and OBBs stay the same; one-update vs split ids may differ only where an earlier update published one). <split>.ids_persistent_fraction >= 0.95: identity persistence is exact in the spec, 0.05 absorbs a box refined beyond the same-object test (0.25 m or IoU 0.05). The split targets are patterns (map_update.split_*.…) because a split's name is data. <split>.stability.{centre_delta_median_m,extent_delta_median_rel,obb_iou_median}: spec §5 'objects that never changed keep their ids, labels and OBBs', with the refinement mapper.md allows ('its OBB is refined as evidence accumulates': the first update saw the object in a few images only): 1.5 x the one-update-vs-split centre and size targets (0.15 m, 30 %) and half its IoU target (0.25). Measured as detail before they were targets (runs 20261005T152742Z and 20261005T161937Z): centre 0.036-0.114 m, size 0.17-0.24, IoU 0.086-0.126, which fails the IoU target: a finding, not a reason to lower it.",
     "perf.<group>.stage.<stage>.*": "Spec §5 'per-stage … wall time and peak memory, per image and per mapping update'. Seconds (.s): explicit targets max(1.75 x measured, measured + 0.5 s) rounded up to two digits, regression tolerance 35 % / 0.25 s (stage times are noisier than totals: GPU queueing between the frames' requests). A stage a command adds later falls back to its group's pattern perf.<group>.stage.*.s = the group's end-to-end target, since a stage never outlasts its run. Memory (.client_peak_mb, .server_peak_gb): the group's end-to-end memory targets as patterns, for the same reason. The explicit stage times (and the end-to-end targets of the locate, office, street2 and server.sh groups) were first derived from run 20261005T102325Z, which ran while other agents loaded the machine, and re-derived with the same rule from the solo run 20261005T152742Z.",
     "perf.locate, perf.mapper_office*, perf.mapper_street2, perf.mapper_split.per_update_wall_s": "Wall time ~1.6 x measured (locate 3 images on the 79-keyframe map 2.24 s -> 3.6 s, from run 20261005T161937Z: run 20261005T152742Z's 2.6 s included ~0.4 s of bytecode recompilation (PYTHONDONTWRITEBYTECODE, fixed in 4c957f2); the office map in one update 48.7 s; the slowest update of the office splits 28.2 s; street2 402 s at -fps 2; the split ainex map's slowest update), client memory max(1.5 x, +200 MB) (the office maps peak at 9.2 / 13.2 GB in COLMAP's features and SfM stages: far above the 6 GB first guessed), server footprint max(+3 GB, 1.2 x).",
     "pose.locate.*, pose.street2.*": "Spec §5 pose accuracy for mapper.sh locate: the held-out captures (the split map's second update, located against the map after its first) use the targets of the map's own captures (registered/located >= 0.9 with 0.05 regression tolerance, yaw error median <= 7 deg, max <= 15 deg); measured 0.58 located, a finding, not a reason to lower it. street2: the share of sampled video frames registered, >= min(0.9, measured - 0.05).",
-    "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 of the reads made while an operation's request runs), the overhead of an operation's request over the same command from the shell max(2 x, +1 s) (first measured as the overhead of a job, before requests replaced jobs); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (response bodies byte-identical to the command's result), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 17 tests of tests/browser/test_webapp*.py run (17 since the request-based application), and no axe-core violation (WCAG 2.0/2.1 A, AA)."
+    "pose.camera_locate.*, perf.camera_locate.*": "Spec §5: examples/camera has the same uses as ainex-captures, so mapper.sh locate runs on it too: the held-out captures (the split map's second update, located against the map after its first) and three captures (the first, halfway, three quarters through) located on the one-update map. Not measured yet: the ainex locate targets. pose.camera_locate.*: located >= 0.9 (0.05), yaw error median <= 7 deg and max <= 15 deg as pose.locate.*; the step angle is not recorded, so a capture's heading is the yaw the split map gives it once an update has added it (both relative to the first capture), not a commanded one. perf.camera_locate: ainex's 690 MB and 16 GB; wall time 5.0 s, ainex's 3.6 s with its features_matching share (1.5 s of the 2.2 s measured) doubled for SIFT on 3 queries of 6.75x the pixels, matched against 27 keyframes instead of 79; stage patterns are the group's end-to-end targets. Re-derive them with the rule of their neighbours from the first run that measures them.",
+    "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 of the reads made while an operation's request runs), the overhead of an operation's request over the same command from the shell max(2 x, +1 s) (first measured as the overhead of a job, before requests replaced jobs); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (response bodies byte-identical to the command's result), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 17 tests of tests/browser/test_webapp*.py run (17 since the request-based application), and no axe-core violation (WCAG 2.0/2.1 A, AA).",
+    "perf.reconstruct_depth, perf.segment_image_png": "Spec §5 'per image' performance covers every output format of the per-image commands, so reconstruct.sh -f depth and segment.sh -i -f png -d are performance groups, no longer contract checks only. Not measured yet: each takes the targets of the run whose inference it repeats. -f depth repeats -f ply's (geometry alone) and encodes a 16-bit PNG instead of a PLY: wall 2.0 s (about 2 x reconstruct -f ply's 0.95-1.5 s), 450 MB, 14 GB. -f png -d repeats segment.sh -i -d (-f json): 3.5 s, 800 MB, 14 GB. Stage patterns are the group's end-to-end targets, as for every group. Re-derive them with the rule of their neighbours from the first run that measures them.",
+    "perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map": "Spec §5 'per image and per mapping update' on examples/camera (27 frames, 1920x888, real images through a wide-angle lens). Not measured yet: each group takes the targets of its ainex-captures counterpart, scaled where the input differs. segment.sh -i per frame: 2.5 s, the ainex frame's 1.6 s for a larger segmentation grid (1024x474, 1.6x the pixels of 640x480; inference took 0.62 s on ainex's grid and 1.29 s on restaurant.jpg's 1024x768), below segment.sh -i restaurant.jpg's 3.5 s, which adds the four artefacts and 115 objects; 350 MB (ainex 250 MB, with 1.9x the per-pixel arrays); 14 GB. Mapping in one update: 120 s, the ainex target per frame (270 s / 79 = 3.4 s) for 27 frames (92 s) plus SIFT on 6.75x the pixels of an ainex frame (the office maps' 4000x3000 images took ~1.7 s each in features_matching); the keyframe grid (768x355) is about the size of ainex's (640x480), so the per-keyframe stages (inference, objects, cloud) scale with the frame count. Split across 3 updates: 140 s (ainex's split / one-update targets, 300 / 270 = 1.11) and its slowest update 65 s (ainex's per-update target is 140 / 300 of its split's). Mapping memory 8000 MB / 20 GB as ainex (COLMAP's features of 2 MP images stay well below the office maps' 9.6 GB at 12 MP). view.sh -m on the camera map: ainex's 3.0 s, 350 MB, 14 GB (a third of the keyframes). Stage patterns are the group's end-to-end targets (the split's per update, as perf.mapper_split.stage.*). Re-derive them with the rule of their neighbours from the first run that measures them.",
+    "pose.camera_*": "Spec §5 pose accuracy on examples/camera, whose names record the pan order but not the step angle. registered_fraction >= 0.95 as ainex (at most 1 of 27 frames unregistered; tolerance 0.04 = one frame, as ainex's 0.03 is ~2 of 79). pan_order_fraction >= 1: every step from one pan position to the next turns left, i.e. its yaw grows (the evaluator's yaw is positive to the left, as ainex's 'left_YYY'); a pan position's heading is the circular mean of its registered captures' yaws; with 8 steps any wrong one fails, an exact property of a working mapper on a camera that turns one way. tilt_yaw_diff_*: the tilts of one pan position share the pan motor's position, so their headings differ only by the base's deviation from level (about tan(tilt) x tan(base tilt): ~1 deg per tilt for a base 2 deg off level at a 30 deg tilt) and the estimator's error: median <= 2 deg, worst <= 5 deg, half of ainex's same-heading 10 deg, which allows for the ~9 deg by which the robot's re-commanded headings really differ. pitch_direction_fraction >= 0.95 as ainex (18 tilted frames: every one; tolerance 0.06 = one frame). Real images through a wide-angle lens may miss these: a finding, not a reason to lower them.",
+    "map.camera_*": "Not measured yet, except frame_agreement_tilt_* (set by user decision on 2026-10-08: see map.camera_*.frame_agreement_tilt_*): the ainex targets (map.*.frame_agreement_pairs_*, map.stability.*, seg.frames.*), for the same spec intent: one consistent cloud wherever keyframes overlap, and the same objects, ids, labels and OBBs whether the sequence is mapped in one update or split across several. The same-heading pairs of examples/camera are the tilt pairs of each pan position (down/mid, mid/up, down/up: the same place and heading, another tilt; a pair sharing fewer than 500 pixels is not compared), judged by frame_agreement_tilt_* instead of ainex's worst same-heading pair (map.*.frame_agreement_median_pct, map.*.frame_agreement_p90_pct).",
+    "map.camera_*.frame_agreement_tilt_*": "Set by user decision on 2026-10-08. For examples/camera only, the tilt pairs (every two of the three tilts of one pan position) are judged with the targets of the overlapping pairs (map.*.frame_agreement_pairs_*), computed over the tilt pairs alone, each pair scored by its median depth disagreement |z_i->j / z_j - 1|: the median of the tilt pairs' medians <= 3 %, their p90 <= 5 %, the share of tilt pairs whose median exceeds 10 % <= 1 % and the largest tilt-pair median <= 15 %, with the same regression tolerances. They replace the targets the camera had copied from ainex (the worst tilt pair's median <= 3 % and the worst tilt pair's within-pair p90 <= 10 %): the within-pair p90 bound is dropped for the camera only, and ainex-captures keeps all its metrics and targets. Why the camera differs: ainex's same-heading pairs are revisits, which see the same surfaces at the same image positions; the camera's tilt pairs share only strips, at the top of one frame and the bottom of the other, so they behave like ordinary overlapping pairs. Evidence, on maps/test-r3 (a one-update map of the 27 frames of examples/camera, built 2026-10-07), with the evaluator's own functions: all 27 tilt pairs compared; median 2.77 %, p90 of the medians 4.67 %, 0 of 27 above 10 %, worst 5.45 % (img_007_p03_down / img_009_p03_up). The worst-pair metrics they replace measured 5.45 % (median) and 22.02 % (that pair's within-pair p90) on the same map.",
+    "seg.camera_frames.*": "Set from a measurement on 2026-10-07, by user decision: segment.sh -i finds objects in 22 of the 27 frames = 0.815, so >= 0.8 (at most 5 frames without a detection); ainex keeps >= 0.9 (seg.frames). The five frames see only steep up-tilts and plain built-ins, where the detector's best correct detection at the default passes scores below 0.5: img_009_p03_up (doorway 0.41), img_010_p04_up (white built-in wardrobe 0.47), img_014_p05_mid (wardrobe 0.17, light switch 0.20; as a 'thermostat' 0.50 on the coarse pass, under its 5 % size floor), img_015_p05_up (wardrobe 0.20) and img_033_p11_up (window with roller shutters 0.41 as 'shop window', the hanging bunting as 'flag' 0.53 on the coarse pass, under its size floor). The default --min-score 0.5 stays: the spec fixes it (specs/segment.md). Input resolution (640-1920 px), lens undistortion, contrast, flips, tiles, 76 prompt wordings, averaged synonym prompts and the other detection head lift none of them cleanly; two extra fused passes (640 px on a 640 px input, 512 px upsampled to 1024, without the size floor) reach 25 of 27 but add about 20 false labels on ainex-captures, at least one on restaurant.jpg and many on examples/camera (README, Known limitations)."
   },
   "defaults": {
     "tolerance_rel": 0.1,
@@ -89,6 +96,25 @@
       "unit": "GB",
       "description": "peak server footprint during: reconstruct.sh -i restaurant.jpg -f ply, warm server (AC22)"
     },
+    "perf.reconstruct_depth.wall_s": {
+      "op": "<=",
+      "value": 2.0,
+      "unit": "s",
+      "tolerance_rel": 0.2,
+      "description": "reconstruct.sh -i restaurant.jpg -f depth (16-bit PNG), warm server"
+    },
+    "perf.reconstruct_depth.client_peak_mb": {
+      "op": "<=",
+      "value": 450,
+      "unit": "MB",
+      "description": "peak resident set of the command's process tree: reconstruct.sh -i restaurant.jpg -f depth (16-bit PNG), warm server"
+    },
+    "perf.reconstruct_depth.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "description": "peak server footprint during: reconstruct.sh -i restaurant.jpg -f depth (16-bit PNG), warm server"
+    },
     "perf.segment_image.wall_s": {
       "op": "<=",
       "value": 3.5,
@@ -110,6 +136,25 @@
       "measured": 11.3656,
       "unit": "GB",
       "description": "peak server footprint during: segment.sh -i restaurant.jpg -d DIR (JSON, with the four artefacts)"
+    },
+    "perf.segment_image_png.wall_s": {
+      "op": "<=",
+      "value": 3.5,
+      "unit": "s",
+      "tolerance_rel": 0.2,
+      "description": "segment.sh -i restaurant.jpg -f png -d DIR (the segmented image, with the four artefacts)"
+    },
+    "perf.segment_image_png.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "description": "peak resident set of the command's process tree: segment.sh -i restaurant.jpg -f png -d DIR (the segmented image, with the four artefacts)"
+    },
+    "perf.segment_image_png.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "description": "peak server footprint during: segment.sh -i restaurant.jpg -f png -d DIR (the segmented image, with the four artefacts)"
     },
     "perf.segment_frames.wall_s": {
       "op": "<=",
@@ -225,6 +270,90 @@
       "unit": "GB",
       "description": "peak server footprint during: view.sh -m on the one-update map: process start until the page has rendered"
     },
+    "perf.segment_camera_frames.wall_s": {
+      "op": "<=",
+      "value": 2.5,
+      "unit": "s",
+      "tolerance_rel": 0.2,
+      "description": "segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+    },
+    "perf.segment_camera_frames.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "description": "peak resident set of the command's process tree: segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+    },
+    "perf.segment_camera_frames.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "description": "peak server footprint during: segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+    },
+    "perf.mapper_camera_single.wall_s": {
+      "op": "<=",
+      "value": 120,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "description": "mapper.sh update of all 27 examples/camera frames in one update"
+    },
+    "perf.mapper_camera_single.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "description": "peak resident set of the command's process tree: mapper.sh update of all 27 examples/camera frames in one update"
+    },
+    "perf.mapper_camera_single.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "description": "peak server footprint during: mapper.sh update of all 27 examples/camera frames in one update"
+    },
+    "perf.mapper_camera_split.wall_s": {
+      "op": "<=",
+      "value": 140,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "description": "mapper.sh update of the same examples/camera frames split across the updates (sum)"
+    },
+    "perf.mapper_camera_split.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "description": "peak resident set of the command's process tree: mapper.sh update of the same examples/camera frames split across the updates (sum)"
+    },
+    "perf.mapper_camera_split.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "description": "peak server footprint during: mapper.sh update of the same examples/camera frames split across the updates (sum)"
+    },
+    "perf.mapper_camera_split.per_update_wall_s": {
+      "op": "<=",
+      "value": 65,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "description": "the slowest update of the split examples/camera map"
+    },
+    "perf.view_camera_map.render_s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.2,
+      "description": "view.sh -m on the one-update examples/camera map: process start until the page has rendered"
+    },
+    "perf.view_camera_map.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "tolerance_rel": 0.15,
+      "description": "peak resident set of the command's process tree: view.sh -m on the one-update examples/camera map: process start until the page has rendered"
+    },
+    "perf.view_camera_map.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "description": "peak server footprint during: view.sh -m on the one-update examples/camera map: process start until the page has rendered"
+    },
     "seg.restaurant.objects": {
       "op": ">=",
       "value": 100,
@@ -239,6 +368,14 @@
       "unit": "",
       "tolerance_abs": 0.05,
       "description": "share of ainex-captures frames with at least one detection"
+    },
+    "seg.camera_frames.with_detections_fraction": {
+      "op": ">=",
+      "value": 0.8,
+      "measured": 0.815,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "share of examples/camera frames with at least one detection"
     },
     "seg.min_score": {
       "op": ">=",
@@ -423,13 +560,202 @@
       "tolerance_abs": 2.0,
       "description": "largest median depth disagreement of one overlapping pair (split map)"
     },
+    "pose.camera_single.registered_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.04,
+      "description": "captures registered (one-update camera map; at least 26 of 27)"
+    },
+    "pose.camera_single.pan_order_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "unit": "",
+      "tolerance_abs": 0.0,
+      "description": "steps from one registered pan position to the next whose heading (the circular mean of the position's registered captures' yaws) turns left, as the pan numbers increase (one-update camera map)"
+    },
+    "pose.camera_single.tilt_yaw_diff_median_deg": {
+      "op": "<=",
+      "value": 2,
+      "unit": "deg",
+      "tolerance_abs": 0.5,
+      "description": "median |yaw difference| of two tilts of one pan position (one-update camera map)"
+    },
+    "pose.camera_single.tilt_yaw_diff_max_deg": {
+      "op": "<=",
+      "value": 5,
+      "unit": "deg",
+      "tolerance_abs": 1.0,
+      "description": "largest |yaw difference| of two tilts of one pan position (one-update camera map)"
+    },
+    "pose.camera_single.pitch_direction_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.06,
+      "description": "up/down frames pitched in the named direction relative to the mid frame of their pan position (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_tilt_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over the tilt pairs (every two tilts of one pan position that share >= 500 pixels), of the pair's median depth disagreement |z_i->j / z_j - 1| (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_tilt_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same tilt pairs, of the pair's median depth disagreement (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_tilt_over10_pct": {
+      "op": "<=",
+      "value": 1,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "share of the same tilt pairs whose median depth disagreement exceeds 10 % (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_tilt_max_pct": {
+      "op": "<=",
+      "value": 15,
+      "unit": "%",
+      "tolerance_abs": 2.0,
+      "description": "largest median depth disagreement of one tilt pair (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_pairs_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over every overlapping keyframe pair (optical axes < 45 deg apart, >= 500 shared pixels, any distance in capture order), of the pair's median depth disagreement |z_i->j / z_j - 1| (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_pairs_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same pairs, of the pair's median depth disagreement (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_pairs_over10_pct": {
+      "op": "<=",
+      "value": 1,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "share of the same pairs whose median depth disagreement exceeds 10 % (one-update camera map)"
+    },
+    "map.camera_single.frame_agreement_pairs_max_pct": {
+      "op": "<=",
+      "value": 15,
+      "unit": "%",
+      "tolerance_abs": 2.0,
+      "description": "largest median depth disagreement of one overlapping pair (one-update camera map)"
+    },
+    "pose.camera_split.registered_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.04,
+      "description": "captures registered (split camera map; at least 26 of 27)"
+    },
+    "pose.camera_split.pan_order_fraction": {
+      "op": ">=",
+      "value": 1.0,
+      "unit": "",
+      "tolerance_abs": 0.0,
+      "description": "steps from one registered pan position to the next whose heading (the circular mean of the position's registered captures' yaws) turns left, as the pan numbers increase (split camera map)"
+    },
+    "pose.camera_split.tilt_yaw_diff_median_deg": {
+      "op": "<=",
+      "value": 2,
+      "unit": "deg",
+      "tolerance_abs": 0.5,
+      "description": "median |yaw difference| of two tilts of one pan position (split camera map)"
+    },
+    "pose.camera_split.tilt_yaw_diff_max_deg": {
+      "op": "<=",
+      "value": 5,
+      "unit": "deg",
+      "tolerance_abs": 1.0,
+      "description": "largest |yaw difference| of two tilts of one pan position (split camera map)"
+    },
+    "pose.camera_split.pitch_direction_fraction": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.06,
+      "description": "up/down frames pitched in the named direction relative to the mid frame of their pan position (split camera map)"
+    },
+    "map.camera_split.frame_agreement_tilt_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over the tilt pairs (every two tilts of one pan position that share >= 500 pixels), of the pair's median depth disagreement |z_i->j / z_j - 1| (split camera map)"
+    },
+    "map.camera_split.frame_agreement_tilt_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same tilt pairs, of the pair's median depth disagreement (split camera map)"
+    },
+    "map.camera_split.frame_agreement_tilt_over10_pct": {
+      "op": "<=",
+      "value": 1,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "share of the same tilt pairs whose median depth disagreement exceeds 10 % (split camera map)"
+    },
+    "map.camera_split.frame_agreement_tilt_max_pct": {
+      "op": "<=",
+      "value": 15,
+      "unit": "%",
+      "tolerance_abs": 2.0,
+      "description": "largest median depth disagreement of one tilt pair (split camera map)"
+    },
+    "map.camera_split.frame_agreement_pairs_median_pct": {
+      "op": "<=",
+      "value": 3,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "median, over every overlapping keyframe pair (optical axes < 45 deg apart, >= 500 shared pixels, any distance in capture order), of the pair's median depth disagreement |z_i->j / z_j - 1| (split camera map)"
+    },
+    "map.camera_split.frame_agreement_pairs_p90_pct": {
+      "op": "<=",
+      "value": 5,
+      "unit": "%",
+      "tolerance_abs": 1.0,
+      "description": "90th percentile, over the same pairs, of the pair's median depth disagreement (split camera map)"
+    },
+    "map.camera_split.frame_agreement_pairs_over10_pct": {
+      "op": "<=",
+      "value": 1,
+      "unit": "%",
+      "tolerance_abs": 0.5,
+      "description": "share of the same pairs whose median depth disagreement exceeds 10 % (split camera map)"
+    },
+    "map.camera_split.frame_agreement_pairs_max_pct": {
+      "op": "<=",
+      "value": 15,
+      "unit": "%",
+      "tolerance_abs": 2.0,
+      "description": "largest median depth disagreement of one overlapping pair (split camera map)"
+    },
     "map.stability.matched_fraction": {
       "op": ">=",
       "value": 0.9,
       "measured": 0.8636,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "share of the one-update map's objects paired with an object of the split map (extra split objects: detail.extra_published)"
+      "description": "share of the one-update map's objects paired with an object of the split map (extra split objects: detail.extra_published, those an earlier update published; detail.extra_unexcused, the others)"
+    },
+    "map.stability.unexcused_extra": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "tolerance_abs": 0.0,
+      "description": "objects of the split map paired with no object of the one-update map and that no earlier update of the split map published (mapper.md lets the split map keep only objects an earlier update published)"
     },
     "map.stability.label_agreement": {
       "op": ">=",
@@ -445,7 +771,7 @@
       "measured": 0.2632,
       "unit": "",
       "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in both maps"
+      "description": "paired objects with the same id in both maps, or whose split-map id an earlier update of the split map published for that object (mapper.md)"
     },
     "map.stability.centre_delta_median_m": {
       "op": "<=",
@@ -471,6 +797,55 @@
       "tolerance_abs": 0.08,
       "description": "median 3D IoU of paired OBBs",
       "tolerance_note": "Regression tolerance set to the run-to-run spread measured on unchanged code on 2026-09-25 (8 runs, commits 521f1e1..10289bf): 0.663-0.777 (0.663 and 0.711 at the same commit)."
+    },
+    "map.camera_stability.matched_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "examples/camera: share of the one-update map's objects paired with an object of the split map (extra split objects: detail.extra_published, those an earlier update published; detail.extra_unexcused, the others)"
+    },
+    "map.camera_stability.unexcused_extra": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "tolerance_abs": 0.0,
+      "description": "examples/camera: objects of the split map paired with no object of the one-update map and that no earlier update of the split map published (mapper.md lets the split map keep only objects an earlier update published)"
+    },
+    "map.camera_stability.label_agreement": {
+      "op": ">=",
+      "value": 0.95,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "examples/camera: objects paired by geometry alone (label-blind) whose labels are the same or compatible"
+    },
+    "map.camera_stability.id_agreement": {
+      "op": ">=",
+      "value": 0.8,
+      "unit": "",
+      "tolerance_abs": 0.1,
+      "description": "examples/camera: paired objects with the same id in both maps, or whose split-map id an earlier update of the split map published for that object (mapper.md)"
+    },
+    "map.camera_stability.centre_delta_median_m": {
+      "op": "<=",
+      "value": 0.1,
+      "unit": "m",
+      "tolerance_abs": 0.03,
+      "description": "examples/camera: median OBB centre distance of paired objects (split map aligned by the shared camera poses)"
+    },
+    "map.camera_stability.extent_delta_median_rel": {
+      "op": "<=",
+      "value": 0.2,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "examples/camera: median relative OBB size difference of paired objects"
+    },
+    "map.camera_stability.obb_iou_median": {
+      "op": ">=",
+      "value": 0.5,
+      "unit": "",
+      "tolerance_abs": 0.08,
+      "description": "examples/camera: median 3D IoU of paired OBBs"
     },
     "contract.stdout.server": {
       "op": "<=",
@@ -675,6 +1050,27 @@
       "unit": "GB",
       "tolerance_rel": 0.1
     },
+    "perf.camera_locate.wall_s": {
+      "op": "<=",
+      "value": 5.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "description": "mapper.sh locate of 3 examples/camera captures (1920x888) on the one-update camera map"
+    },
+    "perf.camera_locate.client_peak_mb": {
+      "op": "<=",
+      "value": 690,
+      "unit": "MB",
+      "tolerance_rel": 0.15,
+      "description": "peak resident set of the command's process tree: mapper.sh locate on the one-update camera map"
+    },
+    "perf.camera_locate.server_peak_gb": {
+      "op": "<=",
+      "value": 16,
+      "unit": "GB",
+      "tolerance_rel": 0.1,
+      "description": "peak server footprint during: mapper.sh locate on the one-update camera map"
+    },
     "perf.mapper_office.wall_s": {
       "op": "<=",
       "value": 78,
@@ -755,6 +1151,26 @@
       "unit": "deg",
       "tolerance_abs": 2.0
     },
+    "pose.camera_locate.located_fraction": {
+      "op": ">=",
+      "value": 0.9,
+      "tolerance_abs": 0.05,
+      "description": "examples/camera captures of the split map's second update located against the map after its first update"
+    },
+    "pose.camera_locate.yaw_err_median_deg": {
+      "op": "<=",
+      "value": 7,
+      "unit": "deg",
+      "tolerance_abs": 1.0,
+      "description": "median |located yaw - the yaw the split map gives the capture once added|, both relative to the first capture (examples/camera)"
+    },
+    "pose.camera_locate.yaw_err_max_deg": {
+      "op": "<=",
+      "value": 15,
+      "unit": "deg",
+      "tolerance_abs": 2.0,
+      "description": "largest |located yaw - the yaw the split map gives the capture once added|, both relative to the first capture (examples/camera)"
+    },
     "pose.street2.registered_fraction": {
       "op": ">=",
       "value": 0.9,
@@ -768,7 +1184,21 @@
     },
     "contract.stdout.server_sh": {
       "op": "<=",
-      "value": 0
+      "value": 0,
+      "unit": "",
+      "description": "server.sh's own stdout (empty) and each operation's response body (exactly one payload of the result's format) breaking stdout purity (server_sh)"
+    },
+    "contract.openlabel.server_sh": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "description": "server.sh operations' JSON response bodies failing the OpenLABEL 1.0.0 schema or the extra checks (server_sh)"
+    },
+    "contract.colour.server_sh": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "description": "server.sh operations' JSON response bodies whose object colours are not those of their ids (server_sh)"
     },
     "server_sh.start_s": {
       "op": "<=",
@@ -865,7 +1295,14 @@
       "value": 0.9,
       "unit": "",
       "tolerance_abs": 0.05,
-      "description": "share of the one-update map's objects paired with an object of the split map (extra split objects: detail.extra_published)"
+      "description": "share of the one-update map's objects paired with an object of the split map (extra split objects: detail.extra_published, those an earlier update published; detail.extra_unexcused, the others)"
+    },
+    "map_update.split_*.vs_one_update.unexcused_extra": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "tolerance_abs": 0.0,
+      "description": "objects of the split map paired with no object of the one-update map and that no earlier update of the split map published (mapper.md lets the split map keep only objects an earlier update published)"
     },
     "map_update.split_*.stability.label_agreement": {
       "op": ">=",
@@ -888,12 +1325,33 @@
       "tolerance_abs": 0.1,
       "description": "paired objects with the same id in both maps"
     },
+    "map_update.split_*.stability.centre_delta_median_m": {
+      "op": "<=",
+      "value": 0.15,
+      "unit": "m",
+      "tolerance_abs": 0.03,
+      "description": "first vs last update of the split: median OBB centre distance of the unchanged objects the first update observed (the updates aligned by their common captures' poses)"
+    },
+    "map_update.split_*.stability.extent_delta_median_rel": {
+      "op": "<=",
+      "value": 0.3,
+      "unit": "",
+      "tolerance_abs": 0.05,
+      "description": "first vs last update of the split: median relative OBB size difference of the unchanged objects"
+    },
+    "map_update.split_*.stability.obb_iou_median": {
+      "op": ">=",
+      "value": 0.25,
+      "unit": "",
+      "tolerance_abs": 0.08,
+      "description": "first vs last update of the split: median 3D IoU of the unchanged objects' OBBs (aligned)"
+    },
     "map_update.split_*.vs_one_update.id_agreement": {
       "op": ">=",
       "value": 0.8,
       "unit": "",
       "tolerance_abs": 0.1,
-      "description": "paired objects with the same id in both maps"
+      "description": "paired objects with the same id in both maps, or whose split-map id an earlier update of the split map published for that object (mapper.md)"
     },
     "map_update.split_*.vs_one_update.centre_delta_median_m": {
       "op": "<=",
@@ -954,6 +1412,25 @@
       "unit": "GB",
       "tolerance_rel": 0.1
     },
+    "perf.reconstruct_depth.stage.*.s": {
+      "op": "<=",
+      "value": 2.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.reconstruct_depth.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 450,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.reconstruct_depth.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
     "perf.segment_image.stage.*.s": {
       "op": "<=",
       "value": 3.5,
@@ -968,6 +1445,25 @@
       "tolerance_rel": 0.15
     },
     "perf.segment_image.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_image_png.stage.*.s": {
+      "op": "<=",
+      "value": 3.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_image_png.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 800,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_image_png.stage.*.server_peak_gb": {
       "op": "<=",
       "value": 14,
       "unit": "GB",
@@ -1084,6 +1580,101 @@
     "perf.locate.stage.*.server_peak_gb": {
       "op": "<=",
       "value": 16,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.camera_locate.stage.*.s": {
+      "op": "<=",
+      "value": 5.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.camera_locate.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 690,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.camera_locate.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 16,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.segment_camera_frames.stage.*.s": {
+      "op": "<=",
+      "value": 2.5,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.segment_camera_frames.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.segment_camera_frames.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_camera_single.stage.*.s": {
+      "op": "<=",
+      "value": 120,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_camera_single.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_camera_single.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.mapper_camera_split.stage.*.s": {
+      "op": "<=",
+      "value": 65,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.mapper_camera_split.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 8000,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.mapper_camera_split.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 20,
+      "unit": "GB",
+      "tolerance_rel": 0.1
+    },
+    "perf.view_camera_map.stage.*.s": {
+      "op": "<=",
+      "value": 3.0,
+      "unit": "s",
+      "tolerance_rel": 0.35,
+      "tolerance_abs": 0.2
+    },
+    "perf.view_camera_map.stage.*.client_peak_mb": {
+      "op": "<=",
+      "value": 350,
+      "unit": "MB",
+      "tolerance_rel": 0.15
+    },
+    "perf.view_camera_map.stage.*.server_peak_gb": {
+      "op": "<=",
+      "value": 14,
       "unit": "GB",
       "tolerance_rel": 0.1
     },

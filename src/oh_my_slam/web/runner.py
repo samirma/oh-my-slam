@@ -58,11 +58,11 @@ STOPPING = "stopping"  # … or the service stops
 
 
 class RunError(Exception):
-    """A request the runner refuses (``status``: the HTTP status)."""
+    """A request the runner refuses: ``code`` is one of the service's own refusals
+    (``web.app.refusals``, which gives its HTTP status)."""
 
-    def __init__(self, status: int, message: str, code: str) -> None:
+    def __init__(self, message: str, code: str) -> None:
         super().__init__(message)
-        self.status = status
         self.code = code
 
 
@@ -161,11 +161,11 @@ class Runner:
         """Queue a valid request (in ticket order) and start what may start. Refused when the
         service stops or another request in progress consumes one of its uploads."""
         if self.stopping:
-            raise RunError(503, "the service is stopping; send the request again once it runs",
-                           "stopping")
+            raise RunError("the service is stopping; send the request again once it runs",
+                           STOPPING)
         taken = [u for u in run.uploads if u in self._in_use]
         if taken:
-            raise RunError(409, f"upload {taken[0]} is the input of another request in progress; "
+            raise RunError(f"upload {taken[0]} is the input of another request in progress; "
                            "upload the file again", "upload_in_use")
         self._loop = asyncio.get_running_loop()
         run.done = self._loop.create_future()

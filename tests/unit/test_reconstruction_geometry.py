@@ -10,45 +10,43 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction import depth as dmod
 from oh_my_slam.reconstruction.fusion import TsdfFusion, choose_voxel_size
 from oh_my_slam.reconstruction.gravity import GravityEstimate, mean_up, refine_with_floor
-from oh_my_slam.reconstruction.pointcloud import frame_cloud, pixel_mask
+from oh_my_slam.reconstruction.pointcloud import pixel_mask, pixel_points
 from tests.synth.scene import default_room, look_at, orbit_poses, render
 
 K = Intrinsics(260.0, 260.0, 160.0, 120.0, 320, 240)
 
 
-def test_frame_cloud_colours_and_edges() -> None:
+def test_pixel_points_unproject_the_selected_pixels() -> None:
     room = default_room()
     pose = look_at(np.array([2.5, 2.0, 1.5]), np.array([0.0, 0.0, 0.5]))
     r = render(room, pose, K)
     m = pixel_mask(r.depth, r.depth > 0)
     assert m.sum() > 0.8 * (r.depth > 0).sum()
-    cloud, idx = frame_cloud(r.depth, r.rgb, K, m, pose)
-    np.testing.assert_array_equal(cloud.rgb, r.rgb.reshape(-1, 3)[idx])
+    pts, idx = pixel_points(r.depth, K, m)
+    assert len(pts) == m.sum() and m.reshape(-1)[idx].all()
     # floor pixels unproject to z ~ 0 in the map frame
     floor = (r.ids.reshape(-1)[idx] == 0)
-    assert np.abs(cloud.xyz[floor, 2]).max() < 0.02
-    with pytest.raises(ValueError):
-        frame_cloud(r.depth, r.rgb[:10], K, m)
+    assert np.abs(pose.apply(pts)[floor, 2]).max() < 0.02
 
 
 def test_gravity_floor_refinement_within_5_degrees(rng: np.random.Generator) -> None:
     room = default_room()
     pose = look_at(np.array([2.5, 2.0, 1.5]), np.array([0.0, 0.0, 0.3]))
     r = render(room, pose, K)
-    cloud, _ = frame_cloud(r.depth, r.rgb, K, r.depth > 0)
+    xyz, _ = pixel_points(r.depth, K, r.depth > 0)
     true_up = pose.R.T @ np.array([0.0, 0.0, 1.0])
     # a prior 3 degrees off
     tilt = rotation_between(true_up, true_up + np.array([0.05, 0.0, 0.0]))
     prior = GravityEstimate(tilt @ true_up, "geocalib", 1.0, 1.5)
-    est = refine_with_floor(cloud.xyz, prior)
+    est = refine_with_floor(xyz, prior)
     assert est.source == "geocalib+floor"
     assert angle_between_deg(est.up_cam, true_up) < 0.5
     assert est.floor_height == pytest.approx(1.5, abs=0.03)
     # a prior 20 degrees off is kept (floor normal outside the 5 degree window)
     far = rotation_between(true_up, true_up + np.array([0.4, 0.0, 0.0])) @ true_up
-    kept = refine_with_floor(cloud.xyz, GravityEstimate(far, "geocalib"))
+    kept = refine_with_floor(xyz, GravityEstimate(far, "geocalib"))
     assert kept.source == "geocalib"
-    assert refine_with_floor(cloud.xyz[:10], prior) is prior
+    assert refine_with_floor(xyz[:10], prior) is prior
     d = est.to_dict()
     assert GravityEstimate.from_dict(d).floor_inliers == est.floor_inliers
     assert est.confidence > prior.confidence

@@ -1,5 +1,5 @@
 """Map scene export (OpenLABEL, map frame) for ``-t full`` / ``-t single``, the PLY payloads
-(derived with the point-cloud attributes by ``segmentation.cloud``), and the read-only access of
+(derived with the point-cloud attributes by ``reconstruction.cloud``), and the read-only access of
 ``mapper.sh locate`` and ``view.sh -m`` to a persisted map."""
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.ply import PointCloud, read_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.objects import ObjectState, load_state
+from oh_my_slam.reconstruction.cloud import MapCloudSource, cloud_ply
 from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.api import SceneObject
-from oh_my_slam.segmentation.cloud import MapCloudSource, cloud_ply, map_cloud_source
+from oh_my_slam.segmentation.api import SceneObject, map_cloud_source
 from oh_my_slam.segmentation.scene import objects_block, ontology_labels
 
 Json = dict[str, Any]

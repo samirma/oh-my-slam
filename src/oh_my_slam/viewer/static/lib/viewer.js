@@ -28,7 +28,8 @@ const HOME_CAMERA_REACH = 2;
 const VIEW_EPS = 1e-6;
 export const GROUPS = ['points', 'segments', 'cameras', 'obbs', 'labels'];
 
-function differs(a, b) {
+// whether two matrices differ beyond VIEW_EPS in any element
+export function differs(a, b) {
   const x = a.elements, y = b.elements;
   for (let i = 0; i < 16; i++) if (Math.abs(x[i] - y[i]) > VIEW_EPS) return true;
   return false;
@@ -301,7 +302,7 @@ export class Viewer {
     if (this._labelsDirty) {
       this._labelsDirty = false;
       const crowded = this.labels.layout(this.camera, this.host.clientWidth, this.host.clientHeight,
-        (g) => this.layers[g] && (g !== 'cameras' || this.layers.labels));
+        (g) => this.layers[g]);
       for (const cb of this._crowdedListeners) cb(crowded);
     }
     if (this._redraw > 0) {

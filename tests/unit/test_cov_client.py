@@ -22,15 +22,19 @@ from PIL import Image
 from oh_my_slam.client import client as client_mod
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient
-from oh_my_slam.core import timing
+from oh_my_slam.core import paths, timing
 from oh_my_slam.core.errors import (
     ExitCode,
     InferenceError,
     InputError,
     ServerBusyError,
+    ServerLoadingError,
     ServerModelsFailedError,
+    ServerProtocolError,
+    ServerStoppingError,
     ServerUnavailableError,
 )
+from oh_my_slam.version import PROTOCOL_VERSION
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -66,10 +70,10 @@ def health(status: str, **models: str | None) -> Handler:
     return lambda req: httpx.Response(200, json=body)
 
 
-def test_the_client_closes_its_connection_on_exit(sock: Path) -> None:
-    with served(sock, health("ready")) as client:
-        assert client.health().status == "ready"
-        assert client._client is not None
+def test_closing_the_client_closes_its_connection(sock: Path) -> None:
+    client = served(sock, health("ready"))
+    assert client.health().status == "ready" and client._client is not None
+    client.close()
     assert client._client is None
     client.close()  # closing again is harmless
 
@@ -134,19 +138,45 @@ def test_ready_waits_for_a_loading_server(sock: Path, clock: Clock) -> None:
 
 
 def test_the_wait_for_a_loading_server_is_bounded(sock: Path, clock: Clock) -> None:
-    with pytest.raises(ServerUnavailableError, match="server status 'loading'"):
+    """Still loading after the wait: its own message (not "not running"), saying how long it
+    waited, what to run and where the progress is; exit 3."""
+    with pytest.raises(ServerLoadingError) as err:
         served(sock, health("loading")).require_ready(wait_loading_s=3.0)
     assert clock.sleeps == [1.0, 1.0, 1.0]
+    msg = str(err.value)
+    assert msg.startswith("inference server is still loading its models after 3 s")
+    assert "./start_inference_server.sh" in msg and str(paths.server_log()) in msg
+    assert "not running" not in msg and err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
-def test_a_stopping_server_is_unavailable(sock: Path) -> None:
-    with pytest.raises(ServerUnavailableError, match="server status 'stopping'"):
+def test_a_stopping_server_has_its_own_message(sock: Path) -> None:
+    with pytest.raises(ServerStoppingError) as err:
         served(sock, health("stopping")).require_ready()
+    msg = str(err.value)
+    assert msg.startswith("inference server is stopping — start it again with "
+                          "./start_inference_server.sh")
+    assert "not running" not in msg and err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
 def test_failed_models_without_detail_are_still_actionable(sock: Path) -> None:
     with pytest.raises(ServerModelsFailedError, match=r"models failed to load \(no detail\)"):
         served(sock, health("error", geometry=None)).require_ready()
+
+
+@pytest.mark.parametrize("status", ["ready", "loading"])
+def test_a_server_of_another_protocol_says_how_to_restart_it(sock: Path, status: str) -> None:
+    """A server started before an upgrade (its health's ``protocol`` is not this code's) would
+    refuse or misread the requests (an HTTP 422, once an internal error, exit 1): exit 3 with the
+    restart command, before any request and without waiting for it to load."""
+    old = PROTOCOL_VERSION + 1
+    body = p.Health(status=status, protocol=old).model_dump()  # type: ignore[arg-type]
+    with pytest.raises(ServerProtocolError) as err:
+        served(sock, lambda req: httpx.Response(200, json=body)).require_ready()
+    assert str(err.value) == (
+        f"the running inference server speaks protocol {old}, this version needs "
+        f"{PROTOCOL_VERSION} (it was started before an upgrade) — restart it with "
+        "./start_inference_server.sh --stop && ./start_inference_server.sh")
+    assert err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
 def test_requests_need_the_socket(tmp_path: Path, image: Path) -> None:
@@ -233,10 +263,18 @@ def test_multiview_without_known_intrinsics_sends_none(sock: Path, image: Path) 
     assert seen[0]["intrinsics"] is None and seen[0]["image_paths"] == [str(image)] * 2
 
 
-def test_connect_shares_one_client_and_checks_the_server_only_when_required(
+def test_connect_shares_one_client_and_checks_the_server_each_time(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client_mod, "_shared", None)
-    first = client_mod.connect(require=False)  # no server in this session: not checked
-    assert client_mod.connect(require=False) is first
     with pytest.raises(ServerUnavailableError):
-        client_mod.connect()
+        client_mod.connect()  # no server in this session: exit 3
+    first = client_mod._shared
+    checked: list[InferenceClient] = []
+
+    def ready(self: InferenceClient) -> p.Health:
+        checked.append(self)
+        return p.Health(status="ready")
+
+    monkeypatch.setattr(InferenceClient, "require_ready", ready)
+    assert client_mod.connect() is first and client_mod.connect() is first
+    assert checked == [first, first]

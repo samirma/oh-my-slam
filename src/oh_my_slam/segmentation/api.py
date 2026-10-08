@@ -4,9 +4,11 @@
 ``label`` PLYs) and ``view.sh -i``; ``detect_alongside``, ``lift_detections`` and ``trim_support``
 serve the mapper (detections of a keyframe while the mapper's own reconstruction call runs;
 instances in map coordinates, without the support their masks bled onto), ``fit_object_obb`` fits
-the boxes of both. Emitted clouds are derived in ``segmentation.cloud``, the segmented image in
-``segmentation.render``. Other packages use segmentation through this module (and ``cloud``,
-``scene``, ``render``, ``artifacts``), never its internals (import-linter contract).
+the boxes of both. Emitted clouds are derived by the reconstruction code (``reconstruction.cloud``,
+spec §4); ``image_cloud_source`` and ``map_cloud_source`` give it the point labels and the colour
+assignment it applies (``POINT_COLORS``). The segmented image is ``segmentation.render``'s. Other
+packages use segmentation through this module (and ``scene``, ``render``, ``catalog``,
+``artifacts``), never its internals (import-linter contract).
 """
 
 from __future__ import annotations
@@ -28,10 +30,22 @@ from oh_my_slam.reconstruction.api import (
     FrameReconstruction,
     reconstruct_image,
 )
+from oh_my_slam.reconstruction.cloud import (
+    ImageCloudSource,
+    MapCloudSource,
+    PointColors,
+    source_of_frame,
+    source_of_points,
+)
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
 from oh_my_slam.segmentation.colors import UNSEGMENTED as UNSEGMENTED
-from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
+from oh_my_slam.segmentation.colors import (
+    color_for_id,
+    color_hex_for_id,
+    height_colors,
+    segment_colors,
+)
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
     claim_order,
@@ -93,8 +107,7 @@ def join_instances(pieces: list[LiftedInstance]) -> LiftedInstance:
            float(boxes[:, 3].max()))
     det = Detection(best.detection.label, best.detection.score, best.detection.source, mask, box)
     lifted = Lifted(np.concatenate([p.lifted.points for p in pieces]),
-                    np.concatenate([p.lifted.pixels for p in pieces]),
-                    sum(p.lifted.mask_pixels for p in pieces))
+                    np.concatenate([p.lifted.pixels for p in pieces]))
     return LiftedInstance(det, mask, lifted)
 
 
@@ -104,7 +117,6 @@ class FrameSegmentation:
     objects: list[SceneObject]
     label_map: NDArray[np.int32]  # object id per grid pixel (0 = none), exclusive masks
     point_pixels: dict[int, NDArray[np.int64]]  # lifted pixel indices per object id
-    points: dict[int, NDArray[np.float64]]  # lifted points per object id (camera frame)
 
     def point_labels(self) -> NDArray[np.int32]:
         """Object id per grid pixel for the pixels lifted into an object's points, 0 elsewhere
@@ -114,6 +126,34 @@ class FrameSegmentation:
         for oid, pix in self.point_pixels.items():
             flat[pix] = oid
         return out
+
+
+# The colour assignment of the emitted clouds (spec §2.4 colour contract): the object colour of
+# each point's id (unsegmented grey for 0) and the color=height ramp. Point clouds are derived by
+# the reconstruction code, which applies these and owns none of them.
+POINT_COLORS = PointColors(segment=segment_colors, height=height_colors)
+LABEL_CHUNK = 1 << 18  # point labels restricted per step: a map's temporaries stay small
+
+
+def image_cloud_source(frame: FrameReconstruction, seg: FrameSegmentation | None = None
+                       ) -> ImageCloudSource:
+    """Cloud source of one reconstructed image with segmentation's colours; with ``seg`` its
+    pixels carry the id of the object whose points they became (``point_labels``)."""
+    return source_of_frame(frame, POINT_COLORS, None if seg is None else seg.point_labels())
+
+
+def map_cloud_source(xyz: NDArray[Any], rgb: NDArray[np.uint8], labels: NDArray[Any] | None,
+                     object_ids: set[int], viewpoints: NDArray[Any]) -> MapCloudSource:
+    """Cloud source of a map with segmentation's colours; point labels of objects not in
+    ``object_ids`` become 0 (unsegmented)."""
+    lab = None
+    if labels is not None:
+        given, ids = np.asarray(labels, np.int32).reshape(-1), sorted(object_ids)
+        lab = np.empty(len(given), np.int32)
+        for s in range(0, len(given), LABEL_CHUNK):  # temporaries of one chunk only
+            part = given[s:s + LABEL_CHUNK]
+            lab[s:s + LABEL_CHUNK] = np.where(np.isin(part, ids), part, 0)
+    return source_of_points(xyz, rgb, lab, viewpoints, POINT_COLORS)
 
 
 def pixel_owners(dets: list[Detection], shape: tuple[int, int]) -> NDArray[np.int32]:
@@ -144,7 +184,7 @@ def trim_support(inst: LiftedInstance, depth: NDArray[Any], K: Intrinsics, valid
         return inst
     keep = ~drop.reshape(-1)[inst.lifted.pixels]
     mask = inst.mask & ~drop
-    lifted = Lifted(inst.lifted.points[keep], inst.lifted.pixels[keep], int(mask.sum()))
+    lifted = Lifted(inst.lifted.points[keep], inst.lifted.pixels[keep])
     return LiftedInstance(inst.detection, mask, lifted)
 
 
@@ -226,7 +266,6 @@ def segment_frame(
     label_map = np.zeros(frame.depth.shape, np.int32)
     objects: list[SceneObject] = []
     point_pixels: dict[int, NDArray[np.int64]] = {}
-    points: dict[int, NDArray[np.float64]] = {}
     for oid, inst in enumerate(instances, start=1):
         box = fit_object_obb(inst.lifted.points, inst.detection.label, up, floor)
         label_map[inst.mask] = oid
@@ -235,8 +274,7 @@ def segment_frame(
             pixel_count=int(inst.mask.sum()), point_count=len(inst.lifted.points), frames=[0],
         ))
         point_pixels[oid] = inst.lifted.pixels
-        points[oid] = inst.lifted.points
-    return FrameSegmentation(frame, objects, label_map, point_pixels, points)
+    return FrameSegmentation(frame, objects, label_map, point_pixels)
 
 
 def detect_alongside(

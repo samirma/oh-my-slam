@@ -35,8 +35,6 @@ def test_reconstruct_image_model_intrinsics_and_gravity(scene) -> None:  # type:
     true_up = pose.R.T @ np.array([0.0, 0.0, 1.0])
     assert angle_between_deg(f.gravity.up_cam, true_up) < 1.0
     assert f.descriptor is not None
-    cloud, idx = f.camera_cloud()
-    np.testing.assert_array_equal(cloud.rgb, f.rgb.reshape(-1, 3)[idx])
     assert client.calls["geometry"] == 1 and client.calls["gravity"] == 1
 
 

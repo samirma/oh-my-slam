@@ -8,19 +8,18 @@ Routes (GET/HEAD only; anything else is 405):
 * ``/api/meta`` — JSON: mode, title, display transform, the cameras of the scene JSON (pose
   ``T``, centre ``position`` in the scene frame, intrinsics, image name), the point-cloud controls
   (from ``core.cloud_attrs``) and their defaults.
-* ``/api/scene`` — the OpenLABEL scene JSON; ``/api/catalog`` — the catalogue rows (JSON);
-  ``/api/segmented.png`` — the segmented image (``view.sh -i`` only).
+* ``/api/scene`` — the OpenLABEL scene JSON; ``/api/catalog`` — the catalogue rows (JSON) and
+  ``/api/segmented.png`` — the segmented image (``view.sh -i`` only: 404 for a map).
 * ``/api/cloud?key=value&…`` — the point cloud derived with those §2.2 attributes (keys not given
   keep their defaults; ``label`` and ``encoding`` concern PLY files only and are refused). Invalid
   input is a 400 with ``{"error": "<actionable message>"}``. The 200 body is one binary document
-  (see :func:`cloud_payload`), sent straight from the cloud's arrays (:class:`CloudDocument`):
+  (see :func:`cloud_document`), sent straight from the cloud's arrays (:class:`CloudDocument`):
   no copy of a cloud is ever assembled in memory.
 """
 
 from __future__ import annotations
 
 import json
-import mimetypes
 import struct
 import threading
 from collections import OrderedDict
@@ -35,14 +34,12 @@ import numpy as np
 
 from oh_my_slam.core.errors import UsageError
 from oh_my_slam.core.log import get_logger
+from oh_my_slam.core.static import find_static
 from oh_my_slam.viewer.bundle import DisplayCloud, ViewBundle
 
 log = get_logger("oh_my_slam.viewer")
 
 STATIC = Path(str(resources.files("oh_my_slam.viewer") / "static"))
-_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
-          ".json": "application/json", ".png": "image/png", ".txt": "text/plain",
-          ".md": "text/plain"}
 CLOUD_CACHE = 3  # recent clouds kept (e.g. toggling a control back and forth) …
 CLOUD_CACHE_BYTES = 256_000_000  # … whose own arrays hold this many bytes (the latest one always;
 # arrays shared with the source, as in a map's complete cloud, cost nothing and do not count)
@@ -78,24 +75,34 @@ def _text(status: int, text: bytes) -> Response:
 
 @dataclass(frozen=True)
 class CloudDocument:
-    """One cloud document (see :func:`cloud_payload`) as the pieces it is sent in: the
+    """One cloud document (see :func:`cloud_document`) as the pieces it is sent in: the
     length-prefixed header, then every buffer (a read-only byte view of the cloud's array, not a
     copy) and its padding."""
 
     pieces: tuple[bytes | memoryview, ...]
     size: int  # bytes of the whole document
     owned_bytes: int  # memory it keeps beyond the cloud source (see ``DisplayCloud.owned_bytes``)
-    # how long the derivation took: sent as a ``Server-Timing`` header, never in the body, so two
-    # identical requests get byte-identical documents
-    seconds: float = 0.0
 
     def tobytes(self) -> bytes:
         return b"".join(self.pieces)
 
 
 def cloud_document(dc: DisplayCloud, attrs: str) -> CloudDocument:
-    """The binary cloud document of ``dc`` (see :func:`cloud_payload`), without copying its
-    arrays."""
+    """The binary cloud document of ``dc``, without copying its arrays: ``uint32`` little-endian
+    length ``J`` of a UTF-8 JSON header, the header (space-padded so that ``4 + J`` is a multiple
+    of 4), then the buffers, each starting on a 4-byte boundary at ``4 + J + offset``. The
+    header::
+
+        {"count": n, "total": n0, "voxel": e, "attrs": "color=rgb,…",
+         "buffers": [{"name", "type", "size", "offset", "bytes"}, …]}
+
+    ``count`` points are shown out of ``total`` derived (the §2.5 display budget): one per occupied
+    voxel of edge ``voxel`` metres; with ``voxel`` 0 all of them, or, above the budget, every finite
+    one or one per distinct position. Buffers, little-endian,
+    ``size`` components per point: ``position`` float32 x 3 (always), ``color`` uint8 x 3 (sRGB;
+    absent for ``color=none``), ``label`` int32 x 1 (object id, 0 = unsegmented), ``normal``
+    float32 x 3 (``normals=on``). The document depends only on the cloud and its attributes, so
+    identical requests get identical bytes."""
     c = dc.cloud
     parts: list[tuple[str, str, int, Any]] = [("position", "float32", 3, c.xyz)]
     if c.rgb is not None:
@@ -117,31 +124,11 @@ def cloud_document(dc: DisplayCloud, attrs: str) -> CloudDocument:
                          "buffers": buffers}).encode()
     header += b" " * (-(4 + len(header)) % 4)
     head = struct.pack("<I", len(header)) + header
-    return CloudDocument((head, *pieces), len(head) + offset,
-                         offset if dc.owned_bytes is None else dc.owned_bytes, dc.seconds)
-
-
-def cloud_payload(dc: DisplayCloud, attrs: str) -> bytes:
-    """Binary cloud document: ``uint32`` little-endian length ``J`` of a UTF-8 JSON header, the
-    header (space-padded so that ``4 + J`` is a multiple of 4), then the buffers, each starting on
-    a 4-byte boundary at ``4 + J + offset``. The header::
-
-        {"count": n, "total": n0, "voxel": e, "attrs": "color=rgb,…",
-         "buffers": [{"name", "type", "size", "offset", "bytes"}, …]}
-
-    ``count`` points are shown out of ``total`` derived: all of them when ``voxel`` is 0, else one
-    per occupied voxel of edge ``voxel`` metres (the §2.5 display budget). Buffers, little-endian,
-    ``size`` components per point: ``position`` float32 x 3 (always), ``color`` uint8 x 3 (sRGB;
-    absent for ``color=none``), ``label`` int32 x 1 (object id, 0 = unsegmented), ``normal``
-    float32 x 3 (``normals=on``). The document depends only on the cloud and its attributes, so
-    identical requests get identical bytes; ``/api/cloud`` sends the derivation time in its
-    ``Server-Timing`` header (``derive;dur=<ms>``). The server sends the same bytes piece by
-    piece (:func:`cloud_document`)."""
-    return cloud_document(dc, attrs).tobytes()
+    return CloudDocument((head, *pieces), len(head) + offset, dc.owned_bytes)
 
 
 def parse_cloud_payload(body: bytes) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Inverse of :func:`cloud_payload` (for tests and tools): the header and the arrays."""
+    """Inverse of :func:`cloud_document` (for tests and tools): the header and the arrays."""
     (n,) = struct.unpack_from("<I", body)
     header = json.loads(body[4:4 + n])
     base = 4 + n
@@ -156,14 +143,10 @@ def parse_cloud_payload(body: bytes) -> tuple[dict[str, Any], dict[str, np.ndarr
 def static_file(rel: str) -> Response:
     """A file of the page's ``static`` folder (scripts, styles, vendored libraries); 404 for
     anything outside it."""
-    try:
-        target = (STATIC / Path(rel)).resolve()
-    except (ValueError, OSError):  # e.g. an embedded NUL byte
+    found = find_static(STATIC, rel)
+    if found is None:
         return _text(404, b"not found")
-    if STATIC.resolve() not in target.parents or not target.is_file():
-        return _text(404, b"not found")
-    ctype = _TYPES.get(target.suffix) or mimetypes.guess_type(target.name)[0] \
-        or "application/octet-stream"
+    target, ctype = found
     return Response.of(200, ctype, (target.read_bytes(),))
 
 
@@ -176,8 +159,9 @@ class ViewerRoutes:
         self._json: dict[str, Callable[[], Any]] = {
             "/api/meta": bundle.meta,
             "/api/scene": lambda: bundle.scene,
-            "/api/catalog": lambda: bundle.catalog,
         }
+        if bundle.catalog is not None:  # an image's (spec §2.5); a map has none: 404
+            self._json["/api/catalog"] = lambda: bundle.catalog
         self._cache: dict[str, bytes] = {}
         self._clouds: OrderedDict[str, CloudDocument] = OrderedDict()
         self._lock = threading.Lock()
@@ -221,9 +205,7 @@ class ViewerRoutes:
                     doc = self.cloud(query)
                 except (UsageError, ValueError) as exc:  # bad attributes, or not derivable
                     return _error(400, str(exc))
-                r = Response.of(200, "application/octet-stream", doc.pieces, doc.size)
-                timing = ("Server-Timing", f"derive;dur={doc.seconds * 1000:.1f}")
-                return Response(r.status, (*r.headers, timing), r.body)
+                return Response.of(200, "application/octet-stream", doc.pieces, doc.size)
             if path == "/api/segmented.png" and self.bundle.segmented_png is not None:
                 return Response.of(200, "image/png", (self.bundle.segmented_png,))
             if path.startswith("/static/"):

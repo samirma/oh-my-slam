@@ -55,7 +55,7 @@ def resolve_inputs(args: list[Path]) -> InputSpec:
             raise InputError(f"input not found: {a}")
         if a.is_dir():
             raise InputError(f"{a} is a folder; -i takes image files (e.g. {a}/*.jpg) or a video")
-        if a.suffix.lower() in IMAGE_SUFFIXES and not a.name.startswith("."):
+        if a.suffix.lower() in IMAGE_SUFFIXES:
             images.append(a)
         else:
             raise InputError(f"unsupported input (not an image or video): {a}")

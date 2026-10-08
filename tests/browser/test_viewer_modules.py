@@ -15,7 +15,7 @@ import pytest
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.cloud import map_cloud_source
+from oh_my_slam.segmentation.api import map_cloud_source
 from oh_my_slam.segmentation.colors import color_for_id, color_hex_for_id
 from oh_my_slam.viewer.bundle import ViewBundle
 from tests.browser.conftest import View
@@ -67,7 +67,7 @@ def over_budget(browser: Any) -> Iterator[View]:
     """A 5000-point map with a display budget of 1000 points, served as view.sh serves it."""
     xyz, rgb, labels = cloud()
     source = map_cloud_source(xyz, rgb, labels, {1, 2}, np.array([[0.0, -3.0, 1.5]]))
-    bundle = ViewBundle(mode="map", title="modules", scene=scene_doc(), source=source, catalog=[],
+    bundle = ViewBundle(mode="map", title="modules", scene=scene_doc(), source=source,
                         point_budget=BUDGET)
     with running(bundle) as url:
         v = View(browser, bundle, url)
@@ -112,11 +112,13 @@ def test_display_budget_notice(over_budget: View) -> None:
 
 
 def test_budget_note_without_a_grid(over_budget: View) -> None:
-    """Points omitted with no grid (edge 0: duplicates or non-finite points) are not described
-    as a "0.00 mm" voxel; a complete cloud has no notice."""
+    """Points omitted with no grid (edge 0: every finite point, or one per distinct position) are
+    not described as a "0.00 mm" voxel, nor as one per distinct position when only non-finite
+    points were dropped: the notice names both reasons; a complete cloud has no notice."""
     v = over_budget
     note = module(v, "controls.js", "return m.budgetNote({count: 5, total: 7, voxel: 0});")
-    assert note.startswith("Showing 5 of 7 points: one per distinct position") and "mm" not in note
+    assert note.startswith("Showing 5 of 7 points: no voxel grid (edge 0); each omitted point has "
+                           "a non-finite coordinate or repeats a shown position") and "mm" not in note
     assert module(v, "controls.js", "return m.budgetNote({count: 7, total: 7, voxel: 0});") == ""
 
 

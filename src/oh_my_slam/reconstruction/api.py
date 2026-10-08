@@ -22,10 +22,9 @@ from oh_my_slam.client.images import remember_rgb, request_rgb
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.images import exif_intrinsics
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.core.ply import PointCloud
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.gravity import GravityEstimate, refine_with_floor
-from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE, frame_cloud, pixel_mask
+from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE, pixel_mask, pixel_points
 
 log = get_logger("oh_my_slam.reconstruction")
 
@@ -49,14 +48,11 @@ class FrameReconstruction:
     def grid_size(self) -> tuple[int, int]:
         return self.depth.shape[1], self.depth.shape[0]
 
-    def camera_cloud(self) -> tuple[PointCloud, NDArray[Any]]:
-        """Coloured points in the camera frame (OpenCV axes, metres) with the default pixel
-        selection, and their pixel indices."""
-        return frame_cloud(self.depth, self.rgb, self.K_grid, pixel_mask(self.depth, self.valid))
-
 
 def connect_server() -> InferenceClient:
-    """The inference client for callers that delegate inference to reconstruction (mapper)."""
+    """The inference client, once the server is ready (``client.connect``; exit 3 otherwise):
+    how every command connects. Mapping and the viewer may not import the client (import-linter),
+    so they reach it here, through the owner of depth."""
     return connect()
 
 
@@ -133,24 +129,18 @@ def reconstruct_image(
     return frame
 
 
-def estimate_gravity(frame: FrameReconstruction, client: InferenceClient | None = None,
-                     refine: bool = True) -> GravityEstimate:
+def estimate_gravity(frame: FrameReconstruction, client: InferenceClient) -> GravityEstimate:
+    """GeoCalib's gravity for ``frame``, refined with the floor plane of its camera-frame points
+    (the default pixel selection, as float32 like an emitted cloud's)."""
     with timing.part("gravity"):
-        return _estimate_gravity(frame, client or connect(), refine)
-
-
-def _estimate_gravity(frame: FrameReconstruction, client: InferenceClient,
-                      refine: bool) -> GravityEstimate:
-    gr = client.gravity(p.GravityRequest(image_path=str(frame.image_path),
-                                         focal_px=frame.intrinsics.fx))
-    prior = GravityEstimate(
-        up_cam=np.asarray(gr.up_cam, dtype=np.float64),
-        source="geocalib",
-        roll_unc_deg=gr.roll_unc_deg,
-        pitch_unc_deg=gr.pitch_unc_deg,
-    )
-    frame.meta["geocalib_focal_px"] = gr.focal_px
-    if not refine:
-        return prior
-    cloud, _ = frame.camera_cloud()
-    return refine_with_floor(cloud.xyz, prior)
+        gr = client.gravity(p.GravityRequest(image_path=str(frame.image_path),
+                                             focal_px=frame.intrinsics.fx))
+        prior = GravityEstimate(
+            up_cam=np.asarray(gr.up_cam, dtype=np.float64),
+            source="geocalib",
+            roll_unc_deg=gr.roll_unc_deg,
+            pitch_unc_deg=gr.pitch_unc_deg,
+        )
+        frame.meta["geocalib_focal_px"] = gr.focal_px
+        pts, _ = pixel_points(frame.depth, frame.K_grid, pixel_mask(frame.depth, frame.valid))
+        return refine_with_floor(pts.astype(np.float32), prior)

@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -146,8 +147,10 @@ def test_view_map_serves_without_server(tmp_path: Path, overlay: bool) -> None:
         assert json.loads(fetch(url + "api/meta"))["mode"] == "map"
         head, arrays = parse_cloud_payload(fetch(url + "api/cloud?voxel=0.1&normals=on"))
         assert head["count"] == 0 and arrays["position"].shape == (0, 3)
-        for path in ("api/scene", "api/catalog"):
-            fetch(url + path)
+        fetch(url + "api/scene")
+        with pytest.raises(urllib.error.HTTPError) as e:  # an image's only (spec §2.5)
+            fetch(url + "api/catalog")
+        assert e.value.code == 404
     finally:
         out = stop_view(proc)
     assert out == b""

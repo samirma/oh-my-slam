@@ -17,7 +17,7 @@ def write_artifacts(
     segmented_png: bytes,
     objects: list[SceneObject],
     title: str,
-) -> list[Path]:
+) -> None:
     """Write exactly the four artefacts; ``scene_json`` and ``segmented_png`` are the exact bytes
     ``-f json`` and ``-f png`` output for the same run."""
     out_dir = Path(out_dir)
@@ -26,4 +26,3 @@ def write_artifacts(
     atomic_write_bytes(out_dir / "segmented.png", segmented_png)
     atomic_write_text(out_dir / "catalog.csv", catalog_csv(objects))
     atomic_write_text(out_dir / "catalog.md", catalog_md(objects, title))
-    return [out_dir / n for n in ARTIFACT_NAMES]

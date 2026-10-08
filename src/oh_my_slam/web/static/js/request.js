@@ -17,7 +17,22 @@ const STATE_TEXT = {
   failed: 'Failed', interrupted: 'Interrupted',
 };
 
-function sameCommand(a, b) { return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]); }
+export function sameCommand(a, b) { return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]); }
+
+// This page's request among the service's requests in progress (its health's `in_progress`): the
+// entry with its command line, and of identical requests the one that arrived nearest to
+// `sentAt`; null when none is listed.
+export function ownEntry(inProgress, command, sentAt) {
+  const mine = inProgress.filter((e) => sameCommand(e.command, command));
+  if (!mine.length) return null;
+  return mine.reduce((a, b) => (Math.abs(b.arrived_at - sentAt) < Math.abs(a.arrived_at - sentAt) ? b : a));
+}
+
+// What an ended request says of its wait for its turn: `waited` seconds, exactly or at least
+// (`exact`); '' below a second.
+export function waitedNote(waited, exact) {
+  return waited >= 1 ? `including ${exact ? '' : 'at least '}${fmtSeconds(waited)} waiting for its turn` : '';
+}
 
 // What interrupting a request of `op` leaves behind, in the commands' terms.
 export function interruptConsequence(op) {
@@ -111,9 +126,8 @@ export class RequestView {
   // nearest to when this one was sent).
   track() {
     if (!this.inFlight) return;
-    const mine = store.inProgress.filter((e) => sameCommand(e.command, this.command));
-    if (!mine.length) return;
-    const e = mine.reduce((a, b) => (Math.abs(b.arrived_at - this.sentAt) < Math.abs(a.arrived_at - this.sentAt) ? b : a));
+    const e = ownEntry(store.inProgress, this.command, this.sentAt);
+    if (!e) return;
     if (e.state === 'running' && e.started_at) { this.waited = Math.max(0, e.started_at - e.arrived_at); this.waitedExact = true; }
     if (e.state !== 'running') this.seenWaiting = (performance.now() - this.t0) / 1000;
     this.setState(e.state === 'running' ? 'running' : 'waiting');
@@ -144,9 +158,7 @@ export class RequestView {
     this.setState(state);
     this.clock.textContent = `${state === 'done' ? 'in' : 'after'} ${fmtSeconds(total)}`;
     // it started between the last time it was seen waiting and its end: at least that long waiting
-    const waited = this.waitedExact ? this.waited : this.seenWaiting;
-    this.waitNote.textContent = waited >= 1
-      ? `including ${this.waitedExact ? '' : 'at least '}${fmtSeconds(waited)} waiting for its turn` : '';
+    this.waitNote.textContent = waitedNote(this.waitedExact ? this.waited : this.seenWaiting, this.waitedExact);
     this.controller = null;
     this.cancelBtn.remove();
     this.belongs.remove();

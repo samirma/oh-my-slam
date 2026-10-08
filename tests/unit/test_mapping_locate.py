@@ -32,10 +32,10 @@ from oh_my_slam.mapping.locate import (
     resolve_images,
     visible_points,
 )
+from oh_my_slam.reconstruction.cloud import MAP_FRAME
 from oh_my_slam.schema.validate import validation_errors
-from oh_my_slam.segmentation.cloud import MAP_FRAME
 from tests.fakes.client import FakeClient, FakeFrame
-from tests.mapsnap import snapshot
+from tests.mapsnap import full_tree_hash, snapshot, with_committed_overlay
 from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.synth.scene import Room
 
@@ -100,9 +100,9 @@ def world(tmp_path_factory: pytest.TempPathFactory):  # type: ignore[no-untyped-
 
 @needs_colmap
 def test_located_poses_match_the_truth_and_the_map_is_untouched(world) -> None:  # type: ignore[no-untyped-def]
-    before, hashed = snapshot(world.map), store.full_tree_hash(world.map)
+    before, hashed = snapshot(world.map), full_tree_hash(world.map)
     res = run(world.map, world.imgs_b)  # defaults: json, single
-    assert snapshot(world.map) == before and store.full_tree_hash(world.map) == hashed
+    assert snapshot(world.map) == before and full_tree_hash(world.map) == hashed
     assert not (world.map / store.STAGING).exists()
     assert [r.located for r in res.results] == [True] * len(world.imgs_b), \
         [r.reason for r in res.results]
@@ -130,6 +130,21 @@ def test_located_poses_match_the_truth_and_the_map_is_untouched(world) -> None: 
         assert abs(fx - 300.0) < 0.03 * 300.0  # the map camera's refined focal (true 300 px)
     assert {"setup", "features_matching", "pose", "export"} <= set(res.timings["stages_s"])
     assert res.timings["counts"]["located"] == len(world.imgs_b)
+
+
+@needs_colmap
+def test_locate_leaves_a_committed_staging_overlay_unchanged(  # type: ignore[no-untyped-def]
+        world, tmp_path: Path) -> None:
+    """Spec §2.3, "nothing in the map folder (including ``.staging/``) changes": a map whose last
+    update was killed after its commit point is read through the overlay; ``locate`` neither
+    rolls the committed update forward nor discards it, whatever the scope and format."""
+    mdir = with_committed_overlay(world.map, tmp_path / "overlaid")
+    before = snapshot(mdir)
+    for mode, fmt in (("single", "json"), ("full", "ply")):
+        res = run(mdir, world.imgs_b[:2], mode=mode, fmt=fmt)
+        assert all(r.located for r in res.results), [r.reason for r in res.results]
+        assert snapshot(mdir) == before, (mode, fmt)
+    assert (mdir / store.STAGING / store.COMMIT).exists()
 
 
 @needs_colmap
@@ -483,6 +498,9 @@ def test_inputs_map_folder_and_output_rules(tmp_path: Path) -> None:
     video = tmp_path / "v.mp4"
     video.write_bytes(b"x")
     assert resolve_images([img]) == [img]
+    hidden = tmp_path / ".hidden.jpg"  # named explicitly: hidden files are no exception
+    hidden.write_bytes(b"x")
+    assert resolve_images([hidden, img]) == [hidden, img]
     with pytest.raises(UsageError, match="video"):
         resolve_images([img, video])
     with pytest.raises(InputError, match="not found"):
@@ -529,6 +547,19 @@ def test_visible_points_frustum_and_occlusion() -> None:
     vis2 = visible_points(xyz, [(T, K), (T2, K)])
     assert vis2[len(wall)]
     assert not visible_points(xyz, []).any()
+
+
+def test_a_lens_sees_points_beyond_its_pinhole() -> None:
+    """A camera with barrel distortion (examples/camera's lens: k -0.524 at 1392 px over 1920 px)
+    sees 42.6° to either side, where the pinhole of its focal length sees 34.6°: a point 40° off
+    the axis is visible, one 45° off is not."""
+    lens = Intrinsics(1392.0, 1392.0, 960.0, 444.0, 1920, 888, "colmap", -0.524)
+    pts = np.array([[np.tan(np.radians(a)) * 3.0, 0.0, 3.0] for a in (0.0, 40.0, -40.0, 45.0)])
+    vis = visible_points(pts, [(Pose.identity(), lens)])
+    np.testing.assert_array_equal(vis, [True, True, True, False])
+    pinhole = Intrinsics(1392.0, 1392.0, 960.0, 444.0, 1920, 888)
+    np.testing.assert_array_equal(visible_points(pts, [(Pose.identity(), pinhole)]),
+                                  [True, False, False, False])
 
 
 def _fake_reader(n: int, tmp_path: Path) -> SimpleNamespace:
@@ -676,7 +707,7 @@ def test_gate_refines_a_centre_error_seen_from_the_keyframes_spot() -> None:
     T = _worst_shift(lmod, K, truth, matches, points.frames, 0.03)
     med, n = lmod.match_residual_deg(T, K, matches, points.frames)
     assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
-    assert lmod.rotation_dominant(T, matches, points)
+    assert lmod._viewpoint(T, matches, points)[0]
     T2, med2, ok = _gate(w, T)
     assert ok and med2 <= lmod.MAX_EPIPOLAR_DEG, med2
     assert rot_err_deg(T2, truth) < 0.15 and np.linalg.norm(T2.t - truth.t) < 0.03
@@ -740,7 +771,7 @@ def test_gate_keeps_the_limit_for_well_baselined_keyframes() -> None:
     T = _worst_shift(lmod, K, truth, matches, points.frames, 0.15)
     med, n = lmod.match_residual_deg(T, K, matches, points.frames)
     assert n >= lmod.EPIPOLAR_MIN_MATCHES and med > lmod.MAX_EPIPOLAR_DEG
-    assert not lmod.rotation_dominant(T, matches, points)
+    assert not lmod._viewpoint(T, matches, points)[0]
     T2, med2, ok = _gate(w, T)
     assert not ok and T2 is T and med2 == med
     assert _gate(w, truth)[2]

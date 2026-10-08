@@ -34,6 +34,7 @@ class StandIn:
 
     made: ClassVar[list[StandIn]] = []
     values: ClassVar[list[float]] = []
+    extra: ClassVar[dict[str, float]] = {}  # more metrics, recorded by every run
 
     def __init__(self, out: Path, runner: Runner, probe: BrowserProbe, street2: Path) -> None:
         self.out, self.runner, self.probe, self.street2 = out, runner, probe, street2
@@ -42,11 +43,13 @@ class StandIn:
 
     def run_all(self) -> None:
         self.metrics.add("perf.a.wall_s", StandIn.values.pop(0))
+        for k, v in StandIn.extra.items():
+            self.metrics.add(k, v)
 
 
 @pytest.fixture
 def stand_in(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> type[StandIn]:
-    StandIn.made, StandIn.values = [], []
+    StandIn.made, StandIn.values, StandIn.extra = [], [], {}
     monkeypatch.setattr(cli, "Evaluation", StandIn)
     monkeypatch.setattr(cli, "environment", lambda repo: {"commit": "abc", "dirty": False})
     monkeypatch.setattr(cli, "DATA", tmp_path / "data")
@@ -62,9 +65,10 @@ def test_a_run_is_judged_written_and_can_become_the_baseline(
     first = tmp_path / "run1"
     assert cli.main(["--out", str(first), *args, "--set-baseline"]) == 0
     out, err = capsys.readouterr()
-    assert out.strip() == str(first / "summary.md")
+    assert out == ""  # spec §4: the path of summary.md goes to stderr, stdout stays empty
     assert f"evaluate: results in {first}" in err
-    assert "1 passed, 0 failed, 0 without a target, baseline not compared" in err
+    assert ("1 passed, 0 failed, 0 without a target, baseline not compared — "
+            f"{first / 'summary.md'}") in err
     assert f"stored {first / 'result.json'} as the baseline {baseline}" in err
     result = json.loads((first / "result.json").read_text())
     assert result["baseline"]["status"] == "missing" and result["details"] == {"runs": "none"}
@@ -74,16 +78,23 @@ def test_a_run_is_judged_written_and_can_become_the_baseline(
     assert ev.out == first and ev.runner.out == first and ev.street2 == tmp_path / "street2.mp4"
     assert ev.probe.launch is not None  # a browser is asked for
     # the next run fails its target and regresses against the stored baseline, which stays
+    # (with a metric the baseline has no value for: reported as not compared)
     second = tmp_path / "run2"
+    stand_in.extra = {"pose.b.fraction": 0.95}
     assert cli.main(["--out", str(second), *args]) == 1
-    err = capsys.readouterr().err
-    assert "0 passed, 1 failed, 0 without a target, 1 regressions" in err
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert ("1 passed, 1 failed, 0 without a target, 1 regressions (1 metrics without a baseline "
+            f"value) — {second / 'summary.md'}") in err
     result = json.loads((second / "result.json").read_text())
     assert result["baseline"]["status"] == "compared"
     assert result["baseline"]["commit"] == "abc"
-    (metric,) = result["metrics"]
+    assert result["baseline"]["not_compared"] == ["pose.b.fraction"]
+    metric, new = result["metrics"]
     assert metric["passed"] is False and metric["regression"] and metric["baseline"] == 2.5
-    assert "**Result: FAIL**" in (second / "summary.md").read_text()
+    assert new["baseline"] is None and result["summary"]["without_baseline"] == 1
+    text = (second / "summary.md").read_text()
+    assert "**Result: FAIL**" in text and "## Not compared with the baseline" in text
     assert baseline.read_bytes() == (first / "result.json").read_bytes()
 
 
@@ -194,6 +205,23 @@ def test_every_detail_section_of_the_summary(tmp_path: Path) -> None:
         "poses.locate": [{"capture": "011_left_060_level.jpg", "commanded_yaw_deg": 60.0,
                           "yaw_deg": 58.0, "yaw_err_deg": 2.0, "vs_mapped_rot_deg": 1.0,
                           "vs_mapped_m": 0.1}],
+        "poses.camera_locate": [{"capture": "img_016_p06_up.jpg", "located": True,
+                                 "yaw_deg": 50.0, "yaw_err_deg": 2.0, "vs_mapped_rot_deg": 2.1,
+                                 "vs_mapped_m": 0.02}],
+        "poses.camera_split": [{"capture": "img_010_p04_up.jpg", "pan": 4, "tilt": "up",
+                                "registered": True, "yaw_deg": 21.4, "pitch_delta_deg": 12.0,
+                                "pitch_ok": True},
+                               {"capture": "img_011_p04_mid.jpg", "pan": 4, "tilt": "mid",
+                                "registered": False}],
+        "segmentation.frames": [{"image": "001_bootstrap_level.jpg", "objects": 2,
+                                 "labels": {"sofa": 2}, "min_score": 0.6, "median_score": 0.7}],
+        "segmentation.camera_frames": [{"image": "img_007_p03_down.jpg", "error": "boom"}],
+        "map.camera_stability": [{"single_id": 4, "split_id": 4, "single_label": "desk",
+                                  "split_label": "desk", "iou": 0.62, "centre_delta_m": 0.04,
+                                  "extent_delta_rel": 0.12}],
+        "map.camera_single.pairs": [{"pair": "img_007_p03_down.jpg~img_008_p03_mid.jpg",
+                                     "gap": 1, "angle_deg": 14.8, "median_pct": 2.2,
+                                     "p90_pct": 6.1}],
         "map_update": {"splits": {"split_4_4_5": {"ids_broken": [
             {"id": 3, "label": "monitor", "published_by_update": 1, "update": 3,
              "now": None}]}}},
@@ -207,7 +235,20 @@ def test_every_detail_section_of_the_summary(tmp_path: Path) -> None:
     assert "| 001.jpg~053.jpg | 52 | 3.1 | 1.2 | 4.5 |" in text
     assert "## Poses — held-out captures located by mapper.sh locate" in text
     assert "| 011_left_060_level.jpg | 60 | 58 | 2 | 1 | 0.1 |" in text
+    assert "## Poses — held-out captures located by mapper.sh locate — camera" in text
+    assert "| img_016_p06_up.jpg | — | 50 | 2 | 2.1 | 0.02 |" in text
     assert "## Map update: split_4_4_5, published ids that did not persist" in text
     assert "| 3 | monitor | 1 | 3 | — |" in text
     assert "split_4_4_5, objects that never changed" not in text  # no stability rows
     assert "## Evaluator errors\n\n* server.sh: RuntimeError: boom" in text
+    # examples/camera: its own pose table (no commanded yaw), frames, objects and pairs
+    assert "## Poses — camera_split map\n\nYaw relative to the first registered capture" in text
+    assert "| img_010_p04_up.jpg | 4 | up | 21.4 | 12 | yes |" in text
+    assert "| img_011_p04_mid.jpg | 4 | mid | — | — | — |" in text
+    assert "## Poses — camera_single map" not in text
+    assert "| 001_bootstrap_level.jpg | 2 | sofa 2 | 0.6 | 0.7 |" in text
+    assert "| img_007_p03_down.jpg | — | boom | — | — |" in text
+    assert "## Objects: one update vs split — camera" in text
+    assert "| 4 | 4 | desk / desk | 0.62 | 0.04 | 0.12 |" in text
+    assert "## Least consistent overlapping keyframe pairs — camera_single map" in text
+    assert "| img_007_p03_down.jpg~img_008_p03_mid.jpg | 1 | 14.8 | 2.2 | 6.1 |" in text

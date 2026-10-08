@@ -1,5 +1,7 @@
 # Default open vocabulary (curated LVIS/COCO nouns, indoor + outdoor). One label per line; the
 # first spelling of a concept is canonical. Lines starting with '#' are comments.
+# 'label = prompt' shows the detector 'prompt' for 'label', a wording it scores far higher (here
+# its COCO class names). 'tv' is COCO's name for TVs and monitors. See detect.py, Vocabulary.
 person
 chair
 armchair
@@ -21,11 +23,11 @@ bookcase
 shelf
 tv stand
 nightstand
-television
+tv
 computer monitor
 laptop
 keyboard
-computer mouse
+computer mouse = mouse
 cell phone
 tablet computer
 remote control
@@ -123,7 +125,7 @@ menu
 cutting board
 pan
 pot
-microwave oven
+microwave oven = microwave
 oven
 stove
 toaster

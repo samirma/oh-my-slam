@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import argparse
 
-from oh_my_slam.cli.common import ArgumentParser, run_main
 from oh_my_slam.commands import spec
+from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.log import claim_stdout, get_logger
 
 PROGRAM = spec.MAPPER
@@ -44,7 +44,8 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "locate":
         return _locate(args)
-    # -p, -o, -fps, the inputs and the map are checked before the server is contacted
+    # -p, -o, -fps, the inputs and the map are checked before the server is contacted; the -o
+    # writer creates nothing until the result is written (a new map may hold the -o file)
     v = spec.validate(UPDATE, args, log.warning)
     out = claim_stdout(args.output)
     from oh_my_slam.core import timing
@@ -61,7 +62,7 @@ def _locate(args: argparse.Namespace) -> int:
     from oh_my_slam.core import timing
     from oh_my_slam.mapping.locate import locate
 
-    # -p, the inputs, the map and -o are checked before -o is prepared (which creates its folder)
+    # -p, the inputs, the map and -o are checked before the -o writer proves it can write there
     v = spec.validate(LOCATE, args, log.warning)
     out = claim_stdout(args.output)
     res = locate(v.reader, v.images, mode=args.mode, fmt=args.format, attrs=v.attrs)

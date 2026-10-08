@@ -208,6 +208,10 @@ ul.files li { list-style: square; }
   background: var(--code-bg); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.4rem 0; font-size: 0.8rem; }
 .stages-box { margin: 0.8rem 0; }
 .ply-header { margin: 0.8rem 0; }
+.result-image { margin: 0.8rem 0; }
+.result-image img { display: block; max-width: 100%; height: auto; border: 1px solid var(--border);
+  border-radius: 6px; }
+.result-image figcaption { margin-top: 0.3rem; }
 .ply-header > summary { cursor: pointer; font-weight: 600; padding: 0.2rem 0; }
 
 /* ---- a point-cloud result in 3D: the §2.5 viewer's canvas (its own dark background, as in

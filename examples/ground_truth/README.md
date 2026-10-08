@@ -5,14 +5,14 @@ subfolders. The `kind` field of each file selects the metrics it adds. Files and
 added without changing any code. The targets of the extra metrics are the `gt.*` entries of
 `examples/targets.json`.
 
-These `gt.*` metrics are the evaluator's accuracy measure. Without annotations, segmentation is
-measured only against the map built from the same detector (`seg.map_consistency.*`, which
-measures consistency, not accuracy). Poses are measured only against the commanded headings in
-the capture names, and the true headings deviate from those by several degrees. The summary
-says when no annotations were found. New annotations take effect on the next run.
+These `gt.*` metrics are the evaluator's accuracy measure. Without annotations, poses are
+measured only against the commanded headings in the capture names, and the true headings deviate
+from those by several degrees. The summary says when no annotations were found. New annotations
+take effect on the next run.
 
-A file that is malformed, or that describes an image the evaluator did not run, is skipped. The
-evaluator lists skipped files and the reason under `details.ground_truth.skipped` in `result.json`.
+A file that is malformed, or that describes a file that is not an example image (or one whose
+`segment.sh -i` run failed), is skipped. The evaluator lists skipped files and the reason under
+`details.ground_truth.skipped` in `result.json`.
 
 ## `kind: "objects"`: the objects in one example image
 
@@ -27,8 +27,10 @@ evaluator lists skipped files and the reason under `details.ground_truth.skipped
 }
 ```
 
-* `image` is the image path relative to `examples/`, for example `restaurant.jpg` or
-  `ainex-captures/001_bootstrap_level.jpg`.
+* `image` is the image path relative to `examples/`, for example `restaurant.jpg`,
+  `ainex-captures/001_bootstrap_level.jpg`, `camera/img_008_p03_mid.jpg` or
+  `office_sequence/20260929_122224.jpg`. Any example image can be annotated: the evaluator runs
+  `segment.sh -i` on an annotated image it does not segment anyway (an `office_sequence` image).
 * `label` uses the detector's vocabulary. Compatible labels, such as sofa and couch, count as the
   same label.
 * `cuboid` is optional. It is an OpenLABEL 10-value cuboid `x, y, z, qx, qy, qz, qw, sx, sy, sz`
@@ -48,7 +50,7 @@ Metrics:
 * `gt.objects.obb_iou_median` is the median 3D IoU of the paired boxes. It is reported only when
   cuboids are annotated.
 
-## `kind: "poses"`: the true head orientation per capture
+## `kind: "poses"`: the true camera orientation per capture
 
 ```json
 {
@@ -60,15 +62,19 @@ Metrics:
 }
 ```
 
-* The keys are capture file names in `examples/ainex-captures/`.
-* `yaw_deg` is the heading in degrees, positive to the left, from any fixed zero.
+* The keys are image file names in `examples/ainex-captures/`, `examples/camera/` or
+  `examples/office_sequence/`. One file may list images of several sequences.
+* `yaw_deg` is the heading in degrees, positive to the left, from any fixed zero (one per capture
+  sequence).
 * `pitch_deg` is the elevation in degrees above the horizon, positive upwards.
 * Either value can be left out.
 
-The evaluator compares these values with the camera poses of the map built in one update:
+The evaluator compares these values with the camera poses of the map built in one update from the
+image's sequence (for `office_sequence`, the map of the whole sequence that `map_update` builds):
 
-* `gt.poses.yaw_err_median_deg` and `gt.poses.yaw_err_max_deg` are computed after the single yaw
-  offset that best aligns the two sets of headings.
+* `gt.poses.yaw_err_median_deg` and `gt.poses.yaw_err_max_deg` are computed over the images of
+  every sequence, each sequence's headings after the single yaw offset that best aligns them with
+  its map (each map has a frame of its own).
 * `gt.poses.pitch_err_median_deg` compares pitch directly, since the map frame is gravity-aligned.
 
 ## `kind: "map_update"`: what changed during `examples/office_sequence/`
@@ -118,15 +124,18 @@ each update's `-t full` scene. Files about the same sequence are merged. Metrics
 * `map_update.before_present_fraction` is the same test as `absent_fraction` on the split map whose
   first update is exactly the early part, after that update. It is the control: an object that was
   never detected early cannot be seen to disappear.
-* `map_update.<split>.stability.label_agreement` and `.id_agreement`: the objects the first
-  update's images observe and that never changed keep their labels and ids from the first update
-  to the last. The two updates are aligned by their common captures' poses first (a rebuild may
-  re-gauge the frame); OBBs may be refined, so the box figures are detail only.
+* `map_update.<split>.stability.*` (`label_agreement`, `id_agreement`, `centre_delta_median_m`,
+  `extent_delta_median_rel`, `obb_iou_median`): the objects the first update's images observe and
+  that never changed keep their labels, ids and OBBs from the first update to the last. The two
+  updates are aligned by their common captures' poses first (a rebuild may re-gauge the frame);
+  the box targets allow for the refinement of an OBB as evidence accumulates.
 * `map_update.<split>.ids_persistent_fraction`: every id an update published for an unchanged object
   is, in every later update (aligned, and after following the map's lasting `merged_into`
   merges), still an object with a compatible label whose box overlaps or nearly coincides with it.
 * `map_update.<split>.vs_one_update.*`: the split map against the one-update map, as `map.stability.*`
-  (an id may differ where an earlier update of the split had published one).
+  (an id may differ where an earlier update of the split had published it for that object, and an
+  extra object of the split map is allowed only if an earlier update published it:
+  `unexcused_extra` counts the others).
 
 Their targets are the `map_update.*` entries of `examples/targets.json` (`map_update.split_*.…`
 patterns for the splits).

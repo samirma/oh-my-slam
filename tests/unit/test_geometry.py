@@ -123,6 +123,26 @@ def test_voxel_downsample_matches_the_row_unique(voxel: float, rng: np.random.Ge
         np.testing.assert_array_equal(g.voxel_downsample_indices(pts, voxel, keep=keep), ref)
 
 
+@pytest.mark.parametrize("voxel", [1e-19, 1e-300, 1e-320, 5e-324])
+def test_a_voxel_too_small_for_int64_keys_never_merges_points(voxel: float,
+                                                              rng: np.random.Generator) -> None:
+    """``-p voxel=1e-300`` is a valid value: where a voxel index does not fit an int64 (it once
+    overflowed to one key, keeping 1 point of 1000), each distinct coordinate is a voxel of its
+    own; repeated points still share theirs, and so do coordinates within one voxel near 0."""
+    pts = rng.uniform(2, 8, (1000, 3))
+    for keep in ("first", "last"):
+        assert g.voxel_downsample_indices(pts, voxel, keep=keep).tolist() == list(range(1000))
+    twice = np.vstack([pts, pts])
+    assert g.voxel_downsample_indices(twice, voxel, keep="first").tolist() == list(range(1000))
+    assert g.voxel_downsample_indices(twice, voxel, keep="last").tolist() == list(
+        range(1000, 2000))
+    if voxel == 1e-19:  # mixed: indices that fit (near 0) next to values that do not
+        mixed = np.array([[1e-20, 0.0, 1.0], [2e-20, -0.0, 1.0],  # one voxel (index 0, 0)
+                          [3.0, 0.0, 1.0], [3.5e-19, 0.0, 1.0],  # value 3.0 vs index 3.0
+                          [5.0, 0.0, 1.0], [np.nextafter(5.0, 9.0), 0.0, 1.0]])
+        assert g.voxel_downsample_indices(mixed, voxel, keep="first").tolist() == [0, 2, 3, 4, 5]
+
+
 def test_ransac_plane_with_prior(rng: np.random.Generator) -> None:
     floor = np.c_[rng.uniform(-2, 2, 500), rng.uniform(-2, 2, 500), rng.normal(0, 0.005, 500)]
     wall = np.c_[rng.uniform(-2, 2, 800), np.full(800, 1.0), rng.uniform(0, 2, 800)]

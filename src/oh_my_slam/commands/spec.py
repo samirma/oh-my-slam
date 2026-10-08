@@ -63,6 +63,7 @@ from oh_my_slam.core.errors import (
     ServerUnavailableError,
     UsageError,
     error_code,
+    internal_message,
 )
 from oh_my_slam.core.timing import Stage
 
@@ -116,6 +117,19 @@ class When:
         return {"option": self.option, "is": "given"}
 
 
+class _OneAttrs(argparse.Action):
+    """``-p``: spec §2.2 defines one ``-p key=value[,key=value…]``, so a second one is an argument
+    error (exit 2), never merged with the first nor silently replacing it."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: Any, option_string: str | None = None) -> None:
+        if getattr(namespace, self.dest) is not None:
+            raise argparse.ArgumentError(self, "given more than once: give every point-cloud "
+                                         "attribute in one -p key=value[,key=value...] "
+                                         "(e.g. -p color=rgb,voxel=0.01)")
+        setattr(namespace, self.dest, values)
+
+
 @dataclass(frozen=True)
 class Option:
     flag: str
@@ -129,7 +143,6 @@ class Option:
     choices: tuple[str, ...] | None = None
     multiple: bool = False  # one or more values (-i of mapper.sh)
     ordered: bool = False  # the order of the values matters (mapper.sh update -i: latest wins)
-    repeatable: bool = False  # may be given several times (-p)
     must_exist: bool | None = None  # a path in that must exist (None: not a path in)
     minimum: float | None = None
     exclusive_minimum: float | None = None
@@ -151,8 +164,8 @@ class Option:
             kw.update(choices=self.choices, default=self.default)
         if self.multiple:
             kw["nargs"] = "+"
-        if self.repeatable:
-            kw["action"] = "append"
+        if self.kind is Kind.ATTRS:
+            kw["action"] = _OneAttrs
         if self.required:
             kw["required"] = True
         if self.type is not None:
@@ -200,8 +213,7 @@ class Problem:
 _MEDIA = {"json": "application/json", "ply": "application/octet-stream", "png": "image/png",
           "csv": "text/csv", "markdown": "text/markdown", "html": "text/html",
           "map": "inode/directory"}
-_SUFFIX = {"json": ".json", "ply": ".ply", "png": ".png", "csv": ".csv", "markdown": ".md",
-           "html": ".html"}  # the file suffix of each output format written as a file
+_SUFFIX = {"json": ".json", "ply": ".ply", "png": ".png"}  # of each format a result has (stdout)
 
 
 def media_type(fmt: str) -> str:
@@ -210,7 +222,7 @@ def media_type(fmt: str) -> str:
 
 
 def suffix_of(fmt: str) -> str:
-    """The file suffix of an output format ('' for one that is not a file, e.g. a map)."""
+    """The file suffix of a result's format, one a command writes to stdout ('' for another)."""
     return _SUFFIX.get(fmt, "")
 
 
@@ -279,7 +291,7 @@ class Command:
         return next(o for o in self.options if o.name == name)
 
     def label(self, mode: Mode) -> str:
-        """The command as typed (``segment.sh -i``, ``mapper.sh update``): the operation id."""
+        """The command as typed (``view.sh -i``, ``mapper.sh update``): the operation id."""
         parts = [self.prog] + ([self.name] if self.name else [])
         if mode.selector is not None:
             parts.append(self.option(mode.selector).flag)
@@ -333,10 +345,10 @@ _PLY_ONLY = "only the PLY output has: use -f ply"
 def _attrs_check(ctx: Context) -> None:
     """``-p``: refused without a PLY output (``-f json``, ``-f depth``), then parsed for the
     mode's scope (spec §2.2); both before any inference."""
-    values = ctx.args.attrs
-    if values and not _PLY.holds(ctx.args):
+    text = ctx.args.attrs
+    if text is not None and not _PLY.holds(ctx.args):
         raise UsageError(f"-p sets point-cloud attributes, which {_PLY_ONLY}")
-    ctx.values.attrs = parse_cloud_attrs(values, ctx.mode.scope())
+    ctx.values.attrs = parse_cloud_attrs(text, ctx.mode.scope())
 
 
 ATTRS_RULE = Rule("attrs", ("attrs", "format"),
@@ -376,12 +388,21 @@ ARTIFACTS_RULE = Rule("artifacts_writable", ("artifacts",),
 
 
 def _image_check(ctx: Context) -> None:
+    from oh_my_slam.core.images import open_header
+
     image: Path = ctx.args.image
     if not image.is_file():
         raise InputError(f"image not found: {image}")
+    if image.suffix.lower() not in ACCEPTS[Kind.IMAGE]:
+        raise InputError(f"unsupported input (not an image): {image}; -i takes "
+                         f"{', '.join(sorted(ACCEPTS[Kind.IMAGE]))}")
+    with open_header(image):  # an image that cannot be read: exit 2 before the server
+        pass
 
 
-IMAGE_RULE = Rule("image_exists", ("image",), "the -i image exists", _image_check, (InputError,))
+IMAGE_RULE = Rule("image_exists", ("image",),
+                  "the -i image exists, has an accepted suffix and can be read, checked before "
+                  "the inference server is contacted", _image_check, (InputError,))
 
 
 def _map_check(ctx: Context) -> None:
@@ -401,15 +422,15 @@ def _fps_check(ctx: Context) -> None:
     if a.fps is not None and not is_video:
         ctx.warn("-fps applies to video input only; ignored for images")
         fps = DEFAULT_FPS  # ignored (spec §2.3), whatever its value
-    if fps <= 0:
-        raise UsageError("-fps must be positive")
+    if not math.isfinite(fps) or fps <= 0:
+        raise UsageError(f"-fps must be a positive finite number, got {_g(fps)}")
     ctx.values.fps = fps
     ctx.values.is_video = is_video
 
 
 FPS_RULE = Rule("fps", ("fps", "inputs"),
-                "-fps must be positive for a video; for images it is ignored with a warning",
-                _fps_check)
+                "-fps must be a positive finite number for a video; for images it is ignored "
+                "with a warning", _fps_check)
 
 
 def _update_inputs_check(ctx: Context) -> None:
@@ -500,7 +521,7 @@ def _output() -> Option:
 
 def _attrs(scope: CloudScope) -> Option:
     return Option("-p", "attrs", Kind.ATTRS, f"{help_text(scope)}; requires -f ply",
-                  repeatable=True, metavar="ATTRS", applies=(_PLY,), applies_text="only with -f ply")
+                  metavar="ATTRS", applies=(_PLY,), applies_text="only with -f ply")
 
 
 def _image(help: str, **kw: Any) -> Option:
@@ -523,8 +544,9 @@ _SCENE = "the OpenLABEL 1.0.0 scene description (spec §3)"
 _DEPTH_IMAGE = ("the depth image: one 16-bit single-channel PNG of the input's pixel size, each "
                 "pixel the metric depth along the optical axis in units of "
                 f"1/{DEPTH_UNITS_PER_METRE} m, {NO_DEPTH} where the model gives no valid depth")
-_SEGMENTED = ("the segmented image: the input image dimmed, each instance mask painted opaque in "
-              "its object's colour")
+_SEGMENTED = ("the segmented image: the input image at the reconstruction's working resolution "
+              "(long side at most 1024 px), dimmed, each instance mask painted opaque in its "
+              "object's colour")
 
 RECONSTRUCT = Program("reconstruct.sh", "Single-image reconstruction (stdout or -o file).", (
     Command("reconstruct.sh", None, "Single-image reconstruction (stdout or -o file).", (
@@ -557,7 +579,8 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
                "(default: full)", default="full", choices=("full", "single")),
         Option("-fps", "fps", Kind.NUMBER,
                f"video frames per second to sample (default: {_g(DEFAULT_FPS)}; ignored for "
-               "images)", default=DEFAULT_FPS, exclusive_minimum=0, omit_if_default=True,
+               "images)", default=DEFAULT_FPS, exclusive_minimum=0, finite=True,
+               omit_if_default=True,
                type=float, applies=(When("inputs", video=True),),
                applies_text="video input only; ignored for images"),
     ), (
@@ -596,8 +619,8 @@ MAPPER = Program("mapper.sh", "Multi-frame mapping (persistent map).", (
     )),
 ))
 
-SEGMENT_IMAGE = Mode(
-    "image", "image", (MIN_SCORE_RULE, OUTPUT_RULE, ARTIFACTS_RULE, IMAGE_RULE),
+SEGMENT_IMAGE = Mode(  # its one mode, like reconstruct.sh's: -i is a required option
+    None, None, (MIN_SCORE_RULE, OUTPUT_RULE, ARTIFACTS_RULE, IMAGE_RULE),
     "required", "segments the image with the inference server",
     (Stage.CONNECT, Stage.INFERENCE, Stage.SEGMENT, Stage.EXPORT, Stage.ARTIFACTS, Stage.WRITE),
     (_scene(f"{_SCENE} (camera frame)"),
@@ -634,8 +657,7 @@ VIEW = Program("view.sh", "Browser visualisation of an image or a map.", (
         Option("--no-browser", "no_browser", Kind.FLAG, "do not open a browser", default=False),
     ), (
         Mode("image", "image", (IMAGE_RULE,), "required",
-             "reconstructs and segments the image with the inference server",
-             (Stage.CONNECT, Stage.INFERENCE), _VIEWER),
+             "reconstructs and segments the image with the inference server", (), _VIEWER),
         Mode("map", "map", (MAP_RULE,), "never", "opens the persisted map read-only", (),
              _VIEWER),
     ), exclusive_required=("image", "map")),
@@ -706,11 +728,10 @@ def argv_of(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[str]:
         if o.kind is Kind.FLAG:
             argv += [o.flag] if v else []
             continue
-        values = list(v) if isinstance(v, list | tuple) else [v]
         if o.multiple:
-            argv += [o.flag, *map(_value, values)]
+            argv += [o.flag, *map(_value, v if isinstance(v, list | tuple) else [v])]
         else:  # flag=value: a value that starts with "-" stays a value
-            argv += [f"{o.flag}={_text(x)}" for x in values]
+            argv.append(f"{o.flag}={_text(v)}")
     return argv
 
 
@@ -765,7 +786,8 @@ def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem
     """Every problem of an API request, without touching anything: argparse's (a bad value, a
     missing parameter) and every rule's check (none prepares anything), each with the parameters
     it concerns, so a form flags them all next to their fields at once (:func:`by_parameter`).
-    A parameter argparse refuses is left out of the following parses and rules."""
+    A parameter argparse refuses is left out of the following parses and rules. A check that
+    crashes is the command's internal error (exit 1), told as ``run_main`` tells it."""
     problems: list[Problem] = []
     current = dict(params)
     while True:
@@ -788,6 +810,9 @@ def dry_run(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> list[Problem
             rule.check(ctx)
         except OhMySlamError as exc:
             problems.append(Problem(rule.name, rule.options, str(exc), exc.exit_code))
+        except Exception as exc:  # e.g. a corrupt map.json
+            problems.append(Problem(rule.name, rule.options, internal_message(exc),
+                                    ExitCode.INTERNAL))
     return problems
 
 
@@ -860,7 +885,7 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
         "required": o.required or o.name == mode.selector,
         "default": None if o.name == mode.selector else o.default,
         "choices": list(o.choices) if o.choices else None,
-        "multiple": o.multiple, "ordered": o.ordered, "repeatable": o.repeatable,
+        "multiple": o.multiple, "ordered": o.ordered,
         "accepts": sorted(ACCEPTS[o.kind]) if o.kind in ACCEPTS else None,
         "must_exist": o.must_exist,
         "minimum": o.minimum, "exclusive_minimum": o.exclusive_minimum, "finite": o.finite,
@@ -875,6 +900,33 @@ def _option(mode: Mode, o: Option) -> dict[str, Any]:
 
 def operations() -> list[tuple[Program, Command, Mode]]:
     return [(p, c, m) for p in PROGRAMS for c in p.commands for m in c.modes]
+
+
+def operation_id(prog: Program, cmd: Command, mode: Mode) -> str:
+    """A mode's URL-safe id, the web service's operation id: program, subcommand and mode joined
+    (``mapper-update``)."""
+    parts = [prog.prog.removesuffix(".sh"), cmd.name, mode.name]
+    return "-".join(p for p in parts if p)
+
+
+def writes_map(cmd: Command, mode: Mode) -> Option | None:
+    """The option naming the map ``mode`` writes (an output written ``via`` that option)."""
+    flags = {o.via for o in mode.outputs}
+    return next((o for o in cmd.mode_options(mode) if o.flag in flags and o.kind is Kind.MAP),
+                None)
+
+
+def result_format(cmd: Command, mode: Mode, params: Mapping[str, Any]) -> str | None:
+    """Format of ``mode``'s result for API parameters (its stdout output whose condition holds),
+    read through the command's own parser (:func:`parse`); None if they do not parse."""
+    try:
+        args = parse(cmd, mode, params)
+    except OhMySlamError:
+        return None
+    for out in mode.outputs:
+        if out.via == "stdout" and (not out.when or any(w.holds(args) for w in out.when)):
+            return out.format
+    return None
 
 
 def describe() -> dict[str, Any]:

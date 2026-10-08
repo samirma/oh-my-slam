@@ -139,12 +139,17 @@ def test_segment_image_creates_its_folder_with_the_server_up(stub_server: None, 
                                                      "segmentation.json", "segmented.png"]
 
 
-def test_preflight_creates_missing_parents_and_names_the_path(tmp_path: Path,
-                                                              not_a_folder: Path) -> None:
+def test_preflight_names_the_path_and_only_the_d_folder_is_created(tmp_path: Path,
+                                                                   not_a_folder: Path) -> None:
+    """An ``-o`` file's missing folders are created only with the file (a command that fails
+    first leaves none behind); a ``-d`` folder is created when it is prepared."""
     target = tmp_path / "a" / "b" / "scene.json"
     preflight_file(target, "-o")
-    assert target.parent.is_dir() and not target.exists()  # parents created, nothing written
-    assert list(target.parent.iterdir()) == []  # the probe file is gone
+    assert list(tmp_path.iterdir()) == [not_a_folder]  # nothing created, the probe file is gone
+    writer = PayloadWriter(path=target)
+    assert not (tmp_path / "a").exists()
+    writer.write_bytes(b"{}\n")
+    assert target.read_bytes() == b"{}\n" and list(target.parent.iterdir()) == [target]
     preflight_dir(tmp_path / "c" / "d", "-d")
     assert (tmp_path / "c" / "d").is_dir()
     with pytest.raises(UsageError, match="plain_file"):

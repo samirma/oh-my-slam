@@ -165,7 +165,7 @@ def test_signed_zero_serialises_as_zero() -> None:
     """Two documents differing only in the sign of a zero (or of a value that rounds to zero)
     serialise to identical bytes: identical runs must be byte-identical (server.sh parity)."""
     from oh_my_slam.core.log import json_payload_bytes
-    from oh_my_slam.segmentation.catalog import _r as catalog_r
+    from oh_my_slam.segmentation.catalog import round_float as catalog_r  # ol's, reused
 
     def doc(z: float) -> bytes:
         pose = Pose(np.eye(3), np.array([0.0, z, z]))

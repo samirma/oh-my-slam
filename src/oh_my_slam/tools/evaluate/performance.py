@@ -25,13 +25,20 @@ from oh_my_slam.tools.evaluate.runner import RunRecord
 PERF_GROUPS: dict[str, tuple[str, str]] = {
     "reconstruct_json": ("wall_s", "single"),
     "reconstruct_ply": ("wall_s", "single"),
+    "reconstruct_depth": ("wall_s", "single"),  # reconstruct.sh -f depth
     "segment_image": ("wall_s", "single"),
+    "segment_image_png": ("wall_s", "single"),  # segment.sh -i -f png
     "segment_frames": ("wall_s", "median"),  # per frame
     "view_image": ("render_s", "single"),
     "mapper_single": ("wall_s", "single"),
     "mapper_split": ("wall_s", "sum"),  # the whole sequence over all updates
     "view_map": ("render_s", "single"),
     "locate": ("wall_s", "single"),  # mapper.sh locate on the reference map
+    "segment_camera_frames": ("wall_s", "median"),  # per examples/camera frame
+    "mapper_camera_single": ("wall_s", "single"),
+    "mapper_camera_split": ("wall_s", "sum"),
+    "view_camera_map": ("render_s", "single"),
+    "camera_locate": ("wall_s", "single"),  # mapper.sh locate on the one-update camera map
     "mapper_office": ("wall_s", "single"),
     "mapper_office_split": ("wall_s", "max"),  # the slowest update of the split office maps
     "mapper_street2": ("wall_s", "single"),

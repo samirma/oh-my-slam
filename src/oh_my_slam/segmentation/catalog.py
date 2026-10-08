@@ -6,6 +6,7 @@ import csv
 import io
 from typing import Any
 
+from oh_my_slam.schema.openlabel import round_float
 from oh_my_slam.segmentation.api import SceneObject
 
 CSV_HEADER = (
@@ -14,21 +15,18 @@ CSV_HEADER = (
 )
 
 
-def _r(x: float, nd: int) -> float:
-    """``round`` with signed zero normalised: ``-0.0`` and ``0.0`` print differently."""
-    return round(x, nd) + 0.0
-
-
 def catalog_rows(objects: list[SceneObject]) -> list[dict[str, Any]]:
     rows = []
     for o in sorted(objects, key=lambda x: x.id):
         w, d, h = (float(v) for v in o.obb.size)
         cx, cy, cz = (float(v) for v in o.obb.center)
         rows.append({
-            "id": o.id, "label": o.label, "score": _r(o.score, 4), "color_hex": o.color_hex,
-            "width_m": _r(w, 3), "height_m": _r(h, 3), "depth_m": _r(d, 3),
-            "volume_m3": _r(w * d * h, 4),
-            "center_x": _r(cx, 3), "center_y": _r(cy, 3), "center_z": _r(cz, 3),
+            "id": o.id, "label": o.label, "score": round_float(o.score, 4),
+            "color_hex": o.color_hex,
+            "width_m": round_float(w, 3), "height_m": round_float(h, 3),
+            "depth_m": round_float(d, 3), "volume_m3": round_float(w * d * h, 4),
+            "center_x": round_float(cx, 3), "center_y": round_float(cy, 3),
+            "center_z": round_float(cz, 3),
             "pixel_count": o.pixel_count, "point_count": o.point_count,
         })
     return rows
@@ -43,8 +41,9 @@ def catalog_csv(objects: list[SceneObject]) -> str:
     return buf.getvalue()
 
 
-def catalog_md(objects: list[SceneObject], title: str = "Object catalogue") -> str:
-    rows = sorted(catalog_rows(objects), key=lambda r: (-r["volume_m3"], r["id"]))
+def catalog_md(objects: list[SceneObject], title: str) -> str:
+    volume = {o.id: o.obb.volume for o in objects}  # unrounded: tiny objects keep their order
+    rows = sorted(catalog_rows(objects), key=lambda r: (-volume[r["id"]], r["id"]))
     lines = [
         f"# {title}",
         "",

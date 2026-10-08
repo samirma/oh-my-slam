@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Flag, auto
 from typing import Any, Literal
 
+from oh_my_slam.core.constants import MAX_GRID_SIDE
 from oh_my_slam.core.errors import UsageError
 
 ColorMode = Literal["rgb", "segment", "height", "none"]
@@ -50,8 +51,7 @@ class CloudAttrs:
 
     def items(self, scope: CloudScope) -> list[tuple[str, str]]:
         """``(key, value)`` of every attribute that applies to ``scope``, in table order."""
-        return [(a.key, a.format(getattr(self, a.field))) for a in ATTRIBUTES
-                if CloudScope.MAP not in scope or not a.pixel_level]
+        return [(a.key, a.format(getattr(self, a.field))) for a in applicable(scope)]
 
     def describe(self, scope: CloudScope) -> str:
         """``key=value,…`` of the applicable attributes, defaults included (the PLY comment);
@@ -121,7 +121,8 @@ ATTRIBUTES: tuple[AttrSpec, ...] = (
              "per-point colour: image colour, object colour, height ramp, or no colour",
              False, _choice(COLOR_MODES), str, {"type": "enum", "choices": list(COLOR_MODES)}),
     AttrSpec("stride", "stride", "N", "an integer >= 1",
-             "keep every n-th pixel along each image axis", True, _stride, str,
+             f"keep every n-th pixel of the depth grid (long side at most {MAX_GRID_SIDE} px) "
+             "along each axis", True, _stride, str,
              {"type": "integer", "minimum": 1}),
     AttrSpec("min-depth", "min_depth", "METRES", "metres >= 0",
              "drop pixels closer than this depth", True, _metres(0.0), _num,
@@ -131,7 +132,8 @@ ATTRIBUTES: tuple[AttrSpec, ...] = (
              _metres(0.0, allow_inf=True, strict=True), _num,
              {"type": "number", "exclusive_minimum": 0, "finite": False}),
     AttrSpec("edge", "edge", "JUMP", "a relative depth jump >= 0",
-             "drop flying pixels on depth discontinuities (0 disables)", True, _metres(0.0), _num,
+             "drop flying pixels on depth discontinuities of the depth grid, and valid pixels "
+             "next to pixels without depth (0 disables both)", True, _metres(0.0), _num,
              {"type": "number", "minimum": 0, "finite": True}),
     AttrSpec("voxel", "voxel", "METRES", "metres >= 0",
              "keep one point per voxel of this size (0 = off; colours are not averaged)",
@@ -164,28 +166,25 @@ def help_text(scope: CloudScope) -> str:
 # --- parsing and validation ---------------------------------------------------------------------
 
 
-def _pairs(spec: str | Iterable[str] | Mapping[str, str] | None) -> list[tuple[str, str]]:
+def _pairs(spec: str | Mapping[str, str] | None) -> list[tuple[str, str]]:
     if spec is None:
         return []
     if isinstance(spec, Mapping):
         return [(str(k).strip(), str(v).strip()) for k, v in spec.items()]
-    texts = [spec] if isinstance(spec, str) else list(spec)
     out = []
-    for text in texts:
-        for item in text.split(","):
-            if not item.strip():
-                continue
-            key, sep, value = item.partition("=")
-            if not sep:
-                raise UsageError(f"point-cloud attribute {item.strip()!r} is not key=value "
-                                 f"(e.g. -p color=rgb,voxel=0.01)")
-            out.append((key.strip(), value.strip()))
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise UsageError(f"point-cloud attribute {item.strip()!r} is not key=value "
+                             f"(e.g. -p color=rgb,voxel=0.01)")
+        out.append((key.strip(), value.strip()))
     return out
 
 
-def parse_cloud_attrs(spec: str | Iterable[str] | Mapping[str, str] | None,
-                      scope: CloudScope) -> CloudAttrs:
-    """Validated attributes for ``scope`` from ``-p`` text(s) or a key → value mapping."""
+def parse_cloud_attrs(spec: str | Mapping[str, str] | None, scope: CloudScope) -> CloudAttrs:
+    """Validated attributes for ``scope`` from the ``-p`` text or a key → value mapping."""
     if (CloudScope.IMAGE in scope) == (CloudScope.MAP in scope):
         raise ValueError("scope must contain exactly one of IMAGE and MAP")
     attrs = CloudAttrs()

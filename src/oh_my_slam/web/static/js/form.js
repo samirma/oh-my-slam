@@ -30,6 +30,43 @@ export function holds(w, current, names) {
   return true;
 }
 
+// A number field's API value from its text: undefined when empty, the number when the text is a
+// plain decimal, else the text as typed (the command's own check then names the problem).
+export function numberValue(text) {
+  const t = text.trim();
+  if (t === '') return undefined;
+  const x = Number(t);
+  return Number.isFinite(x) && /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t) ? x : t;
+}
+
+// The point-cloud attributes' API value from [key, text, default] per attribute: key=value,… of
+// those given a value other than their default; undefined when there is none.
+export function attrsValue(entries) {
+  const parts = [];
+  for (const [key, text, def] of entries) {
+    const v = text.trim();
+    if (v !== '' && v !== String(def)) parts.push(`${key}=${v}`);
+  }
+  return parts.length ? parts.join(',') : undefined;
+}
+
+// What a map name typed for the mode that writes maps does, given the workspace's `maps`: extend
+// the map of that name, or create a new one ('' when no name is typed).
+export function mapNote(name, maps) {
+  const v = name.trim();
+  const known = maps.some((m) => m.name === v);
+  return !v ? '' : known ? `Map ${v} exists: the inputs extend it.` : `A new map ${v} will be created.`;
+}
+
+// The state of a chosen file (FilesField): uploading (with its progress), failed (with the
+// reason), a workspace path, or uploaded (with its size).
+export function fileState(it) {
+  if (it.state === 'uploading') return `uploading ${Math.round((it.progress || 0) * 100)} %`;
+  if (it.state === 'failed') return `upload failed: ${it.error}`;
+  if (it.state === 'path') return 'workspace path';
+  return `uploaded${it.size != null ? `, ${fmtBytes(it.size)}` : ''}`;
+}
+
 // ------------------------------------------------------------------------------------------- fields
 
 class Field {
@@ -103,12 +140,7 @@ class NumberField extends Field {
     this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.help(), this.err);
   }
 
-  value() {
-    const t = this.input.value.trim();
-    if (t === '') return undefined;
-    const x = Number(t);
-    return Number.isFinite(x) && /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t) ? x : t;
-  }
+  value() { return numberValue(this.input.value); }
 }
 
 class FlagField extends Field {
@@ -164,14 +196,7 @@ class AttrsField extends Field {
     this.el.append(fs, this.help(), this.err);
   }
 
-  value() {
-    const parts = [];
-    for (const [key, { input, a }] of this.inputs) {
-      const v = input.value.trim();
-      if (v !== '' && v !== String(a.default)) parts.push(`${key}=${v}`);
-    }
-    return parts.length ? parts.join(',') : undefined;
-  }
+  value() { return attrsValue([...this.inputs].map(([key, { input, a }]) => [key, input.value, a.default])); }
 }
 
 // A map of the workspace: one of the maps, or (for the mode that writes maps) a new name too
@@ -211,11 +236,7 @@ class MapField extends Field {
     }
   }
 
-  drawNote() {
-    const v = this.input.value.trim();
-    const known = this.maps.some((m) => m.name === v);
-    this.note.textContent = !v ? '' : known ? `Map ${v} exists: the inputs extend it.` : `A new map ${v} will be created.`;
-  }
+  drawNote() { this.note.textContent = mapNote(this.input.value, this.maps); }
 
   value() { const v = (this.input.value || '').trim(); return v === '' ? undefined : v; }
 }
@@ -324,16 +345,9 @@ export class FilesField extends Field {
     (row?.querySelector(d < 0 ? '.up' : '.down:not([disabled])') || row?.querySelector('.up:not([disabled]), .down:not([disabled])'))?.focus();
   }
 
-  stateText(it) {
-    if (it.state === 'uploading') return `uploading ${Math.round((it.progress || 0) * 100)} %`;
-    if (it.state === 'failed') return `upload failed: ${it.error}`;
-    if (it.state === 'path') return 'workspace path';
-    return `uploaded${it.size != null ? `, ${fmtBytes(it.size)}` : ''}`;
-  }
-
   renderItem(it) {
     const st = it.row?.querySelector('.file-state');
-    if (st) st.textContent = this.stateText(it);
+    if (st) st.textContent = fileState(it);
   }
 
   render() {
@@ -341,7 +355,7 @@ export class FilesField extends Field {
     this.items.forEach((it, i) => {
       const n = this.items.length;
       const row = el('li', { class: `file ${it.state}`, 'data-name': it.name },
-        el('span', { class: 'file-name' }, it.name), el('span', { class: 'file-state' }, this.stateText(it)));
+        el('span', { class: 'file-name' }, it.name), el('span', { class: 'file-state' }, fileState(it)));
       if (this.ordered && n > 1) {
         const up = el('button', { type: 'button', class: 'icon up', 'aria-label': `Move ${it.name} earlier`, disabled: i === 0 || null }, '↑');
         const down = el('button', { type: 'button', class: 'icon down', 'aria-label': `Move ${it.name} later`, disabled: i === n - 1 || null }, '↓');

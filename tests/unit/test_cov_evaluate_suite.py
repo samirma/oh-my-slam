@@ -2,9 +2,10 @@
 points (spec §5): the inference server's cold start, footprint and restore; a run whose output is
 not JSON; a viewer that rendered but served no scene; the ainex maps built in one update and
 split, with the held-out captures located between the updates, then judged (poses, depth
-agreement, object stability); the split's middle updates publishing ids through their points'
-labels; the reference-map runs failing; office splits that cannot be built; and a section that
-raises."""
+agreement, object stability); the camera maps built, located and judged the same way under names
+of their own; the split's middle updates publishing ids through their points' labels;
+the reference-map runs failing; office splits that cannot be built; a capture sequence whose file
+names break its grammar; and a section that raises."""
 
 from __future__ import annotations
 
@@ -15,12 +16,13 @@ from typing import Any
 import numpy as np
 import pytest
 
+from oh_my_slam.core.errors import NotAMapError
 from oh_my_slam.core.ply import PointCloud, ply_bytes
 from oh_my_slam.core.types import Pose
 from oh_my_slam.segmentation.colors import UNSEGMENTED, segment_colors
 from oh_my_slam.tools.evaluate import mapupdate
 from oh_my_slam.tools.evaluate import suite as st
-from oh_my_slam.tools.evaluate.names import Capture, captures_in
+from oh_my_slam.tools.evaluate.names import AnyCapture, captures_in, pan_captures_in
 from oh_my_slam.tools.evaluate.runner import Runner, RunSpec
 from oh_my_slam.tools.evaluate.scene import DocObject
 from oh_my_slam.tools.evaluate.suite import EXAMPLES, Evaluation, _pose_lines, office_splits
@@ -59,6 +61,28 @@ def test_the_office_splits_come_from_the_annotation_and_the_sequence(tmp_path: P
         (tmp_path / "office_sequence" / name).write_bytes(b"")
     assert office_splits(tmp_path) == ["split_4_2"]
     assert set(mapupdate.metric_ids(["split_4_2"])) <= set(st.expected_ids(tmp_path))
+
+
+def test_both_capture_sequences_are_in_the_plan() -> None:
+    """examples/camera has the uses of ainex-captures (spec §5) under names of its own: pose
+    metrics of the pan order (its names record no angle) instead of the commanded yaw."""
+    assert [(s.folder, s.maps, s.located) for s in st.SEQUENCES] == [
+        ("ainex-captures", ("single", "split"), "locate"),
+        ("camera", ("camera_single", "camera_split"), "camera_locate")]
+    ids = set(st.expected_ids())
+    assert {"seg.frames.with_detections_fraction", "seg.camera_frames.with_detections_fraction",
+            "pose.single.yaw_err_median_deg", "pose.camera_single.pan_order_fraction",
+            "pose.camera_split.tilt_yaw_diff_max_deg",
+            "map.camera_single.frame_agreement_tilt_p90_pct", "map.single.frame_agreement_p90_pct",
+            "map.camera_stability.id_agreement", "perf.segment_camera_frames.wall_s",
+            "perf.mapper_camera_split.per_update_wall_s", "perf.view_camera_map.render_s",
+            "pose.camera_locate.located_fraction", "pose.camera_locate.yaw_err_max_deg",
+            "perf.camera_locate.wall_s"} <= ids
+    assert not any(k.startswith("pose.camera_single.yaw_err") for k in ids)
+    # the camera's tilt pairs are judged like overlapping pairs, not by the worst pair (2026-10-08)
+    assert not {f"map.{mp}.frame_agreement_{k}_pct" for mp in ("camera_single", "camera_split")
+                for k in ("median", "p90")} & ids
+    assert not any(k.startswith("map.single.frame_agreement_tilt") for k in ids)
 
 
 def test_a_pose_header_line_that_is_not_one() -> None:
@@ -142,13 +166,15 @@ def test_the_cold_start_footprint_and_restore(tmp_path: Path,
 # -- the ainex maps ------------------------------------------------------------------------------------
 
 CAPTURES = captures_in(EXAMPLES / "ainex-captures")[:6]  # 001-006: three updates of two
-TILT = {"level": 0.0, "up": 10.0, "down": -10.0}
+PAN_CAPTURES = pan_captures_in(EXAMPLES / "camera")[:6]  # p03 and p04: three updates of two
+TILT = {"level": 0.0, "mid": 0.0, "up": 10.0, "down": -10.0}
 POSES = {c.name: cam(c.yaw_deg, TILT[c.tilt]) for c in CAPTURES}  # every camera at the origin
+POSES.update({c.name: cam(20.0 * (c.pan - 3), TILT[c.tilt]) for c in PAN_CAPTURES})
 OBJECTS = [box(1, "chair", (2.0, 0.0, 0.45)), box(2, "sofa", (0.0, 3.0, 0.4), (2.0, 0.9, 0.8))]
 
 
-def scene(captures: list[Capture], objects: list[DocObject],
-          located: list[Capture] | None = None) -> dict[str, Any]:
+def scene(captures: list[AnyCapture], objects: list[DocObject],
+          located: list[AnyCapture] | None = None) -> dict[str, Any]:
     """A map's (or a locate's) scene: its frames' sources and poses, and its objects."""
     frames = {str(k): frame(POSES[c.name], f"/in/{c.name}") for k, c in enumerate(captures)}
     frames.update({str(len(captures) + k): frame(POSES[c.name], f"/q/{c.name}", located=True)
@@ -186,13 +212,15 @@ cat "$DOCS/full.json"
 """
 
 
-def ainex(tmp_path: Path, middle: str = "labelled") -> Evaluation:
+def fake_maps(tmp_path: Path, captures: list[AnyCapture], middle: str = "labelled"
+              ) -> Evaluation:
+    """A fake mapper.sh whose maps hold ``captures`` (the third and fourth located)."""
     docs = tmp_path / "docs"
-    write_map(docs / "map", [record(i, c.name, POSES[c.name]) for i, c in enumerate(CAPTURES)],
-              {f"f{i:06d}": sphere_depth() for i in range(len(CAPTURES))})
-    held = CAPTURES[2:4]
-    (docs / "full.json").write_text(json.dumps(scene(CAPTURES, OBJECTS)))
-    (docs / "first.json").write_text(json.dumps(scene(CAPTURES[:2], OBJECTS[:1])))
+    write_map(docs / "map", [record(i, c.name, POSES[c.name]) for i, c in enumerate(captures)],
+              {f"f{i:06d}": sphere_depth() for i in range(len(captures))})
+    held = captures[2:4]
+    (docs / "full.json").write_text(json.dumps(scene(captures, OBJECTS)))
+    (docs / "first.json").write_text(json.dumps(scene(captures[:2], OBJECTS[:1])))
     (docs / "located.json").write_text(json.dumps(scene([], [], located=held)))
     (docs / "middle.ply").write_bytes(middle_ply(middle))
     ev = evaluation(tmp_path, mapper=MAPPER)
@@ -200,23 +228,30 @@ def ainex(tmp_path: Path, middle: str = "labelled") -> Evaluation:
     return ev
 
 
+def ainex(tmp_path: Path, middle: str = "labelled") -> Evaluation:
+    return fake_maps(tmp_path, list(CAPTURES), middle)
+
+
 def test_the_maps_are_built_located_and_judged(tmp_path: Path) -> None:
     ev = ainex(tmp_path)
-    single, split = ev.build_maps(CAPTURES)
+    single, split = ev.build_maps(st.AINEX, CAPTURES)
     assert single is not None and split is not None
     assert [r.tag for r in ev.runner.records] == ["mapper_single", "mapper_split_1",
                                                   "locate_held_out", "mapper_split_2",
                                                   "mapper_split_3"]
     assert (tmp_path / "docs" / "log").read_text().splitlines() == [
         "update  ", "update  ", "locate  ", "update single ply", "update full "]
-    # the ids the earlier updates published: the first's objects, the middle's point labels
-    assert ev.published == {1, 5}
+    # what the earlier updates published: the first's objects, and the objects the middle's
+    # point labels name, read from the map as it left it (this fake map has none), with its poses
+    assert [[o.id for o in v.objects] for v in ev.published["split"]] == [[1], []]
+    assert set(ev.published["split"][1].poses) == {c.name for c in CAPTURES}
     checks = ev.contracts.checks
     assert checks[("readonly", "map")] == {"mapper.sh locate (held out)": []}
     assert checks[("openlabel", "mapper")]["locate_held_out/located frames"] == []
     assert checks[("colour", "mapper")]["mapper_split_2"] == []
-    assert [c.name for c in ev.held_out["captures"]] == [c.name for c in CAPTURES[2:4]]
-    ev.map_metrics(CAPTURES, single, split)
+    assert [c.name for c in ev.held_out["ainex-captures"]["captures"]] == [
+        c.name for c in CAPTURES[2:4]]
+    ev.map_metrics(st.AINEX, CAPTURES, single, split)
     v = {k: x.value for k, x in ev.metrics.items.items()}
     for mp in ("single", "split"):
         assert v[f"pose.{mp}.registered_fraction"] == 1.0
@@ -231,19 +266,111 @@ def test_the_maps_are_built_located_and_judged(tmp_path: Path) -> None:
     rows = ev.details["poses.locate"]
     assert [r["capture"] for r in rows] == [c.name for c in CAPTURES[2:4]]
     assert all(r["vs_mapped_rot_deg"] == pytest.approx(0.0, abs=1e-3) for r in rows)
-    assert ev.single_poses is not None and set(ev.single_poses) == set(POSES)
+    assert set(ev.single_poses["ainex-captures"] or {}) == {c.name for c in CAPTURES}
     assert len(ev.details["map.single.pairs"]) > 0 and ev.details["map.stability"]
 
 
-@pytest.mark.parametrize(("middle", "published", "problem"), [
-    ("unlabelled", {1}, "no label property and no object list to check the colours against"),
-    ("broken", {1}, "ValueError: "),
+def test_the_camera_maps_are_built_located_and_judged(tmp_path: Path) -> None:
+    """examples/camera: the same maps and locate as ainex-captures (spec §5: the same uses)
+    under names of their own, judged by the pan order and the agreement of the tilts (its names
+    record no angle); a held-out capture by the yaw the split map gives it later."""
+    ev = fake_maps(tmp_path, list(PAN_CAPTURES))
+    single, split = ev.build_maps(st.CAMERA, PAN_CAPTURES)
+    assert single is not None and split is not None
+    assert [(r.tag, r.spec.group) for r in ev.runner.records] == [
+        ("mapper_camera_single", "mapper_camera_single"),
+        ("mapper_camera_split_1", "mapper_camera_split"),
+        ("camera_locate_held_out", "camera_locate_held_out"),
+        *((f"mapper_camera_split_{k}", "mapper_camera_split") for k in (2, 3))]
+    assert (tmp_path / "docs" / "log").read_text().splitlines() == [
+        "update  ", "update  ", "locate  ", "update single ply", "update full "]
+    last, flag, folder = ev.runner.records[0].argv[-3:]
+    assert last == str(EXAMPLES / "camera" / PAN_CAPTURES[-1].name)
+    assert (flag, folder) == ("-m", str(ev.out / "maps" / "camera_single"))
+    assert ev.runner.records[2].argv[3] == str(EXAMPLES / "camera" / PAN_CAPTURES[2].name)
+    assert ev.contracts.checks[("readonly", "map")] == {
+        "mapper.sh locate (held out) (camera)": []}
+    assert [c.name for c in ev.held_out["camera"]["captures"]] == [
+        c.name for c in PAN_CAPTURES[2:4]]
+    assert [[o.id for o in v.objects] for v in ev.published["camera_split"]] == [[1], []]
+    ev.map_metrics(st.CAMERA, PAN_CAPTURES, single, split)
+    v = {k: x.value for k, x in ev.metrics.items.items()}
+    for mp in ("camera_single", "camera_split"):
+        assert v[f"pose.{mp}.registered_fraction"] == 1.0
+        assert v[f"pose.{mp}.pan_order_fraction"] == 1.0  # p03 to p04 turns left
+        assert v[f"pose.{mp}.tilt_yaw_diff_max_deg"] == pytest.approx(0.0, abs=1e-6)
+        assert v[f"pose.{mp}.pitch_direction_fraction"] == 1.0
+        # the tilts of a pan position are its same-heading pairs, judged like overlapping pairs:
+        # one sphere, every pair agrees
+        assert v[f"map.{mp}.frame_agreement_tilt_max_pct"] == pytest.approx(0.0, abs=0.2)
+        assert f"map.{mp}.frame_agreement_median_pct" not in v
+    assert v["map.camera_stability.matched_fraction"] == 1.0
+    assert v["map.camera_stability.id_agreement"] == 1.0
+    assert v["pose.camera_locate.located_fraction"] == 1.0
+    assert v["pose.camera_locate.yaw_err_max_deg"] == pytest.approx(0.0, abs=1e-6)
+    assert [r["capture"] for r in ev.details["poses.camera_locate"]] == [
+        c.name for c in PAN_CAPTURES[2:4]]
+    assert not any(k.startswith(("pose.locate.", "pose.single.", "map.stability.")) for k in v)
+    assert set(ev.single_poses) == {"camera"}
+    assert ev.details["poses.camera_single"][3] == {
+        "capture": "img_010_p04_up.jpg", "pan": 4, "tilt": "up", "registered": True,
+        "yaw_deg": 20.0, "pitch_delta_deg": 10.0, "pitch_ok": True}
+    assert ev.details["map.camera_stability"] and ev.details["map.camera_split.pairs"]
+
+
+def test_a_file_name_outside_the_grammar_ends_only_its_sequence(tmp_path: Path) -> None:
+    """A capture sequence whose folder holds an image its grammar does not cover runs nothing;
+    the error is reported and the next section goes on (hidden files are no images)."""
+    examples = tmp_path / "examples"
+    (examples / "camera").mkdir(parents=True)
+    for name in ("img_001_p01_mid.jpg", "IMG_0042.jpg", ".DS_Store"):
+        (examples / "camera" / name).write_bytes(b"")
+    ev = evaluation(tmp_path, examples)
+    ev.capture_sequence(st.CAMERA)
+    assert ev.runner.records == []
+    (error,) = ev.details["errors"]
+    assert error == ("camera: capture names: ValueError: not a pan-tilt capture name "
+                     "(img_NNN_pPP_<tilt>.jpg): 'IMG_0042.jpg'")
+
+
+def test_a_middle_update_publishes_the_objects_its_points_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The middle update's points carry id 5: that object of the map as the update left it is
+    what it published (not the map's other objects)."""
+    left = scene(CAPTURES, [*OBJECTS, box(5, "lamp", (-2.0, -2.0, 1.0))])
+    monkeypatch.setattr(st, "persisted_scene", lambda map_dir: left)
+    ev = ainex(tmp_path)
+    single, split = ev.build_maps(st.AINEX, CAPTURES)
+    assert [[o.id for o in v.objects] for v in ev.published["split"]] == [[1], [5]]
+    ev.map_metrics(st.AINEX, CAPTURES, single, split)
+    # the split map has no lamp: nothing extra; its ids are the one-update map's
+    assert ev.metrics.items["map.stability.unexcused_extra"].value == 0
+    assert ev.metrics.items["map.stability.id_agreement"].detail["published_earlier"] == []
+
+
+def test_a_map_that_cannot_be_read_after_a_middle_update_publishes_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unreadable(map_dir: Path) -> dict[str, Any]:
+        raise NotAMapError(f"not a map folder: {map_dir}")
+
+    monkeypatch.setattr(st, "persisted_scene", unreadable)
+    ev = ainex(tmp_path)
+    single, split = ev.build_maps(st.AINEX, CAPTURES)
+    assert single is not None and split is not None
+    assert [[o.id for o in v.objects] for v in ev.published["split"]] == [[1]]
+    (why,) = ev.details["map.stability.unread"].values()
+    assert why.startswith("NotAMapError: not a map folder")
+
+
+@pytest.mark.parametrize(("middle", "problem"), [
+    ("unlabelled", "no label property and no object list to check the colours against"),
+    ("broken", "ValueError: "),
 ])
 def test_a_middle_update_without_point_labels_publishes_nothing(
-        tmp_path: Path, middle: str, published: set[int], problem: str) -> None:
+        tmp_path: Path, middle: str, problem: str) -> None:
     ev = ainex(tmp_path, middle)
-    ev.build_maps(CAPTURES)
-    assert ev.published == published
+    ev.build_maps(st.AINEX, CAPTURES)
+    assert [[o.id for o in v.objects] for v in ev.published["split"]] == [[1]]
     (found,) = ev.contracts.checks[("colour", "mapper")]["mapper_split_2"]
     assert found.startswith(problem)
 
@@ -251,12 +378,12 @@ def test_a_middle_update_without_point_labels_publishes_nothing(
 def test_a_failed_held_out_locate_fails_its_metrics(tmp_path: Path) -> None:
     ev = ainex(tmp_path)
     ev.runner.env["LOCATE_FAIL"] = "1"
-    single, split = ev.build_maps(CAPTURES)
+    single, split = ev.build_maps(st.AINEX, CAPTURES)
     assert single is not None and split is not None  # the split map is still built
-    assert ev.held_out["located"] is None
+    assert ev.held_out["ainex-captures"]["located"] is None
     assert "locate_held_out/located frames" not in ev.contracts.checks[("openlabel", "mapper")]
     assert ev.contracts.checks[("readonly", "map")] == {"mapper.sh locate (held out)": []}
-    ev.held_out_metrics(split)
+    ev.held_out_metrics(st.AINEX, split)
     for k in ("located_fraction", "yaw_err_median_deg", "yaw_err_max_deg"):
         assert ev.metrics.items[f"pose.locate.{k}"].error == "mapper.sh locate failed"
 
@@ -265,7 +392,7 @@ def test_the_reference_map_runs_failing_leave_nothing_to_compare(tmp_path: Path)
     ev = evaluation(tmp_path)  # every entry point fails
     ref = tmp_path / "ref"
     ref.mkdir()
-    ev.locate_reference(scene(CAPTURES, OBJECTS), ref)
+    ev.locate_reference(st.AINEX, scene(CAPTURES, OBJECTS), ref)
     assert [(r.tag, r.ok) for r in ev.runner.records] == [
         ("locate_single", False), ("locate_full", False), ("locate_ply", False)]
     assert ("openlabel", "mapper") not in ev.contracts.checks
@@ -276,9 +403,9 @@ def test_the_reference_map_runs_failing_leave_nothing_to_compare(tmp_path: Path)
 
 def test_held_out_metrics_without_the_split_map_compare_nothing_later(tmp_path: Path) -> None:
     ev = evaluation(tmp_path)
-    ev.held_out = {"located": {CAPTURES[2].name: POSES[CAPTURES[2].name]},
-                   "reference": Pose.identity(), "captures": CAPTURES[2:3]}
-    ev.held_out_metrics(None)
+    ev.held_out["ainex-captures"] = {"located": {CAPTURES[2].name: POSES[CAPTURES[2].name]},
+                                     "reference": Pose.identity(), "captures": CAPTURES[2:3]}
+    ev.held_out_metrics(st.AINEX, None)
     (row,) = ev.details["poses.locate"]
     assert row["located"] and "vs_mapped_rot_deg" not in row
 
@@ -329,3 +456,53 @@ def test_an_error_ends_only_its_section(tmp_path: Path,
     assert ev.details["errors"] == ["maps: RuntimeError: no map"]
     err = capsys.readouterr().err
     assert "== maps" in err and "Traceback" in err and "== sum" in err
+
+
+# -- street2.mp4 and server.sh share the recording proxy -------------------------------------------------
+
+
+def test_server_sh_needs_the_recording_proxy(tmp_path: Path) -> None:
+    """server.sh's parity needs the inference the commands it is compared with got: without the
+    proxy the section ends with the reason; the proxy is the evaluation's while it runs, and its
+    records are deleted when it stops."""
+    ev = evaluation(tmp_path)
+    assert ev.section("server.sh", ev.server_sh) is None
+    assert ev.details["errors"] == [
+        "server.sh: RuntimeError: the recording inference proxy is not running"]
+    with ev.recording_proxy():
+        runtime = Path(ev.proxy_env["OH_MY_SLAM_RUNTIME_DIR"])
+        assert (runtime / "srv.sock").exists()
+    assert ev.proxy_env == {} and not runtime.exists()
+    assert ev.details["server_sh"]["proxy"] == {"recorded": 0, "replayed": 0, "forwarded": 0}
+
+
+def test_a_proxy_that_does_not_start_ends_only_its_section(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.tools.evaluate import proxy as px
+
+    def refuse(self: px.InferenceProxy) -> px.InferenceProxy:
+        raise OSError("socket path in use")
+
+    monkeypatch.setattr(px.InferenceProxy, "start", refuse)
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    monkeypatch.setattr(px, "short_runtime", lambda: runtime)
+    ev = evaluation(tmp_path)
+    with ev.recording_proxy():
+        assert ev.proxy_env == {}  # street2.mp4 is mapped all the same, server.sh says why not
+    assert not runtime.exists()  # nothing left behind
+    assert ev.details["errors"] == ["inference proxy: OSError: socket path in use"]
+    assert "server_sh" not in ev.details
+
+
+def test_an_annotated_image_whose_segmentation_fails_stays_unjudged(tmp_path: Path) -> None:
+    examples = tmp_path / "examples"
+    (examples / "ground_truth").mkdir(parents=True)
+    (examples / "office_sequence").mkdir()
+    (examples / "office_sequence" / "a.jpg").write_bytes(b"")
+    (examples / "ground_truth" / "a.json").write_text(json.dumps({
+        "kind": "objects", "image": "office_sequence/a.jpg", "objects": [{"label": "cup"}]}))
+    ev = evaluation(tmp_path, examples)  # segment.sh fails
+    ev.annotated_images()
+    assert [(r.tag, r.ok) for r in ev.runner.records] == [("segment_annotated_01", False)]
+    assert ev.images == {}

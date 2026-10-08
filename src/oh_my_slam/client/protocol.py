@@ -44,7 +44,10 @@ class Health(BaseModel):
     queue_depth: int = 0
     queue_limit: int = 8
     uptime_s: float = 0.0
-    detail: str | None = None
+
+    def failures(self) -> str:
+        """The models that failed to load, as ``name: error`` joined by ``; `` (empty if none)."""
+        return "; ".join(f"{m.name}: {m.error}" for m in self.models.values() if m.error)
 
 
 class Timings(BaseModel):
