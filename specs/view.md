@@ -18,7 +18,8 @@ the default browser on its page; `--no-browser` only prints the URL on stderr.
 
 The viewer draws every point of a cloud of at most 16 000 000 points. Above that budget it
 shows a voxel-grid subsample: one original point per occupied voxel, with the smallest voxel
-edge that yields at most 16 000 000 points. Each shown point keeps its own position, colour,
+edge, found to within 2 %, that yields at most 16 000 000 points (the count does not fall
+monotonically with the edge, so an exact smallest edge is not well defined). Each shown point keeps its own position, colour,
 normal and object id (no averaging), and the segmentation layer uses the same subset.
 Whenever points are omitted, the point-cloud controls state "showing X of Y points" with the
 voxel edge. Thinning concerns the display only: PLY outputs and the persisted map stay

@@ -10,7 +10,8 @@ start_inference_server.sh --status | --stop
 Loads the monocular depth-estimation model, the instance-segmentation model, and any other
 service or model needed for mapping, and keeps them resident, so that individual
 reconstructions do not pay model start-up cost. `reconstruct.sh`, `mapper.sh update`,
-`segment.sh` and `view.sh -i` use this server. Any operation that requires inference must
+`segment.sh` and `view.sh -i` use this server, and so does `mapper.sh locate` on a map with
+more keyframes than it matches exhaustively (the limit is recorded in `README.md`). Any operation that requires inference must
 fail with a clear, actionable error if the server is not running. Operations on an already
 persisted map (`view.sh -m`) must not require the inference server.
 

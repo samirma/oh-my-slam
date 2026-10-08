@@ -142,6 +142,12 @@ uploads (create and discard); and the workspace's maps, as a list and one by one
 summary taken from each map's own metadata, so a client can name a map. There are no job,
 download or viewer endpoints.
 
+Because the service listens on the LAN, it refuses (with its own error, listed in the OpenAPI
+document) a request whose `Host` does not name this machine, a state-changing request from a
+foreign `Origin` or with a content type a browser could send cross-site without asking, and an
+upload too large for its cap or for the workspace's free disk space. The caps are recorded in
+`README.md`.
+
 ## Web application
 
 The web application is served at `/` by the same process and uses only the public API, so

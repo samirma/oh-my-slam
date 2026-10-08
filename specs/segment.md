@@ -12,8 +12,9 @@ inference server, and fits an OBB to it. `-i` is required.
 * `-i <image>` — input RGB image.
 * `-f json|png` — output format, **default `json`**.
   * `json` — the scene description of [§3](../high_level_spec.md#3-scene-description-json-returned-by-the-tools): objects, labels, colours and OBBs.
-  * `png` — the segmented image: the input image with each instance mask painted in that
-    object's colour, over a dimmed copy of the original. Identical to `segmented.png` below.
+  * `png` — the segmented image: the input image at the reconstruction's working resolution
+    (recorded in `README.md`) with each instance mask painted in that object's colour, over a
+    dimmed copy of the original. Identical to `segmented.png` below.
 * `-o <file>` — write the result to this file instead of stdout; stdout then stays empty.
 * `-d <folder>` — also write the output artefacts listed below into this folder. Without
   `-o` and `-d`, the result goes to stdout and no files are written.

@@ -17,7 +17,7 @@ The system is exposed through six shell entry points and an agent skill:
 | `segment.sh` | Instance segmentation: image → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
 | `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
 | `server.sh` | Web service: an HTTP API and a simple browser application that run every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` (§2.6). |
-| `SKILL.md` agent skill (`oh-my-slam`) | Lets an AI agent use every feature without help: the local scripts on this Mac, and the `server.sh` API with `curl` from this Mac or any machine on the LAN (§2.7). |
+| `SKILL.md` agent skill (`oh-my-slam`) | Lets an AI agent use every operation of the `server.sh` API without help, with `curl`, from this Mac or any machine on the LAN; the local scripts are out of its scope (§2.7). |
 
 This document states requirements only. Detailed decisions — defaults, coordinate
 conventions, exit codes, the OpenLABEL field mapping, the colour palette — are recorded in
@@ -80,8 +80,8 @@ validation) and must validate against that schema.
 ## 5. Benchmark evaluators
 
 The project must ship benchmark evaluators that measure the accuracy and performance of
-every entry point, using the files in `examples/` as reference inputs. Video sampling
-(`mapper.sh -fps`) is not covered, since the examples contain no video.
+every entry point, using the files in `examples/` as reference inputs, and one video kept
+outside the repository for video sampling (`mapper.sh -fps`).
 
 * `start_inference_server.sh` — cold-start time and resident memory; no input file needed.
 * `examples/restaurant.jpg` — single-frame reference for `reconstruct.sh`, `segment.sh -i`
@@ -91,28 +91,41 @@ every entry point, using the files in `examples/` as reference inputs. Video sam
   and — on the resulting map — for `view.sh -m`. File names encode the
   **commanded** head motion as `NNN_<motion>_<tilt>.jpg`:
   * `NNN` — capture order
+* `examples/camera/` — an ordered 27-frame capture sequence (1920×888, no EXIF) of a real
+  pan-tilt indoor camera turning in place in a home office, through a wide-angle lens with
+  visible distortion. Same uses as `examples/ainex-captures/`: `mapper.sh` and, frame by frame,
+  `segment.sh -i`; and — on the resulting map — `view.sh -m`. File names encode the
+  **commanded** motion as `img_NNN_pPP_<tilt>.jpg`:
+  * `NNN` — capture order
+  * `pPP` — pan position, numbered in pan order: the camera turns left as `PP` increases, by a
+    step angle that is not recorded
+  * `<tilt>` — `down`, `mid` or `up`; the three tilts of one pan position are consecutive
 * `examples/office_sequence/` — an ordered 13-image sequence (file names are capture
   timestamps) of an office scene that changes during the capture: a cup visible in the
   first images is gone in the last ones. Reference input for the map-update behaviour of
   [§2.3](specs/mapper.md): mapping the whole sequence must produce a map that reflects the latest
   observation — without the cup.
+* `street2.mp4` — a 150 s street video, kept outside the repository (its default location is
+  recorded in `README.md`), for `mapper.sh update` at the default `-fps`: performance and the
+  fraction of sampled frames registered.
 
 The evaluators must report at least:
 
 * **Performance** — per-stage and end-to-end wall time and peak memory, per image and per
   mapping update; server cold start and resident memory; `view.sh` time until the page has
   rendered.
-* **Pose accuracy** — estimated camera yaw against the headings encoded in the capture file
-  names, pitch direction of the `up` / `down` frames, and the fraction of frames successfully
-  registered.
+* **Pose accuracy** — on both capture sequences: estimated camera yaw against the headings
+  encoded in the capture file names (for `examples/camera/`, whose step angle is not recorded:
+  yaw that follows the pan order and agrees across the three tilts of one pan position), pitch
+  direction of the `up` / `down` frames, and the fraction of frames successfully registered.
 * **Map quality** — point-cloud consistency across overlapping frames (e.g. the same-heading
   pairs above), and stability of object `id`s, labels and OBBs when the same sequence is
   mapped in one update versus split across several.
 * **Map update** — on `examples/office_sequence/`, the final map reflects the latest
   observation: the cup visible in the first images is absent from the map after the full
   sequence is mapped, while objects that never changed keep their `id`s, labels and OBBs.
-* **Segmentation** — detections, labels and scores per frame (`restaurant.jpg` and each
-  `ainex-captures` frame).
+* **Segmentation** — detections, labels and scores per frame (`restaurant.jpg` and each frame
+  of both capture sequences).
 * **Contracts**, for every command — colour contract, OpenLABEL validity, stdout purity.
 
 Evaluators run as a single command, write a machine-readable result (JSON) and a
