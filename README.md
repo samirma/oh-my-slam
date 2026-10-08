@@ -1318,7 +1318,17 @@ pixels, so its results are unchanged.
    * Otherwise: sequential neighbours plus descriptor retrieval, with loop-closure candidates
      for video.
    * Updates: new keyframes are matched against the whole map up to 150 keyframes, and against
-     retrieved keyframes beyond that.
+     retrieved keyframes beyond that. A new video also gets its own loop-closure candidates, as a
+     new map's: `room.mp4` starts in an office that white walls cut off from the rest of its
+     walk, and only its later view of the office through the door joins that stretch to the map.
+   * **A new camera's lens.** When the new keyframes share one camera that no stored keyframe
+     has and that has no lens yet, their own pairs are matched first. Multi-view poses of the
+     new keyframes alone are refined with the camera's focal length and division distortion
+     (rotation-staged when rotations alone explain the matches within 0.5°: a camera turning in
+     place). A lens found by a fit within 1° becomes the database camera, held from then on;
+     the keyframes are inferred again on their undistorted images, and every pair is matched
+     (again) with it. The wide-angle pan-tilt camera of `examples/camera`, added to a phone
+     video's map of the same office, fits 1390 px and k = −0.513 (0.43°).
 
    **Weak links of a video** are matched again with LightGlue on the same SIFT keypoints
    (COLMAP's `SIFT_LIGHTGLUE`, on the CPU). A cut between two consecutive keyframes is weak
@@ -1482,14 +1492,20 @@ pixels, so its results are unchanged.
      (`updates[].notes.sfm_unsupported`, `sfm_join`) records what was re-placed and how.
    * **Update:** photos of the same size whose EXIF focal length matches an existing camera's
      prior (the same device and zoom) share that camera, and so its refined focal length;
-     without EXIF, frames of the same size share it as before. Incremental mapping continues
+     without EXIF, frames of the same size and the same kind of input (video frames, or
+     photos) share it as before. A video and photos are never one camera: the pan-tilt
+     camera's 1920 x 1080 photos took a phone video's pinhole, and their lens was never fitted. Incremental mapping continues
      the stored model only (no further models), with the map's keyframes and cameras fixed and
      a fixed random seed, and the result is mapped back onto the map frame. A fixed keyframe
      that COLMAP dropped and registered again elsewhere (a weakly supported stored pose) is left
      out of that similarity and keeps its stored pose; a result that moved most of them is
      discarded. New cameras keep the focal length the extension refined. Keyframes it cannot
      place, whose depth contradicts the pose, or whose pose contradicts their verified matches
-     (as above) are posed by anchored MapAnything and refined with the matches and depth.
+     (as above) are posed by anchored MapAnything and refined with the matches and depth. In
+     that refinement each new keyframe's gravity estimate is a prior on its tilt (its GeoCalib
+     uncertainty, at least 1°), since the map is gravity-aligned: `room.mp4`'s office, joined to
+     its walk by 16 loop-closure pairs of 15–21 inliers, was otherwise refined 13–21° off its
+     gravity, and the camera registered on it 17°.
    * **Maps with fewer than 3 keyframes:** SfM is re-run over all keyframes and aligned to the
      stored poses.
    * **Rebuilding a weakly posed map.** An update holds the stored keyframes fixed, so a pose SfM

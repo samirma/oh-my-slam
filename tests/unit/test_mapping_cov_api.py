@@ -56,8 +56,10 @@ def jpg(i: int) -> str:
 def ctx_of(new: list[Any], old: list[Any] | None = None, tmp: Path | None = None,
            **kw: Any) -> SimpleNamespace:
     return SimpleNamespace(new=new, old_frames=old or [], notes={}, pose_support={}, rejected=[],
-                           rescaled={}, meta={}, update_id=1, rebuild=None, features=None,
-                           work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None), **kw)
+                           rescaled={}, meta=kw.pop("meta", {}), update_id=1, rebuild=None,
+                           features=None,
+                           work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None),
+                           lens_camera=kw.pop("lens_camera", None), **kw)
 
 
 class FakeModel:
@@ -181,6 +183,23 @@ def test_an_update_of_a_large_map_is_paired_by_retrieval(tmp_path: Path) -> None
     assert api._pairs_update(ctx_of(new, bare, tx=SimpleNamespace(
         current=lambda rel: tmp_path / "bare" / rel)), is_video=False) == retrieval.all_pairs(
         new_ids)
+
+
+def test_a_video_update_pairs_its_own_loop_closures(tmp_path: Path) -> None:
+    """A stretch of the new video its sequential pairs cannot hold (room.mp4's office, cut off
+    from the rest of the walk by white walls) is paired with a later view of the same place."""
+    rng = np.random.default_rng(2)
+    n = api.LOOP_MIN_GAP + 10
+    desc = rng.normal(size=(n, 8))
+    new = [nf(100 + k, desc[k]) for k in range(n)]
+    ids = [100 + k for k in range(n)]
+    old = [_old(i, tmp_path, None) for i in range(3)]
+    pairs = api._pairs_update(ctx_of(new, old, tx=SimpleNamespace(
+        current=lambda rel: tmp_path / rel)), is_video=True)
+    loops = retrieval.top_k_pairs(desc, desc, api.LOOP_TOP_K, ids, ids, api.LOOP_MIN_GAP)
+    assert loops and any(b - a > api.SEQ_OVERLAP for a, b in loops)
+    assert pairs == retrieval.sequential_pairs(ids, api.SEQ_OVERLAP) | loops | \
+        retrieval.all_pairs(ids, [0, 1, 2])
 
 
 def test_anchors_without_descriptors_are_the_latest_posed_views() -> None:
@@ -417,9 +436,10 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     seen: dict[str, Any] = {}
 
     def refine(p: Any, views: dict[str, Any], free: Any, refine_focal: bool = False,
-               hold_distortion: bool = False) -> PoseFit:
+               hold_distortion: bool = False, gravity: Any = None) -> PoseFit:
         seen["views"] = sorted(views)
         seen["hold_distortion"] = hold_distortion
+        seen["gravity"] = gravity
         return PoseFit({jpg(1): Pose.identity()}, 1.0, 2, 40, 1.0, 0.1, {jpg(1): 0.1},
                        {jpg(1): 40})
 
@@ -431,6 +451,7 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     out, focal, distortion = api._refine_multiview(ctx, sfm, poses, {jpg(1)}, False, False)  # type: ignore[arg-type]
     assert seen["views"] == [jpg(0), jpg(1)]  # stray.jpg: no intrinsics, not stored
     assert seen["hold_distortion"] is False  # pinhole cameras: nothing known to hold
+    assert seen["gravity"] is None  # a new map: not levelled yet
     assert focal == 1.0 and distortion == 0.0 and ctx.pose_support == {jpg(1): (0.1, 40)}
     assert ctx.notes["pose_refinement"]["pairs"] == 2
 

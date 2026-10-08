@@ -52,6 +52,7 @@ from oh_my_slam.mapping.sfm import (
     contradicted,
     shared_camera,
     vet,
+    video_source,
     weak_link_pairs,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
@@ -115,6 +116,8 @@ class UpdateContext:
     features: _EarlyFeatures | None = None
     # a rebuild of the map with this update's keyframes (``_restart_weak_map``)
     rebuild: Rebuild | None = None
+    # the new camera whose lens this update fitted (``_calibrate_new_camera``): held from then on
+    lens_camera: int | None = None
 
 
 @dataclass
@@ -260,7 +263,8 @@ def _lens_of(old: list[store.FrameRecord]) -> Callable[[ingest.Keyframe], Intrin
     (``shared_camera``), if any."""
 
     def of(kf: ingest.Keyframe) -> Intrinsics | None:
-        _, shared = shared_camera(old, upright_size(kf.path), kf.exif is not None)
+        _, shared = shared_camera(old, upright_size(kf.path), kf.exif is not None,
+                                  video=video_source(kf.source))
         return shared.K if shared is not None and shared.K.k else None
 
     return of
@@ -362,7 +366,7 @@ def _camera_prior(new: list[NewFrame], old: list[store.FrameRecord]) -> CameraPr
     focals = [nf.frame.intrinsics.fx for nf in new if nf.full_size == size]
     exif = {nf.kf.exif is not None for nf in new}
     return shared_camera(old, size, exif.pop() if len(exif) == 1 else None,
-                         float(np.median(focals)))[0]
+                         float(np.median(focals)), video=video_source(new[0].kf.source))[0]
 
 
 def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
@@ -381,10 +385,18 @@ def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
 
 
 def _pairs_update(ctx: UpdateContext, is_video: bool) -> set[tuple[int, int]]:
+    """The new keyframes' pairs among themselves (a video's: sequential and, as for a new map,
+    its loop closures) and with the map's keyframes (all of them up to ``UPDATE_EXHAUSTIVE_MAX``,
+    else the most similar). The loop closures join a stretch of the video that its sequential
+    pairs cannot hold (room.mp4's office, cut off from its walk by white walls) through a later
+    view of the same place, before it is judged against the map."""
     new_ids = [nf.kf.index for nf in ctx.new]
     old_ids = [f.index for f in ctx.old_frames]
     pairs = retrieval.sequential_pairs(new_ids, SEQ_OVERLAP) if is_video else \
         retrieval.all_pairs(new_ids)
+    if is_video and all(nf.frame.descriptor is not None for nf in ctx.new):
+        desc = np.stack([nf.frame.descriptor for nf in ctx.new])
+        pairs |= retrieval.top_k_pairs(desc, desc, LOOP_TOP_K, new_ids, new_ids, LOOP_MIN_GAP)
     if len(old_ids) <= UPDATE_EXHAUSTIVE_MAX:
         return pairs | retrieval.all_pairs(new_ids, old_ids)
     reader_desc = []
@@ -549,6 +561,77 @@ def _strengthen_weak_links(ctx: UpdateContext, sfm: Sfm, pairs: set[tuple[int, i
              f"(SIFT {res['verified_before']}) in {time.perf_counter() - t0:.0f} s")
 
 
+# A camera that joins a map in an update (``shared_camera``: none of the map's) starts as the
+# pinhole of its prior focal length, and the extension cannot give it a lens: the wide-angle
+# pan-tilt camera's 36 images (``examples/camera``), added to a phone video's map of the same
+# office, were posed through that pinhole 0.4 m apart, 2 m above the floor, their cloud a second
+# office beside the phone's. Its own matches fit the lens as a new map's multi-view fallback fits
+# it (``_turns_through_lens``, ``panorama``), before the keyframes meet the map's.
+CALIBRATION_MAX_KEYFRAMES = 48  # evenly spaced in capture order: enough pairs, bounded inference
+CALIBRATION_MAX_DEG = 1.0  # median residual of a fit whose lens is taken
+
+
+def _calibrate_new_camera(ctx: UpdateContext, sfm: Sfm, client: Any, progress: Progress
+                          ) -> bool:
+    """Fit the lens of an update's new camera from its keyframes' own verified matches.
+
+    Only when all of them share one database camera that no stored keyframe has and that has no
+    distortion yet. Multi-view poses of the new keyframes alone (their largest matched component,
+    up to ``CALIBRATION_MAX_KEYFRAMES``) are refined with the camera's focal length and distortion
+    (``panorama.refine_turning`` when rotations alone explain the matches within
+    ``TURN_FIT_DEG``: a camera turning in place, else ``panorama.refine_poses``). A lens found
+    (``panorama.DISTORTION_MIN_SHARE``) by a fit within ``CALIBRATION_MAX_DEG`` becomes the
+    database camera's (``Sfm.set_distortion``), held from then on (``UpdateContext.lens_camera``),
+    and the keyframes are inferred again on their undistorted images (``_rerun_undistorted``).
+    Returns whether it did; noted as ``new_camera``."""
+    from oh_my_slam.mapping import panorama
+
+    new_names = {f"{nf.kf.name}.jpg" for nf in ctx.new}
+    cams = sfm.image_intrinsics(new_names)
+    ids = {cid for cid, _ in cams.values()}
+    if (len(ids) != 1 or ids & {f.camera_id for f in ctx.old_frames}
+            or any(K.k for _, K in cams.values())):
+        return False
+    component = sfm.largest_component(new_names)
+    if len(component) < 3:
+        return False
+    K = {n: c for n, (_, c) in cams.items()}
+    todo = sorted((v for v in _new_pool(ctx, K) if v.name in component), key=lambda v: v.name)
+    if len(todo) > CALIBRATION_MAX_KEYFRAMES:
+        todo = [todo[i] for i in
+                np.linspace(0, len(todo) - 1, CALIBRATION_MAX_KEYFRAMES).round().astype(int)]
+    progress(f"fitting the lens of the new camera on {len(todo)} keyframes")
+    poses = _multiview_poses(ctx, todo, [], client)
+    by_name = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    with timing.stage(timing.Stage.POSE_REFINEMENT):
+        views = {n: panorama.View(T, K[n], by_name[n].frame.depth, by_name[n].frame.K_grid,
+                                  by_name[n].full_size) for n, T in poses.items()}
+        pairs = panorama.verified_matches(sfm.db, set(views))
+        free = set(views) - {todo[0].name}
+        turn = panorama.refine_poses(pairs, views, free, refine_focal=True, use_depth=False)
+        turning = turn.pairs > 0 and turn.median_after_deg <= TURN_FIT_DEG
+        refine = panorama.refine_turning if turning else panorama.refine_poses
+        fit = refine(pairs, views, free, refine_focal=True)
+    cam = next(iter(cams.values()))[1]
+    focal = cam.fx * fit.focal_scale
+    note = {"camera": next(iter(ids)), "keyframes": len(todo), "turning": turning,
+            "turning_median_deg": round(turn.median_after_deg, 4), **fit.summary(),
+            "corner_shift": round(panorama.corner_shift((cam.width, cam.height), focal,
+                                                        fit.distortion), 4)}
+    ctx.notes["new_camera"] = note
+    if not fit.distortion or not fit.median_after_deg <= CALIBRATION_MAX_DEG:
+        return False
+    sfm.set_distortion(new_names, fit.focal_scale, fit.distortion)
+    ctx.lens_camera = next(iter(ids))
+    lens = sfm.image_intrinsics(new_names)
+    progress(f"new camera: focal length {focal:.0f} px, lens distortion {fit.distortion:.3f} "
+             f"({fit.median_after_deg:.2f}° median residual"
+             + (", turning in place)" if turning else ")"))
+    _rerun_undistorted(ctx, [(nf, lens[f"{nf.kf.name}.jpg"][1]) for nf in ctx.new], client,
+                       progress)
+    return True
+
+
 def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) -> SfmModel:
     check_versions()
     tx = ctx.tx
@@ -572,7 +655,15 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior, video=is_video)
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
-        n = sfm.match_pairs(pairs, names)
+        new_ids = {nf.kf.index for nf in ctx.new}
+        own = {p for p in pairs if p[0] in new_ids and p[1] in new_ids} if ctx.old_frames \
+            else pairs
+        n = sfm.match_pairs(own, names)
+    if ctx.old_frames and _calibrate_new_camera(ctx, sfm, client, progress):
+        sfm.unmatch(own, names)  # verified again with the lens
+        own, n = set(), 0
+    with timing.stage(timing.Stage.FEATURES_MATCHING):
+        n += sfm.match_pairs(pairs - own, names)
         if is_video:
             _strengthen_weak_links(ctx, sfm, pairs, names, progress)
     timing.count(matched_pairs=n)
@@ -762,13 +853,39 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
         refine = panorama.refine_turning if rotation else panorama.refine_poses
         # a camera whose lens is known keeps it: its matches are where its pinhole sees them
         fit = refine(pairs, views, free, refine_focal=refine_focal,
-                     hold_distortion=any(v.K.k for v in views.values()))
+                     hold_distortion=any(v.K.k for v in views.values()),
+                     gravity=_gravity_priors(ctx, free))
     ctx.notes["pose_refinement"] = fit.summary()
     ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
                                  fit.per_frame_matches.get(n, 0)) for n in fit.poses})
     log.info("pose refinement of %d keyframes: median residual %.3f° -> %.3f° (%d pairs)",
              len(fit.poses), fit.median_before_deg, fit.median_after_deg, fit.pairs)
     return {**poses, **fit.poses}, fit.focal_scale, fit.distortion
+
+
+# GeoCalib's uncertainty below this is not taken at its word: keyframes of one place disagree by
+# about a degree (the livingroom walk: median 0.7°, 90th percentile 2°)
+GRAVITY_PRIOR_MIN_DEG = 1.0
+
+
+def _gravity_priors(ctx: UpdateContext, names: set[str]
+                    ) -> dict[str, tuple[NDArray[np.float64], float]] | None:
+    """The gravity estimates of this update's keyframes ``names`` as priors of their tilt in a
+    map whose +z is up (``map_frame.gravity_aligned``; ``panorama.refine_poses``): up in the
+    camera and its uncertainty (degrees, at least ``GRAVITY_PRIOR_MIN_DEG``). Without them a
+    block that hangs on the map by a few weak matches turns about them: room.mp4's office, joined
+    to its walk by 16 loop-closure pairs of 15-21 inliers, was refined 13-21° off its gravity,
+    and the pan-tilt camera registered on it 17°. Keyframes without an estimate (``default``) and
+    a map not yet levelled (a new one) get none."""
+    if not ctx.old_frames or not ctx.meta.get("map_frame", {}).get("gravity_aligned"):
+        return None
+    out = {}
+    for nf in ctx.new:
+        g, name = nf.frame.gravity, f"{nf.kf.name}.jpg"
+        if name in names and g is not None and g.source != "default":
+            out[name] = (np.asarray(g.up_cam, np.float64), max(
+                GRAVITY_PRIOR_MIN_DEG, float(np.hypot(g.roll_unc_deg, g.pitch_unc_deg))))
+    return out
 
 
 def _complete_registration(sfm: Sfm, model: SfmModel, names: set[str], work: Path) -> SfmModel:
@@ -1282,8 +1399,9 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
     method = "sfm-incremental"
     inc: SfmModel | None = None
     if not rotation and len(ctx.old_frames) >= 3:
-        # the map's cameras keep the intrinsics its stored keyframes were posed and fused with
-        held = sfm.model_cameras(model_in)
+        # the map's cameras keep the intrinsics its stored keyframes were posed and fused with,
+        # a new camera the lens this update fitted
+        held = sfm.model_cameras(model_in) | ({ctx.lens_camera} if ctx.lens_camera else set())
         inc = sfm.map_incremental(ctx.work / "sfm_out", input_path=model_in, fix_existing=True,
                                   constant_cameras=held)
         if inc is not None:

@@ -361,7 +361,8 @@ def _normal_equations(pb: _Problem, r: NDArray[Any], J: NDArray[Any], c: float,
 def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collection[str],
                  refine_focal: bool = False, use_depth: bool = True,
                  scales: tuple[float, ...] = ROBUST_SCALES_PX, hold_focal: bool = False,
-                 hold_distortion: bool = False) -> PoseFit:
+                 hold_distortion: bool = False,
+                 gravity: dict[str, tuple[NDArray[Any], float]] | None = None) -> PoseFit:
     """Refine the camera-to-map poses of the ``free`` keyframes (see the module docstring).
 
     ``views``: every keyframe that may take part (free and fixed); pairs with a keyframe outside
@@ -371,7 +372,10 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     ``FOCAL_MAX_FACTOR`` is a wrong camera, and the refinement starts again with it held
     (``hold_focal``: the distortion alone refined). ``hold_distortion``: the camera's distortion
     is known (the keypoints are where its pinhole sees them), the focal length alone refined.
-    ``use_depth=False`` is the pure-rotation model (centres stay put)."""
+    ``use_depth=False`` is the pure-rotation model (centres stay put). ``gravity``: for free
+    keyframes, the up direction in the camera and its uncertainty (degrees), in a map whose up is
+    +z: the tilt between them is a prior (``_tilt``), which levels a block that hangs on the rest
+    by a few weak matches about the axis they leave free."""
     names = sorted(n for n in free if n in views)
     used_pairs = [p for p in pairs if p.a in views and p.b in views
                   and (p.a in free or p.b in free)]
@@ -412,13 +416,18 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     prior_k = (NOISE_PX / DISTORTION_PRIOR) ** 2
     f_px = float(np.median(pb.f))
     image = (views[names[0]].K.width, views[names[0]].K.height)  # the shared camera's
+    tilts = [(k, np.asarray(gravity[n][0], np.float64) / np.linalg.norm(gravity[n][0]),
+              (NOISE_PX / np.radians(gravity[n][1])) ** 2)
+             for k, n in enumerate(names) if gravity and n in gravity]
 
     def residuals(Rs: NDArray[Any], Cs: NDArray[Any], ph: float, ka: float
                   ) -> NDArray[np.float64]:
         return _evaluate(pb, Rs, Cs, ph, ka, jac=False, lens=False)[0]
 
-    def total(r: NDArray[Any], Cs: NDArray[Any], ph: float, ka: float, c: float) -> float:
+    def total(r: NDArray[Any], Rs: NDArray[Any], Cs: NDArray[Any], ph: float, ka: float,
+              c: float) -> float:
         prior = prior_c * float(np.sum((Cs[fi] - C0) ** 2))
+        prior += sum(w * float(np.sum(_tilt(Rs[fi[k]] @ u)[0] ** 2)) for k, u, w in tilts)
         return _cost(r, c) + 0.5 * (prior + prior_f * ph * ph + prior_k * ka * ka)
 
     def degrees(r: NDArray[Any]) -> NDArray[np.float64]:
@@ -433,7 +442,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     for c in scales:
         lam = 1e-3
         r = residuals(R, C, phi, kappa)
-        current = total(r, C, phi, kappa, c)
+        current = total(r, R, C, phi, kappa, c)
         for _ in range(MAX_ITERATIONS):
             r, J = _evaluate(pb, R, C, phi, kappa, jac=True, lens=npar - 1 not in fixed)
             assert J is not None
@@ -442,6 +451,11 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                 sl = slice(6 * k + 3, 6 * k + 6)
                 H[sl, sl] += prior_c * np.eye(3)
                 g[sl] += prior_c * (C[fi[k]] - C0[k])
+            for k, u, w in tilts:  # gravity prior
+                e, Jt = _tilt(R[fi[k]] @ u)
+                sl = slice(6 * k, 6 * k + 3)
+                H[sl, sl] += w * Jt.T @ Jt
+                g[sl] += w * Jt.T @ e
             H[-2, -2] += prior_f
             g[-2] += prior_f * phi
             H[-1, -1] += prior_k
@@ -465,7 +479,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                     Rn[v] = _exp(delta[6 * k:6 * k + 3]) @ R[v]
                     Cn[v] = C[v] + delta[6 * k + 3:6 * k + 6]
                 phn, kan = phi + float(delta[-2]), kappa + float(delta[-1])
-                cn = total(residuals(Rn, Cn, phn, kan), Cn, phn, kan, c)
+                cn = total(residuals(Rn, Cn, phn, kan), Rn, Cn, phn, kan, c)
                 if cn < current:
                     R, C, phi, kappa, current = Rn, Cn, phn, kan, cn
                     lam = max(lam / 3, 1e-7)
@@ -480,7 +494,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
             fixed.append(npar - 1)
     if refine_focal and abs(phi) > np.log(FOCAL_MAX_FACTOR):
         return refine_poses(pairs, views, free, refine_focal, use_depth, scales,
-                            hold_focal=True, hold_distortion=hold_distortion)
+                            hold_focal=True, hold_distortion=hold_distortion, gravity=gravity)
     final = degrees(residuals(R, C, phi, kappa))
     fit.poses = {n: Pose(R[vid[n]], C[vid[n]]) for n in names}
     fit.focal_scale = float(np.exp(phi))
@@ -492,6 +506,13 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
             fit.per_frame_deg[n] = float(np.median(final[mine]))
             fit.per_frame_matches[n] = int(mine.sum() // 2)
     return fit
+
+
+def _tilt(up: NDArray[Any]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """The tilt of a camera whose up direction in the map is ``up`` (unit): ``up`` x +z (its sine
+    as length), and its Jacobian with respect to a left rotation increment of the camera."""
+    z = np.array([0.0, 0.0, 1.0])
+    return np.cross(up, z), _skew(z[None])[0] @ _skew(np.asarray(up, np.float64)[None])[0]
 
 
 def centre_hints(pairs: list[PairMatches], views: dict[str, View], free: Collection[str]
@@ -512,17 +533,18 @@ def centre_hints(pairs: list[PairMatches], views: dict[str, View], free: Collect
 
 
 def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Collection[str],
-                   refine_focal: bool = False, hold_distortion: bool = False) -> PoseFit:
+                   refine_focal: bool = False, hold_distortion: bool = False,
+                   gravity: dict[str, tuple[NDArray[Any], float]] | None = None) -> PoseFit:
     """``refine_poses`` for rotation-dominant input, whose multi-view camera centres are noise
     (decimetres, where the head moves centimetres) that can trap the joint refinement: first the
     rotations alone (pure-rotation model, centres irrelevant), then every free centre restarts at
     the centre of the fixed keyframes it overlaps (``centre_hints``), then rotations and centres
     are refined together with the depth."""
-    rot = refine_poses(pairs, views, free, use_depth=False)
+    rot = refine_poses(pairs, views, free, use_depth=False, gravity=gravity)
     hints = centre_hints(pairs, views, free)
     staged = {n: replace(v, pose=Pose(rot.poses[n].R, hints[n])) if n in rot.poses else v
               for n, v in views.items()}
     fit = refine_poses(pairs, staged, free, refine_focal=refine_focal,
-                       hold_distortion=hold_distortion)
+                       hold_distortion=hold_distortion, gravity=gravity)
     fit.median_before_deg = rot.median_before_deg
     return fit

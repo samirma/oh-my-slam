@@ -5,6 +5,7 @@ map whose ``map.json`` vanished while it was read."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,7 +17,7 @@ from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import locate as lmod
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.sfm import shared_camera
+from oh_my_slam.mapping.sfm import shared_camera, video_source
 from oh_my_slam.schema import openlabel as ol
 from tests.synth.scene import look_at
 
@@ -44,6 +45,21 @@ def test_a_query_with_exif_takes_a_map_camera_of_its_focal_prior() -> None:
     assert (mixed.existing_id, mixed.same_focal_ids) == (None, ())  # with and without EXIF
     alone, none = shared_camera(frames, (320, 240), False)
     assert (alone.existing_id, none) == (None, None)  # no keyframe of that size
+
+
+def test_a_video_and_photos_without_exif_are_not_one_camera() -> None:
+    """The wide-angle pan-tilt camera's photos, added to a map of a phone video of the same size,
+    took the phone's pinhole: only keyframes of the same kind of input share a camera."""
+    video = [replace(frame(i), source=f"/v/walk.MP4@{i / 2:.3f}") for i in range(2)]
+    photos = [replace(frame(i), source=f"/p/img_{i}.jpg") for i in (2, 3)]
+    assert shared_camera(video, (640, 480), False)[1] is None  # photos: a new camera
+    assert shared_camera(video, (640, 480), False, video=True)[1] == video[1]
+    assert shared_camera(video + photos, (640, 480), False)[1] == photos[1]
+    assert shared_camera(video + photos, (640, 480), False, video=True)[1] == video[1]
+    with_exif, _ = shared_camera(video + photos, (640, 480), True, 500.0, lambda f: f.index)
+    assert with_exif.same_focal_ids == (3, 2)  # the photos' cameras only
+    # an "@" in an image's path is no time in a video
+    assert not video_source("/p/me@home.jpg") and video_source("/v/a.mov@1.500")
 
 
 def test_retrieval_pairs_only_keyframes_with_a_descriptor(monkeypatch: pytest.MonkeyPatch
