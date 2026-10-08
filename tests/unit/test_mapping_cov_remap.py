@@ -137,8 +137,9 @@ def test_a_stored_keyframe_staged_and_in_the_database_is_not_extracted_again(
 
 @pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
 def test_a_one_photo_map_extended_by_a_video_is_mapped_again_in_its_frame(tmp_path: Path) -> None:
-    """A video is not a rebuild's input (only photos are): the map's one keyframe and the
-    video's are posed together and brought into the map frame, which stays at the photo."""
+    """A video does not rebuild a map of fewer than three keyframes (a pan from one spot, it
+    would): the map's one keyframe and the video's are posed together and brought into the map
+    frame, which stays at the photo."""
     client = FakeClient()
     poses = ring(10, span=np.pi)
     imgs = add_frames(client, mapping_room(), poses, tmp_path / "in", "p", depth_noise=0.02,

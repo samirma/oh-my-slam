@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.constants import VIDEO_SUFFIXES
 from oh_my_slam.core.errors import OhMySlamError
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
@@ -119,18 +120,29 @@ class CameraPrior:
     same_focal_ids: tuple[int, ...] = ()
 
 
+def video_source(source: str) -> bool:
+    """Whether a keyframe's ``source`` is a time in a video (``ingest.keyframes``: the video's
+    path, ``@`` and the time), not an image file."""
+    head, sep, _ = source.rpartition("@")
+    return bool(sep) and Path(head).suffix.lower() in VIDEO_SUFFIXES
+
+
 def shared_camera(frames: Iterable[FrameRecord], size: tuple[int, int], exif: bool | None,
                   focal: float | None = None,
-                  camera_id: Callable[[FrameRecord], int] = lambda f: f.camera_id
-                  ) -> tuple[CameraPrior, FrameRecord | None]:
+                  camera_id: Callable[[FrameRecord], int] = lambda f: f.camera_id,
+                  video: bool = False) -> tuple[CameraPrior, FrameRecord | None]:
     """The camera that images of ``size`` share with the map's stored keyframes ``frames`` (their
-    database camera: ``camera_id``), with the keyframe it comes from when there is one. Without
-    EXIF (``exif`` False): the camera of the latest keyframe of that size (more frames of the same
-    video, more photos of the device that took the map). With EXIF: the cameras of that size,
-    latest first, of which ``Sfm.existing_camera`` takes the first whose EXIF focal prior is
+    database camera: ``camera_id``), with the keyframe it comes from when there is one: only
+    keyframes of the same kind of input count (``video`` frames, or images: ``video_source``).
+    Without EXIF (``exif`` False): the camera of the latest such keyframe of that size (more frames
+    of the same video, more photos of the device that took the map). With EXIF: the cameras of that
+    size, latest first, of which ``Sfm.existing_camera`` takes the first whose EXIF focal prior is
     ``focal`` (more photos of the same device and zoom). Else, and for images with and without
-    EXIF together (``exif`` None), a new camera."""
-    same = sorted((f for f in frames if (f.width, f.height) == size), key=lambda f: -f.index)
+    EXIF together (``exif`` None), a new camera. A video and photos without EXIF of the same size
+    are not one camera: the wide-angle pan-tilt camera's 1920 x 1080 images added to a map of a
+    1920 x 1080 phone video took the phone's pinhole, and its lens was never fitted."""
+    same = sorted((f for f in frames if (f.width, f.height) == size
+                   and video_source(f.source) == video), key=lambda f: -f.index)
     if exif is None or (exif is False and not same):
         return CameraPrior(*size, focal=focal), None
     if exif:
@@ -432,10 +444,15 @@ def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
 
 
 class Sfm:
-    def __init__(self, db_path: Path, image_dir: Path, work_dir: Path) -> None:
+    def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
+                 only: Iterable[str] | None = None) -> None:
+        """``only``: the images global and incremental mapping may register (all of the
+        database's without it): an update's keyframes mapped on their own, from a copy of the
+        map's database (``mapping.api._own_map``)."""
         self.db = Path(db_path)
         self.image_dir = Path(image_dir)
         self.work = Path(work_dir)
+        self.only = None if only is None else sorted(set(only))
         self.work.mkdir(parents=True, exist_ok=True)
         self.log_path = self.work / "colmap.log"
         _colmap_logs_to(self.log_path)
@@ -576,6 +593,24 @@ class Sfm:
                 "--FeatureMatching.num_threads", str(SFM_THREADS)]
         _run(args, self.log_path)
         return n
+
+    def unmatch(self, pairs: set[tuple[int, int]], names: dict[int, str]) -> None:
+        """Delete the matches and two-view geometries of ``pairs`` (ids into ``names``): COLMAP
+        skips a pair the database holds, and matched again they are verified with the cameras as
+        they are now (a lens fitted since)."""
+        import pycolmap
+
+        db = pycolmap.Database.open(str(self.db))
+        try:
+            ids = {im.name: im.image_id for im in db.read_all_images()}
+            for a, b in sorted(pairs):
+                i, j = ids[names[a]], ids[names[b]]
+                if db.exists_matches(i, j):
+                    db.delete_matches(i, j)
+                if db.exists_two_view_geometry(i, j):
+                    db.delete_two_view_geometry(i, j)
+        finally:
+            db.close()
 
     def rematch_lightglue(self, pairs: set[frozenset[str]]) -> dict[str, int]:
         """Match ``pairs`` (image names) again with LightGlue on their SIFT keypoints. COLMAP
@@ -773,6 +808,8 @@ class Sfm:
         for o in (opts, mapper, mapper.rotation_averaging, mapper.global_positioning):
             o.random_seed = EXTEND_SEED
         mapper.num_threads = SFM_THREADS
+        if self.only is not None:
+            opts.image_names = self.only
         recs = pycolmap.global_mapping(str(self.db), str(self.image_dir), str(out), opts)
         rec = self._largest(recs)
         return None if rec is None else self._with_others(SfmModel(rec, "sfm-global"), recs)
@@ -797,6 +834,8 @@ class Sfm:
         opts.fix_existing_frames = fix_existing
         opts.structure_less_registration_fallback = True
         opts.num_threads = SFM_THREADS
+        if self.only is not None:
+            opts.image_names = self.only
         if input_path:
             # only the input's continuation: with several models COLMAP goes on to start fresh
             # ones from the images left, the input's own images included, in an unrelated frame —

@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.geometry import Sim3
+from oh_my_slam.core.geometry import Sim3, rot_z
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.depth import fit_frame_scale, global_scale, sample_depth
@@ -148,3 +148,45 @@ def align_by_poses(out_poses: list[Pose], ref_poses: list[Pose]) -> Pose:
 def transform_pose(sim: Sim3, T: Pose) -> Pose:
     M = sim.transform_pose(T.matrix())
     return Pose.from_matrix(M)
+
+
+def upright_similarity(src: NDArray[Any], dst: NDArray[Any], with_scale: bool = True) -> Sim3:
+    """Least-squares similarity of the points ``src`` onto ``dst`` (N, 3) that turns about +z
+    only (yaw, scale, translation): both frames are levelled with gravity. Without
+    ``with_scale`` the scale is 1 (both frames metric)."""
+    ms, md = src.mean(axis=0), dst.mean(axis=0)
+    a, b = src - ms, dst - md
+    yaw = float(np.arctan2(np.sum(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]),
+                           np.sum(a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1])))
+    R = rot_z(yaw)
+    var = float(np.sum(a * a))
+    s = float(np.sum(b * (a @ R.T)) / var) if var > 1e-12 and with_scale else 1.0
+    return Sim3(s, R, md - s * R @ ms)
+
+
+def robust_upright_similarity(src: NDArray[Any], dst: NDArray[Any], tol: NDArray[Any],
+                              samples: int = 2000, seed: int = 0, with_scale: bool = True
+                              ) -> tuple[Sim3, NDArray[np.bool_]] | None:
+    """``upright_similarity`` of the correspondences ``src`` -> ``dst`` that agree with it within
+    ``tol`` (per correspondence, metres): RANSAC over pairs of correspondences at least 10 cm
+    apart horizontally (a seeded generator: the same input aligns the same way), then refitted
+    to the inliers twice. None without three inliers."""
+    rng = np.random.default_rng(seed)
+    n = len(src)
+    best: tuple[Sim3, NDArray[np.bool_]] | None = None
+    for _ in range(samples if n >= 2 else 0):
+        i, j = rng.choice(n, 2, replace=False)
+        if np.linalg.norm(src[i, :2] - src[j, :2]) < 0.1:
+            continue
+        S = upright_similarity(src[[i, j]], dst[[i, j]], with_scale)
+        inl = np.linalg.norm(S.apply(src) - dst, axis=1) < tol
+        if best is None or inl.sum() > best[1].sum():
+            best = (S, inl)
+    if best is None or best[1].sum() < 3:
+        return None
+    inl = best[1]
+    for _ in range(2):
+        S = upright_similarity(src[inl], dst[inl], with_scale)
+        inl = np.linalg.norm(S.apply(src) - dst, axis=1) < tol
+    return S, inl
+

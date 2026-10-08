@@ -52,6 +52,7 @@ from oh_my_slam.mapping.sfm import (
     contradicted,
     shared_camera,
     vet,
+    video_source,
     weak_link_pairs,
 )
 from oh_my_slam.reconstruction.api import KEYFRAME_TOKENS, FrameReconstruction, reconstruct_image
@@ -115,6 +116,8 @@ class UpdateContext:
     features: _EarlyFeatures | None = None
     # a rebuild of the map with this update's keyframes (``_restart_weak_map``)
     rebuild: Rebuild | None = None
+    # the new camera whose lens this update fitted (``_calibrate_new_camera``): held from then on
+    lens_camera: int | None = None
 
 
 @dataclass
@@ -260,7 +263,8 @@ def _lens_of(old: list[store.FrameRecord]) -> Callable[[ingest.Keyframe], Intrin
     (``shared_camera``), if any."""
 
     def of(kf: ingest.Keyframe) -> Intrinsics | None:
-        _, shared = shared_camera(old, upright_size(kf.path), kf.exif is not None)
+        _, shared = shared_camera(old, upright_size(kf.path), kf.exif is not None,
+                                  video=video_source(kf.source))
         return shared.K if shared is not None and shared.K.k else None
 
     return of
@@ -362,7 +366,7 @@ def _camera_prior(new: list[NewFrame], old: list[store.FrameRecord]) -> CameraPr
     focals = [nf.frame.intrinsics.fx for nf in new if nf.full_size == size]
     exif = {nf.kf.exif is not None for nf in new}
     return shared_camera(old, size, exif.pop() if len(exif) == 1 else None,
-                         float(np.median(focals)))[0]
+                         float(np.median(focals)), video=video_source(new[0].kf.source))[0]
 
 
 def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
@@ -381,10 +385,18 @@ def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
 
 
 def _pairs_update(ctx: UpdateContext, is_video: bool) -> set[tuple[int, int]]:
+    """The new keyframes' pairs among themselves (a video's: sequential and, as for a new map,
+    its loop closures) and with the map's keyframes (all of them up to ``UPDATE_EXHAUSTIVE_MAX``,
+    else the most similar). The loop closures join a stretch of the video that its sequential
+    pairs cannot hold (room.mp4's office, cut off from its walk by white walls) through a later
+    view of the same place, before it is judged against the map."""
     new_ids = [nf.kf.index for nf in ctx.new]
     old_ids = [f.index for f in ctx.old_frames]
     pairs = retrieval.sequential_pairs(new_ids, SEQ_OVERLAP) if is_video else \
         retrieval.all_pairs(new_ids)
+    if is_video and all(nf.frame.descriptor is not None for nf in ctx.new):
+        desc = np.stack([nf.frame.descriptor for nf in ctx.new])
+        pairs |= retrieval.top_k_pairs(desc, desc, LOOP_TOP_K, new_ids, new_ids, LOOP_MIN_GAP)
     if len(old_ids) <= UPDATE_EXHAUSTIVE_MAX:
         return pairs | retrieval.all_pairs(new_ids, old_ids)
     reader_desc = []
@@ -549,22 +561,181 @@ def _strengthen_weak_links(ctx: UpdateContext, sfm: Sfm, pairs: set[tuple[int, i
              f"(SIFT {res['verified_before']}) in {time.perf_counter() - t0:.0f} s")
 
 
-def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) -> SfmModel:
-    check_versions()
-    tx = ctx.tx
-    db = tx.clone_for_edit(store.SFM_DB)
-    frames_dir = tx.stage("frames")
-    sfm = Sfm(db, frames_dir, ctx.work / "sfm")
-    names = {nf.kf.index: f"{nf.kf.name}.jpg" for nf in ctx.new}
-    names.update({f.index: Path(f.image).name for f in ctx.old_frames})
-    prior = _camera_prior(ctx.new, ctx.old_frames)
-    if ctx.rebuild is not None and ctx.rebuild.camera is not None:
-        prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
-        # its lens is fitted again from all the keyframes: held from an update of a few of them,
-        # it bent the rebuilt map (examples/camera mapped 9 + 9 + 9: k -0.45 from the first 9
-        # frames against -0.52 from all 27, the rotations 4° off the one-update map's)
-        sfm.drop_distortion(ctx.rebuild.camera)
+# SIFT verifies few inliers between views of one place taken from far apart or from across a
+# room: room.mp4's office (f000184-199) and its later view through the door (f000230-245), 16 of
+# their 256 pairs at 15-21 inliers, all the office was held by; LightGlue on the same keypoints
+# verifies 53 of them, at up to 95. Held by so little, the office was refined 1.6 m from one run
+# to the next. A pair that ties the new keyframes to the map, or a video's stretches to each
+# other (loop closures), and that SIFT verified with fewer inliers is matched again, the most
+# similar first (retrieval descriptor), at most LOOSE_MAX_PAIRS (LightGlue costs ~1 s per pair
+# and CPU thread). Photos are matched exhaustively up to 200 and need none of it; on the
+# synthetic test rooms LightGlue verified a photo of another room against the map. A new map is
+# matched as before: its global SfM, given 38 more loop closures of room.mp4's dark hallway,
+# posed six keyframes 30-37° off their gravity and bent the walk about them.
+LOOSE_PAIR_INLIERS = 40
+LOOSE_MAX_PAIRS = 300
+
+
+def _strengthen_loose_pairs(ctx: UpdateContext, sfm: Sfm, pairs: set[tuple[int, int]],
+                            names: dict[int, str], progress: Progress) -> None:
+    """A video added to a map: LightGlue matches again the listed pairs between a new and a stored
+    keyframe, and the video's loop closures (more than ``SEQ_OVERLAP`` apart), that SIFT verified
+    with fewer than ``LOOSE_PAIR_INLIERS`` inliers or not at all: the ``LOOSE_MAX_PAIRS`` most
+    similar by their retrieval descriptors (``Sfm.rematch_lightglue``, which keeps SIFT's result
+    where it verified more). Noted as ``loose_pairs``."""
+    new_ids = {nf.kf.index for nf in ctx.new}
+    listed = sorted((a, b) for a, b in pairs if (a in new_ids) != (b in new_ids)
+                    or abs(a - b) > SEQ_OVERLAP)
+    if not listed:
+        return
+    desc: dict[int, NDArray[np.float32] | None] = {nf.kf.index: nf.frame.descriptor
+                                                   for nf in ctx.new}
+    old = {f.index: f for f in ctx.old_frames}
+    verified = sfm.verified_pairs(min_inliers=1)
+    loose: list[tuple[float, int, int]] = []
+    for a, b in listed:
+        if verified.get(frozenset((names[a], names[b])), (0, 0))[0] >= LOOSE_PAIR_INLIERS:
+            continue
+        for i in (a, b):
+            if i not in desc:
+                desc[i] = _stored_descriptor(ctx, old[i])
+        da, db = desc[a], desc[b]
+        sim = 0.0 if da is None or db is None else float(retrieval.similarity(
+            da[None], db[None])[0, 0])
+        loose.append((sim, a, b))
+    top = sorted(loose, key=lambda x: (-x[0], x[1], x[2]))[:LOOSE_MAX_PAIRS]
+    if not top:
+        return
     t0 = time.perf_counter()
+    with timing.part("lightglue"):
+        res = sfm.rematch_lightglue({frozenset((names[a], names[b])) for _, a, b in top})
+    timing.count(lightglue_loose_pairs=res["pairs"])
+    ctx.notes["loose_pairs"] = {"candidates": len(loose), **res}
+    progress(f"LightGlue on {res['pairs']} loosely verified pairs (map and loop closures): "
+             f"{res['verified_after']} verified (SIFT {res['verified_before']}) in "
+             f"{time.perf_counter() - t0:.0f} s")
+
+
+def _pan_onto_video(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,
+                    progress: Progress, t0: float) -> SfmModel:
+    """A pan from one spot rebuilt with a video (``_restart_plan``), mapped as the video and then
+    the pan would be: the video on its own (``_own_map``), the pan's keyframes registered onto it
+    with their lens held (incremental mapping continuing it, anchored multi-view for those it
+    leaves) and given one centre (``_one_centre``). The video's poses are kept; the model is in
+    metres. Mapped together by global SfM, the wide-angle pan-tilt camera's 36 keyframes bent
+    room.mp4's walk (98 keyframes realigned, the lens refitted to k -0.41) or were left out.
+    Raises ``RegistrationError`` (the rebuild is abandoned) when the video maps on its own to
+    fewer than three keyframes."""
+    assert ctx.rebuild is not None
+    stored = {f"{n}.jpg" for n in ctx.rebuild.uids} & new_names
+    own = _own_map(ctx, sfm, new_names - stored, client, progress)
+    if own is None:
+        raise RegistrationError("the video does not map on its own")
+    base = ctx.work / "pan_base"
+    own.model.write(base)
+    lens = {cid for cid, _ in sfm.image_intrinsics(stored).values()}
+    inc = sfm.map_incremental(ctx.work / "pan_inc", input_path=base, fix_existing=True,
+                              constant_cameras=sfm.model_cameras(base) | lens)
+    poses = dict(own.poses)
+    if inc is not None:
+        poses.update({n: inc.pose(n) for n in inc.registered if n in stored})
+    missing = sorted(stored - set(poses))
+    if missing:
+        K = _keyframe_intrinsics(ctx, sfm, stored)
+        pool = [v for v in _new_pool(ctx, K) if v.name in poses]
+        for v in pool:
+            v.pose = poses[v.name]
+        mv = _multiview_poses(ctx, [v for v in _new_pool(ctx, K) if v.name in missing], pool,
+                              client)
+        poses.update(mv)
+        ctx.notes["mv_names"] = sorted(mv)
+    poses = _one_centre(ctx, sfm, poses, stored, model=inc) or poses
+    model = sfm.extend_with_poses(base, {n: poses[n] for n in stored}, ctx.work / "sfm_pan",
+                                  "own-map+pan")
+    model.notes.update(metric=True, scale_method="own_map")
+    progress(f"the pan's {len(stored)} keyframes registered onto the video mapped on its own "
+             f"({len(missing)} by anchored multi-view) in {time.perf_counter() - t0:.0f} s")
+    return model
+
+
+# A camera that joins a map in an update (``shared_camera``: none of the map's) starts as the
+# pinhole of its prior focal length, and the extension cannot give it a lens: the wide-angle
+# pan-tilt camera's 36 images (``examples/camera``), added to a phone video's map of the same
+# office, were posed through that pinhole 0.4 m apart, 2 m above the floor, their cloud a second
+# office beside the phone's. Its own matches fit the lens as a new map's multi-view fallback fits
+# it (``_turns_through_lens``, ``panorama``), before the keyframes meet the map's.
+CALIBRATION_MAX_KEYFRAMES = 48  # evenly spaced in capture order: enough pairs, bounded inference
+CALIBRATION_MAX_DEG = 1.0  # median residual of a fit whose lens is taken
+
+
+def _calibrate_new_camera(ctx: UpdateContext, sfm: Sfm, client: Any, progress: Progress
+                          ) -> bool:
+    """Fit the lens of an update's new camera from its keyframes' own verified matches.
+
+    Only when all of them share one database camera that no stored keyframe has and that has no
+    distortion yet. Multi-view poses of the new keyframes alone (their largest matched component,
+    up to ``CALIBRATION_MAX_KEYFRAMES``) are refined with the camera's focal length and distortion
+    (``panorama.refine_turning`` when rotations alone explain the matches within
+    ``TURN_FIT_DEG``: a camera turning in place, else ``panorama.refine_poses``). A lens found
+    (``panorama.DISTORTION_MIN_SHARE``) by a fit within ``CALIBRATION_MAX_DEG`` becomes the
+    database camera's (``Sfm.set_distortion``), held from then on (``UpdateContext.lens_camera``),
+    and the keyframes are inferred again on their undistorted images (``_rerun_undistorted``).
+    Returns whether it did; noted as ``new_camera``."""
+    from oh_my_slam.mapping import panorama
+
+    new_names = {f"{nf.kf.name}.jpg" for nf in ctx.new}
+    cams = sfm.image_intrinsics(new_names)
+    ids = {cid for cid, _ in cams.values()}
+    if (len(ids) != 1 or ids & {f.camera_id for f in ctx.old_frames}
+            or any(K.k for _, K in cams.values())):
+        return False
+    component = sfm.largest_component(new_names)
+    if len(component) < 3:
+        return False
+    K = {n: c for n, (_, c) in cams.items()}
+    todo = sorted((v for v in _new_pool(ctx, K) if v.name in component), key=lambda v: v.name)
+    if len(todo) > CALIBRATION_MAX_KEYFRAMES:
+        todo = [todo[i] for i in
+                np.linspace(0, len(todo) - 1, CALIBRATION_MAX_KEYFRAMES).round().astype(int)]
+    progress(f"fitting the lens of the new camera on {len(todo)} keyframes")
+    poses = _multiview_poses(ctx, todo, [], client)
+    by_name = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    with timing.stage(timing.Stage.POSE_REFINEMENT):
+        views = {n: panorama.View(T, K[n], by_name[n].frame.depth, by_name[n].frame.K_grid,
+                                  by_name[n].full_size) for n, T in poses.items()}
+        pairs = panorama.verified_matches(sfm.db, set(views))
+        free = set(views) - {todo[0].name}
+        turn = panorama.refine_poses(pairs, views, free, refine_focal=True, use_depth=False)
+        turning = turn.pairs > 0 and turn.median_after_deg <= TURN_FIT_DEG
+        refine = panorama.refine_turning if turning else panorama.refine_poses
+        fit = refine(pairs, views, free, refine_focal=True)
+    cam = next(iter(cams.values()))[1]
+    focal = cam.fx * fit.focal_scale
+    note = {"camera": next(iter(ids)), "keyframes": len(todo), "turning": turning,
+            "turning_median_deg": round(turn.median_after_deg, 4), **fit.summary(),
+            "corner_shift": round(panorama.corner_shift((cam.width, cam.height), focal,
+                                                        fit.distortion), 4)}
+    ctx.notes["new_camera"] = note
+    if not fit.distortion or not fit.median_after_deg <= CALIBRATION_MAX_DEG:
+        return False
+    sfm.set_distortion(new_names, fit.focal_scale, fit.distortion)
+    ctx.lens_camera = next(iter(ids))
+    lens = sfm.image_intrinsics(new_names)
+    progress(f"new camera: focal length {focal:.0f} px, lens distortion {fit.distortion:.3f} "
+             f"({fit.median_after_deg:.2f}° median residual"
+             + (", turning in place)" if turning else ")"))
+    _rerun_undistorted(ctx, [(nf, lens[f"{nf.kf.name}.jpg"][1]) for nf in ctx.new], client,
+                       progress)
+    return True
+
+
+def _features_and_matching(ctx: UpdateContext, sfm: Sfm, names: dict[int, str],
+                           prior: CameraPrior, is_video: bool, client: Any, progress: Progress
+                           ) -> int:
+    """SIFT features of the new keyframes and the matches of their pairs (``_pairs_new_map``,
+    ``_pairs_update``); an update's own pairs first, so that a new camera's lens is fitted from
+    them (``_calibrate_new_camera``) before its keyframes meet the map's. Weak links of a video
+    and loosely verified pairs are matched again with LightGlue. Returns the pairs matched."""
     with timing.stage(timing.Stage.FEATURES_MATCHING):
         if ctx.features is not None:
             ctx.features.finish(prior)
@@ -572,18 +743,61 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             sfm.extract([f"{nf.kf.name}.jpg" for nf in ctx.new], prior, video=is_video)
         pairs = _pairs_new_map(ctx.new, is_video) if not ctx.old_frames else _pairs_update(
             ctx, is_video)
-        n = sfm.match_pairs(pairs, names)
+        if ctx.rebuild is not None and is_video:  # a pan's keyframes with all the video's
+            pan = [nf.kf.index for nf in ctx.new if nf.kf.name in ctx.rebuild.uids]
+            pairs |= retrieval.all_pairs(pan, [nf.kf.index for nf in ctx.new
+                                               if nf.kf.name not in ctx.rebuild.uids])
+        new_ids = {nf.kf.index for nf in ctx.new}
+        own = {p for p in pairs if p[0] in new_ids and p[1] in new_ids} if ctx.old_frames \
+            else pairs
+        n = sfm.match_pairs(own, names)
+    if ctx.old_frames and _calibrate_new_camera(ctx, sfm, client, progress):
+        sfm.unmatch(own, names)  # verified again with the lens
+        own, n = set(), 0
+    with timing.stage(timing.Stage.FEATURES_MATCHING):
+        n += sfm.match_pairs(pairs - own, names)
         if is_video:
             _strengthen_weak_links(ctx, sfm, pairs, names, progress)
-    timing.count(matched_pairs=n)
-    progress(f"features + matching: {n} pairs in {time.perf_counter() - t0:.0f} s")
+            if ctx.old_frames:
+                _strengthen_loose_pairs(ctx, sfm, pairs, names, progress)
+    return n
+
+
+def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress,
+             own_db: Path | None = None) -> SfmModel:
+    """Pose the update's keyframes (a new map's, or onto the map's: ``_extend``). With
+    ``own_db``, a copy of the map's database that holds their features and matches already,
+    they are mapped on their own as a new map would be (``_own_map``): nothing is matched, and
+    only they are registered."""
+    check_versions()
+    tx = ctx.tx
+    frames_dir = tx.stage("frames")
+    names = {nf.kf.index: f"{nf.kf.name}.jpg" for nf in ctx.new}
+    names.update({f.index: Path(f.image).name for f in ctx.old_frames})
+    prior = _camera_prior(ctx.new, ctx.old_frames)
+    t0 = time.perf_counter()
+    if own_db is not None:
+        sfm = Sfm(own_db, frames_dir, ctx.work / "sfm", only=names.values())
+    else:
+        sfm = Sfm(tx.clone_for_edit(store.SFM_DB), frames_dir, ctx.work / "sfm")
+        if ctx.rebuild is not None and ctx.rebuild.camera is not None:
+            prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
+            # its lens is fitted again from all the keyframes: held from an update of a few of
+            # them, it bent the rebuilt map (examples/camera mapped 9 + 9 + 9: k -0.45 from the
+            # first 9 frames against -0.52 from all 27, the rotations 4° off the one-update map's)
+            sfm.drop_distortion(ctx.rebuild.camera)
+        n = _features_and_matching(ctx, sfm, names, prior, is_video, client, progress)
+        timing.count(matched_pairs=n)
+        progress(f"features + matching: {n} pairs in {time.perf_counter() - t0:.0f} s")
     t0 = time.perf_counter()
     new_names = {f"{nf.kf.name}.jpg" for nf in ctx.new}
     stats = sfm.two_view_stats(new_names if not ctx.old_frames else None)
     ctx.notes["two_view"] = stats
     rotation = stats["rotation_fraction"] > ROTATION_PAIR_FRACTION
     if ctx.old_frames:
-        return _extend(ctx, sfm, new_names, rotation, client, progress, t0)
+        return _extend(ctx, sfm, new_names, rotation, is_video, client, progress, t0)
+    if ctx.rebuild is not None and is_video:  # a pan from one spot, rebuilt with a video
+        return _pan_onto_video(ctx, sfm, new_names, client, progress, t0)
     component = sfm.largest_component(new_names)
     if len(component) < 2:
         component = new_names
@@ -629,6 +843,10 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                                                  refine_focal=True, rotation=rotation)
     mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", focal_scale=focal,
                                           distortion=distortion)
+    if distortion:  # the lens is the database camera's now: one centre if the camera turns
+        one = _one_centre(ctx, sfm, poses, set(poses), gauge=todo[0].name)
+        if one is not None:
+            mv_model = sfm.triangulate_with_poses(one, ctx.work / "sfm_mv_one")
     mv_model.notes.update(reason=reason, metric=True)
     progress(f"multi-view + refinement: {len(mv_model.registered)} keyframes in "
              f"{time.perf_counter() - t0:.0f} s")
@@ -732,14 +950,15 @@ def _keyframe_intrinsics(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> dict[
 
 
 def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free: set[str],
-                      refine_focal: bool, rotation: bool, model: SfmModel | None = None
-                      ) -> tuple[dict[str, Pose], float, float]:
+                      refine_focal: bool, rotation: bool, model: SfmModel | None = None,
+                      hold_centres: bool = False) -> tuple[dict[str, Pose], float, float]:
     """Refine the multi-view poses of the keyframes ``free`` with every verified feature match
     and the keyframes' monocular depth (``mapping.panorama``; staged for ``rotation``-dominant
     input); every other keyframe — this update's other posed keyframes and the map's — holds
     still. Returns all poses, the factor of the shared focal length and the shared camera's
     division coefficient (1 and 0 unless ``refine_focal``: ``panorama``). With the SfM ``model``
-    the poses are in, its cameras (refined focal length) are used."""
+    the poses are in, its cameras (refined focal length) are used. ``hold_centres``: the
+    rotations alone are refined, with the depth (``panorama.refine_poses``)."""
     from oh_my_slam.mapping import panorama
 
     new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
@@ -759,16 +978,100 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
                 f = old[n]
                 views[n] = panorama.View(f.T_map_cam, f.K, store.load_depth(ctx.tx.current, f.name),
                                          f.K_grid, (f.width, f.height), f.K if f.K.k else None)
-        refine = panorama.refine_turning if rotation else panorama.refine_poses
         # a camera whose lens is known keeps it: its matches are where its pinhole sees them
-        fit = refine(pairs, views, free, refine_focal=refine_focal,
-                     hold_distortion=any(v.K.k for v in views.values()))
+        known = any(v.K.k for v in views.values())
+        gravity, up = _gravity_priors(ctx, free, poses) or (None, None)
+        if hold_centres:
+            fit = panorama.refine_poses(pairs, views, free, refine_focal=refine_focal,
+                                        hold_centres=True, hold_distortion=known,
+                                        gravity=gravity, up=up)
+        else:
+            refine = panorama.refine_turning if rotation else panorama.refine_poses
+            fit = refine(pairs, views, free, refine_focal=refine_focal, hold_distortion=known,
+                         gravity=gravity, up=up)
     ctx.notes["pose_refinement"] = fit.summary()
     ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
                                  fit.per_frame_matches.get(n, 0)) for n in fit.poses})
     log.info("pose refinement of %d keyframes: median residual %.3f° -> %.3f° (%d pairs)",
              len(fit.poses), fit.median_before_deg, fit.median_after_deg, fit.pairs)
     return {**poses, **fit.poses}, fit.focal_scale, fit.distortion
+
+
+# A pan-tilt camera turns about one spot: its optical centre moves by centimetres. Posed keyframe
+# by keyframe, through few matches, its views looking up at a bare ceiling went 0.13-0.17 m from
+# the others (examples/camera added to a map of room.mp4). With a lens fitted (a wide-angle camera
+# that SfM's pinhole cannot pose), keyframes that one centre explains within TURN_CAMERA_DEG
+# (median residual of their matches, rotations refined alone) are given it.
+TURN_CAMERA_DEG = 1.0
+
+
+def _one_centre(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], names: set[str],
+                model: SfmModel | None = None, gauge: str | None = None
+                ) -> dict[str, Pose] | None:
+    """The keyframes ``names`` of a camera turning in place, given one centre — the median of
+    their centres (of those SfM registered, when three or more: ``mv_names`` are not) — and their
+    rotations refined alone (``_refine_multiview`` with the centres held; every other keyframe,
+    and a new map's ``gauge`` keyframe, fixed). Returns all poses, or None (the refinement's notes
+    left as they were) when the matches disagree with one centre by more than
+    ``TURN_CAMERA_DEG``. Noted as ``one_centre``."""
+    names = {n for n in names if n in poses}
+    if len(names) < 3:
+        return None
+    sfm_posed = sorted(names - set(ctx.notes.get("mv_names", [])))
+    C = np.median([poses[n].t for n in (sfm_posed if len(sfm_posed) >= 3 else sorted(names))],
+                  axis=0)
+    before = (dict(ctx.notes.get("pose_refinement", {})), dict(ctx.pose_support))
+    trial = {**poses, **{n: Pose(poses[n].R, C) for n in names}}
+    names.discard(gauge)  # type: ignore[arg-type]
+    out, _, _ = _refine_multiview(ctx, sfm, trial, names, refine_focal=False, rotation=False,
+                                  model=model, hold_centres=True)
+    median = float(ctx.notes["pose_refinement"]["median_after_deg"])
+    taken = median <= TURN_CAMERA_DEG
+    ctx.notes["one_centre"] = {
+        "keyframes": len(names), "median_deg": round(median, 4), "taken": taken,
+        "spread_before_m": round(float(max(np.linalg.norm(poses[n].t - C) for n in names)), 4)}
+    if taken:
+        return out
+    ctx.notes["pose_refinement"], ctx.pose_support = before
+    return None
+
+
+# GeoCalib's uncertainty below this is not taken at its word: keyframes of one place disagree by
+# about a degree (the livingroom walk: median 0.7°, 90th percentile 2°)
+GRAVITY_PRIOR_MIN_DEG = 1.0
+
+
+def _gravity_priors(ctx: UpdateContext, names: set[str], poses: dict[str, Pose]
+                    ) -> tuple[dict[str, tuple[NDArray[np.float64], float]],
+                               NDArray[np.float64]] | None:
+    """The gravity estimates of this update's keyframes ``names`` as priors of their tilt
+    (``panorama.refine_poses``): up in the camera and its uncertainty (degrees, at least
+    ``GRAVITY_PRIOR_MIN_DEG``), with the map's up — +z in a map levelled with gravity
+    (``map_frame.gravity_aligned``), else, in a new map not levelled yet, the robust mean up of
+    this update's other posed keyframes (``poses``; at least three with an estimate). Without
+    them a block that hangs on the map by a few weak matches turns about them: room.mp4's office,
+    joined to its walk by 16 loop-closure pairs of 15-21 inliers, was refined 13-21° off its
+    gravity, and the pan-tilt camera registered on it 17°; mapped alone, its dark hallway hung
+    20-38° off. Keyframes without an estimate (``default``) get no prior."""
+    from oh_my_slam.mapping.trajectory import mean_direction
+
+    est = {f"{nf.kf.name}.jpg": nf.frame.gravity for nf in ctx.new
+           if nf.frame.gravity is not None and nf.frame.gravity.source != "default"}
+    if ctx.old_frames:
+        if not ctx.meta.get("map_frame", {}).get("gravity_aligned"):
+            return None
+        up = np.array([0.0, 0.0, 1.0])
+    else:
+        held = [poses[n].R @ np.asarray(g.up_cam, np.float64) for n, g in sorted(est.items())
+                if n in poses and n not in names]
+        mean = mean_direction(held) if len(held) >= 3 else None
+        if mean is None:
+            return None
+        up = mean
+    out = {n: (np.asarray(g.up_cam, np.float64), max(
+        GRAVITY_PRIOR_MIN_DEG, float(np.hypot(g.roll_unc_deg, g.pitch_unc_deg))))
+        for n, g in est.items() if n in names}
+    return out, up
 
 
 def _complete_registration(sfm: Sfm, model: SfmModel, names: set[str], work: Path) -> SfmModel:
@@ -1265,9 +1568,14 @@ def _refined_pose_contradicted(ctx: UpdateContext, name: str) -> bool:
                                        "pose_residual_deg": res if np.isfinite(res) else None})
 
 
-def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, client: Any,
-            progress: Progress, t0: float) -> SfmModel:
-    """Update: place the new keyframes in the existing map frame (old frames fixed)."""
+def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, is_video: bool,
+            client: Any, progress: Progress, t0: float) -> SfmModel:
+    """Update: place the new keyframes in the existing map frame (old frames fixed).
+
+    Incremental mapping continues the stored model. A video whose keyframes it leaves
+    unregistered, at least ``OWN_MAP_MIN_KEYFRAMES`` of them, is mapped on its own and placed as
+    one block (``_own_map``, ``_align_own_map``). The keyframes still missing then get anchored
+    multi-view poses, and the poses of both are refined with the matches, depth and gravity."""
     old_names = {Path(f.image).name for f in ctx.old_frames}
     model_in = ctx.tx.root / store.SFM_MODEL
     if len(ctx.old_frames) < 3 or not (model_in / "images.bin").exists():
@@ -1277,13 +1585,12 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
     if not connected:
         raise RegistrationError("none of the input frames overlaps the map (no verified "
                                 "feature matches); the map is unchanged")
-    model_in = ctx.tx.root / store.SFM_MODEL
     poses: dict[str, Pose] = {}
-    method = "sfm-incremental"
     inc: SfmModel | None = None
     if not rotation and len(ctx.old_frames) >= 3:
-        # the map's cameras keep the intrinsics its stored keyframes were posed and fused with
-        held = sfm.model_cameras(model_in)
+        # the map's cameras keep the intrinsics its stored keyframes were posed and fused with,
+        # a new camera the lens this update fitted
+        held = sfm.model_cameras(model_in) | ({ctx.lens_camera} if ctx.lens_camera else set())
         inc = sfm.map_incremental(ctx.work / "sfm_out", input_path=model_in, fix_existing=True,
                                   constant_cameras=held)
         if inc is not None:
@@ -1293,9 +1600,27 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
             for name in sorted((set(inc.registered) & connected) - set(bad)):
                 if _depth_consistent(ctx, inc, name):
                     poses[name] = inc.pose(name)
+    parts = ["sfm-incremental"] if poses else []
+    block: dict[str, Pose] = {}
+    if is_video and not rotation and len(connected - set(poses)) >= OWN_MAP_MIN_KEYFRAMES:
+        own = _own_map(ctx, sfm, new_names, client, progress)
+        if own is not None:
+            # both metric: the block keeps its size, unless the map's is the weak one (a pan from
+            # one spot, at the scale of its own depth) or the block has none of its own
+            weak = ctx.meta.get("scale", {}).get("method") == "multiview_depth"
+            block = _align_own_map(ctx, sfm, own.poses, progress, posed=poses,
+                                   with_scale=weak or not own.metric)
+            if block:
+                parts.append("own-map")
+                if own.method == "multiview":  # no SfM points: the depth is aligned densely
+                    ctx.notes["mv_names"] = sorted(block)
+    # the block keeps its shape: the keyframes the extension registered too take their place in
+    # it, and the refinement below moves them all, the matches holding the block to the map
+    poses.update(block)
     missing = sorted(connected - set(poses))
+    mv: dict[str, Pose] = {}
     if missing:
-        method = "multiview" if not poses else "sfm-incremental+multiview"
+        parts.append("multiview")
         K = (_model_intrinsics(sfm, inc, new_names) if inc is not None
              else _keyframe_intrinsics(ctx, sfm, new_names))
         pool = _old_pool(ctx) + [v for v in _new_pool(ctx, K) if v.name in poses]
@@ -1307,9 +1632,14 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
                  + (" (rotation-dominant input)" if rotation else ""))
         mv = _multiview_poses(ctx, todo, pool, client)
         poses.update(mv)
-        poses, _, _ = _refine_multiview(ctx, sfm, poses, set(mv), refine_focal=False,
+        ctx.notes["mv_names"] = sorted(set(ctx.notes.get("mv_names", [])) | set(mv))
+    if block or mv:
+        free = set(mv) | (set(poses) & new_names if block else set())
+        poses, _, _ = _refine_multiview(ctx, sfm, poses, free, refine_focal=False,
                                         rotation=rotation, model=inc)
-        ctx.notes["mv_names"] = sorted(mv)
+    if ctx.lens_camera is not None:  # a wide-angle camera of this update: one centre if it turns
+        poses = _one_centre(ctx, sfm, poses, set(poses) & new_names, model=inc) or poses
+    method = "+".join(parts) or "sfm-incremental"
     # new cameras keep the intrinsics the incremental extension refined the poses with
     model = sfm.extend_with_poses(
         model_in, poses, ctx.work / "sfm_ext", method,
@@ -1317,6 +1647,180 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, c
     progress(f"registered {len(poses)}/{len(new_names)} new keyframes ({method}) in "
              f"{time.perf_counter() - t0:.0f} s")
     return model
+
+
+# A video added to a map it overlaps only at a few places was placed keyframe by keyframe, each
+# chunk of anchored multi-view poses on the stored keyframes it looks most like: livingroom.mp4
+# added to a map of room.mp4, which it meets at 14 pairs of 15-20 inliers (the office seen far
+# down the hallway), was anchored on bedroom and laundry keyframes, shrunk to a third and stacked
+# onto them, its depth scales driven to 0. Mapped on its own it is one well-posed block (its 1594
+# verified pairs: a new map of it is posed by global SfM alone), which the few points it shares
+# with the map place as a whole.
+OWN_MAP_MIN_KEYFRAMES = 12
+OWN_ALIGN_MAX_DEPTH = 8.0  # m: farther points are too uncertain to place a block with
+OWN_ALIGN_TOL = (0.05, 0.08)  # a point agrees within max(5 cm, 8 % of its depth in the map)
+OWN_ALIGN_MIN_INLIERS = 40
+OWN_ALIGN_MIN_PAIRS = 3  # verified pairs the agreeing points come from
+OWN_ALIGN_SCALE = (1 / 3, 3.0)
+OWN_ALIGN_CENTRE_TOL = 0.10  # m: a registered keyframe's centre agrees within this
+# the block's floor is put on the map's when the two are this close once placed (further apart,
+# they may be different floors): placed by the far points of its view down a hallway alone,
+# livingroom.mp4 stood 0.22 m above room.mp4's floor
+OWN_FLOOR_TIE_M = 0.4
+
+
+@dataclass
+class OwnMap:
+    """New keyframes mapped on their own (``_own_map``), in a frame of their own levelled with
+    their gravity."""
+
+    poses: dict[str, Pose]
+    method: str
+    metric: bool  # in metres (else the alignment fits the scale)
+    model: SfmModel  # the reconstruction, in that frame
+
+
+def _own_map(ctx: UpdateContext, sfm: Sfm, names: set[str], client: Any, progress: Progress
+             ) -> OwnMap | None:
+    """The new keyframes ``names`` mapped on their own, as a new map of them would be
+    (``_run_sfm``, from a copy of the map's database: their features and matches, nothing of
+    the map), in a frame of their own levelled with their gravity and in metres (their depth
+    over the SfM points, ``frame.metric_scale``; multi-view poses, and a model joined in metres,
+    are metric already). None when fewer than three are posed. Noted as ``own_map``."""
+    work = ctx.work / "own_map"
+    work.mkdir(parents=True, exist_ok=True)
+    db = work / "database.db"
+    shutil.copyfile(sfm.db, db)
+    own = UpdateContext(ctx.tx, {}, [], [nf for nf in ctx.new if f"{nf.kf.name}.jpg" in names],
+                        ctx.update_id, work)
+    progress(f"mapping {len(own.new)} keyframes on their own")
+    model = _run_sfm(own, True, client, lambda m: progress(f"own map: {m}"), own_db=db)
+    poses = {n: model.pose(n) for n in model.registered if n in names}
+    ctx.notes["own_map"] = {"method": model.method, "posed": len(poses), "of": len(names)}
+    if len(poses) < 3:
+        return None
+    fds = _frame_depths(own)
+    scale = 1.0
+    metric = bool(model.notes.get("metric") or "prescale" in model.notes)
+    if not metric:
+        try:
+            scale = mframe.metric_scale(model, fds).scale
+            metric = True
+        except ValueError:
+            pass  # the alignment fits the scale
+    sim = mframe.map_transform(poses[min(poses)], mframe.world_up(poses, fds), scale)
+    ctx.notes["own_map"].update(scale=round(scale, 4), metric=metric)
+    model.transform(sim.s, sim.R, sim.t)
+    return OwnMap({n: mframe.transform_pose(sim, T) for n, T in poses.items()}, model.method,
+                  metric, model)
+
+
+def _align_own_map(ctx: UpdateContext, sfm: Sfm, own: dict[str, Pose], progress: Progress,
+                   posed: dict[str, Pose] | None = None, with_scale: bool = True
+                   ) -> dict[str, Pose]:
+    """The keyframes of an own map (``_own_map``) placed in the map as one block: the
+    similarity about the vertical (both frames are levelled with gravity: yaw, scale and
+    translation) that brings the points their verified matches with stored keyframes see, at the
+    new keyframes' depth, onto the same points at the stored keyframes' depth
+    (``frame.robust_upright_similarity``; points nearer than ``OWN_ALIGN_MAX_DEPTH`` to both). It
+    is taken with at least ``OWN_ALIGN_MIN_INLIERS`` agreeing points from
+    ``OWN_ALIGN_MIN_PAIRS`` pairs and a scale within ``OWN_ALIGN_SCALE``; else nothing is placed.
+    The centres of the keyframes the extension registered already (``posed``) count as points
+    too, within ``OWN_ALIGN_CENTRE_TOL``; where the matches through which it registered them say
+    otherwise, the points outvote them (livingroom.mp4 registered by its far view of the office
+    and left 0.4 m low). Without ``with_scale`` the block
+    keeps its size (both metric: the far points a view down a hallway shares, whose depth is the
+    least sure, shrank livingroom.mp4 to 0.79 of it). Noted under ``own_map``."""
+    from oh_my_slam.mapping import panorama
+
+    old = {Path(f.image).name: f for f in ctx.old_frames}
+    by_name = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    posed = {n: T for n, T in (posed or {}).items() if n in own}
+    K = {n: c for n, (_, c) in sfm.image_intrinsics(set(own)).items()}
+    stored: dict[str, panorama.View] = {}
+    src, dst, tol, pair_of = [], [], [], []
+    if posed:  # pair -1: the registered keyframes' own centres onto theirs
+        src.append(np.array([own[n].t for n in sorted(posed)]))
+        dst.append(np.array([posed[n].t for n in sorted(posed)]))
+        tol.append(np.full(len(posed), OWN_ALIGN_CENTRE_TOL))
+        pair_of.append(np.full(len(posed), -1))
+    for k, p in enumerate(panorama.verified_matches(sfm.db, set(own) | set(old))):
+        if (p.a in own) == (p.b in own) or not ({p.a, p.b} & set(old)):
+            continue
+        n, o, un, uo = (p.a, p.b, p.uv_a, p.uv_b) if p.a in own else (p.b, p.a, p.uv_b, p.uv_a)
+        nf = by_name[n]
+        if o not in stored:
+            f = old[o]
+            stored[o] = panorama.View(f.T_map_cam, f.K, store.load_depth(ctx.tx.current, f.name),
+                                      f.K_grid, (f.width, f.height), f.K if f.K.k else None)
+        Xn = panorama.lift(panorama.View(own[n], K[n], nf.frame.depth, nf.frame.K_grid,
+                                         nf.full_size, nf.lens), un)
+        Xo = panorama.lift(stored[o], uo)
+        dn = np.linalg.norm(Xn - own[n].t, axis=1)
+        do = np.linalg.norm(Xo - stored[o].pose.t, axis=1)
+        ok = np.isfinite(dn) & np.isfinite(do) & (dn < OWN_ALIGN_MAX_DEPTH) & (
+            do < OWN_ALIGN_MAX_DEPTH)
+        src.append(Xn[ok])
+        dst.append(Xo[ok])
+        tol.append(np.maximum(OWN_ALIGN_TOL[0], OWN_ALIGN_TOL[1] * do[ok]))
+        pair_of.append(np.full(int(ok.sum()), k))
+    note = ctx.notes.setdefault("own_map", {})
+    fit = None if not src else mframe.robust_upright_similarity(
+        np.concatenate(src), np.concatenate(dst), np.concatenate(tol), with_scale=with_scale)
+    if fit is None:
+        note["aligned"] = False
+        progress("own map: no points shared with the map to place it by")
+        return {}
+    S, inl = fit
+    which = np.concatenate(pair_of)[inl]
+    pairs = len(set(which[which >= 0].tolist())) + int((which < 0).sum())
+    note.update(aligned=False, points=int(sum(len(x) for x in src)), inliers=int(inl.sum()),
+                pairs=pairs, scale=round(note.get("scale", 1.0) * S.s, 4),
+                yaw_deg=round(float(np.degrees(np.arctan2(S.R[1, 0], S.R[0, 0]))), 2))
+    if (inl.sum() < OWN_ALIGN_MIN_INLIERS or pairs < OWN_ALIGN_MIN_PAIRS
+            or not OWN_ALIGN_SCALE[0] <= S.s <= OWN_ALIGN_SCALE[1]):
+        progress(f"own map not placed: {int(inl.sum())} agreeing points from {pairs} pairs, "
+                 f"scale {S.s:.3g}")
+        return {}
+    note["aligned"] = True
+    S = _on_the_floor(ctx, own, S, note)
+    progress(f"own map placed by {int(inl.sum())} agreeing points from {pairs} pairs "
+             f"(scale {S.s:.3g})")
+    return {n: mframe.transform_pose(S, T) for n, T in own.items()}
+
+
+def _on_the_floor(ctx: UpdateContext, own: dict[str, Pose], S: Any, note: dict[str, Any]) -> Any:
+    """``S`` raised or lowered so that the block's floor — the lowest well-supported horizontal
+    surface of its keyframes' depth (``gravity.floor_candidate_height``) — lies on the map's
+    (``floor_z``), when it is within ``OWN_FLOOR_TIE_M`` of it once placed (both frames are
+    levelled with gravity). Noted as ``floor_shift_m``."""
+    from oh_my_slam.core.geometry import Sim3, unproject_pixels
+    from oh_my_slam.mapping.objects import MAP_FLOOR_MAX_BELOW
+    from oh_my_slam.reconstruction.gravity import floor_candidate_height
+
+    if ctx.meta.get("floor_z") is None:
+        return S
+    zs = []
+    for nf in ctx.new:
+        T = own.get(f"{nf.kf.name}.jpg")
+        d = nf.frame.depth
+        if T is None or d is None:
+            continue
+        v, u = np.nonzero((d > 0) & nf.frame.valid)
+        if not len(u):
+            continue
+        k = slice(None, None, max(1, len(u) // 2000))
+        X = unproject_pixels(u[k], v[k], d[v[k], u[k]], nf.frame.K_grid.K())
+        zs.append(S.apply(X @ T.R.T + T.t)[:, 2])
+    floor = floor_candidate_height(np.concatenate(zs), max_below=MAP_FLOOR_MAX_BELOW) \
+        if zs else None
+    if floor is None:
+        return S
+    shift = float(ctx.meta["floor_z"]) - floor
+    if abs(shift) > OWN_FLOOR_TIE_M:
+        return S
+    note["floor_shift_m"] = round(shift, 3)
+    return Sim3(S.s, S.R, S.t + np.array([0.0, 0.0, shift]))
 
 
 def _contradicted_new(ctx: UpdateContext, sfm: Sfm, inc: SfmModel, new: set[str]
@@ -1511,8 +2015,10 @@ def _define_map_frame(ctx: UpdateContext, model: SfmModel, progress: Progress) -
     fds = _frame_depths(ctx)
     method = "moge_over_sfm_median"
     if model.notes.get("metric"):
-        # refined multi-view poses are in the units of the keyframes' metric depth already
-        scale, method = mframe.ScaleResult(1.0, 0.0, {}, {}), "multiview_depth"
+        # refined multi-view poses are in the units of the keyframes' metric depth already (a
+        # pan placed on a video mapped on its own: of the video's SfM, ``_pan_onto_video``)
+        scale = mframe.ScaleResult(1.0, 0.0, {}, {})
+        method = model.notes.get("scale_method", "multiview_depth")
     else:
         try:
             scale = mframe.metric_scale(model, fds)
@@ -2221,15 +2727,19 @@ def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: inge
     map is not rebuilt (the update's ``restart_skipped`` note), else None.
 
     A map is rebuilt when its keyframes are photos (every update), at most
-    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``), unless the last two
+    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``) — for a video, all of
+    them: a pan from one spot, which a walk gives the parallax it lacks —, unless the last two
     rebuilds left the same keyframes weak and those are still the weak ones
     (``notes.restarted.weak``: more photos did not help, and a rebuild costs more each time), or
     its last update already rebuilt it and left it rotation-dominant (``ROTATION_PAIR_FRACTION`` of the
     verified pairs panoramic): a pan from one spot, which the photos added did not give the
     parallax to triangulate; rebuilt on every update, it would cost more each time."""
     updates = meta.get("updates", [])
-    if (not old or spec.kind != "images" or any(u.get("kind") != "images" for u in updates)
-            or not any(_weak_keyframe(r) for r in old)):
+    weak_enough = any if spec.kind == "images" else all
+    # a video on a map of fewer than three keyframes: posed with them (``_remap_small``)
+    if (not old or any(u.get("kind") != "images" for u in updates)
+            or (spec.kind != "images" and len(old) < 3)
+            or not weak_enough(_weak_keyframe(r) for r in old)):
         return [], None
     if len(old) > RESTART_MAX_KEYFRAMES:
         return [], f"more than {RESTART_MAX_KEYFRAMES} keyframes"
@@ -2328,7 +2838,7 @@ def _try_rebuild(tx: store.MapTransaction, meta: dict[str, Any], old: list[store
                  list(state.vacated),
                  plan[0].camera_id if len({(r.camera_id, r.width, r.height) for r in plan}) == 1
                  and all((nf.full_size == (plan[0].width, plan[0].height)) for nf in new)
-                 else None)
+                 and video_source(plan[0].source) == is_video else None)
     rb.published = {o.id for o in state.objects if o.published}
     tx.start_over(keep=(store.SFM_DB,))  # the stored keyframes' features and matches
     for key in ("floor_z", "scale", "map_frame"):

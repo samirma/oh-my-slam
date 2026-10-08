@@ -14,7 +14,8 @@ API's whole scope: `view.sh` ([§2.5](view.md)) and `start_inference_server.sh`
 ([§2.1](start_inference_server.md)) remain commands only. A user who never opens a terminal
 after `server.sh` must be able to run every mode of the three commands and get its result.
 
-* `--port <n>` — port to bind on `0.0.0.0`, **default `0`** (a free port chosen by the OS).
+* `--port <n>` — port to bind on `0.0.0.0`, **default `0`** (port 9091 if it is free,
+  otherwise a free port chosen by the OS).
 * `--data <folder>` — the workspace that holds maps and uploads, **default
   `~/oh-my-slam-data/`** (see [Workspace](#workspace)).
 * `--no-browser` — do not open the default browser once the service is listening.
@@ -125,6 +126,9 @@ operation in the same way.
 * **Locate in a map.** Finds the camera poses of images in an existing map, without changing
   it; the response is the command's result. Needs the inference server only when the command
   does.
+* **Remove a map.** Deletes the named map from the workspace.
+* **Start or stop a map's viewer.** Starts or stops `view.sh` on the named map, so that the map
+  can be viewed in the browser.
 
 ### `segment.sh` ([§2.4](segment.md))
 

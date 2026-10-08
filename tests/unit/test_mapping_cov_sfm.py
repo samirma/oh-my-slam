@@ -237,6 +237,31 @@ def test_no_pairs_are_no_matching(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert Sfm(tmp_path / "db.db", tmp_path, tmp_path / "w").match_pairs(set(), {}) == 0
 
 
+def test_unmatched_pairs_lose_their_matches_and_geometry(tmp_path: Path) -> None:
+    """A lens fitted after the matching: the pairs are matched (and verified) again with it,
+    which COLMAP does only for pairs the database does not hold."""
+    import pycolmap
+
+    db = tmp_path / "db.db"
+    ids = _db(db, ["a.jpg", "b.jpg", "c.jpg"])
+    a, b, c = ids["a.jpg"], ids["b.jpg"], ids["c.jpg"]
+    _pair(db, a, b, 30)
+    _pair(db, b, c, 30)
+    d = pycolmap.Database.open(str(db))
+    try:
+        d.write_matches(a, b, np.stack([np.arange(30)] * 2, 1).astype(np.uint32))
+    finally:
+        d.close()
+    names = {1: "a.jpg", 2: "b.jpg", 3: "c.jpg"}
+    Sfm(db, tmp_path, tmp_path / "work").unmatch({(1, 2), (1, 3)}, names)
+    d = pycolmap.Database.open(str(db))
+    try:
+        assert not d.exists_matches(a, b) and not d.exists_two_view_geometry(a, b)
+        assert d.exists_two_view_geometry(b, c)  # not asked
+    finally:
+        d.close()
+
+
 def test_lightglue_failure_restores_a_pair_sift_had_not_matched(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = tmp_path / "db.db"

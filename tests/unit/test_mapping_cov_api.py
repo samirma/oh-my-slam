@@ -56,8 +56,10 @@ def jpg(i: int) -> str:
 def ctx_of(new: list[Any], old: list[Any] | None = None, tmp: Path | None = None,
            **kw: Any) -> SimpleNamespace:
     return SimpleNamespace(new=new, old_frames=old or [], notes={}, pose_support={}, rejected=[],
-                           rescaled={}, meta={}, update_id=1, rebuild=None, features=None,
-                           work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None), **kw)
+                           rescaled={}, meta=kw.pop("meta", {}), update_id=1,
+                           rebuild=kw.pop("rebuild", None), features=None,
+                           work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None),
+                           lens_camera=kw.pop("lens_camera", None), **kw)
 
 
 class FakeModel:
@@ -183,6 +185,23 @@ def test_an_update_of_a_large_map_is_paired_by_retrieval(tmp_path: Path) -> None
         new_ids)
 
 
+def test_a_video_update_pairs_its_own_loop_closures(tmp_path: Path) -> None:
+    """A stretch of the new video its sequential pairs cannot hold (room.mp4's office, cut off
+    from the rest of the walk by white walls) is paired with a later view of the same place."""
+    rng = np.random.default_rng(2)
+    n = api.LOOP_MIN_GAP + 10
+    desc = rng.normal(size=(n, 8))
+    new = [nf(100 + k, desc[k]) for k in range(n)]
+    ids = [100 + k for k in range(n)]
+    old = [_old(i, tmp_path, None) for i in range(3)]
+    pairs = api._pairs_update(ctx_of(new, old, tx=SimpleNamespace(
+        current=lambda rel: tmp_path / rel)), is_video=True)
+    loops = retrieval.top_k_pairs(desc, desc, api.LOOP_TOP_K, ids, ids, api.LOOP_MIN_GAP)
+    assert loops and any(b - a > api.SEQ_OVERLAP for a, b in loops)
+    assert pairs == retrieval.sequential_pairs(ids, api.SEQ_OVERLAP) | loops | \
+        retrieval.all_pairs(ids, [0, 1, 2])
+
+
 def test_anchors_without_descriptors_are_the_latest_posed_views() -> None:
     posed = [api.PoolView(f"p{k}", Path("x"), K, None, Pose.identity()) for k in range(6)]
     chunk = [api.PoolView("c", Path("y"), K, np.ones(4, np.float32))]
@@ -259,7 +278,12 @@ def sfm_chain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         return {v.name: Pose.identity() for v in todo}
 
     def refine(ctx: Any, sfm: Any, poses: dict[str, Pose], free: set[str], refine_focal: bool,
-               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float, float]:
+               rotation: bool, model: Any = None, hold_centres: bool = False
+               ) -> tuple[dict[str, Pose], float, float]:
+        if hold_centres:  # one centre for a turning lens camera (``_one_centre``)
+            seen["one_centre"] = (set(free), {p.t.tobytes() for p in poses.values()})
+            ctx.notes["pose_refinement"] = {"median_after_deg": seen.get("one_centre_deg", 2.0)}
+            return poses, 1.0, 0.0
         seen["free"], seen["rotation"] = free, rotation
         return poses, 1.02, -0.3
 
@@ -286,6 +310,20 @@ def test_too_few_keyframes_placed_by_global_and_incremental_fall_back_to_multivi
     assert sfm_chain.seen["todo"] == [jpg(i) for i in range(4)]  # every keyframe
     assert sfm_chain.seen["free"] == {jpg(1), jpg(2), jpg(3)}  # the first holds the gauge
     assert any("multi-view fallback (SfM placed too few frames); 4 connected" in m for m in msgs)
+
+
+def test_a_lens_camera_the_fallback_poses_gets_one_centre_if_it_turns_in_place(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(FakeSfm, "global_model", None)
+    monkeypatch.setattr(FakeSfm, "incremental_model", None)
+    monkeypatch.setattr(FakeSfm, "component", {jpg(i) for i in range(4)})
+    sfm_chain.seen["one_centre_deg"] = 0.3
+    model = api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    free, centres = sfm_chain.seen["one_centre"]
+    assert free == {jpg(1), jpg(2), jpg(3)} and len(centres) == 1  # the gauge shares it, held
+    assert model.notes == {"focal_scale": 1.0, "distortion": 0.0,  # the lens is the database's
+                           "reason": "SfM placed too few frames", "metric": True}
+    assert sfm_chain.ctx.notes["one_centre"]["taken"] is True
 
 
 def test_sfm_of_a_lens_turning_in_place_is_a_pan_from_one_spot(
@@ -417,9 +455,10 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     seen: dict[str, Any] = {}
 
     def refine(p: Any, views: dict[str, Any], free: Any, refine_focal: bool = False,
-               hold_distortion: bool = False) -> PoseFit:
+               hold_distortion: bool = False, gravity: Any = None, up: Any = None) -> PoseFit:
         seen["views"] = sorted(views)
         seen["hold_distortion"] = hold_distortion
+        seen["gravity"] = gravity
         return PoseFit({jpg(1): Pose.identity()}, 1.0, 2, 40, 1.0, 0.1, {jpg(1): 0.1},
                        {jpg(1): 40})
 
@@ -431,6 +470,7 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     out, focal, distortion = api._refine_multiview(ctx, sfm, poses, {jpg(1)}, False, False)  # type: ignore[arg-type]
     assert seen["views"] == [jpg(0), jpg(1)]  # stray.jpg: no intrinsics, not stored
     assert seen["hold_distortion"] is False  # pinhole cameras: nothing known to hold
+    assert seen["gravity"] is None  # a new map: not levelled yet
     assert focal == 1.0 and distortion == 0.0 and ctx.pose_support == {jpg(1): (0.1, 40)}
     assert ctx.notes["pose_refinement"]["pairs"] == 2
 
@@ -747,7 +787,7 @@ def test_a_map_of_fewer_than_three_keyframes_is_mapped_again(
     sentinel = FakeModel({}, method="remapped")
     monkeypatch.setattr(api, "_remap_small", lambda *a: sentinel)
     ctx = ctx_of([nf(10)], old, tx=tx)
-    assert api._extend(ctx, ExtSfm(None), {jpg(10)}, False, None, quiet, 0.0) is sentinel  # type: ignore[arg-type]
+    assert api._extend(ctx, ExtSfm(None), {jpg(10)}, False, False, None, quiet, 0.0) is sentinel  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -772,7 +812,7 @@ def test_without_an_incremental_extension_the_new_keyframes_are_placed_by_multiv
     tx, old = _ext_world(tmp_path)
     ctx = ctx_of([nf(10), nf(11)], old, tx=tx)
     sfm = ExtSfm(None)
-    model = api._extend(ctx, sfm, {jpg(10), jpg(11)}, False, None, quiet, 0.0)  # type: ignore[arg-type]
+    model = api._extend(ctx, sfm, {jpg(10), jpg(11)}, False, False, None, quiet, 0.0)  # type: ignore[arg-type]
     assert model.method == "multiview" and ctx.notes["mv_names"] == [jpg(10), jpg(11)]
     assert extension["pool"] == [jpg(i) for i in range(3)]  # anchored on the map's keyframes
 
@@ -785,7 +825,7 @@ def test_an_extension_moving_a_fixed_frame_or_contradicting_the_depth(
     inc.notes["moved_fixed"] = [jpg(1)]
     monkeypatch.setattr(api, "_depth_consistent", lambda c, m, name: name != jpg(11))
     ctx = ctx_of([nf(10), nf(11)], old, tx=tx)
-    model = api._extend(ctx, ExtSfm(inc), {jpg(10), jpg(11)}, False, None, quiet, 0.0)  # type: ignore[arg-type]
+    model = api._extend(ctx, ExtSfm(inc), {jpg(10), jpg(11)}, False, False, None, quiet, 0.0)  # type: ignore[arg-type]
     assert ctx.notes["sfm_moved_fixed"] == [jpg(1)]
     assert model.method == "sfm-incremental+multiview" and ctx.notes["mv_names"] == [jpg(11)]
     assert extension["pool"] == [jpg(0), jpg(1), jpg(2), jpg(10)]

@@ -255,3 +255,84 @@ def test_depth_on_an_undistorted_grid_is_read_where_that_image_shows_the_keypoin
     plain = View(Pose.identity(), lens, depth, grid, (K.width, K.height))  # the image's own grid
     g = np.rint(uv / 4 - 0.5).astype(int)
     np.testing.assert_array_equal(_depth_at(plain, _usable_depth(plain), uv), depth[g[:, 1], g[:, 0]])
+
+
+def _up_tilt_deg(T: Pose, up_cam: np.ndarray) -> float:
+    up = T.R @ up_cam
+    return float(np.degrees(np.arccos(np.clip(up[2] / np.linalg.norm(up), -1.0, 1.0))))
+
+
+def test_gravity_levels_what_the_matches_leave_free() -> None:
+    """A keyframe the matches do not hold (as a block hanging on the map by a few weak matches
+    turns about them) is levelled with its gravity estimate, its heading kept; keyframes the
+    matches hold are placed as without it."""
+    from oh_my_slam.mapping.panorama import _exp
+
+    truth = _sweep()
+    rig = turning_rig(truth, seed=9)
+    old = {n for n in truth if int(n[1:]) < 9}
+    init = _noisy(truth, old, rot=3.0, trans=0.1, seed=10)
+    true_lonely = truth["f010"]
+    tilted = Pose(true_lonely.R @ _exp(np.radians([8.0, 0.0, 0.0])), true_lonely.t)
+    views = rig.views(init)
+    views["lonely"] = views["f000"].__class__(tilted, K)
+    free = (set(truth) - old) | {"lonely"}
+    gravity = {n: (truth[n].R.T @ np.array([0.0, 0.0, 1.0]), 2.0) for n in set(truth) - old}
+    gravity["lonely"] = (true_lonely.R.T @ np.array([0.0, 0.0, 1.0]), 2.0)
+    fit = refine_poses(rig.pairs, views, free, gravity=gravity)
+    assert _up_tilt_deg(tilted, gravity["lonely"][0]) > 7.9
+    assert _up_tilt_deg(fit.poses["lonely"], gravity["lonely"][0]) < 0.05
+    heading = [np.arctan2(*T.R[:2, 2][::-1]) for T in (true_lonely, fit.poses["lonely"])]
+    assert abs(np.degrees(heading[0] - heading[1])) < 0.5
+    assert max(rot_err_deg(fit.poses[n], truth[n]) for n in set(truth) - old) < 0.1
+    # without the prior it keeps its tilt
+    plain = refine_poses(rig.pairs, views, free)
+    assert _up_tilt_deg(plain.poses["lonely"], gravity["lonely"][0]) > 7.9
+
+
+def test_the_tilt_jacobian_is_its_derivative() -> None:
+    from oh_my_slam.mapping.panorama import _exp, _tilt
+
+    rng = np.random.default_rng(11)
+    up = rng.normal(size=3)
+    up /= np.linalg.norm(up)
+    e, J = _tilt(up)
+    d = 1e-6 * rng.normal(size=3)
+    np.testing.assert_allclose(_tilt(_exp(d) @ up)[0] - e, J @ d, atol=1e-11)
+
+
+def test_held_centres_stay_put_while_the_depth_still_turns_the_views() -> None:
+    """A camera turning about a known centre, matched with views taken elsewhere: its rotations
+    are refined with the depth (a pure-rotation model would bend them to the other views'
+    parallax), its centres not moved."""
+    truth = _sweep()
+    for k, n in enumerate(("s0", "s1", "s2")):  # views from another spot, held
+        truth[n] = head_pose(30.0 * k, -12.0, step=np.array([0.0, 0.4, 0.0]))
+    rig = turning_rig(truth, seed=12)
+    rng = np.random.default_rng(13)
+    free = {n for n in truth if n not in ("f000", "s0", "s1", "s2")}
+    init = {n: Pose(perturb(T, 3.0, 0.0, rng).R, T.t) if n in free else T
+            for n, T in truth.items()}
+    fit = refine_poses(rig.pairs, rig.views(init), free, hold_centres=True)
+    assert max(rot_err_deg(fit.poses[n], truth[n]) for n in free) < 0.1
+    assert all(np.array_equal(fit.poses[n].t, truth[n].t) for n in free)
+
+
+def test_gravity_levels_to_the_up_of_a_map_not_levelled_yet() -> None:
+    """A new map's frame is not levelled yet: the prior holds a view to the map's own up (the
+    held keyframes' gravity), not to +z."""
+    from oh_my_slam.mapping.panorama import _exp
+
+    tilt = _exp(np.radians([10.0, -5.0, 0.0]))  # the map frame, turned from the world's
+    truth = {n: Pose(tilt @ T.R, tilt @ T.t) for n, T in _sweep().items()}
+    rig = turning_rig({n: Pose(tilt.T @ T.R, tilt.T @ T.t) for n, T in truth.items()}, seed=14)
+    views = {n: v.__class__(truth[n], v.K, v.depth, v.K_grid, v.full_size)
+             for n, v in rig.views().items()}
+    up = tilt @ np.array([0.0, 0.0, 1.0])
+    lonely = truth["f010"]
+    off = Pose(lonely.R @ _exp(np.radians([6.0, 0.0, 0.0])), lonely.t)
+    views["lonely"] = views["f000"].__class__(off, K)
+    u = lonely.R.T @ up
+    fit = refine_poses(rig.pairs, views, {"lonely", "f005"}, gravity={"lonely": (u, 2.0)}, up=up)
+    level = fit.poses["lonely"].R @ u
+    assert np.degrees(np.arccos(np.clip(level @ up, -1, 1))) < 0.05
