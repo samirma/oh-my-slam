@@ -2,7 +2,7 @@
 // "Requests"); an operation runs within its request, its stages come in Server-Timing, and every
 // error carries the command's message and the code of its exit status ("Actionable errors").
 import { afterEach, describe, expect, test } from 'bun:test';
-import { ApiError, discardUpload, enc, getJson, parseServerTiming, postJson, runOperation, upload } from '../../../src/oh_my_slam/web/static/js/api.js';
+import { ApiError, discardUpload, enc, getJson, parseServerTiming, postJson, removeMap, runOperation, send, startViewer, stopViewer, upload } from '../../../src/oh_my_slam/web/static/js/api.js';
 import { fakeFetch, json, stubGlobals } from '../helpers.js';
 
 let restore = () => {};
@@ -175,4 +175,26 @@ test('discardUpload deletes an upload no request consumed, even as the page goes
   restore();
   net(() => { throw new TypeError('gone'); });
   expect(await discardUpload('u2')).toBeUndefined();  // nothing to report
+});
+
+describe('send, and the operations on a map: its viewer and its removal', () => {
+  test('a JSON body only when there is data; the answer\'s JSON, null for none (204)', async () => {
+    const answers = [json({ running: true, url: 'http://127.0.0.1:5000/' }), json({ running: false, url: null }), new Response(null, { status: 204 })];
+    const calls = net(() => answers.shift());
+    expect(await startViewer('my map')).toEqual({ running: true, url: 'http://127.0.0.1:5000/' });
+    expect(await stopViewer('my map')).toEqual({ running: false, url: null });
+    expect(await removeMap('my map')).toBeNull();
+    expect(calls.map((c) => [c.url, c.init])).toEqual([
+      ['/api/maps/my%20map/viewer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }],
+      ['/api/maps/my%20map/viewer', { method: 'DELETE' }],
+      ['/api/maps/my%20map', { method: 'DELETE' }]]);
+  });
+
+  test('a refusal throws the service\'s error; no answer says the service is not running', async () => {
+    net(() => json({ error: { code: 'map_in_use', message: 'map m is used by a request in progress', http_status: 409 } }, 409));
+    await expect(removeMap('m')).rejects.toMatchObject({ status: 409, code: 'map_in_use', message: 'map m is used by a request in progress' });
+    restore();
+    net(() => { throw new TypeError('fetch failed'); });
+    await expect(send('DELETE', '/api/maps/m')).rejects.toMatchObject({ status: 0, message: 'the service did not answer; is server.sh running?' });
+  });
 });

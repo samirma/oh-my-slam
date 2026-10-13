@@ -1,8 +1,9 @@
 """``server.sh`` (spec §2.6) beyond ``test_web_server_sh``: the running service's state when its
 file cannot be read, ``--status`` of a service that holds the workspace but does not answer,
 ``--stop`` of one that ignores SIGTERM (a second SIGTERM, then SIGKILL), the one error line on the
-original stderr once listening, a port that cannot be bound, a second ``server.sh`` opening the
-browser on the running one, and a clean exit that says nothing."""
+original stderr once listening, a port that cannot be bound, the port that ``--port 0`` prefers
+and passes over when it is taken, a second ``server.sh`` opening the browser on the running one,
+and a clean exit that says nothing."""
 
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from oh_my_slam.core.errors import ServiceNotRunningError, UsageError
 from oh_my_slam.server.lifecycle import ServerLock
 from oh_my_slam.web import main as web_main
 from oh_my_slam.web.workspace import Workspace
+from tests.unit.test_web_server_sh import free_port
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -199,6 +201,81 @@ def test_a_port_that_only_closed_connections_hold_is_bound_again_at_once(
     assert web_main._binds(socket.AF_INET, port) and web_main._binds(socket.AF_INET6, port)
     with web_main._bind(port) as sock:
         assert sock.getsockname()[1] == port
+
+
+def test_port_0_is_the_service_port_while_it_is_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec §2.6: ``--port 0``, the default, binds port 9091 (``SERVICE_PORT``) if it is free.
+    The tests never hold 9091 itself: the preferred port here is one the OS found free."""
+    preferred = free_port()
+    monkeypatch.setattr(web_main, "SERVICE_PORT", preferred)
+    with web_main._bind(0) as sock:
+        assert sock.getsockname() == ("0.0.0.0", preferred)
+
+
+@pytest.mark.parametrize("family, address", [(socket.AF_INET, "0.0.0.0"),
+                                             (socket.AF_INET, "127.0.0.1"),
+                                             (socket.AF_INET6, "::1")])
+def test_port_0_passes_over_a_service_port_another_process_listens_on(
+        family: int, address: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Otherwise a free port chosen by the OS. The preferred port is free only by the checks an
+    explicit port passes, so another process listening on it at 127.0.0.1 or ::1 only (which
+    would get the browser's and ``--status``'s connections) takes it too. An explicit port is
+    never passed over: it is refused."""
+    with socket.socket(family) as taken:
+        taken.bind((address, 0))
+        taken.listen(8)  # room for both checks' probes, which it never accepts
+        preferred = taken.getsockname()[1]
+        monkeypatch.setattr(web_main, "SERVICE_PORT", preferred)
+        with web_main._bind(0) as sock:
+            host, port = sock.getsockname()
+        assert host == "0.0.0.0" and port not in (0, preferred)
+        with pytest.raises(UsageError, match=f"--port {preferred}: cannot bind \\(another "
+                                             f"process listens on it at "):
+            web_main._bind(preferred)
+
+
+def test_port_0_passes_over_a_service_port_that_does_not_bind(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Taken after the check (or where it cannot look): the bind's own error passes it over
+    too."""
+    monkeypatch.setattr(web_main, "_in_use", lambda port: None)
+    with socket.socket() as taken:
+        taken.bind(("0.0.0.0", 0))
+        taken.listen(1)
+        preferred = taken.getsockname()[1]
+        monkeypatch.setattr(web_main, "SERVICE_PORT", preferred)
+        with web_main._bind(0) as sock:
+            assert sock.getsockname()[1] not in (0, preferred)
+
+
+def test_an_explicit_port_is_bound_whatever_the_service_port(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A port other than 0 is bound as given, never the preferred one, even while that is
+    free."""
+    with socket.socket() as other:  # two distinct ports the OS found free
+        other.bind(("0.0.0.0", 0))
+        preferred = other.getsockname()[1]
+        port = free_port()
+    monkeypatch.setattr(web_main, "SERVICE_PORT", preferred)
+    with web_main._bind(port) as sock:
+        assert sock.getsockname() == ("0.0.0.0", port)
+        assert web_main._in_use(preferred) is None  # left alone
+
+
+@pytest.mark.parametrize("argv", [[], ["--port", "0"]], ids=["default", "port-0"])
+def test_port_0_given_or_not_is_the_default(argv: list[str], tmp_path: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--port 0`` given explicitly is the default: either way the service binds port 0, which
+    prefers ``SERVICE_PORT``."""
+    served: list[int] = []
+
+    def serve(ws: Workspace, port: int, open_browser: bool) -> int:
+        served.append(port)
+        return 0
+
+    monkeypatch.setattr(web_main, "serve", serve)
+    assert web_main.main(["--data", str(tmp_path / "d"), "--no-browser", *argv]) == 0
+    assert served == [0]
 
 
 def test_a_machine_without_ipv6_has_nothing_listening_there(

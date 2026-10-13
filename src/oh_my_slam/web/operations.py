@@ -19,6 +19,7 @@ script execs) as a subprocess: ``web.runner``.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,7 @@ from oh_my_slam.core.errors import (
 )
 
 PATH_IN = frozenset({Kind.IMAGE, Kind.IMAGES, Kind.IMAGES_OR_VIDEO, Kind.MAP})
+FILES_IN = PATH_IN - {Kind.MAP}  # the inputs an upload can be (a map lives in maps/ only)
 WHERE = frozenset({Kind.FILE_OUT, Kind.FOLDER_OUT})  # options that only choose where it writes
 RESULT = "stdout"  # the outputs the response carries: those the command writes to stdout
 
@@ -107,6 +109,7 @@ class Prepared:
     command: list[str] = field(default_factory=list)  # as typed, with workspace paths
     uploads: list[str] = field(default_factory=list)  # the uploads the request names
     writes: str | None = None  # the map folder the request writes
+    reads: str | None = None  # the map folder the request only reads
     result_format: str | None = None  # the format of the command's stdout
     inference: bool = True  # the request uses the inference server
 
@@ -126,12 +129,28 @@ def media_of(fmt: str | None) -> str:
     return spec.media_type(fmt) if fmt else "application/octet-stream"
 
 
+def named_uploads(op: Operation, raw: Any, workspace: Any) -> list[str]:
+    """The uploads a request of ``op`` names, read before any check: it consumes them whatever its
+    outcome, a refusal or a crash included, so reading them never fails (a value that is no
+    workspace path names none)."""
+    if not isinstance(raw, Mapping):
+        return []
+    uids = []
+    for o in op.options:
+        if o.kind in FILES_IN and o.name in raw:
+            for v in _values(raw[o.name]):
+                with contextlib.suppress(Exception):
+                    uids.append(workspace.upload_of(workspace.resolve(v)))
+    return [u for u in dict.fromkeys(uids) if u is not None]
+
+
 def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = None) -> Prepared:
     """Translate an API request into the command's argv and check it with the command's own
-    parser and rules (nothing is written). The uploads a request names are listed even when it is
-    refused: it consumes them all the same. ``prep`` is filled as the request is read, so its
-    caller knows them even when a check crashes."""
+    parser and rules (nothing is written). The uploads a request names are listed first, even
+    when it is refused: it consumes them all the same. ``prep`` is filled as the request is read,
+    so its caller knows them even when a check crashes."""
     prep = Prepared() if prep is None else prep
+    prep.uploads = named_uploads(op, raw, workspace)
     if not isinstance(raw, Mapping):
         prep.problems.append(problem((), "the request body must be a JSON object of parameters"))
         return prep
@@ -158,24 +177,22 @@ def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = Non
                 paths = []
                 for v in _values(value):
                     p = workspace.map_path(v) if o.kind is Kind.MAP else workspace.resolve(v)
-                    uid = workspace.upload_of(p)
-                    if uid is not None:
-                        prep.uploads.append(uid)
-                        if not p.exists():
-                            raise UsageError(
-                                f"{v}: that upload no longer exists (an upload is deleted when "
-                                "the request it was given to ends); upload the file again")
+                    if workspace.upload_of(p) is not None and not p.exists():
+                        raise UsageError(
+                            f"{v}: that upload no longer exists (an upload is deleted when the "
+                            "request it was given to ends); upload the file again")
                     paths.append(p)
                 actual[name] = [str(p) for p in paths] if o.multiple else str(paths[0])
                 shown[name] = [workspace.relative(p) for p in paths] if o.multiple \
                     else workspace.relative(paths[0])
                 if op.writes_map() is o:
                     prep.writes = str(paths[0])
+                elif o.kind is Kind.MAP:
+                    prep.reads = str(paths[0])
             else:
                 actual[name] = shown[name] = value
         except OhMySlamError as exc:
             prep.problems.append(problem((name,), str(exc), exc.exit_code))
-    prep.uploads = list(dict.fromkeys(prep.uploads))
     if prep.problems:
         return prep
     prep.problems = spec.dry_run(op.command, op.mode, actual)
@@ -186,6 +203,20 @@ def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = Non
     prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown)]
     prep.argv = spec.argv_of(op.command, op.mode, actual)
     return prep
+
+
+def named_map(op: Operation, raw: Any, workspace: Any) -> str | None:
+    """The map folder a request of ``op`` names (its map parameter resolved, before any check),
+    which it will read or write; None when it names none, or none a map could be (its validation
+    then refuses it). A map's removal is refused from the request's arrival on."""
+    o = next((o for o in op.options if o.kind is Kind.MAP), None)
+    value = raw.get(o.name) if o is not None and isinstance(raw, Mapping) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(workspace.map_path(value))
+    except OhMySlamError:
+        return None
 
 
 def inference_of(op: Operation, actual: Mapping[str, Any]) -> bool:

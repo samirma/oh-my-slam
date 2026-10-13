@@ -288,6 +288,19 @@ class MapReader:
         return self.path(fr.image)
 
 
+def lock_update(root: Path) -> int:
+    """Take the map's update lock at once: the descriptor that holds it (closing it releases the
+    lock); :class:`MapLockedError` while another update holds it. A map's removal (``server.sh``)
+    takes it too, so it never deletes a map an update is writing."""
+    fd = os.open(root / LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise MapLockedError(f"another update is running on {root}") from exc
+    return fd
+
+
 class MapTransaction:
     """Exclusive, staged update of a map folder (created if missing or empty)."""
 
@@ -307,13 +320,7 @@ class MapTransaction:
         state = refuse_non_map(self.root)
         self.created = state in ("missing", "empty")
         self.root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.root / LOCK, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(fd)
-            raise MapLockedError(f"another update is running on {self.root}") from exc
-        self._lock_fd = fd
+        self._lock_fd = lock_update(self.root)
         self.recover()
         # a committed roll-forward may have turned an 'empty' folder into a map
         self.created = classify(self.root) != "map"

@@ -242,3 +242,8 @@ def test_web_service_is_a_client_without_models_or_open3d() -> None:
     assert '[self.python, "-m", run.module, *run.argv]' in runner
     assert 'return f"oh_my_slam.cli.{' in (SRC / "web" / "operations.py").read_text("utf-8")
     assert not _grep(r"subprocess\.\w+\(\s*\[?[^\]]*\.sh", _py_files("web"))
+    # a map's viewer is view.sh's own entry point, its command line from the shared definition:
+    # the service imports none of the viewer's or the command line's code for it
+    viewers = SRC / "web" / "viewers.py"
+    assert '[self.python, "-m", MODULE, *command(map_dir)]' in viewers.read_text("utf-8")
+    assert not _grep(r"(import|from) oh_my_slam\.(viewer|cli)\b", [viewers])

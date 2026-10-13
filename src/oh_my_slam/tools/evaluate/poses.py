@@ -6,8 +6,9 @@ axis, positive to the left. ``ainex-captures`` (``pose_metrics``): yaw measured 
 001 (the map frame aligned to frame 001) and compared with the commanded yaw after wrapping to
 ±180°. ``camera`` (``pan_pose_metrics``), whose names give the pan order but not the step angle:
 the heading must turn left from one pan position to the next and agree across the tilts of a pan
-position. Pitch direction compares the elevation of each ``up`` / ``down`` frame with the
-untilted frame of the same motion or pan position (``level`` / ``mid``; sign only)."""
+position. Pitch direction compares the elevation of each tilted frame (``up`` / ``down``;
+``floor`` / ``low`` / ``high``) with the untilted frame of the same motion or pan position
+(``level`` / ``mid``; sign only: ``names.TILT_SIGN``)."""
 
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.store import MapReader
 from oh_my_slam.tools.evaluate.metrics import Metrics
 from oh_my_slam.tools.evaluate.names import (
+    TILT_SIGN,
     AnyCapture,
     Capture,
     PanCapture,
@@ -68,16 +70,16 @@ def circular_mean_deg(angles: list[float]) -> float:
 
 def pitch_directions(poses: dict[str, Pose], tilted: list[tuple[str, str, str]]
                      ) -> list[dict[str, Any]]:
-    """For every registered ``up`` / ``down`` capture of ``tilted`` (capture, tilt, its untilted
-    sibling) whose sibling is registered: the pitch difference to the sibling and whether its sign
-    is the named direction."""
+    """For every registered tilted capture of ``tilted`` (capture, tilt, its untilted sibling)
+    whose sibling is registered: the pitch difference to the sibling and whether its sign is the
+    tilt's (``TILT_SIGN``)."""
     rows = []
     for name, tilt, sibling in tilted:
         if name not in poses or sibling not in poses:
             continue
         d = pitch_deg(poses[name].R) - pitch_deg(poses[sibling].R)
         rows.append({"capture": name, "sibling": sibling, "tilt": tilt,
-                     "pitch_delta_deg": round(d, 2), "ok": d > 0 if tilt == "up" else d < 0})
+                     "pitch_delta_deg": round(d, 2), "ok": d * TILT_SIGN[tilt] > 0})
     return rows
 
 
@@ -98,7 +100,7 @@ def _pitch(m: Metrics, mid: str, rows: list[dict[str, Any]], pitch: list[dict[st
         by_name[p["capture"]].update(pitch_delta_deg=p["pitch_delta_deg"], pitch_ok=p["ok"])
     m.add(mid, sum(p["ok"] for p in pitch) / len(pitch) if pitch else None,
           {"evaluated": len(pitch), "wrong": [p["capture"] for p in pitch if not p["ok"]]},
-          error=f"no up/down capture with a registered {untilted} sibling")
+          error=f"no tilted capture with a registered {untilted} sibling")
 
 
 def pose_metrics(m: Metrics, prefix: str, poses: dict[str, Pose], captures: list[Capture]
@@ -142,7 +144,8 @@ def pan_pose_metrics(m: Metrics, prefix: str, poses: dict[str, Pose], captures: 
     ``PAN_POSE_METRICS``): the heading of each pan position (the circular mean of its registered
     captures' yaws) turns left from one pan position to the next (``pan_order_fraction``: the
     share of such steps), the tilts of one pan position share its heading (the yaw differences of
-    ``tilt_pairs``), and the ``up`` / ``down`` captures are pitched that way from the ``mid`` one.
+    ``tilt_pairs``), and the ``floor`` / ``low`` captures are pitched below the ``mid`` one, the
+    ``high`` ones above it.
     Returns per-capture rows for the report, yaw relative to the first registered capture."""
     ids = {k: f"{prefix}.{k}" for k in PAN_POSE_METRICS}
     _registered(m, ids["registered_fraction"], poses, captures)

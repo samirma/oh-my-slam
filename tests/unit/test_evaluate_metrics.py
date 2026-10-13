@@ -149,7 +149,7 @@ def test_unregistered_frames(captures: list) -> None:
 # -- a pan-tilt sequence (examples/camera) -----------------------------------------------------------
 
 STEP = 20.0  # the pan step the names do not record
-TILT = {"mid": 0.0, "up": 15.0, "down": -15.0}
+TILT = {"floor": -30.0, "low": -15.0, "mid": 0.0, "high": 15.0}
 
 
 @pytest.fixture(scope="module")
@@ -165,7 +165,8 @@ def pan_poses(captures: list, offset: float = 0.0) -> dict[str, Pose]:
 
 def test_a_camera_turning_left_with_level_tilts(pan_captures: list) -> None:
     """The headings follow the pan order across ±180° (offset 110°: p06 is at 170°, p07 at
-    -170°), the tilts of a pan position agree, and up / down are pitched that way from mid."""
+    -170°), the tilts of a pan position agree, and floor / low are pitched below mid, high above
+    it."""
     m = Metrics()
     rows = pan_pose_metrics(m, "pose.c", pan_poses(pan_captures, offset=110.0), pan_captures)
     v = {k: x.value for k, x in m.items.items()}
@@ -176,12 +177,15 @@ def test_a_camera_turning_left_with_level_tilts(pan_captures: list) -> None:
     order = m.items["pose.c.pan_order_fraction"].detail
     assert order["steps_deg"]["p06~p07"] == pytest.approx(STEP) and order["wrong"] == []
     assert len(order["steps_deg"]) == 8
-    assert len(m.items["pose.c.tilt_yaw_diff_max_deg"].detail) == 27
-    assert m.items["pose.c.pitch_direction_fraction"].detail == {"evaluated": 18, "wrong": []}
-    first, up = rows[0], rows[2]
-    assert (first["capture"], first["pan"], first["tilt"]) == ("img_007_p03_down.jpg", 3, "down")
-    assert first["yaw_deg"] == 0.0 and first["pitch_delta_deg"] == pytest.approx(-15.0)
-    assert up["pitch_ok"] and rows[-1]["yaw_deg"] == pytest.approx(8 * STEP)
+    assert len(m.items["pose.c.tilt_yaw_diff_max_deg"].detail) == 54
+    assert m.items["pose.c.pitch_direction_fraction"].detail == {"evaluated": 27, "wrong": []}
+    first, low, mid, high = rows[:4]
+    assert (first["capture"], first["pan"], first["tilt"]) == ("img_009_p03_floor.jpg", 3, "floor")
+    assert first["yaw_deg"] == 0.0 and first["pitch_delta_deg"] == pytest.approx(-30.0)
+    assert low["pitch_ok"] and low["pitch_delta_deg"] == pytest.approx(-15.0)
+    assert "pitch_ok" not in mid
+    assert high["pitch_ok"] and high["pitch_delta_deg"] == pytest.approx(15.0)
+    assert rows[-1]["yaw_deg"] == pytest.approx(8 * STEP)
 
 
 def test_a_step_to_the_right_and_disagreeing_tilts(pan_captures: list) -> None:
@@ -189,8 +193,9 @@ def test_a_step_to_the_right_and_disagreeing_tilts(pan_captures: list) -> None:
     for c in pan_captures:
         if c.pan == 6:  # p06 is right of p05: the camera turned back (p07 is left of both)
             poses[c.name] = cam(STEP * 1.5, TILT[c.tilt])
-    poses["img_013_p05_down.jpg"] = cam(STEP * 2 + 4.0, -15.0)  # 4° off its pan position
-    poses["img_015_p05_up.jpg"] = cam(STEP * 2, -2.0)  # "up" but pitched below mid
+    poses["img_017_p05_floor.jpg"] = cam(STEP * 2 + 4.0, -30.0)  # 4° off its pan position
+    poses["img_018_p05_low.jpg"] = cam(STEP * 2, 2.0)  # "low" but pitched above mid
+    poses["img_020_p05_high.jpg"] = cam(STEP * 2, -2.0)  # "high" but pitched below mid
     m = Metrics()
     pan_pose_metrics(m, "p", poses, pan_captures)
     order = m.items["p.pan_order_fraction"]
@@ -198,32 +203,33 @@ def test_a_step_to_the_right_and_disagreeing_tilts(pan_captures: list) -> None:
     assert m.items["p.tilt_yaw_diff_max_deg"].value == pytest.approx(4.0)
     assert m.items["p.tilt_yaw_diff_median_deg"].value == pytest.approx(0.0, abs=1e-6)
     pitch = m.items["p.pitch_direction_fraction"]
-    assert pitch.value == pytest.approx(17 / 18) and pitch.detail["wrong"] == [
-        "img_015_p05_up.jpg"]
+    assert pitch.value == pytest.approx(25 / 27) and pitch.detail["wrong"] == [
+        "img_018_p05_low.jpg", "img_020_p05_high.jpg"]
 
 
 def test_unregistered_camera_frames(pan_captures: list) -> None:
     poses = pan_poses(pan_captures)
-    del poses["img_008_p03_mid.jpg"]  # p03's up and down lose their mid frame
-    for c in pan_captures[3:6]:  # p04 entirely
+    del poses["img_011_p03_mid.jpg"]  # p03's floor, low and high lose their mid frame
+    for c in pan_captures[4:8]:  # p04 entirely
         del poses[c.name]
     m = Metrics()
     pan_pose_metrics(m, "p", poses, pan_captures)
     reg = m.items["p.registered_fraction"]
-    assert reg.value == pytest.approx(23 / 27) and len(reg.detail["missing"]) == 4
+    assert reg.value == pytest.approx(31 / 36) and len(reg.detail["missing"]) == 5
     assert m.items["p.pan_order_fraction"].detail["steps_deg"]["p03~p05"] == pytest.approx(
         2 * STEP)  # the step over the missing pan position
-    assert len(m.items["p.tilt_yaw_diff_max_deg"].detail) == 27 - 3 - 2  # p04, and p03 but one
-    assert m.items["p.pitch_direction_fraction"].detail["evaluated"] == 18 - 2 - 2
+    # p04's six pairs, and p03's three with its mid frame
+    assert len(m.items["p.tilt_yaw_diff_max_deg"].detail) == 54 - 6 - 3
+    assert m.items["p.pitch_direction_fraction"].detail["evaluated"] == 27 - 3 - 3
     m = Metrics()
-    pan_pose_metrics(m, "p", {"img_008_p03_mid.jpg": cam(0.0)}, pan_captures)
-    assert m.items["p.registered_fraction"].value == pytest.approx(1 / 27)
+    pan_pose_metrics(m, "p", {"img_011_p03_mid.jpg": cam(0.0)}, pan_captures)
+    assert m.items["p.registered_fraction"].value == pytest.approx(1 / 36)
     errors = {k: x.error for k, x in m.items.items() if x.value is None}
     assert errors == {
         "p.pan_order_fraction": "fewer than two pan positions registered",
         "p.tilt_yaw_diff_median_deg": "no pan position has two registered tilts",
         "p.tilt_yaw_diff_max_deg": "no pan position has two registered tilts",
-        "p.pitch_direction_fraction": "no up/down capture with a registered mid sibling"}
+        "p.pitch_direction_fraction": "no tilted capture with a registered mid sibling"}
     m = Metrics()
     pan_pose_metrics(m, "p", {}, [])
     assert m.items["p.registered_fraction"].error == "no captures"
@@ -267,12 +273,12 @@ def test_the_tilts_of_a_pan_position_are_judged_like_overlapping_pairs(
         pan_captures: list, tmp_path: Path) -> None:
     """The camera's same-heading pairs are the tilts of one pan position, judged like the
     overlapping pairs over them alone (user ruling 2026-10-08): median, p90, share above 10 % and
-    worst of the pairs' medians. p03's up frame sees the sphere 4 % farther than its other tilts;
-    p04's up frame 6 % and its down frame 12 % farther than its mid frame."""
-    tilt = {"down": -10.0, "mid": 0.0, "up": 10.0}
-    farther = {"img_009_p03_up.jpg": 1.04, "img_010_p04_up.jpg": 1.06,
-               "img_012_p04_down.jpg": 1.12}
-    caps = pan_captures[:6]  # p03: down, mid, up; p04: up, mid, down
+    worst of the pairs' medians. p03's high frame sees the sphere 4 % farther than its other
+    tilts; p04's high frame 6 % and its floor frame 12 % farther than its mid and low frames."""
+    tilt = {"floor": -20.0, "low": -10.0, "mid": 0.0, "high": 10.0}
+    farther = {"img_012_p03_high.jpg": 1.04, "img_013_p04_high.jpg": 1.06,
+               "img_016_p04_floor.jpg": 1.12}
+    caps = pan_captures[:8]  # p03: floor, low, mid, high; p04: high, mid, low, floor
     recs = [record(i, c.name, cam(30.0 * (c.pan - 3), tilt[c.tilt])) for i, c in enumerate(caps)]
     write_map(tmp_path, recs, {r.name: sphere_depth() * farther.get(c.name, 1.0)
                                for r, c in zip(recs, caps, strict=True)})
@@ -281,19 +287,27 @@ def test_the_tilts_of_a_pan_position_are_judged_like_overlapping_pairs(
     v = {k: x.value for k, x in m.items.items()}
     detail = m.items["map.t.frame_agreement_tilt_median_pct"].detail
     pairs = detail["same_heading"]
-    assert list(pairs) == ["img_007_p03_down.jpg~img_008_p03_mid.jpg",
-                           "img_007_p03_down.jpg~img_009_p03_up.jpg",
-                           "img_008_p03_mid.jpg~img_009_p03_up.jpg",
-                           "img_010_p04_up.jpg~img_011_p04_mid.jpg",
-                           "img_010_p04_up.jpg~img_012_p04_down.jpg",
-                           "img_011_p04_mid.jpg~img_012_p04_down.jpg"]
-    # |z_i→j / z_j - 1|, the earlier capture i: 0, 3.85, 3.85 (p03); 6.0, 5.36, 10.71 (p04)
+    assert list(pairs) == ["img_009_p03_floor.jpg~img_010_p03_low.jpg",
+                           "img_009_p03_floor.jpg~img_011_p03_mid.jpg",
+                           "img_009_p03_floor.jpg~img_012_p03_high.jpg",
+                           "img_010_p03_low.jpg~img_011_p03_mid.jpg",
+                           "img_010_p03_low.jpg~img_012_p03_high.jpg",
+                           "img_011_p03_mid.jpg~img_012_p03_high.jpg",
+                           "img_013_p04_high.jpg~img_014_p04_mid.jpg",
+                           "img_013_p04_high.jpg~img_015_p04_low.jpg",
+                           "img_013_p04_high.jpg~img_016_p04_floor.jpg",
+                           "img_014_p04_mid.jpg~img_015_p04_low.jpg",
+                           "img_014_p04_mid.jpg~img_016_p04_floor.jpg",
+                           "img_015_p04_low.jpg~img_016_p04_floor.jpg"]
+    # |z_i→j / z_j - 1|, the earlier capture i: 0, 0, 3.85, 0, 3.85, 3.85 (p03);
+    # 6.0, 6.0, 5.36, 0, 10.71, 10.71 (p04)
     medians = [pairs[k]["median_pct"] for k in pairs]
-    assert medians == pytest.approx([0.0, 3.85, 3.85, 6.0, 5.36, 10.71], abs=0.2)
-    assert detail["pairs"] == 6
-    assert v["map.t.frame_agreement_tilt_median_pct"] == pytest.approx((3.85 + 5.36) / 2, abs=0.2)
-    assert v["map.t.frame_agreement_tilt_p90_pct"] == pytest.approx((6.0 + 10.71) / 2, abs=0.2)
-    assert v["map.t.frame_agreement_tilt_over10_pct"] == pytest.approx(100 / 6, abs=0.01)
+    assert medians == pytest.approx([0.0, 0.0, 3.85, 0.0, 3.85, 3.85,
+                                     6.0, 6.0, 5.36, 0.0, 10.71, 10.71], abs=0.2)
+    assert detail["pairs"] == 12
+    assert v["map.t.frame_agreement_tilt_median_pct"] == pytest.approx(3.85, abs=0.2)
+    assert v["map.t.frame_agreement_tilt_p90_pct"] == pytest.approx(6.0 + 0.9 * 4.71, abs=0.2)
+    assert v["map.t.frame_agreement_tilt_over10_pct"] == pytest.approx(100 * 2 / 12, abs=0.01)
     assert v["map.t.frame_agreement_tilt_max_pct"] == pytest.approx(10.71, abs=0.2)
     # the worst pair's median and p90 judge ainex's revisits only
     assert "map.t.frame_agreement_median_pct" not in v and "map.t.frame_agreement_p90_pct" not in v

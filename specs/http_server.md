@@ -9,10 +9,12 @@ server.sh --status | --stop
 
 Starts a long-lived local HTTP service that exposes `reconstruct.sh` ([§2.2](reconstruct.md)),
 `mapper.sh` ([§2.3](mapper.md)) and `segment.sh` ([§2.4](segment.md)) through an HTTP API,
-and serves a simple browser application built on that API. These three commands are the
-API's whole scope: `view.sh` ([§2.5](view.md)) and `start_inference_server.sh`
-([§2.1](start_inference_server.md)) remain commands only. A user who never opens a terminal
-after `server.sh` must be able to run every mode of the three commands and get its result.
+and serves a simple browser application built on that API. These three commands, plus two
+actions on the workspace's maps (removing a map, and starting or stopping its viewer), are the
+API's whole scope: `start_inference_server.sh` ([§2.1](start_inference_server.md)) remains a
+command only, and `view.sh` ([§2.5](view.md)) is reached only as a map's viewer (`-m`, never
+`-i`). A user who never opens a terminal after `server.sh` must be able to run every mode of
+the three commands and get its result.
 
 * `--port <n>` — port to bind on `0.0.0.0`, **default `0`** (port 9091 if it is free,
   otherwise a free port chosen by the OS).
@@ -83,7 +85,7 @@ web-service module.
   interrupted upload is deleted at once, and an upload that no request has consumed is
   deleted when the service stops or starts.
 * The service keeps no results: a result exists only in its response. It changes a map only
-  through the mapping operation and never deletes one. Operations the commands perform
+  through the mapping operation and deletes one only through the remove operation. Operations the commands perform
   without the inference server also work without it here.
 
 ## Requests
@@ -110,7 +112,9 @@ There are no jobs: an operation runs within its own HTTP request.
 The API offers one operation per mode of the three commands, listed here by command. Their
 parameters, results and errors are the command's own (see
 [Single source of truth](#single-source-of-truth)); a mode that a command gains becomes an
-operation in the same way.
+operation in the same way. Two further operations act on a workspace map (remove it, start or
+stop its viewer); they are not command modes, take only the map's name, have no validation
+endpoint, and never need the inference server.
 
 ### `reconstruct.sh` ([§2.2](reconstruct.md))
 
@@ -126,9 +130,13 @@ operation in the same way.
 * **Locate in a map.** Finds the camera poses of images in an existing map, without changing
   it; the response is the command's result. Needs the inference server only when the command
   does.
-* **Remove a map.** Deletes the named map from the workspace.
-* **Start or stop a map's viewer.** Starts or stops `view.sh` on the named map, so that the map
-  can be viewed in the browser.
+* **Remove a map.** Deletes the named map from the workspace. It is refused, with the
+  service's own error, while another request reads or writes that map; a running viewer of the
+  map is stopped first.
+* **Start or stop a map's viewer.** Starts or stops `view.sh -m` on the named map, so that the
+  map can be viewed in the browser. At most one viewer runs per map: starting a running one
+  answers its URL again. The response gives the viewer's URL, which, like every `view.sh` page,
+  is served on this machine only. Stopping the service stops every viewer it started.
 
 ### `segment.sh` ([§2.4](segment.md))
 
@@ -140,11 +148,12 @@ The artefacts that `segment.sh -d` writes to a folder are not offered by the API
 ## API
 
 All endpoints are under `/api/` and are described by an OpenAPI document at
-`/api/openapi.json`, generated from the operation definitions above. Besides the operations,
-each with its validation endpoint, the API offers only: service and inference-server health;
+`/api/openapi.json`, generated from the operation definitions above. Besides the operations
+(each command mode with its validation endpoint), the API offers only: service and inference-server health;
 uploads (create and discard); and the workspace's maps, as a list and one by one, with a
-summary taken from each map's own metadata, so a client can name a map. There are no job,
-download or viewer endpoints.
+summary taken from each map's own metadata, so a client can name a map, and whether its
+viewer runs. There are no job or download endpoints, and no viewer endpoint besides the
+viewer operation.
 
 Because the service listens on the LAN, it refuses (with its own error, listed in the OpenAPI
 document) a request whose `Host` does not name this machine, a state-changing request from a
@@ -157,8 +166,9 @@ upload too large for its cap or for the workspace's free disk space. The caps ar
 The web application is served at `/` by the same process and uses only the public API, so
 everything it does can also be scripted. Its forms and result pages are **rendered from the
 API description**, not written per command: a new option appears as a new field, a new error
-as a new message. It has no map or scene viewer. A point-cloud result is still drawn in the
-page (see Structure).
+as a new message. It draws no map or scene itself: a map is viewed in its `view.sh` viewer,
+started and stopped from the map's page. A point-cloud result is still drawn in the page (see
+Structure).
 
 ### Structure
 
@@ -170,13 +180,17 @@ page (see Structure).
   score). A point cloud (PLY) is loaded in the page and drawn in 3D with the colours and
   attributes it carries, and the user can rotate, pan and zoom it. The drawing reuses the
   [§2.5](view.md) viewer's own rendering of clouds, so a cloud looks the same as in `view.sh`.
+  One exception: above the viewer's 16 000 000-point budget the page draws evenly spaced
+  points of the file (every k-th vertex) instead of a voxel-grid subsample, and states
+  "showing X of Y points".
   Every result can be downloaded byte for byte.
 * **Maps** — the workspace's maps as cards (name and summary figures from the map's
   metadata), with a filter. Creating or updating a map is a guided flow over the mapping
   operation's options, with the input order visible and editable. A map's page shows its
   summary and its update history with timings, from the map's metadata, and runs the
   operations that take a map (locating images in it), with the same result
-  display and download.
+  display and download. It also starts or stops the map's viewer (with a link to it while it
+  runs) and removes the map, after a confirmation that states the map is deleted for good.
 
 Every page has a stable URL, so a map's page can be bookmarked, reloaded or shared on this
 machine.

@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,12 @@ OCTET = {"content-type": "application/octet-stream"}
 OFFERED = {"reconstruct", "mapper-update", "mapper-locate", "segment"}
 API_ROUTES = {"GET /api/health", "GET /api/openapi.json", "POST /api/ops/{op}",
               "POST /api/ops/{op}/validate", "POST /api/uploads", "PUT /api/uploads",
-              "DELETE /api/uploads/{id}", "GET /api/maps", "GET /api/maps/{name}"}
+              "DELETE /api/uploads/{id}", "GET /api/maps", "GET /api/maps/{name}",
+              "DELETE /api/maps/{name}", "POST /api/maps/{name}/viewer",
+              "DELETE /api/maps/{name}/viewer"}
+MAP_OPERATIONS = {"map-remove": ("delete", "/api/maps/{name}"),
+                  "map-viewer-start": ("post", "/api/maps/{name}/viewer"),
+                  "map-viewer-stop": ("delete", "/api/maps/{name}/viewer")}
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +92,7 @@ def svc(ws: Workspace) -> Iterator[Svc]:
     with TestClient(create_app(service)) as client:
         yield Svc(service, client)
     service.runner.shutdown()
+    service.viewers.stop_all()
 
 
 def fields(body: dict[str, Any]) -> list[str]:
@@ -121,13 +128,24 @@ def api_routes(service: Service) -> set[str]:
 
 
 def test_the_routes_are_exactly_the_specs(svc: Svc) -> None:
-    """Spec §2.6 "API": health, the OpenAPI document, uploads (create, discard), maps (list, one)
-    and the operations with their validation — no job, download or viewer endpoint."""
+    """Spec §2.6 "API": health, the OpenAPI document, uploads (create, discard), maps (list, one),
+    the operations with their validation, and the two operations on a map that are no command's
+    mode (its removal, its viewer's start and stop), with no validation endpoint — no job or
+    download endpoint, and no viewer endpoint besides the viewer operation."""
     assert api_routes(svc.service) == API_ROUTES
     doc = svc.client.get("/api/openapi.json").json()
     fixed = {p for p in doc["paths"] if not p.startswith("/api/ops/")}
     assert fixed == {"/api/health", "/api/uploads", "/api/uploads/{id}", "/api/maps",
-                     "/api/maps/{name}"}
+                     "/api/maps/{name}", "/api/maps/{name}/viewer"}
+    by_id = {op["operationId"]: (method, path) for path, item in doc["paths"].items()
+             for method, op in item.items() if "operationId" in op
+             and not path.startswith("/api/ops/")}
+    assert by_id == MAP_OPERATIONS
+    for method, path in MAP_OPERATIONS.values():  # the map's name only
+        assert [p["name"] for p in doc["paths"][path][method]["parameters"]] == ["name"]
+    assert not [p for p in doc["paths"] if p.endswith("/validate") and "/ops/" not in p]
+    start = doc["paths"]["/api/maps/{name}/viewer"]["post"]
+    assert "never needs the inference server" in start["description"]
     for gone in ("/api/jobs", "/api/jobs/x", "/viewer/map/m/", "/api/maps/m/files/map.json",
                  "/api/maps/m/viewer/api/meta", "/api/display-transform"):
         assert svc.client.get(gone).status_code == 404, gone
@@ -320,6 +338,43 @@ def test_paths_outside_the_workspace_are_refused(svc: Svc, tmp_path: Path) -> No
         r = svc.client.post("/api/ops/segment/validate", json={"image": image})
         assert r.json()["by_parameter"].get("image") is None, r.json()
     assert svc.client.get("/api/maps/evil").status_code == 404
+
+
+def test_a_path_that_cannot_be_resolved_is_refused_and_consumes_the_uploads(
+        ws: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec §2.6 "Workspace": a path a request names that cannot be resolved — the home of a user
+    this machine does not have (``~<user>/…``), a symlink loop — is a usage error (400), never a
+    crash, and the request consumes the uploads it was given all the same, as does one whose
+    map's name crashes (the internal error). A looping entry of ``maps/`` is no map."""
+    nobody = f"~no-such-user-{secrets.token_hex(6)}"
+    minimal_map(ws.maps / "m")
+    (ws.root / "loop").symlink_to(ws.root / "loop")
+    (ws.maps / "loop").symlink_to(ws.maps / "loop")
+    service = make_svc(ws, inference_check=lambda: None)
+    with TestClient(create_app(service), raise_server_exceptions=False) as c:
+        for second, map_, words in ((f"{nobody}/a.jpg", "m", "no such user's home"),
+                                    (None, f"{nobody}/m", "no such user's home"),
+                                    (None, nobody, "no such user's home"),
+                                    ("loop/a.jpg", "m", "cannot be resolved (Symlink loop")):
+            up = c.put("/api/uploads?name=a.jpg", content=b"x").json()
+            inputs = [up["path"], *([second] if second else [])]
+            r = c.post("/api/ops/mapper-locate", json={"inputs": inputs, "map": map_})
+            assert r.status_code == 400 and r.json()["error"]["code"] == "usage", r.text
+            assert words in r.json()["error"]["message"] and "use a path inside the workspace" \
+                in r.json()["error"]["message"]
+            assert not (ws.uploads / up["id"]).exists(), (second, map_)  # consumed
+        assert c.get("/api/maps/loop").status_code == 404
+        assert [m["name"] for m in c.get("/api/maps").json()] == ["m"]
+
+        def crash(*_a: object) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(web_app, "named_map", crash)
+        up = c.put("/api/uploads?name=a.jpg", content=b"x").json()
+        r = c.post("/api/ops/mapper-locate", json={"inputs": [up["path"]], "map": "m"})
+        assert r.status_code == 500 and r.json()["error"]["message"] == "RuntimeError: boom"
+        assert not (ws.uploads / up["id"]).exists()
+    service.runner.shutdown()
 
 
 def test_host_origin_and_content_type_are_checked(ws: Workspace) -> None:
@@ -593,18 +648,20 @@ def test_the_web_process_never_loads_torch_or_open3d(tmp_path: Path) -> None:
     assert out.stdout.strip() == "[]"
 
 
-def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
-    """No request deletes or changes a map outside the mapping operation: no route deletes one,
-    read-only requests (whatever their outcome) and a failing update leave it as it was, and so
-    do a stop and a restart."""
+def test_the_service_changes_a_map_only_through_the_mapping_operation(ws: Workspace) -> None:
+    """No request but the mapping operation changes a map, and none but the remove operation
+    deletes one: read-only requests (whatever their outcome), its viewer, a failing update and a
+    refused removal leave it as it was, and so do a stop and a restart."""
     from tests.mapsnap import snapshot
 
     root = minimal_map(ws.maps / "m")
     before = snapshot(root)
     service = make_svc(ws)
     with TestClient(create_app(service)) as c:
-        assert c.delete("/api/maps/m").status_code == 405
         assert c.delete("/api/uploads/m").status_code == 404
+        assert c.delete("/api/maps/m/x").status_code == 404
+        assert c.post("/api/maps/m/viewer", json={}).json()["running"]
+        assert c.delete("/api/maps/m/viewer").json() == {"running": False, "url": None}
         (ws.root / "bad.jpg").write_bytes(b"not an image")
         for params in ({"map": "m"}, {"map": "maps/m", "format": "ply"}):
             r = c.post("/api/ops/mapper-locate", json={"inputs": ["bad.jpg"], **params})
@@ -614,6 +671,7 @@ def test_the_service_never_deletes_a_map(ws: Workspace) -> None:
         assert r.status_code >= 400
         assert c.get("/api/maps").json()[0]["name"] == "m"
     service.runner.shutdown()
+    service.viewers.stop_all()
     make_svc(ws).runner.shutdown()
     assert snapshot(root) == before
     assert json.loads((root / "map.json").read_text())["update_count"] == 1
@@ -713,6 +771,11 @@ def test_the_services_own_refusals_are_one_table(ws: Workspace,
         monkeypatch.setattr(service.runner, "in_use", lambda _uid: True)
         r = c.delete(f"/api/uploads/{uid}")
         got[r.json()["error"]["code"]] = r.status_code
+        minimal_map(ws.maps / "m")
+        monkeypatch.setattr(service.runner, "map_user", lambda _path: ("mapper-update",
+                                                                      "running"))
+        r = c.delete("/api/maps/m")
+        got[r.json()["error"]["code"]] = r.status_code
         service.runner.stopping = True
         r = c.post("/api/ops/reconstruct", json={})
         got[r.json()["error"]["code"]] = r.status_code
@@ -770,7 +833,17 @@ def test_every_json_answer_follows_its_schema_in_the_document(
         check("/api/maps/{name}", "get", c.get("/api/maps/m"))
         check("/api/maps/{name}", "get", c.get("/api/maps/nope"))
         check("/api/uploads/{id}", "delete", c.delete("/api/uploads/nope"))
+        viewer = "/api/maps/{name}/viewer"
+        check(viewer, "post", c.post("/api/maps/m/viewer", json={}))
+        check("/api/maps", "get", c.get("/api/maps"))  # with a running viewer
+        check("/api/maps/{name}", "get", c.get("/api/maps/m"))
+        check(viewer, "post", c.post("/api/maps/m/viewer", json={"x": 1}))
+        check(viewer, "delete", c.delete("/api/maps/m/viewer"))
+        check(viewer, "delete", c.delete("/api/maps/nope/viewer"))
+        check("/api/maps/{name}", "delete", c.delete("/api/maps/nope"))
+        assert c.delete("/api/maps/m").status_code == 204  # no body
     service.runner.shutdown()
+    service.viewers.stop_all()
     error = Draft202012Validator({**doc, "$ref": "#/components/schemas/Error"})
     for outcome in (Outcome(5, "no overlap"), Outcome(130, None, STOPPING)):
         error.validate(web_app.failure(outcome)[1])

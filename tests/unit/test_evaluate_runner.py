@@ -257,25 +257,25 @@ def test_camera_frames_are_segmented_and_annotations_of_them_apply(tmp_path: Pat
     examples = tmp_path / "examples"
     (examples / "ground_truth").mkdir(parents=True)
     (examples / "ground_truth" / "desk.json").write_text(json.dumps({
-        "kind": "objects", "image": "camera/img_007_p03_down.jpg",
+        "kind": "objects", "image": "camera/img_009_p03_floor.jpg",
         "objects": [{"label": "chair"}, {"label": "monitor"}]}))
     repo = fake_repo(tmp_path, segment=f'case "$2" in *_p04_*) echo boom >&2; exit 1;; esac\n'
                                        f"cat {payload}")
     ev = Evaluation(tmp_path / "out", Runner(tmp_path / "out", repo), BrowserProbe(None),
                     examples=examples)
-    ev.frames(CAMERA, pan_captures_in(EXAMPLES / "camera")[:4])
+    ev.frames(CAMERA, pan_captures_in(EXAMPLES / "camera")[:5])  # p03's four tilts, p04's first
     m = ev.metrics.items["seg.camera_frames.with_detections_fraction"]
-    assert m.value == 1.0 and m.detail == {"segmented": 3, "frames": 4}
+    assert m.value == 1.0 and m.detail == {"segmented": 4, "frames": 5}
     assert [(r.tag, r.spec.group) for r in ev.runner.records][:1] == [
-        ("segment_camera_frame_007", "segment_camera_frames")]
-    assert sorted(ev.images) == ["camera/img_007_p03_down.jpg", "camera/img_008_p03_mid.jpg",
-                                 "camera/img_009_p03_up.jpg"]
+        ("segment_camera_frame_009", "segment_camera_frames")]
+    assert sorted(ev.images) == ["camera/img_009_p03_floor.jpg", "camera/img_010_p03_low.jpg",
+                                 "camera/img_011_p03_mid.jpg", "camera/img_012_p03_high.jpg"]
     rows = ev.details["segmentation.camera_frames"]
-    assert rows[0]["image"] == "img_007_p03_down.jpg" and "boom" in rows[3]["error"]
-    assert ev.runner.records[0].argv[-1] == str(examples / "camera" / "img_007_p03_down.jpg")
+    assert rows[0]["image"] == "img_009_p03_floor.jpg" and "boom" in rows[4]["error"]
+    assert ev.runner.records[0].argv[-1] == str(examples / "camera" / "img_009_p03_floor.jpg")
     ev.ground_truth()
     assert ev.metrics.items["gt.objects.recall"].detail == {
-        "camera/img_007_p03_down.jpg": {"truth": 2, "detections": 4, "paired": 1}}
+        "camera/img_009_p03_floor.jpg": {"truth": 2, "detections": 4, "paired": 1}}
 
 
 def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path) -> None:
@@ -307,7 +307,7 @@ def test_every_command_failing_yields_failed_metrics_not_a_crash(tmp_path: Path)
     assert sum(t.startswith("segment_frame_") for t in tags) == 79
     assert sum(t.startswith("mapper_split_") for t in tags) == 3
     # examples/camera: every frame, both maps and view.sh -m on the one-update map
-    assert sum(t.startswith("segment_camera_frame_") for t in tags) == 27
+    assert sum(t.startswith("segment_camera_frame_") for t in tags) == 36
     assert sum(t.startswith("mapper_camera_split_") for t in tags) == 3
     assert {"mapper_camera_single", "view_camera_map"} <= set(tags)
     assert "mapper_street2" in tags and "server_sh" in tags

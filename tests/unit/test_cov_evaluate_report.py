@@ -205,21 +205,21 @@ def test_every_detail_section_of_the_summary(tmp_path: Path) -> None:
         "poses.locate": [{"capture": "011_left_060_level.jpg", "commanded_yaw_deg": 60.0,
                           "yaw_deg": 58.0, "yaw_err_deg": 2.0, "vs_mapped_rot_deg": 1.0,
                           "vs_mapped_m": 0.1}],
-        "poses.camera_locate": [{"capture": "img_016_p06_up.jpg", "located": True,
+        "poses.camera_locate": [{"capture": "img_021_p06_high.jpg", "located": True,
                                  "yaw_deg": 50.0, "yaw_err_deg": 2.0, "vs_mapped_rot_deg": 2.1,
                                  "vs_mapped_m": 0.02}],
-        "poses.camera_split": [{"capture": "img_010_p04_up.jpg", "pan": 4, "tilt": "up",
+        "poses.camera_split": [{"capture": "img_013_p04_high.jpg", "pan": 4, "tilt": "high",
                                 "registered": True, "yaw_deg": 21.4, "pitch_delta_deg": 12.0,
                                 "pitch_ok": True},
-                               {"capture": "img_011_p04_mid.jpg", "pan": 4, "tilt": "mid",
+                               {"capture": "img_014_p04_mid.jpg", "pan": 4, "tilt": "mid",
                                 "registered": False}],
         "segmentation.frames": [{"image": "001_bootstrap_level.jpg", "objects": 2,
                                  "labels": {"sofa": 2}, "min_score": 0.6, "median_score": 0.7}],
-        "segmentation.camera_frames": [{"image": "img_007_p03_down.jpg", "error": "boom"}],
+        "segmentation.camera_frames": [{"image": "img_009_p03_floor.jpg", "error": "boom"}],
         "map.camera_stability": [{"single_id": 4, "split_id": 4, "single_label": "desk",
                                   "split_label": "desk", "iou": 0.62, "centre_delta_m": 0.04,
                                   "extent_delta_rel": 0.12}],
-        "map.camera_single.pairs": [{"pair": "img_007_p03_down.jpg~img_008_p03_mid.jpg",
+        "map.camera_single.pairs": [{"pair": "img_009_p03_floor.jpg~img_010_p03_low.jpg",
                                      "gap": 1, "angle_deg": 14.8, "median_pct": 2.2,
                                      "p90_pct": 6.1}],
         "map_update": {"splits": {"split_4_4_5": {"ids_broken": [
@@ -236,19 +236,19 @@ def test_every_detail_section_of_the_summary(tmp_path: Path) -> None:
     assert "## Poses — held-out captures located by mapper.sh locate" in text
     assert "| 011_left_060_level.jpg | 60 | 58 | 2 | 1 | 0.1 |" in text
     assert "## Poses — held-out captures located by mapper.sh locate — camera" in text
-    assert "| img_016_p06_up.jpg | — | 50 | 2 | 2.1 | 0.02 |" in text
+    assert "| img_021_p06_high.jpg | — | 50 | 2 | 2.1 | 0.02 |" in text
     assert "## Map update: split_4_4_5, published ids that did not persist" in text
     assert "| 3 | monitor | 1 | 3 | — |" in text
     assert "split_4_4_5, objects that never changed" not in text  # no stability rows
     assert "## Evaluator errors\n\n* server.sh: RuntimeError: boom" in text
     # examples/camera: its own pose table (no commanded yaw), frames, objects and pairs
     assert "## Poses — camera_split map\n\nYaw relative to the first registered capture" in text
-    assert "| img_010_p04_up.jpg | 4 | up | 21.4 | 12 | yes |" in text
-    assert "| img_011_p04_mid.jpg | 4 | mid | — | — | — |" in text
+    assert "| img_013_p04_high.jpg | 4 | high | 21.4 | 12 | yes |" in text
+    assert "| img_014_p04_mid.jpg | 4 | mid | — | — | — |" in text
     assert "## Poses — camera_single map" not in text
     assert "| 001_bootstrap_level.jpg | 2 | sofa 2 | 0.6 | 0.7 |" in text
-    assert "| img_007_p03_down.jpg | — | boom | — | — |" in text
+    assert "| img_009_p03_floor.jpg | — | boom | — | — |" in text
     assert "## Objects: one update vs split — camera" in text
     assert "| 4 | 4 | desk / desk | 0.62 | 0.04 | 0.12 |" in text
     assert "## Least consistent overlapping keyframe pairs — camera_single map" in text
-    assert "| img_007_p03_down.jpg~img_008_p03_mid.jpg | 1 | 14.8 | 2.2 | 6.1 |" in text
+    assert "| img_009_p03_floor.jpg~img_010_p03_low.jpg | 1 | 14.8 | 2.2 | 6.1 |" in text

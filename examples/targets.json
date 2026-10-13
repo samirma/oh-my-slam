@@ -1,7 +1,7 @@
 {
   "about": "Targets of `python -m oh_my_slam.tools.evaluate` (high_level_spec.md §5): metric id -> {op: '<=' or '>=', value}. A metric passes when its value meets the target; it regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the metric's own tolerances or else the defaults. Edit the values here; no code change is needed.",
   "rationale": {
-    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T152742Z (commit 51f168a, Apple M4 Max 36 GB, the final code, run alone under the machine-wide lock); their 'measured' is that run. The targets of examples/camera (perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map, seg.camera_frames, pose.camera_*, map.camera_*; added 2026-10-07) are not measured yet, except seg.camera_frames (set from a measurement on 2026-10-07) and map.camera_*.frame_agreement_tilt_* (set by user decision on 2026-10-08): see their groups below. The targets of mapper.sh locate on examples/camera (pose.camera_locate.*, perf.camera_locate.*; added 2026-10-08) are the ainex locate targets, not measured yet.",
+    "about": "Why each group of targets has its value. Values under 'measured' are from the run 20260924T230511Z (commit f0a8481, Apple M4 Max 36 GB, warm weights), except for the targets a group below says were set from the baseline run 20260925T022345Z (commit 67b8bc9), and are reference only: the evaluator reads only op, value, the tolerances, unit and description. The targets of the metrics added on 2026-10-05 (per stage, mapper.sh locate, the office maps, street2, server.sh) were set from the run 20261005T152742Z (commit 51f168a, Apple M4 Max 36 GB, the final code, run alone under the machine-wide lock); their 'measured' is that run. The targets of examples/camera (perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map, seg.camera_frames, pose.camera_*, map.camera_*; added 2026-10-07) are not measured yet, except seg.camera_frames (set from a measurement on 2026-10-07) and map.camera_*.frame_agreement_tilt_* (set by user decision on 2026-10-08): see their groups below. The targets of mapper.sh locate on examples/camera (pose.camera_locate.*, perf.camera_locate.*; added 2026-10-08) are the ainex locate targets, not measured yet. examples/camera is the 36-frame capture (1920x1080, tilts floor, low, mid, high; spec §5 follows it by user ruling 2026-10-13), which replaced an earlier 27-frame one (1920x888, tilts down, mid, up) on 2026-10-08: on 2026-10-13 the targets that depend on its frame count were re-derived for 36 frames with their groups' own rules, and the measurements quoted for seg.camera_frames and map.camera_*.frame_agreement_tilt_* are of the earlier capture.",
     "perf.*.wall_s, perf.*.render_s, perf.server.cold_start_s": "About 1.5-2x the measured time, rounded: the headroom absorbs run-to-run noise (thermal state, page cache, other load) but not a real slowdown, which the baseline comparison (tolerance_rel 0.2) flags first. Kept where already within ~1.5-2x (reconstruct 3.0 s at 2.1 s, reconstruct -f ply 1.5 s at 0.95 s, mapper one update 300 s at 159 s); tightened elsewhere: cold start 120 -> 45 s (24 s), segment.sh -i 4.0 -> 3.5 s (2.2 s), per frame 2.5 -> 2.0 s (1.07 s), view.sh -i 20 -> 5 s (2.6 s), split mapping 450 -> 360 s (181 s over 3 updates), view.sh -m 10 -> 4 s (1.9 s). Tightened again to ~1.5x the baseline run 20260925T022345Z (commit 67b8bc9; its values are the 'measured' of these metrics): cold start 45 -> 40 s (24.6 s; the start reads the weights from the page cache, so a little more headroom), segment.sh -i per frame 2.0 -> 1.6 s (1.07 s), one-update mapping 300 -> 270 s (177 s), split mapping 360 -> 300 s (198 s), view.sh -m 4 -> 3 s (1.99 s).",
     "perf.*.client_peak_mb": "About 1.5-1.8x the measured peak resident set of the command's process tree, rounded up: memory is far less noisy than time, so the old 4-12 GB limits (8-18x) could not catch any leak. Single-image commands ~510-535 MB -> 800 MB; reconstruct -f ply 260 MB -> 450 MB; one frame 164 MB -> 300 MB; mapping 4.4-5.0 GB (pycolmap in process + COLMAP children) -> 8 GB; view.sh -m 462 MB -> 800 MB. Tightened to ~1.5-1.6x the baseline run 20260925T022345Z where the old limit had become loose: one frame 300 -> 250 MB (165 MB), view.sh -m 800 -> 350 MB (214 MB since commit af1cda8 serves the map cloud without copying it). Mapping (4.5-4.7 GB, 1.7x) keeps 8 GB: its peak includes COLMAP's children and grows with the sequence.",
     "perf.server.*, perf.*.server_peak_gb": "The server's physical footprint includes its Metal/MPS allocations. Resident after start 9.8 GB -> 13 GB. Single-image commands (and view.sh -m, which does not use the server: the figure is its idle footprint) peaked at 10.7-11.4 GB -> 14 GB, i.e. resident plus ~4 GB of activations and caches. Mapping (multi-view inference) 14.7-15.3 GB -> 20 GB, roughly the server's MPS allocation cap (0.7 of Metal's recommended working set on 36 GB); near it the server risks MPS out-of-memory errors.",
@@ -16,14 +16,14 @@
     "perf.<group>.stage.<stage>.*": "Spec §5 'per-stage … wall time and peak memory, per image and per mapping update'. Seconds (.s): explicit targets max(1.75 x measured, measured + 0.5 s) rounded up to two digits, regression tolerance 35 % / 0.25 s (stage times are noisier than totals: GPU queueing between the frames' requests). A stage a command adds later falls back to its group's pattern perf.<group>.stage.*.s = the group's end-to-end target, since a stage never outlasts its run. Memory (.client_peak_mb, .server_peak_gb): the group's end-to-end memory targets as patterns, for the same reason. The explicit stage times (and the end-to-end targets of the locate, office, street2 and server.sh groups) were first derived from run 20261005T102325Z, which ran while other agents loaded the machine, and re-derived with the same rule from the solo run 20261005T152742Z.",
     "perf.locate, perf.mapper_office*, perf.mapper_street2, perf.mapper_split.per_update_wall_s": "Wall time ~1.6 x measured (locate 3 images on the 79-keyframe map 2.24 s -> 3.6 s, from run 20261005T161937Z: run 20261005T152742Z's 2.6 s included ~0.4 s of bytecode recompilation (PYTHONDONTWRITEBYTECODE, fixed in 4c957f2); the office map in one update 48.7 s; the slowest update of the office splits 28.2 s; street2 402 s at -fps 2; the split ainex map's slowest update), client memory max(1.5 x, +200 MB) (the office maps peak at 9.2 / 13.2 GB in COLMAP's features and SfM stages: far above the 6 GB first guessed), server footprint max(+3 GB, 1.2 x).",
     "pose.locate.*, pose.street2.*": "Spec §5 pose accuracy for mapper.sh locate: the held-out captures (the split map's second update, located against the map after its first) use the targets of the map's own captures (registered/located >= 0.9 with 0.05 regression tolerance, yaw error median <= 7 deg, max <= 15 deg); measured 0.58 located, a finding, not a reason to lower it. street2: the share of sampled video frames registered, >= min(0.9, measured - 0.05).",
-    "pose.camera_locate.*, perf.camera_locate.*": "Spec §5: examples/camera has the same uses as ainex-captures, so mapper.sh locate runs on it too: the held-out captures (the split map's second update, located against the map after its first) and three captures (the first, halfway, three quarters through) located on the one-update map. Not measured yet: the ainex locate targets. pose.camera_locate.*: located >= 0.9 (0.05), yaw error median <= 7 deg and max <= 15 deg as pose.locate.*; the step angle is not recorded, so a capture's heading is the yaw the split map gives it once an update has added it (both relative to the first capture), not a commanded one. perf.camera_locate: ainex's 690 MB and 16 GB; wall time 5.0 s, ainex's 3.6 s with its features_matching share (1.5 s of the 2.2 s measured) doubled for SIFT on 3 queries of 6.75x the pixels, matched against 27 keyframes instead of 79; stage patterns are the group's end-to-end targets. Re-derive them with the rule of their neighbours from the first run that measures them.",
+    "pose.camera_locate.*, perf.camera_locate.*": "Spec §5: examples/camera has the same uses as ainex-captures, so mapper.sh locate runs on it too: the held-out captures (the split map's second update, located against the map after its first) and three captures (the first, halfway, three quarters through) located on the one-update map. Not measured yet: the ainex locate targets. pose.camera_locate.*: located >= 0.9 (0.05), yaw error median <= 7 deg and max <= 15 deg as pose.locate.*; the step angle is not recorded, so a capture's heading is the yaw the split map gives it once an update has added it (both relative to the first capture), not a commanded one. perf.camera_locate: ainex's 690 MB and 16 GB; wall time 5.0 s, ainex's 3.6 s with its features_matching share (1.5 s of the 2.2 s measured) doubled for SIFT on 3 queries of 6.75x the pixels, matched against 36 keyframes instead of 79; stage patterns are the group's end-to-end targets. Re-derive them with the rule of their neighbours from the first run that measures them.",
     "server_sh.*": "http_server.md 'Evaluation'. Performance (set from the run): start-up max(2 x, +2 s), resident memory max(1.5 x, +100 MB), web application render max(2 x, +1 s), read-only latency 3 x measured with floors of 20 ms (median), 50 ms (p95) and 100 ms (p95 of the reads made while an operation's request runs), the overhead of an operation's request over the same command from the shell max(2 x, +1 s) (first measured as the overhead of a job, before requests replaced jobs); generous relative tolerances because the figures are milliseconds. Parity is exact: mismatched <= 0 (response bodies byte-identical to the command's result), unverifiable <= 0 (a command that is not byte-reproducible with identical inference cannot be shown identical; measured 2 mapper.sh update JSON cases: SfM scale differs in the 14th digit), every operation covered (>= 1). UI: no failed browser test, at least the 17 tests of tests/browser/test_webapp*.py run (17 since the request-based application), and no axe-core violation (WCAG 2.0/2.1 A, AA).",
     "perf.reconstruct_depth, perf.segment_image_png": "Spec §5 'per image' performance covers every output format of the per-image commands, so reconstruct.sh -f depth and segment.sh -i -f png -d are performance groups, no longer contract checks only. Not measured yet: each takes the targets of the run whose inference it repeats. -f depth repeats -f ply's (geometry alone) and encodes a 16-bit PNG instead of a PLY: wall 2.0 s (about 2 x reconstruct -f ply's 0.95-1.5 s), 450 MB, 14 GB. -f png -d repeats segment.sh -i -d (-f json): 3.5 s, 800 MB, 14 GB. Stage patterns are the group's end-to-end targets, as for every group. Re-derive them with the rule of their neighbours from the first run that measures them.",
-    "perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map": "Spec §5 'per image and per mapping update' on examples/camera (27 frames, 1920x888, real images through a wide-angle lens). Not measured yet: each group takes the targets of its ainex-captures counterpart, scaled where the input differs. segment.sh -i per frame: 2.5 s, the ainex frame's 1.6 s for a larger segmentation grid (1024x474, 1.6x the pixels of 640x480; inference took 0.62 s on ainex's grid and 1.29 s on restaurant.jpg's 1024x768), below segment.sh -i restaurant.jpg's 3.5 s, which adds the four artefacts and 115 objects; 350 MB (ainex 250 MB, with 1.9x the per-pixel arrays); 14 GB. Mapping in one update: 120 s, the ainex target per frame (270 s / 79 = 3.4 s) for 27 frames (92 s) plus SIFT on 6.75x the pixels of an ainex frame (the office maps' 4000x3000 images took ~1.7 s each in features_matching); the keyframe grid (768x355) is about the size of ainex's (640x480), so the per-keyframe stages (inference, objects, cloud) scale with the frame count. Split across 3 updates: 140 s (ainex's split / one-update targets, 300 / 270 = 1.11) and its slowest update 65 s (ainex's per-update target is 140 / 300 of its split's). Mapping memory 8000 MB / 20 GB as ainex (COLMAP's features of 2 MP images stay well below the office maps' 9.6 GB at 12 MP). view.sh -m on the camera map: ainex's 3.0 s, 350 MB, 14 GB (a third of the keyframes). Stage patterns are the group's end-to-end targets (the split's per update, as perf.mapper_split.stage.*). Re-derive them with the rule of their neighbours from the first run that measures them.",
-    "pose.camera_*": "Spec §5 pose accuracy on examples/camera, whose names record the pan order but not the step angle. registered_fraction >= 0.95 as ainex (at most 1 of 27 frames unregistered; tolerance 0.04 = one frame, as ainex's 0.03 is ~2 of 79). pan_order_fraction >= 1: every step from one pan position to the next turns left, i.e. its yaw grows (the evaluator's yaw is positive to the left, as ainex's 'left_YYY'); a pan position's heading is the circular mean of its registered captures' yaws; with 8 steps any wrong one fails, an exact property of a working mapper on a camera that turns one way. tilt_yaw_diff_*: the tilts of one pan position share the pan motor's position, so their headings differ only by the base's deviation from level (about tan(tilt) x tan(base tilt): ~1 deg per tilt for a base 2 deg off level at a 30 deg tilt) and the estimator's error: median <= 2 deg, worst <= 5 deg, half of ainex's same-heading 10 deg, which allows for the ~9 deg by which the robot's re-commanded headings really differ. pitch_direction_fraction >= 0.95 as ainex (18 tilted frames: every one; tolerance 0.06 = one frame). Real images through a wide-angle lens may miss these: a finding, not a reason to lower them.",
-    "map.camera_*": "Not measured yet, except frame_agreement_tilt_* (set by user decision on 2026-10-08: see map.camera_*.frame_agreement_tilt_*): the ainex targets (map.*.frame_agreement_pairs_*, map.stability.*, seg.frames.*), for the same spec intent: one consistent cloud wherever keyframes overlap, and the same objects, ids, labels and OBBs whether the sequence is mapped in one update or split across several. The same-heading pairs of examples/camera are the tilt pairs of each pan position (down/mid, mid/up, down/up: the same place and heading, another tilt; a pair sharing fewer than 500 pixels is not compared), judged by frame_agreement_tilt_* instead of ainex's worst same-heading pair (map.*.frame_agreement_median_pct, map.*.frame_agreement_p90_pct).",
-    "map.camera_*.frame_agreement_tilt_*": "Set by user decision on 2026-10-08. For examples/camera only, the tilt pairs (every two of the three tilts of one pan position) are judged with the targets of the overlapping pairs (map.*.frame_agreement_pairs_*), computed over the tilt pairs alone, each pair scored by its median depth disagreement |z_i->j / z_j - 1|: the median of the tilt pairs' medians <= 3 %, their p90 <= 5 %, the share of tilt pairs whose median exceeds 10 % <= 1 % and the largest tilt-pair median <= 15 %, with the same regression tolerances. They replace the targets the camera had copied from ainex (the worst tilt pair's median <= 3 % and the worst tilt pair's within-pair p90 <= 10 %): the within-pair p90 bound is dropped for the camera only, and ainex-captures keeps all its metrics and targets. Why the camera differs: ainex's same-heading pairs are revisits, which see the same surfaces at the same image positions; the camera's tilt pairs share only strips, at the top of one frame and the bottom of the other, so they behave like ordinary overlapping pairs. Evidence, on maps/test-r3 (a one-update map of the 27 frames of examples/camera, built 2026-10-07), with the evaluator's own functions: all 27 tilt pairs compared; median 2.77 %, p90 of the medians 4.67 %, 0 of 27 above 10 %, worst 5.45 % (img_007_p03_down / img_009_p03_up). The worst-pair metrics they replace measured 5.45 % (median) and 22.02 % (that pair's within-pair p90) on the same map.",
-    "seg.camera_frames.*": "Set from a measurement on 2026-10-07, by user decision: segment.sh -i finds objects in 22 of the 27 frames = 0.815, so >= 0.8 (at most 5 frames without a detection); ainex keeps >= 0.9 (seg.frames). The five frames see only steep up-tilts and plain built-ins, where the detector's best correct detection at the default passes scores below 0.5: img_009_p03_up (doorway 0.41), img_010_p04_up (white built-in wardrobe 0.47), img_014_p05_mid (wardrobe 0.17, light switch 0.20; as a 'thermostat' 0.50 on the coarse pass, under its 5 % size floor), img_015_p05_up (wardrobe 0.20) and img_033_p11_up (window with roller shutters 0.41 as 'shop window', the hanging bunting as 'flag' 0.53 on the coarse pass, under its size floor). The default --min-score 0.5 stays: the spec fixes it (specs/segment.md). Input resolution (640-1920 px), lens undistortion, contrast, flips, tiles, 76 prompt wordings, averaged synonym prompts and the other detection head lift none of them cleanly; two extra fused passes (640 px on a 640 px input, 512 px upsampled to 1024, without the size floor) reach 25 of 27 but add about 20 false labels on ainex-captures, at least one on restaurant.jpg and many on examples/camera (README, Known limitations)."
+    "perf.segment_camera_frames, perf.mapper_camera_*, perf.view_camera_map": "Spec §5 'per image and per mapping update' on examples/camera (36 frames, 1920x1080, real images through a wide-angle lens). Not measured yet: each group takes the targets of its ainex-captures counterpart, scaled where the input differs. segment.sh -i per frame: 2.5 s, the ainex frame's 1.6 s for a larger segmentation grid (1024x576, 1.9x the pixels of 640x480; inference took 0.62 s on ainex's grid and 1.29 s on restaurant.jpg's 1024x768), below segment.sh -i restaurant.jpg's 3.5 s, which adds the four artefacts and 115 objects; 350 MB (ainex 250 MB, with 1.9x the per-pixel arrays); 14 GB. Mapping in one update: 160 s, the ainex target per frame (270 s / 79 = 3.4 s) for 36 frames (123 s) plus SIFT on 6.75x the pixels of an ainex frame (~1 s per frame: the office maps' 4000x3000 images took ~1.7 s each in features_matching); the keyframe grid (768x432) is about the size of ainex's (640x480), so the per-keyframe stages (inference, objects, cloud) scale with the frame count. Split across 3 updates: 180 s (ainex's split / one-update targets, 300 / 270 = 1.11) and its slowest update 85 s (ainex's per-update target is 140 / 300 of its split's). Mapping memory 8000 MB / 20 GB as ainex (COLMAP's features of 2 MP images stay well below the office maps' 9.6 GB at 12 MP). view.sh -m on the camera map: ainex's 3.0 s, 350 MB, 14 GB (under half of the keyframes). Stage patterns are the group's end-to-end targets (the split's per update, as perf.mapper_split.stage.*). Re-derive them with the rule of their neighbours from the first run that measures them.",
+    "pose.camera_*": "Spec §5 pose accuracy on examples/camera, whose names record the pan order but not the step angle. registered_fraction >= 0.95 as ainex (at most 1 of 36 frames unregistered; tolerance 0.03 = one frame, as ainex's 0.03 is ~2 of 79). pan_order_fraction >= 1: every step from one pan position to the next turns left, i.e. its yaw grows (the evaluator's yaw is positive to the left, as ainex's 'left_YYY'); a pan position's heading is the circular mean of its registered captures' yaws; with 8 steps any wrong one fails, an exact property of a working mapper on a camera that turns one way. tilt_yaw_diff_*: the tilts of one pan position share the pan motor's position, so their headings differ only by the base's deviation from level (about tan(tilt) x tan(base tilt): ~1 deg per tilt for a base 2 deg off level at a 30 deg tilt) and the estimator's error: median <= 2 deg, worst <= 5 deg, half of ainex's same-heading 10 deg, which allows for the ~9 deg by which the robot's re-commanded headings really differ. pitch_direction_fraction >= 0.95 as ainex: floor and low below the mid frame of their pan position, high above it (27 tilted frames: at most one wrong; tolerance 0.04 = one frame). Real images through a wide-angle lens may miss these: a finding, not a reason to lower them.",
+    "map.camera_*": "Not measured yet, except frame_agreement_tilt_* (set by user decision on 2026-10-08: see map.camera_*.frame_agreement_tilt_*): the ainex targets (map.*.frame_agreement_pairs_*, map.stability.*, seg.frames.*), for the same spec intent: one consistent cloud wherever keyframes overlap, and the same objects, ids, labels and OBBs whether the sequence is mapped in one update or split across several. The same-heading pairs of examples/camera are the tilt pairs of each pan position (every two of floor, low, mid and high, six per pan position: the same place and heading, another tilt; a pair sharing fewer than 500 pixels is not compared), judged by frame_agreement_tilt_* instead of ainex's worst same-heading pair (map.*.frame_agreement_median_pct, map.*.frame_agreement_p90_pct).",
+    "map.camera_*.frame_agreement_tilt_*": "Set by user decision on 2026-10-08. For examples/camera only, the tilt pairs (every two of the four tilts of one pan position) are judged with the targets of the overlapping pairs (map.*.frame_agreement_pairs_*), computed over the tilt pairs alone, each pair scored by its median depth disagreement |z_i->j / z_j - 1|: the median of the tilt pairs' medians <= 3 %, their p90 <= 5 %, the share of tilt pairs whose median exceeds 10 % <= 1 % and the largest tilt-pair median <= 15 %, with the same regression tolerances. They replace the targets the camera had copied from ainex (the worst tilt pair's median <= 3 % and the worst tilt pair's within-pair p90 <= 10 %): the within-pair p90 bound is dropped for the camera only, and ainex-captures keeps all its metrics and targets. Why the camera differs: ainex's same-heading pairs are revisits, which see the same surfaces at the same image positions; the camera's tilt pairs share only strips, at the top of one frame and the bottom of the other, so they behave like ordinary overlapping pairs. Evidence, on maps/test-r3 (a one-update map of the earlier 27-frame capture of examples/camera, tilts down, mid, up, built 2026-10-07), with the evaluator's own functions: all 27 tilt pairs compared; median 2.77 %, p90 of the medians 4.67 %, 0 of 27 above 10 %, worst 5.45 % (img_007_p03_down / img_009_p03_up). The worst-pair metrics they replace measured 5.45 % (median) and 22.02 % (that pair's within-pair p90) on the same map.",
+    "seg.camera_frames.*": "Set from a measurement on 2026-10-07, by user decision: segment.sh -i finds objects in 22 of the 27 frames of the earlier capture (tilts down, mid, up; not measured yet on the 36 frames) = 0.815, so >= 0.8 (at most 5 frames without a detection); ainex keeps >= 0.9 (seg.frames). The five frames see only steep up-tilts and plain built-ins, where the detector's best correct detection at the default passes scores below 0.5: img_009_p03_up (doorway 0.41), img_010_p04_up (white built-in wardrobe 0.47), img_014_p05_mid (wardrobe 0.17, light switch 0.20; as a 'thermostat' 0.50 on the coarse pass, under its 5 % size floor), img_015_p05_up (wardrobe 0.20) and img_033_p11_up (window with roller shutters 0.41 as 'shop window', the hanging bunting as 'flag' 0.53 on the coarse pass, under its size floor). The default --min-score 0.5 stays: the spec fixes it (specs/segment.md). Input resolution (640-1920 px), lens undistortion, contrast, flips, tiles, 76 prompt wordings, averaged synonym prompts and the other detection head lift none of them cleanly; two extra fused passes (640 px on a 640 px input, 512 px upsampled to 1024, without the size floor) reach 25 of 27 but add about 20 false labels on ainex-captures, at least one on restaurant.jpg and many on examples/camera (README, Known limitations)."
   },
   "defaults": {
     "tolerance_rel": 0.1,
@@ -275,42 +275,42 @@
       "value": 2.5,
       "unit": "s",
       "tolerance_rel": 0.2,
-      "description": "segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+      "description": "segment.sh -i per examples/camera frame (1920x1080; median over the frames)"
     },
     "perf.segment_camera_frames.client_peak_mb": {
       "op": "<=",
       "value": 350,
       "unit": "MB",
-      "description": "peak resident set of the command's process tree: segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+      "description": "peak resident set of the command's process tree: segment.sh -i per examples/camera frame (1920x1080; median over the frames)"
     },
     "perf.segment_camera_frames.server_peak_gb": {
       "op": "<=",
       "value": 14,
       "unit": "GB",
-      "description": "peak server footprint during: segment.sh -i per examples/camera frame (1920x888; median over the frames)"
+      "description": "peak server footprint during: segment.sh -i per examples/camera frame (1920x1080; median over the frames)"
     },
     "perf.mapper_camera_single.wall_s": {
       "op": "<=",
-      "value": 120,
+      "value": 160,
       "unit": "s",
       "tolerance_rel": 0.35,
-      "description": "mapper.sh update of all 27 examples/camera frames in one update"
+      "description": "mapper.sh update of all 36 examples/camera frames in one update"
     },
     "perf.mapper_camera_single.client_peak_mb": {
       "op": "<=",
       "value": 8000,
       "unit": "MB",
-      "description": "peak resident set of the command's process tree: mapper.sh update of all 27 examples/camera frames in one update"
+      "description": "peak resident set of the command's process tree: mapper.sh update of all 36 examples/camera frames in one update"
     },
     "perf.mapper_camera_single.server_peak_gb": {
       "op": "<=",
       "value": 20,
       "unit": "GB",
-      "description": "peak server footprint during: mapper.sh update of all 27 examples/camera frames in one update"
+      "description": "peak server footprint during: mapper.sh update of all 36 examples/camera frames in one update"
     },
     "perf.mapper_camera_split.wall_s": {
       "op": "<=",
-      "value": 140,
+      "value": 180,
       "unit": "s",
       "tolerance_rel": 0.35,
       "description": "mapper.sh update of the same examples/camera frames split across the updates (sum)"
@@ -329,7 +329,7 @@
     },
     "perf.mapper_camera_split.per_update_wall_s": {
       "op": "<=",
-      "value": 65,
+      "value": 85,
       "unit": "s",
       "tolerance_rel": 0.35,
       "description": "the slowest update of the split examples/camera map"
@@ -564,8 +564,8 @@
       "op": ">=",
       "value": 0.95,
       "unit": "",
-      "tolerance_abs": 0.04,
-      "description": "captures registered (one-update camera map; at least 26 of 27)"
+      "tolerance_abs": 0.03,
+      "description": "captures registered (one-update camera map; at least 35 of 36)"
     },
     "pose.camera_single.pan_order_fraction": {
       "op": ">=",
@@ -592,8 +592,8 @@
       "op": ">=",
       "value": 0.95,
       "unit": "",
-      "tolerance_abs": 0.06,
-      "description": "up/down frames pitched in the named direction relative to the mid frame of their pan position (one-update camera map)"
+      "tolerance_abs": 0.04,
+      "description": "floor/low frames pitched below, high frames above, the mid frame of their pan position (one-update camera map)"
     },
     "map.camera_single.frame_agreement_tilt_median_pct": {
       "op": "<=",
@@ -655,8 +655,8 @@
       "op": ">=",
       "value": 0.95,
       "unit": "",
-      "tolerance_abs": 0.04,
-      "description": "captures registered (split camera map; at least 26 of 27)"
+      "tolerance_abs": 0.03,
+      "description": "captures registered (split camera map; at least 35 of 36)"
     },
     "pose.camera_split.pan_order_fraction": {
       "op": ">=",
@@ -683,8 +683,8 @@
       "op": ">=",
       "value": 0.95,
       "unit": "",
-      "tolerance_abs": 0.06,
-      "description": "up/down frames pitched in the named direction relative to the mid frame of their pan position (split camera map)"
+      "tolerance_abs": 0.04,
+      "description": "floor/low frames pitched below, high frames above, the mid frame of their pan position (split camera map)"
     },
     "map.camera_split.frame_agreement_tilt_median_pct": {
       "op": "<=",
@@ -1055,7 +1055,7 @@
       "value": 5.0,
       "unit": "s",
       "tolerance_rel": 0.35,
-      "description": "mapper.sh locate of 3 examples/camera captures (1920x888) on the one-update camera map"
+      "description": "mapper.sh locate of 3 examples/camera captures (1920x1080) on the one-update camera map"
     },
     "perf.camera_locate.client_peak_mb": {
       "op": "<=",
@@ -1623,7 +1623,7 @@
     },
     "perf.mapper_camera_single.stage.*.s": {
       "op": "<=",
-      "value": 120,
+      "value": 160,
       "unit": "s",
       "tolerance_rel": 0.35,
       "tolerance_abs": 0.2
@@ -1642,7 +1642,7 @@
     },
     "perf.mapper_camera_split.stage.*.s": {
       "op": "<=",
-      "value": 65,
+      "value": 85,
       "unit": "s",
       "tolerance_rel": 0.35,
       "tolerance_abs": 0.2

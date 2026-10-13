@@ -15,7 +15,7 @@ from pathlib import Path
 
 from oh_my_slam.commands import spec
 from oh_my_slam.commands.spec import Command, Kind, Mode, Option, Output, Program
-from oh_my_slam.core.constants import DEFAULT_DATA, INFERENCE_SERVER_PROG
+from oh_my_slam.core.constants import DEFAULT_DATA, INFERENCE_SERVER_PROG, SERVICE_PORT
 from oh_my_slam.core.errors import ExitCode, ServiceNotRunningError
 
 _DOWN = f"exit {int(ExitCode.SERVER_UNAVAILABLE)}"  # --status of a server that does not run
@@ -46,7 +46,9 @@ _SERVICE_HELP = "Local web service: the commands as an HTTP API and a browser ap
 
 WEB_SERVICE = Program("server.sh", _SERVICE_HELP, (
     Command("server.sh", None, _SERVICE_HELP, (
-        Option("--port", "port", Kind.NUMBER, "port to bind on 0.0.0.0 (default: 0, a free port)",
+        Option("--port", "port", Kind.NUMBER,
+               f"port to bind on 0.0.0.0 (default: 0, port {SERVICE_PORT} if it is free, "
+               "otherwise a free port chosen by the OS)",
                default=0, minimum=0, type=int, modes=("serve",)),
         Option("--data", "data", Kind.FOLDER_OUT,
                f"workspace folder for maps and uploads (default: {DEFAULT_DATA}/)",

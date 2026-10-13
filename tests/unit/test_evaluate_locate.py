@@ -98,11 +98,11 @@ def test_held_out_pan_captures_against_the_later_maps_headings() -> None:
     """examples/camera records no step angle: a located capture's yaw (relative to the first
     capture's in the map it was located in) is judged against the yaw the split map gives it once
     an update has added it (relative to the first capture's there)."""
-    first = "img_007_p03_down.jpg"
-    held = [parse_pan_capture(n) for n in ("img_016_p06_up.jpg", "img_017_p06_mid.jpg",
-                                           "img_018_p06_down.jpg")]
+    first = "img_009_p03_floor.jpg"
+    held = [parse_pan_capture(n) for n in ("img_021_p06_high.jpg", "img_022_p06_mid.jpg",
+                                           "img_023_p06_low.jpg")]
     m = Metrics()
-    ref = cam(30.0)  # the first map's pose of img_007
+    ref = cam(30.0)  # the first map's pose of img_009
     located = {held[0].name: cam(80.0), held[1].name: cam(77.0)}  # 50 and 47 deg left of it
     later = {first: cam(-10.0), held[0].name: cam(38.0), held[1].name: cam(39.0)}  # 48 and 49
     rows = held_out_metrics(m, "pose.camera_locate", located, ref, held, later, first)
@@ -125,7 +125,7 @@ def test_three_captures_of_each_sequence_are_located_in_its_map() -> None:
     ainex = AINEX.read(EXAMPLES / AINEX.folder)
     assert [c.index for c in locate_picks(ainex)] == [1, 40, 60]
     assert [c.name for c in locate_picks(CAMERA.read(EXAMPLES / CAMERA.folder))] == [
-        "img_007_p03_down.jpg", "img_020_p07_mid.jpg", "img_027_p09_up.jpg"]
+        "img_009_p03_floor.jpg", "img_027_p07_mid.jpg", "img_036_p09_high.jpg"]
     assert locate_picks([7]) == [7] and locate_picks([]) == []
 
 
@@ -199,7 +199,7 @@ case "$*" in *-f\\ ply*) cp "{docs}/out.ply" "${{@: -1}}";; *-t\\ full*) cat "{d
         ("camera_locate_single", "camera_locate"), ("camera_locate_full", "camera_locate_full"),
         ("camera_locate_ply", "camera_locate_ply")]
     assert camera[0].argv[3:6] == [str(EXAMPLES / "camera" / n) for n in (
-        "img_007_p03_down.jpg", "img_020_p07_mid.jpg", "img_027_p09_up.jpg")]
+        "img_009_p03_floor.jpg", "img_027_p07_mid.jpg", "img_036_p09_high.jpg")]
     assert checks[("same_objects", "map")][
         "mapper.sh locate -t full vs update -t full (camera)"] == []
     assert checks[("stdout", "mapper")]["camera_locate_ply/pose header lines"] == [
@@ -308,7 +308,7 @@ def test_the_parity_inputs_are_every_reference_input(tmp_path: Path) -> None:
     assert [p.name[:3] for p in ainex["images"]] == ["040", "060"]
     assert [p.name[:3] for p in ainex["sequence"]] == ["001", "002", "003"]
     assert ainex["map"] == out / "maps" / "single"
-    assert [p.name for p in camera["images"]] == ["img_020_p07_mid.jpg", "img_027_p09_up.jpg"]
+    assert [p.name for p in camera["images"]] == ["img_027_p07_mid.jpg", "img_036_p09_high.jpg"]
     assert camera["map"] == out / "maps" / "camera_single"
     assert len(office["sequence"]) == 3 and office["map"] == out / "maps" / "office"
     (out / "maps" / "office" / "map.json").unlink()  # not built: no map to locate in

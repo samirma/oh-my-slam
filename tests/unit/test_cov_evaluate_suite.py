@@ -166,8 +166,10 @@ def test_the_cold_start_footprint_and_restore(tmp_path: Path,
 # -- the ainex maps ------------------------------------------------------------------------------------
 
 CAPTURES = captures_in(EXAMPLES / "ainex-captures")[:6]  # 001-006: three updates of two
-PAN_CAPTURES = pan_captures_in(EXAMPLES / "camera")[:6]  # p03 and p04: three updates of two
-TILT = {"level": 0.0, "mid": 0.0, "up": 10.0, "down": -10.0}
+# p03's four tilts and p04's high and mid: three updates of two
+PAN_CAPTURES = pan_captures_in(EXAMPLES / "camera")[:6]
+TILT = {"level": 0.0, "mid": 0.0, "up": 10.0, "down": -10.0, "floor": -20.0, "low": -10.0,
+        "high": 10.0}
 POSES = {c.name: cam(c.yaw_deg, TILT[c.tilt]) for c in CAPTURES}  # every camera at the origin
 POSES.update({c.name: cam(20.0 * (c.pan - 3), TILT[c.tilt]) for c in PAN_CAPTURES})
 OBJECTS = [box(1, "chair", (2.0, 0.0, 0.45)), box(2, "sofa", (0.0, 3.0, 0.4), (2.0, 0.9, 0.8))]
@@ -312,9 +314,10 @@ def test_the_camera_maps_are_built_located_and_judged(tmp_path: Path) -> None:
         c.name for c in PAN_CAPTURES[2:4]]
     assert not any(k.startswith(("pose.locate.", "pose.single.", "map.stability.")) for k in v)
     assert set(ev.single_poses) == {"camera"}
-    assert ev.details["poses.camera_single"][3] == {
-        "capture": "img_010_p04_up.jpg", "pan": 4, "tilt": "up", "registered": True,
+    assert ev.details["poses.camera_single"][4] == {
+        "capture": "img_013_p04_high.jpg", "pan": 4, "tilt": "high", "registered": True,
         "yaw_deg": 20.0, "pitch_delta_deg": 10.0, "pitch_ok": True}
+    assert ev.details["poses.camera_single"][0]["pitch_delta_deg"] == -20.0  # p03's floor
     assert ev.details["map.camera_stability"] and ev.details["map.camera_split.pairs"]
 
 

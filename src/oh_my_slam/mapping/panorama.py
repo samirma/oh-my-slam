@@ -28,9 +28,9 @@ With ``k = 0`` it is the pinhole. A wide-angle lens bends straight lines towards
 (110° diagonally; its first, uncropped frames) a pinhole refinement of the shared focal length ran
 from about 1350 px to 6700-9800 px and shrank the pan steps and the tilts to a fifth to a seventh,
 the only way a pinhole bends a turn's rays like the lens. So the distortion is refined with the
-focal length: 1392 px and ``k = -0.524`` on the 27 current frames (43 % of the half-diagonal at
-the corners). A coefficient that moves the image corners by less than ``DISTORTION_MIN_SHARE`` of
-the half-diagonal after a robust scale is set to 0 and held: the pinhole stays the pinhole. The
+focal length: 1392 px and ``k = -0.524`` on the 27 frames of its earlier, cropped capture (43 % of
+the half-diagonal at the corners). A coefficient that moves the image corners by less than
+``DISTORTION_MIN_SHARE`` of the half-diagonal after a robust scale is set to 0 and held: the pinhole stays the pinhole. The
 rendered ``ainex-captures`` fitted 1 % of it; four phone photos of trees behind a window
 (``office_sequence``'s first, images the phone corrects itself) fitted ``k = +0.06`` with the focal
 length 1.2 times their EXIF one, 3.5 %: what few views of a distant scene let the focal length and

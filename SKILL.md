@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "oh-my-slam monocular RGB 3D mapping on a Mac, through the HTTP API of its server.sh web service with sh and curl, from this machine or another on the LAN; needs a server.sh reachable from this machine, no checkout. Operations: reconstruct: one image → JSON/PNG/PLY; mapper-update: images or one video + a new or existing map → JSON/PLY; mapper-locate: images + an existing map → JSON/PLY; segment: one image → JSON/PNG. mapper-update writes a map; the others are read-only. Also uploads, validation, the workspace's maps, health. JSON = OpenLABEL scene (labelled objects with oriented bounding boxes; for a map, camera poses), PNG = depth image or segmented image, PLY = point cloud. Inference server needed by reconstruct, mapper-update and segment, and by mapper-locate for maps over 150 keyframes; the other routes work without it. Use it when the user asks for any of these on images or video, or about the maps."
+description: "oh-my-slam monocular RGB 3D mapping on a Mac, through the HTTP API of its server.sh web service with sh and curl, from this machine or another on the LAN; needs a server.sh reachable from this machine, no checkout. Operations: reconstruct: one image → JSON/PNG/PLY; mapper-update: images or one video + a new or existing map → JSON/PLY; mapper-locate: images + an existing map → JSON/PLY; segment: one image → JSON/PNG. mapper-update writes a map; the others are read-only. Also uploads, validation, the workspace's maps (list, summary, removal, a 3D page on the service's Mac), health. JSON = OpenLABEL scene (labelled objects with oriented bounding boxes; for a map, camera poses), PNG = depth image or segmented image, PLY = point cloud. Inference server needed by reconstruct, mapper-update and segment, and by mapper-locate for maps over 150 keyframes; the other routes work without it. Use it when the user asks for any of these on images or video, or about the maps."
 ---
 
 # oh-my-slam
@@ -24,13 +24,14 @@ follow.
 * **The inference server may be down.** Then the operations `reconstruct`, `mapper-update` and `segment` fail with HTTP
   503 `server_unavailable`, with a message that names the command that starts it, `./start_inference_server.sh`,
   as `GET /api/health` does (`inference.start_command`). Report the message and that command to
-  the user instead of retrying, and offer what works without it: the workspace's maps (`GET /api/maps`, `GET /api/maps/{name}`); `mapper-locate` except for maps over 150 keyframes.
+  the user instead of retrying, and offer what works without it: the workspace's maps (`GET /api/maps`, `GET /api/maps/{name}`); `mapper-locate` except for maps over 150 keyframes; `map-remove` (`DELETE /api/maps/{name}`) only when the user asked for that map's removal; `map-viewer-start` (`POST /api/maps/{name}/viewer`); `map-viewer-stop` (`DELETE /api/maps/{name}/viewer`).
 * **Never start or stop `start_inference_server.sh` or `server.sh`**, and never kill their processes. When one is not running,
   tell the user how to start it: `./start_inference_server.sh` for the inference server, and `./server.sh` in
   the oh-my-slam checkout on the Mac for the service (with `--port <n>` for a URL that stays the
   same, `--data <folder>` for another workspace).
-* **Never change a map except through `mapper-update`**, the mapping operation: no other request
-  writes one, and nothing else may touch a map's folder.
+* **Never change a map except through `mapper-update`**, the mapping operation, **and never remove
+  one unless the user asked for that map's removal** (`DELETE /api/maps/{name}`, which deletes it
+  for good): no other request writes or deletes a map, and nothing else may touch a map's folder.
 * **Ask the user first** before updating an existing map (`GET /api/maps/<name>` answers
   404 `not_found` for a new one), and before starting a long mapping request:
   `mapper-update` runs 15 stages, from `setup` to `commit`, and can take many minutes. Say that an update changes the map
@@ -46,8 +47,10 @@ follow.
 * **Results are the commands' own bytes:** save them with `curl -o` and never rewrite them; report
   a failure's message as it is. Don't repeat a refused or failed request unchanged.
 * **Offer only what the service supports:** the operations, parameters, values and routes of
-  `/api/openapi.json`, and never a local script. Viewing an image or a map in 3D is no operation
-  of the API: leave it to the user.
+  `/api/openapi.json`, and never a local script. Viewing an image in 3D is no operation of the
+  API: leave it to the user. A map's viewer (`POST /api/maps/{name}/viewer`) is a 3D
+  page that only the Mac running the service can open: start it when the user asks to see a map
+  there, give them its `url`, and stop it (`DELETE /api/maps/{name}/viewer`) when they are done.
 
 ## Operations and routes
 
@@ -77,15 +80,20 @@ The routes:
 * `POST /api/uploads` (query `name`): upload one input file: the raw file as the body, with its own media type
 * `DELETE /api/uploads/{id}`: discard an upload no request was given
 * `GET /api/maps`: the workspace's maps with their summaries
-* `GET /api/maps/{name}`: a map's summary and metadata (map.json)
+* `GET /api/maps/{name}`: a map's summary and metadata (map.json), and whether its viewer runs
+* `DELETE /api/maps/{name}` (operation `map-remove`): remove the map: delete it from the workspace for good (refused while a request in progress reads or writes it; its viewer is stopped first)
+* `POST /api/maps/{name}/viewer` (operation `map-viewer-start`): start the map's viewer, a 3D page of the map served on the service's machine only, or answer the URL of the one that runs
+* `DELETE /api/maps/{name}/viewer` (operation `map-viewer-stop`): stop the map's viewer (nothing to do when none runs)
 
-Only the operations need the inference server, and a map changes only through `mapper-update`. The
-browser application at `$BASE/` runs the same operations, for the user.
+Only the commands' operations need the inference server; a map changes only through `mapper-update`
+and is deleted only through `DELETE /api/maps/{name}`. The browser application at `$BASE/`
+runs the same operations, for the user.
 
 ## Find the service
 
-`server.sh` binds a free port unless it was started with `--port <n>`, so its URL changes from
-run to run. This snippet prints the base URL and caches it in `${XDG_CACHE_HOME:-$HOME/.cache}/oh-my-slam/server_url`. It tries, in order: the
+`server.sh` binds port 9091 if it is free, otherwise a free port, unless it was
+started with `--port <n>`, so its URL can change from run to run. This snippet prints the base
+URL and caches it in `${XDG_CACHE_HOME:-$HOME/.cache}/oh-my-slam/server_url`. It tries, in order: the
 URL the user gives (`OMS_URL`); the cached URL, if `/api/health` answers there within 3 s;
 on the Mac that runs the service, the URL the service records in `server.json` in its workspace
 (`~/oh-my-slam-data/`, or the `--data` folder the user names, as `OMS_DATA`), with `0.0.0.0` replaced
@@ -201,6 +209,12 @@ curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/op
 # segment: read-only; inference server needed
 curl -sS -T photo.jpg "$BASE/api/uploads?name=photo.jpg"
 curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/segment" -H 'Content-Type: application/json' -d '{"image":"uploads/<upload>/photo.jpg"}'
+# map-remove: remove the map: delete it from the workspace for good (refused while a request in progress reads or writes it; its viewer is stopped first); only when the user asked for that map's removal
+curl -sS -X DELETE -w '%{http_code}\n' "$BASE/api/maps/<map>"
+# map-viewer-start: start the map's viewer, a 3D page of the map served on the service's machine only, or answer the URL of the one that runs
+curl -sS -X POST -w '%{http_code}\n' "$BASE/api/maps/<map>/viewer" -H 'Content-Type: application/json' -d '{}'
+# map-viewer-stop: stop the map's viewer (nothing to do when none runs)
+curl -sS -X DELETE -w '%{http_code}\n' "$BASE/api/maps/<map>/viewer"
 ```
 
 ## Errors
@@ -240,4 +254,5 @@ The service's own refusals have the same shape:
 | `too_large` | 413 | an upload over 8 GiB |
 | `insufficient_storage` | 413 | an upload that would leave less than 1 GiB free on the workspace's disk |
 | `upload_in_use` | 409 | an upload that another request in progress was given |
+| `map_in_use` | 409 | removing a map that a request in progress names (reads or writes), or a request that names a map being removed |
 | `stopping` | 503 | a request that arrives while the service stops |

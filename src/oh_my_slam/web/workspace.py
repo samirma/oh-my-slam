@@ -1,15 +1,22 @@
 """The service's workspace (spec §2.6 "Workspace"): ``<data>/maps/<name>/`` (maps in exactly the
-format ``mapper.sh`` writes), ``<data>/uploads/<id>/<file>`` (transient inputs) and
+format ``mapper.sh`` writes), ``<data>/uploads/<id>/<file>`` (transient inputs),
 ``<data>/.requests/<id>/`` (what a running request's command writes — its stdout, the result, and
-its timing record — deleted once the response is sent: the service keeps no results). Every path a
-request names is resolved — symlinks included — and refused when it lands outside the workspace or
-goes through a hidden entry."""
+its timing record — deleted once the response is sent: the service keeps no results) and
+``<data>/.removed/<id>`` (a map being removed, moved out of ``maps/`` in one rename and then
+deleted). Every path a request names is resolved — symlinks included — and refused when it lands
+outside the workspace or goes through a hidden entry.
+
+The service reads maps here and changes none: only the mapping command writes one, and only the
+remove operation (:meth:`Workspace.map_lock`, :meth:`Workspace.detach_map`) deletes one."""
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import secrets
 import shutil
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +27,7 @@ from oh_my_slam.core.errors import InputError, UsageError
 MAPS = "maps"
 UPLOADS = "uploads"
 REQUESTS = ".requests"
+REMOVED = ".removed"
 DEFAULT_DATA = Path(constants.DEFAULT_DATA)  # server.sh --data (commands.entry_points)
 
 _NAME = re.compile(r"^[^/\\\0]+$")
@@ -47,7 +55,7 @@ def inside(root: Path, rel: str) -> Path:
     real_root = root.resolve()
     try:
         target = (real_root / rel).resolve()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a symlink loop
         raise NotFoundError(f"not found: {rel}") from exc
     if target != real_root and real_root not in target.parents:
         raise NotFoundError(f"not found: {rel}")
@@ -74,6 +82,7 @@ class Workspace:
         self.maps = self.root / MAPS
         self.uploads = self.root / UPLOADS
         self.requests = self.root / REQUESTS
+        self.removed = self.root / REMOVED
 
     def create(self) -> None:
         for d in (self.root, self.maps, self.uploads):
@@ -83,11 +92,21 @@ class Workspace:
 
     def resolve(self, value: str) -> Path:
         """A path a request names — relative to the workspace, or absolute inside it — resolved
-        with its symlinks; refused when it lands outside the workspace."""
+        with its symlinks; refused (a usage error, never a crash) when it lands outside the
+        workspace or cannot be resolved: the home of no user of this machine (``~nobody/…``), a
+        symlink loop."""
         if not isinstance(value, str) or not value or "\0" in value:
             raise UsageError(f"expected a path inside the workspace {self.root}, got {value!r}")
-        p = Path(value).expanduser()
-        real = (p if p.is_absolute() else self.root / p).resolve()
+        try:
+            p = Path(value).expanduser()
+        except RuntimeError as exc:  # ~<user> of no user of this machine
+            raise UsageError(f"{value}: no such user's home on this machine; use a path inside "
+                             f"the workspace {self.root}") from exc
+        try:
+            real = (p if p.is_absolute() else self.root / p).resolve()
+        except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop
+            raise UsageError(f"{value} cannot be resolved ({exc}); use a path inside the "
+                             f"workspace {self.root}") from exc
         if real != self.root and self.root not in real.parents:
             raise OutsideWorkspaceError(
                 f"{value} resolves outside the workspace {self.root}; upload the file or use a "
@@ -158,7 +177,7 @@ class Workspace:
         """Delete what requests left (at start and stop none runs: a crash, a lost response)."""
         _clear(self.requests)
 
-    # -- maps (read-only) --------------------------------------------------------------------------
+    # -- maps (read here; removed only by the remove operation) -------------------------------------
 
     def map_dir(self, name: str) -> Path:
         d = inside(self.maps, plain_name(name, "a map name"))
@@ -167,6 +186,44 @@ class Workspace:
         if d.parent != self.maps.resolve() or classify(d) != "map":
             raise NotFoundError(f"no map {name} in {self.maps}")
         return d
+
+    @contextlib.contextmanager
+    def map_lock(self, name: str) -> Iterator[Path]:
+        """The update lock of the map ``name`` held, for its removal: its folder. Taken at once:
+        ``MapLockedError`` (with what to do) while an update holds it, before any change."""
+        from oh_my_slam.core.errors import MapLockedError
+        from oh_my_slam.mapping.store import lock_update
+
+        d = self.map_dir(name)
+        try:
+            fd = lock_update(d)
+        except MapLockedError as exc:
+            raise MapLockedError(f"{exc}; remove map {name} once that update ended") from exc
+        try:
+            yield d
+        finally:
+            os.close(fd)  # releases the lock
+
+    def detach_map(self, name: str) -> Path:
+        """The remove operation's step under the map's lock (:meth:`map_lock`): the map ``name``
+        leaves ``maps/`` at once, in one rename, so no request finds it any more and its name is
+        free. Returns where it went, for :meth:`delete_removed`. A name that is a symbolic link
+        loses only the link."""
+        self.removed.mkdir(parents=True, exist_ok=True)
+        gone = self.removed / secrets.token_hex(8)
+        (self.maps / name).rename(gone)
+        return gone
+
+    def delete_removed(self, gone: Path) -> None:
+        """Delete a map :meth:`detach_map` moved out of ``maps/`` (the link, for a linked one)."""
+        if gone.is_symlink():
+            gone.unlink()
+        else:
+            shutil.rmtree(gone, ignore_errors=True)
+
+    def clear_removed(self) -> None:
+        """Delete what a removal that did not finish left (at start no removal runs)."""
+        _clear(self.removed)
 
     def list_maps(self) -> list[dict[str, Any]]:
         """Every map in ``<data>/maps`` with its summary (from its own metadata)."""

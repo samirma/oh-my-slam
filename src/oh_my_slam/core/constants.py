@@ -10,6 +10,8 @@ VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 DEFAULT_FPS = 2.0  # mapper.sh update -fps: video frames sampled per second (spec §2.3)
 DEFAULT_MIN_SCORE = 0.5  # segment.sh --min-score: detection confidence threshold (spec §2.4)
 DEFAULT_DATA = "~/oh-my-slam-data"  # server.sh --data: the workspace of maps and uploads (§2.6)
+# server.sh --port 0, its default (§2.6): this port if it is free, otherwise one the OS picks
+SERVICE_PORT = 9091
 
 # The inference server's entry point (spec §2.1, ``commands.entry_points``) and the command that
 # starts it as the user types it at the root of the checkout (``CHECKOUT``), which the errors of

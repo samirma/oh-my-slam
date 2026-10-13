@@ -42,6 +42,29 @@ export async function postJson(url, data = {}, signal) {
   return body;
 }
 
+// A request that changes something on the service: `method` on `url`, with `data` as its JSON body
+// when given. Resolves to the JSON answer (null when there is none, e.g. 204); throws ApiError with
+// the service's error otherwise.
+export async function send(method, url, data) {
+  const init = { method };
+  if (data !== undefined) Object.assign(init, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  let res;
+  try {
+    res = await fetch(url, init);
+  } catch {
+    throw new ApiError(0, { error: { message: 'the service did not answer; is server.sh running?' } });
+  }
+  const body = await bodyOf(res);
+  if (!res.ok) throw new ApiError(res.status, body);
+  return body;
+}
+
+// The operations on a map of the workspace that are no command's (http_server.md "Operations"):
+// start or stop its viewer (the answer is the viewer's state: {running, url}), and remove it.
+export const startViewer = (name) => send('POST', `/api/maps/${enc(name)}/viewer`, {});
+export const stopViewer = (name) => send('DELETE', `/api/maps/${enc(name)}/viewer`);
+export const removeMap = (name) => send('DELETE', `/api/maps/${enc(name)}`);
+
 // The stages of a Server-Timing header (`name;dur=<ms>, …`): [{name, ms}] in its order.
 export function parseServerTiming(value) {
   if (!value) return [];

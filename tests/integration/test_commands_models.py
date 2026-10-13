@@ -1,6 +1,6 @@
 """Real-model runs of reconstruct.sh / segment.sh on the repository's reference images
 (``-m models``): ``examples/restaurant.jpg`` (spec §5), the first ``examples/ainex-captures``
-frame and a 1920x888 ``examples/camera`` frame; and mapper.sh update on overlapping captures of
+frame and a 1920x1080 ``examples/camera`` frame; and mapper.sh update on overlapping captures of
 both sequences. Timings are printed (``-s`` to see them).
 """
 
@@ -27,6 +27,7 @@ from oh_my_slam.mapping.store import MapReader
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES
 from oh_my_slam.segmentation.colors import hex_to_rgb
+from oh_my_slam.tools.evaluate.names import TILT_SIGN
 
 pytestmark = [
     pytest.mark.models,
@@ -37,14 +38,15 @@ pytestmark = [
 REPO = Path(__file__).resolve().parents[2]
 IMAGES = (REPO / "examples" / "restaurant.jpg",
           REPO / "examples" / "ainex-captures" / "001_bootstrap_level.jpg",
-          REPO / "examples" / "camera" / "img_023_p08_mid.jpg")
+          REPO / "examples" / "camera" / "img_030_p08_mid.jpg")
 # Overlapping captures of the two §5 sequences, two headings each, every heading with its level
-# frame and its up and down tilts: (frames, name grammar → heading and tilt, the level tilt).
+# frame and its tilted ones (camera: floor, low, high; ainex: up, down): (frames, name grammar →
+# heading and tilt, the level tilt).
 # Headings grow to the left: the pan position PP of examples/camera (p08, p09), and the commanded
 # yaw of examples/ainex-captures (004–010: bootstrap_left015 and bootstrap_left030).
 SEQUENCES = {
     "camera": (sorted((REPO / "examples" / "camera").glob("img_*_p0[89]_*.jpg")),
-               r"_p(\d+)_(up|mid|down)\.jpg$", "mid"),
+               r"_p(\d+)_(floor|low|mid|high)\.jpg$", "mid"),
     "ainex": ([f for f in sorted((REPO / "examples" / "ainex-captures").glob("*.jpg"))
                if 4 <= int(f.name[:3]) <= 10],
               r"_left(\d+)(?:_side)?_(up|level|down)\.jpg$", "level"),
@@ -120,7 +122,7 @@ def test_reconstruct_and_segment(img: Path, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("seq", SEQUENCES)
 def test_mapper_update(seq: str, tmp_path: Path) -> None:
-    """mapper.sh update (spec §2.3) creates a map from overlapping captures (camera: 1920x888
+    """mapper.sh update (spec §2.3) creates a map from overlapping captures (camera: 1920x1080
     frames of a real pan-tilt camera through a wide-angle lens with visible distortion; ainex:
     rendered robot head), poses every one of them, and in the directions their names encode (§5
     pose accuracy)."""
@@ -147,7 +149,7 @@ def test_mapper_update(seq: str, tmp_path: Path) -> None:
     turn = {n: direction(rot[ref[lo]], rot[n])[0] for n, (h, _) in names.items() if h == hi}
     step = turn[ref[hi]]
     own = {n: direction(rot[ref[h]], rot[n]) for n, (h, _) in names.items() if n != ref[h]}
-    pitch = {n: own[n][1] for n, (_, tilt) in names.items() if tilt in ("up", "down")}
+    pitch = {n: own[n][1] for n, (_, tilt) in names.items() if tilt != level}
     print(f"{seq}: update {t_map:.2f}s ({len(rot)}/{len(frames)} frames posed, {len(objs)} "
           f"objects), step {step:.1f}°, yaw/pitch off the level frame "
           + ", ".join(f"{n} {y:+.1f}°/{p:+.1f}°" for n, (y, p) in own.items()))
@@ -156,5 +158,5 @@ def test_mapper_update(seq: str, tmp_path: Path) -> None:
     # every frame of a heading shares its yaw: less than half the step between the two headings
     # off its level frame, i.e. nearer in yaw to its own heading than to the other one
     assert all(abs(y) < step / 2 for y, _ in own.values()), (step, own)
-    # pitch direction: up looks image-up of its level frame, down image-down
-    assert all(p > 0 if names[n][1] == "up" else p < 0 for n, p in pitch.items()), pitch
+    # pitch direction: up / high look image-up of their level frame, down / low / floor image-down
+    assert all(p * TILT_SIGN[names[n][1]] > 0 for n, p in pitch.items()), pitch

@@ -372,25 +372,29 @@ The viewer's code:
 ### `server.sh`
 
 ```sh
-./server.sh                          # workspace ~/oh-my-slam-data/, a free port, opens the browser
+./server.sh                          # workspace ~/oh-my-slam-data/, port 9091 if free, opens the browser
 ./server.sh --port 8765 --data ~/ws --no-browser
 ./server.sh --status                 # health JSON on stdout; exit 3 if no service runs for --data
 ./server.sh --stop                   # interrupts the requests in progress, then exits
 ```
 
 A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under uvicorn. Its API
-runs every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh`; `view.sh` and
-`start_inference_server.sh` stay commands only. There are no jobs: an operation runs within its
-own HTTP request, and the response is the command's result.
+runs every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh`, and two operations on a map of
+the workspace: its removal, and starting or stopping its viewer. `start_inference_server.sh` stays
+a command only, and `view.sh` is reached only as a map's viewer (`view.sh -m`, started and stopped
+by the map operations, never `-i`). There are no jobs: an operation runs within its own HTTP
+request, and the response is the command's result.
 
-* **Options.** `--port` binds `0.0.0.0` (default `0`: the OS picks a free port); a port another
+* **Options.** `--port` binds `0.0.0.0` (default `0`: port 9091 if it is free, otherwise a free
+  port chosen by the OS; `SERVICE_PORT` in `core/constants.py`). An explicit port another
   process listens on, at any of the machine's addresses (`127.0.0.1` or `::1` included), is a
-  usage error. `--data` is the workspace (default `~/oh-my-slam-data/`). `--no-browser` skips
-  opening `http://127.0.0.1:<port>/`: the browser gets the loopback address, and the stderr line
-  names the bound address. `--status` and `--stop` take only `--data`; any `--port` (even `0`) or
-  `--no-browser` with them is a usage error: those two belong to the serve mode only
-  (`Option.modes` in `commands/entry_points.py`), and `spec.validate` refuses an option given to a
-  mode it does not belong to.
+  usage error; with `0`, 9091 counts as free only if it passes that same check, and otherwise
+  the OS picks the port. `--data` is the workspace (default `~/oh-my-slam-data/`).
+  `--no-browser` skips opening `http://127.0.0.1:<port>/`: the browser gets the loopback
+  address, and the stderr line names the bound address. `--status` and `--stop` take only
+  `--data`; any `--port` (even `0`) or `--no-browser` with them is a usage error: those two
+  belong to the serve mode only (`Option.modes` in `commands/entry_points.py`), and
+  `spec.validate` refuses an option given to a mode it does not belong to.
 * **Output.** Once accepting connections, stderr carries exactly one line
   `server.sh: listening on http://0.0.0.0:<port>/`. Nothing else is printed while it runs: the
   commands' stderr is a pipe the service reads, and right after the listening line the service's
@@ -408,9 +412,10 @@ own HTTP request, and the response is the command's result.
   still gets its answer once its command has ended: the command's own error, as for a client that
   left (exit 130: 499 `interrupted`); a request that arrives while the service stops is refused
   with 503 `stopping` (uvicorn's graceful shutdown
-  waits up to 65 s, the interruption's SIGINT → SIGTERM → SIGKILL steps). Uploads are deleted.
-  * A second Ctrl-C or SIGTERM during the stop SIGKILLs every running command's process group
-    and exits at once (exit 130).
+  waits up to 65 s, the interruption's SIGINT → SIGTERM → SIGKILL steps). Uploads are deleted,
+  and every map viewer the service started is stopped (SIGTERM, `view.sh`'s normal stop).
+  * A second Ctrl-C or SIGTERM during the stop SIGKILLs every running command's and viewer's
+    process group and exits at once (exit 130).
   * `--stop` sends that second signal itself after 180 s, then SIGKILL after 10 s more.
 * **One service per workspace.** `<data>/server.lock` (flock) and `<data>/server.json` (pid, URL,
   port). A second `server.sh` on the same `--data` prints `already running … at <url>` on stderr
@@ -443,15 +448,17 @@ own HTTP request, and the response is the command's result.
 
 | Path | Contents |
 |---|---|
-| `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service never deletes a map and changes one only through `mapper-update`. |
+| `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service changes a map only through `mapper-update` and deletes one only through the remove operation (`DELETE /api/maps/<name>`, see Maps). |
 | `uploads/<id>/<file>` | Raw-body uploads (`PUT /api/uploads?name=<file>`, as `curl -T <file>` sends it, or `POST /api/uploads?name=<file>` with the file's media type, e.g. `application/octet-stream`). A request refers to one by its path `uploads/<id>/<file>`. An upload is consumed by the one request it is given to and deleted when that request ends, whatever its outcome (refused, failed, interrupted or done); validating a request does not consume it, and a request naming an upload another request in progress was given is refused (409 `upload_in_use`). An interrupted upload is deleted at once, and every upload is deleted at start and stop. An upload may hold at most 8 GiB (long phone videos fit) and must leave 1 GiB free on the workspace's disk; otherwise it gets 413. |
 | `.requests/<id>/` | A running request's scratch: the command's stdout (the result) and its timing record (`OH_MY_SLAM_TIMINGS`). It is deleted once the response is sent, so the service keeps no results; what is left after a crash is deleted at start and stop. |
+| `.removed/<id>` | A map being removed: it leaves `maps/` in one rename, then is deleted. What a stop or a crash left is deleted at start. |
 | `server.log` | The running service's own log, after its listening line (see Output). |
 
 Any other workspace path is accepted as an input, relative to the workspace or absolute. A path
-that resolves outside the workspace (through `..`, `~` or a symlink), or that goes through a
-hidden entry (an upload still arriving, a map's `.staging`, `.requests`), is refused as an input
-error (400) on that parameter. A `jobs/` folder an earlier version left in the workspace is
+that resolves outside the workspace (through `..`, `~` or a symlink), that goes through a hidden
+entry (an upload still arriving, a map's `.staging`, `.requests`), or that cannot be resolved at
+all (`~<user>` of no user of this machine, a symlink loop) is refused as an input error (400) on
+that parameter, never a crash; the request still consumes its uploads. A `jobs/` folder an earlier version left in the workspace is
 ignored, never deleted.
 
 **Single source of truth.** Every operation, parameter, default, validation rule, output and
@@ -460,7 +467,8 @@ option.
 
 * There is one operation per mode of each program the registry offers to the service
   (`Program.service`): `reconstruct`, `mapper-update`, `mapper-locate` and `segment`
-  (program, subcommand and mode joined). `view.sh` is `service=False`.
+  (program, subcommand and mode joined). `view.sh` is `service=False`: its map mode runs only as a
+  map's viewer (see Maps), never as an operation of its own.
 * Each operation has one parameter per option, under the option's `dest` name, except the options
   that only choose where the command writes (kinds `file_out` and `folder_out`: `-o`, `-d`), which
   are refused as parameters: the response is the result, and the files a command writes to a
@@ -505,6 +513,8 @@ option.
     validated, since that one may need the inference server too.
   * All the others start at once, even while one runs.
   * Two requests never write the same map at once: a second writer waits for the first.
+  * Each request in progress records the map it writes (`mapper-update`) or only reads
+    (`mapper-locate`), which a map's removal checks (`Runner.map_user`).
   * `GET /api/health` counts the requests `running` and `waiting`, and lists them
     (`in_progress`, in arrival order: operation, command line as typed, state, arrival and start
     times), so a client tells whether its own request runs or waits.
@@ -527,13 +537,49 @@ option.
 | `DELETE /api/uploads/<id>` | Discard an upload no request was given. |
 | `GET /api/maps` | List maps, with summaries from `map.json` and the frame/object records. |
 | `GET /api/maps/<name>` | One map's summary and its full `map.json`. |
+| `DELETE /api/maps/<name>` | Remove the map (operation `map-remove`); 204. See Maps. |
+| `POST /api/maps/<name>/viewer` | Start the map's viewer, or find the one that runs (operation `map-viewer-start`): `{"running": true, "url": …}`. The body is empty or `{}`, as `application/json`. |
+| `DELETE /api/maps/<name>/viewer` | Stop the map's viewer (operation `map-viewer-stop`): `{"running": false, "url": null}`, also when none ran. |
+
+Every map in `GET /api/maps` and `GET /api/maps/<name>` carries `viewer`: `{"running", "url"}`.
+
+**Maps** (spec §2.6 "Operations"; `web/app.py`, `web/viewers.py`, `Workspace.detach_map`). The
+two operations on a map are no command's mode: they take only the map's name (in the path), have
+no validation endpoint and never need the inference server. A name that is no map answers 404
+`not_found`, and both stay behind the request guard (`Host`, `Origin`; a `POST` is JSON).
+
+* **Removal.** Deletes the map for good. It is refused with the service's own error, 409
+  `map_in_use`, while a request in progress names the map: from its arrival on, while it is still
+  being validated (`Runner.ticket` records the map its map parameter names, `operations.named_map`),
+  then while it waits for its turn or runs, reading or writing it. It is refused with the
+  commands' 409 `map_locked` while an update holds the map's lock (`mapper.sh` run from a
+  terminal): the removal takes that same lock (`mapping.store.lock_update`) at once. These
+  refusals come before any change, so a refused removal leaves the map and its viewer as they
+  were. Once they passed, the map is marked as being removed (`Runner.removing`) until it has
+  left `maps/`: a request that names it meanwhile (to read or write it) is refused at once,
+  before its validation, with 409 `map_in_use` ("map <name> is being removed; send the request
+  again once its removal ended"), and consumes its uploads all the same; a second removal gets
+  409 `map_in_use` too ("already being removed"). So the map is never removed under a request
+  that names it. Under the lock, the map's viewer is stopped first, then the map leaves `maps/`
+  in one rename, so no request finds it any more and its name is free at once (a later
+  `mapper-update` of that name creates a new map); its files are deleted off the event loop once
+  the lock is released. A name that is a symbolic link loses only the link.
+* **Viewer.** `view.sh -m <data>/maps/<name> --no-browser`, run as the commands are: its Python
+  entry point (`python -m oh_my_slam.cli.view`), its command line from the shared definition
+  (`commands.spec.VIEW`, the mode its map option selects), in its own process group. The answer
+  is the URL of its `view.sh: listening on http://127.0.0.1:<port>/` line: `view.sh` binds
+  127.0.0.1 on a free port, so the page is served on the service's machine only, and the service
+  never proxies it. At most one viewer runs per map: starting one that runs answers its URL
+  again. A viewer that ends before it listens answers its own exit status and message by the
+  generic rule; one that does not listen within 120 s is killed (500 `internal`). Stopping it is
+  SIGTERM (SIGKILL after 10 s); a viewer that ended by itself counts as stopped.
 
 **Web application** (spec §2.6 "Web application"). `/` serves a simple browser application in
 `web/static/`: plain ES modules with no build step, served by the service itself (nothing from a
-CDN). It talks only to the public API above, so everything it does can be scripted. It has no map
-or scene viewer (`view.sh` stays the way to explore a reconstruction or a map with its layers,
-objects and cameras), but a point-cloud result is drawn in 3D in the page with the §2.5 viewer's
-own rendering (see Results).
+CDN). It talks only to the public API above, so everything it does can be scripted. It draws no
+map or scene itself: a map is explored with its layers, objects and cameras in its `view.sh`
+viewer, which the map's page starts and stops. A point-cloud result is still drawn in 3D in the
+page with the §2.5 viewer's own rendering (see Results).
 
 * **Rendered from the API description.** The operations, their parameters and their results are
   read from `/api/openapi.json` (each operation's `x-oms` registry entry). Nothing in the app names
@@ -547,10 +593,14 @@ own rendering (see Results).
     A drop zone with a preview, the generated form, the request, then the result.
   * `#/maps?filter=<text>`: the workspace's maps as cards (frames, objects, updates, last update
     and how long it took, from `/api/maps`), with a filter.
-  * `#/maps/<name>?op=<op>`: a map's summary (`/api/maps/<name>`), the operations that take a map
-    without writing it (`mapper-locate`), and its update history: one row per
-    `map.json → updates[]` entry (when, input kind, files, frames added and rejected, objects,
-    time) with its per-stage timings and its other figures.
+  * `#/maps/<name>?op=<op>`: a map's summary (`/api/maps/<name>`); its viewer, with a button
+    that starts or stops it and a link to it while it runs (its page is served on the service's
+    machine only, which the page says); the operations that take a map without writing it
+    (`mapper-locate`); its update history: one row per `map.json → updates[]` entry (when, input
+    kind, files, frames added and rejected, objects, time) with its per-stage timings and its
+    other figures; and *Remove this map*, which asks first in a dialog that states the map is
+    deleted for good (focus on *Keep the map*), then says it is gone, or shows the service's
+    message (for example while a request in progress uses the map).
   * `#/maps/new` and `#/maps/<name>/update`: the guided flow over the mapping operation: 1 the
     inputs, numbered in the order they are used (arrow buttons and *Sort by name* reorder them;
     the latest observation wins), 2 the map (a new name, or the map being updated), 3 the other
@@ -633,8 +683,9 @@ own rendering (see Results).
   the Image page and on a map's page: the canvas shows the file's own colours, the point count is
   the file's, buttons, keys, drag and wheel move it, the display budget with a test's smaller
   budget, a PLY that does not parse, both themes down to tablet width), an image result (PNG),
-  map creation and update (COLMAP), locating images in a map, the downloads (compared with the
-  response body),
+  map creation and update (COLMAP), locating images in a map, a map's viewer started, opened
+  and stopped from its page, a map's removal (asked first, then gone), the downloads (compared
+  with the response body),
   interruption (button, leaving, reloading), a request waiting for its turn, the inference server
   down, registry changes, URLs and the 100 ms rendering of a page, the keyboard, and axe-core. They
   use the real service and request runner with the stub inference server.
@@ -645,7 +696,8 @@ The Agent Skill `oh-my-slam` (spec §2.7) lets an AI agent use every operation o
 API without help, with `sh` and `curl` only. The API is its only entry point: the local scripts
 are out of its scope, so it never runs one nor documents their options, and names one only to
 tell the user what to run (`./start_inference_server.sh`, `./server.sh`, `server.sh --status`
-for the URL); viewing in `view.sh` is left to the user. To install it, copy `SKILL.md` to
+for the URL); viewing an image in `view.sh` is left to the user, and a map's viewer, which the
+API starts and stops, serves its page on the service's Mac only. To install it, copy `SKILL.md` to
 `<skills dir>/oh-my-slam/SKILL.md` (for Claude Code, `~/.claude/skills/oh-my-slam/SKILL.md`) on
 any Linux or macOS machine that reaches the service: the Mac that runs `server.sh`, or any machine
 on the LAN. It needs no checkout.
@@ -663,10 +715,13 @@ on the LAN. It needs no checkout.
     (`core.errors.API_MEANING`) and the service's own refusals (`x-oms.refusals`);
   * its rules: report the start command when the inference server is down (HTTP 503) and offer
     what works without it; never start or stop `server.sh` or the inference server, but tell the
-    user how; never change a map except through the mapping operation; ask before updating a map
-    or starting a long mapping request; inputs are uploads or workspace paths, and an upload is
-    consumed by one request; never offer what the service does not support, nor a local script;
-  * a ready-to-run `curl` example for each operation.
+    user how; never change a map except through the mapping operation, and never remove one
+    unless the user asked for that map's removal; ask before updating a map or starting a long
+    mapping request; inputs are uploads or workspace paths, and an upload is consumed by one
+    request; never offer what the service does not support, nor a local script; start a map's
+    viewer only when the user asks to see the map on the service's Mac, give them its URL, and
+    stop it after;
+  * a ready-to-run `curl` example for each operation, the map's removal and viewer included.
 * **Generated, never hand-edited.** `oh_my_slam.web.skill` writes it from the same definitions as
   the OpenAPI document: the operations (`web.operations`), the document's routes, exit codes,
   refusals and limits, and what the user runs from `commands/entry_points.py` (the servers'
@@ -1090,7 +1145,7 @@ which replaces most files, widens that window.
     sightings are not enough, since the size of one sighting of a few centimetres is noise: on
     `examples/camera`'s desk a speaker and a stapler 2 cm apart measured 0.43–0.50 of each
     other's size, on either side of the comparison, and merged — two keyframes, so confirmed
-    and published — in the 9 + 9 + 9 map only; a pair of headphones and a lamp measured 0.39 in
+    and published — in the 9 + 9 + 9 map of the earlier 27-frame capture only; a pair of headphones and a lamp measured 0.39 in
     the one-update map and 0.92–0.95 in the split ones. The cost: a wall lamp that another
     keyframe saw as a thermostat stays a candidate (the one-update map has 19 objects instead of
     20). The merged object takes the label with the most evidence and lists the others in
@@ -1396,7 +1451,8 @@ pixels, so its results are unchanged.
      rendered `ainex-captures` head) no distortion: their SfM models stand. A rebuild (below) fits the lens again from all its keyframes when they
      share one camera and the new photos have its image size (its stored camera is a pinhole
      again for it; otherwise the stored keyframes keep their `SIMPLE_DIVISION` camera as fitted): held from an update of the first 9 frames (−0.45), the
-     camera's lens bent the 27-frame map, its rotations 4° off the one-update map's, where fitted
+     camera's lens bent the 27-frame map (the earlier capture of `examples/camera`: 1920×888,
+     tilts `down`, `mid`, `up`), its rotations 4° off the one-update map's, where fitted
      again (−0.53) they are within 0.7°. A pinhole fit here ran the focal length from about 1350 px to
      6700–9800 px and shrank the pan steps and the tilts to a fifth to a seventh (on the
      uncropped frames). With the distortion the 27 frames fit 1392 px and a coefficient of
@@ -1449,7 +1505,7 @@ pixels, so its results are unchanged.
      map's poses, meet within 0.23° (median; p90 0.82°) along the rays the map lifts its depth
      with, where the pinhole's rays left 2.59° (p90 7.1°), and the desk lamp seen at the image
      centre and at its border lifts to one place instead of two 0.5 m apart. It costs one more
-     inference pass of the keyframes' geometry (about 12 s for the 27 frames).
+     inference pass of the keyframes' geometry (about 12 s for the earlier capture's 27 frames).
    * **Weakly linked parts of a new map** (typical of a video walk through several rooms): a
      stretch that hangs on the rest by one weak link — a doorway crossed with a few dozen
      matches, or one keyframe shared with the rest — has no scale of its own for the global
@@ -1592,7 +1648,7 @@ pixels, so its results are unchanged.
        update's `objects.removed`; none vanishes unreported. A stored detection keeps its ids
        when the rebuild infers its keyframe again on another undistorted image (a lens fitted
        again: the masks move onto the new grid, the ids with them); lost there,
-       `examples/camera` split 9 + 9 + 9 renumbered every object at each rebuild and gave four
+       `examples/camera` (its earlier 27-frame capture) split 9 + 9 + 9 renumbered every object at each rebuild and gave four
        published ids to other objects. Objects first seen by the new photos are numbered on from
        the map's count, as an extension numbers them. So ids can differ from the one-update
        map's where an earlier update had published one (spec §2.3). In `office_sequence` split
@@ -1789,7 +1845,7 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * on `restaurant.jpg`: `reconstruct.sh` (JSON, PLY, a `color=segment,label=on` PLY, the depth
   image), `segment.sh -i -d` (JSON with the artefacts), `segment.sh -i -f png -d` (the segmented
   image with the artefacts) and `view.sh -i`
-* on each capture sequence, `ainex-captures` (79 frames) and `camera` (27 frames): `segment.sh -i`
+* on each capture sequence, `ainex-captures` (79 frames) and `camera` (36 frames): `segment.sh -i`
   on every frame, `mapper.sh update` on the sequence, once in one update and once split across 3
   updates, and `view.sh -m` on the one-update map, whose folder must not change
 * on each capture sequence, `mapper.sh locate`: between the split map's first and second update,
@@ -1826,26 +1882,28 @@ The same-heading pairs are 001/053 (053 returns to 001's heading) and 026/078 (`
 
 ### The `camera` file names
 
-`examples/camera/` holds 27 frames (1920×888, no EXIF) of a real pan-tilt indoor camera turning
-in place in a home office, through a wide-angle lens with visible distortion: the camera's
-1920×1080 frames cropped by 96 px at the top and the bottom, which removed its date-and-time
-overlay and keeps the principal point centred. The spec gives it the uses of `ainex-captures`,
-and its names encode the
+`examples/camera/` holds 36 frames (1920×1080, no EXIF) of a real pan-tilt indoor camera turning
+in place in a home office, through a wide-angle lens with visible distortion. The spec gives it
+the uses of `ainex-captures`, and its names encode the
 **commanded** motion as `img_NNN_pPP_<tilt>.jpg` (`tools/evaluate/names.py`, `PanCapture`):
 
-* `NNN` is the capture order (007 to 033).
+* `NNN` is the capture order (009 to 044).
 * `pPP` is the pan position (p03 to p11), numbered in pan order: the camera turns left as `PP`
   increases, by a step angle the names do not record.
-* `<tilt>` is `down`, `mid` or `up`; the three tilts of one pan position are consecutive.
+* `<tilt>` is `floor`, `low`, `mid` or `high`, in increasing pitch: `floor` and `low` point below
+  `mid`, `high` above it. The four tilts of one pan position are consecutive, in serpentine
+  order: `floor`, `low`, `mid`, `high` at p03, `high`, `mid`, `low`, `floor` at p04, and so on.
 
 Hidden files such as `.DS_Store` and non-images are ignored. An image of a sequence's folder whose
 name does not follow the sequence's grammar ends that sequence's part of the run with an error
 (`details.errors`); the rest of the run goes on.
 Without an angle in the names, the pose accuracy of `camera` is the pan order and the agreement of
 the tilts: a pan position's heading (the circular mean of its registered frames' yaws) must turn
-left from one pan position to the next, and the three tilts of a pan position, which share its
-heading, are its same-heading pairs (their yaws, and their depths in
-`map.camera_*.frame_agreement_tilt_*`).
+left from one pan position to the next, and the four tilts of a pan position, which share its
+heading, are its same-heading pairs (every two of them: their yaws, and their depths in
+`map.camera_*.frame_agreement_tilt_*`). Pitch direction compares each `floor`, `low` and `high`
+frame with the `mid` frame of its pan position: `floor` and `low` must point below it, `high`
+above it.
 
 ### Metrics
 
@@ -1853,7 +1911,7 @@ heading, are its same-heading pairs (their yaws, and their depths in
 |---|---|
 | `perf.*` | Per image and per mapping update: end-to-end wall time, client and server peak memory, and `view.sh` time to the rendered page; for a map built in several updates also its slowest update (`per_update_wall_s`). Groups: the single-image commands (`reconstruct.sh` JSON, PLY and depth image, `segment.sh -i -d` JSON and segmented image, `view.sh -i`), one `ainex-captures` frame (median), the two `ainex` maps, `view.sh -m`, `mapper.sh locate`, the same for `camera` (`segment_camera_frames`, `mapper_camera_single`, `mapper_camera_split`, `view_camera_map`, `camera_locate`), the office maps (one update, and the slowest update of the splits) and street2. |
 | `perf.<group>.stage.<stage>.*` | Per stage, every stage the commands record: seconds (`.s`: median over the frames of a per-frame group, else the slowest run, so per image and per mapping update), client (`.client_peak_mb`) and server (`.server_peak_gb`) peak memory while it ran. |
-| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames, registered fraction, and same-heading pairs, for both `ainex` maps; `pose.locate.*` the same for the held-out captures `mapper.sh locate` placed (located fraction, yaw error relative to the map's capture 001; the detail compares each with the pose the map gives it once added), and `pose.camera_locate.*` for `camera`'s (its names record no angle: the yaw error is against the yaw the split map gives the capture once added, both relative to the first capture); `pose.street2.registered_fraction` the share of the video's sampled frames the map registered. For the two `camera` maps (`pose.camera_single.*`, `pose.camera_split.*`), whose names record no angle: registered fraction, `pan_order_fraction` (the share of steps from one registered pan position to the next whose heading turns left), `tilt_yaw_diff_median_deg` and `tilt_yaw_diff_max_deg` (yaw differences of the tilts of one pan position), and the pitch direction of `up`/`down` frames against the `mid` frame of their pan position. |
+| `pose.*` | Yaw against the headings in the capture names, pitch direction of `up`/`down` frames against the `level` frame, registered fraction, and same-heading pairs, for both `ainex` maps; `pose.locate.*` the same for the held-out captures `mapper.sh locate` placed (located fraction, yaw error relative to the map's capture 001; the detail compares each with the pose the map gives it once added), and `pose.camera_locate.*` for `camera`'s (its names record no angle: the yaw error is against the yaw the split map gives the capture once added, both relative to the first capture); `pose.street2.registered_fraction` the share of the video's sampled frames the map registered. For the two `camera` maps (`pose.camera_single.*`, `pose.camera_split.*`), whose names record no angle: registered fraction, `pan_order_fraction` (the share of steps from one registered pan position to the next whose heading turns left), `tilt_yaw_diff_median_deg` and `tilt_yaw_diff_max_deg` (yaw differences of the tilts of one pan position), and the pitch direction of `floor`/`low`/`high` frames against the `mid` frame of their pan position (`floor` and `low` below it, `high` above it). |
 | `map.*` | For the `ainex` maps (`map.single.*`, `map.split.*`, `map.stability.*`) and the `camera` maps (`map.camera_single.*`, `map.camera_split.*`, `map.camera_stability.*`, whose same-heading pairs are the tilts of each pan position): frame agreement (depth disagreement) of the same-heading pairs and of every overlapping keyframe pair (`frame_agreement_pairs_*`: optical axes < 45° apart, any distance in capture order: median and p90 over the pairs of each pair's median, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures), and the stability of ids, labels and OBBs between the one-update and the split map. `ainex`'s same-heading pairs are revisits, which see the same surfaces at the same image positions: judged by the worst pair (`frame_agreement_median_pct`, `frame_agreement_p90_pct`: its median and p90). The `camera`'s tilt pairs share only strips, at the top of one frame and the bottom of the other, so they are judged like the overlapping pairs, over the tilt pairs alone and with the same targets (`frame_agreement_tilt_*`: median, p90, share above 10 % and worst of the tilt pairs' medians; user ruling 2026-10-08). Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. `matched_fraction` is the share of the one-update map's objects the split map has: the split map may keep an object an earlier update published that no later image contradicts (`mapper.md`), so such extra objects are listed in the detail (`extra_published`, id and label) and not counted against it; any other extra object counts in `unexcused_extra`. As `mapper.md` allows, an id may differ from the one-update map's where an earlier update of the split map had published it for that object: `id_agreement` counts such a pair as agreeing (its detail keeps the strict share, `same_id`). "Published for that object" means one of that update's `-t full` objects (for a `-t single -f ply` update, the objects its points' labels name, read from the map as it left it) has the id, a compatible label and a box that overlaps or nearly coincides with the split map's once the two updates are aligned: an id another object had is no allowance. |
 | `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids, labels and OBBs of the unchanged objects from the first update to the last, after aligning the two updates by their common captures, since a rebuild may re-gauge the frame (`stability.label_agreement`, `stability.id_agreement`, and `stability.centre_delta_median_m`, `.extent_delta_median_rel`, `.obb_iou_median`, whose targets allow for an OBB refined as evidence accumulates); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, are annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections, labels and scores per frame (`restaurant.jpg`, each `ainex-captures` frame: `seg.frames.*`, and each `camera` frame: `seg.camera_frames.*`). |
@@ -1960,9 +2018,10 @@ timing. Run it on an otherwise idle machine, because concurrent GPU work invalid
   nearest label (apple). Tomato, watermelon and a few other LVIS produce nouns are now included.
 * **Large plain built-ins score low.** The detector scores a doorway, a white built-in wardrobe
   or a window with roller shutters seen at a steep angle at 0.1–0.47, so `segment.sh -i` finds
-  no object at the default `--min-score 0.5` in 5 of the 27 `examples/camera` frames (3 up
-  frames facing the door and wardrobe, 1 facing the window, and the mid frame with the
-  wardrobe and the open door). Input resolution (640–1920 px), lens undistortion, contrast
+  no object at the default `--min-score 0.5` in 5 of the 27 frames of the earlier
+  `examples/camera` capture (tilts `down`, `mid`, `up`; 3 up frames facing the door and
+  wardrobe, 1 facing the window, and the mid frame with the wardrobe and the open door; not
+  measured yet on the current 36 frames). Input resolution (640–1920 px), lens undistortion, contrast
   enhancement, flips, tiles, 76 prompt wordings, averaged synonym prompts and the detection head
   were tried: what lifts one of them past 0.5 lowers others or the rest of the image (at 640 px
   the doorway scores 0.54 and the wardrobe 0.22, as a cabinet, instead of 0.47), and the
@@ -2002,7 +2061,7 @@ timing. Run it on an otherwise idle machine, because concurrent GPU work invalid
   leaves the median pair at 2.5 %, 90 % below 4.7 % and the worst at 8.1 % (with the
   out-of-focus near field invalid, below); within a pair, what remains lies in the thin strips
   in which an up and a down frame of one pan position overlap at the lens's edge (up to 18 %
-  at their p90). The corrections also mean a keyframe's depth is not one scale of MoGe's:
+  at their p90; measured on the earlier 27-frame capture, tilts `down`, `mid`, `up`). The corrections also mean a keyframe's depth is not one scale of MoGe's:
   `frames.json` records `depth_scale` at its median depth, `stats.depth_exponent` and
   `stats.depth_bend`.
 * **Large horizontal surfaces at floor height can stay fragmented.** Pieces of a surface seen

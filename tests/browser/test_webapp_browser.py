@@ -609,6 +609,95 @@ def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -
 # ----------------------------------------------------- interruption, waiting for its turn, registry
 
 
+def test_a_maps_viewer_and_its_removal(tab: Tab, app: tuple[Any, str]) -> None:
+    """A map's page starts the map's viewer — a link to its page while it runs (view.sh's own page,
+    served on 127.0.0.1 only, which the page says) — and stops it, and removes the map after a
+    confirmation that states it is deleted for good (the safe choice is focused; Escape keeps the
+    map); the page then says it is gone. By keyboard, with no accessibility violation."""
+    service, _ = app
+    root = minimal_map(service.workspace.maps / "doomed")
+    pg = tab.go("#/maps/doomed")
+    wait_route(pg, "maps/doomed")
+    status, button = pg.locator("[data-testid=viewer-status]"), pg.locator("[data-action=viewer]")
+    link = pg.locator("[data-testid=viewer-link]")
+    pg.wait_for_function("() => document.querySelector('[data-testid=viewer-status]').textContent "
+                         "=== 'The viewer is stopped.'")
+    assert button.inner_text() == "Start the viewer" and link.is_hidden()
+    button.focus()
+    pg.keyboard.press("Enter")
+    link.wait_for(state="visible")
+    url = link.get_attribute("href")
+    assert url == service.viewers.state("doomed")["url"] and url.startswith("http://127.0.0.1:")
+    assert "served on the machine that runs the service only" in status.inner_text()
+    assert button.inner_text() == "Stop the viewer"
+    assert pg.evaluate("() => document.activeElement.dataset.action") == "viewer"  # focus kept
+    tab.a11y()
+    with tab.ctx.expect_page() as opened:
+        link.click()
+    viewer = opened.value
+    viewer.wait_for_selector('body[data-rendered="true"]', timeout=60000)
+    assert viewer.url == url and viewer.title() == "doomed — oh-my-slam"  # view.sh's page
+    viewer.close()
+    button.focus()
+    pg.keyboard.press("Enter")  # stop it
+    link.wait_for(state="hidden")
+    assert status.inner_text() == "The viewer is stopped."
+    assert service.viewers.state("doomed") == {"running": False, "url": None}
+    pg.keyboard.press("Enter")  # running again: the removal says it stops first
+    link.wait_for(state="visible")
+    remove = pg.locator("[data-action=remove-map]")
+    remove.focus()
+    pg.keyboard.press("Enter")
+    dialog = pg.locator("#confirm")
+    dialog.wait_for(state="visible")
+    text = dialog.inner_text()
+    assert "Remove map doomed for good?" in text and "Its viewer is stopped first." in text
+    assert "is deleted from this workspace for good" in text
+    assert pg.evaluate("() => document.activeElement.id") == "confirm-no"  # the safe choice
+    assert pg.inner_text("#confirm-no") == "Keep the map"
+    tab.a11y()
+    pg.keyboard.press("Escape")
+    dialog.wait_for(state="hidden")
+    assert (root / "map.json").is_file() and service.viewers.state("doomed")["running"]
+    remove.click()
+    pg.click("#confirm-yes")
+    pg.wait_for_selector("h1:has-text('Map doomed removed')")
+    assert pg.evaluate("() => document.activeElement.tagName") == "H1"
+    assert "was deleted from this workspace for good" in pg.inner_text("main")
+    assert not root.exists() and not service.viewers.state("doomed")["running"]
+    tab.a11y()
+    pg.click("text=See the maps of this workspace.")
+    wait_route(pg, "maps")
+    pg.wait_for_selector("li.map-card[data-map=empty]")
+    assert pg.locator("li.map-card[data-map=doomed]").count() == 0
+    assert tab.errors == []
+
+
+def test_a_refused_removal_says_why(tab: Tab, app: tuple[Any, str]) -> None:
+    """A removal the service refuses (here: an update holds the map's lock) leaves the map and
+    its page, with the service's message next to the button."""
+    from oh_my_slam.mapping import store
+
+    service, _ = app
+    root = minimal_map(service.workspace.maps / "held")
+    fd = store.lock_update(root)
+    try:
+        pg = tab.go("#/maps/held")
+        wait_route(pg, "maps/held")
+        pg.click("[data-action=remove-map]")
+        pg.click("#confirm-yes")
+        problem = pg.locator("[data-testid=remove] .notice.error .notice-body")
+        problem.wait_for()
+        assert problem.inner_text().startswith("Map held was not removed: another update is "
+                                               "running on")
+        assert problem.inner_text().endswith("; remove map held once that update ended")
+        assert (root / "map.json").is_file() and pg.locator("h1").inner_text() == "Map held"
+        tab.a11y()
+    finally:
+        os.close(fd)
+    assert [e for e in tab.errors if "409" not in e] == []  # the refusal itself
+
+
 @pytest.fixture
 def extended(app: tuple[Any, str]) -> Iterator[Any]:
     """The registry with new modes — slow.sh -m MAP (reads a map, as long as asked), nap.sh -i

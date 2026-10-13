@@ -8,7 +8,8 @@ only entry point. The local scripts are out of its scope: the skill never runs
 `reconstruct.sh`, `mapper.sh`, `segment.sh`, `view.sh`, `start_inference_server.sh` or
 `server.sh`, nor documents their options. It names a script only to tell the user what to run
 (starting the inference server or `server.sh`, or `server.sh --status` for the service's URL),
-and what only a script does (viewing an image or a map in `view.sh`) is left to the user.
+and what only a script does (viewing an image in `view.sh -i`) is left to the user; a map is
+viewed through the API's viewer operation.
 
 * **Location and name.** `SKILL.md` at the repository root, with front matter `name: oh-my-slam`
   and a `description`.
@@ -22,8 +23,8 @@ and what only a script does (viewing an image or a map in `view.sh`) is left to 
   used: the requests it serves, the need for a `server.sh` reachable from the agent's machine,
   and which operations need the inference server. It stays within the Agent Skills limit of
   1024 characters.
-* **Finds the service.** `server.sh` binds a free port by default, so its URL changes from run to
-  run. A shell snippet resolves the base URL in order: a URL the user gives; the cached URL, if
+* **Finds the service.** `server.sh` binds port 9091 by default when it is free, and otherwise a
+  free port, so its URL can change from run to run. A shell snippet resolves the base URL in order: a URL the user gives; the cached URL, if
   `/api/health` answers there within a few seconds; on the machine running the service, the URL
   the service records in its workspace (`server.json` in `~/oh-my-slam-data/`, or in the
   `--data` folder the user names), with `0.0.0.0` replaced by `127.0.0.1`; and otherwise it
@@ -56,7 +57,7 @@ and what only a script does (viewing an image or a map in `view.sh`) is left to 
     need it).
   * The agent never starts or stops `server.sh` or the inference server; when either is not
     running, it tells the user how to start it. It never changes a map except through the
-    mapping operation.
+    mapping operation, and never removes one unless the user asked for that map's removal.
   * It asks the user before updating an existing map and before starting a long mapping
     request.
   * API inputs are uploads or paths inside the workspace, never paths outside it; an upload is

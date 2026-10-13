@@ -9,9 +9,13 @@ within its own HTTP request, and this module runs the command for it.
 * **Order.** Requests that use the inference server run one at a time, in arrival order (each
   takes a ticket once its body has arrived, and none overtakes an earlier one still being
   validated, which may need the inference server too), and wait for their turn with their
-  connection open; the others start at once. Two requests never write the same map at once: a writer waits for the
-  one before it. The scheduling state lives in the event loop's thread; a running command is
-  waited for in a thread of its own, which hands the outcome back to the loop. ``GET
+  connection open; the others start at once. Two requests never write the same map at once: a
+  writer waits for the one before it. Each request in progress records the map it names — from
+  its arrival, while it is still being validated, then as the map it writes or reads — which a
+  map's removal checks (:meth:`Runner.map_user`); while a map is being removed
+  (``Runner.removing``), a request that names it is refused before its validation. The scheduling state lives in the event loop's
+  thread; a running command is waited for in a thread of its own, which hands the outcome back to
+  the loop. ``GET
   /api/health`` counts the requests running and waiting, and lists each one (``in_progress``:
   operation, command line as typed, state, times), so a client tells whether its own request
   runs or waits for its turn.
@@ -49,7 +53,7 @@ from oh_my_slam.core.timing import ENV_PATH
 from oh_my_slam.web.workspace import Workspace
 
 POLL_S = 0.1
-LOG_TAIL = 40  # stderr lines kept for the command's error message
+LOG_TAIL = 40  # stderr lines kept for a subprocess's error message (a command's, a viewer's)
 INTERRUPT_GRACE_S = 30.0
 STDOUT = "stdout"  # the command's stdout in the request's folder: the result
 TIMINGS = "timings.json"  # its timing record there (OH_MY_SLAM_TIMINGS)
@@ -90,6 +94,7 @@ class Run:
     operation: str = ""  # the API operation id
     command: list[str] = field(default_factory=list)  # as typed, with workspace paths
     arrived_at: float = field(default_factory=time.time)
+    reads: str | None = None  # the map folder it only reads
     started_at: float | None = None
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     state: str = "waiting"  # waiting → running → ended
@@ -99,9 +104,23 @@ class Run:
     done: asyncio.Future[Outcome] | None = None
 
 
-def _killpg(pgid: int, sig: int) -> None:
+def killpg(pgid: int, sig: int) -> None:
+    """Signal a subprocess's process group (one already gone is no error)."""
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, sig)
+
+
+def command_message(prog: str, tail: list[str], code: int, what: str = "command") -> str:
+    """Why a subprocess run as ``prog`` (a command, or ``what`` else: a viewer) failed: its own
+    error line (``<prog>: error: …`` or ``<prog>: internal error: …``) among the last lines of
+    its stderr (``tail``), else the last of them; with none, its exit status ``code``."""
+    for line in reversed(tail):
+        for tag in (f"{prog}: error: ", f"{prog}: internal error: "):
+            if line.startswith(tag):
+                return line[len(tag):]
+    if code < 0:
+        return f"the {what} was stopped by signal {-code}"
+    return tail[-1] if tail else f"the {what} exited with status {code}"
 
 
 class Runner:
@@ -116,24 +135,27 @@ class Runner:
         self.waiting: list[Run] = []  # by ticket
         self.running: list[Run] = []
         self._tickets = 0
-        self._arriving: set[int] = set()  # tickets of requests still being validated
+        # tickets of the requests still being validated → their operation and the map they name
+        self._arriving: dict[int, tuple[str, str | None]] = {}
+        self.removing: set[str] = set()  # the map folders being removed: no request names them
         self._in_use: dict[str, Run] = {}  # upload id → the request that consumes it
         self._threads: dict[str, threading.Thread] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # -- state (the event loop's thread) -------------------------------------------------------------
 
-    def ticket(self) -> int:
-        """A request's place in the arrival order, taken when it arrives; :meth:`arrived` once it
-        was validated (admitted or refused)."""
+    def ticket(self, operation: str = "", map_dir: str | None = None) -> int:
+        """A request's place in the arrival order, taken when it arrives, with its operation and
+        the map folder it names (resolved), if any; :meth:`arrived` once it was validated
+        (admitted or refused)."""
         self._tickets += 1
-        self._arriving.add(self._tickets)
+        self._arriving[self._tickets] = (operation, map_dir)
         return self._tickets
 
     def arrived(self, ticket: int) -> None:
-        """A request's validation ended: the inference requests after it no longer wait for it."""
-        if ticket in self._arriving:
-            self._arriving.discard(ticket)
+        """A request's validation ended: the inference requests after it no longer wait for it,
+        and an admitted one now records its map as the one it writes or reads."""
+        if self._arriving.pop(ticket, None) is not None:
             self._schedule()
 
     def counts(self) -> dict[str, int]:
@@ -149,6 +171,15 @@ class Runner:
 
     def in_use(self, uid: str) -> bool:
         return uid in self._in_use
+
+    def map_user(self, path: str) -> tuple[str, str] | None:
+        """The operation and state (``validating``, ``waiting``, ``running``) of the earliest
+        request in progress that names the map folder ``path`` (resolved) — still being validated,
+        or reading or writing it — if any: a map is not removed under it."""
+        users = [(t, op, "validating") for t, (op, m) in self._arriving.items() if m == path]
+        users += [(r.ticket, r.operation, r.state) for r in [*self.running, *self.waiting]
+                  if path in (r.writes, r.reads)]
+        return min(users)[1:] if users else None
 
     def discard(self, uploads: list[str]) -> None:
         """A refused request ends: the uploads it named go too, unless another request uses
@@ -170,7 +201,7 @@ class Runner:
         self._loop = asyncio.get_running_loop()
         run.done = self._loop.create_future()
         self._in_use.update(dict.fromkeys(run.uploads, run))
-        self._arriving.discard(run.ticket)
+        self._arriving.pop(run.ticket, None)
         at = next((i for i, r in enumerate(self.waiting) if r.ticket > run.ticket),
                   len(self.waiting))
         self.waiting.insert(at, run)
@@ -307,19 +338,8 @@ class Runner:
                     break
             time.sleep(POLL_S)
         code = proc.returncode
-        return Outcome(code, None if code == 0 else self._message(run, list(tail), code),
+        return Outcome(code, None if code == 0 else command_message(run.prog, list(tail), code),
                        run.interrupted)
-
-    @staticmethod
-    def _message(run: Run, tail: list[str], code: int) -> str:
-        """The command's own error line (``<prog>: error: …``), else its last stderr line."""
-        for line in reversed(tail):
-            for tag in (f"{run.prog}: error: ", f"{run.prog}: internal error: "):
-                if line.startswith(tag):
-                    return line[len(tag):]
-        if code < 0:
-            return f"the command was stopped by signal {-code}"
-        return tail[-1] if tail else f"the command exited with status {code}"
 
     # -- signals -------------------------------------------------------------------------------------
 
@@ -328,7 +348,7 @@ class Runner:
         reaped process group id is never signalled)."""
         with run.lock:
             if run.proc is not None and run.proc.poll() is None:
-                _killpg(run.proc.pid, sig)
+                killpg(run.proc.pid, sig)
 
     def _escalate(self, run: Run) -> None:
         """A command that ignores SIGINT gets SIGTERM, then SIGKILL, ``interrupt_grace_s``

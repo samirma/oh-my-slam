@@ -1,7 +1,8 @@
 """Every entry point's shared definitions (``commands.entry_points``): the two servers' parsers are
 built from them, each server mode is selected by its flag (the start by none), the modes declare
 what they start or stop and how they fail, the list of scripts is the checkout's six in the spec's
-order, every exit status has a meaning, and the workspace default is one value."""
+order, every exit status has a meaning, and the workspace default and the port that ``--port 0``
+prefers are each one value."""
 
 from __future__ import annotations
 
@@ -106,3 +107,15 @@ def test_the_workspace_default_is_one_value(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setenv("HOME", str(tmp_path))  # server.sh --status without --data: the default
     with pytest.raises(ServiceNotRunningError, match=str(tmp_path / "oh-my-slam-data")):
         web_main.main(["--status"])
+
+
+def test_the_port_the_default_prefers_is_one_value() -> None:
+    """Spec §2.6: ``--port`` defaults to 0, port 9091 if it is free (``SERVICE_PORT``): the help
+    states the value the service binds."""
+    port = WEB_SERVICE.commands[0].option("port")
+    assert constants.SERVICE_PORT == 9091 and web_main.SERVICE_PORT == constants.SERVICE_PORT
+    assert port.default == 0
+    assert f"default: 0, port {constants.SERVICE_PORT} if it is free, otherwise a free port " \
+        "chosen by the OS" in port.help
+    assert f"port {constants.SERVICE_PORT} if it is free" in " ".join(
+        web_main.build_parser().format_help().split())

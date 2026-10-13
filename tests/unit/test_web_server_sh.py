@@ -36,11 +36,22 @@ def server(*args: str, timeout: float = 60) -> subprocess.CompletedProcess[bytes
                           env=os.environ.copy())
 
 
+def free_port() -> int:
+    """A port the OS found free just now. The tests never bind a fixed port, nor 9091, the one
+    ``--port 0`` prefers (``SERVICE_PORT``), which a service the user runs may hold or want."""
+    with socket.socket() as probe:
+        probe.bind(("0.0.0.0", 0))
+        return int(probe.getsockname()[1])
+
+
 def start(data: Path, probe: Path | None = None, browser: bool = False, extra: tuple[str, ...] = ()
           ) -> tuple[subprocess.Popen[bytes], str]:
-    """Start server.sh on ``data`` (with the options ``extra``). With ``probe``, it runs with
-    ``webbrowser.open`` replaced by ``tests/fakes/browser_probe.py`` (recording into ``probe``),
-    opening the browser if ``browser``."""
+    """Start server.sh on ``data`` (with the options ``extra``; without a ``--port`` among them,
+    on a port the OS found free). With ``probe``, it runs with ``webbrowser.open`` replaced by
+    ``tests/fakes/browser_probe.py`` (recording into ``probe``), opening the browser if
+    ``browser``."""
+    if "--port" not in extra:
+        extra = (*extra, "--port", str(free_port()))
     args = ["--data", str(data), *(() if browser else ("--no-browser",)), *extra]
     cmd = ([str(REPO / "server.sh"), *args] if probe is None else
            [sys.executable, str(PROBE), str(probe), "oh_my_slam.web.main", *args])
@@ -114,6 +125,37 @@ def test_server_sh_lifecycle(data: Path) -> None:
     assert server("--data", str(data), "--status").returncode == 3
 
 
+def test_stopping_the_service_stops_the_viewers_it_started(data: Path) -> None:
+    """Spec §2.6 "Operations": a map's viewer (view.sh -m, served on 127.0.0.1) runs until it is
+    stopped or the service stops; a removal that a stop interrupted after its rename is cleared at
+    the next start."""
+    minimal_map(data / "maps" / "m")
+    proc, url = start(data)
+    try:
+        r = httpx.post(url + "api/maps/m/viewer", json={}, timeout=60)
+        assert r.status_code == 200, r.text
+        viewer_url = r.json()["url"]
+        assert viewer_url.startswith("http://127.0.0.1:")
+        assert httpx.get(viewer_url + "api/meta").json()["mode"] == "map"
+        (viewer,) = [c for c in psutil.Process(proc.pid).children()
+                     if "oh_my_slam.cli.view" in c.cmdline()]
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0 and out == b"" and err == b""
+    assert not viewer.is_running()
+    with pytest.raises(httpx.ConnectError):
+        httpx.get(viewer_url + "api/meta")
+    left = data / ".removed" / "abc"
+    left.mkdir(parents=True)
+    proc, url = start(data)
+    try:
+        assert not left.exists()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=60)
+
+
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
 def test_ctrl_c_and_sigterm_are_the_normal_stop(data: Path, sig: signal.Signals) -> None:
     proc, url = start(data)
@@ -146,6 +188,63 @@ def test_an_explicit_port_is_bound(data: Path) -> None:
         proc.send_signal(signal.SIGTERM)
         out, err = proc.communicate(timeout=60)
     assert proc.returncode == 0 and out == b"" and err == b""
+
+
+PREFERRING = """
+import sys
+from oh_my_slam.web import main
+main.SERVICE_PORT = int(sys.argv.pop(1))  # the port --port 0 prefers: here one the OS found free
+sys.argv = ["server.sh", *sys.argv[1:]]
+main.entry()
+"""
+
+
+def preferring(data: Path, preferred: int, *args: str) -> tuple[subprocess.Popen[bytes], int]:
+    """server.sh on ``data`` (with ``args``), whose ``--port 0`` prefers the port ``preferred``
+    to 9091; the port it listens on."""
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    proc = subprocess.Popen([sys.executable, "-c", PREFERRING, str(preferred), "--data",
+                             str(data), "--no-browser", *args],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=REPO)
+    assert proc.stderr is not None
+    m = LINE.match(proc.stderr.readline().decode().rstrip("\n"))
+    if not m:
+        proc.kill()
+        raise AssertionError("no listening line")
+    return proc, int(m.group(1))
+
+
+def stopped(proc: subprocess.Popen[bytes]) -> None:
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0 and out == b"" and err == b""
+
+
+def test_the_default_port_is_the_service_port_while_it_is_free(tmp_path: Path) -> None:
+    """Spec §2.6: ``--port 0``, the default, binds port 9091 if it is free, otherwise a free port
+    chosen by the OS; ``--port 0`` given explicitly is the same. A service started again gets
+    the port back. (The preferred port is one the OS found free: the tests never hold 9091.)"""
+    preferred = free_port()
+    first, port = preferring(tmp_path / "a", preferred)  # the default
+    try:
+        assert port == preferred
+        health = httpx.get(f"http://127.0.0.1:{port}/api/health").json()
+        assert health["service"]["url"] == f"http://0.0.0.0:{preferred}/"
+        assert json.loads((tmp_path / "a" / "server.json").read_text())["port"] == preferred
+        second, other = preferring(tmp_path / "b", preferred, "--port", "0")  # taken: the OS's
+        try:
+            assert other != preferred
+            assert httpx.get(f"http://127.0.0.1:{other}/api/health").status_code == 200
+        finally:
+            stopped(second)
+    finally:
+        stopped(first)
+    # the service stopped (at most its closed connections are left): a new one gets it back
+    third, port = preferring(tmp_path / "a", preferred, "--port", "0")
+    try:
+        assert port == preferred
+    finally:
+        stopped(third)
 
 
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
@@ -207,8 +306,8 @@ def test_a_failure_after_listening_is_one_line_pointing_at_the_log(data: Path) -
     <data>/server.log, which holds the details."""
     env = {**os.environ, "PYTHONPATH": str(REPO)}
     proc = subprocess.Popen([sys.executable, "-c", FAILING_STOP, "--data", str(data),
-                             "--no-browser"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, cwd=REPO)
+                             "--no-browser", "--port", str(free_port())],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=REPO)
     assert proc.stderr is not None
     assert LINE.match(proc.stderr.readline().decode().rstrip("\n"))
     proc.send_signal(signal.SIGTERM)
@@ -248,8 +347,8 @@ def slow_server(data: Path) -> tuple[subprocess.Popen[bytes], str]:
     registry."""
     env = {**os.environ, "PYTHONPATH": str(REPO)}
     proc = subprocess.Popen([sys.executable, "-c", SLOW_SERVER, "--data", str(data),
-                             "--no-browser"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, cwd=REPO)
+                             "--no-browser", "--port", str(free_port())],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=REPO)
     assert proc.stderr is not None
     m = LINE.match(proc.stderr.readline().decode().rstrip("\n"))
     assert m, "no listening line"
@@ -339,6 +438,6 @@ def test_a_second_signal_kills_the_commands_and_exits(data: Path) -> None:
     assert proc.returncode == 130 and time.monotonic() - t0 < 10
     # after the listening line, the non-zero exit says so in one line pointing at the log
     assert err.decode().splitlines() == [
-        f"server.sh: error: stopped by a second signal; every command's processes were killed "
-        f"(see {data.resolve() / 'server.log'})"]
+        "server.sh: error: stopped by a second signal; every command's and viewer's processes "
+        f"were killed (see {data.resolve() / 'server.log'})"]
     child.wait(10)

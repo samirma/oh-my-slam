@@ -28,7 +28,7 @@ A file that is malformed, or that describes a file that is not an example image 
 ```
 
 * `image` is the image path relative to `examples/`, for example `restaurant.jpg`,
-  `ainex-captures/001_bootstrap_level.jpg`, `camera/img_008_p03_mid.jpg` or
+  `ainex-captures/001_bootstrap_level.jpg`, `camera/img_011_p03_mid.jpg` or
   `office_sequence/20260929_122224.jpg`. Any example image can be annotated: the evaluator runs
   `segment.sh -i` on an annotated image it does not segment anyway (an `office_sequence` image).
 * `label` uses the detector's vocabulary. Compatible labels, such as sofa and couch, count as the

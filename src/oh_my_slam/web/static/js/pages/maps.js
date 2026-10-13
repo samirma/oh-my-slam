@@ -1,20 +1,22 @@
 // Maps (http_server.md "Structure"): the workspace's maps as cards (name and summary figures from
 // the map's metadata) with a filter (#/maps?filter=<text>); a map's page (#/maps/<name>) with its
-// summary, its update history with timings (map.json's `updates`), and the operations that take a
-// map without writing it (#/maps/<name>?op=<id>, e.g. locating images in it), each with its
-// generated form, the running request and the result. The operation that writes maps is the
-// guided flow (mapflow.js).
+// summary, its viewer (started and stopped here, with a link to it while it runs), its update
+// history with timings (map.json's `updates`), the operations that take a map without writing it
+// (#/maps/<name>?op=<id>, e.g. locating images in it), each with its generated form, the running
+// request and the result, and its removal, after a confirmation that it is for good. The
+// operation that writes maps is the guided flow (mapflow.js).
 import { el, clear, notice, facts, fmtDate, fmtSeconds, fmtNumber, humanize } from '../dom.js';
-import { getJson, enc } from '../api.js';
+import { getJson, enc, startViewer, stopViewer, removeMap } from '../api.js';
+import { confirmAction } from '../dialog.js';
 import { store } from '../store.js';
 import { OpForm } from '../form.js';
 import { runPanel } from '../runpanel.js';
 import { stagesTable } from '../result.js';
 import { setQuery } from '../url.js';
 
-// the map store's own bookkeeping, not figures of the map
+// the map store's own bookkeeping, not figures of the map, and the state of its viewer
 const HIDDEN = new Set(['name', 'path', 'meta', 'next_object_id', 'next_frame_index', 'updates_count',
-  'scale_count', 'map_frame_count']);
+  'scale_count', 'map_frame_count', 'viewer']);
 
 // One figure of a map's metadata, readable: *_at a date, *_s a duration, a list its length.
 function figureValue(k, v) {
@@ -142,6 +144,89 @@ function history(updates) {
     el('tbody', {}, ...rows)));
 }
 
+// What the state of a map's viewer ({running, url}, as the service answers it) says.
+export function viewerStatus(v) {
+  return v && v.running
+    ? 'The viewer runs. Its page is served on the machine that runs the service only: open it there.'
+    : 'The viewer is stopped.';
+}
+
+// The confirmation of a map's removal: it states that the map is deleted for good (and that its
+// running viewer stops).
+export function removeQuestion(name, viewer) {
+  return {
+    title: `Remove map ${name} for good?`,
+    body: [`Map ${name} is deleted from this workspace for good: its keyframes, objects and update history cannot be recovered.`,
+      ...(viewer && viewer.running ? ['Its viewer is stopped first.'] : [])],
+    yes: 'Remove the map for good', no: 'Keep the map', danger: true,
+  };
+}
+
+// The viewer's controls in `box`: its state, a button that starts or stops it (the action answers
+// at once; the button stays focusable), a link to it while it runs, and why an action failed.
+// Returns { show(state), state }.
+function viewerControls(box, name) {
+  const status = el('p', { role: 'status', 'data-testid': 'viewer-status' }, 'Loading…');
+  const button = el('button', { type: 'button', 'data-action': 'viewer', 'aria-describedby': 'viewer-about' }, 'Start the viewer');
+  const link = el('a', { target: '_blank', rel: 'noopener', 'data-testid': 'viewer-link', hidden: true }, `Open the viewer of map ${name}`);
+  const problem = el('div', {});
+  box.append(el('p', { class: 'muted', id: 'viewer-about' }, 'The viewer shows the map in 3D, with its objects and cameras, in a page of its own.'),
+    status, el('div', { class: 'actions' }, button, link), problem);
+  let state = { running: false, url: null };
+  let busy = false;
+  const show = (v) => {
+    state = v || { running: false, url: null };
+    status.textContent = viewerStatus(state);
+    button.textContent = state.running ? 'Stop the viewer' : 'Start the viewer';
+    link.hidden = !state.running;
+    if (state.running) link.href = state.url; else link.removeAttribute('href');
+    box.dataset.running = String(state.running);
+  };
+  button.addEventListener('click', async () => {
+    if (busy) return;
+    const running = state.running;
+    busy = true;
+    button.setAttribute('aria-busy', 'true');
+    problem.replaceChildren();
+    status.textContent = running ? 'Stopping the viewer…' : 'Starting the viewer…';
+    try {
+      show(await (running ? stopViewer(name) : startViewer(name)));
+    } catch (err) {
+      show(state);
+      problem.replaceChildren(notice('error', `The viewer could not be ${running ? 'stopped' : 'started'}: ${err.message}`));
+    } finally {
+      busy = false;
+      button.removeAttribute('aria-busy');
+    }
+  });
+  return { show, get state() { return state; } };
+}
+
+// The map's removal in `box`: a button that asks first, then deletes the map; the page then says
+// it is gone. `viewer` is the viewer's controls (its state goes into the question).
+function removeControls(main, box, name, viewer) {
+  const problem = el('div', {});
+  const button = el('button', { type: 'button', class: 'danger', 'data-action': 'remove-map' }, 'Remove this map');
+  box.append(el('p', {}, 'Removing the map deletes it from this workspace for good.'), el('div', { class: 'actions' }, button), problem);
+  button.addEventListener('click', async () => {
+    problem.replaceChildren();
+    if (!(await confirmAction(removeQuestion(name, viewer.state)))) return;
+    button.setAttribute('aria-busy', 'true');
+    try {
+      await removeMap(name);
+    } catch (err) {
+      button.removeAttribute('aria-busy');
+      problem.replaceChildren(notice('error', `Map ${name} was not removed: ${err.message}`));
+      return;
+    }
+    const h1 = el('h1', { tabindex: '-1' }, `Map ${name} removed`);
+    main.replaceChildren(h1, notice('ok', `Map ${name} was deleted from this workspace for good. `,
+      el('a', { href: '#/maps' }, 'See the maps of this workspace.')));
+    document.title = `${h1.textContent} — oh-my-slam`;
+    h1.focus();
+  });
+}
+
 export function mapPage(main, { name, op: wanted }) {
   const ops = [...store.ops.values()].filter((o) => o.mapParam && !o.writesMap);
   const writer = [...store.ops.values()].find((o) => o.writesMap);
@@ -151,7 +236,11 @@ export function mapPage(main, { name, op: wanted }) {
     el('p', { class: 'muted' }, 'Loading…'));
   const runBox = el('section', { 'aria-labelledby': 'run-h', class: 'step' }, el('h2', { id: 'run-h' }, 'Run on this map'));
   const historyBox = el('section', { 'aria-labelledby': 'history-h' }, el('h2', { id: 'history-h' }, 'Update history'));
-  main.append(summary, runBox, historyBox);
+  const viewerBox = el('section', { 'aria-labelledby': 'viewer-h', 'data-testid': 'viewer' }, el('h2', { id: 'viewer-h' }, 'Viewer'));
+  const removeBox = el('section', { 'aria-labelledby': 'remove-h', 'data-testid': 'remove' }, el('h2', { id: 'remove-h' }, 'Remove'));
+  main.append(summary, viewerBox, runBox, historyBox, removeBox);
+  const viewer = viewerControls(viewerBox, name);
+  removeControls(main, removeBox, name, viewer);
   let form = null;
   let panel = null;
   if (ops.length) {
@@ -190,10 +279,12 @@ export function mapPage(main, { name, op: wanted }) {
     getJson(`/api/maps/${enc(name)}`).then((m) => {
       summary.replaceChildren(summary.firstChild, facts(figures(m)));
       historyBox.replaceChildren(historyBox.firstChild, history(m.meta?.updates));
+      viewer.show(m.viewer);
     }).catch((err) => {
       summary.replaceChildren(summary.firstChild, notice('error', `${err.message}`,
         err.status === 404 ? el('p', {}, el('a', { href: '#/maps' }, 'See the maps of this workspace.')) : null));
       historyBox.replaceChildren(historyBox.firstChild);
+      if (err.status === 404) { viewerBox.remove(); removeBox.remove(); } else viewer.show(null);
     });
   }
   loadSummary();

@@ -1,9 +1,13 @@
 """The HTTP routes of ``server.sh`` (spec §2.6 "API"), on Starlette (served by uvicorn).
 
 Everything under ``/api/`` is described by ``/api/openapi.json`` (``web.openapi``): the service's
-health, uploads (create and discard), the workspace's maps (as a list and one by one), and per
-operation ``POST /api/ops/<op>`` — which runs the command within the request and answers when it
-ends (``web.runner``) — and ``POST /api/ops/<op>/validate``. ``/`` is the web application
+health, uploads (create and discard), the workspace's maps (as a list and one by one, each with
+whether its viewer runs), per operation ``POST /api/ops/<op>`` — which runs the command within the
+request and answers when it ends (``web.runner``) — and ``POST /api/ops/<op>/validate``, and the
+two operations on a map, which are no command's mode and have no validation: ``DELETE
+/api/maps/<name>`` removes it (refused while a request in progress reads or writes it; its viewer
+is stopped first) and ``POST`` / ``DELETE /api/maps/<name>/viewer`` start and stop its viewer
+(``web.viewers``). ``/`` is the web application
 (``web/static``: plain ES modules built only on the public API); ``/static/…`` serves its files,
 and ``/static/viewer/lib/…`` and ``/static/viewer/vendor/…`` the §2.5 viewer's own ES modules and
 vendored libraries, from the viewer's package (not copied), with which the application draws a
@@ -56,6 +60,7 @@ from oh_my_slam.core.errors import (
     ExitCode,
     OhMySlamError,
     ServerUnavailableError,
+    UsageError,
     error_code,
     http_status,
     internal_message,
@@ -69,11 +74,14 @@ from oh_my_slam.web.operations import (
     error_body,
     internal,
     media_of,
+    named_map,
+    named_uploads,
     operations,
     prepare,
     problem,
 )
 from oh_my_slam.web.runner import STDOUT, STOPPING, TIMINGS, Outcome, Run, RunError, Runner
+from oh_my_slam.web.viewers import ViewerError, Viewers
 from oh_my_slam.web.workspace import NotFoundError, Workspace
 
 START_COMMAND = START_INFERENCE_SERVER  # what the health names while the server is not ready
@@ -121,6 +129,8 @@ def refusals() -> dict[str, Refusal]:
                                              f"{_gib(MIN_FREE_BYTES)} free on the workspace's "
                                              "disk"),
         Refusal("upload_in_use", 409, "an upload that another request in progress was given"),
+        Refusal("map_in_use", 409, "removing a map that a request in progress names (reads or "
+                                   "writes), or a request that names a map being removed"),
         Refusal(STOPPING, 503, "a request that arrives while the service stops"),
     )}
 
@@ -246,6 +256,10 @@ class Service:
     min_free_bytes: int = MIN_FREE_BYTES
     _hosts: set[str] | None = None
     _hosts_at: float = 0.0
+    viewers: Viewers = field(init=False)  # the maps' viewers it starts
+
+    def __post_init__(self) -> None:
+        self.viewers = Viewers(self.workspace)
 
     @property
     def port(self) -> int | None:
@@ -411,7 +425,17 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         """Validate, wait for the request's turn, run the command, answer when it ends."""
         op = op_of(request)
         params = await body_json(request)
-        ticket, arrived = runner.ticket(), time.time()  # its place in the arrival order
+        try:
+            named = named_map(op, params, ws)
+            if named is not None and named in runner.removing:  # at once: it never runs on it
+                runner.discard(named_uploads(op, params, ws))
+                return refuse("map_in_use", f"map {Path(named).name} is being removed; send the "
+                              "request again once its removal ended")
+        except Exception:  # the internal error: its uploads are consumed all the same
+            runner.discard(named_uploads(op, params, ws))
+            raise
+        # its place in the arrival order, with the map it names: no removal from now on
+        ticket, arrived = runner.ticket(op.id, named), time.time()
         try:
             if runner.stopping:
                 return refuse(STOPPING, "the service is stopping; send the request again once it "
@@ -422,7 +446,7 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
                 status, body = error_body(prep.problems)
                 return JSONResponse(body, status)
             run = Run(ticket, op.program.prog, op.module, prep.argv, prep.inference, prep.writes,
-                      prep.uploads, op.id, prep.command, arrived)
+                      prep.uploads, op.id, prep.command, arrived, reads=prep.reads)
             try:
                 runner.admit(run)
             except RunError as exc:  # its uploads are consumed, but those another request uses
@@ -494,11 +518,63 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
     # -- maps --------------------------------------------------------------------------------------
 
     async def maps(request: Request) -> Response:
-        return JSONResponse(await run_in_threadpool(ws.list_maps))
+        listed = await run_in_threadpool(ws.list_maps)
+        return JSONResponse([{**m, "viewer": service.viewers.state(m["name"])} for m in listed])
 
-    async def map_detail(request: Request) -> Response:
-        return JSONResponse(await run_in_threadpool(ws.map_summary, request.path_params["name"],
-                                                    True))
+    async def map_item(request: Request) -> Response:
+        """``GET``: the map's summary and metadata; ``DELETE``: its removal."""
+        name = request.path_params["name"]
+        if request.method == "DELETE":
+            return await remove_map(name)
+        summary = await run_in_threadpool(ws.map_summary, name, True)
+        return JSONResponse({**summary, "viewer": service.viewers.state(name)})
+
+    async def remove_map(name: str) -> Response:
+        """Delete the map for good. Every refusal comes before any change: while a request in
+        progress names it (still being validated, or reading or writing it), while it is already
+        being removed, and while an update holds its lock (``mapper.sh`` run from a terminal).
+        Then, until it has left ``maps/``, it is marked as being removed (``Runner.removing``): a
+        request that names it meanwhile is refused at once. Under the lock its viewer is stopped,
+        then it leaves ``maps/`` in one rename (no request finds it after that); its files are
+        deleted once the lock is released."""
+        map_dir = str(ws.map_dir(name))
+        user = runner.map_user(map_dir)
+        if user is not None:
+            return refuse("map_in_use", f"map {name} is used by a request in progress ({user[0]}, "
+                          f"{user[1]}); remove it once that request ended")
+        if map_dir in runner.removing:
+            return refuse("map_in_use", f"map {name} is already being removed")
+        with ws.map_lock(name):
+            runner.removing.add(map_dir)  # before the first await: no request names it from now
+            try:
+                await run_in_threadpool(service.viewers.stop, name)
+                gone = ws.detach_map(name)
+            finally:
+                runner.removing.discard(map_dir)
+        await run_in_threadpool(service.viewers.stop, name)  # one started while it stopped
+        await run_in_threadpool(ws.delete_removed, gone)
+        return Response(status_code=204)
+
+    async def viewer(request: Request) -> Response:
+        """``POST``: start the map's viewer (or find the one that runs), its URL; ``DELETE``:
+        stop it."""
+        name = request.path_params["name"]
+        if request.method == "DELETE":
+            await run_in_threadpool(ws.map_dir, name)
+            await run_in_threadpool(service.viewers.stop, name)
+            return JSONResponse(service.viewers.state(name))
+        if await body_json(request) != {}:
+            raise UsageError("a map's viewer takes only the map's name, in the path: send no "
+                             "body, or {}")
+        map_dir = await run_in_threadpool(ws.map_dir, name)
+        try:
+            url = await run_in_threadpool(service.viewers.start, name, map_dir)
+        except ViewerError as exc:
+            status, body = failure(Outcome(exc.code, str(exc)))
+            return JSONResponse(body, status)
+        except RunError as exc:
+            return refuse(exc.code, str(exc))
+        return JSONResponse({"running": True, "url": url})
 
     routes = [
         Route("/", index),
@@ -510,7 +586,8 @@ def create_app(service: Service) -> Callable[..., Awaitable[None]]:
         Route(UPLOADS, upload, methods=["POST", "PUT"]),
         Route("/api/uploads/{id}", delete_upload, methods=["DELETE"]),
         Route("/api/maps", maps),
-        Route("/api/maps/{name}", map_detail),
+        Route("/api/maps/{name}", map_item, methods=["GET", "DELETE"]),
+        Route("/api/maps/{name}/viewer", viewer, methods=["POST", "DELETE"]),
     ]
 
     async def not_found(request: Request, exc: Exception) -> Response:

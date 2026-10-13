@@ -15,10 +15,10 @@ TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html",
 def find_static(root: Path, rel: str) -> tuple[Path, str] | None:
     """The file ``rel`` of the folder ``root``, its symlinks resolved, and its media type; None
     for anything that is no file inside ``root`` (``..``, an absolute path, a symlink that leads
-    out, an embedded NUL byte, a folder)."""
+    out or loops, an embedded NUL byte, a folder)."""
     try:
         target = (root / rel).resolve()
-    except (ValueError, OSError):  # e.g. an embedded NUL byte
+    except (ValueError, OSError, RuntimeError):  # an embedded NUL byte, a symlink loop
         return None
     if root.resolve() not in target.parents or not target.is_file():
         return None

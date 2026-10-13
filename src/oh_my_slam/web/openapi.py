@@ -2,7 +2,11 @@
 /api/ops/<operation>`` (run it within the request) and one ``POST /api/ops/<operation>/validate``
 (check it, nothing runs) per mode of the commands the service offers, their parameters generated
 from ``spec.describe()`` — names, kinds, defaults, choices, bounds and help — plus the service's
-fixed endpoints. Each operation also carries its ``describe()`` entry as the API offers it
+fixed endpoints, among them the two operations on a workspace map that are no command's mode (its
+removal, and starting or stopping its viewer: ``operationId`` ``map-remove``, ``map-viewer-start``,
+``map-viewer-stop``; no validation endpoint; ``x-oms`` says that they never need the inference
+server — the viewer's from ``view.sh``'s map mode — and which one deletes a map). Each command
+operation also carries its ``describe()`` entry as the API offers it
 (``Operation.entry``: outputs, stages, rules, errors, inference need) under ``x-oms``, so a client
 can render forms and result pages from this document alone.
 
@@ -18,6 +22,7 @@ from typing import Any, get_args
 from oh_my_slam.client.protocol import Health, ServerStatus
 from oh_my_slam.commands import spec
 from oh_my_slam.version import __version__
+from oh_my_slam.web import viewers
 from oh_my_slam.web.operations import RESULT, Operation
 
 Json = dict[str, Any]
@@ -128,8 +133,13 @@ def _schemas() -> Json:
             "inference": _object(
                 {"status": {"enum": ["down", *get_args(ServerStatus)]}, "start_command": either},
                 {"message": _STR, "health": _ref("InferenceServerHealth")})}),
+        "Viewer": _object({
+            "running": {"type": "boolean"},
+            "url": {"type": ["string", "null"],
+                    "description": "the viewer's page while it runs (http://127.0.0.1:<port>/: "
+                                   "served on the service's machine only)"}}),
         "MapSummary": _object(
-            {"name": _STR, "path": _STR, "frames": _INT},
+            {"name": _STR, "path": _STR, "frames": _INT, "viewer": _ref("Viewer")},
             {"objects": {"type": ["integer", "null"]},
              "last_update": _object({}, {"frames_added": _INT,
                                          "total_s": {"type": ["number", "null"]}}, more=True)},
@@ -164,6 +174,13 @@ def _upload(summary: str) -> Json:
                                 _ref("Upload"), "201"), "4XX": _ERROR}}
 
 
+def _map_op(removes: bool = False) -> Json:
+    """``x-oms`` of an operation on a map that is no command's mode: its inference need (the
+    removal runs no command; the viewer is ``view.sh``'s map mode) and whether it deletes the
+    map."""
+    return {"inference": "never" if removes else viewers.MODE.inference, "deletes_map": removes}
+
+
 def _fixed() -> Json:
     """The service's own endpoints (not per command)."""
     upload_id = [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}]
@@ -183,10 +200,36 @@ def _fixed() -> Json:
         "/api/maps": {"get": {"summary": "the workspace's maps with their summaries",
                               "responses": _ok("maps", {"type": "array",
                                                         "items": _ref("MapSummary")})}},
-        "/api/maps/{name}": {"get": {"summary": "a map's summary and metadata (map.json)",
-                                     "parameters": name,
-                                     "responses": {**_ok("the map", _ref("Map")),
-                                                   "4XX": _ERROR}}},
+        "/api/maps/{name}": {
+            "get": {"summary": "a map's summary and metadata (map.json), and whether its viewer "
+                               "runs",
+                    "parameters": name,
+                    "responses": {**_ok("the map", _ref("Map")), "4XX": _ERROR}},
+            "delete": {"operationId": "map-remove",
+                       "summary": "remove the map: delete it from the workspace for good (refused "
+                                  "while a request in progress reads or writes it; its viewer is "
+                                  "stopped first)",
+                       "parameters": name, "x-oms": _map_op(removes=True),
+                       "responses": {"204": {"description": "removed"}, "4XX": _ERROR}}},
+        "/api/maps/{name}/viewer": {
+            "post": {"operationId": "map-viewer-start",
+                     "summary": "start the map's viewer, a 3D page of the map served on the "
+                                "service's machine only, or answer the URL of the one that runs",
+                     "description": "Runs the viewer on the map read-only (it never needs the "
+                                    "inference server); at most one runs per map. Its page is "
+                                    "served at http://127.0.0.1:<port>/ on the service's machine "
+                                    "and is not reachable from another one. The body is empty or "
+                                    "{}: the map is named by the path.",
+                     "parameters": name, "x-oms": _map_op(),
+                     "requestBody": {"required": False, "content": {"application/json": {
+                         "schema": {"type": "object", "maxProperties": 0}}}},
+                     "responses": {**_ok("the viewer, running", _ref("Viewer")), "4XX": _ERROR,
+                                   "503": _ERROR}},
+            "delete": {"operationId": "map-viewer-stop",
+                       "summary": "stop the map's viewer (nothing to do when none runs)",
+                       "parameters": name, "x-oms": _map_op(),
+                       "responses": {**_ok("the viewer, stopped", _ref("Viewer")),
+                                     "4XX": _ERROR}}},
     }
 
 

@@ -3,8 +3,9 @@
     server.sh [--port <n>] [--data <folder>] [--no-browser]
     server.sh --status | --stop
 
-Binds ``0.0.0.0:<port>`` (default 0: a free port), serves the API and the web application until
-Ctrl-C or SIGTERM, and once it accepts connections writes exactly one stderr line::
+Binds ``0.0.0.0:<port>`` (default 0: port ``SERVICE_PORT``, 9091, if it is free, otherwise a free
+port chosen by the OS), serves the API and the web application until Ctrl-C or SIGTERM, and once it
+accepts connections writes exactly one stderr line::
 
     server.sh: listening on http://0.0.0.0:<port>/
 
@@ -12,8 +13,9 @@ Nothing goes to stdout except ``--status``'s health JSON. One service runs per w
 and a state file in ``<data>``): a second ``server.sh`` on the same ``--data`` reports the running
 one's URL and exits 0. ``--stop`` stops it the way SIGTERM does: every request in progress is
 interrupted — a waiting one never starts, a running command gets SIGINT, as Ctrl-C — and the
-running ones are waited for, so each still gets its answer. A second Ctrl-C or SIGTERM while it
-stops kills every command's process group and exits at once (130); ``--stop`` sends it after
+running ones are waited for, so each still gets its answer; then every map viewer it started is
+stopped. A second Ctrl-C or SIGTERM while it stops kills every command's and viewer's process group
+and exits at once (130); ``--stop`` sends it after
 waiting ``STOP_TIMEOUT_S``. Its options and modes are defined in ``commands.entry_points``
 (``WEB_SERVICE``).
 """
@@ -38,7 +40,7 @@ from oh_my_slam.commands import spec
 from oh_my_slam.commands.entry_points import WEB_SERVICE
 from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.constants import CHECKOUT
+from oh_my_slam.core.constants import CHECKOUT, SERVICE_PORT
 from oh_my_slam.core.errors import (
     ExitCode,
     OhMySlamError,
@@ -233,7 +235,11 @@ def _bind(port: int) -> socket.socket:
     just stopped can be started again on its port at once. macOS then binds it even while another
     process listens on one of the machine's addresses, which would get the connections to that
     address (the browser's and ``--status``'s ``127.0.0.1``): an explicit port another process
-    listens on, on any address, is refused."""
+    listens on, on any address, is refused. Port 0 (the default) is ``SERVICE_PORT`` if it is
+    free by those same checks, otherwise a free port chosen by the OS."""
+    if port == 0:
+        with contextlib.suppress(UsageError):  # taken: the OS's choice, below
+            return _bind(SERVICE_PORT)
     where = _in_use(port) if port else None
     if where is not None:
         raise UsageError(f"--port {port}: cannot bind (another process listens on it at {where}); "
@@ -271,20 +277,23 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         url = f"http://0.0.0.0:{sock.getsockname()[1]}/"
         ws.clear_uploads()  # no request can consume what an earlier run left
         ws.clear_requests()
+        ws.clear_removed()  # what a removal that did not finish left
         runner = Runner(ws)
         service = Service(ws, runner, url=url)
         app = create_app(service)
 
         def hard_stop(signum: int = 0, frame: object = None) -> None:
-            """A second Ctrl-C or SIGTERM: kill every command's process group and exit now."""
+            """A second Ctrl-C or SIGTERM: kill every command's and viewer's process group and
+            exit now."""
             runner.kill_all()
+            service.viewers.kill_all()
             ws.clear_uploads()
             ws.clear_requests()
             with contextlib.suppress(OSError):
                 (ws.root / STATE).unlink()
             lock.release()
-            _tell_terminal(ws, "stopped by a second signal; every command's processes were "
-                           "killed")
+            _tell_terminal(ws, "stopped by a second signal; every command's and viewer's "
+                           "processes were killed")
             exit_now(int(ExitCode.INTERRUPTED))
 
         class _Server(uvicorn.Server):
@@ -331,8 +340,11 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
         finally:
             for s in (signal.SIGINT, signal.SIGTERM):  # a signal while requests stop: hard stop
                 signal.signal(s, hard_stop)
-            runner.shutdown()
-            sock.close()
+            try:
+                runner.shutdown()
+            finally:  # the viewers run in sessions of their own: never left behind
+                service.viewers.stop_all()
+                sock.close()
     finally:
         with contextlib.suppress(OSError):
             (ws.root / STATE).unlink()
@@ -343,7 +355,7 @@ def serve(ws: Workspace, port: int, open_browser: bool) -> int:
 def main(argv: list[str]) -> int:
     args: argparse.Namespace = build_parser().parse_args(argv)
     spec.validate(WEB_SERVICE.command(), args)  # --port and --no-browser: the serve mode's only
-    port = 0 if args.port is None else args.port
+    port = 0 if args.port is None else args.port  # 0: SERVICE_PORT if it is free (_bind)
     if not 0 <= port <= 65535:
         raise UsageError(f"--port must be between 0 and 65535, got {port}")
     ws = Workspace(args.data or DEFAULT_DATA)

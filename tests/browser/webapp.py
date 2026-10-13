@@ -44,6 +44,7 @@ def running_service(data: Path, **service_kw: Any) -> Iterator[tuple[Service, st
         yield service, service.url
     finally:
         runner.shutdown()
+        service.viewers.stop_all()
         server.should_exit = True
         thread.join(timeout=30)
 

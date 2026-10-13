@@ -2,7 +2,7 @@
 // and a filter, a map's update history with timings (spec §2.6 "Maps", from map.json); the name a
 // result is downloaded under.
 import { describe, expect, test } from 'bun:test';
-import { cardFigures, count, figures, mapMatches, updateStages } from '../../../src/oh_my_slam/web/static/js/pages/maps.js';
+import { cardFigures, count, figures, mapMatches, removeQuestion, updateStages, viewerStatus } from '../../../src/oh_my_slam/web/static/js/pages/maps.js';
 import { stem } from '../../../src/oh_my_slam/web/static/js/pages/image.js';
 import { fmtDate } from '../../../src/oh_my_slam/web/static/js/dom.js';
 
@@ -67,4 +67,25 @@ test('a result is downloaded under its input\'s name, without folders or suffix'
   expect(stem('photo')).toBe('photo');
   expect(stem(null)).toBe('');
   expect(stem(undefined)).toBe('');
+});
+
+describe('a map\'s viewer and its removal', () => {
+  test('the viewer\'s state in words: where its page can be opened', () => {
+    expect(viewerStatus({ running: true, url: 'http://127.0.0.1:5000/' })).toBe(
+      'The viewer runs. Its page is served on the machine that runs the service only: open it there.');
+    expect(viewerStatus({ running: false, url: null })).toBe('The viewer is stopped.');
+    expect(viewerStatus(null)).toBe('The viewer is stopped.');
+  });
+  test('the removal asks first and says it is for good (and that a running viewer stops)', () => {
+    expect(removeQuestion('office', { running: false })).toEqual({
+      title: 'Remove map office for good?',
+      body: ['Map office is deleted from this workspace for good: its keyframes, objects and update history cannot be recovered.'],
+      yes: 'Remove the map for good', no: 'Keep the map', danger: true,
+    });
+    expect(removeQuestion('office', { running: true }).body[1]).toBe('Its viewer is stopped first.');
+    expect(removeQuestion('office', null).body).toHaveLength(1);
+  });
+  test('the viewer\'s state is no figure of the map', () => {
+    expect(figures({ frames: 3, viewer: { running: true, url: 'http://127.0.0.1:5000/' } })).toEqual([['Frames', '3']]);
+  });
 });

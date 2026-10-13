@@ -53,7 +53,9 @@ REPO = Path(__file__).resolve().parents[2]
 REGENERATE = "regenerate it: uv run python -m oh_my_slam.web.skill"
 API_ROUTES = {"GET /api/health", "GET /api/openapi.json", "POST /api/ops/{op}",  # spec §2.6 "API"
               "POST /api/ops/{op}/validate", "POST /api/uploads", "PUT /api/uploads",
-              "DELETE /api/uploads/{id}", "GET /api/maps", "GET /api/maps/{name}"}
+              "DELETE /api/uploads/{id}", "GET /api/maps", "GET /api/maps/{name}",
+              "DELETE /api/maps/{name}", "POST /api/maps/{name}/viewer",
+              "DELETE /api/maps/{name}/viewer"}
 SH_BLOCK = re.compile(r"^ *```sh\n(.*?)^ *```$", re.S | re.M)
 CODE_SPAN = re.compile(r"`([^`\n]+)`")
 FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)")
@@ -260,12 +262,22 @@ def test_the_order_of_calls_the_errors_and_the_rules() -> None:
         i = examples.index(runs[0])
         uploads = [o for o in skill.inputs(op) if o.kind in spec.ACCEPTS]
         assert all(line.startswith("curl -sS -T ") for line in examples[i - len(uploads):i])
+    for op_id, (method, path, _) in skill.map_operations(document()).items():  # remove, viewer
+        assert f"`{method} {path}` (operation `{op_id}`)" in part(text, "Operations and routes")
+        url = '"$BASE' + path.replace("{name}", "<map>") + '"'
+        (line,) = [x for x in examples if x.startswith(f"curl -sS -X {method} ") and url in x]
+        assert examples[examples.index(line) - 1].startswith(f"# {op_id}: ")
+    assert "only when the user asked for that map's removal" in part(text, "Examples")
     errors = part(text, "Errors")
     assert '{"error": {"code": "<code>", "message": "<the command\'s own message>"' in errors
     rules = flat(part(text, "Rules"))
     for rule in ("The inference server may be down.",
                  "Never start or stop `start_inference_server.sh` or `server.sh`",
                  "tell the user how to start it", "Never change a map except through",
+                 "and never remove one unless the user asked for that map's removal** "
+                 "(`DELETE /api/maps/{name}`, which deletes it for good)",
+                 "A map's viewer (`POST /api/maps/{name}/viewer`) is a 3D page that only the "
+                 "Mac running the service can open",
                  "Ask the user first** before updating an existing map",
                  "before starting a long mapping request",
                  "Inputs are uploads or paths inside the workspace",
@@ -404,7 +416,10 @@ def test_every_limit_the_skill_states_is_the_codes() -> None:
     assert f"the command that starts it, `{web_app.START_COMMAND}`" in rules
     assert ("offer what works without it: the workspace's maps (`GET /api/maps`, "
             "`GET /api/maps/{name}`); `mapper-locate` except for maps over "
-            f"{constants.UPDATE_EXHAUSTIVE_MAX} keyframes.") in rules
+            f"{constants.UPDATE_EXHAUSTIVE_MAX} keyframes; `map-remove` (`DELETE /api/maps/{{name}}`) "
+            "only when the user asked for that map's removal; `map-viewer-start` (`POST "
+            "/api/maps/{name}/viewer`); `map-viewer-stop` (`DELETE /api/maps/{name}/viewer`).") \
+        in rules
     (writer,) = [op for op in ops().values() if op.writes_map() is not None]
     stages = [str(s) for s in writer.mode.stages]
     assert f"runs {len(stages)} stages, from `{stages[0]}` to `{stages[-1]}`" in rules
@@ -414,9 +429,36 @@ def test_every_limit_the_skill_states_is_the_codes() -> None:
     assert f"which are refused ({HTTP_STATUS[outside]} `{error_code(outside)}`)" in rules
     find = flat(part(text, "Find the service"))
     assert f"answers {refused['forbidden'].http_status} `forbidden`" in find
+    assert f"binds port {constants.SERVICE_PORT} if it is free, otherwise a free port" in find
     assert f"curl exit {' or '.join(map(str, skill.CURL_EXITS))}" in find
     flow = flat(part(text, "A request, call by call"))
     assert f"is refused with {refused['unsupported_media_type'].http_status}" in flow
+
+
+def test_what_works_without_the_inference_server_is_offered() -> None:
+    """agent_skill.md "Carries the project's rules": with the inference server down, the agent
+    still offers what works without it — every operation the OpenAPI document marks as never
+    needing it (a command's mode, or an operation on a map), and the removal of a map only on the
+    user's request."""
+    doc = document()
+    rule = flat(part(committed(), "Rules")).split("offer what works without it: ", 1)[1]
+    rule = rule.split("\n* ", 1)[0].split(". * ", 1)[0]
+    never = [(op["operationId"], method.upper(), path, op["x-oms"])
+             for path, item in doc["paths"].items() for method, op in item.items()
+             if op.get("x-oms", {}).get("inference") == "never"]
+    assert {i for i, *_ in never} >= {"map-remove", "map-viewer-start", "map-viewer-stop"}
+    for op_id, method, path, oms in never:
+        assert f"`{op_id}`" in rule, op_id
+        if path.startswith("/api/maps/"):
+            clause = rule.split(f"`{op_id}` (`{method} {path}`)", 1)
+            assert len(clause) == 2, op_id
+            removal = "only when the user asked for that map's removal"
+            assert clause[1].split(";")[0].strip().startswith(removal) == oms["deletes_map"]
+    for op in ops().values():  # a command's mode that needs it only sometimes: when it does not
+        if op.mode.inference == "conditional":
+            assert f"`{op.id}` except for {skill.condition(op.mode)}" in rule
+        elif op.mode.inference == "required":
+            assert f"`{op.id}`" not in rule
 
 
 def test_a_changed_limit_changes_the_skill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -424,6 +466,7 @@ def test_a_changed_limit_changes_the_skill(monkeypatch: pytest.MonkeyPatch) -> N
     before = skill.render()
     monkeypatch.setattr(web_app, "MAX_UPLOAD_BYTES", 3 << 30)
     monkeypatch.setattr(skill, "PROBE_TIMEOUT_S", 5)
+    monkeypatch.setattr(constants, "SERVICE_PORT", 8123)
     update, locate = spec.MAPPER.command("update"), spec.MAPPER.command("locate")
     (locating,) = locate.modes
     (updating,) = update.modes
@@ -437,6 +480,7 @@ def test_a_changed_limit_changes_the_skill(monkeypatch: pytest.MonkeyPatch) -> N
     assert "an upload over 3 GiB" in text and "an upload over 8 GiB" not in text
     assert "--max-time 5 " in text and "within 5 s" in text and "--max-time 3 " not in text
     assert "maps over 300 keyframes" in text and "over 150" not in text
+    assert "binds port 8123 if it is free" in text and "9091" not in text
     assert f"runs {len(updating.stages) - 1} stages" in flat(text)
 
 
@@ -539,7 +583,7 @@ def test_the_inference_need_reads_right_whatever_the_modes_need(
     text = skill.render()
     assert "; mapper-locate and the other routes work without it." in description(text)
     assert ("offer what works without it: the workspace's maps (`GET /api/maps`, "
-            "`GET /api/maps/{name}`); `mapper-locate`.") in flat(part(text, "Rules"))
+            "`GET /api/maps/{name}`); `mapper-locate`; `map-remove`") in flat(part(text, "Rules"))
     assert table(text)["mapper-locate"][4] == "not needed"
 
 

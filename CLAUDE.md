@@ -37,7 +37,8 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` is read-o
   `view.sh`, `server.sh` (web service, `specs/http_server.md`: derives everything from the commands' shared
   definitions; its API runs every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` — not `view.sh`
   (`Program.service`) — each within its own HTTP request: no jobs, the response is the command's stdout,
-  its stages in `Server-Timing`, a disconnect interrupts it; its package is `oh_my_slam.web`, since
+  its stages in `Server-Timing`, a disconnect interrupts it; besides those, it removes a map and starts or
+  stops a map's `view.sh -m` viewer as a subprocess (`web/viewers.py`); its package is `oh_my_slam.web`, since
   `oh_my_slam.server` is the inference server), and
   `SKILL.md` (agent skill `oh-my-slam`, `agent_skill.md` at the root: only the `server.sh` API, with
   `sh` + `curl` pointing to `/api/openapi.json`; the local scripts are out of its scope and named

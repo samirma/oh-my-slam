@@ -783,8 +783,9 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
         if ctx.rebuild is not None and ctx.rebuild.camera is not None:
             prior = replace(prior, existing_id=ctx.rebuild.camera)  # the stored keyframes' camera
             # its lens is fitted again from all the keyframes: held from an update of a few of
-            # them, it bent the rebuilt map (examples/camera mapped 9 + 9 + 9: k -0.45 from the
-            # first 9 frames against -0.52 from all 27, the rotations 4° off the one-update map's)
+            # them, it bent the rebuilt map (examples/camera's earlier 27-frame capture mapped
+            # 9 + 9 + 9: k -0.45 from the first 9 frames against -0.52 from all 27, the rotations
+            # 4° off the one-update map's)
             sfm.drop_distortion(ctx.rebuild.camera)
         n = _features_and_matching(ctx, sfm, names, prior, is_video, client, progress)
         timing.count(matched_pairs=n)

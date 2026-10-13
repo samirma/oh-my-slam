@@ -155,12 +155,12 @@ def test_each_capture_sequence_has_its_own_yaw_zero(tmp_path: Path) -> None:
     (tmp_path / "poses.json").write_text(json.dumps({"kind": "poses", "frames": {
         "001_bootstrap_level.jpg": {"yaw_deg": 10.0}, "004_bootstrap_left015_level.jpg": {
             "yaw_deg": 25.0},
-        "img_008_p03_mid.jpg": {"yaw_deg": 0.0, "pitch_deg": 0.0},
-        "img_011_p04_mid.jpg": {"yaw_deg": 30.0}, "img_009_p03_up.jpg": {"pitch_deg": 20.0}}}))
+        "img_011_p03_mid.jpg": {"yaw_deg": 0.0, "pitch_deg": 0.0},
+        "img_014_p04_mid.jpg": {"yaw_deg": 30.0}, "img_012_p03_high.jpg": {"pitch_deg": 20.0}}}))
     maps = {"ainex-captures": {"001_bootstrap_level.jpg": cam(-50.0),
                                "004_bootstrap_left015_level.jpg": cam(-35.0)},
-            "camera": {"img_008_p03_mid.jpg": cam(100.0), "img_011_p04_mid.jpg": cam(131.0),
-                       "img_009_p03_up.jpg": cam(100.0, 18.0)}}
+            "camera": {"img_011_p03_mid.jpg": cam(100.0), "img_014_p04_mid.jpg": cam(131.0),
+                       "img_012_p03_high.jpg": cam(100.0, 18.0)}}
     m = Metrics()
     gt.pose_metrics(m, gt.discover(tmp_path)[0], maps)
     yaw = m.items["gt.poses.yaw_err_median_deg"]

@@ -91,7 +91,7 @@ outside the repository for video sampling (`mapper.sh -fps`).
   and — on the resulting map — for `view.sh -m`. File names encode the
   **commanded** head motion as `NNN_<motion>_<tilt>.jpg`:
   * `NNN` — capture order
-* `examples/camera/` — an ordered 27-frame capture sequence (1920×888, no EXIF) of a real
+* `examples/camera/` — an ordered 36-frame capture sequence (1920×1080, no EXIF) of a real
   pan-tilt indoor camera turning in place in a home office, through a wide-angle lens with
   visible distortion. Same uses as `examples/ainex-captures/`: `mapper.sh` and, frame by frame,
   `segment.sh -i`; and — on the resulting map — `view.sh -m`. File names encode the
@@ -99,7 +99,8 @@ outside the repository for video sampling (`mapper.sh -fps`).
   * `NNN` — capture order
   * `pPP` — pan position, numbered in pan order: the camera turns left as `PP` increases, by a
     step angle that is not recorded
-  * `<tilt>` — `down`, `mid` or `up`; the three tilts of one pan position are consecutive
+  * `<tilt>` — `floor`, `low`, `mid` or `high`, in increasing pitch: `floor` and `low` point
+    below `mid`, `high` above it; the four tilts of one pan position are consecutive
 * `examples/office_sequence/` — an ordered 13-image sequence (file names are capture
   timestamps) of an office scene that changes during the capture: a cup visible in the
   first images is gone in the last ones. Reference input for the map-update behaviour of
@@ -116,8 +117,9 @@ The evaluators must report at least:
   rendered.
 * **Pose accuracy** — on both capture sequences: estimated camera yaw against the headings
   encoded in the capture file names (for `examples/camera/`, whose step angle is not recorded:
-  yaw that follows the pan order and agrees across the three tilts of one pan position), pitch
-  direction of the `up` / `down` frames, and the fraction of frames successfully registered.
+  yaw that follows the pan order and agrees across the four tilts of one pan position), pitch
+  direction of the tilted frames (`up` / `down` against `level`; `floor` / `low` / `high`
+  against `mid`), and the fraction of frames successfully registered.
 * **Map quality** — point-cloud consistency across overlapping frames (e.g. the same-heading
   pairs above), and stability of object `id`s, labels and OBBs when the same sequence is
   mapped in one update versus split across several.

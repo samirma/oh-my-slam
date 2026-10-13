@@ -11,7 +11,8 @@
 
 ``examples/camera`` (``PanCapture``): ``img_NNN_pPP_<tilt>.jpg`` — ``NNN`` is the capture order;
 ``pPP`` the pan position, numbered in pan order: the camera turns left as ``PP`` increases, by a
-step angle the name does not record; ``<tilt>`` is ``down``, ``mid`` or ``up``, and the three tilts
+step angle the name does not record; ``<tilt>`` is ``floor``, ``low``, ``mid`` or ``high``, in
+increasing pitch (``floor`` and ``low`` point below ``mid``, ``high`` above it), and the four tilts
 of one pan position are consecutive.
 """
 
@@ -33,8 +34,11 @@ _NAME = re.compile(
     r")_(?P<tilt>level|up|down)\.jpe?g$",
     re.IGNORECASE,
 )
-_PAN_NAME = re.compile(r"^img_(?P<index>\d{3})_p(?P<pan>\d{2})_(?P<tilt>down|mid|up)\.jpe?g$",
-                       re.IGNORECASE)
+_PAN_NAME = re.compile(
+    r"^img_(?P<index>\d{3})_p(?P<pan>\d{2})_(?P<tilt>floor|low|mid|high)\.jpe?g$", re.IGNORECASE)
+# The commanded pitch of a tilted frame against its untilted sibling (``level`` / ``mid``):
+# +1 above it, -1 below it.
+TILT_SIGN = {"up": 1, "down": -1, "high": 1, "low": -1, "floor": -1}
 
 
 def wrap_deg(angle: float) -> float:
@@ -56,7 +60,7 @@ class PanCapture:
     name: str  # file name
     index: int  # capture order NNN
     pan: int  # pan position PP, in pan order: the camera turns left as it increases
-    tilt: str  # "down" | "mid" | "up"
+    tilt: str  # "floor" | "low" | "mid" | "high", in increasing pitch
 
 
 AnyCapture = Capture | PanCapture
@@ -140,8 +144,8 @@ def pan_positions(captures: list[PanCapture]) -> dict[int, list[PanCapture]]:
 
 
 def mid_siblings(captures: list[PanCapture]) -> dict[str, PanCapture]:
-    """For each ``up`` / ``down`` capture, the ``mid`` capture of the same pan position (the
-    nearest in capture order); tilted captures without one are left out."""
+    """For each ``floor`` / ``low`` / ``high`` capture, the ``mid`` capture of the same pan
+    position (the nearest in capture order); tilted captures without one are left out."""
     out = {}
     for group in pan_positions(captures).values():
         mids = [c for c in group if c.tilt == "mid"]

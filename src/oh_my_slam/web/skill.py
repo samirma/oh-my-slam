@@ -224,8 +224,37 @@ def routes(doc: Json) -> list[str]:
         for method, op in item.items():
             query = [p["name"] for p in op.get("parameters", []) if p["in"] == "query"]
             lines.append(f"* `{method.upper()} {path}`"
+                         + (f" (operation `{op['operationId']}`)" if "operationId" in op else "")
                          + (f" (query `{'`, `'.join(query)}`)" if query else "")
                          + f": {op.get('summary', '')}")
+    return lines
+
+
+def map_operations(doc: Json) -> dict[str, tuple[str, str, Json]]:
+    """The operations on a map of the workspace that are no command's mode (its removal, its
+    viewer), from the OpenAPI document: operation id → method, path and entry."""
+    return {op["operationId"]: (method.upper(), path, op) for path, item in doc["paths"].items()
+            if not path.startswith("/api/ops/") for method, op in item.items()
+            if "operationId" in op}
+
+
+def map_route(doc: Json, op_id: str) -> str:
+    """A map operation's route, as the skill names it (`DELETE /api/maps/{name}`)."""
+    method, path, _ = map_operations(doc)[op_id]
+    return f"`{method} {path}`"
+
+
+def map_examples(doc: Json) -> list[str]:
+    """A ready-to-run example per map operation: the map is named by the path; a POST sends {}
+    as JSON."""
+    lines = []
+    for op_id, (method, path, op) in map_operations(doc).items():
+        url = "$BASE" + path.replace("{name}", "<map>")
+        body = f" {JSON_POST} -d '{{}}'" if "requestBody" in op else ""
+        lines.append(f"# {op_id}: {op['summary']}"
+                     + ("; only when the user asked for that map's removal"
+                        if method == "DELETE" and path == "/api/maps/{name}" else ""))
+        lines.append(f"curl -sS -X {method} -w '%{{http_code}}\\n' \"{url}\"{body}")
     return lines
 
 
@@ -406,7 +435,8 @@ def description(ops: dict[str, Operation]) -> str:
             f"{web} reachable from this machine, no checkout. Operations: "
             + "; ".join(clause(op) for op in ops.values()) + ". "
             + f"{listing(writing)} write{'s' if len(writing) == 1 else ''} a map; the others "
-              "are read-only. Also uploads, validation, the workspace's maps, health. "
+              "are read-only. Also uploads, validation, the workspace's maps (list, summary, "
+              "removal, a 3D page on the service's Mac), health. "
             + ", ".join(gloss(f) for f in result_formats(ops))
             + ". Inference server needed by " + listing(ids("required"))
             + (f", and by {listing(sometimes)}" if sometimes else "")
@@ -454,8 +484,9 @@ RULES = """## Rules
   tell the user how to start it: `{{start}}` for the inference server, and `{{service_start}}` in
   the oh-my-slam checkout on the Mac for the service (with `{{port}} <n>` for a URL that stays the
   same, `{{data_flag}} <folder>` for another workspace).
-* **Never change a map except through {{writers}}**, the mapping operation: no other request
-  writes one, and nothing else may touch a map's folder.
+* **Never change a map except through {{writers}}**, the mapping operation, **and never remove
+  one unless the user asked for that map's removal** ({{remove}}, which deletes it
+  for good): no other request writes or deletes a map, and nothing else may touch a map's folder.
 * **Ask the user first** before updating an existing map (`GET /api/maps/<name>` answers
   {{not_found}} `not_found` for a new one), and before starting a long mapping request:
   {{writers}} runs {{writer_stages}} and can take many minutes. Say that an update changes the map
@@ -471,8 +502,10 @@ RULES = """## Rules
 * **Results are the commands' own bytes:** save them with `curl -o` and never rewrite them; report
   a failure's message as it is. Don't repeat a refused or failed request unchanged.
 * **Offer only what the service supports:** the operations, parameters, values and routes of
-  `/api/openapi.json`, and never a local script. Viewing an image or a map in 3D is no operation
-  of the API: leave it to the user.
+  `/api/openapi.json`, and never a local script. Viewing an image in 3D is no operation of the
+  API: leave it to the user. A map's viewer ({{viewer_start}}) is a 3D
+  page that only the Mac running the service can open: start it when the user asks to see a map
+  there, give them its `url`, and stop it ({{viewer_stop}}) when they are done.
 """
 
 OPERATIONS = """## Operations and routes
@@ -497,14 +530,16 @@ The routes:
 * `GET /api/openapi.json`: the description of every operation, parameter, result and error
 {{routes}}
 
-Only the operations need the inference server, and a map changes only through {{writers}}. The
-browser application at `$BASE/` runs the same operations, for the user.
+Only the commands' operations need the inference server; a map changes only through {{writers}}
+and is deleted only through {{remove}}. The browser application at `$BASE/`
+runs the same operations, for the user.
 """
 
 FIND = """## Find the service
 
-`{{service}}` binds a free port unless it was started with `{{port}} <n>`, so its URL changes from
-run to run. This snippet prints the base URL and caches it in `{{cache}}`. It tries, in order: the
+`{{service}}` binds port {{default_port}} if it is free, otherwise a free port, unless it was
+started with `{{port}} <n>`, so its URL can change from run to run. This snippet prints the base
+URL and caches it in `{{cache}}`. It tries, in order: the
 URL the user gives (`OMS_URL`); the cached URL, if `/api/health` answers there within {{probe}} s;
 on the Mac that runs the service, the URL the service records in `{{state}}` in its workspace
 (`{{data}}/`, or the `{{data_flag}}` folder the user names, as `OMS_DATA`), with `0.0.0.0` replaced
@@ -665,6 +700,11 @@ def render(ops: dict[str, Operation] | None = None) -> str:
     without += [f"{code(op.id)}" for op in ops.values() if op.mode.inference == "never"]
     without += [f"{code(op.id)} except for {condition(op.mode)}" for op in ops.values()
                 if op.mode.inference == "conditional"]
+    without += [f"{code(op_id)} ({map_route(doc, op_id)})"
+                + (" only when the user asked for that map's removal"
+                   if op["x-oms"]["deletes_map"] else "")
+                for op_id, (_, _, op) in map_operations(doc).items()
+                if op["x-oms"]["inference"] == "never"]
     data_flag, port = service_flag("data"), service_flag("port")
 
     parts = [
@@ -673,9 +713,11 @@ def render(ops: dict[str, Operation] | None = None) -> str:
         fill(RULES, need_ops=listing([code(op.id) for op in ops.values()
                                       if op.mode.inference == "required"]) or "none",
              down_http=str(HTTP_STATUS[down]), down_code=error_code(down),
-             start=app.START_COMMAND, without=listing(without, ";").replace(" ; ", "; "),
+             start=app.START_COMMAND, without="; ".join(without),
              servers=listing([code(p.prog) for p in servers()], "or"),
              service_start=start_command(web), port=port, data_flag=data_flag,
+             remove=map_route(doc, "map-remove"), viewer_start=map_route(doc, "map-viewer-start"),
+             viewer_stop=map_route(doc, "map-viewer-stop"),
              writers=listing(writers(ops)) or "the mapping operation",
              not_found=refused["not_found"],
              writer_stages=(f"{len(stages)} stages, from `{stages[0]}` to `{stages[-1]}`,"
@@ -685,8 +727,10 @@ def render(ops: dict[str, Operation] | None = None) -> str:
             f"| `{op.id}` | `POST /api/ops/{op.id}` | {cell(takes_gives(op))} | {map_cell(op)} "
             f"| {inference_cell(op)} |" for op in ops.values()),
              formats=formats_text(ops), routes="\n".join(routes(doc)),
+             remove=map_route(doc, "map-remove"),
              writers=listing(writers(ops)) or "no operation"),
-        fill(FIND, service=web.prog, port=port, cache=URL_CACHE, probe=f"{PROBE_TIMEOUT_S:g}",
+        fill(FIND, service=web.prog, port=port, default_port=str(constants.SERVICE_PORT),
+             cache=URL_CACHE, probe=f"{PROBE_TIMEOUT_S:g}",
              state=service.STATE, data=constants.DEFAULT_DATA, data_flag=data_flag,
              status=status_command(), forbidden=refused["forbidden"],
              curl_exits=" or ".join(map(str, CURL_EXITS)), snippet=fill(
@@ -703,7 +747,7 @@ def render(ops: dict[str, Operation] | None = None) -> str:
                  f"`Server-Timing: {server_timing(ex_stages)}`; `{result_file(ex, params)}` "
                  "holds the result, byte for byte"),
              headers=HEADERS, timing=server_timing(ex_stages)),
-        fill(EXAMPLES, examples=sh(*examples(ops))),
+        fill(EXAMPLES, examples=sh(*examples(ops), *map_examples(doc))),
         fill(ERRORS, op=ex.id, refusal=refusal(ex), failed=failed(ExitCode.NOT_REGISTERED),
              codes="\n".join(f"| {c['exit_code']} | `{c['code']}` | {c['http_status']} "
                              f"| {cell(API_MEANING[ExitCode(c['exit_code'])])} |"

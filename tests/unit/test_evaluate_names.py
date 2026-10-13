@@ -1,5 +1,5 @@
 """The capture file-name grammars of the capture sequences (spec §5), on the real names: the 79
-of examples/ainex-captures and the 27 of examples/camera."""
+of examples/ainex-captures and the 36 of examples/camera."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from oh_my_slam.tools.evaluate.names import (
+    TILT_SIGN,
     PanCapture,
     captures_in,
     level_siblings,
@@ -111,31 +112,43 @@ def pan_captures() -> list:
     return pan_captures_in(CAMERA)
 
 
-def test_all_27_real_camera_names_parse(pan_captures: list) -> None:
-    """img_NNN_pPP_<tilt>.jpg: 9 pan positions in pan order, the three tilts of each consecutive
-    in capture order (the folder's .DS_Store, when the Finder left one, is not a frame)."""
-    assert len(pan_captures) == 27
-    assert [c.index for c in pan_captures] == list(range(7, 34))
+RISING = ["floor", "low", "mid", "high"]  # the tilts in increasing pitch
+
+
+def test_all_36_real_camera_names_parse(pan_captures: list) -> None:
+    """img_NNN_pPP_<tilt>.jpg: 9 pan positions (capture numbers 009-044) in pan order, the four
+    tilts of each consecutive in capture order, serpentine: floor, low, mid, high, then high, mid,
+    low, floor (the folder's .DS_Store, when the Finder left one, is not a frame)."""
+    assert len(pan_captures) == 36
+    assert [c.index for c in pan_captures] == list(range(9, 45))
     groups = pan_positions(pan_captures)
     assert list(groups) == list(range(3, 12))
     for pan, group in groups.items():
-        assert sorted(c.tilt for c in group) == ["down", "mid", "up"], pan
+        assert [c.tilt for c in group] == (RISING if pan % 2 else RISING[::-1]), pan
         first = group[0].index
-        assert [c.index for c in group] == [first, first + 1, first + 2], pan
+        assert [c.index for c in group] == list(range(first, first + 4)), pan
     assert [c.pan for c in pan_captures] == sorted(c.pan for c in pan_captures)
-    assert Counter(c.tilt for c in pan_captures) == {"down": 9, "mid": 9, "up": 9}
+    assert Counter(c.tilt for c in pan_captures) == dict.fromkeys(RISING, 9)
 
 
 def test_camera_name_forms() -> None:
-    assert parse_pan_capture("img_007_p03_down.jpg") == PanCapture("img_007_p03_down.jpg", 7, 3,
-                                                                   "down")
-    c = parse_pan_capture("IMG_021_P07_UP.JPEG")
-    assert (c.name, c.index, c.pan, c.tilt) == ("IMG_021_P07_UP.JPEG", 21, 7, "up")
+    assert parse_pan_capture("img_009_p03_floor.jpg") == PanCapture("img_009_p03_floor.jpg", 9, 3,
+                                                                    "floor")
+    c = parse_pan_capture("IMG_029_P08_HIGH.JPEG")
+    assert (c.name, c.index, c.pan, c.tilt) == ("IMG_029_P08_HIGH.JPEG", 29, 8, "high")
+
+
+def test_tilt_signs_follow_the_increasing_pitch() -> None:
+    """floor and low point below mid, high above it; ainex's up / down against level."""
+    assert [TILT_SIGN[t] for t in RISING if t != "mid"] == [-1, -1, 1]
+    assert (TILT_SIGN["down"], TILT_SIGN["up"]) == (-1, 1)
+    assert "mid" not in TILT_SIGN and "level" not in TILT_SIGN
 
 
 @pytest.mark.parametrize("name", [
-    "img_007_p03_level.jpg", "007_p03_mid.jpg", "img_7_p03_mid.jpg", "img_007_p3_mid.jpg",
-    "img_007_03_mid.jpg", "img_007_p03_mid.png", "001_bootstrap_level.jpg",
+    "img_009_p03_level.jpg", "img_009_p03_down.jpg", "img_012_p03_up.jpg", "009_p03_mid.jpg",
+    "img_9_p03_mid.jpg", "img_009_p3_mid.jpg", "img_009_03_mid.jpg", "img_009_p03_mid.png",
+    "001_bootstrap_level.jpg",
 ])
 def test_camera_names_outside_the_grammar_are_refused(name: str) -> None:
     with pytest.raises(ValueError, match="not a pan-tilt capture name"):
@@ -143,7 +156,7 @@ def test_camera_names_outside_the_grammar_are_refused(name: str) -> None:
 
 
 def test_camera_hidden_files_and_non_images_are_ignored(tmp_path: Path) -> None:
-    for name in ("img_002_p01_up.jpg", "img_001_p01_mid.jpg", ".DS_Store", "notes.txt"):
+    for name in ("img_002_p01_high.jpg", "img_001_p01_mid.jpg", ".DS_Store", "notes.txt"):
         (tmp_path / name).write_bytes(b"x")
     assert [c.index for c in pan_captures_in(tmp_path)] == [1, 2]
     (tmp_path / "001_bootstrap_level.jpg").write_bytes(b"x")  # the other sequence's grammar
@@ -153,16 +166,18 @@ def test_camera_hidden_files_and_non_images_are_ignored(tmp_path: Path) -> None:
 
 def test_tilted_frames_pair_with_the_mid_frame_of_their_pan_position(pan_captures: list) -> None:
     sib = {k: v.name for k, v in mid_siblings(pan_captures).items()}
-    assert len(sib) == 18  # every up/down frame has one
-    assert sib["img_007_p03_down.jpg"] == "img_008_p03_mid.jpg"
-    assert sib["img_010_p04_up.jpg"] == "img_011_p04_mid.jpg"  # the tilts run up-mid-down here
-    assert sib["img_033_p11_up.jpg"] == "img_032_p11_mid.jpg"
-    lone = [parse_pan_capture("img_001_p01_up.jpg"), parse_pan_capture("img_002_p02_mid.jpg")]
+    assert len(sib) == 27  # every floor / low / high frame has one
+    assert sib["img_009_p03_floor.jpg"] == "img_011_p03_mid.jpg"
+    assert sib["img_010_p03_low.jpg"] == "img_011_p03_mid.jpg"
+    assert sib["img_013_p04_high.jpg"] == "img_014_p04_mid.jpg"  # the tilts fall here
+    assert sib["img_016_p04_floor.jpg"] == "img_014_p04_mid.jpg"
+    assert sib["img_044_p11_high.jpg"] == "img_043_p11_mid.jpg"
+    lone = [parse_pan_capture("img_001_p01_high.jpg"), parse_pan_capture("img_002_p02_mid.jpg")]
     assert mid_siblings(lone) == {}  # no mid frame at p01
 
 
 def test_the_tilts_of_a_pan_position_are_its_same_heading_pairs(pan_captures: list) -> None:
     pairs = [(a.index, b.index) for a, b in tilt_pairs(pan_captures)]
-    assert len(pairs) == 27  # three per pan position
-    assert pairs[:3] == [(7, 8), (7, 9), (8, 9)]
-    assert all(a < b and b - a <= 2 for a, b in pairs)
+    assert len(pairs) == 54  # six per pan position: every two of its four tilts
+    assert pairs[:6] == [(9, 10), (9, 11), (9, 12), (10, 11), (10, 12), (11, 12)]
+    assert all(a < b and b - a <= 3 for a, b in pairs)
