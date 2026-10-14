@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from oh_my_slam.core.geometry import rot_z
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import panorama
 from oh_my_slam.mapping import sfm as sfm_mod
@@ -460,3 +461,21 @@ def test_centre_hints_without_fixed_keyframes_keep_each_centre() -> None:
     hints = panorama.centre_hints([], views, {"a", "b"})
     for n in ("a", "b"):
         np.testing.assert_array_equal(hints[n], views[n].pose.t)
+
+
+def test_a_model_reposed_moves_its_keyframes_and_triangulates_again(tmp_path: Path) -> None:
+    """``SfmModel.repose``: registered keyframes take the given poses (intrinsics held), names it
+    does not hold are skipped, and the points are triangulated again from the database."""
+    db = tmp_path / "db.db"
+    ids = _db(db, ["f0.jpg", "f1.jpg", "f2.jpg"])
+    _keypoints(db, ids)
+    poses = {"f0.jpg": Pose.identity(), "f1.jpg": Pose(np.eye(3), np.array([0.1, 0.0, 0.0]))}
+    s = Sfm(db, tmp_path, tmp_path / "work")
+    model = s.triangulate_with_poses(poses, tmp_path / "mv", focal_scale=1.1)
+    moved = Pose(rot_z(np.radians(5.0)), np.array([0.2, 0.05, 0.0]))
+    model.repose({"f1.jpg": moved, "f2.jpg": moved, "zz.jpg": moved}, db, tmp_path,
+                 tmp_path / "repose")
+    assert model.registered == ["f0.jpg", "f1.jpg"]
+    np.testing.assert_allclose(model.pose("f1.jpg").matrix(), moved.matrix(), atol=1e-9)
+    np.testing.assert_allclose(model.pose("f0.jpg").matrix(), np.eye(4), atol=1e-12)
+    np.testing.assert_allclose(model.rec.cameras[1].params, [110.0, 32.0, 24.0])

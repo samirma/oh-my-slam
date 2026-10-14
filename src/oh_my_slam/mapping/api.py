@@ -2171,6 +2171,53 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     _realign_dense(ctx, pool)
 
 
+# The multi-view fallback places the camera centres with each keyframe's depth as the network gave
+# it (``_refine_multiview``), before any alignment: every keyframe at its own scale, which the
+# alignment then corrects by up to 40 % (0.92-1.38 of the seed's on a robot head turning on a
+# kitchen counter). Where the head also moves, the centres follow those scales: its second sweep,
+# two decimetres lower, came 0.22 m (median) from the first where the same refinement on the
+# aligned depth puts it 0.27 m (median residual 0.284° -> 0.196°), and each keyframe's counter top,
+# placed through the short baselines, lay at its own height (p10-p90 4.7 cm; 2.0 cm after). A new map
+# posed by the multi-view fallback is therefore refined again on
+# its aligned depth (``_repose_on_aligned_depth``: the lens held, the first keyframe holding the
+# gauge, low-confidence keyframes by their rays only), and its depth aligned again to those poses;
+# not a camera given one centre (``_one_centre``), whose centres the depth must not move.
+
+
+def _repose_on_aligned_depth(ctx: UpdateContext, model: SfmModel) -> bool:
+    """Refine the poses of a new map's placed keyframes with their aligned depth (see above) and
+    move ``model`` to them (``SfmModel.repose``). Returns whether any keyframe was refined."""
+    from oh_my_slam.mapping import panorama
+
+    placed = sorted((nf for nf in ctx.new if nf.record is not None and nf.depth is not None),
+                    key=lambda nf: nf.kf.index)
+    views: dict[str, panorama.View] = {}
+    for nf in placed:
+        rec = nf.record
+        assert rec is not None
+        views[f"{nf.kf.name}.jpg"] = panorama.View(
+            rec.T_map_cam, rec.K, None if rec.low_confidence else nf.depth, rec.K_grid,
+            nf.full_size, nf.lens)
+    free = set(list(views)[1:])  # the first holds the gauge (the map's origin)
+    tx = ctx.tx
+    db = tx.current(store.SFM_DB)
+    # the first refinement's screening gate, if any: refined poses show the parallax of right
+    # pairs that rotations alone do not explain, and they keep the pairs it kept
+    first = ctx.notes.get("pose_refinement", {}).get("screen_gate_deg", panorama.SCREEN_MIN_DEG)
+    with timing.stage(timing.Stage.POSE_REFINEMENT):
+        pairs, gate = panorama.screen_pairs(panorama.verified_matches(db, set(views)), views,
+                                            free, min_gate_deg=float(first))
+        fit = panorama.refine_poses(pairs, views, free)
+    if not fit.pairs:
+        return False
+    fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
+    ctx.notes["pose_refinement_aligned"] = fit.summary()
+    ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
+                                 fit.per_frame_matches.get(n, 0)) for n in fit.poses})
+    model.repose(fit.poses, db, tx.stage("frames"), ctx.work / "sfm_repose")
+    return True
+
+
 # Each keyframe is first aligned to keyframes before it in capture order: where the depth of a few
 # disagrees with the rest (examples/camera's p06-p07 frames see an out-of-focus ring 0.2 m from the
 # lens, whose depth MoGe places anywhere from 0.2 to 2 m), the order decides which agreement a fit
@@ -2697,6 +2744,10 @@ def _place(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) 
             _define_map_frame(ctx, model, progress)
     with stage(timing.Stage.DEPTH_ALIGNMENT):
         _align_depths(ctx, model)
+    if (not old and model.method == "multiview" and not ctx.notes.get("one_centre", {}).get("taken")
+            and _repose_on_aligned_depth(ctx, model)):
+        with stage(timing.Stage.DEPTH_ALIGNMENT):
+            _align_depths(ctx, model)
     if not old:
         # levelled on the depth as aligned: the global adjustment bends the keyframes to agree
         # with each other, it does not know where up is (on examples/camera its floor leaned

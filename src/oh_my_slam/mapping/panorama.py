@@ -12,8 +12,9 @@ and camera centres of the free keyframes — optionally also the focal length an
 distortion of the camera all keyframes share — with the other keyframes (the map's, when extending
 it) fixed. Keypoints without depth are points at infinity (they constrain the rotations only). The
 depth's own per-keyframe scale error only scales the recovered baselines (centimetres for a turning
-head); it does not bias the rotations. ``refine_turning`` stages it for rotation-dominant input: rotations first, then the
-centres restart where the overlapping fixed keyframes are.
+head); it does not bias the rotations. ``refine_turning`` stages it for rotation-dominant input: the
+pairs the initial poses contradict left out (``screen_pairs``: repetitive texture), rotations first,
+then the centres restart where the overlapping fixed keyframes are.
 
 Solver: Levenberg-Marquardt on left rotation increments and centres, iteratively reweighted, with
 the robust scale shrinking from about a hundred pixels to a few (the initial poses can be degrees
@@ -69,6 +70,11 @@ DISTORTION_PRIOR = 0.5  # weak prior (standard deviation) of the division coeffi
 # a distortion that moves the image corners by less than this share of the half-diagonal is none
 DISTORTION_MIN_SHARE = 0.1
 NOISE_PX = 1.5  # keypoint noise the priors are weighed against
+# A pair whose median residual after the refinement is this many pixels — four times the final
+# robust scale — is one the robust loss gave up on: the refinement's notes count them
+# (``unexplained_pairs``), where a few broken links between otherwise consistent blocks hide
+# behind a small median residual over all matches (80° breaks at a 0.50° median).
+UNEXPLAINED_PX = 4 * ROBUST_SCALES_PX[-1]
 
 
 @dataclass(frozen=True)
@@ -106,14 +112,25 @@ class PoseFit:
     median_after_deg: float = float("nan")
     per_frame_deg: dict[str, float] = field(default_factory=dict)  # median residual per keyframe
     per_frame_matches: dict[str, int] = field(default_factory=dict)  # matches per keyframe
+    # median residual (pixels) of each pair's matches, both directions, by (a, b)
+    per_pair_px: dict[tuple[str, str], float] = field(default_factory=dict)
     distortion: float = 0.0  # the shared camera's division coefficient (module docstring)
+    # ``screen_pairs``: the pairs it left out and its gate (degrees); None: not screened
+    screened: int = 0
+    screen_gate_deg: float | None = None
 
     def summary(self) -> dict[str, Any]:
-        return {"pairs": self.pairs, "matches": self.matches,
-                "median_before_deg": round(self.median_before_deg, 4),
-                "median_after_deg": round(self.median_after_deg, 4),
-                "focal_scale": round(self.focal_scale, 6),
-                "distortion": round(self.distortion, 6)}
+        out: dict[str, Any] = {"pairs": self.pairs, "matches": self.matches,
+                               "median_before_deg": round(self.median_before_deg, 4),
+                               "median_after_deg": round(self.median_after_deg, 4),
+                               "focal_scale": round(self.focal_scale, 6),
+                               "distortion": round(self.distortion, 6)}
+        if self.per_pair_px:
+            out["unexplained_pairs"] = sum(v > UNEXPLAINED_PX for v in self.per_pair_px.values())
+        if self.screen_gate_deg is not None:
+            out.update(screened_pairs=self.screened,
+                       screen_gate_deg=round(self.screen_gate_deg, 3))
+        return out
 
 
 def verified_matches(db_path: Path, names: Collection[str], min_inliers: int = MIN_INLIERS,
@@ -391,8 +408,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     by a few weak matches about the axis they leave free. ``up``: the map's up when it is not +z
     (a new map, not levelled yet)."""
     names = sorted(n for n in free if n in views)
-    used_pairs = [p for p in pairs if p.a in views and p.b in views
-                  and (p.a in free or p.b in free)]
+    used_pairs = _used_pairs(pairs, views, free)
     fit = PoseFit({n: views[n].pose for n in names}, 1.0, len(used_pairs),
                   sum(len(p.uv_a) for p in used_pairs))
     if not used_pairs or not names:
@@ -512,7 +528,12 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
         return refine_poses(pairs, views, free, refine_focal, use_depth, scales,
                             hold_focal=True, hold_distortion=hold_distortion, gravity=gravity,
                             up=up, hold_centres=hold_centres)
-    final = degrees(residuals(R, C, phi, kappa))
+    last = residuals(R, C, phi, kappa)
+    final = degrees(last)
+    px = np.linalg.norm(last, axis=1)
+    bounds = np.r_[pb.starts[::2], len(px)]
+    fit.per_pair_px = {(p.a, p.b): float(np.median(px[lo:hi]))
+                       for p, lo, hi in zip(used_pairs, bounds[:-1], bounds[1:], strict=True)}
     fit.poses = {n: Pose(R[vid[n]], C[vid[n]]) for n in names}
     fit.focal_scale = float(np.exp(phi))
     fit.distortion = kappa
@@ -556,10 +577,12 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
                    gravity: dict[str, tuple[NDArray[Any], float]] | None = None,
                    up: NDArray[Any] | None = None) -> PoseFit:
     """``refine_poses`` for rotation-dominant input, whose multi-view camera centres are noise
-    (decimetres, where the head moves centimetres) that can trap the joint refinement: first the
-    rotations alone (pure-rotation model, centres irrelevant), then every free centre restarts at
-    the centre of the fixed keyframes it overlaps (``centre_hints``), then rotations and centres
-    are refined together with the depth."""
+    (decimetres, where the head moves centimetres) that can trap the joint refinement: the pairs
+    the initial rotations contradict are left out (``screen_pairs``), then the rotations are
+    refined alone (pure-rotation model, centres irrelevant), every free centre restarts at the
+    centre of the fixed keyframes it overlaps (``centre_hints``), and rotations and centres are
+    refined together with the depth."""
+    pairs, gate = screen_pairs(pairs, views, free)
     rot = refine_poses(pairs, views, free, use_depth=False, gravity=gravity, up=up)
     hints = centre_hints(pairs, views, free)
     staged = {n: replace(v, pose=Pose(rot.poses[n].R, hints[n])) if n in rot.poses else v
@@ -567,4 +590,108 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
     fit = refine_poses(pairs, staged, free, refine_focal=refine_focal,
                        hold_distortion=hold_distortion, gravity=gravity, up=up)
     fit.median_before_deg = rot.median_before_deg
+    fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
     return fit
+
+
+# ------------------------------------------------------------------------------------------------
+# pair screening
+#
+# Repetitive texture — tiled floors, brick, carpet, a stone counter top whose texture repeats every
+# few decimetres — gives two keyframes that see different places of one plane hundreds or
+# thousands of matches that a single homography explains (each feature matched to its copy one
+# period away), and COLMAP verifies them (a planar two-view geometry). On a rendered kitchen seen
+# by a robot head turning on its counter (34 keyframes, 640 x 260), 128 of 425 verified pairs —
+# 21,776 of 86,058 matches — implied relative rotations 60-90° off the multi-view poses, where 283
+# agreed within 20° (the multi-view poses' own error). Coherent within each pair, they
+# defeated the per-match robust loss: the rotation-only refinement turned 16 keyframes 78° away
+# from the rest, breaking the 2,554 matches of two neighbours (55° residual), and the depth
+# alignment bent every keyframe to fit. A pair is one piece of evidence, right or wrong as a whole:
+# each pair's own rotation (the rotation that best explains its matches alone, ``pair_rotation``)
+# is compared with the relative rotation of the initial poses, which the matches play no part in,
+# and pairs off by more than ``SCREEN_K`` times the median disagreement are left out. The median
+# measures the initial poses' error; for an isotropic error the disagreement's magnitude follows
+# a Maxwell distribution, whose 99.99th percentile is 3.0 times its median, so a right pair is
+# almost never left out, however good or bad the initial poses are. ``SCREEN_MIN_DEG`` is the
+# smallest gate: below it a disagreement is what parallax and an unrefined focal length give a
+# right pair of a camera turning about a point near its lens.
+SCREEN_K = 3.0
+SCREEN_MIN_DEG = 5.0
+FIT_TOL_DEG = 1.0  # a match agrees with a pair's rotation within this (consensus)
+FIT_HYPOTHESES = 200  # random two-match rotation hypotheses per pair (seeded)
+
+
+@dataclass(frozen=True)
+class ScreenGate:
+    """``screen_pairs``' result besides the pairs: how many it left out, at which gate."""
+
+    dropped: int
+    gate_deg: float
+
+
+def _used_pairs(pairs: list[PairMatches], views: dict[str, View], free: Collection[str]
+                ) -> list[PairMatches]:
+    """The pairs ``refine_poses`` uses: both views known, at least one free."""
+    return [p for p in pairs if p.a in views and p.b in views and (p.a in free or p.b in free)]
+
+
+def _bearings(K: Intrinsics, uv: NDArray[Any]) -> NDArray[np.float64]:
+    """Unit rays (camera frame) of full-resolution pixels ``uv`` through the pinhole ``K``."""
+    from oh_my_slam.core.geometry import unproject_pixels
+
+    x = unproject_pixels(uv[:, 0], uv[:, 1], np.ones(len(uv)), K.K())
+    return np.asarray(x / np.linalg.norm(x, axis=1, keepdims=True), np.float64)
+
+
+def _kabsch(H: NDArray[Any]) -> NDArray[np.float64]:
+    """The rotations M (..., 3, 3) maximising Σ bᵢ·M aᵢ for H = Σ aᵢ bᵢᵀ (..., 3, 3)."""
+    U, _, Vt = np.linalg.svd(H)
+    V = np.swapaxes(Vt, -1, -2)
+    Ut = np.swapaxes(U, -1, -2)
+    d = np.sign(np.linalg.det(V @ Ut))
+    D = np.broadcast_to(np.eye(3), H.shape).copy()
+    D[..., 2, 2] = np.where(d == 0, 1.0, d)
+    return np.asarray(V @ D @ Ut, np.float64)
+
+
+def pair_rotation(Ka: Intrinsics, Kb: Intrinsics, uv_a: NDArray[Any], uv_b: NDArray[Any],
+                  rng: np.random.Generator) -> NDArray[np.float64]:
+    """The rotation M (``ray_b ≈ M ray_a``, i.e. ``R_bᵀ R_a`` for camera-to-map rotations) that
+    explains most of one pair's matches as a turn: RANSAC over two-match hypotheses
+    (``FIT_HYPOTHESES``, consensus within ``FIT_TOL_DEG``), refitted to its consensus twice."""
+    a, b = _bearings(Ka, uv_a), _bearings(Kb, uv_b)
+    idx = rng.integers(0, len(a), size=(FIT_HYPOTHESES, 2))
+    hyp = _kabsch(np.einsum("hki,hkj->hij", a[idx], b[idx]))
+    cos_tol = np.cos(np.radians(FIT_TOL_DEG))
+    agree = np.einsum("hij,nj,ni->hn", hyp, a, b) > cos_tol
+    best = hyp[int(np.argmax(agree.sum(axis=1)))]
+    for _ in range(2):
+        keep = np.sum((a @ best.T) * b, axis=1) > cos_tol
+        if keep.sum() < 2:
+            break
+        best = _kabsch(a[keep].T @ b[keep])
+    return best
+
+
+def _angle_deg(M: NDArray[Any]) -> float:
+    """The angle of the rotation ``M`` (degrees)."""
+    return float(np.degrees(np.arccos(np.clip((np.trace(M) - 1.0) / 2.0, -1.0, 1.0))))
+
+
+def screen_pairs(pairs: list[PairMatches], views: dict[str, View], free: Collection[str],
+                 min_gate_deg: float = SCREEN_MIN_DEG) -> tuple[list[PairMatches], ScreenGate]:
+    """The pairs ``refine_poses`` would use whose own rotation (``pair_rotation``) agrees with the
+    relative rotation of the views' initial poses within the gate ``max(min_gate_deg, SCREEN_K
+    x`` the median disagreement``)`` (see above), and that gate. ``min_gate_deg``: an earlier
+    screening's gate, for poses refined since (the pairs it kept are not left out for the
+    parallax that refined poses show them)."""
+    used = _used_pairs(pairs, views, free)
+    if not used:
+        return used, ScreenGate(0, min_gate_deg)
+    rng = np.random.default_rng(0)
+    off = np.array([_angle_deg(pair_rotation(views[p.a].K, views[p.b].K, p.uv_a, p.uv_b, rng)
+                               @ (views[p.a].pose.R.T @ views[p.b].pose.R))
+                    for p in used])
+    gate = max(min_gate_deg, SCREEN_K * float(np.median(off)))
+    kept = [p for p, d in zip(used, off, strict=True) if d <= gate]
+    return kept, ScreenGate(len(used) - len(kept), gate)

@@ -256,6 +256,22 @@ class SfmModel:
         self.rec.transform(pycolmap.Sim3d(s, pycolmap.Rotation3d(np.asarray(R)),
                                           np.asarray(t, np.float64)))
 
+    def repose(self, poses: dict[str, Pose], db: Path, image_dir: Path, work: Path) -> None:
+        """Move registered keyframes to the camera-to-world ``poses`` and triangulate the
+        database matches again (intrinsics held, no bundle adjustment)."""
+        import pycolmap
+
+        for name, T in poses.items():
+            im = self.rec.find_image_with_name(name)
+            if im is None or not im.has_pose:
+                continue
+            Tcw = T.inverse()
+            self.rec.frames[im.frame_id].rig_from_world = pycolmap.Rigid3d(
+                pycolmap.Rotation3d(Tcw.R), Tcw.t)
+        work.mkdir(parents=True, exist_ok=True)
+        self.rec = pycolmap.triangulate_points(self.rec, str(db), str(image_dir), str(work),
+                                               clear_points=True, refine_intrinsics=False)
+
     def write(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.rec.write(str(path))
