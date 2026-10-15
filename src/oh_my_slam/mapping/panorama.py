@@ -276,6 +276,7 @@ class _Problem:
     depth: NDArray[np.float64]  # (N,) z-depth in src (inf: point at infinity)
     starts: NDArray[np.int64]  # (S,) first match of each segment
     seg_views: list[tuple[int, int]]  # (src, dst) view index of each segment
+    weight: NDArray[np.float64] | None = None  # (N,) each match's weight (None: 1)
 
 
 BEHIND_PX = 1000.0  # residual of a point that projects behind the destination camera
@@ -354,8 +355,48 @@ def _evaluate(pb: _Problem, R: NDArray[Any], C: NDArray[Any], phi: float, kappa:
     return r, J
 
 
-def _cost(r: NDArray[Any], c: float) -> float:
-    return float(0.5 * c * c * np.log1p(np.sum(r * r, axis=1) / (c * c)).sum())
+# A camera that moves while it turns shows its translation as parallax between surfaces at different
+# depths. When most of a pair's matches lie on one near surface — a counter top under a robot head,
+# a table, a wall — that surface's homography dominates the fit, and a rotation with a slightly
+# wrong monocular plane explains it with almost no translation; the few matches on far surfaces,
+# which carry the parallax, are outvoted and then down-weighted as outliers. On the kitchen sequence
+# (``screen_pairs``) the first sweep's far matches (floor, cabinets at 2-3 m; 2-15 % of a pair's)
+# showed 8-12 px of parallax against the counter's homography in the same image rows, growing
+# linearly over 1-4 steps; the refinement left them 7.1 px off (median) with 1 cm steps, and lifted
+# alone with their depth they asked for 4-6 cm. ``depth_balance`` weighs each pair direction's
+# matches so that every depth stratum (``BALANCE_BIN`` of log depth in the source keyframe) carries
+# the same total weight, the direction's total unchanged and no match counting more than
+# ``BALANCE_MAX`` times: the far matches 2.1 px off, the floor and the counter top within 1.3° of
+# parallel (3.7° before), the overlapping keyframes' depth agreeing to 0.70 / 1.21 % (median / p90;
+# 0.73 / 1.55 % before). The strata are depth ratios of 1.25, the tolerance within which monocular
+# depth places one surface (the global adjustment's ``PAIR_GATE`` is a factor of 1.5); the result
+# changed little for ratios of 1.15-1.5 and caps of 10-1000.
+BALANCE_BIN = float(np.log(1.25))  # depth strata of a pair: depth ratios of 1.25
+BALANCE_MAX = 10.0  # a match counts at most this many times
+
+
+def depth_balance(pb: _Problem) -> NDArray[np.float64]:
+    """Per-match weights that give every depth stratum (``BALANCE_BIN`` of log depth in the
+    source keyframe) of each pair direction the same total weight, the direction's total
+    unchanged; at most ``BALANCE_MAX``; matches without depth keep weight 1."""
+    w = np.ones(len(pb.depth))
+    ends = np.r_[pb.starts[1:], len(pb.depth)]
+    for lo, hi in zip(pb.starts.tolist(), ends.tolist(), strict=True):
+        z = pb.depth[lo:hi]
+        fin = np.flatnonzero(np.isfinite(z) & (z > 0))
+        if not len(fin):
+            continue
+        lz = np.log(z[fin])
+        b = np.floor((lz - lz.min()) / BALANCE_BIN).astype(np.int64)
+        counts = np.bincount(b)
+        share = len(fin) / (np.count_nonzero(counts) * counts[b])
+        w[lo + fin] = np.minimum(share, BALANCE_MAX)
+    return w
+
+
+def _cost(r: NDArray[Any], c: float, weight: NDArray[Any] | None = None) -> float:
+    rho = np.log1p(np.sum(r * r, axis=1) / (c * c))
+    return float(0.5 * c * c * (rho if weight is None else weight * rho).sum())
 
 
 def _normal_equations(pb: _Problem, r: NDArray[Any], J: NDArray[Any], c: float,
@@ -368,6 +409,8 @@ def _normal_equations(pb: _Problem, r: NDArray[Any], J: NDArray[Any], c: float,
     H = np.zeros((npar, npar))
     g = np.zeros(npar)
     w = 1.0 / (1.0 + np.sum(r * r, axis=1) / (c * c))
+    if pb.weight is not None:
+        w = w * pb.weight
     Jw = J * w[:, None, None]
     ends = np.r_[pb.starts[1:], len(r)]
     for j, (lo, hi) in enumerate(zip(pb.starts.tolist(), ends.tolist(), strict=True)):
@@ -390,7 +433,8 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                  scales: tuple[float, ...] = ROBUST_SCALES_PX, hold_focal: bool = False,
                  hold_distortion: bool = False,
                  gravity: dict[str, tuple[NDArray[Any], float]] | None = None,
-                 up: NDArray[Any] | None = None, hold_centres: bool = False) -> PoseFit:
+                 up: NDArray[Any] | None = None, hold_centres: bool = False,
+                 balance_depth: bool = False) -> PoseFit:
     """Refine the camera-to-map poses of the ``free`` keyframes (see the module docstring).
 
     ``views``: every keyframe that may take part (free and fixed); pairs with a keyframe outside
@@ -406,7 +450,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     keyframes, the up direction in the camera and its uncertainty (degrees), in a map whose up is
     +z: the tilt between them is a prior (``_tilt``), which levels a block that hangs on the rest
     by a few weak matches about the axis they leave free. ``up``: the map's up when it is not +z
-    (a new map, not levelled yet)."""
+    (a new map, not levelled yet). ``balance_depth``: the matches weighed by ``depth_balance``."""
     names = sorted(n for n in free if n in views)
     used_pairs = _used_pairs(pairs, views, free)
     fit = PoseFit({n: views[n].pose for n in names}, 1.0, len(used_pairs),
@@ -435,6 +479,8 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
             count += size
     pb = _Problem(*(np.concatenate(cols[k]) for k in ("src", "dst", "q", "m", "f", "depth")),
                   starts=np.asarray(starts, np.int64), seg_views=seg_views)
+    if balance_depth and use_depth:
+        pb.weight = depth_balance(pb)
     R = np.stack([views[n].pose.R for n in order]).astype(np.float64)
     C = np.stack([views[n].pose.t for n in order]).astype(np.float64)
     fi = np.array([vid[n] for n in names])
@@ -459,7 +505,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
               c: float) -> float:
         prior = prior_c * float(np.sum((Cs[fi] - C0) ** 2))
         prior += sum(w * float(np.sum(_tilt(Rs[fi[k]] @ u, z)[0] ** 2)) for k, u, w in tilts)
-        return _cost(r, c) + 0.5 * (prior + prior_f * ph * ph + prior_k * ka * ka)
+        return _cost(r, c, pb.weight) + 0.5 * (prior + prior_f * ph * ph + prior_k * ka * ka)
 
     def degrees(r: NDArray[Any]) -> NDArray[np.float64]:
         return np.degrees(np.linalg.norm(r, axis=1) / f_px)
@@ -527,7 +573,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     if refine_focal and abs(phi) > np.log(FOCAL_MAX_FACTOR):
         return refine_poses(pairs, views, free, refine_focal, use_depth, scales,
                             hold_focal=True, hold_distortion=hold_distortion, gravity=gravity,
-                            up=up, hold_centres=hold_centres)
+                            up=up, hold_centres=hold_centres, balance_depth=balance_depth)
     last = residuals(R, C, phi, kappa)
     final = degrees(last)
     px = np.linalg.norm(last, axis=1)
@@ -581,14 +627,16 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
     the initial rotations contradict are left out (``screen_pairs``), then the rotations are
     refined alone (pure-rotation model, centres irrelevant), every free centre restarts at the
     centre of the fixed keyframes it overlaps (``centre_hints``), and rotations and centres are
-    refined together with the depth."""
+    refined together with the depth, every depth stratum of a pair weighing alike
+    (``depth_balance``)."""
     pairs, gate = screen_pairs(pairs, views, free)
     rot = refine_poses(pairs, views, free, use_depth=False, gravity=gravity, up=up)
     hints = centre_hints(pairs, views, free)
     staged = {n: replace(v, pose=Pose(rot.poses[n].R, hints[n])) if n in rot.poses else v
               for n, v in views.items()}
     fit = refine_poses(pairs, staged, free, refine_focal=refine_focal,
-                       hold_distortion=hold_distortion, gravity=gravity, up=up)
+                       hold_distortion=hold_distortion, gravity=gravity, up=up,
+                       balance_depth=True)
     fit.median_before_deg = rot.median_before_deg
     fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
     return fit

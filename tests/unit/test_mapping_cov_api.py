@@ -921,44 +921,96 @@ def test_depth_nodes_skip_unplaced_keyframes_and_one_holds_the_gauge() -> None:
     assert msgs == [] and "depth_scale_adjustment" not in ctx.notes  # one keyframe: nothing
 
 
-def test_levelling_needs_a_floor_with_enough_points_and_a_plane(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    from oh_my_slam.core import geometry
-    from oh_my_slam.mapping import objects
+def tilted_normals(deg: float, count: int = 2000, seed: int = 1) -> np.ndarray:
+    """Unit normals of horizontal surfaces (a few degrees of noise) under a map whose up is
+    ``deg`` off +z (about x), with as many wall normals (horizontal)."""
+    rng = np.random.default_rng(seed)
+    up = rng.normal(0.0, 0.02, (count, 3)) + [0.0, 0.0, 1.0]
+    wall = rng.normal(0.0, 0.02, (count, 3)) + [1.0, 0.0, 0.0]
+    n = np.concatenate([up, wall])
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    return n @ rotation_between(UP, [0.0, -np.sin(np.radians(deg)), np.cos(np.radians(deg))]).T
 
-    rng = np.random.default_rng(0)
+
+def test_levelling_needs_enough_horizontal_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
     model = FakeModel(line([jpg(0)]))
     before = model.pose(jpg(0))
     ctx = ctx_of([nf(0)])
-    for floor in ((np.zeros((0, 3)), None), (rng.uniform(-1, 1, (100, 3)) * [1, 1, 0], 0.0)):
-        monkeypatch.setattr(objects, "map_floor", lambda c, per_frame=None, f=floor: f)
-        api._level_with_floor(ctx, model, quiet)  # type: ignore[arg-type]
-    pts = rng.uniform(-2, 2, (2000, 3)) * [1, 1, 0]
-    monkeypatch.setattr(objects, "map_floor", lambda c, per_frame=None: (pts, 0.0))
-    monkeypatch.setattr(geometry, "ransac_plane", lambda *a, **k: None)
-    api._level_with_floor(ctx, model, quiet)  # type: ignore[arg-type]
-    assert "floor_levelling_deg" not in ctx.notes
+    walls = tilted_normals(0.0)[mframe.LEVEL_MIN_NORMALS * 4:]  # the walls' only
+    for normals in (np.zeros((0, 3)), walls):
+        monkeypatch.setattr(api, "_horizontal_normals", lambda c, n=normals: n)
+        api._level_with_horizontals(ctx, model, quiet)  # type: ignore[arg-type]
+    assert "levelling_deg" not in ctx.notes
+    np.testing.assert_allclose(model.pose(jpg(0)).matrix(), before.matrix())
+    monkeypatch.setattr(api, "_horizontal_normals", lambda c: tilted_normals(0.0))
+    api._level_with_horizontals(ctx, model, quiet)  # type: ignore[arg-type]
+    assert ctx.notes["levelling_deg"] < 0.05  # level already: noted, not rotated
     np.testing.assert_allclose(model.pose(jpg(0)).matrix(), before.matrix())
 
 
 def test_levelling_rotates_the_placed_keyframes_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    from oh_my_slam.mapping import objects
-
-    rng = np.random.default_rng(1)
-    tilt = rotation_between(UP, [np.sin(np.radians(3)), 0.0, np.cos(np.radians(3))])
-    pts = (rng.uniform(-2, 2, (3000, 3)) * [1, 1, 0]) @ tilt.T
-    monkeypatch.setattr(objects, "map_floor", lambda c, per_frame=None: (pts, 0.0))
+    monkeypatch.setattr(api, "_horizontal_normals", lambda c: tilted_normals(3.0))
     placed = nf(1)
     placed.record = store.FrameRecord(1, "f000001", "", "", 1, 640, 480, K, Pose.identity(),
                                       64, 48)
     ctx = ctx_of([nf(0), placed])
     model = FakeModel(line([jpg(1)]))
     msgs: list[str] = []
-    api._level_with_floor(ctx, model, msgs.append)  # type: ignore[arg-type]
-    assert ctx.notes["floor_levelling_deg"] == pytest.approx(3.0, abs=0.2)
+    api._level_with_horizontals(ctx, model, msgs.append)  # type: ignore[arg-type]
+    assert ctx.notes["levelling_deg"] == pytest.approx(3.0, abs=0.1)
     assert ctx.new[0].record is None
-    assert traj.rotation_deg(placed.record.T_map_cam.R, np.eye(3)) == pytest.approx(3.0, abs=0.2)
-    assert msgs and "levelled with the floor plane" in msgs[0]
+    assert traj.rotation_deg(placed.record.T_map_cam.R, np.eye(3)) == pytest.approx(3.0, abs=0.1)
+    assert msgs and "levelled with its horizontal surfaces" in msgs[0]
+
+
+@pytest.mark.parametrize("view", ["oblique", "down", "unregistered"])
+def test_levelling_keeps_the_heading_of_the_origin_keyframe(monkeypatch: pytest.MonkeyPatch,
+                                                           view: str) -> None:
+    monkeypatch.setattr(api, "_horizontal_normals", lambda c: tilted_normals(3.0))
+    pose = (look_at(np.zeros(3), np.array([1.0, 0.0, -1.0])) if view != "down"
+            else Pose(np.diag([1.0, -1.0, -1.0]), np.zeros(3)))  # looking straight down
+    model = FakeModel({jpg(1 if view != "unregistered" else 5): pose})
+    ctx = ctx_of([nf(0), nf(1)])
+    api._level_with_horizontals(ctx, model, quiet)  # type: ignore[arg-type]
+    after = next(iter(model.poses.values())).R
+    assert np.degrees(np.arccos(after[2, 2] * -1.0)) == pytest.approx(
+        0.0 if view == "down" else 45.0, abs=3.1)
+    tilt = rotation_between(UP, [0.0, -np.sin(np.radians(3.0)), np.cos(np.radians(3.0))])
+    expected = tilt.T @ pose.R  # the smallest rotation levelling the map
+    heading = np.degrees(np.arctan2(after[1, 2], after[0, 2]))
+    if view == "oblique":  # kept at 0° (the smallest rotation alone turns it by about 3°)
+        assert heading == pytest.approx(0.0, abs=1e-6)
+        assert abs(np.degrees(np.arctan2(expected[1, 2], expected[0, 2]))) > 2.0
+    else:  # nothing to keep: the smallest rotation
+        np.testing.assert_allclose(after, expected, atol=2e-3)
+
+
+def test_horizontal_up_does_not_depend_on_the_tilt_before() -> None:
+    n = tilted_normals(0.0, seed=2)
+    n[:500] *= -1  # a ceiling faces down: it counts like the floor
+    ups = []
+    for deg in (0.0, 2.0, 6.0):
+        R = rotation_between(UP, [np.sin(np.radians(deg)), 0.0, np.cos(np.radians(deg))])
+        up = mframe.horizontal_up(n @ R.T, UP)
+        assert up is not None
+        ups.append(R.T @ up)
+    for up in ups:
+        assert traj.rotation_deg(rotation_between(up, ups[0]), np.eye(3)) < 1e-6
+    assert mframe.horizontal_up(n[: mframe.LEVEL_MIN_NORMALS - 1], UP) is None
+
+
+def test_horizontal_normals_are_the_confident_keyframes_in_the_map_frame() -> None:
+    placed, low, unplaced = nf(1), nf(2), nf(3)
+    turn = rotation_between(UP, [1.0, 0.0, 0.0])
+    for f in (placed, low):
+        f.record = store.FrameRecord(f.kf.index, f.kf.name, "", "", 1, 640, 480, K,
+                                     Pose(turn, np.zeros(3)), 64, 48, low_confidence=f is low)
+        f.depth = f.frame.depth  # a plane facing the camera at 2 m
+    normals = api._horizontal_normals(ctx_of([placed, low, unplaced]))  # type: ignore[arg-type]
+    usable = len(normals)
+    assert 0 < usable <= (64 // api.LEVEL_STEP) * (48 // api.LEVEL_STEP)
+    np.testing.assert_allclose(normals, np.tile(turn @ [0.0, 0.0, -1.0], (usable, 1)),
+                               atol=1e-6)
 
 
 def test_staging_skips_unplaced_keyframes_and_drops_rejected_images(tmp_path: Path) -> None:
@@ -990,7 +1042,7 @@ def test_placing_fails_without_a_registered_or_placed_keyframe(
     new = [nf(0), nf(1)]
     monkeypatch.setattr(api, "_run_sfm", lambda c, v, cl, p: FakeModel(
         {n: Pose.identity() for n in registered}))
-    for name in ("_rerun_focal", "_define_map_frame", "_level_with_floor"):
+    for name in ("_rerun_focal", "_define_map_frame", "_level_with_horizontals"):
         monkeypatch.setattr(api, name, lambda *a: None)
     monkeypatch.setattr(api, "_adjust_depth_scales", lambda c, p: None)
 

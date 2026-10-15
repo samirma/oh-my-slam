@@ -78,6 +78,7 @@ def test_centres_move_to_where_the_aligned_depth_puts_them(
     assert names[0] not in model.reposed and seen["free"] == set(truth) - {names[0]}
     assert seen["views"][names[5]].depth is None and seen["views"][names[6]].depth is not None
     assert not seen["kw"].get("refine_focal")  # the lens is held
+    assert seen["kw"]["balance_depth"]  # every depth stratum counts alike
     err = {n: float(np.linalg.norm(model.reposed[n].t - truth[n].t)) for n in model.reposed}
     assert float(np.median(list(err.values()))) < 0.01
     second = sorted(truth)[18:]  # the lower sweep: its drop is the depth's
@@ -113,7 +114,7 @@ def test_placing_a_new_multiview_map_aligns_its_depth_again_once_reposed(
     calls: list[str] = []
     model = FakeModel({"f000000.jpg": Pose.identity()}, method=method)
     monkeypatch.setattr(api, "_run_sfm", lambda c, v, cl, p: model)
-    for name in ("_rerun_focal", "_define_map_frame", "_level_with_floor"):
+    for name in ("_rerun_focal", "_define_map_frame", "_level_with_horizontals"):
         monkeypatch.setattr(api, name, lambda *a: None)
     monkeypatch.setattr(api, "_adjust_depth_scales", lambda c, p: None)
 

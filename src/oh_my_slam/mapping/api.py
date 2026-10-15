@@ -2180,7 +2180,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
 # placed through the short baselines, lay at its own height (p10-p90 4.7 cm; 2.0 cm after). A new map
 # posed by the multi-view fallback is therefore refined again on
 # its aligned depth (``_repose_on_aligned_depth``: the lens held, the first keyframe holding the
-# gauge, low-confidence keyframes by their rays only), and its depth aligned again to those poses;
+# gauge, low-confidence keyframes by their rays only, every depth stratum of a pair weighing alike:
+# ``panorama.depth_balance``), and its depth aligned again to those poses;
 # not a camera given one centre (``_one_centre``), whose centres the depth must not move.
 
 
@@ -2207,7 +2208,7 @@ def _repose_on_aligned_depth(ctx: UpdateContext, model: SfmModel) -> bool:
     with timing.stage(timing.Stage.POSE_REFINEMENT):
         pairs, gate = panorama.screen_pairs(panorama.verified_matches(db, set(views)), views,
                                             free, min_gate_deg=float(first))
-        fit = panorama.refine_poses(pairs, views, free)
+        fit = panorama.refine_poses(pairs, views, free, balance_depth=True)
     if not fit.pairs:
         return False
     fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
@@ -2501,38 +2502,68 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
              + ")")
 
 
-LEVEL_MAX_DEG = 10.0
+# A RANSAC plane of the floor band levelled the kitchen sequence (``b16``: a robot on a counter,
+# the floor 2-3 m off, seen at grazing angles by a third of the keyframes, fanned by a few degrees
+# between them) differently from build to build: the same keyframes tilted by 0.3-2.5° before it
+# came out up to 1.5° apart, as different hypotheses won among the floor's layers, and it left the
+# counter top 1.2-1.5° and the camera's pan axes up to 1.8° off the map's up. The mean of every
+# horizontal surface's normals (``mframe.horizontal_up``) does not depend on the tilt before (0.001°
+# over the same tilts): floor 0.95°, counter top 0.3°, the two sweeps' pan axes 1.2° and 0.7°.
+LEVEL_STEP = 4  # every 4th pixel of a keyframe's grid (both axes) gives a normal
 
 
-def _level_with_floor(ctx: UpdateContext, model: SfmModel, progress: Progress) -> None:
-    """Design step 8, second half: refine the map's up axis with the floor plane of the whole
-    (depth-aligned) map — the lowest well-supported horizontal surface — and rotate the map about
-    its origin so the floor normal is exactly +z."""
-    from oh_my_slam.core.geometry import angle_between_deg, ransac_plane, rotation_between
-    from oh_my_slam.mapping.objects import map_floor
+def _horizontal_normals(ctx: UpdateContext) -> NDArray[np.float64]:
+    """Map-frame surface normals of this update's confidently placed keyframes (depth as
+    aligned; ``reconstruction.pointcloud.depth_normals`` on every ``LEVEL_STEP``-th pixel of the
+    grid, both axes) where the depth is usable: away from depth edges and the image border."""
+    from oh_my_slam.reconstruction.pointcloud import depth_normals
 
-    allp, fz = map_floor(ctx, per_frame=4000)
-    if fz is None:
+    s = LEVEL_STEP
+    out = [np.zeros((0, 3))]
+    for nf in ctx.new:
+        if nf.record is None or nf.depth is None or nf.record.low_confidence:
+            continue
+        view = validity.keyframe_view(nf)
+        use = view.usable()[::s, ::s]
+        K = view.K  # of the grid: its every s-th pixel is pixel (u, v) of K / s
+        n = depth_normals(view.depth[::s, ::s], replace(K, fx=K.fx / s, fy=K.fy / s,
+                                                         cx=K.cx / s, cy=K.cy / s), use)
+        out.append(n[use].astype(np.float64) @ view.T_map_cam.R.T)
+    return np.concatenate(out)
+
+
+def _level_with_horizontals(ctx: UpdateContext, model: SfmModel, progress: Progress) -> None:
+    """Design step 8, second half: refine the map's up axis with its horizontal surfaces — floor,
+    counter and table tops, ceilings: the mean of their normals over the confidently placed
+    keyframes (``mframe.horizontal_up``) — and rotate the map about its origin so that it is
+    exactly +z (at most ``mframe.LEVEL_MAX_DEG``), the origin keyframe's view keeping its heading
+    (x: its view projected onto the ground, ``_define_map_frame``). The smallest rotation onto +z
+    alone turned it by 0.5-2.4° on the kitchen sequence, by as much as the up it started from
+    was off: the map's x axis then depended on the gravity estimates of the build."""
+    from oh_my_slam.core.geometry import angle_between_deg, rot_z, rotation_between
+
+    z = np.array([0.0, 0.0, 1.0])
+    up = mframe.horizontal_up(_horizontal_normals(ctx), z)
+    if up is None:
         return
-    band = allp[np.abs(allp[:, 2] - fz) < 0.15]
-    if len(band) < 500:
+    ang = angle_between_deg(up, z)
+    ctx.notes["levelling_deg"] = ang
+    if ang < 0.05:
         return
-    res = ransac_plane(band, 0.03, iterations=400, normal_prior=np.array([0.0, 0.0, 1.0]),
-                       max_angle_deg=LEVEL_MAX_DEG)
-    if res is None:
-        return
-    n = res[0]
-    ang = angle_between_deg(n, [0.0, 0.0, 1.0])
-    ctx.notes["floor_levelling_deg"] = ang
-    if ang < 0.2:
-        return
-    R = rotation_between(n, np.array([0.0, 0.0, 1.0]))
+    R = rotation_between(up, z)
+    first = next((f"{nf.kf.name}.jpg" for nf in ctx.new
+                  if f"{nf.kf.name}.jpg" in model.registered), None)
+    if first is not None:
+        before = model.pose(first).R[:, 2]
+        after = R @ before
+        if min(np.hypot(*before[:2]), np.hypot(*after[:2])) > 1e-6:  # not looking straight down
+            R = rot_z(np.arctan2(before[1], before[0]) - np.arctan2(after[1], after[0])) @ R
     model.transform(1.0, R, np.zeros(3))
     for nf in ctx.new:
         if nf.record is not None:
             T = nf.record.T_map_cam
             nf.record.T_map_cam = Pose(R @ T.R, R @ T.t)
-    progress(f"map levelled with the floor plane ({ang:.1f}° correction)")
+    progress(f"map levelled with its horizontal surfaces ({ang:.1f}° correction)")
 
 
 def _set_aligned(ctx: UpdateContext, nf: NewFrame, T: Pose, K: Intrinsics, model: SfmModel,
@@ -2753,7 +2784,7 @@ def _place(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) 
         # with each other, it does not know where up is (on examples/camera its floor leaned
         # 2.5° against the walls, and levelled with it, so did the walls)
         with stage(timing.Stage.MAP_FRAME):
-            _level_with_floor(ctx, model, progress)
+            _level_with_horizontals(ctx, model, progress)
     with stage(timing.Stage.DEPTH_ALIGNMENT):
         _adjust_depth_scales(ctx, progress)
     if not any(nf.record is not None for nf in new):

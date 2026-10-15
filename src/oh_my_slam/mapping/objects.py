@@ -1163,18 +1163,18 @@ def confirm(obj: MapObject) -> None:
 # the update
 
 
-def map_floor(ctx: Any, per_frame: int | None = None) -> tuple[NDArray[np.float64], float | None]:
-    """Map-frame grid points of this update's confidently placed keyframes (about ``per_frame``
-    of each, all when None) and the floor height among them: the lowest well-supported
-    horizontal surface. Maps accumulate stray points below the floor (see-through shelves,
-    reflections, drift), so up to 10 % of the points may lie beneath it (single images: 3 %)."""
+def map_floor(ctx: Any) -> tuple[NDArray[np.float64], float | None]:
+    """Map-frame grid points of this update's confidently placed keyframes and the floor height
+    among them: the lowest well-supported horizontal surface. Maps accumulate stray points below
+    the floor (see-through shelves, reflections, drift), so up to 10 % of the points may lie
+    beneath it (single images: 3 %)."""
     pts = []
     placed = [nf for nf in ctx.new if nf.record is not None and nf.depth is not None]
     for nf in sorted(placed, key=lambda nf: nf.record.order_key):
         if nf.record.low_confidence:
             continue
         p, _, _ = keyframe_view(nf).grid_points()
-        pts.append(p if per_frame is None else p[:: max(1, len(p) // per_frame)])
+        pts.append(p)
     if not pts:
         return np.zeros((0, 3)), None
     allp = np.concatenate(pts)

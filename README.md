@@ -851,8 +851,8 @@ and 5 → 422, 6 → 409, 3 → 503, 130 → 499, 1 and anything else → 500).
     update posed.
   * x is that camera's viewing direction projected onto the floor, and y = z × x.
   * Up is the confidence-weighted mean of the per-keyframe gravity estimates (GeoCalib refined by
-    the floor plane). The map is then levelled so that the floor normal of the whole map is +z
-    (corrections up to 10°).
+    the floor plane). The map is then levelled so that the mean normal of its horizontal surfaces
+    (floor, counter and table tops, ceilings) is +z (corrections up to 10°).
   * A map created from a single image uses that image's pose and gravity.
   * Later updates are expressed in the same frame. A rebuild (Update semantics) defines it
     again, by the same definition, from the poses it estimates again: map coordinates can
@@ -1731,10 +1731,16 @@ pixels, so its results are unchanged.
       its median depth), `stats.depth_exponent` (1 + b), `stats.depth_field` (the field's 4 × 3
       nodes) and `stats.depth_bend` (the field's largest factor away from 1), every adjustment's
       composed.
-   4. For a new map, the map is levelled with the floor plane — before the global adjustment,
-      on the depth as aligned: the adjustment bends the keyframes to agree with each other, it
-      does not know where up is (on `examples/camera` its floor leaned 2.5° against the walls,
-      and levelled with it, so did the walls).
+   4. For a new map, the map is levelled with its horizontal surfaces — before the global
+      adjustment, on the depth as aligned: the adjustment bends the keyframes to agree with each
+      other, it does not know where up is (on `examples/camera` its floor leaned 2.5° against the
+      walls, and levelled with it, so did the walls). Up is the mean of the surface normals of the
+      confidently placed keyframes (every 4th pixel, away from depth edges) within 10° of the
+      current up, then within 5° of that mean, five times (`mapping.frame.horizontal_up`); a
+      ceiling counts like a floor. Unlike a RANSAC plane of the floor band, which levelled the
+      kitchen sequence's same keyframes up to 1.5° apart depending on their tilt before (the
+      floor seen 2-3 m off at grazing angles, fanned between keyframes), it does not depend on
+      the tilt before, and it weighs the counter top the camera looks at as much as its pixels.
 6. **Integration.** The update applies latest wins, updates the objects (the fused surface
    tells pieces of one horizontal surface: it is fused only in the boxes where they ask for it),
    applies latest wins within the update in input order (see *Later wins*), fuses the cloud once

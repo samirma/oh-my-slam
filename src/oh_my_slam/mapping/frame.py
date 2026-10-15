@@ -99,6 +99,33 @@ def world_up(poses: dict[str, Pose], frames: list[FrameDepth]) -> NDArray[np.flo
     return mean_up(ups, ws)
 
 
+# The up of a map's horizontal surfaces (``horizontal_up``): the normals within LEVEL_MAX_DEG of the
+# current up are averaged, then those within LEVEL_CONE_DEG of that mean, LEVEL_PASSES times (it
+# stays put after two or three); fewer than LEVEL_MIN_NORMALS of them: none.
+LEVEL_MAX_DEG = 10.0
+LEVEL_CONE_DEG = 5.0
+LEVEL_PASSES = 5
+LEVEL_MIN_NORMALS = 500
+
+
+def horizontal_up(normals: NDArray[Any], up: NDArray[Any]) -> NDArray[np.float64] | None:
+    """The mean direction of the surface normals ``normals`` (N, 3; unit) that are horizontal
+    surfaces' — within ``LEVEL_MAX_DEG`` of ``up`` either way (a ceiling faces down) — refined
+    within ``LEVEL_CONE_DEG`` of itself (``LEVEL_PASSES``); None with fewer than
+    ``LEVEL_MIN_NORMALS`` of them. It depends on the surfaces only, not on ``up`` within the cone:
+    every pass averages the same pixels."""
+    n = np.asarray(normals, np.float64).reshape(-1, 3)
+    u = np.asarray(up, np.float64) / np.linalg.norm(up)
+    for cone in (LEVEL_MAX_DEG,) + (LEVEL_CONE_DEG,) * LEVEL_PASSES:
+        c = n @ u
+        near = np.abs(c) >= np.cos(np.radians(cone))
+        if int(near.sum()) < LEVEL_MIN_NORMALS:
+            return None
+        m = (n[near] * np.sign(c[near])[:, None]).sum(axis=0)
+        u = m / np.linalg.norm(m)
+    return u
+
+
 def map_transform(first_pose: Pose, up_world: NDArray[Any], scale: float) -> Sim3:
     """Similarity SfM world → map (see module docstring)."""
     z = np.asarray(up_world, np.float64)
