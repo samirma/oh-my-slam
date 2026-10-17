@@ -241,8 +241,10 @@ class Workspace:
 
     def map_summary(self, name: str, full: bool = False) -> dict[str, Any]:
         """A map's summary figures, read from its own metadata (``map.json``, the frame and object
-        records) through the read-only map store; ``full`` adds the whole ``map.json``."""
-        from oh_my_slam.mapping import store
+        records) through the read-only map store; ``full`` adds the whole ``map.json``. ``objects``
+        counts the objects its scene lists (every export of the map has these), ``candidates`` the
+        detections it keeps unconfirmed and never emits (both None without object records)."""
+        from oh_my_slam.mapping import export, store
 
         reader = store.MapReader(self.map_dir(name))
         meta = reader.meta
@@ -253,10 +255,8 @@ class Workspace:
             else:  # the only other JSON values: a list or an object
                 summary[f"{k}_count"] = len(v)
         summary["frames"] = len(reader.frames)
-        if reader.exists(store.OBJECTS_JSON):
-            objs = reader.read_json(store.OBJECTS_JSON)
-            listed = objs.get("objects") if isinstance(objs, dict) else objs
-            summary["objects"] = len(listed) if isinstance(listed, list | dict) else None
+        counts = export.object_counts(reader)
+        summary["objects"], summary["candidates"] = counts if counts is not None else (None, None)
         updates = meta.get("updates") or []
         if updates:
             last = updates[-1]

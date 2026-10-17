@@ -91,6 +91,37 @@ def test_grounding_only_where_the_evidence_supports_it() -> None:
     assert b.size[2] == pytest.approx(0.3, abs=0.03)
 
 
+def test_a_box_rests_on_the_support_beneath_unless_a_sliver_or_already_below() -> None:
+    rng = np.random.default_rng(2)
+    top_of_cup = slab(rng, (0.12, 0.12, 0.09), (0, 0, 1.0))  # its lower 7 cm never seen
+    b = fit_object_obb(top_of_cup, "cup", UP, None, support_level=0.885)
+    assert bottom(b) == pytest.approx(0.885, abs=1e-6) and b.size[2] == pytest.approx(0.16, abs=0.01)
+    # a 2 cm sliver of what would be a 20 cm box: kept as seen
+    b = fit_object_obb(slab(rng, (0.1, 0.1, 0.02), (0, 0, 1.1)), "cup", UP, None,
+                       support_level=0.9)
+    assert bottom(b) > 1.05
+    # a bowl whose points reach below the counter: not raised
+    b = fit_object_obb(slab(rng, (0.2, 0.2, 0.13), (0, 0, 0.93)), "bowl", UP, None,
+                       support_level=0.9)
+    assert bottom(b) < 0.9
+    # a table grounded on the floor stays there
+    b = fit_object_obb(slab(rng, (1.0, 0.6, 0.04), (0, 0, 0.73)), "dining table", UP, 0.0,
+                       support_level=0.3)
+    assert bottom(b) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_support_an_object_rests_on_is_stored() -> None:
+    rng = np.random.default_rng(3)
+    pts = slab(rng, (0.1, 0.1, 0.1), (0, 0, 1.0))
+    o = map_object(1, "cup", pts, [3, 7])
+    assert o.to_dict()["support_z"] is None
+    o.support = 0.9
+    back = MapObject.from_dict(o.to_dict(), o.points)
+    assert back.support == 0.9
+    o.absorb(map_object(2, "cup", pts, [9]))
+    assert o.support is None  # found again for the merged evidence
+
+
 # --- confirmation --------------------------------------------------------------------------------
 
 
@@ -119,6 +150,21 @@ def test_confirmation_needs_two_reliable_keyframes_when_others_had_it_in_view() 
     legacy.views_in_frustum = 9
     mo.confirm(legacy)
     assert legacy.confirmed
+
+
+def test_detections_cut_off_by_the_border_confirm_when_twice_as_many_agree() -> None:
+    """A tomato at the foot of every view that detected it: 4 border detections that place it
+    alike confirm it, 3 do not, nor 4 that monocular depth scattered along the rays."""
+    rng = np.random.default_rng(4)
+    pts = slab(rng, (0.1, 0.1, 0.08), (0, 0, 2.0))
+    for frames, spread, confirmed in (([1, 2, 3, 4], 0.0, True), ([1, 2, 3], 0.0, False),
+                                      ([1, 2, 3, 4], 0.6, False)):
+        shots = [sighting(f, pts + [0.0, 0.0, spread * k], border=0.9)
+                 for k, f in enumerate(frames)]
+        o = map_object(5, "tomato", pts, frames, sightings=shots)
+        o.views_in_frustum = 9
+        mo.confirm(o)
+        assert o.confirmed == confirmed
 
 
 def test_views_count_keyframes_with_the_object_in_view_ignoring_occlusion() -> None:

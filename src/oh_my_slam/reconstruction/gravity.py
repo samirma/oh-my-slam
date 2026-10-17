@@ -86,6 +86,38 @@ def floor_candidate_height(h: NDArray[Any], bin_m: float = 0.03, min_support: fl
     return None
 
 
+# The floor's own thickness (``floor_band``): the heights of the floor's points spread about its
+# level by the depth noise where the floor is seen (a level camera sees it at grazing angles), its
+# unevenness and what the monocular depth bends; the half width at half maximum of their peak, on
+# a histogram of FLOOR_BAND_BINS bins per bin of the floor finder, is FWHM_SIGMA standard
+# deviations, and a point within FLOOR_BAND_SIGMAS of them of the level lies on the floor. On a
+# robot's rendered room seen from 0.44 m: 1.5 cm, the band ±4.4 cm.
+FLOOR_BAND_SIGMAS = 3.0
+FWHM_SIGMA = float(np.sqrt(2.0 * np.log(2.0)))  # half width at half maximum of a normal law, in sd
+FLOOR_BAND_BINS = 6
+
+
+def floor_band(h: NDArray[Any], level: float, bin_m: float = 0.03, margin: float = 0.12
+               ) -> tuple[float, float]:
+    """(level, half thickness) of the floor among the heights ``h`` (along up) whose floor the
+    finder placed at ``level`` (``floor_candidate_height`` with ``bin_m`` and ``margin``): the
+    mode of the floor's peak, nearest ``level``, and ``FLOOR_BAND_SIGMAS`` standard deviations of
+    it, measured from its half width at half maximum within ``margin`` of ``level``."""
+    fine = bin_m / FLOOR_BAND_BINS
+    edges = level + fine * np.arange(-round(margin / fine), round(margin / fine) + 1)
+    counts = np.histogram(np.asarray(h, np.float64), bins=edges)[0].astype(np.float64)
+    smooth = np.convolve(counts, np.ones(3) / 3.0, mode="same")
+    centers = (edges[:-1] + edges[1:]) / 2
+    near = np.flatnonzero(np.abs(centers - level) <= bin_m)
+    k = int(near[np.argmax(smooth[near])])
+    below = np.flatnonzero(smooth[:k] <= smooth[k] / 2)
+    above = np.flatnonzero(smooth[k + 1:] <= smooth[k] / 2)
+    lo = int(below[-1]) + 1 if len(below) else 0
+    hi = k + int(above[0]) if len(above) else len(smooth) - 1
+    hwhm = (hi - lo + 1) * fine / 2
+    return float(centers[k]), FLOOR_BAND_SIGMAS * hwhm / FWHM_SIGMA
+
+
 def refine_with_floor(
     points_cam: NDArray[Any],
     prior: GravityEstimate,

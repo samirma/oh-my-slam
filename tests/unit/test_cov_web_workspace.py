@@ -86,7 +86,12 @@ def test_the_maps_are_listed_with_their_own_metadata(ws: Workspace) -> None:
                               "timings": {"total_s": 12.5}},
                              {"id": 2, "at": "t2", "kind": "extend", "frames_added": None}]})
     (root / store.MAP_JSON).write_text(json.dumps(meta))
-    (root / store.OBJECTS_JSON).write_text(json.dumps({"objects": [{"id": 1}, {"id": 2}]}))
+    box = {"center": [0, 0, 0], "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "size": [1, 1, 1]}
+    records = [{"id": 1, "label": "chair", "obb": box, "confirmed": True},  # listed
+               {"id": 2, "label": "cup", "obb": box, "published": True},  # listed: published
+               {"id": 3, "label": "cup", "obb": box, "confirmed": False},  # a candidate
+               {"id": 4, "label": "cup", "obb": None, "confirmed": True}]  # no box: a candidate
+    (root / store.OBJECTS_JSON).write_text(json.dumps({"objects": records}))
     plain = minimal_map(ws.maps / "a")
     (plain / store.OBJECTS_JSON).write_text(json.dumps("not a list"))
     (ws.maps / ".staging").mkdir()
@@ -98,9 +103,12 @@ def test_the_maps_are_listed_with_their_own_metadata(ws: Workspace) -> None:
     assert [m["name"] for m in maps] == ["a", "b"]
     a, b = maps
     assert a["path"] == "maps/a" and a["frames"] == 0 and a["objects"] is None
+    assert a["candidates"] is None
     assert a["update_count"] == 1 and "last_update" not in a  # no update history recorded
     assert b["title"] == "kitchen" and b["scale"] == 1.5 and b["up_count"] == 3 and b["ids_count"] == 1
-    assert b["updates_count"] == 2 and b["objects"] == 2
+    # the objects its scene lists; the candidates it never emits apart (QA-1-4: 20 counted, 16
+    # exported)
+    assert b["updates_count"] == 2 and b["objects"] == 2 and b["candidates"] == 2
     assert b["last_update"] == {"id": 2, "at": "t2", "kind": "extend", "frames_added": 0,
                                 "total_s": None}
     assert "meta" not in b and ws.map_summary("b", full=True)["meta"] == meta

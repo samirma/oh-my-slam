@@ -107,7 +107,7 @@ Semantics (spec §2.3):
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,6 +122,7 @@ from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.store import OBJECTS_JSON, frame_file, load_valid
 from oh_my_slam.mapping.validity import (
     BORDER,
+    GRID,
     MIN_OBSERVATIONS,
     POSE_MAX_RESIDUAL_DEG,
     View,
@@ -132,7 +133,7 @@ from oh_my_slam.mapping.validity import (
     well_registered,
 )
 from oh_my_slam.reconstruction.depth import DepthCorrection
-from oh_my_slam.reconstruction.gravity import floor_candidate_height
+from oh_my_slam.reconstruction.gravity import floor_band, floor_candidate_height
 from oh_my_slam.segmentation.api import (
     OBB,
     LiftedInstance,
@@ -142,6 +143,7 @@ from oh_my_slam.segmentation.api import (
     join_instances,
     lift_detections,
     obb_iou_upright,
+    on_the_floor,
     split_surface,
     surface_label,
     trim_support,
@@ -158,6 +160,12 @@ CENTROID_GATE = 1.5
 # downward view, labelled "carpet" and placed inside the counter).
 CONFIRM_DETECTIONS = 2
 BORDER_EVIDENCE = 0.5  # largest share of a reliable detection's mask in the border band
+# Detections mostly in the border band are weak one by one, but an object cut off by the border in
+# every view that this many keyframes place alike (their bounds overlap within the depth noise:
+# ``_agreeing``) is there: a tomato at the foot of a robot's downward views (``b16``), cut off in
+# all 4 keyframes that detected it, 2.7 cm apart. The phantoms the band keeps out are one-offs.
+# A distant cup at the top of 3 views of that sequence stays a candidate.
+CONFIRM_AGREEING = 2 * CONFIRM_DETECTIONS  # a detection in the band counts half
 IN_VIEW_SHARE = 0.5  # a keyframe has an object in view when this share of its points projects in
 VIEW_SAMPLES = 200  # points per object for the in-view test
 MERGE_OVERLAP = 0.5
@@ -430,12 +438,14 @@ def canonical_sources(points: NDArray[Any], sources: NDArray[Any]
 SRC_RELIABLE = 1
 SRC_BORDER = 2
 SRC_LOW_CONFIDENCE = 4
-SRC_ANY = SRC_RELIABLE | SRC_BORDER | SRC_LOW_CONFIDENCE
+SRC_THROUGH = 8  # a detection whose points lie behind its mask's outline (``Lifted.through``)
+SRC_ANY = SRC_RELIABLE | SRC_BORDER | SRC_LOW_CONFIDENCE | SRC_THROUGH
 
 
-def source_of(reliable: bool, confident: bool) -> int:
+def source_of(reliable: bool, confident: bool, through: bool = False) -> int:
     """The ``SRC_*`` bit of a detection's points."""
-    return SRC_LOW_CONFIDENCE if not confident else SRC_RELIABLE if reliable else SRC_BORDER
+    return (SRC_LOW_CONFIDENCE if not confident else SRC_THROUGH if through
+            else SRC_RELIABLE if reliable else SRC_BORDER)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -446,8 +456,9 @@ def source_of(reliable: bool, confident: bool) -> int:
 class Sighting:
     """Summary of one detection of an object: its keyframe, lifted point count, the share of its
     mask in the image-border band, the centroid and robust (2-98 %) bounds of its points in map
-    coordinates, and whether its keyframe was placed confidently (not ``low_confidence``: a
-    reliable depth scale and a pose the matches support)."""
+    coordinates, whether its keyframe was placed confidently (not ``low_confidence``: a
+    reliable depth scale and a pose the matches support), and whether its points lie behind its
+    mask's outline (``through``: what the object is seen in front of, ``Lifted.through``)."""
 
     frame: int
     points: int
@@ -456,6 +467,7 @@ class Sighting:
     lo: tuple[float, float, float]
     hi: tuple[float, float, float]
     confident: bool = True
+    through: bool = False
 
     @property
     def reliable(self) -> bool:
@@ -463,18 +475,18 @@ class Sighting:
 
     def key(self) -> tuple[Any, ...]:
         return (self.frame, self.points, self.centroid, self.lo, self.hi, self.border,
-                self.confident)
+                self.confident, self.through)
 
     def to_list(self) -> list[float]:
         return [self.frame, self.points, self.border, *self.centroid, *self.lo, *self.hi,
-                float(self.confident)]
+                float(self.confident), float(self.through)]
 
     @staticmethod
     def from_list(v: list[float]) -> Sighting:
         def t(x: list[float]) -> tuple[float, float, float]:
             return (float(x[0]), float(x[1]), float(x[2]))
         return Sighting(int(v[0]), int(v[1]), float(v[2]), t(v[3:6]), t(v[6:9]), t(v[9:12]),
-                        bool(v[12]) if len(v) > 12 else True)
+                        bool(v[12]) if len(v) > 12 else True, bool(v[13]) if len(v) > 13 else False)
 
 
 @dataclass
@@ -502,6 +514,8 @@ class MapObject:
     # SRC_* bits per point (None: not recorded — a map written before sources were, or points
     # given directly — every point counts as a source of every kind)
     sources: NDArray[np.uint8] | None = None
+    # the height of the surface its box rests on (``support_level``; None: the box is its points')
+    support: float | None = None
     _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def memo(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -591,7 +605,8 @@ class MapObject:
         self._add_sightings([ob.sighting for ob in obs])
 
     def absorb(self, gone: MapObject) -> None:
-        """Merge another object's evidence into this one."""
+        """Merge another object's evidence into this one (its support is found again)."""
+        self.support = None
         for lab, v in gone.label_votes.items():
             self.label_votes[lab] = self.label_votes.get(lab, 0.0) + v
         self.label = max(self.label_votes.items(), key=lambda kv: (kv[1], kv[0]))[0]
@@ -622,6 +637,7 @@ class MapObject:
             "cloud_points": self.cloud_points, "cloud_min_points": self.cloud_min,
             "point_file": points_file(self.id),
             "sightings": [s.to_list() for s in self.sightings],
+            "support_z": self.support,
         }
 
     @staticmethod
@@ -648,6 +664,7 @@ class MapObject:
                              key=Sighting.key),
             cloud_points=None if cloud is None else int(cloud),
             cloud_min=None if least is None else int(least),
+            support=None if d.get("support_z") is None else float(d["support_z"]),
         )
 
     @property
@@ -701,12 +718,13 @@ class Observation:
         def t(x: NDArray[Any]) -> tuple[float, float, float]:
             return (float(x[0]), float(x[1]), float(x[2]))
         return Sighting(self.frame, len(self.points), border_share(self.inst.mask), t(c), t(lo),
-                        t(hi), self.confident)
+                        t(hi), self.confident, self.inst.lifted.through)
 
     @property
     def source(self) -> int:
         """The ``SRC_*`` bit of its points."""
-        return source_of(border_share(self.inst.mask) <= BORDER_EVIDENCE, self.confident)
+        return source_of(border_share(self.inst.mask) <= BORDER_EVIDENCE, self.confident,
+                         self.inst.lifted.through)
 
     @property
     def label(self) -> str:
@@ -816,8 +834,15 @@ class ObjectState:
         written before cloud counts were recorded). A published object stays published until
         latest wins removes it."""
         return [o.scene_object() for o in sorted(self.objects, key=lambda o: o.id)
-                if o.obb is not None and (o.published or (
-                    o.confirmed and _enough_cloud(o.cloud_points, o.cloud_min)))]
+                if exportable(o)]
+
+
+def exportable(o: MapObject) -> bool:
+    """Whether the map's scene lists the object (``ObjectState.exported``): it has a box, and an
+    earlier update published it or it is confirmed with enough points in the map cloud. Every
+    other object is a candidate, kept in the map's state and never emitted."""
+    return o.obb is not None and (o.published or (
+        o.confirmed and _enough_cloud(o.cloud_points, o.cloud_min)))
 
 
 def _enough_cloud(cloud: int | None, least: int | None) -> bool:
@@ -1078,15 +1103,21 @@ def shaping_sightings(obj: MapObject) -> list[Sighting]:
     """The sightings that may shape an object's box: those of confidently placed keyframes when
     at least ``SHAPE_MIN`` of them detected it (a keyframe of low confidence — an unreliable depth
     scale, or a pose the matches do not support — places the object offset as a whole: a wallet
-    placed onto the neighbouring item; the map cloud leaves these keyframes out too), and of
-    these the reliable ones (``Sighting.reliable``) when they are at least ``SHAPE_MIN`` and a
-    strict majority: a detection mostly in the image-border band is cut off and its monocular
-    depth unreliable, as for confirmation. The others still count as evidence (label, keyframes,
-    confirmation); they shape the box only while nothing better saw the object."""
+    placed onto the neighbouring item; the map cloud leaves these keyframes out too); of these
+    the ones whose points are the object's own surface when at least ``SHAPE_MIN`` are (not
+    ``Sighting.through``: a chair back's mask that holds only the wall seen through it places the
+    chair on the wall, however many keyframes saw it so); and of these the reliable ones
+    (``Sighting.reliable``) when they are at least ``SHAPE_MIN`` and a strict majority: a
+    detection mostly in the image-border band is cut off and its monocular depth unreliable, as
+    for confirmation. The others still count as evidence (label, keyframes, confirmation); they
+    shape the box only while nothing better saw the object."""
     s = obj.sightings
     confident = [x for x in s if x.confident]
     if len(confident) >= SHAPE_MIN:
         s = confident
+    opaque = [x for x in s if not x.through]
+    if len(opaque) >= SHAPE_MIN:
+        s = opaque
     reliable = [x for x in s if x.reliable]
     if len(reliable) >= SHAPE_MIN and 2 * len(reliable) > len(s):
         s = reliable
@@ -1130,7 +1161,7 @@ def fit_points(obj: MapObject) -> NDArray[np.float32]:
         if len(shaping) < len(s):
             allowed = 0
             for x in shaping:
-                allowed |= source_of(x.reliable, x.confident)
+                allowed |= source_of(x.reliable, x.confident, x.through)
             ok = (obj.point_sources() & allowed) != 0
         if len(keep) < len(shaping):
             lo = np.min([x.lo for x in keep], axis=0) - CONSENSUS_MARGIN
@@ -1147,16 +1178,167 @@ def fit_points(obj: MapObject) -> NDArray[np.float32]:
 def refit(obj: MapObject, floor_z: float | None) -> None:
     if len(obj.points) < 10:
         return
-    obj.obb = fit_object_obb(fit_points(obj), obj.label, UP, floor_z)
+    obj.obb = fit_object_obb(fit_points(obj), obj.label, UP, floor_z, obj.support)
+
+
+# Resting on a support (``support_level``). An object whose lower part no keyframe saw — cut off
+# by the bottom of every image that detected it, or hidden behind its own front — has the box of
+# its visible top only: a cup at the foot of a robot's downward views (``b16``, cut off in all 5
+# of them) 6.5 cm above the counter it stands on, a tomato 3.5 cm. Its detecting keyframes see the
+# surface around its foot: the highest level of their points on horizontal surfaces
+# (SUPPORT_TILT_DEG) around its footprint (within SUPPORT_MARGIN of it; SUPPORT_BIN levels with
+# their neighbours, the highest holding SUPPORT_PEAK of the fullest one's points and at least
+# SUPPORT_MIN_POINTS / 2), at most SUPPORT_REACH below the box, is the support: a wall below a
+# power outlet is none. Where none
+# of them saw the space between the box and that level empty (SUPPORT_SEEN of the samples there in
+# its image seen through by more than the depth noise, SUPPORT_NOISE), the box rests on it
+# (``segmentation.api.fit_object_obb``: not from a sliver of the box it would be). Below an object
+# that hangs or overhangs, its keyframes see the space empty (a shelf of ``b16``: 67-75 %
+# of the samples seen through by the keyframes that see there). The top of a neighbouring object
+# is not a support: points inside another object's box, or within SUPPORT_CLEAR of it, are left
+# out, unless that object is the one beneath (``_beneath``: a counter top, a plate under a cup).
+# A tomato 5.5 cm from a plate on ``b16`` rested on the plate's rim, 3.3 cm above the counter.
+# Nor is a ledge on one side of it a support (a partition's edge, a sill, the walkway in front of
+# a shop window): the level must surround the foot (``_around``: SUPPORT_SIDE_POINTS of its
+# points in front of two opposite edges, or in three of the four quadrants the box's axes divide
+# the ring into), as every confident keyframe that sees around it saw it within SUPPORT_AROUND of
+# the footprint (wider than the search: neighbours and occlusion often leave the foot's nearest
+# surroundings bare on a side). On ``examples/camera`` a misplaced cup on a wall rested 8.5 cm
+# lower on a partition's edge beside it; of the 64 supports there and on ``b16``,
+# ``office_sequence`` and ``ainex-captures``, 52 stand, the 12 that go one-sided.
+SUPPORT_REACH = 0.3
+SUPPORT_MARGIN = 0.15
+SUPPORT_TILT_DEG = 30.0  # a support is a horizontal surface: its points' normals this near up
+SUPPORT_CLEAR = 0.02  # metres around another object's box whose points are not a support
+SUPPORT_SIDE_POINTS = 3  # points of the support level that show it on a side of the foot
+SUPPORT_AROUND = 0.25  # metres beyond the footprint in which the level must surround the foot
+SUPPORT_BIN = 0.01
+SUPPORT_PEAK = 0.25
+SUPPORT_MIN_POINTS = 20
+SUPPORT_SEEN = 0.3
+SUPPORT_NOISE = (0.01, 0.015)  # metres, share of the depth
+
+
+def _beneath(other: OBB, box: OBB) -> bool:
+    """Whether ``other`` is what ``box`` stands on: its footprint holds ``box``'s centre and its
+    top is not above ``box``'s bottom (by more than ``SUPPORT_CLEAR``)."""
+    at = np.abs((box.center[:2] - other.center[:2]) @ other.R[:2, :2])
+    return bool(np.all(at <= other.size[:2] / 2)) and (
+        other.center[2] + other.size[2] / 2 <= box.center[2] - box.size[2] / 2 + SUPPORT_CLEAR)
+
+
+def _near_box(pts: NDArray[Any], other: OBB) -> NDArray[np.bool_]:
+    """Points inside ``other``'s box or within ``SUPPORT_CLEAR`` of it."""
+    at = np.abs((pts - other.center) @ other.R)
+    return np.asarray(np.all(at <= other.size / 2 + SUPPORT_CLEAR, axis=1))
+
+
+def _around(pts: NDArray[Any], box: OBB) -> bool:
+    """Whether points around ``box``'s footprint surround it: at least ``SUPPORT_SIDE_POINTS``
+    in front of two opposite edges (within their span), or in three of the four quadrants its
+    axes divide the ring into. A ledge along one edge, however long, is in front of that edge
+    and in two quadrants only."""
+    at = (pts[:, :2] - box.center[:2]) @ box.R[:2, :2]
+    half = box.size[:2] / 2
+    beyond = [int(((at[:, k] * sign > half[k]) & (np.abs(at[:, 1 - k]) <= half[1 - k])).sum())
+              >= SUPPORT_SIDE_POINTS for k in (0, 1) for sign in (1.0, -1.0)]
+    quadrants = sum(int(((at[:, 0] * sx > 0) & (at[:, 1] * sy > 0)).sum()) >= SUPPORT_SIDE_POINTS
+                    for sx in (1.0, -1.0) for sy in (1.0, -1.0))
+    return (beyond[0] and beyond[1]) or (beyond[2] and beyond[3]) or quadrants >= 3
+
+
+def _sees_ring(ring: NDArray[Any], rec: Any) -> bool:
+    """Whether keyframe ``rec`` has any of the map points ``ring`` in front of it and inside its
+    grid."""
+    uv, z = project(rec.T_map_cam.inverse().apply(ring), rec.K_grid.K())
+    with np.errstate(invalid="ignore"):
+        return bool(((z > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < rec.K_grid.width)
+                     & (uv[:, 1] >= 0) & (uv[:, 1] < rec.K_grid.height)).any())
+
+
+def support_level(obj: MapObject, views: _Views, others: Iterable[OBB] = ()) -> float | None:
+    """The height of the surface the object's box rests on (see ``SUPPORT_*``), from the
+    confidently placed keyframes that see around its foot; None when there is none, when it does
+    not surround the foot (``_around``: a ledge beside it), or when the object's detecting
+    keyframes saw the space between the box and it empty. ``others``: the boxes of the map's other
+    objects (candidates too): their points are not its support, unless one is what it stands on
+    (``_beneath``)."""
+    box = obj.obb
+    frames = [(f, v) for f in obj.frames if (v := views.get(f)) is not None
+              and not getattr(views.records.get(f), "low_confidence", False)]
+    if box is None or not frames:
+        return None
+    bottom = float(box.center[2] - box.size[2] / 2)
+    neighbours = [other for other in others if not _beneath(other, box)]
+
+    def ring(pts: NDArray[Any], margin: float) -> NDArray[np.bool_]:
+        """Points within ``margin`` of the footprint, outside it (not its own points, which its
+        box leaves 2 % of below) and not near a neighbour (a plate's rim beside a tomato)."""
+        at = np.abs((pts[:, :2] - box.center[:2]) @ box.R[:2, :2])
+        out = np.any(at > box.size[:2] / 2, axis=1) & np.all(at <= box.size[:2] / 2 + margin,
+                                                              axis=1)
+        for other in neighbours:
+            out &= ~_near_box(pts, other)
+        return out
+
+    pts = np.concatenate([views.flat_points(f) for f, _ in frames])
+    under = ring(pts, SUPPORT_MARGIN) & (pts[:, 2] < bottom - SUPPORT_BIN / 2) & (
+        pts[:, 2] > bottom - SUPPORT_REACH)
+    if under.sum() < SUPPORT_MIN_POINTS:
+        return None
+    z = pts[under, 2]
+    level = np.floor((z - (bottom - SUPPORT_REACH)) / SUPPORT_BIN).astype(np.int64)
+    # each level with its neighbours: keyframes place one surface a centimetre or two apart
+    counts = np.convolve(np.bincount(level), np.ones(3), "same")
+    full = np.flatnonzero(counts >= max(SUPPORT_MIN_POINTS / 2, SUPPORT_PEAK * counts.max()))
+    if not len(full):  # points scattered over the heights: no surface
+        return None
+    support = float(np.median(z[np.abs(level - full[-1]) <= 1]))
+    # a ledge beside it (a partition's edge) is no support: the level must surround the foot, as
+    # every keyframe that sees around it saw it, in a wider ring (neighbours and occlusion often
+    # leave its nearest surroundings bare on a side)
+    grown = box.size[:2] / 2 + SUPPORT_AROUND
+    corners = np.array([box.center + box.R @ np.array([a * grown[0], b * grown[1], 0.0])
+                        for a in (-1.0, 0.0, 1.0) for b in (-1.0, 0.0, 1.0)])
+    corners[:, 2] = support
+    seeing = sorted({f for f, _ in frames} | {
+        i for i, rec in views.records.items()
+        if not getattr(rec, "low_confidence", False) and _sees_ring(corners, rec)})
+    wide = np.concatenate([views.flat_points(f) for f in seeing])
+    if not _around(wide[ring(wide, SUPPORT_AROUND)
+                        & (np.abs(wide[:, 2] - support) <= 1.5 * SUPPORT_BIN)], box):
+        return None
+    # the space between: a 3 x 3 column grid over the footprint's middle half, 4 heights
+    side = np.linspace(-0.25, 0.25, 3)
+    cols = np.array([box.center + box.R @ (np.array([a, b, 0.0]) * box.size)
+                     for a in side for b in side])[:, :2]
+    heights = np.linspace(support + SUPPORT_BIN, bottom - SUPPORT_BIN / 2, 4)
+    samples = np.array([[x, y, h] for h in heights for x, y in cols])
+    for _, v in frames:
+        uv, d = project((samples - v.T_map_cam.t) @ v.T_map_cam.R, v.K.K())
+        h, w = v.depth.shape
+        u = np.rint(np.nan_to_num(uv[:, 0], nan=-1.0)).astype(np.int64)
+        r = np.rint(np.nan_to_num(uv[:, 1], nan=-1.0)).astype(np.int64)
+        inside = (d > 0) & (u >= 0) & (u < w) & (r >= 0) & (r < h)
+        seen = v.depth[r[inside], u[inside]].astype(np.float64)
+        dz = d[inside]
+        through = (seen > 0) & (seen > dz + np.maximum(SUPPORT_NOISE[0], SUPPORT_NOISE[1] * dz))
+        if inside.any() and through.sum() >= SUPPORT_SEEN * inside.sum():
+            return None
+    return support
 
 
 def confirm(obj: MapObject) -> None:
     """Confirmed when reliable detections (``MapObject.reliable_frames``) come from at least
     ``CONFIRM_DETECTIONS`` keyframes, or from one when no other keyframe of the map has the object
-    in view (``views_in_frustum`` <= 1: a single image, or a place only one keyframe saw). A
-    published object stays confirmed whatever the evidence (only latest wins removes it)."""
+    in view (``views_in_frustum`` <= 1: a single image, or a place only one keyframe saw), or
+    when detections of ``CONFIRM_AGREEING`` keyframes, reliable or not, place it alike
+    (``_agreeing``). A published object stays confirmed whatever the evidence (only latest wins
+    removes it)."""
     need = CONFIRM_DETECTIONS if obj.views_in_frustum > 1 else 1
-    obj.confirmed = obj.published or len(obj.reliable_frames()) >= need
+    agreeing = {s.frame for s in _agreeing(obj.sightings, obj.obs_depth)}
+    obj.confirmed = (obj.published or len(obj.reliable_frames()) >= need
+                     or len(agreeing) >= CONFIRM_AGREEING)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1229,7 +1411,7 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
                 w = T.t + _factor_at(corr, T, K, v) * (np.asarray(v, np.float64) - T.t)
                 return (float(w[0]), float(w[1]), float(w[2]))
             out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
-                                moved_to(s.lo), moved_to(s.hi), s.confident))
+                                moved_to(s.lo), moved_to(s.hi), s.confident, s.through))
         w = np.asarray(weights)
         c_obj = float(np.exp(np.sum(w * np.asarray(logs)) / np.sum(w)))
         C_obj = np.sum(np.asarray(centres) * w[:, None], axis=0) / np.sum(w)
@@ -1238,6 +1420,8 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
                 C_obj + c_obj * (o.points.astype(np.float64) - C_obj), o.point_sources())
         o.obs_depth *= c_obj
         o.sightings = sorted(out, key=Sighting.key)
+        if o.support is not None:  # the surface it rests on moves with it
+            o.support = float(C_obj[2] + c_obj * (o.support - C_obj[2]))
         refit(o, state.floor_z)
         moved.add(o.id)
     return moved
@@ -1271,10 +1455,15 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     state = load_state(tx.current, ctx.meta)
     uid = ctx.update_id
     moved = rescale_objects(state, getattr(ctx, "rescaled", {}) or {}, records)
-    _, fz = map_floor(ctx)
+    grid, fz = map_floor(ctx)
     if state.floor_z is None or (fz is not None and not ctx.old_frames):
         state.floor_z = fz
     ctx.meta["floor_z"] = state.floor_z
+    # the floor where this update's keyframes see it: its level and thickness (``floor_band``),
+    # against which a detection is the floor named as an object (``on_the_floor``)
+    ground = None if state.floor_z is None or not len(grid) else floor_band(grid[:, 2],
+                                                                           state.floor_z)
+    floor_named = 0
 
     # 1. every instance of the update, lifted into the map (without the support its mask bled
     #    onto: ``trim_support``), with the number of its detection:
@@ -1310,6 +1499,10 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         insts = [trim_support(inst, nf.depth, nf.frame.K_grid, view.valid, rec.T_map_cam)
                  for inst in lift_detections(nf.frame, nf.dets, rec.T_map_cam, depth=nf.depth,
                                              valid=view.valid)]
+        if ground is not None:
+            above_floor = [i for i in insts if not on_the_floor(i, UP, *ground)]
+            floor_named += len(insts) - len(above_floor)
+            insts = above_floor
         pieces = surface_pieces(view, insts)
         per_frame[rec.index] = list(range(len(obs), len(obs) + len(pieces)))
         rank = {id(det): j for j, det in enumerate(nf.dets)}
@@ -1391,6 +1584,19 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         o.forget_tree()
         o.views_in_frustum = count_views(o, records)
         confirm(o)
+    # boxes whose lower part no keyframe saw rest on the surface beneath (``support_level``),
+    # found again for every object with new evidence: from the box of its points alone, beside
+    # the other objects' boxes as they are before any of these rests (whatever the order)
+    again = [o for o in state.objects if o.id in touched]
+    for o in again:
+        o.support = None
+        refit(o, state.floor_z)
+    boxes = [(o.id, o.obb) for o in state.objects if o.obb is not None]
+    found = {o.id: support_level(o, views, [b for i, b in boxes if i != o.id]) for o in again}
+    for o in again:
+        o.support = found[o.id]
+        if o.support is not None:
+            refit(o, state.floor_z)
 
     # 4. drop non-physical objects, and let the latest keyframes win (``_Places``): every object is
     #    judged by this update's keyframes added after its last detection that could have detected
@@ -1522,6 +1728,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         "pixels_invalidated": sum(state.invalidated.values()),
         "vacated": len(vacated),
         "below_floor_dropped": len(dropped),
+        "floor_named": floor_named,
         "total": len(state.objects), "confirmed": confirmed,
         "unconfirmed": len(state.objects) - confirmed,
     }
@@ -1675,6 +1882,7 @@ class _Views:
         self.views: dict[int, View | None] = dict(new)
         self.prior: dict[int, View | None] = {}
         self.ratios: dict[tuple[int, int], float | None] = {}
+        self.flat: dict[int, NDArray[np.float64]] = {}
 
     def pose(self, index: int) -> Pose | None:
         rec = self.records.get(index)
@@ -1701,6 +1909,23 @@ class _Views:
                 now = View(now.depth, valid & (now.depth > 0), now.K, now.T_map_cam)
             self.prior[index] = now
         return self.prior[index]
+
+    def flat_points(self, index: int) -> NDArray[np.float64]:
+        """The keyframe's grid points (``View.grid_points``) on horizontal surfaces: their normal
+        (``reconstruction.pointcloud.depth_normals``) within ``SUPPORT_TILT_DEG`` of up."""
+        if index not in self.flat:
+            from oh_my_slam.reconstruction.pointcloud import depth_normals
+
+            v = self.get(index)
+            out = np.zeros((0, 3))
+            if v is not None:
+                pts, rows, cols = v.grid_points()
+                n = depth_normals(v.depth, v.K, v.usable())[rows * GRID + GRID // 2,
+                                                             cols * GRID + GRID // 2]
+                up = np.abs(n.astype(np.float64) @ v.T_map_cam.R.T @ UP)
+                out = pts[up >= np.cos(np.radians(SUPPORT_TILT_DEG))]
+            self.flat[index] = out
+        return self.flat[index]
 
     def ratio(self, a: int, b: int) -> float | None:
         if (a, b) not in self.ratios:
@@ -2359,6 +2584,7 @@ class _Grown:
     r0: int
     c0: int
     mask: NDArray[np.bool_]
+    radius: float = 0.0  # pixels the detections were grown by
 
     def covers(self, u: NDArray[np.int64], v: NDArray[np.int64]) -> NDArray[np.bool_]:
         h, w = self.mask.shape
@@ -2438,7 +2664,7 @@ def _grow(mask: NDArray[np.bool_], view: View) -> _Grown | None:
     r0, r1 = max(0, box[0] - r), min(h, box[1] + r)
     c0, c1 = max(0, box[2] - r), min(w, box[3] + r)
     near = ndimage.distance_transform_edt(~mask[r0:r1, c0:c1]) <= r
-    return _Grown(r0, c0, near)
+    return _Grown(r0, c0, near, float(r))
 
 
 def _seen_samples(o: MapObject) -> NDArray[np.float64]:
@@ -2540,6 +2766,62 @@ def _seen_twice(a: MapObject, b: MapObject, masks: _Masks) -> float:
     if not _meet_in_plan(ca + on_b[0] * (pa - ca), cb + on_a[0] * (pb - cb), tol):
         return 0.0
     return min(on_a[1], on_b[1]) / SEEN_ON
+
+
+# Objects on the same rays. Seen from one centre — a camera turning in place — an object's depth
+# along its viewing rays is its monocular depth's alone: no parallax tells it. Detections that
+# lifted different surfaces along those rays then make two objects of one, never detected together,
+# each where the other's detections are in the images: a chair placed at 2.1 m by the keyframes
+# whose masks hold the chair and at 3.7 m, on the wall behind it, by the eleven whose masks hold
+# only the wall seen through its back (``Lifted.through``). Two objects of compatible labels that
+# no keyframe detected together, each detected in CONFIRM_DETECTIONS keyframes, are one when, in
+# the keyframes that cannot tell their depths apart — where either placement projects alike from
+# the keyframe and from the centre of the other object's sightings: focal length times their
+# distance times |1/z_a − 1/z_b| within the tolerance of the detections' grown masks (``_grow``) —
+# each object's points lie on the other's detections (``SEEN_ON`` of those in view, at least
+# ``SEEN_EVIDENCE``), at whatever depth. Two objects side by side, or one in front of the other
+# (detected together where both show), are not on each other's rays; which depth the merged object
+# takes is its detections' (``shaping_sightings``: a detection holding what the object is seen
+# through does not place it where another shows its own surface).
+
+
+def _rays_judged(o: MapObject, other: MapObject, origin: NDArray[np.float64], masks: _Masks
+                 ) -> NDArray[np.float64]:
+    """(on ``o``'s detections, in view) of ``other``'s points, over ``o``'s keyframes from which
+    ``other``'s placement and ``o``'s project alike (see above; ``origin``: the centre of
+    ``other``'s sightings)."""
+    pts = _seen_samples(other)
+    inverse = abs(1.0 / max(o.obs_depth, 1e-3) - 1.0 / max(other.obs_depth, 1e-3))
+    out = np.zeros(2)
+    for f in o.frames:
+        view = masks.views.get(f)
+        grown = None if view is None else masks.mask(o, f, view)
+        if view is None or grown is None:
+            continue
+        if view.K.fx * float(np.linalg.norm(view.T_map_cam.t - origin)) * inverse > grown.radius:
+            continue
+        inside, _, _, u, v = view.lookup_pixels(pts)
+        out += [grown.covers(u[inside], v[inside]).sum(), inside.sum()]
+    return out
+
+
+def _same_rays(a: MapObject, b: MapObject, masks: _Masks) -> float:
+    """>= 1 when two objects are one placed at two depths along the same rays (see above): the
+    smaller share of either's points on the other's detections over ``SEEN_ON``."""
+    if not compatible(a.label, b.label) or set(a.frames) & set(b.frames) \
+            or min(len(a.frames), len(b.frames)) < CONFIRM_DETECTIONS \
+            or not len(a.points) or not len(b.points):
+        return 0.0
+    key = ("rays", a.id, b.id, len(a.points), len(b.points), tuple(a.frames), tuple(b.frames))
+    if key not in masks.results:
+        ca, cb = _ray_origin(a, masks.views), _ray_origin(b, masks.views)
+        share = 0.0
+        if ca is not None and cb is not None:
+            on = [_rays_judged(a, b, cb, masks), _rays_judged(b, a, ca, masks)]
+            if all(c[1] >= SEEN_EVIDENCE for c in on):
+                share = min(c[0] / c[1] for c in on) / SEEN_ON
+        masks.results[key] = share
+    return masks.results[key]
 
 
 def _part_whole(a: MapObject, b: MapObject) -> tuple[MapObject, MapObject, float] | None:
@@ -2675,6 +2957,8 @@ def _merge_strength(a: MapObject, b: MapObject, views: _Views | None = None,
         s = 1.0
     if s < 1.0 and masks is not None:
         s = max(s, _seen_as_one(a, b, masks))
+    if s < 1.0 and masks is not None:
+        s = max(s, _same_rays(a, b, masks))
     return s
 
 
@@ -2749,6 +3033,8 @@ def _merge(state: ObjectState, touched: set[int], alias: dict[int, int],
         seen = masks
         strength.update({k: s for k, s in _seen_pairs(state.objects, touched, seen).items()
                          if joinable(*k)})
+        strength.update({k: s for k, s in _ray_pairs(state.objects, touched, seen).items()
+                         if joinable(*k) and s > strength.get(k, 0.0)})
 
     by = state.by_id()
     for o in sorted(state.objects, key=lambda o: o.id):
@@ -2819,6 +3105,36 @@ def _seen_pairs(objects: list[MapObject], touched: set[int], masks: _Masks
         s = _seen_as_one(a, b, masks)
         if s >= 1.0:
             out[(a.id, b.id)] = s
+    return out
+
+
+def _ray_pairs(objects: list[MapObject], touched: set[int], masks: _Masks
+               ) -> dict[tuple[int, int], float]:
+    """The pairs (ids, lower first; at least one touched by this update) of objects placed twice
+    along the same rays (``_same_rays``), with their strength; first gated by direction: seen
+    from the centre of the first one's sightings, the two lie within their angular radii of each
+    other."""
+    objs = sorted((o for o in objects if len(o.points) and len(o.frames) >= CONFIRM_DETECTIONS),
+                  key=lambda o: o.id)
+    out: dict[tuple[int, int], float] = {}
+    for i, a in enumerate(objs):
+        origin = _ray_origin(a, masks.views)
+        if origin is None:
+            continue
+        for b in objs[i + 1:]:
+            if not (a.id in touched or b.id in touched) or not compatible(a.label, b.label) \
+                    or set(a.frames) & set(b.frames):
+                continue
+            da, db = a.centroid - origin, b.centroid - origin
+            na, nb = float(np.linalg.norm(da)), float(np.linalg.norm(db))
+            if min(na, nb) <= 0.0:
+                continue
+            angle = float(np.arccos(np.clip(da @ db / (na * nb), -1.0, 1.0)))
+            if angle > a.extent / na + b.extent / nb:
+                continue
+            s = _same_rays(a, b, masks)
+            if s >= 1.0:
+                out[(a.id, b.id)] = s
     return out
 
 
@@ -3563,4 +3879,3 @@ def label_map_for(reader_instances: list[dict[str, Any]], shape: tuple[int, int]
         if m.shape == shape:
             lab[m] = oid
     return lab
-

@@ -863,7 +863,8 @@ and 5 → 422, 6 → 409, 3 → 503, 130 → 499, 1 and anything else → 500).
   (−90°, 90°]. The fit keeps the least-area yaw over the convex-hull edge directions, with robust
   2nd–98th percentile extents. For floor-standing classes, a box whose visible bottom floats up to
   0.8 m above the detected floor is extended down to it (person 1.2 m, dog and cat 0.5 m, horse
-  1.0 m).
+  1.0 m). In a map, a box of any class rests on the surface beneath it where no keyframe saw
+  below its visible bottom (see Update semantics).
 
 ## Scene description (OpenLABEL 1.0.0)
 
@@ -1212,7 +1213,11 @@ which replaces most files, widens that window.
     candidate is confirmed once it is detected with a reliable mask (not mostly in the
     image-border band, where the object is cut off and monocular depth is unreliable) in at
     least 2 keyframes, or in 1 when no other keyframe of the map had it in view (occlusion is
-    ignored, so a detection whose depth puts it inside another surface cannot confirm itself).
+    ignored, so a detection whose depth puts it inside another surface cannot confirm itself),
+    or with any masks in at least 4 keyframes that place it alike (their bounds overlap within
+    the depth noise): a detection in the band counts half. A tomato at the foot of a robot's
+    downward views (the kitchen sequence `b16`), cut off in all 4 keyframes that detected it,
+    is confirmed this way; one-off phantoms in the band are not.
     It must also be visibly drawn in the map cloud, so that it appears in every `color=segment`
     cloud in its colour: it needs at least 5 % of the cells of its box's
     largest face at the map's sampling at its nearest detection, and at least 10. A cell is a
@@ -1249,6 +1254,26 @@ which replaces most files, widens that window.
     publish) is seen in place by every later view, since the surface is where its depth puts it, so once
     published it stays for the life of the map; only a later view that sees through its place
     removes it.
+  * A box rests on the surface beneath it where no keyframe saw below its visible bottom: the
+    object was cut off by the bottom of every image that detected it, or hidden behind its own
+    front. The support is the highest level of the detecting keyframes' points on horizontal
+    surfaces (normals within 30° of up) around the box's footprint (within 15 cm of it, at most
+    0.3 m below the box; levels of 1 cm with their neighbours), leaving out the points inside or
+    within 2 cm of another object's box (candidates too) unless that object is the one it stands
+    on (its footprint holds the box's centre, its top at most 2 cm above the box's bottom): a
+    tomato 5.5 cm from a plate otherwise rested on the plate's rim, 3.3 cm above the counter.
+    The level must also surround the foot, as every confident keyframe that sees around it saw
+    it within 25 cm of the footprint: at least 3 of its points in front of two opposite edges of
+    the footprint, or in three of the four quadrants the box's axes divide that ring into. A
+    ledge on one side (a partition's edge, a sill) is no support: on `examples/camera` a cup
+    misplaced on a wall had rested 8.5 cm lower on a partition's edge beside it.
+    The box is extended down to the support unless one of the detecting keyframes saw the space
+    in between empty (30 % of the samples there
+    that it has in view seen through by more than the depth noise) or the visible part is a
+    sliver (under a fifth) of the extended box. On `b16` a cup cut off in all 5 of its keyframes
+    had its box 6.5 cm above the counter it stands on, and a tomato 3.5 cm; both rest on it now,
+    while a shelf seen with the floor beneath it keeps its box, and a power
+    outlet on a wall has no support.
   * The OBB is fitted to the detections that agree with each other: monocular depth of a small
     object can vary by tens of percent between keyframes, and the union of such detections is a
     streak along the viewing rays. With 3 or more detections, the box covers those whose bounds
@@ -1425,6 +1450,17 @@ pixels, so its results are unchanged.
      units are arbitrary — the camera 8 cm from the last one placed 3 m away). MapAnything runs
      in chunks of 24, anchored on up to 4 already-posed keyframes, and is also the fallback when
      SfM fails.
+   * **Refinement of multi-view poses** (`mapping.panorama.refine_turning`, then again on the
+     aligned depth). Every verified match, lifted with its keyframe's monocular depth, must
+     reproject onto its partner. Pairs whose matches imply a rotation far from the multi-view
+     poses' are left out first (repetitive texture: 128 of 425 pairs on the kitchen sequence
+     `b16`). Each depth stratum of a pair (depth ratios of 1.25) weighs alike, so the few far
+     matches that carry a moving head's parallax are not outvoted by the many on one near
+     surface (far points 7.1 → 2.1 px). From the second robust scale on, each residual is
+     whitened along the direction its depth moves it by the depth noise measured from the
+     matches (5–7 % on `b16`), so the wrong depth of near surfaces no longer pulls the rotations
+     of the views that see far ones: `b16`'s two sweeps' pan axes came 1.8° → 0.5° apart.
+     `map.json` records the measured noise (`notes.pose_refinement.depth_noise`).
    * **Lens distortion of a new multi-view map.** Its refinement (`mapping.panorama`) fits one
      focal length for the keyframes, and with it one radial distortion coefficient (COLMAP's
      `SIMPLE_DIVISION`). `examples/camera` is a pan-tilt camera turning in place through a 110°
@@ -2046,9 +2082,10 @@ timing. Run it on an otherwise idle machine, because concurrent GPU work invalid
   keyframes saw. An object seen only from the front has the depth of its visible surface: in
   the `ainex-captures` map the refrigerator against the wall is about 0.8 m wide and 1.65 m
   tall but only 0.1–0.15 m deep, because only its front was seen. The fit does not invent the hidden part from a class-typical size,
-  which would be wrong for any object that is not typical. The only extension is floor
+  which would be wrong for any object that is not typical. The only extensions are floor
   grounding, where the visible bottom floats just above the detected floor (see Coordinate
-  conventions). A box is one upright cuboid: `examples/camera`'s L-shaped workstation (two desks
+  conventions), and resting on the surface beneath where no keyframe saw below the box (see
+  Update semantics). A box is one upright cuboid: `examples/camera`'s L-shaped workstation (two desks
   butted together, detected as one desk) gets a box yawed about 50° to the walls, across the
   corner, that holds the chair in front of it, and the upper cabinets' fronts there run 5° off
   the wall behind them (monocular depth of a surface seen at a grazing angle).

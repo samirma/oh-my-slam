@@ -118,6 +118,7 @@ class PoseFit:
     # ``screen_pairs``: the pairs it left out and its gate (degrees); None: not screened
     screened: int = 0
     screen_gate_deg: float | None = None
+    depth_noise: float | None = None  # the relative depth noise measured (``depth_noise``)
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {"pairs": self.pairs, "matches": self.matches,
@@ -130,6 +131,8 @@ class PoseFit:
         if self.screen_gate_deg is not None:
             out.update(screened_pairs=self.screened,
                        screen_gate_deg=round(self.screen_gate_deg, 3))
+        if self.depth_noise is not None:
+            out["depth_noise"] = round(self.depth_noise, 4)
         return out
 
 
@@ -394,6 +397,50 @@ def depth_balance(pb: _Problem) -> NDArray[np.float64]:
     return w
 
 
+# Depth noise (``refine_poses(depth_noise=True)``). A match lifted with its keyframe's monocular
+# depth reprojects along the epipolar line by g pixels per unit of log depth: a depth error moves
+# it along that line, a pose error across it as well. Monocular depth is off by a few percent
+# from point to point (5-7 % on the kitchen sequence: the robust spread of the along-line
+# residuals over the log-depth change that would remove them, matches moving at least
+# NOISE_GRADIENT px per unit of log depth), so a near point's residual along its line is mostly
+# depth noise; weighed like the keypoint noise, it pulls the rotations of the views that see far
+# surfaces off by degrees (``b16``'s two sweeps, turned by one robot head: their pan axes 1.8°
+# apart, 0.5° whitened; the rotations of its sweep ends 2.6-3.8° from what the image homographies
+# say, 3.4° at most whitened). Each residual is whitened along its line by the noise measured at
+# each robust scale (after the first): its variance there is NOISE_PX² + (sigma g)².
+NOISE_GRADIENT = 20 * NOISE_PX
+NOISE_MIN_MATCHES = 50
+
+
+def _depth_whitening(pb: _Problem, R: NDArray[Any], C: NDArray[Any], phi: float, kappa: float,
+                     reach: float) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+    """Each match's residual direction that its source depth moves (unit, (N, 2)), the factor
+    (N,) that whitens the residual along it, and the relative depth noise ``sigma`` measured from
+    the matches (``NOISE_GRADIENT``; residuals within ``reach`` px): a reprojection that moves by
+    ``g`` pixels per unit of log depth has the variance ``NOISE_PX² + (sigma |g|)²`` along ``g``,
+    ``NOISE_PX²`` across it."""
+    step = 1e-4
+    r0 = _evaluate(pb, R, C, phi, kappa, jac=False, lens=False)[0]
+    r1 = _evaluate(replace(pb, depth=pb.depth * np.exp(step)), R, C, phi, kappa, jac=False,
+                   lens=False)[0]
+    g = np.where(np.isfinite(pb.depth)[:, None], (r1 - r0) / step, 0.0)
+    norm = np.linalg.norm(g, axis=1)
+    unit = g / np.where(norm > 0, norm, 1.0)[:, None]
+    ok = (norm >= NOISE_GRADIENT) & (np.linalg.norm(r0, axis=1) <= reach)
+    sigma = 0.0
+    if ok.sum() >= NOISE_MIN_MATCHES:
+        along = np.abs(np.sum(r0[ok] * unit[ok], axis=1)) / norm[ok]
+        sigma = 1.4826 * float(np.median(along))
+    return unit, NOISE_PX / np.sqrt(NOISE_PX**2 + (sigma * norm) ** 2), sigma
+
+
+def _whiten(r: NDArray[Any], unit: NDArray[Any], factor: NDArray[Any]) -> NDArray[np.float64]:
+    """``r`` (N, 2, ...) scaled by ``factor`` along ``unit`` (``_depth_whitening``)."""
+    along = np.einsum("ni,ni...->n...", unit, r)
+    return np.asarray(r + np.expand_dims((factor - 1.0)[:, None] * unit, tuple(
+        range(2, r.ndim))) * along[:, None])
+
+
 def _cost(r: NDArray[Any], c: float, weight: NDArray[Any] | None = None) -> float:
     rho = np.log1p(np.sum(r * r, axis=1) / (c * c))
     return float(0.5 * c * c * (rho if weight is None else weight * rho).sum())
@@ -434,7 +481,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                  hold_distortion: bool = False,
                  gravity: dict[str, tuple[NDArray[Any], float]] | None = None,
                  up: NDArray[Any] | None = None, hold_centres: bool = False,
-                 balance_depth: bool = False) -> PoseFit:
+                 balance_depth: bool = False, depth_noise: bool = False) -> PoseFit:
     """Refine the camera-to-map poses of the ``free`` keyframes (see the module docstring).
 
     ``views``: every keyframe that may take part (free and fixed); pairs with a keyframe outside
@@ -450,7 +497,10 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     keyframes, the up direction in the camera and its uncertainty (degrees), in a map whose up is
     +z: the tilt between them is a prior (``_tilt``), which levels a block that hangs on the rest
     by a few weak matches about the axis they leave free. ``up``: the map's up when it is not +z
-    (a new map, not levelled yet). ``balance_depth``: the matches weighed by ``depth_balance``."""
+    (a new map, not levelled yet). ``balance_depth``: the matches weighed by ``depth_balance``.
+    ``depth_noise``: from the second robust scale on, each residual whitened along the direction
+    its source depth moves it by the depth noise measured from the matches (``_depth_whitening``;
+    ``PoseFit.depth_noise``)."""
     names = sorted(n for n in free if n in views)
     used_pairs = _used_pairs(pairs, views, free)
     fit = PoseFit({n: views[n].pose for n in names}, 1.0, len(used_pairs),
@@ -497,9 +547,12 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
              for k, n in enumerate(names) if gravity and n in gravity]
     z = np.array([0.0, 0.0, 1.0]) if up is None else np.asarray(up, np.float64)
 
+    white: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
+
     def residuals(Rs: NDArray[Any], Cs: NDArray[Any], ph: float, ka: float
                   ) -> NDArray[np.float64]:
-        return _evaluate(pb, Rs, Cs, ph, ka, jac=False, lens=False)[0]
+        r = _evaluate(pb, Rs, Cs, ph, ka, jac=False, lens=False)[0]
+        return r if white is None else _whiten(r, *white)
 
     def total(r: NDArray[Any], Rs: NDArray[Any], Cs: NDArray[Any], ph: float, ka: float,
               c: float) -> float:
@@ -519,11 +572,16 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
         fixed += ([npar - 2] if hold_focal else []) + ([npar - 1] if hold_distortion else [])
     for c in scales:
         lam = 1e-3
+        if depth_noise and use_depth and not hold_centres and c < scales[0]:
+            unit, factor, fit.depth_noise = _depth_whitening(pb, R, C, phi, kappa, 4 * c)
+            white = (unit, factor)
         r = residuals(R, C, phi, kappa)
         current = total(r, R, C, phi, kappa, c)
         for _ in range(MAX_ITERATIONS):
             r, J = _evaluate(pb, R, C, phi, kappa, jac=True, lens=npar - 1 not in fixed)
             assert J is not None
+            if white is not None:
+                r, J = _whiten(r, *white), _whiten(J, *white)
             H, g = _normal_equations(pb, r, J, c, free_idx, npar)
             for k in range(len(names)):  # weak centre prior
                 sl = slice(6 * k + 3, 6 * k + 6)
@@ -573,7 +631,9 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     if refine_focal and abs(phi) > np.log(FOCAL_MAX_FACTOR):
         return refine_poses(pairs, views, free, refine_focal, use_depth, scales,
                             hold_focal=True, hold_distortion=hold_distortion, gravity=gravity,
-                            up=up, hold_centres=hold_centres, balance_depth=balance_depth)
+                            up=up, hold_centres=hold_centres, balance_depth=balance_depth,
+                            depth_noise=depth_noise)
+    white = None
     last = residuals(R, C, phi, kappa)
     final = degrees(last)
     px = np.linalg.norm(last, axis=1)
@@ -628,7 +688,8 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
     refined alone (pure-rotation model, centres irrelevant), every free centre restarts at the
     centre of the fixed keyframes it overlaps (``centre_hints``), and rotations and centres are
     refined together with the depth, every depth stratum of a pair weighing alike
-    (``depth_balance``)."""
+    (``depth_balance``) and the residuals whitened by the depth noise measured
+    (``depth_noise``)."""
     pairs, gate = screen_pairs(pairs, views, free)
     rot = refine_poses(pairs, views, free, use_depth=False, gravity=gravity, up=up)
     hints = centre_hints(pairs, views, free)
@@ -636,7 +697,7 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
               for n, v in views.items()}
     fit = refine_poses(pairs, staged, free, refine_focal=refine_focal,
                        hold_distortion=hold_distortion, gravity=gravity, up=up,
-                       balance_depth=True)
+                       balance_depth=True, depth_noise=True)
     fit.median_before_deg = rot.median_before_deg
     fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
     return fit

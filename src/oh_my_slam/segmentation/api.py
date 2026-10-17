@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import timing
-from oh_my_slam.core.geometry import depth_edge_mask
+from oh_my_slam.core.geometry import depth_edge_mask, unproject_pixels
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.api import (
     SINGLE_IMAGE_TOKENS,
@@ -37,7 +37,7 @@ from oh_my_slam.reconstruction.cloud import (
     source_of_frame,
     source_of_points,
 )
-from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM
+from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM, floor_band
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
 from oh_my_slam.segmentation.colors import UNSEGMENTED as UNSEGMENTED
 from oh_my_slam.segmentation.colors import (
@@ -48,6 +48,7 @@ from oh_my_slam.segmentation.colors import (
 )
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
+    GROUND_MIN_VISIBLE,
     claim_order,
     detect,
     grounding,
@@ -58,7 +59,13 @@ from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
 from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.detect import surface_label as surface_label
-from oh_my_slam.segmentation.lift import MIN_POINTS, Lifted, lift_mask, support_fringe
+from oh_my_slam.segmentation.lift import (
+    MIN_POINTS,
+    SUPPORT_MAX_SHARE,
+    Lifted,
+    lift_mask,
+    support_fringe,
+)
 from oh_my_slam.segmentation.obb import OBB as OBB
 from oh_my_slam.segmentation.obb import fit_obb
 from oh_my_slam.segmentation.obb import obb_iou_upright as obb_iou_upright
@@ -107,7 +114,8 @@ def join_instances(pieces: list[LiftedInstance]) -> LiftedInstance:
            float(boxes[:, 3].max()))
     det = Detection(best.detection.label, best.detection.score, best.detection.source, mask, box)
     lifted = Lifted(np.concatenate([p.lifted.points for p in pieces]),
-                    np.concatenate([p.lifted.pixels for p in pieces]))
+                    np.concatenate([p.lifted.pixels for p in pieces]),
+                    all(p.lifted.through for p in pieces))
     return LiftedInstance(det, mask, lifted)
 
 
@@ -184,16 +192,59 @@ def trim_support(inst: LiftedInstance, depth: NDArray[Any], K: Intrinsics, valid
         return inst
     keep = ~drop.reshape(-1)[inst.lifted.pixels]
     mask = inst.mask & ~drop
-    lifted = Lifted(inst.lifted.points[keep], inst.lifted.pixels[keep])
+    lifted = Lifted(inst.lifted.points[keep], inst.lifted.pixels[keep], inst.lifted.through)
     return LiftedInstance(inst.detection, mask, lifted)
 
 
+# The floor named as an object. An open-vocabulary detector names bare floor at the bottom of a
+# low camera's views after the furniture it saw elsewhere: "bed" at 0.50-0.79 on the floor strip
+# of 20 of 45 frames of a robot's rendered room, a camera 0.44 m above the floor, in frames that
+# show no bed at all. A detection is the floor, not the object it names, when its class stands on
+# the floor (``detect.grounding``: a body rises from it — a bed, a table, a chair, a cabinet) and
+# more than FLOOR_SHARE of its lifted points lie within the floor's own thickness
+# (``reconstruction.gravity.floor_band``: the floor's spread about its level, measured from the
+# floor's points); nothing more of a body is left than the share a support fringe may take of an
+# object (``lift.SUPPORT_MAX_SHARE``). The floor strips of that room: 100 % of their points; the
+# room's real detections at most 12 %. A floor covering (a rug, a mat) or what may lie flat on
+# the floor (a towel, a book) is no floor-standing class and is kept.
+FLOOR_SHARE = 1.0 - SUPPORT_MAX_SHARE
+
+
+def on_the_floor(inst: LiftedInstance, up: NDArray[Any], floor_level: float, band: float
+                 ) -> bool:
+    """Whether a lifted detection is the floor itself (see ``FLOOR_SHARE``): its points (in a
+    frame whose unit up is ``up``) lie within ``band`` of the floor at ``floor_level`` (along
+    ``up``)."""
+    pts = np.asarray(inst.lifted.points, np.float64)
+    if grounding(inst.detection.label)[0] <= 0 or not len(pts):
+        return False
+    h = pts @ np.asarray(up, np.float64) - floor_level
+    return bool(np.mean(np.abs(h) <= band) > FLOOR_SHARE)
+
+
+def frame_floor(frame: FrameReconstruction) -> tuple[NDArray[np.float64], float, float] | None:
+    """(unit up, floor level along it, the floor's half thickness) of a reconstructed image, from
+    its gravity's floor (``floor_band`` of its points' heights); None without a floor."""
+    if frame.gravity is None or frame.gravity.floor_height is None:
+        return None
+    up = np.asarray(frame.gravity.up_cam, np.float64)
+    up = up / np.linalg.norm(up)
+    ok = frame.valid & (frame.depth > 0)
+    v, u = np.nonzero(ok)
+    pts = unproject_pixels(u, v, frame.depth[v, u], frame.K_grid.K())
+    level, band = floor_band(pts @ up, -float(frame.gravity.floor_height))
+    return up, level, band
+
+
 def fit_object_obb(points: NDArray[Any], label: str, up: NDArray[Any],
-                   floor_level: float | None = None) -> OBB:
+                   floor_level: float | None = None, support_level: float | None = None) -> OBB:
     """Upright OBB of an object's points; floor-standing classes are grounded on the floor at
     ``floor_level`` (the floor's coordinate along ``up``) when their visible bottom floats just
-    above it and the visible part is not a sliver of the grounded box (``detect.grounding``)."""
-    return fit_obb(points, up, floor_level, *grounding(label))
+    above it and the visible part is not a sliver of the grounded box (``detect.grounding``).
+    ``support_level``: the surface beneath an object whose lower part nothing saw (the mapper
+    decides it from its keyframes); the box rests on it unless its visible part is a sliver of
+    the box that would (``detect.GROUND_MIN_VISIBLE``, any class)."""
+    return fit_obb(points, up, floor_level, *grounding(label), support_level, GROUND_MIN_VISIBLE)
 
 
 def lift_detections(
@@ -263,6 +314,9 @@ def segment_frame(
     floor = None
     if frame.gravity is not None and frame.gravity.floor_height is not None:
         floor = -float(frame.gravity.floor_height)  # floor points satisfy up·x = -height
+    found = frame_floor(frame)
+    if found is not None:  # the floor named as an object is no object (``on_the_floor``)
+        instances = [i for i in instances if not on_the_floor(i, *found)]
     label_map = np.zeros(frame.depth.shape, np.int32)
     objects: list[SceneObject] = []
     point_pixels: dict[int, NDArray[np.int64]] = {}

@@ -2181,7 +2181,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
 # posed by the multi-view fallback is therefore refined again on
 # its aligned depth (``_repose_on_aligned_depth``: the lens held, the first keyframe holding the
 # gauge, low-confidence keyframes by their rays only, every depth stratum of a pair weighing alike:
-# ``panorama.depth_balance``), and its depth aligned again to those poses;
+# ``panorama.depth_balance``, the residuals whitened by the depth noise measured), and its depth
+# aligned again to those poses;
 # not a camera given one centre (``_one_centre``), whose centres the depth must not move.
 
 
@@ -2208,7 +2209,7 @@ def _repose_on_aligned_depth(ctx: UpdateContext, model: SfmModel) -> bool:
     with timing.stage(timing.Stage.POSE_REFINEMENT):
         pairs, gate = panorama.screen_pairs(panorama.verified_matches(db, set(views)), views,
                                             free, min_gate_deg=float(first))
-        fit = panorama.refine_poses(pairs, views, free, balance_depth=True)
+        fit = panorama.refine_poses(pairs, views, free, balance_depth=True, depth_noise=True)
     if not fit.pairs:
         return False
     fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
@@ -2401,7 +2402,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     one update, so the map does not depend on how its input was split into updates. A stored
     keyframe whose depth changes has it rewritten and is listed in ``ctx.rescaled``; its objects
     move with it (``objects.update_objects``)."""
-    from oh_my_slam.reconstruction.depth import adjust_depth_corrections, pair_bins
+    from oh_my_slam.reconstruction.depth import adjust_depth_corrections, field_axes, pair_bins
 
     nodes = _scale_nodes(ctx)
     if len(nodes) < 2:
@@ -2425,6 +2426,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
     first: list[float] = []
     last: list[float] = []
     measured = 0
+    axes = (True, True)
     for rnd in range(SCALE_ROUNDS):
         views = {k: v.corrected(corr[k]) for k, v in base.items()}
         pivots = np.zeros(len(nodes))
@@ -2432,6 +2434,8 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
             pivots[k] = v.log_median()
         meas = [b for i, j in pairs for b in pair_bins(i, j, views[i], views[j])]
         measured = len({(min(b.src, b.dst), max(b.src, b.dst)) for b in meas})
+        # the image axes along which the pairs measure the fields (a pan: its columns only)
+        axes = field_axes(meas) if rnd == 0 else axes
         # confident keyframes first; then the low-confidence ones, to them
         for low in (False, True):
             active = {k for k, n in enumerate(nodes) if n.low == low}
@@ -2442,7 +2446,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
                    and (b.src in active or b.dst in active)]
             adj = adjust_depth_corrections(
                 len(nodes), sub, pivots, set(range(len(nodes))) - active,
-                scale_fixed={k for k in active if not nodes[k].free}, flat=flat)
+                scale_fixed={k for k in active if not nodes[k].free}, flat=flat, axes=axes)
             for k in active:
                 c = corr[k].then(adj.corrections[k])
                 # a held scale stays exactly held (composing about shifted pivots rounds it)
@@ -2490,6 +2494,7 @@ def _adjust_depth_scales(ctx: UpdateContext, progress: Progress) -> None:
         "max_correction": round(largest, 5),
         "exponent_range": [round(min(exps), 4), round(max(exps), 4)] if exps else None,
         "largest_bend": round(max(bends), 5) if bends else None,
+        "field_axes": "".join(a for a, on in zip("xy", axes, strict=True) if on),
     }
     ctx.notes["depth_scale_adjustment"] = summary
     timing.count(depth_scale_pairs=measured)

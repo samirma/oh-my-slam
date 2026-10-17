@@ -89,3 +89,54 @@ def test_depth_balance_gives_every_stratum_of_a_direction_the_same_weight() -> N
                               np.zeros((2, 2)), np.ones((2, 2)), np.full(2, np.inf),
                               np.array([0]), [(0, 1)])
     np.testing.assert_array_equal(depth_balance(empty), 1.0)
+
+
+def _noisy(depth: np.ndarray, rng: np.random.Generator, sigma: float) -> np.ndarray:
+    """``depth`` off by a smooth relative error of about ``sigma`` (blobs of a few dozen pixels:
+    monocular depth is wrong surface by surface, not pixel by pixel)."""
+    from scipy.ndimage import gaussian_filter, zoom
+
+    coarse = rng.normal(size=(depth.shape[0] // 20 + 1, depth.shape[1] // 20 + 1))
+    field = zoom(gaussian_filter(coarse, 0.7), 20, order=1)[:depth.shape[0], :depth.shape[1]]
+    return (depth * np.exp(sigma * field / field.std())).astype(np.float32)
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_the_depth_noise_is_measured_from_the_matches_and_keeps_the_turn(seed: int) -> None:
+    """Depth off by 5 % here and there: the refinement whitened by it measures about that much and
+    finds the turn at least as well as the plain one, which the near matches' wrong depth pulls."""
+    rng = np.random.default_rng(seed)
+    Ta = _look(0.0, np.array([0.4, 0.0, 0.0]))  # 14 cm apart: the matches see their depth
+    yaw = 20.0
+    Tb = _look(yaw, 0.4 * np.array([np.cos(np.radians(yaw)), np.sin(np.radians(yaw)), 0.0]))
+    pair = _pair(rng, Ta, Tb, _scene_depth(Ta))
+    start = Pose(Tb.R, Ta.t.copy())
+    views = {"a": View(Ta, K, _noisy(_scene_depth(Ta), rng, 0.05), K, (K.width, K.height)),
+             "b": View(start, K, _noisy(_scene_depth(Tb), rng, 0.05), K, (K.width, K.height))}
+    errors = []
+    for noise in (False, True):
+        fit = refine_poses([pair], views, {"b"}, balance_depth=True, depth_noise=noise)
+        errors.append(float(np.degrees(np.arccos(np.clip(
+            (np.trace(fit.poses["b"].R.T @ Tb.R) - 1) / 2, -1, 1)))))
+        if noise:
+            assert fit.depth_noise is not None and 0.02 < fit.depth_noise < 0.1
+            assert fit.summary()["depth_noise"] == round(fit.depth_noise, 4)
+        else:
+            assert fit.depth_noise is None and "depth_noise" not in fit.summary()
+    assert errors[1] <= errors[0] + 0.02 and errors[1] < 0.3
+
+
+def test_too_few_matches_measure_no_depth_noise() -> None:
+    """Without matches whose reprojection moves with their depth, nothing is whitened."""
+    rng = np.random.default_rng(3)
+    Ta = _look(0.0, np.zeros(3))
+    Tb = _look(10.0, np.zeros(3))
+    pair = _pair(rng, Ta, Tb, _scene_depth(Ta), n=60)
+    views = {"a": View(Ta, K, _scene_depth(Ta), K, (K.width, K.height)),
+             "b": View(Tb, K, _scene_depth(Tb), K, (K.width, K.height))}
+    fit = refine_poses([pair], views, {"b"}, depth_noise=True)
+    assert fit.depth_noise == 0.0
+    whitened = panorama._whiten(np.ones((2, 2, 3)), np.array([[1.0, 0.0], [0.0, 1.0]]),
+                                np.array([0.5, 1.0]))
+    np.testing.assert_allclose(whitened[0], [[0.5] * 3, [1.0] * 3])
+    np.testing.assert_allclose(whitened[1], np.ones((2, 3)))

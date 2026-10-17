@@ -140,6 +140,179 @@ def test_rescaling_moves_sightings_of_held_keyframes_only() -> None:
     assert by_frame[5] == s5 and len(o.points) == 0
 
 
+def test_rescaling_moves_the_support_an_object_rests_on() -> None:
+    s0 = Sighting(0, 100, 0.0, (0.0, 0.0, 2.0), (-0.1, -0.1, 1.9), (0.1, 0.1, 2.1))
+    o = MapObject(3, "cup", {"cup": 1.0}, [0.9], np.zeros((0, 3), np.float32), frames=[0],
+                  obs_depth=2.0, sightings=[s0], support=1.95)
+    corr = DepthCorrection(float(np.log(1.1)), 0.0, float(np.log(2.0)))
+    ob.rescale_objects(ObjectState([o], 4), {0: corr}, [rec(0, Pose.identity())])
+    assert o.support == pytest.approx(1.1 * 1.95)  # about the camera, by its factor
+
+
+# --- resting on a support -------------------------------------------------------------------------
+
+DOWN = Pose(np.diag([1.0, -1.0, -1.0]), np.array([0.0, 0.0, 1.9]))  # 1 m above a counter at 0.9
+
+
+def counter_view(cup_top: float | None) -> View:
+    """The camera above the counter; with ``cup_top``, a cup's top (8 cm square) hides what lies
+    beneath it."""
+    depth = np.full((60, 80), 1.0, np.float32)
+    if cup_top is not None:
+        d = 1.9 - cup_top
+        half = 0.04 / d * K.fx
+        depth[int(30 - half):int(30 + half) + 1, int(40 - half):int(40 + half) + 1] = d
+    return View(depth, np.ones(depth.shape, bool), K, DOWN)
+
+
+def cup(rng: np.random.Generator, bottom: float = 0.99, top: float = 1.05) -> MapObject:
+    pts = rng.uniform(-0.5, 0.5, (400, 3)) * [0.08, 0.08, top - bottom] + [0, 0, (top + bottom) / 2]
+    o = obj(8, "cup", pts, [0])
+    ob.refit(o, None)
+    return o
+
+
+def test_a_box_whose_lower_part_nobody_saw_rests_on_the_surface_beneath() -> None:
+    rng = np.random.default_rng(0)
+    o = cup(rng)
+    hidden = views_of({0: counter_view(1.05)})
+    level = ob.support_level(o, hidden)
+    assert level == pytest.approx(0.9, abs=0.005)
+    o.support = level
+    ob.refit(o, None)
+    assert o.obb is not None
+    assert o.obb.center[2] - o.obb.size[2] / 2 == pytest.approx(0.9, abs=0.005)
+    # the keyframe saw the counter under the box: it floats there (a shelf above a counter)
+    assert ob.support_level(cup(rng), views_of({0: counter_view(None)})) is None
+
+
+def test_no_support_without_a_box_a_view_or_a_surface_beneath() -> None:
+    rng = np.random.default_rng(1)
+    o = cup(rng)
+    assert ob.support_level(o, views_of({})) is None  # its keyframe is not in the map
+    low = views_of({0: counter_view(1.05)}, [rec(0, DOWN, low_confidence=True)])
+    assert ob.support_level(o, low) is None  # placed with low confidence: no evidence
+    none = View(np.zeros((60, 80), np.float32), np.zeros((60, 80), bool), K, DOWN)
+    assert ob.support_level(o, views_of({0: none})) is None  # nothing seen around it
+    # around it a slope, not a horizontal surface; or horizontal bits at every height and many
+    # at none: nothing to rest on
+    slope = np.tile(np.linspace(0.5, 1.4, 80, dtype=np.float32), (60, 1))
+    assert ob.support_level(o, views_of({0: View(slope, np.ones((60, 80), bool), K,
+                                                 DOWN)})) is None
+    steps = np.c_[np.full(30, 0.1), np.zeros(30), np.linspace(0.7, 0.98, 30)]
+    bits = SimpleNamespace(get=lambda f: counter_view(1.05), records={},
+                           flat_points=lambda f: steps)
+    assert ob.support_level(o, bits) is None  # type: ignore[arg-type]
+    assert views_of({}).flat_points(0).shape == (0, 3)
+    o.obb = None
+    assert ob.support_level(o, views_of({0: counter_view(1.05)})) is None
+
+
+def tabletop(patches: list[tuple[float, ...]], base: float = 0.9, grid: Intrinsics = K) -> View:
+    """The camera above a floor or counter at height ``base``, with horizontal rectangular tops
+    on it: (x, y, half side[, half side along y], height); each pixel sees the nearest."""
+    v, u = np.mgrid[0:grid.height, 0:grid.width]
+    depth = np.full((grid.height, grid.width), 1.9 - base)
+    for x, y, *halves, top in patches:
+        hx, hy = halves[0], halves[-1]
+        d = 1.9 - top
+        px, py = (u - grid.cx) / grid.fx * d, -(v - grid.cy) / grid.fy * d
+        on = (np.abs(px - x) <= hx) & (np.abs(py - y) <= hy)
+        depth = np.where(on, np.minimum(depth, d), depth)
+    return View(depth.astype(np.float32), np.ones(depth.shape, bool), grid, DOWN)
+
+
+FINE = Intrinsics(400.0, 400.0, 160.0, 120.0, 320, 240)  # 1 cm grid cells 1 m away
+
+
+def fine(view: View) -> ob._Views:
+    return views_of({0: view}, [rec(0, DOWN, K_grid=FINE)])
+
+
+def standing(rng: np.random.Generator, x: float, y: float, bottom: float, top: float,
+             oid: int = 8) -> MapObject:
+    """An 8 cm wide object whose points the keyframe saw from ``bottom`` to ``top``."""
+    pts = rng.uniform(-0.5, 0.5, (400, 3)) * [0.08, 0.08, top - bottom] + [x, y, (top + bottom) / 2]
+    o = obj(oid, "tomato", pts, [0])
+    ob.refit(o, None)
+    return o
+
+
+def test_a_neighbours_top_is_no_support_whatever_its_place() -> None:
+    """Randomised: an object on the counter with a neighbour beside it (a plate, a board, a box)
+    whose top lies between the counter and the object's visible bottom, within the search: the
+    support is the counter, and the box rests within 1.5 cm of it. Not left out, the neighbour's
+    top, on one side of the object (``_around``), left it without a support."""
+    missed = 0
+    for seed in range(25):
+        rng = np.random.default_rng(seed)
+        x, y = rng.uniform(-0.08, 0.08, 2)
+        bottom = rng.uniform(0.95, 1.0)
+        half = rng.uniform(0.05, 0.12)  # the neighbour
+        gap = rng.uniform(0.0, 0.08)
+        angle = rng.uniform(0, 2 * np.pi)
+        reach = 0.04 + gap + half
+        nx, ny = x + reach * np.cos(angle), y + reach * np.sin(angle)
+        top = rng.uniform(0.91, bottom - 0.01)
+        view = views_of({0: tabletop([(nx, ny, half, top), (x, y, 0.04, bottom + 0.06)])})
+        o = standing(rng, x, y, bottom, bottom + 0.06)
+        neighbour = OBB(np.array([nx, ny, (0.9 + top) / 2]), np.eye(3),
+                        np.array([2 * half, 2 * half, top - 0.9]))
+        level = ob.support_level(o, view, [neighbour])
+        assert level == pytest.approx(0.9, abs=0.01)
+        o.support = level
+        ob.refit(o, None)
+        assert o.obb is not None
+        assert o.obb.center[2] - o.obb.size[2] / 2 == pytest.approx(0.9, abs=0.015)
+        alone = ob.support_level(standing(rng, x, y, bottom, bottom + 0.06), view)
+        assert alone is None or alone == pytest.approx(0.9, abs=0.01)  # never the top beside it
+        missed += alone is None
+    assert missed  # without leaving the neighbour out, its top beside it hid the counter
+
+
+def test_a_ledge_on_one_side_is_no_support_a_surrounding_surface_is(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Randomised: an object whose foot nobody saw, beside a ledge (a partition's edge, a sill)
+    on one side of its footprint over a floor out of reach: not extended, though the ledge is
+    the highest surface below it; on a counter around it: extended to the counter."""
+    for seed in range(25):
+        rng = np.random.default_rng(seed)
+        x, y = rng.uniform(-0.06, 0.06, 2)
+        bottom = rng.uniform(0.95, 1.0)
+        half = 0.04  # the object's (``standing``)
+        ledge = rng.uniform(0.86, bottom - 0.02)
+        depth = rng.uniform(0.03, 0.12)  # outwards from the footprint
+        along = rng.uniform(half, half + 0.1)  # along it, from its centre
+        side = rng.integers(4)
+        axis, sign = side // 2, 1.0 if side % 2 else -1.0
+        centre = [x, y]
+        centre[axis] += sign * (half + depth / 2)
+        halves = [along, along]
+        halves[axis] = depth / 2
+        top = (x, y, half, bottom + 0.06)
+        o = standing(rng, x, y, bottom, bottom + 0.06)
+        beside = fine(tabletop([(*centre, *halves, ledge), top], base=0.3, grid=FINE))
+        assert ob.support_level(o, beside) is None
+        with monkeypatch.context() as m:  # it is the highest surface below the object
+            m.setattr(ob, "_around", lambda pts, box: True)
+            assert ob.support_level(o, beside) == pytest.approx(ledge, abs=0.01)
+        counter = rng.uniform(0.86, bottom - 0.02)
+        around = fine(tabletop([top], base=counter, grid=FINE))
+        assert ob.support_level(o, around) == pytest.approx(counter, abs=0.01)
+
+
+def test_the_object_beneath_is_a_support() -> None:
+    """A cup on a plate: the plate's box holds the cup's centre and its top is below the cup: the
+    plate's top is the support; a lid above the cup's bottom is not what it stands on."""
+    rng = np.random.default_rng(5)
+    view = views_of({0: tabletop([(0.0, 0.0, 0.12, 0.92), (0.0, 0.0, 0.04, 1.03)])})
+    o = standing(rng, 0.0, 0.0, 0.97, 1.03)
+    plate = OBB(np.array([0.0, 0.0, 0.91]), np.eye(3), np.array([0.24, 0.24, 0.02]))
+    assert ob.support_level(o, view, [plate]) == pytest.approx(0.92, abs=0.01)
+    lid = OBB(np.array([0.0, 0.0, 0.95]), np.eye(3), np.array([0.24, 0.24, 0.1]))
+    assert not ob._beneath(lid, o.obb)  # type: ignore[arg-type]
+
+
 def test_label_maps_skip_masks_of_another_grid() -> None:
     state = ObjectState([obj(4, "cup", np.zeros((3, 3)), [0])], 5)
     insts = [{"object_id": 4, "mask": rle.encode(np.ones((10, 10), bool))},

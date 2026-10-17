@@ -207,6 +207,18 @@ MAX_SLOPE = 0.3
 FIELD_PRIOR = 0.2
 FIELD_SMOOTH = 2.0
 FIELD_MEAN_PRIOR = 100.0
+# The pairs measure a field only along the image axes along which the keyframes' overlaps move
+# what they share (``field_axes``): a camera that pans without tilting sees every surface in the
+# same rows from every keyframe, so no pair tells a keyframe's rows apart from another's — they
+# are fitted to whatever links the keyframes weakly (a robot's rendered room, panned at one
+# pitch: shared content shifted by 1 % of the image height at the p90, the fields bent 10 % from
+# the top row to the bottom one and leaned its window wall 3.2°, against 0.3° without rows).
+# Along an axis the overlaps shift content by less than FIELD_AXIS_SHIFT of the nodes' spacing
+# (p90 of the pairs' bins) the field is held constant: adjacent nodes along it are tied by
+# FIELD_TIE bins of average weight. The pan-tilt camera of examples/camera shifts its rows by 50 %
+# of the image height, the robot head of ainex-captures by 29 %: their fields keep their rows.
+FIELD_AXIS_SHIFT = 0.25
+FIELD_TIE = 1e6
 MAX_FACTOR = 1.5  # a correction never scales a pixel's depth by more than this (or less than 1/it)
 
 
@@ -303,6 +315,36 @@ def _roughness(nodes: tuple[int, int]) -> NDArray[np.float64]:
 
 
 FIELD_ROUGHNESS = _roughness(FIELD_NODES)
+
+
+def _axis_roughness(nodes: tuple[int, int], axis: int) -> NDArray[np.float64]:
+    """``LᵀL`` of the differences ``L`` between nodes adjacent along one image axis (0: x, 1: y)
+    of a field (row-major)."""
+    gx, gy = nodes
+    index = np.arange(gx * gy).reshape(gy, gx)
+    a, b = (index[:, :-1], index[:, 1:]) if axis == 0 else (index[:-1], index[1:])
+    L = np.zeros((a.size, gx * gy))
+    L[np.arange(a.size), a.ravel()] = 1.0
+    L[np.arange(a.size), b.ravel()] = -1.0
+    return L.T @ L
+
+
+def field_axes(bins: list[BinRatio], nodes: tuple[int, int] = FIELD_NODES) -> tuple[bool, bool]:
+    """Whether the pairs' ``bins`` measure a field along x and along y (``FIELD_AXIS_SHIFT``): the
+    p90 of how far each bin's points lie apart in the two keyframes' images, along that axis, in
+    spacings of the field's nodes. No bins (or no field): both."""
+    if not bins or not all(b.field_src for b in bins):
+        return True, True
+    gx, gy = nodes
+    xs = np.tile(np.linspace(0.0, 1.0, gx), gy)  # node places, row-major
+    ys = np.repeat(np.linspace(0.0, 1.0, gy), gx)
+    ws = np.array([b.field_src for b in bins])
+    wd = np.array([b.field_dst for b in bins])
+    out = []
+    for places, n in ((xs, gx), (ys, gy)):
+        shift = np.abs(ws @ places - wd @ places)  # bilinear weights reproduce a linear place
+        out.append(n < 2 or float(np.percentile(shift, 90)) * (n - 1) >= FIELD_AXIS_SHIFT)
+    return out[0], out[1]
 
 
 
@@ -469,7 +511,8 @@ class DepthAdjustment:
 def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any], fixed: set[int],
                              scales: tuple[float, ...] = ROBUST_SCALES, iterations: int = 10,
                              scale_fixed: set[int] | None = None,
-                             flat: set[int] | None = None) -> DepthAdjustment:
+                             flat: set[int] | None = None,
+                             axes: tuple[bool, bool] = (True, True)) -> DepthAdjustment:
     """Per-keyframe corrections (log scale a, slope b about ``pivots[k]`` and, when the ``bins``
     carry their places, a field F over the image; identity for ``k`` in ``fixed``, a = 0 for ``k``
     in ``scale_fixed``: its scale holds, its tilt and field are solved) minimising
@@ -482,7 +525,8 @@ def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any],
     nodes' differences 0 ``FIELD_SMOOTH``, and the field's mean over the image and the fields
     summed over the measured keyframes (node by node) held at 0 by ``FIELD_MEAN_PRIOR``; slopes
     are clamped to ±``MAX_SLOPE``. ``flat``: keyframes that take no field (their scale and tilt
-    alone are solved)."""
+    alone are solved); ``axes``: whether the field varies along x and along y (``field_axes``;
+    along an axis it may not, adjacent nodes are tied by ``FIELD_TIE``)."""
     from scipy.sparse import csr_matrix
 
     ident = [DepthCorrection(0.0, 0.0, float(pivots[k])) for k in range(n)]
@@ -530,7 +574,9 @@ def adjust_depth_corrections(n: int, bins: list[BinRatio], pivots: NDArray[Any],
     prior = np.diag(reg)
     if nodes:
         block = avg * (FIELD_MEAN_PRIOR * np.outer(FIELD_MEAN, FIELD_MEAN)
-                       + FIELD_SMOOTH * FIELD_ROUGHNESS)
+                       + FIELD_SMOOTH * FIELD_ROUGHNESS
+                       + FIELD_TIE * sum((_axis_roughness(FIELD_NODES, k)
+                                          for k in (0, 1) if not axes[k]), np.zeros((nodes,) * 2)))
         shared = np.zeros((nodes, nx))
         measured = set(src.tolist()) | set(dst.tolist())
         for k in bent:

@@ -5,6 +5,8 @@ one scale and tilt per keyframe cannot do."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -139,3 +141,93 @@ def test_a_keyframe_without_pairs_keeps_its_depth() -> None:
     adj = adjust_depth_corrections(3, bins, piv, {0})
     assert adj.corrections[2].identity and not adj.corrections[1].identity
     assert all(c.identity for c in adjust_depth_corrections(3, [], piv, set()).corrections)
+
+
+# --- the axes the pairs measure a field along (``field_axes``) ------------------------------------
+
+
+def _sweep(rng: np.random.Generator, yaw_step: float, pitch: Any) -> list[Any]:
+    from tests.synth.turning import head_pose
+
+    n = int(rng.integers(8, 14))
+    start = rng.uniform(0.0, 360.0)
+    return [head_pose(start + yaw_step * k, pitch_deg=float(pitch(k))) for k in range(n)]
+
+
+def _camera(rng: np.random.Generator) -> Any:
+    from oh_my_slam.core.types import Intrinsics
+
+    # Enough sampled pixels for pair_bins' minimum overlap of 300 points per direction.
+    w = int(rng.choice([320, 400, 480]))
+    h = w * 3 // 4
+    f = (w / 2) / np.tan(np.radians(rng.uniform(50.0, 90.0)) / 2)
+    return Intrinsics(f, f, w / 2, h / 2, w, h)
+
+
+def _bins(rng: np.random.Generator, poses: list[Any], K: Any, rows: bool) -> tuple[Any, ...]:
+    """Bins of the overlapping pairs of ``poses``, each keyframe's depth bent across its image
+    (and, with ``rows``, from its top to its bottom) and scaled (scene scale) at random."""
+    from tests.synth.turning import depth_grid
+
+    scale = rng.uniform(0.5, 3.0)
+    views = []
+    for T in poses:
+        d = depth_grid(T, K).astype(np.float64) * scale
+        x = (np.arange(d.shape[1]) + 0.5) / d.shape[1]
+        y = (np.arange(d.shape[0]) + 0.5) / d.shape[0]
+        bend = rng.uniform(-0.1, 0.1) * (x - 0.5)[None, :]
+        if rows:
+            bend = bend + rng.uniform(-0.1, 0.1) * (y - 0.5)[:, None]
+        views.append(DepthView(d * np.exp(bend), K.K(), T.matrix()))
+    F = np.array([T.R[:, 2] for T in poses])
+    pairs = [(i, j) for i in range(len(poses)) for j in range(i + 1, len(poses))
+             if F[i] @ F[j] > np.cos(np.radians(45.0))]
+    bins = [b for i, j in pairs for b in pair_bins(i, j, views[i], views[j])]
+    return views, pairs, bins
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_a_pan_measures_the_fields_columns_and_a_tilting_camera_their_rows(seed: int) -> None:
+    from oh_my_slam.reconstruction.depth import field_axes
+
+    rng = np.random.default_rng(seed)
+    K = _camera(rng)
+    pitch = rng.uniform(-20.0, 5.0)
+    pan = _sweep(rng, rng.uniform(5.0, 12.0), lambda k: pitch)
+    assert field_axes(_bins(rng, pan, K, rows=True)[2]) == (True, False)
+    tilt = rng.uniform(15.0, 25.0)
+    pan_tilt = _sweep(rng, rng.uniform(5.0, 12.0), lambda k: pitch + tilt * (k % 2))
+    assert field_axes(_bins(rng, pan_tilt, K, rows=True)[2]) == (True, True)
+    nod = _sweep(rng, 0.0, lambda k: -30.0 + rng.uniform(8.0, 12.0) * k)
+    assert field_axes(_bins(rng, nod, K, rows=True)[2]) == (False, True)
+    assert field_axes([]) == (True, True)
+    plain = [BinRatio(0, 1, 0.0, 0.0, 0.0, 1.0)]
+    assert field_axes(plain) == (True, True)  # bins without places: no field to measure
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_a_field_is_held_constant_along_an_axis_the_pairs_do_not_measure(seed: int) -> None:
+    """A pan at one pitch: every surface lies in the same rows of every keyframe that sees it, so
+    the keyframes' bends from top to bottom are not measured; the fields keep no rows (they lean
+    no wall) and still take the bends across the images out of the pairs."""
+    from oh_my_slam.reconstruction.depth import FIELD_NODES, field_axes
+
+    rng = np.random.default_rng(10 + seed)
+    K = _camera(rng)
+    pitch = rng.uniform(-20.0, 5.0)
+    poses = _sweep(rng, rng.uniform(5.0, 12.0), lambda k: pitch)
+    views, pairs, bins = _bins(rng, poses, K, rows=True)
+    axes = field_axes(bins)
+    piv = np.array([v.log_median() for v in views])
+    adj = adjust_depth_corrections(len(views), bins, piv, set(), scale_fixed={0}, axes=axes)
+    gx, gy = FIELD_NODES
+    for c in adj.corrections:
+        F = np.asarray(c.field or (0.0,) * (gx * gy)).reshape(gy, gx)
+        assert np.abs(F - F[0]).max() < 1e-3  # every row alike
+    assert np.percentile(adj.residuals_after, 90) < np.percentile(adj.residuals_before, 90)
+    # columns held instead: every column alike
+    adj = adjust_depth_corrections(len(views), bins, piv, set(), scale_fixed={0},
+                                   axes=(False, True))
+    for c in adj.corrections:
+        F = np.asarray(c.field or (0.0,) * (gx * gy)).reshape(gy, gx)
+        assert np.abs(F - F[:, :1]).max() < 1e-3

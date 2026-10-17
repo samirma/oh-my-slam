@@ -14,7 +14,7 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.ply import PointCloud, read_ply
 from oh_my_slam.mapping import store
-from oh_my_slam.mapping.objects import ObjectState, load_state
+from oh_my_slam.mapping.objects import MapObject, ObjectState, exportable, load_state
 from oh_my_slam.reconstruction.cloud import MapCloudSource, cloud_ply
 from oh_my_slam.schema import openlabel as ol
 from oh_my_slam.segmentation.api import SceneObject, map_cloud_source
@@ -108,6 +108,21 @@ def ply_payload(geo: Any, mode: str, records: list[store.FrameRecord], objs: Obj
 def map_objects(reader: store.MapReader) -> tuple[ObjectState, list[SceneObject]]:
     state = load_state(reader.path, reader.meta)
     return state, state.exported()
+
+
+def object_counts(reader: store.MapReader) -> tuple[int, int] | None:
+    """(the objects the map's scene lists, the candidates it keeps but never emits), from its
+    object records alone (``objects.exportable``; no point files read); None for a map without
+    object records."""
+    if not reader.exists(store.OBJECTS_JSON):
+        return None
+    state = reader.read_json(store.OBJECTS_JSON)
+    records = state.get("objects") if isinstance(state, dict) else None
+    if not isinstance(records, list):
+        return None
+    listed = sum(exportable(MapObject.from_dict(d, np.zeros((0, 3), np.float32)))
+                 for d in records)
+    return listed, len(records) - listed
 
 
 def map_cloud(reader: store.MapReader) -> PointCloud:

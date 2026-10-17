@@ -134,12 +134,30 @@ def ground_upright(box: OBB, floor_z: float, max_gap: float, min_visible: float 
     return OBB(center, box.R, size)
 
 
+def rest_on(box: OBB, level: float, min_visible: float) -> OBB:
+    """Extend a z-up box down to the surface at height ``level`` beneath it (an object whose lower
+    part nothing saw: cut off by the image border, or hidden behind its own front), when its
+    visible height is at least ``min_visible`` of the extended height."""
+    bottom = box.center[2] - box.size[2] / 2
+    top = box.center[2] + box.size[2] / 2
+    if not bottom > level or box.size[2] < min_visible * (top - level):
+        return box
+    center = box.center.copy()
+    center[2] = (top + level) / 2
+    size = box.size.copy()
+    size[2] = top - level
+    return OBB(center, box.R, size)
+
+
 def fit_obb(points: NDArray[Any], up: NDArray[Any], floor_level: float | None = None,
-            max_gap: float = 0.0, min_visible: float = 0.0) -> OBB:
+            max_gap: float = 0.0, min_visible: float = 0.0,
+            support_level: float | None = None, support_visible: float = 0.0) -> OBB:
     """Upright OBB for points in any frame, given that frame's unit "up" direction.
 
     ``floor_level`` is the floor's coordinate along ``up`` (``up · x`` for floor points); with
-    ``max_gap > 0`` the box is grounded (see :func:`ground_upright`).
+    ``max_gap > 0`` the box is grounded (see :func:`ground_upright`). ``support_level``: the
+    coordinate along ``up`` of the surface the object rests on, where nothing saw below its
+    visible bottom (:func:`rest_on`, with ``support_visible``).
     """
     up = np.asarray(up, dtype=np.float64)
     up /= np.linalg.norm(up)
@@ -147,6 +165,8 @@ def fit_obb(points: NDArray[Any], up: NDArray[Any], floor_level: float | None = 
     box = fit_upright_obb(np.asarray(points, dtype=np.float64) @ R_g.T)
     if floor_level is not None and max_gap > 0:
         box = ground_upright(box, floor_level, max_gap, min_visible)
+    if support_level is not None:
+        box = rest_on(box, support_level, support_visible)
     return OBB(R_g.T @ box.center, R_g.T @ box.R, box.size)
 
 

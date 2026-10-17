@@ -140,7 +140,11 @@ def _schemas() -> Json:
                                    "served on the service's machine only)"}}),
         "MapSummary": _object(
             {"name": _STR, "path": _STR, "frames": _INT, "viewer": _ref("Viewer")},
-            {"objects": {"type": ["integer", "null"]},
+            {"objects": {"type": ["integer", "null"],
+                         "description": "the objects the map's scene lists (every export of the "
+                                        "map has these)"},
+             "candidates": {"type": ["integer", "null"],
+                            "description": "detections the map keeps unconfirmed and never emits"},
              "last_update": _object({}, {"frames_added": _INT,
                                          "total_s": {"type": ["number", "null"]}}, more=True)},
             more=True),
