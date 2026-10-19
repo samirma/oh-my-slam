@@ -59,6 +59,13 @@ def member_points(a: NDArray[Any], b: NDArray[Any]) -> NDArray[np.bool_]:
     return np.asarray(found.numpy(), bool).reshape(-1)
 
 
+def _no_block_touched(exc: RuntimeError) -> bool:
+    """Open3D's abort when a frame's depth touches no voxel block (a frame facing a surface nearer
+    than the truncation, or given blocks of another frame): the frame has nothing to add, so it is
+    skipped instead of failing the whole update."""
+    return "No block is touched" in str(exc)
+
+
 @dataclass
 class FusionStats:
     frames: int = 0
@@ -117,9 +124,14 @@ class TsdfFusion:
         if inputs is None:
             return None
         img, intr, extr, cut = inputs
-        coords = self.vbg.compute_unique_block_coordinates(
-            img, intr, extr, depth_scale=1.0, depth_max=cut,
-            trunc_voxel_multiplier=self.trunc_voxels)
+        try:
+            coords = self.vbg.compute_unique_block_coordinates(
+                img, intr, extr, depth_scale=1.0, depth_max=cut,
+                trunc_voxel_multiplier=self.trunc_voxels)
+        except RuntimeError as exc:
+            if not _no_block_touched(exc):
+                raise
+            return None
         return np.asarray(coords.numpy(), np.int32).reshape(-1, 3)
 
     def integrate(self, depth: NDArray[Any], K: NDArray[Any], T_world_cam: Pose,
@@ -139,15 +151,24 @@ class TsdfFusion:
             return
         img, intr, extr, cut = inputs
         if blocks is None:
-            coords = self.vbg.compute_unique_block_coordinates(
-                img, intr, extr, depth_scale=1.0, depth_max=cut,
-                trunc_voxel_multiplier=self.trunc_voxels)
+            try:
+                coords = self.vbg.compute_unique_block_coordinates(
+                    img, intr, extr, depth_scale=1.0, depth_max=cut,
+                    trunc_voxel_multiplier=self.trunc_voxels)
+            except RuntimeError as exc:
+                if not _no_block_touched(exc):
+                    raise
+                return                              # the frame touches no block: nothing to add
         else:
             coords = o3c.Tensor(np.ascontiguousarray(blocks, np.int32))
         self.stats.frames += 1
         if coords.shape[0]:
-            self.vbg.integrate(coords, img, intr, extr, depth_scale=1.0, depth_max=cut,
-                               trunc_voxel_multiplier=self.trunc_voxels)
+            try:
+                self.vbg.integrate(coords, img, intr, extr, depth_scale=1.0, depth_max=cut,
+                                   trunc_voxel_multiplier=self.trunc_voxels)
+            except RuntimeError as exc:
+                if not _no_block_touched(exc):
+                    raise
         self.stats.seconds += time.perf_counter() - t0
 
     def release(self) -> None:
