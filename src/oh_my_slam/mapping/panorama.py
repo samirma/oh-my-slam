@@ -114,6 +114,7 @@ class PoseFit:
     per_frame_matches: dict[str, int] = field(default_factory=dict)  # matches per keyframe
     # median residual (pixels) of each pair's matches, both directions, by (a, b)
     per_pair_px: dict[tuple[str, str], float] = field(default_factory=dict)
+    per_pair_deg: dict[tuple[str, str], float] = field(default_factory=dict)  # ... in degrees
     distortion: float = 0.0  # the shared camera's division coefficient (module docstring)
     # ``screen_pairs``: the pairs it left out and its gate (degrees); None: not screened
     screened: int = 0
@@ -640,6 +641,8 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
     bounds = np.r_[pb.starts[::2], len(px)]
     fit.per_pair_px = {(p.a, p.b): float(np.median(px[lo:hi]))
                        for p, lo, hi in zip(used_pairs, bounds[:-1], bounds[1:], strict=True)}
+    fit.per_pair_deg = {(p.a, p.b): float(np.median(final[lo:hi]))
+                        for p, lo, hi in zip(used_pairs, bounds[:-1], bounds[1:], strict=True)}
     fit.poses = {n: Pose(R[vid[n]], C[vid[n]]) for n in names}
     fit.focal_scale = float(np.exp(phi))
     fit.distortion = kappa

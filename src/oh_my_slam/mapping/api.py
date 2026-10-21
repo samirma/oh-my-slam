@@ -109,6 +109,8 @@ class UpdateContext:
     notes: dict[str, Any] = field(default_factory=dict)
     # refined multi-view keyframes: (median match residual in degrees, matches)
     pose_support: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # the last refinement's verified pairs: median match residual in degrees
+    pair_deg: dict[tuple[str, str], float] = field(default_factory=dict)
     # stored keyframes whose depth this update corrected (index -> correction; their objects
     # follow)
     rescaled: dict[int, DepthCorrection] = field(default_factory=dict)
@@ -1031,6 +1033,7 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
     ctx.notes["pose_refinement"] = fit.summary()
     ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
                                  fit.per_frame_matches.get(n, 0)) for n in fit.poses})
+    ctx.pair_deg = dict(fit.per_pair_deg)
     log.info("pose refinement of %d keyframes: median residual %.3f° -> %.3f° (%d pairs)",
              len(fit.poses), fit.median_before_deg, fit.median_after_deg, fit.pairs)
     return {**poses, **fit.poses}, fit.focal_scale, fit.distortion
@@ -1041,6 +1044,14 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
 # the others (examples/camera added to a map of room.mp4). With a lens fitted (a wide-angle camera
 # that SfM's pinhole cannot pose), keyframes that one centre explains within TURN_CAMERA_DEG
 # (median residual of their matches, rotations refined alone) are given it.
+#
+# The median is the near pairs' (see TURN_FIT_DEG): a robot's walk that turned in place for 16
+# frames, then went 2.2 m sideways (a rendered house, e140's first update, its lens fitted by the
+# multi-view fallback) took one centre at 0.41°, its 0.84 m of centres collapsed onto one point,
+# and every later update met it at a scale of 0.005-0.05 (its own map not placed, the update
+# refused). Under one centre 24 % of its pairs keep more than 1.5° (p90 42°), against 0-4.8 % for
+# examples/camera's pan-tilt captures: one centre also needs the far pairs (TURN_PAIR_DEG,
+# TURN_PAIR_SHARE).
 TURN_CAMERA_DEG = 1.0
 
 
@@ -1052,7 +1063,8 @@ def _one_centre(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], names: set
     rotations refined alone (``_refine_multiview`` with the centres held; every other keyframe,
     and a new map's ``gauge`` keyframe, fixed). Returns all poses, or None (the refinement's notes
     left as they were) when the matches disagree with one centre by more than
-    ``TURN_CAMERA_DEG``. Noted as ``one_centre``."""
+    ``TURN_CAMERA_DEG``, or more than ``TURN_PAIR_SHARE`` of the pairs by more than
+    ``TURN_PAIR_DEG``. Noted as ``one_centre``."""
     names = {n for n in names if n in poses}
     if len(names) < 3:
         return None
@@ -1065,9 +1077,12 @@ def _one_centre(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], names: set
     out, _, _ = _refine_multiview(ctx, sfm, trial, names, refine_focal=False, rotation=False,
                                   model=model, hold_centres=True)
     median = float(ctx.notes["pose_refinement"]["median_after_deg"])
-    taken = median <= TURN_CAMERA_DEG
+    off = np.array(list(ctx.pair_deg.values()))
+    beyond = float(np.mean(off > TURN_PAIR_DEG)) if off.size else 0.0
+    taken = median <= TURN_CAMERA_DEG and beyond <= TURN_PAIR_SHARE
     ctx.notes["one_centre"] = {
         "keyframes": len(names), "median_deg": round(median, 4), "taken": taken,
+        "pairs_beyond": round(beyond, 4),
         "spread_before_m": round(float(max(np.linalg.norm(poses[n].t - C) for n in names)), 4)}
     if taken:
         return out

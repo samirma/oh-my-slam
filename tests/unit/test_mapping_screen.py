@@ -135,6 +135,8 @@ def test_per_pair_residuals_are_each_pairs_median() -> None:
     fit = refine_poses(rig.pairs, rig.views(), set(truth) - {"f000"}, scales=())
     assert set(fit.per_pair_px) == {(p.a, p.b) for p in rig.pairs}
     assert max(fit.per_pair_px.values()) < 1.5  # true poses: the keypoint noise
+    assert set(fit.per_pair_deg) == set(fit.per_pair_px)
+    assert max(fit.per_pair_deg.values()) < 0.2
 
 
 def test_a_pair_whose_matches_no_turn_explains_keeps_its_best_hypothesis() -> None:

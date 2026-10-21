@@ -56,7 +56,7 @@ def jpg(i: int) -> str:
 def ctx_of(new: list[Any], old: list[Any] | None = None, tmp: Path | None = None,
            **kw: Any) -> SimpleNamespace:
     return SimpleNamespace(new=new, old_frames=old or [], notes={}, pose_support={}, rejected=[],
-                           rescaled={}, meta=kw.pop("meta", {}), update_id=1,
+                           pair_deg={}, rescaled={}, meta=kw.pop("meta", {}), update_id=1,
                            rebuild=kw.pop("rebuild", None), features=None,
                            work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None),
                            lens_camera=kw.pop("lens_camera", None), **kw)

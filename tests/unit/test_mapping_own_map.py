@@ -364,9 +364,14 @@ def test_the_block_is_scaled_when_one_of_the_scales_is_weak(
     assert w.seen["with_scale"] is with_scale
 
 
-@pytest.mark.parametrize("median,taken", [(0.4, True), (1.4, False)])
+@pytest.mark.parametrize("median,beyond,taken", [
+    (0.4, 0.0, True),
+    (1.4, 0.0, False),
+    (0.4, 0.24, False),  # e140: a walk that turned, then went sideways; its far pairs disagree
+])
 def test_a_wide_angle_camera_turning_in_place_gets_one_centre(
-        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, median: float, taken: bool) -> None:
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, median: float, beyond: float,
+        taken: bool) -> None:
     w = _ext(monkeypatch, tmp_path, n=4, lens=2)
 
     def refine(ctx: Any, sfm: Any, poses: Any, free: set[str], refine_focal: bool,
@@ -375,6 +380,8 @@ def test_a_wide_angle_camera_turning_in_place_gets_one_centre(
         ctx.notes["pose_refinement"] = {"median_after_deg": median if hold_centres else 0.3}
         if hold_centres:
             ctx.pose_support["x"] = (median, 1)
+            far = round(100 * beyond)
+            ctx.pair_deg = {("a", f"b{i}"): 2.0 if i < far else 0.3 for i in range(100)}
         return poses, 1.0, 0.0
 
     monkeypatch.setattr(api, "_refine_multiview", refine)
@@ -384,7 +391,7 @@ def test_a_wide_angle_camera_turning_in_place_gets_one_centre(
                         {v.name: Pose(np.eye(3), np.array(centres[v.name])) for v in todo})
     api._extend(w.ctx, w.sfm, w.names, False, False, None, quiet, 0.0)
     note = w.ctx.notes["one_centre"]
-    assert note["taken"] is taken and note["keyframes"] == 4
+    assert note["taken"] is taken and note["keyframes"] == 4 and note["pairs_beyond"] == beyond
     placed = w.sfm.extended["poses"]
     if taken:
         # fewer than three SfM keyframes: the median of all their centres, x 0.02
