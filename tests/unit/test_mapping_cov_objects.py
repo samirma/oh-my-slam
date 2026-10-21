@@ -140,6 +140,34 @@ def test_rescaling_moves_sightings_of_held_keyframes_only() -> None:
     assert by_frame[5] == s5 and len(o.points) == 0
 
 
+def test_a_depth_dependent_rescale_keeps_a_sighting_s_bounds_in_order() -> None:
+    """A correction that pushes the near corner out and pulls the far one in (here the clamp,
+    x1.5 at 1 m and x1/1.5 at 1.4 m) moved each bound on its own past the other: a box inside
+    out, which agrees with no sighting, not even itself. The bounds are the box of the moved
+    corners."""
+    s0 = Sighting(0, 100, 0.0, (0.0, 0.0, 1.2), (-0.1, -0.1, 1.0), (0.1, 0.1, 1.4))
+    o = MapObject(3, "cup", {"cup": 1.0}, [0.9], np.zeros((0, 3), np.float32), frames=[0],
+                  obs_depth=1.2, sightings=[s0])
+    corr = DepthCorrection(0.0, -4.0, float(np.log(1.2)))
+    ob.rescale_objects(ObjectState([o], 4), {0: corr}, [rec(0, Pose.identity())])
+    (s,) = o.sightings
+    assert all(a <= b for a, b in zip(s.lo, s.hi, strict=True))
+    assert s.lo[2] == pytest.approx(1.4 / 1.5) and s.hi[2] == pytest.approx(1.5)
+    assert ob._agreeing([s], 1.2) == [s]
+
+
+def test_an_object_none_of_whose_sightings_agree_is_fitted_to_all_its_points() -> None:
+    """Sightings stored inside out (by an earlier rescale) agree with none: the box is fitted to
+    every point instead of failing on the bounds of no sighting."""
+    inside_out = [Sighting(f, 100, 0.0, (0.0, 0.0, 2.0), (0.5, 0.5, 2.5), (-0.5, -0.5, 1.5))
+                  for f in range(ob.CONSENSUS_MIN)]
+    pts = np.random.default_rng(1).uniform(-0.1, 0.1, (50, 3)).astype(np.float32) + [0, 0, 2]
+    o = MapObject(3, "cup", {"cup": 1.0}, [0.9] * len(inside_out), pts,
+                  frames=[s.frame for s in inside_out], obs_depth=2.0, sightings=inside_out)
+    assert ob.agreeing_sightings(o) == []
+    np.testing.assert_array_equal(ob.fit_points(o), pts)
+
+
 def test_rescaling_moves_the_support_an_object_rests_on() -> None:
     s0 = Sighting(0, 100, 0.0, (0.0, 0.0, 2.0), (-0.1, -0.1, 1.9), (0.1, 0.1, 2.1))
     o = MapObject(3, "cup", {"cup": 1.0}, [0.9], np.zeros((0, 3), np.float32), frames=[0],

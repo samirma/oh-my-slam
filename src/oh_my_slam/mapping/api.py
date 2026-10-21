@@ -813,6 +813,13 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             model = _vetted(ctx, _plausible_focal(ctx, sfm.map_incremental(ctx.work / "sfm_incr"),
                                                   prior), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
+        rejected = ctx.notes.get("sfm_focal_rejected", {})
+        if (model is None or placed < MIN_PLACED_FRACTION) and rejected and min(
+                r["turn_deg"] for r in rejected.values()) < FOCAL_HELD_MAX_TURN_DEG:
+            model = _vetted(ctx, sfm.map_incremental(ctx.work / "sfm_incr_held", hold_focal=True),
+                            turns)
+            ctx.notes["sfm_focal_held"] = model is not None
+        placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is not None and placed >= MIN_PLACED_FRACTION and _turns_through_lens(
                 ctx, sfm, model, new_names):
             model, rotation = None, True  # its translation is the lens's distortion
@@ -828,10 +835,13 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                 _vet(ctx, model, turns)
                 progress(f"{model.method}: {len(model.registered)} keyframes posed in "
                          f"{time.perf_counter() - t0:.0f} s")
-                model = _join_unplaced(ctx, sfm, model, new_names, turns, is_video, client,
-                                       progress)
-                return model
-    reason = ("no metric scale from the SfM points" if scaleless
+                joined = _join_unplaced(ctx, sfm, model, new_names, turns, is_video, client,
+                                        progress)
+                if joined is not None:
+                    return joined
+    reason = (f"SfM's parts disagree in scale by more than x{BLOCK_FACTOR_MAX:g}"
+              if ctx.notes.get("sfm_scale_rejected") else "no metric scale from the SfM points"
+              if scaleless
               else "a pan from one spot through a lens with distortion"
               if ctx.notes.get("sfm_turning_rejected") else "rotation-dominant input"
               if rotation else "SfM's focal length is off the camera's prior"
@@ -864,8 +874,17 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
 # from about one spot, 0.49° with a coefficient of +0.11 (8.5 % at the corners), parallax that
 # the lens term absorbs (their own refinement fits no distortion): SfM poses them, as it does a
 # turning pinhole (the rendered robot head of ainex-captures).
+#
+# The median over all matches is the near pairs': a robot walking 2 m sideways past bare walls in
+# 0.1 m steps (a rendered house, e71's first update, 37° of turn) fits rotations alone to 0.36°
+# with a coefficient of -0.40 (28 % at the corners), its neighbours' few centimetres of parallax
+# absorbed, while 22 % of its pairs keep more than 1.5° (median of their matches; p90 2.4°): the
+# far ones. A camera turning in place leaves none: examples/camera's second 12 captures, mapped
+# again with the first 12 (-0.53, 0.42°), keep 1.5 % beyond 1.5° (p90 0.83°).
 TURN_FIT_DEG = 0.5  # rotations alone explain the matches within this (median): a pan from one spot
 TURN_LENS_SHIFT = 0.15  # ... through a lens that moves the image corners by at least this share
+TURN_PAIR_DEG = 1.5  # ... and leave at most TURN_PAIR_SHARE of the pairs beyond this (their median)
+TURN_PAIR_SHARE = 0.1
 TURN_MATCHES = 200  # matches per verified pair the test fits (evenly subsampled)
 
 
@@ -873,9 +892,10 @@ def _turns_through_lens(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: se
     """Whether a new map's SfM ``model`` poses a camera that turns in place through a lens with
     distortion (see ``TURN_FIT_DEG``): the rotation-only refinement (``panorama.refine_turning``,
     the shared camera's focal length and distortion refined unless its lens is known) from SfM's
-    rotations fits the verified matches of its keyframes within ``TURN_FIT_DEG``, and the camera's
-    lens (a known one, or the one the fit found) moves the image corners by at least
-    ``TURN_LENS_SHIFT``. Noted as ``sfm_turning_rejected``."""
+    rotations fits the verified matches of its keyframes within ``TURN_FIT_DEG``, leaving at most
+    ``TURN_PAIR_SHARE`` of the pairs beyond ``TURN_PAIR_DEG``, and the camera's lens (a known one,
+    or the one the fit found) moves the image corners by at least ``TURN_LENS_SHIFT``. Noted as
+    ``sfm_turning_rejected``."""
     from oh_my_slam.mapping import panorama
 
     posed = sorted(n for n in model.registered if n in names)
@@ -888,12 +908,16 @@ def _turns_through_lens(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: se
     cam = K[posed[0]]
     k = next((c.k for c in K.values() if c.k), fit.distortion)
     # the lens the fit found, at the focal length it fitted with it
-    shift = panorama.corner_shift((cam.width, cam.height),
-                                  cam.fx * (1.0 if known else fit.focal_scale), k)
-    turning = fit.pairs > 0 and fit.median_after_deg <= TURN_FIT_DEG and shift >= TURN_LENS_SHIFT
+    focal = cam.fx * (1.0 if known else fit.focal_scale)
+    shift = panorama.corner_shift((cam.width, cam.height), focal, k)
+    off = np.degrees(np.arctan(np.array(list(fit.per_pair_px.values())) / focal))
+    beyond = float(np.mean(off > TURN_PAIR_DEG)) if off.size else 0.0
+    turning = (fit.pairs > 0 and fit.median_after_deg <= TURN_FIT_DEG
+               and shift >= TURN_LENS_SHIFT and beyond <= TURN_PAIR_SHARE)
     ctx.notes["sfm_turning_fit"] = {"method": model.method,
                                     "median_deg": round(fit.median_after_deg, 4),
-                                    "distortion": round(k, 4), "corner_shift": round(shift, 4)}
+                                    "distortion": round(k, 4), "corner_shift": round(shift, 4),
+                                    "pairs_beyond": round(beyond, 4)}
     if turning:
         ctx.notes["sfm_turning_rejected"] = ctx.notes["sfm_turning_fit"]
     return turning
@@ -905,14 +929,26 @@ def _turns_through_lens(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: se
 # 253-294 px (global) and 28,800-271,000 px (incremental) for a 1370 px prior, and to 7.5 times
 # its prior on 9 of its first, uncropped frames; the office photos and the street2 video stay
 # within 1.1 of theirs.
+#
+# A camera that hardly turns leaves its focal length free: the matches of a robot strafing 2.6 m
+# past bare walls (a rendered house, e62's first update, 1.3° of turn) fit 1449 px as well as
+# its 689 px, the global model trading the focal length for distance; rejected, its keyframes went
+# to the multi-view fallback, which refined the focal length to 1346 px for the map to keep, and
+# the next update's SfM (at 654 px, right) was rejected against that. Incremental SfM with the
+# focal length held at the prior posed 23 of the 26 keyframes, the walk's shape within 5 cm
+# (median) of the robot's true path, against 22 cm by the fallback. A camera that turns has a
+# focal length its matches fix: examples/camera's wrong one (59° of turn) is a lens no pinhole
+# stands in for, which the fallback fits; held there, the pinhole lost 11 of its 36 keyframes.
+FOCAL_HELD_MAX_TURN_DEG = 15.0  # a rejected model turning less than this is posed again, held
 
 
 def _plausible_focal(ctx: UpdateContext, model: SfmModel | None, prior: CameraPrior
                      ) -> SfmModel | None:
-    """``model``, or None (not accepted, ``notes["sfm_focal_rejected"]``) when the focal length
-    of its camera of the prior's image size is off the prior by more than
-    ``panorama.FOCAL_MAX_FACTOR``."""
+    """``model``, or None (not accepted, ``notes["sfm_focal_rejected"]``, with how far its
+    keyframes turn from the first: ``turn_deg``) when the focal length of its camera of the
+    prior's image size is off the prior by more than ``panorama.FOCAL_MAX_FACTOR``."""
     from oh_my_slam.mapping.panorama import FOCAL_MAX_FACTOR
+    from oh_my_slam.mapping.trajectory import rotation_deg
 
     if model is None or prior.focal is None:
         return model
@@ -921,8 +957,10 @@ def _plausible_focal(ctx: UpdateContext, model: SfmModel | None, prior: CameraPr
             continue
         f = float(np.mean(np.asarray(cam.params)[list(cam.focal_length_idxs())]))
         if max(f / prior.focal, prior.focal / f) > FOCAL_MAX_FACTOR:
+            Rs = [model.pose(n).R for n in model.registered]
             ctx.notes.setdefault("sfm_focal_rejected", {})[model.method] = {
-                "focal_px": round(f, 1), "prior_px": round(prior.focal, 1)}
+                "focal_px": round(f, 1), "prior_px": round(prior.focal, 1),
+                "turn_deg": round(max((rotation_deg(R, Rs[0]) for R in Rs), default=0.0), 1)}
             log.warning("%s: its focal length %.0f px is off the camera's prior %.0f px by more "
                         "than %g times: a wrong camera model, not accepted", model.method, f,
                         prior.focal, FOCAL_MAX_FACTOR)
@@ -1131,7 +1169,7 @@ def _model_intrinsics(sfm: Sfm, model: SfmModel, names: set[str]) -> dict[str, I
 
 def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set[str],
                    turns: set[frozenset[str]], is_video: bool, client: Any, progress: Progress
-                   ) -> SfmModel:
+                   ) -> SfmModel | None:
     """Bring every keyframe of a new map onto the main reconstruction consistently
     (``mapping.trajectory``):
 
@@ -1157,7 +1195,9 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
        support them, and re-placed poses that still disagree with their gravity
        (``trajectory.tilted_keyframes``).
 
-    Keyframes without a verified connection, and rejected poses, are left out (never guessed)."""
+    Keyframes without a verified connection, and rejected poses, are left out (never guessed).
+    A model whose blocks 2 rescales by more than ``BLOCK_FACTOR_MAX`` is no model of the scene:
+    None (noted as ``sfm_scale_rejected``), and the multi-view fallback poses the keyframes."""
     from oh_my_slam.mapping import trajectory as traj
 
     posed = {n: model.pose(n) for n in model.registered}
@@ -1172,6 +1212,14 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     join: dict[str, Any] = {"reconstructions": model.notes.get("reconstructions"),
                             "merged_by_shared_keyframes": sorted(merged)}
     realigned = _fix_blocks(ctx, sfm, model, join)
+    wild = [m["factor"] for m in join.get("fixed_blocks", [])
+            if max(m["factor"], 1 / m["factor"]) > BLOCK_FACTOR_MAX]
+    if wild:
+        ctx.notes["sfm_join"] = join
+        ctx.notes["sfm_scale_rejected"] = {"method": model.method, "factors": wild}
+        log.warning("%s: parts of the model disagree with their depth by x%s in scale: not a "
+                    "model of one scene", model.method, ", x".join(f"{f:.3g}" for f in wild))
+        return None
     posed = {n: model.pose(n) for n in model.registered}
     # photos that hang on the rest through one keyframe have a free SfM scale and too few
     # keyframes for ``_fix_blocks`` to judge it: they are joined like unplaced ones (the multi-view
@@ -1484,6 +1532,15 @@ def _ups_cam(ctx: UpdateContext) -> dict[str, NDArray[np.float64]]:
             for nf in ctx.new if nf.frame.gravity is not None}
 
 
+# A block of a new map's SfM model is rescaled to agree with its depth by 0.09-0.5 (a room.mp4
+# replay, the AiNex robot's square, robot walks); a global model of a robot strafing 2.6 m past a
+# wicker chair (a rendered house, e108: its weave filled the frames) had the walk's first 21
+# keyframes 0.36 m apart and its last 5 needing x966: rescaled, the walk stayed six times too
+# short and every later update was placed against it, 3-10 m off. The multi-view fallback put the
+# same walk within 0.36 m of its true path.
+BLOCK_FACTOR_MAX = 20.0
+
+
 def _fix_blocks(ctx: UpdateContext, sfm: Sfm, model: SfmModel, join: dict[str, Any]
                 ) -> dict[str, Pose]:
     """Poses of the model's keyframes whose SfM scale disagrees with their depth or whose tilt
@@ -1640,6 +1697,12 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, i
                                         rotation=rotation, model=inc)
     if ctx.lens_camera is not None:  # a wide-angle camera of this update: one centre if it turns
         poses = _one_centre(ctx, sfm, poses, set(poses) & new_names, model=inc) or poses
+    if block or mv:
+        K = (_model_intrinsics(sfm, inc, new_names) if inc is not None
+             else _keyframe_intrinsics(ctx, sfm, new_names))
+        off = _depth_contradicted_placements(ctx, sfm, poses, free, K, video=is_video)
+        if off:
+            poses = {n: T for n, T in poses.items() if n not in off}
     method = "+".join(parts) or "sfm-incremental"
     # new cameras keep the intrinsics the incremental extension refined the poses with
     model = sfm.extend_with_poses(
@@ -1822,6 +1885,141 @@ def _on_the_floor(ctx: UpdateContext, own: dict[str, Pose], S: Any, note: dict[s
         return S
     note["floor_shift_m"] = round(shift, 3)
     return Sim3(S.s, S.R, S.t + np.array([0.0, 0.0, shift]))
+
+
+# The keyframes an update places by their own map or by anchored multi-view are held to the map by
+# their verified matches, whose epipolar residual cannot tell how far along its baseline a keyframe
+# lies: a robot's video of a rendered house (e38, procthor 3665: bare walls, about 130 SIFT
+# keypoints a frame) whose walk broke into pieces had its bathroom placed 17 m from where it was
+# filmed and 1.4 m below the floor, its matches to the two keyframes that saw it before fitting
+# within 1-4°, and a hallway 3.3 m up; later updates registered onto both. The points a link
+# matches, lifted with each keyframe's depth, say where it is: on that map, of the links between a
+# keyframe placed within 1 m of the robot's true path and one placed more than 4 m from it, 99 %
+# have no point agreeing (median 7.7 m apart), while half the links between keyframes placed
+# within 1 m agree on 96 % of theirs. A placed keyframe is confirmed when an agreeing link joins
+# it to the map's keyframes, directly or through confirmed ones. The unconfirmed ones, in groups
+# held together by their links not judged to disagree, are left out when a link of the group to a
+# confirmed keyframe disagrees, or when none joins it to one: only the own map's or multi-view's
+# guess holds it there (the replayed e38's hallway, 16 m off, linked to nothing confirmed). A group
+# joined to them by links that judge nothing (fewer than ``LINK_MIN_POINTS`` points within
+# ``OWN_ALIGN_MAX_DEPTH`` of both: far views) keeps its place.
+#
+# The keyframes the extension's SfM registered are judged as blocks, held together by any link
+# between them: SfM registers a new room onto a room it resembles (e78, the same house: a robot
+# leaving its first room through a door, 13 keyframes registered 3.5-8.7 m from where they were
+# filmed, every link of theirs to the map's keyframes disagreeing or judging nothing), while a
+# keyframe whose own depth is off (scaled by 0.5-0.7 later) disagrees with neighbours that SfM
+# placed right. A block with a confirmed keyframe keeps all of its own; one without is judged as a
+# group is (e78's replay: the 24 keyframes 3.5-9.8 m off left out, none of the 46 within 0.7 m).
+#
+# A video's keyframes are one walk: when the links leave most of an update's out, the few they keep
+# that no link to the rest agrees with were matched to a look-alike place (e78's second replay: a
+# keyframe 5.9 m from where it was filmed, its 10 links to the map agreeing — a room like the one
+# it saw — and its 8 to the walk's other keyframes disagreeing; the next update registered 10
+# keyframes onto it, 5.2-5.9 m off). They are left out with the rest, at the cost of the few placed
+# well among them (e78's replays: 2-3 keyframes within 1 m).
+LINK_FEW_KEPT = (2, 0.25)  # at most max(2, this share of the update's placed keyframes)
+LINK_AGREE_TOL = (0.10, 0.15)  # a point agrees within max(10 cm, 15 % of its nearer depth)
+LINK_AGREE_SHARE = 0.5  # a link agrees when this share of its points does
+LINK_MIN_POINTS = 5
+
+
+def _depth_contradicted_placements(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose],
+                                   free: set[str], K: dict[str, Intrinsics],
+                                   video: bool = False) -> set[str]:
+    """The keyframes this update places (``poses``; ``free``: those its own map or anchored
+    multi-view placed, the others SfM registered) that the depth of their verified links
+    contradicts, or that no link ties to the map (see ``LINK_AGREE_TOL``); of a ``video``, also
+    the few kept that disagree with the rest (``LINK_FEW_KEPT``). Noted as
+    ``links_contradicted``."""
+    from oh_my_slam.mapping import panorama
+
+    new = {f"{nf.kf.name}.jpg": nf for nf in ctx.new}
+    old = {Path(f.image).name: f for f in ctx.old_frames}
+    placed = set(poses) & set(new)
+    free = free & placed
+    if not free:
+        return set()
+    registered = placed - free
+    near = {n for p in sfm.verified_pairs() if p & placed for n in p}
+    views: dict[str, panorama.View] = {}
+
+    def view(n: str) -> panorama.View:
+        if n not in views:
+            if n in new:
+                nf = new[n]
+                views[n] = panorama.View(poses[n], K.get(n, nf.frame.intrinsics), nf.frame.depth,
+                                         nf.frame.K_grid, nf.full_size, nf.lens)
+            else:
+                f = old[n]
+                views[n] = panorama.View(f.T_map_cam, f.K, store.load_depth(ctx.tx.current,
+                                                                            f.name),
+                                         f.K_grid, (f.width, f.height), f.K if f.K.k else None)
+        return views[n]
+
+    # links by verdict: True agrees, False disagrees, None judges nothing
+    links: dict[bool | None, dict[str, set[str]]] = {True: {}, False: {}, None: {}}
+    for p in panorama.verified_matches(sfm.db, near & (placed | set(old))):
+        va, vb = view(p.a), view(p.b)
+        Xa, Xb = panorama.lift(va, p.uv_a), panorama.lift(vb, p.uv_b)
+        da, db = np.linalg.norm(Xa - va.pose.t, axis=1), np.linalg.norm(Xb - vb.pose.t, axis=1)
+        ok = np.isfinite(da) & np.isfinite(db) & (da < OWN_ALIGN_MAX_DEPTH) & (
+            db < OWN_ALIGN_MAX_DEPTH)
+        verdict: bool | None = None
+        if ok.sum() >= LINK_MIN_POINTS:
+            tol = np.maximum(LINK_AGREE_TOL[0], LINK_AGREE_TOL[1] * np.minimum(da[ok], db[ok]))
+            verdict = bool(np.mean(np.linalg.norm(Xa[ok] - Xb[ok], axis=1) < tol)
+                           >= LINK_AGREE_SHARE)
+        links[verdict].setdefault(p.a, set()).add(p.b)
+        links[verdict].setdefault(p.b, set()).add(p.a)
+
+    def confirmed_from(anchors: set[str], off: set[str]) -> set[str]:
+        confirmed, stack = set(anchors), sorted(anchors)
+        while stack:
+            for m in links[True].get(stack.pop(), set()) - confirmed - off:
+                confirmed.add(m)
+                stack.append(m)
+        return confirmed
+
+    def groups(names: set[str], verdicts: tuple[bool | None, ...]) -> list[set[str]]:
+        out, left = [], set(names)
+        while left:
+            group, stack = set(), [min(left)]
+            while stack:
+                n = stack.pop()
+                group.add(n)
+                stack.extend(set().union(*(links[v].get(n, set()) for v in verdicts))
+                             & left - group)
+            left -= group
+            out.append(group)
+        return out
+
+    def held_by_nothing(group: set[str], confirmed: set[str]) -> bool:
+        return (any(links[False].get(n, set()) & confirmed for n in group)
+                or not any(links[None].get(n, set()) & confirmed for n in group))
+
+    confirmed = confirmed_from(set(old), set())
+    off: set[str] = set()
+    for block in groups(registered, (True, False, None)):
+        if not block & confirmed and held_by_nothing(block, confirmed):
+            off |= block
+    confirmed = confirmed_from(set(old) | (registered - off), off)
+    # the unconfirmed keyframes, in groups held together by the links not judged to disagree
+    for group in groups(free - confirmed, (True, None)):
+        if held_by_nothing(group, confirmed):
+            off |= group
+    kept = placed - off
+    if video and off and kept and len(kept) <= max(LINK_FEW_KEPT[0],
+                                                   LINK_FEW_KEPT[1] * len(placed)):
+        between = {v for v in links for n in kept if links[v].get(n, set()) & off}
+        if between and True not in between:
+            off |= kept
+    if off:
+        ctx.notes["links_contradicted"] = sorted(off)
+        log.warning("%d keyframes whose placement the depth of their links to the map "
+                    "contradicts, or that no link ties to it, are left out: %s", len(off),
+                    ", ".join(sorted(off)))
+    return off
 
 
 def _contradicted_new(ctx: UpdateContext, sfm: Sfm, inc: SfmModel, new: set[str]

@@ -1163,7 +1163,8 @@ def fit_points(obj: MapObject) -> NDArray[np.float32]:
             for x in shaping:
                 allowed |= source_of(x.reliable, x.confident, x.through)
             ok = (obj.point_sources() & allowed) != 0
-        if len(keep) < len(shaping):
+        # none agreeing: sightings stored inside out (``rescale_objects`` before it moved corners)
+        if keep and len(keep) < len(shaping):
             lo = np.min([x.lo for x in keep], axis=0) - CONSENSUS_MARGIN
             hi = np.max([x.hi for x in keep], axis=0) + CONSENSUS_MARGIN
             ok &= np.all((obj.points >= lo) & (obj.points <= hi), axis=1)
@@ -1410,8 +1411,14 @@ def rescale_objects(state: ObjectState, rescaled: dict[int, DepthCorrection], re
                          ) -> tuple[float, float, float]:
                 w = T.t + _factor_at(corr, T, K, v) * (np.asarray(v, np.float64) - T.t)
                 return (float(w[0]), float(w[1]), float(w[2]))
+            # the bounds as the box of the moved corners: corners at different depths move by
+            # different factors, and moved on their own lo could pass hi (a correction of 84 %
+            # turned a sighting inside out, and the update failed on it, every one after it too)
+            corners = np.array([moved_to((x, y, z)) for x in (s.lo[0], s.hi[0])
+                                for y in (s.lo[1], s.hi[1]) for z in (s.lo[2], s.hi[2])])
             out.append(Sighting(s.frame, s.points, s.border, moved_to(s.centroid),
-                                moved_to(s.lo), moved_to(s.hi), s.confident, s.through))
+                                _t3(corners.min(axis=0)), _t3(corners.max(axis=0)), s.confident,
+                                s.through))
         w = np.asarray(weights)
         c_obj = float(np.exp(np.sum(w * np.asarray(logs)) / np.sum(w)))
         C_obj = np.sum(np.asarray(centres) * w[:, None], axis=0) / np.sum(w)

@@ -235,12 +235,15 @@ class SfmModel:
         return np.asarray([p.xyz for p in self.rec.points3D.values()], np.float64).reshape(-1, 3)
 
     def baseline_ratio(self) -> float:
-        """Median distance between capture-order neighbours / median point depth."""
+        """Median distance of the centres from their median centre / median point depth: how far
+        the camera moved, not how densely it was sampled (a robot walking 2.6 m in 0.1 m steps
+        past walls 5 m away, a rendered house's first update, came to 0.018 between capture-order
+        neighbours and was taken for a camera turning in place)."""
         names = self.registered
         if len(names) < 3:
             return 0.0
         C = np.array([self.pose(n).t for n in names])
-        base = np.median(np.linalg.norm(np.diff(C, axis=0), axis=1))
+        base = np.median(np.linalg.norm(C - np.median(C, axis=0), axis=1))
         depths = []
         for n in names[:: max(1, len(names) // 20)]:
             _, xyz = self.observations(n, max_error=4.0, min_track=2)
@@ -838,11 +841,12 @@ class Sfm:
         return model
 
     def map_incremental(self, out: Path, input_path: Path | None = None,
-                        fix_existing: bool = False, constant_cameras: set[int] | None = None
-                        ) -> SfmModel | None:
+                        fix_existing: bool = False, constant_cameras: set[int] | None = None,
+                        hold_focal: bool = False) -> SfmModel | None:
         """Incremental mapping; with ``input_path``, an extension of that reconstruction (its
         frames fixed with ``fix_existing``, the intrinsics of ``constant_cameras`` held), with a
-        fixed random seed so that the same input extends a map the same way."""
+        fixed random seed so that the same input extends a map the same way. ``hold_focal``: the
+        cameras keep their (prior) focal length."""
         import pycolmap
 
         opts = pycolmap.IncrementalPipelineOptions()
@@ -850,6 +854,7 @@ class Sfm:
         opts.fix_existing_frames = fix_existing
         opts.structure_less_registration_fallback = True
         opts.num_threads = SFM_THREADS
+        opts.ba_refine_focal_length = not hold_focal
         if self.only is not None:
             opts.image_names = self.only
         if input_path:

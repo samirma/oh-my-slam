@@ -78,6 +78,11 @@ def test_an_own_map_registers_its_keyframes_only(monkeypatch: pytest.MonkeyPatch
     sfm_mod.Sfm(tmp_path / "db.db", tmp_path, tmp_path / "w").map_global(tmp_path / "g")
     assert seen == [("global", ["a.jpg", "b.jpg"]), ("incremental", ["a.jpg", "b.jpg"]),
                     ("global", [])]
+    monkeypatch.setattr(pycolmap, "incremental_mapping", lambda db, img, out, opts, input_path:
+                        seen.append(("refine_focal", opts.ba_refine_focal_length)) or {})
+    own.map_incremental(tmp_path / "i", hold_focal=True)
+    own.map_incremental(tmp_path / "i")
+    assert seen[-2:] == [("refine_focal", False), ("refine_focal", True)]
 
 
 # --- placing the own map ------------------------------------------------------------------------
@@ -288,6 +293,9 @@ def _ext(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n: int = 14, aligned: 
         return poses, 1.0, 0.0
 
     monkeypatch.setattr(api, "_refine_multiview", refine)
+    monkeypatch.setattr(api, "_depth_contradicted_placements",
+                        lambda ctx, sfm, poses, free, K, video: (
+                            seen.__setitem__("judged", set(free)) or set()))
     ctx = ctx_of(new, old, tx=tx, lens_camera=lens)
     return SimpleNamespace(ctx=ctx, sfm=_ExtSfm(inc), names=names, seen=seen)
 
@@ -302,6 +310,22 @@ def test_a_video_the_extension_leaves_unregistered_is_placed_as_its_own_map(
     assert w.seen["with_scale"] is False  # both metric: the block keeps its size
     assert w.ctx.notes["mv_names"] == [jpg(113)]  # the one the own map did not hold
     assert w.seen["refined"] == [(w.names, False)]  # every new keyframe moves
+
+
+def test_keyframes_whose_placement_their_links_contradict_are_left_out(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    w = _ext(monkeypatch, tmp_path)
+    monkeypatch.setattr(api, "_depth_contradicted_placements",
+                        lambda ctx, sfm, poses, free, K, video: (
+                            w.seen.__setitem__("judged", (set(free), set(K), video))
+                            or {jpg(105), jpg(106)}))
+    api._extend(w.ctx, w.sfm, w.names, False, True, None, quiet, 0.0)
+    assert w.seen["judged"] == (w.names, w.names, True)  # every keyframe the own map moved
+    assert set(w.sfm.extended["poses"]) == w.names - {jpg(105), jpg(106)}
+    # keyframes SfM alone registered are not judged
+    w = _ext(monkeypatch, tmp_path / "s", n=2)
+    api._extend(w.ctx, w.sfm, w.names, False, True, None, quiet, 0.0)
+    assert "judged" not in w.seen and set(w.sfm.extended["poses"]) == w.names
 
 
 def test_photos_or_an_unplaced_own_map_take_the_multiview_path(
@@ -648,3 +672,84 @@ def test_a_block_without_a_floor_of_its_own_is_left_where_it_was(
     w.ctx.new[1].frame.depth = None
     S = Sim3(1.0, np.eye(3), np.zeros(3))
     assert api._on_the_floor(w.ctx, w.own, S, {}) is S
+
+
+# --- placements the depth of their links contradicts --------------------------------------------
+
+
+def _links_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    """The map's keyframe 0 and every new keyframe look at a wall 2 m ahead (depth 2 m): placed
+    where keyframe 0 is, a new keyframe's matched points meet keyframe 0's; placed 5 m aside,
+    they are 5 m off. Keyframe 16 is registered by SfM, the others are judged as placed by
+    their own map or multi-view."""
+    root = tmp_path / "map"
+    (root / "per_frame" / "f000000").mkdir(parents=True)
+    np.save(root / "per_frame" / "f000000" / "depth.npy", np.full((48, 64), 2.0, np.float16))
+    old = [SimpleNamespace(image=f"frames/{jpg(0)}", name="f000000", T_map_cam=Pose.identity(),
+                           K=K, K_grid=K.resized(64, 48), width=640, height=480)]
+    here, aside = Pose.identity(), Pose(np.eye(3), np.array([5.0, 0.0, 0.0]))
+    poses = {jpg(10): here, jpg(11): here, jpg(12): aside, jpg(13): aside, jpg(14): aside,
+             jpg(15): aside, jpg(16): here, jpg(17): here}
+    uv = np.random.default_rng(4).uniform([40, 40], [600, 440], size=(40, 2))
+    few = uv[:api.LINK_MIN_POINTS - 1]
+
+    def link(a: int, b: int, pts: np.ndarray = uv) -> PairMatches:
+        return PairMatches(jpg(a), jpg(b), pts, pts)
+
+    matches = [
+        link(0, 10),  # agrees: 10 is confirmed by the map
+        link(10, 11),  # agrees: 11 through 10
+        link(0, 12), link(12, 13),  # 12 disagrees with the map; 13 hangs on 12 alone
+        link(10, 12),  # disagrees
+        link(10, 14, few),  # judges nothing: 14 keeps its place
+        link(0, 16), link(16, 17),  # 17 is confirmed by a keyframe SfM registered
+        link(16, 13),  # disagrees
+        link(16, 99),  # 99 was not placed: not judged against
+    ]  # 15 has no link at all
+    names_seen: list[set[str]] = []
+
+    def verified_matches(db: Path, names: Any) -> list[PairMatches]:
+        names_seen.append(set(names))
+        return [p for p in matches if {p.a, p.b} <= set(names)]
+
+    monkeypatch.setattr(panorama, "verified_matches", verified_matches)
+    pairs = {frozenset((p.a, p.b)): (len(p.uv_a), 2) for p in matches}
+    sfm = SimpleNamespace(db=Path("db"), verified_pairs=lambda: pairs)
+    ctx = ctx_of([nf(i) for i in (10, 11, 12, 13, 14, 15, 16, 17, 99)], old,
+                 tx=SimpleNamespace(current=lambda rel: root / rel))
+    return SimpleNamespace(ctx=ctx, sfm=sfm, poses=poses, names_seen=names_seen,
+                           free={jpg(i) for i in (10, 11, 12, 13, 14, 15, 17)})
+
+
+def test_keyframes_their_links_place_elsewhere_or_hold_by_nothing_are_left_out(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    w = _links_world(monkeypatch, tmp_path)
+    K_ = {n: K for n in w.poses}
+    off = api._depth_contradicted_placements(w.ctx, w.sfm, w.poses, w.free, K_)  # type: ignore[arg-type]
+    assert off == {jpg(12), jpg(13), jpg(15)}
+    assert w.ctx.notes["links_contradicted"] == [jpg(12), jpg(13), jpg(15)]
+    assert jpg(99) not in w.names_seen[0]  # only placed keyframes are judged against
+    # registered by SfM, in blocks: 12 and 13 placed elsewhere, 15 held by nothing (11 and 16
+    # confirmed, 14 by a link that judges nothing)
+    free = {jpg(10), jpg(16), jpg(17)}
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, w.poses, free,
+                                              K_) == {jpg(12), jpg(13), jpg(15)}  # type: ignore[arg-type]
+    # a block with a confirmed keyframe (16) keeps those its depth disagrees with (13, 12)
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, w.poses, {jpg(10), jpg(17)},
+                                              K_) == {jpg(15)}  # type: ignore[arg-type]
+    held = {n: T for n, T in w.poses.items() if n != jpg(15)}  # nothing left out
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, held, {jpg(10), jpg(17)},
+                                              K_) == set()  # type: ignore[arg-type]
+    # a video's few kept keyframes that every link to the rest disagrees with go with the rest
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, w.poses, w.free, K_,  # type: ignore[arg-type]
+                                              video=True) == {jpg(12), jpg(13), jpg(15)}
+    few = {n: w.poses[n] for n in (jpg(10), jpg(12), jpg(13), jpg(15))}
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, few, set(few), K_,  # type: ignore[arg-type]
+                                              video=True) == set(few)
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, few, set(few),  # type: ignore[arg-type]
+                                              K_) == {jpg(12), jpg(13), jpg(15)}
+    # ... unless a link to the rest agrees, or none joins them
+    lone = {n: w.poses[n] for n in (jpg(10), jpg(15))}
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, lone, set(lone), K_,  # type: ignore[arg-type]
+                                              video=True) == {jpg(15)}
+    assert api._depth_contradicted_placements(w.ctx, w.sfm, w.poses, set(), K_) == set()  # type: ignore[arg-type]

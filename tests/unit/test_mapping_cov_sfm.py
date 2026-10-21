@@ -153,6 +153,9 @@ def test_baseline_ratio_needs_three_keyframes_and_their_points() -> None:
     assert SfmModel(_reconstruction([0.0, 0.5, 1.0], points=False), "m").baseline_ratio() == 0.0
     # 0.5 m between neighbours, the point 5 m ahead
     assert SfmModel(_reconstruction([0.0, 0.5, 1.0]), "m").baseline_ratio() == pytest.approx(0.1)
+    # the camera's spread, not its sampling: 1 m in 0.1 m steps is 0.3 m (median) from the middle
+    walk = SfmModel(_reconstruction([0.1 * i for i in range(11)]), "m")
+    assert walk.baseline_ratio() == pytest.approx(0.06)
 
 
 def test_the_largest_reconstruction_must_continue_the_extended_model() -> None:

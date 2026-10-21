@@ -232,7 +232,9 @@ class FakeSfm:
 
     global_model: FakeModel | None = None
     incremental_model: FakeModel | None = None
+    held_model: FakeModel | None = None  # incremental mapping with the focal length held
     component: ClassVar[set[str]] = set()
+    held: ClassVar[list[bool]] = []
 
     def __init__(self, db: Path, image_dir: Path, work: Path) -> None:
         self.db = db
@@ -257,6 +259,9 @@ class FakeSfm:
         return self.global_model
 
     def map_incremental(self, out: Path, **kw: Any) -> FakeModel | None:
+        if kw.get("hold_focal"):
+            FakeSfm.held.append(True)
+            return self.held_model
         return self.incremental_model
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
@@ -348,7 +353,8 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """``_turns_through_lens``: the rotation-only fit from SfM's rotations within
     ``TURN_FIT_DEG`` with a lens (found, or the camera's known one) is a pan from one spot; a fit
-    that leaves more, or a pinhole, is not."""
+    that leaves more, more than ``TURN_PAIR_SHARE`` of its pairs beyond ``TURN_PAIR_DEG``, or a
+    pinhole, is not."""
     from oh_my_slam.mapping import panorama
     from oh_my_slam.mapping.panorama import PoseFit
 
@@ -357,8 +363,8 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
     model = FakeModel(line(sorted(names)))
     seen: dict[str, Any] = {}
 
-    def run(cam: Intrinsics, median: float, distortion: float, scale: float = 1.0
-            ) -> tuple[bool, Any]:
+    def run(cam: Intrinsics, median: float, distortion: float, scale: float = 1.0,
+            per_pair: dict[tuple[str, str], float] | None = None) -> tuple[bool, Any]:
         sfm = SimpleNamespace(db=Path("db"), image_intrinsics=lambda ns: {n: (1, cam)
                                                                          for n in ns})
 
@@ -366,7 +372,8 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
                    hold_distortion: bool) -> PoseFit:
             seen.update(free=set(free), refine_focal=refine_focal, hold=hold_distortion,
                         views=views)
-            return PoseFit({}, scale, pairs=3, median_after_deg=median, distortion=distortion)
+            return PoseFit({}, scale, pairs=3, median_after_deg=median, distortion=distortion,
+                           per_pair_px=per_pair or {})
 
         monkeypatch.setattr(panorama, "verified_matches", lambda db, ns, max_per_pair: ["m"])
         monkeypatch.setattr(panorama, "refine_turning", refine)
@@ -390,6 +397,12 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
     ok, notes = run(K, 0.2, -0.3, scale=2.0)
     assert not ok and notes["sfm_turning_fit"]["corner_shift"] < api.TURN_LENS_SHIFT
     assert run(K, 0.2, -0.3)[0]
+    # a walk: the near pairs explained, 3 of 10 far ones left 3.4° (30 px at 500 px)
+    far = {(jpg(0), jpg(i)): 30.0 if i < 4 else 2.0 for i in range(1, 11)}
+    ok, notes = run(K, 0.2, -0.45, per_pair=far)
+    assert not ok and notes["sfm_turning_fit"]["pairs_beyond"] == 0.3
+    one = {k: 30.0 if k[1] == jpg(1) else 2.0 for k in far}  # a broken pair or two: still a pan
+    assert run(K, 0.2, -0.45, per_pair=one)[0]
 
 
 def _with_camera(model: FakeModel, focal: float, size: tuple[int, int] = (640, 480)
@@ -410,11 +423,39 @@ def test_an_sfm_focal_length_far_off_the_prior_is_a_wrong_model(
     monkeypatch.setattr(FakeSfm, "global_model", glob)
     monkeypatch.setattr(FakeSfm, "incremental_model", _with_camera(
         FakeModel(line(names), method="sfm-incremental"), 240.0))
+    monkeypatch.setattr(FakeSfm, "held", [])
     model = api._run_sfm(sfm_chain.ctx, False, None, quiet)
     assert model.notes["reason"] == "SfM's focal length is off the camera's prior"
     assert sfm_chain.ctx.notes["sfm_focal_rejected"] == {
-        "sfm-global": {"focal_px": 1100.0, "prior_px": 500.0},
-        "sfm-incremental": {"focal_px": 240.0, "prior_px": 500.0}}
+        "sfm-global": {"focal_px": 1100.0, "prior_px": 500.0, "turn_deg": 0.0},
+        "sfm-incremental": {"focal_px": 240.0, "prior_px": 500.0, "turn_deg": 0.0}}
+    # a camera that does not turn leaves its focal length free: posed again with it held, here
+    # in vain
+    assert FakeSfm.held == [True] and sfm_chain.ctx.notes["sfm_focal_held"] is False
+
+
+def test_a_camera_that_does_not_turn_is_posed_with_its_focal_length_held(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A strafing camera's SfM focal lengths are off its prior (``_plausible_focal``): incremental
+    mapping with the focal length held poses it. A camera that turns has the focal length its
+    matches fix: a wrong one is a wrong camera model, not posed again."""
+    names = [jpg(i) for i in range(4)]
+    monkeypatch.setattr(FakeSfm, "global_model", _with_camera(FakeModel(line(names)), 1100.0))
+    monkeypatch.setattr(FakeSfm, "incremental_model", None)
+    monkeypatch.setattr(FakeSfm, "held_model", FakeModel(line(names), method="sfm-incremental"))
+    monkeypatch.setattr(FakeSfm, "component", set(names))
+    monkeypatch.setattr(FakeSfm, "held", [])
+    monkeypatch.setattr(api, "_turns_through_lens", lambda ctx, sfm, model, names_: True)
+    api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    assert FakeSfm.held == [True] and sfm_chain.ctx.notes["sfm_focal_held"] is True
+    turning = {n: Pose(rot_z(np.radians(10.0 * k)), np.array([float(k), 0.0, 0.0]))
+               for k, n in enumerate(names)}
+    monkeypatch.setattr(FakeSfm, "global_model", _with_camera(FakeModel(turning), 1100.0))
+    monkeypatch.setattr(FakeSfm, "held", [])
+    sfm_chain.ctx.notes.clear()
+    api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    assert sfm_chain.ctx.notes["sfm_focal_rejected"]["sfm-global"]["turn_deg"] == 30.0
+    assert FakeSfm.held == [] and "sfm_focal_held" not in sfm_chain.ctx.notes
 
 
 def test_an_sfm_focal_length_near_the_prior_or_without_one_is_accepted() -> None:
@@ -425,6 +466,42 @@ def test_an_sfm_focal_length_near_the_prior_or_without_one_is_accepted() -> None
     assert api._plausible_focal(ctx, far, api.CameraPrior(640, 480)) is far  # type: ignore[arg-type]
     assert api._plausible_focal(ctx, None, api.CameraPrior(640, 480, focal=500.0)) is None  # type: ignore[arg-type]
     assert ctx.notes == {}
+
+
+def test_sfm_whose_parts_disagree_in_scale_falls_back_to_multiview(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model whose join rescales a part by more than ``BLOCK_FACTOR_MAX`` is no model of the
+    scene: the multi-view fallback poses the keyframes, as for a walk (not staged for rotation)."""
+    monkeypatch.setattr(FakeSfm, "global_model", FakeModel(line([jpg(i) for i in range(4)])))
+    monkeypatch.setattr(FakeSfm, "component", {jpg(i) for i in range(4)})
+
+    def join(ctx: Any, *args: Any) -> None:
+        ctx.notes["sfm_scale_rejected"] = {"method": "sfm-global", "factors": [965.6]}
+        return None
+
+    monkeypatch.setattr(api, "_join_unplaced", join)
+    monkeypatch.setattr(api, "_metric_scale_known", lambda model, ctx: True)
+    model = api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    assert model.method == "multiview" and sfm_chain.seen["rotation"] is False
+    assert model.notes["reason"] == "SfM's parts disagree in scale by more than x20"
+
+
+def test_a_join_that_rescales_a_part_wildly_rejects_the_model(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    names = [jpg(i) for i in range(6)]
+    model = FakeModel(line(names))
+
+    def fix_blocks(c: Any, s: Any, m: Any, j: dict[str, Any]) -> dict[str, Pose]:
+        j["fixed_blocks"] = [{"keyframes": [jpg(4), jpg(5)], "factor": 965.6},
+                             {"keyframes": [jpg(1)], "factor": 0.2}]
+        return {}
+
+    monkeypatch.setattr(api, "_fix_blocks", fix_blocks)
+    ctx = ctx_of([nf(i) for i in range(6)], tmp=tmp_path)
+    assert api._join_unplaced(ctx, JoinSfm(set()), model, set(names), set(), True, None,  # type: ignore[arg-type]
+                              quiet) is None
+    assert ctx.notes["sfm_scale_rejected"] == {"method": model.method, "factors": [965.6]}
+    assert len(ctx.notes["sfm_join"]["fixed_blocks"]) == 2
 
 
 def test_sfm_points_without_metric_scale_fall_back_to_multiview(
@@ -804,6 +881,9 @@ def extension(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(api, "_refine_multiview",
                         lambda ctx, sfm, p, free, refine_focal, rotation, model=None: (p, 1.0, 0.0))
     monkeypatch.setattr(api, "_contradicting", lambda s, p, k, judged: {})
+    monkeypatch.setattr(api, "_depth_contradicted_placements",
+                        lambda ctx, sfm, p, free, K, video: seen.__setitem__("judged", set(free))
+                        or set())
     return seen
 
 

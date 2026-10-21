@@ -330,7 +330,9 @@ def test_mapper_update_stdout_on_a_multi_image_map(stub_server: None, tmp_path: 
     assert res.returncode == 0, res.stderr.decode()
     assert_one_ply(res.stdout)
     target = tmp_path / "full.json"
-    res = sh("mapper.sh", "update", "-i", str(frames[6]), "-m", str(mdir), "-o", str(target),
+    # a view the map holds: the stub's multi-view pose for a view turned away (frames[6], 30°
+    # left) is one its matches contradict, which the update leaves out
+    res = sh("mapper.sh", "update", "-i", str(frames[0]), "-m", str(mdir), "-o", str(target),
              timeout=600)
     assert res.returncode == 0, res.stderr.decode()
     assert res.stdout == b""
