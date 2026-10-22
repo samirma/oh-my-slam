@@ -3,7 +3,7 @@ server whose depth grid is not the image's, gravity of an image without a floor,
 refinement that keeps the prior (too little floor, two floor levels, a "floor" above the camera),
 pixel selection and normals without a validity mask, depth pairs that overlap too little, an
 iteration cap on the depth adjustment, the fusion's subsampled grid, a frame with no voxel block
-to update and an Open3D failure that is not "no surface"."""
+to update or that touches none, and an Open3D failure that is not "no surface" or "no block"."""
 
 from __future__ import annotations
 
@@ -170,3 +170,39 @@ def test_an_open3d_failure_that_is_not_no_surface_is_raised() -> None:
                             extract_point_cloud=fails)
     with pytest.raises(RuntimeError, match="out of memory"):
         f.extract_points()
+
+
+NO_BLOCK = ("[Open3D Error] (void open3d::t::geometry::VoxelBlockGrid::Integrate(...)) "
+            "No block is touched in TSDF volume, abort integration.")
+WALL = (2.0 + 0.004 * np.mgrid[0:96, 0:128][1]).astype(np.float32)
+WALL_K = np.array([[100.0, 0, 64.0], [0, 100.0, 48.0], [0, 0, 1]])
+
+
+def raising(message: str) -> Any:
+    def fails(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError(message)
+    return fails
+
+
+def test_a_frame_that_touches_no_block_is_skipped() -> None:
+    f = fusion.TsdfFusion(voxel_size=0.02, depth_max=5.0)
+    f.vbg = SimpleNamespace(compute_unique_block_coordinates=raising(NO_BLOCK),
+                            integrate=raising("not reached"))
+    assert f.block_coords(WALL, WALL_K, Pose.identity()) is None
+    f.integrate(WALL, WALL_K, Pose.identity())  # no block from the frame: nothing counted
+    assert f.stats.frames == 0 and f.stats.seconds == 0.0
+    f.vbg = SimpleNamespace(integrate=raising(NO_BLOCK))  # given blocks the depth does not touch
+    f.integrate(WALL, WALL_K, Pose.identity(), blocks=np.zeros((4, 3), np.int32))
+    assert f.stats.frames == 1 and f.stats.seconds > 0.0
+
+
+def test_an_open3d_failure_in_integration_that_is_not_no_block_is_raised() -> None:
+    f = fusion.TsdfFusion(voxel_size=0.02, depth_max=5.0)
+    f.vbg = SimpleNamespace(compute_unique_block_coordinates=raising("out of memory"),
+                            integrate=raising("out of memory"))
+    with pytest.raises(RuntimeError, match="out of memory"):
+        f.block_coords(WALL, WALL_K, Pose.identity())
+    with pytest.raises(RuntimeError, match="out of memory"):
+        f.integrate(WALL, WALL_K, Pose.identity())
+    with pytest.raises(RuntimeError, match="out of memory"):
+        f.integrate(WALL, WALL_K, Pose.identity(), blocks=np.zeros((4, 3), np.int32))
