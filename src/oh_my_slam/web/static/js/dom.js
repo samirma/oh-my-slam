@@ -23,6 +23,19 @@ export function fmtDate(t) {
   return new Date(Number(t) * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+// A date and time in few characters, as two lines (a table's column): [date, time] (none: [])
+export function fmtShortDateLines(t) {
+  if (t == null || !Number.isFinite(Number(t))) return [];
+  const d = new Date(Number(t) * 1000);
+  return [d.toLocaleDateString(undefined, { dateStyle: 'short' }), d.toLocaleTimeString(undefined, { timeStyle: 'short' })];
+}
+
+// A text as a sentence of its own: capitalised, with one full stop.
+export function sentence(text) {
+  const t = String(text || '').trim().replace(/[.\s]+$/, '');
+  return t ? `${t.charAt(0).toUpperCase()}${t.slice(1)}.` : '';
+}
+
 export function fmtSeconds(s) {
   if (s == null || !Number.isFinite(Number(s))) return '';
   s = Number(s);

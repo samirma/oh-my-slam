@@ -2,7 +2,7 @@
 // covers another; larger items on screen are placed first, and the ones with no room are listed.
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
-import { crowdedNote, LABEL_GAP, placeLabels } from '../../../src/oh_my_slam/viewer/static/lib/labels.js';
+import { crowdedNote, LABEL_GAP, labelsName, placeLabels } from '../../../src/oh_my_slam/viewer/static/lib/labels.js';
 
 function view(W, H) {
   const camera = new THREE.PerspectiveCamera(60, W / H, 0.01, 100);
@@ -98,4 +98,12 @@ test('crowdedNote lists the labels with no room, the first 20, then how many mor
   expect(crowdedNote(items.slice(0, 2))).toBe('No room for: 1 chair, 2 chair (zoom in to show)');
   expect(crowdedNote(items)).toBe(`No room for: ${items.slice(0, 20).map((o) => o.note).join(', ')} …and 3 more (zoom in to show)`);
   expect(crowdedNote(items, 22)).toEndWith('22 chair …and 1 more (zoom in to show)');
+});
+
+test('a label layer is named after what it holds', () => {
+  expect(labelsName([{ group: 'labels' }, { group: 'labels' }])).toBe('Object labels');
+  expect(labelsName([{ group: 'cameras' }])).toBe('Camera labels');
+  expect(labelsName([{ group: 'labels' }, { group: 'cameras' }])).toBe('Object and camera labels');
+  expect(labelsName([{ group: 'labels' }, { group: 'cameras' }, { group: 'odd' }])).toBe('Object, camera and other labels');
+  expect(labelsName([])).toBe('Labels');
 });

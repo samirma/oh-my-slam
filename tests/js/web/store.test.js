@@ -3,7 +3,7 @@
 // operation cannot run now ("Actionable errors": disabled with an explanation while the inference
 // server is down, the rest available).
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { blockedReason, Operation, PATH_IN, store } from '../../../src/oh_my_slam/web/static/js/store.js';
+import { blockedReason, inferenceSentence, Operation, PATH_IN, store } from '../../../src/oh_my_slam/web/static/js/store.js';
 import { fakeFetch, json, openapiDocument, stubGlobals } from '../helpers.js';
 
 const DOC = openapiDocument();
@@ -42,6 +42,24 @@ describe('Operation: one command mode, from its registry entry', () => {
   test('its results: what the command writes to stdout, not the map it writes', () => {
     expect(op('mapper-update').results.map((r) => r.format)).toEqual(['json', 'ply']);
     expect(op('reconstruct').results.map((r) => r.format)).toEqual(['json', 'png', 'ply']);
+  });
+
+  test('the parameter that chooses which result the response carries', () => {
+    expect(op('mapper-locate').resultParam.name).toBe('format');
+    expect(op('reconstruct').resultParam.name).toBe('format');
+    expect(op('segment').resultParam).toBeNull();  // a format no parameter of the form chooses
+    const one = op('segment');
+    one.x = { ...one.x, outputs: [{ via: 'stdout', format: 'json', when: [] }] };
+    expect(one.resultParam).toBeNull();
+  });
+
+  test('whether it needs the inference server, in a sentence', () => {
+    expect(inferenceSentence(op('segment'))).toBe('Needs the inference server to segment the image.');
+    expect(inferenceSentence(op('mapper-locate'))).toBe('Needs the inference server only to locate images in maps of more keyframes '
+      + 'than are matched exhaustively; never without images.');
+    const never = op('segment');
+    never.x = { ...never.x, inference: 'never', inference_text: 'opens the map read-only' };
+    expect(inferenceSentence(never)).toBe('Never needs the inference server.');
   });
 
   test('path inputs: images, a video or a map of the workspace', () => {
@@ -114,10 +132,10 @@ describe('blockedReason: why an operation cannot run now', () => {
   afterEach(() => { store.health = null; });
   test('an operation that always needs the inference server, while it is down: what to do', () => {
     store.health = HEALTH;
-    expect(blockedReason(op('segment'))).toBe('segment.sh segments the image with the inference server, and the inference '
+    expect(blockedReason(op('segment'))).toBe('segment.sh needs the inference server to segment the image, and the inference '
       + 'server is down. Start it with ./start_inference_server.sh in a terminal, then try again.');
     store.health = { ...HEALTH, inference: { status: 'error', start_command: null } };
-    expect(blockedReason(op('segment'))).toBe('segment.sh segments the image with the inference server, and the inference server is error.');
+    expect(blockedReason(op('segment'))).toBe('segment.sh needs the inference server to segment the image, and the inference server is error.');
     store.health = { status: 'ok', service: HEALTH.service };
     expect(blockedReason(op('segment'))).toEndWith('and the inference server is down.');
   });

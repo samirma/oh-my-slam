@@ -20,6 +20,7 @@ from oh_my_slam.tools.evaluate import service as sv
 from oh_my_slam.tools.evaluate.contracts import tree_digest
 from oh_my_slam.tools.evaluate.locate import (
     held_out_metrics,
+    last_known_problems,
     located_poses,
     located_problems,
     rotation_deg,
@@ -38,6 +39,38 @@ from oh_my_slam.tools.evaluate.suite import (
 from oh_my_slam.tools.evaluate.viewer import BrowserProbe
 from tests.unit.test_evaluate_metrics import cam
 from tests.unit.test_evaluate_runner import fake_repo, script
+
+# the runs of mapper.sh locate on a sequence's one-update map (suite.locate_reference): with three
+# of its captures, then without images (the last known camera); a bird's-eye image after the JSON
+# it is checked against
+RUNS = ["locate_single", "locate_full", "locate_png_full", "locate_ply", "locate_last_known",
+        "locate_last_known_png", "locate_last_known_full", "locate_last_known_png_obb"]
+
+
+def eye_png(doc: dict[str, Any]) -> bytes:
+    """A bird's-eye image that agrees with ``doc``: 1 cm per pixel around the origin, each camera
+    of ``doc`` a white pixel where it is, the cloud layer alone (no OBB to check)."""
+    import io
+
+    from PIL import Image, PngImagePlugin
+
+    from oh_my_slam.mapping.birdseye import BACKGROUND, CAMERA_FILL
+    from oh_my_slam.tools.evaluate.contracts import doc_cameras
+
+    rgb = np.zeros((200, 200, 3), np.uint8)
+    rgb[:] = BACKGROUND
+    cams = {}
+    for key, (_, t) in doc_cameras(doc).items():
+        rgb[int(100 - 100 * t[1]), int(100 + 100 * t[0])] = CAMERA_FILL
+        cams[key] = {"transform_src_to_dst": {"quaternion": [0, 0, 0, 1], "translation": t.tolist()}}
+    info = PngImagePlugin.PngInfo()
+    for k, v in {"pixel_to_map": [[0.01, 0, -1], [0, -0.01, 1]],
+                 "map_to_pixel": [[100, 0, 100], [0, -100, 100]], "cameras": cams}.items():
+        info.add_text(k, json.dumps(v))
+    info.add_text("layers", "cloud")
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
 
 
 def frame(T: Pose, image: str | None = None, located: bool = False) -> dict[str, Any]:
@@ -129,16 +162,58 @@ def test_three_captures_of_each_sequence_are_located_in_its_map() -> None:
     assert locate_picks([7]) == [7] and locate_picks([]) == []
 
 
+def test_the_last_known_camera_is_the_keyframe_added_last() -> None:
+    """Without images: one camera marked last_known, naming the keyframe of the latest update
+    with the highest frame key, at that keyframe's pose."""
+    def kf(T: Pose, name: str, update: int) -> dict[str, Any]:
+        f = frame(T, f"/x/{name}")
+        f["frame_properties"].update(keyframe=name, update_id=update)
+        return f
+
+    map_doc = {"openlabel": {"frames": {"0": kf(cam(0.0), "f000000", 1),
+                                        "1": kf(cam(30.0), "f000001", 2),
+                                        "2": kf(cam(60.0), "f000002", 1)}}}
+
+    def doc(name: str, T: Pose, *more: dict[str, Any]) -> dict[str, Any]:
+        f = frame(T, "frames/x.jpg")
+        f["frame_properties"].update(last_known=True, keyframe=name)
+        return {"openlabel": {"frames": {"3": f, **{str(4 + k): m for k, m in enumerate(more)}}}}
+
+    assert last_known_problems(doc("f000001", cam(30.0)), map_doc) == []
+    assert last_known_problems(doc("f000002", cam(60.0)), map_doc) == [
+        "the last known camera names keyframe f000002; the keyframe added last is f000001"]
+    assert last_known_problems(doc("f000001", cam(31.0)), map_doc) == [
+        "the last known camera's pose is not that of keyframe f000001"]
+    moved = cam(30.0, t=(0.0, 0.0, 0.01))
+    assert last_known_problems(doc("f000001", moved), map_doc) == [
+        "the last known camera's pose is not that of keyframe f000001"]
+    no_pose = doc("f000001", cam(30.0))
+    no_pose["openlabel"]["frames"]["3"]["frame_properties"].pop("transforms")
+    assert last_known_problems(no_pose, map_doc) == [
+        "the last known camera's pose is not that of keyframe f000001"]
+    twice = doc("f000001", cam(30.0), doc("f000001", cam(30.0))["openlabel"]["frames"]["3"])
+    assert last_known_problems(twice, map_doc) == ["2 frames marked last_known, not one"]
+    assert last_known_problems({"openlabel": {}}, map_doc) == ["0 frames marked last_known, not one"]
+    assert last_known_problems(doc("f000001", cam(30.0)), {"openlabel": {"frames": {}}}) == [
+        "the map has no keyframe"]
+
+
 def test_the_ply_pose_header() -> None:
+    """One line per located image (the others are not in the result), each marked located with
+    its pose."""
     T = {"matrix4x4": np.eye(4).reshape(-1).tolist()}
-    good = ply_bytes(PointCloud(np.zeros((1, 3), np.float32)), comments=[
-        f"located_0 {json.dumps({'image': 'a.jpg', 'located': True, 'transform_src_to_dst': T})}",
-        f"located_1 {json.dumps({'image': 'b.jpg', 'located': False})}"])
-    assert _pose_lines(good, 2) == []
-    assert _pose_lines(good, 3) == ["2 located_ header lines for 3 input images"]
-    bad = ply_bytes(PointCloud(np.zeros((1, 3), np.float32)), comments=[
-        f"located_0 {json.dumps({'located': True})}"])
-    assert _pose_lines(bad, 1) == ["located_0: located but no transform"]
+
+    def ply(*lines: str) -> bytes:
+        return ply_bytes(PointCloud(np.zeros((1, 3), np.float32)), comments=list(lines))
+
+    good = ply(f"located_1 {json.dumps({'image': 'b.jpg', 'located': True, 'transform_src_to_dst': T})}")
+    assert _pose_lines(good, 2) == []  # one of two images located
+    assert _pose_lines(good, 0) == ["1 located_ header lines for 0 input images"]
+    assert _pose_lines(ply(), 2) == ["0 located_ header lines for 2 input images"]
+    bad = ply(f"located_0 {json.dumps({'located': True})}",
+              f"located_1 {json.dumps({'located': False, 'transform_src_to_dst': T})}")
+    assert _pose_lines(bad, 2) == ["located_0: not marked located with a transform",
+                                   "located_1: not marked located with a transform"]
 
 
 def test_the_read_only_digest_sees_hidden_entries(tmp_path: Path) -> None:
@@ -173,37 +248,46 @@ def test_locate_on_the_reference_map_with_a_fake_mapper(tmp_path: Path) -> None:
     (docs / "full.json").write_text(json.dumps(full))
     (docs / "out.ply").write_bytes(ply_bytes(PointCloud(np.zeros((1, 3), np.float32)), comments=[
         'located_0 {"located": false}']))
+    (docs / "eye.png").write_bytes(eye_png(full))  # a bird's-eye image that agrees with full
     repo = fake_repo(tmp_path)
     script(repo, "mapper.sh", f'''echo "$@" >> "{tmp_path}/log"
-case "$*" in *-f\\ ply*) cp "{docs}/out.ply" "${{@: -1}}";; *-t\\ full*) cat "{docs}/full.json";;
-*) cat "{docs}/single.json";; esac''')
+case "$*" in *-f\\ ply*) cp "{docs}/out.ply" "${{@: -1}}";; *-f\\ png*) cat "{docs}/eye.png";;
+*-t\\ full*) cat "{docs}/full.json";; *) cat "{docs}/single.json";; esac''')
     out = tmp_path / "out"
     ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES)
     ref = tmp_path / "ref"
     ref.mkdir()
     ev.locate_reference(AINEX, single_doc, ref)
-    assert [r.spec.tag for r in ev.runner.records] == ["locate_single", "locate_full", "locate_ply"]
-    assert [r.spec.group for r in ev.runner.records] == ["locate", "locate_full", "locate_ply"]
+    assert [r.spec.tag for r in ev.runner.records] == RUNS
+    assert [r.spec.group for r in ev.runner.records] == ["locate", *RUNS[1:]]
     assert all(r.ok for r in ev.runner.records)
     checks = ev.contracts.checks
     assert checks[("stdout", "mapper")]["locate_ply/pose header lines"] == [
-        "1 located_ header lines for 3 input images"]
+        "located_0: not marked located with a transform"]
+    # each bird's-eye image against the JSON result of the same call
+    eye = checks[("birdseye", "mapper")]
+    assert eye["locate_png_full"] == []  # the image agrees with the -t full JSON
+    assert eye["locate_last_known_png_obb"] == []  # the same -t full JSON (the fake's)
+    assert eye["locate_last_known_png"] == []  # the -t single JSON: the same camera
+    # without images: the last known camera, judged against the map (none here)
+    assert "NotAMapError" in checks[("openlabel", "mapper")][
+        "locate_last_known/last known camera"][0]
+    assert checks[("stdout", "mapper")]["locate_png_full"] == []  # one PNG on stdout
     assert checks[("same_objects", "map")]["mapper.sh locate -t full vs update -t full"] == []
     assert checks[("openlabel", "mapper")]["locate_single/located frames"] == []
     assert "located frames for 3" not in str(checks[("openlabel", "mapper")])
     assert (tmp_path / "log").read_text().splitlines()[0].startswith("locate -i ")
     # examples/camera: the same runs on its own map, under its names
     ev.locate_reference(CAMERA, single_doc, ref)
-    camera = ev.runner.records[3:]
+    camera = ev.runner.records[len(RUNS):]
     assert [(r.spec.tag, r.spec.group) for r in camera] == [
-        ("camera_locate_single", "camera_locate"), ("camera_locate_full", "camera_locate_full"),
-        ("camera_locate_ply", "camera_locate_ply")]
+        (f"camera_{t}", f"camera_{g}") for t, g in zip(RUNS, ["locate", *RUNS[1:]], strict=True)]
     assert camera[0].argv[3:6] == [str(EXAMPLES / "camera" / n) for n in (
         "img_009_p03_floor.jpg", "img_027_p07_mid.jpg", "img_036_p09_high.jpg")]
     assert checks[("same_objects", "map")][
         "mapper.sh locate -t full vs update -t full (camera)"] == []
     assert checks[("stdout", "mapper")]["camera_locate_ply/pose header lines"] == [
-        "1 located_ header lines for 3 input images"]
+        "located_0: not marked located with a transform"]
     assert (out / "outputs" / "camera_locate.ply").is_file()
 
 
@@ -221,8 +305,7 @@ def test_the_reference_map_stays_read_only(tmp_path: Path, writes: bool) -> None
     (single / "map.json").write_text("{}")
     ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES)
     ev.map_commands(AINEX, doc)
-    assert [r.spec.tag for r in ev.runner.records] == ["view_map", "locate_single",
-                                                       "locate_full", "locate_ply"]
+    assert [r.spec.tag for r in ev.runner.records] == ["view_map", *RUNS]
     assert ev.contracts.checks[("readonly", "map")] == {
         "view.sh -m, mapper.sh locate": ["the map folder changed"] if writes else []}
     ev = Evaluation(tmp_path / "none", Runner(tmp_path / "none", repo), BrowserProbe(None),
@@ -246,8 +329,8 @@ def test_the_camera_map_stays_read_only_under_view_and_locate(tmp_path: Path,
     ev = Evaluation(out, Runner(out, repo), BrowserProbe(None), examples=EXAMPLES)
     ev.map_commands(CAMERA, locate_doc({}))
     assert [(r.spec.tag, r.spec.group) for r in ev.runner.records] == [
-        ("view_camera_map", "view_camera_map"), ("camera_locate_single", "camera_locate"),
-        ("camera_locate_full", "camera_locate_full"), ("camera_locate_ply", "camera_locate_ply")]
+        ("view_camera_map", "view_camera_map"), *((f"camera_{t}", f"camera_{g}") for t, g in zip(
+            RUNS, ["locate", *RUNS[1:]], strict=True))]
     assert ev.runner.records[0].argv[1:3] == ["-m", str(camera)]
     assert ev.contracts.checks[("readonly", "map")] == {
         "view.sh -m, mapper.sh locate (camera)": ["the map folder changed"] if writes else []}

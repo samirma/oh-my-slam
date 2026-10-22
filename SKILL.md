@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "oh-my-slam monocular RGB 3D mapping on a Mac, through the HTTP API of its server.sh web service with sh and curl, from this machine or another on the LAN; needs a server.sh reachable from this machine, no checkout. Operations: reconstruct: one image → JSON/PNG/PLY; mapper-update: images or one video + a new or existing map → JSON/PLY; mapper-locate: images + an existing map → JSON/PLY; segment: one image → JSON/PNG. mapper-update writes a map; the others are read-only. Also uploads, validation, the workspace's maps (list, summary, removal, a 3D page on the service's Mac), health. JSON = OpenLABEL scene (labelled objects with oriented bounding boxes; for a map, camera poses), PNG = depth image or segmented image, PLY = point cloud. Inference server needed by reconstruct, mapper-update and segment, and by mapper-locate for maps over 150 keyframes; the other routes work without it. Use it when the user asks for any of these on images or video, or about the maps."
+description: "oh-my-slam monocular RGB 3D mapping on a Mac, through the HTTP API of its server.sh web service with sh and curl, from this or another machine on the LAN; needs a server.sh reachable from this machine, no checkout. Operations: reconstruct: one image → JSON/PNG/PLY; mapper-update: images or one video + a new or existing map → JSON/PLY; mapper-locate: optional images + an existing map → JSON/PLY/PNG; segment: one image → JSON/PNG. mapper-update writes a map; the others are read-only. Also uploads, validation, the workspace's maps (list, summary, removal, a 3D page on the service's Mac), health. JSON = OpenLABEL scene (labelled objects with oriented bounding boxes; a map's camera poses), PNG = depth, bird's-eye or segmented image, PLY = point cloud. Inference server needed by reconstruct, mapper-update and segment, and by mapper-locate for images in maps over 150 keyframes; the other routes work without it. Use it when the user asks for any of these on images or video, or about the maps."
 ---
 
 # oh-my-slam
@@ -24,7 +24,7 @@ follow.
 * **The inference server may be down.** Then the operations `reconstruct`, `mapper-update` and `segment` fail with HTTP
   503 `server_unavailable`, with a message that names the command that starts it, `./start_inference_server.sh`,
   as `GET /api/health` does (`inference.start_command`). Report the message and that command to
-  the user instead of retrying, and offer what works without it: the workspace's maps (`GET /api/maps`, `GET /api/maps/{name}`); `mapper-locate` except for maps over 150 keyframes; `map-remove` (`DELETE /api/maps/{name}`) only when the user asked for that map's removal; `map-viewer-start` (`POST /api/maps/{name}/viewer`); `map-viewer-stop` (`DELETE /api/maps/{name}/viewer`).
+  the user instead of retrying, and offer what works without it: the workspace's maps (`GET /api/maps`, `GET /api/maps/{name}`); `mapper-locate` except for images in maps over 150 keyframes; `map-remove` (`DELETE /api/maps/{name}`) only when the user asked for that map's removal; `map-viewer-start` (`POST /api/maps/{name}/viewer`); `map-viewer-stop` (`DELETE /api/maps/{name}/viewer`).
 * **Never start or stop `start_inference_server.sh` or `server.sh`**, and never kill their processes. When one is not running,
   tell the user how to start it: `./start_inference_server.sh` for the inference server, and `./server.sh` in
   the oh-my-slam checkout on the Mac for the service (with `--port <n>` for a URL that stays the
@@ -63,10 +63,10 @@ and uploads in its workspace (`~/oh-my-slam-data/` unless the service was starte
 |---|---|---|---|---|
 | `reconstruct` | `POST /api/ops/reconstruct` | `image` (one image) → JSON, PNG (depth image) or PLY, by `format` | read-only | needed |
 | `mapper-update` | `POST /api/ops/mapper-update` | `inputs` (images or one video, in order) + `map` (a new or existing map) → JSON or PLY, by `format` | **writes the map** `map` | needed |
-| `mapper-locate` | `POST /api/ops/mapper-locate` | `inputs` (images) + `map` (an existing map) → JSON or PLY, by `format` | read-only | only for maps over 150 keyframes |
+| `mapper-locate` | `POST /api/ops/mapper-locate` | `inputs` (optional images) + `map` (an existing map) → JSON, PLY or PNG (bird's-eye image), by `format` | read-only | only for images in maps over 150 keyframes |
 | `segment` | `POST /api/ops/segment` | `image` (one image) → JSON or PNG (segmented image), by `format` | read-only | needed |
 
-Results: JSON is an ASAM OpenLABEL 1.0.0 scene description: each object has a label (`type`), a score, a colour that is the same in every result, and an oriented bounding box `cuboid` whose `val` is `x,y,z,qx,qy,qz,qw,sx,sy,sz` (metres, quaternion scalar last), e.g. `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair","ontology_uid":"0","coordinate_system":"camera","object_data":{"cuboid":[{"name":"obb","val":[0.41,0.18,2.35,0.0,0.0,0.0,1.0,0.48,0.51,0.92],"coordinate_system":"camera"}],"num":[{"name":"score","val":0.91}]},…},…},…}}`; a map's scene also holds its camera poses; PNG is the depth image (`reconstruct` with `"format":"depth"`) or the segmented image (`segment` with `"format":"png"`); PLY is a point cloud in metres whose header records its attributes (`attrs`).
+Results: JSON is an ASAM OpenLABEL 1.0.0 scene description: each object has a label (`type`), a score, a colour that is the same in every result, and an oriented bounding box `cuboid` whose `val` is `x,y,z,qx,qy,qz,qw,sx,sy,sz` (metres, quaternion scalar last), e.g. `{"openlabel":{"metadata":{"schema_version":"1.0.0",…},"objects":{"1":{"name":"chair 1","type":"chair","ontology_uid":"0","coordinate_system":"camera","object_data":{"cuboid":[{"name":"obb","val":[0.41,0.18,2.35,0.0,0.0,0.0,1.0,0.48,0.51,0.92],"coordinate_system":"camera"}],"num":[{"name":"score","val":0.91}]},…},…},…}}`; a map's scene also holds its camera poses; PNG is the depth image (`reconstruct` with `"format":"depth"`) or the bird's-eye image (`mapper-locate` with `"format":"png"`) or the segmented image (`segment` with `"format":"png"`); PLY is a point cloud in metres whose header records its attributes (`attrs`).
 
 The routes:
 
@@ -188,8 +188,11 @@ The example is `reconstruct`; every operation works the same way.
 5. **Read the stage timings** in the `Server-Timing` header: each of the command's own stages
    under its own name, then `total`, in milliseconds: `grep -i '^server-timing:' headers.txt` →
    `server-timing: connect;dur=500.0, inference;dur=500.0, segment;dur=500.0, export;dur=500.0, write;dur=500.0, total;dur=2500.0`.
-6. **Report** the result file, or the error's `message` as it is. A map's summary and update
-   history are at `GET /api/maps/<name>`.
+   When the command gave warnings (for example an image it could not locate, which is left out
+   of its result), an `X-Oms-Warnings` header lists them as JSON, each with the inputs it names:
+   `grep -i '^X-Oms-Warnings:' headers.txt`. A failure's body lists them too (`error.warnings`).
+6. **Report** the result file, or the error's `message` as it is, and any warnings. A map's
+   summary and update history are at `GET /api/maps/<name>`.
 
 ## Examples
 
@@ -203,7 +206,7 @@ curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/op
 # mapper-update: writes the map `map`; inference server needed; ask the user first
 curl -sS -T video.mp4 "$BASE/api/uploads?name=video.mp4"
 curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/mapper-update" -H 'Content-Type: application/json' -d '{"inputs":["uploads/<upload>/video.mp4"],"map":"<map>"}'
-# mapper-locate: read-only; inference server only for maps over 150 keyframes
+# mapper-locate: read-only; inference server only for images in maps over 150 keyframes
 curl -sS -T query.jpg "$BASE/api/uploads?name=query.jpg"
 curl -sS -X POST -o result.json -D headers.txt -w '%{http_code}\n' "$BASE/api/ops/mapper-locate" -H 'Content-Type: application/json' -d '{"inputs":["uploads/<upload>/query.jpg"],"map":"<map>"}'
 # segment: read-only; inference server needed

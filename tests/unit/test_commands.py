@@ -71,10 +71,15 @@ def test_every_command_parser_is_the_registry() -> None:
             actions = _options(leaves[cmd.name])
             assert [a.option_strings for a in actions] == [[o.flag] for o in cmd.options]
             for a, o in zip(actions, cmd.options, strict=True):
-                assert (a.dest, a.help, a.required) == (o.name, o.help, o.required)
+                assert (a.dest, a.help, a.required) == (o.name, o.cli_help, o.required)
+                # where it applies is said once, by applies_text (the web form adds it)
+                assert not o.applies_text or o.applies_text not in o.help
+                if o.choice_text:  # an enum's choices, in order, each with what it means
+                    assert tuple(c for c, _ in o.choice_text) == o.choices
+                    assert all(f"{c} = " in o.help for c, _ in o.choice_text)
                 assert a.choices == (o.choices if o.kind is spec.Kind.ENUM else None)
-                if o.kind is spec.Kind.ENUM:
-                    assert a.default == o.default
+                if o.kind is spec.Kind.ENUM:  # -l: None until given, its rule resolves it
+                    assert a.default == (None if o.given_only else o.default)
 
 
 def test_describe_covers_every_option_of_every_parser() -> None:
@@ -96,7 +101,8 @@ def test_describe_covers_every_option_of_every_parser() -> None:
                 assert {p["flag"] for p in op["parameters"]} == expected, op["id"]
                 for p in op["parameters"]:
                     a = flags[p["flag"]]
-                    assert (p["name"], p["help"]) == (a.dest, a.help)
+                    applies = f" ({p['applies_text']})" if p["applies_text"] else ""
+                    assert (p["name"], p["help"] + applies) == (a.dest, a.help)
                     assert p["required"] == (a.required or p["name"] == mode.selector)
                 assert op["stages"] == [str(s) for s in mode.stages]
                 codes = {e["code"] for e in op["errors"]}
@@ -142,7 +148,38 @@ def test_describe_covers_every_option_of_every_parser() -> None:
     from oh_my_slam.mapping.api import UPDATE_EXHAUSTIVE_MAX
 
     assert ops["mapper.sh locate"]["inference_condition"] == {
-        "map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
+        "images_in_map_keyframes_greater_than": UPDATE_EXHAUSTIVE_MAX}
+    locate = {x["name"]: x for x in ops["mapper.sh locate"]["parameters"]}
+    assert locate["inputs"]["required"] is False and locate["map"]["required"] is True
+    assert locate["format"]["choices"] == ["json", "ply", "png"]
+    assert locate["layers"]["choices"] == ["cloud,obb", "cloud", "obb"]
+    assert locate["layers"]["default"] == "cloud,obb"
+    assert locate["layers"]["applies"] == [{"option": "format", "in": ["png"]}]
+    # a form's names and the meaning of each choice (http_server.md "Forms")
+    assert locate["mode"]["label"] == "scope" and locate["attrs"]["label"] == "point-cloud attributes"
+    assert locate["map"]["label"] == "map" and seg_i["min_score"]["label"] == "minimum score"
+    assert list(locate["layers"]["choice_text"]) == ["cloud,obb", "cloud", "obb"]
+    # a choice's few words fit a form's choice; its help says more
+    assert locate["mode"]["choice_text"] == {"full": "the whole map and every keyframe",
+                                             "single": "only these cameras"}
+    assert all(len(t) <= 40 for o in d["operations"] for p in o["parameters"]
+               for t in (p["choice_text"] or {}).values())
+    # what an operation does, as the API offers it: nothing of the command line's -o or -d
+    assert ops["reconstruct.sh"]["description"].startswith("reconstruct one image")
+    assert not [o["id"] for o in d["operations"] if o["prog"] != "view.sh" and re.search(
+        r"(^|\s)-[od]\b|stdout|artefacts", o["description"])]
+    assert spec.RECONSTRUCT.command().help == "Single-image reconstruction (stdout or -o file)."
+    assert locate["format"]["choice_text"]["png"] == "the bird's-eye image of the map"
+    assert "PNG: the whole map with these cameras only" in locate["mode"]["help"]
+    assert locate["inputs"]["choice_text"] is None
+    titles = {o["format"]: o["title"] for o in ops["mapper.sh locate"]["outputs"]}
+    assert titles == {"json": "the scene description", "ply": "the point cloud",
+                      "png": "the bird's-eye image of the map"}
+    assert {o["title"] for o in ops["segment.sh"]["outputs"] if o["via"] == "-d"} == {
+        "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"}  # no title: its name
+    birdseye = [o for o in ops["mapper.sh locate"]["outputs"] if o["format"] == "png"]
+    assert [(o["when"], o["object_regions"]) for o in birdseye] == [
+        ([{"option": "format", "in": ["png"]}], False)]
     assert {o["name"] for o in ops["segment.sh"]["outputs"]} == {
         "result", "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"}
     assert {"code": "interrupted", "exit_code": 130, "http_status": 499} in d["exit_codes"]
@@ -280,6 +317,11 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
         (M, ["locate", "-i", "v.mp4", "-m", "m"], UsageError, "not a video"),
         (M, ["locate", "-i", str(img), "-m", str(tmp_path / "none")], InputError, "no map in"),
         (M, ["locate", "-i", str(img), "-m", other], NotAMapError, "is not a map"),
+        # -l is the bird's-eye image's: refused with any other format, even at its default
+        *[(M, ["locate", "-m", "m", *fmt, "-l", layers], UsageError,
+           "-l chooses the layers of the bird's-eye image, which only the PNG output has: use "
+           "-f png") for fmt in ([], ["-f", "json"], ["-f", "ply"])
+          for layers in ("obb", "cloud,obb")],
         (S, ["-i", str(img), "--min-score", "nan"], UsageError, "finite number"),
         (S, ["-i", str(img), "-o", str(tmp_path)], UsageError, "is a folder"),
         (S, ["-i", str(tmp_path / "no.jpg")], InputError, "image not found"),
@@ -308,6 +350,14 @@ def test_validation_rules_raise_the_commands_errors(tmp_path: Path) -> None:
     assert _validate(R, ["-i", str(img), "-f", "depth"]).attrs == CloudAttrs()
     assert _validate(R, ["-i", str(img), "-f", "ply", "-p", "voxel=0.1"]).attrs == CloudAttrs(
         voxel=0.1)
+    # mapper.sh locate: -i is optional (the last known camera), -l resolved for the PNG
+    mdir = tmp_path / "map"
+    mdir.mkdir()
+    (mdir / "map.json").write_text("{}")
+    v = _validate(M, ["locate", "-m", str(mdir)])
+    assert v.images == [] and v.layers == ("cloud", "obb") and v.reader.root == mdir.resolve()
+    assert _validate(M, ["locate", "-m", str(mdir), "-f", "png", "-l", "obb"]).layers == ("obb",)
+    assert _validate(M, ["locate", "-i", str(img), "-m", str(mdir), "-f", "png"]).images == [img]
 
 
 def test_an_option_belongs_to_the_modes_it_names() -> None:
@@ -543,3 +593,8 @@ def test_dry_run_reports_a_bad_value_after_an_unknown_parameter(tmp_path: Path) 
     assert [p.parameters for p in problems][:2] == [("map",), ("format",)]
     assert spec.argv_of(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "png",
                                                   "min_score": None}) == ["-i=a.jpg", "-f=png"]
+    # as the commands document it (the web service shows it so): flag and value, two words, but a
+    # value that starts with "-", which stays one word
+    assert spec.argv_of(seg, spec.SEGMENT_IMAGE, {"image": "a.jpg", "format": "png",
+                                                  "min_score": -1}, joined=False) == [
+        "-i", "a.jpg", "-f", "png", "--min-score=-1"]

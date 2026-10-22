@@ -1,18 +1,20 @@
 // Maps (http_server.md "Structure"): the workspace's maps as cards (name and summary figures from
-// the map's metadata) with a filter (#/maps?filter=<text>); a map's page (#/maps/<name>) with its
-// summary, its viewer (started and stopped here, with a link to it while it runs), its update
-// history with timings (map.json's `updates`), the operations that take a map without writing it
-// (#/maps/<name>?op=<id>, e.g. locating images in it), each with its generated form, the running
-// request and the result, and its removal, after a confirmation that it is for good. The
-// operation that writes maps is the guided flow (mapflow.js).
-import { el, clear, notice, facts, fmtDate, fmtSeconds, fmtNumber, humanize } from '../dom.js';
+// the map's metadata) with a filter (#/maps?filter=<text>), and what the operations that take a map
+// give; a map's page (#/maps/<name>) with its summary, the operations that take a map without
+// writing it (#/maps/<name>?op=<id>&<parameter>=<value>…: e.g. locating images in it, or its
+// bird's-eye image; the form's values are kept in the URL), each with its generated form, the
+// running request and the result, its viewer (started and stopped here, with a link to it while it
+// runs), its update history with timings (map.json's `updates`), and its removal, after a
+// confirmation that it is for good. The operation that writes maps is the guided flow
+// (mapflow.js).
+import { el, clear, notice, facts, fmtDate, fmtShortDateLines, fmtSeconds, fmtNumber, humanize, sentence } from '../dom.js';
 import { getJson, enc, startViewer, stopViewer, removeMap } from '../api.js';
 import { confirmAction } from '../dialog.js';
-import { store } from '../store.js';
-import { OpForm } from '../form.js';
+import { store, inferenceSentence } from '../store.js';
+import { OpForm, fieldLabel, resultName } from '../form.js';
 import { runPanel } from '../runpanel.js';
 import { stagesTable } from '../result.js';
-import { setQuery } from '../url.js';
+import { setQuery, formQuery, queryInitial } from '../url.js';
 
 // the map store's own bookkeeping, not figures of the map, and the state of its viewer
 const HIDDEN = new Set(['name', 'path', 'meta', 'next_object_id', 'next_frame_index', 'updates_count',
@@ -60,10 +62,66 @@ export function cardFigures(m) {
   return shown.length ? shown : figures(m).slice(0, 4);
 }
 
-function card(m) {
+// Words joined as one of them: "a", "a or b", "a, b or c".
+export function oneOf(words) {
+  return words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} or ${words[words.length - 1]}`;
+}
+
+// What an operation's result is, from its definition: "Its result: <each result's title
+// (FORMAT)>, by its <the parameter that chooses it>."
+export function resultsText(op) {
+  const results = op.results.map((o) => `${o.title || o.name} (${o.format.toUpperCase()})`);
+  const by = op.resultParam;
+  return `Its result: ${oneOf(results)}${by && results.length > 1 ? `, by its ${fieldLabel(by).toLowerCase()}` : ''}.`;
+}
+
+// What an operation gives, from its definition: "<command>: <what it does>. Its result: …".
+export function producesText(op) { return `${op.label}: ${sentence(op.description)} ${resultsText(op)}`; }
+
+// The maps page's lead, in plain words: what a map's page gives, from the results of the
+// operations that take a map (`ops`).
+export function mapsLead(ops) {
+  const titles = [...new Set(ops.flatMap((o) => o.results.map((r) => r.title || r.name)))];
+  return 'The maps of this workspace. Open one to see its summary and history'
+    + (titles.length ? `, and to get ${oneOf(titles)}.` : '.');
+}
+
+// A result's title as a link's text: "the bird's-eye image of the map" → "Bird's-eye image of the
+// map".
+function linkText(title) { const t = String(title).replace(/^the /, ''); return t.charAt(0).toUpperCase() + t.slice(1); }
+
+// The links a map's card gives straight to an image result of an operation that needs nothing
+// but the map (its other parameters optional): [{ text, op, query: {parameter: value} }], each
+// result's choosing parameter set to the value that selects it.
+export function imageLinks(ops) {
+  const out = [];
+  for (const op of ops) {
+    if (!op.params.every((p) => p === op.mapParam || !p.required)) continue;
+    for (const r of op.results) {
+      const w = (r.when || []).find((c) => Array.isArray(c.in) && c.in.length);
+      if (w && String(r.media_type || '').startsWith('image/')) out.push({ text: linkText(r.title || r.name), op: op.id, query: { [w.option]: w.in[0] } });
+    }
+  }
+  return out;
+}
+
+// The route of an image link on the map `name`: the map's page, which runs it at once (`run=1`,
+// autoRuns) and shows the image.
+export function linkHref(name, link) { return `#/maps/${enc(name)}?${new URLSearchParams({ op: link.op, ...link.query, run: '1' })}`; }
+
+// Whether a map's page asked to run its request at once (`run=1`) may run it unasked: its
+// validation (`v`) passed and says it needs no inference server, and the operation writes
+// nothing but its result (every output is the response's).
+export function autoRuns(op, v) {
+  return !!v && v.valid === true && v.inference === false && op.x.outputs.every((o) => o.via === 'stdout');
+}
+
+function card(m, links = []) {
   return el('li', { class: 'card map-card', 'data-map': m.name },
     el('h2', {}, el('a', { href: `#/maps/${enc(m.name)}`, class: 'card-link' }, m.name)),
-    facts(cardFigures(m)));
+    facts(cardFigures(m)),
+    links.length ? el('p', { class: 'card-actions' }, ...links.flatMap((l, i) => [i ? ' · ' : null,
+      el('a', { href: linkHref(m.name, l), 'data-action': 'image-link', 'aria-label': `${l.text}: map ${m.name}` }, l.text)])) : null);
 }
 
 // Whether a map's card shows for the filter `q` (lower case; '' shows every map): its name or one
@@ -72,25 +130,31 @@ export function mapMatches(m, q) {
   return !q || m.name.toLowerCase().includes(q) || figures(m).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(q));
 }
 
-export function mapsPage(main, { filter }) {
+// The operations a map's page runs: those that take a map without writing it.
+function mapOps() { return [...store.ops.values()].filter((o) => o.mapParam && !o.writesMap); }
+
+export function mapsPage(main, { filter, query = new URLSearchParams() }) {
   const writer = [...store.ops.values()].find((o) => o.writesMap);
+  const ops = mapOps();
+  const links = imageLinks(ops);
+  const other = [...query.keys()].filter((k) => k !== 'filter');  // what the page does not keep
   const input = el('input', { type: 'search', id: 'map-filter', value: filter, autocomplete: 'off', spellcheck: 'false',
     'aria-describedby': 'map-count' });
   const grid = el('ul', { class: 'cards', 'data-testid': 'maps', 'aria-label': 'Maps' });
   const count = el('p', { class: 'muted', id: 'map-count', role: 'status' }, 'Loading the maps…');
   main.append(el('div', { class: 'page-head' }, el('h1', {}, 'Maps'),
     writer ? el('a', { href: '#/maps/new', class: 'button primary', 'data-action': 'new-map' }, 'New map') : null),
-  el('p', { class: 'lead' }, 'The maps of this workspace. Open one to see its summary and update history, and to run the operations that take a map.'),
+  el('p', { class: 'lead', 'data-testid': 'maps-lead' }, mapsLead(ops)),
   el('div', { class: 'filter' }, el('label', { for: 'map-filter' }, 'Filter by name or figure'), input), count, grid);
   let maps = [];
   const draw = () => {
     const q = input.value.trim().toLowerCase();
     const shown = maps.filter((m) => mapMatches(m, q));
-    clear(grid).append(...shown.map(card));
+    clear(grid).append(...shown.map((m) => card(m, links)));
     count.textContent = maps.length
       ? `${shown.length} of ${maps.length} map${maps.length === 1 ? '' : 's'}${q ? ` match “${input.value.trim()}”` : ''}.`
       : `No map yet${writer ? ': create one with New map' : ''}.`;
-    setQuery({ filter: input.value.trim() });
+    setQuery({ ...Object.fromEntries(other.map((k) => [k, null])), filter: input.value.trim() });
   };
   input.addEventListener('input', draw);
   getJson('/api/maps').then((m) => { maps = m; draw(); })
@@ -103,6 +167,26 @@ export function mapsPage(main, { filter }) {
 // timing record) and every other figure it records.
 const UPDATE_COLUMNS = [['kind', 'Input'], ['inputs', 'Files'], ['frames_added', 'Frames added'],
   ['frames_rejected', 'Rejected'], ['sfm', 'Registration']];
+
+// The detections an update tracked (its `objects` record, as the mapper counts them: confirmed or
+// not, before the export's checks — not the objects the map lists, which the summary counts):
+// { confirmed, unconfirmed, total }, each null when it does not say.
+export function trackedCounts(u) {
+  const o = u && u.objects && typeof u.objects === 'object' ? u.objects : {};
+  const num = (v) => (typeof v === 'number' ? v : null);
+  return { confirmed: num(o.confirmed), unconfirmed: num(o.unconfirmed), total: num(o.total) };
+}
+
+// The history's Tracked cell of an update (trackedCounts), as lines: ["8 confirmed",
+// "+ 22 unconfirmed"]; an older record its total alone; ["—"] when it says none.
+export function trackedLines(c) {
+  if (c.confirmed == null) return [c.total != null ? String(c.total) : '—'];
+  return [`${c.confirmed} confirmed`, ...(c.unconfirmed != null ? [`+ ${c.unconfirmed} unconfirmed`] : [])];
+}
+
+// What the Tracked column holds, beside the summary's Objects.
+export const TRACKED_TITLE = 'Detections the map tracked at that update, confirmed or not. The summary\'s Objects are '
+  + 'those the map lists: confirmed, with an OBB and enough points of their own.';
 
 // An update's figure in the history table: a list counts its entries.
 export function count(v) { return Array.isArray(v) ? String(v.length) : figureValue('', v); }
@@ -117,7 +201,9 @@ export function updateStages(t) {
 function history(updates) {
   if (!updates || !updates.length) return el('p', { class: 'muted' }, 'No update recorded.');
   const cols = UPDATE_COLUMNS.filter(([k]) => updates.some((u) => k in u));
-  const objectsCol = updates.some((u) => u.objects && typeof u.objects === 'object' && 'total' in u.objects);
+  const counted = updates.map(trackedCounts);
+  const trackedCol = counted.some((c) => c.confirmed != null || c.total != null);
+  const extra = trackedCol ? 1 : 0;
   const rows = [];
   updates.forEach((u, i) => {
     const n = u.id ?? i + 1;
@@ -125,12 +211,13 @@ function history(updates) {
     const stages = updateStages(t);
     rows.push(el('tr', { 'data-update': n },
       el('th', { scope: 'row' }, `Update ${n}`),
-      el('td', {}, u.at ? fmtDate(u.at) : '—'),
+      el('td', { class: 'when', title: u.at ? fmtDate(u.at) : null },
+        ...(u.at ? fmtShortDateLines(u.at).flatMap((line, k) => (k ? [el('br'), line] : [line])) : ['—'])),
       ...cols.map(([k]) => el('td', { class: Array.isArray(u[k]) ? 'num' : null }, k in u ? count(u[k]) : '—')),
-      objectsCol ? el('td', { class: 'num' }, u.objects?.total != null ? String(u.objects.total) : '—') : null,
+      trackedCol ? el('td', { class: 'num tracked' }, ...trackedLines(counted[i]).flatMap((line, k) => (k ? [el('br'), line] : [line]))) : null,
       el('td', { class: 'num' }, t.total_s != null ? fmtSeconds(t.total_s) : '—')));
     const more = figures(u, new Set(['id', 'at', 'timings', 'notes', 'inputs', 'frames_added', 'frames_rejected']));
-    rows.push(el('tr', { class: 'update-detail' }, el('td', { colspan: cols.length + 3 + (objectsCol ? 1 : 0) },
+    rows.push(el('tr', { class: 'update-detail' }, el('td', { colspan: cols.length + 3 + extra },
       el('details', { class: 'stages-box' }, el('summary', {}, `Timings and figures of update ${n}`),
         stages.length ? stagesTable(stages, `Stages of update ${n}`) : el('p', { class: 'muted' }, 'No timings recorded.'),
         facts(more)))));
@@ -139,7 +226,7 @@ function history(updates) {
     el('caption', { class: 'visually-hidden' }, 'Updates of the map, oldest first'),
     el('thead', {}, el('tr', {}, el('th', { scope: 'col' }, 'Update'), el('th', { scope: 'col' }, 'When'),
       ...cols.map(([, label]) => el('th', { scope: 'col' }, label)),
-      objectsCol ? el('th', { scope: 'col', class: 'num' }, 'Objects') : null,
+      trackedCol ? el('th', { scope: 'col', class: 'num', title: TRACKED_TITLE }, 'Tracked') : null,
       el('th', { scope: 'col', class: 'num' }, 'Time'))),
     el('tbody', {}, ...rows)));
 }
@@ -227,50 +314,78 @@ function removeControls(main, box, name, viewer) {
   });
 }
 
-export function mapPage(main, { name, op: wanted }) {
-  const ops = [...store.ops.values()].filter((o) => o.mapParam && !o.writesMap);
+export function mapPage(main, { name, op: wanted, query = new URLSearchParams() }) {
+  const ops = mapOps();
   const writer = [...store.ops.values()].find((o) => o.writesMap);
-  main.append(el('div', { class: 'page-head' }, el('h1', {}, `Map ${name}`),
-    writer ? el('a', { href: `#/maps/${enc(name)}/update`, class: 'button', 'data-action': 'update-map' }, 'Update this map') : null));
+  const update = writer ? el('a', { href: `#/maps/${enc(name)}/update`, class: 'button', 'data-action': 'update-map' }, 'Update this map') : null;
+  main.append(el('div', { class: 'page-head' }, el('h1', {}, `Map ${name}`), update));
   const summary = el('section', { 'aria-labelledby': 'summary-h' }, el('h2', { id: 'summary-h' }, 'Summary'),
     el('p', { class: 'muted' }, 'Loading…'));
-  const runBox = el('section', { 'aria-labelledby': 'run-h', class: 'step' }, el('h2', { id: 'run-h' }, 'Run on this map'));
+  const runBox = el('section', { 'aria-labelledby': 'run-h', class: 'step', 'data-testid': 'run-on-map' }, el('h2', { id: 'run-h' }, 'Run on this map'));
   const historyBox = el('section', { 'aria-labelledby': 'history-h' }, el('h2', { id: 'history-h' }, 'Update history'));
   const viewerBox = el('section', { 'aria-labelledby': 'viewer-h', 'data-testid': 'viewer' }, el('h2', { id: 'viewer-h' }, 'Viewer'));
   const removeBox = el('section', { 'aria-labelledby': 'remove-h', 'data-testid': 'remove' }, el('h2', { id: 'remove-h' }, 'Remove'));
-  main.append(summary, viewerBox, runBox, historyBox, removeBox);
+  main.append(summary, runBox, viewerBox, historyBox, removeBox);
   const viewer = viewerControls(viewerBox, name);
   removeControls(main, removeBox, name, viewer);
   let form = null;
   let panel = null;
+  let offQuery = null;
+  let kept = [...query.keys()].filter((k) => k !== 'op');  // the query keys to replace: the form's, or unknown
+  let runAsked = query.get('run') === '1';  // run=1: the request at once, if it may run unasked
   if (ops.length) {
     let op = ops.find((o) => o.id === wanted) || ops[0];
     const formBox = el('div', {});
-    const choices = el('fieldset', { class: 'modes', 'data-testid': 'operations' }, el('legend', {}, 'Operation'),
-      ...ops.map((o) => {
-        const id = `op-${o.id}`;
-        const r = el('input', { type: 'radio', name: 'op', id, value: o.id, 'aria-describedby': `${id}-desc` });
-        r.checked = o === op;
-        r.addEventListener('change', () => { if (r.checked) choose(o); });
-        return el('div', { class: 'mode' }, r, el('label', { for: id }, el('code', {}, o.label)),
-          el('span', { class: 'muted', id: `${id}-desc` }, ` ${o.description} · ${o.x.inference_text}`));
-      }));
+    // one operation: said in a sentence; several: a choice between them
+    const about = (o) => [` ${sentence(o.description)} ${inferenceSentence(o)}`];
+    const choices = ops.length === 1
+      ? el('div', { 'data-testid': 'operations', 'data-op': op.id }, el('p', { class: 'op-lead' }, el('code', {}, op.label),
+        `: ${sentence(op.description)} ${inferenceSentence(op)}`))
+      : el('fieldset', { class: 'modes', 'data-testid': 'operations' }, el('legend', {}, 'Operation'),
+        ...ops.map((o) => {
+          const id = `op-${o.id}`;
+          const r = el('input', { type: 'radio', name: 'op', id, value: o.id, 'aria-describedby': `${id}-desc` });
+          r.checked = o === op;
+          r.addEventListener('change', () => { if (r.checked) choose(o); });
+          return el('div', { class: 'mode' }, r, el('label', { for: id }, el('code', {}, o.label)),
+            el('span', { class: 'muted', id: `${id}-desc` }, ...about(o)));
+        }));
+    const lead = el('p', { class: 'lead', 'data-testid': 'produces' });
     const runPanelBox = el('div', {});
-    runBox.append(choices, formBox, runPanelBox);
-    const choose = (o) => {
+    runBox.append(choices, lead, formBox, runPanelBox);
+    const choose = (o, initial = {}) => {
       form?.destroy();
       panel?.dispose();
+      offQuery?.();
       op = o;
+      lead.textContent = resultsText(o);
       formBox.replaceChildren();
-      form = new OpForm(formBox, o, { fixed: { [o.mapParam.name]: name } });
+      form = new OpForm(formBox, o, { fixed: { [o.mapParam.name]: name }, initial });
+      const f = form;
       panel = runPanel({ op: o, form, label: `Run ${o.label}`,
-        downloadName: (fmt) => `${o.id}-${name}${fmt ? `.${fmt}` : ''}`,
+        downloadName: (fmt) => resultName([o.id, name, ...f.variant()], fmt),
         onEnd: () => { loadSummary(); } });
+      const p = panel;
       runPanelBox.replaceChildren(panel.el);
-      setQuery({ op: o.id });
+      const keep = () => {
+        const values = f.queryValues();
+        setQuery(formQuery(o.id, values, kept.filter((k) => !(k in values))));
+        kept = Object.keys(values);
+      };
+      offQuery = form.onValidate(keep);  // after each check (the first one comes at once); drops run
+      if (runAsked) {  // its first check decides: run it now, or show where to run it
+        runAsked = false;
+        const offAsk = form.onValidate((v) => {
+          offAsk();
+          if (panel !== p) return;
+          if (autoRuns(o, v)) { p.run({ focus: true }); return; }
+          p.submit.scrollIntoView({ block: 'center' });
+          p.submit.focus();
+        });
+      }
       form.changed();
     };
-    choose(op);
+    choose(op, op.id === wanted || !wanted ? queryInitial(query, op.params.map((p) => p.name)) : {});
   } else {
     runBox.append(el('p', { class: 'muted' }, 'No operation of this service takes a map.'));
   }
@@ -281,12 +396,20 @@ export function mapPage(main, { name, op: wanted }) {
       historyBox.replaceChildren(historyBox.firstChild, history(m.meta?.updates));
       viewer.show(m.viewer);
     }).catch((err) => {
+      const missing = err.status === 404;
       summary.replaceChildren(summary.firstChild, notice('error', `${err.message}`,
-        err.status === 404 ? el('p', {}, el('a', { href: '#/maps' }, 'See the maps of this workspace.')) : null));
+        missing ? el('p', {}, el('a', { href: '#/maps' }, 'See the maps of this workspace'),
+          ...(writer ? [' or ', el('a', { href: '#/maps/new', 'data-action': 'new-map' }, 'create a new map'), '.'] : ['.'])) : null));
       historyBox.replaceChildren(historyBox.firstChild);
-      if (err.status === 404) { viewerBox.remove(); removeBox.remove(); } else viewer.show(null);
+      if (missing) {  // no map: nothing to run on it, update, view or remove, nor kept in the URL
+        panel?.dispose(); panel = null;
+        form?.destroy(); form = null;
+        offQuery?.();
+        setQuery(Object.fromEntries([...kept, ...query.keys(), 'op'].map((k) => [k, null])));
+        for (const box of [runBox, viewerBox, historyBox, removeBox, update]) box?.remove();
+      } else viewer.show(null);
     });
   }
   loadSummary();
-  return () => { panel?.dispose(); form?.destroy(); };
+  return () => { offQuery?.(); panel?.dispose(); form?.destroy(); };
 }

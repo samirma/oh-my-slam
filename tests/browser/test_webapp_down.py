@@ -75,7 +75,7 @@ def test_the_rest_stays_available(tab: Tab, tmp_path: Path) -> None:
     assert pg.locator(".run-panel .notice.warn").count() == 0
     pg.set_input_files(".field[data-param=inputs] input[type=file]", str(jpeg(tmp_path / "q.jpg")))
     pg.wait_for_selector(".field[data-param=inputs] li.ready")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-m=maps/m')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-m maps/m')")
     with operation_response(pg, "mapper-locate") as answer:
         pg.click("button[data-action=run]")
     tab.wait_request("failed")

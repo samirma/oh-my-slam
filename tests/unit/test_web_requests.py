@@ -146,7 +146,7 @@ def test_inference_requests_run_one_at_a_time_in_arrival_order_others_at_once(
         assert [(r["operation"], r["state"]) for r in listed] == [
             ("infer", "running"), ("infer", "waiting"), ("infer", "waiting")]
         assert [r["command"] for r in listed] == [
-            ["infer.sh", f"--seconds={s:g}"] for s in (1.5, 0.2, 0.2)]
+            ["infer.sh", "--seconds", f"{s:g}"] for s in (1.5, 0.2, 0.2)]
         assert listed[0]["started_at"] >= listed[0]["arrived_at"] and listed[1]["started_at"] is None
         assert listed[0]["arrived_at"] <= listed[1]["arrived_at"] <= listed[2]["arrived_at"]
         checked = await Call(app, "/api/ops/infer/validate", {"seconds": 0.2})()
@@ -360,5 +360,31 @@ def test_the_response_is_the_commands_stdout_with_its_timings(svc: Service) -> N
             "http_status": 409}
         assert "server-timing" not in failed.headers
         assert list(svc.workspace.requests.iterdir()) == []  # no result is kept
+
+    run(svc, scenario)
+
+
+def test_a_commands_warnings_come_with_its_answer(svc: Service) -> None:
+    """Spec §2.6 "Results": the body stays the command's stdout; the warnings the command gave (on
+    stderr, where a terminal shows them) come in the ``X-Oms-Warnings`` header — each with the
+    inputs it names, by their workspace paths — on success and on failure, then in the error's body
+    too. A command that gives none answers no such header."""
+    (svc.workspace.root / "in").mkdir()
+    (svc.workspace.root / "in" / "a.jpg").write_bytes(b"x")
+    named = [{"message": "in/a.jpg: not located — too few matches",
+              "inputs": [{"parameter": "image", "index": 0, "path": "in/a.jpg"}]},
+             {"message": "an option was ignored", "inputs": []}]
+
+    async def scenario(app: Callable[..., Awaitable[None]]) -> None:
+        ok = await Call(app, "/api/ops/slow", {"image": "in/a.jpg", "warn": True})()
+        assert ok.status == 200 and json.loads(ok.body)["slept"] == 0
+        assert json.loads(ok.headers["x-oms-warnings"]) == named
+        failed = await Call(app, "/api/ops/slow", {"image": "in/a.jpg", "warn": True, "code": 2})()
+        assert failed.status == 400 and failed.json()["error"]["message"] == "asked to fail"
+        assert json.loads(failed.headers["x-oms-warnings"]) == named
+        assert failed.json()["error"]["warnings"] == named
+        quiet = await Call(app, "/api/ops/slow", {"code": 2})()
+        assert "x-oms-warnings" not in quiet.headers and "warnings" not in quiet.json()["error"]
+        assert "x-oms-warnings" not in (await Call(app, "/api/ops/slow", {})()).headers
 
     run(svc, scenario)

@@ -12,14 +12,18 @@ the map cloud (full) or the new frames' points (single), map coordinates, shaped
 point-cloud attributes (map scope: the pixel-level keys are refused). -fps (default 2) samples
 video input and is ignored for images. Options are validated before the server is contacted.
 
-    mapper.sh locate -i <image(s)> -m <map> [-f json|ply] [-o <file>] [-p <attrs>] [-t full|single]
+    mapper.sh locate [-i <image(s)>] -m <map> [-f json|ply|png] [-o <file>] [-p <attrs>]
+                     [-t full|single] [-l cloud,obb|cloud|obb]
 
-Registers each image against the whole map (``mapping.locate``). -t single (default): the located
-camera poses only (PLY: the map points visible from them); -t full: the map's scene as ``update -t
-full`` returns it plus the located poses (PLY: the whole map cloud). A video, a missing or empty
--m folder, and an -o inside the map are refused (exit 2); a non-empty folder that is not a map exit
-4; no image located exit 2. The inference server is needed only for retrieval in maps of more than
-``UPDATE_EXHAUSTIVE_MAX`` keyframes (exit 3 when it is down).
+Registers each image against the whole map (``mapping.locate``); without -i the result's camera is
+the map's last known camera (the keyframe added last). -t single (default): the cameras' poses only
+(PLY: the map points visible from them); -t full: the map's scene as ``update -t full`` returns it
+plus the cameras (PLY: the whole map cloud). -f png: the bird's-eye image of the whole map
+(``mapping.birdseye``) with the -l layers under the cameras (-t full: every keyframe's too); -l is
+refused with the other formats. A video, a missing or empty -m folder, and an -o inside the map are
+refused (exit 2); a non-empty folder that is not a map exit 4; no image located exit 2. The
+inference server is needed only to locate images in maps of more than ``UPDATE_EXHAUSTIVE_MAX``
+keyframes (exit 3 when it is down), never without -i.
 """
 
 from __future__ import annotations
@@ -62,10 +66,11 @@ def _locate(args: argparse.Namespace) -> int:
     from oh_my_slam.core import timing
     from oh_my_slam.mapping.locate import locate
 
-    # -p, the inputs, the map and -o are checked before the -o writer proves it can write there
+    # -p, the inputs, -l, the map and -o are checked before the -o writer proves it can write there
     v = spec.validate(LOCATE, args, log.warning)
     out = claim_stdout(args.output)
-    res = locate(v.reader, v.images, mode=args.mode, fmt=args.format, attrs=v.attrs)
+    res = locate(v.reader, v.images, mode=args.mode, fmt=args.format, attrs=v.attrs,
+                 layers=v.layers)
     out.write_bytes(res.payload)
     timing.report(res.timings, log, command=LOCATE.label(LOCATE.mode(None)), mode=args.mode,
                   format=args.format, map=str(args.map))

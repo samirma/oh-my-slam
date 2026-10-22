@@ -51,6 +51,30 @@ def located_problems(doc: Json, asked: int) -> list[str]:
     return out
 
 
+def last_known_problems(doc: Json, map_doc: Json) -> list[str]:
+    """The result of ``mapper.sh locate`` without images (mapper.md): exactly one camera, marked
+    ``last_known``, naming the keyframe of ``map_doc`` (the map's scene) added last — of its
+    latest update (``update_id``), the latest in input order (the highest frame key) — with that
+    keyframe's pose."""
+    marked = [k for k, v in frame_property(doc, "last_known").items() if v is True]
+    if len(marked) != 1:
+        return [f"{len(marked)} frames marked last_known, not one"]
+    k = marked[0]
+    updates = frame_property(map_doc, "update_id")
+    if not updates:
+        return ["the map has no keyframe"]
+    latest = max(updates, key=lambda i: (int(updates[i]), i))
+    want = frame_property(map_doc, "keyframe").get(latest)
+    got = frame_property(doc, "keyframe").get(k)
+    if got != want:
+        return [f"the last known camera names keyframe {got}; the keyframe added last is {want}"]
+    a, b = frame_poses(doc).get(k), frame_poses(map_doc).get(latest)
+    if a is None or b is None or float(np.linalg.norm(a.t - b.t)) > 1e-5 \
+            or rotation_deg(a, b) > 1e-3:
+        return [f"the last known camera's pose is not that of keyframe {want}"]
+    return []
+
+
 def rotation_deg(a: Pose, b: Pose) -> float:
     c = (np.trace(a.R.T @ b.R) - 1.0) / 2.0
     return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))

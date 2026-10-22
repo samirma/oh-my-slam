@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from oh_my_slam.core.ply import PointCloud, parse_header, parse_ply
+from oh_my_slam.schema.openlabel import transform_pose
 from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES
 from oh_my_slam.segmentation.catalog import CSV_HEADER
@@ -30,7 +31,7 @@ from oh_my_slam.segmentation.colors import (
     segment_colors,
 )
 from oh_my_slam.segmentation.render import DIM
-from oh_my_slam.tools.evaluate.scene import DocObject
+from oh_my_slam.tools.evaluate.scene import DocObject, Json, doc_objects
 from oh_my_slam.viewer.routes import parse_cloud_payload
 
 MAX_LISTED = 5
@@ -43,6 +44,8 @@ CONTRACTS: dict[str, tuple[str, ...]] = {
     "artifacts": ("segment",),
     "same_objects": ("image", "map"),
     "readonly": ("map",),
+    # a bird's-eye image (mapper.sh locate -f png) against the JSON result of the same call
+    "birdseye": ("mapper",),
 }
 # Brightest channel of the dimmed background of segmented.png; every palette colour is brighter.
 _DIMMED_MAX = int(255 * DIM)
@@ -315,6 +318,136 @@ def artifact_problems(folder: Path, stdout: bytes | None, fmt: str = "json") -> 
     if stdout is not None and (Path(folder) / same).read_bytes() != stdout:
         out.append(f"{same} differs from the -f {fmt} result on stdout")
     return out
+
+
+# ------------------------------------------------------------------------------------------------
+# bird's-eye image (mapper.sh locate -f png) against the JSON result of the same call
+
+
+# A footprint edge is sampled every pixel; at least this share of its samples must show the
+# object's exact colour within one pixel (another object's outline or tag, or a camera marker,
+# may cover the rest).
+OUTLINE_SHOWN = 0.5
+
+
+def doc_cameras(doc: Json) -> dict[str, tuple[str, NDArray[np.float64]]]:
+    """The cameras of a ``mapper.sh locate`` JSON result by the key the bird's-eye image's
+    metadata gives them — ``located_<k>`` and ``last_known`` (their transform's source), and the
+    map's keyframes (their name) — with their kind and camera-centre translation."""
+    out: dict[str, tuple[str, NDArray[np.float64]]] = {}
+    for fr in (doc.get("openlabel", {}).get("frames") or {}).values():
+        props = fr.get("frame_properties") or {}
+        tr = next(iter((props.get("transforms") or {}).values()), None)
+        if tr is None:
+            continue
+        t = transform_pose(tr["transform_src_to_dst"]).t
+        if props.get("located") is True or props.get("last_known") is True:
+            out[str(tr["src"])] = ("located" if props.get("located") is True else "last_known", t)
+        elif "keyframe" in props:
+            out[str(props["keyframe"])] = ("keyframe", t)
+    return out
+
+
+def _metadata(text: dict[str, str]) -> tuple[NDArray[np.float64], NDArray[np.float64],
+                                             dict[str, Any], list[str]]:
+    to_map = np.asarray(json.loads(text["pixel_to_map"]), np.float64).reshape(2, 3)
+    to_px = np.asarray(json.loads(text["map_to_pixel"]), np.float64).reshape(2, 3)
+    cams = json.loads(text["cameras"])
+    if not isinstance(cams, dict):
+        raise ValueError("cameras is not a JSON object")
+    return to_map, to_px, cams, text["layers"].split(",")
+
+
+def _same_centre(record: Any, t: NDArray[np.float64]) -> bool:
+    """Whether a camera of the image's metadata is centred at ``t``."""
+    try:
+        return bool(np.allclose(transform_pose(record["transform_src_to_dst"]).t, t, atol=1e-6))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _near(rgb: NDArray[np.uint8], u: float, v: float, colours: set[tuple[int, int, int]]) -> bool:
+    """Whether a pixel within one of the continuous pixel position (u, v) has one of
+    ``colours``."""
+    i, j = int(np.floor(u)), int(np.floor(v))
+    h, w = rgb.shape[:2]
+    win = rgb[max(j - 1, 0):max(min(j + 2, h), 0), max(i - 1, 0):max(min(i + 2, w), 0)]
+    return any(tuple(int(c) for c in px) in colours for px in win.reshape(-1, 3))
+
+
+def birdseye_problems(data: bytes, doc: Json) -> list[str]:
+    """A bird's-eye image (``mapper.sh locate -f png``) agrees with the JSON result of the same
+    call (high_level_spec.md §5 "Contracts"): one 8-bit RGB PNG whose text metadata maps pixels to
+    map coordinates (``map_to_pixel`` the inverse of ``pixel_to_map``) and lists exactly the
+    JSON's cameras with their positions; each camera's marker is drawn where its position falls
+    under that mapping; with the ``obb`` layer, every object's footprint (from its JSON cuboid) is
+    outlined in its exact colour; without the ``cloud`` layer, no pixel has another colour than
+    the background, an object's or a marker's (opaque drawing, no anti-aliasing)."""
+    from oh_my_slam.mapping.birdseye import BACKGROUND, CAMERA_EDGE, CAMERA_FILL, KEYFRAME_FILL
+
+    problems = _png_problems(data)
+    if problems:
+        return problems
+    with Image.open(io.BytesIO(data)) as img:
+        if img.mode != "RGB":
+            return [f"a {img.mode} image, not 8-bit RGB"]
+        text, rgb = dict(getattr(img, "text", {})), np.asarray(img)
+    try:
+        to_map, to_px, cams, layers = _metadata(text)
+    except (KeyError, ValueError, TypeError) as exc:
+        return [f"its text metadata does not map pixels to the map: {type(exc).__name__}: {exc}"]
+    out = []
+    square = np.vstack([to_map, [0, 0, 1]]) @ np.vstack([to_px, [0, 0, 1]])
+    if not np.allclose(square, np.eye(3), atol=1e-6):
+        out.append("map_to_pixel is not the inverse of pixel_to_map")
+    want = doc_cameras(doc)
+    if set(cams) != set(want):
+        out.append(f"cameras {sorted(set(cams) ^ set(want))[:MAX_LISTED]} are not in both the "
+                   "image's metadata and the JSON result")
+    marker = {"located": {CAMERA_FILL}, "last_known": {CAMERA_FILL},
+              "keyframe": {KEYFRAME_FILL, CAMERA_FILL, CAMERA_EDGE}}
+    for key, (kind, t) in sorted(want.items()):
+        if key in cams and not _same_centre(cams[key], t):
+            out.append(f"camera {key}: its metadata position is not the JSON's {t.tolist()}")
+        u, v = to_px @ [t[0], t[1], 1.0]
+        if not _near(rgb, u, v, marker[kind]):
+            out.append(f"camera {key} ({kind}) is not drawn at pixel ({u:.1f}, {v:.1f})")
+    # the image draws every object of the map, which a -t single result does not list
+    every = (doc.get("openlabel", {}).get("metadata") or {}).get("scope") != "single"
+    objs = doc_objects(doc)
+    if "obb" in layers:
+        for o in objs:
+            out += _outline_problems(rgb, to_px, o)
+    if "cloud" not in layers and every:
+        allowed = {BACKGROUND, CAMERA_FILL, CAMERA_EDGE, KEYFRAME_FILL,
+                   *(color_for_id(o.id) for o in objs)}
+        foreign = [c for c in np.unique(rgb.reshape(-1, 3), axis=0)
+                   if tuple(int(v) for v in c) not in allowed]
+        if foreign:
+            out.append(f"{len(foreign)} colours are neither the background, an object's nor a "
+                       f"marker's (blended?): {[_rgb(c) for c in foreign[:MAX_LISTED]]}")
+    return out
+
+
+def _outline_problems(rgb: NDArray[np.uint8], to_px: NDArray[np.float64], o: DocObject
+                      ) -> list[str]:
+    box = o.obb()
+    if box is None:
+        return [f"object {o.id} has no cuboid"]
+    hw, hd = box.size[0] / 2, box.size[1] / 2
+    corners = box.center[:2] + np.array([[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]]) \
+        @ box.R[:2, :2].T
+    px = (to_px[:, :2] @ corners.T).T + to_px[:, 2]
+    samples = []
+    for a, b in zip(px, np.roll(px, -1, axis=0), strict=True):
+        n = max(int(np.ceil(np.hypot(*(b - a)))), 1)
+        samples += [a + (b - a) * k / n for k in range(n)]
+    colour = {color_for_id(o.id)}
+    shown = sum(_near(rgb, u, v, colour) for u, v in samples)
+    if shown >= OUTLINE_SHOWN * len(samples):
+        return []
+    return [f"object {o.id}: its footprint is outlined in {_rgb(color_for_id(o.id))} at "
+            f"{shown} of {len(samples)} points of its edges"]
 
 
 def tree_digest(root: Path) -> str:

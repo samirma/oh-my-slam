@@ -2,7 +2,7 @@
 // shows whether it runs or waits for its turn, and for how long ("Responsive feedback"), and states
 // the consequence before running or interrupting it ("Confirmation", "Interruption").
 import { describe, expect, test } from 'bun:test';
-import { interruptConsequence, ownEntry, sameCommand, waitedNote } from '../../../src/oh_my_slam/web/static/js/request.js';
+import { endAnnouncement, focusIsOnRequest, interruptConsequence, ownEntry, sameCommand, waitedNote } from '../../../src/oh_my_slam/web/static/js/request.js';
 import { consequence } from '../../../src/oh_my_slam/web/static/js/runpanel.js';
 import { Operation } from '../../../src/oh_my_slam/web/static/js/store.js';
 import { openapiDocument } from '../helpers.js';
@@ -16,16 +16,23 @@ test('what interrupting a request leaves behind, in the commands\' terms', () =>
   expect(interruptConsequence(op('segment'))).toBe('segment.sh stops as Ctrl-C would stop it, and there is no result.');
 });
 
-test('what running an operation does, stated before it runs', () => {
-  const runs = 'Runs mapper.sh locate within this page\'s request and shows its result here: only for retrieval in maps of more '
-    + 'keyframes than are matched exhaustively.';
-  const queue = 'Requests that use the inference server run one at a time, in arrival order: it may wait for its turn.';
-  expect(consequence(op('mapper-locate'))).toBe(`${runs} ${queue}`);
-  expect(consequence(op('mapper-update'))).toBe('Runs mapper.sh update within this page\'s request and shows its result here: '
-    + `infers depth and objects of every new keyframe. ${queue} It is the only operation that changes a map, and it can take many minutes.`);
+test('what running an operation does, stated before it runs: whether this request waits for the inference server', () => {
+  const runs = 'Runs mapper.sh locate within this page\'s request and shows its result here. Needs the inference server only to '
+    + 'locate images in maps of more keyframes than are matched exhaustively; never without images.';
+  const queue = 'This request uses it: requests that use the inference server run one at a time, in arrival order, so it may wait '
+    + 'for its turn.';
+  // a conditional need: said once its validation answered
+  expect(consequence(op('mapper-locate'))).toBe(runs);
+  expect(consequence(op('mapper-locate'), true)).toBe(`${runs} ${queue}`);
+  expect(consequence(op('mapper-locate'), false)).toBe(`${runs} This request does not use it, so it starts at once.`);
+  // a mode that always needs it
+  expect(consequence(op('mapper-update'))).toBe('Runs mapper.sh update within this page\'s request and shows its result here. '
+    + `Needs the inference server to infer the depth and objects of every new keyframe. ${queue} It is the only operation that `
+    + 'changes a map, and it can take many minutes.');
   const never = op('segment');
-  never.x = { ...never.x, inference: 'never', inference_text: 'needs no inference server' };
-  expect(consequence(never)).toBe('Runs segment.sh within this page\'s request and shows its result here: needs no inference server.');
+  never.x = { ...never.x, inference: 'never', inference_text: 'opens the map read-only' };
+  expect(consequence(never, false)).toBe('Runs segment.sh within this page\'s request and shows its result here. Never needs the '
+    + 'inference server.');
 });
 
 describe('this page\'s request among the service\'s requests in progress', () => {
@@ -55,4 +62,21 @@ test('how long an ended request waited for its turn', () => {
   expect(waitedNote(0.6, true)).toBe('');  // below a second: not worth saying
   expect(waitedNote(5, true)).toBe('including 5.0 s waiting for its turn');
   expect(waitedNote(75, false)).toBe('including at least 1 min 15 s waiting for its turn');  // seen waiting, start unknown
+});
+
+test('a request that ends moves the focus only if it is still where the request left it', () => {
+  const body = { name: 'body' };
+  const inBox = { matches: () => false };
+  const box = { contains: (e) => e === inBox };
+  const button = (action) => ({ matches: (sel) => sel.split(', ').includes(`[data-action=${action}]`) });
+  expect(focusIsOnRequest(null, box, body)).toBe(true);
+  expect(focusIsOnRequest(body, box, body)).toBe(true);
+  expect(focusIsOnRequest(inBox, box, body)).toBe(true);
+  expect(focusIsOnRequest(button('run'), box, body)).toBe(true);
+  expect(focusIsOnRequest(button('interrupt'), box, body)).toBe(true);
+  expect(focusIsOnRequest(button('viewer'), box, body)).toBe(false);  // the user went on elsewhere
+  expect(focusIsOnRequest({ id: 'a field' }, box, body)).toBe(false);
+  // then its end is only announced
+  expect(['done', 'failed', 'interrupted', 'odd'].map(endAnnouncement)).toEqual(['Done: the result is below.',
+    'Failed: why is below.', 'Interrupted: see below.', '']);
 });

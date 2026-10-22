@@ -5,7 +5,8 @@ within its own HTTP request, and this module runs the command for it.
   oh_my_slam.cli.<command>``, what ``scripts/_common.sh`` execs) run as a subprocess in its own
   process group, so the web process never loads the pipeline, a model or torch. Its stdout — the
   result — goes to a file of the request's folder (``Workspace.request_dir``), its timing record
-  there too (``OH_MY_SLAM_TIMINGS``), and its stderr is read for the command's own error line.
+  and its warnings there too (``OH_MY_SLAM_TIMINGS``, ``OH_MY_SLAM_WARNINGS``), and its stderr is
+  read for the command's own error line.
 * **Order.** Requests that use the inference server run one at a time, in arrival order (each
   takes a ticket once its body has arrived, and none overtakes an earlier one still being
   validated, which may need the inference server too), and wait for their turn with their
@@ -48,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from oh_my_slam.core.log import WARNINGS_ENV, read_warnings
 from oh_my_slam.core.process import default_sigint, sigint_blocked
 from oh_my_slam.core.timing import ENV_PATH
 from oh_my_slam.web.workspace import Workspace
@@ -57,6 +59,7 @@ LOG_TAIL = 40  # stderr lines kept for a subprocess's error message (a command's
 INTERRUPT_GRACE_S = 30.0
 STDOUT = "stdout"  # the command's stdout in the request's folder: the result
 TIMINGS = "timings.json"  # its timing record there (OH_MY_SLAM_TIMINGS)
+WARNINGS = "warnings.jsonl"  # its warnings there (OH_MY_SLAM_WARNINGS)
 DISCONNECTED = "disconnected"  # why a request was interrupted: its client left …
 STOPPING = "stopping"  # … or the service stops
 
@@ -73,11 +76,13 @@ class RunError(Exception):
 @dataclass(frozen=True)
 class Outcome:
     """How a request's command ended: its exit status (negative: the signal that stopped it), the
-    command's own error message, and why the request was interrupted, if it was."""
+    command's own error message, why the request was interrupted, if it was, and the warnings it
+    gave, in order."""
 
     code: int
     message: str | None = None
     interrupted: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(eq=False)
@@ -314,8 +319,9 @@ class Runner:
 
     def _command(self, run: Run, folder: Path) -> Outcome:
         folder.mkdir(parents=True, exist_ok=True)
-        env = {k: v for k, v in os.environ.items() if k != ENV_PATH}
-        env.update({ENV_PATH: str(folder / TIMINGS), "PYTHONUNBUFFERED": "1"})
+        env = {k: v for k, v in os.environ.items() if k not in (ENV_PATH, WARNINGS_ENV)}
+        env.update({ENV_PATH: str(folder / TIMINGS), WARNINGS_ENV: str(folder / WARNINGS),
+                    "PYTHONUNBUFFERED": "1"})
         with run.lock:
             if run.interrupted is not None:  # interrupted before its command started
                 return Outcome(130, "interrupted before it started", run.interrupted)
@@ -339,7 +345,7 @@ class Runner:
             time.sleep(POLL_S)
         code = proc.returncode
         return Outcome(code, None if code == 0 else command_message(run.prog, list(tail), code),
-                       run.interrupted)
+                       run.interrupted, tuple(read_warnings(folder / WARNINGS)))
 
     # -- signals -------------------------------------------------------------------------------------
 

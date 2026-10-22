@@ -7,6 +7,10 @@ library — including C++ code in Open3D or COLMAP — land on stderr. The retur
 :class:`PayloadWriter` accepts exactly one payload (one JSON document, one PLY or one PNG) and
 writes it to the real stdout, or — for ``-o <file>`` — atomically to that file, leaving stdout
 empty.
+
+A command's warnings (records of level WARNING and above) go to stderr like every other line;
+when ``OH_MY_SLAM_WARNINGS=<path>`` is set, each one is also appended to that file as one JSON
+line ``{"message": …}``, which is how the web service (spec §2.6) passes them on with a result.
 """
 
 from __future__ import annotations
@@ -22,15 +26,52 @@ from typing import Any, BinaryIO
 from oh_my_slam.core.atomic import atomic_write_bytes, preflight_file
 
 _LOGGER_NAME = "oh_my_slam"
+WARNINGS_ENV = "OH_MY_SLAM_WARNINGS"
+
+
+class WarningsFile(logging.Handler):
+    """Appends each warning to ``path``, one JSON line ``{"message": …}`` each."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(logging.WARNING)
+        self.path = path
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = json.dumps({"message": record.getMessage()}, ensure_ascii=False)
+            with Path(self.path).open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            self.handleError(record)
+
+
+def read_warnings(path: Path) -> list[str]:
+    """The messages a :class:`WarningsFile` appended to ``path`` (none when there is no file); a
+    line that is no such record is taken as it is."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in filter(None, lines):
+        try:
+            out.append(str(json.loads(line)["message"]))
+        except (ValueError, KeyError, TypeError):
+            out.append(line)
+    return out
 
 
 def get_logger(name: str = _LOGGER_NAME) -> logging.Logger:
-    """Return a logger writing to stderr (configured once)."""
+    """Return a logger writing to stderr (configured once), and its warnings to the file
+    ``OH_MY_SLAM_WARNINGS`` names, if any."""
     root = logging.getLogger(_LOGGER_NAME)
     if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[oh-my-slam] %(message)s"))
         root.addHandler(handler)
+        target = os.environ.get(WARNINGS_ENV)
+        if target:
+            root.addHandler(WarningsFile(target))
         root.setLevel(logging.INFO)
         root.propagate = False
     if name == _LOGGER_NAME:

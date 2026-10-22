@@ -34,6 +34,17 @@ export class Operation {
   get mapParam() { return this.ofKind('map')[0] || null; }
   // the outputs the response carries (what the command writes to stdout)
   get results() { return this.x.outputs.filter((o) => o.via === 'stdout'); }
+  // the parameter whose value chooses which of them the response carries (its format), if any
+  get resultParam() {
+    const named = new Set(this.results.flatMap((o) => (o.when || []).map((w) => w.option)));
+    return this.params.find((p) => named.has(p.name)) || null;
+  }
+}
+
+// Whether `op` needs the inference server, in a sentence of its own (its registry entry's
+// `inference_text` completes "Needs the inference server …").
+export function inferenceSentence(op) {
+  return op.x.inference === 'never' ? 'Never needs the inference server.' : `Needs the inference server ${op.x.inference_text}.`;
 }
 
 export const PATH_IN = ['image', 'images', 'images_or_video', 'map'];
@@ -88,6 +99,6 @@ export const store = new Store();
 export function blockedReason(op) {
   if (!store.health || store.health.status === 'unreachable' || store.inferenceUp || op.x.inference !== 'required') return null;
   const cmd = store.startCommand;
-  return `${op.label} ${op.x.inference_text}, and the inference server is ${store.health.inference?.status || 'down'}.`
+  return `${op.label} needs the inference server ${op.x.inference_text}, and the inference server is ${store.health.inference?.status || 'down'}.`
     + (cmd ? ` Start it with ${cmd} in a terminal, then try again.` : '');
 }

@@ -4,13 +4,61 @@
 // command or an option: a new option is a new field, and a kind this file does not know still gets
 // a text field. Fields that do not apply to the current choices (`applies`) are hidden and not
 // sent; every change is checked by the command's own rules (POST /api/ops/<op>/validate) and each
-// message is shown next to the field it names (`by_parameter`), before submission.
+// message is shown next to the field it names (`by_parameter`), before submission. A field's name
+// is its registry `label`, and an enum's choices say what each one means (`choice_text`). The
+// values of every field but the files can be kept in the page's URL and given back to a new form
+// (`OpForm.queryValues`, `initial`), so a page with a form can be bookmarked.
 import { el, clear, nextId, humanize, fmtBytes } from './dom.js';
 import { getJson, postJson, upload, discardUpload, enc } from './api.js';
+import { store } from './store.js';
 
 const VALIDATE_DEBOUNCE_MS = 250;
 
 function suffix(name) { const m = /\.[^./\\]+$/.exec(name); return m ? m[0].toLowerCase() : ''; }
+
+// A field's name: the option's label (its name when it has none), capitalised.
+export function fieldLabel(p) { return humanize(p.label || p.name); }
+
+// An enum choice as a form offers it: the value, with what it means when the registry says so.
+export function choiceLabel(p, c) {
+  const text = p.choice_text?.[c];
+  return (text ? `${c} — ${text}` : c) + (c === p.default ? ' (default)' : '');
+}
+
+// The point-cloud attributes of a value key=value,… (attrsValue's): key → text; ignores a part
+// without "=".
+export function parseAttrs(text) {
+  const out = new Map();
+  for (const part of String(text || '').split(',')) {
+    const i = part.indexOf('=');
+    if (i > 0) out.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+// A command line (its words, as validation answers it) to paste into a shell: a word with
+// anything but letters, digits and ./_=,:@%+- is quoted.
+export function shellLine(words) {
+  return (words || []).map((w) => (/^[\w./=,:@%+-]+$/.test(w) ? w : `'${String(w).replaceAll("'", "'\\''")}'`)).join(' ');
+}
+
+// What the command line of a form says about its paths: they are relative to the workspace
+// (`data`, the service's folder), where the command runs.
+export function commandNote(data) {
+  return data ? `Paths are relative to the workspace ${data}, where the command runs.` : 'Paths are relative to the workspace, where the command runs.';
+}
+
+// The words that tell a result's variant apart in its file name: the values given to `params`
+// (name → value of the fields given a value other than their default), each made safe for a file
+// name (a run of other characters is one "-"), in the order of `params`.
+export function variantWords(params, values) {
+  return params.filter((p) => values[p.name] !== undefined && values[p.name] !== null && values[p.name] !== '')
+    .map((p) => String(values[p.name]).replace(/[^A-Za-z0-9._]+/g, '-').replace(/^-|-$/g, '')).filter(Boolean);
+}
+
+// A result's file name: its words (the operation, its input or map, then what tells its variant
+// apart: OpForm.variant) joined by "-", with the suffix of its format.
+export function resultName(words, fmt) { return words.filter(Boolean).join('-') + (fmt ? `.${fmt}` : ''); }
 
 export function defaultText(p) {
   if (p.default === null || p.default === undefined || p.kind === 'attrs') return null;
@@ -81,7 +129,7 @@ class Field {
     this.err = el('div', { class: 'field-error', id: this.errId, role: 'alert' });
   }
 
-  labelText() { return humanize(this.p.name) + (this.p.required ? ' (required)' : ''); }
+  labelText() { return fieldLabel(this.p) + (this.p.required ? ' (required)' : ''); }
 
   help(extra = '') {
     const p = this.p;
@@ -109,6 +157,10 @@ class Field {
   }
 
   controls() { return [...this.el.querySelectorAll('input:not([type=file]), select, textarea, button.choose')]; }
+  // its value as a page's URL keeps it (undefined: none, or a field the URL does not keep), and
+  // that value given back (setText)
+  queryText() { const v = this.value(); return v === undefined ? undefined : String(v); }
+  setText() {}
   changed() { this.form.changed(this); }
   consumed() {}
   renew() {}
@@ -120,7 +172,7 @@ class EnumField extends Field {
     super(form, p);
     this.input = el('select', { id: this.id, 'aria-describedby': this.describedBy() },
       ...(p.required || p.default != null ? [] : [el('option', { value: '' }, '(not given)')]),
-      ...p.choices.map((c) => el('option', { value: c }, c + (c === p.default ? ' (default)' : ''))));
+      ...p.choices.map((c) => el('option', { value: c }, choiceLabel(p, c))));
     if (p.default != null) this.input.value = p.default;
     this.input.addEventListener('change', () => this.changed());
     this.el.append(el('label', { for: this.id }, this.labelText()), this.input, this.help(), this.err);
@@ -128,6 +180,7 @@ class EnumField extends Field {
 
   value() { return this.input.value === '' || this.input.value === this.p.default ? undefined : this.input.value; }
   current() { return this.input.value === '' ? undefined : this.input.value; }
+  setText(t) { if (this.p.choices.includes(t)) this.input.value = t; }
 }
 
 class NumberField extends Field {
@@ -141,6 +194,7 @@ class NumberField extends Field {
   }
 
   value() { return numberValue(this.input.value); }
+  setText(t) { this.input.value = t; }
 }
 
 class FlagField extends Field {
@@ -154,6 +208,7 @@ class FlagField extends Field {
   }
 
   value() { return this.input.checked === !!this.p.default ? undefined : this.input.checked; }
+  setText(t) { this.input.checked = t === 'true'; }
 }
 
 class TextField extends Field {
@@ -166,6 +221,7 @@ class TextField extends Field {
   }
 
   value() { const t = this.input.value.trim(); return t === '' ? undefined : t; }
+  setText(t) { this.input.value = t; }
 }
 
 // -p: one control per point-cloud attribute of the mode (x-oms `attributes`), sent as key=value,…
@@ -197,6 +253,12 @@ class AttrsField extends Field {
   }
 
   value() { return attrsValue([...this.inputs].map(([key, { input, a }]) => [key, input.value, a.default])); }
+  setText(t) {
+    for (const [key, v] of parseAttrs(t)) {
+      const it = this.inputs.get(key);
+      if (it && (it.input.tagName !== 'SELECT' || [...it.input.options].some((o) => o.value === v))) it.input.value = v;
+    }
+  }
 }
 
 // A map of the workspace: one of the maps, or (for the mode that writes maps) a new name too
@@ -232,13 +294,20 @@ class MapField extends Field {
     } else {
       this.input.replaceChildren(el('option', { value: '' }, this.maps.length ? 'Choose a map' : 'No maps yet'),
         ...this.maps.map((m) => el('option', { value: m.name }, m.name)));
-      if (keep) this.input.value = keep;
+      const restored = this.pending !== undefined;
+      const want = this.pending ?? keep;
+      this.pending = undefined;
+      if (want && this.maps.some((m) => m.name === want)) this.input.value = want;
+      if (restored) this.form.changed();  // the value the page's URL kept, now that it is a choice
     }
   }
 
   drawNote() { this.note.textContent = mapNote(this.input.value, this.maps); }
 
   value() { const v = (this.input.value || '').trim(); return v === '' ? undefined : v; }
+  setText(t) {
+    if (this.writes) { this.input.value = t; this.drawNote(); } else if (this.maps.some((m) => m.name === t)) this.input.value = t; else this.pending = t;
+  }
 }
 
 // Path inputs: files uploaded from this computer (at once, so they can be checked), or paths inside
@@ -374,6 +443,12 @@ export class FilesField extends Field {
 
   settled() { return Promise.all(this.items.map((it) => it.promise).filter(Boolean)); }
   names() { return this.items.map((it) => it.name); }
+  queryText() { return undefined; }  // a file chosen on this computer is no part of a URL
+  // [path, the file the user chose] of each value sent (OpForm.chosen)
+  chosenInputs() {
+    return this.items.filter((it) => it.path).map((it, index) => [it.path,
+      { name: it.name, index, multiple: this.multiple, parameter: this.p.name }]);
+  }
   failed() { return this.items.filter((it) => it.state === 'failed'); }
 
   value() {
@@ -429,14 +504,16 @@ function makeField(form, p, op, options) {
 // ---------------------------------------------------------------------------------------- the form
 
 // A form for `op` into `container`. `fixed`: values set by the page (not rendered); `files`:
-// options of a path field by parameter name ({big, preview}).
+// options of a path field by parameter name ({big, preview}); `initial`: the text of fields'
+// values, by parameter name, as queryValues gave them (a page's URL).
 export class OpForm {
-  constructor(container, op, { fixed = {}, files = {} } = {}) {
+  constructor(container, op, { fixed = {}, files = {}, initial = {} } = {}) {
     this.op = op;
     this.fixed = { ...fixed };
     this.fields = [];
     this.seq = 0;
     this.lastResult = null;
+    this.listeners = new Set();  // called with each validation's answer
     this.touched = new Set();  // the fields the user changed: only their messages show, until a run
     this.reveal = false;  // a run was asked for: every message shows
     this.general = el('div', { class: 'form-problems' });
@@ -448,12 +525,38 @@ export class OpForm {
       this.fields.push(f);
       this.root.append(f.el);
     }
-    this.commandRow = el('p', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), this.command);
+    this.commandNote = el('span', { class: 'muted command-note' });
+    this.commandRow = el('p', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), this.command, ' ', this.commandNote);
     this.root.append(this.general, this.commandRow);
     container.append(this.root);
+    for (const f of this.fields) if (typeof initial[f.p.name] === 'string') f.setText(initial[f.p.name]);
     this.applyApplies();
     this.command.textContent = '(complete the required fields)';
   }
+
+  // the text of every field's value a page's URL keeps (null: none given, or a field that does
+  // not apply), by parameter name; the files chosen are not kept
+  queryValues() {
+    const out = {};
+    for (const f of this.fields) {
+      const t = f.queryText();
+      if (t !== undefined || !(f instanceof FilesField)) out[f.p.name] = f.active && t !== undefined ? t : null;
+    }
+    return out;
+  }
+
+  // the files the user chose, by the path each value sent names: { name, index (among the
+  // parameter's values), multiple, parameter }
+  chosen() { return new Map(this.fields.flatMap((f) => (f.chosenInputs ? f.chosenInputs() : []))); }
+
+  // the words that tell this request's result apart from the operation's others (its download's
+  // name): the enums and point-cloud attributes given, but the one that chooses its format
+  variant() {
+    const which = this.op.resultParam;
+    return variantWords(this.op.params.filter((p) => (p.kind === 'enum' || p.kind === 'attrs') && p !== which), this.values());
+  }
+
+  onValidate(cb) { this.listeners.add(cb); return () => this.listeners.delete(cb); }
 
   field(name) { return this.fields.find((f) => f.p.name === name) || null; }
 
@@ -519,7 +622,9 @@ export class OpForm {
     if (seq !== this.seq) return this.lastResult;
     this.lastResult = r;
     this.show(r.by_parameter || {}, r.problems || []);
-    this.command.textContent = (r.command || []).join(' ') || '(complete the required fields)';
+    this.command.textContent = shellLine(r.command) || '(complete the required fields)';
+    this.commandNote.textContent = r.command?.length ? commandNote(store.health?.service?.data) : '';
+    for (const cb of this.listeners) cb(r);
     return r;
   }
 

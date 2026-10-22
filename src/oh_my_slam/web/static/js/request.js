@@ -4,12 +4,16 @@
 // its turn (the service's health lists the requests in progress, each with the command line its
 // validation gave) and for how long. It belongs to the page: interrupting it — the Interrupt
 // button, leaving or reloading the page — closes the connection, which interrupts the command as
-// Ctrl-C would, so each of these asks first and states the consequence.
+// Ctrl-C would, so each of these asks first and states the consequence. When it ends while the
+// focus is still where the request left it (its Run or Interrupt button, its own box, or nowhere),
+// the focus moves to what it ended with (the result, or why there is none), scrolled into view;
+// otherwise (the user went on elsewhere: a field, another section) its end is only announced.
 import { el, clear, fmtClock, fmtSeconds, notice } from './dom.js';
 import { runOperation, ApiError } from './api.js';
 import { store } from './store.js';
 import { confirmAction } from './dialog.js';
-import { resultView } from './result.js';
+import { resultView, warningsList } from './result.js';
+import { shellLine } from './form.js';
 
 const TICK_MS = 250;
 const STATE_TEXT = {
@@ -41,6 +45,18 @@ export function interruptConsequence(op) {
     : `${op.label} stops as Ctrl-C would stop it, and there is no result.`;
 }
 
+// Whether the end of a request may move the focus: it is still where the request left it — on a
+// Run or Interrupt button, inside the request's own `box`, or on nothing but the page (`body`).
+export function focusIsOnRequest(active, box, body) {
+  if (!active || active === body || box.contains(active)) return true;
+  return typeof active.matches === 'function' && active.matches('[data-action=run], [data-action=interrupt]');
+}
+
+// What a screen reader hears when a request ends and the focus stays where the user put it.
+export function endAnnouncement(state) {
+  return { done: 'Done: the result is below.', failed: 'Failed: why is below.', interrupted: 'Interrupted: see below.' }[state] || '';
+}
+
 function onBeforeUnload(e) {
   e.preventDefault();
   e.returnValue = '';  // the browser asks before leaving or reloading
@@ -67,11 +83,14 @@ export class RequestView {
 
   get inFlight() { return this.controller !== null; }
 
-  // Run with these values; `command`: the command line its validation answered. Resolves to true
-  // when it succeeded.
-  async run(values, command) {
+  // Run with these values; `command`: the command line its validation answered; `focus`: move the
+  // focus to what it ended with wherever it is then (a run the page started, not the user).
+  // Resolves to true when it succeeded.
+  async run(values, command, { focus = false } = {}) {
     this.dispose(false);
+    this.forceFocus = focus;
     this.command = command || [];
+    this.chosen = this.form?.chosen() ?? new Map();  // before the form uploads its files again
     this.t0 = performance.now();
     this.sentAt = Date.now() / 1000;
     this.controller = new AbortController();
@@ -90,7 +109,7 @@ export class RequestView {
       el('div', { class: 'request-head' },
         el('p', { class: 'request-status' }, this.stateEl, el('span', { 'aria-hidden': 'true' }, ' · '), this.clock, ' ', this.waitNote),
         el('div', { class: 'actions' }, this.cancelBtn)),
-      el('p', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), el('code', { class: 'command' }, this.command.join(' '))),
+      el('p', { class: 'command-row' }, el('span', { class: 'sub' }, 'Command: '), el('code', { class: 'command' }, shellLine(this.command))),
       this.belongs = el('p', { class: 'muted belongs' }, 'This request belongs to this page: leaving or reloading the page interrupts it.'),
       this.outcome);
     clear(this.container).append(this.box);
@@ -118,7 +137,23 @@ export class RequestView {
         this.showError(err);
       }
     }
+    this.reveal();
     return ok;
+  }
+
+  // The request ended: the focus on what it ended with, scrolled into view, unless the user put
+  // the focus elsewhere meanwhile (then the end is announced, and the focus and scroll stay).
+  reveal() {
+    const target = this.outcome.querySelector('#result-h') || this.outcome.firstElementChild;
+    if (!target || !this.box.isConnected) return;
+    if (!this.forceFocus && !focusIsOnRequest(document.activeElement, this.box, document.body)) {
+      const live = document.getElementById('announce');
+      if (live) live.textContent = endAnnouncement(this.state);
+      return;
+    }
+    if (!target.hasAttribute('tabindex')) target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({ block: 'start' });
   }
 
   // This page's request is waiting or running: which one, from the service's list of the requests
@@ -170,7 +205,8 @@ export class RequestView {
   async showResult(res) {
     const output = this.form?.result();
     const format = output?.format || (res.mediaType === 'application/json' ? 'json' : '');
-    this.result = await resultView({ ...res, format, downloadName: this.downloadName(format) });
+    this.result = await resultView({ ...res, format, downloadName: this.downloadName(format), chosen: this.chosen, op: this.op,
+      title: output?.title || '' });
     this.outcome.replaceChildren(this.result.el);
   }
 
@@ -183,6 +219,10 @@ export class RequestView {
     if (err instanceof ApiError && Object.keys(err.byParameter).length && this.form) {
       this.form.show(err.byParameter, err.problems);
       parts.push(el('p', {}, 'Fix the fields marked above, then run it again.'));
+    }
+    if (err.warnings?.length) {
+      parts.push(el('p', {}, `It gave ${err.warnings.length} warning${err.warnings.length === 1 ? '' : 's'} first:`),
+        warningsList(err.warnings, this.chosen));
     }
     this.outcome.replaceChildren(notice('error', ...parts));
   }

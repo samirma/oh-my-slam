@@ -1,7 +1,7 @@
 // js/url.js: every page of the web application has a stable URL (spec §2.6 "Structure"), its hash
 // route, whose query keeps the page's state, changed in place.
 import { afterEach, describe, expect, test } from 'bun:test';
-import { parseRoute, setQuery, withQuery } from '../../../src/oh_my_slam/web/static/js/url.js';
+import { formQuery, parseRoute, queryInitial, setQuery, withQuery } from '../../../src/oh_my_slam/web/static/js/url.js';
 import { stubGlobals } from '../helpers.js';
 
 describe('parseRoute: the page a URL names', () => {
@@ -29,6 +29,18 @@ describe('the page\'s state in its URL', () => {
     expect(withQuery('#/maps/a?op=x', { op: undefined })).toBe('#/maps/a');
     expect(withQuery('', { op: 'segment' })).toBe('#/?op=segment');
     expect(withQuery('#/maps', { filter: 'a b&c' })).toBe('#/maps?filter=a+b%26c');
+  });
+
+  test('a form\'s values: the operation, its fields\' values, and another operation\'s keys removed', () => {
+    expect(formQuery('mapper-locate', { format: 'png', layers: 'obb', mode: null }, ['image', 'format']))
+      .toEqual({ image: null, format: 'png', op: 'mapper-locate', layers: 'obb', mode: null });
+    expect(withQuery('#/maps/a?op=reconstruct&image=x', formQuery('mapper-locate', { format: 'png' }, ['image'])))
+      .toBe('#/maps/a?op=mapper-locate&format=png');
+    expect(formQuery('segment', {})).toEqual({ op: 'segment' });
+    expect(withQuery('#/maps/new?op=x&map=a', formQuery(null, { map: 'b' }))).toBe('#/maps/new?map=b');  // a page of one operation
+    const q = new URLSearchParams('op=mapper-locate&format=png&layers=obb&other=1');
+    expect(queryInitial(q, ['format', 'layers', 'mode'])).toEqual({ format: 'png', layers: 'obb' });
+    expect(queryInitial(null, ['format'])).toEqual({});
   });
 
   let restore = () => {};

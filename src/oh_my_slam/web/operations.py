@@ -106,12 +106,16 @@ class Prepared:
 
     problems: list[Problem] = field(default_factory=list)
     argv: list[str] = field(default_factory=list)  # the command's, with absolute paths
-    command: list[str] = field(default_factory=list)  # as typed, with workspace paths
+    # as typed (``-f png``), with workspace paths, run in the workspace
+    command: list[str] = field(default_factory=list)
     uploads: list[str] = field(default_factory=list)  # the uploads the request names
     writes: str | None = None  # the map folder the request writes
     reads: str | None = None  # the map folder the request only reads
     result_format: str | None = None  # the format of the command's stdout
     inference: bool = True  # the request uses the inference server
+    # each path input: (parameter, position among its values, the command's absolute path, its
+    # workspace path), which name the inputs in the command's warnings (``app.command_warnings``)
+    inputs: list[tuple[str, int, str, str]] = field(default_factory=list)
 
 
 def _values(v: Any) -> list[Any]:
@@ -185,6 +189,8 @@ def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = Non
                 actual[name] = [str(p) for p in paths] if o.multiple else str(paths[0])
                 shown[name] = [workspace.relative(p) for p in paths] if o.multiple \
                     else workspace.relative(paths[0])
+                prep.inputs += [(name, k, str(p), workspace.relative(p))
+                                for k, p in enumerate(paths)]
                 if op.writes_map() is o:
                     prep.writes = str(paths[0])
                 elif o.kind is Kind.MAP:
@@ -200,7 +206,7 @@ def prepare(op: Operation, raw: Any, workspace: Any, prep: Prepared | None = Non
         return prep
     prep.result_format = result_format(op, actual)
     prep.inference = inference_of(op, actual)
-    prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown)]
+    prep.command = [op.program.prog, *spec.argv_of(op.command, op.mode, shown, joined=False)]
     prep.argv = spec.argv_of(op.command, op.mode, actual)
     return prep
 

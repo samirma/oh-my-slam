@@ -2,6 +2,8 @@
    controls meet WCAG 2.1 AA contrast in both. Object colours are the colour contract's own sRGB
    values in both themes, and always appear next to the object's id and label. */
 
+@import url("/static/viewer/lib/labels.css");  /* the §2.5 viewer's label layer (a cloud's cameras) */
+
 :root {
   color-scheme: light;
   --bg: #f5f6f8;
@@ -209,9 +211,20 @@ ul.files li { list-style: square; }
 .stages-box { margin: 0.8rem 0; }
 .ply-header { margin: 0.8rem 0; }
 .result-image { margin: 0.8rem 0; }
+.image-frame { display: inline-block; max-width: 100%; }
 .result-image img { display: block; max-width: 100%; height: auto; border: 1px solid var(--border);
   border-radius: 6px; }
 .result-image figcaption { margin-top: 0.3rem; }
+.result-image figcaption > p { margin: 0.3rem 0; }
+.scale { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.3rem; font-size: 0.85rem; }
+.scale-line { display: inline-block; height: 0.45rem; border: 2px solid currentColor; border-top: 0; }
+.legend .sub { margin: 0.4rem 0 0.2rem; }
+.legend ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; font-size: 0.88rem; }
+.legend li { display: flex; align-items: center; gap: 0.4rem; }
+.legend svg.mark { flex: none; background: #15171c; border-radius: 3px; }
+.warnings-list { margin: 0.3rem 0 0; padding-left: 1.2rem; }
+.command-note { display: block; font-size: 0.8rem; }
+.op-lead { margin: 0.3rem 0 0.8rem; }
 .ply-header > summary { cursor: pointer; font-weight: 600; padding: 0.2rem 0; }
 
 /* ---- a point-cloud result in 3D: the §2.5 viewer's canvas (its own dark background, as in
@@ -245,6 +258,7 @@ table.data tbody th { font-weight: 500; }
 table.data .num { text-align: right; }
 table.data tfoot th, table.data tfoot td { font-weight: 700; border-bottom: 0; }
 table.stages { max-width: 40rem; }
+table.cameras td.cam-image { overflow-wrap: anywhere; color: var(--muted); }
 table.stages td.share { width: 45%; color: var(--muted); white-space: nowrap; }
 .bar { display: inline-block; height: 0.6rem; background: var(--bar); border-radius: 2px; vertical-align: middle; min-width: 1px; max-width: calc(100% - 3.5rem); }
 
@@ -271,6 +285,8 @@ table.stages td.share { width: 45%; color: var(--muted); white-space: nowrap; }
 table.updates tr.update-detail > td { padding-top: 0; }
 table.updates tr[data-update] > * { border-bottom: 0; }
 table.updates .stages-box { margin: 0.2rem 0 0.4rem; }
+table.updates td.when { white-space: nowrap; }  /* its date, then its time on a line of its own */
+.card-actions { margin: 0.5rem 0 0; font-size: 0.9rem; }
 
 /* ---- dialog */
 dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); max-width: min(36rem, 92vw); padding: 1rem 1.3rem; }

@@ -1,8 +1,8 @@
 // The server.sh web application (http_server.md "Web application"): a shell (top bar, pages) over
 // the public API only. Every page has a stable URL (hash routing), so a map's page can be
 // bookmarked, reloaded or shared on this machine:
-//   #/image[?op=<op>]  #/maps[?filter=<text>]  #/maps/new  #/maps/<name>[?op=<op>]
-//   #/maps/<name>/update
+//   #/image[?op=<op>&<parameter>=<value>…]  #/maps[?filter=<text>]  #/maps/new[?<parameter>=<value>…]
+//   #/maps/<name>[?op=<op>&<parameter>=<value>…]  #/maps/<name>/update[?<parameter>=<value>…]
 // A request in progress belongs to its page: leaving the page asks first (see request.js).
 import { el, clear, notice } from './dom.js';
 import { store } from './store.js';
@@ -29,11 +29,11 @@ function route(event) {
     if (link.dataset.page === page) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
   }
   let render;
-  if (page === 'image' && !a) render = () => imagePage(main, { op: query.get('op') });
-  else if (page === 'maps' && !a) render = () => mapsPage(main, { filter: query.get('filter') || '' });
-  else if (page === 'maps' && a === 'new' && !b) render = () => mapFlowPage(main, { name: null });
-  else if (page === 'maps' && b === 'update' && parts.length === 3) render = () => mapFlowPage(main, { name: a });
-  else if (page === 'maps' && !b) render = () => mapPage(main, { name: a, op: query.get('op') });
+  if (page === 'image' && !a) render = () => imagePage(main, { op: query.get('op'), query });
+  else if (page === 'maps' && !a) render = () => mapsPage(main, { filter: query.get('filter') || '', query });
+  else if (page === 'maps' && a === 'new' && !b) render = () => mapFlowPage(main, { name: null, query });
+  else if (page === 'maps' && b === 'update' && parts.length === 3) render = () => mapFlowPage(main, { name: a, query });
+  else if (page === 'maps' && !b) render = () => mapPage(main, { name: a, op: query.get('op'), query });
   else {
     render = () => {
       main.append(el('h1', {}, 'Page not found'),

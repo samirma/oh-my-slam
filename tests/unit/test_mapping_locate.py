@@ -209,16 +209,16 @@ def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ign
     for res in (single, full):
         comments = parse_header(res.payload).comments
         assert comments[:2] == [MAP_FRAME, f"attributes {attrs.describe(CloudScope.MAP)}"]
-        assert len(comments) == 2 + len(imgs)  # one line per input image
-        for k, line in enumerate(comments[2:]):
-            key, payload = line.split(" ", 1)
+        lines = [line.split(" ", 1) for line in comments[2:]]
+        # one line per located image: the one the map cannot place is not in the result
+        assert [key for key, _ in lines] == [f"{LOCATED_CS}0", f"{LOCATED_CS}2"]
+        for key, payload in lines:
             d = json.loads(payload)
-            assert key == f"{LOCATED_CS}{k}" and d["image"] == str(imgs[k])
-            if k == 1:
-                assert d == {"image": str(world.other), "located": False}  # no pose
-                continue
+            k = int(key.removeprefix(LOCATED_CS))
             r = js.results[k]
-            assert d["located"] and d["transform_src_to_dst"] == ol.transform_data(r.T_map_cam)  # type: ignore[arg-type]
+            assert d["image"] == str(imgs[k]) and d["located"] is True
+            assert d["inliers"] == r.inliers
+            assert d["transform_src_to_dst"] == ol.transform_data(r.T_map_cam)  # type: ignore[arg-type]
             # the representation of the JSON result: its frame transform and stream properties
             frame = next(f["frame_properties"] for f in doc["openlabel"]["frames"].values()
                          if f["frame_properties"]["image"] == str(imgs[k]))
@@ -236,6 +236,102 @@ def test_ply_poses_in_the_header_and_visible_points(world) -> None:  # type: ign
     seg = parse_cloud_attrs("color=segment,label=on,voxel=0.05", CloudScope.MAP)
     voxel = parse_ply(run(world.map, imgs, fmt="ply", attrs=seg).payload)
     assert voxel.label is not None and len(voxel) < len(c_single)
+
+
+@needs_colmap
+def test_without_images_the_result_is_the_last_known_camera(world) -> None:  # type: ignore[no-untyped-def]
+    """No -i: the keyframe added last, marked last_known, in every format; nothing is matched, so
+    no inference client is ever needed, and the map is untouched."""
+    from oh_my_slam.mapping.locate import LAST_KNOWN, first_located_key
+    from oh_my_slam.tools.evaluate.contracts import birdseye_problems
+
+    before, hashed = snapshot(world.map), full_tree_hash(world.map)
+    reader = open_map(world.map)
+    last = max(reader.frames, key=lambda r: (r.update_id, r.index))
+    assert last.index == max(r.index for r in reader.frames)  # one update: its last frame
+    res = locate(reader, [], progress=quiet)
+    assert res.results == [] and [c.key for c in res.cameras] == [LAST_KNOWN]
+    assert "features_matching" not in res.timings["stages_s"]  # nothing registered
+    doc = json.loads(res.payload)
+    assert validation_errors(doc) == [] and doc["openlabel"]["metadata"]["scope"] == "single"
+    ((key, fr),) = doc["openlabel"]["frames"].items()
+    props = fr["frame_properties"]
+    assert int(key) == first_located_key(reader)  # never one of the map's frames
+    assert (props["last_known"], props["keyframe"], props["image"], props["source"]) == (
+        True, last.name, last.image, last.source)
+    assert "located" not in props and not located_frames(doc)
+    T = pose_of(props, LAST_KNOWN)
+    np.testing.assert_allclose(T.t, last.T_map_cam.t, atol=1e-6)
+    assert rot_deg(T.R, last.T_map_cam.R) < 1e-4
+    assert doc["openlabel"]["streams"][LAST_KNOWN]["uri"] == last.image
+    full = json.loads(locate(reader, [], mode="full", progress=quiet).payload)
+    assert validation_errors(full) == []
+    assert full["openlabel"]["objects"] == json.loads(scene_bytes(reader))["openlabel"]["objects"]
+    marked = [f["frame_properties"] for f in full["openlabel"]["frames"].values()
+              if f["frame_properties"].get("last_known")]
+    assert len(marked) == 1 and marked[0]["keyframe"] == last.name
+    assert len(full["openlabel"]["frames"]) == len(reader.frames) + 1  # the map's, plus it
+    ply = locate(reader, [], fmt="ply", progress=quiet).payload
+    (line,) = parse_header(ply).comments[2:]
+    name, payload = line.split(" ", 1)
+    d = json.loads(payload)
+    assert name == LAST_KNOWN and d["last_known"] and d["keyframe"] == last.name
+    assert d["transform_src_to_dst"] == props["transforms"][f"{LAST_KNOWN}_to_map"][
+        "transform_src_to_dst"]
+    assert 0 < len(parse_ply(ply)) < len(map_cloud(reader))  # what the last camera sees
+    for mode, layers, json_doc in (("single", ("cloud", "obb"), doc), ("full", ("obb",), full)):
+        png = locate(reader, [], mode=mode, fmt="png", layers=layers, progress=quiet).payload
+        assert birdseye_problems(png, json_doc) == [], (mode, layers)
+    assert snapshot(world.map) == before and full_tree_hash(world.map) == hashed
+
+
+@needs_colmap
+def test_a_birdseye_image_of_located_cameras(world) -> None:  # type: ignore[no-untyped-def]
+    """-f png draws the whole map with the located cameras (-t full: every keyframe's too), as
+    its JSON representation of the same cameras says; an image not located is left out."""
+    from oh_my_slam.mapping.locate import scene_json
+    from oh_my_slam.tools.evaluate.contracts import birdseye_problems, doc_cameras
+
+    imgs = [world.imgs_b[0], world.other]
+    reader = open_map(world.map)
+    res = run(world.map, imgs, fmt="png", mode="full")
+    assert [c.key for c in res.cameras] == [f"{LOCATED_CS}0"]  # the other room is not located
+    doc = json.loads(scene_json(reader, res.cameras, "full"))
+    assert birdseye_problems(res.payload, doc) == []
+    assert set(doc_cameras(doc)) == {f"{LOCATED_CS}0", *(r.name for r in reader.frames)}
+
+
+@needs_colmap
+def test_the_cli_without_images_and_its_birdseye_image(world, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    before = snapshot(world.map)
+    res = sh("locate", "-m", str(world.map))
+    assert res.returncode == 0, res.stderr.decode()
+    assert json.loads(res.stdout)["openlabel"]["coordinate_systems"]["map"]["children"] == [
+        "last_known"]
+    assert b"the map's last known camera: keyframe f0000" in res.stderr
+    out = tmp_path / "eye" / "map.png"
+    res = sh("locate", "-m", str(world.map), "-f", "png", "-l", "obb", "-t", "full", "-o",
+             str(out))
+    assert res.returncode == 0 and res.stdout == b"", res.stderr.decode()
+    from PIL import Image
+
+    with Image.open(out) as img:
+        assert img.format == "PNG" and img.mode == "RGB" and img.text["layers"] == "obb"  # type: ignore[attr-defined]
+    for args in (["-l", "obb"], ["-f", "ply", "-l", "cloud"]):
+        bad = sh("locate", "-m", str(world.map), *args)
+        assert bad.returncode == 2 and b"use -f png" in bad.stderr and bad.stdout == b""
+    assert sh("locate", "-m", str(world.map), "-f", "png", "-p", "voxel=1").returncode == 2
+    assert snapshot(world.map) == before
+
+
+def test_a_map_without_keyframes_has_no_last_known_camera(tmp_path: Path) -> None:
+    mdir = tmp_path / "m"
+    mdir.mkdir()
+    (mdir / store.MAP_JSON).write_text("{}")
+    with pytest.raises(InputError, match="has no keyframe, so no last known camera"):
+        locate(open_map(mdir), [], progress=quiet)
+    with pytest.raises(UsageError, match="unknown mode 'single' or format 'gif'"):
+        locate(open_map(mdir), [], fmt="gif")
 
 
 @needs_colmap
@@ -579,37 +675,38 @@ def test_a_vanished_file_retries_only_when_the_map_changed(tmp_path: Path,
     from oh_my_slam.mapping import locate as lmod
 
     reader = SimpleNamespace(root=tmp_path, frames=[], meta={})
+    images, layers = [Path("a.jpg"), Path("b.jpg")], ("cloud", "obb")
     ok = [lmod.Located(Path("a.jpg"), 0, Pose.identity(), Intrinsics(1, 1, 0, 0, 2, 2)),
           lmod.Located(Path("b.jpg"), 1, reason="far away")]
     attempts: list[int] = []
     identity = iter([b"1", b"2", b"2", b"2"])
 
-    def once(*args: object) -> tuple[bytes, list]:
+    def once(*args: object) -> tuple[bytes, list, list]:
         attempts.append(1)
         if len(attempts) == 1:
             raise FileNotFoundError("sfm/model/images.bin")
-        return b"doc", ok
+        return b"doc", ok, ["cameras"]
 
     monkeypatch.setattr(lmod, "_locate_once", once)
     monkeypatch.setattr(lmod, "_stale", lambda r: False)
     monkeypatch.setattr(lmod, "open_map", lambda root: reader)
     monkeypatch.setattr(lmod, "map_identity", lambda root: (next(identity), None))
     with timing.collect() as tm:
-        out = lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
-    assert out == (b"doc", ok) and len(attempts) == 2
+        out = lmod._locate(reader, images, "single", "json", CloudAttrs(), layers, None, quiet)  # type: ignore[arg-type]
+    assert out == (b"doc", ok, ["cameras"]) and len(attempts) == 2
     counts = tm.to_dict()["counts"]
     assert counts["attempts"] == 2 and counts["located"] == 1 and counts["images"] == 2
 
     attempts.clear()
     monkeypatch.setattr(lmod, "map_identity", lambda root: (b"same", None))
     with pytest.raises(FileNotFoundError):
-        lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
+        lmod._locate(reader, images, "single", "json", CloudAttrs(), layers, None, quiet)  # type: ignore[arg-type]
     assert len(attempts) == 1
 
     # an attempt that located nothing fails only once its map state is confirmed
-    monkeypatch.setattr(lmod, "_locate_once", lambda *a: (None, ok[1:]))
+    monkeypatch.setattr(lmod, "_locate_once", lambda *a: (None, ok[1:], []))
     with pytest.raises(InputError, match="none of the images"):
-        lmod._locate(reader, [], "single", "json", CloudAttrs(), None, quiet)  # type: ignore[arg-type]
+        lmod._locate(reader, images, "single", "json", CloudAttrs(), layers, None, quiet)  # type: ignore[arg-type]
 
 
 def test_pairs_exhaustive_for_small_maps_retrieval_for_large(tmp_path: Path) -> None:

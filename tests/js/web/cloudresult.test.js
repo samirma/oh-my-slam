@@ -2,7 +2,7 @@
 // colours and attributes it carries; rotate, pan and zoom), with its text alternative, its buttons
 // and the display budget of the §2.5 viewer.
 import { afterEach, describe, expect, test } from 'bun:test';
-import { budgetOf, drawnText, factRows, joinWords, points, TOOLS } from '../../../src/oh_my_slam/web/static/js/cloudresult.js';
+import { budgetOf, camerasText, drawnText, factRows, joinWords, points, TOOLS } from '../../../src/oh_my_slam/web/static/js/cloudresult.js';
 import * as viewer from '../../../src/oh_my_slam/viewer/static/lib/cloudview.js';
 import { stubGlobals } from '../helpers.js';
 
@@ -46,6 +46,25 @@ test('its caption: points, what each carries, the recorded attributes, the frame
     .toEqual(['Frame', 'oh-my-slam map frame (z up), metres']);
   expect(factRows({ count: 3, total: 3, carries: ['position'], attrs: '', frame: '', format: '', upright: false }))
     .toEqual([['Points', '3'], ['Each point carries', 'position']]);
+  // the cameras its header names (mapper.sh locate), after the frame
+  const one = factRows({ ...facts, cameras: [{ name: 'last_known', kind: 'last_known' }] });
+  expect(one[4]).toEqual(['Camera', 'last_known (the last known camera), drawn at its pose']);
+  const two = factRows({ ...facts, cameras: [{ name: 'located_0', kind: 'located' }, { name: 'located_2', kind: 'located' }] });
+  expect(two[4]).toEqual(['Cameras', 'located_0 (located) and located_2 (located), drawn at their poses']);
+});
+
+test('a located camera is named with the input the user chose', () => {
+  const chosen = new Map([['uploads/u1/IMG_2.jpg', { name: 'IMG_2.jpg', index: 1, multiple: true, parameter: 'inputs' }],
+    ['uploads/u2/one.jpg', { name: 'one.jpg', index: 0, multiple: false, parameter: 'image' }]]);
+  expect(camerasText([{ name: 'located_1', kind: 'located', source: '/ws/uploads/u1/IMG_2.jpg' },
+    { name: 'located_2', kind: 'located', source: '/ws/uploads/u2/one.jpg' },
+    { name: 'last_known', kind: 'last_known', source: 'frames/f000003.jpg' }], chosen))
+    .toBe('input 2 (located_1: IMG_2.jpg), input 1 (located_2: one.jpg) and last_known (the last known camera), drawn at their poses');
+});
+
+test('a camera of a kind the page does not know is named by that kind', () => {
+  expect(camerasText([{ name: 'f000003', kind: 'camera' }, { name: 'x', kind: 'odd' }]))
+    .toBe('f000003 (a camera) and x (odd), drawn at their poses');
 });
 
 test('the buttons make the moves of the viewer\'s keys, in labelled groups', () => {

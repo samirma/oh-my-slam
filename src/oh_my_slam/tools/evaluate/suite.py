@@ -18,8 +18,11 @@ strictly one command at a time.
       metrics: the first's objects, and the objects of the ids a middle update's points carry
       (read from the map as that update left it);
    c. on the one-update map: ``view.sh -m`` and ``mapper.sh locate`` of three of its captures
-      (``locate_picks``: ``-t single`` JSON, ``-t full`` JSON, ``-f ply -o``), which must leave
-      it unchanged, hidden entries included.
+      (``locate_picks``: ``-t single`` JSON, ``-t full`` JSON and its bird's-eye image, ``-f ply
+      -o``) and without images (the last known camera: ``-t single`` JSON and its bird's-eye
+      image, ``-t full`` JSON and its bird's-eye image of the OBBs alone), which must leave it
+      unchanged, hidden entries included. Each bird's-eye image is checked against the JSON
+      result of the same call (contract ``birdseye``).
 4. ``office_sequence``: ``mapper.sh update`` of the whole sequence in one update, and split as
    its annotation says (4+4+5 and 6+7), judged by ``mapupdate`` (the ``map_update.*`` metrics).
 5. Ground truth: ``segment.sh -i`` on every other example image an ``objects`` annotation names.
@@ -59,6 +62,7 @@ from oh_my_slam.tools.evaluate import mapupdate, service
 from oh_my_slam.tools.evaluate.contracts import (
     ContractLog,
     artifact_problems,
+    birdseye_problems,
     catalog_csv_problems,
     catalog_md_problems,
     cloud_colour_problems,
@@ -75,6 +79,7 @@ from oh_my_slam.tools.evaluate.contracts import (
 from oh_my_slam.tools.evaluate.locate import (
     LOCATE_METRICS,
     held_out_metrics,
+    last_known_problems,
     located_poses,
     located_problems,
 )
@@ -275,18 +280,19 @@ def _point_labels(rec: RunRecord) -> set[int]:
 
 
 def _pose_lines(ply: bytes, asked: int) -> list[str]:
-    """``mapper.sh locate -f ply``: one ``located_<k> {json}`` header line per input image."""
+    """``mapper.sh locate -f ply``: one ``located_<k> {json}`` header line per located image (at
+    least one, at most one per input image), each marked located and with its pose."""
     lines = [c for c in parse_header(ply).comments if c.startswith("located_")]
-    out = [] if len(lines) == asked else [f"{len(lines)} located_ header lines for {asked} "
-                                          "input images"]
+    out = [] if 1 <= len(lines) <= asked else [f"{len(lines)} located_ header lines for {asked} "
+                                               "input images"]
     for line in lines:
         try:
             d = json.loads(line.split(" ", 1)[1])
         except (IndexError, ValueError):
             out.append(f"not a pose line: {line[:80]}")
             continue
-        if d.get("located") and "transform_src_to_dst" not in d:
-            out.append(f"{line.split(' ', 1)[0]}: located but no transform")
+        if d.get("located") is not True or "transform_src_to_dst" not in d:
+            out.append(f"{line.split(' ', 1)[0]}: not marked located with a transform")
     return out
 
 
@@ -638,8 +644,9 @@ class Evaluation:
                          single_dir: Path) -> None:
         """``mapper.sh locate`` of three of the sequence's captures (``locate_picks``) on its
         one-update map: ``-t single`` JSON (the default), ``-t full`` JSON (the map exactly as
-        ``update -t full`` gave it, plus the located cameras) and ``-f ply -o`` (map points, one
-        header line per input image)."""
+        ``update -t full`` gave it, plus the located cameras) and its bird's-eye image, and
+        ``-f ply -o`` (map points, one header line per located image); then without images
+        (``last_known``)."""
         if single is None:
             return
         folder = self.examples / seq.folder
@@ -659,6 +666,7 @@ class Evaluation:
                                  seq.named("mapper.sh locate -t full vs update -t full"),
                                  same_objects_problems(doc_objects(single), doc_objects(doc),
                                                        geometry=True))
+        self.birdseye(f"{name}_png_full", doc, *args, "-t", "full")
         target = self.out / "outputs" / f"{name}.ply"
         target.parent.mkdir(parents=True, exist_ok=True)
         rec = self.run(f"{name}_ply", f"{name}_ply", "mapper.sh", *args, "-f", "ply", "-o",
@@ -666,6 +674,35 @@ class Evaluation:
         if rec.ok:
             problems = _problems_reading(lambda: _pose_lines(target.read_bytes(), len(images)))
             self.contracts.check("stdout", "mapper", f"{name}_ply/pose header lines", problems)
+        self.last_known(name, single_dir)
+
+    def last_known(self, name: str, map_dir: Path) -> None:
+        """``mapper.sh locate`` without images (the map's last known camera): ``-t single`` JSON,
+        its bird's-eye image, and ``-t full`` JSON with its bird's-eye image of the OBB layer
+        alone."""
+        args: tuple[str | Path, ...] = ("locate", "-m", map_dir)
+        doc = self.scene(self.run(f"{name}_last_known", f"{name}_last_known", "mapper.sh", *args))
+        if doc is not None:
+            def known(doc: Json = doc) -> list[str]:
+                try:
+                    return last_known_problems(doc, persisted_scene(map_dir))
+                except OhMySlamError as exc:  # the map cannot be read
+                    return [f"{type(exc).__name__}: {exc}"]
+
+            self.contracts.check("openlabel", "mapper", f"{name}_last_known/last known camera",
+                                 _problems_reading(known))
+        self.birdseye(f"{name}_last_known_png", doc, *args)
+        doc = self.scene(self.run(f"{name}_last_known_full", f"{name}_last_known_full",
+                                  "mapper.sh", *args, "-t", "full"))
+        self.birdseye(f"{name}_last_known_png_obb", doc, *args, "-t", "full", "-l", "obb")
+
+    def birdseye(self, tag: str, doc: Json | None, *args: str | Path) -> None:
+        """``mapper.sh locate`` with ``args`` as a bird's-eye image (``-f png``), checked against
+        ``doc``, the JSON result of the same call (high_level_spec.md §5 "Contracts")."""
+        rec = self.run(tag, tag, "mapper.sh", *args, "-f", "png", stdout="png")
+        if rec.ok and doc is not None:
+            self.contracts.check("birdseye", "mapper", tag, _problems_reading(
+                birdseye_problems, rec.stdout_bytes(), doc))
 
     def map_update(self) -> None:
         """The office sequence mapped whole in one update, and split across updates as its

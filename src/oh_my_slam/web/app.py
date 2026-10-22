@@ -16,7 +16,9 @@ point-cloud result.
 An operation's answer is the command's: on success its stdout, byte for byte, in the result's media
 type, with the command's per-stage timings in a ``Server-Timing`` header (its own stage names, in
 milliseconds, and ``total``); otherwise the command's message and the code of its exit status, by
-the generic exit status → HTTP status rule.
+the generic exit status → HTTP status rule. The warnings the command gave (an image ``mapper.sh
+locate`` could not place, an ignored option) come with either answer in an ``X-Oms-Warnings``
+header (JSON: :func:`command_warnings`), and in a failure's body too.
 
 Every request must name this machine in ``Host`` (no DNS rebinding); a state-changing request must
 come from no foreign ``Origin`` (scheme, host and port: this service's own) and carry a content
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import time
@@ -92,6 +95,8 @@ HOSTS_REFRESH_S = 30.0  # an unknown Host re-reads the machine's addresses at mo
 FORMS = frozenset({"application/x-www-form-urlencoded", "multipart/form-data"})  # never a raw file
 SAFELISTED = FORMS | {"", "text/plain"}  # what a cross-site form sends without a preflight
 CLIENT_GONE = 499  # what an interrupted request is logged with (nobody reads it)
+WARNINGS_HEADER = "X-Oms-Warnings"  # the command's warnings, as JSON (command_warnings)
+MAX_WARNINGS = 50  # warnings listed in one answer; a last entry counts the others
 Json = dict[str, Any]
 WEB_STATIC = Path(str(resources.files("oh_my_slam.web") / "static"))
 # the viewer's modules and vendored libraries (spec §2.6 "Image": a point-cloud result is drawn with
@@ -217,13 +222,46 @@ def server_timing(folder: Path) -> str | None:
         return None
 
 
-def failure(outcome: Outcome) -> tuple[int, Json]:
+def failure(outcome: Outcome, warnings: list[Json] | None = None) -> tuple[int, Json]:
     """HTTP status and body of a request whose command did not succeed: its message and the code
     of its exit status, by the generic rule — also when the service's stop interrupted it (exit
-    130: 499 ``interrupted``, as for a client that left)."""
+    130: 499 ``interrupted``, as for a client that left) — and the warnings it gave, if any."""
     status = http_status(outcome.code)
-    return status, {"error": {"code": error_code(outcome.code), "exit_code": outcome.code,
-                              "message": outcome.message or "", "http_status": status}}
+    err: Json = {"code": error_code(outcome.code), "exit_code": outcome.code,
+                 "message": outcome.message or "", "http_status": status}
+    if warnings:
+        err["warnings"] = warnings
+    return status, {"error": err}
+
+
+def command_warnings(messages: tuple[str, ...] | list[str],
+                     inputs: list[tuple[str, int, str, str]]) -> list[Json]:
+    """The warnings a command gave, as an answer lists them: each ``{"message", "inputs"}``, the
+    message with every path input it names by the command's absolute path named by its
+    workspace path instead (as the request's ``command`` names it), and those inputs, each
+    ``{"parameter", "index", "path"}`` (``Prepared.inputs``). At most ``MAX_WARNINGS``, then one
+    that counts the others."""
+    ordered = sorted(inputs, key=lambda i: -len(i[2]))  # a longer path before one it extends
+    out: list[Json] = []
+    for message in messages[:MAX_WARNINGS]:
+        named = []
+        for name, index, absolute, shown in ordered:
+            pattern = re.compile(re.escape(absolute) + r"(?![\w-])")
+            message, n = pattern.subn(shown.replace("\\", r"\\"), message)
+            if n:
+                named.append({"parameter": name, "index": index, "path": shown})
+        out.append({"message": message,
+                    "inputs": sorted(named, key=lambda i: (i["parameter"], i["index"]))})
+    if len(messages) > MAX_WARNINGS:
+        out.append({"message": f"{len(messages) - MAX_WARNINGS} more warnings", "inputs": []})
+    return out
+
+
+def warnings_header(warnings: list[Json]) -> dict[str, str]:
+    """The ``X-Oms-Warnings`` header of an answer (none without warnings): JSON in ASCII."""
+    if not warnings:
+        return {}
+    return {WARNINGS_HEADER: json.dumps(warnings, ensure_ascii=True, separators=(",", ":"))}
 
 
 class _ResultResponse(FileResponse):
@@ -325,15 +363,17 @@ async def disconnected(request: Request) -> None:
 
 
 def answer(outcome: Outcome, prep: Prepared, folder: Path) -> Response:
-    """An operation's response: the command's stdout and its timings on success, else its
-    error."""
+    """An operation's response: the command's stdout and its timings on success, else its error;
+    with the warnings it gave, either way."""
+    warnings = command_warnings(outcome.warnings, prep.inputs)
+    headers = warnings_header(warnings)
     if outcome.code == 0:
         timing = server_timing(folder)
         return _ResultResponse(folder, media_of(prep.result_format),
-                               {"Server-Timing": timing} if timing else {})
+                               {**headers, **({"Server-Timing": timing} if timing else {})})
     shutil.rmtree(folder, ignore_errors=True)
-    status, body = failure(outcome)
-    return JSONResponse(body, status)
+    status, body = failure(outcome, warnings)
+    return JSONResponse(body, status, headers)
 
 
 _STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})

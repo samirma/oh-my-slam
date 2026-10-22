@@ -29,3 +29,15 @@ export function setQuery(changes) {
   const next = withQuery(location.hash, changes);
   if (next !== location.hash) history.replaceState(null, '', next);
 }
+
+// The query that keeps a page's form: the operation `op` it runs (null: none), the text of its fields' values
+// (OpForm.queryValues; null removes a key), and every key of `previous` (another operation's
+// fields) removed.
+export function formQuery(op, values, previous = []) {
+  return { ...Object.fromEntries(previous.map((k) => [k, null])), op, ...values };
+}
+
+// The values a page's query keeps for the parameters `names` (a form's `initial`).
+export function queryInitial(query, names) {
+  return Object.fromEntries(names.filter((n) => query && query.has(n)).map((n) => [n, query.get(n)]));
+}

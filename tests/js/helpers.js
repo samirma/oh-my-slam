@@ -137,28 +137,37 @@ function param(name, flag, kind, extra = {}) {
     ordered: false, accepts: null, applies: [], applies_text: '', ...extra };
 }
 const PLY_ONLY = { applies: [{ option: 'format', in: ['ply'] }], applies_text: 'only with -f ply' };
+const SCOPE = { label: 'scope', default: 'single', choices: ['full', 'single'],
+  choice_text: { full: 'the whole map plus the cameras', single: "the cameras' poses only, with no objects" } };
 const OPERATIONS = [
   ['reconstruct', 'reconstruct.sh', 'Single-image reconstruction (stdout or -o file).', 'required',
-    'reconstructs the image with the inference server',
-    [['stdout', 'json', 'json'], ['stdout', 'png', 'depth'], ['stdout', 'ply', 'ply']],
+    'to reconstruct the image',
+    [['stdout', 'json', 'json', 'the scene description'], ['stdout', 'png', 'depth', 'the 16-bit depth image'],
+      ['stdout', 'ply', 'ply', 'the point cloud']],
     [param('image', '-i', 'image', { required: true, accepts: IMAGE_SUFFIXES }),
-      param('format', '-f', 'enum', { default: 'json', choices: ['json', 'depth', 'ply'] }),
-      param('attrs', '-p', 'attrs', { default: 'color=rgb,stride=1', ...PLY_ONLY })]],
+      param('format', '-f', 'enum', { default: 'json', choices: ['json', 'depth', 'ply'],
+        choice_text: { json: 'the scene description', depth: 'the 16-bit depth image', ply: 'the point cloud' } }),
+      param('attrs', '-p', 'attrs', { default: 'color=rgb,stride=1', label: 'point-cloud attributes', ...PLY_ONLY })]],
   ['mapper-update', 'mapper.sh update', 'add images or a video to a map (created if missing)', 'required',
-    'infers depth and objects of every new keyframe',
-    [['stdout', 'json', 'json'], ['stdout', 'ply', 'ply'], ['-m', 'map', null]],
+    'to infer the depth and objects of every new keyframe',
+    [['stdout', 'json', 'json', 'the scene description'], ['stdout', 'ply', 'ply', 'the point cloud'], ['-m', 'map', null, 'the map']],
     [param('inputs', '-i', 'images_or_video', { required: true, multiple: true, ordered: true, accepts: [...IMAGE_SUFFIXES, ...VIDEO_SUFFIXES] }),
       param('map', '-m', 'map', { required: true }),
       param('format', '-f', 'enum', { default: 'json', choices: ['json', 'ply'] }),
       param('fps', '-fps', 'number', { default: 2, applies: [{ option: 'inputs', is: 'video', suffixes: VIDEO_SUFFIXES }], applies_text: 'only for a video' })]],
   ['mapper-locate', 'mapper.sh locate', 'camera pose of images in an existing map (read-only)', 'conditional',
-    'only for retrieval in maps of more keyframes than are matched exhaustively',
-    [['stdout', 'json', 'json'], ['stdout', 'ply', 'ply']],
-    [param('inputs', '-i', 'images', { required: true, multiple: true }), param('map', '-m', 'map', { required: true })]],
-  ['segment', 'segment.sh', 'Instance segmentation of one image.', 'required', 'segments the image with the inference server',
-    [['stdout', 'json', 'json'], ['stdout', 'png', 'png']],
+    'only to locate images in maps of more keyframes than are matched exhaustively; never without images',
+    [['stdout', 'json', 'json', 'the scene description'], ['stdout', 'ply', 'ply', 'the point cloud'],
+      ['stdout', 'png', 'png', "the bird's-eye image of the map"]],
+    [param('inputs', '-i', 'images', { multiple: true, label: 'images' }), param('map', '-m', 'map', { required: true }),
+      param('format', '-f', 'enum', { default: 'json', choices: ['json', 'ply', 'png'] }),
+      param('mode', '-t', 'enum', SCOPE),
+      param('layers', '-l', 'enum', { default: 'cloud,obb', choices: ['cloud,obb', 'cloud', 'obb'], applies: [{ option: 'format', in: ['png'] }] })]],
+  ['segment', 'segment.sh', 'Instance segmentation of one image.', 'required', 'to segment the image',
+    [['stdout', 'json', 'json', 'the scene description'], ['stdout', 'png', 'png', 'the segmented image']],
     [param('image', '-i', 'image', { required: true }), param('min_score', '--min-score', 'number', { default: 0.5 })]],
 ];
+const MEDIA = { json: 'application/json', ply: 'application/octet-stream', png: 'image/png', map: 'inode/directory' };
 export function openapiDocument() {
   const paths = { '/api/health': { get: { summary: 'health' } }, '/api/maps/{name}': { get: { summary: 'a map' } } };
   for (const [id, label, description, inference, text, outputs, params] of OPERATIONS) {
@@ -166,7 +175,8 @@ export function openapiDocument() {
       properties: Object.fromEntries(params.map((p) => [p.name, { description: p.help, 'x-oms': p }])) } } } };
     paths[`/api/ops/${id}`] = { post: { operationId: id, requestBody: body, 'x-oms': {
       id: label, description, inference, inference_text: text,
-      outputs: outputs.map(([via, format, value]) => ({ via, format, when: value ? [{ option: 'format', in: [value] }] : [] })) } } };
+      outputs: outputs.map(([via, format, value, title]) => ({ via, format, title, media_type: MEDIA[format],
+        when: value ? [{ option: 'format', in: [value] }] : [] })) } } };
     paths[`/api/ops/${id}/validate`] = { post: { operationId: `${id}-validate`, requestBody: body } };
   }
   paths['/api/ops/legacy'] = { post: { operationId: 'legacy' } };  // no registry entry: not an operation of the app

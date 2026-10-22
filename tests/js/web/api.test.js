@@ -2,7 +2,7 @@
 // "Requests"); an operation runs within its request, its stages come in Server-Timing, and every
 // error carries the command's message and the code of its exit status ("Actionable errors").
 import { afterEach, describe, expect, test } from 'bun:test';
-import { ApiError, discardUpload, enc, getJson, parseServerTiming, postJson, removeMap, runOperation, send, startViewer, stopViewer, upload } from '../../../src/oh_my_slam/web/static/js/api.js';
+import { ApiError, discardUpload, enc, getJson, parseServerTiming, parseWarnings, postJson, removeMap, runOperation, send, startViewer, stopViewer, upload } from '../../../src/oh_my_slam/web/static/js/api.js';
 import { fakeFetch, json, stubGlobals } from '../helpers.js';
 
 let restore = () => {};
@@ -17,6 +17,10 @@ describe('ApiError: the service\'s error shape', () => {
     expect([e.message, e.status, e.code]).toEqual(['argument -fps: must be > 0', 400, 'usage']);
     expect(e.problems).toEqual([{ message: 'argument -fps: must be > 0', parameters: ['fps'] }]);
     expect(e.byParameter).toEqual({ fps: ['must be > 0'] });
+    expect(e.warnings).toEqual([]);
+    const w = [{ message: 'uploads/u1/a.jpg: not located', inputs: [{ parameter: 'inputs', index: 0, path: 'uploads/u1/a.jpg' }] }];
+    expect(new ApiError(400, { error: { code: 'usage', message: 'none located', warnings: w } }).warnings).toEqual(w);
+    expect(new ApiError(400, { error: { code: 'usage', message: 'x', warnings: 'odd' } }).warnings).toEqual([]);
   });
   test('whatever else came back still says what happened', () => {
     expect(new ApiError(500, { error: 'boom' }).message).toBe('boom');
@@ -25,6 +29,13 @@ describe('ApiError: the service\'s error shape', () => {
     expect(new ApiError(0, {}).message).toBe('the service did not answer');
     expect(new ApiError(404, { error: { code: 'not_found' } }).message).toBe('HTTP 404');
   });
+});
+
+test('parseWarnings: the command\'s warnings an answer carries, as JSON', () => {
+  const w = [{ message: 'a.jpg: not located', inputs: [] }];
+  expect(parseWarnings(JSON.stringify(w))).toEqual(w);
+  expect(parseWarnings(JSON.stringify([...w, { inputs: [] }, null, 3]))).toEqual(w);  // what is no warning is left out
+  for (const v of [null, '', 'not json', '{"message": "x"}']) expect(parseWarnings(v)).toEqual([]);
 });
 
 test('parseServerTiming: the command\'s stages, in its order, in milliseconds', () => {
@@ -87,6 +98,11 @@ describe('runOperation: an operation within this request', () => {
     expect(new Uint8Array(await res.blob.arrayBuffer())).toEqual(ply);  // byte for byte
     expect(res.mediaType).toBe('application/x-ply');
     expect(res.stages).toEqual([{ name: 'depth', ms: 5 }, { name: 'total', ms: 9 }]);
+    expect(res.warnings).toEqual([]);
+    restore();
+    const w = [{ message: 'uploads/u1/b.jpg: not located', inputs: [{ parameter: 'inputs', index: 1, path: 'uploads/u1/b.jpg' }] }];
+    net(() => new Response('{}', { headers: { 'X-Oms-Warnings': JSON.stringify(w) } }));
+    expect((await runOperation('mapper-locate', {})).warnings).toEqual(w);
   });
 
   test('a body without a media type is octet-stream, without timings no stages', async () => {

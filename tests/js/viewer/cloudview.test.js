@@ -36,7 +36,7 @@ describe('cloudFacts: what a text alternative of the cloud states', () => {
     expect(cloudFacts(cloud)).toEqual({
       count: 2, total: 5, carries: ['position', 'colour (color=segment)', 'normal', 'object id'],
       attrs: 'color=segment,normals=on,label=on', frame: IMAGE_FRAME, format: 'binary_little_endian 1.0', upright: true,
-      note: budgetNote(cloud.header),
+      note: budgetNote(cloud.header), cameras: [],
     });
     expect(cloudFacts(cloud).note).toStartWith('Showing 2 of 5 points: evenly spaced');
   });
@@ -45,6 +45,7 @@ describe('cloudFacts: what a text alternative of the cloud states', () => {
     const cloud = parsePly(plyBytes({ position: arrays.position, color: arrays.color }, { encoding: 'ascii', comments: ['made elsewhere'] }));
     expect(cloudFacts(cloud)).toEqual({
       count: 5, total: 5, carries: ['position', 'colour'], attrs: '', frame: '', format: 'ascii 1.0', upright: false, note: '',
+      cameras: [],
     });
     expect(cloudFacts({ header: { count: 1, total: 1 }, arrays: { position: new Float32Array(3) } }))
       .toMatchObject({ carries: ['position'], attrs: '', frame: '', format: '', upright: false });
@@ -53,6 +54,49 @@ describe('cloudFacts: what a text alternative of the cloud states', () => {
   test('a map\'s frame is named', () => {
     const cloud = parsePly(plyBytes({ position: arrays.position }, { comments: [MAP_FRAME] }));
     expect(cloudFacts(cloud).frame).toBe(MAP_FRAME);
+  });
+});
+
+describe('the cameras a PLY header names (mapper.sh locate)', () => {
+  // mapping/locate.py camera_record: the frame's properties, transform and stream properties
+  const record = (extra = {}, q = [0, 0, 0, 1]) => ({
+    image: 'q.jpg', ...extra,
+    transform_src_to_dst: { quaternion: q, translation: [1, 2, 3] },
+    stream_properties: { intrinsics_pinhole: { width_px: 640, height_px: 480,
+      camera_matrix: [500, 0, 320, 0, 0, 510, 240, 0, 0, 0, 1, 0], distortion_coeffs: [0, 0, 0, 0, 0] } },
+  });
+
+  test('a quaternion (scalar last) is the rotation it names, normalised', () => {
+    expect(view.quaternionMatrix([0, 0, 0, 2])).toEqual([[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
+    const R = view.quaternionMatrix([0, 0, Math.SQRT1_2, Math.SQRT1_2]);  // 90 degrees about z
+    expect(R.map((r) => r.map((v) => Math.round(v * 1e9) / 1e9 + 0))).toEqual([[0, -1, 0], [1, 0, 0], [0, 0, 1]]);
+    expect(view.quaternionMatrix([0, 0, 0, 0])).toEqual([[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
+  });
+
+  test('a record is a camera of cameras.js, of its kind', () => {
+    const c = view.recordCamera('located_0', record({ located: true }));
+    expect(c).toEqual({ name: 'located_0', kind: 'located', input: 1, T: [[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 3], [0, 0, 0, 1]],
+      position: [1, 2, 3], K: [500, 510, 320, 240], size: [640, 480], source: 'q.jpg' });
+    // a located camera's input: its key's position (located_<k>), from 1
+    expect(view.recordCamera('located_12', record({ located: true })).input).toBe(13);
+    expect(view.recordCamera('located', record({ located: true })).input).toBeNull();
+    expect(view.recordCamera('last_known', record({ last_known: true }))).toMatchObject({ kind: 'last_known', input: null });
+    const { image, ...unnamed } = record();
+    expect(view.recordCamera('f000001', unnamed)).toMatchObject({ kind: 'camera', source: null });
+    for (const bad of [null, {}, { ...record(), transform_src_to_dst: { translation: [0, 0, 0] } },
+      { ...record(), transform_src_to_dst: { quaternion: [0, 0, 0, 1] } }, { ...record(), stream_properties: {} }]) {
+      expect(view.recordCamera('x', bad)).toBeNull();
+    }
+  });
+
+  test('the header lines that record a camera, in order; other comments are left out', () => {
+    const header = { comments: [MAP_FRAME, 'attributes color=rgb', `located_2 ${JSON.stringify(record({ located: true }))}`,
+      'located_3 {not json}', 'note {"a": 1}', `last_known ${JSON.stringify(record({ last_known: true }))}`] };
+    expect(view.headerCameras(header).map((c) => [c.name, c.kind])).toEqual([['located_2', 'located'], ['last_known', 'last_known']]);
+    expect(view.headerCameras({})).toEqual([]);
+    const cloud = parsePly(plyBytes({ position: new Float32Array(3) }, { comments: header.comments }));
+    expect(cloudFacts(cloud).cameras).toEqual([{ name: 'located_2', kind: 'located', source: 'q.jpg' },
+      { name: 'last_known', kind: 'last_known', source: 'q.jpg' }]);
   });
 });
 

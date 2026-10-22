@@ -2,7 +2,10 @@
 // and a filter, a map's update history with timings (spec §2.6 "Maps", from map.json); the name a
 // result is downloaded under.
 import { describe, expect, test } from 'bun:test';
-import { cardFigures, count, figures, mapMatches, removeQuestion, updateStages, viewerStatus } from '../../../src/oh_my_slam/web/static/js/pages/maps.js';
+import { autoRuns, cardFigures, count, figures, imageLinks, linkHref, mapMatches, mapsLead, oneOf, producesText, removeQuestion,
+  resultsText, TRACKED_TITLE, trackedCounts, trackedLines, updateStages, viewerStatus } from '../../../src/oh_my_slam/web/static/js/pages/maps.js';
+import { Operation } from '../../../src/oh_my_slam/web/static/js/store.js';
+import { openapiDocument } from '../helpers.js';
 import { stem } from '../../../src/oh_my_slam/web/static/js/pages/image.js';
 import { fmtDate } from '../../../src/oh_my_slam/web/static/js/dom.js';
 
@@ -54,6 +57,18 @@ describe('the update history', () => {
     expect(count(null)).toBe('—');
     expect(count('ok')).toBe('ok');
   });
+  test('the detections an update tracked, confirmed or not: never called the objects the map lists', () => {
+    expect(trackedCounts({ objects: { total: 30, confirmed: 8, unconfirmed: 22 } })).toEqual({ confirmed: 8, unconfirmed: 22, total: 30 });
+    expect(trackedCounts({ objects: { total: 7 } })).toEqual({ confirmed: null, unconfirmed: null, total: 7 });  // an older record
+    expect(trackedCounts({ objects: 'x' })).toEqual({ confirmed: null, unconfirmed: null, total: null });
+    expect(trackedCounts(null)).toEqual({ confirmed: null, unconfirmed: null, total: null });
+    expect(trackedLines({ confirmed: 8, unconfirmed: 22, total: 30 })).toEqual(['8 confirmed', '+ 22 unconfirmed']);
+    expect(trackedLines({ confirmed: 8, unconfirmed: null, total: 8 })).toEqual(['8 confirmed']);
+    expect(trackedLines({ confirmed: null, unconfirmed: null, total: 7 })).toEqual(['7']);
+    expect(trackedLines({ confirmed: null, unconfirmed: null, total: null })).toEqual(['—']);
+    expect(TRACKED_TITLE).toContain('confirmed or not');
+    expect(TRACKED_TITLE).toContain("summary's Objects");
+  });
   test('an update\'s stages in milliseconds, its total last', () => {
     expect(updateStages({ stages_s: { sfm: 12.5, depth: 0.25 }, total_s: 20 })).toEqual([
       { name: 'sfm', ms: 12500 }, { name: 'depth', ms: 250 }, { name: 'total', ms: 20000 }]);
@@ -67,6 +82,41 @@ test('a result is downloaded under its input\'s name, without folders or suffix'
   expect(stem('photo')).toBe('photo');
   expect(stem(null)).toBe('');
   expect(stem(undefined)).toBe('');
+});
+
+test('what an operation that takes a map gives, from its definition', () => {
+  const doc = openapiDocument();
+  const op = (id) => new Operation(id, doc.paths[`/api/ops/${id}`].post);
+  expect(producesText(op('mapper-locate'))).toBe('mapper.sh locate: Camera pose of images in an existing map (read-only). Its result: '
+    + "the scene description (JSON), the point cloud (PLY) or the bird's-eye image of the map (PNG), by its format.");
+  const one = op('segment');
+  one.x = { ...one.x, outputs: [{ via: 'stdout', format: 'json', name: 'result', when: [] }] };
+  expect(producesText(one)).toBe('segment.sh: Instance segmentation of one image. Its result: result (JSON).');
+  // the maps page, in plain words: what a map's page gives
+  expect(mapsLead([op('mapper-locate'), one])).toBe('The maps of this workspace. Open one to see its summary and history, and to get '
+    + "the scene description, the point cloud, the bird's-eye image of the map or result.");
+  expect(mapsLead([])).toBe('The maps of this workspace. Open one to see its summary and history.');
+  // a card's links straight to an image result of an operation that needs nothing but the map
+  const links = imageLinks([op('mapper-locate'), op('mapper-update')]);
+  expect(links).toEqual([{ text: "Bird's-eye image of the map", op: 'mapper-locate', query: { format: 'png' } }]);
+  expect(linkHref('my map', links[0])).toBe('#/maps/my%20map?op=mapper-locate&format=png&run=1');  // run at once
+  // run unasked only when its check passed, it needs no inference server and writes nothing else
+  const locate = op('mapper-locate');
+  expect(autoRuns(locate, { valid: true, inference: false })).toBe(true);
+  expect(autoRuns(locate, { valid: true, inference: true })).toBe(false);
+  expect(autoRuns(locate, { valid: true, inference: null })).toBe(false);
+  expect(autoRuns(locate, { valid: false, inference: null })).toBe(false);
+  expect(autoRuns(locate, null)).toBe(false);
+  expect(autoRuns(op('mapper-update'), { valid: true, inference: false })).toBe(false);  // it writes a map
+  const needy = op('mapper-locate');
+  needy.params = needy.params.map((p) => (p.name === 'inputs' ? { ...p, required: true } : p));
+  expect(imageLinks([needy])).toEqual([]);  // an image it gives only with more than the map
+  const untitled = op('mapper-locate');
+  untitled.x = { ...untitled.x, outputs: [{ via: 'stdout', format: 'png', name: 'result', media_type: 'image/png', when: [{ option: 'format', in: ['png'] }] }] };
+  expect(imageLinks([untitled])[0].text).toBe('Result');
+  expect(resultsText(op('reconstruct'))).toBe('Its result: the scene description (JSON), the 16-bit depth image (PNG) '
+    + 'or the point cloud (PLY), by its format.');
+  expect([oneOf([]), oneOf(['a']), oneOf(['a', 'b'])]).toEqual(['', 'a', 'a or b']);
 });
 
 describe('a map\'s viewer and its removal', () => {

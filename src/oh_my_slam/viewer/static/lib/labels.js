@@ -7,7 +7,9 @@
 //
 // An item is { id, tag, name, background, ink, anchor (THREE.Vector3, display frame), size (m),
 // title, note (its text in a list of crowded items), group (which layer shows it) }; the layer
-// adds `div`, and sets `mode` (null: not shown, 'compact': tag only, 'full': tag and name).
+// adds `div`, and sets `mode` (null: not shown, 'compact': tag only, 'full': tag and name). The
+// layer is named after what it holds (labelsName). An item is measured while shown, so one that
+// was hidden still takes its own room.
 import * as THREE from 'three';
 import { el } from './dom.js';
 
@@ -18,9 +20,21 @@ const DIRS = [0, 1, 11, 2, 10, 3, 9, 4, 8, 5, 7, 6].map((k) => {  // from straig
   return [Math.cos(a), Math.sin(a)];
 });
 
+// What each group of labels holds (a group of another name: labels)
+export const GROUP_WORDS = { labels: 'object', cameras: 'camera' };
+
+// The name of a layer holding `items`: "Object labels", "Camera labels", "Object and camera
+// labels"; "Labels" when it holds none.
+export function labelsName(items) {
+  const words = [...new Set(items.map((o) => GROUP_WORDS[o.group] || 'other'))];
+  if (!words.length) return 'Labels';
+  const text = words.length < 2 ? words[0] : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)} labels`;
+}
+
 export class LabelLayer {
   constructor(host) {
-    this.root = el('div', { class: 'labels', 'aria-label': 'Object labels' });
+    this.root = el('div', { class: 'labels', 'aria-label': labelsName([]) });
     host.appendChild(this.root);
     this.items = [];
     this.measured = false;
@@ -36,20 +50,25 @@ export class LabelLayer {
     this.root.appendChild(item.div);
     this.items.push(item);
     this.measured = false;
+    this.root.setAttribute('aria-label', labelsName(this.items));
     return item;
   }
 
   remove(group) {
     for (const it of this.items.filter((i) => i.group === group)) it.div.remove();
     this.items = this.items.filter((i) => i.group !== group);
+    this.root.setAttribute('aria-label', labelsName(this.items));
   }
 
   measure() {
     for (const o of this.items) {
+      const hidden = o.div.hidden;
+      o.div.hidden = false;  // a hidden label measures nothing: it would take no room
       o.div.classList.remove('compact');
       const r = o.div.getBoundingClientRect();
       o.w = Math.ceil(r.width); o.h = Math.ceil(r.height);
       o.wTag = Math.ceil(o.div.firstChild.getBoundingClientRect().width);
+      o.div.hidden = hidden;
     }
     this.measured = this.items.every((o) => o.w > 0);
   }

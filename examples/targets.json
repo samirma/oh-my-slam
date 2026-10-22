@@ -966,6 +966,12 @@
       "unit": "",
       "description": "view.sh -m / mapper.sh locate runs that changed the map folder (map)"
     },
+    "contract.birdseye.mapper": {
+      "op": "<=",
+      "value": 0,
+      "unit": "",
+      "description": "mapper.sh locate -f png bird's-eye images that disagree with the JSON result of the same call: their pixel-to-map metadata and cameras, a camera's marker or an OBB outline not where the JSON puts it, or a blended colour with -l obb (mapper)"
+    },
     "gt.objects.recall": {
       "op": ">=",
       "value": 0.7,

@@ -3,22 +3,38 @@
 //
 // A camera is { name, T (camera-to-scene, 4 x 4 row-major, OpenCV axes: x right, y down,
 // z forward), position (its centre, metres), K: [fx, fy, cx, cy], size: [width, height],
-// source (image file name) }.
+// source (image file name) }, and, for a camera a result names besides the scene's own
+// (cloudview.js recordCamera), its `kind`: such a camera is drawn in a colour of its kind
+// (KIND_COLORS) and labelled with its name and kind.
 import * as THREE from 'three';
 import { el } from './dom.js';
 import { srgb } from './obbs.js';
 
 export const FRAME_COLOR = '#c9d1dc';
+// the colours of the cameras of a kind (white, and a pale cream: neither is an object colour, whose
+// chroma and lightness the palette bounds), and what each kind is called on its label
+export const KIND_COLORS = { located: '#ffffff', last_known: '#f4e3b5' };
+export const KIND_NAMES = { located: 'located', last_known: 'last known camera' };
 
 export function poseMatrix(f) { return new THREE.Matrix4().fromArray(f.T.flat()).transpose(); }
 
-// A frustum per camera, its depth a fraction of the scene's `size`.
+// A camera's frustum colour: its kind's, else the scene's cameras' FRAME_COLOR.
+export function frustumColor(f) { return KIND_COLORS[f.kind] || FRAME_COLOR; }
+
+// The depth of the frustums of `count` cameras in a scene of `size`.
+export function frustumDepth(count, size) { return Math.max(0.05, size * (count === 1 ? 0.05 : 0.025)); }
+
+// A frustum per camera, its depth a fraction of the scene's `size`: one line set per colour (the
+// scene's own cameras' `frustums`, a kind's `frustums-<kind>`).
 export function buildFrustums(cams, size) {
   const group = new THREE.Group();
   if (!cams.length) return group;
-  const d = Math.max(0.05, size * (cams.length === 1 ? 0.05 : 0.025));
-  const pos = [];
+  const d = frustumDepth(cams.length, size);
+  const byColor = new Map();
   for (const f of cams) {
+    const color = frustumColor(f);
+    if (!byColor.has(color)) byColor.set(color, { name: KIND_COLORS[f.kind] ? `frustums-${f.kind}` : 'frustums', pos: [] });
+    const { pos } = byColor.get(color);
     const T = poseMatrix(f);
     const [fx, fy, cx, cy] = f.K; const [w, h] = f.size;
     const c = new THREE.Vector3(0, 0, 0).applyMatrix4(T);
@@ -26,13 +42,25 @@ export function buildFrustums(cams, size) {
       new THREE.Vector3((u - cx) / fx * d, (v - cy) / fy * d, d).applyMatrix4(T));
     for (let i = 0; i < 4; i++) pos.push(...c.toArray(), ...cs[i].toArray(), ...cs[i].toArray(), ...cs[(i + 1) % 4].toArray());
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  const lines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: srgb(FRAME_COLOR) }));
-  lines.name = 'frustums';
-  lines.frustumCulled = false;
-  group.add(lines);
+  for (const [color, { name, pos }] of byColor) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    const lines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: srgb(color) }));
+    lines.name = name;
+    lines.frustumCulled = false;
+    group.add(lines);
+  }
   return group;
+}
+
+// The label of a camera of a kind (none for the scene's own cameras), in its kind's colour: as its
+// tag, the input it placed ("input 2": its `input` number, as the result's tables and its
+// bird's-eye image number it) or else its name, then its kind; its name in the tooltip.
+export function cameraLabel(f) {
+  if (!KIND_COLORS[f.kind]) return null;
+  const tag = f.input ? `input ${f.input}` : f.name;
+  return { id: `camera-${f.name}`, tag, name: KIND_NAMES[f.kind], background: KIND_COLORS[f.kind], ink: '#000000',
+    title: `${tag}: ${KIND_NAMES[f.kind]}${f.input ? ` (${f.name})` : ''}`, note: `${tag} ${KIND_NAMES[f.kind]}`, group: 'cameras' };
 }
 
 // The viewpoint at a camera: its centre, looking along its optical axis, with the vertical field

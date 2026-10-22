@@ -159,7 +159,9 @@ def test_the_result_format_and_inference_need_of_parameters_that_do_not_parse(
     bad = {"image": "a.jpg", "format": "xml"}
     assert web_ops.result_format(ops["reconstruct"], bad) is None
     assert web_ops.inference_of(ops["reconstruct"], bad) is True
-    assert web_ops.inference_of(ops["mapper-locate"], {"map": "m"}) is True  # conditional
+    # conditional: images in a map it cannot read count as needing it; no image never does
+    assert web_ops.inference_of(ops["mapper-locate"], {"inputs": ["a.jpg"], "map": "m"}) is True
+    assert web_ops.inference_of(ops["mapper-locate"], {"map": "m"}) is False
     assert web_ops.inference_of(_slow(monkeypatch), {"seconds": "soon"}) is False  # never
 
 

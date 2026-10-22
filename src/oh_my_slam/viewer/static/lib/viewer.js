@@ -10,7 +10,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { buildCloud, robustBox } from './cloud.js';
 import { buildObb, inkFor } from './obbs.js';
-import { buildFrustums, cameraView } from './cameras.js';
+import { buildFrustums, cameraLabel, cameraView, frustumDepth, poseMatrix } from './cameras.js';
 import { LabelLayer } from './labels.js';
 
 const BACKGROUND = '#15171c';
@@ -204,12 +204,22 @@ export class Viewer {
     this.invalidate();
   }
 
-  // The cameras' frustums.
+  // The cameras' frustums, and a label on each camera of a kind (a result's located or last known
+  // camera: cameras.js cameraLabel), anchored behind the camera, off its frustum; labels never
+  // cover one another (labels.js placeLabels).
   setCameras(cams) {
     this._clear(this.groups.cameras);
+    this.labels.remove('cameras');
     this.cameras = cams;
     const size = this.cloudBox.isEmpty() ? 1 : this.cloudBox.getSize(new THREE.Vector3()).length();
     for (const lines of [...buildFrustums(cams, size).children]) this.groups.cameras.add(lines);
+    const depth = frustumDepth(cams.length, size);
+    for (const f of cams) {
+      const label = cameraLabel(f);
+      if (!label) continue;
+      const anchor = new THREE.Vector3(0, 0, -depth / 2).applyMatrix4(poseMatrix(f)).applyMatrix4(this.root.matrixWorld);
+      this.labels.add({ ...label, anchor, size: depth });
+    }
     this._updateBox();
     this._labelsDirty = true;
     this.invalidate();

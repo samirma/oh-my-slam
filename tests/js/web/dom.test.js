@@ -1,7 +1,7 @@
 // js/dom.js: the web application's formatting of figures (spec §2.6 "Web application": summaries,
 // timings, sizes) and the one form of colour it puts in a style attribute.
 import { describe, expect, test } from 'bun:test';
-import { fmtBytes, fmtClock, fmtDate, fmtNumber, fmtSeconds, hexColor, humanize, nextId } from '../../../src/oh_my_slam/web/static/js/dom.js';
+import { fmtBytes, fmtClock, fmtDate, fmtNumber, fmtSeconds, fmtShortDateLines, hexColor, humanize, nextId, sentence } from '../../../src/oh_my_slam/web/static/js/dom.js';
 import { PALETTE_HEX } from '../helpers.js';
 
 test('a date from Unix seconds (numbers or numeric text); nothing for a missing or bad one', () => {
@@ -10,6 +10,20 @@ test('a date from Unix seconds (numbers or numeric text); nothing for a missing 
   expect(fmtDate('86400')).toMatch(/^Jan 2, 1970/);
   expect(fmtDate(1700000000.5)).toMatch(/^Nov 14, 2023.*10:13\s?PM$/);
   for (const bad of [null, undefined, 'soon', NaN, Infinity]) expect(fmtDate(bad)).toBe('');
+});
+
+test('a short date for a table\'s column, its time on a second line; nothing for a missing or bad one', () => {
+  const d = new Date(1700000000 * 1000);
+  expect(fmtShortDateLines(1700000000)).toEqual([d.toLocaleDateString(undefined, { dateStyle: 'short' }),
+    d.toLocaleTimeString(undefined, { timeStyle: 'short' })]);
+  expect(fmtShortDateLines(1700000000).join(' ').length).toBeLessThan(fmtDate(1700000000).length);
+  expect([fmtShortDateLines(null), fmtShortDateLines('x')]).toEqual([[], []]);
+});
+
+test('a text as a sentence of its own', () => {
+  expect(sentence('camera pose of images (read-only)')).toBe('Camera pose of images (read-only).');
+  expect(sentence('Instance segmentation.. ')).toBe('Instance segmentation.');
+  expect([sentence(''), sentence(null)]).toEqual(['', '']);
 });
 
 test('a duration in the unit that reads best', () => {

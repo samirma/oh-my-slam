@@ -2,7 +2,47 @@
 // default from the command's option definition, fields that do not apply to the current choices
 // are hidden and not sent, and the values sent are the API's.
 import { describe, expect, test } from 'bun:test';
-import { attrsValue, defaultText, fileState, holds, mapNote, numberValue } from '../../../src/oh_my_slam/web/static/js/form.js';
+import { attrsValue, choiceLabel, commandNote, defaultText, fieldLabel, fileState, holds, mapNote, numberValue, parseAttrs, resultName, shellLine,
+  variantWords } from '../../../src/oh_my_slam/web/static/js/form.js';
+
+test('a field\'s name: the option\'s label, else its name', () => {
+  expect(fieldLabel({ name: 'mode', label: 'scope' })).toBe('Scope');
+  expect(fieldLabel({ name: 'attrs', label: 'point-cloud attributes' })).toBe('Point-cloud attributes');
+  expect(fieldLabel({ name: 'min_score' })).toBe('Min score');
+});
+
+test('an enum choice says what it means, and which one is the default', () => {
+  const p = { default: 'json', choice_text: { png: "the bird's-eye image of the map" } };
+  expect(choiceLabel(p, 'png')).toBe("png — the bird's-eye image of the map");
+  expect(choiceLabel(p, 'json')).toBe('json (default)');
+  expect(choiceLabel({ default: null }, 'obb')).toBe('obb');
+});
+
+test('the point-cloud attributes of a value, to give back to their controls', () => {
+  expect([...parseAttrs('color=segment, voxel=0.01,bad,=x')]).toEqual([['color', 'segment'], ['voxel', '0.01']]);
+  expect([...parseAttrs(undefined)]).toEqual([]);
+});
+
+test('a command line to paste into a shell: a word that needs it is quoted', () => {
+  expect(shellLine(['mapper.sh', 'locate', '-m', 'maps/office', '-f', 'png', '-l', 'cloud,obb', '-p', 'color=segment', '--min-score=-1']))
+    .toBe('mapper.sh locate -m maps/office -f png -l cloud,obb -p color=segment --min-score=-1');
+  expect(shellLine(['segment.sh', '-i', "uploads/u1/my photo's.jpg", ''])).toBe("segment.sh -i 'uploads/u1/my photo'\\''s.jpg' ''");
+  expect(shellLine(null)).toBe('');
+});
+
+test('where the command line\'s paths are relative to', () => {
+  expect(commandNote('/Users/me/oh-my-slam-data')).toBe('Paths are relative to the workspace /Users/me/oh-my-slam-data, where the command runs.');
+  expect(commandNote(undefined)).toBe('Paths are relative to the workspace, where the command runs.');
+});
+
+test('a result\'s file name tells its variant apart', () => {
+  const params = [{ name: 'mode' }, { name: 'layers' }, { name: 'attrs' }, { name: 'none' }];
+  expect(variantWords(params, { mode: 'full', layers: 'cloud,obb', attrs: 'color=segment,voxel=0.01', none: '' }))
+    .toEqual(['full', 'cloud-obb', 'color-segment-voxel-0.01']);
+  expect(variantWords(params, { layers: ',,' })).toEqual([]);
+  expect(resultName(['mapper-locate', 'office', 'full', 'obb'], 'png')).toBe('mapper-locate-office-full-obb.png');
+  expect(resultName(['segment', '', 'photo'], '')).toBe('segment-photo');
+});
 
 test('the default a field shows', () => {
   expect(defaultText({ kind: 'enum', default: 'json' })).toBe('json');

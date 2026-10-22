@@ -76,11 +76,11 @@ EXISTING_MAP = "an existing map"
 FORMATS = {"json": "JSON", "ply": "PLY", "png": "PNG"}
 # The description's gloss of a result format; another is glossed by the names of the results in
 # it (``title``: "PNG = depth image or segmented image").
-GLOSS = {"json": "OpenLABEL scene (labelled objects with oriented bounding boxes; for a map, "
-                 "camera poses)",
+GLOSS = {"json": "OpenLABEL scene (labelled objects with oriented bounding boxes; a map's camera "
+                 "poses)",
          "ply": "point cloud"}
 # Each inference condition of the registry (``spec.CONDITIONS``) in words, its value for ``{}``.
-CONDITION_WORDS = {"map_keyframes_greater_than": "maps over {} keyframes"}
+CONDITION_WORDS = {"images_in_map_keyframes_greater_than": "images in maps over {} keyframes"}
 # The 10 values of an OBB cuboid as schema.openlabel writes them (cuboid_val: quaternion scalar
 # last); tests/unit/test_agent_skill.py checks them against the builder.
 CUBOID = ("x", "y", "z", "qx", "qy", "qz", "qw", "sx", "sy", "sz")
@@ -114,6 +114,15 @@ def sh(*lines: str) -> str:
 def listing(items: list[str], conj: str = "and") -> str:
     """``a``, ``a and b``, ``a, b and c``."""
     return f" {conj} ".join([", ".join(items[:-1]), items[-1]] if len(items) > 2 else items)
+
+
+def alternatives(names: list[str]) -> str:
+    """Names joined by "or", their last word said once when they share it ("depth, bird's-eye or
+    segmented image")."""
+    last = {n.rsplit(" ", 1)[-1] for n in names}
+    if len(names) > 1 and len(last) == 1 and all(" " in n for n in names):
+        return f"{listing([n.rsplit(' ', 1)[0] for n in names], 'or')} {last.pop()}"
+    return " or ".join(names)
 
 
 def statuses() -> str:
@@ -165,13 +174,20 @@ def service_flag(name: str) -> str:
 # -- the operations: everything here comes from the operations' definitions ---------------------------
 
 
+def required(op: Operation, o: Option) -> bool:
+    return o.required or o.name == op.mode.selector
+
+
 def inputs(op: Operation) -> list[Option]:
-    """The inputs an operation must be given: its required files and map."""
-    return [o for o in op.options if o.kind in TAKES and (o.required or o.name == op.mode.selector)]
+    """The inputs an operation takes: its files and map that are required, and its optional
+    files (``mapper.sh locate -i``)."""
+    return [o for o in op.options if o.kind in TAKES
+            and (required(op, o) or o.kind in spec.ACCEPTS)]
 
 
-def takes(o: Option) -> str:
-    return EXISTING_MAP if o.kind is Kind.MAP and o.must_exist else TAKES[o.kind]
+def takes(op: Operation, o: Option) -> str:
+    what = EXISTING_MAP if o.kind is Kind.MAP and o.must_exist else TAKES[o.kind]
+    return what if required(op, o) else f"optional {what}"
 
 
 def results(op: Operation) -> list[Output]:
@@ -195,7 +211,7 @@ def gives(op: Operation) -> str:
 
 
 def takes_gives(op: Operation) -> str:
-    ins = " + ".join(f"`{o.name}` ({takes(o)}" + (", in order" if o.ordered else "") + ")"
+    ins = " + ".join(f"`{o.name}` ({takes(op, o)}" + (", in order" if o.ordered else "") + ")"
                      for o in inputs(op))
     return f"{ins} → {gives(op)}" if ins else gives(op)
 
@@ -278,10 +294,10 @@ def sample_file(o: Option) -> str:
 
 
 def sample_params(op: Operation) -> Json:
-    """The required parameters of an operation with placeholder values."""
+    """The required parameters and the inputs of an operation with placeholder values."""
     out: Json = {}
     for o in op.options:
-        if not (o.required or o.name == op.mode.selector):
+        if not (required(op, o) or o in inputs(op)):
             continue
         if o.kind is Kind.MAP:
             out[o.name] = "<map>"
@@ -414,14 +430,14 @@ def description(ops: dict[str, Operation]) -> str:
     what it takes and produces, the need for a reachable server.sh and the operations that need
     the inference server, within the Agent Skills limit."""
     def clause(op: Operation) -> str:
-        ins = " + ".join(takes(o) for o in inputs(op))
+        ins = " + ".join(takes(op, o) for o in inputs(op))
         outs = "/".join(dict.fromkeys(FORMATS.get(o.format, o.format) for o in results(op)))
         return f"{op.id}: " + (f"{ins} → " if ins else "") + outs
 
     def gloss(fmt: str) -> str:
         names = dict.fromkeys(title(o).removeprefix("the ") for op in ops.values()
                               for o in results(op) if o.format == fmt)
-        return f"{FORMATS.get(fmt, fmt)} = {GLOSS.get(fmt) or ' or '.join(names)}"
+        return f"{FORMATS.get(fmt, fmt)} = {GLOSS.get(fmt) or alternatives(list(names))}"
 
     def ids(inference: str) -> list[str]:
         return [op.id for op in ops.values() if op.mode.inference == inference]
@@ -431,7 +447,7 @@ def description(ops: dict[str, Operation]) -> str:
     sometimes = [f"{op.id} for {condition(op.mode)}" for op in ops.values()
                  if op.mode.inference == "conditional"]
     text = (f"oh-my-slam monocular RGB 3D mapping on a Mac, through the HTTP API of its {web} web "
-            "service with sh and curl, from this machine or another on the LAN; needs a "
+            "service with sh and curl, from this or another machine on the LAN; needs a "
             f"{web} reachable from this machine, no checkout. Operations: "
             + "; ".join(clause(op) for op in ops.values()) + ". "
             + f"{listing(writing)} write{'s' if len(writing) == 1 else ''} a map; the others "
@@ -640,8 +656,11 @@ The example is `{{op}}`; every operation works the same way.
 5. **Read the stage timings** in the `Server-Timing` header: each of the command's own stages
    under its own name, then `total`, in milliseconds: `grep -i '^server-timing:' {{headers}}` →
    `server-timing: {{timing}}`.
-6. **Report** the result file, or the error's `message` as it is. A map's summary and update
-   history are at `GET /api/maps/<name>`.
+   When the command gave warnings (for example an image it could not locate, which is left out
+   of its result), an `{{warnings}}` header lists them as JSON, each with the inputs it names:
+   `grep -i '^{{warnings}}:' {{headers}}`. A failure's body lists them too (`error.warnings`).
+6. **Report** the result file, or the error's `message` as it is, and any warnings. A map's
+   summary and update history are at `GET /api/maps/<name>`.
 """
 
 EXAMPLES = """## Examples
@@ -746,7 +765,8 @@ def render(ops: dict[str, Operation] | None = None) -> str:
              ok=(f"{success(doc, f'/api/ops/{ex.id}', 'post')}, `Content-Type: {media}`, "
                  f"`Server-Timing: {server_timing(ex_stages)}`; `{result_file(ex, params)}` "
                  "holds the result, byte for byte"),
-             headers=HEADERS, timing=server_timing(ex_stages)),
+             headers=HEADERS, timing=server_timing(ex_stages),
+             warnings=app.WARNINGS_HEADER),
         fill(EXAMPLES, examples=sh(*examples(ops), *map_examples(doc))),
         fill(ERRORS, op=ex.id, refusal=refusal(ex), failed=failed(ExitCode.NOT_REGISTERED),
              codes="\n".join(f"| {c['exit_code']} | `{c['code']}` | {c['http_status']} "

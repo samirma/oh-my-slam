@@ -11,7 +11,8 @@ operation also carries its ``describe()`` entry as the API offers it
 can render forms and result pages from this document alone.
 
 Every JSON answer has its schema (``components/schemas``): the upload record, validation's answer,
-the error shape, the health (the inference server's from its own model) and the maps. The
+the error shape, the health (the inference server's from its own model), the maps, and the
+command's warnings that a run's answer carries (``X-Oms-Warnings``: JSON in a header). The
 service's own refusals and its upload limits are exported under ``x-oms`` from ``web.app``, beside
 the commands' exit codes."""
 
@@ -75,10 +76,25 @@ def _body(d: Json) -> Json:
 
 
 _ERROR = {"$ref": "#/components/responses/Error"}
+_COMMAND_ERROR = {"$ref": "#/components/responses/CommandError"}
 _SERVER_TIMING = {"Server-Timing": {
     "description": "the command's per-stage timings: each stage under the command's own name, "
                    "then total, in milliseconds (name;dur=<ms>, comma-separated)",
     "schema": {"type": "string"}}}
+
+
+def _warnings_header() -> Json:
+    from oh_my_slam.web.app import MAX_WARNINGS, WARNINGS_HEADER  # app imports this
+
+    return {WARNINGS_HEADER: {
+        "description": "the warnings the command gave, in order, when it gave any (on stderr, "
+                       "where a command run in a terminal shows them): e.g. an image that could "
+                       "not be located, an option that was ignored. JSON (ASCII), each with the "
+                       "path inputs it names (by their workspace paths, as the request's "
+                       f"command line names them); at most {MAX_WARNINGS}, then one that counts "
+                       "the others",
+        "content": {"application/json": {"schema": {"type": "array",
+                                                    "items": _ref("Warning")}}}}}
 _STR: Json = {"type": "string"}
 _INT: Json = {"type": "integer"}
 _NUM: Json = {"type": "number"}
@@ -115,7 +131,17 @@ def _schemas() -> Json:
              "message": {**_STR, "description": "the command's own message"},
              "http_status": _INT},
             {"exit_code": _INT, "rule": _STR, "parameters": _STRS, "problems": problems,
-             "by_parameter": by_parameter})}),
+             "by_parameter": by_parameter,
+             "warnings": {"type": "array", "items": _ref("Warning"),
+                          "description": "the warnings the command gave before it failed (as "
+                                         "in X-Oms-Warnings)"}})}),
+        "Warning": _object({
+            "message": {**_STR, "description": "the command's warning, each path input named by "
+                                               "its workspace path"},
+            "inputs": {"type": "array", "description": "the path inputs it names",
+                       "items": _object({"parameter": _STR, "index": {
+                           **_INT, "description": "its position among the parameter's values, "
+                                                 "from 0"}, "path": _STR})}}),
         "Upload": _object({"id": _STR, "name": _STR, "size": _INT,
                            "path": {**_STR, "description": "uploads/<id>/<name>: the value to "
                                                            "give one request's parameter"}}),
@@ -163,7 +189,7 @@ def _result(d: Json) -> Json:
     return {"description": "the command's result, byte-identical to what it writes to stdout or "
                            "to -o: " + "; ".join(o["text"] for o in d["outputs"]
                                                  if o["via"] == RESULT),
-            "headers": _SERVER_TIMING,
+            "headers": {**_SERVER_TIMING, **_warnings_header()},
             "content": {m: {} for m in media} or {"application/octet-stream": {}}}
 
 
@@ -257,7 +283,8 @@ def document(ops: dict[str, Operation]) -> Json:
                            "waiting for its turn with its connection open. Disconnecting "
                            "interrupts the command as Ctrl-C would.",
             "requestBody": _body(d),
-            "responses": {"200": _result(d), "4XX": _ERROR, "500": _ERROR, "503": _ERROR},
+            "responses": {"200": _result(d), "4XX": _COMMAND_ERROR, "500": _COMMAND_ERROR,
+                          "503": _COMMAND_ERROR},
             "x-oms": d,
         }}
         paths[f"/api/ops/{op.id}/validate"] = {"post": {
@@ -280,10 +307,15 @@ def document(ops: dict[str, Operation]) -> Json:
                  + ", run within its own request (spec §2.6)."},
         "paths": paths,
         "components": {
-            "responses": {"Error": {"description": "the command's message and the code of its "
-                                                   "exit status, or one of the service's own "
-                                                   "refusals", "content": {
-                "application/json": {"schema": _ref("Error")}}}},
+            "responses": {
+                "Error": {"description": "the command's message and the code of its exit status, "
+                                         "or one of the service's own refusals", "content": {
+                                             "application/json": {"schema": _ref("Error")}}},
+                "CommandError": {"description": "the command's message and the code of its exit "
+                                                "status, or one of the service's own refusals; "
+                                                "with the warnings the command gave, if it ran",
+                                 "headers": _warnings_header(), "content": {
+                                     "application/json": {"schema": _ref("Error")}}}},
             "schemas": _schemas(),
         },
         "x-oms": {"exit_codes": described["exit_codes"], "stages": described["stages"],

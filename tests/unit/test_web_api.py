@@ -203,7 +203,9 @@ def test_each_operation_runs_the_commands_own_entry_point(ws: Workspace) -> None
     ops = web_ops.operations()
     seg = web_ops.prepare(ops["segment"], {"image": "in/a.jpg"}, ws)
     assert seg.argv == [f"-i={(ws.root / 'in' / 'a.jpg')}"]  # the result is its stdout: no -o
-    assert seg.command == ["segment.sh", "-i=in/a.jpg"] and seg.result_format == "json"
+    # as typed: the documented "-i <path>", with workspace paths (run in the workspace)
+    assert seg.command == ["segment.sh", "-i", "in/a.jpg"] and seg.result_format == "json"
+    assert seg.inputs == [("image", 0, str(ws.root / "in" / "a.jpg"), "in/a.jpg")]
     # each result in the media type of its format: the segmented image and the depth image are
     # PNGs, the point cloud a PLY
     for op, params, fmt, media in (
@@ -262,11 +264,11 @@ def test_a_new_option_and_a_new_mode_reach_the_api_without_web_changes(
     image = {"image": "inputs/a.jpg"}
     r = svc.client.post("/api/ops/segment/validate", json={**image, "shade": "light"})
     assert r.json()["valid"], r.json()
-    assert "--shade=light" in r.json()["command"]
+    assert r.json()["command"][-2:] == ["--shade", "light"]
     bad = svc.client.post("/api/ops/segment/validate", json={**image, "shade": "blue"})
     assert fields(bad.json()) == ["shade"]
     v = svc.client.post("/api/ops/slow/validate", json={"seconds": 0.2}).json()
-    assert v["command"] == ["slow.sh", "--seconds=0.2"] and v["inference"] is False
+    assert v["command"] == ["slow.sh", "--seconds", "0.2"] and v["inference"] is False
     r = svc.client.post("/api/ops/slow", json={"seconds": 0.2})
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/json" and r.json()["slept"] == 0.2
@@ -509,8 +511,12 @@ def test_a_locate_that_needs_no_inference_skips_the_inference_queue(ws: Workspac
     loc = spec.MAPPER.command("locate")
     args = spec.parse(loc, loc.modes[0], {"inputs": ["a.jpg"], "map": str(ws.maps / "m")})
     assert spec.needs_inference(loc.modes[0], args) is False  # 0 keyframes: matched exhaustively
-    big = dataclasses.replace(loc.modes[0], inference_condition={"map_keyframes_greater_than": -1})
+    big = dataclasses.replace(loc.modes[0], inference_condition={
+        "images_in_map_keyframes_greater_than": -1})
     assert spec.needs_inference(big, args) is True
+    # without images (the last known camera) nothing is matched: never, whatever the map's size
+    no_images = spec.parse(loc, loc.modes[0], {"map": str(ws.maps / "m"), "format": "png"})
+    assert spec.needs_inference(big, no_images) is False
     odd = dataclasses.replace(loc.modes[0], inference_condition={"unknown_condition": 1})
     assert spec.needs_inference(odd, args) is True  # what cannot be evaluated needs it
     never = slow_command.registry_program().commands[0].modes[0]  # type: ignore[attr-defined]
@@ -845,7 +851,18 @@ def test_every_json_answer_follows_its_schema_in_the_document(
     service.runner.shutdown()
     service.viewers.stop_all()
     error = Draft202012Validator({**doc, "$ref": "#/components/schemas/Error"})
+    warned = web_app.command_warnings(["/x/a.jpg: not located", "ignored"],
+                                      [("inputs", 0, "/x/a.jpg", "uploads/u/a.jpg")])
     for outcome in (Outcome(5, "no overlap"), Outcome(130, None, STOPPING)):
         error.validate(web_app.failure(outcome)[1])
+        error.validate(web_app.failure(outcome, warned)[1])
+    # the warnings header of a run's answer, success or failure: JSON of its declared schema
+    run = doc["paths"]["/api/ops/segment"]["post"]["responses"]
+    command_error = doc["components"]["responses"]["CommandError"]
+    assert run["4XX"] == run["500"] == {"$ref": "#/components/responses/CommandError"}
+    for declared in (run["200"]["headers"], command_error["headers"]):
+        header = declared[web_app.WARNINGS_HEADER]["content"]["application/json"]["schema"]
+        Draft202012Validator({**doc, **header}).validate(
+            json.loads(web_app.warnings_header(warned)[web_app.WARNINGS_HEADER]))
     for schema in doc["components"]["schemas"].values():
         Draft202012Validator.check_schema(schema)

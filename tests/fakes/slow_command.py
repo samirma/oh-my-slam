@@ -4,7 +4,9 @@ stage for ``S`` seconds (the real ``core.timing`` record, written to ``OH_MY_SLA
 its summary line), prints a line on stderr and its result on stdout — one JSON line with its pid
 and the ``time.monotonic()`` (system-wide) of its start and end, so a test can order runs — and
 exits with ``N`` (2: a usage error with a message) — or 130 when interrupted, as every command does
-through ``run_main``; ``--ignore-sigint`` makes it deaf to Ctrl-C from its start, and
+through ``run_main``; ``--warn`` gives two warnings first (one naming its ``-i`` image, as
+``mapper.sh locate`` names an image it could not place); ``--ignore-sigint`` makes it deaf to
+Ctrl-C from its start, and
 ``--interrupt-at-start`` sends it a Ctrl-C while it starts, before ``run_main`` (the moment a
 request interrupted as soon as its command started reaches it).
 
@@ -26,6 +28,7 @@ import time
 
 from oh_my_slam.core import timing
 from oh_my_slam.core.errors import UsageError
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.process import run_main
 from oh_my_slam.core.timing import Stage
 
@@ -42,7 +45,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("-m", dest="map")
     ap.add_argument("-i", dest="image")
     ap.add_argument("--mood")
+    ap.add_argument("--warn", action="store_true")
     args = ap.parse_args(argv)
+    if args.warn:
+        get_logger().warning("%s: not located — too few matches", args.image)
+        get_logger().warning("an option was ignored")
     if args.ignore_sigint:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     start = time.monotonic()
@@ -77,6 +84,7 @@ def registry_program(prog: str = "slow.sh", inference: str = "never") -> object:
                     must_exist=False),
         spec.Option("-i", "image", spec.Kind.IMAGE, "an image it reads (it does not)",
                     must_exist=True),
+        spec.Option("--warn", "warn", spec.Kind.FLAG, "warn about its image", default=False),
     ), (mode,))
     return spec.Program(prog, "sleep", (cmd,))
 

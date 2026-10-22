@@ -176,21 +176,23 @@ def test_the_description_states_every_capability_and_when_to_use_it(
     for op in ops().values():
         clause = by_id[op.id]
         for o in skill.inputs(op):
-            assert skill.takes(o) in clause, (op.id, o.name)
+            assert skill.takes(op, o) in clause, (op.id, o.name)
         for out in skill.results(op):
             assert skill.FORMATS[out.format] in clause.split(" → ")[-1], (op.id, out.format)
     (writer,) = [op.id for op in ops().values() if op.writes_map() is not None]
     assert f"{writer} writes a map; the others are read-only" in text
     assert {o.format for op in ops().values() for o in skill.results(op)} == {"json", "png", "ply"}
     assert "JSON = OpenLABEL scene" in text and "PLY = point cloud" in text
-    assert "PNG = depth image or segmented image" in text  # the names of the PNG results
+    # the names of the PNG results, their shared noun said once
+    assert "PNG = depth, bird's-eye or segmented image" in text
+    assert "mapper-locate: optional images + an existing map → JSON/PLY/PNG" in text
 
     def ids(inference: str) -> list[str]:
         return [op.id for op in ops().values() if op.mode.inference == inference]
 
     assert ("Inference server needed by " + skill.listing(ids("required")) + ", and by "
-            f"mapper-locate for maps over {constants.UPDATE_EXHAUSTIVE_MAX} keyframes; the other "
-            "routes work without it.") in text
+            f"mapper-locate for images in maps over {constants.UPDATE_EXHAUSTIVE_MAX} keyframes; "
+            "the other routes work without it.") in text
     assert set(SCRIPT.findall(text)) == {entry_points.WEB_SERVICE.prog}
     assert "job" not in text.lower() and "view" not in text.lower()
     monkeypatch.setattr(skill, "DESCRIPTION_MAX", 100)  # one that would not fit is refused
@@ -408,14 +410,15 @@ def test_every_limit_the_skill_states_is_the_codes() -> None:
     assert set(skill.CONDITION_WORDS) == set(spec.CONDITIONS)  # every condition has its words
     for op in ops().values():
         for k, v in (op.mode.inference_condition or {}).items():
-            assert k != "map_keyframes_greater_than" or v == constants.UPDATE_EXHAUSTIVE_MAX
+            assert k != "images_in_map_keyframes_greater_than" \
+                or v == constants.UPDATE_EXHAUSTIVE_MAX
             assert f"over {v} keyframes" in table(text)[op.id][4]
     rules = flat(part(text, "Rules"))
     down = ExitCode.SERVER_UNAVAILABLE
     assert f"fail with HTTP {HTTP_STATUS[down]} `{error_code(down)}`" in rules
     assert f"the command that starts it, `{web_app.START_COMMAND}`" in rules
     assert ("offer what works without it: the workspace's maps (`GET /api/maps`, "
-            "`GET /api/maps/{name}`); `mapper-locate` except for maps over "
+            "`GET /api/maps/{name}`); `mapper-locate` except for images in maps over "
             f"{constants.UPDATE_EXHAUSTIVE_MAX} keyframes; `map-remove` (`DELETE /api/maps/{{name}}`) "
             "only when the user asked for that map's removal; `map-viewer-start` (`POST "
             "/api/maps/{name}/viewer`); `map-viewer-stop` (`DELETE /api/maps/{name}/viewer`).") \
@@ -473,7 +476,7 @@ def test_a_changed_limit_changes_the_skill(monkeypatch: pytest.MonkeyPatch) -> N
     mapper = replaced(replaced(
         spec.MAPPER, "update", modes=(dataclasses.replace(updating, stages=updating.stages[:-1]),)),
         "locate", modes=(dataclasses.replace(locating, inference_condition={
-            "map_keyframes_greater_than": 300}),))
+            "images_in_map_keyframes_greater_than": 300}),))
     with_programs(monkeypatch, mapper)
     text = skill.render()
     assert text != before
@@ -535,8 +538,10 @@ def test_the_samples_follow_the_code(tmp_path: Path) -> None:
     assert f"`val` is `{','.join(skill.CUBOID)}`" in text
     # a PNG result is named by the outputs in that format, with the parameter value that gives each
     seg = next(op.id for op in ops().values() if op.program is spec.SEGMENT)
-    assert ("PNG is the depth image (`reconstruct` with `\"format\":\"depth\"`) or the segmented "
-            f"image (`{seg}` with `\"format\":\"png\"`)") in text
+    locate = next(op.id for op in ops().values() if op.command.name == "locate")
+    assert ("PNG is the depth image (`reconstruct` with `\"format\":\"depth\"`) or the bird's-eye "
+            f"image (`{locate}` with `\"format\":\"png\"`) or the segmented image (`{seg}` with "
+            "`\"format\":\"png\"`)") in text
 
 
 def test_the_generator_renders_every_kind_of_input_and_result() -> None:
@@ -559,8 +564,12 @@ def test_the_generator_renders_every_kind_of_input_and_result() -> None:
     assert skill.when_text((spec.When("inputs", video=True),)) == "for one video in `inputs`"
     assert skill.when_text((spec.When("map"), spec.When("mode", ("full", "single")))) == \
         'with `map` or with `"mode":"full"` or with `"mode":"single"`'
-    locate = spec.MAPPER.command("locate")
-    assert skill.takes(locate.option("map")) == skill.EXISTING_MAP
+    locate = ops()["mapper-locate"]
+    assert skill.takes(locate, locate.command.option("map")) == skill.EXISTING_MAP
+    assert skill.takes(locate, locate.command.option("inputs")) == "optional images"
+    assert skill.alternatives(["depth image", "segmented image"]) == "depth or segmented image"
+    assert skill.alternatives(["an image", "a cloud"]) == "an image or a cloud"
+    assert skill.alternatives(["image"]) == "image"
     assert skill.sample_file(spec.Option("-x", "x", spec.Kind.MAP, "a map")) == "photo.jpg"
     assert skill.title(png) == "an image" and skill.title(spec.Output(
         "result", "stdout", "png", "the depth image: 16 bits")) == "the depth image"
@@ -609,15 +618,18 @@ def test_a_registry_change_reaches_the_skill(monkeypatch: pytest.MonkeyPatch) ->
                          default=1.5, minimum=0, type=float)
     mapper = replaced(spec.MAPPER, "locate", options=(*locate.options, ref, radius))
     with_programs(monkeypatch, mapper, slow_command.registry_program())  # type: ignore[arg-type]
+    # a whole new command needs room in the description (its limit is tested on its own)
+    monkeypatch.setattr(skill, "DESCRIPTION_MAX", 2 * skill.DESCRIPTION_MAX)
     text = skill.render()
     assert text != committed()
     rows = table(text)
     assert "`ref` (one image)" in rows["mapper-locate"][2]
-    assert rows["slow"] == ["`slow`", "`POST /api/ops/slow`", "JSON", "**writes the map** `map`",
-                            "not needed"]
+    assert rows["slow"] == ["`slow`", "`POST /api/ops/slow`", "`image` (optional one image) → JSON",
+                            "**writes the map** `map`", "not needed"]
     assert '"$BASE/api/ops/slow"' in part(text, "Examples")
     front = description(text)
-    assert "; slow: JSON." in front and "mapper-update and slow write a map" in front
+    assert "; slow: optional one image → JSON." in front  # its optional file, not its map
+    assert "mapper-update and slow write a map" in front
     assert "; slow and the other routes work without it." in front
     props = document()["paths"]["/api/ops/mapper-locate"]["post"]["requestBody"]["content"][
         "application/json"]["schema"]["properties"]

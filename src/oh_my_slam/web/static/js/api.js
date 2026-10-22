@@ -1,6 +1,6 @@
 // The public API of server.sh (http_server.md "API"), the only thing the web application talks to.
 // Errors come back as ApiError with the command's message and the code of its exit status, as the
-// service sends them ({error: {code, message, http_status, problems?, by_parameter?}}).
+// service sends them ({error: {code, message, http_status, problems?, by_parameter?, warnings?}}).
 
 export const enc = encodeURIComponent;
 
@@ -12,7 +12,18 @@ export class ApiError extends Error {
     this.code = e.code || null;
     this.problems = e.problems || [];
     this.byParameter = e.by_parameter || {};
+    this.warnings = Array.isArray(e.warnings) ? e.warnings : [];
   }
+}
+
+// The command's warnings an answer carries (its X-Oms-Warnings header: JSON, [{message, inputs}]);
+// none when it has none, or none that reads.
+export function parseWarnings(value) {
+  if (!value) return [];
+  try {
+    const w = JSON.parse(value);
+    return Array.isArray(w) ? w.filter((x) => x && typeof x.message === 'string') : [];
+  } catch { return []; }
 }
 
 async function bodyOf(res) {
@@ -76,7 +87,8 @@ export function parseServerTiming(value) {
 }
 
 // Run an operation within this request (POST /api/ops/<op>): resolves when the command ends, to
-// {blob, mediaType, stages} on success; throws ApiError with the command's error otherwise.
+// {blob, mediaType, stages, warnings} on success; throws ApiError with the command's error (and
+// its warnings) otherwise.
 // Aborting `signal` closes the connection, which interrupts the command (http_server.md
 // "Requests").
 export async function runOperation(opId, values, signal) {
@@ -95,6 +107,7 @@ export async function runOperation(opId, values, signal) {
     blob,
     mediaType: (res.headers.get('Content-Type') || 'application/octet-stream').split(';')[0].trim(),
     stages: parseServerTiming(res.headers.get('Server-Timing')),
+    warnings: parseWarnings(res.headers.get('X-Oms-Warnings')),
   };
 }
 

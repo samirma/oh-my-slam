@@ -22,10 +22,11 @@ service builds it), applicability (``When.holds``), result format (``spec.result
 map it writes (``spec.writes_map``) — nothing here names a command or an option. The reference
 inputs (``Inputs``, in the suite's order: restaurant.jpg, each example sequence with its
 one-update map, street2.mp4) each give a value to every kind of path parameter they can. Each
-operation runs on every reference input that has a value for each of its required parameters:
-its default case there, and on the first such input one case per non-default value of each choice
-and per point-cloud attribute (a non-default choice of its first enumerated attribute), with the
-options a case needs to apply set as the definitions say. Each case runs the command from the
+operation runs on every reference input that has a value for each of its required parameters,
+with the optional path inputs that input has a value for too: its default case there, and on the
+first such input one case without each of those optional inputs, and one per non-default value of
+each choice and per point-cloud attribute (a non-default choice of its first enumerated
+attribute), with the options a case needs to apply set as the definitions say. Each case runs the command from the
 shell twice (the first run records the inference, the second replays it) and then as a request,
 and compares the response body with the command's stdout byte for byte. A difference is a
 mismatch, unless the command's own two runs differ too (``unverifiable``: the command is not
@@ -279,10 +280,13 @@ def _applied(op: Op, base: dict[str, Any], given: dict[str, Any]) -> str | None:
     return None
 
 
-def _variants(op: Op, base: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
-    """The default case and one per non-default value of each choice and per point-cloud
-    attribute, made applicable on ``base``; and the variants that cannot be, with the reason."""
+def _variants(op: Op, base: dict[str, Any], optional: Sequence[str] = ()
+              ) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    """The default case, one without each of the ``optional`` path parameters ``base`` gives,
+    and one per non-default value of each choice and per point-cloud attribute, made applicable
+    on ``base``; and the variants that cannot be, with the reason."""
     out: list[tuple[str, dict[str, Any]]] = [("default", {})]
+    out += [(f"without {n}", {n: None}) for n in optional]
     for p in op.params().values():
         if p["kind"] == "enum":
             out += [(f"{p['name']}={c}", {p["name"]: c}) for c in p.get("choices") or []
@@ -306,9 +310,11 @@ def parity_cases(ops: Sequence[Op], inputs: Sequence[Inputs]
                  ) -> tuple[list[Case], dict[str, str]]:
     """The cases of every operation of ``ops`` on the reference inputs (in order), and the
     operations no reference input can run, with the reason. An operation runs on every input that
-    has a value for each of its required parameters: its default case there, and on the first
-    such input also one case per variant (``_variants``); an input the suite already ran gets only
-    the case that run is (``Inputs.ran``). A case that maps creates a map of its own."""
+    has a value for each of its required parameters, with the optional path inputs it has a value
+    for too: its default case there, and on the first such input also one case per variant
+    (``_variants``, one without each of those optional inputs among them); an input the suite
+    already ran gets only the case that run is (``Inputs.ran``). A case that maps creates a map of
+    its own."""
     cases: list[Case] = []
     uncovered: dict[str, str] = {}
     fresh = 0
@@ -317,6 +323,8 @@ def parity_cases(ops: Sequence[Op], inputs: Sequence[Inputs]
         out = spec.writes_map(op.command, op.mode)
         map_out = out.name if out is not None and out.name in params else None
         required = [n for n, p in params.items() if p.get("required") and n != map_out]
+        optional = [n for n, p in params.items() if not p.get("required") and n != map_out
+                    and p.get("must_exist") is True]  # path inputs (-i of mapper.sh locate)
         lacking: list[list[str]] = []
         first = True
         for inp in inputs:
@@ -324,11 +332,12 @@ def parity_cases(ops: Sequence[Op], inputs: Sequence[Inputs]
             if missing:
                 lacking.append(missing)
                 continue
-            base = {n: inp.of(params[n]["kind"]) for n in required}
+            present = [n for n in optional if inp.of(params[n]["kind"]) is not None]
+            base = {n: inp.of(params[n]["kind"]) for n in (*required, *present)}
             todo: list[tuple[str, dict[str, Any]]] = [("default", {})]
             if inp.ran is None and first:
                 parsed = {**base, **({map_out: "parity"} if map_out is not None else {})}
-                todo, first = _variants(op, parsed)[0], False
+                todo, first = _variants(op, parsed, present)[0], False
             for name, given in todo:
                 case_params = dict(base)
                 if map_out is not None and inp.ran is not None and inp.writes:
@@ -337,6 +346,7 @@ def parity_cases(ops: Sequence[Op], inputs: Sequence[Inputs]
                     fresh += 1
                     case_params[map_out] = f"parity-{fresh}"
                 case_params.update(given)
+                case_params = {k: v for k, v in case_params.items() if v is not None}  # without
                 fmt = spec.result_format(op.command, op.mode, case_params) or "json"
                 cases.append(Case(op.id, op.label, name, case_params, map_out, fmt, inp.name,
                                   inp.ran))

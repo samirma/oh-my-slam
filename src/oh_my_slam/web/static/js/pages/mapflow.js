@@ -3,15 +3,18 @@
 // Step 1 holds its input parameters, their order visible and editable where it matters (`ordered`);
 // step 2 the map (#/maps/new: a name; #/maps/<name>/update: that map); step 3 every other option;
 // step 4 states what starting it does before it runs, and asks for confirmation (a long
-// operation). The request then runs in this page, and its result is shown here.
+// operation). The request then runs in this page, and its result is shown here. The values of
+// the options (not the inputs) are kept in the URL (#/maps/new?<parameter>=<value>…). A map to
+// update that is not there says so, as its page does, and offers to create a new one.
 import { el, notice, humanize } from '../dom.js';
-import { enc } from '../api.js';
+import { enc, getJson } from '../api.js';
 import { store, PATH_IN } from '../store.js';
-import { OpForm } from '../form.js';
+import { OpForm, resultName, shellLine } from '../form.js';
 import { runPanel } from '../runpanel.js';
 import { confirmAction } from '../dialog.js';
+import { setQuery, formQuery, queryInitial } from '../url.js';
 
-export function mapFlowPage(main, { name }) {
+export function mapFlowPage(main, { name, query = new URLSearchParams() }) {
   const op = [...store.ops.values()].find((o) => o.writesMap);
   main.append(el('h1', {}, name ? `Update map ${name}` : 'New map'));
   if (!op) { main.append(notice('info', 'No operation of this service writes a map.')); return null; }
@@ -32,7 +35,8 @@ export function mapFlowPage(main, { name }) {
 
   // one form, its fields placed in the steps
   const host = el('div', {});
-  const form = new OpForm(host, op, name ? { fixed: { [mapP.name]: name } } : {});
+  const initial = queryInitial(query, op.params.filter((p) => !inputs.includes(p.name)).map((p) => p.name));
+  const form = new OpForm(host, op, { fixed: name ? { [mapP.name]: name } : {}, initial });
   for (const f of form.fields) (inputs.includes(f.p.name) ? s1 : f.p === mapP ? s2 : s3).append(f.el);
   if (name) s2.append(el('p', {}, 'The new inputs extend map ', el('a', { href: `#/maps/${enc(name)}` }, name), '.'));
   if (!s3.children.length) s3.append(el('p', { class: 'muted' }, 'No other option.'));
@@ -41,13 +45,13 @@ export function mapFlowPage(main, { name }) {
   const label = name ? `Update ${name}…` : 'Create the map…';
   const panel = runPanel({
     op, form, label,
-    downloadName: (fmt) => `${op.id}-${form.values()[mapP.name] || 'map'}${fmt ? `.${fmt}` : ''}`,
+    downloadName: (fmt) => resultName([op.id, form.values()[mapP.name] || 'map', ...form.variant()], fmt),
     confirm: (v) => {
       const target = form.values()[mapP.name];
       return confirmAction({
         title: name ? `Update map ${target}?` : `Create map ${target}?`,
-        body: [`This runs ${v.command.join(' ')}.`,
-          `${op.label} ${op.x.inference_text}; it can take many minutes, and requests that use the inference server run one at a time, so it may first wait for its turn.`,
+        body: [`This runs ${shellLine(v.command)} in the workspace.`,
+          `${op.label} needs the inference server ${op.x.inference_text}; it can take many minutes, and requests that use the inference server run one at a time, so it may first wait for its turn.`,
           'It runs within this page: keep the page open until it ends. Interrupting it, or leaving or reloading the page, stops it and leaves the map exactly as it was. The map changes only when it succeeds.'],
         yes: name ? 'Start the update' : 'Start mapping', no: 'Not now',
       });
@@ -63,6 +67,25 @@ export function mapFlowPage(main, { name }) {
     },
   });
   s4.append(panel.el);
+  let kept = [...query.keys()];  // the query keys to replace: the form's, or unknown
+  const keep = () => {
+    const values = form.queryValues();
+    setQuery(formQuery(null, values, kept.filter((k) => !(k in values))));
+    kept = Object.keys(values);
+  };
+  const offQuery = form.onValidate(keep);
   form.changed();
-  return () => { panel.dispose(); form.destroy(); };
+  if (name) {  // the map it extends: one that is not there would be created instead
+    getJson(`/api/maps/${enc(name)}`).catch((err) => {
+      if (err.status !== 404) return;
+      offQuery();
+      panel.dispose();
+      form.destroy();
+      setQuery(Object.fromEntries([...kept, ...query.keys()].map((k) => [k, null])));
+      for (const s of main.querySelectorAll('section.step, .lead, .flow-done')) s.remove();
+      main.append(notice('error', err.message, el('p', {}, el('a', { href: '#/maps' }, 'See the maps of this workspace'),
+        ' or ', el('a', { href: '#/maps/new', 'data-action': 'new-map' }, 'create a new map'), '.')));
+    });
+  }
+  return () => { offQuery(); panel.dispose(); form.destroy(); };
 }

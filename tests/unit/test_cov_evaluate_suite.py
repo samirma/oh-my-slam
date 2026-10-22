@@ -396,12 +396,13 @@ def test_the_reference_map_runs_failing_leave_nothing_to_compare(tmp_path: Path)
     ref = tmp_path / "ref"
     ref.mkdir()
     ev.locate_reference(st.AINEX, scene(CAPTURES, OBJECTS), ref)
-    assert [(r.tag, r.ok) for r in ev.runner.records] == [
-        ("locate_single", False), ("locate_full", False), ("locate_ply", False)]
+    tags = ["locate_single", "locate_full", "locate_png_full", "locate_ply", "locate_last_known",
+            "locate_last_known_png", "locate_last_known_full", "locate_last_known_png_obb"]
+    assert [(r.tag, r.ok) for r in ev.runner.records] == [(t, False) for t in tags]
     assert ("openlabel", "mapper") not in ev.contracts.checks
     assert ("same_objects", "map") not in ev.contracts.checks
-    assert ev.contracts.checks[("stdout", "mapper")] == {
-        "locate_single": [], "locate_full": [], "locate_ply": []}  # failed, but silent
+    assert ("birdseye", "mapper") not in ev.contracts.checks
+    assert ev.contracts.checks[("stdout", "mapper")] == {t: [] for t in tags}  # failed, silent
 
 
 def test_held_out_metrics_without_the_split_map_compare_nothing_later(tmp_path: Path) -> None:

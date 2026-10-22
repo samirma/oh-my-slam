@@ -102,6 +102,37 @@ def test_the_package_logger_writes_to_stderr_without_propagating() -> None:
     assert log.get_logger("plain") is root.getChild("plain")
 
 
+def test_a_commands_warnings_go_to_the_file_the_environment_names_too(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OH_MY_SLAM_WARNINGS``: each warning (not an info line) is also one JSON line of that file,
+    which the web service reads back (``read_warnings``); without it, there is no such file."""
+    root = logging.getLogger("oh_my_slam")
+    saved = root.handlers[:]
+    target = tmp_path / "warnings.jsonl"
+    try:
+        root.handlers.clear()
+        monkeypatch.setenv(log.WARNINGS_ENV, str(target))
+        mine = log.get_logger("oh_my_slam.locate")
+        mine.info("located 1 of 2 images")
+        mine.warning("%s: not located — %s", "/in/a.jpg", "café")
+        mine.error("and an error")
+        assert [type(h) for h in root.handlers] == [logging.StreamHandler, log.WarningsFile]
+        assert log.read_warnings(target) == ["/in/a.jpg: not located — café", "and an error"]
+        root.handlers.clear()
+        monkeypatch.delenv(log.WARNINGS_ENV)
+        log.get_logger()
+        assert [type(h) for h in root.handlers] == [logging.StreamHandler]
+    finally:
+        root.handlers[:] = saved
+    # a line that is no such record is read as it is; blank lines are none; no file, no warnings
+    target.write_text('{"message": "one"}\n\nplain text\n{"other": 1}\n', encoding="utf-8")
+    assert log.read_warnings(target) == ["one", "plain text", '{"other": 1}']
+    assert log.read_warnings(tmp_path / "none.jsonl") == []
+    # a file that cannot be written is the logging module's own error, never the command's
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    log.WarningsFile(str(tmp_path)).emit(logging.makeLogRecord({"msg": "lost", "levelno": 30}))
+
+
 # --- exit codes ----------------------------------------------------------------------------------
 
 

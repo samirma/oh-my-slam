@@ -144,8 +144,9 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     assert "op=segment" in pg.url
     pg.wait_for_selector(".field[data-param=image] li.ready")
     assert pg.locator(".field[data-param=attrs]").count() == 0  # segment.sh has no -p
+    # each format says what it gives (its output's title)
     assert pg.locator(".field[data-param=format] select option").all_inner_texts() == [
-        "json (default)", "png"]
+        "json — the scene description (default)", "png — the segmented image"]
     # an invalid value is flagged next to its field, in the command's words, before submission
     score = pg.locator(".field[data-param=min_score] input")
     assert "default 0.5" in pg.inner_text(".field[data-param=min_score] .help")  # its default and help
@@ -156,7 +157,7 @@ def test_single_image_request(tab: Tab, app: tuple[Any, str], image: Path) -> No
     assert score.get_attribute("aria-invalid") == "true"
     score.fill("")
     pg.wait_for_function("() => !document.querySelector('.field[data-param=min_score] .field-error').textContent")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.startsWith('segment.sh -i=uploads/')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.startsWith('segment.sh -i uploads/')")
     with operation_response(pg, "segment") as answer:
         pg.click("button[data-action=run]")
         pg.wait_for_selector("[data-testid=request]", timeout=5000)
@@ -233,7 +234,7 @@ def ply_body(pg: Any, op: str) -> bytes:
     """Run the page's operation ``op`` with ``-f ply``; the response body once the 3D view is
     drawn."""
     pg.select_option(".field[data-param=format] select", "ply")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f=ply')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f ply')")
     with operation_response(pg, op) as answer:
         pg.click("button[data-action=run]")
     pg.wait_for_selector("[data-testid=request][data-state=done]", timeout=180_000)
@@ -384,7 +385,7 @@ def test_a_point_cloud_that_does_not_parse(tab: Tab, image: Path) -> None:
     pg.set_input_files(".field[data-param=image] input[type=file]", str(image))
     pg.wait_for_selector(".field[data-param=image] li.ready")
     pg.select_option(".field[data-param=format] select", "ply")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f=ply')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f ply')")
     cut: dict[str, Any] = {}
 
     def truncate(route: Any) -> None:
@@ -422,7 +423,7 @@ def test_a_point_cloud_result_in_both_themes_down_to_tablet_width(browser: Any, 
         pg.wait_for_selector(".field[data-param=image] li.ready")
         pg.select_option(".field[data-param=format] select", "ply")
         pg.select_option(".field[data-param=attrs] .attr[data-attr=color] select", "segment")
-        pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p=color=segment')")
+        pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p color=segment')")
         body = ply_body(pg, "reconstruct")
         check_drawn(pg, body)
         assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
@@ -450,7 +451,7 @@ def test_an_image_result_is_offered_byte_for_byte(tab: Tab, image: Path) -> None
         pg.check(f"#op-{op}")
         pg.wait_for_selector(".field[data-param=image] li.ready")
         pg.select_option(".field[data-param=format] select", fmt)
-        pg.wait_for_function(f"() => document.querySelector('[data-testid=command]').textContent.includes('-f={fmt}')")
+        pg.wait_for_function(f"() => document.querySelector('[data-testid=command]').textContent.includes('-f {fmt}')")
         with operation_response(pg, op) as answer:
             pg.click("button[data-action=run]")
         tab.wait_request()
@@ -532,10 +533,17 @@ def mapped(browser: Any, app: tuple[Any, str], tmp_path_factory: pytest.TempPath
 
 def test_map_cards_filter_and_page(mapped: dict[str, Any], tab: Tab, app: tuple[Any, str]) -> None:
     service, _ = app
-    pg = tab.go("#/maps")
+    pg = tab.go("#/maps?filter=&junk=1")
     card = pg.locator("li.map-card[data-map=room]")
     card.wait_for()
     assert "Frames" in card.inner_text() and "Updates" in card.inner_text()
+    assert "junk" not in pg.url  # a key the page does not keep is dropped
+    # in plain words what a map's page gives, and a link straight to its bird's-eye image
+    lead = pg.inner_text("[data-testid=maps-lead]")
+    assert "the bird's-eye image of the map" in lead and ".sh" not in lead
+    link = card.locator("[data-action=image-link]")
+    assert link.inner_text() == "Bird's-eye image of the map"
+    assert link.get_attribute("href") == "#/maps/room?op=mapper-locate&format=png&run=1"
     pg.fill("#map-filter", "nothing-like-this")
     assert pg.locator("li.map-card").count() == 0
     pg.fill("#map-filter", "roo")
@@ -551,21 +559,50 @@ def test_map_cards_filter_and_page(mapped: dict[str, Any], tab: Tab, app: tuple[
     pg.click("[data-testid=history] tr.update-detail >> nth=1 >> summary")
     stages = pg.locator("[data-testid=history] tr.update-detail >> nth=1 >> [data-testid=stages] tbody th code")
     assert stages.all_inner_texts() == list(meta["updates"][-1]["timings"]["stages_s"])
-    # the operations that take a map without writing it, nothing else
-    ops = pg.locator("[data-testid=operations] input[type=radio]").evaluate_all("els => els.map(e => e.value)")
-    assert sorted(ops) == sorted(o.id for o in web_ops.operations().values()
-                                 if o.options and any(p.kind is spec.Kind.MAP for p in o.options)
-                                 and not o.writes_map())
+    # the operations that take a map without writing it, nothing else: one, said without a choice
+    (op,) = [o for o in web_ops.operations().values()
+             if o.options and any(p.kind is spec.Kind.MAP for p in o.options) and not o.writes_map()]
+    assert pg.get_attribute("[data-testid=operations]", "data-op") == op.id
+    assert pg.locator("[data-testid=operations] input[type=radio]").count() == 0
+    # above the viewer, saying what it gives: every format of its result
+    sections = pg.locator("main > section h2").all_inner_texts()
+    assert sections.index("Run on this map") < sections.index("Viewer") < sections.index("Update history")
+    produces = pg.inner_text("[data-testid=produces]")
+    assert "the bird's-eye image of the map (PNG)" in produces and "by its format" in produces
+    # the history counts the detections each update tracked, confirmed or not — under a name
+    # of its own, never the summary's Objects (those the map lists) or candidates
+    head = pg.locator("[data-testid=history] thead th").all_inner_texts()
+    assert "Tracked" in head and "Objects" not in head and "Candidates" not in head
+    title = pg.get_attribute("[data-testid=history] thead th:has-text('Tracked')", "title")
+    assert "confirmed or not" in title and "summary's Objects" in title
+    last = meta["updates"][-1]["objects"]
+    row = pg.locator("[data-testid=history] tbody tr[data-update]").last.locator("td").all_inner_texts()
+    assert row[-2].split("\n") == [f"{last['confirmed']} confirmed", f"+ {last['unconfirmed']} unconfirmed"]
     tab.a11y()
+    # a card's link: the map's page runs its bird's-eye image at once and shows it, the focus on
+    # it, and the URL no longer asks to run (a reload or a bookmark does not run it unasked)
+    pg = tab.go("#/maps")
+    pg.click("li.map-card[data-map=room] [data-action=image-link]")
+    wait_route(pg, "maps/room")
+    pg.wait_for_selector("[data-testid=result][data-format=png] [data-testid=result-image] img", timeout=180_000)
+    pg.wait_for_function("() => document.activeElement.id === 'result-h'")
+    assert pg.input_value(".field[data-param=format] select") == "png"
+    assert "run=" not in pg.url and "format=png" in pg.url
+    pg.reload()
+    pg.wait_for_selector("body[data-ready=true]")
+    pg.wait_for_timeout(800)
+    assert pg.locator("[data-testid=request]").count() == 0  # not run again
     assert tab.errors == []
 
 
-def test_locating_images_in_a_map(mapped: dict[str, Any], tab: Tab) -> None:
+def test_locating_images_in_a_map(mapped: dict[str, Any], tab: Tab, image: Path) -> None:
     pg = tab.go("#/maps/room?op=mapper-locate")
-    assert pg.is_checked("#op-mapper-locate")
-    pg.set_input_files(".field[data-param=inputs] input[type=file]", str(FRAMES[1]))
-    pg.wait_for_selector(".field[data-param=inputs] li.ready")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-m=maps/room')")
+    assert pg.get_attribute("[data-testid=operations]", "data-op") == "mapper-locate"
+    # an image the map cannot place: left out of the result, said in a warning naming the file
+    # chosen (and its number among the inputs), not its upload's path
+    pg.set_input_files(".field[data-param=inputs] input[type=file]", [str(image), str(FRAMES[1])])
+    wait_ready(pg, "inputs", 2)
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-m maps/room')")
     with operation_response(pg, "mapper-locate") as answer:
         pg.click("button[data-action=run]")
     tab.wait_request()
@@ -573,12 +610,29 @@ def test_locating_images_in_a_map(mapped: dict[str, Any], tab: Tab) -> None:
     doc = json.loads(body)
     assert doc["openlabel"]
     assert listed_objects(pg) == scene_objects(doc)
+    # the result is in view, its heading focused
+    assert pg.evaluate("() => document.activeElement.id") == "result-h"
+    warned = json.loads(answer.headers["x-oms-warnings"])
+    assert [w["inputs"][0]["index"] for w in warned] == [0]
+    warning = pg.inner_text("[data-testid=warnings]")
+    assert f"{image.name} (input 1): not located" in warning and "uploads/" not in warning
+    # -t single: the located camera alone, said to be located, named by the file chosen
+    cams = pg.locator("[data-testid=cameras] tbody tr").evaluate_all(
+        "trs => trs.map(t => [t.dataset.camera, t.dataset.kind, t.firstElementChild.textContent,"
+        " t.lastElementChild.textContent])")
+    # one numbering: the input's, from 1, with the camera's key (as the warning and the
+    # bird's-eye image's tags number them)
+    assert cams == [["located_1", "located", "input 2 (located_1)", FRAMES[1].name]]
+    title = pg.get_attribute("[data-testid=cameras] tbody td.cam-image span", "title")
+    assert title.endswith(f"/{FRAMES[1].name}") and "/uploads/" in title  # the path, as a tooltip
+    # no objects: the result's scope lists none, and the other scope does
+    assert "scope is single" in pg.inner_text("[data-testid=no-objects]")
     assert check_download(pg, body) == "mapper-locate-room.json"
     tab.a11y()
     # the page returns on its URL with the same operation chosen
     pg.reload()
     pg.wait_for_selector("body[data-ready=true]")
-    assert pg.is_checked("#op-mapper-locate")
+    assert pg.get_attribute("[data-testid=operations]", "data-op") == "mapper-locate"
     assert tab.errors == []
 
 
@@ -591,7 +645,7 @@ def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -
     pg.wait_for_selector(".field[data-param=inputs] li.ready")
     pg.select_option(".field[data-param=format] select", "ply")
     pg.select_option(".field[data-param=attrs] .attr[data-attr=color] select", "segment")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p=color=segment')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-p color=segment')")
     body = ply_body(pg, "mapper-locate")
     check_drawn(pg, body)
     assert "color=segment" in pg.inner_text(f"{CLOUD} [data-fact='Each point carries']")
@@ -601,8 +655,240 @@ def test_a_point_cloud_result_on_a_maps_page(mapped: dict[str, Any], tab: Tab) -
     assert turned(settle(pg), first) > 10
     pg.click("[data-move='Zoom out']")
     assert distance(settle(pg)) > distance(first) * 1.2
-    assert check_download(pg, body) == "mapper-locate-room.ply"
+    assert check_download(pg, body) == "mapper-locate-room-color-segment.ply"  # its variant
+    # the camera its header names is drawn at its pose, in its kind's colour and labelled, and
+    # said in the caption with the file chosen
+    assert pg.inner_text(f"{CLOUD} [data-fact=Camera]") == \
+        f"input 1 (located_0: {FRAMES[1].name}), drawn at its pose"
+    assert pg.evaluate(f"document.querySelector('{CLOUD}').cloudView.viewer.cameras.length") == 1
+    assert pg.evaluate(f"document.querySelector('{CLOUD}').cloudView.viewer.groups.cameras.children"
+                       ".map(c => c.name)") == ["frustums-located"]
+    pg.wait_for_selector(f"{CLOUD} .obj-label[data-group=cameras]:not([hidden])")
+    # labelled by the input it placed, as the tables and the bird's-eye image number it
+    assert pg.inner_text(f"{CLOUD} .obj-label[data-group=cameras] .tag") == "input 1"
+    assert "located_0" in pg.get_attribute(f"{CLOUD} .obj-label[data-group=cameras]", "title")
+    assert pg.get_attribute(f"{CLOUD} .labels", "aria-label") == "Camera labels"
     tab.a11y()
+    assert tab.errors == []
+
+
+def test_locating_without_images_shows_every_format(mapped: dict[str, Any], tab: Tab) -> None:
+    """With no image chosen, locate runs on the map alone: its last known camera. Each format of
+    the result is shown: the scene description with its objects and cameras listed, the point
+    cloud in 3D with the camera its header names, the bird's-eye image as received (its layers a
+    field of the PNG format only)."""
+    pg = tab.go("#/maps/room?op=mapper-locate")
+    assert pg.locator(".field[data-param=inputs] li").count() == 0  # nothing chosen
+    pg.select_option(".field[data-param=mode] select", "full")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-t full')")
+    command = pg.inner_text("[data-testid=command]")
+    assert "-m maps/room" in command and " -i " not in command
+    assert pg.locator(".field[data-param=layers]").is_hidden()  # -l: the PNG's only
+    with operation_response(pg, "mapper-locate") as answer:
+        pg.click("button[data-action=run]")
+    tab.wait_request()
+    doc = json.loads(answer.body)
+    assert listed_objects(pg) == scene_objects(doc)
+    rows = pg.locator("[data-testid=cameras] tbody tr")
+    kinds = rows.evaluate_all("trs => trs.map(t => [t.dataset.camera, t.dataset.kind, t.children[1].textContent])")
+    frames = doc["openlabel"]["frames"].values()
+    (last,) = [f["frame_properties"] for f in frames if f["frame_properties"].get("last_known")]
+    keyframes = sorted(f["frame_properties"]["keyframe"] for f in frames
+                       if not f["frame_properties"].get("last_known"))
+    assert kinds == [["last_known", "last_known", "Last known camera"],
+                     *(([k, "frame", "Map frame"]) for k in keyframes)]
+    x, y, z = last["transforms"]["last_known_to_map"]["transform_src_to_dst"]["translation"]
+    assert rows.first.locator("td.num").all_inner_texts() == [f"{v:.3f}" for v in (x, y, z)]
+    assert check_download(pg, answer.body) == "mapper-locate-room-full.json"
+    tab.a11y()
+    # the point cloud: the map cloud, the last known camera drawn at its pose
+    body = ply_body(pg, "mapper-locate")
+    assert b"\ncomment last_known {" in body
+    assert pg.inner_text(f"{CLOUD} [data-fact=Camera]") == \
+        "last_known (the last known camera), drawn at its pose"
+    assert pg.evaluate(f"document.querySelector('{CLOUD}').cloudView.viewer.cameras[0].name") == "last_known"
+    assert "and 1 camera" in pg.get_attribute(CANVAS, "aria-label")
+    tab.a11y()
+    # the bird's-eye image, of the OBB layer alone: its format says what it gives
+    png = pg.locator(".field[data-param=format] option[value=png]").inner_text()
+    assert png == "png — the bird's-eye image of the map"
+    assert "Scope" in pg.inner_text(".field[data-param=mode] label")
+    # a scope's choice in a few words, which the closed select shows whole
+    assert pg.locator(".field[data-param=mode] option[value=single]").inner_text() == \
+        "single — only these cameras (default)"
+    assert pg.eval_on_selector(".field[data-param=mode] select", "s => s.scrollWidth <= s.clientWidth")
+    pg.select_option(".field[data-param=format] select", "png")
+    pg.wait_for_selector(".field[data-param=layers]:not([hidden])")
+    pg.select_option(".field[data-param=layers] select", "obb")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-l obb')")
+    with operation_response(pg, "mapper-locate") as answer:
+        pg.click("button[data-action=run]")
+    pg.wait_for_selector("[data-testid=result][data-format=png]", timeout=180_000)  # this run's
+    assert answer.headers["content-type"] == "image/png"
+    assert answer.body.startswith(b"\x89PNG\r\n\x1a\n")
+    pg.wait_for_function("() => { const i = document.querySelector('[data-testid=result-image] img');"
+                         " return i && i.complete && i.naturalWidth > 0; }")
+    from PIL import Image
+
+    with Image.open(io.BytesIO(answer.body)) as img:
+        size, text = img.size, dict(img.text)  # type: ignore[attr-defined]
+    assert pg.evaluate("document.querySelector('[data-testid=result-image] img').naturalWidth") == size[0]
+    assert text["layers"] == "obb" and "f000000" in json.loads(text["cameras"])  # -t full
+    assert check_download(pg, answer.body) == "mapper-locate-room-full-obb.png"
+    # what its own metadata says: description (its text alternative too), scale, layers, legend,
+    # the cameras drawn, and a link to it at full size
+    alt = pg.get_attribute("[data-testid=result-image] img", "alt")
+    assert alt.startswith(f"The bird's-eye image of the map, as received, {size[0]} × {size[1]} px. ")
+    assert text["Description"] in alt
+    assert pg.inner_text("[data-testid=image-facts] [data-fact=Layers]") == "obb"
+    assert pg.inner_text("[data-testid=image-facts] [data-fact=Scale]").startswith("1 px = ")
+    assert pg.locator("[data-testid=scale-bar]").is_visible()
+    marks = pg.locator("[data-testid=legend] li").evaluate_all("ls => ls.map(l => l.dataset.mark)")
+    assert marks == [m["mark"] for m in json.loads(text["legend"])] and "keyframe" in marks
+    drawn = pg.locator("[data-testid=result-image] ~ details [data-testid=cameras] tbody tr")
+    assert drawn.count() == len(json.loads(text["cameras"]))
+    full = pg.get_attribute("[data-testid=full-size]", "href")
+    assert full.startswith("blob:") and pg.get_attribute("[data-testid=full-size]", "target") == "_blank"
+    tab.a11y()
+    # the form's values are in the page's URL: reloaded, the same bird's-eye view is one Run away
+    assert "format=png" in pg.url and "layers=obb" in pg.url and "mode=full" in pg.url
+    pg.reload()
+    pg.wait_for_selector("body[data-ready=true]")
+    assert pg.input_value(".field[data-param=format] select") == "png"
+    assert pg.input_value(".field[data-param=layers] select") == "obb"
+    assert pg.input_value(".field[data-param=mode] select") == "full"
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-l obb')")
+    assert tab.errors == []
+
+
+def test_a_missing_maps_page_offers_no_action_on_it(tab: Tab) -> None:
+    """A map that is not there: its page says so and points to creating one, with nothing to run
+    on it, update, view or remove."""
+    pg = tab.go("#/maps/nope")
+    pg.wait_for_selector("[data-testid=remove]", state="detached")
+    for gone in ("[data-testid=run-on-map]", "[data-action=update-map]", "[data-testid=viewer]",
+                 "[data-action=run]"):
+        assert pg.locator(gone).count() == 0, gone
+    assert pg.get_attribute("main [data-action=new-map]", "href") == "#/maps/new"
+    pg.wait_for_timeout(600)  # its form's first check would have come by now
+    assert "?" not in pg.url  # no operation kept for a map that is not there
+    tab.a11y()
+    # its update flow: the same, never "the new inputs extend map nope"
+    pg = tab.go("#/maps/nope/update?format=ply")
+    pg.wait_for_selector("main .notice.error")
+    assert pg.locator("section.step").count() == 0 and pg.locator("[data-action=run]").count() == 0
+    assert "extend map nope" not in pg.inner_text("main")
+    assert pg.get_attribute("main [data-action=new-map]", "href") == "#/maps/new"
+    assert "format=" not in pg.url
+    tab.a11y()
+    assert [e for e in tab.errors if "/api/maps/nope" not in e and "404" not in e] == []
+
+
+# what the update records of the workspace's real maps hold (ainex-captures, test), for their
+# history's width: their dates, counts, registration, objects and times
+REAL_UPDATES = {
+    "ainex-captures": {"id": 1, "at": 1792592810.312225, "inputs": [f"/in/{i:04d}.jpg" for i in range(79)],
+                       "kind": "images", "fps": None, "frames_added": [f"f{i:06d}" for i in range(79)],
+                       "frames_rejected": [], "sfm": "multiview",
+                       "objects": {"total": 44, "confirmed": 33, "unconfirmed": 11},
+                       "timings": {"stages_s": {"setup": 1.0, "inference": 100.0}, "total_s": 160.386}},
+    "test": {"id": 1, "at": 1792617707.6158788, "inputs": [f"/in/{i:04d}.jpg" for i in range(36)],
+             "kind": "images", "fps": None, "frames_added": [f"f{i:06d}" for i in range(36)],
+             "frames_rejected": [], "sfm": "multiview",
+             "objects": {"total": 58, "confirmed": 30, "unconfirmed": 28},
+             "timings": {"stages_s": {"setup": 1.0, "inference": 60.0}, "total_s": 88.197}},
+}
+
+
+def test_the_update_history_fits_a_tablet(tab: Tab, app: tuple[Any, str]) -> None:
+    """The history of maps like the workspace's real ones never scrolls sideways at 768 px, with
+    a page scrollbar or without one (the page's width less a classic scrollbar's 15 px): its date
+    and time take two lines."""
+    service, _ = app
+    for name, update in REAL_UPDATES.items():
+        root = minimal_map(service.workspace.maps / name)
+        meta = json.loads((root / "map.json").read_text())
+        (root / "map.json").write_text(json.dumps({**meta, "updates": [update]}))
+    for width in (768, 753):
+        for scrollbar in ("scroll", "hidden"):
+            pg = tab.go("#/maps")
+            pg.set_viewport_size({"width": width, "height": 1024})
+            for name in REAL_UPDATES:
+                pg = tab.go(f"#/maps/{name}")
+                pg.wait_for_selector("[data-testid=history] tbody tr[data-update]")
+                pg.evaluate("(o) => { document.documentElement.style.overflowY = o; }", scrollbar)
+                over = pg.eval_on_selector("[data-testid=history]",
+                                           "t => t.parentElement.scrollWidth - t.parentElement.clientWidth")
+                assert over <= 0, f"{name}'s history scrolls sideways by {over}px at {width}px ({scrollbar})"
+                # with room to spare: its narrowest layout fits with 20 px left (a wider font)
+                least, room = pg.eval_on_selector("[data-testid=history]", """t => {
+                    t.style.width = 'min-content'; const w = t.getBoundingClientRect().width; t.style.width = '';
+                    return [w, t.parentElement.clientWidth]; }""")
+                assert least <= room - 20, (name, width, scrollbar, least, room)
+                assert pg.eval_on_selector("[data-testid=history] td.when", "td => td.innerText.split('\\n').length") == 2
+                assert t_page_fits(pg), f"{name} scrolls sideways at {width}px"
+    pg.set_viewport_size({"width": 1280, "height": 900})
+    tab.a11y()
+    assert tab.errors == []
+
+
+def t_page_fits(pg: Any) -> bool:
+    return pg.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_a_run_asked_by_the_url_that_may_not_run_unasked_shows_where_to_run_it(tab: Tab) -> None:
+    """``run=1`` with a request that does not pass its check: nothing runs; the Run button is
+    focused, in view, and the URL no longer asks to run."""
+    pg = tab.go("#/maps/empty?op=mapper-locate&format=ply&attrs=voxel%3D-1&run=1")
+    pg.wait_for_function("() => document.activeElement?.dataset.action === 'run'")
+    assert pg.locator("[data-testid=request]").count() == 0
+    assert pg.eval_on_selector("button[data-action=run]", "b => { const r = b.getBoundingClientRect();"
+                               " return r.top >= 0 && r.bottom <= window.innerHeight; }")
+    pg.wait_for_function("() => !location.hash.includes('run=')")
+    assert tab.errors == []
+
+
+def test_a_pages_url_keeps_its_form_and_nothing_else(tab: Tab) -> None:
+    """A map's page, the Image page and the map flows keep their forms' values in the URL (never
+    the files chosen), drop the keys they do not keep, and bring the form back on a reload; the
+    operations are described in the web application's words (nothing of the command line's -o)."""
+    pg = tab.go("#/maps/empty?op=mapper-locate&inputs=foo.jpg&format=png&nonsense=1")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('-f png')")
+    pg.wait_for_function("() => !location.hash.includes('inputs=') && !location.hash.includes('nonsense')")
+    assert "format=png" in pg.url and "op=mapper-locate" in pg.url
+    pg = tab.go("#/maps/new?format=ply&map=room2&inputs=x.jpg")
+    assert pg.input_value(".field[data-param=format] select") == "ply"
+    assert pg.input_value(".field[data-param=map] input") == "room2"
+    pg.wait_for_function("() => !location.hash.includes('inputs=')")
+    pg.select_option(".field[data-param=format] select", "json")
+    pg.wait_for_function("() => !location.hash.includes('format=')")  # the default: no key
+    assert "map=room2" in pg.url and "op=" not in pg.url
+    pg = tab.go("#/image")
+    text = pg.inner_text("[data-testid=operations]")
+    assert "-o" not in text and "stdout" not in text and "artefacts" not in text
+    tab.a11y()
+    assert tab.errors == []
+
+
+def test_a_request_that_ends_leaves_the_focus_where_the_user_put_it(extended: Any, tab: Tab) -> None:
+    """The end of a request moves the focus to its result only while the focus is still on its
+    Run or Interrupt button (or nowhere): a user who went on typing keeps the focus and the
+    scroll, and hears that it ended."""
+    service = extended
+    pg = tab.go("#/maps/empty?op=slow")
+    start_slow(pg, 2)
+    field = ".field[data-param=seconds] input"
+    pg.focus(field)
+    scrolled = pg.evaluate("() => window.scrollY")
+    tab.wait_request("done", 60000)
+    assert pg.evaluate("() => document.activeElement.closest('.field')?.dataset.param") == "seconds"
+    assert pg.evaluate("() => window.scrollY") == scrolled
+    assert pg.inner_text("#announce") == "Done: the result is below."
+    wait_idle(service)
+    # left on the Run button, the focus goes to the result
+    pg.click("button[data-action=run]")
+    tab.wait_request("done", 60000)
+    pg.wait_for_function("() => document.activeElement.id === 'result-h'")
     assert tab.errors == []
 
 
@@ -727,7 +1013,7 @@ def start_slow(pg: Any, seconds: float) -> None:
         pg.goto(pg.url.split("#")[0] + "#/maps/empty?op=slow")
         pg.wait_for_selector("body[data-ready=true]")
     pg.fill(".field[data-param=seconds] input", str(seconds))
-    pg.wait_for_function(f"() => document.querySelector('[data-testid=command]').textContent.includes('--seconds={seconds:g}')")
+    pg.wait_for_function(f"() => document.querySelector('[data-testid=command]').textContent.includes('--seconds {seconds:g}')")
     pg.click("button[data-action=run]")
     pg.wait_for_selector("[data-testid=request][data-state=running]", timeout=30000)
 
@@ -840,8 +1126,9 @@ def test_a_registry_change_reaches_the_ui(extended: Any, tab: Tab, image: Path) 
     shade.wait_for()
     assert shade.input_value() == "dark" and "a new option of the export" in pg.inner_text(".field[data-param=shade]")
     shade.select_option("light")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('--shade=light')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('--shade light')")
     assert pg.locator("#op-slow").count() == 1  # the new mode over a map is on the map's page
+    assert pg.is_checked("#op-mapper-locate")  # two operations on a map: a choice between them
     pg = tab.go("#/image")
     pg.check("#op-nap")
     mood = pg.locator(".field[data-param=mood] input")
@@ -856,7 +1143,7 @@ def test_a_registry_change_reaches_the_ui(extended: Any, tab: Tab, image: Path) 
     assert err.inner_text() == slow_command.NAP_LIMIT
     pg.fill(".field[data-param=seconds] input", "0.1")
     pg.fill(".field[data-param=code] input", "2")
-    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('--mood=calm')")
+    pg.wait_for_function("() => document.querySelector('[data-testid=command]').textContent.includes('--mood calm')")
     pg.click("button[data-action=run]")
     tab.wait_request("failed", 60000)
     text = pg.inner_text("[data-testid=request] .notice.error")

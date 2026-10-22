@@ -1,11 +1,13 @@
 // A point-cloud result drawn in the page (http_server.md "Image": a point cloud "is loaded in the
 // page and drawn in 3D with the colours and attributes it carries, and the user can rotate, pan and
-// zoom it"; "the drawing reuses the §2.5 viewer's own rendering of clouds"). The viewer's own
+// zoom it"; "the drawing reuses the §2.5 viewer's own rendering of clouds"; on a map's page, the
+// cameras its header names are drawn at their poses). The viewer's own
 // modules, which this service serves under /static/viewer/ from the viewer's package, read the
 // response bytes the page already holds (no other request, no upload) and draw them; they are loaded
 // only when a result needs them. This module embeds that view in the result: its text alternative,
 // its buttons, the display-budget notice, and a clear message when the bytes cannot be drawn.
 import { el, nextId, notice } from './dom.js';
+import { chosenFor } from './inputs.js';
 
 const fmtN = (n) => Number(n).toLocaleString('en-US');
 
@@ -24,13 +26,28 @@ export function joinWords(words) {
   return words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
 }
 
+// What each kind of camera a PLY's header names is (cloudview.js recordCamera).
+export const CAMERA_KINDS = { located: 'located', last_known: 'the last known camera', camera: 'a camera' };
+
+// The cameras of a cloud (cloudFacts), drawn at their poses: "last_known (the last known
+// camera) and …", a camera that placed an input the user chose named by it (`chosen`: inputs.js):
+// "input 2 (located_1: IMG_2.jpg)".
+export function camerasText(cams, chosen = null) {
+  return `${joinWords(cams.map((c) => {
+    const input = chosenFor(c.source, chosen);
+    return input ? `input ${input.index + 1} (${c.name}: ${input.name})` : `${c.name} (${CAMERA_KINDS[c.kind] || c.kind})`;
+  }))}, drawn at ${cams.length === 1 ? 'its pose' : 'their poses'}`;
+}
+
 // The facts of the cloud's caption, [term, description] pairs, from its cloudFacts.
-export function factRows(f) {
+export function factRows(f, chosen = null) {
+  const cams = f.cameras || [];
   return [
     ['Points', points(f)],
     ['Each point carries', joinWords(f.carries)],
     f.attrs ? ['Recorded attributes', f.attrs.replaceAll(',', ', ')] : null,
     f.frame ? ['Frame', f.upright ? `${f.frame}; shown upright, as view.sh shows an image (level camera)` : f.frame] : null,
+    cams.length ? [cams.length === 1 ? 'Camera' : 'Cameras', camerasText(cams, chosen)] : null,
     f.format ? ['PLY format', f.format] : null,
   ].filter(Boolean);
 }
@@ -52,9 +69,9 @@ export const TOOLS = [
   ['Zoom', [['+', 'Zoom in', (v, m) => v.zoom(m.ZOOM_STEP)], ['−', 'Zoom out', (v, m) => v.zoom(1 / m.ZOOM_STEP)]]],
 ];
 
-// The section of a PLY result: `blob` its bytes as received. Returns { el, ready (resolves once it
-// is drawn, or its error shown), dispose }.
-export function cloudSection(blob) {
+// The section of a PLY result: `blob` its bytes as received; `chosen`: the inputs as the user chose
+// them (inputs.js). Returns { el, ready (resolves once it is drawn, or its error shown), dispose }.
+export function cloudSection(blob, { chosen = null } = {}) {
   const id = nextId('cloud');
   const status = el('p', { class: 'cloud-status muted', role: 'status' }, 'Reading the point cloud…');
   const host = el('div', {
@@ -92,8 +109,9 @@ export function cloudSection(blob) {
       view.show(cloud);
       box.cloudView = view;  // for tests and debugging
       const f = m.cloudFacts(cloud);
-      facts.replaceChildren(...factRows(f).map(([k, v]) => el('div', {}, el('dt', {}, k), el('dd', { 'data-fact': k }, v))));
-      host.setAttribute('aria-label', `The point cloud in 3D: ${points(f)} points, each with ${joinWords(f.carries)}`);
+      facts.replaceChildren(...factRows(f, chosen).map(([k, v]) => el('div', {}, el('dt', {}, k), el('dd', { 'data-fact': k }, v))));
+      host.setAttribute('aria-label', `The point cloud in 3D: ${points(f)} points, each with ${joinWords(f.carries)}`
+        + (f.cameras.length ? `, and ${f.cameras.length} camera${f.cameras.length === 1 ? '' : 's'}` : ''));
       if (f.note) note.replaceChildren(notice('info', f.note));
       for (const [name, buttons] of TOOLS) {
         const gid = `${id}-${name.toLowerCase()}`;

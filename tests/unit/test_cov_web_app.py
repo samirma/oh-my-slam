@@ -194,6 +194,32 @@ def test_an_upload_whose_declared_length_is_not_a_number_is_measured_as_it_arriv
     assert body["size"] == 3 and (service.workspace.root / body["path"]).read_bytes() == b"abc"
 
 
+def test_a_commands_warnings_name_its_inputs_by_their_workspace_paths() -> None:
+    """Each warning names the inputs it names (by the command's absolute path) by their workspace
+    paths, the longest path first (a path that extends another is not mistaken for it), never a
+    path that merely starts the same; at most ``MAX_WARNINGS``, then one that counts the others."""
+    inputs = [("map", 0, "/ws/maps/room", "maps/room"),
+              ("inputs", 0, "/ws/maps/room/frames/f1.jpg", "maps/room/frames/f1.jpg"),
+              ("inputs", 1, "/ws/uploads/u2/b.jpg", "uploads/u2/b.jpg")]
+    warnings = web_app.command_warnings(
+        ["/ws/maps/room/frames/f1.jpg: not located", "/ws/uploads/u2/b.jpg and /ws/maps/room2/x",
+         "/ws/maps/room: scale (/ws/maps/room/sfm)", "nothing named"], inputs)
+    assert warnings == [
+        {"message": "maps/room/frames/f1.jpg: not located",
+         "inputs": [{"parameter": "inputs", "index": 0, "path": "maps/room/frames/f1.jpg"}]},
+        {"message": "uploads/u2/b.jpg and /ws/maps/room2/x",
+         "inputs": [{"parameter": "inputs", "index": 1, "path": "uploads/u2/b.jpg"}]},
+        {"message": "maps/room: scale (maps/room/sfm)",
+         "inputs": [{"parameter": "map", "index": 0, "path": "maps/room"}]},
+        {"message": "nothing named", "inputs": []}]
+    many = web_app.command_warnings([f"w{i}" for i in range(web_app.MAX_WARNINGS + 3)], [])
+    assert len(many) == web_app.MAX_WARNINGS + 1 and many[-1] == {"message": "3 more warnings",
+                                                                    "inputs": []}
+    assert web_app.warnings_header([]) == {}
+    header = web_app.warnings_header([{"message": "café", "inputs": []}])
+    assert header == {"X-Oms-Warnings": '[{"message":"caf\\u00e9","inputs":[]}]'}  # ASCII
+
+
 def test_a_request_the_stop_interrupted_answers_the_commands_own_error() -> None:
     """Spec §2.6 "Requests", "Errors": a request ends with the command's own error by the generic
     rule, also when the service's stop interrupted it (exit 130: 499 ``interrupted``) or it ended

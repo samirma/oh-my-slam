@@ -64,8 +64,15 @@ def test_every_operation_of_the_service_gets_its_cases() -> None:
                                        "attrs=color=segment"]
     assert variants["mapper-update"] == ["default", "format=ply", "attrs=color=segment",
                                          "mode=single"]
-    assert variants["mapper-locate"] == ["default", "format=ply", "attrs=color=segment",
-                                         "mode=full"]
+    # its optional images are given, and left out by a case of its own (the last known camera);
+    # -l applies with -f png only, so its cases ask for -f png
+    assert variants["mapper-locate"] == ["default", "without inputs", "format=ply", "format=png",
+                                         "attrs=color=segment", "mode=full", "layers=cloud",
+                                         "layers=obb"]
+    locate = {c.variant: c for c in by_op["mapper-locate"]}
+    assert "inputs" in locate["default"].params and "inputs" not in locate["without inputs"].params
+    assert locate["layers=obb"].params["format"] == "png"
+    assert locate["layers=obb"].result_format == "png"
     assert variants["segment"] == ["default", "format=png"]
     # inputs by kind; -p applies with -f ply only, so its case asks for -f ply
     attrs = by_op["reconstruct"][3]
@@ -106,7 +113,7 @@ def test_a_new_option_or_mode_is_covered_without_evaluator_changes(
     cases, uncovered = sv.parity_cases(served(), [sv.Inputs("a", image="inputs/a.jpg")])
     assert {c.op for c in cases} == {"reconstruct", "segment"}
     assert uncovered["mapper.sh update"] == "no reference input for inputs (images_or_video)"
-    assert uncovered["mapper.sh locate"] == "no reference input for inputs, map (images, map)"
+    assert uncovered["mapper.sh locate"] == "no reference input for map (map)"
     assert sv.parity_cases(served()[:1], [])[1] == {"reconstruct.sh": "no reference input"}
 
 
@@ -128,7 +135,7 @@ def test_every_reference_input_gets_the_default_case_of_each_mode_it_can_run() -
     assert len(on[("reconstruct.sh", "restaurant.jpg")]) == 4  # every variant on the first
     assert [c.variant for c in on[("reconstruct.sh", "ref")]] == ["default"]
     assert [c.variant for c in on[("reconstruct.sh", "camera")]] == ["default"]
-    assert len(on[("mapper.sh update", "ref")]) == 4 and len(on[("mapper.sh locate", "ref")]) == 4
+    assert len(on[("mapper.sh update", "ref")]) == 4 and len(on[("mapper.sh locate", "ref")]) == 8
     assert [c.variant for c in on[("mapper.sh locate", "camera")]] == ["default"]
     (video,) = on[("mapper.sh update", "street2.mp4")]
     assert video.params == {"inputs": ["inputs/street2/street2.mp4"], "map": "street2"}

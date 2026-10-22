@@ -12,7 +12,7 @@ OpenLABEL mapping and the colour palette).
 | `start_inference_server.sh [--status\|--stop]` | Starts the resident model server, or stops or queries it. |
 | `reconstruct.sh -i IMAGE [-f json\|depth\|ply] [-o FILE] [-p ATTRS]` | One image → OpenLABEL scene (default), depth image (16-bit PNG) or point cloud, in the camera frame. |
 | `mapper.sh update -i IMAGES\|VIDEO -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single] [-fps N]` | Creates or extends a persistent map. |
-| `mapper.sh locate -i IMAGES -m MAP [-f json\|ply] [-o FILE] [-p ATTRS] [-t full\|single]` | Camera pose of each image in an existing map, which stays untouched. |
+| `mapper.sh locate [-i IMAGES] -m MAP [-f json\|ply\|png] [-o FILE] [-p ATTRS] [-t full\|single] [-l LAYERS]` | Camera pose of each image in an existing map, or without images its last known camera, as JSON or PLY, or the whole map drawn from above (bird's-eye PNG); the map stays untouched. |
 | `segment.sh -i IMAGE [-f json\|png] [-o FILE] [-d DIR] [--min-score S]` | Objects of one image: OBBs and colours (JSON, default) or the segmented image (PNG), and with `-d` four artefact files. |
 | `view.sh -i IMAGE \| -m MAP [--no-browser]` | Local browser viewer. `-m` needs no server. |
 | `server.sh [--port N] [--data DIR] [--no-browser]` / `--status` / `--stop` | Local web service: every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` as an HTTP API operation answered with the command's result, and a browser application; maps and uploads in a workspace. |
@@ -54,6 +54,7 @@ weights and the code the server fetches with them, the external tools and the ve
 ./mapper.sh update -i walk.mp4 -m maps/home > map.json
 ./mapper.sh update -i more_photos/*.jpg -m maps/home -t single -f ply -o new_part.ply
 ./mapper.sh locate -i where_am_i.jpg -m maps/home > pose.json
+./mapper.sh locate -m maps/home -f png > home.png    # the map from above, its last known camera
 ./view.sh -m maps/home
 ./start_inference_server.sh --stop
 ```
@@ -147,29 +148,45 @@ The result is always in map coordinates. Every option is checked before the serv
 
 ### `mapper.sh locate`
 
-`mapper.sh locate -i IMAGES… -m MAP [-f json|ply] [-o FILE] [-p ATTRS] [-t full|single]`
+`mapper.sh locate [-i IMAGES…] -m MAP [-f json|ply|png] [-o FILE] [-p ATTRS] [-t full|single]
+[-l cloud,obb|cloud|obb]`
 
-Only `-i` and `-m` are required. With no other option, the command writes the located camera
-poses as JSON to stdout. The map is read-only: nothing in its folder changes (no `.lock`, no
-`.staging/`), and the images are not added.
+Only `-m` is required. With no other option, the command writes the map's last known camera as
+JSON to stdout; with `-i`, the located camera of each image. The map is read-only: nothing in its
+folder changes (no `.lock`, no `.staging/`), the images are not added, and `locate` never records
+a position (locating images does not change the last known camera).
 
 * **`-i`** takes one or more image files (the types and hidden-file rule of `update`). A video is
-  refused (exit 2), and so is a folder.
+  refused (exit 2), and so is a folder. **Without `-i`** the result's camera is the map's **last
+  known camera**: the keyframe added last, in the order of addition of *Update semantics* — of the
+  latest update (its `update_id`), the one of the highest index (an update numbers its keyframes
+  in input order). Nothing is matched then, so it never needs the inference server, whatever the
+  map's size. A map without keyframes has no last known camera (exit 2).
 * **`-m`** must be an existing map. A missing or empty folder is an input error (exit 2) and is not
   created; any other folder that is not a map exits 4.
-* **`-t`** sets the scope of the result (default `single`):
-  * `single` returns the located camera of each image, with no objects. With `-f ply` it returns
-    the map points visible from the located cameras: inside a camera's frustum and not hidden
-    behind nearer map points (a coarse z-buffer, 96 cells on the long side; the image has no depth
-    of its own).
-  * `full` returns the map exactly as `update -t full` returns it, plus the located cameras. With
-    `-f ply` it returns the whole map cloud.
+* **`-f`** `json` (default) and `ply` as for `update`; `png` is the bird's-eye image of the map
+  (below).
+* **`-t`** sets the scope of the result (default `single`). "The cameras" are the located camera
+  of each image, or the last known camera:
+  * `single` returns the cameras, with no objects. With `-f ply` it returns the map points visible
+    from the cameras: inside a camera's frustum and not hidden behind nearer map points (a coarse
+    z-buffer, 96 cells on the long side; the image has no depth of its own). With `-f png` it draws
+    the whole map with these cameras only.
+  * `full` returns the map exactly as `update -t full` returns it, plus the cameras. With `-f ply`
+    it returns the whole map cloud; with `-f png` it draws the whole map with the cameras and every
+    keyframe's camera.
+* **`-l`** chooses what the bird's-eye image draws under the cameras: `cloud,obb` (default), `cloud`
+  (the point cloud) or `obb` (the objects' OBBs). It requires `-f png`: with another format it is
+  refused (exit 2), even at its default value. (A single enum, so the API and the web form offer
+  the three choices; argparse leaves it unset until it is given, `Option.given_only`, and its rule
+  resolves the default.)
 * **`-o`** may not point inside the map folder (exit 2).
 * **`-p`** requires `-f ply`, with the map-scope keys of `update`.
 
 An image the map cannot localise is named on stderr with the reason (too few matches with map
-points, no consistent pose, or a pose that contradicts its matches); the others are still
-returned. If no image is located, the command exits 2.
+points, no consistent pose, or a pose that contradicts its matches) and is left out of the result:
+no frame, no PLY header line, no marker. The others are still returned. If no image is located,
+the command exits 2.
 
 *How an image is located.* The map's COLMAP database is cloned (`cp -c`) into a scratch folder;
 the images get their SIFT features there (a camera the map already has when the image size
@@ -189,20 +206,83 @@ poses, must stay within 0.25° (the check the map's own keyframes pass).
 (`map.json` or the commit marker changes, or a file it read disappears), it opens the map again
 and starts over, up to 3 times; after that it exits 2 with "retry once the update is done".
 
-*Representation of a located camera.* Image `k` (its position in `-i`, from 0) gets its own
+*Representation of the cameras.* Image `k` (its position in `-i`, from 0) gets its own
 `sensor_cs` and camera stream `located_<k>` (its intrinsics, `uri` the image path), so it is never
 confused with the map's `camera_<id>`. Its frame is keyed past every keyframe index the map has
 used (`next_frame_index + k`) and holds `timestamp` (the key, as for a keyframe), `located:
 true`, `image`, `inliers`, the stream `uri` and
 the transform `located_<k>_to_map`, the camera-to-map pose in the form of a keyframe's
-`camera_<id>_to_map`. In a PLY the header carries one comment per input image after the frame and
-attribute lines, in the JSON result's representation: `located_<k> {"image": …, "located": true,
-"transform_src_to_dst": {"quaternion": [qx, qy, qz, qw], "translation": [x, y, z]},
-"stream_properties": {"intrinsics_pinhole": {…}, "intrinsics_source": …}}` — the frame's
-`located_<k>_to_map` transform and the stream's properties — or `{"image": …, "located": false}`
-for an image that could not be located. The `-t single` document's metadata holds the map's base fields
-(`tool` `"mapper"`, `map_frame`) and `scope: "single"`; the `map` coordinate system lists the
-`located_<k>` children.
+`camera_<id>_to_map`. The last known camera gets the coordinate system and camera stream
+`last_known` (the keyframe's intrinsics, `uri` its image in the map, `frames/fNNNNNN.jpg`) and a
+frame keyed `next_frame_index`, so never one of the map's frames (in a `-t full` result that
+keyframe is there as well, as a map frame), with `last_known: true`, `keyframe` (its name),
+`image`, `source` (the input it came from), `update_id` and the transform `last_known_to_map`. In
+a PLY the header carries one comment per camera after the frame and attribute lines, in the JSON
+result's representation: `<key> {json}`, the frame's properties (`located`, `image`, `inliers`;
+or `last_known`, `keyframe`, `image`, `source`, `update_id`) with the `transform_src_to_dst` of
+its `<key>_to_map` transform (`{"quaternion": [qx, qy, qz, qw], "translation": [x, y, z]}`) and
+the stream's `stream_properties` (`{"intrinsics_pinhole": {…}, "intrinsics_source": …}`)
+(`locate.camera_record`). The `-t single` document's metadata holds the map's base fields (`tool`
+`"mapper"`, `map_frame`) and `scope: "single"`; the `map` coordinate system lists the cameras
+(`located_<k>` or `last_known`) as its children.
+
+*The bird's-eye image* (`-f png`, `mapping/birdseye.py`, spec "Bird's-eye image"):
+
+* **Projection and orientation.** Orthographic, along the map's +z (gravity up, see *Coordinate
+  conventions*) onto its horizontal plane, seen from above: image right is map +x, image up is
+  map +y, one scale for both axes. One 8-bit RGB PNG, with no colour profile.
+* **Scale and size.** 1 cm per pixel, or the smallest step of 1, 2 or 5 × 10ⁿ m that draws the
+  drawn extent in at most 2000 px on its long side (a 25 m street: 2 cm; 150 m: 10 cm). The pixel
+  grid is aligned to the scale and covers the whole map — every map point, every OBB footprint and
+  every keyframe's camera centre — and the result's cameras, with 24 px of margin, whatever the
+  layers and the scope: one map and one set of cameras give the same grid for `-l cloud`, `obb`
+  or both, and for `-t single` or `full`. A 5 m room is about 550 px a side.
+* **Point cloud** (layer `cloud`): the map cloud as `-p color=rgb` derives it
+  (`reconstruction.cloud`), each pixel the colour of the highest point that falls in it (of equally
+  high points, the later one). Pixels no point falls in are the viewer's canvas colour `#15171c`.
+* **Ceiling or roof.** Seen from above, a ceiling would hide the floor plan, so the cloud layer
+  leaves it out. It is recognised as a dense, wide horizontal layer above every camera: over the
+  points higher than the highest keyframe camera centre plus 10 cm, binned by height in 5 cm bins,
+  a layer is 3 consecutive bins (15 cm) that hold at least twice the points of the median
+  non-empty layer and cover at least 35 % of the map's footprint (its 25 cm cells that hold any
+  point). Every point from 15 cm below the lowest such layer up is left out (walls keep everything
+  below). With no such layer (outdoors, a ceiling never seen, or a table top a low robot camera
+  sees from below: dense, but not wide) every point is drawn. Its height is the metadata's
+  `ceiling_cut_z`.
+* **OBBs** (layer `obb`): every object of the map (the objects of `-t full`) as the footprint of
+  its upright OBB — its horizontal rectangle — outlined 2 px wide in the object's colour, with its
+  id in that colour on a tag of the background colour just above it (Pillow's default font,
+  12 px; moved into the image at its edges). Everything is drawn opaque with no anti-aliasing, the
+  text included, so the colour contract's exact triple appears and no colour is blended: with
+  `-l obb` alone the image holds no colour but the background, the objects' and the markers'.
+* **Cameras**, on top: a keyframe (`-t full`) is a 3 px disc in the viewer's frustum colour
+  `#c9d1dc` with a 9 px heading tick; the last known camera a white diamond with a black edge
+  (8 px half-diagonal); a located camera a white triangle with a black edge whose tip points where
+  it looks, tagged with the number of its image among the inputs, from 1 (`located_<k>`: `k + 1`),
+  black on a white, black-edged tag (Pillow's default font, 12 px) placed beside it — below,
+  above, right, left or diagonally, 10 px from its centre, then 20 and 30 px — where no other
+  camera's tag is, so cameras a few centimetres apart keep their tags apart. Both have a 20 px
+  white, black-edged heading line. The heading is the camera's viewing
+  direction (+z) projected onto the horizontal plane; for a camera looking straight up or down,
+  its image's up direction. Keyframes are drawn first, located cameras last. None of these colours
+  is an object colour (the palette's chroma and lightness bounds).
+* **Text metadata** (`tEXt`): `Description` (in words: the map, the projection and its axes, the
+  scale and what it shows, e.g. "Bird's-eye image of the map office, seen from straight above (an
+  orthographic projection along the map's +z: image right is map +x, image up is map +y) at 0.01
+  m per pixel, showing its point cloud and its objects' OBBs under the cameras. Its text metadata
+  maps its pixels to map coordinates.");
+  `pixel_to_map`, the 2 × 3 affine matrix M with map (x, y) = M · (u, v, 1), where (u, v) are
+  pixel coordinates with (0, 0) the top-left corner of the top-left pixel (pixel column i, row j
+  has its centre at (i + 0.5, j + 0.5)), i.e. `[[s, 0, x0], [0, -s, y0]]`; `map_to_pixel`, its
+  inverse; `metres_per_pixel` (s); `layers` (`cloud,obb`, `cloud` or `obb`); `ceiling_cut_z` (a
+  height in metres, or `null`); `cameras`, a JSON object of every camera drawn, by key —
+  `located_<k>`, `last_known` and, with `-t full`, each keyframe's name (with `keyframe`, `frame`,
+  its frame key in the JSON result, `image` and `source`) — in the PLY header's representation;
+  `map`, the map folder; and `legend`, a JSON list of the marks drawn, in the order they are
+  drawn — `{"mark", "shape", "fill", "edge", "text"}` for the layers (`cloud`: points, `obb`: an
+  outline) and the kinds of camera drawn (`keyframe`: a disc, `last_known`: a diamond,
+  `located`: a triangle), with their colours (`birdseye.MARKS`). In Python: `M = np.array(json.loads(PIL.Image.open("map.png")
+  .text["pixel_to_map"]))`, then `M @ [u, v, 1]` is the map position of pixel position (u, v).
 
 ### `segment.sh`
 
@@ -430,7 +510,8 @@ request, and the response is the command's result.
     accepted, because the command waits for it.
   * "Will use inference" is decided by `commands.spec.needs_inference`, which evaluates the mode's
     inference condition when the request arrives. `mapper locate` on a map of at most
-    `UPDATE_EXHAUSTIVE_MAX` (150) keyframes needs none, so it runs without the server and outside
+    `UPDATE_EXHAUSTIVE_MAX` (150) keyframes needs none, and without images it never does (the
+    condition `images_in_map_keyframes_greater_than`), so it runs without the server and outside
     the inference queue.
 * **Request guard** (CSRF and DNS rebinding; the 0.0.0.0 binding is required by the spec):
   * every request's `Host` must name this machine: localhost, its host name, or one of its
@@ -450,7 +531,7 @@ request, and the response is the command's result.
 |---|---|
 | `maps/<name>/` | Maps, exactly as `mapper.sh` writes them. An API map parameter is `<name>` or `maps/<name>`, and maps live nowhere else. The service changes a map only through `mapper-update` and deletes one only through the remove operation (`DELETE /api/maps/<name>`, see Maps). |
 | `uploads/<id>/<file>` | Raw-body uploads (`PUT /api/uploads?name=<file>`, as `curl -T <file>` sends it, or `POST /api/uploads?name=<file>` with the file's media type, e.g. `application/octet-stream`). A request refers to one by its path `uploads/<id>/<file>`. An upload is consumed by the one request it is given to and deleted when that request ends, whatever its outcome (refused, failed, interrupted or done); validating a request does not consume it, and a request naming an upload another request in progress was given is refused (409 `upload_in_use`). An interrupted upload is deleted at once, and every upload is deleted at start and stop. An upload may hold at most 8 GiB (long phone videos fit) and must leave 1 GiB free on the workspace's disk; otherwise it gets 413. |
-| `.requests/<id>/` | A running request's scratch: the command's stdout (the result) and its timing record (`OH_MY_SLAM_TIMINGS`). It is deleted once the response is sent, so the service keeps no results; what is left after a crash is deleted at start and stop. |
+| `.requests/<id>/` | A running request's scratch: the command's stdout (the result), its timing record (`OH_MY_SLAM_TIMINGS`) and its warnings (`OH_MY_SLAM_WARNINGS`). It is deleted once the response is sent, so the service keeps no results; what is left after a crash is deleted at start and stop. |
 | `.removed/<id>` | A map being removed: it leaves `maps/` in one rename, then is deleted. What a stop or a crash left is deleted at start. |
 | `server.log` | The running service's own log, after its listening line (see Output). |
 
@@ -474,7 +555,11 @@ option.
   are refused as parameters: the response is the result, and the files a command writes to a
   folder are not offered.
 * A request is a JSON object of parameters; path inputs are workspace paths. The command's own
-  parser and rules (`spec.dry_run`) then check it before anything runs. Problems come back per
+  parser and rules (`spec.dry_run`) then check it before anything runs. The command line its
+  validation answers (`command`, and `in_progress[].command` of the health) is the command as
+  typed, `flag value` as the commands document it (`mapper.sh locate -m maps/office -f png`; a
+  value that starts with `-` stays `flag=value`), with workspace paths: it runs in the workspace.
+  The command itself gets `flag=value` words and absolute paths. Problems come back per
   parameter with the command's messages, and the HTTP status of the first one follows the generic
   rule of `core.errors.HTTP_STATUS`: input errors 400 (`not_a_map` and `not_registered` 422,
   `map_locked` 409), inference server down 503, internal 500. `POST /api/ops/<op>/validate` runs
@@ -502,6 +587,16 @@ option.
   (`connect;dur=12.3, inference;dur=830.1, …, total;dur=1002.4`). Otherwise the body is the error
   `{code, exit_code, message, http_status}`: the command's `<prog>: error:` message and the code
   of its exit status, by the generic rule. No request is ever timed out by the service.
+  * **Warnings.** The warnings a command gives (its log records of level warning, which a
+    terminal shows on stderr: an image `mapper-locate` could not place and left out of its
+    result, an ignored `-fps`) come with either answer in an `X-Oms-Warnings` header, and in a
+    failure's body as `error.warnings`: JSON (ASCII), `[{"message", "inputs": [{"parameter",
+    "index", "path"}]}]`. The command appends each one to `.requests/<id>/warnings.jsonl`
+    (`OH_MY_SLAM_WARNINGS`, `core.log.WarningsFile`); the service names every path input in a
+    message by its workspace path instead of the absolute path the command was given, and lists
+    the inputs each one names (a path followed by a letter, digit, `_` or `-` is another path).
+    At most 50 are listed, then one that counts the others. The OpenAPI document declares the
+    header (`components/schemas/Warning`, `components/responses/CommandError`).
   * **What byte-identical means** (user ruling, 2026-10-05): the same command, with the same
     options and the same **absolute** input paths. A request passes the command the absolute path
     of each workspace input (an upload is `<data>/uploads/<id>/<file>`), and a result that records
@@ -579,40 +674,73 @@ no validation endpoint and never need the inference server. A name that is no ma
 CDN). It talks only to the public API above, so everything it does can be scripted. It draws no
 map or scene itself: a map is explored with its layers, objects and cameras in its `view.sh`
 viewer, which the map's page starts and stops. A point-cloud result is still drawn in 3D in the
-page with the §2.5 viewer's own rendering (see Results).
+page with the §2.5 viewer's own rendering, and an image result (depth, segmented or bird's-eye
+image) is shown as received (see Results).
 
 * **Rendered from the API description.** The operations, their parameters and their results are
   read from `/api/openapi.json` (each operation's `x-oms` registry entry). Nothing in the app names
   a command or an option (a unit test checks this). A new option becomes a new field, a new mode
   a new choice on the page its inputs belong to (one image: the Image page; a map: the map's
   page), an option of a kind the app does not know a text field, and a new error a new message; a
-  browser test adds all of these to the registry and finds them in the pages.
+  browser test adds all of these to the registry and finds them in the pages. An operation is
+  described by its command's `summary` where its `help` names what only the command line has
+  (`reconstruct.sh`'s "(stdout or -o file)", `segment.sh`'s artefacts of `-d`).
 * **Pages.** Each has a stable hash URL, so a reload or a shared link returns to it, and a new
   page moves the focus to its heading and is announced:
   * `#/image?op=<op>`: the operations that take a single image (`reconstruct`, `segment`).
     A drop zone with a preview, the generated form, the request, then the result.
   * `#/maps?filter=<text>`: the workspace's maps as cards (frames, objects, updates, last update
-    and how long it took, from `/api/maps`), with a filter.
-  * `#/maps/<name>?op=<op>`: a map's summary (`/api/maps/<name>`); its viewer, with a button
-    that starts or stops it and a link to it while it runs (its page is served on the service's
-    machine only, which the page says); the operations that take a map without writing it
-    (`mapper-locate`); its update history: one row per `map.json → updates[]` entry (when, input
-    kind, files, frames added and rejected, objects, time) with its per-stage timings and its
-    other figures; and *Remove this map*, which asks first in a dialog that states the map is
-    deleted for good (focus on *Keep the map*), then says it is gone, or shows the service's
-    message (for example while a request in progress uses the map).
+    and how long it took, from `/api/maps`), with a filter, under a lead that says in plain words
+    what a map's page gives (the titles of the map operations' results). Each card links straight
+    to every image result of an operation that needs nothing but the map, its choosing parameter
+    set and `run=1` (*Bird's-eye image of the map*:
+    `#/maps/<name>?op=mapper-locate&format=png&run=1`). A map's page loaded with `run=1` runs its
+    request at once when its first check passes, says it needs no inference server and the
+    operation writes nothing but its result (every output the response's), then moves the focus
+    to the result; otherwise it runs nothing and focuses *Run*, in view. Either way `run` leaves
+    the URL, so a reload or a bookmark never runs it unasked.
+  * `#/maps/<name>?op=<op>&<parameter>=<value>…`: a map's summary (`/api/maps/<name>`); the
+    operations that take a map without writing it (`mapper-locate`: its images are optional, so
+    with no image chosen it shows the map's last known camera, in any of its formats), with what
+    each one gives (its description, and each result's title and format, from its definition;
+    the maps' page lists the same), and a choice between them only when there are several; its
+    viewer, with a button that starts or stops it and a link to it while it runs (its page is
+    served on the service's machine only, which the page says); its update history: one row per
+    `map.json → updates[]` entry (when, as a short date with its time on a second line and the
+    full one as its tooltip, so the table fits 768 px with or without a page scrollbar, input
+    kind, files, frames added and rejected, *Tracked*: the detections the mapper tracked at that
+    update, confirmed or not — `objects.confirmed` and `objects.unconfirmed`, on two lines: `8
+    confirmed` / `+ 22 unconfirmed` — which are not the summary's *Objects* and *Candidates*:
+    those count what the map lists, objects with an OBB and enough points of their own, as its
+    exports do (a confirmed detection without enough points is a candidate there), and time) with
+    its per-stage timings and its other figures;
+    and *Remove this map*, which asks first in a dialog that states the map is deleted for good
+    (focus on *Keep the map*), then says it is gone, or shows the service's message (for example
+    while a request in progress uses the map). A name that is no map says so, with links to the
+    maps and to *New map*, and offers nothing to run, update, view or remove.
   * `#/maps/new` and `#/maps/<name>/update`: the guided flow over the mapping operation: 1 the
     inputs, numbered in the order they are used (arrow buttons and *Sort by name* reorder them;
     the latest observation wins), 2 the map (a new name, or the map being updated), 3 the other
-    options, 4 the command line and what starting it does.
+    options, 4 the command line and what starting it does. A map to update that is not there
+    says so, as its page does, with a link to *New map* (running the flow would create it).
 * **Forms** have one field per parameter, chosen by its kind: path inputs upload at once (or take
   a workspace path), a map is chosen from the workspace's maps (the mapping operation also takes
   a new name and says whether it creates or extends a map), `-p` gets one control per attribute of
-  the mode, and enums, numbers and flags the matching control. Each field shows its flag, help and
-  default. Fields whose `applies` condition fails are hidden and not sent. Each change is checked
-  by `POST /api/ops/<op>/validate`, and its message appears next to the field it names
-  (`by_parameter`), with the command line the request will run; a field shows messages once it was
-  changed, every field once a run was asked for.
+  the mode, and enums, numbers and flags the matching control. Each field is named by its
+  option's `label` (*Scope* for `-t`, *Point-cloud attributes* for `-p`; its name otherwise) and
+  shows its flag, help and default, and where it applies (`applies_text`, which the help never
+  repeats); an enum's choices say in a few words what each one is (`choice_text`: `png — the
+  bird's-eye image of the map`, the format's from its output's `title`; `single — only these
+  cameras`), its help in more detail where a choice has more to say (what `-t` gives in each
+  format). Fields whose `applies` condition fails
+  are hidden and not sent. Each change is checked by `POST /api/ops/<op>/validate`, and its
+  message appears next to the field it names (`by_parameter`), with the command line the request
+  will run, quoted for a shell where a word needs it, and the workspace its paths are relative to;
+  a field shows messages once it was changed, every field once a run was asked for. On the Image
+  page, a map's page and the map flows the values of every field but the files are kept in the
+  page's URL (`?op=<op>&format=png&layers=obb`; the flows have one operation, so no `op`), so a
+  reload or a bookmark brings the same form back; a key the page does not keep is dropped, and a
+  map that is not there keeps none.
 * **A request runs in its page.** *Run* checks the request (a long operation, a map update, first
   states its consequence in a confirmation), then sends it and shows it in progress: *Waiting for
   its turn* or *Running*, with the elapsed time (and the time it waited). The page tells its own
@@ -625,15 +753,46 @@ page with the §2.5 viewer's own rendering (see Results).
   clears its inputs once they are in the map); a page that goes away discards the uploads no
   request consumed.
 * **Results.** The response body is the result. The page offers it as a download, byte for byte
-  (`<op>-<input or map>.<format>`), and shows it, by its format and content, never by the
-  operation: a scene description (OpenLABEL) with its objects listed (id, label, colour as a
-  swatch and its `#rrggbb`, score), the JSON in full (formatted, or exactly as received), a point
-  cloud (PLY: `reconstruct -f ply` on the Image page, `mapper-locate -f ply` on a map's page) drawn
-  in 3D, and the command's per-stage timings from `Server-Timing`. An image result (PNG: the depth
-  image of `reconstruct -f depth`, the segmented image of `segment -f png`) is shown in the page
-  as received (an `<img>` of the response body) and offered as its download, with its media type
-  and size. A failure shows the command's message and code; a refused request also marks its
-  fields.
+  (`<op>-<input or map>[-<variant>].<format>`, the variant the values given to the enums and
+  `-p` other than the format: `mapper-locate-office-full-obb.png`), and shows it, by its format
+  and content, never by the operation. When the request ends while the focus is still where the
+  request left it (its *Run* or *Interrupt* button, its own box, or nowhere), the focus moves to
+  the result's heading (or to why there is none), scrolled into view; when the user put it
+  elsewhere meanwhile (a field, another section), focus and scroll stay and the end is announced
+  (`#announce`: "Done: the result is below."). The command's warnings (`X-Oms-Warnings`, or the
+  failure's `error.warnings`) come first, each input named as the user chose it (the file's
+  name, and `input <n>` among several, from 1), and the located cameras in the camera tables and
+  captions are named by the same number with their key (`input 2 (located_1)`, the number the
+  bird's-eye image tags them with), their file's name with the path the command was given as a
+  tooltip. Then: a scene description (OpenLABEL) with its objects listed (id, label, colour as a
+  swatch and its `#rrggbb`, score) and its cameras (every frame with a camera pose: its name, its
+  kind — *Located*, *Last known camera* or *Map frame*, from the frame's `located` / `last_known`
+  marks — its centre's x, y, z in metres and its image; located and last known cameras first), the
+  JSON in full (formatted, or exactly as received), a point cloud (PLY: `reconstruct -f ply` on
+  the Image page, `mapper-locate -f ply` on a map's page) drawn in 3D, with the cameras its header
+  names (`<key> {json}` lines with a pose and intrinsics: `cloudview.headerCameras`) drawn as
+  frustums at their poses, in their kind's colour (a located camera white, the last known camera
+  cream, `cameras.js KIND_COLORS`; a scene's own cameras keep the frustum grey, so `view.sh` is
+  unchanged) and labelled with the input they placed (`input 2`, the number of the tables and of
+  the bird's-eye image's tags; `located_1` in the label's tooltip) or else their name, and their
+  kind (anchored behind the camera, off its frustum;
+  the label layer, named after what it holds — *Camera labels* — never lets one label cover
+  another, a label hidden when it was measured included), and named in its caption, and the command's
+  per-stage timings from
+  `Server-Timing`. A scene with no objects whose metadata's `scope` is a choice of the
+  operation (a `-t single` locate) says which scope it is and which to choose to include them
+  ("No objects in this result: its scope is single (only these cameras). Choose scope full (the
+  whole map and every keyframe) to include them."). An image
+  result (PNG: the depth image of `reconstruct -f depth`, the segmented image of `segment -f
+  png`, the bird's-eye image of `mapper-locate -f png`) is shown in the page as received (an
+  `<img>` of the response body, its text alternative its output's title, its size and its own
+  `Description`), with a link that opens it full size in a new tab, and offered as its download,
+  with its media type and size. What the PNG's own text metadata says is shown when it has it
+  (read in the page from its `tEXt` and uncompressed `iTXt` chunks): its `Description`, its
+  scale (`metres_per_pixel`, with a scale bar of 1, 2 or 5 × 10ⁿ m under the image), its
+  `layers`, its `legend` (each mark drawn with its shape and colours) and its `cameras` (a
+  table, as for a scene's). A failure shows the command's message and code, and its warnings; a
+  refused request also marks its fields.
 * **A point cloud in 3D** (`web/static/js/cloudresult.js`). The drawing is the §2.5 viewer's own:
   the service serves the viewer package's `static/lib/` and `static/vendor/` (its ES modules and
   three.js) at `/static/viewer/lib/…` and `/static/viewer/vendor/…`, not copies, and loads them
@@ -683,7 +842,11 @@ page with the §2.5 viewer's own rendering (see Results).
   the Image page and on a map's page: the canvas shows the file's own colours, the point count is
   the file's, buttons, keys, drag and wheel move it, the display budget with a test's smaller
   budget, a PLY that does not parse, both themes down to tablet width), an image result (PNG),
-  map creation and update (COLMAP), locating images in a map, a map's viewer started, opened
+  map creation and update (COLMAP), locating images in a map (an image it cannot place named in
+  a warning by the file chosen), locating with no image (the last known camera) and each of its
+  result formats shown (JSON with its objects and cameras listed, PLY with its camera drawn and
+  labelled, the bird's-eye PNG of `-l obb` with its legend, scale, cameras and full-size link,
+  and its form brought back from the page's URL), a missing map's page, a map's viewer started, opened
   and stopped from its page, a map's removal (asked first, then gone), the downloads (compared
   with the response body),
   interruption (button, leaving, reloading), a request waiting for its turn, the inference server
@@ -805,7 +968,8 @@ The same source and attributes always give byte-identical files.
 ## Output contract and exit codes
 
 * **stdout** carries at most one payload: one JSON document (compact, newline-terminated), one
-  PLY or one PNG (`reconstruct.sh -f depth`, `segment.sh -f png`), and no banners or progress. Once
+  PLY or one PNG (`reconstruct.sh -f depth`, `segment.sh -f png`, `mapper.sh locate -f png`), and
+  no banners or progress. Once
   its arguments are parsed and checked, and before any inference, mapping or serving, a command
   points fd 1 at stderr (`core.log.claim_stdout`) and keeps the real stdout for its payload, so
   output from native code (COLMAP, Open3D) lands on stderr too.
@@ -826,7 +990,7 @@ The same source and attributes always give byte-identical files.
 |---|---|
 | 0 | Success. A consumer closing the pipe early (`\| head`) also exits 0. |
 | 1 | Internal error. Also used when the server stays busy after retries, when inference fails, or when COLMAP is missing or the wrong version. |
-| 2 | Usage or input error: bad option, bad `-p`, missing or unsupported input file, `.venv` missing; for `mapper.sh locate` also a missing or empty map folder, an `-o` inside the map, or no image located. |
+| 2 | Usage or input error: bad option, bad `-p`, missing or unsupported input file, `.venv` missing; for `mapper.sh locate` also a missing or empty map folder, an `-o` inside the map, `-l` without `-f png`, no image located, or, without images, a map with no keyframe (no last known camera). |
 | 3 | The inference server is not running, is still loading its models after the command's wait, is stopping, its models failed to load, or it speaks another protocol version (started before an upgrade). The message says what to run (`./start_inference_server.sh`, or a restart, after fixing the cause the log names for failed models). |
 | 4 | `-m` folder is not empty and not a map (`mapper.sh`), or is not a map (`mapper.sh locate`, `view.sh -m`). |
 | 5 | Nothing could be registered, for example because the new images do not overlap the map. The map is unchanged. |
@@ -915,6 +1079,8 @@ appears in all of these:
 * `catalog.csv` and `catalog.md`
 * every PLY or viewer cloud with `color=segment`
 * the OBB rendered by `view.sh`
+* the OBB outline and id tag in a bird's-eye image (`mapper.sh locate -f png`), drawn opaque with
+  no anti-aliasing
 
 Masks are opaque, and each pixel and point belongs to at most one object.
 
@@ -1893,7 +2059,9 @@ A single command benchmarks every entry point on `examples/`, strictly one comma
 * on each capture sequence, `mapper.sh locate`: between the split map's first and second update,
   of the second update's captures (held out of the map so far); and on the one-update map: the
   first capture, the one halfway and the one three quarters through (`ainex-captures`: 001, 040,
-  060), as `-t single` JSON, `-t full` JSON and `-f ply -o`; the map folder, hidden entries
+  060), as `-t single` JSON, `-t full` JSON and its bird's-eye image (`-f png`), and `-f ply -o`;
+  then without images (the last known camera): `-t single` JSON and its bird's-eye image, `-t full`
+  JSON and its bird's-eye image of the OBB layer alone (`-l obb`); the map folder, hidden entries
   (`.staging/`, `.lock`) included, must not change
 * `mapper.sh update` on `office_sequence` (13 images; a cup on the window sill is gone in the last
   ones): the whole sequence in one update, and split as its annotation says (4+4+5 and 6+7)
@@ -1957,7 +2125,7 @@ above it.
 | `map.*` | For the `ainex` maps (`map.single.*`, `map.split.*`, `map.stability.*`) and the `camera` maps (`map.camera_single.*`, `map.camera_split.*`, `map.camera_stability.*`, whose same-heading pairs are the tilts of each pan position): frame agreement (depth disagreement) of the same-heading pairs and of every overlapping keyframe pair (`frame_agreement_pairs_*`: optical axes < 45° apart, any distance in capture order: median and p90 over the pairs of each pair's median, share of pairs above 10 %, worst pair; the detail splits sequence neighbours, ≤ 10 keyframes apart, from loop closures), and the stability of ids, labels and OBBs between the one-update and the split map. `ainex`'s same-heading pairs are revisits, which see the same surfaces at the same image positions: judged by the worst pair (`frame_agreement_median_pct`, `frame_agreement_p90_pct`: its median and p90). The `camera`'s tilt pairs share only strips, at the top of one frame and the bottom of the other, so they are judged like the overlapping pairs, over the tilt pairs alone and with the same targets (`frame_agreement_tilt_*`: median, p90, share above 10 % and worst of the tilt pairs' medians; user ruling 2026-10-08). Ids and boxes are compared on a label-aware pairing, labels on a label-blind one. `matched_fraction` is the share of the one-update map's objects the split map has: the split map may keep an object an earlier update published that no later image contradicts (`mapper.md`), so such extra objects are listed in the detail (`extra_published`, id and label) and not counted against it; any other extra object counts in `unexcused_extra`. As `mapper.md` allows, an id may differ from the one-update map's where an earlier update of the split map had published it for that object: `id_agreement` counts such a pair as agreeing (its detail keeps the strict share, `same_id`). "Published for that object" means one of that update's `-t full` objects (for a `-t single -f ply` update, the objects its points' labels name, read from the map as it left it) has the id, a compatible label and a box that overlaps or nearly coincides with the split map's once the two updates are aligned: an id another object had is no allowance. |
 | `map_update.*` | Map update on `office_sequence`. For the one-update map and for each split (`split_4_4_5`, `split_6_7`) after its last update: the share of the annotated absent objects (the cup) the map no longer has (`absent_fraction`), and `hole_fraction`, the share of the cells of the cup's annotated place where the map shows no surface (the map cloud projected with the map's own poses into the images that showed the cup: a cell with no point, or whose nearest point lies more than 25 % behind the surface around it, is a hole). The control (`before_present_fraction`): the split map after an update of exactly the images that show the cup has it. Per split: the ids, labels and OBBs of the unchanged objects from the first update to the last, after aligning the two updates by their common captures, since a rebuild may re-gauge the frame (`stability.label_agreement`, `stability.id_agreement`, and `stability.centre_delta_median_m`, `.extent_delta_median_rel`, `.obb_iou_median`, whose targets allow for an OBB refined as evidence accumulates); `ids_persistent_fraction`, every id an update published for an unchanged object is, in every later update, still an object of a compatible label at the same place; and the split against the one-update map (`vs_one_update.*`, ids as in `map.*`). A remnant is a map object with a compatible label whose box, projected with the map's own poses into the images that showed the object, covers its annotated region. What changed, and the splits, are annotated in `examples/ground_truth/office_sequence.json` (`kind: "map_update"`). |
 | `seg.*` | Detections, labels and scores per frame (`restaurant.jpg`, each `ainex-captures` frame: `seg.frames.*`, and each `camera` frame: `seg.camera_frames.*`). |
-| `contract.*` | Colour contract, OpenLABEL validity (and `mapper.sh locate`'s located cameras marked as such), stdout purity (one JSON document, PLY or PNG; `locate -f ply`'s one pose line per input image, and `reconstruct.sh -f depth`'s PNG checked as a 16-bit single-channel image of the input's pixel size), artefacts (exactly the four files; `segmentation.json` identical to `-f json`, `segmented.png` identical to `-f png` of the same run), same objects (`locate -t full` gives the map as `update -t full` does), and read-only maps. The colour contract covers the segmented image (`-f png` and `segmented.png`), the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). For `server.sh` (`contract.*.server_sh`): its own stdout is empty, and each operation's response body, the command's result, is exactly one payload of the result's format and, when JSON, valid OpenLABEL with the colours of its ids. |
+| `contract.*` | Colour contract, OpenLABEL validity (and `mapper.sh locate`'s located cameras marked as such; without images, one camera marked `last_known`: the keyframe added last, with its pose), stdout purity (one JSON document, PLY or PNG; `locate -f ply`'s one pose line per located image, and `reconstruct.sh -f depth`'s PNG checked as a 16-bit single-channel image of the input's pixel size), artefacts (exactly the four files; `segmentation.json` identical to `-f json`, `segmented.png` identical to `-f png` of the same run), same objects (`locate -t full` gives the map as `update -t full` does), read-only maps, and the bird's-eye image (`contract.birdseye.mapper`, spec §5: each `mapper.sh locate -f png` against the JSON result of the same call — its metadata maps pixels to the map both ways and lists exactly the JSON's cameras at their positions; each camera's marker is drawn where its position falls; with the `obb` layer every object's footprint, from its JSON cuboid, is outlined in its exact colour on at least half of its edge, within a pixel; with `-l obb` alone and a `-t full` result, no colour but the background, the objects' and the markers'). The colour contract covers the segmented image (`-f png` and `segmented.png`), the viewer's OBBs and its `color=segment` cloud (`/api/cloud`). For `server.sh` (`contract.*.server_sh`): its own stdout is empty, and each operation's response body, the command's result, is exactly one payload of the result's format and, when JSON, valid OpenLABEL with the colours of its ids. |
 | `server_sh.*` | `server.sh` (http_server.md "Evaluation"); see below. |
 | `gt.*` | Accuracy against ground truth, when annotations exist. |
 
@@ -1980,8 +2148,9 @@ the reference inputs and of the one-update maps of the example sequences in that
   `restaurant.jpg`, each example sequence (`ainex-captures`, `camera`, `office_sequence`: its
   first image, its first 3 images to map, two images to locate in its one-update map, and that
   map) and `street2.mp4`. An operation runs on every reference input that has a value for each of
-  its required parameters: its default case there, and on the first such input one case per
-  non-default choice and per point-cloud attribute. Each case runs the command from the shell
+  its required parameters, with the optional path inputs that input has (the images of
+  `mapper-locate`): its default case there, and on the first such input one case without each of
+  those optional inputs, and one per non-default choice and per point-cloud attribute. Each case runs the command from the shell
   twice and then as a request, with the same absolute workspace paths, and the response body must
   be byte-identical to the command's stdout (the stages its `Server-Timing` names are kept in the
   detail). `street2.mp4` is not mapped again: its section's run, made in the workspace through the

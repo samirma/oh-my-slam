@@ -29,12 +29,60 @@ export const ZOOM_STEP = 1.25;      // one zoom step
 
 export function isUpright(header) { return (header.comments || []).includes(IMAGE_FRAME); }
 
+// The rotation matrix (3 x 3, row-major) of a quaternion [qx, qy, qz, qw] (scalar last).
+export function quaternionMatrix([x, y, z, w]) {
+  const n = Math.hypot(x, y, z, w) || 1;
+  [x, y, z, w] = [x / n, y / n, z / n, w / n];
+  return [
+    [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+    [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+    [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+  ];
+}
+
+// A camera as mapper.sh locate records it (a PLY header line `<name> {json}`: its frame's
+// properties, the camera-to-map `transform_src_to_dst` and the stream's `stream_properties`) as a
+// camera of cameras.js, with its `kind`: 'located', 'last_known' or 'camera', and for a located
+// camera its `input`: the number of its image among the inputs, from 1 (its key is
+// located_<k>, k the image's position from 0, as the bird's-eye image tags it with k + 1). Null
+// when the record has no pose or no intrinsics.
+export function recordCamera(name, d) {
+  const tr = d && d.transform_src_to_dst;
+  const intr = d && d.stream_properties && d.stream_properties.intrinsics_pinhole;
+  if (!tr || !Array.isArray(tr.quaternion) || !Array.isArray(tr.translation) || !intr) return null;
+  const R = quaternionMatrix(tr.quaternion);
+  const t = tr.translation;
+  const m = intr.camera_matrix;  // 3 x 4, row-major
+  const kind = d.located === true ? 'located' : d.last_known === true ? 'last_known' : 'camera';
+  const k = /_(\d+)$/.exec(name);
+  return {
+    name, kind, input: kind === 'located' && k ? Number(k[1]) + 1 : null,
+    T: [[...R[0], t[0]], [...R[1], t[1]], [...R[2], t[2]], [0, 0, 0, 1]], position: [...t],
+    K: [m[0], m[5], m[2], m[6]], size: [intr.width_px, intr.height_px], source: d.image || null,
+  };
+}
+
+// The cameras a PLY's header names: its comments of the form `<name> {json}` that record a camera
+// (recordCamera), in the header's order.
+export function headerCameras(header) {
+  const out = [];
+  for (const c of header.comments || []) {
+    const m = /^([A-Za-z_][\w-]*) (\{.*\})$/.exec(c);
+    let d = null;
+    try { d = m ? JSON.parse(m[2]) : null; } catch { d = null; }
+    const cam = d ? recordCamera(m[1], d) : null;
+    if (cam) out.push(cam);
+  }
+  return out;
+}
+
 // The cloud of PLY bytes (an ArrayBuffer, handed over to the reader), within `budget` points.
 export function readCloud(buffer, budget = DISPLAY_POINT_BUDGET) { return loadPly(buffer, budget); }
 
 // What a text alternative of the cloud states: the points drawn and in the file, what each point
 // carries, the attributes its writer recorded ("key=value,…"), the frame its header names, its
-// format, whether it is shown upright, and the display-budget notice ('' when every point is drawn).
+// format, whether it is shown upright, the display-budget notice ('' when every point is drawn),
+// and the cameras its header names ({ name, kind, source: its image }, drawn at their poses).
 export function cloudFacts({ header, arrays }) {
   const recorded = new Map((header.attrs || '').split(',').filter(Boolean).map((p) => p.split('=')));
   const carries = ['position'];
@@ -45,6 +93,7 @@ export function cloudFacts({ header, arrays }) {
     count: header.count, total: header.total, carries, attrs: header.attrs || '',
     frame: (header.comments || []).find((c) => / frame\b|, metres/.test(c)) || '',
     format: header.format || '', upright: isUpright(header), note: budgetNote(header),
+    cameras: headerCameras(header).map((c) => ({ name: c.name, kind: c.kind, source: c.source })),
   };
 }
 
@@ -73,11 +122,13 @@ export class CloudView {
   get drawn() { return this.viewer.cloudDrawn; }  // a frame showing the cloud has been drawn
   get frames() { return this.viewer.frames; }
 
-  // Draw `cloud` (readCloud) and frame it as view.sh's initial view does.
+  // Draw `cloud` (readCloud), with the cameras its header names (headerCameras) at their poses,
+  // and frame it as view.sh's initial view does.
   show(cloud) {
     const v = this.viewer;
     v.setDisplayTransform(isUpright(cloud.header) ? LEVEL_UPRIGHT : IDENTITY);
     v.setCloud(cloud);
+    v.setCameras(headerCameras(cloud.header));
     v.setLayer('points', true);  // applies every layer's state (no scene here: no segmentation layer)
     v.resize();
     v.resetView();

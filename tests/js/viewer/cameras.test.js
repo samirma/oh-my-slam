@@ -2,7 +2,7 @@
 // at their poses, listed with their centres, and the viewpoint "Go to" moves to (spec §2.5).
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
-import { buildFrustums, cameraRows, cameraView, fmtCoord, FRAME_COLOR, poseMatrix } from '../../../src/oh_my_slam/viewer/static/lib/cameras.js';
+import { buildFrustums, cameraLabel, cameraRows, cameraView, fmtCoord, FRAME_COLOR, frustumColor, KIND_COLORS, poseMatrix } from '../../../src/oh_my_slam/viewer/static/lib/cameras.js';
 
 // a camera as api/meta lists it: T camera-to-scene (row-major, OpenCV axes)
 function camera(T, extra = {}) {
@@ -39,6 +39,29 @@ describe('buildFrustums', () => {
     expect([0, 4, 8, 12].map(at)).toEqual(Array(4).fill([1, 2, 3]));  // every ray starts at the centre
     expect([1, 5, 9, 13].map(at)).toEqual([corner(0, 0), corner(640, 0), corner(640, 480), corner(0, 480)]);
     expect([3, 7, 11, 15].map(at)).toEqual([corner(640, 0), corner(640, 480), corner(0, 480), corner(0, 0)]);
+  });
+
+  test('a result\'s cameras of a kind (located, last known) in their kind\'s colour, the scene\'s own in theirs', () => {
+    const g = buildFrustums([camera(IDENTITY), camera(TURNED, { kind: 'located', name: 'located_0' }),
+      camera(TURNED, { kind: 'located', name: 'located_1' }), camera(IDENTITY, { kind: 'last_known', name: 'last_known' }),
+      camera(IDENTITY, { kind: 'camera' })], 10);
+    expect(g.children.map((l) => [l.name, `#${l.material.color.getHexString(THREE.SRGBColorSpace)}`, l.geometry.attributes.position.count]))
+      .toEqual([['frustums', FRAME_COLOR, 32], ['frustums-located', KIND_COLORS.located, 32], ['frustums-last_known', KIND_COLORS.last_known, 16]]);
+    expect([frustumColor({}), frustumColor({ kind: 'located' }), frustumColor({ kind: 'odd' })]).toEqual([FRAME_COLOR, '#ffffff', FRAME_COLOR]);
+    expect(new Set([FRAME_COLOR, ...Object.values(KIND_COLORS)]).size).toBe(3);  // three colours apart
+  });
+
+  test('a camera of a kind is labelled with its name and kind; the scene\'s own are not', () => {
+    expect(cameraLabel(camera(IDENTITY, { kind: 'last_known', name: 'last_known' }))).toEqual({ id: 'camera-last_known', tag: 'last_known',
+      name: 'last known camera', background: KIND_COLORS.last_known, ink: '#000000', title: 'last_known: last known camera',
+      note: 'last_known last known camera', group: 'cameras' });
+    // a located camera by the input it placed (as the result's tables and its bird's-eye image
+    // number it), its name in the tooltip
+    expect(cameraLabel(camera(IDENTITY, { kind: 'located', name: 'located_2', input: 3 }))).toMatchObject({
+      tag: 'input 3', name: 'located', title: 'input 3: located (located_2)', note: 'input 3 located' });
+    expect(cameraLabel(camera(IDENTITY, { kind: 'located', name: 'odd', input: null })).tag).toBe('odd');
+    expect(cameraLabel(camera(IDENTITY))).toBeNull();
+    expect(cameraLabel(camera(IDENTITY, { kind: 'camera' }))).toBeNull();
   });
 
   test('frustums are smaller among several cameras, and never tiny', () => {
