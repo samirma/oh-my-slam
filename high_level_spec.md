@@ -13,7 +13,7 @@ The system is exposed through six shell entry points and an agent skill:
 | --- | --- |
 | `start_inference_server.sh` | Start the depth- and segmentation-inference server and any other long-lived services required for mapping. |
 | `reconstruct.sh` | Single-frame reconstruction: image → scene description (JSON + OBBs), depth image or point cloud. |
-| `mapper.sh` | Multi-frame mapping: build and update a persistent map, and locate an image's camera in it. |
+| `mapper.sh` | Multi-frame mapping: build and update a persistent map, locate an image's camera in it (or report its last known camera), and draw the map from above as a bird's-eye image. |
 | `segment.sh` | Instance segmentation: image → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
 | `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
 | `server.sh` | Web service: an HTTP API and a simple browser application that run every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` (§2.6). |
@@ -128,7 +128,10 @@ The evaluators must report at least:
   sequence is mapped, while objects that never changed keep their `id`s, labels and OBBs.
 * **Segmentation** — detections, labels and scores per frame (`restaurant.jpg` and each frame
   of both capture sequences).
-* **Contracts**, for every command — colour contract, OpenLABEL validity, stdout purity.
+* **Contracts**, for every command — colour contract, OpenLABEL validity, stdout purity; and
+  for a bird's-eye image (`mapper.sh locate -f png`), agreement with the JSON result of the
+  same call: each camera and OBB footprint is drawn where its pose or cuboid falls under the
+  image's own pixel-to-map metadata.
 
 Evaluators run as a single command, write a machine-readable result (JSON) and a
 human-readable summary, and store results outside the repository so runs can be compared

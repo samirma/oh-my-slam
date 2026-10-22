@@ -127,9 +127,10 @@ endpoint, and never need the inference server.
   video, in the order the request gives them; the response is the command's result. Needs
   the inference server, and is usually the longest request. It is the only operation that
   writes a map.
-* **Locate in a map.** Finds the camera poses of images in an existing map, without changing
-  it; the response is the command's result. Needs the inference server only when the command
-  does.
+* **Locate in a map.** Finds the camera poses of images in an existing map, or, with no
+  images, reports the map's last known camera, without changing the map; the response is the
+  command's result: the poses (JSON), a point cloud (PLY) or a bird's-eye image of the map
+  (PNG). Needs the inference server only when the command does.
 * **Remove a map.** Deletes the named map from the workspace. It is refused, with the
   service's own error, while another request reads or writes that map; a running viewer of the
   map is stopped first.
@@ -167,8 +168,8 @@ The web application is served at `/` by the same process and uses only the publi
 everything it does can also be scripted. Its forms and result pages are **rendered from the
 API description**, not written per command: a new option appears as a new field, a new error
 as a new message. It draws no map or scene itself: a map is viewed in its `view.sh` viewer,
-started and stopped from the map's page. A point-cloud result is still drawn in the page (see
-Structure).
+started and stopped from the map's page. A point-cloud result is still drawn in the page, and
+an image result (depth, segmented or bird's-eye image) is shown as received (see Structure).
 
 ### Structure
 
@@ -188,9 +189,14 @@ Structure).
   metadata), with a filter. Creating or updating a map is a guided flow over the mapping
   operation's options, with the input order visible and editable. A map's page shows its
   summary and its update history with timings, from the map's metadata, and runs the
-  operations that take a map (locating images in it), with the same result
-  display and download. It also starts or stops the map's viewer (with a link to it while it
-  runs) and removes the map, after a confirmation that states the map is deleted for good.
+  operations that take a map (locating images in it, or, with no image chosen, showing the
+  map's last known camera), with the same result display and download. Each format of the
+  locate result is shown: the bird's-eye image (PNG) as received, the point cloud (PLY) drawn
+  in 3D with the cameras its header names drawn at their poses, and the scene description
+  (JSON) with its objects and its cameras listed (position, and whether each is located, the
+  last known camera or one of the map's frames). It also starts or stops the map's viewer
+  (with a link to it while it runs) and removes the map, after a confirmation that states the
+  map is deleted for good.
 
 Every page has a stable URL, so a map's page can be bookmarked, reloaded or shared on this
 machine.
@@ -232,5 +238,6 @@ on the same reference inputs as the commands:
   the commands' definitions, so a new option or mode is covered without changing the
   evaluator.
 * **UI** — browser tests run the main flows (single-image request, a point-cloud result drawn
-  in the page, map creation and update, locating images in a map, download,
-  interruption, inference server down) and check accessibility automatically.
+  in the page, map creation and update, locating in a map with and without images and each
+  of its result formats shown, download, interruption, inference server down) and check
+  accessibility automatically.

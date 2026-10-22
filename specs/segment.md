@@ -40,7 +40,8 @@ deterministically from a fixed, perceptually distinct palette, so that the value
 `segmentation.json` (`color` / `color_hex`), the pixels of that instance's mask in
 `segmented.png`, the `color_hex` column of `catalog.csv` and the swatch of `catalog.md`, the
 per-point colour in any PLY or `view.sh` cloud coloured with
-`color=segment`, and the OBB colour rendered by `view.sh` are **the same sRGB triple**. Masks
+`color=segment`, the OBB colour rendered by `view.sh` and the OBB outline in a bird's-eye image
+(`mapper.sh locate -f png`, [§2.3](mapper.md#birds-eye-image)) are **the same sRGB triple**. Masks
 are painted opaque, and each pixel and each point belongs to at most one object, so no two
 colours ever mix.
 

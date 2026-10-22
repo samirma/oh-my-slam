@@ -70,6 +70,7 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` is read-o
   - any PLY or viewer cloud with `color=segment`; unsegmented points are
     mid-grey `#808080`
   - the OBB colour rendered by `view.sh`
+  - the OBB outline in a bird's-eye image (`mapper.sh locate -f png`)
 - **Point-cloud attributes** (`-p`, spec §2.2) are defined once in `core/cloud_attrs.py`. They are
   shared by every PLY writer and by the `view.sh` controls.
 - **Scene JSON is ASAM OpenLABEL 1.0.0** (verified online 2026-09-22):
