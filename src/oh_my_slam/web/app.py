@@ -57,7 +57,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from oh_my_slam.commands import spec
-from oh_my_slam.core.constants import START_INFERENCE_SERVER
+from oh_my_slam.core.constants import RESTART_INFERENCE_SERVER, START_INFERENCE_SERVER
 from oh_my_slam.core.errors import (
     HTTP_STATUS,
     ExitCode,
@@ -88,6 +88,7 @@ from oh_my_slam.web.viewers import ViewerError, Viewers
 from oh_my_slam.web.workspace import NotFoundError, Workspace
 
 START_COMMAND = START_INFERENCE_SERVER  # what the health names while the server is not ready
+RESTART_COMMAND = RESTART_INFERENCE_SERVER  # and while it is degraded (short of device memory)
 MAX_UPLOAD_BYTES = 8 << 30  # 8 GiB: room for a long phone video
 MIN_FREE_BYTES = 1 << 30  # an upload never leaves less than this free on the workspace's disk
 UPLOAD_CHECK_BYTES = 64 << 20  # free space is re-checked as an undeclared upload grows
@@ -152,7 +153,8 @@ def refuse(code: str, message: str, headers: Mapping[str, str] | None = None) ->
 
 
 def inference_health() -> Json:
-    """The inference server's health, or why it is down and the command that starts it."""
+    """The inference server's health, or why it is down; and the command that recovers it: none
+    while it is ready, the restart while it is degraded, else the start."""
     from oh_my_slam.client.client import InferenceClient
 
     try:
@@ -160,17 +162,19 @@ def inference_health() -> Json:
     except ServerUnavailableError as exc:
         return {"status": "down", "message": str(exc), "start_command": START_COMMAND}
     return {"status": h.status, "health": h.model_dump(),
-            "start_command": None if h.status == "ready" else START_COMMAND}
+            "start_command": {"ready": None, "degraded": RESTART_COMMAND}.get(h.status,
+                                                                             START_COMMAND)}
 
 
 def inference_problem() -> spec.Problem | None:
     """The commands' own check of the inference server (exit 3 when it is down or its models
-    failed); a server still loading is fine — the command waits for it itself."""
+    failed); a server still loading is fine — the command waits for it itself — and so is a
+    degraded one (the command warns)."""
     from oh_my_slam.client.client import InferenceClient
 
     client = InferenceClient()
     try:
-        if client.health(timeout=1.0).status in ("ready", "loading"):
+        if client.health(timeout=1.0).status in ("ready", "degraded", "loading"):
             return None
         client.require_ready(wait_loading_s=0.0)
     except OhMySlamError as exc:

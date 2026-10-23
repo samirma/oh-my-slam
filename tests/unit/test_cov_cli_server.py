@@ -443,3 +443,23 @@ def test_the_server_pid_is_the_lock_holders(capsys: pytest.CaptureFixture[str]) 
         assert "without its pid in it; not stopping an unknown process" in capsys.readouterr().err
     finally:
         lock.release()
+
+
+def test_starting_next_to_a_degraded_server_reports_its_memory_and_the_restart(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """A running server short of device memory is running: nothing is launched, the start
+    succeeds and says why it is degraded and how to restart it."""
+
+    class Degraded(Scripted):
+        def health(self, timeout: float = 0.5) -> p.Health:
+            return p.Health(status="degraded", device="mps", last_oom="RuntimeError: MPS out of memory",
+                            memory=p.DeviceMemory(allocated_gib=9.5, driver_gib=9.75,
+                                                  limit_gib=10.0))
+
+    monkeypatch.setattr(server_cli, "InferenceClient", Degraded)
+    assert server_cli.start(60.0) == 0
+    err = capsys.readouterr().err
+    assert ("already running (degraded on mps, 9.50 of 10.00 GiB in use; short of device memory "
+            "(9.50 of 10.00 GiB in use; last error: RuntimeError: MPS out of memory) — restart "
+            f"with {RESTART})") in err
+    assert not paths.server_log().exists()  # nothing launched

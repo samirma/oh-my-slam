@@ -32,7 +32,10 @@ from oh_my_slam.version import __version__
 log = logging.getLogger("oh_my_slam.server")
 
 _VERSION_PACKAGES = ("torch", "ultralytics", "moge", "geocalib", "mapanything")
-MEMORY_FRACTION = 0.7
+# The per-process MPS cap, as a fraction of Metal's recommended working set (13.3 GiB on the M4 Max
+# under macOS 27): the models' weights alone take 6.6 GiB of it, so 0.7 (9.3 GiB) left a
+# multi-view chunk too little and failed with "MPS backend out of memory".
+MEMORY_FRACTION = 1.0
 QUEUE_LIMIT = 8  # jobs waiting for the GPU thread; beyond that the server answers 503
 
 
@@ -55,6 +58,7 @@ def _load_models(state: ServerState, device: str | None) -> None:
             import torch
 
             torch.mps.set_per_process_memory_fraction(MEMORY_FRACTION)
+            state.memory_limit = torch.mps.recommended_max_memory() * MEMORY_FRACTION
         state.registry.load_all(device, log=log.info)
     finally:
         state.loading = False
@@ -85,6 +89,7 @@ def serve(make_registry: Callable[[], Registry], device: str | None = None) -> i
         worker = GpuWorker(max_queue=QUEUE_LIMIT)
         worker.start()
         state = ServerState(registry=registry, worker=worker, versions=_versions())
+        worker.after_job = state.after_job
         app = create_app(state)
 
         import uvicorn

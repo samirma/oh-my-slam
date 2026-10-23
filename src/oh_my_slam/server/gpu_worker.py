@@ -5,11 +5,14 @@ every model operation — loading, ``.to()``, forward passes, read-back and cach
 this one thread. Requests queue up to ``max_queue``; beyond that :class:`QueueFullError` (HTTP 503).
 A job that fails has its traceback's frames (and those of the exceptions chained to it) cleared
 here before its exception leaves the thread, so the device tensors they held are freed on this
-thread, not on the event loop's.
+thread, not on the event loop's. ``after_job``, when set, then runs on this thread after every
+job with the job's exception (None on success), before its future is resolved: the server frees
+and measures device memory there.
 """
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -19,6 +22,8 @@ from concurrent.futures import Future
 from typing import Any, TypeVar
 
 T = TypeVar("T")
+
+log = logging.getLogger(__name__)
 
 _STOP = object()
 
@@ -52,6 +57,7 @@ class GpuWorker:
         self._stopped = threading.Event()
         self._busy = threading.Event()
         self.thread_ident: int | None = None
+        self.after_job: Callable[[BaseException | None], None] | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -79,6 +85,13 @@ class GpuWorker:
             pass
         self._thread.join(timeout)
 
+    def _after(self, exc: BaseException | None) -> None:
+        if self.after_job is not None:
+            try:
+                self.after_job(exc)
+            except Exception:
+                log.exception("after_job failed")
+
     def _run(self) -> None:
         self.thread_ident = threading.get_ident()
         while True:
@@ -97,10 +110,13 @@ class GpuWorker:
                         "queue_s": started - enqueued,
                         "compute_s": time.perf_counter() - started,
                     }
-                fut.set_result(result)
             except BaseException as exc:
                 _clear_frames(exc)
+                self._after(exc)
                 fut.set_exception(exc)
+            else:
+                self._after(None)
+                fut.set_result(result)
             finally:
                 self._busy.clear()
         # fail anything left

@@ -19,6 +19,7 @@ SERVICE_PORT = 9091
 CHECKOUT = "./"
 INFERENCE_SERVER_PROG = "start_inference_server.sh"
 START_INFERENCE_SERVER = CHECKOUT + INFERENCE_SERVER_PROG
+RESTART_INFERENCE_SERVER = f"{START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}"
 
 # reconstruct.sh -f depth (spec §2.2): a 16-bit PNG whose pixel value is the metric depth along the
 # optical axis times DEPTH_UNITS_PER_METRE (1/256 m ≈ 3.9 mm steps, up to 255.996 m), NO_DEPTH

@@ -70,6 +70,11 @@ def test_a_ready_inference_server_needs_no_start_command(monkeypatch: pytest.Mon
     answers(monkeypatch, "loading")  # still loading: the top bar keeps the command that starts it
     h = web_app.inference_health()
     assert h["status"] == "loading" and h["start_command"] == web_app.START_COMMAND
+    answers(monkeypatch, "degraded")  # short of device memory: the restart recovers it
+    h = web_app.inference_health()
+    assert h["status"] == "degraded" and h["start_command"] == (
+        "./start_inference_server.sh --stop && ./start_inference_server.sh")
+    assert web_app.inference_problem() is None  # its operations are still accepted
 
 
 def test_a_server_that_became_ready_while_it_was_checked_is_no_problem(

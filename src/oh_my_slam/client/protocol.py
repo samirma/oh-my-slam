@@ -17,7 +17,10 @@ ROUTE_GRAVITY = "/v1/gravity"
 ROUTE_SEGMENT = "/v1/segment"
 ROUTE_MULTIVIEW = "/v1/multiview"
 
-ServerStatus = Literal["loading", "ready", "error", "stopping"]
+# ``degraded``: the models are loaded, but the last job ran out of device memory or the memory
+# still in use after it is near the cap (``Health.memory``); requests are accepted and may fail
+# until a restart frees the memory.
+ServerStatus = Literal["loading", "ready", "degraded", "error", "stopping"]
 
 # Long side at which the server reads a request's image (``core.images.load_rgb``): the request's
 # ``max_side`` for geometry and detection, these for gravity and multi-view (the server's model
@@ -33,6 +36,16 @@ class ModelStatus(BaseModel):
     detail: str | None = None
 
 
+class DeviceMemory(BaseModel):
+    """The device's memory after the last job (taken on the GPU thread), in GiB: in use by
+    tensors (what the cap is checked against), held from the driver (in use, cached and the
+    frameworks' own), and the per-process cap."""
+
+    allocated_gib: float
+    driver_gib: float
+    limit_gib: float
+
+
 class Health(BaseModel):
     status: ServerStatus
     models: dict[str, ModelStatus] = Field(default_factory=dict)
@@ -44,10 +57,20 @@ class Health(BaseModel):
     queue_depth: int = 0
     queue_limit: int = 8
     uptime_s: float = 0.0
+    memory: DeviceMemory | None = None  # None until a job has run on MPS
+    last_oom: str | None = None  # the last out-of-memory error since the start
 
     def failures(self) -> str:
         """The models that failed to load, as ``name: error`` joined by ``; `` (empty if none)."""
         return "; ".join(f"{m.name}: {m.error}" for m in self.models.values() if m.error)
+
+    def memory_note(self) -> str:
+        """Why the server is ``degraded``: the device memory in use against the cap, and the last
+        out-of-memory error ("no detail" if neither is known)."""
+        notes = [] if self.memory is None else [
+            f"{self.memory.allocated_gib:.2f} of {self.memory.limit_gib:.2f} GiB in use"]
+        notes += [] if self.last_oom is None else [f"last error: {self.last_oom}"]
+        return "; ".join(notes) or "no detail"
 
 
 class Timings(BaseModel):

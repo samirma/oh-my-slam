@@ -278,3 +278,19 @@ def test_connect_shares_one_client_and_checks_the_server_each_time(
     monkeypatch.setattr(InferenceClient, "require_ready", ready)
     assert client_mod.connect() is first and client_mod.connect() is first
     assert checked == [first, first]
+
+
+def test_a_degraded_server_is_used_with_a_warning_naming_the_restart(sock: Path) -> None:
+    """Short of device memory, the server still takes requests (they may succeed): the command
+    goes on, warning why and how to restart it should it fail."""
+    lines: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: lines.append(record.getMessage())  # type: ignore[method-assign]
+    client_mod.log.addHandler(handler)
+    try:
+        assert served(sock, health("degraded")).require_ready().status == "degraded"
+    finally:
+        client_mod.log.removeHandler(handler)
+    assert lines == ["inference server is short of device memory (no detail) — if this fails, "
+                     "restart it with ./start_inference_server.sh --stop && "
+                     "./start_inference_server.sh"]

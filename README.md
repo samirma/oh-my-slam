@@ -74,7 +74,7 @@ When two starts run at once, both end with the one server that got the single-in
 
 | Option | Effect |
 |---|---|
-| `--status` | Prints `/health` as JSON on stdout: status (`loading`, `ready`, `error` when a model failed to load, or `stopping`), device, precision, and each model's load state. Exits 3 if the server is not running. |
+| `--status` | Prints `/health` as JSON on stdout: status (`loading`, `ready`, `degraded` when it is short of device memory, `error` when a model failed to load, or `stopping`), device, precision, each model's load state, the device memory after the last request (`memory`: GiB in use, held from the driver, and the cap) and the last out-of-memory error (`last_oom`). Exits 3 if the server is not running. |
 | `--stop` | Stops the server and removes its socket and state file. The server is the process that holds the single-instance lock: a state file left by a server that crashed is removed, and the process its pid may name since is never signalled. |
 
 The server log is `~/Library/Caches/oh-my-slam/server.log`. [Inference server](#inference-server)
@@ -623,7 +623,7 @@ option.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/health` | Service and inference health, and the requests running and waiting (counts, and each one in `in_progress`). When the inference server is down, the response includes `start_command`. |
+| `GET /api/health` | Service and inference health, and the requests running and waiting (counts, and each one in `in_progress`). When the inference server is down, the response includes `start_command`; while it is `degraded` (short of device memory), `start_command` is the restart. |
 | `GET /api/openapi.json` | The OpenAPI document. |
 | `POST /api/ops/<op>` | Run an operation; the answer is its result, with `Server-Timing`. |
 | `POST /api/ops/<op>/validate` | Check a request; nothing runs. |
@@ -1491,7 +1491,13 @@ answers immediately, even while the models load. It loads four models:
 | YOLOE-26x-seg with the MobileCLIP2-B text encoder | Open-vocabulary instance masks over `segmentation/data/default_labels.txt`, a curated list of LVIS and COCO nouns. |
 | MapAnything (Apache-2.0 checkpoint) | Metric multi-view poses, used as a fallback. |
 
-The device is MPS when available, else the CPU, with a per-process MPS memory cap of 70 %. MPS is not thread-safe, so every model call runs on one GPU worker
+The device is MPS when available, else the CPU, with a per-process MPS memory cap of 100 % of Metal's
+recommended working set (13.3 GiB on the M4 Max under macOS 27; the weights take 6.6 GiB of it,
+and the former 70 % left a multi-view chunk too little). After each request the GPU thread measures the
+memory; after a failed one, or with the memory in use at 90 % of the cap or more, it first frees
+Python's cycles and the allocator's cache. The server is `degraded` while the last request ran out of
+memory or the memory in use stays at 90 % of the cap or more: requests are still accepted (the commands
+warn), and `GET /api/health` names the restart. MPS is not thread-safe, so every model call runs on one GPU worker
 thread (loading, warm-up and every request; a failed request's traceback frames are cleared there,
 so the tensors they held are freed on that thread too). The queue holds 8 jobs; beyond that the
 server answers HTTP 503 and the client retries.

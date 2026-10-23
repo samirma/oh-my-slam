@@ -1,12 +1,15 @@
 """FastAPI application: a non-blocking ``/health`` and one POST route per model.
 
 Every model call is handed to the single :class:`GpuWorker`; the HTTP event loop only awaits
-futures, so ``/health`` never waits on the device.
+futures, so ``/health`` never waits on the device. After every job the worker calls
+:meth:`ServerState.after_job` on its thread, which frees and measures the device memory that
+``/health`` reports (``memory``, ``last_oom`` and the ``degraded`` status).
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import time
 from collections.abc import Callable
@@ -22,6 +25,24 @@ from oh_my_slam.server.gpu_worker import GpuWorker, QueueFullError, WorkerStoppe
 from oh_my_slam.server.models import Registry
 from oh_my_slam.version import PROTOCOL_VERSION
 
+GIB = float(1 << 30)
+# Memory still in use after a job, as a fraction of the cap, from which the server is degraded
+# (a request then has under a tenth of the cap for its own tensors), and from which a successful
+# job also releases the allocator's cache.
+NEAR_LIMIT = 0.9
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    """MPS's "MPS backend out of memory", torch's OutOfMemoryError, or a MemoryError."""
+    return isinstance(exc, MemoryError) or "out of memory" in str(exc).lower()
+
+
+def device_memory(torch: Any, limit: float) -> p.DeviceMemory:
+    """The MPS memory now (GPU thread only), against the cap ``limit`` in bytes."""
+    return p.DeviceMemory(allocated_gib=torch.mps.current_allocated_memory() / GIB,
+                          driver_gib=torch.mps.driver_allocated_memory() / GIB,
+                          limit_gib=limit / GIB)
+
 
 @dataclass
 class ServerState:
@@ -31,13 +52,42 @@ class ServerState:
     loading: bool = True
     stopping: bool = False
     versions: dict[str, str] = field(default_factory=dict)
+    memory_limit: float = 0.0  # the MPS cap in bytes (set when the models load on MPS)
+    memory: p.DeviceMemory | None = None
+    last_oom: str | None = None
+    last_job_oom: bool = False
 
     def status(self) -> str:
         if self.stopping:
             return "stopping"
         if self.loading:
             return "loading"
-        return self.registry.status()
+        status = self.registry.status()
+        if status == "ready" and (self.last_job_oom or self._near_limit(self.memory)):
+            return "degraded"
+        return status
+
+    @staticmethod
+    def _near_limit(mem: p.DeviceMemory | None) -> bool:
+        return mem is not None and mem.allocated_gib >= NEAR_LIMIT * mem.limit_gib
+
+    def after_job(self, exc: BaseException | None) -> None:
+        """On the GPU thread after every job: records an out-of-memory failure, and on MPS frees
+        what the job left (Python's cycles and the allocator's cache) after a failure or when the
+        memory in use is near the cap, then measures the memory."""
+        self.last_job_oom = exc is not None and is_out_of_memory(exc)
+        if self.last_job_oom:
+            self.last_oom = f"{type(exc).__name__}: {exc}"
+        if self.registry.device != "mps" or not self.memory_limit:
+            return
+        import torch
+
+        mem = device_memory(torch, self.memory_limit)
+        if exc is not None or self._near_limit(mem):
+            gc.collect()
+            torch.mps.empty_cache()
+            mem = device_memory(torch, self.memory_limit)
+        self.memory = mem
 
     def health(self) -> p.Health:
         reg = self.registry
@@ -61,6 +111,8 @@ class ServerState:
             queue_depth=self.worker.depth,
             queue_limit=self.worker.max_queue,
             uptime_s=time.time() - self.started_at,
+            memory=self.memory,
+            last_oom=self.last_oom,
         )
 
 

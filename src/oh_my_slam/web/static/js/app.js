@@ -101,11 +101,12 @@ function drawHealth() {
   ws.textContent = h.service.workspace;
   ws.title = h.service.data;
   const s = h.inference.status;
-  const up = s === 'ready' || s === 'loading';
+  const up = s === 'ready' || s === 'loading' || s === 'degraded';
   inf.replaceChildren(el('span', { class: `pill ${s === 'ready' ? 'up' : up ? 'loading' : 'down'}`, 'data-testid': 'inference-status' },
-    s === 'ready' ? '● ready' : s === 'loading' ? '◐ loading' : `○ ${s}`));
-  if (!up && h.inference.start_command) {
-    inf.append(el('span', { class: 'start' }, ' start it with ', el('code', { 'data-testid': 'start-command' }, h.inference.start_command)));
+    s === 'ready' ? '● ready' : s === 'loading' ? '◐ loading' : s === 'degraded' ? '◑ degraded' : `○ ${s}`));
+  if (h.inference.start_command && (!up || s === 'degraded')) {
+    const why = s === 'degraded' ? ' short of device memory — restart it with ' : ' start it with ';
+    inf.append(el('span', { class: 'start' }, why, el('code', { 'data-testid': 'start-command' }, h.inference.start_command)));
   }
   document.body.dataset.inference = up ? 'up' : 'down';
   const c = h.service.requests || { running: 0, waiting: 0 };

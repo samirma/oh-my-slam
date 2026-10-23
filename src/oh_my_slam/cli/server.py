@@ -33,6 +33,7 @@ from oh_my_slam.commands import spec
 from oh_my_slam.commands.entry_points import INFERENCE_SERVER
 from oh_my_slam.commands.parser import ArgumentParser, run_main
 from oh_my_slam.core import paths
+from oh_my_slam.core.constants import RESTART_INFERENCE_SERVER
 from oh_my_slam.core.errors import (
     ServerModelsFailedError,
     ServerProtocolError,
@@ -56,7 +57,13 @@ def _server_cmd() -> list[str]:
 
 
 def _describe(h: p.Health) -> str:
-    return f"{h.status} on {h.device}"
+    """The status and device, with the memory in use, and for ``degraded`` why and the restart."""
+    out = f"{h.status} on {h.device}"
+    if h.memory is not None:
+        out += f", {h.memory.allocated_gib:.2f} of {h.memory.limit_gib:.2f} GiB in use"
+    if h.status == "degraded":
+        out += f"; short of device memory ({h.memory_note()}) — restart with {RESTART_INFERENCE_SERVER}"
+    return out
 
 
 def _models_failed(h: p.Health) -> str:
@@ -104,7 +111,7 @@ def start(timeout: float) -> int:
     if h is not None and h.status != "stopping" and h.protocol != PROTOCOL_VERSION:
         _say(f"already running, but {ServerProtocolError(h.protocol, PROTOCOL_VERSION)}")
         return 1
-    if h is not None and h.status == "ready":
+    if h is not None and h.status in ("ready", "degraded"):
         _say(f"already running ({_describe(h)})")
         return 0
     if h is not None and h.status == "error":
@@ -138,7 +145,7 @@ def _wait_ready(client: InferenceClient, proc: subprocess.Popen[bytes] | None, t
             _say("another start launched a server first; waiting for it")
             proc = None
         h = _health(client, 1.0)
-        if h is not None and h.status == "ready":
+        if h is not None and h.status in ("ready", "degraded"):
             _say(f"ready after {elapsed:.1f} s ({_describe(h)})")
             return 0
         if h is not None and h.status == "error":

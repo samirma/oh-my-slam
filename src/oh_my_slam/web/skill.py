@@ -624,8 +624,10 @@ The example is `{{op}}`; every operation works the same way.
 
 1. **Check the service** and the inference server: `curl -sS "$BASE/api/health"`.
    `inference.status` is one of {{statuses}}; an operation that needs the inference server is
-   accepted while it is `ready` or `loading`, and otherwise `inference.start_command` names the
-   command that starts it (see [Rules](#rules)). `service.requests` counts the requests `running`
+   accepted while it is `ready`, `degraded` or `loading`, and otherwise `inference.start_command`
+   names the command that starts it (see [Rules](#rules)). `degraded` means it is short of device
+   memory (`inference.health.memory`, `inference.health.last_oom`): operations may fail with an
+   out-of-memory error, and `inference.start_command` then names the restart, for the user to run. `service.requests` counts the requests `running`
    and those `waiting` for their turn.
 2. **Upload each input file**, or name a path inside the workspace instead. The body is the raw
    file, sent with `curl -T <file>` (a form, `curl -F`, is refused with {{form}}); `name` is the

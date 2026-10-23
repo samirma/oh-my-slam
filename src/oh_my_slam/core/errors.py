@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-from oh_my_slam.core.constants import START_INFERENCE_SERVER
+from oh_my_slam.core.constants import RESTART_INFERENCE_SERVER, START_INFERENCE_SERVER
 
 
 class ExitCode(IntEnum):
@@ -123,7 +123,7 @@ class ServerModelsFailedError(ServerUnavailableError):
         OhMySlamError.__init__(
             self,
             f"inference server models failed to load ({failed}) — see {log_path}, fix the cause, "
-            f"then restart with {START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}",
+            f"then restart with {RESTART_INFERENCE_SERVER}",
         )
 
 
@@ -160,7 +160,7 @@ class ServerProtocolError(ServerUnavailableError):
             self,
             f"the running inference server speaks protocol {server}, this version needs "
             f"{client} (it was started before an upgrade) — restart it with "
-            f"{START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}",
+            f"{RESTART_INFERENCE_SERVER}",
         )
 
 

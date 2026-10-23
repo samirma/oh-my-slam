@@ -131,16 +131,29 @@ def make_torch(mps_available: bool = False) -> types.ModuleType:
     def normalize(t: Tensor, dim: int = -1) -> Tensor:
         return t._new(t.a / np.linalg.norm(t.a, axis=dim, keepdims=True))
 
+    # the MPS memory in bytes the allocator reports; ``empty_cache`` brings what is in use down to
+    # ``freed_to`` when it is set (what a failed job's tensors held)
+    memory: dict[str, Any] = {"allocated": 0, "driver": 0, "recommended": 16 << 30,
+                              "freed_to": None}
+
+    def empty_cache() -> None:
+        calls.append(("empty_cache",))
+        if memory["freed_to"] is not None:
+            memory["allocated"] = memory["driver"] = memory["freed_to"]
+
     mps = _module("torch.mps",
-                  empty_cache=lambda: calls.append(("empty_cache",)),
-                  set_per_process_memory_fraction=lambda f: calls.append(("memory_fraction", f)))
+                  empty_cache=empty_cache,
+                  set_per_process_memory_fraction=lambda f: calls.append(("memory_fraction", f)),
+                  current_allocated_memory=lambda: memory["allocated"],
+                  driver_allocated_memory=lambda: memory["driver"],
+                  recommended_max_memory=lambda: memory["recommended"])
     backends = _module("torch.backends",
                        mps=_module("torch.backends.mps", is_available=lambda: mps_available))
     functional = _module("torch.nn.functional", normalize=normalize)
     return _module("torch", Tensor=Tensor, device=Device, from_numpy=lambda a: Tensor(a),
                    tensor=tensor, rand=rand, inference_mode=inference_mode, mps=mps,
                    backends=backends, nn=_module("torch.nn", functional=functional),
-                   calls=calls, state=state)
+                   calls=calls, state=state, memory=memory)
 
 
 def libraries(contents: dict[str, dict[str, Any]]) -> dict[str, types.ModuleType]:

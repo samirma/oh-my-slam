@@ -80,10 +80,11 @@ class Store {
     this._healthTimer = setTimeout(() => this.pollHealth(), this.active ? HEALTH_POLL_BUSY_MS : HEALTH_POLL_MS);
   }
 
-  // whether the inference server can take requests (a loading server is fine: commands wait)
+  // whether the inference server can take requests (a loading server is fine: commands wait; a
+  // degraded one, short of device memory, takes them and may fail)
   get inferenceUp() {
     const s = this.health?.inference?.status;
-    return s === 'ready' || s === 'loading';
+    return s === 'ready' || s === 'loading' || s === 'degraded';
   }
 
   get startCommand() { return this.health?.inference?.start_command || null; }

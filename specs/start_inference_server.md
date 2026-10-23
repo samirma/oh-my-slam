@@ -16,5 +16,7 @@ fail with a clear, actionable error if the server is not running. Operations on 
 persisted map (`view.sh -m`) must not require the inference server.
 
 * `--status` — print the server's health JSON on stdout; fail with the server-unavailable
-  error if it is not running.
+  error if it is not running. The health reports the device memory in use against the server's
+  cap, and the status `degraded` (not `ready`) while the last operation ran out of device memory
+  or the memory in use is near the cap, with that error and the restart that recovers it.
 * `--stop` — stop a running server.

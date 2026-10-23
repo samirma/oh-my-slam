@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.images import request_image
 from oh_my_slam.core import paths, timing
+from oh_my_slam.core.constants import RESTART_INFERENCE_SERVER
 from oh_my_slam.core.errors import (
     InferenceError,
     InputError,
@@ -82,9 +83,10 @@ class InferenceClient:
 
     def require_ready(self, wait_loading_s: float = LOADING_WAIT_S) -> p.Health:
         """Fail fast if the server is down or speaks another protocol (started before an
-        upgrade); wait (bounded) while it is still loading. Each status but ``ready`` has its own
-        actionable error (exit 3): down, other protocol, models failed, still loading after the
-        wait, stopping."""
+        upgrade); wait (bounded) while it is still loading. ``degraded`` (short of device memory)
+        is accepted with a warning naming the restart; every other status but ``ready`` has its
+        own actionable error (exit 3): down, other protocol, models failed, still loading after
+        the wait, stopping."""
         h = self.health()
         if h.protocol != PROTOCOL_VERSION:
             raise ServerProtocolError(h.protocol, PROTOCOL_VERSION)
@@ -97,6 +99,10 @@ class InferenceClient:
             time.sleep(1.0)
             h = self.health()
         if h.status == "ready":
+            return h
+        if h.status == "degraded":
+            log.warning("inference server is short of device memory (%s) — if this fails, "
+                        "restart it with %s", h.memory_note(), RESTART_INFERENCE_SERVER)
             return h
         if h.status == "error":
             raise ServerModelsFailedError(h.failures() or "no detail", str(paths.server_log()))
