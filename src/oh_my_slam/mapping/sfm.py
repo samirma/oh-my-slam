@@ -42,6 +42,20 @@ log = get_logger("oh_my_slam.sfm")
 MIN_PLACED_FRACTION = 0.6
 ROTATION_PAIR_FRACTION = 0.5
 ROTATION_BASELINE_RATIO = 0.02
+# COLMAP leaves a verified pair PLANAR_OR_PANORAMIC when a homography holds nearly as many of its
+# matches as the essential matrix: a camera turning in place, or one plane holding the matches. A
+# plane seen from places centimetres apart is no turn: a robot arm's wrist camera circling a granite
+# worktop 0.2-0.6 m away (dev_arm_tiers: 60 photos, 3.8 cm and 10° between neighbours) had 535 of
+# its 598 pairs left so, their parallax 6.9° (median, from the arm's kinematics), and went to the
+# multi-view fallback as a pan (rotation_fraction 0.89); strafing past it, its orientation held
+# (dev_arm_strafe: 5 cm steps), 0.68. Such a pair counts as a turn only when one rotation through
+# the cameras explains its matches within ROTATION_FIT_DEG (``turn_residual_deg``): 26 % of the
+# worktop's pairs and 47 % of the strafe's, which leaves them 0.23 and 0.32, and 95 % of those of
+# ainex-captures, a robot head panning in place (0.75 of its pairs: 0.72 with its focal length
+# prior 20 % short; its first 26 frames 0.68). COLMAP's own resolution of such pairs (their
+# relative pose and triangulation angle) took ainex's for planes too: 761 of 761, 41° (median).
+ROTATION_FIT_DEG = 1.0
+ROTATION_FIT_MATCHES = 200  # matches per pair the rotation is fitted to (evenly subsampled)
 MAX_FEATURES = 4096
 SIFT_UNDOUBLED_VIDEO_SIDE = 1600  # Sfm.extract
 
@@ -360,6 +374,19 @@ def vet(model: SfmModel, rotation_pairs: set[frozenset[str]]) -> dict[str, list[
 # the global mapper's 6-photo office map placed one 0.43° off (0.26° with its neighbours' pairs).
 MAX_EPIPOLAR_DEG = 0.25
 EPIPOLAR_MIN_MATCHES = 50
+
+
+def turn_residual_deg(rays_a: NDArray[Any], rays_b: NDArray[Any]) -> float:
+    """Median angle (degrees) between the unit rays ``rays_b`` and the matched ``rays_a`` (n, 3)
+    turned by the rotation that maps them best, fitted again without the rays beyond 2.5 times
+    the median: the matches a camera turning in place leaves explain themselves."""
+    keep = np.ones(len(rays_a), bool)
+    for _ in range(3):
+        U, _, Vt = np.linalg.svd(rays_b[keep].T @ rays_a[keep])
+        R = U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+        off = np.degrees(np.arccos(np.clip(np.sum(rays_b * (rays_a @ R.T), axis=1), -1.0, 1.0)))
+        keep = off <= 2.5 * np.median(off[keep])
+    return float(np.median(off))
 
 
 def epipolar_deg(Ta: Pose, Ka: Intrinsics, Tb: Pose, Kb: Intrinsics, uv_a: NDArray[Any],
@@ -701,27 +728,60 @@ class Sfm:
             db.close()
         return {"pairs": len(todo), "verified_before": int(before), "verified_after": int(after)}
 
-    def two_view_stats(self, names: set[str] | None = None) -> dict[str, float]:
+    def _verified_turns(self, min_inliers: int = 15, names: set[str] | None = None
+                        ) -> list[tuple[frozenset[str], int, bool]]:
+        """(image names, two-view configuration, whether the camera turned in place) of every
+        verified pair (among ``names``): PANORAMIC, or PLANAR_OR_PANORAMIC with matches that one
+        rotation through the pair's cameras explains within ``ROTATION_FIT_DEG``."""
         import pycolmap
 
         db = pycolmap.Database.open(str(self.db))
         try:
-            id_name = {im.image_id: im.name for im in db.read_all_images()}
+            images = {im.image_id: im for im in db.read_all_images()}
+            cameras = {c.camera_id: c for c in db.read_all_cameras()}
             pair_ids, geoms = db.read_two_view_geometries()
+            keypoints: dict[int, NDArray[np.float64]] = {}
+
+            def rays(i: int, idx: NDArray[Any]) -> NDArray[np.float64]:
+                if i not in keypoints:
+                    keypoints[i] = np.asarray(db.read_keypoints(i), np.float64)[:, :2]
+                xy = cameras[images[i].camera_id].cam_from_img(keypoints[i][idx])
+                r = np.column_stack([xy, np.ones(len(xy))])
+                return np.asarray(r / np.linalg.norm(r, axis=1, keepdims=True))
+
+            out = []
+            for pid, g in zip(pair_ids, geoms, strict=True):
+                a, b = pycolmap.pair_id_to_image_pair(int(pid))
+                if len(g.inlier_matches) < min_inliers or a not in images or b not in images:
+                    continue
+                pair = frozenset((images[a].name, images[b].name))
+                if names is not None and not pair <= names:
+                    continue
+                config = int(g.config)
+                turn = config == _PANORAMIC
+                if config == _PLANAR_OR_PANORAMIC:
+                    m = np.asarray(g.inlier_matches)
+                    m = m[np.linspace(0, len(m) - 1, min(len(m), ROTATION_FIT_MATCHES)).astype(int)]
+                    turn = turn_residual_deg(rays(a, m[:, 0]), rays(b, m[:, 1])) <= ROTATION_FIT_DEG
+                out.append((pair, config, turn))
         finally:
             db.close()
+        return out
+
+    def two_view_stats(self, names: set[str] | None = None) -> dict[str, float]:
+        """The verified pairs among ``names``, and the share of them that turned in place
+        (``_verified_turns``), that COLMAP took for planes, or left planar or panoramic."""
         configs: Counter[int] = Counter()
-        for pid, g in zip(pair_ids, geoms, strict=True):
-            a, b = pycolmap.pair_id_to_image_pair(int(pid))
-            if names is not None and not (id_name.get(a) in names and id_name.get(b) in names):
-                continue
-            if len(g.inlier_matches) >= 15:
-                configs[int(g.config)] += 1
+        turns = 0
+        for _, config, turn in self._verified_turns(names=names):
+            configs[config] += 1
+            turns += turn
         total = sum(configs.values())
-        rot = configs[_PANORAMIC] + configs[_PLANAR_OR_PANORAMIC]
         return {"verified_pairs": float(total),
-                "rotation_fraction": rot / total if total else 0.0,
-                "planar_fraction": configs[_PLANAR] / total if total else 0.0}
+                "rotation_fraction": turns / total if total else 0.0,
+                "planar_fraction": configs[_PLANAR] / total if total else 0.0,
+                "planar_or_panoramic_fraction":
+                    configs[_PLANAR_OR_PANORAMIC] / total if total else 0.0}
 
     def verified_pairs(self, min_inliers: int = 15) -> dict[frozenset[str], tuple[int, int]]:
         """(inlier matches, two-view configuration) of every verified image pair."""
@@ -741,9 +801,8 @@ class Sfm:
         return out
 
     def rotation_pairs(self, min_inliers: int = 15) -> set[frozenset[str]]:
-        """Verified pairs whose two-view geometry is a pure rotation (panoramic)."""
-        return {p for p, (_, c) in self.verified_pairs(min_inliers).items()
-                if c in (_PANORAMIC, _PLANAR_OR_PANORAMIC)}
+        """Verified pairs whose two-view geometry is a pure rotation (``_verified_turns``)."""
+        return {p for p, _, turn in self._verified_turns(min_inliers) if turn}
 
     def match_graph(self, min_inliers: int = 15) -> dict[str, set[str]]:
         """Adjacency of verified image pairs (by image name)."""
@@ -842,11 +901,11 @@ class Sfm:
 
     def map_incremental(self, out: Path, input_path: Path | None = None,
                         fix_existing: bool = False, constant_cameras: set[int] | None = None,
-                        hold_focal: bool = False) -> SfmModel | None:
+                        hold_focal: bool = False, seed: int | None = None) -> SfmModel | None:
         """Incremental mapping; with ``input_path``, an extension of that reconstruction (its
         frames fixed with ``fix_existing``, the intrinsics of ``constant_cameras`` held), with a
         fixed random seed so that the same input extends a map the same way. ``hold_focal``: the
-        cameras keep their (prior) focal length."""
+        cameras keep their (prior) focal length. ``seed``: COLMAP's random seed (else by time)."""
         import pycolmap
 
         opts = pycolmap.IncrementalPipelineOptions()
@@ -855,6 +914,8 @@ class Sfm:
         opts.structure_less_registration_fallback = True
         opts.num_threads = SFM_THREADS
         opts.ba_refine_focal_length = not hold_focal
+        if seed is not None:
+            opts.random_seed = seed
         if self.only is not None:
             opts.image_names = self.only
         if input_path:

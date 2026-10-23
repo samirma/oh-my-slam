@@ -233,8 +233,10 @@ class FakeSfm:
     global_model: FakeModel | None = None
     incremental_model: FakeModel | None = None
     held_model: FakeModel | None = None  # incremental mapping with the focal length held
+    planar_or_panoramic = 0.0  # the share of verified pairs COLMAP left planar or panoramic
     component: ClassVar[set[str]] = set()
     held: ClassVar[list[bool]] = []
+    mapped: ClassVar[list[str]] = []  # the mappers run, in order
 
     def __init__(self, db: Path, image_dir: Path, work: Path) -> None:
         self.db = db
@@ -247,7 +249,8 @@ class FakeSfm:
         return len(pairs)
 
     def two_view_stats(self, names: set[str] | None = None) -> dict[str, float]:
-        return {"verified_pairs": 10.0, "rotation_fraction": 0.0, "planar_fraction": 0.0}
+        return {"verified_pairs": 10.0, "rotation_fraction": 0.0, "planar_fraction": 0.0,
+                "planar_or_panoramic_fraction": self.planar_or_panoramic}
 
     def largest_component(self, names: set[str]) -> set[str]:
         return set(self.component)
@@ -256,12 +259,14 @@ class FakeSfm:
         return set()
 
     def map_global(self, out: Path) -> FakeModel | None:
+        FakeSfm.mapped.append("global")
         return self.global_model
 
     def map_incremental(self, out: Path, **kw: Any) -> FakeModel | None:
         if kw.get("hold_focal"):
             FakeSfm.held.append(True)
             return self.held_model
+        FakeSfm.mapped.append("incremental")
         return self.incremental_model
 
     def triangulate_with_poses(self, poses: dict[str, Pose], out: Path,
@@ -347,6 +352,79 @@ def test_sfm_of_a_lens_turning_in_place_is_a_pan_from_one_spot(
     model = api._run_sfm(sfm_chain.ctx, False, None, msgs.append)
     assert model.method == "multiview" and sfm_chain.seen["rotation"] is True
     assert model.notes["reason"] == "a pan from one spot through a lens with distortion"
+
+
+def test_photos_a_plane_holds_together_are_mapped_incrementally_first(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """dev_arm_tiers: a worktop holds most matches, which leaves the global mapper's relative
+    poses ambiguous; incremental mapping runs first, from fixed seeds until a model none of whose
+    keyframes its matches contradict, the global mapper only if none places enough. A video
+    keeps the global mapper first."""
+    names = [jpg(i) for i in range(4)]
+    models = {0: FakeModel(line(names)), 1: FakeModel(line(names)), 2: FakeModel(line(names[:1]))}
+    contradicting = {id(models[0]): {jpg(1): 0.5, jpg(2): 0.6}}
+    mapped: list[Any] = []
+    returned: list[Any] = []
+
+    def incremental(self: Any, out: Path, **kw: Any) -> FakeModel | None:
+        mapped.append(kw["seed"])
+        returned.append(models.get(kw["seed"]))
+        return returned[-1]
+
+    monkeypatch.setattr(FakeSfm, "planar_or_panoramic", 0.9)
+    monkeypatch.setattr(FakeSfm, "mapped", mapped)
+    monkeypatch.setattr(FakeSfm, "map_incremental", incremental)
+    monkeypatch.setattr(FakeSfm, "global_model", FakeModel(line(names)))
+    monkeypatch.setattr(FakeSfm, "component", set(names))
+    monkeypatch.setattr(api, "_contradicting",  # of the model just mapped
+                        lambda sfm, poses, K, judged: contradicting.get(id(returned[-1]), {}))
+    monkeypatch.setattr(api, "_strengthen_weak_links", lambda *a: None)
+    monkeypatch.setattr(api, "_metric_scale_known", lambda model, ctx: True)
+    monkeypatch.setattr(api, "_complete_registration", lambda sfm, model, names, work: model)
+    monkeypatch.setattr(api, "_vet", lambda ctx, model, turns: None)
+    monkeypatch.setattr(api, "_join_unplaced", lambda ctx, sfm, model, *a: model)
+    # seed 0: two keyframes its matches contradict; seed 1: none, kept
+    assert api._run_sfm(sfm_chain.ctx, False, None, quiet) is models[1]
+    assert mapped == [0, 1] and sfm_chain.ctx.notes["sfm_plane_seeds"] == {"0": "2 of 4",
+                                                                           "1": "0 of 4"}
+    assert models[1].notes["matches_vetted"] and "matches_vetted" not in models[0].notes
+    del models[1].notes["matches_vetted"]
+    # every seed contradicted or short: the one with most keyframes not contradicted
+    contradicting[id(models[1])] = {jpg(3): 0.4}
+    mapped.clear()
+    assert api._run_sfm(sfm_chain.ctx, False, None, quiet) is models[1]
+    assert mapped == [0, 1, 2] and "matches_vetted" not in models[1].notes
+    # no seed gives a model: the global mapper
+    models.clear()
+    mapped.clear()
+    assert api._run_sfm(sfm_chain.ctx, False, None, quiet).registered == names
+    assert mapped == [0, 1, 2, "global"]
+    assert sfm_chain.ctx.notes["sfm_plane_seeds"] == {"0": "none", "1": "none", "2": "none"}
+    mapped.clear()
+    api._run_sfm(sfm_chain.ctx, True, None, quiet)  # a video
+    assert mapped == ["global"]
+
+
+def test_a_video_is_never_a_pan_through_a_lens(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """e141: a robot sliding along a flat wall shifts the image as a pan would; its SfM poses
+    stand, and the multi-view fallback's keyframes keep their centres."""
+    monkeypatch.setattr(FakeSfm, "global_model", FakeModel(line([jpg(i) for i in range(4)])))
+    monkeypatch.setattr(FakeSfm, "component", {jpg(i) for i in range(4)})
+    monkeypatch.setattr(api, "_strengthen_weak_links", lambda *a: None)
+    monkeypatch.setattr(api, "_turns_through_lens",
+                        lambda ctx, sfm, model, names: pytest.fail("a video is not a pan"))
+    monkeypatch.setattr(api, "_metric_scale_known", lambda model, ctx: True)
+    monkeypatch.setattr(api, "_complete_registration", lambda sfm, model, names, work: model)
+    monkeypatch.setattr(api, "_vet", lambda ctx, model, turns: None)
+    monkeypatch.setattr(api, "_join_unplaced", lambda ctx, sfm, model, *a: model)
+    assert api._run_sfm(sfm_chain.ctx, True, None, quiet).method != "multiview"
+    monkeypatch.setattr(FakeSfm, "global_model", None)
+    monkeypatch.setattr(FakeSfm, "incremental_model", None)
+    sfm_chain.seen["one_centre_deg"] = 0.3
+    model = api._run_sfm(sfm_chain.ctx, True, None, quiet)
+    assert model.method == "multiview" and model.notes["distortion"] == -0.3
+    assert "one_centre" not in sfm_chain.seen and "one_centre" not in sfm_chain.ctx.notes
 
 
 def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
@@ -748,6 +826,29 @@ def test_photos_outside_the_confident_depth_range_and_poses_the_dense_test_keeps
     # dense test supports
     assert api._depth_contradicted(ctx, model, names, photos=True) == {jpg(2): 1.5}  # type: ignore[arg-type]
     assert api._depth_contradicted(ctx, model, names, photos=False) == {}  # type: ignore[arg-type]
+
+
+def test_a_photo_whose_pose_the_matches_vet_is_fused_at_the_scale_of_its_own_points(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """dev_arm_tiers: in a model none of whose keyframes its matches contradict, a depth scale off
+    the map's is the depth's: the keyframe keeps its SfM pose (its depth judges none) and is
+    fused at its own points' scale, not left of low confidence."""
+    sparse = {jpg(0): GOOD, jpg(1): ScaleFit(1.5, 200, 0.05)}
+    ctx, model = _depth_world(monkeypatch, sparse, dense=GOOD)
+    api._align_depths(ctx, model)  # type: ignore[arg-type]
+    assert ctx.new[1].record.low_confidence  # not vetted
+    ctx, model = _depth_world(monkeypatch, sparse, dense=GOOD)
+    model.notes["matches_vetted"] = True
+    api._align_depths(ctx, model)  # type: ignore[arg-type]
+    assert not ctx.new[1].record.low_confidence and ctx.new[1].record.depth_scale == 1.5
+    monkeypatch.setattr(api, "_fix_blocks", lambda c, s, m, j: {})
+    monkeypatch.setattr(api, "_contradicting", lambda s, p, k, judged: {})
+    monkeypatch.setattr(api, "_deregister_contradicted",
+                        lambda c, m, n, photos: pytest.fail("judged by its depth"))
+    names = {jpg(0), jpg(1)}
+    ctx = ctx_of([nf(0), nf(1)], tmp=tmp_path)
+    out = api._join_unplaced(ctx, JoinSfm(set()), model, names, set(), False, None, quiet)  # type: ignore[arg-type]
+    assert out is model and "depth_contradicted" not in ctx.notes["sfm_join"]
 
 
 def test_deregistering_a_contradicted_keyframe_that_changes_no_other_ends_the_search(

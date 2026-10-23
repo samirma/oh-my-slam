@@ -298,14 +298,46 @@ def test_two_view_statistics_count_verified_pairs_among_the_names(tmp_path: Path
     _pair(db, a, 99, 30)  # an image the database does not hold
     s = Sfm(db, tmp_path, tmp_path / "work")
     stats = s.two_view_stats({"a.jpg", "b.jpg", "c.jpg"})
-    assert stats == {"verified_pairs": 2.0, "rotation_fraction": 0.5, "planar_fraction": 0.0}
-    every = s.two_view_stats()  # (c, d) is not verified; (a, 99) counts without names
-    assert every == {"verified_pairs": 3.0, "rotation_fraction": pytest.approx(1 / 3),
-                     "planar_fraction": 0.0}
+    assert stats == {"verified_pairs": 2.0, "rotation_fraction": 0.5, "planar_fraction": 0.0,
+                     "planar_or_panoramic_fraction": 0.0}
+    assert s.two_view_stats() == stats  # (c, d) is not verified; (a, 99) has no image
     assert s.two_view_stats({"d.jpg"}) == {"verified_pairs": 0.0, "rotation_fraction": 0.0,
-                                           "planar_fraction": 0.0}
+                                           "planar_fraction": 0.0,
+                                           "planar_or_panoramic_fraction": 0.0}
     assert s.match_graph() == {"a.jpg": {"b.jpg"}, "b.jpg": {"a.jpg", "c.jpg"},
                                "c.jpg": {"b.jpg"}, "d.jpg": set()}
+
+
+def test_a_planar_or_panoramic_pair_turns_only_when_one_rotation_explains_its_matches(
+        tmp_path: Path) -> None:
+    """COLMAP leaves a camera turning in place and a plane seen from two places alike
+    (PLANAR_OR_PANORAMIC): only the turn's matches fit one rotation."""
+    import pycolmap
+
+    db = tmp_path / "db.db"
+    ids = _db(db, ["a.jpg", "b.jpg", "c.jpg"])
+    u, v = np.meshgrid(np.linspace(4, 60, 6), np.linspace(4, 44, 5))
+    rays = np.column_stack([(u.ravel() - 32) / 100.0, (v.ravel() - 24) / 100.0, np.ones(30)])
+    X = rays * (1.0 + 2.0 * rays[:, :1])  # a plane 0.44-1.56 m away, tilted about y
+    c, s = np.cos(np.radians(5.0)), np.sin(np.radians(5.0))
+    turned = X @ np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]).T  # a 5° pan
+    moved = X - np.array([0.2, 0.0, 0.0])
+
+    def pixels(P: np.ndarray) -> np.ndarray:
+        return (100.0 * P[:, :2] / P[:, 2:] + [32.0, 24.0]).astype(np.float32)
+
+    d = pycolmap.Database.open(str(db))
+    try:
+        for name, P in (("a.jpg", X), ("b.jpg", turned), ("c.jpg", moved)):
+            d.write_keypoints(ids[name], pixels(P))
+    finally:
+        d.close()
+    _pair(db, ids["a.jpg"], ids["b.jpg"], 30, config=6)
+    _pair(db, ids["a.jpg"], ids["c.jpg"], 30, config=6)
+    s = Sfm(db, tmp_path, tmp_path / "work")
+    assert s.rotation_pairs() == {frozenset(("a.jpg", "b.jpg"))}
+    assert s.two_view_stats() == {"verified_pairs": 2.0, "rotation_fraction": 0.5,
+                                  "planar_fraction": 0.0, "planar_or_panoramic_fraction": 1.0}
 
 
 def test_the_largest_component_of_the_match_graph(tmp_path: Path) -> None:

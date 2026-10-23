@@ -765,6 +765,58 @@ def _features_and_matching(ctx: UpdateContext, sfm: Sfm, names: dict[int, str],
     return n
 
 
+# The global mapper positions the keyframes from their pairs' relative poses, which a plane
+# holding the matches leaves ambiguous (COLMAP: PLANAR_OR_PANORAMIC, ``sfm.ROTATION_FIT_DEG``);
+# incremental mapping registers each keyframe on the points triangulated so far. A robot arm's
+# wrist camera over a textured worktop 0.2-0.6 m away, 0.9 of its pairs left so: circling it
+# (dev_arm_tiers, 60 photos), the global mapper placed every keyframe 21 cm (median) and 2.8° off
+# the arm's kinematics, at 346 px for its 337.2 px lens, and incremental mapping 0.9 mm and 0.11°
+# off, at 337.8 px (none of its keyframes contradicted by their matches, against 5); strafing past
+# it (dev_arm_strafe, 35 photos, 0.68 of its pairs), 35° and 0.23°. Such a photo set is mapped
+# incrementally first (the global mapper if that places too few). Video is not: no video measured.
+PLANE_PAIR_FRACTION = 0.5
+# Incremental mapping starts from a pair it picks at random, and a pair a plane holds together
+# can start it on the plane's other reading (dev_arm_tiers, 12 seeds: 3 models 1-20 cm and up to
+# 27° off, the other 9 within 1.2 mm and 0.12°). The wrong ones show it: 2-15 of their keyframes
+# contradict their verified matches (``sfm.contradicted``), the right ones none, nor any of
+# dev_arm_strafe's 12 (one model). Seeds are tried in turn, the first such model kept, else the one with
+# most keyframes the matches do not contradict.
+#
+# Such a model's poses are vetted by every match: a keyframe's depth that disagrees with the map's
+# scale is the depth's error, not the pose's (``_depth_contradicted`` judges the pose otherwise).
+# The monocular depth of dev_arm_tiers' views 0.18 m above the worktop ran 0.58-1.54 times the
+# map's scale, while their SfM poses lay within 1.9 cm and 0.9° of the arm's kinematics; judged by
+# it, 13 of the 60 keyframes were re-placed and left out, the staged objects with them. Fitted to
+# their own points instead, they spread as little as the others (0.071 median, 0.113 at most,
+# against 0.062 and 0.255; 52-3092 points each): they keep their pose and are fused at that scale.
+PLANE_SEEDS = (0, 1, 2)
+
+
+def _plane_incremental(ctx: UpdateContext, sfm: Sfm, names: set[str]) -> SfmModel | None:
+    """Incremental mapping of photos a plane holds together, from ``PLANE_SEEDS`` in turn: the
+    first model that places ``MIN_PLACED_FRACTION`` of ``names`` and none of whose keyframes
+    contradicts its verified matches (noted on it as ``matches_vetted``), else the one with most
+    keyframes they do not contradict. Noted as ``sfm_plane_seeds`` (seed: contradicted keyframes,
+    of those placed)."""
+    best: tuple[int, SfmModel] | None = None
+    tried: dict[str, str] = {}
+    for seed in PLANE_SEEDS:
+        model = sfm.map_incremental(ctx.work / f"sfm_incr_{seed}", seed=seed)
+        if model is None:
+            tried[str(seed)] = "none"
+            continue
+        poses = {n: model.pose(n) for n in model.registered}
+        bad = _contradicting(sfm, poses, {n: model.intrinsics(n) for n in poses}, set(poses))
+        tried[str(seed)] = f"{len(bad)} of {len(poses)}"
+        if best is None or len(poses) - len(bad) > best[0]:
+            best = (len(poses) - len(bad), model)
+        if not bad and len(set(poses) & names) >= MIN_PLACED_FRACTION * len(names):
+            model.notes["matches_vetted"] = True  # its depth judges no pose
+            break
+    ctx.notes["sfm_plane_seeds"] = tried
+    return None if best is None else best[1]
+
+
 def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress,
              own_db: Path | None = None) -> SfmModel:
     """Pose the update's keyframes (a new map's, or onto the map's: ``_extend``). With
@@ -808,12 +860,14 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     scaleless = False
     if not rotation:
         turns = sfm.rotation_pairs()
-        model = _vetted(ctx, _plausible_focal(ctx, sfm.map_global(ctx.work / "sfm_global"),
-                                              prior), turns)
+        mappers = [lambda: sfm.map_global(ctx.work / "sfm_global"),
+                   lambda: sfm.map_incremental(ctx.work / "sfm_incr")]
+        if not is_video and stats["planar_or_panoramic_fraction"] > PLANE_PAIR_FRACTION:
+            mappers = [lambda: _plane_incremental(ctx, sfm, new_names), mappers[0]]
+        model = _vetted(ctx, _plausible_focal(ctx, mappers[0](), prior), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is None or placed < MIN_PLACED_FRACTION:
-            model = _vetted(ctx, _plausible_focal(ctx, sfm.map_incremental(ctx.work / "sfm_incr"),
-                                                  prior), turns)
+            model = _vetted(ctx, _plausible_focal(ctx, mappers[1](), prior), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         rejected = ctx.notes.get("sfm_focal_rejected", {})
         if (model is None or placed < MIN_PLACED_FRACTION) and rejected and min(
@@ -822,8 +876,8 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                             turns)
             ctx.notes["sfm_focal_held"] = model is not None
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
-        if model is not None and placed >= MIN_PLACED_FRACTION and _turns_through_lens(
-                ctx, sfm, model, new_names):
+        if model is not None and placed >= MIN_PLACED_FRACTION and not is_video and \
+                _turns_through_lens(ctx, sfm, model, new_names):
             model, rotation = None, True  # its translation is the lens's distortion
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         if model is not None and placed >= MIN_PLACED_FRACTION:
@@ -856,7 +910,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
                                                  refine_focal=True, rotation=rotation)
     mv_model = sfm.triangulate_with_poses(poses, ctx.work / "sfm_mv", focal_scale=focal,
                                           distortion=distortion)
-    if distortion:  # the lens is the database camera's now: one centre if the camera turns
+    if distortion and not is_video:  # the lens is the database camera's: one centre if it turns
         one = _one_centre(ctx, sfm, poses, set(poses), gauge=todo[0].name)
         if one is not None:
             mv_model = sfm.triangulate_with_poses(one, ctx.work / "sfm_mv_one")
@@ -883,6 +937,13 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
 # absorbed, while 22 % of its pairs keep more than 1.5° (median of their matches; p90 2.4°): the
 # far ones. A camera turning in place leaves none: examples/camera's second 12 captures, mapped
 # again with the first 12 (-0.53, 0.42°), keep 1.5 % beyond 1.5° (p90 0.83°).
+#
+# A video is never taken for such a pan. A robot sliding 2.6 m sideways along a flat tiled wall
+# (e141's walk, 26 keyframes) shifts the image as a pan would: rotations with a lens of -0.58
+# explain it to 0.27°, 7.7 % of the pairs beyond 1.5°, and its centres went to one point. Posed
+# by SfM instead, the walk is 2.49 m long and its keyframes within 5 mm (median) of where they
+# were filmed. Every pan through a lens the benchmark maps is a photo set (examples/camera);
+# every robot video taken for one (e71, e140, e141) was a walk.
 TURN_FIT_DEG = 0.5  # rotations alone explain the matches within this (median): a pan from one spot
 TURN_LENS_SHIFT = 0.15  # ... through a lens that moves the image corners by at least this share
 TURN_PAIR_DEG = 1.5  # ... and leave at most TURN_PAIR_SHARE of the pairs beyond this (their median)
@@ -1263,8 +1324,8 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     # so is a keyframe that the deregistrations leave without support (its points were tracks
     # shared with a deregistered keyframe only): its pose, which nothing holds any more, would
     # anchor the multi-view poses (``_deregister_contradicted``, ``_deregister_cascade``)
-    off, unsupported = _deregister_contradicted(ctx, model, set(posed) - set(bad_fit),
-                                                photos=not is_video)
+    off, unsupported = ({}, set()) if model.notes.get("matches_vetted") else \
+        _deregister_contradicted(ctx, model, set(posed) - set(bad_fit), photos=not is_video)
     unsupported |= weak
     if off:
         posed = {n: T for n, T in posed.items() if n not in off}
@@ -2319,6 +2380,9 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     dense_only: set[str] = set(ctx.notes.get("mv_names", []))
     if model.method == "multiview":
         dense_only |= set(model.registered)
+    # SfM poses no keyframe's matches contradict: a depth scale off the map's is the depth's
+    # (``_plane_incremental``), fused at the scale of the keyframe's own points
+    vetted = set(model.registered) - dense_only if model.notes.get("matches_vetted") else set()
     pending = []
     for nf in ctx.new:
         name = f"{nf.kf.name}.jpg"
@@ -2342,7 +2406,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
                 continue
             stats.update({"depth_scale_method": "sparse", "depth_scale_points": fit.inliers,
                           "depth_scale_spread": fit.spread})
-            _set_aligned(ctx, nf, T, K, model, name, stats, s, not (lo <= s <= hi))
+            _set_aligned(ctx, nf, T, K, model, name, stats, s,
+                         not (lo <= s <= hi) and name not in vetted)
             pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid, s))
         else:
             pending.append((nf, T, K, name, stats))

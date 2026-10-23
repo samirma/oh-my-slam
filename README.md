@@ -1608,9 +1608,14 @@ pixels, so its results are unchanged.
    office photos).
 4. **Poses (pycolmap 4.2):**
    * **New map:** global mapping (GLOMAP) runs first. If it places fewer than 60 % of the
-     keyframes, incremental mapping runs instead. Rotation-dominant input goes to MapAnything
+     keyframes, incremental mapping runs instead. Photos whose matches a plane holds (more than
+     half of the verified pairs planar or panoramic, but not a turn: a robot arm's camera over a
+     worktop) are mapped incrementally first, from seeds 0, 1, 2 in turn until no keyframe's
+     verified matches contradict its pose; GLOMAP's relative poses are ambiguous on a plane. Rotation-dominant input goes to MapAnything
      multi-view poses followed by triangulation and bundle adjustment. Input counts as
-     rotation-dominant when more than half of the verified pairs are panoramic, or when the
+     rotation-dominant when more than half of the verified pairs are panoramic (a pair COLMAP
+     leaves planar or panoramic counts only when one rotation explains its matches within 1°:
+     a textured worktop seen from places centimetres apart is a plane, not a turn), or when the
      baseline-to-depth ratio is below 0.02, or when the SfM points fix no metric scale (no
      keyframe has 50 well-triangulated points: a few photos panned from one spot, whose SfM
      units are arbitrary — the camera 8 cm from the last one placed 3 m away). MapAnything runs
@@ -1724,9 +1729,14 @@ pixels, so its results are unchanged.
         it unfused, and no neighbour covers its view) or 0.5–2 for video (it would be left out).
         Two photos taken walking down a hallway, a forward motion the global mapper cannot
         resolve, were placed 1.3–3.9 m along it and 0.5–1.6 m apart in height from run to run,
-        with ratios of 1.3–4. Such keyframes are joined like unplaced ones (step 3). So are
-        photos that hang on the rest through one keyframe: at most two photos whose triangulated
-        points that keyframe sees and no other (a link is 15 shared points). Nothing in the
+        with ratios of 1.3–4. Such keyframes are joined like unplaced ones (step 3), except in
+        an incremental model of photos a plane holds together none of whose keyframes its
+        matches contradict: there the depth is wrong, not the pose (a robot arm's views 0.18 m
+        above a worktop, within 1.9 cm of its kinematics, at ratios of 0.58–1.54), and the
+        keyframe keeps its pose and is fused at the scale of its own points. Photos that hang
+        on the rest through one keyframe are joined like unplaced ones too: at most two photos
+        whose triangulated points that keyframe sees and no other (a link is 15 shared points).
+        Nothing in the
         reconstruction fixes how far from that keyframe they are, and they are too few for step 2
         to judge by their depth. The two hallway photos are such a pair: over 100 seeds of the
         global mapper on one set of matches their depth ratios ranged over 0.015–400, and in 6

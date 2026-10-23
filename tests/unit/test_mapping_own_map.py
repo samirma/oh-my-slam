@@ -463,7 +463,8 @@ def test_an_own_map_is_posed_from_its_database_copy_without_matching(
             made.append((db, sorted(only) if only is not None else None))
 
         def two_view_stats(self, names: Any = None) -> dict[str, float]:
-            return {"verified_pairs": 4.0, "rotation_fraction": 0.0, "planar_fraction": 0.0}
+            return {"verified_pairs": 4.0, "rotation_fraction": 0.0, "planar_fraction": 0.0,
+                    "planar_or_panoramic_fraction": 0.0}
 
         def largest_component(self, names: set[str]) -> set[str]:
             return set(names)
