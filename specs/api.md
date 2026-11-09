@@ -79,8 +79,12 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
 * **Starting a job.** `POST /api/maps/{name}/updates` creates the map if it does not exist. It
   answers `202` with the [`Job`] in state `queued`, and a `Location: /api/jobs/{id}` header that
   duplicates `job_id`.
-* **Watching a job.** `GET /api/jobs/{id}` returns its state, `progress`, `eta_s`,
-  `provisional_version` and `result_version`. Once registration has run, the job also carries
+* **Watching a job.** `GET /api/jobs/{id}` returns:
+  * its state, `progress` and `eta_s`;
+  * `provisional_version` and `result_version`;
+  * `latest_version`, the newest version it has committed so far, intermediate `fusing`
+    versions included, or null before any;
+  * `created_at` and `ended_at`. Once registration has run, the job also carries
   `inputs[]` and `quality`.
   * An optional `?wait_s=<s>` (≤ 30) holds the answer until the state changes or the time
     passes.
@@ -172,6 +176,15 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
     * `floor_end`: the farthest floor seen, when no obstacle is;
     * `unseen`.
   * `depth` — a 16-bit PNG part, as the input depth.
+* **Object ids.** With `map` and `T_map_cam`, a detection matched to a map object carries that
+  object's persistent `id`, in `objects` and in the points' `object_id`. So the client can pick
+  one map object's points out of a close view. A detection that matches no map object, and every
+  detection when there is no map or no pose, gets a local id from 1 000 000 up. `object_id` 0
+  means no object.
+* **Range-scan bearings.**
+  * With `T_map_cam`: `bearing_deg` is a direction in the map frame, counter-clockwise from map
+    +x, and `range_m` is measured from the camera's position projected on the floor.
+  * Without it: `bearing_deg` is counter-clockwise from the camera's viewing direction.
 * **Frame of the outputs.** With `T_map_cam`, every output is in the map frame and scale-corrected
   to the map. Without it, outputs are in a gravity-aligned camera frame: the camera at the
   origin, z up, yaw 0 along the viewing direction.
