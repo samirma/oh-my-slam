@@ -68,7 +68,8 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   * `camera_id`;
   * an optional `prior` [`Prior`];
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
-  * an optional `depth`, a part name.
+  * an optional `depth`, a part name;
+  * an optional `ignore_mask`, a part name, combined with the camera's mask.
 * **Request order** is the order of addition (map.md §3).
 * **`analyse`** takes one frame, with its camera inline or by id of a map's camera (`map`
   given).
@@ -141,6 +142,13 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   * So a non-null `ambiguity` always means a genuinely different pose with comparable
     support, for example the 90° flip of a symmetric room. The client then asks for a second
     frame.
+* **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
+  service can estimate one, else null:
+  * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`;
+  * `turn_deg`: the signed turn from the frame's guessed heading (its prior when given, else the
+    nearest view's) toward that keyframe's view. Positive is counter-clockwise.
+
+  A robot without odometry can then turn toward mapped structure.
 * **Provisional frames.** Locate works against a version whose newest frames are still
   provisional, using their provisional poses.
 * **Nothing located** is a `200` response with every frame `rejected`, not an error.
@@ -169,7 +177,23 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   origin, z up, yaw 0 along the viewing direction.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`.
 
-## 8. Errors
+## 8. Expected durations
+
+* **Timings.** `GET /api/health` reports `timings`: the median and p90 seconds of the last 50
+  measurements on this machine, as run:
+  * per frame: registration, fusion, locate and frame analysis;
+  * per request: grid and objects reads.
+
+  Before any measurement, they report the values recorded in `README.md` for this machine,
+  marked `source: default`.
+* **Job estimates.** A [`Job`] fills `eta_s` from the moment it is queued: the queue ahead plus
+  its own predicted registration and fusion.
+* **Dry-run estimates.** A [`DryRun`] reports `predicted_s {registration, fusion}` for its frame
+  set.
+
+So the client can gate even a run's first update on its deadline.
+
+## 9. Errors
 
 * **Error body.** Every error answers an [`Error`]:
   * `code`, from a fixed list;
