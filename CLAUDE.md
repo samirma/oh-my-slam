@@ -104,6 +104,8 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` is read-o
   and 8088.
 - Run benchmarks one at a time; concurrent GPU work invalidates timings. Every colmap, mapper, inference or
   `-m models` command goes through one machine lock: `~/oh-my-slam-data/bin/heavy <cmd>` (Python `fcntl.flock` wrapper; macOS has no `flock`).
+- Experiments: read `experiments_cases.md` (repo root) before proposing or starting one, and add an
+  entry in its template when one ends (each worktree's stack, patch, results and verdict).
 - Research subagents verify claims online only: no installs, weight downloads or local benchmarks.
   This machine is the user's daily driver.
 - Only commit when the user requeres to
