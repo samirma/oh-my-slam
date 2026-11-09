@@ -120,6 +120,7 @@ class _Anchored:
     gauge_shift: dict[str, float] | None = None
     prior_gravity_deg: float | None = None
     scale_from_priors: bool = False
+    scale_ratio_vs_prev: float | None = None
 
 
 def _mat(T: Any) -> NDArray[np.float64]:
@@ -225,14 +226,14 @@ class Updater:
                                           fr.cam, mask)
                 med = checks.median_depth(fr.depth_m)
             fr.path = indir / f"{f.index:04d}.jpg"
-            if fr.cam.is_canonical and mask is None and f.image[:3] == b"\xff\xd8\xff":
+            if fr.cam.is_canonical and (mask is None or not mask.any()) \
+                    and f.image[:3] == b"\xff\xd8\xff":
                 fr.path.write_bytes(f.image)
             else:
                 save_jpeg(mapper_image(rgb, fr.cam, mask), fr.path, quality=JPEG_QUALITY)
-            fr.reason = checks.reason(fr.measures, med)
-            if fr.reason is None and med is None and fr.measures.suspicious:
+            if med is None and fr.measures.suspicious:
                 med = self.backend.median_depth(fr.path, fr.cam.canonical())
-                fr.reason = checks.reason(fr.measures, med)
+            fr.reason = checks.reason(fr.measures, med)
 
     def _run(self, job: Job, w: UpdateWork, workdir: Path, changed: Callable[[], None]) -> None:
         tm = job.timings_s
@@ -283,6 +284,9 @@ class Updater:
                     assert fr.measures is not None
                     fr.reason = checks.unregistered_reason(fr.measures)
             placed = [fr for fr in todo if fr.internal is not None]
+            if not placed:
+                result = None
+                break
             anchored = self._anchor(placed, prev, internal)
             post = self._post_check(placed, anchored, internal)
             tm["anchor"] = round(tm.get("anchor", 0.0) + time.perf_counter() - t, 3)
@@ -406,7 +410,7 @@ class Updater:
         if not group:  # the mapper kept none of the stored frames: its frame is unchanged
             return _Anchored(prev_sim, prev["scale_source"], prev["scale_sigma_rel"], 0.0,
                              gauge_shift={"translation_m": 0.0, "rotation_deg": 0.0,
-                                          "scale_ratio": 1.0})
+                                          "scale_ratio": 1.0}, scale_ratio_vs_prev=1.0)
         fit = anchor.fit(group)
         if not fit.scale_observable:
             fit = anchor.fit(group, scale=prev_sim.s)
@@ -423,8 +427,22 @@ class Updater:
         gauge = {"translation_m": round(float(np.median(shifts)) if shifts else 0.0, 4),
                  "rotation_deg": round(anchor.rotation_deg(A.R), 3),
                  "scale_ratio": round(A.s, 5)}
-        return _Anchored(fit.sim, source, sigma, self._rms(fit.sim, used), gauge_shift=gauge,
-                         scale_from_priors=source == "priors")
+        out = _Anchored(fit.sim, source, sigma, self._rms(fit.sim, used), gauge_shift=gauge,
+                        scale_from_priors=source == "priors")
+        out.scale_ratio_vs_prev = self._spread_ratio(fit.sim, previous)
+        return out
+
+    @staticmethod
+    def _spread_ratio(sim: Sim3, previous: list[Anchor]) -> float:
+        """The map's scale change on the stored frames: the spread of their new map-frame
+        centres over the spread of their previous ones (1 with fewer than two)."""
+        if len(previous) < 2:
+            return 1.0
+        new = np.array([sim.point(a.src[:3, 3]) for a in previous])
+        old = np.array([a.dst[:3, 3] for a in previous])
+        s_old = float(np.sqrt(((old - old.mean(0)) ** 2).sum(1).mean()))
+        s_new = float(np.sqrt(((new - new.mean(0)) ** 2).sum(1).mean()))
+        return round(s_new / s_old, 5) if s_old > 1e-9 else 1.0
 
     @staticmethod
     def _rms(sim: Sim3, used: list[Anchor]) -> float:
@@ -573,7 +591,8 @@ class Updater:
         prev_res = residual_stats(anchored.previous_residuals) if anchored else None
         gauge = anchored.gauge_shift if anchored else None
         q: dict[str, Any] = {
-            "scale_ratio_vs_prev": None if gauge is None else gauge["scale_ratio"],
+            "scale_ratio_vs_prev": None if prev is None or anchored is None
+            else anchored.scale_ratio_vs_prev,
             "gauge_shift": gauge, "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),
             "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
