@@ -16,6 +16,7 @@ from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.client.images import remember_rgb, request_image, request_rgb
 from oh_my_slam.core import rle
 from oh_my_slam.core.images import load_rgb
+from oh_my_slam.server.gpu_worker import CpuFinish
 from oh_my_slam.server.models.geometry_moge import MoGeGeometry
 from oh_my_slam.server.models.gravity_geocalib import _INPUT_SIDE, GeoCalibGravity
 from oh_my_slam.server.models.multiview_mapanything import _LOAD_SIDE
@@ -103,14 +104,16 @@ class _Server:
                      "mask_array": m}]
 
         monkeypatch.setattr(MoGeGeometry, "infer_array", infer)
-        monkeypatch.setattr(GeoCalibGravity, "estimate_array", estimate)
+        monkeypatch.setattr(GeoCalibGravity, "estimate_deferred",
+                            lambda self, rgb, focal: lambda: estimate(self, rgb, focal))
         monkeypatch.setattr(YoloeSegmenter, "detect_array", detect)
         self.adapters = {p.ROUTE_GEOMETRY: MoGeGeometry(), p.ROUTE_GRAVITY: GeoCalibGravity(),
                          p.ROUTE_SEGMENT: YoloeSegmenter()}
 
     def post(self, route: str, req: Any, model: type) -> Any:
         self.seen.append(req.image_path)
-        return model.model_validate(self.adapters[route].run(req))
+        out = self.adapters[route].run(req)
+        return model.model_validate(out.finish() if isinstance(out, CpuFinish) else out)
 
 
 def test_responses_are_those_of_the_original(photo: Path, tmp_path: Path,

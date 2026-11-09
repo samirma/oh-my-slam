@@ -11,9 +11,46 @@ import numpy as np
 from oh_my_slam.client.protocol import MultiviewRequest
 from oh_my_slam.core.atomic import atomic_save_npy
 from oh_my_slam.core.images import load_rgb, upright_size
+from oh_my_slam.server.models.hub import cached_file
 
 REPO_ID = "facebook/map-anything-apache"  # the Apache-2.0 checkpoint (THIRD_PARTY_LICENSES.md)
+# The checkpoint's revision: read from the Hugging Face cache without asking the Hub, and never
+# replaced by a newer upload (one start re-downloaded the 4.5 GB checkpoint for 249 s).
+REVISION = "00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a"
 _LOAD_SIDE = 1024
+
+
+def build_on_meta(cls: Any, config: dict[str, Any], weights: str, device: str) -> Any:
+    """``cls`` (MapAnything) with ``config``'s arguments and the checkpoint ``weights``
+    (safetensors), on ``device``: built on the ``meta`` device, so that no weight is allocated
+    and randomly initialised before the checkpoint replaces it (about 16 s for the ViT-G), then
+    given the checkpoint's tensors (``load_state_dict(assign=True)``). The weights are those
+    ``from_pretrained`` loads, bit for bit. None when a tensor of the model is not in the
+    checkpoint (it would stay on ``meta``): the caller builds it the usual way."""
+    import inspect
+
+    import torch
+    from safetensors.torch import load_file
+
+    params = inspect.signature(cls.__init__).parameters
+    kwargs = {k: v for k, v in config.items() if k in params}
+    enc = kwargs.get("encoder_config")
+    if isinstance(enc, dict) and enc.get("encoder_str") == "dinov2":
+        # as MapAnything._from_pretrained: the checkpoint holds the encoder's weights
+        kwargs["encoder_config"] = {**enc, "torch_hub_pretrained": False}
+    with torch.device("meta"):
+        model = cls(**kwargs)
+    state = load_file(weights, device="cpu")
+    dtypes = {k: t.dtype for k, t in model.state_dict().items()}
+    # as load_state_dict copies them: in the dtype of the model's own tensors
+    state = {k: v if k not in dtypes or v.dtype == dtypes[k] else v.to(dtypes[k])
+             for k, v in state.items()}
+    model.load_state_dict(state, strict=False, assign=True)
+    del state
+    tensors = [*model.parameters(), *model.buffers()]
+    if any(t.is_meta for t in tensors):
+        return None
+    return model.to(torch.device(device)).eval()
 
 
 class MapAnythingMultiview:
@@ -25,11 +62,22 @@ class MapAnythingMultiview:
         self.device = "cpu"
 
     def load(self, device: str) -> None:
+        import json
+
         import torch
         from mapanything.models import MapAnything
 
         self.device = device
-        self.model = MapAnything.from_pretrained(REPO_ID).to(torch.device(device)).eval()
+        config = cached_file(REPO_ID, "config.json", REVISION)
+        weights = cached_file(REPO_ID, "model.safetensors", REVISION)
+        model = None
+        if config is not None and weights is not None:
+            model = build_on_meta(MapAnything, json.loads(Path(config).read_text()), weights,
+                                  device)
+        if model is None:  # not cached yet (downloads it), or a tensor not in the checkpoint
+            model = MapAnything.from_pretrained(REPO_ID, revision=REVISION)
+            model = model.to(torch.device(device)).eval()
+        self.model = model
 
     def warmup(self) -> None:
         pass  # a forward pass needs >= 1 real view; the first request warms up

@@ -8,6 +8,10 @@ here before its exception leaves the thread, so the device tensors they held are
 thread, not on the event loop's. ``after_job``, when set, then runs on this thread after every
 job with the job's exception (None on success), before its future is resolved: the server frees
 and measures device memory there.
+
+A job whose remainder needs no device returns a :class:`CpuFinish`: the worker records its queue
+and device time in it, and the server runs ``finish`` on a CPU thread (``app.ServerState``), so
+the next job's device work does not wait for it.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -39,6 +44,17 @@ def _clear_frames(exc: BaseException) -> None:
             seen.add(id(e))
             traceback.clear_frames(e.__traceback__)
             todo += [e.__cause__, e.__context__]
+
+
+@dataclass
+class CpuFinish:
+    """What remains of a job once its device work is done: ``finish`` computes the response from
+    CPU data only (it must never touch the device: it runs on another thread). ``queue_s`` and
+    ``compute_s`` are the device part's, set by the worker."""
+
+    finish: Callable[[], dict[str, Any]]
+    queue_s: float = 0.0
+    compute_s: float = 0.0
 
 
 class QueueFullError(RuntimeError):
@@ -110,6 +126,9 @@ class GpuWorker:
                         "queue_s": started - enqueued,
                         "compute_s": time.perf_counter() - started,
                     }
+                elif isinstance(result, CpuFinish):
+                    result.queue_s = started - enqueued
+                    result.compute_s = time.perf_counter() - started
             except BaseException as exc:
                 _clear_frames(exc)
                 self._after(exc)

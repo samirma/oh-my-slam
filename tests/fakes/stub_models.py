@@ -23,6 +23,7 @@ from oh_my_slam.client.protocol import (
 from oh_my_slam.core import rle
 from oh_my_slam.core.atomic import atomic_save_npy
 from oh_my_slam.core.images import load_rgb, upright_size
+from oh_my_slam.server.gpu_worker import CpuFinish
 from oh_my_slam.server.models import Registry
 
 
@@ -74,15 +75,16 @@ class StubGravity(_Base):
     key = "gravity"
     name = "stub gravity"
 
-    def run(self, req: GravityRequest) -> dict[str, Any]:
+    def run(self, req: GravityRequest) -> CpuFinish:
+        """As GeoCalib's adapter: the answer is computed off the device thread (``CpuFinish``)."""
         _delay()
         ow, oh = upright_size(Path(req.image_path))
         f = req.focal_px or ow / (2 * math.tan(math.radians(30)))
-        return {
+        return CpuFinish(lambda: {
             "up_cam": [0.0, -1.0, 0.0], "roll_deg": 0.0, "pitch_deg": 0.0,
             "roll_unc_deg": 0.5, "pitch_unc_deg": 0.5, "focal_px": f, "focal_unc_px": 1.0,
             "vfov_deg": math.degrees(2 * math.atan(oh / (2 * f))), "timings": {},
-        }
+        })
 
 
 class StubSegment(_Base):

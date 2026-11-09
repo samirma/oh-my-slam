@@ -34,7 +34,9 @@ scripts never call each other.
 Model weights are downloaded on the first server start:
 
 * MoGe-2 ViT-L normal (`Ruicheng/moge-2-vitl-normal`) and MapAnything
-  (`facebook/map-anything-apache`) go to the Hugging Face cache.
+  (`facebook/map-anything-apache`, pinned to revision `00f9c245`) go to the Hugging Face cache.
+  Once they are cached the server reads them without contacting the Hub (a newer upload of
+  MapAnything is never downloaded on start).
 * GeoCalib (pinhole weights from its GitHub release) goes to the torch hub cache.
 * YOLOE-26x-seg and its MobileCLIP2-B text encoder go to `~/Library/Caches/oh-my-slam/weights`.
 
@@ -200,7 +202,15 @@ correspondence; a keyframe without a model (a one-keyframe map has no `sfm/`) gi
 metric depth at the keypoint instead. COLMAP's LO-RANSAC absolute pose with refinement solves
 them; the focal length is estimated too unless the image shares a map camera. A pose needs 15
 inliers, and its median epipolar distance to its verified matches, under the stored keyframe
-poses, must stay within 0.25° (the check the map's own keyframes pass).
+poses, must stay within 0.25° (the check the map's own keyframes pass). An image that shares a
+map camera and that this leaves unlocated, whose matched keyframes were taken from one spot (most
+of its matches are with multi-view keyframes, as of a camera turning in place, or the keyframes
+lie within 2 % of their scene depth of each other), is placed by its rotation alone, at the
+keyframes' centre: the rotation that turns its matched rays onto the keyframes' (RANSAC on pairs
+of matches, inliers within 0.5°) is kept with at least 15 inliers that are at least a quarter of
+its verified matches. That needs no depth, so matches on surfaces without it (the out-of-focus
+near field, bare walls) count. On `examples/camera` (the map of its first 12 captures) it locates
+5 more of the 12 held-out captures, 1–4.5° from where the one-update map poses them.
 
 *A concurrent update.* `locate` reads one state of the map. If an update commits while it runs
 (`map.json` or the commit marker changes, or a file it read disappears), it opens the map again
@@ -252,7 +262,8 @@ the stream's `stream_properties` (`{"intrinsics_pinhole": {…}, "intrinsics_sou
 * **OBBs** (layer `obb`): every object of the map (the objects of `-t full`) as the footprint of
   its upright OBB — its horizontal rectangle — outlined 2 px wide in the object's colour, with its
   id in that colour on a tag of the background colour just above it (Pillow's default font,
-  12 px; moved into the image at its edges). Everything is drawn opaque with no anti-aliasing, the
+  12 px; moved into the image at its edges). The tags are drawn first and every outline over
+  them, so a tag that lands on a cluttered spot never hides a small object's outline. Everything is drawn opaque with no anti-aliasing, the
   text included, so the colour contract's exact triple appears and no colour is blended: with
   `-l obb` alone the image holds no colour but the background, the objects' and the markers'.
 * **Cameras**, on top: a keyframe (`-t full`) is a 3 px disc in the viewer's frustum colour
@@ -1504,7 +1515,11 @@ update. The memory a chunk needs grows with its views and their aspect: 4:3 robo
 13-24 views, where 16:9 ones map in chunks of 24. MPS is not thread-safe, so every model call runs on one GPU worker
 thread (loading, warm-up and every request; a failed request's traceback frames are cleared there,
 so the tensors they held are freed on that thread too). The queue holds 8 jobs; beyond that the
-server answers HTTP 503 and the client retries.
+server answers HTTP 503 and the client retries. Only GeoCalib's network runs there: its
+Levenberg-Marquardt refinement, which synchronised with the CPU at each of its 30 steps (about
+0.3 s per image of that thread), runs on the CPU on one of two other threads (`CpuFinish`), with
+CPU tensors only. MapAnything is built on the `meta` device and given its checkpoint's tensors
+(no random initialisation of its ViT-G first): it loads in about 5 s instead of 28 s.
 torch lives only in the server process. The commands never import it, because loading torch and
 Open3D in one process aborts on a duplicate libomp.
 
@@ -1569,7 +1584,12 @@ pixels, so its results are unchanged.
 3. **Features and matching.** The Homebrew `colmap` CLI extracts and matches SIFT features.
    SIFT doubles each photo for its finest scale (COLMAP's default), but not the keyframes of a
    video of at least 1600 px: for those it was most of the COLMAP time and memory (the lv walk:
-   36 s and 8.7 GB doubled, 10 s and 2.4 GB not). Pairs are chosen as follows:
+   36 s and 8.7 GB doubled, 10 s and 2.4 GB not). COLMAP extracts one image per thread, and a
+   12 MP photo read doubled takes 2.3 GB: the extraction runs on as many threads as three
+   quarters of the memory available holds (at least 2; every core when they fit), which leaves
+   the features unchanged. On every core beside the inference server, the 13 office photos
+   swapped the machine (extraction 305 s, the update 180-335 s; at 2 threads 64 s).
+   Pairs are chosen as follows:
    * Photos: every pair up to 200 images.
    * Otherwise: sequential neighbours plus descriptor retrieval, with loop-closure candidates
      for video.

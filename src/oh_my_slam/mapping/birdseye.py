@@ -10,7 +10,8 @@ cameras give one pixel grid. From bottom to top:
   highest point that falls in it, without the ceiling or roof (``ceiling_cut``).
 * ``obb`` — every object of the map as the footprint of its upright OBB, outlined opaque in its
   colour (``OUTLINE_PX``, no anti-aliasing: the colour contract's exact triple), with its id in
-  that colour on a tag of the background colour at the footprint's centre.
+  that colour on a tag of the background colour above the footprint; the tags lie under every
+  outline.
 * the cameras: keyframes (``-t full``) as small discs, the last known camera as a diamond, a
   located camera as a triangle pointing where it looks, tagged with its ``Camera.tag`` (the
   number of its image among the inputs, from 1) where no other camera's tag is; each with its
@@ -231,12 +232,10 @@ def _font(size: int) -> Any:
 
 
 def _draw_objects(draw: Any, grid: Grid, objects: Sequence[Any]) -> None:
-    """Every footprint's outline, then every id tag: centred above its footprint (inside the
-    image), so that it never hides its own outline."""
+    """Every id tag, centred above its footprint (inside the image), then every footprint's
+    outline over the tags: in a cluttered map a tag lands on other objects' footprints, and
+    drawn last it would hide a small object's whole outline."""
     corners = {o.id: grid.pixels(footprint(o)) - 0.5 for o in objects}
-    for o in objects:
-        pts = [tuple(p) for p in corners[o.id]]
-        draw.line([*pts, pts[0]], fill=tuple(o.color), width=OUTLINE_PX, joint="curve")
     font = _font(LABEL_PX)
     for o in objects:
         c = corners[o.id]
@@ -247,6 +246,9 @@ def _draw_objects(draw: Any, grid: Grid, objects: Sequence[Any]) -> None:
         draw.rectangle((x, y, x + w - 1, y + h - 1), fill=BACKGROUND, outline=tuple(o.color))
         draw.text((x + TAG_PAD_PX - left, y + TAG_PAD_PX - top), str(o.id), fill=tuple(o.color),
                   font=font)
+    for o in objects:
+        pts = [tuple(p) for p in corners[o.id]]
+        draw.line([*pts, pts[0]], fill=tuple(o.color), width=OUTLINE_PX, joint="curve")
 
 
 TAG_OFFSETS_PX = ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (-1, 1), (1, -1), (-1, -1))

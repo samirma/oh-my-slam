@@ -1,7 +1,8 @@
 """FastAPI application: a non-blocking ``/health`` and one POST route per model.
 
 Every model call is handed to the single :class:`GpuWorker`; the HTTP event loop only awaits
-futures, so ``/health`` never waits on the device. After every job the worker calls
+futures, so ``/health`` never waits on the device. The part of a call that needs no device
+(``CpuFinish``: GeoCalib's least-squares refinement) then runs on a CPU thread (``cpu_pool``). After every job the worker calls
 :meth:`ServerState.after_job` on its thread, which frees and measures the device memory that
 ``/health`` reports (``memory``, ``last_oom`` and the ``degraded`` status).
 """
@@ -13,6 +14,7 @@ import gc
 import os
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +23,7 @@ from fastapi.responses import JSONResponse
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.core.errors import InputError
-from oh_my_slam.server.gpu_worker import GpuWorker, QueueFullError, WorkerStoppedError
+from oh_my_slam.server.gpu_worker import CpuFinish, GpuWorker, QueueFullError, WorkerStoppedError
 from oh_my_slam.server.models import Registry
 from oh_my_slam.version import PROTOCOL_VERSION
 
@@ -30,6 +32,9 @@ GIB = float(1 << 30)
 # (a request then has under a tenth of the cap for its own tensors), and from which a successful
 # job also releases the allocator's cache.
 NEAR_LIMIT = 0.9
+# CPU threads for the device-free part of the calls (``CpuFinish``): the mapper keeps two frames
+# in flight
+CPU_THREADS = 2
 
 
 def is_out_of_memory(exc: BaseException) -> bool:
@@ -56,6 +61,8 @@ class ServerState:
     memory: p.DeviceMemory | None = None
     last_oom: str | None = None
     last_job_oom: bool = False
+    cpu_pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(
+        CPU_THREADS, thread_name_prefix="cpu-finish"))
 
     def status(self) -> str:
         if self.stopping:
@@ -139,12 +146,22 @@ def create_app(state: ServerState) -> FastAPI:
             return _error(503, "server stopping")
         try:
             result = await asyncio.wrap_future(fut)
+            if isinstance(result, CpuFinish):
+                result = await _finish(result)
         except (InputError, FileNotFoundError, ValueError) as exc:
             return _error(400, type(exc).__name__, str(exc))
         except Exception as exc:
             return _error(500, p.OUT_OF_MEMORY if is_out_of_memory(exc) else type(exc).__name__,
                           str(exc))
         return model.model_validate(result)
+
+    async def _finish(part: CpuFinish) -> dict[str, Any]:
+        """``part``'s response, computed on a CPU thread; its time adds to the device part's."""
+        t0 = time.perf_counter()
+        out = await asyncio.get_running_loop().run_in_executor(state.cpu_pool, part.finish)
+        out["timings"] = {"queue_s": part.queue_s,
+                          "compute_s": part.compute_s + time.perf_counter() - t0}
+        return out
 
     @app.get(p.ROUTE_HEALTH, response_model=p.Health)
     def health() -> p.Health:

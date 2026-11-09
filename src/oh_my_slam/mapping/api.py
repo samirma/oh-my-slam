@@ -2427,6 +2427,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
     # (name, depth loader, pose, K_grid, depth scale)
     pool: list[tuple[str, Any, Pose, Intrinsics, float]] = []
     cache: dict[str, NDArray[np.float32]] = {}
+    medians: dict[int, Any] = {}  # dense_scale's, of the pool's depth arrays (never changed)
 
     def old_depth(name: str) -> Any:
         def load() -> NDArray[np.float32]:
@@ -2485,7 +2486,8 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
                         + 0.1 * float(np.linalg.norm(r[2].t - T.t)))[:DENSE_REFS]
         K_grid = _grid_intrinsics(nf, K)
         fit = dense_scale(nf.frame.depth, K_grid.K(), T.matrix(),
-                          [(ld(), Kg.K(), Tr.matrix()) for _, ld, Tr, Kg, _ in ranked])
+                          [(ld(), Kg.K(), Tr.matrix()) for _, ld, Tr, Kg, _ in ranked],
+                          medians=medians)
         refs = [r[0] for r in ranked]
         low = not fit.ok or fit.spread > DENSE_MAX_SPREAD
         if not low:
@@ -2509,7 +2511,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
         _set_aligned(ctx, nf, T, K, model, name, stats, s, low)
         if not nf.record.low_confidence:
             pool.append((nf.kf.name, (lambda d=nf.depth: d), T, nf.record.K_grid, s))
-    _realign_dense(ctx, pool)
+    _realign_dense(ctx, pool, medians)
 
 
 # The multi-view fallback places the camera centres with each keyframe's depth as the network gave
@@ -2572,10 +2574,11 @@ REALIGN_SWEEPS = 2
 REALIGN_REFS = 8
 
 
-def _realign_dense(ctx: UpdateContext, pool: list[tuple[str, Any, Pose, Intrinsics, float]]
-                   ) -> None:
+def _realign_dense(ctx: UpdateContext, pool: list[tuple[str, Any, Pose, Intrinsics, float]],
+                   medians: dict[int, Any] | None = None) -> None:
     """``_align_depths``' second pass over this update's densely aligned confident keyframes
-    (see ``REALIGN_SWEEPS``); a fit that fails or is inconsistent leaves the scale as it was."""
+    (see ``REALIGN_SWEEPS``); a fit that fails or is inconsistent leaves the scale as it was.
+    ``medians``: ``dense_scale``'s cache of the pool's depth medians."""
     from oh_my_slam.reconstruction.depth import dense_scale
 
     dense = [nf for nf in sorted(ctx.new, key=lambda nf: nf.kf.index)
@@ -2592,7 +2595,8 @@ def _realign_dense(ctx: UpdateContext, pool: list[tuple[str, Any, Pose, Intrinsi
             ranked = sorted((e for n, e in entries.items() if n != nf.kf.name),
                             key=lambda e: -float(e[2].R[:, 2] @ fwd))[:REALIGN_REFS]
             fit = dense_scale(nf.frame.depth, rec.K_grid.K(), rec.T_map_cam.matrix(),
-                              [(e[1](), e[3].K(), e[2].matrix()) for e in ranked])
+                              [(e[1](), e[3].K(), e[2].matrix()) for e in ranked],
+                              medians=medians)
             if not fit.ok or fit.spread > DENSE_MAX_SPREAD:
                 continue
             rec.depth_scale = float(fit.scale)

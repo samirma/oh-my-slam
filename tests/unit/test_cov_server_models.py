@@ -5,6 +5,7 @@ priors, devices) and how its output becomes the protocol response (units, masks,
 
 from __future__ import annotations
 
+import json
 import math
 import types
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ from oh_my_slam.client import protocol as p
 from oh_my_slam.core import rle
 from oh_my_slam.core.images import load_rgb
 from oh_my_slam.server import models
+from oh_my_slam.server.gpu_worker import CpuFinish
 from oh_my_slam.server.models import geometry_moge as gm
 from oh_my_slam.server.models import gravity_geocalib as gg
 from oh_my_slam.server.models import multiview_mapanything as mv
@@ -86,46 +88,76 @@ def test_loading_logs_each_model_and_every_failure() -> None:
 
 
 class _GeoCalib:
+    """GeoCalib's ``calibrate`` in the parts the adapter runs: the image processor, the network
+    (``model``), the least-squares refinement (``_LM``) and the post-processing; ``result`` is
+    what the refinement and post-processing give."""
+
     last: _GeoCalib
 
     def __init__(self, weights: str) -> None:
         self.weights, self.device, self.evaluated = weights, None, False
-        self.calls: list[tuple[Tensor, Any]] = []
+        self.calls: list[tuple[str, Any]] = []
         self.result: dict[str, Any] = {}
+        self.model = types.SimpleNamespace(
+            backbone=lambda data: self._seen("backbone", data, {"features": "hl"}),
+            ll_enc=lambda data: {"features": "ll"},
+            perspective_decoder=lambda data: self._seen("decoder", data, {
+                "up_field": Tensor(np.ones((1, 2, 4, 4), np.float32), self.device),
+                "latitude_field": Tensor(np.zeros((1, 1, 4, 4), np.float32), self.device)}))
         _GeoCalib.last = self
 
+    def _seen(self, what: str, data: Any, out: Any) -> Any:
+        self.calls.append((what, data))
+        return out
+
     def to(self, device: Device) -> _GeoCalib:
-        self.device = device
+        self.device = str(device)
         return self
 
     def eval(self) -> _GeoCalib:
         self.evaluated = True
         return self
 
-    def calibrate(self, img: Tensor, priors: Any = None) -> dict[str, Any]:
-        self.calls.append((img, priors))
-        return self.result
+    def image_processor(self, img: Tensor) -> dict[str, Any]:
+        self.calls.append(("image", img))
+        return {"image": img, "scales": Tensor([0.5, 0.5], img.device)}
+
+    def _post_process(self, camera: Any, img_data: dict[str, Any], out: dict[str, Any]
+                      ) -> tuple[Any, dict[str, Any]]:
+        self.calls.append(("post", img_data))
+        return camera, out
 
 
-def _calibration(f: list[float], vec: list[float], device: str = "mps", unc: bool = True
-                 ) -> dict[str, Any]:
-    grav = types.SimpleNamespace(vec3d=Tensor([vec], device), roll=Tensor([0.1], device),
-                                 pitch=Tensor([-0.2], device))
-    res: dict[str, Any] = {"gravity": grav,
-                           "camera": types.SimpleNamespace(f=Tensor([f], device))}
+class _LM:
+    def __init__(self, conf: dict[str, Any]) -> None:
+        assert conf == {}  # GeoCalib's defaults: the pinhole model, intrinsics not shared
+
+    def __call__(self, out: dict[str, Any]) -> dict[str, Any]:
+        model = _GeoCalib.last
+        model.calls.append(("lm", out))
+        return dict(model.result)
+
+
+def _calibration(f: list[float], vec: list[float], unc: bool = True) -> dict[str, Any]:
+    grav = types.SimpleNamespace(vec3d=Tensor([vec]), roll=Tensor([0.1]), pitch=Tensor([-0.2]))
+    res: dict[str, Any] = {"gravity": grav, "camera": types.SimpleNamespace(f=Tensor([f]))}
     if unc:
-        res |= {"roll_uncertainty": Tensor([0.01], device),
-                "pitch_uncertainty": Tensor([0.02], device),
-                "focal_uncertainty": Tensor([5.0], device)}
+        res |= {"roll_uncertainty": Tensor([0.01]), "pitch_uncertainty": Tensor([0.02]),
+                "focal_uncertainty": Tensor([5.0])}
     return res
 
 
 @pytest.fixture
 def geocalib(torch: types.ModuleType) -> Iterator[gg.GeoCalibGravity]:
-    with installed(libraries({"geocalib": {"GeoCalib": _GeoCalib}})):
+    with installed(libraries({"geocalib": {"GeoCalib": _GeoCalib},
+                              "geocalib.lm_optimizer": {"LMOptimizer": _LM}})):
         g = gg.GeoCalibGravity()
         g.load("mps")
         yield g
+
+
+def _called(model: _GeoCalib, what: str) -> list[Any]:
+    return [data for name, data in model.calls if name == what]
 
 
 def test_geocalib_loads_the_pinhole_weights_on_the_device_and_warms_up(
@@ -134,25 +166,39 @@ def test_geocalib_loads_the_pinhole_weights_on_the_device_and_warms_up(
     assert geocalib.model is model and geocalib.device == "mps"
     assert model.weights == "pinhole" and model.device == "mps" and model.evaluated
     model.result = _calibration([300.0, 300.0], [0.0, -1.0, 0.0])
-    geocalib.warmup()
-    (img, priors), = model.calls
-    assert img.shape == (3, 240, 320) and img.device == "mps" and priors is None
+    geocalib.warmup()  # both parts, on the loading (GPU) thread
+    img, = _called(model, "image")
+    assert img.shape == (1, 3, 240, 320) and img.device == "mps"
+    assert "prior_focal" not in _called(model, "backbone")[0]
+    assert len(_called(model, "lm")) == len(_called(model, "post")) == 1
 
 
-def test_geocalib_reads_the_image_at_640_and_answers_in_full_resolution_pixels(
+def test_geocalib_runs_its_network_on_the_device_and_the_refinement_after_on_the_cpu(
         geocalib: gg.GeoCalibGravity, tmp_path: Path) -> None:
     path = _image(tmp_path / "g.png", 1280, 960)
     model = _GeoCalib.last
     model.result = _calibration([480.0, 500.0], [0.0, -2.0, 0.0])
-    res = p.GravityResponse.model_validate(geocalib.run(p.GravityRequest(image_path=str(path),
-                                                                         focal_px=1000.0)))
-    (img, priors), = model.calls
-    # the model reads the 640 px image as a float CHW tensor in [0, 1] on the device ...
+    part = geocalib.run(p.GravityRequest(image_path=str(path), focal_px=1000.0))
+    # the network ran: the model reads the 640 px image as a float NCHW tensor in [0, 1] on the
+    # device ...
+    assert isinstance(part, CpuFinish)
+    img, = _called(model, "image")
     rgb = load_rgb(path, max_side=640)
-    assert img.shape == (3, 480, 640) and img.device == "mps" and img.dtype == np.float32
-    np.testing.assert_allclose(img.a, rgb.transpose(2, 0, 1) / 255.0, rtol=1e-6)
-    # ... with the focal prior in its pixels (half the original's)
-    assert float(priors["focal"]) == 500.0 and priors["focal"].device == "mps"
+    assert img.shape == (1, 3, 480, 640) and img.device == "mps" and img.dtype == np.float32
+    np.testing.assert_allclose(img.a[0], rgb.transpose(2, 0, 1) / 255.0, rtol=1e-6)
+    # ... with the focal prior in its pixels (half the original's), scaled as ``calibrate`` does
+    data, = _called(model, "backbone")
+    assert data["prior_focal"].device == "mps" and float(data["prior_focal"].a[0]) == 250.0
+    assert data["camera_R_rig"] is None
+    assert not _called(model, "lm")  # the refinement is left to ``finish``
+    res = p.GravityResponse.model_validate(part.finish())
+    # the refinement and post-processing read CPU tensors only (they run off the GPU thread)
+    out, = _called(model, "lm")
+    assert set(out) == {"up_field", "latitude_field", "image", "scales", "prior_focal",
+                        "camera_R_rig"}
+    assert all(v.device == "cpu" for v in out.values() if isinstance(v, Tensor))
+    img_data, = _called(model, "post")
+    assert all(v.device == "cpu" for v in img_data.values())
     # the answer: unit up vector, degrees, and focal lengths in pixels of the original image
     assert res.up_cam == [0.0, -1.0, 0.0]
     assert res.roll_deg == pytest.approx(math.degrees(0.1))
@@ -168,13 +214,13 @@ def test_geocalib_without_prior_single_focal_and_missing_uncertainties(
     path = _image(tmp_path / "s.png", 320, 240)  # small: read as it is
     model = _GeoCalib.last
     model.result = _calibration([250.0], [0.0, 0.0, 3.0], unc=False)
-    res = geocalib.run(p.GravityRequest(image_path=str(path)))
-    assert model.calls[0][1] is None  # no prior
+    res = geocalib.run(p.GravityRequest(image_path=str(path))).finish()
+    assert "prior_focal" not in _called(model, "backbone")[0]  # no prior
     assert res["focal_px"] == pytest.approx(250.0) and res["up_cam"] == [0.0, 0.0, 1.0]
     assert res["roll_unc_deg"] == res["pitch_unc_deg"] == res["focal_unc_px"] == 0.0
     assert res["vfov_deg"] == pytest.approx(math.degrees(2 * math.atan(240 / 500.0)))
     model.result = _calibration([0.0], [0.0, -1.0, 0.0])
-    assert geocalib.run(p.GravityRequest(image_path=str(path)))["vfov_deg"] == 0.0  # no focal
+    assert geocalib.run(p.GravityRequest(image_path=str(path))).finish()["vfov_deg"] == 0.0
 
 
 # ------------------------------------------------------------------------------------------------
@@ -190,9 +236,9 @@ class _MapAnything:
         self.preds: list[dict[str, Tensor]] = []
 
     @classmethod
-    def from_pretrained(cls, repo: str) -> _MapAnything:
+    def from_pretrained(cls, repo: str, revision: str | None = None) -> _MapAnything:
         cls.last = cls()
-        cls.last.repo = repo
+        cls.last.repo, cls.last.revision = repo, revision
         return cls.last
 
     def to(self, device: Device) -> _MapAnything:
@@ -232,8 +278,10 @@ def _prediction(i: int, scale: bool = True) -> dict[str, Tensor]:
 
 
 @pytest.fixture
-def mapanything(torch: types.ModuleType) -> Iterator[mv.MapAnythingMultiview]:
+def mapanything(torch: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+                ) -> Iterator[mv.MapAnythingMultiview]:
     _MapAnything.torch = torch
+    monkeypatch.setattr(mv, "cached_file", lambda *a: None)  # not cached
     with installed(libraries({"mapanything.models": {"MapAnything": _MapAnything},
                               "mapanything.utils.image": {"preprocess_inputs": _preprocess}})):
         yield mv.MapAnythingMultiview()
@@ -241,10 +289,11 @@ def mapanything(torch: types.ModuleType) -> Iterator[mv.MapAnythingMultiview]:
 
 def test_mapanything_loads_the_apache_checkpoint_on_the_device(
         mapanything: mv.MapAnythingMultiview) -> None:
-    mapanything.load("mps")
+    mapanything.load("mps")  # not cached: downloaded, at the pinned revision
     model = _MapAnything.last
     assert mapanything.model is model and mapanything.device == "mps"
     assert model.repo == "facebook/map-anything-apache" == mv.REPO_ID
+    assert model.revision == mv.REVISION
     assert model.device == "mps" and model.evaluated
     mapanything.warmup()  # nothing to run without a real view
     assert model.calls == []
@@ -309,6 +358,107 @@ def test_mapanything_on_the_cpu_without_depth_or_scale(mapanything: mv.MapAnythi
     assert res["metric_scale"] == 1.0 and len(res["views"]) == 9
     assert all("depth_path" not in v and "conf_path" not in v for v in res["views"])
     assert not list((tmp_path / "o").iterdir()) and torch.calls == []
+
+
+class _Weight:
+    """A tensor as ``build_on_meta`` sees it: its dtype, and whether it is on ``meta``."""
+
+    def __init__(self, dtype: str, meta: bool = False) -> None:
+        self.dtype, self.is_meta = dtype, meta
+
+    def to(self, dtype: str) -> _Weight:
+        return _Weight(dtype)
+
+
+class _Built:
+    """A model ``build_on_meta`` builds: its tensors start on the device it was built on."""
+
+    last: _Built
+
+    def __init__(self, name: str, encoder_config: dict[str, Any], keep: bool = False) -> None:
+        meta = Device.active[-1:] == ["meta"]
+        self.kwargs = {"name": name, "encoder_config": encoder_config, "keep": keep}
+        self.built_on_meta = meta
+        self.tensors = {"w": _Weight("float32", meta), "b": _Weight("float32", meta)}
+        self.device, self.evaluated, self.loaded = "", False, {}
+        _Built.last = self
+
+    def state_dict(self) -> dict[str, _Weight]:
+        return dict(self.tensors)
+
+    def load_state_dict(self, state: dict[str, _Weight], strict: bool, assign: bool) -> None:
+        assert not strict and assign
+        self.loaded = state
+        self.tensors |= {k: v for k, v in state.items() if k in self.tensors}
+
+    def parameters(self) -> list[_Weight]:
+        return [self.tensors["w"]]
+
+    def buffers(self) -> list[_Weight]:
+        return [self.tensors["b"]]
+
+    def to(self, device: Device) -> _Built:
+        self.device = str(device)
+        return self
+
+    def eval(self) -> _Built:
+        self.evaluated = True
+        return self
+
+    @classmethod
+    def from_pretrained(cls, repo: str, revision: str | None = None) -> Any:
+        return _MapAnything.from_pretrained(repo, revision)
+
+
+def test_mapanything_builds_a_cached_checkpoint_on_meta_and_assigns_its_weights(
+        torch: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"name": "m", "encoder_config": {"encoder_str": "dinov2"},
+                                  "uses_torch_hub": True}))  # not an argument: left out
+    asked: list[tuple[str, str, str | None]] = []
+
+    def cached(repo: str, filename: str, revision: str | None = None) -> str:
+        asked.append((repo, filename, revision))
+        return str(config if filename == "config.json" else tmp_path / "model.safetensors")
+
+    read: list[tuple[str, str]] = []
+
+    def load_file(path: str, device: str) -> dict[str, _Weight]:
+        read.append((path, device))
+        # a half-precision weight is given the model's dtype, as load_state_dict copies it
+        return {"w": _Weight("float16"), "b": _Weight("float32"), "extra": _Weight("float32")}
+
+    monkeypatch.setattr(mv, "cached_file", cached)
+    with installed(libraries({"mapanything.models": {"MapAnything": _Built},
+                              "safetensors.torch": {"load_file": load_file}})):
+        a = mv.MapAnythingMultiview()
+        a.load("mps")
+    model = _Built.last
+    assert asked == [(mv.REPO_ID, "config.json", mv.REVISION),
+                     (mv.REPO_ID, "model.safetensors", mv.REVISION)]
+    assert read == [(str(tmp_path / "model.safetensors"), "cpu")]
+    assert a.model is model and model.built_on_meta and Device.active == []
+    assert model.kwargs == {"name": "m", "keep": False,
+                            "encoder_config": {"encoder_str": "dinov2",
+                                               "torch_hub_pretrained": False}}
+    assert model.tensors["w"].dtype == "float32" and "extra" in model.loaded
+    assert model.device == "mps" and model.evaluated
+
+
+def test_mapanything_built_on_meta_with_a_tensor_the_checkpoint_lacks_is_built_again(
+        torch: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"name": "m", "encoder_config": {"encoder_str": "radio"}}))
+    monkeypatch.setattr(mv, "cached_file", lambda repo, filename, revision=None: str(config))
+    with installed(libraries({"mapanything.models": {"MapAnything": _Built},
+                              "safetensors.torch": {"load_file": lambda p, device: {
+                                  "w": _Weight("float32")}}})):
+        a = mv.MapAnythingMultiview()
+        a.load("cpu")
+    # the encoder's config as it is (not DINOv2); the buffer stayed on meta: from_pretrained
+    assert _Built.last.kwargs["encoder_config"] == {"encoder_str": "radio"}
+    assert a.model is _MapAnything.last and _MapAnything.last.revision == mv.REVISION
+    assert a.model.device == "cpu"
 
 
 # ------------------------------------------------------------------------------------------------
@@ -539,9 +689,20 @@ def _moge(model: _MoGe, device: str = "cpu") -> gm.MoGeGeometry:
 
 
 @pytest.fixture
-def moge_lib(torch: types.ModuleType) -> Iterator[None]:
+def moge_lib(torch: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setattr(gm, "cached_file", lambda repo, filename: None)  # not cached
     with installed(libraries({"moge.model.v2": {"MoGeModel": _MoGe}})):
         yield
+
+
+def test_moge_loads_the_cached_checkpoint_without_asking_the_hub(
+        moge_lib: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(gm, "cached_file", lambda repo, filename: f"/cache/{repo}/{filename}")
+    monkeypatch.setattr(_MoGe, "from_pretrained",
+                        classmethod(lambda cls, path: (seen.append(path), cls.built)[1]))
+    _moge(_MoGe())
+    assert seen == [f"/cache/{gm.REPO_ID}/model.pt"]
 
 
 def test_moge_drops_the_normal_head_and_uses_native_attention_when_present(

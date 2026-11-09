@@ -112,6 +112,7 @@ def serve(make_registry: Callable[[], Registry], device: str | None = None) -> i
         server.run(sockets=[sock])
         state.stopping = True
         worker.stop(timeout=10.0)
+        state.cpu_pool.shutdown(wait=False, cancel_futures=True)
         return 0
     finally:
         clear_state(sock_path)

@@ -378,3 +378,37 @@ def test_stored_objects_move_with_their_rescaled_keyframes() -> None:
     assert np.linalg.norm(o.obb.center - T0.t) == pytest.approx(dist_before * np.sqrt(0.9),
                                                                 rel=0.02)
     assert not mo.rescale_objects(state, {}, recs)
+
+
+def test_medians_by_the_same_arithmetic_as_numpys() -> None:
+    """``pair_bins``' medians are ``np.median``'s, bit for bit (odd and even counts, sorted)."""
+    from oh_my_slam.reconstruction.depth import _median, _sorted_median
+
+    rng = np.random.default_rng(3)
+    for n in (1, 2, 3, 4, 7, 10, 101):
+        x = rng.standard_normal(n) * 10.0
+        assert _median(x) == float(np.median(x))
+        assert _sorted_median(np.sort(x)) == float(np.median(x))
+
+
+def test_dense_scale_reuses_the_reference_medians_its_caller_keeps() -> None:
+    """``medians``: each reference's median depth computed once per array over several calls,
+    with the same fit as without the cache; another array (or none seen) is measured anew."""
+    from oh_my_slam.reconstruction import depth as dm
+
+    K = np.array([[100.0, 0.0, 32.0], [0.0, 100.0, 24.0], [0.0, 0.0, 1.0]])
+    d = np.full((48, 64), 2.0, np.float32)
+    T_ref = np.eye(4)
+    T_ref[0, 3] = 0.05
+    ref = np.full((48, 64), 2.0, np.float32)
+    plain = dm.dense_scale(d * 1.1, K, np.eye(4), [(ref, K, T_ref)], min_points=50)
+    cache: dict[int, tuple[np.ndarray, float]] = {}
+    first = dm.dense_scale(d * 1.1, K, np.eye(4), [(ref, K, T_ref)], min_points=50,
+                           medians=cache)
+    assert cache[id(ref)] == (ref, 2.0)
+    cache[id(ref)] = (ref, 2.0)  # a hit: the stored value is used as it is
+    again = dm.dense_scale(d * 1.1, K, np.eye(4), [(ref, K, T_ref)], min_points=50,
+                           medians=cache)
+    assert plain == first == again and abs(plain.scale - 1 / 1.1) < 1e-3
+    empty = np.zeros((48, 64), np.float32)
+    assert dm._seen_median(empty, cache) == 0.0 and cache[id(empty)][1] == 0.0

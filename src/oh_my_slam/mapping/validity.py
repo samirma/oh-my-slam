@@ -112,11 +112,12 @@ class View:
         d = np.zeros(len(pts_map))
         ui = np.zeros(len(pts_map), np.int64)
         vi = np.zeros(len(pts_map), np.int64)
-        ui[inside], vi[inside] = u[inside], v[inside]
-        use = self.usable()
-        ok = use[vi[inside], ui[inside]]
-        d[inside] = np.where(ok, self.depth[vi[inside], ui[inside]], 0.0)
-        inside[np.flatnonzero(inside)[~ok]] = False
+        at = np.flatnonzero(inside)
+        ui_at, vi_at = u[at].astype(np.int64), v[at].astype(np.int64)
+        ui[at], vi[at] = ui_at, vi_at
+        ok = self.usable()[vi_at, ui_at]
+        d[at] = np.where(ok, self.depth[vi_at, ui_at], 0.0)
+        inside[at[~ok]] = False
         return inside, z, d, ui, vi
 
 
@@ -212,14 +213,12 @@ def contradicted_cells(old: View, new_views: list[View], mapper: Any = map
         # (2) new surface in front of what the old keyframe observed
         q, _, _ = nv.grid_points()
         if len(q):
-            inside, z, d = old.lookup(q)
+            # the cell of ``old`` each new point lands in: of the pixel it projects to
+            inside, z, d, u, v = old.lookup_pixels(q)
             dn = _normalised(d[inside], z[inside])
             if dn is not None:
-                pc = old.T_map_cam.inverse().apply(q[inside])
-                uv, _ = project(pc, old.K.K())
-                r = np.clip(np.rint(uv[:, 1]).astype(int) // GRID, 0, gh - 1)
-                c = np.clip(np.rint(uv[:, 0]).astype(int) // GRID, 0, gw - 1)
-                samples.append((dn - z[inside], z[inside], d[inside] > far_at, r, c))
+                samples.append((dn - z[inside], z[inside], d[inside] > far_at,
+                                v[inside] // GRID, u[inside] // GRID))
         if not samples:
             return voted, agreed, strong
         diff, z, far, r, c = (np.concatenate(x) for x in zip(*samples, strict=True))

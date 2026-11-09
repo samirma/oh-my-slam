@@ -58,6 +58,19 @@ ROTATION_FIT_DEG = 1.0
 ROTATION_FIT_MATCHES = 200  # matches per pair the rotation is fitted to (evenly subsampled)
 MAX_FEATURES = 4096
 SIFT_UNDOUBLED_VIDEO_SIDE = 1600  # Sfm.extract
+# COLMAP's CPU SIFT extractor runs one image per thread, and an image's working memory grows with
+# the pixels it reads (four times the image's when doubled): 2.3 GB per thread for the 12 MP
+# photos of office_sequence read doubled (13 images: 13.5 GB at 12 threads, 9.3 GB at 4, 4.7 GB
+# at 2), about SIFT_BYTES_PER_PX per pixel read. At every core, beside the inference server, the
+# machine swapped and the extraction took 305 s (68 s alone; 28 s at 4 threads). The threads are
+# therefore as many as SIFT_MEMORY_SHARE of the memory available at the start lets run at once
+# (``extraction_threads``), and at least SIFT_MIN_THREADS: beside the server (3 GB available, so
+# one thread) the office photos mapped in 80-100 s, in 70 s at 2 threads and 63 s at 3 (the
+# server's inference then slowed by swapping, 25 s -> 31 s). A thread's features do not depend on
+# how many run (the same database, byte for byte, at 2, 4 and 12 threads).
+SIFT_BYTES_PER_PX = 50
+SIFT_MEMORY_SHARE = 0.75
+SIFT_MIN_THREADS = 2
 
 # COLMAP TwoViewGeometry configuration codes
 _PLANAR, _PANORAMIC, _PLANAR_OR_PANORAMIC = 4, 5, 6
@@ -489,6 +502,27 @@ def _back_onto(model: SfmModel, base: SfmModel) -> SfmModel | None:
     return model
 
 
+def extraction_threads(width: int, height: int, doubled: bool, images: int) -> int:
+    """COLMAP's ``FeatureExtraction.num_threads`` for ``images`` images of ``width`` x
+    ``height`` (read ``doubled`` or not): ``SFM_THREADS`` when the threads it means (every core,
+    or that many) fit in ``SIFT_MEMORY_SHARE`` of the available memory, else as many threads as
+    fit, at least ``SIFT_MIN_THREADS`` (fewer only when ``SFM_THREADS`` pins fewer)."""
+    import os
+
+    import psutil
+
+    per_image = SIFT_BYTES_PER_PX * width * height * (4 if doubled else 1)
+    fit = int(SIFT_MEMORY_SHARE * psutil.virtual_memory().available // per_image)
+    wanted = SFM_THREADS if SFM_THREADS > 0 else (os.cpu_count() or 1)
+    least = min(SIFT_MIN_THREADS, wanted)
+    if max(fit, least) >= min(wanted, images):
+        return SFM_THREADS
+    threads = max(least, fit)
+    log.info("SIFT extraction on %d threads: %.1f GB per %d x %d image%s", threads,
+             per_image / 1e9, width, height, " (doubled)" if doubled else "")
+    return threads
+
+
 class Sfm:
     def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
                  only: Iterable[str] | None = None) -> None:
@@ -529,7 +563,8 @@ class Sfm:
             str(self.image_dir), "--image_list_path", str(lst),
             "--ImageReader.camera_model", "SIMPLE_PINHOLE",
             "--FeatureExtraction.use_gpu", "0", "--log_level", "1",
-            "--FeatureExtraction.num_threads", str(SFM_THREADS),
+            "--FeatureExtraction.num_threads",
+            str(extraction_threads(prior.width, prior.height, doubled, len(names))),
             "--FeatureExtraction.type", "SIFT", "--SiftExtraction.max_num_features",
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]

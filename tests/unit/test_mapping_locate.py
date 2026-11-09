@@ -872,3 +872,121 @@ def test_gate_keeps_the_limit_for_well_baselined_keyframes() -> None:
     T2, med2, ok = _gate(w, T)
     assert not ok and T2 is T and med2 == med
     assert _gate(w, truth)[2]
+
+
+# ------------------------------------------------------------------------------------------------
+# a query placed by its rotation alone, from the keyframes' spot (analytic head, no COLMAP)
+
+
+def _turn_world(steps: dict[str, np.ndarray], pose_source: str, keep: int | None = None,
+                outliers: int = 0):  # type: ignore[no-untyped-def]
+    """``_gate_world``'s head with ``keep`` matches per keyframe (evenly), ``outliers`` of them
+    (each keyframe's last) moved to random pixels, and keyframes whose depth is valid everywhere
+    (``median_depth``)."""
+    w = _gate_world(steps, pose_source)
+    rng = np.random.default_rng(11)
+    out = []
+    for m in w.matches:
+        sel = np.linspace(0, len(m.uv_q) - 1, keep or len(m.uv_q)).astype(int)
+        uq = m.uv_q[sel].copy()
+        if outliers:
+            uq[-outliers:] = rng.uniform([0, 0], [w.K.width, w.K.height], (outliers, 2))
+        out.append(w.lmod._Match(m.keyframe, m.idx_q[sel], m.idx_k[sel], uq, m.uv_k[sel]))
+    w.matches = out
+    w.points.median_depth = lambda fr: 2.0
+    w.query = w.lmod._Query(Path("/q/turned.jpg"), 0, "locate_000000.jpg", (w.K.width, w.K.height),
+                            None)
+    return w
+
+
+def test_a_query_without_depth_is_turned_from_the_keyframes_spot() -> None:
+    """Keyframes of a head turning in place (multi-view): a query whose matches have no depth is
+    placed by its rotation alone, at the keyframes' centre — within half a degree of the truth
+    (its camera is 5 cm in front of the pivot: the near matches' parallax is no rotation's), and
+    despite a share of outliers."""
+    from tests.synth.turning import rot_err_deg
+
+    w = _turn_world({}, "multiview", keep=12, outliers=2)
+    lmod = w.lmod
+    centre = lmod.one_spot(w.matches, w.points)
+    assert centre is not None
+    r = lmod._located_by_turn(w.query, w.K, w.matches, w.points)
+    assert r is not None and r.located and r.K is w.K
+    assert rot_err_deg(r.T_map_cam, w.truth) < 0.5
+    assert np.allclose(r.T_map_cam.t, centre)
+    total = sum(len(m.idx_q) for m in w.matches)
+    assert lmod.MIN_INLIERS <= r.inliers <= total - 2 * len(w.matches)
+
+
+def test_a_turn_needs_keyframes_from_one_spot_and_agreeing_matches() -> None:
+    """No turn for keyframes metres apart (SfM poses of a walk), for too few matches, or where
+    most of the matches disagree with the rotation."""
+    rng = np.random.default_rng(3)
+    steps = {f"f{k:06d}": np.array([*rng.uniform(-1.2, 1.2, 2), 0.0]) for k in range(7)}
+    w = _turn_world(steps, "sfm-global")
+    lmod = w.lmod
+    assert lmod.one_spot(w.matches, w.points) is None
+    assert lmod._located_by_turn(w.query, w.K, w.matches, w.points) is None
+    # SfM keyframes within a fraction of the scene depth of each other: one spot after all
+    near = {n: 0.002 * s for n, s in steps.items()}
+    assert lmod.one_spot(_turn_world(near, "sfm-global").matches, w.points) is None  # their poses
+    w = _turn_world(near, "sfm-global")
+    assert lmod.one_spot(w.matches, w.points) is not None
+    few = _turn_world({}, "multiview", keep=2)
+    assert sum(len(m.idx_q) for m in few.matches) < lmod.MIN_INLIERS
+    assert lmod._located_by_turn(few.query, few.K, few.matches, few.points) is None
+    noisy = _turn_world({}, "multiview", keep=8, outliers=7)
+    assert lmod._located_by_turn(noisy.query, noisy.K, noisy.matches, noisy.points) is None
+    # keyframes without any depth say nothing about where they were taken from
+    noisy.points.median_depth = lambda fr: None
+    assert lmod.one_spot(noisy.matches, noisy.points) is None
+
+
+def test_a_turn_is_tried_only_after_the_points_and_for_a_map_camera(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_locate_one``: the 2D-3D pose first; the turn only when it fails and the query shares a
+    map camera; the points' reason stays when the turn fails too."""
+    w = _turn_world({}, "multiview", keep=6)
+    lmod = w.lmod
+    seen: list[int] = []
+
+    def no_points(q, K, refine, matches, points):  # type: ignore[no-untyped-def]
+        seen.append(len(matches))
+        return lmod.Located(q.image, q.index, reason="too few")
+
+    monkeypatch.setattr(lmod, "_located_by_points", no_points)
+    assert lmod._locate_one(w.query, w.K, False, w.matches, w.points).located
+    assert seen == [len(w.matches)]
+    assert lmod._locate_one(w.query, w.K, True, w.matches, w.points).reason == "too few"
+    monkeypatch.setattr(lmod, "_located_by_turn", lambda *a: None)
+    assert lmod._locate_one(w.query, w.K, False, w.matches, w.points).reason == "too few"
+    found = lmod.Located(w.query.image, 0, w.truth, w.K, 40)
+    monkeypatch.setattr(lmod, "_located_by_points", lambda *a: found)
+    assert lmod._locate_one(w.query, w.K, False, w.matches, w.points) is found
+
+
+def test_turn_ransac_with_a_single_agreeing_pair() -> None:
+    """Fewer than two inliers: the best two-match rotation and its inliers as they are."""
+    from oh_my_slam.mapping import locate as lmod
+
+    a = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+    b = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+    R, inl = lmod.turn_ransac(a, b)
+    assert inl.sum() == 2 and np.allclose(R @ a.T, b.T)  # turned onto each other exactly
+    # rays 90° apart onto rays 10° apart: no rotation keeps both (the best fit splits the error)
+    c = np.array([[0.0, 0.0, 1.0], [np.sin(np.radians(10.0)), 0.0, np.cos(np.radians(10.0))]])
+    R, inl = lmod.turn_ransac(a, c)
+    assert inl.sum() < 2 and R.shape == (3, 3)
+
+
+def test_a_keyframe_s_median_depth_skips_invalid_cells() -> None:
+    from oh_my_slam.mapping import locate as lmod
+
+    pts = lmod._MapPoints.__new__(lmod._MapPoints)
+    fr = SimpleNamespace(name="f000001")
+    d = np.array([[1.0, 2.0], [3.0, 0.0]], np.float32)
+    pts._depth = {"f000001": (d, np.array([[True, True], [False, True]]))}
+    pts._depth_points = lambda fr, uv: None  # type: ignore[method-assign]
+    assert pts.median_depth(fr) == 1.5  # type: ignore[arg-type]
+    pts._depth = {"f000001": (d, np.zeros((2, 2), bool))}
+    assert pts.median_depth(fr) is None  # type: ignore[arg-type]

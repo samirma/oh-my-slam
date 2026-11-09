@@ -12,7 +12,7 @@ from PIL import Image
 from oh_my_slam.client import protocol as p
 from oh_my_slam.core import rle
 from oh_my_slam.server.app import ServerState, create_app
-from oh_my_slam.server.gpu_worker import GpuWorker
+from oh_my_slam.server.gpu_worker import CpuFinish, GpuWorker
 from oh_my_slam.server.models import Registry
 from tests.fakes.stub_models import stub_registry
 
@@ -165,3 +165,42 @@ def test_failed_models_give_an_actionable_error(monkeypatch: pytest.MonkeyPatch)
     assert "models failed to load" in msg and "MoGe: OSError: no weights" in msg
     assert str(paths.server_log()) in msg and "./start_inference_server.sh" in msg
     assert "not running" not in msg and exc.value.exit_code == ExitCode.SERVER_UNAVAILABLE
+
+
+def test_the_device_free_remainder_of_a_job_runs_off_the_device_thread(image: Path) -> None:
+    """A job that returns a ``CpuFinish`` frees the device thread at once: its ``finish`` runs on
+    the server's CPU threads; the response's compute time is both parts', its queue time the
+    device part's. An error in ``finish`` is answered as a run's error."""
+    state = make_state()
+    client = TestClient(create_app(state))
+    threads: dict[str, int] = {}
+
+    def run(req: object) -> CpuFinish:
+        threads["run"] = threading.get_ident()
+        time.sleep(0.05)
+
+        def finish() -> dict[str, object]:
+            threads["finish"] = threading.get_ident()
+            time.sleep(0.05)
+            return {"up_cam": [0.0, -1.0, 0.0], "roll_deg": 0.0, "pitch_deg": 0.0,
+                    "roll_unc_deg": 0.0, "pitch_unc_deg": 0.0, "focal_px": 1.0,
+                    "focal_unc_px": 0.0, "vfov_deg": 1.0, "timings": {}}
+
+        return CpuFinish(finish)
+
+    state.registry.adapters["gravity"].run = run  # type: ignore[method-assign]
+    body = p.GravityRequest(image_path=str(image)).model_dump()
+    r = p.GravityResponse.model_validate(client.post(p.ROUTE_GRAVITY, json=body).json())
+    assert threads["run"] == state.worker.thread_ident != threads["finish"]
+    assert r.timings.compute_s >= 0.1 and 0 <= r.timings.queue_s < 0.05
+
+    def bad_input() -> dict[str, object]:
+        raise ValueError("no gravity here")
+
+    state.registry.adapters["gravity"].run = (  # type: ignore[method-assign]
+        lambda req: CpuFinish(bad_input))
+    r2 = client.post(p.ROUTE_GRAVITY, json=body)
+    assert r2.status_code == 400 and r2.json() == {"error": "ValueError",
+                                                   "detail": "no gravity here"}
+    state.worker.stop()
+    state.cpu_pool.shutdown()

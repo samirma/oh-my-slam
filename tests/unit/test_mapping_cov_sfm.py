@@ -5,6 +5,7 @@ database rules (cameras, pairs, components, LightGlue restores) and the reconstr
 from __future__ import annotations
 
 import subprocess
+import types
 from pathlib import Path
 from typing import Any
 
@@ -514,3 +515,29 @@ def test_a_model_reposed_moves_its_keyframes_and_triangulates_again(tmp_path: Pa
     np.testing.assert_allclose(model.pose("f1.jpg").matrix(), moved.matrix(), atol=1e-9)
     np.testing.assert_allclose(model.pose("f0.jpg").matrix(), np.eye(4), atol=1e-12)
     np.testing.assert_allclose(model.rec.cameras[1].params, [110.0, 32.0, 24.0])
+
+
+def test_sift_extraction_threads_are_as_many_as_the_available_memory_holds(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``extraction_threads``: every core (``SFM_THREADS``) when they fit in the memory share,
+    else as many as fit, at least ``SIFT_MIN_THREADS``; a pinned thread count stays pinned."""
+    import psutil
+
+    gib = 1 << 30
+    avail = {"bytes": 64 * gib}
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: types.SimpleNamespace(available=avail["bytes"]))
+    monkeypatch.setattr("os.cpu_count", lambda: 12)
+    photo = (4000, 3000)  # 2.4 GB read doubled, 0.6 GB not
+    assert sfm_mod.extraction_threads(*photo, True, 13) == sfm_mod.SFM_THREADS  # 20 fit
+    avail["bytes"] = 12 * gib  # 9 GiB of it: 4 photos read doubled at once
+    assert sfm_mod.extraction_threads(*photo, True, 13) == 4
+    assert sfm_mod.extraction_threads(*photo, False, 13) == sfm_mod.SFM_THREADS  # 16 fit
+    assert sfm_mod.extraction_threads(*photo, True, 3) == sfm_mod.SFM_THREADS  # 3 images: fit
+    avail["bytes"] = gib // 2
+    assert sfm_mod.extraction_threads(*photo, True, 13) == sfm_mod.SIFT_MIN_THREADS == 2
+    assert sfm_mod.extraction_threads(*photo, True, 2) == sfm_mod.SFM_THREADS  # the least: all
+    monkeypatch.setattr(sfm_mod, "SFM_THREADS", 1)  # pinned (the tests' determinism)
+    assert sfm_mod.extraction_threads(*photo, True, 13) == 1
+    avail["bytes"] = 64 * gib
+    assert sfm_mod.extraction_threads(*photo, True, 13) == 1

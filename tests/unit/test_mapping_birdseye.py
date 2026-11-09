@@ -297,6 +297,19 @@ def test_a_tag_stays_inside_the_image(scene: Any) -> None:
     assert np.any(np.all(top == color_for_id(2), axis=-1))  # object 2 lies at y = 1.9..2.0
 
 
+def test_a_tag_never_hides_another_object_s_outline(scene: Any) -> None:
+    """A small object right where a neighbour's id tag goes (a cluttered desk) keeps its whole
+    outline: the tags lie under every outline."""
+    big = obj(1, (0.0, 0.0), (0.6, 0.4))
+    small = obj(7, (0.0, 0.29), (0.05, 0.04))  # under the tag above object 1's footprint
+    reader = scene(objects=[big, small])
+    rgb, text = rgb_of(lo.png_payload(reader, [], "single", ("obb",)))
+    for x, y in ((-0.025, 0.29), (0.025, 0.29), (0.0, 0.27), (0.0, 0.31)):  # its four edges
+        r, c = pixel(text, x, y)
+        window = rgb[r - 1:r + 2, c - 1:c + 2].reshape(-1, 3)
+        assert any(tuple(int(v) for v in px) == color_for_id(7) for px in window), (x, y)
+
+
 # -- the evaluator's check -----------------------------------------------------------------------------
 
 

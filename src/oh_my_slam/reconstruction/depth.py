@@ -83,6 +83,18 @@ def _dominant(r: NDArray[np.float64]) -> NDArray[np.bool_]:
     return np.asarray(np.abs(r - centre) <= CLUSTER_GATE)
 
 
+def _seen_median(rd: NDArray[Any], cache: dict[int, tuple[NDArray[Any], float]]) -> float:
+    """The median of a reference depth map's observed (positive) depths, 0 without any;
+    remembered in ``cache`` by the array (kept there, so its id is not reused)."""
+    hit = cache.get(id(rd))
+    if hit is not None and hit[0] is rd:
+        return hit[1]
+    seen = rd[rd > 0]
+    med = float(np.median(seen)) if len(seen) else 0.0
+    cache[id(rd)] = (rd, med)
+    return med
+
+
 def dense_scale(
     depth: NDArray[Any],
     K: NDArray[Any],
@@ -91,6 +103,7 @@ def dense_scale(
     step: int = 6,
     iterations: int = 2,
     min_points: int = 500,
+    medians: dict[int, tuple[NDArray[Any], float]] | None = None,
 ) -> ScaleFit:
     """Scale s so that ``s * depth`` agrees with already-aligned reference depth maps.
 
@@ -98,7 +111,9 @@ def dense_scale(
     reference (depth, K, T_world_cam) and compared with the depth that reference observed along
     the same ray; the robust median ratio of the dominant cluster updates s (two iterations
     absorb small baselines). The near field (``NEAR_SHARE``) of either view takes no part. Used
-    for keyframes with too few triangulated points for a sparse fit.
+    for keyframes with too few triangulated points for a sparse fit. ``medians``: a cache of the
+    references' median depths that the caller keeps over several calls (by array; the arrays
+    must not change in place meanwhile).
     """
     d = np.asarray(depth, np.float64)
     h, w = d.shape
@@ -112,10 +127,12 @@ def dense_scale(
     Rw, tw = np.asarray(T_world_cam)[:3, :3], np.asarray(T_world_cam)[:3, 3]
     s = 1.0
     fit = ScaleFit(float("nan"), 0, float("inf"))
+    medians = {} if medians is None else medians
+    near = [_seen_median(rd, medians) * NEAR_SHARE for rd, _, _ in refs]
     for _ in range(iterations):
         pts = (Kinv_rays * (s * z0)[:, None]) @ Rw.T + tw
         num, den = [], []
-        for rd, rK, rT in refs:
+        for (rd, rK, rT), near_r in zip(refs, near, strict=True):
             Rc = np.asarray(rT)[:3, :3].T
             tc = -Rc @ np.asarray(rT)[:3, 3]
             pc = pts @ Rc.T + tc
@@ -129,8 +146,7 @@ def dense_scale(
             if inside.sum() < 50:
                 continue
             obs = rd[pv[inside].astype(int), pu[inside].astype(int)]
-            seen = rd[rd > 0]
-            good = (obs > 0) & (obs >= NEAR_SHARE * (np.median(seen) if len(seen) else 0.0))
+            good = (obs > 0) & (obs >= near_r)
             num.append(obs[good])
             den.append(zc[inside][good])
         if not num:
@@ -472,6 +488,23 @@ class BinRatio:
     field_dst: tuple[float, ...] = ()
 
 
+def _median(x: NDArray[np.float64]) -> float:
+    """``np.median`` of a 1-D float array without NaN, by the same arithmetic (the middle
+    value, or the mean of the two middle ones) without its overhead: ``pair_bins`` takes
+    thousands of them."""
+    k = len(x) // 2
+    if len(x) % 2:
+        return float(np.partition(x, k)[k])
+    p = np.partition(x, (k - 1, k))
+    return float((p[k - 1] + p[k]) / 2.0)
+
+
+def _sorted_median(x: NDArray[np.float64]) -> float:
+    """``_median`` of an array already in ascending order."""
+    k = len(x) // 2
+    return float(x[k]) if len(x) % 2 else float((x[k - 1] + x[k]) / 2.0)
+
+
 def pair_bins(i: int, j: int, a: DepthView, b: DepthView, bins: int = DEPTH_BINS,
               min_points: int = PAIR_MIN_POINTS) -> list[BinRatio]:
     """``BinRatio`` of keyframes ``i`` (view ``a``) and ``j`` (view ``b``) in both directions:
@@ -494,8 +527,8 @@ def pair_bins(i: int, j: int, a: DepthView, b: DepthView, bins: int = DEPTH_BINS
             for part in np.array_split(order, int(np.clip(len(idx) // BIN_POINTS, 1, bins))):
                 if len(part) < BIN_MIN_POINTS:
                     continue
-                out.append(BinRatio(s, t, float(np.median(r[part])), float(np.median(ls[part])),
-                                    float(np.median(ld[part])), w * len(part),
+                out.append(BinRatio(s, t, _median(r[part]), _sorted_median(ls[part]),
+                                    _median(ld[part]), w * len(part),
                                     tuple(ws[part].mean(axis=0).tolist()),
                                     tuple(wd[part].mean(axis=0).tolist())))
     return out

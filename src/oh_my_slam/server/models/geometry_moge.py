@@ -26,6 +26,7 @@ import numpy as np
 from oh_my_slam.client.protocol import GeometryRequest
 from oh_my_slam.core.atomic import atomic_save_npy
 from oh_my_slam.core.images import load_rgb, upright_size
+from oh_my_slam.server.models.hub import cached_file
 
 REPO_ID = "Ruicheng/moge-2-vitl-normal"
 
@@ -136,7 +137,8 @@ class MoGeGeometry:
         from moge.model.v2 import MoGeModel
 
         self.device = device
-        model = MoGeModel.from_pretrained(REPO_ID)
+        # the cached checkpoint without asking the Hub (else it is downloaded)
+        model = MoGeModel.from_pretrained(cached_file(REPO_ID, "model.pt") or REPO_ID)
         if hasattr(model, "normal_head"):
             # The server returns no normals. Each head reads only the shared neck, so without this
             # one the others give the same output, bit for bit, and a forward pass takes 5 % less.

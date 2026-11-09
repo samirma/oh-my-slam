@@ -21,8 +21,10 @@ focal length is refined unless the query shares a map camera. A result with fewe
 ``MIN_INLIERS`` inliers, or whose pose contradicts its verified matches to the stored keyframe poses
 (median epipolar distance above ``MAX_EPIPOLAR_DEG``, as for the map's own keyframes;
 ``epipolar_gate``, which refines the pose of a camera seen from the keyframes' spot first), leaves
-the image unlocated: it is reported on stderr, naming the image, and left out of the result; with
-no image located the command fails with an input error.
+the image unlocated — unless it shares a map camera and its matched keyframes were taken from one
+spot (``one_spot``), when its rotation alone places it at their centre (``_located_by_turn``):
+it is reported on stderr, naming the image, and
+left out of the result; with no image located the command fails with an input error.
 
 Without images the result's camera is the map's last known camera (``last_known_camera``): the
 keyframe added last (latest update, then latest frame in input order). Nothing is matched, so the
@@ -426,6 +428,14 @@ class _MapPoints:
             self._depth[fr.name] = (depth, self.reader.valid(fr) & ~depth_edge_mask(depth))
         return depth_points(*self._depth[fr.name], fr, uv)
 
+    def median_depth(self, fr: store.FrameRecord) -> float | None:
+        """The median of keyframe ``fr``'s valid stored depth (off depth edges), None without
+        any."""
+        self._depth_points(fr, np.zeros((0, 2)))  # its depth, read once
+        d, valid = self._depth[fr.name]
+        z = np.asarray(d, np.float64)[np.asarray(valid, bool) & (np.asarray(d) > 0)]
+        return float(np.median(z)) if len(z) else None
+
     def depth_scale(self, fr: store.FrameRecord) -> float | None:
         """Factor of keyframe ``fr``'s depth points: the median model/depth z ratio (camera
         frame) over its keypoints with both, 1 without enough of them (a multi-view keyframe,
@@ -586,6 +596,19 @@ def _query_intrinsics(reader: store.MapReader, sfm: Sfm, q: _Query, db: dict[str
 
 def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
                 points: _MapPoints) -> Located:
+    """The pose of one query from its verified matches with the keyframes: 2D-3D
+    (``_located_by_points``), else, for a query that shares a map camera and matches keyframes
+    taken from one spot, its rotation alone (``_located_by_turn``); an image neither places keeps
+    the reason the points gave."""
+    out = _located_by_points(q, K, refine, matches, points)
+    if out.located or refine:
+        return out
+    turned = _located_by_turn(q, K, matches, points)
+    return turned if turned is not None else out
+
+
+def _located_by_points(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
+                       points: _MapPoints) -> Located:
     out = Located(q.image, q.index)
     # SfM model points alone first: bundle-adjusted with the keyframe poses, they place a camera
     # more precisely than depth points do; the depth fills in when they are too few
@@ -615,6 +638,114 @@ def _locate_one(q: _Query, K: Intrinsics, refine: bool, matches: list[_Match],
         return out
     out.T_map_cam, out.K, out.inliers = T, Kq, inliers
     return out
+
+
+# A query of a map whose keyframes it matches were taken from one spot (a pan-tilt camera turning
+# in place: multi-view keyframes given one centre, or keyframes within ROTATION_BASELINE of the
+# scene depth of each other) may share too few matches with points of known depth — surfaces the
+# depth leaves out (the out-of-focus near field, depth edges) or bare walls, where its matches
+# are few — for the 2D-3D pose: on examples/camera's held-out captures (the map of its first 12
+# captures), 15-22 verified matches each for p07-high, p08-high and p08-mid, 0-2 of them with a
+# map point. Their rays still fix its rotation: the rotation that turns the query's rays onto the
+# keyframes' (Kabsch on two matches, RANSAC, TURN_RANSAC_ROUNDS rounds, inliers within
+# TURN_INLIER_DEG, refitted on them) is the query's, at the keyframes' centre. It is kept with at
+# least MIN_INLIERS inliers that are at least TURN_MIN_SHARE of its verified matches: those three
+# fitted 0.08-0.11° (median) with 17-20 inliers of 21-22, 2.7-4.5° from where the one-update map
+# of all 36 captures poses them; p06-high and p07-floor, whose 2D-3D poses their matches
+# contradicted (0.38° and 0.34°), 0.30° with 90 of 167 and 0.31° with 19 of 59, 3.2° and 1.5° from
+# it. Their verified matches already passed COLMAP's two-view verification; a rotation is not
+# kept where most of them disagree with it. Pairs verified with fewer than MIN_INLIERS inliers
+# (COLMAP's TwoViewGeometry.min_num_inliers at 8) are not pooled: they added nothing there, and
+# p07-floor's 45 more matches left it under TURN_MIN_SHARE.
+TURN_INLIER_DEG = 2 * MAX_EPIPOLAR_DEG
+TURN_MIN_SHARE = 0.25
+TURN_RANSAC_ROUNDS = 500
+
+
+def _keyframe_rays(uv: NDArray[Any], K: Intrinsics) -> NDArray[np.float64]:
+    """Unit rays (camera frame) of pixels ``uv`` where the camera's pinhole sees them (its lens
+    already undone: ``_Match``)."""
+    from dataclasses import replace
+
+    x = np.column_stack([replace(K, k=0.0).rays(uv), np.ones(len(uv))])
+    return np.asarray(x / np.linalg.norm(x, axis=1, keepdims=True), np.float64)
+
+
+def kabsch(a: NDArray[Any], b: NDArray[Any]) -> NDArray[np.float64]:
+    """The rotation ``R`` that best turns the unit vectors ``a`` (N, 3) onto ``b``: R a ~ b."""
+    U, _, Vt = np.linalg.svd(np.asarray(a, np.float64).T @ np.asarray(b, np.float64))
+    D = np.diag([1.0, 1.0, float(np.sign(np.linalg.det(Vt.T @ U.T)))])
+    return np.asarray(Vt.T @ D @ U.T, np.float64)
+
+
+def _angles_deg(R: NDArray[Any], a: NDArray[Any], b: NDArray[Any]) -> NDArray[np.float64]:
+    return np.degrees(np.arccos(np.clip(np.sum((a @ R.T) * b, axis=1), -1.0, 1.0)))
+
+
+def turn_ransac(a: NDArray[Any], b: NDArray[Any]) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """(rotation, inliers) turning the rays ``a`` onto ``b`` (see ``TURN_INLIER_DEG``): the
+    two-match rotation with most inliers (seeded: one input, one result), refitted on them."""
+    rng = np.random.default_rng(0)
+    best: tuple[int, NDArray[np.float64]] = (-1, np.eye(3))
+    for _ in range(TURN_RANSAC_ROUNDS):
+        i = rng.choice(len(a), 2, replace=False)
+        R = kabsch(a[i], b[i])
+        n = int(np.sum(_angles_deg(R, a, b) < TURN_INLIER_DEG))
+        if n > best[0]:
+            best = (n, R)
+    inl = _angles_deg(best[1], a, b) < TURN_INLIER_DEG
+    if inl.sum() >= 2:
+        R = kabsch(a[inl], b[inl])
+        inl = _angles_deg(R, a, b) < TURN_INLIER_DEG
+        return R, inl
+    return best[1], inl
+
+
+def one_spot(matches: list[_Match], points: _MapPoints) -> NDArray[np.float64] | None:
+    """The centre the keyframes ``matches`` link to were taken from, when it is one spot: most
+    matches are with multi-view keyframes (a camera turning in place), or the keyframes lie within
+    ``ROTATION_BASELINE`` of their median scene depth (the median of each one's valid depth) of
+    their median centre (by match count); else None."""
+    w, C, mv, depth = [], [], 0, []
+    for m in matches:
+        fr = points.frames[m.keyframe]
+        z = points.median_depth(fr)
+        if z is None:
+            continue
+        w.append(len(m.idx_k))
+        C.append(fr.T_map_cam.t)
+        mv += 0 if model_points_trusted(fr) else len(m.idx_k)
+        depth.append(z)
+    if not w:
+        return None
+    centre = np.median(np.repeat(np.asarray(C), w, axis=0), axis=0)
+    spread = float(np.median(np.repeat([np.linalg.norm(c - centre) for c in C], w)))
+    z_med = float(np.median(np.repeat(depth, w)))
+    return centre if 2 * mv > sum(w) or spread < ROTATION_BASELINE * z_med else None
+
+
+def _located_by_turn(q: _Query, K: Intrinsics, matches: list[_Match], points: _MapPoints
+                     ) -> Located | None:
+    """The query's pose from its rotation alone (see ``TURN_INLIER_DEG``), at the centre of the
+    keyframes it matches when they were taken from one spot (``one_spot``); None otherwise or when
+    the rotation is not confirmed."""
+    used = [m for m in matches if m.keyframe in points.frames]
+    if sum(len(m.idx_q) for m in used) < MIN_INLIERS:
+        return None
+    centre = one_spot(used, points)
+    if centre is None:
+        return None
+    a = np.concatenate([_keyframe_rays(m.uv_q, K) for m in used])
+    b = np.concatenate([_keyframe_rays(m.uv_k, points.frames[m.keyframe].K)
+                        @ points.frames[m.keyframe].T_map_cam.R.T for m in used])
+    R, inl = turn_ransac(a, b)
+    n = int(inl.sum())
+    ok = n >= MIN_INLIERS and n >= TURN_MIN_SHARE * len(a)
+    log.info("%s: turned from the keyframes' spot: %d of %d matches within %.2f°: %s", q.image,
+             n, len(a), TURN_INLIER_DEG, "accepted" if ok else "rejected")
+    if not ok:
+        return None
+    return Located(q.image, q.index, Pose(R, centre), K, n)
 
 
 def epipolar_gate(T: Pose, K: Intrinsics, matches: list[_Match], points: _MapPoints,

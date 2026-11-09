@@ -16,14 +16,23 @@ import sys
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 
 
 class Device:
+    active: ClassVar[list[str]] = []  # entered as the default device (``with torch.device``)
+
     def __init__(self, name: str | Device) -> None:
         self.type = str(name)
+
+    def __enter__(self) -> Device:
+        Device.active.append(self.type)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        Device.active.pop()
 
     def __str__(self) -> str:
         return self.type
@@ -122,6 +131,10 @@ def make_torch(mps_available: bool = False) -> types.ModuleType:
         finally:
             state["inference_mode"] = False
 
+    @contextmanager
+    def no_grad() -> Iterator[None]:
+        yield
+
     def rand(*shape: int, device: str | Device = "cpu") -> Tensor:
         return Tensor(np.random.default_rng(0).random(shape, dtype=np.float32), device)
 
@@ -151,7 +164,7 @@ def make_torch(mps_available: bool = False) -> types.ModuleType:
                        mps=_module("torch.backends.mps", is_available=lambda: mps_available))
     functional = _module("torch.nn.functional", normalize=normalize)
     return _module("torch", Tensor=Tensor, device=Device, from_numpy=lambda a: Tensor(a),
-                   tensor=tensor, rand=rand, inference_mode=inference_mode, mps=mps,
+                   tensor=tensor, rand=rand, inference_mode=inference_mode, no_grad=no_grad, mps=mps,
                    backends=backends, nn=_module("torch.nn", functional=functional),
                    calls=calls, state=state, memory=memory)
 

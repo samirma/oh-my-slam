@@ -1278,8 +1278,11 @@ def support_level(obj: MapObject, views: _Views, others: Iterable[OBB] = ()) -> 
         at = np.abs((pts[:, :2] - box.center[:2]) @ box.R[:2, :2])
         out = np.any(at > box.size[:2] / 2, axis=1) & np.all(at <= box.size[:2] / 2 + margin,
                                                               axis=1)
+        idx = np.flatnonzero(out)  # each neighbour tests only the ring points left
         for other in neighbours:
-            out &= ~_near_box(pts, other)
+            idx = idx[~_near_box(pts[idx], other)]
+        out = np.zeros(len(pts), bool)
+        out[idx] = True
         return out
 
     pts = np.concatenate([views.flat_points(f) for f, _ in frames])

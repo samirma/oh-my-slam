@@ -28,7 +28,12 @@ from oh_my_slam.core import paths
 from oh_my_slam.core.errors import ServerUnavailableError
 from oh_my_slam.server import main as server_main
 from oh_my_slam.server.app import ServerState, create_app
-from oh_my_slam.server.gpu_worker import GpuWorker, QueueFullError, WorkerStoppedError
+from oh_my_slam.server.gpu_worker import (
+    CpuFinish,
+    GpuWorker,
+    QueueFullError,
+    WorkerStoppedError,
+)
 from oh_my_slam.server.models import Registry
 from tests.fakes.stub_models import stub_adapters
 
@@ -149,9 +154,13 @@ class _Recording:
         self._record("warmup")
         self._adapter.warmup()
 
-    def run(self, req: Any) -> dict[str, Any]:
+    def run(self, req: Any) -> Any:
         self._record("run")
-        return self._adapter.run(req)  # type: ignore[no-any-return]
+        out = self._adapter.run(req)
+        if isinstance(out, CpuFinish):  # its remainder: recorded where it runs
+            finish = out.finish
+            out.finish = lambda: (self._record("finish"), finish())[1]
+        return out
 
 
 def _recording_registry(seen: Seen) -> Registry:
@@ -176,10 +185,15 @@ def _post_every_route(post: Callable[..., Any], tmp_path: Path) -> list[int]:
 
 
 def _assert_on_the_device_thread(seen: Seen, worker: GpuWorker) -> None:
+    """Every load, warm-up and run on the device thread; the device-free remainder of a run
+    (``CpuFinish``: the gravity's) on another thread."""
     every = {(a.key, what) for a in stub_adapters() for what in ("load", "warmup", "run")}
-    assert {(key, what) for key, what, _ in seen} == every
-    assert {ident for *_, ident in seen} == {worker.thread_ident}
+    device = [s for s in seen if s[1] != "finish"]
+    assert {(key, what) for key, what, _ in device} == every
+    assert {ident for *_, ident in device} == {worker.thread_ident}
     assert worker.thread_ident != threading.get_ident()
+    finish, = (s for s in seen if s[1] == "finish")
+    assert finish[0] == "gravity" and finish[2] not in (worker.thread_ident, None)
 
 
 def test_the_app_runs_every_model_operation_on_the_device_thread(tmp_path: Path) -> None:
