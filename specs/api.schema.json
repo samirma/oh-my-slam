@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.0. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.1. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
       "pattern": "^oms/2\\.[0-9]+$",
-      "description": "Schema version of the body."
+      "description": "Schema version of the body, oms/2.<minor>; minors are additive."
     },
     "Mat4": {
       "type": "array",
@@ -262,6 +262,10 @@
         "height_sigma_m": {
           "type": "number",
           "minimum": 0
+        },
+        "ignore_mask": {
+          "$ref": "#/$defs/PartName",
+          "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
         }
       }
     },
@@ -575,7 +579,8 @@
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Seconds until the job ends: from queueing, the queue ahead plus its own predicted registration and fusion."
         },
         "created_at": {
           "type": "string",
@@ -729,7 +734,8 @@
         "map",
         "base_version",
         "frames",
-        "quality"
+        "quality",
+        "predicted_s"
       ],
       "properties": {
         "schema": {
@@ -752,6 +758,21 @@
         },
         "quality": {
           "$ref": "#/$defs/Quality"
+        },
+        "predicted_s": {
+          "type": "object",
+          "required": [
+            "registration",
+            "fusion"
+          ],
+          "properties": {
+            "registration": {
+              "type": "number"
+            },
+            "fusion": {
+              "type": "number"
+            }
+          }
         }
       }
     },
@@ -1127,6 +1148,57 @@
             "integer",
             "null"
           ]
+        },
+        "supported_by": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "id",
+                "verified_version"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "surface",
+                    "object"
+                  ]
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "verified_version": {
+                  "type": "integer"
+                }
+              }
+            }
+          ]
+        },
+        "inside_of": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "id",
+                "verified_version"
+              ],
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "verified_version": {
+                  "type": "integer"
+                }
+              }
+            }
+          ]
         }
       }
     },
@@ -1171,6 +1243,12 @@
               }
             ]
           }
+        },
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Surface"
+          }
         }
       }
     },
@@ -1207,21 +1285,25 @@
         "width_m",
         "normal_deg",
         "regions",
-        "kind"
+        "kind",
+        "jambs_m",
+        "leaf"
       ],
       "properties": {
         "id": {
           "type": "integer"
         },
         "centre_m": {
-          "$ref": "#/$defs/Vec2"
+          "$ref": "#/$defs/Vec2",
+          "description": "Midpoint of the free gap between the jambs."
         },
         "width_m": {
-          "type": "number"
+          "type": "number",
+          "description": "Free width at the narrowest point within the height band, open leaves counted as obstacles."
         },
         "normal_deg": {
           "type": "number",
-          "description": "Direction from regions[0] to regions[1]."
+          "description": "Perpendicular to the jamb line, from regions[0] to regions[1]."
         },
         "regions": {
           "type": "array",
@@ -1237,6 +1319,38 @@
             "opening",
             "narrow"
           ]
+        },
+        "jambs_m": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/Vec2"
+          },
+          "description": "End points of the free gap at floor level."
+        },
+        "leaf": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "polygon_m",
+                "intrudes"
+              ],
+              "properties": {
+                "polygon_m": {
+                  "$ref": "#/$defs/Polygon"
+                },
+                "intrudes": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ],
+          "description": "Door leaf footprint for kind door, else null."
         }
       }
     },
@@ -1326,7 +1440,8 @@
           "required": [
             "state",
             "observations",
-            "height_m"
+            "height_m",
+            "floor_observed"
           ],
           "properties": {
             "state": {
@@ -1340,6 +1455,10 @@
             "height_m": {
               "$ref": "#/$defs/Binary",
               "description": "float32 highest surface, NaN if none."
+            },
+            "floor_observed": {
+              "$ref": "#/$defs/Binary",
+              "description": "uint8 1 when a floor surface was observed in the cell at floor height."
             }
           }
         },
@@ -1433,6 +1552,10 @@
         "height_sigma_m": {
           "type": "number",
           "minimum": 0
+        },
+        "ignore_mask": {
+          "$ref": "#/$defs/PartName",
+          "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
         }
       }
     },
@@ -1561,6 +1684,34 @@
             "boolean",
             "null"
           ]
+        },
+        "nearest_view": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "name",
+                "T_map_cam",
+                "turn_deg"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "T_map_cam": {
+                  "$ref": "#/$defs/Mat4"
+                },
+                "turn_deg": {
+                  "type": "number",
+                  "description": "Signed turn (CCW positive) from the frame's guessed heading toward that keyframe's view."
+                }
+              }
+            }
+          ],
+          "description": "For no_overlap rejections: the most similar keyframe, else null."
         }
       }
     },
@@ -1697,6 +1848,10 @@
           "minimum": 0,
           "maximum": 1,
           "default": 0.5
+        },
+        "ignore_mask": {
+          "$ref": "#/$defs/PartName",
+          "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
         }
       },
       "oneOf": [
@@ -1841,7 +1996,9 @@
         "service",
         "inference",
         "lanes",
-        "version"
+        "version",
+        "capabilities",
+        "timings"
       ],
       "properties": {
         "schema": {
@@ -1910,6 +2067,58 @@
             },
             "bulk": {
               "$ref": "#/$defs/Lane"
+            }
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "O1",
+              "O2",
+              "O3",
+              "O4",
+              "O5",
+              "O6",
+              "O7",
+              "O8",
+              "O9",
+              "O10"
+            ]
+          },
+          "description": "Groups the running service implements."
+        },
+        "timings": {
+          "type": "object",
+          "required": [
+            "registration_per_frame",
+            "fusion_per_frame",
+            "locate_per_frame",
+            "analyse_per_frame",
+            "grid_read",
+            "objects_read"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/TimingStat"
+          },
+          "properties": {
+            "registration_per_frame": {
+              "$ref": "#/$defs/TimingStat"
+            },
+            "fusion_per_frame": {
+              "$ref": "#/$defs/TimingStat"
+            },
+            "locate_per_frame": {
+              "$ref": "#/$defs/TimingStat"
+            },
+            "analyse_per_frame": {
+              "$ref": "#/$defs/TimingStat"
+            },
+            "grid_read": {
+              "$ref": "#/$defs/TimingStat"
+            },
+            "objects_read": {
+              "$ref": "#/$defs/TimingStat"
             }
           }
         }
@@ -2014,6 +2223,61 @@
         },
         "rgb": {
           "$ref": "#/$defs/Binary"
+        }
+      }
+    },
+    "Surface": {
+      "type": "object",
+      "required": [
+        "id",
+        "height_m",
+        "polygon_m",
+        "area_m2"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "height_m": {
+          "type": "number"
+        },
+        "polygon_m": {
+          "$ref": "#/$defs/Polygon"
+        },
+        "area_m2": {
+          "type": "number"
+        }
+      }
+    },
+    "TimingStat": {
+      "type": "object",
+      "required": [
+        "median_s",
+        "p90_s",
+        "count",
+        "source"
+      ],
+      "properties": {
+        "median_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "p90_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "count": {
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "measured",
+            "default"
+          ]
         }
       }
     }

@@ -9,13 +9,23 @@ that scene. oh-my-slam builds and keeps that map from the robot's camera frames,
 the questions the skill's scripts ask about it.
 
 **Scope test.** A feature belongs here only if a row of the client contract (§2) needs it.
-Anything else is removed (§12). oh-my-slam knows nothing about any particular robot, scene or
+Anything else is removed (§13). oh-my-slam knows nothing about any particular robot, scene or
 task:
 * robot knowledge reaches it only as camera pose priors and camera parameters (§4);
 * footprints and height bands are parameters of the requests that need them.
 
 The skill's scripts do all numeric work against this API, so every number the skill needs is in
 a response body, with its unit, frame and uncertainty.
+
+**The measure of "serves the skill"** is what each kind of robot can do with no geometry done
+by the language model:
+* **Base:** a wheeled base, or a walking robot, gets from locate, the grid and its passages
+  everything it needs to plan a route and verify that it followed it.
+* **Arm:** an arm gets from objects, support surfaces, frame analysis and points everything it
+  needs to place its gripper and verify the outcome.
+
+**Pruning.** A response field that no skill script reads is a candidate for removal. The skill
+publishes the fields its client reads, and the rest are pruned in a later minor version.
 
 This document states requirements. Detailed decisions are recorded in `README.md` and must not
 contradict it. Examples of such decisions: defaults, thresholds, encodings, palette.
@@ -71,7 +81,9 @@ Each row is something the skill needs. Each row's test is in §11.
 * **Cameras.** Each camera is described once per map and can be referenced by id afterwards:
   * intrinsics `fx, fy, cx, cy` in pixels, and image size;
   * distortion: the OpenCV model, or none;
-  * optional ignore mask, for pixels showing the robot itself;
+  * optional ignore mask, for pixels showing the robot itself. A frame may add its own mask,
+    for example the arms in a head camera or a held object in a wrist camera. The two masks are
+    combined;
   * optional height of the optical centre above the floor, with a sigma: the scale anchor for
     robots without metric priors. A frame may carry its own height, with a sigma, which
     overrides the camera's: a camera on a pan-tilt head or a wrist moves with the robot's joints.
@@ -154,10 +166,11 @@ Every estimate the skill acts on carries its uncertainty in the same response:
   targets is allowed, CUDA included. Models adapted for another runtime are third-party
   components like any other.
 * **Platforms.**
-  * The service and its inference must run on the target machine, an Apple M4 Max Mac with
-    36 GB of unified memory, where performance is measured.
-  * A CUDA host may also run them.
-  * Smaller Macs are best-effort.
+  * **The serving machine is where targets are measured.** It is the Mac that serves the
+    episodes: an Apple M3 Pro with 18 GB, at 192.168.0.106 on the user's LAN. Every target holds
+    there, measured from a LAN client.
+  * An Apple M4 Max with 36 GB, and CUDA hosts, must also run the service. Numbers measured on
+    them are reported separately.
 * **Errors.** Each error carries a typed, machine-readable code that says whether a retry can
   succeed (api.md §8). An input that cannot be used, such as a frame that cannot be located, is
   a per-input status in a successful response, never an error.
@@ -169,9 +182,14 @@ Every estimate the skill acts on carries its uncertainty in the same response:
 
 ## 11. Evaluation
 
-A single-command evaluator replays recorded robot-guide episodes, from the base, the humanoid
-and the arm, against the simulator's ground truth. It also runs on the reference captures in
-`examples/` (`office_sequence/`, `ainex-captures/`, `camera/`).
+A standalone evaluator replays recorded robot-guide episodes, from the base, the humanoid and
+the arm, against the simulator's ground truth.
+* It is a remote client of the API, run on the machine that holds the episodes and the truth.
+* It also runs on the reference captures in `examples/`:
+  * `office_sequence/`;
+  * `ainex-captures/`;
+  * `camera/`, the only one through a distorting lens: it covers the camera model's distortion
+    (§4) for C1 and C8.
 * It measures each client-contract row (§2).
 * Its targets are data in `examples/targets.json`.
 * It writes a machine-readable result and a summary outside the repository, and compares each
@@ -179,7 +197,20 @@ and the arm, against the simulator's ground truth. It also runs on the reference
 
 The details are in [specs/evaluation.md](specs/evaluation.md).
 
-## 12. Removed features
+## 12. Order of work and capabilities
+
+The groups are implemented in this order, so a robot can run on the API as early as possible:
+1. O1 + O4, with the removals of §13;
+2. O5 + O6: a wheeled base can then run a whole episode;
+3. O7: needed by the camera-only humanoid and the arm;
+4. O2 + O3;
+5. O8–O10.
+
+Until O2 + O3 land, a job commits one version per update and fusion blocks it.
+`GET /api/health` lists the groups the running service implements in `capabilities` (`O1` …
+`O10`), so the client can refuse what is missing instead of failing.
+
+## 13. Removed features
 
 These features are removed because the client never uses them. Across all recorded episodes the
 calls were:
@@ -206,7 +237,8 @@ Last-known camera, pixel-to-map, layers and video were never used.
   *recorded* pose (api.md §6).
 * The map list, and `agent_skill.md`. `SKILL.md` becomes a short API reference.
 * The rule to ask the user before updating an existing map.
-* The outdoor and video examples (`street2.mp4`).
+* The outdoor and video examples (`street2.mp4`), and the single-image reference
+  `restaurant.jpg`. The episodes cover frame analysis.
 * OpenLABEL output. It is replaced by the schema of §7.
 * The single-image colour contract across artefacts. An object's `color` stays a display colour,
   a pure function of its id. Its observed appearance is `mean_rgb` (map.md §5).

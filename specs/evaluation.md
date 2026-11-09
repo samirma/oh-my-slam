@@ -4,13 +4,24 @@ Part of the [high-level specification](../high_level_spec.md) (§11).
 
 ## Command and outputs
 
-`uv run python -m oh_my_slam.tools.evaluate [--episodes DIR] [--url URL] [--out DIR]
-[--baseline PATH] [--set-baseline]` measures every row of the client contract.
+Two evaluators measure the client contract:
+* **Replay evaluator.** `tools/replay_eval/` is a standalone client of the public API: stdlib,
+  numpy and requests only, no import from the service's code. It runs on the machine that holds
+  the episodes and the simulator truth:
+  `python tools/replay_eval/replay_eval.py --server URL --episodes DIR --house PATH
+  --map-prefix NAME --out FILE.json`. Accuracy against simulator truth comes only from it.
+* **Reference evaluator.** `uv run python -m oh_my_slam.tools.evaluate [--url URL] [--out DIR]
+  [--baseline PATH] [--set-baseline] [--requests DIR]` runs the reference captures, and
+  optionally replays request sets recorded from earlier replays (`--requests`), for
+  regression and latency without truth.
+
+Every latency target is measured from a LAN client, uploads included, against the serving
+machine (high_level_spec.md §10). Candidate implementations are each served on their own port
+and run through the same replay evaluator.
 
 * **Sequential.** It runs alone, one measurement at a time.
-* **Service under test.** `--url` points it at a running service, which may be a LAN host.
-  Latency is then measured as a LAN client sees it, uploads included. Without `--url` it starts a
-  service locally on a free port.
+* **Service under test.** `--url` points the reference evaluator at a running service. Without
+  it, it starts a service locally on a free port.
 * **Outputs.** It writes `result.json` (machine-readable: each metric's value, target, pass/fail
   and the baseline comparison) and `summary.md` to `~/oh-my-slam-data/evaluations/<UTC>/`.
 * **Data, not code.** Targets live in `examples/targets.json`, and a stored baseline flags
@@ -61,6 +72,15 @@ transform, not re-fitted per read.
 | C6 | Episodes' warping updates (e034, e040) rejected by `accept_if` at the default thresholds | All |
 | C9 | Grid cells agreeing with the floor plan (free inside rooms, occupied at walls), among observed cells | ≥ 0.9 |
 | C9 | Doors of the floor plan found as passages within 0.3 m | ≥ 0.8 |
+| C9 | Passage `centre_m` within 0.10 m of the floor plan's door-gap centre, and `width_m` within 0.10 m of its free width | ≥ 0.8 of found doors |
+| C9 | Free cells with `floor_observed` where the floor plan has floor | ≥ 0.9 |
+| C9 | Keyframe camera cells, and their near blind ring, `free` | 100 % |
+| C9 | Frontiers bordering a region with `region` set; objects in or on a region with `region` set | 100 % |
+| C9 | Cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` | ≥ 0.95 |
+| C10 | Support height of objects on a surface (`supported_by` surface `height_m`) | ≤ 2 cm |
+| C10 | `supported_by` / `inside_of` agreeing with the truth's relations | ≥ 0.9 |
+| C8 | Rejected frames with `no_overlap` that carry a `nearest_view` whose turn points toward mapped structure | ≥ 0.8 |
+| C3 | `eta_s` of a queued job, and `predicted_s` of a dry run, within ±30 % of the measured time | ≥ 0.8 of jobs |
 | C9 | Floor height error | ≤ 2 cm |
 | C10 | Object centre error, label agreement and id stability across updates | As in `targets.json`, from the round-4 values |
 | C11 | Range-scan error against the floor-plan walls within the band | ≤ 5 % of range |
