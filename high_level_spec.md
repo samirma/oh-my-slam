@@ -55,8 +55,9 @@ Each row is something the skill needs. Each row's test is in §11.
 * **Camera frame.** Optical axes: x right, y down, z forward.
 * **Map frame.** Gravity-aligned and right-handed: x and y horizontal, z up. Yaw is measured
   counter-clockwise from +x about +z. How the frame is fixed is in map.md §1.
-* **Poses.** `T_a_b` is the 4×4 homogeneous pose of frame b in frame a (row-major, as nested
-  arrays). So `T_map_cam` maps camera-frame points to map-frame points.
+* **Poses.** `T_a_b` is the 4×4 homogeneous pose of frame b in frame a, written as nested
+  row-major arrays `M[row][col]`. `T_map_cam` is the pose of the camera's *optical* frame in the
+  map frame, so it maps optical-frame points to map-frame points.
 * **Scale.** Every response that carries map-frame metres also carries:
   * `scale_source`: one of `priors`, `depth`, `camera_height`, `monocular`;
   * `scale_sigma_rel`: the relative one-sigma uncertainty of the map's scale.
@@ -72,7 +73,8 @@ Each row is something the skill needs. Each row's test is in §11.
   * distortion: the OpenCV model, or none;
   * optional ignore mask, for pixels showing the robot itself;
   * optional height of the optical centre above the floor, with a sigma: the scale anchor for
-    robots without metric priors.
+    robots without metric priors. A frame may carry its own height, with a sigma, which
+    overrides the camera's: a camera on a pan-tilt head or a wrist moves with the robot's joints.
 * **Pose priors.** `T_map_cam` with a trust level:
   * `metric` — an absolute pose in the map frame, with position and rotation sigmas. For
     example, odometry with a known start, or kinematics of a fixed arm.

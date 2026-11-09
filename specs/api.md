@@ -47,6 +47,7 @@ server.sh --status | --stop
 | `GET /api/maps/{name}/frames` | Keyframes and their poses | → [`Frames`] |
 | `GET /api/maps/{name}/objects` | Object records | → [`Objects`] |
 | `GET /api/maps/{name}/grid` | Navigation grid | → [`Grid`] |
+| `GET /api/maps/{name}/points` | Fused points inside a box | → [`Points`] |
 | `GET /api/maps/{name}/birdseye.png` | Bird's-eye image | → `image/png` |
 | `GET /api/maps/{name}/birdseye` | Its metadata | → [`Birdseye`] |
 | `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] → [`Locate`] |
@@ -66,6 +67,7 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   * `image`, a part name;
   * `camera_id`;
   * an optional `prior` [`Prior`];
+  * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name.
 * **Request order** is the order of addition (map.md §3).
 * **`analyse`** takes one frame, with its camera inline or by id of a map's camera (`map`
@@ -106,7 +108,8 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
 ## 5. Versions and revert (O2)
 
 * `GET /api/maps/{name}/versions` lists the kept versions [`VersionInfo`]: `version`,
-  `created_at`, `kind` (`update`, `provisional`, `revert`), `job_id`, `frames` and `objects`.
+  `created_at`, `kind` (`update`, `provisional`, `fusing`, `revert`), `job_id`, `frames` and
+  `objects`.
 * `POST /api/maps/{name}/revert {to_version}` commits a new version equal to `to_version`, and
   answers with the new summary.
   * It is refused with `map_busy` while a job of that map is registering or fusing.
@@ -129,6 +132,8 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | `ambiguity` | `{pos_m, rot_deg}`, the distance to the second-best hypothesis, or null when there is none. |
   | `consistent_with_prior` | Bool, or null without a prior. |
 
+* **Provisional frames.** Locate works against a version whose newest frames are still
+  provisional, using their provisional poses.
 * **Nothing located** is a `200` response with every frame `rejected`, not an error.
 * **Recording.** With `record: true`, the last located frame's pose is stored as the map's
   *recorded pose*, outside the map's versions.

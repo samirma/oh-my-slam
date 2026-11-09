@@ -25,7 +25,7 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
-  3. camera heights above the floor (`camera_height`);
+  3. camera heights above the floor, per frame or per camera (`camera_height`);
   4. monocular depth (`monocular`).
 
   `scale_sigma_rel` is estimated from the residuals of that source. A later update may refine
@@ -62,7 +62,7 @@ becomes a job with a `job_id`. A job goes through these states:
 | --- | --- |
 | `queued` | Waiting for the map's earlier jobs. |
 | `registering` | Phase 1: registers every new frame against the version current when the phase starts, and computes the quality report. If the gate (§4) passes, it commits a version with the new frames at provisional poses, and the new frames are readable from then on. |
-| `fusing` | Phase 2: fuses depth into the cloud and the free space, then updates the objects, refined poses and the scale. It commits the final version. |
+| `fusing` | Phase 2: fuses depth into the cloud and the free space, then updates the objects, refined poses and the scale. While it lasts longer than the interval in `README.md` (default 10 s), it commits an intermediate version (`kind: fusing`) at that interval, so the grid and objects grow during fusion. It commits the final version. |
 | `committed` | Done. `result_version` is the final version. |
 | `rejected` | The gate failed. No version was committed, and `quality` states why. |
 | `cancelled` | Cancelled by `DELETE /api/jobs/{id}`, see below. |
@@ -161,7 +161,17 @@ Each object record has:
 **Identifiers.** Region and passage ids are stable between versions where the geometry did not
 change, so the skill can refer to "the kitchen" across updates.
 
-## 7. Bird's-eye image
+## 7. Points near a place
+
+`GET /api/maps/{name}/points?min=x,y,z&max=x,y,z&voxel_m=&max_points=` returns the fused points
+inside an axis-aligned box of the map frame [`Points`]:
+* `xyz`, `object_id` and `rgb` as base64 arrays, as in frame analysis;
+* thinned to `voxel_m` (default 0.01);
+* capped at `max_points` (default 200 000), with `truncated` stating whether the cap applied.
+
+There is no whole-map cloud read.
+
+## 8. Bird's-eye image
 
 `GET /api/maps/{name}/birdseye.png` draws the version seen from above:
 * the cloud, the objects' footprints with their ids, and the keyframe cameras;

@@ -35,6 +35,9 @@ camera from its calibration. It runs it twice:
 * once with the `views.json` poses as `metric` priors, for the base and the arm;
 * once with `trust: none`, as for camera-only robots.
 
+Each episode is replayed as a fresh map. `views.json` poses are in the robot's start frame *of
+that run*, and for a warm run that is not the map frame of an earlier run.
+
 It then compares the API's answers with the truth, after the single similarity transform from
 the map frame to the simulator world that the map's first update fixed. Scale is judged on that
 transform, not re-fitted per read.
@@ -61,6 +64,9 @@ transform, not re-fitted per read.
 | C10 | Object centre error, label agreement and id stability across updates | As in `targets.json`, from the round-4 values |
 | C11 | Range-scan error against the floor-plan walls within the band | ≤ 5 % of range |
 | C12 | Locate and analyse latency while an update runs | ≤ 2 × idle latency, and ≤ 3 s |
+| C12 | Locate of one frame while idle | ≤ 2 s |
+| C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map | ≤ 0.5 s each |
+| C3 | Intermediate version during fusion | At least every 10 s while fusion lasts longer |
 | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes | As before |
 
 ## Reference captures
