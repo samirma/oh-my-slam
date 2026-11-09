@@ -199,18 +199,17 @@ def fit(anchors: list[Anchor], scale: float | None = None, seed: int = 0) -> Fit
             best = (n_in, cost, S)
     assert best is not None
     S = best[2]
-    use = [chi(S, a) <= K_SIGMA for a in anchors]
-    if not any(use):  # nothing agrees: the least-squares fit of all of them
-        use = [True] * len(anchors)
+    use = [chi(S, a) <= K_SIGMA for a in anchors]  # the hypothesis' own anchor at least
     free = scale is None
     sp = float(np.median([a.sp for a in anchors]))
     observable = free and sum(use) >= 2 and _spread(anchors, use) > SCALE_OBSERVABLE_SIGMAS * sp
-    for _ in range(3):
+    k = 0
+    while True:  # refine, then again on the inliers of the refined fit (three times at most)
         S = _refine(anchors, use, S, observable)
         new = [chi(S, a) <= K_SIGMA for a in anchors]
-        if new == use or not any(new):
+        if new == use or not any(new) or k == 2:
             break
-        use = new
+        use, k = new, k + 1
     sigma = None
     if observable:
         dp = np.array([residual(S, a)[0] for a, u in zip(anchors, use, strict=True) if u])

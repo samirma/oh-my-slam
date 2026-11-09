@@ -39,18 +39,13 @@ def build(version: str) -> dict[str, Any]:
     for e in ENDPOINTS:
         op: dict[str, Any] = {"operationId": e.handler, "summary": e.summary,
                               "parameters": [_param(p) for p in e.params], "responses": {}}
-        if e.request:
-            if e.multipart:
-                op["description"] = UPLOAD_NOTE
-                op["requestBody"] = {"required": True, "content": {"multipart/form-data": {
-                    "schema": {"type": "object", "required": ["request"],
-                               "properties": {"request": _ref(e.request)},
-                               "additionalProperties": {"type": "string",
-                                                        "format": "binary"}},
-                    "encoding": {"request": {"contentType": "application/json"}}}}}
-            else:
-                op["requestBody"] = {"required": True,
-                                     "content": {"application/json": {"schema": _ref(e.request)}}}
+        if e.request:  # every request body so far carries images: multipart
+            op["description"] = UPLOAD_NOTE
+            op["requestBody"] = {"required": True, "content": {"multipart/form-data": {
+                "schema": {"type": "object", "required": ["request"],
+                           "properties": {"request": _ref(e.request)},
+                           "additionalProperties": {"type": "string", "format": "binary"}},
+                "encoding": {"request": {"contentType": "application/json"}}}}}
         for status, body in e.responses.items():
             resp: dict[str, Any] = {"description": e.summary}
             if body is not None:

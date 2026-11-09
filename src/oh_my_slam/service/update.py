@@ -249,7 +249,8 @@ class Updater:
         pre = {fr.work.index: fr.reason for fr in frames}
         exclude: set[int] = set()
         result: tuple[Path, InternalMap, _Anchored, int] | None = None
-        for attempt in range(2):
+        attempt = 0
+        while True:
             todo = [fr for fr in frames if fr.path is not None and pre[fr.work.index] is None
                     and fr.work.index not in exclude]
             if not todo:
@@ -294,6 +295,7 @@ class Updater:
             if not post or attempt:
                 break
             exclude |= {fr.work.index for fr in post}
+            attempt += 1
         self._finish(job, w, frames, prev, result)
 
     # -- anchoring -------------------------------------------------------------------------------
@@ -446,8 +448,6 @@ class Updater:
 
     @staticmethod
     def _rms(sim: Sim3, used: list[Anchor]) -> float:
-        if not used:
-            return 0.0
         return float(np.sqrt(np.mean([anchor.residual(sim, a)[0] ** 2 for a in used])))
 
     @staticmethod

@@ -694,3 +694,38 @@ def test_delete_removes_a_map(client: Client) -> None:
     assert client.get("/api/maps/m", status=404)["error"]["code"] == "map_not_found"
     r = client.http.delete("/api/maps/m")
     assert r.status_code == 404 and client.check(r, None)["error"]["code"] == "map_not_found"
+
+
+# -- scale sources at their edges ----------------------------------------------------------------
+
+
+def test_depth_that_the_map_cannot_compare_falls_back_to_the_camera_height(client: Client) -> None:
+    frames, files, truth = frames_of(client, 3)
+    shas = list(client.backend.truth)
+    del client.backend.depth_m[shas[0]]  # no aligned depth in the map
+    files["d0"] = png16(np.full((240, 320), 2000))
+    files["d1"] = png16(np.zeros((240, 320)))  # no valid depth pixel
+    frames[0]["depth"], frames[1]["depth"] = "d0", "d1"
+    frames[2]["height_above_floor_m"] = 1.0
+    frames[1]["height_above_floor_m"] = 0.0  # a camera at the floor tells no scale
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    assert job["scale_source"] == "camera_height"
+
+
+def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    client.backend.floor_z = None
+    real = client.backend.read
+
+    def no_cloud(mapper_dir: Path) -> Any:
+        m = real(mapper_dir)
+        m.bounds = None
+        return m
+
+    monkeypatch.setattr(client.backend, "read", no_cloud)
+    frames, files, _ = frames_of(client, 2)
+    frames[0]["height_above_floor_m"] = 1.0
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    assert job["scale_source"] == "monocular"
+    s = client.get("/api/maps/m", "MapSummary")
+    assert s["floor_z_m"] is None and s["bounds_m"]["min"] == s["bounds_m"]["min"]
