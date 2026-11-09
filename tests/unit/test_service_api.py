@@ -21,7 +21,16 @@ from oh_my_slam.service.app import Service, create_app
 from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.store import Store
 from oh_my_slam.service.update import Updater
-from tests.fakes.service import CAMERA, FakeBackend, FakeInference, multipart, plain, png16, pose, textured
+from tests.fakes.service import (
+    CAMERA,
+    FakeBackend,
+    FakeInference,
+    multipart,
+    plain,
+    png16,
+    pose,
+    textured,
+)
 
 ERRORS = {400, 404, 405, 409, 410, 413, 500, 503}
 

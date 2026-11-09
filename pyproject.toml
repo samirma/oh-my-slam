@@ -206,6 +206,7 @@ type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
     "oh_my_slam.web",
+    "oh_my_slam.service",
     "oh_my_slam.commands",
     "oh_my_slam.tools",
     "oh_my_slam.viewer",
@@ -256,6 +257,7 @@ type = "forbidden"
 source_modules = [
     "oh_my_slam.cli",
     "oh_my_slam.web",
+    "oh_my_slam.service",
     "oh_my_slam.commands",
     "oh_my_slam.tools",
     "oh_my_slam.viewer",
@@ -268,3 +270,38 @@ source_modules = [
 ]
 forbidden_modules = ["open3d"]
 allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "The HTTP service (server.sh, oh_my_slam.service) is the top: nothing imports it"
+type = "forbidden"
+source_modules = [
+    "oh_my_slam.cli",
+    "oh_my_slam.web",
+    "oh_my_slam.commands",
+    "oh_my_slam.tools",
+    "oh_my_slam.viewer",
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.client",
+    "oh_my_slam.schema",
+    "oh_my_slam.core",
+    "oh_my_slam.server",
+]
+forbidden_modules = ["oh_my_slam.service"]
+
+[[tool.importlinter.contracts]]
+name = "The HTTP service uses the mapping, reconstruction and segmentation APIs, never the old web app, command line, viewer, evaluator or inference-server internals"
+type = "forbidden"
+source_modules = ["oh_my_slam.service"]
+forbidden_modules = [
+    "oh_my_slam.web",
+    "oh_my_slam.cli",
+    "oh_my_slam.commands",
+    "oh_my_slam.viewer",
+    "oh_my_slam.tools",
+    "oh_my_slam.server.app",
+    "oh_my_slam.server.main",
+    "oh_my_slam.server.gpu_worker",
+    "oh_my_slam.server.models",
+]

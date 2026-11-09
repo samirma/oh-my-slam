@@ -21,7 +21,12 @@ from PIL import Image
 
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.anchor import Sim3
-from oh_my_slam.service.backend import InternalFrame, InternalMap, NothingRegisteredError, Registered
+from oh_my_slam.service.backend import (
+    InternalFrame,
+    InternalMap,
+    NothingRegisteredError,
+    Registered,
+)
 
 
 def textured(seed: int, w: int = 320, h: int = 240) -> bytes:

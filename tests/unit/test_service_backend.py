@@ -1,0 +1,279 @@
+"""The service's real backend (``backend.MapperBackend``, ``mapper_proc``) and its view of the
+inference server (``inference``), without a model: the mapper process is replaced by scripts,
+the inference client and the reconstruction API by doubles."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from oh_my_slam.client import protocol as p
+from oh_my_slam.core.errors import DeviceMemoryError, InputError, ServerUnavailableError
+from oh_my_slam.core.types import Intrinsics, Pose
+from oh_my_slam.service import backend as be
+from oh_my_slam.service import inference as inf
+from oh_my_slam.service import mapper_proc
+from oh_my_slam.service.errors import ApiError
+
+K = Intrinsics(300.0, 300.0, 160.0, 120.0, 320, 240, "given")
+
+
+# -- the mapper process --------------------------------------------------------------------------
+
+
+def fake_mapper(tmp_path: Path, body: str) -> tuple[str, ...]:
+    """A mapper command: a script given the args file, ``body`` run with ``args`` loaded."""
+    script = tmp_path / "fake_mapper.py"
+    script.write_text("import json, sys, time\nargs = json.load(open(sys.argv[1]))\n"
+                      "def result(d):\n    json.dump(d, open(args['result'], 'w'))\n" + body)
+    return (sys.executable, str(script))
+
+
+@pytest.mark.parametrize(("body", "code", "message"), [
+    ("result({'rejected': ['x'], 'objects': 2, 'seconds': 1.5})", None, None),
+    ("result({'error': {'message': 'none placed'}}); sys.exit(5)", "nothing", "none placed"),
+    ("result({'error': {'message': 'down'}}); sys.exit(3)", "inference_unavailable", "down"),
+    ("result({'error': {'message': 'oom', 'out_of_memory': True}}); sys.exit(1)",
+     "out_of_memory", "oom"),
+    ("print('trace line'); sys.exit(1)", "internal", "exit code 1"),
+])
+def test_register_reads_the_mapper_s_result(tmp_path: Path, body: str, code: str | None,
+                                            message: str | None) -> None:
+    b = be.MapperBackend(fake_mapper(tmp_path, body))
+    img = tmp_path / "0000.jpg"
+    img.write_bytes(b"x")
+    log = tmp_path / "mapper0.log"
+    if code is None:
+        r = b.register(tmp_path / "mapper", [img], {img: K}, log)
+        assert (r.sources_rejected, r.objects, r.seconds) == (["x"], 2, 1.5)
+        args = json.loads(log.with_suffix(".args.json").read_text())
+        assert args["intrinsics"][str(img)]["fx"] == 300.0
+        return
+    with pytest.raises((be.NothingRegisteredError, ApiError)) as e:
+        b.register(tmp_path / "mapper", [img], {img: K}, log)
+    assert message in str(e.value)
+    if code != "nothing":
+        assert isinstance(e.value, ApiError) and e.value.code == code
+    if code == "internal":
+        assert "trace line" in e.value.details["log"]
+
+
+def test_terminate_ends_a_running_mapper(tmp_path: Path) -> None:
+    b = be.MapperBackend(fake_mapper(tmp_path, "time.sleep(30)"))
+    b.terminate()  # nothing running
+    img = tmp_path / "a.jpg"
+    out: list[Any] = []
+
+    def run() -> None:
+        try:
+            b.register(tmp_path / "m", [img], {}, tmp_path / "log.log")
+        except ApiError as exc:
+            out.append(exc)
+
+    t = threading.Thread(target=run)
+    t.start()
+    deadline = time.monotonic() + 10
+    while b._proc is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    b.terminate()
+    t.join(10)
+    assert out and out[0].code == "internal"
+    assert be._tail(tmp_path / "missing.log") == ""
+
+
+def test_mapper_proc_runs_the_mapper_with_the_given_intrinsics(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.mapping import api
+
+    seen: dict[str, Any] = {}
+
+    def update(map_dir: Path, inputs: list[Path], **kw: Any) -> Any:
+        seen.update(kw)
+        scene = {"openlabel": {"objects": {"1": {}, "2": {}}}}
+        return api.UpdateResult(json.dumps(scene).encode(), ["f000003"], ["f000004"], 2.0)
+
+    monkeypatch.setattr(api, "update", update)
+    m = tmp_path / "map"
+    m.mkdir()
+    (m / "map.json").write_text(json.dumps({"next_frame_index": 3}))
+    args = {"map_dir": str(m), "inputs": ["/a.jpg", "/b.jpg"],
+            "intrinsics": {"/a.jpg": K.to_dict()}, "result": str(tmp_path / "r.json")}
+    (tmp_path / "args.json").write_text(json.dumps(args))
+    assert mapper_proc.main([str(tmp_path / "args.json")]) == 0
+    assert json.loads((tmp_path / "r.json").read_text()) == {"rejected": ["/b.jpg"],
+                                                             "objects": 2, "seconds": 2.0}
+    assert seen["intrinsics"] == {Path("/a.jpg"): K}
+
+    def fails(*a: Any, **kw: Any) -> Any:
+        raise DeviceMemoryError("out of memory")
+
+    monkeypatch.setattr(api, "update", fails)
+    args["map_dir"] = str(tmp_path / "new")
+    assert mapper_proc.run(args) == 1
+    err = json.loads((tmp_path / "r.json").read_text())["error"]
+    assert err["out_of_memory"] and err["exit_code"] == 1
+
+
+def test_mapper_proc_as_a_process(tmp_path: Path) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "x.txt").write_text("not a map")
+    img = tmp_path / "a.jpg"
+    Image.new("RGB", (8, 8)).save(img)
+    args = tmp_path / "args.json"
+    args.write_text(json.dumps({"map_dir": str(other), "inputs": [str(img)], "intrinsics": {},
+                                "result": str(tmp_path / "r.json")}))
+    r = subprocess.run([sys.executable, "-m", "oh_my_slam.service.mapper_proc", str(args)],
+                       capture_output=True, timeout=120)
+    assert r.returncode == 4
+    assert "not a map" in json.loads((tmp_path / "r.json").read_text())["error"]["message"]
+
+
+# -- reading the mapper's map --------------------------------------------------------------------
+
+
+def test_read_gives_the_internal_frames_floor_bounds_and_depth(tmp_path: Path) -> None:
+    from oh_my_slam.core.ply import PointCloud, ply_bytes
+    from oh_my_slam.mapping.store import FrameRecord
+
+    m = tmp_path / "map"
+    (m / "per_frame" / "f000000").mkdir(parents=True)
+    recs = [FrameRecord(i, f"f{i:06d}", f"frames/f{i:06d}.jpg", f"/in/{i}.jpg", 1, 320, 240,
+                        K, Pose(np.eye(3), np.array([i, 0.0, 1.0])), 32, 24,
+                        stats={"observations": 50.0}, low_confidence=bool(i))
+            for i in range(2)]
+    (m / "frames.json").write_text(json.dumps({"frames": [r.to_dict() for r in recs]}))
+    (m / "map.json").write_text(json.dumps({"floor_z": -1.0, "updates": [
+        {"notes": {"restarted": {}}}]}))
+    np.save(m / "per_frame" / "f000000" / "depth.npy", np.full((24, 32), 2.0, np.float16))
+    b = be.MapperBackend()
+    r = b.read(m)
+    assert [f.name for f in r.frames] == ["f000000", "f000001"] and r.frames[1].low_confidence
+    assert r.frames[0].source == "/in/0.jpg" and r.frames[0].T[0, 3] == 0.0
+    assert r.floor_z == -1.0 and r.rebuilt and r.bounds is None
+    d = r.depth("f000000")
+    assert d is not None and float(d.mean()) == 2.0
+    assert r.depth("f000001") is None and r.depth("nope") is None
+    (m / "cloud.ply").write_bytes(ply_bytes(PointCloud(np.array([[0, 0, 0], [1, 2, 3]],
+                                                                np.float32))))
+    (m / "map.json").write_text(json.dumps({}))
+    r = b.read(m)
+    assert r.bounds == ([0, 0, 0], [1, 2, 3]) and r.floor_z is None and not r.rebuilt
+    (m / "cloud.ply").write_bytes(ply_bytes(PointCloud(np.zeros((0, 3), np.float32))))
+    assert b.read(m).bounds is None
+
+
+# -- the depth model -----------------------------------------------------------------------------
+
+
+class _Client:
+    def close(self) -> None:
+        pass
+
+
+def test_median_depth_asks_the_depth_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                           ) -> None:
+    from oh_my_slam.reconstruction import api as rec
+
+    seen: dict[str, Any] = {}
+
+    def reconstruct(path: Path, **kw: Any) -> Any:
+        seen.update(kw)
+        return type("F", (), {"depth": np.array([[1.0, 3.0], [5.0, 9.0]], np.float32),
+                              "valid": np.array([[True, True], [True, False]])})()
+
+    monkeypatch.setattr(rec, "connect_server", lambda: _Client())
+    monkeypatch.setattr(rec, "reconstruct_image", reconstruct)
+    assert be.MapperBackend().median_depth(tmp_path / "a.jpg", K) == 3.0
+    assert seen["intrinsics"] == K and seen["max_side"] == 512
+    for exc, code in ((ServerUnavailableError("down"), "inference_unavailable"),
+                      (DeviceMemoryError("oom"), "out_of_memory"), (InputError("bad"), "internal")):
+        def boom(e: Exception = exc) -> Any:
+            raise e
+
+        monkeypatch.setattr(rec, "connect_server", boom)
+        with pytest.raises(ApiError) as err:
+            be.MapperBackend().median_depth(tmp_path / "a.jpg", K)
+        assert err.value.code == code
+
+
+# -- the inference server ------------------------------------------------------------------------
+
+
+def health(status: str, memory: bool = True, error: str | None = None) -> p.Health:
+    return p.Health(status=status, device="mps",
+                    memory=p.DeviceMemory(allocated_gib=2.0, driver_gib=3.0, limit_gib=10.0)
+                    if memory else None,
+                    models={"depth": p.ModelStatus(name="depth", error=error)})
+
+
+def test_inference_ready_and_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    answers: list[Any] = []
+
+    def ask(self: Any, timeout: float = 1.0) -> p.Health:
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(inf.InferenceClient, "health", ask)
+    answers[:] = [health("ready")]
+    inf.inference_ready()
+    for a, state in ((ServerUnavailableError("no socket"), "down"), (health("loading"), "starting")):
+        answers[:] = [a]
+        with pytest.raises(ApiError) as e:
+            inf.inference_ready()
+        assert e.value.code == "inference_unavailable" and e.value.details["state"] == state
+    answers[:] = [health("ready")]
+    be.MapperBackend().require_inference()
+    i = inf.Inference(tmp_path / "inf.log")
+    answers[:] = [health("ready"), health("degraded"), health("error", False, "no weights"),
+                  health("error", False), ServerUnavailableError("no socket")]
+    s = i.state()
+    assert s == {"state": "ready", "device": "mps", "memory_used_gb": 2.147,
+                 "memory_cap_gb": 10.737, "error": None}
+    assert i.state()["error"].startswith("2.00 of 10.00 GiB")
+    assert i.state()["error"] == "depth: no weights"
+    assert i.state() == {"state": "down", "device": "mps", "memory_used_gb": None,
+                         "memory_cap_gb": None, "error": "models failed to load"}
+    assert i.state()["state"] == "down" and not i.started
+
+
+def test_the_service_starts_and_stops_the_inference_server(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    flag = tmp_path / "ran"
+    monkeypatch.setenv("OH_MY_SLAM_INFERENCE_CMD",
+                       f"{sys.executable} -c \"import sys, time; open('{flag}', 'a')"
+                       f".write(' '.join(sys.argv[1:]) + ';'); time.sleep(1)\"")
+    monkeypatch.setattr(inf.ServerLock, "is_held", staticmethod(lambda path=None: False))
+    i = inf.Inference(tmp_path / "inf.log")
+    i.ensure_started()
+    assert i.started and i.state()["state"] == "starting"
+    i.launcher.wait(10)  # type: ignore[union-attr]
+    assert i.state()["state"] == "down"
+    assert inf.stop_inference(tmp_path / "inf.log") == 0
+    assert flag.read_text() == ";--stop;"
+    monkeypatch.delenv("OH_MY_SLAM_INFERENCE_CMD")
+    assert inf.inference_cmd()[1:] == ["-m", "oh_my_slam.cli.server"]
+    # already answering, or starting (its process holds the lock): nothing is launched
+    j = inf.Inference(tmp_path / "inf.log")
+    monkeypatch.setattr(inf.InferenceClient, "health", lambda self, timeout=1.0: health("ready"))
+    j.ensure_started()
+    assert not j.started
+
+    def down(self: Any, timeout: float = 1.0) -> p.Health:
+        raise ServerUnavailableError("no socket")
+
+    monkeypatch.setattr(inf.InferenceClient, "health", down)
+    monkeypatch.setattr(inf.ServerLock, "is_held", staticmethod(lambda path=None: True))
+    j.ensure_started()
+    assert not j.started and j.state()["state"] == "starting"

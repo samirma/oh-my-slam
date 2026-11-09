@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -182,6 +183,14 @@ def serve(store: Store, host: str, port: int) -> int:
                     "data": str(store.root.parent), "version": service.version,
                     "started_inference": inference.started, "started_at": time.time()})
                 _say(f"listening on {url}")
+
+            @contextlib.contextmanager
+            def capture_signals(self) -> Iterator[None]:
+                """Ctrl-C and SIGTERM stop the service normally (uvicorn would raise them
+                again after its shutdown, skipping the jobs' clean-up)."""
+                for s in (signal.SIGINT, signal.SIGTERM):
+                    signal.signal(s, lambda signum, frame: setattr(self, "should_exit", True))
+                yield
 
             async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
                 service.stopping = True

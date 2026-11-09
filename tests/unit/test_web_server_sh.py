@@ -32,7 +32,8 @@ LINE = re.compile(r"^server\.sh: listening on http://0\.0\.0\.0:(\d+)/$")
 
 
 def server(*args: str, timeout: float = 60) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run([str(REPO / "server.sh"), *args], capture_output=True, timeout=timeout,
+    return subprocess.run([sys.executable, "-m", "oh_my_slam.web.main", *args],
+                          capture_output=True, timeout=timeout,
                           env=os.environ.copy())
 
 
@@ -53,7 +54,7 @@ def start(data: Path, probe: Path | None = None, browser: bool = False, extra: t
     if "--port" not in extra:
         extra = (*extra, "--port", str(free_port()))
     args = ["--data", str(data), *(() if browser else ("--no-browser",)), *extra]
-    cmd = ([str(REPO / "server.sh"), *args] if probe is None else
+    cmd = ([sys.executable, "-m", "oh_my_slam.web.main", *args] if probe is None else
            [sys.executable, str(PROBE), str(probe), "oh_my_slam.web.main", *args])
     proc = subprocess.Popen(cmd,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
