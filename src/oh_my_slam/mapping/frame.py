@@ -64,8 +64,11 @@ def per_frame_ratio(uv_full: NDArray[Any], z_model: NDArray[Any], f: FrameDepth,
     return (fit.scale if fit.ok else float("nan")), fit.inliers
 
 
-def metric_scale(model: Any, frames: list[FrameDepth]) -> ScaleResult:
-    """Scale that turns SfM units into metres (x_metric = s * x_sfm)."""
+def metric_scale(model: Any, frames: list[FrameDepth], warn: bool = False) -> ScaleResult:
+    """Scale that turns SfM units into metres (x_metric = s * x_sfm). ``warn``: the scale the map
+    keeps, whose spread is worth a warning; the checks before it measure models whose parts SfM
+    scaled apart, which the join rescales (a robot's scan warned of spreads of 128 and 136 while
+    the map kept a sound scale)."""
     per, counts = {}, {}
     for f in frames:
         if f.name not in model.registered:
@@ -81,7 +84,7 @@ def metric_scale(model: Any, frames: list[FrameDepth]) -> ScaleResult:
     s, spread = global_scale(list(per.values()))
     if not np.isfinite(s):
         raise ValueError("no frame had enough triangulated points to fix the metric scale")
-    if spread > SCALE_SPREAD_WARN:
+    if warn and spread > SCALE_SPREAD_WARN:
         log.warning("metric scale varies across frames (IQR/median %.2f > %.2f)", spread,
                     SCALE_SPREAD_WARN)
     return ScaleResult(s, spread, per, counts)

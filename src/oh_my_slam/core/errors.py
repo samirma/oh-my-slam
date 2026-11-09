@@ -183,6 +183,10 @@ class InferenceError(OhMySlamError):
     exit_code = ExitCode.INTERNAL
 
 
+class DeviceMemoryError(InferenceError):
+    """The server's device ran out of memory for a request; a smaller one may fit."""
+
+
 class NotAMapError(OhMySlamError):
     exit_code = ExitCode.NOT_A_MAP
 

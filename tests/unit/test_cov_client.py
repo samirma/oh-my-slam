@@ -24,6 +24,7 @@ from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.errors import (
+    DeviceMemoryError,
     ExitCode,
     InferenceError,
     InputError,
@@ -215,8 +216,12 @@ def test_a_server_busy_for_too_long_is_an_error(sock: Path, image: Path, clock: 
 @pytest.mark.parametrize(("status", "body", "error", "message"), [
     (400, {"error": "InputError", "detail": "cannot read x.jpg"}, InputError,
      "/v1/segment: InputError: cannot read x.jpg"),
-    (500, {"error": "RuntimeError", "detail": "MPS out of memory"}, InferenceError,
-     "/v1/segment failed: RuntimeError: MPS out of memory"),
+    (500, {"error": "RuntimeError", "detail": "MPS backend out of memory"}, DeviceMemoryError,
+     "/v1/segment failed: RuntimeError: MPS backend out of memory"),  # an older server's
+    (500, {"error": p.OUT_OF_MEMORY, "detail": "MPS backend out of memory"}, DeviceMemoryError,
+     "/v1/segment failed: out_of_memory: MPS backend out of memory"),
+    (500, {"error": "RuntimeError", "detail": "shape mismatch"}, InferenceError,
+     "/v1/segment failed: RuntimeError: shape mismatch"),
     (500, {"error": "model 'segment_yoloe' unavailable", "detail": None}, InferenceError,
      "/v1/segment failed: model 'segment_yoloe' unavailable"),
     (500, "Internal Server Error", InferenceError, "/v1/segment failed: Internal Server Error"),
@@ -232,6 +237,7 @@ def test_server_errors_carry_its_message(sock: Path, image: Path, status: int, b
         served(sock, handler).segment_image(p.SegmentRequest(image_path=str(image),
                                                              labels=["cup"]))
     assert str(exc.value) == message
+    assert (type(exc.value) is DeviceMemoryError) == ("out of memory" in message)
 
 
 def test_a_request_that_times_out_is_an_inference_error(sock: Path, image: Path) -> None:

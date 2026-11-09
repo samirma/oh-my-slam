@@ -104,6 +104,16 @@ def test_error_mapping(tmp_path: Path) -> None:
     state.registry.state["gravity"].error = "boom"
     r = client.post(p.ROUTE_GRAVITY, json={"image_path": "x"})
     assert r.status_code == 500 and r.json()["detail"] == "boom"
+    # a job the device ran out of memory for: its own code, so a client can send less
+    oom = "MPS backend out of memory (MPS allocated: 12.92 GiB, max allowed: 13.32 GiB)"
+
+    def out_of_memory(req: object) -> None:
+        raise RuntimeError(oom)
+
+    state.registry.adapters["geometry"].run = out_of_memory  # type: ignore[method-assign]
+    r = client.post(p.ROUTE_GEOMETRY, json=p.GeometryRequest(
+        image_path=str(tmp_path / "x.jpg"), out_dir=str(tmp_path)).model_dump())
+    assert r.status_code == 500 and r.json() == {"error": p.OUT_OF_MEMORY, "detail": oom}
     state.worker.stop()
 
 

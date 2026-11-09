@@ -6,6 +6,7 @@ stand-ins (``FakeSfm``, ``FakeModel``) so that every branch is driven deliberate
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -59,7 +60,9 @@ def ctx_of(new: list[Any], old: list[Any] | None = None, tmp: Path | None = None
                            pair_deg={}, rescaled={}, meta=kw.pop("meta", {}), update_id=1,
                            rebuild=kw.pop("rebuild", None), features=None,
                            work=tmp or Path("/nonexistent"), tx=kw.pop("tx", None),
-                           lens_camera=kw.pop("lens_camera", None), **kw)
+                           lens_camera=kw.pop("lens_camera", None),
+                           unmatched=kw.pop("unmatched", set()),
+                           depth_rejected=kw.pop("depth_rejected", set()), **kw)
 
 
 class FakeModel:
@@ -206,6 +209,39 @@ def test_anchors_without_descriptors_are_the_latest_posed_views() -> None:
     posed = [api.PoolView(f"p{k}", Path("x"), K, None, Pose.identity()) for k in range(6)]
     chunk = [api.PoolView("c", Path("y"), K, np.ones(4, np.float32))]
     assert [p.name for p in api._pick_anchors(chunk, posed, 4)] == ["p2", "p3", "p4", "p5"]
+
+
+def test_a_chunk_the_device_has_no_memory_for_is_sent_again_smaller(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Out of memory: the chunk again with half its new views (the anchors kept), the smaller
+    size for the rest of the update, down to ``MV_MIN_NEW`` new views; then the error stands."""
+    from oh_my_slam.core.errors import DeviceMemoryError
+    from oh_my_slam.reconstruction import multiview
+
+    sent: list[int] = []
+    fits = {"views": 9}
+
+    def run(images: list[Path], out: Path, intrinsics: Any, poses: Any, client: Any) -> Any:
+        sent.append(len(images))
+        if len(images) > fits["views"]:
+            raise DeviceMemoryError("/v1/multiview failed: out_of_memory: MPS backend")
+        return [SimpleNamespace(pose=Pose.identity()) for _ in images], 1.0
+
+    warned: list[str] = []
+    monkeypatch.setattr(multiview, "run_multiview", run)
+    monkeypatch.setattr(api.log, "warning", lambda msg, *a: warned.append(msg % a))
+    pool = {f"p{k}": api.PoolView(f"p{k}", Path("x"), K, None, Pose.identity())
+            for k in range(4)}
+    todo = [api.PoolView(f"c{k:02d}", Path("y"), K, None) for k in range(30)]
+    ctx, posed = ctx_of([]), {}
+    api._multiview_chunks(ctx, todo, dict(pool), posed, None, temporal=False)  # type: ignore[arg-type]
+    # 4 anchors + 20 new, + 10, + 5: then 9 at a time for the rest
+    assert sent == [24, 14, *[9] * 6] and sorted(posed) == [v.name for v in todo]
+    assert ctx.notes["multiview_chunk"] == 9 and len(warned) == 2
+    fits["views"] = 5  # 4 anchors + 2 new does not fit either
+    with pytest.raises(DeviceMemoryError):
+        api._multiview_chunks(ctx_of([]), todo, dict(pool), {}, None,  # type: ignore[arg-type]
+                              temporal=False)
 
 
 def test_a_keyframe_without_triangulated_points_has_no_sparse_scale() -> None:
@@ -447,9 +483,9 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
                                                                          for n in ns})
 
         def refine(pairs: Any, views: Any, free: Any, refine_focal: bool,
-                   hold_distortion: bool) -> PoseFit:
+                   hold_distortion: bool, focal_max_factor: float) -> PoseFit:
             seen.update(free=set(free), refine_focal=refine_focal, hold=hold_distortion,
-                        views=views)
+                        views=views, focal_max_factor=focal_max_factor)
             return PoseFit({}, scale, pairs=3, median_after_deg=median, distortion=distortion,
                            per_pair_px=per_pair or {})
 
@@ -459,6 +495,7 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
         return api._turns_through_lens(ctx, sfm, model, names), ctx.notes  # type: ignore[arg-type]
 
     assert run(K, 0.2, -0.45)[0] and seen["refine_focal"] and not seen["hold"]
+    assert seen["focal_max_factor"] == 2.0  # keyframes without EXIF: a monocular prior
     assert seen["free"] == {jpg(1), jpg(2)}  # the first holds the gauge
     assert all(not v.pose.t.any() for v in seen["views"].values())  # rotations alone
     ok, notes = run(lens, 0.3, 0.0)  # a known lens: held
@@ -466,6 +503,7 @@ def test_a_pan_through_a_lens_is_told_by_a_rotation_only_fit(
     assert notes["sfm_turning_rejected"]["median_deg"] == 0.3
     assert notes["sfm_turning_rejected"]["distortion"] == -0.3
     assert not run(K, 2.5, -0.45)[0]  # a camera that moves
+    assert run(K, 0.54, -0.46)[0]  # few photos of a pan: the lens held by less (examples/camera)
     assert not run(K, 0.2, 0.0)[0]  # a pinhole turning in place: SfM's
     ok, notes = run(K, 0.2, 0.05)  # a lens term that moves the corners a little: parallax
     assert not ok and "sfm_turning_rejected" not in notes
@@ -534,6 +572,31 @@ def test_a_camera_that_does_not_turn_is_posed_with_its_focal_length_held(
     api._run_sfm(sfm_chain.ctx, False, None, quiet)
     assert sfm_chain.ctx.notes["sfm_focal_rejected"]["sfm-global"]["turn_deg"] == 30.0
     assert FakeSfm.held == [] and "sfm_focal_held" not in sfm_chain.ctx.notes
+
+
+def test_a_focal_length_the_keyframes_carry_is_held_near_it(
+        sfm_chain: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keyframes with their EXIF focal length (500 px): the global mapper's 600 px, within
+    ``FOCAL_MAX_FACTOR`` but beyond ``FOCAL_EXIF_MAX_FACTOR``, is not accepted, and incremental
+    mapping with it held poses them although the camera turns. Without EXIF the model stands."""
+    names = [jpg(i) for i in range(4)]
+    turning = {n: Pose(rot_z(np.radians(10.0 * k)), np.array([float(k), 0.0, 0.0]))
+               for k, n in enumerate(names)}
+    monkeypatch.setattr(FakeSfm, "global_model", _with_camera(FakeModel(turning), 600.0))
+    monkeypatch.setattr(FakeSfm, "incremental_model", None)
+    monkeypatch.setattr(FakeSfm, "held_model", FakeModel(line(names), method="sfm-incremental"))
+    monkeypatch.setattr(FakeSfm, "component", set(names))
+    monkeypatch.setattr(FakeSfm, "held", [])
+    monkeypatch.setattr(api, "_turns_through_lens", lambda ctx, sfm, model, names_: True)
+    exif = replace(K, source="exif")
+    sfm_chain.ctx.new = [nf(i, np.ones(8), exif=exif) for i in range(4)]
+    api._run_sfm(sfm_chain.ctx, False, None, quiet)
+    assert sfm_chain.ctx.notes["sfm_focal_rejected"] == {
+        "sfm-global": {"focal_px": 600.0, "prior_px": 500.0, "turn_deg": 30.0}}
+    assert FakeSfm.held == [True] and sfm_chain.ctx.notes["sfm_focal_held"] is True
+    plain = ctx_of([nf(i, np.ones(8)) for i in range(4)])
+    model = FakeSfm.global_model
+    assert api._plausible_focal(plain, model, api.CameraPrior(640, 480, focal=500.0)) is model  # type: ignore[arg-type]
 
 
 def test_an_sfm_focal_length_near_the_prior_or_without_one_is_accepted() -> None:
@@ -610,7 +673,8 @@ def test_refinement_takes_part_only_keyframes_with_intrinsics(
     seen: dict[str, Any] = {}
 
     def refine(p: Any, views: dict[str, Any], free: Any, refine_focal: bool = False,
-               hold_distortion: bool = False, gravity: Any = None, up: Any = None) -> PoseFit:
+               hold_distortion: bool = False, gravity: Any = None, up: Any = None,
+               focal_max_factor: float = 2.0) -> PoseFit:
         seen["views"] = sorted(views)
         seen["hold_distortion"] = hold_distortion
         seen["gravity"] = gravity
@@ -1056,7 +1120,7 @@ def test_keyframes_whose_sfm_focal_differs_are_reconstructed_again_with_it(
 
 def test_the_map_frame_without_metric_scale_keeps_the_sfm_units(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_scale(m: Any, f: Any) -> Any:
+    def no_scale(m: Any, f: Any, warn: bool = False) -> Any:
         raise ValueError("no scale")
 
     monkeypatch.setattr(api.mframe, "metric_scale", no_scale)
@@ -1233,12 +1297,34 @@ def test_placing_fails_without_a_registered_or_placed_keyframe(
 
     monkeypatch.setattr(api, "_align_depths", align)
     msgs: list[str] = []
+    warned: list[str] = []
+    monkeypatch.setattr(api.log, "warning", lambda msg, *a: warned.append(msg % a))
     if error is None:
         api._place(ctx_of(new), False, None, msgs.append)  # type: ignore[arg-type]
-        assert msgs == ["left out 1 unplaceable keyframes: f000001"]
+        assert not msgs and warned == [
+            "1 of 2 input frames could not be placed consistently with the map (their pose "
+            "failed the update's checks: see its notes) and are left out: f000001 (in1.jpg)"]
     else:
         with pytest.raises(RegistrationError, match=error):
             api._place(ctx_of(new), False, None, msgs.append)  # type: ignore[arg-type]
+
+
+def test_rejected_frames_are_warned_about_by_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each cause its own warning, naming every frame with its input (at most
+    ``REJECTED_LISTED``, then how many more): no verified matches first, then the depth."""
+    warned: list[str] = []
+    monkeypatch.setattr(api.log, "warning", lambda msg, *a: warned.append(msg % a))
+    monkeypatch.setattr(api, "REJECTED_LISTED", 2)
+    new = [nf(i) for i in range(6)]
+    ctx = ctx_of(new, unmatched={"f000001", "f000002", "f000003", "f000005"},
+                 depth_rejected={"f000003", "f000004"})
+    ctx.rejected = ["f000001", "f000002", "f000003", "f000004"]  # f000005: placed after all
+    api._warn_rejected(ctx)  # type: ignore[arg-type]
+    assert warned == [
+        "3 of 6 input frames share no verified feature matches with the map's keyframes and are "
+        "left out: f000001 (in1.jpg), f000002 (in2.jpg) and 1 more",
+        "1 of 6 input frames have a pose their own depth contradicts and are left out: "
+        "f000004 (in4.jpg)"]
 
 
 # --- rebuilding a weak map ----------------------------------------------------------------------

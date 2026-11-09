@@ -85,7 +85,8 @@ server process. Never edit files in `.staging/` of a map; `view.sh -m` is read-o
 
 ## Machine and tooling facts (verified locally)
 
-- Apple M4 Max, 36 GB unified memory, macOS 26, no CUDA.
+- Apple M3 Pro, 18 GiB unified memory, macOS 27.0.1, no CUDA (`sysctl`, `sw_vers`, 2026-10-26).
+  The spec's target machine is still the M4 Max with 36 GB; evaluations run on this one.
 - **COLMAP:**
   - Homebrew `colmap` 4.2.0 includes GLOMAP as `global_mapper`, and ALIKED/LightGlue feature
     extraction and matching through ONNX Runtime with the CoreML provider.

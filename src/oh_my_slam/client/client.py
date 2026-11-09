@@ -20,6 +20,7 @@ from oh_my_slam.client.images import request_image
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.constants import RESTART_INFERENCE_SERVER
 from oh_my_slam.core.errors import (
+    DeviceMemoryError,
     InferenceError,
     InputError,
     ServerBusyError,
@@ -141,6 +142,10 @@ class InferenceClient:
                 continue
             if r.status_code == 400:
                 raise InputError(f"{route}: {body}")
+            # a server older than ``p.OUT_OF_MEMORY`` names the device's own error
+            if r.status_code == 500 and (body.startswith(f"{p.OUT_OF_MEMORY}:")
+                                         or "out of memory" in body):
+                raise DeviceMemoryError(f"{route} failed: {body}")
             raise InferenceError(f"{route} failed: {body}")
 
     # The image of a request is sent at the size the server reads it (``client.images``); what

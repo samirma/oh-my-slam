@@ -1497,7 +1497,11 @@ and the former 70 % left a multi-view chunk too little). After each request the 
 memory; after a failed one, or with the memory in use at 90 % of the cap or more, it first frees
 Python's cycles and the allocator's cache. The server is `degraded` while the last request ran out of
 memory or the memory in use stays at 90 % of the cap or more: requests are still accepted (the commands
-warn), and `GET /api/health` names the restart. MPS is not thread-safe, so every model call runs on one GPU worker
+warn), and `GET /api/health` names the restart. A request the device runs out of memory for
+answers HTTP 500 with the error `out_of_memory`: the mapper then sends that multi-view chunk again
+with half its new views (its anchors kept), down to 2, and keeps the smaller size for the rest of the
+update. The memory a chunk needs grows with its views and their aspect: 4:3 robot frames failed at
+13-24 views, where 16:9 ones map in chunks of 24. MPS is not thread-safe, so every model call runs on one GPU worker
 thread (loading, warm-up and every request; a failed request's traceback frames are cleared there,
 so the tensors they held are freed on that thread too). The queue holds 8 jobs; beyond that the
 server answers HTTP 503 and the client retries.
@@ -1584,8 +1588,8 @@ pixels, so its results are unchanged.
      30–37° off their gravity).
    * **A new camera's lens.** When the new keyframes share one camera that no stored keyframe
      has and that has no lens yet, their own pairs are matched first. Multi-view poses of the
-     new keyframes alone are refined with the camera's focal length and division distortion
-     (rotation-staged when rotations alone explain the matches within 0.5°: a camera turning in
+     new keyframes alone are refined with the camera's focal length (within 1.15 of an EXIF one:
+     step 4) and division distortion (rotation-staged when rotations alone explain the matches within 0.5°: a camera turning in
      place). A lens found by a fit within 1° becomes the database camera, held from then on;
      the keyframes are inferred again on their undistorted images, and every pair is matched
      (again) with it. The wide-angle pan-tilt camera of `examples/camera`, added to a phone
@@ -1627,6 +1631,19 @@ pixels, so its results are unchanged.
      units are arbitrary — the camera 8 cm from the last one placed 3 m away). MapAnything runs
      in chunks of 24, anchored on up to 4 already-posed keyframes, and is also the fallback when
      SfM fails.
+   * **A focal length the keyframes carry stays within 1.15 of it.** When every new keyframe has
+     its EXIF focal length (or the pinhole of its camera's known lens), an SfM model whose camera
+     is further off it is not accepted (`updates[].notes.sfm_focal_rejected`) and incremental
+     mapping with the focal length held poses the keyframes, however far the camera turns
+     (`sfm_focal_held`); the multi-view refinements below hold it beyond that factor, the
+     distortion alone refined. Without EXIF the prior is the keyframes' monocular estimates, and
+     the factor 2 (below). A robot head camera (EXIF 270 px, its `camera_info`'s) walking 0.23 m
+     straight ahead was refined to 365 px by the multi-view fallback: pure translation cannot
+     tell the two apart, every epipolar line running through the focus of expansion, and the
+     images located in that map came out stretched 1.4 times ahead and 2.3 times sideways. SfM's
+     bundle adjustment of short walks drifted as far (394 and 441 px for that camera, 1204 px
+     for one of 656 px). An EXIF focal length is not always exact: a phone's 35 mm-equivalent
+     tag (a rounded integer) can be 8 % off, which SfM corrects within that factor.
    * **Refinement of multi-view poses** (`mapping.panorama.refine_turning`, then again on the
      aligned depth). Every verified match, lifted with its keyframe's monocular depth, must
      reproject onto its partner. Pairs whose matches imply a rotation far from the multi-view
@@ -1644,8 +1661,9 @@ pixels, so its results are unchanged.
      wide-angle lens whose image corners lie about 500 px from where a pinhole would see them.
      Pinhole SfM collapses its frames, fails, or explains them with a focal length off by a large
      factor (253–294 px from the global mapper, 28,800–271,000 px from the incremental one, for a
-     1370 px prior). A new map's SfM model whose focal length is off the camera's prior (EXIF,
-     else the keyframes' monocular estimates) by more than a factor of 2 is not accepted
+     1370 px prior). A new map's SfM model whose focal length is off the camera's prior (the
+     keyframes' monocular estimates) by more than a factor of 2 (an EXIF one by more than 1.15,
+     above) is not accepted
      (`updates[].notes.sfm_focal_rejected`; the office photos and street2 stay within 1.1), so
      such input takes this path. A focal length within that factor does not make the model right:
      on the camera's first 9 frames alone the global mapper fitted 1398–1515 px and spread the
@@ -1674,7 +1692,8 @@ pixels, so its results are unchanged.
      mapper, agrees (+21°/−17° and a 27.7° step for p08/p09). Over few views the focal length and
      the distortion trade off: on the uncropped frames the first 9 fitted 3750 px and −0.77 about
      as well as 1350 px and −0.40, and turned by half as much. A focal length more than twice or
-     less than half its prior is therefore held at the prior and the distortion refined alone. A
+     less than half its prior (1.15 times an EXIF one) is therefore held at the prior and the
+     distortion refined alone. A
      coefficient that moves the image corners by less than 10 % of the half-diagonal is set to 0,
      so pinhole cameras stay pinhole cameras: the rendered `ainex-captures` fit 1 %, and the four
      window photos that open `office_sequence` (a phone, which corrects its images itself; trees

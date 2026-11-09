@@ -52,6 +52,8 @@ def test_metric_scale_is_the_median_ratio_and_warns_about_its_spread(
     frames = [_depth("a", 1.0), _depth("b", 2.0), _depth("c", 3.0), _depth("empty", 2.0),
               _depth("unregistered", 5.0)]
     res = mframe.metric_scale(model, frames)
+    assert not warned  # a check's measurement: only the scale the map keeps warns
+    res = mframe.metric_scale(model, frames, warn=True)
     assert res.scale == pytest.approx(2.0)
     assert res.per_frame == pytest.approx({"a": 1.0, "b": 2.0, "c": 3.0})
     assert set(res.points) == {"a", "b", "c"}  # no observations, not registered: not measured

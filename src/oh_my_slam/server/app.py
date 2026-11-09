@@ -142,7 +142,8 @@ def create_app(state: ServerState) -> FastAPI:
         except (InputError, FileNotFoundError, ValueError) as exc:
             return _error(400, type(exc).__name__, str(exc))
         except Exception as exc:
-            return _error(500, type(exc).__name__, str(exc))
+            return _error(500, p.OUT_OF_MEMORY if is_out_of_memory(exc) else type(exc).__name__,
+                          str(exc))
         return model.model_validate(result)
 
     @app.get(p.ROUTE_HEALTH, response_model=p.Health)

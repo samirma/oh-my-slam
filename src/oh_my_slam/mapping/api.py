@@ -32,7 +32,7 @@ from oh_my_slam.core import paths, timing
 from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.constants import RETRIEVAL_TOP_K as RETRIEVAL_TOP_K
 from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX as UPDATE_EXHAUSTIVE_MAX
-from oh_my_slam.core.errors import RegistrationError
+from oh_my_slam.core.errors import DeviceMemoryError, RegistrationError
 from oh_my_slam.core.images import upright_size
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
@@ -75,6 +75,12 @@ LOOP_MIN_GAP = 30
 PHOTO_EXHAUSTIVE_MAX = 200
 MV_CHUNK = 24  # gate G6
 MV_ANCHORS = 4
+# A chunk the inference server runs out of memory for is sent again with half its new views, the
+# anchors kept, down to this many; the smaller size holds for the rest of the update. MapAnything
+# attends across all views' tokens at once, and a view's tokens grow with its aspect: a robot's
+# 640x480 frames (4:3) failed at 13 views of a new map and at 24 of an update onto 34 keyframes
+# (13.32 GiB, the weights 6.56 of it), where 16:9 frames had mapped in chunks of 24.
+MV_MIN_NEW = 2
 REJECT_SCALE = (0.5, 2.0)
 # a map of photos that some keyframe holds without SfM support (``_weak_keyframe``) is rebuilt
 # with the new photos, as one update of them all, up to this many stored keyframes
@@ -105,6 +111,10 @@ class UpdateContext:
     update_id: int
     work: Path
     rejected: list[str] = field(default_factory=list)
+    # why: rejected keyframes without a verified match to the map's (of a new map, to the posed
+    # ones), and those whose own depth contradicts the pose they were registered at
+    unmatched: set[str] = field(default_factory=set)
+    depth_rejected: set[str] = field(default_factory=set)
     model: SfmModel | None = None
     notes: dict[str, Any] = field(default_factory=dict)
     # refined multi-view keyframes: (median match residual in degrees, matches)
@@ -371,6 +381,34 @@ def _camera_prior(new: list[NewFrame], old: list[store.FrameRecord]) -> CameraPr
                          float(np.median(focals)), video=video_source(new[0].kf.source))[0]
 
 
+# A focal length the keyframes carry stays near it. A robot head camera (EXIF 270 px, its
+# camera_info's) walked 0.23 m straight ahead: the multi-view fallback refined it to 365 px, which
+# pure translation cannot tell from 270 px (every epipolar line runs through the focus of
+# expansion whatever the focal length), and the frames located in that map came out stretched
+# 1.4 times ahead and 2.3 times sideways. SfM's bundle adjustment of short walks drifted as far
+# (394 and 441 px for the same camera, 1204 px for one of 656 px), within FOCAL_MAX_FACTOR. An
+# EXIF focal length is not always exact: a phone's 35 mm-equivalent tag, a rounded integer, put
+# the office split's photos 8 % off, which their SfM corrects (test_mapping_e2e_synth); the 1.2
+# times it that the window photos of office_sequence fitted traded the focal length for a lens
+# (mapping.panorama). Beyond FOCAL_EXIF_MAX_FACTOR the fit is not taken and the EXIF one is held.
+FOCAL_EXIF_MAX_FACTOR = 1.15
+
+
+def _focal_carried(new: list[NewFrame]) -> bool:
+    """Whether every new keyframe carries its focal length: its EXIF one, or the pinhole of its
+    camera's known lens (``_undistorted``)."""
+    return bool(new) and all(nf.kf.exif is not None for nf in new)
+
+
+def _focal_max_factor(new: list[NewFrame]) -> float:
+    """How far the update may refine its keyframes' focal length from their prior:
+    ``FOCAL_EXIF_MAX_FACTOR`` when they carry it (``_focal_carried``), else
+    ``panorama.FOCAL_MAX_FACTOR`` (a prior from the monocular estimates)."""
+    from oh_my_slam.mapping.panorama import FOCAL_MAX_FACTOR
+
+    return FOCAL_EXIF_MAX_FACTOR if _focal_carried(new) else FOCAL_MAX_FACTOR
+
+
 def _pairs_new_map(new: list[NewFrame], is_video: bool) -> set[tuple[int, int]]:
     ids = [nf.kf.index for nf in new]
     desc = np.stack([nf.frame.descriptor for nf in new]) if new[0].frame.descriptor is not None \
@@ -483,17 +521,27 @@ def _multiview_chunks(ctx: UpdateContext, todo: list[PoolView], by_name: dict[st
     from oh_my_slam.reconstruction.multiview import run_multiview
 
     i = 0
+    size = ctx.notes.get("multiview_chunk", MV_CHUNK)
     while i < len(todo):
         if temporal:
-            anchors = _temporal_anchors(todo[i:i + MV_CHUNK - MV_ANCHORS], by_name, MV_ANCHORS)
+            anchors = _temporal_anchors(todo[i:i + size - MV_ANCHORS], by_name, MV_ANCHORS)
         else:
-            anchors = _pick_anchors(todo[i:i + MV_CHUNK], list(by_name.values()), MV_ANCHORS)
-        chunk = todo[i:i + MV_CHUNK - len(anchors)]
+            anchors = _pick_anchors(todo[i:i + size], list(by_name.values()), MV_ANCHORS)
+        chunk = todo[i:i + size - len(anchors)]
         views = anchors + chunk
-        res, _ = run_multiview(
-            [v.image for v in views], ctx.work / "mv", intrinsics=[v.K for v in views],
-            poses=[v.pose for v in views], client=client,
-        )
+        try:
+            res, _ = run_multiview(
+                [v.image for v in views], ctx.work / "mv", intrinsics=[v.K for v in views],
+                poses=[v.pose for v in views], client=client,
+            )
+        except DeviceMemoryError:
+            if len(chunk) <= MV_MIN_NEW:
+                raise
+            size = len(anchors) + max(MV_MIN_NEW, len(chunk) // 2)
+            ctx.notes["multiview_chunk"] = size
+            log.warning("the inference server ran out of memory on %d views at once: sent "
+                        "again %d at a time", len(views), size)
+            continue
         out = {v.name: r.pose for v, r in zip(views, res, strict=True)}
         align = Pose.identity()
         if anchors:
@@ -707,10 +755,12 @@ def _calibrate_new_camera(ctx: UpdateContext, sfm: Sfm, client: Any, progress: P
                                   by_name[n].full_size) for n, T in poses.items()}
         pairs = panorama.verified_matches(sfm.db, set(views))
         free = set(views) - {todo[0].name}
-        turn = panorama.refine_poses(pairs, views, free, refine_focal=True, use_depth=False)
+        factor = _focal_max_factor(ctx.new)
+        turn = panorama.refine_poses(pairs, views, free, refine_focal=True, use_depth=False,
+                                     focal_max_factor=factor)
         turning = turn.pairs > 0 and turn.median_after_deg <= TURN_FIT_DEG
         refine = panorama.refine_turning if turning else panorama.refine_poses
-        fit = refine(pairs, views, free, refine_focal=True)
+        fit = refine(pairs, views, free, refine_focal=True, focal_max_factor=factor)
     cam = next(iter(cams.values()))[1]
     focal = cam.fx * fit.focal_scale
     note = {"camera": next(iter(ids)), "keyframes": len(todo), "turning": turning,
@@ -856,6 +906,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
     component = sfm.largest_component(new_names)
     if len(component) < 2:
         component = new_names
+    ctx.unmatched |= {n.removesuffix(".jpg") for n in new_names - component}
     model: SfmModel | None = None
     scaleless = False
     if not rotation:
@@ -870,8 +921,10 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
             model = _vetted(ctx, _plausible_focal(ctx, mappers[1](), prior), turns)
         placed = 0 if model is None else len(set(model.registered) & new_names) / len(new_names)
         rejected = ctx.notes.get("sfm_focal_rejected", {})
-        if (model is None or placed < MIN_PLACED_FRACTION) and rejected and min(
-                r["turn_deg"] for r in rejected.values()) < FOCAL_HELD_MAX_TURN_DEG:
+        # a focal length the keyframes carry is held whatever the turn: the prior is the camera's
+        if (model is None or placed < MIN_PLACED_FRACTION) and rejected and (
+                _focal_carried(ctx.new)
+                or min(r["turn_deg"] for r in rejected.values()) < FOCAL_HELD_MAX_TURN_DEG):
             model = _vetted(ctx, sfm.map_incremental(ctx.work / "sfm_incr_held", hold_focal=True),
                             turns)
             ctx.notes["sfm_focal_held"] = model is not None
@@ -936,7 +989,10 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
 # with a coefficient of -0.40 (28 % at the corners), its neighbours' few centimetres of parallax
 # absorbed, while 22 % of its pairs keep more than 1.5° (median of their matches; p90 2.4°): the
 # far ones. A camera turning in place leaves none: examples/camera's second 12 captures, mapped
-# again with the first 12 (-0.53, 0.42°), keep 1.5 % beyond 1.5° (p90 0.83°).
+# again with the first 12 (-0.53, 0.42°), keep 1.5 % beyond 1.5° (p90 0.83°). With fewer frames
+# the lens is held by less: examples/camera's two pan positions p08-p09 (8 photos, the
+# models test's set) fit 0.54° (-0.46, corners 50 %) with none beyond 1.5°; at 0.5° SfM's poses
+# were kept, its two pan positions apart, and 5 of the 8 photos were left out.
 #
 # A video is never taken for such a pan. A robot sliding 2.6 m sideways along a flat tiled wall
 # (e141's walk, 26 keyframes) shifts the image as a pan would: rotations with a lens of -0.58
@@ -944,7 +1000,7 @@ def _run_sfm(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress
 # by SfM instead, the walk is 2.49 m long and its keyframes within 5 mm (median) of where they
 # were filmed. Every pan through a lens the benchmark maps is a photo set (examples/camera);
 # every robot video taken for one (e71, e140, e141) was a walk.
-TURN_FIT_DEG = 0.5  # rotations alone explain the matches within this (median): a pan from one spot
+TURN_FIT_DEG = 0.75  # rotations alone explain the matches within this (median): a pan from one spot
 TURN_LENS_SHIFT = 0.15  # ... through a lens that moves the image corners by at least this share
 TURN_PAIR_DEG = 1.5  # ... and leave at most TURN_PAIR_SHARE of the pairs beyond this (their median)
 TURN_PAIR_SHARE = 0.1
@@ -967,7 +1023,8 @@ def _turns_through_lens(ctx: UpdateContext, sfm: Sfm, model: SfmModel, names: se
     pairs = panorama.verified_matches(sfm.db, set(posed), max_per_pair=TURN_MATCHES)
     views = {n: panorama.View(Pose(model.pose(n).R, np.zeros(3)), K[n]) for n in posed}
     fit = panorama.refine_turning(pairs, views, set(posed[1:]), refine_focal=not known,
-                                  hold_distortion=known)
+                                  hold_distortion=known,
+                                  focal_max_factor=_focal_max_factor(ctx.new))
     cam = K[posed[0]]
     k = next((c.k for c in K.values() if c.k), fit.distortion)
     # the lens the fit found, at the focal length it fitted with it
@@ -1009,24 +1066,25 @@ def _plausible_focal(ctx: UpdateContext, model: SfmModel | None, prior: CameraPr
                      ) -> SfmModel | None:
     """``model``, or None (not accepted, ``notes["sfm_focal_rejected"]``, with how far its
     keyframes turn from the first: ``turn_deg``) when the focal length of its camera of the
-    prior's image size is off the prior by more than ``panorama.FOCAL_MAX_FACTOR``."""
-    from oh_my_slam.mapping.panorama import FOCAL_MAX_FACTOR
+    prior's image size is off the prior by more than ``_focal_max_factor`` (an EXIF prior's
+    ``FOCAL_EXIF_MAX_FACTOR``)."""
     from oh_my_slam.mapping.trajectory import rotation_deg
 
     if model is None or prior.focal is None:
         return model
+    factor = _focal_max_factor(ctx.new)
     for cam in model.rec.cameras.values():
         if (cam.width, cam.height) != (prior.width, prior.height):
             continue
         f = float(np.mean(np.asarray(cam.params)[list(cam.focal_length_idxs())]))
-        if max(f / prior.focal, prior.focal / f) > FOCAL_MAX_FACTOR:
+        if max(f / prior.focal, prior.focal / f) > factor:
             Rs = [model.pose(n).R for n in model.registered]
             ctx.notes.setdefault("sfm_focal_rejected", {})[model.method] = {
                 "focal_px": round(f, 1), "prior_px": round(prior.focal, 1),
                 "turn_deg": round(max((rotation_deg(R, Rs[0]) for R in Rs), default=0.0), 1)}
             log.warning("%s: its focal length %.0f px is off the camera's prior %.0f px by more "
                         "than %g times: a wrong camera model, not accepted", model.method, f,
-                        prior.focal, FOCAL_MAX_FACTOR)
+                        prior.focal, factor)
             return None
     return model
 
@@ -1058,7 +1116,8 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
     and the keyframes' monocular depth (``mapping.panorama``; staged for ``rotation``-dominant
     input); every other keyframe — this update's other posed keyframes and the map's — holds
     still. Returns all poses, the factor of the shared focal length and the shared camera's
-    division coefficient (1 and 0 unless ``refine_focal``: ``panorama``). With the SfM ``model``
+    division coefficient (1 and 0 unless ``refine_focal``: ``panorama``, within
+    ``_focal_max_factor``). With the SfM ``model``
     the poses are in, its cameras (refined focal length) are used. ``hold_centres``: the
     rotations alone are refined, with the depth (``panorama.refine_poses``)."""
     from oh_my_slam.mapping import panorama
@@ -1083,14 +1142,15 @@ def _refine_multiview(ctx: UpdateContext, sfm: Sfm, poses: dict[str, Pose], free
         # a camera whose lens is known keeps it: its matches are where its pinhole sees them
         known = any(v.K.k for v in views.values())
         gravity, up = _gravity_priors(ctx, free, poses) or (None, None)
+        factor = _focal_max_factor(ctx.new)
         if hold_centres:
             fit = panorama.refine_poses(pairs, views, free, refine_focal=refine_focal,
                                         hold_centres=True, hold_distortion=known,
-                                        gravity=gravity, up=up)
+                                        gravity=gravity, up=up, focal_max_factor=factor)
         else:
             refine = panorama.refine_turning if rotation else panorama.refine_poses
             fit = refine(pairs, views, free, refine_focal=refine_focal, hold_distortion=known,
-                         gravity=gravity, up=up)
+                         gravity=gravity, up=up, focal_max_factor=factor)
     ctx.notes["pose_refinement"] = fit.summary()
     ctx.pose_support.update({n: (fit.per_frame_deg.get(n, float("inf")),
                                  fit.per_frame_matches.get(n, 0)) for n in fit.poses})
@@ -1355,6 +1415,7 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
     missing = new_names - set(posed) - set(merged) - set(realigned)
     anchored = set(posed) | set(merged) | set(realigned)
     connected = sfm.connected(anchored, missing) if missing else set()
+    ctx.unmatched |= {n.removesuffix(".jpg") for n in missing - connected}
     free: dict[str, Pose] = {}
     mv: dict[str, Pose] = {}
     if connected or realigned:
@@ -1715,6 +1776,7 @@ def _extend(ctx: UpdateContext, sfm: Sfm, new_names: set[str], rotation: bool, i
     if len(ctx.old_frames) < 3 or not (model_in / "images.bin").exists():
         return _remap_small(ctx, sfm, new_names, client, progress, t0)
     connected = sfm.connected(old_names, new_names)
+    ctx.unmatched |= {n.removesuffix(".jpg") for n in new_names - connected}
     ctx.notes["connected_new"] = len(connected)
     if not connected:
         raise RegistrationError("none of the input frames overlaps the map (no verified "
@@ -2296,7 +2358,7 @@ def _define_map_frame(ctx: UpdateContext, model: SfmModel, progress: Progress) -
         method = model.notes.get("scale_method", "multiview_depth")
     else:
         try:
-            scale = mframe.metric_scale(model, fds)
+            scale = mframe.metric_scale(model, fds, warn=True)
         except ValueError:
             # no frame with enough triangulated points: keep the (metric) multi-view scale
             scale = mframe.ScaleResult(1.0, 0.0, {}, {})
@@ -2441,6 +2503,7 @@ def _align_depths(ctx: UpdateContext, model: SfmModel) -> None:
                 REJECT_SCALE[0] <= s <= REJECT_SCALE[1])):
             # neither the sparse nor the dense test supports this pose: misregistered
             ctx.rejected.append(nf.kf.name)
+            ctx.depth_rejected.add(nf.kf.name)
             model.rec.deregister_frame(model.rec.find_image_with_name(name).frame_id)
             continue
         _set_aligned(ctx, nf, T, K, model, name, stats, s, low)
@@ -3074,9 +3137,31 @@ def _place(ctx: UpdateContext, is_video: bool, client: Any, progress: Progress) 
         raise RegistrationError("no input frame could be placed consistently in the map; "
                                 "the map is unchanged")
     if ctx.rejected:
-        progress(f"left out {len(ctx.rejected)} unplaceable keyframes: "
-                 + ", ".join(sorted(ctx.rejected)[:30]))
+        _warn_rejected(ctx)
     return model
+
+
+REJECTED_LISTED = 30  # rejected frames a warning names, then how many more
+
+
+def _warn_rejected(ctx: UpdateContext) -> None:
+    """One warning per cause of the update's rejected keyframes (``frames_rejected``), naming
+    each with its input: no verified feature matches, a pose its own depth contradicts, or a pose
+    the update's other checks did not confirm (its notes say which)."""
+    source = {nf.kf.name: nf.kf.source for nf in ctx.new}
+    rejected = set(ctx.rejected)
+    unmatched = rejected & ctx.unmatched
+    depth = rejected & ctx.depth_rejected - unmatched
+    for names, why in ((unmatched, "share no verified feature matches with the map's keyframes"),
+                       (depth, "have a pose their own depth contradicts"),
+                       (rejected - unmatched - depth, "could not be placed consistently with "
+                        "the map (their pose failed the update's checks: see its notes)")):
+        if not names:
+            continue
+        listed = [f"{n} ({source.get(n, '?')})" for n in sorted(names)[:REJECTED_LISTED]]
+        more = len(names) - len(listed)
+        log.warning("%d of %d input frames %s and are left out: %s%s", len(names), len(ctx.new),
+                    why, ", ".join(listed), f" and {more} more" if more > 0 else "")
 
 
 def _weak_keyframe(rec: store.FrameRecord) -> bool:

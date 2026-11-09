@@ -16,6 +16,9 @@ ROUTE_GEOMETRY = "/v1/geometry"
 ROUTE_GRAVITY = "/v1/gravity"
 ROUTE_SEGMENT = "/v1/segment"
 ROUTE_MULTIVIEW = "/v1/multiview"
+# ``ErrorBody.error`` (HTTP 500) of a request the device ran out of memory for: a smaller one may
+# fit
+OUT_OF_MEMORY = "out_of_memory"
 
 # ``degraded``: the models are loaded, but the last job ran out of device memory or the memory
 # still in use after it is near the cap (``Health.memory``); requests are accepted and may fail

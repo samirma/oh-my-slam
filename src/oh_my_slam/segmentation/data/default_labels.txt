@@ -168,6 +168,8 @@ bread
 cake
 pizza
 sandwich
+# a robot's worktop task ("grab the egg and put it in the bowl"): without it the egg took no label
+egg
 fruit
 apple
 banana

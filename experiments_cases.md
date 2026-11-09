@@ -1166,6 +1166,21 @@ Requested by session "cuda" for the user. Brief: `~/oh-my-slam-data/experiments/
   - Camera IoU 0.99: make the fusion order of a replay independent of the stored update ids.
   - Cup 130's one-update disappearance on camera (update 27): keep each update's `objects.json` in the probe and find the rule.
 
+## Round 4 final evaluations (2026-11-09)
+
+Full evaluator, one run at a time, on the M3 Pro (`~/oh-my-slam-data/experiments/eval-<worktree>/`). exp-locate-motion, exp-da3-depth, exp-replay-main and exp-eval-splits ran with exp-runtime's memory-aware SIFT threads added (`~/oh-my-slam-data/experiments/sift-threads.patch`, user decision): without it the office one-update map's SIFT grew to 25 GB and the guard stopped the run. Metric-by-metric table: `~/oh-my-slam-data/experiments/r4_compare.md`. No stored baseline (missing since 31 Oct), so no regression column.
+
+| Run | Passed / failed (metrics) | What it fixes | What breaks or stays open |
+|---|---|---|---|
+| exp-r1-combined | 601 / 39 (640) | fastest Python run (street2 552 s, objects 54 s) | camera locate 0.67, camera depth agreement (pairs p90 14 %), camera stability IoU 0.28, split IoU 0.22 / 0.07, split timings 310 s, server_sh parity 1 |
+| exp-locate-motion | 595 / 45 (640) | **camera locate 1.00** (only full pass) | otherwise r1's failures, and slower because it lacks exp-runtime (street2 756 s, objects 187 s) |
+| exp-da3-depth | 519 / 85 (604) | **camera depth agreement passes** (pairs p90 4.5 %, single-map all pass) | **ainex single map out of MPS memory** (13.3 GB cap): its 36 single-map metrics have no value; every inference ~50 % slower, street2 1 060 s, server 15.4 GB; camera stability IoU 0.07 |
+| exp-replay-main | 586 / 54 (640) | **camera stability IoU 0.96**, office stability 1.00, split vs one update 1.00 | split update time 224 s per update (limit 140), split total 443 s, persist_frames over; camera locate 0.25 (no locate fix); bird's-eye outline contract 2 (also in exp-eval-splits) |
+| exp-n1 | 602 / 44 (646) | fastest by far (street2 440 s, camera split 68 s, single 92 s, server 3.4 GB); camera locate 0.92 | **`mapper.sh locate` writes into the map folder** (contract.readonly.map 4); latest-wins does not remove the cup (absent_fraction 0); split id persistence 0.90; camera stability IoU 0.13 |
+| exp-eval-splits | 576 / 64 (673, 33 without target) | new checks run on main's code: interleaved locate 0.75 (unseen 0.25); image by image IoU office 0.42, camera 0.36, ainex 0.002 with 43 of 79 refused | office split 4-4-5 update 1 timed out at 3 600 s (cause unknown; the worktree changes only the evaluator) |
+
+Reading: each round-4 keeper fixes its own target in the full evaluator (locate-motion: locate; da3: camera depth; replay: stability), so they combine rather than compete. DA3 needs a memory fix before it can be proposed; N1 needs the read-only and latest-wins fixes before it can replace the Python mapper.
+
 ## Researched, not tested (online only, `~/oh-my-slam-data/experiments/research_late2026.md`)
 
 | Candidate | Why not tested |

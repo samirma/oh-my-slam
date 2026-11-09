@@ -482,14 +482,16 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                  hold_distortion: bool = False,
                  gravity: dict[str, tuple[NDArray[Any], float]] | None = None,
                  up: NDArray[Any] | None = None, hold_centres: bool = False,
-                 balance_depth: bool = False, depth_noise: bool = False) -> PoseFit:
+                 balance_depth: bool = False, depth_noise: bool = False,
+                 focal_max_factor: float = FOCAL_MAX_FACTOR) -> PoseFit:
     """Refine the camera-to-map poses of the ``free`` keyframes (see the module docstring).
 
     ``views``: every keyframe that may take part (free and fixed); pairs with a keyframe outside
     it, or with no free keyframe, are ignored. ``refine_focal`` scales every keyframe's focal
     length by one common factor and gives them one radial distortion (one shared camera, its
     keypoints as the image shows them); a focal length that leaves its initial value by more than
-    ``FOCAL_MAX_FACTOR`` is a wrong camera, and the refinement starts again with it held
+    ``focal_max_factor`` (``FOCAL_MAX_FACTOR``; less for an EXIF one: ``mapping.api.
+    FOCAL_EXIF_MAX_FACTOR``) is a wrong camera, and the refinement starts again with it held
     (``hold_focal``: the distortion alone refined). ``hold_distortion``: the camera's distortion
     is known (the keypoints are where its pinhole sees them), the focal length alone refined.
     ``use_depth=False`` is the pure-rotation model (centres stay put); ``hold_centres`` keeps the
@@ -629,7 +631,7 @@ def refine_poses(pairs: list[PairMatches], views: dict[str, View], free: Collect
                 image, f_px * np.exp(phi), kappa) < DISTORTION_MIN_SHARE:
             kappa = 0.0  # no lens distortion: the pinhole, as without it
             fixed.append(npar - 1)
-    if refine_focal and abs(phi) > np.log(FOCAL_MAX_FACTOR):
+    if refine_focal and abs(phi) > np.log(focal_max_factor):
         return refine_poses(pairs, views, free, refine_focal, use_depth, scales,
                             hold_focal=True, hold_distortion=hold_distortion, gravity=gravity,
                             up=up, hold_centres=hold_centres, balance_depth=balance_depth,
@@ -684,7 +686,8 @@ def centre_hints(pairs: list[PairMatches], views: dict[str, View], free: Collect
 def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Collection[str],
                    refine_focal: bool = False, hold_distortion: bool = False,
                    gravity: dict[str, tuple[NDArray[Any], float]] | None = None,
-                   up: NDArray[Any] | None = None) -> PoseFit:
+                   up: NDArray[Any] | None = None,
+                   focal_max_factor: float = FOCAL_MAX_FACTOR) -> PoseFit:
     """``refine_poses`` for rotation-dominant input, whose multi-view camera centres are noise
     (decimetres, where the head moves centimetres) that can trap the joint refinement: the pairs
     the initial rotations contradict are left out (``screen_pairs``), then the rotations are
@@ -692,7 +695,8 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
     centre of the fixed keyframes it overlaps (``centre_hints``), and rotations and centres are
     refined together with the depth, every depth stratum of a pair weighing alike
     (``depth_balance``) and the residuals whitened by the depth noise measured
-    (``depth_noise``)."""
+    (``depth_noise``). ``refine_focal``, ``hold_distortion`` and ``focal_max_factor`` are
+    ``refine_poses``'s, for that last refinement."""
     pairs, gate = screen_pairs(pairs, views, free)
     rot = refine_poses(pairs, views, free, use_depth=False, gravity=gravity, up=up)
     hints = centre_hints(pairs, views, free)
@@ -700,7 +704,7 @@ def refine_turning(pairs: list[PairMatches], views: dict[str, View], free: Colle
               for n, v in views.items()}
     fit = refine_poses(pairs, staged, free, refine_focal=refine_focal,
                        hold_distortion=hold_distortion, gravity=gravity, up=up,
-                       balance_depth=True, depth_noise=True)
+                       balance_depth=True, depth_noise=True, focal_max_factor=focal_max_factor)
     fit.median_before_deg = rot.median_before_deg
     fit.screened, fit.screen_gate_deg = gate.dropped, gate.gate_deg
     return fit

@@ -5,7 +5,6 @@ about a centimetre, parallax of side steps modelled, focal length recovered, fix
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping.panorama import refine_poses
@@ -176,6 +175,16 @@ def test_a_wide_angle_lens_is_refined_with_the_focal_length() -> None:
     known = refine_turning(rig.pairs, flat, set(truth) - {"f000"}, refine_focal=True,
                            hold_distortion=True)
     assert known.distortion == 0.0 and abs(known.focal_scale - 1.0) < 0.01
+    # a focal length 15 % off: refined back within FOCAL_MAX_FACTOR, held beyond a tighter
+    # factor (an EXIF focal length's: mapping.api.FOCAL_EXIF_MAX_FACTOR)
+    off = Intrinsics(K.fx * 0.85, K.fy * 0.85, K.cx, K.cy, K.width, K.height)
+    far = {n: View(init[n], off, _lens_depth(rig.depth[n], k), K, (K.width, K.height))
+           for n in truth}
+    fitted = refine_poses(pairs, far, set(truth) - {"f000"}, refine_focal=True)
+    assert abs(fitted.focal_scale * 0.85 - 1.0) < 0.03, fitted.focal_scale
+    held_focal = refine_poses(pairs, far, set(truth) - {"f000"}, refine_focal=True,
+                              focal_max_factor=1.15)
+    assert held_focal.focal_scale == 1.0
 
 
 def test_the_jacobian_is_the_residuals_derivative() -> None:
@@ -213,20 +222,16 @@ def test_the_jacobian_is_the_residuals_derivative() -> None:
             assert not J[:, :, 13].any()
 
 
-def test_a_focal_length_that_runs_off_its_prior_is_held(monkeypatch: pytest.MonkeyPatch
-                                                         ) -> None:
-    """A shared focal length that leaves its prior by more than ``FOCAL_MAX_FACTOR`` (here a
+def test_a_focal_length_that_runs_off_its_prior_is_held() -> None:
+    """A shared focal length that leaves its prior by more than ``focal_max_factor`` (here a
     5 % change against a 1 % limit) is a wrong camera: the refinement starts again with it held,
     the distortion alone refined."""
-    from oh_my_slam.mapping import panorama
-
-    monkeypatch.setattr(panorama, "FOCAL_MAX_FACTOR", 1.01)
     truth = _sweep()
     rig = turning_rig(truth, seed=5)
     wrong = Intrinsics(K.fx * 0.95, K.fy * 0.95, K.cx, K.cy, K.width, K.height)
     init = _noisy(truth, {"f000"}, rot=2.0, trans=0.05, seed=6)
     fit = refine_poses(rig.pairs, rig.views(init, K_used=wrong), set(truth) - {"f000"},
-                       refine_focal=True)
+                       refine_focal=True, focal_max_factor=1.01)
     assert fit.focal_scale == 1.0
 
 
