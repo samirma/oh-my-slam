@@ -48,7 +48,8 @@ transform, not re-fitted per read.
 | --- | --- | --- |
 | C8 | Frames within 0.3 m and 15° of a keyframe that are located | ≥ 0.9 |
 | C8 | Median position error of located frames | ≤ max(2 cm, 1 % of the scene depth) |
-| C8 | Ambiguity flagged when the second-best hypothesis is within 3 sigma | Measured on frames with true symmetric matches |
+| C8 | `ambiguity` non-null on located frames whose pose error exceeds 0.3 m or 15° | ≥ 0.8 |
+| C8 | `ambiguity` null on located frames within 0.10 m and 5° of the truth | ≥ 0.9 |
 | C2 | Scale error with `metric` priors | ≤ 3 % |
 | C2 | Scale error with camera height only | ≤ 10 % |
 | C1 | Map-frame shift of stored keyframes between consecutive versions | ≤ 2 cm and ≤ 0.5° (median), beyond the stated `gauge_shift` |

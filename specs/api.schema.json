@@ -1553,7 +1553,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Non-null only when a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has at least ambiguity_support_ratio (default 0.6) of its inliers; pos_m / rot_deg are the rival's distance from the reported pose."
         },
         "consistent_with_prior": {
           "type": [

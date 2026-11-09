@@ -129,9 +129,18 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `too_close` or `blur`. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. |
   | `inlier_ratio` | The share of inliers. |
-  | `ambiguity` | `{pos_m, rot_deg}`, the distance to the second-best hypothesis, or null when there is none. |
+  | `ambiguity` | `{pos_m, rot_deg}` or null; see below. |
   | `consistent_with_prior` | Bool, or null without a prior. |
 
+* **Ambiguity.** `ambiguity` is non-null only when a rival hypothesis has comparable support.
+  * The rival is the best pose hypothesis, other than the reported one, that is farther than
+    0.10 m or 5° from it.
+  * Its support is comparable when its inlier count is at least `ambiguity_support_ratio`
+    (default 0.6, recorded in `README.md`) of the reported pose's.
+  * `pos_m` and `rot_deg` are the distance from the rival pose to the reported one.
+  * So a non-null `ambiguity` always means a genuinely different pose with comparable
+    support, for example the 90° flip of a symmetric room. The client then asks for a second
+    frame.
 * **Provisional frames.** Locate works against a version whose newest frames are still
   provisional, using their provisional poses.
 * **Nothing located** is a `200` response with every frame `rejected`, not an error.
