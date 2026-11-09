@@ -61,6 +61,154 @@ weights and the code the server fetches with them, the external tools and the ve
 ./start_inference_server.sh --stop
 ```
 
+## The oms/2.0 service (`server.sh`, `oh_my_slam.service`)
+
+The HTTP API of `specs/api.md` for the robot-guide skill. Implemented so far: **O1** (anchored map
+frame and priors) and **O4** (per-input status), with the service plumbing they need.
+
+```sh
+./server.sh                                    # 0.0.0.0:9091, data ~/oh-my-slam-data/
+./server.sh --host 0.0.0.0 --port 9091 --data ~/maps-data
+./server.sh --status                           # GET /api/health on stdout; exit 3 if not running
+./server.sh --stop                             # and the inference server, if this service started it
+```
+
+* **Process.** Starlette under uvicorn. It binds `--host` on `--port` (0: a free port), starts
+  the inference server in the background when it is not running (`server.sh --stop` stops it
+  again only if it started it), and writes `server.sh: listening on http://<host>:<port>/` on
+  stderr once it accepts connections. Its log is `<data>/oms/service.log`; the inference server's
+  start log `<data>/oms/inference.log`. One service per data folder (`<data>/oms/service.lock`).
+  `--keep-versions` is accepted; retention comes with O2 (every version is kept until then).
+* **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
+  folder: `maps/<name>/` (`map.json`: cameras, mask digests, latest version; `masks/`;
+  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version),
+  `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
+* **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
+  `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
+  `DELETE /api/maps/{name}`. The other endpoints of api.md come with their groups (O2, O3,
+  O5-O10); `?dry_run=1` answers `invalid_request` until O10.
+  `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
+  `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
+* **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
+  `src/oh_my_slam/service/api.schema.json`, must equal `specs/api.schema.json`; a test checks it),
+  and the tests validate every response body against it. Errors are `ErrorBody`
+  (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
+  field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
+* **Uploads.** A request body is at most 512 MiB (`app.UPLOAD_CAP_BYTES`); the data disk must
+  have 3 times the upload free. Larger: `payload_too_large`.
+* **Map names**: 1-64 letters, digits, `.`, `_`, `-`, starting with a letter or digit.
+* **Server-Timing** on every response: the request's stages (`upload`, `validate`) and `total`.
+  A job's stages are in its body, `timings_s` (`checks`, `register`, `anchor`, `commit`, `total`).
+* **Lanes.** Until O3 the service has one job worker: `lanes.interactive` reports it (busy while a
+  job runs, the queue, the age of the oldest job); `lanes.bulk` is always idle.
+
+### Update jobs (minimal until O3)
+
+`POST /api/maps/{name}/updates` validates the request synchronously (schema; unique frame names;
+every part present; images decodable 8-bit JPEG/PNG of their camera's size; depth 16-bit PNGs of
+that size; masks 8-bit PNGs; prior poses rigid; cameras not redefined, `camera_conflict`), refuses
+with `inference_unavailable` when the inference server is not ready, records new cameras, and
+answers `202` with the job (`queued`, `Location: /api/jobs/{id}`). One worker runs the jobs one at
+a time, in arrival order: `queued` → `registering` → `committed`, or `rejected` (the gate or a
+hard limit: nothing committed), or `failed` (`error`). A job commits one version;
+`provisional_version` stays null until O3, and every committed pose is `fused`. A client
+disconnect never touches a job; a job still running when the service stops is `failed` at the
+next start. Jobs are kept one hour after they end (`jobs/<id>.json`).
+
+The mapper runs in a process of its own per job (`python -m oh_my_slam.service.mapper_proc`), on
+an APFS clone (`cp -c`) of the map's mapper map; the commit moves the clone into place and writes
+the version. A rejected or failed job leaves the map as it was.
+
+### Anchored map frame (O1)
+
+* **Cameras.** The mapper models one focal length with the principal point at the image centre.
+  A frame whose camera is not that already is resampled once (OpenCV `initUndistortRectifyMap`,
+  no rotation) to its *canonical pinhole*: same size, `f = sqrt(fx fy)`, principal point at the
+  centre, no distortion. The optical frame does not change, so the mapper's poses are the
+  camera's. The canonical intrinsics are given to the mapper (`mapping.api.update(intrinsics=)`)
+  in place of EXIF and the monocular focal estimate; the mapper holds them as it holds an EXIF
+  focal length (refined within 1.15, see *A focal length the keyframes carry*). A canonical JPEG
+  without a mask reaches the mapper byte for byte. EXIF orientation is not applied: intrinsics
+  describe the stored pixels.
+* **Ignore mask.** Its pixels take no part in the per-frame checks and are filled from their
+  surroundings (`cv2.inpaint`) in the image the mapper gets, so no feature is extracted on the
+  robot's body. Not yet applied to the mapper's depth and fusion (the cloud reads come with O6/O7).
+* **The map frame.** The mapper keeps its own internal frame, which a rebuild may define again.
+  The service frame is reached from it by one similarity `S` per version (`versions/<n>.json →
+  sim3`), fitted to *anchors* (`service.anchor`):
+  * first update with `metric` priors: the metric priors (their frame becomes the map frame);
+    without metric but with `drifting` priors: the drifting ones; without priors: the first-camera
+    rule (origin at the first registered frame in request order, +x its viewing direction on the
+    horizontal plane, +z up, from the mapper's gravity-aligned frame);
+  * every later update: the previous version's poses of the frames both versions hold, together
+    with every metric prior of the map. The frame therefore never moves; a rebuild is aligned back.
+  The fit is robust: hypotheses from single anchors (rotation and translation) and from pairs
+  (scale), scored by the anchors within 3 sigmas (`K_SIGMA`), then a weighted Procrustes of centres
+  (weight `1/σ_pos²`) and orientations (`1/(2σ_rot²)`) together on the inliers, refined up to three
+  times. Sigmas are floored at 1 cm and 0.5°; a prior without sigmas counts 5 cm and 2°.
+  The scale is fitted only when the inliers' centres spread over 5 position sigmas (a camera
+  turning in place cannot fix it); otherwise it is held (first update: the next scale source;
+  later: the previous version's).
+* **Scale source** (`scale_source`, `scale_sigma_rel` on the job, the summary and the frames):
+  1. `priors`: metric priors that fix the scale (`σ_s = RMS residual / (spread √(n−1))`); drifting
+     priors on a map's first update count here too (their relative motion is metric);
+  2. `depth`: depth PNGs (camera `depth_scale_m`, default 1 mm) against the mapper's aligned depth
+     of the same frames: the median of the per-frame median ratios (≥ 100 common pixels);
+     `σ = 1.4826 MAD(log r)/√n`, at least 0.5 %;
+  3. `camera_height`: per-frame heights (else the camera's) over the mapper's camera heights above
+     its floor (`floor_z`, internal heights above 5 cm); `σ` from their spread and the given
+     sigmas (default 2 cm);
+  4. `monocular`: the mapper's MoGe-aligned metres, `σ = 10 %`.
+  A later update keeps its map's source unless metric priors (two or more inliers) fix the scale.
+* **Quality** (map.md §4): `gauge_shift` is the alignment applied to the update's result in the
+  previous gauge, `A = S_new ∘ S_prev⁻¹`: `translation_m` the median displacement it gives the
+  stored frames, `rotation_deg` its angle, `scale_ratio` its scale (≈ 1 for an extension; a rebuild
+  shows its own gauge). `scale_ratio_vs_prev` is the spread of the stored frames' new map-frame
+  centres over their previous spread. `prior_residuals` (against every metric prior) and
+  `previous_residuals` (stored frames against the previous version), `rebuilt` (the mapper rebuilt
+  the map), `prior_gravity_deg` (first update with priors: the angle between the priors' +z and
+  the mapper's gravity-aligned +z).
+* **Pose priors in the mapper.** Priors enter after registration only, through `S` and the
+  post-checks below: the mapper's pair selection is already exhaustive for up to 200 photos, and
+  pycolmap 4.2's pose-prior bundle adjustment would need the priors in the mapper's internal
+  gauge before the gauge exists. Measured below (*Live check*).
+
+### Per-input status (O4)
+
+`inputs[]` has one entry per frame, in request order: `registered` with `T_map_cam`,
+`sigma_pos_m`, `sigma_rot_deg` and `inliers` (the mapper's observations of the frame, or its
+multi-view refinement's matches), or `rejected` with a reason; `prior_residual_m/deg` whenever the
+frame has a prior and was placed.
+
+| Reason | When (`service.checks`, `service.update`) |
+| --- | --- |
+| `duplicate` | The name, or the exact image bytes, already in the map or earlier in the request. |
+| `too_close` | Median depth < 0.30 m: from the depth PNG, or the monocular depth model for a *suspicious* frame (< 150 SIFT features or texture < 0.05) — before mapping; or the mapper's aligned depth of a registered frame. |
+| `plain` | Texture < 0.01: the share of pixels with an intensity gradient above 4 grey levels per pixel (Sobel/8) at 512 px. Bare walls 0.0003-0.0024; the 128 reference frames ≥ 0.0395. |
+| `blur` | Sharpness < 0.035: variance of the Laplacian at ≤ 1024 px over that at a quarter of the size. Reference frames ≥ 0.12; a Gaussian blur of σ ≥ 1.2 px < 0.035. |
+| `few_features` | < 20 SIFT keypoints at ≤ 1024 px (reference frames ≥ 27) before mapping; or not placed by the mapper with < 150. |
+| `no_overlap` | Not placed by the mapper (no verified link to the map), with ≥ 150 features. |
+| `prior_conflict` | Placed more than 3 sigmas (`K_SIGMA`, the prior's sigmas floored at 1 cm and 0.5°) from its metric prior, or from its drifting prior after the similarity that best fits the request's drifting priors. |
+
+Frames rejected before mapping never reach the mapper. A frame rejected after registration
+(`prior_conflict`, `too_close`) makes the job map once more without it, so it is not in the
+committed map (if the second registration rejects more, they stay in the mapper's map but not
+in the version). Nothing registered is the hard limit: the job is `rejected`
+(`failed_checks: ["hard_limit"]`). `accept_if` is applied to the report before the commit
+(`max_residual_m` against both residual maxima, `max_gauge_shift_m` against
+`gauge_shift.translation_m`, `max_rejected_share`). `low_confidence_share` counts registered
+frames with `sigma_pos_m` > 0.10 m or the mapper's low-confidence flag.
+
+**Pose sigmas** are a documented proxy until the bundle adjustment's covariance is read: the
+registration's angular noise per observation `a` (the mean reprojection error over the focal
+length, or the multi-view refinement's median match residual) over `√n` observations:
+`σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
+for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
+
+### Live check
+
+LIVE_CHECK_PLACEHOLDER
+
 ## Commands
 
 ### `start_inference_server.sh`
@@ -460,13 +608,15 @@ The viewer's code:
     and initial view. `view.sh`'s page does not use them; `server.sh`'s web application draws its
     point-cloud results with them (see below).
 
-### `server.sh`
+### The old web application (`python -m oh_my_slam.web.main`)
+
+`./server.sh` now starts the oms/2.0 service (see *The oms/2.0 service* above). The old web
+application stays until its removal, started as a module:
 
 ```sh
-./server.sh                          # workspace ~/oh-my-slam-data/, port 9091 if free, opens the browser
-./server.sh --port 8765 --data ~/ws --no-browser
-./server.sh --status                 # health JSON on stdout; exit 3 if no service runs for --data
-./server.sh --stop                   # interrupts the requests in progress, then exits
+.venv/bin/python -m oh_my_slam.web.main                    # workspace ~/oh-my-slam-data/, port 9091 if free
+.venv/bin/python -m oh_my_slam.web.main --port 8765 --data ~/ws --no-browser
+.venv/bin/python -m oh_my_slam.web.main --status | --stop
 ```
 
 A long-lived HTTP service (spec §2.6) in `oh_my_slam.web`, on Starlette under uvicorn. Its API

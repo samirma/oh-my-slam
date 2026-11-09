@@ -28,9 +28,9 @@ from numpy.typing import NDArray
 WORK_SIDE = 1024
 TEXTURE_SIDE = 512
 TEXTURE_GRADIENT = 4.0  # grey levels per pixel (Sobel / 8)
-PLAIN_TEXTURE = 0.01  # bare walls 0.0003-0.0024; the reference captures' frames >= 0.057
-BLUR_SHARPNESS = 0.035  # sharp reference frames 0.12-0.59; Gaussian blur of >= 1.2 px < 0.035
-FEW_FEATURES = 20  # the reference captures' frames >= 37 (a bare ceiling with a door frame)
+PLAIN_TEXTURE = 0.01  # bare walls 0.0003-0.0024; the 128 reference frames >= 0.0395
+BLUR_SHARPNESS = 0.035  # the reference frames >= 0.12; a Gaussian blur of >= 1.2 px < 0.035
+FEW_FEATURES = 20  # the reference frames >= 27 (a bare ceiling with a door frame)
 SUSPECT_FEATURES = 150  # below this (or a low texture) the median depth is measured
 SUSPECT_TEXTURE = 0.05
 TOO_CLOSE_M = 0.30  # median depth along the optical axis
