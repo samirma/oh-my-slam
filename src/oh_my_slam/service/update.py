@@ -51,6 +51,7 @@ from oh_my_slam.service.cameras import (
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.jobs import Job
 from oh_my_slam.service.store import Store, clone_tree
+from oh_my_slam.service.timings import FUSION_STAGES, Timings
 
 log = get_logger("oh_my_slam.service.update")
 
@@ -78,6 +79,7 @@ class FrameWork:
     prior: dict[str, Any] | None = None
     height_m: float | None = None
     height_sigma_m: float | None = None
+    mask: bytes | None = None  # the frame's own ignore mask (PNG), combined with the camera's
 
     @property
     def trust(self) -> str:
@@ -174,9 +176,10 @@ def _inliers(f: InternalFrame) -> int:
 class Updater:
     """Runs update jobs (``jobs.Runner``)."""
 
-    def __init__(self, store: Store, backend: Backend) -> None:
+    def __init__(self, store: Store, backend: Backend, timings: Timings | None = None) -> None:
         self.store = store
         self.backend = backend
+        self.timings = timings or Timings()
 
     def __call__(self, job: Job, changed: Callable[[], None]) -> None:
         w: UpdateWork = job.work
@@ -213,6 +216,9 @@ class Updater:
         shas = {r.get("sha256") for r in prev["frames"]} if prev else set()
         for fr in frames:
             f, mask = fr.work, masks[fr.work.camera_id]
+            if f.mask is not None:
+                own = decode_mask(f.mask, f"frames[{f.index}].ignore_mask")
+                mask = own if mask is None else (mask | own)
             if f.name in names or fr.sha in shas:
                 fr.reason = "duplicate"
                 continue
@@ -274,7 +280,12 @@ class Updater:
                 tm["register"] = round(tm.get("register", 0.0) + time.perf_counter() - t, 3)
                 break
             internal = self.backend.read(mapper)
-            tm["register"] = round(tm.get("register", 0.0) + time.perf_counter() - t, 3)
+            wall = time.perf_counter() - t
+            tm["register"] = round(tm.get("register", 0.0) + wall, 3)
+            fusion = sum(v for k, v in reg.stages.items() if k in FUSION_STAGES)
+            self.timings.add("registration_per_frame", max(wall - fusion, 0.0) / len(todo),
+                             len(todo))
+            self.timings.add("fusion_per_frame", fusion / len(todo), len(todo))
             job.progress = 0.8
             changed()
             t = time.perf_counter()

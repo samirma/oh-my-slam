@@ -20,6 +20,7 @@ from oh_my_slam.service.anchor import Sim3, rotation_deg
 from oh_my_slam.service.app import Service, create_app
 from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.store import Store
+from oh_my_slam.service.timings import Timings
 from oh_my_slam.service.update import Updater
 from tests.fakes.service import (
     CAMERA,
@@ -90,9 +91,11 @@ def client(tmp_path: Path) -> Iterator[Client]:
     store = Store(tmp_path / "data")
     store.create()
     backend = FakeBackend()
-    jobs = Jobs(store.jobs, Updater(store, backend))
+    timings = Timings()
+    jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
     jobs.start()
-    service = Service(store, jobs, FakeInference(), backend.require_inference, version="test")
+    service = Service(store, jobs, FakeInference(), backend.require_inference, timings=timings,
+                      version="test")
     with TestClient(create_app(service)) as http:
         yield Client(http, backend, service)
     jobs.stop(timeout=10)
@@ -738,3 +741,109 @@ def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
     assert job["scale_source"] == "monocular"
     s = client.get("/api/maps/m", "MapSummary")
     assert s["floor_z_m"] is None and s["bounds_m"]["min"] == s["bounds_m"]["min"]
+
+
+# -- oms/2.1: capabilities, expected durations, per-frame masks ----------------------------------
+
+
+def test_health_lists_capabilities_and_default_then_measured_timings(client: Client) -> None:
+    h = client.get("/api/health", "Health")
+    assert h["capabilities"] == ["O1", "O4"]
+    reg = h["timings"]["registration_per_frame"]
+    assert reg["source"] == "default" and reg["count"] == 0 and reg["median_s"] > 0
+    frames, files, _ = frames_of(client, 3)
+    client.update("m", frames, files, {"cam": CAMERA})
+    t = client.get("/api/health", "Health")["timings"]
+    assert t["registration_per_frame"]["source"] == "measured"
+    assert t["registration_per_frame"]["count"] == 3 and t["fusion_per_frame"]["count"] == 3
+    assert t["grid_read"]["source"] == "default"
+
+
+def test_eta_counts_the_queue_ahead_and_the_job_s_own_frames(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    client.service.jobs.predict = lambda n: 10.0 * n
+    gate = threading.Event()
+    real = client.backend.register
+
+    def slow(*a: Any) -> Any:
+        gate.wait(10)
+        return real(*a)
+
+    monkeypatch.setattr(client.backend, "register", slow)
+    frames, files, _ = frames_of(client, 3)
+    j1 = client.post_update("m", {"frames": frames[:2], "cameras": {"cam": CAMERA}}, files)
+    assert 0 < j1["eta_s"] <= 20.0
+    deadline = time.monotonic() + 10
+    while client.service.jobs.running is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    j2 = client.post_update("m", {"frames": frames[2:]}, files)
+    assert 20.0 < j2["eta_s"] <= 30.0  # the running job's remainder plus its own 10 s
+    running = client.get(f"/api/jobs/{j1['job_id']}", "Job")
+    assert running["eta_s"] <= 20.0 and running["ended_at"] is None
+    gate.set()
+    done = client.wait(j2["job_id"])
+    assert done["eta_s"] == 0.0 and done["ended_at"] and done["latest_version"] == 2
+
+
+def test_a_frame_mask_is_combined_with_the_camera_s(client: Client) -> None:
+    import io
+
+    from PIL import Image
+
+    def png(rows: slice) -> bytes:
+        m = np.zeros((240, 320), np.uint8)
+        m[rows, :] = 255
+        buf = io.BytesIO()
+        Image.fromarray(m).save(buf, format="PNG")
+        return buf.getvalue()
+
+    frames, files, _ = frames_of(client, 2)
+    frames[0]["ignore_mask"] = "fm"
+    files["fm"] = png(slice(0, 120))
+    files["cm"] = png(slice(120, 240))
+    job = client.update("m", frames, files, {"cam": {**CAMERA, "ignore_mask": "cm"}})
+    # both halves ignored: nothing left to measure, a plain frame
+    assert job["inputs"][0]["reason"] == "plain"
+    frames, files, _ = frames_of(client, 1, start=2)
+    frames[0]["ignore_mask"] = "fm"
+    files["fm"] = png(slice(0, 60))
+    job = client.update("n", frames, files, {"cam": CAMERA})
+    assert job["inputs"][0]["reason"] == "no_overlap"  # inpainted: the mapper's input changed
+    doc = client.post_update("m", {"frames": [{**frames[0], "ignore_mask": "x"}]},
+                             {**files, "x": png16(np.zeros((10, 10)))}, status=400)
+    assert doc["error"]["details"]["field"] == "frames[0].ignore_mask"
+
+
+# -- the main path: a cold start with metric priors, then drifting or none --------------------
+
+
+def test_metric_first_frames_then_drifting_and_none_land_in_the_priors_frame(
+        client: Client) -> None:
+    """Every robot starts with metric priors (the start pose on the floor is the origin, the
+    camera pose from kinematics); its later frames come as drifting or none."""
+    client.backend.gauge = Sim3(0.37, anchor_rot(25), np.array([3.0, -2.0, 0.4]))
+    frames, files, truth = frames_of(client, 3, prior=lambda i, T: {
+        "trust": "metric", "T_map_cam": T.tolist(), "sigma_pos_m": 0.01, "sigma_rot_deg": 0.5})
+    first = client.update("m", frames, files, {"cam": CAMERA})
+    assert first["scale_source"] == "priors"
+    drift = Sim3(1.0, anchor_rot(-30), np.array([5.0, 5.0, 0.0]))  # odometry's own frame
+    frames, files, truth = frames_of(client, 3, start=3, prior=lambda i, T: {
+        "trust": "drifting", "T_map_cam": drift.pose(T).tolist()} if i < 5 else None)
+    job = client.update("m", frames, files)
+    assert job["state"] == "committed" and job["scale_source"] == "priors"
+    for i, t in zip(job["inputs"], truth, strict=True):
+        assert centre_error(i["T_map_cam"], t) < 1e-6
+        assert rotation_deg(np.asarray(i["T_map_cam"])[:3, :3].T @ t[:3, :3]) < 0.1
+    assert job["inputs"][0]["prior_residual_m"] < 1e-6 and job["inputs"][2]["prior_residual_m"] is None
+    assert job["quality"]["gauge_shift"]["translation_m"] < 1e-6
+    frames, files, truth = frames_of(client, 2, start=0, seed=9)
+    job = client.update("m", frames, files)  # trust none: anchored on the stored frames
+    for i, t in zip(job["inputs"], truth, strict=True):
+        assert centre_error(i["T_map_cam"], t) < 1e-6
+
+
+def anchor_rot(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])

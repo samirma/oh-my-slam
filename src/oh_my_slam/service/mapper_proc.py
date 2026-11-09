@@ -47,6 +47,7 @@ def run(args: dict[str, Any]) -> int:
         "rejected": [source.get(n, n) for n in res.rejected],
         "objects": len(scene.get("openlabel", {}).get("objects", {})),
         "seconds": res.seconds,
+        "stages": res.timings.get("stages_s", {}),
     })
     return int(ExitCode.OK)
 

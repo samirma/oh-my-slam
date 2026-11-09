@@ -39,7 +39,8 @@ def fake_mapper(tmp_path: Path, body: str) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize(("body", "code", "message"), [
-    ("result({'rejected': ['x'], 'objects': 2, 'seconds': 1.5})", None, None),
+    ("result({'rejected': ['x'], 'objects': 2, 'seconds': 1.5, 'stages': {'cloud': 1.0}})",
+     None, None),
     ("result({'error': {'message': 'none placed'}}); sys.exit(5)", "nothing", "none placed"),
     ("result({'error': {'message': 'down'}}); sys.exit(3)", "inference_unavailable", "down"),
     ("result({'error': {'message': 'oom', 'out_of_memory': True}}); sys.exit(1)",
@@ -54,7 +55,8 @@ def test_register_reads_the_mapper_s_result(tmp_path: Path, body: str, code: str
     log = tmp_path / "mapper0.log"
     if code is None:
         r = b.register(tmp_path / "mapper", [img], {img: K}, log)
-        assert (r.sources_rejected, r.objects, r.seconds) == (["x"], 2, 1.5)
+        assert (r.sources_rejected, r.objects, r.seconds, r.stages) == (["x"], 2, 1.5,
+                                                                        {"cloud": 1.0})
         args = json.loads(log.with_suffix(".args.json").read_text())
         assert args["intrinsics"][str(img)]["fx"] == 300.0
         return
@@ -99,7 +101,8 @@ def test_mapper_proc_runs_the_mapper_with_the_given_intrinsics(
     def update(map_dir: Path, inputs: list[Path], **kw: Any) -> Any:
         seen.update(kw)
         scene = {"openlabel": {"objects": {"1": {}, "2": {}}}}
-        return api.UpdateResult(json.dumps(scene).encode(), ["f000003"], ["f000004"], 2.0)
+        return api.UpdateResult(json.dumps(scene).encode(), ["f000003"], ["f000004"], 2.0,
+                                {"stages_s": {"sfm": 1.0, "cloud": 0.5}})
 
     monkeypatch.setattr(api, "update", update)
     m = tmp_path / "map"
@@ -109,8 +112,9 @@ def test_mapper_proc_runs_the_mapper_with_the_given_intrinsics(
             "intrinsics": {"/a.jpg": K.to_dict()}, "result": str(tmp_path / "r.json")}
     (tmp_path / "args.json").write_text(json.dumps(args))
     assert mapper_proc.main([str(tmp_path / "args.json")]) == 0
-    assert json.loads((tmp_path / "r.json").read_text()) == {"rejected": ["/b.jpg"],
-                                                             "objects": 2, "seconds": 2.0}
+    assert json.loads((tmp_path / "r.json").read_text()) == {
+        "rejected": ["/b.jpg"], "objects": 2, "seconds": 2.0,
+        "stages": {"sfm": 1.0, "cloud": 0.5}}
     assert seen["intrinsics"] == {Path("/a.jpg"): K}
 
     def fails(*a: Any, **kw: Any) -> Any:

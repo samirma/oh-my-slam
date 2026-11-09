@@ -31,10 +31,12 @@ from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.routes import ENDPOINTS
 from oh_my_slam.service.schema import SCHEMA_VERSION
 from oh_my_slam.service.store import Store, check_name
+from oh_my_slam.service.timings import Timings
 from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
+CAPABILITIES = ["O1", "O4"]  # the groups this service implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
 ROTATION_TOLERANCE = 1e-3
@@ -51,6 +53,7 @@ class Service:
     inference: InferenceState
     # ``inference_unavailable`` unless the inference server is ready (``inference.inference_ready``)
     require_inference: Callable[[], None]
+    timings: Timings = field(default_factory=Timings)
     version: str = "unknown"
     upload_cap: int = UPLOAD_CAP_BYTES
     stopping: bool = False
@@ -212,12 +215,20 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
             if d.shape != (cam["height"], cam["width"]):
                 raise invalid(f"{field}.depth", f"{field}.depth is {d.shape[1]}x{d.shape[0]}; "
                               f"camera {f['camera_id']!r} is {cam['width']}x{cam['height']}")
+        frame_mask = None
+        if "ignore_mask" in f:
+            frame_mask = part(f"{field}.ignore_mask", f["ignore_mask"])
+            m = decode_mask(frame_mask, f"{field}.ignore_mask")
+            if m.shape != (cam["height"], cam["width"]):
+                raise invalid(f"{field}.ignore_mask", f"{field}.ignore_mask is "
+                              f"{m.shape[1]}x{m.shape[0]}; camera {f['camera_id']!r} is "
+                              f"{cam['width']}x{cam['height']}")
         prior = f.get("prior")
         if prior is not None and "T_map_cam" in prior and not _rotation_ok(prior["T_map_cam"]):
             raise invalid(f"{field}.prior.T_map_cam", f"{field}.prior.T_map_cam is not a rigid "
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
-                                f.get("height_above_floor_m"), f.get("height_sigma_m")))
+                                f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask))
     return UpdateWork(name, frames, req.get("accept_if")), new, masks
 
 
@@ -240,7 +251,8 @@ class Api:
             oldest = now - queued[0].created
         return body({
             "version": self.s.version, "service": "stopping" if self.s.stopping else "ready",
-            "inference": inference,
+            "inference": inference, "capabilities": CAPABILITIES,
+            "timings": self.s.timings.body(),
             "lanes": {"interactive": {"state": "busy" if running else "idle",
                                       "queued": len(queued),
                                       "oldest_s": None if oldest is None else round(oldest, 3)},
@@ -276,8 +288,8 @@ class Api:
         _stage(request, "validate", t0)
         if cameras or masks or self.s.store.meta(name) is None:
             self.s.store.add_cameras(name, cameras, masks)
-        job = self.s.jobs.submit(name, work)
-        return JSONResponse(job.body(), 202, {"Location": f"/api/jobs/{job.id}"})
+        job = self.s.jobs.submit(name, work, len(work.frames))
+        return JSONResponse(self.s.jobs.view(job), 202, {"Location": f"/api/jobs/{job.id}"})
 
     async def get_job(self, request: Request) -> Response:
         raw = request.query_params.get("wait_s")
@@ -292,7 +304,7 @@ class Api:
         job_id = request.path_params["id"]
         job = await run_in_threadpool(self.s.jobs.wait, job_id, wait) if wait else \
             self.s.jobs.get(job_id)
-        return JSONResponse(job.body())
+        return JSONResponse(self.s.jobs.view(job))
 
     def _version(self, request: Request) -> tuple[str, dict[str, Any], dict[str, Any]]:
         name = check_name(request.path_params["name"])

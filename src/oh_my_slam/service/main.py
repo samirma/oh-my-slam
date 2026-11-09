@@ -150,6 +150,7 @@ def serve(store: Store, host: str, port: int) -> int:
     from oh_my_slam.service.backend import MapperBackend
     from oh_my_slam.service.inference import Inference
     from oh_my_slam.service.jobs import Jobs
+    from oh_my_slam.service.timings import Timings
     from oh_my_slam.service.update import Updater
 
     store.create()
@@ -165,11 +166,12 @@ def serve(store: Store, host: str, port: int) -> int:
         _log_to(store.root / LOG)
         store.clear_scratch()
         backend = MapperBackend()
-        jobs = Jobs(store.jobs, Updater(store, backend))
+        timings = Timings(store.root / "timings.json")
+        jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
         jobs.load()
         inference = Inference(store.root / INFERENCE_LOG)
         inference.ensure_started()
-        service = Service(store, jobs, inference, backend.require_inference,
+        service = Service(store, jobs, inference, backend.require_inference, timings=timings,
                           version=git_version())
         app = create_app(service)
         bound = sock.getsockname()[1]

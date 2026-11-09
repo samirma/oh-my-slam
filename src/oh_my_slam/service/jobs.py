@@ -48,6 +48,8 @@ class Job:
     timings_s: dict[str, float] = field(default_factory=dict)
     error: dict[str, Any] | None = None
     ended: float | None = None
+    frames: int = 0  # frames sent
+    started: float | None = None
     # the request, kept while the job runs (not part of the body)
     work: Any = None
 
@@ -61,21 +63,23 @@ class Job:
             "schema": SCHEMA_VERSION, "job_id": self.id, "map": self.map, "state": self.state,
             "progress": self.progress, "eta_s": self.eta_s, "created_at": utc(self.created),
             "base_version": self.base_version, "provisional_version": None,
-            "result_version": self.result_version, "inputs": self.inputs,
+            "result_version": self.result_version, "latest_version": self.result_version,
+            "ended_at": None if self.ended is None else utc(self.ended), "inputs": self.inputs,
             "quality": self.quality, "scale_source": self.scale_source,
             "scale_sigma_rel": self.scale_sigma_rel, "timings_s": self.timings_s,
             "error": self.error,
         }
 
     def record(self) -> dict[str, Any]:
-        return {**self.body(), "created": self.created, "ended": self.ended}
+        return {**self.body(), "created": self.created, "ended": self.ended,
+                "frames": self.frames}
 
     @staticmethod
     def from_record(d: dict[str, Any]) -> Job:
         return Job(d["job_id"], d["map"], float(d["created"]), d["state"], float(d["progress"]),
                    d["eta_s"], d.get("base_version"), d["result_version"], d["inputs"],
                    d["quality"], d.get("scale_source"), d.get("scale_sigma_rel"),
-                   d.get("timings_s", {}), d["error"], d.get("ended"))
+                   d.get("timings_s", {}), d["error"], d.get("ended"), int(d.get("frames", 0)))
 
 
 Runner = Callable[[Job, Callable[[], None]], None]
@@ -86,9 +90,11 @@ class Jobs:
     fields and calling ``changed()`` after each state change; it ends the job in a final state
     (an exception fails it as ``internal``)."""
 
-    def __init__(self, folder: Path, runner: Runner) -> None:
+    def __init__(self, folder: Path, runner: Runner,
+                 predict: Callable[[int], float] = lambda frames: 0.0) -> None:
         self.folder = folder
         self.runner = runner
+        self.predict = predict  # seconds an update of so many frames takes
         self._jobs: dict[str, Job] = {}
         self._cond = threading.Condition()
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -128,11 +134,12 @@ class Jobs:
 
     # -- jobs ------------------------------------------------------------------------------------
 
-    def submit(self, map_name: str, work: Any) -> Job:
-        job = Job(uuid.uuid4().hex[:16], map_name, time.time(), work=work)
+    def submit(self, map_name: str, work: Any, frames: int = 0) -> Job:
+        job = Job(uuid.uuid4().hex[:16], map_name, time.time(), work=work, frames=frames)
         with self._cond:
             self._expire()
             self._jobs[job.id] = job
+            job.eta_s = self._eta(job)
             self._save(job)
         self._queue.put(job.id)
         return job
@@ -145,10 +152,32 @@ class Jobs:
                            "after they end)", {"job_id": job_id})
         return job
 
+    def _remaining(self, job: Job, now: float) -> float:
+        own = self.predict(job.frames)
+        return max(0.0, own - (now - job.started)) if job.started is not None else own
+
+    def _eta(self, job: Job) -> float:
+        """Seconds until ``job`` ends: the jobs ahead of it and its own predicted duration."""
+        if not job.active:
+            return 0.0
+        now = time.time()
+        if job.state != "queued":
+            return round(self._remaining(job, now), 1)
+        ahead = sum(self._remaining(j, now) for j in self._jobs.values()
+                    if j.active and j is not job and (j.state != "queued" or j.created < job.created))
+        return round(ahead + self._remaining(job, now), 1)
+
+    def view(self, job: Job) -> dict[str, Any]:
+        """The ``Job`` body with its current ``eta_s``."""
+        with self._cond:
+            job.eta_s = self._eta(job)
+            return job.body()
+
     def changed(self, job: Job) -> None:
         with self._cond:
             if not job.active and job.ended is None:
                 job.ended = time.time()
+            job.eta_s = self._eta(job)
             self._save(job)
             self._cond.notify_all()
 
@@ -193,6 +222,7 @@ class Jobs:
             if job is None or job.state != "queued":
                 continue
             self.running = jid
+            job.started = time.time()
             try:
                 self.runner(job, lambda j=job: self.changed(j))  # type: ignore[misc]
             except Exception as exc:  # a bug: the job fails, the worker goes on

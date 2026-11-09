@@ -62,6 +62,7 @@ class Registered:
     sources_rejected: list[str]
     objects: int
     seconds: float = 0.0
+    stages: dict[str, float] = field(default_factory=dict)  # the mapper's stage seconds
 
 
 class Backend(Protocol):
@@ -150,7 +151,8 @@ class MapperBackend:
         except (OSError, ValueError):
             res = {}
         if code == 0 and "rejected" in res:
-            return Registered(res["rejected"], int(res["objects"]), float(res["seconds"]))
+            return Registered(res["rejected"], int(res["objects"]), float(res["seconds"]),
+                              dict(res.get("stages", {})))
         err = res.get("error", {})
         message = err.get("message") or f"the mapper ended with exit code {code}"
         if code == ExitCode.NOT_REGISTERED:

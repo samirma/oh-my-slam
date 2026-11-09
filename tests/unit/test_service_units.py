@@ -320,3 +320,20 @@ def test_the_worker_skips_jobs_that_are_not_queued(tmp_path: Path) -> None:
     jobs.start()
     jobs.stop(10)
     assert not ran.is_set()
+
+
+def test_timings_persist_and_predict(tmp_path: Path) -> None:
+    from oh_my_slam.service.timings import DEFAULTS, Timings
+
+    path = tmp_path / "t.json"
+    t = Timings(path)
+    assert t.predict_update(2) == 2 * (DEFAULTS["registration_per_frame"]
+                                       + DEFAULTS["fusion_per_frame"])
+    t.add("locate_per_frame", 1.0, 3)
+    t.add("locate_per_frame", 3.0)
+    again = Timings(path)
+    assert again.body()["locate_per_frame"] == {"median_s": 1.0, "p90_s": 2.4, "count": 4,
+                                                "source": "measured"}
+    path.write_text(json.dumps({"other": [1], "locate_per_frame": "x"}))
+    assert Timings(path).body()["locate_per_frame"]["count"] == 0
+    assert Timings(path).median("grid_read") == DEFAULTS["grid_read"]
