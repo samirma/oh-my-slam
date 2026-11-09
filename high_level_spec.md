@@ -1,141 +1,210 @@
-# Monocular RGB Mapping — High-Level Specification
+# oh-my-slam — High-Level Specification
 
-## 1. Goal
+## 1. Purpose and scope
 
-Build an application that reconstructs 3D point clouds from **RGB-only** images and
-video, incrementally assembles them into a persistent map that can be inspected in a
-browser, and describes that map as a set of **labelled objects with oriented bounding
-boxes (OBBs)**.
+oh-my-slam exists to serve one client: the **robot-guide skill**. The skill's goal states that
+"at any point in time, the working map can be accessible", describing the most up-to-date map of
+the scene, while a robot (a wheeled base, a humanoid or an arm, real or simulated) moves through
+that scene. oh-my-slam builds and keeps that map from the robot's camera frames, and answers
+the questions the skill's scripts ask about it.
 
-The system is exposed through six shell entry points and an agent skill:
+**Scope test.** A feature belongs here only if a row of the client contract (§2) needs it.
+Anything else is removed (§12). oh-my-slam knows nothing about any particular robot, scene or
+task:
+* robot knowledge reaches it only as camera pose priors and camera parameters (§4);
+* footprints and height bands are parameters of the requests that need them.
 
-| Entry point | Responsibility |
+The skill's scripts do all numeric work against this API, so every number the skill needs is in
+a response body, with its unit, frame and uncertainty.
+
+This document states requirements. Detailed decisions are recorded in `README.md` and must not
+contradict it. Examples of such decisions: defaults, thresholds, encodings, palette.
+
+| File | Contents |
 | --- | --- |
-| `start_inference_server.sh` | Start the depth- and segmentation-inference server and any other long-lived services required for mapping. |
-| `reconstruct.sh` | Single-frame reconstruction: image → scene description (JSON + OBBs), depth image or point cloud. |
-| `mapper.sh` | Multi-frame mapping: build and update a persistent map, locate an image's camera in it (or report its last known camera), and draw the map from above as a bird's-eye image. |
-| `segment.sh` | Instance segmentation: image → JSON + OBBs, a colour-coded segmented image, and an object catalogue. |
-| `view.sh` | Browser visualisation of either a single image reconstruction or a persisted map. |
-| `server.sh` | Web service: an HTTP API and a simple browser application that run every mode of `reconstruct.sh`, `mapper.sh` and `segment.sh` (§2.6). |
-| `SKILL.md` agent skill (`oh-my-slam`) | Lets an AI agent use every operation of the `server.sh` API without help, with `curl`, from this Mac or any machine on the LAN; the local scripts are out of its scope (§2.7). |
+| [specs/api.md](specs/api.md) | HTTP API: endpoints, requests, responses, errors |
+| [specs/map.md](specs/map.md) | Map model: frame, versions, update jobs, quality gate, objects, grid |
+| [specs/inference.md](specs/inference.md) | Inference server and its lanes |
+| [specs/evaluation.md](specs/evaluation.md) | Replay evaluator and targets |
+| [specs/api.schema.json](specs/api.schema.json) | JSON Schema (2020-12) of every request and response body |
+| `SKILL.md` | Short API reference for the robot-guide client, generated from the API definitions |
 
-This document states requirements only. Detailed decisions — defaults, coordinate
-conventions, exit codes, the OpenLABEL field mapping, the colour palette — are recorded in
-`README.md` and in the implementation plan (`~/.dev-workflow/oh-my-slam.md`), and must not
-contradict this document.
+## 2. Client contract
 
-## 2. Components
+Each row is something the skill needs. Each row's test is in §11.
 
-Each entry point is specified in its own file:
-
-| Section | Entry point | Specification |
+| # | The skill needs | Provided by |
 | --- | --- | --- |
-| §2.1 | `start_inference_server.sh` | [Inference server](specs/start_inference_server.md) |
-| §2.2 | `reconstruct.sh` | [Single-frame reconstruction](specs/reconstruct.md) |
-| §2.3 | `mapper.sh` | [Mapping](specs/mapper.md) |
-| §2.4 | `segment.sh` | [Segmentation](specs/segment.md) |
-| §2.5 | `view.sh` | [Visualisation](specs/view.md) |
-| §2.6 | `server.sh` | [Web service](specs/http_server.md) |
-| §2.7 | `SKILL.md` | [Agent skill](agent_skill.md), always in its own file next to this one |
+| C1 | One map frame that never jumps: positions it stored before an update are still valid after it. | Anchored map frame (map.md §1) |
+| C2 | The map's metric scale and how well it is known, so map distances can be driven. | `scale_source`, `scale_sigma_rel` on every metric output |
+| C3 | A readable, current map at any moment, including while an update runs. | Versioned snapshots; two-phase update jobs (map.md §2–§3) |
+| C4 | To know, per frame sent, whether it was used, and why not. | Per-input status in the update result (api.md §4) |
+| C5 | To undo an update that made the map worse, in seconds. | Revert to a kept version (api.md §5) |
+| C6 | To reject an update automatically when it would damage the map. | Quality report and `accept_if` gate (map.md §4) |
+| C7 | To check frames before sending them as an update. | Dry run (api.md §4) |
+| C8 | Where the camera is, with an uncertainty and a warning when the answer is ambiguous. | Locate (api.md §6) |
+| C9 | Where the robot can go: free, occupied and unknown floor, the frontiers, rooms and doorways. | Navigation grid (map.md §6) |
+| C10 | The objects of the scene: what, where, how big, their real colour, whether they moved. | Object records (map.md §5) |
+| C11 | What the camera sees now, without changing the map: objects, points, and a range scan. | Frame analysis (api.md §7) |
+| C12 | Locate and frame analysis answered within seconds even while an update runs. | Inference lanes (inference.md) |
+| C13 | A map that shows what is there now: a later observation wins over an earlier one. | Update semantics (map.md §3) |
 
-## 3. Scene description (JSON) returned by the tools
+## 3. Frames and units
 
-The scene JSON follows the well-known ASAM OpenLABEL 1.0.0 schema, with each object's OBB
-stored as a `cuboid`. Every document names the schema URL it conforms to inside
-`openlabel.metadata` (the schema allows no other root key, so a root `$schema` would fail
-validation) and must validate against that schema.
+* **Units.** Metres, degrees, seconds, everywhere. Angles in responses are degrees.
+* **Camera frame.** Optical axes: x right, y down, z forward.
+* **Map frame.** Gravity-aligned and right-handed: x and y horizontal, z up. Yaw is measured
+  counter-clockwise from +x about +z. How the frame is fixed is in map.md §1.
+* **Poses.** `T_a_b` is the 4×4 homogeneous pose of frame b in frame a (row-major, as nested
+  arrays). So `T_map_cam` maps camera-frame points to map-frame points.
+* **Scale.** Every response that carries map-frame metres also carries:
+  * `scale_source`: one of `priors`, `depth`, `camera_height`, `monocular`;
+  * `scale_sigma_rel`: the relative one-sigma uncertainty of the map's scale.
 
-## 4. Constraints
+## 4. Inputs
 
-* **Input is RGB only.** No depth sensor, no stereo pair, no IMU — depth comes from
-  monocular inference.
-* **Python**, with dependencies and the virtual environment managed by `uv` (`.venv`), is
-  preferable but not mandatory.
-* Ownership is enforced between the modules of the shared package, not by the shell scripts
-  calling each other. Taken literally at the shell level it would be circular:
-  `reconstruct.sh -f json` needs objects, and `segment.sh` needs depth. The reconstruction
-  code is the single owner of depth and point-cloud generation, which mapping and segmentation
-  reuse; the segmentation code is the single owner of segmentation, OBB fitting and colour
-  assignment, which the JSON output of reconstruction reuses. Neither reconstruction, mapping
-  nor the viewer re-implements that logic.
-* Shared logic lives in one common package used by all tools. Avoid duplicated and
-  redundant code; follow the language's standard project conventions (typed interfaces,
-  small focused modules, tests).
-* stdout carries at most one JSON document, one PLY file or one PNG image, machine-parseable on its own — no
-  banners, no progress output. Everything human-facing goes to stderr. `reconstruct.sh`,
-  `mapper.sh` and `segment.sh` accept `-o <file>` to write that result to a file instead.
-* It must work on the target machine, an Apple M4 Max Mac with 36 GB of unified memory,
-  where performance is measured; smaller Macs are best-effort. MPS support is preferable but
-  not mandatory.
-* The tools must be accurate and performant, both per image and for mapping, as measured by
-  the evaluators of §5 against their targets.
-* All code is covered by unit tests that check every required component and its behaviour
-  against this specification. The unit tests run offline: no network, no model weights and no
-  running inference server (models are replaced by test doubles). The build fails below 100 %
-  line and branch coverage of the whole shared package, models and evaluators included.
-* Licences are not a blocker: the project is for personal and research use, so copyleft and
-  non-commercial components are acceptable. Every third-party component and its licence is
-  listed in `THIRD_PARTY_LICENSES.md`.
+* **Frames.** Colour images: JPEG or PNG, 8-bit RGB. Each frame names its camera and may carry:
+  * a pose prior;
+  * a depth image: 16-bit PNG, depth along the optical axis, scale given per camera, 0 = no
+    value.
+* **Cameras.** Each camera is described once per map and can be referenced by id afterwards:
+  * intrinsics `fx, fy, cx, cy` in pixels, and image size;
+  * distortion: the OpenCV model, or none;
+  * optional ignore mask, for pixels showing the robot itself;
+  * optional height of the optical centre above the floor, with a sigma: the scale anchor for
+    robots without metric priors.
+* **Pose priors.** `T_map_cam` with a trust level:
+  * `metric` — an absolute pose in the map frame, with position and rotation sigmas. For
+    example, odometry with a known start, or kinematics of a fixed arm.
+  * `drifting` — reliable relative motion between frames of one request, with drift over time.
+  * `none` — no prior. This is the case for camera-only robots.
 
-## 5. Benchmark evaluators
+  Odometry, depth and joint kinematics reach oh-my-slam only through priors and depth. There is
+  no IMU, stereo or LiDAR input.
+* There is no video input. The client samples its own frames.
 
-The project must ship benchmark evaluators that measure the accuracy and performance of
-every entry point, using the files in `examples/` as reference inputs, and one video kept
-outside the repository for video sampling (`mapper.sh -fps`).
+## 5. Map model and lifecycle
 
-* `start_inference_server.sh` — cold-start time and resident memory; no input file needed.
-* `examples/restaurant.jpg` — single-frame reference for `reconstruct.sh`, `segment.sh -i`
-  and `view.sh -i`.
-* `examples/ainex-captures/` — an ordered 79-frame capture sequence (640×480, rendered, no
-  EXIF) of a robot head turning in place, for `mapper.sh` and, frame by frame, `segment.sh -i`;
-  and — on the resulting map — for `view.sh -m`. File names encode the
-  **commanded** head motion as `NNN_<motion>_<tilt>.jpg`:
-  * `NNN` — capture order
-* `examples/camera/` — an ordered 36-frame capture sequence (1920×1080, no EXIF) of a real
-  pan-tilt indoor camera turning in place in a home office, through a wide-angle lens with
-  visible distortion. Same uses as `examples/ainex-captures/`: `mapper.sh` and, frame by frame,
-  `segment.sh -i`; and — on the resulting map — `view.sh -m`. File names encode the
-  **commanded** motion as `img_NNN_pPP_<tilt>.jpg`:
-  * `NNN` — capture order
-  * `pPP` — pan position, numbered in pan order: the camera turns left as `PP` increases, by a
-    step angle that is not recorded
-  * `<tilt>` — `floor`, `low`, `mid` or `high`, in increasing pitch: `floor` and `low` point
-    below `mid`, `high` above it; the four tilts of one pan position are consecutive
-* `examples/office_sequence/` — an ordered 13-image sequence (file names are capture
-  timestamps) of an office scene that changes during the capture: a cup visible in the
-  first images is gone in the last ones. Reference input for the map-update behaviour of
-  [§2.3](specs/mapper.md): mapping the whole sequence must produce a map that reflects the latest
-  observation — without the cup.
-* `street2.mp4` — a 150 s street video, kept outside the repository (its default location is
-  recorded in `README.md`), for `mapper.sh update` at the default `-fps`: performance and the
-  fraction of sampled frames registered.
+A map is created by its first committed update. Every commit after that produces an immutable,
+integer **version**.
+* Reads are atomic: each answer comes from one version, which it names. A read may ask for a
+  past version that is still kept.
+* An update runs as an asynchronous **job** in two phases:
+  * **registration** publishes the new frames with provisional poses within seconds;
+  * **fusion** then fuses their depth and objects.
 
-The evaluators must report at least:
+  Each phase that succeeds commits a version.
+* An update can be checked first (dry run), gated (`accept_if`) and undone (revert).
+* A map is deleted only by its delete request.
 
-* **Performance** — per-stage and end-to-end wall time and peak memory, per image and per
-  mapping update; server cold start and resident memory; `view.sh` time until the page has
-  rendered.
-* **Pose accuracy** — on both capture sequences: estimated camera yaw against the headings
-  encoded in the capture file names (for `examples/camera/`, whose step angle is not recorded:
-  yaw that follows the pan order and agrees across the four tilts of one pan position), pitch
-  direction of the tilted frames (`up` / `down` against `level`; `floor` / `low` / `high`
-  against `mid`), and the fraction of frames successfully registered.
-* **Map quality** — point-cloud consistency across overlapping frames (e.g. the same-heading
-  pairs above), and stability of object `id`s, labels and OBBs when the same sequence is
-  mapped in one update versus split across several.
-* **Map update** — on `examples/office_sequence/`, the final map reflects the latest
-  observation: the cup visible in the first images is absent from the map after the full
-  sequence is mapped, while objects that never changed keep their `id`s, labels and OBBs.
-* **Segmentation** — detections, labels and scores per frame (`restaurant.jpg` and each frame
-  of both capture sequences).
-* **Contracts**, for every command — colour contract, OpenLABEL validity, stdout purity; and
-  for a bird's-eye image (`mapper.sh locate -f png`), agreement with the JSON result of the
-  same call: each camera and OBB footprint is drawn where its pose or cuboid falls under the
-  image's own pixel-to-map metadata.
+The details are in [specs/map.md](specs/map.md).
 
-Evaluators run as a single command, write a machine-readable result (JSON) and a
-human-readable summary, and store results outside the repository so runs can be compared
-over time. Each metric has a target and a pass/fail result, and each run is also compared
-with a stored baseline run so that regressions are flagged. Targets and the baseline are
-data read by the evaluators, so they change without code changes. Ground-truth annotations
-added later for the example files must be picked up without changing evaluator code.
+## 6. HTTP API
+
+One long-lived service, `server.sh`, serves the whole API under `/api/`. [specs/api.md](specs/api.md)
+defines it, and `/api/openapi.json` describes it.
+* It listens on a fixed default port, **9091**.
+* It is reachable from the LAN and from Docker containers using host networking.
+* It owns no model: the inference server (§8) does.
+
+## 7. Output schemas
+
+Every JSON body follows [specs/api.schema.json](specs/api.schema.json), a flat, documented JSON
+Schema (draft 2020-12). Each response names its schema version in `schema`. A change that
+removes or renames a field, or changes its meaning, raises the major version. The skill's client
+is written against this schema. OpenLABEL is no longer produced.
+
+## 8. Concurrency and latency
+
+* **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
+  bird's-eye image, last pose, versions and jobs.
+* **Interactive work.** Locate and frame analysis run in an interactive lane that never waits
+  behind an update's work. A job's registration phase also runs there.
+* **Bulk work.** Fusion runs in a bulk lane.
+* **Ordering.** One job writes a given map at a time. A map's further jobs queue in arrival
+  order.
+* **Disconnects.** A job continues when its client disconnects. Only a cancel request or a stop
+  of the service ends it.
+* **Latency targets** (specs/evaluation.md):
+  * a frame is readable in a map version at most 2 s after its upload;
+  * fusion takes at most 3 s per new frame, for maps up to 500 keyframes.
+
+## 9. Uncertainty
+
+Every estimate the skill acts on carries its uncertainty in the same response:
+* camera poses: position and rotation sigmas;
+* a located camera: also its ambiguity, the distance to the second-best hypothesis;
+* object centres: a sigma, and whether each extent was seen in full or partially;
+* the map scale: its source and relative sigma;
+* grid cells: an observation count, with the unknown state kept distinct from free.
+
+## 10. Constraints
+
+* **Ownership.** Each concern has a single owner module, and none of it is reimplemented
+  elsewhere:
+  * depth and point-cloud generation;
+  * segmentation, box fitting and colour;
+  * mapping (registration, fusion, objects, grid, versions);
+  * the HTTP layer.
+
+  The ownership is enforced by import contracts.
+* **Code.** Shared logic lives in one package. Any language or runtime that serves the
+  targets is allowed, CUDA included. Models adapted for another runtime are third-party
+  components like any other.
+* **Platforms.**
+  * The service and its inference must run on the target machine, an Apple M4 Max Mac with
+    36 GB of unified memory, where performance is measured.
+  * A CUDA host may also run them.
+  * Smaller Macs are best-effort.
+* **Errors.** Each error carries a typed, machine-readable code that says whether a retry can
+  succeed (api.md §8). An input that cannot be used, such as a frame that cannot be located, is
+  a per-input status in a successful response, never an error.
+* **Tests.** Every module is covered by offline unit tests: no network, no model weights, no
+  running inference server, with models replaced by test doubles. The build fails below 100 %
+  line and branch coverage of the whole package, models and evaluators included.
+* **Licences.** Licences are not a blocker: the project is for personal and research use.
+  Every third-party component and its licence is listed in `THIRD_PARTY_LICENSES.md`.
+
+## 11. Evaluation
+
+A single-command evaluator replays recorded robot-guide episodes, from the base, the humanoid
+and the arm, against the simulator's ground truth. It also runs on the reference captures in
+`examples/` (`office_sequence/`, `ainex-captures/`, `camera/`).
+* It measures each client-contract row (§2).
+* Its targets are data in `examples/targets.json`.
+* It writes a machine-readable result and a summary outside the repository, and compares each
+  run with a stored baseline.
+
+The details are in [specs/evaluation.md](specs/evaluation.md).
+
+## 12. Removed features
+
+These features are removed because the client never uses them. Across all recorded episodes the
+calls were:
+
+| Call | Count |
+| --- | --- |
+| update JSON | 158 |
+| locate PNG | 138 |
+| segment JSON | 34 |
+| locate JSON | 15 |
+| locate PLY | 6 |
+| reconstruct PLY | 6 |
+| reconstruct JSON | 5 |
+
+Last-known camera, pixel-to-map, layers and video were never used.
+
+* The public shell entry points `reconstruct.sh`, `segment.sh`, `mapper.sh`, `view.sh` and
+  `start_inference_server.sh`. The inference server is managed by `server.sh` (inference.md).
+* The rule that the HTTP API mirrors the command line byte for byte.
+* The web application and the 3D viewer.
+* Video input and frame sampling (`-fps`).
+* PLY and PNG variants of update and locate, the bird's-eye layers option, and the "last known
+  camera". Two things remain: the bird's-eye image, as a versioned read, and the last
+  *recorded* pose (api.md §6).
+* The map list, and `agent_skill.md`. `SKILL.md` becomes a short API reference.
+* The rule to ask the user before updating an existing map.
+* The outdoor and video examples (`street2.mp4`).
+* OpenLABEL output. It is replaced by the schema of §7.
+* The single-image colour contract across artefacts. An object's `color` stays a display colour,
+  a pure function of its id. Its observed appearance is `mean_rgb` (map.md §5).

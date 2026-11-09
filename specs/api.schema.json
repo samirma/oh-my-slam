@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
+  "title": "oh-my-slam API bodies",
+  "description": "Schema version oms/2.0. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "$defs": {
+    "SchemaVersion": {"type": "string", "pattern": "^oms/2\\.[0-9]+$", "description": "Schema version of the body."},
+    "Mat4": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}, "description": "4x4 homogeneous transform, row-major."},
+    "Vec2": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
+    "Vec3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
+    "Polygon": {"type": "array", "minItems": 3, "items": {"$ref": "#/$defs/Vec2"}, "description": "Closed polygon in map x, y (first point not repeated)."},
+    "Binary": {
+      "type": "object", "required": ["dtype", "shape", "data"], "additionalProperties": false,
+      "properties": {
+        "dtype": {"enum": ["uint8", "uint16", "uint32", "float32"]},
+        "shape": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "data": {"type": "string", "contentEncoding": "base64"}
+      }
+    },
+    "PartName": {"type": "string", "minLength": 1, "description": "Name of a multipart file part of the same request."},
+    "ScaleSource": {"enum": ["priors", "depth", "camera_height", "monocular"]},
+    "Scale": {
+      "type": "object", "required": ["scale_source", "scale_sigma_rel"],
+      "properties": {
+        "scale_source": {"$ref": "#/$defs/ScaleSource"},
+        "scale_sigma_rel": {"type": "number", "minimum": 0, "description": "One-sigma relative uncertainty of the map scale."}
+      }
+    },
+
+    "Camera": {
+      "type": "object", "required": ["fx", "fy", "cx", "cy", "width", "height"], "additionalProperties": false,
+      "properties": {
+        "fx": {"type": "number", "exclusiveMinimum": 0}, "fy": {"type": "number", "exclusiveMinimum": 0},
+        "cx": {"type": "number"}, "cy": {"type": "number"},
+        "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1},
+        "distortion": {
+          "type": ["object", "null"], "additionalProperties": false, "required": ["model", "coefficients"],
+          "properties": {"model": {"const": "opencv"}, "coefficients": {"type": "array", "minItems": 4, "maxItems": 8, "items": {"type": "number"}, "description": "k1, k2, p1, p2[, k3[, k4, k5, k6]]"}}
+        },
+        "ignore_mask": {"$ref": "#/$defs/PartName", "description": "8-bit PNG of the image size; non-zero pixels are ignored (e.g. the robot's own body)."},
+        "depth_scale_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.001, "description": "Metres per unit of this camera's 16-bit depth PNGs."},
+        "height_above_floor_m": {"type": "number", "description": "Height of the optical centre above the floor, when known (scale anchor)."},
+        "height_sigma_m": {"type": "number", "minimum": 0}
+      }
+    },
+    "Prior": {
+      "type": "object", "required": ["trust"], "additionalProperties": false,
+      "properties": {
+        "trust": {"enum": ["metric", "drifting", "none"]},
+        "T_map_cam": {"$ref": "#/$defs/Mat4"},
+        "sigma_pos_m": {"type": "number", "minimum": 0},
+        "sigma_rot_deg": {"type": "number", "minimum": 0}
+      },
+      "if": {"properties": {"trust": {"enum": ["metric", "drifting"]}}}, "then": {"required": ["trust", "T_map_cam"]}
+    },
+    "FrameInput": {
+      "type": "object", "required": ["name", "image", "camera_id"], "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "image": {"$ref": "#/$defs/PartName"},
+        "camera_id": {"type": "string", "minLength": 1},
+        "prior": {"$ref": "#/$defs/Prior"},
+        "depth": {"$ref": "#/$defs/PartName"}
+      }
+    },
+    "AcceptIf": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "max_residual_m": {"type": "number", "minimum": 0},
+        "max_gauge_shift_m": {"type": "number", "minimum": 0},
+        "max_rejected_share": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "UpdateRequest": {
+      "type": "object", "required": ["frames"], "additionalProperties": false,
+      "properties": {
+        "cameras": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Camera"}},
+        "frames": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/FrameInput"}},
+        "accept_if": {"$ref": "#/$defs/AcceptIf"}
+      }
+    },
+
+    "RejectReason": {"enum": ["no_overlap", "few_features", "plain", "too_close", "blur", "prior_conflict", "duplicate"]},
+    "InputStatus": {
+      "type": "object", "required": ["name", "status", "reason", "inliers", "T_map_cam", "sigma_pos_m", "sigma_rot_deg", "prior_residual_m", "prior_residual_deg"],
+      "properties": {
+        "name": {"type": "string"},
+        "status": {"enum": ["registered", "provisional", "rejected"]},
+        "reason": {"oneOf": [{"$ref": "#/$defs/RejectReason"}, {"type": "null"}]},
+        "inliers": {"type": "integer", "minimum": 0},
+        "T_map_cam": {"oneOf": [{"$ref": "#/$defs/Mat4"}, {"type": "null"}]},
+        "sigma_pos_m": {"type": ["number", "null"]},
+        "sigma_rot_deg": {"type": ["number", "null"]},
+        "prior_residual_m": {"type": ["number", "null"]},
+        "prior_residual_deg": {"type": ["number", "null"]}
+      }
+    },
+    "GaugeShift": {
+      "type": "object", "required": ["translation_m", "rotation_deg", "scale_ratio"],
+      "properties": {"translation_m": {"type": "number"}, "rotation_deg": {"type": "number"}, "scale_ratio": {"type": "number"}}
+    },
+    "Residuals": {
+      "type": "object", "required": ["median_m", "max_m", "median_deg", "max_deg", "count"],
+      "properties": {"median_m": {"type": "number"}, "max_m": {"type": "number"}, "median_deg": {"type": "number"}, "max_deg": {"type": "number"}, "count": {"type": "integer"}}
+    },
+    "Quality": {
+      "type": "object", "required": ["scale_ratio_vs_prev", "gauge_shift", "prior_residuals", "previous_residuals", "rejected_share", "low_confidence_share", "rebuilt", "accepted", "failed_checks"],
+      "properties": {
+        "scale_ratio_vs_prev": {"type": ["number", "null"], "description": "New scale over the previous version's; null on a map's first update."},
+        "gauge_shift": {"oneOf": [{"$ref": "#/$defs/GaugeShift"}, {"type": "null"}]},
+        "prior_residuals": {"oneOf": [{"$ref": "#/$defs/Residuals"}, {"type": "null"}], "description": "Against metric priors."},
+        "previous_residuals": {"oneOf": [{"$ref": "#/$defs/Residuals"}, {"type": "null"}], "description": "Stored frames against the previous version's poses."},
+        "rejected_share": {"type": "number", "minimum": 0, "maximum": 1},
+        "low_confidence_share": {"type": "number", "minimum": 0, "maximum": 1},
+        "rebuilt": {"type": "boolean"},
+        "prior_gravity_deg": {"type": ["number", "null"]},
+        "accepted": {"type": "boolean"},
+        "failed_checks": {"type": "array", "items": {"enum": ["max_residual_m", "max_gauge_shift_m", "max_rejected_share", "hard_limit"]}}
+      }
+    },
+    "Job": {
+      "type": "object", "required": ["schema", "job_id", "map", "state", "progress", "eta_s", "created_at", "provisional_version", "result_version", "inputs", "quality", "error"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"},
+        "job_id": {"type": "string"},
+        "map": {"type": "string"},
+        "state": {"enum": ["queued", "registering", "fusing", "committed", "rejected", "cancelled", "failed"]},
+        "progress": {"type": "number", "minimum": 0, "maximum": 1, "description": "Progress of the current phase."},
+        "eta_s": {"type": ["number", "null"]},
+        "created_at": {"type": "string", "format": "date-time"},
+        "base_version": {"type": ["integer", "null"], "description": "Version registration ran against; null for a new map."},
+        "provisional_version": {"type": ["integer", "null"]},
+        "result_version": {"type": ["integer", "null"]},
+        "inputs": {"type": ["array", "null"], "items": {"$ref": "#/$defs/InputStatus"}},
+        "quality": {"oneOf": [{"$ref": "#/$defs/Quality"}, {"type": "null"}]},
+        "scale_source": {"oneOf": [{"$ref": "#/$defs/ScaleSource"}, {"type": "null"}]},
+        "scale_sigma_rel": {"type": ["number", "null"]},
+        "timings_s": {"type": "object", "additionalProperties": {"type": "number"}},
+        "error": {"oneOf": [{"$ref": "#/$defs/Error"}, {"type": "null"}]}
+      }
+    },
+    "DryRunFrame": {
+      "type": "object", "required": ["name", "features", "map_inliers", "neighbour_inliers", "plain", "too_close", "predicted_status", "predicted_reason"],
+      "properties": {
+        "name": {"type": "string"},
+        "features": {"type": "integer", "minimum": 0},
+        "map_inliers": {"type": ["integer", "null"], "description": "Null for a new map."},
+        "neighbour_inliers": {"type": "array", "items": {"type": "object", "required": ["name", "inliers"], "properties": {"name": {"type": "string"}, "inliers": {"type": "integer"}}}},
+        "plain": {"type": "boolean"},
+        "too_close": {"type": "boolean"},
+        "predicted_status": {"enum": ["registered", "rejected"]},
+        "predicted_reason": {"oneOf": [{"$ref": "#/$defs/RejectReason"}, {"type": "null"}]}
+      }
+    },
+    "DryRun": {
+      "type": "object", "required": ["schema", "map", "base_version", "frames", "quality"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"},
+        "map": {"type": "string"},
+        "base_version": {"type": ["integer", "null"]},
+        "frames": {"type": "array", "items": {"$ref": "#/$defs/DryRunFrame"}},
+        "quality": {"$ref": "#/$defs/Quality"}
+      }
+    },
+
+    "MapSummary": {
+      "type": "object", "required": ["schema", "map", "map_version", "latest_version", "created_at", "frames", "provisional_frames", "objects", "cameras", "bounds_m", "floor_z_m", "running_job"],
+      "allOf": [{"$ref": "#/$defs/Scale"}],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"},
+        "map": {"type": "string"},
+        "map_version": {"type": "integer", "minimum": 1},
+        "latest_version": {"type": "integer", "minimum": 1},
+        "created_at": {"type": "string", "format": "date-time"},
+        "frames": {"type": "integer"},
+        "provisional_frames": {"type": "integer"},
+        "objects": {"type": "integer"},
+        "cameras": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Camera"}},
+        "bounds_m": {"type": "object", "required": ["min", "max"], "properties": {"min": {"$ref": "#/$defs/Vec3"}, "max": {"$ref": "#/$defs/Vec3"}}},
+        "floor_z_m": {"type": ["number", "null"]},
+        "running_job": {"type": ["string", "null"]}
+      }
+    },
+    "VersionInfo": {
+      "type": "object", "required": ["version", "created_at", "kind", "job_id", "frames", "objects"],
+      "properties": {
+        "version": {"type": "integer"}, "created_at": {"type": "string", "format": "date-time"},
+        "kind": {"enum": ["update", "provisional", "revert"]}, "job_id": {"type": ["string", "null"]},
+        "reverted_to": {"type": ["integer", "null"]},
+        "frames": {"type": "integer"}, "objects": {"type": "integer"}
+      }
+    },
+    "Versions": {
+      "type": "object", "required": ["schema", "map", "latest_version", "versions"],
+      "properties": {"schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "latest_version": {"type": "integer"}, "versions": {"type": "array", "items": {"$ref": "#/$defs/VersionInfo"}}}
+    },
+    "RevertRequest": {"type": "object", "required": ["to_version"], "additionalProperties": false, "properties": {"to_version": {"type": "integer", "minimum": 1}}},
+    "FrameRecord": {
+      "type": "object", "required": ["name", "camera_id", "T_map_cam", "sigma_pos_m", "sigma_rot_deg", "pose_state", "added_version"],
+      "properties": {
+        "name": {"type": "string"}, "camera_id": {"type": "string"},
+        "T_map_cam": {"$ref": "#/$defs/Mat4"},
+        "sigma_pos_m": {"type": "number"}, "sigma_rot_deg": {"type": "number"},
+        "pose_state": {"enum": ["provisional", "fused"]},
+        "added_version": {"type": "integer"}
+      }
+    },
+    "Frames": {
+      "type": "object", "required": ["schema", "map", "map_version", "frames"], "allOf": [{"$ref": "#/$defs/Scale"}],
+      "properties": {"schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"}, "frames": {"type": "array", "items": {"$ref": "#/$defs/FrameRecord"}}}
+    },
+
+    "Extent": {"enum": ["full", "partial"]},
+    "Object": {
+      "type": "object", "required": ["id", "label", "detected_as", "score", "centre_m", "size_m", "yaw_deg", "sigma_centre_m", "extent_seen", "mean_rgb", "color"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "label": {"type": "string"},
+        "detected_as": {"type": "array", "items": {"type": "string"}},
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "centre_m": {"$ref": "#/$defs/Vec3"},
+        "size_m": {"$ref": "#/$defs/Vec3", "description": "x = longer horizontal side, y, z = height."},
+        "yaw_deg": {"type": "number", "exclusiveMinimum": -90, "maximum": 90},
+        "sigma_centre_m": {"type": "number", "minimum": 0},
+        "extent_seen": {"type": "object", "required": ["x", "y", "z"], "properties": {"x": {"$ref": "#/$defs/Extent"}, "y": {"$ref": "#/$defs/Extent"}, "z": {"$ref": "#/$defs/Extent"}}},
+        "mean_rgb": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 0, "maximum": 255}, "description": "Observed colour (sRGB)."},
+        "color": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 0, "maximum": 255}, "description": "Display colour, a pure function of id; not the object's appearance."},
+        "bbox_px": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}, "description": "Frame analysis only: x_min, y_min, x_max, y_max."},
+        "state": {"enum": ["confirmed", "moved", "struck"]},
+        "moved_from_m": {"oneOf": [{"$ref": "#/$defs/Vec3"}, {"type": "null"}]},
+        "first_seen_version": {"type": "integer"},
+        "last_seen_version": {"type": "integer"},
+        "region": {"type": ["integer", "null"]}
+      }
+    },
+    "Objects": {
+      "type": "object", "required": ["schema", "map", "map_version", "objects"], "allOf": [{"$ref": "#/$defs/Scale"}],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"},
+        "objects": {"type": "array", "items": {"allOf": [{"$ref": "#/$defs/Object"}, {"required": ["state", "moved_from_m", "first_seen_version", "last_seen_version", "region"]}]}}
+      }
+    },
+
+    "Region": {
+      "type": "object", "required": ["id", "area_m2", "coverage_share", "polygon_m"],
+      "properties": {"id": {"type": "integer"}, "area_m2": {"type": "number"}, "coverage_share": {"type": "number", "minimum": 0, "maximum": 1}, "polygon_m": {"$ref": "#/$defs/Polygon"}}
+    },
+    "Passage": {
+      "type": "object", "required": ["id", "centre_m", "width_m", "normal_deg", "regions", "kind"],
+      "properties": {
+        "id": {"type": "integer"}, "centre_m": {"$ref": "#/$defs/Vec2"}, "width_m": {"type": "number"},
+        "normal_deg": {"type": "number", "description": "Direction from regions[0] to regions[1]."},
+        "regions": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer"}},
+        "kind": {"enum": ["door", "opening", "narrow"]}
+      }
+    },
+    "Frontier": {
+      "type": "object", "required": ["id", "centre_m", "length_m", "region"],
+      "properties": {"id": {"type": "integer"}, "centre_m": {"$ref": "#/$defs/Vec2"}, "length_m": {"type": "number"}, "region": {"type": ["integer", "null"]}}
+    },
+    "Grid": {
+      "type": "object", "required": ["schema", "map", "map_version", "origin_m", "cell_m", "shape", "z_band_m", "floor_z_m", "layers", "regions", "passages", "frontiers"],
+      "allOf": [{"$ref": "#/$defs/Scale"}],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"},
+        "origin_m": {"$ref": "#/$defs/Vec2", "description": "Map x, y of the corner of cell [0, 0]."},
+        "cell_m": {"type": "number", "exclusiveMinimum": 0},
+        "shape": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer"}, "description": "[rows (y), cols (x)]"},
+        "z_band_m": {"$ref": "#/$defs/Vec2", "description": "Height band above floor_z_m."},
+        "floor_z_m": {"type": "number"},
+        "layers": {
+          "type": "object", "required": ["state", "observations", "height_m"],
+          "properties": {
+            "state": {"$ref": "#/$defs/Binary", "description": "uint8: 0 unknown, 1 free, 2 occupied."},
+            "observations": {"$ref": "#/$defs/Binary", "description": "uint16 frame count."},
+            "height_m": {"$ref": "#/$defs/Binary", "description": "float32 highest surface, NaN if none."}
+          }
+        },
+        "regions": {"type": "array", "items": {"$ref": "#/$defs/Region"}},
+        "passages": {"type": "array", "items": {"$ref": "#/$defs/Passage"}},
+        "frontiers": {"type": "array", "items": {"$ref": "#/$defs/Frontier"}}
+      }
+    },
+    "Birdseye": {
+      "type": "object", "required": ["schema", "map", "map_version", "width", "height", "pixel_to_map"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"},
+        "width": {"type": "integer"}, "height": {"type": "integer"},
+        "pixel_to_map": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}, "description": "2x3 affine: [x, y] = A [u, v, 1] for pixel centre (u, v)."}
+      }
+    },
+
+    "LocateFrame": {
+      "type": "object", "required": ["name", "image", "camera_id"], "additionalProperties": false,
+      "properties": {"name": {"type": "string"}, "image": {"$ref": "#/$defs/PartName"}, "camera_id": {"type": "string"}, "prior": {"$ref": "#/$defs/Prior"}}
+    },
+    "LocateRequest": {
+      "type": "object", "required": ["frames"], "additionalProperties": false,
+      "properties": {
+        "cameras": {"type": "object", "additionalProperties": {"$ref": "#/$defs/Camera"}},
+        "frames": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/LocateFrame"}},
+        "record": {"type": "boolean", "default": false},
+        "version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "LocateResult": {
+      "type": "object", "required": ["name", "status", "reason", "T_map_cam", "sigma_pos_m", "sigma_rot_deg", "inlier_ratio", "ambiguity", "consistent_with_prior"],
+      "properties": {
+        "name": {"type": "string"},
+        "status": {"enum": ["located", "rejected"]},
+        "reason": {"oneOf": [{"enum": ["no_overlap", "few_features", "plain", "too_close", "blur"]}, {"type": "null"}]},
+        "T_map_cam": {"oneOf": [{"$ref": "#/$defs/Mat4"}, {"type": "null"}]},
+        "sigma_pos_m": {"type": ["number", "null"]}, "sigma_rot_deg": {"type": ["number", "null"]},
+        "inlier_ratio": {"type": ["number", "null"]},
+        "ambiguity": {"oneOf": [{"type": "object", "required": ["pos_m", "rot_deg"], "properties": {"pos_m": {"type": "number"}, "rot_deg": {"type": "number"}}}, {"type": "null"}]},
+        "consistent_with_prior": {"type": ["boolean", "null"]}
+      }
+    },
+    "Locate": {
+      "type": "object", "required": ["schema", "map", "map_version", "frames"], "allOf": [{"$ref": "#/$defs/Scale"}],
+      "properties": {"schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"}, "frames": {"type": "array", "items": {"$ref": "#/$defs/LocateResult"}}}
+    },
+    "Pose": {
+      "type": "object", "required": ["schema", "map", "map_version", "name", "recorded_at", "T_map_cam", "sigma_pos_m", "sigma_rot_deg"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"}, "map": {"type": "string"}, "map_version": {"type": "integer"},
+        "name": {"type": "string"}, "recorded_at": {"type": "string", "format": "date-time"},
+        "T_map_cam": {"$ref": "#/$defs/Mat4"}, "sigma_pos_m": {"type": "number"}, "sigma_rot_deg": {"type": "number"}
+      }
+    },
+
+    "AnalyseRequest": {
+      "type": "object", "required": ["image", "outputs"], "additionalProperties": false,
+      "properties": {
+        "image": {"$ref": "#/$defs/PartName"},
+        "camera": {"$ref": "#/$defs/Camera"},
+        "camera_id": {"type": "string"}, "map": {"type": "string", "description": "With camera_id: take the camera, and the scale, from this map."},
+        "T_map_cam": {"$ref": "#/$defs/Mat4"},
+        "depth": {"$ref": "#/$defs/PartName"},
+        "outputs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["objects", "points", "range_scan", "depth"]}},
+        "z_band_m": {"$ref": "#/$defs/Vec2", "default": [0.05, 1.8]},
+        "bearing_step_deg": {"type": "number", "exclusiveMinimum": 0, "default": 1.0},
+        "voxel_m": {"type": "number", "minimum": 0, "default": 0.02},
+        "min_score": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5}
+      },
+      "oneOf": [{"required": ["camera"]}, {"required": ["camera_id", "map"]}]
+    },
+    "RangeBeam": {
+      "type": "object", "required": ["bearing_deg", "range_m", "kind"],
+      "properties": {"bearing_deg": {"type": "number"}, "range_m": {"type": ["number", "null"]}, "kind": {"enum": ["obstacle", "floor_end", "unseen"]}}
+    },
+    "Analysis": {
+      "type": "object", "required": ["schema", "frame", "scale_source", "scale_sigma_rel"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"},
+        "frame": {"enum": ["map", "gravity_camera"]},
+        "scale_source": {"$ref": "#/$defs/ScaleSource"},
+        "scale_sigma_rel": {"type": "number"},
+        "objects": {"type": "array", "items": {"allOf": [{"$ref": "#/$defs/Object"}, {"required": ["bbox_px"]}]}},
+        "points": {"type": "object", "required": ["xyz", "object_id", "rgb"], "properties": {"xyz": {"$ref": "#/$defs/Binary"}, "object_id": {"$ref": "#/$defs/Binary"}, "rgb": {"$ref": "#/$defs/Binary"}}},
+        "range_scan": {"type": "array", "items": {"$ref": "#/$defs/RangeBeam"}},
+        "depth": {"$ref": "#/$defs/Binary", "description": "uint16 depth, metres = value x depth_scale_m (0.001); 0 = no value."}
+      }
+    },
+
+    "Lane": {
+      "type": "object", "required": ["state", "queued", "oldest_s"],
+      "properties": {"state": {"enum": ["idle", "busy"]}, "queued": {"type": "integer"}, "oldest_s": {"type": ["number", "null"]}}
+    },
+    "Health": {
+      "type": "object", "required": ["schema", "service", "inference", "lanes", "version"],
+      "properties": {
+        "schema": {"$ref": "#/$defs/SchemaVersion"},
+        "version": {"type": "string", "description": "oh-my-slam build version (git commit)."},
+        "service": {"enum": ["ready", "stopping"]},
+        "inference": {
+          "type": "object", "required": ["state", "device", "memory_used_gb", "memory_cap_gb", "error"],
+          "properties": {
+            "state": {"enum": ["ready", "starting", "degraded", "down"]},
+            "device": {"type": "string"}, "memory_used_gb": {"type": ["number", "null"]}, "memory_cap_gb": {"type": ["number", "null"]},
+            "error": {"type": ["string", "null"]}
+          }
+        },
+        "lanes": {"type": "object", "required": ["interactive", "bulk"], "properties": {"interactive": {"$ref": "#/$defs/Lane"}, "bulk": {"$ref": "#/$defs/Lane"}}}
+      }
+    },
+    "Error": {
+      "type": "object", "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"enum": ["invalid_request", "camera_conflict", "map_not_found", "job_not_found", "version_gone", "no_pose", "map_busy", "inference_unavailable", "out_of_memory", "payload_too_large", "internal"]},
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "details": {"type": "object"}
+      }
+    },
+    "ErrorBody": {"type": "object", "required": ["schema", "error"], "properties": {"schema": {"$ref": "#/$defs/SchemaVersion"}, "error": {"$ref": "#/$defs/Error"}}}
+  }
+}
