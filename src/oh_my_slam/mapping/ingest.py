@@ -74,9 +74,11 @@ def write_upright_jpeg(src: Path, dst: Path) -> None:
         save_jpeg(load_rgb(src), dst, quality=95)
 
 
-def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int
-              ) -> Iterator[Keyframe]:
-    """Write keyframes as ``frames_dir/fNNNNNN.jpg`` and yield them in capture order."""
+def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int,
+              intrinsics: dict[Path, Intrinsics] | None = None) -> Iterator[Keyframe]:
+    """Write keyframes as ``frames_dir/fNNNNNN.jpg`` and yield them in capture order. An image
+    that ``intrinsics`` names carries those (a calibrated camera, ``oh_my_slam.service``) instead
+    of its EXIF ones: the mapper holds them as it holds an EXIF focal length."""
     idx = start_index
     if spec.kind == "video":
         from oh_my_slam.core.video import sample_frames
@@ -93,5 +95,6 @@ def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int
         name = frame_name(idx)
         path = frames_dir / f"{name}.jpg"
         write_upright_jpeg(src, path)
-        yield Keyframe(name, idx, path, str(src), exif_intrinsics(src))
+        given = (intrinsics or {}).get(src)
+        yield Keyframe(name, idx, path, str(src), exif_intrinsics(src) if given is None else given)
         idx += 1

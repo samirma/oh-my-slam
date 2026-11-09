@@ -296,6 +296,19 @@ def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
     assert len(vk) == 4 and float(vk[1].source.rsplit("@", 1)[1]) >= 0.5
 
 
+def test_given_intrinsics_replace_the_exif_ones(tmp_path: Path) -> None:
+    from oh_my_slam.core.types import Intrinsics
+
+    d = tmp_path / "caps"
+    d.mkdir()
+    Image.new("RGB", (40, 30)).save(d / "a.jpg")
+    Image.new("RGB", (40, 30)).save(d / "b.jpg")
+    K = Intrinsics(33.0, 33.0, 20.0, 15.0, 40, 30, "given")
+    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "a.jpg", d / "b.jpg"]), 2.0,
+                                tmp_path / "frames", 0, {d / "a.jpg": K}))
+    assert kfs[0].exif == K and kfs[1].exif is None
+
+
 # --- retrieval ----------------------------------------------------------------------------------
 
 

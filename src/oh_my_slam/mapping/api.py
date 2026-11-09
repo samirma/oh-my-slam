@@ -3007,20 +3007,25 @@ class UpdateResult:
     rejected: list[str]
     seconds: float
     timings: dict[str, Any] = field(default_factory=dict)
+    # of ``rejected``: those without a verified feature match to the map (``UpdateContext``)
+    unmatched: list[str] = field(default_factory=list)
 
 
 def update(map_dir: Path, inputs: list[Path], *, fps: float = ingest.DEFAULT_FPS,
            mode: str = "full", fmt: str = "json", attrs: CloudAttrs | None = None,
-           client: Any = None, progress: Progress = _progress) -> UpdateResult:
-    """``attrs``: point-cloud attributes of the ``fmt="ply"`` payload (map scope; default rgb)."""
+           client: Any = None, progress: Progress = _progress,
+           intrinsics: dict[Path, Intrinsics] | None = None) -> UpdateResult:
+    """``attrs``: point-cloud attributes of the ``fmt="ply"`` payload (map scope; default rgb).
+    ``intrinsics``: given intrinsics of input images, in place of their EXIF ones
+    (``ingest.keyframes``)."""
     with timing.collect() as tm:
         return _update(map_dir, inputs, fps, mode, fmt, attrs or CloudAttrs(), client, progress,
-                       tm)
+                       tm, intrinsics)
 
 
 def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
-            attrs: CloudAttrs, client: Any, progress: Progress, tm: timing.Timings
-            ) -> UpdateResult:
+            attrs: CloudAttrs, client: Any, progress: Progress, tm: timing.Timings,
+            intrinsics: dict[Path, Intrinsics] | None = None) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
     from oh_my_slam.mapping import export
@@ -3040,7 +3045,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             update_id = int(meta.get("update_count", 0)) + 1
             progress(("creating map " if tx.created else "extending map ") + str(tx.root))
             kfs = ingest.keyframes(spec, fps, tx.stage("frames"),
-                                   int(meta.get("next_frame_index", 0)))
+                                   int(meta.get("next_frame_index", 0)), intrinsics)
             plan, skipped = _restart_plan(meta, old, spec)
             early: list[_EarlyFeatures] = []
 
@@ -3101,7 +3106,8 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
             elapsed = time.perf_counter() - t_start
             progress(f"committed update {update_id}: {len(new_names)} keyframes added, "
                      f"{len(objs.exported())} objects, {elapsed:.0f} s")
-            return UpdateResult(payload, new_names, ctx.rejected, elapsed, tm.to_dict())
+            return UpdateResult(payload, new_names, ctx.rejected, elapsed, tm.to_dict(),
+                                sorted(set(ctx.rejected) & ctx.unmatched))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
