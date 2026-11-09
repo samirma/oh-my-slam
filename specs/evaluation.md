@@ -74,6 +74,9 @@ transform, not re-fitted per read.
 | C9 | Doors of the floor plan found as passages within 0.3 m | ≥ 0.8 |
 | C9 | Passage `centre_m` within 0.10 m of the floor plan's door-gap centre, and `width_m` within 0.10 m of its free width | ≥ 0.8 of found doors |
 | C9 | Free cells with `floor_observed` where the floor plan has floor | ≥ 0.9 |
+| C9 | Keyframe camera cells, and their near blind ring, `free` | 100 % |
+| C9 | Frontiers bordering a region with `region` set; objects in or on a region with `region` set | 100 % |
+| C9 | Cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` | ≥ 0.95 |
 | C10 | Support height of objects on a surface (`supported_by` surface `height_m`) | ≤ 2 cm |
 | C10 | `supported_by` / `inside_of` agreeing with the truth's relations | ≥ 0.9 |
 | C8 | Rejected frames with `no_overlap` that carry a `nearest_view` whose turn points toward mapped structure | ≥ 0.8 |

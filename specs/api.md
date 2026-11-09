@@ -25,7 +25,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.0"`).
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.1"`).
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
 * **Access.** Requests from the LAN are accepted without authentication: the service is meant

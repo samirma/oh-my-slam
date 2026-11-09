@@ -117,7 +117,7 @@ Each object record has:
 | `color` | Display colour only: a pure function of `id`. |
 | `state` | `confirmed` (seen again where it was), `moved` (seen elsewhere: `moved_from_m` gives the earlier centre), or `struck` (seen gone; kept for one version, then removed). |
 | `first_seen_version`, `last_seen_version` | Versions where it first and last appeared. |
-| `region` | Id of the grid region its centre lies in (§6), or null. |
+| `region` | The grid region (§6) of the object, or null. It is set when its centre or footprint lies in a region or on its boundary; the region chosen is the one its footprint overlaps most. An object on a wall, such as a door or a shelf, belongs to the region it was seen from. Null only when it touches no region. |
 | `supported_by` | `{kind: surface \| object, id, verified_version}` for the support surface or object it rests on, or null. |
 | `inside_of` | `{id, verified_version}` when its centre lies within another object's concave interior (a bowl, a drawer, a box), or null. |
 
@@ -135,6 +135,15 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
 * cells seen through are **free**;
 * cells holding surfaces within the height band are **occupied**;
 * everything else is **unknown**.
+
+**Where cameras stood is free.** The cells under each keyframe's camera position are free,
+whatever the camera saw, because the robot stood there. So is the ring around that position
+that the camera could not see: its near blind zone on the floor, from the camera's height and
+its lower field-of-view edge.
+
+**The band applies as asked.** `occupied` uses the requested `z_min`–`z_max`, whatever its
+height. A request whose `z_max` is the robot's height plus a margin marks everything the robot
+could hit.
 
 A cell under an overhang that lies wholly above the band's `z_max`, such as a table top above
 the band, is free if it was seen through below the overhang, and unknown otherwise. Only surfaces
@@ -168,9 +177,10 @@ seen there.
   * `jambs_m`, the two end points of the free gap at floor level;
   * `centre_m`, the midpoint of the free gap between the jambs. It is not the midpoint of the
     door frame, nor of the open leaves' free ends;
-  * `width_m`, the free width at the narrowest point within the height band, with open leaves
-    counted as obstacles;
-  * `normal_deg`, perpendicular to the jamb line, from `regions[0]` to `regions[1]`;
+  * `width_m`, the clear width between the jambs: the free width at the narrowest point within
+    the height band, with open leaves counted as obstacles;
+  * `normal_deg`, the crossing direction: perpendicular to the jamb line, from `regions[0]` to
+    `regions[1]`;
   * `regions [a, b]`;
   * for kind `door`, `leaf`: null, or `{polygon_m, intrudes}`, the leaf's footprint and whether
     it intrudes into the gap;
@@ -179,7 +189,8 @@ seen there.
   * `opening`;
   * `narrow`, narrower than 2 × `footprint_radius_m` when that parameter is given.
 * `frontiers[]` — boundaries between free and unknown cells, longer than a minimum length. Each
-  has `id`, `centre_m`, `length_m` and `region`.
+  has `id`, `centre_m`, `length_m` and `region`. `region` is set whenever the frontier borders a
+  region, and is null only for a frontier that touches none.
 
 **Identifiers.** Region and passage ids are stable between versions where the geometry did not
 change, so the skill can refer to "the kitchen" across updates.
