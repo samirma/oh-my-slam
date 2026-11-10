@@ -92,3 +92,39 @@ def test_keyframe_sigmas_without_inliers_and_a_rival_in_the_same_basin(
     monkeypatch.setattr(rl, "_same_basin", lambda *a: True)  # every rival: the same place
     o = rl.locate(_query(T, P, D), twin)
     assert o.located and o.ambiguity is None
+
+
+def test_a_1m_repeated_structure_inflates_the_sigmas_and_the_prior_picks() -> None:
+    """e051 loc091: two copies of one structure 1 m apart, each mapped by its own keyframe; the
+    frame sees one of them. Its rival lies 1 m away with comparable support: the sigmas cover
+    it (half its distance at least), and a prior that agrees with the rival picks the rival."""
+    P, D = _scene()
+    shift = np.eye(4)
+    shift[0, 3] = 1.0
+    idx = rl.Index([_kf("a", A, P, D), _kf("b", shift @ A, _apply(shift, P), D)])
+    T = rooms.camera(0.05, 0.02, 1.0, -2.0, -10.0)
+    o = rl.locate(_query(T, P, D), idx)
+    assert o.located and o.ambiguity is not None
+    assert o.ambiguity["pos_m"] == pytest.approx(1.0, abs=0.05)
+    assert o.sigma_pos_m is not None and o.sigma_pos_m >= 0.5 * o.ambiguity["pos_m"] - 1e-3
+    for prior in (T, shift @ T):
+        p = rl.locate(_query(T, P, D, prior=prior), idx)
+        assert p.T is not None and rl.pose_distance(p.T, prior)[0] < 0.05
+        assert p.consistent_with_prior is True and p.sigma_pos_m is not None
+        assert p.sigma_pos_m >= 0.49
+
+
+def test_a_low_inlier_ratio_floors_the_sigmas() -> None:
+    P, D = _scene()
+    idx = rl.Index([_kf("a", A, P, D)])
+    T = rooms.camera(0.05, 0.02, 1.0, -2.0, -10.0)
+    q = _query(T, P, D)
+    rng = np.random.default_rng(3)  # most of the frame's matches point nowhere
+    kf = idx.keyframes[0]
+    bad = np.isfinite(kf.xyz).all(axis=1)
+    kf.xyz[bad] += rng.normal(0, 1.0, (int(bad.sum()), 3)).astype(np.float32) * \
+        (rng.random(int(bad.sum())) < 0.7)[:, None]
+    o = rl.locate(q, idx)
+    assert o.located and o.inlier_ratio is not None and o.inlier_ratio < rl.LOW_RATIO
+    assert o.sigma_pos_m is not None and o.sigma_pos_m >= rl.LOW_RATIO_SIGMA_POS_M
+    assert o.sigma_rot_deg is not None and o.sigma_rot_deg >= rl.LOW_RATIO_SIGMA_ROT_DEG

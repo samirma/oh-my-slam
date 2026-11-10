@@ -288,7 +288,9 @@ server.
   (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it is
   measured against); *spread* the RMS distance of the other hypotheses of the same place,
   weighted by their squared relative support. Keyframes whose depth or pose disagree therefore
-  widen the sigmas.
+  widen the sigmas. With an `ambiguity`, each sigma is at least half the rival's distance (the
+  mixture of the two, not the winner alone); with an `inlier_ratio` below 0.4, at least 5 cm and
+  1° (a provisional floor until the replay calibrates it).
   `SIGMA_SCALE` is 1.0 until the replay calibrates it (see the measurements below).
 * **Ambiguity** (`ambiguity_support_ratio` **0.6**). The rival is the best-supported other
   hypothesis that is another place: farther than 0.3 m or 15° — or 3 times the pose's fit and
@@ -297,7 +299,8 @@ server.
   disagree in depth), and not brought back to the pose when refined on both inlier sets
   (`_same_basin`). `ambiguity` is set when its support is
   ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. A prior, then the frame's height,
-  picks between the pose and its rival when only one agrees with it. Turn fits: a second turn
+  picks the rival over the pose when only the rival agrees with it and it has ≥ 0.6 of the
+  pose's support. Turn fits: a second turn
   fit without the first one's inliers, > 5° away, at the same ratio.
 * **`consistent_with_prior`**: the pose within 3 σ of a `metric` or `drifting` prior, the two
   sigmas combined per component (the prior's default 5 cm, 2°); null without a prior.

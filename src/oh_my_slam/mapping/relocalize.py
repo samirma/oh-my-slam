@@ -62,6 +62,10 @@ RIVAL_KEYFRAMES = 6
 AMBIGUITY_POS_M = 0.10
 AMBIGUITY_ROT_DEG = 5.0
 AMBIGUITY_SUPPORT_RATIO = 0.6
+RIVAL_SIGMA_SHARE = 0.5  # with a rival, the sigmas are at least half its distance
+LOW_RATIO = 0.4  # an inlier ratio below this floors the sigmas at (README "Locate"):
+LOW_RATIO_SIGMA_POS_M = 0.05
+LOW_RATIO_SIGMA_ROT_DEG = 1.0
 TWIN_REL = 0.3  # distinct: map points of a twin view this far apart, relative to their range
 FAR_POS_M = 0.3  # a rival lies at least this far, or is turned this much (``tolerance``)
 FAR_ROT_DEG = 15.0
@@ -610,8 +614,10 @@ def locate(q: Query, index: Index) -> Outcome:
             sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
             rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq,
                                keyframes=_keyframe_sigmas(rival, kfs, index))
-            if (consistent(q, main.T, sp, sr) is False and consistent(q, rival.T, rsp, rsr)) or (
-                    not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp)):
+            comparable = rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers
+            if comparable and ((consistent(q, main.T, sp, sr) is False
+                                and consistent(q, rival.T, rsp, rsr))
+                               or (not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp))):
                 others = [main, *[h for h in others if h is not rival]]
                 main, rival = rival, main
                 main, cov = _refined(main, hypothesis, q, uv, xyz, origin, px)
@@ -619,13 +625,17 @@ def locate(q: Query, index: Index) -> Outcome:
         if not plausible(main, kfs, index):
             return out  # a degenerate solve: not located (a wrong pose is worse than none)
         sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
-        out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, sp, sr
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
         if rival is not None and rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers:
             dp, dr = pose_distance(rival.T, main.T)
             out.ambiguity = {"pos_m": round(dp, 4), "rot_deg": round(dr, 3)}
+            # the sigmas cover the mixture of the pose and its rival, not the winner alone
+            sp, sr = max(sp, RIVAL_SIGMA_SHARE * dp), max(sr, RIVAL_SIGMA_SHARE * dr)
+        if out.inlier_ratio < LOW_RATIO:  # most matches unexplained: never millimetres
+            sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
+        out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
         out.consistent_with_prior = consistent(q, main.T, sp, sr)
         return out
     if ray_q:
