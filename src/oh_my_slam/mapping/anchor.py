@@ -26,11 +26,27 @@ Array = NDArray[np.float64]
 K_SIGMA = 3.0  # an anchor whose residual exceeds this many sigmas is an outlier
 MIN_SIGMA_POS_M = 0.01  # floors of the anchors' sigmas: a perfect prior still has noise
 MIN_SIGMA_ROT_DEG = 0.5
-DEFAULT_SIGMA_POS_M = 0.05  # a prior without sigmas
+DEFAULT_SIGMA_POS_M = 0.05  # a metric prior without sigmas (api.md §3)
 DEFAULT_SIGMA_ROT_DEG = 2.0
+DRIFTING_SIGMA_POS_M = 0.20  # a drifting prior without sigmas (api.md §3)
+DRIFTING_SIGMA_ROT_DEG = 5.0
 SCALE_OBSERVABLE_SIGMAS = 5.0  # centres must spread over this many position sigmas to fix scale
 MAX_HYPOTHESES = 400
 REFINE_ITERATIONS = 20
+
+
+def default_sigmas(trust: str) -> tuple[float, float]:
+    """The fixed sigmas (m, deg) of a prior sent without any (api.md §3): ``drifting`` 0.20 m /
+    5°, ``metric`` 0.05 m / 2°."""
+    if trust == "drifting":
+        return DRIFTING_SIGMA_POS_M, DRIFTING_SIGMA_ROT_DEG
+    return DEFAULT_SIGMA_POS_M, DEFAULT_SIGMA_ROT_DEG
+
+
+def prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
+    """A request ``Prior``'s sigmas (m, deg): its own, else its trust's defaults."""
+    dp, dr = default_sigmas(str(p.get("trust", "metric")))
+    return float(p.get("sigma_pos_m", dp)), float(p.get("sigma_rot_deg", dr))
 
 
 def rotation_deg(R: Array) -> float:
