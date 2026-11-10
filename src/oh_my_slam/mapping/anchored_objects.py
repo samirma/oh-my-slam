@@ -20,10 +20,15 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   depth (``judge``): samples seen through by more than ``tau`` (max(``SEEN_TAU_M``,
   ``SEEN_TAU_REL`` x depth)) against samples seen in place; samples hidden by something nearer
   and those in the bottom ``FOOT_SHARE`` of the box (the support at its foot looks the same with
-  or without it) tell nothing; nor is what depth sees through anyway (``SEE_THROUGH``: a window,
-  a glass). After an object's last sighting in the update, it is ``struck``
+  or without it) tell nothing. An object the depth sees through (``see_through``: a keyframe
+  detected it after a keyframe's depth had seen it gone, or in several of its sightings the
+  depth inside its mask lies beyond its own points — a glass globe, a window, trees behind one) is never judged on depth: only a keyframe that has its place in view,
+  unhidden and large enough, and does not detect it counts against it, and one such keyframe
+  never strikes it. Nor does a keyframe judge an object on depth where one of its detections of
+  a comparable size covers the object's place (``_detected_there``: a glass detected under
+  another label). After an object's last sighting in the update, it is ``struck``
   when the keyframes that saw it gone outnumber those that saw it in place (a single one must see
-  ``GONE_ALONE`` of it through). A struck object keeps its record for that version and is removed
+  ``GONE_ALONE`` of it through, with a depth image: one monocular view is not enough). A struck object keeps its record for that version and is removed
   by the next update; the cloud voxels inside its box that its witnesses see through are carved
   (``carve``), so the surface behind it shows the latest view.
 * **Moved.** A new object of a compatible label, similar size (``MOVE_SIZE``) and colour
@@ -68,7 +73,7 @@ from numpy.typing import NDArray
 from scipy import ndimage
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.geometry import project, voxel_keys
+from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
@@ -139,8 +144,12 @@ SURFACE_ID_CENTRE_M = 0.3
 SUPPORT_TOL_M = 0.05
 SUPPORT_PREFER_OBJECT_M = 0.01
 CARVE_GROW_M = 0.02
-# what a keyframe's depth sees through even while it is there: never judged on depth
-SEE_THROUGH = frozenset({"window", "shop window", "glass", "wine glass", "glass door"})
+BEHIND_SHARE = 0.3  # of a detection's mask: depth beyond its own points (it is seen through)
+SEE_THROUGH_VIEWS = 2
+ABSENT_SHARE = 0.5  # a see-through object's verdict when a keyframe does not detect it
+DETECT_MIN_PX = 200  # ... judged only where it would cover this many pixels
+COVERED_SHARE = 0.5  # a keyframe that detects something over this share of an object's place
+COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no depth verdict
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -201,6 +210,10 @@ class Sighting:
     label: str
     score: float
     depth_rel: float = DEPTH_NOISE_REL  # the keyframe depth's relative noise
+    # see-through evidence (``see_through``): the share of the mask's depth beyond the object's
+    # own points, and the median range of the mask's depth from the camera
+    behind: float = 0.0
+    mask_range: float = 0.0
 
     @property
     def truncated(self) -> bool:
@@ -290,6 +303,10 @@ class MapObject:
     last_seen_version: int = 0
     published: bool = False
     misses: int = 0  # keyframes that saw its place in place without detecting it
+    # keyframes that detected it after a keyframe's depth saw it gone (``see_through``), and
+    # the latest verdict on it ("seen", "gone", "in_place")
+    contradicted: int = 0
+    last_verdict: str | None = None
     supported_by: dict[str, Any] | None = None
     inside_of: dict[str, Any] | None = None
     struck_version: int | None = None
@@ -312,7 +329,8 @@ class MapObject:
                 "moved_from": self.moved_from, "first_seen_version": self.first_seen_version,
                 "last_seen_version": self.last_seen_version, "published": self.published,
                 "misses": self.misses, "supported_by": self.supported_by,
-                "inside_of": self.inside_of, "struck_version": self.struck_version}
+                "inside_of": self.inside_of, "struck_version": self.struck_version,
+                "contradicted": self.contradicted, "last_verdict": self.last_verdict}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> MapObject:
@@ -324,7 +342,9 @@ class MapObject:
                          last_seen_version=int(d["last_seen_version"]),
                          published=bool(d["published"]), misses=int(d["misses"]),
                          supported_by=d["supported_by"], inside_of=d["inside_of"],
-                         struck_version=d["struck_version"])
+                         struck_version=d["struck_version"],
+                         contradicted=int(d.get("contradicted", 0)),
+                         last_verdict=d.get("last_verdict"))
 
 
 @dataclass
@@ -448,20 +468,72 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
         c = np.median(pts, axis=0)
         ray = c - view.centre
         dist = float(np.linalg.norm(ray))
+        behind, mask_range = _behind(inst.mask, depth, valid, view, pts)
         s = Sighting(view.kid, version, c.round(5).tolist(), round(dist, 4),
                      int(inst.mask.sum()), cut, (ray / max(dist, 1e-9)).round(5).tolist(),
                      view.centre.round(5).tolist(), float(view.sigma_pos_m), rgb,
                      inst.detection.label, round(float(inst.detection.score), 4),
-                     view.depth_rel)
+                     view.depth_rel, round(behind, 4), round(mask_range, 4))
         out.append(Observation(inst.detection.label, float(inst.detection.score), pts,
                                inst.mask, s))
     return out
 
 
+def _behind(mask: NDArray[np.bool_], depth: NDArray[np.float32], valid: NDArray[np.bool_],
+            view: View, pts: Array) -> tuple[float, float]:
+    """(share of the inner mask's depth beyond the object's own points by more than ``tau``,
+    median range of the inner mask's depth): what a detection sees through (a glass, a window,
+    trees behind one)."""
+    inner = ndimage.binary_erosion(mask, iterations=RGB_ERODE_PX) & valid
+    if inner.sum() < 10:
+        inner = mask & valid
+    vv, uu = np.nonzero(inner)
+    r_mask = np.linalg.norm(unproject_pixels(uu, vv, depth[vv, uu], view.K.K()), axis=1)
+    far = float(np.percentile(np.linalg.norm(pts - view.centre, axis=1), 90))
+    tau = max(SEEN_TAU_M, SEEN_TAU_REL * far)
+    return float(np.mean(r_mask > far + tau)), float(np.median(r_mask))
+
+
+def _detected_there(view: View, u: Array, v: Array, px: float) -> bool:
+    """Whether one of the keyframe's detections covers ``COVERED_SHARE`` of an object's samples
+    (their pixels ``u``, ``v``) with a mask at most ``COVER_SIZE`` times the pixels the object
+    covers (``px``): the keyframe sees an object there, whatever its label or depth."""
+    if not len(u):
+        return False
+    uu, vv = u.astype(np.intp), v.astype(np.intp)
+    for det in view.dets:
+        if det.mask[vv, uu].mean() >= COVERED_SHARE and det.mask.sum() <= COVER_SIZE * max(px, 1):
+            return True
+    return False
+
+
+def see_through(o: MapObject) -> bool:
+    """Whether the depth sees through the object (see the module docstring): a keyframe detected
+    it after a keyframe's depth had seen it gone (``contradicted``), or several of its
+    sightings, at least ``SEE_THROUGH_VIEWS`` and a third of them, see the depth inside its mask
+    beyond its own points (``BEHIND_SHARE`` of the mask), or the mask's median depth beyond its
+    box by more than half its size."""
+    if o.contradicted:
+        return True
+    if o.box is None:
+        return False
+    half = 0.5 * float(np.max(o.box.size))
+    n = 0
+    for s in o.sightings:
+        box_range = float(np.linalg.norm(o.box.centre - np.asarray(s.cam)))
+        tau = max(SEEN_TAU_M, SEEN_TAU_REL * box_range)
+        if s.behind >= BEHIND_SHARE or s.mask_range > box_range + max(tau, half):
+            n += 1
+    return n >= SEE_THROUGH_VIEWS and 3 * n >= len(o.sightings)
+
+
 def judge(o: MapObject, view: View) -> tuple[str, float] | None:
     """A keyframe's verdict on an object it did not detect: ("gone" | "in_place", share seen
-    through), or None when it does not judge it (out of view, too far, hidden)."""
-    if o.box is None or not len(o.points) or o.label in SEE_THROUGH:
+    through), or None when it does not judge it (out of view, too far, hidden). An object the
+    depth sees through (``see_through``) is judged by its detection alone: "gone" at
+    ``ABSENT_SHARE`` (so that one keyframe never strikes it) when the keyframe has its place in
+    view, unhidden, at a size the detector sees (``DETECT_MIN_PX``)."""
+    if o.box is None or not len(o.points):
         return None
     pts = o.points[o.box.contains(o.points, 0.01)]
     if len(pts) < JUDGE_MIN:
@@ -483,6 +555,16 @@ def judge(o: MapObject, view: View) -> tuple[str, float] | None:
     has = d > 0
     d, zs = d[has], zs[has]
     tau = np.maximum(SEEN_TAU_M, SEEN_TAU_REL * zs)
+    z_med = float(np.median(z[inside]))
+    px = float(np.median([s.pixels * (s.distance / z_med) ** 2 for s in o.sightings])) \
+        if o.sightings else 0.0
+    if _detected_there(view, u[inside], v[inside], px):
+        return None  # the keyframe detects something of its size there (another label)
+    if see_through(o):
+        hidden = float(np.mean(d < zs - tau)) if len(zs) else 1.0
+        if hidden >= 0.5 or px < DETECT_MIN_PX:
+            return None
+        return "gone", ABSENT_SHARE
     through = int(np.sum(d > zs + tau))
     place = int(np.sum(np.abs(d - zs) <= tau))
     judged = through + place
@@ -732,12 +814,16 @@ class ObjectMap:
                 else:
                     o = by_id[oid]
                 self._add(o, ob, version, floor_z)
+                if o.last_verdict == "gone":
+                    o.contradicted += 1  # its depth said gone, the detector sees it
+                o.last_verdict = "seen"
                 events.setdefault(o.id, []).append(("seen", 1.0, view))
                 seen.add(o.id)
             for o in cands:
                 if o.id not in seen:
                     verdict = judge(o, view)
                     if verdict is not None:
+                        o.last_verdict = verdict[0]
                         events.setdefault(o.id, []).append((*verdict, view))
         struck: list[tuple[MapObject, list[View]]] = []
         dropped: set[int] = set()
@@ -749,7 +835,11 @@ class ObjectMap:
             gone = [e for e in ev[last + 1:] if e[0] == "gone"]
             place = sum(e[0] == "in_place" for e in ev[last + 1:])
             o.misses += place
-            if gone and len(gone) > place and (len(gone) >= 2 or gone[0][1] >= GONE_ALONE):
+            # one keyframe alone strikes only with a depth image: monocular depth sees past
+            # glass and foliage (a tree behind a window, a window pane) from one view or another
+            alone = len(gone) == 1 and gone[0][1] >= GONE_ALONE and \
+                gone[0][2].depth_rel <= SENSOR_DEPTH_REL
+            if gone and len(gone) > place and (len(gone) >= 2 or alone):
                 if not o.published and len(o.sightings) < 2:
                     dropped.add(o.id)  # a single detection seen gone was never there
                 else:

@@ -538,9 +538,74 @@ def test_seen_twice_then_gone_in_one_update_is_struck(tmp_path: Path) -> None:
     assert [(o["label"], o["state"]) for o in om.records()["objects"]] == [("box", "struck")]
 
 
-def test_what_depth_sees_through_is_not_judged() -> None:
-    v = view("c", EYES[0], TableScene(items=[]))
-    o = MapObject(1, {"window": 1.0}, box=Box(np.array([0.25, 0.225, TOP + 0.06]),
-                                              np.array([0.2, 0.15, 0.12]), 0.0))
-    o.points = np.full((40, 3), [0.25, 0.225, TOP + 0.1], np.float32)
-    assert ao.judge(o, v) is None
+def test_a_contradicted_object_is_judged_by_its_detection_only(tmp_path: Path) -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    empty = TableScene(items=[])
+    om = ObjectMap(tmp_path)
+    # seen, its place seen through (the depth looks past it), seen again: unjudgeable by depth
+    om.update([view("a", EYES[0], sc), view("b", EYES[1], sc), view("c", EYES[2], empty),
+               view("d", EYES[3], sc)], 1, 0.0)
+    o = om.objects[0]
+    assert o.contradicted == 1 and ao.see_through(o) and o.state == "confirmed"
+    # one keyframe that does not detect it never strikes it
+    assert om.update([view("e", EYES[0], empty)], 2, 0.0) == []
+    assert om.objects[0].state == "confirmed"
+    assert ao.judge(o, view("f", EYES[1], empty)) == ("gone", ao.ABSENT_SHARE)
+    # hidden behind a nearer surface, or too small to be detected: no verdict
+    wall = TableScene(items=[Item("wall", [((0.0, -0.4, 0.0), (1.2, -0.38, 2.0))])])
+    assert ao.judge(o, view("g", EYES[0], wall)) is None
+    tiny = MapObject(9, {"box": 1.0}, box=o.box, sightings=[
+        Sighting("k", 1, [0, 0, 0], 0.1, 1, [False] * 4, [1.0, 0, 0], [0, 0, 0], 0.01,
+                 [1.0, 1, 1], "box", 0.9)], points=o.points, contradicted=1)
+    assert ao.judge(tiny, view("h", EYES[1], empty)) is None
+    # two keyframes that do not detect it strike it
+    assert len(om.update([view("i", EYES[1], empty), view("j", EYES[2], empty)], 3, 0.0)) == 1
+
+
+def test_a_place_detected_as_something_else_is_not_judged() -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    obs = ao.observe(v, 1, None)
+    o = MapObject(1, {"box": 1.0}, sightings=[obs[0].sighting],
+                  points=obs[0].points.astype(np.float32))
+    o.box = Box.of(__import__("oh_my_slam.segmentation.api", fromlist=["x"]).fit_object_obb(
+        obs[0].points, "box", ao.UP, None))
+    gone = view("b", EYES[0], TableScene(items=[]))
+    assert ao.judge(o, gone)[0] == "gone"  # type: ignore[index]
+    gone.dets = [Detection("globe", 0.8, "test", v.dets[0].mask, v.dets[0].box)]
+    assert ao.judge(o, gone) is None
+    big = np.ones_like(v.dets[0].mask)
+    gone.dets = [Detection("wall art", 0.8, "test", big, (0.0, 0.0, 640.0, 480.0))]
+    assert ao.judge(o, gone)[0] == "gone"  # type: ignore[index]
+    assert not ao._detected_there(gone, np.zeros(0), np.zeros(0), 10.0)
+
+
+def test_see_through_evidence_inside_the_masks() -> None:
+    def sighting(behind: float, mask_range: float) -> Sighting:
+        return Sighting("k", 1, [0, 0, 0], 1.0, 100, [False] * 4, [1.0, 0, 0], [-1, 0, 0],
+                        0.01, [1.0, 1, 1], "globe", 0.9, behind=behind, mask_range=mask_range)
+
+    o = MapObject(1, {"globe": 1.0}, box=Box(np.zeros(3), np.full(3, 0.2), 0.0))
+    o.sightings = [sighting(0.5, 1.0), sighting(0.0, 1.0)]
+    assert not ao.see_through(o)  # one sighting alone
+    o.sightings = [sighting(0.5, 1.0), sighting(0.0, 2.0), sighting(0.0, 1.0)]
+    assert ao.see_through(o)  # its mask's depth beyond its points, and beyond its box
+    assert not ao.see_through(MapObject(2, {"globe": 1.0}))
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    m = np.zeros(v.depth.shape, bool)
+    m[200:203, 300:303] = True  # too thin to erode: the mask itself
+    pts = np.array([[0.25, 0.225, TOP + 0.12]])
+    share, rng = ao._behind(m, v.depth, v.depth > 0, v, pts)
+    assert 0.0 <= share <= 1.0 and rng > 0
+
+@pytest.mark.parametrize(("rel", "struck"), [(ao.SENSOR_DEPTH_REL, True),
+                                             (ao.MONO_DEPTH_REL, False)])
+def test_one_keyframe_strikes_only_with_a_depth_image(tmp_path: Path, rel: float,
+                                                      struck: bool) -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    om = ObjectMap(tmp_path)
+    om.update([view("a", EYES[0], sc), view("b", EYES[1], sc)], 1, 0.0)
+    gone = view("c", EYES[2], TableScene(items=[]))
+    gone.depth_rel = rel
+    assert bool(om.update([gone], 2, 0.0)) is struck
