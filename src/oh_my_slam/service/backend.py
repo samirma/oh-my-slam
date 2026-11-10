@@ -233,7 +233,7 @@ class MapperBackend:
         from oh_my_slam.service.checks import median_depth
 
         try:
-            client = connect_server()
+            client = connect_server().clone()  # a client of its own: asked from several threads
             try:
                 fr = reconstruct_image(image, intrinsics=K, max_side=512, want_gravity=False,
                                        client=client)

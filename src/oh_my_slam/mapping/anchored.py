@@ -135,6 +135,9 @@ MONO_DEPTH_TOL = 0.20  # ... of monocular depth (its own scale is aligned per fr
 MIN_OVERLAP = 0.10  # share of a frame's points a reference view's depth sees
 MIN_AGREEMENT = 0.75  # share of those that agree
 MIN_AGREEING = 40  # points
+ICP_SIGMA_M = 0.01  # a depth image point's noise (plus DEPTH_NOISE_REL of its depth)
+ICP_MAX_M = 0.10  # a point's match at most this far (plus the prior's reach, at first)
+ICP_ITERATIONS = 12
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -637,6 +640,7 @@ class Agreement:
     agree: int
     conflict: int
     median_abs_m: float = 0.0  # median depth difference of the points references see (m)
+    median_ratio: float = 1.0  # median ratio of the references' depth to the points' there
 
     @property
     def overlap(self) -> float:
@@ -671,6 +675,7 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
     agree = np.zeros(n, bool)
     conflict = np.zeros(n, bool)
     best = np.full(n, np.inf)
+    ratio = np.full(n, np.nan)
     for r in refs:
         Xr = (X - r.T[:3, 3]) @ r.T[:3, :3]
         z = Xr[:, 2]
@@ -686,11 +691,88 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
         rel = np.where(seen, (z - d) / np.where(seen, d, 1.0), 0.0)
         agree |= seen & (np.abs(rel) <= tol)
         conflict |= seen & (np.abs(rel) > tol)
-        best = np.where(seen, np.minimum(best, np.abs(z - d)), best)
+        closer = seen & (np.abs(z - d) < best)
+        ratio = np.where(closer, d / np.where(seen, z, 1.0), ratio)
+        best = np.where(closer, np.abs(z - d), best)
     conflict &= ~agree
     seen_any = np.isfinite(best)
-    return Agreement(n, int(agree.sum()), int(conflict.sum()),
-                     float(np.median(best[seen_any])) if seen_any.any() else 0.0)
+    if not seen_any.any():
+        return Agreement(n, int(agree.sum()), int(conflict.sum()))
+    return Agreement(n, int(agree.sum()), int(conflict.sum()), float(np.median(best[seen_any])),
+                     float(np.median(ratio[seen_any])))
+
+
+def _normals(depth: NDArray[np.float32], K: Array, T: Array, side: int = SAMPLE_SIDE
+             ) -> tuple[Array, Array]:
+    """World points and unit normals of a depth grid seen from ``T``, on a grid of at most
+    ``side`` per axis (central differences; points without a full neighbourhood dropped)."""
+    h, w = depth.shape
+    step = max(1, math.ceil(max(h, w) / side))
+    vs, us = np.mgrid[step // 2:h:step, step // 2:w:step]
+    z = depth[vs, us].astype(np.float64)
+    P = np.stack([(us + 0.5 - K[0, 2]) / K[0, 0] * z, (vs + 0.5 - K[1, 2]) / K[1, 1] * z, z], -1)
+    ok = np.isfinite(z) & (z > MIN_DEPTH_M)
+    du = P[1:-1, 2:] - P[1:-1, :-2]
+    dv = P[2:, 1:-1] - P[:-2, 1:-1]
+    n = np.cross(du, dv)
+    norm = np.linalg.norm(n, axis=-1)
+    good = (ok[1:-1, 1:-1] & ok[1:-1, 2:] & ok[1:-1, :-2] & ok[2:, 1:-1] & ok[:-2, 1:-1]
+            & (norm > 1e-12))
+    # a depth edge is no surface: its neighbours more than EDGE_REL apart
+    zc = z[1:-1, 1:-1]
+    span = np.max(np.abs(np.stack([z[1:-1, 2:], z[1:-1, :-2], z[2:, 1:-1], z[:-2, 1:-1]])
+                         - zc), axis=0)
+    good &= span <= 3.0 * EDGE_REL * np.maximum(zc, MIN_DEPTH_M)
+    pc, nc = P[1:-1, 1:-1][good], n[good] / norm[good][:, None]
+    return pc @ T[:3, :3].T + T[:3, 3], nc @ T[:3, :3].T
+
+
+def depth_icp(pts: Array, refs: list[DepthRef], T0: Array, sp0: float, sr0: float
+              ) -> tuple[Array, float, float, int] | None:
+    """A camera's pose from its camera-frame depth points ``pts`` against the references'
+    depth: point-to-plane Gauss-Newton from ``T0`` with the prior (``sp0`` m, ``sr0`` deg) as
+    a factor, each point's noise ``ICP_SIGMA_M`` + ``DEPTH_NOISE_REL`` of its depth, matches
+    within ``K_SIGMA`` prior sigmas plus ``ICP_MAX_M``, Huber. Returns (T, sigma_pos_m,
+    sigma_rot_deg, matched points), or None with fewer than ``MIN_AGREEING`` matches."""
+    from scipy.spatial import cKDTree
+
+    got = [_normals(r.depth, r.K, r.T) for r in refs]
+    Q = np.vstack([g[0] for g in got])
+    N = np.vstack([g[1] for g in got])
+    if len(Q) < MIN_AGREEING or len(pts) < MIN_AGREEING:
+        return None
+    tree = cKDTree(Q)
+    sig = ICP_SIGMA_M + DEPTH_NOISE_REL * pts[:, 2]
+    R, c = T0[:3, :3].copy(), T0[:3, 3].copy()
+    sr = math.radians(sr0)
+    H = np.eye(6)
+    n_in = 0
+    for it in range(ICP_ITERATIONS):
+        X = pts @ R.T + c
+        reach = K_SIGMA * sp0 + ICP_MAX_M if it < ICP_ITERATIONS // 2 else ICP_MAX_M
+        d, j = tree.query(X, distance_upper_bound=reach)
+        m = np.isfinite(d)
+        n_in = int(m.sum())
+        if n_in < MIN_AGREEING:
+            return None
+        Xm, n_m, s_m = X[m], N[j[m]], sig[m]
+        r = ((Xm - Q[j[m]]) * n_m).sum(1) / s_m
+        w = np.where(np.abs(r) <= HUBER_SIGMAS, 1.0, HUBER_SIGMAS / np.maximum(np.abs(r), 1e-12))
+        # left perturbation: X' = exp(w) (X - c) + c + dc
+        J = np.hstack([np.cross(Xm - c, n_m), n_m]) / s_m[:, None]
+        rp = np.concatenate([log_so3(R @ T0[:3, :3].T) / sr, (c - T0[:3, 3]) / sp0])
+        Jp = np.diag(np.r_[np.full(3, 1.0 / sr), np.full(3, 1.0 / sp0)])
+        H = J.T @ (w[:, None] * J) + Jp.T @ Jp
+        g = J.T @ (w * r) + Jp.T @ rp
+        delta = -np.linalg.solve(H + 1e-9 * np.eye(6), g)
+        R = exp_so3(delta[:3]) @ R
+        c = c + delta[3:]
+        if float(np.abs(delta).max()) < 1e-7:
+            break
+    cov = np.linalg.inv(H + 1e-9 * np.eye(6))
+    sp = math.sqrt(float(np.linalg.svd(cov[3:, 3:], compute_uv=False)[0]))
+    srd = math.degrees(math.sqrt(float(np.linalg.svd(cov[:3, :3], compute_uv=False)[0])))
+    return pose(R, c), sp, srd, n_in
 
 
 # -- the map ---------------------------------------------------------------------------------------
@@ -1387,14 +1469,14 @@ class AnchoredMap:
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
         if img is None:
-            return Placement(f.name, "provisional", reason, T0, sp0, sr0, 0, "prior",
-                             pose_residual(T0, ref))
+            return self._depth_place(f, T0, sp0, sr0, ref) or Placement(
+                f.name, "provisional", reason, T0, sp0, sr0, 0, "prior", pose_residual(T0, ref))
         s, n, ratio, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
         if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
                                                                        2.0 * sp0)):
-            return Placement(f.name, "provisional", reason, T0, sp0, sr0, n, "prior",
-                             pose_residual(T0, ref))
+            return self._depth_place(f, T0, sp0, sr0, ref) or Placement(
+                f.name, "provisional", reason, T0, sp0, sr0, n, "prior", pose_residual(T0, ref))
         metric = f.prior["trust"] == "metric"
         if metric:
             # a metric prior is weighed against the image pose's real uncertainty: depth
@@ -1444,6 +1526,34 @@ class AnchoredMap:
             self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands,  # type: ignore[arg-type]
                                  (sub, refs, f.K, _prior_sigmas(f.prior)))
         return pl
+
+    def _depth_place(self, f: FrameIn, T0: Array, sp0: float, sr0: float, ref: Array
+                     ) -> Placement | None:
+        """A frame with a depth image and a prior the images do not place (a bare wall, too
+        few matches): its depth aligned on the depth of the keyframes near its prior
+        (``depth_icp``: point-to-plane, the prior a factor, so a plane fixes what it can and
+        the prior the rest), registered when its depth then agrees with theirs
+        (``Agreement.confirmed``) and it stays within ``K_SIGMA`` of the prior. None
+        otherwise."""
+        if f.depth is None or not np.count_nonzero(f.depth > 0):
+            return None
+        refs = [r for k in self._candidates(f, T0, None) for r in [self._grid(k)]
+                if r is not None]
+        if not refs:
+            return None
+        pts = backproject(f.depth.astype(np.float32), f.K.K())
+        got = depth_icp(pts, refs, T0, sp0, sr0)
+        if got is None:
+            return None
+        T, sp, sr, n = got
+        dp, dr = pose_residual(T, T0)
+        # prior plus depth: the depth may refine the prior, never overrule it
+        if dp > K_SIGMA * sp0 or dr > K_SIGMA * sr0 \
+                or not agreement(pts, T, refs, SENSOR_DEPTH_TOL).confirmed:
+            return None
+        return Placement(f.name, "registered", None, T, round(max(sp, REPORT_MIN_SIGMA_POS_M), 4),
+                         round(max(sr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, "depth",
+                         pose_residual(T, ref))
 
     def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
                         cands: list[Keyframe], fit: tuple[Any, Refs, Intrinsics,
@@ -1696,7 +1806,7 @@ class AnchoredMap:
         (``Agreement.contradicted``), the median depth difference is its residual to the map
         (the quality report's ``previous_residuals``), and beyond ``K_SIGMA`` of its position
         sigma and the depth's own tolerance it contradicts the map: ``prior_conflict``, not
-        fused."""
+        fused. A monocular depth is first scaled by its median ratio to the map's there."""
         assert pl.T is not None and pl.sigma_pos_m is not None
         refs = [r for k in self._candidates(f, pl.T, None) for r in [self._grid(k)]
                 if r is not None]
@@ -1704,6 +1814,10 @@ class AnchoredMap:
         tol = SENSOR_DEPTH_TOL if sensor else MONO_DEPTH_TOL
         pts = backproject(depth, K_grid.K())
         a = agreement(pts, pl.T, refs, tol)
+        if not sensor and ALIGN_RANGE[0] <= a.median_ratio <= ALIGN_RANGE[1]:
+            # monocular depth has its own scale per frame: judged once brought onto the map's
+            pts = pts * a.median_ratio
+            a = agreement(pts, pl.T, refs, tol)
         if not a.contradicted:
             return
         pl.map_residual = (a.median_abs_m, 0.0)

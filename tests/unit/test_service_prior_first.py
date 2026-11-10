@@ -335,17 +335,16 @@ def test_a_re_sweep_after_an_odometry_slip(client: Client) -> None:
     poses = [base_pose(30 * k) for k in range(4)]
     fr, files = frames_for(client, poses, tag="a", trust="drifting")
     client.update("m", fr, files, cameras={"cam": CAM})
-    truth = [base_pose(y) for y in (80, 65, 50)]
+    truth = [base_pose(y) for y in (70, 80, 65, 50)]
+    slips = [-30.0, 25.0, 25.0, 25.0]  # the first slipped otherwise: a conflict of its own
     fr, files = frames_for(client, truth, tag="s", trust="drifting",
-                           priors=[_slip(T, 25.0) for T in truth])
+                           priors=[_slip(T, d) for T, d in zip(truth, slips, strict=True)])
     out = dry(client, "m", fr, files)
-    assert [r["predicted_status"] for r in out["frames"]] == ["registered"] * 3
-    job = client.update("m", fr, files)
-    assert [i["status"] for i in job["inputs"]] == ["registered"] * 3
-    one, ofiles = frames_for(client, [base_pose(70)], tag="o", trust="drifting",
-                             priors=[_slip(base_pose(70), -30.0)])
-    out = dry(client, "m", one, ofiles)
+    want = ["rejected"] + ["registered"] * 3
+    assert [r["predicted_status"] for r in out["frames"]] == want
     assert out["frames"][0]["predicted_reason"] == "prior_conflict"
+    job = client.update("m", fr, files)
+    assert [i["status"] for i in job["inputs"]] == want
 
 
 def test_dry_run_measures_suspicious_frames(client: Client) -> None:
@@ -425,3 +424,68 @@ def test_a_keyframe_without_its_image_is_no_locate_reference(client: Client,
     client.service.derived._derive("m", 1, v, tmp_path / "d")
     meta = json.loads((tmp_path / "d" / "meta.json").read_text())
     assert meta["keyframes"] == ["a0"]
+
+
+def test_bare_walls_with_depth_and_a_drifting_prior_register(client: Client) -> None:
+    """A bare wall (plain, no features) with a depth image and a prior is not rejected by the
+    checks: its depth registers it on the map's (prior plus depth geometry)."""
+    poses = [base_pose(26 * k) for k in range(3)]
+    fr, files = frames_for(client, poses, tag="a", trust="drifting")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    T = base_pose(78)
+    fr, files = frames_for(client, [T], tag="w", trust="drifting")
+    files["w0"] = plain(320, 240)
+    job = client.update("m", fr, files)
+    i = job["inputs"][0]
+    assert (i["status"], i["reason"]) == ("registered", None)
+    assert np.linalg.norm(np.array(i["T_map_cam"])[:3, 3] - T[:3, 3]) < 0.05
+    v = client.service.store.version("m")
+    assert v["frames"][-1]["method"] == "depth"
+    # without a depth image a bare wall is still rejected by the checks
+    nf, nfiles = frames_for(client, [base_pose(100)], tag="p", trust="drifting", depth=False)
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 240), (90, 92, 95)).save(buf, format="JPEG")
+    nfiles["p0"] = buf.getvalue()
+    assert client.update("m", nf, nfiles)["inputs"][0]["reason"] == "plain"
+
+
+def test_a_look_in_two_halves_with_a_dry_run_between(client: Client,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The look sends its first half, dry-runs the second while the first fuses, then sends
+    the second: the dry run reads the latest committed version at once (it never waits for the
+    running job), and the second job registers against the first's result."""
+    import threading
+
+    from oh_my_slam.service import prior_first
+
+    fr, files = frames_for(client, [base_pose(0)], tag="o")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    fusing, release = threading.Event(), threading.Event()
+    real = prior_first.fuse_objects
+
+    def slow(*a: Any, **k: Any) -> Any:
+        fusing.set()
+        release.wait(20)
+        return real(*a, **k)
+
+    monkeypatch.setattr(prior_first, "fuse_objects", slow)
+    first = [base_pose(26 * k) for k in range(1, 4)]
+    second = [base_pose(26 * k) for k in range(4, 7)]
+    f1, files1 = frames_for(client, first, tag="h1")
+    j1 = client.post_update("m", {"frames": f1}, files1)
+    assert fusing.wait(20)
+    f2, files2 = frames_for(client, second, tag="h2")
+    t = time.monotonic()
+    out = dry(client, "m", f2, files2)
+    assert time.monotonic() - t < 10 and not release.is_set()
+    assert out["base_version"] == 1  # the first half is not committed yet
+    j2 = client.post_update("m", {"frames": f2}, files2)
+    assert client.get(f"/api/jobs/{j2['job_id']}", "Job")["state"] == "queued"
+    release.set()
+    d1, d2 = client.wait(j1["job_id"]), client.wait(j2["job_id"])
+    assert (d1["state"], d1["result_version"]) == ("committed", 2)
+    assert (d2["state"], d2["base_version"], d2["result_version"]) == ("committed", 2, 3)
+    assert [i["status"] for i in d2["inputs"]] == ["registered"] * 3
+    again = dry(client, "m", f2, files2)
+    assert again["base_version"] == 3
+    assert [r["predicted_reason"] for r in again["frames"]] == ["duplicate"] * 3

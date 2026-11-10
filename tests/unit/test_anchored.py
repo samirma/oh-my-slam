@@ -286,10 +286,13 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
-    # no features at all: kept at its prior
-    p0 = m.update([frame("blank", base_pose(10), rgb=blank)])[0]
+    # no features at all, no depth image: kept at its prior
+    p0 = m.update([frame("blank", base_pose(10), rgb=blank, depth=False, mono=1.0)])[0]
     assert (p0.status, p0.reason, p0.method) == ("provisional", "few_features", "prior")
     assert p0.prior_residual is not None and p0.prior_residual[1] < 1e-3
+    # with its depth image: registered by its prior and its depth against the map's
+    pd = m.update([frame("blankd", base_pose(15), rgb=blank)])[0]
+    assert (pd.status, pd.method) == ("registered", "depth")
     # its prior points away from anything mapped: kept at its prior
     p1 = m.update([frame("away", base_pose(180))])[0]
     assert (p1.status, p1.reason) == ("provisional", "no_overlap")
@@ -308,8 +311,8 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
         an.STRONG_INLIERS = strong
     assert p3.status == "provisional" and p3.inliers > 0
     # provisional frames at metric priors are references; nothing stored moved
-    assert [k.state for k in m.keyframes] == ["fused", "fused", "provisional", "provisional",
-                                              "provisional"]
+    assert [k.state for k in m.keyframes] == ["fused", "fused", "provisional", "fused",
+                                              "provisional", "provisional"]
     assert np.allclose(m.keyframes[0].T, base_pose(0))
     # a metric prior is called a conflict only on two references: one keyframe sees it
     m2 = new_map(tmp_path / "one")
@@ -390,6 +393,7 @@ def test_init_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         T[:3, :3], T[:3, 3], np.ones(len(X), bool)))
     monkeypatch.setattr(an, "refine_pose", lambda R, c, uv, *a, **k: (an.Solve(
         R, c, np.eye(6), np.zeros(len(uv), bool), 1.0), np.ones(1)))
+    monkeypatch.setattr(AnchoredMap, "_depth_place", lambda self, *a: None)
     p = m.update([frame("c", base_pose(25))])[0]
     assert p.status == "provisional"
 
@@ -414,7 +418,8 @@ def test_drifting_walk_with_odometry_overcount(tmp_path: Path) -> None:
     # an unconfirmed drifting frame goes where the corrected odometry puts it
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     T = base_pose(0, 0.9, 0.0)
-    p = m.update([frame("b", T, p=prior(odo(T), "drifting"), rgb=blank)])[0]
+    p = m.update([frame("b", T, p=prior(odo(T), "drifting"), rgb=blank, depth=False,
+                        mono=1.0)])[0]
     assert p.status == "provisional" and err(p.T, T)[0] < 0.03
     assert m.keyframes[-1].usable() is False  # a provisional drifting frame is no reference
 
@@ -481,7 +486,7 @@ def test_kf_without_features(tmp_path: Path) -> None:
     assert len(m.keyframes[0].kdepth) == 0
     m.save()
     m2 = AnchoredMap.load(m.root)
-    p = m2.update([frame("a1", base_pose(10))])[0]
+    p = m2.update([frame("a1", base_pose(10), depth=False, mono=1.0)])[0]
     assert p.status == "provisional"
 
 
@@ -532,6 +537,7 @@ def test_an_ill_determined_image_pose_confirms_nothing(tmp_path: Path,
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0))])
     monkeypatch.setattr(an.Solve, "sigmas", lambda self: (0.5, 0.3))
+    monkeypatch.setattr(AnchoredMap, "_depth_place", lambda self, *a: None)
     p = m.update([frame("b", base_pose(20))])[0]
     assert p.status == "provisional" and p.inliers > 0
 
@@ -705,7 +711,9 @@ def test_a_slipped_odometry_is_reanchored_on_two_agreeing_frames(tmp_path: Path)
     assert not m2._same_drift(f, an.Placement("x", "rejected"), f, p)
 
 
-def test_an_unconfirmed_frame_against_the_map_s_depth(tmp_path: Path) -> None:
+def test_an_unconfirmed_frame_against_the_map_s_depth(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(AnchoredMap, "_depth_place", lambda self, *a: None)
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     m.save()
@@ -738,3 +746,82 @@ def test_guided_matching_without_candidates_in_reach() -> None:
     f = an.features(img)
     pred = np.full((len(f.kps), 2), -1000.0)
     assert len(an.guided_match(f, f, pred, np.full(len(pred), 8.0))[0]) == 0
+
+
+def test_a_reanchored_frame_may_still_be_rejected(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    m = new_map(tmp_path)
+    m.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
+    m.save()
+    (m.root / an.KF_DIR / f"{m.keyframes[0].id}.depth.npy").unlink()
+    m = AnchoredMap.load(m.root)
+    assert m._grid(m.keyframes[0]) is None  # its depth grid is gone
+    real = m.place
+    calls = [0]
+
+    def place(*a: Any, **kw: Any) -> an.Placement:
+        calls[0] += 1
+        return an.Placement("x", "rejected", "prior_conflict") if calls[0] > 2 else real(*a, **kw)
+
+    monkeypatch.setattr(m, "place", place)
+    truth = [base_pose(y) for y in (80, 65)]
+    pls = m.update([frame(f"s{k}", T, p=prior(_slip(T, 25.0), "drifting"))
+                    for k, T in enumerate(truth)])
+    assert [p.status for p in pls] == ["rejected", "rejected"] and calls[0] == 4
+
+
+def test_an_unconfirmed_monocular_frame_is_judged_at_the_map_s_scale(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    blank = np.full((K.height, K.width, 3), 120, np.uint8)
+    T = base_pose(10)
+    # its monocular depth 1.4x off: consistent once scaled
+    p = m.update([frame("m", T, p=prior(T), rgb=blank, depth=False, mono=1.4)])[0]
+    assert p.status == "provisional" and p.map_residual is None
+    p = m.update([frame("f", T, p=prior(base_pose(40, 0.0, 0.6)), rgb=blank, depth=False,
+                        mono=1.4)])[0]
+    assert p.map_residual is not None  # a scale does not explain a wrong view
+
+
+def test_depth_registration_edges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    T = base_pose(0)
+    _, z = shot(T)
+    ref = an.DepthRef(T, z.astype(np.float32), K.K())
+    pts = an.backproject(z.astype(np.float32), K.K())
+    assert an.depth_icp(pts[:10], [ref], T, 0.05, 2.0) is None  # too few points
+    far = T.copy()
+    far[:3, 3] += [0.0, 0.0, 5.0]  # nothing within reach
+    assert an.depth_icp(pts, [ref], far, 0.01, 1.0) is None
+    monkeypatch.setattr(an, "ICP_ITERATIONS", 1)  # no convergence in one step: still a pose
+    got = an.depth_icp(pts, [ref], T, 0.05, 2.0)
+    assert got is not None and err(got[0], T)[0] < 0.01
+    # a frame placed by depth needs references with a depth grid near its prior, and an
+    # alignment that stays within its prior's sigmas
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    blank = np.full((K.height, K.width, 3), 120, np.uint8)
+    f = frame("b", base_pose(10), rgb=blank)
+    T0 = base_pose(10)
+    for k in m.keyframes:
+        k.grid, k.K_grid = None, None
+    assert m._depth_place(f, T0, 0.05, 2.0, T0) is None
+    m2 = new_map(tmp_path / "two")
+    m2.update([frame("a0", base_pose(0))])
+    monkeypatch.setattr(an, "depth_icp", lambda *a: None)
+    assert m2._depth_place(f, T0, 0.05, 2.0, T0) is None
+    off = base_pose(40)
+    monkeypatch.setattr(an, "depth_icp", lambda *a: (off, 0.01, 0.1, 500))
+    assert m2._depth_place(f, T0, 0.05, 2.0, T0) is None
+
+
+def test_a_snapshot_of_a_map_without_mapper_folder(tmp_path: Path) -> None:
+    from oh_my_slam.service.store import Store
+
+    s = Store(tmp_path / "d")
+    s.create()
+    assert s.snapshot("m", tmp_path / "x") is None
+    s.add_cameras("m", {"cam": {"fx": 1.0, "fy": 1.0, "cx": 0.5, "cy": 0.5, "width": 1,
+                                "height": 1}}, {})
+    s.commit("m", {"frames": []}, None)
+    assert s.snapshot("m", tmp_path / "x")["version"] == 1  # type: ignore[index]
+    assert not (tmp_path / "x").exists()

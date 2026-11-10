@@ -150,6 +150,18 @@ class Store:
     def mapper_dir(self, name: str) -> Path:
         return self.dir(name) / "mapper"
 
+    def snapshot(self, name: str, dest: Path) -> dict[str, Any] | None:
+        """The latest committed version of a map (None before any) and its mapper map cloned
+        to ``dest``, both read under the commit lock: one version, even while a job commits
+        the next (a dry run reads it while a job runs)."""
+        with self._lock:
+            if not self.latest(name):
+                return None
+            v = self.version(name)
+            if self.mapper_dir(name).exists():
+                clone_tree(self.mapper_dir(name), dest)
+            return v
+
     def commit(self, name: str, record: dict[str, Any], mapper: Path | None,
                files: dict[str, Any] | None = None) -> int:
         """Commit a new version: ``record`` (its ``version`` and ``created_at`` set here), the

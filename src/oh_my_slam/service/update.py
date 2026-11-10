@@ -69,6 +69,7 @@ FLOOR_BINS = 50  # estimate_floor
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
 JPEG_QUALITY = 95
+DEPTH_PLACED = ("plain", "few_features")  # reasons a frame with depth and a prior escapes
 CHECK_THREADS = 4  # frames measured at once (OpenCV releases the GIL)
 
 
@@ -316,15 +317,24 @@ class Updater:
         # prior-first path gets it with the frame's depth (``_resolve_deferred``)
         fr.deferred = med is None and fr.measures.suspicious
         fr.reason = checks.reason(fr.measures, med)
+        if fr.reason in DEPTH_PLACED and med is not None and f.trust in ("metric", "drifting"):
+            # a bare wall with a depth image and a prior is placed by both (the prior-first
+            # engine's depth registration), not rejected for its texture
+            fr.reason = None
 
     def _resolve_deferred(self, frames: list[_Frame]) -> None:
-        """The mapper's path: the median monocular depth of the suspicious frames (``too_close``
-        takes precedence over the other reasons)."""
-        for fr in frames:
-            if fr.deferred:
-                assert fr.path is not None and fr.measures is not None
-                fr.reason = checks.reason(fr.measures, self.backend.median_depth(
-                    fr.path, fr.cam.canonical()))
+        """The median monocular depth of the suspicious frames, ``CHECK_THREADS`` asked at once
+        (``too_close`` takes precedence over the other reasons): the mapper's path and the dry
+        run."""
+        todo = [fr for fr in frames if fr.deferred]
+
+        def one(fr: _Frame) -> None:
+            assert fr.path is not None and fr.measures is not None
+            fr.reason = checks.reason(fr.measures, self.backend.median_depth(
+                fr.path, fr.cam.canonical()))
+
+        with ThreadPoolExecutor(CHECK_THREADS) as pool:
+            list(pool.map(one, todo))
 
     def _run(self, job: Job, w: UpdateWork, workdir: Path, changed: Callable[[], None]) -> None:
         tm = job.timings_s

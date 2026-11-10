@@ -180,6 +180,51 @@ registration's angular noise per observation `a` (the mean reprojection error ov
 length, or the multi-view refinement's median match residual) over `√n` observations:
 `σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
 for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
+Anchored maps (below) report their own sigmas.
+
+### Prior-first registration: camera-only frames, odometry, map consistency (impl/reg2)
+
+* **Camera-only frames** (prior `none`) take the engine `OH_MY_SLAM_NONE_ENGINE` names:
+  `mapanything` (default, `service.register_ma`, ported from the MapAnything candidate
+  `cand/mapanything-priors`) or `geometric` (`mapping.anchored`, as frames with priors). The
+  frames with priors are registered first; the camera-only ones after them, against the map's
+  confirmed keyframes (a new camera-only map's origin is the geometric engine's: the first-camera
+  rule). One MapAnything call per 4 new frames with up to 4 anchors (the most similar keyframes by
+  thumbnail among the 60 most recent); anchors closer than 0.30 m leave a call without depth images
+  unposed (a turn in place). Its output is aligned rigidly on the anchors and scaled by the frames'
+  depth images, else by the anchors' stored depth: the map's own depth scale, whose camera-height
+  vote (`ScaleState`, `floor_candidates`) each registered frame feeds as a monocular keyframe does
+  — never MapAnything's metres. A frame is registered where its depth agrees with the anchors'
+  (`mapping.anchored.agreement`: ≥ 10 % of its points seen, ≥ 75 % of those within 10 % for depth
+  images, 15 % between MapAnything's own depths), else `no_overlap` (`few_features` under 150
+  features); `too_close` under 0.30 m median depth. Out of memory halves the new frames per call,
+  then keeps 2 anchors.
+* **Drifting odometry.** Its sigmas grow with the odometry's *path* since the last frame the images
+  confirmed (`Drift.observe`: every drifting prior seen, kept, provisional or rejected, across
+  updates), not with the straight line between the two priors: a robot that drove away and came
+  back has drifted with its path. Two consecutive strong conflicts whose image poses imply the same
+  correction (`_same_drift`: one predicted from the other within 3 combined sigmas) re-anchor the
+  odometry on the first, and both are placed again (a slip, a long unseen drive); a single one stays
+  `prior_conflict`.
+* **Map consistency of unconfirmed frames.** A frame kept `provisional` at its prior (no image
+  pose) is checked against the depth the keyframes near it see (`AnchoredMap._map_consistency`):
+  when enough of its points are seen and fewer than 75 % agree (10 % depth images, 20 % monocular
+  after scaling by its median ratio to the map's), the median depth difference is its residual
+  (`quality.previous_residuals`, so `max_residual_m` sees a warp), and beyond 3 position sigmas
+  plus the depth tolerance it is `prior_conflict` and not fused. Registered frames report the
+  residual of their committed pose to their image-only pose, as before.
+* **Pose sigmas** of an anchored map's frames: the image pose's covariance (Gauss-Newton, inflated
+  by its χ²) with the depth bias the covariance does not see (1 % of the references' median
+  depth), combined with the prior as the estimate combines them — for a metric prior the weighted
+  mean's own variance (`w² σ_img² + (1−w)² σ_prior²`, `w` from the weights the fusion used, which
+  floor the image pose at 5 cm / 1°), for a drifting prior the inverse-variance combination; floored
+  at 1 mm and 0.01° (no longer at 1 cm / 0.1°).
+* **Guided matching** is vectorised (one pass over all candidate pairs) and skipped for a keyframe
+  that already has 300 ratio-test matches.
+* **Dry run.** Features, map placements and neighbour links run 6 frames at a time
+  (`dry_run.DRY_THREADS`), each placed against the stored map without scale evidence; drifting
+  priors are predicted along the request (the path grows frame by frame) and the re-anchoring rule
+  applies as in the update. The update's checks run 4 frames at a time.
 
 ### Objects, surfaces and relations (O8)
 
@@ -430,7 +475,13 @@ registration 3.7 and fusion 0.54 per frame (above); locate 2.0 per frame and gri
 targets: measured values replace them as soon as the service has run them); frame analysis 1.5
 and objects read 0.1 are placeholders until their groups measure them. Each kind
 keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
-`eta_s` = the remaining predicted time of the jobs ahead + `frames × (registration + fusion)`.
+A prediction adds up a job's phases, each measured as run (`Timings.predict_phases`):
+`job_overhead` (per job: clone, save, commit; default 0.5) + `checks_per_frame` × frames sent
+(0.05) + `registration_per_frame` × frames the geometric engine gets +
+`registration_mapanything_per_frame` × camera-only frames MapAnything gets (1.5) +
+`fusion_per_frame` × frames kept. `eta_s` = the remaining predicted time of the jobs ahead + the
+job's own (every frame counted as kept); a dry run's `predicted_s` uses its own predicted checks
+and statuses (`registration` = overhead + checks + registration, `fusion`).
 
 
 ## Maps

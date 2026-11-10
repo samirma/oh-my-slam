@@ -3,7 +3,7 @@
 It runs synchronously and writes nothing (no camera, version, job or mapper file):
 
 * the per-frame checks of an update (``Updater._check``), with the monocular median depth of the
-  suspicious frames (``too_close``);
+  first ``DRY_DEPTH_FRAMES`` suspicious frames (``too_close``);
 * per kept frame, its link to the map: on an anchored map the prior-first placement against the
   current version (``AnchoredMap.place`` on a copy loaded read-only; nothing is added, no scale
   evidence), whose inliers are ``map_inliers``; on a new map or a map of the mapper, null. The
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 NEIGHBOUR_PX = 3.0  # the fundamental matrix's RANSAC threshold
 DRY_THREADS = 6
+DRY_DEPTH_FRAMES = 4
 
 
 def link(a: Features, b: Features) -> int:
@@ -65,21 +66,24 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
     from oh_my_slam.service.update import gate, residual_stats
 
     store = up.store
-    prev = store.version(w.map) if store.latest(w.map) else None
     workdir = store.work / f"dry-{uuid.uuid4().hex}"
     indir = workdir / "in"
     indir.mkdir(parents=True, exist_ok=True)
     try:
+        # the latest committed version and its mapper map, as one: a job may commit meanwhile
+        prev = store.snapshot(w.map, workdir / "mapper")
         frames, masks = up._frames(w, new_cameras, new_masks)
         up._check(frames, masks, prev, indir)
-        up._resolve_deferred(frames)
+        # the monocular depth of at most DRY_DEPTH_FRAMES suspicious frames (too_close): a
+        # dry run stays a few seconds; the others are predicted by their other checks
+        up._resolve_deferred([fr for fr in frames if fr.deferred][:DRY_DEPTH_FRAMES])
         with ThreadPoolExecutor(DRY_THREADS) as pool:
             got = list(pool.map(lambda fr: None if fr.rgb is None else features(fr.rgb, fr.ignore),
                                 frames))
             feats: dict[int, Features] = {fr.work.index: g for fr, g in zip(frames, got,
                                                                            strict=True)
                                           if g is not None}
-            am = AnchoredMap.load(store.mapper_dir(w.map)) \
+            am = AnchoredMap.load(workdir / "mapper") \
                 if prev is not None and prev.get("engine") == "anchored" else None
             placed = _place_all(pool, am, frames, feats)
             links = list(pool.map(lambda k: _neighbours(k, frames, feats), range(len(frames))))
