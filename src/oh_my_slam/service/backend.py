@@ -29,10 +29,13 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.errors import ApiError
 
 if TYPE_CHECKING:
-    from oh_my_slam.segmentation.api import Detection
+    from oh_my_slam.segmentation.api import Detection, Region
 
 LOG_TAIL_LINES = 20
 MONO_GRID_SIDE = 640  # the monocular depth grid of an anchored map's keyframes (README)
+# a map update keeps detections from this score: below the default threshold (0.5), an object
+# needs two keyframes to be listed (``mapping.anchored_objects.TRUSTED_SCORE``)
+MAP_MIN_SCORE = 0.2
 
 
 class NothingRegisteredError(Exception):
@@ -127,6 +130,12 @@ class Backend(Protocol):
 
     def detect(self, image: Path, grid: tuple[int, int]) -> list[Detection]:
         """The detections of an image, masks on ``grid`` (width, height)."""
+
+    def look_closer(self, image: Path, regions: list[Region], dets: list[Detection],
+                    grid: tuple[int, int]) -> list[Detection]:
+        """The detections ``dets`` of an image looking down at its support (masks on ``grid``),
+        looked at closer (``segmentation.api.look_closer``): its raised areas ``regions`` that
+        they leave uncovered labelled, the other labels of each."""
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
@@ -289,7 +298,21 @@ class MapperBackend:
         try:
             client = connect_server().clone()
             try:
-                return detect_on_grid(image, grid, client)
+                return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE)
+            finally:
+                client.close()
+        except OhMySlamError as exc:
+            raise api_error(exc) from exc
+
+    def look_closer(self, image: Path, regions: list[Region], dets: list[Detection],
+                    grid: tuple[int, int]) -> list[Detection]:
+        from oh_my_slam.reconstruction.api import connect_server
+        from oh_my_slam.segmentation.api import look_closer
+
+        try:
+            client = connect_server().clone()
+            try:
+                return look_closer(image, regions, dets, grid, client, MAP_MIN_SCORE)
             finally:
                 client.close()
         except OhMySlamError as exc:

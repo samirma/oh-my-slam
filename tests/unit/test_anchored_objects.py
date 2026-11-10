@@ -196,6 +196,7 @@ def test_the_floor_named_as_an_object_is_dropped(tmp_path: Path) -> None:
     pts, _ = pixel_points(z, K_TABLE, np.ones_like(floor))
     zmap = (pts @ T[:3, :3].T + T[:3, 3])[:, 2].reshape(z.shape)
     m = floor & (np.abs(zmap) < 0.01)
+    m[:, :400] = False  # a part of the floor (a mask over most of the view is background)
     r, c = np.nonzero(m)
     det = Detection("bed", 0.8, "test", m, (c.min(), r.min(), c.max(), r.max()))
     v = View("a", T, 0.01, K_TABLE, z, rgb, [det])
@@ -221,12 +222,13 @@ def test_flickering_labels_and_ignore_masks(tmp_path: Path) -> None:
 
 
 def test_cut_masks_leave_extents_partial(tmp_path: Path) -> None:
-    sc = TableScene(items=[Item("shelf", [((-1.0, 2.3, 0.0), (1.0, 2.5, 2.0))])])
+    sc = TableScene(items=[Item("shelf", [((-1.0, 2.3, 0.8), (1.0, 2.5, 1.2))])])
     om = ObjectMap(tmp_path)
     om.update([view("a", (0.0, 1.2, 1.0), sc, target=(0.0, 3.0, 1.0))], 1, 0.0)
-    o = om.records()["objects"][0]
-    assert o["extent_seen"] == {"x": "partial", "y": "partial", "z": "partial"}
-    assert o["sigma_centre_m"] >= ao.MIN_SIGMA_M
+    assert om.records()["objects"] == []  # one sighting cut by the border: not listed yet
+    o = om.objects[0]
+    assert ao.extent_seen(o) == {"x": "partial", "y": "partial", "z": "partial"}
+    assert ao.sigma_centre(o) >= ao.MIN_SIGMA_M
 
 
 # -- pieces ---------------------------------------------------------------------------------------
@@ -361,7 +363,16 @@ def test_summaries_without_sightings() -> None:
     o.box = Box(np.zeros(3), np.ones(3), 0.0)
     o.sightings = [s]
     o.supported_by = {"kind": "surface", "id": 1, "verified_version": 1}
-    assert ao.extent_seen(o)["z"] == "full"  # rests on a support, its top seen
+    assert ao.extent_seen(o)["z"] == "partial"  # its bottom cut: the height not seen
+    from_above = Sighting("k3", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 0.0, -1.0],
+                          [0, 0, 1], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
+    o.sightings = [s, from_above]
+    assert ao.extent_seen(o)["z"] == "partial"  # seen from above: the top alone
+    side = Sighting("k4", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 1.0, 0.0],
+                    [0, -1, 0], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
+    o.sightings = [s, side]
+    assert ao.extent_seen(o)["z"] == "full"
+    o.sightings = [s]
     assert Sighting.from_json(s.to_json()) == s
     back = Sighting("k2", 1, [0, 0, 0], 1.0, 100, [True, False, False, False], [0.0, -1.0, 0.0],
                     [0, 1, 0], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
@@ -538,9 +549,214 @@ def test_seen_twice_then_gone_in_one_update_is_struck(tmp_path: Path) -> None:
     assert [(o["label"], o["state"]) for o in om.records()["objects"]] == [("box", "struck")]
 
 
-def test_what_depth_sees_through_is_not_judged() -> None:
-    v = view("c", EYES[0], TableScene(items=[]))
-    o = MapObject(1, {"window": 1.0}, box=Box(np.array([0.25, 0.225, TOP + 0.06]),
-                                              np.array([0.2, 0.15, 0.12]), 0.0))
-    o.points = np.full((40, 3), [0.25, 0.225, TOP + 0.1], np.float32)
-    assert ao.judge(o, v) is None
+def test_a_contradicted_object_is_judged_by_its_detection_only(tmp_path: Path) -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    empty = TableScene(items=[])
+    om = ObjectMap(tmp_path)
+    # seen, its place seen through (the depth looks past it), seen again: unjudgeable by depth
+    om.update([view("a", EYES[0], sc), view("b", EYES[1], sc), view("c", EYES[2], empty),
+               view("d", EYES[3], sc)], 1, 0.0)
+    o = om.objects[0]
+    assert o.contradicted == 1 and ao.see_through(o) and o.state == "confirmed"
+    # one keyframe that does not detect it never strikes it
+    assert om.update([view("e", EYES[0], empty)], 2, 0.0) == []
+    assert om.objects[0].state == "confirmed"
+    assert ao.judge(o, view("f", EYES[1], empty)) == ("gone", ao.ABSENT_SHARE)
+    # hidden behind a nearer surface, or too small to be detected: no verdict
+    wall = TableScene(items=[Item("wall", [((0.0, -0.4, 0.0), (1.2, -0.38, 2.0))])])
+    assert ao.judge(o, view("g", EYES[0], wall)) is None
+    tiny = MapObject(9, {"box": 1.0}, box=o.box, sightings=[
+        Sighting("k", 1, [0, 0, 0], 0.1, 1, [False] * 4, [1.0, 0, 0], [0, 0, 0], 0.01,
+                 [1.0, 1, 1], "box", 0.9)], points=o.points, contradicted=1)
+    assert ao.judge(tiny, view("h", EYES[1], empty)) is None
+    # two keyframes that do not detect it strike it
+    assert len(om.update([view("i", EYES[1], empty), view("j", EYES[2], empty)], 3, 0.0)) == 1
+
+
+def test_a_place_detected_as_something_else_is_not_judged() -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    obs = ao.observe(v, 1, None)
+    o = MapObject(1, {"box": 1.0}, sightings=[obs[0].sighting],
+                  points=obs[0].points.astype(np.float32))
+    o.box = Box.of(__import__("oh_my_slam.segmentation.api", fromlist=["x"]).fit_object_obb(
+        obs[0].points, "box", ao.UP, None))
+    gone = view("b", EYES[0], TableScene(items=[]))
+    assert ao.judge(o, gone)[0] == "gone"  # type: ignore[index]
+    gone.dets = [Detection("globe", 0.8, "test", v.dets[0].mask, v.dets[0].box)]
+    assert ao.judge(o, gone) is None
+    big = np.ones_like(v.dets[0].mask)
+    gone.dets = [Detection("wall art", 0.8, "test", big, (0.0, 0.0, 640.0, 480.0))]
+    assert ao.judge(o, gone)[0] == "gone"  # type: ignore[index]
+    assert not ao._detected_there(gone, np.zeros(0), np.zeros(0), 10.0)
+
+
+def test_see_through_evidence_inside_the_masks() -> None:
+    def sighting(behind: float, mask_range: float) -> Sighting:
+        return Sighting("k", 1, [0, 0, 0], 1.0, 100, [False] * 4, [1.0, 0, 0], [-1, 0, 0],
+                        0.01, [1.0, 1, 1], "globe", 0.9, behind=behind, mask_range=mask_range)
+
+    o = MapObject(1, {"globe": 1.0}, box=Box(np.zeros(3), np.full(3, 0.2), 0.0))
+    o.sightings = [sighting(0.5, 1.0), sighting(0.0, 1.0)]
+    assert not ao.see_through(o)  # one sighting alone
+    o.sightings = [sighting(0.5, 1.0), sighting(0.0, 2.0), sighting(0.0, 1.0)]
+    assert ao.see_through(o)  # its mask's depth beyond its points, and beyond its box
+    assert not ao.see_through(MapObject(2, {"globe": 1.0}))
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    m = np.zeros(v.depth.shape, bool)
+    m[200:203, 300:303] = True  # too thin to erode: the mask itself
+    pts = np.array([[0.25, 0.225, TOP + 0.12]])
+    share, rng = ao._behind(m, v.depth, v.depth > 0, v, pts)
+    assert 0.0 <= share <= 1.0 and rng > 0
+
+@pytest.mark.parametrize(("rel", "struck"), [(ao.SENSOR_DEPTH_REL, True),
+                                             (ao.MONO_DEPTH_REL, False)])
+def test_one_keyframe_strikes_only_with_a_depth_image(tmp_path: Path, rel: float,
+                                                      struck: bool) -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    om = ObjectMap(tmp_path)
+    om.update([view("a", EYES[0], sc), view("b", EYES[1], sc)], 1, 0.0)
+    gone = view("c", EYES[2], TableScene(items=[]))
+    gone.depth_rel = rel
+    assert bool(om.update([gone], 2, 0.0)) is struck
+
+
+def test_specific_labels_win_over_generic_ones() -> None:
+    o = MapObject(1, {"ball": 2.0, "apple": 0.6, "fruit": 0.5})
+    assert o.label == "apple"
+    o = MapObject(1, {"ball": 4.0, "apple": 0.6})
+    assert o.label == "ball"  # too little evidence for the specific label
+    assert MapObject(1, {"ball": 1.0}).label == "ball"
+    assert MapObject(1, {"cup": 1.0, "apple": 0.5}).label == "cup"
+    assert ao.alike("ball", "tomato") and ao.alike("egg", "fruit") and not ao.alike("egg", "cup")
+
+ABOVE = [(0.42, 0.05, 1.5), (0.40, 0.15, 1.55), (0.45, 0.1, 1.45)]
+OBLIQUE = [(0.0, 0.0, 1.45), (0.1, -0.3, 1.5), (0.0, 0.3, 1.4), (0.2, 0.0, 1.55)]
+
+
+@pytest.mark.parametrize("eyes", [OBLIQUE, ABOVE], ids=["oblique", "above"])
+def test_worktop_support_heights_with_noisy_depth(tmp_path: Path,
+                                                  eyes: list[tuple[float, float, float]]
+                                                  ) -> None:
+    """An arm's worktop at 0.9 m at 640 x 360 with 1 % + 3 mm depth noise, beside a lower
+    counter 9 cm down, a rug detected on the worktop: the worktop's height within 1 cm; the
+    items 3-8 cm tall rest on it with their full heights, also when seen only from above (their
+    height then ``partial``); a tomato on a plate; the rug neither listed nor a support."""
+    from oh_my_slam.core.types import Intrinsics
+    from tests.synth.room import Room
+
+    K = Intrinsics(320.0, 320.0, 320.0, 180.0, 640, 360)
+    w = 0.9
+    items = [Item("counter", [((-0.2, -0.4, 0.0), (1.0, 0.6, w))]),
+             Item("cabinet", [((1.0, -0.4, 0.0), (1.6, 0.6, w - 0.09))]),
+             Item("rug", [((0.50, -0.20, w), (0.68, -0.02, w + 0.002))], (90, 60, 40)),
+             Item("apple", [((0.30, 0.00, w), (0.37, 0.07, w + 0.07))], (200, 30, 30)),
+             Item("egg", [((0.45, 0.10, w), (0.49, 0.15, w + 0.045))], (230, 220, 200)),
+             Item("plate", [((0.20, 0.20, w), (0.42, 0.42, w + 0.02))], (240, 240, 240)),
+             Item("mug", [((0.55, -0.15, w + 0.002), (0.63, -0.07, w + 0.08))],
+                  (40, 90, 200)),
+             Item("tomato", [((0.28, 0.27, w + 0.02), (0.34, 0.33, w + 0.07))], (220, 50, 20))]
+    sc = TableScene(items=items, room=Room(boxes=[]))
+    rng = np.random.default_rng(0)
+    cloud = Cloud()
+    views = []
+    for i, eye in enumerate(eyes):
+        T = look_at(eye, (0.42, 0.1, w)) if eye[0] != 0.42 else look_at(eye, (0.42, 0.06, w))
+        rgb, z, idx = sc.render(T, K)
+        z = (z * (1 + 0.01 * rng.standard_normal(z.shape))
+             + 0.003 * rng.standard_normal(z.shape)).astype(np.float32)
+        ok = edge_free(z)
+        lat = np.zeros_like(ok)
+        lat[::2, ::2] = True
+        pts, fl = pixel_points(z, K, ok & lat)
+        cloud.add(pts @ T[:3, :3].T + T[:3, 3], rgb.reshape(-1, 3)[fl].astype(float))
+        views.append(View(f"k{i}", T, 0.005, K, z, rgb, detections(sc, idx), None,
+                          ao.SENSOR_DEPTH_REL))
+    om = ObjectMap(tmp_path)
+    om.update(views, 1, w)
+    om.finish(cloud.points(), 1.6, 1, np.array([v.centre for v in views]))
+    rec = om.records()
+    top = next(s for s in rec["surfaces"] if abs(s["height_m"] - w) < 0.05)
+    assert top["height_m"] == pytest.approx(w, abs=0.01)
+    o = by_label(rec)
+    assert "rug" not in o
+    heights = {"apple": 0.07, "egg": 0.045, "plate": 0.02, "mug": 0.08}
+    for name, h in heights.items():
+        assert o[name]["supported_by"]["id"] == top["id"], name
+        bottom = o[name]["centre_m"][2] - o[name]["size_m"][2] / 2
+        assert bottom == pytest.approx(w, abs=0.01), name
+        assert o[name]["size_m"][2] == pytest.approx(h, abs=0.02), name
+    assert o["tomato"]["supported_by"] == {"kind": "object", "id": o["plate"]["id"],
+                                           "verified_version": 1}
+    if eyes is ABOVE:
+        assert o["egg"]["extent_seen"]["z"] == "partial"
+
+
+def _edge_view(sc: TableScene, kid: str) -> View:
+    """A keyframe that has the apple cut by its left border."""
+    eye = (0.25, -0.6, 1.3)
+    for dx in np.linspace(0.7, 1.2, 51):
+        v = view(kid, eye, sc, target=(0.25 + dx, 0.3, TOP))
+        d = next((d for d in v.dets if d.label == "apple"), None)
+        if d is not None and d.mask[:, 0].any() and d.mask.sum() > 150:
+            return v
+    raise AssertionError("no edge view")
+
+
+def test_a_fragment_at_the_border_is_the_object(tmp_path: Path) -> None:
+    sc = TableScene(items=[default_items()[0],
+                           Item("apple", [((0.21, 0.26, TOP), (0.29, 0.34, TOP + 0.08))],
+                                (200, 30, 30))])
+    whole = view("a", EYES[0], sc)
+    edge = _edge_view(sc, "b")
+    edge.dets = [Detection("orange" if d.label == "apple" else d.label, 0.95, d.source, d.mask,
+                           d.box) for d in edge.dets]
+    om = ObjectMap(tmp_path)
+    om.update([whole, edge], 1, 0.0)
+    labels = [o["label"] for o in om.records()["objects"]]
+    assert labels.count("apple") == 1 and "orange" not in labels
+    apple = next(o for o in om.objects if o.label == "apple")
+    assert len(apple.sightings) == 2 and apple.sightings[1].truncated
+    # a fragment alone is not listed until another view confirms it
+    om2 = ObjectMap(tmp_path / "two")
+    om2.update([_edge_view(sc, "c")], 1, 0.0)
+    assert not [o for o in om2.records()["objects"] if o["label"] == "apple"]
+
+
+def test_produce_goes_together() -> None:
+    assert ao.alike("apple", "orange") and ao.alike("tomato", "peach")
+    assert not ao.alike("apple", "cup")
+
+
+def test_tiny_fragments_are_not_listed() -> None:
+    o = MapObject(1, {"wire": 1.0}, published=True,
+                  box=Box(np.zeros(3), np.array([0.02, 0.01, 0.01]), 0.0))
+    assert not ao.listed(o)
+    o.box = Box(np.zeros(3), np.array([0.04, 0.01, 0.01]), 0.0)
+    assert ao.listed(o)
+
+
+def test_background_and_robot_masks_are_dropped() -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    whole = np.ones(v.depth.shape, bool)
+    v.dets = [Detection("tree", 0.4, "test", whole, (0.0, 0.0, 640.0, 480.0))]
+    assert ao.observe(v, 1, None) == []
+    near = view("b", (0.25, 0.225, TOP + 0.6), sc, target=(0.25, 0.225, TOP))
+    near.depth = np.full_like(near.depth, 0.08)
+    near.dets = [Detection("box", 0.9, "test", near.dets[0].mask, near.dets[0].box)]
+    assert ao.observe(near, 1, None) == []
+
+
+def test_a_low_score_detection_needs_a_second_view(tmp_path: Path) -> None:
+    sc = TableScene(items=[Item("plate", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.02))])])
+    om = ObjectMap(tmp_path)
+    v = view("a", EYES[0], sc)
+    v.dets = [Detection(d.label, 0.3, d.source, d.mask, d.box) for d in v.dets]
+    om.update([v], 1, 0.0)
+    assert om.records()["objects"] == []
+    w = view("b", EYES[1], sc)
+    w.dets = [Detection(d.label, 0.25, d.source, d.mask, d.box) for d in w.dets]
+    om.update([w], 2, 0.0)
+    assert [o["label"] for o in om.records()["objects"]] == ["plate"]

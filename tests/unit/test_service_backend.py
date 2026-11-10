@@ -445,14 +445,15 @@ def test_detect_asks_the_detector_on_a_grid(tmp_path: Path, monkeypatch: pytest.
 
     seen: dict[str, Any] = {}
 
-    def detect_on_grid(path: Path, grid: tuple[int, int], client: Any) -> list[Any]:
+    def detect_on_grid(path: Path, grid: tuple[int, int], client: Any, **kw: Any) -> list[Any]:
         seen["grid"] = grid
+        seen.update(kw)
         return ["d"]
 
     monkeypatch.setattr(rec, "connect_server", lambda: _Client())
     monkeypatch.setattr(seg, "detect_on_grid", detect_on_grid)
     assert be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48)) == ["d"]
-    assert seen["grid"] == (64, 48)
+    assert seen["grid"] == (64, 48) and seen["min_score"] == be.MAP_MIN_SCORE
 
     def boom() -> Any:
         raise ServerUnavailableError("down")
@@ -460,4 +461,29 @@ def test_detect_asks_the_detector_on_a_grid(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(rec, "connect_server", boom)
     with pytest.raises(ApiError) as err:
         be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48))
+    assert err.value.code == "inference_unavailable"
+
+
+def test_look_closer_asks_the_detector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.reconstruction import api as rec
+    from oh_my_slam.segmentation import api as seg
+
+    seen: list[Any] = []
+
+    def look_closer(path: Path, regions: Any, dets: Any, grid: Any, client: Any,
+                    min_score: float) -> list[Any]:
+        seen.append((regions, dets, grid, min_score))
+        return ["d", "e"]
+
+    monkeypatch.setattr(rec, "connect_server", lambda: _Client())
+    monkeypatch.setattr(seg, "look_closer", look_closer)
+    assert be.MapperBackend().look_closer(tmp_path / "a.jpg", ["r"], ["d"], (64, 48)) == ["d", "e"]
+    assert seen == [(["r"], ["d"], (64, 48), be.MAP_MIN_SCORE)]
+
+    def boom() -> Any:
+        raise ServerUnavailableError("down")
+
+    monkeypatch.setattr(rec, "connect_server", boom)
+    with pytest.raises(ApiError) as err:
+        be.MapperBackend().look_closer(tmp_path / "a.jpg", [], [], (64, 48))
     assert err.value.code == "inference_unavailable"

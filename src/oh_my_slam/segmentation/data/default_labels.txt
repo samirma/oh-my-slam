@@ -186,6 +186,15 @@ broccoli
 potato
 onion
 salad
+# simulated kitchens (iTHOR): without them these take the nearest generic label
+lettuce
+spatula
+ladle
+salt shaker
+pepper shaker
+sponge
+spray bottle
+credit card
 wine rack
 display case
 vending machine

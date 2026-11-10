@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy import ndimage
 
 from oh_my_slam.client.client import InferenceClient
 from oh_my_slam.core import timing
@@ -47,14 +48,21 @@ from oh_my_slam.segmentation.colors import (
 from oh_my_slam.segmentation.detect import (
     DEFAULT_MIN_SCORE,
     GROUND_MIN_VISIBLE,
+    PASS_IOU,
     claim_order,
+    dedupe,
     detect,
+    detect_regions,
     grounding,
+    label_scores,
+    mask_iou,
+    order,
     priority,
     request_floor,
 )
 from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
+from oh_my_slam.segmentation.detect import label_fit as label_fit
 from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.detect import surface_label as surface_label
 from oh_my_slam.segmentation.lift import (
@@ -67,6 +75,8 @@ from oh_my_slam.segmentation.lift import (
 from oh_my_slam.segmentation.obb import OBB as OBB
 from oh_my_slam.segmentation.obb import fit_obb
 from oh_my_slam.segmentation.obb import obb_iou_upright as obb_iou_upright
+from oh_my_slam.segmentation.regions import Region as Region
+from oh_my_slam.segmentation.regions import raised_regions as raised_regions
 
 
 @dataclass
@@ -417,3 +427,54 @@ def reconstruct_and_detect(
     floor = request_floor(min_score)
     return detect_alongside(image_path, client, reconstruct, max_side=MAX_GRID_SIDE,
                             min_score=floor, floor=floor)
+
+
+# Geometry-first candidates (``segmentation.regions``): a raised area of a view looking down at
+# its support that the frame's detections leave uncovered (less than REGION_COVERED of it) is
+# looked at closer (``detect.detect_regions``); a detection of that crop is kept when
+# REGION_ON_SHARE of its mask lies on the raised area (grown by REGION_GROW_PX: a rim's outer
+# edge), so the texture of the support itself is never named, and when it is no detection the
+# frame already has (``detect.PASS_IOU``).
+REGION_COVERED = 0.5
+REGION_ON_SHARE = 0.6
+REGION_GROW_PX = 3
+
+
+def uncovered_regions(regions: list[Region], dets: list[Detection]) -> list[Region]:
+    """The candidates the frame's detections cover less than ``REGION_COVERED`` of."""
+    if not dets:
+        return list(regions)
+    covered = np.logical_or.reduce([d.mask for d in dets])
+    return [r for r in regions if float(covered[r.mask].mean()) < REGION_COVERED]
+
+
+def label_regions(regions: list[Region], looks: list[list[Detection]], dets: list[Detection]
+                  ) -> list[Detection]:
+    """The detections of the closer looks (``looks[i]``: the crop around ``regions[i]``) that lie
+    on their raised area and that the frame's ``dets`` do not have yet, ``priority`` order."""
+    out: list[Detection] = []
+    for r, found in zip(regions, looks, strict=True):
+        on = ndimage.binary_dilation(r.mask, iterations=REGION_GROW_PX)
+        for d in found:
+            if float(on[d.mask].mean()) < REGION_ON_SHARE:
+                continue
+            if any(mask_iou(d.mask, e.mask) > PASS_IOU for e in dets):
+                continue
+            out.append(d)
+    return order(dedupe(out))
+
+
+
+def look_closer(image_path: Path, regions: list[Region], dets: list[Detection],
+                grid: tuple[int, int], client: InferenceClient,
+                min_score: float = DEFAULT_MIN_SCORE) -> list[Detection]:
+    """The detections ``dets`` (masks on ``grid``) of a view looking down at its support (its
+    raised areas ``regions``), looked at closer: the areas they leave uncovered labelled from a
+    crop around each (``detect.detect_regions``, ``label_regions``, from ``min_score``), then the
+    other labels the detector scores every detection as (``detect.label_scores``)."""
+    todo = uncovered_regions(regions, dets)
+    if todo:
+        dets = dets + label_regions(
+            todo, detect_regions(image_path, [r.box for r in todo], grid, client, min_score),
+            dets)
+    return label_scores(image_path, dets, grid, client)

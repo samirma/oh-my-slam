@@ -60,7 +60,7 @@ class YoloeSegmenter:
         self._active = names
 
     def detect_array(self, rgb: np.ndarray, labels: list[str], conf: float, iou: float,
-                     imgsz: int) -> list[dict[str, Any]]:
+                     imgsz: int, per_label: bool = False) -> list[dict[str, Any]]:
         names = tuple(labels)
         self._set_vocabulary(names)
         bgr = np.ascontiguousarray(rgb[..., ::-1])
@@ -73,7 +73,7 @@ class YoloeSegmenter:
             retina_masks=True,
             verbose=False,
             max_det=300,
-            agnostic_nms=True,
+            agnostic_nms=not per_label,
         )
         r = results[0]
         out: list[dict[str, Any]] = []
@@ -105,7 +105,7 @@ class YoloeSegmenter:
     def run(self, req: SegmentRequest) -> dict[str, Any]:
         rgb = load_rgb(Path(req.image_path), max_side=req.max_side)
         h, w = rgb.shape[:2]
-        dets = self.detect_array(rgb, req.labels, req.conf, req.iou, req.imgsz)
+        dets = self.detect_array(rgb, req.labels, req.conf, req.iou, req.imgsz, req.per_label)
         instances = []
         for d in dets:
             m = d.pop("mask_array")

@@ -97,7 +97,7 @@ class _Server:
                     "focal_unc_px_small": f / 7, "vfov_deg": 50.0}
 
         def detect(_: Any, rgb: np.ndarray, labels: list[str], conf: float, iou: float,
-                   imgsz: int) -> list[dict[str, Any]]:
+                   imgsz: int, per_label: bool = False) -> list[dict[str, Any]]:
             m = rgb[..., 1] > 128
             return [{"label": labels[0], "score": 0.9, "source": "yoloe",
                      "box_xyxy": [1.0, 2.0, float(rgb.shape[1]), float(rgb.shape[0])],
