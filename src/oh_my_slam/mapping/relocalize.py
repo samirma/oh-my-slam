@@ -351,6 +351,11 @@ TRIANGULATE_MAX_ANGLE_DEG = 60.0
 TRIANGULATE_PX = 2.0
 TRIANGULATE_MIN_RAY_DEG = 2.0
 DEPTH_SCALE_MIN_POINTS = 20
+TRIANGULATE_SCALE_RANGE = (0.67, 1.5)  # a keyframe's triangulation against its depth
+TRIANGULATE_DEPTH_TOL = 0.5  # a point this far (relative) from its depth is dropped
+PLAUSIBLE_NEAR_M = 2.0  # a located pose at most this far from every keyframe...
+PLAUSIBLE_BOUNDS_M = 1.0  # ... and inside the keyframes' bounds grown by this
+PLAUSIBLE_KEYFRAMES = 2  # inliers on this many keyframes, or twice MIN_INLIERS on one
 
 
 def _depth_of(kf_xyz: NDArray[Any], T: Array) -> Array:
@@ -414,6 +419,15 @@ def triangulate(kfs: Sequence[Keyframe], pair_matches: Any = None) -> list[NDArr
         both = has & np.isfinite(z_d) & (z_d > 0)
         scale = float(np.median(z_t[both] / z_d[both])) \
             if int(both.sum()) >= DEPTH_SCALE_MIN_POINTS else 1.0
+        if not TRIANGULATE_SCALE_RANGE[0] <= scale <= TRIANGULATE_SCALE_RANGE[1]:
+            # the triangulation disagrees with the keyframe's own depth as a whole (poses that
+            # the images did not confirm, rays too parallel): the depth points stand
+            continue
+        # a triangulated point far from the keyframe's own depth is a bad match or ray
+        with np.errstate(invalid="ignore"):
+            off = np.isfinite(z_d) & (z_d > 0) & (np.abs(z_t / (scale * z_d) - 1.0)
+                                                  > TRIANGULATE_DEPTH_TOL)
+        has &= ~off
         fill = a.centre + scale * (np.asarray(a.xyz, np.float64) - a.centre)
         out[i] = np.where(has[:, None], tri, fill).astype(np.float32)
     return out
@@ -571,6 +585,8 @@ def locate(q: Query, index: Index) -> Outcome:
                     not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp)):
                 others = [main, *[h for h in others if h is not rival]]
                 main, rival = rival, main
+        if not plausible(main, kfs, index):
+            return out  # a degenerate solve: not located (a wrong pose is worse than none)
         sp, sr = _sigmas(main, others, q, uv, xyz, iq, kfs, index)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, sp, sr
         out.inliers = main.inliers
@@ -587,6 +603,21 @@ def locate(q: Query, index: Index) -> Outcome:
         if turned is not None:
             return _with_votes(turned, out)
     return out
+
+
+def plausible(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
+    """Whether a solve can be the frame's pose: within ``PLAUSIBLE_NEAR_M`` of a keyframe and
+    inside the keyframes' bounds grown by ``PLAUSIBLE_BOUNDS_M``, its inliers on
+    ``PLAUSIBLE_KEYFRAMES`` keyframes (or twice ``MIN_INLIERS`` on one)."""
+    C = np.array([k.centre for k in index.keyframes])
+    c = h.T[:3, 3]
+    if float(np.linalg.norm(C - c, axis=1).min()) > PLAUSIBLE_NEAR_M:
+        return False
+    if (c < C.min(0) - PLAUSIBLE_BOUNDS_M).any() or (c > C.max(0) + PLAUSIBLE_BOUNDS_M).any():
+        return False
+    per = np.bincount(kfs[h.mask], minlength=len(index.keyframes))
+    return int((per >= MIN_PAIR_MATCHES).sum()) >= PLAUSIBLE_KEYFRAMES \
+        or int(per.max()) >= 2 * MIN_INLIERS
 
 
 def _with_votes(o: Outcome, base: Outcome) -> Outcome:

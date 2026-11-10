@@ -279,3 +279,28 @@ def test_triangulated_points_follow_the_keyframe_poses_and_rescale_the_depth() -
 
     out = rl.triangulate([a, b], cached)
     assert calls == [(0, 1), (1, 0)] and np.allclose(out[0], a.xyz, equal_nan=True)
+
+
+def test_a_triangulation_that_disagrees_with_the_depth_is_not_taken() -> None:
+    """Depth twice too far (or keyframe poses the images did not confirm): the triangulation's
+    scale against the depth leaves the range, and the depth points stand; single points far from
+    their depth are dropped."""
+    P, D = _scene(n=800)
+    a = _kf("a", A, P, D)
+    b = _kf("b", rooms.camera(0.0, 0.6, 1.0, -10.0, -10.0), P, D)
+    a2 = rl.Keyframe("a2", a.T, a.K, a.uv, a.desc,
+                     (a.centre + 2.0 * (a.xyz - a.centre)).astype(np.float32))
+    pts = rl.triangulate([a2, b])
+    assert np.allclose(pts[0], a2.xyz, equal_nan=True)
+    a3 = rl.Keyframe("a3", a.T, a.K, a.uv, a.desc, a.xyz.copy())
+    a3.xyz[:20] = (a.centre + 3.0 * (a.xyz[:20] - a.centre)).astype(np.float32)
+    pts = rl.triangulate([a3, b])
+    _, _, idx = _view(A, P, D)
+    assert np.nanmedian(np.linalg.norm(pts[0] - P[idx], axis=1)) < 0.01
+
+
+def test_an_implausible_solve_is_not_located(monkeypatch: pytest.MonkeyPatch) -> None:
+    P, D = _scene()
+    monkeypatch.setattr(rl, "plausible", lambda h, kfs, index: False)
+    o = rl.locate(_query(A, P, D), rl.Index([_kf("a", A, P, D)]))
+    assert not o.located
