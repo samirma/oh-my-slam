@@ -141,7 +141,9 @@ def test_openapi_describes_every_endpoint_with_the_schema_defs(client: Client) -
     doc = client.get("/api/openapi.json")
     assert doc["openapi"] == "3.1.0"
     assert set(doc["paths"]) == {"/api/health", "/api/openapi.json", "/api/maps/{name}/updates",
-                                 "/api/jobs/{id}", "/api/maps/{name}", "/api/maps/{name}/frames"}
+                                 "/api/jobs/{id}", "/api/maps/{name}", "/api/maps/{name}/frames",
+                                 "/api/maps/{name}/grid", "/api/maps/{name}/points",
+                                 "/api/maps/{name}/locate", "/api/maps/{name}/pose"}
     assert set(doc["components"]["schemas"]) == set(schema.defs())
     text = str(doc)
     assert "#/$defs/" not in text
@@ -750,7 +752,7 @@ def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
 
 def test_health_lists_capabilities_and_default_then_measured_timings(client: Client) -> None:
     h = client.get("/api/health", "Health")
-    assert h["capabilities"] == ["O1", "O3-jobs", "O4"]
+    assert h["capabilities"] == ["O1", "O3-jobs", "O4", "O5", "O6", "O9", "O10"]
     reg = h["timings"]["registration_per_frame"]
     assert reg["source"] == "default" and reg["count"] == 0 and reg["median_s"] > 0
     frames, files, _ = frames_of(client, 3)

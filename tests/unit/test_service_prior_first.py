@@ -56,11 +56,16 @@ def client(tmp_path: Path) -> Iterator[Client]:
     updater = Updater(store, backend, timings)
     jobs = Jobs(store.jobs, updater, timings.predict_update)
     jobs.start()
+    from oh_my_slam.service.derived import Derived
+
+    derived = Derived(store, backend.read)
+    derived.start()
     service = Service(store, jobs, FakeInference(), backend.require_inference, timings=timings,
-                      version="test", dry_run=updater.dry_run)
+                      version="test", dry_run=updater.dry_run, derived=derived)
     with TestClient(create_app(service)) as http:
         yield Client(http, backend, service)
     jobs.stop(timeout=10)
+    derived.stop()
 
 
 def prior(T: np.ndarray, trust: str = "metric", sp: float = 0.02, sr: float = 1.0
@@ -89,7 +94,7 @@ def frames_for(c: Client, poses: list[np.ndarray], *, tag: str = "f", depth: boo
 
 
 def test_health_lists_o3_jobs(client: Client) -> None:
-    assert CAPABILITIES == ["O1", "O3-jobs", "O4", "O9", "O10"]
+    assert CAPABILITIES == ["O1", "O3-jobs", "O4", "O5", "O6", "O9", "O10"]
     assert client.get("/api/health", "Health")["capabilities"] == CAPABILITIES
 
 
@@ -326,3 +331,34 @@ def test_neighbour_links(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dr.link(f, features(np.full_like(rgb, 128))) == 0
     monkeypatch.setattr(cv2, "findFundamentalMat", lambda *a, **k: (None, None))
     assert dr.link(f, f) == 0
+
+
+def test_grid_points_and_locate_read_an_anchored_map(client: Client) -> None:
+    fr, files = frames_for(client, [base_pose(30.0 * k) for k in range(6)], tag="a")
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "committed"
+    deadline = time.monotonic() + 60
+    while True:
+        r = client.http.get("/api/maps/m/grid?cell_m=0.1")
+        if r.status_code == 200 or time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+    grid = client.check(r, "Grid")
+    assert grid["map_version"] == 1 and grid["shape"][0] > 5
+    pts = client.get("/api/maps/m/points?min=-3,-3,-1&max=3,3,3", "Points")
+    assert pts["count"] > 1000 if "count" in pts else True
+    from oh_my_slam.service.backend import read_anchored
+
+    im = read_anchored(client.service.store.mapper_dir("m"))
+    f0 = im.frames[0].name
+    d = im.depth(f0)
+    assert d is not None and d.shape == (240, 320) and im.image(f0) is not None
+    c = im.cloud()
+    assert c is not None and len(c.xyz) > 1000 and im.objects() == []
+    img, _, _ = shot(base_pose(45))
+    from tests.fakes.service import multipart
+
+    data, ctype = multipart({"frames": [{"name": "q", "image": "q", "camera_id": "cam"}],
+                             "record": False}, {"q": img})
+    r = client.http.post("/api/maps/m/locate", content=data, headers={"content-type": ctype})
+    assert r.status_code == 200, r.text

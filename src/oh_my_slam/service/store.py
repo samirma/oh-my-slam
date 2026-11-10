@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,9 @@ class Store:
         self.work = self.root / "work"
         self.trash = self.root / "trash"
         self._lock = threading.RLock()
+        # called with (map, version) once a version is committed (``derived`` derives the grid,
+        # points and locate inputs from it); a listener's failure never fails the commit
+        self.listeners: list[Callable[[str, int], None]] = []
 
     def create(self) -> None:
         for d in (self.maps, self.jobs, self.work, self.trash):
@@ -162,7 +166,19 @@ class Store:
             self._write_meta(name, meta)
         shutil.rmtree(self.trash, ignore_errors=True)
         self.trash.mkdir(parents=True, exist_ok=True)
+        self.committed(name, n)
         return n
+
+    def committed(self, name: str, n: int) -> None:
+        """Tell the listeners that version ``n`` of map ``name`` is committed."""
+        from oh_my_slam.core.log import get_logger
+
+        for listener in self.listeners:
+            try:
+                listener(name, n)
+            except Exception:
+                get_logger("oh_my_slam.service.store").exception(
+                    "commit listener failed for %s version %d", name, n)
 
     def delete(self, name: str) -> bool:
         """Remove a map and its versions; False when there is none."""

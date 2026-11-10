@@ -9,7 +9,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
 * Every JSON body carries `schema` (`oms/2.1`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
-* Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4, O9, O10. Refuse what is missing instead of calling it.
+* Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4, O5, O6, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
 ## Endpoints
@@ -22,6 +22,10 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `GET /api/jobs/{id}` | Job state and result |  | 200 [`Job`] | `wait_s` |
 | `GET /api/maps/{name}` | Map summary |  | 200 [`MapSummary`] | `version` |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses |  | 200 [`Frames`] | `version` |
+| `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m` |
+| `GET /api/maps/{name}/points` | Fused points inside a box |  | 200 [`Points`] | `version`, `min`, `max`, `voxel_m`, `max_points` |
+| `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] (multipart: part `request` + file parts) | 200 [`Locate`] |  |
+| `GET /api/maps/{name}/pose` | Last recorded pose |  | 200 [`Pose`] |  |
 | `DELETE /api/maps/{name}` | Delete the map and its versions |  | 204 |  |
 
 An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with `?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate.

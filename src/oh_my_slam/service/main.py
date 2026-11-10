@@ -147,6 +147,7 @@ def serve(store: Store, host: str, port: int) -> int:
 
     from oh_my_slam.service.app import Service, create_app
     from oh_my_slam.service.backend import MapperBackend
+    from oh_my_slam.service.derived import Derived
     from oh_my_slam.service.inference import Inference
     from oh_my_slam.service.jobs import Jobs
     from oh_my_slam.service.timings import Timings
@@ -171,8 +172,10 @@ def serve(store: Store, host: str, port: int) -> int:
         jobs.load()
         inference = Inference()
         inference.ensure_started()
+        derived = Derived(store, backend.read)
+        derived.start()
         service = Service(store, jobs, inference, backend.require_inference, timings=timings,
-                          version=git_version(), dry_run=updater.dry_run)
+                          version=git_version(), dry_run=updater.dry_run, derived=derived)
         app = create_app(service)
         bound = sock.getsockname()[1]
         url = f"http://{host}:{bound}/"
@@ -206,6 +209,7 @@ def serve(store: Store, host: str, port: int) -> int:
         finally:
             backend.terminate()
             jobs.stop(timeout=STOP_TIMEOUT_S)
+            derived.stop()
             sock.close()
     finally:
         with contextlib.suppress(OSError):

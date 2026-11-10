@@ -57,6 +57,20 @@ class InternalMap:
     # a keyframe's aligned depth on its grid (internal units), None if it has none
     depth: Callable[[str], NDArray[np.float32] | None]
     points_z: NDArray[np.float64] | None = None  # heights of the cloud's points (internal)
+    # what the derived reads (``derived``: grid, points, locate) need beyond registration; each
+    # answers None (or nothing) when the mapper has no such data
+    image: Callable[[str], Path | None] = field(default=lambda name: None)  # the keyframe image
+    cloud: Callable[[], Cloud | None] = field(default=lambda: None)  # the fused cloud
+    objects: Callable[[], list[dict[str, Any]]] = field(default=lambda: [])  # internal frame
+
+
+@dataclass
+class Cloud:
+    """The fused cloud in the internal frame: positions, sRGB colours and object ids (0: none)."""
+
+    xyz: NDArray[np.float32]
+    rgb: NDArray[np.uint8]
+    object_id: NDArray[np.uint32]
 
 
 @dataclass
@@ -104,6 +118,40 @@ class Backend(Protocol):
 
     def terminate(self) -> None:
         """End the mapper process of a running job (the service stops)."""
+
+
+def is_anchored(mapper_dir: Path) -> bool:
+    """Whether a mapper folder holds a prior-first map (``mapping.anchored``)."""
+    from oh_my_slam.mapping.anchored import STATE_JSON
+
+    return (mapper_dir / STATE_JSON).exists()
+
+
+def read_anchored(mapper_dir: Path) -> InternalMap:
+    """A prior-first map as the derived reads see it: its frame is the map frame (metres), its
+    keyframes' ids are the internal names, provisional keyframes count as low confidence, the
+    depth of a keyframe is its grid at the map's depth scale, the cloud its fused voxels (no
+    object ids: the prior-first path computes no objects)."""
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    am = AnchoredMap.load(mapper_dir)
+    frames = [InternalFrame(k.id, k.name, k.T.copy(), float(k.K.fx),
+                            {"inliers": k.inliers, "method": k.method}, k.state == "provisional")
+              for k in am.keyframes]
+    floor, pts = am.floor_and_bounds()
+    bounds = (pts.min(0).tolist(), pts.max(0).tolist()) if len(pts) else None
+    xyz = am.cloud.points()
+
+    def cloud() -> Cloud | None:
+        if not len(xyz):
+            return None
+        rgb = am.cloud.rgb / np.maximum(am.cloud.count, 1)[:, None]
+        return Cloud(xyz.astype(np.float32), np.clip(np.round(rgb), 0, 255).astype(np.uint8),
+                     np.zeros(len(xyz), np.uint32))
+
+    return InternalMap(frames, floor, bounds, False, am.depth_of,
+                       np.asarray(xyz[:, 2], np.float64) if len(xyz) else None, am.image_path,
+                       cloud)
 
 
 def api_error(exc: OhMySlamError) -> ApiError:
@@ -209,8 +257,10 @@ class MapperBackend:
                        {"stage": "mapper", "exit_code": code, "log": _tail(log)})
 
     def read(self, mapper_dir: Path) -> InternalMap:
+        if is_anchored(mapper_dir):
+            return read_anchored(mapper_dir)
         from oh_my_slam.core.ply import read_ply
-        from oh_my_slam.mapping.store import CLOUD_PLY, MapReader
+        from oh_my_slam.mapping.store import CLOUD_OBJECTS, CLOUD_PLY, OBJECTS_JSON, MapReader
 
         reader = MapReader(mapper_dir)
         frames = [InternalFrame(f.name, f.source, f.T_map_cam.matrix(), float(f.K.fx),
@@ -235,9 +285,38 @@ class MapperBackend:
                 return None
             return np.where(reader.valid(fr), d, 0.0).astype(np.float32)
 
+        def image(name: str) -> Path | None:
+            fr = by_name.get(name)
+            return None if fr is None else reader.image_path(fr)
+
+        def cloud() -> Cloud | None:
+            if not reader.exists(CLOUD_PLY):
+                return None
+            pc = read_ply(reader.path(CLOUD_PLY))
+            n = len(pc.xyz)
+            rgb = np.zeros((n, 3), np.uint8) if pc.rgb is None else np.asarray(pc.rgb, np.uint8)
+            ids = np.zeros(n, np.uint32)
+            if reader.exists(CLOUD_OBJECTS):
+                lab = np.load(reader.path(CLOUD_OBJECTS))
+                if len(lab) == n:
+                    ids = np.where(lab > 0, lab, 0).astype(np.uint32)
+            return Cloud(np.asarray(pc.xyz, np.float32), rgb, ids)
+
+        def objects() -> list[dict[str, Any]]:
+            if not reader.exists(OBJECTS_JSON):
+                return []
+            out = []
+            for o in reader.read_json(OBJECTS_JSON).get("objects", []):
+                obb = o.get("obb") or {}
+                if "center" in obb:
+                    out.append({"id": o.get("id"), "label": str(o.get("label", "")),
+                                "center": obb["center"], "R": obb.get("R"),
+                                "size": obb.get("size")})
+            return out
+
         floor = reader.meta.get("floor_z")
         return InternalMap(frames, None if floor is None else float(floor), bounds, rebuilt, depth,
-                           points_z)
+                           points_z, image, cloud, objects)
 
     def terminate(self) -> None:
         with self._lock:

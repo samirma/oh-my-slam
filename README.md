@@ -34,8 +34,9 @@ Model weights are downloaded on the first start of the inference server:
 The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
-status), **O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing they need. Maps started with pose priors take the
-*prior-first registration* (below); camera-only maps keep the mapper.
+status), **O5** (locate with uncertainty), **O6** (navigation grid, points near a place),
+**O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing
+they need. New maps take the *prior-first registration* (below).
 
 ```sh
 ./server.sh                                    # 0.0.0.0:9091, data ~/oh-my-slam-data/
@@ -52,12 +53,15 @@ status), **O9** (quality report and `accept_if` gate) and **O10** (dry run), wit
   `--keep-versions` is accepted; retention comes with O2 (every version is kept until then).
 * **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
   folder: `maps/<name>/` (`map.json`: cameras, mask digests, latest version; `masks/`;
-  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version),
+  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version;
+  `derived/`, what the grid, points and locate read per version (below); `pose.json`, the
+  recorded pose),
   `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
 * **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
-  `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*). The other endpoints of api.md
-  come with their groups (O2, O3, O5-O8).
+  `GET /api/maps/{name}/grid` and `/points`, `POST /api/maps/{name}/locate`,
+  `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*).
+  The other endpoints of api.md come with their groups (O2, O3, O7, O8).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
@@ -177,172 +181,9 @@ length, or the multi-view refinement's median match residual) over `√n` observ
 `σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
 for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
 
-### Prior-first registration (anchored maps)
-
-Every new map is **anchored** (`versions/<n>.json → engine: "anchored"`) and every later update
-of it runs `service.prior_first` → `mapping.anchored` instead of the mapper
-(`Updater(prior_first=False)` keeps every map on the mapper; the tests of the mapper path use
-it; maps created by the mapper stay on it). Design choices, each measured on the synthetic room
-of `tests/synth/room.py`, on the robot-guide humanoid's simulated frames of a recorded map and
-on the reference captures (numbers in *Prior-first measurements*):
-
-* **Frame and origin.** The first frame with a prior (request order) is placed at its prior and
-  defines the map frame (the priors' frame). Without any prior (camera-only robots), the first
-  frame is the origin: at its optical centre, +z up along the gravity the monocular model sees in
-  it, +x its viewing direction on the horizontal plane (map.md §1). The mapper folder of the
-  version is the engine's folder (`state.json`, `kf/<id>.npz`, `cloud.npz`), its frame the map
-  frame: the version's `sim3` is the identity and stored poses never move (no re-gauging, no
-  re-pose: `gauge_shift` is 0 and `previous_residuals` are 0 by construction).
-* **Place first.** Each new frame gets a predicted pose from its prior: a metric prior as sent
-  (after the metric priors' own scale bias, when one is measured: *Scale*); a drifting prior
-  through the odometry's latest correction (`Drift`: the last frame the images confirmed, its
-  map pose and its prior, and the odometry's scale fitted on confirmed pairs ≥ 0.2 m apart),
-  with sigmas grown by 10 % of the travel, 5 % of the turn and 2°/m since that frame. Sigmas are
-  floored at 1 cm / 0.1°; a prior without sigmas counts 5 cm / 2°.
-* **Matching.** Candidates: the 5 stored keyframes nearest the predicted pose (score =
-  distance / 0.5 m + axis angle / 30°, within 5 m and 100°); without a prior, the 5 most similar
-  by retrieval descriptor, else the 8 most recent. SIFT (4000, contrast 0.01: the simulated
-  robot frames give a few hundred features at OpenCV's default) with RootSIFT, matched by the
-  ratio test (0.8) and, with a prior, also **guided by it**: each keyframe keypoint (lifted by
-  its depth, or as a direction without one) is projected into the new frame by the predicted
-  pose and matched among the new keypoints within 3 sigmas of the prior in pixels (6–80 px) with
-  a ratio test of 0.9 among those.
-* **Refinement against the map** (`refine_pose`, stored poses fixed). A first pose comes from PnP
-  (AP3P RANSAC, 6 px at 640 px width, ≥ 15 inliers) on the lifted points, else from a
-  rotation-only fit (RANSAC) at the prior's centre when that is within 0.2 m or a quarter of the
-  scene depth of a keyframe (without a prior: at the best-matched keyframe's centre: a camera
-  turning in place). Then a robust Gauss-Newton (Huber at 2 sigmas) over the rotation, the centre
-  and **one depth scale per reference keyframe**: a lifted point is reprojected after its
-  reference's scale, with its own depth noise (2 %) times the parallax its reference's distance
-  gives; a match without depth is reprojected as a direction, its noise grown by the full
-  parallax (exact for a turn in place, harmless for a step); each reference's scale is held at 1
-  by its sigma (3 % for a depth image, the monocular scale's sigma, or 30 % while nothing has
-  measured it). A wrong depth scale therefore moves the centre only along the reference's
-  baseline and only as far as the other factors allow; a turn in place is fixed by its rotation.
-  The image-only solve judges the frame (below); the final pose is the same solve with the pose
-  prior as a factor (its sigmas): a metric prior with 2 cm / 1° bounds the pose, the images
-  refine it within that, and `prior_residual_m/deg` reports the refined pose against the prior
-  as sent (a drifting prior: against its corrected prediction). The design's local bundle
-  adjustment of the new frames is this per-frame solve: frames are placed in request order and
-  each placed frame is a fixed reference for the next ones of the same job.
-* **Unconfirmed frames.** No image pose, or an image pose that is not determined within
-  2° and (unless rotation-only) 10 cm or twice the prior's position sigma, or one beyond 3 combined sigmas of the prediction with fewer than 40 inliers or
-  30 % inliers: `provisional` at the predicted pose with the prior's sigmas (`reason`:
-  `few_features` below 150 features, else `no_overlap`), `pose_state: provisional`. Beyond 3
-  sigmas with ≥ 40 inliers and ≥ 30 %: `rejected prior_conflict`. Without a prior and no image
-  pose: `rejected` (`no_overlap` / `few_features`). Provisional frames at metric priors are
-  references for later frames; at drifting priors they are not.
-* **Scale.** A keyframe's depth is its depth PNG (metric) or the monocular depth (640 px grid)
-  times the map's depth scale `k`, then brought onto the map by its own factor: the median
-  ratio of the depth the lifted points it was registered on have in its camera to its own depth
-  there (≥ 30 points, within 0.5–2; the monocular model's metres vary from frame to frame, and
-  without this a chain of monocular keyframes drifts in scale). `k` comes first from camera
-  heights (frame or camera `height_above_floor_m` over the lowest dense layer of the frame's
-  monocular points below the camera, rotated by its pose: a scale the images measure, whatever
-  the priors say), else from metric priors once their centres span 0.3 m and 3 baselines ≥ 0.1 m
-  exist (least squares of the prior baselines on the image-only baselines between the same two
-  frames, in raw monocular units), else from drifting priors the same way (odometry baselines;
-  σ at least 10 %, reported as `priors`), else 1. Each update refines `k`; positions never
-  move, stored monocular keyframes use `k / k_used` when matched.
-* **The priors' own scale bias.** Robot odometry over-counts (5–10 % on the replays) whether it
-  is sent as `metric` or `drifting`. Drifting priors are only predictions from the last
-  confirmed frame, scaled by the fitted odometry scale, so their bias never reaches the map.
-  For metric priors, the baselines between pairs of frames are compared with the image-only
-  baselines whose scale the priors did not set (depth images, or monocular depth scaled by
-  camera heights): once the priors span 0.5 m with 5 baselines, their least-squares ratio is the
-  priors' bias, applied to the later predictions about the origin's prior when it differs from 1
-  by more than twice its own and the image scale's uncertainty (3 % for depth images). A metric
-  prior without measured bias is taken as metric. `scale_source`: `priors` once unbiased metric
-  priors span 0.3 m (σ = √2 · median prior σ / span), else `depth` with any depth PNG (σ 1 %),
-  else the source of `k` (`camera_height`, σ from the heights' spread and sigmas; `priors` from
-  odometry; `monocular`, 10 %). `scale_ratio_vs_prev`: `k` over the previous `k` when the map
-  has monocular keyframes (their depth follows `k`), else 1 (positions and depth images never
-  move).
-* **Incremental fusion.** Only the new keyframes are lifted (every 2nd pixel, ≤ 6 m, off depth
-  edges and ignore masks) into a voxel cloud (2 cm, running mean of position and colour per
-  voxel): nothing stored is fused again. The floor of the version is the cloud's lowest dense
-  layer below the cameras. Objects are not computed on this path (`objects: 0`; O8 is not
-  served).
-* **Cheap rejection.** The per-frame checks run first; a job whose frames they all reject asks
-  no inference and commits nothing (`hard_limit`).
-* **Inference.** Frames without a depth PNG get monocular depth (and the retrieval descriptor)
-  from the inference server, two in flight, each on its own client (the shared client is not
-  for several threads); a new map's origin frame always asks it, with gravity
-  (`prior_gravity_deg`, or the camera-only map's up).
-* **Quality.** `rejected_share` counts rejected over sent; `low_confidence_share` counts the
-  kept frames that are provisional or whose `sigma_pos_m` exceeds 0.10 m; `prior_residuals`
-  are over every metric prior of the map; `rebuilt` is false.
-* **The 202 answer** is the job as queued, even when the worker has already started it.
-
-### Prior-first measurements
-
-Measured 2026-11-10 on the serving machine (M3 Pro), the inference server shared with the live
-services, every run under the machine lock. Truth is exact only on the synthetic room
-(`tests/synth/room.py`: ray-cast, 640×480 fx 270 like the humanoid and the base, 640×360 fx 337
-like the arm; a wheeled base's camera 0.1 m ahead of its turning centre at 0.5 m, pitched
-−10°); monocular depth is the real model's on those renders (its metres are 0.45–0.67 of the
-truth there: a harsh case). Metric priors: truth + 1 cm / 0.5° noise, sent with σ 2 cm / 1°.
-Times are a job's wall time over its frames, checks included.
-
-| Run (synthetic room unless named) | Result |
-| --- | --- |
-| Cold start: 1 frame, then an in-place sweep of 11 frames 30° apart, metric priors + depth | 11/11 registered; ≤ 1.4 cm, ≤ 0.7°; 0.09 s/frame; `depth` |
-| Same, no depth (monocular) | 10–11/11 registered (one run: 1 `prior_conflict`); ≤ 5.3 cm, ≤ 1.1°; 0.66–0.67 s/frame |
-| Same at 640×360, depth / no depth | 11/11, 0.09 s/frame / 10/11, 0.71 s/frame |
-| Drifting priors, base walk of 14 frames (3.3 m) with an 8 % odometry over-count, depth | 13/13 registered; ≤ 1.8 cm, ≤ 0.3°; map positions to truth: scale 1.0005; odometry scale fitted 0.925 (truth 0.926); 0.10 s/frame |
-| Same, no depth, camera height 0.5 m | 13/13; median 1.7 cm, max 5.3 cm; positions scale 1.016 (1.6 %); depth scale 3 % from truth; `camera_height` |
-| Same, no depth, no height | 13/13; positions scale 1.067; depth scale 4.8 % from truth; `priors` (odometry, σ 10 %) |
-| Camera height only (in-place sweep, no depth, metric priors spanning < 0.3 m) | 11/11; depth scale within 1.5 % of truth (0.7 % in another run); `camera_height` σ 1.4–6 % |
-| Largest in-place step, depth + metric prior (hfov 100°) | 75° (11/11 in every run); 90° and 105°: 9–10/11, the rest provisional |
-| Largest in-place step, no depth | 60° (11/11); 75°: 8/11 (2 `prior_conflict`, 1 provisional) |
-| `examples/ainex-captures` (truth: the legacy evaluation map's poses, metres by a 0.34 m camera height), cold sweep 30° | depth: 9/11 registered, 1 provisional, 1 rejected; no depth: 10/11 + 1 provisional, ≤ 4.7 cm / 1.6° from that truth; 0.72 s/frame at 640×480, 0.93 at 640×360 |
-| `examples/office_sequence` walk at 640×480, drifting priors + 8 % | 3–2/12 registered, 7 provisional, 2–3 `prior_conflict`: the legacy map's poses disagree with its own aligned depths by 2–9°, so this truth cannot judge it |
-
-Per frame, without depth, the time is the monocular inference (~0.6 s at 640×480, one GPU
-lane); registration (SIFT, matching, PnP) takes 0.03 s and fusion 0.01 s. With depth images a
-frame costs ~0.09 s. A job whose frames the checks all reject costs the checks only (< 1 s for
-two frames in the tests).
-
-
-Second round (after the conductor's replay of 6cf9485: on the simulated base frames nearly every
-frame stayed provisional at its prior, `prior_residual` 0): guided matching, the joint
-refinement with per-reference depth scales and the prior as a factor, camera heights before
-priors for the depth scale, the metric priors' bias, camera-only maps on this path. Measured on
-the humanoid's simulated frames of a recorded robot-guide map (`task_map`, 52 frames: scans,
-turns of 8–15° per frame, 1.3 m legs; truth = that map's legacy poses in metres by its 0.34 m
-camera height, itself approximate), monocular depth only, 1-frame start then the rest in one job
-(every 2nd frame: 26 frames, every 4th: 13):
-
-| Run | Result |
-| --- | --- |
-| metric priors (1 cm / 0.5° noise, σ 2 cm / 1°), every 2nd frame | 17 registered, 3 provisional, 6 `prior_conflict`; median 3.0 cm / 1.3°; prior residual median 3.9 cm (no longer 0); positions to truth scale 1.018; 0.67 s/frame |
-| same, every 4th frame | 8 registered, 3 provisional, 2 `prior_conflict`; median 2.4 cm / 0.8°; scale 1.009 |
-| metric + camera heights | 17 registered; positions scale 1.091 (the depth scale now follows the heights) |
-| drifting priors + camera heights | 23/26 registered, 1 `prior_conflict`; positions scale 1.093; `camera_height` σ 3 % |
-| no priors, camera heights (the walking humanoid's none mode) | 25/26 registered (1 `too_close`); positions scale 1.094 (every 4th frame: 12/13, 1.155); median 22 cm |
-| synthetic room, 30° / 90° sweeps with depth, exact priors | 11/11; ≤ 0.9 cm / 0.17° and ≤ 1.0 cm / 0.25°; 0.26 s/frame registration |
-| synthetic room, metric priors 10 % over-counted, depth images | 11/11 registered within 2 cm; bias measured 0.91 (truth 1/1.1), predictions corrected; `scale_source: depth` |
-| synthetic room, camera-only turn in place (no priors, heights) | 6/6 registered, rotation within 1°, depth scale within 5 % (unit test) |
-
-The camera-height scale on these frames is 9 % from that truth in every mode (the monocular
-floor of a camera 0.34 m above it, or the truth's own scale); on the synthetic room it is within
-1–3 %.
-
-### Dry run (O10)
-
-`POST /api/maps/{name}/updates?dry_run=1` (`service.dry_run`) validates the request as an update
-does, then answers synchronously with a `DryRun` and writes nothing (neither the request's
-cameras nor any version, job or mapper file): per frame its checks (`features`, `plain`,
-`too_close` — the monocular median depth of a suspicious frame is measured), its predicted link
-to the map (`map_inliers`: on an anchored map, the inliers of its prior-first placement against
-the current version, computed on a read-only copy; null on a new map or a mapper map), its
-links to the previous and next frames of the request (`neighbour_inliers`: fundamental-matrix
-RANSAC inliers, 3 px, of their ratio-test SIFT matches), and `predicted_status` /
-`predicted_reason` (a provisional placement predicts `registered`; on a new map a frame without
-prior and with fewer than 15 inliers to its neighbours predicts `no_overlap`). Its `quality` is
-the job's report over the predicted placements with the `accept_if` gate; `predicted_s` is the
-kept frames times the measured registration and fusion per frame. Same validation errors as an
-update; a dry run asks the inference server only for suspicious frames.
+  `GET /api/maps/{name}/grid` and `/points`, `POST /api/maps/{name}/locate`,
+  `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*).
+  The other endpoints of api.md come with their groups (O2, O3, O7, O8).
 
 ### Live check
 
@@ -364,8 +205,9 @@ against the 1-3 cm the priors measured.
 ### Expected durations
 
 `/api/health → timings` defaults before any measurement (`service.timings.DEFAULTS`, seconds):
-registration 3.7 and fusion 0.54 per frame (above); locate 2.0 and frame analysis 1.5 per frame,
-grid read 0.5 and objects read 0.1 are placeholders until their groups measure them. Each kind
+registration 3.7 and fusion 0.54 per frame (above); locate 2.0 per frame and grid read 0.5 (the
+targets: measured values replace them as soon as the service has run them); frame analysis 1.5
+and objects read 0.1 are placeholders until their groups measure them. Each kind
 keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
 `eta_s` = the remaining predicted time of the jobs ahead + `frames × (registration + fusion)`.
 
