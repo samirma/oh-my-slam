@@ -52,6 +52,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
+from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
 
@@ -106,6 +107,7 @@ MIN_SCALE_SIGMA_REL = 0.002
 DEFAULT_HEIGHT_SIGMA_M = 0.02
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
+BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
 HUBER_PX = 2.0
 MIN_PIXEL_SIGMA = 0.5
 VOXEL_M = 0.02
@@ -178,8 +180,7 @@ def rays(K: Intrinsics, uv: NDArray[Any]) -> Array:
     """Camera rays with unit z of pixels ``uv`` (N x 2, pixel centres at integer + 0.5 as
     OpenCV's keypoints are at integers: OpenCV's convention)."""
     uv = np.asarray(uv, np.float64).reshape(-1, 2)
-    return np.column_stack([(uv[:, 0] - K.cx) / K.fx, (uv[:, 1] - K.cy) / K.fy,
-                            np.ones(len(uv))])
+    return unproject_pixels(uv[:, 0], uv[:, 1], np.ones(len(uv)), K.K())
 
 
 def unit(v: Array) -> Array:
@@ -257,8 +258,9 @@ def sample_depth(depth: NDArray[np.float32], K_grid: Intrinsics, K: Intrinsics,
     """The depth grid's value at image pixels ``uv`` (nearest; NaN off the grid, invalid or on
     a depth edge)."""
     ok = edge_free(depth)
-    u = np.round((uv[:, 0] - K.cx) / K.fx * K_grid.fx + K_grid.cx).astype(np.intp)
-    v = np.round((uv[:, 1] - K.cy) / K.fy * K_grid.fy + K_grid.cy).astype(np.intp)
+    g, _ = project(rays(K, uv), K_grid.K())
+    u = np.round(g[:, 0]).astype(np.intp)
+    v = np.round(g[:, 1]).astype(np.intp)
     h, w = depth.shape
     inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
     out = np.full(len(uv), np.nan, np.float32)
@@ -289,15 +291,18 @@ class Solve:
 
     def sigmas(self) -> tuple[float, float]:
         """One-sigma position (m) and rotation (deg) from the covariance (largest axis)."""
-        sp = math.sqrt(max(float(np.linalg.eigvalsh(self.cov[3:, 3:]).max()), 0.0))
-        sr = math.degrees(math.sqrt(max(float(np.linalg.eigvalsh(self.cov[:3, :3]).max()), 0.0)))
+        # the largest singular value of a covariance block is its largest variance
+        sp = math.sqrt(float(np.linalg.svd(self.cov[3:, 3:], compute_uv=False)[0]))
+        sr = math.degrees(math.sqrt(float(np.linalg.svd(self.cov[:3, :3], compute_uv=False)[0])))
         return sp, sr
 
 
 def _project(R: Array, c: Array, X: Array, K: Intrinsics, directions: bool) -> Array:
-    p = (X - (0.0 if directions else c)) @ R  # camera frame: R^T (X - c), row-wise
-    z = np.where(np.abs(p[:, 2]) < 1e-9, 1e-9, p[:, 2])
-    return np.column_stack([K.fx * p[:, 0] / z + K.cx, K.fy * p[:, 1] / z + K.cy])
+    """Pixels of world points (or directions) in the camera ``R``, ``c``; a point behind the
+    camera lands far off the image."""
+    uv, _ = project((X - (0.0 if directions else c)) @ R, K.K())  # camera frame: R^T (X - c)
+    out: Array = np.nan_to_num(uv, nan=BEHIND_PX)
+    return out
 
 
 def refine(R0: Array, c0: Array, X: Array, uv: Array, K: Intrinsics, *, directions: bool = False,
@@ -461,7 +466,7 @@ class Cloud:
 
     @staticmethod
     def _keys(p: NDArray[Any]) -> NDArray[np.int64]:
-        q = np.floor(p / VOXEL_M).astype(np.int64) + (1 << 20)
+        q = voxel_keys(p, VOXEL_M) + (1 << 20)
         out: NDArray[np.int64] = (q[:, 0] << 42) | (q[:, 1] << 21) | q[:, 2]
         return out
 
