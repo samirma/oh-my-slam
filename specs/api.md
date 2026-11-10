@@ -77,7 +77,8 @@ error code `invalid_request` (§9).
   * `name`, unique in the request;
   * `image`, a part name;
   * `camera_id`;
-  * an optional `prior` [`Prior`];
+  * an optional `prior` [`Prior`]. A prior without sigmas takes fixed defaults: `metric`
+    0.05 m / 2°, `drifting` 0.20 m / 5°. Clients should always send sigmas;
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name;
   * an optional `ignore_mask`, a part name, combined with the camera's mask.
@@ -121,8 +122,9 @@ error code `invalid_request` (§9).
   * `rejected` with `prior_conflict` only when the images confirm a pose farther than 3 prior
     sigmas from the prior, and no supported hypothesis lies within 3 prior sigmas of it.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
-  * A view the map already has is `registered`; it is rejected as `too_close` only when it adds
-    nothing new.
+  * A view the map already has is `registered`; it is rejected as `duplicate` only when it adds
+    nothing new. `too_close` is only the camera-to-scene distance limit, with `min_distance_m`
+    and `scene_distance_m`.
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
     alone.
 
@@ -173,16 +175,20 @@ The versions read, revert and `--keep-versions` are O2.
   | `inlier_ratio` | The share of inliers. |
   | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
   | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
-  | `consistent_with_prior` | Bool, or null without a prior. |
+  | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
   support at least 0.25. When none lies within 3 × the prior's sigmas, the frame is `rejected`
-  with `prior_conflict`, not located with `consistent_with_prior: false`.
+  with `prior_conflict`, not located with `consistent_with_prior: false`; so a located frame
+  with a prior always has `consistent_with_prior: true`. A prior without sigmas takes the fixed
+  defaults of §3 (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send
+  sigmas.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
     it.
-  * Its support is its inlier count over the reported pose's inlier count. A rival is supported
-    when its support is at least 0.25, whatever else its inliers explain.
+  * A hypothesis's support is its inlier count over the best hypothesis's inlier count (at most
+    1). A rival is supported when its support is at least 0.25, whatever else its inliers
+    explain.
   * `pos_m` and `rot_deg` are the distance from the best-supported rival to the reported pose.
   * `rivals` lists every supported rival with its distance and support, strongest first;
     `ambiguity` repeats its first entry.

@@ -227,7 +227,8 @@
           "trust",
           "T_map_cam"
         ]
-      }
+      },
+      "description": "A prior without sigmas takes fixed defaults: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg. Clients should always send sigmas."
     },
     "FrameInput": {
       "type": "object",
@@ -285,6 +286,11 @@
           "type": "number",
           "minimum": 0,
           "description": "Gates quality.max_displacement_m, so one bad frame fails the update."
+        },
+        "max_displacement_deg": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Gates quality.max_displacement_deg, including frames unconstrained in translation."
         },
         "max_rejected_share": {
           "type": "number",
@@ -645,6 +651,7 @@
               "max_residual_m",
               "max_gauge_shift_m",
               "max_displacement_m",
+              "max_displacement_deg",
               "max_rejected_share",
               "hard_limit",
               "prior_frames_rejected"
@@ -1646,6 +1653,7 @@
         "shape",
         "z_band_m",
         "floor_z_m",
+        "floor_sigma_m",
         "height_cap_m",
         "layers",
         "regions",
@@ -1691,6 +1699,11 @@
         "floor_z_m": {
           "type": "number",
           "description": "Absolute map-frame z of the floor estimate."
+        },
+        "floor_sigma_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "One-sigma height uncertainty of the floor estimate; the floor band is max(0.06, 3 x floor_sigma_m) above floor_z_m."
         },
         "height_cap_m": {
           "type": "number",
@@ -1895,7 +1908,7 @@
               "type": "null"
             }
           ],
-          "description": "prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas."
+          "description": "prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
         },
         "T_map_cam": {
           "oneOf": [
@@ -1949,7 +1962,7 @@
               "type": "null"
             }
           ],
-          "description": "The strongest supported rival (rivals[0]), or null: non-null whenever a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has support >= 0.25 (its inlier count over the reported pose's), whatever else its inliers explain."
+          "description": "The strongest supported rival (rivals[0]), or null: non-null whenever a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has support >= 0.25 (its inlier count over the best hypothesis's, <= 1), whatever else its inliers explain."
         },
         "rivals": {
           "type": "array",
@@ -1972,7 +1985,8 @@
               "support": {
                 "type": "number",
                 "minimum": 0.25,
-                "description": "Rival's inlier count over the reported pose's."
+                "maximum": 1,
+                "description": "Rival's inlier count over the best hypothesis's inlier count."
               }
             }
           },
@@ -1983,7 +1997,7 @@
             "boolean",
             "null"
           ],
-          "description": "Null without a prior. A frame with a prior that no supported hypothesis matches within 3 prior sigmas is rejected with prior_conflict."
+          "description": "Null without a prior; always true for a located frame with a prior, since a frame that no supported hypothesis matches within 3 prior sigmas is rejected with prior_conflict."
         },
         "nearest_view": {
           "oneOf": [

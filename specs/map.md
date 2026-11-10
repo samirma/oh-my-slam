@@ -50,7 +50,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
   images give between overlapping frames. Where two frames overlap by at least 50 % and their
   image relative rotation disagrees with their priors' relative rotation by more than 3 of the
-  priors' rotation sigmas, the rotation is corrected from the images. `quality` always reports
+  priors' rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
+  the images. `quality` always reports
   `prior_disagreement_deg`: the largest such disagreement over the update's frames, 0 when
   none.
 * **Scale.** The scale comes from the first available of:
@@ -133,11 +134,13 @@ becomes a job with a `job_id`. A job goes through these states:
   * `rebuilt`: whether stored poses were re-estimated;
   * `prior_gravity_deg`, on a map's first update.
 * **The gate.** The request option `accept_if {max_residual_m, max_gauge_shift_m,
-  max_displacement_m, max_rejected_share}` is evaluated on the registration phase's report,
-  before anything is committed. `max_residual_m` gates the anchor residuals, so a stored
-  keyframe that moved fails the update; `max_gauge_shift_m` gates the stored keyframes' median
-  movement; `max_displacement_m` gates `quality.max_displacement_m`, so a single new frame that
-  disagrees with its images fails the update.
+  max_displacement_m, max_displacement_deg, max_rejected_share}` is evaluated on the
+  registration phase's report, before anything is committed. `max_residual_m` gates the anchor
+  residuals, so a stored keyframe that moved fails the update; `max_gauge_shift_m` gates the
+  stored keyframes' median movement; `max_displacement_m` and `max_displacement_deg` gate
+  `quality.max_displacement_m` and `quality.max_displacement_deg`, so a single new frame that
+  disagrees with its images fails the update, a frame unconstrained in translation through its
+  rotation.
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
   * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
@@ -172,8 +175,8 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
   `leaves[].object_id`.
 * **Floor height.** The floor height used for boxes comes from the grid's floor estimate, so
   boxes and grid agree.
-* **Floor band.** A surface within max(0.06 m, 3 × the floor estimate's height sigma) of
-  `floor_z_m` is floor (§6): it never makes a floor-standing object. This minimum height applies
+* **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m` is floor
+  (§6): it never makes a floor-standing object. This minimum height applies
   only above the floor estimate: an object resting on any other support surface keeps its
   detection whatever its height (a 16 mm plate or an egg on a worktop is still an object). A
   surface of `surfaces[]` is never itself raised to an object by this rule.
@@ -211,18 +214,17 @@ seen there.
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.
 
-  **Floor band.** A surface within max(0.06 m, 3 × the floor estimate's height sigma) of
-  `floor_z_m` is floor: it never makes an occupied cell or defines a passage, whatever `z_min`
-  is.
+  **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m` is floor:
+  it never makes an occupied cell or defines a passage, whatever `z_min` is.
 * Optional `footprint_radius_m`: the robot's radius.
 * `height_cap_m`: the ceiling of the `height_m` layer, relative to `floor_z_m`. Default 2.0 m,
   or the band's `z_max` when the request gives one. Echoed in the header.
 
 **Header.**
 * `map_version`, `origin_m` (the corner of cell [0, 0]), `cell_m`, `shape [rows (y), cols (x)]`,
-  `z_band_m`, `floor_z_m` and `height_cap_m`. `z_band_m` and `height_cap_m` are relative to
-  `floor_z_m`, as the request's `z_min` and `z_max` are. `floor_z_m` is the floor's absolute
-  map-frame z;
+  `z_band_m`, `floor_z_m`, `floor_sigma_m` and `height_cap_m`. `z_band_m` and `height_cap_m`
+  are relative to `floor_z_m`, as the request's `z_min` and `z_max` are. `floor_z_m` is the
+  floor's absolute map-frame z, and `floor_sigma_m` the one-sigma uncertainty of its height;
 * `scale_source` and `scale_sigma_rel`.
 
 **Layers.** Each layer is a little-endian array, base64, row-major:
