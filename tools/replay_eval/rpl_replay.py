@@ -37,6 +37,10 @@ class Options:
     sigma_pos_m: float = 0.02
     sigma_rot_deg: float = 1.0
     height_sigma_m: float = 0.02
+    # the `metric` replay's prior trust per robot kind (default metric), and the share of the
+    # distance travelled added to sigma_pos_m (odometry over-counts)
+    prior_trust: dict[str, str] = field(default_factory=lambda: {"base": "drifting"})
+    travel_share: dict[str, float] = field(default_factory=lambda: {"base": 0.10})
 
 
 @dataclass
@@ -139,8 +143,10 @@ class Replayer:
     def frame_entry(self, f: Frame, part: str) -> dict[str, Any]:
         entry: dict[str, Any] = {"name": f.name, "image": part, "camera_id": f.camera_id}
         if self.mode == "metric":
-            entry["prior"] = {"trust": "metric", "T_map_cam": self.prior_pose(f).tolist(),
-                              "sigma_pos_m": self.opt.sigma_pos_m,
+            kind = self.ep.kind
+            sigma = max(self.opt.sigma_pos_m, self.opt.travel_share.get(kind, 0.0) * f.travel_m)
+            entry["prior"] = {"trust": self.opt.prior_trust.get(kind, "metric"),
+                              "T_map_cam": self.prior_pose(f).tolist(), "sigma_pos_m": sigma,
                               "sigma_rot_deg": self.opt.sigma_rot_deg}
         else:
             entry["prior"] = {"trust": "none"}

@@ -57,8 +57,16 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
         assert fake.accept_ifs and all(a == {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05,
                                              "max_rejected_share": 0.5}
                                        for a in fake.accept_ifs)
+        priors = [p for p in fake.priors if p["trust"] != "none"]
+        # the base's odometry priors are drifting, sigma 10 % of the distance travelled
+        assert priors and {p["trust"] for p in priors} == {"drifting"}
+        sig = [p["sigma_pos_m"] for p in priors]
+        assert min(sig) == 0.02 and sig[1] == pytest.approx(0.1 * 0.4 * synth.ODOM_SCALE)
+        assert max(sig) > 0.5  # the whole r1 path, over-counted
     ov = res["overall"]
     assert ov["c6.other_updates_accepted"]["value"] == 1.0
+    assert ov["c1.prior_residual_m"]["status"] == "info"
+    assert ov["c1.prior_residual_m"]["value"] == pytest.approx(0.01)
     assert res["episodes"]["e041"]["passed"] is True
     assert res["health"]["start"]["capabilities"] == ALL_CAPS
     assert res["client"]["jsonschema"] is True
@@ -99,8 +107,10 @@ def test_capabilities_missing_and_gate(base_episode: tuple[Path, synth.Synth],
                       gate_reject={name(syn, "r1/chain1", 0)}, no_server_timing=True)
     with Fake(cfg) as fake:
         res = run(fake, root, tmp_path / "r.json", "--priors", "metric", "--keep",
-                  "--no-jsonschema", "--accept-if", "{}", "--passing", "e034")
+                  "--no-jsonschema", "--accept-if", "{}", "--passing", "e034",
+                  "--base-priors", "metric")
         assert any(m == "DELETE" for m, _ in fake.requests)
+        assert {p["trust"] for p in fake.priors} == {"metric"}
         assert fake.accept_ifs and all(a == {} for a in fake.accept_ifs)
     ov = res["overall"]
     assert ov["c6.warping_rejected"]["value"] == 1.0
@@ -213,7 +223,7 @@ def test_dump_layout(base_episode: tuple[Path, synth.Synth],
     dump = json.loads(capsys.readouterr().out)
     d = dump[0]
     assert d["load"]["robot"] == "rosmaster_x3_plus"
-    assert d["load"]["views_vs_truth_m"]["pos_m"] == pytest.approx(0.0, abs=1e-9)
+    assert d["load"]["odometry_scale"]["r1"] == pytest.approx(1 / synth.ODOM_SCALE)
     assert d["truth"]["robot"]["cams"] == ["camera_color_optical_frame", "usb_cam"]
     assert d["sets"][0]["exif_fx_fy"] == [synth.FX_EXIF, synth.FX_EXIF]
     assert d["requests_log"]["used"] is False

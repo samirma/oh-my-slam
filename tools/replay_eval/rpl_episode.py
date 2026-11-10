@@ -39,6 +39,7 @@ from rpl_geometry import (
     quat_to_R,
     rigid_fit,
     rot_z,
+    umeyama,
     yaw_of_R,
 )
 from rpl_images import ImageError, exif_focal_px, image_size
@@ -57,6 +58,7 @@ class Frame:
     width: int
     height: int
     odom: tuple[float, float, float] | None = None  # views "base": [x, y, yaw rad]
+    travel_m: float = 0.0  # odometry distance since the run's first frame
     intrinsics: dict[str, float] = field(default_factory=dict)
     camera_id: str = ""
     truth: Arr | None = None  # T_world_cam
@@ -119,6 +121,9 @@ class Track:
     def window(self, lo: float, hi: float) -> Any:
         return np.nonzero((self.t >= lo) & (self.t <= hi))[0]
 
+    def base_at(self, t: float) -> Arr:
+        return np.array([np.interp(t, self.t, self.base_pos[:, k]) for k in range(3)])
+
     def cam_at(self, t: float) -> Arr:
         return np.array([np.interp(t, self.t, self.cam[:, k]) for k in range(3)])
 
@@ -133,14 +138,15 @@ class Track:
         return self.cam[k].copy(), float(self.t[k])
 
     def match_odometry(self, T_ws: Arr, odom: tuple[float, float, float], lo: float, hi: float,
-                       yaw_weight_m: float) -> float:
-        """The time in [lo, hi] whose base pose, in the start frame, best matches ``odom``."""
+                       yaw_weight_m: float, yaw_ref: float | None = None) -> float:
+        """The time in [lo, hi] whose base pose, in the start frame, best matches ``odom``.
+        ``yaw_ref`` is the truth base yaw at odometry yaw 0 (default: the start pose's yaw)."""
         idx = self.window(lo, hi)
         if len(idx) == 0:
             return (lo + hi) / 2.0
         R0, t0 = T_ws[:3, :3], T_ws[:3, 3]
         rel = (self.base_pos[idx] - t0) @ R0  # R0^T (p - t0), row-wise
-        yaw0 = yaw_of_R(R0)
+        yaw0 = yaw_of_R(R0) if yaw_ref is None else yaw_ref
         best, best_t = math.inf, float(self.t[idx[0]])
         for k, i in enumerate(idx):
             dyaw = (yaw_of_R(self.base_R[i]) - yaw0 - odom[2] + math.pi) % (2 * math.pi) - math.pi
@@ -170,6 +176,7 @@ class Episode:
     start_poses: dict[str, Arr]
     warnings: list[str]
     passed: bool | None = None  # from meta.json or verdict.md; None when neither says
+    odom_scale: dict[str, float] = field(default_factory=dict)  # run -> truth / odometry
 
     def frames(self, event: Event) -> list[Frame]:
         fs = self.sets[event.set_key].frames
@@ -389,16 +396,59 @@ def set_windows(sets: dict[str, FrameSet]) -> dict[str, tuple[float, float]]:
     return out
 
 
+def frame_windows(ep: Episode, layout: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    """Frame name -> its matching window: +-frame_window_s around its own name time when its set
+    names each frame with its own time, else its set's window (``set_windows``)."""
+    sets = set_windows(ep.sets)
+    slack = float(layout["frame_window_s"])
+    out: dict[str, tuple[float, float]] = {}
+    for s in ep.sets.values():
+        own = len({f.name_time for f in s.frames}) == len(s.frames)
+        for f in s.frames:
+            if own and f.name_time is not None:
+                out[f.name] = (f.name_time - slack, f.name_time + slack)
+            elif s.key in sets:
+                out[f.name] = sets[s.key]
+    return out
+
+
+def fit_odometry(ep: Episode, frames: list[Frame],
+                 layout: dict[str, Any]) -> tuple[Arr, float, float] | None:
+    """The run's start pose (yaw and (x, y) at floor_z), the truth / odometry scale, and the truth
+    base yaw at odometry yaw 0 (the body's quaternion need not point along its heading), from a
+    2-D similarity fit of the views odometry to the truth base track at the frames' name times;
+    None when the frames span too little."""
+    timed = [(f.odom, f.name_time) for f in frames
+             if f.odom is not None and f.name_time is not None]
+    if len(timed) < 2:
+        return None
+    src = np.array([[o[0], o[1], 0.0] for o, _ in timed])
+    dst = np.array([[p[0], p[1], 0.0] for p in (ep.track.base_at(t) for _, t in timed)])
+    if np.linalg.norm(dst.max(axis=0) - dst.min(axis=0)) < layout["odometry_fit_min_spread_m"]:
+        return None
+    try:
+        sim, _ = umeyama(src, dst, min_ratio=math.inf)  # yaw-only: both frames are z-up
+    except ValueError:  # the odometry never moved
+        return None
+    z = 0.0 if ep.floor_z is None else ep.floor_z
+    d = [yaw_of_R(ep.track.base_R[ep.track.index(t)]) - o[2] for o, t in timed]
+    yaw_ref = math.atan2(sum(math.sin(a) for a in d), sum(math.cos(a) for a in d))
+    return make_T(sim.R, np.array([sim.t[0], sim.t[1], z])), sim.s, yaw_ref
+
+
 def _match_run(ep: Episode, frames: list[Frame], T_ws: Arr, windows: dict[str, tuple[float, float]],
-               layout: dict[str, Any]) -> list[tuple[Arr, float | None, str]]:
+               layout: dict[str, Any], scale: float = 1.0,
+               yaw_ref: float | None = None) -> list[tuple[Arr, float | None, str]]:
     out: list[tuple[Arr, float | None, str]] = []
     for f in frames:
         p_hat = (T_ws @ f.pose)[:3, 3]
-        win = windows.get(f"{f.run}/{f.set}")
+        win = windows.get(f.name)
         if f.stamp is not None:
             out.append((ep.track.cam_at(f.stamp), f.stamp, "stamp"))
         elif win is not None and f.odom is not None:
-            t = ep.track.match_odometry(T_ws, f.odom, *win, layout["odometry_yaw_weight_m"])
+            odom = (f.odom[0] * scale, f.odom[1] * scale, f.odom[2])
+            t = ep.track.match_odometry(T_ws, odom, *win, layout["odometry_yaw_weight_m"],
+                                        yaw_ref)
             out.append((ep.track.cam_at(t), t, "odometry"))
         elif win is not None:
             pos, t = ep.track.match(p_hat, *win)
@@ -413,18 +463,18 @@ def _best_shift(ep: Episode, frames: list[Frame], T_ws: Arr,
     """``T_ws`` translated by the shift that best lays the views positions on the truth camera
     samples of their sets' windows: each (frame, sample) pair proposes a shift, scored by the
     median distance of every frame to its nearest sample."""
-    timed = [f for f in frames if f"{f.run}/{f.set}" in windows]
+    timed = [f for f in frames if f.name in windows]
 
     def spread(items: list[Frame], n: int) -> list[Frame]:  # at most n, evenly spaced
         return [items[int(i)] for i in np.unique(np.linspace(0, len(items) - 1, n).round())]
 
-    pairs = [((T_ws @ f.pose)[:3, 3], ep.track.cam[ep.track.window(*windows[f"{f.run}/{f.set}"])])
+    pairs = [((T_ws @ f.pose)[:3, 3], ep.track.cam[ep.track.window(*windows[f.name])])
              for f in spread(timed, 30)]
     pairs = [(x, s) for x, s in pairs if len(s)]
     best, best_shift = math.inf, np.zeros(3)
     for f in spread(timed, 5):
         p = (T_ws @ f.pose)[:3, 3]
-        samples = ep.track.cam[ep.track.window(*windows[f"{f.run}/{f.set}"])]
+        samples = ep.track.cam[ep.track.window(*windows[f.name])]
         for q in samples:
             shift = q - p
             score = float(np.median([np.min(np.linalg.norm(s - (x + shift), axis=1))
@@ -436,16 +486,29 @@ def _best_shift(ep: Episode, frames: list[Frame], T_ws: Arr,
 
 def assign_truth(ep: Episode, layout: dict[str, Any]) -> None:
     """Truth pose and height above the floor of every frame (module docstring)."""
-    windows = set_windows(ep.sets)
+    windows = frame_windows(ep, layout)
     link = layout["rotation_body"].get(ep.kind)
     for run in sorted({s.run for s in ep.sets.values()}):
         frames = [f for s in ep.sets.values() if s.run == run for f in s.frames]
         times = [f.time for f in frames if f.time is not None]
         if not times:
             ep.warnings.append(f"run {run}: no frame time; its start pose is the first truth line")
-        T_ws = start_pose(ep.track, min(times) if times else None, ep.kind, layout, ep.floor_z)
-        matched = _match_run(ep, frames, T_ws, windows, layout)
-        if ep.kind in layout["refine_start"] and any(m[2] == "views position" for m in matched):
+        t0 = min(times) if times else None
+        T_ws, scale, src0 = start_pose(ep.track, t0, ep.kind, layout, ep.floor_z), 1.0, "quat"
+        yaw_ref: float | None = None
+        body0 = layout["start_link"].get(ep.kind)
+        first = ep.track.bodies[0 if t0 is None else ep.track.index(t0)]
+        fitted = fit_odometry(ep, frames, layout) if ep.kind in layout["odometry_fit"] else None
+        if body0 is not None and body0 in first:
+            T_ws = make_T(np.eye(3), np.asarray(need(first[body0], layout["truth"]["pos"],
+                                                     f"bodies.{body0}"), dtype=float))
+            src0 = f"bodies.{body0}"
+        elif fitted is not None:
+            (T_ws, scale, yaw_ref), src0 = fitted, "odometry fit"
+        ep.odom_scale[run] = scale
+        matched = _match_run(ep, frames, T_ws, windows, layout, scale, yaw_ref)
+        if src0 == "quat" and ep.kind in layout["refine_start"] and any(
+                m[2] == "views position" for m in matched):
             T_ws = _best_shift(ep, frames, T_ws, windows)
             matched = _match_run(ep, frames, T_ws, windows, layout)
             for _ in range(int(layout["refine_iterations"])):  # ICP until the pose settles
@@ -459,6 +522,13 @@ def assign_truth(ep: Episode, layout: dict[str, Any]) -> None:
                 if settled:
                     break
         ep.start_poses[run] = T_ws
+        travel, last = 0.0, None
+        for f in sorted(frames, key=lambda f: (f.time if f.time is not None else math.inf, f.file)):
+            if f.odom is not None:
+                if last is not None:
+                    travel += math.hypot(f.odom[0] - last[0], f.odom[1] - last[1])
+                last = f.odom
+            f.travel_m = travel
         for f, (pos, t, src) in zip(frames, matched, strict=True):
             R = (T_ws @ f.pose)[:3, :3]
             if link and t is not None and link in ep.track.bodies[ep.track.index(t)]:
@@ -610,7 +680,8 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
                        for e in ep.events],
             "frames": len(ep.all_frames()),
             "truth_sources": sorted({f.truth_source for f in ep.all_frames()}),
-            "views_vs_truth_m": _views_vs_truth(ep), "warnings": ep.warnings[:50]}
+            "views_vs_truth_m": _views_vs_truth(ep), "odometry_scale": ep.odom_scale,
+            "warnings": ep.warnings[:50]}
     return out
 
 

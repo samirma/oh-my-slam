@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +43,16 @@ def test_base_episode(tmp_path: Path) -> None:
     assert ep.cameras == {"cam0": {"fx": 655.8, "fy": 655.8, "cx": 319.5, "cy": 239.5,
                                    "width": 640, "height": 480}}
     assert {f.truth_source for f in ep.all_frames()} == {"odometry"}
+    # file-name times are UTC; the base body's quat is turned 90° from its heading and its
+    # odometry over-counts by 8 %: the start pose and the times come from the odometry fit
     check_truth(ep, syn)
     assert all(f.height_m == pytest.approx(0.5) for f in ep.all_frames())
-    assert np.allclose(ep.start_poses["r2"], syn.start["r2"])
+    assert np.allclose(ep.start_poses["r1"], syn.start["r1"], atol=1e-9)
+    assert np.allclose(ep.start_poses["r2"], syn.start["r2"], atol=1e-9)  # yaw 180°
+    assert ep.odom_scale == {"r1": pytest.approx(1 / synth.ODOM_SCALE),
+                             "r2": pytest.approx(1 / synth.ODOM_SCALE)}
+    chain = ep.sets["r1/chain1"].frames
+    assert chain[1].travel_m - chain[0].travel_m == pytest.approx(0.4 * synth.ODOM_SCALE)
     assert ep.truth_objects(LAYOUT) == [] and ep.passed is True
 
 
@@ -59,23 +67,26 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
             synth.SetSpec("r1", "look", [(0.1, 0, 12)])]
     arm = synth.build(tmp_path, "e044", "rebot_b601_rs", sets=sets, scene="ithor:1",
                       objects_lines=True)
-    # the truth base pose is off: the shift search and ICP recover the start pose
+    # the robot line's pos and quat belong to another body: the start pose is bodies.base_link
+    ep = load(arm.root)
+    assert np.allclose(ep.start_poses["r1"], arm.start["r1"], atol=1e-9)
+    check_truth(ep, arm)
+    # without base_link, the fallback refines the line's pose: shift search, then ICP
     truth = arm.root / "truth.jsonl"
     lines = [json.loads(x) for x in truth.read_text().splitlines() if x.strip()]
 
-    def write(dx: float, dy: float, yaw_deg: float) -> None:
+    def write(yaw_deg: float) -> None:
         out = []
         for x in lines:
             if x["kind"] == "robot":
-                x = {**x, "pos": [x["pos"][0] + dx, x["pos"][1] + dy, x["pos"][2]],
-                     "quat": synth.quat_wxyz(synth.rot_z(math.radians(yaw_deg)))}
+                x = {**x, "bodies": {}, "quat": synth.quat_wxyz(synth.rot_z(math.radians(yaw_deg)))}
             out.append(x)
         truth.write_text("\n".join(json.dumps(x) for x in out))
 
-    write(0.2, -0.1, 4.0)  # a yaw error too: one ICP iteration does not settle
+    write(4.0)  # a yaw error too: one ICP iteration does not settle
     one = load(arm.root, merge(LAYOUT, {"refine_iterations": 1}))
     assert one.start_poses["r1"].shape == (4, 4)
-    write(0.2, -0.1, 0.0)
+    write(0.0)
     ep = load(arm.root)
     assert ep.kind == "arm" and ep.sets["r1/pp"].variant == "arm"
     assert ep.sets["r1/pp"].frames[0].file.endswith("-approach.jpg")
@@ -84,6 +95,7 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
     assert {f.truth_source for f in ep.all_frames()} == {"views position"}
     check_truth(ep, arm)
     assert np.allclose(ep.start_poses["r1"], arm.start["r1"], atol=1e-6)
+    assert ep.odom_scale == {"r1": 1.0}
     assert ep.worktop_z == pytest.approx(1.1)
     objs = {o.label: o for o in ep.truth_objects(LAYOUT)}
     assert objs["apple"].support_z == pytest.approx(1.1) and objs["box"].support_z is None
@@ -245,8 +257,10 @@ def test_dump_layout(tmp_path: Path) -> None:
     root = syn.root
     full = epi.dump_layout(root, LAYOUT)
     assert full["load"]["events"][2] == "update r1/chain1 (4)"
-    assert full["load"]["views_vs_truth_m"] == {"pos_m": pytest.approx(0, abs=1e-6),
-                                                "rot_deg": pytest.approx(0, abs=1e-4)}
+    # the views over-count by 8 %; the rotations agree
+    assert full["load"]["views_vs_truth_m"]["pos_m"] > 0.05
+    assert full["load"]["views_vs_truth_m"]["rot_deg"] == pytest.approx(0, abs=1e-4)
+    assert full["load"]["odometry_scale"]["r1"] == pytest.approx(1 / synth.ODOM_SCALE)
     start = next(s for s in full["sets"] if s["set"] == "r1/start")
     assert start["value"] == ["base", "pose"] and start["name_time_parsed"] == 4
     assert full["requests_log"] == {"lines": 6, "json_lines": 6, "keys": [
@@ -282,3 +296,28 @@ def test_views_vs_truth_without_truth(tmp_path: Path) -> None:
     for f in ep.all_frames():
         f.truth = None
     assert epi._views_vs_truth(ep) == {"pos_m": None, "rot_deg": None}
+
+
+def test_name_times_are_utc() -> None:
+    from datetime import datetime
+    want = datetime(2026, 10, 26, 8, 52, 0, tzinfo=UTC).timestamp()
+    assert epi.parse_name_time("c1-20261026-085200.jpg", LAYOUT) == want
+    assert epi.parse_name_time("start-20261026-085200mp9.jpg", LAYOUT) == want
+    assert epi.parse_name_time("pp-20261026-085200-pregrasp.jpg", LAYOUT) == want
+    assert epi.parse_name_time("sheet.jpg", LAYOUT) is None
+    assert epi.parse_name_time("x-20261399-990000.jpg", LAYOUT) is None
+
+
+def test_odometry_fit_fallbacks(tmp_path: Path) -> None:
+    # turning in place only: too little spread for the fit, the base quat gives the start pose
+    turn = [synth.SetSpec("r1", "scan", [(0, 0, 0), (0, 0, 30), (0, 0, 60)])]
+    syn = synth.build(tmp_path, sets=turn)
+    ep = load(syn.root)
+    assert ep.odom_scale == {"r1": 1.0}
+    yaw = math.degrees(math.atan2(ep.start_poses["r1"][1, 0], ep.start_poses["r1"][0, 0]))
+    assert yaw == pytest.approx(math.degrees(synth.MODEL_YAW))  # the body's own convention
+    assert epi.fit_odometry(ep, ep.sets["r1/scan"].frames[:1], LAYOUT) is None
+    for f in ep.all_frames():  # odometry that never moved while the truth did
+        f.odom = (0.0, 0.0, 0.0)
+    moved = merge(LAYOUT, {"odometry_fit_min_spread_m": 0.0})
+    assert epi.fit_odometry(ep, ep.all_frames(), moved) is None

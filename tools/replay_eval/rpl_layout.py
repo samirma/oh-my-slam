@@ -22,8 +22,12 @@ LAYOUT: dict[str, Any] = {
         "views": "views.json",  # beside the frames of a set
         "frame_suffixes": [".jpg", ".jpeg", ".png"],
     },
-    # a local date-time anywhere in a frame's file name (not every name has one, nor -NN)
-    "frame_time": {"pattern": r"(\d{8})-(\d{6})", "utc_offset_h": 1.0},
+    # a date-time anywhere in a frame's file name (not every name has one, nor -NN); the agents
+    # ran in Docker on UTC, so the offset to truth `t` (epoch) is 0
+    "frame_time": {"pattern": r"(\d{8})-(\d{6})", "utc_offset_h": 0.0},
+    # a frame whose set holds one name time per frame is matched within this many seconds of it;
+    # frames sharing their set's time use the window between the neighbouring sets
+    "frame_window_s": 3.0,
     "replay": {
         # sets whose name starts with these are locate-only (turn-in-place frames)
         "locate_prefixes": ["loc", "look"],
@@ -85,6 +89,18 @@ LAYOUT: dict[str, Any] = {
     # truth camera positions (exact kinematics)
     "refine_start": ["arm"],
     "refine_iterations": 100,
+    # robot kind -> truth body whose position is the start frame's origin, with identity rotation
+    # (the arm's base link); when the body is missing, the base pose is refined as above
+    "start_link": {"arm": "base_link"},
+    # robot kinds whose start pose is fitted (yaw, translation and odometry scale, 2-D) from the
+    # views odometry against the truth base track at the frames' name times, not the base quat
+    "odometry_fit": ["base"],
+    "odometry_fit_min_spread_m": 0.3,
+    # the prior trust of the `metric` replay per robot kind (default metric): the base's
+    # odometry over-counts by 5-10 %, so its priors are drifting, with sigma_pos_m the larger of
+    # prior_sigma_pos_m and this share of the distance travelled since the run's start
+    "prior_trust": {"base": "drifting"},
+    "prior_sigma_travel_share": {"base": 0.10},
     # odometry matching of the base: cost = hypot(position error m, yaw_weight_m x yaw error rad)
     "odometry_yaw_weight_m": 0.5,
     # EXIF FocalPlaneResolutionUnit when the tag is absent: the conductor writes px per mm

@@ -105,6 +105,7 @@ class Fake:
         self.requests: list[tuple[str, str]] = []
         self.revert_calls = 0
         self.accept_ifs: list[Any] = []
+        self.priors: list[Any] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -527,7 +528,7 @@ class Fake:
         for f in req["frames"]:
             if f["image"] not in files:
                 raise FakeError(400, "invalid_request", f"no part {f['image']}")
-        metric = req["frames"][0].get("prior", {}).get("trust") == "metric"
+        metric = req["frames"][0].get("prior", {}).get("trust") in ("metric", "drifting")
         with self.lock:
             sim = self.maps[name].sim if name in self.maps else (
                 self.cfg.metric_sim if metric else self.cfg.none_sim)
@@ -561,6 +562,7 @@ class Fake:
                              "quality": self.quality(job),
                              "predicted_s": {"registration": 0.07, "fusion": 0.12}}
             self.accept_ifs.append(req.get("accept_if"))
+            self.priors.extend(f.get("prior") for f in req["frames"])
             if name in self.maps:
                 self.maps[name].cameras.update(req.get("cameras", {}))
             job = Job(uuid.uuid4().hex[:8], name, [f["name"] for f in req["frames"]], inputs,

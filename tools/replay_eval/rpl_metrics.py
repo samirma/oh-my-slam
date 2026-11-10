@@ -72,6 +72,10 @@ DEFS: list[Def] = [
         "versions beyond gauge_shift (median)", "<=", 0.02, "median", "m"),
     Def("c1.shift_rot_deg", "C1", "Rotation of stored keyframes between consecutive versions "
         "beyond gauge_shift (median)", "<=", 0.5, "median", "deg"),
+    Def("c1.prior_residual_m", "C1", "Registered inputs' position residual to their priors "
+        "(median; biased base odometry priors)", None, None, "median", "m"),
+    Def("c1.prior_residual_deg", "C1", "Registered inputs' rotation residual to their priors "
+        "(median)", None, None, "median", "deg"),
     Def("c3.readable_s", "C3", "Upload to frame readable in a version (p90 over jobs)", "<=",
         2.0, "p90", "s"),
     Def("c3.fusion_s_per_frame", "C3", "Fusion time per new frame (p90 over jobs)", "<=", 3.0,
@@ -406,6 +410,10 @@ class Measure:
                 continue
             s.add("c4.inputs_contract", [i["name"] for i in inputs] == j.names)
             for i in inputs:
+                for key, mid in (("prior_residual_m", "c1.prior_residual_m"),
+                                 ("prior_residual_deg", "c1.prior_residual_deg")):
+                    if i.get(key) is not None:
+                        s.add(mid, i[key])
                 if i["status"] != "rejected" or i["name"] not in order:
                     continue
                 f = self.by_name[i["name"]]
@@ -686,7 +694,7 @@ def missing_for(d: Def, caps: set[str], plan: FloorPlan | None) -> str | None:
 
 
 def applies(d: Def, mode: str, episode: str, params: Params) -> bool:
-    if d.id == "c2.scale_error_priors":
+    if d.id in ("c2.scale_error_priors", "c1.prior_residual_m", "c1.prior_residual_deg"):
         return mode == "metric"
     if d.id in ("c2.scale_error_height", "c2.scale_error_monocular"):
         return mode == "none"

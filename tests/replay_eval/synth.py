@@ -8,13 +8,16 @@ import math
 import struct
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-LOCAL = timezone(timedelta(hours=1))
+LOCAL = UTC  # the agents ran in Docker on UTC: file-name times are UTC
+ODOM_SCALE = 1.08  # the base's odometry over-counts distances
+MODEL_YAW = math.pi / 2  # the base body's own frame is turned against its heading
+ARM_LINE_OFFSET = (0.2, -0.1)  # the arm's robot-line pos is another body than its base link
 T0 = datetime(2026, 11, 9, 10, 0, 0, tzinfo=LOCAL).timestamp()
 # optical axes in a forward-looking body frame (x forward, y left, z up)
 R_BODY_OPT = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
@@ -239,19 +242,24 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
         key = f"{spec.run}/{spec.name}"
         syn.names[key] = []
         for k, (x, y, yaw) in enumerate(spec.poses):
+            t_f = t_set + 2 * k  # the first frame at the file-name time
+            if robot == "rosmaster_x3_plus":  # the base names each frame with its own time
+                stamp = datetime.fromtimestamp(t_f, LOCAL).strftime("%Y%m%d-%H%M%S")
             file = frame_file(robot, spec.name, stamp, k, "jpg" if image == "jpeg" else "png")
             T_sc = camera_body(robot, x, y, yaw)
             exif = tiff_exif(focal_entries(FX_EXIF)) if robot == "rosmaster_x3_plus" else None
             data = jpeg(w, h, exif) if image == "jpeg" else png(w, h, exif)
             (folder / file).write_bytes(data)
-            t_f = t_set + 2 * k  # the first frame at the file-name time
             if arm:
                 views[file] = T_sc.tolist()
             elif robot == "ainex":
                 views[file] = {"pose": T_sc.tolist(), "pan": 0.0, "tilt": 0.0, "pitch": 0.0,
                                "roll": 0.0, "imu_yaw": 0.0, "stamp": t_f}
             else:
-                views[file] = {"pose": T_sc.tolist(), "base": [x, y, math.radians(yaw)]}
+                odo = T_sc.copy()
+                odo[:2, 3] *= ODOM_SCALE
+                views[file] = {"pose": odo.tolist(),
+                               "base": [x * ODOM_SCALE, y * ODOM_SCALE, math.radians(yaw)]}
             T_wc = T_ws @ T_sc
             name = f"{spec.run}/{spec.name}/{Path(file).stem}"
             syn.truth[name] = T_wc
@@ -284,12 +292,18 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
                 base = make_T(ba[:3, :3], ba[:3, 3] + u * (bb[:3, 3] - ba[:3, 3])
                               + (0.0 if arm else side))
                 cam, R = ca + u * (cb - ca) + side, Ra
+        line_pos, line_R = base[:3, 3].copy(), base[:3, :3]
+        if robot == "rosmaster_x3_plus":
+            line_R = base[:3, :3] @ rot_z(MODEL_YAW)
+        if arm:
+            line_pos[:2] += ARM_LINE_OFFSET
+            line_R = rot_z(math.radians(4.0))
         bodies: dict[str, Any] = {"base_link": {"pos": base[:3, 3].tolist(),
                                                 "quat": quat_wxyz(base[:3, :3])}}
         if robot in LINK:
             bodies[LINK[robot]] = {"pos": cam.tolist(), "quat": quat_wxyz(R @ R_BODY_OPT.T)}
         line: dict[str, Any] = {"kind": "robot", "t": float(t), "sim_time": float(t - T0),
-                                "pos": base[:3, 3].tolist(), "quat": quat_wxyz(base[:3, :3]),
+                                "pos": line_pos.tolist(), "quat": quat_wxyz(line_R),
                                 "cams": {CAM[robot]: cam.tolist(), "usb_cam": [0, 0, 0]},
                                 "bodies": bodies}
         if arm:

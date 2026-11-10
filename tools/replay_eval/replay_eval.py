@@ -63,6 +63,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--wait-s", type=float, default=10.0)
     p.add_argument("--probe-interval-s", type=float, default=0.5)
     p.add_argument("--no-probes", action="store_true", help="no reads while a job runs")
+    p.add_argument("--base-priors", choices=["drifting", "metric"], default="drifting",
+                   help="trust of the wheeled base's odometry priors in the metric replay "
+                   "(sigma: 10 %% of the distance travelled)")
     p.add_argument("--no-height", action="store_true",
                    help="no height_above_floor_m in the trust-none replay")
     p.add_argument("--range-scans", type=int, default=5)
@@ -224,7 +227,9 @@ def main(argv: list[str] | None = None) -> int:
                       job_timeout_s=args.job_timeout_s,
                       sigma_pos_m=layout["prior_sigma_pos_m"],
                       sigma_rot_deg=layout["prior_sigma_rot_deg"],
-                      height_sigma_m=layout["height_sigma_m"])
+                      height_sigma_m=layout["height_sigma_m"],
+                      prior_trust={**layout["prior_trust"], "base": args.base_priors},
+                      travel_share=dict(layout["prior_sigma_travel_share"]))
     episodes: dict[str, Any] = {}
     pooled: list[tuple[Samples, dict[str, dict[str, Any]]]] = []
     for path in paths:

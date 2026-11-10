@@ -42,6 +42,7 @@ python3 tools/replay_eval/replay_eval.py --server http://192.168.0.106:9091 \
 | `--accept-if JSON` | The `accept_if` sent with every update when O9 is served. The default is the skill's thresholds (`specs/evaluation.md`, C6): `{"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}`. `{}` checks nothing. |
 | `--warping e034,e040` | The episodes whose warping update the gate must reject (C6). |
 | `--passing e041,...` | The passing episodes whose updates the gate must accept (C6). Without it, `meta.json`'s `verdict`, or else `verdict.md`, decides (see below). |
+| `--base-priors drifting\|metric` | The trust of the wheeled base's odometry priors in the prior replay. The default is `drifting`. |
 | `--no-height` | No `height_above_floor_m` in the `none` replay; its scale is then reported as `c2.scale_error_monocular`. |
 | `--no-probes` | No reads while a job runs. This drops C3 one-version reads, the busy C12 latencies and the C3 fusing cadence. |
 | `--no-jsonschema` | Minimal required-keys validation, even if `jsonschema` is installed. |
@@ -63,9 +64,15 @@ The exit status is 0 when at least one replay was measured, and 1 otherwise.
      right after it (`POST locate`, O5).
    * Sets whose name starts with `loc` or `look` (`replay.locate_prefixes`) are located whole,
      never mapped: they are turn-in-place frames.
-   * `metric` replay: each frame carries its `views.json` pose as a `metric` prior, with sigmas
-     0.02 m and 1°. A later run's poses are moved into the first run's start frame through the
-     truth start poses, because a map has one frame.
+   * Prior replay (mode `metric`): each frame carries its `views.json` pose as a prior.
+     * Base: the odometry over-counts by 5–10 %, so its priors are `drifting` by default
+       (`--base-priors metric` for `metric`). Either way, `sigma_pos_m` is the larger of
+       0.02 m and 10 % of the odometry distance travelled since the run's first frame. This is
+       an O1 test of biased priors, reported as `c1.prior_residual_m` / `_deg`.
+     * Arm: `metric`, with sigmas 0.02 m and 1°.
+
+     A later run's poses are moved into the first run's start frame through the truth start
+     poses, because a map has one frame.
    * `none` replay: `trust: none`. Floor robots also send `height_above_floor_m` = `pose[2][3]`
      of the `views.json` pose, with sigma 0.02 m.
    * With O10, a dry run (`?dry_run=1`) precedes each update, for `predicted_s`. With O9,
@@ -92,7 +99,7 @@ key of `LAYOUT` in `rpl_layout.py`.
 
 * **Frames.** `agent_files/runs/<run>/<set>/*.jpg`, with one `views.json` per set. File names are
   not assumed to follow `<set>-date-time-NN`: the first `YYYYMMDD-HHMMSS` found anywhere in the
-  name is the local time at UTC+1 (`frame_time`), and a name without one has no time. Frames of a
+  name is a UTC time (the agents ran in Docker on UTC; `frame_time.utc_offset_h` is 0), and a name without one has no time. Frames of a
   set are ordered by `stamp`, then by file name.
 * **`views.json`.** A dict keyed by file name. The base's value is `{"pose", "base": [x, y,
   yaw]}`, with `base` the odometry in the start frame. The humanoid's is `{"pose", "pan", "tilt",
@@ -115,22 +122,30 @@ key of `LAYOUT` in `rpl_layout.py`.
   with mm as the unit when the tag is absent, and c at the image centre). Without EXIF, it takes
   the table scaled to its size, with a warning. `calibration.md` is not read.
 * **Truth pose of a frame.**
-  * **Start frame to world.** The truth base pose at the run's first frame. For floor robots,
-    this is its yaw and its (x, y) at `floor_z`. For the arm, it is the full pose, then refined,
-    since its kinematics are exact:
-    * first by the translation that best lays the views positions on the truth camera samples
-      of their sets' windows;
-    * then by ICP: a rigid fit of the views positions to the matched truth positions, repeated
-      until it settles.
+  * **Start frame to world.** It depends on the robot:
+    * **Base:** a 2-D similarity fit (yaw, translation and scale) of the views `base` odometry
+      [x, y] to the truth base track at the frames' file-name times. The scale is reported as
+      `odometry_scale`. The truth base yaw at odometry yaw 0 is fitted too: it is used when
+      matching, so the body's quaternion need not point along its heading. When the frames
+      span less than 0.3 m, the fallback is the truth base pose at the run's first frame (its
+      yaw and its (x, y) at `floor_z`).
+    * **Arm:** truth `bodies.base_link.pos`, with identity rotation (`start_link`), at the run's
+      first frame. The robot line's `pos` is another body. Only when `base_link` is missing
+      does the fallback refine the line's pose: first by the translation that best lays the
+      views positions on the truth camera samples, then by ICP until it settles.
+    * **Humanoid:** the truth base pose at the run's first frame (its yaw and its (x, y) at
+      `floor_z`).
   * **Time.** The frame's time is found as follows:
     * **Humanoid:** its `stamp`.
-    * **Base:** the time in its set's window at which the truth base track, taken relative to
-      the start pose, best matches the views `base` odometry (cost: hypot(position error,
-      0.5 m × yaw error in rad)).
+    * **Base:** the time in its window at which the truth base track, taken relative to the
+      start pose, best matches the views `base` odometry rescaled by `odometry_scale` (cost:
+      hypot(position error, 0.5 m × yaw error in rad)).
     * **Arm:** the truth `cams` sample nearest the views position, in that window.
 
-    A set's window runs from the set before it to the set after it, by file-name time, with 2 s
-    of slack; the file-name times are local UTC+1, and the truth `t` is epoch. A frame with no
+    The window is ±3 s (`frame_window_s`) around the frame's own file-name time, when its set
+    names each frame with its own time (the base). Otherwise it is the set's window: from the
+    set before it to the set after it, with 2 s of slack. File-name times are UTC, as is the
+    epoch truth `t`. A frame with no
     time keeps the views pose composed with the start pose (`truth_source: views`), with a
     warning.
   * **Position.** `cams.<camera>` at that time: `camera` (humanoid), or
@@ -163,7 +178,7 @@ with its target. The overall value pools the samples of all replays. Statuses ar
 
 | Group | Metrics |
 | --- | --- |
-| Always | `c3.readable_s` (upload → `provisional_version`/`result_version` seen, p90 ≤ 2 s); `c3.fusion_s_per_frame` (p90 ≤ 3 s); `c3.reads_one_version` (100 %); `c4.reason_agreement` (≥ 0.8); `c4.inputs_contract`; `c2.scale_error_priors` (≤ 3 %, metric replay), `c2.scale_error_height` (≤ 10 %, none replay with heights), `c2.scale_error_monocular` (info); `c1.shift_pos_m` (≤ 2 cm) and `c1.shift_rot_deg` (≤ 0.5°), as medians beyond `quality.gauge_shift`; `contract.schema_valid`; `contract.server_timing` |
+| Always | `c3.readable_s` (upload → `provisional_version`/`result_version` seen, p90 ≤ 2 s); `c3.fusion_s_per_frame` (p90 ≤ 3 s); `c3.reads_one_version` (100 %); `c4.reason_agreement` (≥ 0.8); `c4.inputs_contract`; `c2.scale_error_priors` (≤ 3 %, metric replay), `c2.scale_error_height` (≤ 10 %, none replay with heights), `c2.scale_error_monocular` (info); `c1.shift_pos_m` (≤ 2 cm) and `c1.shift_rot_deg` (≤ 0.5°), as medians beyond `quality.gauge_shift`; `c1.prior_residual_m` and `_deg` (info, prior replay: the inputs' `prior_residual_*`); `contract.schema_valid`; `contract.server_timing` |
 | O2 | `c5.revert_s` (≤ 2 s); `c5.revert_contract` |
 | O3 | `c3.eta_within_30pct` (job `eta_s`, and dry-run `predicted_s` when O10 is served); `c3.fusing_version_gap_s` (≤ 10 s when fusion lasts longer) |
 | O5 | `c8.located_near_keyframe` (≥ 0.9); `c8.pos_error_over_tolerance` (median ≤ 1, where the tolerance is max(2 cm, 1 % of the scene depth)); `c8.pos_error_m` (info); `c8.ambiguity_on_wrong` (≥ 0.8); `c8.ambiguity_null_on_right` (≥ 0.9); `c8.ambiguity_rule` (api.md §6); `c8.nearest_view_turn` (≥ 0.8); `c12.locate_idle_s` (≤ 2 s); `c12.locate_busy_s` (≤ 3 s); `c12.locate_busy_ratio` (≤ 2) |
