@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import io
+import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -194,6 +195,9 @@ def test_provisional_rejected_and_the_gate(client: Client) -> None:
     # the derived reads skip the provisional frame as a locate reference
     grid = client.get("/api/maps/m/grid?cell_m=0.1", "Grid")
     assert grid["map_version"] == 2
+    assert client.service.derived is not None
+    dv = client.service.derived.get("m", 2)
+    assert "b0" not in dv.meta["keyframes"] and "a0" in dv.meta["keyframes"]
 
 
 def test_drifting_map_and_frames_without_prior(client: Client) -> None:
@@ -375,3 +379,16 @@ def test_grid_points_and_locate_read_an_anchored_map(client: Client) -> None:
                              "record": False}, {"q": img})
     r = client.http.post("/api/maps/m/locate", content=data, headers={"content-type": ctype})
     assert r.status_code == 200, r.text
+
+
+def test_a_keyframe_without_its_image_is_no_locate_reference(client: Client,
+                                                            tmp_path: Path) -> None:
+    fr, files = frames_for(client, [base_pose(0), base_pose(30)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    store = client.service.store
+    v = store.version("m")
+    (store.mapper_dir("m") / "kf" / f"{v['frames'][1]['internal']}.jpg").unlink()
+    assert client.service.derived is not None
+    client.service.derived._derive("m", 1, v, tmp_path / "d")
+    meta = json.loads((tmp_path / "d" / "meta.json").read_text())
+    assert meta["keyframes"] == ["a0"]
