@@ -26,6 +26,7 @@ from oh_my_slam.service.backend import (
     InternalFrame,
     InternalMap,
     Mono,
+    MvView,
     NothingRegisteredError,
     Registered,
 )
@@ -50,6 +51,13 @@ def plain(w: int = 320, h: int = 240) -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", (w, h), (200, 198, 190)).save(buf, format="JPEG", quality=95)
     return buf.getvalue()
+
+
+def _thumb(image: bytes) -> np.ndarray:
+    """A normalised 32 x 24 grey thumbnail of an image."""
+    g = np.asarray(Image.open(io.BytesIO(image)).convert("L").resize((32, 24)), np.float64)
+    g -= g.mean()
+    return g / max(float(np.linalg.norm(g)), 1e-9)
 
 
 def png16(arr: np.ndarray) -> bytes:
@@ -99,6 +107,16 @@ class FakeBackend:
     depth_maps: dict[str, np.ndarray] = field(default_factory=dict)  # sha -> depth (world m)
     cloud_world: Cloud | None = None  # the fused cloud (world frame)
     objects_world: list[dict[str, Any]] = field(default_factory=list)  # center/R/size (world)
+    # MapAnything (``geometry_views``): each image's pose (sha -> T_world_cam, else ``truth``,
+    # else the identity) relative to the call's first view, its depth ``mono_depth`` (else a
+    # flat 2 m), both times ``mv_scale``; out of memory above ``mv_oom`` views. An image whose
+    # bytes are unknown (a keyframe's re-encoded JPEG) is the known one it looks like
+    # (``mv_add``)
+    mv_pose: dict[str, np.ndarray] = field(default_factory=dict)
+    mv_thumbs: dict[str, np.ndarray] = field(default_factory=dict)
+    mv_scale: float = 1.0
+    mv_oom: int | None = None
+    mv_calls: list[list[str]] = field(default_factory=list)
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -128,6 +146,39 @@ class FakeBackend:
         depth = (np.full((K.height, K.width), 2.0) if d is None else d * self.mono_scale)
         return Mono(depth.astype(np.float32), K, self.descriptors.get(sha),
                     np.array([0.0, -1.0, 0.0]) if gravity else None)
+
+    def mv_add(self, image: bytes, T: np.ndarray) -> None:
+        sha = hashlib.sha256(image).hexdigest()
+        self.mv_pose[sha] = T
+        self.mv_thumbs[sha] = _thumb(image)
+
+    def _mv_sha(self, path: Path) -> str:
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        if sha in self.mv_pose or not self.mv_thumbs:
+            return sha
+        t = _thumb(data)
+        best = max(self.mv_thumbs, key=lambda k: float((self.mv_thumbs[k] * t).sum()))
+        return best if float((self.mv_thumbs[best] * t).sum()) > 0.99 else sha
+
+    def geometry_views(self, images: list[Path], intrinsics: list[Intrinsics],
+                       poses: list[np.ndarray | None], out_dir: Path) -> list[MvView]:
+        from oh_my_slam.service.errors import ApiError
+
+        self.mv_calls.append([p.name for p in images])
+        if self.mv_oom is not None and len(images) > self.mv_oom:
+            raise ApiError("out_of_memory", "out of memory (test)")
+        shas = [self._mv_sha(p) for p in images]
+        Ts = [self.mv_pose.get(h, self.truth.get(h, np.eye(4))) for h in shas]
+        ref = np.linalg.inv(Ts[0])
+        out = []
+        for h, T, K in zip(shas, Ts, intrinsics, strict=True):
+            rel = ref @ T
+            rel[:3, 3] *= self.mv_scale
+            d = self.mono_depth.get(h)
+            depth = np.full((K.height, K.width), 2.0) if d is None else d
+            out.append(MvView(rel, (depth * self.mv_scale).astype(np.float32), K.K()))
+        return out
 
     def _internal(self, sha: str) -> np.ndarray:
         T = self.truth[sha].copy()

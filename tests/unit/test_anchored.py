@@ -431,13 +431,13 @@ def test_height_evidence_edges(tmp_path: Path) -> None:
     T = base_pose(0)
     _, z = shot(T)
     f = frame("a", T, depth=False, mono=1.0, height=0.0)
-    m._height_evidence(f, T, z, K)
+    m.add_height_evidence(f, T, z, K)
     f.height_m = 0.5
-    m._height_evidence(f, T, np.zeros_like(z), K)
+    m.add_height_evidence(f, T, np.zeros_like(z), K)
     up = look(0, (0.0, 0.0, 0.5), 80.0)  # looking at the ceiling: no floor below
-    m._height_evidence(f, up, shot(up)[1], K)
+    m.add_height_evidence(f, up, shot(up)[1], K)
     assert m.scale.heights == []
-    m._height_evidence(f, T, z, K)
+    m.add_height_evidence(f, T, z, K)
     assert m.scale.heights[0][0] == pytest.approx(an.DEFAULT_HEIGHT_SIGMA_M / 0.5)
 
 
@@ -659,3 +659,82 @@ def test_keyframe_images_and_depth_are_kept(tmp_path: Path) -> None:
     assert again.depth_of("nope") is None and again.image_path("nope") is None
     (again.root / an.KF_DIR / f"{kid}.depth.npy").unlink()
     assert again.depth_of(kid) is None
+
+
+def test_the_odometry_drifts_with_its_path() -> None:
+    d = Drift()
+    d.confirm(base_pose(0), base_pose(0))
+    away, back = base_pose(0, 1.0, 0.0), base_pose(5, 0.02, 0.0)
+    straight = d.predict(back, 0.02, 1.0)
+    d.observe(away)
+    T, sp, sr = d.predict(back, 0.02, 1.0)
+    assert np.allclose(T, straight[0]) and sp > straight[1] + 0.15 and sr > straight[2]
+    d.observe(back)
+    assert d.path_m == pytest.approx(2.0, abs=0.05)
+    again = Drift.from_json(d.to_json())
+    assert again.path_m == d.path_m and np.allclose(again.last_prior, back)  # type: ignore[arg-type]
+    # a state written before the path was kept: the straight line
+    old = {k: v for k, v in d.to_json().items() if k not in ("last_prior", "path_m", "turn_deg")}
+    assert Drift.from_json(old).predict(back, 0.02, 1.0)[1] == pytest.approx(straight[1])
+    d.confirm(back, back)
+    assert (d.path_m, d.turn_deg) == (0.0, 0.0)
+
+
+def _slip(T: np.ndarray, deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    Rz = np.eye(4)
+    Rz[:2, :2] = [[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]]
+    return Rz @ T
+
+
+def test_a_slipped_odometry_is_reanchored_on_two_agreeing_frames(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
+    truth = [base_pose(y) for y in (80, 65, 50)]
+    pls = m.update([frame(f"s{k}", T, p=prior(_slip(T, 25.0), "drifting"))
+                    for k, T in enumerate(truth)])
+    assert [p.status for p in pls] == ["registered"] * 3
+    for p, T in zip(pls, truth, strict=True):
+        assert err(p.T, T)[1] < 1.0  # type: ignore[arg-type]
+    # a single strong conflict stays one; placements without an image pose never agree
+    m2 = new_map(tmp_path / "one")
+    m2.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
+    p = m2.update([frame("s", truth[0], p=prior(_slip(truth[0], 25.0), "drifting"))])[0]
+    assert (p.status, p.reason) == ("rejected", "prior_conflict") and p.align_T is not None
+    f = frame("s", truth[0], p=prior(_slip(truth[0], 25.0), "drifting"))
+    assert not m2._same_drift(f, an.Placement("x", "rejected"), f, p)
+
+
+def test_an_unconfirmed_frame_against_the_map_s_depth(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    m.save()
+    m = AnchoredMap.load(tmp_path / "m")  # the keyframes' depth from disk
+    blank = np.full((K.height, K.width, 3), 120, np.uint8)
+    T = base_pose(10)
+    far = T.copy()
+    far[:3, 3] += [0.8, 0.0, 0.0]
+    p = m.update([frame("far", T, p=prior(far), rgb=blank)])[0]
+    assert (p.status, p.reason) == ("rejected", "prior_conflict")
+    assert p.map_residual is not None and p.map_residual[0] > 0.5
+    # contradicted within its sigmas: kept, its depth residual reported
+    near = T.copy()
+    near[:3, 3] += [0.45, 0.0, 0.0]
+    p = m.update([frame("near", T, p=prior(near, sp=0.4), rgb=blank)])[0]
+    assert p.status == "provisional" and p.map_residual is not None
+    assert 0.2 < p.map_residual[0] < 0.6
+    # where it agrees with the map: no residual
+    p = m.update([frame("same", T, p=prior(T), rgb=blank)])[0]
+    assert p.status == "provisional" and p.map_residual is None
+    # a keyframe without a depth grid is no reference
+    for k in m.keyframes:
+        k.grid, k.K_grid = None, None
+    p = m.update([frame("none", T, p=prior(far), rgb=blank)])[0]
+    assert p.status == "provisional" and p.map_residual is None
+
+
+def test_guided_matching_without_candidates_in_reach() -> None:
+    img, _ = shot(base_pose(0))
+    f = an.features(img)
+    pred = np.full((len(f.kps), 2), -1000.0)
+    assert len(an.guided_match(f, f, pred, np.full(len(pred), 8.0))[0]) == 0

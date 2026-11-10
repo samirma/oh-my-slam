@@ -327,8 +327,11 @@ def test_timings_persist_and_predict(tmp_path: Path) -> None:
 
     path = tmp_path / "t.json"
     t = Timings(path)
-    assert t.predict_update(2) == 2 * (DEFAULTS["registration_per_frame"]
-                                       + DEFAULTS["fusion_per_frame"])
+    d = DEFAULTS
+    assert t.predict_update(2, 1) == pytest.approx(
+        d["job_overhead"] + 2 * d["checks_per_frame"] + d["registration_per_frame"]
+        + d["registration_mapanything_per_frame"] + 2 * d["fusion_per_frame"])
+    assert t.predict_phases(0, 0, 0, 0) == (0.0, 0.0)
     t.add("locate_per_frame", 1.0, 3)
     t.add("locate_per_frame", 3.0)
     again = Timings(path)

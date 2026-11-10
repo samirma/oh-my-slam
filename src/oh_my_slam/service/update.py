@@ -28,6 +28,7 @@ import math
 import shutil
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ FLOOR_BINS = 50  # estimate_floor
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
 JPEG_QUALITY = 95
+CHECK_THREADS = 4  # frames measured at once (OpenCV releases the GIL)
 
 
 @dataclass
@@ -234,7 +236,15 @@ class Updater:
             job.state, job.error = "failed", exc.body()
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
-            job.timings_s["total"] = round(time.perf_counter() - t0, 3)
+            tm = job.timings_s
+            tm["total"] = round(time.perf_counter() - t0, 3)
+        if job.state != "failed" and w.frames:
+            # the phases a prediction adds up (``Timings.predict_phases``)
+            self.timings.add("checks_per_frame", tm.get("checks", 0.0) / len(w.frames),
+                             len(w.frames))
+            self.timings.add("job_overhead", max(tm["total"] - tm.get("checks", 0.0)
+                                                 - tm.get("register", 0.0)
+                                                 - tm.get("fusion", 0.0), 0.0))
 
     # -- the job -------------------------------------------------------------------------------
 
@@ -258,41 +268,54 @@ class Updater:
 
     def _check(self, frames: list[_Frame], masks: dict[str, NDArray[np.bool_] | None],
                prev: dict[str, Any] | None, indir: Path) -> None:
+        """The per-frame checks: duplicates in request order, then the measurements of the
+        others, ``CHECK_THREADS`` frames at a time."""
         names = {r["name"] for r in prev["frames"]} if prev else set()
         shas = {r.get("sha256") for r in prev["frames"]} if prev else set()
+        todo = []
         for fr in frames:
-            f, mask = fr.work, masks[fr.work.camera_id]
-            if f.mask is not None:
-                own = decode_mask(f.mask, f"frames[{f.index}].ignore_mask")
-                mask = own if mask is None else (mask | own)
-            if f.name in names or fr.sha in shas:
+            if fr.work.name in names or fr.sha in shas:
                 fr.reason = "duplicate"
                 continue
-            names.add(f.name)
+            names.add(fr.work.name)
             shas.add(fr.sha)
-            rgb = decode_rgb(f.image, f"frames[{f.index}].image")
-            fr.measures = checks.measure(rgb, mask)
-            med = None
-            if f.depth is not None:
-                fr.depth_m = mapper_depth(decode_png16(f.depth, f"frames[{f.index}].depth"),
-                                          fr.cam, mask)
-                med = checks.median_depth(fr.depth_m)
-            fr.path = indir / f"{f.index:04d}.jpg"
-            if fr.cam.is_canonical and (mask is None or not mask.any()) \
-                    and f.image[:3] == b"\xff\xd8\xff":
-                fr.path.write_bytes(f.image)
-                fr.rgb = rgb
-            else:
-                fr.rgb = mapper_image(rgb, fr.cam, mask)
-                save_jpeg(fr.rgb, fr.path, quality=JPEG_QUALITY)
-            if mask is not None and mask.any():
-                fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
-                fr.mask_path = indir / f"{f.index:04d}.mask.png"
-                fr.mask_path.write_bytes(png_bytes(fr.ignore.astype(np.uint8) * 255))
-            # the monocular depth ``too_close`` needs is measured once the path is known: the
-            # prior-first path gets it with the frame's depth (``_resolve_deferred``)
-            fr.deferred = med is None and fr.measures.suspicious
-            fr.reason = checks.reason(fr.measures, med)
+            todo.append(fr)
+        if len(todo) < 2:
+            for fr in todo:
+                self._check_one(fr, masks, indir)
+            return
+        with ThreadPoolExecutor(CHECK_THREADS) as pool:
+            list(pool.map(lambda fr: self._check_one(fr, masks, indir), todo))
+
+    @staticmethod
+    def _check_one(fr: _Frame, masks: dict[str, NDArray[np.bool_] | None], indir: Path) -> None:
+        f, mask = fr.work, masks[fr.work.camera_id]
+        if f.mask is not None:
+            own = decode_mask(f.mask, f"frames[{f.index}].ignore_mask")
+            mask = own if mask is None else (mask | own)
+        rgb = decode_rgb(f.image, f"frames[{f.index}].image")
+        fr.measures = checks.measure(rgb, mask)
+        med = None
+        if f.depth is not None:
+            fr.depth_m = mapper_depth(decode_png16(f.depth, f"frames[{f.index}].depth"),
+                                      fr.cam, mask)
+            med = checks.median_depth(fr.depth_m)
+        fr.path = indir / f"{f.index:04d}.jpg"
+        if fr.cam.is_canonical and (mask is None or not mask.any()) \
+                and f.image[:3] == b"\xff\xd8\xff":
+            fr.path.write_bytes(f.image)
+            fr.rgb = rgb
+        else:
+            fr.rgb = mapper_image(rgb, fr.cam, mask)
+            save_jpeg(fr.rgb, fr.path, quality=JPEG_QUALITY)
+        if mask is not None and mask.any():
+            fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
+            fr.mask_path = indir / f"{f.index:04d}.mask.png"
+            fr.mask_path.write_bytes(png_bytes(fr.ignore.astype(np.uint8) * 255))
+        # the monocular depth ``too_close`` needs is measured once the path is known: the
+        # prior-first path gets it with the frame's depth (``_resolve_deferred``)
+        fr.deferred = med is None and fr.measures.suspicious
+        fr.reason = checks.reason(fr.measures, med)
 
     def _resolve_deferred(self, frames: list[_Frame]) -> None:
         """The mapper's path: the median monocular depth of the suspicious frames (``too_close``

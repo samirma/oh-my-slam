@@ -48,6 +48,13 @@ def shot(T: np.ndarray) -> tuple[bytes, bytes, np.ndarray]:
     return img, dep, np.load(io.BytesIO(z))
 
 
+@pytest.fixture(autouse=True)
+def geometric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests run the prior-first engine on every frame (``OH_MY_SLAM_NONE_ENGINE``); the
+    MapAnything engine of camera-only frames has its own tests (``test_service_register_ma``)."""
+    monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "geometric")
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[Client]:
     store = Store(tmp_path / "data")
@@ -313,6 +320,32 @@ def test_dry_run_against_an_anchored_map(client: Client) -> None:
     assert not q["accepted"] and q["failed_checks"] == ["max_rejected_share"]
     assert q["prior_residuals"]["count"] == 2 and q["low_confidence_share"] == 0.5
     assert client.service.store.latest("m") == 1  # nothing committed
+
+
+def _slip(T: np.ndarray, deg: float) -> np.ndarray:
+    a = np.radians(deg)
+    Rz = np.eye(4)
+    Rz[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
+    return Rz @ T
+
+
+def test_a_re_sweep_after_an_odometry_slip(client: Client) -> None:
+    """Strong placements that agree on one correction of a drifting odometry re-anchor it in
+    the dry run as in the update; the dry run predicts along the request."""
+    poses = [base_pose(30 * k) for k in range(4)]
+    fr, files = frames_for(client, poses, tag="a", trust="drifting")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    truth = [base_pose(y) for y in (80, 65, 50)]
+    fr, files = frames_for(client, truth, tag="s", trust="drifting",
+                           priors=[_slip(T, 25.0) for T in truth])
+    out = dry(client, "m", fr, files)
+    assert [r["predicted_status"] for r in out["frames"]] == ["registered"] * 3
+    job = client.update("m", fr, files)
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 3
+    one, ofiles = frames_for(client, [base_pose(70)], tag="o", trust="drifting",
+                             priors=[_slip(base_pose(70), -30.0)])
+    out = dry(client, "m", one, ofiles)
+    assert out["frames"][0]["predicted_reason"] == "prior_conflict"
 
 
 def test_dry_run_measures_suspicious_frames(client: Client) -> None:

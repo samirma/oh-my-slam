@@ -767,7 +767,7 @@ def test_eta_counts_the_queue_ahead_and_the_job_s_own_frames(
         client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
     import threading
 
-    client.service.jobs.predict = lambda n: 10.0 * n
+    client.service.jobs.predict = lambda n, camera_only: 10.0 * n
     gate = threading.Event()
     real = client.backend.register
 

@@ -88,6 +88,17 @@ class Mono:
 
 
 @dataclass
+class MvView:
+    """One view of a multi-view call (``Backend.geometry_views``): its pose (4x4
+    camera-to-world in the call's frame), its z-depth (0 = none) and the 3x3 intrinsics of the
+    depth's grid."""
+
+    pose: NDArray[np.float64]
+    depth: NDArray[np.float32]
+    K: NDArray[np.float64]
+
+
+@dataclass
 class Registered:
     sources_rejected: list[str]
     objects: int
@@ -105,6 +116,11 @@ class Backend(Protocol):
     def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
         """The monocular depth of a canonical image with its intrinsics ``K`` (and the camera's
         up direction when ``gravity``)."""
+
+    def geometry_views(self, images: list[Path], intrinsics: list[Intrinsics],
+                       poses: list[NDArray[np.float64] | None], out_dir: Path) -> list[MvView]:
+        """MapAnything over ``images`` with their intrinsics and the given camera-to-world
+        poses; ``ApiError`` ``out_of_memory`` when the call does not fit."""
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
@@ -218,6 +234,27 @@ class MapperBackend:
         up = None if fr.gravity is None else np.asarray(fr.gravity.up_cam, np.float64)
         return Mono(np.where(fr.valid, fr.depth, 0.0).astype(np.float32), fr.K_grid,
                     None if fr.descriptor is None else np.asarray(fr.descriptor, np.float32), up)
+
+    def geometry_views(self, images: list[Path], intrinsics: list[Intrinsics],
+                       poses: list[NDArray[np.float64] | None], out_dir: Path) -> list[MvView]:
+        from oh_my_slam.core.types import Pose
+        from oh_my_slam.reconstruction.api import connect_server
+        from oh_my_slam.reconstruction.multiview import run_multiview
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            client = connect_server().clone()
+            try:
+                res, _ = run_multiview(
+                    images, out_dir, intrinsics=list(intrinsics),
+                    poses=[None if T is None else Pose.from_matrix(T) for T in poses],
+                    want_depth=True, client=client)
+            finally:
+                client.close()
+        except OhMySlamError as exc:
+            raise api_error(exc) from exc
+        return [MvView(r.pose.matrix(), np.load(str(r.depth_path)).astype(np.float32), r.K)
+                for r in res]
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,

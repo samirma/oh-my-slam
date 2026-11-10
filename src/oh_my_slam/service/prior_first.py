@@ -16,6 +16,8 @@ similarity: the mapper's frame is the map frame, and stored poses never move.
 
 from __future__ import annotations
 
+import functools
+import os
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -23,7 +25,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from oh_my_slam.mapping.anchored import AnchoredMap, FrameIn, Placement, pose_residual
+from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping.anchored import AnchoredMap, FrameIn, Placement, features, pose_residual
+from oh_my_slam.service import register_ma
 from oh_my_slam.service.anchor import Sim3
 from oh_my_slam.service.backend import Mono
 from oh_my_slam.service.store import clone_tree
@@ -36,6 +40,86 @@ if TYPE_CHECKING:
 
 INFERENCE_IN_FLIGHT = 2
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
+NONE_ENGINE_ENV = "OH_MY_SLAM_NONE_ENGINE"
+DEFAULT_NONE_ENGINE = "mapanything"
+
+
+def none_engine() -> str:
+    """The engine of the frames without a prior (``register_ma``): ``OH_MY_SLAM_NONE_ENGINE``,
+    else ``DEFAULT_NONE_ENGINE``."""
+    v = os.environ.get(NONE_ENGINE_ENV, DEFAULT_NONE_ENGINE).strip().lower()
+    if v not in register_ma.ENGINES:
+        raise ValueError(f"{NONE_ENGINE_ENV}={v!r}: expected one of {register_ma.ENGINES}")
+    return v
+
+
+def camera_only(w: UpdateWork) -> int:
+    """The frames of a request MapAnything registers (``none_engine``): those without a metric
+    or drifting prior."""
+    if none_engine() != "mapanything":
+        return 0
+    return sum(f.trust not in ("metric", "drifting") for f in w.frames)
+
+
+def _trusted(fr: _Frame) -> bool:
+    return fr.work.trust in ("metric", "drifting")
+
+
+def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
+                   progress: Callable[[str], None]) -> tuple[list[Placement], float, float]:
+    """The camera-only frames by MapAnything (``register_ma``) against the map's confirmed
+    keyframes, each registered one added as a keyframe; its depth scale is the map's, and its
+    camera height feeds the map's depth scale (``ScaleState``) as a monocular keyframe's does.
+    Returns the placements (frames' order) and the registration and fusion seconds."""
+    t = time.perf_counter()
+    am.save()  # this update's keyframes get their image and depth on disk: anchors
+    stored = [register_ma.Stored(k.id, img, k.K, k.T, i, functools.partial(am.depth_of, k.id))
+              for i, k in enumerate(am.keyframes)
+              if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
+    if not stored:  # nothing confirmed to register against (a camera-only map without origin)
+        return [Placement(fr.work.name, "rejected", "no_overlap") for fr in frames], \
+            time.perf_counter() - t, 0.0
+    new = []
+    for fr in frames:
+        assert fr.path is not None and fr.measures is not None
+        new.append(register_ma.New(fr.work.index, fr.path, fr.cam.canonical(),
+                                   fr.depth_m if _has_depth(fr) else None,
+                                   fr.measures.features))
+    calls = [0]
+
+    def multiview(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
+        calls[0] += 1
+        return up.backend.geometry_views(images, Ks, poses, workdir / f"mv{calls[0]}")
+
+    res = register_ma.Registration(multiview, new, stored).run()
+    reg_s = time.perf_counter() - t
+    t = time.perf_counter()
+    out = []
+    for fr in frames:
+        p = res.placements[fr.work.index]
+        if p.status == "rejected":
+            out.append(Placement(fr.work.name, "rejected", p.reason))
+            progress(f"{fr.work.name}: rejected ({p.reason})")
+            continue
+        assert p.T is not None and p.depth is not None and p.K_depth is not None
+        pl = Placement(fr.work.name, "registered", None, p.T, p.sigma_pos_m, p.sigma_rot_deg,
+                       p.inliers, "mapanything")
+        f = _frame_in(fr, None)
+        h, w = p.depth.shape
+        Kg = Intrinsics(float(p.K_depth[0, 0]), float(p.K_depth[1, 1]), float(p.K_depth[0, 2]),
+                        float(p.K_depth[1, 2]), w, h)
+        depth = p.depth
+        kind = "sensor" if _has_depth(fr) else "mono"
+        if kind == "mono":
+            am.add_height_evidence(f, p.T, depth, Kg)
+            k = am.scale.k
+            am.scale.estimate(am.prior_span(), am.prior_span("drifting"))
+            depth = (depth * (am.scale.k / k)).astype(np.float32)
+        assert fr.rgb is not None
+        am.add(f, features(fr.rgb, fr.ignore), pl, depth, Kg, kind, None)
+        out.append(pl)
+        progress(f"{fr.work.name}: registered (mapanything, {p.inliers} points)")
+    return out, reg_s, time.perf_counter() - t
 def _waiter(fut: Future[Mono]) -> Callable[[], tuple[Any, Any, Any, Any]]:
     return lambda: fut.result().as_tuple()
 
@@ -97,10 +181,14 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         # gravity: the angle to its prior's up axis, or the camera-only map's up
         origin = None
         if prev is None:
-            origin = next((fr for fr in todo if fr.work.trust in ("metric", "drifting")),
-                          todo[0])
+            origin = next((fr for fr in todo if _trusted(fr)), todo[0])
+        # frames without a prior go to MapAnything after the others, but a new camera-only
+        # map's origin is the prior-first engine's
+        late = [fr for fr in todo if not _trusted(fr) and fr is not origin] \
+            if none_engine() == "mapanything" else []
+        geo = [fr for fr in todo if all(fr is not x for x in late)]
         ins = []
-        for fr in todo:
+        for fr in geo:
             fut = None
             if not _has_depth(fr) or fr is origin:
                 assert fr.path is not None
@@ -114,20 +202,27 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             changed()
 
         try:
-            pls = am.update(ins, progress)
+            pls = am.update(ins, progress) if ins else []
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-        for fr, pl in zip(todo, pls, strict=True):
+        reg_s, fuse_s = am.timings.get("register", 0.0), am.timings.get("fuse", 0.0)
+        for fr, pl in zip(geo, pls, strict=True):
             placements[fr.work.index] = pl
+        if geo:
+            up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
+        if late:
+            lp, r, fu = _register_none(up, am, late, workdir, progress)
+            up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
+            reg_s, fuse_s = reg_s + r, fuse_s + fu
+            for fr, pl in zip(late, lp, strict=True):
+                placements[fr.work.index] = pl
         t = time.perf_counter()
         am.save()
-        tm["register"] = am.timings["register"]
-        tm["fusion"] = round(am.timings["fuse"] + time.perf_counter() - t, 3)
-        n = len(todo)
-        # everything but fusion counts as registration (checks, clone): the job's own time
-        reg = tm["checks"] + tm["clone"] + tm["register"]
-        up.timings.add("registration_per_frame", reg / n, n)
-        up.timings.add("fusion_per_frame", tm["fusion"] / n, n)
+        tm["register"] = round(reg_s, 3)
+        tm["fusion"] = round(fuse_s + time.perf_counter() - t, 3)
+        n_kept = sum(pl.status != "rejected" for pl in placements.values())
+        if n_kept:
+            up.timings.add("fusion_per_frame", tm["fusion"] / n_kept, n_kept)
     job.progress = 0.95
     changed()
     t = time.perf_counter()

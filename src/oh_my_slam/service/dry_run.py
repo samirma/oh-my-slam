@@ -5,8 +5,13 @@ It runs synchronously and writes nothing (no camera, version, job or mapper file
 * the per-frame checks of an update (``Updater._check``), with the monocular median depth of the
   suspicious frames (``too_close``);
 * per kept frame, its link to the map: on an anchored map the prior-first placement against the
-  current version (``AnchoredMap.place`` on a copy loaded read-only; nothing is added), whose
-  inliers are ``map_inliers``; on a new map or a map of the mapper, null;
+  current version (``AnchoredMap.place`` on a copy loaded read-only; nothing is added, no scale
+  evidence), whose inliers are ``map_inliers``; on a new map or a map of the mapper, null. The
+  frames are placed ``DRY_THREADS`` at a time, each against the stored map only; a drifting
+  prior's prediction follows the request (the odometry's path grows frame by frame, as in the
+  update), and two strong conflicts that agree on one correction of the odometry re-anchor it,
+  as the update does (``AnchoredMap._same_drift``): the conflicts that correction explains are
+  predicted registered;
 * its links to its neighbours in the request (the previous and the next frame): the inliers of a
   fundamental matrix (RANSAC) on their ratio-test SIFT matches;
 * the predicted status and reason, the predicted quality report with its gate (``accept_if``),
@@ -14,8 +19,11 @@ It runs synchronously and writes nothing (no camera, version, job or mapper file
 
 from __future__ import annotations
 
+import copy
+import itertools
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -26,17 +34,19 @@ from oh_my_slam.mapping.anchored import (
     AnchoredMap,
     Features,
     Placement,
+    _prior_sigmas,
     features,
     match,
     pose_residual,
 )
 from oh_my_slam.service import checks
-from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in
+from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in, none_engine
 
 if TYPE_CHECKING:
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
 
 NEIGHBOUR_PX = 3.0  # the fundamental matrix's RANSAC threshold
+DRY_THREADS = 6
 
 
 def link(a: Features, b: Features) -> int:
@@ -63,14 +73,21 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
         frames, masks = up._frames(w, new_cameras, new_masks)
         up._check(frames, masks, prev, indir)
         up._resolve_deferred(frames)
-        feats: dict[int, Features] = {fr.work.index: features(fr.rgb, fr.ignore)
-                                      for fr in frames if fr.rgb is not None}
-        am = AnchoredMap.load(store.mapper_dir(w.map)) \
-            if prev is not None and prev.get("engine") == "anchored" else None
+        with ThreadPoolExecutor(DRY_THREADS) as pool:
+            got = list(pool.map(lambda fr: None if fr.rgb is None else features(fr.rgb, fr.ignore),
+                                frames))
+            feats: dict[int, Features] = {fr.work.index: g for fr, g in zip(frames, got,
+                                                                           strict=True)
+                                          if g is not None}
+            am = AnchoredMap.load(store.mapper_dir(w.map)) \
+                if prev is not None and prev.get("engine") == "anchored" else None
+            placed = _place_all(pool, am, frames, feats)
+            links = list(pool.map(lambda k: _neighbours(k, frames, feats), range(len(frames))))
         out, kept, prior_res = [], [], []
         first_kept = True
         for k, fr in enumerate(frames):
-            row, pl = _frame(fr, k, frames, feats, am, prev is None, first_kept)
+            row, pl = _frame(fr, links[k], placed.get(fr.work.index), am is not None,
+                             prev is None, first_kept)
             if row["predicted_status"] == "registered":
                 first_kept = False
                 kept.append(pl)
@@ -94,33 +111,68 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
         "rebuilt": False, "prior_gravity_deg": None,
     }
-    n = len(kept)
+    reached = [fr for fr in frames if fr.reason is None]
+    ma = len([fr for fr in reached if fr.work.trust not in ("metric", "drifting")]) \
+        if none_engine() == "mapanything" and (prev is None or am is not None) else 0
+    reg, fus = up.timings.predict_phases(len(frames), len(reached) - ma, ma, len(kept))
     return {"map": w.map,
             "base_version": None if prev is None else prev["version"], "frames": out,
             "quality": gate(q, bool(kept), w.accept_if),
-            "predicted_s": {
-                "registration": round(n * up.timings.median("registration_per_frame"), 3),
-                "fusion": round(n * up.timings.median("fusion_per_frame"), 3)}}
+            "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
 
 
-def _frame(fr: _Frame, k: int, frames: list[_Frame], feats: dict[int, Features],
-           am: AnchoredMap | None, new_map: bool, first: bool
-           ) -> tuple[dict[str, Any], Placement | None]:
-    m = fr.measures
-    neighbours: list[dict[str, Any]] = []
-    own = feats.get(fr.work.index)
+def _place_all(pool: ThreadPoolExecutor, am: AnchoredMap | None, frames: list[_Frame],
+               feats: dict[int, Features]) -> dict[int, Placement]:
+    """Every kept frame placed against the stored map (``AnchoredMap.place``): the drifting
+    priors predicted along the request on a copy of the map's odometry, then the strong
+    conflicts a re-anchored odometry explains predicted registered."""
+    if am is None:
+        return {}
+    todo = [fr for fr in frames if fr.reason is None and fr.work.index in feats]
+    ins = {fr.work.index: _frame_in(fr, None) for fr in todo}
+    drift = copy.deepcopy(am.drift)
+    preds: dict[int, tuple[Any, float, float] | None] = {}
+    for fr in todo:
+        f = ins[fr.work.index]
+        if f.prior is not None and f.prior["trust"] == "drifting":
+            P = np.asarray(f.prior["T_map_cam"], np.float64)
+            preds[fr.work.index] = drift.predict(P, *_prior_sigmas(f.prior))
+            drift.observe(P)
+    pls = list(pool.map(lambda fr: am.place(ins[fr.work.index], feats[fr.work.index], None,
+                                            preds.get(fr.work.index), evidence=False), todo))
+    out = {fr.work.index: pl for fr, pl in zip(todo, pls, strict=True)}
+    conflicts = [fr.work.index for fr, pl in zip(todo, pls, strict=True)
+                 if pl.reason == "prior_conflict" and fr.work.trust == "drifting"]
+    for a, b in itertools.pairwise(conflicts):
+        if not am._same_drift(ins[a], out[a], ins[b], out[b]):
+            continue
+        for c in conflicts:  # the conflicts this correction explains
+            if c == a or am._same_drift(ins[a], out[a], ins[c], out[c]):
+                pl = out[c]
+                pl.status, pl.reason, pl.T = "registered", None, pl.align_T
+                pl.sigma_pos_m, pl.sigma_rot_deg = pl.image_sigmas or (None, None)
+        break
+    return out
+
+
+def _neighbours(k: int, frames: list[_Frame], feats: dict[int, Features]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    own = feats.get(frames[k].work.index)
     for j in (k - 1, k + 1):
-        if 0 <= j < len(frames) and own is not None \
-                and frames[j].work.index in feats:
-            neighbours.append({"name": frames[j].work.name,
-                               "inliers": link(own, feats[frames[j].work.index])})
-    status, reason, map_inliers, pl = "registered", fr.reason, None, None
+        if 0 <= j < len(frames) and own is not None and frames[j].work.index in feats:
+            out.append({"name": frames[j].work.name,
+                        "inliers": link(own, feats[frames[j].work.index])})
+    return out
+
+
+def _frame(fr: _Frame, neighbours: list[dict[str, Any]], pl: Placement | None, anchored: bool,
+           new_map: bool, first: bool) -> tuple[dict[str, Any], Placement | None]:
+    m = fr.measures
+    status, reason, map_inliers = "registered", fr.reason, None
     if reason is not None:
         status = "rejected"
-    elif am is not None:
-        assert own is not None
-        f = _frame_in(fr, None)
-        pl = am.place(f, own, None)
+    elif anchored:
+        assert pl is not None
         map_inliers = pl.inliers
         if pl.status == "rejected":
             status, reason = "rejected", pl.reason

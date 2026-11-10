@@ -21,6 +21,12 @@ WINDOW = 50
 DEFAULTS: dict[str, float] = {
     "registration_per_frame": 3.7,
     "fusion_per_frame": 0.54,
+    # a job's phases (README "Expected durations"), measured on the prior-first path: the
+    # checks of every frame sent, MapAnything's registration of a camera-only frame, and what
+    # a job costs beyond its frames (clone, save, commit)
+    "checks_per_frame": 0.05,
+    "registration_mapanything_per_frame": 1.5,
+    "job_overhead": 0.5,
     "locate_per_frame": 2.0,
     "analyse_per_frame": 1.5,
     "grid_read": 0.5,
@@ -71,6 +77,20 @@ class Timings:
                               "source": "default"}
         return out
 
-    def predict_update(self, frames: int) -> float:
-        """Seconds an update of ``frames`` frames is expected to take."""
-        return frames * (self.median("registration_per_frame") + self.median("fusion_per_frame"))
+    def predict_update(self, frames: int, camera_only: int = 0) -> float:
+        """Seconds an update of ``frames`` frames is expected to take, ``camera_only`` of them
+        registered by MapAnything, all of them kept (``predict_phases``)."""
+        reg, fus = self.predict_phases(frames, frames - camera_only, camera_only, frames)
+        return reg + fus
+
+    def predict_phases(self, sent: int, geometric: int, mapanything: int, kept: int
+                       ) -> tuple[float, float]:
+        """(registration, fusion) seconds of an update: its overhead, the checks of the
+        ``sent`` frames, the registration of the frames each engine gets and the fusion of
+        the ``kept`` ones."""
+        if not sent:
+            return 0.0, 0.0
+        reg = (self.median("job_overhead") + sent * self.median("checks_per_frame")
+               + geometric * self.median("registration_per_frame")
+               + mapanything * self.median("registration_mapanything_per_frame"))
+        return reg, kept * self.median("fusion_per_frame")

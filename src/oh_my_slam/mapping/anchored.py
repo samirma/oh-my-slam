@@ -39,6 +39,7 @@ retrieval descriptor), ``cloud.npz``."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import time
@@ -74,6 +75,8 @@ RATIO = 0.8  # Lowe's ratio test
 GUIDED_RATIO = 0.9  # the ratio test among the keypoints near a match's predicted pixel
 GUIDED_MIN_PX = 6.0  # the predicted pixel's search radius: at least this
 GUIDED_MAX_PX = 80.0  # ... at most this
+GUIDED_CHUNK = 65536  # descriptor pairs compared at once
+GUIDED_ENOUGH = 300  # a keyframe with this many ratio-test matches needs no guided matching
 MAX_CANDIDATES = 5
 CANDIDATE_MAX_ANGLE_DEG = 100.0  # optical axes further apart share no view
 CANDIDATE_MAX_DIST_M = 5.0
@@ -103,6 +106,8 @@ MIN_SIGMA_POS_M = 0.01
 MIN_SIGMA_ROT_DEG = 0.1
 IMAGE_SIGMA_POS_REL = 0.01  # of the median scene depth: depth bias the covariance does not see
 IMAGE_SIGMA_ROT_MIN_DEG = 0.2
+REPORT_MIN_SIGMA_POS_M = 0.001  # floors of the reported sigmas
+REPORT_MIN_SIGMA_ROT_DEG = 0.01
 DEFAULT_SIGMA_POS_M = 0.05  # a prior without sigmas (as service.anchor)
 DEFAULT_SIGMA_ROT_DEG = 2.0
 UNANCHORED_SIGMA_POS_M = 0.10  # rotation-only without a prior: the centre is the keyframe's
@@ -123,6 +128,13 @@ DEPTH_SIGMA_REL = 0.01  # depth images (README "Prior-first registration")
 MONOCULAR_SIGMA_REL = 0.10
 MIN_SCALE_SIGMA_REL = 0.002
 DEFAULT_HEIGHT_SIGMA_M = 0.02
+MIN_DEPTH_M = 0.05
+SAMPLE_SIDE = 64  # a depth agreement samples a grid of at most this side
+SENSOR_DEPTH_TOL = 0.10  # relative depth agreement of depth images
+MONO_DEPTH_TOL = 0.20  # ... of monocular depth (its own scale is aligned per frame)
+MIN_OVERLAP = 0.10  # share of a frame's points a reference view's depth sees
+MIN_AGREEMENT = 0.75  # share of those that agree
+MIN_AGREEING = 40  # points
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -460,27 +472,36 @@ def guided_match(new: Features, ref: Features, predicted: Array, radius: Array
     from scipy.spatial import cKDTree
 
     ok = np.isfinite(predicted).all(axis=1)
+    empty = np.zeros(0, np.intp), np.zeros(0, np.intp)
     if len(new.kps) < 2 or not ok.any():
-        return np.zeros(0, np.intp), np.zeros(0, np.intp)
+        return empty
     jb = np.nonzero(ok)[0]
     near = cKDTree(new.kps).query_ball_point(predicted[jb], radius[jb])
+    lens = np.fromiter((len(x) for x in near), np.intp, len(near))
+    if not lens.sum():
+        return empty
+    ii = np.fromiter(itertools.chain.from_iterable(near), np.intp, int(lens.sum()))
+    jj = np.repeat(jb, lens)
     a = new.desc.astype(np.float32)
     b = ref.desc.astype(np.float32)
-    pairs: dict[int, tuple[float, int]] = {}
-    for j, idx in zip(jb, near, strict=True):
-        if not idx:
-            continue
-        dd = np.linalg.norm(a[idx] - b[j], axis=1)
-        o = np.argsort(dd)
-        d1 = float(dd[o[0]])
-        if len(o) > 1 and d1 >= GUIDED_RATIO * float(dd[o[1]]):
-            continue
-        i = int(idx[o[0]])
-        if i not in pairs or d1 < pairs[i][0]:
-            pairs[i] = (d1, int(j))
-    ia = np.array(list(pairs.keys()), np.intp)
-    ib = np.array([v[1] for v in pairs.values()], np.intp)
-    return ia, ib
+    d = np.empty(len(ii), np.float32)
+    for s in range(0, len(ii), GUIDED_CHUNK):
+        e = s + GUIDED_CHUNK
+        d[s:e] = np.linalg.norm(a[ii[s:e]] - b[jj[s:e]], axis=1)
+    o = np.lexsort((d, jj))  # by reference keypoint, then distance
+    ii, jj, d = ii[o], jj[o], d[o]
+    first = np.nonzero(np.r_[True, jj[1:] != jj[:-1]])[0]
+    count = np.diff(np.r_[first, len(jj)])
+    d1 = d[first]
+    d2 = np.where(count > 1, d[np.minimum(first + 1, len(d) - 1)], np.inf)
+    keep = d1 < GUIDED_RATIO * d2
+    i1, j1, d1 = ii[first][keep], jj[first][keep], d1[keep]
+    if not len(i1):
+        return empty
+    o = np.lexsort((j1, d1, i1))  # one per new keypoint: the closest (the first on ties)
+    i1, j1 = i1[o], j1[o]
+    one = np.r_[True, i1[1:] != i1[:-1]]
+    return i1[one].astype(np.intp), j1[one].astype(np.intp)
 
 
 @dataclass
@@ -581,6 +602,95 @@ def refine_pose(R0: Array, c0: Array, uv: Array, X: Array, d: Array, ref: NDArra
     R, c, sc = unpack(p)
     rms = float(np.sqrt(np.mean((e[inl] * px) ** 2))) if inl.any() else float("inf")
     return Solve(R, c, cov6, inl, rms), sc
+
+
+# -- depth agreement ------------------------------------------------------------------------------
+
+
+def backproject(depth: NDArray[np.float32], K: Array, side: int = SAMPLE_SIDE) -> Array:
+    """Camera-frame points of a depth map (3x3 ``K`` of its grid), on a grid of at most
+    ``side`` per axis."""
+    h, w = depth.shape
+    step = max(1, math.ceil(max(h, w) / side))
+    vs, us = np.mgrid[step // 2:h:step, step // 2:w:step]
+    z = depth[vs, us].astype(np.float64)
+    ok = np.isfinite(z) & (z > MIN_DEPTH_M)
+    z, us, vs = z[ok], us[ok], vs[ok]
+    x = (us + 0.5 - K[0, 2]) / K[0, 0] * z
+    y = (vs + 0.5 - K[1, 2]) / K[1, 1] * z
+    out: Array = np.column_stack([x, y, z])
+    return out
+
+
+@dataclass
+class DepthRef:
+    """A reference view of a depth agreement: a pose and a metric depth on its grid (3x3)."""
+
+    T: Array
+    depth: NDArray[np.float32]
+    K: Array
+
+
+@dataclass
+class Agreement:
+    points: int
+    agree: int
+    conflict: int
+    median_abs_m: float = 0.0  # median depth difference of the points references see (m)
+
+    @property
+    def overlap(self) -> float:
+        return (self.agree + self.conflict) / self.points if self.points else 0.0
+
+    @property
+    def agreement(self) -> float:
+        n = self.agree + self.conflict
+        return self.agree / n if n else 0.0
+
+    @property
+    def confirmed(self) -> bool:
+        return (self.agree >= MIN_AGREEING and self.overlap >= MIN_OVERLAP
+                and self.agreement >= MIN_AGREEMENT)
+
+    @property
+    def contradicted(self) -> bool:
+        """Enough points seen by the references, too few of them where they see a surface."""
+        return (self.agree + self.conflict >= MIN_AGREEING and self.overlap >= MIN_OVERLAP
+                and self.agreement < MIN_AGREEMENT)
+
+
+def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> Agreement:
+    """How the camera-frame points of a frame at pose ``T`` agree with the references' depth: a
+    point agrees when some reference sees it within ``tol`` (relative) of its depth, and
+    conflicts when references see it but none agrees (in front of their surface, or behind it:
+    the small baselines of a robot's frames leave little to occlusion)."""
+    n = len(points_cam)
+    if not n or not refs:
+        return Agreement(n, 0, 0)
+    X = points_cam @ T[:3, :3].T + T[:3, 3]
+    agree = np.zeros(n, bool)
+    conflict = np.zeros(n, bool)
+    best = np.full(n, np.inf)
+    for r in refs:
+        Xr = (X - r.T[:3, 3]) @ r.T[:3, :3]
+        z = Xr[:, 2]
+        front = z > MIN_DEPTH_M
+        zs = np.where(front, z, 1.0)
+        u = np.floor(r.K[0, 0] * Xr[:, 0] / zs + r.K[0, 2]).astype(np.int64)
+        v = np.floor(r.K[1, 1] * Xr[:, 1] / zs + r.K[1, 2]).astype(np.int64)
+        h, w = r.depth.shape
+        inside = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        d = np.zeros(n)
+        d[inside] = r.depth[v[inside], u[inside]]
+        seen = inside & (d > MIN_DEPTH_M) & np.isfinite(d)
+        rel = np.where(seen, (z - d) / np.where(seen, d, 1.0), 0.0)
+        agree |= seen & (np.abs(rel) <= tol)
+        conflict |= seen & (np.abs(rel) > tol)
+        best = np.where(seen, np.minimum(best, np.abs(z - d)), best)
+    conflict &= ~agree
+    seen_any = np.isfinite(best)
+    return Agreement(n, int(agree.sum()), int(conflict.sum()),
+                     float(np.median(best[seen_any])) if seen_any.any() else 0.0)
 
 
 # -- the map ---------------------------------------------------------------------------------------
@@ -695,35 +805,63 @@ class Cloud:
 @dataclass
 class Drift:
     """The latest correction of the drifting odometry: the last keyframe the images confirmed
-    with a drifting prior (its map pose and its prior) and the odometry's scale."""
+    with a drifting prior (its map pose and its prior), the odometry's scale, and the odometry
+    travelled since that keyframe along every drifting prior seen after it (``observe``): a
+    robot that drove away and came back has drifted with its path, not with the straight line
+    between its two priors."""
 
     ref_T: Array | None = None
     ref_prior: Array | None = None
     odo_scale: float = 1.0
     evidence: list[list[float]] = field(default_factory=list)  # [odometry m, map m]
+    last_prior: Array | None = None  # the last drifting prior seen
+    path_m: float = 0.0  # odometry path from ``ref_prior`` to ``last_prior``
+    turn_deg: float = 0.0  # ... and its turns
 
     def to_json(self) -> dict[str, Any]:
         return {"ref_T": None if self.ref_T is None else self.ref_T.tolist(),
                 "ref_prior": None if self.ref_prior is None else self.ref_prior.tolist(),
-                "odo_scale": self.odo_scale, "evidence": self.evidence}
+                "odo_scale": self.odo_scale, "evidence": self.evidence,
+                "last_prior": None if self.last_prior is None else self.last_prior.tolist(),
+                "path_m": self.path_m, "turn_deg": self.turn_deg}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Drift:
+        last = d.get("last_prior")
         return Drift(None if d["ref_T"] is None else np.asarray(d["ref_T"], np.float64),
                      None if d["ref_prior"] is None else np.asarray(d["ref_prior"], np.float64),
-                     float(d["odo_scale"]), [list(e) for e in d["evidence"]])
+                     float(d["odo_scale"]), [list(e) for e in d["evidence"]],
+                     None if last is None else np.asarray(last, np.float64),
+                     float(d.get("path_m", 0.0)), float(d.get("turn_deg", 0.0)))
+
+    def _step(self, P: Array) -> tuple[float, float]:
+        """The odometry's travel and turn from the last prior seen to ``P``."""
+        if self.last_prior is None:
+            return 0.0, 0.0
+        D = np.linalg.inv(self.last_prior) @ P
+        return float(np.linalg.norm(D[:3, 3])) * self.odo_scale, rot_deg(D[:3, :3])
 
     def predict(self, P: Array, sigma_pos: float, sigma_rot: float
                 ) -> tuple[Array, float, float]:
-        """The map pose and sigmas of a drifting prior ``P``."""
+        """The map pose and sigmas of a drifting prior ``P``: through the latest correction,
+        the sigmas grown with the travel since it (the longer of its path and the straight
+        line)."""
         if self.ref_T is None or self.ref_prior is None:
             return P.copy(), sigma_pos, sigma_rot
         D = np.linalg.inv(self.ref_prior) @ P
         D[:3, 3] *= self.odo_scale
-        travel = float(np.linalg.norm(D[:3, 3]))
-        turn = rot_deg(D[:3, :3])
+        step, step_turn = self._step(P)
+        travel = max(float(np.linalg.norm(D[:3, 3])), self.path_m + step)
+        turn = max(rot_deg(D[:3, :3]), self.turn_deg + step_turn)
         return (self.ref_T @ D, sigma_pos + DRIFT_POS_REL * travel,
                 sigma_rot + DRIFT_ROT_REL * turn + DRIFT_ROT_DEG_PER_M * travel)
+
+    def observe(self, P: Array) -> None:
+        """A drifting prior seen (whatever its frame became): the path grows by its step."""
+        step, step_turn = self._step(P)
+        self.path_m += step
+        self.turn_deg += step_turn
+        self.last_prior = P.copy()
 
     def confirm(self, T: Array, P: Array) -> None:
         """A drifting frame the images placed at ``T``: the new reference, and odometry scale
@@ -738,6 +876,7 @@ class Drift:
                 s = float((odo_m * map_m).sum() / (odo_m ** 2).sum())
                 self.odo_scale = float(np.clip(s, *ODO_SCALE_RANGE))
         self.ref_T, self.ref_prior = T.copy(), P.copy()
+        self.last_prior, self.path_m, self.turn_deg = P.copy(), 0.0, 0.0
 
 
 @dataclass
@@ -862,6 +1001,7 @@ class Placement:
     # the committed pose against the image-only pose on the stored map: how far the update puts
     # the frame from where the map says it is (the quality report's residuals and gauge shift)
     map_residual: tuple[float, float] | None = None
+    image_sigmas: tuple[float, float] | None = None  # of ``align_T`` (a conflict's image pose)
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -884,6 +1024,27 @@ def depth_alignment(T: Array, X: Array, uv: Array, depth: NDArray[np.float32],
         return None
     a = float(np.median(z_map[ok] / z_own[ok]))
     return a if ALIGN_RANGE[0] <= a <= ALIGN_RANGE[1] else None
+
+
+def _real_sigmas(s: Solve, refs: Refs) -> tuple[float, float]:
+    """An image pose's sigmas as reported: its covariance (``Solve.sigmas``) and the depth bias
+    the covariance does not see (``IMAGE_SIGMA_POS_REL`` of the references' median depth)."""
+    sp, sr = s.sigmas()
+    bias = IMAGE_SIGMA_POS_REL * float(np.median(refs.median))
+    return max(math.hypot(sp, bias), REPORT_MIN_SIGMA_POS_M), max(sr, REPORT_MIN_SIGMA_ROT_DEG)
+
+
+def _given_sigmas(p: dict[str, Any]) -> tuple[float, float]:
+    """A prior's sigmas as the robot gave them (defaults without), for the reported sigmas."""
+    return (max(float(p.get("sigma_pos_m", DEFAULT_SIGMA_POS_M)), REPORT_MIN_SIGMA_POS_M),
+            max(float(p.get("sigma_rot_deg", DEFAULT_SIGMA_ROT_DEG)), REPORT_MIN_SIGMA_ROT_DEG))
+
+
+def _combined(real_a: float, weight_a: float, real_b: float, weight_b: float) -> float:
+    """The sigma of the weighted mean of two independent estimates whose weights are
+    ``1/weight²`` and whose real sigmas are ``real_a``, ``real_b``."""
+    w = weight_b ** 2 / (weight_a ** 2 + weight_b ** 2)  # the share of estimate a
+    return math.hypot(w * real_a, (1.0 - w) * real_b)
 
 
 def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
@@ -1073,7 +1234,7 @@ class AnchoredMap:
             Xk = c + (ray * z[:, None]) @ R.T
             dk = unit(ray @ R.T)
             ia, ib = match(feats.desc, k.feats.desc)
-            if pred is not None and K is not None:
+            if pred is not None and K is not None and len(ia) < GUIDED_ENOUGH:
                 T0, sp0, sr0 = pred
                 Kn = K
                 kf_has = np.isfinite(Xk).all(axis=1)
@@ -1166,9 +1327,13 @@ class AnchoredMap:
             return None
         return got_r[0], centre.copy(), got_r[1], True
 
-    def place(self, f: FrameIn, feats: Features, descriptor: Any) -> Placement:
-        """Place one new frame (the map has its origin); does not add it."""
-        pred = self._predict(f)
+    def place(self, f: FrameIn, feats: Features, descriptor: Any,
+              predicted: tuple[Array, float, float] | None = None, evidence: bool = True
+              ) -> Placement:
+        """Place one new frame (the map has its origin); does not add it. ``predicted``
+        replaces the prior's prediction (a dry run's, along its request); without
+        ``evidence`` it leaves the map's scale evidence as it is."""
+        pred = self._predict(f) if predicted is None else predicted
         T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         cands = self._candidates(f, T0, descriptor)
         if pred is None:
@@ -1206,8 +1371,11 @@ class AnchoredMap:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
                 return Placement(f.name, "rejected", reason)
-            s, n, _, method, spi, sri, _, _ = img
-            return Placement(f.name, "registered", None, s.T, round(spi, 4), round(sri, 3), n,
+            s, n, _, method, spi, sri, _, refs = img
+            rp, rr = _real_sigmas(s, refs)
+            if method == "rotation":
+                rp = UNANCHORED_SIGMA_POS_M
+            return Placement(f.name, "registered", None, s.T, round(rp, 4), round(rr, 3), n,
                              method, lifted=_lifted(corr))  # type: ignore[arg-type]
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
@@ -1237,28 +1405,36 @@ class AnchoredMap:
                            >= MIN_INLIERS).sum())
             if n >= STRONG_INLIERS and ratio >= STRONG_RATIO and (not metric or refs_ok >= 2):
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
-                                 method, (dp, dr))
+                                 method, (dp, dr), align_T=s.T, image_sigmas=(spi, sri))
             weak = Placement(f.name, "provisional", "no_overlap", T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
             weak.map_residual = (dp, dr)
             return weak
+        # the reported sigmas: the image pose's covariance with the depth bias it does not see,
+        # combined with the prior's own sigmas as the estimate combines them
+        rp, rr = _real_sigmas(s, refs)
+        gp, gr = _given_sigmas(f.prior)
         if metric:
             img_T = s.T
             if rot_only:
                 img_T[:3, 3] = T0[:3, 3]
-            T, fsp, fsr = fuse_poses(img_T, spi, sri, T0, sp0, sr0)
+            T, _, _ = fuse_poses(img_T, spi, sri, T0, sp0, sr0)
+            fsp = gp if rot_only else _combined(rp, spi, gp, sp0)
+            fsr = _combined(rr, sri, gr, sr0)
         else:
             # the frame refined on its matches and its prior together (stored poses fixed)
             fused, _ = refine_pose(s.R, T0[:3, 3].copy() if rot_only else s.c, *sub, refs, f.K,
                                    prior=(T0, sp0, sr0))
-            fsp, fsr = fused.sigmas()
             T = fused.T
-        pl = Placement(f.name, "registered", None, T, round(max(fsp, MIN_SIGMA_POS_M), 4),
-                       round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref),
+            fsp = sp0 if rot_only else 1.0 / math.sqrt(1.0 / rp ** 2 + 1.0 / sp0 ** 2)
+            fsr = 1.0 / math.sqrt(1.0 / rr ** 2 + 1.0 / sr0 ** 2)
+        pl = Placement(f.name, "registered", None, T, round(max(fsp, REPORT_MIN_SIGMA_POS_M), 4),
+                       round(max(fsr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, method,
+                       pose_residual(T, ref),
                        lifted=_lifted(corr), align_T=s.T,  # type: ignore[arg-type]
                        map_residual=pose_residual(T, s.T) if not rot_only
                        else (0.0, pose_residual(T, s.T)[1]))
-        if method == "pnp":
+        if method == "pnp" and evidence:
             self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands,  # type: ignore[arg-type]
                                  (sub, refs, f.K, _prior_sigmas(f.prior)))
         return pl
@@ -1356,7 +1532,7 @@ class AnchoredMap:
         col = rgb.reshape(-1, 3)[idx].astype(np.float64)
         self.cloud.add(pts @ kf.T[:3, :3].T + kf.centre, col)
 
-    def _height_evidence(self, f: FrameIn, T: Array, depth: NDArray[np.float32],
+    def add_height_evidence(self, f: FrameIn, T: Array, depth: NDArray[np.float32],
                          K_grid: Intrinsics) -> None:
         """A monocular keyframe with a known camera height: the height over its raw floor."""
         if f.height_m is None or f.height_m <= 0:
@@ -1396,6 +1572,35 @@ class AnchoredMap:
             order = [first] + [i for i in order if i != first]
         reg_s = 0.0
         fuse_s = 0.0
+        feats_of: dict[int, Features] = {}
+        pending: int | None = None  # the last strong conflict of a drifting prior
+
+        def keep(i: int, pl: Placement) -> None:
+            f = frames[i]
+            depth, Kg, kind, desc = self._keyframe_depth(f)
+            if not self.keyframes and self.created_with != "none" and f.mono is not None:
+                self._up_check(f, pl)
+            if kind == "mono":
+                assert pl.T is not None
+                # its own scale brought onto the map's (the monocular model's metres vary from
+                # frame to frame), on the points lifted at the map's current scale
+                if pl.lifted is not None:
+                    a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
+                                        *pl.lifted, depth, Kg, f.K)
+                    if a is not None:
+                        depth = (depth * a).astype(np.float32)
+                # its camera height, if known, refines the depth scale before it is fused
+                self.add_height_evidence(f, pl.T, depth, Kg)
+                k = self.scale.k
+                self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+                depth = (depth * (self.scale.k / k)).astype(np.float32)
+            if pl.status == "provisional" and self.keyframes:
+                self._map_consistency(f, pl, depth, Kg)
+                if pl.status == "rejected":
+                    return
+            self.add(f, feats_of[i], pl, depth, Kg, kind, desc)
+            progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
+
         for i in order:
             f = frames[i]
             t = time.perf_counter()
@@ -1408,9 +1613,10 @@ class AnchoredMap:
                 d = mono[0][np.isfinite(mono[0]) & (mono[0] > 0)]
                 if f.check_close and d.size and float(np.median(d)) * self.scale.k < TOO_CLOSE_M:
                     out[i] = Placement(f.name, "rejected", "too_close")
+                    self._odometry(f, out[i])
                     reg_s += time.perf_counter() - t
                     continue
-            feats = features(f.rgb, f.ignore)
+            feats_of[i] = features(f.rgb, f.ignore)
             if not self.keyframes:
                 p = f.prior
                 if p is not None and p["trust"] in ("metric", "drifting"):
@@ -1426,39 +1632,105 @@ class AnchoredMap:
                     res = None
                 pl = Placement(f.name, "registered", None, P, sp, sr, 0, "origin", res)
             else:
-                pl = self.place(f, feats, None if mono is None else mono[2])
-            reg_s += time.perf_counter() - t
-            out[i] = pl
-            if pl.status == "rejected":
+                pl = self.place(f, feats_of[i], None if mono is None else mono[2])
+            again = []
+            if pl.reason == "prior_conflict" and f.prior is not None \
+                    and f.prior["trust"] == "drifting":
+                if pending is not None and self._same_drift(frames[pending], out[pending], f, pl):
+                    # two strong placements agree on a correction the odometry's sigmas did
+                    # not allow (a slip, a long unseen drive): the odometry is re-anchored on
+                    # the first, and both are placed again
+                    assert out[pending].align_T is not None
+                    self.drift.confirm(out[pending].align_T, np.asarray(
+                        frames[pending].prior["T_map_cam"], np.float64))  # type: ignore[index]
+                    again = [pending, i]
+                    pending = None
+                else:
+                    pending = i
+            elif pl.status == "registered":
+                pending = None
+            if not again:
+                out[i] = pl
+                self._odometry(f, pl)
+                reg_s += time.perf_counter() - t
+                if pl.status == "rejected":
+                    continue
+                t = time.perf_counter()
+                keep(i, pl)
+                fuse_s += time.perf_counter() - t
                 continue
-            t = time.perf_counter()
-            depth, Kg, kind, desc = self._keyframe_depth(f)
-            if not self.keyframes and self.created_with != "none" and f.mono is not None:
-                self._up_check(f, pl)
-            if kind == "mono":
-                assert pl.T is not None
-                # its own scale brought onto the map's (the monocular model's metres vary from
-                # frame to frame), on the points lifted at the map's current scale
-                if pl.lifted is not None:
-                    a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
-                                        *pl.lifted, depth, Kg, f.K)
-                    if a is not None:
-                        depth = (depth * a).astype(np.float32)
-                # its camera height, if known, refines the depth scale before it is fused
-                self._height_evidence(f, pl.T, depth, Kg)
-                k = self.scale.k
-                self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
-                depth = (depth * (self.scale.k / k)).astype(np.float32)
-            self.add(f, feats, pl, depth, Kg, kind, desc)
-            if f.prior is not None and f.prior["trust"] == "drifting" and pl.T is not None \
-                    and pl.status == "registered":
-                self.drift.confirm(pl.T, np.asarray(f.prior["T_map_cam"], np.float64))
-            fuse_s += time.perf_counter() - t
-            progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
+            for j in again:
+                t = time.perf_counter()
+                out[j] = self.place(frames[j], feats_of[j], None)
+                self._odometry(frames[j], out[j])
+                reg_s += time.perf_counter() - t
+                if out[j].status != "rejected":
+                    t = time.perf_counter()
+                    keep(j, out[j])
+                    fuse_s += time.perf_counter() - t
         self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
         self.timings = {"register": round(reg_s, 3), "fuse": round(fuse_s, 3),
                         "total": round(time.perf_counter() - t0, 3)}
         return [out[i] for i in range(len(frames))]
+
+    def _grid(self, k: Keyframe) -> DepthRef | None:
+        """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
+        if k.grid is None and k.K_grid is not None:
+            p = self.root / KF_DIR / f"{k.id}.depth.npy"
+            if p.exists():
+                k.grid = np.load(p).astype(np.float32)
+        if k.grid is None or k.K_grid is None:
+            return None
+        return DepthRef(k.T, (k.grid * self._depth_factor(k)).astype(np.float32), k.K_grid.K())
+
+    def _map_consistency(self, f: FrameIn, pl: Placement, depth: NDArray[np.float32],
+                         K_grid: Intrinsics) -> None:
+        """A provisional frame (at its prior: the images did not confirm it) against the depth
+        the map's keyframes near it see: where they see enough of its points and too few agree
+        (``Agreement.contradicted``), the median depth difference is its residual to the map
+        (the quality report's ``previous_residuals``), and beyond ``K_SIGMA`` of its position
+        sigma and the depth's own tolerance it contradicts the map: ``prior_conflict``, not
+        fused."""
+        assert pl.T is not None and pl.sigma_pos_m is not None
+        refs = [r for k in self._candidates(f, pl.T, None) for r in [self._grid(k)]
+                if r is not None]
+        sensor = f.depth is not None and bool(np.count_nonzero(f.depth > 0))
+        tol = SENSOR_DEPTH_TOL if sensor else MONO_DEPTH_TOL
+        pts = backproject(depth, K_grid.K())
+        a = agreement(pts, pl.T, refs, tol)
+        if not a.contradicted:
+            return
+        pl.map_residual = (a.median_abs_m, 0.0)
+        med = float(np.median(pts[:, 2])) if len(pts) else 0.0
+        if a.median_abs_m > K_SIGMA * pl.sigma_pos_m + tol * med:
+            pl.status, pl.reason = "rejected", "prior_conflict"
+
+    def _odometry(self, f: FrameIn, pl: Placement) -> None:
+        """A frame with a drifting prior: the new reference of the odometry when the images
+        confirmed it, else one more step of its path."""
+        if f.prior is None or f.prior["trust"] != "drifting":
+            return
+        P = np.asarray(f.prior["T_map_cam"], np.float64)
+        if pl.status == "registered" and pl.T is not None:
+            self.drift.confirm(pl.T, P)
+        else:
+            self.drift.observe(P)
+
+    def _same_drift(self, fa: FrameIn, a: Placement, fb: FrameIn, b: Placement) -> bool:
+        """Whether two drifting frames' image poses (strong conflicts with their priors) imply
+        the same correction of the odometry: ``b``'s image pose predicted from ``a``'s, as a
+        reference, within ``K_SIGMA`` of their combined sigmas."""
+        if a.align_T is None or b.align_T is None or a.image_sigmas is None \
+                or b.image_sigmas is None:
+            return False
+        assert fa.prior is not None and fb.prior is not None
+        trial = Drift(a.align_T, np.asarray(fa.prior["T_map_cam"], np.float64),
+                      self.drift.odo_scale)
+        T, sp, sr = trial.predict(np.asarray(fb.prior["T_map_cam"], np.float64),
+                                  *_prior_sigmas(fb.prior))
+        dp, dr = pose_residual(b.align_T, T)
+        return dp <= K_SIGMA * math.hypot(sp, a.image_sigmas[0], b.image_sigmas[0]) \
+            and dr <= K_SIGMA * math.hypot(sr, a.image_sigmas[1], b.image_sigmas[1])
 
     def _up_check(self, f: FrameIn, pl: Placement) -> None:
         """The angle between the origin prior's up axis and the monocular gravity estimate."""

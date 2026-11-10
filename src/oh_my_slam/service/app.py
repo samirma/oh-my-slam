@@ -29,6 +29,7 @@ from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, sa
 from oh_my_slam.service.derived import Derived
 from oh_my_slam.service.errors import ApiError, invalid
 from oh_my_slam.service.jobs import Jobs
+from oh_my_slam.service.prior_first import camera_only
 from oh_my_slam.service.routes import ENDPOINTS
 from oh_my_slam.service.schema import SCHEMA_VERSION
 from oh_my_slam.service.store import Store, check_name
@@ -301,7 +302,7 @@ class Api:
             return body(out)
         if cameras or masks or self.s.store.meta(name) is None:
             self.s.store.add_cameras(name, cameras, masks)
-        job = self.s.jobs.submit(name, work, len(work.frames))
+        job = self.s.jobs.submit(name, work, len(work.frames), camera_only(work))
         return JSONResponse(job.queued_view, 202, {"Location": f"/api/jobs/{job.id}"})
 
     async def get_job(self, request: Request) -> Response:

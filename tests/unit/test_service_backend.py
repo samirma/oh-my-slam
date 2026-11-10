@@ -277,6 +277,43 @@ def test_infer_returns_the_monocular_depth(tmp_path: Path, monkeypatch: pytest.M
     assert err.value.code == "inference_unavailable"
 
 
+def test_geometry_views_runs_mapanything(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                         ) -> None:
+    from oh_my_slam.reconstruction import api as rec
+    from oh_my_slam.reconstruction import multiview as mv
+
+    class Client(_Client):
+        def clone(self) -> Client:
+            return Client()
+
+        def multiview(self, req: p.MultiviewRequest) -> p.MultiviewResponse:
+            assert req.poses == [np.eye(4).tolist(), None] and req.want_depth
+            assert req.intrinsics is not None and req.intrinsics[0] == K.K().tolist()
+            out = []
+            for i in range(2):
+                path = Path(req.out_dir) / f"d{i}.npy"
+                np.save(path, np.full((3, 4), 2.0 + i))
+                out.append(p.MultiviewView(pose=np.eye(4).tolist(), intrinsics=np.eye(3).tolist(),
+                                           width=4, height=3, depth_path=str(path)))
+            return p.MultiviewResponse(views=out)
+
+    monkeypatch.setattr(rec, "connect_server", lambda: Client())
+    b = be.MapperBackend()
+    views = b.geometry_views([tmp_path / "a.jpg", tmp_path / "b.jpg"], [K, K],
+                             [np.eye(4), None], tmp_path / "mv")
+    assert [float(v.depth.mean()) for v in views] == [2.0, 3.0]
+    assert views[0].depth.dtype == np.float32 and views[1].pose.shape == (4, 4)
+    assert mv.DEFAULT_RESOLUTION == 518
+
+    def boom() -> Any:
+        raise DeviceMemoryError("oom")
+
+    monkeypatch.setattr(rec, "connect_server", boom)
+    with pytest.raises(ApiError) as err:
+        b.geometry_views([tmp_path / "a.jpg"], [K], [None], tmp_path / "mv")
+    assert err.value.code == "out_of_memory"
+
+
 # -- the inference server ------------------------------------------------------------------------
 
 
