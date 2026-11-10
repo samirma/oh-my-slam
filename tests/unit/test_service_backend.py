@@ -175,6 +175,40 @@ def test_read_gives_the_internal_frames_floor_bounds_and_depth(tmp_path: Path) -
     assert b.read(m).bounds is None
 
 
+def test_read_gives_keyframe_images_the_cloud_and_objects(tmp_path: Path) -> None:
+    from oh_my_slam.core.ply import PointCloud, ply_bytes
+    from oh_my_slam.mapping.store import FrameRecord
+
+    m = tmp_path / "map"
+    m.mkdir()
+    rec = FrameRecord(0, "f000000", "frames/f000000.jpg", "/in/0.jpg", 1, 320, 240, K,
+                      Pose(np.eye(3), np.zeros(3)), 32, 24)
+    (m / "frames.json").write_text(json.dumps({"frames": [rec.to_dict()]}))
+    (m / "map.json").write_text(json.dumps({}))
+    b = be.MapperBackend()
+    r = b.read(m)
+    assert r.image("f000000") == m / "frames" / "f000000.jpg" and r.image("nope") is None
+    assert r.cloud() is None and r.objects() == []
+    (m / "cloud.ply").write_bytes(ply_bytes(PointCloud(np.array([[0, 0, 0], [1, 2, 3]],
+                                                                np.float32))))
+    c = b.read(m).cloud()
+    assert c is not None and c.rgb.shape == (2, 3) and c.object_id.tolist() == [0, 0]
+    rgb = np.array([[1, 2, 3], [4, 5, 6]], np.uint8)
+    (m / "cloud.ply").write_bytes(ply_bytes(PointCloud(np.zeros((2, 3), np.float32), rgb)))
+    np.save(m / "cloud_objects.npy", np.array([-1, 7], np.int32))
+    c = b.read(m).cloud()
+    assert c is not None and c.rgb.tolist() == rgb.tolist() and c.object_id.tolist() == [0, 7]
+    np.save(m / "cloud_objects.npy", np.array([7], np.int32))  # stale: of another cloud
+    c = b.read(m).cloud()
+    assert c is not None and c.object_id.tolist() == [0, 0]
+    (m / "objects.json").write_text(json.dumps({"objects": [
+        {"id": 3, "label": "door", "obb": {"center": [1, 2, 3], "R": np.eye(3).tolist(),
+                                           "size": [1, 0.1, 2]}},
+        {"id": 4, "label": "ghost"}]}))
+    assert b.read(m).objects() == [{"id": 3, "label": "door", "center": [1, 2, 3],
+                                    "R": np.eye(3).tolist(), "size": [1, 0.1, 2]}]
+
+
 # -- the depth model -----------------------------------------------------------------------------
 
 

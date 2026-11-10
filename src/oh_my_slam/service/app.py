@@ -24,8 +24,9 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.service import openapi, schema
+from oh_my_slam.service import nav, openapi, schema
 from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, same_camera
+from oh_my_slam.service.derived import Derived
 from oh_my_slam.service.errors import ApiError, invalid
 from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.routes import ENDPOINTS
@@ -36,7 +37,7 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O4"]  # the groups this service implements (high_level_spec.md §12)
+CAPABILITIES = ["O1", "O4", "O5", "O6"]  # the groups this service implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
 ROTATION_TOLERANCE = 1e-3
@@ -58,6 +59,8 @@ class Service:
     upload_cap: int = UPLOAD_CAP_BYTES
     stopping: bool = False
     started_at: float = field(default_factory=time.time)
+    derived: Derived | None = None  # the grid, points and locate inputs of each version
+    ids: nav.Ids | None = None
 
 
 def body(data: dict[str, Any], status: int = 200, headers: dict[str, str] | None = None
@@ -335,6 +338,84 @@ class Api:
         return body({"map": name, "map_version": v["version"],
                      "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"],
                      "frames": [{k: f[k] for k in keys} for f in v["frames"]]})
+
+    def _derived(self) -> Derived:
+        assert self.s.derived is not None, "the service derives versions (main.serve)"
+        return self.s.derived
+
+    def _ids(self) -> nav.Ids:
+        if self.s.ids is None:
+            self.s.ids = nav.Ids(self.s.store)
+        return self.s.ids
+
+    async def get_grid(self, request: Request) -> Response:
+        t0 = time.perf_counter()
+        name, _, v = self._version(request)
+        q = request.query_params
+        cell = nav.number(q, "cell_m", nav.DEFAULT_CELL_M, nav.MIN_CELL_M, nav.MAX_CELL_M)
+        z_min = nav.number(q, "z_min", nav.DEFAULT_Z_BAND[0])
+        z_max = nav.number(q, "z_max", nav.DEFAULT_Z_BAND[1])
+        foot = nav.number(q, "footprint_radius_m", None, 0.0)
+        assert cell is not None and z_min is not None and z_max is not None
+        if z_max <= z_min:
+            raise invalid("z_max", f"z_max ({z_max}) must be above z_min ({z_min})")
+        dv = await run_in_threadpool(self._derived().get, name, v["version"])
+        _stage(request, "derive", t0)
+        t1 = time.perf_counter()
+        answer = await run_in_threadpool(nav.grid, dv, self._ids(), cell, z_min, z_max, foot)
+        _stage(request, "grid", t1)
+        self.s.timings.add("grid_read", time.perf_counter() - t0)
+        return body(answer.body)
+
+    async def get_points(self, request: Request) -> Response:
+        name, _, v = self._version(request)
+        q = request.query_params
+        lo, hi = nav.vec3(q, "min"), nav.vec3(q, "max")
+        if (hi < lo).any():
+            raise invalid("max", "max must be at least min on every axis")
+        voxel = nav.number(q, "voxel_m", nav.DEFAULT_VOXEL_M, 0.001, 1.0)
+        cap = nav.number(q, "max_points", nav.DEFAULT_MAX_POINTS, 1, nav.MAX_POINTS)
+        assert voxel is not None and cap is not None
+        if cap != int(cap):
+            raise invalid("max_points", "max_points must be an integer")
+        dv = await run_in_threadpool(self._derived().get, name, v["version"])
+        return body(await run_in_threadpool(nav.points, dv, lo, hi, voxel, int(cap)))
+
+    async def post_locate(self, request: Request) -> Response:
+        name = check_name(request.path_params["name"])
+        meta = self.s.store.require(name)
+        t0 = time.perf_counter()
+        data = await read_body(request, self.s.upload_cap)
+        parts = parse_multipart(request.headers.get("content-type", ""), data)
+        _stage(request, "upload", t0)
+        t0 = time.perf_counter()
+        if "request" not in parts:
+            raise invalid("request", "no multipart part named 'request' (the JSON body)")
+        try:
+            req = json.loads(parts["request"])
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
+        schema.validate("LocateRequest", req)
+        frames = await run_in_threadpool(nav.locate_frames, self.s.store, name, req, parts)
+        v = self.s.store.version(name, req.get("version") or int(meta["latest_version"]))
+        dv = await run_in_threadpool(self._derived().get, name, v["version"])
+        _stage(request, "prepare", t0)
+        t0 = time.perf_counter()
+        results = await run_in_threadpool(nav.locate, self._derived(), dv, frames)
+        dt = time.perf_counter() - t0
+        _stage(request, "locate", t0)
+        self.s.timings.add("locate_per_frame", dt / len(frames), len(frames))
+        located = [r for r in results if r["status"] == "located"]
+        if req.get("record") and located:
+            nav.record_pose(self.s.store, name, v["version"], located[-1])
+        return body({"map": name, "map_version": v["version"],
+                     "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"],
+                     "frames": results})
+
+    async def get_pose(self, request: Request) -> Response:
+        name = check_name(request.path_params["name"])
+        self.s.store.require(name)
+        return body({"map": name, **nav.recorded_pose(self.s.store, name)})
 
     async def delete_map(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])

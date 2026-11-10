@@ -22,6 +22,7 @@ from PIL import Image
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.anchor import Sim3
 from oh_my_slam.service.backend import (
+    Cloud,
     InternalFrame,
     InternalMap,
     NothingRegisteredError,
@@ -89,6 +90,9 @@ class FakeBackend:
     nothing: bool = False
     stats: dict[str, Any] = field(default_factory=lambda: {"observations": 400.0,
                                                            "reproj_error": 0.6})
+    depth_maps: dict[str, np.ndarray] = field(default_factory=dict)  # sha -> depth (world m)
+    cloud_world: Cloud | None = None  # the fused cloud (world frame)
+    objects_world: list[dict[str, Any]] = field(default_factory=list)  # center/R/size (world)
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -132,6 +136,9 @@ class FakeBackend:
             if sha in self.refuse or sha not in self.truth:
                 rejected.append(str(p))
                 continue
+            images = mapper_dir / "images"
+            images.mkdir(exist_ok=True)
+            (images / f"f{state['next']:06d}.jpg").write_bytes(p.read_bytes())
             state["frames"].append({"name": f"f{state['next']:06d}", "source": str(p),
                                     "T": self._internal(sha).tolist(), "sha": sha,
                                     "fx": intrinsics[p].fx})
@@ -150,16 +157,35 @@ class FakeBackend:
 
         def depth(name: str) -> np.ndarray | None:
             sha = shas.get(name)
+            if sha is not None and sha in self.depth_maps:
+                return (self.depth_maps[sha] * gauge.s).astype(np.float32)
             if sha is None or sha not in self.depth_m:
                 return None
             return np.full((24, 32), self.depth_m[sha] * gauge.s, np.float32)
+
+        def image(name: str) -> Path | None:
+            p = mapper_dir / "images" / f"{name}.jpg"
+            return p if name in shas else None
+
+        def cloud() -> Cloud | None:
+            c = self.cloud_world
+            if c is None:
+                return None
+            return Cloud(gauge.point(np.asarray(c.xyz, np.float64)).astype(np.float32), c.rgb,
+                         c.object_id)
+
+        def objects() -> list[dict[str, Any]]:
+            return [{**o, "center": gauge.point(np.asarray(o["center"], np.float64)).tolist(),
+                     "R": (gauge.R @ np.asarray(o.get("R", np.eye(3)))).tolist(),
+                     "size": (np.asarray(o["size"]) * gauge.s).tolist()}
+                    for o in self.objects_world]
 
         floor = None if self.floor_z is None else float(gauge.point(np.array([0, 0, self.floor_z]))[2])
         lo = gauge.point(np.array([-1.0, -1.0, 0.0]))
         hi = gauge.point(np.array([3.0, 3.0, 2.0]))
         pz = None if self.points_z is None else self.points_z * gauge.s + gauge.t[2]
         return InternalMap(frames, floor, (np.minimum(lo, hi).tolist(), np.maximum(lo, hi).tolist()),
-                           bool(state.get("rebuilt")), depth, pz)
+                           bool(state.get("rebuilt")), depth, pz, image, cloud, objects)
 
     def terminate(self) -> None:
         pass

@@ -32,8 +32,9 @@ Model weights are downloaded on the first start of the inference server:
 ## The service (`server.sh`, `oh_my_slam.service`)
 
 The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
-(`/api/health → capabilities`): **O1** (anchored map frame and priors) and **O4** (per-input
-status), with the service plumbing they need.
+(`/api/health → capabilities`): **O1** (anchored map frame and priors), **O4** (per-input
+status), **O5** (locate with uncertainty) and **O6** (navigation grid, points near a place), with
+the service plumbing they need.
 
 ```sh
 ./server.sh                                    # 0.0.0.0:9091, data ~/oh-my-slam-data/
@@ -50,12 +51,15 @@ status), with the service plumbing they need.
   `--keep-versions` is accepted; retention comes with O2 (every version is kept until then).
 * **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
   folder: `maps/<name>/` (`map.json`: cameras, mask digests, latest version; `masks/`;
-  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version),
+  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version;
+  `derived/`, what the grid, points and locate read per version (below); `pose.json`, the
+  recorded pose),
   `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
 * **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
-  `DELETE /api/maps/{name}`. The other endpoints of api.md come with their groups (O2, O3,
-  O5-O10); `?dry_run=1` answers `invalid_request` until O10.
+  `GET /api/maps/{name}/grid` and `/points`, `POST /api/maps/{name}/locate`,
+  `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`. The other endpoints of api.md come with
+  their groups (O2, O3, O7-O10); `?dry_run=1` answers `invalid_request` until O10.
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
@@ -175,6 +179,158 @@ length, or the multi-view refinement's median match residual) over `√n` observ
 `σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
 for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
 
+### Locate (O5)
+
+`POST /api/maps/{name}/locate` (multipart, as an update: a `request` part with the
+`LocateRequest`, one part per image or mask) places each frame in one version without changing the
+map (`mapping.relocalize`, from the version's derived keyframes, below). It needs no inference
+server.
+
+* **Checks.** A frame is first measured as in an update (`service.checks`): `plain`, `blur` or
+  `few_features` before matching (`too_close` needs a depth part, which a locate frame has not).
+  The camera's ignore mask and the frame's own are combined, rectified with the image to the
+  camera's canonical pinhole (lens handling as in an update), and no feature is taken there.
+* **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px) against every keyframe up to 24,
+  else the 12 with most nearest-neighbour votes (FLANN, L2 < 230) plus up to 6 keyframes within
+  max(1 m, 3 σ + 0.5 m) of the frame's prior; Lowe ratio 0.8, ≥ 8 matches per keyframe.
+* **Map points.** Each keyframe keypoint's map point is triangulated with the stored keyframe
+  poses where a neighbour keyframe (4 nearest with a baseline ≥ 5 % of the scene depth, optical
+  axes within 60°) sees it (reprojection ≤ 2 px at 640 px, rays ≥ 2° apart); the others come from
+  the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Provisional frames
+  take part with their provisional poses.
+* **Pose.** RANSAC PnP (EPnP, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
+  besides that pooled hypothesis, a second fit without its inliers and a fit on each of the 6
+  keyframes with most correspondences alone. The reported pose is the hypothesis explaining most
+  query keypoints, refined (Levenberg-Marquardt) on its inliers. Without enough correspondences
+  (< 15 inliers), a frame whose matched keyframes were taken from one spot (centres within
+  max(5 cm, 2 % of the depth)) is placed at their centre with the rotation that turns its rays onto
+  theirs (the turn fit of `mapping.locate`, ≥ 15 inliers that are ≥ 25 % of the matches); its
+  height is the floor plus the frame's `height_above_floor_m` (else the camera's) when given.
+* **Sigmas.** `SIGMA_SCALE × √(fit² + spread²)`, combined with the matched keyframes' median sigma:
+  *fit* is the Gauss-Newton covariance `s² (JᵀJ)⁻¹` of the inliers' reprojection residuals
+  (`s` their RMS, ≥ 0.3 px), as the 3-D RMS of the centre (m) and of the rotation (deg); *spread*
+  is the RMS distance of the other hypotheses of the same place, weighted by their squared
+  relative support. Keyframes whose depth or pose disagree therefore widen the sigmas.
+  `SIGMA_SCALE` is 1.0 until the replay calibrates it (see the measurements below).
+* **Ambiguity** (`ambiguity_support_ratio` **0.6**). The rival is the best-supported other
+  hypothesis farther than **0.10 m or 5°** that is another place: explaining mostly the same
+  query keypoints by map points ≥ 0.5 m (median) from the pose's (a symmetric room's twin view), or
+  mostly other keypoints while lying > 0.3 m or 15° away. `ambiguity` is set when its support is
+  ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. A prior, then the frame's height,
+  picks between the pose and its rival when only one agrees with it. Turn fits: a second turn
+  fit without the first one's inliers, > 5° away, at the same ratio.
+* **`consistent_with_prior`**: the pose within 3 σ of a `metric` or `drifting` prior, the two
+  sigmas combined per component (the prior's default 5 cm, 2°); null without a prior.
+* **`inlier_ratio`**: query keypoints the pose explains over those with a correspondence (turn
+  fits: inlier rays over matched rays).
+* **`nearest_view`** (no_overlap only): the keyframe with most nearest-neighbour votes (the
+  retrieval of this service: SIFT votes, no inference); `turn_deg` from the frame's guessed
+  heading (its prior's, else that keyframe's) toward where the keyframe looks (the mean of its
+  keypoints' map points) seen from the guessed position, counter-clockwise positive, in
+  (−180, 180]. Null when no keyframe has a vote.
+* **Recording.** `record: true` stores the last located frame of the request as
+  `maps/<name>/pose.json` (outside the versions); `GET /api/maps/{name}/pose` answers it, or
+  `no_pose`.
+
+### Navigation grid and points (O6)
+
+`GET /api/maps/{name}/grid?cell_m=&z_min=&z_max=&footprint_radius_m=&version=` (defaults 0.05 m,
+0.05 m, 1.8 m; `cell_m` 0.01–1 m) and `GET /api/maps/{name}/points?min=x,y,z&max=x,y,z&voxel_m=
+&max_points=` (defaults 0.01 m, 200 000; at most 2 000 000), from the version's derived data
+(`mapping.navgrid`, `service.nav`).
+
+* **Free space.** The fusion's TSDF keeps only voxels near surfaces, so the grid keeps its own
+  occupancy volume: 5 cm voxels (5 cm high), per voxel the frames whose rays passed through it
+  (`free`), ended in it (`hit`), and ended in it on a horizontal surface (`flat`, normal within
+  25° of vertical); per column the frames that observed it. A keyframe adds its aligned depth:
+  surface points from (almost) every pixel (≤ 400 000), free-space rays every few pixels (one
+  voxel apart at 4 m, ≤ 40 000), each ray free up to 5 cm + 2 % short of its hit, depth edges
+  skipped, ranges ≤ 6 m.
+* **A band.** A voxel is a surface when `hit ≥ 0.3 (hit + free)`, unless it is floor-like (at least
+  half its hits flat, within 0.10 m of the floor). A cell is `occupied` when a surface voxel's centre
+  lies in `[floor + z_min, floor + z_max]`, `free` when not occupied and a ray passed through it in
+  the band (or its floor was seen), else `unknown`; an overhang above `z_max` never makes a cell
+  occupied. `height_m` is the highest surface or floor voxel's centre below `max(z_max, 2.0)`,
+  relative to the floor; `floor_observed` a floor-like voxel in the column. `floor_z_m` is the
+  version's floor, else the lowest layer with ≥ 25 % of the most flat hits of any layer, else the
+  cameras' heights, else 1 m below the lowest camera.
+* **Camera stands.** The cell under every keyframe camera (and the disc of `footprint_radius_m`)
+  is free whatever was seen; so are the unknown cells of its blind disc that the camera cell
+  reaches without crossing an occupied cell: radius `h / tan(depression)` of the bottom row's
+  centre ray at camera height `h` (0 when that ray looks < 2° below the horizon; at most 2 m).
+* **Passages.** Through every free cell on the medial axis of the free space with a clearance
+  below 1 m, the chord toward its nearest obstacle and on to the opposite one, refined to the
+  shortest within ±10°; kept when it lies in a wall — beyond both ends the obstacle goes on along
+  the chord for 0.4 m, no free cell on the line, ≥ 70 % occupied (beside the line included) — and
+  ≤ 2 m long; the shortest one per gap; then narrowed beside it (shifts ≤ 0.3 m, ±10°) so that an
+  open leaf counts as an obstacle. Its ends are `jambs_m`, its length `width_m`, its midpoint
+  `centre_m`, `normal_deg` perpendicular to it from `regions[0]` to `regions[1]`. `kind`:
+  `narrow` when narrower than `2 × footprint_radius_m`; else `door` when a door-labelled object
+  of the version lies within 0.6 m of its centre, or both jambs are occupied and it is 0.55–1.3 m
+  wide; else `opening`. `leaf` (doors): the occupied cells within the gap's width of the jamb line
+  (off it by > 0.15 m), along it within 0.15 m of the gap, spanning ≥ 0.3 m — their rectangle;
+  `intrudes` when they reach between the jambs.
+* **Regions.** The chords are cut out of the free cells; each connected part of ≥ 0.25 m² is a
+  region (a chord whose two sides stay connected is dropped). `polygon_m` its outer boundary,
+  `coverage_share` its cells over its cells plus the unknown cells its boundary encloses.
+* **Frontiers.** Free cells next to an unknown cell (or the grid's edge), in 8-connected runs of
+  ≥ 0.3 m; `region` the region most of its cells belong to (cells on a cut: the nearest region).
+* **Ids.** `derived/ids.json` registers every region, passage and frontier answered; a new one
+  takes the id of the registered one of its kind whose centre lies within 0.75 m (regions, area
+  within a factor 2), 0.3 m (passages) or 0.5 m (frontiers), else the next id.
+* **Objects.** `nav.object_regions` is the hook the objects read (O8) calls: the region an
+  object's footprint (plus one cell) overlaps most, else the region of the cameras that saw it,
+  else null.
+* **Points.** The fused cloud in the map frame (with its object ids and colours) inside the box,
+  one point per `voxel_m` voxel (`core.geometry.voxel_downsample_indices`), then, above
+  `max_points`, the budget grid of `core.geometry.budget_voxel_indices` (`truncated: true`).
+
+**Encodings.** Every `Binary` is little-endian, row-major, base64: `state` uint8 (0 unknown,
+1 free, 2 occupied), `observations` uint16, `height_m` float32 (NaN: none), `floor_observed` uint8,
+shape `[rows (y), cols (x)]`; cell `[r, c]` covers x `origin_m[0] + c·cell_m` to `+cell_m`, y
+likewise with `r`. Points: `xyz` float32 `[n, 3]`, `object_id` uint32 `[n]` (0: none), `rgb`
+uint8 `[n, 3]`.
+
+### O5 and O6 measured (2026-11-10, M3 Pro, served from the working tree, heavy lock held)
+
+* **Locate, `examples/ainex-captures`** (640×480, fx 270, camera height 0.34 m): a map of the 64
+  frames other than every fifth registered 21 of them (this base's registration); of the 15
+  held-out frames 8 were located, 6 `no_overlap` (their headings, left 90°–210° and right
+  90°–120°, have no keyframe in that map) and 1 `few_features`. Latency per frame over HTTP
+  (upload included) median 0.3 s, max 0.55 s. The map's keyframes disagree with each other by
+  10–30° about the same view (single-keyframe fits of one frame range over 40°): the located
+  frames report `sigma_rot_deg` 3.8–24° and `sigma_pos_m` 1.1–4 cm from that spread, and one
+  (`065_right_060_down`) a rival 34° away with 0.6 of its support (`ambiguity`). Against a map of
+  all 79 frames (aligned on 17 shared keyframes, 1.3 cm rms) only one held-out frame has a
+  reference: 0.8 cm, 5.5° (σ 3.5 cm, 14.7°).
+* **Locate, `examples/office_sequence`** (12 MP): a map of 11 photos, the 2 held out located,
+  0.5 s each; against the map of all 13 (aligned 5.5 cm rms) 4.8 cm / 0.26° and 13 cm / 1.9°,
+  with σ 9.5 cm / 2.2° and 10.4 cm / 1.6° (median error/σ 0.8 in position, 0.6 in rotation; the
+  reference itself is uncertain by its 5.5 cm alignment). No ambiguity.
+* **Synthetic room** (`tests/synth/scene.py`, exact depth): 8 frames between 12 keyframes located
+  within 0.1–0.5 cm and 0.02–0.1°, 50–90 ms each; a symmetric twin view gives `ambiguity` at 180°,
+  and a prior or the camera height picks the right one (`tests/unit/test_relocalize.py`).
+* **Grid.** Derivation of a version (volume, features, triangulation): 1.8–2.7 s for 11–23
+  keyframes. `GET grid` 9–25 ms on these maps; on a synthetic 15 × 15 m house of nine rooms
+  (108 frames at 640×480, a 340 × 340 grid at 5 cm) 0.20 s in process for layers, stands and
+  features, with 11 of its 12 doors found (0.89–0.90 m; one narrowed to 0.5 m by a box beside it;
+  the missed one has a box 5 cm in front of it) and two spurious passages beside boxes. Camera cells free: 23/23 (ainex) and 13/13 (office). `GET points` of a
+  10 m box 35–330 ms. The two-room scene of `tests/synth/rooms.py` gives the door exactly: width
+  0.90 m, jambs at y 1.50 and 2.40, normal 0°/180°, kind `door`; with an open leaf 0.85 m, leaf
+  reported.
+
+### Derived versions
+
+What the grid, points and locate read is derived from each committed version once, on a worker
+thread subscribed to the store's commits (`service.derived`; a read of a version not derived yet
+derives it first): under `maps/<name>/derived/<n>/`, `volume.npz` (the previous version's volume
+plus the new or moved frames' rays; all of them again when a stored frame moved), `cloud.npz`
+(map frame), `locate.npz` (keyframe points) and `meta.json` (floor, objects, door positions);
+`derived/features/<image sha>.npz` holds each keyframe image's SIFT once for all versions.
+It uses two interfaces only: the version record (`frames[]` with `name`, `camera_id`, `internal`,
+`T_map_cam`, sigmas, `sha256`; `sim3`; `floor_z_m`) and the backend's `InternalMap`
+(`depth`, `image`, `cloud`, `objects` by internal frame name).
+
 ### Live check
 
 Run on the serving machine (M3 Pro, 18 GB), 2026-11-10, service and inference server started by
@@ -195,8 +351,9 @@ against the 1-3 cm the priors measured.
 ### Expected durations
 
 `/api/health → timings` defaults before any measurement (`service.timings.DEFAULTS`, seconds):
-registration 3.7 and fusion 0.54 per frame (above); locate 2.0 and frame analysis 1.5 per frame,
-grid read 0.5 and objects read 0.1 are placeholders until their groups measure them. Each kind
+registration 3.7 and fusion 0.54 per frame (above); locate 2.0 per frame and grid read 0.5 (the
+targets: measured values replace them as soon as the service has run them); frame analysis 1.5
+and objects read 0.1 are placeholders until their groups measure them. Each kind
 keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
 `eta_s` = the remaining predicted time of the jobs ahead + `frames × (registration + fusion)`.
 
