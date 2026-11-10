@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -215,11 +215,29 @@ def test_read_gives_keyframe_images_the_cloud_and_objects(tmp_path: Path) -> Non
 
 
 class _Client:
+    priorities: ClassVar[list[str | None]] = []  # of the clones asked for
+
     def close(self) -> None:
         pass
 
-    def clone(self) -> _Client:
+    def clone(self, priority: str | None = None) -> _Client:
+        _Client.priorities.append(priority)
         return _Client()
+
+
+def test_an_interactive_backend_asks_ahead_of_fusion(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.reconstruction import api as rec
+
+    monkeypatch.setattr(rec, "connect_server", lambda: _Client())
+    monkeypatch.setattr(rec, "reconstruct_image", lambda path, **kw: type(
+        "F", (), {"depth": np.ones((2, 2), np.float32), "valid": np.ones((2, 2), bool)})())
+    _Client.priorities = []
+    fast = be.MapperBackend().interactive()
+    assert fast.priority == "interactive"
+    fast.median_depth(tmp_path / "a.jpg", K)
+    be.MapperBackend().median_depth(tmp_path / "a.jpg", K)
+    assert _Client.priorities == ["interactive", None]
 
 
 def test_median_depth_asks_the_depth_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -285,7 +303,7 @@ def test_geometry_views_runs_mapanything(tmp_path: Path, monkeypatch: pytest.Mon
     from oh_my_slam.reconstruction import multiview as mv
 
     class Client(_Client):
-        def clone(self) -> Client:
+        def clone(self, priority: str | None = None) -> Client:
             return Client()
 
         def multiview(self, req: p.MultiviewRequest) -> p.MultiviewResponse:

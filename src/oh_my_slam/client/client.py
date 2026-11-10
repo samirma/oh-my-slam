@@ -45,9 +45,12 @@ log = get_logger("oh_my_slam.client")
 
 
 class InferenceClient:
-    def __init__(self, socket_path: Path | None = None, timeout: float = REQUEST_TIMEOUT_S) -> None:
+    def __init__(self, socket_path: Path | None = None, timeout: float = REQUEST_TIMEOUT_S,
+                 priority: str | None = None) -> None:
         self.socket_path = Path(socket_path) if socket_path else paths.socket_path()
         self.timeout = timeout
+        # sent in ``p.PRIORITY_HEADER`` with every request: ``p.INTERACTIVE`` is served first
+        self.priority = priority
         self._client: httpx.Client | None = None
 
     # -- plumbing ----------------------------------------------------------------------------------
@@ -60,9 +63,10 @@ class InferenceClient:
             )
         return self._client
 
-    def clone(self) -> InferenceClient:
-        """A separate client (own connection pool) for use from another thread."""
-        return InferenceClient(self.socket_path, self.timeout)
+    def clone(self, priority: str | None = None) -> InferenceClient:
+        """A separate client (own connection pool) for use from another thread; ``priority``
+        replaces this one's when given."""
+        return InferenceClient(self.socket_path, self.timeout, priority or self.priority)
 
     def close(self) -> None:
         if self._client is not None:
@@ -122,7 +126,8 @@ class InferenceClient:
             if not self.socket_path.exists():
                 raise ServerUnavailableError("no socket")
             try:
-                r = self._http().post(route, json=data)
+                r = self._http().post(route, json=data, headers=None if self.priority is None
+                                      else {p.PRIORITY_HEADER: self.priority})
             except httpx.TimeoutException as exc:
                 raise InferenceError(f"{route} timed out after {self.timeout:.0f} s") from exc
             except httpx.HTTPError as exc:

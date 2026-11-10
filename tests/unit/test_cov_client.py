@@ -204,6 +204,22 @@ def test_a_queue_full_answer_is_retried_with_back_off(sock: Path, image: Path,
                                      "compute_s": 0.5}
 
 
+def test_an_interactive_client_sends_its_priority(sock: Path, image: Path) -> None:
+    seen: list[str | None] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.headers.get(p.PRIORITY_HEADER))
+        return httpx.Response(200, json=GRAVITY)
+
+    bulk = served(sock, handler)
+    bulk.gravity(p.GravityRequest(image_path=str(image)))
+    fast = bulk.clone(p.INTERACTIVE)
+    assert fast.priority == p.INTERACTIVE and fast.clone().priority == p.INTERACTIVE
+    fast._client = bulk._client
+    fast.gravity(p.GravityRequest(image_path=str(image)))
+    assert seen == [None, p.INTERACTIVE]
+
+
 def test_a_server_busy_for_too_long_is_an_error(sock: Path, image: Path, clock: Clock) -> None:
     client = served(sock, lambda req: httpx.Response(503, json={"error": "busy"}))
     with pytest.raises(ServerBusyError, match=r"/v1/gravity: server busy \(busy\)"):

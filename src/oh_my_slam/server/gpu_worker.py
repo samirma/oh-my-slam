@@ -3,6 +3,9 @@
 PyTorch's MPS backend aborts the process when two threads touch the device (pytorch#197805), so
 every model operation — loading, ``.to()``, forward passes, read-back and cache clearing — runs on
 this one thread. Requests queue up to ``max_queue``; beyond that :class:`QueueFullError` (HTTP 503).
+The queue is a priority queue (inference.md, single worker): a job submitted with
+``INTERACTIVE`` priority (locate, dry runs, frame analysis) runs before every ``BULK`` one (a
+job's fusion) still waiting, and jobs of one priority run in submission order.
 A job that fails has its traceback's frames (and those of the exceptions chained to it) cleared
 here before its exception leaves the thread, so the device tensors they held are freed on this
 thread, not on the event loop's. ``after_job``, when set, then runs on this thread after every
@@ -16,6 +19,7 @@ the next job's device work does not wait for it.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import threading
@@ -31,6 +35,9 @@ T = TypeVar("T")
 log = logging.getLogger(__name__)
 
 _STOP = object()
+INTERACTIVE = 0  # priorities: lower runs first
+BULK = 1
+_LAST = 2  # the stop marker: after everything queued
 
 
 def _clear_frames(exc: BaseException) -> None:
@@ -68,7 +75,8 @@ class WorkerStoppedError(RuntimeError):
 class GpuWorker:
     def __init__(self, max_queue: int = 8, name: str = "gpu-worker") -> None:
         self.max_queue = max_queue
-        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max_queue)
+        self._queue: queue.PriorityQueue[Any] = queue.PriorityQueue(maxsize=max_queue)
+        self._seq = itertools.count()  # submission order within a priority
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._stopped = threading.Event()
         self._busy = threading.Event()
@@ -84,11 +92,17 @@ class GpuWorker:
         return self._queue.qsize() + (1 if self._busy.is_set() else 0)
 
     def submit(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> Future[T]:
+        return self.submit_at(BULK, fn, *args, **kwargs)
+
+    def submit_at(self, priority: int, fn: Callable[..., T], *args: Any, **kwargs: Any
+                  ) -> Future[T]:
+        """``submit`` with a priority (``INTERACTIVE`` before ``BULK``)."""
         if self._stopped.is_set():
             raise WorkerStoppedError("worker stopped")
         fut: Future[T] = Future()
         try:
-            self._queue.put_nowait((fut, fn, args, kwargs, time.perf_counter()))
+            self._queue.put_nowait((priority, next(self._seq),
+                                    (fut, fn, args, kwargs, time.perf_counter())))
         except queue.Full as exc:
             raise QueueFullError(f"queue full ({self.max_queue} jobs)") from exc
         return fut
@@ -96,7 +110,7 @@ class GpuWorker:
     def stop(self, timeout: float = 10.0) -> None:
         self._stopped.set()
         try:
-            self._queue.put(_STOP, timeout=timeout)
+            self._queue.put((_LAST, next(self._seq), _STOP), timeout=timeout)
         except queue.Full:
             pass
         self._thread.join(timeout)
@@ -111,7 +125,7 @@ class GpuWorker:
     def _run(self) -> None:
         self.thread_ident = threading.get_ident()
         while True:
-            item = self._queue.get()
+            item = self._queue.get()[2]
             if item is _STOP:
                 break
             fut, fn, args, kwargs, enqueued = item
@@ -141,7 +155,7 @@ class GpuWorker:
         # fail anything left
         while True:
             try:
-                item = self._queue.get_nowait()
+                item = self._queue.get_nowait()[2]
             except queue.Empty:
                 break
             if item is not _STOP:

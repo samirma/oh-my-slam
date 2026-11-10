@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.client.protocol import INTERACTIVE
 from oh_my_slam.core.errors import (
     DeviceMemoryError,
     ExitCode,
@@ -105,6 +106,10 @@ class Registered:
 class Backend(Protocol):
     def require_inference(self) -> None:
         """``inference_unavailable`` unless the inference server is ready."""
+
+    def interactive(self) -> Backend:
+        """This backend with its inference requests served ahead of fusion (dry runs:
+        inference.md, single worker)."""
 
     def median_depth(self, image: Path, K: Intrinsics) -> float | None:
         """The median monocular depth of an image (metres), or None."""
@@ -217,10 +222,16 @@ MAPPER_CMD = (sys.executable, "-m", "oh_my_slam.service.mapper_proc")
 
 
 class MapperBackend:
-    def __init__(self, cmd: tuple[str, ...] = MAPPER_CMD) -> None:
+    def __init__(self, cmd: tuple[str, ...] = MAPPER_CMD, priority: str | None = None) -> None:
         self.cmd = cmd
+        self.priority = priority  # of its inference requests (``client.protocol.PRIORITIES``)
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
+
+    def interactive(self) -> MapperBackend:
+        """A backend whose inference requests the server serves before fusion's; it runs no
+        mapper (a dry run's)."""
+        return MapperBackend(self.cmd, INTERACTIVE)
 
     def require_inference(self) -> None:
         from oh_my_slam.service.inference import inference_ready
@@ -232,7 +243,7 @@ class MapperBackend:
         from oh_my_slam.reconstruction.api import connect_server, reconstruct_image
 
         try:
-            client = connect_server().clone()  # a client of its own: asked from several threads
+            client = connect_server().clone(self.priority)  # a client of its own: asked from several threads
             try:
                 fr = reconstruct_image(image, intrinsics=K, max_side=512, want_gravity=False,
                                        client=client)
@@ -248,7 +259,7 @@ class MapperBackend:
         try:
             # a client of its own: jobs ask for several frames at once, and the shared client
             # is not for use from several threads
-            client = connect_server().clone()
+            client = connect_server().clone(self.priority)
             try:
                 fr = reconstruct_image(image, intrinsics=K, max_side=MONO_GRID_SIDE,
                                        want_gravity=gravity, want_descriptor=True, client=client)
@@ -268,7 +279,7 @@ class MapperBackend:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
-            client = connect_server().clone()
+            client = connect_server().clone(self.priority)
             try:
                 res, _ = run_multiview(
                     images, out_dir, intrinsics=list(intrinsics),
@@ -286,7 +297,7 @@ class MapperBackend:
         from oh_my_slam.segmentation.api import detect_on_grid
 
         try:
-            client = connect_server().clone()
+            client = connect_server().clone(self.priority)
             try:
                 return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE)
             finally:
@@ -300,7 +311,7 @@ class MapperBackend:
         from oh_my_slam.segmentation.api import look_closer
 
         try:
-            client = connect_server().clone()
+            client = connect_server().clone(self.priority)
             try:
                 return look_closer(image, regions, dets, grid, client, MAP_MIN_SCORE)
             finally:

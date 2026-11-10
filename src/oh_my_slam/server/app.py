@@ -1,7 +1,8 @@
 """FastAPI application: a non-blocking ``/health`` and one POST route per model.
 
 Every model call is handed to the single :class:`GpuWorker`; the HTTP event loop only awaits
-futures, so ``/health`` never waits on the device. The part of a call that needs no device
+futures, so ``/health`` never waits on the device. A request whose ``p.PRIORITY_HEADER`` is
+``p.INTERACTIVE`` (locate, dry runs, frame analysis) is queued ahead of the others (fusion). The part of a call that needs no device
 (``CpuFinish``: GeoCalib's least-squares refinement) then runs on a CPU thread (``cpu_pool``). After every job the worker calls
 :meth:`ServerState.after_job` on its thread, which frees and measures the device memory that
 ``/health`` reports (``memory``, ``last_oom`` and the ``degraded`` status).
@@ -18,12 +19,19 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.core.errors import InputError
-from oh_my_slam.server.gpu_worker import CpuFinish, GpuWorker, QueueFullError, WorkerStoppedError
+from oh_my_slam.server.gpu_worker import (
+    BULK,
+    INTERACTIVE,
+    CpuFinish,
+    GpuWorker,
+    QueueFullError,
+    WorkerStoppedError,
+)
 from oh_my_slam.server.models import Registry
 from oh_my_slam.version import PROTOCOL_VERSION
 
@@ -130,7 +138,8 @@ def _error(status: int, error: str, detail: str | None = None) -> JSONResponse:
 def create_app(state: ServerState) -> FastAPI:
     app = FastAPI(title="oh-my-slam inference server", docs_url=None, redoc_url=None)
 
-    async def dispatch(key: str, call: Callable[[Any], dict[str, Any]], model: type) -> Any:
+    async def dispatch(key: str, call: Callable[[Any], dict[str, Any]], model: type,
+                       request: Request) -> Any:
         status = state.status()
         if status in ("loading", "stopping"):
             return _error(503, f"server {status}")
@@ -139,7 +148,9 @@ def create_app(state: ServerState) -> FastAPI:
             err = state.registry.state.get(key)
             return _error(500, f"model '{key}' unavailable", err.error if err else None)
         try:
-            fut = state.worker.submit(call, adapter)
+            priority = INTERACTIVE if request.headers.get(p.PRIORITY_HEADER) == p.INTERACTIVE \
+                else BULK
+            fut = state.worker.submit_at(priority, call, adapter)
         except QueueFullError as exc:
             return _error(503, "busy", str(exc))
         except WorkerStoppedError:
@@ -168,19 +179,19 @@ def create_app(state: ServerState) -> FastAPI:
         return state.health()
 
     @app.post(p.ROUTE_GEOMETRY, response_model=p.GeometryResponse)
-    async def geometry(req: p.GeometryRequest) -> Any:
-        return await dispatch("geometry", lambda a: a.run(req), p.GeometryResponse)
+    async def geometry(req: p.GeometryRequest, request: Request) -> Any:
+        return await dispatch("geometry", lambda a: a.run(req), p.GeometryResponse, request)
 
     @app.post(p.ROUTE_GRAVITY, response_model=p.GravityResponse)
-    async def gravity(req: p.GravityRequest) -> Any:
-        return await dispatch("gravity", lambda a: a.run(req), p.GravityResponse)
+    async def gravity(req: p.GravityRequest, request: Request) -> Any:
+        return await dispatch("gravity", lambda a: a.run(req), p.GravityResponse, request)
 
     @app.post(p.ROUTE_SEGMENT, response_model=p.SegmentResponse)
-    async def segment(req: p.SegmentRequest) -> Any:
-        return await dispatch("segment_yoloe", lambda a: a.run(req), p.SegmentResponse)
+    async def segment(req: p.SegmentRequest, request: Request) -> Any:
+        return await dispatch("segment_yoloe", lambda a: a.run(req), p.SegmentResponse, request)
 
     @app.post(p.ROUTE_MULTIVIEW, response_model=p.MultiviewResponse)
-    async def multiview(req: p.MultiviewRequest) -> Any:
-        return await dispatch("multiview", lambda a: a.run(req), p.MultiviewResponse)
+    async def multiview(req: p.MultiviewRequest, request: Request) -> Any:
+        return await dispatch("multiview", lambda a: a.run(req), p.MultiviewResponse, request)
 
     return app

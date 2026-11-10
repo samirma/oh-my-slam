@@ -189,14 +189,34 @@ def test_jobs_queued_behind_the_stop_marker_fail() -> None:
     stopper.start()
     _until(lambda: w._queue.qsize() == 1)  # the stop marker is queued
     late: Future[Any] = Future()
-    w._queue.put_nowait((late, lambda: "late", (), {}, time.perf_counter()))
-    w._queue.put_nowait(gpu_worker._STOP)  # a second stop() racing the first
+    w._queue.put_nowait((gpu_worker._LAST, next(w._seq),
+                         (late, lambda: "late", (), {}, time.perf_counter())))
+    # a second stop() racing the first
+    w._queue.put_nowait((gpu_worker._LAST, next(w._seq), gpu_worker._STOP))
     gate.set()
     stopper.join(5)
     with pytest.raises(WorkerStoppedError):
         late.result(timeout=5)
     with pytest.raises(WorkerStoppedError):
         w.submit(lambda: None)
+
+
+def test_interactive_jobs_run_before_waiting_bulk_ones() -> None:
+    """The single worker's queue is a priority queue (inference.md): an interactive job
+    submitted after bulk ones runs before them; jobs of one priority keep their order."""
+    w = GpuWorker(max_queue=8)
+    gate = threading.Event()
+    order: list[str] = []
+    w.start()
+    w.submit(gate.wait, 5)
+    _until(lambda: w._queue.qsize() == 0 and w.depth == 1)
+    futs = [w.submit(order.append, "bulk1"), w.submit(order.append, "bulk2"),
+            w.submit_at(gpu_worker.INTERACTIVE, order.append, "locate")]
+    gate.set()
+    for f in futs:
+        f.result(timeout=5)
+    w.stop()
+    assert order == ["locate", "bulk1", "bulk2"]
 
 
 def _until(cond: Any, timeout: float = 5.0) -> None:

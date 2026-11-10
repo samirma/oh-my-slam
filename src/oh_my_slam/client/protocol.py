@@ -16,6 +16,10 @@ ROUTE_GEOMETRY = "/v1/geometry"
 ROUTE_GRAVITY = "/v1/gravity"
 ROUTE_SEGMENT = "/v1/segment"
 ROUTE_MULTIVIEW = "/v1/multiview"
+# a request's priority (inference.md, single worker): the device queue serves ``interactive``
+# requests (locate, dry runs, frame analysis) before the others (a job's fusion)
+PRIORITY_HEADER = "x-oms-priority"
+INTERACTIVE = "interactive"
 # ``ErrorBody.error`` (HTTP 500) of a request the device ran out of memory for: a smaller one may
 # fit
 OUT_OF_MEMORY = "out_of_memory"

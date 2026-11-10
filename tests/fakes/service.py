@@ -131,6 +131,11 @@ class FakeBackend:
         self.depth_m[sha] = depth_m
         return image
 
+    def interactive(self) -> FakeBackend:
+        """Itself, its interactive calls counted (a dry run's)."""
+        self.interactive_calls = getattr(self, "interactive_calls", 0) + 1
+        return self
+
     def require_inference(self) -> None:
         from oh_my_slam.service.errors import ApiError
 
