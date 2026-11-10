@@ -1476,7 +1476,7 @@
             },
             "floor_observed": {
               "$ref": "#/$defs/Binary",
-              "description": "uint8 1 when a floor surface was observed in the cell at floor height."
+              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc); 0 not observed."
             }
           }
         },
@@ -1723,8 +1723,11 @@
                   "$ref": "#/$defs/Mat4"
                 },
                 "turn_deg": {
-                  "type": "number",
-                  "description": "Signed turn (CCW positive) from the frame's guessed heading toward that keyframe's view."
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "Signed turn (CCW positive) from the frame's prior heading toward that keyframe's view; null without a prior."
                 }
               }
             }

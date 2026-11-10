@@ -67,7 +67,7 @@ def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit() -> None:
     assert o.T is not None
     dp, dr = rl.pose_distance(o.T, T)
     assert dp < 0.01 and dr < 0.2
-    assert o.sigma_pos_m is not None and 0.01 < o.sigma_pos_m < 0.03
+    assert o.sigma_pos_m is not None and 0.0005 < o.sigma_pos_m < 0.03  # not floored at 1 cm
     noisy = rl.locate(_query(T, P, D, noise=2.0), idx)
     assert noisy.sigma_pos_m is not None and noisy.sigma_pos_m > o.sigma_pos_m
     assert o.inlier_ratio is not None and o.inlier_ratio > 0.9
@@ -175,15 +175,15 @@ def test_nearest_view_turns_toward_where_the_keyframe_looks() -> None:
     idx = rl.Index([kf])
     q = _query(A, P, D)
     k, turn = rl.nearest_view(q, idx, 0)
-    assert k is kf and abs(turn) < 15.0
+    assert k is kf and turn is None  # no prior: the frame's heading is unknown
+    q.prior = A
+    _, turn = rl.nearest_view(q, idx, 0)
+    assert turn is not None and abs(turn) < 15.0
     q.prior = rooms.camera(0.0, 0.0, 1.0, 90.0)  # looking 90 deg left of the keyframe's view
     _, turn = rl.nearest_view(q, idx, 0)
     assert turn == pytest.approx(-90.0, abs=15.0)
     blind = rl.Keyframe("b", A, K, kf.uv, kf.desc, np.full_like(kf.xyz, np.nan), 0.0, 0.0)
     assert np.allclose(blind.view_point(), A[:3, 3] + A[:3, 2])
-    q.prior = None
-    _, turn = rl.nearest_view(q, rl.Index([blind]), 0)
-    assert turn == pytest.approx(0.0, abs=1e-6)
     above = A.copy()
     above[:3, 3] = blind.view_point() - [0, 0, 1]
     q.prior = above

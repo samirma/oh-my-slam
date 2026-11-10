@@ -79,10 +79,12 @@ CHORD_REFINE_DEG = 10.0
 PASSAGE_MAX_W = 2.0  # wider gaps are not narrowings
 MIN_PASSAGE_W = 0.2
 NMS_M = 0.3
-NARROW_SHIFT_M = 0.3
+NARROW_SHIFT_M = 0.5
+NARROW_TURN_DEG = 20.0
+NARROW_EXACT = 8  # screened chords measured exactly
 CHORD_MAX_M = 4.0  # a chord is measured this far each way
 JAMB_RUN_M = 0.4  # a passage's jambs: wall that goes on this far along the gap's line
-JAMB_OCCUPIED = 0.7
+JAMB_OCCUPIED = 0.5
 DOOR_MIN_W = 0.55
 DOOR_MAX_W = 1.3
 DOOR_OBJECT_M = 0.6  # a door-labelled object this close to a passage's centre makes it a door
@@ -90,6 +92,7 @@ LEAF_MIN_M = 0.3
 LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, are leaf cells
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
+FLOOR_BY_RULE = 2  # floor_observed: free by rule (camera stand, blind disc), floor not seen
 
 Array = NDArray[np.float64]
 
@@ -377,8 +380,9 @@ def resample(lay: Layers, cell: float) -> Layers:
     np.maximum.at(state, target, prio)
     obs = np.zeros(rows * cols, np.uint16)
     np.maximum.at(obs, target, lay.observations.ravel())
-    fl = np.zeros(rows * cols, np.uint8)
-    np.maximum.at(fl, target, lay.floor_observed.ravel())
+    fl = np.zeros(rows * cols, np.uint8)  # seen (1) over free by rule (2) over not seen (0)
+    np.maximum.at(fl, target, np.array([0, 2, 1], np.uint8)[lay.floor_observed.ravel()])
+    fl = np.array([0, 2, 1], np.uint8)[fl]
     h = np.full(rows * cols, -np.inf, np.float32)
     np.maximum.at(h, target, np.where(np.isnan(lay.height), -np.inf, lay.height).ravel())
     h[np.isinf(h)] = np.nan
@@ -437,11 +441,12 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
                 footprint_radius: float | None) -> None:
     """Free the camera cells (and the footprint) whatever was seen there, and the unknown cells
     of each camera's blind disc that the camera cell reaches without crossing an occupied cell
-    (in place)."""
+    (in place). Those cells whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
         r, c = _disc(lay, xy, footprint_radius or 0.0)
         lay.state[r, c] = FREE
+        _by_rule(lay, r, c)
         ring = blind_radius(st, floor_z)
         if ring <= lay.cell:
             continue
@@ -458,6 +463,13 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         reach = lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]
         unknown = reach & (lay.state[r, c] == UNKNOWN)
         lay.state[r[unknown], c[unknown]] = FREE
+        _by_rule(lay, r[reach], c[reach])
+
+
+def _by_rule(lay: Layers, r: NDArray[np.int64], c: NDArray[np.int64]) -> None:
+    """``floor_observed`` 2 on free cells whose floor was not seen."""
+    m = (lay.floor_observed[r, c] == 0) & (lay.state[r, c] == FREE)
+    lay.floor_observed[r[m], c[m]] = FLOOR_BY_RULE
 
 
 # ------------------------------------------------------------------------------------------------
@@ -624,19 +636,19 @@ def _passage_chords(state: NDArray[np.uint8], cell: float
     rc = np.argwhere(ridge)
     P = rc[:, ::-1] + 0.5
     D = np.column_stack([ix[rc[:, 0], rc[:, 1]], iy[rc[:, 0], rc[:, 1]]]) + 0.5 - P
-    theta = np.arctan2(D[:, 1], D[:, 0])
     lim = PASSAGE_MAX_W / cell + 1
-    U = np.column_stack([np.cos(theta), np.sin(theta)])
-    t1 = _march_many(free, P, U, lim)
-    t2 = _march_many(free, P, -U, lim)
-    keep = (t1 + t2) * cell <= PASSAGE_MAX_W + cell
-    keep[keep] = _walled_many(state, P[keep] - U[keep] * t2[keep, None],
-                              P[keep] + U[keep] * t1[keep, None], cell)
     found = []
-    for k in np.flatnonzero(keep):
-        L, e1, e2, _, _ = _chord_at(free, P[k], float(theta[k]), max_t)
-        if L * cell <= PASSAGE_MAX_W and _walled(state, e1, e2, cell):
-            found.append((L, P[k], float(theta[k])))
+    for theta in (np.arctan2(D[:, 1], D[:, 0]),):  # toward the nearest obstacle
+        U = np.column_stack([np.cos(theta), np.sin(theta)])
+        t1 = _march_many(free, P, U, lim)
+        t2 = _march_many(free, P, -U, lim)
+        keep = (t1 + t2) * cell <= PASSAGE_MAX_W + cell
+        keep[keep] = _walled_many(state, P[keep] - U[keep] * t2[keep, None],
+                                  P[keep] + U[keep] * t1[keep, None], cell)
+        for k in np.flatnonzero(keep):
+            L, e1, e2, _, _ = _chord_at(free, P[k], float(theta[k]), max_t)
+            if L * cell <= PASSAGE_MAX_W and _walled(state, e1, e2, cell):
+                found.append((L, P[k], float(theta[k])))
     out: list[tuple[float, Array, Array, tuple[int, int] | None, tuple[int, int] | None]] = []
     centres: list[tuple[Array, float]] = []
     for _, p, th in sorted(found, key=lambda f: (f[0], f[1][1], f[1][0])):
@@ -659,23 +671,33 @@ def _passage_chords(state: NDArray[np.uint8], cell: float
 def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any], cell: float,
                max_t: float) -> tuple[float, Array, Array, tuple[int, int] | None,
                                       tuple[int, int] | None]:
-    """The narrowest free chord beside a passage's walled chord ``ch`` (shifted by up to
-    ``NARROW_SHIFT_M`` across it, turned by up to ``CHORD_REFINE_DEG``) whose ends stay within
-    ``NARROW_SHIFT_M`` of its ends: an open leaf narrows the gap next to the wall."""
+    """The narrowest free chord of a passage: shifted along its normal by up to
+    ``NARROW_SHIFT_M``, turned by up to ``NARROW_TURN_DEG``, ending on obstacles at both ends,
+    its midpoint between the walled chord ``ch``'s jambs (along their line). An open leaf, or a
+    door frame deeper than the wall, narrows the gap beside the wall line."""
     L0, a, b = ch[0], ch[1], ch[2]
     u = (b - a) / max(L0, 1e-9)
     n = np.array([-u[1], u[0]])
     mid = (a + b) / 2
     th0 = math.atan2(u[1], u[0])
-    best = ch
     shift = NARROW_SHIFT_M / cell
-    for s_ in np.arange(-shift, shift + 1e-9, 1.0):
-        for ang in np.arange(-CHORD_REFINE_DEG, CHORD_REFINE_DEG + 1e-9, 2.5):
-            c = _chord_at(free, mid + n * s_, th0 + math.radians(ang), max_t)
-            ends = sorted((c[1], c[2]), key=lambda e: float((e - a) @ u))
-            if c[0] < best[0] - 1e-9 and float(np.linalg.norm(ends[0] - a)) <= shift \
-                    and float(np.linalg.norm(ends[1] - b)) <= shift:
-                best = (c[0], c[2], c[1], c[4], c[3])  # from a's side to b's, as ``ch``
+    S, A = np.meshgrid(np.arange(-shift, shift + 1e-9, 1.0),
+                       np.radians(np.arange(-NARROW_TURN_DEG, NARROW_TURN_DEG + 1e-9, 2.5)))
+    P = mid + np.outer(S.ravel(), n)
+    th = th0 + A.ravel()
+    U = np.column_stack([np.cos(th), np.sin(th)])
+    lim = L0 + 2.0  # a screening of every shift and turn, then the best ones exactly
+    t1 = _march_many(free, P, U, lim)
+    t2 = _march_many(free, P, -U, lim)
+    along = ((P + U * ((t1 - t2) / 2)[:, None]) - a) @ u
+    ok = (t1 < lim) & (t2 < lim) & (along >= 0) & (along <= L0)
+    best = ch
+    for k in np.flatnonzero(ok)[np.argsort((t1 + t2)[ok], kind="stable")][:NARROW_EXACT]:
+        c = _chord_at(free, P[k], float(th[k]), max_t)
+        mid_along = float(((c[1] + c[2]) / 2 - a) @ u)
+        if c[0] < best[0] - 1e-9 and c[3] is not None and c[4] is not None \
+                and 0.0 <= mid_along <= L0:
+            best = (c[0], c[2], c[1], c[4], c[3])  # from a's side to b's, as ``ch``
     return best
 
 
@@ -791,11 +813,12 @@ def features(lay: Layers, footprint_radius: float | None = None,
         filled = ndimage.binary_fill_holes(cells)
         enclosed_unknown = int((filled & (state == UNKNOWN)).sum())
         n_cells = int(cells.sum())
+        seen = int((cells & (lay.floor_observed == 1)).sum())
         rows, cols = np.nonzero(cells)
         regions.append(Region(cells, round(float(area), 4),
                               lay.centre(float(rows.mean()), float(cols.mean())),
                               _polygon(cells, lay),
-                              round(n_cells / (n_cells + enclosed_unknown), 4)))
+                              round(seen / (n_cells + enclosed_unknown), 4)))
         index[i] = len(regions)
     labels = index[parts].astype(np.int32)
     near_lab = _geodesic_labels(free, labels)  # barrier cells and small parts: nearest region
