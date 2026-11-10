@@ -788,6 +788,12 @@ class Cloud:
         out: NDArray[np.float64] = self.xyz / np.maximum(self.count, 1)[:, None]
         return out
 
+    def drop(self, mask: NDArray[np.bool_]) -> None:
+        """Remove the voxels ``mask`` selects (a struck object's place seen through)."""
+        keep = ~np.asarray(mask, bool)
+        self.keys, self.xyz, self.rgb, self.count = (self.keys[keep], self.xyz[keep],
+                                                     self.rgb[keep], self.count[keep])
+
     def save(self, path: Path) -> None:
         tmp = path.with_suffix(".tmp.npz")
         np.savez(tmp, keys=self.keys, xyz=self.xyz, rgb=self.rgb.astype(np.float32),

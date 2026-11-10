@@ -56,6 +56,9 @@ ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint("GET", "/api/maps/{name}/frames", "get_frames", "Keyframes and their poses",
              {200: "Frames"}, ("map_not_found", "version_gone", "invalid_request"),
              params=(MAP, VERSION)),
+    Endpoint("GET", "/api/maps/{name}/objects", "get_objects", "Object records and support "
+             "surfaces", {200: "Objects"}, ("map_not_found", "version_gone", "invalid_request"),
+             params=(MAP, VERSION)),
     Endpoint("GET", "/api/maps/{name}/grid", "get_grid", "Navigation grid", {200: "Grid"},
              ("map_not_found", "version_gone", "invalid_request"),
              params=(MAP, VERSION,

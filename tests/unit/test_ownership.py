@@ -128,7 +128,8 @@ def test_mapping_delegates_depth_and_segmentation() -> None:
     assert _grep(r"reconstruct_image\(", files) == {"mapping/api.py", "mapping/locate.py"}
     assert _grep(r"detect_alongside\(", files) == {"mapping/api.py"}
     assert _grep(r"lift_detections\(", files) == {"mapping/objects.py"}
-    assert _grep(r"fit_object_obb\(", files) == {"mapping/objects.py"}
+    assert _grep(r"fit_object_obb\(", files) == {"mapping/objects.py",
+                                                  "mapping/anchored_objects.py"}
     assert not _grep(r"\bfit_obb\(|\blift_mask\(|\bdetect\(|color(_hex)?_for_id\(|"
                      r"segmentation\.(detect|lift|obb|colors)\b", files)
     # segmentation owns lifting and colours; it does not know the mapper's keyframe settings

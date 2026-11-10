@@ -35,7 +35,7 @@ The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Imple
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
 status), **O5** (locate with uncertainty), **O6** (navigation grid, points near a place),
-**O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing
+**O8** (object records, support surfaces and relations), **O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing
 they need. New maps take the *prior-first registration* (below).
 
 ```sh
@@ -59,9 +59,9 @@ they need. New maps take the *prior-first registration* (below).
   `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
 * **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
-  `GET /api/maps/{name}/grid` and `/points`, `POST /api/maps/{name}/locate`,
+  `GET /api/maps/{name}/grid`, `/points` and `/objects`, `POST /api/maps/{name}/locate`,
   `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*).
-  The other endpoints of api.md come with their groups (O2, O3, O7, O8).
+  The other endpoints of api.md come with their groups (O2, O3, O7).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
@@ -181,6 +181,73 @@ length, or the multi-view refinement's median match residual) over `√n` observ
 `σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
 for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
 
+### Objects, surfaces and relations (O8)
+
+`GET /api/maps/{name}/objects` [`Objects`] on an anchored map (`mapping.anchored_objects`,
+called by `service.prior_first` after the engine placed and fused the update's keyframes):
+
+* **Detections.** Every new frame is segmented (YOLOE-26x + MobileCLIP2 in the inference
+  server, `segmentation.api.detect_on_grid`) while it is registered, masks on its monocular
+  depth grid (640 px on the long side), and only the frames kept as keyframes are used. Each
+  detection is lifted on the keyframe's fused depth into the map frame (`lift_on_grid`, without
+  the support its mask bled onto, without the floor named as an object).
+* **Association, incremental.** Only the new keyframes are folded in, in request order. A
+  detection goes to the object it overlaps (points within the object's box grown by 5 cm, or the
+  object's within its own; for compatible labels also the nearness of the centres; for other
+  labels both ways at 0.7) and the box is refitted at once; else it starts an object whose id is
+  never reused. `match` is what frame analysis (O7) reuses to give a detection a map id.
+* **Latest wins.** A keyframe that has an object in view and does not detect it judges it on its
+  depth: samples seen through by more than max(4 cm, 4 % of the depth) against samples in place
+  (hidden ones and the bottom quarter, the support, tell nothing). After the object's last
+  sighting, more keyframes seeing it gone than in place strike it (one alone must see 70 %
+  through): `state: struck` for that version, removed by the next update, and the cloud voxels
+  in its box that the witnesses see through are carved. A new object of a compatible label,
+  similar size (×1.6) and colour (60 sRGB) appearing in the same update is that object moved:
+  `moved`, `moved_from_m`. An object is listed from two detections, or one that no keyframe
+  contradicted by seeing its place without detecting it.
+* **Fields.** `mean_rgb`: the pixel-weighted mean of the robust mean colours (inner mask, 10-90 %
+  luminance) of the 3 sightings that saw it best (uncut masks first, then largest). `color`: the
+  id's display colour. `sigma_centre_m`: the sightings' pose sigma and depth noise (1 % sensor,
+  5 % monocular, of the distance) over their number, plus the spread of their centres while an
+  axis is only partly seen. `extent_seen`: an axis is `full` when an uncut sighting sees it across
+  (|cos| ≤ 0.8 to the ray) or sightings from both ends see it; `z` when one sees top and bottom
+  uncut, or the top with the box resting on a support.
+* **Surfaces.** Horizontal planes of the fused cloud: 5 cm cells whose points concentrate (50 %
+  of ±10 cm) in a ±2 cm slab at a height many cells share; connected areas of at least 0.06 m²
+  with a core (no lines of wall cells), up to the highest camera. `height_m` is the median of
+  their points; ids are stable (same height within 4 cm and overlapping extent).
+* **Relations.** `supported_by`: the surface or object top within 5 cm of the box's bottom under
+  its centre — the surface when both fit unless the object's top is nearer by 1 cm and it is no
+  table-like top; the box then rests on the surface. `inside_of`: the centre within the box of a
+  larger container (bowl, box, basket, drawer, cup...), which also supports it.
+  `verified_version`: the latest version that observed the object or its support with the
+  relation holding (surfaces are measured by every update).
+* **Region** is the grid's (`nav.object_regions`, the default grid), set when the read's answer
+  is computed. Door-labelled objects feed the grid's passages of kind `door`; the points read
+  carries each object's id in `object_id`.
+* **Per version.** The records are committed with the version (`versions/<n>.objects.json`); the
+  answer with regions is computed by the derivation worker after the commit and kept
+  (`derived/<n>/objects.json`): a read loads it. Maps of the older mapper list their objects with
+  defaults (no surfaces, colour grey, `partial` extents).
+
+Measured on the serving machine (M3 Pro), 2026-11-10, in-process service with the shared
+inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `none`:
+
+* **Latest wins.** Split 4 + 9: version 1 lists the cup (`confirmed`, on the windowsill surface,
+  `mean_rgb` (159, 155, 147) for a cream mug in shade); version 2 lists it `struck` (p04, p10,
+  p11, p12 see its place 97-100 % through), and the laptop, keyboard, key, wallet and glass keep
+  their ids 2, 4, 5, 6, 8. In one update of 13 the cup is `struck` in version 1 as well.
+* **Surfaces.** Desk top at −0.53 m (0.35 m²; the keyboard, key, laptop and speaker on it) and
+  windowsill at −0.41 m (0.22 m²; the cup, wallet and glass on it), ids stable across versions;
+  a lower ledge at −0.71 m.
+* **Speed.** Segmentation per keyframe 0.22 s at 640 × 480 and 0.18 s at 640 × 360 (median of
+  11, one pass); about 1 s at 1280 × 960 (two passes). Objects fusion of 13 keyframes 7.8-14 s
+  including the detections it waits for. The objects read: 1-2 ms once the version's answer is
+  kept; 0.6-2.6 s when it arrives before the derivation worker has derived the version (the read
+  derives it).
+* **Synthetic table** (`tests/unit/test_anchored_objects.py`, exact depth and masks): floor and
+  table top within 5 mm, `supported_by`, `inside_of` (apple in basket, egg in bowl), box resting
+  on the top, `mean_rgb` exact, struck and moved with ids kept.
 ### Locate (O5)
 
 `POST /api/maps/{name}/locate` (multipart, as an update: a `request` part with the
