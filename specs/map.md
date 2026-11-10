@@ -33,7 +33,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   Its `quality.gauge_shift` is the movement of the stored keyframes: over the previous
   version's keyframes, the median translation (m) and rotation (deg) between their pose in the
   previous version and the pose that would be committed; `scale_ratio` 1. It is about 0 when
-  no stored keyframe moved.
+  no stored keyframe moved. Stored `kept_at_prior` keyframes are stored keyframes: their
+  movement counts here and in `previous_residuals`.
 * **Residuals against the previous version.** `quality.previous_residuals` covers the earlier
   keyframes only: its `count` is at most the previous version's keyframe count. A stored
   keyframe that moves beyond tolerance shows in `previous_residuals.max_m` / `max_deg` and is
@@ -45,15 +46,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     median scene depth, below 0.02) counts only its rotation;
   * frames `kept_at_prior` or `rejected` have no image-only pose and are left out.
 
-  So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gate
-  on `max_displacement_m` measures new-frame disagreement.
+  So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gates
+  on `max_displacement_m` / `max_displacement_deg` measure new-frame disagreement. Prior
+  corrections show in `prior_disagreement_deg` and `prior_residual_*` only.
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
   images give between overlapping frames. Where two frames overlap by at least 50 % and their
   image relative rotation disagrees with their priors' relative rotation by more than 3 of the
   priors' rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
-  the images. `quality` always reports
-  `prior_disagreement_deg`: the largest such disagreement over the update's frames, 0 when
-  none.
+  the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
+  over the update's frames, 0 when none.
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
@@ -109,7 +110,9 @@ becomes a job with a `job_id`. A job goes through these states:
 * **What ends a job.** A client disconnect never cancels a job. Only a cancel or a stop of the
   service ends it. A job still running when the service stops is `failed` on restart.
 * **Order of addition.** A later job wins over an earlier one, and within one job a later frame
-  wins over an earlier one, in request order. Capture timestamps are not used.
+  wins over an earlier one, in request order. Capture timestamps are not used. An engine may
+  register frames in any internal order, but the committed result equals request-order
+  semantics: a later observation wins (C13).
 * **What a later observation does.**
   * A later observation of a surface or object replaces the earlier one: an object seen gone is
     `struck` (§5), and the surface behind it is refilled from the latest view.
@@ -134,13 +137,19 @@ becomes a job with a `job_id`. A job goes through these states:
   * `rebuilt`: whether stored poses were re-estimated;
   * `prior_gravity_deg`, on a map's first update.
 * **The gate.** The request option `accept_if {max_residual_m, max_gauge_shift_m,
-  max_displacement_m, max_displacement_deg, max_rejected_share}` is evaluated on the
-  registration phase's report, before anything is committed. `max_residual_m` gates the anchor
-  residuals, so a stored keyframe that moved fails the update; `max_gauge_shift_m` gates the
-  stored keyframes' median movement; `max_displacement_m` and `max_displacement_deg` gate
-  `quality.max_displacement_m` and `quality.max_displacement_deg`, so a single new frame that
-  disagrees with its images fails the update, a frame unconstrained in translation through its
-  rotation.
+  max_displacement_m, max_displacement_deg, max_prior_disagreement_deg, max_rejected_share}` is
+  evaluated on the registration phase's report, before anything is committed:
+  * `max_residual_m` gates `previous_residuals.max_m` (stored keyframes) only, so a stored
+    keyframe that moved fails the update. New-frame disagreement is gated only by
+    `max_displacement_*`. Prior corrections, shown in `prior_disagreement_deg` and
+    `prior_residual_*`, never fail it;
+  * `max_gauge_shift_m` gates the stored keyframes' median movement;
+  * `max_displacement_m` and `max_displacement_deg` gate `quality.max_displacement_m` and
+    `quality.max_displacement_deg`, so a single new frame that disagrees with its images fails
+    the update, a frame unconstrained in translation through its rotation. A null value (no
+    measurable frame) passes;
+  * `max_prior_disagreement_deg` gates `quality.prior_disagreement_deg`, so a client can refuse
+    an update that bends its priors. Without it there is no such gate.
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
   * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
@@ -172,9 +181,11 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
 
 * **Doorways.** A door opening is a passage of the grid (§6), not an object. A detected door
   leaf is an object: label `door`, with its `state` and `region`. The passage names it in
-  `leaves[].object_id`.
-* **Floor height.** The floor height used for boxes comes from the grid's floor estimate, so
-  boxes and grid agree.
+  `leaves[].object_id`. A door object is a leaf: thin (< 0.20 m), vertical and at least 0.6 m
+  tall. Detections of a doorway, a gate or an opening are not objects; they may only hint a
+  passage.
+* **Floor height.** Objects use the grid's floor estimate: one estimate per version, with the
+  same `floor_z_m` and `floor_sigma_m`, so boxes and grid agree.
 * **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m` is floor
   (§6): it never makes a floor-standing object. This minimum height applies
   only above the floor estimate: an object resting on any other support surface keeps its

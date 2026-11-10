@@ -21,14 +21,15 @@ Part of the [high-level specification](../high_level_spec.md) (§8, §10).
     silicon, the lanes are priority queues: the interactive lane always runs first.
   * On a CUDA host they may run concurrently.
   * **Single worker.** An implementation may serve all inference work from one worker, without
-    lanes. It then runs dry runs, locate and frame analysis ahead of fusion work, so that none of
-    them waits behind fusion; the C12 latency target (evaluation.md) is the test.
+    lanes. Its inference requests then form a priority queue: locate, dry-run and frame-analysis
+    requests are served before fusion requests, so that none of them waits behind fusion; the
+    C12 latency target (evaluation.md) is the test.
 * **Health.** `GET /api/health` [`Health`] reports:
   * the service state, and the inference server state (`ready`, `starting`, `degraded`, `down`);
   * device memory in use against its cap;
   * per lane: `idle` / `busy`, queue length, and the age of the oldest item. With lanes they are
-    `interactive` and `bulk`; a single worker reports one lane, `worker`, for what it really
-    runs. Health is base: every implementation serves it.
+    `interactive` and `bulk`. Without lanes, one lane, `worker`: the service's single job
+    worker, with its state and queue length. Health is base: every implementation serves it.
 
   When the inference server is down, an operation that needs it answers
   `inference_unavailable`. Reads of committed versions never need it.
