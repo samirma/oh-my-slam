@@ -89,7 +89,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `passages.geometry` | C9 | Share of found doors whose `centre_m` is within the tolerance of the floor plan's door-gap centre and whose `width_m` is within the tolerance of its free width |
 | `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
 | `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
-| `grid.floor_false_obstacles` | C9 | Occupied cells and objects lower than 0.06 m on open floor, that is free cells with `floor_observed` 1 (map.md §5–§6) |
+| `grid.floor_false_obstacles` | C9 | Service-occupied cells and floor-standing objects lower than 0.06 m on open floor: cells that are free floor in the truth floor plan with no object or fixture, restricted to cells inside some keyframe camera's view frustum within the height band (unseen floor counts neither way) (map.md §5–§6) |
 | `grid.id_stability` | C9 | Share of regions and passages whose id is unchanged between consecutive versions where their geometry did not change |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
