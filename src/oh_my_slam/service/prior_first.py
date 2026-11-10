@@ -32,6 +32,8 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.images import size_at_max_side
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping import register_ma
+from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import AnchoredMap, FrameIn, Placement, features, pose_residual
 from oh_my_slam.mapping.anchored_objects import (
     MONO_DEPTH_REL,
@@ -44,8 +46,6 @@ from oh_my_slam.segmentation.api import (
     Region,
     raised_regions,
 )
-from oh_my_slam.service import register_ma
-from oh_my_slam.service.anchor import Sim3
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
 from oh_my_slam.service.store import clone_tree
 
@@ -372,6 +372,6 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                            "max": pts.max(0).round(4).tolist()},
               "points": len(am.cloud.keys)}
     job.result_version = up.store.commit(w.map, record, mapper,
-                                         {"objects.json": om.records()})
+                                         {"objects.json": om.records()}, w.cameras, w.masks)
     job.state, job.progress = "committed", 1.0
     tm["commit"] = round(time.perf_counter() - t, 3)

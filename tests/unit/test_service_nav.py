@@ -352,6 +352,27 @@ def test_locate_rejects_unusable_frames_and_points_away_from_no_overlap(
         nav.get("/api/maps/room/pose", "Pose")
 
 
+def test_a_kept_frame_with_fewer_keypoints_than_a_pose_needs_is_few_features(
+        room_map: tuple[Nav, Any, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The checks keep a frame (20 features at least); with fewer keypoints for matching than a
+    pose needs inliers it is few_features, else (any frame not located) no_overlap."""
+    from oh_my_slam.mapping import relocalize
+
+    nav, _, _ = room_map
+    real = relocalize.extract
+
+    def few(gray: Any, mask: Any = None) -> Any:
+        uv, desc = real(gray, mask)
+        return uv[:relocalize.MIN_INLIERS - 1], desc[:relocalize.MIN_INLIERS - 1]
+
+    monkeypatch.setattr(relocalize, "extract", few)
+    doc = nav.locate("room", {"frames": [{"name": "b", "image": "b", "camera_id": "cam"}]},
+                     {"b": textured(77)})
+    b = doc["frames"][0]
+    assert b["status"] == "rejected" and b["reason"] == "few_features"
+    assert b["nearest_view"] is None
+
+
 def test_locate_requests_are_validated(room_map: tuple[Nav, Any, Any]) -> None:
     nav, _, _ = room_map
     img = textured(5)
@@ -441,7 +462,7 @@ def test_versions_derive_incrementally_and_rebuild_when_a_pose_moves(
 
 
 def test_derived_floor_fallbacks_and_maps_without_mapper(nav: Nav) -> None:
-    from oh_my_slam.service.anchor import Sim3
+    from oh_my_slam.mapping.anchor import Sim3
 
     s = nav.service
     assert s.derived is not None

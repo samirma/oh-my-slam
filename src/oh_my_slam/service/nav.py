@@ -20,8 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.mapping import navgrid, relocalize
-from oh_my_slam.service import checks
+from oh_my_slam.mapping import checks, navgrid, relocalize
 from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
@@ -341,7 +340,10 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                         "inlier_ratio": o.inlier_ratio, "ambiguity": o.ambiguity,
                         "consistent_with_prior": o.consistent_with_prior})
         else:
-            res["reason"] = checks.unregistered_reason(measures)
+            # the checks kept it (it has features): no pose means no overlap with the map,
+            # unless it has fewer keypoints than a pose needs inliers
+            res["reason"] = "few_features" if len(q.uv) < relocalize.MIN_INLIERS \
+                else "no_overlap"
             if res["reason"] == "no_overlap" and o.nearest is not None:
                 kf, turn = relocalize.nearest_view(q, index, o.nearest)
                 res["nearest_view"] = {"name": kf.name, "T_map_cam": np.round(kf.T, 6).tolist(),

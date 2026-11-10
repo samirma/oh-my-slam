@@ -13,7 +13,11 @@ Under ``<data>/oms/maps/<name>/derived/``:
   version.
 
 ``Derived`` subscribes to ``Store.listeners`` and derives each committed version on a worker
-thread; a read of a version not derived yet derives it at once. Everything it needs comes through
+thread; a read of a version not derived yet derives it at once. A version's mapper-map content
+(depth, cloud, images, objects) comes from the mapper map it was committed with: before a commit
+replaces that map, every version it serves that is not derived yet is derived from it
+(``Store.replacing``); a version whose mapper map is gone and that was never derived answers
+``version_gone``. Everything it needs comes through
 two interfaces: the version record (``frames[]`` with ``name``, ``camera_id``, ``internal``,
 ``T_map_cam``, ``sigma_pos_m``, ``sigma_rot_deg``, ``sha256``; ``sim3``; ``floor_z_m``) and the
 mapper map read by the backend (``backend.InternalMap``: ``depth``, ``image``, ``cloud``,
@@ -40,15 +44,19 @@ from numpy.typing import NDArray
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
-from oh_my_slam.service.anchor import Sim3
+from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
+from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.store import Store
 
 log = get_logger("oh_my_slam.service.derived")
 
 CACHE_VERSIONS = 3  # versions kept in memory
-DEFAULT_CAMERA_HEIGHT_M = 1.0  # a map with no floor at all: this far below its lowest camera
+DEFAULT_CAMERA_HEIGHT_M = 1.0
+# what the older mapper records of an object beyond its box, kept for the objects read
+MAPPER_OBJECT_KEYS = ("score", "label_votes", "observations", "created_update",
+                      "last_seen_update")  # a map with no floor at all: this far below its lowest camera
 
 
 @dataclass
@@ -119,6 +127,7 @@ class Derived:
         # read's answer: ``objects.body``)
         self.after: list[Callable[[DerivedVersion], Any]] = []
         store.listeners.append(self.committed)
+        store.replacing.append(self.replacing)
 
     # -- worker ---------------------------------------------------------------------------------
 
@@ -134,6 +143,13 @@ class Derived:
 
     def committed(self, name: str, n: int) -> None:
         self._queue.put((name, n))
+
+    def replacing(self, name: str, first: int, last: int) -> None:
+        """Versions ``first``..``last`` derived from the mapper map a commit is about to
+        replace."""
+        for n in range(first, last + 1):
+            if not (self.dir(name) / str(n) / "meta.json").exists():
+                self.get(name, n)
 
     def _work(self) -> None:
         while True:
@@ -172,6 +188,11 @@ class Derived:
         vdir = self.dir(name) / str(n)
         with self._map_lock(name):
             if not (vdir / "meta.json").exists():
+                if self.store.mapper_version(name) > n:
+                    raise ApiError("version_gone", f"version {n} of map {name!r} is no longer "
+                                   "kept: its mapper map was replaced before it was derived",
+                                   {"map": name, "version": n,
+                                    "latest_version": self.store.latest(name)})
                 self._derive(name, n, record, vdir)
         dv = DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()), vdir,
                             self._stands(name, record))
@@ -314,7 +335,8 @@ class Derived:
             size = np.asarray(o.get("size") or [0.0, 0.0, 0.0], np.float64) * sim.s
             objects.append({"id": o.get("id"), "label": o["label"],
                             "centre_m": sim.point(np.asarray(o["center"], np.float64)).tolist(),
-                            "size_m": size.tolist(), "yaw_deg": yaw_of(sim.R @ R)})
+                            "size_m": size.tolist(), "yaw_deg": yaw_of(sim.R @ R),
+                            **{k: o[k] for k in MAPPER_OBJECT_KEYS if k in o}})
         atomic_write_json(vdir / "meta.json", {
             "version": n, "floor_z": float(floor), "objects": objects,
             "doors": [o["centre_m"][:2] for o in objects if "door" in o["label"].lower()],

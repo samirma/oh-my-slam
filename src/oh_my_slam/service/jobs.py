@@ -204,6 +204,12 @@ class Jobs:
                           key=lambda j: (j.state == "queued", j.created))
         return mine[0] if mine else None
 
+    def active_jobs(self, map_name: str) -> list[Job]:
+        """The map's queued and running jobs, oldest first."""
+        with self._cond:
+            return sorted((j for j in self._jobs.values() if j.map == map_name and j.active),
+                          key=lambda j: j.created)
+
     def queued(self) -> list[Job]:
         with self._cond:
             return sorted((j for j in self._jobs.values() if j.state == "queued"),

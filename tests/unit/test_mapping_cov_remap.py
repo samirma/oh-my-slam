@@ -1,12 +1,9 @@
 """A map of fewer than three keyframes extended without a rebuild (``mapping.api._remap_small``):
 SfM runs again over the stored and the new keyframes and the result is brought into the map's
-frame. Real COLMAP on a one-photo map extended by a video, and the refusals with COLMAP's results
-stood in for."""
+frame. The refusals with COLMAP's results stood in for."""
 
 from __future__ import annotations
 
-import json
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,16 +12,11 @@ import numpy as np
 import pytest
 
 from oh_my_slam.core.errors import RegistrationError
-from oh_my_slam.core.images import load_rgb, save_jpeg
+from oh_my_slam.core.images import save_jpeg
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import api, store
-from oh_my_slam.mapping.api import update
-from oh_my_slam.mapping.store import MapReader
-from tests.fakes.client import FakeClient
-from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.synth.scene import look_at
 from tests.unit.test_mapping_cov_api import FakeModel, nf
-from tests.unit.test_mapping_e2e_video import write_video
 
 K = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap")
 
@@ -133,29 +125,3 @@ def test_a_stored_keyframe_staged_and_in_the_database_is_not_extracted_again(
                             0.0) is model
     assert sfm.extracted == [] and staged.read_bytes() == b"staged before"
     assert ctx.notes["remap_small"] == {"old_frames": 1, "scale": 2.0}
-
-
-@pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
-def test_a_one_photo_map_extended_by_a_video_is_mapped_again_in_its_frame(tmp_path: Path) -> None:
-    """A video does not rebuild a map of fewer than three keyframes (a pan from one spot, it
-    would): the map's one keyframe and the video's are posed together and brought into the map
-    frame, which stays at the photo."""
-    client = FakeClient()
-    poses = ring(10, span=np.pi)
-    imgs = add_frames(client, mapping_room(), poses, tmp_path / "in", "p", depth_noise=0.02,
-                      seed=7)
-    mdir = tmp_path / "map"
-    update(mdir, [imgs[0]], client=client, progress=lambda m: None)
-    T0 = MapReader(mdir).frames[0].T_map_cam
-    video = tmp_path / "walk.mp4"
-    write_video(video, [load_rgb(p) for p in imgs[1:]], fps=1)
-    res = update(mdir, [video], fps=1.0, client=client, progress=lambda m: None)
-    frames = MapReader(mdir).frames
-    assert len(frames) >= 8 and res.new_frames == [f.name for f in frames[1:]]
-    np.testing.assert_allclose(frames[0].T_map_cam.matrix(), T0.matrix(), atol=1e-9)
-    d_est = np.linalg.norm(frames[1].T_map_cam.t - frames[0].T_map_cam.t)
-    d_true = np.linalg.norm(poses[1].t - poses[0].t)
-    assert d_est == pytest.approx(d_true, rel=0.15)
-    last = json.loads((mdir / "map.json").read_text())["updates"][-1]
-    assert last["kind"] == "video" and last["notes"]["remap_small"]["old_frames"] == 1
-    assert "restarted" not in last["notes"]

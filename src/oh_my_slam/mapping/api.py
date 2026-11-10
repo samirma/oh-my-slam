@@ -509,43 +509,22 @@ def _pick_anchors(chunk: list[PoolView], pool: list[PoolView], k: int) -> list[P
     return [posed[i] for i in order[:k]]
 
 
-def _temporal_anchors(chunk: list[PoolView], by_name: dict[str, PoolView], k: int
-                      ) -> list[PoolView]:
-    """The ``k`` posed views nearest in capture order to the chunk, before and after it
-    (``trajectory.temporal_anchors``): consecutive video keyframes are close in space."""
-    from oh_my_slam.mapping.trajectory import temporal_anchors
-
-    posed = sorted(n for n, p in by_name.items() if p.pose is not None)
-    return [by_name[n] for n in temporal_anchors(chunk[0].name, chunk[-1].name, posed, k)]
-
-
 def _multiview_poses(ctx: UpdateContext, todo: list[PoolView], pool: list[PoolView],
-                     client: Any, temporal: bool = False) -> dict[str, Pose]:
+                     client: Any) -> dict[str, Pose]:
     """Chunked, pose-anchored MapAnything poses (metric).
 
     Each chunk carries up to ``MV_ANCHORS`` already-posed views (the most similar ones); the
     model returns poses in its own frame (the first view's), so every chunk is brought into the
     reference frame with the rotation/translation that maps its anchors onto their known poses
     (see ``frame.align_by_poses``; valid for rotation-only rigs). The first chunk of a new map
-    has no anchors and defines the frame. ``temporal`` (keyframes of one video, ``todo`` in capture
-    order): chunks never span two runs of consecutive keyframes (``trajectory.capture_runs``) and
-    their anchors are the posed keyframes next to them in capture order."""
-    from oh_my_slam.mapping.trajectory import capture_runs
-
+    has no anchors and defines the frame."""
     posed: dict[str, Pose] = {}
-    by_name = {p.name: p for p in pool}
-    if not temporal:
-        _multiview_chunks(ctx, todo, by_name, posed, client, temporal=False)
-        return posed
-    views = {v.name: v for v in todo}
-    order = sorted({*views, *by_name})
-    for run in capture_runs(order, set(views)):
-        _multiview_chunks(ctx, [views[n] for n in run], by_name, posed, client, temporal=True)
+    _multiview_chunks(ctx, todo, {p.name: p for p in pool}, posed, client)
     return posed
 
 
 def _multiview_chunks(ctx: UpdateContext, todo: list[PoolView], by_name: dict[str, PoolView],
-                      posed: dict[str, Pose], client: Any, temporal: bool) -> None:
+                      posed: dict[str, Pose], client: Any) -> None:
     """``_multiview_poses`` of the views ``todo``, chunk after chunk (placed views join the pool
     ``by_name`` and anchor the next chunks)."""
     from oh_my_slam.reconstruction.multiview import run_multiview
@@ -553,10 +532,7 @@ def _multiview_chunks(ctx: UpdateContext, todo: list[PoolView], by_name: dict[st
     i = 0
     size = ctx.notes.get("multiview_chunk", MV_CHUNK)
     while i < len(todo):
-        if temporal:
-            anchors = _temporal_anchors(todo[i:i + size - MV_ANCHORS], by_name, MV_ANCHORS)
-        else:
-            anchors = _pick_anchors(todo[i:i + size], list(by_name.values()), MV_ANCHORS)
+        anchors = _pick_anchors(todo[i:i + size], list(by_name.values()), MV_ANCHORS)
         chunk = todo[i:i + size - len(anchors)]
         views = anchors + chunk
         try:
@@ -1466,9 +1442,8 @@ def _join_unplaced(ctx: UpdateContext, sfm: Sfm, model: SfmModel, new_names: set
                                  known.get(v.name)) for v in _new_pool(ctx)]
                 todo = sorted((v for v in pool if v.name in connected), key=lambda v: v.name)
                 progress(f"anchored multi-view for {len(todo)} keyframes the SfM model does not "
-                         "hold" + (" (anchored in capture order)" if is_video else ""))
-                mv = _multiview_poses(ctx, todo, [v for v in pool if v.pose is not None], client,
-                                      temporal=is_video)
+                         "hold")
+                mv = _multiview_poses(ctx, todo, [v for v in pool if v.pose is not None], client)
             allp, _, _ = _refine_multiview(ctx, sfm, {**posed, **merged, **free, **mv},
                                            set(free) | set(mv), refine_focal=False,
                                            rotation=False, model=model)
@@ -3041,20 +3016,18 @@ class UpdateResult:
     objects: int = 0  # the map's published objects after the update
 
 
-def update(map_dir: Path, inputs: list[Path], *, fps: float = ingest.DEFAULT_FPS,
-           client: Any = None, progress: Progress = _progress,
+def update(map_dir: Path, inputs: list[Path], *, client: Any = None, progress: Progress = _progress,
            intrinsics: dict[Path, Intrinsics] | None = None,
            ignore: dict[Path, Path] | None = None) -> UpdateResult:
-    """Map the images ``inputs`` (in order), or one video sampled at ``fps`` (an internal sequence
-    input: the service sends images), into the map ``map_dir`` (created when missing).
+    """Map the images ``inputs`` (in order) into the map ``map_dir`` (created when missing).
     ``intrinsics``: given intrinsics of input images, in place of their EXIF ones
     (``ingest.keyframes``); ``ignore``: an 8-bit PNG mask per input image, whose non-zero pixels
     are neither fused nor detected (``_ignore_pixels``)."""
     with timing.collect() as tm:
-        return _update(map_dir, inputs, fps, client, progress, tm, intrinsics, ignore)
+        return _update(map_dir, inputs, client, progress, tm, intrinsics, ignore)
 
 
-def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress: Progress,
+def _update(map_dir: Path, inputs: list[Path], client: Any, progress: Progress,
             tm: timing.Timings, intrinsics: dict[Path, Intrinsics] | None = None,
             ignore: dict[Path, Path] | None = None) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
@@ -3074,7 +3047,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress
                 old = store.read_frames(tx)
             update_id = int(meta.get("update_count", 0)) + 1
             progress(("creating map " if tx.created else "extending map ") + str(tx.root))
-            kfs = ingest.keyframes(spec, fps, tx.stage("frames"),
+            kfs = ingest.keyframes(spec, tx.stage("frames"),
                                    int(meta.get("next_frame_index", 0)), intrinsics)
             plan, skipped = _restart_plan(meta, old, spec)
             early: list[_EarlyFeatures] = []
@@ -3117,7 +3090,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress
             })
             record: dict[str, Any] = {
                 "id": update_id, "at": time.time(), "inputs": [str(i) for i in inputs],
-                "kind": spec.kind, "fps": fps if spec.kind == "video" else None,
+                "kind": spec.kind,
                 "frames_added": new_names, "frames_rejected": ctx.rejected,
                 "sfm": None if model is None else model.method, "notes": _jsonable(ctx.notes),
                 "objects": objs.summary,
@@ -3212,20 +3185,17 @@ def _restart_plan(meta: dict[str, Any], old: list[store.FrameRecord], spec: inge
     """The stored keyframes to map again with the new input (``_try_rebuild``), and why a weak
     map is not rebuilt (the update's ``restart_skipped`` note), else None.
 
-    A map is rebuilt when its keyframes are photos (every update), at most
-    ``RESTART_MAX_KEYFRAMES``, some of them weakly posed (``_weak_keyframe``) — for a video, all of
-    them: a pan from one spot, which a walk gives the parallax it lacks —, unless the last two
+    A map is rebuilt when its keyframes are photos (every update: a map an earlier tool built
+    from a video never is), at most ``RESTART_MAX_KEYFRAMES``, some of them weakly posed
+    (``_weak_keyframe``), unless the last two
     rebuilds left the same keyframes weak and those are still the weak ones
     (``notes.restarted.weak``: more photos did not help, and a rebuild costs more each time), or
     its last update already rebuilt it and left it rotation-dominant (``ROTATION_PAIR_FRACTION`` of the
     verified pairs panoramic): a pan from one spot, which the photos added did not give the
     parallax to triangulate; rebuilt on every update, it would cost more each time."""
     updates = meta.get("updates", [])
-    weak_enough = any if spec.kind == "images" else all
-    # a video on a map of fewer than three keyframes: posed with them (``_remap_small``)
     if (not old or any(u.get("kind") != "images" for u in updates)
-            or (spec.kind != "images" and len(old) < 3)
-            or not weak_enough(_weak_keyframe(r) for r in old)):
+            or not any(_weak_keyframe(r) for r in old)):
         return [], None
     if len(old) > RESTART_MAX_KEYFRAMES:
         return [], f"more than {RESTART_MAX_KEYFRAMES} keyframes"

@@ -46,12 +46,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping import anchor
+from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import DepthRef as Ref
 from oh_my_slam.mapping.anchored import agreement, backproject
-from oh_my_slam.service import anchor
-from oh_my_slam.service.anchor import Anchor, Sim3
-from oh_my_slam.service.backend import MvView
-from oh_my_slam.service.errors import ApiError
 
 Array = NDArray[np.float64]
 
@@ -74,6 +72,24 @@ SIGMA_ROT_FLOOR_DEG = 0.1
 TOO_CLOSE_M = 0.30
 MIN_SCALE_SIGMA_REL = 0.005
 FEW_FEATURES = 150
+
+
+
+@dataclass
+class MvView:
+    """One view of a multi-view call (the backend's ``geometry_views``): its pose (4x4
+    camera-to-world in the call's frame), its z-depth (0 = none) and the 3x3 intrinsics of the
+    depth's grid."""
+
+    pose: NDArray[np.float64]
+    depth: NDArray[np.float32]
+    K: NDArray[np.float64]
+
+
+def out_of_memory(exc: BaseException) -> bool:
+    """Whether a multi-view call failed for want of device memory: the service's typed error
+    ``out_of_memory`` (its ``code``)."""
+    return getattr(exc, "code", None) == "out_of_memory"
 
 
 Multiview = Callable[[list[Path], list[Intrinsics], list[Array | None]], list[MvView]]
@@ -335,8 +351,8 @@ class Registration:
             anchors = self.anchors(chunk)
             try:
                 out = self._call(anchors, chunk)
-            except ApiError as exc:
-                if exc.code != "out_of_memory" or (len(chunk) == 1
+            except Exception as exc:
+                if not out_of_memory(exc) or (len(chunk) == 1
                                                    and self.max_anchors <= MIN_ANCHORS):
                     raise
                 if len(chunk) > 1:

@@ -2,12 +2,13 @@
 
 Under ``<data>/oms/maps/<name>/``:
 
-* ``map.json`` — the cameras (``Camera`` bodies as sent), their ignore masks' digests, the
-  creation time and the latest version;
+* ``map.json`` — the cameras (``Camera`` bodies as sent) of its committed versions, their ignore
+  masks' digests, the creation time and the latest version; a job's new cameras are recorded
+  with the version it commits, so a rejected or failed job leaves none;
 * ``masks/<camera_id>.png`` — ignore masks;
 * ``versions/<n>.json`` — version *n*, immutable once written: its frames with their map-frame
   poses and sigmas, the similarity from the mapper's internal frame (``anchor.Sim3``), the scale
-  and its source, and the counts a summary reads;
+  and its source, the cameras known at that version, and the counts a summary reads;
 * ``mapper/`` — the mapper's map of the latest version (``mapping.store``), in its internal
   frame. An update works on a clone of it and moves the clone into place when it commits.
 
@@ -64,6 +65,9 @@ class Store:
         # called with (map, version) once a version is committed (``derived`` derives the grid,
         # points and locate inputs from it); a listener's failure never fails the commit
         self.listeners: list[Callable[[str, int], None]] = []
+        # called with (map, first, last) before a commit replaces the mapper map that versions
+        # first..last were committed with (``derived`` derives them from it first)
+        self.replacing: list[Callable[[str, int, int], None]] = []
 
     def create(self) -> None:
         for d in (self.maps, self.jobs, self.work, self.trash):
@@ -135,9 +139,9 @@ class Store:
         return self.dir(name) / "masks" / f"{camera_id}.png"
 
     def add_cameras(self, name: str, cameras: dict[str, dict[str, Any]],
-                    masks: dict[str, tuple[str, bytes]]) -> None:
+                    masks: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
         """Record new cameras of a map (creating its folder), with their ignore masks
-        (``camera_id -> (digest, PNG bytes)``)."""
+        (``camera_id -> (digest, PNG bytes)``); returns the map's metadata."""
         with self._lock:
             meta = self.meta(name) or {"name": name, "cameras": {}, "masks": {},
                                         "latest_version": None, "created_at": None}
@@ -146,6 +150,7 @@ class Store:
                 meta["masks"][cid] = digest
             meta["cameras"].update(cameras)
             self._write_meta(name, meta)
+            return meta
 
     def mapper_dir(self, name: str) -> Path:
         return self.dir(name) / "mapper"
@@ -163,21 +168,31 @@ class Store:
             return v
 
     def commit(self, name: str, record: dict[str, Any], mapper: Path | None,
-               files: dict[str, Any] | None = None) -> int:
-        """Commit a new version: ``record`` (its ``version`` and ``created_at`` set here), the
-        version's JSON ``files`` (``versions/<n>.<file name>``: the objects of an anchored map)
-        and the mapper map ``mapper`` moved into place. Returns the version."""
+               files: dict[str, Any] | None = None,
+               cameras: dict[str, dict[str, Any]] | None = None,
+               masks: dict[str, tuple[str, bytes]] | None = None) -> int:
+        """Commit a new version: ``record`` (its ``version``, ``created_at`` and ``cameras``
+        set here), the version's JSON ``files`` (``versions/<n>.<file name>``: the objects of an
+        anchored map), the job's new ``cameras`` and their ignore ``masks`` (creating the map)
+        and the mapper map ``mapper`` moved into place. Returns the version.
+
+        Before the mapper map is replaced, ``replacing`` listeners get the versions the current
+        one serves (``mapper_version`` to the latest): what is derived from the mapper map of a
+        version is derived from that version's, never from a later one."""
+        if mapper is not None:
+            self._replacing(name)
         with self._lock:
-            meta = self.meta(name)
-            assert meta is not None, "cameras are recorded before a job runs"
+            meta = self.add_cameras(name, cameras or {}, masks or {})
             n = int(meta.get("latest_version") or 0) + 1
             now = time.time()
-            record = {**record, "version": n, "created_at": utc(now)}
+            record = {**record, "version": n, "created_at": utc(now),
+                      "cameras": dict(meta["cameras"])}
             if mapper is not None:
                 current = self.mapper_dir(name)
                 if current.exists():
                     current.rename(self.trash / f"{name}-{uuid.uuid4().hex}")
                 mapper.rename(current)
+                meta["mapper_version"] = n
             for fname, data in (files or {}).items():
                 atomic_write_json(self.version_file(name, n, fname), data)
             atomic_write_json(self.dir(name) / "versions" / f"{n}.json", record)
@@ -188,6 +203,26 @@ class Store:
         self.trash.mkdir(parents=True, exist_ok=True)
         self.committed(name, n)
         return n
+
+    def mapper_version(self, name: str) -> int:
+        """The first version the current mapper map serves: it holds the content of every
+        version from it to the latest (a version committed without a mapper map keeps it). 0 for
+        a map written before this was recorded."""
+        return int((self.meta(name) or {}).get("mapper_version") or 0)
+
+    def _replacing(self, name: str) -> None:
+        latest = self.latest(name)
+        if not latest:
+            return
+        first = self.mapper_version(name) or latest  # unknown: the latest at least
+        for listener in self.replacing:
+            try:
+                listener(name, first, latest)
+            except Exception:
+                from oh_my_slam.core.log import get_logger
+
+                get_logger("oh_my_slam.service.store").exception(
+                    "replacing listener failed for %s versions %d-%d", name, first, latest)
 
     def committed(self, name: str, n: int) -> None:
         """Tell the listeners that version ``n`` of map ``name`` is committed."""

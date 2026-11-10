@@ -24,6 +24,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oh_my_slam.core.log import get_logger
+from oh_my_slam.service import birdseye as birdseye_read
 from oh_my_slam.service import nav, openapi, schema
 from oh_my_slam.service import objects as objects_read
 from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, same_camera
@@ -63,7 +64,7 @@ class Service:
     stopping: bool = False
     started_at: float = field(default_factory=time.time)
     # the dry run of an update request (``Updater.dry_run``), None: not served
-    dry_run: Callable[[Any, dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None
+    dry_run: Callable[[Any], dict[str, Any]] | None = None
     derived: Derived | None = None  # the grid, points and locate inputs of each version
     ids: nav.Ids | None = None
 
@@ -164,10 +165,12 @@ def _rotation_ok(T: list[list[float]]) -> bool:
             and float(np.linalg.det(R)) > 0 and bool(np.isfinite(M).all()))
 
 
-def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, bytes]
-                ) -> tuple[UpdateWork, dict[str, dict[str, Any]], dict[str, tuple[str, bytes]]]:
-    """The job of a valid ``UpdateRequest`` and the cameras (with ignore masks) it adds to the
-    map; ``invalid_request`` or ``camera_conflict`` otherwise."""
+def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, bytes],
+                pending: dict[str, dict[str, Any]] | None = None) -> UpdateWork:
+    """The job of a valid ``UpdateRequest``, with the cameras (and ignore masks) it adds to the
+    map, recorded when the job commits; ``invalid_request`` or ``camera_conflict`` otherwise. A
+    frame may name a camera that an earlier job of the map, still queued or running, adds
+    (``pending``): the job fails if that one does not commit it."""
     known = store.cameras(name)
     new: dict[str, dict[str, Any]] = {}
     masks: dict[str, tuple[str, bytes]] = {}
@@ -198,7 +201,7 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
         if digest is not None:
             masks[cid] = (digest, parts[cam["ignore_mask"]])
         new[cid] = cam
-    cameras = {**known, **new}
+    cameras = {**(pending or {}), **known, **new}
     seen: set[str] = set()
     frames = []
     for i, f in enumerate(req["frames"]):
@@ -237,7 +240,7 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
                                 f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask))
-    return UpdateWork(name, frames, req.get("accept_if")), new, masks
+    return UpdateWork(name, frames, req.get("accept_if"), new, masks)
 
 
 # -- the API -------------------------------------------------------------------------------------
@@ -292,17 +295,18 @@ class Api:
         except (ValueError, UnicodeDecodeError) as exc:
             raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
         schema.validate("UpdateRequest", req)
-        work, cameras, masks = await run_in_threadpool(update_work, self.s.store, name, req,
-                                                       parts)
+        pending: dict[str, dict[str, Any]] = {}
+        for j in self.s.jobs.active_jobs(name):
+            pending.update(getattr(j.work, "cameras", None) or {})
+        work = await run_in_threadpool(update_work, self.s.store, name, req, parts,
+                                       None if dry else pending)
         _stage(request, "validate", t0)
         if dry:
             assert self.s.dry_run is not None
             t0 = time.perf_counter()
-            out = await run_in_threadpool(self.s.dry_run, work, cameras, masks)
+            out = await run_in_threadpool(self.s.dry_run, work)
             _stage(request, "dry_run", t0)
             return body(out)
-        if cameras or masks or self.s.store.meta(name) is None:
-            self.s.store.add_cameras(name, cameras, masks)
         job = self.s.jobs.submit(name, work, len(work.frames), camera_only(work))
         return JSONResponse(job.queued_view, 202, {"Location": f"/api/jobs/{job.id}"})
 
@@ -339,7 +343,8 @@ class Api:
             "map": name, "map_version": v["version"], "latest_version": meta["latest_version"],
             "created_at": meta["created_at"], "frames": len(v["frames"]),
             "provisional_frames": sum(f["pose_state"] == "provisional" for f in v["frames"]),
-            "objects": v["objects"], "cameras": meta["cameras"], "bounds_m": v["bounds_m"],
+            "objects": v["objects"], "cameras": v.get("cameras", meta["cameras"]),
+            "bounds_m": v["bounds_m"],
             "floor_z_m": v["floor_z_m"], "running_job": None if job is None else job.id,
             "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"]})
 
@@ -402,6 +407,25 @@ class Api:
             raise invalid("max_points", "max_points must be an integer")
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         return body(await run_in_threadpool(nav.points, dv, lo, hi, voxel, int(cap)))
+
+    async def _birdseye(self, request: Request) -> tuple[bytes, dict[str, Any]]:
+        t0 = time.perf_counter()
+        name, _, v = self._version(request)
+        derived = self._derived()
+        dv = await run_in_threadpool(derived.get, name, v["version"])
+        objects = await run_in_threadpool(objects_read.body, self.s.store, derived, self._ids(),
+                                          dv)
+        out = await run_in_threadpool(birdseye_read.read, dv, objects)
+        _stage(request, "birdseye", t0)
+        return out
+
+    async def get_birdseye_png(self, request: Request) -> Response:
+        png, _ = await self._birdseye(request)
+        return Response(png, media_type="image/png")
+
+    async def get_birdseye(self, request: Request) -> Response:
+        _, meta = await self._birdseye(request)
+        return body(meta)
 
     async def post_locate(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])

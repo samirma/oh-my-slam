@@ -283,7 +283,7 @@ def _ext(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n: int = 14, aligned: 
         return dict(own) if aligned else {}
 
     monkeypatch.setattr(api, "_align_own_map", align)
-    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client, temporal=False:
+    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client:
                         {v.name: Pose.identity() for v in todo})
 
     def refine(ctx: Any, sfm: Any, poses: Any, free: set[str], refine_focal: bool,
@@ -387,7 +387,7 @@ def test_a_wide_angle_camera_turning_in_place_gets_one_centre(
     monkeypatch.setattr(api, "_refine_multiview", refine)
     centres = {jpg(100): [0.0, 0, 0], jpg(101): [0.02, 0, 0], jpg(102): [0.5, 0, 0],
                jpg(103): [0.04, 0, 0]}
-    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client, temporal=False:
+    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client:
                         {v.name: Pose(np.eye(3), np.array(centres[v.name])) for v in todo})
     api._extend(w.ctx, w.sfm, w.names, False, False, None, quiet, 0.0)
     note = w.ctx.notes["one_centre"]
@@ -556,7 +556,7 @@ def _pan(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inc_names: list[str],
     monkeypatch.setattr(api, "_own_map", lambda ctx, sfm, names, client, progress: (
         seen.__setitem__("own_of", set(names)) or (api.OwnMap(
             {n: Pose.identity() for n in names}, "sfm-global", True, model) if own else None)))
-    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client, temporal=False:
+    monkeypatch.setattr(api, "_multiview_poses", lambda ctx, todo, pool, client:
                         seen.__setitem__("mv", ([v.name for v in todo], sorted(
                             v.name for v in pool))) or {v.name: Pose.identity() for v in todo})
     monkeypatch.setattr(api, "_one_centre", lambda ctx, sfm, poses, names, model=None:

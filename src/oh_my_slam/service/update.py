@@ -38,8 +38,8 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.images import png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.service import anchor, checks
-from oh_my_slam.service.anchor import Anchor, Sim3
+from oh_my_slam.mapping import anchor, checks
+from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
 from oh_my_slam.service.cameras import (
     Camera,
@@ -97,6 +97,10 @@ class UpdateWork:
     map: str
     frames: list[FrameWork]
     accept_if: dict[str, float] | None = None
+    # the cameras the request adds to the map and their ignore masks (``camera_id -> (digest,
+    # PNG bytes)``): recorded with the version the job commits, never before
+    cameras: dict[str, dict[str, Any]] = field(default_factory=dict)
+    masks: dict[str, tuple[str, bytes]] = field(default_factory=dict)
 
 
 @dataclass
@@ -249,16 +253,34 @@ class Updater:
 
     # -- the job -------------------------------------------------------------------------------
 
-    def _frames(self, w: UpdateWork, new_cameras: dict[str, dict[str, Any]] | None = None,
-                new_masks: dict[str, tuple[str, bytes]] | None = None
-                ) -> tuple[list[_Frame], dict[str, NDArray[np.bool_] | None]]:
-        """The request's frames and the cameras' ignore masks: the map's, and those of a dry
-        run's cameras (``new_cameras``, ``new_masks``: never recorded)."""
-        cams = {**self.store.cameras(w.map), **(new_cameras or {})}
+    def _frames(self, w: UpdateWork) -> tuple[list[_Frame], dict[str, NDArray[np.bool_] | None]]:
+        """The request's frames and the cameras' ignore masks: the map's committed cameras and
+        the request's own (``w.cameras``, ``w.masks``). A request camera that a version committed
+        since the request was accepted defines otherwise is ``camera_conflict``; a frame whose
+        camera came from an earlier job of the map that did not commit is ``invalid_request``."""
+        from oh_my_slam.service.cameras import same_camera
+
+        known = self.store.cameras(w.map)
+        for cid, cam in w.cameras.items():
+            digest = w.masks[cid][0] if cid in w.masks else None
+            if cid in known and (not same_camera(known[cid], cam) or (
+                    digest is not None and digest != self.store.mask_digest(w.map, cid))):
+                raise ApiError("camera_conflict", f"camera {cid!r} of map {w.map!r} was defined "
+                               "with other values by an update committed meanwhile: omit it, or "
+                               "use a new camera id",
+                               {"field": f"cameras.{cid}", "camera_id": cid,
+                                "known": known[cid]})
+        cams = {**known, **w.cameras}
+        for i, f in enumerate(w.frames):
+            if f.camera_id not in cams:
+                raise ApiError("invalid_request", f"frames[{i}].camera_id {f.camera_id!r}: the "
+                               "earlier update that defined this camera was not committed — "
+                               "send the camera with the frames",
+                               {"field": f"frames[{i}].camera_id"})
         masks: dict[str, NDArray[np.bool_] | None] = {}
         for cid in {f.camera_id for f in w.frames}:
-            if cid in (new_masks or {}):
-                masks[cid] = decode_mask((new_masks or {})[cid][1], f"cameras.{cid}.ignore_mask")
+            if cid in w.masks:
+                masks[cid] = decode_mask(w.masks[cid][1], f"cameras.{cid}.ignore_mask")
                 continue
             p = self.store.mask_path(w.map, cid)
             masks[cid] = decode_mask(p.read_bytes(), f"cameras.{cid}.ignore_mask") \
@@ -413,12 +435,11 @@ class Updater:
             attempt += 1
         self._finish(job, w, frames, prev, result)
 
-    def dry_run(self, w: UpdateWork, cameras: dict[str, dict[str, Any]],
-                masks: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+    def dry_run(self, w: UpdateWork) -> dict[str, Any]:
         """The ``DryRun`` of an update request (``service.dry_run``): nothing is written."""
         from oh_my_slam.service.dry_run import dry_run
 
-        return dry_run(self, w, cameras, masks)
+        return dry_run(self, w)
 
     def _is_anchored(self, prev: dict[str, Any] | None, frames: list[_Frame]) -> bool:
         """Whether the job runs on the prior-first registration: the map has been anchored by
@@ -650,7 +671,8 @@ class Updater:
             job.progress = 1.0
             return
         assert result is not None and record is not None
-        job.result_version = self.store.commit(w.map, record, result[0])
+        job.result_version = self.store.commit(w.map, record, result[0], None, w.cameras,
+                                               w.masks)
         job.state = "committed"
         job.progress = 1.0
         job.timings_s["commit"] = round(time.perf_counter() - t, 3)

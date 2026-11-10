@@ -24,12 +24,7 @@ focal length is refined unless the query shares a map camera. A result with fewe
 the image unlocated — unless it shares a map camera and its matched keyframes were taken from one
 spot (``one_spot``), when its rotation alone places it at their centre (``_located_by_turn``):
 it is reported on stderr, naming the image, and
-left out of the result; with no image located the command fails with an input error.
-
-Without images the result's camera is the map's last known camera (``last_known_camera``): the
-keyframe added last (latest update, then latest frame in input order). Nothing is matched, so the
-inference server is never needed. ``-f png`` draws the map from above with the result's cameras
-(``birdseye``; ``-t full`` adds every keyframe's).
+left out of the result; with no image located the call fails with an input error.
 """
 
 from __future__ import annotations

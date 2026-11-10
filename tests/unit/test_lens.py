@@ -1,6 +1,6 @@
 """Lens distortion (``Intrinsics.k``, COLMAP's division model): pixels to the undistorted image's
-and back, the undistorted image (which holds the whole lens), grids over it, the OpenCV
-coefficients and the OpenLABEL camera stream that records it (and gives it back)."""
+and back, the undistorted image (which holds the whole lens), grids over it and the OpenCV
+coefficients."""
 
 from __future__ import annotations
 

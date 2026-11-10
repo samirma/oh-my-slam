@@ -5,6 +5,7 @@ commits only what passes the gate; a job whose frames are all rejected costs onl
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import io
@@ -300,6 +301,19 @@ def test_dry_run_of_a_new_map_writes_nothing(client: Client) -> None:
     assert out["predicted_s"]["registration"] > 0
     client.get("/api/maps/m", status=404)
     assert client.service.store.meta("m") is None  # not even the camera
+    # the first update's prior_gravity_deg, predicted as the update reports it
+    g = out["quality"]["prior_gravity_deg"]
+    assert g is not None
+    assert dry(client, "m", nf, nfiles, cameras={"cam": CAM})["quality"][
+        "prior_gravity_deg"] is None  # a camera-only map: levelled by that gravity
+    real = client.backend.infer
+    client.backend.infer = lambda *a, **k: dataclasses.replace(  # type: ignore[method-assign]
+        real(*a, **k), up_cam=None)
+    assert dry(client, "m", fr, files, cameras={"cam": CAM})["quality"][
+        "prior_gravity_deg"] is None  # no gravity estimate
+    client.backend.infer = real  # type: ignore[method-assign]
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["quality"]["prior_gravity_deg"] == g
 
 
 def test_dry_run_against_an_anchored_map(client: Client) -> None:

@@ -52,15 +52,17 @@ they need. New maps take the *prior-first registration* (below).
   log `~/Library/Caches/oh-my-slam/server.log` (`OH_MY_SLAM_RUNTIME_DIR` moves it). One service per data folder (`<data>/oms/service.lock`).
   `--keep-versions` is accepted; retention comes with O2 (every version is kept until then).
 * **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
-  folder: `maps/<name>/` (`map.json`: cameras, mask digests, latest version; `masks/`;
-  `versions/<n>.json`, immutable; `mapper/`, the mapper's own map of the latest version;
-  `derived/`, what the grid, points and locate read per version (below); `pose.json`, the
-  recorded pose),
+  folder: `maps/<name>/` (`map.json`: the cameras of its committed versions, mask digests, latest
+  version, the first version the mapper map serves; `masks/`; `versions/<n>.json`, immutable,
+  with the cameras known at that version; `mapper/`, the mapper's own map of the latest version;
+  `derived/`, what the grid, points, objects, bird's-eye and locate reads use per version
+  (below); `pose.json`, the recorded pose),
   `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
 * **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
-  `GET /api/maps/{name}/grid`, `/points` and `/objects`, `POST /api/maps/{name}/locate`,
-  `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*).
+  `GET /api/maps/{name}/grid`, `/points`, `/objects`, `/birdseye.png` and `/birdseye`,
+  `POST /api/maps/{name}/locate`, `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and
+  `?dry_run=1` (O10, *Dry run*).
   The other endpoints of api.md come with their groups (O2, O3, O7).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
@@ -82,13 +84,22 @@ they need. New maps take the *prior-first registration* (below).
 `POST /api/maps/{name}/updates` validates the request synchronously (schema; unique frame names;
 every part present; images decodable 8-bit JPEG/PNG of their camera's size; depth 16-bit PNGs of
 that size; masks 8-bit PNGs; prior poses rigid; cameras not redefined, `camera_conflict`), refuses
-with `inference_unavailable` when the inference server is not ready, records new cameras, and
+with `inference_unavailable` when the inference server is not ready, and
 answers `202` with the job (`queued`, `Location: /api/jobs/{id}`). One worker runs the jobs one at
 a time, in arrival order: `queued` → `registering` → `committed`, or `rejected` (the gate or a
 hard limit: nothing committed), or `failed` (`error`). A job commits one version;
 `provisional_version` stays null until O3, and every committed pose is `fused`. A client
 disconnect never touches a job; a job still running when the service stops is `failed` at the
 next start. Jobs are kept one hour after they end (`jobs/<id>.json`).
+
+**Cameras** are known to a map once a version that brought them is committed: a job records its
+new cameras (and their ignore masks) with the version it commits, so a rejected or failed job
+leaves none, and sending that camera id again with other values is no `camera_conflict`. A
+request may omit a camera that an earlier job of the map, still queued or running, sends; if
+that job does not commit, the later one fails with `invalid_request`
+(`details.field: frames[i].camera_id`). A camera a version committed meanwhile with other values
+fails the job with `camera_conflict`. `GET /api/maps/{name}` lists the cameras of the version it
+answers.
 
 The mapper runs in a process of its own per job (`python -m oh_my_slam.service.mapper_proc`), on
 an APFS clone (`cp -c`) of the map's mapper map; the commit moves the clone into place and writes
@@ -111,7 +122,7 @@ the version. A rejected or failed job leaves the map as it was.
   robot's body. Not yet applied to the mapper's depth and fusion (the cloud reads come with O6/O7).
 * **The map frame.** The mapper keeps its own internal frame, which a rebuild may define again.
   The service frame is reached from it by one similarity `S` per version (`versions/<n>.json →
-  sim3`), fitted to *anchors* (`service.anchor`):
+  sim3`), fitted to *anchors* (`mapping.anchor`):
   * first update with `metric` priors: the metric priors (their frame becomes the map frame);
     without metric but with `drifting` priors: the drifting ones; without priors: the first-camera
     rule (origin at the first registered frame in request order, +x its viewing direction on the
@@ -156,7 +167,7 @@ the version. A rejected or failed job leaves the map as it was.
 multi-view refinement's matches), or `rejected` with a reason; `prior_residual_m/deg` whenever the
 frame has a prior and was placed.
 
-| Reason | When (`service.checks`, `service.update`) |
+| Reason | When (`mapping.checks`, `service.update`) |
 | --- | --- |
 | `duplicate` | The name, or the exact image bytes, already in the map or earlier in the request. |
 | `too_close` | Median depth < 0.30 m: from the depth PNG, or the monocular depth model for a *suspicious* frame (< 150 SIFT features or texture < 0.05) — before mapping; or the mapper's aligned depth of a registered frame. |
@@ -262,7 +273,12 @@ Anchored maps (below) report their own sigmas.
 * **Dry run.** Features, map placements and neighbour links run 6 frames at a time
   (`dry_run.DRY_THREADS`), each placed against the stored map without scale evidence; drifting
   priors are predicted along the request (the path grows frame by frame) and the re-anchoring rule
-  applies as in the update. The update's checks run 4 frames at a time.
+  applies as in the update. The update's checks run 4 frames at a time. Its predicted
+  `quality` is the registration phase's, without fusion: `scale_ratio_vs_prev` 1 (fusion refines
+  the scale, map.md §3), `gauge_shift` and the residuals as the update computes them from the
+  placements; on a new anchored map `prior_gravity_deg` is the update's: the angle between the
+  up axis of the origin frame's prior (the first kept frame with a metric or drifting prior) and
+  the gravity the monocular model sees in it (one inference call), null for a camera-only map.
 
 ### Objects, surfaces and relations (O8)
 
@@ -364,8 +380,18 @@ called by `service.prior_first` after the engine placed and fused the update's k
   carries each object's id in `object_id`.
 * **Per version.** The records are committed with the version (`versions/<n>.objects.json`); the
   answer with regions is computed by the derivation worker after the commit and kept
-  (`derived/<n>/objects.json`): a read loads it. Maps of the older mapper list their objects with
-  defaults (no surfaces, colour grey, `partial` extents).
+  (`derived/<n>/objects.json`): a read loads it.
+* **Objects of the older mapper.** A map of the older mapper (`service.objects`) lists its
+  published objects from what that mapper records, never made-up values: `score` its score (the
+  mean of its three best detection scores), `detected_as` its labels by vote, `mean_rgb` the
+  median colour of its points in the version's cloud, `sigma_centre_m`
+  `√(σ_pose² + (spread / √n)²)` (σ_pose the version's median keyframe `sigma_pos_m`, spread the
+  RMS distance of its points from their mean, n its observations), and `first_seen_version` /
+  `last_seen_version` its first and last mapper update ids, which are the versions on a map the
+  service built (one mapper update per committed version; clamped to the version read). That
+  mapper does not record which views bound a box: every extent is `partial` (not seen in full).
+  `state` is `confirmed`; no surfaces or relations. An object without those records, or without
+  points in the cloud, is not listed.
 
 Measured on the serving machine (M3 Pro), 2026-11-10, in-process service with the shared
 inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `none`:
@@ -425,8 +451,11 @@ inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `n
 map (`mapping.relocalize`, from the version's derived keyframes, below). It needs no inference
 server.
 
-* **Checks.** A frame is first measured as in an update (`service.checks`): `plain`, `blur` or
+* **Checks.** A frame is first measured as in an update (`mapping.checks`): `plain`, `blur` or
   `few_features` before matching (`too_close` needs a depth part, which a locate frame has not).
+  A frame the checks keep that gets no pose is `no_overlap` (with `nearest_view`, below), unless
+  it has fewer SIFT keypoints than a pose needs inliers (15, `relocalize.MIN_INLIERS`):
+  `few_features`.
   The camera's ignore mask and the frame's own are combined, rectified with the image to the
   camera's canonical pinhole (lens handling as in an update), and no feature is taken there.
 * **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px, contrast threshold 0.01: a quarter
@@ -696,10 +725,32 @@ thread subscribed to the store's commits (`service.derived`; a read of a version
 derives it first): under `maps/<name>/derived/<n>/`, `volume.npz` (the previous version's volume
 plus the new or moved frames' rays; all of them again when a stored frame moved), `cloud.npz`
 (map frame), `locate.npz` (keyframe points) and `meta.json` (floor, objects, door positions);
-`derived/features/<image sha>.npz` holds each keyframe image's SIFT once for all versions.
+`objects.json` (the objects read's answer) and `birdseye.png` with `birdseye.json` are added on
+first use; `derived/features/<image sha>.npz` holds each keyframe image's SIFT once for all
+versions.
+
+A version's depth, cloud, images and objects come from the mapper map it was committed with,
+never a later one: the store records the first version the current mapper map serves
+(`map.json → mapper_version`), and before a commit replaces that mapper map every version it
+serves that is not derived yet is derived from it (`Store.replacing`). A version whose mapper map
+is gone and that was never derived (its derivation failed) answers `version_gone`.
 It uses two interfaces only: the version record (`frames[]` with `name`, `camera_id`, `internal`,
 `T_map_cam`, sigmas, `sha256`; `sim3`; `floor_z_m`) and the backend's `InternalMap`
 (`depth`, `image`, `cloud`, `objects` by internal frame name).
+
+### Bird's-eye image
+
+`GET /api/maps/{name}/birdseye.png?version=` draws a version from above (`service.birdseye`,
+`mapping.birdseye.render`): an orthographic view along +z, image right map +x, image up map +y,
+1 cm per pixel or the smallest 1-2-5 step that keeps the drawn extent within 2000 px, with a
+24 px margin; the version's fused cloud (each pixel the highest point, the ceiling or roof above
+the keyframe cameras left out), every object of its objects read as its footprint outlined in
+its display `color` with its id, and the keyframe cameras as discs with a tick where they look.
+`GET /api/maps/{name}/birdseye` [`Birdseye`] gives `width`, `height` and `pixel_to_map`, which
+maps a pixel's centre, by its column and row indices `(u, v)`, to map `(x, y) = A (u, v, 1)`. The
+PNG's text metadata records the same `map`, `map_version`, `pixel_to_map` and its inverse
+`map_to_pixel`, plus `Description`, `metres_per_pixel`, `ceiling_cut_z` and a `legend`. Both are
+drawn once per version and kept (`derived/<n>/birdseye.png`, `birdseye.json`).
 
 ### Live check
 
@@ -763,8 +814,7 @@ which replaces most files, widens that window.
 ### Update semantics
 
 * **The order of addition is "latest".** A later update wins over an earlier one, and within one
-  update a later keyframe wins over an earlier one, in input order (the order of the `-i` images;
-  a video's frame order). A sequence mapped in one update or split across several in the same
+  update a later keyframe wins over an earlier one, in input order (the order of the images). A sequence mapped in one update or split across several in the same
   order gives the same objects, labels and boxes, within the evaluator's stability targets (spec
   §2.3 and §5; not to the centimetre: the threaded global mapper is not deterministic, and two
   runs of one update differ too); only ids may differ, where an earlier update had already
@@ -1131,11 +1181,15 @@ Open3D in one process aborts on a duplicate libomp.
 
 ### Mapping (an update)
 
+The mapper's input is images only: video input and frame sampling are removed (high_level_spec.md
+§13; the client samples its own frames). What follows still describes how it treats keyframes
+of a video in maps an earlier tool built from one (a keyframe whose source is `<video>@<time>`).
+
 1. **Lock and stage.** Resolve the inputs into keyframes.
 2. **Per-keyframe inference.** Each keyframe gets depth (768 px grid), gravity, a descriptor and
    detections at the default threshold (the single-image detection, masks on the 768 px grid).
-   Two keyframes are processed at a time, each as soon as ingest has written it, so the video
-   is decoded while the first keyframes' inference runs. For a new map whose keyframes have
+   Two keyframes are processed at a time, each as soon as ingest has written it, so the
+   images are written while the first keyframes' inference runs. For a new map whose keyframes have
    one size, the SIFT features of step 3 are extracted on the CPU while the server's GPU runs
    this inference; their camera gets its prior focal length (the median of the keyframes'
    estimates) once inference is done, which leaves the database as extracting afterwards does.

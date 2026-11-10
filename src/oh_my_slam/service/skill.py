@@ -23,7 +23,8 @@ def render() -> str:
     rows = []
     for e in ENDPOINTS:
         body = f"[`{e.request}`] (multipart: part `request` + file parts)" if e.request else ""
-        ok = ", ".join(f"{s} [`{n}`]" if n else str(s) for s, n in e.responses.items())
+        ok = ", ".join(f"{s} [`{n}`]" if n else f"{s} `{e.media}`" if e.media else str(s)
+                       for s, n in e.responses.items())
         params = ", ".join(f"`{p.name}`" for p in e.params if p.where == "query")
         rows.append(f"| `{e.method} {e.path}` | {e.summary} | {body} | {ok} | {params} |")
     errors = [f"| `{code}` | {status} | {'yes' if retry else 'no'} |"
@@ -32,8 +33,11 @@ def render() -> str:
         "---",
         "name: oh-my-slam",
         f'description: "Short reference of the oh-my-slam HTTP API (schema {SCHEMA_VERSION}) for '
-        "the robot-guide skill's client: update jobs that build an anchored map from camera "
-        'frames with pose priors, per-frame status, map summary and keyframes, health."',
+        "the robot-guide skill's client: update jobs (and dry runs) that build an anchored map "
+        "from camera frames with pose priors, per-frame status and the quality gate; the map "
+        "summary, keyframes, objects and support surfaces, navigation grid, points near a place "
+        "and bird's-eye image of any kept version; locating frames with uncertainty and "
+        'ambiguity, the recorded pose; health and timings."',
         "---",
         "",
         "# oh-my-slam API",

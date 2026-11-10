@@ -117,18 +117,11 @@ def test_collapse_guard_on_a_single_other_keyframe() -> None:
     assert traj.collapsed_keyframes(poses, supported, radius) == {b}
 
 
-def test_capture_runs_and_temporal_anchors() -> None:
+def test_capture_runs() -> None:
     order = [f"f{k:06d}.jpg" for k in range(12)]
     todo = {order[k] for k in (2, 3, 4, 8, 11)}
     runs = traj.capture_runs(order, todo)
     assert runs == [[order[2], order[3], order[4]], [order[8]], [order[11]]]
-    posed = [n for n in order if n not in todo]
-    assert traj.temporal_anchors(order[2], order[4], posed, 4) == [
-        order[1], order[5], order[0], order[6]]
-    # only one side has posed keyframes: all anchors come from it
-    assert traj.temporal_anchors(order[11], order[11], posed, 3) == [
-        order[10], order[9], order[7]]
-    assert traj.temporal_anchors(order[2], order[4], [], 4) == []
 
 
 def test_summary_reports_the_largest_jump() -> None:

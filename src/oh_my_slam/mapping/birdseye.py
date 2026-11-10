@@ -1,4 +1,5 @@
-"""The bird's-eye image of a map (map.md §8; served as a versioned read in a later group).
+"""The bird's-eye image of a map (map.md §8; the service's versioned read ``GET birdseye.png``
+draws each version with ``render``).
 
 An orthographic projection along the map's up axis (+z) onto its horizontal plane, one scale for
 both axes, as one 8-bit RGB PNG: image right is map +x, image up is map +y (seen from above). The
@@ -25,7 +26,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,13 +42,12 @@ LAYERS = ("cloud", "obb")
 MIN_METRES_PER_PX = 0.01
 MAX_SIDE_PX = 2000  # the drawn extent's long side at most (the margins come on top)
 MARGIN_PX = 24  # around the drawn extent: room for the markers and tags at its edge
-BACKGROUND = (0x15, 0x17, 0x1C)  # the viewer's canvas (viewer/static/lib/viewer.js)
+BACKGROUND = (0x15, 0x17, 0x1C)  # a dark canvas, no object colour
 OUTLINE_PX = 2
 LABEL_PX = 12  # font size of the id tags (Pillow's default font)
 TAG_PAD_PX = 2
-# cameras: a located camera and the last known camera white with a black edge, a keyframe the
-# viewer's frustum colour (viewer/static/lib/cameras.js FRAME_COLOR); none of them is an object
-# colour (OKLab chroma below the palette's 0.08, or lighter than its 0.93)
+# cameras: a located camera white with a black edge, a keyframe a light grey-blue; none of them
+# is an object colour (OKLab chroma below the palette's 0.08, or lighter than its 0.93)
 CAMERA_FILL = (0xFF, 0xFF, 0xFF)
 CAMERA_EDGE = (0x00, 0x00, 0x00)
 KEYFRAME_FILL = (0xC9, 0xD1, 0xDC)
@@ -92,7 +92,8 @@ METADATA = {
     "metres_per_pixel": "the scale",
     "ceiling_cut_z": "the height from which map points are left out (null: none)",
     "cameras": "the cameras drawn, as the JSON result represents them",
-    "map": "the map folder",
+    "map": "the map: its folder, or its name for the service's read",
+    "map_version": "the version drawn (the service's read)",
     "legend": "the marks drawn (MARKS): each one's mark, shape, colours and meaning",
 }
 
@@ -203,11 +204,28 @@ def highest_rgb(grid: Grid, xyz: NDArray[Any], rgb: NDArray[Any]
     return p[last], np.asarray(rgb, np.uint8)[order[last]]
 
 
+def corners(centre: Any, size: Any, R2: Any) -> NDArray[np.float64]:
+    """The four horizontal corners (4, 2) of an upright box: its centre (x, y), its size (x, y)
+    and the 2 x 2 rotation of its horizontal axes, in order around it."""
+    hw, hd = float(size[0]) / 2, float(size[1]) / 2
+    local = np.array([[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]])
+    return np.asarray(np.asarray(centre, np.float64)[:2] + local @ np.asarray(R2, np.float64).T,
+                      np.float64)
+
+
 def footprint(obj: Any) -> NDArray[np.float64]:
     """The four horizontal corners (4, 2) of an object's upright OBB, in order around it."""
-    hw, hd = obj.obb.size[0] / 2, obj.obb.size[1] / 2
-    local = np.array([[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]])
-    return np.asarray(obj.obb.center[:2] + local @ obj.obb.R[:2, :2].T, np.float64)
+    return corners(obj.obb.center, obj.obb.size, obj.obb.R[:2, :2])
+
+
+@dataclass(frozen=True)
+class Footprint:
+    """An object as the image draws it: its id, its display colour and its footprint's corners
+    (4, 2) in the map frame."""
+
+    id: int
+    color: tuple[int, int, int]
+    corners: NDArray[np.float64]
 
 
 def heading(T: Pose) -> NDArray[np.float64]:
@@ -225,14 +243,14 @@ def _font(size: int) -> Any:
     return ImageFont.load_default(size)
 
 
-def _draw_objects(draw: Any, grid: Grid, objects: Sequence[Any]) -> None:
+def _draw_objects(draw: Any, grid: Grid, objects: Sequence[Footprint]) -> None:
     """Every id tag, centred above its footprint (inside the image), then every footprint's
     outline over the tags: in a cluttered map a tag lands on other objects' footprints, and
     drawn last it would hide a small object's whole outline."""
-    corners = {o.id: grid.pixels(footprint(o)) - 0.5 for o in objects}
+    px = {o.id: grid.pixels(o.corners) - 0.5 for o in objects}
     font = _font(LABEL_PX)
     for o in objects:
-        c = corners[o.id]
+        c = px[o.id]
         left, top, right, bottom = draw.textbbox((0, 0), str(o.id), font=font)
         w, h = right - left + 2 * TAG_PAD_PX, bottom - top + 2 * TAG_PAD_PX
         x = round(min(max(float(c[:, 0].mean()) - w / 2, 0), grid.width - w))
@@ -241,7 +259,7 @@ def _draw_objects(draw: Any, grid: Grid, objects: Sequence[Any]) -> None:
         draw.text((x + TAG_PAD_PX - left, y + TAG_PAD_PX - top), str(o.id), fill=tuple(o.color),
                   font=font)
     for o in objects:
-        pts = [tuple(p) for p in corners[o.id]]
+        pts = [tuple(p) for p in px[o.id]]
         draw.line([*pts, pts[0]], fill=tuple(o.color), width=OUTLINE_PX, joint="curve")
 
 
@@ -301,25 +319,41 @@ def _draw_camera(draw: Any, grid: Grid, cam: Camera) -> None:
 def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera]) -> bytes:
     """The bird's-eye image of the map ``reader`` reads: its cloud and objects under
     ``cameras``."""
-    from PIL import Image, ImageDraw
-
     from oh_my_slam.reconstruction.cloud import derive_cloud
 
     _, objects = export.map_objects(reader)
     cloud = derive_cloud(export.map_source(export.map_cloud(reader), objects, reader.frames),
                          CloudAttrs(color="rgb"))
-    xyz = np.asarray(cloud.xyz, np.float64).reshape(-1, 3)
     centres = np.array([fr.T_map_cam.t for fr in reader.frames]).reshape(-1, 3)
-    extent = [xyz[:, :2], centres[:, :2], *(footprint(o) for o in objects),
+    png, _ = render(np.asarray(cloud.xyz, np.float64).reshape(-1, 3), np.asarray(cloud.rgb),
+                    [Footprint(o.id, tuple(o.color), footprint(o)) for o in objects], cameras,
+                    centres, reader.root.name, lambda g: {"map": str(reader.root)})
+    return png
+
+
+def render(xyz: NDArray[Any], rgb: NDArray[Any], objects: Sequence[Footprint],
+           cameras: Sequence[Camera], keyframe_centres: NDArray[Any], name: str,
+           extra_text: Callable[[Grid], dict[str, str]]) -> tuple[bytes, Grid]:
+    """The bird's-eye image of a cloud (``xyz``, ``rgb`` in the map frame), the objects'
+    footprints and ``cameras``, and its pixel grid. ``keyframe_centres`` (N, 3) are the map's
+    keyframe camera centres: the image covers them and the ceiling cut starts above them.
+    ``extra_text`` gives text metadata (key -> text) of the grid, added to or replacing the
+    image's own."""
+    from PIL import Image, ImageDraw
+
+    xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
+    centres = np.asarray(keyframe_centres, np.float64).reshape(-1, 3)
+    extent = [xyz[:, :2], centres[:, :2], *(o.corners for o in objects),
               np.array([c.T_map_cam.t[:2] for c in cameras]).reshape(-1, 2)]
-    grid = grid_for(np.concatenate(extent))
+    shown = np.concatenate(extent)
+    grid = grid_for(shown if len(shown) else np.zeros((1, 2)))  # an empty map: its origin
     cut = ceiling_cut(xyz, float(centres[:, 2].max()) if len(centres) else None)
     img = np.empty((grid.height, grid.width, 3), np.uint8)
     img[:] = BACKGROUND
     if len(xyz):
         keep = slice(None) if cut is None else xyz[:, 2] < cut
-        pix, rgb = highest_rgb(grid, xyz[keep], np.asarray(cloud.rgb)[keep])
-        img.reshape(-1, 3)[pix] = rgb
+        pix, colours = highest_rgb(grid, xyz[keep], np.asarray(rgb)[keep])
+        img.reshape(-1, 3)[pix] = colours
     canvas = Image.fromarray(img)
     draw = ImageDraw.Draw(canvas)
     draw.fontmode = "1"  # no anti-aliasing: every pixel drawn is exactly its colour
@@ -335,16 +369,16 @@ def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera]) -> bytes:
     kinds = {c.kind for c in cameras}
     legend = [{"mark": k, **MARKS[k]} for k in MARKS if k in LAYERS or k in kinds]
     text = {
-        "Description": description(reader.root.name, grid.s),
+        "Description": description(name, grid.s),
         "pixel_to_map": _compact(grid.pixel_to_map()),
         "map_to_pixel": _compact(grid.map_to_pixel()),
         "metres_per_pixel": _compact(grid.s),
         "ceiling_cut_z": _compact(None if cut is None else round(cut, 6)),
         "cameras": _compact({c.key: c.record for c in cameras}),
-        "map": str(reader.root),
         "legend": _compact(legend),
     }
-    return png_bytes(np.asarray(canvas), text=text)
+    text.update(extra_text(grid))
+    return png_bytes(np.asarray(canvas), text=text), grid
 
 
 def description(name: str, s: float) -> str:

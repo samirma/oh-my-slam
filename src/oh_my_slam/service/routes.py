@@ -27,6 +27,7 @@ class Endpoint:
     request: str | None = None  # $defs name of the body
     multipart: bool = False  # the body is the ``request`` part of a multipart form
     params: tuple[Param, ...] = field(default_factory=tuple)
+    media: str | None = None  # the media type of a body that is not JSON (``responses``: None)
 
 
 MAP = Param("name", "path", "string", "Map name: 1-64 of letters, digits, '.', '_', '-'.",
@@ -84,6 +85,14 @@ ENDPOINTS: tuple[Endpoint, ...] = (
                      Param("max_points", "query", "integer", "Cap on the points returned "
                            "(default 200000); truncated says whether it applied.", minimum=1,
                            maximum=2000000))),
+    Endpoint("GET", "/api/maps/{name}/birdseye.png", "get_birdseye_png",
+             "Bird's-eye image: the cloud, the objects' footprints with their ids and the "
+             "keyframe cameras seen from above; its text metadata records map_version and "
+             "pixel_to_map", {200: None}, ("map_not_found", "version_gone", "invalid_request"),
+             params=(MAP, VERSION), media="image/png"),
+    Endpoint("GET", "/api/maps/{name}/birdseye", "get_birdseye",
+             "The bird's-eye image's metadata: size and pixel_to_map", {200: "Birdseye"},
+             ("map_not_found", "version_gone", "invalid_request"), params=(MAP, VERSION)),
     Endpoint("POST", "/api/maps/{name}/locate", "post_locate", "Locate frames in the map",
              {200: "Locate"}, ("invalid_request", "camera_conflict", "map_not_found",
                                "version_gone", "payload_too_large"),

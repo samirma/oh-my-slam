@@ -138,10 +138,22 @@ def test_detection_failure_fails_the_job(client: Client) -> None:
 def test_objects_of_a_map_of_the_older_mapper(tmp_path: Path) -> None:
     store = Store(tmp_path / "data")
     store.create()
-    backend = FakeBackend(gauge=__import__("oh_my_slam.service.anchor", fromlist=["Sim3"]).Sim3())
+    backend = FakeBackend(gauge=__import__("oh_my_slam.mapping.anchor", fromlist=["Sim3"]).Sim3())
+    rec = {"score": 0.8, "label_votes": {"door": 1.6, "cabinet": 0.4}, "observations": 4,
+           "created_update": 1, "last_seen_update": 7}
     backend.objects_world = [
-        {"id": 3, "label": "door", "center": [1.0, 0.0, 1.0], "size": [0.9, 0.05, 2.0]},
-        {"id": None, "label": "ghost", "center": [0.0, 0.0, 0.5], "size": [0.1, 0.1, 0.1]}]
+        {"id": 3, "label": "door", "center": [1.0, 0.0, 1.0], "size": [0.9, 0.05, 2.0], **rec},
+        {"id": None, "label": "ghost", "center": [0.0, 0.0, 0.5], "size": [0.1, 0.1, 0.1]},
+        # no score recorded: not listed (never made up)
+        {"id": 4, "label": "old", "center": [2.0, 0.0, 0.5], "size": [0.1, 0.1, 0.1]},
+        # no points in the cloud: no observed colour, not listed
+        {"id": 5, "label": "lamp", "center": [2.0, 1.0, 0.5], "size": [0.1, 0.1, 0.1], **rec}]
+    from oh_my_slam.service.backend import Cloud
+
+    xyz = np.array([[0.9, 0.0, 1.0], [1.1, 0.0, 1.0], [1.0, 0.0, 0.5], [0.0, 0.0, 0.0]],
+                   np.float32)
+    backend.cloud_world = Cloud(xyz, np.array([[200, 40, 40]] * 3 + [[0, 0, 0]], np.uint8),
+                                np.array([3, 3, 3, 0], np.uint32))
     timings = Timings()
     updater = Updater(store, backend, timings, prior_first=False)
     jobs = Jobs(store.jobs, updater, timings.predict_update)
@@ -159,7 +171,13 @@ def test_objects_of_a_map_of_the_older_mapper(tmp_path: Path) -> None:
         assert job["state"] == "committed", job
         doc = c.get("/api/maps/m/objects", "Objects")
         assert [o["label"] for o in doc["objects"]] == ["door"]
-        assert doc["surfaces"] == [] and doc["objects"][0]["state"] == "confirmed"
+        o = doc["objects"][0]
+        assert doc["surfaces"] == [] and o["state"] == "confirmed"
+        assert o["score"] == 0.8 and o["detected_as"] == ["door", "cabinet"]
+        assert o["mean_rgb"] == [200, 40, 40] and o["sigma_centre_m"] > 0
+        # the mapper's update ids are the versions, at most the version read
+        assert o["first_seen_version"] == 1 and o["last_seen_version"] == 1
+        assert o["extent_seen"] == {"x": "partial", "y": "partial", "z": "partial"}
         c.get("/api/maps/nothing/objects", status=404)
     jobs.stop(timeout=10)
 
@@ -213,3 +231,43 @@ def test_views_from_above_are_looked_at_closer(client: Client) -> None:
     assert client.backend.looked and all(boxes for _, boxes in client.backend.looked)
     box = labels(client.get("/api/maps/u/objects", "Objects"))["box"]
     assert box["detected_as"] == ["box"]
+
+
+def test_birdseye_of_each_version(client: Client) -> None:
+    """GET birdseye.png draws the version from above; GET birdseye gives the same metadata; its
+    pixel_to_map takes each object's footprint centre onto an outline pixel of its colour."""
+    import io
+    import json
+
+    from PIL import Image
+
+    fr, files = frames(client, "full", EYES[:4], "a")
+    assert client.update("t", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    meta = client.get("/api/maps/t/birdseye", "Birdseye")
+    assert meta["map"] == "t" and meta["map_version"] == 1
+    r = client.http.get("/api/maps/t/birdseye.png")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    assert "server-timing" in r.headers
+    img = Image.open(io.BytesIO(r.content))
+    assert img.size == (meta["width"], meta["height"])
+    text = img.text  # type: ignore[attr-defined]
+    assert json.loads(text["pixel_to_map"]) == meta["pixel_to_map"]
+    assert text["map_version"] == "1" and text["map"] == "t"
+    A = np.asarray(meta["pixel_to_map"])
+    inv = np.linalg.inv(np.vstack([A, [0, 0, 1]]))
+    rgb = np.asarray(img.convert("RGB"))
+    objects = client.get("/api/maps/t/objects", "Objects")["objects"]
+    for o in objects:  # the object's colour is drawn around its centre's pixel
+        u, v, _ = inv @ [o["centre_m"][0], o["centre_m"][1], 1.0]
+        r_px = max(o["size_m"][:2]) / A[0, 0] / 2 + 3
+        ys, xs = np.mgrid[0:rgb.shape[0], 0:rgb.shape[1]]
+        near = np.hypot(xs - u, ys - v) <= r_px
+        assert (rgb[near] == o["color"]).all(axis=1).any(), o["label"]
+    # kept per version: a second read loads it; a past version answers its own
+    assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
+    fr2, files2 = frames(client, "taken", EYES[2:3], "b")
+    assert client.update("t", fr2, files2)["state"] == "committed"
+    assert client.get("/api/maps/t/birdseye", "Birdseye")["map_version"] == 2
+    assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
+    client.get("/api/maps/t/birdseye?version=9", status=400)
+    client.get("/api/maps/none/birdseye.png", status=404)

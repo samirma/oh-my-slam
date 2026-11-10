@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.1) for the robot-guide skill's client: update jobs that build an anchored map from camera frames with pose priors, per-frame status, map summary and keyframes, health."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.1) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; health and timings."
 ---
 
 # oh-my-slam API
@@ -25,6 +25,8 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `GET /api/maps/{name}/objects` | Object records and support surfaces |  | 200 [`Objects`] | `version` |
 | `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m` |
 | `GET /api/maps/{name}/points` | Fused points inside a box |  | 200 [`Points`] | `version`, `min`, `max`, `voxel_m`, `max_points` |
+| `GET /api/maps/{name}/birdseye.png` | Bird's-eye image: the cloud, the objects' footprints with their ids and the keyframe cameras seen from above; its text metadata records map_version and pixel_to_map |  | 200 `image/png` | `version` |
+| `GET /api/maps/{name}/birdseye` | The bird's-eye image's metadata: size and pixel_to_map |  | 200 [`Birdseye`] | `version` |
 | `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] (multipart: part `request` + file parts) | 200 [`Locate`] |  |
 | `GET /api/maps/{name}/pose` | Last recorded pose |  | 200 [`Pose`] |  |
 | `DELETE /api/maps/{name}` | Delete the map and its versions |  | 204 |  |

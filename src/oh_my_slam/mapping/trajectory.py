@@ -29,7 +29,7 @@ keeps both. The checks:
 Keyframes left out of the main reconstruction join it through a secondary reconstruction that
 shares keyframes with it (``merge_by_shared``: similarity from the shared poses, verified on each
 of them), else through the anchored multi-view path of the mapper; for video its anchors are the
-posed keyframes next to them in capture order (``capture_runs``, ``temporal_anchors``).
+posed keyframes next to them in capture order (``capture_runs``).
 """
 
 from __future__ import annotations
@@ -164,19 +164,6 @@ def capture_runs(order: list[str], todo: Collection[str]) -> list[list[str]]:
     if current:
         runs.append(current)
     return runs
-
-
-def temporal_anchors(first: str, last: str, posed: list[str], k: int) -> list[str]:
-    """Up to ``k`` of the ``posed`` keyframes (in capture order) nearest in capture order to a run
-    ``first`` … ``last``: alternately the nearest before it and the nearest after it."""
-    before = [n for n in posed if n < first][::-1]
-    after = [n for n in posed if n > last]
-    out: list[str] = []
-    while len(out) < k and (before or after):
-        for side in (before, after):
-            if side and len(out) < k:
-                out.append(side.pop(0))
-    return out
 
 
 def summary(poses: dict[str, Pose], order: list[str]) -> dict[str, Any]:

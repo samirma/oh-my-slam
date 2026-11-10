@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.service.anchor import Sim3
+from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.service.backend import (
     Cloud,
     InternalFrame,

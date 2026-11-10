@@ -217,8 +217,9 @@ def test_frame_record_roundtrip() -> None:
 # --- ingest -------------------------------------------------------------------------------------
 
 
-def test_resolve_inputs_images_in_order_or_one_video(tmp_path: Path) -> None:
-    """Spec §2.3: ``-i`` is image(s) or a video; images keep the order given, folders are refused."""
+def test_resolve_inputs_images_in_order(tmp_path: Path) -> None:
+    """An update's inputs are images, in the order given; a video (no video input, high_level
+    §13) and folders are refused."""
     d = tmp_path / "caps"
     d.mkdir()
     for name in ("b.jpg", "a.jpg", "c.png"):
@@ -228,9 +229,8 @@ def test_resolve_inputs_images_in_order_or_one_video(tmp_path: Path) -> None:
     assert spec.kind == "images" and [p.name for p in spec.images] == ["b.jpg", "a.jpg", "c.png"]
     vid = tmp_path / "v.mp4"
     vid.write_bytes(b"x")
-    assert ingest.resolve_inputs([vid]).kind == "video"
-    with pytest.raises(UsageError):
-        ingest.resolve_inputs([vid, d / "a.jpg"])
+    with pytest.raises(InputError, match="not an image"):
+        ingest.resolve_inputs([vid])
     with pytest.raises(UsageError):
         ingest.resolve_inputs([])
     with pytest.raises(InputError):
@@ -245,13 +245,13 @@ def test_resolve_inputs_images_in_order_or_one_video(tmp_path: Path) -> None:
     (d / "._a.jpg").write_bytes(b"\x00\x05\x16\x07AppleDouble")
     spec = ingest.resolve_inputs([d / ".hidden.jpg", d / "._a.jpg"])
     assert [p.name for p in spec.images] == [".hidden.jpg", "._a.jpg"]
-    kfs = ingest.keyframes(spec, 2.0, tmp_path / "frames", 0)
+    kfs = ingest.keyframes(spec, tmp_path / "frames", 0)
     assert next(kfs).source == str(d / ".hidden.jpg")
     with pytest.raises(InputError, match="cannot read image"):
         next(kfs)
 
 
-def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
+def test_keyframes_from_images(tmp_path: Path) -> None:
     d = tmp_path / "caps"
     d.mkdir()
     img = Image.new("RGB", (40, 30), (200, 10, 10))
@@ -259,16 +259,10 @@ def test_keyframes_from_images_and_video(tmp_path: Path) -> None:
     exif[0x0112] = 6  # rotated: must be re-encoded upright
     img.save(d / "r.jpg", exif=exif)
     Image.new("RGB", (40, 30)).save(d / "s.jpg")
-    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "r.jpg", d / "s.jpg"]), 2.0,
+    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "r.jpg", d / "s.jpg"]),
                                 tmp_path / "frames", 5))
     assert [k.name for k in kfs] == ["f000005", "f000006"]
     assert Image.open(kfs[0].path).size == (30, 40)
-    from tests.unit.test_video import _make_clip
-
-    clip = tmp_path / "c.mp4"
-    _make_clip(clip, seconds=2.0, fps=10)
-    vk = list(ingest.keyframes(ingest.resolve_inputs([clip]), 2.0, tmp_path / "vf", 0))
-    assert len(vk) == 4 and float(vk[1].source.rsplit("@", 1)[1]) >= 0.5
 
 
 def test_given_intrinsics_replace_the_exif_ones(tmp_path: Path) -> None:
@@ -279,7 +273,7 @@ def test_given_intrinsics_replace_the_exif_ones(tmp_path: Path) -> None:
     Image.new("RGB", (40, 30)).save(d / "a.jpg")
     Image.new("RGB", (40, 30)).save(d / "b.jpg")
     K = Intrinsics(33.0, 33.0, 20.0, 15.0, 40, 30, "given")
-    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "a.jpg", d / "b.jpg"]), 2.0,
+    kfs = list(ingest.keyframes(ingest.resolve_inputs([d / "a.jpg", d / "b.jpg"]),
                                 tmp_path / "frames", 0, {d / "a.jpg": K}))
     assert kfs[0].exif == K and kfs[1].exif is None
 

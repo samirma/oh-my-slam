@@ -50,6 +50,8 @@ def build(version: str) -> dict[str, Any]:
             resp: dict[str, Any] = {"description": e.summary}
             if body is not None:
                 resp["content"] = {"application/json": {"schema": _ref(body)}}
+            elif e.media is not None:
+                resp["content"] = {e.media: {"schema": {"type": "string", "format": "binary"}}}
             elif e.handler == "openapi":
                 resp["content"] = {"application/json": {"schema": {"type": "object"}}}
             if status == 202:

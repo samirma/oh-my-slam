@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import math
 import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
+from oh_my_slam.mapping import checks
 from oh_my_slam.mapping.anchored import (
     MIN_INLIERS,
     AnchoredMap,
@@ -39,8 +41,8 @@ from oh_my_slam.mapping.anchored import (
     inherit_conflicts,
     match,
     pose_residual,
+    unit,
 )
-from oh_my_slam.service import checks
 from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in, none_engine
 
 if TYPE_CHECKING:
@@ -61,8 +63,7 @@ def link(a: Features, b: Features) -> int:
     return 0 if mask is None else int(mask.sum())
 
 
-def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
-            new_masks: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     """The ``DryRun`` body of an update request."""
     from oh_my_slam.service.update import gate, residual_stats
 
@@ -73,7 +74,7 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
     try:
         # the latest committed version and its mapper map, as one: a job may commit meanwhile
         prev = store.snapshot(w.map, workdir / "mapper")
-        frames, masks = up._frames(w, new_cameras, new_masks)
+        frames, masks = up._frames(w)
         up._check(frames, masks, prev, indir)
         # the monocular depth of at most DRY_DEPTH_FRAMES suspicious frames (too_close): a
         # dry run stays a few seconds; the others are predicted by their other checks
@@ -100,6 +101,7 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
                     assert fr.work.prior is not None
                     prior_res.append(pose_residual(pl.T, np.asarray(fr.work.prior["T_map_cam"])))
             out.append(row)
+        gravity = _prior_gravity(up, frames) if prev is None and up.prior_first else None
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     low = sum(pl is not None and (pl.status == "provisional"
@@ -119,7 +121,7 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
         if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
-        "rebuilt": False, "prior_gravity_deg": None,
+        "rebuilt": False, "prior_gravity_deg": gravity,
     }
     reached = [fr for fr in frames if fr.reason is None]
     ma = len([fr for fr in reached if fr.work.trust not in ("metric", "drifting")]) \
@@ -129,6 +131,24 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
             "base_version": None if prev is None else prev["version"], "frames": out,
             "quality": gate(q, bool(kept), w.accept_if),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
+
+
+def _prior_gravity(up: Updater, frames: list[_Frame]) -> float | None:
+    """A new anchored map's ``prior_gravity_deg``, as its first update reports it
+    (``AnchoredMap._up_check``): the angle between the up axis of the origin frame's prior (the
+    first kept frame with a metric or drifting prior) and the gravity the monocular model sees in
+    it. None without such a frame (a camera-only map is levelled by that gravity) or estimate."""
+    origin = next((fr for fr in frames if fr.reason is None and fr.path is not None
+                   and fr.work.trust in ("metric", "drifting")), None)
+    if origin is None:
+        return None
+    assert origin.path is not None and origin.work.prior is not None
+    up_cam = up.backend.infer(origin.path, origin.cam.canonical(), True).up_cam
+    if up_cam is None:
+        return None
+    R = np.asarray(origin.work.prior["T_map_cam"], np.float64)[:3, :3]
+    u = R @ unit(np.asarray(up_cam, np.float64))
+    return round(math.degrees(math.acos(max(-1.0, min(1.0, float(u[2]))))), 3)
 
 
 def _place_all(pool: ThreadPoolExecutor, am: AnchoredMap | None, frames: list[_Frame],

@@ -206,7 +206,9 @@ def test_read_gives_keyframe_images_the_cloud_and_objects(tmp_path: Path) -> Non
                                            "size": [1, 0.1, 2]}},
         {"id": 4, "label": "ghost"}]}))
     assert b.read(m).objects() == [{"id": 3, "label": "door", "center": [1, 2, 3],
-                                    "R": np.eye(3).tolist(), "size": [1, 0.1, 2]}]
+                                    "R": np.eye(3).tolist(), "size": [1, 0.1, 2],
+                                    "score": None, "label_votes": {}, "observations": None,
+                                    "created_update": None, "last_seen_update": None}]
 
 
 # -- the depth model -----------------------------------------------------------------------------

@@ -38,8 +38,9 @@ inference server process. Never edit files in `.staging/` of a map.
   validated against it; tests check every response against it. `/api/openapi.json` and `SKILL.md`
   are generated from the same endpoint definitions (`service/routes.py`). Errors are typed
   (`code`, `retryable`); an unusable frame is an input status, never an error.
-- **Capabilities.** `GET /api/health → capabilities` lists the groups really implemented (now O1,
-  O4); the order of work is high_level_spec.md §12.
+- **Capabilities.** `GET /api/health → capabilities` lists the groups really implemented (read it
+  there, or `service/app.py` `CAPABILITIES`, rather than a list kept here); the order of work is
+  high_level_spec.md §12.
 - **Map frame and versions.** The map frame is fixed by a map's first update (the metric priors'
   frame when given — the main path: every robot starts with metric priors — else the drifting
   priors', else the first-camera rule) and never re-gauged: each update fits the similarity from
@@ -49,7 +50,8 @@ inference server process. Never edit files in `.staging/` of a map.
 - **Jobs.** An update is an asynchronous job; a client disconnect never cancels it. Until O2 + O3
   a job commits one version and fusion blocks it.
 - **Ownership** (import-linter in `pyproject.toml`, `tests/unit/test_ownership.py`): `service`
-  (HTTP) > `mapping` (registration, fusion, objects, store, bird's-eye) > `segmentation`
+  (HTTP, jobs, version store) > `mapping` (registration and anchoring, frame checks, fusion,
+  objects, grid, the mapper's store, bird's-eye) > `segmentation`
   (detection, boxes, colours) > `reconstruction` (depth, point generation, cloud derivation) >
   `client` > `core`; `server` owns the models only. Nothing imports `service`; reconstruction never
   imports segmentation or mapping.
@@ -59,7 +61,8 @@ inference server process. Never edit files in `.staging/` of a map.
 ## Machine and tooling facts (verified locally)
 
 - Apple M3 Pro, 18 GiB unified memory, macOS 27.0.1, no CUDA (`sysctl`, `sw_vers`, 2026-10-26).
-  The spec's target machine is still the M4 Max with 36 GB; evaluations run on this one.
+  This is the serving machine where targets are measured (high_level_spec.md §10); the M4 Max
+  with 36 GB and CUDA hosts must also run the service, their numbers reported separately.
 - **COLMAP:**
   - Homebrew `colmap` 4.2.0 includes GLOMAP as `global_mapper`, and ALIKED/LightGlue feature
     extraction and matching through ONNX Runtime with the CoreML provider.

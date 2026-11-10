@@ -288,3 +288,11 @@ def test_a_tag_never_hides_another_object_s_outline(scene: Any) -> None:
         r, c = pixel(text, x, y)
         window = rgb[r - 1:r + 2, c - 1:c + 2].reshape(-1, 3)
         assert any(tuple(int(v) for v in px) == color_for_id(7) for px in window), (x, y)
+
+
+def test_an_empty_map_is_drawn_around_its_origin() -> None:
+    png, grid = be.render(np.zeros((0, 3)), np.zeros((0, 3), np.uint8), [], [], np.zeros((0, 3)),
+                          "empty", lambda g: {"map": "empty"})
+    img = Image.open(io.BytesIO(png))
+    assert img.size == (grid.width, grid.height) == (2 * be.MARGIN_PX + 1,) * 2
+    assert img.text["map"] == "empty"  # type: ignore[attr-defined]

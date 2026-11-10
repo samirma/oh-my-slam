@@ -11,7 +11,6 @@ from numpy.typing import NDArray
 from PIL import ExifTags, Image, ImageOps
 
 from oh_my_slam.core.constants import IMAGE_SUFFIXES as IMAGE_SUFFIXES
-from oh_my_slam.core.constants import VIDEO_SUFFIXES as VIDEO_SUFFIXES
 from oh_my_slam.core.errors import InputError
 from oh_my_slam.core.types import Intrinsics
 

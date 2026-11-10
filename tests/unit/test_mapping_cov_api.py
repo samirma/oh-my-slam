@@ -234,14 +234,13 @@ def test_a_chunk_the_device_has_no_memory_for_is_sent_again_smaller(
             for k in range(4)}
     todo = [api.PoolView(f"c{k:02d}", Path("y"), K, None) for k in range(30)]
     ctx, posed = ctx_of([]), {}
-    api._multiview_chunks(ctx, todo, dict(pool), posed, None, temporal=False)  # type: ignore[arg-type]
+    api._multiview_chunks(ctx, todo, dict(pool), posed, None)  # type: ignore[arg-type]
     # 4 anchors + 20 new, + 10, + 5: then 9 at a time for the rest
     assert sent == [24, 14, *[9] * 6] and sorted(posed) == [v.name for v in todo]
     assert ctx.notes["multiview_chunk"] == 9 and len(warned) == 2
     fits["views"] = 5  # 4 anchors + 2 new does not fit either
     with pytest.raises(DeviceMemoryError):
-        api._multiview_chunks(ctx_of([]), todo, dict(pool), {}, None,  # type: ignore[arg-type]
-                              temporal=False)
+        api._multiview_chunks(ctx_of([]), todo, dict(pool), {}, None)  # type: ignore[arg-type]
 
 
 def test_a_keyframe_without_triangulated_points_has_no_sparse_scale() -> None:
@@ -318,8 +317,7 @@ def sfm_chain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
     monkeypatch.setattr(api, "Sfm", FakeSfm)
     seen: dict[str, Any] = {}
 
-    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any,
-                  temporal: bool = False) -> dict[str, Pose]:
+    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any) -> dict[str, Pose]:
         seen["todo"] = [v.name for v in todo]
         return {v.name: Pose.identity() for v in todo}
 
@@ -817,9 +815,8 @@ def test_joining_a_video_merges_another_reconstruction_and_guards_the_re_placed(
     placed = {jpg(6): look_at(np.array([14.0, 0.0, 1.5]), np.array([14.0, 3.0, 1.5])),
               jpg(7): Pose(turned.R, 2.0 * turned.t)}
 
-    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any,
-                  temporal: bool = False) -> dict[str, Pose]:
-        assert temporal and [v.name for v in todo] == [jpg(6), jpg(7)]
+    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any) -> dict[str, Pose]:
+        assert [v.name for v in todo] == [jpg(6), jpg(7)]
         return {v.name: placed[v.name] for v in todo}
 
     def refine(ctx: Any, sfm: Any, p: dict[str, Pose], free: set[str], refine_focal: bool,
@@ -1036,8 +1033,7 @@ def test_a_map_of_fewer_than_three_keyframes_is_mapped_again(
 def extension(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     seen: dict[str, Any] = {}
 
-    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any,
-                  temporal: bool = False) -> dict[str, Pose]:
+    def multiview(ctx: Any, todo: list[Any], pool: list[Any], client: Any) -> dict[str, Pose]:
         seen["todo"] = [v.name for v in todo]
         seen["pool"] = sorted(v.name for v in pool if v.pose is not None)
         return {v.name: Pose.identity() for v in todo}
@@ -1425,3 +1421,68 @@ def test_an_abandoned_rebuild_gives_the_new_keyframes_back_as_inference_gave_the
                          lambda m: None)
     assert new.dets == ["det"] and new.lens is None and new.record is None
     np.testing.assert_array_equal(new.frame.depth, original.depth)
+
+
+def test_global_mapping_is_completed_incrementally(tmp_path: Path) -> None:
+    """Keyframes the global mapper left out that have matches to its model are registered
+    incrementally with the global poses fixed; a result that adds none keeps the global model."""
+    model = FakeModel(line([jpg(0), jpg(1)]))
+    more = FakeModel(line([jpg(0), jpg(1), jpg(2)]), method="sfm-incremental")
+    more.notes = {"x": 1}
+    sfm = SimpleNamespace(connected=lambda a, b: True,
+                          map_incremental=lambda path, input_path, fix_existing: more)
+    out = api._complete_registration(sfm, model, {jpg(0), jpg(1), jpg(2)}, tmp_path)  # type: ignore[arg-type]
+    assert out is more and out.method == "sfm-global+incremental"
+    assert out.registered == [jpg(0), jpg(1), jpg(2)] and out.notes == {"x": 1}
+    sfm.map_incremental = lambda path, input_path, fix_existing: FakeModel(line([jpg(0)]))
+    assert api._complete_registration(sfm, model, {jpg(2)}, tmp_path) is model  # type: ignore[arg-type]
+
+
+def test_mis_scaled_blocks_are_moved(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = FakeModel(line([jpg(i) for i in range(4)]))
+    moved = {jpg(3): Pose.identity()}
+    move = {"keyframes": [jpg(3)], "factor": 2.0, "tilt_deg": 0.0, "pivot": jpg(2)}
+    monkeypatch.setattr(traj, "fix_blocks", lambda *a: traj.BlockFix(moved, [move], set()))
+    monkeypatch.setattr(api.mframe, "metric_scale",
+                        lambda m, f: mframe.ScaleResult(1.0, 0.0, {}, {}))
+    warned: list[str] = []
+    monkeypatch.setattr(api.log, "warning", lambda msg, *a: warned.append(msg % a))
+    join: dict[str, Any] = {}
+    sfm = SimpleNamespace(verified_pairs=lambda: {})
+    assert api._fix_blocks(ctx_of([nf(i) for i in range(4)]), sfm, model, join) == moved  # type: ignore[arg-type]
+    assert join["fixed_blocks"] == [move] and "hang on nothing" not in warned[0]
+    # levelling again finds nothing to change: the block keeps its poses
+    monkeypatch.setattr(traj, "level_block", lambda *a: {})
+    poses = line([jpg(0), jpg(1), jpg(2), jpg(3)])
+    free = {jpg(3): poses[jpg(3)]}
+    ups = [nf(i, up_cam=poses[jpg(i)].R.T @ UP) for i in range(4)]
+    api._relevel_blocks(ctx_of(ups), {jpg(0): poses[jpg(0)]}, free, {"fixed_blocks": [
+        {**move, "about": jpg(2)}]})
+    assert free == {jpg(3): poses[jpg(3)]}
+
+
+def test_realigned_blocks_without_unplaced_keyframes_are_refined_alone(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A model whose blocks were rescaled but that left no keyframe out: no multi-view call, the
+    realigned keyframes are refined with the others fixed."""
+    names = [jpg(i) for i in range(4)]
+    model = FakeModel(line(names))
+    poses = line(names)
+    monkeypatch.setattr(api, "_fix_blocks", lambda c, s, m, j: {jpg(3): poses[jpg(3)]})
+    monkeypatch.setattr(api, "_contradicting", lambda s, p, k, judged: {})
+    monkeypatch.setattr(api, "_deregister_contradicted", lambda c, m, n, photos: ({}, set()))
+    monkeypatch.setattr(api.mframe, "metric_scale",
+                        lambda m, f: mframe.ScaleResult(1.0, 0.0, {}, {}))
+    monkeypatch.setattr(api, "_multiview_poses",
+                        lambda *a: pytest.fail("no keyframe left out: no multi-view call"))
+    refined: dict[str, Any] = {}
+
+    def refine(ctx: Any, sfm: Any, p: dict[str, Pose], free: set[str], refine_focal: bool,
+               rotation: bool, model: Any = None) -> tuple[dict[str, Pose], float, float]:
+        refined["free"] = set(free)
+        return p, 1.0, 0.0
+
+    monkeypatch.setattr(api, "_refine_multiview", refine)
+    ctx = ctx_of([nf(i) for i in range(4)], tmp=tmp_path)
+    api._join_unplaced(ctx, JoinSfm(set()), model, set(names), set(), False, None, quiet)  # type: ignore[arg-type]
+    assert refined["free"] == {jpg(3)}

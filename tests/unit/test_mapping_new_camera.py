@@ -54,8 +54,7 @@ def _world(monkeypatch: pytest.MonkeyPatch, n: int = 5, fit: PoseFit | None = No
     ctx = ctx_of(new, old)
     seen: dict[str, Any] = {"refined": []}
 
-    def multiview(ctx_: Any, todo: list[Any], pool: list[Any], client: Any,
-                  temporal: bool = False) -> dict[str, Pose]:
+    def multiview(ctx_: Any, todo: list[Any], pool: list[Any], client: Any) -> dict[str, Pose]:
         seen["todo"], seen["pool"] = [v.name for v in todo], pool
         return {v.name: Pose.identity() for v in todo}
 
@@ -225,20 +224,16 @@ def _photo(i: int, weak: bool) -> Any:
                              K, Pose.identity(), 64, 48, stats=stats)
 
 
-def test_a_pan_from_one_spot_is_rebuilt_with_the_first_video_added_to_it() -> None:
-    """A map of photos that multi-view posed from one spot (the pan-tilt camera alone: none of its
-    keyframes posed by SfM) has no parallax to place a video's walk by: it is mapped again with the
-    video, as one new map. A photo map that SfM posed in part is extended by a video as before."""
+def test_a_weak_photo_map_is_rebuilt_with_the_photos_added_to_it() -> None:
+    """A map of photos with some keyframes weakly posed is mapped again with the new photos; a
+    map that an earlier tool built from a video is never rebuilt."""
     from oh_my_slam.mapping import ingest
 
     meta = {"updates": [{"kind": "images", "notes": {}}]}
-    video = ingest.InputSpec("video", [], Path("walk.mp4"))
     photos = ingest.InputSpec("images", [Path("a.jpg")])
     weak = [_photo(i, True) for i in range(3)]
     mixed = [_photo(0, False), *weak[1:]]
-    assert api._restart_plan(meta, weak, video) == (weak, None)
-    assert api._restart_plan(meta, mixed, video) == ([], None)
-    assert api._restart_plan(meta, mixed, photos) == (mixed, None)  # photos: some weak is enough
+    assert api._restart_plan(meta, mixed, photos) == (mixed, None)  # some weak is enough
+    assert api._restart_plan(meta, [_photo(0, False)], photos) == ([], None)
     after_video = {"updates": [*meta["updates"], {"kind": "video", "notes": {}}]}
-    assert api._restart_plan(after_video, weak, video) == ([], None)
-    assert api._restart_plan(meta, weak[:2], video) == ([], None)  # remapped with it instead
+    assert api._restart_plan(after_video, weak, photos) == ([], None)

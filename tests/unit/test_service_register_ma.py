@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.service import prior_first, register_ma
+from oh_my_slam.mapping import register_ma
+from oh_my_slam.service import prior_first
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.update import FrameWork, UpdateWork
 from tests.fakes.service import FakeBackend

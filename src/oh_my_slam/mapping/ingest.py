@@ -1,5 +1,5 @@
-"""Mapper inputs: ``-i`` resolution (image files, or exactly one video), keyframe sampling and
-naming."""
+"""Mapper inputs: the image files of an update, in order, written as named keyframes. There is no
+video input (high_level_spec.md §13): the client samples its own frames."""
 
 from __future__ import annotations
 
@@ -10,11 +10,9 @@ from pathlib import Path
 
 from PIL import ExifTags
 
-from oh_my_slam.core.constants import DEFAULT_FPS as DEFAULT_FPS
 from oh_my_slam.core.errors import InputError, UsageError
 from oh_my_slam.core.images import (
     IMAGE_SUFFIXES,
-    VIDEO_SUFFIXES,
     exif_intrinsics,
     load_rgb,
     open_header,
@@ -26,9 +24,8 @@ from oh_my_slam.mapping.store import frame_name
 
 @dataclass
 class InputSpec:
-    kind: str  # "images" | "video"
+    kind: str  # "images" (an update's record names its kind; maps of earlier tools: "video")
     images: list[Path]
-    video: Path | None = None
 
 
 @dataclass
@@ -41,24 +38,19 @@ class Keyframe:
 
 
 def resolve_inputs(args: list[Path]) -> InputSpec:
-    """Image files, in the order given, or exactly one video (spec §2.3: image(s) or a video)."""
+    """Image files, in the order given."""
     if not args:
-        raise UsageError("-i needs at least one image or a video")
-    videos = [a for a in args if a.is_file() and a.suffix.lower() in VIDEO_SUFFIXES]
-    if videos:
-        if len(args) != 1:
-            raise UsageError("-i takes exactly one video, or images (not both)")
-        return InputSpec("video", [], videos[0])
+        raise UsageError("an update needs at least one image")
     images: list[Path] = []
     for a in args:
         if not a.exists():
             raise InputError(f"input not found: {a}")
         if a.is_dir():
-            raise InputError(f"{a} is a folder; -i takes image files (e.g. {a}/*.jpg) or a video")
+            raise InputError(f"{a} is a folder; an update takes image files (e.g. {a}/*.jpg)")
         if a.suffix.lower() in IMAGE_SUFFIXES:
             images.append(a)
         else:
-            raise InputError(f"unsupported input (not an image or video): {a}")
+            raise InputError(f"unsupported input (not an image): {a}")
     return InputSpec("images", images)
 
 
@@ -74,23 +66,12 @@ def write_upright_jpeg(src: Path, dst: Path) -> None:
         save_jpeg(load_rgb(src), dst, quality=95)
 
 
-def keyframes(spec: InputSpec, fps: float, frames_dir: Path, start_index: int,
+def keyframes(spec: InputSpec, frames_dir: Path, start_index: int,
               intrinsics: dict[Path, Intrinsics] | None = None) -> Iterator[Keyframe]:
     """Write keyframes as ``frames_dir/fNNNNNN.jpg`` and yield them in capture order. An image
     that ``intrinsics`` names carries those (a calibrated camera, ``oh_my_slam.service``) instead
     of its EXIF ones: the mapper holds them as it holds an EXIF focal length."""
     idx = start_index
-    if spec.kind == "video":
-        from oh_my_slam.core.video import sample_frames
-
-        assert spec.video is not None
-        for f in sample_frames(spec.video, fps):
-            name = frame_name(idx)
-            path = frames_dir / f"{name}.jpg"
-            save_jpeg(f.rgb, path, quality=95)
-            yield Keyframe(name, idx, path, f"{spec.video}@{f.timestamp:.3f}", None)
-            idx += 1
-        return
     for src in spec.images:
         name = frame_name(idx)
         path = frames_dir / f"{name}.jpg"

@@ -26,6 +26,7 @@ from oh_my_slam.core.errors import (
     ServerUnavailableError,
 )
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping.register_ma import MvView
 from oh_my_slam.service.errors import ApiError
 
 if TYPE_CHECKING:
@@ -91,17 +92,6 @@ class Mono:
 
     def as_tuple(self) -> tuple[NDArray[np.float32], Intrinsics, Any, Any]:
         return self.depth, self.K_grid, self.descriptor, self.up_cam
-
-
-@dataclass
-class MvView:
-    """One view of a multi-view call (``Backend.geometry_views``): its pose (4x4
-    camera-to-world in the call's frame), its z-depth (0 = none) and the 3x3 intrinsics of the
-    depth's grid."""
-
-    pose: NDArray[np.float64]
-    depth: NDArray[np.float32]
-    K: NDArray[np.float64]
 
 
 @dataclass
@@ -238,8 +228,8 @@ class MapperBackend:
         inference_ready()
 
     def median_depth(self, image: Path, K: Intrinsics) -> float | None:
+        from oh_my_slam.mapping.checks import median_depth
         from oh_my_slam.reconstruction.api import connect_server, reconstruct_image
-        from oh_my_slam.service.checks import median_depth
 
         try:
             client = connect_server().clone()  # a client of its own: asked from several threads
@@ -410,7 +400,11 @@ class MapperBackend:
                 if "center" in obb:
                     out.append({"id": o.get("id"), "label": str(o.get("label", "")),
                                 "center": obb["center"], "R": obb.get("R"),
-                                "size": obb.get("size")})
+                                "size": obb.get("size"), "score": o.get("score"),
+                                "label_votes": o.get("label_votes") or {},
+                                "observations": o.get("observations"),
+                                "created_update": o.get("created_update"),
+                                "last_seen_update": o.get("last_seen_update")})
             return out
 
         floor = reader.meta.get("floor_z")

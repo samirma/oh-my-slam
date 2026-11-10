@@ -16,8 +16,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from oh_my_slam.service import anchor, checks, schema
-from oh_my_slam.service.anchor import Anchor, Sim3
+from oh_my_slam.mapping import anchor, checks
+from oh_my_slam.mapping.anchor import Anchor, Sim3
+from oh_my_slam.service import schema
 from oh_my_slam.service.cameras import (
     Camera,
     decode_png16,
@@ -250,6 +251,52 @@ def test_store_clones_and_clears(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert s.commit("m", {"frames": []}, None) == 1
     assert s.version("m")["version"] == 1 and s.require("m")["created_at"]
     assert st.utc(0.5) == "1970-01-01T00:00:00.500Z"
+
+
+def test_a_version_is_derived_from_its_own_mapper_map(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Before a commit replaces the mapper map, the versions it serves that are not derived yet
+    are derived from it; one whose mapper map is gone underived answers version_gone."""
+    from oh_my_slam.service.backend import InternalMap
+    from oh_my_slam.service.derived import Derived
+
+    s = Store(tmp_path / "data")
+    s.create()
+    read: list[str] = []
+
+    def read_map(p: Path) -> InternalMap:
+        read.append((p / "tag").read_text())
+        return InternalMap([], None, None, False, lambda name: None)
+
+    d = Derived(s, read_map)  # no worker: only reads and replacements derive
+    rec = {"frames": [], "sim3": Sim3().to_dict(), "floor_z_m": 0.0}
+
+    def mapper(tag: str) -> Path:
+        m = s.work / tag
+        m.mkdir()
+        (m / "tag").write_text(tag)
+        return m
+
+    s.add_cameras("m", {}, {})
+    assert s.commit("m", rec, None) == 1  # no mapper map yet (unknown: the latest at least)
+    assert s.commit("m", rec, mapper("A")) == 2
+    assert read == []  # version 1 had none (derived without one), nothing read from A
+    assert s.mapper_version("m") == 2
+    assert s.commit("m", rec, None) == 3  # version 3 shares A
+    assert s.commit("m", rec, mapper("B")) == 4
+    assert read == ["A", "A"]  # versions 2 and 3, before B replaced A
+    # a derivation that fails before the replacement: the version is gone, never derived from
+    # a later mapper map
+    real = d._derive
+    monkeypatch.setattr(d, "_derive", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    assert s.commit("m", rec, mapper("C")) == 5  # the listener's failure never fails a commit
+    monkeypatch.setattr(d, "_derive", real)
+    with pytest.raises(ApiError) as e:
+        d.get("m", 4)
+    assert e.value.code == "version_gone"
+    d.get("m", 5)
+    assert read[-1] == "C"
+
 
 
 # -- jobs ----------------------------------------------------------------------------------------

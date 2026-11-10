@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
+from oh_my_slam.mapping.anchor import Sim3, rotation_deg
 from oh_my_slam.service import schema
-from oh_my_slam.service.anchor import Sim3, rotation_deg
 from oh_my_slam.service.app import Service, create_app
 from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.store import Store
@@ -144,7 +144,10 @@ def test_openapi_describes_every_endpoint_with_the_schema_defs(client: Client) -
                                  "/api/jobs/{id}", "/api/maps/{name}", "/api/maps/{name}/frames",
                                  "/api/maps/{name}/grid", "/api/maps/{name}/points",
                                  "/api/maps/{name}/locate", "/api/maps/{name}/pose",
-                                 "/api/maps/{name}/objects"}
+                                 "/api/maps/{name}/objects", "/api/maps/{name}/birdseye.png",
+                                 "/api/maps/{name}/birdseye"}
+    png = doc["paths"]["/api/maps/{name}/birdseye.png"]["get"]["responses"]["200"]
+    assert png["content"] == {"image/png": {"schema": {"type": "string", "format": "binary"}}}
     assert set(doc["components"]["schemas"]) == set(schema.defs())
     text = str(doc)
     assert "#/$defs/" not in text
@@ -298,7 +301,14 @@ def test_a_distorted_camera_with_a_mask_is_rectified_for_the_mapper(client: Clie
     # the mapper got a resampled image the fake does not know: not placed
     assert job["state"] == "rejected" and job["inputs"][0]["reason"] == "no_overlap"
     assert job["quality"]["failed_checks"] == ["hard_limit"]
-    assert client.service.store.mask_digest("m", "cam")
+    # a rejected job records no camera: the same id with other values is no camera_conflict
+    assert client.service.store.mask_digest("m", "cam") is None
+    assert client.service.store.cameras("m") == {}
+    known = client.backend.add(textured(43), WORLD[0])
+    job = client.update("m", [{"name": "a", "image": "a", "camera_id": "cam"}], {"a": known},
+                        {"cam": CAMERA})
+    assert job["state"] == "committed"
+    assert client.get("/api/maps/m", "MapSummary")["cameras"] == {"cam": CAMERA}
 
 
 # -- per-input status ----------------------------------------------------------------------------
@@ -350,7 +360,9 @@ def test_a_suspicious_frame_is_measured_with_the_monocular_depth(client: Client)
                         {"cam": CAMERA})
     assert job["inputs"][0]["reason"] == "too_close"
     client.backend.mono = None
-    job = client.update("m", [{"name": "a", "image": "a", "camera_id": "cam"}], files)
+    # the rejected job recorded no camera: it is sent again
+    job = client.update("m", [{"name": "a", "image": "a", "camera_id": "cam"}], files,
+                        {"cam": CAMERA})
     assert job["inputs"][0]["reason"] == "few_features"  # placed by no one either way
 
 
@@ -371,7 +383,8 @@ def test_nothing_registered_is_a_rejected_job_and_no_map(client: Client) -> None
     assert job["quality"]["failed_checks"] == ["hard_limit"]
     assert client.get("/api/maps/m", status=404)["error"]["code"] == "map_not_found"
     files2 = {"w": plain()}
-    job = client.update("m", [{"name": "w", "image": "w", "camera_id": "cam"}], files2)
+    job = client.update("m", [{"name": "w", "image": "w", "camera_id": "cam"}], files2,
+                        {"cam": CAMERA})
     assert job["state"] == "rejected" and job["inputs"][0]["reason"] == "plain"
     assert client.backend.calls == [["0000.jpg", "0001.jpg"]]  # the wall never reached it
 
@@ -816,7 +829,8 @@ def test_a_frame_mask_is_combined_with_the_camera_s(client: Client) -> None:
     files["fm"] = png(slice(0, 60))
     job = client.update("n", frames, files, {"cam": CAMERA})
     assert job["inputs"][0]["reason"] == "no_overlap"  # inpainted: the mapper's input changed
-    doc = client.post_update("m", {"frames": [{**frames[0], "ignore_mask": "x"}]},
+    doc = client.post_update("m", {"frames": [{**frames[0], "ignore_mask": "x"}],
+                                   "cameras": {"cam": CAMERA}},
                              {**files, "x": png16(np.zeros((10, 10)))}, status=400)
     assert doc["error"]["details"]["field"] == "frames[0].ignore_mask"
 
@@ -900,3 +914,38 @@ def test_masks_reach_the_mapper_with_their_frames(client: Client) -> None:
     frames[1]["ignore_mask"] = "m"
     client.update("m", frames, {**files, "m": buf.getvalue()}, {"cam": CAMERA})
     assert client.backend.masks == [{"0001.jpg": "0001.mask.png"}]
+
+
+def test_cameras_are_recorded_by_the_commit_and_may_come_from_a_pending_job(
+        client: Client) -> None:
+    """A request may name a camera an earlier, still active job of the map sends; it fails if
+    that job does not commit it. A camera a version committed meanwhile with other values fails
+    the job with camera_conflict."""
+    import hashlib
+
+    from oh_my_slam.service.errors import ApiError
+    from oh_my_slam.service.jobs import Job
+    from oh_my_slam.service.update import UpdateWork
+
+    jobs = client.service.jobs
+    pending = Job("pending0000000", "p", time.time(),
+                  work=UpdateWork("p", [], None, {"cam": CAMERA}))
+    jobs._jobs[pending.id] = pending  # queued, never run: it will not commit its camera
+    frames, files, _ = frames_of(client, 2)
+    job = client.wait(client.post_update("p", {"frames": frames}, files)["job_id"])
+    assert job["state"] == "failed" and job["error"]["code"] == "invalid_request"
+    assert job["error"]["details"]["field"] == "frames[0].camera_id"
+    pending.state = "failed"
+    # the map's committed camera differs from the one a job brings: camera_conflict at its start
+    assert client.update("p", frames, files, {"cam": CAMERA})["state"] == "committed"
+    other = {**CAMERA, "fx": CAMERA["fx"] + 1}
+    w = UpdateWork("p", [], None, {"cam": other})
+    updater = jobs.runner
+    with pytest.raises(ApiError) as e:
+        updater._frames(w)  # type: ignore[attr-defined]
+    assert e.value.code == "camera_conflict"
+    w = UpdateWork("p", [], None, {"cam": CAMERA}, {"cam": (hashlib.sha256(b"m").hexdigest(),
+                                                            b"m")})
+    with pytest.raises(ApiError) as e:
+        updater._frames(w)  # type: ignore[attr-defined]
+    assert e.value.code == "camera_conflict"  # the same values, another mask

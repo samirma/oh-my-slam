@@ -4,11 +4,10 @@ nothing heavy."""
 from __future__ import annotations
 
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
+# the source of a keyframe that an earlier tool sampled from a video (``<video>@<time>``); there
+# is no video input any more (high_level_spec.md §13)
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
-# frames sampled per second of a video (the mapper's internal sequence input; the service sends
-# images only)
-DEFAULT_FPS = 2.0
 DEFAULT_MIN_SCORE = 0.5  # detection confidence threshold
 SERVICE_PORT = 9091  # server.sh --port (specs/api.md §1)
 
