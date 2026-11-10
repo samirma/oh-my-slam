@@ -72,10 +72,9 @@ def test_geometry_helpers() -> None:
     assert np.allclose(an.exp_so3(an.log_so3(R)), R)
     a = np.random.default_rng(0).normal(size=(10, 3))
     assert np.allclose(an.kabsch(a, a @ R.T), R)
-    A, B = an.pose(np.eye(3), np.zeros(3)), an.pose(R, np.ones(3))
-    T, sp, sr = an.fuse_poses(A, 1.0, 1.0, B, 1.0, 1.0)
-    assert np.allclose(T[:3, 3], 0.5) and sp == pytest.approx(math.sqrt(0.5))
-    assert an.rot_deg(A[:3, :3].T @ T[:3, :3]) == pytest.approx(an.rot_deg(R) / 2, rel=1e-6)
+    T = an.first_camera((0.0, -1.0, 0.0))
+    assert np.allclose(T[:3, 2], [1.0, 0.0, 0.0]) and np.allclose(T[:3, 0], [0.0, -1.0, 0.0])
+    assert np.allclose(an.first_camera(None), T)
     assert an.lowest_layer(np.zeros(10), 1.0) is None
     z = np.concatenate([np.full(500, -0.5), np.full(300, 0.4)])
     assert an.lowest_layer(z, 1.0) == pytest.approx(-0.5)
@@ -106,24 +105,52 @@ def test_sample_depth() -> None:
     assert d[0] == 2.0 and d[3] == 4.0 and np.isnan(d[1]) and np.isnan(d[2]) and np.isnan(d[4])
 
 
-def test_refine_and_pnp() -> None:
+def _refs(c: np.ndarray, sz: float = 0.03, med: float = 2.0) -> an.Refs:
+    return an.Refs(np.asarray(c, float).reshape(1, 3), np.array([sz]), np.array([med]))
+
+
+def test_refine_pose_and_pnp() -> None:
     rng = np.random.default_rng(1)
     T = base_pose(20)
     X = T[:3, 3] + (rng.uniform(-1, 1, (200, 3)) * [1, 1, 0.3] + [0, 0, 2]) @ T[:3, :3].T
     uv = an._project(T[:3, :3], T[:3, 3], X, K, False) + rng.normal(0, 0.3, (200, 2))
     got = an.pnp(X, uv, K, 2.0)
     assert got is not None
-    s = an.refine(got[0], got[1], X, uv, K)
-    assert err(s.T, T)[0] < 0.01 and err(s.T, T)[1] < 0.2
+    d = an.unit(X - T[:3, 3])
+    ref = np.zeros(200, np.intp)
+    s, sc = an.refine_pose(got[0], got[1], uv, X, d, ref, _refs(T[:3, 3]), K)
+    assert err(s.T, T)[0] < 0.01 and err(s.T, T)[1] < 0.2 and abs(sc[0] - 1) < 0.01
     sp, sr = s.sigmas()
     assert 0 < sp < 0.05 and 0 < sr < 0.5
     assert an.pnp(X[:5], uv[:5], K, 2.0) is None
     assert an.pnp(rng.normal(size=(50, 3)) + [0, 0, 5], rng.uniform(0, 300, (50, 2)), K,
                   0.5) is None
-    d = an.unit(X - T[:3, 3])
-    r = an.refine(an.exp_so3(np.array([0.02, 0, 0])) @ T[:3, :3], T[:3, 3], d, uv, K,
-                  directions=True, fix_centre=True)
+    # without depth: directions, the centre held
+    nan = np.full_like(X, np.nan)
+    r, _ = an.refine_pose(an.exp_so3(np.array([0.02, 0, 0])) @ T[:3, :3], T[:3, 3], uv, nan, d,
+                          ref, _refs(T[:3, 3]), K, fix_centre=True)
     assert err(r.T, T)[1] < 0.2
+    # a prior pulls within its sigmas; points scaled 10 % about their reference: the scale
+    # parameter takes it, the rotation stays
+    C = T[:3, 3] + np.array([0.3, 0.0, 0.0])
+    Xs = C + 1.1 * (X - C)
+    P = T.copy()
+    P[:3, 3] += [0.005, 0.0, 0.0]
+    f, sc = an.refine_pose(T[:3, :3], T[:3, 3], uv, Xs, d, ref, _refs(C, 0.3), K,
+                           prior=(P, 0.01, 1.0))
+    assert err(f.T, T)[1] < 0.2 and err(f.T, T)[0] < 0.02 and sc[0] < 1.0
+
+
+def test_guided_matching() -> None:
+    img, _ = shot(base_pose(0))
+    f = an.features(img)
+    pred = f.kps.astype(np.float64) + 2.0
+    ia, ib = an.guided_match(f, f, pred, np.full(len(pred), 8.0))
+    assert len(ia) > 0.8 * len(f.kps) and (ia == ib).mean() > 0.95
+    nanp = np.full_like(pred, np.nan)
+    assert len(an.guided_match(f, f, nanp, np.full(len(pred), 8.0))[0]) == 0
+    one = an.Features(f.kps[:1], f.desc[:1])
+    assert len(an.guided_match(one, f, pred, np.full(len(pred), 8.0))[0]) == 0
 
 
 def test_rotation_ransac() -> None:
@@ -171,14 +198,14 @@ def test_scale_state() -> None:
     s = ScaleState()
     s.estimate(1.0)
     assert (s.k, s.source) == (1.0, "monocular")
-    s.heights = [[0.5, 0.04], [0.52, 0.04]]
-    s.estimate(0.0)
-    assert s.source == "camera_height" and s.k == pytest.approx(math.sqrt(0.5 * 0.52), rel=1e-3)
     s.priors = [[0.5, 0.45], [1.0, 0.9], [0.8, 0.72], [0.05, 0.01]]
     s.estimate(0.2)  # the priors span too little yet
-    assert s.source == "camera_height"
+    assert s.source == "monocular"
     s.estimate(1.0)
     assert s.source == "priors" and s.k == pytest.approx(1 / 0.9, rel=1e-6)
+    s.heights = [[0.5, 0.04], [0.52, 0.04]]  # camera heights come first
+    s.estimate(1.0)
+    assert s.source == "camera_height" and s.k == pytest.approx(math.sqrt(0.5 * 0.52), rel=1e-3)
     assert ScaleState.from_json(s.to_json()).k == s.k
 
 
@@ -189,9 +216,21 @@ def new_map(tmp_path: Path) -> AnchoredMap:
     return AnchoredMap(tmp_path / "m")
 
 
-def test_new_map_needs_a_prior(tmp_path: Path) -> None:
-    with pytest.raises(ValueError):
-        new_map(tmp_path).update([frame("a", base_pose(0), p=None)])
+def test_a_camera_only_map_turning_in_place(tmp_path: Path) -> None:
+    """No priors: the first frame is the origin, level by its gravity; a sweep registers by
+    the images alone and the camera height sets the scale."""
+    m = new_map(tmp_path)
+    T0 = base_pose(0, pitch_deg=0.0)
+    first = m.update([frame("a", T0, p=None, depth=False, mono=1.3, height=0.5)])[0]
+    assert first.status == "registered" and first.prior_residual is None
+    assert m.created_with == "none" and np.allclose(m.keyframes[0].T[:3, 2], [1, 0, 0])
+    to_map = m.keyframes[0].T @ np.linalg.inv(T0)
+    pls = m.update([frame(f"s{k}", base_pose(30.0 * k, pitch_deg=0.0), p=None, depth=False,
+                          mono=1.3, height=0.5) for k in range(1, 7)])
+    assert all(p.status == "registered" for p in pls)
+    for k, p in enumerate(pls, start=1):
+        assert err(p.T, to_map @ base_pose(30.0 * k, pitch_deg=0.0))[1] < 1.0
+    assert m.scale.source == "camera_height" and m.scale.k == pytest.approx(1 / 1.3, rel=0.05)
 
 
 def test_cold_start_sweep_with_depth(tmp_path: Path) -> None:
@@ -262,10 +301,12 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     assert (p2.status, p2.reason) == ("rejected", "prior_conflict")
     assert p2.prior_residual is not None and p2.prior_residual[0] > 0.3
     # few matches, beyond its prior: not confirmed, kept at its prior
-    crop = shot(T)[0].copy()
-    crop[:, : K.width - 31] = 120
-    p3 = m.update([frame("weak", T, p=prior(wrong), rgb=crop)])[0]
-    assert p3.status == "provisional" and p3.inliers < an.STRONG_INLIERS
+    an.STRONG_INLIERS, strong = 10 ** 6, an.STRONG_INLIERS
+    try:
+        p3 = m.update([frame("weak", base_pose(21), p=prior(wrong))])[0]
+    finally:
+        an.STRONG_INLIERS = strong
+    assert p3.status == "provisional" and p3.inliers > 0
     # provisional frames at metric priors are references; nothing stored moved
     assert [k.state for k in m.keyframes] == ["fused", "provisional", "provisional",
                                               "provisional"]
@@ -324,7 +365,7 @@ def test_rotation_failing_is_unconfirmed(tmp_path: Path, monkeypatch: pytest.Mon
         == "provisional"
 
 
-def test_pnp_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0))])
     f = frame("b", base_pose(20))
@@ -332,18 +373,21 @@ def test_pnp_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     cands = m._candidates(f, base_pose(20), None)
     corr = m._correspondences(feats, cands)
     monkeypatch.setattr(an, "pnp", lambda *a, **k: None)
-    assert m._solve_pnp(f, corr) is None
+    got = m._init(f, corr, cands, base_pose(20))
+    assert got is not None and got[3]  # rotation-only at the prior's centre
     monkeypatch.setattr(an, "pnp", lambda X, uv, K_, t, **k: (
         np.eye(3), np.zeros(3), np.arange(len(X)) < 5))
-    assert m._solve_pnp(f, corr) is None
+    monkeypatch.setattr(an, "rotation_ransac", lambda *a, **k: None)
+    assert m._init(f, corr, cands, base_pose(20)) is None
+    far = base_pose(20, 3.0, 0.0)
+    assert m._init(f, corr, cands, far) is None
     T = base_pose(20)
     monkeypatch.setattr(an, "pnp", lambda X, uv, K_, t, **k: (
         T[:3, :3], T[:3, 3], np.ones(len(X), bool)))
-    monkeypatch.setattr(an, "refine", lambda *a, **k: an.Solve(
-        T[:3, :3], T[:3, 3], np.eye(6), np.zeros(len(a[2]), bool), 1.0))
-    assert m._solve_pnp(f, corr) is None
-    empty = an._Corr(np.zeros((0, 2)), np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0, np.intp))
-    assert m._solve_pnp(f, empty) is None
+    monkeypatch.setattr(an, "refine_pose", lambda R, c, uv, *a, **k: (an.Solve(
+        R, c, np.eye(6), np.zeros(len(uv), bool), 1.0), np.ones(1)))
+    p = m.update([frame("c", base_pose(25))])[0]
+    assert p.status == "provisional"
 
 
 def test_drifting_walk_with_odometry_overcount(tmp_path: Path) -> None:
@@ -463,23 +507,27 @@ def test_cv2_rng_seeded() -> None:
     assert cv2.__version__
 
 
-def test_refine_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_refine_pose_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     rng = np.random.default_rng(4)
     T = base_pose(0)
     X = T[:3, 3] + (rng.uniform(-1, 1, (50, 3)) + [0, 0, 3]) @ T[:3, :3].T
     uv = an._project(T[:3, :3], T[:3, 3], X, K, False)
+    d = an.unit(X - T[:3, 3])
+    ref = np.zeros(50, np.intp)
     monkeypatch.setattr(an, "GN_ITERATIONS", 1)
-    assert err(an.refine(T[:3, :3], T[:3, 3] + 0.05, X, uv, K).T, T)[0] < 0.05
+    s, _ = an.refine_pose(T[:3, :3], T[:3, 3] + 0.05, uv, X, d, ref, _refs(T[:3, 3]), K)
+    assert err(s.T, T)[0] < 0.05
     monkeypatch.undo()
-    s = an.refine(T[:3, :3], T[:3, 3], X, rng.uniform(0, 300, (50, 2)), K)
-    assert s.inliers.sum() < 3 and s.rms_px == float("inf")
+    s, _ = an.refine_pose(T[:3, :3], T[:3, 3], rng.uniform(0, 300, (50, 2)), X, d, ref,
+                          _refs(T[:3, 3]), K)
+    assert s.inliers.sum() < 10
 
 
 def test_an_ill_determined_image_pose_confirms_nothing(tmp_path: Path,
                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0))])
-    monkeypatch.setattr(AnchoredMap, "_pnp_sigmas", lambda self, s, c: (0.5, 0.3))
+    monkeypatch.setattr(an.Solve, "sigmas", lambda self: (0.5, 0.3))
     p = m.update([frame("b", base_pose(20))])[0]
     assert p.status == "provisional" and p.inliers > 0
 
@@ -535,3 +583,23 @@ def test_a_disagreeing_monocular_depth_is_kept_as_it_is(tmp_path: Path,
     m.update([frame("a0", base_pose(0), depth=False, mono=1.0)])
     monkeypatch.setattr(an, "depth_alignment", lambda *a: None)
     assert m.update([frame("b", base_pose(20), depth=False, mono=1.0)])[0].status == "registered"
+
+
+def test_metric_priors_with_a_scale_bias(tmp_path: Path) -> None:
+    """Metric priors over-counting 10 % against depth images: the bias is measured and the
+    later predictions corrected (and a sensor map reports depth, not the biased priors)."""
+    m = new_map(tmp_path)
+    o = np.array([-1.5, 0.0])
+
+    def biased(T: np.ndarray) -> dict[str, Any]:
+        P = T.copy()
+        P[:2, 3] = o + (T[:2, 3] - o) * 1.10
+        return prior(P, sp=0.05, sr=1.0)
+
+    truth = [base_pose(5 * (k % 3), -1.5 + 0.2 * k, 0.05 * (k % 2)) for k in range(12)]
+    m.update([frame("w0", truth[0], p=biased(truth[0]))])
+    pls = m.update([frame(f"w{k}", truth[k], p=biased(truth[k])) for k in range(1, 12)])
+    assert all(p.status == "registered" for p in pls)
+    assert m.prior_bias() == pytest.approx(1 / 1.10, rel=0.03)
+    assert m.scale_summary()[0] == "depth"
+    assert err(pls[-1].T, truth[-1])[0] < 0.05

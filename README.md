@@ -179,48 +179,54 @@ for a low-confidence keyframe, combined with the anchoring's RMS residual, floor
 
 ### Prior-first registration (anchored maps)
 
-A map whose first update has a kept frame with a `metric` or `drifting` prior is **anchored**
-(`versions/<n>.json → engine: "anchored"`) and every later update of it runs
-`service.prior_first` → `mapping.anchored` instead of the mapper (`Updater(prior_first=False)`
-keeps every map on the mapper; the tests of the mapper path use it). A map whose first update
-carries no prior (camera-only, trust `none`) stays on the mapper as before. Design choices, each
-measured on the synthetic room of `tests/synth/room.py` and on the reference captures (numbers in
-*Prior-first measurements*):
+Every new map is **anchored** (`versions/<n>.json → engine: "anchored"`) and every later update
+of it runs `service.prior_first` → `mapping.anchored` instead of the mapper
+(`Updater(prior_first=False)` keeps every map on the mapper; the tests of the mapper path use
+it; maps created by the mapper stay on it). Design choices, each measured on the synthetic room
+of `tests/synth/room.py`, on the robot-guide humanoid's simulated frames of a recorded map and
+on the reference captures (numbers in *Prior-first measurements*):
 
 * **Frame and origin.** The first frame with a prior (request order) is placed at its prior and
-  defines the map frame (the priors' frame). The mapper folder of the version is the engine's
-  folder (`state.json`, `kf/<id>.npz`, `cloud.npz`), its frame the map frame: the version's
-  `sim3` is the identity and stored poses never move (no re-gauging, no re-pose:
-  `gauge_shift` is 0 and `previous_residuals` are 0 by construction).
-* **Place first.** Each new frame gets a predicted pose from its prior: a metric prior as sent;
-  a drifting prior through the odometry's latest correction (`Drift`: the last frame the images
-  confirmed, its map pose and its prior, and the odometry's scale fitted on confirmed pairs
-  ≥ 0.2 m apart), with sigmas grown by 10 % of the travel, 5 % of the turn and 2°/m since that
-  frame. Sigmas are floored at 1 cm / 0.1°; a prior without sigmas counts 5 cm / 2°.
-* **Refinement against the stored map.** Candidates: the 5 stored keyframes nearest the
-  predicted pose (score = distance / 0.5 m + axis angle / 30°, within 5 m and 100°); without a
-  prior, the 5 most similar by retrieval descriptor, else the 8 most recent. SIFT (2000, contrast
-  0.02, RootSIFT) matched with the ratio test (0.8); each match lifted to 3-D by the keyframe's
-  depth (off depth edges). **PnP first** (AP3P RANSAC, 3 px at 640 px width, ≥ 20 inliers), then
-  a robust Gauss-Newton (Huber 2 px) whose normal equations give the covariance. The design
-  asked for a rotation-only fit when the centre is within a few cm of a stored one; measured, PnP
-  is better there too: scaling a keyframe's points about its centre (a wrong monocular depth
-  scale) moves the PnP centre along its distance to the keyframe but leaves its rotation exact,
-  while a rotation-only fit at the prior's centre takes that error into its rotation (30° sweep
-  with a 15 % monocular scale error: 0.3° max rotation error with PnP first, 1.7° with
-  rotation-first). Rotation-only (centre held at the prior's) remains the fallback when PnP has
-  too few lifted points (no depth at all), within 0.2 m of a keyframe; its sigma includes the
-  parallax the centre's distance can leave.
-* **Combining image and prior.** The image pose (sigmas: covariance, floored at 1 cm or 1 % of
-  the scene depth, plus the depth scale's sigma times the distance to the keyframes for
-  monocular depth) and the predicted pose are averaged by their information (`fuse_poses`,
-  centre by `1/σ²`, rotation on the geodesic). A metric prior with a 1 mm sigma therefore keeps
-  the arm's poses at its priors. The design's local bundle adjustment of the new frames was not
-  needed: frames are placed in request order and each placed frame is a fixed reference for the
-  next ones of the same job (stored poses fixed), which keeps a sweep that never overlaps its
-  first frame registered.
+  defines the map frame (the priors' frame). Without any prior (camera-only robots), the first
+  frame is the origin: at its optical centre, +z up along the gravity the monocular model sees in
+  it, +x its viewing direction on the horizontal plane (map.md §1). The mapper folder of the
+  version is the engine's folder (`state.json`, `kf/<id>.npz`, `cloud.npz`), its frame the map
+  frame: the version's `sim3` is the identity and stored poses never move (no re-gauging, no
+  re-pose: `gauge_shift` is 0 and `previous_residuals` are 0 by construction).
+* **Place first.** Each new frame gets a predicted pose from its prior: a metric prior as sent
+  (after the metric priors' own scale bias, when one is measured: *Scale*); a drifting prior
+  through the odometry's latest correction (`Drift`: the last frame the images confirmed, its
+  map pose and its prior, and the odometry's scale fitted on confirmed pairs ≥ 0.2 m apart),
+  with sigmas grown by 10 % of the travel, 5 % of the turn and 2°/m since that frame. Sigmas are
+  floored at 1 cm / 0.1°; a prior without sigmas counts 5 cm / 2°.
+* **Matching.** Candidates: the 5 stored keyframes nearest the predicted pose (score =
+  distance / 0.5 m + axis angle / 30°, within 5 m and 100°); without a prior, the 5 most similar
+  by retrieval descriptor, else the 8 most recent. SIFT (4000, contrast 0.01: the simulated
+  robot frames give a few hundred features at OpenCV's default) with RootSIFT, matched by the
+  ratio test (0.8) and, with a prior, also **guided by it**: each keyframe keypoint (lifted by
+  its depth, or as a direction without one) is projected into the new frame by the predicted
+  pose and matched among the new keypoints within 3 sigmas of the prior in pixels (6–80 px) with
+  a ratio test of 0.9 among those.
+* **Refinement against the map** (`refine_pose`, stored poses fixed). A first pose comes from PnP
+  (AP3P RANSAC, 6 px at 640 px width, ≥ 15 inliers) on the lifted points, else from a
+  rotation-only fit (RANSAC) at the prior's centre when that is within 0.2 m or a quarter of the
+  scene depth of a keyframe (without a prior: at the best-matched keyframe's centre: a camera
+  turning in place). Then a robust Gauss-Newton (Huber at 2 sigmas) over the rotation, the centre
+  and **one depth scale per reference keyframe**: a lifted point is reprojected after its
+  reference's scale, with its own depth noise (2 %) times the parallax its reference's distance
+  gives; a match without depth is reprojected as a direction, its noise grown by the full
+  parallax (exact for a turn in place, harmless for a step); each reference's scale is held at 1
+  by its sigma (3 % for a depth image, the monocular scale's sigma, or 30 % while nothing has
+  measured it). A wrong depth scale therefore moves the centre only along the reference's
+  baseline and only as far as the other factors allow; a turn in place is fixed by its rotation.
+  The image-only solve judges the frame (below); the final pose is the same solve with the pose
+  prior as a factor (its sigmas): a metric prior with 2 cm / 1° bounds the pose, the images
+  refine it within that, and `prior_residual_m/deg` reports the refined pose against the prior
+  as sent (a drifting prior: against its corrected prediction). The design's local bundle
+  adjustment of the new frames is this per-frame solve: frames are placed in request order and
+  each placed frame is a fixed reference for the next ones of the same job.
 * **Unconfirmed frames.** No image pose, or an image pose that is not determined within
-  10 cm / 2°, or one beyond 3 combined sigmas of the prediction with fewer than 40 inliers or
+  2° and (unless rotation-only) 10 cm or twice the prior's position sigma, or one beyond 3 combined sigmas of the prediction with fewer than 40 inliers or
   30 % inliers: `provisional` at the predicted pose with the prior's sigmas (`reason`:
   `few_features` below 150 features, else `no_overlap`), `pose_state: provisional`. Beyond 3
   sigmas with ≥ 40 inliers and ≥ 30 %: `rejected prior_conflict`. Without a prior and no image
@@ -230,16 +236,23 @@ measured on the synthetic room of `tests/synth/room.py` and on the reference cap
   times the map's depth scale `k`, then brought onto the map by its own factor: the median
   ratio of the depth the lifted points it was registered on have in its camera to its own depth
   there (≥ 30 points, within 0.5–2; the monocular model's metres vary from frame to frame, and
-  without this a chain of monocular keyframes drifts in scale). `k` comes from the metric
-  priors once their centres span 0.3 m and 3 PnP baselines ≥ 0.1 m exist (least squares of the
-  prior baselines on the image-only PnP baselines relative to the reference keyframe, in raw
-  monocular units: the similarity of the map's positions to the priors), else from camera
+  without this a chain of monocular keyframes drifts in scale). `k` comes first from camera
   heights (frame or camera `height_above_floor_m` over the lowest dense layer of the frame's
-  monocular points below the camera, rotated by its pose), else from drifting priors the same
-  way as metric ones (odometry baselines; σ at least 10 %, reported as `priors`), else 1. While
-  nothing has measured `k`, PnP centres on monocular depth are weighed with a 30 % scale sigma,
-  so drifting odometry carries the positions. Each update refines `k`; positions never move,
-  stored monocular keyframes use `k / k_used` when matched. `scale_source`: `priors` once metric
+  monocular points below the camera, rotated by its pose: a scale the images measure, whatever
+  the priors say), else from metric priors once their centres span 0.3 m and 3 baselines ≥ 0.1 m
+  exist (least squares of the prior baselines on the image-only baselines between the same two
+  frames, in raw monocular units), else from drifting priors the same way (odometry baselines;
+  σ at least 10 %, reported as `priors`), else 1. Each update refines `k`; positions never
+  move, stored monocular keyframes use `k / k_used` when matched.
+* **The priors' own scale bias.** Robot odometry over-counts (5–10 % on the replays) whether it
+  is sent as `metric` or `drifting`. Drifting priors are only predictions from the last
+  confirmed frame, scaled by the fitted odometry scale, so their bias never reaches the map.
+  For metric priors, the baselines between pairs of frames are compared with the image-only
+  baselines whose scale the priors did not set (depth images, or monocular depth scaled by
+  camera heights): once the priors span 0.5 m with 5 baselines, their least-squares ratio is the
+  priors' bias, applied to the later predictions about the origin's prior when it differs from 1
+  by more than twice its own and the image scale's uncertainty (3 % for depth images). A metric
+  prior without measured bias is taken as metric. `scale_source`: `priors` once unbiased metric
   priors span 0.3 m (σ = √2 · median prior σ / span), else `depth` with any depth PNG (σ 1 %),
   else the source of `k` (`camera_height`, σ from the heights' spread and sigmas; `priors` from
   odometry; `monocular`, 10 %). `scale_ratio_vs_prev`: `k` over the previous `k` when the map
@@ -254,7 +267,8 @@ measured on the synthetic room of `tests/synth/room.py` and on the reference cap
   no inference and commits nothing (`hard_limit`).
 * **Inference.** Frames without a depth PNG get monocular depth (and the retrieval descriptor)
   from the inference server, two in flight, each on its own client (the shared client is not
-  for several threads); the map's first frame also asks for gravity (`prior_gravity_deg`).
+  for several threads); a new map's origin frame always asks it, with gravity
+  (`prior_gravity_deg`, or the camera-only map's up).
 * **Quality.** `rejected_share` counts rejected over sent; `low_confidence_share` counts the
   kept frames that are provisional or whose `sigma_pos_m` exceeds 0.10 m; `prior_residuals`
   are over every metric prior of the map; `rebuilt` is false.
@@ -288,6 +302,31 @@ Per frame, without depth, the time is the monocular inference (~0.6 s at 640×48
 lane); registration (SIFT, matching, PnP) takes 0.03 s and fusion 0.01 s. With depth images a
 frame costs ~0.09 s. A job whose frames the checks all reject costs the checks only (< 1 s for
 two frames in the tests).
+
+
+Second round (after the conductor's replay of 6cf9485: on the simulated base frames nearly every
+frame stayed provisional at its prior, `prior_residual` 0): guided matching, the joint
+refinement with per-reference depth scales and the prior as a factor, camera heights before
+priors for the depth scale, the metric priors' bias, camera-only maps on this path. Measured on
+the humanoid's simulated frames of a recorded robot-guide map (`task_map`, 52 frames: scans,
+turns of 8–15° per frame, 1.3 m legs; truth = that map's legacy poses in metres by its 0.34 m
+camera height, itself approximate), monocular depth only, 1-frame start then the rest in one job
+(every 2nd frame: 26 frames, every 4th: 13):
+
+| Run | Result |
+| --- | --- |
+| metric priors (1 cm / 0.5° noise, σ 2 cm / 1°), every 2nd frame | 17 registered, 3 provisional, 6 `prior_conflict`; median 3.0 cm / 1.3°; prior residual median 3.9 cm (no longer 0); positions to truth scale 1.018; 0.67 s/frame |
+| same, every 4th frame | 8 registered, 3 provisional, 2 `prior_conflict`; median 2.4 cm / 0.8°; scale 1.009 |
+| metric + camera heights | 17 registered; positions scale 1.091 (the depth scale now follows the heights) |
+| drifting priors + camera heights | 23/26 registered, 1 `prior_conflict`; positions scale 1.093; `camera_height` σ 3 % |
+| no priors, camera heights (the walking humanoid's none mode) | 25/26 registered (1 `too_close`); positions scale 1.094 (every 4th frame: 12/13, 1.155); median 22 cm |
+| synthetic room, 30° / 90° sweeps with depth, exact priors | 11/11; ≤ 0.9 cm / 0.17° and ≤ 1.0 cm / 0.25°; 0.26 s/frame registration |
+| synthetic room, metric priors 10 % over-counted, depth images | 11/11 registered within 2 cm; bias measured 0.91 (truth 1/1.1), predictions corrected; `scale_source: depth` |
+| synthetic room, camera-only turn in place (no priors, heights) | 6/6 registered, rotation within 1°, depth scale within 5 % (unit test) |
+
+The camera-height scale on these frames is 9 % from that truth in every mode (the monocular
+floor of a camera 0.34 m above it, or the truth's own scale); on the synthetic room it is within
+1–3 %.
 
 ### Live check
 

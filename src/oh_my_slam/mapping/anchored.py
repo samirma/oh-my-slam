@@ -65,10 +65,14 @@ STATE_JSON = "state.json"
 CLOUD_NPZ = "cloud.npz"
 KF_DIR = "kf"
 
-MAX_FEATURES = 2000
-SIFT_CONTRAST = 0.02  # half OpenCV's default: indoor robot frames are dim and low in texture
+MAX_FEATURES = 4000
+SIFT_CONTRAST = 0.01  # a quarter of OpenCV's default: simulated and indoor robot frames are low
+# in texture (a few hundred features at the default)
 ROOTSIFT_QUANT = 512.0
 RATIO = 0.8  # Lowe's ratio test
+GUIDED_RATIO = 0.9  # the ratio test among the keypoints near a match's predicted pixel
+GUIDED_MIN_PX = 6.0  # the predicted pixel's search radius: at least this
+GUIDED_MAX_PX = 80.0  # ... at most this
 MAX_CANDIDATES = 5
 CANDIDATE_MAX_ANGLE_DEG = 100.0  # optical axes further apart share no view
 CANDIDATE_MAX_DIST_M = 5.0
@@ -76,12 +80,17 @@ CANDIDATE_DIST_UNIT_M = 0.5  # candidate score = distance / unit + angle / unit
 CANDIDATE_ANGLE_UNIT_DEG = 30.0
 RECENT_CANDIDATES = 8  # without prior or descriptor: the most recent keyframes
 ROTATION_FALLBACK_M = 0.20  # PnP failed: rotation-only still tried up to this distance
+ROTATION_FALLBACK_REL = 0.25  # ... or this share of the keyframe's median depth
 REPROJ_PX = 3.0  # inlier threshold at 640 px width, scaled with the image width
 REF_WIDTH = 640.0
-MIN_INLIERS = 20
+MIN_INLIERS = 15
+PIXEL_SIGMA = 1.0  # a match's pixel noise at 640 px width
+DEPTH_NOISE_REL = 0.02  # a lifted point's own depth noise (the scale error is a parameter)
+SENSOR_SCALE_SIGMA_REL = 0.03  # a depth image's scale, as a prior of its reference's scale
 STRONG_INLIERS = 40  # an image pose this well supported can contradict a prior
 STRONG_RATIO = 0.3  # ... with this share of its matches as inliers
-CONFIRM_SIGMA_POS_M = 0.10  # an image pose confirms a frame only this well determined
+CONFIRM_SIGMA_POS_M = 0.10  # an image pose confirms a frame only this well determined (or
+# within twice the prior's sigma)
 CONFIRM_SIGMA_ROT_DEG = 2.0
 K_SIGMA = 3.0
 MIN_SIGMA_POS_M = 0.01
@@ -97,6 +106,8 @@ DRIFT_ROT_DEG_PER_M = 2.0  # ... and this much per metre travelled
 ODO_SCALE_MIN_TRAVEL_M = 0.2
 ODO_SCALE_RANGE = (0.5, 2.0)
 PRIOR_SPAN_M = 0.3  # metric priors fix the scale once their centres span this
+BIAS_SPAN_M = 0.5  # metric priors' own scale bias is judged once they span this
+BIAS_EVIDENCE_MIN = 5
 SCALE_EVIDENCE_MIN_M = 0.1  # a PnP baseline shorter than this tells little about the scale
 SCALE_EVIDENCE_MIN = 3
 SCALE_RANGE = (0.2, 5.0)
@@ -109,6 +120,7 @@ EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this i
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
 HUBER_PX = 2.0
+HUBER_SIGMAS = 2.0
 MIN_PIXEL_SIGMA = 0.5
 VOXEL_M = 0.02
 FUSE_STRIDE = 2
@@ -164,18 +176,6 @@ def pose_residual(A: Array, B: Array) -> tuple[float, float]:
     return (float(np.linalg.norm(A[:3, 3] - B[:3, 3])), rot_deg(A[:3, :3].T @ B[:3, :3]))
 
 
-def fuse_poses(A: Array, spa: float, sra: float, B: Array, spb: float, srb: float
-               ) -> tuple[Array, float, float]:
-    """The information-weighted mean of two independent pose estimates with isotropic sigmas:
-    centres weighted by ``1/sigma_pos²``, rotation interpolated on the geodesic by
-    ``1/sigma_rot²``; the sigmas of the mean."""
-    wa, wb = 1.0 / spa ** 2, 1.0 / spb ** 2
-    c = (A[:3, 3] * wa + B[:3, 3] * wb) / (wa + wb)
-    va, vb = 1.0 / sra ** 2, 1.0 / srb ** 2
-    R = exp_so3(log_so3(A[:3, :3] @ B[:3, :3].T) * va / (va + vb)) @ B[:3, :3]
-    return pose(R, c), 1.0 / math.sqrt(wa + wb), 1.0 / math.sqrt(va + vb)
-
-
 def rays(K: Intrinsics, uv: NDArray[Any]) -> Array:
     """Camera rays with unit z of pixels ``uv`` (N x 2, pixel centres at integer + 0.5 as
     OpenCV's keypoints are at integers: OpenCV's convention)."""
@@ -186,6 +186,17 @@ def rays(K: Intrinsics, uv: NDArray[Any]) -> Array:
 def unit(v: Array) -> Array:
     out: Array = v / np.linalg.norm(v, axis=-1, keepdims=True)
     return out
+
+
+def first_camera(up_cam: Any) -> Array:
+    """The pose of a camera-only map's first frame (map.md §1, without priors): at the origin,
+    +z up along the gravity it sees (``up_cam``, the up direction in its optical frame; level
+    when unknown), +x its viewing direction on the horizontal plane."""
+    up = unit(np.asarray((0.0, -1.0, 0.0) if up_cam is None else up_cam, np.float64))
+    fwd = np.array([0.0, 0.0, 1.0]) - up[2] * up  # the optical axis on the horizontal plane
+    x = unit(fwd)
+    M = np.stack([x, np.cross(up, x), up])  # rows: the map's axes in the optical frame
+    return pose(M, np.zeros(3))
 
 
 def lowest_layer(z: NDArray[Any], below: float) -> float | None:
@@ -305,57 +316,6 @@ def _project(R: Array, c: Array, X: Array, K: Intrinsics, directions: bool) -> A
     return out
 
 
-def refine(R0: Array, c0: Array, X: Array, uv: Array, K: Intrinsics, *, directions: bool = False,
-           fix_centre: bool = False, huber_px: float = HUBER_PX) -> Solve:
-    """Robust Gauss-Newton (Huber IRLS) of a camera pose on reprojections of world points ``X``
-    (or world directions, ``directions``: rotation only) onto pixels ``uv``. The pose is ``R = exp(w) R0``, ``c = c0 + dc``; the covariance comes from
-    the normal equations with the pixel noise estimated from the inliers' residuals."""
-    n_par = 3 if fix_centre else 6
-    R, c = R0.copy(), c0.copy()
-    sigma_px = huber_px
-
-    def residual(R_: Array, c_: Array) -> Array:
-        return (_project(R_, c_, X, K, directions) - uv).ravel()
-
-    def step(d: Array) -> tuple[Array, Array]:
-        R_ = exp_so3(d[:3]) @ R
-        c_ = c if fix_centre else c + d[3:6]
-        return R_, c_
-
-    eps = 1e-6
-    w = np.ones(len(uv))
-    J = np.zeros((2 * len(uv), n_par))
-    for _ in range(GN_ITERATIONS):
-        r = residual(R, c)
-        e = np.hypot(r[0::2], r[1::2])
-        w = np.where(e <= huber_px, 1.0, huber_px / np.maximum(e, 1e-12))
-        J = np.zeros((len(r), n_par))
-        for k in range(n_par):
-            d = np.zeros(6)
-            d[k] = eps
-            R_, c_ = step(d)
-            J[:, k] = (residual(R_, c_) - r) / eps
-        W = np.repeat(w, 2) / sigma_px ** 2
-        H = J.T @ (W[:, None] * J)
-        delta = -np.linalg.solve(H + 1e-9 * np.eye(n_par), J.T @ (W * r))
-        d = np.zeros(6)
-        d[:n_par] = delta
-        R, c = step(d)
-        if float(np.abs(delta).max()) < 1e-8:
-            break
-    r = residual(R, c)
-    e = np.hypot(r[0::2], r[1::2])
-    inl = e <= 2.0 * huber_px
-    if inl.sum() >= 3:
-        sigma_px = max(1.4826 * float(np.median(e[inl])) / math.sqrt(2.0) * 1.2, MIN_PIXEL_SIGMA)
-    W = np.repeat(w, 2) / sigma_px ** 2
-    H = J.T @ (W[:, None] * J)
-    cov6 = np.zeros((6, 6))
-    cov6[:n_par, :n_par] = np.linalg.inv(H + 1e-9 * np.eye(n_par))
-    rms = float(np.sqrt(np.mean(e[inl] ** 2))) if inl.any() else float("inf")
-    return Solve(R, c, cov6, inl, rms)
-
-
 def pnp(X: Array, uv: Array, K: Intrinsics, thr_px: float, seed: int = 0
         ) -> tuple[Array, Array, NDArray[np.bool_]] | None:
     """RANSAC PnP: (R, c, inliers) of the camera seeing world points ``X`` at ``uv``."""
@@ -402,6 +362,138 @@ def rotation_ransac(d_world: Array, b_cam: Array, thr_rad: float, seed: int = 0,
         R = kabsch(b_cam[inl], d_world[inl])
     inl = (b_cam @ R.T * d_world).sum(1) > cos_thr
     return R, inl
+
+
+def guided_match(new: Features, ref: Features, predicted: Array, radius: Array
+                 ) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
+    """Matches of ``ref``'s keypoints, each looked for only among ``new``'s keypoints within
+    ``radius`` px of its ``predicted`` pixel in the new frame (by the prior), with a ratio test
+    among those: the low-texture frames of a robot give too few matches that pass the ratio
+    test against the whole image. One match per new keypoint (the closest)."""
+    from scipy.spatial import cKDTree
+
+    ok = np.isfinite(predicted).all(axis=1)
+    if len(new.kps) < 2 or not ok.any():
+        return np.zeros(0, np.intp), np.zeros(0, np.intp)
+    jb = np.nonzero(ok)[0]
+    near = cKDTree(new.kps).query_ball_point(predicted[jb], radius[jb])
+    a = new.desc.astype(np.float32)
+    b = ref.desc.astype(np.float32)
+    pairs: dict[int, tuple[float, int]] = {}
+    for j, idx in zip(jb, near, strict=True):
+        if not idx:
+            continue
+        dd = np.linalg.norm(a[idx] - b[j], axis=1)
+        o = np.argsort(dd)
+        d1 = float(dd[o[0]])
+        if len(o) > 1 and d1 >= GUIDED_RATIO * float(dd[o[1]]):
+            continue
+        i = int(idx[o[0]])
+        if i not in pairs or d1 < pairs[i][0]:
+            pairs[i] = (d1, int(j))
+    ia = np.array(list(pairs.keys()), np.intp)
+    ib = np.array([v[1] for v in pairs.values()], np.intp)
+    return ia, ib
+
+
+@dataclass
+class Refs:
+    """The reference keyframes of a frame's matches: centres, the sigma of each one's depth
+    scale and its median depth."""
+
+    c: Array  # n x 3
+    scale_sigma: Array  # n
+    median: Array  # n
+
+
+def refine_pose(R0: Array, c0: Array, uv: Array, X: Array, d: Array, ref: NDArray[np.intp],
+                refs: Refs, K: Intrinsics, *, prior: tuple[Array, float, float] | None = None,
+                fix_centre: bool = False) -> tuple[Solve, Array]:
+    """The pose of a frame (stored poses fixed) on its matches to reference keyframes: a robust
+    Gauss-Newton (Huber at 2 sigmas) over the rotation, the centre (unless ``fix_centre``) and
+    one log depth scale per reference, with
+
+    * a lifted point (``X`` finite) reprojected after its reference's depth scale; its noise is
+      the pixel noise and its own depth noise times the parallax its reference's distance gives;
+    * a match without depth reprojected as a direction (``d``), its noise grown by the full
+      parallax of its reference's distance (exact for a camera turning in place);
+    * each reference's depth scale held at 1 by its sigma (a depth image's, the monocular
+      scale's), so one wrong depth scale moves the centre along its distance to that reference
+      only as far as the other factors let it;
+    * the pose prior (``prior``: T, sigma_pos_m, sigma_rot_deg) when given.
+
+    Returns the solve (its covariance: rotation vector, centre) and the depth scales."""
+    n_ref = len(refs.c)
+    n_pose = 3 if fix_centre else 6
+    n = n_pose + n_ref
+    has = np.isfinite(X).all(axis=1)
+    Xh = np.where(has[:, None], X, 0.0)
+    f = math.sqrt(K.fx * K.fy)
+    px = PIXEL_SIGMA * K.width / REF_WIDTH
+    cr = refs.c[ref]
+
+    def unpack(p: Array) -> tuple[Array, Array, Array]:
+        R = exp_so3(p[:3]) @ R0
+        c = c0 if fix_centre else c0 + p[3:6]
+        return R, c, np.exp(p[n_pose:])
+
+    def sigmas(c: Array) -> Array:
+        b = np.linalg.norm(c - cr, axis=1) / refs.median[ref]
+        return np.sqrt(px ** 2 + (f * b * np.where(has, DEPTH_NOISE_REL, 1.0)) ** 2)
+
+    def obs(p: Array, sig: Array) -> Array:
+        R, c, sc = unpack(p)
+        Xs = cr + sc[ref][:, None] * (Xh - cr)
+        pred = np.where(has[:, None], _project(R, c, Xs, K, False),
+                        _project(R, c, d, K, True))
+        return ((pred - uv) / sig[:, None]).ravel()
+
+    def extra(p: Array) -> Array:
+        R, c, _ = unpack(p)
+        out = [p[n_pose:] / refs.scale_sigma]
+        if prior is not None:
+            T, sp, sr = prior
+            out.append(log_so3(R @ T[:3, :3].T) / math.radians(sr))
+            out.append((c - T[:3, 3]) / sp)
+        return np.concatenate(out)
+
+    p = np.zeros(n)
+    eps = 1e-6
+    sig = sigmas(c0)
+    w = np.ones(len(uv))
+    J = np.zeros((2 * len(uv), n))
+    Je = np.zeros((0, n))
+    for _ in range(GN_ITERATIONS):
+        sig = sigmas(unpack(p)[1])
+        r = obs(p, sig)
+        re = extra(p)
+        e = np.hypot(r[0::2], r[1::2])
+        w = np.where(e <= HUBER_SIGMAS, 1.0, HUBER_SIGMAS / np.maximum(e, 1e-12))
+        J = np.zeros((len(r), n))
+        Je = np.zeros((len(re), n))
+        for k in range(n):
+            q = p.copy()
+            q[k] += eps
+            J[:, k] = (obs(q, sig) - r) / eps
+            Je[:, k] = (extra(q) - re) / eps
+        W = np.repeat(w, 2)
+        H = J.T @ (W[:, None] * J) + Je.T @ Je
+        delta = -np.linalg.solve(H + 1e-9 * np.eye(n), J.T @ (W * r) + Je.T @ re)
+        p = p + delta
+        if float(np.abs(delta).max()) < 1e-9:
+            break
+    r = obs(p, sig)
+    e = np.hypot(r[0::2], r[1::2])
+    inl = e <= 3.0
+    chi = float(np.mean(e[inl] ** 2) / 2.0) if inl.sum() > n else 1.0
+    W = np.repeat(w, 2)
+    H = J.T @ (W[:, None] * J) + Je.T @ Je
+    cov = np.linalg.inv(H + 1e-9 * np.eye(n)) * max(chi, 1.0)
+    cov6 = np.zeros((6, 6))
+    cov6[:n_pose, :n_pose] = cov[:n_pose, :n_pose]
+    R, c, sc = unpack(p)
+    rms = float(np.sqrt(np.mean((e[inl] * px) ** 2))) if inl.any() else float("inf")
+    return Solve(R, c, cov6, inl, rms), sc
 
 
 # -- the map ---------------------------------------------------------------------------------------
@@ -593,14 +685,10 @@ class ScaleState:
         return float(np.clip(k, *SCALE_RANGE)), mad / math.sqrt(len(ev))
 
     def estimate(self, prior_span: float, odometry_span: float = 0.0) -> None:
-        """``k`` from the evidence: metric priors (once their span allows), else camera heights,
-        else drifting priors (their relative motion is metric within the odometry's drift:
-        ``DRIFT_POS_REL`` at best, reported as ``priors``), else held at 1."""
-        got = self._baselines(self.priors, prior_span)
-        if got is not None:
-            self.k, self.source = got[0], "priors"
-            self.sigma_rel = max(got[1], MIN_SCALE_SIGMA_REL)
-            return
+        """``k`` from the evidence: camera heights (a scale the images measure, independent of
+        the priors), else metric priors (once their span allows), else drifting priors (their
+        relative motion is metric within the odometry's drift: ``DRIFT_POS_REL`` at best,
+        reported as ``priors``), else held at 1."""
         if self.heights:
             r = np.array([h[0] for h in self.heights])
             rel = np.array([h[1] for h in self.heights])
@@ -610,6 +698,11 @@ class ScaleState:
             self.source = "camera_height"
             self.sigma_rel = max(math.sqrt(mad ** 2 + float(np.median(rel)) ** 2)
                                  / math.sqrt(len(r)), MIN_SCALE_SIGMA_REL)
+            return
+        got = self._baselines(self.priors, prior_span)
+        if got is not None:
+            self.k, self.source = got[0], "priors"
+            self.sigma_rel = max(got[1], MIN_SCALE_SIGMA_REL)
             return
         got = self._baselines(self.odometry, odometry_span)
         if got is not None:
@@ -701,6 +794,9 @@ class AnchoredMap:
         self.next_id = 0
         self.cloud = Cloud()
         self.created_with: str | None = None  # the trust of the origin's prior
+        self.origin_c: Array | None = None  # the origin's prior centre (metric bias pivot)
+        # baselines of metric priors against independently scaled image ones: [prior, image]
+        self.bias: list[list[float]] = []
         self.up_check_deg: float | None = None
         self.timings: dict[str, float] = {}
         self._added: list[Keyframe] = []
@@ -716,6 +812,8 @@ class AnchoredMap:
         m.drift = Drift.from_json(d["drift"])
         m.next_id = int(d["next_id"])
         m.created_with = d["created_with"]
+        m.origin_c = None if d["origin_c"] is None else np.asarray(d["origin_c"], np.float64)
+        m.bias = [list(e) for e in d["bias"]]
         m.cloud = Cloud.load(root / CLOUD_NPZ)
         return m
 
@@ -731,7 +829,9 @@ class AnchoredMap:
         atomic_write_json(self.root / STATE_JSON, {
             "engine": ENGINE, "keyframes": [k.to_json() for k in self.keyframes],
             "scale": self.scale.to_json(), "drift": self.drift.to_json(),
-            "next_id": self.next_id, "created_with": self.created_with})
+            "next_id": self.next_id, "created_with": self.created_with,
+            "origin_c": None if self.origin_c is None else self.origin_c.tolist(),
+            "bias": self.bias})
 
     def _load_kf(self, kf: Keyframe) -> None:
         if kf.feats is not None:
@@ -756,7 +856,7 @@ class AnchoredMap:
         span ``PRIOR_SPAN_M`` (positions are theirs), else depth images, else the depth scale's
         source (camera heights or the monocular model)."""
         span = self.prior_span()
-        if span >= PRIOR_SPAN_M:
+        if span >= PRIOR_SPAN_M and self.prior_bias() == 1.0:
             sp = float(np.median([_prior_sigmas(k.prior)[0] for k in self.keyframes
                                   if k.prior is not None and k.prior["trust"] == "metric"]))
             return "priors", max(math.sqrt(2.0) * sp / span, MIN_SCALE_SIGMA_REL)
@@ -773,8 +873,30 @@ class AnchoredMap:
         P = np.asarray(p["T_map_cam"], np.float64)
         sp, sr = _prior_sigmas(p)
         if p["trust"] == "metric":
+            s_b = self.prior_bias()
+            if s_b != 1.0 and self.origin_c is not None:
+                P = P.copy()
+                P[:3, 3] = self.origin_c + s_b * (P[:3, 3] - self.origin_c)
             return P, sp, sr
         return self.drift.predict(P, sp, sr)
+
+    def prior_bias(self) -> float:
+        """The metric priors' own scale bias, measured against image baselines whose scale the
+        priors did not set (depth images, camera heights): the least-squares ratio of image to
+        prior baselines once the priors span ``BIAS_SPAN_M`` with ``BIAS_EVIDENCE_MIN``
+        baselines, applied only when it differs from 1 by more than twice its uncertainty and
+        the image scale's (else 1: a metric prior is taken as metric)."""
+        ev = [e for e in self.bias if e[0] >= SCALE_EVIDENCE_MIN_M]
+        if len(ev) < BIAS_EVIDENCE_MIN or self.prior_span() < BIAS_SPAN_M:
+            return 1.0
+        b_p = np.array([e[0] for e in ev])
+        b_i = np.array([e[1] for e in ev])
+        s_b = float((b_p * b_i).sum() / (b_p ** 2).sum())
+        r = np.log(np.maximum(b_i, 1e-9) / (s_b * b_p))
+        sigma = 1.4826 * float(np.median(np.abs(r - np.median(r)))) / math.sqrt(len(ev))
+        vis = SENSOR_SCALE_SIGMA_REL if any(k.depth_kind == "sensor" for k in self.keyframes) \
+            else max(self.scale.sigma_rel, MIN_SCALE_SIGMA_REL)
+        return s_b if abs(s_b - 1.0) > 2.0 * math.hypot(sigma, vis) else 1.0
 
     def _candidates(self, f: FrameIn, T0: Array | None, descriptor: Any) -> list[Keyframe]:
         usable = [k for k in self.keyframes if k.usable()]
@@ -800,23 +922,52 @@ class AnchoredMap:
                 return [with_desc[int(i)] for i in order]
         return usable[-RECENT_CANDIDATES:][::-1]
 
-    def _correspondences(self, feats: Features, cands: list[Keyframe]) -> _Corr:
+    def _correspondences(self, feats: Features, cands: list[Keyframe],
+                         pred: tuple[Array, float, float] | None = None,
+                         K: Intrinsics | None = None) -> _Corr:
+        """Matches of the new frame's keypoints to the candidates', each lifted by its
+        keyframe's depth: ratio-test matches, and with a predicted pose (``pred``) the matches
+        guided by it (``guided_match``), within its sigmas' reach in pixels."""
         uv, X, d, which = [], [], [], []
         seen = np.zeros(len(feats.kps), bool)
         for j, k in enumerate(cands):
             self._load_kf(k)
             assert k.feats is not None and k.kdepth is not None
+            ray = rays(k.K, k.feats.kps)
+            z = k.kdepth.astype(np.float64) * self._depth_factor(k)
+            R, c = k.T[:3, :3], k.centre
+            Xk = c + (ray * z[:, None]) @ R.T
+            dk = unit(ray @ R.T)
             ia, ib = match(feats.desc, k.feats.desc)
+            if pred is not None and K is not None:
+                T0, sp0, sr0 = pred
+                Kn = K
+                kf_has = np.isfinite(Xk).all(axis=1)
+                P = np.where(kf_has[:, None],
+                             _project(T0[:3, :3], T0[:3, 3], np.where(kf_has[:, None], Xk, 0.0),
+                                      Kn, False),
+                             _project(T0[:3, :3], T0[:3, 3], dk, Kn, True))
+                P[np.abs(P) >= BEHIND_PX / 2] = np.nan
+                zc = np.where(kf_has, ((np.where(kf_has[:, None], Xk, 0.0) - T0[:3, 3])
+                                       @ T0[:3, :3])[:, 2], np.inf)
+                fpx = Kn.fx
+                base = float(np.linalg.norm(c - T0[:3, 3]))
+                rad = (K_SIGMA * fpx * (math.radians(sr0) + np.where(
+                    np.isfinite(zc) & (zc > 0.05), sp0 / np.maximum(zc, 0.05),
+                    base / (k.median_depth or 2.0))) + GUIDED_MIN_PX)
+                ga, gb = guided_match(feats, k.feats, P, np.clip(rad, GUIDED_MIN_PX,
+                                                                 GUIDED_MAX_PX))
+                known = set(ia.tolist())
+                extra = np.array([i not in known for i in ga.tolist()], bool)
+                ia = np.concatenate([ia, ga[extra]]) if extra.size else ia
+                ib = np.concatenate([ib, gb[extra]]) if extra.size else ib
             keep = ~seen[ia]
             ia, ib = ia[keep], ib[keep]
             if not len(ia):
                 continue
             seen[ia] = True
-            ray = rays(k.K, k.feats.kps[ib])
-            z = k.kdepth[ib].astype(np.float64) * self._depth_factor(k)
-            R, c = k.T[:3, :3], k.centre
-            X.append(c + (ray * z[:, None]) @ R.T)
-            d.append(unit(ray @ R.T))
+            X.append(Xk[ib])
+            d.append(dk[ib])
             uv.append(feats.kps[ia].astype(np.float64))
             which.append(np.full(len(ia), j, np.intp))
         if not uv:
@@ -829,92 +980,57 @@ class AnchoredMap:
         it was fused (monocular keyframes only)."""
         return self.scale.k / k.k_used if k.depth_kind == "mono" else 1.0
 
+    def _scale_sigma(self, k: Keyframe) -> float:
+        """The sigma of a reference keyframe's depth scale: a depth image's, else the monocular
+        scale's while something measured it, else ``MONOCULAR_REGISTRATION_SIGMA_REL``."""
+        if k.depth_kind == "sensor":
+            return SENSOR_SCALE_SIGMA_REL
+        if self.scale.source == "monocular":
+            return MONOCULAR_REGISTRATION_SIGMA_REL
+        return max(self.scale.sigma_rel, SENSOR_SCALE_SIGMA_REL)
+
+    def _refs(self, cands: list[Keyframe]) -> Refs:
+        return Refs(np.array([k.centre for k in cands]),
+                    np.array([self._scale_sigma(k) for k in cands]),
+                    np.array([k.median_depth or 2.0 for k in cands]))
+
     @staticmethod
     def _thr(K: Intrinsics) -> float:
         return REPROJ_PX * K.width / REF_WIDTH
 
-    def _solve_rotation(self, f: FrameIn, corr: _Corr, cands: list[Keyframe], centre: Array
-                        ) -> tuple[Solve, int, float] | None:
-        """Rotation-only, the camera at ``centre``: directions to the lifted points where they
-        have depth, else the keyframes' rays. Returns the solve, its inliers and the angular
-        bias (rad) the centre's distance to the keyframes can leave: the parallax of the rays,
-        or the depth scale's uncertainty times that parallax for lifted points."""
+    def _init(self, f: FrameIn, corr: _Corr, cands: list[Keyframe], T0: Array | None
+              ) -> tuple[Array, Array, NDArray[np.bool_], bool] | None:
+        """A first pose and its inliers: PnP (RANSAC) on the lifted points; failing that, a
+        rotation-only fit (RANSAC) at the prior's centre when that is within
+        ``ROTATION_FALLBACK_M`` or ``ROTATION_FALLBACK_REL`` of the median depth of a keyframe,
+        or without a prior at the best-matched keyframe's centre (a camera turning in place).
+        Returns (R, c, inliers, rotation_only)."""
         has = np.isfinite(corr.X).all(axis=1)
+        if has.sum() >= MIN_INLIERS:
+            got = pnp(corr.X[has], corr.uv[has], f.K, 2.0 * self._thr(f.K))
+            if got is not None and got[2].sum() >= MIN_INLIERS:
+                inl = np.zeros(len(corr.uv), bool)
+                inl[np.nonzero(has)[0][got[2]]] = True
+                return got[0], got[1], inl, False
+        if T0 is not None:
+            near = [float(np.linalg.norm(k.centre - T0[:3, 3])) for k in cands]
+            j = int(np.argmin(near))
+            if near[j] > max(ROTATION_FALLBACK_M,
+                             ROTATION_FALLBACK_REL * (cands[j].median_depth or 2.0)):
+                return None
+            centre = T0[:3, 3]
+        else:
+            centre = cands[int(np.bincount(corr.kf).argmax())].centre
         dirs = corr.d.copy()
         dirs[has] = unit(corr.X[has] - centre)
         dist = np.array([float(np.linalg.norm(cands[j].centre - centre)) for j in corr.kf])
         med = np.array([cands[j].median_depth or 2.0 for j in corr.kf])
-        sk = np.array([self.scale.sigma_rel if cands[j].depth_kind == "mono" else DEPTH_SIGMA_REL
-                       for j in corr.kf])
-        bias_i = np.where(has, sk, 1.0) * dist / med
-        b = unit(rays(f.K, corr.uv))
-        got = rotation_ransac(dirs, b, self._thr(f.K) / f.K.fx + float(np.median(bias_i)))
-        if got is None:
+        par = np.where(has, 0.1, 1.0) * dist / med
+        got_r = rotation_ransac(dirs, unit(rays(f.K, corr.uv)),
+                                2.0 * self._thr(f.K) / f.K.fx + float(np.median(par)))
+        if got_r is None or got_r[1].sum() < MIN_INLIERS:
             return None
-        R, inl = got
-        if inl.sum() < MIN_INLIERS:
-            return None
-        s = refine(R, centre, dirs[inl], corr.uv[inl], f.K, directions=True, fix_centre=True)
-        return s, int(s.inliers.sum()), float(np.median(bias_i[inl]))
-
-    def _solve_pnp(self, f: FrameIn, corr: _Corr) -> tuple[Solve, int, float] | None:
-        has = np.isfinite(corr.X).all(axis=1)
-        if has.sum() < MIN_INLIERS:
-            return None
-        X, uv = corr.X[has], corr.uv[has]
-        got = pnp(X, uv, f.K, self._thr(f.K))
-        if got is None:
-            return None
-        R, c, inl = got
-        if inl.sum() < MIN_INLIERS:
-            return None
-        s = refine(R, c, X[inl], uv[inl], f.K)
-        n = int(s.inliers.sum())
-        if n < MIN_INLIERS:
-            return None
-        return s, n, n / max(int(has.sum()), 1)
-
-    def _pnp_sigmas(self, s: Solve, cands: list[Keyframe]) -> tuple[float, float]:
-        """The image pose's sigmas: its covariance, floored by the depth's own bias (a share of
-        the scene depth) and, for monocular depth, the depth scale's uncertainty times the
-        distance to the keyframes (scaling their points about their centres moves the PnP
-        centre along that distance, not its rotation)."""
-        sp, sr = s.sigmas()
-        med = float(np.median([k.median_depth or 2.0 for k in cands]))
-        floor_p = max(MIN_SIGMA_POS_M, IMAGE_SIGMA_POS_REL * med)
-        if any(k.depth_kind == "mono" for k in cands):
-            base = float(np.min([np.linalg.norm(k.centre - s.c) for k in cands]))
-            sk = MONOCULAR_REGISTRATION_SIGMA_REL if self.scale.source == "monocular" \
-                else self.scale.sigma_rel
-            floor_p = math.hypot(floor_p, sk * base)
-        return max(sp, floor_p), max(sr, IMAGE_SIGMA_ROT_MIN_DEG)
-
-    def _solve(self, f: FrameIn, corr: _Corr, cands: list[Keyframe], T0: Array | None,
-               sp0: float) -> tuple[Solve, int, float, str, float, float] | None:
-        """The image-only pose: PnP on the lifted points; failing that, rotation-only at the
-        prior's centre (within ``ROTATION_FALLBACK_M`` of a keyframe) or, without a prior, at
-        the best-matched keyframe's centre. Returns (solve, inliers, inlier ratio, method,
-        sigma_pos_m, sigma_rot_deg)."""
-        p = self._solve_pnp(f, corr)
-        if p is not None:
-            return (p[0], p[1], p[2], "pnp", *self._pnp_sigmas(p[0], cands))
-        if T0 is not None:
-            near = min(float(np.linalg.norm(k.centre - T0[:3, 3])) for k in cands)
-            if near > ROTATION_FALLBACK_M:
-                return None
-            sub, centre, sp = np.ones(len(corr.uv), bool), T0[:3, 3], sp0
-        else:
-            best = int(np.bincount(corr.kf).argmax())
-            sub, centre, sp = corr.kf == best, cands[best].centre, UNANCHORED_SIGMA_POS_M
-        if sub.sum() < MIN_INLIERS:
-            return None
-        r = self._solve_rotation(f, _Corr(corr.uv[sub], corr.X[sub], corr.d[sub], corr.kf[sub]),
-                                 cands, centre)
-        if r is None:
-            return None
-        s, n, bias = r
-        sr = max(s.sigmas()[1], math.degrees(bias), IMAGE_SIGMA_ROT_MIN_DEG)
-        return s, n, n / int(sub.sum()), "rotation", sp, sr
+        return got_r[0], centre.copy(), got_r[1], True
 
     def place(self, f: FrameIn, feats: Features, descriptor: Any) -> Placement:
         """Place one new frame (the map has its origin); does not add it."""
@@ -923,39 +1039,57 @@ class AnchoredMap:
         cands = self._candidates(f, T0, descriptor)
         reason = "few_features" if min(f.features_count or len(feats.kps), len(feats.kps)) \
             < 150 else "no_overlap"
-        corr = self._correspondences(feats, cands) if cands and len(feats.kps) else None
-        sol = None
+        corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) else None
+        init = None
         if corr is not None and len(corr.uv) >= MIN_INLIERS:
-            sol = self._solve(f, corr, cands, T0, sp0)
+            init = self._init(f, corr, cands, T0)
+        img = None
+        if init is not None:
+            assert corr is not None
+            R, c, inl, rot_only = init
+            refs = self._refs(cands)
+            sub = (corr.uv[inl], corr.X[inl], corr.d[inl], corr.kf[inl])
+            s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
+            n = int(s.inliers.sum())
+            if n >= MIN_INLIERS:
+                spi, sri = s.sigmas()
+                spi = max(spi, MIN_SIGMA_POS_M)
+                sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
+                if rot_only:
+                    spi = sp0 if T0 is not None else UNANCHORED_SIGMA_POS_M
+                img = (s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri,
+                       sub, refs)
         if T0 is None:
-            if sol is None:
+            if img is None:
                 return Placement(f.name, "rejected", reason)
-            s, n, _, method, spi, sri = sol
+            s, n, _, method, spi, sri, _, _ = img
             return Placement(f.name, "registered", None, s.T, round(spi, 4), round(sri, 3), n,
-                             method, lifted=_lifted(corr))
+                             method, lifted=_lifted(corr))  # type: ignore[arg-type]
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
-        if sol is None:
+        if img is None:
             return Placement(f.name, "provisional", reason, T0, sp0, sr0, 0, "prior",
                              pose_residual(T0, ref))
-        s, n, ratio, method, spi, sri = sol
+        s, n, ratio, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
-        if rot_only:  # the centre is the prior's
-            s.c = T0[:3, 3].copy()
-        elif spi > CONFIRM_SIGMA_POS_M or sri > CONFIRM_SIGMA_ROT_DEG:
+        if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
+                                                                       2.0 * sp0)):
             return Placement(f.name, "provisional", reason, T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
         dp, dr = pose_residual(s.T, T0)
-        if dp > K_SIGMA * math.hypot(sp0, spi) or dr > K_SIGMA * math.hypot(sr0, sri):
+        if (not rot_only and dp > K_SIGMA * math.hypot(sp0, spi)) \
+                or dr > K_SIGMA * math.hypot(sr0, sri):
             if n >= STRONG_INLIERS and ratio >= STRONG_RATIO:
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr))
             return Placement(f.name, "provisional", "no_overlap", T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
-        T, fsp, fsr = fuse_poses(s.T, spi, sri, T0, sp0, sr0)
-        if rot_only:
-            T[:3, 3], fsp = T0[:3, 3], sp0
+        # the frame refined on its matches and its prior together (stored poses fixed)
+        fused, _ = refine_pose(s.R, T0[:3, 3].copy() if rot_only else s.c, *sub, refs, f.K,
+                               prior=(T0, sp0, sr0))
+        fsp, fsr = fused.sigmas()
+        T = fused.T
         pl = Placement(f.name, "registered", None, T, round(max(fsp, MIN_SIGMA_POS_M), 4),
                        round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref),
                        lifted=_lifted(corr))  # type: ignore[arg-type]
@@ -965,17 +1099,27 @@ class AnchoredMap:
 
     def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
                         cands: list[Keyframe]) -> None:
-        """A PnP centre against its prior, both relative to the reference keyframe (the one
-        with the most matches), in that keyframe's raw depth units (monocular only). A metric
-        prior is compared with the reference's map centre; a drifting one with the
-        reference's own drifting prior (odometry baselines)."""
+        """An image-only centre against its prior, both relative to the reference keyframe
+        (the one with the most matches). For a monocular reference, in its raw depth units: a
+        metric prior is compared with the reference's map centre, a drifting one with the
+        reference's own drifting prior (odometry baselines), both evidence of ``k``. For a
+        reference whose depth scale is measured independently of the priors (a depth image,
+        or camera heights), in metres: evidence of the metric priors' own scale bias."""
         j = int(np.bincount(corr.kf).argmax())
         ref = cands[j]
+        b_img = float(np.linalg.norm(s.c - ref.centre))
+        # the prior baseline between the same two frames: to the reference's own metric prior
+        ref_p = np.asarray(ref.prior["T"])[:3, 3] if ref.prior is not None \
+            and ref.prior["trust"] == "metric" else ref.centre
+        b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref_p))
+        anchored = ref.depth_kind == "sensor" or (ref.depth_kind == "mono"
+                                                  and self.scale.source == "camera_height")
+        if trust == "metric" and anchored:
+            self.bias = [*self.bias, [b_prior, b_img]][-MAX_EVIDENCE:]
         if ref.depth_kind != "mono":
             return
-        b_img = float(np.linalg.norm(s.c - ref.centre)) / self.scale.k
+        b_img /= self.scale.k
         if trust == "metric":
-            b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref.centre))
             self.scale.priors = [*self.scale.priors, [b_prior, b_img]][-MAX_EVIDENCE:]
         elif ref.prior is not None and ref.prior["trust"] == "drifting":
             b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(ref.prior["T"])[:3, 3]))
@@ -1067,10 +1211,9 @@ class AnchoredMap:
         out: dict[int, Placement] = {}
         order = list(range(len(frames)))
         if not self.keyframes:
+            # the first frame with a prior, else the first frame (camera-only robots)
             first = next((i for i, f in enumerate(frames) if f.prior is not None
-                          and f.prior["trust"] in ("metric", "drifting")), None)
-            if first is None:
-                raise ValueError("an anchored map starts from a frame with a prior")
+                          and f.prior["trust"] in ("metric", "drifting")), 0)
             order = [first] + [i for i in order if i != first]
         reg_s = 0.0
         fuse_s = 0.0
@@ -1091,11 +1234,18 @@ class AnchoredMap:
             feats = features(f.rgb, f.ignore)
             if not self.keyframes:
                 p = f.prior
-                assert p is not None
-                P = np.asarray(p["T_map_cam"], np.float64)
-                sp, sr = _prior_sigmas(p)
-                pl = Placement(f.name, "registered", None, P, sp, sr, 0, "origin", (0.0, 0.0))
-                self.created_with = p["trust"]
+                if p is not None and p["trust"] in ("metric", "drifting"):
+                    P = np.asarray(p["T_map_cam"], np.float64)
+                    sp, sr = _prior_sigmas(p)
+                    self.created_with = p["trust"]
+                    self.origin_c = P[:3, 3].copy()
+                    res: tuple[float, float] | None = (0.0, 0.0)
+                else:
+                    P = first_camera(None if f.mono is None else f.mono()[3])
+                    sp, sr = MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG
+                    self.created_with = "none"
+                    res = None
+                pl = Placement(f.name, "registered", None, P, sp, sr, 0, "origin", res)
             else:
                 pl = self.place(f, feats, None if mono is None else mono[2])
             reg_s += time.perf_counter() - t
@@ -1104,9 +1254,9 @@ class AnchoredMap:
                 continue
             t = time.perf_counter()
             depth, Kg, kind, desc = self._keyframe_depth(f)
+            if not self.keyframes and self.created_with != "none" and f.mono is not None:
+                self._up_check(f, pl)
             if kind == "mono":
-                if not self.keyframes:
-                    self._up_check(f, pl)
                 assert pl.T is not None
                 # its own scale brought onto the map's (the monocular model's metres vary from
                 # frame to frame), on the points lifted at the map's current scale

@@ -93,15 +93,18 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             am = AnchoredMap(mapper)
         tm["clone"] = round(time.perf_counter() - t, 3)
         pool = ThreadPoolExecutor(INFERENCE_IN_FLIGHT)
-        gravity = prev is None
+        # a new map's origin frame (its first with a prior, else its first) also gives
+        # gravity: the angle to its prior's up axis, or the camera-only map's up
+        origin = None
+        if prev is None:
+            origin = next((fr for fr in todo if fr.work.trust in ("metric", "drifting")),
+                          todo[0])
         ins = []
         for fr in todo:
             fut = None
-            if not _has_depth(fr):
+            if not _has_depth(fr) or fr is origin:
                 assert fr.path is not None
-                fut = pool.submit(up.backend.infer, fr.path, fr.cam.canonical(),
-                                  gravity and fr.work.trust in ("metric", "drifting"))
-                gravity = gravity and fr.work.trust not in ("metric", "drifting")
+                fut = pool.submit(up.backend.infer, fr.path, fr.cam.canonical(), fr is origin)
             ins.append(_frame_in(fr, fut))
         done = [0]
 

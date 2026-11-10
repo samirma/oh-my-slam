@@ -375,12 +375,10 @@ class Updater:
 
     def _is_anchored(self, prev: dict[str, Any] | None, frames: list[_Frame]) -> bool:
         """Whether the job runs on the prior-first registration: the map has been anchored by
-        it, or it is new and a frame the checks kept carries a metric or drifting prior."""
+        it, or it is new (with or without priors) and ``prior_first`` holds."""
         if prev is not None:
             return prev.get("engine") == "anchored"
-        return self.prior_first and any(fr.reason is None and fr.path is not None
-                                        and fr.work.trust in ("metric", "drifting")
-                                        for fr in frames)
+        return self.prior_first
 
     # -- anchoring -------------------------------------------------------------------------------
 

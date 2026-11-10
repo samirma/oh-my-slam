@@ -100,8 +100,8 @@ def test_cold_start_then_a_sweep(client: Client) -> None:
     assert job["inputs"][0]["prior_residual_m"] == 0.0
     q = job["quality"]
     assert q["gauge_shift"] is None and q["scale_ratio_vs_prev"] is None
-    assert q["prior_gravity_deg"] is None  # a depth image: no gravity asked
-    assert job["scale_source"] == "depth" and client.backend.infers == []
+    assert q["prior_gravity_deg"] == pytest.approx(10.0, abs=0.1)  # the base camera's pitch
+    assert job["scale_source"] == "depth" and [g for _, g in client.backend.infers] == [True]
     poses = [base_pose(15.0 + 30.0 * k) for k in range(6)]
     fr, files = frames_for(client, poses, tag="s")
     job = client.update("m", fr, files)
@@ -123,6 +123,7 @@ def test_cold_start_then_a_sweep(client: Client) -> None:
     v = client.service.store.version("m")
     assert v["engine"] == "anchored" and v["sim3"]["s"] == 1.0
     assert client.backend.calls == []  # the mapper never ran
+    assert len(client.backend.infers) == 1  # depth images: no monocular depth asked
 
 
 def test_monocular_depth_with_camera_height(client: Client) -> None:
@@ -212,12 +213,16 @@ def test_ignore_mask_and_new_map_without_priors(client: Client) -> None:
     fr[0]["ignore_mask"] = "m0"
     job = client.update("m", fr, {**files, "m0": buf.getvalue()}, cameras={"cam": CAM})
     assert [i["status"] for i in job["inputs"]] == ["registered", "registered"]
-    # a new map whose kept frames carry no prior goes to the mapper
-    fr, files = frames_for(client, [base_pose(0)], tag="z", trust=None)
-    client.backend.add(files["z0"], base_pose(0))
+    # a new map without priors is anchored too: its first frame is the origin, level by its
+    # gravity, and a turn in place registers on the images alone
+    fr, files = frames_for(client, [base_pose(0), base_pose(20), base_pose(40)], tag="z",
+                           trust=None, depth=False)
     job = client.update("other", fr, files, cameras={"cam": CAM})
-    assert job["state"] == "committed" and client.backend.calls
-    assert "engine" not in client.service.store.version("other")
+    assert job["state"] == "committed" and not client.backend.calls
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 3
+    assert job["inputs"][0]["prior_residual_m"] is None
+    v = client.service.store.version("other")
+    assert v["engine"] == "anchored" and np.allclose(np.array(v["frames"][0]["T_map_cam"])[:3, 3], 0)
 
 
 def test_inference_failure_fails_the_job(client: Client) -> None:
