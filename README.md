@@ -259,7 +259,8 @@ server.
   `few_features` before matching (`too_close` needs a depth part, which a locate frame has not).
   The camera's ignore mask and the frame's own are combined, rectified with the image to the
   camera's canonical pinhole (lens handling as in an update), and no feature is taken there.
-* **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px) against every keyframe up to 24,
+* **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px, contrast threshold 0.01: a quarter
+  of OpenCV's default, for low-contrast simulated and indoor frames) against every keyframe up to 24,
   else the 12 with most nearest-neighbour votes (FLANN, L2 < 230) plus up to 6 keyframes within
   max(1 m, 3 σ + 0.5 m) of the frame's prior; Lowe ratio 0.8, ≥ 8 matches per keyframe.
 * **Map points.** Each keyframe keypoint's map point is triangulated with the stored keyframe
@@ -267,24 +268,34 @@ server.
   axes within 60°) sees it (reprojection ≤ 2 px at 640 px, rays ≥ 2° apart); the others come from
   the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Provisional frames
   take part with their provisional poses.
-* **Pose.** RANSAC PnP (EPnP, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
+* **Pose.** RANSAC PnP (AP3P, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
   besides that pooled hypothesis, a second fit without its inliers and a fit on each of the 6
   keyframes with most correspondences alone. The reported pose is the hypothesis explaining most
-  query keypoints, refined (Levenberg-Marquardt) on its inliers. Without enough correspondences
+  query keypoints, refined (Levenberg-Marquardt) on its inliers, then refined against every
+  matched keyframe at once (`relocalize.refine_keyframes`): each inlier correspondence of each
+  keyframe is one residual, whitened by its own uncertainty — 1 px (at 640 px) across the image
+  of the keyframe's ray (the epipolar line), and along it the pixel plus the keyframe depth's
+  5 % (`DEPTH_SIGMA_REL`) — Gauss-Newton with a Huber weight at 2 σ, 8 steps. A keyframe's depth
+  error thus moves the pose only where the geometry cannot tell, and several keyframes average
+  out. Without enough correspondences
   (< 15 inliers), a frame whose matched keyframes were taken from one spot (centres within
   max(5 cm, 2 % of the depth)) is placed at their centre with the rotation that turns its rays onto
   theirs (the turn fit of `mapping.locate`, ≥ 15 inliers that are ≥ 25 % of the matches); its
   height is the floor plus the frame's `height_above_floor_m` (else the camera's) when given.
-* **Sigmas.** `SIGMA_SCALE × √(fit² + spread²)`, no floor (the keyframes' own sigmas, a floored
-  proxy in this base, are not added): *fit* is the Gauss-Newton covariance `s² (JᵀJ)⁻¹` of the inliers' reprojection residuals
-  (`s` their RMS, ≥ 0.3 px), as the 3-D RMS of the centre (m) and of the rotation (deg); *spread*
-  is the RMS distance of the other hypotheses of the same place, weighted by their squared
-  relative support. Keyframes whose depth or pose disagree therefore widen the sigmas.
+* **Sigmas.** `SIGMA_SCALE × √(fit² + keyframes² + spread²)`: *fit* is the covariance of that
+  refinement (scaled by its RMS whitened residual when above 1), as the 3-D RMS of the centre (m)
+  and of the rotation (deg); *keyframes* the matched keyframes' own sigmas from the version
+  (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it is
+  measured against); *spread* the RMS distance of the other hypotheses of the same place,
+  weighted by their squared relative support. Keyframes whose depth or pose disagree therefore
+  widen the sigmas.
   `SIGMA_SCALE` is 1.0 until the replay calibrates it (see the measurements below).
 * **Ambiguity** (`ambiguity_support_ratio` **0.6**). The rival is the best-supported other
-  hypothesis farther than **0.10 m or 5°** that is another place: explaining mostly the same
-  query keypoints by map points ≥ 0.5 m (median) from the pose's (a symmetric room's twin view), or
-  mostly other keypoints while lying > 0.3 m or 15° away. `ambiguity` is set when its support is
+  hypothesis that is another place: farther than 0.3 m or 15° — or 3 times the pose's fit and
+  keyframe sigmas when larger — and, when it explains mostly the same query keypoints, by map
+  points ≥ 30 % of their range apart (median; a symmetric room's twin view, not keyframes that
+  disagree in depth), and not brought back to the pose when refined on both inlier sets
+  (`_same_basin`). `ambiguity` is set when its support is
   ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. A prior, then the frame's height,
   picks between the pose and its rival when only one agrees with it. Turn fits: a second turn
   fit without the first one's inliers, > 5° away, at the same ratio.
@@ -315,19 +326,37 @@ server.
   surface points from (almost) every pixel (≤ 400 000), free-space rays every few pixels (one
   voxel apart at 4 m, ≤ 40 000), each ray free up to 5 cm + 2 % short of its hit, depth edges
   skipped, ranges ≤ 6 m.
-* **A band.** A voxel is a surface when `hit ≥ 0.3 (hit + free)`, unless it is floor-like (at least
-  half its hits flat, within 0.10 m of the floor). A cell is `occupied` when a surface voxel's centre
+* **Weights.** Each frame's evidence in a voxel counts `round(4 m / range)`, 1 to 4 (its most
+  precise ray there): near views outvote far ones on where a surface ends. Normals of the flat
+  test come from points 3 cm apart at 4 m (a wider stencil than adjacent pixels); a flat point
+  seen from above at a grazing angle also stands for the floor of its footprint along the ray
+  (≤ 0.3 m), so the far floor between pixel rows counts as seen.
+* **A band.** A voxel is a surface when `hit ≥ 0.2 (hit + free)` — a thin panel (an open door
+  leaf) hit from any view stays a surface unless rays saw through it four times as often —
+  unless it is floor-like (within 0.10 m of the floor: any hit below the band's `z_min`, at least
+  half its hits flat inside it). Walls — occupied structures ≥ 1.5 m long — grow by one cell
+  where they are less than 4 cells thick (`navgrid.inflate_walls`): a wall's face lies anywhere
+  in its cell, and a thin wall seen from both sides sits on a cell boundary. Passages and regions
+  use the grid before that growth. A cell is `occupied` when a surface voxel's centre
   lies in `[floor + z_min, floor + z_max]`, `free` when not occupied and a ray passed through it in
   the band (or its floor was seen), else `unknown`; an overhang above `z_max` never makes a cell
   occupied. `height_m` is the highest surface or floor voxel's centre below `max(z_max, 2.0)`,
   relative to the floor; `floor_observed` 1 for a floor-like voxel in the column, 2 for a cell free
   by rule (below) whose floor was not seen, else 0. `floor_z_m` is the
-  version's floor, else the lowest layer with ≥ 25 % of the most flat hits of any layer, else the
-  cameras' heights, else 1 m below the lowest camera.
+  surface the robot stands on (map.md §6), from the heights of the volume's flat points (1 cm
+  bins, smoothed over 3): of the peaks below the lowest camera (by 5 cm) holding ≥ 50 % of the
+  highest, the one within 0.10 m of the version's floor (the mapper's choice: the plane nearest
+  z 0 when priors fixed the frame, else the lowest), else the lowest; its height is the mean of
+  the points within 3 cm. Else the version's floor, else the cameras' heights, else 1 m below the
+  lowest camera.
 * **Camera stands.** The cell under every keyframe camera (and the disc of `footprint_radius_m`)
-  is free whatever was seen; so are the unknown cells of its blind disc that the camera cell
-  reaches without crossing an occupied cell: radius `h / tan(depression)` of the bottom row's
-  centre ray at camera height `h` (0 when that ray looks < 2° below the horizon; at most 2 m).
+  is free whatever was seen; so is its blind disc: radius `h / tan(depression)` of the bottom
+  row's centre ray at camera height `h` — its pose above the floor, or the frame's (camera's)
+  `height_above_floor_m` when larger — (0 when that ray looks < 2° below the horizon; at most
+  2 m). A disc cell stays occupied only when its highest surface in the band lies more than
+  0.10 m above the camera's lowest line of sight there (`h (1 − d / radius)`: a wall, a jamb, a
+  table leg the camera could see), and only the cells the camera cell reaches without crossing
+  those are freed.
   This is done at 5 cm for the features and again on the cells asked.
 * **Resolution.** Passages, regions and frontiers are computed at the volume's 5 cm whatever
   `cell_m` is asked (the layers are then resampled), so they do not change with the cell size.
@@ -335,9 +364,11 @@ server.
   below 1 m, the chord toward its nearest obstacle and on to the opposite one, refined to the
   shortest within ±10°; kept when it lies in a wall — beyond both ends the obstacle goes on along
   the chord for 0.4 m, no free cell on the line, ≥ 50 % occupied (beside the line included) — and
-  ≤ 2 m long; the shortest one per gap; then the narrowest free chord beside it is taken (shifted
+  ≤ 2 m long; the shortest one per gap; and, for each door-labelled object of the version with
+  no chord within 0.6 m, the shortest free chord through the free cells within 0.6 m of it, every
+  10°, ending on occupied cells, of a door's width (a wall seen from one side or partly); then the narrowest free chord beside it is taken (shifted
   along its normal by up to ±0.5 m, turned by up to ±20°, both ends on obstacles, its midpoint
-  between the walled chord's jambs), so that an open leaf or a deep frame counts as an obstacle. Its ends are `jambs_m`, its length `width_m`, its midpoint
+  between the walled chord's jambs), so that an open leaf or a deep frame counts as an obstacle. Its ends, moved half a cell outward (a jamb's face lies inside the cell the chord ends on), are `jambs_m`, their distance `width_m`, its midpoint
   `centre_m`, `normal_deg` perpendicular to it from `regions[0]` to `regions[1]`. `kind`:
   `narrow` when narrower than `2 × footprint_radius_m`; else `door` when a door-labelled object
   of the version lies within 0.6 m of its centre, or both jambs are occupied and it is 0.55–1.3 m
@@ -367,6 +398,25 @@ likewise with `r`. Points: `xyz` float32 `[n, 3]`, `object_id` uint32 `[n]` (0: 
 uint8 `[n, 3]`.
 
 ### O5 and O6 measured (2026-11-10, M3 Pro, served from the working tree, heavy lock held)
+
+* **Wheeled-base bench** (in process; a 12 × 8 m house of six 4 × 4 m rooms joined by five
+  0.9–1.0 m doors, furniture with legs; a base tour at 0.25 m camera height, f 655.8 at 640×480,
+  sweeps every 30° and drives every 0.4 m, 81 frames; depth on a 320×240 grid with a per-frame
+  scale error σ 2 %, a smooth ±3 % field and 0.3 % pixel noise; poses off by σ 2 cm / 0.5°; the
+  map 4 cm off the floor plan; walls 2 cm and 10 cm thick). The replay's C9 shares, before → now:
+  floor error 25 → 0.6 mm; camera cells and blind ring free 0 → 0.73–0.74 (the rest hold table
+  and chair legs the camera saw inside its disc); doors found 1/5 → 5/5, geometry 0.8;
+  band_occupied 0.84 → 0.92 (2 cm walls), 0.92 → 0.97 (10 cm); floor_observed 0.53 → 0.60;
+  grid agreement 0.85 → 0.86–0.87. With heavier depth noise (scale σ 3 %, field ±4 %, 1 % pixel
+  noise, poses 3 cm / 1°) doors 5/5, geometry 0.4–0.6, band 0.97–0.99, agreement 0.78–0.79.
+  `GET grid` layers + stands + features 0.26–0.5 s.
+* **Locate bench** (the same house, textured renders, keyframes every frame but every fifth,
+  held-out frames located): keyframes off by 2 cm / 0.5°, monocular-like depth: median 3.7 cm,
+  0.55°, error/σ median 0.63 (p90 1.25), ambiguity null on every right frame; keyframes off by
+  5 cm / 1.5° with low texture: 20/20 located (6/20 at OpenCV's default SIFT contrast), median
+  9.7 cm, error/σ 0.85 (p90 1.1), ambiguity null on 10 of 11 right frames. An in-place sweep is
+  unbiased (median 0.5°) when its keyframes are; keyframes whose yaws are over-counted by 10 %
+  give a 10° error that locate inherits: its sigma is then only as honest as the keyframes'.
 
 * **Locate, `examples/ainex-captures`** (640×480, fx 270, camera height 0.34 m): a map of the 64
   frames other than every fifth registered 21 of them (this base's registration); of the 15

@@ -144,6 +144,7 @@ class Derived:
                 dv = self.get(*item)
                 for hook in self.after:
                     hook(dv)
+                self.index(dv)  # the locate index ready before the first locate
             except Exception:
                 log.exception("deriving %s version %d failed", *item)
 
@@ -187,9 +188,11 @@ class Derived:
             cam = cams.get(f["camera_id"])
             if cam is None:
                 continue
-            K = Camera.from_json(cam).canonical()
+            c = Camera.from_json(cam)
+            K = c.canonical()
+            h = f.get("height_above_floor_m", c.height_above_floor_m)
             out.append(navgrid.Stand(np.asarray(f["T_map_cam"], np.float64), K.K(), K.width,
-                                     K.height))
+                                     K.height, None if h is None else float(h)))
         return out
 
     # -- derivation -----------------------------------------------------------------------------
@@ -266,7 +269,7 @@ class Derived:
                 else None
             if img is None or not img.exists():
                 continue
-            key = f.get("sha256") or _sha_file(img)
+            key = f"{f.get('sha256') or _sha_file(img)}-{relocalize.FEATURES_TAG}"
             feat = self._features(name, key, img)
             if feat is None:
                 continue
@@ -292,9 +295,13 @@ class Derived:
         arrays: dict[str, Any] = {f"p{i}": p for i, p in enumerate(points)}
         np.savez(buf, **arrays)
         atomic_write_bytes(vdir / "locate.npz", buf.getvalue())
-        floor = record.get("floor_z_m")
+        # the floor: the plane of the volume's flat points below the cameras (the depth's own,
+        # to the centimetre) that the version's floor names — the surface the robot stands on,
+        # which the objects use too (map.md §6) — else the lowest; else the version's
+        floor = vol.estimate_floor(float(C[:, 2].min()), record.get("floor_z_m")) \
+            if frames else None
         if floor is None:
-            floor = vol.estimate_floor()
+            floor = record.get("floor_z_m")
         if floor is None:
             heights = [np.asarray(f["T_map_cam"])[2, 3] - cams[f["camera_id"]].height_above_floor_m
                        for f in frames if cams[f["camera_id"]].height_above_floor_m is not None]

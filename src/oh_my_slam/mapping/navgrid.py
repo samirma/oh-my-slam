@@ -70,13 +70,14 @@ NORMAL_STENCIL_M = 0.03  # normals from points this far apart at STRIDE_RANGE_M 
 MAX_FOOTPRINT_M = 0.3  # a grazing flat point's floor footprint, at most
 FLOOR_BIN_M = 0.01
 FLOOR_SMOOTH_BINS = 3
-FLOOR_PEAK_SHARE = 0.3
+FLOOR_PEAK_SHARE = 0.5
 FLOOR_REFINE_M = 0.03
+FLOOR_MATCH_M = 0.10  # estimate_floor: a peak this near the named floor is that floor
 MIN_CAMERA_HEIGHT_M = 0.05
 NEAR_WEIGHT_M = 4.0  # range_weight
 MAX_WEIGHT = 4
 
-OCC_RATIO = 0.5  # a voxel is a surface when at least this share of its evidence is hits
+OCC_RATIO = 0.2  # a voxel is a surface unless rays saw through it four times as often
 WALL_EXTENT_M = 1.5  # inflate_walls: an occupied structure this long is a wall,
 WALL_THICK_CELLS = 4  # ... grown beside it where it is thinner than this
 FLOOR_TOL_M = 0.10
@@ -101,6 +102,7 @@ JAMB_IN_CELL = 0.5  # a jamb's face: this far (in cells) into the cell its chord
 DOOR_MIN_W = 0.55
 DOOR_MAX_W = 1.3
 DOOR_OBJECT_M = 0.6  # a door-labelled object this close to a passage's centre makes it a door
+DOOR_CHORD_STEP_DEG = 10.0
 LEAF_MIN_M = 0.3
 LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, are leaf cells
 
@@ -358,12 +360,15 @@ class Volume:
             np.zeros(v.shape[0] * v.bins_per_voxel, np.float64)  # a volume of an older version
         return v
 
-    def estimate_floor(self, below: float | None = None) -> float | None:
+    def estimate_floor(self, below: float | None = None, near: float | None = None
+                       ) -> float | None:
         """The floor's height (map.md §6): the lowest large horizontal plane below the cameras
         (``below``: their lowest height, less ``MIN_CAMERA_HEIGHT_M``). The flat surface
         points' heights, in ``FLOOR_BIN_M`` bins smoothed over ``FLOOR_SMOOTH_BINS``, are
         searched for peaks holding at least ``FLOOR_PEAK_SHARE`` of the highest one; the floor is
-        the mean height of the points within ``FLOOR_REFINE_M`` of the lowest such peak. Falls
+        the mean height of the points within ``FLOOR_REFINE_M`` of the lowest such peak, or of
+        the one nearest ``near`` when given (the surface the robot stands on, when priors fixed
+        the map frame: map.md §6). Falls
         back on the layers of flat hits (a volume without heights); None without flat hits."""
         if self.empty:
             return None
@@ -377,9 +382,12 @@ class Volume:
             left = np.concatenate([[-1.0], s[:-1]])
             right = np.concatenate([s[1:], [-1.0]])
             peaks = np.flatnonzero((s >= left) & (s > right) & (s >= FLOOR_PEAK_SHARE * s.max()))
-            p = int(peaks[0])
-            near = np.abs(zc - zc[p]) <= FLOOR_REFINE_M
-            return float((zc[near] * h[near]).sum() / h[near].sum())
+            p = int(peaks[0]) if near is None else \
+                int(peaks[np.argmin(np.abs(zc[peaks] - near))])
+            if near is not None and abs(float(zc[p]) - near) > FLOOR_MATCH_M:
+                return float(near)  # no such plane among the flat points: as named
+            sel = np.abs(zc - zc[p]) <= FLOOR_REFINE_M
+            return float((zc[sel] * h[sel]).sum() / h[sel].sum())
         per = self.flat.reshape(self.shape[0], -1).sum(axis=1).astype(np.float64)
         if per.max() <= 0:
             return None
@@ -590,8 +598,9 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
     disc (in place): its floor out to ``blind_radius``, which the camera could not see. A cell of
     the disc stays occupied only when it holds a surface the camera could see: higher, by
     ``SIGHT_MARGIN_M``, than the camera's lowest line of sight above that cell (a wall, a door
-    jamb, a table's leg), not what lies below it (other frames' floor noise, a low step). The
-    cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
+    jamb, a table's leg), not what lies below it (other frames' floor noise, a low step); and
+    only the cells the camera cell reaches without crossing those (not the floor behind a
+    wall). The cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
         r, c, _ = _disc(lay, xy, footprint_radius or 0.0)
@@ -601,6 +610,8 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         if ring <= lay.cell:
             continue
         r, c, dist = _disc(lay, xy, ring)
+        if not r.size:  # the camera and its disc lie outside the grid
+            continue
         sight = camera_height(st, floor_z) * (1.0 - dist / ring)
         occ = lay.state[r, c] == OCCUPIED
         if lay.top is None:
@@ -608,8 +619,17 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         else:
             with np.errstate(invalid="ignore"):
                 keep = occ & ~(lay.top[r, c] <= sight + SIGHT_MARGIN_M)
-        lay.state[r[~keep], c[~keep]] = FREE
-        _by_rule(lay, r[~keep], c[~keep])
+        # what the camera cell reaches without crossing a kept surface (not behind a wall)
+        r0, c0 = r.min(), c.min()
+        box = np.zeros((r.max() - r0 + 1, c.max() - c0 + 1), bool)
+        box[r - r0, c - c0] = ~keep
+        lab, _ = ndimage.label(box)
+        me = lay.cell_of(xy)
+        if not (0 <= me[0] - r0 < box.shape[0] and 0 <= me[1] - c0 < box.shape[1]):
+            continue  # the camera lies outside the grid
+        go = (lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]) & ~keep
+        lay.state[r[go], c[go]] = FREE
+        _by_rule(lay, r[go], c[go])
 
 
 def _by_rule(lay: Layers, r: NDArray[np.int64], c: NDArray[np.int64]) -> None:
@@ -814,6 +834,44 @@ def _passage_chords(state: NDArray[np.uint8], cell: float
     return out
 
 
+def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
+                 doors: Sequence[Sequence[float]]
+                 ) -> list[tuple[float, Array, Array, tuple[int, int] | None,
+                                 tuple[int, int] | None]]:
+    """The chords of the door-labelled objects no chord found: a wall seen from one side, or
+    partly, need not pass ``_walled``, but a door object says where the gap is. Through the free
+    cells within ``DOOR_OBJECT_M`` of the door's centre, every ``DOOR_CHORD_STEP_DEG``, the
+    shortest free chord ending on occupied cells at both ends whose length is a door's
+    (``DOOR_MIN_W``-``DOOR_MAX_W`` of free width), then narrowed beside it (``_narrowest``)."""
+    free = state == FREE
+    cell = lay.cell
+    max_t = CHORD_MAX_M / cell
+    out: list[Any] = []
+    for d in doors:
+        c = np.array([(d[0] - lay.origin[0]) / cell, (d[1] - lay.origin[1]) / cell])
+        if any(float(np.linalg.norm((ch[1] + ch[2]) / 2 - c)) * cell <= DOOR_OBJECT_M
+               for ch in [*chords, *out]):
+            continue
+        k = math.ceil(DOOR_OBJECT_M / cell)
+        r0, c0 = math.floor(c[1]), math.floor(c[0])
+        best = None
+        for r in range(max(r0 - k, 0), min(r0 + k + 1, state.shape[0]), 2):
+            for cc in range(max(c0 - k, 0), min(c0 + k + 1, state.shape[1]), 2):
+                if not free[r, cc] or math.hypot(r - r0, cc - c0) > k:
+                    continue
+                for a in np.radians(np.arange(0.0, 180.0, DOOR_CHORD_STEP_DEG)):
+                    ch = _chord_at(free, np.array([cc + 0.5, r + 0.5]), float(a), max_t)
+                    w = (ch[0] + 2 * JAMB_IN_CELL) * cell
+                    if ch[3] is None or ch[4] is None or state[ch[3]] != OCCUPIED or \
+                            state[ch[4]] != OCCUPIED or not DOOR_MIN_W <= w <= DOOR_MAX_W:
+                        continue
+                    if best is None or ch[0] < best[0]:
+                        best = ch
+        if best is not None:
+            out.append(_narrowest(free, best, cell, max_t))
+    return out
+
+
 def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any], cell: float,
                max_t: float) -> tuple[float, Array, Array, tuple[int, int] | None,
                                       tuple[int, int] | None]:
@@ -939,6 +997,7 @@ def features(lay: Layers, footprint_radius: float | None = None,
     R, C = state.shape
     cell = lay.cell
     chords = _passage_chords(state, cell)
+    chords += _door_chords(state, lay, chords, doors)
     # cut the chords out of the free space; the parts are the regions
     import cv2
 

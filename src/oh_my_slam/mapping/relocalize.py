@@ -62,6 +62,7 @@ RIVAL_KEYFRAMES = 6
 AMBIGUITY_POS_M = 0.10
 AMBIGUITY_ROT_DEG = 5.0
 AMBIGUITY_SUPPORT_RATIO = 0.6
+TWIN_REL = 0.3  # distinct: map points of a twin view this far apart, relative to their range
 FAR_POS_M = 0.3  # a rival lies at least this far, or is turned this much (``tolerance``)
 FAR_ROT_DEG = 15.0
 K_SIGMA = 3.0
@@ -276,7 +277,7 @@ def pnp(uv: NDArray[Any], xyz: NDArray[Any], K: Array, px: float, seed: int = 0
     ok, rvec, tvec, inl = cv2.solvePnPRansac(
         np.ascontiguousarray(xyz, np.float64), np.ascontiguousarray(uv, np.float64), K, None,
         iterationsCount=RANSAC_ITERATIONS, reprojectionError=px, confidence=0.999,
-        flags=cv2.SOLVEPNP_EPNP)
+        flags=cv2.SOLVEPNP_AP3P)
     if not ok or inl is None or len(inl) < MIN_INLIERS:
         return None
     idx = inl.ravel()
@@ -489,13 +490,25 @@ def _first(h: Hypothesis, iq: NDArray[np.int64]) -> dict[int, int]:
     return out
 
 
-def distinct(h: Hypothesis, main: Hypothesis, tol: tuple[float, float]) -> bool:
-    """Whether ``h`` is another place than ``main``: farther than ``tol`` (m, deg) from it
-    (``tolerance``), such as a symmetric room's twin view, or keyframes that disagree that much
-    about the frame. Nearer hypotheses are the same view through keyframes whose depth or pose
-    are a little off: they widen the sigmas instead (``spread``)."""
+def distinct(h: Hypothesis, main: Hypothesis, tol: tuple[float, float],
+             iq: NDArray[np.int64], xyz: Array) -> bool:
+    """Whether ``h`` is another place than ``main``, not the same view through keyframes whose
+    depth or pose are off (those widen the sigmas instead, ``spread``). It must lie farther than
+    ``tol`` (m, deg) from ``main`` (``tolerance``). When it explains mostly the query keypoints
+    ``main`` explains, their map points must also be far apart: by ``TWIN_REL`` of their
+    distance from ``main``'s camera (median) — a symmetric room's twin view puts them across the
+    room, keyframes that disagree in depth or pose only a share of their range."""
     dp, dr = pose_distance(h.T, main.T)
-    return dp > tol[0] or dr > tol[1]
+    if dp <= tol[0] and dr <= tol[1]:
+        return False
+    hk, mk = _first(h, iq), _first(main, iq)
+    shared = [k for k in hk if k in mk]
+    if not shared or len(shared) * 2 < h.inliers:
+        return True
+    a = np.array([xyz[hk[k]] for k in shared])
+    b = np.array([xyz[mk[k]] for k in shared])
+    rng = np.linalg.norm(b - main.T[:3, 3], axis=1)
+    return float(np.median(np.linalg.norm(a - b, axis=1) / np.maximum(rng, 1e-6))) >= TWIN_REL
 
 
 def tolerance(fit: tuple[float, float]) -> tuple[float, float]:
@@ -505,8 +518,8 @@ def tolerance(fit: tuple[float, float]) -> tuple[float, float]:
     return max(FAR_POS_M, K_SIGMA * fit[0]), max(FAR_ROT_DEG, K_SIGMA * fit[1])
 
 
-def _rival(best: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float]
-           ) -> Hypothesis | None:
+def _rival(best: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
+           iq: NDArray[np.int64], xyz: Array) -> Hypothesis | None:
     """The best-supported hypothesis farther than ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG``
     from ``best`` that is another place (``distinct``)."""
     out = None
@@ -514,20 +527,20 @@ def _rival(best: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, flo
         dp, dr = pose_distance(h.T, best.T)
         if dp <= AMBIGUITY_POS_M and dr <= AMBIGUITY_ROT_DEG:
             continue
-        if not distinct(h, best, tol):
+        if not distinct(h, best, tol, iq, xyz):
             continue
         if out is None or h.inliers > out.inliers:
             out = h
     return out
 
 
-def spread(main: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float]
-           ) -> tuple[float, float]:
+def spread(main: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
+           iq: NDArray[np.int64], xyz: Array) -> tuple[float, float]:
     """(m, deg): the RMS distance from ``main`` of the hypotheses of the same place, each
     weighted by its support relative to ``main``'s, squared (``main`` counts once, at 0)."""
     w_sum, dp2, dr2 = 1.0, 0.0, 0.0
     for h in others:
-        if distinct(h, main, tol):
+        if distinct(h, main, tol, iq, xyz):
             continue
         w = (h.inliers / max(main.inliers, 1)) ** 2
         dp, dr = pose_distance(h.T, main.T)
@@ -589,10 +602,10 @@ def locate(q: Query, index: Index) -> Outcome:
         others = [h for k, h in enumerate(hyps) if k != k_best]
         kf_sig = _keyframe_sigmas(main, kfs, index)
         tol = tolerance(_fit(main, q, uv, xyz, iq, cov, kf_sig))
-        rival = _rival(main, others, tol)
+        rival = _rival(main, others, tol, iq, xyz)
         while rival is not None and _same_basin(rival, main, q, uv, xyz, origin, px, tol):
             others = [h for h in others if h is not rival]  # the same place, seen off
-            rival = _rival(main, others, tol)
+            rival = _rival(main, others, tol, iq, xyz)
         if rival is not None:  # the prior, then the height, pick when only one agrees
             sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
             rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq,
@@ -779,7 +792,7 @@ def _sigmas(h: Hypothesis, others: Sequence[Hypothesis], q: Query, uv: Array, xy
     """``SIGMA_SCALE`` times the fit's sigmas (``_fit``) and the same-place hypotheses' spread,
     combined."""
     fit = _fit(h, q, uv, xyz, iq, cov, keyframes)
-    s_pos, s_rot = spread(h, others, tolerance(fit))
+    s_pos, s_rot = spread(h, others, tolerance(fit), iq, xyz)
     return (round(SIGMA_SCALE * math.hypot(fit[0], s_pos), 4),
             round(SIGMA_SCALE * math.hypot(fit[1], s_rot), 3))
 
