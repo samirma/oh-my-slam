@@ -41,6 +41,8 @@ Array = NDArray[np.float64]
 
 MAX_FEATURES = 2000
 WORK_SIDE = 1024  # features on the image scaled to at most this side
+SIFT_CONTRAST = 0.01  # a quarter of OpenCV's default: simulated and indoor robot frames are low
+FEATURES_TAG = "c01"  # in the derived feature cache's keys: features of these parameters
 RATIO = 0.8
 MATCH_ALL = 24
 TOP_K = 12
@@ -60,14 +62,23 @@ RIVAL_KEYFRAMES = 6
 AMBIGUITY_POS_M = 0.10
 AMBIGUITY_ROT_DEG = 5.0
 AMBIGUITY_SUPPORT_RATIO = 0.6
-TWIN_MIN_M = 0.5  # a rival explaining the same keypoints must place them this far away
-FAR_POS_M = 0.3  # a rival explaining other keypoints must lie this far, or turned this much
+RIVAL_SIGMA_SHARE = 0.5  # with a rival, the sigmas are at least half its distance
+LOW_RATIO = 0.4  # an inlier ratio below this floors the sigmas at (README "Locate"):
+LOW_RATIO_SIGMA_POS_M = 0.05
+LOW_RATIO_SIGMA_ROT_DEG = 1.0
+TWIN_REL = 0.3  # distinct: map points of a twin view this far apart, relative to their range
+FAR_POS_M = 0.3  # a rival lies at least this far, or is turned this much (``tolerance``)
 FAR_ROT_DEG = 15.0
 K_SIGMA = 3.0
 DEFAULT_PRIOR_SIGMA_POS_M = 0.05
 DEFAULT_PRIOR_SIGMA_ROT_DEG = 2.0
 DEFAULT_HEIGHT_SIGMA_M = 0.02
 EDGE_REL = 0.04
+DEPTH_SIGMA_REL = 0.05  # a keyframe point's depth, relative (README "Locate")
+PIXEL_SIGMA = 1.0  # a keypoint's pixel noise at 640 px
+HUBER_SIGMAS = 2.0
+REFINE_ITERATIONS = 8
+BEHIND_SIGMAS = 1e3
 
 
 # ------------------------------------------------------------------------------------------------
@@ -92,7 +103,8 @@ def extract(gray: NDArray[np.uint8], mask: NDArray[np.bool_] | None = None
     if mask is not None and mask.any():
         keep = (cv2.resize((~mask).astype(np.uint8), (img.shape[1], img.shape[0]),
                            interpolation=cv2.INTER_NEAREST) * 255)
-    sift: Any = cv2.SIFT_create(nfeatures=MAX_FEATURES)  # type: ignore[attr-defined]
+    sift: Any = cv2.SIFT_create(nfeatures=MAX_FEATURES,  # type: ignore[attr-defined]
+                                contrastThreshold=SIFT_CONTRAST)
     kps, desc = sift.detectAndCompute(img, keep)
     if desc is None or not kps:
         return np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8)
@@ -269,7 +281,7 @@ def pnp(uv: NDArray[Any], xyz: NDArray[Any], K: Array, px: float, seed: int = 0
     ok, rvec, tvec, inl = cv2.solvePnPRansac(
         np.ascontiguousarray(xyz, np.float64), np.ascontiguousarray(uv, np.float64), K, None,
         iterationsCount=RANSAC_ITERATIONS, reprojectionError=px, confidence=0.999,
-        flags=cv2.SOLVEPNP_EPNP)
+        flags=cv2.SOLVEPNP_AP3P)
     if not ok or inl is None or len(inl) < MIN_INLIERS:
         return None
     idx = inl.ravel()
@@ -482,23 +494,36 @@ def _first(h: Hypothesis, iq: NDArray[np.int64]) -> dict[int, int]:
     return out
 
 
-def distinct(h: Hypothesis, main: Hypothesis, iq: NDArray[np.int64], xyz: Array) -> bool:
+def distinct(h: Hypothesis, main: Hypothesis, tol: tuple[float, float],
+             iq: NDArray[np.int64], xyz: Array) -> bool:
     """Whether ``h`` is another place than ``main``, not the same view through keyframes whose
-    depth or pose are a little off (those widen the sigmas instead, ``spread``): when it explains
-    mostly the query keypoints ``main`` explains, by map points ``TWIN_MIN_M`` (median) away from
-    ``main``'s (a symmetric room's twin view); when it explains mostly others, by lying farther
-    than ``FAR_POS_M`` or ``FAR_ROT_DEG`` from ``main``."""
+    depth or pose are off (those widen the sigmas instead, ``spread``). It must lie farther than
+    ``tol`` (m, deg) from ``main`` (``tolerance``). When it explains mostly the query keypoints
+    ``main`` explains, their map points must also be far apart: by ``TWIN_REL`` of their
+    distance from ``main``'s camera (median) — a symmetric room's twin view puts them across the
+    room, keyframes that disagree in depth or pose only a share of their range."""
+    dp, dr = pose_distance(h.T, main.T)
+    if dp <= tol[0] and dr <= tol[1]:
+        return False
     hk, mk = _first(h, iq), _first(main, iq)
     shared = [k for k in hk if k in mk]
-    if len(shared) * 2 < h.inliers:
-        dp, dr = pose_distance(h.T, main.T)
-        return dp > FAR_POS_M or dr > FAR_ROT_DEG
-    d = [float(np.linalg.norm(xyz[hk[k]] - xyz[mk[k]])) for k in shared]
-    return float(np.median(d)) >= TWIN_MIN_M
+    if not shared or len(shared) * 2 < h.inliers:
+        return True
+    a = np.array([xyz[hk[k]] for k in shared])
+    b = np.array([xyz[mk[k]] for k in shared])
+    rng = np.linalg.norm(b - main.T[:3, 3], axis=1)
+    return float(np.median(np.linalg.norm(a - b, axis=1) / np.maximum(rng, 1e-6))) >= TWIN_REL
 
 
-def _rival(best: Hypothesis, others: Sequence[Hypothesis], iq: NDArray[np.int64], xyz: Array
-           ) -> Hypothesis | None:
+def tolerance(fit: tuple[float, float]) -> tuple[float, float]:
+    """How far (m, deg) another hypothesis must lie to be another place: ``FAR_POS_M`` or
+    ``FAR_ROT_DEG``, or ``K_SIGMA`` times the pose's own sigmas (fit and keyframes, ``fit``)
+    when larger."""
+    return max(FAR_POS_M, K_SIGMA * fit[0]), max(FAR_ROT_DEG, K_SIGMA * fit[1])
+
+
+def _rival(best: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
+           iq: NDArray[np.int64], xyz: Array) -> Hypothesis | None:
     """The best-supported hypothesis farther than ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG``
     from ``best`` that is another place (``distinct``)."""
     out = None
@@ -506,20 +531,20 @@ def _rival(best: Hypothesis, others: Sequence[Hypothesis], iq: NDArray[np.int64]
         dp, dr = pose_distance(h.T, best.T)
         if dp <= AMBIGUITY_POS_M and dr <= AMBIGUITY_ROT_DEG:
             continue
-        if not distinct(h, best, iq, xyz):
+        if not distinct(h, best, tol, iq, xyz):
             continue
         if out is None or h.inliers > out.inliers:
             out = h
     return out
 
 
-def spread(main: Hypothesis, others: Sequence[Hypothesis], iq: NDArray[np.int64], xyz: Array
-           ) -> tuple[float, float]:
+def spread(main: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
+           iq: NDArray[np.int64], xyz: Array) -> tuple[float, float]:
     """(m, deg): the RMS distance from ``main`` of the hypotheses of the same place, each
     weighted by its support relative to ``main``'s, squared (``main`` counts once, at 0)."""
     w_sum, dp2, dr2 = 1.0, 0.0, 0.0
     for h in others:
-        if distinct(h, main, iq, xyz):
+        if distinct(h, main, tol, iq, xyz):
             continue
         w = (h.inliers / max(main.inliers, 1)) ** 2
         dp, dr = pose_distance(h.T, main.T)
@@ -576,25 +601,41 @@ def locate(q: Query, index: Index) -> Outcome:
                 hyps.append(hypothesis(alone[0]))
         k_best = max(range(len(hyps)), key=lambda k: (hyps[k].inliers, -k))
         main = hypothesis(_refine(hyps[k_best], q.K, uv, xyz, iq))
+        origin = np.array([index.keyframes[int(i)].centre for i in kfs]).reshape(-1, 3)
+        main, cov = _refined(main, hypothesis, q, uv, xyz, origin, px)
         others = [h for k, h in enumerate(hyps) if k != k_best]
-        rival = _rival(main, others, iq, xyz)
+        kf_sig = _keyframe_sigmas(main, kfs, index)
+        tol = tolerance(_fit(main, q, uv, xyz, iq, cov, kf_sig))
+        rival = _rival(main, others, tol, iq, xyz)
+        while rival is not None and _same_basin(rival, main, q, uv, xyz, origin, px, tol):
+            others = [h for h in others if h is not rival]  # the same place, seen off
+            rival = _rival(main, others, tol, iq, xyz)
         if rival is not None:  # the prior, then the height, pick when only one agrees
-            sp, sr = _sigmas(main, others, q, uv, xyz, iq)
-            rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq)
-            if (consistent(q, main.T, sp, sr) is False and consistent(q, rival.T, rsp, rsr)) or (
-                    not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp)):
+            sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
+            rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq,
+                               keyframes=_keyframe_sigmas(rival, kfs, index))
+            comparable = rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers
+            if comparable and ((consistent(q, main.T, sp, sr) is False
+                                and consistent(q, rival.T, rsp, rsr))
+                               or (not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp))):
                 others = [main, *[h for h in others if h is not rival]]
                 main, rival = rival, main
+                main, cov = _refined(main, hypothesis, q, uv, xyz, origin, px)
+                kf_sig = _keyframe_sigmas(main, kfs, index)
         if not plausible(main, kfs, index):
             return out  # a degenerate solve: not located (a wrong pose is worse than none)
-        sp, sr = _sigmas(main, others, q, uv, xyz, iq)
-        out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, sp, sr
+        sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
         if rival is not None and rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers:
             dp, dr = pose_distance(rival.T, main.T)
             out.ambiguity = {"pos_m": round(dp, 4), "rot_deg": round(dr, 3)}
+            # the sigmas cover the mixture of the pose and its rival, not the winner alone
+            sp, sr = max(sp, RIVAL_SIGMA_SHARE * dp), max(sr, RIVAL_SIGMA_SHARE * dr)
+        if out.inlier_ratio < LOW_RATIO:  # most matches unexplained: never millimetres
+            sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
+        out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
         out.consistent_with_prior = consistent(q, main.T, sp, sr)
         return out
     if ray_q:
@@ -642,16 +683,141 @@ def _refine(h: Hypothesis, K: Array, uv: Array, xyz: Array, iq: NDArray[np.int64
     return T
 
 
+def _whitened(T: Array, K: Array, uv: Array, xyz: Array, origin: Array, px: float,
+              rel: float) -> Array:
+    """(N, 2) residuals of correspondences in units of their sigmas: a map point is the
+    keyframe's ray (from ``origin``, the keyframe's centre) at its depth, uncertain by ``rel`` of
+    that distance along the ray; its projection is uncertain by ``px`` pixels and, along the image
+    of that ray (the epipolar line), by the depth's share too."""
+    q, z = project(T, K, xyz)
+    r = q - uv
+    e = xyz - origin
+    dist = np.linalg.norm(e, axis=1)
+    e = e / np.maximum(dist, 1e-9)[:, None]
+    cam = (xyz - T[:3, 3]) @ T[:3, :3]
+    dcam = e @ T[:3, :3]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        j = np.column_stack([K[0, 0] * (dcam[:, 0] * cam[:, 2] - cam[:, 0] * dcam[:, 2]),
+                             K[1, 1] * (dcam[:, 1] * cam[:, 2] - cam[:, 1] * dcam[:, 2])]) \
+            / (cam[:, 2] ** 2)[:, None]
+    jn = np.linalg.norm(j, axis=1)
+    u = j / np.maximum(jn, 1e-12)[:, None]
+    along = np.sum(r * u, axis=1)
+    perp = r[:, 0] * u[:, 1] - r[:, 1] * u[:, 0]
+    s_along = np.sqrt(px ** 2 + (rel * dist * jn) ** 2)
+    out = np.column_stack([perp / px, along / s_along])
+    out[~np.isfinite(out).all(axis=1) | (z <= 0)] = BEHIND_SIGMAS
+    return out
+
+
+def refine_keyframes(T0: Array, K: Array, uv: Array, xyz: Array, origin: Array, px: float,
+                     rel: float = DEPTH_SIGMA_REL) -> tuple[Array, Array, float]:
+    """The pose refined on every inlier correspondence of every matched keyframe (a query
+    keypoint seen in several keyframes constrains it once per keyframe), each weighed by its own
+    uncertainty (``_whitened``): across the epipolar line a correspondence is as precise as its
+    pixels, along it as its keyframe's depth. Gauss-Newton with a Huber weight
+    (``HUBER_SIGMAS``), ``REFINE_ITERATIONS`` steps. Returns (pose, 6x6 covariance of the
+    rotation (rad) and centre (m), RMS whitened residual)."""
+    R0, C0 = T0[:3, :3].copy(), T0[:3, 3].copy()
+
+    def pose(p: Array) -> Array:
+        T = np.eye(4)
+        T[:3, :3] = _exp(p[:3]) @ R0
+        T[:3, 3] = C0 + p[3:]
+        return T
+
+    p = np.zeros(6)
+    eps = np.array([1e-6] * 3 + [1e-5] * 3)
+    J = np.zeros((2 * len(uv), 6))
+    w = np.ones(2 * len(uv))
+    for _ in range(REFINE_ITERATIONS):
+        r0 = _whitened(pose(p), K, uv, xyz, origin, px, rel).ravel()
+        for i in range(6):
+            e = np.zeros(6)
+            e[i] = eps[i]
+            J[:, i] = (_whitened(pose(p + e), K, uv, xyz, origin, px, rel).ravel()
+                       - _whitened(pose(p - e), K, uv, xyz, origin, px, rel).ravel()) / (2 * eps[i])
+        a = np.abs(r0)
+        w = np.where(a <= HUBER_SIGMAS, 1.0, HUBER_SIGMAS / np.maximum(a, 1e-12))
+        A = J.T @ (J * w[:, None])
+        try:
+            dp = -np.linalg.solve(A + 1e-9 * np.eye(6), J.T @ (w * r0))
+        except np.linalg.LinAlgError:
+            break
+        p = p + dp
+        if float(np.linalg.norm(dp[:3])) < 1e-7 and float(np.linalg.norm(dp[3:])) < 1e-6:
+            break
+    r = _whitened(pose(p), K, uv, xyz, origin, px, rel).ravel()
+    ok = np.abs(r) <= HUBER_SIGMAS
+    rms = math.sqrt(float(np.mean(r[ok] ** 2))) if ok.any() else math.inf
+    try:
+        cov = np.linalg.inv(J.T @ (J * w[:, None])) * max(rms, 1.0) ** 2
+    except np.linalg.LinAlgError:
+        cov = np.full((6, 6), math.inf)
+    return pose(p), cov, rms
+
+
+def _refined(h: Hypothesis, hypothesis: Any, q: Query, uv: Array, xyz: Array, origin: Array,
+             px: float) -> tuple[Hypothesis, Array | None]:
+    """A hypothesis refined on all its inlier correspondences (``refine_keyframes``) and that
+    refinement's covariance; the hypothesis as it was (None) when the refinement explains fewer
+    query keypoints."""
+    m = h.mask
+    T, cov, _ = refine_keyframes(h.T, q.K, uv[m], xyz[m], origin[m],
+                                 PIXEL_SIGMA * max(q.width, q.height) / 640.0)
+    out = hypothesis(T)
+    if out.inliers < h.inliers or not np.isfinite(cov).all():
+        return h, None
+    return out, cov
+
+
+def _same_basin(h: Hypothesis, main: Hypothesis, q: Query, uv: Array, xyz: Array,
+                origin: Array, px: float, tol: tuple[float, float]) -> bool:
+    """Whether ``h``, refined on its own and ``main``'s inlier correspondences
+    (``refine_keyframes``), comes back to ``main``: a hypothesis the matches cannot tell from
+    ``main`` (along a direction the frame barely constrains, such as its distance to far
+    structure) is no other place."""
+    m = h.mask | main.mask
+    T, _, _ = refine_keyframes(h.T, q.K, uv[m], xyz[m], origin[m],
+                               PIXEL_SIGMA * max(q.width, q.height) / 640.0)
+    dp, dr = pose_distance(T, main.T)
+    return dp <= tol[0] / 2 and dr <= tol[1] / 2
+
+
+def _keyframe_sigmas(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> tuple[float, float]:
+    """The RMS of the matched keyframes' own sigmas, weighted by the inliers on each: a pose is
+    no better placed in the map than the keyframes it is measured against."""
+    per = np.bincount(kfs[h.mask], minlength=len(index.keyframes)).astype(np.float64)
+    if per.sum() <= 0:
+        return 0.0, 0.0
+    sp = np.array([k.sigma_pos_m for k in index.keyframes])
+    sr = np.array([k.sigma_rot_deg for k in index.keyframes])
+    return (math.sqrt(float(per @ sp ** 2 / per.sum())),
+            math.sqrt(float(per @ sr ** 2 / per.sum())))
+
+
 def _sigmas(h: Hypothesis, others: Sequence[Hypothesis], q: Query, uv: Array, xyz: Array,
-            iq: NDArray[np.int64]) -> tuple[float, float]:
-    """``SIGMA_SCALE`` times the fit's covariance and the same-place hypotheses' spread. The
-    keyframes' own sigmas are not added: until O5 calibrates the registration they are a floored
-    proxy (1 cm, 0.1°), which would floor these too."""
-    sel = np.array(sorted(_first(h, iq).values()), np.int64)
-    pos, rot = covariance(h.T, q.K, uv[sel], xyz[sel])
-    s_pos, s_rot = spread(h, others, iq, xyz)
-    return (round(SIGMA_SCALE * math.hypot(pos, s_pos), 4),
-            round(SIGMA_SCALE * math.hypot(rot, s_rot), 3))
+            iq: NDArray[np.int64], cov: Array | None = None,
+            keyframes: tuple[float, float] = (0.0, 0.0)) -> tuple[float, float]:
+    """``SIGMA_SCALE`` times the fit's sigmas (``_fit``) and the same-place hypotheses' spread,
+    combined."""
+    fit = _fit(h, q, uv, xyz, iq, cov, keyframes)
+    s_pos, s_rot = spread(h, others, tolerance(fit), iq, xyz)
+    return (round(SIGMA_SCALE * math.hypot(fit[0], s_pos), 4),
+            round(SIGMA_SCALE * math.hypot(fit[1], s_rot), 3))
+
+
+def _fit(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
+         cov: Array | None, keyframes: tuple[float, float]) -> tuple[float, float]:
+    """(m, deg): the fit's covariance (``cov`` of the refinement when given, else the
+    reprojection one) and the keyframes' own sigmas, combined."""
+    if cov is not None:
+        rot = math.degrees(math.sqrt(max(float(np.trace(cov[:3, :3])), 0.0)))
+        pos = math.sqrt(max(float(np.trace(cov[3:, 3:])), 0.0))
+    else:
+        sel = np.array(sorted(_first(h, iq).values()), np.int64)
+        pos, rot = covariance(h.T, q.K, uv[sel], xyz[sel])
+    return math.hypot(pos, keyframes[0]), math.hypot(rot, keyframes[1])
 
 
 def _rays(uv: NDArray[Any], K: Array) -> Array:

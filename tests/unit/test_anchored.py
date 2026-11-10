@@ -246,7 +246,19 @@ def test_cold_start_sweep_with_depth(tmp_path: Path) -> None:
         assert e[0] < 0.02 and e[1] < 0.5, (k, e)
     assert m.scale_summary() == ("depth", an.DEPTH_SIGMA_REL)
     floor, pts = m.floor_and_bounds()
-    assert floor is not None and abs(floor) < 0.03 and len(pts) > 1000
+    assert floor is not None and abs(floor) < 0.03 and len(pts) > 1000  # a base: the floor
+    # a larger plane 1.1 m lower, seen past the edge (a worktop's room floor): priors fixed the
+    # frame, so the floor stays the plane nearest z 0, the one the robot stands on (map.md §6)
+    g = np.mgrid[-4.0:4.0:0.02, -4.0:4.0:0.02].reshape(2, -1).T
+    lower = np.column_stack([g, np.full(len(g), -1.1)])
+    m.cloud.add(lower, np.zeros((len(lower), 3)))
+    floor, _ = m.floor_and_bounds()
+    assert floor is not None and abs(floor) < 0.03
+    m.created_with = "none"  # without priors: the lowest large plane
+    floor, _ = m.floor_and_bounds()
+    assert floor == pytest.approx(-1.1, abs=0.03)
+    m.created_with = "metric"
+    m.cloud.drop(m.cloud.points()[:, 2] < -1.0)
     m.save()
     again = AnchoredMap.load(m.root)
     assert len(again.keyframes) == 12 and again.keyframes[0].feats is None

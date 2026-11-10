@@ -58,7 +58,8 @@ H = 2.5
 DOOR = (1.5, 2.4)  # the door gap's y extent in the wall x in [4.0, 4.1]
 
 
-def two_rooms(door: tuple[float, float] = DOOR, leaf: bool = False, table: bool = False) -> Scene:
+def two_rooms(door: tuple[float, float] = DOOR, leaf: bool = False, table: bool = False,
+              leaf_t: float = 0.04) -> Scene:
     """Room A (x 0-4) and room B (x 4.1-8), y 0-4, joined by a door in the wall between them."""
     s = Scene()
     s.add((-1.0, -1.0, -0.05), (9.0, 5.0, 0.0))  # floor
@@ -70,7 +71,7 @@ def two_rooms(door: tuple[float, float] = DOOR, leaf: bool = False, table: bool 
     s.add((4.0, door[1], 0.0), (4.1, 4.0, H))  # and above it
     s.add((4.0, door[0], 2.1), (4.1, door[1], H))  # lintel
     if leaf:  # an open leaf, hinged at the door's upper jamb, swung 90 deg into room B
-        s.add((4.1, door[1] - 0.04, 0.0), (4.1 + 0.8, door[1], 2.0))
+        s.add((4.1, door[1] - leaf_t, 0.0), (4.1 + 0.8, door[1], 2.0))
     if table:  # a table top at 0.75 m on thin legs, in room A
         s.add((1.0, 2.5, 0.72), (2.0, 3.3, 0.76))
         for x, y in ((1.0, 2.5), (1.95, 2.5), (1.0, 3.25), (1.95, 3.25)):

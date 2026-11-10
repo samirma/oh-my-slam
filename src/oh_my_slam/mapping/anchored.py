@@ -1861,14 +1861,21 @@ class AnchoredMap:
 
     def floor_and_bounds(self) -> tuple[float | None, NDArray[np.float64]]:
         """The floor height (map.md §6) and the points bounding the map (the cloud's and the
-        cameras'). The floor is the lowest large horizontal plane of the cloud below every
-        camera: among the planes (``floor_candidates``) holding at least ``MAP_FLOOR_SHARE`` of
-        the best one's points, the lowest; without one, the lowest dense layer."""
+        cameras'). The floor is the surface the robot stands on: among the large horizontal
+        planes of the cloud below every camera (``floor_candidates``, holding at least
+        ``MAP_FLOOR_SHARE`` of the best one's points), the one nearest z 0 when priors fixed the
+        map frame (their origin is where the robot stands), else the lowest; without one, the
+        lowest dense layer."""
         pts = self.cloud.points()
         centres = np.array([k.centre for k in self.keyframes]).reshape(-1, 3)
         below = float(centres[:, 2].min()) if len(centres) else 0.0
         floor = None
         if len(pts):
             planes = floor_candidates(pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)
-            floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
+            if planes and self.created_with in ("metric", "drifting"):
+                # priors fixed the frame: the plane the robot stands on, nearest their origin
+                # height (z 0), not a lower floor seen past a worktop's edge (map.md §6)
+                floor = below - min(planes, key=lambda h: abs(below - h))
+            else:
+                floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
         return floor, np.vstack([pts, centres]) if len(pts) else centres

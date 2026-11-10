@@ -231,12 +231,16 @@ def test_rivals_need_distinct_evidence_and_small_keyframes_give_no_hypothesis() 
     close[0, 3] = 0.2
     m3 = np.zeros(16, bool)
     m3[10:] = True
-    twin = rl.Hypothesis(close, 6, m3)
-    assert rl._rival(best, [same, near], iq, xyz) is None
-    assert rl._rival(best, [same, other, rl.Hypothesis(far, 2, m2)], iq, xyz) is other
-    assert rl._rival(best, [rl.Hypothesis(close, 4, m2)], iq, xyz) is None  # near, other points
-    assert rl._rival(best, [twin], iq, xyz) is twin
-    assert rl.spread(best, [same], iq, xyz) == pytest.approx((1.0 / math.sqrt(2), 0.0))
+    twin = rl.Hypothesis(far, 6, m3)  # the same keypoints, by points 2 m away: a twin view
+    tol = rl.tolerance((0.01, 0.1))
+    assert tol == (rl.FAR_POS_M, rl.FAR_ROT_DEG)
+    assert rl.tolerance((0.2, 6.0)) == pytest.approx((0.6, 18.0))
+    assert rl._rival(best, [same, near], tol, iq, xyz) is None  # same points: keyframes off
+    assert rl._rival(best, [same, other, rl.Hypothesis(far, 2, m2)], tol, iq, xyz) is other
+    assert rl._rival(best, [rl.Hypothesis(close, 4, m2)], tol, iq, xyz) is None  # within tol
+    assert rl._rival(best, [twin], tol, iq, xyz) is twin
+    assert rl._rival(best, [rl.Hypothesis(far, 0, np.zeros(16, bool))], tol, iq, xyz) is not None
+    assert rl.spread(best, [same], tol, iq, xyz) == pytest.approx((1.0 / math.sqrt(2), 0.0))
     P, D = _scene()
     small = _kf("s", rooms.camera(0.2, 0.0, 1.0, 0.0, -10.0), P[:12], D[:12])
     o = rl.locate(_query(A, P, D), rl.Index([_kf("a", A, P, D), small]))

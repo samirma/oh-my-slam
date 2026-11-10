@@ -56,7 +56,7 @@ def test_integrate_skips_frames_with_nothing_to_add(monkeypatch: pytest.MonkeyPa
     blob = v.to_bytes()
     w = ng.Volume.from_bytes(blob)
     assert w.shape == v.shape and w.frames == v.frames and (w.hit == v.hit).all()
-    assert w.estimate_floor() == pytest.approx(-0.025)
+    assert w.estimate_floor() == pytest.approx(0.0, abs=0.01)  # the floor box top: z 0
 
 
 def _grid(state: np.ndarray, cell: float = 0.1) -> ng.Layers:
@@ -94,7 +94,7 @@ def test_blind_radius_and_stands_outside_the_grid() -> None:
     out = ng.Stand(rooms.camera(-5.0, -5.0, 1.0, 0, 0.0), K, 320, 240)
     edge = ng.Stand(rooms.camera(-0.05, 0.5, 1.0, 0, -30.0), K, 320, 240)
     ng.mark_stands(lay, [out, edge], 0.0, None)
-    assert (lay.state == 1).sum() == 1
+    assert (lay.state == 1).sum() == 1  # neither stands inside the grid
     lay2 = _grid(np.zeros((40, 40), np.uint8))
     lay2.state[:, 8] = 2  # a wall 0.85 m from the camera
     ng.mark_stands(lay2, [ng.Stand(rooms.camera(0.5, 2.0, 1.0, 0, -20.0), K, 320, 240)], 0.0, 0.2)
@@ -150,7 +150,7 @@ def test_features_kinds_frontiers_and_small_parts() -> None:
     f = ng.features(lay)
     assert len(f.regions) == 2 and len(f.passages) == 1
     (p,) = f.passages
-    assert p.kind == "door" and p.width == pytest.approx(0.8, abs=0.11)
+    assert p.kind == "door" and p.width == pytest.approx(0.9, abs=0.11)
     assert {fr.region for fr in f.frontiers} <= {0, 1, None}
     f2 = ng.features(lay, doors=[p.centre])
     assert f2.passages[0].kind == "door" and f2.passages[0].leaf is None
@@ -185,7 +185,8 @@ def test_a_chord_that_does_not_split_is_no_passage() -> None:
     f = ng.features(_grid(st))
     assert len(f.regions) == 2 and len(f.passages) == 2
     for p in f.passages:
-        assert p.width == pytest.approx(0.8, abs=0.01) and p.kind == "door"
+        # 0.8 m of free cells; the jambs' faces half a cell into the cells the chord ends on
+        assert p.width == pytest.approx(0.9, abs=0.01) and p.kind == "door"
 
 
 def test_walled_checks_both_ends() -> None:
@@ -250,8 +251,8 @@ def test_the_narrowest_chord_beside_the_wall_line_is_the_passage() -> None:
     st[24:26, 31:34] = 2
     f = ng.features(_grid(st))
     (p,) = f.passages
-    assert p.width == pytest.approx(0.9, abs=0.01)
-    assert sorted(j[1] for j in p.jambs) == pytest.approx([1.5, 2.4], abs=0.01)
+    assert p.width == pytest.approx(0.9 + 0.1, abs=0.01)  # half a cell beyond each end
+    assert sorted(j[1] for j in p.jambs) == pytest.approx([1.45, 2.45], abs=0.01)
     assert 3.1 <= p.centre[0] <= 3.4 and p.centre[1] == pytest.approx(1.95)
 
 
@@ -280,3 +281,55 @@ def test_cells_free_by_rule_get_floor_observed_2() -> None:
     coarse = ng.resample(lay, 0.2)
     assert coarse.floor_observed[10, 4] == 1  # seen wins over free by rule
     assert coarse.floor_observed[10, 2] == 2
+
+
+@pytest.mark.parametrize("thickness", [0.02, 0.03, 0.04])
+def test_a_thin_open_leaf_seen_from_a_few_views_stays_occupied(thickness: float) -> None:
+    """A door leaf 2-4 cm thick, open at 90 deg to the wall into room B, seen from three views in
+    room B among a room A sweep whose rays pass beside it: its cells are occupied (other views'
+    carving does not erase it) and the door's passage reports it."""
+    scene = rooms.two_rooms(leaf=True, leaf_t=thickness)
+    cams = [rooms.camera(2.0, 2.0, 1.0, yaw) for yaw in range(0, 360, 30)]
+    cams += [rooms.camera(3.0, 1.95, 1.0, 0.0)]
+    cams += [rooms.camera(5.6, 1.2, 1.0, 140.0), rooms.camera(6.2, 2.2, 1.0, 175.0),
+             rooms.camera(5.5, 3.4, 1.0, -135.0)]
+    vol = ng.Volume()
+    for i, T in enumerate(cams):
+        d = scene.depth(T)
+        vol.integrate(f"f{i}", d, rooms.K640, T, d > 0)
+    floor = vol.estimate_floor(1.0)
+    assert floor == pytest.approx(0.0, abs=0.02)
+    lay = ng.layers(vol, floor, 0.05, 1.8)
+    y = rooms.DOOR[1] - thickness / 2
+    leaf_cells = [lay.cell_of([x, y]) for x in np.arange(4.2, 4.85, 0.05)]
+    seen = [rc for rc in leaf_cells if lay.observations[rc] > 0]
+    assert len(seen) >= 8
+    assert all(lay.state[rc] == ng.OCCUPIED for rc in seen)
+    feat = ng.features(lay)
+    door = [p for p in feat.passages if abs(p.centre[0] - 4.05) < 0.3]
+    assert door and door[0].leaf is not None
+
+
+def test_the_floor_is_the_surface_the_robot_stands_on() -> None:
+    """An arm on a worktop (top at z 0, priors' origin) looking down past its edge at the room
+    floor 1.1 m below: named by the version's floor (near 0) the worktop is the floor; without,
+    the lowest large plane. A base on the floor: the floor either way."""
+    s = rooms.Scene()
+    s.add((-3.0, -3.0, -1.15), (3.0, 3.0, -1.1))  # the room floor
+    s.add((-0.5, -0.5, -1.1), (0.5, 0.5, 0.0))  # the worktop
+    vol = ng.Volume()
+    for i, yaw in enumerate(range(0, 360, 45)):
+        T = rooms.camera(0.0, 0.0, 0.45, yaw, -35.0)
+        d = s.depth(T)
+        vol.integrate(f"a{i}", d, rooms.K640, T, d > 0)
+    assert vol.estimate_floor(0.45) == pytest.approx(-1.1, abs=0.02)
+    assert vol.estimate_floor(0.45, 0.02) == pytest.approx(0.0, abs=0.02)
+    assert vol.estimate_floor(0.45, 0.5) == 0.5  # no plane there: as named
+    base = ng.Volume()
+    scene = rooms.two_rooms()
+    for i, yaw in enumerate(range(0, 360, 60)):
+        T = rooms.camera(2.0, 2.0, 0.25, yaw, 0.0)
+        d = scene.depth(T)
+        base.integrate(f"b{i}", d, rooms.K640, T, d > 0)
+    assert base.estimate_floor(0.25) == pytest.approx(0.0, abs=0.01)
+    assert base.estimate_floor(0.25, 0.06) == pytest.approx(0.0, abs=0.01)
