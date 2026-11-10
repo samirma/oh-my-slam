@@ -157,7 +157,9 @@ seen there.
 **Parameters.**
 * `cell_m`: the cell size.
 * `z_min`, `z_max`: the height band in the map frame, relative to the floor estimate
-  `floor_z_m` (default 0.05–1.8 m).
+  `floor_z_m` (default 0.05–1.8 m). `floor_z_m` is the lowest large horizontal plane seen below
+  the cameras. For a robot that never sees the room floor, such as an arm on a worktop looking
+  down, that is the surface it works on.
 * Optional `footprint_radius_m`: the robot's radius.
 
 **Header.**
