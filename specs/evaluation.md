@@ -68,6 +68,9 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `locate.median_pos_error` | C8 | Median position error of located frames |
 | `locate.ambiguity_flagged` | C8 | Share of located frames whose pose error exceeds 0.10 m or 5° that carry a non-null `ambiguity` (a supported rival beyond 0.10 m or 5° is never silent, api.md §6) |
 | `locate.nearest_view` | C8 | Share of rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure |
+| `locate.sigma_containment` | C8 | Share of located frames whose position error ≤ 3 × `sigma_pos_m` and rotation error ≤ 3 × `sigma_rot_deg` |
+| `locate.sigma_tightness` | C8 | Information, no target: median over located frames of error / sigma (position and rotation reported separately); near 1 means sigmas neither over- nor under-confident |
+| `update.sigma_containment` | C1, C4 | Share of non-rejected update frames (registered and `kept_at_prior`, the latter against their prior's sigmas) whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
 | `scale.error_metric` | C2 | Scale error with `metric` priors |
 | `scale.error_camera_height` | C2 | Scale error with camera height only |
 | `frame.shift` | C1 | Map-frame shift of stored keyframes between consecutive versions, median position and rotation, beyond the stated `gauge_shift` |
@@ -129,6 +132,9 @@ these ids.
 | `locate.median_pos_error` | ≤ max(2 cm, 1 % of the scene depth) |
 | `locate.ambiguity_flagged` | ≥ 0.8 |
 | `locate.nearest_view` | ≥ 0.8 |
+| `locate.sigma_containment` | ≥ 0.99 |
+| `locate.sigma_tightness` | information only |
+| `update.sigma_containment` | ≥ 0.99 |
 | `scale.error_metric` | ≤ 3 % |
 | `scale.error_camera_height` | ≤ 10 % |
 | `frame.shift` | ≤ 2 cm and ≤ 0.5° |
