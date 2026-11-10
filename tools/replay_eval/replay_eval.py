@@ -74,6 +74,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=3, help="retries of a retryable error")
     p.add_argument("--retry-wait-s", type=float, default=2.0)
     p.add_argument("--align-min-spread-m", type=float, default=0.5)
+    p.add_argument("--align-full-rotation", action="store_true",
+                   help="fit a 3-D rotation from map to world instead of a yaw")
     return p.parse_args(argv)
 
 
@@ -216,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     caps = list(health["capabilities"])
     targets = load_targets(args.targets)
     params = Params(align_min_spread_m=args.align_min_spread_m,
+                    align_full_rotation=args.align_full_rotation,
                     probe_interval_s=args.probe_interval_s,
                     warping=tuple(w for w in args.warping.split(",") if w),
                     heights=not args.no_height,

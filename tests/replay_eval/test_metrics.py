@@ -277,3 +277,56 @@ def test_nearest_view_needs_a_prior_and_o3_jobs(world: Any) -> None:
     assert rm.missing_for(rm.BY_ID["c3.fusing_version_gap_s"], {"O3-jobs"}, None) == \
         "capability O3"
     assert rm.missing_for(rm.BY_ID["c3.eta_within_30pct"], {"O3-jobs"}, None) is None
+
+
+def test_floor_height_goes_through_the_alignment(world: Any) -> None:
+    """The floor's map z is compared after the map -> world similarity. Cameras at one height
+    along a line leave a 3-D rotation's roll free; the gravity-aligned (yaw) fit does not."""
+    ep, syn, _, _ = world
+    names = syn.names["r1/start"] + syn.names["r1/chain1"]
+    sim = Sim(1.05, 30.0, (1.0, 2.0, 0.3))  # world = 1.05 R map + t
+    fr = rows(ep, names, sim)
+    for k, r in enumerate(fr):  # registration noise: 2 cm sideways and up together
+        T = np.array(r["T_map_cam"])
+        T[1, 3] += 0.02 if k % 2 else -0.02
+        T[2, 3] += 0.02 if k % 2 else -0.02
+        r["T_map_cam"] = T.tolist()
+    rec = record(["O6"], frames={1: {"frames": fr}})
+    rec.jobs = [job(names)]
+    floor_map = float(sim.to_map([0.0, 0.0, 0.0])[2])  # the true floor in the map frame
+    rec.grid = grid(np.ones((4, 4)), (-1.0, -1.0), floor_z_m=floor_map)
+    yaw = measure(rec, ep)
+    assert yaw.values["c9.floor_height_error_m"][0] < 0.02
+    assert yaw.info["floor_reference_m"] == 0.0
+    full = measure(rec, ep, align_full_rotation=True)
+    assert full.values["c9.floor_height_error_m"][0] > 0.1  # the roll tips the floor
+
+
+def test_camera_cells_use_map_poses_and_rows_y(world: Any) -> None:
+    """A grid that is free only under the cameras, in a map frame that is not the world's, on a
+    non-square grid with a non-zero origin: right only with map-frame poses, rows = y, cols = x
+    and origin_m as the corner of cell [0, 0]."""
+    ep, syn, _, _ = world
+    names = syn.names["r1/start"][:2]
+    sim = Sim(1.05, 30.0, (1.0, 2.0, 0.0))
+    fr = rows(ep, names, sim)
+    for r in fr:  # looking up: no blind ring, only the stand cell is required free
+        T = np.array(r["T_map_cam"])
+        T[:3, :3] = T[:3, :3] @ np.diag([1.0, -1.0, -1.0])
+        r["T_map_cam"] = T.tolist()
+    origin, cell, shape = (-3.0, -2.5), 0.1, (40, 70)  # rows (y) x cols (x)
+    state = np.full(shape, 2, np.uint8)
+    for r in fr:
+        x, y = r["T_map_cam"][0][3], r["T_map_cam"][1][3]
+        state[math.floor((y - origin[1]) / cell), math.floor((x - origin[0]) / cell)] = 1
+    rec = record(["O6"], frames={1: {"frames": fr}})
+    rec.grid = grid(state, origin, cell)
+    s = measure(rec, ep)
+    assert s.values["c9.camera_cells_free"] == [1.0, 1.0]
+    assert s.values["c9.camera_stand_free"] == [1.0, 1.0]
+    # the same cameras with world poses, or the grid read as rows = x, would miss
+    rec.frames = {1: {"frames": rows(ep, names)}}
+    assert measure(rec, ep).values["c9.camera_stand_free"] == [0.0, 0.0]
+    rec.frames = {1: {"frames": fr}}
+    rec.grid = grid(np.ascontiguousarray(state.T), (origin[1], origin[0]), cell)
+    assert 1.0 not in measure(rec, ep).values.get("c9.camera_stand_free", [])

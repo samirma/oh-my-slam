@@ -191,17 +191,23 @@ with its target. The overall value pools the samples of all replays. Statuses ar
 | O2 | `c5.revert_s` (≤ 2 s); `c5.revert_contract` |
 | O3 | `c3.eta_within_30pct` (job `eta_s`, and dry-run `predicted_s` when O10 is served; also measured with `O3-jobs`); `c3.fusing_version_gap_s` (≤ 10 s when fusion lasts longer) |
 | O5 | `c8.located_near_keyframe` (≥ 0.9); `c8.pos_error_over_tolerance` (median ≤ 1, where the tolerance is max(2 cm, 1 % of the scene depth)); `c8.pos_error_m` (info); `c8.ambiguity_on_wrong` (≥ 0.8); `c8.ambiguity_null_on_right` (≥ 0.9); `c8.ambiguity_rule` (api.md §6); `c8.nearest_view_turn` (≥ 0.8; only `no_overlap` frames sent with a prior, i.e. in the prior replay, since `turn_deg` is null without one; a null turn then counts as a miss); `c12.locate_idle_s` (≤ 2 s, per frame of each idle request: the one-frame probes and the replay's locates); `c12.locate_first_s` (info: the first idle locate per frame, the warm-up); `c12.locate_busy_s` (≤ 3 s); `c12.locate_busy_ratio` (≤ 2) |
-| O6 | `c9.camera_cells_free`; `c9.regions_set`; `c9.band_as_asked`; `c9.floor_height_error_m` (≤ 2 cm, against the lowest large support plane in view: `hello.floor_z`, or `hello.worktop.z` for an arm, `Params.worktop_kinds`); `c9.grid_read_s` (≤ 0.5 s). With a floor plan: `c9.grid_agreement` (≥ 0.9); `c9.doors_found` (≥ 0.8); `c9.passage_geometry` (≥ 0.8); `c9.floor_observed` (≥ 0.9; cells with `floor_observed` 2, free by rule, are left out); `c9.band_occupied` (≥ 0.95) |
+| O6 | `c9.camera_cells_free`, with `c9.camera_stand_free` (info: the camera cells alone, to tell a missing stand from a missing blind ring). Both index the grid by `origin_m` (the corner of cell [0, 0]), rows = y and cols = x, with the cameras' map-frame poses from `GET frames` of the grid's version; `c9.regions_set`; `c9.band_as_asked`; `c9.floor_height_error_m` (≤ 2 cm, against the lowest large support plane in view: `hello.floor_z`, or `hello.worktop.z` for an arm, `Params.worktop_kinds`); `c9.grid_read_s` (≤ 0.5 s). With a floor plan: `c9.grid_agreement` (≥ 0.9); `c9.doors_found` (≥ 0.8); `c9.passage_geometry` (≥ 0.8); `c9.floor_observed` (≥ 0.9; cells with `floor_observed` 2, free by rule, are left out); `c9.band_occupied` (≥ 0.95) |
 | O7 | `c12.analyse_busy_s` (≤ 3 s); `c12.analyse_busy_ratio` (≤ 2); with a floor plan, `c11.range_rel_error` (median ≤ 5 %) |
 | O8 | `c10.objects_read_s` (≤ 0.5 s); `c10.centre_error_m`; `c10.label_agreement`; `c10.id_stability`; `c10.support_height_error_m` (≤ 2 cm); `c10.relations_agreement` (≥ 0.9) |
 | O9 | `c6.warping_rejected` (every `--warping` episode has an update rejected by the gate); `c6.other_updates_accepted` (≥ 0.9: the updates of the passing episodes, warping episodes excluded since their warping update is not identified, accepted at the same thresholds) |
 
 The truth-derived checks have these thresholds (`Params` in `rpl_metrics.py`):
 
-* **Alignment.** Umeyama fit of the keyframe camera positions against the truth positions, on
-  the first version whose truth positions span 0.5 m (`--align-min-spread-m`). The map frame is
-  fixed by the first update, so a later version is in the same frame. Nearly collinear
-  positions get a yaw-only fit, since both frames are z-up.
+* **Alignment.** A similarity fit (scale, yaw, translation) of the keyframe camera positions
+  against the truth positions, on the first version whose truth positions span 0.5 m
+  (`--align-min-spread-m`). The map frame is fixed by the first update, so a later version is in
+  the same frame.
+  * Both frames are gravity-aligned with z up, so the rotation is a yaw only and a map z maps as
+    z' = s·z + t_z. A full 3-D rotation (`--align-full-rotation`) leaves the roll free for
+    cameras at one height along a line. That roll moves every point below the cameras, such as
+    the floor, by up to twice their height.
+  * `floor_z_m` and every grid cell go through this same similarity as the camera positions.
+    The result info records `floor_z_world_m` and `floor_reference_m`.
 * **C4 truth reasons.**
   * `too_close`: the floor-plan wall along the heading is under 0.35 m away.
   * `plain`: all 9 rays across the horizontal field of view hit walls under 1.5 m away, and no

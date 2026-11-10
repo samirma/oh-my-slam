@@ -108,6 +108,8 @@ DEFS: list[Def] = [
         "floor", ">=", 0.9, "share", "share", ("O6",), True),
     Def("c9.camera_cells_free", "C9", "Keyframe camera cells and their near blind ring free",
         ">=", 1.0, "share", "share", ("O6",)),
+    Def("c9.camera_stand_free", "C9", "Keyframe camera cells alone free (diagnoses "
+        "c9.camera_cells_free: stand vs blind ring)", None, None, "share", "share", ("O6",)),
     Def("c9.regions_set", "C9", "Frontiers bordering a region, and objects in or on one, with "
         "region set", ">=", 1.0, "share", "share", ("O6",)),
     Def("c9.band_occupied", "C9", "Observed wall cells (obstacles across the band) marked "
@@ -159,6 +161,7 @@ class Params:
     """Thresholds of the truth-derived checks (README "Metrics")."""
 
     align_min_spread_m: float = 0.5
+    align_full_rotation: bool = False  # a 3-D rotation instead of a yaw (see alignment)
     match_m: float = 1.0
     too_close_m: float = 0.35
     plain_m: float = 1.5
@@ -219,11 +222,16 @@ def frame_pose(r: dict[str, Any]) -> Arr:
     return mat4(r["T_map_cam"])
 
 
-def alignment(rec: Record, by_name: dict[str, Frame],
-              min_spread: float) -> tuple[Sim3, int, float] | None:
+def alignment(rec: Record, by_name: dict[str, Frame], min_spread: float,
+              full_rotation: bool = False) -> tuple[Sim3, int, float] | None:
     """The map -> world similarity fitted on the keyframes of the first version whose truth
     camera positions span ``min_spread`` (the map frame is fixed by the first update, map.md §1,
-    so every later version is in that frame)."""
+    so every later version is in that frame).
+
+    Both frames are gravity-aligned with z up, so the rotation is a yaw (scale, yaw and
+    translation: z' = s z + t_z). A full 3-D rotation (``full_rotation``) is ill-posed for camera
+    positions at one height along a line: its roll about that line is free, which moves every
+    point below the cameras, such as the floor, by up to twice their height."""
     for job in rec.jobs:
         for key in ("provisional_version", "result_version"):
             v = job.job.get(key)
@@ -238,7 +246,7 @@ def alignment(rec: Record, by_name: dict[str, Frame],
             if np.linalg.norm(dst.max(axis=0) - dst.min(axis=0)) < min_spread:
                 continue
             try:
-                sim, rms = umeyama(src, dst)
+                sim, rms = umeyama(src, dst, min_ratio=1e-3 if full_rotation else math.inf)
             except ValueError:
                 continue
             return sim, int(v), rms
@@ -321,7 +329,8 @@ class Measure:
         self.s = Samples()
         self.by_name = {f.name: f for f in ep.all_frames()}
         self.caps = set(rec.capabilities)
-        self.al = alignment(rec, self.by_name, params.align_min_spread_m)
+        self.al = alignment(rec, self.by_name, params.align_min_spread_m,
+                            params.align_full_rotation)
         latest = max(rec.frames) if rec.frames else None
         self.keyframes = [r for r in rec.frames[latest]["frames"] if r["name"] in self.by_name] \
             if latest is not None else []
@@ -566,7 +575,9 @@ class Measure:
             c, rr = math.floor((p[0] - ox) / cell), math.floor((p[1] - oy) / cell)
             if not (0 <= c < cols and 0 <= rr < rows):
                 s.add("c9.camera_cells_free", False)
+                s.add("c9.camera_stand_free", False)
                 continue
+            s.add("c9.camera_stand_free", bool(state[rr, c] == 1))
             disc = np.hypot(gx - p[0], gy - p[1]) <= max(0.0, radius - cell)
             if cls is not None:  # floor-plan walls stay occupied
                 disc &= ~np.isin(cls.reshape(rows, cols), (WALL, BORDER, OUTSIDE))
@@ -588,8 +599,11 @@ class Measure:
         ref = self.floor_reference()
         if ref is not None and frames["frames"]:
             mean = np.mean([frame_pose(r)[:2, 3] for r in frames["frames"]], axis=0)
+            # floor_z_m is a map-frame z: through the same similarity as the cameras
             s.add("c9.floor_height_error_m",
                   abs(float(sim.point([mean[0], mean[1], fz])[2]) - ref))
+            s.info["floor_z_world_m"] = float(sim.point([mean[0], mean[1], fz])[2])
+            s.info["floor_reference_m"] = ref
         if W is None or cls is None or self.plan is None:
             return
         st, ob, fo = state.ravel(), obs.ravel(), floor_obs.ravel()
