@@ -7,7 +7,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 
 * **When the frame is fixed.** The map frame is fixed by the first committed update and never
   changes afterwards. No re-gauging.
-* **With priors** (`metric` or `drifting` on at least one frame of the first update):
+* **With priors** (`metric` or `drifting` on at least one frame of the first update). This is
+  the normal case: on a cold start every robot, camera-only included, sends its first frames with
+  `metric` priors, with the start pose on the floor as origin. Frames after walking without
+  odometry come as `drifting` or `none`.
   * the map frame is the priors' frame;
   * the priors must be gravity-aligned with z up;
   * the first update reports the angle between the priors' up axis and the gravity it
@@ -99,6 +102,7 @@ becomes a job with a `job_id`. A job goes through these states:
   max_rejected_share}` is evaluated on the registration phase's report, before anything is
   committed.
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
+  * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
     that would make the map inconsistent, for example a frame set that registers to nothing.
 
@@ -158,13 +162,14 @@ seen there.
 
 **Header.**
 * `map_version`, `origin_m` (the corner of cell [0, 0]), `cell_m`, `shape [rows (y), cols (x)]`,
-  `z_band_m` and `floor_z_m`;
+  `z_band_m` and `floor_z_m`. `z_band_m` is relative to `floor_z_m`, as the request's `z_min`
+  and `z_max` are. `floor_z_m` is the floor's absolute map-frame z;
 * `scale_source` and `scale_sigma_rel`.
 
 **Layers.** Each layer is a little-endian array, base64, row-major:
 * `state`: uint8, 0 unknown, 1 free, 2 occupied;
 * `observations`: uint16, the number of frames that observed the cell;
-* `height_m`: float32, the highest surface in the cell, NaN if none;
+* `height_m`: float32, the highest surface in the cell relative to `floor_z_m`, NaN if none;
 * `floor_observed`: uint8, 1 when a floor surface was observed in the cell at the floor height.
   A cell that is free but whose floor was not observed means the camera saw through it above a
   floor nobody saw: there may be a low obstacle or a step, so the planner looks first.

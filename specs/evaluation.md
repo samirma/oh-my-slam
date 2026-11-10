@@ -69,7 +69,8 @@ transform, not re-fitted per read.
 | C3 | Reads during an update answered from one version | 100 % |
 | C4 | Rejected inputs whose `reason` agrees with the truth (bare wall, too close, no overlap) | ≥ 0.8 |
 | C5 | Revert latency | ≤ 2 s |
-| C6 | Episodes' warping updates (e034, e040) rejected by `accept_if` at the default thresholds | All |
+| C6 | Episodes' warping updates (e034, e040) rejected by `accept_if {max_residual_m: 0.10, max_gauge_shift_m: 0.05, max_rejected_share: 0.5}` (the thresholds the skill sends) | All |
+| C6 | The other updates of the passing episodes accepted at those thresholds | ≥ 0.9 |
 | C9 | Grid cells agreeing with the floor plan (free inside rooms, occupied at walls), among observed cells | ≥ 0.9 |
 | C9 | Doors of the floor plan found as passages within 0.3 m | ≥ 0.8 |
 | C9 | Passage `centre_m` within 0.10 m of the floor plan's door-gap centre, and `width_m` within 0.10 m of its free width | ≥ 0.8 of found doors |
