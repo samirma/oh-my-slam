@@ -81,10 +81,8 @@ CANDIDATE_DIST_UNIT_M = 0.5  # candidate score = distance / unit + angle / unit
 CANDIDATE_ANGLE_UNIT_DEG = 30.0
 RECENT_CANDIDATES = 8  # without prior or descriptor: the most recent keyframes
 RECENT_GUIDED = 3  # without prior: candidates near the last confirmed keyframe added
-NO_PRIOR_GUIDE_POS_M = 0.3  # ... whose pose guides the matching with these sigmas
-NO_PRIOR_GUIDE_ROT_DEG = 20.0
-NO_PRIOR_MIN_INLIERS = 30  # a frame without prior is registered on this many inliers...
-NO_PRIOR_MIN_RATIO = 0.25  # ... and this share of its matches
+NO_PRIOR_MIN_INLIERS = 15  # a frame without prior is registered on this many inliers...
+NO_PRIOR_MIN_RATIO = 0.15  # ... and this share of its matches
 ROTATION_FALLBACK_M = 0.20  # PnP failed: rotation-only still tried up to this distance
 ROTATION_FALLBACK_REL = 0.25  # ... or this share of the keyframe's median depth
 REPROJ_PX = 3.0  # inlier threshold at 640 px width, scaled with the image width
@@ -1173,19 +1171,17 @@ class AnchoredMap:
         pred = self._predict(f)
         T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         cands = self._candidates(f, T0, descriptor)
-        guide = pred
         if pred is None:
-            # without a prior, a camera-only robot is near its last confirmed frame: that pose
-            # (loose sigmas) guides the matching and adds its neighbours to the candidates
-            # (the origin is always confirmed)
+            # without a prior, a camera-only robot is near its last confirmed frame: the
+            # keyframes near that pose join the candidates (the origin is always confirmed). Its
+            # pose does not guide the matching: a guess that loose matches anything.
             last = next(k for k in reversed(self.keyframes) if k.state == "fused")
-            guide = (last.T, NO_PRIOR_GUIDE_POS_M, NO_PRIOR_GUIDE_ROT_DEG)
             near = self._candidates(f, last.T, None)
             cands = cands + [k for k in near if all(k is not c for c in cands)]
             cands = cands[:MAX_CANDIDATES + RECENT_GUIDED]
         reason = "few_features" if min(f.features_count or len(feats.kps), len(feats.kps)) \
             < 150 else "no_overlap"
-        corr = self._correspondences(feats, cands, guide, f.K) if cands and len(feats.kps) \
+        corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) \
             else None
         init = None
         if corr is not None and len(corr.uv) >= MIN_INLIERS:
