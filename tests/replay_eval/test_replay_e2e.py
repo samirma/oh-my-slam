@@ -54,7 +54,12 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     with Fake(cfg) as fake:
         res = run(fake, root, tmp_path / "out" / "r.json", "--house",
                   str(tmp_path / "house.json"), "--episode", "e041")
+        assert fake.accept_ifs and all(a == {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05,
+                                             "max_rejected_share": 0.5}
+                                       for a in fake.accept_ifs)
     ov = res["overall"]
+    assert ov["c6.other_updates_accepted"]["value"] == 1.0
+    assert res["episodes"]["e041"]["passed"] is True
     assert res["health"]["start"]["capabilities"] == ALL_CAPS
     assert res["client"]["jsonschema"] is True
     e = res["episodes"]["e041"]
@@ -76,8 +81,10 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     assert ov["c9.grid_agreement"]["value"] > 0.95
     assert ov["c9.floor_height_error_m"]["value"] == pytest.approx(0.0, abs=1e-9)
     assert "c6.warping_rejected" not in ov  # not a warping episode
-    assert all(m["status"] != "fail" for m in ov.values()), \
-        {k: m for k, m in ov.items() if m["status"] == "fail"}
+    # latencies of the fake (milliseconds, noisy ratios) are not judged here
+    fails = {k: m for k, m in ov.items() if m["status"] == "fail" and m["unit"] != "s"
+             and not k.endswith("_busy_ratio")}
+    assert not fails, fails
     run_m = e["runs"]["metric"]
     assert run_m["info"]["alignment"]["scale"] == pytest.approx(1.0)
     assert run_m["jobs"][0]["state"] == "committed"
@@ -92,10 +99,12 @@ def test_capabilities_missing_and_gate(base_episode: tuple[Path, synth.Synth],
                       gate_reject={name(syn, "r1/chain1", 0)}, no_server_timing=True)
     with Fake(cfg) as fake:
         res = run(fake, root, tmp_path / "r.json", "--priors", "metric", "--keep",
-                  "--no-jsonschema")
+                  "--no-jsonschema", "--accept-if", "{}", "--passing", "e034")
         assert any(m == "DELETE" for m, _ in fake.requests)
+        assert fake.accept_ifs and all(a == {} for a in fake.accept_ifs)
     ov = res["overall"]
     assert ov["c6.warping_rejected"]["value"] == 1.0
+    assert "c6.other_updates_accepted" not in ov  # a warping episode
     assert ov["c8.located_near_keyframe"] == {**ov["c8.located_near_keyframe"],
                                              "status": "not_measurable",
                                              "missing": "capability O5"}

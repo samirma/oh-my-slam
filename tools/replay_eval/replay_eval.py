@@ -27,7 +27,7 @@ from rpl_episode import Episode, dump_layout, load_episode
 from rpl_floorplan import FloorPlan, Raster, load_house, rasterise
 from rpl_layout import LayoutError, load_layout
 from rpl_metrics import Measure, Params, Samples, overall, run_metrics
-from rpl_replay import Options, Record, Replayer
+from rpl_replay import GATE, Options, Record, Replayer
 from rpl_validate import DEFAULT_SCHEMA, Validator
 
 MODES = ("metric", "none")
@@ -54,8 +54,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     p.add_argument("--no-jsonschema", action="store_true",
                    help="minimal required-keys validation even if jsonschema is installed")
-    p.add_argument("--accept-if", default="{}", help="accept_if JSON sent when O9 is served")
+    p.add_argument("--accept-if", default=json.dumps(GATE),
+                   help="accept_if JSON sent with every update when O9 is served (default: the "
+                   "skill's thresholds; {} checks nothing)")
     p.add_argument("--warping", default="e034,e040", help="episodes with a warping update (C6)")
+    p.add_argument("--passing", help="comma-separated passing episodes (C6); default: each "
+                   "episode's verdict.md")
     p.add_argument("--wait-s", type=float, default=10.0)
     p.add_argument("--probe-interval-s", type=float, default=0.5)
     p.add_argument("--no-probes", action="store_true", help="no reads while a job runs")
@@ -211,7 +215,9 @@ def main(argv: list[str] | None = None) -> int:
     params = Params(align_min_spread_m=args.align_min_spread_m,
                     probe_interval_s=args.probe_interval_s,
                     warping=tuple(w for w in args.warping.split(",") if w),
-                    heights=not args.no_height)
+                    heights=not args.no_height,
+                    passing=None if args.passing is None
+                    else tuple(e for e in args.passing.split(",") if e))
     options = Options(wait_s=args.wait_s, probe_interval_s=args.probe_interval_s,
                       probes=not args.no_probes, heights=not args.no_height, keep=args.keep,
                       accept_if=json.loads(args.accept_if), range_scans=args.range_scans,
@@ -231,7 +237,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         raster = rasterise(plan) if plan is not None and plan.has_rooms else None
         entry: dict[str, Any] = {
-            "robot": ep.robot, "kind": ep.kind, "scene": ep.scene, "floor_plan": plan is not None,
+            "robot": ep.robot, "kind": ep.kind, "scene": ep.scene, "passed": ep.passed,
+            "floor_plan": plan is not None,
             "frames": len(ep.all_frames()), "events": len(ep.events),
             "warnings": (ep.warnings + warnings)[:100], "runs": {}}
         for mode in modes_for(ep, args.priors, layout):

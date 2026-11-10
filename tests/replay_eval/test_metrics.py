@@ -221,3 +221,14 @@ def test_verdicts_and_overall() -> None:
     assert rm.overall([(smp, {"c3.readable_s": na})], {})["c3.readable_s"]["status"] == \
         "not_measurable"
     assert rm.same_label("DiningTable", "table") and not rm.same_label("", "x")
+
+
+def test_other_updates_accepted(world: Any) -> None:
+    ep, syn, _, _ = world
+    names = syn.names["r1/start"]
+    failed = JobObs("x", names, 0.0, error="boom")  # never answered: no state
+    rec = record(["O9"])
+    rec.jobs = [job(names), job(names, state="rejected"), failed]
+    assert measure(rec, ep).values["c6.other_updates_accepted"] == [1.0, 0.0]
+    assert "c6.other_updates_accepted" not in measure(rec, ep, passing=("e999",)).values
+    assert measure(rec, ep, passing=("e041",)).values["c6.other_updates_accepted"] == [1.0, 0.0]

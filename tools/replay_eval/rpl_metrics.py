@@ -91,6 +91,8 @@ DEFS: list[Def] = [
         ("O2",)),
     Def("c6.warping_rejected", "C6", "Warping episodes with an update rejected by accept_if "
         "at the default thresholds", ">=", 1.0, "share", "share", ("O9",)),
+    Def("c6.other_updates_accepted", "C6", "Updates of the passing episodes accepted at the "
+        "skill's accept_if thresholds", ">=", 0.9, "share", "share", ("O9",)),
     Def("c9.grid_agreement", "C9", "Observed grid cells agreeing with the floor plan (free in "
         "rooms, occupied at walls)", ">=", 0.9, "share", "share", ("O6",), True),
     Def("c9.doors_found", "C9", "Observed doors of the floor plan found as passages within "
@@ -156,6 +158,7 @@ class Params:
     door_m: float = 0.3
     probe_interval_s: float = 0.5
     warping: tuple[str, ...] = ("e034", "e040")
+    passing: tuple[str, ...] | None = None  # None: from each episode's verdict.md
     heights: bool = True
 
 
@@ -314,6 +317,12 @@ class Measure:
             if latest is not None else []
         self.truth_objects = truth_objects
 
+    def passed(self) -> bool:
+        """A passing episode: named in --passing, else by its verdict.md."""
+        if self.p.passing is not None:
+            return self.ep.id in self.p.passing
+        return self.ep.passed is True
+
     def run(self) -> Samples:
         s = self.s
         if self.al is not None:
@@ -337,6 +346,10 @@ class Measure:
         if "O9" in self.caps and self.ep.id in self.p.warping:
             s.add("c6.warping_rejected", any(j.job.get("state") == "rejected"
                                              for j in self.rec.jobs))
+        elif "O9" in self.caps and self.passed():
+            for j in self.rec.jobs:
+                if j.job.get("state"):
+                    s.add("c6.other_updates_accepted", j.job["state"] != "rejected")
         if "O2" in self.caps:
             if self.rec.revert_s is not None:
                 s.add("c5.revert_s", self.rec.revert_s)
@@ -371,10 +384,10 @@ class Measure:
                     m = j.t_end - j.t_start
                     s.add("c3.eta_within_30pct", abs(total - m) <= 0.3 * m)
                 if j.t_fusing is not None and j.t_end - j.t_fusing > 10.0:
-                    v0 = max([v for t, v in self.rec.probe_versions if t <= j.t_fusing],
-                             default=-1)
+                    seen_at = sorted(self.rec.probe_versions + j.versions_seen)
+                    v0 = max([v for t, v in seen_at if t <= j.t_fusing], default=-1)
                     times, seen = [], v0
-                    for t, v in self.rec.probe_versions:
+                    for t, v in seen_at:
                         if j.t_fusing < t <= j.t_end and v > seen:
                             times.append(t)
                             seen = v
@@ -679,6 +692,8 @@ def applies(d: Def, mode: str, episode: str, params: Params) -> bool:
         return mode == "none"
     if d.id == "c6.warping_rejected":
         return episode in params.warping
+    if d.id == "c6.other_updates_accepted":
+        return episode not in params.warping
     return True
 
 

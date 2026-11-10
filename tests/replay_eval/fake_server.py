@@ -104,6 +104,7 @@ class Fake:
         self.lock = threading.RLock()
         self.requests: list[tuple[str, str]] = []
         self.revert_calls = 0
+        self.accept_ifs: list[Any] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -196,7 +197,9 @@ class Fake:
                            for i in job.inputs] if registered else None,
                 "quality": self.quality(job) if registered else None,
                 "scale_source": "priors", "scale_sigma_rel": 0.01,
-                "timings_s": {"registration": 0.05}, "error": None}
+                "timings_s": {"registration": 0.05}, "error": None,
+                "latest_version": job.result or job.provisional,
+                "ended_at": NOW if job.state in ("committed", "rejected", "cancelled") else None}
 
     # ---- answers ----------------------------------------------------------------------------
     def health(self) -> dict[str, Any]:
@@ -557,6 +560,7 @@ class Fake:
                                          "predicted_reason": i["reason"]} for i in inputs],
                              "quality": self.quality(job),
                              "predicted_s": {"registration": 0.07, "fusion": 0.12}}
+            self.accept_ifs.append(req.get("accept_if"))
             if name in self.maps:
                 self.maps[name].cameras.update(req.get("cameras", {}))
             job = Job(uuid.uuid4().hex[:8], name, [f["name"] for f in req["frames"]], inputs,

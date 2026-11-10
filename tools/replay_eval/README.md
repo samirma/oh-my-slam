@@ -39,8 +39,9 @@ python3 tools/replay_eval/replay_eval.py --server http://192.168.0.106:9091 \
 | `--dump-layout` | Prints what each episode folder holds, key by key, plus the result of loading it, then exits. |
 | `--layout FILE.json` | Overrides any key or convention of the layout table (`rpl_layout.py`, deep-merged), with no code change. |
 | `--targets FILE.json` | Overrides targets: `{metric id: {"op": "<=" or ">=", "value": x}}`, optionally under `"targets"`. |
-| `--accept-if JSON` | The `accept_if` sent with every update when O9 is served. The default is `{}`, meaning the service's default thresholds. |
+| `--accept-if JSON` | The `accept_if` sent with every update when O9 is served. The default is the skill's thresholds (`specs/evaluation.md`, C6): `{"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}`. `{}` checks nothing. |
 | `--warping e034,e040` | The episodes whose warping update the gate must reject (C6). |
+| `--passing e041,...` | The passing episodes whose updates the gate must accept (C6). Without it, each episode's `verdict.md` decides (see below). |
 | `--no-height` | No `height_above_floor_m` in the `none` replay; its scale is then reported as `c2.scale_error_monocular`. |
 | `--no-probes` | No reads while a job runs. This drops C3 one-version reads, the busy C12 latencies and the C3 fusing cadence. |
 | `--no-jsonschema` | Minimal required-keys validation, even if `jsonschema` is installed. |
@@ -64,7 +65,7 @@ The exit status is 0 when at least one replay was measured, and 1 otherwise.
    * `none` replay: `trust: none`. Floor robots also send `height_above_floor_m` = `pose[2][3]`
      of the `views.json` pose, with sigma 0.02 m.
    * With O10, a dry run (`?dry_run=1`) precedes each update, for `predicted_s`. With O9,
-     `accept_if` is sent.
+     every update carries `accept_if` (the skill's thresholds, or `--accept-if`).
 3. Each job is polled with `GET /api/jobs/{id}?wait_s=` until it ends. Meanwhile a second thread
    reads `GET frames` every `--probe-interval-s`, and also runs a one-frame locate (O5) and
    analyse (O7) on a keyframe of the previous version. After the job, every version a probe saw
@@ -129,6 +130,10 @@ key of `LAYOUT` in `rpl_layout.py`.
     positions are exact.
   * **Check.** `--dump-layout` prints `views_vs_truth_m`: the median distance between the views
     positions and the truth positions. A large value means one of these assumptions is wrong.
+* **`verdict.md`.** It is prose. An episode passed when the earliest of the pass words (`pass`,
+  `success`, `succeeded`) or fail words (`fail`, `abort`, `timeout`, `timed out`, `error`) in
+  it is a pass word (`verdict` in the layout). Neither found: not judged. `--dump-layout`
+  prints `verdict_passed`; `--passing` overrides it.
 * **House JSON.** Simulator world (x, y, z) = THOR (x, z, y).
   * Rooms: `floorPolygon`. Walls: `polygon`, or ids `wall|room|x0|z0|x1|z1`.
   * Doors: the `holePolygon` x range along `wall0` from its first point.
@@ -150,7 +155,7 @@ with its target. The overall value pools the samples of all replays. Statuses ar
 | O6 | `c9.camera_cells_free`; `c9.regions_set`; `c9.band_as_asked`; `c9.floor_height_error_m` (≤ 2 cm); `c9.grid_read_s` (≤ 0.5 s). With a floor plan: `c9.grid_agreement` (≥ 0.9); `c9.doors_found` (≥ 0.8); `c9.passage_geometry` (≥ 0.8); `c9.floor_observed` (≥ 0.9); `c9.band_occupied` (≥ 0.95) |
 | O7 | `c12.analyse_busy_s` (≤ 3 s); `c12.analyse_busy_ratio` (≤ 2); with a floor plan, `c11.range_rel_error` (median ≤ 5 %) |
 | O8 | `c10.objects_read_s` (≤ 0.5 s); `c10.centre_error_m`; `c10.label_agreement`; `c10.id_stability`; `c10.support_height_error_m` (≤ 2 cm); `c10.relations_agreement` (≥ 0.9) |
-| O9 | `c6.warping_rejected` (every `--warping` episode has an update rejected by the gate) |
+| O9 | `c6.warping_rejected` (every `--warping` episode has an update rejected by the gate); `c6.other_updates_accepted` (≥ 0.9: the updates of the passing episodes, warping episodes excluded since their warping update is not identified, accepted at the same thresholds) |
 
 The truth-derived checks have these thresholds (`Params` in `rpl_metrics.py`):
 
@@ -165,6 +170,8 @@ The truth-derived checks have these thresholds (`Params` in `rpl_metrics.py`):
   * `no_overlap`: no earlier frame of the replay lies within 1.5 m with its optical axis less
     than one horizontal field of view away.
   * Without a floor plan, only `no_overlap` is judged.
+* **C3 fusing cadence.** Versions are timed both from the probes' reads and from the job's
+  `latest_version` as polled.
 * **C8.**
   * Near a keyframe: within 0.3 m and 15° of another frame of the located version.
   * Scene depth: the median wall distance along the keyframes' headings, or their height above

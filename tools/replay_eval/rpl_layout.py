@@ -82,6 +82,9 @@ LAYOUT: dict[str, Any] = {
     "rotation_body": {},
     # EXIF FocalPlaneResolutionUnit when the tag is absent: the conductor writes px per mm
     "exif_default_unit": "mm",
+    # verdict.md is prose: an episode passed when the earliest of these words in it is a pass word
+    "verdict": {"file": "verdict.md", "pass_words": ["pass", "success", "succeeded"],
+                "fail_words": ["fail", "abort", "timeout", "timed out", "error"]},
     "prior_sigma_pos_m": 0.02,
     "prior_sigma_rot_deg": 1.0,
     "height_sigma_m": 0.02,

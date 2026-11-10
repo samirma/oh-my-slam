@@ -133,6 +133,7 @@ class Episode:
     objects_lines: list[dict[str, Any]]
     start_poses: dict[str, Arr]
     warnings: list[str]
+    passed: bool | None = None  # from verdict.md; None when it does not say
 
     def frames(self, event: Event) -> list[Frame]:
         fs = self.sets[event.set_key].frames
@@ -275,6 +276,18 @@ def _strings(obj: Any) -> list[str]:
     if isinstance(obj, list):
         return [s for v in obj for s in _strings(v)]
     return []
+
+
+def read_verdict(root: Path, layout: dict[str, Any]) -> bool | None:
+    """True/False when the earliest pass or fail word of verdict.md says so, else None."""
+    v = layout["verdict"]
+    path = root / v["file"]
+    if not path.is_file():
+        return None
+    text = path.read_text().lower()
+    hits = [(text.find(w), ok) for ok, key in ((True, "pass_words"), (False, "fail_words"))
+            for w in v[key] if w in text]
+    return min(hits)[1] if hits else None
 
 
 def classify(text: str, words: dict[str, Any]) -> str:
@@ -439,7 +452,7 @@ def load_episode(root: Path, layout: dict[str, Any]) -> Episode:
         meta=meta, sets=sets, events=read_events(root, sets, layout, warnings),
         cameras=cameras, track=read_track(lines, str(spec["camera"]), keys),
         objects_lines=[x for x in lines if x.get(keys["kind"]) == keys["kind_objects"]],
-        start_poses={}, warnings=warnings)
+        start_poses={}, warnings=warnings, passed=read_verdict(root, layout))
     assign_truth(ep, layout)
     return ep
 
@@ -501,6 +514,7 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
                            "first": [json.dumps(x)[:400] for x in reqs[:3]]}
     else:
         out["requests"] = f"missing {layout['files']['requests']}"
+    out["verdict_passed"] = read_verdict(root, layout)
     rc = root / "robot_control"
     out["robot_control"] = sorted(str(p.relative_to(rc)) for p in rc.rglob("*")) \
         if rc.is_dir() else []

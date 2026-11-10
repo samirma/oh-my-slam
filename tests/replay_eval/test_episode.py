@@ -210,3 +210,16 @@ def test_dump_layout_degraded(tmp_path: Path) -> None:
     assert "image_error" in by_set["r1/chain1"]
     assert "error" in d["load"]
     assert bad.exists()
+
+
+def test_verdicts(tmp_path: Path) -> None:
+    syn = synth.build(tmp_path)
+    v = syn.root / "verdict.md"
+    assert epi.read_verdict(syn.root, LAYOUT) is True
+    v.write_text("# Verdict\nThe run FAILED: it passed the door but timed out.\n")
+    assert epi.read_verdict(syn.root, LAYOUT) is False
+    v.write_text("unclear\n")
+    assert epi.read_verdict(syn.root, LAYOUT) is None
+    v.unlink()
+    assert epi.read_verdict(syn.root, LAYOUT) is None
+    assert epi.dump_layout(syn.root, LAYOUT)["verdict_passed"] is None

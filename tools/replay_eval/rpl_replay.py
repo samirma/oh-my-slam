@@ -16,6 +16,8 @@ from rpl_geometry import Arr, inv_T
 from rpl_images import mime
 
 TERMINAL = {"committed", "rejected", "cancelled", "failed"}
+# the gate the skill sends (specs/evaluation.md, C6); an empty accept_if checks nothing
+GATE = {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}
 MAP = "/api/maps/{name}"
 
 
@@ -26,7 +28,7 @@ class Options:
     probes: bool = True
     heights: bool = True
     keep: bool = False
-    accept_if: dict[str, Any] = field(default_factory=dict)  # sent when O9 is served
+    accept_if: dict[str, Any] = field(default_factory=lambda: dict(GATE))  # sent with O9
     grid_cell_m: float = 0.05
     z_band_m: tuple[float, float] = (0.05, 1.8)
     range_scans: int = 5
@@ -53,10 +55,13 @@ class JobObs:
     dry: dict[str, Any] | None = None
     dry_s: float | None = None
     error: str | None = None
+    versions_seen: list[tuple[float, int]] = field(default_factory=list)  # job latest_version
 
     def observe(self, t: float, job: dict[str, Any]) -> None:
         self.job = job
         self.states.append((t, str(job["state"])))
+        if job.get("latest_version") is not None:
+            self.versions_seen.append((t, int(job["latest_version"])))
         if self.t_fusing is None and job["state"] == "fusing":
             self.t_fusing = t
         if self.t_readable is None and (job.get("provisional_version") is not None
