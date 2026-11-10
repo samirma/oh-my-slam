@@ -1890,7 +1890,8 @@
               ],
               "properties": {
                 "name": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "A confirmed keyframe, never kept_at_prior."
                 },
                 "T_map_cam": {
                   "$ref": "#/$defs/Mat4"
@@ -1905,7 +1906,7 @@
               }
             }
           ],
-          "description": "For no_overlap rejections: the most similar keyframe, else null. kept_at_prior frames are never locate references."
+          "description": "For no_overlap rejections: the most similar keyframe, else null. Only confirmed keyframes qualify, never a kept_at_prior one."
         }
       }
     },
@@ -2382,7 +2383,14 @@
           "type": "boolean"
         },
         "details": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "field": {
+              "type": "string",
+              "description": "For invalid_request: the body field or query parameter at fault, e.g. \"version\" on GET pose."
+            }
+          },
+          "description": "Machine-readable context; internal names the failing stage."
         }
       }
     },

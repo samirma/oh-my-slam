@@ -63,7 +63,8 @@ Each other endpoint belongs to the group named in its section, or in map.md.
 
 Every `GET` under `/api/maps/{name}`, except `/pose`, accepts `?version=<n>` and names its
 version in `map_version`. `GET …/pose` takes no `?version`: the recorded pose lives outside the
-versions, and its `map_version` is the version it was located in (§6).
+versions, and its `map_version` is the version it was located in (§6). A `?version` sent to it
+answers 400 `invalid_request` with `details.field: "version"`.
 
 An unknown route answers HTTP 404 and a known route with another method HTTP 405, both with the
 error code `invalid_request` (§9).
@@ -170,7 +171,8 @@ The versions read, revert and `--keep-versions` are O2.
     The client then asks for a second frame.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
   service can estimate one, else null:
-  * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`;
+  * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`. Only
+    confirmed keyframes qualify, never a `kept_at_prior` one;
   * `turn_deg`: the signed turn from the frame's prior heading toward that keyframe's view.
     Positive is counter-clockwise. It is null when the frame carries no prior, because the
     frame's own heading in the map is then unknown.

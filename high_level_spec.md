@@ -126,7 +126,15 @@ defines it, and `/api/openapi.json` describes it.
 Every JSON body follows [specs/api.schema.json](specs/api.schema.json), a flat, documented JSON
 Schema (draft 2020-12). Each response names its schema version in `schema`. A change that
 removes or renames a field, or changes its meaning, raises the major version. The skill's client
-is written against this schema. OpenLABEL is no longer produced.
+is written against this schema.
+
+**Narrowings accepted in oms/2.2.** Three changes narrow what a response may hold, yet stay in
+minor 2.2, because the API has a single client, updated in step with it:
+1. passage `kind`: `narrow` is deprecated and no longer produced (a separate `narrow` flag
+   replaces it), and `door` requires a found leaf;
+2. locate's `reason` no longer includes `too_close`;
+3. health `lanes` may be a single `worker` lane instead of `interactive` and `bulk`.
+ OpenLABEL is no longer produced.
 
 ## 8. Concurrency and latency
 
@@ -140,9 +148,9 @@ is written against this schema. OpenLABEL is no longer produced.
   order.
 * **Disconnects.** A job continues when its client disconnects. Only a cancel request or a stop
   of the service ends it.
-* **Latency targets** (specs/evaluation.md):
-  * a frame is readable in a map version at most 2 s after its upload;
-  * fusion takes at most 3 s per new frame, for maps up to 500 keyframes.
+* **Latency targets** (specs/evaluation.md; thresholds in `examples/targets.json`):
+  * upload to frame readable in a map version: `update.readable_latency`;
+  * fusion per new frame, for maps up to 500 keyframes: `fusion.time_per_frame`.
 
 ## 9. Uncertainty
 

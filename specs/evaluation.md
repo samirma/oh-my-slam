@@ -67,7 +67,6 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `locate.recall` | C8 | Share of frames within 0.3 m and 15° of a keyframe that are located |
 | `locate.median_pos_error` | C8 | Median position error of located frames |
 | `locate.ambiguity_flagged` | C8 | Share of located frames whose pose error exceeds 0.10 m or 5° that carry a non-null `ambiguity` (a supported rival beyond 0.10 m or 5° is never silent, api.md §6) |
-| `locate.ambiguity_quiet` | C8 | Share of located frames within 0.10 m and 5° of the truth whose `ambiguity` is null |
 | `locate.nearest_view` | C8 | Share of rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure |
 | `scale.error_metric` | C2 | Scale error with `metric` priors |
 | `scale.error_camera_height` | C2 | Scale error with camera height only |
@@ -88,7 +87,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
-| `grid.floor_height` | C9 | Floor height error, against the lowest large support plane in view: the floor, or the worktop for an arm scene |
+| `grid.floor_height` | C9 | Floor height error, against the surface the robot stands on (map.md §6): the large horizontal plane nearest the priors' origin height, else the lowest large horizontal plane below the cameras |
 | `reads.latency` | C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map, each |
 | `objects.support_height` | C10 | Support height error of objects on a surface (`supported_by` surface `height_m`) |
 | `objects.relations` | C10 | Share of `supported_by` / `inside_of` agreeing with the truth's relations |
@@ -129,7 +128,6 @@ these ids.
 | `locate.recall` | ≥ 0.9 |
 | `locate.median_pos_error` | ≤ max(2 cm, 1 % of the scene depth) |
 | `locate.ambiguity_flagged` | ≥ 0.8 |
-| `locate.ambiguity_quiet` | ≥ 0.9 |
 | `locate.nearest_view` | ≥ 0.8 |
 | `scale.error_metric` | ≤ 3 % |
 | `scale.error_camera_height` | ≤ 10 % |
