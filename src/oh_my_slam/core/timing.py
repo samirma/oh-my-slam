@@ -28,7 +28,6 @@ of its update, whose stages split a job's time into registration and fusion
 
 from __future__ import annotations
 
-import json
 import os
 import resource
 import threading
@@ -36,10 +35,8 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import StrEnum
-from pathlib import Path
 from typing import Any
 
-ENV_PATH = "OH_MY_SLAM_TIMINGS"
 MEMORY_SAMPLE_S = 0.05  # resident-set sampling period while a collection is open
 
 
@@ -208,22 +205,6 @@ class Timings:
                                   for n, a, b in sorted(self.windows, key=lambda w: w[1])],
             }
 
-    def summary(self) -> str:
-        return summary_line(self.to_dict())
-
-
-def summary_line(d: dict[str, Any]) -> str:
-    """One stderr line: total, stages (largest first) and server compute per endpoint."""
-    stages = sorted(d["stages_s"].items(), key=lambda kv: -kv[1])
-    fields = [f"timings: total {d['total_s']:.1f} s"]
-    if stages:
-        fields.append(", ".join(f"{k} {v:.2f}" for k, v in stages))
-    if d["server"]:
-        fields.append("server compute: " + ", ".join(
-            f"{k} {v['count']}× {v['compute_s']:.2f}" for k, v in d["server"].items()))
-    fields.append(f"peak RSS {d['peak_rss_mb']['self']:.0f} MB")
-    return " | ".join(fields)
-
 
 _MAXRSS_UNIT = 1.0 if os.uname().sysname == "Darwin" else 1024.0  # ru_maxrss: bytes / KiB
 
@@ -310,15 +291,3 @@ def count(**values: Any) -> None:
         t.count(**values)
 
 
-def report(t: Timings | dict[str, Any], logger: Any, **extra: Any) -> dict[str, Any]:
-    """Log the summary line on stderr; write the full record to ``$OH_MY_SLAM_TIMINGS`` if set."""
-    record = {**extra, **(t.to_dict() if isinstance(t, Timings) else t)}
-    logger.info(summary_line(record))
-    target = os.environ.get(ENV_PATH)
-    if target:
-        path = Path(target)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(record, indent=1, default=float) + "\n")
-        tmp.replace(path)
-    return record

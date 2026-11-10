@@ -3,8 +3,6 @@ server request records, no-op outside a collection, the stderr summary and the J
 
 from __future__ import annotations
 
-import json
-import logging
 import subprocess
 import sys
 import threading
@@ -66,27 +64,6 @@ def test_parts_and_requests_from_threads() -> None:
     assert srv["wall_s"] == pytest.approx(8.0)
     assert d["counts"] == {"keyframes_sampled": 3}
     assert d["peak_rss_mb"]["self"] > 10
-
-
-def test_report_logs_one_line_and_writes_the_env_file(tmp_path: Path,
-                                                     monkeypatch: pytest.MonkeyPatch,
-                                                     caplog: pytest.LogCaptureFixture) -> None:
-    target = tmp_path / "sub" / "timings.json"
-    monkeypatch.setenv(timing.ENV_PATH, str(target))
-    with timing.collect() as t:
-        with timing.stage("inference"):
-            timing.record_request("/v1/segment", 0.3, 0.0, 0.25)
-    logger = logging.getLogger("test_timing")
-    with caplog.at_level(logging.INFO, logger="test_timing"):
-        rec = timing.report(t, logger, command="x")
-    line = caplog.records[-1].getMessage()
-    assert line.startswith("timings: total") and "inference" in line and "segment 1×" in line
-    data = json.loads(target.read_text())
-    assert data == json.loads(json.dumps(rec))
-    assert data["command"] == "x" and "inference" in data["stages_s"]
-    # a finished record (dict) can be reported too
-    monkeypatch.delenv(timing.ENV_PATH)
-    assert timing.report(rec, logger)["stages_s"] == rec["stages_s"]
 
 
 def test_peak_memory_per_stage_and_the_stage_windows() -> None:

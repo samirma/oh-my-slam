@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import shutil
 import subprocess
@@ -125,9 +126,13 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:
-    from oh_my_slam.core.log import json_payload_bytes
-
     atomic_write_bytes(path, json_payload_bytes(obj))
+
+
+def json_payload_bytes(obj: Any) -> bytes:
+    """Canonical JSON serialisation of every JSON file the package writes."""
+    return (json.dumps(obj, ensure_ascii=False, indent=None, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
 
 
 def atomic_save_npy(path: Path, array: np.ndarray[Any, Any]) -> None:
