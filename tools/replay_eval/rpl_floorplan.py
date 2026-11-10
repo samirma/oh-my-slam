@@ -210,12 +210,12 @@ def rasterise(plan: FloorPlan, cell: float = 0.05, wall_half_m: float = 0.075,
     classes = np.full(len(P), OUTSIDE, dtype=np.uint8)
     for poly in plan.rooms:
         classes[inside(P, poly)] = FLOOR
-    if plan.walls:
-        dist = np.min([seg_distance(P, a, b) for a, b in plan.walls], axis=0)
-        classes[(dist > wall_half_m) & (dist <= border_m) & (classes != OUTSIDE)] = BORDER
-        classes[dist <= wall_half_m] = WALL
     for door in plan.doors:
         classes[seg_distance(P, door.a, door.b) <= wall_half_m] = DOOR
+    if plan.walls:  # a solid wall wins over a door gap at the jambs
+        dist = np.min([seg_distance(P, a, b) for a, b in plan.walls], axis=0)
+        classes[(dist > wall_half_m) & (dist <= border_m) & (classes == FLOOR)] = BORDER
+        classes[dist <= wall_half_m] = WALL
     return Raster(lo, cell, classes.reshape(rows, cols))
 
 

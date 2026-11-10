@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from rpl_api import Log
 from rpl_episode import Episode, Frame
-from rpl_floorplan import DOOR, FLOOR, WALL, FloorPlan, Raster, TruthObject, poly_distance, ray_cast
+from rpl_floorplan import BORDER, DOOR, FLOOR, OUTSIDE, WALL, FloorPlan, Raster, TruthObject, poly_distance, ray_cast
 from rpl_geometry import Arr, Sim3, angle_deg, mat4, optical_yaw_deg, umeyama, wrap_deg
 from rpl_replay import Record
 
@@ -497,6 +497,14 @@ class Measure:
         cx = ox + (np.arange(cols) + 0.5) * cell
         cy = oy + (np.arange(rows) + 0.5) * cell
         gx, gy = np.meshgrid(cx, cy)
+        sim = self.al[0] if self.al is not None else None
+        floor_plan = self.plan is not None and self.raster is not None and self.plan.has_rooms
+        W = cls = None
+        if sim is not None and floor_plan:
+            assert self.raster is not None
+            P = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, fz)])
+            W = sim.points(P)[:, :2]
+            cls = self.raster.classify(W)
         for r in frames["frames"]:
             T = frame_pose(r)
             cam = self.ep.cameras.get(r["camera_id"])
@@ -511,6 +519,8 @@ class Measure:
                 s.add("c9.camera_cells_free", False)
                 continue
             disc = np.hypot(gx - p[0], gy - p[1]) <= max(0.0, radius - cell)
+            if cls is not None:  # floor-plan walls stay occupied
+                disc &= ~np.isin(cls.reshape(rows, cols), (WALL, BORDER, OUTSIDE))
             disc[rr, c] = True
             s.add("c9.camera_cells_free", bool((state[disc] == 1).all()))
         polys = [np.asarray(reg["polygon_m"], dtype=float) for reg in g["regions"]]
@@ -524,18 +534,14 @@ class Measure:
                 if o.get("state") != "struck" and any(
                         float(poly_distance(c2, poly)[0]) <= cell for poly in polys):
                     s.add("c9.regions_set", o["region"] is not None)
-        if self.al is None:
+        if sim is None:
             return
-        sim = self.al[0]
         if self.ep.floor_z is not None and frames["frames"]:
             mean = np.mean([frame_pose(r)[:2, 3] for r in frames["frames"]], axis=0)
             s.add("c9.floor_height_error_m",
                   abs(float(sim.point([mean[0], mean[1], fz])[2]) - self.ep.floor_z))
-        if self.plan is None or self.raster is None or not self.plan.has_rooms:
+        if W is None or cls is None or self.plan is None:
             return
-        P = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, fz)])
-        W = sim.points(P)[:, :2]
-        cls = self.raster.classify(W)
         st, ob, fo = state.ravel(), obs.ravel(), floor_obs.ravel()
         floorish = (cls == FLOOR) | (cls == DOOR)
         seen = st != 0
