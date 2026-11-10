@@ -100,6 +100,10 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
   | `prior_residual_m`, `prior_residual_deg` | The residual to its prior; null without a prior. |
 
+  **Pose sigmas are a lower bound** until O5 calibrates them against replay truth: until then
+  `sigma_pos_m` and `sigma_rot_deg`, here and in [`Frames`], come from the registration's noise
+  and the anchoring's residual, not from a pose covariance, and the true error can be larger.
+
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It runs
   on the interactive lane. Per frame it gives:
