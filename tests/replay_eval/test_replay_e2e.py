@@ -70,6 +70,16 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     assert ov["c6.other_updates_accepted"]["value"] == 1.0
     assert ov["c1.prior_residual_m"]["status"] == "info"
     assert ov["c12.locate_first_s"]["status"] == "info"
+    # the per-object section: map labels "cup" and "dining table" agree with Mug and DiningTable
+    objs = res["episodes"]["e041"]["runs"]["metric"]["info"]["objects"]
+    rows = {r["name"]: r for r in objs["truth"]}
+    mug = rows["Mug|1|2"]
+    assert mug["matched"]["label"] == "cup" and mug["label_agreed"] is True
+    assert mug["canonical"] == "cup" and mug["centre_error_m"] == pytest.approx(0, abs=1e-6)
+    assert rows["DiningTable|1|1"]["label_agreed"] is True
+    assert [u["label"] for u in objs["unmatched_map"]] == ["Chair"]
+    assert res["label_rule"]["examples"]["Apple_1"] == "apple"
+    assert ov["c10.label_agreement"]["value"] == 1.0
     # nearest_view turns are judged only in the prior replay: turn_deg is null without a prior
     runs = res["episodes"]["e041"]["runs"]
     assert runs["metric"]["metrics"]["c8.nearest_view_turn"]["value"] == 1.0
@@ -247,3 +257,26 @@ def test_script_entry_point(base_episode: tuple[Path, synth.Synth],
         runpy.run_path(str(Path(replay_eval.__file__)), run_name="__main__")
     assert e.value.code == 0
     assert np.isfinite(len(capsys.readouterr().out))
+
+
+def test_arm_floor_like_e044(tmp_path: Path) -> None:
+    """e044's shape: the hello block at meta.sim.hello, placement "worktop", the arm's map frame
+    at its base link at worktop height. A floor_z_m on the worktop (about 0 in the map) is right;
+    one on the room floor (about -1.1 in the map) is a 1.1 m error, and the info shows which."""
+    root = tmp_path / "eps"
+    sets = [synth.SetSpec("r1", "pp", [(0, 0, 0), (0.3, 0, 10), (0.6, 0.3, 20)])]
+    arm = synth.build(root, "e044", "rebot_b601_rs", sets=sets, scene="ithor:1",
+                      objects_lines=True)
+    meta = json.loads((arm.root / "truth.jsonl").read_text().splitlines()[0])
+    assert sorted(meta) == ["cameras", "kind", "objects", "placement", "robot", "robot_row",
+                            "sim", "t", "t0"]
+    worktop = synth.WORKTOP_Z["arm"]
+    anchor = Sim(1.0, 0.0, tuple(arm.start["r1"][:3, 3]))  # the base link, at worktop height
+    for floor_world, want in ((worktop, 0.0), (0.0, worktop)):
+        cfg = Config(truth=arm.truth, metric_sim=anchor, floor_world_z=floor_world)
+        with Fake(cfg) as fake:
+            res = run(fake, root, tmp_path / f"r{floor_world}.json")
+        r = res["episodes"]["e044"]["runs"]["metric"]
+        assert r["metrics"]["c9.floor_height_error_m"]["value"] == pytest.approx(want, abs=1e-6)
+        assert r["info"]["floor_reference_m"] == pytest.approx(worktop)
+        assert r["info"]["floor_z_world_m"] == pytest.approx(floor_world, abs=1e-6)

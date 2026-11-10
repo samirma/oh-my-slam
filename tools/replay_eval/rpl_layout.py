@@ -125,6 +125,17 @@ LAYOUT: dict[str, Any] = {
     "height_sigma_m": 0.02,
     # scenes without a floor plan (no room polygons): objects come from truth.jsonl
     "no_floorplan_scene_prefixes": ["ithor"],
+    # how truth object names are compared with map labels (rpl_labels.py): synonym groups (the
+    # first word is canonical) and whether one label ending with the other agrees
+    "labels": {"synonyms": [["cup", "mug"], ["sofa", "couch"],
+                            ["television", "tv", "tvmonitor"], ["refrigerator", "fridge"],
+                            ["garbagecan", "trashcan", "bin", "wastebin", "dustbin"],
+                            ["cellphone", "phone", "mobilephone", "smartphone"],
+                            ["laptop", "notebook"], ["pottedplant", "houseplant", "plant"],
+                            ["remotecontrol", "remote"], ["sink", "sinkbasin"],
+                            ["bathtub", "tub", "bathtubbasin"],
+                            ["bed", "mattress"]],
+               "suffix_match": True},
     # THOR object types whose children are inside them rather than on them
     "container_types": ["Box", "Bowl", "Cup", "Mug", "Pot", "Pan", "Drawer", "Cabinet", "Fridge",
                         "Microwave", "Safe", "GarbageCan", "Sink", "SinkBasin", "Bathtub",

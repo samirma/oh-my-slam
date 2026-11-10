@@ -205,7 +205,9 @@ class Episode:
             if self.worktop_z is not None and 0.0 <= pos[2] - self.worktop_z <= 0.3:
                 support = self.worktop_z
             label = re.sub(r"[\d_\-.]+$", "", name) or name
-            out.append(TruthObject(name, label, pos, support_z=support))
+            size = body.get("size")
+            out.append(TruthObject(name, label, pos, support_z=support,
+                                   size=None if size is None else np.asarray(size, dtype=float)))
         return out
 
 

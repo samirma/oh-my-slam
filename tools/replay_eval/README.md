@@ -241,7 +241,28 @@ The truth-derived checks have these thresholds (`Params` in `rpl_metrics.py`):
   * The blind ring has the radius at which the image's bottom edge meets the floor. Floor-plan
     walls inside it may stay occupied.
 * **C10.** Objects are matched to the nearest truth object within 1 m, of the same label for
-  the centre error. The support height is judged against the worktop (arm) or the floor
+  the centre error.
+  * **Labels** (`rpl_labels.py`, synonyms in the layout's `labels`). Both names are normalised:
+    * keep the part before `|`;
+    * split camelCase, lower-case;
+    * strip a trailing instance number (`Apple_1` → `apple`);
+    * keep letters only;
+    * singularise.
+
+    Synonyms (mug ~ cup, couch ~ sofa, tv ~ television, …) then map to one canonical word. Two
+    labels agree when equal, or when one ends with the other (`coffeetable` ~ `table`). The
+    rule and examples are written to the result as `label_rule`.
+  * **Per-object section** (`runs.<mode>.info.objects`, no images or paths).
+    * `truth[]`, one row per truth object:
+      * its name, label, canonical label, world centre and size (when the truth has one);
+      * the matched map object: the same label within 1 m, else the nearest within 1 m. Its
+        id, label, canonical label, `detected_as`, world centre after alignment, size,
+        `mean_rgb`, state, `supported_by` and `inside_of`;
+      * `centre_error_m`, `label_agreed` and `support_height_error_m`.
+    * `unmatched_map[]`: the map objects matched to no truth object, with label and centre.
+
+    So a low `c10.label_agreement` can be split into matching (a label that should have agreed)
+    and real misdetection. The support height is judged against the worktop (arm) or the floor
   (ProcTHOR objects without a parent). The relation is judged against the house's
   `children` nesting.
 * **C11.** Beams of kind `obstacle` are compared with a ray cast against the floor-plan walls.

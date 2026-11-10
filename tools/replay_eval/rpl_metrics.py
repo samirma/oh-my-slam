@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import itertools
 import math
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +30,7 @@ from rpl_floorplan import (
     ray_cast,
 )
 from rpl_geometry import Arr, Sim3, angle_deg, mat4, optical_yaw_deg, umeyama, wrap_deg
+from rpl_labels import LabelRule
 from rpl_replay import Record
 
 
@@ -173,6 +173,7 @@ class Params:
     passing: tuple[str, ...] | None = None  # None: from each episode's verdict.md
     worktop_kinds: tuple[str, ...] = ("arm",)  # floor_z_m is judged against the worktop
     worktop_placements: tuple[str, ...] = ("worktop",)  # ... as for meta.placement "worktop"
+    labels: LabelRule = field(default_factory=LabelRule)
     heights: bool = True
 
 
@@ -305,15 +306,6 @@ def truth_reason(f: Frame, earlier: list[Frame], plan: FloorPlan | None, hfov: f
             < hfov for e in earlier):
         return "no_overlap"
     return None
-
-
-def norm_label(s: str) -> str:
-    return re.sub(r"[^a-z]", "", s.lower())
-
-
-def same_label(a: str, b: str) -> bool:
-    x, y = norm_label(a), norm_label(b)
-    return bool(x and y) and (x == y or x in y or y in x)
 
 
 def layer(grid: dict[str, Any], name: str) -> Arr:
@@ -641,7 +633,7 @@ class Measure:
             w = self.al[0].point(o["centre_m"])
             cands = [(float(np.linalg.norm(t.centre - w)), i, t)
                      for i, t in enumerate(self.truth_objects)
-                     if not same or same_label(o["label"], t.label)]
+                     if not same or self.p.labels.same(o["label"], t.label)]
             cands = [c for c in cands if c[0] <= self.p.match_m]
             if cands:
                 out[int(o["id"])] = min(cands, key=lambda c: (c[0], c[1]))[2]
@@ -659,7 +651,8 @@ class Measure:
         nearest = self.match(live, same=False)
         for o in live:
             if int(o["id"]) in nearest:
-                s.add("c10.label_agreement", same_label(o["label"], nearest[int(o["id"])].label))
+                s.add("c10.label_agreement",
+                      self.p.labels.same(o["label"], nearest[int(o["id"])].label))
         matched = self.match(live, same=True)
         for o in live:
             t = matched.get(int(o["id"]))
@@ -688,12 +681,64 @@ class Measure:
             elif t.support_z is not None:
                 s.add("c10.relations_agreement",
                       bool(sup) and sup["kind"] == "surface" and not ins)
+        s.info["objects"] = self.object_report(live, nearest, matched, surfaces)
         versions = sorted(self.rec.objects)
         for a, b in itertools.pairwise(versions):
             ma = {t.id: oid for oid, t in self.match(self.rec.objects[a]["objects"], True).items()}
             mb = {t.id: oid for oid, t in self.match(self.rec.objects[b]["objects"], True).items()}
             for tid in sorted(set(ma) & set(mb)):
                 s.add("c10.id_stability", ma[tid] == mb[tid])
+
+    def object_report(self, live: list[dict[str, Any]], nearest: dict[int, TruthObject],
+                      matched: dict[int, TruthObject],
+                      surfaces: dict[int, dict[str, Any]]) -> dict[str, Any]:
+        """Per truth object: the map object matched to it (same label within match_m, else the
+        nearest within match_m), the centre error, the label agreement and the support-height
+        error; then the map objects matched to no truth object. No images, no paths."""
+        assert self.al is not None
+        sim, rule = self.al[0], self.p.labels
+        by_id = {int(o["id"]): o for o in live}
+
+        def world(o: dict[str, Any]) -> list[float]:
+            return [round(float(v), 4) for v in sim.point(o["centre_m"])]
+
+        def best(pairs: dict[int, TruthObject], t: TruthObject) -> int | None:
+            ids = [oid for oid, tt in pairs.items() if tt is t]
+            return min(ids, key=lambda i: float(np.linalg.norm(sim.point(by_id[i]["centre_m"])
+                                                                - t.centre)), default=None)
+
+        truth_rows, used = [], set()
+        for t in self.truth_objects:
+            oid = best(matched, t)
+            if oid is None:
+                oid = best(nearest, t)
+            row: dict[str, Any] = {
+                "name": t.id, "label": t.label, "canonical": rule.canon(t.label),
+                "centre_world": [round(float(v), 4) for v in t.centre],
+                "size_world": None if t.size is None else [float(v) for v in t.size],
+                "matched": None, "centre_error_m": None, "label_agreed": None,
+                "support_height_error_m": None}
+            if oid is not None:
+                o = by_id[oid]
+                used.add(oid)
+                row["matched"] = {
+                    "id": oid, "label": o["label"], "canonical": rule.canon(o["label"]),
+                    "detected_as": o.get("detected_as"), "centre_world": world(o),
+                    "size": o.get("size_m"), "mean_rgb": o.get("mean_rgb"),
+                    "state": o.get("state"), "supported_by": o.get("supported_by"),
+                    "inside_of": o.get("inside_of")}
+                row["centre_error_m"] = float(np.linalg.norm(sim.point(o["centre_m"]) - t.centre))
+                row["label_agreed"] = rule.same(o["label"], t.label)
+                sup = o.get("supported_by")
+                if sup and sup["kind"] == "surface" and int(sup["id"]) in surfaces \
+                        and t.support_z is not None:
+                    c = o["centre_m"]
+                    z = sim.point([c[0], c[1], surfaces[int(sup["id"])]["height_m"]])[2]
+                    row["support_height_error_m"] = abs(float(z) - t.support_z)
+            truth_rows.append(row)
+        unmatched = [{"id": int(o["id"]), "label": o["label"], "canonical": rule.canon(o["label"]),
+                      "centre_world": world(o)} for o in live if int(o["id"]) not in used]
+        return {"truth": truth_rows, "unmatched_map": unmatched}
 
     # ---- O7 ---------------------------------------------------------------------------------
     def analyse(self) -> None:

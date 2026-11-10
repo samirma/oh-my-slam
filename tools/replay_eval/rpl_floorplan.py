@@ -44,6 +44,7 @@ class TruthObject:
     parent: str | None = None  # id of the object it rests on or is in
     inside: bool = False  # True when the parent is a container
     support_z: float | None = None  # truth height of the surface it rests on, when known
+    size: Arr | None = None  # world extent, when the truth gives one
 
 
 @dataclass

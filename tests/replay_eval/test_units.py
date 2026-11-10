@@ -251,3 +251,23 @@ def test_standalone_imports() -> None:
             for n in names:
                 top = n.split(".")[0]
                 assert top in allowed or top in own, f"{path.name} imports {n}"
+
+
+def test_label_rule() -> None:
+    import rpl_labels as lb
+
+    rule = lb.LabelRule()
+    assert [lb.normalise(n) for n in ("Apple_1", "Mug|1|2", "DiningTable", "dining table",
+                                      "cherries", "dishes", "boxes", "tomatoes", "cups", "glass",
+                                      "bus", "sofa-2")] == [
+        "apple", "mug", "diningtable", "diningtable", "cherry", "dish", "box", "tomato", "cup",
+        "glass", "bus", "sofa"]
+    assert rule.canon("Mug") == "cup" and rule.canon("couch") == "sofa"
+    assert rule.same("Mug", "cup") and rule.same("TV", "television")
+    assert rule.same("CoffeeTable", "table") and not rule.same("ab", "cab")
+    assert not rule.same("apple", "orange") and not rule.same("", "apple")
+    strict = lb.LabelRule.from_layout({"synonyms": [["cup", "mug"]], "suffix_match": False})
+    assert not strict.same("CoffeeTable", "table") and strict.same("mug", "Cup")
+    d = rule.describe()
+    assert d["examples"]["DiningTable|1|1"] == "diningtable" and d["steps"]
+    assert rpl_layout.LAYOUT["labels"]["synonyms"] == lb.DEFAULT_SYNONYMS

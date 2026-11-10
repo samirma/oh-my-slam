@@ -25,6 +25,7 @@ import numpy as np
 from rpl_api import Api, ApiError, Log
 from rpl_episode import Episode, dump_layout, load_episode
 from rpl_floorplan import FloorPlan, Raster, load_house, rasterise
+from rpl_labels import LabelRule
 from rpl_layout import LayoutError, load_layout
 from rpl_metrics import Measure, Params, Samples, overall, run_metrics
 from rpl_replay import GATE, Options, Record, Replayer
@@ -220,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     params = Params(align_min_spread_m=args.align_min_spread_m,
                     align_full_rotation=args.align_full_rotation,
                     worktop_placements=tuple(layout["worktop_placements"]),
+                    labels=LabelRule.from_layout(layout["labels"]),
                     probe_interval_s=args.probe_interval_s,
                     warping=tuple(w for w in args.warping.split(",") if w),
                     heights=not args.no_height,
@@ -267,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         "client": {"host": platform.node(), "python": platform.python_version(),
                    "jsonschema": validator.full,
                    "timings_s": {"total_s": time.monotonic() - t0}},
+        "label_rule": params.labels.describe(),
         "episodes": episodes, "overall": overall(pooled, targets),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -220,7 +220,8 @@ def test_verdicts_and_overall() -> None:
     smp = rm.Samples()
     assert rm.overall([(smp, {"c3.readable_s": na})], {})["c3.readable_s"]["status"] == \
         "not_measurable"
-    assert rm.same_label("DiningTable", "table") and not rm.same_label("", "x")
+    rule = rm.Params().labels
+    assert rule.same("DiningTable", "table") and not rule.same("", "x")
 
 
 def test_other_updates_accepted(world: Any) -> None:
@@ -332,3 +333,34 @@ def test_camera_cells_use_map_poses_and_rows_y(world: Any) -> None:
     rec.frames = {1: {"frames": fr}}
     rec.grid = grid(np.ascontiguousarray(state.T), (origin[1], origin[0]), cell)
     assert 1.0 not in measure(rec, ep).values.get("c9.camera_stand_free", [])
+
+
+def test_object_report_rows(world: Any) -> None:
+    ep, syn, plan, _ = world
+    names = syn.names["r1/start"]
+    base = {"state": "confirmed", "region": None, "supported_by": None, "inside_of": None,
+            "size_m": [0.1, 0.1, 0.1], "mean_rgb": [1, 2, 3], "detected_as": ["x"]}
+    objs = [  # map frame = world - (0.8, 1.45, 0)
+        {**base, "id": 1, "label": "orange", "centre_m": [1.2, 1.05, 0.85]},  # at the Mug
+        {**base, "id": 2, "label": "sofa", "centre_m": [5.2, 1.05, 0.4],
+         "supported_by": {"kind": "surface", "id": 1, "verified_version": 1}},
+        {**base, "id": 3, "label": "sofa", "centre_m": [5.25, 1.05, 0.4]},  # a duplicate
+        {**base, "id": 4, "label": "lamp", "centre_m": [-5.0, -5.0, 0.4]},
+    ]
+    rec = record(["O8"], frames={1: {"frames": rows(ep, names)}},
+                 objects={1: {"objects": objs, "surfaces": [
+                     {"id": 1, "height_m": 0.03, "polygon_m": [[0, 0], [1, 0], [1, 1]],
+                      "area_m2": 1.0}]}})
+    rec.jobs = [job(names)]
+    truth = [o for o in plan.objects if o.label in ("Mug", "Sofa", "Apple")]
+    truth.append(fp.TruthObject("far", "Vase", np.array([20.0, 20.0, 0.0]),
+                                size=np.array([0.1, 0.2, 0.3])))
+    rep = measure(rec, ep, objs=truth).info["objects"]
+    rows_ = {r["name"]: r for r in rep["truth"]}
+    mug = rows_["Mug|1|2"]
+    assert mug["matched"]["id"] == 1 and mug["label_agreed"] is False  # nearest, other label
+    sofa = rows_["Sofa|2|1"]
+    assert sofa["matched"]["id"] == 2 and sofa["label_agreed"] is True
+    assert sofa["support_height_error_m"] == pytest.approx(0.03)
+    assert rows_["far"]["matched"] is None and rows_["far"]["size_world"] == [0.1, 0.2, 0.3]
+    assert {u["id"] for u in rep["unmatched_map"]} == {3, 4}

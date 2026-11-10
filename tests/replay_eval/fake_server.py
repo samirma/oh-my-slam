@@ -71,6 +71,7 @@ class Config:
     fail_route: str | None = None  # answer 500 internal on this path suffix
     busy_once: bool = False  # the first revert answers map_busy (retryable)
     eta: float | None = 0.19
+    floor_world_z: float = 0.0  # the world z of the plane the grid reports as floor_z_m
 
 
 @dataclass
@@ -286,7 +287,7 @@ class Fake:
 
         return {"schema": "oms/2.1", "map": name, "map_version": v["version"],
                 "origin_m": lo.tolist(), "cell_m": cell, "shape": [int(rows), int(cols)],
-                "z_band_m": band, "floor_z_m": self.world_floor_map_z(m, 0, 0),
+                "z_band_m": band, "floor_z_m": float(m.sim.to_map([0.0, 0.0, self.cfg.floor_world_z])[2]),
                 **self.scale(name),
                 "layers": {"state": b64(state), "observations": b64(observed),
                            "height_m": b64(np.full((rows, cols), np.nan, np.float32)),
@@ -316,7 +317,8 @@ class Fake:
             c = m.sim.to_map(w)
             sup = support[label]
             out.append({
-                "id": oid, "label": label, "detected_as": [label], "score": 0.9,
+                "id": oid, "label": {"Mug": "cup", "DiningTable": "dining table"}.get(label, label),
+                "detected_as": [label], "score": 0.9,
                 "centre_m": c.tolist(), "size_m": [0.5, 0.4, 0.3], "yaw_deg": 0.0,
                 "sigma_centre_m": 0.02, "extent_seen": {"x": "full", "y": "full", "z": "partial"},
                 "mean_rgb": [10, 20, 30], "color": [1, 2, 3], "state": "confirmed",
