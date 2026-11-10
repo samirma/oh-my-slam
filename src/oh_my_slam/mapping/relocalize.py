@@ -16,18 +16,23 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
 * **Turn fit.** Without enough of those, a frame whose matched keyframes were taken from one spot
   (centres within ``ONE_SPOT_REL`` of their depth, or ``ONE_SPOT_M``) is placed at their centre with
   the rotation that turns its rays onto theirs (``locate.turn_ransac``).
-* **Rival.** The best other hypothesis: a second fit without the inliers of the first, and a fit
-  on each of the ``RIVAL_KEYFRAMES`` keyframes with most correspondences alone. A hypothesis is a
-  rival when it lies farther than ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG`` from the pose and
-  most of its inliers are not the pose's (distinct evidence); the frame is ambiguous when the
-  rival's inliers are at least ``AMBIGUITY_SUPPORT_RATIO`` of the pose's.
+* **Rival.** The other hypotheses: a second fit without the inliers of the first, a fit on each
+  of the ``RIVAL_KEYFRAMES`` keyframes with most correspondences alone, one on each of the
+  ``RIVAL_PLACES`` places the matched keyframes were taken from (``places``) and one on the
+  keyframes near the prior. A hypothesis is a rival when it lies farther than
+  ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG`` from the pose and is another place
+  (``distinct``); the frame is ambiguous when the best rival's inliers are at least
+  ``AMBIGUITY_SUPPORT_RATIO`` of the pose's. The sigmas cover every rival with at least
+  ``COVER_RATIO`` of that support.
 
-A prior picks between the pose and its rival when only one agrees with it (``consistent``), as
-does the frame's height above the floor."""
+A prior, then the frame's height above the floor, picks the best-supported other place that
+agrees with it when the pose does not (``consistent``); a pose that still disagrees with its
+prior has sigmas that cover the prior."""
 
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,10 +64,14 @@ ONE_SPOT_REL = 0.02
 ONE_SPOT_M = 0.05
 TURN_MIN_SHARE = 0.25
 RIVAL_KEYFRAMES = 6
+RIVAL_PLACES = 4
+PLACE_M = 1.5  # keyframes within this of a place's best-matched keyframe belong to it
 AMBIGUITY_POS_M = 0.10
 AMBIGUITY_ROT_DEG = 5.0
 AMBIGUITY_SUPPORT_RATIO = 0.6
 RIVAL_SIGMA_SHARE = 0.5  # with a rival, the sigmas are at least half its distance
+COVER_RATIO = 0.25  # the sigmas cover every rival with this share of the pose's support
+PRIOR_PICK_RATIO = 0.25  # a place agreeing with the prior needs this share of the support
 LOW_RATIO = 0.4  # an inlier ratio below this floors the sigmas at (README "Locate"):
 LOW_RATIO_SIGMA_POS_M = 0.05
 LOW_RATIO_SIGMA_ROT_DEG = 1.0
@@ -165,25 +174,37 @@ class Index:
     keyframes: list[Keyframe]
     _flann: Any = None
     _owner: NDArray[np.int64] | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def prepare(self) -> None:
+        """Build the nearest-neighbour index of every keyframe descriptor (once; locates of
+        several requests share it, so it is built and searched under a lock)."""
+        import cv2
+
+        with self._lock:
+            if self._owner is not None:
+                return
+            all_d = [k.desc for k in self.keyframes]
+            owner = np.concatenate([np.full(len(d), i) for i, d in enumerate(all_d)]) \
+                if all_d else np.zeros(0, np.int64)
+            if len(owner):
+                self._flann = cv2.FlannBasedMatcher({"algorithm": 1, "trees": 4}, {"checks": 32})
+                self._flann.add([np.concatenate(all_d).astype(np.float32)])
+                self._flann.train()
+            self._owner = owner
 
     def votes(self, desc: NDArray[np.uint8]) -> NDArray[np.int64]:
         """Per keyframe, how many of ``desc`` have their nearest keyframe descriptor in it
         within ``VOTE_DIST``."""
-        import cv2
-
         n = len(self.keyframes)
         if not len(desc) or not n:
             return np.zeros(n, np.int64)
-        if self._owner is None:
-            all_d = [k.desc for k in self.keyframes]
-            self._owner = np.concatenate([np.full(len(d), i) for i, d in enumerate(all_d)])
-            if len(self._owner):
-                self._flann = cv2.FlannBasedMatcher({"algorithm": 1, "trees": 4}, {"checks": 32})
-                self._flann.add([np.concatenate(all_d).astype(np.float32)])
-                self._flann.train()
+        self.prepare()
         if self._flann is None:
             return np.zeros(n, np.int64)
-        m = self._flann.match(desc.astype(np.float32))
+        with self._lock:
+            m = self._flann.match(desc.astype(np.float32))
+        assert self._owner is not None
         idx = np.array([x.trainIdx for x in m if x.distance < VOTE_DIST], np.int64)
         return np.bincount(self._owner[idx], minlength=n) if idx.size else np.zeros(n, np.int64)
 
@@ -459,16 +480,42 @@ def candidates(q: Query, index: Index) -> tuple[list[int], NDArray[np.int64]]:
         chosen = list(range(n))
     else:
         chosen = [int(i) for i in np.argsort(-votes, kind="stable")[:TOP_K] if votes[i] > 0]
-    if q.prior is not None:
-        C = q.prior[:3, 3]
-        radius = max(PRIOR_RADIUS_M, K_SIGMA * q.prior_sigma_pos_m + 0.5)
-        near = sorted((float(np.linalg.norm(k.centre - C)), i) for i, k in enumerate(index.keyframes)
-                      if float(np.linalg.norm(k.centre - C)) <= radius
-                      and float(k.T[:3, 2] @ q.prior[:3, 2]) > -0.2)
-        for _, i in near[:PRIOR_KEYFRAMES]:
-            if i not in chosen:
-                chosen.append(i)
+    for i in near_prior(q, index)[:PRIOR_KEYFRAMES]:
+        if i not in chosen:
+            chosen.append(i)
     return chosen, votes
+
+
+def near_prior(q: Query, index: Index) -> list[int]:
+    """The keyframes near the frame's prior, nearest first: within max(``PRIOR_RADIUS_M``,
+    ``K_SIGMA`` sigmas + 0.5 m), not looking against it; none without a prior."""
+    if q.prior is None:
+        return []
+    C = q.prior[:3, 3]
+    radius = max(PRIOR_RADIUS_M, K_SIGMA * q.prior_sigma_pos_m + 0.5)
+    near = sorted((float(np.linalg.norm(k.centre - C)), i) for i, k in enumerate(index.keyframes)
+                  if float(np.linalg.norm(k.centre - C)) <= radius
+                  and float(k.T[:3, 2] @ q.prior[:3, 2]) > -0.2)
+    return [i for _, i in near]
+
+
+def places(per_kf: Sequence[tuple[int, int]], index: Index) -> list[list[int]]:
+    """The matched keyframes (``(correspondences, keyframe)``) grouped by where they were taken:
+    each, best-matched first, joins the first group whose first keyframe lies within ``PLACE_M``,
+    else starts one. Groups by their correspondences, most first; none when all are one place
+    (the pooled fit is that place's)."""
+    groups: list[tuple[Array, list[int], list[int]]] = []
+    for n, i in sorted(per_kf, reverse=True):
+        c = index.keyframes[i].centre
+        g = next((g for g in groups if float(np.linalg.norm(g[0] - c)) <= PLACE_M), None)
+        if g is None:
+            groups.append((c, [i], [n]))
+        else:
+            g[1].append(i)
+            g[2].append(n)
+    if len(groups) < 2:
+        return []
+    return [g[1] for g in sorted(groups, key=lambda g: -sum(g[2]))]
 
 
 def consistent(q: Query, T: Array, sp: float, sr: float) -> bool | None:
@@ -520,22 +567,6 @@ def tolerance(fit: tuple[float, float]) -> tuple[float, float]:
     ``FAR_ROT_DEG``, or ``K_SIGMA`` times the pose's own sigmas (fit and keyframes, ``fit``)
     when larger."""
     return max(FAR_POS_M, K_SIGMA * fit[0]), max(FAR_ROT_DEG, K_SIGMA * fit[1])
-
-
-def _rival(best: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
-           iq: NDArray[np.int64], xyz: Array) -> Hypothesis | None:
-    """The best-supported hypothesis farther than ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG``
-    from ``best`` that is another place (``distinct``)."""
-    out = None
-    for h in others:
-        dp, dr = pose_distance(h.T, best.T)
-        if dp <= AMBIGUITY_POS_M and dr <= AMBIGUITY_ROT_DEG:
-            continue
-        if not distinct(h, best, tol, iq, xyz):
-            continue
-        if out is None or h.inliers > out.inliers:
-            out = h
-    return out
 
 
 def spread(main: Hypothesis, others: Sequence[Hypothesis], tol: tuple[float, float],
@@ -591,52 +622,59 @@ def locate(q: Query, index: Index) -> Outcome:
     pooled = pnp(uv, xyz, q.K, px)
     if pooled is not None and hypothesis(pooled[0]).inliers >= MIN_INLIERS:
         hyps = [hypothesis(pooled[0])]
-        second = pnp(uv[~hyps[0].mask], xyz[~hyps[0].mask], q.K, px, seed=1)
-        if second is not None:
-            hyps.append(hypothesis(second[0]))
-        for _, i in sorted(per_kf, reverse=True)[:RIVAL_KEYFRAMES]:
-            sel = kfs == i
-            alone = pnp(uv[sel], xyz[sel], q.K, px, seed=2)
-            if alone is not None:
-                hyps.append(hypothesis(alone[0]))
+        subsets = [~hyps[0].mask]  # the second fit
+        subsets += [kfs == i for _, i in sorted(per_kf, reverse=True)[:RIVAL_KEYFRAMES]]
+        n_kf = len(subsets)
+        subsets += [np.isin(kfs, g) for g in places(per_kf, index)[:RIVAL_PLACES]]
+        n_places = len(subsets)
+        near = near_prior(q, index)
+        if near:
+            subsets.append(np.isin(kfs, near))
+        is_place = [False]
+        for k, sel in enumerate(subsets):
+            got = pnp(uv[sel], xyz[sel], q.K, px, seed=k + 1) if sel.any() else None
+            if got is not None:
+                hyps.append(hypothesis(got[0]))
+                is_place.append(n_kf <= k < n_places)
         k_best = max(range(len(hyps)), key=lambda k: (hyps[k].inliers, -k))
-        main = hypothesis(_refine(hyps[k_best], q.K, uv, xyz, iq))
         origin = np.array([index.keyframes[int(i)].centre for i in kfs]).reshape(-1, 3)
-        main, cov = _refined(main, hypothesis, q, uv, xyz, origin, px)
-        others = [h for k, h in enumerate(hyps) if k != k_best]
-        kf_sig = _keyframe_sigmas(main, kfs, index)
-        tol = tolerance(_fit(main, q, uv, xyz, iq, cov, kf_sig))
-        rival = _rival(main, others, tol, iq, xyz)
-        while rival is not None and _same_basin(rival, main, q, uv, xyz, origin, px, tol):
-            others = [h for h in others if h is not rival]  # the same place, seen off
-            rival = _rival(main, others, tol, iq, xyz)
-        if rival is not None:  # the prior, then the height, pick when only one agrees
-            sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
-            rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq,
-                               keyframes=_keyframe_sigmas(rival, kfs, index))
-            comparable = rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers
-            if comparable and ((consistent(q, main.T, sp, sr) is False
-                                and consistent(q, rival.T, rsp, rsr))
-                               or (not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp))):
-                others = [main, *[h for h in others if h is not rival]]
-                main, rival = rival, main
-                main, cov = _refined(main, hypothesis, q, uv, xyz, origin, px)
-                kf_sig = _keyframe_sigmas(main, kfs, index)
+        fit = _Fit(q, index, uv, xyz, iq, kfs, origin, px, hypothesis)
+        main, cov = fit.refined(hypothesis(_refine(hyps[k_best], q.K, uv, xyz, iq)))
+        # a place's fit is a rival only from another place: near the pose it is the same view
+        # through other keyframes (their errors are the per-keyframe fits' spread)
+        others = [h for k, h in enumerate(hyps) if k != k_best and not (
+            is_place[k] and float(np.linalg.norm(h.T[:3, 3] - main.T[:3, 3])) <= PLACE_M)]
+        rivals = fit.rivals(main, cov, others)
+        sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index))
+        if consistent(q, main.T, sp, sr) is False or not _height_ok(q, main.T, sp):
+            # the prior, then the height, pick the best-supported other place that agrees
+            agree = [h for h in rivals if h.inliers >= PRIOR_PICK_RATIO * main.inliers
+                     and fit.agrees(h, [main, *others]) and plausible(h, kfs, index)]
+            if agree:
+                best = max(agree, key=lambda h: h.inliers)
+                others = [main, *[h for h in others if h is not best]]
+                main, cov = fit.refined(best)
+                rivals = fit.rivals(main, cov, others)
         if not plausible(main, kfs, index):
             return out  # a degenerate solve: not located (a wrong pose is worse than none)
-        sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, kf_sig)
+        sp, sr = _sigmas(main, others, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index))
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
+        out.consistent_with_prior = consistent(q, main.T, sp, sr)
+        rival = max(rivals, key=lambda h: h.inliers, default=None)
         if rival is not None and rival.inliers >= AMBIGUITY_SUPPORT_RATIO * main.inliers:
             dp, dr = pose_distance(rival.T, main.T)
             out.ambiguity = {"pos_m": round(dp, 4), "rot_deg": round(dr, 3)}
-            # the sigmas cover the mixture of the pose and its rival, not the winner alone
-            sp, sr = max(sp, RIVAL_SIGMA_SHARE * dp), max(sr, RIVAL_SIGMA_SHARE * dr)
+        for h in rivals:
+            # the sigmas cover the mixture of the pose and its rivals, not the winner alone
+            if h.inliers >= COVER_RATIO * main.inliers:
+                dp, dr = pose_distance(h.T, main.T)
+                sp, sr = max(sp, RIVAL_SIGMA_SHARE * dp), max(sr, RIVAL_SIGMA_SHARE * dr)
+        sp, sr = _cover_prior(q, main.T, sp, sr, out.consistent_with_prior)
         if out.inlier_ratio < LOW_RATIO:  # most matches unexplained: never millimetres
             sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
-        out.consistent_with_prior = consistent(q, main.T, sp, sr)
         return out
     if ray_q:
         turned = _turn(q, index, np.concatenate(ray_q), np.concatenate(ray_k),
@@ -644,6 +682,61 @@ def locate(q: Query, index: Index) -> Outcome:
         if turned is not None:
             return _with_votes(turned, out)
     return out
+
+
+@dataclass
+class _Fit:
+    """One frame's correspondences, for refining and comparing its hypotheses."""
+
+    q: Query
+    index: Index
+    uv: Array
+    xyz: Array
+    iq: NDArray[np.int64]
+    kfs: NDArray[np.int64]
+    origin: Array
+    px: float
+    hypothesis: Any
+
+    def refined(self, h: Hypothesis) -> tuple[Hypothesis, Array | None]:
+        return _refined(h, self.hypothesis, self.q, self.uv, self.xyz, self.origin, self.px)
+
+    def rivals(self, main: Hypothesis, cov: Array | None, others: Sequence[Hypothesis]
+               ) -> list[Hypothesis]:
+        """The hypotheses that are another place than ``main``: farther than
+        ``AMBIGUITY_POS_M`` or ``AMBIGUITY_ROT_DEG``, ``distinct`` (beyond ``main``'s
+        ``tolerance``), and not brought back to it when refined on both inlier sets
+        (``_same_basin``)."""
+        kf_sig = _keyframe_sigmas(main, self.kfs, self.index)
+        tol = tolerance(_fit(main, self.q, self.uv, self.xyz, self.iq, cov, kf_sig))
+        out = []
+        for h in others:
+            dp, dr = pose_distance(h.T, main.T)
+            if (dp > AMBIGUITY_POS_M or dr > AMBIGUITY_ROT_DEG) \
+                    and distinct(h, main, tol, self.iq, self.xyz) \
+                    and not _same_basin(h, main, self.q, self.uv, self.xyz, self.origin, self.px,
+                                        tol):
+                out.append(h)
+        return out
+
+    def agrees(self, h: Hypothesis, others: Sequence[Hypothesis]) -> bool:
+        """Whether ``h`` agrees with the frame's prior (or has none) and its height."""
+        sp, sr = _sigmas(h, others, self.q, self.uv, self.xyz, self.iq,
+                         keyframes=_keyframe_sigmas(h, self.kfs, self.index))
+        return consistent(self.q, h.T, sp, sr) is not False and _height_ok(self.q, h.T, sp)
+
+
+def _cover_prior(q: Query, T: Array, sp: float, sr: float, agrees: bool | None
+                 ) -> tuple[float, float]:
+    """Sigmas of a pose that disagrees with its prior (``agrees`` False) widened to cover the
+    prior: at least ``RIVAL_SIGMA_SHARE`` of the distance plus the prior's own sigma, as for a
+    rival (the images or the prior may be the one that is wrong)."""
+    if agrees is not False:
+        return sp, sr
+    assert q.prior is not None
+    dp, dr = pose_distance(q.prior, T)
+    return (max(sp, RIVAL_SIGMA_SHARE * dp + q.prior_sigma_pos_m),
+            max(sr, RIVAL_SIGMA_SHARE * dr + q.prior_sigma_rot_deg))
 
 
 def plausible(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
@@ -868,6 +961,8 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
         if dr > AMBIGUITY_ROT_DEG and n2 >= AMBIGUITY_SUPPORT_RATIO * n:
             out.ambiguity = {"pos_m": 0.0, "rot_deg": round(dr, 3)}
     out.consistent_with_prior = consistent(q, T, sp, sr)
+    sp, sr = _cover_prior(q, T, sp, sr, out.consistent_with_prior)
+    out.sigma_pos_m, out.sigma_rot_deg = round(sp, 4), round(sr, 3)
     return out
 
 

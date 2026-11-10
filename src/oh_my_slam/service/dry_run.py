@@ -36,6 +36,7 @@ from oh_my_slam.mapping.anchored import (
     Placement,
     _prior_sigmas,
     features,
+    inherit_conflicts,
     match,
     pose_residual,
 )
@@ -104,13 +105,18 @@ def dry_run(up: Updater, w: UpdateWork, new_cameras: dict[str, dict[str, Any]],
     low = sum(pl is not None and (pl.status == "provisional"
                                   or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M)
               for pl in kept)
+    # the kept frames against the stored map, as the update reports them (stored frames do not
+    # move): where its priors alone place a frame, the update's prior conflicts count
+    moved = [pl.map_residual for pl in kept if pl is not None and pl.map_residual is not None]
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": None if prev is None else 1.0,
-        "gauge_shift": None if prev is None else {"translation_m": 0.0, "rotation_deg": 0.0,
-                                                  "scale_ratio": 1.0},
+        "gauge_shift": None if prev is None else {
+            "translation_m": round(float(np.median([m for m, _ in moved])), 4) if moved else 0.0,
+            "rotation_deg": round(float(np.median([d for _, d in moved])), 3) if moved else 0.0,
+            "scale_ratio": 1.0},
         "prior_residuals": residual_stats(prior_res),
-        "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
-        else None,
+        "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"]) + moved)
+        if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
         "rebuilt": False, "prior_gravity_deg": None,
@@ -156,6 +162,7 @@ def _place_all(pool: ThreadPoolExecutor, am: AnchoredMap | None, frames: list[_F
                 pl.status, pl.reason, pl.T = "registered", None, pl.align_T
                 pl.sigma_pos_m, pl.sigma_rot_deg = pl.image_sigmas or (None, None)
         break
+    inherit_conflicts(list(out.values()))
     return out
 
 

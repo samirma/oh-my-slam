@@ -42,6 +42,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -1090,6 +1091,29 @@ class Placement:
     image_sigmas: tuple[float, float] | None = None  # of ``align_T`` (a conflict's image pose)
 
 
+def inherit_conflicts(pls: list[Placement]) -> None:
+    """The frames of one update that its priors alone placed — at the prior (``prior``), by
+    depth geometry that cannot see every direction (``depth``), or in position by a rotation
+    fit (``rotation``) — take as their residual to the map (``map_residual``, the quality
+    report's ``previous_residuals`` and gauge shift) at least the largest disagreement between
+    the update's priors and the map that its prior conflicts measured: an image pose beyond the
+    combined sigmas of its prior (the conflict's ``prior_residual``), or a depth that contradicts
+    the map at the prior (its ``map_residual``). Priors that the images show off by that much may
+    put the frames nobody confirmed as far off: such an update warps the map, and
+    ``max_residual_m`` sees it. An update without a conflict is unchanged."""
+    ev = [e for p in pls if p.reason == "prior_conflict"
+          for e in [p.prior_residual if p.align_T is not None else p.map_residual]
+          if e is not None]
+    if not ev:
+        return
+    ep, er = max(e[0] for e in ev), max(e[1] for e in ev)
+    for p in pls:
+        if p.status == "rejected" or p.method not in ("prior", "depth", "rotation"):
+            continue
+        cur = p.map_residual or (0.0, 0.0)
+        p.map_residual = (max(cur[0], ep), cur[1] if p.method == "rotation" else max(cur[1], er))
+
+
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
     has = np.isfinite(corr.X).all(axis=1)
     return corr.X[has], corr.uv[has]
@@ -1163,6 +1187,7 @@ class AnchoredMap:
         self.up_check_deg: float | None = None
         self.timings: dict[str, float] = {}
         self._added: list[Keyframe] = []
+        self._kf_lock = threading.Lock()
 
     # -- persistence ---------------------------------------------------------------------------
 
@@ -1215,12 +1240,24 @@ class AnchoredMap:
         return (np.load(p).astype(np.float32) * self._depth_factor(kf)).astype(np.float32)
 
     def _load_kf(self, kf: Keyframe) -> None:
+        """A stored keyframe's features, keypoint depths and descriptor, once. A dry run places
+        its frames on several threads: they load under a lock and the features are set last
+        (a thread that sees them sees the depths too). A keyframe stored without them keeps
+        none (``_correspondences`` skips it)."""
         if kf.feats is not None:
             return
-        with np.load(self.root / KF_DIR / f"{kf.id}.npz") as z:
-            kf.feats = Features(z["kps"], z["desc"])
-            kf.kdepth = z["kdepth"]
-            kf.descriptor = z["descriptor"] if "descriptor" in z.files else None
+        with self._kf_lock:
+            if kf.feats is not None:
+                return
+            p = self.root / KF_DIR / f"{kf.id}.npz"
+            if not p.exists():
+                return
+            with np.load(p) as z:
+                if not {"kps", "desc", "kdepth"} <= set(z.files):
+                    return
+                kf.descriptor = z["descriptor"] if "descriptor" in z.files else None
+                kf.kdepth = z["kdepth"]
+                kf.feats = Features(z["kps"], z["desc"])
 
     # -- summary -------------------------------------------------------------------------------
 
@@ -1313,7 +1350,9 @@ class AnchoredMap:
         seen = np.zeros(len(feats.kps), bool)
         for j, k in enumerate(cands):
             self._load_kf(k)
-            assert k.feats is not None and k.kdepth is not None
+            if k.feats is None or k.kdepth is None or len(k.kdepth) != len(k.feats.kps) \
+                    or not len(k.feats.kps):
+                continue  # a keyframe without features or keypoint depths: no reference
             ray = rays(k.K, k.feats.kps)
             z = k.kdepth.astype(np.float64) * self._depth_factor(k)
             R, c = k.T[:3, :3], k.centre
@@ -1785,7 +1824,9 @@ class AnchoredMap:
         self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
         self.timings = {"register": round(reg_s, 3), "fuse": round(fuse_s, 3),
                         "total": round(time.perf_counter() - t0, 3)}
-        return [out[i] for i in range(len(frames))]
+        pls = [out[i] for i in range(len(frames))]
+        inherit_conflicts(pls)
+        return pls
 
     def _grid(self, k: Keyframe) -> DepthRef | None:
         """A keyframe's depth grid at the map's depth scale now, as a depth reference."""

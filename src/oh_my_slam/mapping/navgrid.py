@@ -90,6 +90,7 @@ MIN_REGION_M2 = 0.25
 MIN_FRONTIER_M = 0.3
 CHORD_REFINE_DEG = 10.0
 PASSAGE_MAX_W = 2.0  # wider gaps are not narrowings
+DOOR_CHORD_MAX_W = 2.5  # ... unless a door object says so (a wide double door)
 MIN_PASSAGE_W = 0.2
 NMS_M = 0.3
 NARROW_SHIFT_M = 0.5
@@ -103,6 +104,9 @@ DOOR_MIN_W = 0.55
 DOOR_MAX_W = 1.3
 DOOR_OBJECT_M = 0.6  # a door-labelled object this close to a passage's centre makes it a door
 DOOR_CHORD_STEP_DEG = 10.0
+DOOR_SEARCH_M = 1.0  # a door object's chord passes through free cells this near it
+DOOR_CLEAR_SHARE = 0.4  # a door chord's midpoint is at least this share of its length from obstacles
+DOOR_WALL_M = 1.0  # _door_walled: the door's wall is looked for this far beyond a chord's end
 LEAF_MIN_M = 0.3
 LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, are leaf cells
 
@@ -600,7 +604,7 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
     ``SIGHT_MARGIN_M``, than the camera's lowest line of sight above that cell (a wall, a door
     jamb, a table's leg), not what lies below it (other frames' floor noise, a low step); and
     only the cells the camera cell reaches without crossing those (not the floor behind a
-    wall). The cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
+    wall), in a straight line (``_in_sight``: not what an open leaf or a wall end hides). The cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
         r, c, _ = _disc(lay, xy, footprint_radius or 0.0)
@@ -628,8 +632,25 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         if not (0 <= me[0] - r0 < box.shape[0] and 0 <= me[1] - c0 < box.shape[1]):
             continue  # the camera lies outside the grid
         go = (lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]) & ~keep
+        go &= lay.state[r, c] != FREE  # what is free already stays so
+        if go.any():
+            go[go] = _in_sight(box, me[0] - r0, me[1] - c0, r[go] - r0, c[go] - c0)
         lay.state[r[go], c[go]] = FREE
         _by_rule(lay, r[go], c[go])
+
+
+def _in_sight(clear: NDArray[np.bool_], r0: int, c0: int, r: NDArray[np.int64],
+              c: NDArray[np.int64]) -> NDArray[np.bool_]:
+    """Whether the straight line from cell (``r0``, ``c0``) to each cell (``r``, ``c``) crosses
+    only ``clear`` cells (half-cell steps): a cell hidden behind a surface (an open leaf, a wall
+    end) lies outside the camera's blind disc, whose floor only its field of view hid."""
+    d = np.hypot(r - r0, c - c0)
+    n = max(int(np.ceil(d.max() * 2)) if d.size else 1, 1)
+    t = (np.arange(1, n + 1) / n)[None, :]
+    rr = np.floor(r0 + 0.5 + (r - r0)[:, None] * t).astype(np.int64)
+    cc = np.floor(c0 + 0.5 + (c - c0)[:, None] * t).astype(np.int64)
+    own = (rr == r[:, None]) & (cc == c[:, None])  # the target cell itself is not in the way
+    return np.asarray((clear[rr, cc] | own).all(axis=1))
 
 
 def _by_rule(lay: Layers, r: NDArray[np.int64], c: NDArray[np.int64]) -> None:
@@ -660,8 +681,9 @@ class Passage:
     jambs: tuple[Array, Array]
     regions: tuple[int, int]  # indices into the regions list until ids are assigned
     kind: str
-    leaf: dict[str, Any] | None
+    leaf: dict[str, Any] | None  # the largest of ``leaves`` (the API's one leaf)
     id: int = 0
+    leaves: list[dict[str, Any]] = field(default_factory=list)  # every open leaf, largest first
 
 
 @dataclass
@@ -838,38 +860,107 @@ def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
                  doors: Sequence[Sequence[float]]
                  ) -> list[tuple[float, Array, Array, tuple[int, int] | None,
                                  tuple[int, int] | None]]:
-    """The chords of the door-labelled objects no chord found: a wall seen from one side, or
-    partly, need not pass ``_walled``, but a door object says where the gap is. Through the free
-    cells within ``DOOR_OBJECT_M`` of the door's centre, every ``DOOR_CHORD_STEP_DEG``, the
-    shortest free chord ending on occupied cells at both ends whose length is a door's
-    (``DOOR_MIN_W``-``DOOR_MAX_W`` of free width), then narrowed beside it (``_narrowest``)."""
+    """The chords of the door-labelled objects no chord passes near (within ``DOOR_OBJECT_M``):
+    a wall seen from one side, or partly, or hidden behind open leaves, need not pass
+    ``_walled``, but a door object says where the gap is. Through the free cells within
+    ``DOOR_SEARCH_M`` of the door, every ``DOOR_CHORD_STEP_DEG``, the free chords that end on
+    occupied cells at both ends, ``DOOR_MIN_W`` to ``DOOR_CHORD_MAX_W`` of free width, across the
+    gap (their midpoint's clearance ``DOOR_CLEAR_SHARE`` of their length at least): of those that
+    lie in the door's wall line (``_door_walled``) and end on occupied cells, or on a jamb hidden
+    behind an open leaf (unknown, with the wall going on beyond it), the one with most wall seen
+    beyond its ends, then the shortest; else (a door
+    seen partly) the shortest ending on occupied cells of a door's width (up to ``DOOR_MAX_W``).
+    Then narrowed beside it (``_narrowest``): open leaves count as obstacles."""
     free = state == FREE
     cell = lay.cell
     max_t = CHORD_MAX_M / cell
+    clear = ndimage.distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1]
     out: list[Any] = []
     for d in doors:
         c = np.array([(d[0] - lay.origin[0]) / cell, (d[1] - lay.origin[1]) / cell])
-        if any(float(np.linalg.norm((ch[1] + ch[2]) / 2 - c)) * cell <= DOOR_OBJECT_M
+        if any(_segment_distance(c, ch[1], ch[2]) * cell <= DOOR_OBJECT_M
                for ch in [*chords, *out]):
             continue
-        k = math.ceil(DOOR_OBJECT_M / cell)
+        k = math.ceil(DOOR_SEARCH_M / cell)
         r0, c0 = math.floor(c[1]), math.floor(c[0])
-        best = None
-        for r in range(max(r0 - k, 0), min(r0 + k + 1, state.shape[0]), 2):
-            for cc in range(max(c0 - k, 0), min(c0 + k + 1, state.shape[1]), 2):
+        best, best_any, best_key = None, None, (0, 0.0)
+        for r in range(max(r0 - k, 0), min(r0 + k + 1, state.shape[0])):
+            for cc in range(max(c0 - k, 0), min(c0 + k + 1, state.shape[1])):
                 if not free[r, cc] or math.hypot(r - r0, cc - c0) > k:
                     continue
                 for a in np.radians(np.arange(0.0, 180.0, DOOR_CHORD_STEP_DEG)):
                     ch = _chord_at(free, np.array([cc + 0.5, r + 0.5]), float(a), max_t)
                     w = (ch[0] + 2 * JAMB_IN_CELL) * cell
-                    if ch[3] is None or ch[4] is None or state[ch[3]] != OCCUPIED or \
-                            state[ch[4]] != OCCUPIED or not DOOR_MIN_W <= w <= DOOR_MAX_W:
+                    if ch[3] is None or ch[4] is None or not DOOR_MIN_W <= w <= DOOR_CHORD_MAX_W:
                         continue
-                    if best is None or ch[0] < best[0]:
-                        best = ch
-        if best is not None:
-            out.append(_narrowest(free, best, cell, max_t))
+                    mid = np.floor((ch[1] + ch[2]) / 2).astype(int)
+                    if clear[mid[1], mid[0]] < DOOR_CLEAR_SHARE * ch[0]:
+                        continue  # a chord along a wall, not across a gap
+                    ends = (state[ch[4]], state[ch[3]])  # the cells beyond e2's end, e1's
+                    walled = _door_walled(state, ch[1], ch[2], cell)
+                    if walled is not None and all(v == OCCUPIED or on for v, on in
+                                                  zip(ends, walled[:2], strict=True)):
+                        # the most wall beyond its ends (the wall line, not a chord between
+                        # two open leaves), then the shortest
+                        key = (-round(walled[2] / cell), ch[0])
+                        if best is None or key < best_key:
+                            best, best_key = ch, key
+                    elif ends == (OCCUPIED, OCCUPIED) and w <= DOOR_MAX_W and \
+                            (best_any is None or ch[0] < best_any[0]):
+                        best_any = ch
+        pick = best if best is not None else best_any
+        if pick is not None:
+            out.append(_narrowest(free, pick, cell, max_t))
     return out
+
+
+def _segment_distance(p: Array, a: Array, b: Array) -> float:
+    """Distance from ``p`` to the segment ``a``-``b``."""
+    d = b - a
+    t = min(max(float((p - a) @ d) / max(float(d @ d), 1e-12), 0.0), 1.0)
+    return float(np.linalg.norm(p - (a + t * d)))
+
+
+def _door_walled(state: NDArray[np.uint8], e1: Array, e2: Array, cell: float
+                 ) -> tuple[bool, bool, float] | None:
+    """Whether a chord near a door object lies in the door's wall line: per end (``e2``'s,
+    ``e1``'s), whether the wall goes on beyond it, and the length of wall seen beyond both (m);
+    None when the chord is not in a wall line.
+    Beyond an end, along the chord for up to ``DOOR_WALL_M``, the wall goes on when, before any
+    free cell on the line, at least ``JAMB_RUN_M`` of it is occupied (on the line or beside it:
+    perhaps after a stretch hidden behind an open leaf); an end may also see nothing free at all
+    (a wall wholly hidden), but the wall must go on beyond one end at least. A chord across the
+    room's corner crosses the walls instead of running along one; a chord between two open
+    leaves, or behind one, has free floor beyond an end."""
+    R, C = state.shape
+    L = float(np.linalg.norm(e2 - e1))
+    u = (e2 - e1) / max(L, 1e-9)
+    nrm = np.array([-u[1], u[0]])
+    n = max(2, round(DOOR_WALL_M / cell * 4))
+    step = DOOR_WALL_M / n
+    t = (np.arange(n) + 0.5) * (DOOR_WALL_M / cell) / n
+    out = []
+    seen = 0.0
+    for end, d in ((e2, u), (e1, -u)):
+        pts = end[None] + d[None] * t[:, None]
+        occ = np.zeros(n, bool)
+        on = np.zeros(n, bool)
+        for off in (0.0, -1.0, 1.0):
+            q = pts + off * nrm
+            x, y = np.floor(q[:, 0]).astype(int), np.floor(q[:, 1]).astype(int)
+            inside = (x >= 0) & (x < C) & (y >= 0) & (y < R)
+            v = np.where(inside, state[np.clip(y, 0, R - 1), np.clip(x, 0, C - 1)], UNKNOWN)
+            occ |= v == OCCUPIED
+            if off == 0.0:
+                on = v == FREE
+        k_free = int(np.argmax(on)) if on.any() else n
+        run = float(occ[:k_free].sum()) * step
+        goes_on = run >= JAMB_RUN_M
+        if not goes_on and k_free < n:
+            return None
+        out.append(goes_on)
+        seen += run
+    return (out[0], out[1], seen) if any(out) else None
 
 
 def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any], cell: float,
@@ -894,14 +985,23 @@ def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any]
     t1 = _march_many(free, P, U, lim)
     t2 = _march_many(free, P, -U, lim)
     along = ((P + U * ((t1 - t2) / 2)[:, None]) - a) @ u
-    ok = (t1 < lim) & (t2 < lim) & (along >= 0) & (along <= L0)
-    best = ch
-    for k in np.flatnonzero(ok)[np.argsort((t1 + t2)[ok], kind="stable")][:NARROW_EXACT]:
+    R, C = free.shape
+    pr, pc = np.floor(P[:, 1]).astype(np.int64), np.floor(P[:, 0]).astype(np.int64)
+    inside = (pr >= 0) & (pr < R) & (pc >= 0) & (pc < C)
+    on_free = inside & free[np.clip(pr, 0, R - 1), np.clip(pc, 0, C - 1)]  # chords of free space
+    ok = on_free & (t1 < lim) & (t2 < lim) & (along >= 0) & (along <= L0)
+    best, best_off = ch, 0.0
+    # the shortest first, of equal ones (within a cell's tenth: open leaves at 90 deg) the
+    # nearest to the walled chord, so the jambs stay on its line
+    order = np.lexsort((np.abs(S.ravel())[ok], np.round((t1 + t2)[ok] * 10.0)))
+    for k in np.flatnonzero(ok)[order][:NARROW_EXACT]:
         c = _chord_at(free, P[k], float(th[k]), max_t)
-        mid_along = float(((c[1] + c[2]) / 2 - a) @ u)
-        if c[0] < best[0] - 1e-9 and c[3] is not None and c[4] is not None \
-                and 0.0 <= mid_along <= L0:
-            best = (c[0], c[2], c[1], c[4], c[3])  # from a's side to b's, as ``ch``
+        mid = (c[1] + c[2]) / 2
+        mid_along = float((mid - a) @ u)
+        off = abs(float((mid - a) @ n))
+        shorter = c[0] < best[0] - 0.1 or (c[0] < best[0] - 1e-9 and off <= best_off + 1e-9)
+        if shorter and c[3] is not None and c[4] is not None and 0.0 <= mid_along <= L0:
+            best, best_off = (c[0], c[2], c[1], c[4], c[3]), off  # from a's side to b's
     return best
 
 
@@ -954,38 +1054,49 @@ def _polygon(mask: NDArray[np.bool_], lay: Layers) -> list[list[float]]:
     return pts
 
 
-def _leaf(state: NDArray[np.uint8], lay: Layers, j1: Array, j2: Array) -> dict[str, Any] | None:
-    """An open door leaf at the gap ``j1``-``j2`` (map x, y): the occupied cells off the jamb line by
-    more than ``LEAF_WALL_M`` (and less than the gap's width), along it within ``LEAF_WALL_M`` of the
-    gap, spanning at least ``LEAF_MIN_M``; its footprint, and whether it reaches into the gap
-    between the jambs."""
+def _leaves(state: NDArray[np.uint8], lay: Layers, j1: Array, j2: Array) -> list[dict[str, Any]]:
+    """The open door leaves at the gap ``j1``-``j2`` (map x, y), largest first: the occupied cells
+    off the jamb line by more than ``LEAF_WALL_M`` (and less than the gap's width), along it within
+    ``LEAF_WALL_M`` of the gap, in connected pieces (a double door's two leaves) spanning at least
+    ``LEAF_MIN_M``; each one's footprint, and whether it reaches into the gap between the jambs."""
     gap = float(np.linalg.norm(j2 - j1))
     u = (j2 - j1) / max(gap, 1e-9)
     n = np.array([-u[1], u[0]])
     occ = np.argwhere(state == OCCUPIED)
     if not len(occ):
-        return None
+        return []
     cen = np.column_stack([lay.origin[0] + (occ[:, 1] + 0.5) * lay.cell,
                            lay.origin[1] + (occ[:, 0] + 0.5) * lay.cell])
     along = (cen - j1) @ u
     off = np.abs((cen - j1) @ n)
     pick = (off > LEAF_WALL_M) & (off <= gap + lay.cell) & (along >= -LEAF_WALL_M) & \
         (along <= gap + LEAF_WALL_M)
-    pts = cen[pick]
-    if len(pts) < 2:
-        return None
-    span = float(np.max(np.linalg.norm(pts[:, None] - pts[None], axis=-1)))
-    if span + lay.cell < LEAF_MIN_M:
-        return None
-    a_ = (pts - j1) @ u  # the leaf's rectangle, along the jamb line and across it
-    b_ = (pts - j1) @ n
-    h_ = lay.cell / 2
-    poly = [[round(float(x), 4), round(float(y), 4)] for x, y in
-            (j1 + u * (a_.min() - h_) + n * (b_.min() - h_), j1 + u * (a_.max() + h_) + n * (b_.min() - h_),
-             j1 + u * (a_.max() + h_) + n * (b_.max() + h_), j1 + u * (a_.min() - h_) + n * (b_.max() + h_))]
-    inside = along[pick]
-    intrudes = bool(np.any((inside > lay.cell) & (inside < gap - lay.cell)))
-    return {"polygon_m": poly, "intrudes": intrudes}
+    if int(pick.sum()) < 2:
+        return []
+    mask = np.zeros(state.shape, bool)
+    mask[occ[pick, 0], occ[pick, 1]] = True
+    parts, n_parts = ndimage.label(mask, structure=np.ones((3, 3)))
+    out = []
+    for i in range(1, n_parts + 1):
+        rc = np.argwhere(parts == i)
+        pts = np.column_stack([lay.origin[0] + (rc[:, 1] + 0.5) * lay.cell,
+                               lay.origin[1] + (rc[:, 0] + 0.5) * lay.cell])
+        if len(pts) < 2:
+            continue
+        span = float(np.max(np.linalg.norm(pts[:, None] - pts[None], axis=-1)))
+        if span + lay.cell < LEAF_MIN_M:
+            continue
+        a_ = (pts - j1) @ u  # the leaf's rectangle, along the jamb line and across it
+        b_ = (pts - j1) @ n
+        h_ = lay.cell / 2
+        poly = [[round(float(x), 4), round(float(y), 4)] for x, y in
+                (j1 + u * (a_.min() - h_) + n * (b_.min() - h_),
+                 j1 + u * (a_.max() + h_) + n * (b_.min() - h_),
+                 j1 + u * (a_.max() + h_) + n * (b_.max() + h_),
+                 j1 + u * (a_.min() - h_) + n * (b_.max() + h_))]
+        intrudes = bool(np.any((a_ > lay.cell) & (a_ < gap - lay.cell)))
+        out.append((len(pts), {"polygon_m": poly, "intrudes": intrudes}))
+    return [leaf for _, leaf in sorted(out, key=lambda x: -x[0])]
 
 
 def features(lay: Layers, footprint_radius: float | None = None,
@@ -1054,7 +1165,7 @@ def features(lay: Layers, footprint_radius: float | None = None,
         normal = math.degrees(math.atan2(n[1], n[0]))  # from sides[0] (behind) to sides[1]
         walls = c1 is not None and c2 is not None and state[c1] == OCCUPIED and \
             state[c2] == OCCUPIED
-        door_obj = any(math.hypot(d[0] - centre[0], d[1] - centre[1]) <= DOOR_OBJECT_M
+        door_obj = any(_segment_distance(np.asarray(d[:2], np.float64), j1, j2) <= DOOR_OBJECT_M
                        for d in doors)
         if footprint_radius and width < 2 * footprint_radius:
             kind = "narrow"
@@ -1062,9 +1173,9 @@ def features(lay: Layers, footprint_radius: float | None = None,
             kind = "door"
         else:
             kind = "opening"
-        leaf = _leaf(state, lay, j1, j2) if kind == "door" else None
+        leaves = _leaves(state, lay, j1, j2) if kind == "door" else []
         passages.append(Passage(centre, width, normal, (j1, j2), (sides[0] - 1, sides[1] - 1),
-                                kind, leaf))
+                                kind, leaves[0] if leaves else None, leaves=leaves))
     # frontiers: free cells next to unknown ones (or the grid's edge)
     unknown = np.pad(state == UNKNOWN, 1, constant_values=True)
     next_unknown = unknown[:-2, 1:-1] | unknown[2:, 1:-1] | unknown[1:-1, :-2] | unknown[1:-1, 2:]

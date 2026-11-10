@@ -235,11 +235,12 @@ def test_rivals_need_distinct_evidence_and_small_keyframes_give_no_hypothesis() 
     tol = rl.tolerance((0.01, 0.1))
     assert tol == (rl.FAR_POS_M, rl.FAR_ROT_DEG)
     assert rl.tolerance((0.2, 6.0)) == pytest.approx((0.6, 18.0))
-    assert rl._rival(best, [same, near], tol, iq, xyz) is None  # same points: keyframes off
-    assert rl._rival(best, [same, other, rl.Hypothesis(far, 2, m2)], tol, iq, xyz) is other
-    assert rl._rival(best, [rl.Hypothesis(close, 4, m2)], tol, iq, xyz) is None  # within tol
-    assert rl._rival(best, [twin], tol, iq, xyz) is twin
-    assert rl._rival(best, [rl.Hypothesis(far, 0, np.zeros(16, bool))], tol, iq, xyz) is not None
+    assert not rl.distinct(same, best, tol, iq, xyz)  # same points: keyframes off
+    assert not rl.distinct(near, best, tol, iq, xyz)  # the same pose
+    assert rl.distinct(other, best, tol, iq, xyz)  # other keypoints, far
+    assert not rl.distinct(rl.Hypothesis(close, 4, m2), best, tol, iq, xyz)  # within tol
+    assert rl.distinct(twin, best, tol, iq, xyz)
+    assert rl.distinct(rl.Hypothesis(far, 0, np.zeros(16, bool)), best, tol, iq, xyz)
     assert rl.spread(best, [same], tol, iq, xyz) == pytest.approx((1.0 / math.sqrt(2), 0.0))
     P, D = _scene()
     small = _kf("s", rooms.camera(0.2, 0.0, 1.0, 0.0, -10.0), P[:12], D[:12])
@@ -308,3 +309,54 @@ def test_an_implausible_solve_is_not_located(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(rl, "plausible", lambda h, kfs, index: False)
     o = rl.locate(_query(A, P, D), rl.Index([_kf("a", A, P, D)]))
     assert not o.located
+
+
+def test_repeated_rooms_with_noisy_keyframes_stay_within_three_sigma() -> None:
+    """Three copies of one structure 4 m apart (a house of repeated rooms), the frame's own copy
+    mapped by one keyframe, the others by two, every keyframe 2 cm / 0.5 deg off: without a prior
+    the pose may be any copy, but its sigmas cover the others (the truth within 3 sigma); with a
+    prior the copy that agrees with it is picked although it has less support, and a prior that
+    no hypothesis agrees with widens the sigmas to cover it."""
+    P, D = _scene(n=500)
+    rng = np.random.default_rng(4)
+
+    def off(T: np.ndarray) -> np.ndarray:
+        out = _rz(float(rng.normal(0, 0.5)), T[:3, 3]) @ T
+        out[:3, 3] += rng.normal(0, 0.02, 3)
+        return out
+
+    kfs = []
+    for k, n in ((0, 1), (1, 2), (2, 2)):
+        S = np.eye(4)
+        S[1, 3] = 4.0 * k
+        for j in range(n):
+            T = S @ rooms.camera(0.0, 0.15 * j, 1.0, 4.0 * j, -10.0)
+            kf = _kf(f"c{k}{j}", T, _apply(S, P), D)
+            kf.T = off(kf.T)
+            kfs.append(kf)
+    idx = rl.Index(kfs)
+    T = rooms.camera(0.1, 0.05, 1.0, -3.0, -10.0)
+    o = rl.locate(_query(T, P, D), idx)
+    assert o.T is not None and o.sigma_pos_m is not None and o.sigma_rot_deg is not None
+    ep, er = rl.pose_distance(o.T, T)
+    assert ep <= 3 * o.sigma_pos_m and er <= 3 * o.sigma_rot_deg
+    p = rl.locate(_query(T, P, D, prior=T), idx)
+    assert p.T is not None and rl.pose_distance(p.T, T)[0] < 0.1 and p.consistent_with_prior
+    lost = T.copy()
+    lost[0, 3] += 2.0  # a prior 2 m off every copy
+    q = rl.locate(_query(T, P, D, prior=lost), idx)
+    assert q.T is not None and q.consistent_with_prior is False and q.sigma_pos_m is not None
+    assert rl.pose_distance(q.T, lost)[0] <= 3 * q.sigma_pos_m
+
+
+def test_a_weak_twin_neither_flags_nor_widens() -> None:
+    """A twin view mapped by a keyframe that sees a sixth of the structure: a rival with less
+    than a quarter of the pose's support is no ambiguity and leaves the sigmas as they are."""
+    P, D = _scene()
+    S = _rz(180.0, np.array([2.75, 0.0, 0.0]))
+    twin = _kf("twin", S @ A, _apply(S, P)[:100], D[:100])
+    idx = rl.Index([_kf("a", A, P, D), twin])
+    T = rooms.camera(0.1, 0.05, 1.0, -3.0, -10.0)
+    o = rl.locate(_query(T, P, D), idx)
+    assert o.T is not None and o.ambiguity is None and rl.pose_distance(o.T, T)[0] < 0.02
+    assert o.sigma_pos_m is not None and o.sigma_pos_m < 0.05

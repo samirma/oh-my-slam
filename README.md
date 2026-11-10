@@ -213,6 +213,29 @@ Anchored maps (below) report their own sigmas.
   (`quality.previous_residuals`, so `max_residual_m` sees a warp), and beyond 3 position sigmas
   plus the depth tolerance it is `prior_conflict` and not fused. Registered frames report the
   residual of their committed pose to their image-only pose, as before.
+* **A warping update is rejected with priors too.** A frame that the update's priors alone place
+  — kept `provisional` at its prior, registered by depth geometry (which cannot see a slide along a
+  bare wall), or placed in position by a rotation fit — takes as its residual to the map
+  (`quality.previous_residuals`, and so the gauge shift) at least the largest disagreement the
+  update's prior conflicts measured: a conflict's image pose against its prior, or a depth that
+  contradicts the map at the prior (`mapping.anchored.inherit_conflicts`, in the update and the
+  dry run). Before, those frames reported no residual, and conflicting frames are rejected
+  rather than measured, so an update whose priors had slipped was accepted as long as fewer
+  than half its frames conflicted. Measured on the ray-cast room (a textured frame at its prior,
+  then priors slipped by 0.3 m: one textured frame, three bare walls with depth images; the
+  skill's gate `max_residual_m 0.10, max_gauge_shift_m 0.05, max_rejected_share 0.5`): metric
+  and drifting priors, accepted (previous residual max 3 mm, rejected share 0.2) → rejected
+  (`max_residual_m`, `max_gauge_shift_m`; previous residual max 0.30 m), and the dry run
+  predicts it; the same update with priors that agree is accepted (max 1 mm). An update without
+  a prior conflict reports what it did before (a consistent offset of metric priors is still
+  caught by the gauge shift from 0.1 m, a drifting prior's offset is the odometry's and is
+  absorbed).
+* **Keyframes without features or depth are no references.** A stored keyframe whose features or
+  keypoint depths are missing (its `kf/<id>.npz` gone or partial) is skipped by registration,
+  never an error. A dry run places its frames on several threads against one loaded map: a
+  keyframe's features are loaded once under a lock and set after its depths, so no thread sees
+  the features without the depths (before, a dry run could fail with `AssertionError` in
+  `_correspondences`, HTTP 500, reproduced by `test_keyframes_load_once_across_threads...`).
 * **Pose sigmas** of an anchored map's frames: the image pose's covariance (Gauss-Newton, inflated
   by its χ²) with the depth bias the covariance does not see (1 % of the references' median
   depth), combined with the prior as the estimate combines them — for a metric prior the weighted
@@ -320,7 +343,9 @@ server.
   The camera's ignore mask and the frame's own are combined, rectified with the image to the
   camera's canonical pinhole (lens handling as in an update), and no feature is taken there.
 * **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px, contrast threshold 0.01: a quarter
-  of OpenCV's default, for low-contrast simulated and indoor frames) against every keyframe up to 24,
+  of OpenCV's default, for low-contrast simulated and indoor frames; in a house of repeated rooms
+  it gives more wrong-room poses than the default, 13 against 7 of 30, which the rules below
+  cover with their sigmas, and on other scenes fewer false ambiguities, 1 against 4 of 25) against every keyframe up to 24,
   else the 12 with most nearest-neighbour votes (FLANN, L2 < 230) plus up to 6 keyframes within
   max(1 m, 3 σ + 0.5 m) of the frame's prior; Lowe ratio 0.8, ≥ 8 matches per keyframe.
 * **Map points.** Each keyframe keypoint's map point is triangulated with the stored keyframe
@@ -329,8 +354,11 @@ server.
   the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Provisional frames
   take part with their provisional poses.
 * **Pose.** RANSAC PnP (AP3P, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
-  besides that pooled hypothesis, a second fit without its inliers and a fit on each of the 6
-  keyframes with most correspondences alone. The reported pose is the hypothesis explaining most
+  besides that pooled hypothesis, a second fit without its inliers, a fit on each of the 6
+  keyframes with most correspondences alone, a fit on each of the 4 *places* the matched keyframes
+  were taken from (each keyframe, best-matched first, joins the first place whose first keyframe
+  lies within 1.5 m: a twin room's keyframes give their own hypothesis) and, with a prior, a fit on
+  the keyframes near it (those `candidates` adds). The reported pose is the hypothesis explaining most
   query keypoints, refined (Levenberg-Marquardt) on its inliers, then refined against every
   matched keyframe at once (`relocalize.refine_keyframes`): each inlier correspondence of each
   keyframe is one residual, whitened by its own uncertainty — 1 px (at 640 px) across the image
@@ -348,19 +376,26 @@ server.
   (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it is
   measured against); *spread* the RMS distance of the other hypotheses of the same place,
   weighted by their squared relative support. Keyframes whose depth or pose disagree therefore
-  widen the sigmas. With an `ambiguity`, each sigma is at least half the rival's distance (the
-  mixture of the two, not the winner alone); with an `inlier_ratio` below 0.4, at least 5 cm and
-  1° (a provisional floor until the replay calibrates it).
+  widen the sigmas. Every rival (below) with at least **0.25** of the pose's support, not only
+  the one that makes the pose ambiguous, floors each sigma at half its distance (the mixture of
+  the pose and its rivals, not the winner alone); a pose that disagrees with its prior
+  (`consistent_with_prior` false, judged on the sigmas before this) has sigmas of at least half
+  its distance to the prior plus the prior's own sigma (the images or the prior may be the one
+  that is wrong; turn fits too); with an `inlier_ratio` below 0.4, at least 5 cm and 1° (a
+  provisional floor until the replay calibrates it).
   `SIGMA_SCALE` is 1.0 until the replay calibrates it (see the measurements below).
 * **Ambiguity** (`ambiguity_support_ratio` **0.6**). The rival is the best-supported other
   hypothesis that is another place: farther than 0.3 m or 15° — or 3 times the pose's fit and
   keyframe sigmas when larger — and, when it explains mostly the same query keypoints, by map
   points ≥ 30 % of their range apart (median; a symmetric room's twin view, not keyframes that
   disagree in depth), and not brought back to the pose when refined on both inlier sets
-  (`_same_basin`). `ambiguity` is set when its support is
-  ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. A prior, then the frame's height,
-  picks the rival over the pose when only the rival agrees with it and it has ≥ 0.6 of the
-  pose's support. Turn fits: a second turn
+  (`_same_basin`). `ambiguity` is set when the best rival's support is
+  ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. When the pose disagrees with the
+  frame's prior (or its height), the prior (then the height) picks the best-supported rival that
+  agrees with it and has ≥ **0.25** of the pose's support (and is plausible); the pose it
+  replaces is then a rival, which sets `ambiguity` when it has ≥ 0.6 of the support and widens
+  the sigmas. In a house of repeated rooms the right room often has a third of the wrong one's
+  support (fewer keyframes there), so the earlier rule (≥ 0.6) kept the wrong room. Turn fits: a second turn
   fit without the first one's inliers, > 5° away, at the same ratio.
 * **`consistent_with_prior`**: the pose within 3 σ of a `metric` or `drifting` prior, the two
   sigmas combined per component (the prior's default 5 cm, 2°); null without a prior.
@@ -371,6 +406,9 @@ server.
   toward where the keyframe looks (the mean of its keypoints' map points) seen from the prior's
   position, counter-clockwise positive, in (−180, 180]; null without a prior. `nearest_view` is
   null when no keyframe has a vote.
+* **Index.** The derivation worker builds each version's locate index, its nearest-neighbour
+  index of every keyframe descriptor included (`Index.prepare`), right after deriving it; the
+  first locate does not wait for it. Concurrent locates share it under a lock (built once).
 * **Recording.** `record: true` stores the last located frame of the request as
   `maps/<name>/pose.json` (outside the versions); `GET /api/maps/{name}/pose` answers it, or
   `no_pose`.
@@ -419,7 +457,10 @@ server.
   2 m). A disc cell stays occupied only when its highest surface in the band lies more than
   0.10 m above the camera's lowest line of sight there (`h (1 − d / radius)`: a wall, a jamb, a
   table leg the camera could see), and only the cells the camera cell reaches without crossing
-  those are freed.
+  those are freed, and of those only the cells in straight sight of it (no such surface on the
+  line from the camera's cell): what an open leaf or a wall's end hides is not its blind disc
+  (before, the flood fill went round a leaf's free end and freed the wall hidden behind it,
+  which joined the two rooms of a doorway and blocked its passage).
   This is done at 5 cm for the features and again on the cells asked.
 * **Resolution.** Passages, regions and frontiers are computed at the volume's 5 cm whatever
   `cell_m` is asked (the layers are then resampled), so they do not change with the cell size.
@@ -427,17 +468,31 @@ server.
   below 1 m, the chord toward its nearest obstacle and on to the opposite one, refined to the
   shortest within ±10°; kept when it lies in a wall — beyond both ends the obstacle goes on along
   the chord for 0.4 m, no free cell on the line, ≥ 50 % occupied (beside the line included) — and
-  ≤ 2 m long; the shortest one per gap; and, for each door-labelled object of the version with
-  no chord within 0.6 m, the shortest free chord through the free cells within 0.6 m of it, every
-  10°, ending on occupied cells, of a door's width (a wall seen from one side or partly); then the narrowest free chord beside it is taken (shifted
-  along its normal by up to ±0.5 m, turned by up to ±20°, both ends on obstacles, its midpoint
-  between the walled chord's jambs), so that an open leaf or a deep frame counts as an obstacle. Its ends, moved half a cell outward (a jamb's face lies inside the cell the chord ends on), are `jambs_m`, their distance `width_m`, its midpoint
+  ≤ 2 m long; the shortest one per gap (2.5 m let furniture gaps through: 11 → 18 passages on
+  the house bench, doors unchanged).
+* **Door objects' passages.** For each door-labelled object of the version that no chord passes
+  within 0.6 m of: through the free cells within 1 m of it, every 10°, the free chords 0.55–2.5 m
+  wide (a 2 m double door) across the gap (their midpoint at least 0.4 of their length from any obstacle) that lie in
+  the door's wall line (`navgrid._door_walled`): beyond each end, along the chord for up to 1 m,
+  no free cell before 0.4 m of wall is seen (on the line or beside it, perhaps after a stretch
+  hidden behind an open leaf), or nothing free at all (a wall wholly hidden), with the wall seen
+  beyond one end at least; each end on an occupied cell, or on a jamb hidden behind a leaf
+  (unknown, the wall going on beyond it). Of those, the one with most wall seen beyond its ends
+  (the wall line, not a chord between two open leaves or across a room's corner), then the
+  shortest; failing any, the shortest ending on occupied cells of a door's width (≤ 1.3 m).
+* **Narrowest.** Each passage's chord is then replaced by the narrowest free chord beside it
+  (from free cells, shifted along its normal by up to ±0.5 m, turned by up to ±20°, both ends on
+  obstacles, its midpoint between the walled chord's jambs), of equal ones (within a tenth of a
+  cell: leaves open at 90°) the nearest to the walled chord, so that an open leaf or a deep frame
+  counts as an obstacle and the jambs stay on the wall line. Its ends, moved half a cell outward (a jamb's face lies inside the cell the chord ends on), are `jambs_m`, their distance `width_m`, its midpoint
   `centre_m`, `normal_deg` perpendicular to it from `regions[0]` to `regions[1]`. `kind`:
   `narrow` when narrower than `2 × footprint_radius_m`; else `door` when a door-labelled object
-  of the version lies within 0.6 m of its centre, or both jambs are occupied and it is 0.55–1.3 m
-  wide; else `opening`. `leaf` (doors): the occupied cells within the gap's width of the jamb line
-  (off it by > 0.15 m), along it within 0.15 m of the gap, spanning ≥ 0.3 m — their rectangle;
-  `intrudes` when they reach between the jambs.
+  of the version lies within 0.6 m of its jamb segment, or both jambs are occupied and it is
+  0.55–1.3 m wide; else `opening`. `leaf` (doors): the occupied cells within the gap's width of
+  the jamb line (off it by > 0.15 m), along it within 0.15 m of the gap, in connected pieces
+  spanning ≥ 0.3 m (a double door's two leaves) — the largest one's rectangle (the schema has
+  one leaf; the others are computed, `Passage.leaves`, but not answered); `intrudes` when it
+  reaches between the jambs.
 * **Regions.** The chords are cut out of the free cells; each connected part of ≥ 0.25 m² is a
   region (a chord whose two sides stay connected is dropped). `polygon_m` its outer boundary,
   `coverage_share` its cells with `floor_observed` 1 over its free cells plus the unknown cells its
@@ -506,6 +561,46 @@ uint8 `[n, 3]`.
   10 m box 35–330 ms. The two-room scene of `tests/synth/rooms.py` gives the door exactly: width
   0.90 m, jambs at y 1.50 and 2.40, normal 0°/180°, kind `door`; with an open leaf 0.85 m, leaf
   reported.
+
+### Locate outliers and wide doorways measured (2026-11-10, M3 Pro, in process)
+
+* **Repeated rooms** (the wheeled-base house with every room alike — texture and furniture —, a
+  123-frame tour, keyframes off by σ 3 cm / 1° and one in ten by a further 0.25 m / 6° their
+  sigmas do not state, monocular-like depth; 30 held-out frames, without and with a prior off by
+  σ 5 cm / 2°). Before (the merged locate line): 30/30 located, p90 position error 8.0 m, 7 poses
+  outside 3 σ with a 3 cm sigma (a twin room 4–8 m away; with a prior, `consistent_with_prior`
+  false but the sigma tight). The causes, by ablation: the right room's hypothesis was often
+  missing (only the 6 best keyframes were fitted alone) or had a third of the wrong room's support
+  (the prior needed 0.6 to pick it), and sigmas covered only a rival of ≥ 0.6 support, never the
+  prior; AP3P, the joint refinement and the sigma floors change nothing measurable (13 wrong rooms
+  of 30 with each removed), contrast 0.01 against 0.04 gives 13 against 7 wrong rooms without a
+  prior, the prebuilt index only latency. After (place fits, a prior fit, the prior picking at
+  0.25, sigmas covering rivals ≥ 0.25 and a disagreeing prior): without a prior 30/30 located, 13 in a twin room (no
+  image can tell the rooms apart) but every pose within 3 σ of the truth (10 of the 13 with
+  `ambiguity`, the others with sigmas covering a weaker rival); with a prior every frame in the
+  right room, median 4.5 cm, p90 9.8 cm, max 0.23 m, none outside 3 σ (the sigmas then cover the
+  twin room: `ambiguity` set on most frames, as the spec asks of a rival with comparable
+  support).
+* **The same house without repetition**: unchanged positions (median 4.3–4.4 cm, p90 11.6 cm, none
+  outside 3 σ), `ambiguity` null on 24 of the 25 frames within 0.10 m / 5° as before, error/σ
+  median 0.33–0.42 (0.41–0.44 before).
+* **Low texture** (the earlier locate bench, keyframes off by 5 cm / 1.5°): 20/20 (16/20 at the lowest texture) as before, median 9.3 cm,
+  error/σ median 0.87 (p90 1.0); default texture 20/20, median 3.7 cm, error/σ 0.59 (p90 1.02),
+  ambiguity null on all 18 right frames; latency p90 0.14–0.58 s per frame.
+* **Wide doorways** (two rooms, doorways 0.8–2.0 m with one leaf (< 1.2 m) or two, open 90° into
+  the observer's room or the far room, cameras 1–2 m from the door at 1.0 m and 0.25 m height,
+  door objects on the leaves or at the gap; 24 cases per direction): leaves into the observer's
+  room, passages within 0.3 m, centre within 0.10 m and width within 0.10 m of the clear width:
+  4/24 → 23/24 (door objects on the leaves or at the gap); leaves into the far room 8/24 (13/24
+  with the object at the gap) → 24/24. Without door objects 0–1/24 (into the observer's room):
+  the wall beside the jambs hides behind the leaves, and the plain rule needs it seen beyond both
+  ends. The 2 m double door: width 1.95 m (clear 1.92 m), centre 7 cm off the gap's along the
+  normal (the jamb line lies inside the cell), jambs at y 1.03 and 2.98, both leaves. With a
+  depth range of 2.5 m (3 m) only 12/24 (15/24): from 2 m the doorway itself and the far side
+  stay unknown, so no far region exists and, by map.md §6, no passage. House bench (five 0.9 m
+  doors, 2 cm and 10 cm walls): doors 5/5 and their geometry unchanged, camera rings unchanged
+  (0.74), passages 11 → 12 and 13 → 14 (one more beside furniture), `GET grid` layers and
+  features 0.26–0.30 s → 0.27–0.42 s (measured while the test suite ran).
 
 ### Derived versions
 

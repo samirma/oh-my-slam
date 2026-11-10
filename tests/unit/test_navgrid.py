@@ -126,16 +126,22 @@ def test_leaf_needs_cells_off_the_jamb_line() -> None:
     st = np.zeros((40, 40), np.uint8)
     lay = _grid(st)
     j1, j2 = np.array([2.0, 1.5]), np.array([2.0, 2.4])
-    assert ng._leaf(st, lay, j1, j2) is None  # nothing occupied
+    assert ng._leaves(st, lay, j1, j2) == []  # nothing occupied
     st[15, 25] = 2
-    assert ng._leaf(st, lay, j1, j2) is None  # one cell
+    assert ng._leaves(st, lay, j1, j2) == []  # one cell
+    apart = st.copy()
+    apart[18, 27] = 2
+    assert ng._leaves(apart, lay, j1, j2) == []  # two cells, apart: two pieces of one cell
     short = np.zeros((40, 40), np.uint8)
     short[15, 22:24] = 2
-    assert ng._leaf(short, lay, j1, j2) is None  # too short
+    assert ng._leaves(short, lay, j1, j2) == []  # too short
     st[16:20, 22] = 2  # a leaf swung half into the gap
     st[15, 21:29] = 2
-    leaf = ng._leaf(st, lay, j1, j2)
-    assert leaf is not None and leaf["intrudes"] and len(leaf["polygon_m"]) == 4
+    (leaf,) = ng._leaves(st, lay, j1, j2)
+    assert leaf["intrudes"] and len(leaf["polygon_m"]) == 4
+    st[24, 21:29] = 2  # a second leaf, at the other jamb: a double door
+    two = ng._leaves(st, lay, j1, j2)
+    assert len(two) == 2 and two[0] == leaf and not two[1]["intrudes"]
 
 
 def test_features_kinds_frontiers_and_small_parts() -> None:
@@ -333,3 +339,38 @@ def test_the_floor_is_the_surface_the_robot_stands_on() -> None:
         base.integrate(f"b{i}", d, rooms.K640, T, d > 0)
     assert base.estimate_floor(0.25) == pytest.approx(0.0, abs=0.01)
     assert base.estimate_floor(0.25, 0.06) == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.parametrize("height", [1.0, 0.25])
+def test_a_wide_double_doorway_with_both_leaves_open_into_the_room(height: float) -> None:
+    """A 2 m double doorway, both leaves open 90 deg into the observer's room, the observer 1.5 m
+    away, the far room seen only through the opening, door objects detected on the leaves: the
+    passage is the doorway, its width the clear width between the leaves (open leaves are
+    obstacles), its centre the free gap's at the jamb line, both leaves reported. Without the
+    door objects the hidden wall leaves no walled chord; the blind disc frees nothing the leaves
+    hide."""
+    scene = rooms.double_door()
+    cams = [rooms.camera(x, y, height, yaw, -15.0 if height > 0.5 else 0.0)
+            for x, y in ((2.5, 2.0), (2.0, 1.3)) for yaw in range(0, 360, 30)]
+    vol = ng.Volume()
+    for i, T in enumerate(cams):
+        d = scene.depth(T)
+        vol.integrate(f"f{i}", d, rooms.K640, T, d > 0)
+    floor = vol.estimate_floor(height)
+    lay = ng.layers(vol, floor, 0.05, 1.8)
+    ng.mark_stands(lay, [ng.Stand(T, rooms.K640, 320, 240) for T in cams], floor, 0.0)
+    assert lay.state[lay.cell_of([3.5, 3.5])] == ng.UNKNOWN  # behind a leaf, inside a disc
+    assert not ng.features(lay).passages
+    feat = ng.features(lay, doors=[(3.5, 1.02), (3.5, 2.98)])
+    (p,) = feat.passages
+    assert p.kind == "door" and len(feat.regions) == 2 and p.regions in ((0, 1), (1, 0))
+    assert p.width == pytest.approx(1.92, abs=0.1)
+    assert float(np.linalg.norm(p.centre - [4.05, 2.0])) <= 0.1
+    assert sorted(round(float(j[1]), 1) for j in p.jambs) == [1.0, 3.0]
+    assert len(p.leaves) == 2 and p.leaf == p.leaves[0]
+    assert all(abs(float(np.mean([q[1] for q in leaf["polygon_m"]])) - y) < 0.1
+               for leaf, y in zip(sorted(p.leaves, key=lambda f: f["polygon_m"][0][1]),
+                                  (1.02, 2.98), strict=True))
+    # one door object at the gap's centre finds it too
+    (q,) = ng.features(lay, doors=[(4.05, 2.0)]).passages
+    assert float(np.linalg.norm(q.centre - p.centre)) < 1e-6

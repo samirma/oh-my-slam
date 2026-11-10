@@ -88,3 +88,13 @@ def tour(height: float = 1.0) -> list[NDArray[np.float64]]:
     out.append(camera(3.0, 1.95, height, 0.0))
     out.append(camera(5.2, 1.95, height, 180.0))
     return out
+
+
+def double_door(gap: tuple[float, float] = (1.0, 3.0), leaf_t: float = 0.04) -> Scene:
+    """The two rooms joined by a wide double doorway whose two leaves, hinged at its jambs, stand
+    open 90 deg into room A (the observer's): the wall beside the jambs hides behind them."""
+    s = two_rooms(door=gap)
+    w = (gap[1] - gap[0]) / 2
+    s.add((4.0 - w, gap[0], 0.0), (4.0, gap[0] + leaf_t, 2.0))
+    s.add((4.0 - w, gap[1] - leaf_t, 0.0), (4.0, gap[1], 2.0))
+    return s

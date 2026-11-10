@@ -837,3 +837,60 @@ def test_a_snapshot_of_a_map_without_mapper_folder(tmp_path: Path) -> None:
     s.commit("m", {"frames": []}, None)
     assert s.snapshot("m", tmp_path / "x")["version"] == 1  # type: ignore[index]
     assert not (tmp_path / "x").exists()
+
+
+def test_keyframes_load_once_across_threads_and_incomplete_ones_are_skipped(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dry run places frames on several threads against a map loaded from disk: a keyframe's
+    features are never seen without its keypoint depths (they load under a lock, features
+    last), and keyframes stored without either are no references."""
+    import threading
+    import time as _time
+
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    m.save()
+    real = np.lib.npyio.NpzFile.__getitem__
+
+    def slow(self: Any, key: str) -> Any:
+        if key == "kdepth":
+            _time.sleep(0.05)  # widen the window between features and depths
+        return real(self, key)
+
+    monkeypatch.setattr(np.lib.npyio.NpzFile, "__getitem__", slow)
+    m2 = AnchoredMap.load(m.root)
+    fs = [frame(f"n{k}", base_pose(5 + 3 * k), p=None) for k in range(6)]
+    feats = [an.features(f.rgb, f.ignore) for f in fs]
+    out: list[Any] = [None] * len(fs)
+
+    def one(k: int) -> None:
+        out[k] = m2.place(fs[k], feats[k], None, evidence=False)
+
+    threads = [threading.Thread(target=one, args=(k,)) for k in range(len(fs))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [p.status for p in out] == ["registered"] * len(fs)
+    # the lock's second look: another thread loaded it meanwhile
+    k0 = AnchoredMap.load(m.root).keyframes[0]
+    m3 = AnchoredMap.load(m.root)
+
+    class Loaded:
+        def __enter__(self) -> None:
+            k0.feats = an.Features(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8))
+
+        def __exit__(self, *a: Any) -> None:
+            return None
+
+    m3._kf_lock = Loaded()  # type: ignore[assignment]
+    m3._load_kf(k0)
+    assert k0.kdepth is None and k0.feats is not None and not len(k0.feats.kps)
+    # stored without depths, or without anything: skipped
+    kd = m.root / an.KF_DIR / f"{m.keyframes[1].id}.npz"
+    with np.load(kd) as z:
+        np.savez(kd, kps=z["kps"], desc=z["desc"])
+    (m.root / an.KF_DIR / f"{m.keyframes[0].id}.npz").unlink()
+    m4 = AnchoredMap.load(m.root)
+    corr = m4._correspondences(feats[0], m4.keyframes)
+    assert len(corr.uv) == 0 and all(k.feats is None for k in m4.keyframes)

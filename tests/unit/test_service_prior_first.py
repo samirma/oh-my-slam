@@ -489,3 +489,69 @@ def test_a_look_in_two_halves_with_a_dry_run_between(client: Client,
     again = dry(client, "m", f2, files2)
     assert again["base_version"] == 3
     assert [r["predicted_reason"] for r in again["frames"]] == ["duplicate"] * 3
+
+
+def test_keyframes_without_features_or_depth_are_skipped_with_trust_none(client: Client) -> None:
+    """A map holding a keyframe stored without its features and one without its keypoint
+    depths: an update and a dry run of frames with trust none skip them as references, never
+    fail (HTTP 500)."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(30), base_pose(60)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    store = client.service.store
+    v = store.version("m")
+    kf = store.mapper_dir("m") / "kf" / f"{v['frames'][1]['internal']}.npz"
+    with np.load(kf) as z:
+        kept = {k: z[k] for k in z.files if k != "kdepth"}
+    np.savez(kf, **kept)  # a keyframe stored without its keypoint depths
+    (store.mapper_dir("m") / "kf" / f"{v['frames'][2]['internal']}.npz").unlink()  # nor features
+    nf, nfiles = frames_for(client, [base_pose(10), base_pose(20)], tag="n", trust=None)
+    for f in nf:
+        f["prior"] = {"trust": "none"}
+    out = dry(client, "m", nf, nfiles)
+    assert [r["predicted_status"] for r in out["frames"]] == ["registered"] * 2
+    job = client.update("m", nf, nfiles)
+    assert job["state"] == "committed"
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 2
+
+
+SKILL_GATE = {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}
+
+
+def _bare(k: int) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 240), (200 - 3 * k, 198, 190)).save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("trust", ["metric", "drifting"])
+@pytest.mark.parametrize("slip", [0.0, 0.3])
+def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, trust: str,
+                                                             slip: float) -> None:
+    """After a first textured frame the update's priors slip by 0.3 m: the one textured frame
+    after the slip conflicts with its prior (rejected, a fifth of the update), and the bare
+    walls are placed by their priors and depth alone, which cannot see a slide along the wall.
+    Their residual to the map is the conflict's (``inherit_conflicts``): the gate rejects the
+    update, in the dry run too. The same update with priors that agree is accepted."""
+    poses = [base_pose(30 * k) for k in range(6)]
+    fr, files = frames_for(client, poses, tag="a", trust=trust)
+    client.update("m", fr, files, cameras={"cam": CAM})
+    new = [base_pose(12 + 25 * k) for k in range(5)]
+    shift = np.eye(4)
+    shift[0, 3] = slip
+    fr, files = frames_for(client, new, tag="b", trust=trust,
+                           priors=[new[0]] + [shift @ T for T in new[1:]])
+    for k in (1, 3, 4):
+        files[f"b{k}"] = _bare(k)
+    d = dry(client, "m", fr, files, accept_if=SKILL_GATE)
+    job = client.update("m", fr, files, accept_if=SKILL_GATE)
+    q = job["quality"]
+    if slip == 0.0:
+        assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"]
+        assert [i["status"] for i in job["inputs"]] == ["registered"] * 5
+        assert q["previous_residuals"]["max_m"] < 0.02
+        return
+    assert job["state"] == "rejected" and "max_residual_m" in q["failed_checks"]
+    assert "max_residual_m" in d["quality"]["failed_checks"]
+    assert q["rejected_share"] == 0.2 and q["previous_residuals"]["max_m"] > 0.25
+    assert [i["reason"] for i in job["inputs"]][2] == "prior_conflict"
+    assert client.service.store.latest("m") == 1
