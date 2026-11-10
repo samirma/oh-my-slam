@@ -465,31 +465,43 @@ inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `n
 map (`mapping.relocalize`, from the version's derived keyframes, below). It needs no inference
 server.
 
-* **Checks.** A frame is first measured as in an update (`mapping.checks`): `plain`, `blur` or
-  `few_features` before matching (`too_close` needs a depth part, which a locate frame has not).
-  A frame the checks keep that gets no pose is `no_overlap` (with `nearest_view`, below), unless
-  it has fewer SIFT keypoints than a pose needs inliers (15, `relocalize.MIN_INLIERS`):
-  `few_features`.
+* **Checks.** A frame is first measured as in an update (`mapping.checks`): `plain` or `blur`
+  before matching (`too_close` is no locate reason). `few_features` is locate's own count: fewer
+  SIFT keypoints for matching than a pose needs inliers (**15**, `relocalize.MIN_INLIERS`); the
+  update checks' feature count plays no part. A frame with enough keypoints that gets no pose is
+  `no_overlap` (with `nearest_view`, below).
   The camera's ignore mask and the frame's own are combined, rectified with the image to the
   camera's canonical pinhole (lens handling as in an update), and no feature is taken there.
 * **Matching.** SIFT (OpenCV, ≤ 2000 keypoints at ≤ 1024 px, contrast threshold 0.01: a quarter
   of OpenCV's default, for low-contrast simulated and indoor frames; in a house of repeated rooms
   it gives more wrong-room poses than the default, 13 against 7 of 30, which the rules below
-  cover with their sigmas, and on other scenes fewer false ambiguities, 1 against 4 of 25) against every keyframe up to 24,
+  flag as rivals, and on other scenes fewer false ambiguities, 1 against 4 of 25) against every keyframe up to 24,
   else the 12 with most nearest-neighbour votes (FLANN, L2 < 230) plus up to 6 keyframes within
   max(1 m, 3 σ + 0.5 m) of the frame's prior; Lowe ratio 0.8, ≥ 8 matches per keyframe.
 * **Map points.** Each keyframe keypoint's map point is triangulated with the stored keyframe
   poses where a neighbour keyframe (4 nearest with a baseline ≥ 5 % of the scene depth, optical
   axes within 60°) sees it (reprojection ≤ 2 px at 640 px, rays ≥ 2° apart); the others come from
-  the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Provisional frames
-  take part with their provisional poses.
+  the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Only confirmed
+  keyframes take part: a `kept_at_prior` frame is never a reference.
 * **Pose.** RANSAC PnP (AP3P, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
   besides that pooled hypothesis, a second fit without its inliers, a fit on each of the 6
   keyframes with most correspondences alone, a fit on each of the 4 *places* the matched keyframes
   were taken from (each keyframe, best-matched first, joins the first place whose first keyframe
   lies within 1.5 m: a twin room's keyframes give their own hypothesis) and, with a prior, a fit on
-  the keyframes near it (those `candidates` adds). The reported pose is the hypothesis explaining most
-  query keypoints, refined (Levenberg-Marquardt) on its inliers, then refined against every
+  the keyframes near it (those `candidates` adds). A solve far from every keyframe, outside
+  their bounds or held by one keyframe's few inliers (`plausible`) is no hypothesis. A
+  hypothesis's **support** is its inliers (query keypoints it explains) over the best
+  hypothesis's, at most 1; it is *supported* at **0.25** (`SUPPORT_MIN`). The reported pose is
+  chosen among the supported hypotheses (`relocalize.choose`):
+  * with a `metric` or `drifting` prior, the one nearest the prior (distance in the prior's
+    sigmas, position and rotation combined) among those within 3 × the prior's own sigmas on
+    each component; when none is, the frame is `rejected` with **`prior_conflict`**. A prior
+    without sigmas takes the defaults of its trust (`anchor.default_sigmas`): `metric`
+    **0.05 m / 2°**, `drifting` **0.20 m / 5°**;
+  * without a prior, the best-supported, preferring those whose height agrees with the floor
+    plus the frame's `height_above_floor_m` (else the camera's), within 3 σ + 5 cm.
+
+  It is refined (Levenberg-Marquardt) on its inliers, then refined against every
   matched keyframe at once (`relocalize.refine_keyframes`): each inlier correspondence of each
   keyframe is one residual, whitened by its own uncertainty — 1 px (at 640 px) across the image
   of the keyframe's ray (the epipolar line), and along it the pixel plus the keyframe depth's
@@ -500,48 +512,40 @@ server.
   max(5 cm, 2 % of the depth)) is placed at their centre with the rotation that turns its rays onto
   theirs (the turn fit of `mapping.locate`, ≥ 15 inliers that are ≥ 25 % of the matches); its
   height is the floor plus the frame's `height_above_floor_m` (else the camera's) when given.
-* **Sigmas.** `SIGMA_SCALE × √(fit² + keyframes² + spread²)`: *fit* is the covariance of that
-  refinement (scaled by its RMS whitened residual when above 1), as the 3-D RMS of the centre (m)
-  and of the rotation (deg); *keyframes* the matched keyframes' own sigmas from the version
-  (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it is
-  measured against); *spread* the RMS distance of the other hypotheses of the same place,
-  weighted by their squared relative support. Keyframes whose depth or pose disagree therefore
-  widen the sigmas. Every rival (below) with at least **0.25** of the pose's support, not only
-  the one that makes the pose ambiguous, floors each sigma at half its distance (the mixture of
-  the pose and its rivals, not the winner alone); a pose that disagrees with its prior
-  (`consistent_with_prior` false, judged on the sigmas before this) has sigmas of at least half
-  its distance to the prior plus the prior's own sigma (the images or the prior may be the one
-  that is wrong; turn fits too); with an `inlier_ratio` below 0.4, at least 5 cm and 1° (a
-  provisional floor until the replay calibrates it).
-  `SIGMA_SCALE` is 1.0 until the replay calibrates it (see the measurements below).
-* **Ambiguity** (`ambiguity_support_ratio` **0.6**). The rival is the best-supported other
-  hypothesis that is another place: farther than 0.3 m or 15° — or 3 times the pose's fit and
-  keyframe sigmas when larger — and, when it explains mostly the same query keypoints, by map
-  points ≥ 30 % of their range apart (median; a symmetric room's twin view, not keyframes that
-  disagree in depth), and not brought back to the pose when refined on both inlier sets
-  (`_same_basin`). `ambiguity` is set when the best rival's support is
-  ≥ 0.6 of the pose's; `pos_m`, `rot_deg` are its distance. When the pose disagrees with the
-  frame's prior (or its height), the prior (then the height) picks the best-supported rival that
-  agrees with it and has ≥ **0.25** of the pose's support (and is plausible); the pose it
-  replaces is then a rival, which sets `ambiguity` when it has ≥ 0.6 of the support and widens
-  the sigmas. In a house of repeated rooms the right room often has a third of the wrong one's
-  support (fewer keyframes there), so the earlier rule (≥ 0.6) kept the wrong room. Turn fits: a second turn
-  fit without the first one's inliers, > 5° away, at the same ratio.
-* **`consistent_with_prior`**: the pose within 3 σ of a `metric` or `drifting` prior, the two
-  sigmas combined per component (the prior's default 5 cm, 2°); null without a prior.
+* **Sigmas.** The chosen hypothesis's own only (api.md §6), never the spread of its rivals or
+  the distance to the prior: `SIGMA_SCALE × √(fit² + keyframes²)`; *fit* is the covariance of
+  that refinement (scaled by its RMS whitened residual when above 1), as the 3-D RMS of the
+  centre (m) and of the rotation (deg); *keyframes* the matched keyframes' own sigmas from the
+  version (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it
+  is measured against). With an `inlier_ratio` below 0.4, at least 5 cm and 1° (the chosen
+  hypothesis explains few of its matches). `SIGMA_SCALE` is 1.0 until the replay calibrates it
+  (see the measurements below): until then the sigmas are a lower bound.
+* **Rivals and ambiguity.** A rival is any other plausible hypothesis farther than **0.10 m** or
+  **5°** from the reported pose (`RIVAL_POS_M`, `RIVAL_ROT_DEG`) with support ≥ 0.25, whatever
+  else its inliers explain (`relocalize.rivals_of`). `rivals` lists them strongest first with
+  `pos_m`, `rot_deg` (their distance to the reported pose) and `support`; a hypothesis within
+  0.10 m and 5° of a stronger rival is that rival solved again from other keyframes and is
+  listed once. `ambiguity` repeats `rivals[0]`, or is null when there is none. Turn fits have
+  two hypotheses: the turn and a second turn fit without its inliers (≥ 15 of them), chosen and
+  ranked by the same rules.
+* **`consistent_with_prior`**: null without a prior; always true for a located frame with one
+  (a frame that no supported hypothesis matches within 3 prior sigmas is `prior_conflict`).
 * **`inlier_ratio`**: query keypoints the pose explains over those with a correspondence (turn
   fits: inlier rays over matched rays).
-* **`nearest_view`** (no_overlap only): the keyframe with most nearest-neighbour votes (the
-  retrieval of this service: SIFT votes, no inference); `turn_deg` from the frame's prior heading
-  toward where the keyframe looks (the mean of its keypoints' map points) seen from the prior's
-  position, counter-clockwise positive, in (−180, 180]; null without a prior. `nearest_view` is
-  null when no keyframe has a vote.
+* **`nearest_view`** (no_overlap only, confirmed keyframes only): the keyframe with most
+  nearest-neighbour votes (the retrieval of this service: SIFT votes, no inference); for a frame
+  with a prior and no vote at all, the keyframe whose centre is nearest the prior's position, so
+  a frame with a prior always carries one. `turn_deg` from the frame's prior heading toward where
+  the keyframe looks (the mean of its keypoints' map points) seen from the prior's position,
+  counter-clockwise positive, in (−180, 180]; null without a prior. Without a prior,
+  `nearest_view` is null when no keyframe has a vote.
 * **Index.** The derivation worker builds each version's locate index, its nearest-neighbour
   index of every keyframe descriptor included (`Index.prepare`), right after deriving it; the
   first locate does not wait for it. Concurrent locates share it under a lock (built once).
 * **Recording.** `record: true` stores the last located frame of the request as
-  `maps/<name>/pose.json` (outside the versions); `GET /api/maps/{name}/pose` answers it, or
-  `no_pose`.
+  `maps/<name>/pose.json` (outside the versions), with its version's `scale_source` and
+  `scale_sigma_rel`; `GET /api/maps/{name}/pose` answers it, or `no_pose`. It takes no
+  `?version`: one answers 400 `invalid_request` with `details.field: "version"`.
 
 ### Navigation grid and points (O6)
 

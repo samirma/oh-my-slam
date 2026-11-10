@@ -245,6 +245,9 @@ def test_birdseye_of_each_version(client: Client) -> None:
     assert client.update("t", fr, files, cameras={"cam": CAM})["state"] == "committed"
     meta = client.get("/api/maps/t/birdseye", "Birdseye")
     assert meta["map"] == "t" and meta["map_version"] == 1
+    summary = client.get("/api/maps/t", "MapSummary")  # the version's scale (map.md §8)
+    assert (meta["scale_source"], meta["scale_sigma_rel"]) == (summary["scale_source"],
+                                                               summary["scale_sigma_rel"])
     r = client.http.get("/api/maps/t/birdseye.png")
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert "server-timing" in r.headers

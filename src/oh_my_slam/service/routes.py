@@ -91,13 +91,16 @@ ENDPOINTS: tuple[Endpoint, ...] = (
              "pixel_to_map", {200: None}, ("map_not_found", "version_gone", "invalid_request"),
              params=(MAP, VERSION), media="image/png"),
     Endpoint("GET", "/api/maps/{name}/birdseye", "get_birdseye",
-             "The bird's-eye image's metadata: size and pixel_to_map", {200: "Birdseye"},
+             "The bird's-eye image's metadata: size, pixel_to_map and the version's "
+             "scale_source and scale_sigma_rel", {200: "Birdseye"},
              ("map_not_found", "version_gone", "invalid_request"), params=(MAP, VERSION)),
     Endpoint("POST", "/api/maps/{name}/locate", "post_locate", "Locate frames in the map",
              {200: "Locate"}, ("invalid_request", "camera_conflict", "map_not_found",
                                "version_gone", "payload_too_large"),
              request="LocateRequest", multipart=True, params=(MAP,)),
-    Endpoint("GET", "/api/maps/{name}/pose", "get_pose", "Last recorded pose", {200: "Pose"},
+    Endpoint("GET", "/api/maps/{name}/pose", "get_pose",
+             "Last recorded pose, with the version it was located in and that version's scale; "
+             "takes no ?version (400 invalid_request, details.field version)", {200: "Pose"},
              ("map_not_found", "no_pose", "invalid_request"), params=(MAP,)),
     Endpoint("DELETE", "/api/maps/{name}", "delete_map", "Delete the map and its versions",
              {204: None}, ("map_not_found", "map_busy", "invalid_request"), params=(MAP,)),

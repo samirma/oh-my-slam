@@ -9,7 +9,7 @@ import pytest
 from oh_my_slam.mapping import navgrid as ng
 from oh_my_slam.mapping import relocalize as rl
 from tests.synth import rooms
-from tests.unit.test_relocalize import A, _apply, _kf, _query, _rz, _scene
+from tests.unit.test_relocalize import A, _apply, _kf, _query, _scene
 
 
 def test_a_tiny_depth_grid_has_no_normals_and_the_floor_falls_back_on_layers() -> None:
@@ -80,24 +80,18 @@ def test_refinement_survives_singular_systems(monkeypatch: pytest.MonkeyPatch) -
     assert np.allclose(T, A) and not np.isfinite(cov).all() and rms < 1.0
 
 
-def test_keyframe_sigmas_without_inliers_and_a_rival_in_the_same_basin(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+def test_keyframe_sigmas_without_inliers() -> None:
     P, D = _scene()
     idx = rl.Index([_kf("a", A, P, D)])
     h = rl.Hypothesis(A, 0, np.zeros(3, bool))
     assert rl._keyframe_sigmas(h, np.zeros(3, np.int64), idx) == (0.0, 0.0)
-    S = _rz(180.0, np.array([2.75, 0.0, 0.0]))
-    twin = rl.Index([_kf("a", A, P, D), _kf("twin", S @ A, _apply(S, P), D)])
-    T = rooms.camera(0.1, 0.05, 1.0, -3.0, -10.0)
-    monkeypatch.setattr(rl, "_same_basin", lambda *a: True)  # every rival: the same place
-    o = rl.locate(_query(T, P, D), twin)
-    assert o.located and o.ambiguity is None
 
 
-def test_a_1m_repeated_structure_inflates_the_sigmas_and_the_prior_picks() -> None:
+def test_a_1m_repeated_structure_is_a_rival_and_the_prior_picks() -> None:
     """e051 loc091: two copies of one structure 1 m apart, each mapped by its own keyframe; the
-    frame sees one of them. Its rival lies 1 m away with comparable support: the sigmas cover
-    it (half its distance at least), and a prior that agrees with the rival picks the rival."""
+    frame sees one of them. Its rival lies 1 m away with comparable support: it is flagged, the
+    sigmas stay the chosen hypothesis's own (api.md §6), and a prior that agrees with the rival
+    picks the rival."""
     P, D = _scene()
     shift = np.eye(4)
     shift[0, 3] = 1.0
@@ -106,12 +100,12 @@ def test_a_1m_repeated_structure_inflates_the_sigmas_and_the_prior_picks() -> No
     o = rl.locate(_query(T, P, D), idx)
     assert o.located and o.ambiguity is not None
     assert o.ambiguity["pos_m"] == pytest.approx(1.0, abs=0.05)
-    assert o.sigma_pos_m is not None and o.sigma_pos_m >= 0.5 * o.ambiguity["pos_m"] - 1e-3
+    assert o.sigma_pos_m is not None and o.sigma_pos_m < 0.1
     for prior in (T, shift @ T):
         p = rl.locate(_query(T, P, D, prior=prior), idx)
         assert p.T is not None and rl.pose_distance(p.T, prior)[0] < 0.05
-        assert p.consistent_with_prior is True and p.sigma_pos_m is not None
-        assert p.sigma_pos_m >= 0.49
+        assert p.consistent_with_prior is True and p.ambiguity is not None
+        assert p.ambiguity["pos_m"] == pytest.approx(1.0, abs=0.05)
 
 
 def test_a_low_inlier_ratio_floors_the_sigmas() -> None:

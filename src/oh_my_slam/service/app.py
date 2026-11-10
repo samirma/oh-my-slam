@@ -453,13 +453,18 @@ class Api:
         self.s.timings.add("locate_per_frame", dt / len(frames), len(frames))
         located = [r for r in results if r["status"] == "located"]
         if req.get("record") and located:
-            nav.record_pose(self.s.store, name, v["version"], located[-1])
+            nav.record_pose(self.s.store, name, v["version"], located[-1], v["scale_source"],
+                            v["scale_sigma_rel"])
         return body({"map": name, "map_version": v["version"],
                      "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"],
                      "frames": results})
 
     async def get_pose(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])
+        if "version" in request.query_params:
+            raise invalid("version", "GET …/pose takes no ?version: the recorded pose lives "
+                          "outside the versions, and its map_version is the version it was "
+                          "located in")
         self.s.store.require(name)
         return body({"map": name, **nav.recorded_pose(self.s.store, name)})
 

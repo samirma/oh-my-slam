@@ -66,12 +66,15 @@ def _draw(dv: DerivedVersion, objects: dict[str, Any]) -> tuple[bytes, dict[str,
 
 
 def read(dv: DerivedVersion, objects: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
-    """The version's image and its ``Birdseye`` metadata (without ``schema``), drawn once."""
+    """The version's image and its ``Birdseye`` metadata (without ``schema``), drawn once, with
+    the version's ``scale_source`` and ``scale_sigma_rel`` (map.md §8)."""
     png_path, meta_path = dv.dir / PNG, dv.dir / META
+    scale = {"scale_source": dv.record["scale_source"],
+             "scale_sigma_rel": dv.record["scale_sigma_rel"]}
     if meta_path.exists() and png_path.exists():
         out: dict[str, Any] = json.loads(meta_path.read_text())
-        return png_path.read_bytes(), out
+        return png_path.read_bytes(), {**out, **scale}
     png, meta = _draw(dv, objects)
     atomic_write_bytes(png_path, png)
     atomic_write_json(meta_path, meta)  # last: both exist once it does
-    return png, meta
+    return png, {**meta, **scale}

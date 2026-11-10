@@ -85,6 +85,7 @@ def test_a_symmetric_twin_makes_the_pose_ambiguous_and_the_prior_picks() -> None
     assert o.ambiguity["rot_deg"] == pytest.approx(180.0, abs=1.0)
     assert o.ambiguity["pos_m"] == pytest.approx(
         float(np.linalg.norm(T[:3, 3] - (S @ T)[:3, 3])), abs=0.05)
+    assert o.rivals and o.rivals[0]["support"] <= 1.0
     for prior in (T, S @ T):
         p = rl.locate(_query(T, P, D, prior=prior), idx)
         assert p.T is not None and rl.pose_distance(p.T, prior)[0] < 0.05
@@ -97,13 +98,17 @@ def test_a_symmetric_twin_makes_the_pose_ambiguous_and_the_prior_picks() -> None
         assert h.T is not None and rl.pose_distance(h.T, want)[0] < 0.05
 
 
-def test_a_prior_far_from_the_pose_is_inconsistent() -> None:
+def test_a_prior_far_from_every_hypothesis_is_a_prior_conflict() -> None:
+    """No supported hypothesis within 3 x the prior's sigmas: rejected prior_conflict, not
+    located with consistent_with_prior false (api.md §6); the frame keeps its nearest keyframe."""
     P, D = _scene()
     idx = rl.Index([_kf("a", A, P, D)])
     far = A.copy()
     far[0, 3] += 1.0
     o = rl.locate(_query(A, P, D, prior=far), idx)
-    assert o.located and o.consistent_with_prior is False
+    assert not o.located and o.reason == "prior_conflict" and o.nearest == 0
+    wide = rl.locate(_query(A, P, D, prior=far, prior_sigma_pos_m=0.5), idx)
+    assert wide.located and wide.consistent_with_prior is True and wide.reason is None
 
 
 def test_keyframes_from_one_spot_place_a_turn_without_depth() -> None:
@@ -213,39 +218,41 @@ def test_helpers() -> None:
     assert np.allclose(pts[0], [0, 0, 2]) or np.isnan(pts[0]).all()
 
 
-def test_rivals_need_distinct_evidence_and_small_keyframes_give_no_hypothesis() -> None:
-    m1 = np.zeros(16, bool)
-    m1[:6] = True
-    iq = np.r_[np.arange(10), np.arange(6)]  # correspondences 10-15: keypoints 0-5 again
-    xyz = np.zeros((16, 3))
-    xyz[10:] = [2.0, 0.0, 0.0]  # elsewhere: a twin
-    best = rl.Hypothesis(np.eye(4), 6, m1)
-    far = np.eye(4)
-    far[0, 3] = 1.0
-    same = rl.Hypothesis(far, 6, m1.copy())
-    near = rl.Hypothesis(np.eye(4), 4, ~m1)
-    m2 = np.zeros(16, bool)
-    m2[6:10] = True
-    other = rl.Hypothesis(far, 4, m2)
-    close = np.eye(4)
-    close[0, 3] = 0.2
-    m3 = np.zeros(16, bool)
-    m3[10:] = True
-    twin = rl.Hypothesis(far, 6, m3)  # the same keypoints, by points 2 m away: a twin view
-    tol = rl.tolerance((0.01, 0.1))
-    assert tol == (rl.FAR_POS_M, rl.FAR_ROT_DEG)
-    assert rl.tolerance((0.2, 6.0)) == pytest.approx((0.6, 18.0))
-    assert not rl.distinct(same, best, tol, iq, xyz)  # same points: keyframes off
-    assert not rl.distinct(near, best, tol, iq, xyz)  # the same pose
-    assert rl.distinct(other, best, tol, iq, xyz)  # other keypoints, far
-    assert not rl.distinct(rl.Hypothesis(close, 4, m2), best, tol, iq, xyz)  # within tol
-    assert rl.distinct(twin, best, tol, iq, xyz)
-    assert rl.distinct(rl.Hypothesis(far, 0, np.zeros(16, bool)), best, tol, iq, xyz)
-    assert rl.spread(best, [same], tol, iq, xyz) == pytest.approx((1.0 / math.sqrt(2), 0.0))
+def test_choosing_and_rivals() -> None:
+    """``choose``: supported hypotheses only; with a prior the nearest within 3 prior sigmas, else
+    none; without, the best-supported at the camera's height. ``rivals_of``: every supported
+    hypothesis beyond 0.10 m or 5 deg, whatever it explains, strongest first, a repeat of a
+    stronger rival listed once."""
+    def at(x: float, deg: float = 0.0) -> np.ndarray:
+        T = _rz(deg, np.zeros(3))
+        T[0, 3] = x
+        return T
+
+    poses = [at(0.0), at(1.0), at(0.05), at(2.0), at(1.02)]
+    inl = [100, 60, 90, 20, 50]
+    q = rl.Query(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8), K, 320, 240)
+    assert rl.choose(q, poses, inl) == 0 and rl.prior_distance(q, A) == 0.0
+    assert rl.within_prior(q, A)
+    q.camera_z = 0.0
+    lifted = [at(0.0), at(1.0)]
+    lifted[0][2, 3] = 1.0  # the best is off the camera's height: the other is level
+    assert rl.choose(q, lifted, [100, 60]) == 1
+    q.prior, q.prior_sigma_pos_m, q.prior_sigma_rot_deg = at(0.9), 0.05, 2.0
+    assert rl.choose(q, poses, inl) == 1  # 1.0 is 2 sigmas off; 1.02 is farther
+    q.prior = at(2.0)
+    assert rl.choose(q, poses, inl) is None  # the only one there has support 0.2
+    q.prior = at(0.0, 10.0)
+    assert rl.choose(q, poses, inl) is None  # turned 10 deg: beyond 3 x 2 deg
+    rivals = rl.rivals_of(poses[0], poses[1:], inl[1:], 100)
+    assert [r["support"] for r in rivals] == [0.6]  # 0.05 m is the pose; 1.02 repeats 1.0
+    assert rivals[0]["pos_m"] == pytest.approx(1.0) and rivals[0]["rot_deg"] == 0.0
+    turned = rl.rivals_of(poses[0], [at(0.0, 6.0)], [25], 100)
+    assert turned == [{"pos_m": 0.0, "rot_deg": pytest.approx(6.0, abs=1e-3), "support": 0.25}]
+    assert rl.rivals_of(poses[0], [at(1.0)], [10], 0) == []
     P, D = _scene()
     small = _kf("s", rooms.camera(0.2, 0.0, 1.0, 0.0, -10.0), P[:12], D[:12])
     o = rl.locate(_query(A, P, D), rl.Index([_kf("a", A, P, D), small]))
-    assert o.located and o.ambiguity is None
+    assert o.located and o.ambiguity is None and o.rivals == []
     assert rl.Index([rl.Keyframe("e", A, K, np.zeros((0, 2), np.float32),
                                  np.zeros((0, 128), np.uint8), np.zeros((0, 3), np.float32))]
                     ).votes(D).tolist() == [0]
@@ -311,12 +318,12 @@ def test_an_implausible_solve_is_not_located(monkeypatch: pytest.MonkeyPatch) ->
     assert not o.located
 
 
-def test_repeated_rooms_with_noisy_keyframes_stay_within_three_sigma() -> None:
+def test_repeated_rooms_with_noisy_keyframes_are_flagged_and_the_prior_picks() -> None:
     """Three copies of one structure 4 m apart (a house of repeated rooms), the frame's own copy
     mapped by one keyframe, the others by two, every keyframe 2 cm / 0.5 deg off: without a prior
-    the pose may be any copy, but its sigmas cover the others (the truth within 3 sigma); with a
-    prior the copy that agrees with it is picked although it has less support, and a prior that
-    no hypothesis agrees with widens the sigmas to cover it."""
+    the pose may be any copy, and the others are its rivals (never silent); with a prior the copy
+    that agrees with it is picked although it has less support, and a prior that no hypothesis
+    agrees with is a prior conflict."""
     P, D = _scene(n=500)
     rng = np.random.default_rng(4)
 
@@ -337,16 +344,17 @@ def test_repeated_rooms_with_noisy_keyframes_stay_within_three_sigma() -> None:
     idx = rl.Index(kfs)
     T = rooms.camera(0.1, 0.05, 1.0, -3.0, -10.0)
     o = rl.locate(_query(T, P, D), idx)
-    assert o.T is not None and o.sigma_pos_m is not None and o.sigma_rot_deg is not None
-    ep, er = rl.pose_distance(o.T, T)
-    assert ep <= 3 * o.sigma_pos_m and er <= 3 * o.sigma_rot_deg
+    assert o.T is not None and o.ambiguity is not None and len(o.rivals) >= 2
+    assert o.ambiguity == {"pos_m": o.rivals[0]["pos_m"], "rot_deg": o.rivals[0]["rot_deg"]}
+    assert [r["support"] for r in o.rivals] == sorted((r["support"] for r in o.rivals),
+                                                      reverse=True)
+    assert all(0.25 <= r["support"] <= 1.0 for r in o.rivals)
     p = rl.locate(_query(T, P, D, prior=T), idx)
     assert p.T is not None and rl.pose_distance(p.T, T)[0] < 0.1 and p.consistent_with_prior
     lost = T.copy()
     lost[0, 3] += 2.0  # a prior 2 m off every copy
     q = rl.locate(_query(T, P, D, prior=lost), idx)
-    assert q.T is not None and q.consistent_with_prior is False and q.sigma_pos_m is not None
-    assert rl.pose_distance(q.T, lost)[0] <= 3 * q.sigma_pos_m
+    assert q.T is None and q.reason == "prior_conflict"
 
 
 def test_a_weak_twin_neither_flags_nor_widens() -> None:
@@ -360,3 +368,64 @@ def test_a_weak_twin_neither_flags_nor_widens() -> None:
     o = rl.locate(_query(T, P, D), idx)
     assert o.T is not None and o.ambiguity is None and rl.pose_distance(o.T, T)[0] < 0.02
     assert o.sigma_pos_m is not None and o.sigma_pos_m < 0.05
+
+
+def test_a_frame_with_a_prior_always_gets_a_nearest_keyframe() -> None:
+    """No keyframe looks like the frame (no votes): with a prior, the keyframe nearest it."""
+    P, D = _scene()
+    idx = rl.Index([_kf("a", A, P, D), _kf("b", rooms.camera(3.0, 0.0, 1.0, 0.0), P, D)])
+    rng = np.random.default_rng(9)
+    q = rl.Query(rng.uniform(0, 300, (300, 2)).astype(np.float32),
+                 rng.integers(0, 256, (300, 128)).astype(np.uint8), K, 320, 240,
+                 prior=rooms.camera(2.8, 0.0, 1.0, 0.0))
+    o = rl.locate(q, idx)
+    assert not o.located and o.nearest == 1
+
+
+def test_a_turn_with_a_prior_picks_its_hypothesis_or_conflicts() -> None:
+    P, D = _scene(n=800)
+    C = np.array([0.0, 0.0, 1.0])
+    a = _kf("a", rooms.camera(*C, 0.0, -10.0), P, D, depth=False)
+    T90 = rooms.camera(*C, 90.0, -10.0)
+    b = rl.Keyframe("b", T90, K, a.uv, a.desc, a.xyz, 0.01, 0.1)  # sees the same, turned 90 deg
+    T = rooms.camera(*C, 3.0, -10.0)
+    for want in (T, _rz(90.0, C) @ T):
+        o = rl.locate(_query(T, P, D, prior=want), rl.Index([a, b]))
+        assert o.located and o.method == "turn" and o.T is not None
+        assert rl.pose_distance(o.T, want)[1] < 2.0 and o.consistent_with_prior is True
+        assert o.ambiguity is not None and o.rivals[0]["rot_deg"] == pytest.approx(90.0, abs=2.0)
+    o = rl.locate(_query(T, P, D, prior=_rz(45.0, C) @ T), rl.Index([a, b]))
+    assert not o.located and o.reason == "prior_conflict"
+
+
+def test_a_refinement_that_leaves_the_prior_keeps_the_solve(monkeypatch: pytest.MonkeyPatch
+                                                             ) -> None:
+    P, D = _scene()
+    idx = rl.Index([_kf("a", A, P, D)])
+
+    def away(h: rl.Hypothesis, *a: object) -> tuple[rl.Hypothesis, None]:
+        T = h.T.copy()
+        T[0, 3] += 1.0
+        return rl.Hypothesis(T, h.inliers, h.mask), None
+
+    monkeypatch.setattr(rl, "_refined", away)
+    o = rl.locate(_query(A, P, D, prior=A), idx)
+    assert o.T is not None and rl.pose_distance(o.T, A)[0] < 0.05
+
+
+def test_a_turn_whose_leftover_rays_hold_no_second_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    P, D = _scene(n=800)
+    C = np.array([0.0, 0.0, 1.0])
+    a = _kf("a", rooms.camera(*C, 0.0, -10.0), P, D, depth=False)
+    b = rl.Keyframe("b", rooms.camera(*C, 90.0, -10.0), K, a.uv, a.desc, a.xyz, 0.01, 0.1)
+    real = rl.turn_ransac
+    calls = [0]
+
+    def once(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        calls[0] += 1
+        R, inl = real(x, y)
+        return (R, inl) if calls[0] == 1 else (R, np.zeros(len(x), bool))
+
+    monkeypatch.setattr(rl, "turn_ransac", once)
+    o = rl.locate(_query(rooms.camera(*C, 3.0, -10.0), P, D), rl.Index([a, b]))
+    assert o.located and o.method == "turn" and o.rivals == [] and calls[0] == 2

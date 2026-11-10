@@ -321,7 +321,7 @@ def test_locate_places_frames_with_sigmas_and_records_the_pose(room_map: tuple[N
         assert res["status"] == "located" and res["reason"] is None
         err = np.linalg.norm(np.asarray(res["T_map_cam"])[:3, 3] - T[:3, 3])
         assert err < 0.03 and 0 < res["sigma_pos_m"] < 0.1 and 0 < res["sigma_rot_deg"] < 2
-        assert 0 < res["inlier_ratio"] <= 1 and res["ambiguity"] is None
+        assert 0 < res["inlier_ratio"] <= 1 and res["ambiguity"] is None and res["rivals"] == []
     assert doc["frames"][0]["consistent_with_prior"] is None
     assert doc["frames"][1]["consistent_with_prior"] is True
     pose = nav.get("/api/maps/room/pose", "Pose")
@@ -329,6 +329,28 @@ def test_locate_places_frames_with_sigmas_and_records_the_pose(room_map: tuple[N
     assert pose["T_map_cam"] == doc["frames"][1]["T_map_cam"]
     h = nav.get("/api/health", "Health")
     assert h["timings"]["locate_per_frame"]["count"] == 2
+    assert (pose["scale_source"], pose["scale_sigma_rel"]) == (doc["scale_source"],
+                                                               doc["scale_sigma_rel"])
+    bad = nav.get("/api/maps/room/pose?version=1", status=400)["error"]
+    assert bad["code"] == "invalid_request" and bad["details"]["field"] == "version"
+    # a pose recorded before its scale was stored takes its version's
+    import json
+
+    path = nav.service.store.dir("room") / "pose.json"
+    old = json.loads(path.read_text())
+    del old["scale_source"], old["scale_sigma_rel"]
+    path.write_text(json.dumps(old))
+    assert nav.get("/api/maps/room/pose", "Pose")["scale_source"] == "priors"
+    # a prior 0.3 m off: within 3 x the drifting defaults (0.20 m / 5 deg), beyond the metric
+    # ones (0.05 m / 2 deg), where no hypothesis agrees with it: prior_conflict (api.md §6)
+    off = truth[0].copy()
+    off[0, 3] += 0.3
+    req = [{"name": t, "image": "q0", "camera_id": "cam",
+            "prior": {"trust": t, "T_map_cam": off.tolist()}} for t in ("drifting", "metric")]
+    drifting, conflict = nav.locate("room", {"frames": req}, files)["frames"]
+    assert drifting["status"] == "located" and drifting["consistent_with_prior"] is True
+    assert conflict["status"] == "rejected" and conflict["reason"] == "prior_conflict"
+    assert conflict["T_map_cam"] is None and conflict["nearest_view"] is None
 
 
 def test_locate_rejects_unusable_frames_and_points_away_from_no_overlap(
@@ -346,16 +368,16 @@ def test_locate_rejects_unusable_frames_and_points_away_from_no_overlap(
     a, b = doc["frames"]
     assert a["status"] == "rejected" and a["reason"] == "plain" and a["nearest_view"] is None
     assert b["status"] == "rejected" and b["reason"] == "no_overlap"
-    if b["nearest_view"] is not None:
-        assert -180 <= b["nearest_view"]["turn_deg"] <= 180
+    assert -180 <= b["nearest_view"]["turn_deg"] <= 180  # guaranteed with a prior
     with pytest.raises(AssertionError):
         nav.get("/api/maps/room/pose", "Pose")
 
 
 def test_a_kept_frame_with_fewer_keypoints_than_a_pose_needs_is_few_features(
         room_map: tuple[Nav, Any, Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    """The checks keep a frame (20 features at least); with fewer keypoints for matching than a
-    pose needs inliers it is few_features, else (any frame not located) no_overlap."""
+    """With fewer keypoints for matching than a pose needs inliers (``relocalize.MIN_INLIERS``)
+    a frame is few_features, else (any frame not located) no_overlap; the update checks' own
+    feature count plays no part."""
     from oh_my_slam.mapping import relocalize
 
     nav, _, _ = room_map
@@ -371,6 +393,13 @@ def test_a_kept_frame_with_fewer_keypoints_than_a_pose_needs_is_few_features(
     b = doc["frames"][0]
     assert b["status"] == "rejected" and b["reason"] == "few_features"
     assert b["nearest_view"] is None
+    monkeypatch.setattr(relocalize, "extract", real)
+    from oh_my_slam.mapping import checks
+
+    monkeypatch.setattr(checks, "reason", lambda m, d: "few_features")  # the update checks'
+    doc = nav.locate("room", {"frames": [{"name": "b", "image": "b", "camera_id": "cam"}]},
+                     {"b": textured(77)})
+    assert doc["frames"][0]["reason"] == "no_overlap"
 
 
 def test_locate_requests_are_validated(room_map: tuple[Nav, Any, Any]) -> None:

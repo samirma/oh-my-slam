@@ -20,7 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.mapping import checks, navgrid, relocalize
+from oh_my_slam.mapping import anchor, checks, navgrid, relocalize
 from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
@@ -306,9 +306,8 @@ def _query(fr: LocateFrame, floor_z: float) -> tuple[relocalize.Query, checks.Me
     p = fr.prior
     if p is not None and p.get("trust") in ("metric", "drifting") and "T_map_cam" in p:
         q.prior = np.asarray(p["T_map_cam"], np.float64)
-        q.prior_sigma_pos_m = float(p.get("sigma_pos_m", relocalize.DEFAULT_PRIOR_SIGMA_POS_M))
-        q.prior_sigma_rot_deg = float(p.get("sigma_rot_deg",
-                                            relocalize.DEFAULT_PRIOR_SIGMA_ROT_DEG))
+        # its own sigmas, else its trust's defaults (api.md §3)
+        q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
     h = fr.height_m if fr.height_m is not None else cam.height_above_floor_m
     if h is not None:
         sig = fr.height_sigma_m if fr.height_m is not None else cam.height_sigma_m
@@ -319,15 +318,20 @@ def _query(fr: LocateFrame, floor_z: float) -> tuple[relocalize.Query, checks.Me
 
 def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
            ) -> list[dict[str, Any]]:
+    """One ``LocateResult`` per frame (api.md §6): ``plain`` and ``blur`` from the image checks,
+    ``few_features`` below ``relocalize.MIN_INLIERS`` keypoints (fewer than a pose needs
+    inliers), else the pose, ``prior_conflict``, or ``no_overlap`` with its ``nearest_view``."""
     index = derived.index(dv)
     out = []
     for fr in frames:
         q, measures = _query(fr, dv.floor_z)
         res: dict[str, Any] = {"name": fr.name, "status": "rejected", "reason": None,
                                "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
-                               "inlier_ratio": None, "ambiguity": None,
+                               "inlier_ratio": None, "ambiguity": None, "rivals": [],
                                "consistent_with_prior": None, "nearest_view": None}
         reason = checks.reason(measures, None)
+        if reason not in ("plain", "blur"):  # locate's few_features is its own keypoint count
+            reason = "few_features" if len(q.uv) < relocalize.MIN_INLIERS else None
         if reason is not None:
             res["reason"] = reason
             out.append(res)
@@ -338,13 +342,12 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
             res.update({"status": "located", "T_map_cam": np.round(o.T, 6).tolist(),
                         "sigma_pos_m": o.sigma_pos_m, "sigma_rot_deg": o.sigma_rot_deg,
                         "inlier_ratio": o.inlier_ratio, "ambiguity": o.ambiguity,
-                        "consistent_with_prior": o.consistent_with_prior})
-        else:
-            # the checks kept it (it has features): no pose means no overlap with the map,
-            # unless it has fewer keypoints than a pose needs inliers
-            res["reason"] = "few_features" if len(q.uv) < relocalize.MIN_INLIERS \
-                else "no_overlap"
-            if res["reason"] == "no_overlap" and o.nearest is not None:
+                        "rivals": o.rivals, "consistent_with_prior": o.consistent_with_prior})
+        elif o.reason is not None:  # prior_conflict
+            res["reason"] = o.reason
+        else:  # enough keypoints, no pose: no overlap with the map
+            res["reason"] = "no_overlap"
+            if o.nearest is not None:
                 kf, turn = relocalize.nearest_view(q, index, o.nearest)
                 res["nearest_view"] = {"name": kf.name, "T_map_cam": np.round(kf.T, 6).tolist(),
                                        "turn_deg": turn}
@@ -352,17 +355,26 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
     return out
 
 
-def record_pose(store: Store, name: str, version: int, located: dict[str, Any]) -> None:
+def record_pose(store: Store, name: str, version: int, located: dict[str, Any],
+                scale_source: str, scale_sigma_rel: float) -> None:
+    """The map's recorded pose (api.md §6): the located frame, the version it was located in
+    and that version's scale."""
     atomic_write_json(store.dir(name) / "pose.json", {
         "map_version": version, "name": located["name"], "recorded_at": utc(time.time()),
         "T_map_cam": located["T_map_cam"], "sigma_pos_m": located["sigma_pos_m"],
-        "sigma_rot_deg": located["sigma_rot_deg"]})
+        "sigma_rot_deg": located["sigma_rot_deg"], "scale_source": scale_source,
+        "scale_sigma_rel": scale_sigma_rel})
 
 
 def recorded_pose(store: Store, name: str) -> dict[str, Any]:
+    """The recorded pose; ``no_pose`` without one. A pose recorded before its scale was stored
+    takes the scale of the version it was located in."""
     try:
         out: dict[str, Any] = json.loads((store.dir(name) / "pose.json").read_text())
     except (OSError, ValueError) as exc:
         raise ApiError("no_pose", f"map {name!r} has no recorded pose: locate a frame with "
                        "record: true first", {"map": name}) from exc
+    if "scale_source" not in out:
+        v = store.version(name, int(out["map_version"]))
+        out["scale_source"], out["scale_sigma_rel"] = v["scale_source"], v["scale_sigma_rel"]
     return out
