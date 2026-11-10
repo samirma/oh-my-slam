@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.service import nav, openapi, schema
+from oh_my_slam.service import objects as objects_read
 from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived
 from oh_my_slam.service.errors import ApiError, invalid
@@ -37,7 +38,7 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O3-jobs", "O4", "O5", "O6", "O9", "O10"]  # the groups this service
+CAPABILITIES = ["O1", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]  # the groups this service
 # implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
@@ -377,6 +378,16 @@ class Api:
         self.s.timings.add("grid_read", time.perf_counter() - t0)
         return body(answer.body)
 
+    async def get_objects(self, request: Request) -> Response:
+        t0 = time.perf_counter()
+        name, _, v = self._version(request)
+        derived = self._derived()
+        dv = await run_in_threadpool(derived.get, name, v["version"])
+        out = await run_in_threadpool(objects_read.body, self.s.store, derived, self._ids(), dv)
+        _stage(request, "objects", t0)
+        self.s.timings.add("objects_read", time.perf_counter() - t0)
+        return body(out)
+
     async def get_points(self, request: Request) -> Response:
         name, _, v = self._version(request)
         q = request.query_params
@@ -464,6 +475,9 @@ async def _http_error(request: Request, exc: Exception) -> Response:
 
 def create_app(service: Service) -> ASGIApp:
     api = Api(service)
+    if service.derived is not None:  # each version's objects answer, computed once derived
+        derived = service.derived
+        derived.after.append(lambda dv: objects_read.body(service.store, derived, api._ids(), dv))
     routes = [Route(e.path, _wrap(getattr(api, e.handler)), methods=[e.method])
               for e in ENDPOINTS]
     app = Starlette(routes=routes, exception_handlers={HTTPException: _http_error})

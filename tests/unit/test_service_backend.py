@@ -399,3 +399,28 @@ def test_read_of_an_anchored_map_without_cloud(tmp_path: Path) -> None:
     m = be.MapperBackend().read(am.root)
     assert m.frames == [] and m.cloud() is None and m.points_z is None and m.bounds is None
     assert m.depth("k000000") is None and m.image("k000000") is None and m.objects() == []
+
+
+def test_detect_asks_the_detector_on_a_grid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                            ) -> None:
+    from oh_my_slam.reconstruction import api as rec
+    from oh_my_slam.segmentation import api as seg
+
+    seen: dict[str, Any] = {}
+
+    def detect_on_grid(path: Path, grid: tuple[int, int], client: Any) -> list[Any]:
+        seen["grid"] = grid
+        return ["d"]
+
+    monkeypatch.setattr(rec, "connect_server", lambda: _Client())
+    monkeypatch.setattr(seg, "detect_on_grid", detect_on_grid)
+    assert be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48)) == ["d"]
+    assert seen["grid"] == (64, 48)
+
+    def boom() -> Any:
+        raise ServerUnavailableError("down")
+
+    monkeypatch.setattr(rec, "connect_server", boom)
+    with pytest.raises(ApiError) as err:
+        be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48))
+    assert err.value.code == "inference_unavailable"

@@ -115,6 +115,9 @@ class Derived:
         self._lock = threading.Lock()
         self._map_locks: dict[str, threading.Lock] = {}
         self._pairs: dict[tuple[str, str], NDArray[np.int64]] = {}  # keyframe matches by image
+        # what the worker also computes for each committed version once derived (the objects
+        # read's answer: ``objects.body``)
+        self.after: list[Callable[[DerivedVersion], Any]] = []
         store.listeners.append(self.committed)
 
     # -- worker ---------------------------------------------------------------------------------
@@ -138,7 +141,9 @@ class Derived:
             if item is None:
                 return
             try:
-                self.get(*item)
+                dv = self.get(*item)
+                for hook in self.after:
+                    hook(dv)
             except Exception:
                 log.exception("deriving %s version %d failed", *item)
 

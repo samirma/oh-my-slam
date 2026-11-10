@@ -119,6 +119,10 @@ class Store:
                            {"map": name, "version": n, "latest_version": latest}) from exc
         return out
 
+    def version_file(self, name: str, n: int, fname: str) -> Path:
+        """A file committed with version ``n`` (``commit``'s ``files``)."""
+        return self.dir(name) / "versions" / f"{n}.{fname}"
+
     def cameras(self, name: str) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = (self.meta(name) or {}).get("cameras", {})
         return out
@@ -146,9 +150,11 @@ class Store:
     def mapper_dir(self, name: str) -> Path:
         return self.dir(name) / "mapper"
 
-    def commit(self, name: str, record: dict[str, Any], mapper: Path | None) -> int:
-        """Commit a new version: ``record`` (its ``version`` and ``created_at`` set here) and
-        the mapper map ``mapper`` moved into place. Returns the version."""
+    def commit(self, name: str, record: dict[str, Any], mapper: Path | None,
+               files: dict[str, Any] | None = None) -> int:
+        """Commit a new version: ``record`` (its ``version`` and ``created_at`` set here), the
+        version's JSON ``files`` (``versions/<n>.<file name>``: the objects of an anchored map)
+        and the mapper map ``mapper`` moved into place. Returns the version."""
         with self._lock:
             meta = self.meta(name)
             assert meta is not None, "cameras are recorded before a job runs"
@@ -160,6 +166,8 @@ class Store:
                 if current.exists():
                     current.rename(self.trash / f"{name}-{uuid.uuid4().hex}")
                 mapper.rename(current)
+            for fname, data in (files or {}).items():
+                atomic_write_json(self.version_file(name, n, fname), data)
             atomic_write_json(self.dir(name) / "versions" / f"{n}.json", record)
             meta["latest_version"] = n
             meta["created_at"] = meta.get("created_at") or utc(now)
