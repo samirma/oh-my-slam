@@ -79,8 +79,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     (§6) until it is registered. A later update may re-register a stored `kept_at_prior`
     frame: when a later job's images confirm it, its pose leaves `kept_at_prior` in that
     version (it becomes a registered pose, `provisional` then `fused`), and from then on it
-    feeds occupancy, heights, the cloud and objects. There is no automatic background
-    refinement;
+    feeds occupancy, heights, the cloud and objects. The job lists each such frame in
+    `quality.reregistered` (§4). There is no automatic background refinement;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -139,6 +139,9 @@ becomes a job with a `job_id`. A job goes through these states:
     image-only pose (§1), or null when there is none. A frame unconstrained in translation
     (§1) contributes to `max_displacement_deg` only;
   * `prior_disagreement_deg` (§1), 0 when no image relative rotation disagrees with the priors;
+  * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
+    frame this job's images confirmed (§2): how far confirmation moved the frame from its
+    prior-placed pose. Empty when there are none; a dry run predicts it;
   * the anchor residuals (median and max, in m and deg, against metric priors and, over earlier
     keyframes only, against the previous version);
   * `rejected_share`: inputs rejected over inputs sent;

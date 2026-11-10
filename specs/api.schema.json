@@ -588,7 +588,8 @@
         "rebuilt",
         "accepted",
         "failed_checks",
-        "prior_disagreement_deg"
+        "prior_disagreement_deg",
+        "reregistered"
       ],
       "properties": {
         "scale_ratio_vs_prev": {
@@ -689,6 +690,31 @@
             ]
           },
           "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created."
+        },
+        "reregistered": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "displacement_m",
+              "displacement_deg"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "displacement_m": {
+                "type": "number",
+                "minimum": 0
+              },
+              "displacement_deg": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          },
+          "description": "One entry per stored kept_at_prior frame this job's images confirmed: how far confirmation moved it from its prior-placed pose. Empty when none; a dry run predicts it."
         }
       }
     },
