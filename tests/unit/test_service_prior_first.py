@@ -125,9 +125,10 @@ def test_cold_start_then_a_sweep(client: Client) -> None:
         assert np.linalg.norm(np.array(i["T_map_cam"])[:3, 3] - T[:3, 3]) < 0.03
         assert i["inliers"] > 50 and i["sigma_pos_m"] >= 0.01
     q = job["quality"]
-    # the new frames against the stored map: small for a consistent update
-    assert q["gauge_shift"]["translation_m"] < 0.03 and q["gauge_shift"]["scale_ratio"] == 1.0
-    assert q["previous_residuals"]["count"] == 6 and q["scale_ratio_vs_prev"] == 1.0
+    # the stored keyframes between versions: none moved
+    assert q["gauge_shift"] == {"translation_m": 0.0, "rotation_deg": 0.0, "scale_ratio": 1.0}
+    assert q["previous_residuals"]["count"] == 1 and q["previous_residuals"]["max_m"] == 0.0
+    assert q["scale_ratio_vs_prev"] == 1.0
     assert q["prior_residuals"]["count"] == 7 and q["rejected_share"] == 0.0
     assert q["rebuilt"] is False and q["accepted"]
     assert set(job["timings_s"]) >= {"checks", "clone", "register", "fusion", "commit", "total"}
@@ -552,6 +553,97 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
         return
     assert job["state"] == "rejected" and "max_residual_m" in q["failed_checks"]
     assert "max_residual_m" in d["quality"]["failed_checks"]
-    assert q["rejected_share"] == 0.2 and q["previous_residuals"]["max_m"] > 0.25
+    assert q["rejected_share"] == 0.2 and q["previous_residuals"]["max_m"] == 0.0  # none moved
+    assert q["gauge_shift"]["translation_m"] == 0.0
     assert [i["reason"] for i in job["inputs"]][2] == "prior_conflict"
     assert client.service.store.latest("m") == 1
+
+
+def _jitter(T: np.ndarray, k: int) -> np.ndarray:
+    """``T`` off by at most 0.01 m and 1.5 deg (a tight metric prior)."""
+    a = np.radians(1.5 * (-1) ** k)
+    R = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+    out = T.copy()
+    out[:3, :3] = R @ T[:3, :3]
+    out[:3, 3] += [0.007 * (-1) ** k, 0.007, 0.0]
+    return out
+
+
+def test_a_closing_sweep_from_one_standpoint_passes_the_gauge_gate(client: Client) -> None:
+    """Six depth frames closing a 360 deg sweep from one standpoint (the camera turns in place),
+    their metric priors within 0.01 m and 1.5 deg of the truth: no stored keyframe moves, so the
+    gauge shift is 0 and ``previous_residuals`` counts the earlier keyframes only; the update
+    passes a 0.05 m gauge gate (and the skill's gate)."""
+    first = [base_pose(60.0 * k, offset=0.0) for k in range(6)]
+    fr, files = frames_for(client, first, tag="a")
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    poses = [base_pose(30.0 + 60.0 * k, offset=0.0) for k in range(6)]
+    fr, files = frames_for(client, poses, tag="b",
+                           priors=[_jitter(T, k) for k, T in enumerate(poses)])
+    gate = {"max_gauge_shift_m": 0.05}
+    d = dry(client, "m", fr, files, accept_if=gate)
+    job = client.update("m", fr, files, accept_if=gate)
+    q = job["quality"]
+    assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"]
+    assert q["gauge_shift"]["translation_m"] == 0.0 and q["gauge_shift"]["rotation_deg"] == 0.0
+    assert q["previous_residuals"]["count"] == 6 and q["previous_residuals"]["max_m"] == 0.0
+    assert all(i["prior_residual_m"] <= 0.02 for i in job["inputs"])
+    frames = client.get("/api/maps/m/frames", None)["frames"]
+    assert len(frames) == 12
+
+
+def test_a_stored_keyframe_that_moves_fails_the_gate(client: Client,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """An update whose engine moves a stored keyframe 0.9 m (a bug, or a re-posing engine): the
+    poses it would commit put that move in the gauge shift and ``previous_residuals``, and a
+    0.05 m gate rejects it; nothing is committed."""
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    real = AnchoredMap.update
+
+    def moving(self: AnchoredMap, *a: Any, **k: Any) -> Any:
+        out = real(self, *a, **k)
+        self.keyframes[0].T = self.keyframes[0].T.copy()
+        self.keyframes[0].T[0, 3] += 0.9
+        return out
+
+    monkeypatch.setattr(AnchoredMap, "update", moving)
+    fr, files = frames_for(client, [base_pose(20), base_pose(40)], tag="b")
+    job = client.update("m", fr, files,
+                        accept_if={"max_gauge_shift_m": 0.05, "max_residual_m": 0.05})
+    q = job["quality"]
+    assert job["state"] == "rejected"
+    assert q["gauge_shift"]["translation_m"] == pytest.approx(0.9, abs=1e-6)
+    assert q["previous_residuals"]["count"] == 1
+    assert q["previous_residuals"]["max_m"] == pytest.approx(0.9, abs=1e-6)
+    assert sorted(q["failed_checks"]) == ["max_gauge_shift_m", "max_residual_m"]
+    assert client.service.store.latest("m") == 1
+
+
+def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> None:
+    """A PnP frame within ``PARALLAX_MIN`` of its stored keyframe's depth counts only its
+    rotation; one with parallax counts both; rejected frames and frames without a residual do
+    not count; without stored keyframes nothing is excluded."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.mapping.anchored import Placement
+    from oh_my_slam.service.prior_first import PARALLAX_MIN, displacements
+
+    T = np.eye(4)
+    far = np.eye(4)
+    far[0, 3] = 0.5
+    kfs: Any = [SimpleNamespace(centre=np.zeros(3), median_depth=None),
+                SimpleNamespace(centre=np.array([9.0, 0, 0]), median_depth=3.0)]
+
+    def pl(T: np.ndarray, status: str = "registered", method: str = "pnp",
+           res: tuple[float, float] | None = (0.3, 2.0)) -> Placement:
+        return Placement("f", status, None, T, 0.01, 0.1, 100, method, map_residual=res)
+
+    near = np.eye(4)
+    near[0, 3] = PARALLAX_MIN * 2.0 * 0.5
+    got = displacements([pl(T), pl(near), pl(far), pl(T, method="rotation"),
+                         pl(T, "rejected"), pl(T, res=None), None], kfs)
+    assert got == [(0.0, 2.0), (0.0, 2.0), (0.3, 2.0), (0.3, 2.0)]
+    assert displacements([pl(T)], []) == [(0.3, 2.0)]

@@ -20,7 +20,8 @@ volume is the previous one plus its new frames (``Volume.integrate``).
   floor-like voxel there.
 
 **Camera stands** (``mark_stands``). The cell under each keyframe camera, and the robot's footprint
-there, are free whatever was seen; so are the unknown cells of the disc the camera could not see:
+there, are free whatever was seen; so are the cells of the disc the camera could not see, but for
+surfaces above its lowest line of sight and what lies behind them:
 radius ``h / tan(depression)`` of its lower field-of-view edge at height ``h`` above the floor
 (``blind_radius``, at most ``BLIND_RING_MAX_M``).
 
@@ -603,8 +604,9 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
     the disc stays occupied only when it holds a surface the camera could see: higher, by
     ``SIGHT_MARGIN_M``, than the camera's lowest line of sight above that cell (a wall, a door
     jamb, a table's leg), not what lies below it (other frames' floor noise, a low step); and
-    only the cells the camera cell reaches without crossing those (not the floor behind a
-    wall), in a straight line (``_in_sight``: not what an open leaf or a wall end hides). The cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
+    the disc stops at those surfaces (not the floor behind a wall that cuts the disc). Every
+    other cell of the disc is free, already free ones included; those whose floor nobody saw get
+    ``floor_observed`` 2 (free by rule)."""
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
         r, c, _ = _disc(lay, xy, footprint_radius or 0.0)
@@ -623,7 +625,7 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         else:
             with np.errstate(invalid="ignore"):
                 keep = occ & ~(lay.top[r, c] <= sight + SIGHT_MARGIN_M)
-        # what the camera cell reaches without crossing a kept surface (not behind a wall)
+        # the disc's cells the camera cell reaches without crossing a kept surface
         r0, c0 = r.min(), c.min()
         box = np.zeros((r.max() - r0 + 1, c.max() - c0 + 1), bool)
         box[r - r0, c - c0] = ~keep
@@ -632,25 +634,8 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         if not (0 <= me[0] - r0 < box.shape[0] and 0 <= me[1] - c0 < box.shape[1]):
             continue  # the camera lies outside the grid
         go = (lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]) & ~keep
-        go &= lay.state[r, c] != FREE  # what is free already stays so
-        if go.any():
-            go[go] = _in_sight(box, me[0] - r0, me[1] - c0, r[go] - r0, c[go] - c0)
         lay.state[r[go], c[go]] = FREE
         _by_rule(lay, r[go], c[go])
-
-
-def _in_sight(clear: NDArray[np.bool_], r0: int, c0: int, r: NDArray[np.int64],
-              c: NDArray[np.int64]) -> NDArray[np.bool_]:
-    """Whether the straight line from cell (``r0``, ``c0``) to each cell (``r``, ``c``) crosses
-    only ``clear`` cells (half-cell steps): a cell hidden behind a surface (an open leaf, a wall
-    end) lies outside the camera's blind disc, whose floor only its field of view hid."""
-    d = np.hypot(r - r0, c - c0)
-    n = max(int(np.ceil(d.max() * 2)) if d.size else 1, 1)
-    t = (np.arange(1, n + 1) / n)[None, :]
-    rr = np.floor(r0 + 0.5 + (r - r0)[:, None] * t).astype(np.int64)
-    cc = np.floor(c0 + 0.5 + (c - c0)[:, None] * t).astype(np.int64)
-    own = (rr == r[:, None]) & (cc == c[:, None])  # the target cell itself is not in the way
-    return np.asarray((clear[rr, cc] | own).all(axis=1))
 
 
 def _by_rule(lay: Layers, r: NDArray[np.int64], c: NDArray[np.int64]) -> None:

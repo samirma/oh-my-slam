@@ -650,8 +650,8 @@ def test_jobs_wait_and_unknown_ids(client: Client) -> None:
     frames, files, _ = frames_of(client, 1)
     job = client.update("m", frames, files, {"cam": CAMERA})
     t0 = time.monotonic()
-    again = client.get(f"/api/jobs/{job['job_id']}?wait_s=0.2", "Job")
-    assert again["state"] == "committed" and time.monotonic() - t0 >= 0.2
+    again = client.get(f"/api/jobs/{job['job_id']}?wait_s=30", "Job")
+    assert again["state"] == "committed" and time.monotonic() - t0 < 1.0  # ended: at once
     assert client.get(f"/api/jobs/{job['job_id']}", "Job") == again
 
 

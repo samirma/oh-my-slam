@@ -210,13 +210,13 @@ Anchored maps (below) report their own sigmas.
   pose) is checked against the depth the keyframes near it see (`AnchoredMap._map_consistency`):
   when enough of its points are seen and fewer than 75 % agree (10 % depth images, 20 % monocular
   after scaling by its median ratio to the map's), the median depth difference is its residual
-  (`quality.previous_residuals`, so `max_residual_m` sees a warp), and beyond 3 position sigmas
+  (the new frames' displacement, so `max_residual_m` sees a warp), and beyond 3 position sigmas
   plus the depth tolerance it is `prior_conflict` and not fused. Registered frames report the
   residual of their committed pose to their image-only pose, as before.
 * **A warping update is rejected with priors too.** A frame that the update's priors alone place
   — kept `provisional` at its prior, registered by depth geometry (which cannot see a slide along a
   bare wall), or placed in position by a rotation fit — takes as its residual to the map
-  (`quality.previous_residuals`, and so the gauge shift) at least the largest disagreement the
+  (the new frames' displacement, which `max_residual_m` checks) at least the largest disagreement the
   update's prior conflicts measured: a conflict's image pose against its prior, or a depth that
   contradicts the map at the prior (`mapping.anchored.inherit_conflicts`, in the update and the
   dry run). Before, those frames reported no residual, and conflicting frames are rejected
@@ -230,6 +230,20 @@ Anchored maps (below) report their own sigmas.
   a prior conflict reports what it did before (a consistent offset of metric priors is still
   caught by the gauge shift from 0.1 m, a drifting prior's offset is the odometry's and is
   absorbed).
+* **Gauge shift and residuals of the anchored engine.** Stored keyframes never move, so
+  `gauge_shift` is the median movement of the previous version's frames between that version and
+  the poses this one would commit (0 when none moved), and `previous_residuals` is over those
+  frames only (`count` = the previous version's frames): a stored keyframe that moves shows in
+  its `max_m`, which `max_residual_m` checks. The new frames' disagreement with the stored map
+  (their `map_residual` above: committed pose against image-only pose, with the inherited
+  conflicts) has no field in the oms/2.1 report; the gate checks its maximum with
+  `max_residual_m` too (`service.prior_first.displacements`, update and dry run). A frame
+  registered by PnP whose baseline to its nearest stored keyframe is below 0.02 of that
+  keyframe's median depth (`PARALLAX_MIN`; 2 m without one) turned in place: its image-only
+  translation is unconstrained, so only its rotation counts; a rotation fit's translation never
+  counts; rejected frames do not count. Before, both fields were computed from the new frames,
+  so a sweep closing on itself from one standpoint, whose image-only translations are noise,
+  failed a 0.05 m gauge gate (0.16 m) with nothing stored moved.
 * **Keyframes without features or depth are no references.** A stored keyframe whose features or
   keypoint depths are missing (its `kf/<id>.npz` gone or partial) is skipped by registration,
   never an error. A dry run places its frames on several threads against one loaded map: a
@@ -544,10 +558,11 @@ server.
   2 m). A disc cell stays occupied only when its highest surface in the band lies more than
   0.10 m above the camera's lowest line of sight there (`h (1 − d / radius)`: a wall, a jamb, a
   table leg the camera could see), and only the cells the camera cell reaches without crossing
-  those are freed, and of those only the cells in straight sight of it (no such surface on the
-  line from the camera's cell): what an open leaf or a wall's end hides is not its blind disc
-  (before, the flood fill went round a leaf's free end and freed the wall hidden behind it,
-  which joined the two rooms of a doorway and blocked its passage).
+  those are freed. Every other cell of the disc is free, cells that rays already made free
+  included, and those whose floor nobody saw get `floor_observed` 2. (A straight-sight test
+  added once on top of that clipped almost the whole disc on a one-standpoint sweep — 9 cells of
+  1248 within 1 m by rule — and the cells already free never got `floor_observed` 2; both are
+  gone.)
   This is done at 5 cm for the features and again on the cells asked.
 * **Resolution.** Passages, regions and frontiers are computed at the volume's 5 cm whatever
   `cell_m` is asked (the layers are then resampled), so they do not change with the cell size.
