@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Shared by the six entry points: locate the repository, check the uv environment and exec the
-# Python command-line module (oh_my_slam.cli.<name>, or a full oh_my_slam.* module path). The entry scripts never call each other (delegation happens at the
-# Python API level, see README "Ownership").
+# Used by server.sh: locate the repository, check the uv environment and exec a Python module
+# (a full oh_my_slam.* module path).
 set -euo pipefail
 
 OMS_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,10 +16,7 @@ oms_exec() {
   export PYTHONUNBUFFERED=1
   # Let Python cache bytecode (__pycache__, git-ignored): with PYTHONDONTWRITEBYTECODE inherited
   # (set by some agent/IDE shells) a checkout whose caches were never written recompiles every
-  # module it imports — about +0.5 s and +40 MB on every command.
+  # module it imports.
   unset PYTHONDONTWRITEBYTECODE
-  if [[ "${module}" != oh_my_slam.* ]]; then
-    module="oh_my_slam.cli.${module}"
-  fi
   exec "${OMS_PY}" -m "${module}" "$@"
 }

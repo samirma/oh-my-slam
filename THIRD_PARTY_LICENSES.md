@@ -9,14 +9,9 @@ re-check every row below. These matter most:
 * the Apple research-only MobileCLIP2 encoder
 * the GPL components: plyfile, the codecs bundled in the PyAV, OpenCV and pillow-heif wheels, and
   the Homebrew COLMAP build (and, for one unit test only, the Homebrew FFmpeg CLI)
-* the vendored ASAM OpenLABEL JSON schema, whose licensing terms (ASAM e.V.) let neither research
-  institutions nor other non-members pass it on (see "Data, specifications and design assets")
 
 **Redistributed in this repository:**
 
-* three.js (vendored browser library)
-* axe-core (vendored for the browser tests only; MPL-2.0)
-* the ASAM OpenLABEL JSON schema
 * 10 of the 19 palette colours and the 11 viridis samples in `segmentation/colors.py`
 * the label list in `segmentation/data/default_labels.txt`
 
@@ -259,34 +254,16 @@ by" names the packages of this list that depend on it. Versions are those of `uv
 |---|---|---|---|
 | COLMAP (Homebrew `colmap`) | 4.2.0 | SIFT feature extraction and matching CLI (LightGlue on a video's weak links through its ONNX Runtime); GLOMAP is part of COLMAP 4.2 | BSD-3-Clause (COLMAP, GLOMAP). COLMAP's licence notes that its dependencies may change the licence of the built binary. The Homebrew formula depends on CGAL 6.2.1 (GPL-3.0-or-later), Qt 6 `qtbase` (LGPL-3.0 / GPL), SuiteSparse (mixed, including GPL and LGPL) and ONNX Runtime 1.30.0 (MIT), so the Homebrew binary should be treated as GPL-3.0-or-later. |
 | LightGlue for SIFT (`sift-lightglue.onnx`) | COLMAP release asset 3.13.0, sha256 `e0500228…096e`; the `colmap` CLI downloads it into `~/.cache/colmap` on first use | Matching the SIFT keypoints of a video's weak links again (`mapping/sfm.py`) | Apache-2.0 (code and pre-trained weights, `cvg/LightGlue` README, checked 2026-10-02); the ONNX export is COLMAP's (BSD-3-Clause) |
-| Microsoft Edge or Google Chrome | system-installed | Playwright browser tests and the evaluator's page timing | Proprietary; not bundled |
 | uv | 0.9.18 (installed) | Environment and dependency manager | MIT OR Apache-2.0 |
 | FFmpeg CLI (Homebrew `ffmpeg`) | 9.0.1 (installed) | One unit test writes a rotated video with it (`tests/unit/test_video.py`; skipped without it); development only, not bundled | LGPL-2.1-or-later source; the Homebrew build is configured `--enable-gpl --enable-version3` with libx264 and libx265, so the binary is GPL-3.0-or-later |
-| bun (Homebrew `bun`) | 1.3.11 (installed) | Unit tests of the browser modules (`bun test`, `tests/js`, run by `tests/unit/test_js_units.py`); development only, not bundled | MIT (Bun itself; it statically links JavaScriptCore/WebKit, LGPL-2, and tinycc, LGPL-2.1) |
-
-## Browser libraries (vendored in `src/oh_my_slam/viewer/static/vendor/`)
-
-| Component | Version | Licence |
-|---|---|---|
-| three.js: `three.module.js`, `three.core.js` and the addons `OrbitControls`, `LineSegments2`, `LineMaterial`, `LineSegmentsGeometry` | 0.186.0 (r186), from the npm tarball recorded in `VERSIONS.txt` | MIT (`vendor/three/LICENSE`) |
-
-The `server.sh` web application (`src/oh_my_slam/web/static/`) vendors nothing more: it reuses the
-viewer's modules and three.js above, which it serves under `/static/viewer/`.
-
-## Test-only browser libraries (vendored in `tests/browser/vendor/`, never served)
-
-| Component | Version | Used for | Licence |
-|---|---|---|---|
-| axe-core: `axe.min.js` | 4.13.0, from the npm package `axe-core@4.13.0` (sha256 `c24f097b…a0c1`, which matches its published SRI `sha256-wk8Je9L0…RwoME=`) | The browser tests' automatic accessibility check of every page (WCAG 2.1 A and AA rules) | MPL-2.0 (`vendor/axe-core/LICENSE`; its bundled third-party notices in `LICENSE-3RD-PARTY.txt`) |
 
 ## Data, specifications and design assets
 
 | Component | Where | Licence |
 |---|---|---|
-| ASAM OpenLABEL 1.0.0 JSON schema | Vendored as `src/oh_my_slam/schema/openlabel_json_schema.json`, sha256-pinned; published at `https://openlabel.asam.net/V1-0-0/schema/openlabel_json_schema.json` | **Proprietary, © ASAM e.V.; not an open licence** (checked online on 2026-10-07). The schema file carries no licence notice, and ASAM publishes no open-source licence for it (no OpenLABEL repository under `github.com/asam-ev`). The standard is free of charge, but downloading it means accepting ASAM's terms. ASAM's "Licensing Terms for Grant of Rights to Use ASAM Products" (`asam.net/license`, version of 2017-10-26) count schemata as part of a standard. Members and purchasers may use it commercially, and the research and education communities non-commercially. Research institutions and other licensees "are not entitled to pass standards on to third parties". Vendoring the schema in this repository is therefore covered only for ASAM members or purchasers. Anyone else should fetch it from the URL instead. |
 | LVIS vocabulary | Label names curated from LVIS and COCO nouns in `segmentation/data/default_labels.txt`; the ontology URI `https://www.lvisdataset.org/` | LVIS annotations CC-BY-4.0; COCO annotations CC-BY-4.0 (COCO Consortium). No images are used. |
 | Distinct-colour palette | Sasha Trubetskoy, "List of 20 Simple, Distinct Colors" (sashamaps.net); 10 colours used (the other 9 palette colours are this project's own) | No licence is stated on the source page, which offers the list for free download. The colours are credited in `segmentation/colors.py`. |
-| Viridis colour map | 11 samples used for `color=height` | CC0-1.0 (mpl-colormaps by Nathaniel Smith and Stéfan van der Walt) |
+| Viridis colour map | 11 samples in `segmentation/colors.py` | CC0-1.0 (mpl-colormaps by Nathaniel Smith and Stéfan van der Walt) |
 
 ## Development tools (`[dependency-groups] dev` and build)
 
