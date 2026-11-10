@@ -9,7 +9,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
 * Every JSON body carries `schema` (`oms/2.1`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
-* Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4. Refuse what is missing instead of calling it.
+* Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
 ## Endpoints
@@ -18,7 +18,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | --- | --- | --- | --- | --- |
 | `GET /api/health` | Service, inference server and lane states |  | 200 [`Health`] |  |
 | `GET /api/openapi.json` | This API (OpenAPI 3.1) |  | 200 |  |
-| `POST /api/maps/{name}/updates` | Start an update job (creates the map) | [`UpdateRequest`] (multipart: part `request` + file parts) | 202 [`Job`] |  |
+| `POST /api/maps/{name}/updates` | Start an update job (creates the map); with dry_run=1, check the frames and write nothing | [`UpdateRequest`] (multipart: part `request` + file parts) | 202 [`Job`], 200 [`DryRun`] | `dry_run` |
 | `GET /api/jobs/{id}` | Job state and result |  | 200 [`Job`] | `wait_s` |
 | `GET /api/maps/{name}` | Map summary |  | 200 [`MapSummary`] | `version` |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses |  | 200 [`Frames`] | `version` |

@@ -36,7 +36,7 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O3-jobs", "O4"]  # the groups this service implements (high_level_spec.md §12)
+CAPABILITIES = ["O1", "O3-jobs", "O4", "O9", "O10"]  # the groups this service implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
 ROTATION_TOLERANCE = 1e-3
@@ -58,6 +58,8 @@ class Service:
     upload_cap: int = UPLOAD_CAP_BYTES
     stopping: bool = False
     started_at: float = field(default_factory=time.time)
+    # the dry run of an update request (``Updater.dry_run``), None: not served
+    dry_run: Callable[[Any, dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None
 
 
 def body(data: dict[str, Any], status: int = 200, headers: dict[str, str] | None = None
@@ -264,8 +266,9 @@ class Api:
     async def post_update(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])
         await run_in_threadpool(self.s.require_inference)
-        if request.query_params.get("dry_run") not in (None, "0", "false"):
-            raise invalid("dry_run", "dry runs (?dry_run=1) are not available yet (O10)")
+        dry = request.query_params.get("dry_run") not in (None, "0", "false")
+        if dry and self.s.dry_run is None:
+            raise invalid("dry_run", "dry runs (?dry_run=1) are not served by this service")
         t0 = time.perf_counter()
         data = await read_body(request, self.s.upload_cap)
         free = shutil.disk_usage(self.s.store.root).free
@@ -286,6 +289,12 @@ class Api:
         work, cameras, masks = await run_in_threadpool(update_work, self.s.store, name, req,
                                                        parts)
         _stage(request, "validate", t0)
+        if dry:
+            assert self.s.dry_run is not None
+            t0 = time.perf_counter()
+            out = await run_in_threadpool(self.s.dry_run, work, cameras, masks)
+            _stage(request, "dry_run", t0)
+            return body(out)
         if cameras or masks or self.s.store.meta(name) is None:
             self.s.store.add_cameras(name, cameras, masks)
         job = self.s.jobs.submit(name, work, len(work.frames))

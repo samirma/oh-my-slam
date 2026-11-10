@@ -166,12 +166,13 @@ def serve(store: Store, host: str, port: int) -> int:
         store.clear_scratch()
         backend = MapperBackend()
         timings = Timings(store.root / "timings.json")
-        jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
+        updater = Updater(store, backend, timings)
+        jobs = Jobs(store.jobs, updater, timings.predict_update)
         jobs.load()
         inference = Inference()
         inference.ensure_started()
         service = Service(store, jobs, inference, backend.require_inference, timings=timings,
-                          version=git_version())
+                          version=git_version(), dry_run=updater.dry_run)
         app = create_app(service)
         bound = sock.getsockname()[1]
         url = f"http://{host}:{bound}/"

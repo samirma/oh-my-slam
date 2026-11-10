@@ -33,8 +33,8 @@ Model weights are downloaded on the first start of the inference server:
 
 The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
-(asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes) and **O4** (per-input
-status), with the service plumbing they need. Maps started with pose priors take the
+(asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
+status), **O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing they need. Maps started with pose priors take the
 *prior-first registration* (below); camera-only maps keep the mapper.
 
 ```sh
@@ -327,6 +327,22 @@ camera height, itself approximate), monocular depth only, 1-frame start then the
 The camera-height scale on these frames is 9 % from that truth in every mode (the monocular
 floor of a camera 0.34 m above it, or the truth's own scale); on the synthetic room it is within
 1–3 %.
+
+### Dry run (O10)
+
+`POST /api/maps/{name}/updates?dry_run=1` (`service.dry_run`) validates the request as an update
+does, then answers synchronously with a `DryRun` and writes nothing (neither the request's
+cameras nor any version, job or mapper file): per frame its checks (`features`, `plain`,
+`too_close` — the monocular median depth of a suspicious frame is measured), its predicted link
+to the map (`map_inliers`: on an anchored map, the inliers of its prior-first placement against
+the current version, computed on a read-only copy; null on a new map or a mapper map), its
+links to the previous and next frames of the request (`neighbour_inliers`: fundamental-matrix
+RANSAC inliers, 3 px, of their ratio-test SIFT matches), and `predicted_status` /
+`predicted_reason` (a provisional placement predicts `registered`; on a new map a frame without
+prior and with fewer than 15 inliers to its neighbours predicts `no_overlap`). Its `quality` is
+the job's report over the predicted placements with the `accept_if` gate; `predicted_s` is the
+kept frames times the measured registration and fusion per frame. Same validation errors as an
+update; a dry run asks the inference server only for suspicious frames.
 
 ### Live check
 

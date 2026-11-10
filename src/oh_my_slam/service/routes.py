@@ -39,9 +39,12 @@ ENDPOINTS: tuple[Endpoint, ...] = (
              {200: "Health"}),
     Endpoint("GET", "/api/openapi.json", "openapi", "This API (OpenAPI 3.1)", {200: None}),
     Endpoint("POST", "/api/maps/{name}/updates", "post_update",
-             "Start an update job (creates the map)", {202: "Job"},
+             "Start an update job (creates the map); with dry_run=1, check the frames and write "
+             "nothing", {202: "Job", 200: "DryRun"},
              ("invalid_request", "camera_conflict", "inference_unavailable", "payload_too_large"),
-             request="UpdateRequest", multipart=True, params=(MAP,)),
+             request="UpdateRequest", multipart=True,
+             params=(MAP, Param("dry_run", "query", "integer", "1: answer a DryRun "
+                                "synchronously, write nothing (O10).", minimum=0, maximum=1))),
     Endpoint("GET", "/api/jobs/{id}", "get_job", "Job state and result", {200: "Job"},
              ("job_not_found", "invalid_request"),
              params=(Param("id", "path", "string", "Job id.", required=True),

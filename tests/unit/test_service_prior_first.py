@@ -53,10 +53,11 @@ def client(tmp_path: Path) -> Iterator[Client]:
     store.create()
     backend = FakeBackend()
     timings = Timings()
-    jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
+    updater = Updater(store, backend, timings)
+    jobs = Jobs(store.jobs, updater, timings.predict_update)
     jobs.start()
     service = Service(store, jobs, FakeInference(), backend.require_inference, timings=timings,
-                      version="test")
+                      version="test", dry_run=updater.dry_run)
     with TestClient(create_app(service)) as http:
         yield Client(http, backend, service)
     jobs.stop(timeout=10)
@@ -88,7 +89,7 @@ def frames_for(c: Client, poses: list[np.ndarray], *, tag: str = "f", depth: boo
 
 
 def test_health_lists_o3_jobs(client: Client) -> None:
-    assert CAPABILITIES == ["O1", "O3-jobs", "O4"]
+    assert CAPABILITIES == ["O1", "O3-jobs", "O4", "O9", "O10"]
     assert client.get("/api/health", "Health")["capabilities"] == CAPABILITIES
 
 
@@ -241,3 +242,87 @@ def test_an_all_rejected_job_on_an_anchored_map(client: Client) -> None:
     assert job["state"] == "rejected" and job["quality"]["failed_checks"] == ["hard_limit"]
     assert job["quality"]["scale_ratio_vs_prev"] is None and job["scale_source"] is None
     assert client.service.store.latest("m") == 1
+
+
+def dry(c: Client, name: str, frames: list[dict[str, Any]], files: dict[str, bytes],
+        **extra: Any) -> dict[str, Any]:
+    from tests.fakes.service import multipart
+
+    data, ctype = multipart({"frames": frames, **extra}, files)
+    r = c.http.post(f"/api/maps/{name}/updates?dry_run=1", content=data,
+                    headers={"content-type": ctype})
+    assert r.status_code == 200, r.text
+    out: dict[str, Any] = c.check(r, "DryRun")
+    return out
+
+
+def test_dry_run_of_a_new_map_writes_nothing(client: Client) -> None:
+    mask = np.zeros((240, 320), np.uint8)
+    mask[220:, :] = 255
+    buf = io.BytesIO()
+    Image.fromarray(mask).save(buf, "PNG")
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    nf, nfiles = frames_for(client, [base_pose(15), base_pose(180)], tag="n", trust=None)
+    files.update(nfiles)
+    files["p"] = plain(320, 240)
+    frames = fr + nf + [{"name": "p", "image": "p", "camera_id": "cam"}]
+    out = dry(client, "m", frames, {**files, "mk": buf.getvalue()},
+              cameras={"cam": {**CAM, "ignore_mask": "mk"}})
+    rows = {r["name"]: r for r in out["frames"]}
+    assert out["base_version"] is None and all(r["map_inliers"] is None for r in out["frames"])
+    assert rows["a0"]["predicted_status"] == "registered" and rows["a0"]["features"] > 100
+    assert rows["n0"]["predicted_status"] == "registered"
+    assert rows["n0"]["neighbour_inliers"][0]["inliers"] >= 15
+    assert (rows["n1"]["predicted_status"], rows["n1"]["predicted_reason"]) == (
+        "rejected", "no_overlap")
+    assert rows["p"]["plain"] and rows["p"]["predicted_reason"] == "plain"
+    assert out["quality"]["rejected_share"] == 0.5 and out["quality"]["accepted"]
+    assert out["predicted_s"]["registration"] > 0
+    client.get("/api/maps/m", status=404)
+    assert client.service.store.meta("m") is None  # not even the camera
+
+
+def test_dry_run_against_an_anchored_map(client: Client) -> None:
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    T = base_pose(20)
+    off = T.copy()
+    off[:3, 3] += [0.5, 0.0, 0.0]
+    fr, files = frames_for(client, [base_pose(10), T, base_pose(180)], tag="b",
+                           priors=[base_pose(10), off, base_pose(180)])
+    fr.append({"name": "a0", "image": "b0", "camera_id": "cam"})
+    out = dry(client, "m", fr, files, accept_if={"max_rejected_share": 0.1})
+    rows = [(r["predicted_status"], r["predicted_reason"]) for r in out["frames"]]
+    assert rows == [("registered", None), ("rejected", "prior_conflict"), ("registered", None),
+                    ("rejected", "duplicate")]
+    assert out["frames"][0]["map_inliers"] > 50 and out["base_version"] == 1
+    q = out["quality"]
+    assert not q["accepted"] and q["failed_checks"] == ["max_rejected_share"]
+    assert q["prior_residuals"]["count"] == 2 and q["low_confidence_share"] == 0.5
+    assert client.service.store.latest("m") == 1  # nothing committed
+
+
+def test_dry_run_measures_suspicious_frames(client: Client) -> None:
+    import cv2
+
+    img = np.full((240, 320, 3), 128, np.uint8)
+    cv2.rectangle(img, (40, 40), (280, 200), (30, 30, 30), 3)
+    client.backend.mono = 0.2
+    out = dry(client, "m", [{"name": "s", "image": "s", "camera_id": "cam"}],
+              {"s": jpeg(img)}, cameras={"cam": CAM})
+    assert out["frames"][0]["too_close"] and out["quality"]["failed_checks"] == ["hard_limit"]
+
+
+def test_neighbour_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cv2
+
+    from oh_my_slam.mapping.anchored import features
+    from oh_my_slam.service import dry_run as dr
+
+    img, _, _ = shot(base_pose(0))
+    rgb = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+    f = features(rgb)
+    assert dr.link(f, f) > 100
+    assert dr.link(f, features(np.full_like(rgb, 128))) == 0
+    monkeypatch.setattr(cv2, "findFundamentalMat", lambda *a, **k: (None, None))
+    assert dr.link(f, f) == 0

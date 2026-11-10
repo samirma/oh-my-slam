@@ -238,10 +238,17 @@ class Updater:
 
     # -- the job -------------------------------------------------------------------------------
 
-    def _frames(self, w: UpdateWork) -> tuple[list[_Frame], dict[str, NDArray[np.bool_] | None]]:
-        cams = self.store.cameras(w.map)
+    def _frames(self, w: UpdateWork, new_cameras: dict[str, dict[str, Any]] | None = None,
+                new_masks: dict[str, tuple[str, bytes]] | None = None
+                ) -> tuple[list[_Frame], dict[str, NDArray[np.bool_] | None]]:
+        """The request's frames and the cameras' ignore masks: the map's, and those of a dry
+        run's cameras (``new_cameras``, ``new_masks``: never recorded)."""
+        cams = {**self.store.cameras(w.map), **(new_cameras or {})}
         masks: dict[str, NDArray[np.bool_] | None] = {}
         for cid in {f.camera_id for f in w.frames}:
+            if cid in (new_masks or {}):
+                masks[cid] = decode_mask((new_masks or {})[cid][1], f"cameras.{cid}.ignore_mask")
+                continue
             p = self.store.mask_path(w.map, cid)
             masks[cid] = decode_mask(p.read_bytes(), f"cameras.{cid}.ignore_mask") \
                 if self.store.mask_digest(w.map, cid) else None
@@ -372,6 +379,13 @@ class Updater:
             exclude |= {fr.work.index for fr in post}
             attempt += 1
         self._finish(job, w, frames, prev, result)
+
+    def dry_run(self, w: UpdateWork, cameras: dict[str, dict[str, Any]],
+                masks: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+        """The ``DryRun`` of an update request (``service.dry_run``): nothing is written."""
+        from oh_my_slam.service.dry_run import dry_run
+
+        return dry_run(self, w, cameras, masks)
 
     def _is_anchored(self, prev: dict[str, Any] | None, frames: list[_Frame]) -> bool:
         """Whether the job runs on the prior-first registration: the map has been anchored by
