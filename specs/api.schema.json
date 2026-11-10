@@ -241,7 +241,8 @@
       "properties": {
         "name": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Unique within the map; a name the map or request already holds is rejected duplicate, whatever the image."
         },
         "image": {
           "$ref": "#/$defs/PartName"
@@ -276,7 +277,8 @@
       "properties": {
         "max_residual_m": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Gates previous_residuals (stored keyframes) and the new frames' displacement; prior corrections never fail it."
         },
         "max_gauge_shift_m": {
           "type": "number",
@@ -285,12 +287,17 @@
         "max_displacement_m": {
           "type": "number",
           "minimum": 0,
-          "description": "Gates quality.max_displacement_m, so one bad frame fails the update."
+          "description": "Gates quality.max_displacement_m; a null value passes."
         },
         "max_displacement_deg": {
           "type": "number",
           "minimum": 0,
-          "description": "Gates quality.max_displacement_deg, including frames unconstrained in translation."
+          "description": "Gates quality.max_displacement_deg, including frames unconstrained in translation; a null value passes."
+        },
+        "max_prior_disagreement_deg": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Gates quality.prior_disagreement_deg, so a client can refuse an update that bends its priors. No gate when left out."
         },
         "max_rejected_share": {
           "type": "number",
@@ -332,8 +339,10 @@
         "too_close",
         "blur",
         "prior_conflict",
-        "duplicate"
-      ]
+        "duplicate",
+        "unusable_image"
+      ],
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: also a frame name the map or request already holds."
     },
     "InputStatus": {
       "type": "object",
@@ -359,7 +368,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm; its pose is the prior, its sigmas the prior's, its prior residuals 0; it may be fused, and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed plain, blur or few_features); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it may be fused, and locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -652,6 +661,7 @@
               "max_gauge_shift_m",
               "max_displacement_m",
               "max_displacement_deg",
+              "max_prior_disagreement_deg",
               "max_rejected_share",
               "hard_limit",
               "prior_frames_rejected"
@@ -2420,7 +2430,7 @@
               }
             }
           ],
-          "description": "With lanes: interactive and bulk. A single-worker implementation reports one lane, worker, for all its inference work."
+          "description": "With lanes: interactive and bulk. Without lanes, one lane, worker: the service's single job worker, its state and queue length."
         },
         "capabilities": {
           "type": "array",

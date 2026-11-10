@@ -82,7 +82,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `fusion.intermediate_interval` | C3 | Longest interval between intermediate versions while fusion lasts longer than it |
 | `inputs.reason_agreement` | C4 | Share of rejected inputs whose `reason` agrees with the truth (bare wall, too close, no overlap) |
 | `revert.latency` | C5 | Revert latency |
-| `gate.warping_rejected` | C6 | Share of the warping updates listed in `targets.json` rejected by `accept_if` at the thresholds `targets.json` gives (`gate.accept_if`) |
+| `gate.warping_rejected` | C6 | Share of the warping updates rejected by the gate parameters below |
 | `gate.others_accepted` | C6 | Share of the other updates of the passing episodes accepted at those thresholds |
 | `grid.floor_plan_agreement` | C9 | Share of observed cells agreeing with the floor plan (free inside rooms, occupied at walls) |
 | `passages.door_recall` | C9 | Share of the floor plan's doors found as passages within 0.3 m |
@@ -102,6 +102,11 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `interactive.latency_under_load` | C12 | Locate and analyse latency while an update runs: ratio to idle latency, and absolute |
 | `locate.latency_idle` | C12 | Locate while idle, per frame of the request |
 | `update.later_wins` | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes |
+
+**Gate parameters.** The C6 metrics send `accept_if {max_residual_m: 0.10, max_gauge_shift_m:
+0.05, max_rejected_share: 0.5}`, the thresholds the client sends. They are parameters of the
+measurement, not targets, so `targets.json` does not hold them: it holds metric thresholds only.
+The warping updates are those of the recorded episodes e034 and e040.
 
 ## Reference captures
 
@@ -149,8 +154,7 @@ these ids.
 | `fusion.intermediate_interval` | ≤ 10 s |
 | `inputs.reason_agreement` | ≥ 0.8 |
 | `revert.latency` | ≤ 2 s |
-| `gate.accept_if` | `{max_residual_m: 0.10, max_gauge_shift_m: 0.05, max_rejected_share: 0.5}` |
-| `gate.warping_rejected` | All (100 %), on the warping updates of episodes e034 and e040 |
+| `gate.warping_rejected` | All (100 %) |
 | `gate.others_accepted` | ≥ 0.9 |
 | `grid.floor_plan_agreement` | ≥ 0.9 |
 | `passages.door_recall` | ≥ 0.8 |

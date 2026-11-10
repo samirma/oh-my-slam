@@ -126,15 +126,16 @@ defines it, and `/api/openapi.json` describes it.
 Every JSON body follows [specs/api.schema.json](specs/api.schema.json), a flat, documented JSON
 Schema (draft 2020-12). Each response names its schema version in `schema`. A change that
 removes or renames a field, or changes its meaning, raises the major version. The skill's client
-is written against this schema.
+is written against this schema. OpenLABEL is no longer produced.
 
-**Narrowings accepted in oms/2.2.** Three changes narrow what a response may hold, yet stay in
+**Narrowings accepted in oms/2.2.** Four changes narrow what a response may hold, yet stay in
 minor 2.2, because the API has a single client, updated in step with it:
 1. passage `kind`: `narrow` is deprecated and no longer produced (a separate `narrow` flag
    replaces it), and `door` requires a found leaf;
 2. locate's `reason` no longer includes `too_close`;
-3. health `lanes` may be a single `worker` lane instead of `interactive` and `bulk`.
- OpenLABEL is no longer produced.
+3. health `lanes` may be a single `worker` lane instead of `interactive` and `bulk`;
+4. an input status's `reason` is null for `registered` and `provisional`, and set for
+   `rejected` and `kept_at_prior`.
 
 ## 8. Concurrency and latency
 

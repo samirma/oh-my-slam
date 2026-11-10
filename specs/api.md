@@ -77,7 +77,8 @@ error code `invalid_request` (§9).
   later job may omit it. If that earlier job does not commit, the later job fails with
   `invalid_request`.
 * **`frames[]`** — each [`FrameInput`] has:
-  * `name`, unique in the request;
+  * `name`, unique within the map: a name the map or the request already holds is rejected
+    `duplicate`, whatever the image;
   * `image`, a part name;
   * `camera_id`;
   * an optional `prior` [`Prior`]. A prior without sigmas takes fixed defaults: `metric`
@@ -111,20 +112,30 @@ error code `invalid_request` (§9).
   | --- | --- |
   | `name` | The frame's name. |
   | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. |
-  | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict` or `duplicate`. |
+  | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
-  `reason` says why. Its pose is the prior, its sigmas are the prior's, and its prior residuals
-  are 0. It is stored and may be fused, but locate never uses it as a reference (§6).
+  `reason` says why. Its prior residuals are 0. It is stored and may be fused, but locate never
+  uses it as a reference (§6).
+  * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
+  * With a `drifting` prior, its pose is the prior mapped into the map frame through the
+    current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
+    plus the drift estimate's uncertainty.
 
   **Choosing a status.**
-  * `rejected` with `prior_conflict` only when the images confirm a pose farther than 3 prior
-    sigmas from the prior, and no supported hypothesis lies within 3 prior sigmas of it.
+  * A hypothesis's support is its inlier count over the best image hypothesis's inlier count;
+    it is supported at 0.25 or more (the same definition as locate, §6).
+  * `rejected` with `prior_conflict` only when the images confirm a pose farther than 3 × the
+    prior's sigmas from the prior (the prior's sigmas alone, not combined with the image's), and
+    no supported hypothesis lies within 3 × the prior's sigmas of it.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
+  * A frame with a prior whose image fails the quality checks (`plain`, `blur`,
+    `few_features`) is `kept_at_prior` with that reason. It is `rejected` only when the image is
+    unusable (`unusable_image`: it does not decode, or its size is not the camera's).
   * A view the map already has is `registered`; it is rejected as `duplicate` only when it adds
     nothing new. `too_close` is only the camera-to-scene distance limit, with `min_distance_m`
     and `scene_distance_m`.
@@ -200,10 +211,10 @@ The versions read, revert and `--keep-versions` are O2.
 * **Reasons.**
   * `few_features`: the frame has fewer keypoints than a pose needs inliers. That minimum is an
     implementation constant recorded in `README.md` (currently 15).
-  * `no_overlap`: the frame has enough keypoints but gets no pose. It carries `nearest_view`
-    when it has a prior (below), pointing only at a confirmed keyframe.
-* **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
-  service can estimate one, else null:
+  * `no_overlap`: the frame has enough keypoints but gets no pose; see `nearest_view` below.
+* **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view`. It is
+  guaranteed when the frame has a prior. Without a prior it is allowed, with `turn_deg` null,
+  when the service can estimate one; otherwise null:
   * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`. Only
     confirmed keyframes qualify, never a `kept_at_prior` one;
   * `turn_deg`: the signed turn from the frame's prior heading toward that keyframe's view.
