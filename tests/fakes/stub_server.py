@@ -2,8 +2,8 @@
 
 ``python -m tests.fakes.stub_server`` runs the shipped server (lock, socket, worker thread, HTTP
 app) with the stub adapters on the CPU. ``start_stub_server`` launches it in the background the way
-``start_inference_server.sh`` launches the real one and waits until it is ready; the shipped
-``start_inference_server.sh --status`` / ``--stop`` then manage it like any server.
+``server.sh`` launches the real one and waits until it is ready; the service's
+``inference.stop_inference`` then stops it like any server.
 """
 
 from __future__ import annotations

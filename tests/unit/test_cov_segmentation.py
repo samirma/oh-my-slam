@@ -2,7 +2,7 @@
 its edges: a detection whose mask is empty claims no pixel, a mask lifted with only the model's
 validity mask, a support strip that cannot be judged on too few points, a box fitted to points on
 a line, a colour that would repeat an earlier id or break the colour rules, no heights to ramp,
-an image cloud thinned for display, and a scene description without gravity."""
+and an image cloud thinned for display."""
 
 from __future__ import annotations
 
@@ -15,12 +15,10 @@ from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.reconstruction.cloud import derive_cloud, derive_thinned
-from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import colors
 from oh_my_slam.segmentation.api import Detection, image_cloud_source, pixel_owners, segment_frame
 from oh_my_slam.segmentation.lift import MIN_POINTS, lift_mask, support_fringe
 from oh_my_slam.segmentation.obb import fit_upright_obb
-from oh_my_slam.segmentation.scene import single_image_scene
 from tests.fakes.client import FakeClient, FakeFrame, FakeInstance
 
 K = Intrinsics(100.0, 100.0, 40.0, 30.0, 80, 60)
@@ -112,12 +110,3 @@ def test_an_image_cloud_thinned_for_display_keeps_exact_points(tmp_path: Path) -
     assert np.array_equal(thin.cloud.label, full.label[picked])
     again = derive_thinned(source, CloudAttrs(color="rgb"), 500)  # colour only: same selection
     assert np.array_equal(again.cloud.xyz, thin.cloud.xyz) and again.voxel == thin.voxel
-
-
-def test_a_scene_without_gravity_says_none(tmp_path: Path) -> None:
-    frame, seg = frame_with_objects(tmp_path, gravity=False)
-    assert frame.gravity is None and [o.label for o in seg.objects] == ["box"]
-    doc = single_image_scene(seg, tool="segment")
-    meta = doc["openlabel"]["metadata"]
-    assert "gravity" not in meta and meta["tool"] == "segment"
-    assert validation_errors(doc) == []

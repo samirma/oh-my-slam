@@ -36,7 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 def test_the_entry_point_refuses_to_start_while_another_server_holds_the_lock() -> None:
-    """``python -m oh_my_slam.server.main`` (what start_inference_server.sh launches) exits 1 with
+    """``python -m oh_my_slam.server.main`` (what server.sh launches) exits 1 with
     the reason when another server holds the single-instance lock, loading no model."""
     lock = lifecycle.ServerLock()
     lock.acquire()
@@ -235,14 +235,14 @@ def test_a_model_failure_answers_500_with_its_type_and_message(tmp_path: Path) -
         key, name = "multiview", "broken"
 
         def run(self, req: p.MultiviewRequest) -> dict[str, Any]:
-            raise RuntimeError("MPS backend out of memory")
+            raise RuntimeError("shape mismatch")
 
     state.registry.adapters["multiview"] = Broken()
     client = TestClient(create_app(state))
     r = client.post(p.ROUTE_MULTIVIEW, json=p.MultiviewRequest(
         image_paths=["a.jpg"], out_dir=str(tmp_path)).model_dump())
     assert r.status_code == 500
-    assert r.json() == {"error": "RuntimeError", "detail": "MPS backend out of memory"}
+    assert r.json() == {"error": "RuntimeError", "detail": "shape mismatch"}
     # the server keeps answering
     assert client.get(p.ROUTE_HEALTH).json()["status"] == "ready"
     state.worker.stop()

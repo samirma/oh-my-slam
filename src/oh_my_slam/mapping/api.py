@@ -1,4 +1,4 @@
-"""``mapper.sh update``: create or extend a persistent map.
+"""The mapper's update: create or extend a persistent map (run by the service's update jobs).
 
 Order (design, "Mapping update"): lock + stage → inputs/keyframes → per-keyframe geometry,
 gravity and descriptor (``reconstruction.api``) with detections (``segmentation.api``) → features,

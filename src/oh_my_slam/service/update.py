@@ -6,7 +6,7 @@
 2. **Registration.** The other frames, rectified to their camera's canonical pinhole
    (``cameras``) with its intrinsics given to the mapper in place of EXIF and focal estimation,
    are mapped into a clone of the map's mapper map (``backend``): COLMAP SIFT, global or
-   incremental SfM, the multi-view fallback, depth alignment and fusion, as ``mapper.sh update``.
+   incremental SfM, the multi-view fallback, depth alignment and fusion (``mapping.api.update``).
    A frame the mapper does not place is ``few_features`` or ``no_overlap``.
 3. **Anchoring.** The similarity ``S`` from the mapper's internal frame to the map frame is fitted
    to the anchors (``anchor``): on a map's first update the metric priors (else the drifting

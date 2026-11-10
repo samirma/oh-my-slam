@@ -1,7 +1,7 @@
 """The point-cloud attributes of every emitted PLY (spec §2.2): definition, defaults, validation.
 
-One definition shared by ``reconstruct.sh -f ply``, ``mapper.sh -f ply`` and the ``view.sh``
-controls. ``-p key=value[,key=value…]`` is parsed here; keys that are not given keep their defaults
+One definition shared by every cloud the reconstruction code derives (``reconstruction.cloud``).
+``key=value[,key=value…]`` is parsed here; keys that are not given keep their defaults
 (``CloudAttrs()``), and every problem is a :class:`UsageError` (exit 2) raised before any inference
 runs.
 
@@ -199,7 +199,7 @@ def parse_cloud_attrs(spec: str | Mapping[str, str] | None, scope: CloudScope) -
         seen.add(key)
         if a.pixel_level and CloudScope.MAP in scope:
             raise UsageError(f"{key} is a pixel-level attribute: it applies before unprojection, "
-                             "to single images only (reconstruct.sh); a map's points are already "
+                             "to single images only; a map's points are already "
                              "3D — use voxel to thin them")
         try:
             parsed = a.parse(value)

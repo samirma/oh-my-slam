@@ -1,7 +1,7 @@
 """HTTP-over-Unix-socket client for the inference server.
 
 Any failure to reach the server becomes :class:`ServerUnavailableError` (exit 3, with the hint to
-run ``./start_inference_server.sh``). Queue-full responses (503) are retried with back-off.
+run ``./server.sh``). Queue-full responses (503) are retried with back-off.
 """
 
 from __future__ import annotations

@@ -297,7 +297,6 @@ def _depth_limit(fd: FrameData) -> float:
 @dataclass
 class MapGeometry:
     cloud: PointCloud  # map cloud, label = object id
-    new_cloud: PointCloud  # points of this update's keyframes
     stats: dict[str, Any]
     nearest: dict[int, float] = field(default_factory=dict)  # nearest_detections
 
@@ -1313,12 +1312,11 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
         for fd in fused.frames:
             fd.labels = _frame_labels(ctx, fd.rec, fd.depth.shape, objs)
         xyz = fused.xyz
-        rgb, label, seen_new = attribute_points(xyz, fused.frames, attribution_gates(objs),
+        rgb, label, _ = attribute_points(xyz, fused.frames, attribution_gates(objs),
                                                 fused.vacated, fused.retired)
         supported = support_labels(xyz, label, objs,
                                    fused_objects(objs, fused.frames, fused.depth_max))
         cloud = PointCloud(xyz, rgb, label)
-        new_cloud = cloud.subset(np.nonzero(seen_new)[0])
         assert cloud.label is not None
         tx.write_bytes(store.CLOUD_PLY, ply_bytes(PointCloud(cloud.xyz, cloud.rgb),
                                                   comments=["oh-my-slam map cloud, metres, z up"]))
@@ -1328,4 +1326,4 @@ def build_geometry(ctx: Any, records: list[store.FrameRecord], objs: ObjectState
     stats = {"cloud_points": len(cloud), "voxel": fused.voxel, "focal_px": round(fused.focal, 2),
              "support_objects": supported, "consensus": fused.consensus}
     ctx.notes["geometry"] = stats
-    return MapGeometry(cloud, new_cloud, stats, nearest_detections(objs, fused.frames))
+    return MapGeometry(cloud, stats, nearest_detections(objs, fused.frames))

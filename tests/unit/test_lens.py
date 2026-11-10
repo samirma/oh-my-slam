@@ -9,7 +9,6 @@ import pytest
 
 from oh_my_slam.core.images import grid_index, undistort_rgb
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.schema import openlabel as ol
 
 LENS = Intrinsics(1392.0, 1392.0, 960.0, 444.0, 1920, 888, "colmap", -0.524)
 
@@ -114,23 +113,3 @@ def test_a_grid_over_the_undistorted_image_indexes_the_image_grid() -> None:
     np.testing.assert_array_equal(rows, v)
     np.testing.assert_array_equal(cols, u)
     assert (same[0, 48] == -1) and (same >= -1).all() and shown[22, 48]
-
-
-def test_a_camera_stream_records_its_lens() -> None:
-    pin = ol.camera_stream(LENS.pinhole(), uri="a.jpg")["stream_properties"]
-    assert pin["intrinsics_pinhole"]["distortion_coeffs"] == [0.0] * 5
-    assert "intrinsics_custom" not in pin
-    lens = ol.camera_stream(LENS)["stream_properties"]
-    assert lens["intrinsics_pinhole"]["distortion_coeffs"] == LENS.opencv_distortion()
-    custom = lens["intrinsics_custom"]
-    assert custom["model"] == "division" and custom["k"] == -0.524
-    assert (custom["focal_length_px"], custom["center_x_px"]) == (1392.0, 960.0)
-
-
-def test_a_camera_stream_gives_its_camera_back() -> None:
-    for cam in (LENS, LENS.pinhole().with_source("exif")):
-        back = ol.stream_intrinsics(ol.camera_stream(cam)["stream_properties"])
-        assert (back.width, back.height, back.source, back.k) == (cam.width, cam.height,
-                                                                  cam.source, cam.k)
-        np.testing.assert_allclose([back.fx, back.fy, back.cx, back.cy],
-                                   [cam.fx, cam.fy, cam.cx, cam.cy], rtol=1e-6)

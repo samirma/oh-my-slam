@@ -164,13 +164,6 @@ class ServerProtocolError(ServerUnavailableError):
         )
 
 
-class ServiceNotRunningError(OhMySlamError):
-    """``server.sh --status`` without a running service: exit 3, like ``start_inference_server.sh
-    --status``."""
-
-    exit_code = ExitCode.SERVER_UNAVAILABLE
-
-
 class ServerBusyError(OhMySlamError):
     """The server queue is full (HTTP 503) and retries were exhausted."""
 

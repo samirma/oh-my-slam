@@ -487,10 +487,9 @@ def test_identity_colour_and_obb_refinement_across_updates(tmp_path: Path) -> No
     assert all(iou3[k] >= iou1[k] - 0.02 for k in ids), (iou1, iou3)
     assert np.mean(list(iou3.values())) > np.mean(list(iou1.values())) + 0.05, (iou1, iou3)
     assert min(iou3.values()) > 0.6, iou3
-    # the colour contract on the map cloud: each labelled point has its object's colour
-    doc = json.loads(export.scene_bytes(store.MapReader(mdir)))
-    for oid, od in doc["openlabel"]["objects"].items():
-        assert od["object_data"]["text"][0]["val"] == color_hex_for_id(int(oid))
+    # each published object's display colour is a pure function of its id
+    for o in export.map_objects(store.MapReader(mdir))[1]:
+        assert o.color_hex == color_hex_for_id(o.id)
 
 
 def test_merge_keeps_the_lower_id(tmp_path: Path) -> None:
@@ -537,7 +536,7 @@ def test_merge_keeps_the_lower_id(tmp_path: Path) -> None:
     assert set(np.unique(r2.cloud.label)) == {0, halves[0]}
     reader = store.MapReader(mdir)
     _, objs_ = export.map_objects(reader)
-    src = export.reader_source(reader, objs_)
+    src = export.map_source(export.map_cloud(reader), objs_, reader.frames)
     assert src.labels is not None and set(np.unique(src.labels)) == {0, halves[0]}
     assert [o.id for o in objs_] == [halves[0]] and objs_[0].color == color_for_id(halves[0])
     r1_insts = [i["object_id"] for r in reader.frames if r.update_id == 1

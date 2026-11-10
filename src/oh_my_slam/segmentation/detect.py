@@ -4,8 +4,7 @@ ordering. Also owns the vocabulary and label rules.
 
 Grid-independent: what the detector is shown never depends on the caller's grid (1024 px for a
 single image, 768 px for map keyframes); only the masks are resampled onto it. The same image
-therefore gives the same detections to ``segment.sh -i`` / ``view.sh -i`` / ``reconstruct.sh`` and
-to the mapper (``DETECT_SIDE``, ``COARSE_SIDE``).
+therefore gives the same detections to a single frame's segmentation and to the mapper (``DETECT_SIDE``, ``COARSE_SIDE``).
 
 Stable across thresholds: the server is asked for every detection above ``request_floor``
 (``TRUSTED_SCORE`` for the default and higher thresholds, ``DETECTION_FLOOR`` below it, and

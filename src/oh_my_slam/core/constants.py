@@ -23,6 +23,6 @@ MAX_GRID_SIDE = 1024
 
 # Map registration: a map of up to UPDATE_EXHAUSTIVE_MAX keyframes is matched exhaustively (no
 # inference server needed); a larger one through the RETRIEVAL_TOP_K most similar keyframes by the
-# server's retrieval descriptor, so mapper.sh locate needs the server only then.
+# server's retrieval descriptor, so locate needs the server only then.
 UPDATE_EXHAUSTIVE_MAX = 150
 RETRIEVAL_TOP_K = 30

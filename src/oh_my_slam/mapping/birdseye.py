@@ -1,10 +1,9 @@
-"""The bird's-eye image of a map: ``mapper.sh locate -f png`` (specs/mapper.md "Bird's-eye image").
+"""The bird's-eye image of a map (map.md §8; served as a versioned read in a later group).
 
 An orthographic projection along the map's up axis (+z) onto its horizontal plane, one scale for
 both axes, as one 8-bit RGB PNG: image right is map +x, image up is map +y (seen from above). The
 image always covers the whole map — every map point, every OBB footprint, every keyframe camera
-centre — and the cameras it draws, whatever its layers and scope, so one map and one set of
-cameras give one pixel grid. From bottom to top:
+centre — and the cameras it draws, so one map and one set of cameras give one pixel grid. From bottom to top:
 
 * ``cloud`` — the map cloud as ``color=rgb`` derives it (``reconstruction.cloud``), each pixel the
   highest point that falls in it, without the ceiling or roof (``ceiling_cut``).
@@ -12,15 +11,14 @@ cameras give one pixel grid. From bottom to top:
   colour (``OUTLINE_PX``, no anti-aliasing: the colour contract's exact triple), with its id in
   that colour on a tag of the background colour above the footprint; the tags lie under every
   outline.
-* the cameras: keyframes (``-t full``) as small discs, the last known camera as a diamond, a
-  located camera as a triangle pointing where it looks, tagged with its ``Camera.tag`` (the
+* the cameras: keyframes as small discs, a located camera as a triangle pointing where it looks, tagged with its ``Camera.tag`` (the
   number of its image among the inputs, from 1) where no other camera's tag is; each with its
   viewing direction projected onto the horizontal plane.
 
 Scale: ``MIN_METRES_PER_PX`` (1 cm) per pixel, or the smallest 1-2-5 step that keeps the drawn
 extent within ``MAX_SIDE_PX``; the grid is aligned to the scale, with ``MARGIN_PX`` around it. The
 PNG's text metadata (``Description`` and the keys of ``METADATA``) maps pixels to map coordinates
-and records the layers, the ceiling cut, the cameras in the JSON result's representation and a
+and records the ceiling cut, the cameras' records and a
 legend of the marks drawn (``MARKS``: shape, colours, meaning)."""
 
 from __future__ import annotations
@@ -54,9 +52,8 @@ CAMERA_FILL = (0xFF, 0xFF, 0xFF)
 CAMERA_EDGE = (0x00, 0x00, 0x00)
 KEYFRAME_FILL = (0xC9, 0xD1, 0xDC)
 LOCATED_PX = (11.0, 7.0, 7.0)  # triangle: apex ahead of the centre, base behind it, half-width
-LAST_KNOWN_PX = 8.0  # diamond: half-diagonal
 KEYFRAME_PX = 3.0  # disc radius
-HEADING_PX = {"located": 20.0, "last_known": 20.0, "keyframe": 9.0}
+HEADING_PX = {"located": 20.0, "keyframe": 9.0}
 # Ceiling or roof (ceiling_cut): over the points higher than every keyframe camera centre by
 # CEILING_CLEARANCE_M, in CEILING_BIN_M bins, a layer is CEILING_SLAB_BINS consecutive bins holding
 # at least CEILING_DENSITY times the median non-empty layer's points and covering at least
@@ -84,8 +81,6 @@ MARKS: dict[str, dict[str, str]] = {
                                         "colour and tagged with its id"},
     "keyframe": {"shape": "disc", "fill": _hex(KEYFRAME_FILL), "edge": _hex(CAMERA_EDGE),
                  "text": "a keyframe's camera, its tick pointing where it looked"},
-    "last_known": {"shape": "diamond", "fill": _hex(CAMERA_FILL), "edge": _hex(CAMERA_EDGE),
-                   "text": "the map's last known camera, its line pointing where it looked"},
     "located": {"shape": "triangle", "fill": _hex(CAMERA_FILL), "edge": _hex(CAMERA_EDGE),
                 "text": "a located camera, its tip and its line pointing where it looks, tagged "
                         "with the number of its image among the inputs (1: the first)"},
@@ -95,7 +90,6 @@ METADATA = {
     "pixel_to_map": "2 x 3 affine matrix M: map (x, y) = M (u, v, 1)",
     "map_to_pixel": "its inverse: pixel (u, v) = M (x, y, 1)",
     "metres_per_pixel": "the scale",
-    "layers": "the layers drawn under the cameras (-l)",
     "ceiling_cut_z": "the height from which map points are left out (null: none)",
     "cameras": "the cameras drawn, as the JSON result represents them",
     "map": "the map folder",
@@ -105,8 +99,8 @@ METADATA = {
 
 @dataclass(frozen=True)
 class Camera:
-    """A camera the image draws: ``kind`` "located", "last_known" or "keyframe"; ``record`` its
-    JSON representation (``locate.camera_record``), keyed ``key`` in the metadata; ``tag`` the
+    """A camera the image draws: ``kind`` "located" or "keyframe"; ``record`` what the metadata
+    records of it, keyed ``key``; ``tag`` the
     text a located camera is tagged with (none: no tag)."""
 
     key: str
@@ -299,12 +293,8 @@ def _draw_camera(draw: Any, grid: Grid, cam: Camera) -> None:
         return
     draw.line([tuple(c), tip], fill=CAMERA_EDGE, width=4)
     draw.line([tuple(c), tip], fill=CAMERA_FILL, width=2)
-    if cam.kind == "located":
-        ahead, behind, half = LOCATED_PX
-        shape = [c + d * ahead, c - d * behind + n * half, c - d * behind - n * half]
-    else:
-        r = LAST_KNOWN_PX
-        shape = [c + d * r, c + n * r, c - d * r, c - n * r]
+    ahead, behind, half = LOCATED_PX  # a located camera
+    shape = [c + d * ahead, c - d * behind + n * half, c - d * behind - n * half]
     draw.polygon([tuple(p) for p in shape], fill=CAMERA_FILL, outline=CAMERA_EDGE)
 
 
@@ -342,11 +332,10 @@ def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera]) -> bytes:
     for cam in ordered:  # over every marker, each where no other tag is
         if cam.tag:
             _draw_tag(draw, grid, cam, taken)
-    drawn = ",".join(LAYERS)
     kinds = {c.kind for c in cameras}
     legend = [{"mark": k, **MARKS[k]} for k in MARKS if k in LAYERS or k in kinds]
     text = {
-        "Description": description(reader.root.name, grid.s, drawn),
+        "Description": description(reader.root.name, grid.s),
         "pixel_to_map": _compact(grid.pixel_to_map()),
         "map_to_pixel": _compact(grid.map_to_pixel()),
         "metres_per_pixel": _compact(grid.s),
@@ -358,13 +347,10 @@ def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera]) -> bytes:
     return png_bytes(np.asarray(canvas), text=text)
 
 
-LAYER_WORDS = {"cloud": "its point cloud", "obb": "its objects' OBBs"}
-
-
-def description(name: str, s: float, layers: str) -> str:
+def description(name: str, s: float) -> str:
     """The image's ``Description``, in words: the map, the projection and its axes, the scale and
     what it shows."""
-    shown = " and ".join(LAYER_WORDS[k] for k in layers.split(","))
+    shown = "its point cloud and its objects' OBBs"
     return (f"Bird's-eye image of the map {name}, seen from straight above (an orthographic "
             f"projection along the map's +z: image right is map +x, image up is map +y) at "
             f"{s:g} m per pixel, showing {shown} under the cameras. Its text metadata maps its "

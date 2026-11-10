@@ -163,7 +163,7 @@ def test_failed_models_give_an_actionable_error(monkeypatch: pytest.MonkeyPatch)
         InferenceClient().require_ready()
     msg = str(exc.value)
     assert "models failed to load" in msg and "MoGe: OSError: no weights" in msg
-    assert str(paths.server_log()) in msg and "./start_inference_server.sh" in msg
+    assert str(paths.server_log()) in msg and "./server.sh" in msg
     assert "not running" not in msg and exc.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 

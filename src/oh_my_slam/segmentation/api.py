@@ -1,14 +1,12 @@
 """Segmentation API: detections → exclusive masks → 3D points → upright OBBs → ids and colours.
 
-``segment_frame`` serves ``segment.sh``, ``reconstruct.sh`` (JSON and ``color=segment`` /
-``label`` PLYs) and ``view.sh -i``; ``detect_alongside``, ``lift_detections`` and ``trim_support``
+``segment_frame`` segments a single frame (frame analysis, a later group); ``detect_alongside``, ``lift_detections`` and ``trim_support``
 serve the mapper (detections of a keyframe while the mapper's own reconstruction call runs;
 instances in map coordinates, without the support their masks bled onto), ``fit_object_obb`` fits
 the boxes of both. Emitted clouds are derived by the reconstruction code (``reconstruction.cloud``,
 spec §4); ``image_cloud_source`` and ``map_cloud_source`` give it the point labels and the colour
-assignment it applies (``POINT_COLORS``). The segmented image is ``segmentation.render``'s. Other
-packages use segmentation through this module (and ``scene``, ``render``, ``catalog``,
-``artifacts``), never its internals (import-linter contract).
+assignment it applies (``POINT_COLORS``). Other
+packages use segmentation through this module, never its internals (import-linter contract).
 """
 
 from __future__ import annotations

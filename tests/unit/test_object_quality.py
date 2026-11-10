@@ -15,12 +15,8 @@ import pytest
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import objects as mo
 from oh_my_slam.mapping.objects import MapObject, ObjectState, Sighting
-from oh_my_slam.schema import openlabel as ol
-from oh_my_slam.segmentation.api import SceneObject, fit_object_obb
+from oh_my_slam.segmentation.api import fit_object_obb
 from oh_my_slam.segmentation.obb import OBB
-from oh_my_slam.segmentation.scene import object_entry
-from oh_my_slam.tools.evaluate.scene import doc_objects
-from oh_my_slam.tools.evaluate.segmentation import paired_labels
 
 
 def canonical(points: np.ndarray) -> np.ndarray:
@@ -386,28 +382,3 @@ def test_point_count_is_the_objects_points_in_the_map_cloud() -> None:
     stored = {d["id"]: d for d in written[mo.OBJECTS_JSON]["objects"]}
     assert stored[3]["point_count"] == 45_000
     assert MapObject.from_dict(stored[3], big.points).point_count == 45_000
-
-
-# --- export and evaluation of flickering labels ---------------------------------------------------
-
-
-def test_detected_as_labels_are_exported_and_paired() -> None:
-    box = OBB(np.zeros(3), np.eye(3), np.ones(3))
-    plain = SceneObject(1, "cup", 0.8, box, 10, 10)
-    assert "detected_as" not in json_names(object_entry(plain, "map"))
-    merged = SceneObject(2, "door", 0.8, box, 10, 10, frames=[0, 5],
-                         labels=("door", "wardrobe"))
-    entry = object_entry(merged, "map")
-    assert entry["object_data"]["vec"][0]["name"] == "color"  # the colour stays first
-    doc = {"openlabel": {"objects": {"1": object_entry(plain, "map"), "2": entry}}}
-    objs = doc_objects(doc)
-    assert objs[1].labels == ("door", "wardrobe") and objs[0].labels == ()
-    # frame 5 detected the door as a wardrobe: the map object is backed by that detection
-    assert paired_labels([objs[1].labels], ["wardrobe"]) == 1
-    assert paired_labels(["door"], ["wardrobe"]) == 0
-    assert paired_labels([("door", "wardrobe"), "cup"], ["mug", "door"]) == 2
-    assert ol.vec("detected_as", ["a", "b"]) == {"name": "detected_as", "val": ["a", "b"]}
-
-
-def json_names(entry: dict[str, Any]) -> set[str]:
-    return {v["name"] for v in entry["object_data"].get("vec", [])}

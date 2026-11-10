@@ -12,7 +12,6 @@ import pytest
 from oh_my_slam.core.geometry import angle_between_deg
 from oh_my_slam.mapping.api import update
 from oh_my_slam.mapping.store import MapReader
-from oh_my_slam.schema.validate import validation_errors
 from tests.fakes.client import FakeClient
 from tests.synth.mapping import add_frames, mapping_room, ring
 
@@ -26,8 +25,7 @@ def test_single_image_map_then_extension(tmp_path: Path) -> None:
     imgs = add_frames(client, room, poses, tmp_path / "in", "p", depth_noise=0.02, seed=7)
     mdir = tmp_path / "map"
     res = update(mdir, [imgs[0]], client=client, progress=lambda m: None)
-    doc = json.loads(res.payload)
-    assert validation_errors(doc) == []
+    assert res.new_frames == ["f000000"]
     r = MapReader(mdir)
     assert len(r.frames) == 1 and r.frames[0].pose_source == "identity"
     np.testing.assert_allclose(r.frames[0].T_map_cam.t, 0, atol=1e-9)

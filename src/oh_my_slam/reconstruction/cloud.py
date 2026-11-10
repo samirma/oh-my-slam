@@ -245,7 +245,7 @@ def cloud_ply(source: CloudSource, attrs: CloudAttrs, extra_comments: Sequence[s
               ) -> bytes:
     """``derive_cloud`` as a PLY whose header names the frame and records the effective
     attributes (defaults included; for a map only those that apply), then ``extra_comments``
-    (one header line each: the located cameras of ``mapper.sh locate``)."""
+    (one header line each)."""
     scope = scope_of(source)
     frame = IMAGE_FRAME if scope == CloudScope.IMAGE else MAP_FRAME
     return ply_bytes(derive_cloud(source, attrs), encoding=attrs.encoding,

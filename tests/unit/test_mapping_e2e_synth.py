@@ -12,17 +12,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from oh_my_slam.core.cloud_attrs import CloudScope, parse_cloud_attrs
 from oh_my_slam.core.errors import MapLockedError, NotAMapError, RegistrationError
 from oh_my_slam.core.geometry import rot_z
-from oh_my_slam.core.ply import parse_header, parse_ply
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.api import update
-from oh_my_slam.mapping.export import scene_bytes
-from oh_my_slam.schema.validate import validation_errors
-from oh_my_slam.segmentation.colors import color_hex_for_id, hex_to_rgb
+from oh_my_slam.mapping.export import map_cloud
+from oh_my_slam.segmentation.colors import color_hex_for_id
 from oh_my_slam.segmentation.obb import OBB, obb_iou_upright
 from tests.fakes.client import FakeClient
+from tests.mapobjects import by_label, frames, objects
 from tests.mapsnap import full_tree_hash
 from tests.synth.mapping import add_frames, mapping_room, ring
 from tests.synth.scene import Box, Room
@@ -38,34 +36,15 @@ def truth_obb(box: Box) -> OBB:
     return OBB(np.asarray(box.center, float), rot_z(box.yaw), np.asarray(box.size, float))
 
 
-def objects_by_label(doc: dict) -> dict[str, list[dict]]:
-    out: dict[str, list[dict]] = {}
-    for oid, o in doc["openlabel"]["objects"].items():
-        o = dict(o, id=int(oid))
-        out.setdefault(o["type"], []).append(o)
-    return out
-
-
-def cuboid_obb(o: dict) -> OBB:
-    from oh_my_slam.core.geometry import quat_to_rot
-
-    v = o["object_data"]["cuboid"][0]["val"]
-    return OBB(np.array(v[:3]), quat_to_rot(np.array(v[3:7])), np.array(v[7:10]))
-
-
-def map_to_world(doc: dict, frames_true: dict[str, object]) -> object:
+def map_to_world(mdir: Path, frames_true: dict[str, object]) -> object:
     """Similarity map → synthetic world from the keyframe camera centres (Umeyama)."""
     from oh_my_slam.core.geometry import umeyama
 
     src, dst = [], []
-    for fr in doc["openlabel"]["frames"].values():
-        name = fr["frame_properties"]["keyframe"]
-        if name in frames_true:
-            src.append(fr["frame_properties"]["transforms"]["camera_1_to_map"][
-                "transform_src_to_dst"]["translation"] if "camera_1_to_map" in fr[
-                "frame_properties"]["transforms"] else next(iter(fr["frame_properties"][
-                    "transforms"].values()))["transform_src_to_dst"]["translation"])
-            dst.append(frames_true[name])
+    for fr in frames(mdir):
+        if fr.name in frames_true:
+            src.append(fr.T_map_cam.t)
+            dst.append(frames_true[fr.name])
     return umeyama(np.array(src), np.array(dst), with_scale=True)
 
 
@@ -98,19 +77,17 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     mdir = base / "map"
 
     # --- update A: create -----------------------------------------------------------------------
-    res = update(mdir, sorted((base / "a").glob("*.png")), mode="full", client=client, progress=quiet)
-    doc_a = json.loads(res.payload)
-    assert validation_errors(doc_a) == []
+    res = update(mdir, sorted((base / "a").glob("*.png")), client=client, progress=quiet)
     assert len(res.new_frames) >= 13  # >= 90 % registered
     assert (mdir / "map.json").exists() and not (mdir / "mesh").exists()
     for rel in ("frames.json", "cloud.ply", "cloud_objects.npy", "objects.json",
                 "sfm/database.db", "sfm/model"):
         assert (mdir / rel).exists(), rel
-    assert len(doc_a["openlabel"]["frames"]) == len(res.new_frames)
+    assert len(frames(mdir)) == len(res.new_frames)
+    assert res.objects == len(objects(mdir))
     # per-stage timings (R44): in the result and, up to the commit, in the update history
     expected_stages = {"setup", "ingest", "inference", "features_matching", "sfm", "map_frame",
-                       "depth_alignment", "persist_frames", "validity", "objects", "cloud",
-                       "export"}
+                       "depth_alignment", "persist_frames", "validity", "objects", "cloud"}
     assert expected_stages | {"commit"} <= set(res.timings["stages_s"])
     assert sum(res.timings["stages_s"].values()) <= res.timings["total_s"] + 0.01
     assert res.timings["counts"]["keyframes_sampled"] == len(imgs_a)
@@ -118,73 +95,47 @@ def test_update_sequence(world) -> None:  # type: ignore[no-untyped-def]
     assert {"geometry", "gravity", "segmentation", "lift"} <= set(res.timings["parts"])
     hist = json.loads((mdir / "map.json").read_text())["updates"][-1]["timings"]
     assert expected_stages <= set(hist["stages_s"]) and "commit" not in hist["stages_s"]
-    for fr in doc_a["openlabel"]["frames"].values():
-        assert any(k.endswith("_to_map") for k in fr["frame_properties"]["transforms"])
-    by = objects_by_label(doc_a)
+    by = by_label(mdir)
     for label in ("cabinet", "box", "sofa"):
         assert len(by.get(label, [])) == 1, (label, by.keys())
     truth_a = {n: p.t for n, p in zip([f"f{i:06d}" for i in range(len(poses_a))], poses_a,
                                       strict=True)}
-    sim = map_to_world(doc_a, truth_a)
+    sim = map_to_world(mdir, truth_a)
     assert sim.s == pytest.approx(1.0, rel=0.1)  # metric scale within 10 %
     ious_a = {}
     for label, box in zip(("cabinet", "box", "sofa"), world["room_a"].boxes, strict=True):
         o = by[label][0]
-        est = cuboid_obb(o)
+        est = o.obb
         est_w = OBB(sim.apply(est.center[None])[0], sim.R @ est.R, est.size * sim.s)
         ious_a[label] = obb_iou_upright(est_w, truth_obb(box))
         assert ious_a[label] >= 0.5, (label, ious_a[label], est_w.center, est_w.size, box.center,
                                       box.size, sim.s)
-        assert o["object_data"]["text"][0]["val"] == color_hex_for_id(o["id"])
-    ids_a = {label: by[label][0]["id"] for label in ("cabinet", "box", "sofa")}
+        assert o.color_hex == color_hex_for_id(o.id)
+    ids_a = {label: by[label][0].id for label in ("cabinet", "box", "sofa")}
 
-    # --- update B: same room again, -t single -------------------------------------------------
-    res_b = update(mdir, sorted((base / "b").glob("*.png")), mode="single", client=client, progress=quiet)
-    doc_b = json.loads(res_b.payload)
-    assert validation_errors(doc_b) == []
-    names_b = {fr["frame_properties"]["keyframe"] for fr in doc_b["openlabel"]["frames"].values()}
-    assert names_b == set(res_b.new_frames)  # -t single lists exactly the new frames
-    full = json.loads(scene_bytes(store.MapReader(mdir)))
-    by_b = objects_by_label(full)
+    # --- update B: same room again --------------------------------------------------------------
+    res_b = update(mdir, sorted((base / "b").glob("*.png")), client=client, progress=quiet)
+    assert set(res_b.new_frames) <= {fr.name for fr in frames(mdir)}
+    by_b = by_label(mdir)
     for label, oid in ids_a.items():
-        assert [o["id"] for o in by_b[label]] == [oid]  # identity and colour kept
-        est = cuboid_obb(by_b[label][0])
+        assert [o.id for o in by_b[label]] == [oid]  # identity and colour kept
+        est = by_b[label][0].obb
         box = world["room_a"].boxes[("cabinet", "box", "sofa").index(label)]
         est_w = OBB(sim.apply(est.center[None])[0], sim.R @ est.R, est.size * sim.s)
         assert obb_iou_upright(est_w, truth_obb(box)) >= min(0.5, ious_a[label] - 0.05)
-    single_ids = {int(k) for k in doc_b["openlabel"]["objects"]}
-    observed = {int(it["object_id"]) for n in res_b.new_frames for it in json.loads(
-        (mdir / store.frame_file(n, "instances.json")).read_text())["instances"]}
-    # exactly the map's objects the new frames observed
-    assert single_ids == observed & {o["id"] for v in by_b.values() for o in v} != set()
 
-    # --- update C: removed / moved / added (PLY payload with point-cloud attributes) ------------
-    attrs = parse_cloud_attrs("color=segment,label=on,normals=on,voxel=0.03", CloudScope.MAP)
-    res_c = update(mdir, sorted((base / "c").glob("*.png")), mode="full", fmt="ply", attrs=attrs, client=client,
-                   progress=quiet)
-    cloud_c = parse_ply(res_c.payload)
-    assert parse_header(res_c.payload).comments[-1] == \
-        f"attributes {attrs.describe(CloudScope.MAP)}"
-    full_c = json.loads(scene_bytes(store.MapReader(mdir)))
-    by_c = objects_by_label(full_c)
-    # colour contract on the map cloud: every labelled point has its object's colour, the others
-    # are grey, and only objects of the scene appear; normals are unit vectors
-    assert cloud_c.label is not None and cloud_c.rgb is not None and cloud_c.normals is not None
-    scene_ids = {int(k) for k in full_c["openlabel"]["objects"]}
+    # --- update C: removed / moved / added ------------------------------------------------------
+    update(mdir, sorted((base / "c").glob("*.png")), client=client, progress=quiet)
+    by_c = by_label(mdir)
+    # the stored cloud's object ids are objects of the map
+    cloud_c = map_cloud(store.MapReader(mdir))
+    scene_ids = {o.id for o in objects(mdir)}
     assert set(np.unique(cloud_c.label)) - {0} <= scene_ids and (cloud_c.label > 0).any()
-    for oid in set(np.unique(cloud_c.label)) - {0}:
-        np.testing.assert_array_equal(np.unique(cloud_c.rgb[cloud_c.label == oid], axis=0),
-                                      [hex_to_rgb(color_hex_for_id(int(oid)))])
-    np.testing.assert_array_equal(np.unique(cloud_c.rgb[cloud_c.label == 0], axis=0),
-                                  [(128, 128, 128)])
-    np.testing.assert_allclose(np.linalg.norm(cloud_c.normals, axis=1), 1.0, atol=1e-4)
-    keys = np.floor(cloud_c.xyz.astype(np.float64) / 0.03).astype(np.int64)
-    assert len(np.unique(keys, axis=0)) == len(cloud_c)  # one point per voxel
-    all_ids = [o["id"] for v in by_c.values() for o in v]
+    all_ids = [o.id for v in by_c.values() for o in v]
     assert "box" not in by_c  # removed box gone
-    assert ids_a["sofa"] in [o["id"] for o in by_c["sofa"]]  # unchanged object kept
+    assert ids_a["sofa"] in [o.id for o in by_c["sofa"]]  # unchanged object kept
     assert "chair" in by_c  # added
-    cab_ids = [o["id"] for o in by_c.get("cabinet", [])]
+    cab_ids = [o.id for o in by_c.get("cabinet", [])]
     assert ids_a["cabinet"] not in cab_ids and len(cab_ids) == 1  # moved → new id
     assert max(all_ids) >= max(ids_a.values())
     assert len(all_ids) == len(set(all_ids))
@@ -287,15 +238,15 @@ def test_one_update_and_split_updates_agree(world, tmp_path: Path) -> None:  # t
     same frames (7 of which fix the metric scale in the split case) allow."""
     client = world["client"]
     imgs = sorted((world["base"] / "a").iterdir())
-    one = json.loads(update(tmp_path / "one", imgs, client=client, progress=quiet).payload)
+    update(tmp_path / "one", imgs, client=client, progress=quiet)
     update(tmp_path / "two", imgs[:7], client=client, progress=quiet)
-    two = json.loads(update(tmp_path / "two", imgs[7:], client=client, progress=quiet).payload)
-    a, b = objects_by_label(one), objects_by_label(two)
+    update(tmp_path / "two", imgs[7:], client=client, progress=quiet)
+    a, b = by_label(tmp_path / "one"), by_label(tmp_path / "two")
     assert sorted(a) == sorted(b) == ["box", "cabinet", "sofa"], (a.keys(), b.keys())
     for label in a:
         (oa,), (ob,) = a[label], b[label]
-        assert oa["id"] == ob["id"], label
-        assert oa["object_data"]["text"] == ob["object_data"]["text"]  # colour
-        iou = obb_iou_upright(cuboid_obb(oa), cuboid_obb(ob))
-        centre = np.linalg.norm(cuboid_obb(oa).center - cuboid_obb(ob).center)
+        assert oa.id == ob.id, label
+        assert oa.color_hex == ob.color_hex  # colour
+        iou = obb_iou_upright(oa.obb, ob.obb)
+        centre = np.linalg.norm(oa.obb.center - ob.obb.center)
         assert iou > 0.5 and centre < 0.15, (label, iou, centre)

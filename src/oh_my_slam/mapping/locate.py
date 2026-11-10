@@ -1,4 +1,4 @@
-"""``mapper.sh locate``: the camera pose of images registered against an existing map, which stays
+"""Locate: the camera pose of images registered against an existing map, which stays
 read-only (spec 2.3).
 
 The map is never written, locked or staged: it is read through ``store.MapReader``, and its COLMAP
@@ -95,7 +95,7 @@ def _progress(msg: str) -> None:
 
 @dataclass
 class Located:
-    """The result for one input image (``index``: its position in ``-i``)."""
+    """The result for one input image (``index``: its position among the images)."""
 
     image: Path
     index: int
@@ -143,7 +143,7 @@ def open_map(map_dir: Path) -> store.MapReader:
         return store.MapReader(map_dir)
     except NotAMapError:
         raise InputError(f"no map in {map_dir} ({state} folder): locate needs an existing map — "
-                         "build one with mapper.sh update") from None
+                         "build one with an update") from None
 
 
 # ------------------------------------------------------------------------------------------------

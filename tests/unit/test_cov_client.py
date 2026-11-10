@@ -90,7 +90,7 @@ def test_a_socket_nobody_listens_on_means_not_running() -> None:
     finally:
         path.unlink()
     assert err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
-    assert "ConnectError" in str(err.value) and "./start_inference_server.sh" in str(err.value)
+    assert "ConnectError" in str(err.value) and "./server.sh" in str(err.value)
 
 
 def test_an_unhealthy_answer_means_not_running(sock: Path) -> None:
@@ -146,7 +146,7 @@ def test_the_wait_for_a_loading_server_is_bounded(sock: Path, clock: Clock) -> N
     assert clock.sleeps == [1.0, 1.0, 1.0]
     msg = str(err.value)
     assert msg.startswith("inference server is still loading its models after 3 s")
-    assert "./start_inference_server.sh" in msg and str(paths.server_log()) in msg
+    assert "./server.sh" in msg and str(paths.server_log()) in msg
     assert "not running" not in msg and err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
@@ -155,7 +155,7 @@ def test_a_stopping_server_has_its_own_message(sock: Path) -> None:
         served(sock, health("stopping")).require_ready()
     msg = str(err.value)
     assert msg.startswith("inference server is stopping — start it again with "
-                          "./start_inference_server.sh")
+                          "./server.sh")
     assert "not running" not in msg and err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
@@ -176,7 +176,7 @@ def test_a_server_of_another_protocol_says_how_to_restart_it(sock: Path, status:
     assert str(err.value) == (
         f"the running inference server speaks protocol {old}, this version needs "
         f"{PROTOCOL_VERSION} (it was started before an upgrade) — restart it with "
-        "./start_inference_server.sh --stop && ./start_inference_server.sh")
+        "./server.sh --stop && ./server.sh")
     assert err.value.exit_code == ExitCode.SERVER_UNAVAILABLE
 
 
@@ -298,5 +298,5 @@ def test_a_degraded_server_is_used_with_a_warning_naming_the_restart(sock: Path)
     finally:
         client_mod.log.removeHandler(handler)
     assert lines == ["inference server is short of device memory (no detail) — if this fails, "
-                     "restart it with ./start_inference_server.sh --stop && "
-                     "./start_inference_server.sh"]
+                     "restart it with ./server.sh --stop && "
+                     "./server.sh"]

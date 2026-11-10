@@ -1,5 +1,6 @@
-"""Ownership rules (AC20): import-linter contracts plus source checks for who calls which
-endpoint, who fits OBBs and who assigns colours."""
+"""Ownership rules (high_level_spec.md §10): import-linter contracts plus source checks for who
+calls which endpoint, who fits OBBs and who assigns colours. The HTTP service is the top: it uses
+the mapping, reconstruction and segmentation APIs, and nothing imports it."""
 
 from __future__ import annotations
 
@@ -7,8 +8,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "oh_my_slam"
 
@@ -58,7 +57,7 @@ def test_endpoint_callers() -> None:
 
 
 def test_import_contracts_express_the_ownership_rules() -> None:
-    """The §4 rules are import-linter contracts, not only conventions."""
+    """The ownership rules are import-linter contracts, not only conventions."""
     import tomllib
 
     cfg = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
@@ -68,33 +67,38 @@ def test_import_contracts_express_the_ownership_rules() -> None:
         if c["type"] == "forbidden":
             for s in c["source_modules"]:
                 by_source.setdefault(s, set()).update(c["forbidden_modules"])
+    packages = {p.name for p in SRC.iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    assert packages == {"client", "core", "mapping", "reconstruction", "segmentation", "server",
+                        "service"}
+    # no contract names a package that no longer exists
+    named = {m for c in contracts.values() for k in ("source_modules", "forbidden_modules")
+             for m in c.get(k, []) if m.startswith("oh_my_slam.")}
+    named |= {m.strip("() ") for c in contracts.values() for layer in c.get("layers", [])
+              for m in layer.split("|")}
+    assert {m.split(".")[1] for m in named} <= packages, named
     seg_internals = {f"oh_my_slam.segmentation.{m}" for m in ("detect", "lift", "obb", "colors")}
     assert seg_internals <= by_source["oh_my_slam.mapping"]
-    assert seg_internals <= by_source["oh_my_slam.viewer"]
-    assert seg_internals <= by_source["oh_my_slam.cli"]
     assert "oh_my_slam.client" in by_source["oh_my_slam.mapping"]
     assert {"oh_my_slam.segmentation", "oh_my_slam.mapping"} <= by_source[
         "oh_my_slam.reconstruction"]
     assert "oh_my_slam.core.ply" in by_source["oh_my_slam.segmentation"]  # it writes no PLY
-    for pkg in ("mapping", "segmentation", "viewer", "server", "cli", "commands", "tools"):
+    # Open3D (depth fusion) lives in reconstruction and mapping's geometry
+    for pkg in ("segmentation", "service", "server", "client", "core"):
         assert "open3d" in by_source[f"oh_my_slam.{pkg}"], pkg
-    for pkg in ("cli", "commands", "tools", "viewer", "mapping", "segmentation", "reconstruction",
-                "client"):
+    for pkg in ("service", "mapping", "segmentation", "reconstruction", "client", "core"):
         assert {"torch", "ultralytics"} <= by_source[f"oh_my_slam.{pkg}"], pkg
-    assert "oh_my_slam.client" in by_source["oh_my_slam.viewer"]
-    # only the CLI starts the server; the evaluator reads its lifecycle state and nothing else
-    for pkg in ("commands", "viewer", "mapping", "segmentation", "reconstruction", "client",
-                "schema", "core"):
+    # the service is the top: nothing imports it
+    for pkg in packages - {"service"}:
+        assert "oh_my_slam.service" in by_source[f"oh_my_slam.{pkg}"], pkg
+    # the pipeline never imports the inference server; the server owns models, no pipeline logic
+    for pkg in ("mapping", "segmentation", "reconstruction", "client", "core"):
         assert "oh_my_slam.server" in by_source[f"oh_my_slam.{pkg}"], pkg
-    assert "oh_my_slam.commands" in by_source["oh_my_slam.server"]
-    # the commands' definitions sit right under the command line, the web service (spec 2.6) and
-    # the evaluators (spec 5), which never import one another
-    (layers,) = [c["layers"] for c in contracts.values() if c["type"] == "layers"]
-    assert layers[:2] == ["oh_my_slam.cli | (oh_my_slam.web) | oh_my_slam.tools",
-                          "oh_my_slam.commands"]
+    assert {"oh_my_slam.mapping", "oh_my_slam.segmentation",
+            "oh_my_slam.reconstruction"} <= by_source["oh_my_slam.server"]
+    # the service reuses the inference server's lifecycle helpers only
     server_internals = {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")}
-    assert server_internals <= by_source["oh_my_slam.tools"]
-    assert "oh_my_slam.server.lifecycle" not in by_source["oh_my_slam.tools"]
+    assert server_internals <= by_source["oh_my_slam.service"]
+    assert "oh_my_slam.server.lifecycle" not in by_source["oh_my_slam.service"]
 
 
 def test_point_clouds_are_reconstructions_and_colours_segmentations() -> None:
@@ -104,7 +108,7 @@ def test_point_clouds_are_reconstructions_and_colours_segmentations() -> None:
     defs = _grep(r"def (derive_cloud|derive_thinned|cloud_ply)\(|"
                  r"class (ImageCloudSource|MapCloudSource|PointColors)\b", _py_files())
     assert defs == {"reconstruction/cloud.py"}, defs
-    users = _py_files("segmentation") + _py_files("viewer") + _py_files("cli")
+    users = _py_files("segmentation") + _py_files("service")
     assert not _grep(r"\b(pixel_mask|pixel_points|depth_normals|PointNormals|"
                      r"voxel_downsample_indices|budget_voxel_indices|ply_bytes)\(", users)
     assert _grep(r"def (segment_colors|height_colors|color_for_id)\(", _py_files()) == {
@@ -114,9 +118,6 @@ def test_point_clouds_are_reconstructions_and_colours_segmentations() -> None:
     # segmentation hands its colour assignment to the derivation, as data
     api = (SRC / "segmentation" / "api.py").read_text("utf-8")
     assert "POINT_COLORS = PointColors(segment=segment_colors, height=height_colors)" in api
-    rec = (SRC / "cli" / "reconstruct.py").read_text("utf-8")
-    assert "from oh_my_slam.reconstruction.cloud import" in rec
-    assert "cloud_ply(image_cloud_source(" in rec  # segmentation's colours, as data
 
 
 def test_mapping_delegates_depth_and_segmentation() -> None:
@@ -165,85 +166,3 @@ def test_mapping_reimplements_no_shared_geometry() -> None:
     geometry = (SRC / "mapping" / "geometry.py").read_text("utf-8")
     assert "border_depths(" in geometry
     assert "def correct_borders(" in (SRC / "reconstruction" / "borders.py").read_text("utf-8")
-
-
-
-# view.sh owns only the web server and UI (spec §2.5). It may call the owners' public APIs — one
-# reconstruction + segmentation run (segmentation.api), the read-only map export, the shared
-# point-cloud derivation (reconstruction.cloud) and attribute definition (core.cloud_attrs) — but never
-# the internals behind them, and it re-implements none of their logic.
-VIEWER_FORBIDDEN_IMPORTS = (
-    r"import torch|oh_my_slam\.client|oh_my_slam\.server"
-    r"|segmentation\.(colors|obb|lift|detect)"
-    r"|reconstruction\.(pointcloud|fusion|depth|multiview)"
-    r"|mapping\.(api|objects|sfm|geometry|fusion)"
-)
-VIEWER_REIMPLEMENTATION = (
-    r"unproject|pixel_mask|depth_edge_mask|depth_normals|PointNormals|voxel_keys"
-    r"|voxel_downsample|budget_voxel|fit_obb|fit_upright_obb|color_for_id|color_hex_for_id|segment_colors"
-    r"|height_colors|PALETTE|np\.random|default_rng|K\.fx|\.K\(\)"
-)
-
-
-def test_viewer_only_calls_the_owners_apis() -> None:
-    files = _py_files("viewer") + [SRC / "cli" / "view.py"]
-    assert not _grep(VIEWER_FORBIDDEN_IMPORTS, files)
-    assert not _grep(VIEWER_REIMPLEMENTATION, files)
-    bundle = (SRC / "viewer" / "bundle.py").read_text("utf-8")
-    # every displayed cloud is the shared derivation, controlled by the shared attribute set
-    for call in ("derive_thinned(", "applicable(", "parse_cloud_attrs(", "image_cloud_source(",
-                 "reader_source(", "segment_frame(", "single_image_scene(", "scene_bytes("):
-        assert call in bundle, call
-
-
-def test_viewer_page_has_no_palette_or_randomness() -> None:
-    """Colours reach the page only as data (scene JSON, derived clouds); nothing random."""
-    from oh_my_slam.segmentation.colors import PALETTE_HEX, UNSEGMENTED, rgb_to_hex
-
-    static = SRC / "viewer" / "static"
-    pages = [p for p in static.rglob("*") if p.suffix in (".js", ".html", ".css")
-             and "vendor" not in p.relative_to(static).parts]
-    assert pages
-    for p in pages:
-        text = p.read_text("utf-8").lower()
-        assert not [h for h in (*PALETTE_HEX, rgb_to_hex(UNSEGMENTED)) if h in text], p
-        assert "math.random" not in text, p
-
-
-ENTRY_SCRIPTS = ("reconstruct.sh", "mapper.sh", "segment.sh", "view.sh",
-                 "start_inference_server.sh", "server.sh")
-
-
-@pytest.mark.parametrize("script", ENTRY_SCRIPTS)
-def test_entry_scripts_are_thin_and_never_call_each_other(script: str) -> None:
-    root = SRC.parents[1]
-    text = (root / script).read_text()
-    assert "oms_exec" in text
-    for other in ENTRY_SCRIPTS:
-        if other != script:
-            assert not re.search(rf"(?<![\w]){re.escape(other)}", text), other
-    assert (root / script).stat().st_mode & 0o111
-
-
-def test_web_service_is_a_client_without_models_or_open3d() -> None:
-    """server.sh (oh_my_slam.web, spec 2.6) is covered by the ownership contracts: no model
-    framework, no Open3D, no inference-server internals; it reuses only the lifecycle helpers."""
-    import tomllib
-
-    cfg = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
-    forbidden: set[str] = set()
-    for c in cfg["tool"]["importlinter"]["contracts"]:
-        if c["type"] == "forbidden" and "oh_my_slam.web" in c["source_modules"]:
-            forbidden.update(c["forbidden_modules"])
-    assert {"torch", "ultralytics", "open3d"} <= forbidden
-    assert {f"oh_my_slam.server.{m}" for m in ("app", "main", "gpu_worker", "models")} <= forbidden
-    # it runs the commands' Python entry points as subprocesses, never the shell scripts
-    runner = (SRC / "web" / "runner.py").read_text("utf-8")
-    assert '[self.python, "-m", run.module, *run.argv]' in runner
-    assert 'return f"oh_my_slam.cli.{' in (SRC / "web" / "operations.py").read_text("utf-8")
-    assert not _grep(r"subprocess\.\w+\(\s*\[?[^\]]*\.sh", _py_files("web"))
-    # a map's viewer is view.sh's own entry point, its command line from the shared definition:
-    # the service imports none of the viewer's or the command line's code for it
-    viewers = SRC / "web" / "viewers.py"
-    assert '[self.python, "-m", MODULE, *command(map_dir)]' in viewers.read_text("utf-8")
-    assert not _grep(r"(import|from) oh_my_slam\.(viewer|cli)\b", [viewers])

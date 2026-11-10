@@ -1,11 +1,8 @@
 """Segmentation on synthetic frames with the fake client: detection filters, exclusive masks,
-lifting, OBBs, ids/colours, catalogue, segmented.png, artefacts and the OpenLABEL scene."""
+lifting, OBBs and ids/colours."""
 
 from __future__ import annotations
 
-import csv
-import io
-import json
 from pathlib import Path
 
 import numpy as np
@@ -13,27 +10,18 @@ import pytest
 from PIL import Image
 
 from oh_my_slam.core.cloud_attrs import CloudAttrs
-from oh_my_slam.core.images import load_png
-from oh_my_slam.core.log import json_payload_bytes
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.api import reconstruct_image
 from oh_my_slam.reconstruction.cloud import derive_cloud
-from oh_my_slam.schema.validate import validation_errors
 from oh_my_slam.segmentation import detect
 from oh_my_slam.segmentation.api import (
-    OBB,
-    SceneObject,
     image_cloud_source,
     map_cloud_source,
     pixel_owners,
     reconstruct_and_detect,
     segment_frame,
 )
-from oh_my_slam.segmentation.artifacts import ARTIFACT_NAMES, write_artifacts
-from oh_my_slam.segmentation.catalog import CSV_HEADER, catalog_csv, catalog_md
 from oh_my_slam.segmentation.colors import UNSEGMENTED, color_for_id, segment_colors
-from oh_my_slam.segmentation.render import segmented_image, segmented_png
-from oh_my_slam.segmentation.scene import single_image_scene
 from tests.fakes.client import FakeClient, FakeFrame, FakeInstance
 from tests.synth.scene import default_room, look_at, render
 
@@ -495,64 +483,13 @@ def test_fuse_passes_and_resample_mask() -> None:
     assert half.shape == (5, 5) and half.sum() == 4 and half[1:3, 2:4].all()
 
 
-def test_scene_catalogue_render_and_artifacts(synth, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_object_colours_are_a_function_of_their_ids(synth) -> None:  # type: ignore[no-untyped-def]
     client, img = synth
     frame = reconstruct_image(img, client=client)
     seg = segment_frame(frame, client=client)
-    scene = single_image_scene(seg, tool="segment")
-    assert validation_errors(scene) == []
-    objs = scene["openlabel"]["objects"]
+    assert seg.objects and frame.intrinsics.source == "model"
     for o in seg.objects:
-        entry = objs[str(o.id)]
-        assert entry["type"] == o.label and entry["name"] == f"{o.label} {o.id}"
-        assert entry["object_data"]["text"][0]["val"] == o.color_hex
-        assert entry["object_data"]["vec"][0]["val"] == list(o.color)
-        assert "boolean" not in entry["object_data"]  # every listed object is an object
-    md = scene["openlabel"]["metadata"]
-    assert md["intrinsics_source"] == "model" and md["gravity"]["source"].startswith("geocalib")
-
-    csv_text = catalog_csv(seg.objects)
-    assert csv_text.splitlines()[0] == ",".join(CSV_HEADER)
-    rows = list(csv.DictReader(io.StringIO(csv_text)))
-    assert [int(r["id"]) for r in rows] == [o.id for o in seg.objects]
-    md_text = catalog_md(seg.objects, "Objects in room.png")
-    vols = [float(line.split("|")[9]) for line in md_text.splitlines() if line.startswith("| <span")]
-    assert vols == sorted(vols, reverse=True)
-
-    png = segmented_image(frame.rgb, seg.label_map)
-    for o in seg.objects:
-        np.testing.assert_array_equal(np.unique(png[seg.label_map == o.id], axis=0), [o.color])
-    bg = seg.label_map == 0
-    assert (png[bg].astype(int) <= frame.rgb[bg].astype(int)).all()
-
-    payload = json_payload_bytes(scene)
-    out = tmp_path / "out"
-    png_payload = segmented_png(frame.rgb, seg.label_map)
-    write_artifacts(out, payload, png_payload, seg.objects, "t")
-    assert sorted(p.name for p in out.iterdir()) == sorted(ARTIFACT_NAMES)
-    assert list(ARTIFACT_NAMES) == [
-        "segmentation.json", "segmented.png", "catalog.csv", "catalog.md"]
-    assert (out / "catalog.md").read_text().startswith("# t\n")
-    assert (out / "segmentation.json").read_bytes() == payload
-    assert json.loads(payload)["openlabel"]["objects"]
-    assert (out / "segmented.png").read_bytes() == png_payload  # the bytes of -f png
-    img_back = load_png(out / "segmented.png")
-    np.testing.assert_array_equal(img_back, png)
-    assert "icc_profile" not in Image.open(out / "segmented.png").info
-
-
-def test_catalogue_md_orders_tiny_objects_by_their_volume() -> None:
-    """catalog.md is ordered by the unrounded volume, then id: objects under 5e-5 m³, all
-    printed as 0.0000, still come by descending volume."""
-    def obj(oid: int, size: tuple[float, float, float]) -> SceneObject:
-        return SceneObject(oid, "pen", 0.8, OBB(np.zeros(3), np.eye(3), np.array(size)), 10, 5)
-
-    objs = [obj(1, (0.01, 0.01, 0.02)), obj(2, (0.02, 0.04, 0.06)), obj(3, (0.5, 0.5, 0.5)),
-            obj(4, (0.01, 0.01, 0.02))]  # 2e-6, 4.8e-5, 0.125 and 2e-6 m³
-    rows = [line.split("|") for line in catalog_md(objs, "t").splitlines()
-            if line.startswith("| <span")]
-    assert [int(r[2]) for r in rows] == [3, 2, 1, 4]
-    assert [r[9].strip() for r in rows] == ["0.1250", "0.0000", "0.0000", "0.0000"]
+        assert o.color == color_for_id(o.id) and (seg.label_map == o.id).any()
 
 
 def test_map_source_keeps_only_exported_objects() -> None:

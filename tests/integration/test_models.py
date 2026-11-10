@@ -1,5 +1,5 @@
 """Real-model integration tests (``-m models``): the inference server must be running
-(``./start_inference_server.sh``) and ``OH_MY_SLAM_TEST_REAL_SERVER=1`` set so the tests talk
+(``./server.sh``) and ``OH_MY_SLAM_TEST_REAL_SERVER=1`` set so the tests talk
 to the real runtime directory."""
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Rigid/similarity transforms, quaternions (scalar last), camera projection and point utilities.
 
-Quaternions are ``(qx, qy, qz, qw)`` as in the OpenLABEL cuboid, normalised with ``qw >= 0``.
+Quaternions are ``(qx, qy, qz, qw)``, normalised with ``qw >= 0``.
 Cameras use OpenCV axes. All functions are pure NumPy.
 """
 

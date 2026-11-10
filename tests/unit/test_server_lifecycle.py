@@ -27,16 +27,8 @@ from oh_my_slam.server.lifecycle import (
     read_state,
     socket_is_live,
 )
-from tests.fakes.stub_server import SERVER_CMD, start_stub_server, stub_env
-
-REPO = Path(__file__).resolve().parents[2]
-START = REPO / "start_inference_server.sh"
-
-
-def run_start(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    e = os.environ.copy()
-    e.update(env or {})
-    return subprocess.run([str(START), *args], capture_output=True, text=True, env=e, timeout=120)
+from oh_my_slam.service.inference import stop_inference
+from tests.fakes.stub_server import REPO, SERVER_CMD, start_stub_server, stub_env
 
 
 @pytest.fixture
@@ -45,31 +37,27 @@ def stub_server() -> Iterator[None]:
     try:
         yield
     finally:
-        run_start("--stop")
+        stop_inference()
 
 
-def test_start_is_idempotent_and_stop_cleans_up(stub_server: None) -> None:
+def test_stop_cleans_up(stub_server: None) -> None:
+    """The service's stop (``service.inference.stop_inference``) ends the server it finds by its
+    lock, which removes its socket and state file."""
     sock = paths.socket_path()
     assert sock.exists() and oct(sock.stat().st_mode & 0o777) == "0o600"
     state = read_state()
     assert state is not None and pid_alive(state["pid"])
-    t0 = time.monotonic()
-    again = run_start()
-    assert again.returncode == 0 and "already running" in again.stderr
-    assert time.monotonic() - t0 < 2.0
-    status = run_start("--status")
-    assert status.returncode == 0
-    h = p.Health.model_validate_json(status.stdout)
+    h = InferenceClient().health()
     assert h.status == "ready" and h.pid == state["pid"]
     t0 = time.monotonic()
-    stopped = run_start("--stop")
-    assert stopped.returncode == 0
+    assert stop_inference() == f"stopped the inference server (pid {state['pid']})"
     assert time.monotonic() - t0 < 15.0
+    deadline = time.monotonic() + 5
+    while (sock.exists() or paths.state_file().exists()) and time.monotonic() < deadline:
+        time.sleep(0.05)
     assert not sock.exists() and not paths.state_file().exists()
     assert not pid_alive(state["pid"])
-    down = run_start("--status")
-    assert down.returncode == 3 and "./start_inference_server.sh" in down.stderr
-    assert run_start("--stop").stderr.strip().endswith("not running")
+    assert stop_inference() == "the inference server was not running"
 
 
 def test_concurrent_clients_never_crash_the_server(stub_server: None, tmp_path: Path) -> None:
@@ -135,15 +123,4 @@ def test_client_fails_fast_when_down() -> None:
     with pytest.raises(ServerUnavailableError) as err:
         InferenceClient().require_ready()
     assert time.monotonic() - t0 < 2.0
-    assert "./start_inference_server.sh" in str(err.value)
-
-
-def test_the_command_starts_stops_or_queries_and_nothing_else() -> None:
-    """Spec §2.1: the command starts the server; ``--stop`` and ``--status`` operate it (the
-    evaluator stops it to time a cold start). No other option exists."""
-    from oh_my_slam.cli.server import main
-
-    for extra in (["--foreground"], ["--timeout", "5"], ["--stop", "--status"]):
-        with pytest.raises(SystemExit) as e:
-            main(extra)
-        assert e.value.code == 2
+    assert "./server.sh" in str(err.value)

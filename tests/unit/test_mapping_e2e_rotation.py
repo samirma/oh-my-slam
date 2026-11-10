@@ -11,9 +11,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from oh_my_slam.core.ply import parse_ply
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping.api import update
+from oh_my_slam.mapping.export import map_cloud
 from oh_my_slam.mapping.store import MapReader
 from tests.fakes.client import FakeClient
 from tests.synth.mapping import add_frames, mapping_room
@@ -65,12 +65,11 @@ def test_rotation_only_map_and_anchored_update(tmp_path: Path,
     assert np.linalg.norm(centres - centres.mean(0), axis=1).max() < 0.3
     old_poses = {f.name: f.T_map_cam.matrix() for f in r.frames}
 
-    # anchored update, -t single -f ply
-    res2 = update(mdir, sorted((tmp_path / "b").glob("*.png")), mode="single", fmt="ply", client=client,
+    # anchored update
+    res2 = update(mdir, sorted((tmp_path / "b").glob("*.png")), client=client,
                   progress=msgs.append)
     assert len(res2.new_frames) == 8
-    cloud = parse_ply(res2.payload)
-    assert len(cloud) > 1000
+    assert len(map_cloud(MapReader(mdir))) > 1000
     r2 = MapReader(mdir)
     for f in r2.frames:
         if f.name in old_poses:

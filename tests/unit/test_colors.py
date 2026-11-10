@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from oh_my_slam.segmentation import colors as c
-from oh_my_slam.segmentation.render import DIM
 
 # One just-noticeable difference in OKLab (ΔE_OK), as CSS Color 4's gamut mapping takes it.
 JND = 0.02
@@ -45,16 +44,11 @@ def test_ids_1_to_1000_unique_admissible_and_never_grey() -> None:
     assert delta_e(cols, c.UNSEGMENTED).min() >= c.MIN_GREY_DISTANCE
 
 
-def test_visible_on_the_viewer_and_on_the_dimmed_image() -> None:
-    """WCAG 1.4.11 contrast (3:1) on the viewer's canvas and panel; brighter than every pixel of
-    the dimmed photo of segmented.png (whose brightest pixel is 35 % of white)."""
+def test_visible_on_a_dark_canvas() -> None:
+    """WCAG 1.4.11 contrast (3:1) on a dark canvas and panel (the bird's-eye image's)."""
     cols = colours(300)
     assert c.contrast_ratio(cols, VIEWER_CANVAS).min() >= 3.0
     assert c.contrast_ratio(cols, c.DARK_SURFACE).min() >= 3.0
-    dimmed_white = np.full(3, int(255 * DIM))
-    lum = c._linear(cols) @ c._LUMA
-    assert lum.min() > float(c._linear(dimmed_white) @ c._LUMA)
-    assert cols.max(axis=1).min() > int(255 * DIM)  # the evaluator's mask test holds
     for navy in ((0, 0, 117), (128, 0, 0)):  # the old palette's near-invisible entries
         assert not c.admissible(navy)
 

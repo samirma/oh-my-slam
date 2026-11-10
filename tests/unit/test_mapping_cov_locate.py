@@ -1,4 +1,4 @@
-"""``mapper.sh locate`` (``mapping.locate``) at its edges: the query's camera, retrieval without
+"""Locate (``mapping.locate``) at its edges: the query's camera, retrieval without
 descriptors, the verified matches of the scratch database, the 2D-3D correspondences of keyframes
 the model holds only partly, poses that cannot be solved or that the epipolar gate rejects, and a
 map whose ``map.json`` vanished while it was read."""
@@ -18,7 +18,6 @@ from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import locate as lmod
 from oh_my_slam.mapping import store
 from oh_my_slam.mapping.sfm import shared_camera, video_source
-from oh_my_slam.schema import openlabel as ol
 from tests.synth.scene import look_at
 
 K = Intrinsics(500.0, 500.0, 320.0, 240.0, 640, 480, "colmap")
@@ -284,7 +283,7 @@ def test_a_model_pose_the_gate_rejects_falls_back_to_the_depth_points(
     out = lmod._locate_one(_query(), K, False, [], None)  # type: ignore[arg-type]
     assert asked == [False, True] and out.located and out.inliers == 120
     np.testing.assert_allclose(out.T_map_cam.t, T.t, atol=1e-6)  # type: ignore[union-attr]
-    assert out.key == "located_3"
+    assert out.index == 3
 
 
 def test_correspondences_that_agree_on_no_pose_leave_the_image_unlocated(
@@ -347,5 +346,11 @@ def test_a_camera_located_with_the_map_s_lens_keeps_its_distortion() -> None:
     assert held is not None and held[1].k == lens.k and held[1].fx == lens.fx
     free = lmod.solve_pose(uv, xyz, lens, True)
     assert free is not None and free[1].k == 0.0
-    stream = ol.camera_stream(held[1])["stream_properties"]
-    assert stream["intrinsics_custom"]["k"] == lens.k
+
+
+def test_the_default_progress_goes_to_the_log(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=lmod.log.name):
+        lmod._progress("locating 1 image")
+    assert "locating 1 image" in caplog.text

@@ -4,7 +4,6 @@ map frame, latest wins and object bookkeeping."""
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -212,31 +211,6 @@ def test_frame_record_roundtrip() -> None:
     assert back.name == rec.name and back.K == rec.K
     np.testing.assert_allclose(back.T_map_cam.matrix(), rec.T_map_cam.matrix(), atol=1e-9)
     assert back.K_grid.width == 320 and back.K_grid.fx == pytest.approx(250)
-
-
-def test_scene_metadata_floats_are_rounded_for_byte_parity(tmp_path: Path) -> None:
-    """Threaded SfM makes the map's scale and floor height differ by ~1e-12 between identical
-    runs: the scene JSON rounds them as it rounds poses and cuboids, so the two runs' documents
-    are byte-identical."""
-    from oh_my_slam.mapping import export
-
-    rec = store.FrameRecord(0, "f000000", "frames/f000000.jpg", "x.jpg", 1, 640, 480,
-                            Intrinsics(500, 500, 320, 240, 640, 480, "colmap"),
-                            Pose(rot_z(0.3), np.array([1.0, 2.0, 3.0])), 320, 240)
-
-    def doc(eps: float) -> bytes:
-        meta = {"scale": {"sfm_to_metric": 0.123456789 + eps, "spread": 0.0421 + eps,
-                          "frames": 13, "method": "sfm"},
-                "floor_z": np.float64(-1.2345678912 + eps), "update_count": 1,
-                "map_frame": {"units": "m", "gravity_aligned": True}}
-        return json.dumps(export.full_scene(tmp_path, meta, [rec], [])).encode()
-
-    a, b = doc(0.0), doc(3e-12)
-    assert a == b
-    md = json.loads(a)["openlabel"]["metadata"]
-    assert md["scale"] == {"sfm_to_metric": 0.123457, "spread": 0.0421, "frames": 13,
-                           "method": "sfm"}
-    assert md["floor_z"] == -1.234568 and md["map_frame"]["gravity_aligned"] is True
 
 
 # --- ingest -------------------------------------------------------------------------------------
@@ -520,127 +494,6 @@ def test_object_bookkeeping_and_projection() -> None:
     st = ObjectState([o], 6, {9: 5, 12: 9})
     assert st.resolve(12) == 5 and st.resolve(77) is None
     assert st.exported() == []  # unconfirmed, no OBB yet
-
-
-@pytest.mark.parametrize("env", [{}])
-def test_mapper_cli_arguments(env: dict[str, str], tmp_path: Path,
-                              capsys: pytest.CaptureFixture[str]) -> None:
-    """Only ``-i`` and ``-m`` are required (``-t`` defaults to full); ``-a`` no longer exists."""
-    from oh_my_slam.cli import mapper as cli_mapper
-
-    ap = cli_mapper.build_parser()
-    a = ap.parse_args(["update", "-i", "x.mp4", "-m", "m"])
-    assert (a.inputs, a.map) == ([Path("x.mp4")], Path("m"))
-    assert (a.format, a.mode, a.fps, a.output, a.attrs) == ("json", "full", None, None, None)
-    assert ap.parse_args(["update", "-i", "x.mp4", "-m", "m", "-t", "full"]).mode == "full"
-    a = ap.parse_args(["update", "-i", "a.jpg", "b.jpg", "-m", "m", "-f", "ply", "-o", "c.ply",
-                       "-p", "voxel=0.05,normals=on", "-t", "single", "-fps", "3"])
-    assert a.inputs == [Path("a.jpg"), Path("b.jpg")] and (a.mode, a.fps) == ("single", 3.0)
-    assert (a.output, a.attrs) == (Path("c.ply"), "voxel=0.05,normals=on")
-    for bad, message in ((["update", "-m", "m"], "required: -i"),
-                         (["update", "-i", "x.mp4"], "required: -m"),
-                         (["update", "-a", "x.mp4", "-m", "m"], "required: -i"),
-                         (["update", "-i", "x.mp4", "-m", "m", "-a", "y.mp4"],
-                          "unrecognized arguments: -a"),
-                         (["-i", "x"], "invalid choice"),
-                         (["update", "-i", "x", "-m", "m", "-t", "partial"], "invalid choice")):
-        with pytest.raises(SystemExit) as e:
-            ap.parse_args(bad)
-        assert e.value.code == 2
-        assert message in capsys.readouterr().err, bad
-    repo = Path(__file__).resolve().parents[2]
-    res = subprocess.run([str(repo / "mapper.sh"), "update", "-a", "x.mp4", "-m",
-                          str(tmp_path / "m")], capture_output=True, env=os.environ.copy())
-    assert res.returncode == 2 and res.stdout == b"" and b"required: -i" in res.stderr
-    assert not (tmp_path / "m").exists()
-
-
-def test_mapper_validates_attributes_before_updating(monkeypatch: pytest.MonkeyPatch,
-                                                     tmp_path: Path) -> None:
-    """``-p`` is checked (map scope, needs -f ply) before ``update`` could reach the server;
-    ``-o`` receives the payload."""
-    import io
-    from types import SimpleNamespace
-
-    from oh_my_slam.cli import mapper as cli_mapper
-    from oh_my_slam.core import timing
-    from oh_my_slam.core.cloud_attrs import CloudAttrs
-    from oh_my_slam.core.log import PayloadWriter
-    from oh_my_slam.mapping import api
-
-    calls: list[dict] = []
-
-    def fake_update(*args, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append(kwargs)
-        return SimpleNamespace(payload=b"PAYLOAD", timings=timing.Timings().to_dict())
-
-    stdout = io.BytesIO()
-    monkeypatch.setattr(api, "update", fake_update)
-    monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
-        stdout) if output is None else PayloadWriter(path=output))
-    (tmp_path / "x.jpg").write_bytes(b"")  # the inputs are checked before update() runs
-    base = ["update", "-i", str(tmp_path / "x.jpg"), "-m", str(tmp_path / "m")]
-    for bad in (["-p", "voxel=0.1"], ["-f", "ply", "-p", "stride=2"],
-                ["-f", "ply", "-p", "max-depth=3"], ["-f", "ply", "-p", "voxel=-1"]):
-        with pytest.raises(UsageError):
-            cli_mapper.main(base + bad)
-    assert calls == []
-    target = tmp_path / "out.ply"
-    assert cli_mapper.main(base + ["-f", "ply", "-p", "voxel=0.1,normals=on,color=height",
-                                   "-o", str(target)]) == 0
-    assert calls[0]["attrs"] == CloudAttrs(color="height", voxel=0.1, normals=True)
-    assert calls[0]["fmt"] == "ply" and target.read_bytes() == b"PAYLOAD"
-    assert stdout.getvalue() == b""
-    assert cli_mapper.main(base) == 0  # defaults: the whole map as JSON to stdout
-    assert calls[1]["attrs"] == CloudAttrs() and stdout.getvalue() == b"PAYLOAD"
-    assert (calls[1]["mode"], calls[1]["fmt"], calls[1]["fps"]) == ("full", "json", 2.0)
-    assert cli_mapper.main(base + ["-t", "single"]) == 0
-    assert calls[2]["mode"] == "single"
-
-
-def test_mapper_ignores_fps_for_images(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Spec §2.3: ``-fps`` is ignored for images, so any value (0, negative) only warns; for a
-    video a non-positive or non-finite value (nan, inf) is a usage error. Through the shell with
-    the server down, images with ``-fps 0`` reach the server check (exit 3, not 2) after the
-    warning."""
-    from types import SimpleNamespace
-
-    from oh_my_slam.cli import mapper as cli_mapper
-    from oh_my_slam.core import timing
-    from oh_my_slam.core.log import PayloadWriter
-    from oh_my_slam.mapping import api
-
-    calls: list[dict] = []
-    warnings: list[str] = []
-    monkeypatch.setattr(api, "update", lambda *a, **k: calls.append(k) or SimpleNamespace(
-        payload=b"{}\n", timings=timing.Timings().to_dict()))
-    monkeypatch.setattr(cli_mapper, "claim_stdout", lambda output=None: PayloadWriter(
-        path=tmp_path / "out.json"))
-    monkeypatch.setattr(cli_mapper.log, "warning", lambda msg, *a: warnings.append(msg % a))
-    for fps in ("0", "-1", "3"):
-        for name in ("a.jpg", "b.jpg"):  # the inputs are checked before update() runs
-            (tmp_path / name).write_bytes(b"")
-        assert cli_mapper.main(["update", "-i", str(tmp_path / "a.jpg"), str(tmp_path / "b.jpg"),
-                                "-m", str(tmp_path / "m"),
-                                "-fps", fps]) == 0
-        assert warnings.pop() == "-fps applies to video input only; ignored for images"
-    assert len(calls) == 3
-    from oh_my_slam.mapping.ingest import DEFAULT_FPS
-
-    assert [c["fps"] for c in calls] == [DEFAULT_FPS] * 3  # ignored: the default is passed on
-    for fps in ("0", "-1", "nan", "inf"):  # refused before the server is contacted
-        with pytest.raises(UsageError, match="-fps must be a positive finite number"):
-            cli_mapper.main(["update", "-i", "x.mp4", "-m", str(tmp_path / "m"), "-fps", fps])
-    assert len(calls) == 3 and warnings == []
-
-    img = tmp_path / "a.jpg"
-    Image.new("RGB", (32, 24)).save(img)
-    repo = Path(__file__).resolve().parents[2]
-    res = subprocess.run([str(repo / "mapper.sh"), "update", "-i", str(img), "-m",
-                          str(tmp_path / "m2"), "-fps", "0"], capture_output=True,
-                         env=os.environ.copy(), timeout=60)
-    assert res.returncode == 3 and res.stdout == b"", res.stderr
-    assert b"-fps applies to video input only; ignored for images" in res.stderr
 
 
 # --- map cloud: fused surface + latest-frame attribution ----------------------------------------

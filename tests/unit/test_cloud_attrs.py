@@ -73,40 +73,6 @@ def test_bad_values_are_actionable_usage_errors(spec: str, message: str) -> None
     assert e.value.exit_code == ExitCode.USAGE
 
 
-def test_a_repeated_p_is_an_argument_error(capsys: pytest.CaptureFixture[str]) -> None:
-    """Spec §2.2 defines one ``-p key=value[,key=value…]``: a second ``-p`` is an argument error
-    (exit 2) before any inference, never merged with the first nor silently replacing it."""
-    from oh_my_slam.commands import spec
-    from oh_my_slam.commands.parser import ParameterError, RaisingParser
-
-    twice = ["-f", "ply", "-p", "voxel=0.1", "-p", "normals=on"]
-    message = ("argument -p: given more than once: give every point-cloud attribute in one -p "
-               "key=value[,key=value...] (e.g. -p color=rgb,voxel=0.01)")
-    for program, argv in ((spec.RECONSTRUCT, ["-i", "a.jpg", *twice]),
-                          (spec.MAPPER, ["update", "-i", "a.jpg", "-m", "m", *twice])):
-        with pytest.raises(SystemExit) as e:
-            spec.build_parser(program).parse_args(argv)
-        assert e.value.code == ExitCode.USAGE and message in capsys.readouterr().err
-        with pytest.raises(ParameterError) as p:  # the web service's parser
-            spec.build_parser(program, RaisingParser).parse_args(argv)
-        assert str(p.value) == message and p.value.parameters == ("attrs",)
-        assert p.value.exit_code == ExitCode.USAGE
-    one = spec.build_parser(spec.RECONSTRUCT).parse_args(["-i", "a.jpg", *twice[:4]])
-    assert one.attrs == "voxel=0.1"  # one -p is its text
-
-
-@pytest.mark.parametrize("key", PIXEL_KEYS)
-def test_map_scope_refuses_pixel_level_attributes(key: str) -> None:
-    value = {"stride": "2", "min-depth": "1", "max-depth": "3", "edge": "0"}[key]
-    parse_cloud_attrs(f"{key}={value}", IMAGE)  # fine for a single image
-    with pytest.raises(UsageError, match="pixel-level attribute"):
-        parse_cloud_attrs(f"{key}={value}", MAP)
-    # the unknown-key hint for a map lists only the keys that apply
-    with pytest.raises(UsageError) as e:
-        parse_cloud_attrs("nope=1", MAP)
-    assert "stride" not in str(e.value) and "voxel" in str(e.value)
-
-
 def test_every_colour_is_valid_in_every_scope() -> None:
     for color in ("rgb", "segment", "height", "none"):
         for scope in (IMAGE, MAP):

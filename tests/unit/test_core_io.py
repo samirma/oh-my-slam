@@ -204,7 +204,7 @@ def test_paths_short_socket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 def test_error_codes() -> None:
     err = ServerUnavailableError("no socket")
     assert err.exit_code == ExitCode.SERVER_UNAVAILABLE == 3
-    assert "./start_inference_server.sh" in str(err)
+    assert "./server.sh" in str(err)
     assert InputError("x").exit_code == 2
 
 

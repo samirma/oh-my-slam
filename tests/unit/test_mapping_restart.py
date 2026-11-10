@@ -23,11 +23,12 @@ import pytest
 from oh_my_slam.core.types import Pose
 from oh_my_slam.mapping import api
 from oh_my_slam.mapping.api import update
+from oh_my_slam.segmentation.api import SceneObject
 from oh_my_slam.segmentation.obb import obb_iou_upright
 from tests.fakes.client import FakeClient, FakeFrame, FakeInstance
+from tests.mapobjects import by_id, by_label
 from tests.synth.mapping import K, mapping_room, ring
 from tests.synth.scene import Room, look_at, render
-from tests.unit.test_mapping_e2e_synth import cuboid_obb, objects_by_label
 
 pytestmark = pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
 
@@ -84,26 +85,34 @@ def _quiet(msg: str) -> None:
     pass
 
 
+Published = dict[int, SceneObject]
+
+
+def _update(mdir: Path, imgs: list[Path], client: FakeClient) -> Published:
+    """One update; the map's published objects after it, by id."""
+    update(mdir, imgs, client=client, progress=_quiet)
+    return by_id(mdir)
+
+
 def test_a_weak_first_update_is_rebuilt_with_the_next(
         views: tuple[FakeClient, list[Path], list[Path]], tmp_path: Path) -> None:
     client, first, rest = views
-    one = json.loads(update(tmp_path / "one", first + rest, client=client,
-                            progress=_quiet).payload)
+    one = _update(tmp_path / "one", first + rest, client)
     split = tmp_path / "split"
-    published = json.loads(update(split, first, client=client, progress=_quiet).payload)
+    published = _update(split, first, client)
     frames = json.loads((split / "frames.json").read_text())["frames"]
     assert all(api._weak_keyframe(api.store.FrameRecord.from_dict(f)) for f in frames)
-    two = json.loads(update(split, rest, client=client, progress=_quiet).payload)
+    two = _update(split, rest, client)
     meta = json.loads((split / "map.json").read_text())
     assert meta["updates"][-1]["notes"]["restarted"]["stored_keyframes"] == len(first)
     assert meta["updates"][0]["frames_added"] == [f"f{k:06d}" for k in range(4)]
-    a, b = objects_by_label(one), objects_by_label(two)
+    a, b = by_label(tmp_path / "one"), by_label(split)
     assert sorted(a) == sorted(b) == ["box", "cabinet", "sofa"], (a.keys(), b.keys())
     _ids_persist(split, published, two)
     for label in a:
         (oa,), (ob,) = a[label], b[label]
-        iou = obb_iou_upright(cuboid_obb(oa), cuboid_obb(ob))
-        centre = np.linalg.norm(cuboid_obb(oa).center - cuboid_obb(ob).center)
+        iou = obb_iou_upright(oa.obb, ob.obb)
+        centre = np.linalg.norm(oa.obb.center - ob.obb.center)
         assert iou > 0.7 and centre < 0.05, (label, iou, centre)
     # nothing of the first map's derived files is left behind
     ids = {o["id"] for o in json.loads((split / "objects.json").read_text())["objects"]}
@@ -134,25 +143,25 @@ def _resolve(mdir: Path, oid: int) -> int:
     return oid
 
 
-def _ids_persist(mdir: Path, before: dict, after: dict) -> None:  # type: ignore[type-arg]
+def _ids_persist(mdir: Path, before: Published, after: Published) -> None:
     """Every id ``before`` published resolves (itself, or through the merges) to an object of
     ``after`` with a compatible label, the one of that label nearest the published box (the same
     object, not another one the id moved to: a weakly posed map placed it decimetres off, but
     not nearer another), or an update reported it removed."""
     from oh_my_slam.segmentation.detect import compatible
 
-    now = {int(k): o for k, o in after["openlabel"]["objects"].items()}
+    now = after
     removed = {oid for u in json.loads((mdir / "map.json").read_text())["updates"]
                for oid in u["objects"]["removed"]}
-    for k, o in before["openlabel"]["objects"].items():
-        oid = _resolve(mdir, int(k))
-        assert oid in now or int(k) in removed, (k, o["type"], sorted(now))
+    for k, o in before.items():
+        oid = _resolve(mdir, k)
+        assert oid in now or k in removed, (k, o.label, sorted(now))
         if oid in now:
-            assert compatible(o["type"], now[oid]["type"]), (k, o["type"], now[oid]["type"])
-            c = cuboid_obb(o).center
-            near = min((j for j, x in now.items() if compatible(o["type"], x["type"])),
-                       key=lambda j: float(np.linalg.norm(cuboid_obb(now[j]).center - c)))
-            assert near == oid, (k, o["type"], oid, near)
+            assert compatible(o.label, now[oid].label), (k, o.label, now[oid].label)
+            c = o.obb.center
+            near = min((j for j, x in now.items() if compatible(o.label, x.label)),
+                       key=lambda j: float(np.linalg.norm(now[j].obb.center - c)))
+            assert near == oid, (k, o.label, oid, near)
 
 
 def test_published_ids_survive_a_rebuild_whatever_the_server_says_again(
@@ -164,8 +173,8 @@ def test_published_ids_survive_a_rebuild_whatever_the_server_says_again(
 
     client, first, rest = views
     m = tmp_path / "m"
-    published = json.loads(update(m, first, client=client, progress=_quiet).payload)
-    assert published["openlabel"]["objects"]
+    published = _update(m, first, client)
+    assert published
     from dataclasses import replace
 
     forgetful = Fake(mv_noise=client.mv_noise)
@@ -173,7 +182,7 @@ def test_published_ids_survive_a_rebuild_whatever_the_server_says_again(
     for p in first:  # the same images, no detection: a re-inference would find other objects
         key = str(p.resolve())
         forgetful.frames[key] = replace(forgetful.frames[key], instances=[])
-    after = json.loads(update(m, rest, client=forgetful, progress=_quiet).payload)
+    after = _update(m, rest, forgetful)
     assert json.loads((m / "map.json").read_text())["updates"][-1]["notes"]["restarted"]
     _ids_persist(m, published, after)
 
@@ -193,8 +202,8 @@ def test_a_published_object_stays_published_through_rebuilds(
     client = FakeClient(mv_noise=shared.mv_noise)
     client.frames = dict(shared.frames)
     m = tmp_path / "m"
-    published = json.loads(update(m, first, client=client, progress=_quiet).payload)
-    before = {int(k): o["type"] for k, o in published["openlabel"]["objects"].items()}
+    published = _update(m, first, client)
+    before = {k: o.label for k, o in published.items()}
     assert before
     monkeypatch.setattr(api, "_weak_keyframe", lambda rec: True)  # every update rebuilds
     monkeypatch.setattr(mo, "CONFIRM_DETECTIONS", 1000)
@@ -208,15 +217,15 @@ def test_a_published_object_stays_published_through_rebuilds(
     monkeypatch.setattr(mo, "_published_ids", spy)
     exported_before = set(before)
     for k, part in enumerate([rest[:6], rest[6:]]):
-        after = json.loads(update(m, part, client=client, progress=_quiet).payload)
+        after = _update(m, part, client)
         meta = json.loads((m / "map.json").read_text())
         assert meta["updates"][-1]["notes"]["restarted"], k
         assert meta["updates"][-1]["objects"]["removed"] == [], k
         assert "unpublished" not in meta["updates"][-1]["objects"]
-        now = {int(i): o for i, o in after["openlabel"]["objects"].items()}
+        now = after
         for oid, label in before.items():
             r = _resolve(m, oid)
-            assert r in now and now[r]["type"] == label, (k, oid, label, r, sorted(now))
+            assert r in now and now[r].label == label, (k, oid, label, r, sorted(now))
         state = mo.load_state(lambda name: m / name, meta)
         assert {o.id for o in state.objects if o.confirmed} == set(now)
         assert all(o.published for o in state.objects if o.id in now)
@@ -288,16 +297,16 @@ def test_an_object_an_update_removed_does_not_come_back_with_a_rebuild(
     second = _add(client, room, ring(12, start=0.2), tmp_path / "b", "b")
     third = _add(client, room, ring(6, start=0.45, radius=2.0), tmp_path / "c", "c")
     m = tmp_path / "m"
-    one = json.loads(update(m, first, client=client, progress=_quiet).payload)
-    labels = {int(k): o["type"] for k, o in one["openlabel"]["objects"].items()}
+    one = _update(m, first, client)
+    labels = {k: o.label for k, o in one.items()}
     (chair_id,) = [k for k, t in labels.items() if t == "chair"]
     update(m, second, client=client, progress=_quiet)
-    doc = json.loads(update(m, third, client=client, progress=_quiet).payload)
+    doc = _update(m, third, client)
     updates = json.loads((m / "map.json").read_text())["updates"]
     assert ["restarted" in u["notes"] for u in updates] == [False, True, True]
     assert chair_id in updates[1]["objects"]["removed"]
-    assert "chair" not in {o["type"] for o in doc["openlabel"]["objects"].values()}
-    assert _resolve(m, chair_id) not in {int(k) for k in doc["openlabel"]["objects"]}
+    assert "chair" not in {o.label for o in doc.values()}
+    assert _resolve(m, chair_id) not in doc
     _ids_persist(m, one, doc)
 
 
@@ -407,16 +416,16 @@ def test_a_rebuild_never_gives_one_object_two_published_ids(
 
     monkeypatch.setattr(objs, "_group", grouping)
     m = tmp_path / "m"
-    docs: list[dict] = []  # type: ignore[type-arg]
+    docs: list[Published] = []
     for part in (first, rest[:6], rest[6:]):
-        doc = json.loads(update(m, part, client=client, progress=_quiet).payload)
+        doc = _update(m, part, client)
         for before in docs:
             _ids_persist(m, before, doc)
         docs.append(doc)
         assert not json.loads((m / "objects.json").read_text()).get("rebuild_merged")
-    cabinets = [k for k, o in docs[0]["openlabel"]["objects"].items() if o["type"] == "cabinet"]
+    cabinets = [k for k, o in docs[0].items() if o.label == "cabinet"]
     assert len(cabinets) == 2
-    assert all(c in d["openlabel"]["objects"] for d in docs for c in cabinets)
+    assert all(c in d for d in docs for c in cabinets)
     assert "restarted" in json.loads((m / "map.json").read_text())["updates"][1]["notes"]
     # the rebuild was tempted, and kept the two cabinets apart
     assert tempted and apart and all(apart), (len(tempted), apart)

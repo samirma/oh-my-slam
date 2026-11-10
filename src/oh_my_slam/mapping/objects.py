@@ -803,7 +803,6 @@ class ObjectState:
     next_id: int
     merged_into: dict[int, int] = field(default_factory=dict)
     floor_z: float | None = None
-    observed: set[int] = field(default_factory=set)  # ids the update's input observed
     # keyframe index -> pixels this update invalidated in it: the masks of the objects it removed
     invalidated: dict[int, int] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
@@ -1718,11 +1717,6 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
         items = [(final_id(owner[i]), first.get(id(m.detection), final_id(owner[i])), m)
                  for i in idxs for m in obs[i].members]
         tx.write_json(frame_file(nf.record.name, "instances.json"), _instances_json(items))
-    # observed: the objects the update's input saw (``-t single``), not the stored keyframes a
-    # rebuild maps again
-    state.observed = {final_id(owner[i]) for i, ob in enumerate(obs)
-                      if is_input(ctx, new_views[ob.frame][0].kf.name)
-                      } & {o.id for o in state.objects}
     for o in state.objects:
         if o.id in touched or o.id in moved:
             tx.save_npy(points_file(o.id), o.points.astype(np.float32))
