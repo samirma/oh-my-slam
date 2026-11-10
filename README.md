@@ -1735,10 +1735,31 @@ produces it.
 
 ## Reference captures
 
+### The evaluators
+
+The evaluators are client-side tools outside the package (`specs/evaluation.md`); the service
+never imports them, and the package's coverage rule does not cover them (their offline tests are
+`tests/replay_eval/`). Both read their thresholds from `examples/targets.json`, keyed by the
+metric ids of evaluation.md, and share `tools/replay_eval/rpl_api.py` (client, timing),
+`rpl_validate.py` (schema) and `rpl_targets.py` (thresholds, baseline comparison).
+
+* `tools/replay_eval/replay_eval.py` replays recorded episodes against the simulator truth
+  (`tools/replay_eval/README.md`).
+* `tools/evaluate/evaluate.py` runs the reference captures camera-only, each in one job and split
+  (`halves`, `interleaved`: three jobs dealt round-robin, `per_frame`, and `truth`:
+  office_sequence's ground-truth splits). Cameras: office_sequence from its EXIF 35 mm focal
+  length; ainex-captures 640×480, fx 270; camera 1920×1080 taken as a 110° pinhole (override with
+  `--cameras`). Without truth it measures latencies, `reads.atomic`, `frame.shift`,
+  `jobs.eta_accuracy`, `grid.id_stability`, `features.region_set`, `grid.camera_cells_free`,
+  locate recall on the keyframes' own images, object id stability, label and centre agreement of
+  the split runs with the one-job run, and `update.later_wins`; every other metric is reported
+  `not_measured` with its reason. Its baseline is
+  `~/oh-my-slam-data/evaluations/baseline_reference.json` unless `--baseline` names one.
+
 ### The `ainex-captures` file names
 
 The spec no longer spells out the capture names, which encode the **commanded** head motion as
-`NNN_<motion>_<tilt>.jpg` (`tools/evaluate/names.py`; a name that does not follow it is an error):
+`NNN_<motion>_<tilt>.jpg` (a name that does not follow it is an error):
 
 * `NNN` is the capture order.
 * `<motion>` is the commanded yaw relative to frame 001, positive to the left: `bootstrap` (0°),
@@ -1755,7 +1776,7 @@ The same-heading pairs are 001/053 (053 returns to 001's heading) and 026/078 (`
 `examples/camera/` holds 36 frames (1920×1080, no EXIF) of a real pan-tilt indoor camera turning
 in place in a home office, through a wide-angle lens with visible distortion. The spec gives it
 the uses of `ainex-captures`, and its names encode the
-**commanded** motion as `img_NNN_pPP_<tilt>.jpg` (`tools/evaluate/names.py`, `PanCapture`):
+**commanded** motion as `img_NNN_pPP_<tilt>.jpg`:
 
 * `NNN` is the capture order (009 to 044).
 * `pPP` is the pan position (p03 to p11), numbered in pan order: the camera turns left as `PP`
