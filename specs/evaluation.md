@@ -106,7 +106,9 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 **Gate parameters.** The C6 metrics send `accept_if {max_residual_m: 0.10, max_gauge_shift_m:
 0.05, max_rejected_share: 0.5}`, the thresholds the client sends. They are parameters of the
 measurement, not targets, so `targets.json` does not hold them: it holds metric thresholds only.
-The warping updates are those of the recorded episodes e034 and e040.
+A warping update is a test update whose priors, or whose images' geometry, slip by at least
+0.3 m against the truth after its first frame; a clean update is one whose priors stay within
+their sigmas.
 
 ## Reference captures
 
