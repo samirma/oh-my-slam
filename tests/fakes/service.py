@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -99,6 +100,10 @@ class FakeBackend:
     depth_maps: dict[str, np.ndarray] = field(default_factory=dict)  # sha -> depth (world m)
     cloud_world: Cloud | None = None  # the fused cloud (world frame)
     objects_world: list[dict[str, Any]] = field(default_factory=list)  # center/R/size (world)
+    # sha256 of an image -> its detections (masks on any grid: resampled to the one asked)
+    detections: dict[str, list[Any]] = field(default_factory=dict)
+    detected: list[tuple[str, tuple[int, int]]] = field(default_factory=list)
+    detect_error: bool = False
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -128,6 +133,22 @@ class FakeBackend:
         depth = (np.full((K.height, K.width), 2.0) if d is None else d * self.mono_scale)
         return Mono(depth.astype(np.float32), K, self.descriptors.get(sha),
                     np.array([0.0, -1.0, 0.0]) if gravity else None)
+
+    def detect(self, image: Path, grid: tuple[int, int]) -> list[Any]:
+        from oh_my_slam.segmentation.api import Detection
+        from oh_my_slam.service.errors import ApiError
+
+        self.detected.append((image.name, grid))
+        if self.detect_error:
+            raise ApiError("inference_unavailable", "down (test)")
+        out = []
+        for d in self.detections.get(hashlib.sha256(image.read_bytes()).hexdigest(), []):
+            m = cv2.resize(d.mask.astype(np.uint8), grid, interpolation=cv2.INTER_NEAREST) > 0
+            sx, sy = grid[0] / d.mask.shape[1], grid[1] / d.mask.shape[0]
+            b = d.box
+            out.append(Detection(d.label, d.score, d.source, m,
+                                 (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
+        return out
 
     def _internal(self, sha: str) -> np.ndarray:
         T = self.truth[sha].copy()

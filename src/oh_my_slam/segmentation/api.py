@@ -38,8 +38,8 @@ from oh_my_slam.reconstruction.cloud import (
 from oh_my_slam.reconstruction.gravity import DEFAULT_UP_CAM, floor_band
 from oh_my_slam.reconstruction.pointcloud import MAX_GRID_SIDE
 from oh_my_slam.segmentation.colors import UNSEGMENTED as UNSEGMENTED
+from oh_my_slam.segmentation.colors import color_for_id as color_for_id
 from oh_my_slam.segmentation.colors import (
-    color_for_id,
     color_hex_for_id,
     height_colors,
     segment_colors,
@@ -279,6 +279,47 @@ def _lift_detections(frame: FrameReconstruction, dets: list[Detection], T_parent
         lifted = lift_mask(m, d, frame.K_grid, v, T_parent_cam, edges=edges)
         if len(lifted.points) >= MIN_POINTS:
             out.append(LiftedInstance(det, m, lifted))
+    return out
+
+
+def lift_on_grid(dets: list[Detection], depth: NDArray[Any], K: Intrinsics,
+                 T_parent_cam: Pose, valid: NDArray[Any] | None = None) -> list[LiftedInstance]:
+    """Exclusive masks of ``dets`` (on ``depth``'s grid, intrinsics ``K``) lifted into the parent
+    frame, as ``lift_detections`` lifts a reconstructed frame's: a keyframe of a map whose depth
+    is a grid of its own (an anchored map's, ``mapping.anchored_objects``)."""
+    d = np.asarray(depth, np.float32)
+    v = (np.isfinite(d) & (d > 0)) if valid is None else np.asarray(valid, bool)
+    edges = depth_edge_mask(np.where(v, d, 0.0))
+    owner = pixel_owners(dets, d.shape)
+    out = []
+    for i, det in enumerate(dets):
+        m = owner == i
+        if not m.any():
+            continue
+        lifted = lift_mask(m, d, K, v, T_parent_cam, edges=edges)
+        if len(lifted.points) >= MIN_POINTS:
+            out.append(LiftedInstance(det, m, lifted))
+    return out
+
+
+def detect_on_grid(image_path: Path, grid: tuple[int, int], client: InferenceClient | None = None,
+                   min_score: float = DEFAULT_MIN_SCORE) -> list[Detection]:
+    """Detections of an image with masks and boxes on ``grid`` (width, height): a keyframe's
+    depth grid, whatever its size (the detector's input does not depend on it)."""
+    from oh_my_slam.segmentation.detect import resample_mask
+
+    dets = detect(image_path, min_score=min_score, floor=min_score, max_side=max(grid),
+                  client=client)
+    out = []
+    for d in dets:
+        h, w = d.mask.shape
+        if (w, h) == grid:
+            out.append(d)
+            continue
+        sx, sy = grid[0] / w, grid[1] / h
+        b = d.box
+        out.append(Detection(d.label, d.score, d.source, resample_mask(d.mask, grid),
+                             (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
     return out
 
 

@@ -110,3 +110,34 @@ def test_an_image_cloud_thinned_for_display_keeps_exact_points(tmp_path: Path) -
     assert np.array_equal(thin.cloud.label, full.label[picked])
     again = derive_thinned(source, CloudAttrs(color="rgb"), 500)  # colour only: same selection
     assert np.array_equal(again.cloud.xyz, thin.cloud.xyz) and again.voxel == thin.voxel
+
+
+def test_detections_on_a_keyframe_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    from oh_my_slam.segmentation import api
+
+    small = Detection("cup", 0.9, "yoloe", rect(3, 6, 4, 8, (12, 16)), (4.0, 3.0, 8.0, 6.0))
+    same = Detection("box", 0.8, "yoloe", rect(10, 50, 10, 70), (10.0, 10.0, 70.0, 50.0))
+    seen: dict[str, object] = {}
+
+    def detect(path: Path, **kw: object) -> list[Detection]:
+        seen.update(kw)
+        return [small, same]
+
+    monkeypatch.setattr(api, "detect", detect)
+    out = api.detect_on_grid(Path("a.jpg"), (80, 60))
+    assert seen["max_side"] == 80
+    assert out[0].mask.shape == (60, 80) and out[0].box == (20.0, 15.0, 40.0, 30.0)
+    assert out[1] is same
+
+
+def test_lifting_on_a_grid_of_its_own() -> None:
+    from oh_my_slam.segmentation.api import lift_on_grid
+
+    depth = np.full((60, 80), 2.0, np.float32)
+    empty = Detection("cup", 0.9, "yoloe", np.zeros((60, 80), bool), (0.0, 0.0, 0.0, 0.0))
+    tiny = Detection("pen", 0.9, "yoloe", rect(0, 2, 0, 2), (0.0, 0.0, 2.0, 2.0))
+    box = Detection("box", 0.8, "yoloe", rect(10, 50, 10, 70), (10.0, 10.0, 70.0, 50.0))
+    out = lift_on_grid([empty, tiny, box], depth, K, Pose.identity())
+    assert [i.detection.label for i in out] == ["box"]
+    valid = np.zeros((60, 80), bool)
+    assert lift_on_grid([box], depth, K, Pose.identity(), valid) == []

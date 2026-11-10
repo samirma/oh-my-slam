@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -27,6 +27,9 @@ from oh_my_slam.core.errors import (
 )
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.errors import ApiError
+
+if TYPE_CHECKING:
+    from oh_my_slam.segmentation.api import Detection
 
 LOG_TAIL_LINES = 20
 MONO_GRID_SIDE = 640  # the monocular depth grid of an anchored map's keyframes (README)
@@ -106,6 +109,9 @@ class Backend(Protocol):
         """The monocular depth of a canonical image with its intrinsics ``K`` (and the camera's
         up direction when ``gravity``)."""
 
+    def detect(self, image: Path, grid: tuple[int, int]) -> list[Detection]:
+        """The detections of an image, masks on ``grid`` (width, height)."""
+
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
                  masks: dict[Path, Path] | None = None) -> Registered:
@@ -130,9 +136,11 @@ def is_anchored(mapper_dir: Path) -> bool:
 def read_anchored(mapper_dir: Path) -> InternalMap:
     """A prior-first map as the derived reads see it: its frame is the map frame (metres), its
     keyframes' ids are the internal names, provisional keyframes count as low confidence, the
-    depth of a keyframe is its grid at the map's depth scale, the cloud its fused voxels (no
-    object ids: the prior-first path computes no objects)."""
+    depth of a keyframe is its grid at the map's depth scale, the cloud its fused voxels, each
+    with the id of the listed object whose box holds it (the smallest), and the listed objects
+    that are not struck (``mapping.anchored_objects``)."""
     from oh_my_slam.mapping.anchored import AnchoredMap
+    from oh_my_slam.mapping.anchored_objects import ObjectMap
 
     am = AnchoredMap.load(mapper_dir)
     frames = [InternalFrame(k.id, k.name, k.T.copy(), float(k.K.fx),
@@ -141,17 +149,35 @@ def read_anchored(mapper_dir: Path) -> InternalMap:
     floor, pts = am.floor_and_bounds()
     bounds = (pts.min(0).tolist(), pts.max(0).tolist()) if len(pts) else None
     xyz = am.cloud.points()
+    live = [o for o in ObjectMap.load(mapper_dir).live() if o.box is not None]
 
     def cloud() -> Cloud | None:
         if not len(xyz):
             return None
         rgb = am.cloud.rgb / np.maximum(am.cloud.count, 1)[:, None]
+        ids = np.zeros(len(xyz), np.uint32)
+        vol = np.full(len(xyz), np.inf)
+        for o in live:
+            assert o.box is not None
+            v = float(np.prod(o.box.size))
+            r = float(np.linalg.norm(o.box.size)) / 2
+            near = np.flatnonzero(np.all(np.abs(xyz - o.box.centre) <= r, axis=1))
+            hit = near[o.box.contains(xyz[near]) & (vol[near] > v)]
+            ids[hit], vol[hit] = o.id, v
         return Cloud(xyz.astype(np.float32), np.clip(np.round(rgb), 0, 255).astype(np.uint8),
-                     np.zeros(len(xyz), np.uint32))
+                     ids)
+
+    def objects() -> list[dict[str, Any]]:
+        out = []
+        for o in live:
+            assert o.box is not None
+            out.append({"id": o.id, "label": o.label, "center": o.box.centre.tolist(),
+                        "R": o.box.R.tolist(), "size": o.box.size.tolist()})
+        return out
 
     return InternalMap(frames, floor, bounds, False, am.depth_of,
                        np.asarray(xyz[:, 2], np.float64) if len(xyz) else None, am.image_path,
-                       cloud)
+                       cloud, objects)
 
 
 def api_error(exc: OhMySlamError) -> ApiError:
@@ -218,6 +244,19 @@ class MapperBackend:
         up = None if fr.gravity is None else np.asarray(fr.gravity.up_cam, np.float64)
         return Mono(np.where(fr.valid, fr.depth, 0.0).astype(np.float32), fr.K_grid,
                     None if fr.descriptor is None else np.asarray(fr.descriptor, np.float32), up)
+
+    def detect(self, image: Path, grid: tuple[int, int]) -> list[Detection]:
+        from oh_my_slam.reconstruction.api import connect_server
+        from oh_my_slam.segmentation.api import detect_on_grid
+
+        try:
+            client = connect_server().clone()
+            try:
+                return detect_on_grid(image, grid, client)
+            finally:
+                client.close()
+        except OhMySlamError as exc:
+            raise api_error(exc) from exc
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
