@@ -206,8 +206,8 @@ server.
   max(5 cm, 2 % of the depth)) is placed at their centre with the rotation that turns its rays onto
   theirs (the turn fit of `mapping.locate`, ≥ 15 inliers that are ≥ 25 % of the matches); its
   height is the floor plus the frame's `height_above_floor_m` (else the camera's) when given.
-* **Sigmas.** `SIGMA_SCALE × √(fit² + spread²)`, combined with the matched keyframes' median sigma:
-  *fit* is the Gauss-Newton covariance `s² (JᵀJ)⁻¹` of the inliers' reprojection residuals
+* **Sigmas.** `SIGMA_SCALE × √(fit² + spread²)`, no floor (the keyframes' own sigmas, a floored
+  proxy in this base, are not added): *fit* is the Gauss-Newton covariance `s² (JᵀJ)⁻¹` of the inliers' reprojection residuals
   (`s` their RMS, ≥ 0.3 px), as the 3-D RMS of the centre (m) and of the rotation (deg); *spread*
   is the RMS distance of the other hypotheses of the same place, weighted by their squared
   relative support. Keyframes whose depth or pose disagree therefore widen the sigmas.
@@ -224,10 +224,10 @@ server.
 * **`inlier_ratio`**: query keypoints the pose explains over those with a correspondence (turn
   fits: inlier rays over matched rays).
 * **`nearest_view`** (no_overlap only): the keyframe with most nearest-neighbour votes (the
-  retrieval of this service: SIFT votes, no inference); `turn_deg` from the frame's guessed
-  heading (its prior's, else that keyframe's) toward where the keyframe looks (the mean of its
-  keypoints' map points) seen from the guessed position, counter-clockwise positive, in
-  (−180, 180]. Null when no keyframe has a vote.
+  retrieval of this service: SIFT votes, no inference); `turn_deg` from the frame's prior heading
+  toward where the keyframe looks (the mean of its keypoints' map points) seen from the prior's
+  position, counter-clockwise positive, in (−180, 180]; null without a prior. `nearest_view` is
+  null when no keyframe has a vote.
 * **Recording.** `record: true` stores the last located frame of the request as
   `maps/<name>/pose.json` (outside the versions); `GET /api/maps/{name}/pose` answers it, or
   `no_pose`.
@@ -251,19 +251,24 @@ server.
   lies in `[floor + z_min, floor + z_max]`, `free` when not occupied and a ray passed through it in
   the band (or its floor was seen), else `unknown`; an overhang above `z_max` never makes a cell
   occupied. `height_m` is the highest surface or floor voxel's centre below `max(z_max, 2.0)`,
-  relative to the floor; `floor_observed` a floor-like voxel in the column. `floor_z_m` is the
+  relative to the floor; `floor_observed` 1 for a floor-like voxel in the column, 2 for a cell free
+  by rule (below) whose floor was not seen, else 0. `floor_z_m` is the
   version's floor, else the lowest layer with ≥ 25 % of the most flat hits of any layer, else the
   cameras' heights, else 1 m below the lowest camera.
 * **Camera stands.** The cell under every keyframe camera (and the disc of `footprint_radius_m`)
   is free whatever was seen; so are the unknown cells of its blind disc that the camera cell
   reaches without crossing an occupied cell: radius `h / tan(depression)` of the bottom row's
   centre ray at camera height `h` (0 when that ray looks < 2° below the horizon; at most 2 m).
+  This is done at 5 cm for the features and again on the cells asked.
+* **Resolution.** Passages, regions and frontiers are computed at the volume's 5 cm whatever
+  `cell_m` is asked (the layers are then resampled), so they do not change with the cell size.
 * **Passages.** Through every free cell on the medial axis of the free space with a clearance
   below 1 m, the chord toward its nearest obstacle and on to the opposite one, refined to the
   shortest within ±10°; kept when it lies in a wall — beyond both ends the obstacle goes on along
-  the chord for 0.4 m, no free cell on the line, ≥ 70 % occupied (beside the line included) — and
-  ≤ 2 m long; the shortest one per gap; then narrowed beside it (shifts ≤ 0.3 m, ±10°) so that an
-  open leaf counts as an obstacle. Its ends are `jambs_m`, its length `width_m`, its midpoint
+  the chord for 0.4 m, no free cell on the line, ≥ 50 % occupied (beside the line included) — and
+  ≤ 2 m long; the shortest one per gap; then the narrowest free chord beside it is taken (shifted
+  along its normal by up to ±0.5 m, turned by up to ±20°, both ends on obstacles, its midpoint
+  between the walled chord's jambs), so that an open leaf or a deep frame counts as an obstacle. Its ends are `jambs_m`, its length `width_m`, its midpoint
   `centre_m`, `normal_deg` perpendicular to it from `regions[0]` to `regions[1]`. `kind`:
   `narrow` when narrower than `2 × footprint_radius_m`; else `door` when a door-labelled object
   of the version lies within 0.6 m of its centre, or both jambs are occupied and it is 0.55–1.3 m
@@ -272,7 +277,8 @@ server.
   `intrudes` when they reach between the jambs.
 * **Regions.** The chords are cut out of the free cells; each connected part of ≥ 0.25 m² is a
   region (a chord whose two sides stay connected is dropped). `polygon_m` its outer boundary,
-  `coverage_share` its cells over its cells plus the unknown cells its boundary encloses.
+  `coverage_share` its cells with `floor_observed` 1 over its free cells plus the unknown cells its
+  boundary encloses (holes filled).
 * **Frontiers.** Free cells next to an unknown cell (or the grid's edge), in 8-connected runs of
   ≥ 0.3 m; `region` the region most of its cells belong to (cells on a cut: the nearest region).
 * **Ids.** `derived/ids.json` registers every region, passage and frontier answered; a new one
@@ -286,7 +292,7 @@ server.
   `max_points`, the budget grid of `core.geometry.budget_voxel_indices` (`truncated: true`).
 
 **Encodings.** Every `Binary` is little-endian, row-major, base64: `state` uint8 (0 unknown,
-1 free, 2 occupied), `observations` uint16, `height_m` float32 (NaN: none), `floor_observed` uint8,
+1 free, 2 occupied), `observations` uint16, `height_m` float32 (NaN: none), `floor_observed` uint8 (0 not seen, 1 seen, 2 free by rule),
 shape `[rows (y), cols (x)]`; cell `[r, c]` covers x `origin_m[0] + c·cell_m` to `+cell_m`, y
 likewise with `r`. Points: `xyz` float32 `[n, 3]`, `object_id` uint32 `[n]` (0: none), `rgb`
 uint8 `[n, 3]`.

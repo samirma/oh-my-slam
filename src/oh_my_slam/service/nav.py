@@ -146,12 +146,15 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
          footprint: float | None) -> GridAnswer:
     vol = dv.volume()
     floor = dv.floor_z
-    lay = navgrid.resample(navgrid.layers(vol, floor, z_min, z_max), cell)
+    base = navgrid.layers(vol, floor, z_min, z_max)  # the features at the volume's resolution,
+    navgrid.mark_stands(base, dv.stands, floor, footprint)  # whatever cell size is asked
+    lay = navgrid.resample(base, cell)
     if lay.state.size > MAX_GRID_CELLS:
         raise invalid("cell_m", f"cell_m {cell} gives {lay.state.size} cells (at most "
                       f"{MAX_GRID_CELLS}): ask for larger cells")
-    navgrid.mark_stands(lay, dv.stands, floor, footprint)
-    feat = navgrid.features(lay, footprint, dv.meta.get("doors", []))
+    if lay is not base:
+        navgrid.mark_stands(lay, dv.stands, floor, footprint)
+    feat = navgrid.features(base, footprint, dv.meta.get("doors", []))
     rid = ids.assign(dv.name, "regions", [(r.centroid, r.area_m2) for r in feat.regions])
     pid = ids.assign(dv.name, "passages", [(p.centre, 0.0) for p in feat.passages])
     fid = ids.assign(dv.name, "frontiers", [(f.centre, 0.0) for f in feat.frontiers])
@@ -177,7 +180,7 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
                    "height_m": binary(lay.height.astype(np.float32)),
                    "floor_observed": binary(lay.floor_observed.astype(np.uint8))},
         "regions": regions, "passages": passages, "frontiers": frontiers}
-    return GridAnswer(body, lay, feat, rid)
+    return GridAnswer(body, base, feat, rid)
 
 
 def object_regions(answer: GridAnswer, objects: list[dict[str, Any]],

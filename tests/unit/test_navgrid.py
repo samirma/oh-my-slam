@@ -238,3 +238,45 @@ def test_an_obstacle_beside_the_wall_narrows_the_passage() -> None:
     (ch,) = ng._passage_chords(st, 0.1)
     assert ch[0] < 8.0 - 1e-6
     assert float(np.linalg.norm(ch[2] - ch[1])) == pytest.approx(ch[0])
+
+
+def test_the_narrowest_chord_beside_the_wall_line_is_the_passage() -> None:
+    st = np.zeros((40, 70), np.uint8)
+    st[5:35, 2:34] = 1
+    st[5:35, 36:68] = 1
+    st[5:35, 34:36] = 2
+    st[12:26, 34:36] = 1  # a 1.4 m gap in the wall
+    st[12:15, 31:34] = 2  # a frame, 0.3 m deep on one side, leaves 0.9 m
+    st[24:26, 31:34] = 2
+    f = ng.features(_grid(st))
+    (p,) = f.passages
+    assert p.width == pytest.approx(0.9, abs=0.01)
+    assert sorted(j[1] for j in p.jambs) == pytest.approx([1.5, 2.4], abs=0.01)
+    assert 3.1 <= p.centre[0] <= 3.4 and p.centre[1] == pytest.approx(1.95)
+
+
+def test_coverage_counts_floor_seen_over_free_and_enclosed_unknown() -> None:
+    st = np.zeros((30, 30), np.uint8)
+    st[2:28, 2:28] = 1
+    st[10:14, 10:14] = 0  # an unknown hole inside the region
+    lay = _grid(st)
+    lay.floor_observed[:] = 0
+    lay.floor_observed[2:15, 2:28] = 1
+    (r,) = ng.features(lay).regions
+    free = int((st == 1).sum())
+    seen = int(((st == 1) & (lay.floor_observed == 1)).sum())
+    assert r.coverage_share == pytest.approx(seen / (free + 16), abs=1e-4)
+
+
+def test_cells_free_by_rule_get_floor_observed_2() -> None:
+    K = rooms.K640
+    lay = _grid(np.zeros((40, 40), np.uint8))
+    lay.floor_observed[:] = 0
+    lay.floor_observed[20, 8] = 1  # seen floor stays seen
+    lay.state[20, 8] = 1
+    ng.mark_stands(lay, [ng.Stand(rooms.camera(0.5, 2.0, 1.0, 0, -20.0), K, 320, 240)], 0.0, 0.2)
+    assert lay.floor_observed[20, 5] == 2 and lay.floor_observed[20, 8] == 1
+    assert lay.floor_observed[20, 30] == 0
+    coarse = ng.resample(lay, 0.2)
+    assert coarse.floor_observed[10, 4] == 1  # seen wins over free by rule
+    assert coarse.floor_observed[10, 2] == 2

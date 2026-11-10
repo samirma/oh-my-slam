@@ -587,3 +587,14 @@ def test_locate_uses_the_map_s_camera_mask_and_a_repeated_camera(
     monkeypatch.setattr(relocalize, "locate", lambda q, index: relocalize.Outcome())
     doc = nav.locate("room", {"frames": [f]}, {"q": img})
     assert doc["frames"][0]["reason"] == "no_overlap" and doc["frames"][0]["nearest_view"] is None
+
+
+def test_passages_do_not_depend_on_the_cell_size(rooms_map: Nav) -> None:
+    got = []
+    for cell in (0.05, 0.08, 0.12):
+        g = rooms_map.get(f"/api/maps/house/grid?cell_m={cell}", "Grid")
+        got.append([(p["centre_m"], p["width_m"], p["jambs_m"], p["kind"]) for p in g["passages"]])
+        assert len(g["regions"]) == 2
+        fl = decode(g["layers"]["floor_observed"])
+        assert set(np.unique(fl).tolist()) <= {0, 1, 2}
+    assert got[0] == got[1] == got[2] and len(got[0]) == 1

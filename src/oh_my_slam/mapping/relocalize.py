@@ -565,13 +565,13 @@ def locate(q: Query, index: Index) -> Outcome:
         others = [h for k, h in enumerate(hyps) if k != k_best]
         rival = _rival(main, others, iq, xyz)
         if rival is not None:  # the prior, then the height, pick when only one agrees
-            sp, sr = _sigmas(main, others, q, uv, xyz, iq, kfs, index)
-            rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq, kfs, index)
+            sp, sr = _sigmas(main, others, q, uv, xyz, iq)
+            rsp, rsr = _sigmas(rival, [main, *others], q, uv, xyz, iq)
             if (consistent(q, main.T, sp, sr) is False and consistent(q, rival.T, rsp, rsr)) or (
                     not _height_ok(q, main.T, sp) and _height_ok(q, rival.T, rsp)):
                 others = [main, *[h for h in others if h is not rival]]
                 main, rival = rival, main
-        sp, sr = _sigmas(main, others, q, uv, xyz, iq, kfs, index)
+        sp, sr = _sigmas(main, others, q, uv, xyz, iq)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, sp, sr
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
@@ -612,17 +612,15 @@ def _refine(h: Hypothesis, K: Array, uv: Array, xyz: Array, iq: NDArray[np.int64
 
 
 def _sigmas(h: Hypothesis, others: Sequence[Hypothesis], q: Query, uv: Array, xyz: Array,
-            iq: NDArray[np.int64], kfs: NDArray[np.int64], index: Index) -> tuple[float, float]:
-    """``SIGMA_SCALE`` times the fit's covariance and the same-place hypotheses' spread, combined
-    with the matched keyframes' own sigmas."""
+            iq: NDArray[np.int64]) -> tuple[float, float]:
+    """``SIGMA_SCALE`` times the fit's covariance and the same-place hypotheses' spread. The
+    keyframes' own sigmas are not added: until O5 calibrates the registration they are a floored
+    proxy (1 cm, 0.1°), which would floor these too."""
     sel = np.array(sorted(_first(h, iq).values()), np.int64)
     pos, rot = covariance(h.T, q.K, uv[sel], xyz[sel])
     s_pos, s_rot = spread(h, others, iq, xyz)
-    used = np.unique(kfs[h.mask])
-    kp = float(np.median([index.keyframes[i].sigma_pos_m for i in used]))
-    kr = float(np.median([index.keyframes[i].sigma_rot_deg for i in used]))
-    return (round(math.hypot(SIGMA_SCALE * math.hypot(pos, s_pos), kp), 4),
-            round(math.hypot(SIGMA_SCALE * math.hypot(rot, s_rot), kr), 3))
+    return (round(SIGMA_SCALE * math.hypot(pos, s_pos), 4),
+            round(SIGMA_SCALE * math.hypot(rot, s_rot), 3))
 
 
 def _rays(uv: NDArray[Any], K: Array) -> Array:
@@ -662,10 +660,8 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
     T[:3, 3] = centre
     if q.camera_z is not None:
         T[2, 3] = q.camera_z
-    kp = float(np.median([index.keyframes[i].sigma_pos_m for i in used]))
-    kr = float(np.median([index.keyframes[i].sigma_rot_deg for i in used]))
-    sp = math.sqrt(spread ** 2 + kp ** 2 + (ONE_SPOT_REL * float(np.median(depth))) ** 2)
-    sr = math.hypot(rot, kr)
+    sp = math.hypot(spread, ONE_SPOT_REL * float(np.median(depth)))
+    sr = rot
     out = Outcome(T, round(sp, 4), round(sr, 3), round(n / len(a), 4), n, method="turn")
     rest = ~inl
     if rest.sum() >= MIN_INLIERS:
@@ -681,13 +677,14 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
 MIN_PX_SIGMA_DEG = 0.05
 
 
-def nearest_view(q: Query, index: Index, k: int) -> tuple[Keyframe, float]:
-    """The keyframe ``k`` and the signed turn (deg, CCW) from the frame's guessed heading — its
-    prior's, else the keyframe's — toward where that keyframe looks, seen from the frame's guessed
-    position (its prior's, else the keyframe's)."""
+def nearest_view(q: Query, index: Index, k: int) -> tuple[Keyframe, float | None]:
+    """The keyframe ``k`` and the signed turn (deg, CCW) from the frame's prior heading toward
+    where that keyframe looks (the mean of its keypoints' points), seen from the prior's
+    position; None without a prior (the frame's heading in the map is unknown)."""
     kf = index.keyframes[k]
-    guess = q.prior if q.prior is not None else kf.T
-    target = kf.view_point() - guess[:3, 3]
+    if q.prior is None:
+        return kf, None
+    target = kf.view_point() - q.prior[:3, 3]
     heading = math.degrees(math.atan2(target[1], target[0])) if np.hypot(*target[:2]) > 1e-6 \
         else yaw_deg(kf.T)
-    return kf, round(wrap_deg(heading - yaw_deg(guess)), 2)
+    return kf, round(wrap_deg(heading - yaw_deg(q.prior)), 2)
