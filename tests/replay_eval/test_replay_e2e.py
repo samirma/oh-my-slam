@@ -76,6 +76,8 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     mug = rows["Mug|1|2"]
     assert mug["matched"]["label"] == "cup" and mug["label_agreed"] is True
     assert mug["canonical"] == "cup" and mug["centre_error_m"] == pytest.approx(0, abs=1e-6)
+    assert mug["origin"] == "centre" and mug["centre_z_error_m"] == pytest.approx(0, abs=1e-6)
+    assert mug["bottom_z_error_m"] is None  # house positions are centres
     assert rows["DiningTable|1|1"]["label_agreed"] is True
     assert [u["label"] for u in objs["unmatched_map"]] == ["Chair"]
     assert res["label_rule"]["examples"]["Apple_1"] == "apple"

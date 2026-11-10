@@ -123,7 +123,8 @@ DEFS: list[Def] = [
         "max", "s", ("O6",)),
     Def("c10.objects_read_s", "C10", "GET objects on a committed version", "<=", 0.5, "max",
         "s", ("O8",)),
-    Def("c10.centre_error_m", "C10", "Object centre error (median, same-label match within "
+    Def("c10.centre_error_m", "C10", "Object position error: box centre, or centre xy and "
+        "bottom z for base-origin truth (median, same-label match within "
         "1 m)", "<=", 0.10, "median", "m", ("O8",)),
     Def("c10.label_agreement", "C10", "Objects whose label agrees with the nearest truth "
         "object", ">=", 0.8, "share", "share", ("O8",)),
@@ -624,14 +625,24 @@ class Measure:
                 s.add("c9.passage_geometry", dist <= 0.10 and abs(width - door.width) <= 0.10)
 
     # ---- O8 ---------------------------------------------------------------------------------
+    def compared(self, o: dict[str, Any], t: TruthObject) -> Arr:
+        """The world point of map object ``o`` that truth ``t``'s position stands for: the box
+        centre, or for a base-origin truth the centre xy at the box bottom."""
+        assert self.al is not None
+        c = [float(v) for v in o["centre_m"]]
+        if t.origin == "base":
+            c[2] -= float(o["size_m"][2]) / 2.0
+        return self.al[0].point(c)
+
+    def error(self, o: dict[str, Any], t: TruthObject) -> float:
+        return float(np.linalg.norm(self.compared(o, t) - t.centre))
+
     def match(self, objs: list[dict[str, Any]], same: bool) -> dict[int, TruthObject]:
         """Map object id -> nearest truth object within match_m (with the same label if
         ``same``)."""
-        assert self.al is not None
         out: dict[int, TruthObject] = {}
         for o in objs:
-            w = self.al[0].point(o["centre_m"])
-            cands = [(float(np.linalg.norm(t.centre - w)), i, t)
+            cands = [(self.error(o, t), i, t)
                      for i, t in enumerate(self.truth_objects)
                      if not same or self.p.labels.same(o["label"], t.label)]
             cands = [c for c in cands if c[0] <= self.p.match_m]
@@ -657,8 +668,7 @@ class Measure:
         for o in live:
             t = matched.get(int(o["id"]))
             if t is not None:
-                s.add("c10.centre_error_m", float(np.linalg.norm(sim.point(o["centre_m"])
-                                                                  - t.centre)))
+                s.add("c10.centre_error_m", self.error(o, t))
         surfaces = {int(x["id"]): x for x in final.get("surfaces", [])}
         by_truth = {t.id: oid for oid, t in matched.items()}
         for o in live:
@@ -704,8 +714,7 @@ class Measure:
 
         def best(pairs: dict[int, TruthObject], t: TruthObject) -> int | None:
             ids = [oid for oid, tt in pairs.items() if tt is t]
-            return min(ids, key=lambda i: float(np.linalg.norm(sim.point(by_id[i]["centre_m"])
-                                                                - t.centre)), default=None)
+            return min(ids, key=lambda i: self.error(by_id[i], t), default=None)
 
         truth_rows, used = [], set()
         for t in self.truth_objects:
@@ -716,7 +725,9 @@ class Measure:
                 "name": t.id, "label": t.label, "canonical": rule.canon(t.label),
                 "centre_world": [round(float(v), 4) for v in t.centre],
                 "size_world": None if t.size is None else [float(v) for v in t.size],
-                "matched": None, "centre_error_m": None, "label_agreed": None,
+                "origin": t.origin, "matched": None, "centre_error_m": None,
+                "xy_error_m": None, "bottom_z_error_m": None, "centre_z_error_m": None,
+                "label_agreed": None,
                 "support_height_error_m": None}
             if oid is not None:
                 o = by_id[oid]
@@ -727,7 +738,11 @@ class Measure:
                     "size": o.get("size_m"), "mean_rgb": o.get("mean_rgb"),
                     "state": o.get("state"), "supported_by": o.get("supported_by"),
                     "inside_of": o.get("inside_of")}
-                row["centre_error_m"] = float(np.linalg.norm(sim.point(o["centre_m"]) - t.centre))
+                d = self.compared(o, t) - t.centre
+                row["centre_error_m"] = float(np.linalg.norm(d))
+                row["xy_error_m"] = float(np.linalg.norm(d[:2]))
+                row["bottom_z_error_m" if t.origin == "base" else "centre_z_error_m"] = \
+                    abs(float(d[2]))
                 row["label_agreed"] = rule.same(o["label"], t.label)
                 sup = o.get("supported_by")
                 if sup and sup["kind"] == "surface" and int(sup["id"]) in surfaces \

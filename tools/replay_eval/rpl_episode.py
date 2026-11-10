@@ -207,7 +207,8 @@ class Episode:
             label = re.sub(r"[\d_\-.]+$", "", name) or name
             size = body.get("size")
             out.append(TruthObject(name, label, pos, support_z=support,
-                                   size=None if size is None else np.asarray(size, dtype=float)))
+                                   size=None if size is None else np.asarray(size, dtype=float),
+                                   origin=str(layout["object_origin"])))
         return out
 
 

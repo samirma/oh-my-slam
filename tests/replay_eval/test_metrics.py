@@ -364,3 +364,23 @@ def test_object_report_rows(world: Any) -> None:
     assert sofa["support_height_error_m"] == pytest.approx(0.03)
     assert rows_["far"]["matched"] is None and rows_["far"]["size_world"] == [0.1, 0.2, 0.3]
     assert {u["id"] for u in rep["unmatched_map"]} == {3, 4}
+
+
+@pytest.mark.parametrize("origin, err, xy, z_key", [("base", 0.0, 0.0, "bottom_z_error_m"),
+                                                    ("centre", 0.1, 0.0, "centre_z_error_m")])
+def test_object_origin(world: Any, origin: str, err: float, xy: float, z_key: str) -> None:
+    """A truth position at the object's base (MuJoCo body origin of a staged object) is compared
+    with the box's centre xy and bottom z; a centre position with the box centre."""
+    ep, syn, _, _ = world
+    names = syn.names["r1/start"]
+    obj = {"id": 1, "label": "apple", "centre_m": [0.4, 0.05, 0.8], "size_m": [0.1, 0.1, 0.2],
+           "state": "confirmed", "region": None, "supported_by": None, "inside_of": None}
+    rec = record(["O8"], frames={1: {"frames": rows(ep, names)}},
+                 objects={1: {"objects": [obj]}})
+    rec.jobs = [job(names)]  # map = world - (0.8, 1.45, 0)
+    truth = [fp.TruthObject("apple_1", "apple", np.array([1.2, 1.5, 0.7]), origin=origin)]
+    s = measure(rec, ep, objs=truth)
+    assert s.values["c10.centre_error_m"] == [pytest.approx(err)]
+    row = s.info["objects"]["truth"][0]
+    assert row["origin"] == origin and row["centre_error_m"] == pytest.approx(err)
+    assert row["xy_error_m"] == pytest.approx(xy) and row[z_key] == pytest.approx(err)

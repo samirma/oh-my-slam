@@ -107,7 +107,8 @@ def house_for(ep: Episode, house: Path | None, layout: dict[str, Any],
             warnings.append(f"no house JSON for scene '{ep.scene}' in {house}")
             return None
         path = found[0]
-    return load_house(json.loads(path.read_text()), layout["container_types"], ep.floor_z)
+    return load_house(json.loads(path.read_text()), layout["container_types"], ep.floor_z,
+                      str(layout["house_object_origin"]))
 
 
 def load_targets(path: Path | None) -> dict[str, dict[str, Any]]:

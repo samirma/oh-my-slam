@@ -45,6 +45,7 @@ class TruthObject:
     inside: bool = False  # True when the parent is a container
     support_z: float | None = None  # truth height of the surface it rests on, when known
     size: Arr | None = None  # world extent, when the truth gives one
+    origin: str = "centre"  # where `centre` sits on the object: its centre, or its base
 
 
 @dataclass
@@ -123,7 +124,7 @@ def _objects(items: list[Any], containers: set[str], parent: TruthObject | None,
 
 
 def load_house(house: dict[str, Any], containers: list[str],
-               floor_z: float | None = None) -> FloorPlan:
+               floor_z: float | None = None, origin: str = "centre") -> FloorPlan:
     """The floor plan of a ProcTHOR house JSON (keys rooms, walls, doors, objects)."""
     plan = FloorPlan()
     for i, room in enumerate(house.get("rooms") or []):
@@ -145,6 +146,8 @@ def load_house(house: dict[str, Any], containers: list[str],
     for seg in walls.values():
         plan.walls.extend(_cut(seg, plan.doors))
     _objects(house.get("objects") or [], set(containers), None, plan.objects, floor_z)
+    for o in plan.objects:
+        o.origin = origin
     return plan
 
 

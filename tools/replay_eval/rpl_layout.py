@@ -136,6 +136,10 @@ LAYOUT: dict[str, Any] = {
                             ["bathtub", "tub", "bathtubbasin"],
                             ["bed", "mattress"]],
                "suffix_match": True},
+    # where a truth object's position sits: "base" (truth.jsonl objects: the MuJoCo body origin,
+    # at the object's base) compares the map box's centre xy and BOTTOM z; "centre" its centre
+    "object_origin": "base",
+    "house_object_origin": "centre",  # ProcTHOR house JSON positions
     # THOR object types whose children are inside them rather than on them
     "container_types": ["Box", "Bowl", "Cup", "Mug", "Pot", "Pan", "Drawer", "Cabinet", "Fridge",
                         "Microwave", "Safe", "GarbageCan", "Sink", "SinkBasin", "Bathtub",

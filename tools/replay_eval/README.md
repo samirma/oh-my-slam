@@ -242,6 +242,14 @@ The truth-derived checks have these thresholds (`Params` in `rpl_metrics.py`):
     walls inside it may stay occupied.
 * **C10.** Objects are matched to the nearest truth object within 1 m, of the same label for
   the centre error.
+  * **Where the truth position sits** (`object_origin`, default `base`):
+    * `truth.jsonl` object `pos` is the MuJoCo body origin, which for the staged objects is at
+      their base (worktop top + 1 mm). It is compared with the map box's centre xy and its
+      bottom z (centre z − size z / 2).
+    * `centre_error_m` is the 3-D error of that point. The per-object rows add `xy_error_m` and
+      `bottom_z_error_m`.
+    * ProcTHOR house positions are centres (`house_object_origin: centre`), compared with the
+      box centre, with `centre_z_error_m`.
   * **Labels** (`rpl_labels.py`, synonyms in the layout's `labels`). Both names are normalised:
     * keep the part before `|`;
     * split camelCase, lower-case;

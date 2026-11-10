@@ -108,6 +108,7 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
     assert ep.worktop_z == pytest.approx(1.10001) and ep.floor_z == 0.0
     assert ep.placement == "worktop" and ep.scene == "ithor:1"
     objs = {o.label: o for o in ep.truth_objects(LAYOUT)}
+    assert {o.origin for o in objs.values()} == {"base"}  # MuJoCo body origins
     assert objs["apple"].support_z == pytest.approx(1.10001) and objs["box"].support_z is None
     assert epi.dump_layout(arm.root, LAYOUT)["truth"]["meta"]["hello"] == [
         "engine", "floor_z", "rtf", "scene", "starting", "worktop"]
