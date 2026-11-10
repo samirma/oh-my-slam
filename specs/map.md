@@ -102,6 +102,7 @@ becomes a job with a `job_id`. A job goes through these states:
   max_rejected_share}` is evaluated on the registration phase's report, before anything is
   committed.
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
+  * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
     that would make the map inconsistent, for example a frame set that registers to nothing.
 
