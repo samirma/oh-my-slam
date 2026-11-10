@@ -29,7 +29,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
-from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.constants import RETRIEVAL_TOP_K as RETRIEVAL_TOP_K
 from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX as UPDATE_EXHAUSTIVE_MAX
 from oh_my_slam.core.errors import DeviceMemoryError, RegistrationError
@@ -3002,33 +3001,31 @@ def integrate(ctx: UpdateContext, progress: Progress
 
 @dataclass
 class UpdateResult:
-    payload: bytes
     new_frames: list[str]
     rejected: list[str]
     seconds: float
     timings: dict[str, Any] = field(default_factory=dict)
     # of ``rejected``: those without a verified feature match to the map (``UpdateContext``)
     unmatched: list[str] = field(default_factory=list)
+    objects: int = 0  # the map's published objects after the update
 
 
 def update(map_dir: Path, inputs: list[Path], *, fps: float = ingest.DEFAULT_FPS,
-           mode: str = "full", fmt: str = "json", attrs: CloudAttrs | None = None,
            client: Any = None, progress: Progress = _progress,
            intrinsics: dict[Path, Intrinsics] | None = None) -> UpdateResult:
-    """``attrs``: point-cloud attributes of the ``fmt="ply"`` payload (map scope; default rgb).
+    """Map the images ``inputs`` (in order), or one video sampled at ``fps`` (an internal sequence
+    input: the service sends images), into the map ``map_dir`` (created when missing).
     ``intrinsics``: given intrinsics of input images, in place of their EXIF ones
     (``ingest.keyframes``)."""
     with timing.collect() as tm:
-        return _update(map_dir, inputs, fps, mode, fmt, attrs or CloudAttrs(), client, progress,
-                       tm, intrinsics)
+        return _update(map_dir, inputs, fps, client, progress, tm, intrinsics)
 
 
-def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
-            attrs: CloudAttrs, client: Any, progress: Progress, tm: timing.Timings,
-            intrinsics: dict[Path, Intrinsics] | None = None) -> UpdateResult:
+def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress: Progress,
+            tm: timing.Timings, intrinsics: dict[Path, Intrinsics] | None = None
+            ) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
-    from oh_my_slam.mapping import export
     from oh_my_slam.reconstruction.api import connect_server as connect
 
     stage = timing.stage
@@ -3093,21 +3090,16 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, mode: str, fmt: str,
                 "objects": objs.summary,
             }
             meta.setdefault("updates", []).append(record)
-            with stage(timing.Stage.EXPORT):
-                scene_full = export.full_scene(tx.root, meta, records, objs.exported())
-                if fmt == "ply":
-                    payload = export.ply_payload(geo, mode, records, objs, attrs)
-                else:
-                    payload = export.scene_payload(scene_full, mode, new_names, records, objs)
             # timings up to the commit (map.json is written by the commit itself)
             record["timings"] = _jsonable(tm.to_dict())
             with stage(timing.Stage.COMMIT):
                 tx.commit(meta)
             elapsed = time.perf_counter() - t_start
+            published = len(objs.exported())
             progress(f"committed update {update_id}: {len(new_names)} keyframes added, "
-                     f"{len(objs.exported())} objects, {elapsed:.0f} s")
-            return UpdateResult(payload, new_names, ctx.rejected, elapsed, tm.to_dict(),
-                                sorted(set(ctx.rejected) & ctx.unmatched))
+                     f"{published} objects, {elapsed:.0f} s")
+            return UpdateResult(new_names, ctx.rejected, elapsed, tm.to_dict(),
+                                sorted(set(ctx.rejected) & ctx.unmatched), published)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

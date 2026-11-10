@@ -21,16 +21,9 @@ cover this process only: the evaluator adds child processes (COLMAP) and the inf
 sampling them from outside during each stage's time windows (``t0_unix`` + ``stage_windows``,
 wall-clock seconds).
 
-Outside :func:`collect` every call is a no-op. ``mapper.sh update``, ``reconstruct.sh`` and
-``segment.sh`` log a one-line summary on stderr and, when ``OH_MY_SLAM_TIMINGS=<path>`` is set,
-write the full record there as JSON.
-
-The web service (spec §2.6) runs each request's command as a subprocess with
-``OH_MY_SLAM_TIMINGS`` set and answers with its stages in a ``Server-Timing`` header, so the
-collector here is per process and needs no isolation between requests.
-
-Stage names are the members of :class:`Stage`; ``oh_my_slam.commands.spec`` lists the stages of each
-command.
+Outside :func:`collect` every call is a no-op. The service's mapper process returns the record
+of its update, whose stages split a job's time into registration and fusion
+(``service.timings``). Stage names are the members of :class:`Stage`.
 """
 
 from __future__ import annotations
@@ -51,8 +44,7 @@ MEMORY_SAMPLE_S = 0.05  # resident-set sampling period while a collection is ope
 
 
 class Stage(StrEnum):
-    """Every timing stage name a command records (``tests/unit/test_commands.py`` checks that
-    each ``stage("…")`` in the package is one of them)."""
+    """Every timing stage name the pipeline records."""
 
     CONNECT = "connect"
     SETUP = "setup"

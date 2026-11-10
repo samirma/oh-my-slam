@@ -1,31 +1,21 @@
-"""Defaults and input types the commands' option definitions (``oh_my_slam.commands``) share with
-the code that applies them. No imports, so reading the definitions (``-h``, the web service's
-API description) loads nothing heavy."""
+"""Defaults and input types shared across the package. No imports, so reading them loads
+nothing heavy."""
 
 from __future__ import annotations
 
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
-DEFAULT_FPS = 2.0  # mapper.sh update -fps: video frames sampled per second (spec §2.3)
-DEFAULT_MIN_SCORE = 0.5  # segment.sh --min-score: detection confidence threshold (spec §2.4)
-DEFAULT_DATA = "~/oh-my-slam-data"  # server.sh --data: the workspace of maps and uploads (§2.6)
-# server.sh --port 0, its default (§2.6): this port if it is free, otherwise one the OS picks
-SERVICE_PORT = 9091
+# frames sampled per second of a video (the mapper's internal sequence input; the service sends
+# images only)
+DEFAULT_FPS = 2.0
+DEFAULT_MIN_SCORE = 0.5  # detection confidence threshold
+SERVICE_PORT = 9091  # server.sh --port (specs/api.md §1)
 
-# The inference server's entry point (spec §2.1, ``commands.entry_points``) and the command that
-# starts it as the user types it at the root of the checkout (``CHECKOUT``), which the errors of
-# the commands that need it, the web service's health and the agent skill name.
-CHECKOUT = "./"
-INFERENCE_SERVER_PROG = "start_inference_server.sh"
-START_INFERENCE_SERVER = CHECKOUT + INFERENCE_SERVER_PROG
-RESTART_INFERENCE_SERVER = f"{START_INFERENCE_SERVER} --stop && {START_INFERENCE_SERVER}"
-
-# reconstruct.sh -f depth (spec §2.2): a 16-bit PNG whose pixel value is the metric depth along the
-# optical axis times DEPTH_UNITS_PER_METRE (1/256 m ≈ 3.9 mm steps, up to 255.996 m), NO_DEPTH
-# where the model gives no valid depth
-DEPTH_UNITS_PER_METRE = 256
-NO_DEPTH = 0
+# server.sh starts and stops the inference server (specs/inference.md); the errors of the code
+# that needs it name the command that restarts both
+START_INFERENCE_SERVER = "./server.sh"
+RESTART_INFERENCE_SERVER = "./server.sh --stop && ./server.sh"
 
 # The reconstruction's working resolution (spec §2.2): the long side, in pixels, of the depth
 # grid an image is reconstructed on, whose pixels the pixel-level point-cloud attributes count

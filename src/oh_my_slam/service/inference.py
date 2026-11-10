@@ -1,19 +1,21 @@
 """The inference server as the service sees it (inference.md): its state for ``/api/health``,
-started with the service when it is not running, and stopped by ``server.sh --stop`` when the
-service started it. The service talks to it only through its client and its command line
-(``start_inference_server`` in ``oh_my_slam.cli.server``)."""
+started with the service when it is not running (``python -m oh_my_slam.server.main``, its log
+``core.paths.server_log()``), and stopped by ``server.sh --stop`` when the service started it.
+The service talks to it through its client and its lock (``server.lifecycle``) only."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 from oh_my_slam.client.client import InferenceClient
+from oh_my_slam.core import paths
 from oh_my_slam.core.errors import ServerUnavailableError
 from oh_my_slam.server.lifecycle import ServerLock
 from oh_my_slam.service.errors import ApiError
@@ -24,11 +26,14 @@ STATES = {"ready": "ready", "degraded": "degraded", "loading": "starting", "erro
           "stopping": "down"}
 
 
+STOP_TIMEOUT_S = 12.0
+
+
 def inference_cmd() -> list[str]:
     """The inference server's command line; ``OH_MY_SLAM_INFERENCE_CMD`` replaces it (the
     tests, which never start the real server)."""
     env = os.environ.get("OH_MY_SLAM_INFERENCE_CMD")
-    return shlex.split(env) if env else [sys.executable, "-m", "oh_my_slam.cli.server"]
+    return shlex.split(env) if env else [sys.executable, "-m", "oh_my_slam.server.main"]
 
 
 def inference_ready() -> None:
@@ -45,8 +50,7 @@ def inference_ready() -> None:
 
 
 class Inference:
-    def __init__(self, log: Path) -> None:
-        self.log = log
+    def __init__(self) -> None:
         self.launcher: subprocess.Popen[bytes] | None = None
         self.launched_at: float | None = None
 
@@ -64,7 +68,7 @@ class Inference:
             pass
         if ServerLock.is_held():
             return  # its process holds the lock and loads its models
-        with self.log.open("ab") as out:
+        with paths.server_log().open("ab") as out:
             self.launcher = subprocess.Popen(inference_cmd(), stdin=subprocess.DEVNULL, stdout=out,
                                              stderr=out, start_new_session=True)
         self.launched_at = time.time()
@@ -94,8 +98,24 @@ class Inference:
                 "error": error}
 
 
-def stop_inference(log: Path) -> int:
-    """Stop the inference server (its command line's ``--stop``)."""
-    with log.open("ab") as out:
-        return subprocess.run([*inference_cmd(), "--stop"], stdin=subprocess.DEVNULL, stdout=out,
-                              stderr=out).returncode
+def stop_inference() -> str:
+    """Stop the inference server: SIGTERM to the process that holds its lock (its pid is in the
+    lock file), SIGKILL after ``STOP_TIMEOUT_S``. Returns what happened."""
+    if not ServerLock.is_held():
+        paths.socket_path().unlink(missing_ok=True)
+        paths.state_file().unlink(missing_ok=True)
+        return "the inference server was not running"
+    try:
+        pid = int(paths.lock_file().read_text().strip())
+    except (OSError, ValueError):
+        return f"a process holds {paths.lock_file()} without its pid; not stopping it"
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_TIMEOUT_S
+    while ServerLock.is_held() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if ServerLock.is_held():
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        return f"stopped the inference server (pid {pid}, killed)"
+    return f"stopped the inference server (pid {pid})"

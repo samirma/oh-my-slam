@@ -34,7 +34,6 @@ inference server is never needed. ``-f png`` draws the map from above with the r
 
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 from collections.abc import Callable, Sequence
@@ -47,11 +46,10 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
 from oh_my_slam.core.atomic import clone_file
-from oh_my_slam.core.cloud_attrs import CloudAttrs
 from oh_my_slam.core.errors import InputError, NotAMapError, UsageError
 from oh_my_slam.core.geometry import project, unproject_pixels
-from oh_my_slam.core.images import IMAGE_SUFFIXES, VIDEO_SUFFIXES, exif_intrinsics, upright_size
-from oh_my_slam.core.log import get_logger, json_payload_bytes
+from oh_my_slam.core.images import IMAGE_SUFFIXES, exif_intrinsics, upright_size
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.timing import Stage
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.mapping import retrieval, store
@@ -68,16 +66,6 @@ from oh_my_slam.mapping.sfm import (
 log = get_logger("oh_my_slam.locate")
 
 QUERY_PREFIX = "locate_"  # query image names in the scratch database: never fNNNNNN.jpg
-LOCATED_CS = "located_"  # coordinate system / stream / PLY comment of input image k: located_<k>
-LAST_KNOWN = "last_known"  # coordinate system / stream / PLY comment of the last known camera
-# PLY -t single: map points visible from a located camera — in its frustum, beyond VIS_NEAR, and
-# at most VIS_REL_TOL behind the nearest point around their cell (3 x 3 cells, which closes the gaps
-# between the points of a near surface) of a coarse z-buffer, VIS_GRID_SIDE cells on the long side:
-# the query has no depth of its own
-VIS_GRID_SIDE = 96
-VIS_REL_TOL = 0.05
-VIS_NEAR = 0.05
-VIS_CHUNK = 1 << 20
 # Epipolar gate of a camera that sees the map from the keyframes' spot (_viewpoint: most
 # matches with multi-view keyframes, or a baseline below ROTATION_BASELINE of the scene depth):
 # a pose above MAX_EPIPOLAR_DEG is refined against the keyframe poses (IRLS Cauchy on the
@@ -120,36 +108,11 @@ class Located:
     def located(self) -> bool:
         return self.T_map_cam is not None
 
-    @property
-    def key(self) -> str:
-        return f"{LOCATED_CS}{self.index}"
-
-
-@dataclass(frozen=True)
-class ResultCamera:
-    """A camera of the result (mapper.md "the cameras"): a located image's (``located_<k>``) or
-    the map's last known camera (``last_known``); ``frame`` its key in the JSON result,
-    ``properties`` what its frame says besides its stream and transform."""
-
-    key: str
-    frame: int
-    T_map_cam: Pose
-    K: Intrinsics
-    uri: str
-    description: str
-    properties: dict[str, Any]
-
-    @property
-    def kind(self) -> str:
-        return "last_known" if self.key == LAST_KNOWN else "located"
-
 
 @dataclass
 class LocateResult:
-    payload: bytes
-    results: list[Located]  # one per input image (none without -i)
+    results: list[Located]  # one per input image
     timings: dict[str, Any] = field(default_factory=dict)
-    cameras: list[ResultCamera] = field(default_factory=list)  # the result's
 
 
 # ------------------------------------------------------------------------------------------------
@@ -157,13 +120,11 @@ class LocateResult:
 
 
 def resolve_images(inputs: Sequence[Path]) -> list[Path]:
-    """``-i`` of ``locate``: image files only; a video is refused (usage error)."""
+    """The images to locate: image files only."""
     if not inputs:
-        raise UsageError("-i needs at least one image")
+        raise UsageError("locate needs at least one image")
     out = []
     for p in map(Path, inputs):
-        if p.suffix.lower() in VIDEO_SUFFIXES:
-            raise UsageError(f"locate takes images, not a video: {p}")
         if not p.exists():
             raise InputError(f"input not found: {p}")
         if not p.is_file() or p.suffix.lower() not in IMAGE_SUFFIXES:
@@ -183,16 +144,6 @@ def open_map(map_dir: Path) -> store.MapReader:
     except NotAMapError:
         raise InputError(f"no map in {map_dir} ({state} folder): locate needs an existing map — "
                          "build one with mapper.sh update") from None
-
-
-def check_output(map_dir: Path, output: Path | None) -> None:
-    """``-o`` must not point into the map folder: the map is read-only for ``locate``."""
-    if output is None:
-        return
-    root = Path(map_dir).resolve()
-    if Path(output).resolve().is_relative_to(root):
-        raise UsageError(f"-o {output} is inside the map folder, which locate never writes; "
-                         "choose a file outside it")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -878,203 +829,6 @@ def refine_to_keyframes(T: Pose, K: Intrinsics, matches: list[_Match],
 # results
 
 
-def first_located_key(reader: store.MapReader) -> int:
-    """Frame key of input image 0: past every keyframe index the map has used."""
-    return max([int(reader.meta.get("next_frame_index", 0))] +
-               [fr.index + 1 for fr in reader.frames])
-
-
-def located_cameras(reader: store.MapReader, results: Sequence[Located]) -> list[ResultCamera]:
-    """The cameras of the located images (the others are not in the result): image ``k`` (its
-    position in ``-i``) is ``located_<k>``, its frame keyed past every keyframe index the map
-    has used (``first_located_key + k``), marked ``located``, with its image and inliers."""
-    base = first_located_key(reader)
-    return [ResultCamera(r.key, base + r.index, r.T_map_cam, r.K, str(r.image),
-                         f"located {r.image}",
-                         {"located": True, "image": str(r.image), "inliers": r.inliers})
-            for r in results if r.T_map_cam is not None and r.K is not None]
-
-
-def last_known(reader: store.MapReader) -> store.FrameRecord:
-    """The keyframe added last, in the order of addition (mapper.md): of the latest update, the
-    latest in input order (keyframe indices follow it). A map without keyframes has none: an
-    input error."""
-    if not reader.frames:
-        raise InputError(f"the map {reader.root} has no keyframe, so no last known camera; "
-                         "add images to it with mapper.sh update")
-    return max(reader.frames, key=lambda fr: (fr.update_id, fr.index))
-
-
-def last_known_camera(reader: store.MapReader) -> ResultCamera:
-    """The map's last known camera (``last_known``): the pose and intrinsics of the keyframe
-    added last, its frame keyed past every keyframe index (``first_located_key``), marked
-    ``last_known`` and naming that keyframe, its image in the map and the input it came from."""
-    fr = last_known(reader)
-    return ResultCamera(LAST_KNOWN, first_located_key(reader), fr.T_map_cam, fr.K, fr.image,
-                        f"last known camera: keyframe {fr.name}",
-                        {"last_known": True, "keyframe": fr.name, "image": fr.image,
-                         "source": fr.source, "update_id": fr.update_id})
-
-
-def camera_blocks(cameras: Sequence[ResultCamera]
-                  ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """(coordinate systems, streams, frames) of the result's cameras: each its own sensor
-    coordinate system and camera stream (its key) and frame (``ResultCamera.frame``), with the
-    ``<key>_to_map`` transform."""
-    from oh_my_slam.schema import openlabel as ol
-
-    css, streams, frames = {}, {}, {}
-    for c in cameras:
-        css[c.key] = ol.sensor_cs("map")
-        streams[c.key] = ol.camera_stream(c.K, uri=c.uri, description=c.description)
-        frames[str(c.frame)] = ol.frame(
-            timestamp=float(c.frame), stream_uris={c.key: c.uri},
-            transforms={f"{c.key}_to_map": ol.transform(c.key, "map", c.T_map_cam)},
-            **c.properties)
-    return css, streams, frames
-
-
-def scene_json(reader: store.MapReader, cameras: Sequence[ResultCamera], mode: str) -> bytes:
-    """``-t single``: the result's cameras only; ``-t full``: the map's scene (``export.
-    scene_bytes``, as ``update -t full`` returns it) plus them."""
-    from oh_my_slam.mapping import export
-    from oh_my_slam.schema import openlabel as ol
-
-    css, streams, frames = camera_blocks(cameras)
-    if mode == "single":
-        md = ol.metadata(reader.root.name, tagged_file=str(reader.root), tool="mapper",
-                         map_frame=reader.meta.get("map_frame"), scope="single")
-        return json_payload_bytes(ol.document(md, {}, coordinate_systems={
-            "map": ol.map_cs(list(css)), **css}, streams=streams, frames=frames))
-    doc = json.loads(export.scene_bytes(reader))
-    root = doc["openlabel"]
-    root["coordinate_systems"]["map"]["children"] += list(css)
-    root["coordinate_systems"].update(css)
-    root.setdefault("streams", {}).update(streams)
-    root.setdefault("frames", {}).update(frames)
-    root["frame_intervals"] = ol.frame_intervals([int(k) for k in root["frames"]])
-    # keep the key order of a scene document (objects last)
-    root["objects"] = root.pop("objects")
-    return json_payload_bytes(doc)
-
-
-def camera_record(properties: dict[str, Any], T_map_cam: Pose, K: Intrinsics) -> dict[str, Any]:
-    """A camera as the PLY header and the bird's-eye image's metadata give it, in the JSON
-    result's representation: its frame's properties (``located``, ``image``, …), the
-    camera-to-map ``transform_src_to_dst`` of its ``<key>_to_map`` transform and its stream's
-    ``stream_properties`` (intrinsics)."""
-    from oh_my_slam.schema import openlabel as ol
-
-    return {**properties, "transform_src_to_dst": ol.transform_data(T_map_cam),
-            "stream_properties": ol.camera_stream(K)["stream_properties"]}
-
-
-def pose_comment(c: ResultCamera) -> str:
-    """The PLY header line of one of the result's cameras: ``<key> {json}`` (``camera_record``)."""
-    d = camera_record(c.properties, c.T_map_cam, c.K)
-    return f"{c.key} {json.dumps(d, separators=(',', ':'), ensure_ascii=True)}"
-
-
-def visible_points(xyz: NDArray[Any], cams: Sequence[tuple[Pose, Intrinsics]]) -> NDArray[np.bool_]:
-    """Points seen by any of the cameras (``T_map_cam``, full-resolution intrinsics): in the
-    frustum and not hidden behind nearer points (coarse z-buffer, ``VIS_*``). A lens with
-    distortion is judged on its undistorted image (``Intrinsics.pinhole``, which holds the whole
-    lens): a point is in view where the lens shows it inside the image."""
-    xyz = np.asarray(xyz).reshape(-1, 3)
-    keep = np.zeros(len(xyz), bool)
-    for T, K in cams:
-        s = VIS_GRID_SIDE / max(K.width, K.height)
-        gw, gh = max(1, int(np.ceil(K.width * s))), max(1, int(np.ceil(K.height * s)))
-
-        def cells(sl: slice, T: Pose = T, K: Intrinsics = K, s: float = s, gw: int = gw,
-                  gh: int = gh) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
-            pin = K.pinhole()
-            uv, z = project((np.asarray(xyz[sl], np.float64) - T.t) @ T.R, pin.K())
-            u, v = uv[:, 0], uv[:, 1]
-            img = K.image_pixels(np.nan_to_num(uv))  # where the lens shows them (itself: none)
-            with np.errstate(invalid="ignore"):
-                inside = ((z > VIS_NEAR) & (u >= 0) & (u < K.width) & (v >= 0) & (v < K.height)
-                          & (img[:, 0] >= 0) & (img[:, 0] < K.width) & (img[:, 1] >= 0)
-                          & (img[:, 1] < K.height))
-            cell = np.full(len(z), -1, np.int64)
-            cell[inside] = (np.minimum((v[inside] * s).astype(np.int64), gh - 1) * gw
-                            + np.minimum((u[inside] * s).astype(np.int64), gw - 1))
-            return cell, z
-
-        zmin = np.full(gw * gh, np.inf)
-        chunks = [slice(i, i + VIS_CHUNK) for i in range(0, len(xyz), VIS_CHUNK)]
-        for sl in chunks:
-            cell, z = cells(sl)
-            ok = cell >= 0
-            np.minimum.at(zmin, cell[ok], z[ok])
-        zmin = _min3x3(zmin.reshape(gh, gw)).reshape(-1)
-        for sl in chunks:
-            cell, z = cells(sl)
-            ok = cell >= 0
-            vis = np.zeros(len(z), bool)
-            vis[ok] = z[ok] <= zmin[cell[ok]] * (1.0 + VIS_REL_TOL)
-            keep[sl] |= vis
-    return keep
-
-
-def _min3x3(a: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Minimum over each cell's 3 x 3 neighbourhood."""
-    p = np.pad(a, 1, constant_values=np.inf)
-    h, w = a.shape
-    out = p[1:h + 1, 1:w + 1].copy()
-    for i in range(3):
-        for j in range(3):
-            np.minimum(out, p[i:i + h, j:j + w], out=out)
-    return out
-
-
-def ply_payload(reader: store.MapReader, cameras: Sequence[ResultCamera], mode: str,
-                attrs: CloudAttrs) -> bytes:
-    """``-f ply``: the map points visible from the result's cameras (single) or the whole map
-    cloud (full), with one header line per camera (``pose_comment``)."""
-    from oh_my_slam.mapping import export
-    from oh_my_slam.reconstruction.cloud import cloud_ply
-
-    _, objs = export.map_objects(reader)
-    cloud = export.map_cloud(reader)
-    if mode == "single":
-        cams = [(c.T_map_cam, c.K) for c in cameras]
-        cloud = cloud.subset(np.flatnonzero(visible_points(cloud.xyz, cams)))
-    return cloud_ply(export.map_source(cloud, objs, reader.frames), attrs,
-                     extra_comments=[pose_comment(c) for c in cameras])
-
-
-def png_payload(reader: store.MapReader, cameras: Sequence[ResultCamera], mode: str,
-                layers: Sequence[str]) -> bytes:
-    """``-f png``: the bird's-eye image of the whole map with ``layers`` under the result's
-    cameras — a located one tagged with the number of its image among the inputs (``located_<k>``:
-    ``k + 1``) — and, for ``-t full``, every keyframe's camera (keyed by its name, its frame's
-    ``keyframe`` property in the JSON result)."""
-    from oh_my_slam.mapping import birdseye
-
-    def tag(c: ResultCamera) -> str:
-        return str(int(c.key.removeprefix(LOCATED_CS)) + 1) if c.kind == "located" else ""
-
-    drawn = [birdseye.Camera(c.key, c.kind, c.T_map_cam,
-                             camera_record(c.properties, c.T_map_cam, c.K), tag(c))
-             for c in cameras]
-    if mode == "full":
-        drawn = [birdseye.Camera(fr.name, "keyframe", fr.T_map_cam, camera_record(
-            {"keyframe": fr.name, "frame": fr.index, "image": fr.image, "source": fr.source},
-            fr.T_map_cam, fr.K)) for fr in sorted(reader.frames, key=lambda r: r.index)] + drawn
-    return birdseye.birdseye_png(reader, drawn, layers)
-
-
-def payload(reader: store.MapReader, cameras: Sequence[ResultCamera], mode: str, fmt: str,
-            attrs: CloudAttrs, layers: Sequence[str]) -> bytes:
-    """The result of ``-f fmt`` (json, ply or png) for the result's ``cameras``."""
-    if fmt == "ply":
-        return ply_payload(reader, cameras, mode, attrs)
-    if fmt == "png":
-        return png_payload(reader, cameras, mode, layers)
-    return scene_json(reader, cameras, mode)
-
-
 # ------------------------------------------------------------------------------------------------
 # entry point
 
@@ -1094,35 +848,24 @@ def map_identity(root: Path) -> tuple[bytes, bytes | None]:
     return read(root / store.MAP_JSON) or b"", read(root / store.STAGING / store.COMMIT)
 
 
-FORMATS = ("json", "ply", "png")
-
-
-def locate(reader: store.MapReader, images: Sequence[Path], *, mode: str = "single",
-           fmt: str = "json", attrs: CloudAttrs | None = None,
-           layers: Sequence[str] = ("cloud", "obb"), client: Any = None,
+def locate(reader: store.MapReader, images: Sequence[Path], *, client: Any = None,
            progress: Progress = _progress) -> LocateResult:
     """Camera pose of each of ``images`` (``resolve_images``) in the map ``reader`` reads
-    (``open_map``), or with no image the map's last known camera; the map is never modified.
-    ``layers``: what a bird's-eye image (``fmt`` "png") draws under the cameras. ``client``: the
-    inference client, needed only for retrieval on a map of more than ``UPDATE_EXHAUSTIVE_MAX``
-    keyframes (connected on demand).
+    (``open_map``); the map is never modified. ``client``: the inference client, needed only for
+    retrieval on a map of more than ``UPDATE_EXHAUSTIVE_MAX`` keyframes (connected on demand).
 
-    Every result comes from one state of the map: when a concurrent ``mapper.sh update`` commits
-    while it runs (``map_identity`` changed, or a file it read vanished), the map is opened again
-    and the images located again, at most ``MAX_ATTEMPTS`` times."""
-    if mode not in ("single", "full") or fmt not in FORMATS:
-        raise UsageError(f"locate: unknown mode {mode!r} or format {fmt!r}")
+    Every result comes from one state of the map: when an update commits while it runs
+    (``map_identity`` changed, or a file it read vanished), the map is opened again and the
+    images located again, at most ``MAX_ATTEMPTS`` times. Nothing located is a result too."""
     with timing.collect() as tm:
-        out, results, cameras = _locate(reader, list(images), mode, fmt, attrs or CloudAttrs(),
-                                        tuple(layers), client, progress)
-        return LocateResult(out, results, tm.to_dict(), cameras)
+        results = _locate(reader, list(images), client, progress)
+        return LocateResult(results, tm.to_dict())
 
 
-def _locate(reader: store.MapReader, images: list[Path], mode: str, fmt: str, attrs: CloudAttrs,
-            layers: tuple[str, ...], client: Any, progress: Progress
-            ) -> tuple[bytes, list[Located], list[ResultCamera]]:
-    """``_locate_once`` until one attempt saw a single state of the map; only that attempt's
-    results are reported (its unlocated images, or the failure when none is located)."""
+def _locate(reader: store.MapReader, images: list[Path], client: Any, progress: Progress
+            ) -> list[Located]:
+    """``_register`` until one attempt saw a single state of the map; only that attempt's
+    results are reported."""
     root = reader.root
     for attempt in range(MAX_ATTEMPTS):
         timing.count(attempts=attempt + 1)
@@ -1131,28 +874,19 @@ def _locate(reader: store.MapReader, images: list[Path], mode: str, fmt: str, at
             progress("the map changed during locate (a concurrent update); starting again")
             reader = open_map(root)
         try:
-            out, results, cameras = _locate_once(reader, images, mode, fmt, attrs, layers,
-                                                 client, progress)
+            results = _register(reader, images, client, progress)
         except FileNotFoundError:
             if map_identity(root) == ident:
                 raise
             continue
         if map_identity(root) != ident:
             continue
-        for r in results:
-            if not r.located:
-                log.warning("%s: not located — %s; take it closer to where the map's images "
-                            "were taken, of the same surroundings", r.image, r.reason)
         n = sum(r.located for r in results)
         timing.count(images=len(results), located=n, map_frames=len(reader.frames))
-        if out is None:
-            raise InputError("none of the images could be located in the map (not enough "
-                             "overlap with it); the map is unchanged")
-        progress(f"located {n} of {len(results)} images" if images else
-                 f"the map's last known camera: keyframe {cameras[0].properties['keyframe']}")
-        return out, results, cameras
-    raise InputError(f"the map {root} kept changing during locate (a concurrent mapper.sh "
-                     "update); retry once the update is done")
+        progress(f"located {n} of {len(results)} images")
+        return results
+    raise InputError(f"the map {root} kept changing during locate (a concurrent update); retry "
+                     "once the update is done")
 
 
 def _stale(reader: store.MapReader) -> bool:
@@ -1161,19 +895,6 @@ def _stale(reader: store.MapReader) -> bool:
         return bool(reader.read_json(store.MAP_JSON) != reader.meta)
     except FileNotFoundError:
         return True
-
-
-def _locate_once(reader: store.MapReader, images: list[Path], mode: str, fmt: str,
-                 attrs: CloudAttrs, layers: tuple[str, ...], client: Any, progress: Progress
-                 ) -> tuple[bytes | None, list[Located], list[ResultCamera]]:
-    """(payload, or None when no image is located; the result of each image; the result's
-    cameras) in the map state ``reader`` read. Without images: the last known camera."""
-    results = _register(reader, images, client, progress) if images else []
-    if images and not any(r.located for r in results):
-        return None, results, []
-    cameras = located_cameras(reader, results) if images else [last_known_camera(reader)]
-    with timing.stage(Stage.EXPORT):
-        return payload(reader, cameras, mode, fmt, attrs, layers), results, cameras
 
 
 def _register(reader: store.MapReader, images: list[Path], client: Any, progress: Progress

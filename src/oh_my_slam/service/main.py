@@ -38,7 +38,7 @@ PROG = "server.sh"
 DEFAULT_DATA = Path("~/oh-my-slam-data")
 DEFAULT_KEEP_VERSIONS = 20
 STOP_TIMEOUT_S = 60.0
-LOCK, STATE, LOG, INFERENCE_LOG = "service.lock", "service.json", "service.log", "inference.log"
+LOCK, STATE, LOG = "service.lock", "service.json", "service.log"
 
 
 def _say(msg: str) -> None:
@@ -114,8 +114,7 @@ def stop(store: Store) -> int:
             os.kill(pid, signal.SIGKILL)
     _say(f"stopped (pid {pid})")
     if state and state.get("started_inference"):
-        stop_inference(store.root / INFERENCE_LOG)
-        _say("stopped the inference server it started")
+        _say(stop_inference())
     return 0
 
 
@@ -169,7 +168,7 @@ def serve(store: Store, host: str, port: int) -> int:
         timings = Timings(store.root / "timings.json")
         jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
         jobs.load()
-        inference = Inference(store.root / INFERENCE_LOG)
+        inference = Inference()
         inference.ensure_started()
         service = Service(store, jobs, inference, backend.require_inference, timings=timings,
                           version=git_version())

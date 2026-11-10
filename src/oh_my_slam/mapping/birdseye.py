@@ -308,17 +308,13 @@ def _draw_camera(draw: Any, grid: Grid, cam: Camera) -> None:
     draw.polygon([tuple(p) for p in shape], fill=CAMERA_FILL, outline=CAMERA_EDGE)
 
 
-def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera],
-                 layers: Sequence[str] = LAYERS) -> bytes:
-    """The bird's-eye image of the map ``reader`` reads with ``cameras`` (the result's, and for
-    ``-t full`` every keyframe's), drawing ``layers`` (``LAYERS``) under them."""
+def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera]) -> bytes:
+    """The bird's-eye image of the map ``reader`` reads: its cloud and objects under
+    ``cameras``."""
     from PIL import Image, ImageDraw
 
     from oh_my_slam.reconstruction.cloud import derive_cloud
 
-    unknown = sorted(set(layers) - set(LAYERS))
-    if unknown or not layers:
-        raise ValueError(f"bird's-eye layers must be some of {LAYERS}, got {list(layers)}")
     _, objects = export.map_objects(reader)
     cloud = derive_cloud(export.map_source(export.map_cloud(reader), objects, reader.frames),
                          CloudAttrs(color="rgb"))
@@ -330,16 +326,15 @@ def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera],
     cut = ceiling_cut(xyz, float(centres[:, 2].max()) if len(centres) else None)
     img = np.empty((grid.height, grid.width, 3), np.uint8)
     img[:] = BACKGROUND
-    if "cloud" in layers and len(xyz):
+    if len(xyz):
         keep = slice(None) if cut is None else xyz[:, 2] < cut
         pix, rgb = highest_rgb(grid, xyz[keep], np.asarray(cloud.rgb)[keep])
         img.reshape(-1, 3)[pix] = rgb
     canvas = Image.fromarray(img)
     draw = ImageDraw.Draw(canvas)
     draw.fontmode = "1"  # no anti-aliasing: every pixel drawn is exactly its colour
-    if "obb" in layers:
-        _draw_objects(draw, grid, objects)
-    order = {"keyframe": 0, "last_known": 1, "located": 2}
+    _draw_objects(draw, grid, objects)
+    order = {"keyframe": 0, "located": 1}
     ordered = sorted(cameras, key=lambda c: order[c.kind])
     for cam in ordered:
         _draw_camera(draw, grid, cam)
@@ -347,15 +342,14 @@ def birdseye_png(reader: store.MapReader, cameras: Sequence[Camera],
     for cam in ordered:  # over every marker, each where no other tag is
         if cam.tag:
             _draw_tag(draw, grid, cam, taken)
-    drawn = ",".join(k for k in LAYERS if k in layers)
+    drawn = ",".join(LAYERS)
     kinds = {c.kind for c in cameras}
-    legend = [{"mark": k, **MARKS[k]} for k in MARKS if k in layers or k in kinds]
+    legend = [{"mark": k, **MARKS[k]} for k in MARKS if k in LAYERS or k in kinds]
     text = {
         "Description": description(reader.root.name, grid.s, drawn),
         "pixel_to_map": _compact(grid.pixel_to_map()),
         "map_to_pixel": _compact(grid.map_to_pixel()),
         "metres_per_pixel": _compact(grid.s),
-        "layers": drawn,
         "ceiling_cut_z": _compact(None if cut is None else round(cut, 6)),
         "cameras": _compact({c.key: c.record for c in cameras}),
         "map": str(reader.root),

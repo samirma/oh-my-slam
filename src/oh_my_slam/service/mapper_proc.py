@@ -4,7 +4,7 @@
 
 ``args.json`` names the mapper map, the input images in request order and their intrinsics. It
 runs ``mapping.api.update`` and writes the result JSON the args name: the inputs the mapper did
-not register and the object count, or the error. Its exit code is the mapper's
+not register, the object count and the stage timings, or the error. Its exit code is the mapper's
 (``core.errors.ExitCode``)."""
 
 from __future__ import annotations
@@ -42,10 +42,9 @@ def run(args: dict[str, Any]) -> int:
                                           "out_of_memory": isinstance(exc, DeviceMemoryError)}})
         return int(exc.exit_code)
     source = {frame_name(start + i): str(p) for i, p in enumerate(inputs)}
-    scene = json.loads(res.payload)
     atomic_write_json(out, {
         "rejected": [source.get(n, n) for n in res.rejected],
-        "objects": len(scene.get("openlabel", {}).get("objects", {})),
+        "objects": res.objects,
         "seconds": res.seconds,
         "stages": res.timings.get("stages_s", {}),
     })
