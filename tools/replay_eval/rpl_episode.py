@@ -36,6 +36,7 @@ from rpl_geometry import (
     inv_T,
     make_T,
     mat4,
+    mean_rotation,
     quat_to_R,
     rigid_fit,
     rot_z,
@@ -59,6 +60,7 @@ class Frame:
     height: int
     odom: tuple[float, float, float] | None = None  # views "base": [x, y, yaw rad]
     travel_m: float = 0.0  # odometry distance since the run's first frame
+    truth_t: float | None = None  # time of the matched truth sample
     intrinsics: dict[str, float] = field(default_factory=dict)
     camera_id: str = ""
     truth: Arr | None = None  # T_world_cam
@@ -177,6 +179,7 @@ class Episode:
     warnings: list[str]
     passed: bool | None = None  # from meta.json or verdict.md; None when neither says
     odom_scale: dict[str, float] = field(default_factory=dict)  # run -> truth / odometry
+    mount_rot_spread_deg: float | None = None  # median spread of the per-frame mount estimates
 
     def frames(self, event: Event) -> list[Frame]:
         fs = self.sets[event.set_key].frames
@@ -530,15 +533,35 @@ def assign_truth(ep: Episode, layout: dict[str, Any]) -> None:
                 last = f.odom
             f.travel_m = travel
         for f, (pos, t, src) in zip(frames, matched, strict=True):
-            R = (T_ws @ f.pose)[:3, :3]
-            if link and t is not None and link in ep.track.bodies[ep.track.index(t)]:
-                b = ep.track.bodies[ep.track.index(t)][link]
-                R = quat_to_R(need(b, layout["truth"]["quat"], f"bodies.{link}"),
-                              layout["truth"]["quat_order"]) @ R_LINK_OPT
-            f.truth = make_T(R, pos)
+            f.truth = make_T((T_ws @ f.pose)[:3, :3], pos)
             f.truth_source = src
+            f.truth_t = t
             if ep.kind in layout["floor_robots"]:
                 f.height_m = float(f.pose[2, 3])
+    if link:
+        orient(ep, link, layout)
+
+
+def orient(ep: Episode, link: str, layout: dict[str, Any]) -> None:
+    """Truth orientations from the link's quaternion at each frame's matched sample: through the
+    fixed link -> optical rotation, or, for ``mount_fit`` kinds, through the mount rotation
+    estimated from the frames themselves."""
+    keys = layout["truth"]
+    rows: list[tuple[Frame, Arr]] = []
+    for f in ep.all_frames():
+        if f.truth_t is None:
+            continue
+        bodies = ep.track.bodies[ep.track.index(f.truth_t)]
+        if link in bodies:
+            rows.append((f, quat_to_R(need(bodies[link], keys["quat"], f"bodies.{link}"),
+                                      keys["quat_order"])))
+    mount = R_LINK_OPT
+    if ep.kind in layout["mount_fit"] and rows:
+        believed = [R_link.T @ f.truth[:3, :3] for f, R_link in rows]  # type: ignore[index]
+        mount, ep.mount_rot_spread_deg = mean_rotation(believed)
+    for f, R_link in rows:
+        assert f.truth is not None
+        f.truth[:3, :3] = R_link @ mount
 
 
 def words_verdict(text: str, v: dict[str, Any]) -> bool | None:
@@ -681,6 +704,7 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
             "frames": len(ep.all_frames()),
             "truth_sources": sorted({f.truth_source for f in ep.all_frames()}),
             "views_vs_truth_m": _views_vs_truth(ep), "odometry_scale": ep.odom_scale,
+            "mount_rot_spread_deg": ep.mount_rot_spread_deg,
             "warnings": ep.warnings[:50]}
     return out
 

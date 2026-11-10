@@ -18,6 +18,8 @@ LOCAL = UTC  # the agents ran in Docker on UTC: file-name times are UTC
 ODOM_SCALE = 1.08  # the base's odometry over-counts distances
 MODEL_YAW = math.pi / 2  # the base body's own frame is turned against its heading
 ARM_LINE_OFFSET = (0.2, -0.1)  # the arm's robot-line pos is another body than its base link
+ARM_CAM_ERROR = np.array([0.003, -0.002, 0.001])  # simulator camera vs the arm's kinematics
+
 T0 = datetime(2026, 11, 9, 10, 0, 0, tzinfo=LOCAL).timestamp()
 # optical axes in a forward-looking body frame (x forward, y left, z up)
 R_BODY_OPT = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
@@ -32,6 +34,15 @@ DOOR_Y = (1.0, 1.9)  # door gap in the wall x = 4 (world)
 def rot_z(a: float) -> np.ndarray:
     c, s = math.cos(a), math.sin(a)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _rot_x(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+# the wrist camera's fixed mount: optical = gripper_end link rotated by this
+ARM_MOUNT = _rot_x(math.radians(15)) @ rot_z(math.radians(-100))
 
 
 def make_T(R: np.ndarray, t: Any) -> np.ndarray:
@@ -261,6 +272,8 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
                 views[file] = {"pose": odo.tolist(),
                                "base": [x * ODOM_SCALE, y * ODOM_SCALE, math.radians(yaw)]}
             T_wc = T_ws @ T_sc
+            if arm:  # the simulator's camera sits a few mm off the believed kinematics
+                T_wc[:3, 3] += ARM_CAM_ERROR
             name = f"{spec.run}/{spec.name}/{Path(file).stem}"
             syn.truth[name] = T_wc
             syn.names[key].append(name)
@@ -302,6 +315,8 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
                                                 "quat": quat_wxyz(base[:3, :3])}}
         if robot in LINK:
             bodies[LINK[robot]] = {"pos": cam.tolist(), "quat": quat_wxyz(R @ R_BODY_OPT.T)}
+        if arm:
+            bodies["gripper_end"] = {"pos": cam.tolist(), "quat": quat_wxyz(R @ ARM_MOUNT.T)}
         line: dict[str, Any] = {"kind": "robot", "t": float(t), "sim_time": float(t - T0),
                                 "pos": line_pos.tolist(), "quat": quat_wxyz(line_R),
                                 "cams": {CAM[robot]: cam.tolist(), "usb_cam": [0, 0, 0]},

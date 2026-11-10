@@ -67,10 +67,16 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
             synth.SetSpec("r1", "look", [(0.1, 0, 12)])]
     arm = synth.build(tmp_path, "e044", "rebot_b601_rs", sets=sets, scene="ithor:1",
                       objects_lines=True)
-    # the robot line's pos and quat belong to another body: the start pose is bodies.base_link
+    # the robot line's pos and quat belong to another body: the start pose is bodies.base_link;
+    # the truth is the simulator's camera (a few mm off the kinematics), oriented by gripper_end
+    # through the fixed mount rotation estimated from the frames
     ep = load(arm.root)
     assert np.allclose(ep.start_poses["r1"], arm.start["r1"], atol=1e-9)
     check_truth(ep, arm)
+    assert ep.mount_rot_spread_deg == pytest.approx(0.0, abs=1e-5)
+    vt = epi._views_vs_truth(ep)
+    assert vt["pos_m"] == pytest.approx(float(np.linalg.norm(synth.ARM_CAM_ERROR)))
+    assert vt["rot_deg"] == pytest.approx(0.0, abs=1e-4)
     # without base_link, the fallback refines the line's pose: shift search, then ICP
     truth = arm.root / "truth.jsonl"
     lines = [json.loads(x) for x in truth.read_text().splitlines() if x.strip()]
@@ -93,8 +99,10 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
     assert [e.op for e in ep.events] == ["update", "locate"]
     assert all(f.height_m is None for f in ep.all_frames())
     assert {f.truth_source for f in ep.all_frames()} == {"views position"}
-    check_truth(ep, arm)
-    assert np.allclose(ep.start_poses["r1"], arm.start["r1"], atol=1e-6)
+    for f in ep.all_frames():  # the fallback has no gripper_end: positions only
+        assert np.allclose(f.truth[:3, 3], arm.truth[f.name][:3, 3], atol=1e-6)
+    assert ep.mount_rot_spread_deg is None
+    assert np.allclose(ep.start_poses["r1"][:3, :3], arm.start["r1"][:3, :3], atol=1e-6)
     assert ep.odom_scale == {"r1": 1.0}
     assert ep.worktop_z == pytest.approx(1.1)
     objs = {o.label: o for o in ep.truth_objects(LAYOUT)}
@@ -164,6 +172,8 @@ def test_rotation_without_link(tmp_path: Path) -> None:
     syn = synth.build(tmp_path)
     lay = merge(LAYOUT, {"rotation_body": {"base": "no_such_link"}})
     check_truth(load(syn.root, lay), syn)  # the views rotation composed with the start pose
+    none = merge(LAYOUT, {"rotation_body": {"base": ""}})  # no link for the kind at all
+    check_truth(load(syn.root, none), syn)
 
 
 def test_camera_table_scaling_exif_and_errors(tmp_path: Path) -> None:

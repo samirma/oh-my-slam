@@ -150,10 +150,19 @@ key of `LAYOUT` in `rpl_layout.py`.
     warning.
   * **Position.** `cams.<camera>` at that time: `camera` (humanoid), or
     `camera_color_optical_frame` (base and arm).
-  * **Orientation.** From the link quaternion at that time: `head_tilt_link` (humanoid) or
-    `camera_link` (base). Links are x forward, y left, z up, so optical x = −link y, optical y =
-    −link z and optical z = link x. The arm, and any kind without a link (`rotation_body`), takes
-    the views rotation composed with the start pose.
+  * **Orientation.** From the link quaternion at the matched sample: `head_tilt_link`
+    (humanoid), `camera_link` (base) or `gripper_end` (arm).
+    * **Humanoid and base:** their links are x forward, y left, z up, so optical x = −link y,
+      optical y = −link z and optical z = link x.
+    * **Arm:** its wrist camera sits at a fixed, unknown mount rotation from `gripper_end`
+      (`mount_fit`). That rotation is estimated once per episode as the robust mean of
+      gripper_end⁻¹ · views rotation (through the `base_link` start pose), over all frames,
+      then applied to every sample. The dump reports the spread of the per-frame estimates as
+      `mount_rot_spread_deg`; it should be small. The arm's truth position is the simulator's
+      `cams.camera_color_optical_frame`, so `views_vs_truth_m` for the arm should be a few
+      millimetres, not exactly 0.
+    * A kind without a link (`rotation_body`), or a frame whose sample lacks it, keeps the views
+      rotation composed with the start pose.
   * **Check.** `--dump-layout` prints `views_vs_truth_m: {pos_m, rot_deg}`: the median
     difference between the views poses (via the start pose) and the truth poses. For the
     humanoid, it shows the odometry drift.

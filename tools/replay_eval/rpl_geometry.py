@@ -152,3 +152,22 @@ def rigid_fit(src: Arr, dst: Arr, R0: Arr | None = None, min_ratio: float = 1e-3
         S[2, 2] = -1.0
     R = U @ S @ Vt
     return make_T(R, mu_d - R @ mu_s)
+
+
+def project_rotation(M: Arr) -> Arr:
+    """The rotation nearest a 3x3 matrix (Frobenius)."""
+    U, _, Vt = np.linalg.svd(M)
+    S = np.eye(3)
+    if np.linalg.det(U @ Vt) < 0:
+        S[2, 2] = -1.0
+    return np.asarray(U @ S @ Vt, dtype=np.float64)
+
+
+def mean_rotation(Rs: list[Arr]) -> tuple[Arr, float]:
+    """A robust mean of rotations (chordal mean, refitted without those farther than
+    max(3 x the median angle, 1 deg)) and the median angle (deg) of all of them to it."""
+    M = project_rotation(np.sum(Rs, axis=0))
+    ang = [angle_deg(M, R) for R in Rs]
+    keep = [R for R, a in zip(Rs, ang, strict=True) if a <= max(3 * float(np.median(ang)), 1.0)]
+    M = project_rotation(np.sum(keep, axis=0))
+    return M, float(np.median([angle_deg(M, R) for R in Rs]))

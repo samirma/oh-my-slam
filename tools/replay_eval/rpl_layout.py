@@ -84,7 +84,11 @@ LAYOUT: dict[str, Any] = {
     # robot kind -> truth link (x forward, y left, z up) whose quaternion orients the camera; the
     # optical frame is that link rotated (optical x = -link y, y = -link z, z = link x). A kind
     # without one takes the views.json rotation composed with the run's start pose.
-    "rotation_body": {"humanoid": "head_tilt_link", "base": "camera_link"},
+    "rotation_body": {"humanoid": "head_tilt_link", "base": "camera_link", "arm": "gripper_end"},
+    # robot kinds whose camera is mounted on their rotation body at a fixed but unknown rotation
+    # (the arm's wrist camera): the mount rotation (link -> optical) is estimated once per
+    # episode as the robust mean of link^-1 x views rotation (through the start pose)
+    "mount_fit": ["arm"],
     # robot kinds whose start pose is refined by a rigid fit of the views positions to the matched
     # truth camera positions (exact kinematics)
     "refine_start": ["arm"],

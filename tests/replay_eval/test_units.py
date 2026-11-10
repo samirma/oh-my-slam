@@ -123,6 +123,10 @@ def test_umeyama() -> None:
     T = geo.rigid_fit(line, line + 2.0, R)  # collinear: translation only, rotation kept
     assert np.allclose(T[:3, :3], R) and np.allclose(T @ np.r_[line[1], 1], np.r_[line[1] + 2, 1])
     assert np.allclose(geo.rigid_fit(line[:2], line[:2])[:3, :3], np.eye(3))
+    Rs = [geo.rot_z(a) for a in (0.01, -0.01, 0.0, 2.0)]  # one outlier
+    M, spread = geo.mean_rotation(Rs)
+    assert geo.angle_deg(M, np.eye(3)) < 0.1 and spread == pytest.approx(math.degrees(0.01), 0.2)
+    assert np.linalg.det(geo.project_rotation(-np.eye(3))) == pytest.approx(1.0)
     with pytest.raises(ValueError, match="two point pairs"):
         geo.umeyama(line[:1], line[:1])
     with pytest.raises(ValueError, match="coincide"):
