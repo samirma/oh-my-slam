@@ -56,7 +56,7 @@ def test_stop_cleans_up(stub_server: None) -> None:
     while (sock.exists() or paths.state_file().exists()) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not sock.exists() and not paths.state_file().exists()
-    assert not pid_alive(state["pid"])
+    assert not ServerLock.is_held()  # its process ended (the test's child may stay a zombie)
     assert stop_inference() == "the inference server was not running"
 
 

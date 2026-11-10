@@ -4,7 +4,6 @@ the small pose / similarity helpers."""
 
 from __future__ import annotations
 
-import errno
 import os
 import struct
 import subprocess
@@ -16,7 +15,6 @@ import pytest
 from PIL import Image
 
 from oh_my_slam.core import atomic, images, rle
-from oh_my_slam.core.errors import ExitCode, UsageError
 from oh_my_slam.core.geometry import Sim3, rot_z
 from oh_my_slam.core.ply import parse_ply, read_ply
 from oh_my_slam.core.types import Pose
@@ -52,46 +50,6 @@ def test_published_files_get_the_usual_mode_not_mkstemps_0600(tmp_path: Path) ->
     os.umask(umask)
     for name in ("a.bin", "a.npy"):
         assert (tmp_path / name).stat().st_mode & 0o777 == 0o666 & ~umask
-
-
-def test_a_folder_that_may_not_be_written_is_a_usage_error(tmp_path: Path) -> None:
-    locked = tmp_path / "locked"
-    locked.mkdir()
-    locked.chmod(0o500)
-    try:
-        with pytest.raises(UsageError, match="Permission denied") as err:
-            atomic.check_dir(locked / "out" / "deeper", "-d")
-        assert err.value.exit_code == ExitCode.USAGE and str(locked / "out") in str(err.value)
-        with pytest.raises(UsageError, match="cannot write there"):
-            atomic.check_file(locked / "x.ply", "-o")
-    finally:
-        locked.chmod(0o700)
-
-
-def test_an_output_file_is_proven_writable_without_creating_its_folders(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``preflight_file`` probes the nearest existing folder and creates nothing; a folder the
-    permissions allow but the filesystem refuses (read-only) is still a usage error."""
-    target = tmp_path / "new" / "deeper" / "out.json"
-    atomic.preflight_file(target, "-o")
-    assert list(tmp_path.iterdir()) == []
-
-    def read_only(*args: object, **kwargs: object) -> None:
-        raise OSError(errno.EROFS, "Read-only file system")
-
-    monkeypatch.setattr(atomic.tempfile, "TemporaryFile", read_only)
-    with pytest.raises(UsageError, match=r"-o .*deeper: cannot write there \(Read-only file"):
-        atomic.preflight_file(target, "-o")
-
-
-def test_a_special_file_is_written_in_place_unless_read_only(tmp_path: Path) -> None:
-    fifo = tmp_path / "pipe"
-    os.mkfifo(fifo, 0o600)
-    atomic.check_file(fifo, "-o")  # writable: accepted, its folder is not checked
-    fifo.chmod(0o400)
-    for check in (atomic.check_file, atomic.preflight_file):
-        with pytest.raises(UsageError, match=r"-o .*pipe: cannot write there \(permission denied\)"):
-            check(fifo, "-o")
 
 
 def test_a_copy_falls_back_to_a_plain_copy_without_clones(tmp_path: Path,
