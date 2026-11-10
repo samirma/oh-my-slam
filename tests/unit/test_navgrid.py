@@ -289,6 +289,44 @@ def test_cells_free_by_rule_get_floor_observed_2() -> None:
     assert coarse.floor_observed[10, 2] == 2
 
 
+def test_one_standpoint_sweep_frees_the_whole_blind_disc() -> None:
+    """A level camera 0.4955 m above the floor (640x480, vertical FOV 40.2 deg: its lower edge
+    meets the floor 1.357 m ahead) sweeping 360 deg from one position in an open room: every cell
+    of the blind disc is free, with ``floor_observed`` 1 or 2 (the camera cells 100 % free), even
+    those that other frames' rays already made free; a table leg inside the disc stays occupied."""
+    fy = 240.0 / math.tan(math.radians(40.2 / 2))
+    K = np.array([[fy, 0.0, 320.0], [0.0, fy, 240.0], [0.0, 0.0, 1.0]])
+    s = rooms.Scene()
+    s.add((-4.0, -4.0, -0.05), (4.0, 4.0, 0.0))  # the floor
+    s.add((-4.0, -4.0, 0.0), (-3.9, 4.0, 2.0)).add((3.9, -4.0, 0.0), (4.0, 4.0, 2.0))
+    s.add((-4.0, -4.0, 0.0), (4.0, -3.9, 2.0)).add((-4.0, 3.9, 0.0), (4.0, 4.0, 2.0))
+    s.add((0.80, 0.30, 0.0), (0.85, 0.35, 0.7))  # a table leg inside the disc
+    cams = [rooms.camera(0.0, 0.0, 0.4955, yaw, 0.0) for yaw in range(0, 360, 24)]
+    vol = ng.Volume()
+    for i, T in enumerate(cams):
+        d = s.depth(T, K, 640, 480)
+        vol.integrate(f"f{i}", d, K, T, d > 0)
+    floor = vol.estimate_floor(0.4955)
+    assert floor == pytest.approx(0.0, abs=0.02)
+    lay = ng.layers(vol, floor, 0.05, 1.8)
+    lay.state[lay.cell_of([0.5, -0.5])] = ng.FREE  # free from a ray, floor unseen
+    lay.floor_observed[lay.cell_of([0.5, -0.5])] = 0
+    stands = [ng.Stand(T, K, 640, 480) for T in cams]
+    ring = ng.blind_radius(stands[0], floor)
+    assert ring == pytest.approx(1.357, abs=0.01)
+    ng.mark_stands(lay, stands, floor, None)
+    rr, cc = np.mgrid[0:lay.shape[0], 0:lay.shape[1]]
+    centres = lay.origin[None, None, :] + (np.stack([cc, rr], -1) + 0.5) * lay.cell
+    disc = np.hypot(centres[..., 0], centres[..., 1]) < ring - lay.cell
+    assert lay.state[lay.cell_of([0.825, 0.325])] == ng.OCCUPIED
+    near_leg = (np.abs(centres[..., 0] - 0.825) < 0.1) & (np.abs(centres[..., 1] - 0.325) < 0.1)
+    disc &= ~near_leg
+    assert disc.sum() > 2000
+    assert (lay.state[disc] == ng.FREE).all()  # camera_cells_free 100 %
+    assert np.isin(lay.floor_observed[disc], (1, 2)).all()
+    assert lay.floor_observed[lay.cell_of([0.5, -0.5])] == 2
+
+
 @pytest.mark.parametrize("thickness", [0.02, 0.03, 0.04])
 def test_a_thin_open_leaf_seen_from_a_few_views_stays_occupied(thickness: float) -> None:
     """A door leaf 2-4 cm thick, open at 90 deg to the wall into room B, seen from three views in

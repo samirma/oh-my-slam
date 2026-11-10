@@ -1086,7 +1086,7 @@ class Placement:
     lifted: tuple[Array, Array] | None = None
     align_T: Array | None = None  # the image-only pose the lifted points agree with
     # the committed pose against the image-only pose on the stored map: how far the update puts
-    # the frame from where the map says it is (the quality report's residuals and gauge shift)
+    # the frame from where the map says it is (the new frames' displacement the gate checks)
     map_residual: tuple[float, float] | None = None
     image_sigmas: tuple[float, float] | None = None  # of ``align_T`` (a conflict's image pose)
 
@@ -1094,8 +1094,8 @@ class Placement:
 def inherit_conflicts(pls: list[Placement]) -> None:
     """The frames of one update that its priors alone placed — at the prior (``prior``), by
     depth geometry that cannot see every direction (``depth``), or in position by a rotation
-    fit (``rotation``) — take as their residual to the map (``map_residual``, the quality
-    report's ``previous_residuals`` and gauge shift) at least the largest disagreement between
+    fit (``rotation``) — take as their residual to the map (``map_residual``, the new frames'
+    displacement the gate's ``max_residual_m`` checks) at least the largest disagreement between
     the update's priors and the map that its prior conflicts measured: an image pose beyond the
     combined sigmas of its prior (the conflict's ``prior_residual``), or a depth that contradicts
     the map at the prior (its ``map_residual``). Priors that the images show off by that much may
@@ -1843,7 +1843,7 @@ class AnchoredMap:
         """A provisional frame (at its prior: the images did not confirm it) against the depth
         the map's keyframes near it see: where they see enough of its points and too few agree
         (``Agreement.contradicted``), the median depth difference is its residual to the map
-        (the quality report's ``previous_residuals``), and beyond ``K_SIGMA`` of its position
+        (the new frames' displacement the gate checks), and beyond ``K_SIGMA`` of its position
         sigma and the depth's own tolerance it contradicts the map: ``prior_conflict``, not
         fused. A monocular depth is first scaled by its median ratio to the map's there."""
         assert pl.T is not None and pl.sigma_pos_m is not None

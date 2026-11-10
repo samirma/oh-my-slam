@@ -188,12 +188,13 @@ class Jobs:
             self._cond.notify_all()
 
     def wait(self, job_id: str, wait_s: float) -> Job:
-        """The job once its state differs from the current one, or after ``wait_s``."""
+        """The job once its state differs from the current one, or after ``wait_s``; at once
+        when it has ended (committed, rejected, cancelled or failed: its state never changes)."""
         job = self.get(job_id)
         state = job.state
         deadline = time.monotonic() + min(max(wait_s, 0.0), MAX_WAIT_S)
         with self._cond:
-            while job.state == state and (left := deadline - time.monotonic()) > 0:
+            while job.active and job.state == state and (left := deadline - time.monotonic()) > 0:
                 self._cond.wait(left)
         return job
 

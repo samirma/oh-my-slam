@@ -765,18 +765,19 @@ class Updater:
         return gate(q, bool(registered), accept_if)
 
 
-def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None
-         ) -> dict[str, Any]:
+def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None,
+         displacement_m: float = 0.0) -> dict[str, Any]:
     """``accepted`` and ``failed_checks`` of a quality report (map.md §4): nothing kept is the
-    hard limit; ``accept_if`` checks the residual maxima, the gauge shift and the rejected
-    share."""
+    hard limit; ``accept_if`` checks the residual maxima (with ``displacement_m``, the new
+    frames' largest disagreement with the stored map, which the report has no field for), the
+    gauge shift and the rejected share."""
     prior_res, prev_res, gauge = q["prior_residuals"], q["previous_residuals"], q["gauge_shift"]
     failed = []
     if not kept_any:
         failed.append("hard_limit")
     a = accept_if or {}
     if "max_residual_m" in a:
-        worst = max([r["max_m"] for r in (prior_res, prev_res) if r] or [0.0])
+        worst = max([r["max_m"] for r in (prior_res, prev_res) if r] + [displacement_m])
         if worst > a["max_residual_m"]:
             failed.append("max_residual_m")
     if "max_gauge_shift_m" in a and gauge and gauge["translation_m"] > a["max_gauge_shift_m"]:

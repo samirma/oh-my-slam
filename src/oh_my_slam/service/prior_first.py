@@ -34,7 +34,14 @@ from oh_my_slam.core.images import size_at_max_side
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import register_ma
 from oh_my_slam.mapping.anchor import Sim3
-from oh_my_slam.mapping.anchored import AnchoredMap, FrameIn, Placement, features, pose_residual
+from oh_my_slam.mapping.anchored import (
+    AnchoredMap,
+    FrameIn,
+    Keyframe,
+    Placement,
+    features,
+    pose_residual,
+)
 from oh_my_slam.mapping.anchored_objects import (
     MONO_DEPTH_REL,
     SENSOR_DEPTH_REL,
@@ -63,6 +70,11 @@ INFERENCE_IN_FLIGHT = 2
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
 NONE_ENGINE_ENV = "OH_MY_SLAM_NONE_ENGINE"
 DEFAULT_NONE_ENGINE = "mapanything"
+# a new frame whose baseline to its nearest stored keyframe is below this share of that
+# keyframe's median depth turned in place: its image-only translation is unconstrained, and only
+# its rotation counts in its displacement (README "Quality report")
+PARALLAX_MIN = 0.02
+PARALLAX_DEPTH_M = 2.0  # a keyframe's depth when it has none
 
 
 def none_engine() -> str:
@@ -141,6 +153,28 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
         out.append(pl)
         progress(f"{fr.work.name}: registered (mapanything, {p.inliers} points)")
     return out, reg_s, time.perf_counter() - t
+
+
+def displacements(pls: list[Placement | None], stored: list[Keyframe]
+                  ) -> list[tuple[float, float]]:
+    """The new frames' disagreement with the stored map (m, deg): each kept frame's committed
+    pose against its image-only pose on the stored map (``Placement.map_residual``, which also
+    carries the update's prior conflicts onto the frames its priors alone placed). A frame
+    registered by PnP that turned in place (``PARALLAX_MIN``) counts only its rotation."""
+    out = []
+    for pl in pls:
+        if pl is None or pl.status == "rejected" or pl.map_residual is None:
+            continue
+        dp, dr = pl.map_residual
+        if pl.status == "registered" and pl.method == "pnp" and stored and pl.T is not None:
+            d = [float(np.linalg.norm(k.centre - pl.T[:3, 3])) for k in stored]
+            k = stored[int(np.argmin(d))]
+            if min(d) < PARALLAX_MIN * (k.median_depth or PARALLAX_DEPTH_M):
+                dp = 0.0
+        out.append((dp, dr))
+    return out
+
+
 def detection_grid(K: Intrinsics) -> tuple[int, int]:
     """The grid (width, height) a frame's detections are asked on: its monocular depth grid."""
     return size_at_max_side(K.width, K.height, MONO_GRID_SIDE)
@@ -238,6 +272,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
     placements: dict[int, Placement] = {}
     am: AnchoredMap | None = None
+    stored: list[Keyframe] = []
     k_prev: float | None = None
     mapper = workdir / "anchored"
     om: ObjectMap | None = None
@@ -248,6 +283,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             clone_tree(up.store.mapper_dir(w.map), mapper)
             am = AnchoredMap.load(mapper)
             k_prev = am.scale.k
+            stored = list(am.keyframes)
         else:
             mapper.mkdir(parents=True, exist_ok=True)
             am = AnchoredMap(mapper)
@@ -316,7 +352,15 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     kept = [(fr, placements[fr.work.index]) for fr in todo
             if placements[fr.work.index].status != "rejected"]
     version = (prev["version"] + 1) if prev else 1
-    rows = list(prev["frames"]) if prev else []
+    # the stored frames at the poses this version would commit (their keyframes'), and how far
+    # each moved from the previous version: the gauge shift and ``previous_residuals``
+    by_id = {k.id: k for k in am.keyframes} if am is not None else {}
+    rows, shifts = [], []
+    for r in prev["frames"] if prev else []:
+        k = by_id.get(r.get("internal") or "")
+        row = r if k is None else {**r, "T_map_cam": k.T.tolist()}
+        shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
+        rows.append(row)
     for fr, pl in kept:
         assert pl.T is not None
         p = fr.work.prior
@@ -337,26 +381,26 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         ratio = round(am.scale.k / k_prev, 5) if mono and k_prev else 1.0
     low = sum(pl.status == "provisional" or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
               for _, pl in kept)
-    # the new frames against the stored map: how far the update puts each from where the
-    # images on the previous version place it (stored frames never move)
-    moved = [pl.map_residual for _, pl in kept if pl.map_residual is not None]
     gauge = None
     if prev is not None:
-        gauge = {"translation_m": round(float(np.median([m for m, _ in moved])), 4)
-                 if moved else 0.0,
-                 "rotation_deg": round(float(np.median([d for _, d in moved])), 3)
-                 if moved else 0.0, "scale_ratio": 1.0}
+        gauge = {"translation_m": round(float(np.median([m for m, _ in shifts])), 4)
+                 if shifts else 0.0,
+                 "rotation_deg": round(float(np.median([d for _, d in shifts])), 3)
+                 if shifts else 0.0, "scale_ratio": 1.0}
+    # the new frames against the stored map: how far the update puts each from where the
+    # images on the previous version place it (checked by ``max_residual_m``)
+    moved = displacements([pl for _, pl in kept], stored)
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": ratio,
         "gauge_shift": gauge,
         "prior_residuals": residual_stats(prior_res),
-        "previous_residuals": residual_stats(moved) if prev else None,
+        "previous_residuals": residual_stats(shifts) if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
         "rebuilt": False,
         "prior_gravity_deg": None if prev is not None or am is None else am.up_check_deg,
     }
-    job.quality = gate(q, bool(kept), w.accept_if)
+    job.quality = gate(q, bool(kept), w.accept_if, max((m for m, _ in moved), default=0.0))
     if am is not None:
         job.scale_source, job.scale_sigma_rel = source, round(sigma, 5)
     if not job.quality["accepted"]:

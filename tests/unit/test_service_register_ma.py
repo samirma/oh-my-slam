@@ -1,4 +1,4 @@
-"""The MapAnything engine of an anchored map's camera-only frames (``service.register_ma``,
+"""The MapAnything engine of an anchored map's camera-only frames (``mapping.register_ma``,
 ``OH_MY_SLAM_NONE_ENGINE=mapanything``): end to end through the Starlette app on the ray-cast
 room (``tests.synth.room``), MapAnything played by ``FakeBackend.geometry_views`` (true relative
 poses at ``mv_scale``), and its edges on ``Registration`` itself."""

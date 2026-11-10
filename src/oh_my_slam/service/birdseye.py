@@ -2,7 +2,8 @@
 ``GET /api/maps/{name}/birdseye`` [``Birdseye``].
 
 Each version is drawn once from what it holds (``derived``): its fused cloud, its objects'
-footprints with their ids (the objects read of that version) and its keyframe cameras
+footprints with their ids (the confirmed and moved objects of that version's objects read;
+struck ones are not drawn) and its keyframe cameras
 (``mapping.birdseye.render``). The image and its metadata are kept with the version's derived
 data (``derived/<n>/birdseye.png`` and ``birdseye.json``), so both reads answer the same version
 with the same metadata. ``pixel_to_map`` maps a pixel's centre, given by its column and row
@@ -39,6 +40,8 @@ def _draw(dv: DerivedVersion, objects: dict[str, Any]) -> tuple[bytes, dict[str,
     c = dv.cloud()
     boxes = []
     for o in objects["objects"]:
+        if o.get("state") == "struck":  # seen gone: not drawn
+            continue
         a = math.radians(float(o["yaw_deg"]))
         R2 = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
         boxes.append(birdseye.Footprint(int(o["id"]), tuple(o["color"]),

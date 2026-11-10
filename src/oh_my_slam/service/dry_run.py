@@ -43,7 +43,12 @@ from oh_my_slam.mapping.anchored import (
     pose_residual,
     unit,
 )
-from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in, none_engine
+from oh_my_slam.service.prior_first import (
+    LOW_CONFIDENCE_SIGMA_M,
+    _frame_in,
+    displacements,
+    none_engine,
+)
 
 if TYPE_CHECKING:
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
@@ -107,18 +112,16 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     low = sum(pl is not None and (pl.status == "provisional"
                                   or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M)
               for pl in kept)
-    # the kept frames against the stored map, as the update reports them (stored frames do not
-    # move): where its priors alone place a frame, the update's prior conflicts count
-    moved = [pl.map_residual for pl in kept if pl is not None and pl.map_residual is not None]
+    # stored frames do not move (no gauge shift, no previous residual); the kept frames against
+    # the stored map, as the update checks them (``prior_first.displacements``)
+    moved = displacements(kept, [] if am is None else am.keyframes)
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": None if prev is None else 1.0,
-        "gauge_shift": None if prev is None else {
-            "translation_m": round(float(np.median([m for m, _ in moved])), 4) if moved else 0.0,
-            "rotation_deg": round(float(np.median([d for _, d in moved])), 3) if moved else 0.0,
-            "scale_ratio": 1.0},
+        "gauge_shift": None if prev is None else {"translation_m": 0.0, "rotation_deg": 0.0,
+                                                  "scale_ratio": 1.0},
         "prior_residuals": residual_stats(prior_res),
-        "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"]) + moved)
-        if prev else None,
+        "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
+        else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
         "rebuilt": False, "prior_gravity_deg": gravity,
@@ -129,7 +132,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     reg, fus = up.timings.predict_phases(len(frames), len(reached) - ma, ma, len(kept))
     return {"map": w.map,
             "base_version": None if prev is None else prev["version"], "frames": out,
-            "quality": gate(q, bool(kept), w.accept_if),
+            "quality": gate(q, bool(kept), w.accept_if, max((m for m, _ in moved), default=0.0)),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
 
 

@@ -253,21 +253,29 @@ def test_birdseye_of_each_version(client: Client) -> None:
     text = img.text  # type: ignore[attr-defined]
     assert json.loads(text["pixel_to_map"]) == meta["pixel_to_map"]
     assert text["map_version"] == "1" and text["map"] == "t"
-    A = np.asarray(meta["pixel_to_map"])
-    inv = np.linalg.inv(np.vstack([A, [0, 0, 1]]))
-    rgb = np.asarray(img.convert("RGB"))
-    objects = client.get("/api/maps/t/objects", "Objects")["objects"]
-    for o in objects:  # the object's colour is drawn around its centre's pixel
-        u, v, _ = inv @ [o["centre_m"][0], o["centre_m"][1], 1.0]
+    def drawn(meta: dict[str, Any], png: bytes, o: dict[str, Any]) -> bool:
+        """Whether the object's colour is drawn around its centre's pixel."""
+        A = np.asarray(meta["pixel_to_map"])
+        u, v, _ = np.linalg.inv(np.vstack([A, [0, 0, 1]])) @ [*o["centre_m"][:2], 1.0]
+        rgb = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
         r_px = max(o["size_m"][:2]) / A[0, 0] / 2 + 3
         ys, xs = np.mgrid[0:rgb.shape[0], 0:rgb.shape[1]]
         near = np.hypot(xs - u, ys - v) <= r_px
-        assert (rgb[near] == o["color"]).all(axis=1).any(), o["label"]
+        return bool((rgb[near] == o["color"]).all(axis=1).any())
+
+    objects = client.get("/api/maps/t/objects", "Objects")["objects"]
+    assert all(drawn(meta, r.content, o) for o in objects)
     # kept per version: a second read loads it; a past version answers its own
     assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
     fr2, files2 = frames(client, "taken", EYES[2:3], "b")
     assert client.update("t", fr2, files2)["state"] == "committed"
-    assert client.get("/api/maps/t/birdseye", "Birdseye")["map_version"] == 2
+    meta2 = client.get("/api/maps/t/birdseye", "Birdseye")
+    assert meta2["map_version"] == 2
+    png2 = client.http.get("/api/maps/t/birdseye.png").content
+    o2 = labels(client.get("/api/maps/t/objects", "Objects"))
+    assert o2["apple"]["state"] == "struck"
+    assert not drawn(meta2, png2, o2["apple"])  # seen gone: not drawn
+    assert drawn(meta2, png2, o2["table"])
     assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
     client.get("/api/maps/t/birdseye?version=9", status=400)
     client.get("/api/maps/none/birdseye.png", status=404)
