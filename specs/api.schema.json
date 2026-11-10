@@ -1252,7 +1252,8 @@
         },
         "sigma_centre_m": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "One-sigma uncertainty of the centre; when the bounding views were never recorded, from the formula documented in README.md."
         },
         "extent_seen": {
           "type": "object",
@@ -1271,7 +1272,8 @@
             "z": {
               "$ref": "#/$defs/Extent"
             }
-          }
+          },
+          "description": "full or partial per box axis, from the views that bound it; partial on every axis when the map's builder never recorded those views."
         },
         "mean_rgb": {
           "type": "array",
@@ -1800,7 +1802,7 @@
               "type": "number"
             }
           },
-          "description": "2x3 affine: [x, y] = A [u, v, 1] for pixel centre (u, v)."
+          "description": "2x3 affine: [x, y] = A [u, v, 1], where (u, v) are the integer column and row indices of a pixel; A maps them to the centre of pixel (u, v)."
         }
       }
     },
@@ -1908,7 +1910,7 @@
               "type": "null"
             }
           ],
-          "description": "prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
+          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
         },
         "T_map_cam": {
           "oneOf": [

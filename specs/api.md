@@ -72,7 +72,10 @@ error code `invalid_request` (§9).
 ## 3. Cameras and frames in requests
 
 * **`cameras`** — a dictionary from `camera_id` to [`Camera`]. A camera already known to the map
-  may be omitted; sending it again with other values is refused (`camera_conflict`).
+  may be omitted; sending it again with other values is refused (`camera_conflict`). A camera
+  sent by an earlier job of the same map that is still queued or running counts as known, so a
+  later job may omit it. If that earlier job does not commit, the later job fails with
+  `invalid_request`.
 * **`frames[]`** — each [`FrameInput`] has:
   * `name`, unique in the request;
   * `image`, a part name;
@@ -194,6 +197,11 @@ The versions read, revert and `--keep-versions` are O2.
     `ambiguity` repeats its first entry.
   * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
     The client then asks for a second frame.
+* **Reasons.**
+  * `few_features`: the frame has fewer keypoints than a pose needs inliers. That minimum is an
+    implementation constant recorded in `README.md` (currently 15).
+  * `no_overlap`: the frame has enough keypoints but gets no pose. It carries `nearest_view`
+    when it has a prior (below), pointing only at a confirmed keyframe.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
   service can estimate one, else null:
   * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`. Only

@@ -156,8 +156,8 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | `id` | Positive integer, persistent for the map's lifetime. |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
-| `sigma_centre_m` | One-sigma uncertainty of the centre. |
-| `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. |
+| `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
+| `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. When the map's builder never recorded those views, `partial` on every axis. |
 | `mean_rgb` | Observed colour: robust mean of the object's pixels in sRGB 0–255, from the views that saw it best. |
 | `color` | Display colour only: a pure function of `id`. |
 | `state` | `confirmed` (seen again where it was), `moved` (seen elsewhere: `moved_from_m` gives the earlier centre), or `struck` (seen gone; kept for one version, then removed). |
@@ -286,9 +286,11 @@ There is no whole-map cloud read.
 Bird's-eye belongs to step 1 of the order of work (high_level_spec.md §12, §13).
 
 `GET /api/maps/{name}/birdseye.png` draws the version seen from above:
-* the cloud, the objects' footprints with their ids, and the keyframe cameras;
+* the cloud, the footprints of the present objects (`confirmed` or `moved`) with their ids,
+  and the keyframe cameras. `struck` objects are not drawn;
 * the PNG's text metadata records `map_version` and `pixel_to_map`, an affine map from pixel to
-  map x, y.
+  map x, y: (u, v) are integer column and row indices, and `pixel_to_map` maps them to the
+  centre of pixel (u, v).
 
 `GET /api/maps/{name}/birdseye` returns the same metadata as JSON, with the version's
 `scale_source` and `scale_sigma_rel`.
