@@ -9,6 +9,8 @@ server.sh [--port <n>] [--host <addr>] [--data <folder>] [--keep-versions <n>]
 server.sh --status | --stop
 ```
 
+`--keep-versions` belongs to O2 (map.md §2).
+
 ## 1. Service
 
 * **Starting.** `server.sh` binds `--host` (default `0.0.0.0`) on `--port` (default **9091**):
@@ -25,13 +27,17 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.1"`).
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.2"`), except
+    `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
 * **Access.** Requests from the LAN are accepted without authentication: the service is meant
   for a trusted network. Upload caps are recorded in `README.md`.
 
 ## 2. Endpoints
+
+Health, timings (§8) and errors (§9) are base: every implementation serves them, in no group.
+Each other endpoint belongs to the group named in its section, or in map.md.
 
 | Method and path | Purpose | Body → response |
 | --- | --- | --- |
@@ -42,21 +48,25 @@ server.sh --status | --stop
 | `GET /api/jobs/{id}` | Job state and result | → [`Job`] |
 | `DELETE /api/jobs/{id}` | Cancel a job | → [`Job`] |
 | `GET /api/maps/{name}` | Map summary | → [`MapSummary`] |
-| `GET /api/maps/{name}/versions` | Kept versions | → [`Versions`] |
-| `POST /api/maps/{name}/revert` | Commit a copy of a kept version | [`RevertRequest`] → [`MapSummary`] |
+| `GET /api/maps/{name}/versions` | Kept versions (O2) | → [`Versions`] |
+| `POST /api/maps/{name}/revert` | Commit a copy of a kept version (O2) | [`RevertRequest`] → [`MapSummary`] |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses | → [`Frames`] |
 | `GET /api/maps/{name}/objects` | Object records | → [`Objects`] |
-| `GET /api/maps/{name}/grid` | Navigation grid | → [`Grid`] |
-| `GET /api/maps/{name}/points` | Fused points inside a box | → [`Points`] |
-| `GET /api/maps/{name}/birdseye.png` | Bird's-eye image | → `image/png` |
-| `GET /api/maps/{name}/birdseye` | Its metadata | → [`Birdseye`] |
-| `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] → [`Locate`] |
-| `GET /api/maps/{name}/pose` | Last recorded pose | → [`Pose`] |
+| `GET /api/maps/{name}/grid` | Navigation grid (O6) | → [`Grid`] |
+| `GET /api/maps/{name}/points` | Fused points inside a box (O6) | → [`Points`] |
+| `GET /api/maps/{name}/birdseye.png` | Bird's-eye image (O1) | → `image/png` |
+| `GET /api/maps/{name}/birdseye` | Its metadata (O1) | → [`Birdseye`] |
+| `POST /api/maps/{name}/locate` | Locate frames in the map (O5) | [`LocateRequest`] → [`Locate`] |
+| `GET /api/maps/{name}/pose` | Last recorded pose (O5) | → [`Pose`] |
 | `DELETE /api/maps/{name}` | Delete the map and its versions | → 204 |
 | `POST /api/frames/analyse` | Analyse one frame, no map change | [`AnalyseRequest`] → [`Analysis`] |
 
-Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its version in
-`map_version`.
+Every `GET` under `/api/maps/{name}`, except `/pose`, accepts `?version=<n>` and names its
+version in `map_version`. `GET …/pose` takes no `?version`: the recorded pose lives outside the
+versions, and its `map_version` is the version it was located in (§6).
+
+An unknown route answers HTTP 404 and a known route with another method HTTP 405, both with the
+error code `invalid_request` (§9).
 
 ## 3. Cameras and frames in requests
 
@@ -94,27 +104,36 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | Field | Meaning |
   | --- | --- |
   | `name` | The frame's name. |
-  | `status` | `registered`, `provisional` (registered, not yet fused) or `rejected`. |
-  | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict` or `duplicate`; otherwise null. |
+  | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. |
+  | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict` or `duplicate`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
   | `prior_residual_m`, `prior_residual_deg` | The residual to its prior; null without a prior. |
+
+  **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
+  `reason` says why. Its pose is the prior, its sigmas are the prior's, and its prior residuals
+  are 0. It is stored and may be fused, but locate never uses it as a reference (§6).
 
   **Pose sigmas are a lower bound** until O5 calibrates them against replay truth: until then
   `sigma_pos_m` and `sigma_rot_deg`, here and in [`Frames`], come from the registration's noise
   and the anchoring's residual, not from a pose covariance, and the true error can be larger.
 
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
-* **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It runs
-  on the interactive lane. Per frame it gives:
+* **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
+  waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
+  single worker (inference.md). Per frame it gives:
   * `features`;
-  * the predicted link to the map: `map_inliers`, `predicted_status`, `predicted_reason`;
+  * the predicted link to the map: `map_inliers`, `predicted_status` (`registered`,
+    `kept_at_prior` or `rejected`), `predicted_reason`;
   * the predicted links to its neighbours in the request: `neighbour_inliers[]`;
   * the flags `plain` and `too_close`.
 
-  It also gives a predicted `quality`, without fusion.
+  It also gives a predicted `quality`, without fusion, and `scale_source` and
+  `scale_sigma_rel`.
 
 ## 5. Versions and revert (O2)
+
+The versions read, revert and `--keep-versions` are O2.
 
 * `GET /api/maps/{name}/versions` lists the kept versions [`VersionInfo`]: `version`,
   `created_at`, `kind` (`update`, `provisional`, `fusing`, `revert`), `job_id`, `frames` and
@@ -135,21 +154,20 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | --- | --- |
   | `name` | The frame's name. |
   | `status` | `located` or `rejected`. |
-  | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `too_close` or `blur`. |
+  | `reason` | When rejected: `no_overlap`, `few_features`, `plain` or `blur`; otherwise null. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. |
   | `inlier_ratio` | The share of inliers. |
   | `ambiguity` | `{pos_m, rot_deg}` or null; see below. |
   | `consistent_with_prior` | Bool, or null without a prior. |
 
-* **Ambiguity.** `ambiguity` is non-null only when a rival hypothesis has comparable support.
-  * The rival is the best pose hypothesis, other than the reported one, that is farther than
-    0.10 m or 5° from it.
-  * Its support is comparable when its inlier count is at least `ambiguity_support_ratio`
-    (default 0.6, recorded in `README.md`) of the reported pose's.
-  * `pos_m` and `rot_deg` are the distance from the rival pose to the reported one.
-  * So a non-null `ambiguity` always means a genuinely different pose with comparable
-    support, for example the 90° flip of a symmetric room. The client then asks for a second
-    frame.
+* **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
+  * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
+    it.
+  * Its support is its inlier count over the reported pose's inlier count. A rival is supported
+    when its support is at least 0.25, whatever else its inliers explain.
+  * `pos_m` and `rot_deg` are the distance from the best-supported rival to the reported pose.
+  * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
+    The client then asks for a second frame.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
   service can estimate one, else null:
   * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`;
@@ -160,11 +178,12 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   A robot without odometry can then turn toward mapped structure.
 * **Provisional frames.** Locate works against a version whose newest frames are still
   provisional, using their provisional poses.
+* **Frames kept at prior.** Locate never uses a `kept_at_prior` frame as a reference.
 * **Nothing located** is a `200` response with every frame `rejected`, not an error.
 * **Recording.** With `record: true`, the last located frame's pose is stored as the map's
   *recorded pose*, outside the map's versions.
-  * `GET /api/maps/{name}/pose` returns it with the time it was recorded, its `map_version`
-    and its sigmas.
+  * `GET /api/maps/{name}/pose` returns it with the time it was recorded, the `map_version` it
+    was located in, its sigmas, and that version's `scale_source` and `scale_sigma_rel`.
   * It answers `no_pose` when nothing was recorded.
 
 ## 7. Frame analysis (O7)
@@ -172,8 +191,9 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
 * **Request.** `POST /api/frames/analyse {image, camera | camera_id + map, T_map_cam?, depth?,
   outputs[], z_band_m?, bearing_step_deg?}` analyses one frame and changes nothing.
 * **Outputs.** `outputs` chooses any of:
-  * `objects` — as map.md §5, plus `bbox_px`, without the map-only fields (`state`,
-    `moved_from_m`, versions);
+  * `objects` — [`AnalysisObject`]: as map.md §5, plus `bbox_px`, without the map-only fields
+    (`state`, `moved_from_m`, versions, `region`, `supported_by`, `inside_of`), which only
+    [`MapObject`] carries;
   * `points` — the frame's 3-D points (`float32` xyz), their object ids (`uint32`, 0 = none) and
     `rgb` (`uint8`), each as a base64 array, thinned to the voxel size given;
   * `range_scan` — per bearing in the horizontal plane: `range_m` and `kind`:
@@ -223,6 +243,8 @@ So the client can gate even a run's first update on its deadline.
   | `code` | HTTP | Retryable | When |
   | --- | --- | --- | --- |
   | `invalid_request` | 400 | no | Body or parameter fails validation; `details.field` names it |
+  | `invalid_request` | 404 | no | Unknown route |
+  | `invalid_request` | 405 | no | Method not allowed on a known route |
   | `camera_conflict` | 409 | no | Camera redefined with other values |
   | `map_not_found`, `job_not_found` | 404 | no | Unknown name or id |
   | `version_gone` | 410 | no | Version no longer kept |

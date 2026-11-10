@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.1. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.2. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -281,6 +281,11 @@
           "type": "number",
           "minimum": 0
         },
+        "max_displacement_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Gates quality.max_displacement_m, so one bad frame fails the update."
+        },
         "max_rejected_share": {
           "type": "number",
           "minimum": 0,
@@ -345,8 +350,10 @@
           "enum": [
             "registered",
             "provisional",
+            "kept_at_prior",
             "rejected"
-          ]
+          ],
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm; its pose is the prior, its sigmas the prior's, its prior residuals 0; it may be fused, and locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -356,7 +363,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Null for registered and provisional; set for rejected and kept_at_prior."
         },
         "inliers": {
           "type": "integer",
@@ -396,7 +404,63 @@
             "null"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "registered",
+                  "provisional"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "rejected",
+                  "kept_at_prior"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/RejectReason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "kept_at_prior"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "T_map_cam": {
+                "$ref": "#/$defs/Mat4"
+              }
+            }
+          }
+        }
+      ]
     },
     "GaugeShift": {
       "type": "object",
@@ -449,6 +513,7 @@
       "required": [
         "scale_ratio_vs_prev",
         "gauge_shift",
+        "max_displacement_m",
         "prior_residuals",
         "previous_residuals",
         "rejected_share",
@@ -473,7 +538,16 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Similarity aligning a re-estimated result back onto the previous version. For an engine that never re-poses stored frames: the median, over the update's new frames, of the displacement between committed pose and image-only pose (scale_ratio 1)."
+        },
+        "max_displacement_m": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Largest displacement, over the update's new frames that have an image-only pose, between committed pose and image-only pose; null when there is none."
         },
         "prior_residuals": {
           "oneOf": [
@@ -525,10 +599,13 @@
             "enum": [
               "max_residual_m",
               "max_gauge_shift_m",
+              "max_displacement_m",
               "max_rejected_share",
-              "hard_limit"
+              "hard_limit",
+              "prior_frames_rejected"
             ]
-          }
+          },
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created."
         }
       }
     },
@@ -728,6 +805,7 @@
         "predicted_status": {
           "enum": [
             "registered",
+            "kept_at_prior",
             "rejected"
           ]
         },
@@ -752,6 +830,11 @@
         "frames",
         "quality",
         "predicted_s"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/Scale"
+        }
       ],
       "properties": {
         "schema": {
@@ -991,8 +1074,10 @@
         "pose_state": {
           "enum": [
             "provisional",
-            "fused"
-          ]
+            "fused",
+            "kept_at_prior"
+          ],
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images (it may be fused); never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -1036,7 +1121,7 @@
         "partial"
       ]
     },
-    "Object": {
+    "ObjectCore": {
       "type": "object",
       "required": [
         "id",
@@ -1055,7 +1140,7 @@
         "id": {
           "type": "integer",
           "minimum": 1,
-          "description": "Map object id. In an Analysis: the map's persistent id when the detection matched a map object (map and T_map_cam given), else a local id >= 1000000."
+          "description": "Map object id. In an AnalysisObject: the map's persistent id when the detection matched a map object (map and T_map_cam given), else a local id >= 1000000."
         },
         "label": {
           "type": "string"
@@ -1127,16 +1212,27 @@
             "maximum": 255
           },
           "description": "Display colour, a pure function of id; not the object's appearance."
-        },
-        "bbox_px": {
-          "type": "array",
-          "minItems": 4,
-          "maxItems": 4,
-          "items": {
-            "type": "number"
-          },
-          "description": "Frame analysis only: x_min, y_min, x_max, y_max."
-        },
+        }
+      },
+      "description": "Fields shared by MapObject and AnalysisObject."
+    },
+    "MapObject": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/ObjectCore"
+        }
+      ],
+      "required": [
+        "state",
+        "moved_from_m",
+        "first_seen_version",
+        "last_seen_version",
+        "region",
+        "supported_by",
+        "inside_of"
+      ],
+      "properties": {
         "state": {
           "enum": [
             "confirmed",
@@ -1217,7 +1313,31 @@
             }
           ]
         }
-      }
+      },
+      "description": "An object record of an objects read (map.md §5)."
+    },
+    "AnalysisObject": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/ObjectCore"
+        }
+      ],
+      "required": [
+        "bbox_px"
+      ],
+      "properties": {
+        "bbox_px": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "number"
+          },
+          "description": "x_min, y_min, x_max, y_max."
+        }
+      },
+      "description": "A detection of a frame analysis: the frame-analysis subset of an object, plus bbox_px."
     },
     "Objects": {
       "type": "object",
@@ -1245,20 +1365,7 @@
         "objects": {
           "type": "array",
           "items": {
-            "allOf": [
-              {
-                "$ref": "#/$defs/Object"
-              },
-              {
-                "required": [
-                  "state",
-                  "moved_from_m",
-                  "first_seen_version",
-                  "last_seen_version",
-                  "region"
-                ]
-              }
-            ]
+            "$ref": "#/$defs/MapObject"
           }
         },
         "surfaces": {
@@ -1304,7 +1411,10 @@
         "regions",
         "kind",
         "jambs_m",
-        "leaf"
+        "leaf",
+        "leaves",
+        "narrow",
+        "frontier"
       ],
       "properties": {
         "id": {
@@ -1320,22 +1430,32 @@
         },
         "normal_deg": {
           "type": "number",
-          "description": "Perpendicular to the jamb line, from regions[0] to regions[1]."
+          "description": "Perpendicular to the jamb line, from regions[0] to regions[1] (or toward the unobserved side)."
         },
         "regions": {
           "type": "array",
           "minItems": 2,
           "maxItems": 2,
-          "items": {
-            "type": "integer"
-          }
+          "prefixItems": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          ],
+          "description": "[a, b], or [a, null] for a doorway whose far side was never observed (frontier then names it)."
         },
         "kind": {
           "enum": [
             "door",
             "opening",
             "narrow"
-          ]
+          ],
+          "description": "door when a leaf (door object) is found, so leaves is not empty; else opening. narrow: deprecated, not produced since oms/2.2; see the narrow field."
         },
         "jambs_m": {
           "type": "array",
@@ -1363,11 +1483,54 @@
                 },
                 "intrudes": {
                   "type": "boolean"
+                },
+                "object_id": {
+                  "type": "integer",
+                  "minimum": 1
                 }
               }
             }
           ],
-          "description": "Door leaf footprint for kind door, else null."
+          "description": "Deprecated: leaves[0], or null when leaves is empty."
+        },
+        "leaves": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "polygon_m",
+              "intrudes",
+              "object_id"
+            ],
+            "properties": {
+              "polygon_m": {
+                "$ref": "#/$defs/Polygon"
+              },
+              "intrudes": {
+                "type": "boolean"
+              },
+              "object_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The leaf's object id (label door) in the objects read."
+              }
+            }
+          },
+          "description": "Door leaves found at the passage; empty when none."
+        },
+        "narrow": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "width_m below 2 x footprint_radius_m; null when footprint_radius_m is not given."
+        },
+        "frontier": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "When regions[1] is null: the frontier on the unobserved side; else null."
         }
       }
     },
@@ -1408,6 +1571,7 @@
         "shape",
         "z_band_m",
         "floor_z_m",
+        "height_cap_m",
         "layers",
         "regions",
         "passages",
@@ -1453,6 +1617,11 @@
           "type": "number",
           "description": "Absolute map-frame z of the floor estimate."
         },
+        "height_cap_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Ceiling of the height_m layer, relative to floor_z_m: the request's height_cap_m, default 2.0 or the requested z_max."
+        },
         "layers": {
           "type": "object",
           "required": [
@@ -1472,7 +1641,7 @@
             },
             "height_m": {
               "$ref": "#/$defs/Binary",
-              "description": "float32 highest surface in the cell, relative to floor_z_m; NaN if none."
+              "description": "float32 highest surface in the cell at or below height_cap_m, relative to floor_z_m; NaN if none."
             },
             "floor_observed": {
               "$ref": "#/$defs/Binary",
@@ -1509,6 +1678,11 @@
         "width",
         "height",
         "pixel_to_map"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/Scale"
+        }
       ],
       "properties": {
         "schema": {
@@ -1637,7 +1811,6 @@
                 "no_overlap",
                 "few_features",
                 "plain",
-                "too_close",
                 "blur"
               ]
             },
@@ -1695,7 +1868,7 @@
               "type": "null"
             }
           ],
-          "description": "Non-null only when a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has at least ambiguity_support_ratio (default 0.6) of its inliers; pos_m / rot_deg are the rival's distance from the reported pose."
+          "description": "Non-null whenever a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has support >= 0.25 (its inlier count over the reported pose's), whatever else its inliers explain; pos_m / rot_deg are the best-supported rival's distance from the reported pose."
         },
         "consistent_with_prior": {
           "type": [
@@ -1732,7 +1905,7 @@
               }
             }
           ],
-          "description": "For no_overlap rejections: the most similar keyframe, else null."
+          "description": "For no_overlap rejections: the most similar keyframe, else null. kept_at_prior frames are never locate references."
         }
       }
     },
@@ -1779,6 +1952,11 @@
         "sigma_pos_m",
         "sigma_rot_deg"
       ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/Scale"
+        }
+      ],
       "properties": {
         "schema": {
           "$ref": "#/$defs/SchemaVersion"
@@ -1787,7 +1965,8 @@
           "type": "string"
         },
         "map_version": {
-          "type": "integer"
+          "type": "integer",
+          "description": "The version the pose was located in. GET pose takes no ?version."
         },
         "name": {
           "type": "string"
@@ -1943,16 +2122,7 @@
         "objects": {
           "type": "array",
           "items": {
-            "allOf": [
-              {
-                "$ref": "#/$defs/Object"
-              },
-              {
-                "required": [
-                  "bbox_px"
-                ]
-              }
-            ]
+            "$ref": "#/$defs/AnalysisObject"
           }
         },
         "points": {
@@ -2079,18 +2249,52 @@
         },
         "lanes": {
           "type": "object",
-          "required": [
-            "interactive",
-            "bulk"
-          ],
+          "minProperties": 1,
+          "additionalProperties": false,
           "properties": {
             "interactive": {
               "$ref": "#/$defs/Lane"
             },
             "bulk": {
               "$ref": "#/$defs/Lane"
+            },
+            "worker": {
+              "$ref": "#/$defs/Lane"
             }
-          }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "interactive",
+                "bulk"
+              ],
+              "not": {
+                "required": [
+                  "worker"
+                ]
+              }
+            },
+            {
+              "required": [
+                "worker"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "interactive"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "bulk"
+                    ]
+                  }
+                ]
+              }
+            }
+          ],
+          "description": "With lanes: interactive and bulk. A single-worker implementation reports one lane, worker, for all its inference work."
         },
         "capabilities": {
           "type": "array",
@@ -2109,7 +2313,7 @@
               "O3-jobs"
             ]
           },
-          "description": "Groups the running service implements. \"O3-jobs\": asynchronous jobs (202 + GET/poll) without the two-phase provisional commit, cancel or lanes."
+          "description": "Groups the running service implements. \"O3-jobs\": asynchronous jobs (202 + GET/poll) without the two-phase provisional commit, cancel or lanes. O10 may be claimed without lanes, provided a dry run never waits behind fusion."
         },
         "timings": {
           "type": "object",
@@ -2168,7 +2372,8 @@
             "out_of_memory",
             "payload_too_large",
             "internal"
-          ]
+          ],
+          "description": "invalid_request also answers an unknown route (HTTP 404) and a wrong method (HTTP 405)."
         },
         "message": {
           "type": "string"

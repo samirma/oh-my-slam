@@ -4,15 +4,17 @@ Part of the [high-level specification](../high_level_spec.md) (§11).
 
 ## Command and outputs
 
-Two evaluators measure the client contract:
+Two evaluators measure the client contract. Both are client-side tools under `tools/`, outside
+the service's scope: they use only the public API, and neither the service nor the package
+imports or depends on them.
 * **Replay evaluator.** `tools/replay_eval/` is a standalone client of the public API: stdlib,
   numpy and requests only, no import from the service's code. It runs on the machine that holds
   the episodes and the simulator truth:
   `python tools/replay_eval/replay_eval.py --server URL --episodes DIR --house PATH
   --map-prefix NAME --out FILE.json`. Accuracy against simulator truth comes only from it.
-* **Reference evaluator.** `uv run python -m oh_my_slam.tools.evaluate [--url URL] [--out DIR]
-  [--baseline PATH] [--set-baseline] [--requests DIR]` runs the reference captures, and
-  optionally replays request sets recorded from earlier replays (`--requests`), for
+* **Reference evaluator.** `tools/evaluate/`: `python tools/evaluate/evaluate.py [--url URL]
+  [--out DIR] [--baseline PATH] [--set-baseline] [--requests DIR]` runs the reference captures,
+  and optionally replays request sets recorded from earlier replays (`--requests`), for
   regression and latency without truth.
 
 Every latency target is measured from a LAN client, uploads included, against the serving
@@ -24,8 +26,10 @@ and run through the same replay evaluator.
   it, it starts a service locally on a free port.
 * **Outputs.** It writes `result.json` (machine-readable: each metric's value, target, pass/fail
   and the baseline comparison) and `summary.md` to `~/oh-my-slam-data/evaluations/<UTC>/`.
-* **Data, not code.** Targets live in `examples/targets.json`, and a stored baseline flags
-  regressions. Both are data: changing them needs no code change.
+* **Data, not code.** Targets live in `examples/targets.json`, the single source of targets,
+  keyed by the metric ids below; a stored baseline flags regressions. Both are data: changing
+  them needs no code change. This document defines the metrics and does not repeat their
+  thresholds, apart from the migration appendix that `targets.json` supersedes.
 
 ## Replay of recorded episodes
 
@@ -53,43 +57,46 @@ It then compares the API's answers with the truth, after the single similarity t
 the map frame to the simulator world that the map's first update fixed. Scale is judged on that
 transform, not re-fitted per read.
 
-## Targets
+## Metrics
 
-| Contract | Metric | Target |
+Each metric's threshold is the entry of `examples/targets.json` under its id. Parameters that
+are part of a definition (a distance, an angle, a cell size) stay here.
+
+| Id | Contract | Metric |
 | --- | --- | --- |
-| C8 | Frames within 0.3 m and 15° of a keyframe that are located | ≥ 0.9 |
-| C8 | Median position error of located frames | ≤ max(2 cm, 1 % of the scene depth) |
-| C8 | `ambiguity` non-null on located frames whose pose error exceeds 0.3 m or 15° | ≥ 0.8 |
-| C8 | `ambiguity` null on located frames within 0.10 m and 5° of the truth | ≥ 0.9 |
-| C2 | Scale error with `metric` priors | ≤ 3 % |
-| C2 | Scale error with camera height only | ≤ 10 % |
-| C1 | Map-frame shift of stored keyframes between consecutive versions | ≤ 2 cm and ≤ 0.5° (median), beyond the stated `gauge_shift` |
-| C3 | Upload to frame readable in a version (`provisional_version` committed) | ≤ 2 s |
-| C3 | Fusion time per new frame, maps up to 500 keyframes | ≤ 3 s |
-| C3 | Reads during an update answered from one version | 100 % |
-| C4 | Rejected inputs whose `reason` agrees with the truth (bare wall, too close, no overlap) | ≥ 0.8 |
-| C5 | Revert latency | ≤ 2 s |
-| C6 | Episodes' warping updates (e034, e040) rejected by `accept_if {max_residual_m: 0.10, max_gauge_shift_m: 0.05, max_rejected_share: 0.5}` (the thresholds the skill sends) | All |
-| C6 | The other updates of the passing episodes accepted at those thresholds | ≥ 0.9 |
-| C9 | Grid cells agreeing with the floor plan (free inside rooms, occupied at walls), among observed cells | ≥ 0.9 |
-| C9 | Doors of the floor plan found as passages within 0.3 m | ≥ 0.8 |
-| C9 | Passage `centre_m` within 0.10 m of the floor plan's door-gap centre, and `width_m` within 0.10 m of its free width | ≥ 0.8 of found doors |
-| C9 | Free cells with `floor_observed` where the floor plan has floor | ≥ 0.9 |
-| C9 | Keyframe camera cells, and their near blind ring, `free` | 100 % |
-| C9 | Frontiers bordering a region with `region` set; objects in or on a region with `region` set | 100 % |
-| C9 | Cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` | ≥ 0.95 |
-| C10 | Support height of objects on a surface (`supported_by` surface `height_m`) | ≤ 2 cm |
-| C10 | `supported_by` / `inside_of` agreeing with the truth's relations | ≥ 0.9 |
-| C8 | Rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure | ≥ 0.8 |
-| C3 | `eta_s` of a queued job, and `predicted_s` of a dry run, within ±30 % of the measured time | ≥ 0.8 of jobs |
-| C9 | Floor height error, against the lowest large support plane in view: the floor, or the worktop for an arm scene | ≤ 2 cm |
-| C10 | Object centre error, label agreement and id stability across updates | As in `targets.json`, from the round-4 values |
-| C11 | Range-scan error against the floor-plan walls within the band | ≤ 5 % of range |
-| C12 | Locate and analyse latency while an update runs | ≤ 2 × idle latency, and ≤ 3 s |
-| C12 | Locate while idle, per frame of the request | ≤ 2 s |
-| C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map | ≤ 0.5 s each |
-| C3 | Intermediate version during fusion | At least every 10 s while fusion lasts longer |
-| C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes | As before |
+| `locate.recall` | C8 | Share of frames within 0.3 m and 15° of a keyframe that are located |
+| `locate.median_pos_error` | C8 | Median position error of located frames |
+| `locate.ambiguity_flagged` | C8 | Share of located frames whose pose error exceeds 0.10 m or 5° that carry a non-null `ambiguity` (a supported rival beyond 0.10 m or 5° is never silent, api.md §6) |
+| `locate.ambiguity_quiet` | C8 | Share of located frames within 0.10 m and 5° of the truth whose `ambiguity` is null |
+| `locate.nearest_view` | C8 | Share of rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure |
+| `scale.error_metric` | C2 | Scale error with `metric` priors |
+| `scale.error_camera_height` | C2 | Scale error with camera height only |
+| `frame.shift` | C1 | Map-frame shift of stored keyframes between consecutive versions, median position and rotation, beyond the stated `gauge_shift` |
+| `update.readable_latency` | C3 | Upload to frame readable in a version (`provisional_version` committed) |
+| `fusion.time_per_frame` | C3 | Fusion time per new frame, maps up to 500 keyframes |
+| `reads.atomic` | C3 | Share of reads during an update answered from one version |
+| `jobs.eta_accuracy` | C3 | Share of jobs whose `eta_s` when queued, and dry runs whose `predicted_s`, fall within the tolerance of the measured time |
+| `fusion.intermediate_interval` | C3 | Longest interval between intermediate versions while fusion lasts longer than it |
+| `inputs.reason_agreement` | C4 | Share of rejected inputs whose `reason` agrees with the truth (bare wall, too close, no overlap) |
+| `revert.latency` | C5 | Revert latency |
+| `gate.warping_rejected` | C6 | Share of the warping updates listed in `targets.json` rejected by `accept_if` at the thresholds `targets.json` gives (`gate.accept_if`) |
+| `gate.others_accepted` | C6 | Share of the other updates of the passing episodes accepted at those thresholds |
+| `grid.floor_plan_agreement` | C9 | Share of observed cells agreeing with the floor plan (free inside rooms, occupied at walls) |
+| `passages.door_recall` | C9 | Share of the floor plan's doors found as passages within 0.3 m |
+| `passages.geometry` | C9 | Share of found doors whose `centre_m` is within the tolerance of the floor plan's door-gap centre and whose `width_m` is within the tolerance of its free width |
+| `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
+| `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
+| `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
+| `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
+| `grid.floor_height` | C9 | Floor height error, against the lowest large support plane in view: the floor, or the worktop for an arm scene |
+| `reads.latency` | C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map, each |
+| `objects.support_height` | C10 | Support height error of objects on a surface (`supported_by` surface `height_m`) |
+| `objects.relations` | C10 | Share of `supported_by` / `inside_of` agreeing with the truth's relations |
+| `objects.centre_error`, `objects.label_agreement`, `objects.id_stability` | C10 | Object centre error, label agreement and id stability across updates |
+| `analysis.range_scan_error` | C11 | Range-scan error against the floor-plan walls within the band, relative to range |
+| `interactive.latency_under_load` | C12 | Locate and analyse latency while an update runs: ratio to idle latency, and absolute |
+| `locate.latency_idle` | C12 | Locate while idle, per frame of the request |
+| `update.later_wins` | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes |
 
 ## Reference captures
 
@@ -111,3 +118,45 @@ The evaluator checks these too; the target for each is zero violations:
 * a job continuing after its client disconnects;
 * `Server-Timing` present;
 * bird's-eye `pixel_to_map` agreeing with the objects' footprints.
+
+## Appendix: current thresholds
+
+The migration source for `examples/targets.json`, which supersedes this table once it holds
+these ids.
+
+| Id | Threshold |
+| --- | --- |
+| `locate.recall` | ≥ 0.9 |
+| `locate.median_pos_error` | ≤ max(2 cm, 1 % of the scene depth) |
+| `locate.ambiguity_flagged` | ≥ 0.8 |
+| `locate.ambiguity_quiet` | ≥ 0.9 |
+| `locate.nearest_view` | ≥ 0.8 |
+| `scale.error_metric` | ≤ 3 % |
+| `scale.error_camera_height` | ≤ 10 % |
+| `frame.shift` | ≤ 2 cm and ≤ 0.5° |
+| `update.readable_latency` | ≤ 2 s |
+| `fusion.time_per_frame` | ≤ 3 s |
+| `reads.atomic` | 100 % |
+| `jobs.eta_accuracy` | ≥ 0.8, tolerance ±30 % |
+| `fusion.intermediate_interval` | ≤ 10 s |
+| `inputs.reason_agreement` | ≥ 0.8 |
+| `revert.latency` | ≤ 2 s |
+| `gate.accept_if` | `{max_residual_m: 0.10, max_gauge_shift_m: 0.05, max_rejected_share: 0.5}` |
+| `gate.warping_rejected` | All (100 %), on the warping updates of episodes e034 and e040 |
+| `gate.others_accepted` | ≥ 0.9 |
+| `grid.floor_plan_agreement` | ≥ 0.9 |
+| `passages.door_recall` | ≥ 0.8 |
+| `passages.geometry` | ≥ 0.8, tolerances 0.10 m (centre) and 0.10 m (width) |
+| `grid.floor_observed` | ≥ 0.9 |
+| `grid.camera_cells_free` | 100 % |
+| `features.region_set` | 100 % |
+| `grid.band_occupied` | ≥ 0.95 |
+| `grid.floor_height` | ≤ 2 cm |
+| `reads.latency` | ≤ 0.5 s |
+| `objects.support_height` | ≤ 2 cm |
+| `objects.relations` | ≥ 0.9 |
+| `objects.centre_error`, `objects.label_agreement`, `objects.id_stability` | The round-4 values already in `targets.json` |
+| `analysis.range_scan_error` | ≤ 5 % of range |
+| `interactive.latency_under_load` | ≤ 2 × idle latency, and ≤ 3 s |
+| `locate.latency_idle` | ≤ 2 s |
+| `update.later_wins` | As before (unchanged ids and boxes; cup `struck`) |

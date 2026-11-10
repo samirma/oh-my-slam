@@ -131,9 +131,10 @@ is written against this schema. OpenLABEL is no longer produced.
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
-  bird's-eye image, last pose, versions and jobs.
-* **Interactive work.** Locate and frame analysis run in an interactive lane that never waits
-  behind an update's work. A job's registration phase also runs there.
+  bird's-eye image, last pose, jobs, and versions (O2).
+* **Interactive work.** Locate, frame analysis and dry runs run in an interactive lane that
+  never waits behind an update's work. A job's registration phase also runs there. A service
+  with a single worker instead runs them ahead of fusion (inference.md).
 * **Bulk work.** Fusion runs in a bulk lane.
 * **Ordering.** One job writes a given map at a time. A map's further jobs queue in arrival
   order.
@@ -176,11 +177,16 @@ Every estimate the skill acts on carries its uncertainty in the same response:
   a per-input status in a successful response, never an error.
 * **Tests.** Every module is covered by offline unit tests: no network, no model weights, no
   running inference server, with models replaced by test doubles. The build fails below 100 %
-  line and branch coverage of the whole package, models and evaluators included.
+  line and branch coverage of the whole package, models included. The evaluators are not part
+  of the package (§11).
 * **Licences.** Licences are not a blocker: the project is for personal and research use.
   Every third-party component and its licence is listed in `THIRD_PARTY_LICENSES.md`.
 
 ## 11. Evaluation
+
+The evaluators are client-side tools. They may live in the repository under `tools/`, but they
+are outside the service's scope: the service never depends on them, and the package does not
+contain them.
 
 A standalone evaluator replays recorded robot-guide episodes, from the base, the humanoid and
 the arm, against the simulator's ground truth.
@@ -191,7 +197,8 @@ the arm, against the simulator's ground truth.
   * `camera/`, the only one through a distorting lens: it covers the camera model's distortion
     (§4) for C1 and C8.
 * It measures each client-contract row (§2).
-* Its targets are data in `examples/targets.json`.
+* Its targets are data in `examples/targets.json`, the single source of targets, keyed by the
+  metric ids of evaluation.md.
 * It writes a machine-readable result and a summary outside the repository, and compares each
   run with a stored baseline.
 
@@ -199,7 +206,8 @@ The details are in [specs/evaluation.md](specs/evaluation.md).
 
 ## 12. Order of work and capabilities
 
-The groups are implemented in this order, so a robot can run on the API as early as possible:
+This order of work is guidance, so a robot can run on the API as early as possible. A group is
+claimed when it is served and passes its tests, whatever the order:
 1. O1 + O4, with the removals of §13;
 2. O5 + O6: a wheeled base can then run a whole episode;
 3. O7: needed by the camera-only humanoid and the arm;
@@ -210,7 +218,12 @@ Until O2 + O3 land, a job commits one version per update and fusion blocks it.
 `GET /api/health` lists the groups the running service implements in `capabilities` (`O1` …
 `O10`), so the client can refuse what is missing instead of failing. A partly served group is
 named by its part: `O3-jobs` means asynchronous jobs (202, then poll) without the provisional
-phase, cancel or lanes.
+phase, cancel or lanes. O10 may be claimed without lanes, provided a dry run never waits behind
+fusion; the C12 latency target stays its test.
+
+Health, timings and errors are base: every implementation serves them, in no group. The group
+of every other endpoint is named in api.md and map.md; the bird's-eye reads belong to step 1
+(§13).
 
 ## 13. Removed features
 
