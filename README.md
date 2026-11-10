@@ -56,8 +56,8 @@ status), **O9** (quality report and `accept_if` gate) and **O10** (dry run), wit
   `jobs/<id>.json` and the scratch folders `work/` and `trash/`.
 * **Endpoints.** `GET /api/health`, `GET /api/openapi.json`, `POST /api/maps/{name}/updates`,
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
-  `DELETE /api/maps/{name}`. The other endpoints of api.md come with their groups (O2, O3,
-  O5-O10); `?dry_run=1` answers `invalid_request` until O10.
+  `DELETE /api/maps/{name}`, and `?dry_run=1` (O10, *Dry run*). The other endpoints of api.md
+  come with their groups (O2, O3, O5-O8).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
