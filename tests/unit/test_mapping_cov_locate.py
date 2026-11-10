@@ -354,3 +354,32 @@ def test_the_default_progress_goes_to_the_log(caplog: pytest.LogCaptureFixture) 
     with caplog.at_level(logging.INFO, logger=lmod.log.name):
         lmod._progress("locating 1 image")
     assert "locating 1 image" in caplog.text
+
+
+def test_degenerate_solves_are_not_located() -> None:
+    """A solve far from every keyframe, outside their bounds, or held by one keyframe's few
+    inliers is no pose (a wrong locate with a small sigma is the worst case)."""
+    import numpy as np
+
+    from oh_my_slam.mapping import relocalize as rl
+
+    def kf(x: float) -> rl.Keyframe:
+        T = np.eye(4)
+        T[0, 3] = x
+        return rl.Keyframe(f"k{x}", T, np.eye(3), np.zeros((0, 2), np.float32),
+                           np.zeros((0, 128), np.uint8), np.zeros((0, 3), np.float32))
+
+    index = rl.Index([kf(0.0), kf(1.0), kf(2.0)])
+    T = np.eye(4)
+    kfs = np.array([0] * 10 + [1] * 10)
+    mask = np.ones(20, bool)
+    assert rl.plausible(rl.Hypothesis(T, 20, mask), kfs, index)
+    far = T.copy()
+    far[1, 3] = 5.0
+    assert not rl.plausible(rl.Hypothesis(far, 20, mask), kfs, index)
+    out = T.copy()
+    out[:3, 3] = [3.5, 0.0, 0.0]  # near the last keyframe, beyond the bounds grown by 1 m
+    assert not rl.plausible(rl.Hypothesis(out, 20, mask), kfs, index)
+    one = np.zeros(20, np.int64)
+    assert not rl.plausible(rl.Hypothesis(T, 20, mask), one, index)
+    assert rl.plausible(rl.Hypothesis(T, 40, np.ones(40, bool)), np.zeros(40, np.int64), index)

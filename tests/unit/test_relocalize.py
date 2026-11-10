@@ -67,7 +67,7 @@ def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit() -> None:
     assert o.T is not None
     dp, dr = rl.pose_distance(o.T, T)
     assert dp < 0.01 and dr < 0.2
-    assert o.sigma_pos_m is not None and 0.01 < o.sigma_pos_m < 0.03
+    assert o.sigma_pos_m is not None and 0.0005 < o.sigma_pos_m < 0.03  # not floored at 1 cm
     noisy = rl.locate(_query(T, P, D, noise=2.0), idx)
     assert noisy.sigma_pos_m is not None and noisy.sigma_pos_m > o.sigma_pos_m
     assert o.inlier_ratio is not None and o.inlier_ratio > 0.9
@@ -175,15 +175,15 @@ def test_nearest_view_turns_toward_where_the_keyframe_looks() -> None:
     idx = rl.Index([kf])
     q = _query(A, P, D)
     k, turn = rl.nearest_view(q, idx, 0)
-    assert k is kf and abs(turn) < 15.0
+    assert k is kf and turn is None  # no prior: the frame's heading is unknown
+    q.prior = A
+    _, turn = rl.nearest_view(q, idx, 0)
+    assert turn is not None and abs(turn) < 15.0
     q.prior = rooms.camera(0.0, 0.0, 1.0, 90.0)  # looking 90 deg left of the keyframe's view
     _, turn = rl.nearest_view(q, idx, 0)
     assert turn == pytest.approx(-90.0, abs=15.0)
     blind = rl.Keyframe("b", A, K, kf.uv, kf.desc, np.full_like(kf.xyz, np.nan), 0.0, 0.0)
     assert np.allclose(blind.view_point(), A[:3, 3] + A[:3, 2])
-    q.prior = None
-    _, turn = rl.nearest_view(q, rl.Index([blind]), 0)
-    assert turn == pytest.approx(0.0, abs=1e-6)
     above = A.copy()
     above[:3, 3] = blind.view_point() - [0, 0, 1]
     q.prior = above
@@ -279,3 +279,28 @@ def test_triangulated_points_follow_the_keyframe_poses_and_rescale_the_depth() -
 
     out = rl.triangulate([a, b], cached)
     assert calls == [(0, 1), (1, 0)] and np.allclose(out[0], a.xyz, equal_nan=True)
+
+
+def test_a_triangulation_that_disagrees_with_the_depth_is_not_taken() -> None:
+    """Depth twice too far (or keyframe poses the images did not confirm): the triangulation's
+    scale against the depth leaves the range, and the depth points stand; single points far from
+    their depth are dropped."""
+    P, D = _scene(n=800)
+    a = _kf("a", A, P, D)
+    b = _kf("b", rooms.camera(0.0, 0.6, 1.0, -10.0, -10.0), P, D)
+    a2 = rl.Keyframe("a2", a.T, a.K, a.uv, a.desc,
+                     (a.centre + 2.0 * (a.xyz - a.centre)).astype(np.float32))
+    pts = rl.triangulate([a2, b])
+    assert np.allclose(pts[0], a2.xyz, equal_nan=True)
+    a3 = rl.Keyframe("a3", a.T, a.K, a.uv, a.desc, a.xyz.copy())
+    a3.xyz[:20] = (a.centre + 3.0 * (a.xyz[:20] - a.centre)).astype(np.float32)
+    pts = rl.triangulate([a3, b])
+    _, _, idx = _view(A, P, D)
+    assert np.nanmedian(np.linalg.norm(pts[0] - P[idx], axis=1)) < 0.01
+
+
+def test_an_implausible_solve_is_not_located(monkeypatch: pytest.MonkeyPatch) -> None:
+    P, D = _scene()
+    monkeypatch.setattr(rl, "plausible", lambda h, kfs, index: False)
+    o = rl.locate(_query(A, P, D), rl.Index([_kf("a", A, P, D)]))
+    assert not o.located

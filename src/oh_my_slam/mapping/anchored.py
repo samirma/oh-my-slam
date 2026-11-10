@@ -80,6 +80,9 @@ CANDIDATE_MAX_DIST_M = 5.0
 CANDIDATE_DIST_UNIT_M = 0.5  # candidate score = distance / unit + angle / unit
 CANDIDATE_ANGLE_UNIT_DEG = 30.0
 RECENT_CANDIDATES = 8  # without prior or descriptor: the most recent keyframes
+RECENT_GUIDED = 3  # without prior: candidates near the last confirmed keyframe added
+NO_PRIOR_MIN_INLIERS = 15  # a frame without prior is registered on this many inliers...
+NO_PRIOR_MIN_RATIO = 0.15  # ... and this share of its matches
 ROTATION_FALLBACK_M = 0.20  # PnP failed: rotation-only still tried up to this distance
 ROTATION_FALLBACK_REL = 0.25  # ... or this share of the keyframe's median depth
 REPROJ_PX = 3.0  # inlier threshold at 640 px width, scaled with the image width
@@ -141,7 +144,7 @@ FLOOR_SAMPLE = 5000  # points a plane is fitted on
 HEIGHT_VOTE_BIN = 0.03  # log scale: the frames' floor candidates vote in bins this wide
 HEIGHT_VOTE_TOL = 0.15  # a frame's candidate this near the vote counts
 FLOOR_CANDIDATES = 8  # the most supported height peaks tried as planes
-FLOOR_SUPPORT_SHARE = 0.25  # a floor plane holds at least this share of the best plane's points
+MAP_FLOOR_SHARE = 0.5  # the map's floor: the lowest plane with this share of the best one's
 TOO_CLOSE_M = 0.30  # median depth (as service.checks.TOO_CLOSE_M)
 MIN_CAMERA_HEIGHT = 0.05
 ALIGN_MIN_POINTS = 30  # a new monocular keyframe's depth is aligned on this many lifted points
@@ -225,11 +228,11 @@ def first_camera(up_cam: Any) -> Array:
     return pose(M, np.zeros(3))
 
 
-def floor_candidates(p: Array) -> list[float]:
+def floor_candidates(p: Array, share: float = 0.25) -> list[float]:
     """The camera's heights above every strong horizontal plane below it, in its own points
     ``p`` (camera-centred, z up along gravity, unscaled), best supported first: the peaks of the
     points' log heights, each tried as a plane (``_horizontal_plane``), kept when it holds
-    ``FLOOR_SUPPORT_SHARE`` of the best one's points. Which one is the floor is decided across
+    ``share`` of the best one's points. Which one is the floor is decided across
     frames (``ScaleState._height_votes``): fitted per frame, so a frame that sees a lower floor
     through a door or a counter offers it without moving the others."""
     out: list[float] = []
@@ -246,8 +249,7 @@ def floor_candidates(p: Array) -> list[float]:
               if (got := _horizontal_plane(q, math.exp(centres[i]))) is not None]
     if planes:
         top = max(n for _, n in planes)
-        out = [h for h, n in sorted(planes, key=lambda hn: -hn[1])
-               if n >= FLOOR_SUPPORT_SHARE * top]
+        out = [h for h, n in sorted(planes, key=lambda hn: -hn[1]) if n >= share * top]
     return out
 
 
@@ -863,6 +865,9 @@ class Placement:
     # the lifted points it was registered on and their pixels (``AnchoredMap.align_depth``)
     lifted: tuple[Array, Array] | None = None
     align_T: Array | None = None  # the image-only pose the lifted points agree with
+    # the committed pose against the image-only pose on the stored map: how far the update puts
+    # the frame from where the map says it is (the quality report's residuals and gauge shift)
+    map_residual: tuple[float, float] | None = None
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -1172,9 +1177,18 @@ class AnchoredMap:
         pred = self._predict(f)
         T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         cands = self._candidates(f, T0, descriptor)
+        if pred is None:
+            # without a prior, a camera-only robot is near its last confirmed frame: the
+            # keyframes near that pose join the candidates (the origin is always confirmed). Its
+            # pose does not guide the matching: a guess that loose matches anything.
+            last = next(k for k in reversed(self.keyframes) if k.state == "fused")
+            near = self._candidates(f, last.T, None)
+            cands = cands + [k for k in near if all(k is not c for c in cands)]
+            cands = cands[:MAX_CANDIDATES + RECENT_GUIDED]
         reason = "few_features" if min(f.features_count or len(feats.kps), len(feats.kps)) \
             < 150 else "no_overlap"
-        corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) else None
+        corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) \
+            else None
         init = None
         if corr is not None and len(corr.uv) >= MIN_INLIERS:
             init = self._init(f, corr, cands, T0)
@@ -1195,7 +1209,8 @@ class AnchoredMap:
                 img = (s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri,
                        sub, refs)
         if T0 is None:
-            if img is None:
+            # without a prior, the images alone must carry it: more inliers, a fair share
+            if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
                 return Placement(f.name, "rejected", reason)
             s, n, _, method, spi, sri, _, _ = img
             return Placement(f.name, "registered", None, s.T, round(spi, 4), round(sri, 3), n,
@@ -1229,8 +1244,10 @@ class AnchoredMap:
             if n >= STRONG_INLIERS and ratio >= STRONG_RATIO and (not metric or refs_ok >= 2):
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr))
-            return Placement(f.name, "provisional", "no_overlap", T0, sp0, sr0, n, "prior",
+            weak = Placement(f.name, "provisional", "no_overlap", T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
+            weak.map_residual = (dp, dr)
+            return weak
         if metric:
             img_T = s.T
             if rot_only:
@@ -1244,7 +1261,9 @@ class AnchoredMap:
             T = fused.T
         pl = Placement(f.name, "registered", None, T, round(max(fsp, MIN_SIGMA_POS_M), 4),
                        round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref),
-                       lifted=_lifted(corr), align_T=s.T)  # type: ignore[arg-type]
+                       lifted=_lifted(corr), align_T=s.T,  # type: ignore[arg-type]
+                       map_residual=pose_residual(T, s.T) if not rot_only
+                       else (0.0, pose_residual(T, s.T)[1]))
         if method == "pnp":
             self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands,  # type: ignore[arg-type]
                                  (sub, refs, f.K, _prior_sigmas(f.prior)))
@@ -1457,10 +1476,15 @@ class AnchoredMap:
         self.up_check_deg = round(math.degrees(math.acos(max(-1.0, min(1.0, float(u[2]))))), 3)
 
     def floor_and_bounds(self) -> tuple[float | None, NDArray[np.float64]]:
-        """The floor height (lowest dense layer of the cloud below every camera) and the points
-        bounding the map (the cloud's and the cameras')."""
+        """The floor height (map.md §6) and the points bounding the map (the cloud's and the
+        cameras'). The floor is the lowest large horizontal plane of the cloud below every
+        camera: among the planes (``floor_candidates``) holding at least ``MAP_FLOOR_SHARE`` of
+        the best one's points, the lowest; without one, the lowest dense layer."""
         pts = self.cloud.points()
         centres = np.array([k.centre for k in self.keyframes]).reshape(-1, 3)
         below = float(centres[:, 2].min()) if len(centres) else 0.0
-        floor = lowest_layer(pts[:, 2], below) if len(pts) else None
+        floor = None
+        if len(pts):
+            planes = floor_candidates(pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)
+            floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
         return floor, np.vstack([pts, centres]) if len(pts) else centres

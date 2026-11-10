@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import io
+import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -117,8 +118,9 @@ def test_cold_start_then_a_sweep(client: Client) -> None:
         assert np.linalg.norm(np.array(i["T_map_cam"])[:3, 3] - T[:3, 3]) < 0.03
         assert i["inliers"] > 50 and i["sigma_pos_m"] >= 0.01
     q = job["quality"]
-    assert q["gauge_shift"] == {"translation_m": 0.0, "rotation_deg": 0.0, "scale_ratio": 1.0}
-    assert q["previous_residuals"]["count"] == 1 and q["scale_ratio_vs_prev"] == 1.0
+    # the new frames against the stored map: small for a consistent update
+    assert q["gauge_shift"]["translation_m"] < 0.03 and q["gauge_shift"]["scale_ratio"] == 1.0
+    assert q["previous_residuals"]["count"] == 6 and q["scale_ratio_vs_prev"] == 1.0
     assert q["prior_residuals"]["count"] == 7 and q["rejected_share"] == 0.0
     assert q["rebuilt"] is False and q["accepted"]
     assert set(job["timings_s"]) >= {"checks", "clone", "register", "fusion", "commit", "total"}
@@ -190,6 +192,12 @@ def test_provisional_rejected_and_the_gate(client: Client) -> None:
     assert job["state"] == "rejected" and job["quality"]["failed_checks"] == [
         "max_rejected_share"]
     assert job["result_version"] is None and client.service.store.latest("m") == 2
+    # the derived reads skip the provisional frame as a locate reference
+    grid = client.get("/api/maps/m/grid?cell_m=0.1", "Grid")
+    assert grid["map_version"] == 2
+    assert client.service.derived is not None
+    dv = client.service.derived.get("m", 2)
+    assert "b0" not in dv.meta["keyframes"] and "a0" in dv.meta["keyframes"]
 
 
 def test_drifting_map_and_frames_without_prior(client: Client) -> None:
@@ -345,6 +353,15 @@ def test_grid_points_and_locate_read_an_anchored_map(client: Client) -> None:
         time.sleep(0.5)
     grid = client.check(r, "Grid")
     assert grid["map_version"] == 1 and grid["shape"][0] > 5
+    import base64
+
+    lay = grid["layers"]["state"]
+    state = np.frombuffer(base64.b64decode(lay["data"]), np.uint8).reshape(grid["shape"])
+    ox, oy = grid["origin_m"]
+    for T in (base_pose(0), base_pose(90)):  # the cameras' cells are free
+        c, rr = int((T[0, 3] - ox) / 0.1), int((T[1, 3] - oy) / 0.1)
+        assert state[rr, c] == 1, (rr, c, state[max(rr - 1, 0):rr + 2, max(c - 1, 0):c + 2])
+    assert abs(grid["floor_z_m"]) < 0.05, grid["floor_z_m"]
     pts = client.get("/api/maps/m/points?min=-3,-3,-1&max=3,3,3", "Points")
     assert pts["count"] > 1000 if "count" in pts else True
     from oh_my_slam.service.backend import read_anchored
@@ -362,3 +379,16 @@ def test_grid_points_and_locate_read_an_anchored_map(client: Client) -> None:
                              "record": False}, {"q": img})
     r = client.http.post("/api/maps/m/locate", content=data, headers={"content-type": ctype})
     assert r.status_code == 200, r.text
+
+
+def test_a_keyframe_without_its_image_is_no_locate_reference(client: Client,
+                                                            tmp_path: Path) -> None:
+    fr, files = frames_for(client, [base_pose(0), base_pose(30)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    store = client.service.store
+    v = store.version("m")
+    (store.mapper_dir("m") / "kf" / f"{v['frames'][1]['internal']}.jpg").unlink()
+    assert client.service.derived is not None
+    client.service.derived._derive("m", 1, v, tmp_path / "d")
+    meta = json.loads((tmp_path / "d" / "meta.json").read_text())
+    assert meta["keyframes"] == ["a0"]

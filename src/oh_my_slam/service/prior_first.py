@@ -196,7 +196,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         tm["register"] = am.timings["register"]
         tm["fusion"] = round(am.timings["fuse"] + tm["objects"] + time.perf_counter() - t, 3)
         n = len(todo)
-        up.timings.add("registration_per_frame", tm["register"] / n, n)
+        # everything but fusion counts as registration (checks, clone): the job's own time
+        reg = tm["checks"] + tm["clone"] + tm["register"]
+        up.timings.add("registration_per_frame", reg / n, n)
         up.timings.add("fusion_per_frame", tm["fusion"] / n, n)
     job.progress = 0.95
     changed()
@@ -226,13 +228,20 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         ratio = round(am.scale.k / k_prev, 5) if mono and k_prev else 1.0
     low = sum(pl.status == "provisional" or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
               for _, pl in kept)
+    # the new frames against the stored map: how far the update puts each from where the
+    # images on the previous version place it (stored frames never move)
+    moved = [pl.map_residual for _, pl in kept if pl.map_residual is not None]
+    gauge = None
+    if prev is not None:
+        gauge = {"translation_m": round(float(np.median([m for m, _ in moved])), 4)
+                 if moved else 0.0,
+                 "rotation_deg": round(float(np.median([d for _, d in moved])), 3)
+                 if moved else 0.0, "scale_ratio": 1.0}
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": ratio,
-        "gauge_shift": None if prev is None else {"translation_m": 0.0, "rotation_deg": 0.0,
-                                                  "scale_ratio": 1.0},
+        "gauge_shift": gauge,
         "prior_residuals": residual_stats(prior_res),
-        "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
-        else None,
+        "previous_residuals": residual_stats(moved) if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
         "rebuilt": False,

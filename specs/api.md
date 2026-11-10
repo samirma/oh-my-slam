@@ -153,8 +153,9 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
   service can estimate one, else null:
   * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`;
-  * `turn_deg`: the signed turn from the frame's guessed heading (its prior when given, else the
-    nearest view's) toward that keyframe's view. Positive is counter-clockwise.
+  * `turn_deg`: the signed turn from the frame's prior heading toward that keyframe's view.
+    Positive is counter-clockwise. It is null when the frame carries no prior, because the
+    frame's own heading in the map is then unknown.
 
   A robot without odometry can then turn toward mapped structure.
 * **Provisional frames.** Locate works against a version whose newest frames are still
