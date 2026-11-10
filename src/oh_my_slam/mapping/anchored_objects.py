@@ -14,7 +14,10 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   compatible labels — one
   object per observation and one observation per object in a keyframe. Compatible labels match
   from ``MATCH_MIN`` (a generic label, ``GENERIC_LABELS``, goes with any), others (a
-  flickering label) only from ``MATCH_ANY``. The label is the most voted, a specific one first
+  flickering label) only from ``MATCH_ANY``; a detection cut by the image border with half its
+  points within an object's grown box is that object, whatever its label (a fragment of it), and
+  votes for its label with a quarter of its score; round produce the detector confuses
+  (``PRODUCE``) goes together. The label is the most voted, a specific one first
   (``MapObject.label``). An unmatched
   observation starts a new object, its id the next of ``next_id`` (never reused).
 * **Latest wins** (map.md §3). Every object that a keyframe has in view (``IN_VIEW_SHARE`` of its
@@ -36,8 +39,9 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
 * **Moved.** A new object of a compatible label, similar size (``MOVE_SIZE``) and colour
   (``MOVE_RGB``) that appears in the update in which an object is struck takes that object's id:
   ``state: moved`` with ``moved_from_m`` its old centre.
-* **Published.** An object is listed once two keyframes detected it, or one did and no keyframe
-  that had it in view saw its place without detecting it; once listed it stays listed. A single
+* **Published.** An object is listed once two keyframes detected it, or one did, whole (its mask
+  touching no image border), and no keyframe that had it in view saw its place without detecting
+  it; once listed it stays listed. A single
   detection that later keyframes see gone is dropped; two or more make it ``struck``.
 * **Boxes** are upright boxes (``segmentation.api.fit_object_obb``) fitted to the points of its
   sightings that agree on the centre; floor-standing classes are grounded on the map's floor.
@@ -164,6 +168,9 @@ COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no dept
 # has SPECIFIC_SHARE of their votes, and they go with any label
 GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
 SPECIFIC_SHARE = 0.25
+PRODUCE = frozenset({"apple", "orange", "tomato", "peach", "lemon", "pear", "onion", "potato"})
+FRAGMENT_INSIDE = 0.5  # a border-cut detection with this share of its points in an object's box
+CUT_VOTE = 0.25  # (grown by MATCH_GROW_M) is that object; it votes with this share of its score
 # floor coverings: never a support, and listed only on a room-sized surface (ROOM_FLOOR_M2)
 FLOOR_COVERINGS = frozenset({"rug", "carpet", "mat", "doormat", "bath mat"})
 ROOM_FLOOR_M2 = 3.0
@@ -394,9 +401,11 @@ class Observation:
 
 
 def alike(a: str, b: str) -> bool:
-    """Compatible labels (``segmentation.api.compatible``), or one of them generic
-    (``GENERIC_LABELS``: a ball, a fruit, a container may be anything of its shape)."""
-    return compatible(a, b) or a in GENERIC_LABELS or b in GENERIC_LABELS
+    """Compatible labels (``segmentation.api.compatible``), one of them generic
+    (``GENERIC_LABELS``: a ball, a fruit, a container may be anything of its shape), or both
+    round produce the detector confuses (``PRODUCE``: an apple seen as an orange)."""
+    return compatible(a, b) or a in GENERIC_LABELS or b in GENERIC_LABELS or (
+        a in PRODUCE and b in PRODUCE)
 
 
 def _extent(points: Array) -> float:
@@ -406,11 +415,17 @@ def _extent(points: Array) -> float:
     return float(np.max(hi - lo))
 
 
-def affinity(label: str, points: Array, centre: Array, o: MapObject) -> float:
-    """How strongly an observation (its label, map-frame points and centre) is object ``o``."""
+def affinity(label: str, points: Array, centre: Array, o: MapObject, cut: bool = False
+             ) -> float:
+    """How strongly an observation (its label, map-frame points and centre; ``cut``: its mask
+    touches the image border) is object ``o``."""
     if o.box is None or not len(points):
         return 0.0
     inside = float(np.mean(o.box.contains(points, MATCH_GROW_M)))
+    if cut and inside >= FRAGMENT_INSIDE:
+        # a fragment at the image border, within or touching the object's box: the object,
+        # whatever the label it was given
+        return max(MATCH_MIN, inside * MATCH_ANY)
     back = 0.0
     if len(o.points):
         lo, hi = points.min(0) - MATCH_GROW_M, points.max(0) + MATCH_GROW_M
@@ -428,14 +443,16 @@ def affinity(label: str, points: Array, centre: Array, o: MapObject) -> float:
     return a if a >= MATCH_ANY else 0.0
 
 
-def match(obs: list[tuple[str, Array, Array]], objects: list[MapObject]) -> list[int | None]:
-    """The object id of each observation (label, map-frame points, centre) of one image, or
-    None: strongest affinity first, one object per observation and one observation per object.
-    Frame analysis (O7) gives its detections the ids of the map objects they match."""
+def match(obs: list[tuple[str, Array, Array]], objects: list[MapObject],
+          cut: list[bool] | None = None) -> list[int | None]:
+    """The object id of each observation (label, map-frame points, centre; ``cut``: its mask
+    touches the image border) of one image, or None: strongest affinity first, one object per
+    observation and one observation per object. Frame analysis (O7) gives its detections the ids
+    of the map objects they match."""
     pairs = []
     for i, (label, pts, c) in enumerate(obs):
         for o in objects:
-            a = affinity(label, pts, c, o)
+            a = affinity(label, pts, c, o, bool(cut[i]) if cut is not None else False)
             if a > 0:
                 pairs.append((-a, i, o.id))
     out: list[int | None] = [None] * len(obs)
@@ -846,7 +863,8 @@ class ObjectMap:
         for view in views:
             obs = observe(view, version, floor_z)
             cands = [o for o in self.objects if o.box is not None]
-            ids = match([(ob.label, ob.points, ob.centre) for ob in obs], cands)
+            ids = match([(ob.label, ob.points, ob.centre) for ob in obs], cands,
+                        [ob.sighting.truncated for ob in obs])
             by_id = self.by_id()
             seen: set[int] = set()
             for ob, oid in zip(obs, ids, strict=True):
@@ -892,7 +910,9 @@ class ObjectMap:
                 continue
             if last >= 0 and o.id not in created:
                 o.state, o.moved_from = "confirmed", None  # seen again where it is
-            if not o.published and last >= 0 and (len(o.sightings) >= 2 or o.misses == 0):
+            # one sighting lists an object only whole in the image (no fragment at its border)
+            if not o.published and last >= 0 and (len(o.sightings) >= 2 or (
+                    o.misses == 0 and not o.sightings[0].truncated)):
                 o.published = True
         self.objects = [o for o in self.objects if o.id not in dropped]
         self._moves([o for o, _ in struck], created, version)
@@ -905,7 +925,10 @@ class ObjectMap:
         return out
 
     def _add(self, o: MapObject, ob: Observation, version: int, floor_z: float | None) -> None:
-        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + ob.score, 4)
+        # a detection cut by the image border votes for its label with CUT_VOTE of its score:
+        # the label of a whole view wins
+        w = ob.score * (CUT_VOTE if ob.sighting.truncated else 1.0)
+        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + w, 4)
         o.sightings.append(ob.sighting)
         k = len(o.sightings) - 1
         pts = _thin(ob.points).astype(np.float32)

@@ -224,9 +224,10 @@ def test_cut_masks_leave_extents_partial(tmp_path: Path) -> None:
     sc = TableScene(items=[Item("shelf", [((-1.0, 2.3, 0.0), (1.0, 2.5, 2.0))])])
     om = ObjectMap(tmp_path)
     om.update([view("a", (0.0, 1.2, 1.0), sc, target=(0.0, 3.0, 1.0))], 1, 0.0)
-    o = om.records()["objects"][0]
-    assert o["extent_seen"] == {"x": "partial", "y": "partial", "z": "partial"}
-    assert o["sigma_centre_m"] >= ao.MIN_SIGMA_M
+    assert om.records()["objects"] == []  # one sighting cut by the border: not listed yet
+    o = om.objects[0]
+    assert ao.extent_seen(o) == {"x": "partial", "y": "partial", "z": "partial"}
+    assert ao.sigma_centre(o) >= ao.MIN_SIGMA_M
 
 
 # -- pieces ---------------------------------------------------------------------------------------
@@ -689,3 +690,39 @@ def test_worktop_support_heights_with_noisy_depth(tmp_path: Path,
                                            "verified_version": 1}
     if eyes is ABOVE:
         assert o["egg"]["extent_seen"]["z"] == "partial"
+
+
+def _edge_view(sc: TableScene, kid: str) -> View:
+    """A keyframe that has the apple cut by its left border."""
+    eye = (0.25, -0.6, 1.3)
+    for dx in np.linspace(0.7, 1.2, 51):
+        v = view(kid, eye, sc, target=(0.25 + dx, 0.3, TOP))
+        d = next((d for d in v.dets if d.label == "apple"), None)
+        if d is not None and d.mask[:, 0].any() and d.mask.sum() > 150:
+            return v
+    raise AssertionError("no edge view")
+
+
+def test_a_fragment_at_the_border_is_the_object(tmp_path: Path) -> None:
+    sc = TableScene(items=[default_items()[0],
+                           Item("apple", [((0.21, 0.26, TOP), (0.29, 0.34, TOP + 0.08))],
+                                (200, 30, 30))])
+    whole = view("a", EYES[0], sc)
+    edge = _edge_view(sc, "b")
+    edge.dets = [Detection("orange" if d.label == "apple" else d.label, 0.95, d.source, d.mask,
+                           d.box) for d in edge.dets]
+    om = ObjectMap(tmp_path)
+    om.update([whole, edge], 1, 0.0)
+    labels = [o["label"] for o in om.records()["objects"]]
+    assert labels.count("apple") == 1 and "orange" not in labels
+    apple = next(o for o in om.objects if o.label == "apple")
+    assert len(apple.sightings) == 2 and apple.sightings[1].truncated
+    # a fragment alone is not listed until another view confirms it
+    om2 = ObjectMap(tmp_path / "two")
+    om2.update([_edge_view(sc, "c")], 1, 0.0)
+    assert not [o for o in om2.records()["objects"] if o["label"] == "apple"]
+
+
+def test_produce_goes_together() -> None:
+    assert ao.alike("apple", "orange") and ao.alike("tomato", "peach")
+    assert not ao.alike("apple", "cup")

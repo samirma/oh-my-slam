@@ -214,6 +214,11 @@ called by `service.prior_first` after the engine placed and fused the update's k
   no keyframe judges any object on depth where one of its detections of a comparable size (≤ 4×)
   covers the object's place. On `office_sequence` (640 px in 4 + 4, 1280 px in 13 and 4 + 9) only
   the cup is struck; the glass globe, the tree behind the window and the window panes stay.
+* **Fragments.** A detection cut by the image border that has half its points within an
+  object's box grown by 5 cm is that object, whatever its label (an apple's edge seen as an
+  orange), and votes for its label with a quarter of its score; one cut detection alone is not
+  listed until another view confirms it. Round produce the detector confuses (apple, orange,
+  tomato, peach, lemon, pear, onion, potato) is associated together.
 * **Labels.** Generic labels (`ball`, `food`, `fruit`, `vegetable`, `toy`, `container`) match
   any label and never outvote a specific one that has a quarter of their votes; the vocabulary
   has the simulated kitchens' items (lettuce, spatula, ladle, salt and pepper shakers, sponge,
