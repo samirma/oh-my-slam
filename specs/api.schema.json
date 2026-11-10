@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: within 0.02 m and 2 deg of a stored keyframe of the same camera (README-configurable defaults; never at 0.05 m or 5 deg), or a frame name the map or request already holds; duplicate_of names that frame."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg) of a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, same camera, or a frame name the map or request already holds; duplicate_of names that frame."
     },
     "InputStatus": {
       "type": "object",
@@ -433,7 +433,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the name of the stored (or earlier) frame it duplicates, within 0.02 m and 2 deg of it (README-configurable defaults) or holding the same name."
+          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name."
         }
       },
       "allOf": [
@@ -914,7 +914,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the name of the stored (or earlier) frame it duplicates, within 0.02 m and 2 deg of it (README-configurable defaults) or holding the same name."
+          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name."
         }
       },
       "allOf": [
@@ -1211,7 +1211,7 @@
             "fused",
             "kept_at_prior"
           ],
-          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells until registered; never a locate reference."
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -1466,11 +1466,11 @@
                 "type": "number",
                 "minimum": 0,
                 "maximum": 1,
-                "description": "Fraction of the frames that saw the object and gave this label."
+                "description": "Frames that gave this label over frames in which the object was in view, detected or not."
               }
             }
           },
-          "description": "Highest share first; shares sum to at most 1. detected_as is unchanged."
+          "description": "Highest share first; shares sum to at most 1, and may sum to less. detected_as is unchanged."
         }
       },
       "description": "An object record of an objects read (map.md §5)."
@@ -1775,7 +1775,7 @@
         },
         "floor_z_m": {
           "type": "number",
-          "description": "Absolute map-frame z of the floor estimate."
+          "description": "Absolute map-frame z of the floor estimate: with priors, the large plane nearest the priors' origin height; without priors but with a camera height, the floor plane the height defines (about 0), refined by an observed plane within 3 sigma; otherwise the lowest large plane below the cameras."
         },
         "floor_sigma_m": {
           "type": "number",

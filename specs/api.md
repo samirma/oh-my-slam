@@ -124,7 +124,8 @@ error code `invalid_request` (§9).
   `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
   uses it as a reference (§6). Occupancy, heights, the cloud and object records come only from
   image-confirmed frames: a `kept_at_prior` frame counts only for free-by-rule cells (its camera
-  stand and near blind disc, map.md §6) until it is registered.
+  stand and near blind disc, map.md §6) until a later job's images confirm it; its pose then
+  becomes a registered one in that version (map.md §2).
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
@@ -140,11 +141,12 @@ error code `invalid_request` (§9).
   * A frame with a prior whose image fails the quality checks (`plain`, `blur`,
     `few_features`) is `kept_at_prior` with that reason. It is `rejected` only when the image is
     unusable (`unusable_image`: it does not decode, or its size is not the camera's).
-  * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or one
-    whose name the map or the request already holds (§3). `duplicate_of` names that stored (or
-    earlier) frame. 0.02 m and 2° are defaults, configurable in `README.md`; a frame 0.05 m or
-    5° away from every stored keyframe of its camera is never a duplicate, whatever the
-    configuration. A view the map already has, farther than those limits, is `registered`.
+  * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or of
+    an earlier `registered` frame of the same request and camera, or one whose name the map or
+    the request already holds (§3). `duplicate_of` names that frame. Stored `kept_at_prior`
+    keyframes do not count for this test. 0.02 m and 2° are defaults; `README.md` may raise
+    them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or 5° away is never a
+    duplicate. A view the map already has, beyond those limits, is `registered`.
   * `too_close` is only the camera-to-scene distance limit, with `min_distance_m` and
     `scene_distance_m`.
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
