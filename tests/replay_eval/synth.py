@@ -187,6 +187,7 @@ class Synth:
     truth: dict[str, np.ndarray] = field(default_factory=dict)  # frame name -> T_world_cam
     start: dict[str, np.ndarray] = field(default_factory=dict)  # run -> T_world_start
     names: dict[str, list[str]] = field(default_factory=dict)  # set key -> frame names
+    times: dict[str, float] = field(default_factory=dict)  # frame name -> capture time
 
 
 RUN_STARTS = {"r1": (0.8, 1.45, 0.0), "r2": (6.0, 1.0, 180.0)}
@@ -276,6 +277,7 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
                 T_wc[:3, 3] += ARM_CAM_ERROR
             name = f"{spec.run}/{spec.name}/{Path(file).stem}"
             syn.truth[name] = T_wc
+            syn.times[name] = t_f
             syn.names[key].append(name)
             base = T_ws if arm else T_ws @ make_T(rot_z(math.radians(yaw)), [x, y, 0.0])
             track.append((t_f, base, T_wc[:3, 3].copy(), T_wc[:3, :3].copy()))

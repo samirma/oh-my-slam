@@ -92,6 +92,50 @@ The exit status is 0 when at least one replay was measured, and 1 otherwise.
 Every response is validated against `specs/api.schema.json`, as is every error body
 (`ErrorBody`). A missing `Server-Timing` header is counted too.
 
+## Skill-v2 episodes (picked automatically)
+
+An episode is read as v2 when `agent_files/runs/<run>/frames/*.json` sidecars exist and no
+`<run>/<set>/views.json` does (`rpl_episode_v2.py`). The old reader stays for the old layout.
+
+* **Frames.** `frames/<name>.png`, `<name>.depth.png` (16-bit, mm) and a `<name>.json` sidecar
+  `{name, image, depth, camera_id, width_px, height_px, stamp, ros_stamp, state_ros_stamp,
+  T_body_cam, T_body_cam_source, height_above_floor_m, height_sigma_m, pose_source, pose_state,
+  prior {T_map_cam, sigma_pos_m, sigma_rot_deg, trust}}`.
+  * Any field may be null or missing, except `stamp` and the image file. Files starting with
+    `_` (`_select.json`) are not frames.
+  * Errors name the file and the key.
+* **Plan.**
+  * **Updates:** every job of `oms/jobs.json` (`{"jobs": [{job_id, frames, accept_if, state,
+    submitted_at, measured}]}`, or a bare list), in submission order. Each carries its frames,
+    their sidecar priors and depth images, their heights, and the job's own `accept_if`. The
+    run's `oms/jobs.json` is read first, else the episode's.
+  * **Locates:** the `loc*` frames that are in no job, located at their stamps. Frames less than
+    10 s apart are grouped into one request, which carries their sidecar priors.
+  * Other frames (`close*`, `probe*` outside jobs, …) were not sent, and are not sent here.
+  * Each job's `measured.s` is reported as `recorded_s` next to the replayed time.
+* **Intrinsics, per run and camera:**
+  1. `calibrate_camera.json` → `intrinsics {fx_px, fy_px, cx_px, cy_px, width_px, height_px}`,
+     when its size matches the frames;
+  2. `camera_info_<camera_id>.json` → ROS CameraInfo `msg` (`K`, `width`, `height`; `D` with
+     `plumb_bob` or `rational_polynomial` becomes OpenCV distortion when non-zero);
+  3. `--camera '{"fx": …, "fy": …, "cx": …, "cy": …, "width": …, "height": …}'`.
+
+  The error lists what was tried. A camera id calibrated differently in a later run is sent
+  as `<id>@<run>`.
+* **Truth.** The truth `cams.<camera>` position at the sidecar `stamp` (no matching needed). The
+  orientation comes from the robot's link, as in v1. The run's start frame (the priors' map
+  frame) is fitted by a gravity-aligned similarity of the prior positions to the truth
+  positions; its scale is reported as `odometry_scale`. When it cannot be fitted, the start
+  frame is the arm's `base_link` or the base pose at the first stamp.
+* **Replay.**
+  * The prior replay (`metric`) sends each frame's sidecar prior as recorded (trust and
+    sigmas). The `none` replay sends `trust: none`.
+  * Both send the sidecar heights (`--no-height` to drop them) and the depth images with
+    updates (`--no-depth` to drop them).
+* **`--dump-layout`** prints, per run: sidecar counts by name prefix, sidecar keys, prior trusts,
+  depth count, camera ids and the intrinsics source, job count and keys, `oms/` file names, and
+  the line count and keys of `log.jsonl`. Never values.
+
 ## Assumptions about the episode keys (to confirm with `--dump-layout`)
 
 They follow the conductor's layout (`~/oh-my-slam-data/robot-guide/episode_layout.md`). Each is a
@@ -197,6 +241,7 @@ with its target. The overall value pools the samples of all replays. Statuses ar
 | Always | `c3.readable_s` (upload → `provisional_version`/`result_version` seen, p90 ≤ 2 s); `c3.fusion_s_per_frame` (p90 ≤ 3 s); `c3.reads_one_version` (100 %); `c4.reason_agreement` (≥ 0.8); `c4.inputs_contract`; `c2.scale_error_priors` (≤ 3 %, metric replay), `c2.scale_error_height` (≤ 10 %, none replay with heights), `c2.scale_error_monocular` (info); `c1.shift_pos_m` (≤ 2 cm) and `c1.shift_rot_deg` (≤ 0.5°), as medians beyond `quality.gauge_shift`; `c1.prior_residual_m` and `_deg` (info, prior replay: the inputs' `prior_residual_*`); `contract.schema_valid`; `contract.server_timing` |
 | O2 | `c5.revert_s` (≤ 2 s); `c5.revert_contract` |
 | O3 | `c3.eta_within_30pct` (job `eta_s`, and dry-run `predicted_s` when O10 is served; also measured with `O3-jobs`); `c3.fusing_version_gap_s` (≤ 10 s when fusion lasts longer) |
+| Always (look sweeps) | `c8.sweep_yaw_error_deg` (info: each look-sweep keyframe's map yaw after the gravity-aligned fit against truth, median) and `c8.sweep_yaw_span_ratio` (info: map over truth yaw span of each sweep, median; > 1 over-counts). A sweep is a run of consecutive `look*` frames, in time order, from one stand (within 0.25 m of its first; `sweep` in the layout). `info.sweeps` lists each sweep's median, max, spans and ratio. |
 | O5 | `c8.located_near_keyframe` (≥ 0.9); `c8.pos_error_over_tolerance` (median ≤ 1, where the tolerance is max(2 cm, 1 % of the scene depth)); `c8.pos_error_m` (info); `c8.ambiguity_on_wrong` (≥ 0.8); `c8.ambiguity_null_on_right` (≥ 0.9); `c8.ambiguity_rule` (api.md §6); `c8.nearest_view_turn` (≥ 0.8; only `no_overlap` frames sent with a prior, i.e. in the prior replay, since `turn_deg` is null without one; a null turn then counts as a miss); `c12.locate_idle_s` (≤ 2 s, per frame of each idle request: the one-frame probes and the replay's locates); `c12.locate_first_s` (info: the first idle locate per frame, the warm-up); `c12.locate_busy_s` (≤ 3 s); `c12.locate_busy_ratio` (≤ 2) |
 | O6 | `c9.camera_cells_free`, with `c9.camera_stand_free` (info: the camera cells alone, to tell a missing stand from a missing blind ring). Both index the grid by `origin_m` (the corner of cell [0, 0]), rows = y and cols = x, with the cameras' map-frame poses from `GET frames` of the grid's version; `c9.regions_set`; `c9.band_as_asked`; `c9.floor_height_error_m` (≤ 2 cm, against the lowest large support plane in view: the hello block's `floor_z`, or its `worktop.z` when `meta.placement` is `worktop` (`worktop_placements`) or the robot's kind is arm (`Params.worktop_kinds`)); `c9.grid_read_s` (≤ 0.5 s). With a floor plan: `c9.grid_agreement` (≥ 0.9); `c9.doors_found` (≥ 0.8); `c9.passage_geometry` (≥ 0.8); `c9.floor_observed` (≥ 0.9; cells with `floor_observed` 2, free by rule, are left out); `c9.band_occupied` (≥ 0.95) |
 | O7 | `c12.analyse_busy_s` (≤ 3 s); `c12.analyse_busy_ratio` (≤ 2); with a floor plan, `c11.range_rel_error` (median ≤ 5 %) |

@@ -108,6 +108,8 @@ class Fake:
         self.accept_ifs: list[Any] = []
         self.priors: list[Any] = []
         self.locate_priors: list[Any] = []
+        self.depths: list[str] = []
+        self.heights: list[float] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -569,6 +571,10 @@ class Fake:
                              "predicted_s": {"registration": 0.07, "fusion": 0.12}}
             self.accept_ifs.append(req.get("accept_if"))
             self.priors.extend(f.get("prior") for f in req["frames"])
+            self.heights.extend(f["height_above_floor_m"] for f in req["frames"]
+                                if "height_above_floor_m" in f)
+            self.depths.extend(f["depth"] for f in req["frames"]
+                               if "depth" in f and f["depth"] in files)
             if name in self.maps:
                 self.maps[name].cameras.update(req.get("cameras", {}))
             job = Job(uuid.uuid4().hex[:8], name, [f["name"] for f in req["frames"]], inputs,

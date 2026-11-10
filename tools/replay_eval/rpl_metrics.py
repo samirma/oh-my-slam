@@ -12,6 +12,7 @@ import base64
 import itertools
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -63,6 +64,11 @@ DEFS: list[Def] = [
     Def("c8.nearest_view_turn", "C8", "no_overlap frames sent with a prior whose nearest_view "
         "turn points toward "
         "the keyframe's view (within 45°)", ">=", 0.8, "share", "share", ("O5",)),
+    Def("c8.sweep_yaw_error_deg", "C8", "Keyframe yaw error in look sweeps after the "
+        "gravity-aligned fit (median; is a locate yaw bias from registration?)", None, None,
+        "median", "deg"),
+    Def("c8.sweep_yaw_span_ratio", "C8", "Map over truth yaw span of each look sweep's "
+        "keyframes (median; > 1 over-counts the turn)", None, None, "median", "ratio"),
     Def("c2.scale_error_priors", "C2", "Scale error with metric priors", "<=", 0.03, "max",
         "ratio"),
     Def("c2.scale_error_height", "C2", "Scale error with camera height only", "<=", 0.10,
@@ -175,6 +181,8 @@ class Params:
     worktop_kinds: tuple[str, ...] = ("arm",)  # floor_z_m is judged against the worktop
     worktop_placements: tuple[str, ...] = ("worktop",)  # ... as for meta.placement "worktop"
     labels: LabelRule = field(default_factory=LabelRule)
+    sweep_prefixes: tuple[str, ...] = ("look",)  # a sweep: consecutive frames named so ...
+    sweep_stand_m: float = 0.25  # ... whose truth positions stay this close to the first
     heights: bool = True
 
 
@@ -354,6 +362,7 @@ class Measure:
         else:
             s.info["alignment"] = None
         self.latency()
+        self.sweeps()
         self.inputs()
         self.scale()
         self.stability()
@@ -418,6 +427,46 @@ class Measure:
                       max(0.0, float(gaps.max()) - self.p.probe_interval_s))
         for ok in self.rec.consistency:
             s.add("c3.reads_one_version", ok)
+
+    def sweeps(self) -> None:
+        """Per sweep (consecutive look frames from one stand, in time order): each keyframe's
+        map yaw, after the gravity-aligned fit, against truth; and the map yaw span (sum of the
+        turns between consecutive keyframes) over the truth span."""
+        if self.al is None or not self.keyframes:
+            return
+        sim = self.al[0]
+        kf = {r["name"]: frame_pose(r) for r in self.keyframes}
+        ordered = sorted(self.ep.all_frames(),
+                         key=lambda f: (f.time if f.time is not None else math.inf, f.name))
+        groups: list[list[Frame]] = []
+        prev_in = False
+        for f in ordered:
+            look = Path(f.file).stem.startswith(self.p.sweep_prefixes)
+            assert f.truth is not None
+            if look and prev_in and np.linalg.norm(
+                    f.truth[:3, 3] - groups[-1][0].truth[:3, 3]) <= self.p.sweep_stand_m:  # type: ignore[index]
+                groups[-1].append(f)
+            elif look:
+                groups.append([f])
+            prev_in = look
+        report = []
+        for g in groups:
+            rows = [(optical_yaw_deg(sim.R @ kf[f.name][:3, :3]),
+                     optical_yaw_deg(f.truth[:3, :3])) for f in g if f.name in kf]  # type: ignore[index]
+            if len(rows) < 2:
+                continue
+            errs = [abs(wrap_deg(m - t)) for m, t in rows]
+            span_m = sum(wrap_deg(b[0] - a[0]) for a, b in itertools.pairwise(rows))
+            span_t = sum(wrap_deg(b[1] - a[1]) for a, b in itertools.pairwise(rows))
+            ratio = span_m / span_t if abs(span_t) >= 1.0 else None
+            for e in errs:
+                self.s.add("c8.sweep_yaw_error_deg", e)
+            if ratio is not None:
+                self.s.add("c8.sweep_yaw_span_ratio", ratio)
+            report.append({"first": g[0].name, "frames": len(g), "keyframes": len(rows),
+                           "median_deg": float(np.median(errs)), "max_deg": float(max(errs)),
+                           "span_map_deg": span_m, "span_truth_deg": span_t, "ratio": ratio})
+        self.s.info["sweeps"] = report
 
     def inputs(self) -> None:
         s = self.s

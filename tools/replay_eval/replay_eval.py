@@ -67,6 +67,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--base-priors", choices=["drifting", "metric"], default="drifting",
                    help="trust of the wheeled base's odometry priors in the metric replay "
                    "(sigma: 10 %% of the distance travelled)")
+    p.add_argument("--camera", help="intrinsics JSON {fx, fy, cx, cy, width, height} for v2 runs "
+                   "with neither calibrate_camera.json nor camera_info_<id>.json")
+    p.add_argument("--no-depth", action="store_true", help="no v2 depth images in updates")
     p.add_argument("--no-height", action="store_true",
                    help="no height_above_floor_m in the trust-none replay")
     p.add_argument("--range-scans", type=int, default=5)
@@ -147,7 +150,8 @@ def job_brief(rec: Record) -> list[dict[str, Any]]:
             "readable_s": None if j.t_readable is None else j.t_readable - j.t_start,
             "total_s": None if j.t_end is None else j.t_end - j.t_start,
             "rejected": {i["name"]: i["reason"] for i in inputs if i["status"] == "rejected"},
-            "quality": j.job.get("quality"), "error": j.error})
+            "quality": j.job.get("quality"), "error": j.error,
+            "recorded_job_id": j.job_id_recorded, "recorded_s": j.recorded_s})
     return out
 
 
@@ -206,6 +210,8 @@ def replay_run(args: argparse.Namespace, validator: Validator, ep: Episode, mode
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     layout = load_layout(args.layout)
+    if args.camera:
+        layout["camera_override"] = json.loads(args.camera)
     paths = select_episodes(args.episodes, [e for group in args.episode for e in group])
     if args.dump_layout:
         print(json.dumps([dump_layout(p, layout) for p in paths], indent=1, default=str))
@@ -223,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
                     align_full_rotation=args.align_full_rotation,
                     worktop_placements=tuple(layout["worktop_placements"]),
                     labels=LabelRule.from_layout(layout["labels"]),
+                    sweep_prefixes=tuple(layout["sweep"]["prefixes"]),
+                    sweep_stand_m=float(layout["sweep"]["stand_m"]),
                     probe_interval_s=args.probe_interval_s,
                     warping=tuple(w for w in args.warping.split(",") if w),
                     heights=not args.no_height,
@@ -231,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     options = Options(wait_s=args.wait_s, probe_interval_s=args.probe_interval_s,
                       probes=not args.no_probes, heights=not args.no_height, keep=args.keep,
                       accept_if=json.loads(args.accept_if), range_scans=args.range_scans,
-                      job_timeout_s=args.job_timeout_s,
+                      job_timeout_s=args.job_timeout_s, depth=not args.no_depth,
                       sigma_pos_m=layout["prior_sigma_pos_m"],
                       sigma_rot_deg=layout["prior_sigma_rot_deg"],
                       height_sigma_m=layout["height_sigma_m"],

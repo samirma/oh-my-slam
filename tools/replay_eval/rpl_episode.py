@@ -66,6 +66,15 @@ class Frame:
     truth: Arr | None = None  # T_world_cam
     truth_source: str = ""
     height_m: float | None = None
+    # v2 layout: the sidecar's prior as the skill sent it, depth image, height sigma
+    prior: dict[str, Any] | None = None
+    depth_path: Path | None = None
+    height_sigma_m: float | None = None
+
+    @property
+    def has_pose(self) -> bool:
+        """A views/prior pose is known (v2 frames without a prior have none)."""
+        return bool(np.isfinite(self.pose).all())
 
     @property
     def name(self) -> str:
@@ -100,6 +109,9 @@ class Event:
     op: str  # update | locate
     set_key: str
     files: list[str] | None  # a subset of the set's files, or None for all
+    accept_if: dict[str, Any] | None = None  # v2: the job's own gate
+    job_id: str | None = None  # v2: the recorded job
+    measured_s: float | None = None  # v2: the recorded job's measured time
 
 
 @dataclass
@@ -181,6 +193,7 @@ class Episode:
     placement: str = ""  # meta.placement, e.g. "worktop"
     odom_scale: dict[str, float] = field(default_factory=dict)  # run -> truth / odometry
     mount_rot_spread_deg: float | None = None  # median spread of the per-frame mount estimates
+    version: int = 1  # episode layout: 1 (views.json sets) or 2 (frames/ sidecars, oms/jobs.json)
 
     def frames(self, event: Event) -> list[Frame]:
         fs = self.sets[event.set_key].frames
@@ -561,8 +574,10 @@ def orient(ep: Episode, link: str, layout: dict[str, Any]) -> None:
                                       keys["quat_order"])))
     mount = R_LINK_OPT
     if ep.kind in layout["mount_fit"] and rows:
-        believed = [R_link.T @ f.truth[:3, :3] for f, R_link in rows]  # type: ignore[index]
-        mount, ep.mount_rot_spread_deg = mean_rotation(believed)
+        believed = [R_link.T @ f.truth[:3, :3] for f, R_link in rows  # type: ignore[index]
+                    if np.isfinite(f.truth[:3, :3]).all()]  # type: ignore[index]
+        if believed:
+            mount, ep.mount_rot_spread_deg = mean_rotation(believed)
     for f, R_link in rows:
         assert f.truth is not None
         f.truth[:3, :3] = R_link @ mount
@@ -602,7 +617,18 @@ def hello_of(meta: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def is_v2(root: Path, layout: dict[str, Any]) -> bool:
+    """The skill-v2 layout: runs/<run>/frames/<name>.json sidecars, no views.json."""
+    runs = root / layout["files"]["runs"]
+    return any(p.name[:1] != "_" for p in runs.glob("*/frames/*.json")) and \
+        not any(runs.glob(f"*/*/{layout['files']['views']}"))
+
+
 def load_episode(root: Path, layout: dict[str, Any]) -> Episode:
+    if is_v2(root, layout):
+        from rpl_episode_v2 import load_v2
+
+        return load_v2(root, layout)
     warnings: list[str] = []
     keys = layout["truth"]
     lines = read_jsonl(root / layout["files"]["truth"])
@@ -679,6 +705,11 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
             out["truth"][k] = info
     else:
         out["truth"] = f"missing {layout['files']['truth']}"
+    if is_v2(root, layout):
+        from rpl_episode_v2 import dump_v2
+
+        out["layout_version"] = 2
+        out["runs_v2"] = dump_v2(root, layout)
     sets: list[dict[str, Any]] = []
     runs = root / layout["files"]["runs"]
     for views_path in sorted(runs.glob(f"*/*/{layout['files']['views']}")):
@@ -734,7 +765,7 @@ def _views_vs_truth(ep: Episode) -> dict[str, float | None]:
     and the truth poses: a check of the start-frame, time and orientation assumptions."""
     pos, rot = [], []
     for f in ep.all_frames():
-        if f.truth is None:
+        if f.truth is None or not f.has_pose:
             continue
         V = ep.start_poses[f.run] @ f.pose
         pos.append(float(np.linalg.norm(V[:3, 3] - f.truth[:3, 3])))

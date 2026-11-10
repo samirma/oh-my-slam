@@ -33,6 +33,7 @@ class Options:
     z_band_m: tuple[float, float] = (0.05, 1.8)
     range_scans: int = 5
     job_timeout_s: float = 1800.0
+    depth: bool = True  # send v2 depth images with updates
     locate_batch: int = 8
     sigma_pos_m: float = 0.02
     sigma_rot_deg: float = 1.0
@@ -59,6 +60,8 @@ class JobObs:
     dry: dict[str, Any] | None = None
     dry_s: float | None = None
     error: str | None = None
+    job_id_recorded: str | None = None  # v2: the episode's job
+    recorded_s: float | None = None  # v2: its measured time in the episode
     versions_seen: list[tuple[float, int]] = field(default_factory=list)  # job latest_version
 
     def observe(self, t: float, job: dict[str, Any]) -> None:
@@ -142,8 +145,27 @@ class Replayer:
         sp = self.ep.start_poses
         return inv_T(sp[self.anchor_run]) @ sp[f.run] @ f.pose
 
+    def frame_entry_v2(self, f: Frame, entry: dict[str, Any]) -> dict[str, Any]:
+        """A v2 frame as the skill sent it: its sidecar prior (prior replay) and height."""
+        p = f.prior
+        if self.mode == "metric" and p is not None and p.get("trust", "none") != "none":
+            prior = {"trust": p["trust"], "T_map_cam": f.pose.tolist()}
+            for key in ("sigma_pos_m", "sigma_rot_deg"):
+                if p.get(key) is not None:
+                    prior[key] = float(p[key])
+            entry["prior"] = prior
+        else:
+            entry["prior"] = {"trust": "none"}
+        if self.opt.heights and f.height_m is not None:
+            entry["height_above_floor_m"] = f.height_m
+            entry["height_sigma_m"] = f.height_sigma_m if f.height_sigma_m is not None \
+                else self.opt.height_sigma_m
+        return entry
+
     def frame_entry(self, f: Frame, part: str) -> dict[str, Any]:
         entry: dict[str, Any] = {"name": f.name, "image": part, "camera_id": f.camera_id}
+        if self.ep.version == 2:
+            return self.frame_entry_v2(f, entry)
         if self.mode == "metric":
             kind = self.ep.kind
             sigma = max(self.opt.sigma_pos_m, self.opt.travel_share.get(kind, 0.0) * f.travel_m)
@@ -157,13 +179,21 @@ class Replayer:
                 entry["height_sigma_m"] = self.opt.height_sigma_m
         return entry
 
-    def body_and_parts(self, frames: list[Frame]) -> tuple[dict[str, Any], list[Part]]:
+    def body_and_parts(self, frames: list[Frame],
+                       depth: bool = False) -> tuple[dict[str, Any], list[Part]]:
+        """The request body and file parts; ``depth`` adds each frame's depth image (updates
+        only: locate frames carry none)."""
         parts: list[Part] = []
         entries = []
         for i, f in enumerate(frames):
             data = f.path.read_bytes()
             parts.append((f"f{i}", f.file, data, mime(data)))
-            entries.append(self.frame_entry(f, f"f{i}"))
+            entry = self.frame_entry(f, f"f{i}")
+            if depth and self.opt.depth and f.depth_path is not None:
+                parts.append((f"d{i}", f.depth_path.name, f.depth_path.read_bytes(),
+                              "image/png"))
+                entry["depth"] = f"d{i}"
+            entries.append(entry)
         cams = {f.camera_id: self.ep.cameras[f.camera_id] for f in frames}
         return {"cameras": cams, "frames": entries}, parts
 
@@ -233,10 +263,12 @@ class Replayer:
 
     # ---- one update -----------------------------------------------------------------------
     def update(self, event: Event, frames: list[Frame]) -> JobObs:
-        body, parts = self.body_and_parts(frames)
-        if "O9" in self.caps:
-            body["accept_if"] = dict(self.opt.accept_if)
-        obs = JobObs(event.set_key, [f.name for f in frames], time.monotonic())
+        body, parts = self.body_and_parts(frames, depth=True)
+        if "O9" in self.caps:  # a v2 job keeps its own gate
+            gate = event.accept_if if event.accept_if is not None else self.opt.accept_if
+            body["accept_if"] = dict(gate)
+        obs = JobObs(event.set_key, [f.name for f in frames], time.monotonic(),
+                     job_id_recorded=event.job_id, recorded_s=event.measured_s)
         if "O10" in self.caps:
             obs.dry, obs.dry_s = self.api.call("POST", self.path + "/updates", "POST dry run",
                                                "DryRun", params={"dry_run": 1}, body=body,

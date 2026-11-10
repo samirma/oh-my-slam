@@ -384,3 +384,33 @@ def test_object_origin(world: Any, origin: str, err: float, xy: float, z_key: st
     row = s.info["objects"]["truth"][0]
     assert row["origin"] == origin and row["centre_error_m"] == pytest.approx(err)
     assert row["xy_error_m"] == pytest.approx(xy) and row[z_key] == pytest.approx(err)
+
+
+def test_sweeps_split_by_stand_and_flat(world: Any) -> None:
+    ep, syn, _, _ = world
+    names = syn.names["r1/start"] + syn.names["r1/chain1"]
+    rec = record(["O1"], frames={1: {"frames": rows(ep, names)}})
+    rec.jobs = [job(names)]
+    # start frames 0.4 m apart: one frame per stand, no sweep
+    s = measure(rec, ep, sweep_prefixes=("start",))
+    assert s.info["sweeps"] == [] and "c8.sweep_yaw_error_deg" not in s.values
+    # chain frames as one stand that never turns: errors, but no span ratio
+    s = measure(rec, ep, sweep_prefixes=("chain",), sweep_stand_m=5.0)
+    assert s.values["c8.sweep_yaw_error_deg"] == [pytest.approx(0.0, abs=1e-6)] * 5
+    assert s.info["sweeps"][0]["ratio"] is None and "c8.sweep_yaw_span_ratio" not in s.values
+
+
+def test_sweep_span_over_count(world: Any) -> None:
+    """A registration that over-turns a sweep by 10 % shows as a span ratio of 1.1."""
+    ep, syn, _, _ = world
+    names = syn.names["r1/scan1"] + syn.names["r1/start"][:1]
+    fr = rows(ep, names)
+    for r in fr[:4]:
+        T = np.array(r["T_map_cam"])
+        yaw = math.atan2(T[1, 2], T[0, 2])
+        T[:3, :3] = synth.rot_z(0.1 * yaw) @ T[:3, :3]
+        r["T_map_cam"] = T.tolist()
+    rec = record(["O1"], frames={1: {"frames": fr}})
+    rec.jobs = [job(names)]
+    s = measure(rec, ep, sweep_prefixes=("scan",))
+    assert s.values["c8.sweep_yaw_span_ratio"] == [pytest.approx(1.1, abs=0.02)]

@@ -28,6 +28,21 @@ LAYOUT: dict[str, Any] = {
     # a frame whose set holds one name time per frame is matched within this many seconds of it;
     # frames sharing their set's time use the window between the neighbouring sets
     "frame_window_s": 3.0,
+    # the skill-v2 layout (picked when runs/<run>/frames/*.json sidecars exist): paths relative to
+    # runs/<run>/ unless noted; files starting with "_" in frames/ are not frames (_select.json)
+    "v2": {
+        "frames": "frames",
+        "jobs": ["oms/jobs.json", "../../../oms/jobs.json"],  # the run's, else the episode's
+        "calibrate": "calibrate_camera.json",  # "intrinsics": {fx_px, fy_px, cx_px, cy_px, ...}
+        "camera_info": "camera_info_{camera_id}.json",  # ROS CameraInfo under "msg": K, D, ...
+        "log": "log.jsonl",
+        "locate_prefixes": ["loc"],  # locate frames (their sidecar prior is what was sent)
+        "locate_gap_s": 10.0,  # consecutive locate frames closer than this are one request
+    },
+    # a sweep is a run of consecutive frames with this name prefix from one stand position
+    "sweep": {"prefixes": ["look"], "stand_m": 0.25},
+    # --camera: intrinsics {fx, fy, cx, cy, width, height} used when a run has none
+    "camera_override": None,
     "replay": {
         # sets whose name starts with these are locate-only (turn-in-place frames)
         "locate_prefixes": ["loc", "look"],
