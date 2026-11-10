@@ -36,9 +36,6 @@ if TYPE_CHECKING:
 
 INFERENCE_IN_FLIGHT = 2
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
-DEPTH_SCALED_SOURCES = ("camera_height", "monocular")
-
-
 def _waiter(fut: Future[Mono]) -> Callable[[], tuple[Any, Any, Any, Any]]:
     return lambda: fut.result().as_tuple()
 
@@ -149,8 +146,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     source, sigma = am.scale_summary() if am is not None else ("monocular", 0.1)
     ratio = None
     if prev is not None and am is not None:
-        ratio = round(am.scale.k / k_prev, 5) if source in DEPTH_SCALED_SOURCES \
-            and k_prev else 1.0
+        # the monocular keyframes' depth follows k; positions and depth images do not move
+        mono = any(k.depth_kind == "mono" for k in am.keyframes)
+        ratio = round(am.scale.k / k_prev, 5) if mono and k_prev else 1.0
     low = sum(pl.status == "provisional" or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
               for _, pl in kept)
     q: dict[str, Any] = {

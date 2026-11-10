@@ -115,7 +115,12 @@ FLOOR_BINS = 50
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
 TOO_CLOSE_M = 0.30  # median depth (as service.checks.TOO_CLOSE_M)
-MIN_CAMERA_HEIGHT = 0.05  # raw monocular units: a camera this low tells no scale
+MIN_CAMERA_HEIGHT = 0.05
+ALIGN_MIN_POINTS = 30  # a new monocular keyframe's depth is aligned on this many lifted points
+ALIGN_RANGE = (0.5, 2.0)
+# the depth scale's sigma that weighs PnP centres on monocular depth while nothing has measured
+# the scale: the monocular model's metres are off by up to this between scenes
+MONOCULAR_REGISTRATION_SIGMA_REL = 0.30  # raw monocular units: a camera this low tells no scale
 
 
 # -- small geometry -------------------------------------------------------------------------------
@@ -554,29 +559,42 @@ class ScaleState:
     # PnP baselines against metric priors: [prior baseline (m), raw image baseline, ...]
     priors: list[list[float]] = field(default_factory=list)
     heights: list[list[float]] = field(default_factory=list)  # [given m / raw height, sigma rel]
+    # PnP baselines against drifting priors: [odometry baseline (m), raw image baseline]
+    odometry: list[list[float]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {"k": self.k, "source": self.source, "sigma_rel": self.sigma_rel,
-                "priors": self.priors, "heights": self.heights}
+                "priors": self.priors, "heights": self.heights, "odometry": self.odometry}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> ScaleState:
         return ScaleState(float(d["k"]), d["source"], float(d["sigma_rel"]),
-                          [list(e) for e in d["priors"]], [list(e) for e in d["heights"]])
+                          [list(e) for e in d["priors"]], [list(e) for e in d["heights"]],
+                          [list(e) for e in d["odometry"]])
 
-    def estimate(self, prior_span: float) -> None:
+    @staticmethod
+    def _baselines(evidence: list[list[float]], span: float) -> tuple[float, float] | None:
+        """The least-squares scale of prior baselines on raw image baselines and the robust
+        spread of their log ratios over the root of their count, when the priors span
+        ``PRIOR_SPAN_M`` and ``SCALE_EVIDENCE_MIN`` baselines are long enough."""
+        ev = [e for e in evidence if e[0] >= SCALE_EVIDENCE_MIN_M and e[1] > 1e-6]
+        if span < PRIOR_SPAN_M or len(ev) < SCALE_EVIDENCE_MIN:
+            return None
+        b_p = np.array([e[0] for e in ev])
+        b_i = np.array([e[1] for e in ev])
+        k = float((b_p * b_i).sum() / (b_i ** 2).sum())
+        r = np.log(b_p / (k * b_i))
+        mad = 1.4826 * float(np.median(np.abs(r - np.median(r))))
+        return float(np.clip(k, *SCALE_RANGE)), mad / math.sqrt(len(ev))
+
+    def estimate(self, prior_span: float, odometry_span: float = 0.0) -> None:
         """``k`` from the evidence: metric priors (once their span allows), else camera heights,
-        else held at 1."""
-        ev = [e for e in self.priors if e[0] >= SCALE_EVIDENCE_MIN_M and e[1] > 1e-6]
-        if prior_span >= PRIOR_SPAN_M and len(ev) >= SCALE_EVIDENCE_MIN:
-            b_p = np.array([e[0] for e in ev])
-            b_i = np.array([e[1] for e in ev])
-            k = float((b_p * b_i).sum() / (b_i ** 2).sum())
-            r = np.log(b_p / (k * b_i))
-            mad = 1.4826 * float(np.median(np.abs(r - np.median(r))))
-            self.k = float(np.clip(k, *SCALE_RANGE))
-            self.source = "priors"
-            self.sigma_rel = max(mad / math.sqrt(len(ev)), MIN_SCALE_SIGMA_REL)
+        else drifting priors (their relative motion is metric within the odometry's drift:
+        ``DRIFT_POS_REL`` at best, reported as ``priors``), else held at 1."""
+        got = self._baselines(self.priors, prior_span)
+        if got is not None:
+            self.k, self.source = got[0], "priors"
+            self.sigma_rel = max(got[1], MIN_SCALE_SIGMA_REL)
             return
         if self.heights:
             r = np.array([h[0] for h in self.heights])
@@ -587,6 +605,11 @@ class ScaleState:
             self.source = "camera_height"
             self.sigma_rel = max(math.sqrt(mad ** 2 + float(np.median(rel)) ** 2)
                                  / math.sqrt(len(r)), MIN_SCALE_SIGMA_REL)
+            return
+        got = self._baselines(self.odometry, odometry_span)
+        if got is not None:
+            self.k, self.source = got[0], "priors"
+            self.sigma_rel = max(got[1], DRIFT_POS_REL)
             return
         self.k, self.source, self.sigma_rel = 1.0, "monocular", MONOCULAR_SIGMA_REL
 
@@ -623,6 +646,30 @@ class Placement:
     method: str | None = None  # origin, prior, pnp, rotation
     prior_residual: tuple[float, float] | None = None
     keyframe: str | None = None  # the keyframe id when kept
+    # the lifted points it was registered on and their pixels (``AnchoredMap.align_depth``)
+    lifted: tuple[Array, Array] | None = None
+
+
+def _lifted(corr: _Corr) -> tuple[Array, Array]:
+    has = np.isfinite(corr.X).all(axis=1)
+    return corr.X[has], corr.uv[has]
+
+
+def depth_alignment(T: Array, X: Array, uv: Array, depth: NDArray[np.float32],
+                    K_grid: Intrinsics, K: Intrinsics) -> float | None:
+    """The factor bringing a new keyframe's depth onto the map: the median ratio of the depth
+    the map's lifted points ``X`` have in the camera ``T`` to the keyframe's own depth at their
+    pixels ``uv``. None with fewer than ``ALIGN_MIN_POINTS`` or a factor outside
+    ``ALIGN_RANGE`` (the depth and the pose disagree: kept as it is)."""
+    if len(X) < ALIGN_MIN_POINTS:
+        return None
+    z_map = ((X - T[:3, 3]) @ T[:3, :3])[:, 2]
+    z_own = sample_depth(depth, K_grid, K, uv).astype(np.float64)
+    ok = np.isfinite(z_own) & (z_own > 0) & (z_map > 0)
+    if ok.sum() < ALIGN_MIN_POINTS:
+        return None
+    a = float(np.median(z_map[ok] / z_own[ok]))
+    return a if ALIGN_RANGE[0] <= a <= ALIGN_RANGE[1] else None
 
 
 def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
@@ -691,10 +738,10 @@ class AnchoredMap:
 
     # -- summary -------------------------------------------------------------------------------
 
-    def prior_span(self) -> float:
-        """The largest distance between two metric priors of the map's keyframes."""
+    def prior_span(self, trust: str = "metric") -> float:
+        """The largest distance between two priors of that trust of the map's keyframes."""
         c = np.array([np.asarray(k.prior["T"])[:3, 3] for k in self.keyframes
-                      if k.prior is not None and k.prior["trust"] == "metric"])
+                      if k.prior is not None and k.prior["trust"] == trust])
         if len(c) < 2:
             return 0.0
         return float(np.linalg.norm(c[:, None, :] - c[None, :, :], axis=2).max())
@@ -832,7 +879,9 @@ class AnchoredMap:
         floor_p = max(MIN_SIGMA_POS_M, IMAGE_SIGMA_POS_REL * med)
         if any(k.depth_kind == "mono" for k in cands):
             base = float(np.min([np.linalg.norm(k.centre - s.c) for k in cands]))
-            floor_p = math.hypot(floor_p, self.scale.sigma_rel * base)
+            sk = MONOCULAR_REGISTRATION_SIGMA_REL if self.scale.source == "monocular" \
+                else self.scale.sigma_rel
+            floor_p = math.hypot(floor_p, sk * base)
         return max(sp, floor_p), max(sr, IMAGE_SIGMA_ROT_MIN_DEG)
 
     def _solve(self, f: FrameIn, corr: _Corr, cands: list[Keyframe], T0: Array | None,
@@ -878,7 +927,7 @@ class AnchoredMap:
                 return Placement(f.name, "rejected", reason)
             s, n, _, method, spi, sri = sol
             return Placement(f.name, "registered", None, s.T, round(spi, 4), round(sri, 3), n,
-                             method)
+                             method, lifted=_lifted(corr))
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
@@ -903,22 +952,29 @@ class AnchoredMap:
         if rot_only:
             T[:3, 3], fsp = T0[:3, 3], sp0
         pl = Placement(f.name, "registered", None, T, round(max(fsp, MIN_SIGMA_POS_M), 4),
-                       round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref))
-        if method == "pnp" and f.prior["trust"] == "metric":
-            self._scale_evidence(s, prior_T, corr, cands)  # type: ignore[arg-type]
+                       round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref),
+                       lifted=_lifted(corr))  # type: ignore[arg-type]
+        if method == "pnp":
+            self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands)  # type: ignore[arg-type]
         return pl
 
-    def _scale_evidence(self, s: Solve, prior_T: Array, corr: _Corr,
+    def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
                         cands: list[Keyframe]) -> None:
-        """A PnP centre against its metric prior, both relative to the reference keyframe (the
-        one with the most matches), in that keyframe's raw depth units (monocular only)."""
+        """A PnP centre against its prior, both relative to the reference keyframe (the one
+        with the most matches), in that keyframe's raw depth units (monocular only). A metric
+        prior is compared with the reference's map centre; a drifting one with the
+        reference's own drifting prior (odometry baselines)."""
         j = int(np.bincount(corr.kf).argmax())
         ref = cands[j]
         if ref.depth_kind != "mono":
             return
-        b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref.centre))
         b_img = float(np.linalg.norm(s.c - ref.centre)) / self.scale.k
-        self.scale.priors = [*self.scale.priors, [b_prior, b_img]][-MAX_EVIDENCE:]
+        if trust == "metric":
+            b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref.centre))
+            self.scale.priors = [*self.scale.priors, [b_prior, b_img]][-MAX_EVIDENCE:]
+        elif ref.prior is not None and ref.prior["trust"] == "drifting":
+            b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(ref.prior["T"])[:3, 3]))
+            self.scale.odometry = [*self.scale.odometry, [b_odo, b_img]][-MAX_EVIDENCE:]
 
     # -- adding keyframes ----------------------------------------------------------------------
 
@@ -1046,11 +1102,17 @@ class AnchoredMap:
             if kind == "mono":
                 if not self.keyframes:
                     self._up_check(f, pl)
-                # its camera height, if known, refines the depth scale before it is fused
                 assert pl.T is not None
+                # its own scale brought onto the map's (the monocular model's metres vary from
+                # frame to frame), on the points lifted at the map's current scale
+                if pl.lifted is not None:
+                    a = depth_alignment(pl.T, *pl.lifted, depth, Kg, f.K)
+                    if a is not None:
+                        depth = (depth * a).astype(np.float32)
+                # its camera height, if known, refines the depth scale before it is fused
                 self._height_evidence(f, pl.T, depth, Kg)
                 k = self.scale.k
-                self.scale.estimate(self.prior_span())
+                self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
                 depth = (depth * (self.scale.k / k)).astype(np.float32)
             self.add(f, feats, pl, depth, Kg, kind, desc)
             if f.prior is not None and f.prior["trust"] == "drifting" and pl.T is not None \
@@ -1058,7 +1120,7 @@ class AnchoredMap:
                 self.drift.confirm(pl.T, np.asarray(f.prior["T_map_cam"], np.float64))
             fuse_s += time.perf_counter() - t
             progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
-        self.scale.estimate(self.prior_span())
+        self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
         self.timings = {"register": round(reg_s, 3), "fuse": round(fuse_s, 3),
                         "total": round(time.perf_counter() - t0, 3)}
         return [out[i] for i in range(len(frames))]

@@ -227,17 +227,24 @@ measured on the synthetic room of `tests/synth/room.py` and on the reference cap
   pose: `rejected` (`no_overlap` / `few_features`). Provisional frames at metric priors are
   references for later frames; at drifting priors they are not.
 * **Scale.** A keyframe's depth is its depth PNG (metric) or the monocular depth (640 px grid)
-  times the map's depth scale `k`. `k` comes from the metric priors once their centres span
-  0.3 m and 3 PnP baselines ≥ 0.1 m exist (least squares of the prior baselines on the image-only
-  PnP baselines relative to the reference keyframe, in raw monocular units: the similarity of
-  the map's positions to the priors), else from camera heights (frame or camera
-  `height_above_floor_m` over the lowest dense layer of the frame's monocular points below the
-  camera, rotated by its pose), else 1. Each update refines `k`; positions never move, stored
-  monocular keyframes use `k / k_used` when matched. `scale_source`: `priors` once metric priors
-  span 0.3 m (σ = √2 · median prior σ / span), else `depth` with any depth PNG (σ 1 %), else the
-  source of `k` (`camera_height`, σ from the heights' spread and sigmas; `monocular`, 10 %).
-  `scale_ratio_vs_prev`: `k` over the previous `k` for maps scaled by camera height or the
-  monocular model, else 1 (positions are the priors' or the depth images').
+  times the map's depth scale `k`, then brought onto the map by its own factor: the median
+  ratio of the depth the lifted points it was registered on have in its camera to its own depth
+  there (≥ 30 points, within 0.5–2; the monocular model's metres vary from frame to frame, and
+  without this a chain of monocular keyframes drifts in scale). `k` comes from the metric
+  priors once their centres span 0.3 m and 3 PnP baselines ≥ 0.1 m exist (least squares of the
+  prior baselines on the image-only PnP baselines relative to the reference keyframe, in raw
+  monocular units: the similarity of the map's positions to the priors), else from camera
+  heights (frame or camera `height_above_floor_m` over the lowest dense layer of the frame's
+  monocular points below the camera, rotated by its pose), else from drifting priors the same
+  way as metric ones (odometry baselines; σ at least 10 %, reported as `priors`), else 1. While
+  nothing has measured `k`, PnP centres on monocular depth are weighed with a 30 % scale sigma,
+  so drifting odometry carries the positions. Each update refines `k`; positions never move,
+  stored monocular keyframes use `k / k_used` when matched. `scale_source`: `priors` once metric
+  priors span 0.3 m (σ = √2 · median prior σ / span), else `depth` with any depth PNG (σ 1 %),
+  else the source of `k` (`camera_height`, σ from the heights' spread and sigmas; `priors` from
+  odometry; `monocular`, 10 %). `scale_ratio_vs_prev`: `k` over the previous `k` when the map
+  has monocular keyframes (their depth follows `k`), else 1 (positions and depth images never
+  move).
 * **Incremental fusion.** Only the new keyframes are lifted (every 2nd pixel, ≤ 6 m, off depth
   edges and ignore masks) into a voxel cloud (2 cm, running mean of position and colour per
   voxel): nothing stored is fused again. The floor of the version is the cloud's lowest dense

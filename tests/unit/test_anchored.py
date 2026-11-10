@@ -494,3 +494,44 @@ def test_suspicious_frames_too_close_by_their_monocular_depth(tmp_path: Path) ->
     pls = m.update([near, ok])
     assert (pls[0].status, pls[0].reason) == ("rejected", "too_close")
     assert pls[1].status == "registered"
+
+
+def test_drifting_priors_scale_monocular_depth_without_heights(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    truth = [base_pose(0, -1.0 + 0.15 * k, 0.05 * (k % 2)) for k in range(8)]
+    m.update([frame("w0", truth[0], p="drifting", depth=False, mono=1.4)])
+    pls = m.update([frame(f"w{k}", truth[k], p="drifting", depth=False, mono=1.4)
+                    for k in range(1, 8)])
+    assert all(p.status == "registered" for p in pls)
+    assert m.scale.source == "priors" and m.scale.sigma_rel >= an.DRIFT_POS_REL
+    assert m.scale.k == pytest.approx(1 / 1.4, rel=0.1)
+    s = ScaleState(odometry=[[0.5, 0.4]] * 3)
+    s.estimate(0.0, 0.1)  # the odometry spans too little
+    assert s.source == "monocular"
+
+
+def test_odometry_evidence_needs_a_drifting_reference(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0, -1.0, 0.0), depth=False, mono=1.0)])
+    p = m.update([frame("d", base_pose(0, -0.8, 0.0), p="drifting", depth=False, mono=1.0)])[0]
+    assert p.status == "registered" and m.scale.odometry == [] and m.scale.priors == []
+
+
+def test_depth_alignment() -> None:
+    T = base_pose(0)
+    _, z = shot(T)
+    uv = np.stack(np.meshgrid(np.arange(20, 300, 20.0), np.arange(20, 220, 20.0)), -1).reshape(-1, 2)
+    X = T[:3, 3] + (an.rays(K, uv) * an.sample_depth(z, K, K, uv)[:, None]) @ T[:3, :3].T
+    ok = np.isfinite(X).all(axis=1)
+    assert an.depth_alignment(T, X[ok], uv[ok], z * 0.8, K, K) == pytest.approx(1.25, rel=1e-3)
+    assert an.depth_alignment(T, X[ok][:5], uv[ok][:5], z, K, K) is None
+    assert an.depth_alignment(T, X[ok], uv[ok], np.zeros_like(z), K, K) is None
+    assert an.depth_alignment(T, X[ok], uv[ok], z * 0.2, K, K) is None
+
+
+def test_a_disagreeing_monocular_depth_is_kept_as_it_is(tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0), depth=False, mono=1.0)])
+    monkeypatch.setattr(an, "depth_alignment", lambda *a: None)
+    assert m.update([frame("b", base_pose(20), depth=False, mono=1.0)])[0].status == "registered"
