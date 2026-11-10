@@ -64,6 +64,7 @@ ENGINE = "anchored"
 STATE_JSON = "state.json"
 CLOUD_NPZ = "cloud.npz"
 KF_DIR = "kf"
+KF_JPEG_QUALITY = 92
 
 MAX_FEATURES = 4000
 SIFT_CONTRAST = 0.01  # a quarter of OpenCV's default: simulated and indoor robot frames are low
@@ -92,6 +93,8 @@ STRONG_RATIO = 0.3  # ... with this share of its matches as inliers
 CONFIRM_SIGMA_POS_M = 0.10  # an image pose confirms a frame only this well determined (or
 # within twice the prior's sigma)
 CONFIRM_SIGMA_ROT_DEG = 2.0
+METRIC_IMAGE_SIGMA_POS_M = 0.05  # an image pose weighed against a metric prior: at least this
+METRIC_IMAGE_SIGMA_ROT_DEG = 1.0
 K_SIGMA = 3.0
 MIN_SIGMA_POS_M = 0.01
 MIN_SIGMA_ROT_DEG = 0.1
@@ -108,6 +111,7 @@ ODO_SCALE_RANGE = (0.5, 2.0)
 PRIOR_SPAN_M = 0.3  # metric priors fix the scale once their centres span this
 BIAS_SPAN_M = 0.5  # metric priors' own scale bias is judged once they span this
 BIAS_EVIDENCE_MIN = 5
+EVIDENCE_SCALE_SIGMA = 1.0  # reference scales left free when a metric prior measures them
 SCALE_EVIDENCE_MIN_M = 0.1  # a PnP baseline shorter than this tells little about the scale
 SCALE_EVIDENCE_MIN = 3
 SCALE_RANGE = (0.2, 5.0)
@@ -128,6 +132,16 @@ FUSE_MAX_DEPTH_M = 6.0
 FLOOR_BINS = 50
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
+FLOOR_PEAK_MIN = 20.0  # points per 1 % height bin for a horizontal surface
+FLOOR_BAND_REL = 0.05  # points this near a peak's height take part in its plane
+FLOOR_PLANE_TOL_REL = 0.02
+FLOOR_TILT_DEG = 10.0
+FLOOR_RANSAC = 100
+FLOOR_SAMPLE = 5000  # points a plane is fitted on
+HEIGHT_VOTE_BIN = 0.03  # log scale: the frames' floor candidates vote in bins this wide
+HEIGHT_VOTE_TOL = 0.15  # a frame's candidate this near the vote counts
+FLOOR_CANDIDATES = 8  # the most supported height peaks tried as planes
+FLOOR_SUPPORT_SHARE = 0.25  # a floor plane holds at least this share of the best plane's points
 TOO_CLOSE_M = 0.30  # median depth (as service.checks.TOO_CLOSE_M)
 MIN_CAMERA_HEIGHT = 0.05
 ALIGN_MIN_POINTS = 30  # a new monocular keyframe's depth is aligned on this many lifted points
@@ -176,6 +190,18 @@ def pose_residual(A: Array, B: Array) -> tuple[float, float]:
     return (float(np.linalg.norm(A[:3, 3] - B[:3, 3])), rot_deg(A[:3, :3].T @ B[:3, :3]))
 
 
+def fuse_poses(A: Array, spa: float, sra: float, B: Array, spb: float, srb: float
+               ) -> tuple[Array, float, float]:
+    """The information-weighted mean of two independent pose estimates with isotropic sigmas:
+    centres weighted by ``1/sigma_pos²``, rotation interpolated on the geodesic by
+    ``1/sigma_rot²``; the sigmas of the mean."""
+    wa, wb = 1.0 / spa ** 2, 1.0 / spb ** 2
+    c = (A[:3, 3] * wa + B[:3, 3] * wb) / (wa + wb)
+    va, vb = 1.0 / sra ** 2, 1.0 / srb ** 2
+    R = exp_so3(log_so3(A[:3, :3] @ B[:3, :3].T) * va / (va + vb)) @ B[:3, :3]
+    return pose(R, c), 1.0 / math.sqrt(wa + wb), 1.0 / math.sqrt(va + vb)
+
+
 def rays(K: Intrinsics, uv: NDArray[Any]) -> Array:
     """Camera rays with unit z of pixels ``uv`` (N x 2, pixel centres at integer + 0.5 as
     OpenCV's keypoints are at integers: OpenCV's convention)."""
@@ -197,6 +223,65 @@ def first_camera(up_cam: Any) -> Array:
     x = unit(fwd)
     M = np.stack([x, np.cross(up, x), up])  # rows: the map's axes in the optical frame
     return pose(M, np.zeros(3))
+
+
+def floor_candidates(p: Array) -> list[float]:
+    """The camera's heights above every strong horizontal plane below it, in its own points
+    ``p`` (camera-centred, z up along gravity, unscaled), best supported first: the peaks of the
+    points' log heights, each tried as a plane (``_horizontal_plane``), kept when it holds
+    ``FLOOR_SUPPORT_SHARE`` of the best one's points. Which one is the floor is decided across
+    frames (``ScaleState._height_votes``): fitted per frame, so a frame that sees a lower floor
+    through a door or a counter offers it without moving the others."""
+    out: list[float] = []
+    q = p[np.isfinite(p).all(axis=1) & (p[:, 2] < -MIN_CAMERA_HEIGHT)]
+    if len(q) < FLOOR_MIN_POINTS:
+        return out
+    z = np.log(-q[:, 2])
+    hist, edges = np.histogram(z, bins=max(3, int((z.max() - z.min()) / 0.01) + 1))
+    smooth = np.convolve(hist, np.ones(3) / 3.0, mode="same")
+    peaks = [i for i in range(len(smooth))
+             if smooth[i] >= FLOOR_PEAK_MIN and smooth[i] == smooth[max(i - 2, 0):i + 3].max()]
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    planes = [got for i in sorted(peaks, key=lambda j: -smooth[j])[:FLOOR_CANDIDATES]
+              if (got := _horizontal_plane(q, math.exp(centres[i]))) is not None]
+    if planes:
+        top = max(n for _, n in planes)
+        out = [h for h, n in sorted(planes, key=lambda hn: -hn[1])
+               if n >= FLOOR_SUPPORT_SHARE * top]
+    return out
+
+
+def _horizontal_plane(q: Array, h0: float) -> tuple[float, int] | None:
+    """The plane (RANSAC, normal within ``FLOOR_TILT_DEG`` of vertical) among the points near
+    height ``-h0``: its distance to the camera and its inliers, or None."""
+    near = q[np.abs(-q[:, 2] - h0) <= FLOOR_BAND_REL * h0]
+    if len(near) < FLOOR_MIN_POINTS // 2:
+        return None
+    rng = np.random.default_rng(0)
+    best: tuple[int, Array, float] | None = None
+    tol = FLOOR_PLANE_TOL_REL * h0
+    if len(near) > FLOOR_SAMPLE:
+        near = near[rng.integers(0, len(near), FLOOR_SAMPLE)]
+    for _ in range(FLOOR_RANSAC):
+        a, b, c = near[rng.integers(0, len(near), 3)]
+        nrm = np.cross(b - a, c - a)
+        if np.linalg.norm(nrm) < 1e-12:
+            continue
+        nrm = nrm / np.linalg.norm(nrm)
+        if abs(nrm[2]) < math.cos(math.radians(FLOOR_TILT_DEG)):
+            continue
+        d = -float(nrm @ a)
+        cnt = int((np.abs(near @ nrm + d) < tol).sum())
+        if best is None or cnt > best[0]:
+            best = (cnt, nrm, d)
+    if best is None or best[0] < FLOOR_MIN_POINTS // 2:
+        return None
+    _, nrm, d = best
+    inl = near[np.abs(near @ nrm + d) < tol]
+    c0 = inl.mean(axis=0)
+    _, _, Vt = np.linalg.svd(inl - c0)
+    nrm = Vt[2] * np.sign(Vt[2][2])
+    return float(abs(nrm @ c0)), len(inl)
 
 
 def lowest_layer(z: NDArray[Any], below: float) -> float | None:
@@ -519,6 +604,10 @@ class Keyframe:
     feats: Features | None = None
     kdepth: NDArray[np.float32] | None = None  # depth of each keypoint as fused (NaN: none)
     descriptor: NDArray[np.float32] | None = None
+    # set while the update runs, written with it: the depth grid as fused and the image
+    grid: NDArray[np.float32] | None = None
+    K_grid: Intrinsics | None = None
+    rgb: NDArray[np.uint8] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "camera_id": self.camera_id,
@@ -526,14 +615,17 @@ class Keyframe:
                 "sigma_rot_deg": self.sigma_rot_deg, "state": self.state, "prior": self.prior,
                 "depth_kind": self.depth_kind, "k_used": self.k_used,
                 "median_depth": self.median_depth, "method": self.method,
-                "inliers": self.inliers}
+                "inliers": self.inliers,
+                "K_grid": None if self.K_grid is None else self.K_grid.to_dict()}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
         return Keyframe(d["id"], d["name"], d["camera_id"], Intrinsics.from_dict(d["K"]),
                         np.asarray(d["T"], np.float64), float(d["sigma_pos_m"]),
                         float(d["sigma_rot_deg"]), d["state"], d["prior"], d["depth_kind"],
-                        float(d["k_used"]), d["median_depth"], d["method"], int(d["inliers"]))
+                        float(d["k_used"]), d["median_depth"], d["method"], int(d["inliers"]),
+                        K_grid=None if d.get("K_grid") is None
+                        else Intrinsics.from_dict(d["K_grid"]))
 
     @property
     def centre(self) -> Array:
@@ -669,6 +761,25 @@ class ScaleState:
                           [list(e) for e in d["priors"]], [list(e) for e in d["heights"]],
                           [list(e) for e in d["odometry"]])
 
+    def _height_votes(self) -> NDArray[np.float64]:
+        """Per frame, the log scale of its floor: each frame offers every strong horizontal
+        plane below its camera (``heights``: [sigma_rel, scale per plane...]); the scale most
+        frames agree on (the mode of all candidates, ``HEIGHT_VOTE_BIN`` wide) picks, in each
+        frame, the candidate nearest it (within ``HEIGHT_VOTE_TOL``). A counter or a lower room
+        seen through a door is one frame's plane, the floor every frame's."""
+        cands = [np.log(np.asarray(h[1:], np.float64)) for h in self.heights]
+        allc = np.concatenate(cands)
+        bins = np.floor(allc / HEIGHT_VOTE_BIN)
+        frames_per_bin: dict[float, int] = {}
+        for c in cands:
+            for b in set(np.floor(c / HEIGHT_VOTE_BIN).tolist()):
+                for nb in (b - 1, b, b + 1):
+                    frames_per_bin[nb] = frames_per_bin.get(nb, 0) + 1
+        best = max(set(bins.tolist()), key=lambda b: (frames_per_bin[b], -b))
+        mode = float(np.median(allc[np.abs(bins - best) <= 1]))
+        return np.array([float(c[np.argmin(np.abs(c - mode))]) for c in cands
+                         if np.min(np.abs(c - mode)) <= HEIGHT_VOTE_TOL])
+
     @staticmethod
     def _baselines(evidence: list[list[float]], span: float) -> tuple[float, float] | None:
         """The least-squares scale of prior baselines on raw image baselines and the robust
@@ -690,14 +801,13 @@ class ScaleState:
         relative motion is metric within the odometry's drift: ``DRIFT_POS_REL`` at best,
         reported as ``priors``), else held at 1."""
         if self.heights:
-            r = np.array([h[0] for h in self.heights])
-            rel = np.array([h[1] for h in self.heights])
-            lr = np.log(r)
+            lr = self._height_votes()
+            rel = np.array([h[0] for h in self.heights])
             mad = 1.4826 * float(np.median(np.abs(lr - np.median(lr))))
             self.k = float(np.clip(np.exp(np.median(lr)), *SCALE_RANGE))
             self.source = "camera_height"
             self.sigma_rel = max(math.sqrt(mad ** 2 + float(np.median(rel)) ** 2)
-                                 / math.sqrt(len(r)), MIN_SCALE_SIGMA_REL)
+                                 / math.sqrt(len(lr)), MIN_SCALE_SIGMA_REL)
             return
         got = self._baselines(self.priors, prior_span)
         if got is not None:
@@ -746,6 +856,7 @@ class Placement:
     keyframe: str | None = None  # the keyframe id when kept
     # the lifted points it was registered on and their pixels (``AnchoredMap.align_depth``)
     lifted: tuple[Array, Array] | None = None
+    align_T: Array | None = None  # the image-only pose the lifted points agree with
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -824,6 +935,11 @@ class AnchoredMap:
             extra = {} if kf.descriptor is None else {"descriptor": kf.descriptor}
             np.savez(self.root / KF_DIR / f"{kf.id}.npz", kps=kf.feats.kps, desc=kf.feats.desc,
                      kdepth=kf.kdepth, **extra)
+            assert kf.grid is not None and kf.rgb is not None
+            np.save(self.root / KF_DIR / f"{kf.id}.depth.npy", kf.grid.astype(np.float16))
+            cv2.imwrite(str(self.root / KF_DIR / f"{kf.id}.jpg"),
+                        cv2.cvtColor(kf.rgb, cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, KF_JPEG_QUALITY])
         self._added = []
         self.cloud.save(self.root / CLOUD_NPZ)
         atomic_write_json(self.root / STATE_JSON, {
@@ -832,6 +948,19 @@ class AnchoredMap:
             "next_id": self.next_id, "created_with": self.created_with,
             "origin_c": None if self.origin_c is None else self.origin_c.tolist(),
             "bias": self.bias})
+
+    def image_path(self, kid: str) -> Path | None:
+        """A keyframe's canonical image, or None."""
+        p = self.root / KF_DIR / f"{kid}.jpg"
+        return p if p.exists() else None
+
+    def depth_of(self, kid: str) -> NDArray[np.float32] | None:
+        """A keyframe's depth grid in metres (0: none), at the map's depth scale now."""
+        p = self.root / KF_DIR / f"{kid}.depth.npy"
+        kf = next((k for k in self.keyframes if k.id == kid), None)
+        if kf is None or not p.exists():
+            return None
+        return (np.load(p).astype(np.float32) * self._depth_factor(kf)).astype(np.float32)
 
     def _load_kf(self, kf: Keyframe) -> None:
         if kf.feats is not None:
@@ -1077,28 +1206,47 @@ class AnchoredMap:
                                                                        2.0 * sp0)):
             return Placement(f.name, "provisional", reason, T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
+        metric = f.prior["trust"] == "metric"
+        if metric:
+            # a metric prior is weighed against the image pose's real uncertainty: depth
+            # images misregistered to the colour, monocular depth, a few references — far more
+            # than the covariance of hundreds of correlated matches says
+            spi = max(spi, METRIC_IMAGE_SIGMA_POS_M)
+            sri = max(sri, METRIC_IMAGE_SIGMA_ROT_DEG)
         dp, dr = pose_residual(s.T, T0)
         if (not rot_only and dp > K_SIGMA * math.hypot(sp0, spi)) \
                 or dr > K_SIGMA * math.hypot(sr0, sri):
-            if n >= STRONG_INLIERS and ratio >= STRONG_RATIO:
+            # a conflict needs strong, independent support: enough inliers, and for a metric
+            # prior inliers on at least two references
+            refs_ok = int((np.bincount(sub[3][s.inliers], minlength=len(cands))
+                           >= MIN_INLIERS).sum())
+            if n >= STRONG_INLIERS and ratio >= STRONG_RATIO and (not metric or refs_ok >= 2):
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr))
             return Placement(f.name, "provisional", "no_overlap", T0, sp0, sr0, n, "prior",
                              pose_residual(T0, ref))
-        # the frame refined on its matches and its prior together (stored poses fixed)
-        fused, _ = refine_pose(s.R, T0[:3, 3].copy() if rot_only else s.c, *sub, refs, f.K,
-                               prior=(T0, sp0, sr0))
-        fsp, fsr = fused.sigmas()
-        T = fused.T
+        if metric:
+            img_T = s.T
+            if rot_only:
+                img_T[:3, 3] = T0[:3, 3]
+            T, fsp, fsr = fuse_poses(img_T, spi, sri, T0, sp0, sr0)
+        else:
+            # the frame refined on its matches and its prior together (stored poses fixed)
+            fused, _ = refine_pose(s.R, T0[:3, 3].copy() if rot_only else s.c, *sub, refs, f.K,
+                                   prior=(T0, sp0, sr0))
+            fsp, fsr = fused.sigmas()
+            T = fused.T
         pl = Placement(f.name, "registered", None, T, round(max(fsp, MIN_SIGMA_POS_M), 4),
                        round(max(fsr, MIN_SIGMA_ROT_DEG), 3), n, method, pose_residual(T, ref),
-                       lifted=_lifted(corr))  # type: ignore[arg-type]
+                       lifted=_lifted(corr), align_T=s.T)  # type: ignore[arg-type]
         if method == "pnp":
-            self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands)  # type: ignore[arg-type]
+            self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands,  # type: ignore[arg-type]
+                                 (sub, refs, f.K, _prior_sigmas(f.prior)))
         return pl
 
     def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
-                        cands: list[Keyframe]) -> None:
+                        cands: list[Keyframe], fit: tuple[Any, Refs, Intrinsics,
+                                                          tuple[float, float]]) -> None:
         """An image-only centre against its prior, both relative to the reference keyframe
         (the one with the most matches). For a monocular reference, in its raw depth units: a
         metric prior is compared with the reference's map centre, a drifting one with the
@@ -1120,6 +1268,12 @@ class AnchoredMap:
             return
         b_img /= self.scale.k
         if trust == "metric":
+            # the depth scale the references need for the frame to sit at its metric prior: the
+            # refinement with the prior and free reference scales (stored poses fixed)
+            sub, refs, K, (sp, sr) = fit
+            free = Refs(refs.c, np.full(len(refs.c), EVIDENCE_SCALE_SIGMA), refs.median)
+            _, sc = refine_pose(s.R, s.c, *sub, free, K, prior=(prior_T, sp, sr))
+            b_img = b_prior / float(sc[j]) / self.scale.k
             self.scale.priors = [*self.scale.priors, [b_prior, b_img]][-MAX_EVIDENCE:]
         elif ref.prior is not None and ref.prior["trust"] == "drifting":
             b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(ref.prior["T"])[:3, 3]))
@@ -1157,6 +1311,7 @@ class AnchoredMap:
         kf.kdepth = sample_depth(depth, K_grid, f.K, feats.kps) if len(feats.kps) \
             else np.zeros(0, np.float32)
         kf.descriptor = None if descriptor is None else np.asarray(descriptor, np.float32)
+        kf.grid, kf.K_grid, kf.rgb = depth, K_grid, f.rgb
         self.keyframes.append(kf)
         self._added.append(kf)
         pl.keyframe = kid
@@ -1193,13 +1348,18 @@ class AnchoredMap:
         if not ok.any():
             return
         pts, _ = pixel_points(depth / self.scale.k, K_grid, ok)
-        dz = (pts @ T[:3, :3].T)[:, 2]
-        floor = lowest_layer(dz, -MIN_CAMERA_HEIGHT)
-        if floor is None:
+        R = T[:3, :3]
+        if f.prior is None and f.mono is not None and f.mono()[3] is not None:
+            # a camera-only frame: along its own gravity, not the chain of registrations
+            R = first_camera(f.mono()[3])[:3, :3]
+        planes = floor_candidates(pts @ R.T)
+        if not planes:
             return
         sig = f.height_sigma_m if f.height_sigma_m else DEFAULT_HEIGHT_SIGMA_M
         self.scale.heights = [*self.scale.heights,
-                              [f.height_m / -floor, sig / f.height_m]][-MAX_EVIDENCE:]
+                              [sig / f.height_m, *(f.height_m / h for h in planes)]
+                              ][-MAX_EVIDENCE:]
+        log.debug("%s: camera height %.3f m over planes %s (raw)", f.name, f.height_m, planes)
 
     # -- an update -----------------------------------------------------------------------------
 
@@ -1261,7 +1421,8 @@ class AnchoredMap:
                 # its own scale brought onto the map's (the monocular model's metres vary from
                 # frame to frame), on the points lifted at the map's current scale
                 if pl.lifted is not None:
-                    a = depth_alignment(pl.T, *pl.lifted, depth, Kg, f.K)
+                    a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
+                                        *pl.lifted, depth, Kg, f.K)
                     if a is not None:
                         depth = (depth * a).astype(np.float32)
                 # its camera height, if known, refines the depth scale before it is fused

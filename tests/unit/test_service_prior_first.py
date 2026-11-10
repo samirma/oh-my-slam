@@ -161,7 +161,7 @@ def test_a_job_whose_frames_are_all_rejected_is_cheap(client: Client) -> None:
 
 
 def test_provisional_rejected_and_the_gate(client: Client) -> None:
-    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
     T = base_pose(20)
     off = T.copy()
@@ -176,7 +176,7 @@ def test_provisional_rejected_and_the_gate(client: Client) -> None:
     q = job["quality"]
     assert q["rejected_share"] == round(2 / 3, 4) and q["low_confidence_share"] == 1.0
     frames = client.get("/api/maps/m/frames", "Frames")["frames"]
-    assert [f["pose_state"] for f in frames] == ["fused", "provisional"]
+    assert [f["pose_state"] for f in frames] == ["fused", "fused", "provisional"]
     summary = client.get("/api/maps/m", "MapSummary")
     assert summary["provisional_frames"] == 1
     # a gate that fails commits nothing
@@ -283,7 +283,7 @@ def test_dry_run_of_a_new_map_writes_nothing(client: Client) -> None:
 
 
 def test_dry_run_against_an_anchored_map(client: Client) -> None:
-    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
     T = base_pose(20)
     off = T.copy()

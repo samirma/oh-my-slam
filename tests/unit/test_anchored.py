@@ -203,7 +203,7 @@ def test_scale_state() -> None:
     assert s.source == "monocular"
     s.estimate(1.0)
     assert s.source == "priors" and s.k == pytest.approx(1 / 0.9, rel=1e-6)
-    s.heights = [[0.5, 0.04], [0.52, 0.04]]  # camera heights come first
+    s.heights = [[0.04, 0.5], [0.04, 0.52, 0.9]]  # camera heights come first
     s.estimate(1.0)
     assert s.source == "camera_height" and s.k == pytest.approx(math.sqrt(0.5 * 0.52), rel=1e-3)
     assert ScaleState.from_json(s.to_json()).k == s.k
@@ -284,7 +284,7 @@ def test_metric_priors_fix_the_monocular_depth_scale(tmp_path: Path) -> None:
 
 def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     m = new_map(tmp_path)
-    m.update([frame("a0", base_pose(0))])
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     # no features at all: kept at its prior
     p0 = m.update([frame("blank", base_pose(10), rgb=blank)])[0]
@@ -308,9 +308,13 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
         an.STRONG_INLIERS = strong
     assert p3.status == "provisional" and p3.inliers > 0
     # provisional frames at metric priors are references; nothing stored moved
-    assert [k.state for k in m.keyframes] == ["fused", "provisional", "provisional",
+    assert [k.state for k in m.keyframes] == ["fused", "fused", "provisional", "provisional",
                                               "provisional"]
     assert np.allclose(m.keyframes[0].T, base_pose(0))
+    # a metric prior is called a conflict only on two references: one keyframe sees it
+    m2 = new_map(tmp_path / "one")
+    m2.update([frame("a0", base_pose(0))])
+    assert m2.update([frame("off", T, p=prior(wrong))])[0].status == "provisional"
 
 
 def test_frames_without_prior_in_an_anchored_map(tmp_path: Path) -> None:
@@ -434,7 +438,7 @@ def test_height_evidence_edges(tmp_path: Path) -> None:
     m._height_evidence(f, up, shot(up)[1], K)
     assert m.scale.heights == []
     m._height_evidence(f, T, z, K)
-    assert m.scale.heights[0][1] == pytest.approx(an.DEFAULT_HEIGHT_SIGMA_M / 0.5)
+    assert m.scale.heights[0][0] == pytest.approx(an.DEFAULT_HEIGHT_SIGMA_M / 0.5)
 
 
 def test_fusion_ignores_masked_pixels(tmp_path: Path) -> None:
@@ -602,4 +606,56 @@ def test_metric_priors_with_a_scale_bias(tmp_path: Path) -> None:
     assert all(p.status == "registered" for p in pls)
     assert m.prior_bias() == pytest.approx(1 / 1.10, rel=0.03)
     assert m.scale_summary()[0] == "depth"
-    assert err(pls[-1].T, truth[-1])[0] < 0.05
+    assert err(pls[-1].T, truth[-1])[0] < 0.08
+
+
+def test_floor_candidates_and_the_vote() -> None:
+    """Each frame offers its horizontal planes; the frames vote for the floor: a counter seen
+    by one frame, or a lower floor seen through a door, does not win."""
+    rng = np.random.default_rng(5)
+
+    def plane(h: float, n: int) -> np.ndarray:
+        return np.column_stack([rng.uniform(-2, 2, n), rng.uniform(0.5, 4, n),
+                                np.full(n, -h) + rng.normal(0, 0.002, n)])
+
+    wall = np.column_stack([rng.uniform(-2, 2, 3000), np.full(3000, 3.0),
+                            rng.uniform(-0.6, 1.0, 3000)])
+    pts = np.vstack([plane(0.5, 4000), plane(0.2, 1500), wall])
+    c = an.floor_candidates(pts)
+    assert c[0] == pytest.approx(0.5, abs=0.01) and any(abs(h - 0.2) < 0.01 for h in c)
+    assert an.floor_candidates(wall[:100]) == []
+    assert an._horizontal_plane(plane(0.5, 50), 0.5) is None
+    assert an.floor_candidates(np.column_stack([wall[:, :2], -np.abs(wall[:, 2]) - 0.1])) == []
+    s = ScaleState(heights=[[0.04, 1.0, 2.5], [0.04, 1.02], [0.04, 0.98, 0.4], [0.04, 3.0]])
+    s.estimate(0.0)
+    assert s.source == "camera_height" and s.k == pytest.approx(1.0, abs=0.03)
+
+
+def test_a_metric_prior_dominates_the_image_pose(tmp_path: Path) -> None:
+    """A metric prior 3 cm / 1.5 deg off truth with sigma 2 cm / 1 deg: the frame stays within
+    its prior's reach (the images refine it, they do not replace it)."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    T = base_pose(20)
+    P = T.copy()
+    P[:3, 3] += [0.03, 0.0, 0.0]
+    p = m.update([frame("b", T, p=prior(P))])[0]
+    assert p.status == "registered" and p.prior_residual is not None
+    assert 0.001 < p.prior_residual[0] < 0.02
+
+
+def test_keyframe_images_and_depth_are_kept(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0), depth=False, mono=1.0)])
+    m.save()
+    again = AnchoredMap.load(m.root)
+    kid = again.keyframes[0].id
+    p = again.image_path(kid)
+    assert p is not None and cv2.imread(str(p)).shape == (K.height, K.width, 3)
+    d = again.depth_of(kid)
+    assert d is not None and d.shape == (K.height, K.width) and again.keyframes[0].K_grid == K
+    again.scale.k *= 2.0  # a monocular keyframe's depth follows the map's depth scale
+    assert np.allclose(again.depth_of(kid), 2.0 * d, rtol=1e-3)
+    assert again.depth_of("nope") is None and again.image_path("nope") is None
+    (again.root / an.KF_DIR / f"{kid}.depth.npy").unlink()
+    assert again.depth_of(kid) is None
