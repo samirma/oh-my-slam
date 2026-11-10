@@ -208,7 +208,9 @@ The groups are implemented in this order, so a robot can run on the API as early
 
 Until O2 + O3 land, a job commits one version per update and fusion blocks it.
 `GET /api/health` lists the groups the running service implements in `capabilities` (`O1` …
-`O10`), so the client can refuse what is missing instead of failing.
+`O10`), so the client can refuse what is missing instead of failing. A partly served group is
+named by its part: `O3-jobs` means asynchronous jobs (202, then poll) without the provisional
+phase, cancel or lanes.
 
 ## 13. Removed features
 
