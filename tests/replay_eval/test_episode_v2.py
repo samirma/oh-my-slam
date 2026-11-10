@@ -262,27 +262,41 @@ def test_robot_control_calibration(tmp_path: Path) -> None:
     sidecar's camera_id, whatever its layout; --dump-layout shows its keys."""
     s = synth_v2.build_v2(tmp_path, camera="none")
     rc = s.root / "robot_control"
+    def entry(v: Any, unit: str = "px") -> dict[str, Any]:
+        return {"value": v, "unit": unit, "source": "camera_info", "run_id": "20261110-155923",
+                "date": "2026-11-10", "confirmed": True}
+
+    def calibration(robot: str, cam: str, fx: float, w: int, h: int) -> dict[str, Any]:
+        """The harness layout of e051's robot_control/<robot>/calibration.json."""
+        vals = {f"camera.{cam}.{k}": entry(v) for k, v in (
+            ("fx_px", fx), ("fy_px", fx), ("cx_px", (w - 1) / 2), ("cy_px", (h - 1) / 2),
+            ("width_px", w), ("height_px", h))}
+        vals[f"camera.{cam}.T_body_cam"] = entry(
+            [[0, 0, 1, -0.043645], [-1, 0, 0, 0], [0, -1, 0, 0.49555], [0, 0, 0, 1]], "m")
+        vals.update({"base.kind": entry("mecanum", ""), "base.half_width_m": entry(0.12, "m"),
+                     "base.odom_scale.x": entry(1.01, ""), "base.axis.yaw.sign": entry(1, ""),
+                     "scan.T_body_scan": entry([[1, 0, 0, 0]] * 4, "m")})
+        return {"robot_id": robot, "values": vals}
+
     (rc / "re_bot_arm_rs").mkdir(parents=True)
     (rc / "re_bot_arm_rs" / "calibration.json").write_text(json.dumps(
-        {"cameras": {"rs": {"fx": 337.2, "fy": 337.2, "cx": 319.5, "cy": 179.5}}}))
+        calibration("rebot_b601_rs", "rs", 337.2, 640, 360)))
     (rc / "yahboomcar_x3plus").mkdir()
     (rc / "yahboomcar_x3plus" / "calibration.json").write_text(json.dumps(
-        {"robot": "x3plus", "sensors": [{"camera_id": "astra", "resolution": [640, 480],
-                                         "camera_matrix": {"data": [655.8, 0, 319.5, 0, 655.8,
-                                                                    239.5, 0, 0, 1]}}]}))
+        calibration("rosmaster_x3_plus", "astra", 655.8, 640, 480)))
     ep = epi.load_episode(s.root, LAYOUT)
     assert ep.cameras["astra"] == {"fx": 655.8, "fy": 655.8, "cx": 319.5, "cy": 239.5,
                                    "width": 640, "height": 480}
     assert ep.meta["camera_sources"]["astra"].endswith("yahboomcar_x3plus/calibration.json")
     r = epi.dump_layout(s.root, LAYOUT)["runs_v2"][0]
     assert r["intrinsics"] == {"astra": "calibration.json"}
-    assert r["robot_control"]["yahboomcar_x3plus"] == {
-        "robot": "str", "sensors": [{"camera_id": "str", "resolution": ["int"],
-                                     "camera_matrix": {"data": ["float"]}}]}
-    # another size in the calibration: not used
+    tree = r["robot_control"]["yahboomcar_x3plus"]
+    assert tree["robot_id"] == "str" and tree["values"]["camera.astra.fx_px"] == {
+        "value": "float", "unit": "str", "source": "str", "run_id": "str", "date": "str",
+        "confirmed": "bool"}
+    # the calibration of another size: not used
     (rc / "yahboomcar_x3plus" / "calibration.json").write_text(json.dumps(
-        {"astra": {"intrinsics": {"fx_px": 1.0, "fy_px": 2.0, "cx_px": 3.0, "cy_px": 4.0},
-                   "width": 320, "height": 240}}))
+        calibration("rosmaster_x3_plus", "astra", 655.8, 320, 240)))
     with pytest.raises(LayoutError, match="lists 'astra' with intrinsics"):
         epi.load_episode(s.root, LAYOUT)
 
@@ -297,9 +311,16 @@ def test_calibration_parsing_variants() -> None:
     assert v2._intrinsics({"nested": {"fx": 1, "fy": 2, "ppx": 3, "ppy": 4}}) == {
         "fx": 1.0, "fy": 2.0, "cx": 3.0, "cy": 4.0}
     assert v2._intrinsics({"K": [1, 2], "other": 5}) is None
+    assert v2._intrinsics({"camera_matrix": {"data": [5, 0, 6, 0, 7, 8, 0, 0, 1]}}) == {
+        "fx": 5.0, "fy": 7.0, "cx": 6.0, "cy": 8.0}
     assert v2._size({"image_width": 8, "image_height": 6}) == (8, 6)
     assert v2._size({"inner": {"size": [4, 3]}}) == (4, 3)
     assert v2._size({"width": 8, "size": [1]}) is None
+    assert v2._from_values({"values": {"camera.astra.fx_px": 1}}, "astra") is None
+    assert v2._from_values({"values": [1]}, "astra") is None and v2._from_values(3, "a") is None
+    k, size = v2._from_values({"values": {f"camera.a.{n}": 1 for n in  # type: ignore[misc]
+                                          ("fx_px", "fy_px", "cx_px", "cy_px")}}, "a")
+    assert size is None and k["fx"] == 1.0
     assert v2.key_tree({"a": []}) == {"a": []} and v2.key_tree({"a": 1}, 1) == {"a": "..."}
     assert v2._intrinsics({"a": {"x": 1}, "b": {"fx": 1, "fy": 1, "cx": 1, "cy": 1}}) == {
         "fx": 1.0, "fy": 1.0, "cx": 1.0, "cy": 1.0}

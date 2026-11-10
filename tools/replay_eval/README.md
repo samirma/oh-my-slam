@@ -118,14 +118,16 @@ An episode is read as v2 when `agent_files/runs/<run>/frames/*.json` sidecars ex
      when its size matches the frames;
   2. `camera_info_<camera_id>.json` → ROS CameraInfo `msg` (`K`, `width`, `height`; `D` with
      `plumb_bob` or `rational_polynomial` becomes OpenCV distortion when non-zero);
-  3. the episode's `robot_control/<robot>/calibration.json` that lists the sidecar's
-     `camera_id`. The robot folder is picked by which calibration names that id, whatever its
-     layout:
-     * the id is found as a key, or as a `camera_id` / `id` / `name` / `camera` value;
-     * intrinsics as `fx`/`fx_px`, … keys, or a 3×3 matrix under `K`, `camera_matrix`, …
-       (nine numbers, rows, or `{data}`);
-     * the size from `width`/`height`, `resolution` or `size`. When none is given, the
-       frame's size is used; a calibration of another size is skipped.
+  3. the episode's `robot_control/<robot>/calibration.json` (URDF robot names, e.g.
+     `yahboomcar_x3plus`, `re_bot_arm_rs`) whose values hold `camera.<sidecar camera_id>.*`.
+     * The harness layout is parsed first: `{"robot_id", "values": {"camera.<id>.fx_px":
+       {"value", "unit", "source", "run_id", "date", "confirmed"}, …}}`, with `fx_px`,
+       `fy_px`, `cx_px`, `cy_px`, `width_px` and `height_px`.
+     * Failing that, a tolerant search is tried: the id as a key or a `camera_id`/`id`/`name`
+       value; `fx`… keys or a `K`/`camera_matrix` 3×3; the size from `width`/`height` or
+       `resolution`.
+     * A calibration of another size is skipped. One without a size is taken at the frame's
+       size.
 
      `--dump-layout` prints each `calibration.json`'s key tree (keys and types only).
   4. `--camera '{"fx": …, "fy": …, "cx": …, "cy": …, "width": …, "height": …}'`.

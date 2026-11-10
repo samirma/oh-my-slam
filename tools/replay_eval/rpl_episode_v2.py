@@ -194,17 +194,43 @@ def _size(d: dict[str, Any]) -> tuple[int, int] | None:
     return None
 
 
+def _from_values(data: Any, camera_id: str) -> tuple[dict[str, float], tuple[int, int] | None] \
+        | None:
+    """The harness layout: ``{"robot_id", "values": {"camera.<id>.fx_px": {"value": ...,
+    "unit", "source", ...}, ...}}``; None when ``values`` holds no camera.<id>.fx/fy/cx/cy."""
+    values = data.get("values") if isinstance(data, dict) else None
+    if not isinstance(values, dict):
+        return None
+
+    def get(key: str) -> float | None:
+        v = values.get(f"camera.{camera_id}.{key}")
+        v = v.get("value") if isinstance(v, dict) else v
+        return float(v) if isinstance(v, int | float) else None
+
+    k = {"fx": get("fx_px"), "fy": get("fy_px"), "cx": get("cx_px"), "cy": get("cy_px")}
+    if any(v is None for v in k.values()):
+        return None
+    w, h = get("width_px"), get("height_px")
+    return {n: float(v) for n, v in k.items()}, (  # type: ignore[arg-type]
+        None if w is None or h is None else (int(w), int(h)))
+
+
 def camera_from_robot_control(robot_dir: Path, camera_id: str,
                               size: tuple[int, int]) -> tuple[dict[str, Any], str] | None:
-    """Intrinsics from the robot_control/<robot>/calibration.json that lists ``camera_id``
-    (tolerant of its layout); None when none lists it with intrinsics of the frame's size (a
-    calibration without a size is taken at the frame's size)."""
+    """Intrinsics from the robot_control/<robot>/calibration.json that holds ``camera_id``:
+    first the harness layout (``values["camera.<id>.fx_px"]`` ...), else a tolerant search;
+    None when none has it at the frame's size (one without a size is taken at that size)."""
     for path in sorted(robot_dir.glob("*/calibration.json")):
-        block = _block_for(json.loads(path.read_text()), camera_id)
-        k = None if block is None else _intrinsics(block)
-        if block is None or k is None:
-            continue
-        cal_size = _size(block) or size
+        data = json.loads(path.read_text())
+        found = _from_values(data, camera_id)
+        if found is None:
+            block = _block_for(data, camera_id)
+            ki = None if block is None else _intrinsics(block)
+            if block is None or ki is None:
+                continue
+            found = (ki, _size(block))
+        k, cal = found
+        cal_size = cal or size
         if cal_size == size:
             return {**k, "width": size[0], "height": size[1]}, str(path)
     return None
