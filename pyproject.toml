@@ -43,7 +43,6 @@ dev = [
     "ruff>=0.16",
     "mypy>=1.15",
     "import-linter>=2.1",
-    "playwright>=1.50",
 ]
 
 [build-system]

@@ -267,7 +267,7 @@ by" names the packages of this list that depend on it. Versions are those of `uv
 
 ## Development tools (`[dependency-groups] dev` and build)
 
-Every package that `uv.lock` resolves for the `dev` group, directly or transitively (24 packages;
+Every package that `uv.lock` resolves for the `dev` group, directly or transitively (21 packages;
 `uv sync` installs them by default). Generated as the runtime table above. click, packaging,
 pygments and typing-extensions are runtime packages too.
 
@@ -276,7 +276,6 @@ pygments and typing-extensions are runtime packages too.
 | ast-serialize | 0.12.1 | MIT | mypy | |
 | click | 8.5.0 | BSD-3-Clause | import-linter | Also a runtime package |
 | coverage | 7.16.2 | Apache-2.0 | pytest-cov | |
-| greenlet | 3.5.6 | MIT AND PSF-2.0 | playwright | |
 | grimp | 3.17 | BSD 2-Clause License | import-linter | |
 | import-linter | 2.15 | BSD 2-Clause License | oh-my-slam (dev, direct) | |
 | iniconfig | 2.3.0 | MIT | pytest | |
@@ -287,9 +286,7 @@ pygments and typing-extensions are runtime packages too.
 | mypy-extensions | 1.1.0 | MIT | mypy | |
 | packaging | 26.3 | Apache-2.0 OR BSD-2-Clause | pytest | Also a runtime package |
 | pathspec | 1.1.1 | MPL-2.0 | mypy | |
-| playwright | 1.63.0 | Apache-2.0 | oh-my-slam (dev, direct) | The wheel bundles the Playwright driver (Apache-2.0; its `ThirdPartyNotices.txt`) and a Node.js 24.21.0 runtime (MIT, with the licences of its bundled parts in `driver/LICENSE`) |
 | pluggy | 1.6.0 | MIT | pytest, pytest-cov | |
-| pyee | 13.0.1 | MIT | playwright | |
 | pygments | 2.21.0 | BSD-2-Clause | pytest, rich | Also a runtime package |
 | pytest | 9.1.1 | MIT | oh-my-slam (dev, direct), pytest-cov, pytest-timeout | |
 | pytest-cov | 7.1.0 | MIT | oh-my-slam (dev, direct) | |
