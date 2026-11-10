@@ -20,7 +20,8 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   depth (``judge``): samples seen through by more than ``tau`` (max(``SEEN_TAU_M``,
   ``SEEN_TAU_REL`` x depth)) against samples seen in place; samples hidden by something nearer
   and those in the bottom ``FOOT_SHARE`` of the box (the support at its foot looks the same with
-  or without it) tell nothing. After an object's last sighting in the update, it is ``struck``
+  or without it) tell nothing; nor is what depth sees through anyway (``SEE_THROUGH``: a window,
+  a glass). After an object's last sighting in the update, it is ``struck``
   when the keyframes that saw it gone outnumber those that saw it in place (a single one must see
   ``GONE_ALONE`` of it through). A struck object keeps its record for that version and is removed
   by the next update; the cloud voxels inside its box that its witnesses see through are carved
@@ -29,7 +30,8 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   (``MOVE_RGB``) that appears in the update in which an object is struck takes that object's id:
   ``state: moved`` with ``moved_from_m`` its old centre.
 * **Published.** An object is listed once two keyframes detected it, or one did and no keyframe
-  that had it in view saw its place without detecting it; once listed it stays listed.
+  that had it in view saw its place without detecting it; once listed it stays listed. A single
+  detection that later keyframes see gone is dropped; two or more make it ``struck``.
 * **Boxes** are upright boxes (``segmentation.api.fit_object_obb``) fitted to the points of its
   sightings that agree on the centre; floor-standing classes are grounded on the map's floor.
 * **Surfaces** (``find_surfaces``): horizontal planes of the fused cloud — cells of
@@ -67,6 +69,7 @@ from scipy import ndimage
 
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.geometry import project, voxel_keys
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
     OBB,
@@ -78,6 +81,8 @@ from oh_my_slam.segmentation.api import (
     surface_label,
     trim_support,
 )
+
+log = get_logger("oh_my_slam.mapping.anchored_objects")
 
 Array = NDArray[np.float64]
 
@@ -121,9 +126,9 @@ ACROSS_COS = 0.8
 ENDS_COS = 0.3
 SURFACE_CELL_M = 0.05
 SURFACE_BIN_M = 0.01
-SLAB_BINS = 1  # the slab: this many bins either side (3 cm)
+SLAB_BINS = 2  # the slab: this many bins either side (5 cm: monocular depth spreads a plane)
 BAND_BINS = 10  # the column a cell's slab share is counted in: +-10 cm
-FLAT_SHARE = 0.6
+FLAT_SHARE = 0.5
 SURFACE_MIN_AREA_M2 = 0.06
 SURFACE_MIN_POINTS = 200
 CORE_SHARE = 0.25  # of the least area: cells left after one erosion (no lines of cells)
@@ -134,6 +139,8 @@ SURFACE_ID_CENTRE_M = 0.3
 SUPPORT_TOL_M = 0.05
 SUPPORT_PREFER_OBJECT_M = 0.01
 CARVE_GROW_M = 0.02
+# what a keyframe's depth sees through even while it is there: never judged on depth
+SEE_THROUGH = frozenset({"window", "shop window", "glass", "wine glass", "glass door"})
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -454,7 +461,7 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
 def judge(o: MapObject, view: View) -> tuple[str, float] | None:
     """A keyframe's verdict on an object it did not detect: ("gone" | "in_place", share seen
     through), or None when it does not judge it (out of view, too far, hidden)."""
-    if o.box is None or not len(o.points):
+    if o.box is None or not len(o.points) or o.label in SEE_THROUGH:
         return None
     pts = o.points[o.box.contains(o.points, 0.01)]
     if len(pts) < JUDGE_MIN:
@@ -736,14 +743,17 @@ class ObjectMap:
         dropped: set[int] = set()
         for o in self.objects:
             ev = events.get(o.id, [])
+            log.debug("object %d %s: %s", o.id, o.label,
+                      [(e[0], round(e[1], 2), e[2].kid) for e in ev])
             last = max((i for i, e in enumerate(ev) if e[0] == "seen"), default=-1)
             gone = [e for e in ev[last + 1:] if e[0] == "gone"]
             place = sum(e[0] == "in_place" for e in ev[last + 1:])
             o.misses += place
             if gone and len(gone) > place and (len(gone) >= 2 or gone[0][1] >= GONE_ALONE):
-                if not o.published:
-                    dropped.add(o.id)  # a candidate seen gone was never there
+                if not o.published and len(o.sightings) < 2:
+                    dropped.add(o.id)  # a single detection seen gone was never there
                 else:
+                    o.published = True  # seen twice, then gone: listed once, as struck
                     struck.append((o, [e[2] for e in gone]))
                 continue
             if last >= 0 and o.id not in created:

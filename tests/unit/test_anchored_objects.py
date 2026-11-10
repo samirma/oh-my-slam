@@ -526,3 +526,21 @@ def test_a_surface_elsewhere_at_the_same_height_takes_a_new_id() -> None:
 def test_yaw_stays_in_its_range() -> None:
     assert ao.yaw_deg(-90.0) == 90.0 and ao.yaw_deg(-89.99996) == 90.0
     assert ao.yaw_deg(270.0) == 90.0 and ao.yaw_deg(10.0) == 10.0
+
+
+def test_seen_twice_then_gone_in_one_update_is_struck(tmp_path: Path) -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    empty = TableScene(items=[])
+    om = ObjectMap(tmp_path)
+    struck = om.update([view("a", EYES[0], sc), view("b", EYES[1], sc),
+                        view("c", EYES[2], empty), view("d", EYES[3], empty)], 1, 0.0)
+    assert len(struck) == 1
+    assert [(o["label"], o["state"]) for o in om.records()["objects"]] == [("box", "struck")]
+
+
+def test_what_depth_sees_through_is_not_judged() -> None:
+    v = view("c", EYES[0], TableScene(items=[]))
+    o = MapObject(1, {"window": 1.0}, box=Box(np.array([0.25, 0.225, TOP + 0.06]),
+                                              np.array([0.2, 0.15, 0.12]), 0.0))
+    o.points = np.full((40, 3), [0.25, 0.225, TOP + 0.1], np.float32)
+    assert ao.judge(o, v) is None

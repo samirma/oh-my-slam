@@ -216,8 +216,8 @@ called by `service.prior_first` after the engine placed and fused the update's k
   axis is only partly seen. `extent_seen`: an axis is `full` when an uncut sighting sees it across
   (|cos| ≤ 0.8 to the ray) or sightings from both ends see it; `z` when one sees top and bottom
   uncut, or the top with the box resting on a support.
-* **Surfaces.** Horizontal planes of the fused cloud: 5 cm cells whose points concentrate (60 %
-  of ±10 cm) in a ±1 cm slab at a height many cells share; connected areas of at least 0.06 m²
+* **Surfaces.** Horizontal planes of the fused cloud: 5 cm cells whose points concentrate (50 %
+  of ±10 cm) in a ±2 cm slab at a height many cells share; connected areas of at least 0.06 m²
   with a core (no lines of wall cells), up to the highest camera. `height_m` is the median of
   their points; ids are stable (same height within 4 cm and overlapping extent).
 * **Relations.** `supported_by`: the surface or object top within 5 cm of the box's bottom under
