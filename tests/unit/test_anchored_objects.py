@@ -361,7 +361,16 @@ def test_summaries_without_sightings() -> None:
     o.box = Box(np.zeros(3), np.ones(3), 0.0)
     o.sightings = [s]
     o.supported_by = {"kind": "surface", "id": 1, "verified_version": 1}
-    assert ao.extent_seen(o)["z"] == "full"  # rests on a support, its top seen
+    assert ao.extent_seen(o)["z"] == "partial"  # its bottom cut: the height not seen
+    from_above = Sighting("k3", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 0.0, -1.0],
+                          [0, 0, 1], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
+    o.sightings = [s, from_above]
+    assert ao.extent_seen(o)["z"] == "partial"  # seen from above: the top alone
+    side = Sighting("k4", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 1.0, 0.0],
+                    [0, -1, 0], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
+    o.sightings = [s, side]
+    assert ao.extent_seen(o)["z"] == "full"
+    o.sightings = [s]
     assert Sighting.from_json(s.to_json()) == s
     back = Sighting("k2", 1, [0, 0, 0], 1.0, 100, [True, False, False, False], [0.0, -1.0, 0.0],
                     [0, 1, 0], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
@@ -620,28 +629,38 @@ def test_specific_labels_win_over_generic_ones() -> None:
     assert MapObject(1, {"cup": 1.0, "apple": 0.5}).label == "cup"
     assert ao.alike("ball", "tomato") and ao.alike("egg", "fruit") and not ao.alike("egg", "cup")
 
+ABOVE = [(0.42, 0.05, 1.5), (0.40, 0.15, 1.55), (0.45, 0.1, 1.45)]
+OBLIQUE = [(0.0, 0.0, 1.45), (0.1, -0.3, 1.5), (0.0, 0.3, 1.4), (0.2, 0.0, 1.55)]
 
-def test_worktop_support_heights_with_noisy_depth(tmp_path: Path) -> None:
-    """An arm's worktop at 0.9 m seen from above at 640 x 360 with 1 % + 3 mm depth noise:
-    the worktop's height within 1 cm, the items 3-8 cm tall rest on it, a tomato on a plate."""
+
+@pytest.mark.parametrize("eyes", [OBLIQUE, ABOVE], ids=["oblique", "above"])
+def test_worktop_support_heights_with_noisy_depth(tmp_path: Path,
+                                                  eyes: list[tuple[float, float, float]]
+                                                  ) -> None:
+    """An arm's worktop at 0.9 m at 640 x 360 with 1 % + 3 mm depth noise, beside a lower
+    counter 9 cm down, a rug detected on the worktop: the worktop's height within 1 cm; the
+    items 3-8 cm tall rest on it with their full heights, also when seen only from above (their
+    height then ``partial``); a tomato on a plate; the rug neither listed nor a support."""
     from oh_my_slam.core.types import Intrinsics
     from tests.synth.room import Room
 
     K = Intrinsics(320.0, 320.0, 320.0, 180.0, 640, 360)
     w = 0.9
     items = [Item("counter", [((-0.2, -0.4, 0.0), (1.0, 0.6, w))]),
+             Item("cabinet", [((1.0, -0.4, 0.0), (1.6, 0.6, w - 0.09))]),
+             Item("rug", [((0.50, -0.20, w), (0.68, -0.02, w + 0.002))], (90, 60, 40)),
              Item("apple", [((0.30, 0.00, w), (0.37, 0.07, w + 0.07))], (200, 30, 30)),
              Item("egg", [((0.45, 0.10, w), (0.49, 0.15, w + 0.045))], (230, 220, 200)),
              Item("plate", [((0.20, 0.20, w), (0.42, 0.42, w + 0.02))], (240, 240, 240)),
-             Item("mug", [((0.55, -0.15, w), (0.63, -0.07, w + 0.08))], (40, 90, 200)),
+             Item("mug", [((0.55, -0.15, w + 0.002), (0.63, -0.07, w + 0.08))],
+                  (40, 90, 200)),
              Item("tomato", [((0.28, 0.27, w + 0.02), (0.34, 0.33, w + 0.07))], (220, 50, 20))]
     sc = TableScene(items=items, room=Room(boxes=[]))
     rng = np.random.default_rng(0)
     cloud = Cloud()
     views = []
-    for i, eye in enumerate([(0.0, 0.0, 1.45), (0.1, -0.3, 1.5), (0.0, 0.3, 1.4),
-                             (0.2, 0.0, 1.55)]):
-        T = look_at(eye, (0.42, 0.1, w))
+    for i, eye in enumerate(eyes):
+        T = look_at(eye, (0.42, 0.1, w)) if eye[0] != 0.42 else look_at(eye, (0.42, 0.06, w))
         rgb, z, idx = sc.render(T, K)
         z = (z * (1 + 0.01 * rng.standard_normal(z.shape))
              + 0.003 * rng.standard_normal(z.shape)).astype(np.float32)
@@ -654,14 +673,19 @@ def test_worktop_support_heights_with_noisy_depth(tmp_path: Path) -> None:
                           ao.SENSOR_DEPTH_REL))
     om = ObjectMap(tmp_path)
     om.update(views, 1, w)
-    om.finish(cloud.points(), 1.6, 1)
+    om.finish(cloud.points(), 1.6, 1, np.array([v.centre for v in views]))
     rec = om.records()
     top = next(s for s in rec["surfaces"] if abs(s["height_m"] - w) < 0.05)
     assert top["height_m"] == pytest.approx(w, abs=0.01)
     o = by_label(rec)
-    for name in ("apple", "egg", "plate", "mug"):
+    assert "rug" not in o
+    heights = {"apple": 0.07, "egg": 0.045, "plate": 0.02, "mug": 0.08}
+    for name, h in heights.items():
         assert o[name]["supported_by"]["id"] == top["id"], name
         bottom = o[name]["centre_m"][2] - o[name]["size_m"][2] / 2
         assert bottom == pytest.approx(w, abs=0.01), name
+        assert o[name]["size_m"][2] == pytest.approx(h, abs=0.02), name
     assert o["tomato"]["supported_by"] == {"kind": "object", "id": o["plate"]["id"],
                                            "verified_version": 1}
+    if eyes is ABOVE:
+        assert o["egg"]["extent_seen"]["z"] == "partial"

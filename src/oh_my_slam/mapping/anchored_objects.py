@@ -41,14 +41,21 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   detection that later keyframes see gone is dropped; two or more make it ``struck``.
 * **Boxes** are upright boxes (``segmentation.api.fit_object_obb``) fitted to the points of its
   sightings that agree on the centre; floor-standing classes are grounded on the map's floor.
-* **Surfaces** (``find_surfaces``): horizontal planes of the fused cloud — cells of
+* **Surfaces** (``find_surfaces``): horizontal planes of the fused cloud's points that face up
+  (normals within 25 degrees of up, turned towards the cameras: no object sides, walls or
+  ceiling) — cells of
   ``SURFACE_CELL_M`` whose points concentrate (``FLAT_SHARE``) in a slab of ``SLAB_BINS`` bins either side at a
   height that many cells share; their connected areas over ``SURFACE_MIN_AREA_M2``. Ids are
   stable across versions (``assign_surface_ids``: height within ``SURFACE_ID_DZ`` and overlapping
   extent).
 * **Relations.** ``supported_by``: the surface or the top of an object within
   ``SUPPORT_TOL_M`` of the box's bottom under its centre (a surface when both fit, unless the
-  object's top is clearly nearer and it is no furniture top); the box rests on it. ``inside_of``:
+  object's top is clearly nearer and it is no furniture top; of surfaces as near, the largest;
+  a support object is at least as large as the object and no floor covering, which is listed
+  only on a room-sized surface); the box, as fitted, rests on it: a view from above sees only
+  an object's top, so its height is completed down to the support, found up to
+  ``SUPPORT_REACH_M`` below it (``z`` stays ``partial``
+  unless a sighting saw its height from the side). ``inside_of``:
   the centre within a container's box (``CONTAINERS``: a bowl, a box, a drawer, a cup) that is
   larger than the object, which then is supported by it too. ``verified_version``: the latest
   version that observed the object or its support with the relation holding.
@@ -138,6 +145,7 @@ BAND_BINS = 10  # the column a cell's slab share is counted in: +-10 cm
 FLAT_SHARE = 0.5
 SURFACE_MIN_AREA_M2 = 0.06
 SURFACE_MIN_POINTS = 200
+UP_NORMAL_Z = 0.9  # a point of a support plane's top: its normal within 25 degrees of up
 CORE_SHARE = 0.25  # of the least area: cells left after one erosion (no lines of cells)
 SURFACE_PEAK_BINS = 2
 SURFACE_ID_DZ = 0.04
@@ -156,6 +164,12 @@ COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no dept
 # has SPECIFIC_SHARE of their votes, and they go with any label
 GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
 SPECIFIC_SHARE = 0.25
+# floor coverings: never a support, and listed only on a room-sized surface (ROOM_FLOOR_M2)
+FLOOR_COVERINGS = frozenset({"rug", "carpet", "mat", "doormat", "bath mat"})
+ROOM_FLOOR_M2 = 3.0
+SUPPORT_AREA_RATIO = 1.0  # a support object's footprint is at least the object's
+SUPPORT_SAME_M = 0.01
+SUPPORT_REACH_M = 0.30  # surfaces this near in gap: the larger one supports
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -635,10 +649,18 @@ def _polygon(mask: NDArray[np.bool_], x0: int, y0: int) -> list[list[float]]:
     return [[round(float(x), 4), round(float(y), 4)] for x, y in pts]
 
 
-def find_surfaces(xyz: NDArray[Any], top_z: float | None = None) -> list[Surface]:
+def find_surfaces(xyz: NDArray[Any], top_z: float | None = None,
+                  viewpoints: NDArray[Any] | None = None) -> list[Surface]:
     """Horizontal support planes of a cloud (map frame, z up; see the module docstring), lowest
-    first; none above ``top_z``."""
+    first; none above ``top_z``. With ``viewpoints`` (the cameras), only the points whose normal,
+    turned towards the cameras, points up (``UP_NORMAL_Z``) take part: a plane's top, not the
+    sides of what stands on it, nor walls, nor a ceiling."""
     p = np.asarray(xyz, np.float64)
+    if viewpoints is not None and len(p) >= SURFACE_MIN_POINTS:
+        from oh_my_slam.reconstruction.pointcloud import PointNormals
+
+        n = PointNormals(p, viewpoints).at(np.arange(len(p)))
+        p = p[n[:, 2] >= UP_NORMAL_Z]
     if len(p) < SURFACE_MIN_POINTS:
         return []
     cxy = voxel_keys(p[:, :2], SURFACE_CELL_M)
@@ -765,6 +787,7 @@ class ObjectMap:
         self.next_surface_id = 1
         self.surfaces: list[Surface] = []
         self.version = 0
+        self.floor_z: float | None = None  # the floor of the latest update (box grounding)
 
     @staticmethod
     def load(root: Path) -> ObjectMap:
@@ -816,6 +839,7 @@ class ObjectMap:
         """Fold the new keyframes ``views`` (request order) into the objects of ``version``;
         returns the objects struck, for carving."""
         self.version = version
+        self.floor_z = floor_z
         self.objects = [o for o in self.objects if o.state != "struck"]
         events: dict[int, list[tuple[str, float, View]]] = {}
         created: set[int] = set()
@@ -964,12 +988,21 @@ class ObjectMap:
 
     # -- what the cloud says ------------------------------------------------------------------
 
-    def finish(self, xyz: Array, top_z: float | None, version: int) -> None:
-        """Surfaces from the fused cloud, then every listed object's relations."""
-        self.surfaces = find_surfaces(xyz, top_z)
+    def finish(self, xyz: Array, top_z: float | None, version: int,
+               viewpoints: Array | None = None, floor_z: float | None = None) -> None:
+        """Surfaces from the fused cloud (the points facing up, seen from ``viewpoints``), then
+        every listed object's relations, on its box as fitted (it rests on its support anew)."""
+        self.surfaces = find_surfaces(xyz, top_z, viewpoints)
         self.surface_ids, self.next_surface_id = assign_surface_ids(
             self.surfaces, self.surface_ids, self.next_surface_id)
+        for o in self.objects:
+            if o.label in FLOOR_COVERINGS and o.published and o.box is not None and \
+                    not any(s.area_m2 >= ROOM_FLOOR_M2 and abs(o.box.bottom - s.height_m)
+                            <= SUPPORT_TOL_M for s in self.surfaces):
+                o.published = False  # a rug on a worktop: a false detection
         live = self.live()
+        for o in live:
+            self._fit(o, self.floor_z if floor_z is None else floor_z)
         for o in live:
             self._relate(o, live, version)
 
@@ -990,18 +1023,24 @@ class ObjectMap:
         if inside is not None:
             support = ("object", inside.id, 0.0)
         else:
+            # an object whose height no sighting saw (seen from above) may stand on a support
+            # as far below its visible top part as SUPPORT_REACH_M
+            reach = SUPPORT_TOL_M if extent_seen(o)["z"] == "full" else SUPPORT_REACH_M
             best_s = None
-            for s in self.surfaces:
+            for s in sorted(self.surfaces, key=lambda s: -s.area_m2):
                 gap = box.bottom - s.height_m
-                if abs(gap) <= SUPPORT_TOL_M and s.contains(box.centre) and (
-                        best_s is None or abs(gap) < abs(best_s[1])):
-                    best_s = (s, gap)
+                if -SUPPORT_TOL_M <= gap <= reach and s.contains(box.centre) and (
+                        best_s is None or abs(gap) < abs(best_s[1]) - SUPPORT_SAME_M):
+                    best_s = (s, gap)  # the nearest in height, the largest when as near
             best_o = None
+            area = float(box.size[0] * box.size[1])
             for p in live:
-                if p is o or p.box is None or p.box.top > box.top:
+                if p is o or p.box is None or p.box.top > box.top or \
+                        p.label in FLOOR_COVERINGS or \
+                        float(p.box.size[0] * p.box.size[1]) < SUPPORT_AREA_RATIO * area:
                     continue
                 gap = box.bottom - p.box.top
-                if abs(gap) <= SUPPORT_TOL_M and p.box.footprint_contains(box.centre) and (
+                if -SUPPORT_TOL_M <= gap <= reach and p.box.footprint_contains(box.centre) and (
                         best_o is None or abs(gap) < abs(best_o[1])):
                     best_o = (p, gap)
             if best_o is not None and (best_s is None or (
@@ -1019,9 +1058,10 @@ class ObjectMap:
                 sup_obs = sup_obs or q.last_seen_version == version
             else:
                 sup_obs = True  # the surfaces are measured again by every update
-            if kind == "surface" and gap != 0.0:
-                # the box rests on its support
-                level = next(s.height_m for s in self.surfaces if s.id == sid)
+            if gap != 0.0:
+                # the box rests on its support (a top-down view sees only its top)
+                level = next(s.height_m for s in self.surfaces if s.id == sid) \
+                    if kind == "surface" else next(p for p in live if p.id == sid).box.top
                 top = max(box.top, level + POINT_VOXEL_M)
                 box.centre[2] = (top + level) / 2
                 box.size[2] = top - level
@@ -1108,7 +1148,7 @@ def extent_seen(o: MapObject) -> dict[str, str]:
         ends = any(d > ENDS_COS for d in dots) and any(d < -ENDS_COS for d in dots)
         if across or ends:
             out[name] = "full"
-    tops = [s for s in o.sightings if not s.cut[2]]
-    if any(not s.cut[3] for s in tops) or (o.supported_by is not None and tops):
+    # the height is seen only from the side: a view from above sees the top alone
+    if any(not s.cut[2] and not s.cut[3] and abs(s.ray[2]) <= ACROSS_COS for s in whole):
         out["z"] = "full"
     return out

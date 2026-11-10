@@ -225,13 +225,17 @@ called by `service.prior_first` after the engine placed and fused the update's k
   axis is only partly seen. `extent_seen`: an axis is `full` when an uncut sighting sees it across
   (|cos| ≤ 0.8 to the ray) or sightings from both ends see it; `z` when one sees top and bottom
   uncut, or the top with the box resting on a support.
-* **Surfaces.** Horizontal planes of the fused cloud: 5 cm cells whose points concentrate (50 %
+* **Surfaces.** Horizontal planes of the fused cloud's up-facing points (normals within 25° of
+  up, turned to the cameras: no object sides, walls or ceiling): 5 cm cells whose points concentrate (50 %
   of ±10 cm) in a ±2 cm slab at a height many cells share; connected areas of at least 0.06 m²
   with a core (no lines of wall cells), up to the highest camera. `height_m` is the median of
   their points; ids are stable (same height within 4 cm and overlapping extent).
 * **Relations.** `supported_by`: the surface or object top within 5 cm of the box's bottom under
   its centre — the surface when both fit unless the object's top is nearer by 1 cm and it is no
-  table-like top; the box then rests on the surface. `inside_of`: the centre within the box of a
+  table-like top; of surfaces as near, the largest; a support object is at least as large as the
+  object and no floor covering (a rug or carpet is listed only on a room-sized surface). The box
+  as fitted then rests on its support: an object seen only from above (its height `partial`)
+  finds its support up to 30 cm below its top part and its height is completed down to it. `inside_of`: the centre within the box of a
   larger container (bowl, box, basket, drawer, cup...), which also supports it.
   `verified_version`: the latest version that observed the object or its support with the
   relation holding (surfaces are measured by every update).
