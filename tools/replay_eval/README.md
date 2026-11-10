@@ -118,7 +118,17 @@ An episode is read as v2 when `agent_files/runs/<run>/frames/*.json` sidecars ex
      when its size matches the frames;
   2. `camera_info_<camera_id>.json` → ROS CameraInfo `msg` (`K`, `width`, `height`; `D` with
      `plumb_bob` or `rational_polynomial` becomes OpenCV distortion when non-zero);
-  3. `--camera '{"fx": …, "fy": …, "cx": …, "cy": …, "width": …, "height": …}'`.
+  3. the episode's `robot_control/<robot>/calibration.json` that lists the sidecar's
+     `camera_id`. The robot folder is picked by which calibration names that id, whatever its
+     layout:
+     * the id is found as a key, or as a `camera_id` / `id` / `name` / `camera` value;
+     * intrinsics as `fx`/`fx_px`, … keys, or a 3×3 matrix under `K`, `camera_matrix`, …
+       (nine numbers, rows, or `{data}`);
+     * the size from `width`/`height`, `resolution` or `size`. When none is given, the
+       frame's size is used; a calibration of another size is skipped.
+
+     `--dump-layout` prints each `calibration.json`'s key tree (keys and types only).
+  4. `--camera '{"fx": …, "fy": …, "cx": …, "cy": …, "width": …, "height": …}'`.
 
   The error lists what was tried. A camera id calibrated differently in a later run is sent
   as `<id>@<run>`.

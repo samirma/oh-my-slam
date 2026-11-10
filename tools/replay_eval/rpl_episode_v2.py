@@ -122,6 +122,105 @@ def camera_from_info(path: Path) -> dict[str, Any] | None:
     return cam
 
 
+INTRINSIC_KEYS = {"fx": ("fx", "fx_px", "f_x"), "fy": ("fy", "fy_px", "f_y"),
+                  "cx": ("cx", "cx_px", "c_x", "ppx"), "cy": ("cy", "cy_px", "c_y", "ppy")}
+MATRIX_KEYS = ("K", "k", "camera_matrix", "intrinsic_matrix", "matrix")
+WIDTH_KEYS = ("width", "width_px", "image_width")
+HEIGHT_KEYS = ("height", "height_px", "image_height")
+SIZE_KEYS = ("resolution", "size", "image_size")
+
+
+def _block_for(obj: Any, camera_id: str) -> dict[str, Any] | None:
+    """The part of a calibration that names ``camera_id``: a key equal to it, or a dict whose
+    camera_id / id / name / camera is it (searched depth-first)."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get(camera_id), dict):
+            return obj[camera_id]
+        if any(obj.get(k) == camera_id for k in ("camera_id", "id", "name", "camera")):
+            return obj
+        children: list[Any] = list(obj.values())
+    elif isinstance(obj, list):
+        children = obj
+    else:
+        return None
+    for v in children:
+        found = _block_for(v, camera_id)
+        if found is not None:
+            return found
+    return None
+
+
+def _flat(m: Any) -> list[float] | None:
+    if isinstance(m, dict):
+        m = m.get("data")
+    if isinstance(m, list) and m and isinstance(m[0], list):
+        m = [v for row in m for v in row]
+    return [float(v) for v in m] if isinstance(m, list) and len(m) == 9 else None
+
+
+def _intrinsics(d: dict[str, Any]) -> dict[str, float] | None:
+    """fx, fy, cx, cy from a dict or the first nested dict that has them (named keys, or a 3x3
+    matrix as 9 numbers, rows, or {data: [...]})."""
+    named = {k: next((d[n] for n in names if isinstance(d.get(n), int | float)), None)
+             for k, names in INTRINSIC_KEYS.items()}
+    if all(v is not None for v in named.values()):
+        return {k: float(v) for k, v in named.items()}  # type: ignore[arg-type]
+    for key in MATRIX_KEYS:
+        K = _flat(d.get(key))
+        if K is not None:
+            return {"fx": K[0], "fy": K[4], "cx": K[2], "cy": K[5]}
+    for v in d.values():
+        if isinstance(v, dict):
+            found = _intrinsics(v)
+            if found is not None:
+                return found
+    return None
+
+
+def _size(d: dict[str, Any]) -> tuple[int, int] | None:
+    w = next((d[k] for k in WIDTH_KEYS if isinstance(d.get(k), int | float)), None)
+    h = next((d[k] for k in HEIGHT_KEYS if isinstance(d.get(k), int | float)), None)
+    if w is not None and h is not None:
+        return int(w), int(h)
+    for k in SIZE_KEYS:
+        v = d.get(k)
+        if isinstance(v, list) and len(v) == 2:
+            return int(v[0]), int(v[1])
+    for v in d.values():
+        if isinstance(v, dict):
+            found = _size(v)
+            if found is not None:
+                return found
+    return None
+
+
+def camera_from_robot_control(robot_dir: Path, camera_id: str,
+                              size: tuple[int, int]) -> tuple[dict[str, Any], str] | None:
+    """Intrinsics from the robot_control/<robot>/calibration.json that lists ``camera_id``
+    (tolerant of its layout); None when none lists it with intrinsics of the frame's size (a
+    calibration without a size is taken at the frame's size)."""
+    for path in sorted(robot_dir.glob("*/calibration.json")):
+        block = _block_for(json.loads(path.read_text()), camera_id)
+        k = None if block is None else _intrinsics(block)
+        if block is None or k is None:
+            continue
+        cal_size = _size(block) or size
+        if cal_size == size:
+            return {**k, "width": size[0], "height": size[1]}, str(path)
+    return None
+
+
+def key_tree(obj: Any, depth: int = 6) -> Any:
+    """The keys of a JSON value, nested to ``depth`` (lists show their first element)."""
+    if depth == 0:
+        return "..."
+    if isinstance(obj, dict):
+        return {str(k): key_tree(v, depth - 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [key_tree(obj[0], depth - 1)] if obj else []
+    return type(obj).__name__
+
+
 def run_camera(run_dir: Path, camera_id: str, size: tuple[int, int], layout: dict[str, Any],
                sources: dict[str, str]) -> dict[str, Any]:
     """The intrinsics of one camera of a run, in the order calibrate_camera.json (when its size
@@ -133,12 +232,18 @@ def run_camera(run_dir: Path, camera_id: str, size: tuple[int, int], layout: dic
     source = str(cal)
     if cam is None or (cam["width"], cam["height"]) != size:
         cam, source = camera_from_info(info), str(info)
+    robot_dir = (run_dir / v2["robot_control"]).resolve()
+    if cam is None:
+        found = camera_from_robot_control(robot_dir, camera_id, size)
+        if found is not None:
+            cam, source = found
     if cam is None and layout.get("camera_override"):
         cam, source = dict(layout["camera_override"]), "--camera"
     if cam is None:
         raise LayoutError(f"run {run_dir.name}, camera '{camera_id}' ({size[0]}x{size[1]}): no "
                           f"intrinsics: {cal} is missing or another size, {info} is missing, "
-                          f"and no --camera was given")
+                          f"no {robot_dir}/<robot>/calibration.json lists '{camera_id}' with "
+                          f"intrinsics, and no --camera was given")
     sources[camera_id] = source
     return cam
 
@@ -373,6 +478,10 @@ def dump_v2(root: Path, layout: dict[str, Any]) -> list[dict[str, Any]]:
                 entry["intrinsics"][cam] = Path(sources[cam]).name
             except LayoutError as e:
                 entry["intrinsics"][cam] = f"error: {e}"
+        robot_dir = (run_dir / v2["robot_control"]).resolve()
+        entry["robot_control"] = {
+            p.parent.name: key_tree(json.loads(p.read_text()))
+            for p in sorted(robot_dir.glob("*/calibration.json"))}
         log = run_dir / v2["log"]
         if log.is_file():
             lines = [x for x in log.read_text().splitlines() if x.strip()]

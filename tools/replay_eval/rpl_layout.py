@@ -36,6 +36,8 @@ LAYOUT: dict[str, Any] = {
         "calibrate": "calibrate_camera.json",  # "intrinsics": {fx_px, fy_px, cx_px, cy_px, ...}
         "camera_info": "camera_info_{camera_id}.json",  # ROS CameraInfo under "msg": K, D, ...
         "log": "log.jsonl",
+        # the episode's robot_control/<robot>/calibration.json (intrinsics fallback 3)
+        "robot_control": "../../../robot_control",
         "locate_prefixes": ["loc"],  # locate frames (their sidecar prior is what was sent)
         "locate_gap_s": 10.0,  # consecutive locate frames closer than this are one request
     },

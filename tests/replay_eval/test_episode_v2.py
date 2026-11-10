@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,9 @@ def test_intrinsics_order(tmp_path: Path) -> None:
     none = synth_v2.build_v2(tmp_path / "c", camera="none")
     with pytest.raises(LayoutError, match=r"camera 'astra' \(640x480\): no intrinsics: .*"
                                           r"calibrate_camera.json is missing.*camera_info_astra"
-                                          r".json is missing, and no --camera"):
+                                          r".json is missing, no .*robot_control/<robot>/calibration"
+                                          r"\.json lists 'astra' with intrinsics, and no "
+                                          r"--camera"):
         epi.load_episode(none.root, LAYOUT)
     over = merge(LAYOUT, {"camera_override": {"fx": 500.0, "fy": 500.0, "cx": 320.0,
                                               "cy": 240.0, "width": 640, "height": 480}})
@@ -252,3 +255,65 @@ def test_v2_frame_entry_partial_prior(tmp_path: Path) -> None:
     e = r.frame_entry(f, "f0")
     assert e["prior"] == {"trust": "drifting", "T_map_cam": f.pose.tolist()}
     assert e["height_above_floor_m"] == 0.5 and e["height_sigma_m"] == 0.02
+
+
+def test_robot_control_calibration(tmp_path: Path) -> None:
+    """Fallback 3: the episode's robot_control/<robot>/calibration.json that lists the
+    sidecar's camera_id, whatever its layout; --dump-layout shows its keys."""
+    s = synth_v2.build_v2(tmp_path, camera="none")
+    rc = s.root / "robot_control"
+    (rc / "re_bot_arm_rs").mkdir(parents=True)
+    (rc / "re_bot_arm_rs" / "calibration.json").write_text(json.dumps(
+        {"cameras": {"rs": {"fx": 337.2, "fy": 337.2, "cx": 319.5, "cy": 179.5}}}))
+    (rc / "yahboomcar_x3plus").mkdir()
+    (rc / "yahboomcar_x3plus" / "calibration.json").write_text(json.dumps(
+        {"robot": "x3plus", "sensors": [{"camera_id": "astra", "resolution": [640, 480],
+                                         "camera_matrix": {"data": [655.8, 0, 319.5, 0, 655.8,
+                                                                    239.5, 0, 0, 1]}}]}))
+    ep = epi.load_episode(s.root, LAYOUT)
+    assert ep.cameras["astra"] == {"fx": 655.8, "fy": 655.8, "cx": 319.5, "cy": 239.5,
+                                   "width": 640, "height": 480}
+    assert ep.meta["camera_sources"]["astra"].endswith("yahboomcar_x3plus/calibration.json")
+    r = epi.dump_layout(s.root, LAYOUT)["runs_v2"][0]
+    assert r["intrinsics"] == {"astra": "calibration.json"}
+    assert r["robot_control"]["yahboomcar_x3plus"] == {
+        "robot": "str", "sensors": [{"camera_id": "str", "resolution": ["int"],
+                                     "camera_matrix": {"data": ["float"]}}]}
+    # another size in the calibration: not used
+    (rc / "yahboomcar_x3plus" / "calibration.json").write_text(json.dumps(
+        {"astra": {"intrinsics": {"fx_px": 1.0, "fy_px": 2.0, "cx_px": 3.0, "cy_px": 4.0},
+                   "width": 320, "height": 240}}))
+    with pytest.raises(LayoutError, match="lists 'astra' with intrinsics"):
+        epi.load_episode(s.root, LAYOUT)
+
+
+def test_calibration_parsing_variants() -> None:
+    block = v2._block_for
+    assert block({"a": [{"id": "astra", "x": 1}]}, "astra") == {"id": "astra", "x": 1}
+    assert block({"astra": {"K": 1}}, "astra") == {"K": 1}
+    assert block([1, "astra"], "astra") is None and block(3, "astra") is None
+    assert v2._intrinsics({"K": [[1, 0, 2], [0, 3, 4], [0, 0, 1]]}) == {
+        "fx": 1.0, "fy": 3.0, "cx": 2.0, "cy": 4.0}
+    assert v2._intrinsics({"nested": {"fx": 1, "fy": 2, "ppx": 3, "ppy": 4}}) == {
+        "fx": 1.0, "fy": 2.0, "cx": 3.0, "cy": 4.0}
+    assert v2._intrinsics({"K": [1, 2], "other": 5}) is None
+    assert v2._size({"image_width": 8, "image_height": 6}) == (8, 6)
+    assert v2._size({"inner": {"size": [4, 3]}}) == (4, 3)
+    assert v2._size({"width": 8, "size": [1]}) is None
+    assert v2.key_tree({"a": []}) == {"a": []} and v2.key_tree({"a": 1}, 1) == {"a": "..."}
+    assert v2._intrinsics({"a": {"x": 1}, "b": {"fx": 1, "fy": 1, "cx": 1, "cy": 1}}) == {
+        "fx": 1.0, "fy": 1.0, "cx": 1.0, "cy": 1.0}
+    assert v2._size({"a": {"x": 1}, "b": {"width": 2, "height": 1}}) == (2, 1)
+    no_k = Path(tempfile.mkdtemp())
+    (no_k / "bot").mkdir()
+    (no_k / "bot" / "calibration.json").write_text(json.dumps({"astra": {"model": "x"}}))
+    assert v2.camera_from_robot_control(no_k, "astra", (640, 480)) is None
+    (no_k / "bot" / "calibration.json").write_text(json.dumps({"astra": {"fx": 1, "fy": 1,
+                                                                         "cx": 1, "cy": 1}}))
+    cam, src = v2.camera_from_robot_control(no_k, "astra", (640, 480))  # type: ignore[misc]
+    assert cam["width"] == 640 and src.endswith("calibration.json")  # no size: the frame's
+    (no_k / "abot").mkdir()  # listed first, another size: the next robot's is used
+    (no_k / "abot" / "calibration.json").write_text(json.dumps(
+        {"astra": {"fx": 9, "fy": 9, "cx": 9, "cy": 9, "size": [320, 240]}}))
+    cam, src = v2.camera_from_robot_control(no_k, "astra", (640, 480))  # type: ignore[misc]
+    assert cam["fx"] == 1.0 and "/bot/" in src
