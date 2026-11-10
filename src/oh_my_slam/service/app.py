@@ -36,7 +36,7 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O4"]  # the groups this service implements (high_level_spec.md §12)
+CAPABILITIES = ["O1", "O3-jobs", "O4"]  # the groups this service implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
 ROTATION_TOLERANCE = 1e-3
@@ -289,7 +289,7 @@ class Api:
         if cameras or masks or self.s.store.meta(name) is None:
             self.s.store.add_cameras(name, cameras, masks)
         job = self.s.jobs.submit(name, work, len(work.frames))
-        return JSONResponse(self.s.jobs.view(job), 202, {"Location": f"/api/jobs/{job.id}"})
+        return JSONResponse(job.queued_view, 202, {"Location": f"/api/jobs/{job.id}"})
 
     async def get_job(self, request: Request) -> Response:
         raw = request.query_params.get("wait_s")

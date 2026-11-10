@@ -107,6 +107,8 @@ class _Frame:
     depth_m: NDArray[np.float32] | None = None  # on the canonical pinhole
     path: Path | None = None  # the image the mapper gets
     mask_path: Path | None = None  # its ignore mask (PNG, the mapper's pixels), when it has one
+    rgb: NDArray[np.uint8] | None = None  # the image the mapper gets (canonical pinhole)
+    ignore: NDArray[np.bool_] | None = None  # its ignore mask on the canonical pinhole
     reason: str | None = None
     internal: InternalFrame | None = None
     pose: NDArray[np.float64] | None = None  # T_map_cam
@@ -208,10 +210,14 @@ def _inliers(f: InternalFrame) -> int:
 class Updater:
     """Runs update jobs (``jobs.Runner``)."""
 
-    def __init__(self, store: Store, backend: Backend, timings: Timings | None = None) -> None:
+    def __init__(self, store: Store, backend: Backend, timings: Timings | None = None,
+                 prior_first: bool = True) -> None:
         self.store = store
         self.backend = backend
         self.timings = timings or Timings()
+        # maps started with priors take the prior-first registration (``prior_first``); False
+        # keeps every map on the mapper (the earlier path)
+        self.prior_first = prior_first
 
     def __call__(self, job: Job, changed: Callable[[], None]) -> None:
         w: UpdateWork = job.work
@@ -267,13 +273,14 @@ class Updater:
             if fr.cam.is_canonical and (mask is None or not mask.any()) \
                     and f.image[:3] == b"\xff\xd8\xff":
                 fr.path.write_bytes(f.image)
+                fr.rgb = rgb
             else:
-                save_jpeg(mapper_image(rgb, fr.cam, mask), fr.path, quality=JPEG_QUALITY)
+                fr.rgb = mapper_image(rgb, fr.cam, mask)
+                save_jpeg(fr.rgb, fr.path, quality=JPEG_QUALITY)
             if mask is not None and mask.any():
+                fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
                 fr.mask_path = indir / f"{f.index:04d}.mask.png"
-                fr.mask_path.write_bytes(png_bytes(
-                    (fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0).astype(np.uint8)
-                    * 255))
+                fr.mask_path.write_bytes(png_bytes(fr.ignore.astype(np.uint8) * 255))
             if med is None and fr.measures.suspicious:
                 med = self.backend.median_depth(fr.path, fr.cam.canonical())
             fr.reason = checks.reason(fr.measures, med)
@@ -289,6 +296,11 @@ class Updater:
         tm["checks"] = round(time.perf_counter() - t, 3)
         job.progress = 0.1
         changed()
+        if self._is_anchored(prev, frames):
+            from oh_my_slam.service.prior_first import run_anchored
+
+            run_anchored(self, job, w, frames, prev, workdir, changed)
+            return
         pre = {fr.work.index: fr.reason for fr in frames}
         exclude: set[int] = set()
         result: tuple[Path, InternalMap, _Anchored, int] | None = None
@@ -346,6 +358,15 @@ class Updater:
             exclude |= {fr.work.index for fr in post}
             attempt += 1
         self._finish(job, w, frames, prev, result)
+
+    def _is_anchored(self, prev: dict[str, Any] | None, frames: list[_Frame]) -> bool:
+        """Whether the job runs on the prior-first registration: the map has been anchored by
+        it, or it is new and a frame the checks kept carries a metric or drifting prior."""
+        if prev is not None:
+            return prev.get("engine") == "anchored"
+        return self.prior_first and any(fr.reason is None and fr.path is not None
+                                        and fr.work.trust in ("metric", "drifting")
+                                        for fr in frames)
 
     # -- anchoring -------------------------------------------------------------------------------
 
@@ -660,18 +681,27 @@ class Updater:
             "prior_gravity_deg": None if prev is not None or anchored is None
             else anchored.prior_gravity_deg,
         }
-        failed = []
-        if not registered:
-            failed.append("hard_limit")
-        a = accept_if or {}
-        if "max_residual_m" in a:
-            worst = max([r["max_m"] for r in (prior_res, prev_res) if r] or [0.0])
-            if worst > a["max_residual_m"]:
-                failed.append("max_residual_m")
-        if "max_gauge_shift_m" in a and gauge and gauge["translation_m"] > a["max_gauge_shift_m"]:
-            failed.append("max_gauge_shift_m")
-        if "max_rejected_share" in a and q["rejected_share"] > a["max_rejected_share"]:
-            failed.append("max_rejected_share")
-        q["accepted"] = not failed
-        q["failed_checks"] = failed
-        return q
+        return gate(q, bool(registered), accept_if)
+
+
+def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None
+         ) -> dict[str, Any]:
+    """``accepted`` and ``failed_checks`` of a quality report (map.md §4): nothing kept is the
+    hard limit; ``accept_if`` checks the residual maxima, the gauge shift and the rejected
+    share."""
+    prior_res, prev_res, gauge = q["prior_residuals"], q["previous_residuals"], q["gauge_shift"]
+    failed = []
+    if not kept_any:
+        failed.append("hard_limit")
+    a = accept_if or {}
+    if "max_residual_m" in a:
+        worst = max([r["max_m"] for r in (prior_res, prev_res) if r] or [0.0])
+        if worst > a["max_residual_m"]:
+            failed.append("max_residual_m")
+    if "max_gauge_shift_m" in a and gauge and gauge["translation_m"] > a["max_gauge_shift_m"]:
+        failed.append("max_gauge_shift_m")
+    if "max_rejected_share" in a and q["rejected_share"] > a["max_rejected_share"]:
+        failed.append("max_rejected_share")
+    q["accepted"] = not failed
+    q["failed_checks"] = failed
+    return q

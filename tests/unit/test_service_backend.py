@@ -182,6 +182,9 @@ class _Client:
     def close(self) -> None:
         pass
 
+    def clone(self) -> _Client:
+        return _Client()
+
 
 def test_median_depth_asks_the_depth_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                            ) -> None:
@@ -207,6 +210,37 @@ def test_median_depth_asks_the_depth_model(tmp_path: Path, monkeypatch: pytest.M
         with pytest.raises(ApiError) as err:
             be.MapperBackend().median_depth(tmp_path / "a.jpg", K)
         assert err.value.code == code
+
+
+def test_infer_returns_the_monocular_depth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                           ) -> None:
+    from oh_my_slam.reconstruction import api as rec
+
+    seen: dict[str, Any] = {}
+    grav = type("G", (), {"up_cam": (0.0, -1.0, 0.0)})()
+
+    def reconstruct(path: Path, **kw: Any) -> Any:
+        seen.update(kw)
+        return type("F", (), {"depth": np.array([[1.0, 3.0]], np.float32),
+                              "valid": np.array([[True, False]]), "K_grid": K,
+                              "descriptor": np.ones(4) if kw["want_gravity"] else None,
+                              "gravity": grav if kw["want_gravity"] else None})()
+
+    monkeypatch.setattr(rec, "connect_server", lambda: _Client())
+    monkeypatch.setattr(rec, "reconstruct_image", reconstruct)
+    m = be.MapperBackend().infer(tmp_path / "a.jpg", K, gravity=True)
+    assert m.depth.tolist() == [[1.0, 0.0]] and m.up_cam is not None and m.descriptor is not None
+    assert seen["max_side"] == be.MONO_GRID_SIDE and seen["want_descriptor"]
+    d, Kg, desc, up = be.MapperBackend().infer(tmp_path / "a.jpg", K).as_tuple()
+    assert desc is None and up is None and Kg == K
+
+    def boom() -> Any:
+        raise ServerUnavailableError("down")
+
+    monkeypatch.setattr(rec, "connect_server", boom)
+    with pytest.raises(ApiError) as err:
+        be.MapperBackend().infer(tmp_path / "a.jpg", K)
+    assert err.value.code == "inference_unavailable"
 
 
 # -- the inference server ------------------------------------------------------------------------

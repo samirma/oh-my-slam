@@ -92,7 +92,9 @@ def client(tmp_path: Path) -> Iterator[Client]:
     store.create()
     backend = FakeBackend()
     timings = Timings()
-    jobs = Jobs(store.jobs, Updater(store, backend, timings), timings.predict_update)
+    # the mapper's path for every map (the prior-first path: test_service_prior_first.py)
+    jobs = Jobs(store.jobs, Updater(store, backend, timings, prior_first=False),
+                timings.predict_update)
     jobs.start()
     service = Service(store, jobs, FakeInference(), backend.require_inference, timings=timings,
                       version="test")
@@ -748,7 +750,7 @@ def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
 
 def test_health_lists_capabilities_and_default_then_measured_timings(client: Client) -> None:
     h = client.get("/api/health", "Health")
-    assert h["capabilities"] == ["O1", "O4"]
+    assert h["capabilities"] == ["O1", "O3-jobs", "O4"]
     reg = h["timings"]["registration_per_frame"]
     assert reg["source"] == "default" and reg["count"] == 0 and reg["median_s"] > 0
     frames, files, _ = frames_of(client, 3)

@@ -52,6 +52,8 @@ class Job:
     started: float | None = None
     # the request, kept while the job runs (not part of the body)
     work: Any = None
+    # the job as it was queued: the 202 answer, even when the worker has already started it
+    queued_view: dict[str, Any] | None = None
 
     @property
     def active(self) -> bool:
@@ -141,6 +143,7 @@ class Jobs:
             self._jobs[job.id] = job
             job.eta_s = self._eta(job)
             self._save(job)
+            job.queued_view = self.view(job)
         self._queue.put(job.id)
         return job
 

@@ -24,6 +24,7 @@ from oh_my_slam.service.anchor import Sim3
 from oh_my_slam.service.backend import (
     InternalFrame,
     InternalMap,
+    Mono,
     NothingRegisteredError,
     Registered,
 )
@@ -89,6 +90,11 @@ class FakeBackend:
     nothing: bool = False
     stats: dict[str, Any] = field(default_factory=lambda: {"observations": 400.0,
                                                            "reproj_error": 0.6})
+    mono_depth: dict[str, np.ndarray] = field(default_factory=dict)  # sha -> true z-depth
+    mono_scale: float = 1.0
+    descriptors: dict[str, np.ndarray] = field(default_factory=dict)
+    infers: list[tuple[str, bool]] = field(default_factory=list)
+    infer_error: bool = False
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -104,6 +110,20 @@ class FakeBackend:
 
     def median_depth(self, image: Path, K: Intrinsics) -> float | None:
         return self.mono
+
+    def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
+        """Monocular depth: ``mono_depth`` of the image's bytes (times ``mono_scale``), else a
+        flat 2 m; the retrieval descriptor ``descriptors`` gives; up when asked."""
+        from oh_my_slam.service.errors import ApiError
+
+        self.infers.append((image.name, gravity))
+        if self.infer_error:
+            raise ApiError("inference_unavailable", "down (test)")
+        sha = hashlib.sha256(image.read_bytes()).hexdigest()
+        d = self.mono_depth.get(sha)
+        depth = (np.full((K.height, K.width), 2.0) if d is None else d * self.mono_scale)
+        return Mono(depth.astype(np.float32), K, self.descriptors.get(sha),
+                    np.array([0.0, -1.0, 0.0]) if gravity else None)
 
     def _internal(self, sha: str) -> np.ndarray:
         T = self.truth[sha].copy()

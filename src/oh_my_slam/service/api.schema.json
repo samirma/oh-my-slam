@@ -2102,10 +2102,11 @@
               "O7",
               "O8",
               "O9",
-              "O10"
+              "O10",
+              "O3-jobs"
             ]
           },
-          "description": "Groups the running service implements."
+          "description": "Groups the running service implements. \"O3-jobs\": asynchronous jobs (202 + GET/poll) without the two-phase provisional commit, cancel or lanes."
         },
         "timings": {
           "type": "object",

@@ -9,7 +9,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
 * Every JSON body carries `schema` (`oms/2.1`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
-* Implemented groups (`GET /api/health` → `capabilities`): O1, O4. Refuse what is missing instead of calling it.
+* Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
 ## Endpoints

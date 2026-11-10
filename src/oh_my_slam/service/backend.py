@@ -29,6 +29,7 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.errors import ApiError
 
 LOG_TAIL_LINES = 20
+MONO_GRID_SIDE = 640  # the monocular depth grid of an anchored map's keyframes (README)
 
 
 class NothingRegisteredError(Exception):
@@ -59,6 +60,20 @@ class InternalMap:
 
 
 @dataclass
+class Mono:
+    """A frame's monocular depth: grid (metres, 0: none), its intrinsics, the retrieval
+    descriptor and the camera's up direction (when asked), as ``mapping.anchored`` takes it."""
+
+    depth: NDArray[np.float32]
+    K_grid: Intrinsics
+    descriptor: NDArray[np.float32] | None
+    up_cam: NDArray[np.float64] | None
+
+    def as_tuple(self) -> tuple[NDArray[np.float32], Intrinsics, Any, Any]:
+        return self.depth, self.K_grid, self.descriptor, self.up_cam
+
+
+@dataclass
 class Registered:
     sources_rejected: list[str]
     objects: int
@@ -72,6 +87,10 @@ class Backend(Protocol):
 
     def median_depth(self, image: Path, K: Intrinsics) -> float | None:
         """The median monocular depth of an image (metres), or None."""
+
+    def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
+        """The monocular depth of a canonical image with its intrinsics ``K`` (and the camera's
+        up direction when ``gravity``)."""
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
@@ -133,6 +152,24 @@ class MapperBackend:
         except OhMySlamError as exc:
             raise api_error(exc) from exc
         return median_depth(np.where(fr.valid, fr.depth, 0.0).astype(np.float32))
+
+    def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
+        from oh_my_slam.reconstruction.api import connect_server, reconstruct_image
+
+        try:
+            # a client of its own: jobs ask for several frames at once, and the shared client
+            # is not for use from several threads
+            client = connect_server().clone()
+            try:
+                fr = reconstruct_image(image, intrinsics=K, max_side=MONO_GRID_SIDE,
+                                       want_gravity=gravity, want_descriptor=True, client=client)
+            finally:
+                client.close()
+        except OhMySlamError as exc:
+            raise api_error(exc) from exc
+        up = None if fr.gravity is None else np.asarray(fr.gravity.up_cam, np.float64)
+        return Mono(np.where(fr.valid, fr.depth, 0.0).astype(np.float32), fr.K_grid,
+                    None if fr.descriptor is None else np.asarray(fr.descriptor, np.float32), up)
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,

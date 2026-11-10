@@ -32,8 +32,10 @@ Model weights are downloaded on the first start of the inference server:
 ## The service (`server.sh`, `oh_my_slam.service`)
 
 The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
-(`/api/health → capabilities`): **O1** (anchored map frame and priors) and **O4** (per-input
-status), with the service plumbing they need.
+(`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
+(asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes) and **O4** (per-input
+status), with the service plumbing they need. Maps started with pose priors take the
+*prior-first registration* (below); camera-only maps keep the mapper.
 
 ```sh
 ./server.sh                                    # 0.0.0.0:9091, data ~/oh-my-slam-data/
@@ -174,6 +176,82 @@ registration's angular noise per observation `a` (the mean reprojection error ov
 length, or the multi-view refinement's median match residual) over `√n` observations:
 `σ_rot = a √(2/n)`, `σ_pos = d a √(8/n)` with `d` the frame's median depth (2 m without), times 3
 for a low-confidence keyframe, combined with the anchoring's RMS residual, floored at 1 cm and 0.1°.
+
+### Prior-first registration (anchored maps)
+
+A map whose first update has a kept frame with a `metric` or `drifting` prior is **anchored**
+(`versions/<n>.json → engine: "anchored"`) and every later update of it runs
+`service.prior_first` → `mapping.anchored` instead of the mapper (`Updater(prior_first=False)`
+keeps every map on the mapper; the tests of the mapper path use it). A map whose first update
+carries no prior (camera-only, trust `none`) stays on the mapper as before. Design choices, each
+measured on the synthetic room of `tests/synth/room.py` and on the reference captures (numbers in
+*Prior-first measurements*):
+
+* **Frame and origin.** The first frame with a prior (request order) is placed at its prior and
+  defines the map frame (the priors' frame). The mapper folder of the version is the engine's
+  folder (`state.json`, `kf/<id>.npz`, `cloud.npz`), its frame the map frame: the version's
+  `sim3` is the identity and stored poses never move (no re-gauging, no re-pose:
+  `gauge_shift` is 0 and `previous_residuals` are 0 by construction).
+* **Place first.** Each new frame gets a predicted pose from its prior: a metric prior as sent;
+  a drifting prior through the odometry's latest correction (`Drift`: the last frame the images
+  confirmed, its map pose and its prior, and the odometry's scale fitted on confirmed pairs
+  ≥ 0.2 m apart), with sigmas grown by 10 % of the travel, 5 % of the turn and 2°/m since that
+  frame. Sigmas are floored at 1 cm / 0.1°; a prior without sigmas counts 5 cm / 2°.
+* **Refinement against the stored map.** Candidates: the 5 stored keyframes nearest the
+  predicted pose (score = distance / 0.5 m + axis angle / 30°, within 5 m and 100°); without a
+  prior, the 5 most similar by retrieval descriptor, else the 8 most recent. SIFT (2000, contrast
+  0.02, RootSIFT) matched with the ratio test (0.8); each match lifted to 3-D by the keyframe's
+  depth (off depth edges). **PnP first** (AP3P RANSAC, 3 px at 640 px width, ≥ 20 inliers), then
+  a robust Gauss-Newton (Huber 2 px) whose normal equations give the covariance. The design
+  asked for a rotation-only fit when the centre is within a few cm of a stored one; measured, PnP
+  is better there too: scaling a keyframe's points about its centre (a wrong monocular depth
+  scale) moves the PnP centre along its distance to the keyframe but leaves its rotation exact,
+  while a rotation-only fit at the prior's centre takes that error into its rotation (30° sweep
+  with a 15 % monocular scale error: 0.3° max rotation error with PnP first, 1.7° with
+  rotation-first). Rotation-only (centre held at the prior's) remains the fallback when PnP has
+  too few lifted points (no depth at all), within 0.2 m of a keyframe; its sigma includes the
+  parallax the centre's distance can leave.
+* **Combining image and prior.** The image pose (sigmas: covariance, floored at 1 cm or 1 % of
+  the scene depth, plus the depth scale's sigma times the distance to the keyframes for
+  monocular depth) and the predicted pose are averaged by their information (`fuse_poses`,
+  centre by `1/σ²`, rotation on the geodesic). A metric prior with a 1 mm sigma therefore keeps
+  the arm's poses at its priors. The design's local bundle adjustment of the new frames was not
+  needed: frames are placed in request order and each placed frame is a fixed reference for the
+  next ones of the same job (stored poses fixed), which keeps a sweep that never overlaps its
+  first frame registered.
+* **Unconfirmed frames.** No image pose, or an image pose that is not determined within
+  10 cm / 2°, or one beyond 3 combined sigmas of the prediction with fewer than 40 inliers or
+  30 % inliers: `provisional` at the predicted pose with the prior's sigmas (`reason`:
+  `few_features` below 150 features, else `no_overlap`), `pose_state: provisional`. Beyond 3
+  sigmas with ≥ 40 inliers and ≥ 30 %: `rejected prior_conflict`. Without a prior and no image
+  pose: `rejected` (`no_overlap` / `few_features`). Provisional frames at metric priors are
+  references for later frames; at drifting priors they are not.
+* **Scale.** A keyframe's depth is its depth PNG (metric) or the monocular depth (640 px grid)
+  times the map's depth scale `k`. `k` comes from the metric priors once their centres span
+  0.3 m and 3 PnP baselines ≥ 0.1 m exist (least squares of the prior baselines on the image-only
+  PnP baselines relative to the reference keyframe, in raw monocular units: the similarity of
+  the map's positions to the priors), else from camera heights (frame or camera
+  `height_above_floor_m` over the lowest dense layer of the frame's monocular points below the
+  camera, rotated by its pose), else 1. Each update refines `k`; positions never move, stored
+  monocular keyframes use `k / k_used` when matched. `scale_source`: `priors` once metric priors
+  span 0.3 m (σ = √2 · median prior σ / span), else `depth` with any depth PNG (σ 1 %), else the
+  source of `k` (`camera_height`, σ from the heights' spread and sigmas; `monocular`, 10 %).
+  `scale_ratio_vs_prev`: `k` over the previous `k` for maps scaled by camera height or the
+  monocular model, else 1 (positions are the priors' or the depth images').
+* **Incremental fusion.** Only the new keyframes are lifted (every 2nd pixel, ≤ 6 m, off depth
+  edges and ignore masks) into a voxel cloud (2 cm, running mean of position and colour per
+  voxel): nothing stored is fused again. The floor of the version is the cloud's lowest dense
+  layer below the cameras. Objects are not computed on this path (`objects: 0`; O8 is not
+  served).
+* **Cheap rejection.** The per-frame checks run first; a job whose frames they all reject asks
+  no inference and commits nothing (`hard_limit`).
+* **Inference.** Frames without a depth PNG get monocular depth (and the retrieval descriptor)
+  from the inference server, two in flight, each on its own client (the shared client is not
+  for several threads); the map's first frame also asks for gravity (`prior_gravity_deg`).
+* **Quality.** `rejected_share` counts rejected over sent; `low_confidence_share` counts the
+  kept frames that are provisional or whose `sigma_pos_m` exceeds 0.10 m; `prior_residuals`
+  are over every metric prior of the map; `rebuilt` is false.
+* **The 202 answer** is the job as queued, even when the worker has already started it.
 
 ### Live check
 
