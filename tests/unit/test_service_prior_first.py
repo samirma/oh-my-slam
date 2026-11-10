@@ -226,3 +226,13 @@ def test_inference_failure_fails_the_job(client: Client) -> None:
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "failed" and job["error"]["code"] == "inference_unavailable"
     client.get("/api/maps/m", status=404)
+
+
+def test_an_all_rejected_job_on_an_anchored_map(client: Client) -> None:
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    job = client.update("m", [{"name": "p", "image": "p", "camera_id": "cam",
+                               "prior": prior(base_pose(5))}], {"p": plain(320, 240)})
+    assert job["state"] == "rejected" and job["quality"]["failed_checks"] == ["hard_limit"]
+    assert job["quality"]["scale_ratio_vs_prev"] is None and job["scale_source"] is None
+    assert client.service.store.latest("m") == 1

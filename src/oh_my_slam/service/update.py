@@ -109,6 +109,7 @@ class _Frame:
     mask_path: Path | None = None  # its ignore mask (PNG, the mapper's pixels), when it has one
     rgb: NDArray[np.uint8] | None = None  # the image the mapper gets (canonical pinhole)
     ignore: NDArray[np.bool_] | None = None  # its ignore mask on the canonical pinhole
+    deferred: bool = False  # suspicious, its median depth not measured yet (``_check``)
     reason: str | None = None
     internal: InternalFrame | None = None
     pose: NDArray[np.float64] | None = None  # T_map_cam
@@ -281,9 +282,19 @@ class Updater:
                 fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
                 fr.mask_path = indir / f"{f.index:04d}.mask.png"
                 fr.mask_path.write_bytes(png_bytes(fr.ignore.astype(np.uint8) * 255))
-            if med is None and fr.measures.suspicious:
-                med = self.backend.median_depth(fr.path, fr.cam.canonical())
+            # the monocular depth ``too_close`` needs is measured once the path is known: the
+            # prior-first path gets it with the frame's depth (``_resolve_deferred``)
+            fr.deferred = med is None and fr.measures.suspicious
             fr.reason = checks.reason(fr.measures, med)
+
+    def _resolve_deferred(self, frames: list[_Frame]) -> None:
+        """The mapper's path: the median monocular depth of the suspicious frames (``too_close``
+        takes precedence over the other reasons)."""
+        for fr in frames:
+            if fr.deferred:
+                assert fr.path is not None and fr.measures is not None
+                fr.reason = checks.reason(fr.measures, self.backend.median_depth(
+                    fr.path, fr.cam.canonical()))
 
     def _run(self, job: Job, w: UpdateWork, workdir: Path, changed: Callable[[], None]) -> None:
         tm = job.timings_s
@@ -301,6 +312,9 @@ class Updater:
 
             run_anchored(self, job, w, frames, prev, workdir, changed)
             return
+        t = time.perf_counter()
+        self._resolve_deferred(frames)
+        tm["checks"] = round(tm["checks"] + time.perf_counter() - t, 3)
         pre = {fr.work.index: fr.reason for fr in frames}
         exclude: set[int] = set()
         result: tuple[Path, InternalMap, _Anchored, int] | None = None

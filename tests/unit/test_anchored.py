@@ -482,3 +482,15 @@ def test_an_ill_determined_image_pose_confirms_nothing(tmp_path: Path,
     monkeypatch.setattr(AnchoredMap, "_pnp_sigmas", lambda self, s, c: (0.5, 0.3))
     p = m.update([frame("b", base_pose(20))])[0]
     assert p.status == "provisional" and p.inliers > 0
+
+
+def test_suspicious_frames_too_close_by_their_monocular_depth(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    near = frame("near", base_pose(10), depth=False, mono=0.05)
+    near.check_close = True
+    ok = frame("ok", base_pose(20), depth=False, mono=1.0)
+    ok.check_close = True
+    pls = m.update([near, ok])
+    assert (pls[0].status, pls[0].reason) == ("rejected", "too_close")
+    assert pls[1].status == "registered"

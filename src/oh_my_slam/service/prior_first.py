@@ -50,7 +50,8 @@ def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
     height, sigma = (f.height_m, f.height_sigma_m) if f.height_m is not None else (
         fr.cam.height_above_floor_m, fr.cam.height_sigma_m)
     return FrameIn(f.name, f.camera_id, fr.rgb, fr.cam.canonical(), prior, fr.depth_m, fr.ignore,
-                   height, sigma, fr.measures.features, None if mono is None else _waiter(mono))
+                   height, sigma, fr.measures.features, None if mono is None else _waiter(mono),
+                   check_close=fr.deferred)
 
 
 def _has_depth(fr: _Frame) -> bool:

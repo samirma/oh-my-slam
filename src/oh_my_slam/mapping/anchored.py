@@ -114,6 +114,7 @@ FUSE_MAX_DEPTH_M = 6.0
 FLOOR_BINS = 50
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
+TOO_CLOSE_M = 0.30  # median depth (as service.checks.TOO_CLOSE_M)
 MIN_CAMERA_HEIGHT = 0.05  # raw monocular units: a camera this low tells no scale
 
 
@@ -607,6 +608,7 @@ class FrameIn:
     # monocular depth (grid metres, K_grid, retrieval descriptor or None, up in camera or None),
     # waited for when needed
     mono: Callable[[], tuple[NDArray[np.float32], Intrinsics, Any, Any]] | None = None
+    check_close: bool = False  # reject it ``too_close`` if its monocular depth says so
 
 
 @dataclass
@@ -1014,11 +1016,18 @@ class AnchoredMap:
         for i in order:
             f = frames[i]
             t = time.perf_counter()
-            feats = features(f.rgb, f.ignore)
             mono = None
             if (f.depth is None or not np.count_nonzero(f.depth > 0)) and f.mono is not None \
-                    and f.prior is None:
-                mono = f.mono()  # the retrieval descriptor finds candidates without a prior
+                    and (f.prior is None or f.check_close):
+                # the retrieval descriptor finds candidates without a prior; a suspicious
+                # frame's depth may say it is too close
+                mono = f.mono()
+                d = mono[0][np.isfinite(mono[0]) & (mono[0] > 0)]
+                if f.check_close and d.size and float(np.median(d)) * self.scale.k < TOO_CLOSE_M:
+                    out[i] = Placement(f.name, "rejected", "too_close")
+                    reg_s += time.perf_counter() - t
+                    continue
+            feats = features(f.rgb, f.ignore)
             if not self.keyframes:
                 p = f.prior
                 assert p is not None
