@@ -103,7 +103,7 @@
         "scale_sigma_rel": {
           "type": "number",
           "minimum": 0,
-          "description": "One-sigma relative uncertainty of the map scale."
+          "description": "One-sigma relative uncertainty of the map scale; it bounds the relative error of any horizontal distance, in every direction."
         }
       }
     },
@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: also a frame name the map or request already holds."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: within 0.02 m and 2 deg of a stored keyframe of the same camera (README-configurable defaults; never at 0.05 m or 5 deg), or a frame name the map or request already holds; duplicate_of names that frame."
     },
     "InputStatus": {
       "type": "object",
@@ -368,7 +368,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed plain, blur or few_features); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it may be fused, and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed plain, blur or few_features); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), and locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -430,6 +430,10 @@
           "type": "number",
           "minimum": 0,
           "description": "With reason too_close: the frame's median scene depth."
+        },
+        "duplicate_of": {
+          "type": "string",
+          "description": "With reason duplicate: the name of the stored (or earlier) frame it duplicates, within 0.02 m and 2 deg of it (README-configurable defaults) or holding the same name."
         }
       },
       "allOf": [
@@ -502,6 +506,23 @@
             "required": [
               "min_distance_m",
               "scene_distance_m"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "duplicate"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "duplicate_of"
             ]
           }
         }
@@ -890,6 +911,10 @@
           "type": "number",
           "minimum": 0,
           "description": "With reason too_close: the frame's median scene depth."
+        },
+        "duplicate_of": {
+          "type": "string",
+          "description": "With reason duplicate: the name of the stored (or earlier) frame it duplicates, within 0.02 m and 2 deg of it (README-configurable defaults) or holding the same name."
         }
       },
       "allOf": [
@@ -908,6 +933,23 @@
             "required": [
               "min_distance_m",
               "scene_distance_m"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "predicted_reason": {
+                "const": "duplicate"
+              }
+            },
+            "required": [
+              "predicted_reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "duplicate_of"
             ]
           }
         }
@@ -1169,7 +1211,7 @@
             "fused",
             "kept_at_prior"
           ],
-          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images (it may be fused); never a locate reference."
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells until registered; never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -1324,7 +1366,8 @@
         "last_seen_version",
         "region",
         "supported_by",
-        "inside_of"
+        "inside_of",
+        "detection_votes"
       ],
       "properties": {
         "state": {
@@ -1406,6 +1449,28 @@
               }
             }
           ]
+        },
+        "detection_votes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "share"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "share": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Fraction of the frames that saw the object and gave this label."
+              }
+            }
+          },
+          "description": "Highest share first; shares sum to at most 1. detected_as is unchanged."
         }
       },
       "description": "An object record of an objects read (map.md §5)."

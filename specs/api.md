@@ -117,11 +117,14 @@ error code `invalid_request` (§9).
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
+  | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
-  `drifting` prior, after mapping through the drift estimate). It is stored and may be fused, but locate never
-  uses it as a reference (§6).
+  `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
+  uses it as a reference (§6). Occupancy, heights, the cloud and object records come only from
+  image-confirmed frames: a `kept_at_prior` frame counts only for free-by-rule cells (its camera
+  stand and near blind disc, map.md §6) until it is registered.
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
@@ -137,9 +140,13 @@ error code `invalid_request` (§9).
   * A frame with a prior whose image fails the quality checks (`plain`, `blur`,
     `few_features`) is `kept_at_prior` with that reason. It is `rejected` only when the image is
     unusable (`unusable_image`: it does not decode, or its size is not the camera's).
-  * A view the map already has is `registered`; it is rejected as `duplicate` only when it adds
-    nothing new. `too_close` is only the camera-to-scene distance limit, with `min_distance_m`
-    and `scene_distance_m`.
+  * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or one
+    whose name the map or the request already holds (§3). `duplicate_of` names that stored (or
+    earlier) frame. 0.02 m and 2° are defaults, configurable in `README.md`; a frame 0.05 m or
+    5° away from every stored keyframe of its camera is never a duplicate, whatever the
+    configuration. A view the map already has, farther than those limits, is `registered`.
+  * `too_close` is only the camera-to-scene distance limit, with `min_distance_m` and
+    `scene_distance_m`.
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
     alone.
 
@@ -156,6 +163,7 @@ error code `invalid_request` (§9).
     `kept_at_prior` or `rejected`), `predicted_reason`;
   * the predicted links to its neighbours in the request: `neighbour_inliers[]`;
   * the flags `plain` and `too_close`;
+  * with `predicted_reason` `duplicate`: `duplicate_of`, as in `inputs[]`;
   * with `predicted_reason` `too_close`: `min_distance_m` and `scene_distance_m`, as in
     `inputs[]`.
 
