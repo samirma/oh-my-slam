@@ -66,12 +66,24 @@ ABOVE_CAMERA_M = 2.0
 MAX_CELLS_XY = 2400 * 2400  # a volume never grows beyond this many columns
 SAME_POSE_M = 0.005  # a frame is re-integrated only when its pose moved more than this
 SAME_POSE_DEG = 0.1
+NORMAL_STENCIL_M = 0.03  # normals from points this far apart at STRIDE_RANGE_M (in pixels)
+MAX_FOOTPRINT_M = 0.3  # a grazing flat point's floor footprint, at most
+FLOOR_BIN_M = 0.01
+FLOOR_SMOOTH_BINS = 3
+FLOOR_PEAK_SHARE = 0.3
+FLOOR_REFINE_M = 0.03
+MIN_CAMERA_HEIGHT_M = 0.05
+NEAR_WEIGHT_M = 4.0  # range_weight
+MAX_WEIGHT = 4
 
-OCC_RATIO = 0.3
+OCC_RATIO = 0.5  # a voxel is a surface when at least this share of its evidence is hits
+WALL_EXTENT_M = 1.5  # inflate_walls: an occupied structure this long is a wall,
+WALL_THICK_CELLS = 4  # ... grown beside it where it is thinner than this
 FLOOR_TOL_M = 0.10
 HEIGHT_CAP_M = 2.0
 BLIND_RING_MAX_M = 2.0
 MIN_DEPRESSION_DEG = 2.0
+SIGHT_MARGIN_M = 0.10  # a blind disc's surface this far above the lowest line of sight stays
 
 MIN_REGION_M2 = 0.25
 MIN_FRONTIER_M = 0.3
@@ -85,6 +97,7 @@ NARROW_EXACT = 8  # screened chords measured exactly
 CHORD_MAX_M = 4.0  # a chord is measured this far each way
 JAMB_RUN_M = 0.4  # a passage's jambs: wall that goes on this far along the gap's line
 JAMB_OCCUPIED = 0.5
+JAMB_IN_CELL = 0.5  # a jamb's face: this far (in cells) into the cell its chord ends on
 DOOR_MIN_W = 0.55
 DOOR_MAX_W = 1.3
 DOOR_OBJECT_M = 0.6  # a door-labelled object this close to a passage's centre makes it a door
@@ -116,6 +129,15 @@ def pose_moved(a: Sequence[float], b: Sequence[float]) -> bool:
     return bool(np.linalg.norm(A[:3, 3] - B[:3, 3]) > SAME_POSE_M or deg > SAME_POSE_DEG)
 
 
+def range_weight(r: NDArray[Any]) -> NDArray[np.int64]:
+    """The weight of a frame's evidence at range ``r`` (m): ``NEAR_WEIGHT_M / r``, rounded, from 1
+    to ``MAX_WEIGHT``. Depth errors grow with range, so near views outvote far ones on where a
+    surface ends."""
+    with np.errstate(divide="ignore"):
+        w = np.round(NEAR_WEIGHT_M / np.maximum(np.asarray(r, np.float64), 1e-6))
+    return np.clip(w, 1, MAX_WEIGHT).astype(np.int64)
+
+
 @dataclass
 class Volume:
     origin: Array = field(default_factory=lambda: np.zeros(3))  # corner of voxel [0, 0, 0]
@@ -126,6 +148,12 @@ class Volume:
     flat: NDArray[np.uint16] = field(default_factory=lambda: np.zeros((0, 0, 0), np.uint16))
     obs: NDArray[np.uint16] = field(default_factory=lambda: np.zeros((0, 0), np.uint16))
     frames: dict[str, list[float]] = field(default_factory=dict)  # key -> flattened T_map_cam
+    # heights of the flat surface points, in FLOOR_BIN_M bins from origin z (the floor's height)
+    flat_z: NDArray[np.float64] = field(default_factory=lambda: np.zeros(0, np.float64))
+
+    @property
+    def bins_per_voxel(self) -> int:
+        return max(1, round(self.vz / FLOOR_BIN_M))
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -153,6 +181,7 @@ class Volume:
             self.hit = np.zeros_like(self.free)
             self.flat = np.zeros_like(self.free)
             self.obs = np.zeros((n[1], n[0]), np.uint16)
+            self.flat_z = np.zeros(n[2] * self.bins_per_voxel, np.float64)
             return True
         Z, Y, X = self.shape
         cur_hi = self.origin + step * np.array([X, Y, Z])
@@ -170,6 +199,8 @@ class Volume:
         self.hit = np.pad(self.hit, pad3)
         self.flat = np.pad(self.flat, pad3)
         self.obs = np.pad(self.obs, pad3[1:])
+        b = self.bins_per_voxel
+        self.flat_z = np.pad(self.flat_z, (before[2] * b, after[2] * b))
         self.origin = self.origin - before * step
         return True
 
@@ -210,18 +241,20 @@ class Volume:
         u, v = np.meshgrid(cols + 0.5, rows + 0.5)
         rays = unproject_pixels(u, v, np.ones_like(u), Kf)
         P = (rays * np.where(ok, d, 0.0)[..., None]) @ R.T + C  # (h, w, 3)
-        # normals of the point grid (map frame), for the flat surfaces
+        # normals of the point grid (map frame), for the flat surfaces: central differences
+        # ``ns`` points apart (a wider stencil averages the depth's pixel noise)
+        h_, w_ = ok.shape
+        ns = max(1, round(NORMAL_STENCIL_M * float(Kf[0, 0]) / hs / STRIDE_RANGE_M))
         dx = np.zeros_like(P)
         dy = np.zeros_like(P)
-        dx[:, :-1] = P[:, 1:] - P[:, :-1]
-        dy[:-1] = P[1:] - P[:-1]
+        has_n = np.zeros_like(ok)
+        if w_ > 2 * ns and h_ > 2 * ns:
+            dx[ns:-ns, ns:-ns] = P[ns:-ns, 2 * ns:] - P[ns:-ns, :-2 * ns]
+            dy[ns:-ns, ns:-ns] = P[2 * ns:, ns:-ns] - P[:-2 * ns, ns:-ns]
+            has_n[ns:-ns, ns:-ns] = (ok[ns:-ns, ns:-ns] & ok[ns:-ns, 2 * ns:] & ok[ns:-ns, :-2 * ns]
+                                     & ok[2 * ns:, ns:-ns] & ok[:-2 * ns, ns:-ns])
         n = np.cross(dx, dy)
         nn = np.linalg.norm(n, axis=-1)
-        has_n = ok.copy()
-        has_n[:, :-1] &= ok[:, 1:]
-        has_n[:-1] &= ok[1:]
-        has_n[-1, :] = False
-        has_n[:, -1] = False
         with np.errstate(invalid="ignore", divide="ignore"):
             flat_px = has_n & (np.abs(n[..., 2]) / np.where(nn > 0, nn, 1.0)
                                > math.cos(math.radians(FLAT_DEG)))
@@ -230,7 +263,28 @@ class Volume:
         dirs_all /= np.linalg.norm(dirs_all, axis=-1, keepdims=True)
         surf = ok & (rng_all <= MAX_RANGE_M)
         ends = P[surf] + dirs_all[surf] * HIT_INTO_M
-        flats = P[surf & flat_px] + dirs_all[surf & flat_px] * HIT_INTO_M
+        ends_r = rng_all[surf]
+        fl = surf & flat_px
+        flats = P[fl] + dirs_all[fl] * HIT_INTO_M
+        flats_r = rng_all[fl]
+        flat_heights = P[fl][:, 2]
+        # a flat point seen at a grazing angle stands for the floor between it and the next row's:
+        # its footprint along the ray's horizontal direction (pixel angle / sine of the grazing)
+        sin_g = np.abs(dirs_all[fl][:, 2])
+        foot = np.minimum(rng_all[fl] * (hs / float(Kf[1, 1])) / np.maximum(sin_g, 1e-3),
+                          MAX_FOOTPRINT_M)
+        long = (foot > self.voxel) & (flat_heights < C[2])  # seen from above
+        if long.any():
+            hd = dirs_all[fl][long] * [1.0, 1.0, 0.0]
+            hd /= np.maximum(np.linalg.norm(hd, axis=1, keepdims=True), 1e-9)
+            k_n = np.ceil(foot[long] / (0.7 * self.voxel)).astype(np.int64)
+            rep = np.repeat(np.arange(int(long.sum())), k_n)
+            start = np.repeat(np.cumsum(k_n) - k_n, k_n)
+            frac = ((np.arange(int(k_n.sum())) - start + 0.5) / k_n[rep] - 0.5) * foot[long][rep]
+            extra = flats[long][rep] + hd[rep] * frac[:, None]
+            extra_r = flats_r[long][rep]
+            flats, flats_r = np.vstack([flats, extra]), np.concatenate([flats_r, extra_r])
+            ends, ends_r = np.vstack([ends, extra]), np.concatenate([ends_r, extra_r])
         # the free-space rays: every ``ray_stride`` pixel
         k = max(1, ray_stride(float(Kf[0, 0]), W, H, self.voxel) // hs)
         sub = np.zeros_like(ok)
@@ -258,12 +312,21 @@ class Volume:
         samples = C + dirs[idx_ray] * t[:, None]
         _Z, Y, X = self.shape
         cols_seen = np.zeros(Y * X, bool)
-        for arr, at in ((self.free, samples), (self.hit, ends), (self.flat, flats)):
+        for arr, at, r_at in ((self.free, samples, rng[idx_ray]), (self.hit, ends, ends_r),
+                              (self.flat, flats, flats_r)):
             fi, inside = self._index(at)
-            fi = np.unique(fi[inside])
-            arr.reshape(-1)[fi] = np.minimum(arr.reshape(-1)[fi].astype(np.int64) + 1,
+            w = range_weight(r_at[inside])
+            fi = fi[inside]
+            order = np.lexsort((-w, fi))  # per voxel, the frame's most precise evidence once
+            fi, w = fi[order], w[order]
+            first = np.concatenate([[True], fi[1:] != fi[:-1]]) if fi.size else np.zeros(0, bool)
+            fi, w = fi[first], w[first]
+            arr.reshape(-1)[fi] = np.minimum(arr.reshape(-1)[fi].astype(np.int64) + w,
                                              np.iinfo(np.uint16).max).astype(np.uint16)
             cols_seen[fi % (Y * X)] = True
+        zb = np.floor((flat_heights - self.origin[2]) / FLOOR_BIN_M).astype(np.int64)
+        zb = zb[(zb >= 0) & (zb < len(self.flat_z))]
+        self.flat_z += np.bincount(zb, minlength=len(self.flat_z))[:len(self.flat_z)]
         seen = np.flatnonzero(cols_seen)
         self.obs.reshape(-1)[seen] = np.minimum(self.obs.reshape(-1)[seen].astype(np.int64) + 1,
                                                 np.iinfo(np.uint16).max).astype(np.uint16)
@@ -278,6 +341,7 @@ class Volume:
         buf = io.BytesIO()
         np.savez_compressed(buf, origin=self.origin, voxel=np.array([self.voxel, self.vz]),
                             free=self.free, hit=self.hit, flat=self.flat, obs=self.obs,
+                            flat_z=self.flat_z,
                             frames=np.frombuffer(json.dumps(self.frames).encode(), np.uint8))
         return buf.getvalue()
 
@@ -287,20 +351,40 @@ class Volume:
 
         z = np.load(io.BytesIO(data))
         vox = z["voxel"]
-        return Volume(np.asarray(z["origin"], np.float64), float(vox[0]), float(vox[1]),
-                      z["free"], z["hit"], z["flat"], z["obs"],
-                      json.loads(bytes(z["frames"]).decode()))
+        v = Volume(np.asarray(z["origin"], np.float64), float(vox[0]), float(vox[1]),
+                   z["free"], z["hit"], z["flat"], z["obs"],
+                   json.loads(bytes(z["frames"]).decode()))
+        v.flat_z = np.asarray(z["flat_z"], np.float64) if "flat_z" in z.files else \
+            np.zeros(v.shape[0] * v.bins_per_voxel, np.float64)  # a volume of an older version
+        return v
 
-    def estimate_floor(self) -> float | None:
-        """The floor's height when the map has none: the lowest layer holding at least a quarter
-        of the most flat hits of any layer (its centre), None without flat hits."""
+    def estimate_floor(self, below: float | None = None) -> float | None:
+        """The floor's height (map.md §6): the lowest large horizontal plane below the cameras
+        (``below``: their lowest height, less ``MIN_CAMERA_HEIGHT_M``). The flat surface
+        points' heights, in ``FLOOR_BIN_M`` bins smoothed over ``FLOOR_SMOOTH_BINS``, are
+        searched for peaks holding at least ``FLOOR_PEAK_SHARE`` of the highest one; the floor is
+        the mean height of the points within ``FLOOR_REFINE_M`` of the lowest such peak. Falls
+        back on the layers of flat hits (a volume without heights); None without flat hits."""
         if self.empty:
             return None
+        zc = self.origin[2] + (np.arange(len(self.flat_z)) + 0.5) * FLOOR_BIN_M
+        h = self.flat_z.copy()
+        if below is not None:
+            h[zc > below - MIN_CAMERA_HEIGHT_M] = 0.0
+        if h.max() > 0:
+            k = np.ones(FLOOR_SMOOTH_BINS) / FLOOR_SMOOTH_BINS
+            s = np.convolve(h, k, mode="same")
+            left = np.concatenate([[-1.0], s[:-1]])
+            right = np.concatenate([s[1:], [-1.0]])
+            peaks = np.flatnonzero((s >= left) & (s > right) & (s >= FLOOR_PEAK_SHARE * s.max()))
+            p = int(peaks[0])
+            near = np.abs(zc - zc[p]) <= FLOOR_REFINE_M
+            return float((zc[near] * h[near]).sum() / h[near].sum())
         per = self.flat.reshape(self.shape[0], -1).sum(axis=1).astype(np.float64)
         if per.max() <= 0:
             return None
-        k = int(np.argmax(per >= 0.25 * per.max()))
-        return float(self.origin[2] + (k + 0.5) * self.vz)
+        k_ = int(np.argmax(per >= 0.25 * per.max()))
+        return float(self.origin[2] + (k_ + 0.5) * self.vz)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -315,6 +399,7 @@ class Layers:
     observations: NDArray[np.uint16]
     height: NDArray[np.float32]
     floor_observed: NDArray[np.uint8]
+    top: NDArray[np.float32] | None = None  # the highest surface in the band (NaN: none)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -338,11 +423,17 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float) -> Layers:
     hit = vol.hit.astype(np.float32)
     free = vol.free.astype(np.float32)
     surface = (vol.hit > 0) & (hit >= OCC_RATIO * (hit + free))
-    floorlike = (vol.flat.astype(np.float32) * 2 >= hit) & (vol.hit > 0) & \
-        (np.abs(zc) <= FLOOR_TOL_M)[:, None, None]
+    # floor-like: hits at the floor's height, mostly flat ones where they lie inside the band
+    # (below it, any hit is the floor or what stands on it, which the band does not judge)
+    flat_enough = (vol.flat.astype(np.float32) * 2 >= hit) | (zc < z_min)[:, None, None]
+    floorlike = flat_enough & (vol.hit > 0) & (np.abs(zc) <= FLOOR_TOL_M)[:, None, None]
     surface &= ~floorlike
     band = ((zc >= z_min) & (zc <= z_max))[:, None, None]
-    occupied = (surface & band).any(axis=0)
+    in_band = surface & band
+    occupied = in_band.any(axis=0)
+    kb = Z - 1 - np.argmax(in_band[::-1], axis=0)
+    band_top = np.where(occupied, zc[np.clip(kb, 0, max(Z - 1, 0))], np.nan).astype(
+        np.float32) if Z else np.full((Y, X), np.nan, np.float32)
     floor_obs = floorlike.any(axis=0)
     free2 = (((vol.free > 0) & band).any(axis=0) | floor_obs) & ~occupied
     state = np.where(occupied, OCCUPIED, np.where(free2, FREE, UNKNOWN)).astype(np.uint8)
@@ -353,7 +444,7 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float) -> Layers:
     height = np.where(has, zc[np.clip(k, 0, max(Z - 1, 0))], np.nan).astype(np.float32) \
         if Z else np.full((Y, X), np.nan, np.float32)
     return Layers(vol.origin[:2].copy(), vol.voxel, state, vol.obs.copy(), height,
-                  floor_obs.astype(np.uint8))
+                  floor_obs.astype(np.uint8), band_top)
 
 
 def resample(lay: Layers, cell: float) -> Layers:
@@ -370,7 +461,7 @@ def resample(lay: Layers, cell: float) -> Layers:
         c = np.minimum(((np.arange(cols) + 0.5) * cell / lay.cell).astype(int), C - 1)
         g = np.ix_(r, c)
         return Layers(lay.origin, cell, lay.state[g], lay.observations[g], lay.height[g],
-                      lay.floor_observed[g])
+                      lay.floor_observed[g], None if lay.top is None else lay.top[g])
     r = np.minimum(((np.arange(R) + 0.5) * lay.cell / cell).astype(int), rows - 1)
     c = np.minimum(((np.arange(C) + 0.5) * lay.cell / cell).astype(int), cols - 1)
     rr, cc = np.meshgrid(r, c, indexing="ij")
@@ -383,11 +474,55 @@ def resample(lay: Layers, cell: float) -> Layers:
     fl = np.zeros(rows * cols, np.uint8)  # seen (1) over free by rule (2) over not seen (0)
     np.maximum.at(fl, target, np.array([0, 2, 1], np.uint8)[lay.floor_observed.ravel()])
     fl = np.array([0, 2, 1], np.uint8)[fl]
-    h = np.full(rows * cols, -np.inf, np.float32)
-    np.maximum.at(h, target, np.where(np.isnan(lay.height), -np.inf, lay.height).ravel())
-    h[np.isinf(h)] = np.nan
+
+    def highest(a: NDArray[np.float32]) -> NDArray[np.float32]:
+        h = np.full(rows * cols, -np.inf, np.float32)
+        np.maximum.at(h, target, np.where(np.isnan(a), -np.inf, a).ravel())
+        h[np.isinf(h)] = np.nan
+        return h.reshape(rows, cols)
+
     return Layers(lay.origin, cell, state.reshape(rows, cols), obs.reshape(rows, cols),
-                  h.reshape(rows, cols), fl.reshape(rows, cols))
+                  highest(lay.height), fl.reshape(rows, cols),
+                  None if lay.top is None else highest(lay.top))
+
+
+def inflate_walls(lay: Layers) -> Layers:
+    """The layers with every thin wall grown by one cell into the cells beside it: a wall is a
+    connected occupied structure (8-connected) at least ``WALL_EXTENT_M`` long, grown on a side
+    where it is less than ``WALL_THICK_CELLS`` thick across (the noise of the depth has not
+    thickened it already). A wall's
+    face lies anywhere in its cell, and a thin wall seen from both sides sits on a cell boundary:
+    the cell beside it may hold the surface. Furniture and thin obstacles are left as seen. The
+    grown cells take the highest surface of the wall cells beside them (``top``)."""
+    occ = lay.state == OCCUPIED
+    lab, n = ndimage.label(occ, np.ones((3, 3), bool))
+    big = np.zeros(n + 1, bool)
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        assert sl is not None
+        big[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) * lay.cell \
+            >= WALL_EXTENT_M
+    cross = ndimage.generate_binary_structure(2, 1)
+    wall = np.pad(big[lab], WALL_THICK_CELLS + 1)
+    R, C = occ.shape
+    k = WALL_THICK_CELLS + 1
+    grow = np.zeros_like(occ)
+    for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+        def at(m: int, dr: int = dr, dc: int = dc) -> NDArray[np.bool_]:
+            return wall[k + m * dr:k + m * dr + R, k + m * dc:k + m * dc + C]
+        thick = np.ones_like(occ)
+        for m in range(1, WALL_THICK_CELLS + 1):
+            thick &= at(m)
+        grow |= at(1) & ~thick  # beside a wall thinner than WALL_THICK_CELLS that way
+    grow &= ~occ
+    state = lay.state.copy()
+    state[grow] = OCCUPIED
+    top = None
+    if lay.top is not None:
+        t = np.where(np.isnan(lay.top) | ~big[lab], -np.inf, lay.top)
+        top = lay.top.copy()
+        top[grow] = ndimage.maximum_filter(t, footprint=cross)[grow]
+    return Layers(lay.origin, lay.cell, state, lay.observations, lay.height,
+                  lay.floor_observed.copy(), top)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -396,12 +531,21 @@ def resample(lay: Layers, cell: float) -> Layers:
 
 @dataclass(frozen=True)
 class Stand:
-    """A keyframe camera: its pose and the intrinsics of its image."""
+    """A keyframe camera: its pose, the intrinsics of its image and, when the frame stated it,
+    its height above the floor."""
 
     T_map_cam: Array
     K: Array  # 3x3
     width: int
     height: int
+    height_m: float | None = None
+
+
+def camera_height(stand: Stand, floor_z: float) -> float:
+    """The camera's height above the floor: its pose above ``floor_z``, or the frame's stated
+    height when that is larger (a floor estimate too high would shrink the blind disc)."""
+    h = float(np.asarray(stand.T_map_cam, np.float64)[2, 3]) - floor_z
+    return max(h, stand.height_m) if stand.height_m is not None else h
 
 
 def blind_radius(stand: Stand, floor_z: float) -> float:
@@ -411,7 +555,7 @@ def blind_radius(stand: Stand, floor_z: float) -> float:
     from oh_my_slam.core.geometry import unproject_pixels
 
     T = np.asarray(stand.T_map_cam, np.float64)
-    h = float(T[2, 3]) - floor_z
+    h = camera_height(stand, floor_z)
     if h <= 0:
         return 0.0
     K = np.asarray(stand.K, np.float64)
@@ -424,46 +568,48 @@ def blind_radius(stand: Stand, floor_z: float) -> float:
     return min(h / math.tan(math.radians(depression)), BLIND_RING_MAX_M)
 
 
-def _disc(lay: Layers, xy: Array, radius: float) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """(rows, cols) of the cells whose centres lie within ``radius`` of ``xy``, plus its own."""
+def _disc(lay: Layers, xy: Array, radius: float
+          ) -> tuple[NDArray[np.int64], NDArray[np.int64], Array]:
+    """(rows, cols, distances) of the cells whose centres lie within ``radius`` of ``xy``, plus
+    its own."""
     R, C = lay.shape
     r0, c0 = lay.cell_of(xy)
     k = math.ceil(radius / lay.cell) + 1
     rr, cc = np.mgrid[r0 - k:r0 + k + 1, c0 - k:c0 + k + 1]
     cen_x = lay.origin[0] + (cc + 0.5) * lay.cell
     cen_y = lay.origin[1] + (rr + 0.5) * lay.cell
-    inside = (np.hypot(cen_x - xy[0], cen_y - xy[1]) <= radius) | ((rr == r0) & (cc == c0))
+    dist = np.hypot(cen_x - xy[0], cen_y - xy[1])
+    inside = (dist <= radius) | ((rr == r0) & (cc == c0))
     inside &= (rr >= 0) & (rr < R) & (cc >= 0) & (cc < C)
-    return rr[inside], cc[inside]
+    return rr[inside], cc[inside], dist[inside]
 
 
 def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
                 footprint_radius: float | None) -> None:
-    """Free the camera cells (and the footprint) whatever was seen there, and the unknown cells
-    of each camera's blind disc that the camera cell reaches without crossing an occupied cell
-    (in place). Those cells whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
+    """Free the camera cells (and the footprint) whatever was seen there, and each camera's blind
+    disc (in place): its floor out to ``blind_radius``, which the camera could not see. A cell of
+    the disc stays occupied only when it holds a surface the camera could see: higher, by
+    ``SIGHT_MARGIN_M``, than the camera's lowest line of sight above that cell (a wall, a door
+    jamb, a table's leg), not what lies below it (other frames' floor noise, a low step). The
+    cells so freed whose floor nobody saw get ``floor_observed`` 2 (free by rule)."""
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
-        r, c = _disc(lay, xy, footprint_radius or 0.0)
+        r, c, _ = _disc(lay, xy, footprint_radius or 0.0)
         lay.state[r, c] = FREE
         _by_rule(lay, r, c)
         ring = blind_radius(st, floor_z)
         if ring <= lay.cell:
             continue
-        r, c = _disc(lay, xy, ring)
-        if not r.size:  # the camera lies outside the grid
-            continue
-        r0, c0 = r.min(), c.min()
-        box = np.zeros((r.max() - r0 + 1, c.max() - c0 + 1), bool)
-        box[r - r0, c - c0] = lay.state[r, c] != OCCUPIED
-        lab, _ = ndimage.label(box)
-        me = lay.cell_of(xy)
-        if not (0 <= me[0] - r0 < box.shape[0] and 0 <= me[1] - c0 < box.shape[1]):
-            continue
-        reach = lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]
-        unknown = reach & (lay.state[r, c] == UNKNOWN)
-        lay.state[r[unknown], c[unknown]] = FREE
-        _by_rule(lay, r[reach], c[reach])
+        r, c, dist = _disc(lay, xy, ring)
+        sight = camera_height(st, floor_z) * (1.0 - dist / ring)
+        occ = lay.state[r, c] == OCCUPIED
+        if lay.top is None:
+            keep = occ
+        else:
+            with np.errstate(invalid="ignore"):
+                keep = occ & ~(lay.top[r, c] <= sight + SIGHT_MARGIN_M)
+        lay.state[r[~keep], c[~keep]] = FREE
+        _by_rule(lay, r[~keep], c[~keep])
 
 
 def _by_rule(lay: Layers, r: NDArray[np.int64], c: NDArray[np.int64]) -> None:
@@ -838,8 +984,12 @@ def features(lay: Layers, footprint_radius: float | None = None,
             sides.append(max(votes, key=lambda v: votes[v]) if votes else 0)
         if sides[0] == 0 or sides[1] == 0 or sides[0] == sides[1]:
             continue
-        j1 = np.array([lay.origin[0] + e1[0] * cell, lay.origin[1] + e1[1] * cell])
-        j2 = np.array([lay.origin[0] + e2[0] * cell, lay.origin[1] + e2[1] * cell])
+        # the jambs' faces lie inside the cells the chord ends on: half a cell beyond its ends
+        # on average (the chord stops at those cells' boundaries)
+        j1 = np.array([lay.origin[0] + e1[0] * cell, lay.origin[1] + e1[1] * cell]) \
+            - u * cell * JAMB_IN_CELL
+        j2 = np.array([lay.origin[0] + e2[0] * cell, lay.origin[1] + e2[1] * cell]) \
+            + u * cell * JAMB_IN_CELL
         width = float(np.linalg.norm(j2 - j1))
         centre = (j1 + j2) / 2
         normal = math.degrees(math.atan2(n[1], n[0]))  # from sides[0] (behind) to sides[1]

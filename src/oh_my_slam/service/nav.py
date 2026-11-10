@@ -147,12 +147,14 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
     vol = dv.volume()
     floor = dv.floor_z
     base = navgrid.layers(vol, floor, z_min, z_max)  # the features at the volume's resolution,
-    navgrid.mark_stands(base, dv.stands, floor, footprint)  # whatever cell size is asked
-    lay = navgrid.resample(base, cell)
+    walls = navgrid.inflate_walls(base)  # whatever cell size is asked, on the walls as seen
+    navgrid.mark_stands(base, dv.stands, floor, footprint)
+    navgrid.mark_stands(walls, dv.stands, floor, footprint)
+    lay = navgrid.resample(walls, cell)
     if lay.state.size > MAX_GRID_CELLS:
         raise invalid("cell_m", f"cell_m {cell} gives {lay.state.size} cells (at most "
                       f"{MAX_GRID_CELLS}): ask for larger cells")
-    if lay is not base:
+    if lay is not walls:
         navgrid.mark_stands(lay, dv.stands, floor, footprint)
     feat = navgrid.features(base, footprint, dv.meta.get("doors", []))
     rid = ids.assign(dv.name, "regions", [(r.centroid, r.area_m2) for r in feat.regions])
