@@ -388,3 +388,14 @@ def test_stop_inference(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         child.kill()
         child.wait(10)
+
+
+def test_read_of_an_anchored_map_without_cloud(tmp_path: Path) -> None:
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    am = AnchoredMap(tmp_path / "mapper")
+    am.root.mkdir()
+    am.save()
+    m = be.MapperBackend().read(am.root)
+    assert m.frames == [] and m.cloud() is None and m.points_z is None and m.bounds is None
+    assert m.depth("k000000") is None and m.image("k000000") is None and m.objects() == []
