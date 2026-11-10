@@ -219,6 +219,21 @@ Anchored maps (below) report their own sigmas.
   mean's own variance (`w² σ_img² + (1−w)² σ_prior²`, `w` from the weights the fusion used, which
   floor the image pose at 5 cm / 1°), for a drifting prior the inverse-variance combination; floored
   at 1 mm and 0.01° (no longer at 1 cm / 0.1°).
+* **Bare walls with depth.** A frame with a depth image and a metric or drifting prior is not
+  rejected `plain` or `few_features` by the checks (`update.DEPTH_PLACED`); when the images do not
+  place it, its depth is aligned on the depth of the keyframes near its prior
+  (`mapping.anchored.depth_icp`: point-to-plane Gauss-Newton, the prior a factor, so a wall fixes
+  its normal and the prior the rest), and it is `registered` (`method: depth`) when its depth then
+  agrees with theirs and the alignment stays within 3 sigmas of the prior. Measured on the
+  ray-cast room (`tests.synth.room`, the base camera: 640×480, fx 655.8, 52° HFOV; drifting priors
+  over-counting the yaw by 1° per frame, σ 5 cm / 3°): every frame of a 360° turn registers up to a
+  45° step, with textured walls (max error 0.8 cm / 0.3°), bare walls and textured boxes (4.5 cm /
+  1.1°) and an empty bare room (1.4 cm / 0.4°); at 48° bare walls fail (3 of 9), at 52° (no
+  overlap) every engine does; 40° steps hold with 3° per frame of odometry drift.
+* **A look in two halves.** A dry run reads the latest committed version and its mapper map as one
+  snapshot (`Store.snapshot`, under the commit lock), so it never mixes two versions and never
+  waits for a running job; the jobs run one at a time and each reads the version committed when
+  it starts (`test_a_look_in_two_halves_with_a_dry_run_between`).
 * **Guided matching** is vectorised (one pass over all candidate pairs) and skipped for a keyframe
   that already has 300 ratio-test matches.
 * **Dry run.** Features, map placements and neighbour links run 6 frames at a time
@@ -470,15 +485,18 @@ against the 1-3 cm the priors measured.
 
 ### Expected durations
 
-`/api/health → timings` defaults before any measurement (`service.timings.DEFAULTS`, seconds):
-registration 3.7 and fusion 0.54 per frame (above); locate 2.0 per frame and grid read 0.5 (the
+`/api/health → timings` defaults before any measurement (`service.timings.DEFAULTS`, seconds,
+measured 2026-11-10 on the M3 Pro with the prior-first path at 640x480: task_map frames with
+priors and monocular depth, objects fused; ainex camera-only frames by MapAnything): registration
+0.6 and fusion 1.3 per frame, MapAnything's registration 1.9, checks 0.02 per frame, job overhead
+0.4; locate 2.0 per frame and grid read 0.5 (the
 targets: measured values replace them as soon as the service has run them); frame analysis 1.5
 and objects read 0.1 are placeholders until their groups measure them. Each kind
 keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
 A prediction adds up a job's phases, each measured as run (`Timings.predict_phases`):
-`job_overhead` (per job: clone, save, commit; default 0.5) + `checks_per_frame` × frames sent
-(0.05) + `registration_per_frame` × frames the geometric engine gets +
-`registration_mapanything_per_frame` × camera-only frames MapAnything gets (1.5) +
+`job_overhead` (per job: clone, save, commit) + `checks_per_frame` × frames sent +
+`registration_per_frame` × frames the geometric engine gets +
+`registration_mapanything_per_frame` × camera-only frames MapAnything gets +
 `fusion_per_frame` × frames kept. `eta_s` = the remaining predicted time of the jobs ahead + the
 job's own (every frame counted as kept); a dry run's `predicted_s` uses its own predicted checks
 and statuses (`registration` = overhead + checks + registration, `fusion`).

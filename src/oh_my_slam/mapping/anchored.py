@@ -619,9 +619,7 @@ def backproject(depth: NDArray[np.float32], K: Array, side: int = SAMPLE_SIDE) -
     z = depth[vs, us].astype(np.float64)
     ok = np.isfinite(z) & (z > MIN_DEPTH_M)
     z, us, vs = z[ok], us[ok], vs[ok]
-    x = (us + 0.5 - K[0, 2]) / K[0, 0] * z
-    y = (vs + 0.5 - K[1, 2]) / K[1, 1] * z
-    out: Array = np.column_stack([x, y, z])
+    out: Array = unproject_pixels(us + 0.5, vs + 0.5, z, K)
     return out
 
 
@@ -680,9 +678,9 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
         Xr = (X - r.T[:3, 3]) @ r.T[:3, :3]
         z = Xr[:, 2]
         front = z > MIN_DEPTH_M
-        zs = np.where(front, z, 1.0)
-        u = np.floor(r.K[0, 0] * Xr[:, 0] / zs + r.K[0, 2]).astype(np.int64)
-        v = np.floor(r.K[1, 1] * Xr[:, 1] / zs + r.K[1, 2]).astype(np.int64)
+        uv, _ = project(np.where(front[:, None], Xr, 1.0), r.K)
+        uv = np.floor(np.nan_to_num(uv, nan=-1.0, posinf=-1.0, neginf=-1.0))
+        u, v = uv[:, 0].astype(np.int64), uv[:, 1].astype(np.int64)
         h, w = r.depth.shape
         inside = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
         d = np.zeros(n)
@@ -710,7 +708,7 @@ def _normals(depth: NDArray[np.float32], K: Array, T: Array, side: int = SAMPLE_
     step = max(1, math.ceil(max(h, w) / side))
     vs, us = np.mgrid[step // 2:h:step, step // 2:w:step]
     z = depth[vs, us].astype(np.float64)
-    P = np.stack([(us + 0.5 - K[0, 2]) / K[0, 0] * z, (vs + 0.5 - K[1, 2]) / K[1, 1] * z, z], -1)
+    P = unproject_pixels(us + 0.5, vs + 0.5, z, K)
     ok = np.isfinite(z) & (z > MIN_DEPTH_M)
     du = P[1:-1, 2:] - P[1:-1, :-2]
     dv = P[2:, 1:-1] - P[:-2, 1:-1]

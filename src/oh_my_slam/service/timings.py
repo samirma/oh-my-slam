@@ -15,18 +15,18 @@ import numpy as np
 from oh_my_slam.core.atomic import atomic_write_json
 
 WINDOW = 50
-# seconds (README "Expected durations"): registration and fusion measured on the serving machine
-# (M3 Pro, 18 GB) with examples/office_sequence, 13 photos of 12 MP per job; the others are
-# placeholders until their groups (O5-O7) measure them
+# seconds (README "Expected durations"), measured on the serving machine (M3 Pro, 18 GB) with
+# the prior-first path at 640x480 (task_map frames with priors and monocular depth, objects
+# fused; ainex camera-only frames by MapAnything); the reads are placeholders until their
+# groups measure them
 DEFAULTS: dict[str, float] = {
-    "registration_per_frame": 3.7,
-    "fusion_per_frame": 0.54,
-    # a job's phases (README "Expected durations"), measured on the prior-first path: the
-    # checks of every frame sent, MapAnything's registration of a camera-only frame, and what
-    # a job costs beyond its frames (clone, save, commit)
-    "checks_per_frame": 0.05,
-    "registration_mapanything_per_frame": 1.5,
-    "job_overhead": 0.5,
+    "registration_per_frame": 0.6,
+    "fusion_per_frame": 1.3,
+    # a job's phases: the checks of every frame sent, MapAnything's registration of a
+    # camera-only frame, and what a job costs beyond its frames (clone, save, commit)
+    "checks_per_frame": 0.02,
+    "registration_mapanything_per_frame": 1.9,
+    "job_overhead": 0.4,
     "locate_per_frame": 2.0,
     "analyse_per_frame": 1.5,
     "grid_read": 0.5,
