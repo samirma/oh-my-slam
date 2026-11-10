@@ -30,10 +30,29 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     ratio);
   * the residuals of the anchors, which are the metric priors and the previous version's poses.
 * **Never re-posing.** An engine that never re-estimates stored poses has no such transform.
-  Its `quality.gauge_shift` is instead, over the update's new frames, the median displacement
-  between each frame's committed pose and its image-only pose (the pose its images alone give
-  against the map): `translation_m` in m, `rotation_deg` in deg, `scale_ratio` 1. Frames
-  `kept_at_prior` or `rejected` have no image-only pose and are left out.
+  Its `quality.gauge_shift` is the movement of the stored keyframes: over the previous
+  version's keyframes, the median translation (m) and rotation (deg) between their pose in the
+  previous version and the pose that would be committed; `scale_ratio` 1. It is about 0 when
+  no stored keyframe moved.
+* **Residuals against the previous version.** `quality.previous_residuals` covers the earlier
+  keyframes only: its `count` is at most the previous version's keyframe count. A stored
+  keyframe that moves beyond tolerance shows in `previous_residuals.max_m` / `max_deg` and is
+  gated by `max_residual_m` (§4).
+* **New-frame disagreement.** The disagreement of the update's new frames between committed
+  pose and image-only pose (the pose their images alone give against the map) is in
+  `quality.max_displacement_m` and `max_displacement_deg` (§4), not in `gauge_shift`:
+  * a frame whose image-only pose is unconstrained in translation (parallax, baseline over
+    median scene depth, below 0.02) counts only its rotation;
+  * frames `kept_at_prior` or `rejected` have no image-only pose and are left out.
+
+  So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gate
+  on `max_displacement_m` measures new-frame disagreement.
+* **Priors against images.** A prior is weighed by its sigmas against the relative pose the
+  images give between overlapping frames. Where two frames overlap by at least 50 % and their
+  image relative rotation disagrees with their priors' relative rotation by more than 3 of the
+  priors' rotation sigmas, the rotation is corrected from the images. `quality` always reports
+  `prior_disagreement_deg`: the largest such disagreement over the update's frames, 0 when
+  none.
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
@@ -101,11 +120,13 @@ becomes a job with a `job_id`. A job goes through these states:
 
 * **The quality report.** Every job, dry runs included, reports `quality`:
   * `scale_ratio_vs_prev` and `gauge_shift` (§1);
-  * `max_displacement_m`: over the update's new frames that have an image-only pose, the
-    largest displacement between committed pose and image-only pose (§1), or null when there
-    is none;
-  * the anchor residuals (median and max, in m and deg, against metric priors and against the
-    previous version);
+  * `max_displacement_m` and `max_displacement_deg`: over the update's new frames that have an
+    image-only pose, the largest translation and rotation between committed pose and
+    image-only pose (§1), or null when there is none. A frame unconstrained in translation
+    (§1) contributes to `max_displacement_deg` only;
+  * `prior_disagreement_deg` (§1), 0 when no image relative rotation disagrees with the priors;
+  * the anchor residuals (median and max, in m and deg, against metric priors and, over earlier
+    keyframes only, against the previous version);
   * `rejected_share`: inputs rejected over inputs sent;
   * `low_confidence_share`: registered inputs whose pose sigma exceeds the threshold in
     `README.md`;
@@ -113,9 +134,10 @@ becomes a job with a `job_id`. A job goes through these states:
   * `prior_gravity_deg`, on a map's first update.
 * **The gate.** The request option `accept_if {max_residual_m, max_gauge_shift_m,
   max_displacement_m, max_rejected_share}` is evaluated on the registration phase's report,
-  before anything is committed. `max_residual_m` gates the anchor residuals;
-  `max_displacement_m` gates `quality.max_displacement_m`, so a single bad frame fails the
-  update.
+  before anything is committed. `max_residual_m` gates the anchor residuals, so a stored
+  keyframe that moved fails the update; `max_gauge_shift_m` gates the stored keyframes' median
+  movement; `max_displacement_m` gates `quality.max_displacement_m`, so a single new frame that
+  disagrees with its images fails the update.
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
   * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
@@ -150,12 +172,17 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
   `leaves[].object_id`.
 * **Floor height.** The floor height used for boxes comes from the grid's floor estimate, so
   boxes and grid agree.
+* **Floor band.** A surface within max(0.06 m, 3 × the floor estimate's height sigma) of
+  `floor_z_m` is floor (§6): it never makes a floor-standing object. This minimum height applies
+  only above the floor estimate: an object resting on any other support surface keeps its
+  detection whatever its height (a 16 mm plate or an egg on a worktop is still an object). A
+  surface of `surfaces[]` is never itself raised to an object by this rule.
 
 ## 6. Navigation grid (O6)
 
 `GET /api/maps/{name}/grid` returns a 2-D grid built from the free space the fusion keeps:
 * cells seen through are **free**;
-* cells holding surfaces within the height band are **occupied**;
+* cells holding surfaces within the height band are **occupied**, except floor;
 * everything else is **unknown**.
 
 **Where cameras stood is free.** The cells under each keyframe's camera position are free,
@@ -183,6 +210,10 @@ seen there.
 
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.
+
+  **Floor band.** A surface within max(0.06 m, 3 × the floor estimate's height sigma) of
+  `floor_z_m` is floor: it never makes an occupied cell or defines a passage, whatever `z_min`
+  is.
 * Optional `footprint_radius_m`: the robot's radius.
 * `height_cap_m`: the ceiling of the `height_m` layer, relative to `floor_z_m`. Default 2.0 m,
   or the band's `z_max` when the request gives one. Echoed in the header.

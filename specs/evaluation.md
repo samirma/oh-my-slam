@@ -67,6 +67,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `locate.recall` | C8 | Share of frames within 0.3 m and 15° of a keyframe that are located |
 | `locate.median_pos_error` | C8 | Median position error of located frames |
 | `locate.ambiguity_flagged` | C8 | Share of located frames whose pose error exceeds 0.10 m or 5° that carry a non-null `ambiguity` (a supported rival beyond 0.10 m or 5° is never silent, api.md §6) |
+| `locate.sigma_right_median` | C8 | Median `sigma_pos_m` of located frames within 0.05 m of the truth, on a clear match (`rivals` empty) |
 | `locate.nearest_view` | C8 | Share of rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure |
 | `locate.sigma_containment` | C8 | Share of located frames whose position error ≤ 3 × `sigma_pos_m` and rotation error ≤ 3 × `sigma_rot_deg` |
 | `locate.sigma_tightness` | C8 | Information, no target: median over located frames of error / sigma (position and rotation reported separately); near 1 means sigmas neither over- nor under-confident |
@@ -77,7 +78,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `update.readable_latency` | C3 | Upload to frame readable in a version (`provisional_version` committed) |
 | `fusion.time_per_frame` | C3 | Fusion time per new frame, maps up to 500 keyframes |
 | `reads.atomic` | C3 | Share of reads during an update answered from one version |
-| `jobs.eta_accuracy` | C3 | Share of jobs whose `eta_s` when queued, and dry runs whose `predicted_s`, fall within the tolerance of the measured time |
+| `jobs.eta_accuracy` | C3 | Share of jobs whose `eta_s` when queued, and dry runs whose `predicted_s`, fall within the tolerance of the measured time; camera-only dry runs (no priors) included |
 | `fusion.intermediate_interval` | C3 | Longest interval between intermediate versions while fusion lasts longer than it |
 | `inputs.reason_agreement` | C4 | Share of rejected inputs whose `reason` agrees with the truth (bare wall, too close, no overlap) |
 | `revert.latency` | C5 | Revert latency |
@@ -88,6 +89,8 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `passages.geometry` | C9 | Share of found doors whose `centre_m` is within the tolerance of the floor plan's door-gap centre and whose `width_m` is within the tolerance of its free width |
 | `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
 | `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
+| `grid.floor_false_obstacles` | C9 | Occupied cells and objects lower than 0.06 m on open floor (map.md §5–§6) |
+| `grid.id_stability` | C9 | Share of regions and passages whose id is unchanged between consecutive versions where their geometry did not change |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
 | `grid.floor_height` | C9 | Floor height error, against the surface the robot stands on (map.md §6): the large horizontal plane nearest the priors' origin height, else the lowest large horizontal plane below the cameras |
@@ -131,6 +134,7 @@ these ids.
 | `locate.recall` | ≥ 0.9 |
 | `locate.median_pos_error` | ≤ max(2 cm, 1 % of the scene depth) |
 | `locate.ambiguity_flagged` | ≥ 0.8 |
+| `locate.sigma_right_median` | < 0.10 m |
 | `locate.nearest_view` | ≥ 0.8 |
 | `locate.sigma_containment` | ≥ 0.99 |
 | `locate.sigma_tightness` | information only |
@@ -153,6 +157,8 @@ these ids.
 | `passages.geometry` | ≥ 0.8, tolerances 0.10 m (centre) and 0.10 m (width) |
 | `grid.floor_observed` | ≥ 0.9 |
 | `grid.camera_cells_free` | 100 % |
+| `grid.floor_false_obstacles` | 0 |
+| `grid.id_stability` | 1.0 |
 | `features.region_set` | 100 % |
 | `grid.band_occupied` | ≥ 0.95 |
 | `grid.floor_height` | ≤ 2 cm |

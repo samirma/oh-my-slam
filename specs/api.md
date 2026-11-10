@@ -98,7 +98,8 @@ error code `invalid_request` (§9).
   * `created_at` and `ended_at`. Once registration has run, the job also carries
   `inputs[]` and `quality`.
   * An optional `?wait_s=<s>` (≤ 30) holds the answer until the state changes or the time
-    passes.
+    passes. A job already in a terminal state (`committed`, `rejected`, `cancelled`, `failed`)
+    answers at once, whatever `wait_s`.
   * Jobs are kept for at least one hour after they end.
 * **Inputs.** `inputs[]` has one [`InputStatus`] per frame sent, in request order:
 
@@ -109,11 +110,21 @@ error code `invalid_request` (§9).
   | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict` or `duplicate`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
-  | `prior_residual_m`, `prior_residual_deg` | The residual to its prior; null without a prior. |
+  | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
+  | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its pose is the prior, its sigmas are the prior's, and its prior residuals
   are 0. It is stored and may be fused, but locate never uses it as a reference (§6).
+
+  **Choosing a status.**
+  * `rejected` with `prior_conflict` only when the images confirm a pose farther than 3 prior
+    sigmas from the prior, and no supported hypothesis lies within 3 prior sigmas of it.
+  * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
+  * A view the map already has is `registered`; it is rejected as `too_close` only when it adds
+    nothing new.
+  * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
+    alone.
 
   **Pose sigmas are a lower bound** until O5 calibrates them against replay truth: until then
   `sigma_pos_m` and `sigma_rot_deg`, here and in [`Frames`], come from the registration's noise
@@ -127,7 +138,9 @@ error code `invalid_request` (§9).
   * the predicted link to the map: `map_inliers`, `predicted_status` (`registered`,
     `kept_at_prior` or `rejected`), `predicted_reason`;
   * the predicted links to its neighbours in the request: `neighbour_inliers[]`;
-  * the flags `plain` and `too_close`.
+  * the flags `plain` and `too_close`;
+  * with `predicted_reason` `too_close`: `min_distance_m` and `scene_distance_m`, as in
+    `inputs[]`.
 
   It also gives a predicted `quality`, without fusion, and `scale_source` and
   `scale_sigma_rel`.
@@ -155,18 +168,24 @@ The versions read, revert and `--keep-versions` are O2.
   | --- | --- |
   | `name` | The frame's name. |
   | `status` | `located` or `rejected`. |
-  | `reason` | When rejected: `no_overlap`, `few_features`, `plain` or `blur`; otherwise null. |
-  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. |
+  | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `blur` or `prior_conflict`; otherwise null. |
+  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. The sigmas describe the chosen hypothesis only, not the spread of rivals. |
   | `inlier_ratio` | The share of inliers. |
-  | `ambiguity` | `{pos_m, rot_deg}` or null; see below. |
+  | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
+  | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
   | `consistent_with_prior` | Bool, or null without a prior. |
 
+* **With a prior.** The reported pose is the hypothesis nearest the prior among those with
+  support at least 0.25. When none lies within 3 × the prior's sigmas, the frame is `rejected`
+  with `prior_conflict`, not located with `consistent_with_prior: false`.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
     it.
   * Its support is its inlier count over the reported pose's inlier count. A rival is supported
     when its support is at least 0.25, whatever else its inliers explain.
   * `pos_m` and `rot_deg` are the distance from the best-supported rival to the reported pose.
+  * `rivals` lists every supported rival with its distance and support, strongest first;
+    `ambiguity` repeats its first entry.
   * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
     The client then asks for a second frame.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the

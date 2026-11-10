@@ -396,13 +396,25 @@
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Residual between the committed pose and the frame's prior; null without a prior."
         },
         "prior_residual_deg": {
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Residual between the committed pose and the frame's prior; null without a prior."
+        },
+        "min_distance_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "With reason too_close: the distance limit applied."
+        },
+        "scene_distance_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "With reason too_close: the frame's median scene depth."
         }
       },
       "allOf": [
@@ -459,6 +471,24 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "too_close"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "min_distance_m",
+              "scene_distance_m"
+            ]
+          }
         }
       ]
     },
@@ -514,13 +544,15 @@
         "scale_ratio_vs_prev",
         "gauge_shift",
         "max_displacement_m",
+        "max_displacement_deg",
         "prior_residuals",
         "previous_residuals",
         "rejected_share",
         "low_confidence_share",
         "rebuilt",
         "accepted",
-        "failed_checks"
+        "failed_checks",
+        "prior_disagreement_deg"
       ],
       "properties": {
         "scale_ratio_vs_prev": {
@@ -539,7 +571,7 @@
               "type": "null"
             }
           ],
-          "description": "Similarity aligning a re-estimated result back onto the previous version. For an engine that never re-poses stored frames: the median, over the update's new frames, of the displacement between committed pose and image-only pose (scale_ratio 1)."
+          "description": "Similarity aligning a re-estimated result back onto the previous version. For an engine that never re-poses stored frames: the median translation and rotation of the previous version's keyframes between their previous pose and the pose that would be committed (scale_ratio 1); about 0 when none moved."
         },
         "max_displacement_m": {
           "type": [
@@ -547,7 +579,15 @@
             "null"
           ],
           "minimum": 0,
-          "description": "Largest displacement, over the update's new frames that have an image-only pose, between committed pose and image-only pose; null when there is none."
+          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (parallax = baseline / median depth < 0.02) are left out; kept_at_prior and rejected frames excluded; null when there is none."
+        },
+        "max_displacement_deg": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Largest rotation, over the same frames (those unconstrained in translation included), between committed pose and image-only pose; null when there is none."
         },
         "prior_residuals": {
           "oneOf": [
@@ -569,7 +609,7 @@
               "type": "null"
             }
           ],
-          "description": "Stored frames against the previous version's poses."
+          "description": "Earlier keyframes only (count <= the previous version's keyframes) against their previous version's poses; a stored keyframe moving beyond tolerance shows in max_m / max_deg and is gated by max_residual_m."
         },
         "rejected_share": {
           "type": "number",
@@ -589,6 +629,11 @@
             "number",
             "null"
           ]
+        },
+        "prior_disagreement_deg": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Largest disagreement, over the update's frames overlapping by at least 50 %, between the images' relative rotation and the priors' relative rotation; 0 when none. Beyond 3 prior rotation sigmas the rotation is corrected from the images."
         },
         "accepted": {
           "type": "boolean"
@@ -818,8 +863,38 @@
               "type": "null"
             }
           ]
+        },
+        "min_distance_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "With reason too_close: the distance limit applied."
+        },
+        "scene_distance_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "With reason too_close: the frame's median scene depth."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "predicted_reason": {
+                "const": "too_close"
+              }
+            },
+            "required": [
+              "predicted_reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "min_distance_m",
+              "scene_distance_m"
+            ]
+          }
+        }
+      ]
     },
     "DryRun": {
       "type": "object",
@@ -1792,6 +1867,7 @@
         "sigma_rot_deg",
         "inlier_ratio",
         "ambiguity",
+        "rivals",
         "consistent_with_prior"
       ],
       "properties": {
@@ -1811,13 +1887,15 @@
                 "no_overlap",
                 "few_features",
                 "plain",
-                "blur"
+                "blur",
+                "prior_conflict"
               ]
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas."
         },
         "T_map_cam": {
           "oneOf": [
@@ -1827,19 +1905,22 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "With a prior: the hypothesis nearest the prior among those with support >= 0.25."
         },
         "sigma_pos_m": {
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Uncertainty of the chosen hypothesis only."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Uncertainty of the chosen hypothesis only."
         },
         "inlier_ratio": {
           "type": [
@@ -1868,13 +1949,41 @@
               "type": "null"
             }
           ],
-          "description": "Non-null whenever a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has support >= 0.25 (its inlier count over the reported pose's), whatever else its inliers explain; pos_m / rot_deg are the best-supported rival's distance from the reported pose."
+          "description": "The strongest supported rival (rivals[0]), or null: non-null whenever a rival hypothesis farther than 0.10 m or 5 deg from the reported pose has support >= 0.25 (its inlier count over the reported pose's), whatever else its inliers explain."
+        },
+        "rivals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "pos_m",
+              "rot_deg",
+              "support"
+            ],
+            "properties": {
+              "pos_m": {
+                "type": "number",
+                "minimum": 0
+              },
+              "rot_deg": {
+                "type": "number",
+                "minimum": 0
+              },
+              "support": {
+                "type": "number",
+                "minimum": 0.25,
+                "description": "Rival's inlier count over the reported pose's."
+              }
+            }
+          },
+          "description": "Every supported rival (support >= 0.25, farther than 0.10 m or 5 deg), strongest first; empty when none."
         },
         "consistent_with_prior": {
           "type": [
             "boolean",
             "null"
-          ]
+          ],
+          "description": "Null without a prior. A frame with a prior that no supported hypothesis matches within 3 prior sigmas is rejected with prior_conflict."
         },
         "nearest_view": {
           "oneOf": [
