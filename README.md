@@ -260,6 +260,35 @@ measured on the synthetic room of `tests/synth/room.py` and on the reference cap
   are over every metric prior of the map; `rebuilt` is false.
 * **The 202 answer** is the job as queued, even when the worker has already started it.
 
+### Prior-first measurements
+
+Measured 2026-11-10 on the serving machine (M3 Pro), the inference server shared with the live
+services, every run under the machine lock. Truth is exact only on the synthetic room
+(`tests/synth/room.py`: ray-cast, 640×480 fx 270 like the humanoid and the base, 640×360 fx 337
+like the arm; a wheeled base's camera 0.1 m ahead of its turning centre at 0.5 m, pitched
+−10°); monocular depth is the real model's on those renders (its metres are 0.45–0.67 of the
+truth there: a harsh case). Metric priors: truth + 1 cm / 0.5° noise, sent with σ 2 cm / 1°.
+Times are a job's wall time over its frames, checks included.
+
+| Run (synthetic room unless named) | Result |
+| --- | --- |
+| Cold start: 1 frame, then an in-place sweep of 11 frames 30° apart, metric priors + depth | 11/11 registered; ≤ 1.4 cm, ≤ 0.7°; 0.09 s/frame; `depth` |
+| Same, no depth (monocular) | 10–11/11 registered (one run: 1 `prior_conflict`); ≤ 5.3 cm, ≤ 1.1°; 0.66–0.67 s/frame |
+| Same at 640×360, depth / no depth | 11/11, 0.09 s/frame / 10/11, 0.71 s/frame |
+| Drifting priors, base walk of 14 frames (3.3 m) with an 8 % odometry over-count, depth | 13/13 registered; ≤ 1.8 cm, ≤ 0.3°; map positions to truth: scale 1.0005; odometry scale fitted 0.925 (truth 0.926); 0.10 s/frame |
+| Same, no depth, camera height 0.5 m | 13/13; median 1.7 cm, max 5.3 cm; positions scale 1.016 (1.6 %); depth scale 3 % from truth; `camera_height` |
+| Same, no depth, no height | 13/13; positions scale 1.067; depth scale 4.8 % from truth; `priors` (odometry, σ 10 %) |
+| Camera height only (in-place sweep, no depth, metric priors spanning < 0.3 m) | 11/11; depth scale within 1.5 % of truth (0.7 % in another run); `camera_height` σ 1.4–6 % |
+| Largest in-place step, depth + metric prior (hfov 100°) | 75° (11/11 in every run); 90° and 105°: 9–10/11, the rest provisional |
+| Largest in-place step, no depth | 60° (11/11); 75°: 8/11 (2 `prior_conflict`, 1 provisional) |
+| `examples/ainex-captures` (truth: the legacy evaluation map's poses, metres by a 0.34 m camera height), cold sweep 30° | depth: 9/11 registered, 1 provisional, 1 rejected; no depth: 10/11 + 1 provisional, ≤ 4.7 cm / 1.6° from that truth; 0.72 s/frame at 640×480, 0.93 at 640×360 |
+| `examples/office_sequence` walk at 640×480, drifting priors + 8 % | 3–2/12 registered, 7 provisional, 2–3 `prior_conflict`: the legacy map's poses disagree with its own aligned depths by 2–9°, so this truth cannot judge it |
+
+Per frame, without depth, the time is the monocular inference (~0.6 s at 640×480, one GPU
+lane); registration (SIFT, matching, PnP) takes 0.03 s and fusion 0.01 s. With depth images a
+frame costs ~0.09 s. A job whose frames the checks all reject costs the checks only (< 1 s for
+two frames in the tests).
+
 ### Live check
 
 Run on the serving machine (M3 Pro, 18 GB), 2026-11-10, service and inference server started by
