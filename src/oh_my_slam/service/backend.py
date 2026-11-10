@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 
 LOG_TAIL_LINES = 20
 MONO_GRID_SIDE = 640  # the monocular depth grid of an anchored map's keyframes (README)
+# a map update keeps detections from this score: below the default threshold (0.5), an object
+# needs two keyframes to be listed (``mapping.anchored_objects.TRUSTED_SCORE``)
+MAP_MIN_SCORE = 0.2
 
 
 class NothingRegisteredError(Exception):
@@ -252,7 +255,7 @@ class MapperBackend:
         try:
             client = connect_server().clone()
             try:
-                return detect_on_grid(image, grid, client)
+                return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE)
             finally:
                 client.close()
         except OhMySlamError as exc:

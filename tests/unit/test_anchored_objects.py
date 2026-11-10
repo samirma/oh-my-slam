@@ -196,6 +196,7 @@ def test_the_floor_named_as_an_object_is_dropped(tmp_path: Path) -> None:
     pts, _ = pixel_points(z, K_TABLE, np.ones_like(floor))
     zmap = (pts @ T[:3, :3].T + T[:3, 3])[:, 2].reshape(z.shape)
     m = floor & (np.abs(zmap) < 0.01)
+    m[:, :400] = False  # a part of the floor (a mask over most of the view is background)
     r, c = np.nonzero(m)
     det = Detection("bed", 0.8, "test", m, (c.min(), r.min(), c.max(), r.max()))
     v = View("a", T, 0.01, K_TABLE, z, rgb, [det])
@@ -221,7 +222,7 @@ def test_flickering_labels_and_ignore_masks(tmp_path: Path) -> None:
 
 
 def test_cut_masks_leave_extents_partial(tmp_path: Path) -> None:
-    sc = TableScene(items=[Item("shelf", [((-1.0, 2.3, 0.0), (1.0, 2.5, 2.0))])])
+    sc = TableScene(items=[Item("shelf", [((-1.0, 2.3, 0.8), (1.0, 2.5, 1.2))])])
     om = ObjectMap(tmp_path)
     om.update([view("a", (0.0, 1.2, 1.0), sc, target=(0.0, 3.0, 1.0))], 1, 0.0)
     assert om.records()["objects"] == []  # one sighting cut by the border: not listed yet
@@ -726,3 +727,36 @@ def test_a_fragment_at_the_border_is_the_object(tmp_path: Path) -> None:
 def test_produce_goes_together() -> None:
     assert ao.alike("apple", "orange") and ao.alike("tomato", "peach")
     assert not ao.alike("apple", "cup")
+
+
+def test_tiny_fragments_are_not_listed() -> None:
+    o = MapObject(1, {"wire": 1.0}, published=True,
+                  box=Box(np.zeros(3), np.array([0.02, 0.01, 0.01]), 0.0))
+    assert not ao.listed(o)
+    o.box = Box(np.zeros(3), np.array([0.04, 0.01, 0.01]), 0.0)
+    assert ao.listed(o)
+
+
+def test_background_and_robot_masks_are_dropped() -> None:
+    sc = TableScene(items=[Item("box", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.12))])])
+    v = view("a", EYES[0], sc)
+    whole = np.ones(v.depth.shape, bool)
+    v.dets = [Detection("tree", 0.4, "test", whole, (0.0, 0.0, 640.0, 480.0))]
+    assert ao.observe(v, 1, None) == []
+    near = view("b", (0.25, 0.225, TOP + 0.6), sc, target=(0.25, 0.225, TOP))
+    near.depth = np.full_like(near.depth, 0.08)
+    near.dets = [Detection("box", 0.9, "test", near.dets[0].mask, near.dets[0].box)]
+    assert ao.observe(near, 1, None) == []
+
+
+def test_a_low_score_detection_needs_a_second_view(tmp_path: Path) -> None:
+    sc = TableScene(items=[Item("plate", [((0.15, 0.15, TOP), (0.35, 0.3, TOP + 0.02))])])
+    om = ObjectMap(tmp_path)
+    v = view("a", EYES[0], sc)
+    v.dets = [Detection(d.label, 0.3, d.source, d.mask, d.box) for d in v.dets]
+    om.update([v], 1, 0.0)
+    assert om.records()["objects"] == []
+    w = view("b", EYES[1], sc)
+    w.dets = [Detection(d.label, 0.25, d.source, d.mask, d.box) for d in w.dets]
+    om.update([w], 2, 0.0)
+    assert [o["label"] for o in om.records()["objects"]] == ["plate"]

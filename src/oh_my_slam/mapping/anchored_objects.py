@@ -39,8 +39,10 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
 * **Moved.** A new object of a compatible label, similar size (``MOVE_SIZE``) and colour
   (``MOVE_RGB``) that appears in the update in which an object is struck takes that object's id:
   ``state: moved`` with ``moved_from_m`` its old centre.
-* **Published.** An object is listed once two keyframes detected it, or one did, whole (its mask
-  touching no image border), and no keyframe that had it in view saw its place without detecting
+* **Published.** Detections are kept from a score of 0.2 (``service.backend.MAP_MIN_SCORE``),
+  without masks over 40 % of the image (background) or nearer the camera than 12 cm (the robot).
+  An object is listed once two keyframes detected it, or one did, whole (its mask touching no
+  image border) and with a score of at least ``TRUSTED_SCORE``, and no keyframe that had it in view saw its place without detecting
   it; once listed it stays listed. A single
   detection that later keyframes see gone is dropped; two or more make it ``struck``.
 * **Boxes** are upright boxes (``segmentation.api.fit_object_obb``) fitted to the points of its
@@ -168,6 +170,10 @@ COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no dept
 # has SPECIFIC_SHARE of their votes, and they go with any label
 GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
 SPECIFIC_SHARE = 0.25
+MIN_OBJECT_M = 0.03
+TRUSTED_SCORE = 0.5  # a single detection lists an object only from this score
+MAX_MASK_SHARE = 0.4  # a mask over more of the image than this is the background
+NEAR_CAMERA_M = 0.12  # a detection nearer the camera than this is on the robot  # a box smaller than this on its longest side is a fragment, not listed
 PRODUCE = frozenset({"apple", "orange", "tomato", "peach", "lemon", "pear", "onion", "potato"})
 FRAGMENT_INSIDE = 0.5  # a border-cut detection with this share of its points in an object's box
 CUT_VOTE = 0.25  # (grown by MATCH_GROW_M) is that object; it votes with this share of its score
@@ -508,8 +514,10 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
     out = []
     for inst in insts:
         pts = np.asarray(inst.lifted.points, np.float64)
-        if len(pts) < 10:
-            continue
+        if len(pts) < 10 or inst.mask.mean() > MAX_MASK_SHARE:
+            continue  # too few points, or the background (a tree, a sign over the whole view)
+        if float(np.median(np.linalg.norm(pts - view.centre, axis=1))) < NEAR_CAMERA_M:
+            continue  # on the camera (a gripper, a lens hood)
         if floor_z is not None and on_the_floor(inst, UP, floor_z, FLOOR_BAND_M):
             continue
         rgb = robust_rgb(view.rgb, inst.mask) or [128.0, 128.0, 128.0]
@@ -848,7 +856,7 @@ class ObjectMap:
 
     def live(self) -> list[MapObject]:
         """The listed objects that are not struck."""
-        return [o for o in self.objects if o.published and o.state != "struck"]
+        return [o for o in self.objects if listed(o) and o.state != "struck"]
 
     # -- an update ------------------------------------------------------------------------------
 
@@ -911,8 +919,10 @@ class ObjectMap:
             if last >= 0 and o.id not in created:
                 o.state, o.moved_from = "confirmed", None  # seen again where it is
             # one sighting lists an object only whole in the image (no fragment at its border)
+            # and trusted (TRUSTED_SCORE); below that, two keyframes must detect it
             if not o.published and last >= 0 and (len(o.sightings) >= 2 or (
-                    o.misses == 0 and not o.sightings[0].truncated)):
+                    o.misses == 0 and not o.sightings[0].truncated
+                    and o.sightings[0].score >= TRUSTED_SCORE)):
                 o.published = True
         self.objects = [o for o in self.objects if o.id not in dropped]
         self._moves([o for o, _ in struck], created, version)
@@ -1109,7 +1119,7 @@ class ObjectMap:
         listed object and the surfaces, map frame."""
         out = []
         for o in sorted(self.objects, key=lambda o: o.id):
-            if not o.published or o.box is None:
+            if not listed(o):
                 continue
             out.append({
                 "id": o.id, "label": o.label, "detected_as": o.detected_as(),
@@ -1127,6 +1137,12 @@ class ObjectMap:
 
 
 # -- per-object summaries ------------------------------------------------------------------------
+
+
+def listed(o: MapObject) -> bool:
+    """Whether the objects read lists an object: published, with a box of at least
+    ``MIN_OBJECT_M`` on its longest side (a few pixels of a mask lifted are no object)."""
+    return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M
 
 
 def mean_rgb(o: MapObject) -> list[float]:
