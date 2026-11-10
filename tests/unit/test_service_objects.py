@@ -193,3 +193,23 @@ def test_detections_on_a_coarser_grid_than_the_depth(client: Client) -> None:
     assert job["state"] == "committed", job
     assert {g for _, g in client.backend.detected} == {(640, 480)}
     assert {"table", "box", "basket"} <= set(labels(client.get("/api/maps/b/objects", "Objects")))
+
+
+def test_views_from_above_are_looked_at_closer(client: Client) -> None:
+    """Keyframes looking down at the table top are looked at closer (the backend's
+    ``look_closer`` gets their raised areas); the other labels it gives a detection count as
+    evidence for the object's label."""
+    from oh_my_slam.segmentation.api import Detection
+
+    def closer(image: Path, regions: list[Any], dets: list[Detection]) -> list[Detection]:
+        return [Detection(d.label, d.score, d.source, d.mask, d.box,
+                          {"globe": 0.05} if d.label == "box" else {}) for d in dets]
+
+    client.backend.closer = closer
+    above = [(0.62, 0.42, TOP + 0.9), (0.58, 0.38, TOP + 0.95)]
+    fr, files = frames(client, "full", above, "u")
+    job = client.update("u", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "committed", job
+    assert client.backend.looked and all(boxes for _, boxes in client.backend.looked)
+    box = labels(client.get("/api/maps/u/objects", "Objects"))["box"]
+    assert box["detected_as"] == ["box"]

@@ -121,6 +121,8 @@ class FakeBackend:
     # sha256 of an image -> its detections (masks on any grid: resampled to the one asked)
     detections: dict[str, list[Any]] = field(default_factory=dict)
     detected: list[tuple[str, tuple[int, int]]] = field(default_factory=list)
+    looked: list[tuple[str, list[Any]]] = field(default_factory=list)
+    closer: Any = lambda image, regions, dets: dets
     detect_error: bool = False
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
@@ -200,6 +202,13 @@ class FakeBackend:
             out.append(Detection(d.label, d.score, d.source, m,
                                  (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
         return out
+
+    def look_closer(self, image: Path, regions: list[Any], dets: list[Any],
+                    grid: tuple[int, int]) -> list[Any]:
+        """``closer(image, regions, dets)``: a test's closer look (the detections as they are by
+        default)."""
+        self.looked.append((image.name, [r.box for r in regions]))
+        return list(self.closer(image, regions, dets))
 
     def _internal(self, sha: str) -> np.ndarray:
         T = self.truth[sha].copy()

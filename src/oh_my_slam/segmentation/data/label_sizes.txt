@@ -1,0 +1,112 @@
+# The typical shape of a class: "label: smallest largest [thin=T] [open]" - the range of the
+# largest side of its box in metres; thin=T: the most its smallest side measures (a flat class);
+# open: its top is lower inside than at its rim (a bowl, a plate, a cup), while a class without
+# the flag is closed on top (an apple, a mouse). A map object detected as several labels ranks
+# them by how well its measured box and relief fit each (segmentation.detect.label_fit): a mug's
+# rim seen from above is no satellite dish, a grey bowl no mirror. Only classes of a
+# well-bounded shape are listed; a class without a line fits any box.
+# produce and food
+apple: 0.05 0.12
+orange: 0.05 0.12
+lemon: 0.04 0.10
+pear: 0.05 0.15
+tomato: 0.03 0.12
+onion: 0.04 0.12
+potato: 0.04 0.16
+egg: 0.035 0.08
+banana: 0.10 0.26
+grape: 0.01 0.30
+carrot: 0.08 0.30
+broccoli: 0.08 0.25
+pineapple: 0.15 0.40
+watermelon: 0.18 0.50
+lettuce: 0.10 0.35
+bread: 0.08 0.70
+cake: 0.08 0.45
+pizza: 0.15 0.50
+sandwich: 0.06 0.30
+# tableware and kitchen items
+plate: 0.12 0.40 thin=0.05 open
+bowl: 0.06 0.45 open
+cup: 0.05 0.13 open
+mug: 0.07 0.15 open
+glass: 0.04 0.16 open
+wine glass: 0.05 0.25 open
+bottle: 0.04 0.45
+wine bottle: 0.06 0.40
+jar: 0.04 0.30
+teapot: 0.10 0.35
+kettle: 0.12 0.35
+pitcher: 0.08 0.35
+fork: 0.10 0.30 thin=0.03
+knife: 0.08 0.40 thin=0.03
+spoon: 0.08 0.30 thin=0.04
+chopsticks: 0.15 0.30 thin=0.02
+spatula: 0.15 0.45 thin=0.05
+ladle: 0.15 0.45
+salt shaker: 0.03 0.15
+pepper shaker: 0.03 0.25
+sponge: 0.04 0.20
+cutting board: 0.15 0.70 thin=0.06
+pan: 0.15 0.65 open
+pot: 0.12 0.60 open
+tray: 0.20 0.70 thin=0.08 open
+toaster: 0.15 0.45
+blender: 0.12 0.50
+microwave oven: 0.30 0.70
+# small objects
+computer mouse: 0.05 0.14 thin=0.05
+cell phone: 0.09 0.22 thin=0.03
+remote control: 0.10 0.30 thin=0.05
+credit card: 0.07 0.10 thin=0.01
+key: 0.03 0.12
+wallet: 0.07 0.25 thin=0.05
+watch: 0.03 0.30
+glasses: 0.10 0.18
+sunglasses: 0.10 0.18
+pen: 0.08 0.20
+scissors: 0.10 0.35
+stapler: 0.10 0.25
+calculator: 0.08 0.25
+toothbrush: 0.12 0.25
+soap: 0.04 0.15
+candle: 0.02 0.40
+keyboard: 0.25 0.60 thin=0.06
+laptop: 0.25 0.50 thin=0.06
+book: 0.10 0.50 thin=0.10
+notebook: 0.10 0.40 thin=0.04
+envelope: 0.10 0.40 thin=0.02
+paper: 0.10 1.0 thin=0.01
+tablet computer: 0.15 0.35 thin=0.03
+globe: 0.15 0.60
+vase: 0.08 0.80
+clock: 0.10 0.60 thin=0.10
+lamp: 0.20 1.0
+table lamp: 0.20 1.0
+sink: 0.30 1.20 open
+toilet: 0.35 0.85 open
+bathtub: 1.2 2.0 open
+trash can: 0.20 0.80 open
+bucket: 0.20 0.45 open
+basket: 0.15 0.70 open
+# flat things that stand or hang
+mirror: 0.20 2.5 thin=0.06
+picture frame: 0.10 1.5 thin=0.06
+painting: 0.15 3.0 thin=0.08
+poster: 0.20 2.0 thin=0.02
+# large objects
+satellite dish: 0.30 4.0 open
+car: 2.5 6.0
+taxi: 2.5 6.0
+van: 3.5 7.0
+bus: 7.0 20.0
+truck: 4.0 20.0
+bicycle: 1.0 2.2
+motorcycle: 1.5 2.8
+sofa: 1.0 4.0
+bed: 1.2 2.6
+refrigerator: 0.5 2.2
+washing machine: 0.5 1.0
+dishwasher: 0.5 1.0
+door: 0.6 2.6
+person: 0.4 2.2

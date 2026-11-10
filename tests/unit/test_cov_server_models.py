@@ -587,6 +587,9 @@ def test_yoloe_detections_on_the_image_grid(yoloe: sy.YoloeSegmenter) -> None:
     model.result = _result(full, [[7, 5, 13, 9]], [0.9], [0])
     (det,) = yoloe.detect_array(rgb, ["cup", "bowl"], 0.05, 0.6, 1024)
     np.testing.assert_array_equal(det["mask_array"], full[0] > 0.5)
+    # every label of a candidate: class-wise selection
+    yoloe.detect_array(rgb, ["cup", "bowl"], 0.05, 0.6, 1024, per_label=True)
+    assert model.events[-1][2]["agnostic_nms"] is False
 
 
 def test_yoloe_nothing_detected(yoloe: sy.YoloeSegmenter) -> None:

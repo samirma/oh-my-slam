@@ -147,6 +147,9 @@ class SegmentRequest(BaseModel):
     conf: float = 0.05  # score pre-filter
     iou: float = 0.6
     imgsz: int = 1024
+    # every label a candidate scores above ``conf``, as instances of their own (the same box and
+    # mask), instead of its best label alone (class-agnostic selection)
+    per_label: bool = False
 
 
 class Instance(BaseModel):

@@ -17,7 +17,10 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   flickering label) only from ``MATCH_ANY``; a detection cut by the image border with half its
   points within an object's grown box is that object, whatever its label (a fragment of it), and
   votes for its label with a quarter of its score; round produce the detector confuses
-  (``PRODUCE``) goes together. The label is the most voted, a specific one first
+  (``PRODUCE``) goes together. The label has the most evidence (``MapObject.evidence``: the
+  scores of the sightings detected as it and those the detector gave the others under it,
+  ``Detection.alternatives``), weighted by how well the box and its relief seen from above
+  (``relief``) fit the class (``segmentation.api.label_fit``), a specific one first
   (``MapObject.label``). An unmatched
   observation starts a new object, its id the next of ``next_id`` (never reused).
 * **Latest wins** (map.md §3). Every object that a keyframe has in view (``IN_VIEW_SHARE`` of its
@@ -96,6 +99,7 @@ from oh_my_slam.segmentation.api import (
     Detection,
     compatible,
     fit_object_obb,
+    label_fit,
     lift_on_grid,
     on_the_floor,
     surface_label,
@@ -170,10 +174,22 @@ COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no dept
 # has SPECIFIC_SHARE of their votes, and they go with any label
 GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
 SPECIFIC_SHARE = 0.25
-MIN_OBJECT_M = 0.03
+# relief (``relief``): of an object at most RELIEF_MAX_M across, seen from above (a ray within
+# 45 degrees of down) in RELIEF_VIEWS sightings, its top inside (RELIEF_INNER of its half
+# footprint) against its rim (from RELIEF_RIM): lower by RELIEF_M or RELIEF_SHARE of its height
+# is "open", higher by as much "closed"
+RELIEF_MAX_M = 0.6
+RELIEF_DOWN = 0.7
+RELIEF_VIEWS = 1
+RELIEF_INNER = 0.4
+RELIEF_RIM = 0.6
+RELIEF_M = 0.01
+RELIEF_SHARE = 0.25
+RELIEF_MIN_POINTS = 10
+MIN_OBJECT_M = 0.03  # a box smaller than this on its longest side is a fragment, not listed
 TRUSTED_SCORE = 0.5  # a single detection lists an object only from this score
 MAX_MASK_SHARE = 0.4  # a mask over more of the image than this is the background
-NEAR_CAMERA_M = 0.12  # a detection nearer the camera than this is on the robot  # a box smaller than this on its longest side is a fragment, not listed
+NEAR_CAMERA_M = 0.12  # a detection nearer the camera than this is on the robot
 PRODUCE = frozenset({"apple", "orange", "tomato", "peach", "lemon", "pear", "onion", "potato"})
 FRAGMENT_INSIDE = 0.5  # a border-cut detection with this share of its points in an object's box
 CUT_VOTE = 0.25  # (grown by MATCH_GROW_M) is that object; it votes with this share of its score
@@ -343,25 +359,49 @@ class MapObject:
     supported_by: dict[str, Any] | None = None
     inside_of: dict[str, Any] | None = None
     struck_version: int | None = None
+    # the scores the detector gave its sightings under the labels they were not detected as
+    # (``Detection.alternatives``), summed: label -> score
+    others: dict[str, float] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
-        """The label with the most votes, the specific ones first: a specific label with at
-        least ``SPECIFIC_SHARE`` of the leading generic one's votes wins (an apple also scored
-        as a ball or a fruit is an apple)."""
-        best = max(sorted(self.votes), key=lambda k: self.votes[k])
-        specific = [k for k in sorted(self.votes) if k not in GENERIC_LABELS]
+        """The label with the most evidence (``evidence``), the specific ones first: a specific
+        label with at least ``SPECIFIC_SHARE`` of the leading generic one's evidence wins (an
+        apple also scored as a ball or a fruit is an apple)."""
+        ev = self.evidence()
+        best = max(sorted(ev), key=lambda k: ev[k])
+        specific = [k for k in sorted(ev) if k not in GENERIC_LABELS]
         if not specific or best not in GENERIC_LABELS:
             return best
-        top = max(specific, key=lambda k: self.votes[k])
-        return top if self.votes[top] >= SPECIFIC_SHARE * self.votes[best] else best
+        top = max(specific, key=lambda k: ev[k])
+        return top if ev[top] >= SPECIFIC_SHARE * ev[best] else best
+
+    def evidence(self) -> dict[str, float]:
+        """Each label's evidence: the scores of the sightings detected as it (``votes``) and
+        those the detector gave the other sightings under it (``others``: label scores), summed
+        over the views, times how well the object's box and relief fit the label
+        (``segmentation.api.label_fit``: a mug's rim seen from above, scored as a satellite dish,
+        defers to the cup it was also scored as)."""
+        ev = {k: self.votes.get(k, 0.0) + self.others.get(k, 0.0)
+              for k in sorted(set(self.votes) | set(self.others))}
+        if self.box is None or len(ev) < 2:
+            return ev
+        seen = extent_seen(self)
+        whole = seen["x"] == "full" and seen["y"] == "full"
+        size = (float(self.box.size[0]), float(self.box.size[1]), float(self.box.size[2]))
+        shape = relief(self)
+        return {k: v * label_fit(k, size, whole, shape) for k, v in ev.items()}
 
     @property
     def score(self) -> float:
         return max((s.score for s in self.sightings), default=0.0)
 
     def detected_as(self) -> list[str]:
-        return sorted(self.votes, key=lambda k: (-self.votes[k], k))
+        """The labels it was detected as, most votes first; the label chosen first when only
+        the label scores (``others``) gave it."""
+        out = sorted(self.votes, key=lambda k: (-self.votes[k], k))
+        label = self.label
+        return out if label in out else [label, *out]
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "votes": self.votes,
@@ -371,7 +411,8 @@ class MapObject:
                 "last_seen_version": self.last_seen_version, "published": self.published,
                 "misses": self.misses, "supported_by": self.supported_by,
                 "inside_of": self.inside_of, "struck_version": self.struck_version,
-                "contradicted": self.contradicted, "last_verdict": self.last_verdict}
+                "contradicted": self.contradicted, "last_verdict": self.last_verdict,
+                "others": self.others}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> MapObject:
@@ -385,7 +426,8 @@ class MapObject:
                          supported_by=d["supported_by"], inside_of=d["inside_of"],
                          struck_version=d["struck_version"],
                          contradicted=int(d.get("contradicted", 0)),
-                         last_verdict=d.get("last_verdict"))
+                         last_verdict=d.get("last_verdict"),
+                         others={k: float(v) for k, v in d.get("others", {}).items()})
 
 
 @dataclass
@@ -397,6 +439,7 @@ class Observation:
     points: Array
     mask: NDArray[np.bool_]
     sighting: Sighting
+    alternatives: dict[str, float] = field(default_factory=dict)
 
     @property
     def centre(self) -> Array:
@@ -534,7 +577,7 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
                      inst.detection.label, round(float(inst.detection.score), 4),
                      view.depth_rel, round(behind, 4), round(mask_range, 4))
         out.append(Observation(inst.detection.label, float(inst.detection.score), pts,
-                               inst.mask, s))
+                               inst.mask, s, dict(inst.detection.alternatives)))
     return out
 
 
@@ -937,8 +980,10 @@ class ObjectMap:
     def _add(self, o: MapObject, ob: Observation, version: int, floor_z: float | None) -> None:
         # a detection cut by the image border votes for its label with CUT_VOTE of its score:
         # the label of a whole view wins
-        w = ob.score * (CUT_VOTE if ob.sighting.truncated else 1.0)
-        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + w, 4)
+        cut = CUT_VOTE if ob.sighting.truncated else 1.0
+        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + ob.score * cut, 4)
+        for alt, v in ob.alternatives.items():
+            o.others[alt] = round(o.others.get(alt, 0.0) + v * cut, 4)
         o.sightings.append(ob.sighting)
         k = len(o.sightings) - 1
         pts = _thin(ob.points).astype(np.float32)
@@ -983,6 +1028,8 @@ class ObjectMap:
             old.sightings, old.points, old.source = n.sightings, n.points, n.source
             old.box = n.box
             old.votes = {k: old.votes.get(k, 0.0) + v for k, v in n.votes.items()}
+            old.others = {k: old.others.get(k, 0.0) + n.others.get(k, 0.0)
+                          for k in sorted(set(old.others) | set(n.others))}
             old.last_seen_version = version
             old.misses = 0
             self.objects.remove(n)
@@ -1143,6 +1190,27 @@ def listed(o: MapObject) -> bool:
     """Whether the objects read lists an object: published, with a box of at least
     ``MIN_OBJECT_M`` on its longest side (a few pixels of a mask lifted are no object)."""
     return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M
+
+
+def relief(o: MapObject) -> str | None:
+    """``"open"``, ``"closed"`` or None (unknown) for the top of an object seen from above (see
+    ``RELIEF_MAX_M``): its points inside the footprint against those at its rim."""
+    if o.box is None or float(np.max(o.box.size[:2])) > RELIEF_MAX_M or \
+            sum(s.ray[2] <= -RELIEF_DOWN for s in o.sightings) < RELIEF_VIEWS:
+        return None
+    local = (np.asarray(o.points, np.float64) - o.box.centre) @ o.box.R
+    half = np.maximum(o.box.size[:2] / 2, 1e-6)
+    r = np.hypot(local[:, 0] / half[0], local[:, 1] / half[1])
+    inner, rim = local[r < RELIEF_INNER, 2], local[(r >= RELIEF_RIM) & (r <= 1.0), 2]
+    if len(inner) < RELIEF_MIN_POINTS or len(rim) < RELIEF_MIN_POINTS:
+        return None
+    step = max(RELIEF_M, RELIEF_SHARE * float(o.box.size[2]))
+    top = float(np.percentile(rim, 90))
+    if float(np.median(inner)) < top - step:
+        return "open"
+    if float(np.median(inner)) > float(np.median(rim)) + step:
+        return "closed"
+    return None
 
 
 def mean_rgb(o: MapObject) -> list[float]:

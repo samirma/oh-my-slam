@@ -279,10 +279,42 @@ called by `service.prior_first` after the engine placed and fused the update's k
   orange), and votes for its label with a quarter of its score; one cut detection alone is not
   listed until another view confirms it. Round produce the detector confuses (apple, orange,
   tomato, peach, lemon, pear, onion, potato) is associated together.
-* **Labels.** Generic labels (`ball`, `food`, `fruit`, `vegetable`, `toy`, `container`) match
-  any label and never outvote a specific one that has a quarter of their votes; the vocabulary
-  has the simulated kitchens' items (lettuce, spatula, ladle, salt and pepper shakers, sponge,
-  spray bottle, credit card, besides the produce and tableware it had).
+* **Views from above** (`segmentation.regions`, `segmentation.api.look_closer`, called from
+  `service.prior_first.fuse_objects`). A keyframe whose optical axis is within 45° of straight
+  down and whose depth has a dominant support (30 % of its samples within ±1 cm of one height)
+  is looked at closer, with two more detector calls:
+  * **Raised areas.** Its depth finds what stands on the support: areas raised by more than
+    max(8 mm, 2 × the depth's relative noise × the depth) and at most 0.4 m, holes filled (the
+    inside of a plate's rim or of a mug), not on the robot (nearer than 15 cm, or a fifth of
+    the outline touching that), of 300 px to 0.6 m. An area the frame's detections cover less
+    than half of is shown to the detector as a crop around it (grown by a quarter of its
+    size, 128 px at least, upsampled to the detector's 1024 px input). A crop detection is
+    kept only when 60 % of its mask lies on the raised area, so the support's texture is never
+    named, and only when the frame has no detection there yet.
+  * **Label scores.** One class-wise pass (`SegmentRequest.per_label`: every label a
+    candidate scores from 0.05, not only its best) gives each detection the other labels the
+    detector scores it as (`Detection.alternatives`; an instance overlapping it by IoU 0.7 is
+    the same candidate under another label).
+* **Labels.** An object's label is the one with the most **evidence**: the scores of the
+  sightings detected as it (`votes`; a cut view counts a quarter) plus the scores the detector
+  gave its other sightings under it (`others`, from the label scores), summed over the views.
+  Each label's evidence is weighted by how well the object fits the class
+  (`segmentation.detect.label_fit`, `data/label_sizes.txt`):
+  * the largest side of the box against the class's typical range (the lower bound halved
+    while its sides were not all seen across), and the smallest side against a flat class's
+    thickness (a mirror, an envelope, a mouse); a box that misses by a factor f counts 1/f²;
+  * the relief its depth shows from above (`anchored_objects.relief`, objects up to 0.6 m
+    seen by a ray within 45° of down). The top inside 40 % of the half-footprint against the
+    rim from 60 %: lower by max(1 cm, a quarter of the height) is `open` (a bowl, a plate, a
+    cup), higher by as much is `closed` (an apple, a mouse). A class of the other kind counts
+    0.3.
+
+  A class without a typical shape fits any box. Generic labels (`ball`, `food`, `fruit`,
+  `vegetable`, `toy`, `container`) match any label and never outweigh a specific one that has a
+  quarter of their evidence. `detected_as` lists the labels detected, most votes first, and the
+  label chosen first when only the label scores gave it. The vocabulary has the simulated
+  kitchens' items (lettuce, spatula, ladle, salt and pepper shakers, sponge, spray bottle,
+  credit card, besides the produce and tableware it had).
 * **Fields.** `mean_rgb`: the pixel-weighted mean of the robust mean colours (inner mask, 10-90 %
   luminance) of the 3 sightings that saw it best (uncut masks first, then largest). `color`: the
   id's display colour. `sigma_centre_m`: the sightings' pose sigma and depth noise (1 % sensor,
@@ -327,6 +359,36 @@ inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `n
   including the detections it waits for. The objects read: 1-2 ms once the version's answer is
   kept; 0.6-2.6 s when it arrives before the derivation worker has derived the version (the read
   derives it).
+* **Arm's view from above** (`e053_evidence`, a rendered kitchen worktop: an arm-mounted
+  RGB-D camera at 640 × 360 looking straight down from 0.35 m, metric priors, 10 keyframes in
+  3 updates). The objects were replayed offline from the map's stored keyframes (images, depth,
+  poses) with the shared inference server, 2026-11-10. Label agreement counts a label the same
+  as or compatible with the true one; the centre error is the horizontal distance to the true
+  base position:
+
+  | object | main build (served) | + O8 merge | + views from above, evidence, fit |
+  |---|---|---|---|
+  | apple | apple, 0.4 cm | apple, 0.4 cm | apple, 0.4 cm |
+  | egg | egg, 0.7 cm | egg, 0.4 cm | egg, 0.4 cm |
+  | plate | missed | plate, 0.5 cm | plate, 0.5 cm |
+  | bowl | missed | mirror, 1.3 cm | **bowl**, 1.3 cm |
+  | mug | satellite dish, 5.4 cm | computer mouse, 1.3 cm | **cup** (compatible), 1.3 cm |
+  | tomato | apple, 0.6 cm | apple, 0.6 cm | apple, 0.6 cm |
+  | not there | a 2 cm wire | — | — |
+  | **agreement** | 2/6 = 0.33 | 3/6 = 0.50 | **5/6 = 0.83** (4/6 exact) |
+
+  The bowl is a mirror on every frame (0.61, 0.52) and the detector's bowl score is 0.12 at
+  best. The mirror does not fit an 8 cm-thick box with an open top (0.08 of evidence against the
+  bowl's 0.12). The mug is a cup at 0.48 in its one uncut view; as a satellite dish (0.65) it
+  is a third of a dish's least size, and as a mouse (0.68, cut by the border) it is twice a
+  mouse's height and open. The tomato stays an apple: the detector scores it as an apple in
+  all three views (0.85, 0.68, 0.56) and as a tomato at 0.33, 0.07 and 0.29. Its size (8.6 cm)
+  and relief fit both classes, so neither prior can tell them apart. The closer looks at raised
+  areas added nothing on this map: the plate's crop is a mirror off its rim (26 % on the raised
+  area). The serving inference server predates `per_label`, so the label scores were emulated
+  with removal rounds (6 rounds, each without the labels that won a candidate in the round
+  before). That is a lower bound of the class-wise pass: a label that won another candidate is
+  missing.
 * **Synthetic worktop** (an arm's view from above at 640 × 360, depth noise 1 % + 3 mm): the
   worktop within 1 cm, the apple, egg, plate and mug bottoms on it within 1 cm, the tomato
   `supported_by` the plate.

@@ -39,7 +39,11 @@ from oh_my_slam.mapping.anchored_objects import (
     ObjectMap,
     View,
 )
-from oh_my_slam.segmentation.api import Detection
+from oh_my_slam.segmentation.api import (
+    Detection,
+    Region,
+    raised_regions,
+)
 from oh_my_slam.service import register_ma
 from oh_my_slam.service.anchor import Sim3
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
@@ -50,6 +54,10 @@ if TYPE_CHECKING:
 
     from oh_my_slam.service.jobs import Job
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
+
+    # the closer look at a keyframe looking down at its support (image, raised areas,
+    # detections, grid): its detections, more and with their other labels
+    Closer = Callable[[Path, list[Region], list[Detection], tuple[int, int]], list[Detection]]
 
 INFERENCE_IN_FLIGHT = 2
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
@@ -145,10 +153,11 @@ def _on_grid(a: NDArray[Any], shape: tuple[int, int], interp: int) -> NDArray[An
 
 
 def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[list[Detection]]]],
-                 version: int) -> tuple[ObjectMap, int]:
+                 version: int, closer: Closer) -> tuple[ObjectMap, int]:
     """The objects of the new keyframes (``mapping.anchored_objects``), fused in request order
     into the map's: struck objects carved from the cloud, then the surfaces and relations.
-    Returns the objects and how many are listed."""
+    ``closer`` looks closer at a keyframe looking down at its support
+    (``segmentation.api.raised_regions``; the backend's ``look_closer``). Returns the objects and how many are listed."""
     om = ObjectMap.load(am.root)
     by_id = {k.id: k for k in am.keyframes}
     views = []
@@ -167,9 +176,14 @@ def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[l
                                   (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
         ignore = None if fr.ignore is None else _on_grid(
             fr.ignore.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+        rel = SENSOR_DEPTH_REL if kf.depth_kind == "sensor" else MONO_DEPTH_REL
+        regions = raised_regions(kf.grid, kf.K_grid, kf.T, rel,
+                                 None if ignore is None else ~ignore)
+        if regions:  # a view looking down at its support
+            assert fr.path is not None  # a frame kept has its image
+            dets = closer(fr.path, regions, dets, (shape[1], shape[0]))
         views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, kf.grid,
-                          _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore,
-                          SENSOR_DEPTH_REL if kf.depth_kind == "sensor" else MONO_DEPTH_REL))
+                          _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore, rel))
     floor, _ = am.floor_and_bounds()
     struck = om.update(views, version, floor)
     if struck:
@@ -283,7 +297,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             t = time.perf_counter()
             version = (prev["version"] + 1) if prev else 1
             om, n_objects = fuse_objects(am, [(fr, placements[fr.work.index], dets[fr.work.index])
-                                              for fr in todo], version)
+                                              for fr in todo], version, up.backend.look_closer)
             tm["objects"] = round(time.perf_counter() - t, 3)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)

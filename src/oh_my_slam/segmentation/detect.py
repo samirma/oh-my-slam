@@ -20,7 +20,8 @@ the higher floor."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -28,12 +29,13 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from PIL import Image
 
 from oh_my_slam.client import protocol as p
 from oh_my_slam.client.client import InferenceClient, connect
 from oh_my_slam.core import rle, timing
 from oh_my_slam.core.constants import DEFAULT_MIN_SCORE as DEFAULT_MIN_SCORE
-from oh_my_slam.core.images import size_at_max_side, upright_size
+from oh_my_slam.core.images import load_rgb, size_at_max_side, upright_size
 
 # Score floor requested from the server for a --min-score below TRUSTED_SCORE; a --min-score below
 # this floor is requested as such, since it drops only the detections below it (spec §2.4; the
@@ -246,6 +248,61 @@ def label_of(name: str) -> str:
     return _labels_of_prompts().get(name, name)
 
 
+@dataclass(frozen=True)
+class Typical:
+    """A class's typical shape (``data/label_sizes.txt``): the range of its box's largest side,
+    the most its smallest side measures (a flat class; None: any), whether its top is open."""
+
+    lo: float
+    hi: float
+    thin: float | None = None
+    open: bool = False
+
+
+@cache
+def _typical() -> dict[str, Typical]:
+    text = (resources.files("oh_my_slam.segmentation") / "data" / "label_sizes.txt").read_text()
+    out: dict[str, Typical] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            label, _, spec = line.partition(":")
+            lo, hi, *flags = spec.split()
+            thin = next((float(f[5:]) for f in flags if f.startswith("thin=")), None)
+            out[normalize_label(label)] = Typical(float(lo), float(hi), thin, "open" in flags)
+    return out
+
+
+# How well a measured box fits a class (``label_fit``): 1 within its typical shape, else the
+# factor by which it misses, to the power FIT_POWER, inverted (a box 1.5 times too large: 0.44;
+# a mug's 10 cm rim as a satellite dish of 30 cm at least: 0.11). A box whose sides are not all
+# seen whole may be up to PARTIAL_SLACK times smaller than the object (cut by the image border).
+# The relief measured from depth (``"open"``: a top lower inside than at its rim, a bowl, a plate;
+# ``"closed"``: higher inside, an apple) that contradicts the class's counts SHAPE_MISS.
+FIT_POWER = 2.0
+PARTIAL_SLACK = 2.0
+SHAPE_MISS = 0.3
+
+
+def label_fit(label: str, size_m: tuple[float, float, float], whole: bool,
+              relief: str | None = None) -> float:
+    """How well an object whose box measures ``size_m`` (any order; ``whole``: its horizontal
+    sides were seen across) with ``relief`` (``"open"``, ``"closed"`` or None: unknown) fits a
+    ``label``, in (0, 1]; a class without a typical shape fits any."""
+    t = _typical().get(normalize_label(label))
+    if t is None:
+        return 1.0
+    big, small = max(size_m), min(size_m)
+    lo = t.lo if whole else t.lo / PARTIAL_SLACK
+    miss = max(lo / max(big, 1e-6), big / t.hi, 1.0)
+    if t.thin is not None:
+        miss *= max(small / t.thin, 1.0)
+    fit = miss ** -FIT_POWER
+    if relief is not None and (relief == "open") != t.open:
+        fit *= SHAPE_MISS
+    return float(fit)
+
+
 def compatible(a: str, b: str) -> bool:
     a, b = normalize_label(a), normalize_label(b)
     return a == b or any(a in g and b in g for g in COMPATIBLE_GROUPS)
@@ -258,6 +315,8 @@ class Detection:
     source: str
     mask: NDArray[np.bool_]
     box: tuple[float, float, float, float]
+    # the other labels the detector scores this candidate as (``label_scores``): label -> score
+    alternatives: dict[str, float] = field(default_factory=dict)
 
     @property
     def area(self) -> int:
@@ -404,6 +463,94 @@ def _detect_pass(image_path: Path, side: int, min_score: float, floor: float,
                               (float(b[0]) * sx, float(b[1]) * sy, float(b[2]) * sx,
                                float(b[3]) * sy)))
     return dets
+
+
+# Closer looks (``detect_regions``): a crop around a candidate place (``segmentation.regions``)
+# grown by CROP_MARGIN of its size on each side (CROP_MIN_PX at least, in image pixels), shown to
+# the detector as a pass is (upsampled to DETECT_SIDE), so a small or low-contrast object fills
+# its input instead of a fraction of the frame.
+CROP_MARGIN = 0.25
+CROP_MIN_PX = 128
+
+
+def detect_regions(image_path: Path, boxes: list[tuple[int, int, int, int]],
+                   grid: tuple[int, int], client: InferenceClient, min_score: float
+                   ) -> list[list[Detection]]:
+    """The detections of a crop of the image around each box (x0, y0, x1, y1 on ``grid``,
+    width x height), masks and boxes on ``grid``; each crop's own detections, ``priority``
+    order."""
+    if not boxes:
+        return []
+    rgb = load_rgb(Path(image_path))
+    h, w = rgb.shape[:2]
+    sx, sy = w / grid[0], h / grid[1]
+    out = []
+    with tempfile.TemporaryDirectory(prefix="oms-crop-") as tmp, timing.part("segmentation"):
+        for k, (bx0, by0, bx1, by1) in enumerate(boxes):
+            x0, x1, y0, y1 = bx0 * sx, (bx1 + 1) * sx, by0 * sy, (by1 + 1) * sy
+            side = max(x1 - x0, y1 - y0)
+            pad = max(CROP_MARGIN * side, (CROP_MIN_PX - side) / 2, 0.0)
+            cx0, cy0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
+            cx1, cy1 = min(w, int(np.ceil(x1 + pad))), min(h, int(np.ceil(y1 + pad)))
+            path = Path(tmp) / f"crop{k}.png"
+            Image.fromarray(rgb[cy0:cy1, cx0:cx1]).save(path)
+            res = client.segment_image(p.SegmentRequest(
+                image_path=str(path), labels=list(default_prompts()), max_side=DETECT_SIDE,
+                imgsz=DETECT_SIDE, conf=max(min_score - 1e-6, 0.0)))
+            dets = []
+            for inst in res.instances:
+                label = label_of(inst.label)
+                score = float(np.clip(inst.score, 0.0, 1.0))
+                if label in BACKGROUND_LABELS or score < min_score:
+                    continue
+                full = np.zeros((h, w), bool)
+                full[cy0:cy1, cx0:cx1] = resample_mask(rle.decode(inst.mask),
+                                                       (cx1 - cx0, cy1 - cy0))
+                mask = resample_mask(full, grid)
+                if mask.sum() < MIN_AREA_PX:
+                    continue
+                b = inst.box_xyxy
+                fx, fy = (cx1 - cx0) / res.width, (cy1 - cy0) / res.height
+                dets.append(Detection(label, score, inst.source, mask, (
+                    (cx0 + b[0] * fx) / sx, (cy0 + b[1] * fy) / sy,
+                    (cx0 + b[2] * fx) / sx, (cy0 + b[3] * fy) / sy)))
+            out.append(order(dedupe(dets)))
+    return out
+
+
+# Label scores (``label_scores``): the detector shown the image as the fine pass is, every label
+# a candidate scores from ALT_FLOOR reported (class-wise selection, ``per_label``); an instance
+# whose mask overlaps a detection's by ALT_IOU is that candidate under another label (the same
+# box and mask: one candidate, several labels). Scores are independent per prompt (Vocabulary),
+# so these are the scores the detector gives the object under each label.
+ALT_FLOOR = 0.05
+ALT_IOU = 0.7
+
+
+def label_scores(image_path: Path, dets: list[Detection], grid: tuple[int, int],
+                 client: InferenceClient) -> list[Detection]:
+    """``dets`` (masks on ``grid``) with the other labels the detector scores each as
+    (``Detection.alternatives``, from ``ALT_FLOOR``)."""
+    if not dets:
+        return []
+    res = client.segment_image(p.SegmentRequest(
+        image_path=str(Path(image_path).resolve()), labels=list(default_prompts()),
+        max_side=DETECT_SIDE, imgsz=DETECT_SIDE, conf=ALT_FLOOR - 1e-6, per_label=True))
+    cands = []
+    for inst in res.instances:
+        label = label_of(inst.label)
+        if label not in BACKGROUND_LABELS:
+            cands.append((label, float(np.clip(inst.score, 0.0, 1.0)),
+                          resample_mask(rle.decode(inst.mask), grid)))
+    out = []
+    for d in dets:
+        alt: dict[str, float] = {}
+        for label, score, mask in cands:
+            if label != d.label and score > alt.get(label, 0.0) and \
+                    mask_iou(d.mask, mask) >= ALT_IOU:
+                alt[label] = round(score, 4)
+        out.append(Detection(d.label, d.score, d.source, d.mask, d.box, alt))
+    return out
 
 
 def resample_mask(mask: NDArray[np.bool_], grid: tuple[int, int]) -> NDArray[np.bool_]:
