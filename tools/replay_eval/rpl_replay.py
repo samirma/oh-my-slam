@@ -76,7 +76,7 @@ class LocateObs:
     names: list[str]
     response: dict[str, Any]
     seconds: float
-    source: str  # agent | fallback
+    source: str  # plan | fallback
 
 
 @dataclass
@@ -288,7 +288,7 @@ class Replayer:
             _, s = self.analyse(self.probe_frame)
             self.rec.idle_analyse_s.append(s)
 
-    def agent_locate(self, frames: list[Frame], source: str) -> None:
+    def plan_locate(self, frames: list[Frame], source: str) -> None:
         try:
             res, s = self.locate(frames)
         except ApiError as e:
@@ -318,7 +318,7 @@ class Replayer:
                     self.anchor_run = frames[0].run
                 self.rec.jobs.append(self.update(event, frames))
             elif "O5" in self.caps and self.anchor_run is not None:
-                self.agent_locate(frames, "agent")
+                self.plan_locate(frames, "plan")
         self.rec.timings_s["replay_s"] = time.monotonic() - t0
         t1 = time.monotonic()
         if self.rec.jobs and any(j.job.get("result_version") for j in self.rec.jobs):
@@ -337,11 +337,11 @@ class Replayer:
         self.rec.summary = summary
         frames = self.read_frames(None)
         keyframes = [r for r in frames["frames"] if r["name"] in self.by_name]
-        if "O5" in self.caps and not any(lo.source == "agent" for lo in self.rec.locates):
+        if "O5" in self.caps and not any(lo.source == "plan" for lo in self.rec.locates):
             kept = {r["name"] for r in keyframes}
             rest = [self.by_name[n] for n in self.rec.sent if n not in kept]
             for i in range(0, len(rest), self.opt.locate_batch):
-                self.agent_locate(rest[i:i + self.opt.locate_batch], "fallback")
+                self.plan_locate(rest[i:i + self.opt.locate_batch], "fallback")
         if "O6" in self.caps:
             lo, hi = self.opt.z_band_m
             self.rec.grid_band = (lo, hi)

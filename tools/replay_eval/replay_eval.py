@@ -2,7 +2,7 @@
 """Replay evaluator of oh-my-slam (specs/evaluation.md): replays recorded robot-guide episodes
 against a running service's public HTTP API and measures the targets against the simulator truth.
 
-Standalone: Python 3.12 standard library, numpy and requests (jsonschema optional). It imports
+Standalone: Python 3.11+ standard library, numpy and requests (jsonschema optional). It imports
 nothing from the service. See README.md beside this file.
 """
 

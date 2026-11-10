@@ -104,14 +104,14 @@ def test_locates_before_the_map_and_new_versions(ep: Any) -> None:
         raise err("map_not_found", 404)
 
     r = replayer(ep, missing)
-    r.agent_locate(frames[:1], "agent")
+    r.plan_locate(frames[:1], "plan")
     assert "locate before the map exists" in r.rec.warnings[0]
 
     def broken(method: str, path: str, route: str, kw: dict[str, Any]) -> Any:
         raise err("internal", 500)
 
     with pytest.raises(ApiError):
-        replayer(ep, broken).agent_locate(frames[:1], "agent")
+        replayer(ep, broken).plan_locate(frames[:1], "plan")
 
     def located(method: str, path: str, route: str, kw: dict[str, Any]) -> Any:
         seen.append(route)
@@ -120,9 +120,9 @@ def test_locates_before_the_map_and_new_versions(ep: Any) -> None:
         return frames_body(3)
 
     r = replayer(ep, located)
-    r.agent_locate(frames[:1], "agent")
+    r.plan_locate(frames[:1], "plan")
     assert seen == ["POST locate", "GET frames"] and 3 in r.rec.frames
-    r.agent_locate(frames[:1], "agent")
+    r.plan_locate(frames[:1], "plan")
     assert seen[-1] == "POST locate"
 
 
@@ -138,7 +138,7 @@ def test_run_delete_errors_and_empty_events(ep: Any) -> None:
         deletes.append(1)
         raise err("map_not_found", 404)
 
-    ep.events = [Event("update", "r1/start", ["nothing.jpg"], 1)]
+    ep.events = [Event("update", "r1/start", ["nothing.jpg"])]
     rec = replayer(ep, handler).run()
     assert rec.jobs == [] and len(deletes) == 2
     assert rec.warnings == ["delete: HTTP 404 map_not_found: map_not_found"]
@@ -147,7 +147,7 @@ def test_run_delete_errors_and_empty_events(ep: Any) -> None:
 def test_fallback_locates_and_single_version(tmp_path: Path) -> None:
     root = tmp_path / "eps"
     sets = [synth.SetSpec("r1", "start", [(0, 0, 0), (0.2, 0, 0), (0.4, 0, 0), (0.6, 0, 0)])]
-    syn = synth.build(root, sets=sets, requests=[{"cmd": "mapper.sh update r1/start"}])
+    syn = synth.build(root, sets=sets)  # four frames: nothing held out, no locate set
     rej = syn.names["r1/start"][1]
     cfg = Config(truth=syn.truth, metric_sim=Sim(1.0, 0.0, tuple(syn.start["r1"][:3, 3])),
                  reject={rej: "blur"}, capabilities=["O1", "O2", "O4", "O5"],

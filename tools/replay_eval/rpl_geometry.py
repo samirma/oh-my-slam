@@ -131,3 +131,24 @@ def umeyama(src: Arr, dst: Arr, min_ratio: float = 1e-3) -> tuple[Sim3, float]:
     sim = Sim3(s, R, t)
     rms = float(np.sqrt(((sim.points(src) - dst) ** 2).sum(axis=1).mean()))
     return sim, rms
+
+
+# optical axes in a link frame (x forward, y left, z up): optical x = -y, y = -z, z = x
+R_LINK_OPT = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+
+
+def rigid_fit(src: Arr, dst: Arr, R0: Arr | None = None, min_ratio: float = 1e-3) -> Arr:
+    """The rigid 4x4 T with dst ~ T src (Kabsch). When the points are nearly collinear or fewer
+    than three, only the translation is fitted, keeping rotation ``R0`` (default identity)."""
+    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
+    xs, xd = src - mu_s, dst - mu_d
+    sv = np.linalg.svd(xs, compute_uv=False)
+    if len(src) < 3 or sv[1] <= min_ratio * max(float(sv[0]), 1e-12):
+        R0 = np.eye(3) if R0 is None else R0
+        return make_T(R0, mu_d - R0 @ mu_s)
+    U, _, Vt = np.linalg.svd(xd.T @ xs)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1.0
+    R = U @ S @ Vt
+    return make_T(R, mu_d - R @ mu_s)

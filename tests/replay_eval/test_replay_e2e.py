@@ -119,7 +119,7 @@ def test_capabilities_missing_and_gate(base_episode: tuple[Path, synth.Synth],
 def test_humanoid_and_arm(tmp_path: Path) -> None:
     root = tmp_path / "eps"
     hum = synth.build(root, "e017", "ainex", image="png")
-    arm_sets = [synth.SetSpec("r1", "look", [(0, 0, 0), (0.3, 0, 10), (0.6, 0.3, 20)]),
+    arm_sets = [synth.SetSpec("r1", "pp", [(0, 0, 0), (0.3, 0, 10), (0.6, 0.3, 20)]),
                 synth.SetSpec("r1", "loc", [(0.1, 0, 12)])]
     arm = synth.build(root, "e044", "rebot_b601_rs", sets=arm_sets, scene="ithor:1",
                       objects_lines=True)
@@ -213,10 +213,10 @@ def test_dump_layout(base_episode: tuple[Path, synth.Synth],
     dump = json.loads(capsys.readouterr().out)
     d = dump[0]
     assert d["load"]["robot"] == "rosmaster_x3_plus"
-    assert d["load"]["views_vs_truth_m"] == pytest.approx(0.0, abs=1e-9)
+    assert d["load"]["views_vs_truth_m"]["pos_m"] == pytest.approx(0.0, abs=1e-9)
     assert d["truth"]["robot"]["cams"] == ["camera_color_optical_frame", "usb_cam"]
     assert d["sets"][0]["exif_fx_fy"] == [synth.FX_EXIF, synth.FX_EXIF]
-    assert d["requests"]["ops"] == {"update": 5, "locate": 1, "other": 1}
+    assert d["requests_log"]["used"] is False
 
 
 def test_script_entry_point(base_episode: tuple[Path, synth.Synth],

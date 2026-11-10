@@ -16,15 +16,19 @@ from typing import Any
 LAYOUT: dict[str, Any] = {
     "files": {
         "truth": "truth.jsonl",
-        "requests": "oms/agent_requests.jsonl",
+        "requests": "oms/agent_requests.jsonl",  # a shell-command log: only counted by the dump
+        "meta": "meta.json",
         "runs": "agent_files/runs",  # runs/<run>/<set>/ holds one frame set
         "views": "views.json",  # beside the frames of a set
         "frame_suffixes": [".jpg", ".jpeg", ".png"],
     },
-    # <set>-YYYYMMDD-HHMMSS-NN.jpg; the time is local time at a fixed UTC offset
-    "frame_name": {
-        "pattern": r"^(?P<set>.+)-(?P<date>\d{8})-(?P<time>\d{6})-(?P<nn>\d+)\.[A-Za-z]+$",
-        "utc_offset_h": 1.0,
+    # a local date-time anywhere in a frame's file name (not every name has one, nor -NN)
+    "frame_time": {"pattern": r"(\d{8})-(\d{6})", "utc_offset_h": 1.0},
+    "replay": {
+        # sets whose name starts with these are locate-only (turn-in-place frames)
+        "locate_prefixes": ["loc", "look"],
+        # every n-th frame of an update set is held out of the update and located after it
+        "holdout_every": 5,
     },
     "truth": {
         "kind": "kind",
@@ -32,27 +36,22 @@ LAYOUT: dict[str, Any] = {
         "kind_meta": "meta",
         "kind_robot": "robot",
         "kind_objects": "objects",
+        # meta: {cameras, hello, kind, objects, placement, robot, robot_row, t, t0}
         "meta_robot": "robot",
-        "meta_hello": "hello",  # meta.hello holds scene, floor_z, worktop
+        "meta_hello": "hello",  # hello: {engine, floor_z, rtf, scene, sim_time, starting, worktop}
         "scene": "scene",
         "floor_z": "floor_z",
         "worktop": "worktop",
         "worktop_z": "z",
+        # robot lines: {bodies, cams, kind, pos, quat, sim_time, t} (+ joints on the arm)
         "pos": "pos",
         "quat": "quat",
         "quat_order": "wxyz",
-        "cams": "cams",  # robot line: {camera name: optical centre [x, y, z] in the world}
+        "cams": "cams",  # {camera name: optical centre [x, y, z] in the world}
         "bodies": "bodies",  # robot line: links; objects line: objects; each {pos, quat}
     },
     # views.json: {file name: value}; value is {"pose": 4x4, ...} or the bare 4x4 (arm)
-    "views": {"pose": "pose", "stamp": "stamp"},
-    "requests": {
-        # a request line is classified by the first of these words found in its text
-        "locate_words": ["locate"],
-        "update_words": ["update"],
-        "skip_words": ["segment", "reconstruct", "analyse", "delete", "revert", "health"],
-        "dedupe_updates": True,  # a set sent again as an update is skipped (the agent's retry)
-    },
+    "views": {"pose": "pose", "stamp": "stamp", "base": "base"},
     "robots": {
         "ainex": {
             "kind": "humanoid",
@@ -69,7 +68,8 @@ LAYOUT: dict[str, Any] = {
         "rosmaster_x3_plus": {
             "kind": "base",
             "camera": "camera_color_optical_frame",
-            "intrinsics": "exif",  # fx from each frame's EXIF, cx, cy at the image centre
+            "intrinsics": {"width": 640, "height": 480, "fx": 655.8, "fy": 655.8,
+                           "cx": 319.5, "cy": 239.5},
         },
     },
     # the replays each robot kind gets with --priors both (evaluation.md: metric priors for the
@@ -77,13 +77,22 @@ LAYOUT: dict[str, Any] = {
     "default_modes": {"base": ["metric", "none"], "humanoid": ["none"], "arm": ["metric"]},
     # robots standing on the floor: height above floor = views pose[2][3] (start frame on the floor)
     "floor_robots": ["base", "humanoid"],
-    # robot kind -> truth body link whose quaternion is the camera's optical orientation; when
-    # unset the truth orientation is the views.json rotation composed with the run's start pose
-    "rotation_body": {},
+    # robot kind -> truth link (x forward, y left, z up) whose quaternion orients the camera; the
+    # optical frame is that link rotated (optical x = -link y, y = -link z, z = link x). A kind
+    # without one takes the views.json rotation composed with the run's start pose.
+    "rotation_body": {"humanoid": "head_tilt_link", "base": "camera_link"},
+    # robot kinds whose start pose is refined by a rigid fit of the views positions to the matched
+    # truth camera positions (exact kinematics)
+    "refine_start": ["arm"],
+    "refine_iterations": 100,
+    # odometry matching of the base: cost = hypot(position error m, yaw_weight_m x yaw error rad)
+    "odometry_yaw_weight_m": 0.5,
     # EXIF FocalPlaneResolutionUnit when the tag is absent: the conductor writes px per mm
     "exif_default_unit": "mm",
-    # verdict.md is prose: an episode passed when the earliest of these words in it is a pass word
-    "verdict": {"file": "verdict.md", "pass_words": ["pass", "success", "succeeded"],
+    # pass/fail: meta.json[verdict_key] when present (a bool, or text read with the words below),
+    # else verdict.md: the earliest of the pass or fail words in it decides
+    "verdict": {"file": "verdict.md", "meta_key": "verdict",
+                "pass_words": ["pass", "success", "succeeded"],
                 "fail_words": ["fail", "abort", "timeout", "timed out", "error"]},
     "prior_sigma_pos_m": 0.02,
     "prior_sigma_rot_deg": 1.0,

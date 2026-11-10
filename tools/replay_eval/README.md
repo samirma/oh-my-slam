@@ -41,7 +41,7 @@ python3 tools/replay_eval/replay_eval.py --server http://192.168.0.106:9091 \
 | `--targets FILE.json` | Overrides targets: `{metric id: {"op": "<=" or ">=", "value": x}}`, optionally under `"targets"`. |
 | `--accept-if JSON` | The `accept_if` sent with every update when O9 is served. The default is the skill's thresholds (`specs/evaluation.md`, C6): `{"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}`. `{}` checks nothing. |
 | `--warping e034,e040` | The episodes whose warping update the gate must reject (C6). |
-| `--passing e041,...` | The passing episodes whose updates the gate must accept (C6). Without it, each episode's `verdict.md` decides (see below). |
+| `--passing e041,...` | The passing episodes whose updates the gate must accept (C6). Without it, `meta.json`'s `verdict`, or else `verdict.md`, decides (see below). |
 | `--no-height` | No `height_above_floor_m` in the `none` replay; its scale is then reported as `c2.scale_error_monocular`. |
 | `--no-probes` | No reads while a job runs. This drops C3 one-version reads, the busy C12 latencies and the C3 fusing cadence. |
 | `--no-jsonschema` | Minimal required-keys validation, even if `jsonschema` is installed. |
@@ -53,12 +53,16 @@ The exit status is 0 when at least one replay was measured, and 1 otherwise.
 
 1. `GET /api/health` reads `version`, `capabilities` and `timings`. Metrics whose group is not
    in `capabilities` are `not_measurable`, and each one names the missing group.
-2. The agent's requests in `oms/agent_requests.jsonl` are replayed in order. Each update request
-   becomes one update job carrying that frame set. It is a multipart request: a `request` JSON
-   part plus one file part per frame, with the camera from the intrinsics table. Each locate
-   request becomes one `POST locate` (O5). A set that the requests never name was not sent, and
-   is not sent here either. A set sent again as an update is skipped, as the agent's retry
-   (`requests.dedupe_updates`).
+2. Every frame set that has a `views.json` is replayed, in time order: the humanoid's `stamp`,
+   else the file-name time, else the set folder order (a set without a time keeps its place after
+   the set before it). `oms/agent_requests.jsonl` is not used: it is a log of the agent's shell
+   commands, and most updates never appear in it.
+   * Each set is one update job: a multipart request with a `request` JSON part plus one file
+     part per frame, and the camera from the intrinsics table.
+   * Every fifth frame of a set (`replay.holdout_every`) is held out of its update and located
+     right after it (`POST locate`, O5).
+   * Sets whose name starts with `loc` or `look` (`replay.locate_prefixes`) are located whole,
+     never mapped: they are turn-in-place frames.
    * `metric` replay: each frame carries its `views.json` pose as a `metric` prior, with sigmas
      0.02 m and 1°. A later run's poses are moved into the first run's start frame through the
      truth start poses, because a map has one frame.
@@ -75,8 +79,8 @@ The exit status is 0 when at least one replay was measured, and 1 otherwise.
 4. At the end come the map summary, the grid (`cell_m=0.05&z_min=0.05&z_max=1.8`, O6), the
    objects (O8), range scans on `--range-scans` keyframes with their `T_map_cam` (O7), the
    versions list, and a revert to `latest - 1` (O2). The map is then deleted.
-   * If the episode has no locate request, every sent frame that is not a keyframe is located,
-     in batches of 8.
+   * If nothing was located during the replay, every sent frame that is not a keyframe is
+     located, in batches of 8.
 
 Every response is validated against `specs/api.schema.json`, as is every error body
 (`ErrorBody`). A missing `Server-Timing` header is counted too.
@@ -86,54 +90,65 @@ Every response is validated against `specs/api.schema.json`, as is every error b
 They follow the conductor's layout (`~/oh-my-slam-data/robot-guide/episode_layout.md`). Each is a
 key of `LAYOUT` in `rpl_layout.py`.
 
-* **Frames.** `agent_files/runs/<run>/<set>/<set>-YYYYMMDD-HHMMSS-NN.jpg`, with one `views.json`
-  per set. The file-name time is local time at UTC+1 (`frame_name.utc_offset_h`).
-* **`views.json`.** A dict keyed by file name. Each value is `{"pose": 4x4, ...}`: the base has
-  `base`, and the humanoid has `stamp` (epoch s). For the arm, the value is the bare 4x4. The
-  pose is the optical pose in the run's start frame.
-* **`truth.jsonl`.**
-  * Every line has `kind`. The first `meta` line holds `robot` and `hello.{scene, floor_z,
-    worktop.z}`.
-  * `robot` lines hold `t` (epoch s), `pos`, `quat` (`[w, x, y, z]`), `cams.<camera>` (the
-    optical centre in the world) and `bodies`.
-  * `objects` lines hold `bodies.<name>.{pos, quat}`.
+* **Frames.** `agent_files/runs/<run>/<set>/*.jpg`, with one `views.json` per set. File names are
+  not assumed to follow `<set>-date-time-NN`: the first `YYYYMMDD-HHMMSS` found anywhere in the
+  name is the local time at UTC+1 (`frame_time`), and a name without one has no time. Frames of a
+  set are ordered by `stamp`, then by file name.
+* **`views.json`.** A dict keyed by file name. The base's value is `{"pose", "base": [x, y,
+  yaw]}`, with `base` the odometry in the start frame. The humanoid's is `{"pose", "pan", "tilt",
+  "pitch", "roll", "imu_yaw", "stamp"}`. The arm's is the bare 4x4. The pose is the full optical
+  pose in the run's start frame.
+* **`truth.jsonl`** (keys confirmed by the conductor).
+  * `meta`: `{cameras, hello, kind, objects, placement, robot, robot_row, t, t0}`, with `hello`:
+    `{engine, floor_z, rtf, scene, sim_time, starting, worktop}`.
+  * `robot` lines: `{bodies, cams, kind, pos, quat, sim_time, t}`, plus `joints` on the arm.
+    `t` is epoch s, `quat` is `[w, x, y, z]`, and `cams.<camera>` is the optical centre in the
+    world.
+  * `objects` lines: `bodies.<name>.{pos, quat}`.
 * **Robots.** The table maps `meta.robot` to a kind, a camera name and intrinsics:
   * `ainex`: humanoid, `camera`, 640×480, f 270, c (319.5, 239.5);
   * `rebot_b601_rs`: arm, `camera_color_optical_frame`, 640×360, f 337.2, c (319.5, 179.5);
-  * `rosmaster_x3_plus`: base, `camera_color_optical_frame`. Its fx and fy come from each
-    frame's EXIF: FocalLength × FocalPlaneX/YResolution, with the unit taken as mm when the tag
-    is absent. cx and cy are at the image centre.
+  * `rosmaster_x3_plus`: base, `camera_color_optical_frame`, 640×480, f 655.8, c (319.5,
+    239.5). The EXIF agrees.
 
-  A frame of another size gets scaled intrinsics and a warning. `calibration.md` is not read.
-* **`oms/agent_requests.jsonl`.** The keys are not known. A line is an update or a locate by the
-  earliest of the words `locate`, `update` or a skip word (`segment`, `reconstruct`, ...) in its
-  JSON text. It names its frames by any of these, in this order:
-  * frame file names;
-  * a `run/set` path;
-  * a path component equal to a set name.
-
-  A file-name list that covers only part of a set sends only those frames. `--dump-layout`
-  prints the first three lines and the classification counts.
+  A frame whose size is not the table's takes its EXIF (FocalLength × FocalPlaneX/YResolution,
+  with mm as the unit when the tag is absent, and c at the image centre). Without EXIF, it takes
+  the table scaled to its size, with a warning. `calibration.md` is not read.
 * **Truth pose of a frame.**
   * **Start frame to world.** The truth base pose at the run's first frame. For floor robots,
-    this is its yaw and its (x, y) at `floor_z`. For the arm, it is the full pose.
-  * **Position.** The truth `cams.<camera>` position at the frame's time:
-    * the humanoid's `stamp`, interpolated;
-    * otherwise the file-name time. That time has a resolution of 1 s and is shared by a whole
-      set, so the frame's position is the point of the truth track nearest the views position
-      (composed with the start pose), within the time window between the neighbouring sets.
-    * Without any time, the views position composed with the start pose (`truth_source:
-      views`, with a warning).
-  * **Orientation.** The `views.json` rotation composed with the start pose, unless
-    `rotation_body.<kind>` names a truth body whose quaternion is the camera's optical
-    orientation. For the drifting humanoid, this orientation carries its odometry drift. Its
-    positions are exact.
-  * **Check.** `--dump-layout` prints `views_vs_truth_m`: the median distance between the views
-    positions and the truth positions. A large value means one of these assumptions is wrong.
-* **`verdict.md`.** It is prose. An episode passed when the earliest of the pass words (`pass`,
-  `success`, `succeeded`) or fail words (`fail`, `abort`, `timeout`, `timed out`, `error`) in
-  it is a pass word (`verdict` in the layout). Neither found: not judged. `--dump-layout`
-  prints `verdict_passed`; `--passing` overrides it.
+    this is its yaw and its (x, y) at `floor_z`. For the arm, it is the full pose, then refined,
+    since its kinematics are exact:
+    * first by the translation that best lays the views positions on the truth camera samples
+      of their sets' windows;
+    * then by ICP: a rigid fit of the views positions to the matched truth positions, repeated
+      until it settles.
+  * **Time.** The frame's time is found as follows:
+    * **Humanoid:** its `stamp`.
+    * **Base:** the time in its set's window at which the truth base track, taken relative to
+      the start pose, best matches the views `base` odometry (cost: hypot(position error,
+      0.5 m × yaw error in rad)).
+    * **Arm:** the truth `cams` sample nearest the views position, in that window.
+
+    A set's window runs from the set before it to the set after it, by file-name time, with 2 s
+    of slack; the file-name times are local UTC+1, and the truth `t` is epoch. A frame with no
+    time keeps the views pose composed with the start pose (`truth_source: views`), with a
+    warning.
+  * **Position.** `cams.<camera>` at that time: `camera` (humanoid), or
+    `camera_color_optical_frame` (base and arm).
+  * **Orientation.** From the link quaternion at that time: `head_tilt_link` (humanoid) or
+    `camera_link` (base). Links are x forward, y left, z up, so optical x = −link y, optical y =
+    −link z and optical z = link x. The arm, and any kind without a link (`rotation_body`), takes
+    the views rotation composed with the start pose.
+  * **Check.** `--dump-layout` prints `views_vs_truth_m: {pos_m, rot_deg}`: the median
+    difference between the views poses (via the start pose) and the truth poses. For the
+    humanoid, it shows the odometry drift.
+* **Pass or fail.** `meta.json` decides when it has `verdict`, as a bool, or as text read with
+  the words below. Otherwise `verdict.md` is read as prose: the episode passed when the earliest
+  of the pass words (`pass`, `success`, `succeeded`) or fail words (`fail`, `abort`, `timeout`,
+  `timed out`, `error`) is a pass word. When neither file decides, the episode is not judged.
+  `--passing` overrides all of this.
+* **`--dump-layout`.** It prints only keys, counts and parsed values: never raw lines of
+  `agent_requests.jsonl` (only its line count and keys) or of any other file.
 * **House JSON.** Simulator world (x, y, z) = THOR (x, z, y).
   * Rooms: `floorPolygon`. Walls: `polygon`, or ids `wall|room|x0|z0|x1|z1`.
   * Doors: the `holePolygon` x range along `wall0` from its first point.

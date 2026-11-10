@@ -27,10 +27,10 @@ from .fake_server import Config, Fake
 def test_layout_merge_and_errors(tmp_path: Path) -> None:
     assert rpl_layout.load_layout(None) == rpl_layout.LAYOUT
     p = tmp_path / "l.json"
-    p.write_text(json.dumps({"frame_name": {"utc_offset_h": 2}, "new": [1]}))
+    p.write_text(json.dumps({"frame_time": {"utc_offset_h": 2}, "new": [1]}))
     lay = rpl_layout.load_layout(p)
-    assert lay["frame_name"]["utc_offset_h"] == 2 and lay["new"] == [1]
-    assert lay["frame_name"]["pattern"] == rpl_layout.LAYOUT["frame_name"]["pattern"]
+    assert lay["frame_time"]["utc_offset_h"] == 2 and lay["new"] == [1]
+    assert lay["frame_time"]["pattern"] == rpl_layout.LAYOUT["frame_time"]["pattern"]
     p.write_text("[1]")
     with pytest.raises(rpl_layout.LayoutError, match="JSON object"):
         rpl_layout.load_layout(p)
@@ -116,6 +116,13 @@ def test_umeyama() -> None:
     line = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0.0]])  # collinear: yaw-only fit
     sim, rms = geo.umeyama(line, true.points(line))
     assert sim.s == pytest.approx(1.3) and rms < 1e-9
+    R = geo.rot_z(0.4)
+    T = geo.rigid_fit(src, src @ R.T + 1.0)
+    assert np.allclose(T[:3, :3], R) and np.allclose(T[:3, 3], 1.0)
+    assert np.linalg.det(geo.rigid_fit(src, reflected)[:3, :3]) == pytest.approx(1.0)
+    T = geo.rigid_fit(line, line + 2.0, R)  # collinear: translation only, rotation kept
+    assert np.allclose(T[:3, :3], R) and np.allclose(T @ np.r_[line[1], 1], np.r_[line[1] + 2, 1])
+    assert np.allclose(geo.rigid_fit(line[:2], line[:2])[:3, :3], np.eye(3))
     with pytest.raises(ValueError, match="two point pairs"):
         geo.umeyama(line[:1], line[:1])
     with pytest.raises(ValueError, match="coincide"):

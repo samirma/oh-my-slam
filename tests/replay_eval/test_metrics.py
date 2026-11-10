@@ -87,7 +87,7 @@ def test_scene_depth_and_reasons(world: Any) -> None:
     away.truth[:3, :3] = synth.rot_z(math.pi) @ synth.R_BODY_OPT  # outside, facing -x
     down = dataclasses.replace(f, truth=synth.make_T(np.diag([1.0, -1.0, -1.0]), [1, 1, 1.0]))
     assert rm.scene_depth(ep, plan, [away]) == 1.0
-    assert rm.scene_depth(ep, plan, [down]) == pytest.approx(0.3)  # above the worktop
+    assert rm.scene_depth(ep, plan, [down]) == pytest.approx(1 - 0.776)  # above the worktop
     bare = dataclasses.replace(ep, worktop_z=None, floor_z=None)
     assert rm.scene_depth(bare, None, [down]) == 1.0
     p = rm.Params()
@@ -202,7 +202,7 @@ def test_locate_without_frames_of_its_version(world: Any) -> None:
     n = syn.names["r1/loc"][0]
     lo = LocateObs([n], {"map_version": 9, "frames": [
         {"name": n, "status": "rejected", "reason": "no_overlap", "ambiguity": None,
-         "nearest_view": {"name": "elsewhere", "T_map_cam": [], "turn_deg": 0}}]}, 0.1, "agent")
+         "nearest_view": {"name": "elsewhere", "T_map_cam": [], "turn_deg": 0}}]}, 0.1, "plan")
     rec = record(["O5"], locates=[lo])
     s = measure(rec, ep)
     assert "c8.located_near_keyframe" not in s.values and "c8.nearest_view_turn" not in s.values

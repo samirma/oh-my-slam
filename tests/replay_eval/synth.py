@@ -22,7 +22,7 @@ CAM = {"rosmaster_x3_plus": "camera_color_optical_frame", "ainex": "camera",
        "rebot_b601_rs": "camera_color_optical_frame"}
 HEIGHT = {"rosmaster_x3_plus": 0.5, "ainex": 0.34}
 SIZE = {"rosmaster_x3_plus": (640, 480), "ainex": (640, 480), "rebot_b601_rs": (640, 360)}
-FX_EXIF = 400.0
+FX_EXIF = 655.8
 DOOR_Y = (1.0, 1.9)  # door gap in the wall x = 4 (world)
 
 
@@ -179,7 +179,8 @@ RUN_STARTS = {"r1": (0.8, 1.45, 0.0), "r2": (6.0, 1.0, 180.0)}
 DEFAULT_SETS = [
     SetSpec("r1", "start", [(0, 0, 0), (0.4, 0, 0), (0.8, 0, 0), (1.2, 0, 0)]),
     SetSpec("r1", "scan1", [(1.2, 0, 20), (1.2, 0, 40), (1.2, 0, -20), (1.2, 0, -40)]),
-    SetSpec("r1", "chain1", [(1.6, 0, 0), (2.0, 0, 0), (2.4, 0, 0), (2.6, 0, 0)]),
+    SetSpec("r1", "chain1", [(1.6, 0, 0), (2.0, 0, 0), (2.4, 0, 0), (2.6, 0, 0),
+                             (2.5, 0, 0)]),  # the fifth frame is held out and located
     SetSpec("r1", "loc", [(0.4, 0, 0), (0.8, 0, 5), (2.0, 0, 0), (1.2, 0, 180)]),
     # facing the wall x = 0: 0.3 m away (too close), 1.0 m away (a bare wall)
     SetSpec("r1", "wall", [(0.0, 0, 180), (-0.5, 0, 180), (0.2, 0, 180)]),
@@ -199,24 +200,38 @@ def camera_body(robot: str, x: float, y: float, yaw_deg: float) -> np.ndarray:
     return make_T(rot_z(math.radians(yaw_deg)) @ R_BODY_OPT, [x, y, HEIGHT[robot]])
 
 
+ARM_LABELS = ["approach", "grasp", "lift", "place", "pregrasp", "release", "retreat"]
+LINK = {"rosmaster_x3_plus": "camera_link", "ainex": "head_tilt_link"}
+WORKTOP_Z = {"house": 0.776, "arm": 1.100}
+
+
+def frame_file(robot: str, set_name: str, stamp: str, k: int, ext: str) -> str:
+    """File names as the robots write them: only the base's follow <set>-date-time-NN."""
+    if robot == "ainex":
+        return f"{set_name}-{stamp}{'' if k == 0 else f'mp{k}'}.{ext}"
+    if robot == "rebot_b601_rs":
+        return f"{set_name}-{stamp}-{ARM_LABELS[k]}.{ext}"
+    return f"{set_name}-{stamp}-{k + 1:02d}.{ext}"
+
+
 def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
-          sets: list[SetSpec] | None = None, image: str = "jpeg",
-          requests: list[dict[str, Any]] | None = None, scene: str = "procthor:7",
-          floor_z: float = 0.0, objects_lines: bool = False) -> Synth:
+          sets: list[SetSpec] | None = None, image: str = "jpeg", scene: str = "procthor:7",
+          floor_z: float = 0.0, objects_lines: bool = False,
+          meta_verdict: Any = None) -> Synth:
     """Write episode ``eid`` under ``root`` and return its truth."""
     sets = sets if sets is not None else DEFAULT_SETS
+    arm = robot == "rebot_b601_rs"
+    worktop = WORKTOP_Z["arm" if arm else "house"]
     ep = root / eid
     syn = Synth(ep, robot)
     w, h = SIZE[robot]
-    track: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []  # t, base T, cam pos
+    # t, base T (world), camera position, camera optical R (world)
+    track: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
     t_set = T0
     for spec in sets:
         sx, sy, syaw = RUN_STARTS[spec.run]
-        T_ws = make_T(rot_z(math.radians(syaw)), [sx, sy, floor_z])
-        if robot == "rebot_b601_rs":
-            T_ws = make_T(rot_z(math.radians(syaw)), [sx, sy, floor_z + 0.8])
-        syn.start.setdefault(spec.run, T_ws)
-        T_ws = syn.start[spec.run]
+        T_ws = make_T(rot_z(math.radians(syaw)), [sx, sy, worktop if arm else floor_z])
+        T_ws = syn.start.setdefault(spec.run, T_ws)
         stamp = datetime.fromtimestamp(t_set, LOCAL).strftime("%Y%m%d-%H%M%S")
         folder = ep / "agent_files" / "runs" / spec.run / spec.name
         folder.mkdir(parents=True)
@@ -224,16 +239,13 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
         key = f"{spec.run}/{spec.name}"
         syn.names[key] = []
         for k, (x, y, yaw) in enumerate(spec.poses):
-            file = f"{spec.name}-{stamp}-{k + 1:02d}.{'jpg' if image == 'jpeg' else 'png'}"
+            file = frame_file(robot, spec.name, stamp, k, "jpg" if image == "jpeg" else "png")
             T_sc = camera_body(robot, x, y, yaw)
-            if robot == "rosmaster_x3_plus":
-                exif = tiff_exif(focal_entries(FX_EXIF))
-            else:
-                exif = None
+            exif = tiff_exif(focal_entries(FX_EXIF)) if robot == "rosmaster_x3_plus" else None
             data = jpeg(w, h, exif) if image == "jpeg" else png(w, h, exif)
             (folder / file).write_bytes(data)
-            t_f = t_set + 1 + 2 * k
-            if robot == "rebot_b601_rs":
+            t_f = t_set + 2 * k  # the first frame at the file-name time
+            if arm:
                 views[file] = T_sc.tolist()
             elif robot == "ainex":
                 views[file] = {"pose": T_sc.tolist(), "pan": 0.0, "tilt": 0.0, "pitch": 0.0,
@@ -244,57 +256,64 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
             name = f"{spec.run}/{spec.name}/{Path(file).stem}"
             syn.truth[name] = T_wc
             syn.names[key].append(name)
-            base = T_ws @ make_T(rot_z(math.radians(yaw)), [x, y, 0.0])
-            if robot == "rebot_b601_rs":
-                base = T_ws
+            base = T_ws if arm else T_ws @ make_T(rot_z(math.radians(yaw)), [x, y, 0.0])
             track.append((t_f, base, T_wc[:3, 3].copy(), T_wc[:3, :3].copy()))
         (folder / "views.json").write_text(json.dumps(views))
         t_set += 2 * len(spec.poses) + 4
+    meta = {"kind": "meta", "t": T0 - 5, "t0": T0 - 5, "robot": robot, "robot_row": 1,
+            "placement": "p1", "cameras": [CAM[robot]], "objects": [],
+            "hello": {"engine": "mujoco", "scene": scene, "floor_z": floor_z, "rtf": 1.0,
+                      "sim_time": 0.0, "starting": True,
+                      "worktop": {"name": "table", "z": worktop, "area_m2": 1.0}}}
+    lines: list[dict[str, Any]] = [meta]
     # the truth track: still at each frame for 1 s, moving linearly in between (5 Hz)
-    lines: list[dict[str, Any]] = [{"kind": "meta", "t": T0 - 5, "t0": T0 - 5, "robot": robot,
-                                    "placement": "p1", "hello": {
-                                        "engine": "mujoco", "scene": scene, "floor_z": floor_z,
-                                        "worktop": {"name": "table", "z": floor_z + 0.7,
-                                                    "area_m2": 1.0},
-                                        "sim_time": 0.0}}]
     times = np.arange(T0 - 2, t_set + 2, 0.2)
     for t in times:
         k = int(np.searchsorted([x[0] for x in track], t))
-        if k == 0:
-            base, cam = track[0][1], track[0][2]
-        elif k >= len(track):
-            base, cam = track[-1][1], track[-1][2]
+        if k == 0 or k >= len(track):
+            _, base, cam, R = track[0 if k == 0 else -1]
         else:
-            (ta, ba, ca, _), (tb, bb, cb, _) = track[k - 1], track[k]
+            (ta, ba, ca, Ra), (tb, bb, cb, Rb) = track[k - 1], track[k]
             if t - ta <= 0.5:
-                base, cam = ba, ca
+                base, cam, R = ba, ca, Ra
             elif tb - t <= 0.5:
-                base, cam = bb, cb
-            else:
+                base, cam, R = bb, cb, Rb
+            else:  # in motion: halfway poses, matching nothing the views hold
                 u = (t - ta - 0.5) / (tb - ta - 1.0)
-                base = ba if u < 0.5 else bb
-                cam = ca + u * (cb - ca)
-        lines.append({"kind": "robot", "t": float(t), "sim_time": float(t - T0),
-                      "pos": base[:3, 3].tolist(), "quat": quat_wxyz(base[:3, :3]),
-                      "cams": {CAM[robot]: cam.tolist(), "usb_cam": [0, 0, 0]},
-                      "bodies": {"base_link": {"pos": base[:3, 3].tolist(),
-                                               "quat": quat_wxyz(base[:3, :3])}}})
+                side = np.array([0.0, 0.05, 0.0])  # off the straight line between frames
+                base = make_T(ba[:3, :3], ba[:3, 3] + u * (bb[:3, 3] - ba[:3, 3])
+                              + (0.0 if arm else side))
+                cam, R = ca + u * (cb - ca) + side, Ra
+        bodies: dict[str, Any] = {"base_link": {"pos": base[:3, 3].tolist(),
+                                                "quat": quat_wxyz(base[:3, :3])}}
+        if robot in LINK:
+            bodies[LINK[robot]] = {"pos": cam.tolist(), "quat": quat_wxyz(R @ R_BODY_OPT.T)}
+        line: dict[str, Any] = {"kind": "robot", "t": float(t), "sim_time": float(t - T0),
+                                "pos": base[:3, 3].tolist(), "quat": quat_wxyz(base[:3, :3]),
+                                "cams": {CAM[robot]: cam.tolist(), "usb_cam": [0, 0, 0]},
+                                "bodies": bodies}
+        if arm:
+            line["joints"] = {"j1": 0.0}
+        lines.append(line)
     if objects_lines:
         lines.append({"kind": "objects", "t": t_set, "sim_time": 1.0, "bodies": {
-            "apple_1": {"pos": [1.2, 1.5, floor_z + 0.75], "quat": [1, 0, 0, 0]},
-            "box_2": {"pos": [1.5, 1.2, floor_z + 0.1], "quat": [1, 0, 0, 0]}}})
+            "apple_1": {"pos": [1.2, 1.5, worktop + 0.05], "quat": [1, 0, 0, 0]},
+            "box_2": {"pos": [1.5, 1.2, worktop - 0.5], "quat": [1, 0, 0, 0]}}})
     lines.append({"kind": "render", "t": t_set, "file": "r.png"})
     lines.append({"kind": "end", "t": t_set + 1, "samples": len(times), "errors": 0})
     (ep / "truth.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n\n")
-    if requests is None:
-        requests = default_requests(syn)
+    # the agent's shell-command log: not used by the replay
     (ep / "oms").mkdir(parents=True, exist_ok=True)
-    (ep / "oms" / "agent_requests.jsonl").write_text(
-        "\n".join(json.dumps(x) for x in requests) + "\n")
+    (ep / "oms" / "agent_requests.jsonl").write_text("\n".join(json.dumps(
+        {"id": i, "command": f"mapper.sh update /home/u/{k}", "result": "ok", "is_error": False,
+         "subagent": None}) for i, k in enumerate(syn.names)) + "\n")
     rc = ep / "robot_control" / robot
     rc.mkdir(parents=True)
     (rc / "calibration.md").write_text("The camera looks forward.\n")
-    (ep / "meta.json").write_text(json.dumps({"robot": robot}))
+    meta_json: dict[str, Any] = {"robot": robot}
+    if meta_verdict is not None:
+        meta_json["verdict"] = meta_verdict
+    (ep / "meta.json").write_text(json.dumps(meta_json))
     (ep / "verdict.md").write_text("pass\n")
     return syn
 
@@ -302,22 +321,3 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
 def files_of(syn: Synth, key: str) -> list[str]:
     folder = syn.root / "agent_files" / "runs" / key
     return sorted(p.name for p in folder.iterdir() if p.name != "views.json")
-
-
-def default_requests(syn: Synth) -> list[dict[str, Any]]:
-    """Every way a request line can name a set: file names, a run/set path, a bare set name."""
-    keys = list(syn.names)
-    out: list[dict[str, Any]] = []
-    for key in keys:
-        run, name = key.split("/")
-        if name == "loc":
-            out.append({"t": 1, "cmd": "mapper.sh locate", "args": {"set": name}})
-        elif name == "chain1":
-            out.append({"t": 1, "cmd": "mapper.sh update",
-                        "images": [f"/x/agent_files/runs/{key}/{f}" for f in files_of(syn, key)]})
-        elif run == "r2":
-            out.append({"t": 1, "endpoint": "POST /api/maps/m/updates", "dir": f"runs/{key}"})
-        else:
-            out.append({"t": 1, "cmd": f"mapper.sh update {key}/"})
-    out.insert(1, {"t": 1, "cmd": "segment.sh -i frame.jpg", "images": ["frame.jpg"]})
-    return out
