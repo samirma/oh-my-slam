@@ -60,7 +60,8 @@ DEFS: list[Def] = [
         "and 5° of the truth", ">=", 0.9, "share", "share", ("O5",)),
     Def("c8.ambiguity_rule", "C8", "Non-null ambiguity is a rival farther than 0.10 m or 5° "
         "(api.md §6)", ">=", 1.0, "share", "share", ("O5",)),
-    Def("c8.nearest_view_turn", "C8", "no_overlap frames whose nearest_view turn points toward "
+    Def("c8.nearest_view_turn", "C8", "no_overlap frames sent with a prior whose nearest_view "
+        "turn points toward "
         "the keyframe's view (within 45°)", ">=", 0.8, "share", "share", ("O5",)),
     Def("c2.scale_error_priors", "C2", "Scale error with metric priors", "<=", 0.03, "max",
         "ratio"),
@@ -83,7 +84,7 @@ DEFS: list[Def] = [
     Def("c3.reads_one_version", "C3", "Reads during an update answered from one version", ">=",
         1.0, "share", "share"),
     Def("c3.eta_within_30pct", "C3", "eta_s of a queued job, and predicted_s of a dry run, "
-        "within ±30 % of the measured time", ">=", 0.8, "share", "share", ("O3",)),
+        "within ±30 % of the measured time", ">=", 0.8, "share", "share", ("O3|O3-jobs",)),
     Def("c3.fusing_version_gap_s", "C3", "Longest gap between versions while fusion lasts "
         "longer than 10 s", "<=", 10.0, "max", "s", ("O3",)),
     Def("c4.reason_agreement", "C4", "Rejected inputs whose reason agrees with the truth (bare "
@@ -113,7 +114,8 @@ DEFS: list[Def] = [
         "occupied", ">=", 0.95, "share", "share", ("O6",), True),
     Def("c9.band_as_asked", "C9", "Grid z_band_m equal to the requested band", ">=", 1.0,
         "share", "share", ("O6",)),
-    Def("c9.floor_height_error_m", "C9", "Floor height error", "<=", 0.02, "max", "m",
+    Def("c9.floor_height_error_m", "C9", "Floor height error against the lowest large support "
+        "plane in view (the floor; the worktop for an arm)", "<=", 0.02, "max", "m",
         ("O6",)),
     Def("c9.grid_read_s", "C9", "GET grid (5 cm cells) on a committed version", "<=", 0.5,
         "max", "s", ("O6",)),
@@ -131,7 +133,10 @@ DEFS: list[Def] = [
         "relations", ">=", 0.9, "share", "share", ("O8",)),
     Def("c11.range_rel_error", "C11", "Range-scan error against the floor-plan walls (median, "
         "relative)", "<=", 0.05, "median", "ratio", ("O7",), True),
-    Def("c12.locate_idle_s", "C12", "Locate of one frame while idle (p90)", "<=", 2.0, "p90",
+    Def("c12.locate_first_s", "C12", "The replay's first idle locate, per frame (warm-up)",
+        None, None, "max", "s", ("O5",)),
+    Def("c12.locate_idle_s", "C12", "Locate while idle, per frame of the request (p90)", "<=",
+        2.0, "p90",
         "s", ("O5",)),
     Def("c12.locate_busy_s", "C12", "Locate of one frame while an update runs (p90)", "<=",
         3.0, "p90", "s", ("O5",)),
@@ -163,6 +168,7 @@ class Params:
     probe_interval_s: float = 0.5
     warping: tuple[str, ...] = ("e034", "e040")
     passing: tuple[str, ...] | None = None  # None: from each episode's verdict.md
+    worktop_kinds: tuple[str, ...] = ("arm",)  # floor_z_m is judged against the worktop
     heights: bool = True
 
 
@@ -321,6 +327,13 @@ class Measure:
             if latest is not None else []
         self.truth_objects = truth_objects
 
+    def floor_reference(self) -> float | None:
+        """The lowest large support plane in view: the worktop for the kinds that work on one
+        and never see the room floor (the arm), else the floor."""
+        if self.ep.kind in self.p.worktop_kinds and self.ep.worktop_z is not None:
+            return self.ep.worktop_z
+        return self.ep.floor_z
+
     def passed(self) -> bool:
         """A passing episode: named in --passing, else by its verdict.md."""
         if self.p.passing is not None:
@@ -378,7 +391,7 @@ class Measure:
             n = max(1, sum(1 for i in j.job.get("inputs") or [] if i["status"] != "rejected"))
             start = j.t_fusing if j.t_fusing is not None else j.t_start
             s.add("c3.fusion_s_per_frame", (j.t_end - start) / n)
-            if "O3" in self.caps:
+            if has(self.caps, "O3|O3-jobs"):
                 measured = j.t_end - j.t_posted
                 if j.eta_queued is not None and measured > 0:
                     s.add("c3.eta_within_30pct", abs(j.eta_queued - measured) <= 0.3 * measured)
@@ -387,17 +400,17 @@ class Measure:
                     total = float(pred["registration"]) + float(pred["fusion"])
                     m = j.t_end - j.t_start
                     s.add("c3.eta_within_30pct", abs(total - m) <= 0.3 * m)
-                if j.t_fusing is not None and j.t_end - j.t_fusing > 10.0:
-                    seen_at = sorted(self.rec.probe_versions + j.versions_seen)
-                    v0 = max([v for t, v in seen_at if t <= j.t_fusing], default=-1)
-                    times, seen = [], v0
-                    for t, v in seen_at:
-                        if j.t_fusing < t <= j.t_end and v > seen:
-                            times.append(t)
-                            seen = v
-                    gaps = np.diff([j.t_fusing, *times, j.t_end])
-                    s.add("c3.fusing_version_gap_s",
-                          max(0.0, float(gaps.max()) - self.p.probe_interval_s))
+            if "O3" in self.caps and j.t_fusing is not None and j.t_end - j.t_fusing > 10.0:
+                seen_at = sorted(self.rec.probe_versions + j.versions_seen)
+                v0 = max([v for t, v in seen_at if t <= j.t_fusing], default=-1)
+                times, seen = [], v0
+                for t, v in seen_at:
+                    if j.t_fusing < t <= j.t_end and v > seen:
+                        times.append(t)
+                        seen = v
+                gaps = np.diff([j.t_fusing, *times, j.t_end])
+                s.add("c3.fusing_version_gap_s",
+                      max(0.0, float(gaps.max()) - self.p.probe_interval_s))
         for ok in self.rec.consistency:
             s.add("c3.reads_one_version", ok)
 
@@ -466,6 +479,8 @@ class Measure:
         s, rec = self.s, self.rec
         for x in rec.idle_locate_s:
             s.add("c12.locate_idle_s", x)
+        if rec.first_locate_s is not None:
+            s.add("c12.locate_first_s", rec.first_locate_s)
         for x in rec.busy_locate_s:
             s.add("c12.locate_busy_s", x)
         if rec.idle_locate_s and rec.busy_locate_s:
@@ -502,13 +517,15 @@ class Measure:
                     if e_pos <= 0.10 and e_rot <= 5.0:
                         s.add("c8.ambiguity_null_on_right", amb is None)
                 nv = r.get("nearest_view")
+                # judged only for frames sent with a prior: turn_deg is null without one
                 if r["status"] == "rejected" and r.get("reason") == "no_overlap" and nv \
-                        and nv["name"] in self.by_name:
+                        and nv["name"] in self.by_name and lo.with_prior:
                     kt = self.by_name[nv["name"]].truth
                     assert kt is not None
                     want = wrap_deg(optical_yaw_deg(kt[:3, :3]) - optical_yaw_deg(T[:3, :3]))
-                    s.add("c8.nearest_view_turn",
-                          abs(wrap_deg(float(nv["turn_deg"]) - want)) <= self.p.turn_tol_deg)
+                    turn = nv.get("turn_deg")
+                    s.add("c8.nearest_view_turn", turn is not None and
+                          abs(wrap_deg(float(turn) - want)) <= self.p.turn_tol_deg)
 
     # ---- O6 ---------------------------------------------------------------------------------
     def grid(self) -> None:
@@ -568,10 +585,11 @@ class Measure:
                     s.add("c9.regions_set", o["region"] is not None)
         if sim is None:
             return
-        if self.ep.floor_z is not None and frames["frames"]:
+        ref = self.floor_reference()
+        if ref is not None and frames["frames"]:
             mean = np.mean([frame_pose(r)[:2, 3] for r in frames["frames"]], axis=0)
             s.add("c9.floor_height_error_m",
-                  abs(float(sim.point([mean[0], mean[1], fz])[2]) - self.ep.floor_z))
+                  abs(float(sim.point([mean[0], mean[1], fz])[2]) - ref))
         if W is None or cls is None or self.plan is None:
             return
         st, ob, fo = state.ravel(), obs.ravel(), floor_obs.ravel()
@@ -579,7 +597,7 @@ class Measure:
         seen = st != 0
         for ok in np.concatenate([st[seen & floorish] == 1, st[seen & (cls == WALL)] == 2]):
             s.add("c9.grid_agreement", bool(ok))
-        for ok in fo[(st == 1) & floorish] == 1:
+        for ok in fo[(st == 1) & floorish & (fo != 2)] == 1:  # 2: free by rule, not seen
             s.add("c9.floor_observed", bool(ok))
         for ok in st[(cls == WALL) & (ob > 0)] == 2:
             s.add("c9.band_occupied", bool(ok))
@@ -684,8 +702,13 @@ class Measure:
                           abs(sim.s * float(beam["range_m"]) - truth) / truth)
 
 
+def has(caps: set[str], need: str) -> bool:
+    """``need`` is one group or alternatives joined by ``|`` (e.g. ``O3|O3-jobs``)."""
+    return any(c in caps for c in need.split("|"))
+
+
 def missing_for(d: Def, caps: set[str], plan: FloorPlan | None) -> str | None:
-    lack = [c for c in d.needs if c not in caps]
+    lack = [c for c in d.needs if not has(caps, c)]
     if lack:
         return "capability " + ", ".join(lack)
     if d.floorplan and (plan is None or not plan.has_rooms):

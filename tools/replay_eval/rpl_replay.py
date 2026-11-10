@@ -81,6 +81,7 @@ class LocateObs:
     response: dict[str, Any]
     seconds: float
     source: str  # plan | fallback
+    with_prior: bool = False  # the request's frames carried priors
 
 
 @dataclass
@@ -97,7 +98,8 @@ class Record:
     probe_versions: list[tuple[float, int]] = field(default_factory=list)
     consistency: list[bool] = field(default_factory=list)
     busy_locate_s: list[float] = field(default_factory=list)
-    idle_locate_s: list[float] = field(default_factory=list)
+    idle_locate_s: list[float] = field(default_factory=list)  # per frame of each request
+    first_locate_s: float | None = None  # the replay's first idle locate, per frame (warm-up)
     busy_analyse_s: list[float] = field(default_factory=list)
     idle_analyse_s: list[float] = field(default_factory=list)
     grid: dict[str, Any] | None = None
@@ -289,10 +291,18 @@ class Replayer:
         self.probe_frame = self.by_name[good[-1]]
         if "O5" in self.caps:
             _, s = self.locate([self.probe_frame])
-            self.rec.idle_locate_s.append(s)
+            self.idle_locate(s, 1)
         if "O7" in self.caps:
             _, s = self.analyse(self.probe_frame)
             self.rec.idle_analyse_s.append(s)
+
+    def idle_locate(self, seconds: float, frames: int) -> None:
+        """An idle locate's latency per frame of its request (C12); the first one is also kept
+        apart, so the warm-up shows."""
+        per = seconds / frames
+        self.rec.idle_locate_s.append(per)
+        if self.rec.first_locate_s is None:
+            self.rec.first_locate_s = per
 
     def plan_locate(self, frames: list[Frame], source: str) -> None:
         try:
@@ -302,7 +312,9 @@ class Replayer:
                 raise
             self.rec.warnings.append(f"locate before the map exists: {len(frames)} frames")
             return
-        self.rec.locates.append(LocateObs([f.name for f in frames], res, s, source))
+        self.rec.locates.append(LocateObs([f.name for f in frames], res, s, source,
+                                          with_prior=self.mode == "metric"))
+        self.idle_locate(s, len(frames))
         v = int(res["map_version"])
         if v not in self.rec.frames:
             self.read_frames(v)

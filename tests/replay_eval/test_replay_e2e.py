@@ -63,9 +63,17 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
         sig = [p["sigma_pos_m"] for p in priors]
         assert min(sig) == 0.02 and sig[1] == pytest.approx(0.1 * 0.4 * synth.ODOM_SCALE)
         assert max(sig) > 0.5  # the whole r1 path, over-counted
+        # locate frames carry the episode's prior in the prior replay, none in the other
+        trusts = {p["trust"] for p in fake.locate_priors}
+        assert trusts == {"drifting", "none"}
     ov = res["overall"]
     assert ov["c6.other_updates_accepted"]["value"] == 1.0
     assert ov["c1.prior_residual_m"]["status"] == "info"
+    assert ov["c12.locate_first_s"]["status"] == "info"
+    # nearest_view turns are judged only in the prior replay: turn_deg is null without a prior
+    runs = res["episodes"]["e041"]["runs"]
+    assert runs["metric"]["metrics"]["c8.nearest_view_turn"]["value"] == 1.0
+    assert runs["none"]["metrics"]["c8.nearest_view_turn"]["status"] == "no_samples"
     assert ov["c1.prior_residual_m"]["value"] == pytest.approx(0.01)
     assert res["episodes"]["e041"]["passed"] is True
     assert res["health"]["start"]["capabilities"] == ALL_CAPS

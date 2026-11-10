@@ -232,3 +232,48 @@ def test_other_updates_accepted(world: Any) -> None:
     assert measure(rec, ep).values["c6.other_updates_accepted"] == [1.0, 0.0]
     assert "c6.other_updates_accepted" not in measure(rec, ep, passing=("e999",)).values
     assert measure(rec, ep, passing=("e041",)).values["c6.other_updates_accepted"] == [1.0, 0.0]
+
+
+def test_floor_reference_and_floor_observed_by_rule(world: Any) -> None:
+    ep, syn, plan, raster = world
+    names = syn.names["r1/start"]
+    rec = record(["O6"], frames={1: {"frames": rows(ep, names)}})
+    rec.jobs = [job(names)]
+    rec.grid = grid(np.ones((10, 20)), (-1.0, -1.45), floor_z_m=0.2)
+    base = measure(rec, ep)  # a floor robot: judged against the floor (0.0)
+    assert base.values["c9.floor_height_error_m"] == [pytest.approx(0.2)]
+    arm = dataclasses.replace(ep, kind="arm", worktop_z=0.2)  # an arm: against the worktop
+    assert measure(rec, arm).values["c9.floor_height_error_m"] == [pytest.approx(0.0)]
+    bare = dataclasses.replace(ep, kind="arm", worktop_z=None, floor_z=None)
+    assert "c9.floor_height_error_m" not in measure(rec, bare).values
+    # floor_observed 2 (free by rule: a camera stood there) is not an observation of the floor
+    fo = np.ones((10, 20), np.uint8)
+    fo[:, :10] = 2
+    rec.grid["layers"]["floor_observed"] = b64(fo)
+    full = len(measure(rec, ep, plan, raster).values["c9.floor_observed"])
+    fo[:, :10] = 1
+    rec.grid["layers"]["floor_observed"] = b64(fo)
+    assert len(measure(rec, ep, plan, raster).values["c9.floor_observed"]) > full
+
+
+def test_nearest_view_needs_a_prior_and_o3_jobs(world: Any) -> None:
+    ep, syn, _, _ = world
+    n = syn.names["r1/loc"][3]
+    kf = syn.names["r1/start"][0]
+    body = {"map_version": 1, "frames": [
+        {"name": n, "status": "rejected", "reason": "no_overlap", "ambiguity": None,
+         "nearest_view": {"name": kf, "T_map_cam": [], "turn_deg": None}}]}
+    rec = record(["O5", "O3-jobs"], frames={1: {"frames": rows(ep, [kf])}},
+                 locates=[LocateObs([n], body, 0.1, "plan", with_prior=True),
+                          LocateObs([n], body, 0.1, "plan", with_prior=False)],
+                 idle_locate_s=[0.5, 0.1], first_locate_s=0.5)
+    j = job([kf])
+    j.eta_queued = 1.9
+    rec.jobs = [j]
+    s = measure(rec, ep)
+    assert s.values["c8.nearest_view_turn"] == [0.0]  # with a prior but no turn: a miss
+    assert s.values["c12.locate_first_s"] == [0.5]
+    assert s.values["c3.eta_within_30pct"] == [1.0]  # O3-jobs serves eta_s
+    assert rm.missing_for(rm.BY_ID["c3.fusing_version_gap_s"], {"O3-jobs"}, None) == \
+        "capability O3"
+    assert rm.missing_for(rm.BY_ID["c3.eta_within_30pct"], {"O3-jobs"}, None) is None

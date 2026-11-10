@@ -178,3 +178,10 @@ def test_final_reads_without_a_second_version(ep: Any) -> None:
     r = replayer(ep, handler, caps=("O2",))
     r.final_reads()
     assert "POST revert" not in routes and r.rec.revert_s is None
+
+
+def test_idle_locate_per_frame_and_first(ep: Any) -> None:
+    r = replayer(ep, lambda *a: None)
+    r.idle_locate(3.0, 3)
+    r.idle_locate(0.4, 1)
+    assert r.rec.idle_locate_s == [1.0, 0.4] and r.rec.first_locate_s == 1.0

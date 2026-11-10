@@ -106,6 +106,7 @@ class Fake:
         self.revert_calls = 0
         self.accept_ifs: list[Any] = []
         self.priors: list[Any] = []
+        self.locate_priors: list[Any] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -332,6 +333,7 @@ class Fake:
                 **self.scale(name), "objects": out, "surfaces": surfaces}
 
     def locate(self, name: str, req: dict[str, Any]) -> dict[str, Any]:
+        self.locate_priors.extend(f.get("prior") for f in req["frames"])
         m = self.maps[name]
         v = m.versions[-1]
         out = []
@@ -347,7 +349,9 @@ class Fake:
                     kt = self.cfg.truth[kf["name"]]
                     turn = (math.degrees(math.atan2(kt[1, 2], kt[0, 2]) -
                                          math.atan2(T[1, 2], T[0, 2])) + 180) % 360 - 180
-                    nv = {"name": kf["name"], "T_map_cam": kf["T_map_cam"], "turn_deg": turn}
+                    prior = f.get("prior", {}).get("trust", "none") != "none"
+                    nv = {"name": kf["name"], "T_map_cam": kf["T_map_cam"],
+                          "turn_deg": turn if prior else None}
                 out.append({**base, "status": "rejected", "reason": "no_overlap",
                             "nearest_view": nv})
                 continue
