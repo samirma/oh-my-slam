@@ -100,9 +100,8 @@ def test_mapper_proc_runs_the_mapper_with_the_given_intrinsics(
 
     def update(map_dir: Path, inputs: list[Path], **kw: Any) -> Any:
         seen.update(kw)
-        scene = {"openlabel": {"objects": {"1": {}, "2": {}}}}
-        return api.UpdateResult(json.dumps(scene).encode(), ["f000003"], ["f000004"], 2.0,
-                                {"stages_s": {"sfm": 1.0, "cloud": 0.5}})
+        return api.UpdateResult(["f000003"], ["f000004"], 2.0,
+                                {"stages_s": {"sfm": 1.0, "cloud": 0.5}}, objects=2)
 
     monkeypatch.setattr(api, "update", update)
     m = tmp_path / "map"
@@ -239,7 +238,7 @@ def test_inference_ready_and_state(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert e.value.code == "inference_unavailable" and e.value.details["state"] == state
     answers[:] = [health("ready")]
     be.MapperBackend().require_inference()
-    i = inf.Inference(tmp_path / "inf.log")
+    i = inf.Inference()
     answers[:] = [health("ready"), health("degraded"), health("error", False, "no weights"),
                   health("error", False), ServerUnavailableError("no socket")]
     s = i.state()
@@ -259,17 +258,16 @@ def test_the_service_starts_and_stops_the_inference_server(
                        f"{sys.executable} -c \"import sys, time; open('{flag}', 'a')"
                        f".write(' '.join(sys.argv[1:]) + ';'); time.sleep(1)\"")
     monkeypatch.setattr(inf.ServerLock, "is_held", staticmethod(lambda path=None: False))
-    i = inf.Inference(tmp_path / "inf.log")
+    i = inf.Inference()
     i.ensure_started()
     assert i.started and i.state()["state"] == "starting"
     i.launcher.wait(10)  # type: ignore[union-attr]
     assert i.state()["state"] == "down"
-    assert inf.stop_inference(tmp_path / "inf.log") == 0
-    assert flag.read_text() == ";--stop;"
+    assert flag.read_text() == ";"
     monkeypatch.delenv("OH_MY_SLAM_INFERENCE_CMD")
-    assert inf.inference_cmd()[1:] == ["-m", "oh_my_slam.cli.server"]
+    assert inf.inference_cmd()[1:] == ["-m", "oh_my_slam.server.main"]
     # already answering, or starting (its process holds the lock): nothing is launched
-    j = inf.Inference(tmp_path / "inf.log")
+    j = inf.Inference()
     monkeypatch.setattr(inf.InferenceClient, "health", lambda self, timeout=1.0: health("ready"))
     j.ensure_started()
     assert not j.started
@@ -281,3 +279,44 @@ def test_the_service_starts_and_stops_the_inference_server(
     monkeypatch.setattr(inf.ServerLock, "is_held", staticmethod(lambda path=None: True))
     j.ensure_started()
     assert not j.started and j.state()["state"] == "starting"
+
+
+def _holder(script: str) -> subprocess.Popen[str]:
+    """A process holding the inference server's lock as ``script`` does, once it prints."""
+    child = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    assert child.stdout is not None and child.stdout.readline() == "held\n"
+    return child
+
+
+HOLD = ("import signal, time\n"
+        "from oh_my_slam.server.lifecycle import ServerLock\n"
+        "{extra}"
+        "ServerLock().acquire()\n"
+        "print('held', flush=True)\n"
+        "time.sleep(60)\n")
+
+
+def test_stop_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    import signal
+
+    from oh_my_slam.core import paths
+
+    assert inf.stop_inference() == "the inference server was not running"
+    child = _holder(HOLD.format(extra=""))
+    assert inf.stop_inference() == f"stopped the inference server (pid {child.pid})"
+    assert child.wait(10) == -signal.SIGTERM
+    monkeypatch.setattr(inf, "STOP_TIMEOUT_S", 0.3)
+    child = _holder(HOLD.format(extra="signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"))
+    assert inf.stop_inference() == f"stopped the inference server (pid {child.pid}, killed)"
+    assert child.wait(10) == -signal.SIGKILL
+    child = _holder("import fcntl, os, time\n"
+                    f"fd = os.open({str(paths.lock_file())!r}, os.O_RDWR | os.O_CREAT)\n"
+                    "os.ftruncate(fd, 0)\n"
+                    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                    "print('held', flush=True)\n"
+                    "time.sleep(60)\n")
+    try:
+        assert "without its pid" in inf.stop_inference()
+    finally:
+        child.kill()
+        child.wait(10)

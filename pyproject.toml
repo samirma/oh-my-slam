@@ -1,7 +1,7 @@
 [project]
 name = "oh-my-slam"
 version = "0.1.0"
-description = "Monocular RGB mapping: single-image reconstruction, persistent maps and OpenLABEL objects with oriented bounding boxes."
+description = "The robot-guide skill's map service: anchored, versioned maps of camera frames with objects and uncertainty, over HTTP (server.sh)."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -70,7 +70,6 @@ override-dependencies = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["src/oh_my_slam/viewer/static"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["RUF059", "N802", "PTH", "RUF005", "B008", "SIM117", "RUF021", "F841"]
@@ -95,7 +94,7 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 # NumPy dtype generics and untyped third-party APIs (open3d, pycolmap) produce noise here.
-module = ["oh_my_slam.mapping.*", "oh_my_slam.viewer.*", "oh_my_slam.reconstruction.*",
+module = ["oh_my_slam.mapping.*", "oh_my_slam.reconstruction.*",
           "oh_my_slam.server.app"]
 disable_error_code = ["misc", "union-attr", "arg-type", "attr-defined", "str-bytes-safe",
                       "call-overload"]
@@ -133,116 +132,100 @@ root_package = "oh_my_slam"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layered ownership: cli | web | tools > commands > viewer > mapping > segmentation > reconstruction > client > schema > core"
+name = "Layered ownership: service (HTTP) > mapping > segmentation > reconstruction > client > core"
 type = "layers"
 layers = [
-    # the command line, the web service (spec §2.6) and the evaluators (spec §5) are independent
-    # siblings over the commands' shared definitions: the evaluators run the commands and the
-    # service as their users do, and derive what they compare from the same definitions
-    "oh_my_slam.cli | (oh_my_slam.web) | oh_my_slam.tools",
-    "oh_my_slam.commands",
-    "oh_my_slam.viewer",
+    "oh_my_slam.service",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
     "oh_my_slam.reconstruction",
     "oh_my_slam.client",
-    "oh_my_slam.schema",
     "oh_my_slam.core",
 ]
 
 [[tool.importlinter.contracts]]
-name = "Only the CLI starts the server; the pipeline packages never import it"
+name = "The HTTP service (server.sh, oh_my_slam.service) is the top: nothing imports it"
 type = "forbidden"
 source_modules = [
-    "oh_my_slam.commands",
-    "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
     "oh_my_slam.reconstruction",
     "oh_my_slam.client",
-    "oh_my_slam.schema",
+    "oh_my_slam.core",
+    "oh_my_slam.server",
+]
+forbidden_modules = ["oh_my_slam.service"]
+
+[[tool.importlinter.contracts]]
+name = "The HTTP service is a client of the inference server: it reuses only its lifecycle helpers (lock, pid)"
+type = "forbidden"
+source_modules = ["oh_my_slam.service"]
+forbidden_modules = [
+    "oh_my_slam.server.app",
+    "oh_my_slam.server.main",
+    "oh_my_slam.server.gpu_worker",
+    "oh_my_slam.server.models",
+]
+
+[[tool.importlinter.contracts]]
+name = "The pipeline packages never import the inference server process"
+type = "forbidden"
+source_modules = [
+    "oh_my_slam.mapping",
+    "oh_my_slam.segmentation",
+    "oh_my_slam.reconstruction",
+    "oh_my_slam.client",
     "oh_my_slam.core",
 ]
 forbidden_modules = ["oh_my_slam.server"]
 
 [[tool.importlinter.contracts]]
-name = "The evaluator reads the server's lifecycle state only (cold start, resident memory)"
-type = "forbidden"
-source_modules = ["oh_my_slam.tools"]
-forbidden_modules = [
-    "oh_my_slam.server.app",
-    "oh_my_slam.server.main",
-    "oh_my_slam.server.gpu_worker",
-    "oh_my_slam.server.models",
-]
-
-[[tool.importlinter.contracts]]
-name = "The web service is a client of the inference server: it reuses only the lifecycle helpers (lock, pid)"
-type = "forbidden"
-source_modules = ["oh_my_slam.web"]
-forbidden_modules = [
-    "oh_my_slam.server.app",
-    "oh_my_slam.server.main",
-    "oh_my_slam.server.gpu_worker",
-    "oh_my_slam.server.models",
-]
-
-[[tool.importlinter.contracts]]
-name = "The server owns models only (no pipeline logic)"
+name = "The inference server owns models only (no pipeline logic)"
 type = "forbidden"
 source_modules = ["oh_my_slam.server"]
 forbidden_modules = [
-    "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
     "oh_my_slam.reconstruction",
-    "oh_my_slam.cli",
-    "oh_my_slam.commands",
 ]
 
 [[tool.importlinter.contracts]]
-name = "Model frameworks stay inside the server process"
+name = "Model frameworks stay inside the inference server process"
 type = "forbidden"
 source_modules = [
-    "oh_my_slam.cli",
-    "oh_my_slam.web",
     "oh_my_slam.service",
-    "oh_my_slam.commands",
-    "oh_my_slam.tools",
-    "oh_my_slam.viewer",
     "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
     "oh_my_slam.reconstruction",
     "oh_my_slam.client",
-    "oh_my_slam.schema",
     "oh_my_slam.core",
 ]
 forbidden_modules = ["torch", "ultralytics", "moge", "geocalib", "mapanything", "transformers"]
 
 [[tool.importlinter.contracts]]
-name = "Reconstruction never touches segmentation: the cloud derivation gets point labels and colours as data"
+name = "Reconstruction never touches segmentation or mapping: the cloud derivation gets point labels and colours as data"
 type = "forbidden"
 source_modules = ["oh_my_slam.reconstruction"]
 forbidden_modules = ["oh_my_slam.segmentation", "oh_my_slam.mapping"]
 
 [[tool.importlinter.contracts]]
-name = "Reconstruction alone derives and writes the emitted point clouds (reconstruction.cloud): segmentation writes no PLY"
+name = "Reconstruction alone derives and writes point clouds: segmentation writes no PLY"
 type = "forbidden"
 source_modules = ["oh_my_slam.segmentation"]
 forbidden_modules = ["oh_my_slam.core.ply"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
-name = "Mapping and viewer never talk to the inference server: depth through reconstruction, detections through segmentation"
+name = "Mapping never talks to the inference server: depth through reconstruction, detections through segmentation"
 type = "forbidden"
-source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer"]
+source_modules = ["oh_my_slam.mapping"]
 forbidden_modules = ["oh_my_slam.client"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
-name = "Segmentation alone detects, lifts, fits OBBs and assigns colours: mapping, viewer and the command line use it through its API"
+name = "Segmentation alone detects, lifts, fits boxes and assigns colours: mapping uses it through its API"
 type = "forbidden"
-source_modules = ["oh_my_slam.mapping", "oh_my_slam.viewer", "oh_my_slam.cli"]
+source_modules = ["oh_my_slam.mapping"]
 forbidden_modules = [
     "oh_my_slam.segmentation.detect",
     "oh_my_slam.segmentation.lift",
@@ -252,56 +235,14 @@ forbidden_modules = [
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
-name = "Depth fusion (Open3D) lives in reconstruction; the server never loads it next to torch"
+name = "Depth fusion (Open3D) lives in reconstruction and mapping's geometry; the service and the inference server never load it"
 type = "forbidden"
 source_modules = [
-    "oh_my_slam.cli",
-    "oh_my_slam.web",
     "oh_my_slam.service",
-    "oh_my_slam.commands",
-    "oh_my_slam.tools",
-    "oh_my_slam.viewer",
-    "oh_my_slam.mapping",
     "oh_my_slam.segmentation",
     "oh_my_slam.client",
-    "oh_my_slam.schema",
     "oh_my_slam.core",
     "oh_my_slam.server",
 ]
 forbidden_modules = ["open3d"]
 allow_indirect_imports = true
-
-[[tool.importlinter.contracts]]
-name = "The HTTP service (server.sh, oh_my_slam.service) is the top: nothing imports it"
-type = "forbidden"
-source_modules = [
-    "oh_my_slam.cli",
-    "oh_my_slam.web",
-    "oh_my_slam.commands",
-    "oh_my_slam.tools",
-    "oh_my_slam.viewer",
-    "oh_my_slam.mapping",
-    "oh_my_slam.segmentation",
-    "oh_my_slam.reconstruction",
-    "oh_my_slam.client",
-    "oh_my_slam.schema",
-    "oh_my_slam.core",
-    "oh_my_slam.server",
-]
-forbidden_modules = ["oh_my_slam.service"]
-
-[[tool.importlinter.contracts]]
-name = "The HTTP service uses the mapping, reconstruction and segmentation APIs, never the old web app, command line, viewer, evaluator or inference-server internals"
-type = "forbidden"
-source_modules = ["oh_my_slam.service"]
-forbidden_modules = [
-    "oh_my_slam.web",
-    "oh_my_slam.cli",
-    "oh_my_slam.commands",
-    "oh_my_slam.viewer",
-    "oh_my_slam.tools",
-    "oh_my_slam.server.app",
-    "oh_my_slam.server.main",
-    "oh_my_slam.server.gpu_worker",
-    "oh_my_slam.server.models",
-]

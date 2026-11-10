@@ -66,9 +66,9 @@ def test_lifecycle(tmp_path: Path, served: tuple[subprocess.Popen[str], int]) ->
         time.sleep(0.05)
     stop = sh(tmp_path, "--stop")
     assert stop.returncode == 0 and "stopped (pid" in stop.stderr
-    assert "inference server" in stop.stderr
+    assert "the inference server was not running" in stop.stderr  # the no-op ended at once
     assert proc.wait(30) == 0 and proc.stdout is not None and proc.stdout.read() == ""
-    assert (tmp_path / "inference.calls").read_text() == ";--stop;"
+    assert (tmp_path / "inference.calls").read_text() == ";"
     assert sh(tmp_path, "--status").returncode == 3
     assert "not running" in sh(tmp_path, "--stop").stderr
     assert (tmp_path / "data" / "oms" / "service.log").exists()
