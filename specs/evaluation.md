@@ -80,13 +80,13 @@ transform, not re-fitted per read.
 | C9 | Cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` | ≥ 0.95 |
 | C10 | Support height of objects on a surface (`supported_by` surface `height_m`) | ≤ 2 cm |
 | C10 | `supported_by` / `inside_of` agreeing with the truth's relations | ≥ 0.9 |
-| C8 | Rejected frames with `no_overlap` that carry a `nearest_view` whose turn points toward mapped structure | ≥ 0.8 |
+| C8 | Rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure | ≥ 0.8 |
 | C3 | `eta_s` of a queued job, and `predicted_s` of a dry run, within ±30 % of the measured time | ≥ 0.8 of jobs |
-| C9 | Floor height error | ≤ 2 cm |
+| C9 | Floor height error, against the lowest large support plane in view: the floor, or the worktop for an arm scene | ≤ 2 cm |
 | C10 | Object centre error, label agreement and id stability across updates | As in `targets.json`, from the round-4 values |
 | C11 | Range-scan error against the floor-plan walls within the band | ≤ 5 % of range |
 | C12 | Locate and analyse latency while an update runs | ≤ 2 × idle latency, and ≤ 3 s |
-| C12 | Locate of one frame while idle | ≤ 2 s |
+| C12 | Locate while idle, per frame of the request | ≤ 2 s |
 | C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map | ≤ 0.5 s each |
 | C3 | Intermediate version during fusion | At least every 10 s while fusion lasts longer |
 | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes | As before |

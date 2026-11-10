@@ -157,7 +157,14 @@ seen there.
 **Parameters.**
 * `cell_m`: the cell size.
 * `z_min`, `z_max`: the height band in the map frame, relative to the floor estimate
-  `floor_z_m` (default 0.05–1.8 m).
+  `floor_z_m` (default 0.05–1.8 m). `floor_z_m` is the surface the robot stands on:
+  * when priors fixed the map frame, it is the large horizontal plane nearest the priors'
+    origin height (z = 0). Robots put that origin where they stand: on the floor for a base or a
+    humanoid, at the base link on the worktop for an arm;
+  * without priors, it is the lowest large horizontal plane seen below the cameras.
+
+  Other planes, such as the room floor seen past a worktop's edge, are support surfaces
+  (`surfaces[]`), not the floor.
 * Optional `footprint_radius_m`: the robot's radius.
 
 **Header.**
