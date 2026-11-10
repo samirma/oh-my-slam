@@ -609,3 +609,59 @@ def test_one_keyframe_strikes_only_with_a_depth_image(tmp_path: Path, rel: float
     gone = view("c", EYES[2], TableScene(items=[]))
     gone.depth_rel = rel
     assert bool(om.update([gone], 2, 0.0)) is struck
+
+
+def test_specific_labels_win_over_generic_ones() -> None:
+    o = MapObject(1, {"ball": 2.0, "apple": 0.6, "fruit": 0.5})
+    assert o.label == "apple"
+    o = MapObject(1, {"ball": 4.0, "apple": 0.6})
+    assert o.label == "ball"  # too little evidence for the specific label
+    assert MapObject(1, {"ball": 1.0}).label == "ball"
+    assert MapObject(1, {"cup": 1.0, "apple": 0.5}).label == "cup"
+    assert ao.alike("ball", "tomato") and ao.alike("egg", "fruit") and not ao.alike("egg", "cup")
+
+
+def test_worktop_support_heights_with_noisy_depth(tmp_path: Path) -> None:
+    """An arm's worktop at 0.9 m seen from above at 640 x 360 with 1 % + 3 mm depth noise:
+    the worktop's height within 1 cm, the items 3-8 cm tall rest on it, a tomato on a plate."""
+    from oh_my_slam.core.types import Intrinsics
+    from tests.synth.room import Room
+
+    K = Intrinsics(320.0, 320.0, 320.0, 180.0, 640, 360)
+    w = 0.9
+    items = [Item("counter", [((-0.2, -0.4, 0.0), (1.0, 0.6, w))]),
+             Item("apple", [((0.30, 0.00, w), (0.37, 0.07, w + 0.07))], (200, 30, 30)),
+             Item("egg", [((0.45, 0.10, w), (0.49, 0.15, w + 0.045))], (230, 220, 200)),
+             Item("plate", [((0.20, 0.20, w), (0.42, 0.42, w + 0.02))], (240, 240, 240)),
+             Item("mug", [((0.55, -0.15, w), (0.63, -0.07, w + 0.08))], (40, 90, 200)),
+             Item("tomato", [((0.28, 0.27, w + 0.02), (0.34, 0.33, w + 0.07))], (220, 50, 20))]
+    sc = TableScene(items=items, room=Room(boxes=[]))
+    rng = np.random.default_rng(0)
+    cloud = Cloud()
+    views = []
+    for i, eye in enumerate([(0.0, 0.0, 1.45), (0.1, -0.3, 1.5), (0.0, 0.3, 1.4),
+                             (0.2, 0.0, 1.55)]):
+        T = look_at(eye, (0.42, 0.1, w))
+        rgb, z, idx = sc.render(T, K)
+        z = (z * (1 + 0.01 * rng.standard_normal(z.shape))
+             + 0.003 * rng.standard_normal(z.shape)).astype(np.float32)
+        ok = edge_free(z)
+        lat = np.zeros_like(ok)
+        lat[::2, ::2] = True
+        pts, fl = pixel_points(z, K, ok & lat)
+        cloud.add(pts @ T[:3, :3].T + T[:3, 3], rgb.reshape(-1, 3)[fl].astype(float))
+        views.append(View(f"k{i}", T, 0.005, K, z, rgb, detections(sc, idx), None,
+                          ao.SENSOR_DEPTH_REL))
+    om = ObjectMap(tmp_path)
+    om.update(views, 1, w)
+    om.finish(cloud.points(), 1.6, 1)
+    rec = om.records()
+    top = next(s for s in rec["surfaces"] if abs(s["height_m"] - w) < 0.05)
+    assert top["height_m"] == pytest.approx(w, abs=0.01)
+    o = by_label(rec)
+    for name in ("apple", "egg", "plate", "mug"):
+        assert o[name]["supported_by"]["id"] == top["id"], name
+        bottom = o[name]["centre_m"][2] - o[name]["size_m"][2] / 2
+        assert bottom == pytest.approx(w, abs=0.01), name
+    assert o["tomato"]["supported_by"] == {"kind": "object", "id": o["plate"]["id"],
+                                           "verified_version": 1}

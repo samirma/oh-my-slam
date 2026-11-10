@@ -13,7 +13,9 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   of the object's inside its own; both, for other labels), or the nearness of the centres for
   compatible labels — one
   object per observation and one observation per object in a keyframe. Compatible labels match
-  from ``MATCH_MIN``, others (a flickering label) only from ``MATCH_ANY``. An unmatched
+  from ``MATCH_MIN`` (a generic label, ``GENERIC_LABELS``, goes with any), others (a
+  flickering label) only from ``MATCH_ANY``. The label is the most voted, a specific one first
+  (``MapObject.label``). An unmatched
   observation starts a new object, its id the next of ``next_id`` (never reused).
 * **Latest wins** (map.md §3). Every object that a keyframe has in view (``IN_VIEW_SHARE`` of its
   samples in the image, within the fused depth) but did not detect is judged on that keyframe's
@@ -150,6 +152,10 @@ ABSENT_SHARE = 0.5  # a see-through object's verdict when a keyframe does not de
 DETECT_MIN_PX = 200  # ... judged only where it would cover this many pixels
 COVERED_SHARE = 0.5  # a keyframe that detects something over this share of an object's place
 COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no depth verdict
+# labels the detector gives what it cannot name better: they never outvote a specific label that
+# has SPECIFIC_SHARE of their votes, and they go with any label
+GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
+SPECIFIC_SHARE = 0.25
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -313,7 +319,15 @@ class MapObject:
 
     @property
     def label(self) -> str:
-        return max(sorted(self.votes), key=lambda k: self.votes[k])
+        """The label with the most votes, the specific ones first: a specific label with at
+        least ``SPECIFIC_SHARE`` of the leading generic one's votes wins (an apple also scored
+        as a ball or a fruit is an apple)."""
+        best = max(sorted(self.votes), key=lambda k: self.votes[k])
+        specific = [k for k in sorted(self.votes) if k not in GENERIC_LABELS]
+        if not specific or best not in GENERIC_LABELS:
+            return best
+        top = max(specific, key=lambda k: self.votes[k])
+        return top if self.votes[top] >= SPECIFIC_SHARE * self.votes[best] else best
 
     @property
     def score(self) -> float:
@@ -365,6 +379,12 @@ class Observation:
 # -- association (also frame analysis') ----------------------------------------------------------
 
 
+def alike(a: str, b: str) -> bool:
+    """Compatible labels (``segmentation.api.compatible``), or one of them generic
+    (``GENERIC_LABELS``: a ball, a fruit, a container may be anything of its shape)."""
+    return compatible(a, b) or a in GENERIC_LABELS or b in GENERIC_LABELS
+
+
 def _extent(points: Array) -> float:
     if not len(points):
         return 0.0
@@ -381,7 +401,7 @@ def affinity(label: str, points: Array, centre: Array, o: MapObject) -> float:
     if len(o.points):
         lo, hi = points.min(0) - MATCH_GROW_M, points.max(0) + MATCH_GROW_M
         back = float(np.mean(np.all((o.points >= lo) & (o.points <= hi), axis=1)))
-    if compatible(label, o.label) or any(compatible(label, k) for k in o.votes):
+    if alike(label, o.label) or any(alike(label, k) for k in o.votes):
         a = max(inside, back)
         gate = MATCH_CENTRE_M + 0.5 * max(_extent(points), float(np.max(o.box.size)))
         d = float(np.linalg.norm(centre - o.box.centre))
@@ -885,7 +905,7 @@ class ObjectMap:
                 continue
             best = None
             for n in fresh:
-                if n.id in used or n.box is None or not compatible(n.label, old.label):
+                if n.id in used or n.box is None or not alike(n.label, old.label):
                     continue
                 if float(np.linalg.norm(n.box.centre - old.box.centre)) < MOVE_MIN_M:
                     continue
