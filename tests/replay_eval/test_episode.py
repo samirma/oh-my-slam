@@ -104,9 +104,13 @@ def test_humanoid_and_arm(tmp_path: Path) -> None:
     assert ep.mount_rot_spread_deg is None
     assert np.allclose(ep.start_poses["r1"][:3, :3], arm.start["r1"][:3, :3], atol=1e-6)
     assert ep.odom_scale == {"r1": 1.0}
-    assert ep.worktop_z == pytest.approx(1.1)
+    # read from meta.sim.hello (the arm's real nesting), with the placement
+    assert ep.worktop_z == pytest.approx(1.10001) and ep.floor_z == 0.0
+    assert ep.placement == "worktop" and ep.scene == "ithor:1"
     objs = {o.label: o for o in ep.truth_objects(LAYOUT)}
-    assert objs["apple"].support_z == pytest.approx(1.1) and objs["box"].support_z is None
+    assert objs["apple"].support_z == pytest.approx(1.10001) and objs["box"].support_z is None
+    assert epi.dump_layout(arm.root, LAYOUT)["truth"]["meta"]["hello"] == [
+        "engine", "floor_z", "rtf", "scene", "starting", "worktop"]
 
 
 def test_track_matching() -> None:
@@ -331,3 +335,13 @@ def test_odometry_fit_fallbacks(tmp_path: Path) -> None:
         f.odom = (0.0, 0.0, 0.0)
     moved = merge(LAYOUT, {"odometry_fit_min_spread_m": 0.0})
     assert epi.fit_odometry(ep, ep.all_frames(), moved) is None
+
+
+def test_hello_paths() -> None:
+    keys = LAYOUT["truth"]
+    sim = {"sim": {"hello": {"floor_z": 1.0}}, "hello": {"floor_z": 2.0}}
+    assert epi.hello_of(sim, keys) == {"floor_z": 1.0}  # meta.sim.hello first
+    assert epi.hello_of({"sim": 3, "hello": {"floor_z": 2.0}}, keys) == {"floor_z": 2.0}
+    flat = {"floor_z": 4.0}
+    assert epi.hello_of(flat, keys) is flat  # neither: the meta line itself
+    assert epi.hello_of({"h": {"x": 1}}, {**keys, "meta_hello": "h"}) == {"x": 1}

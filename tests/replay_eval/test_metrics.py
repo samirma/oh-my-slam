@@ -244,6 +244,8 @@ def test_floor_reference_and_floor_observed_by_rule(world: Any) -> None:
     assert base.values["c9.floor_height_error_m"] == [pytest.approx(0.2)]
     arm = dataclasses.replace(ep, kind="arm", worktop_z=0.2)  # an arm: against the worktop
     assert measure(rec, arm).values["c9.floor_height_error_m"] == [pytest.approx(0.0)]
+    placed = dataclasses.replace(ep, placement="worktop", worktop_z=0.2)  # any kind on a worktop
+    assert measure(rec, placed).values["c9.floor_height_error_m"] == [pytest.approx(0.0)]
     bare = dataclasses.replace(ep, kind="arm", worktop_z=None, floor_z=None)
     assert "c9.floor_height_error_m" not in measure(rec, bare).values
     # floor_observed 2 (free by rule: a camera stood there) is not an observation of the floor

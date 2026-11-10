@@ -172,6 +172,7 @@ class Params:
     warping: tuple[str, ...] = ("e034", "e040")
     passing: tuple[str, ...] | None = None  # None: from each episode's verdict.md
     worktop_kinds: tuple[str, ...] = ("arm",)  # floor_z_m is judged against the worktop
+    worktop_placements: tuple[str, ...] = ("worktop",)  # ... as for meta.placement "worktop"
     heights: bool = True
 
 
@@ -337,9 +338,11 @@ class Measure:
         self.truth_objects = truth_objects
 
     def floor_reference(self) -> float | None:
-        """The lowest large support plane in view: the worktop for the kinds that work on one
-        and never see the room floor (the arm), else the floor."""
-        if self.ep.kind in self.p.worktop_kinds and self.ep.worktop_z is not None:
+        """The lowest large support plane in view: the worktop when the robot is placed on one
+        (meta.placement) or is of a kind that works on one (the arm), else the floor."""
+        on_worktop = self.ep.placement in self.p.worktop_placements or \
+            self.ep.kind in self.p.worktop_kinds
+        if on_worktop and self.ep.worktop_z is not None:
             return self.ep.worktop_z
         return self.ep.floor_z
 

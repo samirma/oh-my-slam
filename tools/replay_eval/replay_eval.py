@@ -219,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     targets = load_targets(args.targets)
     params = Params(align_min_spread_m=args.align_min_spread_m,
                     align_full_rotation=args.align_full_rotation,
+                    worktop_placements=tuple(layout["worktop_placements"]),
                     probe_interval_s=args.probe_interval_s,
                     warping=tuple(w for w in args.warping.split(",") if w),
                     heights=not args.no_height,

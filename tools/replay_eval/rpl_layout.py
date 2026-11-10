@@ -40,9 +40,13 @@ LAYOUT: dict[str, Any] = {
         "kind_meta": "meta",
         "kind_robot": "robot",
         "kind_objects": "objects",
-        # meta: {cameras, hello, kind, objects, placement, robot, robot_row, t, t0}
+        # meta: {cameras, sim, kind, objects, placement, robot, robot_row, t, t0}; robot is an
+        # id (the kind comes from the robots table)
         "meta_robot": "robot",
-        "meta_hello": "hello",  # hello: {engine, floor_z, rtf, scene, sim_time, starting, worktop}
+        "meta_placement": "placement",
+        # the first of these dotted paths in meta that holds a dict is "hello": {engine, scene,
+        # floor_z, worktop {name, z, area_m2, centroid, bounds}, starting, rtf}
+        "meta_hello": ["sim.hello", "hello"],
         "scene": "scene",
         "floor_z": "floor_z",
         "worktop": "worktop",
@@ -81,6 +85,8 @@ LAYOUT: dict[str, Any] = {
     "default_modes": {"base": ["metric", "none"], "humanoid": ["none"], "arm": ["metric"]},
     # robots standing on the floor: height above floor = views pose[2][3] (start frame on the floor)
     "floor_robots": ["base", "humanoid"],
+    # a meta.placement that puts the robot on a worktop: the floor reference is the worktop
+    "worktop_placements": ["worktop"],
     # robot kind -> truth link (x forward, y left, z up) whose quaternion orients the camera; the
     # optical frame is that link rotated (optical x = -link y, y = -link z, z = link x). A kind
     # without one takes the views.json rotation composed with the run's start pose.

@@ -178,6 +178,7 @@ class Episode:
     start_poses: dict[str, Arr]
     warnings: list[str]
     passed: bool | None = None  # from meta.json or verdict.md; None when neither says
+    placement: str = ""  # meta.placement, e.g. "worktop"
     odom_scale: dict[str, float] = field(default_factory=dict)  # run -> truth / odometry
     mount_rot_spread_deg: float | None = None  # median spread of the per-frame mount estimates
 
@@ -585,6 +586,19 @@ def read_verdict(root: Path, layout: dict[str, Any]) -> bool | None:
     return words_verdict(path.read_text(), v) if path.is_file() else None
 
 
+def hello_of(meta: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """The simulator's hello block: the first dotted path of ``meta_hello`` holding a dict in
+    the meta line (``sim.hello``, then ``hello``), else the meta line itself."""
+    paths = keys["meta_hello"]
+    for path in [paths] if isinstance(paths, str) else paths:
+        node: Any = meta
+        for part in path.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            return node
+    return meta
+
+
 def load_episode(root: Path, layout: dict[str, Any]) -> Episode:
     warnings: list[str] = []
     keys = layout["truth"]
@@ -595,7 +609,7 @@ def load_episode(root: Path, layout: dict[str, Any]) -> Episode:
                           f"'{keys['kind_meta']}'")
     meta = metas[0]
     robot = str(need(meta, keys["meta_robot"], "truth.jsonl meta line"))
-    hello = meta.get(keys["meta_hello"]) or meta
+    hello = hello_of(meta, keys)
     robots = layout["robots"]
     if robot not in robots:
         raise LayoutError(f"robot '{robot}' is not in the layout's robots table "
@@ -614,7 +628,8 @@ def load_episode(root: Path, layout: dict[str, Any]) -> Episode:
         meta=meta, sets=sets, events=plan_events(sets, layout),
         cameras=cameras, track=read_track(lines, str(spec["camera"]), keys),
         objects_lines=[x for x in lines if x.get(keys["kind"]) == keys["kind_objects"]],
-        start_poses={}, warnings=warnings, passed=read_verdict(root, layout))
+        start_poses={}, warnings=warnings, passed=read_verdict(root, layout),
+        placement=str(meta.get(keys["meta_placement"]) or ""))
     assign_truth(ep, layout)
     return ep
 
@@ -653,9 +668,11 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
         out["truth"] = {"kinds": kinds}
         for k, x in first.items():
             info: dict[str, Any] = {"keys": sorted(x)}
-            for sub in (keys["meta_hello"], keys["cams"], keys["bodies"]):
+            for sub in (keys["cams"], keys["bodies"]):
                 if isinstance(x.get(sub), dict):
                     info[sub] = sorted(x[sub])[:40]
+            if k == keys["kind_meta"]:
+                info["hello"] = sorted(hello_of(x, keys))
             out["truth"][k] = info
     else:
         out["truth"] = f"missing {layout['files']['truth']}"
@@ -698,7 +715,7 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
     else:
         out["load"] = {
             "robot": ep.robot, "kind": ep.kind, "scene": ep.scene, "floor_z": ep.floor_z,
-            "worktop_z": ep.worktop_z, "cameras": ep.cameras,
+            "worktop_z": ep.worktop_z, "placement": ep.placement, "cameras": ep.cameras,
             "events": [f"{e.op} {e.set_key}" + ("" if e.files is None else f" ({len(e.files)})")
                        for e in ep.events],
             "frames": len(ep.all_frames()),

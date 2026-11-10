@@ -216,7 +216,7 @@ def camera_body(robot: str, x: float, y: float, yaw_deg: float) -> np.ndarray:
 
 ARM_LABELS = ["approach", "grasp", "lift", "place", "pregrasp", "release", "retreat"]
 LINK = {"rosmaster_x3_plus": "camera_link", "ainex": "head_tilt_link"}
-WORKTOP_Z = {"house": 0.776, "arm": 1.100}
+WORKTOP_Z = {"house": 0.776, "arm": 1.10001}
 
 
 def frame_file(robot: str, set_name: str, stamp: str, k: int, ext: str) -> str:
@@ -281,11 +281,16 @@ def build(root: Path, eid: str = "e041", robot: str = "rosmaster_x3_plus",
             track.append((t_f, base, T_wc[:3, 3].copy(), T_wc[:3, :3].copy()))
         (folder / "views.json").write_text(json.dumps(views))
         t_set += 2 * len(spec.poses) + 4
-    meta = {"kind": "meta", "t": T0 - 5, "t0": T0 - 5, "robot": robot, "robot_row": 1,
-            "placement": "p1", "cameras": [CAM[robot]], "objects": [],
-            "hello": {"engine": "mujoco", "scene": scene, "floor_z": floor_z, "rtf": 1.0,
-                      "sim_time": 0.0, "starting": True,
-                      "worktop": {"name": "table", "z": worktop, "area_m2": 1.0}}}
+    hello = {"engine": "mujoco", "scene": scene, "floor_z": floor_z, "rtf": 1.0,
+             "starting": True,
+             "worktop": {"name": "table", "z": worktop, "area_m2": 1.0,
+                         "centroid": [0.0, 0.0], "bounds": [[-1, -1], [1, 1]]}}
+    meta: dict[str, Any] = {"kind": "meta", "t": T0 - 5, "t0": T0 - 5, "robot": robot,
+                            "robot_row": 1, "cameras": [CAM[robot]], "objects": []}
+    if arm:  # the arm episodes' real nesting: meta.sim.hello, placement "worktop", no kind
+        meta.update(placement="worktop", sim={"hello": hello, "sim_time": 0.0})
+    else:
+        meta.update(placement="p1", hello={**hello, "sim_time": 0.0})
     lines: list[dict[str, Any]] = [meta]
     # the truth track: still at each frame for 1 s, moving linearly in between (5 Hz)
     times = np.arange(T0 - 2, t_set + 2, 0.2)
