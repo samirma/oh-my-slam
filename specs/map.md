@@ -157,7 +157,9 @@ seen there.
 **Parameters.**
 * `cell_m`: the cell size.
 * `z_min`, `z_max`: the height band in the map frame, relative to the floor estimate
-  `floor_z_m` (default 0.05–1.8 m).
+  `floor_z_m` (default 0.05–1.8 m). `floor_z_m` is the lowest large horizontal plane seen below
+  the cameras. For a robot that never sees the room floor, such as an arm on a worktop looking
+  down, that is the surface it works on.
 * Optional `footprint_radius_m`: the robot's radius.
 
 **Header.**
@@ -170,7 +172,11 @@ seen there.
 * `state`: uint8, 0 unknown, 1 free, 2 occupied;
 * `observations`: uint16, the number of frames that observed the cell;
 * `height_m`: float32, the highest surface in the cell relative to `floor_z_m`, NaN if none;
-* `floor_observed`: uint8, 1 when a floor surface was observed in the cell at the floor height.
+* `floor_observed`: uint8:
+  * 1 — a floor surface was observed in the cell at the floor height;
+  * 2 — not observed, but free by rule: a camera stood here, or the cell lies inside a camera's
+    near blind disc;
+  * 0 — not observed.
   A cell that is free but whose floor was not observed means the camera saw through it above a
   floor nobody saw: there may be a low obstacle or a step, so the planner looks first.
 

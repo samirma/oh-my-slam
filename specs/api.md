@@ -100,6 +100,10 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
   | `prior_residual_m`, `prior_residual_deg` | The residual to its prior; null without a prior. |
 
+  **Pose sigmas are a lower bound** until O5 calibrates them against replay truth: until then
+  `sigma_pos_m` and `sigma_rot_deg`, here and in [`Frames`], come from the registration's noise
+  and the anchoring's residual, not from a pose covariance, and the true error can be larger.
+
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It runs
   on the interactive lane. Per frame it gives:
@@ -149,8 +153,9 @@ Every `GET` under `/api/maps/{name}` accepts `?version=<n>` and names its versio
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view` when the
   service can estimate one, else null:
   * the keyframe most similar to the frame by retrieval: its `name` and `T_map_cam`;
-  * `turn_deg`: the signed turn from the frame's guessed heading (its prior when given, else the
-    nearest view's) toward that keyframe's view. Positive is counter-clockwise.
+  * `turn_deg`: the signed turn from the frame's prior heading toward that keyframe's view.
+    Positive is counter-clockwise. It is null when the frame carries no prior, because the
+    frame's own heading in the map is then unknown.
 
   A robot without odometry can then turn toward mapped structure.
 * **Provisional frames.** Locate works against a version whose newest frames are still
