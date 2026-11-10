@@ -63,8 +63,9 @@ weights and the code the server fetches with them, the external tools and the ve
 
 ## The oms/2.0 service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` for the robot-guide skill. Implemented so far: **O1** (anchored map
-frame and priors) and **O4** (per-input status), with the service plumbing they need.
+The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
+(`/api/health → capabilities`): **O1** (anchored map frame and priors) and **O4** (per-input
+status), with the service plumbing they need.
 
 ```sh
 ./server.sh                                    # 0.0.0.0:9091, data ~/oh-my-slam-data/
@@ -130,7 +131,8 @@ the version. A rejected or failed job leaves the map as it was.
   focal length (refined within 1.15, see *A focal length the keyframes carry*). A canonical JPEG
   without a mask reaches the mapper byte for byte. EXIF orientation is not applied: intrinsics
   describe the stored pixels.
-* **Ignore mask.** Its pixels take no part in the per-frame checks and are filled from their
+* **Ignore mask.** The camera's mask and the frame's own (`FrameInput.ignore_mask`) are combined.
+  Their pixels take no part in the per-frame checks and are filled from their
   surroundings (`cv2.inpaint`) in the image the mapper gets, so no feature is extracted on the
   robot's body. Not yet applied to the mapper's depth and fusion (the cloud reads come with O6/O7).
 * **The map frame.** The mapper keeps its own internal frame, which a rebuild may define again.
@@ -207,7 +209,28 @@ for a low-confidence keyframe, combined with the anchoring's RMS residual, floor
 
 ### Live check
 
-LIVE_CHECK_PLACEHOLDER
+Run on the serving machine (M3 Pro, 18 GB), 2026-11-10, service and inference server started by
+`server.sh` on 0.0.0.0:9091, the 13 photos of `examples/office_sequence` (12 MP, the EXIF
+intrinsics given as the camera), one job each (scripts in the session's scratchpad):
+
+| Run | Result |
+| --- | --- |
+| 1. trust `none`, new map | 13/13 registered, `scale_source: monocular` (σ 10 %); 58 s wall (checks 1.5 s, mapper 56 s). |
+| 2. metric priors = run 1's poses after a known similarity (s 1.3, yaw 40°, t (2, −1, 0.5)) plus noise (σ 2 cm per axis, 0.5°), sent with σ 3 cm / 1°; plus a bare-wall frame (the right part of `examples/camera/img_012`) | 13/13 registered, the wall `plain` (texture 0.0003, 0 features), `scale_source: priors`, `scale_sigma_rel` 0.029. Against the known similarity of run 1: median 1.1 cm, max 1.5 cm, 0.31° — within the noise; scale 1.319 for 1.3 (1.5 %). Prior residuals median 2.1 cm, max 3.7 cm, 0.74°. `prior_gravity_deg` 0.22. 58 s. |
+| 3. main path: the first 7 photos with metric priors (as run 2, new noise), then the other 6 with `drifting` priors in an odometry frame rotated −30° and moved (5, 5, 0) | Update 1: 5/7 registered within 0.9–3.6 cm of the truth; 2 `prior_conflict` (17 and 20 cm, 3–5°: the 7 photos alone are the weakly posed window set, see *Rebuilding a weakly posed map*), mapped again without them. Update 2: the mapper rebuilt the map (`rebuilt`, `gauge_shift` 1.59 m / 1.56° / scale 0.117 for its new internal gauge), aligned back: stored frames within 0.8 cm median, 1.5 cm max of version 1; the new frames 0.3–2.1 cm from the truth, in the priors' frame; 2 drifting frames `prior_conflict` at 8–9° (their default σ of 2°). 69 s and 76 s. |
+
+Measured per frame (`/api/health → timings`, 26 frames): registration 3.7 s, fusion 0.54 s. A job's
+`eta_s` uses them; a 7-frame job took 69-76 s against 30 s predicted (the mapper's fixed costs).
+The pose sigma proxy stayed at its floors (1 cm, 0.1°) on these SfM poses, which is optimistic
+against the 1-3 cm the priors measured.
+
+### Expected durations
+
+`/api/health → timings` defaults before any measurement (`service.timings.DEFAULTS`, seconds):
+registration 3.7 and fusion 0.54 per frame (above); locate 2.0 and frame analysis 1.5 per frame,
+grid read 0.5 and objects read 0.1 are placeholders until their groups measure them. Each kind
+keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
+`eta_s` = the remaining predicted time of the jobs ahead + `frames × (registration + fusion)`.
 
 ## Commands
 
