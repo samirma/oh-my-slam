@@ -847,3 +847,51 @@ def test_metric_first_frames_then_drifting_and_none_land_in_the_priors_frame(
 def anchor_rot(deg: float) -> np.ndarray:
     a = math.radians(deg)
     return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+
+
+# -- camera heights without the mapper's floor; masks reach the mapper --------------------------
+
+
+def test_heights_anchor_the_scale_on_the_cloud_s_floor_when_the_mapper_has_none(
+        client: Client) -> None:
+    rng = np.random.default_rng(2)
+    client.backend.floor_z = None
+    client.backend.points_z = np.concatenate([rng.normal(0.0, 0.005, 3000),  # the floor
+                                              rng.uniform(0.0, 0.9, 1000)])  # furniture
+    frames, files, truth = frames_of(client, 3)
+    job = client.update("m", frames, files, {"cam": {**CAMERA, "height_above_floor_m": 1.0,
+                                                     "height_sigma_m": 0.02}})
+    assert job["scale_source"] == "camera_height"
+    d01 = centre_error(job["inputs"][1]["T_map_cam"], np.asarray(job["inputs"][0]["T_map_cam"]))
+    assert d01 == pytest.approx(centre_error(truth[1], truth[0]), rel=0.02)
+    assert client.get("/api/maps/m", "MapSummary")["floor_z_m"] == pytest.approx(-1.0, abs=0.02)
+
+
+def test_a_monocular_map_takes_the_first_height_anchor(client: Client) -> None:
+    frames, files, truth = frames_of(client, 3)
+    first = client.update("m", frames, files, {"cam": CAMERA})
+    assert first["scale_source"] == "monocular"
+    frames, files, _ = frames_of(client, 2, start=3)
+    for f in frames:
+        f["height_above_floor_m"] = 1.0
+    job = client.update("m", frames, files)
+    assert job["scale_source"] == "camera_height"
+    assert job["quality"]["scale_ratio_vs_prev"] == pytest.approx(2.0, rel=1e-3)
+    fr = client.get("/api/maps/m/frames", "Frames")["frames"]
+    assert centre_error(fr[1]["T_map_cam"], np.asarray(fr[0]["T_map_cam"])) == pytest.approx(
+        centre_error(truth[1], truth[0]), rel=1e-3)
+
+
+def test_masks_reach_the_mapper_with_their_frames(client: Client) -> None:
+    import io
+
+    from PIL import Image
+
+    m = np.zeros((240, 320), np.uint8)
+    m[200:] = 255
+    buf = io.BytesIO()
+    Image.fromarray(m).save(buf, format="PNG")
+    frames, files, _ = frames_of(client, 2)
+    frames[1]["ignore_mask"] = "m"
+    client.update("m", frames, {**files, "m": buf.getvalue()}, {"cam": CAMERA})
+    assert client.backend.masks == [{"0001.jpg": "0001.mask.png"}]

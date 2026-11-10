@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.images import save_jpeg
+from oh_my_slam.core.images import png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.service import anchor, checks
 from oh_my_slam.service.anchor import Anchor, Sim3
@@ -64,6 +64,9 @@ SIGMA_POS_FLOOR_M = 0.01  # pose sigma proxy floors (README "Per-input status")
 SIGMA_ROT_FLOOR_DEG = 0.1
 DEFAULT_SCENE_DEPTH_M = 2.0
 LOW_CONFIDENCE_FACTOR = 3.0
+FLOOR_BINS = 50  # estimate_floor
+FLOOR_PEAK_SHARE = 0.25
+FLOOR_MIN_POINTS = 200
 JPEG_QUALITY = 95
 
 
@@ -103,6 +106,7 @@ class _Frame:
     measures: checks.Measures | None = None
     depth_m: NDArray[np.float32] | None = None  # on the canonical pinhole
     path: Path | None = None  # the image the mapper gets
+    mask_path: Path | None = None  # its ignore mask (PNG, the mapper's pixels), when it has one
     reason: str | None = None
     internal: InternalFrame | None = None
     pose: NDArray[np.float64] | None = None  # T_map_cam
@@ -167,6 +171,34 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
     pos = math.hypot(k * pos, align_rms_m)
     return (round(max(pos, SIGMA_POS_FLOOR_M), 4),
             round(max(math.degrees(k * rot), SIGMA_ROT_FLOOR_DEG), 3))
+
+
+def estimate_floor(points_z: NDArray[np.float64] | None, below: float) -> float | None:
+    """The floor's height from a cloud's point heights when the mapper has none (it takes its
+    floor from a detected floor surface, which a robot looking ahead may never see): among the
+    points lower than every camera (``below``), the lowest dense layer — the lowest of
+    ``FLOOR_BINS`` height bins between their 1st percentile and ``below`` that holds at least
+    ``FLOOR_PEAK_SHARE`` of the fullest bin — as the median height of that bin and its two
+    neighbours. None with fewer than ``FLOOR_MIN_POINTS`` such points."""
+    if points_z is None:
+        return None
+    z = points_z[np.isfinite(points_z) & (points_z < below)]
+    if z.size < FLOOR_MIN_POINTS:
+        return None
+    lo = float(np.percentile(z, 1))
+    hist, edges = np.histogram(z, bins=FLOOR_BINS, range=(lo, below))
+    i = int(np.argmax(hist >= FLOOR_PEAK_SHARE * hist.max()))
+    near = z[(z >= edges[max(i - 1, 0)]) & (z <= edges[min(i + 2, FLOOR_BINS)])]
+    return float(np.median(near))
+
+
+def map_floor(internal: InternalMap) -> float | None:
+    """The internal map's floor height: the mapper's, else ``estimate_floor`` of its cloud."""
+    if internal.floor_z is not None:
+        return internal.floor_z
+    if not internal.frames:
+        return None
+    return estimate_floor(internal.points_z, min(float(f.T[2, 3]) for f in internal.frames))
 
 
 def _inliers(f: InternalFrame) -> int:
@@ -237,6 +269,11 @@ class Updater:
                 fr.path.write_bytes(f.image)
             else:
                 save_jpeg(mapper_image(rgb, fr.cam, mask), fr.path, quality=JPEG_QUALITY)
+            if mask is not None and mask.any():
+                fr.mask_path = indir / f"{f.index:04d}.mask.png"
+                fr.mask_path.write_bytes(png_bytes(
+                    (fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0).astype(np.uint8)
+                    * 255))
             if med is None and fr.measures.suspicious:
                 med = self.backend.median_depth(fr.path, fr.cam.canonical())
             fr.reason = checks.reason(fr.measures, med)
@@ -270,8 +307,9 @@ class Updater:
             paths = [fr.path for fr in todo if fr.path is not None]
             intrinsics = {fr.path: fr.cam.canonical() for fr in todo if fr.path is not None}
             try:
-                reg = self.backend.register(mapper, paths, intrinsics,
-                                            workdir / f"mapper{attempt}.log")
+                reg = self.backend.register(
+                    mapper, paths, intrinsics, workdir / f"mapper{attempt}.log",
+                    {fr.path: fr.mask_path for fr in todo if fr.path and fr.mask_path})
             except NothingRegisteredError:
                 for fr in todo:
                     assert fr.measures is not None
@@ -336,7 +374,8 @@ class Updater:
             return (float(np.median(r)), "depth",
                     max(mad / math.sqrt(len(r)), MIN_SCALE_SIGMA_REL))
         heights = []
-        if internal.floor_z is not None:
+        floor_z = map_floor(internal)
+        if floor_z is not None:
             for fr in placed:
                 assert fr.internal is not None
                 h = fr.work.height_m if fr.work.height_m is not None else \
@@ -345,7 +384,7 @@ class Updater:
                     continue
                 sig = fr.work.height_sigma_m if fr.work.height_m is not None else \
                     fr.cam.height_sigma_m
-                h_int = float(fr.internal.T[2, 3]) - internal.floor_z
+                h_int = float(fr.internal.T[2, 3]) - floor_z
                 if h_int > MIN_CAMERA_HEIGHT_M and h > 0:
                     heights.append((h / h_int, (sig or DEFAULT_HEIGHT_SIGMA_M) / h))
         if heights:
@@ -434,6 +473,16 @@ class Updater:
             source = "priors"
             sigma = min(sigma, fit.scale_sigma_rel or sigma) if prev["scale_source"] == "priors" \
                 else (fit.scale_sigma_rel or sigma)
+        sim = fit.sim
+        if prev["scale_source"] == "monocular" and source == "monocular":
+            # a map anchored on monocular depth takes the first metric anchor that comes (depth
+            # images, camera heights): every stored position scales about the origin, which
+            # scale_ratio_vs_prev and the previous residuals report
+            s_new, src, sig = self._fallback_scale(placed, internal)
+            if src != "monocular":
+                sim = Sim3(s_new / sim.s).compose(sim)
+                source, sigma = src, sig
+        fit.sim = sim
         A = fit.sim.compose(prev_sim.inverse())
         shifts = [float(np.linalg.norm(A.point(x) - x))
                   for x in (prev_sim.point(a.src[:3, 3]) for a in previous)]
@@ -567,9 +616,9 @@ class Updater:
         else:
             pts = centres
         floor = None
-        if internal.floor_z is not None:
-            c = np.array([*np.mean([f.T[:2, 3] for f in internal.frames], axis=0),
-                          internal.floor_z])
+        floor_z = map_floor(internal)
+        if floor_z is not None:
+            c = np.array([*np.mean([f.T[:2, 3] for f in internal.frames], axis=0), floor_z])
             floor = round(float(sim.point(c)[2]), 4)
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "scale_source": anchored.scale_source,

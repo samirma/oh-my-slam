@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -1165,3 +1166,40 @@ def test_a_reader_reads_again_once_while_a_commit_is_applied(tmp_path: Path) -> 
     (tmp_path / store.STAGING / store.COMMIT).write_text("{}")
     calls.clear()
     assert reader._again(flaky) == 7 and len(calls) == 2
+
+
+def test_ignored_pixels_are_neither_fused_nor_detected(tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """The robot's own body (an ignore mask) leaves no depth and no detection on its keyframe."""
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.mapping import api
+    from oh_my_slam.reconstruction.api import FrameReconstruction
+    from oh_my_slam.segmentation.api import Detection
+
+    mask = np.zeros((40, 60), np.uint8)
+    mask[20:, :] = 255  # the lower half of the full-resolution image
+    png = tmp_path / "m.png"
+    Image.fromarray(mask).save(png)
+    K = Intrinsics(30.0, 30.0, 15.0, 10.0, 30, 20)
+
+    def reconstruct(kf: Any, work: Path, client: Any, lens: Any = None) -> Any:
+        frame = FrameReconstruction(kf.path, np.zeros((20, 30, 3), np.uint8),
+                                    np.ones((20, 30), np.float32), np.ones((20, 30), bool), K, K)
+        low = np.zeros((20, 30), bool)
+        low[15:] = True
+        both = np.ones((20, 30), bool)
+        return frame, [Detection("rug", 0.9, "default", low, (0, 15, 30, 20)),
+                       Detection("chair", 0.8, "default", both, (0, 0, 30, 20))]
+
+    monkeypatch.setattr(api, "reconstruct_and_detect_keyframe", reconstruct)
+    kf = ingest.Keyframe("f000000", 0, tmp_path / "a.jpg", "/in/a.jpg", None)
+    Image.new("RGB", (60, 40)).save(kf.path)
+    plain_kf = ingest.Keyframe("f000001", 1, tmp_path / "b.jpg", "/in/b.jpg", None)
+    Image.new("RGB", (60, 40)).save(plain_kf.path)
+    out = api._infer_frames([kf, plain_kf], "images", tmp_path, None, lambda m: None,
+                            lambda kfs: None, ignore={"/in/a.jpg": png})
+    nf, plain = out
+    assert not nf.frame.valid[10:].any() and nf.frame.valid[:10].all()
+    assert (nf.frame.depth[10:] == 0).all() and (nf.frame.depth[:10] == 1).all()
+    assert [d.label for d in nf.dets] == ["chair"] and not nf.dets[0].mask[10:].any()
+    assert plain.frame.valid.all() and len(plain.dets) == 2

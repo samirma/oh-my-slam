@@ -337,3 +337,20 @@ def test_timings_persist_and_predict(tmp_path: Path) -> None:
     path.write_text(json.dumps({"other": [1], "locate_per_frame": "x"}))
     assert Timings(path).body()["locate_per_frame"]["count"] == 0
     assert Timings(path).median("grid_read") == DEFAULTS["grid_read"]
+
+
+def test_the_floor_of_a_cloud() -> None:
+    from oh_my_slam.service.update import estimate_floor, map_floor
+
+    rng = np.random.default_rng(5)
+    z = np.concatenate([rng.normal(-1.5, 0.01, 4000), rng.uniform(-1.4, -0.2, 1500),
+                        rng.uniform(-3.0, -2.0, 20)])  # a few points below it: noise
+    assert estimate_floor(z, 0.0) == pytest.approx(-1.5, abs=0.03)
+    assert estimate_floor(None, 0.0) is None
+    assert estimate_floor(np.zeros(10) - 1.0, 0.0) is None
+
+    class Empty:
+        floor_z = None
+        frames: tuple[Any, ...] = ()
+
+    assert map_floor(Empty()) is None  # type: ignore[arg-type]

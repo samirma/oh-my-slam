@@ -167,17 +167,21 @@ def _progress(msg: str) -> None:
 
 def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client: Any,
                   progress: Progress, ingested: Callable[[list[ingest.Keyframe]], None],
-                  lens_of: Callable[[ingest.Keyframe], Intrinsics | None] = lambda kf: None
-                  ) -> list[NewFrame]:
+                  lens_of: Callable[[ingest.Keyframe], Intrinsics | None] = lambda kf: None,
+                  ignore: dict[str, Path] | None = None) -> list[NewFrame]:
     """Geometry, gravity and detections for every keyframe (two frames in flight), each started as
     soon as ingest has written it: the stage ``ingest`` decodes the input while the first
     keyframes' inference runs, ``inference`` waits for the rest. ``ingested`` is called with the
     keyframes once ingest has written them all, while their inference runs. A keyframe whose
-    camera ``lens_of`` knows to have distortion is inferred undistorted (``_undistorted``)."""
+    camera ``lens_of`` knows to have distortion is inferred undistorted (``_undistorted``). A keyframe
+whose source ``ignore`` names has that mask's pixels taken out (``_ignore_pixels``)."""
 
     def one(kf: ingest.Keyframe) -> NewFrame:
         lens = lens_of(kf)
         frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client, lens)
+        mask = (ignore or {}).get(kf.source)
+        if mask is not None:
+            dets = _ignore_pixels(frame, dets, mask)
         return NewFrame(kf, frame, dets, upright_size(kf.path), lens=lens)
 
     out: list[NewFrame] = []
@@ -201,6 +205,33 @@ def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client:
     finally:
         pool.shutdown(cancel_futures=True)  # on an error, the keyframes not started yet
     return out
+
+
+def _ignore_pixels(frame: FrameReconstruction, dets: list[Detection], mask_png: Path
+                   ) -> list[Detection]:
+    """Take the pixels an ignore mask marks (non-zero: the robot's own body) out of a keyframe:
+    no depth there, so they are never fused, and out of its detections (a detection left empty
+    goes). The mask has the keyframe image's size and is resampled onto each grid (nearest)."""
+    import cv2
+
+    from oh_my_slam.core.images import load_png
+
+    full = (np.asarray(load_png(mask_png)) > 0).astype(np.uint8)
+
+    def on(shape: tuple[int, ...]) -> NDArray[np.bool_]:
+        out: NDArray[np.bool_] = cv2.resize(full, (shape[1], shape[0]),
+                                            interpolation=cv2.INTER_NEAREST) > 0
+        return out
+
+    m = on(frame.depth.shape)
+    frame.valid = frame.valid & ~m
+    frame.depth = np.where(m, 0.0, frame.depth).astype(frame.depth.dtype)
+    kept = []
+    for det in dets:
+        keep = det.mask & ~on(det.mask.shape)
+        if keep.any():
+            kept.append(replace(det, mask=keep))
+    return kept
 
 
 def _undistorted(kf: ingest.Keyframe, lens: Intrinsics, work: Path) -> ingest.Keyframe:
@@ -3012,18 +3043,20 @@ class UpdateResult:
 
 def update(map_dir: Path, inputs: list[Path], *, fps: float = ingest.DEFAULT_FPS,
            client: Any = None, progress: Progress = _progress,
-           intrinsics: dict[Path, Intrinsics] | None = None) -> UpdateResult:
+           intrinsics: dict[Path, Intrinsics] | None = None,
+           ignore: dict[Path, Path] | None = None) -> UpdateResult:
     """Map the images ``inputs`` (in order), or one video sampled at ``fps`` (an internal sequence
     input: the service sends images), into the map ``map_dir`` (created when missing).
     ``intrinsics``: given intrinsics of input images, in place of their EXIF ones
-    (``ingest.keyframes``)."""
+    (``ingest.keyframes``); ``ignore``: an 8-bit PNG mask per input image, whose non-zero pixels
+    are neither fused nor detected (``_ignore_pixels``)."""
     with timing.collect() as tm:
-        return _update(map_dir, inputs, fps, client, progress, tm, intrinsics)
+        return _update(map_dir, inputs, fps, client, progress, tm, intrinsics, ignore)
 
 
 def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress: Progress,
-            tm: timing.Timings, intrinsics: dict[Path, Intrinsics] | None = None
-            ) -> UpdateResult:
+            tm: timing.Timings, intrinsics: dict[Path, Intrinsics] | None = None,
+            ignore: dict[Path, Path] | None = None) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
     from oh_my_slam.reconstruction.api import connect_server as connect
@@ -3054,7 +3087,7 @@ def _update(map_dir: Path, inputs: list[Path], fps: float, client: Any, progress
                     early.append(f)
 
             new = _infer_frames(kfs, spec.kind, work, client, progress, ingested,
-                                _lens_of(old))
+                                _lens_of(old), {str(k): v for k, v in (ignore or {}).items()})
             timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
             is_video = spec.kind == "video"
             ctx = UpdateContext(tx, meta, old, new, update_id, work,

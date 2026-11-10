@@ -55,6 +55,7 @@ class InternalMap:
     rebuilt: bool
     # a keyframe's aligned depth on its grid (internal units), None if it has none
     depth: Callable[[str], NDArray[np.float32] | None]
+    points_z: NDArray[np.float64] | None = None  # heights of the cloud's points (internal)
 
 
 @dataclass
@@ -73,8 +74,10 @@ class Backend(Protocol):
         """The median monocular depth of an image (metres), or None."""
 
     def register(self, mapper_dir: Path, inputs: list[Path],
-                 intrinsics: dict[Path, Intrinsics], log: Path) -> Registered:
-        """Map ``inputs`` into the mapper map ``mapper_dir`` (created if missing); raises
+                 intrinsics: dict[Path, Intrinsics], log: Path,
+                 masks: dict[Path, Path] | None = None) -> Registered:
+        """Map ``inputs`` into the mapper map ``mapper_dir`` (created if missing), the pixels of
+        each one's ignore mask (``masks``, PNG) neither fused nor detected; raises
         ``NothingRegisteredError`` or ``ApiError``."""
 
     def read(self, mapper_dir: Path) -> InternalMap:
@@ -132,12 +135,14 @@ class MapperBackend:
         return median_depth(np.where(fr.valid, fr.depth, 0.0).astype(np.float32))
 
     def register(self, mapper_dir: Path, inputs: list[Path],
-                 intrinsics: dict[Path, Intrinsics], log: Path) -> Registered:
+                 intrinsics: dict[Path, Intrinsics], log: Path,
+                 masks: dict[Path, Path] | None = None) -> Registered:
         args = log.with_suffix(".args.json")
         result = log.with_suffix(".result.json")
         args.write_text(json.dumps({
             "map_dir": str(mapper_dir), "inputs": [str(p) for p in inputs],
             "intrinsics": {str(p): K.to_dict() for p, K in intrinsics.items()},
+            "masks": {str(p): str(m) for p, m in (masks or {}).items()},
             "result": str(result)}))
         with log.open("ab") as out, self._lock:
             self._proc = subprocess.Popen(
@@ -174,11 +179,12 @@ class MapperBackend:
         frames = [InternalFrame(f.name, f.source, f.T_map_cam.matrix(), float(f.K.fx),
                                 dict(f.stats), bool(f.low_confidence)) for f in reader.frames]
         by_name = {f.name: f for f in reader.frames}
-        bounds = None
+        bounds, points_z = None, None
         if reader.exists(CLOUD_PLY):
             pts = read_ply(reader.path(CLOUD_PLY)).xyz
             if len(pts):
                 bounds = (pts.min(0).tolist(), pts.max(0).tolist())
+                points_z = np.asarray(pts[:, 2], np.float64)
         updates = reader.meta.get("updates", [])
         rebuilt = bool(updates and "restarted" in updates[-1].get("notes", {}))
 
@@ -193,7 +199,8 @@ class MapperBackend:
             return np.where(reader.valid(fr), d, 0.0).astype(np.float32)
 
         floor = reader.meta.get("floor_z")
-        return InternalMap(frames, None if floor is None else float(floor), bounds, rebuilt, depth)
+        return InternalMap(frames, None if floor is None else float(floor), bounds, rebuilt, depth,
+                           points_z)
 
     def terminate(self) -> None:
         with self._lock:

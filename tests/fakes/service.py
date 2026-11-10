@@ -84,6 +84,8 @@ class FakeBackend:
     mono: float | None = 2.0
     rebuild_with: Sim3 | None = None  # a new gauge applied to every stored frame on register
     calls: list[list[str]] = field(default_factory=list)
+    masks: list[dict[str, str]] = field(default_factory=list)  # the ignore masks of each call
+    points_z: np.ndarray | None = None  # the cloud's heights (world), for a mapper without floor
     nothing: bool = False
     stats: dict[str, Any] = field(default_factory=lambda: {"observations": 400.0,
                                                            "reproj_error": 0.6})
@@ -109,8 +111,9 @@ class FakeBackend:
         return self.gauge.pose(T)
 
     def register(self, mapper_dir: Path, inputs: list[Path], intrinsics: dict[Path, Intrinsics],
-                 log: Path) -> Registered:
+                 log: Path, masks: dict[Path, Path] | None = None) -> Registered:
         self.calls.append([p.name for p in inputs])
+        self.masks.append({p.name: m.name for p, m in (masks or {}).items()})
         if self.nothing:
             raise NothingRegisteredError("nothing (test)")
         mapper_dir.mkdir(parents=True, exist_ok=True)
@@ -154,8 +157,9 @@ class FakeBackend:
         floor = None if self.floor_z is None else float(gauge.point(np.array([0, 0, self.floor_z]))[2])
         lo = gauge.point(np.array([-1.0, -1.0, 0.0]))
         hi = gauge.point(np.array([3.0, 3.0, 2.0]))
+        pz = None if self.points_z is None else self.points_z * gauge.s + gauge.t[2]
         return InternalMap(frames, floor, (np.minimum(lo, hi).tolist(), np.maximum(lo, hi).tolist()),
-                           bool(state.get("rebuilt")), depth)
+                           bool(state.get("rebuilt")), depth, pz)
 
     def terminate(self) -> None:
         pass
