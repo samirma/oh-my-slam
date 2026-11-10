@@ -159,7 +159,7 @@ def test_retry_timeout_and_monocular(base_episode: tuple[Path, synth.Synth],
     cfg = base_config(syn, busy_once=True, capabilities=["O1", "O2", "O4"], eta=None)
     with Fake(cfg) as fake:
         res = run(fake, root, tmp_path / "r.json", "--priors", "none", "--no-height",
-                  "--targets", str(write(tmp_path / "t.json", {"targets": {
+                  "--retry-wait-s", "0", "--targets", str(write(tmp_path / "t.json", {"targets": {
                       "c3.readable_s": {"op": "<=", "value": 1e-9}, "junk": 1}})))
     ov = res["overall"]
     assert ov["c2.scale_error_monocular"]["status"] == "info"
@@ -168,7 +168,7 @@ def test_retry_timeout_and_monocular(base_episode: tuple[Path, synth.Synth],
     cfg = base_config(syn, durations=(0.0, 0.05, 30.0))
     with Fake(cfg) as fake:
         res = run(fake, root, tmp_path / "r2.json", "--priors", "metric", "--job-timeout-s",
-                  "0.3", "--episode", "e041")
+                  "0.1", "--wait-s", "0.05", "--episode", "e041")
     jobs = res["episodes"]["e041"]["runs"]["metric"]["jobs"]
     assert jobs[0]["state"] == "cancelled" and "timed out" in jobs[0]["error"]
 

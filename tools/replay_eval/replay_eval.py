@@ -64,6 +64,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--range-scans", type=int, default=5)
     p.add_argument("--job-timeout-s", type=float, default=1800.0)
     p.add_argument("--timeout-s", type=float, default=300.0, help="per HTTP request")
+    p.add_argument("--retries", type=int, default=3, help="retries of a retryable error")
+    p.add_argument("--retry-wait-s", type=float, default=2.0)
     p.add_argument("--align-min-spread-m", type=float, default=0.5)
     return p.parse_args(argv)
 
@@ -173,7 +175,8 @@ def replay_run(args: argparse.Namespace, validator: Validator, ep: Episode, mode
                layout: dict[str, Any], params: Params, options: Options,
                targets: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], Samples | None]:
     log = Log()
-    api = Api(args.server, validator, log, timeout_s=args.timeout_s)
+    api = Api(args.server, validator, log, timeout_s=args.timeout_s, retries=args.retries,
+              retry_wait_s=args.retry_wait_s)
     name = f"{args.map_prefix}{ep.id}-{mode}"
     try:
         rec = Replayer(api, ep, mode, caps, name, options).run()

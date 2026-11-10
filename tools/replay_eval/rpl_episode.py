@@ -324,7 +324,7 @@ def read_events(root: Path, sets: dict[str, FrameSet], layout: dict[str, Any],
             for leaf in _strings(line):
                 for part in re.split(r"[/\\]", leaf):
                     keys = by_name.get(part, [])
-                    choice = [k for k in keys if k.split("/")[0] in leaf] or keys
+                    choice = [k for k in keys if k.split("/")[0] in text] or keys
                     if choice:
                         refs.append((text.find(leaf), choice[0], None))
         if not refs:
@@ -506,7 +506,7 @@ def dump_layout(root: Path, layout: dict[str, Any]) -> dict[str, Any]:
         if rc.is_dir() else []
     try:
         ep = load_episode(root, layout)
-    except (LayoutError, ValueError, KeyError) as e:
+    except (LayoutError, ValueError, KeyError, OSError) as e:
         out["load"] = {"error": str(e)}
     else:
         out["load"] = {

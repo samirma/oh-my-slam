@@ -18,7 +18,18 @@ from typing import Any
 import numpy as np
 from rpl_api import Log
 from rpl_episode import Episode, Frame
-from rpl_floorplan import BORDER, DOOR, FLOOR, OUTSIDE, WALL, FloorPlan, Raster, TruthObject, poly_distance, ray_cast
+from rpl_floorplan import (
+    BORDER,
+    DOOR,
+    FLOOR,
+    OUTSIDE,
+    WALL,
+    FloorPlan,
+    Raster,
+    TruthObject,
+    poly_distance,
+    ray_cast,
+)
 from rpl_geometry import Arr, Sim3, angle_deg, mat4, optical_yaw_deg, umeyama, wrap_deg
 from rpl_replay import Record
 

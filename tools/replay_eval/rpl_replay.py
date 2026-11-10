@@ -248,7 +248,7 @@ class Replayer:
                     obs.observe(time.monotonic(), job)
                     break
                 job, _ = self.api.call("GET", f"/api/jobs/{obs.job_id}", "GET job", "Job",
-                                       params={"wait_s": self.opt.wait_s})
+                                       params={"wait_s": min(30.0, self.opt.wait_s)})
                 obs.observe(time.monotonic(), job)
         except ApiError as e:
             obs.error = str(e)

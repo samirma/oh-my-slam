@@ -220,7 +220,7 @@ class Fake:
         if "version" in query:
             v = int(query["version"][0])
             if v < 1 or v > len(m.versions):
-                raise Failure(410, "version_gone", "version gone")
+                raise FakeError(410, "version_gone", "version gone")
             return m.versions[v - 1]
         return m.versions[-1]
 
@@ -433,10 +433,10 @@ class Fake:
                     with fake.lock:
                         fake.advance_all()
                     if fake.cfg.fail_route and path.endswith(fake.cfg.fail_route):
-                        raise Failure(500, "internal", "boom")
+                        raise FakeError(500, "internal", "boom")
                     status, body = fake.route(method, path, q, self)
                     self.send(status, body)
-                except Failure as e:
+                except FakeError as e:
                     self.send(e.status, {"schema": "oms/2.1", "error": {
                         "code": e.code, "message": e.message, "retryable": e.retryable,
                         "details": {}}})
@@ -461,13 +461,13 @@ class Fake:
             req, _ = h.body()
             with self.lock:
                 if req.get("map") not in self.maps:
-                    raise Failure(404, "map_not_found", "no map")
+                    raise FakeError(404, "map_not_found", "no map")
                 return 200, self.analyse(req)
         if parts[:2] == ["api", "jobs"]:
             with self.lock:
                 job = self.jobs.get(parts[2])
                 if job is None:
-                    raise Failure(404, "job_not_found", "no job")
+                    raise FakeError(404, "job_not_found", "no job")
                 if method == "DELETE":
                     job.state = "cancelled"
                     return 200, self.job_body(job)
@@ -483,7 +483,7 @@ class Fake:
             return self.update(name, req, files, "dry_run" in q)
         with self.lock:
             if name not in self.maps:
-                raise Failure(404, "map_not_found", f"no map {name}")
+                raise FakeError(404, "map_not_found", f"no map {name}")
             m = self.maps[name]
             if method == "DELETE":
                 del self.maps[name]
@@ -508,7 +508,7 @@ class Fake:
             with self.lock:
                 self.revert_calls += 1
                 if self.cfg.busy_once and self.revert_calls == 1:
-                    raise Failure(409, "map_busy", "busy", True)
+                    raise FakeError(409, "map_busy", "busy", True)
                 old = m.versions[int(req["to_version"]) - 1]
                 m.frames = {r["name"]: dict(r) for r in old["frames"]}
                 self.commit(name, "revert", None)
@@ -517,13 +517,13 @@ class Fake:
             req, _ = h.body()
             with self.lock:
                 return 200, self.locate(name, req)
-        raise Failure(404, "invalid_request", f"no route {method} {path}")
+        raise FakeError(404, "invalid_request", f"no route {method} {path}")
 
     def update(self, name: str, req: dict[str, Any], files: dict[str, bytes],
                dry: bool) -> tuple[int, Any]:
         for f in req["frames"]:
             if f["image"] not in files:
-                raise Failure(400, "invalid_request", f"no part {f['image']}")
+                raise FakeError(400, "invalid_request", f"no part {f['image']}")
         metric = req["frames"][0].get("prior", {}).get("trust") == "metric"
         with self.lock:
             sim = self.maps[name].sim if name in self.maps else (
@@ -565,7 +565,7 @@ class Fake:
             return 202, self.job_body(job)
 
 
-class Failure(Exception):
+class FakeError(Exception):
     def __init__(self, status: int, code: str, message: str, retryable: bool = False) -> None:
         super().__init__(message)
         self.status, self.code, self.message, self.retryable = status, code, message, retryable
