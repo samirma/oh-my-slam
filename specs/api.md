@@ -119,7 +119,8 @@ error code `invalid_request` (§9).
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
-  `reason` says why. Its prior residuals are 0. It is stored and may be fused, but locate never
+  `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
+  `drifting` prior, after mapping through the drift estimate). It is stored and may be fused, but locate never
   uses it as a reference (§6).
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the

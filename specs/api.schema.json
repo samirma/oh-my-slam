@@ -278,7 +278,7 @@
         "max_residual_m": {
           "type": "number",
           "minimum": 0,
-          "description": "Gates previous_residuals (stored keyframes) and the new frames' displacement; prior corrections never fail it."
+          "description": "Gates previous_residuals.max_m (stored keyframes) only; new-frame disagreement is gated by max_displacement_*; prior corrections never fail it."
         },
         "max_gauge_shift_m": {
           "type": "number",

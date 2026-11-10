@@ -139,9 +139,10 @@ becomes a job with a `job_id`. A job goes through these states:
 * **The gate.** The request option `accept_if {max_residual_m, max_gauge_shift_m,
   max_displacement_m, max_displacement_deg, max_prior_disagreement_deg, max_rejected_share}` is
   evaluated on the registration phase's report, before anything is committed:
-  * `max_residual_m` gates `previous_residuals` (stored keyframes) and the new frames'
-    displacement only, so a stored keyframe that moved fails the update. Prior corrections,
-    shown in `prior_disagreement_deg` and `prior_residual_*`, never fail it;
+  * `max_residual_m` gates `previous_residuals.max_m` (stored keyframes) only, so a stored
+    keyframe that moved fails the update. New-frame disagreement is gated only by
+    `max_displacement_*`. Prior corrections, shown in `prior_disagreement_deg` and
+    `prior_residual_*`, never fail it;
   * `max_gauge_shift_m` gates the stored keyframes' median movement;
   * `max_displacement_m` and `max_displacement_deg` gate `quality.max_displacement_m` and
     `quality.max_displacement_deg`, so a single new frame that disagrees with its images fails
