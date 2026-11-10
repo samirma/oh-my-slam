@@ -260,11 +260,29 @@ called by `service.prior_first` after the engine placed and fused the update's k
   depth: samples seen through by more than max(4 cm, 4 % of the depth) against samples in place
   (hidden ones and the bottom quarter, the support, tell nothing). After the object's last
   sighting, more keyframes seeing it gone than in place strike it (one alone must see 70 %
-  through): `state: struck` for that version, removed by the next update, and the cloud voxels
+  through, from a depth image; monocular views need two): `state: struck` for that version, removed by the next update, and the cloud voxels
   in its box that the witnesses see through are carved. A new object of a compatible label,
   similar size (×1.6) and colour (60 sRGB) appearing in the same update is that object moved:
   `moved`, `moved_from_m`. An object is listed from two detections, or one that no keyframe
   contradicted by seeing its place without detecting it.
+* **See-through objects.** Monocular depth looks past glass and foliage, and per detection it
+  shows no sign of it (the depth inside a globe's or a window's mask matched its own points within
+  1-7 % on `office_sequence`). So an object is treated as see-through by its history: a keyframe
+  detected it after another keyframe's depth had seen it gone, or (with depth images) the depth
+  inside its masks lies beyond its points in several views. It is then judged by its detection
+  only (a keyframe that has its place in view, unhidden, at ≥ 200 px and does not detect it), and
+  no keyframe judges any object on depth where one of its detections of a comparable size (≤ 4×)
+  covers the object's place. On `office_sequence` (640 px in 4 + 4, 1280 px in 13 and 4 + 9) only
+  the cup is struck; the glass globe, the tree behind the window and the window panes stay.
+* **Fragments.** A detection cut by the image border that has half its points within an
+  object's box grown by 5 cm is that object, whatever its label (an apple's edge seen as an
+  orange), and votes for its label with a quarter of its score; one cut detection alone is not
+  listed until another view confirms it. Round produce the detector confuses (apple, orange,
+  tomato, peach, lemon, pear, onion, potato) is associated together.
+* **Labels.** Generic labels (`ball`, `food`, `fruit`, `vegetable`, `toy`, `container`) match
+  any label and never outvote a specific one that has a quarter of their votes; the vocabulary
+  has the simulated kitchens' items (lettuce, spatula, ladle, salt and pepper shakers, sponge,
+  spray bottle, credit card, besides the produce and tableware it had).
 * **Fields.** `mean_rgb`: the pixel-weighted mean of the robust mean colours (inner mask, 10-90 %
   luminance) of the 3 sightings that saw it best (uncut masks first, then largest). `color`: the
   id's display colour. `sigma_centre_m`: the sightings' pose sigma and depth noise (1 % sensor,
@@ -272,13 +290,17 @@ called by `service.prior_first` after the engine placed and fused the update's k
   axis is only partly seen. `extent_seen`: an axis is `full` when an uncut sighting sees it across
   (|cos| ≤ 0.8 to the ray) or sightings from both ends see it; `z` when one sees top and bottom
   uncut, or the top with the box resting on a support.
-* **Surfaces.** Horizontal planes of the fused cloud: 5 cm cells whose points concentrate (50 %
+* **Surfaces.** Horizontal planes of the fused cloud's up-facing points (normals within 25° of
+  up, turned to the cameras: no object sides, walls or ceiling): 5 cm cells whose points concentrate (50 %
   of ±10 cm) in a ±2 cm slab at a height many cells share; connected areas of at least 0.06 m²
   with a core (no lines of wall cells), up to the highest camera. `height_m` is the median of
   their points; ids are stable (same height within 4 cm and overlapping extent).
 * **Relations.** `supported_by`: the surface or object top within 5 cm of the box's bottom under
   its centre — the surface when both fit unless the object's top is nearer by 1 cm and it is no
-  table-like top; the box then rests on the surface. `inside_of`: the centre within the box of a
+  table-like top; of surfaces as near, the largest; a support object is at least as large as the
+  object and no floor covering (a rug or carpet is listed only on a room-sized surface). The box
+  as fitted then rests on its support: an object seen only from above (its height `partial`)
+  finds its support up to 30 cm below its top part and its height is completed down to it. `inside_of`: the centre within the box of a
   larger container (bowl, box, basket, drawer, cup...), which also supports it.
   `verified_version`: the latest version that observed the object or its support with the
   relation holding (surfaces are measured by every update).
@@ -305,6 +327,9 @@ inference server, `examples/office_sequence` downscaled to 1280 × 960, trust `n
   including the detections it waits for. The objects read: 1-2 ms once the version's answer is
   kept; 0.6-2.6 s when it arrives before the derivation worker has derived the version (the read
   derives it).
+* **Synthetic worktop** (an arm's view from above at 640 × 360, depth noise 1 % + 3 mm): the
+  worktop within 1 cm, the apple, egg, plate and mug bottoms on it within 1 cm, the tomato
+  `supported_by` the plate.
 * **Synthetic table** (`tests/unit/test_anchored_objects.py`, exact depth and masks): floor and
   table top within 5 mm, `supported_by`, `inside_of` (apple in basket, egg in bowl), box resting
   on the top, `mean_rgb` exact, struck and moved with ids kept.

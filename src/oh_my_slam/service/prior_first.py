@@ -175,7 +175,8 @@ def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[l
     if struck:
         am.cloud.drop(om.carve(struck, am.cloud.points()))
     top = max((float(k.centre[2]) for k in am.keyframes), default=None)
-    om.finish(am.cloud.points(), top, version)
+    om.finish(am.cloud.points(), top, version,
+              np.array([k.centre for k in am.keyframes]).reshape(-1, 3), floor)
     return om, len(om.records()["objects"])
 
 

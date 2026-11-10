@@ -445,14 +445,15 @@ def test_detect_asks_the_detector_on_a_grid(tmp_path: Path, monkeypatch: pytest.
 
     seen: dict[str, Any] = {}
 
-    def detect_on_grid(path: Path, grid: tuple[int, int], client: Any) -> list[Any]:
+    def detect_on_grid(path: Path, grid: tuple[int, int], client: Any, **kw: Any) -> list[Any]:
         seen["grid"] = grid
+        seen.update(kw)
         return ["d"]
 
     monkeypatch.setattr(rec, "connect_server", lambda: _Client())
     monkeypatch.setattr(seg, "detect_on_grid", detect_on_grid)
     assert be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48)) == ["d"]
-    assert seen["grid"] == (64, 48)
+    assert seen["grid"] == (64, 48) and seen["min_score"] == be.MAP_MIN_SCORE
 
     def boom() -> Any:
         raise ServerUnavailableError("down")

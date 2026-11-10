@@ -13,35 +13,55 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   of the object's inside its own; both, for other labels), or the nearness of the centres for
   compatible labels — one
   object per observation and one observation per object in a keyframe. Compatible labels match
-  from ``MATCH_MIN``, others (a flickering label) only from ``MATCH_ANY``. An unmatched
+  from ``MATCH_MIN`` (a generic label, ``GENERIC_LABELS``, goes with any), others (a
+  flickering label) only from ``MATCH_ANY``; a detection cut by the image border with half its
+  points within an object's grown box is that object, whatever its label (a fragment of it), and
+  votes for its label with a quarter of its score; round produce the detector confuses
+  (``PRODUCE``) goes together. The label is the most voted, a specific one first
+  (``MapObject.label``). An unmatched
   observation starts a new object, its id the next of ``next_id`` (never reused).
 * **Latest wins** (map.md §3). Every object that a keyframe has in view (``IN_VIEW_SHARE`` of its
   samples in the image, within the fused depth) but did not detect is judged on that keyframe's
   depth (``judge``): samples seen through by more than ``tau`` (max(``SEEN_TAU_M``,
   ``SEEN_TAU_REL`` x depth)) against samples seen in place; samples hidden by something nearer
   and those in the bottom ``FOOT_SHARE`` of the box (the support at its foot looks the same with
-  or without it) tell nothing; nor is what depth sees through anyway (``SEE_THROUGH``: a window,
-  a glass). After an object's last sighting in the update, it is ``struck``
+  or without it) tell nothing. An object the depth sees through (``see_through``: a keyframe
+  detected it after a keyframe's depth had seen it gone, or in several of its sightings the
+  depth inside its mask lies beyond its own points — a glass globe, a window, trees behind one) is never judged on depth: only a keyframe that has its place in view,
+  unhidden and large enough, and does not detect it counts against it, and one such keyframe
+  never strikes it. Nor does a keyframe judge an object on depth where one of its detections of
+  a comparable size covers the object's place (``_detected_there``: a glass detected under
+  another label). After an object's last sighting in the update, it is ``struck``
   when the keyframes that saw it gone outnumber those that saw it in place (a single one must see
-  ``GONE_ALONE`` of it through). A struck object keeps its record for that version and is removed
+  ``GONE_ALONE`` of it through, with a depth image: one monocular view is not enough). A struck object keeps its record for that version and is removed
   by the next update; the cloud voxels inside its box that its witnesses see through are carved
   (``carve``), so the surface behind it shows the latest view.
 * **Moved.** A new object of a compatible label, similar size (``MOVE_SIZE``) and colour
   (``MOVE_RGB``) that appears in the update in which an object is struck takes that object's id:
   ``state: moved`` with ``moved_from_m`` its old centre.
-* **Published.** An object is listed once two keyframes detected it, or one did and no keyframe
-  that had it in view saw its place without detecting it; once listed it stays listed. A single
+* **Published.** Detections are kept from a score of 0.2 (``service.backend.MAP_MIN_SCORE``),
+  without masks over 40 % of the image (background) or nearer the camera than 12 cm (the robot).
+  An object is listed once two keyframes detected it, or one did, whole (its mask touching no
+  image border) and with a score of at least ``TRUSTED_SCORE``, and no keyframe that had it in view saw its place without detecting
+  it; once listed it stays listed. A single
   detection that later keyframes see gone is dropped; two or more make it ``struck``.
 * **Boxes** are upright boxes (``segmentation.api.fit_object_obb``) fitted to the points of its
   sightings that agree on the centre; floor-standing classes are grounded on the map's floor.
-* **Surfaces** (``find_surfaces``): horizontal planes of the fused cloud — cells of
+* **Surfaces** (``find_surfaces``): horizontal planes of the fused cloud's points that face up
+  (normals within 25 degrees of up, turned towards the cameras: no object sides, walls or
+  ceiling) — cells of
   ``SURFACE_CELL_M`` whose points concentrate (``FLAT_SHARE``) in a slab of ``SLAB_BINS`` bins either side at a
   height that many cells share; their connected areas over ``SURFACE_MIN_AREA_M2``. Ids are
   stable across versions (``assign_surface_ids``: height within ``SURFACE_ID_DZ`` and overlapping
   extent).
 * **Relations.** ``supported_by``: the surface or the top of an object within
   ``SUPPORT_TOL_M`` of the box's bottom under its centre (a surface when both fit, unless the
-  object's top is clearly nearer and it is no furniture top); the box rests on it. ``inside_of``:
+  object's top is clearly nearer and it is no furniture top; of surfaces as near, the largest;
+  a support object is at least as large as the object and no floor covering, which is listed
+  only on a room-sized surface); the box, as fitted, rests on it: a view from above sees only
+  an object's top, so its height is completed down to the support, found up to
+  ``SUPPORT_REACH_M`` below it (``z`` stays ``partial``
+  unless a sighting saw its height from the side). ``inside_of``:
   the centre within a container's box (``CONTAINERS``: a bowl, a box, a drawer, a cup) that is
   larger than the object, which then is supported by it too. ``verified_version``: the latest
   version that observed the object or its support with the relation holding.
@@ -68,7 +88,7 @@ from numpy.typing import NDArray
 from scipy import ndimage
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.geometry import project, voxel_keys
+from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
@@ -131,6 +151,7 @@ BAND_BINS = 10  # the column a cell's slab share is counted in: +-10 cm
 FLAT_SHARE = 0.5
 SURFACE_MIN_AREA_M2 = 0.06
 SURFACE_MIN_POINTS = 200
+UP_NORMAL_Z = 0.9  # a point of a support plane's top: its normal within 25 degrees of up
 CORE_SHARE = 0.25  # of the least area: cells left after one erosion (no lines of cells)
 SURFACE_PEAK_BINS = 2
 SURFACE_ID_DZ = 0.04
@@ -139,8 +160,29 @@ SURFACE_ID_CENTRE_M = 0.3
 SUPPORT_TOL_M = 0.05
 SUPPORT_PREFER_OBJECT_M = 0.01
 CARVE_GROW_M = 0.02
-# what a keyframe's depth sees through even while it is there: never judged on depth
-SEE_THROUGH = frozenset({"window", "shop window", "glass", "wine glass", "glass door"})
+BEHIND_SHARE = 0.3  # of a detection's mask: depth beyond its own points (it is seen through)
+SEE_THROUGH_VIEWS = 2
+ABSENT_SHARE = 0.5  # a see-through object's verdict when a keyframe does not detect it
+DETECT_MIN_PX = 200  # ... judged only where it would cover this many pixels
+COVERED_SHARE = 0.5  # a keyframe that detects something over this share of an object's place
+COVER_SIZE = 4.0  # ... at most this many times its size, sees it there: no depth verdict
+# labels the detector gives what it cannot name better: they never outvote a specific label that
+# has SPECIFIC_SHARE of their votes, and they go with any label
+GENERIC_LABELS = frozenset({"ball", "food", "fruit", "vegetable", "toy", "container"})
+SPECIFIC_SHARE = 0.25
+MIN_OBJECT_M = 0.03
+TRUSTED_SCORE = 0.5  # a single detection lists an object only from this score
+MAX_MASK_SHARE = 0.4  # a mask over more of the image than this is the background
+NEAR_CAMERA_M = 0.12  # a detection nearer the camera than this is on the robot  # a box smaller than this on its longest side is a fragment, not listed
+PRODUCE = frozenset({"apple", "orange", "tomato", "peach", "lemon", "pear", "onion", "potato"})
+FRAGMENT_INSIDE = 0.5  # a border-cut detection with this share of its points in an object's box
+CUT_VOTE = 0.25  # (grown by MATCH_GROW_M) is that object; it votes with this share of its score
+# floor coverings: never a support, and listed only on a room-sized surface (ROOM_FLOOR_M2)
+FLOOR_COVERINGS = frozenset({"rug", "carpet", "mat", "doormat", "bath mat"})
+ROOM_FLOOR_M2 = 3.0
+SUPPORT_AREA_RATIO = 1.0  # a support object's footprint is at least the object's
+SUPPORT_SAME_M = 0.01
+SUPPORT_REACH_M = 0.30  # surfaces this near in gap: the larger one supports
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -201,6 +243,10 @@ class Sighting:
     label: str
     score: float
     depth_rel: float = DEPTH_NOISE_REL  # the keyframe depth's relative noise
+    # see-through evidence (``see_through``): the share of the mask's depth beyond the object's
+    # own points, and the median range of the mask's depth from the camera
+    behind: float = 0.0
+    mask_range: float = 0.0
 
     @property
     def truncated(self) -> bool:
@@ -290,13 +336,25 @@ class MapObject:
     last_seen_version: int = 0
     published: bool = False
     misses: int = 0  # keyframes that saw its place in place without detecting it
+    # keyframes that detected it after a keyframe's depth saw it gone (``see_through``), and
+    # the latest verdict on it ("seen", "gone", "in_place")
+    contradicted: int = 0
+    last_verdict: str | None = None
     supported_by: dict[str, Any] | None = None
     inside_of: dict[str, Any] | None = None
     struck_version: int | None = None
 
     @property
     def label(self) -> str:
-        return max(sorted(self.votes), key=lambda k: self.votes[k])
+        """The label with the most votes, the specific ones first: a specific label with at
+        least ``SPECIFIC_SHARE`` of the leading generic one's votes wins (an apple also scored
+        as a ball or a fruit is an apple)."""
+        best = max(sorted(self.votes), key=lambda k: self.votes[k])
+        specific = [k for k in sorted(self.votes) if k not in GENERIC_LABELS]
+        if not specific or best not in GENERIC_LABELS:
+            return best
+        top = max(specific, key=lambda k: self.votes[k])
+        return top if self.votes[top] >= SPECIFIC_SHARE * self.votes[best] else best
 
     @property
     def score(self) -> float:
@@ -312,7 +370,8 @@ class MapObject:
                 "moved_from": self.moved_from, "first_seen_version": self.first_seen_version,
                 "last_seen_version": self.last_seen_version, "published": self.published,
                 "misses": self.misses, "supported_by": self.supported_by,
-                "inside_of": self.inside_of, "struck_version": self.struck_version}
+                "inside_of": self.inside_of, "struck_version": self.struck_version,
+                "contradicted": self.contradicted, "last_verdict": self.last_verdict}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> MapObject:
@@ -324,7 +383,9 @@ class MapObject:
                          last_seen_version=int(d["last_seen_version"]),
                          published=bool(d["published"]), misses=int(d["misses"]),
                          supported_by=d["supported_by"], inside_of=d["inside_of"],
-                         struck_version=d["struck_version"])
+                         struck_version=d["struck_version"],
+                         contradicted=int(d.get("contradicted", 0)),
+                         last_verdict=d.get("last_verdict"))
 
 
 @dataclass
@@ -345,6 +406,14 @@ class Observation:
 # -- association (also frame analysis') ----------------------------------------------------------
 
 
+def alike(a: str, b: str) -> bool:
+    """Compatible labels (``segmentation.api.compatible``), one of them generic
+    (``GENERIC_LABELS``: a ball, a fruit, a container may be anything of its shape), or both
+    round produce the detector confuses (``PRODUCE``: an apple seen as an orange)."""
+    return compatible(a, b) or a in GENERIC_LABELS or b in GENERIC_LABELS or (
+        a in PRODUCE and b in PRODUCE)
+
+
 def _extent(points: Array) -> float:
     if not len(points):
         return 0.0
@@ -352,16 +421,22 @@ def _extent(points: Array) -> float:
     return float(np.max(hi - lo))
 
 
-def affinity(label: str, points: Array, centre: Array, o: MapObject) -> float:
-    """How strongly an observation (its label, map-frame points and centre) is object ``o``."""
+def affinity(label: str, points: Array, centre: Array, o: MapObject, cut: bool = False
+             ) -> float:
+    """How strongly an observation (its label, map-frame points and centre; ``cut``: its mask
+    touches the image border) is object ``o``."""
     if o.box is None or not len(points):
         return 0.0
     inside = float(np.mean(o.box.contains(points, MATCH_GROW_M)))
+    if cut and inside >= FRAGMENT_INSIDE:
+        # a fragment at the image border, within or touching the object's box: the object,
+        # whatever the label it was given
+        return max(MATCH_MIN, inside * MATCH_ANY)
     back = 0.0
     if len(o.points):
         lo, hi = points.min(0) - MATCH_GROW_M, points.max(0) + MATCH_GROW_M
         back = float(np.mean(np.all((o.points >= lo) & (o.points <= hi), axis=1)))
-    if compatible(label, o.label) or any(compatible(label, k) for k in o.votes):
+    if alike(label, o.label) or any(alike(label, k) for k in o.votes):
         a = max(inside, back)
         gate = MATCH_CENTRE_M + 0.5 * max(_extent(points), float(np.max(o.box.size)))
         d = float(np.linalg.norm(centre - o.box.centre))
@@ -374,14 +449,16 @@ def affinity(label: str, points: Array, centre: Array, o: MapObject) -> float:
     return a if a >= MATCH_ANY else 0.0
 
 
-def match(obs: list[tuple[str, Array, Array]], objects: list[MapObject]) -> list[int | None]:
-    """The object id of each observation (label, map-frame points, centre) of one image, or
-    None: strongest affinity first, one object per observation and one observation per object.
-    Frame analysis (O7) gives its detections the ids of the map objects they match."""
+def match(obs: list[tuple[str, Array, Array]], objects: list[MapObject],
+          cut: list[bool] | None = None) -> list[int | None]:
+    """The object id of each observation (label, map-frame points, centre; ``cut``: its mask
+    touches the image border) of one image, or None: strongest affinity first, one object per
+    observation and one observation per object. Frame analysis (O7) gives its detections the ids
+    of the map objects they match."""
     pairs = []
     for i, (label, pts, c) in enumerate(obs):
         for o in objects:
-            a = affinity(label, pts, c, o)
+            a = affinity(label, pts, c, o, bool(cut[i]) if cut is not None else False)
             if a > 0:
                 pairs.append((-a, i, o.id))
     out: list[int | None] = [None] * len(obs)
@@ -437,8 +514,10 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
     out = []
     for inst in insts:
         pts = np.asarray(inst.lifted.points, np.float64)
-        if len(pts) < 10:
-            continue
+        if len(pts) < 10 or inst.mask.mean() > MAX_MASK_SHARE:
+            continue  # too few points, or the background (a tree, a sign over the whole view)
+        if float(np.median(np.linalg.norm(pts - view.centre, axis=1))) < NEAR_CAMERA_M:
+            continue  # on the camera (a gripper, a lens hood)
         if floor_z is not None and on_the_floor(inst, UP, floor_z, FLOOR_BAND_M):
             continue
         rgb = robust_rgb(view.rgb, inst.mask) or [128.0, 128.0, 128.0]
@@ -448,20 +527,72 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
         c = np.median(pts, axis=0)
         ray = c - view.centre
         dist = float(np.linalg.norm(ray))
+        behind, mask_range = _behind(inst.mask, depth, valid, view, pts)
         s = Sighting(view.kid, version, c.round(5).tolist(), round(dist, 4),
                      int(inst.mask.sum()), cut, (ray / max(dist, 1e-9)).round(5).tolist(),
                      view.centre.round(5).tolist(), float(view.sigma_pos_m), rgb,
                      inst.detection.label, round(float(inst.detection.score), 4),
-                     view.depth_rel)
+                     view.depth_rel, round(behind, 4), round(mask_range, 4))
         out.append(Observation(inst.detection.label, float(inst.detection.score), pts,
                                inst.mask, s))
     return out
 
 
+def _behind(mask: NDArray[np.bool_], depth: NDArray[np.float32], valid: NDArray[np.bool_],
+            view: View, pts: Array) -> tuple[float, float]:
+    """(share of the inner mask's depth beyond the object's own points by more than ``tau``,
+    median range of the inner mask's depth): what a detection sees through (a glass, a window,
+    trees behind one)."""
+    inner = ndimage.binary_erosion(mask, iterations=RGB_ERODE_PX) & valid
+    if inner.sum() < 10:
+        inner = mask & valid
+    vv, uu = np.nonzero(inner)
+    r_mask = np.linalg.norm(unproject_pixels(uu, vv, depth[vv, uu], view.K.K()), axis=1)
+    far = float(np.percentile(np.linalg.norm(pts - view.centre, axis=1), 90))
+    tau = max(SEEN_TAU_M, SEEN_TAU_REL * far)
+    return float(np.mean(r_mask > far + tau)), float(np.median(r_mask))
+
+
+def _detected_there(view: View, u: Array, v: Array, px: float) -> bool:
+    """Whether one of the keyframe's detections covers ``COVERED_SHARE`` of an object's samples
+    (their pixels ``u``, ``v``) with a mask at most ``COVER_SIZE`` times the pixels the object
+    covers (``px``): the keyframe sees an object there, whatever its label or depth."""
+    if not len(u):
+        return False
+    uu, vv = u.astype(np.intp), v.astype(np.intp)
+    for det in view.dets:
+        if det.mask[vv, uu].mean() >= COVERED_SHARE and det.mask.sum() <= COVER_SIZE * max(px, 1):
+            return True
+    return False
+
+
+def see_through(o: MapObject) -> bool:
+    """Whether the depth sees through the object (see the module docstring): a keyframe detected
+    it after a keyframe's depth had seen it gone (``contradicted``), or several of its
+    sightings, at least ``SEE_THROUGH_VIEWS`` and a third of them, see the depth inside its mask
+    beyond its own points (``BEHIND_SHARE`` of the mask), or the mask's median depth beyond its
+    box by more than half its size."""
+    if o.contradicted:
+        return True
+    if o.box is None:
+        return False
+    half = 0.5 * float(np.max(o.box.size))
+    n = 0
+    for s in o.sightings:
+        box_range = float(np.linalg.norm(o.box.centre - np.asarray(s.cam)))
+        tau = max(SEEN_TAU_M, SEEN_TAU_REL * box_range)
+        if s.behind >= BEHIND_SHARE or s.mask_range > box_range + max(tau, half):
+            n += 1
+    return n >= SEE_THROUGH_VIEWS and 3 * n >= len(o.sightings)
+
+
 def judge(o: MapObject, view: View) -> tuple[str, float] | None:
     """A keyframe's verdict on an object it did not detect: ("gone" | "in_place", share seen
-    through), or None when it does not judge it (out of view, too far, hidden)."""
-    if o.box is None or not len(o.points) or o.label in SEE_THROUGH:
+    through), or None when it does not judge it (out of view, too far, hidden). An object the
+    depth sees through (``see_through``) is judged by its detection alone: "gone" at
+    ``ABSENT_SHARE`` (so that one keyframe never strikes it) when the keyframe has its place in
+    view, unhidden, at a size the detector sees (``DETECT_MIN_PX``)."""
+    if o.box is None or not len(o.points):
         return None
     pts = o.points[o.box.contains(o.points, 0.01)]
     if len(pts) < JUDGE_MIN:
@@ -483,6 +614,16 @@ def judge(o: MapObject, view: View) -> tuple[str, float] | None:
     has = d > 0
     d, zs = d[has], zs[has]
     tau = np.maximum(SEEN_TAU_M, SEEN_TAU_REL * zs)
+    z_med = float(np.median(z[inside]))
+    px = float(np.median([s.pixels * (s.distance / z_med) ** 2 for s in o.sightings])) \
+        if o.sightings else 0.0
+    if _detected_there(view, u[inside], v[inside], px):
+        return None  # the keyframe detects something of its size there (another label)
+    if see_through(o):
+        hidden = float(np.mean(d < zs - tau)) if len(zs) else 1.0
+        if hidden >= 0.5 or px < DETECT_MIN_PX:
+            return None
+        return "gone", ABSENT_SHARE
     through = int(np.sum(d > zs + tau))
     place = int(np.sum(np.abs(d - zs) <= tau))
     judged = through + place
@@ -533,10 +674,18 @@ def _polygon(mask: NDArray[np.bool_], x0: int, y0: int) -> list[list[float]]:
     return [[round(float(x), 4), round(float(y), 4)] for x, y in pts]
 
 
-def find_surfaces(xyz: NDArray[Any], top_z: float | None = None) -> list[Surface]:
+def find_surfaces(xyz: NDArray[Any], top_z: float | None = None,
+                  viewpoints: NDArray[Any] | None = None) -> list[Surface]:
     """Horizontal support planes of a cloud (map frame, z up; see the module docstring), lowest
-    first; none above ``top_z``."""
+    first; none above ``top_z``. With ``viewpoints`` (the cameras), only the points whose normal,
+    turned towards the cameras, points up (``UP_NORMAL_Z``) take part: a plane's top, not the
+    sides of what stands on it, nor walls, nor a ceiling."""
     p = np.asarray(xyz, np.float64)
+    if viewpoints is not None and len(p) >= SURFACE_MIN_POINTS:
+        from oh_my_slam.reconstruction.pointcloud import PointNormals
+
+        n = PointNormals(p, viewpoints).at(np.arange(len(p)))
+        p = p[n[:, 2] >= UP_NORMAL_Z]
     if len(p) < SURFACE_MIN_POINTS:
         return []
     cxy = voxel_keys(p[:, :2], SURFACE_CELL_M)
@@ -663,6 +812,7 @@ class ObjectMap:
         self.next_surface_id = 1
         self.surfaces: list[Surface] = []
         self.version = 0
+        self.floor_z: float | None = None  # the floor of the latest update (box grounding)
 
     @staticmethod
     def load(root: Path) -> ObjectMap:
@@ -706,7 +856,7 @@ class ObjectMap:
 
     def live(self) -> list[MapObject]:
         """The listed objects that are not struck."""
-        return [o for o in self.objects if o.published and o.state != "struck"]
+        return [o for o in self.objects if listed(o) and o.state != "struck"]
 
     # -- an update ------------------------------------------------------------------------------
 
@@ -714,13 +864,15 @@ class ObjectMap:
         """Fold the new keyframes ``views`` (request order) into the objects of ``version``;
         returns the objects struck, for carving."""
         self.version = version
+        self.floor_z = floor_z
         self.objects = [o for o in self.objects if o.state != "struck"]
         events: dict[int, list[tuple[str, float, View]]] = {}
         created: set[int] = set()
         for view in views:
             obs = observe(view, version, floor_z)
             cands = [o for o in self.objects if o.box is not None]
-            ids = match([(ob.label, ob.points, ob.centre) for ob in obs], cands)
+            ids = match([(ob.label, ob.points, ob.centre) for ob in obs], cands,
+                        [ob.sighting.truncated for ob in obs])
             by_id = self.by_id()
             seen: set[int] = set()
             for ob, oid in zip(obs, ids, strict=True):
@@ -732,12 +884,16 @@ class ObjectMap:
                 else:
                     o = by_id[oid]
                 self._add(o, ob, version, floor_z)
+                if o.last_verdict == "gone":
+                    o.contradicted += 1  # its depth said gone, the detector sees it
+                o.last_verdict = "seen"
                 events.setdefault(o.id, []).append(("seen", 1.0, view))
                 seen.add(o.id)
             for o in cands:
                 if o.id not in seen:
                     verdict = judge(o, view)
                     if verdict is not None:
+                        o.last_verdict = verdict[0]
                         events.setdefault(o.id, []).append((*verdict, view))
         struck: list[tuple[MapObject, list[View]]] = []
         dropped: set[int] = set()
@@ -749,7 +905,11 @@ class ObjectMap:
             gone = [e for e in ev[last + 1:] if e[0] == "gone"]
             place = sum(e[0] == "in_place" for e in ev[last + 1:])
             o.misses += place
-            if gone and len(gone) > place and (len(gone) >= 2 or gone[0][1] >= GONE_ALONE):
+            # one keyframe alone strikes only with a depth image: monocular depth sees past
+            # glass and foliage (a tree behind a window, a window pane) from one view or another
+            alone = len(gone) == 1 and gone[0][1] >= GONE_ALONE and \
+                gone[0][2].depth_rel <= SENSOR_DEPTH_REL
+            if gone and len(gone) > place and (len(gone) >= 2 or alone):
                 if not o.published and len(o.sightings) < 2:
                     dropped.add(o.id)  # a single detection seen gone was never there
                 else:
@@ -758,7 +918,11 @@ class ObjectMap:
                 continue
             if last >= 0 and o.id not in created:
                 o.state, o.moved_from = "confirmed", None  # seen again where it is
-            if not o.published and last >= 0 and (len(o.sightings) >= 2 or o.misses == 0):
+            # one sighting lists an object only whole in the image (no fragment at its border)
+            # and trusted (TRUSTED_SCORE); below that, two keyframes must detect it
+            if not o.published and last >= 0 and (len(o.sightings) >= 2 or (
+                    o.misses == 0 and not o.sightings[0].truncated
+                    and o.sightings[0].score >= TRUSTED_SCORE)):
                 o.published = True
         self.objects = [o for o in self.objects if o.id not in dropped]
         self._moves([o for o, _ in struck], created, version)
@@ -771,7 +935,10 @@ class ObjectMap:
         return out
 
     def _add(self, o: MapObject, ob: Observation, version: int, floor_z: float | None) -> None:
-        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + ob.score, 4)
+        # a detection cut by the image border votes for its label with CUT_VOTE of its score:
+        # the label of a whole view wins
+        w = ob.score * (CUT_VOTE if ob.sighting.truncated else 1.0)
+        o.votes[ob.label] = round(o.votes.get(ob.label, 0.0) + w, 4)
         o.sightings.append(ob.sighting)
         k = len(o.sightings) - 1
         pts = _thin(ob.points).astype(np.float32)
@@ -795,7 +962,7 @@ class ObjectMap:
                 continue
             best = None
             for n in fresh:
-                if n.id in used or n.box is None or not compatible(n.label, old.label):
+                if n.id in used or n.box is None or not alike(n.label, old.label):
                     continue
                 if float(np.linalg.norm(n.box.centre - old.box.centre)) < MOVE_MIN_M:
                     continue
@@ -854,12 +1021,21 @@ class ObjectMap:
 
     # -- what the cloud says ------------------------------------------------------------------
 
-    def finish(self, xyz: Array, top_z: float | None, version: int) -> None:
-        """Surfaces from the fused cloud, then every listed object's relations."""
-        self.surfaces = find_surfaces(xyz, top_z)
+    def finish(self, xyz: Array, top_z: float | None, version: int,
+               viewpoints: Array | None = None, floor_z: float | None = None) -> None:
+        """Surfaces from the fused cloud (the points facing up, seen from ``viewpoints``), then
+        every listed object's relations, on its box as fitted (it rests on its support anew)."""
+        self.surfaces = find_surfaces(xyz, top_z, viewpoints)
         self.surface_ids, self.next_surface_id = assign_surface_ids(
             self.surfaces, self.surface_ids, self.next_surface_id)
+        for o in self.objects:
+            if o.label in FLOOR_COVERINGS and o.published and o.box is not None and \
+                    not any(s.area_m2 >= ROOM_FLOOR_M2 and abs(o.box.bottom - s.height_m)
+                            <= SUPPORT_TOL_M for s in self.surfaces):
+                o.published = False  # a rug on a worktop: a false detection
         live = self.live()
+        for o in live:
+            self._fit(o, self.floor_z if floor_z is None else floor_z)
         for o in live:
             self._relate(o, live, version)
 
@@ -880,18 +1056,24 @@ class ObjectMap:
         if inside is not None:
             support = ("object", inside.id, 0.0)
         else:
+            # an object whose height no sighting saw (seen from above) may stand on a support
+            # as far below its visible top part as SUPPORT_REACH_M
+            reach = SUPPORT_TOL_M if extent_seen(o)["z"] == "full" else SUPPORT_REACH_M
             best_s = None
-            for s in self.surfaces:
+            for s in sorted(self.surfaces, key=lambda s: -s.area_m2):
                 gap = box.bottom - s.height_m
-                if abs(gap) <= SUPPORT_TOL_M and s.contains(box.centre) and (
-                        best_s is None or abs(gap) < abs(best_s[1])):
-                    best_s = (s, gap)
+                if -SUPPORT_TOL_M <= gap <= reach and s.contains(box.centre) and (
+                        best_s is None or abs(gap) < abs(best_s[1]) - SUPPORT_SAME_M):
+                    best_s = (s, gap)  # the nearest in height, the largest when as near
             best_o = None
+            area = float(box.size[0] * box.size[1])
             for p in live:
-                if p is o or p.box is None or p.box.top > box.top:
+                if p is o or p.box is None or p.box.top > box.top or \
+                        p.label in FLOOR_COVERINGS or \
+                        float(p.box.size[0] * p.box.size[1]) < SUPPORT_AREA_RATIO * area:
                     continue
                 gap = box.bottom - p.box.top
-                if abs(gap) <= SUPPORT_TOL_M and p.box.footprint_contains(box.centre) and (
+                if -SUPPORT_TOL_M <= gap <= reach and p.box.footprint_contains(box.centre) and (
                         best_o is None or abs(gap) < abs(best_o[1])):
                     best_o = (p, gap)
             if best_o is not None and (best_s is None or (
@@ -909,9 +1091,10 @@ class ObjectMap:
                 sup_obs = sup_obs or q.last_seen_version == version
             else:
                 sup_obs = True  # the surfaces are measured again by every update
-            if kind == "surface" and gap != 0.0:
-                # the box rests on its support
-                level = next(s.height_m for s in self.surfaces if s.id == sid)
+            if gap != 0.0:
+                # the box rests on its support (a top-down view sees only its top)
+                level = next(s.height_m for s in self.surfaces if s.id == sid) \
+                    if kind == "surface" else next(p for p in live if p.id == sid).box.top
                 top = max(box.top, level + POINT_VOXEL_M)
                 box.centre[2] = (top + level) / 2
                 box.size[2] = top - level
@@ -936,7 +1119,7 @@ class ObjectMap:
         listed object and the surfaces, map frame."""
         out = []
         for o in sorted(self.objects, key=lambda o: o.id):
-            if not o.published or o.box is None:
+            if not listed(o):
                 continue
             out.append({
                 "id": o.id, "label": o.label, "detected_as": o.detected_as(),
@@ -954,6 +1137,12 @@ class ObjectMap:
 
 
 # -- per-object summaries ------------------------------------------------------------------------
+
+
+def listed(o: MapObject) -> bool:
+    """Whether the objects read lists an object: published, with a box of at least
+    ``MIN_OBJECT_M`` on its longest side (a few pixels of a mask lifted are no object)."""
+    return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M
 
 
 def mean_rgb(o: MapObject) -> list[float]:
@@ -998,7 +1187,7 @@ def extent_seen(o: MapObject) -> dict[str, str]:
         ends = any(d > ENDS_COS for d in dots) and any(d < -ENDS_COS for d in dots)
         if across or ends:
             out[name] = "full"
-    tops = [s for s in o.sightings if not s.cut[2]]
-    if any(not s.cut[3] for s in tops) or (o.supported_by is not None and tops):
+    # the height is seen only from the side: a view from above sees the top alone
+    if any(not s.cut[2] and not s.cut[3] and abs(s.ray[2]) <= ACROSS_COS for s in whole):
         out["z"] = "full"
     return out
