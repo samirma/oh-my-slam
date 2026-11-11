@@ -333,6 +333,9 @@ class Query:
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
     camera_z_sigma: float = DEFAULT_HEIGHT_SIGMA_M
+    # the map's scale comes from camera heights (api.md §6 "Camera-height scale"): a pose's
+    # height disagreement joins its position sigma and ranks it (``height_consistent``)
+    height_scale: bool = False
 
 
 @dataclass
@@ -548,6 +551,24 @@ def _height_ok(q: Query, T: Array) -> bool:
     return abs(float(T[2, 3]) - q.camera_z) <= K_SIGMA * q.camera_z_sigma + HEIGHT_SLACK_M
 
 
+def height_consistent(q: Query, T: Array, sigma_pos_m: float) -> bool | None:
+    """With a camera-height scale and an expected camera height (api.md §6): whether a pose's
+    camera height agrees with it within ``K_SIGMA`` × sqrt(height_sigma² + σ_z²), σ_z its
+    image-only position sigma along z (a 3-D RMS sigma over √3); None otherwise."""
+    if not q.height_scale or q.camera_z is None:
+        return None
+    dz = abs(float(T[2, 3]) - q.camera_z)
+    return dz <= K_SIGMA * math.hypot(q.camera_z_sigma, sigma_pos_m / math.sqrt(3.0))
+
+
+def height_sigma(q: Query, T: Array, sigma_pos_m: float) -> float:
+    """A located pose's position sigma with a camera-height scale (api.md §6): hypot(σ_rel,
+    |z_located − z_expected|); σ_rel as it is otherwise."""
+    if not q.height_scale or q.camera_z is None:
+        return sigma_pos_m
+    return math.hypot(sigma_pos_m, float(T[2, 3]) - q.camera_z)
+
+
 def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
            sig: Sequence[tuple[float, float]] | None = None) -> int | None:
     """The hypothesis to report among ``poses`` (their inlier counts ``inliers``, their
@@ -559,11 +580,16 @@ def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
     best = max(inliers)
     sg = list(sig) if sig is not None else [(0.0, 0.0)] * len(poses)
     sup = [k for k in range(len(poses)) if inliers[k] >= SUPPORT_MIN * best]
+    # with a camera-height scale, a height-inconsistent pose ranks below any consistent one
+    off = [height_consistent(q, poses[k], sg[k][0]) is False for k in range(len(poses))]
     if q.prior is not None:
         near = [k for k in sup if within_prior(q, poses[k], sg[k])]
         if not near:
             return None
-        return min(near, key=lambda k: (prior_distance(q, poses[k], sg[k]), -inliers[k], k))
+        return min(near, key=lambda k: (off[k], prior_distance(q, poses[k], sg[k]),
+                                        -inliers[k], k))
+    if any(off):
+        sup = [k for k in sup if not off[k]] or sup
     level = [k for k in sup if _height_ok(q, poses[k])]
     return max(level or sup, key=lambda k: (inliers[k], -k))
 

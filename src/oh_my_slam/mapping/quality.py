@@ -29,15 +29,21 @@ def too_close(scene_m: float | None, inliers: int) -> bool:
 
 
 def displacements(pls: list[Placement | None]) -> list[tuple[float | None, float]]:
-    """The new frames' disagreement with the stored map (map.md §1): each registered frame's
-    committed pose against its image-only pose (``Placement.map_residual``), as (m or None,
-    deg). Frames kept at their prior or rejected have no image-only pose and are left out; a
-    frame whose image pose is unconstrained in translation — rotation-only, or below the
-    two-view parallax limit against every reference it registers to
-    (``Placement.unconstrained``) — counts only its rotation (None in metres)."""
+    """The new frames' displacement (map.md §1 "New-frame displacement"), as (m or None, deg)
+    per registered frame: a frame with a prior, its committed pose against the prior as sent (a
+    drifting prior as placed through the drift estimate: its prior residual); a frame without
+    one, its committed pose against its image-only pose (``Placement.map_residual``), only its
+    rotation (None in metres) when that pose is unconstrained in translation — rotation-only,
+    or below the two-view parallax limit against every reference it registers to
+    (``Placement.unconstrained``). Frames kept at their prior or rejected are left out."""
     out: list[tuple[float | None, float]] = []
     for pl in pls:
-        if pl is None or pl.status != "registered" or pl.map_residual is None:
+        if pl is None or pl.status != "registered":
+            continue
+        if pl.has_prior:  # a registered frame with a prior has its residual (origin: 0)
+            out.append(pl.prior_residual or (0.0, 0.0))
+            continue
+        if pl.map_residual is None:
             continue
         dp = None if pl.method == "rotation" or pl.unconstrained else pl.map_residual[0]
         out.append((dp, pl.map_residual[1]))

@@ -310,7 +310,8 @@ def locate_frames(store: Store, name: str, req: dict[str, Any], parts: dict[str,
     return out
 
 
-def _query(fr: LocateFrame, floor_z: float) -> tuple[relocalize.Query, checks.Measures]:
+def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
+           ) -> tuple[relocalize.Query, checks.Measures]:
     import cv2
 
     cam = fr.camera
@@ -331,6 +332,7 @@ def _query(fr: LocateFrame, floor_z: float) -> tuple[relocalize.Query, checks.Me
         sig = fr.height_sigma_m if fr.height_m is not None else cam.height_sigma_m
         q.camera_z = floor_z + float(h)
         q.camera_z_sigma = float(sig if sig is not None else relocalize.DEFAULT_HEIGHT_SIGMA_M)
+        q.height_scale = height_scale
     return q, measures
 
 
@@ -342,11 +344,13 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
     index = derived.index(dv)
     out = []
     for fr in frames:
-        q, measures = _query(fr, dv.floor_z)
+        # with a camera-height scale, the camera height sent is the map's expected one there
+        q, measures = _query(fr, dv.floor_z, dv.record["scale_source"] == "camera_height")
         res: dict[str, Any] = {"name": fr.name, "status": "rejected", "reason": None,
                                "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
                                "inlier_ratio": None, "ambiguity": None, "rivals": [],
-                               "consistent_with_prior": None, "nearest_view": None}
+                               "consistent_with_prior": None, "height_consistent": None,
+                               "nearest_view": None}
         reason = checks.reason(measures, None)
         if reason not in ("plain", "blur"):  # locate's few_features is its own keypoint count
             reason = "few_features" if len(q.uv) < relocalize.MIN_INLIERS else None
@@ -356,9 +360,13 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
             continue
         o = relocalize.locate(q, index)
         if o.located:
-            assert o.T is not None
+            assert o.T is not None and o.sigma_pos_m is not None
+            # api.md §6 "Camera-height scale": the height disagreement joins the position sigma
             res.update({"status": "located", "T_map_cam": np.round(o.T, 6).tolist(),
-                        "sigma_pos_m": o.sigma_pos_m, "sigma_rot_deg": o.sigma_rot_deg,
+                        "sigma_pos_m": round(relocalize.height_sigma(q, o.T, o.sigma_pos_m), 4),
+                        "height_consistent": relocalize.height_consistent(q, o.T,
+                                                                          o.sigma_pos_m),
+                        "sigma_rot_deg": o.sigma_rot_deg,
                         "inlier_ratio": o.inlier_ratio, "ambiguity": o.ambiguity,
                         "rivals": o.rivals, "consistent_with_prior": o.consistent_with_prior})
         elif o.reason is not None:  # prior_conflict

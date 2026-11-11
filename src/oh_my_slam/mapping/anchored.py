@@ -5,10 +5,24 @@ A map whose first update carries camera pose priors (``metric`` or ``drifting``)
 in the priors' frame, and never re-posed:
 
 * **Map frame.** The origin frame is placed at its prior: the priors' frame is the map frame.
-* **Place first.** Every later frame is first placed by its prior — a metric prior as given, a
-  drifting one through the odometry's latest correction (``Drift``) with sigmas that grow with
-  the travel since the last frame the images confirmed — then refined against the stored
-  keyframes nearest to that pose (by prior pose, else by retrieval descriptor):
+* **Match graph** (map.md §2, ``AnchoredMap._register_job``). A job's registration does not
+  depend on its frames' request order: wherever an order matters the frames go in canonical
+  order (``natural_key`` of their names, then camera). Rounds place every frame not yet
+  registered against the confirmed keyframes as they stand; one that registers (an edge: at
+  least ``MIN_INLIERS`` image inliers and its fitted pose passing the prior checks) is a
+  reference at once; a frame that fails is placed again in the next round. A component the
+  confirmed map does not reach is seeded at the prior of one of its frames without an image
+  pose, kept only when another frame registers through it. A frame that ends the job kept is
+  never a reference; keyframes are fused into the cloud once the statuses are final.
+* **Drift estimate** (map.md §1, ``_fit_drift``). Within a job every drifting prior is predicted
+  from the estimate in force when the job starts; after it the estimate is fitted robustly over
+  the job's drifting-prior frames with an image pose, a large change needing three frames and
+  half the job, and a frame it leaves out is rejected ``prior_conflict``; a changed estimate
+  registers the job again under it.
+* **Place first.** Every frame is first placed by its prior — a metric prior as given, a
+  drifting one through the drift estimate (``Drift``) with sigmas that grow with the travel
+  since the last frame the images confirmed — then refined against the confirmed keyframes
+  nearest to that pose (by prior pose, else by retrieval descriptor):
   * SIFT matches against those keyframes, each match lifted to 3-D by the keyframe's depth;
   * PnP (RANSAC) on the lifted points and a robust Gauss-Newton refinement, the stored poses
     held fixed. PnP comes first even for a camera turning in place: the lifted points fix its
@@ -17,29 +31,38 @@ in the priors' frame, and never re-posed:
     that is within ``ROTATION_FALLBACK_M`` of a keyframe (without a prior: at the best-matched
     keyframe's centre);
   * the image pose and the prior are combined by their sigmas (``fuse_poses``). Each frame so
-    placed is a fixed reference for the later frames of the same update.
+    placed is a fixed reference for the frames placed after it in the same update.
 * **Origin.** The map frame is the priors' frame. While the map has no image-confirmed
-  keyframe, the next frame with a prior that passes the checks and is not too close is placed
-  at its prior and registered (``origin``); one that fails them is kept at its prior (it still
-  lies in the map frame, api.md §4). Without any prior, the first frame is the origin
+  keyframe, the first frame with a prior in canonical order that passes the checks and is not
+  too close is placed at its prior and registered (``origin``); one before it that fails them is
+  kept at its prior (it still lies in the map frame, api.md §4). Without any prior, the first frame is the origin
   (``first_camera``): with a camera height, the origin is the floor below it (map.md §1).
 * **Kept at prior.** A frame with a prior that its images do not confirm (no image pose, an
   image pose too loose, an image pose beyond the conflict bound without strong support, an image
   that failed the checks: ``FrameIn.unconfirmed``, or a frame too close) is ``kept_at_prior``
   (api.md §4): at its prior as placed (metric as given; drifting through the odometry's
-  correction) with the prior's sigmas (drifting: grown by the drift), prior residual 0. It is
-  stored with its features, image, depth and reason, but it is never a reference for later
+  correction) with the prior's own sigmas (drifting: grown by the drift), prior residual 0, and
+  ``Placement.detail`` saying why (``no_image_pose``, ``loose_image_pose``,
+  ``conflict_unsupported``; none for a failed check). A frame without an image pose is kept
+  whatever its depth says: depth never places a frame. It is stored with its features, image, depth and reason, but it is never a reference for later
   frames nor scale evidence (map.md §2): only image-confirmed frames are (``Keyframe.usable``).
   Nor is it fused into the cloud, but for the too-close exception (api.md §4,
   ``Keyframe.contributes``): kept only for ``too_close``, with a metric prior and a depth image,
   its depth inside ``DEPTH_VALID_RANGE_M`` is fused at its prior pose.
-* **Re-registration.** When an update registers new frames that overlap a stored
+* **Re-registration.** After each round, when the job has registered new frames that overlap a
+  stored
   ``kept_at_prior`` keyframe (the overlap of map.md §1 with the kept frame as the reference:
   ``REREGISTER_OVERLAP`` of its image's 8 x 8 cells holding an epipolar inlier, ``coverage``),
   that keyframe is placed again against the confirmed map (``reregister``) by its images only,
   never its depth (a frame kept for a failed check too); confirmed, its pose leaves
   ``kept_at_prior`` and it is fused (``reregistered``: name and displacement); otherwise it stays
-  kept with its reason.
+  kept with its reason. Confirmed, it is a reference for the job's later rounds.
+* **Height gate** (map.md §2, ``height_consistent``). A frame whose committed camera height
+  disagrees with the one sent beyond ``K_SIGMA`` × sqrt(height_sigma² + σ_z²) stays registered
+  but gives no content (``Keyframe.height_ok``; ``height_inconsistent``).
+* **Static image content** (map.md §1, ``static_content``). Features fixed in the image across
+  three frames of the job turned pairwise by more than ``STATIC_ROT_DEG`` are left out of
+  matching.
 * **prior_conflict.** Only when a strongly supported image pose lies beyond the combined bound
   ``K_SIGMA`` × sqrt(σ_prior² + σ_image²) of the prior (position and rotation separately; σ_image
   its image-only calibrated sigma, ``mapping.sigmas``; σ_prior drift-grown for a drifting prior)
@@ -60,7 +83,8 @@ in the priors' frame, and never re-posed:
 * **Priors against images.** Between two registered frames of the update that overlap by at
   least ``OVERLAP_MIN``, the disagreement of the images' relative rotation with the priors' is
   measured (``prior_disagreement_deg``); beyond ``K_SIGMA`` of the priors' combined rotation
-  sigmas the later frame's rotation is corrected from the images (map.md §1).
+  sigmas the frame registered later (canonical order, rounds) has its rotation corrected from
+  the images (map.md §1).
 * **Scale.** Keyframe depth is the frame's depth image when it has one (metric), else the
   monocular depth times the map's depth scale ``k``. ``k`` comes from the metric priors once
   their centres span ``PRIOR_SPAN_M``: the scale that best brings the image-only PnP positions
@@ -78,11 +102,13 @@ retrieval descriptor), ``cloud.npz``."""
 
 from __future__ import annotations
 
+import copy
 import functools
 import itertools
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -183,9 +209,6 @@ SENSOR_DEPTH_TOL = 0.10  # relative depth agreement of depth images
 MIN_OVERLAP = 0.10  # share of a frame's points a reference view's depth sees
 MIN_AGREEMENT = 0.75  # share of those that agree
 MIN_AGREEING = 40  # points
-ICP_SIGMA_M = 0.01  # a depth image point's noise (plus DEPTH_NOISE_REL of its depth)
-ICP_MAX_M = 0.10  # a point's match at most this far (plus the prior's reach, at first)
-ICP_ITERATIONS = 12
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -225,7 +248,17 @@ DUPLICATE_CAP_ROT_DEG = 5.0
 DUPLICATE_POS_ENV = "OH_MY_SLAM_DUPLICATE_M"
 DUPLICATE_ROT_ENV = "OH_MY_SLAM_DUPLICATE_DEG"
 DUPLICATE_REMATCH = 0.90  # a pose duplicate's features re-matched in the keyframe (api.md §4)
+FAILED_CHECKS = ("plain", "blur", "few_features", "too_close")  # api.md §4, in that order
 REREGISTER_OVERLAP = 0.10  # a new frame sees this share of a kept keyframe's view: placed again
+# the match graph (map.md §2): an edge needs the registration minimum of inliers (MIN_INLIERS)
+DRIFT_PASSES = 3  # a job registered again at most this often under its drift fit's decision
+DRIFT_MIN_SUPPORT = 3  # map.md §1 "Drift estimate": a large change needs this many frames ...
+DRIFT_SUPPORT_SHARE = 0.5  # ... and this share of the job's drifting-prior frames
+STATIC_PX = 2.0  # map.md §1 "Static image content": a feature fixed within this (px) ...
+STATIC_FRAMES = 3  # ... across this many frames ...
+STATIC_ROT_DEG = 5.0  # ... turned pairwise by more than this is left out of matching
+STATIC_DESC = 0.25  # ... its RootSIFT descriptors this near (unit-norm L2)
+STATIC_MAX_PAIRS = 4_000_000  # keypoint pairs compared at once (two frames of 2000)
 MIN_CAMERA_HEIGHT = 0.05
 ALIGN_MIN_POINTS = 30  # a new monocular keyframe's depth is aligned on this many lifted points
 ALIGN_RANGE = (0.5, 2.0)
@@ -887,79 +920,6 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
                      float(np.median(ratio[seen_any])))
 
 
-def _normals(depth: NDArray[np.float32], K: Array, T: Array, side: int = SAMPLE_SIDE
-             ) -> tuple[Array, Array]:
-    """World points and unit normals of a depth grid seen from ``T``, on a grid of at most
-    ``side`` per axis (central differences; points without a full neighbourhood dropped)."""
-    h, w = depth.shape
-    step = max(1, math.ceil(max(h, w) / side))
-    vs, us = np.mgrid[step // 2:h:step, step // 2:w:step]
-    z = depth[vs, us].astype(np.float64)
-    P = unproject_pixels(us + 0.5, vs + 0.5, z, K)
-    ok = np.isfinite(z) & (z > MIN_DEPTH_M)
-    du = P[1:-1, 2:] - P[1:-1, :-2]
-    dv = P[2:, 1:-1] - P[:-2, 1:-1]
-    n = np.cross(du, dv)
-    norm = np.linalg.norm(n, axis=-1)
-    good = (ok[1:-1, 1:-1] & ok[1:-1, 2:] & ok[1:-1, :-2] & ok[2:, 1:-1] & ok[:-2, 1:-1]
-            & (norm > 1e-12))
-    # a depth edge is no surface: its neighbours more than EDGE_REL apart
-    zc = z[1:-1, 1:-1]
-    span = np.max(np.abs(np.stack([z[1:-1, 2:], z[1:-1, :-2], z[2:, 1:-1], z[:-2, 1:-1]])
-                         - zc), axis=0)
-    good &= span <= 3.0 * EDGE_REL * np.maximum(zc, MIN_DEPTH_M)
-    pc, nc = P[1:-1, 1:-1][good], n[good] / norm[good][:, None]
-    return pc @ T[:3, :3].T + T[:3, 3], nc @ T[:3, :3].T
-
-
-def depth_icp(pts: Array, refs: list[DepthRef], T0: Array, sp0: float, sr0: float
-              ) -> tuple[Array, float, float, int] | None:
-    """A camera's pose from its camera-frame depth points ``pts`` against the references'
-    depth: point-to-plane Gauss-Newton from ``T0`` with the prior (``sp0`` m, ``sr0`` deg) as
-    a factor, each point's noise ``ICP_SIGMA_M`` + ``DEPTH_NOISE_REL`` of its depth, matches
-    within ``K_SIGMA`` prior sigmas plus ``ICP_MAX_M``, Huber. Returns (T, sigma_pos_m,
-    sigma_rot_deg, matched points), or None with fewer than ``MIN_AGREEING`` matches."""
-    from scipy.spatial import cKDTree
-
-    got = [_normals(r.depth, r.K, r.T) for r in refs]
-    Q = np.vstack([g[0] for g in got])
-    N = np.vstack([g[1] for g in got])
-    if len(Q) < MIN_AGREEING or len(pts) < MIN_AGREEING:
-        return None
-    tree = cKDTree(Q)
-    sig = ICP_SIGMA_M + DEPTH_NOISE_REL * pts[:, 2]
-    R, c = T0[:3, :3].copy(), T0[:3, 3].copy()
-    sr = math.radians(sr0)
-    H = np.eye(6)
-    n_in = 0
-    for it in range(ICP_ITERATIONS):
-        X = pts @ R.T + c
-        reach = K_SIGMA * sp0 + ICP_MAX_M if it < ICP_ITERATIONS // 2 else ICP_MAX_M
-        d, j = tree.query(X, distance_upper_bound=reach)
-        m = np.isfinite(d)
-        n_in = int(m.sum())
-        if n_in < MIN_AGREEING:
-            return None
-        Xm, n_m, s_m = X[m], N[j[m]], sig[m]
-        r = ((Xm - Q[j[m]]) * n_m).sum(1) / s_m
-        w = np.where(np.abs(r) <= HUBER_SIGMAS, 1.0, HUBER_SIGMAS / np.maximum(np.abs(r), 1e-12))
-        # left perturbation: X' = exp(w) (X - c) + c + dc
-        J = np.hstack([np.cross(Xm - c, n_m), n_m]) / s_m[:, None]
-        rp = np.concatenate([log_so3(R @ T0[:3, :3].T) / sr, (c - T0[:3, 3]) / sp0])
-        Jp = np.diag(np.r_[np.full(3, 1.0 / sr), np.full(3, 1.0 / sp0)])
-        H = J.T @ (w[:, None] * J) + Jp.T @ Jp
-        g = J.T @ (w * r) + Jp.T @ rp
-        delta = -np.linalg.solve(H + 1e-9 * np.eye(6), g)
-        R = exp_so3(delta[:3]) @ R
-        c = c + delta[3:]
-        if float(np.abs(delta).max()) < 1e-7:
-            break
-    cov = np.linalg.inv(H + 1e-9 * np.eye(6))
-    sp = math.sqrt(float(np.linalg.svd(cov[3:, 3:], compute_uv=False)[0]))
-    srd = math.degrees(math.sqrt(float(np.linalg.svd(cov[:3, :3], compute_uv=False)[0])))
-    return pose(R, c), sp, srd, n_in
-
-
 # -- the map ---------------------------------------------------------------------------------------
 
 
@@ -990,6 +950,9 @@ class Keyframe:
     rgb: NDArray[np.uint8] | None = None
     # kept at its prior: the reason (the check its image failed, too_close, no_overlap ...)
     reason: str | None = None
+    # its committed camera height agrees with the one sent (map.md §2 height gate): False
+    # keeps it a reference but out of occupancy, heights and objects
+    height_ok: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "camera_id": self.camera_id,
@@ -997,7 +960,7 @@ class Keyframe:
                 "sigma_rot_deg": self.sigma_rot_deg, "state": self.state, "prior": self.prior,
                 "depth_kind": self.depth_kind, "k_used": self.k_used,
                 "median_depth": self.median_depth, "method": self.method,
-                "inliers": self.inliers, "reason": self.reason,
+                "inliers": self.inliers, "reason": self.reason, "height_ok": self.height_ok,
                 "K_grid": None if self.K_grid is None else self.K_grid.to_dict()}
 
     @staticmethod
@@ -1007,7 +970,8 @@ class Keyframe:
                         float(d["sigma_rot_deg"]), d["state"], d["prior"], d["depth_kind"],
                         float(d["k_used"]), d["median_depth"], d["method"], int(d["inliers"]),
                         K_grid=None if d.get("K_grid") is None
-                        else Intrinsics.from_dict(d["K_grid"]), reason=d.get("reason"))
+                        else Intrinsics.from_dict(d["K_grid"]), reason=d.get("reason"),
+                        height_ok=bool(d.get("height_ok", True)))
 
     @property
     def centre(self) -> Array:
@@ -1023,10 +987,11 @@ class Keyframe:
         """Content for the cloud, occupancy, heights and objects (never scale evidence nor a
         reference): confirmed by the images, or the too-close exception (api.md §4): kept at its
         prior only because it is ``too_close``, with a ``metric`` prior and a depth image (its
-        depth inside ``DEPTH_VALID_RANGE_M``, at the prior pose)."""
-        return self.usable() or (self.reason == "too_close" and self.prior is not None
-                                 and self.prior["trust"] == "metric"
-                                 and self.depth_kind == "sensor")
+        depth inside ``DEPTH_VALID_RANGE_M``, at the prior pose); never a frame the height gate
+        failed (``height_ok``, map.md §2)."""
+        return self.height_ok and (self.usable() or (
+            self.reason == "too_close" and self.prior is not None
+            and self.prior["trust"] == "metric" and self.depth_kind == "sensor"))
 
 
 @dataclass
@@ -1356,6 +1321,12 @@ class Placement:
     # its image-only pose is unconstrained in translation: two-view parallax below
     # ``standpoint.PARALLAX_MAX_PX`` against every reference it registers to (map.md §1)
     unconstrained: bool = False
+    # with reason no_overlap, why its images did not confirm it (api.md §4 ``detail``):
+    # no_image_pose, loose_image_pose or conflict_unsupported; None otherwise
+    detail: str | None = None
+    has_prior: bool = False  # its displacement is against the prior (map.md §1)
+    # the scale evidence of its image pose, recorded only once the job keeps it registered
+    evidence: Callable[[], None] | None = None
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -1415,10 +1386,11 @@ def _median(depth: NDArray[np.float32] | None) -> float | None:
 
 
 def _kept(f: FrameIn, T0: Array, sp0: float, sr0: float, reason: str, n: int,
-          scene_m: float | None = None) -> Placement:
-    """A frame kept at its prior as placed (api.md §4): ``T0`` with its sigmas, residual 0."""
+          scene_m: float | None = None, detail: str | None = None) -> Placement:
+    """A frame kept at its prior as placed (api.md §4): ``T0`` with the prior's sigmas (as
+    given, a drifting prior's grown by the drift: ``AnchoredMap.kept_at``), residual 0."""
     return Placement(f.name, "kept_at_prior", reason, T0.copy(), round(sp0, 4), round(sr0, 3), n,
-                     "prior", (0.0, 0.0), scene_m=scene_m)
+                     "prior", (0.0, 0.0), scene_m=scene_m, detail=detail, has_prior=True)
 
 
 def _displacement(T: Array, image_T: Array, rot_only: bool) -> tuple[float, float]:
@@ -1461,6 +1433,177 @@ class _Corr:
     kf: NDArray[np.intp]  # index into the candidate list
 
 
+@dataclass
+class _Prep:
+    """A job frame as registration needs it, measured once (``AnchoredMap._prepare``)."""
+
+    feats: Features
+    scene: float | None  # its median scene depth (too_close), or None
+    close: bool
+    descriptor: Any  # the retrieval descriptor (monocular inference), or None
+
+
+def _order(frames: list[FrameIn], i: int) -> tuple[Any, ...]:
+    """The canonical order of a job's frames (map.md §2: the outcome does not depend on the
+    request order): by name in natural order (its digit runs as numbers: ``f2`` before
+    ``f10``, so a capture's numbered frames go in capture order), then camera."""
+    return natural_key(frames[i].name), frames[i].camera_id, i
+
+
+def natural_key(name: str) -> tuple[tuple[int, int, str], ...]:
+    """A name's natural order key: its digit runs as numbers (``f2`` before ``f10``)."""
+    return tuple((0, int(t), "") if t.isdigit() else (1, 0, t)
+                 for t in re.split(r"(\d+)", name) if t)
+
+
+@dataclass
+class _DriftObs:
+    """A drifting-prior frame's own image pose, for the drift fit (``AnchoredMap._fit_drift``)."""
+
+    index: int
+    name: str
+    T: Array  # its image-only pose (an origin's or a seed's: its committed one)
+    P: Array  # its prior as sent (odometry frame)
+    sigma_prior: tuple[float, float]
+    sigma_image: tuple[float, float]
+    rotation_only: bool
+    pl: Placement
+
+
+def _drift_inliers(d: Drift, obs: list[_DriftObs]) -> set[int]:
+    """The observations a drift estimate predicts within the combined bound (api.md §4, the
+    drift-grown prior sigma and the image-only sigma; a rotation-only pose, the rotation)."""
+    out = set()
+    for o in obs:
+        T, sp, sr = d.predict(o.P, *o.sigma_prior)
+        dp, dr = pose_residual(o.T, T)
+        if not sigmas.conflicts(dp, dr, (sp, sr), o.sigma_image, position=not o.rotation_only):
+            out.add(o.index)
+    return out
+
+
+def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[int, Placement]:
+    """The observations a drift estimate leaves out, each rejected ``prior_conflict`` (map.md §1
+    "Drift estimate"), its residual against its prior through that estimate."""
+    out = {}
+    for o in obs:
+        if o.index in inliers:
+            continue
+        T = d.predict(o.P, *o.sigma_prior)[0]
+        out[o.index] = Placement(o.name, "rejected", "prior_conflict", None, None, None,
+                                 o.pl.inliers, o.pl.method, pose_residual(o.T, T),
+                                 align_T=o.T.copy(), image_sigmas=o.sigma_image,
+                                 has_prior=True, prior_ref=T)
+    return out
+
+
+def _refined_drift(trial: Drift, obs: list[_DriftObs]) -> Drift:
+    """A trial drift estimate refined over its inliers ``obs``: its reference pose as the mean of
+    the reference poses each inlier implies (its image pose back through its odometry from the
+    reference prior; rotations by their chordal mean)."""
+    assert trial.ref_prior is not None
+    Rs, cs = [], []
+    for o in obs:
+        D = np.linalg.inv(trial.ref_prior) @ o.P
+        D[:3, 3] *= trial.odo_scale
+        R = o.T[:3, :3] @ D[:3, :3].T
+        Rs.append(R)
+        cs.append(o.T[:3, 3] - R @ D[:3, 3])
+    U, _, Vt = np.linalg.svd(np.sum(Rs, axis=0))
+    R = U @ np.diag([1.0, 1.0, float(np.linalg.det(U @ Vt))]) @ Vt
+    return Drift(pose(R, np.mean(cs, axis=0)), trial.ref_prior.copy(), trial.odo_scale)
+
+
+def _drift_sigma(obs: list[_DriftObs]) -> tuple[float, float]:
+    """A fitted drift estimate's own sigma (position, rotation): the RMS of its inliers' combined
+    prior and image sigmas over the root of their count."""
+    sp = [math.hypot(o.sigma_prior[0], o.sigma_image[0]) for o in obs]
+    sr = [math.hypot(o.sigma_prior[1], o.sigma_image[1]) for o in obs]
+    n = math.sqrt(len(obs))
+    return (math.sqrt(float(np.mean(np.square(sp)))) / n,
+            math.sqrt(float(np.mean(np.square(sr)))) / n)
+
+
+def _pair_rotation(fa: FrameIn, a: Features, fb: FrameIn, b: Features) -> float | None:
+    """Two job frames' relative rotation (deg): their priors' when both have one, else the
+    rotation-only fit of their matched rays; None without enough matches."""
+    if fa.prior is not None and fb.prior is not None:
+        Ra = np.asarray(fa.prior["T_map_cam"], np.float64)[:3, :3]
+        Rb = np.asarray(fb.prior["T_map_cam"], np.float64)[:3, :3]
+        return rot_deg(Ra.T @ Rb)
+    ib, ia = match(b.desc, a.desc)
+    if len(ia) < MIN_INLIERS:
+        return None
+    got = rotation_ransac(unit(rays(fb.K, b.kps[ib].astype(np.float64))),
+                          unit(rays(fa.K, a.kps[ia].astype(np.float64))),
+                          2.0 * REPROJ_PX * fa.K.width / REF_WIDTH / fa.K.fx)
+    return None if got is None else rot_deg(got[0])
+
+
+def static_content(frames: list[FrameIn], prep: list[_Prep]) -> None:
+    """Static image content out of matching (map.md §1 "Static image content"): a feature whose
+    image position stays within ``STATIC_PX`` (and its descriptor within ``STATIC_DESC``) across
+    at least ``STATIC_FRAMES`` frames of the job whose relative rotations exceed
+    ``STATIC_ROT_DEG`` (pairwise) is removed from each of those frames' features — the robot's
+    own shadow, a mark on the lens, a frame overlay. A job without such rotation keeps all its
+    features."""
+    n = len(frames)
+    if n < STATIC_FRAMES:
+        return
+    rot: dict[tuple[int, int], float | None] = {}
+
+    def turned(i: int, j: int) -> bool:
+        key = (min(i, j), max(i, j))
+        if key not in rot:
+            rot[key] = _pair_rotation(frames[key[0]], prep[key[0]].feats, frames[key[1]],
+                                      prep[key[1]].feats)
+        r = rot[key]
+        return r is not None and r > STATIC_ROT_DEG
+
+    drop: list[set[int]] = [set() for _ in range(n)]
+    for i in range(n):
+        a = prep[i].feats
+        if not len(a.kps):
+            continue
+        # per keypoint of i: the frames holding a like keypoint within STATIC_PX
+        hits: list[list[tuple[int, int]]] = [[] for _ in range(len(a.kps))]
+        for j in range(n):
+            b = prep[j].feats
+            if j == i or not len(b.kps) or frames[j].K.width != frames[i].K.width:
+                continue
+            d = np.linalg.norm(a.kps[:, None, :] - b.kps[None, :, :], axis=2) \
+                if len(a.kps) * len(b.kps) <= STATIC_MAX_PAIRS else None
+            if d is None:
+                continue
+            ka, kb = np.nonzero(d <= STATIC_PX)
+            if not len(ka):
+                continue
+            dd = np.linalg.norm(a.desc[ka].astype(np.float32) - b.desc[kb].astype(np.float32),
+                                axis=1) / ROOTSIFT_QUANT
+            for p, q in zip(ka[dd <= STATIC_DESC].tolist(), kb[dd <= STATIC_DESC].tolist(),
+                            strict=True):
+                hits[p].append((j, q))
+        for p, h in enumerate(hits):
+            if len(h) + 1 < STATIC_FRAMES:
+                continue
+            # frames pairwise turned beyond STATIC_ROT_DEG (greedy, canonical order)
+            group = [i]
+            for j, _ in sorted(h, key=lambda t: _order(frames, t[0])):
+                if all(turned(j, g) for g in group):
+                    group.append(j)
+            if len(group) >= STATIC_FRAMES:
+                drop[i].add(p)
+                for j, q in h:
+                    if j in group:
+                        drop[j].add(q)
+    for i, d in enumerate(drop):
+        if d:
+            keep = np.array([k not in d for k in range(len(prep[i].feats.kps))], bool)
+            f = prep[i].feats
+            prep[i].feats = Features(f.kps[keep], f.desc[keep])
+            log.info("%s: %d static features left out of matching", frames[i].name, len(d))
+
+
 class AnchoredMap:
     """An anchored map in its mapper folder (see the module docstring)."""
 
@@ -1490,6 +1633,12 @@ class AnchoredMap:
         # a frame without a prior, registered: its placement as one standpoint with a confirmed
         # keyframe when it shares one (map.md §1; set by the update job: ``mapping.standpoint``)
         self.standpoint: Callable[[FrameIn, Features, Placement], Placement] | None = None
+        # the last update's frames the height gate kept out of content (map.md §2)
+        self.height_inconsistent: list[str] = []
+        # while an update runs: the keyframes whose fusion waits for its end (``_fuse_later``)
+        self._defer: list[tuple[Keyframe, NDArray[np.uint8], NDArray[np.bool_] | None,
+                                NDArray[np.float32], Intrinsics]] | None = None
+        self._keep_s = 0.0  # the running update's seconds storing keyframes (its fusion)
         self._kf_lock = threading.Lock()
 
     # -- persistence ---------------------------------------------------------------------------
@@ -1795,15 +1944,28 @@ class AnchoredMap:
             return None
         return got_r[0], centre.copy(), got_r[1], True
 
-    def place(self, f: FrameIn, feats: Features, descriptor: Any,
-              predicted: tuple[Array, float, float] | None = None, evidence: bool = True
-              ) -> Placement:
-        """Place one new frame (the map has its origin); does not add it. ``predicted``
-        replaces the prior's prediction (a dry run's, along its request); without
-        ``evidence`` it leaves the map's scale evidence as it is."""
-        pred = self._predict(f) if predicted is None else predicted
-        T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
-        cands = self._candidates(f, T0, descriptor)
+    def kept_at(self, f: FrameIn, reason: str, n: int, scene_m: float | None = None,
+                detail: str | None = None, pred: tuple[Array, float, float] | None = None
+                ) -> Placement:
+        """A frame with a prior kept at it (api.md §4 "Kept at prior"): at its prior as placed
+        (``pred``, else its prediction: a metric prior as given, a drifting one through the
+        drift estimate), with the prior's own sigmas (the trust defaults without; a drifting
+        prior's grown by the drift estimate's uncertainty)."""
+        assert f.prior is not None
+        T0 = (pred or self._predict(f))[0]  # type: ignore[index]
+        if reason in FAILED_CHECKS:  # kept for a failed check: no detail (api.md §4)
+            detail = None
+        gp, gr = _given_sigmas(f.prior)
+        if f.prior["trust"] == "drifting":
+            _, gp, gr = self.drift.predict(np.asarray(f.prior["T_map_cam"], np.float64), gp, gr)
+        return _kept(f, T0, gp, gr, reason, n, scene_m, detail)
+
+    def candidates_for(self, f: FrameIn, descriptor: Any,
+                       pred: tuple[Array, float, float] | None) -> list[Keyframe]:
+        """The confirmed keyframes a frame is matched against (``place``): nearest its prior
+        as placed, else by retrieval descriptor; without a prior, also those near the last
+        confirmed keyframe."""
+        cands = self._candidates(f, None if pred is None else pred[0], descriptor)
         if pred is None:
             # without a prior, a camera-only robot is near its last confirmed frame: the
             # keyframes near that pose join the candidates. Its
@@ -1812,6 +1974,19 @@ class AnchoredMap:
             near = self._candidates(f, last.T, None)
             cands = cands + [k for k in near if all(k is not c for c in cands)]
             cands = cands[:MAX_CANDIDATES + RECENT_GUIDED]
+        return cands
+
+    def place(self, f: FrameIn, feats: Features, descriptor: Any,
+              predicted: tuple[Array, float, float] | None = None,
+              cands: list[Keyframe] | None = None) -> Placement:
+        """Place one new frame (the map has its origin) against the confirmed keyframes
+        ``cands`` (``candidates_for`` without); does not add it. ``predicted`` replaces the
+        prior's prediction (a stored kept keyframe placed again: its pose as kept). Its scale
+        evidence is left in ``Placement.evidence``, recorded only when the job keeps it."""
+        pred = self._predict(f) if predicted is None else predicted
+        T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
+        if cands is None:
+            cands = self.candidates_for(f, descriptor, pred)
         reason = "few_features" if min(f.features_count or len(feats.kps), len(feats.kps)) \
             < 150 else "no_overlap"
         corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) \
@@ -1854,20 +2029,18 @@ class AnchoredMap:
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
 
-        def kept(why: str, n_in: int) -> Placement:
-            return self._depth_place(f, T0, sp0, sr0, ref) or _kept(f, T0, sp0, sr0, why, n_in)
-
         if f.unconfirmed is not None:
             # its image failed a check: the prior holds it, and depth agreement alone never
             # confirms it (api.md §4)
-            return _kept(f, T0, sp0, sr0, f.unconfirmed, 0)
+            return self.kept_at(f, f.unconfirmed, 0, pred=pred)
         if img is None:
-            return kept(reason, 0)
+            # no edge (map.md §2 match graph): the images give no pose
+            return self.kept_at(f, reason, 0, detail="no_image_pose", pred=pred)
         s, n, ratio, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
         if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
                                                                        2.0 * sp0)):
-            return kept(reason, n)
+            return self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
         dp, dr = pose_residual(s.T, T0)
         # the image-only calibrated sigmas (api.md §4: σ_hypothesis); a rotation-only pose takes
         # the standpoint's position sigma (its centre is the prior's: dp is 0)
@@ -1883,18 +2056,20 @@ class AnchoredMap:
             strong = n >= STRONG_INLIERS and ratio >= STRONG_RATIO \
                 and (f.prior["trust"] != "metric" or refs_ok >= 2)
             if not strong:
-                return _kept(f, T0, sp0, sr0, "no_overlap", n)
+                return self.kept_at(f, "no_overlap", n, detail="conflict_unsupported",
+                                    pred=pred)
             assert corr is not None
             hyp = None if rot_only else self._near_prior(f, corr, cands, T0, sp0, sr0, n)
             if hyp is None:
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
-                                 method, (dp, dr), align_T=s.T, image_sigmas=ci)
+                                 method, (dp, dr), align_T=s.T, image_sigmas=ci, has_prior=True,
+                                 prior_ref=ref)
             s, n, sub, refs = hyp
             spi, sri = s.sigmas()
             spi, sri = max(spi, MIN_SIGMA_POS_M), max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
         assert corr is not None
         pl = self._register(f, s, n, method, spi, sri, sub, refs, corr, cands,
-                            (T0, sp0, sr0), ref, evidence)
+                            (T0, sp0, sr0), ref)
         if not rot_only:
             pl.unconstrained = self._unconstrained(f, feats, s, sub[3], cands)
         return pl
@@ -1950,8 +2125,8 @@ class AnchoredMap:
 
     def _register(self, f: FrameIn, s: Solve, n: int, method: str, spi: float, sri: float,
                   sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs, corr: _Corr,
-                  cands: list[Keyframe], pred: tuple[Array, float, float], ref: Array,
-                  evidence: bool) -> Placement:
+                  cands: list[Keyframe], pred: tuple[Array, float, float], ref: Array
+                  ) -> Placement:
         """A frame with a prior that its image pose ``s`` confirms: the two combined."""
         assert f.prior is not None
         T0, sp0, sr0 = pred
@@ -1988,52 +2163,30 @@ class AnchoredMap:
                        round(max(fsr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, method,
                        pose_residual(T, ref),
                        lifted=_lifted(corr), align_T=s.T,  # type: ignore[arg-type]
-                       map_residual=_displacement(T, s.T, rot_only), prior_ref=ref)
-        if method == "pnp" and evidence:
-            prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
-            self._scale_evidence(s, prior_T, f.prior["trust"], corr, cands,
-                                 (sub, refs, f.K, _prior_sigmas(f.prior)))
+                       map_residual=_displacement(T, s.T, rot_only), prior_ref=ref,
+                       image_sigmas=(rp, rr), has_prior=True)
+        if method == "pnp":
+            ev = functools.partial(self._scale_evidence, s,
+                                   np.asarray(f.prior["T_map_cam"], np.float64),
+                                   f.prior["trust"], corr, cands,
+                                   (sub, refs, f.K, _prior_sigmas(f.prior)), self.scale.k)
+            pl.evidence = lambda: self._record_evidence(ev())
         return pl
-
-    def _depth_place(self, f: FrameIn, T0: Array, sp0: float, sr0: float, ref: Array
-                     ) -> Placement | None:
-        """A frame with a depth image and a prior the images do not place (too few matches; never
-        one whose image failed a check, api.md §4): its depth aligned on the depth of the
-        keyframes near its prior (``depth_icp``: point-to-plane, the prior a factor, so a plane
-        fixes what it can and the prior the rest), registered when its depth then agrees with
-        theirs (``Agreement.confirmed``) and it stays within the combined conflict bound of the
-        prior (its calibrated sigmas). None otherwise."""
-        if f.depth is None or not np.count_nonzero(f.depth > 0):
-            return None
-        refs = [r for k in self._candidates(f, T0, None) for r in [self._grid(k)]
-                if r is not None]
-        if not refs:
-            return None
-        pts = backproject(f.depth.astype(np.float32), f.K.K())
-        got = depth_icp(pts, refs, T0, sp0, sr0)
-        if got is None:
-            return None
-        T, sp, sr, n = got
-        dp, dr = pose_residual(T, T0)
-        assert f.prior is not None
-        sp, sr = sigmas.calibrated(sp, sr, True, f.prior["trust"])
-        # prior plus depth: the depth may refine the prior, never overrule it
-        if sigmas.conflicts(dp, dr, (sp0, sr0), (sp, sr)) \
-                or not agreement(pts, T, refs, SENSOR_DEPTH_TOL).confirmed:
-            return None
-        return Placement(f.name, "registered", None, T, round(max(sp, REPORT_MIN_SIGMA_POS_M), 4),
-                         round(max(sr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, "depth",
-                         pose_residual(T, ref))
 
     def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
                         cands: list[Keyframe], fit: tuple[Any, Refs, Intrinsics,
-                                                          tuple[float, float]]) -> None:
+                                                          tuple[float, float]],
+                        k: float) -> list[tuple[str, list[float]]]:
         """An image-only centre against its prior, both relative to the reference keyframe
         (the one with the most matches). For a monocular reference, in its raw depth units: a
         metric prior is compared with the reference's map centre, a drifting one with the
         reference's own drifting prior (odometry baselines), both evidence of ``k``. For a
         reference whose depth scale is measured independently of the priors (a depth image,
-        or camera heights), in metres: evidence of the metric priors' own scale bias."""
+        or camera heights), in metres: evidence of the metric priors' own scale bias. ``k`` is
+        the map's depth scale at placement; the evidence is recorded only when the job keeps
+        the frame (``_record_evidence``): a list of (``bias`` | ``priors`` | ``odometry``,
+        entry)."""
+        out: list[tuple[str, list[float]]] = []
         j = int(np.bincount(corr.kf).argmax())
         ref = cands[j]
         b_img = float(np.linalg.norm(s.c - ref.centre))
@@ -2044,21 +2197,32 @@ class AnchoredMap:
         anchored = ref.depth_kind == "sensor" or (ref.depth_kind == "mono"
                                                   and self.scale.source == "camera_height")
         if trust == "metric" and anchored:
-            self.bias = [*self.bias, [b_prior, b_img]][-MAX_EVIDENCE:]
+            out.append(("bias", [b_prior, b_img]))
         if ref.depth_kind != "mono":
-            return
-        b_img /= self.scale.k
+            return out
+        b_img /= k
         if trust == "metric":
             # the depth scale the references need for the frame to sit at its metric prior: the
             # refinement with the prior and free reference scales (stored poses fixed)
             sub, refs, K, (sp, sr) = fit
             free = Refs(refs.c, np.full(len(refs.c), EVIDENCE_SCALE_SIGMA), refs.median)
             _, sc = refine_pose(s.R, s.c, *sub, free, K, prior=(prior_T, sp, sr))
-            b_img = b_prior / float(sc[j]) / self.scale.k
-            self.scale.priors = [*self.scale.priors, [b_prior, b_img]][-MAX_EVIDENCE:]
+            b_img = b_prior / float(sc[j]) / k
+            out.append(("priors", [b_prior, b_img]))
         elif ref.prior is not None and ref.prior["trust"] == "drifting":
             b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(ref.prior["T"])[:3, 3]))
-            self.scale.odometry = [*self.scale.odometry, [b_odo, b_img]][-MAX_EVIDENCE:]
+            out.append(("odometry", [b_odo, b_img]))
+        return out
+
+    def _record_evidence(self, entries: list[tuple[str, list[float]]]) -> None:
+        """Scale evidence measured at placement (``_scale_evidence``), recorded."""
+        for kind, e in entries:
+            if kind == "bias":
+                self.bias = [*self.bias, e][-MAX_EVIDENCE:]
+            elif kind == "priors":
+                self.scale.priors = [*self.scale.priors, e][-MAX_EVIDENCE:]
+            else:
+                self.scale.odometry = [*self.scale.odometry, e][-MAX_EVIDENCE:]
 
     # -- adding keyframes ----------------------------------------------------------------------
 
@@ -2071,10 +2235,28 @@ class AnchoredMap:
         d, Kg, desc, _ = f.mono()
         return (d * self.scale.k).astype(np.float32), Kg, "mono", desc
 
+    def height_consistent(self, f: FrameIn, pl: Placement) -> bool:
+        """The height gate (map.md §2): with ``height_above_floor_m`` and ``height_sigma_m``
+        sent, whether the frame's committed camera height (its centre's z: the map's floor is
+        z 0 when priors or a camera height fixed the frame, map.md §1) agrees with the one sent
+        within ``K_SIGMA`` × sqrt(height_sigma² + σ_z²), σ_z its committed position sigma
+        along z (a 3-D RMS sigma over √3). True when nothing is sent or the map has no floor
+        convention (a camera-only map without a camera height)."""
+        if f.height_m is None or f.height_sigma_m is None or pl.T is None \
+                or pl.sigma_pos_m is None:
+            return True
+        if self.created_with not in ("metric", "drifting") and self.origin_height_m is None:
+            return True
+        sz = pl.sigma_pos_m / math.sqrt(3.0)
+        return abs(float(pl.T[2, 3]) - f.height_m) <= K_SIGMA * math.hypot(f.height_sigma_m, sz)
+
     def add(self, f: FrameIn, feats: Features, pl: Placement, depth: NDArray[np.float32],
             K_grid: Intrinsics, kind: str, descriptor: Any) -> Keyframe:
         """Keep a placed frame as a keyframe and, when the images confirmed it, fuse it into the
-        cloud (a frame kept at its prior is stored, not fused: map.md §2)."""
+        cloud (a frame kept at its prior is stored, not fused: map.md §2). A frame the height
+        gate fails (``height_consistent``) stays a reference but gives no content, and is
+        listed in ``height_inconsistent``. While an update runs, the fusion waits for its end
+        (``update``: a frame registered there may still be dropped)."""
         assert pl.T is not None and pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
         kid = f"k{self.next_id:06d}"
         self.next_id += 1
@@ -2094,12 +2276,25 @@ class AnchoredMap:
             else np.zeros(0, np.float32)
         kf.descriptor = None if descriptor is None else np.asarray(descriptor, np.float32)
         kf.grid, kf.K_grid, kf.rgb = depth, K_grid, f.rgb
+        kf.height_ok = self.height_consistent(f, pl)
+        if not kf.height_ok:
+            self.height_inconsistent.append(f.name)
         self.keyframes.append(kf)
         self._added.append(kf)
         pl.keyframe = kid
-        if kind != "none" and kf.contributes():
-            self._fuse(f.rgb, f.ignore, kf, depth, K_grid)
+        if kind != "none":
+            self._fuse_later(kf, f.rgb, f.ignore, depth, K_grid)
         return kf
+
+    def _fuse_later(self, kf: Keyframe, image: NDArray[np.uint8],
+                    ignore: NDArray[np.bool_] | None, depth: NDArray[np.float32],
+                    K_grid: Intrinsics) -> None:
+        """A keyframe's depth into the cloud when it carries content (``Keyframe.contributes``):
+        now, or at the end of the running update (``_defer``)."""
+        if self._defer is not None:
+            self._defer.append((kf, image, ignore, depth, K_grid))
+        elif kf.contributes():
+            self._fuse(image, ignore, kf, depth, K_grid)
 
     def _fuse(self, image: NDArray[np.uint8], ignore: NDArray[np.bool_] | None, kf: Keyframe,
               depth: NDArray[np.float32], K_grid: Intrinsics) -> None:
@@ -2168,145 +2363,353 @@ class AnchoredMap:
 
     def update(self, frames: list[FrameIn], progress: Callable[[str], None] = log.info
                ) -> list[Placement]:
-        """Register and fuse ``frames`` (request order) into the map. While the map has no
-        image-confirmed keyframe, the next frame with a prior that passes the checks is placed
-        at its prior as the origin (one that fails them is kept at its prior); without any
-        prior, the first frame is (``first_camera``). When every frame with a prior is rejected
-        or kept, the frames without a prior are rejected ``no_overlap`` (map.md §1). Then the
-        stored kept keyframes the new frames overlap are placed again (``reregister``)."""
+        """Register and fuse ``frames`` into the map over the job's match graph (map.md §2,
+        order-independent): ``_register_job`` under the drift estimate as it stands, then the
+        robust drift fit (``_fit_drift``); when it changes the estimate or leaves frames out,
+        the job is registered again under its decision, at most ``DRIFT_PASSES`` times. The
+        keyframes are fused into the cloud at the end, once their statuses are final; then the
+        drift estimate takes this job's confirmations (``_close_drift``)."""
         t0 = time.perf_counter()
-        out: dict[int, Placement] = {}
         new = not self.keyframes
-        kept_before = [k for k in self.keyframes if not k.usable()]
-        remaining = list(range(len(frames)))
-        trusted = {i for i, f in enumerate(frames) if f.prior is not None
-                   and f.prior["trust"] in ("metric", "drifting")}
-        reg_s = 0.0
-        fuse_s = 0.0
-        feats_of: dict[int, Features] = {}
-        pending: int | None = None  # the last strong conflict of a drifting prior
-        # this update's frames the images confirmed, with their features
-        mine: list[tuple[FrameIn, Placement, Features]] = []
-        self.prior_disagreement_deg = 0.0
-        self.reregistered = []
-
-        def keep(i: int, pl: Placement) -> None:
-            f = frames[i]
-            depth, Kg, kind, desc = self._keyframe_depth(f)
-            if not self.keyframes and self.created_with != "none" and f.mono is not None:
-                self._up_check(f, pl)
-            if kind == "sensor" and pl.status == "registered" and pl.lifted is not None:
-                assert pl.T is not None
-                # the depth image against the map's lifted points: its source's residual
-                a = depth_alignment(pl.T if pl.align_T is None else pl.align_T, *pl.lifted,
-                                    depth, Kg, f.K)
-                if a is not None:
-                    self.scale.depth_residuals.setdefault("sensor", []).append(math.log(a))
-                    del self.scale.depth_residuals["sensor"][:-MAX_EVIDENCE]
-            if kind == "mono" and pl.status == "registered":
-                assert pl.T is not None
-                # its own scale brought onto the map's (the monocular model's metres vary from
-                # frame to frame), on the points lifted at the map's current scale
-                if pl.lifted is not None:
-                    a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
-                                        *pl.lifted, depth, Kg, f.K)
-                    if a is not None:
-                        depth = (depth * a).astype(np.float32)
-                        self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
-                        del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
-                # its camera height, if known, refines the depth scale before it is fused (a
-                # frame kept at its prior is no scale evidence: map.md §2)
-                self.add_height_evidence(f, pl.T, depth, Kg)
-                k = self.scale.k
-                self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
-                depth = (depth * (self.scale.k / k)).astype(np.float32)
-            self.add(f, feats_of[i], pl, depth, Kg, kind, desc)
-            progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
-
-        while remaining:
-            i = remaining[0]
-            origin = not self.confirmed()
-            if origin and (trusted or self.keyframes):
-                left = [j for j in remaining if j in trusted]
-                if not left:  # no frame with a prior became the origin: nothing to register on
-                    for j in remaining:
-                        out[j] = Placement(frames[j].name, "rejected", "no_overlap")
-                    break
-                i = left[0]
-            remaining.remove(i)
-            f = frames[i]
-            t = time.perf_counter()
-            scene = _median(f.depth)
-            mono = None
-            if scene is None and f.mono is not None and (f.prior is None or f.check_close):
-                # the retrieval descriptor finds candidates without a prior; a suspicious
-                # frame's depth gives its scene distance (too_close)
-                mono = f.mono()
-                if f.check_close:
-                    d = _median(mono[0])
-                    scene = None if d is None else d * self.scale.k
-            close = scene is not None and scene < TOO_CLOSE_M
-            feats_of[i] = features(f.rgb, f.ignore)
-            if origin:
-                pl = self._origin(f, close, scene)
-            else:
-                pl = self.place(f, feats_of[i], None if mono is None else mono[2],
-                                evidence=not close)
-                if f.prior is None and pl.status == "registered" and self.standpoint is not None:
-                    pl = self.standpoint(f, feats_of[i], pl)
-                # the 300-inlier exemption counts image feature inliers only: depth never
-                # overrides too_close (api.md §4)
-                if close and (0 if pl.method == "depth" else pl.inliers) < TOO_CLOSE_INLIERS:
-                    pl = self._too_close(f, pl, scene)
-            pl = self._dedup(f, pl, feats_of[i])
-            again = []
-            if pl.reason == "prior_conflict" and f.prior is not None \
-                    and f.prior["trust"] == "drifting":
-                if pending is not None and self._same_drift(frames[pending], out[pending], f, pl):
-                    # two strong placements agree on a correction the odometry's sigmas did
-                    # not allow (a slip, a long unseen drive): the odometry is re-anchored on
-                    # the first, and both are placed again
-                    assert out[pending].align_T is not None
-                    self.drift.confirm(out[pending].align_T, np.asarray(
-                        frames[pending].prior["T_map_cam"], np.float64))  # type: ignore[index]
-                    again = [pending, i]
-                    pending = None
-                else:
-                    pending = i
-            elif pl.status == "registered":
-                pending = None
-            if not again:
-                out[i] = self._checked(f, pl, mine, feats_of[i])
-                self._odometry(f, pl)
-                reg_s += time.perf_counter() - t
-                if pl.status == "rejected":
-                    continue
-                t = time.perf_counter()
-                keep(i, pl)
-                fuse_s += time.perf_counter() - t
-                continue
-            for j in again:
-                t = time.perf_counter()
-                out[j] = self._checked(frames[j], self._dedup(frames[j], self.place(
-                    frames[j], feats_of[j], None), feats_of[j]), mine, feats_of[j])
-                self._odometry(frames[j], out[j])
-                reg_s += time.perf_counter() - t
-                if out[j].status != "rejected":
-                    t = time.perf_counter()
-                    keep(j, out[j])
-                    fuse_s += time.perf_counter() - t
+        prep = [self._prepare(f) for f in frames]
+        static_content(frames, prep)
+        snap = self._snapshot()
+        used = copy.deepcopy(self.drift)
+        forced: dict[int, Placement] = {}
+        self._keep_s = 0.0
+        passes = 0
+        while True:
+            if passes:
+                self._restore(snap)
+            passes += 1
+            self.drift = copy.deepcopy(used)
+            self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = 0.0, [], []
+            self._defer = []
+            out = self._register_job(frames, prep, forced, progress)
+            got, outliers = self._fit_drift(frames, out, used)
+            fresh = {i: pl for i, pl in outliers.items() if i not in forced}
+            if (got is None and not fresh) or passes == DRIFT_PASSES:
+                break
+            used = got or used
+            forced.update(fresh)
+        self._close_drift(frames, out, used)
         t = time.perf_counter()
-        added = [self.keyframe(pl.keyframe) for pl in out.values()
-                 if pl.status == "registered" and pl.keyframe is not None]
-        self.reregistered = self.reregister(kept_before, [k for k in added if k is not None])
-        reg_s += time.perf_counter() - t
+        pending, self._defer = self._defer or [], None
+        for kf, image, ignore, depth, K_grid in pending:  # in the order the job kept them
+            if kf.contributes():
+                self._fuse(image, ignore, kf, depth, K_grid)
+        fuse_s = self._keep_s + time.perf_counter() - t
         self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
         pls = [out[i] for i in range(len(frames))]
         if new and self.created_with == "none":
             self._level_by_floor(pls)
-        self.timings = {"register": round(reg_s, 3), "fuse": round(fuse_s, 3),
-                        "total": round(time.perf_counter() - t0, 3)}
+        total = time.perf_counter() - t0
+        self.timings = {"register": round(total - fuse_s, 3), "fuse": round(fuse_s, 3),
+                        "total": round(total, 3)}
         return pls
+
+    def _prepare(self, f: FrameIn) -> _Prep:
+        """A frame's features, its scene distance (depth image, else, for a suspicious frame,
+        its monocular depth: too_close) and retrieval descriptor (frames without a prior)."""
+        scene = _median(f.depth)
+        mono = None
+        if scene is None and f.mono is not None and (f.prior is None or f.check_close):
+            mono = f.mono()
+            if f.check_close:
+                d = _median(mono[0])
+                scene = None if d is None else d * self.scale.k
+        return _Prep(features(f.rgb, f.ignore), scene, scene is not None and scene < TOO_CLOSE_M,
+                     None if mono is None else mono[2])
+
+    def _snapshot(self) -> dict[str, Any]:
+        """What registering a job changes in the map (``_restore``): the keyframes and the
+        state of the stored ones, the scale evidence, the drift and the origin's records."""
+        return {"keyframes": list(self.keyframes), "added": list(self._added),
+                "next_id": self.next_id, "scale": copy.deepcopy(self.scale),
+                "drift": copy.deepcopy(self.drift), "bias": list(self.bias),
+                "origin": (self.created_with, self.origin_c, self.origin_height_m,
+                           self.up_check_deg),
+                "report": (self.prior_disagreement_deg, list(self.reregistered),
+                           list(self.height_inconsistent)),
+                "defer": None if self._defer is None else list(self._defer),
+                "stored": [(k, k.T.copy(), k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method,
+                            k.inliers, k.rgb, k.reason, k.height_ok) for k in self.keyframes]}
+
+    def _restore(self, snap: dict[str, Any]) -> None:
+        self.keyframes, self._added = list(snap["keyframes"]), list(snap["added"])
+        self.next_id, self.bias = snap["next_id"], list(snap["bias"])
+        self.scale, self.drift = copy.deepcopy(snap["scale"]), copy.deepcopy(snap["drift"])
+        self.created_with, self.origin_c, self.origin_height_m, self.up_check_deg = snap["origin"]
+        d, r, h = snap["report"]
+        self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = \
+            d, list(r), list(h)
+        self._defer = None if snap["defer"] is None else list(snap["defer"])
+        for k, T, sp, sr, state, method, n, rgb, reason, h_ok in snap["stored"]:
+            k.T, k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method = T.copy(), sp, sr, state, method
+            k.inliers, k.rgb, k.reason, k.height_ok = n, rgb, reason, h_ok
+
+    def _keep(self, f: FrameIn, pr: _Prep, pl: Placement,
+              progress: Callable[[str], None]) -> Keyframe:
+        """Store a placed frame as a keyframe (``add``): its depth (a depth image; else its
+        monocular depth brought onto the map's scale, its camera height refining that scale)
+        and, registered with a depth image, its depth's residual against the map."""
+        t = time.perf_counter()
+        depth, Kg, kind, desc = self._keyframe_depth(f)
+        if not self.keyframes and self.created_with != "none" and f.mono is not None:
+            self._up_check(f, pl)
+        if kind == "sensor" and pl.status == "registered" and pl.lifted is not None:
+            assert pl.T is not None
+            # the depth image against the map's lifted points: its source's residual
+            a = depth_alignment(pl.T if pl.align_T is None else pl.align_T, *pl.lifted,
+                                depth, Kg, f.K)
+            if a is not None:
+                self.scale.depth_residuals.setdefault("sensor", []).append(math.log(a))
+                del self.scale.depth_residuals["sensor"][:-MAX_EVIDENCE]
+        if kind == "mono" and pl.status == "registered":
+            assert pl.T is not None
+            # its own scale brought onto the map's (the monocular model's metres vary from
+            # frame to frame), on the points lifted at the map's current scale
+            if pl.lifted is not None:
+                a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
+                                    *pl.lifted, depth, Kg, f.K)
+                if a is not None:
+                    depth = (depth * a).astype(np.float32)
+                    self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
+                    del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
+            # its camera height, if known, refines the depth scale before it is fused (a
+            # frame kept at its prior is no scale evidence: map.md §2)
+            self.add_height_evidence(f, pl.T, depth, Kg)
+            k = self.scale.k
+            self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+            depth = (depth * (self.scale.k / k)).astype(np.float32)
+        kf = self.add(f, pr.feats, pl, depth, Kg, kind, desc)
+        progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
+        self._keep_s += time.perf_counter() - t
+        return kf
+
+    @staticmethod
+    def _trusted(f: FrameIn) -> bool:
+        return f.prior is not None and f.prior["trust"] in ("metric", "drifting")
+
+    def _register_job(self, frames: list[FrameIn], prep: list[_Prep],
+                      forced: dict[int, Placement], progress: Callable[[str], None]
+                      ) -> dict[int, Placement]:
+        """One registration of the job over its match graph (map.md §2), the ``forced``
+        frames (left out of the drift fit) rejected as given:
+
+        1. without a confirmed keyframe, the origin (``_origin``): the first frame with a prior
+           in canonical order (name, camera) that passes the checks, the ones before it kept at
+           their priors; without any prior, the first frame in request order (map.md §1);
+        2. rounds (``_rounds``): every frame not yet registered is placed against the confirmed
+           keyframes as they stand, and those that register become references together;
+        3. a component the confirmed map does not reach is placed by its own priors: a frame
+           with a prior and no image pose seeds it at its prior, and stays registered when
+           another frame registers through it (else it is undone);
+        4. what never registered keeps its last placement: kept at its prior (stored, never a
+           reference) or rejected.
+
+        The result depends on the frames, not their request order (canonical order wherever an
+        order matters; a frame that registers in a later round counts as later)."""
+        out: dict[int, Placement] = dict(forced)
+        pending = [i for i in range(len(frames)) if i not in forced]
+        mine: list[tuple[FrameIn, Placement, Features]] = []
+        kept_before = [k for k in self.keyframes if not k.usable()]
+        if not self.confirmed():
+            self._origin_of(frames, prep, pending, out, progress)
+        results: dict[int, Placement] = {}
+        seen: dict[int, tuple[str, ...]] = {}
+        self._rounds(frames, prep, pending, out, results, seen, mine, kept_before, progress)
+        tried: set[int] = set()
+        while True:
+            seeds = [i for i in sorted(pending, key=lambda j: _order(frames, j))
+                     if i not in tried and self._trusted(frames[i])
+                     and results[i].detail == "no_image_pose"]
+            if not seeds:
+                break
+            s = seeds[0]
+            tried.add(s)
+            snap = self._snapshot()
+            before = (dict(results), dict(seen), list(mine), dict(out))
+            pl = self._seed(frames[s])
+            self._keep(frames[s], prep[s], pl, lambda _: None)
+            rest = [i for i in pending if i != s]
+            if self._rounds(frames, prep, rest, out, results, seen, mine, kept_before, progress):
+                out[s] = results[s] = pl
+                pending = rest
+                progress(f"{frames[s].name}: registered (prior, a component's seed)")
+                continue
+            self._restore(snap)
+            results, seen, mine, out = before[0], before[1], before[2], before[3]
+        for i in sorted(pending, key=lambda j: _order(frames, j)):
+            out[i] = results.get(i) or Placement(frames[i].name, "rejected", "no_overlap")
+            if out[i].status == "kept_at_prior":
+                self._keep(frames[i], prep[i], out[i], progress)
+        return out
+
+    def _origin_of(self, frames: list[FrameIn], prep: list[_Prep], pending: list[int],
+                   out: dict[int, Placement], progress: Callable[[str], None]) -> None:
+        """The origin of a map without a confirmed keyframe (``_register_job`` step 1), taken
+        out of ``pending``; when no frame with a prior can be it (a map holding only kept
+        frames), every frame left is rejected ``no_overlap``."""
+        trusted = [i for i in pending if self._trusted(frames[i])]
+        if trusted or self.keyframes:
+            for i in sorted(trusted, key=lambda j: _order(frames, j)):
+                pl = self._origin(frames[i], prep[i].close, prep[i].scene)
+                pending.remove(i)
+                out[i] = pl
+                self._keep(frames[i], prep[i], pl, progress)
+                if pl.status == "registered":
+                    return
+            for j in pending:  # nothing to register on
+                out[j] = Placement(frames[j].name, "rejected", "no_overlap")
+            pending.clear()
+            return
+        for i in list(pending):  # the first camera, in request order (map.md §1)
+            pl = self._origin(frames[i], prep[i].close, prep[i].scene)
+            pending.remove(i)
+            out[i] = pl
+            if pl.status != "rejected":
+                self._keep(frames[i], prep[i], pl, progress)
+                return
+
+    def _seed(self, f: FrameIn) -> Placement:
+        """A component's seed (``_register_job`` step 3): registered at its prior as placed,
+        with the prior's sigmas, prior residual 0."""
+        kept = self.kept_at(f, "no_overlap", 0)
+        assert kept.T is not None
+        return Placement(f.name, "registered", None, kept.T, kept.sigma_pos_m,
+                         kept.sigma_rot_deg, 0, "prior", (0.0, 0.0), has_prior=True)
+
+    def _rounds(self, frames: list[FrameIn], prep: list[_Prep], pending: list[int],
+                out: dict[int, Placement], results: dict[int, Placement],
+                seen: dict[int, tuple[str, ...]], mine: list[tuple[FrameIn, Placement, Features]],
+                kept_before: list[Keyframe], progress: Callable[[str], None]) -> bool:
+        """Rounds over the match graph (``_register_job`` step 2) until one registers nothing:
+        in canonical order, each frame of ``pending`` is placed against the confirmed keyframes
+        as they stand (again only when its candidates changed since its last placement), a
+        frame without a prior joining a standpoint, the distance limit applied; one that
+        registers becomes a reference at once (``_dedup``, ``_checked``, its scale evidence,
+        ``_keep``) and leaves ``pending``. After each round the stored kept keyframes the new
+        ones overlap are placed again (``reregister``), confirmed ones becoming references too.
+        A frame that fails in one round is placed again in the next against what registered
+        since: the fixed point does not depend on the request order. Returns whether any frame
+        registered."""
+        grown = False
+        while pending:
+            added = []
+            for i in sorted(pending, key=lambda j: _order(frames, j)):
+                f, pr = frames[i], prep[i]
+                pred = self._predict(f)
+                cands = self.candidates_for(f, pr.descriptor, pred)
+                ids = tuple(k.id for k in cands)
+                if i in results and seen.get(i) == ids:
+                    continue  # nothing new to match: as it was
+                seen[i] = ids
+                pl = self.place(f, pr.feats, pr.descriptor, cands=cands)
+                if f.prior is None and pl.status == "registered" and self.standpoint is not None:
+                    pl = self.standpoint(f, pr.feats, pl)
+                # the 300-inlier exemption counts image feature inliers only (api.md §4)
+                if pr.close and pl.inliers < TOO_CLOSE_INLIERS:
+                    pl = self._too_close(f, pl, pr.scene)
+                results[i] = pl
+                if pl.status != "registered":
+                    continue
+                pending.remove(i)
+                pl = self._dedup(f, pl, pr.feats)
+                if pl.status == "rejected":
+                    out[i] = results[i] = pl
+                    continue
+                pl = self._checked(f, pl, mine, pr.feats)
+                if pl.evidence is not None and not pr.close:
+                    pl.evidence()
+                out[i] = results[i] = pl
+                added.append(self._keep(f, pr, pl, progress))
+            if not added:
+                break
+            grown = True
+            self.reregistered += self.reregister([k for k in kept_before if not k.usable()],
+                                                 added)
+        return grown
+
+    def _drift_evidence(self, frames: list[FrameIn], out: dict[int, Placement]
+                        ) -> list[_DriftObs]:
+        """The job's frames with a drifting prior whose images give a pose of their own
+        (registered, or rejected ``prior_conflict``): the drift fit's observations."""
+        obs = []
+        for i, f in enumerate(frames):
+            pl = out.get(i)
+            if pl is None or f.prior is None or f.prior["trust"] != "drifting":
+                continue
+            if pl.status == "registered" and pl.method in ("origin", "prior"):
+                assert pl.T is not None
+                T, sh = pl.T, (MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG)
+            elif (pl.status == "registered" or pl.reason == "prior_conflict") \
+                    and pl.align_T is not None and pl.image_sigmas is not None:
+                T, sh = pl.align_T, pl.image_sigmas
+            else:
+                continue
+            obs.append(_DriftObs(i, f.name, T, np.asarray(f.prior["T_map_cam"], np.float64),
+                                 _prior_sigmas(f.prior), sh, pl.method == "rotation", pl))
+        return obs
+
+    def _fit_drift(self, frames: list[FrameIn], out: dict[int, Placement], used: Drift
+                   ) -> tuple[Drift | None, dict[int, Placement]]:
+        """The robust drift estimate (map.md §1 "Drift estimate") over the job's image-confirmed
+        drifting-prior frames (``_drift_evidence``): the estimate in force (``used``) and one
+        trial per observation (that frame as the reference) each count the observations within
+        ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²) of their prediction (position and
+        rotation); the trial with the most, refined over them (``_refined_drift``), replaces
+        the estimate in force only when it has more. A change larger than ``K_SIGMA`` × its own
+        sigma (``_drift_sigma``) needs ``DRIFT_MIN_SUPPORT`` frames and
+        ``DRIFT_SUPPORT_SHARE`` of the job's drifting-prior frames; without a previous estimate
+        (a map whose frame no drifting prior fixed, before its first) the same share. Returns
+        the new estimate (None: the one in force stays) and the observations it leaves out,
+        each a ``prior_conflict`` rejection."""
+        obs = self._drift_evidence(frames, out)
+        n_job = sum(f.prior is not None and f.prior["trust"] == "drifting" for f in frames)
+        if not obs:
+            return None, {}
+        base = _drift_inliers(used, obs)
+        best, best_in = None, base
+        for o in sorted(obs, key=lambda o: o.name):
+            trial = Drift(o.T, o.P, used.odo_scale)
+            got = _drift_inliers(trial, obs)
+            if len(got) > len(best_in):
+                best, best_in = trial, got
+        if best is None:
+            return None, _drift_outliers(used, obs, base)
+        fitted = _refined_drift(best, [o for o in obs if o.index in best_in])
+        previous = used.ref_T is not None or self.created_with == "drifting"
+        ref = best.ref_prior
+        assert ref is not None
+        dp, dr = pose_residual(fitted.predict(ref, 0.0, 0.0)[0], used.predict(ref, 0.0, 0.0)[0])
+        sp, sr = _drift_sigma([o for o in obs if o.index in best_in])
+        large = dp > K_SIGMA * sp or dr > K_SIGMA * sr
+        share = len(best_in) >= DRIFT_SUPPORT_SHARE * n_job
+        supported = share and len(best_in) >= min(DRIFT_MIN_SUPPORT, n_job) if not previous \
+            else share and len(best_in) >= DRIFT_MIN_SUPPORT
+        if large and not supported:
+            log.info("drift change of %.3f m / %.2f deg refused: %d of %d frames support it",
+                     dp, dr, len(best_in), n_job)
+            return None, _drift_outliers(used, obs, base)
+        return fitted, _drift_outliers(fitted, obs, best_in)
+
+    def _close_drift(self, frames: list[FrameIn], out: dict[int, Placement], used: Drift
+                     ) -> None:
+        """The drift estimate after the job: the one the job was registered under, then each
+        registered drifting frame in request order as the new reference (``Drift.confirm``: its
+        odometry-scale evidence), and the drifting priors after the last one as path
+        (``Drift.observe``). The request order matters only for later jobs."""
+        self.drift = copy.deepcopy(used)
+        for i, f in enumerate(frames):
+            if f.prior is None or f.prior["trust"] != "drifting":
+                continue
+            P = np.asarray(f.prior["T_map_cam"], np.float64)
+            pl = out[i]
+            if pl.status == "registered" and pl.T is not None:
+                self.drift.confirm(pl.T, P)
+            else:
+                self.drift.observe(P)
 
     def keyframe(self, kid: str) -> Keyframe | None:
         """The keyframe of id ``kid``, or None."""
@@ -2326,10 +2729,10 @@ class AnchoredMap:
                 self.created_with = p["trust"]
                 self.origin_c = P[:3, 3].copy()
             if f.unconfirmed is not None or close:
-                T0, sp0, sr0 = self._predict(f) or (P, sp, sr)
-                return _kept(f, T0, sp0, sr0, f.unconfirmed or "too_close", 0,
-                             scene if f.unconfirmed is None else None)
-            return Placement(f.name, "registered", None, P, sp, sr, 0, "origin", (0.0, 0.0))
+                return self.kept_at(f, f.unconfirmed or "too_close", 0,
+                                    scene if f.unconfirmed is None else None)
+            return Placement(f.name, "registered", None, P, sp, sr, 0, "origin", (0.0, 0.0),
+                             has_prior=True)
         if close:  # an origin has no inliers: too close, it cannot be registered
             return Placement(f.name, "rejected", "too_close", scene_m=scene)
         h = f.height_m if f.height_m is not None and f.height_m > 0 else None
@@ -2346,16 +2749,15 @@ class AnchoredMap:
         if pred is None:
             return Placement(f.name, "rejected", "too_close", inliers=pl.inliers, scene_m=scene)
         if f.unconfirmed is not None:
-            return _kept(f, *pred, f.unconfirmed, pl.inliers)
-        return _kept(f, *pred, "too_close", pl.inliers, scene)
+            return self.kept_at(f, f.unconfirmed, pl.inliers, pred=pred)
+        return self.kept_at(f, "too_close", pl.inliers, scene, pred=pred)
 
     def _dedup(self, f: FrameIn, pl: Placement, feats: Features | None = None) -> Placement:
         """A registered frame within ``duplicate_limits`` of an image-confirmed keyframe of its
         camera, stored or added earlier in the update (api.md §4: the registered pose), whose
         image agrees with that keyframe's (``duplicate_of``): rejected ``duplicate``, naming
         it. One whose image does not agree is registered (the later observation wins)."""
-        if pl.status != "registered" or pl.T is None:
-            return pl
+        assert pl.status == "registered" and pl.T is not None
         dup = self.duplicate_of(f.camera_id, pl.T, feats)
         if dup is None:
             return pl
@@ -2400,7 +2802,7 @@ class AnchoredMap:
             kf.rgb, kf.reason = rgb, None
             ref = self._grid(kf)
             if not had and ref is not None and kf.depth_kind != "none" and kf.K_grid is not None:
-                self._fuse(rgb, None, kf, ref.depth, kf.K_grid)
+                self._fuse_later(kf, rgb, None, ref.depth, kf.K_grid)
             out.append({"name": kf.name, "keyframe": kf.id, "displacement_m": round(dp, 4),
                         "displacement_deg": round(dr, 3), "content": had})
             log.info("%s: re-registered (%.3f m, %.2f deg from its prior)", kf.name, dp, dr)
@@ -2424,9 +2826,8 @@ class AnchoredMap:
                  "sigma_pos_m": kf.prior["sigma_pos_m"], "sigma_rot_deg": kf.prior["sigma_rot_deg"]}
         f = FrameIn(kf.name, kf.camera_id, rgb, kf.K, prior, None,
                     features_count=len(kf.feats.kps))
-        pl = self.place(f, kf.feats, kf.descriptor, (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg),
-                        evidence=False)
-        return (pl, rgb) if pl.status == "registered" and pl.method != "depth" else None
+        pl = self.place(f, kf.feats, kf.descriptor, (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg))
+        return (pl, rgb) if pl.status == "registered" else None
 
     def _level_by_floor(self, pls: list[Placement]) -> None:
         """A new camera-only map's up from the floor plane too (map.md §1): the first-camera
@@ -2484,9 +2885,9 @@ class AnchoredMap:
         relative rotation and the priors' raises ``prior_disagreement_deg``; beyond ``K_SIGMA``
         of the two priors' combined rotation sigmas, this frame's rotation is corrected from the
         images (relative to the earlier frame's committed rotation). Then it joins ``mine``."""
-        assert f.prior is not None and pl.T is not None
-        if pl.align_T is None or pl.lifted is None:
-            return
+        # registered with a prior in a round: placed by its image pose (``_register``)
+        assert f.prior is not None and pl.T is not None and pl.align_T is not None \
+            and pl.lifted is not None
         P = np.asarray(f.prior["T_map_cam"], np.float64)
         sr = _prior_sigmas(f.prior)[1]
         for g, q, gf in mine:
@@ -2517,33 +2918,6 @@ class AnchoredMap:
         if k.grid is None or k.K_grid is None:
             return None
         return DepthRef(k.T, (k.grid * self._depth_factor(k)).astype(np.float32), k.K_grid.K())
-
-    def _odometry(self, f: FrameIn, pl: Placement) -> None:
-        """A frame with a drifting prior: the new reference of the odometry when the images
-        confirmed it, else one more step of its path."""
-        if f.prior is None or f.prior["trust"] != "drifting":
-            return
-        P = np.asarray(f.prior["T_map_cam"], np.float64)
-        if pl.status == "registered" and pl.T is not None:
-            self.drift.confirm(pl.T, P)
-        else:
-            self.drift.observe(P)
-
-    def _same_drift(self, fa: FrameIn, a: Placement, fb: FrameIn, b: Placement) -> bool:
-        """Whether two drifting frames' image poses (strong conflicts with their priors) imply
-        the same correction of the odometry: ``b``'s image pose predicted from ``a``'s, as a
-        reference, within ``K_SIGMA`` of their combined sigmas."""
-        if a.align_T is None or b.align_T is None or a.image_sigmas is None \
-                or b.image_sigmas is None:
-            return False
-        assert fa.prior is not None and fb.prior is not None
-        trial = Drift(a.align_T, np.asarray(fa.prior["T_map_cam"], np.float64),
-                      self.drift.odo_scale)
-        T, sp, sr = trial.predict(np.asarray(fb.prior["T_map_cam"], np.float64),
-                                  *_prior_sigmas(fb.prior))
-        dp, dr = pose_residual(b.align_T, T)
-        return dp <= K_SIGMA * math.hypot(sp, a.image_sigmas[0], b.image_sigmas[0]) \
-            and dr <= K_SIGMA * math.hypot(sr, a.image_sigmas[1], b.image_sigmas[1])
 
     def _up_check(self, f: FrameIn, pl: Placement) -> None:
         """The angle between the origin prior's up axis and the monocular gravity estimate."""

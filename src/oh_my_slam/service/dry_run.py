@@ -4,14 +4,14 @@ It runs synchronously and writes nothing (no camera, version, job or mapper file
 
 * the per-frame checks of an update (``Updater._check``), with the monocular median depth of the
   first ``DRY_DEPTH_FRAMES`` suspicious frames (``too_close``);
-* per kept frame, its link to the map: on an anchored map the prior-first placement against the
-  current version (``AnchoredMap.place`` on a copy loaded read-only; nothing is added, no scale
-  evidence), whose inliers are ``map_inliers``; on a new map or a map of the mapper, null. The
-  frames are placed ``DRY_THREADS`` at a time, each against the stored map only; a drifting
-  prior's prediction follows the request (the odometry's path grows frame by frame, as in the
-  update), and two strong conflicts that agree on one correction of the odometry re-anchor it,
-  as the update does (``AnchoredMap._same_drift``): the conflicts that correction explains are
-  predicted registered;
+* per kept frame, its link to the map: on a map the prior-first engine registers (an anchored
+  map, or a new map while ``Updater.prior_first`` holds), the job's own registration
+  (``AnchoredMap.update``: the match graph, the drift fit, the distance limit, pose duplicates,
+  re-registration and the height gate) on the snapshot of the current version, its monocular
+  depth asked only when a frame needs it, so the predicted statuses are the update's (map.md
+  §2); the snapshot is discarded. ``map_inliers`` are its inliers. Frames without a prior that
+  the update would give MapAnything (``prior_first.none_engine``) are predicted by the same
+  geometric registration. On a map of the mapper, null;
 * its links to its neighbours in the request (the previous and the next frame): the inliers of a
   fundamental matrix (RANSAC) on their ratio-test SIFT matches;
 * the predicted status (``registered``, ``kept_at_prior`` or ``rejected``) and reason, with
@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import itertools
 import math
 import shutil
 import uuid
@@ -59,7 +58,6 @@ from oh_my_slam.mapping.anchored import (
     features,
     match,
     pose_residual,
-    unit,
 )
 from oh_my_slam.mapping.quality import (
     displacement_quality,
@@ -72,11 +70,14 @@ from oh_my_slam.mapping.quality import (
 from oh_my_slam.service.prior_first import (
     LOW_CONFIDENCE_SIGMA_M,
     _frame_in,
+    _has_depth,
     frame_class,
     none_engine,
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
 
 NEIGHBOUR_PX = 3.0  # the fundamental matrix's RANSAC threshold
@@ -107,31 +108,32 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         prev = store.snapshot(w.map, workdir / "mapper")
         frames, masks = up._frames(w)
         up._check(frames, masks, prev, indir)
-        # the monocular depth of at most DRY_DEPTH_FRAMES suspicious frames (too_close): a
-        # dry run stays a few seconds; the others are predicted by their other checks
-        up._resolve_deferred([fr for fr in frames if fr.deferred][:DRY_DEPTH_FRAMES])
+        engine = up._is_anchored(prev, frames)
+        if not engine:
+            # the monocular median depth of at most DRY_DEPTH_FRAMES suspicious frames
+            # (too_close): a dry run of the mapper stays a few seconds; the others are predicted
+            # by their other checks. The engine measures them itself, as the job's does
+            up._resolve_deferred([fr for fr in frames if fr.deferred][:DRY_DEPTH_FRAMES])
         with ThreadPoolExecutor(DRY_THREADS) as pool:
             got = list(pool.map(lambda fr: None if fr.rgb is None else features(fr.rgb, fr.ignore),
                                 frames))
             feats: dict[int, Features] = {fr.work.index: g for fr, g in zip(frames, got,
                                                                            strict=True)
                                           if g is not None}
-            am = AnchoredMap.load(workdir / "mapper") \
-                if prev is not None and prev.get("engine") == "anchored" else None
-            placed = _place_all(pool, am, frames, feats)
             links = list(pool.map(lambda k: _neighbours(k, frames, feats), range(len(frames))))
+        am, placed, pairs = _engine(up, frames, prev, workdir) if engine else (None, {}, None)
         out, kept, prior_res = [], [], []
         first_kept = True
-        # predicted registered: name, camera, pose, features (the pose duplicate's candidates)
+        # predicted registered without the engine: name, camera, pose, features (the pose
+        # duplicate's candidates)
         earlier: list[tuple[str, str, Any, Callable[[], Features | None]]] = []
         for k, fr in enumerate(frames):
-            row, pl = _frame(fr, links[k], placed.get(fr.work.index), am is not None,
+            row, pl = _frame(fr, links[k], placed.get(fr.work.index), engine,
                              prev is None, first_kept)
-            T = _predicted_pose(fr, pl, am is not None, prev is None)
-            if row["predicted_status"] == "registered" and T is not None:
+            T = _predicted_pose(fr, pl, engine, prev is None)
+            if not engine and row["predicted_status"] == "registered" and T is not None:
                 own = feats.get(fr.work.index)
-                dup = (None if am is None else am.duplicate_of(fr.work.camera_id, T, own)) \
-                    or duplicate_among(fr.work.camera_id, T, own, earlier)
+                dup = duplicate_among(fr.work.camera_id, T, own, earlier)
                 if dup is not None:
                     row.update(predicted_status="rejected", predicted_reason="duplicate",
                                duplicate_of=dup)
@@ -145,22 +147,19 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                     assert fr.work.prior is not None
                     prior_res.append(pose_residual(pl.T, np.asarray(fr.work.prior["T_map_cam"])))
             out.append(row)
-        gravity = _prior_gravity(up, frames) if prev is None and up.prior_first else None
-        disagreement = 0.0
-        if am is not None:  # the registered frames with a prior against each other
-            mine: list[Any] = []
-            ins = {fr.work.index: fr for fr in frames}
-            for idx, pl in placed.items():
-                if pl.status == "registered":
-                    am._checked(_frame_in(ins[idx], None), pl, mine, feats[idx])
-            disagreement = am.prior_disagreement_deg
+        # a new anchored map's: the origin's gravity, as the job measures it (null without a
+        # frame with a prior: a camera-only map is levelled by that gravity)
+        gravity = am.up_check_deg if prev is None and am is not None \
+            and am.created_with in ("metric", "drifting") else None
+        disagreement = 0.0 if am is None else am.prior_disagreement_deg
+        heights = [] if am is None else list(am.height_inconsistent)
         source, sigma = _scale(prev, am, frames)
         # an update without priors: its predicted poses against the images' relative rotations
         # (map.md §4 rotation_inconsistent), as the job measures them
-        rotations_bad = am is not None and not any(
-            fr.work.trust in ("metric", "drifting") for fr in frames) and _rotations_bad(
-            am, frames, feats, placed)
-        again = [] if am is None else _reregistered(am, frames, feats, placed, out)
+        rotations_bad = am is not None and pairs is not None and not any(
+            fr.work.trust in ("metric", "drifting") for fr in frames) \
+            and standpoint.rotation_check(am, list(placed.values()), pairs)
+        again = [] if am is None else reregistered(am.reregistered)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     registered = [pl for status, pl in kept if status == "registered"]
@@ -176,6 +175,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         **displacement_quality(moved),
         "prior_disagreement_deg": disagreement,
         "reregistered": again,
+        "height_inconsistent": heights,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
         else None,
@@ -214,21 +214,6 @@ def _predicted_pose(fr: _Frame, pl: Placement | None, anchored: bool, new_map: b
     return None
 
 
-def _rotations_bad(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],
-                   placed: dict[int, Placement]) -> bool:
-    """The predicted ``rotation_inconsistent`` (``standpoint.consistency``) of the frames
-    predicted registered, at their predicted poses, with the stored keyframes they neighbour."""
-    new = [(fr, pl) for fr in frames for pl in [placed.get(fr.work.index)]
-           if pl is not None and pl.status == "registered" and pl.T is not None
-           and fr.work.index in feats]
-    views = standpoint.stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3]) for _, pl in new  # type: ignore[index]
-                              ])
-    views += [standpoint.View(fr.work.name, fr.cam.canonical(), feats[fr.work.index],
-                              pl.T[:3, :3].copy(), pl.T[:3, 3].copy(),  # type: ignore[index]
-                              False, fr.work.index) for fr, pl in new]
-    return standpoint.inconsistent(*standpoint.consistency(views, standpoint.Pairs()))
-
-
 def _classes(frames: list[_Frame]) -> dict[str, int]:
     """The predicted kept frames by fusion class (``prior_first.frame_class``)."""
     out: dict[str, int] = {}
@@ -236,31 +221,6 @@ def _classes(frames: list[_Frame]) -> dict[str, int]:
         c = frame_class(fr)
         out[c] = out.get(c, 0) + 1
     return out
-
-
-def _reregistered(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],
-                  placed: dict[int, Placement], rows: list[dict[str, Any]]
-                  ) -> list[dict[str, Any]]:
-    """The predicted ``quality.reregistered`` (map.md §2): the frames predicted registered are
-    added to the read-only copy at their predicted poses (their depth image, else no depth),
-    then the stored kept keyframes they overlap are placed again as the update does
-    (``AnchoredMap.reregister``). Nothing is written."""
-    kept = [k for k in am.keyframes if not k.usable()]
-    if not kept:
-        return []
-    added = []
-    for fr, row in zip(frames, rows, strict=True):
-        pl = placed.get(fr.work.index)
-        if row["predicted_status"] != "registered" or pl is None or pl.T is None \
-                or pl.sigma_pos_m is None or fr.work.index not in feats:
-            continue
-        f = _frame_in(fr, None)
-        K = f.K
-        depth, kind = (f.depth, "sensor") if f.depth is not None \
-            and bool(np.count_nonzero(f.depth > 0)) else (
-            np.zeros((K.height, K.width), np.float32), "none")
-        added.append(am.add(f, feats[fr.work.index], copy.copy(pl), depth, K, kind, None))
-    return reregistered(am.reregister(kept, added))
 
 
 def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Frame]
@@ -295,56 +255,33 @@ def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Fr
     return "monocular", MONOCULAR_SIGMA_REL
 
 
-def _prior_gravity(up: Updater, frames: list[_Frame]) -> float | None:
-    """A new anchored map's ``prior_gravity_deg``, as its first update reports it
-    (``AnchoredMap._up_check``): the angle between the up axis of the origin frame's prior (the
-    first kept frame with a metric or drifting prior) and the gravity the monocular model sees in
-    it. None without such a frame (a camera-only map is levelled by that gravity) or estimate."""
-    origin = next((fr for fr in frames if fr.reason is None and fr.path is not None
-                   and fr.work.trust in ("metric", "drifting")), None)
-    if origin is None:
-        return None
-    assert origin.path is not None and origin.work.prior is not None
-    up_cam = up.backend.infer(origin.path, origin.cam.canonical(), True).up_cam
-    if up_cam is None:
-        return None
-    R = np.asarray(origin.work.prior["T_map_cam"], np.float64)[:3, :3]
-    u = R @ unit(np.asarray(up_cam, np.float64))
-    return round(math.degrees(math.acos(max(-1.0, min(1.0, float(u[2]))))), 3)
+def _engine(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None, workdir: Path
+            ) -> tuple[AnchoredMap, dict[int, Placement], standpoint.Pairs]:
+    """The job's registration on the snapshot (``AnchoredMap.update``, every frame the checks
+    keep, in the geometric engine): the map as the job would leave it (discarded), each frame's
+    placement by request index, and the update's two-view fits (the rotation hard limit)."""
+    root = workdir / "mapper"
+    am = AnchoredMap.load(root) if prev is not None else AnchoredMap(workdir / "new-map")
+    am.root.mkdir(parents=True, exist_ok=True)
+    pairs = standpoint.Pairs()
+    am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
+    todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
+    origin = next((fr for fr in todo if fr.work.trust in ("metric", "drifting")),
+                  todo[0] if todo else None) if prev is None else None
+    ins = [_frame_in_lazy(up, fr, fr is origin) for fr in todo]
+    pls = am.update(ins, lambda _: None) if ins else []
+    return am, {fr.work.index: pl for fr, pl in zip(todo, pls, strict=True)}, pairs
 
 
-def _place_all(pool: ThreadPoolExecutor, am: AnchoredMap | None, frames: list[_Frame],
-               feats: dict[int, Features]) -> dict[int, Placement]:
-    """Every kept frame placed against the stored map (``AnchoredMap.place``): the drifting
-    priors predicted along the request on a copy of the map's odometry, then the strong
-    conflicts a re-anchored odometry explains predicted registered."""
-    if am is None:
-        return {}
-    todo = [fr for fr in frames if fr.reason is None and fr.work.index in feats]
-    ins = {fr.work.index: _frame_in(fr, None) for fr in todo}
-    drift = copy.deepcopy(am.drift)
-    preds: dict[int, tuple[Any, float, float] | None] = {}
-    for fr in todo:
-        f = ins[fr.work.index]
-        if f.prior is not None and f.prior["trust"] == "drifting":
-            P = np.asarray(f.prior["T_map_cam"], np.float64)
-            preds[fr.work.index] = drift.predict(P, *_prior_sigmas(f.prior))
-            drift.observe(P)
-    pls = list(pool.map(lambda fr: am.place(ins[fr.work.index], feats[fr.work.index], None,
-                                            preds.get(fr.work.index), evidence=False), todo))
-    out = {fr.work.index: pl for fr, pl in zip(todo, pls, strict=True)}
-    conflicts = [fr.work.index for fr, pl in zip(todo, pls, strict=True)
-                 if pl.reason == "prior_conflict" and fr.work.trust == "drifting"]
-    for a, b in itertools.pairwise(conflicts):
-        if not am._same_drift(ins[a], out[a], ins[b], out[b]):
-            continue
-        for c in conflicts:  # the conflicts this correction explains
-            if c == a or am._same_drift(ins[a], out[a], ins[c], out[c]):
-                pl = out[c]
-                pl.status, pl.reason, pl.T = "registered", None, pl.align_T
-                pl.sigma_pos_m, pl.sigma_rot_deg = pl.image_sigmas or (None, None)
-        break
-    return out
+def _frame_in_lazy(up: Updater, fr: _Frame, gravity: bool) -> Any:
+    """A frame as the engine takes it, its monocular depth asked only when the engine needs it
+    (a frame without a depth image, or a new map's origin for its gravity)."""
+    f = _frame_in(fr, None)
+    if not _has_depth(fr) or gravity:
+        assert fr.path is not None
+        path, K = fr.path, fr.cam.canonical()
+        f.mono = functools.cache(lambda: up.backend.infer(path, K, gravity).as_tuple())
+    return f
 
 
 def _neighbours(k: int, frames: list[_Frame], feats: dict[int, Features]) -> list[dict[str, Any]]:
@@ -363,34 +300,45 @@ def _frame(fr: _Frame, neighbours: list[dict[str, Any]], pl: Placement | None, a
     status, reason, map_inliers = "registered", fr.reason, None
     if reason is not None:
         status = "rejected"
-    elif anchored:
+    elif anchored:  # the job's own registration (``_engine``): it applied the distance limit
         assert pl is not None
-        map_inliers = pl.inliers
         status, reason = pl.status, pl.reason
+        row = _row(fr, m, None if new_map else pl.inliers, neighbours, status, reason)
+        row["too_close"] = row["too_close"] or (pl.scene_m is not None
+                                                and pl.scene_m < TOO_CLOSE_M)
+        if reason == "duplicate" and status == "rejected":
+            row["duplicate_of"] = pl.duplicate_of or fr.work.name
+        if reason == "too_close" and status != "registered":
+            row["min_distance_m"] = TOO_CLOSE_M
+            row["scene_distance_m"] = round(pl.scene_m or fr.scene_m or 0.0, 3)
+        return row, pl
     elif fr.unconfirmed is not None:  # its image failed a check: kept at its prior
         status, reason = "kept_at_prior", fr.unconfirmed
     elif new_map and not first and fr.work.trust not in ("metric", "drifting") \
             and max([int(n["inliers"]) for n in neighbours] or [0]) < MIN_INLIERS:
         # a new map's frame without prior holds only by its links to the request's frames
         status, reason = "rejected", "no_overlap"
-    # the 300-inlier exemption counts image feature inliers only, never depth (api.md §4)
-    close = too_close(fr.scene_m, 0 if map_inliers is None or pl is None
-                      or pl.method == "depth" else map_inliers)
+    close = too_close(fr.scene_m, 0)  # no registration predicted: no inliers
     if close and fr.reason is None and fr.work.trust in ("metric", "drifting"):
         # the distance limit (api.md §4): a frame with a prior is kept at it, its reason the
         # check its image failed, else too_close
         status, reason = "kept_at_prior", fr.unconfirmed or "too_close"
     elif close and status != "rejected":
         status, reason = "rejected", "too_close"
-    row = {"name": fr.work.name, "features": 0 if m is None else m.features,
-           "map_inliers": map_inliers, "neighbour_inliers": neighbours,
-           "plain": m is not None and m.texture < checks.PLAIN_TEXTURE,
-           "too_close": fr.scene_m is not None and fr.scene_m < TOO_CLOSE_M,
-           "predicted_status": status, "predicted_reason": None if status == "registered"
-           else reason}
+    row = _row(fr, m, map_inliers, neighbours, status, reason)
     if reason == "too_close" and status != "registered":
         row["min_distance_m"] = TOO_CLOSE_M
         row["scene_distance_m"] = round(fr.scene_m or 0.0, 3)
     if reason == "duplicate" and status == "rejected":
         row["duplicate_of"] = fr.duplicate_of or fr.work.name
     return row, pl
+
+
+def _row(fr: _Frame, m: Any, map_inliers: int | None, neighbours: list[dict[str, Any]],
+         status: str, reason: str | None) -> dict[str, Any]:
+    return {"name": fr.work.name, "features": 0 if m is None else m.features,
+            "map_inliers": map_inliers, "neighbour_inliers": neighbours,
+            "plain": m is not None and m.texture < checks.PLAIN_TEXTURE,
+            "too_close": fr.scene_m is not None and fr.scene_m < TOO_CLOSE_M,
+            "predicted_status": status, "predicted_reason": None if status == "registered"
+            else reason}

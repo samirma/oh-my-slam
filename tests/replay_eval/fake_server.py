@@ -191,7 +191,7 @@ class Fake:
                 "rejected_share": rejected / max(1, len(job.inputs)),
                 "low_confidence_share": 0.0, "rebuilt": False, "prior_gravity_deg": 0.5,
                 "max_displacement_m": 0.01, "max_displacement_deg": 0.1,
-                "prior_disagreement_deg": 0.0, "reregistered": [],
+                "prior_disagreement_deg": 0.0, "reregistered": [], "height_inconsistent": [],
                 "accepted": not gated, "failed_checks": ["max_residual_m"] if gated else []}
 
     def job_body(self, job: Job) -> dict[str, Any]:
@@ -351,7 +351,7 @@ class Fake:
             T = self.cfg.truth[n]
             base = {"name": n, "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
                     "inlier_ratio": None, "ambiguity": None, "rivals": [],
-                    "consistent_with_prior": None}
+                    "consistent_with_prior": None, "height_consistent": None}
             if n in self.cfg.locate_reject:
                 nv = None
                 if kf is not None:
@@ -372,6 +372,7 @@ class Fake:
                         "T_map_cam": m.sim.pose_to_map(Tw).tolist(), "sigma_pos_m": 0.01,
                         "sigma_rot_deg": 0.5, "inlier_ratio": 0.8, "ambiguity": amb,
                         "consistent_with_prior": True if "prior" in f else None,
+                        "height_consistent": None,
                         "nearest_view": None})
         return {"schema": "oms/2.2", "map": name, "map_version": v["version"],
                 **self.scale(name), "frames": out}
@@ -561,7 +562,8 @@ class Fake:
                     inputs.append({"name": n, "status": "rejected", "reason": self.cfg.reject[n],
                                    "inliers": 3, "T_map_cam": None, "sigma_pos_m": None,
                                    "sigma_rot_deg": None, "prior_residual_m": None,
-                                   "prior_residual_deg": None, "camera_id": f["camera_id"]})
+                                   "prior_residual_deg": None, "detail": None,
+                                   "camera_id": f["camera_id"]})
                     if self.cfg.reject[n] == "too_close":
                         inputs[-1].update(min_distance_m=0.3, scene_distance_m=0.2)
                     continue
@@ -570,7 +572,7 @@ class Fake:
                                "T_map_cam": sim.pose_to_map(self.cfg.truth[n]).tolist(),
                                "sigma_pos_m": 0.01, "sigma_rot_deg": 0.5,
                                "prior_residual_m": 0.01 if metric else None,
-                               "prior_residual_deg": 0.1 if metric else None,
+                               "prior_residual_deg": 0.1 if metric else None, "detail": None,
                                "camera_id": f["camera_id"]})
             if dry:
                 job = Job("dry", name, [], inputs, 0.0, False)

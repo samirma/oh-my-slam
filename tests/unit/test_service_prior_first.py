@@ -368,10 +368,11 @@ def test_dry_run_of_a_new_map_predicts_pose_duplicates(client: Client) -> None:
     assert (rows["a1"]["predicted_status"], rows["a1"]["predicted_reason"],
             rows["a1"]["duplicate_of"]) == ("rejected", "duplicate", "a0")
     assert rows["a2"]["predicted_status"] == "registered"
+    # a camera-only first update: the job's own registration predicts it too (map.md §2)
     nf, nfiles = frames_for(client, [base_pose(0), base_pose(0)], tag="n", trust=None)
     nfiles["n1"] = nfiles["n0"]
     rows = {r["name"]: r for r in dry(client, "m", nf, nfiles, cameras={"cam": CAM})["frames"]}
-    assert rows["n1"]["predicted_reason"] != "duplicate"
+    assert (rows["n1"]["predicted_reason"], rows["n1"]["duplicate_of"]) == ("duplicate", "n0")
     assert "rotation_inconsistent" not in out["quality"]["failed_checks"]
 
 
@@ -427,9 +428,14 @@ def test_dry_run_measures_suspicious_frames(client: Client) -> None:
     img = np.full((240, 320, 3), 128, np.uint8)
     cv2.rectangle(img, (40, 40), (280, 200), (30, 30, 30), 3)
     client.backend.mono = 0.2
-    out = dry(client, "m", [{"name": "s", "image": "s", "camera_id": "cam"}],
-              {"s": jpeg(img)}, cameras={"cam": CAM})
-    assert out["frames"][0]["too_close"] and out["quality"]["failed_checks"] == ["hard_limit"]
+    req = ([{"name": "s", "image": "s", "camera_id": "cam"}], {"s": jpeg(img)})
+    out = dry(client, "m", *req, cameras={"cam": CAM})
+    assert out["quality"]["failed_checks"] == ["hard_limit"]
+    # the prediction is the job's verdict (map.md §2): a frame the checks reject never
+    # reaches the registration, so its distance is not measured there
+    job = client.update("m", *req, cameras={"cam": CAM})
+    assert (out["frames"][0]["predicted_status"], out["frames"][0]["predicted_reason"]) == (
+        job["inputs"][0]["status"], job["inputs"][0]["reason"])
 
 
 def test_neighbour_links(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -766,9 +772,11 @@ def test_late_camera_only_frames_too_close(client: Client,
     cv2.rectangle(img, (40, 40), (280, 200), (30, 30, 30), 3)
     nfiles["s"] = jpeg(img)
     nf.append({"name": "s", "image": "s", "camera_id": "cam"})
-    from oh_my_slam.mapping import quality
+    from oh_my_slam.mapping import anchored, quality
 
     monkeypatch.setattr(quality, "TOO_CLOSE_INLIERS", 10 ** 9)  # however many points
+    # the dry run predicts camera-only frames by the geometric registration (README "Dry run")
+    monkeypatch.setattr(anchored, "TOO_CLOSE_INLIERS", 10 ** 9)
     monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
     client.backend.mono = 0.2
     d = dry(client, "m", nf[:1], nfiles)  # predicted on the stored map: too close as well

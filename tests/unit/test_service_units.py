@@ -54,7 +54,7 @@ def test_validation_names_the_deepest_failing_field() -> None:
         schema.validate("InputStatus", {"name": "a", "status": "rejected", "reason": "bad",
                                         "inliers": 0, "T_map_cam": None, "sigma_pos_m": None,
                                         "sigma_rot_deg": None, "prior_residual_m": None,
-                                        "prior_residual_deg": None})
+                                        "prior_residual_deg": None, "detail": None})
     assert e.value.details["field"] == "reason"
     assert schema.field_path([]) == "body" and schema.field_path(["a", 0, "b"]) == "a[0].b"
     schema.validate("Vec2", [1, 2])

@@ -147,7 +147,7 @@ def test_too_close_and_a_new_map_without_origin(client: Client, tmp_path: Path) 
 
     am = AnchoredMap(tmp_path / "am")
     am.root.mkdir()
-    work = type("W", (), {"name": "f"})()
+    work = type("W", (), {"name": "f", "index": 0})()
     got, reg_s, fuse_s = prior_first._register_none(
         None, am, [type("F", (), {"work": work})()], tmp_path, print)  # type: ignore[arg-type]
     assert [(p.status, p.reason) for p in got] == [("rejected", "no_overlap")] and fuse_s == 0.0

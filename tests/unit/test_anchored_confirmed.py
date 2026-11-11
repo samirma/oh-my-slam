@@ -55,7 +55,7 @@ def test_kept_frames_are_stored_but_never_fused_or_references(tmp_path: Path) ->
 def test_an_origin_failing_a_check_is_kept_then_the_next_prior_registers(tmp_path: Path
                                                                           ) -> None:
     m = new_map(tmp_path)
-    bad = frame("bad", base_pose(0))
+    bad = frame("a0", base_pose(0))  # canonical order (map.md §2): tried as the origin first
     bad.unconfirmed = "plain"
     pls = m.update([bad, frame("a1", base_pose(30))])
     assert (pls[0].status, pls[0].reason) == ("kept_at_prior", "plain")
@@ -260,8 +260,8 @@ def test_depth_never_overrides_too_close(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     near = frame("near", base_pose(10), rgb=blank)
-    got = m.place(near, an.features(blank), None)
-    assert (got.status, got.method) == ("registered", "depth") and got.inliers >= 300
+    got = m.place(near, an.features(blank), None)  # no edge: its depth places nothing
+    assert (got.status, got.method, got.inliers) == ("kept_at_prior", "prior", 0)
     p = m.update([frame("near", base_pose(10), rgb=blank)])[0]
     assert (p.status, p.reason) == ("kept_at_prior", "too_close")
     # kept only for too_close with a metric prior and a depth image: its depth is content

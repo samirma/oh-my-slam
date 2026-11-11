@@ -63,7 +63,7 @@ from oh_my_slam.mapping.anchored import (
     floor_spread,
     lowest_layer,
 )
-from oh_my_slam.mapping.quality import gate, residual_stats
+from oh_my_slam.mapping.quality import displacement_quality, gate, residual_stats
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
 from oh_my_slam.service.cameras import (
     Camera,
@@ -145,6 +145,8 @@ class _Frame:
     scene_m: float | None = None  # its median scene depth (the distance limit), when measured
     unconfirmed: str | None = None  # the check a frame with a prior failed: kept at its prior
     duplicate_of: str | None = None  # with reason duplicate: the frame it duplicates
+    detail: str | None = None  # kept with no_overlap: why its images did not confirm it
+    height_off: bool = False  # registered, its camera height disagrees with the one sent
     internal: InternalFrame | None = None
     pose: NDArray[np.float64] | None = None  # T_map_cam
     sigma_pos_m: float | None = None
@@ -491,6 +493,8 @@ class Updater:
             why = "too_close"
         if fr.work.trust in ("metric", "drifting"):
             fr.unconfirmed = why
+            # the mapper gave it no pose (api.md §4 ``detail``)
+            fr.detail = "no_image_pose" if why == "no_overlap" else None
         else:
             fr.reason = why
 
@@ -870,6 +874,19 @@ class Updater:
         return standpoint.views_inconsistent(new, stored)
 
     @staticmethod
+    def _height_off(fr: _Frame, floor: float | None) -> bool:
+        """The height gate (map.md §2) on a registered frame: with a camera height and its sigma
+        sent, its committed camera height over the version's floor (z 0 without one) disagrees
+        by more than ``K_SIGMA`` × sqrt(height_sigma² + σ_z²) (σ_z: its position sigma over
+        √3)."""
+        h = _height(fr)
+        hs = fr.work.height_sigma_m if fr.work.height_m is not None else fr.cam.height_sigma_m
+        if h is None or hs is None or fr.pose is None or fr.sigma_pos_m is None:
+            return False
+        dz = abs(float(fr.pose[2, 3]) - (floor or 0.0) - h)
+        return dz > anchor.K_SIGMA * math.hypot(hs, fr.sigma_pos_m / math.sqrt(3.0))
+
+    @staticmethod
     def _keep_at_prior(fr: _Frame, anchored: _Anchored | None) -> None:
         """A frame kept at its prior (api.md §4): a metric prior as given, a drifting one mapped
         into the map frame by the update's drift estimate (``_Anchored.drift_sim``, else as
@@ -947,6 +964,11 @@ class Updater:
             # lies within FLOOR_BAND_SIGMAS of the floor points' spread of it
             floor = floor if floor is not None and abs(floor) <= FLOOR_BAND_SIGMAS * floor_sigma \
                 else 0.0
+        rows = {r["name"]: r for r in out}
+        for fr in registered:
+            if fr.internal is not None and self._height_off(fr, floor):
+                fr.height_off = True
+                rows[fr.work.name]["height_inconsistent"] = True
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "origin_height_m": anchored.origin_height_m,
                 "scale_source": anchored.scale_source,
@@ -967,7 +989,7 @@ class Updater:
                          fr.unconfirmed if status == "kept_at_prior" else fr.reason,
                          _inliers(fr.internal) if fr.internal is not None else 0, fr.pose,
                          fr.sigma_pos_m, fr.sigma_rot_deg, fr.prior_residual, fr.scene_m,
-                         fr.duplicate_of)
+                         fr.duplicate_of, fr.detail)
 
     @staticmethod
     def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],
@@ -984,12 +1006,15 @@ class Updater:
             "scale_ratio_vs_prev": None if prev is None or anchored is None
             else anchored.scale_ratio_vs_prev,
             "gauge_shift": gauge,
-            # a registered frame's committed pose is its aligned image pose: no displacement
-            "max_displacement_m": 0.0 if registered else None,
-            "max_displacement_deg": 0.0 if registered else None,
+            # map.md §1 "New-frame displacement": a frame with a prior against that prior (its
+            # prior residual, through the drift estimate for a drifting one); one without, its
+            # committed pose is its aligned image pose: 0
+            **displacement_quality([(0.0, 0.0) if fr.prior_residual is None
+                                    else fr.prior_residual for fr in registered]),
             "prior_disagreement_deg": anchored.prior_disagreement_deg if anchored else 0.0,
             # the mapper ties kept frames to no image: nothing re-registers them (map.md §2)
             "reregistered": [],
+            "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),
             "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
