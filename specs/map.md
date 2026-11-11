@@ -56,8 +56,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * sigmas stay honest: the containment targets (evaluation.md) apply.
 * **Every engine.** These apply to every engine, the older mapper included: calibrated sigmas
   (every engine's sigmas mean the same thing), the `rotation_inconsistent` limit (§4), the
-  robust drift estimate across versions, drift-grown sigmas for kept frames, and acceptance of
-  an update whose frames are all `kept_at_prior` (§4). The older mapper is exempt from
+  robust drift estimate across versions, drift-grown sigmas for kept frames, acceptance of an
+  update whose frames are all `kept_at_prior` (§4), and the too-close content exception
+  (api.md §4). The older mapper is exempt from
   static-content exclusion, standpoint grouping and the match graph (§2) only.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
@@ -97,22 +98,32 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
   images give between overlapping frames. Where two frames overlap (§1, Overlap) by at least
   50 % and their image relative rotation disagrees with their priors' relative rotation by more
-  than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames'
-  prior rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
-  the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
+  than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames' prior rotation sigmas (`metric` and
+  `drifting` priors alike), the rotation is corrected from the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
   over the update's frames, 0 when none.
 * **Drift estimate.** The drift estimate that places `drifting` priors is robust:
   * it is fitted over image-confirmed frames with `drifting` priors;
   * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
     rejected with `prior_conflict`;
-  * a frame can support an estimate when its image-only pose meets the measurable-pair
-    threshold (above) to confirmed keyframes, even if it conflicts under the current estimate;
+  * a frame can support a first estimate or a change when its image-only pose, per frame and
+    across all its references, has at least 100 inliers against confirmed keyframes and an
+    8 × 8 overlap of at least 10 % with at least one of them, even if it conflicts under the
+    current estimate;
   * a first estimate, when the map has none yet, and a change of the estimate between versions
     larger than 3 × its own sigma, both need the same robust support: min(3, n) supporting
-    frames, n the frames of the job that can support it, and at least 50 % of those frames.
-    One strong frame alone is never enough. Without that support a change is refused, the
-    previous estimate stays, and the unsupported frames are rejected with `prior_conflict`;
-  * after a change is accepted, the job's frames are re-tested under the new estimate.
+    frames and at least 50 % of n, where n counts every `drifting`-prior frame of the job that
+    can support it, whatever its final status. One strong frame alone is never enough;
+  * a refused change keeps the previous estimate, and the unsupported frames are rejected with
+    `prior_conflict`;
+  * a refused first estimate leaves the drift at the identity: priors are used as sent, with
+    their sigmas. Only frames that conflict with their priors under the identity are rejected
+    with `prior_conflict`; frames consistent with their priors keep their normal status;
+  * after a change is accepted, the job's frames are re-tested under the new estimate;
+  * **Drift-grown sigma.** A frame placed through the drift estimate has the root sum of
+    squares of its prior's sigma and the drift estimate's own sigma at that pose. The drift
+    estimate's sigma includes its extrapolation away from the frames that supported it: it
+    grows with distance from them, and is never only the fit residual at those frames. This
+    holds on every engine.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
@@ -160,8 +171,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     pose leaves `kept_at_prior` in that version (it becomes a registered pose, `provisional`
     then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job
     lists each such frame in `quality.reregistered` (§4); the movement of that confirmation is
-    excluded from `previous_residuals` and `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
-    the prediction is approximate. An engine that cannot re-register (the older mapper) reports
+    excluded from `previous_residuals` and `gauge_shift`. A dry run predicts `reregistered`
+    with the same test, without committing; the prediction is approximate. An engine that cannot re-register (the older mapper) reports
     `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
     keyframes, even within the duplicate limits. Nothing re-registers a frame outside a job:
     there is no automatic background refinement;
@@ -178,7 +189,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        priors of all its frames together, or both. A component that reaches no confirmed
        keyframe is seeded at one frame's prior. Its frames' reported sigmas cover the seed
        prior's sigma combined with each frame's fusion, and are never tighter than the seed
-       prior's.
+       prior's. This floor applies to every frame whose placement depends on the component,
+       whatever the engine or pass (MapAnything, a retry, re-registration), until the
+       component links to a confirmed keyframe.
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests,
        api.md §4) apply frame by frame to the component's fitted poses. A failing frame is
        `kept_at_prior`. The rest of the component stays registered if it is still connected
@@ -194,8 +207,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        matches with at least the registration minimum of inliers goes through re-registration
        (above): confirmed by images only, never by depth, and only when its fitted pose passes
        the prior checks. So the same job can confirm it.
-    6. The outcome does not depend on the order of frames in the request. Where any order is
-       still needed (the origin frame, the seed frame, a duplicate's earlier frame), frames are
+    6. **Pose duplicates.** After the registration fixed point, one pose-duplicate pass covers
+       every frame registered in the job, in canonical name order; of a pair, the later-named
+       frame is the duplicate (api.md §4).
+    7. The outcome does not depend on the order of frames in the request. Where any order is
+       still needed (the origin frame, the seed frame, the pose-duplicate pass), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the
        same statuses, except on maps built by the MapAnything engine, where it predicts with
        geometric registration and its statuses can differ (api.md §4);
@@ -301,8 +317,8 @@ becomes a job with a `job_id`. A job goes through these states:
     * Image-measured: each pair's own two-view relative rotation, independent of the joint
       solve.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
-    registered frames only, over measurable pairs (at least 100 epipolar inliers, §1). With no
-    measurable pair, every pair limit passes.
+    registered frames only, over measurable pairs (§1: at least 100 epipolar inliers and an
+    overlap of at least 10 %). With no measurable pair, every pair limit passes.
 
 ## 5. Objects (O8)
 

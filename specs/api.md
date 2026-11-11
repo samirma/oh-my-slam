@@ -131,7 +131,8 @@ error code `invalid_request` (§9).
   and near blind disc, map.md §6) until a later job's images confirm it; its pose then becomes a
   registered one in that version (map.md §2), and the job reports it in
   `quality.reregistered`.
-  * **Too-close exception.** A frame that is `kept_at_prior` only because it is `too_close`,
+  * **Too-close exception** (every engine, the older mapper included). A frame that is
+    `kept_at_prior` only because it is `too_close`,
     and has a `metric` prior, still contributes at its prior pose: its detections, to object
     records and `detection_votes`; its depth points, to the cloud, occupancy and heights. Depth
     points count only from a depth image, inside its valid range (`README.md`). Without a depth
@@ -145,8 +146,10 @@ error code `invalid_request` (§9).
     every kept frame carries (the schema requires a reason for `kept_at_prior`).
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
-    current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
-    plus the drift estimate's uncertainty.
+    current drift estimate. Its sigmas are drift-grown: the root sum of squares of the prior's
+    sigma (or the 0.20 m / 5° default, §3) and the drift estimate's own sigma at that pose,
+    which grows with distance from the frames that supported the estimate (map.md §1). This
+    holds on every engine.
 
   **Choosing a status.** Registration is order-independent and runs over the job's match graph
   (map.md §2). An edge needs the registration minimum of inliers (the `README.md` constant,
@@ -166,7 +169,8 @@ error code `invalid_request` (§9).
     the prior, and no supported hypothesis lies within that bound.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
   * In updates, `few_features` is only the checks' verdict: fewer keypoints than the
-    registration minimum (§6). A frame with a prior that passed the checks but was not placed
+    registration minimum (§6); one `README.md` constant serves both (currently 15). A frame
+    with a prior that passed the checks but was not placed
     is `kept_at_prior` with `no_overlap`, `detail` `no_image_pose` or `loose_image_pose`.
   * A frame with a prior whose image fails a quality check, or that is too close, is
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
@@ -185,10 +189,11 @@ error code `invalid_request` (§9).
     * A name duplicate holds a name the map or the request already holds (§3). It is always
       rejected.
     * A pose duplicate lies within 0.02 m and 2° of a stored confirmed keyframe of the same
-      camera, or of a `registered` frame of the same request and camera that precedes it in
-      canonical name order (map.md §2, match graph). The pose test
-      uses the frame's registered pose, after registration: a frame that does not register can
-      be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
+      camera, or of another frame registered in the same job with the same camera. There is
+      one pose-duplicate pass, after the registration fixed point, over all frames registered
+      in the job in canonical name order; of a pair, the later-named frame is the duplicate
+      (map.md §2, match graph). The pose test uses the frame's registered pose: a frame that
+      does not register can be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
       with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
       Otherwise it is `registered`, and the later observation wins (map.md §3, C13).
     * Stored `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
@@ -284,8 +289,9 @@ The versions read, revert and `--keep-versions` are O2.
     * Without any height, `height_consistent` is null and the position sigma is σ_rel.
     * `height_consistent` is false when |z_located − z_expected| > 3 × sqrt(height_sigma² +
       σ_z²), with σ_z = σ_rel / √3 (the sigmas are 3-D RMS). height_sigma is the locate
-      frame's `height_sigma_m` when it carries one, else the map frames' `height_sigma_m`
-      there.
+      frame's `height_sigma_m` when it carries one; else the median `height_sigma_m` of the
+      confirmed keyframes that served as the answer's references; else, when none of them
+      carries one, the camera's registered z sigma (`sigma_pos_m` / √3).
     * Such a hypothesis ranks below any height-consistent rival. `consistent_with_prior` does
       not change.
   * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
@@ -310,8 +316,9 @@ The versions read, revert and `--keep-versions` are O2.
     The client then asks for a second frame.
 * **Reasons.**
   * `few_features`: the frame has fewer keypoints than a pose needs inliers. That minimum is an
-    implementation constant recorded in `README.md` (currently 15), the registration minimum.
-    In updates `few_features` is only the checks' verdict (§4).
+    implementation constant recorded in `README.md` (currently 15), the registration minimum;
+    the `few_features` check uses it, one constant for both. In updates `few_features` is only
+    the checks' verdict (§4).
   * `no_overlap`: the frame has enough keypoints but gets no pose; see `nearest_view` below.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view`. It is
   guaranteed when the frame has a prior. Without a prior it is allowed, with `turn_deg` null,
