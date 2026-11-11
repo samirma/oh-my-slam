@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.2. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.3. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -168,7 +168,7 @@
         },
         "ignore_mask": {
           "$ref": "#/$defs/PartName",
-          "description": "8-bit PNG of the image size; non-zero pixels are ignored (e.g. the robot's own body)."
+          "description": "8-bit PNG of the image size; non-zero pixels are ignored (e.g. the robot's own body). Pixels in it (or in a frame's own mask) contribute nothing anywhere, on every engine."
         },
         "depth_scale_m": {
           "type": "number",
@@ -267,7 +267,7 @@
         },
         "ignore_mask": {
           "$ref": "#/$defs/PartName",
-          "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
+          "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask. Combined with the camera's mask; a pixel in the union contributes nothing anywhere (no keypoints, matches, depth, occupancy, free-space or floor evidence, detections, votes or cloud points), on every engine."
         }
       }
     },
@@ -328,6 +328,16 @@
         },
         "accept_if": {
           "$ref": "#/$defs/AcceptIf"
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "pattern": "^\\s*\\S(.{0,62}\\S)?\\s*$",
+            "description": "A text prompt, 1-64 characters after trimming."
+          },
+          "description": "oms/2.3: text prompts added to the map's label vocabulary (the union over all its updates). Detection prompts with the default vocabulary merged with the map's, duplicates removed case-insensitively. An invalid label refuses the request with invalid_request (details.field labels)."
         }
       }
     },
@@ -1135,7 +1145,8 @@
         "base_version",
         "frames",
         "quality",
-        "predicted_s"
+        "predicted_s",
+        "labels"
       ],
       "allOf": [
         {
@@ -1178,6 +1189,13 @@
               "type": "number"
             }
           }
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "oms/2.3: the vocabulary detection would use: the defaults merged with the map's vocabulary and the request's labels, duplicates removed case-insensitively."
         }
       }
     },
@@ -1195,7 +1213,8 @@
         "cameras",
         "bounds_m",
         "floor_z_m",
-        "running_job"
+        "running_job",
+        "labels"
       ],
       "allOf": [
         {
@@ -1262,6 +1281,13 @@
             "string",
             "null"
           ]
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "oms/2.3: the version's label vocabulary (read-only): the union of its updates' labels, without the defaults."
         }
       }
     },

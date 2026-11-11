@@ -83,7 +83,9 @@ Each row is something the skill needs. Each row's test is in §11.
   * distortion: the OpenCV model, or none;
   * optional ignore mask, for pixels showing the robot itself. A frame may add its own mask,
     for example the arms in a head camera or a held object in a wrist camera. The two masks are
-    combined;
+    combined, and a pixel in their union contributes nothing anywhere, on every engine: no
+    keypoints or matches, no depth points, no occupancy, free-space or floor evidence, no
+    detections or votes, no cloud points (map.md §2);
   * optional height of the optical centre above the floor, with a sigma: the scale anchor for
     robots without metric priors. A frame may carry its own height, with a sigma, which
     overrides the camera's: a camera on a pan-tilt head or a wrist moves with the robot's joints.
@@ -136,6 +138,9 @@ minor 2.2, because the API has a single client, updated in step with it:
 3. health `lanes` may be a single `worker` lane instead of `interactive` and `bulk`;
 4. an input status's `reason` is null for `registered` and `provisional`, and set for
    `rejected` and `kept_at_prior`.
+
+**oms/2.3** is additive: the update request's optional `labels` (a map's label vocabulary,
+map.md §5), reported on the map summary and the dry run.
 
 ## 8. Concurrency and latency
 

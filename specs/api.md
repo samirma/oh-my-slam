@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.2"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.3"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -47,7 +47,7 @@ Each other endpoint belongs to the group named in its section, or in map.md.
 | `POST /api/maps/{name}/updates?dry_run=1` | Check frames, write nothing | [`UpdateRequest`] → 200 [`DryRun`] |
 | `GET /api/jobs/{id}` | Job state and result | → [`Job`] |
 | `DELETE /api/jobs/{id}` | Cancel a job | → [`Job`] |
-| `GET /api/maps/{name}` | Map summary | → [`MapSummary`] |
+| `GET /api/maps/{name}` | Map summary, with the version's label vocabulary | → [`MapSummary`] |
 | `GET /api/maps/{name}/versions` | Kept versions (O2) | → [`Versions`] |
 | `POST /api/maps/{name}/revert` | Commit a copy of a kept version (O2) | [`RevertRequest`] → [`MapSummary`] |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses | → [`Frames`] |
@@ -85,7 +85,13 @@ error code `invalid_request` (§9).
     0.05 m / 2°, `drifting` 0.20 m / 5°. Clients should always send sigmas;
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name;
-  * an optional `ignore_mask`, a part name, combined with the camera's mask.
+  * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
+    union of the two masks contributes nothing anywhere, on every engine (map.md §2, Ignored
+    pixels).
+* **`labels`** (update requests, optional, oms/2.3) — text prompts added to the map's label
+  vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. An invalid
+  label refuses the request with `invalid_request` (`details.field: "labels"`); it is never a
+  frame status.
 * **Request order** is the order of addition (map.md §3).
 * **`analyse`** takes one frame, with its camera inline or by id of a map's camera (`map`
   given).
@@ -243,7 +249,8 @@ error code `invalid_request` (§9).
     `inputs[]`.
 
   It also gives a predicted `quality`, without fusion, and `scale_source` and
-  `scale_sigma_rel`.
+  `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use
+  (map.md §5).
 
 ## 5. Versions and revert (O2)
 
