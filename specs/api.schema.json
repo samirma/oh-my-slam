@@ -670,7 +670,7 @@
         "prior_disagreement_deg": {
           "type": "number",
           "minimum": 0,
-          "description": "Largest disagreement, over the update's frames overlapping by at least 50 %, between the images' relative rotation and the priors' relative rotation; 0 when none. Beyond 3 prior rotation sigmas the rotation is corrected from the images."
+          "description": "Largest disagreement, over pairs of the update's frames overlapping by at least 50 % (overlap: the smaller of the two directed shares of matched points inside the other image), between the images' relative rotation and the priors' relative rotation; 0 when none. Beyond 3 x hypot of the two frames' prior rotation sigmas the rotation is corrected from the images."
         },
         "accepted": {
           "type": "boolean"
@@ -689,7 +689,7 @@
               "prior_frames_rejected"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it."
         },
         "reregistered": {
           "type": "array",
@@ -1806,7 +1806,7 @@
         "floor_sigma_m": {
           "type": "number",
           "minimum": 0,
-          "description": "One-sigma height uncertainty of the floor estimate; the floor band is max(0.06, 3 x floor_sigma_m) above floor_z_m."
+          "description": "Spread (standard deviation) of the floor points' heights, not the uncertainty of their mean; the floor band is max(0.06, 3 x floor_sigma_m) on either side of floor_z_m."
         },
         "height_cap_m": {
           "type": "number",
@@ -2022,7 +2022,7 @@
               "type": "null"
             }
           ],
-          "description": "With a prior: the hypothesis nearest the prior among those with support >= 0.25."
+          "description": "With a prior: among hypotheses with support >= 0.25, the nearest the prior by hypot(dp / sigma_pos, dr / sigma_rot)."
         },
         "sigma_pos_m": {
           "type": [
@@ -2093,7 +2093,7 @@
               }
             }
           },
-          "description": "Every supported rival (support >= 0.25, farther than 0.10 m or 5 deg), strongest first; empty when none."
+          "description": "Every supported rival (support >= 0.25, farther than 0.10 m or 5 deg), strongest first; empty when none. Rivals within 0.10 m and 5 deg of each other are de-duplicated: only the strongest is listed."
         },
         "consistent_with_prior": {
           "type": [

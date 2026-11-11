@@ -106,11 +106,13 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `update.later_wins` | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes |
 
 **Gate parameters.** The C6 metrics send `accept_if {max_residual_m: 0.10, max_gauge_shift_m:
-0.05, max_rejected_share: 0.5}`, the thresholds the client sends. They are parameters of the
+0.05, max_displacement_m: 0.10, max_displacement_deg: 3, max_rejected_share: 0.5}`, the
+thresholds the client sends. The displacement gates catch a warping update whose stored
+keyframes do not move. They are parameters of the
 measurement, not targets, so `targets.json` does not hold them: it holds metric thresholds only.
 A warping update is a test update whose priors, or whose images' geometry, slip by at least
 0.3 m against the truth after its first frame; a clean update is one whose priors stay within
-their sigmas.
+3 × their sigmas of the truth.
 
 ## Reference captures
 

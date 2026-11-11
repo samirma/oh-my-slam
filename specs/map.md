@@ -18,7 +18,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     estimates (`quality.prior_gravity_deg`);
   * if every prior-carrying frame of the first update is `rejected`, the update is rejected:
     job state `rejected`, `quality.failed_checks` holding `prior_frames_rejected`, no version
-    committed and no map created. A frame `kept_at_prior` is not rejected.
+    committed and no map created. A frame `kept_at_prior` is not rejected. An engine that cannot
+    tie kept frames to the priors' frame, on a first update where no prior-carrying frame
+    registers, may reject the update the same way (`prior_frames_rejected`).
 * **Without priors:**
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
@@ -53,9 +55,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   on `max_displacement_m` / `max_displacement_deg` measure new-frame disagreement. Prior
   corrections show in `prior_disagreement_deg` and `prior_residual_*` only.
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
-  images give between overlapping frames. Where two frames overlap by at least 50 % and their
-  image relative rotation disagrees with their priors' relative rotation by more than 3 of the
-  priors' rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
+  images give between overlapping frames. The overlap of two frames is the smaller of the two
+  directed shares: the share of one frame's matched points that lie inside the other image.
+  Where two frames overlap by at least 50 % and their image relative rotation disagrees with
+  their priors' relative rotation by more than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames'
+  prior rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
   the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
   over the update's frames, 0 when none.
 * **Scale.** The scale comes from the first available of:
@@ -200,9 +204,9 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
   passage.
 * **Floor height.** Objects use the grid's floor estimate: one estimate per version, with the
   same `floor_z_m` and `floor_sigma_m`, so boxes and grid agree.
-* **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m` is floor
-  (§6): it never makes a floor-standing object. This minimum height applies
-  only above the floor estimate: an object resting on any other support surface keeps its
+* **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m`, above or
+  below it, is floor (§6): it never makes a floor-standing object. The minimum object height
+  applies above the floor estimate only: an object resting on any other support surface keeps its
   detection whatever its height (a 16 mm plate or an egg on a worktop is still an object). A
   surface of `surfaces[]` is never itself raised to an object by this rule.
 
@@ -247,8 +251,9 @@ seen there.
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.
 
-  **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m` is floor:
-  it never makes an occupied cell or defines a passage, whatever `z_min` is.
+  **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m`, on either
+  side of it, is floor: it never makes an occupied cell or defines a passage, whatever `z_min`
+  is.
 * Optional `footprint_radius_m`: the robot's radius.
 * `height_cap_m`: the ceiling of the `height_m` layer, relative to `floor_z_m`. Default 2.0 m,
   or the band's `z_max` when the request gives one. Echoed in the header.
@@ -257,7 +262,8 @@ seen there.
 * `map_version`, `origin_m` (the corner of cell [0, 0]), `cell_m`, `shape [rows (y), cols (x)]`,
   `z_band_m`, `floor_z_m`, `floor_sigma_m` and `height_cap_m`. `z_band_m` and `height_cap_m`
   are relative to `floor_z_m`, as the request's `z_min` and `z_max` are. `floor_z_m` is the
-  floor's absolute map-frame z, and `floor_sigma_m` the one-sigma uncertainty of its height;
+  floor's absolute map-frame z, and `floor_sigma_m` the spread (standard deviation) of the floor
+  points' heights, not the uncertainty of their mean;
 * `scale_source` and `scale_sigma_rel`.
 
 **Layers.** Each layer is a little-endian array, base64, row-major:

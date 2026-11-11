@@ -141,6 +141,10 @@ error code `invalid_request` (§9).
   * A frame with a prior whose image fails the quality checks (`plain`, `blur`,
     `few_features`) is `kept_at_prior` with that reason. It is `rejected` only when the image is
     unusable (`unusable_image`: it does not decode, or its size is not the camera's).
+  * This holds for an origin frame too: a frame of a map's first update whose image fails a
+    quality check is `kept_at_prior` and still defines the map frame (map.md §1). An engine that
+    cannot tie kept frames to the priors' frame, when no prior-carrying frame registers, may
+    reject the first update with `prior_frames_rejected` (map.md §1).
   * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or of
     an earlier `registered` frame of the same request and camera, or one whose name the map or
     the request already holds (§3). `duplicate_of` names that frame. Stored `kept_at_prior`
@@ -203,7 +207,8 @@ The versions read, revert and `--keep-versions` are O2.
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
-  support at least 0.25. When none lies within 3 × the prior's sigmas, the frame is `rejected`
+  support at least 0.25, nearest by hypot(dp / σp, dr / σr): the position and rotation
+  distances to the prior over the prior's position and rotation sigmas. When none lies within 3 × the prior's sigmas, the frame is `rejected`
   with `prior_conflict`, not located with `consistent_with_prior: false`; so a located frame
   with a prior always has `consistent_with_prior: true`. A prior without sigmas takes the fixed
   defaults of §3 (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send
@@ -216,7 +221,8 @@ The versions read, revert and `--keep-versions` are O2.
     explain.
   * `pos_m` and `rot_deg` are the distance from the best-supported rival to the reported pose.
   * `rivals` lists every supported rival with its distance and support, strongest first;
-    `ambiguity` repeats its first entry.
+    `ambiguity` repeats its first entry. Rivals within 0.10 m and 5° of each other are one
+    rival: only the strongest of them is listed.
   * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
     The client then asks for a second frame.
 * **Reasons.**
