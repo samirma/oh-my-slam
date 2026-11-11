@@ -180,7 +180,8 @@ error code `invalid_request` (§9).
     * A name duplicate holds a name the map or the request already holds (§3). It is always
       rejected.
     * A pose duplicate lies within 0.02 m and 2° of a stored confirmed keyframe of the same
-      camera, or of an earlier `registered` frame of the same request and camera. The pose test
+      camera, or of a `registered` frame of the same request and camera that precedes it in
+      canonical name order (map.md §2, match graph). The pose test
       uses the frame's registered pose, after registration: a frame that does not register can
       be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
       with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
@@ -205,7 +206,9 @@ error code `invalid_request` (§9).
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
   waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
-  single worker (inference.md). Per frame it gives:
+  single worker (inference.md). Documented limit: on maps built by the MapAnything engine, the
+  dry run predicts with geometric registration, so its statuses can differ from the update's.
+  Per frame it gives:
   * `features`;
   * the predicted link to the map: `map_inliers`, `predicted_status` (`registered`,
     `kept_at_prior` or `rejected`), `predicted_reason`;
@@ -269,11 +272,13 @@ The versions read, revert and `--keep-versions` are O2.
     `locate.sigma_containment` and `locate.sigma_tightness_bound` (evaluation.md) both hold.
     If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported
     alone.
-  * **Camera-height scale.** When the map's `scale_source` is `camera_height`, the position
-    sigma is hypot(σ_rel, |z_located − z_expected|). z_expected is the map's camera height at
-    that pose, used only where the map's frames carried `height_above_floor_m`.
-    `height_consistent` is false beyond 3 sigma, and such a hypothesis ranks below any
-    height-consistent rival. `consistent_with_prior` does not change.
+  * **Camera-height scale.** When the map's `scale_source` is `camera_height`, the reported
+    position sigma is hypot(σ_rel, |z_located − z_expected|). z_expected is the map's camera
+    height at that pose, used only where the map's frames carried `height_above_floor_m`.
+    `height_consistent` is false when |z_located − z_expected| > 3 × sqrt(height_sigma² +
+    σ_z²), with height_sigma the map frames' `height_sigma_m` there and σ_z = σ_rel / √3 (the
+    sigmas are 3-D RMS). Such a hypothesis ranks below any height-consistent rival.
+    `consistent_with_prior` does not change.
   * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
 
     | Depth | `metric` | `drifting` | `none` |
