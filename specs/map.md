@@ -37,9 +37,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
   * frames whose pairwise two-view parallax (above) is below 1 px form one standpoint group,
-    registered as a pure rotation about a common centre. The common centre is the overlapped
-    stored keyframe with the most pair inliers (ties: the lowest keyframe id), or, when they overlap none, the mean of their image-only
-    centres; its position sigma is their spread.
+    registered about a common centre. The group fixes only that centre: each frame keeps its
+    own image-only rotation, which the group never overrides. The common centre is the
+    overlapped stored keyframe with the most pair inliers (ties: the lowest keyframe id), or,
+    when they overlap none, the mean of their image-only centres; its position sigma is their
+    spread;
+  * **Measurable pair.** A pair of frames is measurable only with at least 100 epipolar
+    inliers. Fewer counts as no measurable pair, which passes every pair limit (§4);
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
@@ -69,23 +73,39 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   keyframes only: its `count` is at most the previous version's keyframe count. A stored
   keyframe that moves beyond tolerance shows in `previous_residuals.max_m` / `max_deg` and is
   gated by `max_residual_m` (§4).
-* **New-frame disagreement.** The disagreement of the update's new frames between committed
-  pose and image-only pose (the pose their images alone give against the map) is in
-  `quality.max_displacement_m` and `max_displacement_deg` (§4), not in `gauge_shift`:
-  * a frame whose image-only pose is unconstrained in translation (two-view parallax, above,
-    below 1 px against every reference it registers to) counts only its rotation;
-  * frames `kept_at_prior` or `rejected` have no image-only pose and are left out.
+* **New-frame displacement.** How far the service moves the update's new frames from what was
+  sent is in `quality.max_displacement_m` and `max_displacement_deg` (§4), not in
+  `gauge_shift`. A client setting `max_displacement_*` asks exactly that.
+  * A frame with a prior: its committed pose against the prior as sent (a `drifting` prior as
+    placed through the drift estimate).
+  * A frame without a prior: its committed pose against its image-only pose (the pose its
+    images alone give against the map). Such a frame whose image-only pose is unconstrained in
+    translation (two-view parallax, above, below 1 px against every reference it registers to)
+    counts only its rotation.
+  * Frames `kept_at_prior` or `rejected` are left out.
+  * `prior_conflict` is unchanged (api.md §4).
 
   So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gates
-  on `max_displacement_m` / `max_displacement_deg` measure new-frame disagreement. Prior
+  on `max_displacement_m` / `max_displacement_deg` measure new-frame displacement. Prior
   corrections show in `prior_disagreement_deg` and `prior_residual_*` only.
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
   images give between overlapping frames. Where two frames overlap (§1, Overlap) by at least
-  50 % and their image relative rotation disagrees with
-  their priors' relative rotation by more than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames'
+  50 % and their image relative rotation disagrees with their priors' relative rotation by more
+  than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames'
   prior rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
   the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
   over the update's frames, 0 when none.
+* **Drift estimate.** The drift estimate that places `drifting` priors is robust:
+  * it is fitted over image-confirmed frames with `drifting` priors;
+  * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
+    rejected with `prior_conflict`;
+  * a change of the estimate between versions larger than 3 × its own sigma needs the support
+    of at least 3 frames and of at least 50 % of the job's `drifting`-prior frames. Without it
+    the change is refused, the previous estimate stays, and the unsupported frames are
+    rejected with `prior_conflict`.
+* **Static image content.** Features whose image position stays within 2 px across at least 3
+  frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
+  such rotation keeps all its features.
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
@@ -108,22 +128,56 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     from image-confirmed frames; a `kept_at_prior` frame counts only for free-by-rule cells
     (§6) until it is registered. Exception: a frame kept only for `too_close` with a `metric`
     prior contributes its detections and its in-range depth at the prior pose (api.md §4), but
-    never scale evidence. Only image-confirmed keyframes are registration references
-    for new frames; `kept_at_prior` frames are not.
+    never scale evidence.
+  * **Height gate.** When frames carry `height_above_floor_m` and `height_sigma_m`, a frame
+    whose committed camera height disagrees with it by more than
+    3 × sqrt(height_sigma² + σ_z²) (σ_z: its committed position sigma along z) contributes
+    nothing to occupancy, heights or objects. Its registration status is unchanged, and
+    `quality.height_inconsistent` lists it by name.
+  * Only image-confirmed keyframes are registration references for new
+    frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
+    kept. Within a job, a job frame counts as an edge once it is registered (match graph,
+    below).
   * **Re-registration.** When a job registers new frames that overlap a stored `kept_at_prior`
     frame (the overlap of §1 with the kept frame as the reference: at least 10 % of the kept
     frame's image covered by a new registered frame of the job), the service re-runs that
     stored frame's registration against the confirmed map. A frame kept for a failed check is
     eligible too. Only its images can confirm it, never depth; when they do not, it stays
-    `kept_at_prior` and is not listed in `quality.reregistered`. If its images confirm it, its pose leaves `kept_at_prior` in that version (it becomes a
-    registered pose, `provisional` then `fused`), and from then on it feeds occupancy,
-    heights, the cloud and objects. The job lists each such frame in `quality.reregistered`
+    `kept_at_prior` and is not listed in `quality.reregistered`. If its images confirm it, its
+    pose leaves `kept_at_prior` in that version (it becomes a registered pose, `provisional`
+    then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job lists each such frame in `quality.reregistered`
     (§4); the movement of that confirmation is excluded from `previous_residuals` and
     `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
     the prediction is approximate. An engine that cannot re-register (the older mapper) reports
     `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
     keyframes, even within the duplicate limits. Nothing re-registers a frame outside a job:
     there is no automatic background refinement;
+  * **Match graph.** A job's registration is order-independent and runs over the job's match
+    graph:
+    1. An edge joins two frames of the job, or a new frame and a confirmed stored keyframe.
+       Each edge needs at least the registration minimum of inliers: the implementation
+       constant in `README.md` (currently 15) behind `few_features` (api.md §6). An edge counts
+       only if the frame's fitted pose then passes the prior checks (step 3). The 100-inlier
+       measurable-pair threshold (§1) stays for the rotation check and the other pair
+       limits.
+    2. Each connected component of new frames registers as a whole. Relative poses come from
+       the images. The component is placed by its matches to confirmed keyframes, by the
+       priors of all its frames together, or both.
+    3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests,
+       api.md §4) apply frame by frame to the component's fitted poses. A failing frame is
+       `kept_at_prior`. The rest of the component stays registered if it is still connected
+       and placed without that frame. Removals iterate to a fixed point, re-checking
+       connectivity after each removal, and the final statuses do not depend on the order in
+       which frames are removed.
+    4. A frame is kept with `no_overlap` only if its component cannot be placed at all. A lone
+       frame, with no edge at the registration minimum, cannot be placed: with a prior it is
+       `kept_at_prior`, reason `no_overlap`, `detail` `no_image_pose`.
+    5. `kept_at_prior` frames of earlier versions are not references, and a job frame counts
+       as an edge only once it is registered. Earlier kept frames that match a registered
+       component with at least the registration minimum of inliers go through re-registration (above, images only),
+       so the same job can confirm them.
+    6. The outcome does not depend on the order of frames in the request. A dry run applies
+       the same procedure and predicts the same statuses;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -138,7 +192,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   History stays linear and readers never see a version change in place.
 * **Retention (`--keep-versions`).** The service keeps at least the last *N* versions of each
   map (default 20, recorded in `README.md`). Older ones are deleted, except one that a running
-  job or read is using. Kept versions share their unchanged content, so a version costs only what changed.
+  job or read is using. Kept versions share their unchanged content, so a version costs only
+  what changed.
 
 ## 3. Update jobs (O3)
 
@@ -177,11 +232,14 @@ becomes a job with a `job_id`. A job goes through these states:
 
 * **The quality report.** Every job, dry runs included, reports `quality`:
   * `scale_ratio_vs_prev` and `gauge_shift` (§1);
-  * `max_displacement_m` and `max_displacement_deg`: over the update's new frames that have an
-    image-only pose, the largest translation and rotation between committed pose and
-    image-only pose (§1), or null when there is none. A frame unconstrained in translation
-    (§1) contributes to `max_displacement_deg` only;
+  * `max_displacement_m` and `max_displacement_deg`: the largest translation and rotation, over
+    the update's new frames, between the committed pose and the prior as sent (frames with a
+    prior) or the image-only pose (frames without), §1; null when there is no such frame. A
+    frame without a prior that is unconstrained in translation contributes to
+    `max_displacement_deg` only;
   * `prior_disagreement_deg` (§1), 0 when no image relative rotation disagrees with the priors;
+  * `height_inconsistent`: the names of the frames the height gate (§2) excluded from content;
+    empty when none;
   * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
     frame this job's images confirmed (§2): how far confirmation moved the frame from its
     prior-placed pose. Empty when there are none; a dry run predicts it. This movement is not
@@ -197,7 +255,7 @@ becomes a job with a `job_id`. A job goes through these states:
   max_displacement_m, max_displacement_deg, max_prior_disagreement_deg, max_rejected_share}` is
   evaluated on the registration phase's report, before anything is committed:
   * `max_residual_m` gates `previous_residuals.max_m` (stored keyframes) only, so a stored
-    keyframe that moved fails the update. New-frame disagreement is gated only by
+    keyframe that moved fails the update. New-frame displacement is gated only by
     `max_displacement_*`. Prior corrections, shown in `prior_disagreement_deg` and
     `prior_residual_*`, never fail it;
   * `max_gauge_shift_m` gates the stored keyframes' median movement;
@@ -222,7 +280,8 @@ becomes a job with a `job_id`. A job goes through these states:
     * Image-measured: each pair's own two-view relative rotation, independent of the joint
       solve.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
-    registered frames only. With no measurable pair, every pair limit passes.
+    registered frames only, over measurable pairs (at least 100 epipolar inliers, §1). With no
+    measurable pair, every pair limit passes.
 
 ## 5. Objects (O8)
 

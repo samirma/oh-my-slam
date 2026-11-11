@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change."
     },
     "InputStatus": {
       "type": "object",
@@ -355,7 +355,8 @@
         "sigma_pos_m",
         "sigma_rot_deg",
         "prior_residual_m",
-        "prior_residual_deg"
+        "prior_residual_deg",
+        "detail"
       ],
       "properties": {
         "name": {
@@ -436,6 +437,21 @@
         "duplicate_of": {
           "type": "string",
           "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or an earlier registered frame of the request, same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
+        },
+        "detail": {
+          "oneOf": [
+            {
+              "enum": [
+                "no_image_pose",
+                "loose_image_pose",
+                "conflict_unsupported"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check."
         }
       },
       "allOf": [
@@ -548,6 +564,51 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "not": {
+                  "const": "kept_at_prior"
+                }
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "plain",
+                  "blur",
+                  "few_features",
+                  "too_close"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "null"
+              }
+            }
+          }
         }
       ]
     },
@@ -612,7 +673,8 @@
         "accepted",
         "failed_checks",
         "prior_disagreement_deg",
-        "reregistered"
+        "reregistered",
+        "height_inconsistent"
       ],
       "properties": {
         "scale_ratio_vs_prev": {
@@ -639,7 +701,7 @@
             "null"
           ],
           "minimum": 0,
-          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (two-view parallax below 1 px against every reference, map.md §1) are left out; kept_at_prior and rejected frames excluded; null when there is none."
+          "description": "Largest translation, over the update's new frames, between the committed pose and the prior as sent (frames with a prior; a drifting prior as placed through the drift estimate) or the image-only pose (frames without a prior; those unconstrained in translation, two-view parallax below 1 px against every reference, are left out); kept_at_prior and rejected frames excluded; null when there is none."
         },
         "max_displacement_deg": {
           "type": [
@@ -647,7 +709,7 @@
             "null"
           ],
           "minimum": 0,
-          "description": "Largest rotation, over the same frames (those unconstrained in translation included), between committed pose and image-only pose; null when there is none."
+          "description": "Largest rotation, over the same frames (frames without a prior unconstrained in translation included), between the committed pose and the prior as sent or the image-only pose; null when there is none."
         },
         "prior_residuals": {
           "oneOf": [
@@ -713,7 +775,7 @@
               "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only; with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers); with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -739,6 +801,13 @@
             }
           },
           "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test. Overlap: at least 10 % 8x8 inlier-cell coverage of the kept frame's image by a new registered frame. Only images confirm, never depth. The dry-run prediction is approximate. An engine that cannot re-register reports an empty list."
+        },
+        "height_inconsistent": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of frames whose committed camera height disagrees with their height_above_floor_m by more than 3 x sqrt(height_sigma^2 + sigma_z^2); they contribute nothing to occupancy, heights or objects, and their status is unchanged. Empty when none."
         }
       }
     },
@@ -2010,7 +2079,8 @@
         "inlier_ratio",
         "ambiguity",
         "rivals",
-        "consistent_with_prior"
+        "consistent_with_prior",
+        "height_consistent"
       ],
       "properties": {
         "name": {
@@ -2127,6 +2197,13 @@
             "null"
           ],
           "description": "Null without a prior; always true for a located frame with a prior, since a frame that no supported hypothesis matches within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) (position and rotation separately) is rejected with prior_conflict."
+        },
+        "height_consistent": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "When the map's scale_source is camera_height and its frames carried height_above_floor_m: false when the located camera height differs from the expected one by more than 3 sigma (position sigma = hypot(sigma_rel, |z_located - z_expected|)); such a hypothesis ranks below any height-consistent rival. Null otherwise."
         },
         "nearest_view": {
           "oneOf": [
