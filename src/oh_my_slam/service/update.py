@@ -197,10 +197,14 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
     observation (its mean reprojection error over the focal length, or the multi-view
     refinement's median match residual) over the square root of its observations, times the
     scene depth for the position, combined with the anchoring's RMS residual; three times that
-    for a low-confidence keyframe, as 3-D RMS (sqrt(3) times the per-axis proxy); then calibrated (``mapping.sigmas.calibrated``: the
-    image-registration noise of the data kind, a depth image or not and the prior's trust),
-    floored. Without ``calibrate``, the proxy alone: the weight of a stored pose as an anchor of
-    the next version's fit (``_anchor``), which the noise floors would leave without scale."""
+    for a low-confidence keyframe; reported as 3-D RMS (sqrt(3) times the per-axis proxy), then
+    calibrated (``mapping.sigmas.calibrated``: the image-registration noise of the data kind, a
+    depth image or not and the prior's trust), floored. Without ``calibrate``, the per-axis
+    proxy alone: the weight of a stored pose as an anchor of the next version's fit
+    (``_anchor``), which the noise floors would leave without scale. The weights stay per axis
+    as the metric priors' sigmas they are weighed against (the 3-D RMS convention of api.md §6
+    is the reported sigmas'; scaling the anchors by sqrt(3) weighs the priors more, a likely
+    cause of the round-5 replay's scale.error_metric rise, unverified on the replay)."""
     st = f.stats
     if "pose_matches" in st:
         n = float(st.get("pose_matches") or 0)
@@ -210,9 +214,10 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
         ang = float(st.get("reproj_error") or 1.0) / max(f.fx, 1.0)
     n = max(n, 1.0)
     d = scene_depth_m or DEFAULT_SCENE_DEPTH_M
-    # per axis, times sqrt(3): 3-D RMS (api.md §6 "Sigma convention", every engine alike)
-    rot = math.sqrt(3.0) * ang * math.sqrt(2.0 / n)
-    pos = math.sqrt(3.0) * d * ang * math.sqrt(8.0 / n)
+    # reported: per axis times sqrt(3), 3-D RMS (api.md §6 "Sigma convention", every engine)
+    rms = math.sqrt(3.0) if calibrate else 1.0
+    rot = rms * ang * math.sqrt(2.0 / n)
+    pos = rms * d * ang * math.sqrt(8.0 / n)
     k = LOW_CONFIDENCE_FACTOR if f.low_confidence else 1.0
     pos, rot = math.hypot(k * pos, align_rms_m), math.degrees(k * rot)
     if calibrate:

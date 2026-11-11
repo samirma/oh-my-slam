@@ -508,11 +508,15 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   epipolar baseline, 0.3). Below 1 px (`PARALLAX_MAX_PX`, one constant) the pair is
   translation-unconstrained: one standpoint. On the test room (fx 160 px) pure turns read
   0.18–0.57 px and a 2 cm move 1.5 px. The pair's overlap is the smaller of the two coverages.
-  The image-measured relative rotation is the epipolar fit's (unbiased whether or not the camera
-  moved), the rotation fit's only for an unconstrained pair whose epipolar rotation leaves it by
-  more than 2° (`EPIPOLAR_AGREE_DEG`: a degenerate essential matrix). The rotation-only fit
-  absorbs a small translation as rotation: on a robot turning with its camera 10 cm ahead of its
-  axis (test room, 25° steps) it is 1.3–1.5° off per pair, the epipolar one 0.2–2°. A
+  The image-measured relative rotation is that of the relative pose refined on the pair's
+  epipolar inliers (`standpoint.refined_rotation`: the Huber-robust Sampson error of [t]× R,
+  from the essential matrix's pose and from the rotation-only fit with that translation and its
+  opposite, the lowest cost kept; measurable pairs only, about 15 ms a pair). The round-6 replay rejected every real pure turn (about
+  45° steps) as `rotation_inconsistent`: at the true rotations of the test room's 45° turn the
+  RANSAC essential matrix's rotation was 0.8–3.9° off and the rotation-only fit 1.5–3.5° (it
+  absorbs the translation of a camera 10 cm ahead of the robot's axis), 6.2° on one pair after
+  the geometric engine; the refined pose is 0.1–0.6° off (2.7° on a 0.55 px pair), and every
+  pair the check measures is logged (`standpoint.measured`, `tests/unit/test_round6.py`). A
   *measurable pair* (map.md §1, oms/2.2 P12; `TwoView.measurable`) has ≥ 100 epipolar inliers
   and an overlap ≥ 10 %: standpoint grouping and the rotation check use it. The pairs fitted are
   every pair of views that can share a view (`standpoint.close`: committed centres within 5 m and

@@ -178,6 +178,9 @@ K_SIGMA = 3.0
 SUPPORT_MIN = 0.25  # a hypothesis's inliers over the best one's: supported from this share
 TOO_CLOSE_INLIERS = 300  # a frame this well registered is never rejected for distance alone
 OVERLAP_MIN = 0.5  # frames overlapping this much compare their relative rotation to the priors'
+# ... matched only when each sees at least this share of the other's matched points (a cost
+# limit: half of an image's cells hardly hold matches with a view that sees a quarter of it)
+OVERLAP_VIEW_MIN = 0.25
 MIN_SIGMA_POS_M = 0.01
 MIN_SIGMA_ROT_DEG = 0.1
 IMAGE_SIGMA_POS_REL = 0.01  # of the median scene depth: depth bias the covariance does not see
@@ -1708,6 +1711,11 @@ class AnchoredMap:
         self._kf_lock = threading.Lock()
         # the keyframes stored before the running job (``begin_job``): the others are its own
         self._stored_ids: set[str] = set()
+        # the running job's epipolar fits by pair of feature sets (``_epipolar``): a job's
+        # features never change, so its rounds and drift passes fit each pair once; and its
+        # placements (``_placed``) by frame, prediction and candidates
+        self._epi: dict[tuple[int, int, int], tuple[Features, Features, Epipolar | None]] = {}
+        self._placed: dict[tuple[Any, ...], Placement] = {}
 
     # -- persistence ---------------------------------------------------------------------------
 
@@ -1821,8 +1829,27 @@ class AnchoredMap:
         return self.scale.source, self.scale.sigma_rel
 
     def begin_job(self) -> None:
-        """A job starts: the keyframes stored now are the earlier versions' (``duplicate_of``)."""
+        """A job starts: the keyframes stored now are the earlier versions' (``duplicate_of``);
+        the job's caches start empty."""
         self._stored_ids = {k.id for k in self.keyframes}
+        self._epi, self._placed = {}, {}
+
+    def _epipolar(self, a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
+                  min_matches: int = EPIPOLAR_MIN_MATCHES) -> Epipolar | None:
+        """``epipolar``, each pair of feature sets fitted once per job (the sets are kept with
+        the fit, so their ids stay theirs)."""
+        key = (id(a), id(b), min_matches)
+        got = self._epi.get(key)
+        if got is None:
+            got = (a, b, epipolar(a, Ka, b, Kb, min_matches))
+            self._epi[key] = got
+        return got[2]
+
+    def _coverage(self, a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics
+                  ) -> tuple[float, float]:
+        """``coverage`` through the job's fits (``_epipolar``)."""
+        e = self._epipolar(a, Ka, b, Kb)
+        return (0.0, 0.0) if e is None else (cell_share(e.ua, Ka), cell_share(e.ub, Kb))
 
     def duplicate_of(self, camera_id: str, T: Array, feats: Features | None = None,
                      name: str | None = None) -> str | None:
@@ -2099,11 +2126,14 @@ class AnchoredMap:
             if method == "rotation":
                 rp = max(rp, UNANCHORED_SIGMA_POS_M)
             # its committed pose is its image-only one (displacement 0) until a standpoint
-            # turns it (``standpoint``)
+            # turns it (``standpoint``); its displacement counts the rotation only when that
+            # pose is unconstrained in translation (map.md §1)
             return Placement(f.name, "registered", None, s.T, round(rp, 4), round(rr, 3), n,
                              method, lifted=_lifted(corr),  # type: ignore[arg-type]
                              align_T=s.T, map_residual=(0.0, 0.0),
-                             inlier_share=cell_share(sub[0][s.inliers], f.K))
+                             inlier_share=cell_share(sub[0][s.inliers], f.K),
+                             unconstrained=method != "rotation" and self._unconstrained(
+                                 f, feats, s, sub[3], cands))
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
@@ -2149,8 +2179,7 @@ class AnchoredMap:
         assert corr is not None
         pl = self._register(f, s, n, method, spi, sri, sub, refs, corr, cands,
                             (T0, sp0, sr0), ref)
-        if not rot_only:
-            pl.unconstrained = self._unconstrained(f, feats, s, sub[3], cands)
+        # (a frame with a prior: its displacement is against the prior, never unconstrained)
         pl.inlier_share = cell_share(sub[0][s.inliers], f.K)
         return pl
 
@@ -2720,7 +2749,7 @@ class AnchoredMap:
                 if i in results and seen.get(i) == ids:
                     continue  # nothing new to match: as it was
                 seen[i] = ids
-                pl = self.place(f, pr.feats, pr.descriptor, cands=cands)
+                pl = self._place_cached(i, f, pr, pred, cands)
                 if f.prior is None and pl.status == "registered" and self.standpoint is not None:
                     pl = self.standpoint(f, pr.feats, pl)
                 # the 300-inlier exemption counts image feature inliers only (api.md §4)
@@ -2745,6 +2774,18 @@ class AnchoredMap:
             self.reregistered += self.reregister([k for k in kept_before if not k.usable()],
                                                  added)
         return grown
+
+    def _place_cached(self, i: int, f: FrameIn, pr: _Prep,
+                      pred: tuple[Array, float, float] | None, cands: list[Keyframe]
+                      ) -> Placement:
+        """``place`` of job frame ``i``, once per prediction and candidate set (their ids,
+        names and poses): a drift pass that predicts it as before reuses it. A copy each time
+        (its fields are reassigned, never changed in place, by the steps after)."""
+        key = (i, None if pred is None else (pred[0].tobytes(), pred[1], pred[2]),
+               tuple((k.id, k.name, k.T.tobytes()) for k in cands))
+        if key not in self._placed:
+            self._placed[key] = self.place(f, pr.feats, pr.descriptor, cands=cands)
+        return copy.copy(self._placed[key])
 
     def _drift_evidence(self, frames: list[FrameIn], out: dict[int, Placement]
                         ) -> list[_DriftObs]:
@@ -2894,7 +2935,7 @@ class AnchoredMap:
         self._load_kf(kept)
         if kept.feats is None or other.feats is None:
             return False
-        e = epipolar(kept.feats, kept.K, other.feats, other.K, MIN_INLIERS)
+        e = self._epipolar(kept.feats, kept.K, other.feats, other.K, MIN_INLIERS)
         return e is not None and cell_share(e.ua, kept.K) >= REREGISTER_OVERLAP
 
     def reregister(self, kept: list[Keyframe], new: list[Keyframe]) -> list[dict[str, Any]]:
@@ -3058,8 +3099,8 @@ class AnchoredMap:
         """A registered frame with a prior against the earlier ones of the update (map.md §1
         "Priors against images"): for each that overlaps it by at least ``OVERLAP_MIN`` (the
         overlap of map.md §1, no named reference: the smaller of the two ``coverage``s; pairs
-        whose views share nothing, by ``view_overlap`` of the points each matched, are not
-        matched), the disagreement between the images'
+        that share less than ``OVERLAP_VIEW_MIN`` of the points each matched, by
+        ``view_overlap``, are not matched: a cost limit), the disagreement between the images'
         relative rotation and the priors' raises ``prior_disagreement_deg``; beyond ``K_SIGMA``
         of the two priors' combined rotation sigmas, this frame's rotation is corrected from the
         images (relative to the earlier frame's committed rotation). Then it joins ``mine``."""
@@ -3072,7 +3113,7 @@ class AnchoredMap:
             assert g.prior is not None and q.T is not None and q.align_T is not None \
                 and q.lifted is not None
             if min(view_overlap(pl.lifted[0], q.T, g.K), view_overlap(q.lifted[0], pl.T, f.K)) \
-                    <= 0.0 or min(coverage(feats, f.K, gf, g.K)) < OVERLAP_MIN:
+                    < OVERLAP_VIEW_MIN or min(self._coverage(feats, f.K, gf, g.K)) < OVERLAP_MIN:
                 continue
             Q = np.asarray(g.prior["T_map_cam"], np.float64)
             img_rel = q.align_T[:3, :3].T @ pl.align_T[:3, :3]
@@ -3086,6 +3127,10 @@ class AnchoredMap:
                 pl.map_residual = _displacement(T, pl.align_T, pl.method == "rotation")
                 pl.T = T
         mine.append((f, pl, feats))
+
+    def depth_ref(self, k: Keyframe) -> DepthRef | None:
+        """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
+        return self._grid(k)
 
     def _grid(self, k: Keyframe) -> DepthRef | None:
         """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
