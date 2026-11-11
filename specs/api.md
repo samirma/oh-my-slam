@@ -165,11 +165,13 @@ error code `invalid_request` (§9).
     rotation. σ_hypothesis is the hypothesis's own image-only calibrated sigma, before fusion
     with the prior and with no rival inflation. For a `drifting` prior, σ_prior is the
     drift-grown sigma. The same bound applies to locate (§6).
-  * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with
-    the prior, and no supported hypothesis lies within that bound. The images confirm a pose
-    when its image-only pose meets the measurable-pair threshold (at least 100 inliers and
-    10 % overlap with a confirmed or registered reference, map.md §1). A frame that fails the
-    prior checks without meeting it is `kept_at_prior`, `detail` `conflict_unsupported`.
+  * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with the
+    prior, and no supported hypothesis lies within that bound. The images confirm a pose when its
+    image-only pose meets the measurable-pair threshold (at least 100 inliers and 10 % overlap, both
+    with the same confirmed or registered reference; map.md §1, Measurable pair). A frame that fails
+    a looseness test is `kept_at_prior`, `detail` `loose_image_pose`, whatever else it fails;
+    otherwise a frame beyond the conflict bound that does not meet the threshold is `kept_at_prior`,
+    `detail` `conflict_unsupported`.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
   * In updates, `few_features` is only the checks' verdict: fewer keypoints than the
     registration minimum (§6); one `README.md` constant serves both (currently 15). A frame
@@ -191,17 +193,20 @@ error code `invalid_request` (§9).
     the frame it duplicates. A duplicate is always `rejected`, never `kept_at_prior`.
     * A name duplicate holds a name the map or the request already holds (§3). It is always
       rejected.
-    * A pose duplicate lies within 0.02 m and 2° of a stored confirmed keyframe of the same
-      camera, or of another frame registered in the same job with the same camera. There is
-      one pose-duplicate pass, after the registration fixed point, over all frames registered
-      in the job in canonical name order; of a pair, the later-named frame is the duplicate
-      (map.md §2, match graph). A stored kept keyframe re-registered in this job counts as a
-      frame of this job for the pass. If a rejected duplicate served as a reference, as the
-      drift reference, as scale evidence or for a re-registration, the registration fixed
-      point runs once more without it. The pose test uses the frame's registered pose: a frame
-      that does not register can be a duplicate only by name. A pose duplicate is rejected only
-      when its image also agrees with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
-      Otherwise it is `registered`, and the later observation wins (map.md §3, C13).
+    * A pose duplicate lies within 0.02 m and 2° of a stored confirmed keyframe of the same camera,
+      or of another frame registered in the same job with the same camera. There is one
+      pose-duplicate pass, after the registration fixed point, over all frames registered in the job
+      in canonical name order; of a pair, the later-named frame is the duplicate (map.md §2, match
+      graph). A stored kept keyframe re-registered in this job counts as a frame of this job for the
+      pass. If a rejected duplicate served as a reference, as the drift reference, as scale evidence
+      or for a re-registration, the registration fixed point runs once more without it: at most once
+      per job (a duplicate found in that run is rejected without a further run); a rejected
+      duplicate keeps its first `duplicate_of`; and if the later member is a stored kept keyframe
+      the job re-registered, its re-registration is undone and the second run skips it. The pose
+      test uses the frame's registered pose: a frame that does not register can be a duplicate only
+      by name. A pose duplicate is rejected only when its image also agrees with that keyframe: at
+      least 90 % of its features re-matched. No detection is run for it. Otherwise it is
+      `registered`, and the later observation wins (map.md §3, C13).
     * Stored `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
       `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or
       5° away is never a duplicate. A view the map already has, beyond those limits, is
@@ -302,7 +307,9 @@ The versions read, revert and `--keep-versions` are O2.
       2. else the median `height_sigma_m` that the answer's reference keyframes carried when
          they were sent (the map frames' `height_sigma_m`);
       3. else, when none of them carries one, the median of those reference keyframes'
-         `sigma_pos_m` / √3, from their registered pose sigmas;
+         `sigma_pos_m` / √3, from their registered pose sigmas. Only image-confirmed
+         (registered) reference keyframes count; kept references are skipped, and if none
+         remain step 4 applies;
       4. else the default recorded in `README.md`.
     * Such a hypothesis ranks below any height-consistent rival. `consistent_with_prior` does
       not change.
