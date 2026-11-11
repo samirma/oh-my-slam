@@ -133,8 +133,10 @@ error code `invalid_request` (§9).
   `quality.reregistered`.
   * **Too-close exception.** A frame that is `kept_at_prior` only because it is `too_close`,
     and has a `metric` prior, still contributes at its prior pose: its detections, to object
-    records and `detection_votes`; its depth points, to the cloud, occupancy and heights. Only
-    depth inside the depth image's valid range (`README.md`) counts. It never contributes scale
+    records and `detection_votes`; its depth points, to the cloud, occupancy and heights. Depth
+    points count only from a depth image, inside its valid range (`README.md`). Without a depth
+    image, its detections and `detection_votes` still count at the prior pose, placed like any
+    monocular detection. It never contributes scale
     evidence: scale stays confirmed-only.
   * Every other `kept_at_prior` frame contributes nothing until its images confirm it,
     including a `too_close` frame with a `drifting` prior and a frame kept for any other failed
@@ -163,6 +165,9 @@ error code `invalid_request` (§9).
   * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with
     the prior, and no supported hypothesis lies within that bound.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
+  * In updates, `few_features` is only the checks' verdict: fewer keypoints than the
+    registration minimum (§6). A frame with a prior that passed the checks but was not placed
+    is `kept_at_prior` with `no_overlap`, `detail` `no_image_pose` or `loose_image_pose`.
   * A frame with a prior whose image fails a quality check, or that is too close, is
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
     `few_features`, `too_close`, with `min_distance_m` and `scene_distance_m` when it is
@@ -273,12 +278,16 @@ The versions read, revert and `--keep-versions` are O2.
     If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported
     alone.
   * **Camera-height scale.** When the map's `scale_source` is `camera_height`, the reported
-    position sigma is hypot(σ_rel, |z_located − z_expected|). z_expected is the map's camera
-    height at that pose, used only where the map's frames carried `height_above_floor_m`.
-    `height_consistent` is false when |z_located − z_expected| > 3 × sqrt(height_sigma² +
-    σ_z²), with height_sigma the map frames' `height_sigma_m` there and σ_z = σ_rel / √3 (the
-    sigmas are 3-D RMS). Such a hypothesis ranks below any height-consistent rival.
-    `consistent_with_prior` does not change.
+    position sigma is hypot(σ_rel, |z_located − z_expected|).
+    * z_expected is the floor height plus the locate frame's `height_above_floor_m`, or else
+      the camera's registered height in the map.
+    * Without any height, `height_consistent` is null and the position sigma is σ_rel.
+    * `height_consistent` is false when |z_located − z_expected| > 3 × sqrt(height_sigma² +
+      σ_z²), with σ_z = σ_rel / √3 (the sigmas are 3-D RMS). height_sigma is the locate
+      frame's `height_sigma_m` when it carries one, else the map frames' `height_sigma_m`
+      there.
+    * Such a hypothesis ranks below any height-consistent rival. `consistent_with_prior` does
+      not change.
   * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
 
     | Depth | `metric` | `drifting` | `none` |
@@ -301,7 +310,8 @@ The versions read, revert and `--keep-versions` are O2.
     The client then asks for a second frame.
 * **Reasons.**
   * `few_features`: the frame has fewer keypoints than a pose needs inliers. That minimum is an
-    implementation constant recorded in `README.md` (currently 15).
+    implementation constant recorded in `README.md` (currently 15), the registration minimum.
+    In updates `few_features` is only the checks' verdict (§4).
   * `no_overlap`: the frame has enough keypoints but gets no pose; see `nearest_view` below.
 * **Out of the mapped area.** A frame rejected with `no_overlap` carries `nearest_view`. It is
   guaranteed when the frame has a prior. Without a prior it is allowed, with `turn_deg` null,

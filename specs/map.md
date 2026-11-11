@@ -37,23 +37,28 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     (§2, match graph);
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
-  * frames whose pairwise two-view parallax (above) is below 1 px form one standpoint group,
+  * frames whose pairwise two-view parallax (above) is below 1 px, over measurable pairs
+    (below), form one standpoint group,
     registered about a common centre. The group fixes only that centre: each frame keeps its
     own image-only rotation, which the group never overrides. The common centre is the
     overlapped stored keyframe with the most pair inliers (ties: the lowest keyframe id), or,
     when they overlap none, the mean of their image-only centres; its position sigma is their
     spread;
   * **Measurable pair.** A pair of frames is measurable only with at least 100 epipolar
-    inliers. Fewer counts as no measurable pair, which passes every pair limit (§4);
+    inliers and an overlap (§1, Overlap) of at least 10 %. Otherwise it counts as no
+    measurable pair, which passes every pair limit (§4). Standpoint grouping and the pair
+    limits use this threshold;
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
     image-measured relative rotations: a hard limit (§4, `rotation_inconsistent`). With priors
     this limit does not apply; the prior-rotation correction below covers it;
   * sigmas stay honest: the containment targets (evaluation.md) apply.
-* **Every engine.** Calibrated sigmas and the `rotation_inconsistent` limit (§4) apply to every
-  engine, the older mapper included: every engine's sigmas mean the same thing. The older
-  mapper is exempt from standpoint grouping only.
+* **Every engine.** These apply to every engine, the older mapper included: calibrated sigmas
+  (every engine's sigmas mean the same thing), the `rotation_inconsistent` limit (§4), the
+  robust drift estimate across versions, drift-grown sigmas for kept frames, and acceptance of
+  an update whose frames are all `kept_at_prior` (§4). The older mapper is exempt from
+  static-content exclusion, standpoint grouping and the match graph (§2) only.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -100,12 +105,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * it is fitted over image-confirmed frames with `drifting` priors;
   * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
     rejected with `prior_conflict`;
-  * a first estimate, when the map has none yet, needs the support of min(3, n) frames, n the
-    job's `drifting`-prior frames, and of at least 50 % of them;
-  * a change of the estimate between versions larger than 3 × its own sigma needs the support
-    of at least 3 frames and of at least 50 % of the job's `drifting`-prior frames. Without it
-    the change is refused, the previous estimate stays, and the unsupported frames are
-    rejected with `prior_conflict`.
+  * a frame can support an estimate when its image-only pose meets the measurable-pair
+    threshold (above) to confirmed keyframes, even if it conflicts under the current estimate;
+  * a first estimate, when the map has none yet, and a change of the estimate between versions
+    larger than 3 × its own sigma, both need the same robust support: min(3, n) supporting
+    frames, n the frames of the job that can support it, and at least 50 % of those frames.
+    One strong frame alone is never enough. Without that support a change is refused, the
+    previous estimate stays, and the unsupported frames are rejected with `prior_conflict`;
+  * after a change is accepted, the job's frames are re-tested under the new estimate.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
@@ -142,16 +149,18 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
     kept. Within a job, a job frame counts as an edge once it is registered (match graph,
     below).
-  * **Re-registration.** When a job registers new frames that overlap a stored `kept_at_prior`
-    frame (the overlap of §1 with the kept frame as the reference: at least 10 % of the kept
-    frame's image covered by a new registered frame of the job), the service re-runs that
-    stored frame's registration against the confirmed map. A frame kept for a failed check is
-    eligible too. Only its images can confirm it, never depth; when they do not, it stays
-    `kept_at_prior` and is not listed in `quality.reregistered`. If its images confirm it, its
+  * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame
+    of the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
+    reference) and matches it with at least the registration minimum of inliers (the
+    `README.md` constant, currently 15). The service then re-runs that stored frame's
+    registration against the confirmed map. A frame kept for a failed check is eligible too.
+    It is confirmed by its images only, never by depth, and only when its fitted pose passes
+    the prior checks (api.md §4); otherwise it stays `kept_at_prior` and is not listed in
+    `quality.reregistered`. If its images confirm it, its
     pose leaves `kept_at_prior` in that version (it becomes a registered pose, `provisional`
     then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job
-    lists each such frame in `quality.reregistered` (§4); the movement of that confirmation is excluded from `previous_residuals` and
-    `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
+    lists each such frame in `quality.reregistered` (§4); the movement of that confirmation is
+    excluded from `previous_residuals` and `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
     the prediction is approximate. An engine that cannot re-register (the older mapper) reports
     `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
     keyframes, even within the duplicate limits. Nothing re-registers a frame outside a job:
@@ -180,9 +189,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        frame, with no edge at the registration minimum, cannot be placed: with a prior it is
        `kept_at_prior`, reason `no_overlap`, `detail` `no_image_pose`.
     5. `kept_at_prior` frames of earlier versions are not references, and a job frame counts
-       as an edge only once it is registered. Earlier kept frames that match a registered
-       component with at least the registration minimum of inliers go through re-registration
-       (above, images only), so the same job can confirm them.
+       as an edge only once it is registered. An earlier kept frame that a registered frame of
+       the component covers at least 10 % of (8 × 8 coverage of the kept frame's image) and
+       matches with at least the registration minimum of inliers goes through re-registration
+       (above): confirmed by images only, never by depth, and only when its fitted pose passes
+       the prior checks. So the same job can confirm it.
     6. The outcome does not depend on the order of frames in the request. Where any order is
        still needed (the origin frame, the seed frame, a duplicate's earlier frame), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the

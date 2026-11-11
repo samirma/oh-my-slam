@@ -800,7 +800,7 @@
               }
             }
           },
-          "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test. Overlap: at least 10 % 8x8 inlier-cell coverage of the kept frame's image by a new registered frame. Only images confirm, never depth. The dry-run prediction is approximate. An engine that cannot re-register reports an empty list."
+          "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test. Eligible with at least 10 % 8x8 inlier-cell coverage of the kept frame's image by a new registered frame and at least the registration minimum of inliers; confirmed by images only, never depth, and only when its fitted pose passes the prior checks. The dry-run prediction is approximate. An engine that cannot re-register reports an empty list."
         },
         "height_inconsistent": {
           "type": "array",
@@ -2203,7 +2203,7 @@
             "boolean",
             "null"
           ],
-          "description": "When the map's scale_source is camera_height and its frames carried height_above_floor_m: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); the reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null otherwise."
+          "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is the locate frame's height_sigma_m when given. The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
         },
         "nearest_view": {
           "oneOf": [
