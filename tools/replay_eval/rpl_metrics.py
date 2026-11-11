@@ -79,6 +79,15 @@ DEFS: list[Def] = [
     Def("locate.sigma_tightness", "C8", "Median error / sigma of located frames, position and "
         "rotation", "median", "ratio", ("O5",),
         parts=(("pos", "median", "ratio"), ("rot", "median", "ratio"))),
+    Def("locate.sigma_tightness_bound", "C8", "Median error / sigma of located frames, position "
+        "and rotation separately, two-sided", "median", "ratio", ("O5",),
+        parts=(("pos", "median", "ratio"), ("rot", "median", "ratio"))),
+    Def("update.sigma_tightness", "C1, C4", "Median error / sigma of registered update frames, "
+        "position and rotation", "median", "ratio",
+        parts=(("pos", "median", "ratio"), ("rot", "median", "ratio"))),
+    Def("update.sigma_tightness_bound", "C1, C4", "Median error / sigma of registered update "
+        "frames, position and rotation separately, two-sided", "median", "ratio",
+        parts=(("pos", "median", "ratio"), ("rot", "median", "ratio"))),
     Def("update.sigma_containment", "C1, C4", "Non-rejected inputs (registered and "
         "kept_at_prior) whose committed pose is within 3 of its sigmas of the truth", "share",
         "share"),
@@ -583,6 +592,14 @@ class Measure:
                 self.s.add("update.sigma_containment",
                            e_pos <= 3 * sim.s * float(i["sigma_pos_m"])
                            and e_rot <= 3 * float(i["sigma_rot_deg"]))
+                if i["status"] != "registered":
+                    continue
+                sp_w, sr = sim.s * float(i["sigma_pos_m"]), float(i["sigma_rot_deg"])
+                for mid in ("update.sigma_tightness", "update.sigma_tightness_bound"):
+                    if sp_w > 0:
+                        self.s.add(f"{mid}#pos", e_pos / sp_w)
+                    if sr > 0:
+                        self.s.add(f"{mid}#rot", e_rot / sr)
 
     def scale(self) -> None:
         if self.al is None:
@@ -710,10 +727,11 @@ class Measure:
                             s.add("locate.sigma_right_median", sp_w)
                         s.add("locate.sigma_containment",
                               e_pos <= 3 * sp_w and e_rot <= 3 * float(sr))
-                        if sp_w > 0:
-                            s.add("locate.sigma_tightness#pos", e_pos / sp_w)
-                        if float(sr) > 0:
-                            s.add("locate.sigma_tightness#rot", e_rot / float(sr))
+                        for mid in ("locate.sigma_tightness", "locate.sigma_tightness_bound"):
+                            if sp_w > 0:
+                                s.add(f"{mid}#pos", e_pos / sp_w)
+                            if float(sr) > 0:
+                                s.add(f"{mid}#rot", e_rot / float(sr))
                     if e_pos <= 0.10 and e_rot <= 5.0:
                         s.add("diag.ambiguity_null_on_right", amb is None)
                 nv = r.get("nearest_view")

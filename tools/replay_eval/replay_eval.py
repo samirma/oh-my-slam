@@ -156,12 +156,19 @@ def fmt(v: Any) -> str:
     return f"{v:.3g}" if isinstance(v, float) else str(v)
 
 
+def _bound_text(t: dict[str, Any]) -> str:
+    v = t["value"]
+    if t["op"] == "between":
+        return f"in [{fmt(float(v[0]))}, {fmt(float(v[1]))}]"
+    return f"{t['op']} {fmt(float(v))}"
+
+
 def target_text(t: dict[str, Any] | None) -> str:
     if not t or t.get("info"):
         return "-"
     if "parts" in t:
-        return " & ".join(f"{k} {p['op']} {fmt(float(p['value']))}" for k, p in t["parts"].items())
-    return f"{t['op']} {fmt(float(t['value']))}"
+        return " & ".join(f"{k} {_bound_text(p)}" for k, p in t["parts"].items())
+    return _bound_text(t)
 
 
 def value_text(v: Any) -> str:

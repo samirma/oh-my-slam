@@ -305,7 +305,8 @@ def test_targets_file_and_rules(tmp_path: Path) -> None:
     appendix = {
         "locate.recall", "locate.median_pos_error", "locate.ambiguity_flagged",
         "locate.sigma_right_median", "locate.nearest_view", "locate.sigma_containment",
-        "locate.sigma_tightness", "update.sigma_containment", "scale.error_metric",
+        "locate.sigma_tightness", "locate.sigma_tightness_bound", "update.sigma_tightness",
+        "update.sigma_tightness_bound", "update.sigma_containment", "scale.error_metric",
         "scale.error_camera_height", "scale.error_by_direction", "frame.shift", "update.readable_latency",
         "fusion.time_per_frame", "reads.atomic", "jobs.eta_accuracy",
         "fusion.intermediate_interval", "inputs.reason_agreement", "revert.latency",
@@ -321,7 +322,8 @@ def test_targets_file_and_rules(tmp_path: Path) -> None:
     assert t.param("passages.geometry", "centre_tolerance_m", 0) == 0.10
     assert t.param("nothing", "x", 7.0) == 7.0
     for bad in ([], {"parts": {}}, {"parts": {"a": {"parts": {}}}}, {"op": "==", "value": 1},
-                {"op": "<=", "value": "x"}):
+                {"op": "<=", "value": "x"}, {"op": "between", "value": 1},
+                {"op": "between", "value": [2, 1]}, {"op": "between", "value": [0, "x"]}):
         with pytest.raises(ValueError):
             rt.Targets({"m": bad})  # type: ignore[dict-item]
     assert rt.reduce([1, 2], "sum") == 3 and rt.reduce([1, 3], "median") == 2
@@ -343,3 +345,8 @@ def test_targets_file_and_rules(tmp_path: Path) -> None:
     assert cmp["lat"]["regressed"] and cmp["share"]["regressed"] and cmp["c"]["regressed"]
     assert not cmp["mixed"]["regressed"] and "x" not in cmp
     assert not rt.worse("lat", float("nan"), 1.0, tg.get("lat"))
+    band = {"op": "between", "value": [0.3, 1.5]}
+    assert rt.meets(0.3, "between", [0.3, 1.5]) and not rt.meets(1.6, "between", [0.3, 1.5])
+    assert rt.judge(1.0, band) == "pass" and rt.judge(0.2, band) == "fail"
+    assert rt.worse("b", 2.0, 1.6, band) and not rt.worse("b", 1.0, 1.6, band)
+    assert rt.worse("b", 0.1, 0.2, band)

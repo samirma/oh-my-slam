@@ -1,7 +1,8 @@
 """The thresholds of examples/targets.json (specs/evaluation.md "Data, not code"), shared by the
 replay evaluator and the reference evaluator (tools/evaluate/).
 
-An entry is ``{op, value, ...}`` (one number), ``{parts: {name: {op, value}}}`` (a metric with
+An entry is ``{op, value, ...}`` (one number; ``op: between`` with ``value: [low, high]`` is a
+two-sided bound, both ends included), ``{parts: {name: {op, value}}}`` (a metric with
 several values that passes when every part does) or ``{info: true}``. Its other keys are threshold
 parameters (``abs_m``, ``time_tolerance_rel``, ...) and regression tolerances (``tolerance_abs``,
 ``tolerance_rel``; the file's ``defaults`` otherwise).
@@ -61,6 +62,12 @@ def check_entry(mid: str, t: Any) -> None:
             if "parts" in p:
                 raise ValueError(f"targets: {mid}#{name}: parts do not nest")
         return
+    if t.get("op") == "between":
+        v = t.get("value")
+        if not isinstance(v, list) or len(v) != 2 \
+                or not all(isinstance(x, int | float) for x in v) or v[0] > v[1]:
+            raise ValueError(f"targets: {mid}: between expects value [low, high]")
+        return
     if t.get("op") not in OPS or not isinstance(t.get("value"), int | float):
         raise ValueError(f"targets: {mid}: expected op in {OPS} and a numeric value")
 
@@ -80,7 +87,9 @@ def reduce(values: list[float], how: str) -> float | None:
     return float(a.max())
 
 
-def meets(value: float, op: str, target: float) -> bool:
+def meets(value: float, op: str, target: Any) -> bool:
+    if op == "between":
+        return float(target[0]) <= value <= float(target[1])
     if op == "<=":
         return value <= target
     if op == ">=":
@@ -101,14 +110,14 @@ def judge(value: float | dict[str, float | None] | None,
         if not isinstance(value, dict) or all(v is None for v in value.values()):
             return "no_samples"
         results = [None if value.get(k) is None else meets(float(value[k]),  # type: ignore[arg-type]
-                                                          p["op"], float(p["value"]))
+                                                          p["op"], p["value"])
                    for k, p in target["parts"].items()]
         if any(r is False for r in results):
             return "fail"
         return "pass" if all(r is True for r in results) else "no_samples"
     if value is None or isinstance(value, dict):
         return "no_samples"
-    return "pass" if meets(float(value), target["op"], float(target["value"])) else "fail"
+    return "pass" if meets(float(value), target["op"], target["value"]) else "fail"
 
 
 def worse(mid: str, value: float, baseline: float, target: dict[str, Any] | None,
@@ -120,6 +129,9 @@ def worse(mid: str, value: float, baseline: float, target: dict[str, Any] | None
     op = t.get("op")
     if op is None or not math.isfinite(value) or not math.isfinite(baseline):
         return False
+    if op == "between":  # worse: farther outside the bound
+        lo, hi = float(t["value"][0]), float(t["value"][1])
+        return max(lo - value, value - hi, 0.0) > max(lo - baseline, baseline - hi, 0.0)
     return value > baseline if op in ("<=", "<") else value < baseline
 
 

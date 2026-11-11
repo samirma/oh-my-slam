@@ -1,5 +1,5 @@
 {
- "about": "Targets of the client-side evaluators tools/replay_eval/replay_eval.py and tools/evaluate/evaluate.py (specs/evaluation.md, high_level_spec.md §11): metric id -> threshold. Keys are exactly the metric ids of specs/evaluation.md; the metrics and their fixed definition parameters live there, the thresholds only here. A threshold is {op: '<=' | '>=' | '<', value} (a single number), {parts: {name: {op, value}}} (a metric with several values, which passes when every part does), or {info: true} (information, no target). Extra keys of an entry are threshold parameters the evaluators read (tolerances, an absolute floor). A metric regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the entry's own tolerances or else the defaults. Edit the values here; no code change is needed. The gate parameters of the C6 metrics are measurement parameters, not targets (evaluation.md 'Gate parameters'), and are not held here.",
+ "about": "Targets of the client-side evaluators tools/replay_eval/replay_eval.py and tools/evaluate/evaluate.py (specs/evaluation.md, high_level_spec.md §11): metric id -> threshold. Keys are exactly the metric ids of specs/evaluation.md; the metrics and their fixed definition parameters live there, the thresholds only here. A threshold is {op: '<=' | '>=' | '<', value} (a single number), {op: 'between', value: [low, high]} (a two-sided bound, both ends included), {parts: {name: {op, value}}} (a metric with several values, which passes when every part does), or {info: true} (information, no target). Extra keys of an entry are threshold parameters the evaluators read (tolerances, an absolute floor). A metric regresses when it is worse than the baseline run by more than max(tolerance_abs, tolerance_rel * |baseline|), using the entry's own tolerances or else the defaults. Edit the values here; no code change is needed. The gate parameters of the C6 metrics are measurement parameters, not targets (evaluation.md 'Gate parameters'), and are not held here.",
  "format": 2,
  "defaults": {"tolerance_rel": 0.1, "tolerance_abs": 0.0},
  "metrics": {
@@ -10,6 +10,9 @@
   "locate.nearest_view": {"op": ">=", "value": 0.8, "unit": "share"},
   "locate.sigma_containment": {"op": ">=", "value": 0.99, "unit": "share"},
   "locate.sigma_tightness": {"info": true, "unit": "ratio"},
+  "locate.sigma_tightness_bound": {"parts": {"pos": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}, "rot": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}}, "description": "median error / sigma of located frames, position and rotation each between 0.3 and 1.5"},
+  "update.sigma_tightness": {"info": true, "unit": "ratio"},
+  "update.sigma_tightness_bound": {"parts": {"pos": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}, "rot": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}}, "description": "median error / sigma of registered update frames, position and rotation each between 0.3 and 1.5"},
   "update.sigma_containment": {"op": ">=", "value": 0.99, "unit": "share"},
   "scale.error_metric": {"op": "<=", "value": 0.03, "unit": "ratio"},
   "scale.error_camera_height": {"op": "<=", "value": 0.10, "unit": "ratio"},

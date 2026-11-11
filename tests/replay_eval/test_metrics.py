@@ -307,6 +307,9 @@ def test_locate_sigmas_and_update_containment(world: Any) -> None:
     assert s.values["locate.sigma_right_median"] == [pytest.approx(0.01)]
     assert s.values["locate.sigma_containment"] == [1.0, 0.0]
     assert s.values["locate.sigma_tightness#pos"] == [pytest.approx(0.0, abs=1e-6)]
+    assert s.values["locate.sigma_tightness_bound#pos"] == [pytest.approx(0.0, abs=1e-6)]
+    assert s.values["update.sigma_tightness#pos"] == [pytest.approx(0.0, abs=1e-6)]
+    assert s.values["update.sigma_tightness_bound#rot"] == [pytest.approx(0.0, abs=1e-4)]
     assert s.values["locate.ambiguity_flagged"] == [1.0]
 
 

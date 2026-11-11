@@ -118,7 +118,9 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     # floor is not at z 0: judged, and failing
     assert ov["scale.error_by_direction"]["status"] == "fail"
     fails = {k: m for k, m in ov.items() if m["status"] == "fail" and m["unit"] != "s"
-             and k not in ("locate.sigma_containment", "scale.error_by_direction")}
+             and k not in ("locate.sigma_containment", "scale.error_by_direction",
+                           # the fake's fixed sigmas are not calibrated against its errors
+                           "locate.sigma_tightness_bound", "update.sigma_tightness_bound")}
     # the fake locates some frames wrongly with a 1 cm sigma: never contained
     assert ov["locate.sigma_containment"]["value"] < 1.0
     assert not fails, fails

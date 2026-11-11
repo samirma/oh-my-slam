@@ -82,6 +82,8 @@ NOT_MEASURED = {
     "locate.median_pos_error": TRUTH, "locate.ambiguity_flagged": TRUTH,
     "locate.sigma_right_median": TRUTH, "locate.nearest_view": TRUTH + " (frames with priors)",
     "locate.sigma_containment": TRUTH, "locate.sigma_tightness": TRUTH,
+    "locate.sigma_tightness_bound": TRUTH, "update.sigma_tightness": TRUTH,
+    "update.sigma_tightness_bound": TRUTH,
     "update.sigma_containment": TRUTH, "scale.error_metric": TRUTH + " (metric priors)",
     "scale.error_camera_height": TRUTH, "inputs.reason_agreement": TRUTH,
     "scale.error_by_direction": TRUTH + " (truth positions in four directions)",
