@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from oh_my_slam.mapping import relocalize as rl
+from oh_my_slam.mapping import sigmas
 from tests.synth import rooms
 
 K = np.array([[300.0, 0.0, 160.0], [0.0, 300.0, 120.0], [0.0, 0.0, 1.0]])
@@ -80,6 +81,30 @@ def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit(
     assert b.sigma_pos_m > a.sigma_pos_m
     assert o.inlier_ratio is not None and o.inlier_ratio > 0.9
     assert o.consistent_with_prior is None and o.nearest in (0, 1)
+
+
+def test_locate_sigmas_are_image_only_and_the_map_sigma_is_a_switch(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.md §6 "Locate sigmas": trust class none, the prior never changes them; the
+    reference keyframes' map sigma joins only with ``OH_MY_SLAM_LOCATE_MAP_SIGMA``."""
+    P, D = _scene()
+    idx = rl.Index([_kf("a", A, P, D, sigma=0.05),
+                    _kf("b", rooms.camera(0.3, 0.2, 1.0, -8.0, -10.0), P, D, sigma=0.05)])
+    T = rooms.camera(0.15, 0.1, 1.05, -4.0, -12.0)
+    monkeypatch.delenv(sigmas.LOCATE_MAP_SIGMA_ENV, raising=False)
+    bare = rl.locate(_query(T, P, D), idx)
+    with_prior = rl.locate(_query(T, P, D, prior=T.copy(), prior_sigma_pos_m=0.01,
+                                  prior_sigma_rot_deg=0.5), idx)
+    assert bare.located and with_prior.located
+    assert (with_prior.sigma_pos_m, with_prior.sigma_rot_deg) == (bare.sigma_pos_m,
+                                                                  bare.sigma_rot_deg)
+    assert bare.sigma_pos_m is not None and bare.sigma_pos_m < 0.05  # not the keyframes' 5 cm
+    monkeypatch.setenv(sigmas.LOCATE_MAP_SIGMA_ENV, "1")
+    combined = rl.locate(_query(T, P, D), idx)
+    assert combined.sigma_pos_m is not None and combined.sigma_pos_m >= 0.05
+    monkeypatch.setenv(sigmas.LOCATE_MAP_SIGMA_ENV, "maybe")
+    with pytest.raises(ValueError, match=sigmas.LOCATE_MAP_SIGMA_ENV):
+        sigmas.locate_map_sigma()
 
 
 def test_a_symmetric_twin_makes_the_pose_ambiguous_and_the_prior_picks() -> None:
@@ -458,7 +483,7 @@ def test_a_keyframe_located_with_its_own_tight_prior_locates_and_a_far_prior_con
     P, D = _scene()
     B = rooms.camera(0.3, 0.2, 1.0, -8.0, -10.0)
     idx = rl.Index([_kf("a", A, P, D, sigma=0.002), _kf("b", B, P, D, sigma=0.002)])
-    tight = {"prior_sigma_pos_m": 0.002, "prior_sigma_rot_deg": 0.05, "trust": "metric"}
+    tight = {"prior_sigma_pos_m": 0.002, "prior_sigma_rot_deg": 0.05}
     o = rl.locate(_query(A, P, D, noise=2.0, prior=A.copy(), **tight), idx)
     assert o.located and o.consistent_with_prior is True and o.reason is None
     assert o.T is not None and rl.pose_distance(o.T, A)[0] > 0.0  # the image noise moved it

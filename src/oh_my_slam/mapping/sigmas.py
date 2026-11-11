@@ -27,6 +27,7 @@ import os
 K_SIGMA = 3.0
 SIGMA_SCALE_ENV = "OH_MY_SLAM_SIGMA_SCALE"
 SIGMA_FLOORS_ENV = "OH_MY_SLAM_SIGMA_FLOORS"
+LOCATE_MAP_SIGMA_ENV = "OH_MY_SLAM_LOCATE_MAP_SIGMA"
 SIGMA_SCALE = 1.0  # the covariance sigma's factor before the floor is added
 DEPTH, NO_DEPTH = "depth", "nodepth"
 TRUSTS = ("metric", "drifting", "none")
@@ -66,6 +67,19 @@ def scale() -> float:
     if not v > 0:
         raise ValueError(f"{SIGMA_SCALE_ENV}={raw!r}: expected a positive number")
     return v
+
+
+def locate_map_sigma() -> bool:
+    """Whether a located pose's image-only sigma is combined with its reference keyframes' map
+    sigmas (api.md §6 "Locate sigmas": only while ``locate.sigma_containment`` and
+    ``locate.sigma_tightness_bound`` both hold, which only a replay shows):
+    ``OH_MY_SLAM_LOCATE_MAP_SIGMA`` ``1``; off by default (σ_rel alone)."""
+    raw = os.environ.get(LOCATE_MAP_SIGMA_ENV, "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{LOCATE_MAP_SIGMA_ENV}={raw!r}: expected 0 or 1")
 
 
 def kind(depth: bool, trust: str | None) -> str:

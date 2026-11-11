@@ -11,9 +11,11 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
   (``PX_THRESHOLD`` px at 640 px of width) refined on the inliers. Its covariance is the
   Gauss-Newton one, ``s^2 (J^T J)^-1`` over the inliers' reprojection residuals (``s`` their RMS,
   at least ``MIN_PX_SIGMA``), for the rotation and the camera centre; ``sigma_pos_m`` and
-  ``sigma_rot_deg`` are the square roots of their traces (the 3-D RMS), combined with the matched
-  keyframes' own sigmas, then calibrated (``mapping.sigmas.calibrated``: the image-registration
-  noise floor of the data kind, depth keyframes or not and the prior's trust).
+  ``sigma_rot_deg`` are the square roots of their traces (the 3-D RMS), calibrated from the
+  images alone (api.md §6 "Locate sigmas": ``mapping.sigmas.calibrated`` with trust class
+  ``none``, the noise floor of depth keyframes or not; the prior never changes them). Combined
+  with the matched keyframes' own map sigmas only when ``sigmas.locate_map_sigma`` is on
+  (``OH_MY_SLAM_LOCATE_MAP_SIGMA``, off by default).
 * **Turn fit.** Without enough of those, a frame whose matched keyframes were taken from one spot
   (centres within ``ONE_SPOT_REL`` of their depth, or ``ONE_SPOT_M``) is placed at their centre with
   the rotation that turns its rays onto theirs (``locate.turn_ransac``).
@@ -331,7 +333,6 @@ class Query:
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
     camera_z_sigma: float = DEFAULT_HEIGHT_SIGMA_M
-    trust: str | None = None  # the prior's trust (the calibration's data kind)
 
 
 @dataclass
@@ -847,23 +848,27 @@ def _on_depth(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
 def _sigmas(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
             cov: Array | None = None, keyframes: tuple[float, float] = (0.0, 0.0),
             depth: bool = False) -> tuple[float, float]:
-    """A hypothesis's own sigmas (``_fit``), calibrated (``sigmas.calibrated``, the data kind of
-    ``depth`` and the prior's trust): never the spread of its rivals (api.md §6)."""
+    """A hypothesis's own sigmas (``_fit``), calibrated from the images alone
+    (``sigmas.calibrated``, the data kind of ``depth`` and trust class ``none``; api.md §6
+    "Locate sigmas"): never the spread of its rivals, never changed by the prior."""
     fit = _fit(h, q, uv, xyz, iq, cov, keyframes)
-    sp, sr = sigmas.calibrated(fit[0], fit[1], depth, q.trust)
+    sp, sr = sigmas.calibrated(fit[0], fit[1], depth, None)
     return round(sp, 4), round(sr, 3)
 
 
 def _fit(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
          cov: Array | None, keyframes: tuple[float, float]) -> tuple[float, float]:
     """(m, deg): the fit's covariance (``cov`` of the refinement when given, else the
-    reprojection one) and the keyframes' own sigmas, combined."""
+    reprojection one), combined with the keyframes' own map sigmas only when
+    ``sigmas.locate_map_sigma`` is on."""
     if cov is not None:
         rot = math.degrees(math.sqrt(max(float(np.trace(cov[:3, :3])), 0.0)))
         pos = math.sqrt(max(float(np.trace(cov[3:, 3:])), 0.0))
     else:
         sel = np.array(sorted(_first(h, iq).values()), np.int64)
         pos, rot = covariance(h.T, q.K, uv[sel], xyz[sel])
+    if not sigmas.locate_map_sigma():
+        return pos, rot
     return math.hypot(pos, keyframes[0]), math.hypot(rot, keyframes[1])
 
 
@@ -898,7 +903,7 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
     on_depth = bool(np.mean([index.keyframes[i].depth for i in used]) >= 0.5)
     # a rotation-only hypothesis takes the standpoint's position sigma (map.md §1), calibrated
     sp = sigmas.calibrated(math.hypot(spread, ONE_SPOT_REL * float(np.median(depth))), 0.0,
-                           on_depth, q.trust)[0]
+                           on_depth, None)[0]
 
     def pose(R: Array) -> Array:
         T = np.eye(4)
@@ -911,7 +916,7 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
     def rot_sigma(a: Array, b: Array, R: Array) -> float:
         ang = np.degrees(np.arccos(np.clip(np.sum((a @ R.T) * b, axis=1), -1.0, 1.0)))
         raw = math.sqrt(float(np.mean(ang ** 2)) + MIN_PX_SIGMA_DEG ** 2) * math.sqrt(2.0 / len(a))
-        return sigmas.calibrated(0.0, raw, on_depth, q.trust)[1]
+        return sigmas.calibrated(0.0, raw, on_depth, None)[1]
 
     R = kabsch(a[inl], b[inl])
     # the hypotheses: this turn, and a second one on the rays it leaves (a twin view)
