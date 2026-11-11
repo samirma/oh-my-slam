@@ -2256,7 +2256,7 @@
             "boolean",
             "null"
           ],
-          "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is the locate frame's height_sigma_m when given, else the median height_sigma_m of the answer's confirmed reference keyframes, else the camera's registered z sigma (sigma_pos_m / sqrt(3)). The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
+          "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is, in order: the locate frame's height_sigma_m; else the median height_sigma_m the answer's reference keyframes carried when sent; else the median of their sigma_pos_m / sqrt(3); else the README default. The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
         },
         "nearest_view": {
           "oneOf": [
