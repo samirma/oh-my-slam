@@ -22,6 +22,10 @@ Commands:
 - `SKILL.md`: `uv run python -m oh_my_slam.service.skill` regenerates it after any API change;
   `tests/unit/test_service_skill.py` fails while it is stale.
 - Mapping features are SIFT (Homebrew `colmap` CLI); poses through pycolmap.
+- Evaluators (client-side, outside the package and its coverage rule; tests in
+  `tests/replay_eval/`): `python tools/replay_eval/replay_eval.py ...` and
+  `python tools/evaluate/evaluate.py [--url URL]` (specs/evaluation.md); thresholds in
+  `examples/targets.json`, keyed by evaluation.md's metric ids.
 
 Never import torch/open3d in the same process (duplicate libomp aborts): torch lives only in the
 inference server process. Never edit files in `.staging/` of a map.

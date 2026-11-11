@@ -165,8 +165,7 @@ def test_a_job_whose_frames_are_all_rejected_is_cheap(client: Client) -> None:
     blank = np.full((240, 320, 3), 128, np.uint8)
     blank[:, :2] = 0  # a different image, as bare
     files = {"p0": plain(320, 240), "p1": jpeg(blank)}
-    frames = [{"name": f"p{i}", "image": f"p{i}", "camera_id": "cam",
-               "prior": prior(base_pose(10 * i))} for i in range(2)]
+    frames = [{"name": f"p{i}", "image": f"p{i}", "camera_id": "cam"} for i in range(2)]
     t = time.perf_counter()
     job = client.update("m", frames, files, cameras={"cam": CAM})
     assert time.perf_counter() - t < 5.0
@@ -174,6 +173,45 @@ def test_a_job_whose_frames_are_all_rejected_is_cheap(client: Client) -> None:
     assert [i["reason"] for i in job["inputs"]] == ["plain", "plain"]
     assert job["scale_source"] is None and client.backend.infers == []
     client.get("/api/maps/m", status=404)
+
+
+def test_bare_frames_with_priors_are_kept_at_them(client: Client) -> None:
+    """A frame with a prior whose image fails a check is kept at its prior with that reason
+    (api.md §4): on a new map the first one is the origin, itself unconfirmed."""
+    blank = np.full((240, 320, 3), 128, np.uint8)
+    blank[:, :2] = 0
+    files = {"p0": plain(320, 240), "p1": jpeg(blank)}
+    frames = [{"name": f"p{i}", "image": f"p{i}", "camera_id": "cam",
+               "prior": prior(base_pose(10 * i))} for i in range(2)]
+    job = client.update("m", frames, files, cameras={"cam": CAM})
+    assert job["state"] == "committed"
+    assert [(i["status"], i["reason"]) for i in job["inputs"]] == [("kept_at_prior", "plain")] * 2
+    assert job["inputs"][1]["prior_residual_m"] == 0.0
+    assert job["inputs"][1]["sigma_pos_m"] == 0.02  # the prior's own sigma
+    assert job["quality"]["rejected_share"] == 0.0 and job["quality"]["max_displacement_m"] is None
+    rows = client.get("/api/maps/m/frames", "Frames")["frames"]
+    assert [f["pose_state"] for f in rows] == ["kept_at_prior"] * 2
+    # a camera-only frame then has no confirmed keyframe to register against
+    fr, files = frames_for(client, [base_pose(5)], tag="n", trust=None, depth=False)
+    job = client.update("m", fr, files)
+    assert (job["inputs"][0]["status"], job["inputs"][0]["reason"]) == ("rejected", "no_overlap")
+
+
+def test_every_frame_with_a_prior_rejected_creates_no_map(client: Client) -> None:
+    """map.md §1: the first update whose frames with a prior are all rejected is rejected
+    ``prior_frames_rejected``; the first-camera rule never applies with priors."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(20)], tag="a")
+    fr[0]["prior"] = prior(base_pose(0))
+    files["a1"] = b"not an image"
+    fr[1] = {**fr[1], "prior": {"trust": "none"}}
+    fr[0]["image"] = "a1"
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "rejected"
+    assert "prior_frames_rejected" in job["quality"]["failed_checks"]
+    assert job["inputs"][0]["reason"] == "unusable_image"
+    client.get("/api/maps/m", status=404)
+    d = dry(client, "m", fr, files, cameras={"cam": CAM})
+    assert "prior_frames_rejected" in d["quality"]["failed_checks"]
 
 
 def test_provisional_rejected_and_the_gate(client: Client) -> None:
@@ -186,22 +224,24 @@ def test_provisional_rejected_and_the_gate(client: Client) -> None:
     fr.append({"name": "a0", "image": "b0", "camera_id": "cam"})  # a duplicate name
     job = client.update("m", fr, files)
     assert [(i["status"], i["reason"]) for i in job["inputs"]] == [
-        ("provisional", "no_overlap"), ("rejected", "prior_conflict"), ("rejected", "duplicate")]
+        ("kept_at_prior", "no_overlap"), ("rejected", "prior_conflict"), ("rejected", "duplicate")]
     assert job["inputs"][0]["T_map_cam"] is not None
     assert job["inputs"][1]["T_map_cam"] is None and job["inputs"][1]["prior_residual_m"] > 0.3
     q = job["quality"]
-    assert q["rejected_share"] == round(2 / 3, 4) and q["low_confidence_share"] == 1.0
+    # low_confidence_share is over the registered frames: none here (map.md §4)
+    assert q["rejected_share"] == round(2 / 3, 4) and q["low_confidence_share"] == 0.0
+    assert job["inputs"][0]["prior_residual_m"] == 0.0
     frames = client.get("/api/maps/m/frames", "Frames")["frames"]
-    assert [f["pose_state"] for f in frames] == ["fused", "fused", "provisional"]
+    assert [f["pose_state"] for f in frames] == ["fused", "fused", "kept_at_prior"]
     summary = client.get("/api/maps/m", "MapSummary")
-    assert summary["provisional_frames"] == 1
+    assert summary["provisional_frames"] == 0  # the O3 state, not a kept frame
     # a gate that fails commits nothing
     fr, files = frames_for(client, [base_pose(10), T], tag="c", priors=[base_pose(10), off])
     job = client.update("m", fr, files, accept_if={"max_rejected_share": 0.2})
     assert job["state"] == "rejected" and job["quality"]["failed_checks"] == [
         "max_rejected_share"]
     assert job["result_version"] is None and client.service.store.latest("m") == 2
-    # the derived reads skip the provisional frame as a locate reference
+    # the derived reads skip the kept frame as a locate reference
     grid = client.get("/api/maps/m/grid?cell_m=0.1", "Grid")
     assert grid["map_version"] == 2
     assert client.service.derived is not None
@@ -259,8 +299,8 @@ def test_inference_failure_fails_the_job(client: Client) -> None:
 def test_an_all_rejected_job_on_an_anchored_map(client: Client) -> None:
     fr, files = frames_for(client, [base_pose(0)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
-    job = client.update("m", [{"name": "p", "image": "p", "camera_id": "cam",
-                               "prior": prior(base_pose(5))}], {"p": plain(320, 240)})
+    job = client.update("m", [{"name": "p", "image": "p", "camera_id": "cam"}],
+                        {"p": plain(320, 240)})
     assert job["state"] == "rejected" and job["quality"]["failed_checks"] == ["hard_limit"]
     assert job["quality"]["scale_ratio_vs_prev"] is None and job["scale_source"] is None
     assert client.service.store.latest("m") == 1
@@ -328,12 +368,13 @@ def test_dry_run_against_an_anchored_map(client: Client) -> None:
     fr.append({"name": "a0", "image": "b0", "camera_id": "cam"})
     out = dry(client, "m", fr, files, accept_if={"max_rejected_share": 0.1})
     rows = [(r["predicted_status"], r["predicted_reason"]) for r in out["frames"]]
-    assert rows == [("registered", None), ("rejected", "prior_conflict"), ("registered", None),
-                    ("rejected", "duplicate")]
+    assert rows == [("registered", None), ("rejected", "prior_conflict"),
+                    ("kept_at_prior", "no_overlap"), ("rejected", "duplicate")]
     assert out["frames"][0]["map_inliers"] > 50 and out["base_version"] == 1
     q = out["quality"]
     assert not q["accepted"] and q["failed_checks"] == ["max_rejected_share"]
-    assert q["prior_residuals"]["count"] == 2 and q["low_confidence_share"] == 0.5
+    assert q["prior_residuals"]["count"] == 2 and q["low_confidence_share"] == 0.0
+    assert out["scale_source"] == client.service.store.version("m")["scale_source"]
     assert client.service.store.latest("m") == 1  # nothing committed
 
 
@@ -544,9 +585,10 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
                                                              slip: float) -> None:
     """After a first textured frame the update's priors slip by 0.3 m: the one textured frame
     after the slip conflicts with its prior (rejected, a fifth of the update), and the bare
-    walls are placed by their priors and depth alone, which cannot see a slide along the wall.
-    Their residual to the map is the conflict's (``inherit_conflicts``): the gate rejects the
-    update, in the dry run too. The same update with priors that agree is accepted."""
+    walls are kept at their priors or placed by their depth, which cannot see a slide along the
+    wall. No stored keyframe moves: ``max_residual_m`` gates the stored keyframes only (map.md
+    §4), so the C6 gate parameters accept it; a client gate on ``max_rejected_share`` rejects
+    it, in the dry run too. The same update with priors that agree is accepted."""
     poses = [base_pose(30 * k) for k in range(6)]
     fr, files = frames_for(client, poses, tag="a", trust=trust)
     client.update("m", fr, files, cameras={"cam": CAM})
@@ -557,20 +599,23 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
                            priors=[new[0]] + [shift @ T for T in new[1:]])
     for k in (1, 3, 4):
         files[f"b{k}"] = _bare(k)
-    d = dry(client, "m", fr, files, accept_if=SKILL_GATE)
-    job = client.update("m", fr, files, accept_if=SKILL_GATE)
+    gate = {**SKILL_GATE, "max_rejected_share": 0.1}
+    d = dry(client, "m", fr, files, accept_if=gate)
+    job = client.update("m", fr, files, accept_if=gate)
     q = job["quality"]
     if slip == 0.0:
         assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"]
         assert [i["status"] for i in job["inputs"]] == ["registered"] * 5
         assert q["previous_residuals"]["max_m"] < 0.02
         return
-    assert job["state"] == "rejected" and "max_residual_m" in q["failed_checks"]
-    assert "max_residual_m" in d["quality"]["failed_checks"]
+    assert job["state"] == "rejected" and q["failed_checks"] == ["max_rejected_share"]
+    assert d["quality"]["failed_checks"] == ["max_rejected_share"]
     assert q["rejected_share"] == 0.2 and q["previous_residuals"]["max_m"] == 0.0  # none moved
     assert q["gauge_shift"]["translation_m"] == 0.0
     assert [i["reason"] for i in job["inputs"]][2] == "prior_conflict"
     assert client.service.store.latest("m") == 1
+    job = client.update("m", fr, files, accept_if=SKILL_GATE)
+    assert job["state"] == "committed"  # the C6 parameters alone do not see it
 
 
 def _jitter(T: np.ndarray, k: int) -> np.ndarray:
@@ -643,7 +688,7 @@ def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> N
     from types import SimpleNamespace
 
     from oh_my_slam.mapping.anchored import Placement
-    from oh_my_slam.service.prior_first import PARALLAX_MIN, displacements
+    from oh_my_slam.service.prior_first import PARALLAX_MIN, displacement_quality, displacements
 
     T = np.eye(4)
     far = np.eye(4)
@@ -658,6 +703,11 @@ def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> N
     near = np.eye(4)
     near[0, 3] = PARALLAX_MIN * 2.0 * 0.5
     got = displacements([pl(T), pl(near), pl(far), pl(T, method="rotation"),
-                         pl(T, "rejected"), pl(T, res=None), None], kfs)
-    assert got == [(0.0, 2.0), (0.0, 2.0), (0.3, 2.0), (0.3, 2.0)]
+                         pl(T, "rejected"), pl(T, "kept_at_prior"), pl(T, res=None), None], kfs)
+    # unconstrained in translation: rotation only (None in metres); kept and rejected left out
+    assert got == [(None, 2.0), (None, 2.0), (0.3, 2.0), (None, 2.0)]
     assert displacements([pl(T)], []) == [(0.3, 2.0)]
+    assert displacement_quality(got) == {"max_displacement_m": 0.3, "max_displacement_deg": 2.0}
+    assert displacement_quality([(None, 1.0)]) == {"max_displacement_m": None,
+                                                   "max_displacement_deg": 1.0}
+    assert displacement_quality([]) == {"max_displacement_m": None, "max_displacement_deg": None}

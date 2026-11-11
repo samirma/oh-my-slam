@@ -133,7 +133,8 @@ def centre_error(T: Any, ref: np.ndarray) -> float:
 def test_health_reports_the_inference_server_and_one_lane(client: Client) -> None:
     doc = client.get("/api/health", "Health")
     assert doc["service"] == "ready" and doc["inference"]["state"] == "ready"
-    assert doc["lanes"]["interactive"] == {"state": "idle", "queued": 0, "oldest_s": None}
+    # a single worker: one lane, the service's job worker (inference.md)
+    assert doc["lanes"] == {"worker": {"state": "idle", "queued": 0, "oldest_s": None}}
     assert doc["version"] == "test"
 
 
@@ -248,8 +249,8 @@ def test_a_conflicting_prior_is_rejected_and_the_frame_mapped_again_without_it(
 
 
 def test_drifting_priors_fix_the_frame_and_report_their_residuals(client: Client) -> None:
-    frames, files, truth = frames_of(client, 5, prior=lambda i, T: {"trust": "drifting",
-                                                                      "T_map_cam": T.tolist()})
+    frames, files, truth = frames_of(client, 5, prior=lambda i, T: {
+        "trust": "drifting", "T_map_cam": T.tolist(), "sigma_pos_m": 0.05, "sigma_rot_deg": 2.0})
     job = client.update("m", frames, files, {"cam": CAMERA})
     assert job["scale_source"] == "priors"
     for i, t in zip(job["inputs"], truth, strict=True):
@@ -321,7 +322,7 @@ def test_each_input_has_a_status_and_a_reason(client: Client) -> None:
 
     files["wall"] = plain()
     frames.append({"name": "wall", "image": "wall", "camera_id": "cam"})
-    near = client.backend.add(textured(77), WORLD[3])
+    near = client.backend.add(textured(77), WORLD[3], depth_m=0.15)  # as its depth PNG
     files["near"], files["nd"] = near, png16(np.full((240, 320), 150))
     frames.append({"name": "near", "image": "near", "camera_id": "cam", "depth": "nd"})
     lost = textured(78)
@@ -333,11 +334,14 @@ def test_each_input_has_a_status_and_a_reason(client: Client) -> None:
     frames.append({"name": "blur", "image": "blur", "camera_id": "cam"})
     files["dup"] = files["img0"]
     frames.append({"name": "dup", "image": "dup", "camera_id": "cam"})
+    client.backend.stats = {"observations": 120.0, "reproj_error": 0.6}  # below 300 inliers
     job = client.update("m", frames, files, {"cam": CAMERA})
     reasons = {i["name"]: (i["status"], i["reason"]) for i in job["inputs"]}
     assert reasons["f0_0"] == ("registered", None)
     assert reasons["wall"] == ("rejected", "plain")
     assert reasons["near"] == ("rejected", "too_close")
+    near_in = next(i for i in job["inputs"] if i["name"] == "near")
+    assert near_in["min_distance_m"] == 0.3 and near_in["scene_distance_m"] == 0.15
     assert reasons["lost"] == ("rejected", "no_overlap")
     assert reasons["blur"] == ("rejected", "blur")
     assert reasons["dup"] == ("rejected", "duplicate")
@@ -369,9 +373,19 @@ def test_a_suspicious_frame_is_measured_with_the_monocular_depth(client: Client)
 def test_a_registered_frame_whose_aligned_depth_is_too_close_is_rejected(client: Client) -> None:
     frames, files, truth = frames_of(client, 3)
     client.backend.depth_m[next(iter(client.backend.truth))] = 0.2  # img0, 0.2 m away
+    client.backend.stats = {"observations": 120.0, "reproj_error": 0.6}  # below 300 inliers
     job = client.update("m", frames, files, {"cam": CAMERA})
     assert job["inputs"][0]["reason"] == "too_close" and job["state"] == "committed"
+    assert job["inputs"][0]["scene_distance_m"] < 0.3
     assert len(client.backend.calls) == 2
+
+
+def test_a_well_registered_frame_is_never_too_close(client: Client) -> None:
+    """At least 300 inliers to the map: never rejected for distance alone (api.md §4)."""
+    frames, files, truth = frames_of(client, 3)
+    client.backend.depth_m[next(iter(client.backend.truth))] = 0.2  # 400 inliers (the fake's)
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    assert job["inputs"][0]["status"] == "registered" and len(client.backend.calls) == 1
 
 
 def test_nothing_registered_is_a_rejected_job_and_no_map(client: Client) -> None:
@@ -531,9 +545,6 @@ def one(**f: Any) -> dict[str, Any]:
     (one(prior={"trust": "metric"}), {}, "frames[0].prior"),
     (one(), {}, "frames[0].image"),
     ({**one(), "cameras": {}}, {"a": b"x"}, "frames[0].camera_id"),
-    ({"frames": one()["frames"] * 2, "cameras": {"cam": CAMERA}}, {"a": textured(1)},
-     "frames[1].name"),
-    (one(), {"a": b"not an image"}, "frames[0].image"),
     (one(depth="d"), {"a": textured(1), "d": textured(2)}, "frames[0].depth"),
     (one(depth="d"), {"a": textured(1), "d": png16(np.zeros((10, 10)))}, "frames[0].depth"),
     (one(depth="d"), {"a": textured(1), "d": b"junk"}, "frames[0].depth"),
@@ -562,9 +573,16 @@ def test_an_image_of_another_size_or_format_is_refused(client: Client) -> None:
 
     gif = io.BytesIO()
     Image.new("RGB", (320, 240)).save(gif, format="GIF")
-    for data in (textured(1, 100, 80), gif.getvalue()):
-        doc = client.post_update("m", one(), {"a": data}, status=400)
-        assert doc["error"]["details"]["field"] == "frames[0].image"
+    frames, files, truth = frames_of(client, 3)
+    for k, data in enumerate((textured(1, 100, 80), gif.getvalue(), b"not an image")):
+        files[f"bad{k}"] = data
+        frames.append({"name": f"bad{k}", "image": f"bad{k}", "camera_id": "cam"})
+    frames.append({"name": "f0_0", "image": "img1", "camera_id": "cam"})  # a name sent twice
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    # an unusable image or a repeated name is an input status, not an error (api.md §4)
+    assert job["state"] == "committed"
+    assert [(i["status"], i["reason"]) for i in job["inputs"][3:]] == \
+        [("rejected", "unusable_image")] * 3 + [("rejected", "duplicate")]
 
 
 def test_bodies_that_are_not_multipart_requests_are_refused(client: Client) -> None:
@@ -688,8 +706,8 @@ def test_a_queued_job_shows_in_health_and_the_summary(client: Client,
         time.sleep(0.01)
     j2 = client.post_update("m", {"frames": frames[1:]}, files)
     h = client.get("/api/health", "Health")
-    assert h["lanes"]["interactive"]["state"] == "busy" and h["lanes"]["interactive"]["queued"] == 1
-    assert h["lanes"]["interactive"]["oldest_s"] >= 0
+    assert h["lanes"]["worker"]["state"] == "busy" and h["lanes"]["worker"]["queued"] == 1
+    assert h["lanes"]["worker"]["oldest_s"] >= 0
     assert client.get("/api/maps/m", "MapSummary")["running_job"] == j1["job_id"]
     doc = client.http.delete("/api/maps/m")
     assert doc.status_code == 409 and client.check(doc, None)["error"]["code"] == "map_busy"
@@ -702,7 +720,7 @@ def test_health_counts_a_queued_job_before_the_worker_takes_it(client: Client) -
     client.service.jobs.stop(timeout=10)
     frames, files, _ = frames_of(client, 1)
     client.post_update("m", {"frames": frames, "cameras": {"cam": CAMERA}}, files)
-    h = client.get("/api/health", "Health")["lanes"]["interactive"]
+    h = client.get("/api/health", "Health")["lanes"]["worker"]
     assert h["state"] == "idle" and h["queued"] == 1 and h["oldest_s"] >= 0
 
 

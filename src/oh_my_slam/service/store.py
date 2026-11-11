@@ -33,6 +33,10 @@ from oh_my_slam.service.errors import ApiError, invalid
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROOT = "oms"  # under --data, beside what the earlier tools keep there
+# a version record's ``pose_states``: its frames' ``pose_state`` follows oms/2.2 (a frame kept at
+# its prior is ``kept_at_prior``). Earlier records named such frames ``provisional``, before the
+# O3 two-phase state existed: they are read as ``kept_at_prior`` (``version``)
+POSE_STATES = "oms/2.2"
 
 
 def utc(t: float) -> str:
@@ -121,6 +125,10 @@ class Store:
         except FileNotFoundError as exc:
             raise ApiError("version_gone", f"version {n} of map {name!r} is no longer kept",
                            {"map": name, "version": n, "latest_version": latest}) from exc
+        if out.get("pose_states") != POSE_STATES:
+            for r in out.get("frames", []):
+                if r.get("pose_state") == "provisional":
+                    r["pose_state"] = "kept_at_prior"
         return out
 
     def version_file(self, name: str, n: int, fname: str) -> Path:

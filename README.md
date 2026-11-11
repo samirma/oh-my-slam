@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.1) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.2) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
 status), **O5** (locate with uncertainty), **O6** (navigation grid, points near a place),
@@ -67,8 +67,8 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, must equal `specs/api.schema.json`; a test checks it),
-  and the tests validate every response body against it. Errors are `ErrorBody`
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.2; a test checks
+  it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
 * **Uploads.** A request body is at most 512 MiB (`app.UPLOAD_CAP_BYTES`); the data disk must
@@ -76,19 +76,27 @@ they need. New maps take the *prior-first registration* (below).
 * **Map names**: 1-64 letters, digits, `.`, `_`, `-`, starting with a letter or digit.
 * **Server-Timing** on every response: the request's stages (`upload`, `validate`) and `total`.
   A job's stages are in its body, `timings_s` (`checks`, `register`, `anchor`, `commit`, `total`).
-* **Lanes.** Until O3 the service has one job worker: `lanes.interactive` reports it (busy while a
-  job runs, the queue, the age of the oldest job); `lanes.bulk` is always idle.
+* **Lanes.** No lanes until O3: one job worker, reported as the single lane `lanes.worker` (busy
+  while a job runs, the queue, the age of the oldest job; inference.md). The inference server's
+  device queue is a priority queue: requests sent with `x-oms-priority: interactive` (dry runs:
+  `Backend.interactive`) run before every waiting fusion request (`server.gpu_worker`); locate
+  needs no inference.
 
 ### Update jobs (minimal until O3)
 
-`POST /api/maps/{name}/updates` validates the request synchronously (schema; unique frame names;
-every part present; images decodable 8-bit JPEG/PNG of their camera's size; depth 16-bit PNGs of
-that size; masks 8-bit PNGs; prior poses rigid; cameras not redefined, `camera_conflict`), refuses
+`POST /api/maps/{name}/updates` validates the request synchronously (schema; every part present;
+depth 16-bit PNGs of the camera's size; masks 8-bit PNGs; prior poses rigid; cameras not
+redefined, `camera_conflict`). A frame whose image does not decode as an 8-bit JPEG/PNG of its
+camera's size, or whose name is repeated, is no error: it is the input `rejected`
+`unusable_image` or `duplicate`. It refuses
 with `inference_unavailable` when the inference server is not ready, and
 answers `202` with the job (`queued`, `Location: /api/jobs/{id}`). One worker runs the jobs one at
 a time, in arrival order: `queued` → `registering` → `committed`, or `rejected` (the gate or a
 hard limit: nothing committed), or `failed` (`error`). A job commits one version;
-`provisional_version` stays null until O3, and every committed pose is `fused`. A client
+`provisional_version` stays null until O3; a committed pose is `fused`, or `kept_at_prior` for a
+frame its images did not confirm (`pose_state`; no frame is `provisional` before O3, and a
+version written before oms/2.2 that named such frames `provisional` is read as `kept_at_prior`,
+`store.POSE_STATES`). A client
 disconnect never touches a job; a job still running when the service stops is `failed` at the
 next start. Jobs are kept one hour after they end (`jobs/<id>.json`).
 
@@ -126,13 +134,17 @@ the version. A rejected or failed job leaves the map as it was.
   * first update with `metric` priors: the metric priors (their frame becomes the map frame);
     without metric but with `drifting` priors: the drifting ones; without priors: the first-camera
     rule (origin at the first registered frame in request order, +x its viewing direction on the
-    horizontal plane, +z up, from the mapper's gravity-aligned frame);
+    horizontal plane, +z up, from the mapper's gravity-aligned frame). With priors, when no frame
+    with a prior registers, the mapper cannot tie the map to the priors' frame: the update is
+    rejected `prior_frames_rejected` (the anchored engine, which new maps take, keeps such frames
+    at their priors instead);
   * every later update: the previous version's poses of the frames both versions hold, together
     with every metric prior of the map. The frame therefore never moves; a rebuild is aligned back.
   The fit is robust: hypotheses from single anchors (rotation and translation) and from pairs
   (scale), scored by the anchors within 3 sigmas (`K_SIGMA`), then a weighted Procrustes of centres
   (weight `1/σ_pos²`) and orientations (`1/(2σ_rot²)`) together on the inliers, refined up to three
-  times. Sigmas are floored at 1 cm and 0.5°; a prior without sigmas counts 5 cm and 2°.
+  times. Sigmas are floored at 1 cm and 0.5°; a prior without sigmas counts `metric` 5 cm / 2°,
+  `drifting` 20 cm / 5° (`anchor.default_sigmas`, api.md §3).
   The scale is fitted only when the inliers' centres spread over 5 position sigmas (a camera
   turning in place cannot fix it); otherwise it is held (first update: the next scale source;
   later: the previous version's).
@@ -164,27 +176,50 @@ the version. A rejected or failed job leaves the map as it was.
 
 `inputs[]` has one entry per frame, in request order: `registered` with `T_map_cam`,
 `sigma_pos_m`, `sigma_rot_deg` and `inliers` (the mapper's observations of the frame, or its
-multi-view refinement's matches), or `rejected` with a reason; `prior_residual_m/deg` whenever the
-frame has a prior and was placed.
+multi-view refinement's matches), `kept_at_prior` with its reason (a frame with a prior its
+images did not confirm: at its prior with the prior's sigmas, prior residual 0), or `rejected`
+with a reason; `prior_residual_m/deg` whenever the frame has a prior and was placed; with
+`too_close`, `min_distance_m` (0.30) and `scene_distance_m`.
 
 | Reason | When (`mapping.checks`, `service.update`) |
 | --- | --- |
-| `duplicate` | The name, or the exact image bytes, already in the map or earlier in the request. |
-| `too_close` | Median depth < 0.30 m: from the depth PNG, or the monocular depth model for a *suspicious* frame (< 150 SIFT features or texture < 0.05) — before mapping; or the mapper's aligned depth of a registered frame. |
+| `unusable_image` | The image does not decode as an 8-bit JPEG/PNG, or is not its camera's size. |
+| `duplicate` | A name the map or the request already holds (whatever the image), or the exact image bytes the map already has or an earlier frame of the request sent. |
+| `too_close` | Median scene depth < 0.30 m (`checks.TOO_CLOSE_M`): from the depth PNG, the monocular depth model for a *suspicious* frame (< 150 SIFT features or texture < 0.05), or the mapper's aligned depth — unless the frame registers with ≥ 300 inliers (`TOO_CLOSE_INLIERS`): decided after registration. A frame known to be that close that also fails a quality check is rejected before mapping. |
 | `plain` | Texture < 0.01: the share of pixels with an intensity gradient above 4 grey levels per pixel (Sobel/8) at 512 px. Bare walls 0.0003-0.0024; the 128 reference frames ≥ 0.0395. |
 | `blur` | Sharpness < 0.035: variance of the Laplacian at ≤ 1024 px over that at a quarter of the size. Reference frames ≥ 0.12; a Gaussian blur of σ ≥ 1.2 px < 0.035. |
 | `few_features` | < 20 SIFT keypoints at ≤ 1024 px (reference frames ≥ 27) before mapping; or not placed by the mapper with < 150. |
 | `no_overlap` | Not placed by the mapper (no verified link to the map), with ≥ 150 features. |
-| `prior_conflict` | Placed more than 3 sigmas (`K_SIGMA`, the prior's sigmas floored at 1 cm and 0.5°) from its metric prior, or from its drifting prior after the similarity that best fits the request's drifting priors. |
+| `prior_conflict` | Registered more than 3 of the prior's own sigmas (`K_SIGMA`; floored at 1 cm and 0.5°) from its metric prior, or from its drifting prior after the similarity that best fits the request's drifting priors; the mapper gives one hypothesis, so none lies nearer the prior. |
 
-Frames rejected before mapping never reach the mapper. A frame rejected after registration
-(`prior_conflict`, `too_close`) makes the job map once more without it, so it is not in the
-committed map (if the second registration rejects more, they stay in the mapper's map but not
-in the version). Nothing registered is the hard limit: the job is `rejected`
-(`failed_checks: ["hard_limit"]`). `accept_if` is applied to the report before the commit
-(`max_residual_m` against both residual maxima, `max_gauge_shift_m` against
-`gauge_shift.translation_m`, `max_rejected_share`). `low_confidence_share` counts registered
-frames with `sigma_pos_m` > 0.10 m or the mapper's low-confidence flag.
+`plain`, `blur` and `few_features` reject a frame without a prior before mapping; a frame with a
+metric or drifting prior is instead `kept_at_prior` with that reason (api.md §4), and so is one
+the mapper does not register. A frame rejected after registration (`prior_conflict`,
+`too_close`) makes the job map once more without it, so it is not in the committed map (if the
+second registration rejects more, they stay in the mapper's map but not in the version). Nothing
+registered is the hard limit: the job is `rejected` (`failed_checks: ["hard_limit"]`).
+`low_confidence_share` counts registered frames with `sigma_pos_m` > 0.10 m or the mapper's
+low-confidence flag, over the registered frames.
+
+**Quality and gate** (map.md §4, `update.gate`; the same for both engines and the dry run).
+`accept_if` is applied to the registration's report before the commit, each field on its own and
+only when given:
+
+| Field | Fails when |
+| --- | --- |
+| `max_residual_m` | `previous_residuals.max_m` (the stored keyframes' movement) exceeds it. Prior residuals and new-frame displacement never fail it. |
+| `max_gauge_shift_m` | `gauge_shift.translation_m` exceeds it. |
+| `max_displacement_m`, `max_displacement_deg` | `quality.max_displacement_m` / `_deg` (new frames' committed pose against their image-only pose) exceeds it; null (no measurable frame) passes. |
+| `max_prior_disagreement_deg` | `quality.prior_disagreement_deg` exceeds it. |
+| `max_rejected_share` | `rejected_share` (rejected over sent; `kept_at_prior` is not rejected) exceeds it. |
+
+`failed_checks` also lists `hard_limit` (nothing registered) and `prior_frames_rejected` (map.md
+§1: a map's first update whose every frame with a prior is rejected; nothing is committed). On
+the mapper's engine a registered frame's committed pose is its aligned image pose, so
+`max_displacement_*` are 0 (null without a registered frame), and `prior_disagreement_deg` is the
+largest angle, over pairs of registered frames with priors whose views (at their median scene
+depth, `mapping.anchored.frustum_points`) overlap by ≥ 50 % both ways, between the mapper's
+relative rotation and the priors': the mapper's rotations are the images' own.
 
 **Pose sigmas** are a documented proxy until the bundle adjustment's covariance is read: the
 registration's angular noise per observation `a` (the mean reprojection error over the focal
@@ -200,7 +235,8 @@ Anchored maps (below) report their own sigmas.
   `cand/mapanything-priors`) or `geometric` (`mapping.anchored`, as frames with priors). The
   frames with priors are registered first; the camera-only ones after them, against the map's
   confirmed keyframes (a new camera-only map's origin is the geometric engine's: the first-camera
-  rule). One MapAnything call per 4 new frames with up to 4 anchors (the most similar keyframes by
+  rule). This internal order is free (map.md §3): the objects are fused in request order after
+  every frame is placed, so a later observation still wins. One MapAnything call per 4 new frames with up to 4 anchors (the most similar keyframes by
   thumbnail among the 60 most recent); anchors closer than 0.30 m leave a call without depth images
   unposed (a turn in place). Its output is aligned rigidly on the anchors and scaled by the frames'
   depth images, else by the anchors' stored depth: the map's own depth scale, whose camera-height
@@ -208,53 +244,70 @@ Anchored maps (below) report their own sigmas.
   — never MapAnything's metres. A frame is registered where its depth agrees with the anchors'
   (`mapping.anchored.agreement`: ≥ 10 % of its points seen, ≥ 75 % of those within 10 % for depth
   images, 15 % between MapAnything's own depths), else `no_overlap` (`few_features` under 150
-  features); `too_close` under 0.30 m median depth. Out of memory halves the new frames per call,
+  features); `too_close` under 0.30 m median scene depth with fewer than 300 inliers. Out of memory halves the new frames per call,
   then keeps 2 anchors.
 * **Drifting odometry.** Its sigmas grow with the odometry's *path* since the last frame the images
-  confirmed (`Drift.observe`: every drifting prior seen, kept, provisional or rejected, across
+  confirmed (`Drift.observe`: every drifting prior seen, kept at its prior or rejected, across
   updates), not with the straight line between the two priors: a robot that drove away and came
   back has drifted with its path. Two consecutive strong conflicts whose image poses imply the same
   correction (`_same_drift`: one predicted from the other within 3 combined sigmas) re-anchor the
   odometry on the first, and both are placed again (a slip, a long unseen drive); a single one stays
   `prior_conflict`.
-* **Map consistency of unconfirmed frames.** A frame kept `provisional` at its prior (no image
-  pose) is checked against the depth the keyframes near it see (`AnchoredMap._map_consistency`):
-  when enough of its points are seen and fewer than 75 % agree (10 % depth images, 20 % monocular
-  after scaling by its median ratio to the map's), the median depth difference is its residual
-  (the new frames' displacement, so `max_residual_m` sees a warp), and beyond 3 position sigmas
-  plus the depth tolerance it is `prior_conflict` and not fused. Registered frames report the
-  residual of their committed pose to their image-only pose, as before.
-* **A warping update is rejected with priors too.** A frame that the update's priors alone place
-  — kept `provisional` at its prior, registered by depth geometry (which cannot see a slide along a
-  bare wall), or placed in position by a rotation fit — takes as its residual to the map
-  (the new frames' displacement, which `max_residual_m` checks) at least the largest disagreement the
-  update's prior conflicts measured: a conflict's image pose against its prior, or a depth that
-  contradicts the map at the prior (`mapping.anchored.inherit_conflicts`, in the update and the
-  dry run). Before, those frames reported no residual, and conflicting frames are rejected
-  rather than measured, so an update whose priors had slipped was accepted as long as fewer
-  than half its frames conflicted. Measured on the ray-cast room (a textured frame at its prior,
-  then priors slipped by 0.3 m: one textured frame, three bare walls with depth images; the
-  skill's gate `max_residual_m 0.10, max_gauge_shift_m 0.05, max_rejected_share 0.5`): metric
-  and drifting priors, accepted (previous residual max 3 mm, rejected share 0.2) → rejected
-  (`max_residual_m`, `max_gauge_shift_m`; previous residual max 0.30 m), and the dry run
-  predicts it; the same update with priors that agree is accepted (max 1 mm). An update without
-  a prior conflict reports what it did before (a consistent offset of metric priors is still
-  caught by the gauge shift from 0.1 m, a drifting prior's offset is the odometry's and is
-  absorbed).
+* **Kept at prior.** A frame with a prior that its images do not confirm is `kept_at_prior`
+  (`mapping.anchored._kept`): no image pose, an image pose looser than 2° or than max(0.10 m, twice
+  the prior's position sigma), an image pose beyond 3 prior sigmas without strong support
+  (reason `no_overlap`), or an image that failed a check (`plain`, `blur`, `few_features`; a frame
+  with a depth image is first tried by depth alignment, below). Its pose is the prior as placed —
+  a metric prior as given, a drifting one through the odometry's correction (`Drift.predict`) —
+  with the prior's sigmas (or the trust's defaults), for a drifting prior grown by the drift; its
+  prior residual is 0. It is stored and a keyframe for the update's later frames, never a locate
+  reference.
+* **Map consistency of kept frames.** A kept frame's depth is checked against the depth the
+  keyframes near it see (`AnchoredMap._map_consistency`): when enough of its points are seen and
+  fewer than 75 % agree (10 % depth images, 20 % monocular after scaling by its median ratio to the
+  map's), and the median depth difference exceeds 3 position sigmas plus the depth tolerance, its
+  depth contradicts the map: it is stored, not fused (its keyframe has no depth). It is never
+  `prior_conflict`: no image confirms another pose.
+* **`prior_conflict`** (api.md §4). An image pose beyond 3 of the prior's own sigmas (not
+  combined with the image's) with strong support (≥ 40 inliers, ≥ 30 % of the matches, and for a
+  metric prior ≥ 15 inliers on each of two references) rejects the frame, unless a supported
+  hypothesis lies near the prior (`_near_prior`): the lifted matches that reproject at the prior
+  within 3 of its sigmas' reach, refined on their own, with at least 0.25 of the best
+  hypothesis's inliers (`SUPPORT_MIN`) and its pose within 3 prior sigmas; the frame is then
+  registered on it.
+* **`too_close`.** The scene distance is the depth image's median, or for a suspicious frame its
+  monocular depth's at the map's scale; below 0.30 m, a frame is placed as any other and then
+  rejected `too_close` unless it has ≥ 300 inliers. On a new map the origin has no inliers: a too
+  close origin is rejected and the next frame with a prior becomes the origin; when every frame
+  with a prior is rejected there is no origin, the others are `no_overlap` and the job is
+  `prior_frames_rejected`.
+* **Priors against images** (map.md §1). A registered frame with a prior is compared with each
+  earlier registered frame with a prior of the same update whose view overlaps it by ≥ 50 % both
+  ways (`view_overlap`: the share of the points each matched inside the other's image): the
+  angle between the images' relative rotation and the priors' is `prior_disagreement_deg` (the
+  largest, 0 when none); beyond 3 of the two priors' combined rotation sigmas
+  (`hypot(σ_a, σ_b)`), the later frame's rotation is set from the images, relative to the earlier
+  frame's committed rotation (its prior residual then shows the correction). The dry run predicts
+  it on its placements.
+* **The new frames' displacement** (`quality.max_displacement_m/deg`, map.md §1,
+  `service.prior_first.displacements`): over the registered frames with an image-only pose (PnP
+  or a rotation fit), the committed pose against it. A frame registered by PnP whose baseline to
+  its nearest stored keyframe is below 0.02 of that keyframe's median depth (`PARALLAX_MIN`; 2 m
+  without one), and a rotation fit, count only their rotation; frames kept at their prior,
+  rejected, the origin, depth-aligned and MapAnything frames have no image-only pose and count
+  nowhere. Null when no frame counts. Before oms/2.2 this was folded into `max_residual_m`, with
+  the update's prior conflicts pushed onto every frame its priors alone placed
+  (`inherit_conflicts`, removed): a warping update is now caught by its `prior_conflict`
+  rejections (`max_rejected_share`), `max_displacement_*`, `gauge_shift` and, when the client asks
+  for it, `max_prior_disagreement_deg`.
 * **Gauge shift and residuals of the anchored engine.** Stored keyframes never move, so
   `gauge_shift` is the median movement of the previous version's frames between that version and
   the poses this one would commit (0 when none moved), and `previous_residuals` is over those
-  frames only (`count` = the previous version's frames): a stored keyframe that moves shows in
-  its `max_m`, which `max_residual_m` checks. The new frames' disagreement with the stored map
-  (their `map_residual` above: committed pose against image-only pose, with the inherited
-  conflicts) has no field in the oms/2.1 report; the gate checks its maximum with
-  `max_residual_m` too (`service.prior_first.displacements`, update and dry run). A frame
-  registered by PnP whose baseline to its nearest stored keyframe is below 0.02 of that
-  keyframe's median depth (`PARALLAX_MIN`; 2 m without one) turned in place: its image-only
-  translation is unconstrained, so only its rotation counts; a rotation fit's translation never
-  counts; rejected frames do not count. Before, both fields were computed from the new frames,
-  so a sweep closing on itself from one standpoint, whose image-only translations are noise,
-  failed a 0.05 m gauge gate (0.16 m) with nothing stored moved.
+  frames only (`count` = the previous version's frames, kept-at-prior ones included, map.md §1): a
+  stored keyframe that moves shows in its `max_m`, which `max_residual_m` checks. Before, both
+  fields were computed from the new frames, so a sweep closing on itself from one standpoint,
+  whose image-only translations are noise, failed a 0.05 m gauge gate (0.16 m) with nothing stored
+  moved.
 * **Keyframes without features or depth are no references.** A stored keyframe whose features or
   keypoint depths are missing (its `kf/<id>.npz` gone or partial) is skipped by registration,
   never an error. A dry run places its frames on several threads against one loaded map: a
@@ -267,9 +320,9 @@ Anchored maps (below) report their own sigmas.
   mean's own variance (`w² σ_img² + (1−w)² σ_prior²`, `w` from the weights the fusion used, which
   floor the image pose at 5 cm / 1°), for a drifting prior the inverse-variance combination; floored
   at 1 mm and 0.01° (no longer at 1 cm / 0.1°).
-* **Bare walls with depth.** A frame with a depth image and a metric or drifting prior is not
-  rejected `plain` or `few_features` by the checks (`update.DEPTH_PLACED`); when the images do not
-  place it, its depth is aligned on the depth of the keyframes near its prior
+* **Bare walls with depth.** A frame with a metric or drifting prior is not rejected `plain`,
+  `blur` or `few_features` by the checks (it is kept at its prior); with a depth image, or when the
+  images do not place it, its depth is aligned on the depth of the keyframes near its prior
   (`mapping.anchored.depth_icp`: point-to-plane Gauss-Newton, the prior a factor, so a wall fixes
   its normal and the prior the rest), and it is `registered` (`method: depth`) when its depth then
   agrees with theirs and the alignment stays within 3 sigmas of the prior. Measured on the
@@ -289,8 +342,14 @@ Anchored maps (below) report their own sigmas.
   priors are predicted along the request (the path grows frame by frame) and the re-anchoring rule
   applies as in the update. The update's checks run 4 frames at a time. Its predicted
   `quality` is the registration phase's, without fusion: `scale_ratio_vs_prev` 1 (fusion refines
-  the scale, map.md §3), `gauge_shift` and the residuals as the update computes them from the
-  placements; on a new anchored map `prior_gravity_deg` is the update's: the angle between the
+  the scale, map.md §3), `gauge_shift`, the residuals, `max_displacement_*` and
+  `prior_disagreement_deg` as the update computes them from the placements. `predicted_status`
+  is `registered`, `kept_at_prior` (a frame with a prior its images do not confirm, or whose image
+  failed a check) or `rejected`; with `too_close`, `min_distance_m` and `scene_distance_m`. Its
+  `scale_source` / `scale_sigma_rel`: an anchored map's own, a mapper map's version's; on a new
+  map metric priors spanning 0.3 m (σ √2 · median prior σ / span), else depth images (1 %), else
+  camera heights (median height σ over height, over √n), else monocular (10 %). Its inference
+  calls are interactive (served before fusion); on a new anchored map `prior_gravity_deg` is the update's: the angle between the
   up axis of the origin frame's prior (the first kept frame with a metric or drifting prior) and
   the gravity the monocular model sees in it (one inference call), null for a camera-only map.
 

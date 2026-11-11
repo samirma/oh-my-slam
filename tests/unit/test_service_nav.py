@@ -501,7 +501,9 @@ def test_versions_derive_incrementally_and_rebuild_when_a_pose_moves(
     moved[0]["T_map_cam"] = T.tolist()
     s.store.commit("house", {**rec, "frames": moved}, None)
     s.derived.get("house", 3)
-    assert len(calls) == len(moved)  # all of them again
+    # all of them again, but the frames kept at their prior that the mapper never placed (no
+    # internal frame: no depth to integrate)
+    assert len(calls) == len([f for f in moved if f.get("internal")]) < len(moved)
     for n in (1, 2, 3):  # the cache keeps CACHE_VERSIONS versions; older ones load again
         assert s.derived.get("house", n).version == n
     g = rooms_map.get("/api/maps/house/grid?version=1", "Grid")

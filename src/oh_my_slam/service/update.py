@@ -1,8 +1,12 @@
 """An update job (O1 anchored frame and priors, O4 per-input status; map.md §1, api.md §4).
 
-1. **Checks.** Each frame is measured (``checks``): a frame already in the map (same name or
-   same image bytes) or earlier in the request is a ``duplicate``; one that is ``too_close``,
-   ``plain``, ``blur`` or has ``few_features`` is rejected before it reaches the mapper.
+1. **Checks.** A frame whose image does not decode or does not have its camera's size is
+   ``unusable_image``; a frame whose name the map or the request already holds, or whose image
+   bytes the map already has, is a ``duplicate``. The others are measured (``checks``): one that
+   is ``plain``, ``blur`` or has ``few_features`` is rejected before it reaches the mapper, or
+   with a prior kept at it (``kept_at_prior``, api.md §4); the median scene depth is kept for
+   the distance limit (``too_close``), decided after registration (``too_close``: unless the
+   frame has ``TOO_CLOSE_INLIERS`` inliers).
 2. **Registration.** The other frames, rectified to their camera's canonical pinhole
    (``cameras``) with its intrinsics given to the mapper in place of EXIF and focal estimation,
    are mapped into a clone of the map's mapper map (``backend``): COLMAP SIFT, global or
@@ -15,8 +19,12 @@
    rebuild that re-estimates stored poses is aligned back onto them. The scale comes from the
    metric priors, else depth PNGs, else camera heights, else the monocular depth.
 4. **Post-checks.** A registered frame whose pose disagrees with its prior by more than
-   ``anchor.K_SIGMA`` sigmas is ``prior_conflict``; one whose aligned depth has a median below
-   ``checks.TOO_CLOSE_M`` is ``too_close``. If any, registration runs once more without them.
+   ``anchor.K_SIGMA`` of the prior's own sigmas is ``prior_conflict`` (the mapper gives one
+   hypothesis: none other lies near the prior); one whose scene depth is below
+   ``checks.TOO_CLOSE_M`` and that has fewer than ``TOO_CLOSE_INLIERS`` inliers is
+   ``too_close``. If any, registration runs once more without them. A frame with a prior that
+   the mapper does not register is ``kept_at_prior``: at its metric prior, or at its drifting
+   prior mapped by the similarity fitted on the update's registered drifting frames.
 5. **Quality and gate.** The quality report (map.md §4) and ``accept_if``; nothing registered is
    a hard limit. A passing job commits one version.
 """
@@ -36,10 +44,12 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.images import png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import anchor, checks
 from oh_my_slam.mapping.anchor import Anchor, Sim3
+from oh_my_slam.mapping.anchored import OVERLAP_MIN, floor_spread, frustum_points, view_overlap
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
 from oh_my_slam.service.cameras import (
     Camera,
@@ -51,7 +61,7 @@ from oh_my_slam.service.cameras import (
 )
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.jobs import Job
-from oh_my_slam.service.store import Store, clone_tree
+from oh_my_slam.service.store import POSE_STATES, Store, clone_tree
 from oh_my_slam.service.timings import FUSION_STAGES, Timings
 
 log = get_logger("oh_my_slam.service.update")
@@ -61,6 +71,7 @@ MIN_SCALE_SIGMA_REL = 0.005
 DEFAULT_HEIGHT_SIGMA_M = 0.02
 MIN_CAMERA_HEIGHT_M = 0.05  # internal camera heights below this tell no scale
 LOW_CONFIDENCE_SIGMA_M = 0.10  # registered frames above it count in low_confidence_share
+TOO_CLOSE_INLIERS = 300  # a frame this well registered is never too close (as mapping.anchored)
 SIGMA_POS_FLOOR_M = 0.01  # pose sigma proxy floors (README "Per-input status")
 SIGMA_ROT_FLOOR_DEG = 0.1
 DEFAULT_SCENE_DEPTH_M = 2.0
@@ -69,7 +80,6 @@ FLOOR_BINS = 50  # estimate_floor
 FLOOR_PEAK_SHARE = 0.25
 FLOOR_MIN_POINTS = 200
 JPEG_QUALITY = 95
-DEPTH_PLACED = ("plain", "few_features")  # reasons a frame with depth and a prior escapes
 CHECK_THREADS = 4  # frames measured at once (OpenCV releases the GIL)
 
 
@@ -86,6 +96,9 @@ class FrameWork:
     height_m: float | None = None
     height_sigma_m: float | None = None
     mask: bytes | None = None  # the frame's own ignore mask (PNG), combined with the camera's
+    # rejected before any check (api.md §4): ``duplicate`` (a name already in the request) or
+    # ``unusable_image`` (an image that does not decode or is not its camera's size)
+    reject: str | None = None
 
     @property
     def trust(self) -> str:
@@ -118,6 +131,8 @@ class _Frame:
     ignore: NDArray[np.bool_] | None = None  # its ignore mask on the canonical pinhole
     deferred: bool = False  # suspicious, its median depth not measured yet (``_check``)
     reason: str | None = None
+    scene_m: float | None = None  # its median scene depth (the distance limit), when measured
+    unconfirmed: str | None = None  # the check a frame with a prior failed: kept at its prior
     internal: InternalFrame | None = None
     pose: NDArray[np.float64] | None = None  # T_map_cam
     sigma_pos_m: float | None = None
@@ -137,6 +152,10 @@ class _Anchored:
     prior_gravity_deg: float | None = None
     scale_from_priors: bool = False
     scale_ratio_vs_prev: float | None = None
+    # the similarity from the map frame to the update's drifting priors' frame, fitted on its
+    # registered drifting frames (``_drifting_residuals``); None without any
+    drift_sim: Sim3 | None = None
+    prior_disagreement_deg: float = 0.0
 
 
 def _mat(T: Any) -> NDArray[np.float64]:
@@ -144,8 +163,7 @@ def _mat(T: Any) -> NDArray[np.float64]:
 
 
 def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
-    return (float(p.get("sigma_pos_m", anchor.DEFAULT_SIGMA_POS_M)),
-            float(p.get("sigma_rot_deg", anchor.DEFAULT_SIGMA_ROT_DEG)))
+    return anchor.prior_sigmas(p)
 
 
 def residual_stats(res: list[tuple[float, float]]) -> dict[str, Any] | None:
@@ -297,6 +315,9 @@ class Updater:
         shas = {r.get("sha256") for r in prev["frames"]} if prev else set()
         todo = []
         for fr in frames:
+            if fr.work.reject is not None:
+                fr.reason = fr.work.reject
+                continue
             if fr.work.name in names or fr.sha in shas:
                 fr.reason = "duplicate"
                 continue
@@ -335,25 +356,38 @@ class Updater:
             fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
             fr.mask_path = indir / f"{f.index:04d}.mask.png"
             fr.mask_path.write_bytes(png_bytes(fr.ignore.astype(np.uint8) * 255))
-        # the monocular depth ``too_close`` needs is measured once the path is known: the
-        # prior-first path gets it with the frame's depth (``_resolve_deferred``)
+        # the monocular depth the distance limit needs is measured once the path is known:
+        # the prior-first engine gets it with the frame's depth, the mapper's path and the dry
+        # run ask it (``_resolve_deferred``)
         fr.deferred = med is None and fr.measures.suspicious
-        fr.reason = checks.reason(fr.measures, med)
-        if fr.reason in DEPTH_PLACED and med is not None and f.trust in ("metric", "drifting"):
-            # a bare wall with a depth image and a prior is placed by both (the prior-first
-            # engine's depth registration), not rejected for its texture
-            fr.reason = None
+        fr.scene_m = med
+        Updater._verdict(fr)
+
+    @staticmethod
+    def _verdict(fr: _Frame) -> None:
+        """A measured frame's verdict before registration: a frame that fails a quality check
+        is rejected with it, or kept at its prior when it has one (api.md §4); a frame known to
+        be too close that also fails one cannot reach ``TOO_CLOSE_INLIERS``: ``too_close``."""
+        assert fr.measures is not None
+        r = checks.reason(fr.measures, None)
+        fr.reason = fr.unconfirmed = None
+        if r is not None and fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M:
+            fr.reason = "too_close"
+        elif r is not None and fr.work.trust in ("metric", "drifting"):
+            fr.unconfirmed = r
+        else:
+            fr.reason = r
 
     def _resolve_deferred(self, frames: list[_Frame]) -> None:
         """The median monocular depth of the suspicious frames, ``CHECK_THREADS`` asked at once
         (``too_close`` takes precedence over the other reasons): the mapper's path and the dry
         run."""
-        todo = [fr for fr in frames if fr.deferred]
+        todo = [fr for fr in frames if fr.deferred and fr.reason in (None, *checks.QUALITY)]
 
         def one(fr: _Frame) -> None:
-            assert fr.path is not None and fr.measures is not None
-            fr.reason = checks.reason(fr.measures, self.backend.median_depth(
-                fr.path, fr.cam.canonical()))
+            assert fr.path is not None
+            fr.scene_m = self.backend.median_depth(fr.path, fr.cam.canonical())
+            Updater._verdict(fr)
 
         with ThreadPoolExecutor(CHECK_THREADS) as pool:
             list(pool.map(one, todo))
@@ -377,7 +411,8 @@ class Updater:
         t = time.perf_counter()
         self._resolve_deferred(frames)
         tm["checks"] = round(tm["checks"] + time.perf_counter() - t, 3)
-        pre = {fr.work.index: fr.reason for fr in frames}
+        # frames rejected, or kept at their prior, by the checks never reach the mapper
+        pre = {fr.work.index: fr.reason or fr.unconfirmed for fr in frames}
         exclude: set[int] = set()
         result: tuple[Path, InternalMap, _Anchored, int] | None = None
         attempt = 0
@@ -388,6 +423,7 @@ class Updater:
                 break
             for fr in todo:  # a second attempt starts again from the checks' verdicts
                 fr.reason, fr.internal, fr.pose, fr.prior_residual = None, None, None, None
+                fr.unconfirmed = None
             t = time.perf_counter()
             mapper = workdir / f"mapper{attempt}"
             if self.store.mapper_dir(w.map).exists():
@@ -400,8 +436,7 @@ class Updater:
                     {fr.path: fr.mask_path for fr in todo if fr.path and fr.mask_path})
             except NothingRegisteredError:
                 for fr in todo:
-                    assert fr.measures is not None
-                    fr.reason = checks.unregistered_reason(fr.measures)
+                    self._unregistered(fr)
                 result = None
                 tm["register"] = round(tm.get("register", 0.0) + time.perf_counter() - t, 3)
                 break
@@ -419,8 +454,7 @@ class Updater:
             for fr in todo:
                 fr.internal = by_source.get(str(fr.path))
                 if fr.internal is None:
-                    assert fr.measures is not None
-                    fr.reason = checks.unregistered_reason(fr.measures)
+                    self._unregistered(fr)
             placed = [fr for fr in todo if fr.internal is not None]
             if not placed:
                 result = None
@@ -434,6 +468,20 @@ class Updater:
             exclude |= {fr.work.index for fr in post}
             attempt += 1
         self._finish(job, w, frames, prev, result)
+
+    @staticmethod
+    def _unregistered(fr: _Frame) -> None:
+        """A frame the mapper did not register: ``too_close`` when its scene is within the
+        distance limit, else kept at its prior when it has one (its images merely did not
+        confirm it), else rejected ``few_features`` or ``no_overlap``."""
+        assert fr.measures is not None
+        why = checks.unregistered_reason(fr.measures)
+        if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M:
+            fr.reason = "too_close"
+        elif fr.work.trust in ("metric", "drifting"):
+            fr.unconfirmed = why
+        else:
+            fr.reason = why
 
     def dry_run(self, w: UpdateWork) -> dict[str, Any]:
         """The ``DryRun`` of an update request (``service.dry_run``): nothing is written."""
@@ -533,7 +581,8 @@ class Updater:
             fr.pose = out.sim.pose(fr.internal.T)
             if fr.work.name in new_metric:
                 fr.prior_residual = anchor.residual(out.sim, new_metric[fr.work.name])
-        self._drifting_residuals(placed, out.sim)
+        out.drift_sim = self._drifting_residuals(placed, out.sim)
+        out.prior_disagreement_deg = self._prior_disagreement(placed, internal, out.sim)
         out.prior_residuals = [anchor.residual(out.sim, a) for a in metric]
         out.previous_residuals = [anchor.residual(out.sim, a) for a in previous]
         return out
@@ -612,12 +661,41 @@ class Updater:
         return float(np.sqrt(np.mean([anchor.residual(sim, a)[0] ** 2 for a in used])))
 
     @staticmethod
-    def _drifting_residuals(placed: list[_Frame], sim: Sim3) -> None:
+    def _prior_disagreement(placed: list[_Frame], internal: InternalMap, sim: Sim3) -> float:
+        """``prior_disagreement_deg`` (map.md §1): over the pairs of registered frames with a
+        metric or drifting prior that overlap by at least ``OVERLAP_MIN`` (both ways, their
+        views at their median scene depth), the largest angle between the images' relative
+        rotation and the priors'. The mapper's rotations are the images' own: the correction is
+        inherent."""
+        views = []
+        for fr in placed:
+            assert fr.internal is not None and fr.pose is not None
+            if fr.work.trust not in ("metric", "drifting"):
+                continue
+            assert fr.work.prior is not None
+            d = internal.depth(fr.internal.name)
+            med = None if d is None else checks.median_depth(d)
+            K = fr.cam.canonical()
+            depth = med * sim.s if med is not None else DEFAULT_SCENE_DEPTH_M
+            views.append((fr.pose, K, frustum_points(fr.pose, K, depth),
+                          _mat(fr.work.prior["T_map_cam"])))
+        worst = 0.0
+        for i, (Ta, Ka, Xa, Pa) in enumerate(views):
+            for Tb, Kb, Xb, Pb in views[i + 1:]:
+                if min(view_overlap(Xa, Tb, Kb), view_overlap(Xb, Ta, Ka)) < OVERLAP_MIN:
+                    continue
+                img = Ta[:3, :3].T @ Tb[:3, :3]
+                worst = max(worst, anchor.rotation_deg(img.T @ (Pa[:3, :3].T @ Pb[:3, :3])))
+        return round(worst, 3)
+
+    @staticmethod
+    def _drifting_residuals(placed: list[_Frame], sim: Sim3) -> Sim3 | None:
         """Residuals of drifting priors: after the similarity that best brings the request's
-        aligned poses onto them (their frame drifts; their relative motion is reliable)."""
+        aligned poses onto them (their frame drifts; their relative motion is reliable).
+        Returns that similarity (map frame to the priors' frame), None without any."""
         drift = [fr for fr in placed if fr.work.trust == "drifting"]
         if not drift:
-            return
+            return None
         anchors = []
         for fr in drift:
             assert fr.internal is not None and fr.work.prior is not None
@@ -627,6 +705,7 @@ class Updater:
         fit = anchor.fit(anchors)
         for fr, a in zip(drift, anchors, strict=True):
             fr.prior_residual = anchor.residual(fit.sim, a)
+        return fit.sim
 
     def _post_check(self, placed: list[_Frame], anchored: _Anchored, internal: InternalMap
                     ) -> list[_Frame]:
@@ -634,6 +713,8 @@ class Updater:
         for fr in placed:
             assert fr.internal is not None
             if fr.prior_residual is not None and fr.work.prior is not None:
+                # beyond 3 of the prior's own sigmas (floored as the anchors' noise), and the
+                # mapper's one hypothesis is the only one: none lies near the prior
                 sp, sr = _prior_sigmas(fr.work.prior)
                 dp, dr = fr.prior_residual
                 if (dp > anchor.K_SIGMA * max(sp, anchor.MIN_SIGMA_POS_M)
@@ -643,7 +724,10 @@ class Updater:
                     continue
             d = internal.depth(fr.internal.name)
             med = None if d is None else checks.median_depth(d)
-            if med is not None and med * anchored.sim.s < checks.TOO_CLOSE_M:
+            if med is not None:
+                fr.scene_m = med * anchored.sim.s
+            if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M \
+                    and _inliers(fr.internal) < TOO_CLOSE_INLIERS:
                 fr.reason = "too_close"
                 out.append(fr)
         return out
@@ -655,13 +739,21 @@ class Updater:
         t = time.perf_counter()
         registered = [fr for fr in frames if fr.reason is None and fr.internal is not None]
         record: dict[str, Any] | None = None
-        anchored = None
+        anchored = None if result is None else result[2]
+        kept = [fr for fr in frames if fr.reason is None and fr.unconfirmed is not None]
+        for fr in kept:
+            self._keep_at_prior(fr, anchored)
         if result is not None:
             _, internal, anchored, objects = result
-            record = self._record(job, frames, registered, prev, internal, anchored, objects)
+            record = self._record(job, frames, registered + kept, prev, internal, anchored,
+                                  objects)
         job.inputs = [self._input(fr) for fr in frames]
-        quality = self._quality(frames, registered, prev, anchored, w.accept_if,
-                                result is not None and result[1].rebuilt)
+        # the mapper's engine ties kept frames to the map frame only through registered ones:
+        # a first update without a registered frame with a prior cannot fix the priors' frame
+        no_prior = prev is None and any(fr.work.trust in ("metric", "drifting") for fr in frames) \
+            and not any(fr.work.trust in ("metric", "drifting") for fr in registered)
+        quality = self._quality(frames, registered, kept, prev, anchored, w.accept_if,
+                                result is not None and result[1].rebuilt, no_prior)
         job.quality = quality
         if anchored is not None:
             job.scale_source, job.scale_sigma_rel = anchored.scale_source, round(
@@ -676,6 +768,20 @@ class Updater:
         job.state = "committed"
         job.progress = 1.0
         job.timings_s["commit"] = round(time.perf_counter() - t, 3)
+
+    @staticmethod
+    def _keep_at_prior(fr: _Frame, anchored: _Anchored | None) -> None:
+        """A frame kept at its prior (api.md §4): a metric prior as given, a drifting one mapped
+        into the map frame by the update's drift estimate (``_Anchored.drift_sim``, else as
+        given), with the prior's sigmas; prior residual 0."""
+        p = fr.work.prior
+        assert p is not None
+        P = _mat(p["T_map_cam"])
+        if p["trust"] == "drifting" and anchored is not None and anchored.drift_sim is not None:
+            P = anchored.drift_sim.inverse().pose(P)
+        fr.pose = P
+        fr.sigma_pos_m, fr.sigma_rot_deg = _prior_sigmas(p)
+        fr.prior_residual = (0.0, 0.0)
 
     def _record(self, job: Job, frames: list[_Frame], registered: list[_Frame],
                 prev: dict[str, Any] | None, internal: InternalMap, anchored: _Anchored,
@@ -698,16 +804,19 @@ class Updater:
             sp, sr = pose_sigmas(f, depth_m(f), anchored.align_rms_m)
             out.append({**r, "T_map_cam": sim.pose(f.T).tolist(), "sigma_pos_m": sp,
                         "sigma_rot_deg": sr})
-        for fr in registered:
-            assert fr.internal is not None and fr.pose is not None
-            fr.sigma_pos_m, fr.sigma_rot_deg = pose_sigmas(fr.internal, depth_m(fr.internal),
-                                                           anchored.align_rms_m)
+        for fr in sorted(registered, key=lambda fr: fr.work.index):
+            assert fr.pose is not None
+            if fr.internal is not None:
+                fr.sigma_pos_m, fr.sigma_rot_deg = pose_sigmas(
+                    fr.internal, depth_m(fr.internal), anchored.align_rms_m)
             p = fr.work.prior
             out.append({"name": fr.work.name, "camera_id": fr.work.camera_id,
-                        "internal": fr.internal.name, "T_map_cam": fr.pose.tolist(),
+                        "internal": None if fr.internal is None else fr.internal.name,
+                        "T_map_cam": fr.pose.tolist(),
                         "sigma_pos_m": fr.sigma_pos_m, "sigma_rot_deg": fr.sigma_rot_deg,
-                        "pose_state": "fused", "added_version": version, "sha256": fr.sha,
-                        "inliers": _inliers(fr.internal),
+                        "pose_state": "fused" if fr.internal is not None else "kept_at_prior",
+                        "added_version": version, "sha256": fr.sha,
+                        "inliers": 0 if fr.internal is None else _inliers(fr.internal),
                         "prior": p if p is not None and p["trust"] == "metric" else None})
         centres = np.array([np.asarray(r["T_map_cam"])[:3, 3] for r in out])
         if internal.bounds is not None:
@@ -718,35 +827,39 @@ class Updater:
         else:
             pts = centres
         floor = None
+        floor_sigma = FLOOR_SIGMA_DEFAULT_M  # the version's one floor estimate (map.md §5)
         floor_z = map_floor(internal)
         if floor_z is not None:
             c = np.array([*np.mean([f.T[:2, 3] for f in internal.frames], axis=0), floor_z])
             floor = round(float(sim.point(c)[2]), 4)
+            if internal.points_z is not None:
+                floor_sigma = floor_spread(internal.points_z, floor_z) * sim.s
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "scale_source": anchored.scale_source,
                 "scale_sigma_rel": round(anchored.scale_sigma_rel, 5), "frames": out,
-                "objects": objects, "floor_z_m": floor,
+                "objects": objects, "floor_z_m": floor, "floor_sigma_m": round(floor_sigma, 4),
+                "pose_states": POSE_STATES,
                 "bounds_m": {"min": pts.min(0).round(4).tolist(),
                              "max": pts.max(0).round(4).tolist()}}
 
     @staticmethod
     def _input(fr: _Frame) -> dict[str, Any]:
+        from oh_my_slam.service.prior_first import input_row
+
         ok = fr.reason is None and fr.internal is not None
-        res = fr.prior_residual
-        return {"name": fr.work.name, "status": "registered" if ok else "rejected",
-                "reason": None if ok else fr.reason,
-                "inliers": _inliers(fr.internal) if fr.internal is not None else 0,
-                "T_map_cam": fr.pose.round(6).tolist() if ok and fr.pose is not None else None,
-                "sigma_pos_m": fr.sigma_pos_m if ok else None,
-                "sigma_rot_deg": fr.sigma_rot_deg if ok else None,
-                "prior_residual_m": None if res is None else round(res[0], 4),
-                "prior_residual_deg": None if res is None else round(res[1], 3)}
+        status = "registered" if ok else "kept_at_prior" if fr.reason is None \
+            and fr.unconfirmed is not None else "rejected"
+        return input_row(fr.work.name, status,
+                         fr.unconfirmed if status == "kept_at_prior" else fr.reason,
+                         _inliers(fr.internal) if fr.internal is not None else 0, fr.pose,
+                         fr.sigma_pos_m, fr.sigma_rot_deg, fr.prior_residual, fr.scene_m)
 
     @staticmethod
-    def _quality(frames: list[_Frame], registered: list[_Frame], prev: dict[str, Any] | None,
-                 anchored: _Anchored | None, accept_if: dict[str, float] | None,
-                 rebuilt: bool) -> dict[str, Any]:
-        rejected = sum(fr.reason is not None or fr.internal is None for fr in frames)
+    def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],
+                 prev: dict[str, Any] | None, anchored: _Anchored | None,
+                 accept_if: dict[str, float] | None, rebuilt: bool, no_prior: bool
+                 ) -> dict[str, Any]:
+        rejected = len(frames) - len(registered) - len(kept)
         low = sum((fr.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
                   or (fr.internal is not None and fr.internal.low_confidence) for fr in registered)
         prior_res = residual_stats(anchored.prior_residuals) if anchored else None
@@ -755,33 +868,47 @@ class Updater:
         q: dict[str, Any] = {
             "scale_ratio_vs_prev": None if prev is None or anchored is None
             else anchored.scale_ratio_vs_prev,
-            "gauge_shift": gauge, "prior_residuals": prior_res, "previous_residuals": prev_res,
+            "gauge_shift": gauge,
+            # a registered frame's committed pose is its aligned image pose: no displacement
+            "max_displacement_m": 0.0 if registered else None,
+            "max_displacement_deg": 0.0 if registered else None,
+            "prior_disagreement_deg": anchored.prior_disagreement_deg if anchored else 0.0,
+            "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),
             "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
             "rebuilt": rebuilt,
             "prior_gravity_deg": None if prev is not None or anchored is None
             else anchored.prior_gravity_deg,
         }
-        return gate(q, bool(registered), accept_if)
+        return gate(q, bool(registered), accept_if, no_prior)
 
 
 def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None,
-         displacement_m: float = 0.0) -> dict[str, Any]:
+         prior_frames_rejected: bool = False) -> dict[str, Any]:
     """``accepted`` and ``failed_checks`` of a quality report (map.md §4): nothing kept is the
-    hard limit; ``accept_if`` checks the residual maxima (with ``displacement_m``, the new
-    frames' largest disagreement with the stored map, which the report has no field for), the
-    gauge shift and the rejected share."""
-    prior_res, prev_res, gauge = q["prior_residuals"], q["previous_residuals"], q["gauge_shift"]
+    hard limit, and a map's first update whose frames with a prior are all rejected is
+    ``prior_frames_rejected`` (map.md §1). ``accept_if`` checks, each on its own and only when
+    given: ``max_residual_m`` on ``previous_residuals.max_m`` (stored keyframes only; prior
+    corrections never fail it), ``max_gauge_shift_m``, ``max_displacement_m`` and
+    ``max_displacement_deg`` (a null value passes), ``max_prior_disagreement_deg`` and
+    ``max_rejected_share``."""
+    prev_res, gauge = q["previous_residuals"], q["gauge_shift"]
     failed = []
     if not kept_any:
         failed.append("hard_limit")
+    if prior_frames_rejected:
+        failed.append("prior_frames_rejected")
     a = accept_if or {}
-    if "max_residual_m" in a:
-        worst = max([r["max_m"] for r in (prior_res, prev_res) if r] + [displacement_m])
-        if worst > a["max_residual_m"]:
-            failed.append("max_residual_m")
+    if "max_residual_m" in a and prev_res and prev_res["max_m"] > a["max_residual_m"]:
+        failed.append("max_residual_m")
     if "max_gauge_shift_m" in a and gauge and gauge["translation_m"] > a["max_gauge_shift_m"]:
         failed.append("max_gauge_shift_m")
+    for key in ("max_displacement_m", "max_displacement_deg"):
+        if key in a and q[key] is not None and q[key] > a[key]:
+            failed.append(key)
+    if "max_prior_disagreement_deg" in a \
+            and q["prior_disagreement_deg"] > a["max_prior_disagreement_deg"]:
+        failed.append("max_prior_disagreement_deg")
     if "max_rejected_share" in a and q["rejected_share"] > a["max_rejected_share"]:
         failed.append("max_rejected_share")
     q["accepted"] = not failed

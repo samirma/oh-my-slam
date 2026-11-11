@@ -165,6 +165,15 @@ def _rotation_ok(T: list[list[float]]) -> bool:
             and float(np.linalg.det(R)) > 0 and bool(np.isfinite(M).all()))
 
 
+def _usable(image: bytes, cam: dict[str, Any]) -> bool:
+    """Whether a frame's image decodes as RGB at its camera's size."""
+    try:
+        rgb = decode_rgb(image, "image")
+    except ApiError:
+        return False
+    return bool(rgb.shape[:2] == (cam["height"], cam["width"]))
+
+
 def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, bytes],
                 pending: dict[str, dict[str, Any]] | None = None) -> UpdateWork:
     """The job of a valid ``UpdateRequest``, with the cameras (and ignore masks) it adds to the
@@ -206,19 +215,16 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
     frames = []
     for i, f in enumerate(req["frames"]):
         field = f"frames[{i}]"
-        if f["name"] in seen:
-            raise invalid(f"{field}.name", f"{field}.name {f['name']!r} is not unique in the "
-                          "request")
+        # a repeated name is the frame's input status, not an error (api.md §3-§4)
+        reject = "duplicate" if f["name"] in seen else None
         seen.add(f["name"])
         cam = cameras.get(f["camera_id"])
         if cam is None:
             raise invalid(f"{field}.camera_id", f"{field}.camera_id {f['camera_id']!r} is "
                           "neither in the request's cameras nor known to the map")
         image = part(f"{field}.image", f["image"])
-        rgb = decode_rgb(image, f"{field}.image")
-        if rgb.shape[:2] != (cam["height"], cam["width"]):
-            raise invalid(f"{field}.image", f"{field}.image is {rgb.shape[1]}x{rgb.shape[0]}; "
-                          f"camera {f['camera_id']!r} is {cam['width']}x{cam['height']}")
+        if reject is None and not _usable(image, cam):
+            reject = "unusable_image"  # it does not decode, or is not its camera's size
         depth = None
         if "depth" in f:
             depth = part(f"{field}.depth", f["depth"])
@@ -239,7 +245,8 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
             raise invalid(f"{field}.prior.T_map_cam", f"{field}.prior.T_map_cam is not a rigid "
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
-                                f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask))
+                                f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask,
+                                reject))
     return UpdateWork(name, frames, req.get("accept_if"), new, masks)
 
 
@@ -264,10 +271,10 @@ class Api:
             "version": self.s.version, "service": "stopping" if self.s.stopping else "ready",
             "inference": inference, "capabilities": CAPABILITIES,
             "timings": self.s.timings.body(),
-            "lanes": {"interactive": {"state": "busy" if running else "idle",
-                                      "queued": len(queued),
-                                      "oldest_s": None if oldest is None else round(oldest, 3)},
-                      "bulk": {"state": "idle", "queued": 0, "oldest_s": None}}})
+            # no lanes: one lane, the service's single job worker (inference.md)
+            "lanes": {"worker": {"state": "busy" if running else "idle",
+                                 "queued": len(queued),
+                                 "oldest_s": None if oldest is None else round(oldest, 3)}}})
 
     async def openapi(self, request: Request) -> Response:
         return JSONResponse(openapi.build(self.s.version))
@@ -379,6 +386,8 @@ class Api:
         assert cell is not None and z_min is not None and z_max is not None and cap is not None
         if z_max <= z_min:
             raise invalid("z_max", f"z_max ({z_max}) must be above z_min ({z_min})")
+        if cap <= 0:
+            raise invalid("height_cap_m", f"height_cap_m ({cap}) must be above the floor (> 0)")
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         _stage(request, "derive", t0)
         t1 = time.perf_counter()
@@ -387,8 +396,6 @@ class Api:
         _stage(request, "grid", t1)
         self.s.timings.add("grid_read", time.perf_counter() - t0)
         return body(answer.body)
-        if cap <= 0:
-            raise invalid("height_cap_m", f"height_cap_m ({cap}) must be above the floor (> 0)")
 
     async def get_objects(self, request: Request) -> Response:
         t0 = time.perf_counter()

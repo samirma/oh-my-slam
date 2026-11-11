@@ -12,9 +12,12 @@ Every frame of an update is measured before it reaches the mapper:
 * the median depth, from the frame's depth PNG, or from the monocular depth model for frames
   whose features or texture are low (``suspicious``).
 
-A frame is rejected before mapping when it is ``too_close``, ``plain``, ``blur`` or has
-``few_features``, in that order of precedence: such frames registered wrongly, or warped the
-map, in the field."""
+A frame fails a quality check when it is ``plain``, ``blur`` or has ``few_features``, in that
+order of precedence: such frames registered wrongly, or warped the map, in the field. Without a
+prior it is rejected before mapping; with one it is kept at its prior (api.md §4). ``too_close``
+is the distance limit alone (``TOO_CLOSE_M``); an update decides it after registration, since a
+well registered frame is never rejected for distance (``reason`` with a depth is the locate
+and dry-run order of precedence)."""
 
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ FEW_FEATURES = 20  # the reference frames >= 27 (a bare ceiling with a door fram
 SUSPECT_FEATURES = 150  # below this (or a low texture) the median depth is measured
 SUSPECT_TEXTURE = 0.05
 TOO_CLOSE_M = 0.30  # median depth along the optical axis
+QUALITY = ("plain", "blur", "few_features")  # the quality checks
 
 
 @dataclass(frozen=True)

@@ -35,6 +35,8 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import register_ma
 from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import (
+    TOO_CLOSE_INLIERS,
+    TOO_CLOSE_M,
     AnchoredMap,
     FrameIn,
     Keyframe,
@@ -54,7 +56,7 @@ from oh_my_slam.segmentation.api import (
     raised_regions,
 )
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
-from oh_my_slam.service.store import clone_tree
+from oh_my_slam.service.store import POSE_STATES, clone_tree
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -130,6 +132,11 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
     out = []
     for fr in frames:
         p = res.placements[fr.work.index]
+        if p.status != "rejected" and too_close(fr.scene_m, p.inliers):
+            out.append(Placement(fr.work.name, "rejected", "too_close", inliers=p.inliers,
+                                 scene_m=fr.scene_m))
+            progress(f"{fr.work.name}: rejected (too_close)")
+            continue
         if p.status == "rejected":
             out.append(Placement(fr.work.name, "rejected", p.reason))
             progress(f"{fr.work.name}: rejected ({p.reason})")
@@ -155,24 +162,41 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
     return out, reg_s, time.perf_counter() - t
 
 
+def too_close(scene_m: float | None, inliers: int) -> bool:
+    """The distance limit (api.md §4): a median scene depth below ``TOO_CLOSE_M``, unless the
+    frame has at least ``TOO_CLOSE_INLIERS`` inliers."""
+    return scene_m is not None and scene_m < TOO_CLOSE_M and inliers < TOO_CLOSE_INLIERS
+
+
 def displacements(pls: list[Placement | None], stored: list[Keyframe]
-                  ) -> list[tuple[float, float]]:
-    """The new frames' disagreement with the stored map (m, deg): each kept frame's committed
-    pose against its image-only pose on the stored map (``Placement.map_residual``, which also
-    carries the update's prior conflicts onto the frames its priors alone placed). A frame
-    registered by PnP that turned in place (``PARALLAX_MIN``) counts only its rotation."""
-    out = []
+                  ) -> list[tuple[float | None, float]]:
+    """The new frames' disagreement with the stored map (map.md §1): each registered frame's
+    committed pose against its image-only pose (``Placement.map_residual``), as (m or None,
+    deg). Frames kept at their prior or rejected have no image-only pose and are left out; a
+    frame whose image pose is unconstrained in translation — rotation-only, or registered by PnP
+    with a parallax to its nearest stored keyframe below ``PARALLAX_MIN`` — counts only its
+    rotation (None in metres)."""
+    out: list[tuple[float | None, float]] = []
     for pl in pls:
-        if pl is None or pl.status == "rejected" or pl.map_residual is None:
+        if pl is None or pl.status != "registered" or pl.map_residual is None:
             continue
-        dp, dr = pl.map_residual
-        if pl.status == "registered" and pl.method == "pnp" and stored and pl.T is not None:
+        dp: float | None = pl.map_residual[0]
+        if pl.method == "rotation":
+            dp = None
+        elif pl.method == "pnp" and stored and pl.T is not None:
             d = [float(np.linalg.norm(k.centre - pl.T[:3, 3])) for k in stored]
             k = stored[int(np.argmin(d))]
             if min(d) < PARALLAX_MIN * (k.median_depth or PARALLAX_DEPTH_M):
-                dp = 0.0
-        out.append((dp, dr))
+                dp = None
+        out.append((dp, pl.map_residual[1]))
     return out
+
+
+def displacement_quality(moved: list[tuple[float | None, float]]) -> dict[str, float | None]:
+    """``max_displacement_m`` and ``max_displacement_deg`` (map.md §4), null without any."""
+    m = [d for d, _ in moved if d is not None]
+    return {"max_displacement_m": round(max(m), 4) if m else None,
+            "max_displacement_deg": round(max(r for _, r in moved), 3) if moved else None}
 
 
 def detection_grid(K: Intrinsics) -> tuple[int, int]:
@@ -218,8 +242,10 @@ def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[l
             dets = closer(fr.path, regions, dets, (shape[1], shape[0]))
         views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, kf.grid,
                           _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore, rel))
-    floor, _ = am.floor_and_bounds()
-    struck = om.update(views, version, floor)
+    # the version's one floor estimate (map.md §5): the objects' and, through the version
+    # record, the grid's (``run_anchored``: ``om.floor_z``, ``om.floor_sigma``)
+    floor, floor_sigma = am.floor()
+    struck = om.update(views, version, floor, floor_sigma)
     if struck:
         am.cloud.drop(om.carve(struck, am.cloud.points()))
     top = max((float(k.centre[2]) for k in am.keyframes), default=None)
@@ -240,7 +266,7 @@ def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
         fr.cam.height_above_floor_m, fr.cam.height_sigma_m)
     return FrameIn(f.name, f.camera_id, fr.rgb, fr.cam.canonical(), prior, fr.depth_m, fr.ignore,
                    height, sigma, fr.measures.features, None if mono is None else _waiter(mono),
-                   check_close=fr.deferred)
+                   check_close=fr.deferred, unconfirmed=fr.unconfirmed)
 
 
 def _has_depth(fr: _Frame) -> bool:
@@ -248,19 +274,40 @@ def _has_depth(fr: _Frame) -> bool:
 
 
 def _input(fr: _Frame, pl: Placement | None) -> dict[str, Any]:
+    """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed."""
     if pl is None:  # rejected by the checks
-        return {"name": fr.work.name, "status": "rejected", "reason": fr.reason, "inliers": 0,
-                "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
-                "prior_residual_m": None, "prior_residual_deg": None}
-    kept = pl.status != "rejected"
+        return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
+                         fr.scene_m)
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
-    return {"name": fr.work.name, "status": pl.status, "reason": pl.reason,
-            "inliers": pl.inliers,
-            "T_map_cam": pl.T.round(6).tolist() if kept and pl.T is not None else None,
-            "sigma_pos_m": pl.sigma_pos_m if kept else None,
-            "sigma_rot_deg": pl.sigma_rot_deg if kept else None,
-            "prior_residual_m": None if res is None else round(res[0], 4),
-            "prior_residual_deg": None if res is None else round(res[1], 3)}
+    return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
+                     pl.sigma_rot_deg, res, pl.scene_m)
+
+
+def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
+              sigma_pos_m: float | None, sigma_rot_deg: float | None,
+              residual: tuple[float, float] | None, scene_m: float | None) -> dict[str, Any]:
+    """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
+    null without a prior, and with reason ``too_close`` the distance limit and the frame's
+    median scene depth."""
+    kept = status != "rejected"
+    row = {"name": name, "status": status, "reason": reason, "inliers": inliers,
+           "T_map_cam": np.asarray(T).round(6).tolist() if kept and T is not None else None,
+           "sigma_pos_m": sigma_pos_m if kept else None,
+           "sigma_rot_deg": sigma_rot_deg if kept else None,
+           "prior_residual_m": None if residual is None else round(residual[0], 4),
+           "prior_residual_deg": None if residual is None else round(residual[1], 3)}
+    if reason == "too_close":
+        row["min_distance_m"] = TOO_CLOSE_M
+        row["scene_distance_m"] = round(scene_m if scene_m is not None else 0.0, 3)
+    return row
+
+
+def prior_frames_rejected(frames: list[_Frame], status: dict[int, str]) -> bool:
+    """Whether every prior-carrying frame of a map's first update is rejected (map.md §1):
+    ``status`` holds each frame's status by index (absent: rejected by the checks)."""
+    trusted = [fr for fr in frames if fr.work.trust in ("metric", "drifting")]
+    return bool(trusted) and all(status.get(fr.work.index, "rejected") == "rejected"
+                                 for fr in trusted)
 
 
 def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
@@ -325,6 +372,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             if geo:
                 up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
             if late:
+                for fr in late:  # a suspicious frame's scene distance (too_close)
+                    if fr.deferred and fr.scene_m is None and fr.path is not None:
+                        fr.scene_m = up.backend.median_depth(fr.path, fr.cam.canonical())
                 lp, r, fu = _register_none(up, am, late, workdir, progress)
                 up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
                 reg_s, fuse_s = reg_s + r, fuse_s + fu
@@ -332,14 +382,17 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                     placements[fr.work.index] = pl
             t = time.perf_counter()
             version = (prev["version"] + 1) if prev else 1
-            om, n_objects = fuse_objects(am, [(fr, placements[fr.work.index], dets[fr.work.index])
-                                              for fr in todo], version, up.backend.look_closer)
+            if am.keyframes:  # else no origin: every frame with a prior was rejected
+                om, n_objects = fuse_objects(am, [(fr, placements[fr.work.index],
+                                                   dets[fr.work.index]) for fr in todo],
+                                             version, up.backend.look_closer)
             tm["objects"] = round(time.perf_counter() - t, 3)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         t = time.perf_counter()
         am.save()
-        om.save()
+        if om is not None:
+            om.save()
         tm["register"] = round(reg_s, 3)
         tm["fusion"] = round(fuse_s + tm["objects"] + time.perf_counter() - t, 3)
         n_kept = sum(pl.status != "rejected" for pl in placements.values())
@@ -367,7 +420,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         rows.append({"name": fr.work.name, "camera_id": fr.work.camera_id,
                      "internal": pl.keyframe, "T_map_cam": pl.T.tolist(),
                      "sigma_pos_m": pl.sigma_pos_m, "sigma_rot_deg": pl.sigma_rot_deg,
-                     "pose_state": "fused" if pl.status == "registered" else "provisional",
+                     "pose_state": "fused" if pl.status == "registered" else "kept_at_prior",
                      "added_version": version, "sha256": fr.sha, "inliers": pl.inliers,
                      "method": pl.method,
                      "prior": p if p is not None and p["trust"] == "metric" else None})
@@ -379,39 +432,44 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         # the monocular keyframes' depth follows k; positions and depth images do not move
         mono = any(k.depth_kind == "mono" for k in am.keyframes)
         ratio = round(am.scale.k / k_prev, 5) if mono and k_prev else 1.0
-    low = sum(pl.status == "provisional" or (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
-              for _, pl in kept)
+    # registered inputs whose pose sigma exceeds the threshold (map.md §4)
+    registered = [pl for _, pl in kept if pl.status == "registered"]
+    low = sum((pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M for pl in registered)
     gauge = None
     if prev is not None:
         gauge = {"translation_m": round(float(np.median([m for m, _ in shifts])), 4)
                  if shifts else 0.0,
                  "rotation_deg": round(float(np.median([d for _, d in shifts])), 3)
                  if shifts else 0.0, "scale_ratio": 1.0}
-    # the new frames against the stored map: how far the update puts each from where the
-    # images on the previous version place it (checked by ``max_residual_m``)
+    # the new frames against their image-only poses (map.md §1, ``max_displacement_*``)
     moved = displacements([pl for _, pl in kept], stored)
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": ratio,
         "gauge_shift": gauge,
+        **displacement_quality(moved),
+        "prior_disagreement_deg": 0.0 if am is None else am.prior_disagreement_deg,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats(shifts) if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
-        "low_confidence_share": round(low / len(kept), 4) if kept else 0.0,
+        "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
         "rebuilt": False,
         "prior_gravity_deg": None if prev is not None or am is None else am.up_check_deg,
     }
-    job.quality = gate(q, bool(kept), w.accept_if, max((m for m, _ in moved), default=0.0))
+    status = {i: pl.status for i, pl in placements.items()}
+    job.quality = gate(q, bool(kept), w.accept_if,
+                       prev is None and prior_frames_rejected(frames, status))
     if am is not None:
         job.scale_source, job.scale_sigma_rel = source, round(sigma, 5)
     if not job.quality["accepted"]:
         job.state, job.progress = "rejected", 1.0
         return
     assert am is not None and om is not None
-    floor, pts = am.floor_and_bounds()
+    floor, floor_sigma, pts = om.floor_z, om.floor_sigma, am.bounds()
     record = {"kind": "update", "engine": "anchored", "job_id": job.id,
               "sim3": Sim3().to_dict(), "scale_source": source,
               "scale_sigma_rel": round(sigma, 5), "frames": rows, "objects": n_objects,
               "floor_z_m": None if floor is None else round(floor, 4),
+              "floor_sigma_m": round(floor_sigma, 4), "pose_states": POSE_STATES,
               "bounds_m": {"min": pts.min(0).round(4).tolist(),
                            "max": pts.max(0).round(4).tolist()},
               "points": len(am.cloud.keys)}
