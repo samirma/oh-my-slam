@@ -65,6 +65,9 @@ if TYPE_CHECKING:
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
 
 INFERENCE_IN_FLIGHT = 2
+# the other engine's keyframes joining the anchor pool mid-job (``_MaRun.more``): the most
+# recent, after the stored keyframes and this engine's own frames
+ANCHOR_ORDER = 2 * 10 ** 9
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
 NONE_ENGINE_ENV = "OH_MY_SLAM_NONE_ENGINE"
 DEFAULT_NONE_ENGINE = "mapanything"
@@ -164,11 +167,19 @@ class _MaRun:
 
     def more(self, extra: list[Keyframe]) -> list[Keyframe]:
         """The frames still unconfirmed tested again against ``extra`` (keyframes the other
-        engine added since) and what they bring; the keyframes added."""
+        engine added since: anchors and references from now on) and what they bring, then
+        inferred again, once per growth of the anchor pool (``Registration.retry``); the
+        keyframes added."""
         assert self.reg is not None  # only after ``first`` added keyframes
         t = time.perf_counter()
-        refs = [r for k in extra for r in [self.am.depth_ref(k)] if r is not None]
-        got = set(self.reg.recheck(refs))
+        am = self.am
+        am.save()  # their image and depth on disk: anchors
+        self.reg.add_anchors([register_ma.Stored(k.id, img, k.K, k.T, ANCHOR_ORDER + i,
+                                                 functools.partial(am.depth_of, k.id))
+                              for i, k in enumerate(extra)
+                              for img in [am.image_path(k.id)] if img is not None])
+        got = set(self.reg.recheck())
+        got |= set(self.reg.retry())
         self.reg_s += time.perf_counter() - t
         return self._place([fr for fr in self.frames if fr.work.index in got])
 
@@ -264,8 +275,8 @@ def _late(up: Updater, am: AnchoredMap, geo: list[_Frame], ins: list[FrameIn],
         again = am.retry_kept(kept, added)
         placements.update({fr.work.index: again[fr.work.name] for fr in geo
                            if fr.work.name in again})
-        confirmed = [k for got in again.values() for k in [am.keyframe(got.keyframe or "")]
-                     if k is not None]
+        confirmed = [k for got in again.values() if got.status == "registered"
+                     for k in [am.keyframe(got.keyframe or "")] if k is not None]
         new += confirmed
         run.reg_s += time.perf_counter() - t
         added = run.more(confirmed) if confirmed else []
@@ -463,35 +474,61 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         # a frame without a prior registered by the prior-first engine joins a standpoint
         am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
         try:
-            # the job stays open until both engines registered (``AnchoredMap.end_job``: the
-            # pose-duplicate pass over all of them, then the fusion)
-            pls = am.update(ins, progress, static=not late, hold=True) if ins else []
-            reg_s, fuse_s = am.timings.get("register", 0.0), am.timings.get("fuse", 0.0)
-            # a new camera-only map whose origin was rejected: the next frame in canonical
-            # order is offered as the origin (map.md §1: the first *registered* frame)
-            while camera_only_origin and late and not am.confirmed():
-                origin = min(late, key=_canonical)
-                late.remove(origin)
-                geo.append(origin)
-                assert origin.path is not None
-                fin = _frame_in(origin, pool.submit(up.backend.infer, origin.path,
-                                                    origin.cam.canonical(), True))
-                fin.feats = late_feats.pop(origin.work.index)
-                ins.append(fin)
-                pls += am.update([fin], progress, static=False, hold=True)
+            # the job as it starts: a second registration starts again from it (map.md §2
+            # match graph: a pose duplicate that served the job, a cross-engine drift fit)
+            start = am.job_start()
+            geo0, ins0, late0, late_feats0 = list(geo), list(ins), list(late), dict(late_feats)
+            reg_s = fuse_s = late_r = 0.0
+            while True:
+                # the job stays open until both engines registered (``AnchoredMap.end_job``:
+                # the pose-duplicate pass over all of them, then the fusion)
+                pls = am.update(ins, progress, static=not late, hold=True) if ins else []
                 reg_s += am.timings.get("register", 0.0)
                 fuse_s += am.timings.get("fuse", 0.0)
-            for fr, pl in zip(geo, pls, strict=True):
-                placements[fr.work.index] = pl
+                # a new camera-only map whose origin was rejected: the next frame in canonical
+                # order is offered as the origin (map.md §1: the first *registered* frame)
+                while camera_only_origin and late and not am.confirmed():
+                    origin = min(late, key=_canonical)
+                    late.remove(origin)
+                    geo.append(origin)
+                    assert origin.path is not None
+                    fin = _frame_in(origin, pool.submit(up.backend.infer, origin.path,
+                                                        origin.cam.canonical(), True))
+                    fin.feats = late_feats.pop(origin.work.index)
+                    ins.append(fin)
+                    pls += am.update([fin], progress, static=False, hold=True)
+                    reg_s += am.timings.get("register", 0.0)
+                    fuse_s += am.timings.get("fuse", 0.0)
+                for fr, pl in zip(geo, pls, strict=True):
+                    placements[fr.work.index] = pl
+                geo_s = reg_s - late_r
+                fused = {"geo": fuse_s, "late": 0.0}  # each engine's fusion seconds
+                if late:  # their scene distance is MapAnything's depth (``register_ma``)
+                    r, fu = _late(up, am, geo, ins, late, late_feats, placements, stored,
+                                  workdir, progress, pairs)
+                    late_r += r
+                    reg_s, fuse_s = reg_s + r, fuse_s + fu
+                    fused["late"] = fu
+                job_pls = [placements[fr.work.index] for fr in todo
+                           if fr.work.index in placements]
+                if not am.plan_drift_rerun(ins, [placements[fr.work.index] for fr in geo]) \
+                        and not am.plan_rerun(job_pls):
+                    break
+                # once more from the job's start, without what the plan leaves out
+                am.job_restart(start)
+                placements.clear()
+                geo, ins, late = list(geo0), list(ins0), []
+                late_feats = dict(late_feats0)
+                for fr in late0:
+                    if fr.work.name in am.excluded():
+                        placements[fr.work.index] = am.excluded()[fr.work.name]
+                    else:
+                        late.append(fr)
             if geo:
-                up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
-            fused = {"geo": fuse_s, "late": 0.0}  # each engine's fusion seconds
-            if late:  # their scene distance is MapAnything's depth (``register_ma``)
-                r, fu = _late(up, am, geo, ins, late, late_feats, placements, stored, workdir,
-                              progress, pairs)
-                up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
-                reg_s, fuse_s = reg_s + r, fuse_s + fu
-                fused["late"] = fu
+                up.timings.add("registration_per_frame", geo_s / len(geo), len(geo))
+            if late:
+                up.timings.add("registration_mapanything_per_frame", late_r / len(late),
+                               len(late))
             dups, end_s = am.end_job([placements[fr.work.index] for fr in todo
                                       if fr.work.index in placements], prev is None)
             for fr in todo:

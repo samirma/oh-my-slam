@@ -66,7 +66,7 @@ def test_kept_frames_say_why_and_keep_the_prior_s_sigmas(tmp_path: Path,
     T = base_pose(20)
     wrong = T.copy()
     wrong[:3, 3] += [0.5, 0.0, 0.0]
-    monkeypatch.setattr(an, "STRONG_INLIERS", 10 ** 6)
+    monkeypatch.setattr(an, "MEASURABLE_INLIERS", 10 ** 6)
     p = m.update([frame("weak", T, p=prior(wrong))])[0]
     assert (p.status, p.reason, p.detail) == ("kept_at_prior", "no_overlap",
                                               "conflict_unsupported")
@@ -136,7 +136,7 @@ def test_a_drift_change_needs_three_frames_and_half_the_job(tmp_path: Path) -> N
 
 def test_drift_fit_helpers() -> None:
     T = base_pose(0)
-    pl = an.Placement("x", "registered", T=T)
+    pl = an.Placement("x", "registered", T=T, inliers=150, inlier_share=0.3, measurable=True)
     o = an._DriftObs(0, "x", T, T, (0.02, 1.0), (0.01, 0.5), False, pl)
     d = an.Drift(T, T)
     assert an._drift_inliers(d, [o]) == {0}
@@ -144,6 +144,16 @@ def test_drift_fit_helpers() -> None:
     far = an.Drift(_rot_z(T, 40.0), T)
     out = an._drift_outliers(far, [o], set())
     assert out[0].reason == "prior_conflict" and out[0].prior_residual[1] > 30.0  # type: ignore[index]
+    # R-9: it keeps its overlap, so it still counts and can support in the next fit
+    assert out[0].inlier_share == 0.3 and an._can_support(out[0])
+    # P16: without a measurable pose, a frame left out is kept, conflict_unsupported
+    weak = an._DriftObs(0, "x", T, T, (0.02, 1.0), (0.01, 0.5), False,
+                        an.Placement("x", "registered", T=T, inliers=150, inlier_share=0.3))
+    kept = an._drift_outliers(far, [weak], set())[0]
+    assert (kept.status, kept.reason, kept.detail) == ("kept_at_prior", "no_overlap",
+                                                       "conflict_unsupported")
+    assert kept.align_T is not None and kept.image_sigmas == (0.01, 0.5)
+    assert an._can_support(kept)
     fitted = an._refined_drift(d, [o])
     assert err(fitted.ref_T, T)[0] < 1e-9  # type: ignore[arg-type]
     sp, sr = an._drift_sigma([o, o])

@@ -187,7 +187,8 @@ with a reason; `prior_residual_m/deg` whenever the frame has a prior and was pla
 the images did not confirm a kept frame: `no_image_pose` (no edge of the match graph: fewer
 than the registration minimum of 15 inliers, `MIN_INLIERS`, to every reference), `loose_image_pose`
 (an image pose looser than 2° or than max(0.10 m, twice the prior's position sigma)) or
-`conflict_unsupported` (beyond the conflict bound without strong support); those three are kept
+`conflict_unsupported` (beyond the conflict bound, its image-only pose short of the measurable-pair
+threshold, oms/2.2 P16); those three are kept
 with reason `no_overlap` whatever the frame's feature count (oms/2.2 P12: in updates
 `few_features` is only the checks' verdict; it, every other failed check and `too_close` carry a
 null `detail`). Null on every other status. The mapper's engine sets `no_image_pose` on a frame
@@ -202,7 +203,7 @@ it did not register.
 | `blur` | Sharpness < 0.035: variance of the Laplacian at ≤ 1024 px over that at a quarter of the size. Reference frames ≥ 0.12; a Gaussian blur of σ ≥ 1.2 px < 0.035. |
 | `few_features` | Fewer SIFT keypoints at ≤ 1024 px than the registration minimum, 15 (`core.constants.REGISTRATION_MIN`: one constant for the check, registration and locate): the checks' verdict only (api.md §4), never given after registration. |
 | `no_overlap` | Not placed by the mapper or engine (no verified link to the map), whatever its feature count. |
-| `prior_conflict` | Registered farther than 3 × sqrt(σ_prior² + σ_image²) from its metric prior, or from its drifting prior after the mapper's drift estimate, position and rotation separately (`mapping.sigmas.conflicts`; σ_prior floored at 1 cm and 0.5°, σ_image the frame's calibrated sigma proxy before the anchoring); the mapper gives one hypothesis, so none lies nearer the prior. A frame that is too close is kept at its prior first (a failed check wins, api.md §4). The mapper's drift estimate (map.md §1 "Every engine", oms/2.2 P12; `Updater._drifting_residuals`) is robust across versions: the similarity that best brings the job's aligned poses onto their drifting priors (`anchor.fit`, its inliers), against the previous version's (`drift_sim` and `drift_sigma` of its record; none yet: the identity). A first estimate, or a change larger than 3 × the fit's own sigma (the RMS of its inliers' prior sigmas over √n), needs min(3, n) supporting inliers, n the drifting frames with ≥ 100 mapper inliers, ≥ 50 % of those and never one alone; without it a change keeps the previous estimate and a refused first estimate leaves the drift at the identity (priors as sent, with their sigmas; no estimate recorded), the frames it does not predict are `prior_conflict`, and the mapper runs once more without them. A drifting frame kept at its prior is placed through that estimate, its sigmas drift-grown (oms/2.2 P13, `update.drift_grown`): the root sum of squares of the prior's and the estimate's own at its pose, which is the fit's sigma and its extrapolation away from the supporting frames (`drift_support` of the record: their prior centres), `DRIFT_POS_REL` × the distance to the nearest in position and `DRIFT_ROT_DEG_PER_M` per metre in rotation; a drifting prior's σ_prior in the conflict test is that drift-grown sigma. A frame kept only because it is too close, with a metric prior and a depth image, is the too-close exception on this engine too (row `content: true`; its depth image committed with the version as `kept_depth.json`, 16-bit PNG millimetres, read by `service.derived` for occupancy and heights). Its detections and votes do not yet reach this engine's objects, which the mapper process builds itself (a known gap). The older mapper stays exempt from static-content exclusion, standpoint grouping and the match graph. |
+| `prior_conflict` | Registered farther than 3 × sqrt(σ_prior² + σ_image²) from its metric prior, or from its drifting prior after the mapper's drift estimate, position and rotation separately (`mapping.sigmas.conflicts`; σ_prior floored at 1 cm and 0.5°, σ_image the frame's calibrated sigma proxy before the anchoring); the mapper gives one hypothesis, so none lies nearer the prior. A conflicting frame with fewer than 100 mapper inliers (this engine's measurable-pair threshold, as for its drift support) is kept at its prior instead, `detail` `conflict_unsupported`, and the mapper runs again without it (oms/2.2 P16). A frame that is too close is kept at its prior first (a failed check wins, api.md §4). The mapper's drift estimate (map.md §1 "Every engine", oms/2.2 P12; `Updater._drifting_residuals`) is robust across versions: the similarity that best brings the job's aligned poses onto their drifting priors (`anchor.fit`, its inliers), against the previous version's (`drift_sim` and `drift_sigma` of its record; none yet: the identity). A first estimate, or a change larger than 3 × the fit's own sigma (the RMS of its inliers' prior sigmas over √n), needs min(3, n) supporting inliers, n the drifting frames with ≥ 100 mapper inliers, ≥ 50 % of those and never one alone; without it a change keeps the previous estimate and a refused first estimate leaves the drift at the identity (priors as sent, with their sigmas; no estimate recorded), the frames it does not predict are `prior_conflict`, and the mapper runs once more without them. A drifting frame kept at its prior is placed through that estimate, its sigmas drift-grown (oms/2.2 P13, `update.drift_grown`): the root sum of squares of the prior's and the estimate's own at its pose, which is the fit's sigma and its extrapolation away from the supporting frames (`drift_support` of the record: their prior centres), `DRIFT_POS_REL` × the distance from the frame's prior position to the nearest in position and `DRIFT_ROT_DEG_PER_M` per metre of it in rotation (oms/2.2 P16, the prior-first engine's rule too); a drifting prior's σ_prior in the conflict test is that drift-grown sigma. A frame kept only because it is too close, with a metric prior and a depth image, is the too-close exception on this engine too (row `content: true`; its depth image committed with the version as `kept_depth.json`, 16-bit PNG millimetres, read by `service.derived` for occupancy and heights, not for the cloud, which is this engine's own fused cloud: oms/2.2 P16). Its detections and votes do not yet reach this engine's objects, which the mapper process builds itself (a known gap). The older mapper stays exempt from static-content exclusion, standpoint grouping and the match graph. |
 
 `plain`, `blur` and `few_features` reject a frame without a prior before mapping; a frame with a
 metric or drifting prior is instead `kept_at_prior` with that reason (api.md §4), and so is one
@@ -342,10 +343,18 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     camera-only origin (map.md §1, oms/2.2 P11: the first *registered* frame; on the MapAnything
     path a rejected origin hands over to the next frame in canonical order), a component's
     seed, the pose-duplicate pass (step 6, `AnchoredMap._job_duplicates`: after the fixed point
-    of both engines, every frame the job registered against the stored confirmed keyframes and
-    the job's frames named before it, the later-named frame of a pair the duplicate, its
-    keyframe dropped; `begin_job` marks the stored ones) and the drift reference kept for later
-    jobs (`_close_drift`). The later-wins content rule and `inputs[]`
+    of both engines, every frame the job registered, and every stored kept keyframe it
+    re-registered (a frame of the job for the pass, oms/2.2 P16), against the stored confirmed
+    keyframes and the job's frames named before it, the later-named frame of a pair the
+    duplicate, its keyframe dropped, a re-registered stored keyframe's re-registration undone;
+    `begin_job` marks the stored ones) and the drift reference kept for later jobs
+    (`_close_drift`). When a duplicate served the job — a reference of another placement or of a
+    seeded component, a drifting frame the drift took (its reference or support), scale evidence
+    (`_evidence_from`), or a re-registration (`_rereg_by`) — the job's registration runs once
+    more from its start without the duplicates (`plan_rerun`: they are forced `duplicate`, a
+    re-registered stored one is not re-registered), so none of its effects remain; the pass of
+    that second registration is final (`reran`). On the MapAnything path both engines run again
+    (`prior_first.run_anchored`, `job_start`/`job_restart`). The later-wins content rule and `inputs[]`
     stay in request order.
   * *Edges and rounds.* An edge is a placement with at least the registration minimum of 15
     image inliers (`MIN_INLIERS`) whose fitted pose passes the prior checks (the combined
@@ -389,22 +398,35 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     later in the same pass registers too), and the frames MapAnything left `no_overlap` are
     tried again against those, until neither adds a frame. The job is held open over both
     engines (`update(hold=True)`): the pose-duplicate pass and the fusion run once at its end
-    (`end_job`). The drift fit and
-    the prior-rotation correction are not run again for the frames confirmed this way.
-* **Drifting odometry.** Its sigmas are drift-grown (map.md §1, oms/2.2 P13; `Drift.predict`):
-  the root sum of squares of the prior's sigma and the drift estimate's own at that pose, which
-  is the accepted fit's sigma (`Drift.fit_sigma`) and its extrapolation, growing with the
-  odometry's *path* since the last frame the images
-  confirmed (`Drift.observe`: every drifting prior seen, kept at its prior or rejected, across
-  updates), not with the straight line between the two priors: a robot that drove away and came
-  back has drifted with its path. Within a job the drift estimate is the one in force when the job
-  starts (every frame predicted from it, whatever its place in the request); after the job its
-  registered drifting frames, in canonical name order, become the new reference (`Drift.confirm`,
-  with the odometry-scale evidence) and the drifting priors after the last one grow the path:
+    (`end_job`). A frame confirmed this way goes through the prior checks against the job's
+    other frames with a prior (`_checked`: the priors-against-images correction) and records
+    its scale evidence; one whose images now give a pose that fails the prior checks takes that
+    verdict (rejected `prior_conflict`, or kept with `detail` `conflict_unsupported` /
+    `loose_image_pose`, never a stale `no_image_pose`). When a retry gave a drifting frame an
+    image pose, the robust drift fit runs over the job's frames as they ended
+    (`plan_drift_rerun`); if it changes the estimate the job registered under, or leaves out a
+    frame not already left out, the job registers once more from the fitted estimate with those
+    frames forced to its verdict (once per job). MapAnything takes the keyframes `retry_kept`
+    confirmed as anchors too (`Registration.add_anchors`): a frame still unconfirmed is inferred
+    again once per growth of the anchor pool (`_MaRun.more`).
+* **Drifting odometry.** Its sigmas are drift-grown (map.md §1, oms/2.2 P16; `Drift.predict`,
+  `anchored.drift_grown`, the same function as the older mapper's `update.drift_grown`): the
+  root sum of squares of the prior's sigma and the drift estimate's own at that pose, which is
+  the accepted fit's sigma (`Drift.fit_sigma`) and its extrapolation, growing with the distance
+  from the frame's prior position to the nearest supporting frame's prior position
+  (`Drift.support`: the fit's inliers and every drifting frame the images confirmed since) at
+  **`DRIFT_POS_REL` = 0.10** of that distance in position and **`DRIFT_ROT_DEG_PER_M` = 2° per
+  metre** of it in rotation. Travel since the client's last fix is the client's part: drifting
+  priors carry sigmas grown with it, and the engine no longer adds the odometry's path. A state
+  written before the supporters were kept grows from its reference. Within a job the drift
+  estimate is the one in force when the job starts (every frame predicted from it, whatever its
+  place in the request); after the job its registered drifting frames, in canonical name order,
+  become the new reference and supporters (`Drift.confirm`, with the odometry-scale evidence):
   later jobs do not depend on the request order either.
 * **Robust drift estimate** (map.md §1 "Drift estimate", `AnchoredMap._fit_drift`). After the
   job is registered, the drift is fitted over its drifting-prior frames whose images give a pose
-  (registered, or rejected `prior_conflict`): the estimate in force and one trial per frame
+  (registered, rejected `prior_conflict`, or kept `conflict_unsupported` when it can support
+  an estimate): the estimate in force and one trial per frame
   (that frame as the reference) each count the frames whose image pose lies within 3 ×
   sqrt(σ_prior² + σ_hypothesis²) of their prediction (position and rotation; σ_prior
   drift-grown, σ_hypothesis the image-only calibrated sigma). The trial with the most, refined
@@ -421,9 +443,11 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   frame kept `conflict_unsupported` counts); an origin or a seed cannot. Without that support
   a change is refused (the previous estimate stays) and a first estimate leaves the drift at
   the identity (priors as sent, with their sigmas); the frames the estimate in force does not
-  predict are rejected `prior_conflict`, the others keep their status. A frame the accepted
-  estimate leaves out is rejected `prior_conflict` too, its residual against the prior as sent
-  through that estimate. Whenever the fit changes the estimate or leaves out other frames, the
+  predict are left out, the others keep their status. A frame an estimate leaves out is
+  rejected `prior_conflict` when its image-only pose meets the measurable-pair threshold
+  (`Placement.measurable`), else kept at its prior through that estimate, `conflict_unsupported`
+  (oms/2.2 P16); its residual is against the prior as sent through that estimate, and it keeps
+  its image-only pose and overlap, so it still counts in n and can support the next fit. Whenever the fit changes the estimate or leaves out other frames, the
   whole job is registered again under its decision: every frame re-tested, the left-out ones
   those of the latest fit (one left out before may come back), until a fixed point; after 6
   fits (`DRIFT_PASSES`) one last pass applies the last fit's outliers without fitting again, so
@@ -436,8 +460,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   other frame moves (`tests/unit/test_match_graph_engine.py`).
 * **Kept at prior.** A frame with a prior that its images do not confirm is `kept_at_prior`
   (`mapping.anchored.AnchoredMap.kept_at`): no image pose, an image pose looser than 2° or than
-  max(0.10 m, twice the prior's position sigma), an image pose beyond the conflict bound without
-  strong support (reason `no_overlap`, `detail` saying which), an image that failed a check
+  max(0.10 m, twice the prior's position sigma), an image pose beyond the conflict bound short
+  of the measurable-pair threshold (reason `no_overlap`, `detail` saying which), an image that failed a check
   (`plain`, `blur`, `few_features`: never confirmed by depth, api.md §4), or a frame too close.
   Its pose is the prior as placed — a metric prior as given, a drifting one through the drift
   estimate (`Drift.predict`) — with the prior's own sigmas as sent (or the trust's defaults; the
@@ -492,9 +516,9 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   duplicate limits. The mapper's engine never re-registers: its `reregistered` is empty (map.md
   §2 allows it).
 * **`prior_conflict`** (api.md §4). An image pose beyond the combined bound 3 ×
-  sqrt(σ_prior² + σ_image²) (*Conflict with the prior* above) with strong support (≥ 40 inliers,
-  ≥ 30 % of the matches, and for a metric prior ≥ 15 inliers on each of two references) rejects
-  the frame, unless a supported hypothesis lies near the prior (`_near_prior`): the lifted
+  sqrt(σ_prior² + σ_image²) (*Conflict with the prior* above) whose image-only pose meets the
+  measurable-pair threshold (oms/2.2 P16, `measurable_pose`: on one confirmed or registered
+  reference at least 100 inliers covering at least 10 % of the 8 × 8 cells) rejects the frame, unless a supported hypothesis lies near the prior (`_near_prior`): the lifted
   matches that reproject at the prior within 3 of its sigmas' reach, refined on their own, with
   at least 0.25 of the best hypothesis's inliers (`SUPPORT_MIN`) and its pose within the
   combined bound of its own calibrated sigma; the frame is then registered on it. A frame whose

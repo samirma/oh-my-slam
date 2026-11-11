@@ -175,11 +175,23 @@ def test_a_seed_takes_its_image_pose_once_frames_registered_through_it(tmp_path:
     member = an.Keyframe("k9", "c", "cam", f.K, base_pose(16), 0.05, 5.0, "fused", None, "none",
                          seed=kf.id, seed_sigma=(0.05, 5.0))
     m.keyframes.append(member)
-    pl = m._unseed(f, pr, seed, kf)
+    pl = m._unseed(f, pr, seed, kf, [])
     assert pl.status == "registered" and pl.method != "prior" and pl.keyframe == kf.id
     assert pl.prior_residual is not None and pl.prior_residual[1] > 1.0
     assert an.rot_deg(kf.T[:3, :3].T @ T[:3, :3]) < 1.0  # the image pose, not the prior
     assert kf.seed is None and member.seed is None  # linked to the map
+    # round 8: its image pose checked against the job's others and its scale evidence kept;
+    # too close (with the inliers to stay registered), no scale evidence
+    assert "s" in m._evidence_from
+    m._evidence_from.clear()
+    import dataclasses
+    close = dataclasses.replace(pr, close=True)
+    an_inliers, an.TOO_CLOSE_INLIERS = an.TOO_CLOSE_INLIERS, 0
+    try:
+        assert m._unseed(f, close, seed, kf, []).status == "registered"
+    finally:
+        an.TOO_CLOSE_INLIERS = an_inliers
+    assert "s" not in m._evidence_from
     # with nothing else to register on, it stays the seed
     m2 = new_map(tmp_path / "alone")
     m2.update([frame("a0", base_pose(0))])
@@ -187,7 +199,7 @@ def test_a_seed_takes_its_image_pose_once_frames_registered_through_it(tmp_path:
     pr2 = m2._prepare(g)
     seed2 = m2._seed(g)
     kf2 = m2._keep(g, pr2, seed2, lambda _: None)
-    assert m2._unseed(g, pr2, seed2, kf2) is seed2  # no candidate at all
+    assert m2._unseed(g, pr2, seed2, kf2, []) is seed2  # no candidate at all
     m3 = new_map(tmp_path / "apart")
     m3.update([frame("a0", base_pose(0))])
     h = frame("u", base_pose(90), p=prior(base_pose(90)))
@@ -195,7 +207,7 @@ def test_a_seed_takes_its_image_pose_once_frames_registered_through_it(tmp_path:
     seed3 = m3._seed(h)
     kf3 = m3._keep(h, pr3, seed3, lambda _: None)
     assert "a0" in [k.name for k in m3.candidates_for(h, None, m3._predict(h))]
-    assert m3._unseed(h, pr3, seed3, kf3) is seed3  # a candidate its images do not place on
+    assert m3._unseed(h, pr3, seed3, kf3, []) is seed3  # a candidate its images do not place on
 
 
 # -- the too-close exception on the older mapper (api.md §4, SI-8) -------------------------------

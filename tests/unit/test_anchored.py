@@ -186,18 +186,20 @@ def test_drift() -> None:
     assert np.allclose(T0, P) and (sp, sr) == (0.02, 1.0)
     d.confirm(base_pose(0), P)
     T1, sp1, sr1 = d.predict(base_pose(90, 2.0, 0.0), 0.02, 1.0)
-    assert np.allclose(T1[:3, 3], base_pose(90, 1.0, 0.0)[:3, 3]) and sp1 > 0.09 and sr1 > 5
-    # map.md §1 (P13): the root sum of squares of the prior's and the drift's own, which is its
-    # fit's sigma and its growth with the travel
+    assert np.allclose(T1[:3, 3], base_pose(90, 1.0, 0.0)[:3, 3]) and sp1 > 0.09 and sr1 > 2
+    # map.md §1 (P16): the root sum of squares of the prior's and the drift's own, which is its
+    # fit's sigma and its growth with the distance to the nearest supporting frame's prior
     P2 = base_pose(90, 2.0, 0.0)
-    D = np.linalg.inv(P) @ P2
-    travel, turn = float(np.linalg.norm(D[:3, 3])), an.rot_deg(D[:3, :3])
-    assert sp1 == pytest.approx(math.hypot(0.02, an.DRIFT_POS_REL * travel))
+    dist = float(np.linalg.norm(P2[:3, 3] - P[:3, 3]))
+    assert d.support == [P[:3, 3].tolist()]
+    assert sp1 == pytest.approx(math.hypot(0.02, an.DRIFT_POS_REL * dist))
     d.fit_sigma = (0.03, 0.4)
     sp2, sr2 = d.predict(P2, 0.02, 1.0)[1:]
-    assert sp2 == pytest.approx(math.hypot(0.02, 0.03, an.DRIFT_POS_REL * travel))
-    assert sr2 == pytest.approx(math.hypot(1.0, 0.4, an.DRIFT_ROT_REL * turn
-                                           + an.DRIFT_ROT_DEG_PER_M * travel))
+    assert sp2 == pytest.approx(math.hypot(0.02, 0.03, an.DRIFT_POS_REL * dist))
+    assert sr2 == pytest.approx(math.hypot(1.0, 0.4, an.DRIFT_ROT_DEG_PER_M * dist))
+    # the same rule as the older mapper's (every engine)
+    from oh_my_slam.service.update import drift_grown
+    assert (sp2, sr2) == drift_grown(0.02, 1.0, P2, d.fit_sigma, d.support)
     assert Drift.from_json(d.to_json()).fit_sigma == (0.03, 0.4)
     d.fit_sigma = (0.0, 0.0)
     d.confirm(base_pose(0, 0.05), base_pose(0, 1.05))  # too short to tell the odometry's scale
@@ -368,20 +370,21 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     assert (p2.status, p2.reason) == ("rejected", "prior_conflict")
     assert p2.prior_residual is not None and p2.prior_residual[0] > 0.3
     # few matches, beyond its prior: not confirmed, kept at its prior
-    an.STRONG_INLIERS, strong = 10 ** 6, an.STRONG_INLIERS
+    an.MEASURABLE_INLIERS, strong = 10 ** 6, an.MEASURABLE_INLIERS
     try:
         p3 = m.update([frame("weak", base_pose(21), p=prior(wrong))])[0]
     finally:
-        an.STRONG_INLIERS = strong
+        an.MEASURABLE_INLIERS = strong
     assert p3.status == "kept_at_prior" and p3.inliers > 0
     # nothing stored moved
     assert [k.state for k in m.keyframes] == ["fused", "fused", "provisional", "provisional",
                                               "provisional", "provisional"]
     assert np.allclose(m.keyframes[0].T, base_pose(0))
-    # a metric prior is called a conflict only on two references: one keyframe sees it
+    # P16: one reference is enough when the pair is measurable (no two-reference rule)
     m2 = new_map(tmp_path / "one")
     m2.update([frame("a0", base_pose(0))])
-    assert m2.update([frame("off", T, p=prior(wrong))])[0].status == "kept_at_prior"
+    one = m2.update([frame("off", T, p=prior(wrong))])[0]
+    assert (one.status, one.reason, one.measurable) == ("rejected", "prior_conflict", True)
 
 
 def test_frames_without_prior_in_an_anchored_map(tmp_path: Path) -> None:
@@ -781,23 +784,24 @@ def test_keyframe_images_and_depth_are_kept(tmp_path: Path) -> None:
     assert again.depth_of(kid) is None
 
 
-def test_the_odometry_drifts_with_its_path() -> None:
+def test_the_drift_grows_from_the_nearest_supporting_frame() -> None:
+    """map.md §1 (P16): the distance from the frame's prior position to the nearest supporting
+    frame's prior position, never the travel since one reference."""
     d = Drift()
     d.confirm(base_pose(0), base_pose(0))
-    away, back = base_pose(0, 1.0, 0.0), base_pose(5, 0.02, 0.0)
-    straight = d.predict(back, 0.02, 1.0)
-    d.observe(away)
-    T, sp, sr = d.predict(back, 0.02, 1.0)
-    assert np.allclose(T, straight[0]) and sp > straight[1] + 0.15 and sr > straight[2]
-    d.observe(back)
-    assert d.path_m == pytest.approx(2.0, abs=0.05)
+    d.confirm(base_pose(0, 3.0, 0.0), base_pose(0, 3.0, 0.0))  # the reference: the last one
+    near_first = base_pose(5, 0.1, 0.0)  # far from the reference, near the first supporter
+    sp = d.predict(near_first, 0.02, 1.0)[1]
+    near = float(np.linalg.norm(near_first[:3, 3] - base_pose(0)[:3, 3]))
+    assert near < 0.2 and sp == pytest.approx(math.hypot(0.02, an.DRIFT_POS_REL * near))
     again = Drift.from_json(d.to_json())
-    assert again.path_m == d.path_m and np.allclose(again.last_prior, back)  # type: ignore[arg-type]
-    # a state written before the path was kept: the straight line
-    old = {k: v for k, v in d.to_json().items() if k not in ("last_prior", "path_m", "turn_deg")}
-    assert Drift.from_json(old).predict(back, 0.02, 1.0)[1] == pytest.approx(straight[1])
-    d.confirm(back, back)
-    assert (d.path_m, d.turn_deg) == (0.0, 0.0)
+    assert again.support == d.support
+    # a state written before the supporters were kept: its reference
+    old = {k: v for k, v in d.to_json().items() if k != "support"}
+    ref = float(np.linalg.norm(near_first[:3, 3] - base_pose(0, 3.0, 0.0)[:3, 3]))
+    assert ref > 2.5
+    assert Drift.from_json(old).predict(near_first, 0.02, 1.0)[1] == pytest.approx(
+        math.hypot(0.02, an.DRIFT_POS_REL * ref))
 
 
 def _slip(T: np.ndarray, deg: float) -> np.ndarray:

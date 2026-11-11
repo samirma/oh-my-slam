@@ -57,8 +57,6 @@ from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import (
     DRIFT_MIN_SUPPORT,
     DRIFT_NEVER_ALONE,
-    DRIFT_POS_REL,
-    DRIFT_ROT_DEG_PER_M,
     DRIFT_SUPPORT_SHARE,
     MEASURABLE_INLIERS,
     OVERLAP_MIN,
@@ -69,6 +67,9 @@ from oh_my_slam.mapping.anchored import (
     floor_spread,
     lowest_layer,
     natural_key,
+)
+from oh_my_slam.mapping.anchored import (
+    drift_grown as anchored_drift_grown,
 )
 from oh_my_slam.mapping.quality import displacement_quality, gate, residual_stats
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
@@ -256,16 +257,11 @@ def _has_depth(fr: _Frame) -> bool:
 def drift_grown(sigma_pos: float, sigma_rot: float, P: NDArray[np.float64],
                 sigma: tuple[float, float] | None, support: list[list[float]] | None
                 ) -> tuple[float, float]:
-    """A drifting prior ``P``'s drift-grown sigmas (map.md §1, P13; every engine): the root sum
-    of squares of the prior's and the drift estimate's own at that pose, which is its fit's
-    sigma (``sigma``) and its extrapolation away from the frames that supported it (``support``,
-    their prior centres), growing with the distance to the nearest as the prior-first engine's
-    drift does with travel (``DRIFT_POS_REL``, ``DRIFT_ROT_DEG_PER_M``)."""
-    fp, fr = sigma or (0.0, 0.0)  # a record before the drift sigma: none
-    d = min((float(np.linalg.norm(P[:3, 3] - np.asarray(c))) for c in support), default=0.0) \
-        if support else 0.0
-    return (math.hypot(sigma_pos, math.hypot(fp, DRIFT_POS_REL * d)),
-            math.hypot(sigma_rot, math.hypot(fr, DRIFT_ROT_DEG_PER_M * d)))
+    """A drifting prior ``P``'s drift-grown sigmas on the older mapper (map.md §1, P16; every
+    engine the same rule, ``anchored.drift_grown``): its fit's sigma (``sigma``; a record
+    before the drift sigma: none) and the distance from ``P``'s prior position to the nearest
+    supporting frame's (``support``, their prior centres; none: no growth)."""
+    return anchored_drift_grown(sigma_pos, sigma_rot, P, sigma or (0.0, 0.0), support or [])
 
 
 def _too_close_content(fr: _Frame) -> bool:
@@ -820,7 +816,8 @@ class Updater:
     def _post_check(self, placed: list[_Frame], anchored: _Anchored, internal: InternalMap,
                     prev: dict[str, Any] | None = None) -> list[_Frame]:
         """The registered frames to leave out: ``too_close`` (kept at its prior when it has one:
-        a failed check wins over ``prior_conflict``, api.md §4), ``prior_conflict`` and pose
+        a failed check wins over ``prior_conflict``, api.md §4), ``prior_conflict`` (kept at its
+        prior, ``conflict_unsupported``, below the measurable-pair threshold) and pose
         ``duplicate`` (``_duplicate_of``)."""
         out = []
         earlier: list[_Frame] = []
@@ -855,7 +852,15 @@ class Updater:
                 dp, dr = fr.prior_residual
                 if sigmas.conflicts(dp, dr, (max(sp, anchor.MIN_SIGMA_POS_M),
                                              max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp):
-                    fr.reason = "prior_conflict"
+                    # the images confirm the conflict only when its pose meets the
+                    # measurable-pair threshold (api.md §4, P16; on this engine its mapper
+                    # inliers, as its drift support); else it is kept at its prior,
+                    # ``conflict_unsupported``, and the mapper runs again without it
+                    if _inliers(fr.internal) >= MEASURABLE_INLIERS:
+                        fr.reason = "prior_conflict"
+                    else:
+                        fr.unconfirmed, fr.detail = "no_overlap", "conflict_unsupported"
+                        fr.internal = None
                     out.append(fr)
                     continue
             dup = self._duplicate_of(fr, prev, earlier, internal)

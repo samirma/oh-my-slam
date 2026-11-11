@@ -359,6 +359,13 @@ class Registration:
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
                                 lambda: got))
 
+    def add_anchors(self, stored: list[Stored]) -> None:
+        """Views another engine registered during the job, joining the pool: anchors of later
+        calls (``retry``: a frame is inferred again once the pool grew since its call) and
+        references of ``recheck``."""
+        self.pool += [_Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s))
+                      for s in stored]
+
     def recheck(self, extra: list[Ref] | None = None) -> list[int]:
         """The frames no reference confirmed (``waiting``) tested again, without inferring them
         again (their call's pose and depth), against every view registered since — this

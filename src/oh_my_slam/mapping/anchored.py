@@ -172,8 +172,6 @@ MIN_INLIERS = REGISTRATION_MIN  # the registration minimum (api.md §6)
 PIXEL_SIGMA = 1.0  # a match's pixel noise at 640 px width
 DEPTH_NOISE_REL = 0.02  # a lifted point's own depth noise (the scale error is a parameter)
 SENSOR_SCALE_SIGMA_REL = 0.03  # a depth image's scale, as a prior of its reference's scale
-STRONG_INLIERS = 40  # an image pose this well supported can contradict a prior
-STRONG_RATIO = 0.3  # ... with this share of its matches as inliers
 CONFIRM_SIGMA_POS_M = 0.10  # an image pose confirms a frame only this well determined (or
 # within twice the prior's sigma)
 CONFIRM_SIGMA_ROT_DEG = 2.0
@@ -194,9 +192,9 @@ IMAGE_SIGMA_ROT_MIN_DEG = 0.2
 REPORT_MIN_SIGMA_POS_M = 0.001  # floors of the reported sigmas
 REPORT_MIN_SIGMA_ROT_DEG = 0.01
 UNANCHORED_SIGMA_POS_M = 0.10  # rotation-only without a prior: the centre is the keyframe's
-DRIFT_POS_REL = 0.10  # drifting prior: sigma grows by this share of the travel
-DRIFT_ROT_REL = 0.05  # ... by this share of the turn
-DRIFT_ROT_DEG_PER_M = 2.0  # ... and this much per metre travelled
+# a drift estimate's sigma grows by this share of the distance from its supporting frames
+DRIFT_POS_REL = 0.10
+DRIFT_ROT_DEG_PER_M = 2.0  # ... and this much per metre of it in rotation
 ODO_SCALE_MIN_TRAVEL_M = 0.2
 ODO_SCALE_RANGE = (0.5, 2.0)
 PRIOR_SPAN_M = 0.3  # metric priors fix the scale once their centres span this
@@ -1115,72 +1113,49 @@ class Cloud:
 @dataclass
 class Drift:
     """The latest correction of the drifting odometry: the last keyframe the images confirmed
-    with a drifting prior (its map pose and its prior), the odometry's scale, and the odometry
-    travelled since that keyframe along every drifting prior seen after it (``observe``): a
-    robot that drove away and came back has drifted with its path, not with the straight line
-    between its two priors."""
+    with a drifting prior (its map pose and its prior), the odometry's scale, and the prior
+    centres of the frames that supported the estimate (``support``): its sigma grows with the
+    distance from them (map.md §1 "Drift-grown sigma", P16). Travel since the client's last fix
+    is the client's part: drifting priors carry sigmas grown with it."""
 
     ref_T: Array | None = None
     ref_prior: Array | None = None
     odo_scale: float = 1.0
     evidence: list[list[float]] = field(default_factory=list)  # [odometry m, map m]
-    last_prior: Array | None = None  # the last drifting prior seen
-    path_m: float = 0.0  # odometry path from ``ref_prior`` to ``last_prior``
-    turn_deg: float = 0.0  # ... and its turns
     # the fitted estimate's own sigma at its supporting frames (position m, rotation deg;
     # ``_drift_sigma``): the base its sigma grows from away from them (``predict``)
     fit_sigma: tuple[float, float] = (0.0, 0.0)
+    # the prior centres (odometry frame) of the frames that supported it: the fit's inliers and
+    # every drifting frame the images confirmed since (``confirm``)
+    support: list[list[float]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {"ref_T": None if self.ref_T is None else self.ref_T.tolist(),
                 "ref_prior": None if self.ref_prior is None else self.ref_prior.tolist(),
                 "odo_scale": self.odo_scale, "evidence": self.evidence,
-                "last_prior": None if self.last_prior is None else self.last_prior.tolist(),
-                "path_m": self.path_m, "turn_deg": self.turn_deg,
-                "fit_sigma": list(self.fit_sigma)}
+                "fit_sigma": list(self.fit_sigma), "support": self.support}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Drift:
-        last = d.get("last_prior")
         return Drift(None if d["ref_T"] is None else np.asarray(d["ref_T"], np.float64),
                      None if d["ref_prior"] is None else np.asarray(d["ref_prior"], np.float64),
                      float(d["odo_scale"]), [list(e) for e in d["evidence"]],
-                     None if last is None else np.asarray(last, np.float64),
-                     float(d.get("path_m", 0.0)), float(d.get("turn_deg", 0.0)),
-                     tuple(d.get("fit_sigma", (0.0, 0.0))))  # type: ignore[arg-type]
-
-    def _step(self, P: Array) -> tuple[float, float]:
-        """The odometry's travel and turn from the last prior seen to ``P``."""
-        if self.last_prior is None:
-            return 0.0, 0.0
-        D = np.linalg.inv(self.last_prior) @ P
-        return float(np.linalg.norm(D[:3, 3])) * self.odo_scale, rot_deg(D[:3, :3])
+                     tuple(d.get("fit_sigma", (0.0, 0.0))),  # type: ignore[arg-type]
+                     [list(c) for c in d.get("support", [])])
 
     def predict(self, P: Array, sigma_pos: float, sigma_rot: float
                 ) -> tuple[Array, float, float]:
-        """The map pose and drift-grown sigmas of a drifting prior ``P`` (map.md §1, P13):
-        through the latest correction; each sigma the root sum of squares of the prior's and
-        the estimate's own at that pose, which is its fit's sigma (``fit_sigma``) and its
-        extrapolation away from the frame that last supported it, grown with the travel since
-        (the longer of its path and the straight line). Without an estimate (the identity),
-        the prior as sent with its sigmas."""
+        """The map pose and drift-grown sigmas of a drifting prior ``P`` (map.md §1, P16):
+        through the latest correction; the sigmas ``drift_grown`` from its supporting frames
+        (a state written before they were kept: its reference). Without an estimate (the
+        identity), the prior as sent with its sigmas."""
         if self.ref_T is None or self.ref_prior is None:
             return P.copy(), sigma_pos, sigma_rot
         D = np.linalg.inv(self.ref_prior) @ P
         D[:3, 3] *= self.odo_scale
-        step, step_turn = self._step(P)
-        travel = max(float(np.linalg.norm(D[:3, 3])), self.path_m + step)
-        turn = max(rot_deg(D[:3, :3]), self.turn_deg + step_turn)
-        dp = math.hypot(self.fit_sigma[0], DRIFT_POS_REL * travel)
-        dr = math.hypot(self.fit_sigma[1], DRIFT_ROT_REL * turn + DRIFT_ROT_DEG_PER_M * travel)
-        return self.ref_T @ D, math.hypot(sigma_pos, dp), math.hypot(sigma_rot, dr)
-
-    def observe(self, P: Array) -> None:
-        """A drifting prior seen (whatever its frame became): the path grows by its step."""
-        step, step_turn = self._step(P)
-        self.path_m += step
-        self.turn_deg += step_turn
-        self.last_prior = P.copy()
+        sp, sr = drift_grown(sigma_pos, sigma_rot, P, self.fit_sigma,
+                             self.support or [self.ref_prior[:3, 3].tolist()])
+        return self.ref_T @ D, sp, sr
 
     def confirm(self, T: Array, P: Array) -> None:
         """A drifting frame the images placed at ``T``: the new reference, and odometry scale
@@ -1195,7 +1170,22 @@ class Drift:
                 s = float((odo_m * map_m).sum() / (odo_m ** 2).sum())
                 self.odo_scale = float(np.clip(s, *ODO_SCALE_RANGE))
         self.ref_T, self.ref_prior = T.copy(), P.copy()
-        self.last_prior, self.path_m, self.turn_deg = P.copy(), 0.0, 0.0
+        self.support = [*self.support, P[:3, 3].tolist()][-MAX_EVIDENCE:]
+
+
+def drift_grown(sigma_pos: float, sigma_rot: float, P: Array, fit_sigma: tuple[float, float],
+                support: list[list[float]]) -> tuple[float, float]:
+    """A drifting prior ``P``'s drift-grown sigmas (map.md §1 "Drift-grown sigma", P16; every
+    engine): the root sum of squares of the prior's (``sigma_pos``, ``sigma_rot``) and the drift
+    estimate's own at that pose, which is its fit's sigma (``fit_sigma``) and its extrapolation
+    away from the frames that supported it (``support``, their prior centres): ``DRIFT_POS_REL``
+    × the distance from ``P``'s prior position to the nearest in position, ``DRIFT_ROT_DEG_PER_M``
+    per metre of it in rotation."""
+    c = P[:3, 3]
+    d = min((float(np.linalg.norm(c - np.asarray(q, np.float64))) for q in support),
+            default=0.0)
+    return (math.hypot(sigma_pos, fit_sigma[0], DRIFT_POS_REL * d),
+            math.hypot(sigma_rot, fit_sigma[1], DRIFT_ROT_DEG_PER_M * d))
 
 
 @dataclass
@@ -1387,6 +1377,10 @@ class Placement:
     # the keyframes its pose depends on (its image pose's references, or the other engine's
     # anchors): a seeded component's sigma floor (``AnchoredMap._seed_floor``)
     refs: tuple[str, ...] = ()
+    # its image-only pose meets the measurable-pair threshold with one reference
+    # (``measurable_pose``): when it fails the prior checks, the images confirm the conflict
+    # (rejected ``prior_conflict``), else it is kept ``conflict_unsupported`` (api.md §4, P16)
+    measurable: bool = False
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -1550,17 +1544,30 @@ def _drift_inliers(d: Drift, obs: list[_DriftObs]) -> set[int]:
 
 
 def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[int, Placement]:
-    """The observations a drift estimate leaves out, each rejected ``prior_conflict`` (map.md §1
-    "Drift estimate"), its residual against its prior through that estimate."""
+    """The observations a drift estimate leaves out (map.md §1 "Drift estimate"), its residual
+    against its prior through that estimate: rejected ``prior_conflict`` when its image-only
+    pose meets the measurable-pair threshold (``Placement.measurable``), else kept at its prior
+    through that estimate, ``conflict_unsupported`` (api.md §4, P16). Each keeps its image-only
+    pose and its overlap (``inlier_share``): it still counts, and can support, in the next fit
+    (``_can_support``)."""
     out = {}
     for o in obs:
         if o.index in inliers:
             continue
-        T = d.predict(o.P, *o.sigma_prior)[0]
-        out[o.index] = Placement(o.name, "rejected", "prior_conflict", None, None, None,
-                                 o.pl.inliers, o.pl.method, pose_residual(o.T, T),
-                                 align_T=o.T.copy(), image_sigmas=o.sigma_image,
-                                 has_prior=True, prior_ref=T)
+        T, sp, sr = d.predict(o.P, *o.sigma_prior)
+        if o.pl.measurable:
+            out[o.index] = Placement(o.name, "rejected", "prior_conflict", None, None, None,
+                                     o.pl.inliers, o.pl.method, pose_residual(o.T, T),
+                                     align_T=o.T.copy(), image_sigmas=o.sigma_image,
+                                     has_prior=True, prior_ref=T,
+                                     inlier_share=o.pl.inlier_share, measurable=True)
+        else:
+            out[o.index] = Placement(o.name, "kept_at_prior", "no_overlap", T.copy(),
+                                     round(sp, 4), round(sr, 3), o.pl.inliers, "prior",
+                                     (0.0, 0.0), align_T=o.T.copy(),
+                                     image_sigmas=o.sigma_image, has_prior=True,
+                                     detail="conflict_unsupported",
+                                     inlier_share=o.pl.inlier_share)
     return out
 
 
@@ -1598,6 +1605,22 @@ def _can_support(pl: Placement) -> bool:
     least ``MEASURABLE_OVERLAP`` with at least one of them (``ref_share``), even when it
     conflicts under the current estimate, whatever its final status."""
     return pl.inliers >= MEASURABLE_INLIERS and pl.inlier_share >= MEASURABLE_OVERLAP
+
+
+def measurable_pose(uv: Array, ref_of: NDArray[np.intp], K: Intrinsics) -> bool:
+    """Whether an image-only pose meets the measurable-pair threshold (api.md §4, map.md §2 match
+    graph step 3, P16): on at least one confirmed or registered reference, at least
+    ``MEASURABLE_INLIERS`` of its inliers ``uv`` (``ref_of``: each inlier's reference) covering
+    at least ``MEASURABLE_OVERLAP`` of its 8 x 8 cells."""
+    return any(int((ref_of == j).sum()) >= MEASURABLE_INLIERS
+               and cell_share(uv[ref_of == j], K) >= MEASURABLE_OVERLAP
+               for j in np.unique(ref_of))
+
+
+def kf_detail(pl: Placement | None) -> str | None:
+    """A kept placement's ``detail`` (``AnchoredMap.retry_kept``: a stored kept job frame's is
+    ``no_image_pose``)."""
+    return "no_image_pose" if pl is None else pl.detail
 
 
 def _ref_ids(cands: list[Keyframe], ref_of: NDArray[np.intp]) -> tuple[str, ...]:
@@ -1775,6 +1798,24 @@ class AnchoredMap:
         # placements (``_placed``) by frame, prediction and candidates
         self._epi: dict[tuple[int, int, int], tuple[Features, Features, Epipolar | None]] = {}
         self._placed: dict[tuple[Any, ...], Placement] = {}
+        # the running job (map.md §2 match graph, step 6): the frames that gave scale evidence,
+        # the new keyframes each re-registration rested on (by re-registered id) and its
+        # keyframe's state before it (``_rereg_state``, to undo it), its frames with a prior
+        # registered so far (``_mine``, ``_against_priors``) and the drift estimate it
+        # registered under (``_job_used``); what a second registration takes (``plan_rerun``,
+        # ``plan_drift_rerun``): frames forced to a placement by name, stored kept keyframes
+        # not to re-register, the drift estimate to start from; whether it ran, and whether a
+        # cross-engine retry gave a drifting frame an image pose (``retry_kept``)
+        self._evidence_from: set[str] = set()
+        self._rereg_by: dict[str, set[str]] = {}
+        self._rereg_state: dict[str, tuple[Any, ...]] = {}
+        self._mine: list[tuple[FrameIn, Placement, Features]] = []
+        self._job_used: Drift | None = None
+        self._exclude: dict[str, Placement] = {}
+        self._no_rereg: set[str] = set()
+        self._start_drift: Drift | None = None
+        self.reran: set[str] = set()
+        self._retried_drifting = False
 
     # -- persistence ---------------------------------------------------------------------------
 
@@ -2187,7 +2228,7 @@ class AnchoredMap:
         if img is None:
             # no edge (map.md §2 match graph): the images give no pose
             return self.kept_at(f, reason, 0, detail="no_image_pose", pred=pred)
-        s, n, ratio, method, spi, sri, sub, refs = img
+        s, n, _, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
         if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
                                                                        2.0 * sp0)):
@@ -2198,27 +2239,24 @@ class AnchoredMap:
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
         if rot_only:
             ci = (spi, ci[1])
+        share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
+        measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         if sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only):
-            # beyond the combined bound (api.md §4): a conflict needs strong, independent
-            # support — enough inliers, and for a metric prior inliers on at least two
-            # references — and no supported hypothesis near the prior
-            refs_ok = int((np.bincount(sub[3][s.inliers], minlength=len(cands))
-                           >= MIN_INLIERS).sum())
-            strong = n >= STRONG_INLIERS and ratio >= STRONG_RATIO \
-                and (f.prior["trust"] != "metric" or refs_ok >= 2)
-            if not strong:  # its image-only pose may still support a drift estimate
+            # beyond the combined bound (api.md §4, P16): the images confirm the conflict only
+            # when its image-only pose meets the measurable-pair threshold, and no supported
+            # hypothesis lies near the prior; else it is kept, its image-only pose (which may
+            # still support a drift estimate: ``_can_support``) with it
+            if not measurable:
                 kept = self.kept_at(f, "no_overlap", n, detail="conflict_unsupported",
                                     pred=pred)
-                kept.inlier_share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
+                kept.align_T, kept.image_sigmas, kept.inlier_share = s.T, ci, share
                 return kept
             assert corr is not None
             hyp = None if rot_only else self._near_prior(f, corr, cands, T0, sp0, sr0, n)
             if hyp is None:
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr), align_T=s.T, image_sigmas=ci, has_prior=True,
-                                 prior_ref=ref,
-                                 inlier_share=ref_share(sub[0][s.inliers], sub[3][s.inliers],
-                                                        f.K))
+                                 prior_ref=ref, inlier_share=share, measurable=True)
             s, n, sub, refs = hyp
             spi, sri = s.sigmas()
             spi, sri = max(spi, MIN_SIGMA_POS_M), max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -2227,6 +2265,7 @@ class AnchoredMap:
                             (T0, sp0, sr0), ref)
         # (a frame with a prior: its displacement is against the prior, never unconstrained)
         pl.inlier_share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
+        pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
         return pl
 
@@ -2380,6 +2419,14 @@ class AnchoredMap:
             else:
                 self.scale.odometry = [*self.scale.odometry, e][-MAX_EVIDENCE:]
 
+    def _evidence(self, f: FrameIn, pl: Placement) -> None:
+        """A registered frame's scale evidence measured at placement (``Placement.evidence``),
+        recorded; the frame noted as scale evidence (``_evidence_from``: a pose duplicate that
+        gave some is undone by a second registration, map.md §2 match graph step 6)."""
+        if pl.evidence is not None:
+            pl.evidence()
+            self._evidence_from.add(f.name)
+
     # -- adding keyframes ----------------------------------------------------------------------
 
     def _keyframe_depth(self, f: FrameIn) -> tuple[NDArray[np.float32], Intrinsics, str, Any]:
@@ -2493,6 +2540,7 @@ class AnchoredMap:
             return
         self.scale.depth_residuals.setdefault("sensor", []).append(math.log(a.median_ratio))
         del self.scale.depth_residuals["sensor"][:-MAX_EVIDENCE]
+        self._evidence_from.add(f.name)
 
     def add_height_evidence(self, f: FrameIn, T: Array, depth: NDArray[np.float32],
                          K_grid: Intrinsics) -> None:
@@ -2521,6 +2569,7 @@ class AnchoredMap:
                               ][-MAX_EVIDENCE:]
         if aligned:
             self.scale.height_yaws = [*self.scale.height_yaws, yaw][-MAX_EVIDENCE:]
+        self._evidence_from.add(f.name)
         log.debug("%s: camera height %.3f m over planes %s (raw)", f.name, f.height_m, planes)
 
     # -- an update -----------------------------------------------------------------------------
@@ -2535,8 +2584,12 @@ class AnchoredMap:
         applies the last fit's outliers without fitting again, so no outlier stays registered. The
         drift estimate takes this job's confirmations (``_close_drift``); then the job ends
         (``end_job``: the pose-duplicate pass, the fusion of the keyframes once their statuses
-        are final). With ``hold`` the job stays open for another engine's frames (MapAnything,
-        ``retry_kept``): its caller ends it with ``end_job``."""
+        are final). When a pose duplicate served the job (``plan_rerun``), it registers once
+        more without the duplicates (map.md §2 match graph, step 6). With ``hold`` the job
+        stays open for another engine's frames (MapAnything, ``retry_kept``): its caller ends
+        it with ``end_job`` (and plans a second registration itself). A second registration
+        starts from ``_start_drift`` when one is planned, its ``_exclude`` frames forced to
+        their placement."""
         t0 = time.perf_counter()
         new = not self.keyframes
         self.begin_job()
@@ -2544,30 +2597,14 @@ class AnchoredMap:
         if static:  # else the job's features left static content out already (``job_features``)
             static_content(frames, prep)
         snap = self._snapshot()
-        used = copy.deepcopy(self.drift)
-        forced: dict[int, Placement] = {}
         self._keep_s = 0.0
-        passes, final = 0, False
         while True:
-            if passes:
-                self._restore(snap)
-            passes += 1
-            self.drift = copy.deepcopy(used)
-            self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = 0.0, [], []
-            self._defer = list(snap["defer"] or [])
-            out = self._register_job(frames, prep, forced, progress)
-            if final:  # the last pass applies the last fit's outliers
+            out, used = self._register_drift(frames, prep, snap, progress)
+            self._close_drift(frames, out, used)
+            pls = [out[i] for i in range(len(frames))]
+            if hold or not self.plan_rerun(pls):
                 break
-            got, outliers = self._fit_drift(frames, out, used)
-            if got is None and outliers.keys() == forced.keys():
-                break  # a fixed point: the estimate stays and leaves out the same frames
-            # re-test every frame under the accepted estimate (map.md §1): the left-out ones are
-            # the latest fit's, a frame left out before may come back
-            used = got or used
-            forced = outliers
-            final = passes >= DRIFT_PASSES
-        self._close_drift(frames, out, used)
-        pls = [out[i] for i in range(len(frames))]
+            self._restore(snap)
         fuse_s = self._keep_s
         if not hold:
             dups, end_s = self.end_job(pls, new)
@@ -2578,16 +2615,48 @@ class AnchoredMap:
                         "total": round(total, 3)}
         return pls
 
+    def _register_drift(self, frames: list[FrameIn], prep: list[_Prep], snap: dict[str, Any],
+                        progress: Callable[[str], None]) -> tuple[dict[int, Placement], Drift]:
+        """The job's registration (``_register_job``) under the drift estimate as it stands
+        (``_start_drift`` when a second registration starts from one), then the robust drift
+        fit (``_fit_drift``) until a fixed point (``update``). Returns the placements by frame
+        index and the estimate they were registered under (``_job_used``)."""
+        used = copy.deepcopy(self._start_drift or self.drift)
+        excluded = {i: self._exclude[f.name] for i, f in enumerate(frames)
+                    if f.name in self._exclude}
+        forced: dict[int, Placement] = {}
+        passes, final = 0, False
+        while True:
+            if passes:
+                self._restore(snap)
+            passes += 1
+            self.drift = copy.deepcopy(used)
+            self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = 0.0, [], []
+            self._defer = list(snap["defer"] or [])
+            out = self._register_job(frames, prep, {**forced, **excluded}, progress)
+            if final:  # the last pass applies the last fit's outliers
+                break
+            got, outliers = self._fit_drift(frames, out, used)
+            outliers = {i: pl for i, pl in outliers.items() if i not in excluded}
+            if got is None and outliers.keys() == forced.keys():
+                break  # a fixed point: the estimate stays and leaves out the same frames
+            # re-test every frame under the accepted estimate (map.md §1): the left-out ones are
+            # the latest fit's, a frame left out before may come back
+            used = got or used
+            forced = outliers
+            final = passes >= DRIFT_PASSES
+        self._job_used = copy.deepcopy(used)
+        return out, used
+
     def end_job(self, pls: list[Placement], new: bool) -> tuple[dict[str, Placement], float]:
         """The end of a job's registration (``update``; after the other engine's frames when it
         held the job open): the pose-duplicate pass (``_job_duplicates``), then the fusion of
         the keyframes left, in the order the job kept them, the depth scale, and a new
         camera-only map levelled by its floor (``_level_by_floor``, ``pls`` turned with it);
-        the job's caches are dropped.
+        the job's caches and its second-registration plan are dropped.
         Returns the duplicates' placements by frame name and the seconds of the fusion."""
         t = time.perf_counter()
-        dups = self._job_duplicates()
-        gone = {pl.keyframe for pl in dups.values()}
+        dups, gone = self._drop_duplicates(self._job_duplicates())
         pending, self._defer = self._defer or [], None
         for kf, image, ignore, depth, K_grid in pending:
             if kf.id not in gone and kf.contributes():
@@ -2598,17 +2667,24 @@ class AnchoredMap:
         for pl in dups.values():
             pl.keyframe = None
         self._epi, self._placed = {}, {}  # the job's caches end with it (memory)
+        self._exclude, self._no_rereg, self._start_drift = {}, set(), None
+        self._evidence_from, self._rereg_by, self._rereg_state = set(), {}, {}
+        self._mine, self._job_used, self.reran, self._retried_drifting = [], None, set(), False
         return dups, time.perf_counter() - t
+
+    def _rereg_ids(self) -> set[str]:
+        """The stored kept keyframes this job re-registered."""
+        return {e["keyframe"] for e in self.reregistered}
 
     def _job_duplicates(self) -> dict[str, Placement]:
         """The pose-duplicate pass (map.md §2 match graph, step 6; api.md §4): after the
-        registration fixed point, every frame the job registered, in canonical name order,
-        against the stored confirmed keyframes and the job's registered frames named before it
-        that are not duplicates themselves (``duplicate_among``: the registered pose within
+        registration fixed point, every frame the job registered, and every stored kept
+        keyframe it re-registered (a frame of this job for the pass, P16), in canonical name
+        order, against the stored confirmed keyframes and the job's frames named before it that
+        are not duplicates themselves (``duplicate_among``: the registered pose within
         ``duplicate_limits``, its image agreeing). Of a pair, the later-named frame is the
-        duplicate: rejected ``duplicate`` naming the other, its keyframe dropped (no content,
-        no reference). Returns their placements by frame name (``keyframe``: the dropped id,
-        for ``end_job``)."""
+        duplicate: rejected ``duplicate`` naming the other (``keyframe``: its id). Nothing is
+        changed (``_drop_duplicates``)."""
         def loaded(k: Keyframe) -> Features | None:
             self._load_kf(k)
             return k.feats
@@ -2616,10 +2692,12 @@ class AnchoredMap:
         def entry(k: Keyframe) -> tuple[str, str, Array, Callable[[], Features | None]]:
             return k.name, k.camera_id, k.T, functools.partial(loaded, k)
 
-        cands = [entry(k) for k in self.confirmed() if k.id in self._stored_ids]
+        again = self._rereg_ids()
+        cands = [entry(k) for k in self.confirmed() if k.id in self._stored_ids
+                 and k.id not in again]
         out: dict[str, Placement] = {}
-        for k in sorted((k for k in self.confirmed() if k.id not in self._stored_ids),
-                        key=lambda k: (natural_key(k.name), k.camera_id)):
+        for k in sorted((k for k in self.confirmed() if k.id not in self._stored_ids
+                         or k.id in again), key=lambda k: (natural_key(k.name), k.camera_id)):
             dup = duplicate_among(k.camera_id, k.T, loaded(k), cands)
             if dup is None:
                 cands.append(entry(k))
@@ -2627,12 +2705,86 @@ class AnchoredMap:
             out[k.name] = Placement(k.name, "rejected", "duplicate", inliers=k.inliers,
                                     duplicate_of=dup, keyframe=k.id)
             log.info("%s: a pose duplicate of %s", k.name, dup)
-        if out:
-            gone = {pl.keyframe for pl in out.values()}
-            self.keyframes = [k for k in self.keyframes if k.id not in gone]
-            self._added = [k for k in self._added if k.id not in gone]
-            self.height_inconsistent = [n for n in self.height_inconsistent if n not in out]
         return out
+
+    def _drop_duplicates(self, dups: dict[str, Placement]
+                         ) -> tuple[dict[str, Placement], set[str]]:
+        """The pass's duplicates applied: a job frame's keyframe dropped (no content, no
+        reference); a re-registered stored keyframe's re-registration undone (it stays kept, as
+        stored). Returns the job frames' placements by name and the keyframe ids whose fusion
+        is dropped."""
+        gone = {pl.keyframe for pl in dups.values() if pl.keyframe is not None}
+        again = gone & self._rereg_ids()
+        for kid in again:
+            kf = self.keyframe(kid)
+            assert kf is not None
+            (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg, kf.state, kf.method, kf.inliers, kf.rgb,
+             kf.reason, kf.height_ok, kf.seed, kf.seed_sigma) = self._rereg_state[kid]
+        self.reregistered = [e for e in self.reregistered if e["keyframe"] not in again]
+        drop = gone - again
+        self.keyframes = [k for k in self.keyframes if k.id not in drop]
+        self._added = [k for k in self._added if k.id not in drop]
+        self.height_inconsistent = [n for n in self.height_inconsistent if n not in dups]
+        return {n: pl for n, pl in dups.items() if pl.keyframe not in again}, gone
+
+    def _dup_effects(self, dups: dict[str, Placement], pls: list[Placement]) -> bool:
+        """Whether a duplicate of the pass served the job (map.md §2 match graph, step 6): as a
+        reference of another placement (``pls``: the job's, ``Placement.refs``; a seeded
+        component's), as the drift reference or support (a job frame registered with a
+        drifting prior: ``_close_drift`` confirmed it), as scale evidence (``_evidence_from``),
+        or for a re-registration (``_rereg_by``)."""
+        for name, d in dups.items():
+            kid = d.keyframe
+            kf = self.keyframe(kid or "")
+            assert kid is not None and kf is not None
+            if any(kid in p.refs for p in pls if p.name != name) \
+                    or any(k.seed == kid and k.id != kid for k in self.keyframes) \
+                    or any(kid in by for by in self._rereg_by.values()) \
+                    or name in self._evidence_from:
+                return True
+            if kid not in self._stored_ids and kf.prior is not None \
+                    and kf.prior["trust"] == "drifting":
+                return True
+        return False
+
+    def job_start(self) -> dict[str, Any]:
+        """A held job as it starts (``service.prior_first``): its fusion deferred to its end
+        (``_fuse_later``), whichever engine adds a keyframe first, and the state a second
+        registration starts again from (``job_restart``)."""
+        self._defer = [] if self._defer is None else self._defer
+        return self._snapshot()
+
+    def job_restart(self, start: dict[str, Any]) -> None:
+        """A held job back at ``start`` (``job_start``) for its second registration; the plan
+        (``excluded``, ``reran``) stays."""
+        self._restore(start)
+
+    def excluded(self) -> dict[str, Placement]:
+        """The frames a planned second registration forces to a placement, by name."""
+        return self._exclude
+
+    def plan_rerun(self, pls: list[Placement]) -> bool:
+        """Whether the job registers once more (map.md §2 match graph, step 6, P16): when a
+        frame the pose-duplicate pass rejects served the job (``_dup_effects``), the second
+        registration runs without the pass's duplicates (``_exclude``: their rejection; a
+        re-registered stored keyframe: ``_no_rereg``). Once per job (``reran``: its ``duplicates``)."""
+        if "duplicates" in self.reran:
+            return False
+        dups = self._job_duplicates()
+        if not dups or not self._dup_effects(dups, pls):
+            return False
+        again = self._rereg_ids()
+        for name, d in dups.items():
+            assert d.keyframe is not None
+            if d.keyframe in again:
+                self._no_rereg.add(d.keyframe)
+            else:
+                self._exclude[name] = Placement(name, "rejected", "duplicate",
+                                                inliers=d.inliers, duplicate_of=d.duplicate_of)
+        self.reran.add("duplicates")
+        log.info("pose duplicates %s served the job: it registers once more without them",
+                 sorted(dups))
+        return True
 
     def _prepare(self, f: FrameIn) -> _Prep:
         """A frame's features, its scene distance (depth image, else, for a suspicious frame,
@@ -2659,6 +2811,8 @@ class AnchoredMap:
                 "report": (self.prior_disagreement_deg, list(self.reregistered),
                            list(self.height_inconsistent)),
                 "defer": None if self._defer is None else list(self._defer),
+                "job": (set(self._evidence_from), copy.deepcopy(self._rereg_by),
+                        dict(self._rereg_state)),
                 "stored": [(k, k.T.copy(), k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method,
                             k.inliers, k.rgb, k.reason, k.height_ok, k.seed, k.seed_sigma)
                            for k in self.keyframes]}
@@ -2672,6 +2826,9 @@ class AnchoredMap:
         self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = \
             d, list(r), list(h)
         self._defer = None if snap["defer"] is None else list(snap["defer"])
+        ev, by, st = snap["job"]
+        self._evidence_from, self._rereg_by, self._rereg_state = set(ev), copy.deepcopy(by), \
+            dict(st)
         for k, T, sp, sr, state, method, n, rgb, reason, h_ok, seed, seed_s in snap["stored"]:
             k.T, k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method = T.copy(), sp, sr, state, method
             k.inliers, k.rgb, k.reason, k.height_ok = n, rgb, reason, h_ok
@@ -2694,6 +2851,7 @@ class AnchoredMap:
             if a is not None:
                 self.scale.depth_residuals.setdefault("sensor", []).append(math.log(a))
                 del self.scale.depth_residuals["sensor"][:-MAX_EVIDENCE]
+                self._evidence_from.add(f.name)
         if kind == "mono" and pl.status == "registered":
             assert pl.T is not None
             # its own scale brought onto the map's (the monocular model's metres vary from
@@ -2705,6 +2863,7 @@ class AnchoredMap:
                     depth = (depth * a).astype(np.float32)
                     self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
                     del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
+                    self._evidence_from.add(f.name)
             # its camera height, if known, refines the depth scale before it is fused (a
             # frame kept at its prior is no scale evidence: map.md §2)
             self.add_height_evidence(f, pl.T, depth, Kg)
@@ -2739,9 +2898,10 @@ class AnchoredMap:
 
         The result depends on the frames, not their request order (canonical order wherever an
         order matters). The pose duplicates are decided after it, once (``end_job``)."""
-        out: dict[int, Placement] = dict(forced)
+        out = {i: copy.copy(pl) for i, pl in forced.items()}
         pending = [i for i in range(len(frames)) if i not in forced]
         mine: list[tuple[FrameIn, Placement, Features]] = []
+        self._mine = mine  # the cross-engine retries check against them (``retry_kept``)
         kept_before = [k for k in self.keyframes if not k.usable()]
         if not self.confirmed():
             self._origin_of(frames, prep, pending, out, progress)
@@ -2768,7 +2928,7 @@ class AnchoredMap:
             if self._rounds(frames, prep, rest, out, results, seen, mine, kept_before, progress):
                 # the seed placed again against what registered since: an image pose when the
                 # images now give it one (its prior was only the component's start)
-                out[s] = results[s] = self._unseed(frames[s], prep[s], pl, kf)
+                out[s] = results[s] = self._unseed(frames[s], prep[s], pl, kf, mine)
                 pending = rest
                 progress(f"{frames[s].name}: registered ({out[s].method})")
                 continue
@@ -2776,6 +2936,11 @@ class AnchoredMap:
             results, seen, mine, out = before[0], before[1], before[2], before[3]
         for i in sorted(pending, key=lambda j: _order(frames, j)):
             out[i] = results.get(i) or Placement(frames[i].name, "rejected", "no_overlap")
+            if out[i].status == "kept_at_prior":
+                self._keep(frames[i], prep[i], out[i], progress)
+        # a frame the drift fit left out without a measurable pose: kept at its prior
+        # (``_drift_outliers``), stored as every kept frame
+        for i in sorted(forced, key=lambda j: _order(frames, j)):
             if out[i].status == "kept_at_prior":
                 self._keep(frames[i], prep[i], out[i], progress)
         return out
@@ -2832,13 +2997,16 @@ class AnchoredMap:
         pl.sigma_rot_deg = round(math.hypot(sr, pl.sigma_rot_deg), 3)
         return k0.seed, (sp, sr)
 
-    def _unseed(self, f: FrameIn, pr: _Prep, seed: Placement, kf: Keyframe) -> Placement:
+    def _unseed(self, f: FrameIn, pr: _Prep, seed: Placement, kf: Keyframe,
+                mine: list[tuple[FrameIn, Placement, Features]]) -> Placement:
         """A component's seed once frames registered through it (``_register_job`` step 3):
         placed again against the confirmed keyframes but its own (``place``). When its images
         now give it a pose (the distance limit as in ``_rounds``), its keyframe takes that
         image pose and its sigmas (the seed floor, ``_seed_floor``: a pose resting on a
         confirmed keyframe outside the component links it to the map) and that placement is
-        its own; else it stays at its prior, the seed."""
+        its own, checked against the job's other frames with a prior (``_checked``) and its
+        scale evidence recorded as any registered frame's; else it stays at its prior, the
+        seed."""
         cands = [k for k in self.candidates_for(f, pr.descriptor, self._predict(f))
                  if k is not kf]
         if not cands:
@@ -2846,6 +3014,9 @@ class AnchoredMap:
         pl = self.place(f, pr.feats, pr.descriptor, cands=cands)
         if pl.status != "registered" or (pr.close and pl.inliers < TOO_CLOSE_INLIERS):
             return seed
+        pl = self._checked(f, pl, mine, pr.feats)
+        if not pr.close:
+            self._evidence(f, pl)
         assert pl.T is not None and pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
         floor = self._seed_floor(pl)
         kf.T, kf.sigma_pos_m, kf.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
@@ -2905,8 +3076,8 @@ class AnchoredMap:
                     continue
                 pending.remove(i)
                 pl = self._checked(f, pl, mine, pr.feats)
-                if pl.evidence is not None and not pr.close:
-                    pl.evidence()
+                if not pr.close:
+                    self._evidence(f, pl)
                 out[i] = results[i] = pl
                 added.append(self._keep(f, pr, pl, progress))
             if not added:
@@ -2934,7 +3105,9 @@ class AnchoredMap:
     def _drift_evidence(self, frames: list[FrameIn], out: dict[int, Placement]
                         ) -> list[_DriftObs]:
         """The job's frames with a drifting prior whose images give a pose of their own
-        (registered, or rejected ``prior_conflict``): the drift fit's observations."""
+        (registered, rejected ``prior_conflict``, or kept ``conflict_unsupported`` when it can
+        support an estimate: ``_can_support``, map.md §1 "even if it conflicts"): the drift
+        fit's observations."""
         obs = []
         for i, f in enumerate(frames):
             pl = out.get(i)
@@ -2943,7 +3116,8 @@ class AnchoredMap:
             if pl.status == "registered" and pl.method in ("origin", "prior"):
                 assert pl.T is not None
                 T, sh = pl.T, (MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG)
-            elif (pl.status == "registered" or pl.reason == "prior_conflict") \
+            elif (pl.status == "registered" or pl.reason == "prior_conflict"
+                  or (pl.detail == "conflict_unsupported" and _can_support(pl))) \
                     and pl.align_T is not None and pl.image_sigmas is not None:
                 T, sh = pl.align_T, pl.image_sigmas
             else:
@@ -2999,14 +3173,15 @@ class AnchoredMap:
                      dp, dr, got_n, n)
             return None, _drift_outliers(used, obs, base)
         fitted.fit_sigma = (sp, sr)
+        fitted.support = [o.P[:3, 3].tolist() for o in obs if o.index in best_in]
         return fitted, _drift_outliers(fitted, obs, best_in)
 
     def _close_drift(self, frames: list[FrameIn], out: dict[int, Placement], used: Drift
                      ) -> None:
         """The drift estimate after the job: the one the job was registered under, then each
         registered drifting frame in canonical order (map.md §2: the request order never
-        matters) as the new reference (``Drift.confirm``: its odometry-scale evidence), and the
-        drifting priors after the last one as path (``Drift.observe``)."""
+        matters) as the new reference and a supporting frame (``Drift.confirm``: its
+        odometry-scale evidence)."""
         self.drift = copy.deepcopy(used)
         for i in sorted(range(len(frames)), key=lambda j: _order(frames, j)):
             f = frames[i]
@@ -3016,8 +3191,6 @@ class AnchoredMap:
             pl = out[i]
             if pl.status == "registered" and pl.T is not None:
                 self.drift.confirm(pl.T, P)
-            else:
-                self.drift.observe(P)
 
     def keyframe(self, kid: str) -> Keyframe | None:
         """The keyframe of id ``kid``, or None."""
@@ -3078,17 +3251,26 @@ class AnchoredMap:
         of ``new`` overlaps (``overlaps``), each placed again against the confirmed map
         (``place``, from its pose as kept, no scale evidence: map.md §2). One whose images now
         confirm it takes its registered pose and sigmas, becomes confirmed and is fused (its
-        depth as stored, at the map's scale now). Returns one ``{name, keyframe,
+        depth as stored, at the map's scale now). One a second registration of the job leaves
+        out (``_no_rereg``) stays kept. Returns one ``{name, keyframe,
         displacement_m, displacement_deg}`` per keyframe confirmed: how far confirmation moved
         it from its prior-placed pose."""
         out: list[dict[str, Any]] = []
         for kf in kept:
-            if kf.usable() or kf.prior is None or not any(self.overlaps(kf, n) for n in new):
+            if kf.usable() or kf.prior is None or kf.id in self._no_rereg:
+                continue
+            by = next((n.id for n in new if self.overlaps(kf, n)), None)
+            if by is None:
                 continue
             got = self._place_again(kf)
             if got is None:
                 continue
             pl, rgb = got
+            # what it rests on, and its state before (a pose duplicate undoes it: map.md §2)
+            self._rereg_by[kf.id] = {by, *pl.refs}
+            self._rereg_state[kf.id] = (kf.T.copy(), kf.sigma_pos_m, kf.sigma_rot_deg,
+                                        kf.state, kf.method, kf.inliers, kf.rgb, kf.reason,
+                                        kf.height_ok, kf.seed, kf.seed_sigma)
             assert pl.T is not None and pl.sigma_pos_m is not None \
                 and pl.sigma_rot_deg is not None
             seed = self._seed_floor(pl)  # through a seeded component: its floor
@@ -3122,11 +3304,14 @@ class AnchoredMap:
         until a pass confirms nothing new (a fixed point: a frame linked to the map only through
         one confirmed later in the same pass is tried again). A frame is placed again only when
         one of ``new``, or a frame confirmed here, is among its candidates. One that registers
-        takes its pose and sigmas and is fused (``Keyframe.contributes``; the job's pose-duplicate
-        pass follows, ``end_job``). Returns
-        the new placements by frame name. Frames kept for a failed check, or too close, stay
-        kept. Not repeated here: the drift fit and the prior-rotation correction of
-        ``_against_priors``, which ran with the first engine."""
+        goes through the prior checks against the job's other frames (``_checked``:
+        ``_against_priors``), records its scale evidence, takes its pose and sigmas and is
+        fused (``Keyframe.contributes``; the job's pose-duplicate pass follows, ``end_job``).
+        One whose images now give a pose that fails the prior checks takes that verdict
+        (api.md §4, P16): rejected ``prior_conflict`` (its keyframe dropped) or kept with
+        ``detail`` ``conflict_unsupported`` / ``loose_image_pose``. Returns the new placements
+        by frame name. Frames kept for a failed check, or too close, stay kept. The drift fit
+        over the job with these frames follows (``plan_drift_rerun``)."""
         ids = {k.id for k in new}
         out: dict[str, Placement] = {}
         tried: dict[str, frozenset[str]] = {}
@@ -3134,8 +3319,9 @@ class AnchoredMap:
         while grown:
             grown = False
             for f, kf in sorted(kept, key=lambda t: (natural_key(t[0].name), t[0].camera_id)):
-                if f.name in out or kf.usable() or f.unconfirmed is not None \
-                        or kf.reason != "no_overlap" or tried.get(f.name) == frozenset(ids):
+                if (f.name in out and out[f.name].status != "kept_at_prior") or kf.usable() \
+                        or f.unconfirmed is not None or kf.reason != "no_overlap" \
+                        or tried.get(f.name) == frozenset(ids):
                     continue
                 tried[f.name] = frozenset(ids)
                 grown |= self._retry_one(f, kf, ids, out)
@@ -3144,15 +3330,29 @@ class AnchoredMap:
     def _retry_one(self, f: FrameIn, kf: Keyframe, ids: set[str], out: dict[str, Placement]
                    ) -> bool:
         """One kept job frame placed again (``retry_kept``): whether it registered (its
-        keyframe id joins ``ids``, its placement into ``out``)."""
+        keyframe id joins ``ids``, its placement into ``out``; a new verdict without a
+        registration too)."""
         self._load_kf(kf)
         assert kf.feats is not None  # a job keyframe keeps its features
         cands = self.candidates_for(f, kf.descriptor, self._predict(f))
         if not any(c.id in ids for c in cands):
             return False
         pl = self.place(f, kf.feats, kf.descriptor, cands=cands)
-        if pl.status != "registered":
+        drifting = f.prior is not None and f.prior["trust"] == "drifting"
+        if pl.align_T is not None and drifting:
+            self._retried_drifting = True  # an image pose for the drift fit
+        if pl.status == "rejected":  # the images confirm a conflict (api.md §4)
+            self.keyframes = [k for k in self.keyframes if k is not kf]
+            self._added = [k for k in self._added if k is not kf]
+            out[f.name] = pl
             return False
+        if pl.status != "registered":
+            if pl.detail != kf_detail(out.get(f.name)) and pl.detail != "no_image_pose":
+                pl.keyframe = kf.id
+                out[f.name] = pl
+            return False
+        pl = self._checked(f, pl, self._mine, kf.feats)
+        self._evidence(f, pl)
         assert pl.T is not None and pl.sigma_pos_m is not None \
             and pl.sigma_rot_deg is not None
         seed = self._seed_floor(pl)  # through a seeded component: its floor
@@ -3169,6 +3369,30 @@ class AnchoredMap:
         pl.keyframe = kf.id
         out[f.name] = pl
         ids.add(kf.id)
+        return True
+
+    def plan_drift_rerun(self, frames: list[FrameIn], pls: list[Placement]) -> bool:
+        """After the cross-engine fixed point (``retry_kept``), the robust drift fit over the
+        job's frames with a prior as they ended (``pls``, of ``frames``), when a retry gave a
+        drifting frame an image pose (map.md §1: the estimate is fitted over every
+        image-confirmed drifting frame, whichever engine's frames confirmed it). Under the
+        estimate the job registered under (``_job_used``), when the fit changes it or leaves
+        out a frame not already left out, the job registers once more from the fitted
+        estimate with those frames forced to the fit's verdict (``_start_drift``, ``_exclude``).
+        Once per job (``reran``: its ``drift``); whether it does."""
+        if not self._retried_drifting or "drift" in self.reran or self._job_used is None:
+            return False
+        out = dict(enumerate(pls))
+        got, outliers = self._fit_drift(frames, out, self._job_used)
+        new = {i for i, pl in outliers.items()
+               if (out[i].status, out[i].reason, out[i].detail) != (pl.status, pl.reason,
+                                                                      pl.detail)}
+        if got is None and not new:
+            return False
+        self._start_drift = got or self._job_used
+        self._exclude.update({frames[i].name: pl for i, pl in outliers.items()})
+        self.reran.add("drift")
+        log.info("the cross-engine drift fit changed the job's: it registers once more")
         return True
 
     def _place_again(self, kf: Keyframe) -> tuple[Placement, NDArray[np.uint8]] | None:
@@ -3278,10 +3502,6 @@ class AnchoredMap:
                 pl.map_residual = _displacement(T, pl.align_T, pl.method == "rotation")
                 pl.T = T
         mine.append((f, pl, feats))
-
-    def depth_ref(self, k: Keyframe) -> DepthRef | None:
-        """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
-        return self._grid(k)
 
     def _grid(self, k: Keyframe) -> DepthRef | None:
         """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
