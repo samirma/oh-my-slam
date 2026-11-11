@@ -2046,7 +2046,7 @@
               "type": "null"
             }
           ],
-          "description": "With a prior: among hypotheses with support >= 0.25 within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior (position and rotation separately), the nearest the prior by hypot(dp / sigma_pos, dr / sigma_rot)."
+          "description": "With a prior: among hypotheses with support >= 0.25 within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior (position and rotation separately), the nearest the prior by hypot(dp / sqrt(sigma_pos_prior^2 + sigma_pos_hyp^2), dr / sqrt(sigma_rot_prior^2 + sigma_rot_hyp^2))."
         },
         "sigma_pos_m": {
           "type": [

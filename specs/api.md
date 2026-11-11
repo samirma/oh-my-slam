@@ -215,8 +215,9 @@ The versions read, revert and `--keep-versions` are O2.
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
-  support at least 0.25, nearest by hypot(dp / σp, dr / σr): the position and rotation
-  distances to the prior over the prior's position and rotation sigmas. Only hypotheses within
+  support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
+  position and rotation distances to the prior over the combined prior and hypothesis sigmas, the
+  same normalisation as the conflict bound. Only hypotheses within
   the conflict bound of §4 qualify: 3 × sqrt(σ_prior² + σ_hypothesis²), tested separately for
   position and rotation. When none does, the frame is `rejected` with `prior_conflict`, not
   located with `consistent_with_prior: false`; so a located frame with a prior always has
