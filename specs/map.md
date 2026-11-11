@@ -24,7 +24,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Without priors:**
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
-  * +z is up, estimated from gravity and the floor plane.
+  * +z is up, estimated from gravity and the floor plane;
+  * frames whose mutual parallax (baseline over median scene depth) is below 0.02, that is one
+    standpoint, are registered as a pure rotation about a common centre;
+  * the committed relative rotations of overlapping neighbours must agree with their
+    image-measured relative rotations: a hard limit (§4, `rotation_inconsistent`). With priors
+    this limit does not apply; the prior-rotation correction below covers it;
+  * sigmas stay honest: the containment targets (evaluation.md) apply.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -180,6 +186,10 @@ becomes a job with a `job_id`. A job goes through these states:
   * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
     that would make the map inconsistent, for example a frame set that registers to nothing.
+  * **Rotation consistency** (updates without priors only): a hard limit rejects the update,
+    `failed_checks` holding `rotation_inconsistent`, when the committed relative rotations
+    between overlapping neighbours disagree with their image-measured relative rotations by
+    more than 3° in median over the pairs, or by more than 10° on any single pair.
 
 ## 5. Objects (O8)
 
