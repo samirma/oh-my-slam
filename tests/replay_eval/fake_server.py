@@ -191,7 +191,7 @@ class Fake:
                 "rejected_share": rejected / max(1, len(job.inputs)),
                 "low_confidence_share": 0.0, "rebuilt": False, "prior_gravity_deg": 0.5,
                 "max_displacement_m": 0.01, "max_displacement_deg": 0.1,
-                "prior_disagreement_deg": 0.0,
+                "prior_disagreement_deg": 0.0, "reregistered": [],
                 "accepted": not gated, "failed_checks": ["max_residual_m"] if gated else []}
 
     def job_body(self, job: Job) -> dict[str, Any]:
@@ -327,6 +327,7 @@ class Fake:
                 "centre_m": c.tolist(), "size_m": [0.5, 0.4, 0.3], "yaw_deg": 0.0,
                 "sigma_centre_m": 0.02, "extent_seen": {"x": "full", "y": "full", "z": "partial"},
                 "mean_rgb": [10, 20, 30], "color": [1, 2, 3], "state": "confirmed",
+                "detection_votes": [{"label": label, "share": 1.0}],
                 "moved_from_m": None, "first_seen_version": 1, "last_seen_version": v["version"],
                 "region": 1 if w[0] < 4 else 2,
                 "supported_by": None if sup is None else {**sup, "verified_version": 1},

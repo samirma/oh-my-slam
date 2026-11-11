@@ -85,6 +85,11 @@ DEFS: list[Def] = [
     Def("scale.error_metric", "C2", "Scale error with metric priors", "max", "ratio"),
     Def("scale.error_camera_height", "C2", "Scale error with camera height only", "max",
         "ratio"),
+    Def("scale.error_by_direction", "C2", "Worst relative scale error over four horizontal "
+        "directions (0, 45, 90, 135 deg) of the confirmed keyframes' truth positions (error), "
+        "and its verification (within): that error over 3 x the stated scale_sigma_rel, and "
+        "with a camera height and no priors |floor_z_m| over 0.02 m (<= 1 passes)", "max",
+        "ratio", parts=(("error", "max", "ratio"), ("within", "max", "ratio"))),
     Def("frame.shift", "C1", "Shift of stored keyframes between consecutive versions beyond "
         "gauge_shift (medians)", "median", "", parts=(("pos_m", "median", "m"),
                                                          ("rot_deg", "median", "deg"))),
@@ -118,6 +123,9 @@ DEFS: list[Def] = [
     Def("grid.floor_false_obstacles", "C9", "Occupied cells, and present objects lower than "
         "0.06 m, on observed open floor of the floor plan in a keyframe's horizontal field of "
         "view, away from every truth object (count)", "sum", "count", ("O6",), True),
+    Def("grid.unconfirmed_occupancy", "C9, C10", "Occupied cells, and floor-standing objects, "
+        "on open floor of the floor plan inside the view of kept_at_prior frames only and of no "
+        "confirmed frame (count)", "sum", "count", ("O6",), True),
     Def("grid.id_stability", "C9", "Regions and passages keeping their id between consecutive "
         "versions where their geometry did not change", "share", "share", ("O6",)),
     Def("features.region_set", "C9", "Frontiers bordering a region, and objects in or on one, "
@@ -179,6 +187,11 @@ DEFS: list[Def] = [
 BY_ID = {d.id: d for d in DEFS}
 CONTRACT_TARGET = {"op": ">=", "value": 1.0}  # zero violations (evaluation.md "Contracts")
 WARPING_SLIP_M = 0.3  # evaluation.md "Gate parameters": a warping update's slip
+CLEAN_SIGMAS = 3.0  # ... and a clean one's priors stay within this many sigmas of the truth
+DIRECTIONS_DEG = (0.0, 45.0, 90.0, 135.0)  # scale.error_by_direction: the directions measured
+SCALE_SIGMAS = 3.0  # ... within this many stated scale sigmas
+FLOOR_ZERO_M = 0.02  # ... and with a camera height floor_z_m this near 0
+VIEW_RAYS = 64  # grid.unconfirmed_occupancy: rays per camera bounding its view by the walls
 
 
 @dataclass
@@ -519,7 +532,8 @@ class Measure:
     def slip(self, j: JobObs) -> tuple[float, bool] | None:
         """A job's prior slip against the truth after its first frame (the largest position
         offset of its later priors once its first prior is put on its truth pose), and whether
-        every prior stays within its position sigma; None without two priors with truth."""
+        every prior stays within ``CLEAN_SIGMAS`` of its position sigma (a clean update,
+        evaluation.md "Gate parameters"); None without two priors with truth."""
         rows = [(self.by_name[n], j.priors[n]) for n in j.names
                 if n in j.priors and n in self.by_name and self.by_name[n].truth is not None]
         if len(rows) < 2:
@@ -530,13 +544,15 @@ class Measure:
         for f, p in rows[1:]:
             d = float(np.linalg.norm((D @ mat4(p["T_map_cam"]))[:3, 3] - f.truth[:3, 3]))  # type: ignore[index]
             worst = max(worst, d)
-            within = within and d <= float(p.get("sigma_pos_m", self.p.default_sigma_m))
+            within = within and d <= CLEAN_SIGMAS * float(p.get("sigma_pos_m",
+                                                                 self.p.default_sigma_m))
         return worst, within
 
     def gate(self) -> None:
         """C6 at the gate parameters (``rpl_replay.GATE``): a warping update (priors slipping by
-        WARPING_SLIP_M or more) must be rejected; a clean one (priors within their sigmas, or no
-        priors) of a passing episode accepted. Updates neither warping nor clean are left out."""
+        WARPING_SLIP_M or more) must be rejected; a clean one (priors within CLEAN_SIGMAS of
+        their sigmas, or no priors) of a passing episode accepted. Updates neither warping nor
+        clean are left out."""
         for j in self.rec.jobs:
             if j.job.get("state") not in ("committed", "rejected"):
                 continue
@@ -579,6 +595,50 @@ class Measure:
             self.s.add("scale.error_camera_height", err)
         else:
             self.s.add("diag.scale_error_monocular", err)
+        self.scale_by_direction()
+
+    def scale_by_direction(self) -> None:
+        """scale.error_by_direction (map.md §1): the linear map from the confirmed keyframes'
+        horizontal map positions to their truth positions (after the yaw of the alignment, no
+        scale), its relative scale error along each of DIRECTIONS_DEG over SCALE_SIGMAS of the
+        stated scale_sigma_rel (the map's metres are its stated scale); with keyframes along a
+        line, only along it. With camera heights and no priors, |floor_z_m| over FLOOR_ZERO_M too
+        (the floor is z 0, map.md §1). Samples: the worst error (``error``) and the worst
+        ratio (``within``, <= 1 passes)."""
+        if self.al is None or not self.rec.frames:
+            return
+        latest = self.rec.frames[max(self.rec.frames)]
+        sigma = latest.get("scale_sigma_rel")
+        rows = [r for r in latest["frames"] if r.get("pose_state", "fused") != "kept_at_prior"
+                and r["name"] in self.by_name and self.by_name[r["name"]].truth is not None]
+        if sigma is None or len(rows) < 2:
+            return
+        M = np.array([frame_pose(r)[:2, 3] for r in rows])
+        W = np.array([self.by_name[r["name"]].truth[:2, 3] for r in rows])  # type: ignore[index]
+        Mc, Wc = M - M.mean(axis=0), W - W.mean(axis=0)
+        _, sv, Vt = np.linalg.svd(Mc, full_matrices=False)
+        if sv[0] < 1e-6:
+            return
+        allowed = SCALE_SIGMAS * max(float(sigma), 1e-6)
+        if sv[-1] / math.sqrt(len(rows)) < self.p.align_min_spread_m / 4.0:
+            u = Vt[0]  # along a line: its direction only
+            x = Mc @ u
+            a = (x @ Wc) / float(x @ x)
+            errors = [abs(float(np.linalg.norm(a)) - 1.0)]
+        else:
+            A, *_ = np.linalg.lstsq(Mc, Wc, rcond=None)
+            errors = []
+            for deg in DIRECTIONS_DEG:
+                u = np.array([math.cos(math.radians(deg)), math.sin(math.radians(deg))])
+                errors.append(abs(float(np.linalg.norm(u @ A)) - 1.0))
+        ratios = [e / allowed for e in errors]
+        heights = self.p.heights and self.rec.mode != "metric" and any(
+            self.by_name[n].height_m is not None for n in self.rec.sent)
+        if heights and self.rec.grid is not None:
+            ratios.append(abs(float(self.rec.grid["floor_z_m"])) / FLOOR_ZERO_M)
+        self.s.info["scale_by_direction"] = ratios
+        self.s.add("scale.error_by_direction#error", max(errors))
+        self.s.add("scale.error_by_direction#within", max(ratios))
 
     def stability(self) -> None:
         gauge: dict[int, dict[str, Any]] = {}
@@ -748,6 +808,8 @@ class Measure:
             s.add("grid.band_occupied", bool(ok))
         s.add("grid.floor_false_obstacles",
               self.false_obstacles(W, cls, st == 2, ob > 0, frames["frames"], fz))
+        s.add("grid.unconfirmed_occupancy",
+              self.unconfirmed(W, cls, st == 2, frames["frames"], fz))
         passages = [(sim.point([*pg["centre_m"], fz])[:2], sim.s * float(pg["width_m"]))
                     for pg in g["passages"]]
         for door in self.plan.doors:
@@ -798,6 +860,57 @@ class Measure:
                 w = sim.point(c)[:2]
                 i = int(np.argmin(np.linalg.norm(W - w, axis=1)))
                 count += int(bool(open_floor[i] and seen[i]))
+        return count
+
+    def in_view(self, W: Arr, r: dict[str, Any]) -> Arr:
+        """The world cells ``W`` (x, y) inside a frame's view: in its horizontal field of view
+        and nearer than the floor plan's wall along their bearing (``VIEW_RAYS`` rays)."""
+        assert self.al is not None and self.plan is not None
+        cam = self.ep.cameras.get(r["camera_id"])
+        if cam is None:
+            return np.zeros(len(W), dtype=bool)
+        T = self.al[0].pose(frame_pose(r))
+        yaw, half = optical_yaw_deg(T[:3, :3]), hfov_deg(cam) / 2.0
+        v = W - T[:2, 3]
+        d = (np.degrees(np.arctan2(v[:, 1], v[:, 0])) - yaw + 180.0) % 360.0 - 180.0
+        bearings = np.linspace(-half, half, VIEW_RAYS)
+        walls = np.array([ray_cast(self.plan, T[:2, 3], yaw + float(b)) or math.inf
+                          for b in bearings])
+        reach = walls[np.clip(np.round((d + half) / (2 * half) * (VIEW_RAYS - 1)).astype(int),
+                              0, VIEW_RAYS - 1)]
+        out: Arr = (np.abs(d) <= half) & (np.linalg.norm(v, axis=1) <= reach)
+        return out
+
+    def unconfirmed(self, W: Arr, cls: Arr, occupied: Arr, frames: list[dict[str, Any]],
+                    fz: float) -> int:
+        """grid.unconfirmed_occupancy (map.md §2, §6): occupied cells, and floor-standing
+        objects, on open floor of the floor plan (more than one cell from every truth object)
+        inside the view of kept_at_prior frames only, and of no image-confirmed frame."""
+        assert self.al is not None
+        sim = self.al[0]
+        cell = float(self.rec.grid["cell_m"]) * sim.s  # type: ignore[index]
+        open_floor = cls == FLOOR
+        for t in self.truth_objects:
+            half = (np.asarray(t.size[:2], dtype=float) / 2.0) if t.size is not None \
+                else np.zeros(2)
+            open_floor &= ~np.all(np.abs(W - t.centre[:2]) <= half + cell, axis=1)
+        kept = np.zeros(len(W), dtype=bool)
+        confirmed = np.zeros(len(W), dtype=bool)
+        for r in frames:
+            if r.get("pose_state", "fused") == "kept_at_prior":
+                kept |= self.in_view(W, r)
+            else:
+                confirmed |= self.in_view(W, r)
+        only = open_floor & kept & ~confirmed
+        count = int((occupied & only).sum())
+        if "O8" in self.caps and self.rec.objects:
+            for o in self.rec.objects[max(self.rec.objects)]["objects"]:
+                c = o["centre_m"]
+                if o.get("state") == "struck" or abs(
+                        float(c[2]) - float(o["size_m"][2]) / 2.0 - fz) > self.p.low_object_m:
+                    continue  # not floor-standing
+                i = int(np.argmin(np.linalg.norm(W - sim.point(c)[:2], axis=1)))
+                count += int(bool(only[i]))
         return count
 
     def grid_ids(self) -> None:

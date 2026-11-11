@@ -512,3 +512,68 @@ def test_sweep_span_over_count(world: Any) -> None:
     rec.jobs = [job(names)]
     s = measure(rec, ep, sweep_prefixes=("scan",))
     assert s.values["diag.sweep_yaw_span_ratio"] == [pytest.approx(1.1, abs=0.02)]
+
+
+def test_scale_by_direction(world: Any) -> None:
+    """scale.error_by_direction: the confirmed keyframes' map positions against the truth along
+    four horizontal directions, over 3 x the stated sigma; a map stretched 5 % along one axis
+    fails at a 1 % sigma and passes at a 5 % one."""
+    ep, syn, _, _ = world
+    names = keyframes(syn)
+    fr = rows(ep, names)
+    rec = record(["O6"], frames={1: {"frames": fr, "scale_sigma_rel": 0.01}})
+    rec.jobs = [job(names)]
+    assert measure(rec, ep).values["scale.error_by_direction#within"][0] < 0.2
+    stretched = [dict(r) for r in fr]
+    for r in stretched:
+        T = np.array(r["T_map_cam"])
+        T[0, 3] *= 1.05
+        r["T_map_cam"] = T.tolist()
+    rec.frames = {1: {"frames": stretched, "scale_sigma_rel": 0.01}}
+    worst = measure(rec, ep).values["scale.error_by_direction#within"][0]
+    rec.frames = {1: {"frames": stretched, "scale_sigma_rel": 0.05}}
+    assert worst > 1.0 >= measure(rec, ep).values["scale.error_by_direction#within"][0]
+    # without a stated sigma or two keyframes: no sample; kept frames are no evidence
+    rec.frames = {1: {"frames": fr}}
+    assert "scale.error_by_direction#within" not in measure(rec, ep).values
+    kept = [{**r, "pose_state": "kept_at_prior"} for r in fr[1:]]
+    rec.frames = {1: {"frames": [fr[0], *kept], "scale_sigma_rel": 0.01}}
+    assert "scale.error_by_direction#within" not in measure(rec, ep).values
+
+
+def test_scale_by_direction_on_a_line_and_floor(world: Any) -> None:
+    """Keyframes along a line are measured along it only; with camera heights and no priors
+    the floor_z_m offset from 0 counts too."""
+    ep, syn, _, _ = world
+    names = keyframes(syn)
+    fr = rows(ep, names)
+    for r in fr:  # every keyframe on the map's x axis
+        T = np.array(r["T_map_cam"])
+        T[1, 3] = 0.0
+        r["T_map_cam"] = T.tolist()
+    rec = Record("e041", "none", "m", ["O6"], frames={1: {"frames": fr,
+                                                          "scale_sigma_rel": 0.5}})
+    rec.jobs = [job(names)]
+    rec.sent = names
+    rec.grid = grid(np.ones((4, 4)), (-1.0, -1.0), floor_z_m=0.04)
+    for f in ep.all_frames():
+        f.height_m = None
+    assert len(measure(rec, ep).info["scale_by_direction"]) == 1  # along the line only
+    for f in ep.all_frames():
+        f.height_m = 1.0
+    s = measure(rec, ep)
+    assert len(s.info["scale_by_direction"]) == 2
+    assert s.values["scale.error_by_direction#within"][0] == pytest.approx(2.0)  # 0.04 m / 0.02 m
+
+
+def test_unconfirmed_occupancy(world: Any) -> None:
+    """grid.unconfirmed_occupancy: occupied open-floor cells seen only by kept_at_prior frames
+    count; the same cells seen by a confirmed frame do not."""
+    ep, syn, plan, raster = world
+    names = syn.names["r1/start"]
+    rec = record(["O6"], frames={1: {"frames": rows(ep, names, state="kept_at_prior")}})
+    rec.jobs = [job(names)]
+    rec.grid = grid(np.full((20, 40), 2), (-1.0, -1.45), 0.1)
+    kept = measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0]
+    rec.frames = {1: {"frames": rows(ep, names)}}
+    assert kept > 0 == measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0]

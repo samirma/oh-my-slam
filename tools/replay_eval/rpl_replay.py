@@ -17,7 +17,8 @@ from rpl_images import mime
 
 TERMINAL = {"committed", "rejected", "cancelled", "failed"}
 # the gate the skill sends (specs/evaluation.md, C6); an empty accept_if checks nothing
-GATE = {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_rejected_share": 0.5}
+GATE = {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05, "max_displacement_m": 0.10,
+        "max_displacement_deg": 3, "max_rejected_share": 0.5}
 MAP = "/api/maps/{name}"
 
 

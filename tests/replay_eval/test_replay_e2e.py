@@ -55,6 +55,8 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
         res = run(fake, root, tmp_path / "out" / "r.json", "--house",
                   str(tmp_path / "house.json"), "--episode", "e041")
         assert fake.accept_ifs and all(a == {"max_residual_m": 0.10, "max_gauge_shift_m": 0.05,
+                                             "max_displacement_m": 0.10,
+                                             "max_displacement_deg": 3,
                                              "max_rejected_share": 0.5}
                                        for a in fake.accept_ifs)
         priors = [p for p in fake.priors if p["trust"] != "none"]
@@ -112,8 +114,11 @@ def test_base_episode_all_capabilities(base_episode: tuple[Path, synth.Synth],
     assert ov["gate.others_accepted"]["value"] == 1.0
     assert ov["grid.floor_false_obstacles"]["status"] in ("pass", "fail")
     # latencies of the fake (milliseconds, noisy ratios) are not judged here
+    # the fake's camera-height map is 5 % off (above) against a smaller stated sigma, and its
+    # floor is not at z 0: judged, and failing
+    assert ov["scale.error_by_direction"]["status"] == "fail"
     fails = {k: m for k, m in ov.items() if m["status"] == "fail" and m["unit"] != "s"
-             and k != "locate.sigma_containment"}
+             and k not in ("locate.sigma_containment", "scale.error_by_direction")}
     # the fake locates some frames wrongly with a 1 cm sigma: never contained
     assert ov["locate.sigma_containment"]["value"] < 1.0
     assert not fails, fails

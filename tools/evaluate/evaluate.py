@@ -84,6 +84,8 @@ NOT_MEASURED = {
     "locate.sigma_containment": TRUTH, "locate.sigma_tightness": TRUTH,
     "update.sigma_containment": TRUTH, "scale.error_metric": TRUTH + " (metric priors)",
     "scale.error_camera_height": TRUTH, "inputs.reason_agreement": TRUTH,
+    "scale.error_by_direction": TRUTH + " (truth positions in four directions)",
+    "grid.unconfirmed_occupancy": TRUTH + " (floor plan, kept_at_prior frames' views)",
     "gate.warping_rejected": TRUTH + " (warping updates)", "gate.others_accepted": TRUTH,
     "grid.floor_plan_agreement": TRUTH + " (floor plan)",
     "passages.door_recall": TRUTH + " (floor plan)", "passages.geometry": TRUTH,
