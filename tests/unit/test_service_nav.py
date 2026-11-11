@@ -338,7 +338,9 @@ def test_locate_places_frames_with_sigmas_and_records_the_pose(room_map: tuple[N
     for res, T in zip(doc["frames"], truth, strict=True):
         assert res["status"] == "located" and res["reason"] is None
         err = np.linalg.norm(np.asarray(res["T_map_cam"])[:3, 3] - T[:3, 3])
-        assert err < 0.03 and 0 < res["sigma_pos_m"] < 0.1 and 0 < res["sigma_rot_deg"] < 2
+        # calibrated (mapping.sigmas): this map's keyframes carry no depth kind, so the
+        # no-depth noise floor (2.1 deg) adds to the keyframes' own calibrated sigmas
+        assert err < 0.03 and 0 < res["sigma_pos_m"] < 0.15 and 2.1 <= res["sigma_rot_deg"] < 4
         assert 0 < res["inlier_ratio"] <= 1 and res["ambiguity"] is None and res["rivals"] == []
     assert doc["frames"][0]["consistent_with_prior"] is None
     assert doc["frames"][1]["consistent_with_prior"] is True

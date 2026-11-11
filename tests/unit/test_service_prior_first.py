@@ -482,9 +482,10 @@ def test_a_keyframe_without_its_image_is_no_locate_reference(client: Client,
     assert meta["keyframes"] == ["a0"]
 
 
-def test_bare_walls_with_depth_and_a_drifting_prior_register(client: Client) -> None:
+def test_bare_walls_with_depth_and_a_drifting_prior_are_kept(client: Client) -> None:
     """A bare wall (plain, no features) with a depth image and a prior is not rejected by the
-    checks: its depth registers it on the map's (prior plus depth geometry)."""
+    checks: it is kept at its prior, even though its depth would agree with the map's (api.md
+    §4: depth agreement alone never confirms a frame that failed a check)."""
     poses = [base_pose(26 * k) for k in range(3)]
     fr, files = frames_for(client, poses, tag="a", trust="drifting")
     client.update("m", fr, files, cameras={"cam": CAM})
@@ -493,10 +494,10 @@ def test_bare_walls_with_depth_and_a_drifting_prior_register(client: Client) -> 
     files["w0"] = plain(320, 240)
     job = client.update("m", fr, files)
     i = job["inputs"][0]
-    assert (i["status"], i["reason"]) == ("registered", None)
-    assert np.linalg.norm(np.array(i["T_map_cam"])[:3, 3] - T[:3, 3]) < 0.05
+    # depth agreement alone never confirms a frame whose image failed a check (api.md §4)
+    assert (i["status"], i["reason"]) == ("kept_at_prior", "plain")
     v = client.service.store.version("m")
-    assert v["frames"][-1]["method"] == "depth"
+    assert v["frames"][-1]["method"] == "prior"
     # without a depth image a bare wall is still rejected by the checks
     nf, nfiles = frames_for(client, [base_pose(100)], tag="p", trust="drifting", depth=False)
     buf = io.BytesIO()
@@ -585,8 +586,7 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
                                                              slip: float) -> None:
     """After a first textured frame the update's priors slip by 0.3 m: the one textured frame
     after the slip conflicts with its prior (rejected, a fifth of the update), and the bare
-    walls are kept at their priors or placed by their depth, which cannot see a slide along the
-    wall. No stored keyframe moves: ``max_residual_m`` gates the stored keyframes only (map.md
+    walls are kept at their priors (a check failed: depth never confirms them). No stored keyframe moves: ``max_residual_m`` gates the stored keyframes only (map.md
     §4), so the C6 gate parameters accept it; a client gate on ``max_rejected_share`` rejects
     it, in the dry run too. The same update with priors that agree is accepted."""
     poses = [base_pose(30 * k) for k in range(6)]
@@ -605,7 +605,9 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
     q = job["quality"]
     if slip == 0.0:
         assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"], (q, job["inputs"])
-        assert [i["status"] for i in job["inputs"]] == ["registered"] * 5
+        # the bare walls are kept at their priors (api.md §4: never confirmed by depth alone)
+        assert [i["status"] for i in job["inputs"]] == [
+            "registered", "kept_at_prior", "registered", "kept_at_prior", "kept_at_prior"]
         assert q["previous_residuals"]["max_m"] < 0.02
         return
     assert job["state"] == "rejected" and q["failed_checks"] == ["max_rejected_share"]
@@ -853,6 +855,8 @@ def test_a_camera_only_frame_at_a_stored_pose_is_a_duplicate(
     fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
     fr, files = frames_for(client, [base_pose(35)], tag="z", trust=None)
+    for T in (base_pose(0), base_pose(35)):  # MapAnything's poses: the truth
+        client.backend.mv_add(shot(T)[0], T)
     job = client.update("m", fr, files)
     assert (job["inputs"][0]["reason"], job["inputs"][0].get("duplicate_of")) == (
         "duplicate", "a1"), job["inputs"]

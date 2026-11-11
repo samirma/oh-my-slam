@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 
@@ -59,10 +60,16 @@ def test_engine_switch_and_camera_only_counts(monkeypatch: pytest.MonkeyPatch) -
 
 def test_a_camera_only_map_turning_in_place(client: Client) -> None:
     """The origin by the prior-first engine, the turn by unposed MapAnything calls aligned on
-    the map's keyframes: its metres are not the map's (``mv_scale``)."""
+    the map's keyframes: its metres are not the map's (``mv_scale``). One standpoint: the frames
+    are registered as a pure rotation about the origin's centre (map.md §1), MapAnything's
+    rotations replaced by the two-view ones."""
     client.backend.mv_scale = 3.0
-    poses = [base_pose(25.0 * k) for k in range(6)]
+    poses = [base_pose(25.0 * k, offset=0.0) for k in range(6)]
     fr, files = ma_frames(client, poses, trust=None, depth=False, height_above_floor_m=0.5)
+    for T in poses[1:]:  # MapAnything turns them wrongly; the standpoint corrects it
+        bad = T.copy()
+        bad[:3, :3] = cv2.Rodrigues(np.array([0.0, 0.0, 0.06]))[0] @ T[:3, :3]
+        client.backend.mv_pose[hashlib.sha256(shot(T)[0]).hexdigest()] = bad
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "committed", job
     assert [i["status"] for i in job["inputs"]] == ["registered"] * 6
@@ -75,9 +82,9 @@ def test_a_camera_only_map_turning_in_place(client: Client) -> None:
         cos = (np.trace(rel_true[:3, :3].T @ rel[:3, :3]) - 1) / 2
         assert np.degrees(np.arccos(min(1.0, cos))) < 0.5
         assert np.linalg.norm(rel[:3, 3] - rel_true[:3, 3]) < 0.02
-        assert i["sigma_rot_deg"] >= register_ma.UNPOSED_SIGMA_ROT_DEG
     v = client.service.store.version("m")
-    assert {f["method"] for f in v["frames"][1:]} == {"mapanything"}
+    assert {f["method"] for f in v["frames"][1:]} == {"rotation"}
+    assert job["quality"]["failed_checks"] == []
     h = client.get("/api/health", "Health")["timings"]
     assert h["registration_mapanything_per_frame"]["count"] == 5
     assert h["checks_per_frame"]["source"] == "measured"
@@ -197,3 +204,19 @@ def test_registration_edges(tmp_path: Path) -> None:
     r = register_ma.Registration(mv, [register_ma.New(9, tmp_path / "missing.jpg", K)], stored)
     assert len(r.anchors(r.new)) == 2  # no thumbnail: by recency
     assert register_ma.baseline([np.eye(4)]) == 0.0
+
+
+def test_camera_only_rotations_that_disagree_with_the_images_fail_the_hard_limit(
+        client: Client) -> None:
+    """map.md §4 rotation_inconsistent: an update without priors whose committed relative
+    rotations of overlapping neighbours disagree with their two-view rotations (MapAnything
+    turns frames that moved, not one standpoint) is rejected by the hard limit."""
+    poses = [base_pose(0, 0.25 * k - 0.5, 0.0) for k in range(4)]
+    fr, files = ma_frames(client, poses, trust=None, depth=False, height_above_floor_m=0.5)
+    for k, T in enumerate(poses[1:], 1):
+        bad = T.copy()
+        bad[:3, :3] = cv2.Rodrigues(np.array([0.0, 0.0, 0.3 * (-1) ** k]))[0] @ T[:3, :3]
+        client.backend.mv_pose[hashlib.sha256(shot(T)[0]).hexdigest()] = bad
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "rejected", job
+    assert job["quality"]["failed_checks"] == ["rotation_inconsistent"]

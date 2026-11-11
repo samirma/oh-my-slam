@@ -24,7 +24,7 @@ in the priors' frame, and never re-posed:
   lies in the map frame, api.md §4). Without any prior, the first frame is the origin
   (``first_camera``): with a camera height, the origin is the floor below it (map.md §1).
 * **Kept at prior.** A frame with a prior that its images do not confirm (no image pose, an
-  image pose too loose, an image pose beyond 3 prior sigmas without strong support, an image
+  image pose too loose, an image pose beyond the conflict bound without strong support, an image
   that failed the checks: ``FrameIn.unconfirmed``, or a frame too close) is ``kept_at_prior``
   (api.md §4): at its prior as placed (metric as given; drifting through the odometry's
   correction) with the prior's sigmas (drifting: grown by the drift), prior residual 0. It is
@@ -35,9 +35,15 @@ in the priors' frame, and never re-posed:
   ``kept_at_prior`` keyframe (``REREGISTER_OVERLAP`` of its view), that keyframe is placed
   again against the confirmed map (``reregister``); confirmed, its pose leaves
   ``kept_at_prior`` and it is fused (``reregistered``: name and displacement).
-* **prior_conflict.** Only when a strongly supported image pose lies beyond ``K_SIGMA`` of the
-  prior's own sigmas and no image hypothesis of support >= ``SUPPORT_MIN`` lies within them
-  (``_near_prior``); a supported hypothesis near the prior registers the frame instead.
+* **prior_conflict.** Only when a strongly supported image pose lies beyond the combined bound
+  ``K_SIGMA`` × sqrt(σ_prior² + σ_image²) of the prior (position and rotation separately; σ_image
+  its image-only calibrated sigma, ``mapping.sigmas``; σ_prior drift-grown for a drifting prior)
+  and no image hypothesis of support >= ``SUPPORT_MIN`` lies within that bound (``_near_prior``);
+  a supported hypothesis near the prior registers the frame instead. A frame whose image failed
+  a check is kept at its prior before any of this (api.md §4: the check wins).
+* **Calibrated sigmas.** Every image pose's sigma is calibrated (``mapping.sigmas.calibrated``:
+  its covariance with the image-registration noise floor of its data kind, the references'
+  depth kind and the prior's trust) before it is weighed or reported.
 * **too_close.** A frame whose median scene depth is below ``TOO_CLOSE_M`` and that has fewer
   than ``TOO_CLOSE_INLIERS`` inliers is too close (api.md §4): rejected ``too_close`` without a
   prior, kept at its prior with a prior (reason: the check its image failed, else
@@ -86,6 +92,7 @@ from oh_my_slam.core.constants import FLOOR_BAND_SIGMAS, FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import prior_sigmas
 
 log = get_logger("oh_my_slam.mapping.anchored")
@@ -1349,6 +1356,9 @@ class AnchoredMap:
         self.reregistered: list[dict[str, Any]] = []
         self.timings: dict[str, float] = {}
         self._added: list[Keyframe] = []
+        # a frame without a prior, registered: its placement as one standpoint with a confirmed
+        # keyframe when it shares one (map.md §1; set by the update job: ``mapping.standpoint``)
+        self.standpoint: Callable[[FrameIn, Features, Placement], Placement] | None = None
         self._kf_lock = threading.Lock()
 
     # -- persistence ---------------------------------------------------------------------------
@@ -1575,6 +1585,15 @@ class AnchoredMap:
             return _Corr(np.zeros((0, 2)), e, e, np.zeros(0, np.intp))
         return _Corr(np.vstack(uv), np.vstack(X), np.vstack(d), np.concatenate(which))
 
+    @staticmethod
+    def _on_sensor(cands: list[Keyframe], which: NDArray[np.intp]) -> bool:
+        """Whether most of the correspondences ``which`` (indices into ``cands``) lie on
+        keyframes with depth images: the calibration's data kind (``mapping.sigmas``)."""
+        if not len(which):
+            return False
+        sensor = np.array([k.depth_kind == "sensor" for k in cands], bool)
+        return bool(sensor[which].mean() >= 0.5)
+
     def _depth_factor(self, k: Keyframe) -> float:
         """What a keyframe's stored depth is multiplied by now: the depth scale's change since
         it was fused (monocular keyframes only)."""
@@ -1672,14 +1691,16 @@ class AnchoredMap:
                     spi = sp0 if T0 is not None else UNANCHORED_SIGMA_POS_M
                 img = (s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri,
                        sub, refs)
+        trust = None if f.prior is None else f.prior["trust"]
         if T0 is None:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
                 return Placement(f.name, "rejected", reason)
-            s, n, _, method, spi, sri, _, refs = img
-            rp, rr = _real_sigmas(s, refs)
+            s, n, _, method, spi, sri, sub, refs = img
+            rp, rr = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
+                                       None)
             if method == "rotation":
-                rp = UNANCHORED_SIGMA_POS_M
+                rp = max(rp, UNANCHORED_SIGMA_POS_M)
             return Placement(f.name, "registered", None, s.T, round(rp, 4), round(rr, 3), n,
                              method, lifted=_lifted(corr))  # type: ignore[arg-type]
         assert f.prior is not None
@@ -1689,8 +1710,10 @@ class AnchoredMap:
         def kept(why: str, n_in: int) -> Placement:
             return self._depth_place(f, T0, sp0, sr0, ref) or _kept(f, T0, sp0, sr0, why, n_in)
 
-        if f.unconfirmed is not None:  # its image failed a check: the prior holds it
-            return kept(f.unconfirmed, 0)
+        if f.unconfirmed is not None:
+            # its image failed a check: the prior holds it, and depth agreement alone never
+            # confirms it (api.md §4)
+            return _kept(f, T0, sp0, sr0, f.unconfirmed, 0)
         if img is None:
             return kept(reason, 0)
         s, n, ratio, method, spi, sri, sub, refs = img
@@ -1699,10 +1722,15 @@ class AnchoredMap:
                                                                        2.0 * sp0)):
             return kept(reason, n)
         dp, dr = pose_residual(s.T, T0)
-        if (not rot_only and dp > K_SIGMA * sp0) or dr > K_SIGMA * sr0:
-            # beyond 3 of the prior's own sigmas (api.md §4): a conflict needs strong,
-            # independent support — enough inliers, and for a metric prior inliers on at least
-            # two references — and no supported hypothesis near the prior
+        # the image-only calibrated sigmas (api.md §4: σ_hypothesis); a rotation-only pose takes
+        # the standpoint's position sigma (its centre is the prior's: dp is 0)
+        ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
+        if rot_only:
+            ci = (spi, ci[1])
+        if sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only):
+            # beyond the combined bound (api.md §4): a conflict needs strong, independent
+            # support — enough inliers, and for a metric prior inliers on at least two
+            # references — and no supported hypothesis near the prior
             refs_ok = int((np.bincount(sub[3][s.inliers], minlength=len(cands))
                            >= MIN_INLIERS).sum())
             strong = n >= STRONG_INLIERS and ratio >= STRONG_RATIO \
@@ -1712,11 +1740,8 @@ class AnchoredMap:
             assert corr is not None
             hyp = None if rot_only else self._near_prior(f, corr, cands, T0, sp0, sr0, n)
             if hyp is None:
-                si, sr_i = s.sigmas()
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
-                                 method, (dp, dr), align_T=s.T,
-                                 image_sigmas=(max(si, MIN_SIGMA_POS_M),
-                                               max(sr_i, IMAGE_SIGMA_ROT_MIN_DEG)))
+                                 method, (dp, dr), align_T=s.T, image_sigmas=ci)
             s, n, sub, refs = hyp
             spi, sri = s.sigmas()
             spi, sri = max(spi, MIN_SIGMA_POS_M), max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -1731,7 +1756,8 @@ class AnchoredMap:
         matches that reproject at the prior within ``K_SIGMA`` of its sigmas' reach (as the
         guided matching), refined on their own; it counts when its inliers are at least
         ``SUPPORT_MIN`` of the best hypothesis's ``best`` (and ``MIN_INLIERS``) and its pose
-        lies within ``K_SIGMA`` of the prior's own sigmas. None otherwise."""
+        lies within the combined conflict bound (``sigmas.conflicts``, its own calibrated
+        sigmas). None otherwise."""
         has = np.isfinite(corr.X).all(axis=1)
         Xh = np.where(has[:, None], corr.X, 0.0)
         z = ((Xh - T0[:3, 3]) @ T0[:3, :3])[:, 2]
@@ -1747,7 +1773,9 @@ class AnchoredMap:
         s, _ = refine_pose(T0[:3, :3].copy(), T0[:3, 3].copy(), *sub, refs, f.K)
         n = int(s.inliers.sum())
         dp, dr = pose_residual(s.T, T0)
-        if n < need or dp > K_SIGMA * sp0 or dr > K_SIGMA * sr0:
+        trust = None if f.prior is None else f.prior["trust"]
+        ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
+        if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci):
             return None
         return s, n, sub, refs
 
@@ -1760,15 +1788,18 @@ class AnchoredMap:
         T0, sp0, sr0 = pred
         rot_only = method == "rotation"
         metric = f.prior["trust"] == "metric"
+        # the image pose's calibrated sigmas (``mapping.sigmas``): its covariance with the depth
+        # bias it does not see and the image-registration noise of its data kind
+        rp, rr = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
+                                   f.prior["trust"])
         if metric:
             # a metric prior is weighed against the image pose's real uncertainty: depth
             # images misregistered to the colour, monocular depth, a few references — far more
             # than the covariance of hundreds of correlated matches says
-            spi = max(spi, METRIC_IMAGE_SIGMA_POS_M)
-            sri = max(sri, METRIC_IMAGE_SIGMA_ROT_DEG)
-        # the reported sigmas: the image pose's covariance with the depth bias it does not see,
-        # combined with the prior's own sigmas as the estimate combines them
-        rp, rr = _real_sigmas(s, refs)
+            spi = max(spi, METRIC_IMAGE_SIGMA_POS_M, rp)
+            sri = max(sri, METRIC_IMAGE_SIGMA_ROT_DEG, rr)
+        # the reported sigmas: the calibrated image sigmas combined with the prior's own as the
+        # estimate combines them
         gp, gr = _given_sigmas(f.prior)
         if metric:
             img_T = s.T
@@ -1797,12 +1828,12 @@ class AnchoredMap:
 
     def _depth_place(self, f: FrameIn, T0: Array, sp0: float, sr0: float, ref: Array
                      ) -> Placement | None:
-        """A frame with a depth image and a prior the images do not place (a bare wall, too
-        few matches): its depth aligned on the depth of the keyframes near its prior
-        (``depth_icp``: point-to-plane, the prior a factor, so a plane fixes what it can and
-        the prior the rest), registered when its depth then agrees with theirs
-        (``Agreement.confirmed``) and it stays within ``K_SIGMA`` of the prior. None
-        otherwise."""
+        """A frame with a depth image and a prior the images do not place (too few matches; never
+        one whose image failed a check, api.md §4): its depth aligned on the depth of the
+        keyframes near its prior (``depth_icp``: point-to-plane, the prior a factor, so a plane
+        fixes what it can and the prior the rest), registered when its depth then agrees with
+        theirs (``Agreement.confirmed``) and it stays within the combined conflict bound of the
+        prior (its calibrated sigmas). None otherwise."""
         if f.depth is None or not np.count_nonzero(f.depth > 0):
             return None
         refs = [r for k in self._candidates(f, T0, None) for r in [self._grid(k)]
@@ -1815,8 +1846,10 @@ class AnchoredMap:
             return None
         T, sp, sr, n = got
         dp, dr = pose_residual(T, T0)
+        assert f.prior is not None
+        sp, sr = sigmas.calibrated(sp, sr, True, f.prior["trust"])
         # prior plus depth: the depth may refine the prior, never overrule it
-        if dp > K_SIGMA * sp0 or dr > K_SIGMA * sr0 \
+        if sigmas.conflicts(dp, dr, (sp0, sr0), (sp, sr)) \
                 or not agreement(pts, T, refs, SENSOR_DEPTH_TOL).confirmed:
             return None
         return Placement(f.name, "registered", None, T, round(max(sp, REPORT_MIN_SIGMA_POS_M), 4),
@@ -2023,6 +2056,8 @@ class AnchoredMap:
             else:
                 pl = self.place(f, feats_of[i], None if mono is None else mono[2],
                                 evidence=not close)
+                if f.prior is None and pl.status == "registered" and self.standpoint is not None:
+                    pl = self.standpoint(f, feats_of[i], pl)
                 if close and pl.inliers < TOO_CLOSE_INLIERS:
                     pl = self._too_close(f, pl, scene)
             pl = self._dedup(f, pl)

@@ -318,6 +318,7 @@ def _query(fr: LocateFrame, floor_z: float) -> tuple[relocalize.Query, checks.Me
         q.prior = np.asarray(p["T_map_cam"], np.float64)
         # its own sigmas, else its trust's defaults (api.md §3)
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
+        q.trust = str(p["trust"])
     h = fr.height_m if fr.height_m is not None else cam.height_above_floor_m
     if h is not None:
         sig = fr.height_sigma_m if fr.height_m is not None else cam.height_sigma_m

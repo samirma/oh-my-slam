@@ -973,9 +973,11 @@ def test_overlapping_frames_correct_the_priors_rotation(tmp_path: Path) -> None:
     pls = m.update([frame("b", b, p=prior(_yaw(b, 5.0), sr=2.0)),
                     frame("c", c, p=prior(_yaw(c, -5.0), sr=2.0))])
     assert [p.status for p in pls] == ["registered", "registered"]
-    assert m.prior_disagreement_deg == pytest.approx(10.0, abs=1.0)
+    # b's committed rotation leans to its prior by the calibrated image sigma (1.25 deg against
+    # 2 deg): c, registered on b, carries that lean into the measured disagreement
+    assert m.prior_disagreement_deg == pytest.approx(10.0, abs=2.0)
     rel = pls[0].T[:3, :3].T @ pls[1].T[:3, :3]  # type: ignore[union-attr]
-    assert an.rot_deg(rel.T @ (b[:3, :3].T @ c[:3, :3])) < 1.0  # the images' relative rotation
+    assert an.rot_deg(rel.T @ (b[:3, :3].T @ c[:3, :3])) < 2.0  # the images' relative rotation
     assert pls[1].prior_residual is not None and pls[1].prior_residual[1] > 3.0
     # priors that agree: measured, nothing corrected
     pls = m.update([frame("d", base_pose(25), p=prior(base_pose(25))),
@@ -1020,3 +1022,24 @@ def test_a_conflict_with_a_supported_hypothesis_near_the_prior_registers(
     monkeypatch.setattr(AnchoredMap, "_near_prior", near)
     p = m.update([frame("n", T, p=prior(off))])[0]
     assert seen and p.status == "registered" and p.inliers > 0
+
+
+def test_a_tight_prior_registers_and_one_metre_off_conflicts(tmp_path: Path) -> None:
+    """R20 (api.md §4): a frame whose metric prior is its true pose with the tight sigmas of a
+    fused keyframe (2 mm / 0.05 deg) is registered: the conflict bound combines the prior's
+    sigma with the image pose's calibrated one, so the image noise alone never conflicts. The
+    same frame with its prior 1 m off is still a conflict. A frame whose image failed a check
+    is kept at its prior, even with a depth image that agrees (N9)."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    T = base_pose(15)
+    p = m.update([frame("own", T, p=prior(T, sp=0.002, sr=0.05))])[0]
+    assert (p.status, p.reason) == ("registered", None)
+    off = T.copy()
+    off[:3, 3] += [1.0, 0.0, 0.0]
+    q = m.update([frame("off", base_pose(16), p=prior(off, sp=0.002, sr=0.05))])[0]
+    assert (q.status, q.reason) == ("rejected", "prior_conflict")
+    f = frame("plain", base_pose(17))
+    f.unconfirmed = "plain"
+    r = m.update([f])[0]
+    assert (r.status, r.reason, r.method) == ("kept_at_prior", "plain", "prior")

@@ -46,7 +46,7 @@ def _kf(name: str, T: np.ndarray, P: np.ndarray, D: np.ndarray, depth: bool = Tr
         sigma: float = 0.01) -> rl.Keyframe:
     uv, d, idx = _view(T, P, D)
     xyz = P[idx].astype(np.float32) if depth else np.full((len(idx), 3), np.nan, np.float32)
-    return rl.Keyframe(name, T, K, uv, d, xyz, sigma, 0.1)
+    return rl.Keyframe(name, T, K, uv, d, xyz, sigma, 0.1, depth)
 
 
 def _query(T: np.ndarray, P: np.ndarray, D: np.ndarray, noise: float = 0.5, **kw: object
@@ -58,7 +58,8 @@ def _query(T: np.ndarray, P: np.ndarray, D: np.ndarray, noise: float = 0.5, **kw
 A = rooms.camera(0.0, 0.0, 1.0, 0.0, -10.0)
 
 
-def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit() -> None:
+def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     P, D = _scene()
     idx = rl.Index([_kf("a", A, P, D), _kf("b", rooms.camera(0.3, 0.2, 1.0, -8.0, -10.0), P, D)])
     T = rooms.camera(0.15, 0.1, 1.05, -4.0, -12.0)
@@ -67,9 +68,16 @@ def test_a_frame_near_a_keyframe_is_located_with_sigmas_from_its_fit() -> None:
     assert o.T is not None
     dp, dr = rl.pose_distance(o.T, T)
     assert dp < 0.01 and dr < 0.2
-    assert o.sigma_pos_m is not None and 0.0005 < o.sigma_pos_m < 0.03  # not floored at 1 cm
+    # the depth keyframes' calibrated floor (mapping.sigmas): 12 mm with the keyframes' 1 cm
+    assert o.sigma_pos_m is not None and 0.012 <= o.sigma_pos_m < 0.03
     noisy = rl.locate(_query(T, P, D, noise=2.0), idx)
-    assert noisy.sigma_pos_m is not None and noisy.sigma_pos_m > o.sigma_pos_m
+    assert noisy.sigma_pos_m is not None and noisy.sigma_pos_m >= o.sigma_pos_m
+    # without the noise floors the fit's own covariance shows: noisier, looser
+    monkeypatch.setenv("OH_MY_SLAM_SIGMA_FLOORS", '{"depth/none": [0, 0]}')
+    a = rl.locate(_query(T, P, D), idx)
+    b = rl.locate(_query(T, P, D, noise=2.0), idx)
+    assert a.sigma_pos_m is not None and b.sigma_pos_m is not None
+    assert b.sigma_pos_m > a.sigma_pos_m
     assert o.inlier_ratio is not None and o.inlier_ratio > 0.9
     assert o.consistent_with_prior is None and o.nearest in (0, 1)
 
@@ -243,6 +251,17 @@ def test_choosing_and_rivals() -> None:
     assert rl.choose(q, poses, inl) is None  # the only one there has support 0.2
     q.prior = at(0.0, 10.0)
     assert rl.choose(q, poses, inl) is None  # turned 10 deg: beyond 3 x 2 deg
+    # the combined bound (api.md §4, §6): 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2), each
+    # hypothesis's own calibrated sigma; 10 deg off a 2 deg prior is within 3 x hypot(2, 3)
+    sig = [(0.01, 3.0)] * len(poses)
+    assert rl.choose(q, poses, inl, sig) == 0
+    assert rl.within_prior(q, at(0.0, 10.0), (0.01, 3.0))
+    assert not rl.within_prior(q, at(0.3, 10.0), (0.01, 3.0))  # 0.3 m: beyond 3 x hypot(.05,.01)
+    assert rl.within_prior(q, at(0.3, 10.0), (0.01, 3.0), position=False)
+    # ranked over the combined sigmas: a loose hypothesis farther off can be nearer
+    q.prior = at(0.0)
+    near = rl.prior_distance(q, at(0.1), (0.5, 1.0))
+    assert near < rl.prior_distance(q, at(0.05), (0.0, 1.0))
     rivals = rl.rivals_of(poses[0], poses[1:], inl[1:], 100)
     assert [r["support"] for r in rivals] == [0.6]  # 0.05 m is the pose; 1.02 repeats 1.0
     assert rivals[0]["pos_m"] == pytest.approx(1.0) and rivals[0]["rot_deg"] == 0.0
@@ -429,3 +448,21 @@ def test_a_turn_whose_leftover_rays_hold_no_second_turn(monkeypatch: pytest.Monk
     monkeypatch.setattr(rl, "turn_ransac", once)
     o = rl.locate(_query(rooms.camera(*C, 3.0, -10.0), P, D), rl.Index([a, b]))
     assert o.located and o.method == "turn" and o.rivals == [] and calls[0] == 2
+
+
+def test_a_keyframe_located_with_its_own_tight_prior_locates_and_a_far_prior_conflicts() -> None:
+    """R20: a fused keyframe's own image located with its own committed pose as a metric prior of
+    its committed (tight) sigmas is located: the bound combines the prior's sigma with the
+    hypothesis's calibrated one, so the image noise alone never makes a conflict. A prior 1 m off
+    still conflicts."""
+    P, D = _scene()
+    B = rooms.camera(0.3, 0.2, 1.0, -8.0, -10.0)
+    idx = rl.Index([_kf("a", A, P, D, sigma=0.002), _kf("b", B, P, D, sigma=0.002)])
+    tight = {"prior_sigma_pos_m": 0.002, "prior_sigma_rot_deg": 0.05, "trust": "metric"}
+    o = rl.locate(_query(A, P, D, noise=2.0, prior=A.copy(), **tight), idx)
+    assert o.located and o.consistent_with_prior is True and o.reason is None
+    assert o.T is not None and rl.pose_distance(o.T, A)[0] > 0.0  # the image noise moved it
+    off = A.copy()
+    off[0, 3] += 1.0
+    far = rl.locate(_query(A, P, D, noise=2.0, prior=off, **tight), idx)
+    assert not far.located and far.reason == "prior_conflict"

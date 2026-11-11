@@ -11,8 +11,9 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
   (``PX_THRESHOLD`` px at 640 px of width) refined on the inliers. Its covariance is the
   Gauss-Newton one, ``s^2 (J^T J)^-1`` over the inliers' reprojection residuals (``s`` their RMS,
   at least ``MIN_PX_SIGMA``), for the rotation and the camera centre; ``sigma_pos_m`` and
-  ``sigma_rot_deg`` are ``SIGMA_SCALE`` times the square roots of their traces (the 3-D RMS),
-  combined with the matched keyframes' own sigmas.
+  ``sigma_rot_deg`` are the square roots of their traces (the 3-D RMS), combined with the matched
+  keyframes' own sigmas, then calibrated (``mapping.sigmas.calibrated``: the image-registration
+  noise floor of the data kind, depth keyframes or not and the prior's trust).
 * **Turn fit.** Without enough of those, a frame whose matched keyframes were taken from one spot
   (centres within ``ONE_SPOT_REL`` of their depth, or ``ONE_SPOT_M``) is placed at their centre with
   the rotation that turns its rays onto theirs (``locate.turn_ransac``).
@@ -21,8 +22,10 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
   ``RIVAL_PLACES`` places the matched keyframes were taken from (``places``) and one on the
   keyframes near the prior; a degenerate solve (``plausible``) is none. A hypothesis's support is
   its inliers over the best hypothesis's; it is supported at ``SUPPORT_MIN`` (``choose``).
-* **The reported pose.** With a prior, the supported hypothesis nearest it among those within
-  ``K_SIGMA`` times the prior's own sigmas; none there is ``prior_conflict``. Without a prior, the
+* **The reported pose.** With a prior, the supported hypothesis nearest it (``sigmas.distance``)
+  among those within the combined bound ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²), position
+  and rotation separately, σ_hypothesis each hypothesis's own calibrated sigma
+  (``sigmas.conflicts``); none there is ``prior_conflict``. Without a prior, the
   best-supported, preferring those at the camera's expected height. Its sigmas are its own fit's
   only, never the spread of its rivals.
 * **Rivals.** Every other supported hypothesis farther than ``RIVAL_POS_M`` or ``RIVAL_ROT_DEG``
@@ -40,6 +43,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import DEFAULT_SIGMA_POS_M, DEFAULT_SIGMA_ROT_DEG
 from oh_my_slam.mapping.locate import kabsch, turn_ransac
 
@@ -60,7 +64,6 @@ MIN_INLIERS = 15
 PX_THRESHOLD = 4.0
 RANSAC_ITERATIONS = 2000
 MIN_PX_SIGMA = 0.3
-SIGMA_SCALE = 1.0  # README "Locate": calibrated against replay truth (O5)
 ONE_SPOT_REL = 0.02
 ONE_SPOT_M = 0.05
 TURN_MIN_SHARE = 0.25
@@ -150,6 +153,7 @@ class Keyframe:
     xyz: NDArray[np.float32]  # map frame, NaN without depth
     sigma_pos_m: float = 0.0
     sigma_rot_deg: float = 0.0
+    depth: bool = False  # its points come from a depth image (the calibration's data kind)
 
     @property
     def centre(self) -> Array:
@@ -327,6 +331,7 @@ class Query:
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
     camera_z_sigma: float = DEFAULT_HEIGHT_SIGMA_M
+    trust: str | None = None  # the prior's trust (the calibration's data kind)
 
 
 @dataclass
@@ -515,22 +520,25 @@ def places(per_kf: Sequence[tuple[int, int]], index: Index) -> list[list[int]]:
     return [g[1] for g in sorted(groups, key=lambda g: -sum(g[2]))]
 
 
-def prior_distance(q: Query, T: Array) -> float:
-    """How far a pose lies from the frame's prior, in the prior's sigmas (position and rotation
-    combined); 0 without a prior."""
+def prior_distance(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0)) -> float:
+    """How far a pose of calibrated sigmas ``sig`` lies from the frame's prior, over the
+    combined prior and hypothesis sigmas (``sigmas.distance``); 0 without a prior."""
     if q.prior is None:
         return 0.0
     dp, dr = pose_distance(T, q.prior)
-    return math.hypot(dp / max(q.prior_sigma_pos_m, 1e-9), dr / max(q.prior_sigma_rot_deg, 1e-9))
+    return sigmas.distance(dp, dr, (q.prior_sigma_pos_m, q.prior_sigma_rot_deg), sig)
 
 
-def within_prior(q: Query, T: Array) -> bool:
-    """Whether a pose lies within ``K_SIGMA`` times the prior's own sigmas (position and
-    rotation each); True without a prior."""
+def within_prior(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0),
+                 position: bool = True) -> bool:
+    """Whether a pose of calibrated sigmas ``sig`` lies within the conflict bound of the prior
+    (``sigmas.conflicts``: ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²), position and rotation
+    each; only the rotation without ``position``); True without a prior."""
     if q.prior is None:
         return True
     dp, dr = pose_distance(T, q.prior)
-    return dp <= K_SIGMA * q.prior_sigma_pos_m and dr <= K_SIGMA * q.prior_sigma_rot_deg
+    return not sigmas.conflicts(dp, dr, (q.prior_sigma_pos_m, q.prior_sigma_rot_deg), sig,
+                                position)
 
 
 def _height_ok(q: Query, T: Array) -> bool:
@@ -539,19 +547,22 @@ def _height_ok(q: Query, T: Array) -> bool:
     return abs(float(T[2, 3]) - q.camera_z) <= K_SIGMA * q.camera_z_sigma + HEIGHT_SLACK_M
 
 
-def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int]) -> int | None:
-    """The hypothesis to report among ``poses`` (their inlier counts ``inliers``): only those
-    with support (inliers over the best's) at least ``SUPPORT_MIN`` compete. With a prior, the
-    one nearest the prior (``prior_distance``) among those within ``K_SIGMA`` prior sigmas, None
-    when none is (``prior_conflict``); without one, the best-supported, preferring those that
-    agree with the camera's expected height."""
+def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
+           sig: Sequence[tuple[float, float]] | None = None) -> int | None:
+    """The hypothesis to report among ``poses`` (their inlier counts ``inliers``, their
+    calibrated sigmas ``sig``): only those with support (inliers over the best's) at least
+    ``SUPPORT_MIN`` compete. With a prior, the one nearest the prior (``prior_distance``) among
+    those within the combined conflict bound (``within_prior``), None when none is
+    (``prior_conflict``); without one, the best-supported, preferring those that agree with the
+    camera's expected height."""
     best = max(inliers)
+    sg = list(sig) if sig is not None else [(0.0, 0.0)] * len(poses)
     sup = [k for k in range(len(poses)) if inliers[k] >= SUPPORT_MIN * best]
     if q.prior is not None:
-        near = [k for k in sup if within_prior(q, poses[k])]
+        near = [k for k in sup if within_prior(q, poses[k], sg[k])]
         if not near:
             return None
-        return min(near, key=lambda k: (prior_distance(q, poses[k]), -inliers[k], k))
+        return min(near, key=lambda k: (prior_distance(q, poses[k], sg[k]), -inliers[k], k))
     level = [k for k in sup if _height_ok(q, poses[k])]
     return max(level or sup, key=lambda k: (inliers[k], -k))
 
@@ -648,19 +659,23 @@ def locate(q: Query, index: Index) -> Outcome:
         hyps = [h for h in hyps if plausible(h, kfs, index)]
         if not hyps:
             return out
-        k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps])
+        # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
+        sig = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
+                       _on_depth(h, kfs, index)) for h in hyps]
+        k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps], sig)
         if k is None:
             out.reason = "prior_conflict"
             return out
         origin = np.array([index.keyframes[int(i)].centre for i in kfs]).reshape(-1, 3)
         main, cov = _refined(hypothesis(_refine(hyps[k], q.K, uv, xyz, iq)), hypothesis, q, uv,
                              xyz, origin, px)
-        if not within_prior(q, main.T):  # the refinement left the prior: the solve as it was
-            main, cov = hyps[k], None
+        sp, sr = _sigmas(main, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index),
+                         _on_depth(main, kfs, index))
+        if not within_prior(q, main.T, (sp, sr)):  # the refinement left the prior: as it was
+            main, (sp, sr) = hyps[k], sig[k]
         others = [h for j, h in enumerate(hyps) if j != k]
         best = max([main.inliers, *(h.inliers for h in others)])
         out.rivals = rivals_of(main.T, [h.T for h in others], [h.inliers for h in others], best)
-        sp, sr = _sigmas(main, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index))
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
@@ -677,8 +692,8 @@ def locate(q: Query, index: Index) -> Outcome:
 
 
 def _finish(q: Query, o: Outcome) -> Outcome:
-    """A located outcome's prior agreement (true: ``choose`` keeps only poses within the prior's
-    sigmas) and its ambiguity, the strongest rival."""
+    """A located outcome's prior agreement (true: ``choose`` keeps only poses within the
+    combined conflict bound) and its ambiguity, the strongest rival."""
     o.consistent_with_prior = None if q.prior is None else True
     o.ambiguity = None if not o.rivals else {"pos_m": o.rivals[0]["pos_m"],
                                              "rot_deg": o.rivals[0]["rot_deg"]}
@@ -822,13 +837,21 @@ def _keyframe_sigmas(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> tup
             math.sqrt(float(per @ sr ** 2 / per.sum())))
 
 
+def _on_depth(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
+    """Whether most of a hypothesis's inliers lie on keyframes with depth images."""
+    per = np.bincount(kfs[h.mask], minlength=len(index.keyframes)).astype(np.float64)
+    depth = np.array([k.depth for k in index.keyframes], np.float64)
+    return bool(per.sum() > 0 and float(per @ depth) >= 0.5 * float(per.sum()))
+
+
 def _sigmas(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
-            cov: Array | None = None, keyframes: tuple[float, float] = (0.0, 0.0)
-            ) -> tuple[float, float]:
-    """``SIGMA_SCALE`` times the chosen hypothesis's own sigmas (``_fit``): never the spread of
-    its rivals (api.md §6)."""
+            cov: Array | None = None, keyframes: tuple[float, float] = (0.0, 0.0),
+            depth: bool = False) -> tuple[float, float]:
+    """A hypothesis's own sigmas (``_fit``), calibrated (``sigmas.calibrated``, the data kind of
+    ``depth`` and the prior's trust): never the spread of its rivals (api.md §6)."""
     fit = _fit(h, q, uv, xyz, iq, cov, keyframes)
-    return round(SIGMA_SCALE * fit[0], 4), round(SIGMA_SCALE * fit[1], 3)
+    sp, sr = sigmas.calibrated(fit[0], fit[1], depth, q.trust)
+    return round(sp, 4), round(sr, 3)
 
 
 def _fit(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
@@ -872,7 +895,10 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
     n = int(inl.sum())
     if n < MIN_INLIERS or n < TURN_MIN_SHARE * len(a):
         return None
-    sp = math.hypot(spread, ONE_SPOT_REL * float(np.median(depth)))
+    on_depth = bool(np.mean([index.keyframes[i].depth for i in used]) >= 0.5)
+    # a rotation-only hypothesis takes the standpoint's position sigma (map.md §1), calibrated
+    sp = sigmas.calibrated(math.hypot(spread, ONE_SPOT_REL * float(np.median(depth))), 0.0,
+                           on_depth, q.trust)[0]
 
     def pose(R: Array) -> Array:
         T = np.eye(4)
@@ -884,8 +910,8 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
 
     def rot_sigma(a: Array, b: Array, R: Array) -> float:
         ang = np.degrees(np.arccos(np.clip(np.sum((a @ R.T) * b, axis=1), -1.0, 1.0)))
-        return SIGMA_SCALE * math.sqrt(float(np.mean(ang ** 2)) + MIN_PX_SIGMA_DEG ** 2) * \
-            math.sqrt(2.0 / len(a))
+        raw = math.sqrt(float(np.mean(ang ** 2)) + MIN_PX_SIGMA_DEG ** 2) * math.sqrt(2.0 / len(a))
+        return sigmas.calibrated(0.0, raw, on_depth, q.trust)[1]
 
     R = kabsch(a[inl], b[inl])
     # the hypotheses: this turn, and a second one on the rays it leaves (a twin view)
@@ -898,7 +924,8 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
         if n2 >= MIN_INLIERS:
             R2 = kabsch(ar[inl2], br[inl2])
             hyps.append((pose(R2), n2, rot_sigma(ar[inl2], br[inl2], R2)))
-    k = choose(q, [h[0] for h in hyps], [h[1] for h in hyps])
+    # the position test uses the standpoint's sigma (map.md §1): its centre is the keyframes'
+    k = choose(q, [h[0] for h in hyps], [h[1] for h in hyps], [(sp, h[2]) for h in hyps])
     if k is None:
         return Outcome(reason="prior_conflict")
     T, nk, sr = hyps[k]

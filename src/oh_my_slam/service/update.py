@@ -50,7 +50,7 @@ from numpy.typing import NDArray
 from oh_my_slam.core.constants import FLOOR_BAND_SIGMAS, FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.images import png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.mapping import anchor, checks
+from oh_my_slam.mapping import anchor, checks, sigmas
 from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import (
     OVERLAP_MIN,
@@ -179,13 +179,17 @@ def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
     return anchor.prior_sigmas(p)
 
 
-def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: float
+def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: float,
+                depth: bool = False, trust: str | None = None, calibrate: bool = True
                 ) -> tuple[float, float]:
     """The pose sigma proxy (README "Per-input status"): the registration's angular noise per
     observation (its mean reprojection error over the focal length, or the multi-view
     refinement's median match residual) over the square root of its observations, times the
     scene depth for the position, combined with the anchoring's RMS residual; three times that
-    for a low-confidence keyframe, floored."""
+    for a low-confidence keyframe; then calibrated (``mapping.sigmas.calibrated``: the
+    image-registration noise of the data kind, a depth image or not and the prior's trust),
+    floored. Without ``calibrate``, the proxy alone: the weight of a stored pose as an anchor of
+    the next version's fit (``_anchor``), which the noise floors would leave without scale."""
     st = f.stats
     if "pose_matches" in st:
         n = float(st.get("pose_matches") or 0)
@@ -198,9 +202,10 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
     rot = ang * math.sqrt(2.0 / n)
     pos = d * ang * math.sqrt(8.0 / n)
     k = LOW_CONFIDENCE_FACTOR if f.low_confidence else 1.0
-    pos = math.hypot(k * pos, align_rms_m)
-    return (round(max(pos, SIGMA_POS_FLOOR_M), 4),
-            round(max(math.degrees(k * rot), SIGMA_ROT_FLOOR_DEG), 3))
+    pos, rot = math.hypot(k * pos, align_rms_m), math.degrees(k * rot)
+    if calibrate:
+        pos, rot = sigmas.calibrated(pos, rot, depth, trust)
+    return round(max(pos, SIGMA_POS_FLOOR_M), 4), round(max(rot, SIGMA_ROT_FLOOR_DEG), 3)
 
 
 def map_floor(internal: InternalMap) -> float | None:
@@ -220,6 +225,10 @@ def _height(fr: _Frame) -> float | None:
     """A frame's camera height above the floor: its own, else its camera's; None without."""
     h = fr.work.height_m if fr.work.height_m is not None else fr.cam.height_above_floor_m
     return float(h) if h is not None and h > 0 else None
+
+
+def _has_depth(fr: _Frame) -> bool:
+    return fr.depth_m is not None and bool(np.count_nonzero(fr.depth_m > 0))
 
 
 def _inliers(f: InternalFrame) -> int:
@@ -548,8 +557,10 @@ class Updater:
                 f = by_name.get(r["internal"])
                 if f is None:
                     continue
+                # its uncalibrated sigmas when recorded (``pose_sigmas``), else the reported
+                sp, sr = r.get("anchor_sigmas") or (r["sigma_pos_m"], r["sigma_rot_deg"])
                 previous.append(Anchor(r["name"], "previous", f.T, _mat(r["T_map_cam"]),
-                                       r["sigma_pos_m"], r["sigma_rot_deg"]))
+                                       float(sp), float(sr)))
                 p = r.get("prior")
                 if p and p["trust"] == "metric":
                     metric.append(Anchor(r["name"], "prior", f.T, _mat(p["T_map_cam"]),
@@ -714,18 +725,22 @@ class Updater:
         earlier: list[_Frame] = []
         for fr in sorted(placed, key=lambda fr: fr.work.index):
             assert fr.internal is not None
+            d = internal.depth(fr.internal.name)
+            med = None if d is None else checks.median_depth(d)
             if fr.prior_residual is not None and fr.work.prior is not None:
-                # beyond 3 of the prior's own sigmas (floored as the anchors' noise), and the
-                # mapper's one hypothesis is the only one: none lies near the prior
+                # beyond the combined bound 3 x sqrt(sigma_prior^2 + sigma_image^2) (api.md §4:
+                # the prior's sigmas floored as the anchors' noise; the image pose's calibrated
+                # proxy before the anchoring), and the mapper's one hypothesis is the only one:
+                # none lies near the prior
                 sp, sr = _prior_sigmas(fr.work.prior)
+                hyp = pose_sigmas(fr.internal, None if med is None else med * anchored.sim.s,
+                                  0.0, _has_depth(fr), fr.work.trust)
                 dp, dr = fr.prior_residual
-                if (dp > anchor.K_SIGMA * max(sp, anchor.MIN_SIGMA_POS_M)
-                        or dr > anchor.K_SIGMA * max(sr, anchor.MIN_SIGMA_ROT_DEG)):
+                if sigmas.conflicts(dp, dr, (max(sp, anchor.MIN_SIGMA_POS_M),
+                                             max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp):
                     fr.reason = "prior_conflict"
                     out.append(fr)
                     continue
-            d = internal.depth(fr.internal.name)
-            med = None if d is None else checks.median_depth(d)
             if med is not None:
                 fr.scene_m = med * anchored.sim.s
             if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M \
@@ -832,14 +847,21 @@ class Updater:
             if f is None:  # kept as it was
                 out.append(r)
                 continue
-            sp, sr = pose_sigmas(f, depth_m(f), anchored.align_rms_m)
+            p = r.get("prior")
+            sp, sr = pose_sigmas(f, depth_m(f), anchored.align_rms_m, False,
+                                 None if p is None else p.get("trust"))
             out.append({**r, "T_map_cam": sim.pose(f.T).tolist(), "sigma_pos_m": sp,
-                        "sigma_rot_deg": sr})
+                        "sigma_rot_deg": sr, "anchor_sigmas": list(pose_sigmas(
+                            f, depth_m(f), anchored.align_rms_m, calibrate=False))})
         for fr in sorted(registered, key=lambda fr: fr.work.index):
             assert fr.pose is not None
+            raw = None
             if fr.internal is not None:
                 fr.sigma_pos_m, fr.sigma_rot_deg = pose_sigmas(
-                    fr.internal, depth_m(fr.internal), anchored.align_rms_m)
+                    fr.internal, depth_m(fr.internal), anchored.align_rms_m, _has_depth(fr),
+                    fr.work.trust)
+                raw = list(pose_sigmas(fr.internal, depth_m(fr.internal),
+                                       anchored.align_rms_m, calibrate=False))
             p = fr.work.prior
             out.append({"name": fr.work.name, "camera_id": fr.work.camera_id,
                         "internal": None if fr.internal is None else fr.internal.name,
@@ -848,6 +870,7 @@ class Updater:
                         "pose_state": "fused" if fr.internal is not None else "kept_at_prior",
                         "added_version": version, "sha256": fr.sha,
                         "inliers": 0 if fr.internal is None else _inliers(fr.internal),
+                        **({} if raw is None else {"anchor_sigmas": raw}),
                         "prior": p if p is not None and p["trust"] == "metric" else None})
         centres = np.array([np.asarray(r["T_map_cam"])[:3, 3] for r in out])
         if internal.bounds is not None:

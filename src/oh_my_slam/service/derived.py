@@ -422,7 +422,8 @@ class Derived:
             kfs.append(relocalize.Keyframe(
                 kname, np.asarray(f["T_map_cam"], np.float64),
                 cams[f["camera_id"]].canonical().resized(w, h).K(), uv, desc, z[f"p{i}"],
-                float(f.get("sigma_pos_m") or 0.0), float(f.get("sigma_rot_deg") or 0.0)))
+                float(f.get("sigma_pos_m") or 0.0), float(f.get("sigma_rot_deg") or 0.0),
+                f.get("depth_kind") == "sensor"))
         idx = relocalize.Index(kfs)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
         with dv._lock:

@@ -32,16 +32,19 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.images import size_at_max_side
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.mapping import register_ma
+from oh_my_slam.mapping import register_ma, sigmas, standpoint
 from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import (
     TOO_CLOSE_M,
     AnchoredMap,
+    Features,
     FrameIn,
     Keyframe,
     Placement,
     features,
+    pose,
     pose_residual,
+    rot_deg,
 )
 from oh_my_slam.mapping.anchored_objects import (
     MONO_DEPTH_REL,
@@ -102,8 +105,90 @@ def _trusted(fr: _Frame) -> bool:
     return fr.work.trust in ("metric", "drifting")
 
 
+def stored_views(am: AnchoredMap, near: list[tuple[Any, Any]], exclude: list[Keyframe] | None = None
+                 ) -> list[standpoint.View]:
+    """The map's image-confirmed keyframes (but ``exclude``) as ``standpoint`` views: those
+    among the ``standpoint.NEIGHBOURS`` nearest (by centre and optical axis) of each pose of
+    ``near`` ((R, centre) pairs), with their features."""
+    conf = [k for k in am.confirmed() if all(k is not n for n in exclude or [])]
+    chosen: dict[str, Keyframe] = {}
+    for R, c in near:
+        score = sorted((float(np.linalg.norm(k.centre - c)) / 0.5
+                        + rot_deg(R.T @ k.T[:3, :3]) / 30.0, i)
+                       for i, k in enumerate(conf))
+        for _, i in score[:standpoint.NEIGHBOURS]:
+            chosen[conf[i].id] = conf[i]
+    out = []
+    for k in chosen.values():
+        am._load_kf(k)
+        if k.feats is not None and len(k.feats.kps):
+            out.append(standpoint.View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(),
+                                       True))
+    return out
+
+
+def standpoints(am: AnchoredMap, new: list[tuple[_Frame, Any, Features]],
+                pairs: standpoint.Pairs) -> dict[int, tuple[Any, float, float]]:
+    """The frames without a prior of ``new`` (frame, image-only pose, features) that share a
+    standpoint with each other or with a stored confirmed keyframe (``standpoint.groups``,
+    map.md §1): by frame index, their pure-rotation pose about the group's centre and its
+    calibrated sigmas (the position's: the group's spread)."""
+    views = stored_views(am, [(T[:3, :3], T[:3, 3]) for _, T, _ in new])
+    for fr, T, ft in new:
+        views.append(standpoint.View(fr.work.name, fr.cam.canonical(), ft, T[:3, :3].copy(),
+                                     T[:3, 3].copy(), False, fr.work.index))
+    got = standpoint.groups(views, pairs)
+    out = {}
+    for fr, _, _ in new:
+        g = got.get(fr.work.name)
+        if g is not None:
+            sp, sr = sigmas.calibrated(g.sigma_pos_m, g.sigma_rot_deg, _has_depth(fr), None)
+            out[fr.work.index] = (pose(g.R, g.c), round(sp, 4), round(sr, 3))
+    return out
+
+
+def join_standpoint(am: AnchoredMap, pairs: standpoint.Pairs, f: FrameIn, feats: Features,
+                    pl: Placement) -> Placement:
+    """A frame without a prior that the prior-first engine registered, placed as one
+    standpoint with the confirmed keyframe it shares one with (the most inliers; map.md §1):
+    a pure rotation about that keyframe's centre, its position sigma the distance of its
+    image-only centre to it. As it was when it shares none."""
+    assert pl.T is not None
+    new = standpoint.View(f.name, f.K, feats, pl.T[:3, :3].copy(), pl.T[:3, 3].copy())
+    best = None
+    for v in stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3])]):
+        tv = pairs.get(new, v)
+        if tv is not None and tv.standpoint and (best is None or tv.inliers > best[1].inliers):
+            best = (v, tv)
+    if best is None:
+        return pl
+    v, tv = best
+    spread = float(np.linalg.norm(pl.T[:3, 3] - v.c))
+    sp, sr = sigmas.calibrated(spread, tv.noise_deg, f.depth is not None, None)
+    T = pose(v.R @ tv.R_ab.T, v.c)
+    return Placement(pl.name, "registered", None, T, round(sp, 4), round(sr, 3), pl.inliers,
+                     "rotation", lifted=pl.lifted, align_T=pl.align_T,
+                     map_residual=None if pl.align_T is None else (0.0, rot_deg(
+                         T[:3, :3].T @ pl.align_T[:3, :3])))
+
+
+def rotation_check(am: AnchoredMap, placed: list[Placement], pairs: standpoint.Pairs
+                   ) -> bool:
+    """The hard limit ``rotation_inconsistent`` (map.md §4) over the update's registered
+    frames ``placed`` (their keyframes) and the stored confirmed keyframes they neighbour."""
+    kfs = [k for pl in placed if pl.status == "registered" and pl.keyframe is not None
+           for k in [am.keyframe(pl.keyframe)] if k is not None and k.feats is not None]
+    if not kfs:
+        return False
+    views = stored_views(am, [(k.T[:3, :3], k.centre) for k in kfs], kfs)
+    views += [standpoint.View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), False,
+                              i) for i, k in enumerate(kfs) if k.feats is not None]
+    return standpoint.inconsistent(*standpoint.consistency(views, pairs))
+
+
 def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
-                   progress: Callable[[str], None]) -> tuple[list[Placement], float, float]:
+                   progress: Callable[[str], None], pairs: standpoint.Pairs | None = None
+                   ) -> tuple[list[Placement], float, float]:
     """The camera-only frames by MapAnything (``register_ma``) against the map's confirmed
     keyframes, each registered one added as a keyframe; its depth scale is the map's, and its
     camera height feeds the map's depth scale (``ScaleState``) as a monocular keyframe's does.
@@ -129,6 +214,15 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
         return up.backend.geometry_views(images, Ks, poses, workdir / f"mv{calls[0]}")
 
     res = register_ma.Registration(multiview, new, stored).run()
+    # frames of one standpoint: a pure rotation about its centre (map.md §1)
+    feats = {}
+    for fr in frames:
+        assert fr.rgb is not None
+        feats[fr.work.index] = features(fr.rgb, fr.ignore)
+    turned = standpoints(am, [(fr, p.T, feats[fr.work.index]) for fr in frames
+                              for p in [res.placements[fr.work.index]]
+                              if p.status == "registered" and p.T is not None],
+                         pairs or standpoint.Pairs())
     reg_s = time.perf_counter() - t
     t = time.perf_counter()
     out = []
@@ -145,14 +239,17 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
             progress(f"{fr.work.name}: rejected ({p.reason})")
             continue
         assert p.T is not None and p.depth is not None and p.K_depth is not None
-        dup = am.duplicate_of(fr.work.camera_id, p.T)
+        T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
+            p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
+        dup = am.duplicate_of(fr.work.camera_id, T)
         if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
             out.append(Placement(fr.work.name, "rejected", "duplicate", inliers=p.inliers,
                                  duplicate_of=dup))
             progress(f"{fr.work.name}: rejected (duplicate of {dup})")
             continue
-        pl = Placement(fr.work.name, "registered", None, p.T, p.sigma_pos_m, p.sigma_rot_deg,
-                       p.inliers, "mapanything")
+        # its sigmas calibrated as every image pose's (``mapping.sigmas``; no prior)
+        pl = Placement(fr.work.name, "registered", None, T, round(sp, 4), round(sr, 3),
+                       p.inliers, "rotation" if fr.work.index in turned else "mapanything")
         f = _frame_in(fr, None)
         h, w = p.depth.shape
         Kg = Intrinsics(float(p.K_depth[0, 0]), float(p.K_depth[1, 1]), float(p.K_depth[0, 2]),
@@ -160,12 +257,12 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
         depth = p.depth
         kind = "sensor" if _has_depth(fr) else "mono"
         if kind == "mono":
-            am.add_height_evidence(f, p.T, depth, Kg)
+            am.add_height_evidence(f, T, depth, Kg)
             k = am.scale.k
             am.scale.estimate(am.prior_span(), am.prior_span("drifting"))
             depth = (depth * (am.scale.k / k)).astype(np.float32)
         assert fr.rgb is not None
-        am.add(f, features(fr.rgb, fr.ignore), pl, depth, Kg, kind, None)
+        am.add(f, feats[fr.work.index], pl, depth, Kg, kind, None)
         out.append(pl)
         progress(f"{fr.work.name}: registered (mapanything, {p.inliers} points)")
     return out, reg_s, time.perf_counter() - t
@@ -254,6 +351,12 @@ def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
                    check_close=fr.deferred, unconfirmed=fr.unconfirmed)
 
 
+def _depth_kind(am: AnchoredMap | None, pl: Placement) -> str:
+    """The depth kind (``sensor``, ``mono``, ``none``) of a placed frame's keyframe."""
+    k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
+    return "none" if k is None else k.depth_kind
+
+
 def _has_depth(fr: _Frame) -> bool:
     return fr.depth_m is not None and bool(np.count_nonzero(fr.depth_m > 0))
 
@@ -310,6 +413,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     mapper = workdir / "anchored"
     om: ObjectMap | None = None
     n_objects = 0
+    pairs = standpoint.Pairs()  # the two-view fits of this update (standpoints, the hard limit)
+    rotations_bad = False
     if todo:
         t = time.perf_counter()
         if prev is not None:
@@ -350,6 +455,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             job.progress = round(0.1 + 0.8 * done[0] / len(todo), 3)
             changed()
 
+        # a frame without a prior registered by the prior-first engine joins a standpoint
+        am.standpoint = functools.partial(join_standpoint, am, pairs)
         try:
             pls = am.update(ins, progress) if ins else []
             reg_s, fuse_s = am.timings.get("register", 0.0), am.timings.get("fuse", 0.0)
@@ -358,7 +465,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             if geo:
                 up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
             if late:  # their scene distance is MapAnything's depth (``register_ma``)
-                lp, r, fu = _register_none(up, am, late, workdir, progress)
+                lp, r, fu = _register_none(up, am, late, workdir, progress, pairs)
                 up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
                 reg_s, fuse_s = reg_s + r, fuse_s + fu
                 for fr, pl in zip(late, lp, strict=True):
@@ -368,6 +475,12 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                         if pl.status == "registered" and pl.keyframe is not None]
                 am.reregistered += am.reregister([k for k in stored if not k.usable()],
                                                  [k for k in news if k is not None])
+            if not any(_trusted(fr) for fr in frames):
+                # an update without priors: committed relative rotations against the images'
+                # (map.md §4 rotation_inconsistent; registered frames only)
+                t = time.perf_counter()
+                rotations_bad = rotation_check(am, list(placements.values()), pairs)
+                reg_s += time.perf_counter() - t
             t = time.perf_counter()
             version = (prev["version"] + 1) if prev else 1
             again = []  # the re-registered keyframes' objects: their stored image's detections
@@ -423,7 +536,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                      "sigma_pos_m": pl.sigma_pos_m, "sigma_rot_deg": pl.sigma_rot_deg,
                      "pose_state": "fused" if pl.status == "registered" else "kept_at_prior",
                      "added_version": version, "sha256": fr.sha, "inliers": pl.inliers,
-                     "method": pl.method,
+                     "method": pl.method, "depth_kind": _depth_kind(am, pl),
                      "prior": p if p is not None and p["trust"] == "metric" else None})
     prior_res = [pose_residual(np.asarray(r["T_map_cam"]), np.asarray(r["prior"]["T_map_cam"]))
                  for r in rows if r.get("prior")]
@@ -459,7 +572,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     }
     status = {i: pl.status for i, pl in placements.items()}
     job.quality = gate(q, bool(kept), w.accept_if,
-                       prev is None and prior_frames_rejected(frames, status))
+                       prev is None and prior_frames_rejected(frames, status), rotations_bad)
     if am is not None:
         job.scale_source, job.scale_sigma_rel = source, round(sigma, 5)
     if not job.quality["accepted"]:
