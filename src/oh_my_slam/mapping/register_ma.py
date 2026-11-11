@@ -30,8 +30,9 @@ reference view's depth and ``MIN_AGREEMENT`` of those agree within ``DEPTH_TOL``
 (``mapping.anchored.agreement``) (``CALL_DEPTH_TOL``
 between MapAnything's own depths of one call). The references are the anchors and the frames this
 update already registered. A frame no reference confirms is rejected (``no_overlap``, or
-``few_features`` with fewer than 150 features); ``too_close`` when its median depth is below
-``TOO_CLOSE_M``."""
+``few_features`` with fewer than 150 features). Each placement carries the frame's median scene
+depth (``Placement.scene_m``): the caller applies the distance limit, which a frame with enough
+inliers escapes (api.md §4)."""
 
 from __future__ import annotations
 
@@ -69,7 +70,6 @@ CALL_DEPTH_TOL = 0.15  # between MapAnything's depths of one call (0.76 / 0.88 a
 MIN_DEPTH_M = 0.05
 SIGMA_POS_FLOOR_M = 0.01
 SIGMA_ROT_FLOOR_DEG = 0.1
-TOO_CLOSE_M = 0.30
 MIN_SCALE_SIGMA_REL = 0.005
 FEW_FEATURES = 150
 
@@ -128,6 +128,7 @@ class Placement:
     inliers: int = 0  # agreeing depth points
     depth: NDArray[np.float32] | None = None  # metric depth for fusion, on the grid of ``K_depth``
     K_depth: Array | None = None  # 3x3
+    scene_m: float | None = None  # the frame's median scene depth (the distance limit)
 
 
 @dataclass
@@ -226,6 +227,7 @@ class Registration:
         self.pool: list[_Posed] = [
             _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s)) for s in stored]
         self.placements: dict[int, Placement] = {}
+        self.scenes: dict[int, float | None] = {}  # each new frame's median scene depth
         self.calls = 0
         self.views = 0
         self.max_new = MAX_VIEWS - MAX_ANCHORS
@@ -310,9 +312,7 @@ class Registration:
             depth, Kd = (f.depth, resized_K(f.K, f.depth.shape)) if f.depth is not None \
                 else (ma_depth, v.K)
             med = median_depth(depth)
-            if med is not None and med < TOO_CLOSE_M:
-                self.placements[f.index] = Placement("rejected", "too_close")
-                continue
+            self.scenes[f.index] = med
             rel = UNPOSED_SIGMA_POS_REL if self.unposed else MA_SIGMA_POS_REL
             sig = (max(ma_sigma[0], rel * (med or 0.0)), ma_sigma[1])
             cand[f.index] = (f, T, sig, depth, Kd, ma_depth, v.K)
@@ -333,13 +333,15 @@ class Registration:
                 changed = True
         for idx, (f, *_rest) in cand.items():
             self.placements[idx] = Placement(
-                "rejected", "few_features" if f.features < FEW_FEATURES else "no_overlap")
+                "rejected", "few_features" if f.features < FEW_FEATURES else "no_overlap",
+                scene_m=self.scenes.get(idx))
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
                   Kd: Array, inliers: int) -> None:
         self.placements[f.index] = Placement(
             "registered", None, T, round(max(sig[0], SIGMA_POS_FLOOR_M), 4),
-            round(max(sig[1], SIGMA_ROT_FLOOR_DEG), 3), inliers, depth, Kd)
+            round(max(sig[1], SIGMA_ROT_FLOOR_DEG), 3), inliers, depth, Kd,
+            self.scenes.get(f.index))
         got = (depth, Kd)
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
                                 lambda: got))

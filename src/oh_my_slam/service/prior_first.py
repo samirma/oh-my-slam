@@ -132,9 +132,10 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
     out = []
     for fr in frames:
         p = res.placements[fr.work.index]
-        if p.status != "rejected" and too_close(fr.scene_m, p.inliers):
+        scene = fr.scene_m if fr.scene_m is not None else p.scene_m
+        if too_close(scene, p.inliers):
             out.append(Placement(fr.work.name, "rejected", "too_close", inliers=p.inliers,
-                                 scene_m=fr.scene_m))
+                                 scene_m=scene))
             progress(f"{fr.work.name}: rejected (too_close)")
             continue
         if p.status == "rejected":
@@ -371,10 +372,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 placements[fr.work.index] = pl
             if geo:
                 up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
-            if late:
-                for fr in late:  # a suspicious frame's scene distance (too_close)
-                    if fr.deferred and fr.scene_m is None and fr.path is not None:
-                        fr.scene_m = up.backend.median_depth(fr.path, fr.cam.canonical())
+            if late:  # their scene distance is MapAnything's depth (``register_ma``)
                 lp, r, fu = _register_none(up, am, late, workdir, progress)
                 up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
                 reg_s, fuse_s = reg_s + r, fuse_s + fu

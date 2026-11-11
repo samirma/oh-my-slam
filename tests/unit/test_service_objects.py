@@ -152,13 +152,17 @@ def test_objects_of_a_map_of_the_older_mapper(tmp_path: Path) -> None:
         # no score recorded: not listed (never made up)
         {"id": 4, "label": "old", "center": [2.0, 0.0, 0.5], "size": [0.1, 0.1, 0.1]},
         # no points in the cloud: no observed colour, not listed
-        {"id": 5, "label": "lamp", "center": [2.0, 1.0, 0.5], "size": [0.1, 0.1, 0.1], **rec}]
+        {"id": 5, "label": "lamp", "center": [2.0, 1.0, 0.5], "size": [0.1, 0.1, 0.1], **rec},
+        # map.md §5: a door is a leaf (thin, vertical, tall); an opening is never an object
+        {"id": 6, "label": "door", "center": [3.0, 0.0, 1.0], "size": [0.9, 0.8, 2.0], **rec},
+        {"id": 7, "label": "doorway", "center": [4.0, 0.0, 1.0], "size": [0.9, 0.05, 2.0],
+         **rec}]
     from oh_my_slam.service.backend import Cloud
 
-    xyz = np.array([[0.9, 0.0, 1.0], [1.1, 0.0, 1.0], [1.0, 0.0, 0.5], [0.0, 0.0, 0.0]],
-                   np.float32)
-    backend.cloud_world = Cloud(xyz, np.array([[200, 40, 40]] * 3 + [[0, 0, 0]], np.uint8),
-                                np.array([3, 3, 3, 0], np.uint32))
+    xyz = np.array([[0.9, 0.0, 1.0], [1.1, 0.0, 1.0], [1.0, 0.0, 0.5], [0.0, 0.0, 0.0],
+                    [3.0, 0.0, 1.0], [4.0, 0.0, 1.0]], np.float32)
+    backend.cloud_world = Cloud(xyz, np.array([[200, 40, 40]] * 3 + [[0, 0, 0]] * 3, np.uint8),
+                                np.array([3, 3, 3, 0, 6, 7], np.uint32))
     timings = Timings()
     updater = Updater(store, backend, timings, prior_first=False)
     jobs = Jobs(store.jobs, updater, timings.predict_update)

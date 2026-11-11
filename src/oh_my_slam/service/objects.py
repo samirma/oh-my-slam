@@ -24,6 +24,7 @@ import numpy as np
 
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.segmentation.api import color_for_id
+from oh_my_slam.segmentation.detect import PASSAGE_LABELS, door_leaf
 from oh_my_slam.service import nav
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.store import Store
@@ -41,6 +42,8 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
         oid = int(o.get("id") or 0)
         if oid < 1 or o.get("score") is None or not o.get("created_update"):
             continue
+        if o["label"] in PASSAGE_LABELS or (o["label"] == "door" and not door_leaf(o["size_m"])):
+            continue  # an opening is a passage, and a door object is a leaf (map.md §5)
         mine = cloud["object_id"] == oid
         if not mine.any():
             continue
