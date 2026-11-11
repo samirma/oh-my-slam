@@ -103,7 +103,7 @@
         "scale_sigma_rel": {
           "type": "number",
           "minimum": 0,
-          "description": "One-sigma relative uncertainty of the map scale; it bounds the relative error of any horizontal distance, in every direction."
+          "description": "One-sigma relative uncertainty of the map scale, from image-confirmed frames only; the relative error of any horizontal distance, in every direction, stays within 3 x scale_sigma_rel."
         }
       }
     },
@@ -368,7 +368,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed plain, blur or few_features); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), and locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -433,7 +433,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name."
+          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name. The pose test uses the registered pose; a frame that does not register is a duplicate only by name. A duplicate is always rejected."
         }
       },
       "allOf": [
@@ -524,6 +524,27 @@
             "required": [
               "duplicate_of"
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "kept_at_prior"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "not": {
+                  "const": "duplicate"
+                }
+              }
+            }
           }
         }
       ]
@@ -714,7 +735,7 @@
               }
             }
           },
-          "description": "One entry per stored kept_at_prior frame this job's images confirmed: how far confirmation moved it from its prior-placed pose. Empty when none; a dry run predicts it."
+          "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test."
         }
       }
     },
@@ -940,7 +961,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name."
+          "description": "With reason duplicate: the name of the frame it duplicates: a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, of the same camera, within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg), or the frame holding the same name. The pose test uses the registered pose; a frame that does not register is a duplicate only by name. A duplicate is always rejected."
         }
       },
       "allOf": [
@@ -1492,7 +1513,7 @@
                 "type": "number",
                 "minimum": 0,
                 "maximum": 1,
-                "description": "Frames that gave this label over frames in which the object was in view, detected or not."
+                "description": "Frames that gave this label over image-confirmed frames whose view frustum contains the box centre, detected or not (kept_at_prior excluded); for older-mapper maps, that mapper's per-label vote counts over its observing frames."
               }
             }
           },

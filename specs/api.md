@@ -122,10 +122,11 @@ error code `invalid_request` (§9).
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
   `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
-  uses it as a reference (§6). Occupancy, heights, the cloud and object records come only from
-  image-confirmed frames: a `kept_at_prior` frame counts only for free-by-rule cells (its camera
+  uses it as a reference (§6), nor does registration of new frames. Occupancy, heights, the
+  cloud, object records and scale evidence come only from image-confirmed frames: a `kept_at_prior` frame counts only for free-by-rule cells (its camera
   stand and near blind disc, map.md §6) until a later job's images confirm it; its pose then
-  becomes a registered one in that version (map.md §2).
+  becomes a registered one in that version (map.md §2), and the job reports it in
+  `quality.reregistered`.
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
@@ -138,19 +139,23 @@ error code `invalid_request` (§9).
     prior's sigmas from the prior (the prior's sigmas alone, not combined with the image's), and
     no supported hypothesis lies within 3 × the prior's sigmas of it.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
-  * A frame with a prior whose image fails the quality checks (`plain`, `blur`,
-    `few_features`) is `kept_at_prior` with that reason. It is `rejected` only when the image is
-    unusable (`unusable_image`: it does not decode, or its size is not the camera's).
+  * A frame with a prior whose image fails a quality check, or that is too close, is
+    `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
+    `few_features`, `too_close`, with `min_distance_m` and `scene_distance_m` when it is
+    `too_close`. It is `rejected` only when the image is unusable (`unusable_image`: it does not
+    decode, or its size is not the camera's).
   * This holds for an origin frame too: a frame of a map's first update whose image fails a
     quality check is `kept_at_prior` and still defines the map frame (map.md §1). An engine that
     cannot tie kept frames to the priors' frame, when no prior-carrying frame registers, may
     reject the first update with `prior_frames_rejected` (map.md §1).
   * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or of
     an earlier `registered` frame of the same request and camera, or one whose name the map or
-    the request already holds (§3). `duplicate_of` names that frame. Stored `kept_at_prior`
-    keyframes do not count for this test. 0.02 m and 2° are defaults; `README.md` may raise
-    them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or 5° away is never a
-    duplicate. A view the map already has, beyond those limits, is `registered`.
+    the request already holds (§3). `duplicate_of` names that frame. The pose test uses the
+    frame's registered pose, after registration: a frame that does not register can be a
+    duplicate only by name. A duplicate is always `rejected`, never `kept_at_prior`. Stored
+    `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
+    `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or 5°
+    away is never a duplicate. A view the map already has, beyond those limits, is `registered`.
   * `too_close` is only the camera-to-scene distance limit, with `min_distance_m` and
     `scene_distance_m`.
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
