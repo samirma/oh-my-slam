@@ -18,7 +18,7 @@ import json
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
@@ -170,7 +170,8 @@ def _progress(msg: str) -> None:
 def _infer_frames(kfs: Iterable[ingest.Keyframe], kind: str, work: Path, client: Any,
                   progress: Progress, ingested: Callable[[list[ingest.Keyframe]], None],
                   lens_of: Callable[[ingest.Keyframe], Intrinsics | None] = lambda kf: None,
-                  ignore: dict[str, Path] | None = None) -> list[NewFrame]:
+                  ignore: dict[str, Path] | None = None, labels: Sequence[str] = ()
+                  ) -> list[NewFrame]:
     """Geometry, gravity and detections for every keyframe (two frames in flight), each started as
     soon as ingest has written it: the stage ``ingest`` decodes the input while the first
     keyframes' inference runs, ``inference`` waits for the rest. ``ingested`` is called with the
@@ -180,7 +181,7 @@ whose source ``ignore`` names has that mask's pixels taken out (``_ignore_pixels
 
     def one(kf: ingest.Keyframe) -> NewFrame:
         lens = lens_of(kf)
-        frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client, lens)
+        frame, dets = reconstruct_and_detect_keyframe(kf, work / kf.name, client, lens, labels)
         mask = (ignore or {}).get(kf.source)
         if mask is not None:
             dets = _ignore_pixels(frame, dets, mask)
@@ -344,7 +345,7 @@ def _reconstruct_keyframe(path: Path, client: Any, intrinsics: Intrinsics | None
 
 
 def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any,
-                                    lens: Intrinsics | None = None
+                                    lens: Intrinsics | None = None, labels: Sequence[str] = ()
                                     ) -> tuple[FrameReconstruction, list[Detection]]:
     """Depth, gravity and descriptor from reconstruction, detections from segmentation (at the
     default threshold, requested while the reconstruction runs). With the keyframe's camera
@@ -356,7 +357,7 @@ def reconstruct_and_detect_keyframe(kf: ingest.Keyframe, work: Path, client: Any
     try:
         frame, dets = detect_alongside(
             kf.path, own, lambda c: _reconstruct_keyframe(src.path, c, src.exif, work),
-            max_side=KEYFRAME_GRID_SIDE)
+            max_side=KEYFRAME_GRID_SIDE, labels=labels)
     finally:
         if own is not client:
             own.close()
@@ -3040,18 +3041,20 @@ class UpdateResult:
 
 def update(map_dir: Path, inputs: list[Path], *, client: Any = None, progress: Progress = _progress,
            intrinsics: dict[Path, Intrinsics] | None = None,
-           ignore: dict[Path, Path] | None = None) -> UpdateResult:
+           ignore: dict[Path, Path] | None = None, labels: Sequence[str] = ()
+            ) -> UpdateResult:
     """Map the images ``inputs`` (in order) into the map ``map_dir`` (created when missing).
     ``intrinsics``: given intrinsics of input images, in place of their EXIF ones
     (``ingest.keyframes``); ``ignore``: an 8-bit PNG mask per input image, whose non-zero pixels
     are neither fused nor detected (``_ignore_pixels``)."""
     with timing.collect() as tm:
-        return _update(map_dir, inputs, client, progress, tm, intrinsics, ignore)
+        return _update(map_dir, inputs, client, progress, tm, intrinsics, ignore, labels)
 
 
 def _update(map_dir: Path, inputs: list[Path], client: Any, progress: Progress,
             tm: timing.Timings, intrinsics: dict[Path, Intrinsics] | None = None,
-            ignore: dict[Path, Path] | None = None) -> UpdateResult:
+            ignore: dict[Path, Path] | None = None, labels: Sequence[str] = ()
+            ) -> UpdateResult:
     """``update`` with per-stage timings (``core.timing``; stages are exclusive and sequential,
     geometry/gravity/segmentation per keyframe are parts, server time per endpoint)."""
     from oh_my_slam.reconstruction.api import connect_server as connect
@@ -3082,7 +3085,8 @@ def _update(map_dir: Path, inputs: list[Path], client: Any, progress: Progress,
                     early.append(f)
 
             new = _infer_frames(kfs, spec.kind, work, client, progress, ingested,
-                                _lens_of(old), {str(k): v for k, v in (ignore or {}).items()})
+                                _lens_of(old), {str(k): v for k, v in (ignore or {}).items()},
+                                labels)
             timing.count(input_kind=spec.kind, keyframes_sampled=len(new), map_frames_before=len(old))
             is_video = spec.kind == "video"
             ctx = UpdateContext(tx, meta, old, new, update_id, work,

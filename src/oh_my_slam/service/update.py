@@ -72,6 +72,7 @@ from oh_my_slam.mapping.anchored import (
     drift_grown as anchored_drift_grown,
 )
 from oh_my_slam.mapping.quality import displacement_quality, gate, residual_stats
+from oh_my_slam.segmentation.detect import normalize_label
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
 from oh_my_slam.service.cameras import (
     Camera,
@@ -133,6 +134,22 @@ class UpdateWork:
     # PNG bytes)``): recorded with the version the job commits, never before
     cameras: dict[str, dict[str, Any]] = field(default_factory=dict)
     masks: dict[str, tuple[str, bytes]] = field(default_factory=dict)
+    # the request's ``labels`` (oms/2.3), added to the map's label vocabulary (map.md §5)
+    labels: list[str] = field(default_factory=list)
+
+
+def map_labels(prev: dict[str, Any] | None, labels: list[str]) -> list[str]:
+    """A version's label vocabulary (map.md §5, oms/2.3): the previous version's, then the
+    update's ``labels`` it does not hold yet, compared case-insensitively, each trimmed; never the
+    defaults (``segmentation.detect.vocabulary`` merges them for detection)."""
+    out = list((prev or {}).get("labels") or [])
+    seen = {normalize_label(lab) for lab in out}
+    for lab in labels:
+        key = normalize_label(lab)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(lab.strip())
+    return out
 
 
 @dataclass
@@ -501,9 +518,10 @@ class Updater:
             paths = [fr.path for fr in todo if fr.path is not None]
             intrinsics = {fr.path: fr.cam.canonical() for fr in todo if fr.path is not None}
             try:
-                reg = self.backend.register(
+                reg = self.backend.register(  # its detections prompt with the vocabulary
                     mapper, paths, intrinsics, workdir / f"mapper{attempt}.log",
-                    {fr.path: fr.mask_path for fr in todo if fr.path and fr.mask_path})
+                    {fr.path: fr.mask_path for fr in todo if fr.path and fr.mask_path},
+                    labels=map_labels(prev, w.labels))
             except NothingRegisteredError:
                 for fr in todo:
                     self._unregistered(fr)
@@ -984,6 +1002,7 @@ class Updater:
             job.progress = 1.0
             return
         assert record is not None
+        record = {**record, "labels": map_labels(prev, w.labels)}
         depths = kept_depth(kept)
         job.result_version = self.store.commit(w.map, record,
                                                None if result is None else result[0],

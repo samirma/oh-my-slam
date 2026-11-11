@@ -37,7 +37,8 @@ def run(args: dict[str, Any]) -> int:
     start = _next_index(map_dir)
     try:
         res = update(map_dir, inputs, intrinsics=intrinsics,
-                     ignore={Path(p): Path(m) for p, m in args.get("masks", {}).items()})
+                     ignore={Path(p): Path(m) for p, m in args.get("masks", {}).items()},
+                     labels=list(args.get("labels", [])))
     except OhMySlamError as exc:
         atomic_write_json(out, {"error": {"message": str(exc), "exit_code": int(exc.exit_code),
                                           "out_of_memory": isinstance(exc, DeviceMemoryError)}})

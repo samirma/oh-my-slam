@@ -121,6 +121,7 @@ class FakeBackend:
     # sha256 of an image -> its detections (masks on any grid: resampled to the one asked)
     detections: dict[str, list[Any]] = field(default_factory=dict)
     detected: list[tuple[str, tuple[int, int]]] = field(default_factory=list)
+    prompted: list[list[str]] = field(default_factory=list)  # each call's map labels
     looked: list[tuple[str, list[Any]]] = field(default_factory=list)
     closer: Any = lambda image, regions, dets: dets
     detect_error: bool = False
@@ -192,11 +193,12 @@ class FakeBackend:
             out.append(MvView(rel, (depth * self.mv_scale).astype(np.float32), K.K()))
         return out
 
-    def detect(self, image: Path, grid: tuple[int, int]) -> list[Any]:
+    def detect(self, image: Path, grid: tuple[int, int], labels: Any = ()) -> list[Any]:
         from oh_my_slam.segmentation.api import Detection
         from oh_my_slam.service.errors import ApiError
 
         self.detected.append((image.name, grid))
+        self.prompted.append(list(labels))
         if self.detect_error:
             raise ApiError("inference_unavailable", "down (test)")
         out = []
@@ -209,7 +211,7 @@ class FakeBackend:
         return out
 
     def look_closer(self, image: Path, regions: list[Any], dets: list[Any],
-                    grid: tuple[int, int]) -> list[Any]:
+                    grid: tuple[int, int], labels: Any = ()) -> list[Any]:
         """``closer(image, regions, dets)``: a test's closer look (the detections as they are by
         default)."""
         self.looked.append((image.name, [r.box for r in regions]))
@@ -221,8 +223,10 @@ class FakeBackend:
         return self.gauge.pose(T)
 
     def register(self, mapper_dir: Path, inputs: list[Path], intrinsics: dict[Path, Intrinsics],
-                 log: Path, masks: dict[Path, Path] | None = None) -> Registered:
+                 log: Path, masks: dict[Path, Path] | None = None, labels: Any = ()
+                 ) -> Registered:
         self.calls.append([p.name for p in inputs])
+        self.prompted.append(list(labels))
         self.masks.append({p.name: m.name for p, m in (masks or {}).items()})
         if self.nothing:
             raise NothingRegisteredError("nothing (test)")

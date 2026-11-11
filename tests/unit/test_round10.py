@@ -375,3 +375,58 @@ def test_mapanything_depth_on_ignored_pixels_counts_for_nothing() -> None:
     out = rm._without_ignored([v, v, v], 1, chunk)
     assert out[0] is v and out[2] is v
     assert not out[1].depth[5:].any() and out[1].depth[:5].all()
+
+
+# -- P18: the label vocabulary (oms/2.3) --------------------------------------------------------
+
+
+def test_labels_are_validated_as_the_field_labels(client: Client) -> None:  # noqa: F811
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    for bad in ([""], ["   "], ["x" * 65], ["ok"] * 65, [3]):
+        req = {"frames": fr, "cameras": {"cam": CAM}, "labels": bad}
+        doc = client.post_update("m", req, files, status=400)
+        assert doc["error"]["code"] == "invalid_request"
+        assert doc["error"]["details"]["field"] == "labels", bad
+    doc = client.post_update("m", {"frames": fr, "cameras": {"cam": CAM}, "nope": 1}, files,
+                             status=400)
+    assert doc["error"]["details"]["field"] != "labels"
+
+
+def test_the_label_vocabulary_is_the_union_of_the_updates(client: Client) -> None:  # noqa: F811
+    """map.md §5 (oms/2.3): each update's labels join the version's vocabulary (case-insensitive,
+    trimmed, never the defaults); detection prompts with the defaults and it; the summary
+    reports it, a dry run the merged one; a revert restores it."""
+    from oh_my_slam.segmentation.detect import default_vocabulary
+
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    job = client.update("m", fr, files, cameras={"cam": CAM}, labels=[" Red Mug ", "chair"])
+    assert job["state"] == "committed"
+    assert client.backend.prompted and client.backend.prompted[-1] == ["Red Mug", "chair"]
+    assert client.get("/api/maps/m", "MapSummary")["labels"] == ["Red Mug", "chair"]
+    fr, files = frames_for(client, [base_pose(20)], tag="b")
+    req = {"frames": fr, "labels": ["red mug", "Lamp Shade"]}
+    from tests.unit.test_service_prior_first import dry
+
+    d = dry(client, "m", fr, files, labels=["red mug", "Lamp Shade"])
+    defaults = list(default_vocabulary())
+    assert d["labels"][:len(defaults)] == defaults
+    extra = d["labels"][len(defaults):]
+    assert "Red Mug" in extra and "Lamp Shade" in extra and "red mug" not in extra
+    assert "chair" in defaults and "chair" not in extra
+    job = client.wait(client.post_update("m", req, files)["job_id"])
+    assert job["state"] == "committed"
+    s = client.get("/api/maps/m", "MapSummary")
+    assert s["labels"] == ["Red Mug", "chair", "Lamp Shade"]
+    assert client.get("/api/maps/m?version=1", "MapSummary")["labels"] == ["Red Mug", "chair"]
+    assert _revert(client, 1)["labels"] == ["Red Mug", "chair"]
+
+
+def test_prompts_merge_the_defaults_case_insensitively() -> None:
+    from oh_my_slam.segmentation import detect as dt
+
+    defaults = list(dt.default_prompts())
+    first = dt.default_vocabulary()[0]
+    got = dt.prompts([first.upper(), "  Red  Mug ", "red mug", "", "blue_box"])
+    assert got[:len(defaults)] == defaults and got[len(defaults):] == ["Red  Mug", "blue_box"]
+    assert dt.label_of("Red  Mug") == "red mug"
+    assert dt.vocabulary(["Red Mug"])[-1] == "Red Mug" and dt.prompts() == defaults

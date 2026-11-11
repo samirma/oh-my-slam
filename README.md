@@ -70,7 +70,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.2; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.3; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -792,6 +792,22 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   map.
 
 ### Objects, surfaces and relations (O8)
+
+* **Label vocabulary** (oms/2.3, map.md §5). An update's optional `labels` (at most 64, each
+  1-64 characters after trimming; otherwise `invalid_request`, `details.field` `labels`) join
+  the map's vocabulary, stored with the version (`versions/<n>.json` `labels`): the previous
+  version's, then each new label it does not hold yet, compared case-insensitively
+  (`segmentation.detect.normalize_label`), trimmed, first spelling kept
+  (`update.map_labels`), never the defaults; a revert restores the target's. Every detection of
+  a job (each frame's, a re-registered keyframe's, the closer looks and their label scores, the
+  older mapper's in its own process) prompts with the defaults (`default_labels.txt`) followed
+  by the vocabulary's labels the defaults do not hold, as label or prompt
+  (`segmentation.detect.prompts`, `extra_labels`). A label gets no other treatment: its own text
+  is its prompt, and a detection under it reports it normalised (lower case, single spaces). The
+  inference server already takes the prompts with each request (`SegmentRequest.labels`, its
+  text embeddings cached per prompt set), so it did not change. `GET /api/maps/{name}` reports
+  the version's vocabulary in `labels` (without the defaults), a dry run in `labels` the merged
+  one it would use (`segmentation.detect.vocabulary`: the default labels, then the others).
 
 `GET /api/maps/{name}/objects` [`Objects`] on an anchored map (`mapping.anchored_objects`,
 called by `service.prior_first` after the engine placed and fused the update's keyframes):

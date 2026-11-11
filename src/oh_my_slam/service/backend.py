@@ -11,7 +11,7 @@ import json
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -126,18 +126,21 @@ class Backend(Protocol):
         """MapAnything over ``images`` with their intrinsics and the given camera-to-world
         poses; ``ApiError`` ``out_of_memory`` when the call does not fit."""
 
-    def detect(self, image: Path, grid: tuple[int, int]) -> list[Detection]:
-        """The detections of an image, masks on ``grid`` (width, height)."""
+    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = ()
+               ) -> list[Detection]:
+        """The detections of an image, masks on ``grid`` (width, height); ``labels``: the map's
+        vocabulary, prompted with the defaults (``segmentation.detect.prompts``)."""
 
     def look_closer(self, image: Path, regions: list[Region], dets: list[Detection],
-                    grid: tuple[int, int]) -> list[Detection]:
+                    grid: tuple[int, int], labels: Sequence[str] = ()) -> list[Detection]:
         """The detections ``dets`` of an image looking down at its support (masks on ``grid``),
         looked at closer (``segmentation.api.look_closer``): its raised areas ``regions`` that
         they leave uncovered labelled, the other labels of each."""
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
-                 masks: dict[Path, Path] | None = None) -> Registered:
+                 masks: dict[Path, Path] | None = None, labels: Sequence[str] = ()
+                 ) -> Registered:
         """Map ``inputs`` into the mapper map ``mapper_dir`` (created if missing), the pixels of
         each one's ignore mask (``masks``, PNG) neither fused nor detected; raises
         ``NothingRegisteredError`` or ``ApiError``."""
@@ -295,28 +298,30 @@ class MapperBackend:
         return [MvView(r.pose.matrix(), np.load(str(r.depth_path)).astype(np.float32), r.K)
                 for r in res]
 
-    def detect(self, image: Path, grid: tuple[int, int]) -> list[Detection]:
+    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = ()
+               ) -> list[Detection]:
         from oh_my_slam.reconstruction.api import connect_server
         from oh_my_slam.segmentation.api import detect_on_grid
 
         try:
             client = connect_server().clone(self.priority)
             try:
-                return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE)
+                return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE,
+                                      labels=labels)
             finally:
                 client.close()
         except OhMySlamError as exc:
             raise api_error(exc) from exc
 
     def look_closer(self, image: Path, regions: list[Region], dets: list[Detection],
-                    grid: tuple[int, int]) -> list[Detection]:
+                    grid: tuple[int, int], labels: Sequence[str] = ()) -> list[Detection]:
         from oh_my_slam.reconstruction.api import connect_server
         from oh_my_slam.segmentation.api import look_closer
 
         try:
             client = connect_server().clone(self.priority)
             try:
-                return look_closer(image, regions, dets, grid, client, MAP_MIN_SCORE)
+                return look_closer(image, regions, dets, grid, client, MAP_MIN_SCORE, labels)
             finally:
                 client.close()
         except OhMySlamError as exc:
@@ -324,14 +329,15 @@ class MapperBackend:
 
     def register(self, mapper_dir: Path, inputs: list[Path],
                  intrinsics: dict[Path, Intrinsics], log: Path,
-                 masks: dict[Path, Path] | None = None) -> Registered:
+                 masks: dict[Path, Path] | None = None, labels: Sequence[str] = ()
+                 ) -> Registered:
         args = log.with_suffix(".args.json")
         result = log.with_suffix(".result.json")
         args.write_text(json.dumps({
             "map_dir": str(mapper_dir), "inputs": [str(p) for p in inputs],
             "intrinsics": {str(p): K.to_dict() for p, K in intrinsics.items()},
             "masks": {str(p): str(m) for p, m in (masks or {}).items()},
-            "result": str(result)}))
+            "labels": list(labels), "result": str(result)}))
         with log.open("ab") as out, self._lock:
             self._proc = subprocess.Popen(
                 [*self.cmd, str(args)],

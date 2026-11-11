@@ -68,6 +68,7 @@ from oh_my_slam.mapping.quality import (
     residual_stats,
     too_close,
 )
+from oh_my_slam.segmentation.detect import vocabulary
 from oh_my_slam.service.prior_first import (
     LOW_CONFIDENCE_SIGMA_M,
     _frame_in,
@@ -207,7 +208,10 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             "quality": gate(q, bool(kept), w.accept_if, prev is None and bool(trusted) and all(
                 r["predicted_status"] == "rejected" for r in trusted), rotations_bad),
             "scale_source": source, "scale_sigma_rel": round(sigma, 5),
-            "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
+            "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)},
+            # the vocabulary detection would use (map.md §5): the defaults and the map's with
+            # the request's labels
+            "labels": vocabulary(_map_labels(prev, w.labels))}
 
 
 def _predicted_pose(fr: _Frame, pl: Placement | None, anchored: bool, new_map: bool
@@ -351,3 +355,9 @@ def _row(fr: _Frame, m: Any, map_inliers: int | None, neighbours: list[dict[str,
             "too_close": fr.scene_m is not None and fr.scene_m < TOO_CLOSE_M,
             "predicted_status": status, "predicted_reason": None if status == "registered"
             else reason}
+
+
+def _map_labels(prev: dict[str, Any] | None, labels: list[str]) -> list[str]:
+    from oh_my_slam.service.update import map_labels
+
+    return map_labels(prev, labels)

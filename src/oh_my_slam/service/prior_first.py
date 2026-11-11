@@ -434,6 +434,11 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     pairs = standpoint.Pairs()  # the two-view fits of this update (standpoints, the hard limit)
     rotations_bad = False
     rotation_pairs: list[dict[str, Any]] = []  # the rotation check's pairs (map.md §4)
+    # the map's label vocabulary with this update's labels (map.md §5): every detection of the
+    # job prompts with it and the defaults
+    from oh_my_slam.service.update import map_labels
+
+    labels = map_labels(prev, w.labels)
     if todo:
         t = time.perf_counter()
         if prev is not None:
@@ -471,7 +476,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                               strict=True)) if late else {}
         # the detections queue behind the monocular depth registration waits for
         dets = {fr.work.index: pool.submit(up.backend.detect, fr.path,
-                                           detection_grid(fr.cam.canonical()))
+                                           detection_grid(fr.cam.canonical()), labels)
                 for fr in todo if fr.path is not None}
         done = [0]
 
@@ -562,11 +567,13 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                     continue
                 kf, path = am.keyframe(e["keyframe"]), am.image_path(e["keyframe"])
                 assert kf is not None and path is not None
-                again.append((kf, pool.submit(up.backend.detect, path, detection_grid(kf.K))))
+                again.append((kf, pool.submit(up.backend.detect, path, detection_grid(kf.K),
+                                              labels)))
             if am.keyframes:  # else no origin: every frame with a prior was rejected
                 om, n_objects = fuse_objects(am, [(placements[fr.work.index], fr.ignore,
                                                    fr.path, dets[fr.work.index]) for fr in todo],
-                                             version, up.backend.look_closer, again)
+                                             version, functools.partial(
+                                                 up.backend.look_closer, labels=labels), again)
             tm["objects"] = round(time.perf_counter() - t, 3)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -672,7 +679,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
               "floor_sigma_m": round(floor_sigma, 4), "pose_states": POSE_STATES,
               "bounds_m": {"min": pts.min(0).round(4).tolist(),
                            "max": pts.max(0).round(4).tolist()},
-              "points": len(am.cloud.keys)}
+              "points": len(am.cloud.keys), "labels": labels}
     job.result_version = up.store.commit(w.map, record, mapper,
                                          {"objects.json": om.records()}, w.cameras, w.masks)
     job.state, job.progress = "committed", 1.0

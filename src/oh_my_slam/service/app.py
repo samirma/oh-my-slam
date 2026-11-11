@@ -248,7 +248,8 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
                                 f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask,
                                 reject))
-    return UpdateWork(name, frames, req.get("accept_if"), new, masks)
+    return UpdateWork(name, frames, req.get("accept_if"), new, masks,
+                      [str(lab).strip() for lab in req.get("labels") or []])
 
 
 # -- the API -------------------------------------------------------------------------------------
@@ -302,7 +303,13 @@ class Api:
             req = json.loads(parts["request"])
         except (ValueError, UnicodeDecodeError) as exc:
             raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
-        schema.validate("UpdateRequest", req)
+        try:
+            schema.validate("UpdateRequest", req)
+        except ApiError as exc:
+            # a label is refused as the field labels (api.md §3), never as a frame status
+            if str(exc.details.get("field", "")).startswith("labels"):
+                raise invalid("labels", exc.message, schema="UpdateRequest") from exc
+            raise
         pending: dict[str, dict[str, Any]] = {}
         for j in self.s.jobs.active_jobs(name):
             pending.update(getattr(j.work, "cameras", None) or {})
@@ -368,6 +375,8 @@ class Api:
             "objects": v["objects"], "cameras": v.get("cameras", meta["cameras"]),
             "bounds_m": v["bounds_m"],
             "floor_z_m": v["floor_z_m"], "running_job": None if job is None else job.id,
+            # the version's label vocabulary (oms/2.3, map.md §5), without the defaults
+            "labels": list(v.get("labels") or []),
             "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"]})
 
     async def get_versions(self, request: Request) -> Response:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from importlib import resources
@@ -252,6 +253,31 @@ def default_prompts() -> tuple[str, ...]:
     return tuple(_vocabulary().values())
 
 
+def extra_labels(labels: Sequence[str] = ()) -> tuple[str, ...]:
+    """A map's label vocabulary (map.md §5, oms/2.3) beyond the defaults: each label trimmed,
+    those the defaults hold (as a label or a prompt) or that repeat one before it, compared
+    case-insensitively (``normalize_label``), left out."""
+    known = {normalize_label(k) for k in _vocabulary()} | set(_labels_of_prompts())
+    out: list[str] = []
+    for lab in labels:
+        key = normalize_label(lab)
+        if key and key not in known:
+            known.add(key)
+            out.append(lab.strip())
+    return tuple(out)
+
+
+def vocabulary(labels: Sequence[str] = ()) -> list[str]:
+    """The labels detection uses: the defaults merged with ``labels`` (``extra_labels``)."""
+    return [*default_vocabulary(), *extra_labels(labels)]
+
+
+def prompts(labels: Sequence[str] = ()) -> list[str]:
+    """What the detector is shown: the default prompts, then the map's own labels, each its own
+    prompt (``label_of`` reports it as its normalised text: no special treatment)."""
+    return [*default_prompts(), *extra_labels(labels)]
+
+
 @cache
 def _labels_of_prompts() -> dict[str, str]:
     return {prompt: label for label, prompt in _vocabulary().items()}
@@ -420,41 +446,45 @@ def detect(
     max_side: int = DETECT_SIDE,
     client: InferenceClient | None = None,
     min_area_px: int = MIN_AREA_PX,
+    labels: Sequence[str] = (),
 ) -> list[Detection]:
     """Detections scoring at least ``min_score``, with masks and boxes on the ``max_side`` grid
     (the reconstruction's grid of the image; ``min_area_px`` counts its pixels). The detector's
     input does not depend on ``max_side`` (``DETECT_SIDE``, ``COARSE_SIDE``), so every caller
     gets the same detections of an image. The server is asked for everything above ``floor``
     (between 0 and ``min_score``), so the request — and the detections it returns — do not depend
-    on ``min_score``."""
+    on ``min_score``. ``labels``: the map's vocabulary beyond the defaults (``prompts``)."""
     if not 0.0 <= floor <= max(min_score, 0.0):
         raise ValueError(f"the detection floor {floor} must lie between 0 and min_score "
                          f"{min_score}")
     with timing.part("segmentation"):
-        return _detect(image_path, min_score, floor, max_side, client or connect(), min_area_px)
+        return _detect(image_path, min_score, floor, max_side, client or connect(), min_area_px,
+                       labels)
 
 
 def _detect(image_path: Path, min_score: float, floor: float, max_side: int,
-            client: InferenceClient, min_area_px: int) -> list[Detection]:
+            client: InferenceClient, min_area_px: int, labels: Sequence[str] = ()
+            ) -> list[Detection]:
     w, h = upright_size(Path(image_path))
     grid = size_at_max_side(w, h, max_side)
-    fine = _detect_pass(image_path, DETECT_SIDE, min_score, floor, grid, client, min_area_px)
+    fine = _detect_pass(image_path, DETECT_SIDE, min_score, floor, grid, client, min_area_px,
+                        labels)
     if max(w, h) <= COARSE_SIDE:
         return order(dedupe(fine))
     large = max(min_area_px, COARSE_MIN_SHARE * grid[0] * grid[1])
-    coarse = _detect_pass(image_path, COARSE_SIDE, min_score, floor, grid, client, large)
+    coarse = _detect_pass(image_path, COARSE_SIDE, min_score, floor, grid, client, large, labels)
     return order(dedupe(fuse_passes([fine, coarse])))
 
 
 def _detect_pass(image_path: Path, side: int, min_score: float, floor: float,
-                 grid: tuple[int, int], client: InferenceClient, min_area_px: float
-                 ) -> list[Detection]:
+                 grid: tuple[int, int], client: InferenceClient, min_area_px: float,
+                 labels: Sequence[str] = ()) -> list[Detection]:
     """One pass: the image at ``side`` px shown to the detector, masks resampled onto ``grid``
     (width, height)."""
     res = client.segment_image(
         p.SegmentRequest(
             image_path=str(Path(image_path).resolve()),
-            labels=list(default_prompts()),
+            labels=prompts(labels),
             max_side=side,
             imgsz=DETECT_SIDE,
             # the model keeps scores strictly above its threshold, which must not be negative
@@ -490,8 +520,8 @@ CROP_MIN_PX = 128
 
 
 def detect_regions(image_path: Path, boxes: list[tuple[int, int, int, int]],
-                   grid: tuple[int, int], client: InferenceClient, min_score: float
-                   ) -> list[list[Detection]]:
+                   grid: tuple[int, int], client: InferenceClient, min_score: float,
+                   labels: Sequence[str] = ()) -> list[list[Detection]]:
     """The detections of a crop of the image around each box (x0, y0, x1, y1 on ``grid``,
     width x height), masks and boxes on ``grid``; each crop's own detections, ``priority``
     order."""
@@ -511,7 +541,7 @@ def detect_regions(image_path: Path, boxes: list[tuple[int, int, int, int]],
             path = Path(tmp) / f"crop{k}.png"
             Image.fromarray(rgb[cy0:cy1, cx0:cx1]).save(path)
             res = client.segment_image(p.SegmentRequest(
-                image_path=str(path), labels=list(default_prompts()), max_side=DETECT_SIDE,
+                image_path=str(path), labels=prompts(labels), max_side=DETECT_SIDE,
                 imgsz=DETECT_SIDE, conf=max(min_score - 1e-6, 0.0)))
             dets = []
             for inst in res.instances:
@@ -544,13 +574,13 @@ ALT_IOU = 0.7
 
 
 def label_scores(image_path: Path, dets: list[Detection], grid: tuple[int, int],
-                 client: InferenceClient) -> list[Detection]:
+                 client: InferenceClient, labels: Sequence[str] = ()) -> list[Detection]:
     """``dets`` (masks on ``grid``) with the other labels the detector scores each as
     (``Detection.alternatives``, from ``ALT_FLOOR``)."""
     if not dets:
         return []
     res = client.segment_image(p.SegmentRequest(
-        image_path=str(Path(image_path).resolve()), labels=list(default_prompts()),
+        image_path=str(Path(image_path).resolve()), labels=prompts(labels),
         max_side=DETECT_SIDE, imgsz=DETECT_SIDE, conf=ALT_FLOOR - 1e-6, per_label=True))
     cands = []
     for inst in res.instances:

@@ -11,7 +11,7 @@ packages use segmentation through this module, never its internals (import-linte
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -320,13 +320,14 @@ def lift_on_grid(dets: list[Detection], depth: NDArray[Any], K: Intrinsics,
 
 
 def detect_on_grid(image_path: Path, grid: tuple[int, int], client: InferenceClient | None = None,
-                   min_score: float = DEFAULT_MIN_SCORE) -> list[Detection]:
+                   min_score: float = DEFAULT_MIN_SCORE, labels: Sequence[str] = ()
+                   ) -> list[Detection]:
     """Detections of an image with masks and boxes on ``grid`` (width, height): a keyframe's
     depth grid, whatever its size (the detector's input does not depend on it)."""
     from oh_my_slam.segmentation.detect import resample_mask
 
     dets = detect(image_path, min_score=min_score, floor=min_score, max_side=max(grid),
-                  client=client)
+                  client=client, labels=labels)
     out = []
     for d in dets:
         h, w = d.mask.shape
@@ -395,6 +396,7 @@ def detect_alongside(
     max_side: int,
     min_score: float = DEFAULT_MIN_SCORE,
     floor: float | None = None,
+    labels: Sequence[str] = (),
 ) -> tuple[FrameReconstruction, list[Detection]]:
     """Detections of ``image_path`` requested on a second connection while the caller's
     ``reconstruct(client)`` runs, so the server's queue stays busy while this process decodes and
@@ -408,7 +410,7 @@ def detect_alongside(
         with ThreadPoolExecutor(1) as pool:
             fut = pool.submit(detect, image_path, min_score=min_score,
                               floor=min_score if floor is None else floor, max_side=max_side,
-                              client=det_client)
+                              client=det_client, labels=labels)
             frame = reconstruct(client)
             dets = fut.result()
     finally:
@@ -474,7 +476,8 @@ def label_regions(regions: list[Region], looks: list[list[Detection]], dets: lis
 
 def look_closer(image_path: Path, regions: list[Region], dets: list[Detection],
                 grid: tuple[int, int], client: InferenceClient,
-                min_score: float = DEFAULT_MIN_SCORE) -> list[Detection]:
+                min_score: float = DEFAULT_MIN_SCORE, labels: Sequence[str] = ()
+                ) -> list[Detection]:
     """The detections ``dets`` (masks on ``grid``) of a view looking down at its support (its
     raised areas ``regions``), looked at closer: the areas they leave uncovered labelled from a
     crop around each (``detect.detect_regions``, ``label_regions``, from ``min_score``), then the
@@ -482,6 +485,6 @@ def look_closer(image_path: Path, regions: list[Region], dets: list[Detection],
     todo = uncovered_regions(regions, dets)
     if todo:
         dets = dets + label_regions(
-            todo, detect_regions(image_path, [r.box for r in todo], grid, client, min_score),
-            dets)
-    return label_scores(image_path, dets, grid, client)
+            todo, detect_regions(image_path, [r.box for r in todo], grid, client, min_score,
+                                 labels), dets)
+    return label_scores(image_path, dets, grid, client, labels)
