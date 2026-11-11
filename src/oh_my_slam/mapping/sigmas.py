@@ -12,6 +12,10 @@ combined in quadrature with the *image-registration noise floor* of its data kin
 ``OH_MY_SLAM_SIGMA_FLOORS`` (JSON ``{"<depth>/<trust>": [m, deg], ...}``, the keys of
 ``NOISE_FLOORS``) and ``OH_MY_SLAM_SIGMA_SCALE``.
 
+**Convention.** Every sigma is 3-D RMS (api.md §6 "Sigma convention"): σ² is the trace of the
+position or rotation covariance, for update and locate and every engine; the noise floors are
+3-D RMS errors too (the client's measurements are error norms).
+
 **Conflict.** A hypothesis conflicts with a prior when its distance from the prior exceeds
 ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²), position and rotation tested separately; σ_hypothesis
 is the hypothesis's image-only calibrated sigma (before fusion with the prior, no rival

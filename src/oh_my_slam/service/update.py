@@ -51,17 +51,17 @@ from numpy.typing import NDArray
 from oh_my_slam.core.constants import FLOOR_BAND_SIGMAS, FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.images import png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.mapping import anchor, checks, sigmas
+from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping import anchor, checks, sigmas, standpoint
 from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import (
     OVERLAP_MIN,
     Features,
+    coverage,
     duplicate_among,
     features,
     floor_spread,
-    frustum_points,
     lowest_layer,
-    view_overlap,
 )
 from oh_my_slam.mapping.quality import gate, residual_stats
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
@@ -188,7 +188,7 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
     observation (its mean reprojection error over the focal length, or the multi-view
     refinement's median match residual) over the square root of its observations, times the
     scene depth for the position, combined with the anchoring's RMS residual; three times that
-    for a low-confidence keyframe; then calibrated (``mapping.sigmas.calibrated``: the
+    for a low-confidence keyframe, as 3-D RMS (sqrt(3) times the per-axis proxy); then calibrated (``mapping.sigmas.calibrated``: the
     image-registration noise of the data kind, a depth image or not and the prior's trust),
     floored. Without ``calibrate``, the proxy alone: the weight of a stored pose as an anchor of
     the next version's fit (``_anchor``), which the noise floors would leave without scale."""
@@ -201,8 +201,9 @@ def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: floa
         ang = float(st.get("reproj_error") or 1.0) / max(f.fx, 1.0)
     n = max(n, 1.0)
     d = scene_depth_m or DEFAULT_SCENE_DEPTH_M
-    rot = ang * math.sqrt(2.0 / n)
-    pos = d * ang * math.sqrt(8.0 / n)
+    # per axis, times sqrt(3): 3-D RMS (api.md §6 "Sigma convention", every engine alike)
+    rot = math.sqrt(3.0) * ang * math.sqrt(2.0 / n)
+    pos = math.sqrt(3.0) * d * ang * math.sqrt(8.0 / n)
     k = LOW_CONFIDENCE_FACTOR if f.low_confidence else 1.0
     pos, rot = math.hypot(k * pos, align_rms_m), math.degrees(k * rot)
     if calibrate:
@@ -680,26 +681,22 @@ class Updater:
     @staticmethod
     def _prior_disagreement(placed: list[_Frame], internal: InternalMap, sim: Sim3) -> float:
         """``prior_disagreement_deg`` (map.md §1): over the pairs of registered frames with a
-        metric or drifting prior that overlap by at least ``OVERLAP_MIN`` (both ways, their
-        views at their median scene depth), the largest angle between the images' relative
-        rotation and the priors'. The mapper's rotations are the images' own: the correction is
-        inherent."""
+        metric or drifting prior that overlap by at least ``OVERLAP_MIN`` (the overlap of map.md
+        §1, no named reference: the smaller of the two ``coverage``s of their request images),
+        the largest angle between the images' relative rotation and the priors'. The mapper's
+        rotations are the images' own: the correction is inherent."""
         views = []
         for fr in placed:
             assert fr.internal is not None and fr.pose is not None
-            if fr.work.trust not in ("metric", "drifting"):
+            if fr.work.trust not in ("metric", "drifting") or fr.rgb is None:
                 continue
             assert fr.work.prior is not None
-            d = internal.depth(fr.internal.name)
-            med = None if d is None else checks.median_depth(d)
-            K = fr.cam.canonical()
-            depth = med * sim.s if med is not None else DEFAULT_SCENE_DEPTH_M
-            views.append((fr.pose, K, frustum_points(fr.pose, K, depth),
+            views.append((fr.pose, fr.cam.canonical(), features(fr.rgb, fr.ignore),
                           _mat(fr.work.prior["T_map_cam"])))
         worst = 0.0
-        for i, (Ta, Ka, Xa, Pa) in enumerate(views):
-            for Tb, Kb, Xb, Pb in views[i + 1:]:
-                if min(view_overlap(Xa, Tb, Kb), view_overlap(Xb, Ta, Ka)) < OVERLAP_MIN:
+        for i, (Ta, Ka, Fa, Pa) in enumerate(views):
+            for Tb, Kb, Fb, Pb in views[i + 1:]:
+                if min(coverage(Fa, Ka, Fb, Kb)) < OVERLAP_MIN:
                     continue
                 img = Ta[:3, :3].T @ Tb[:3, :3]
                 worst = max(worst, anchor.rotation_deg(img.T @ (Pa[:3, :3].T @ Pb[:3, :3])))
@@ -819,8 +816,16 @@ class Updater:
         # a first update without a registered frame with a prior cannot fix the priors' frame
         no_prior = prev is None and any(fr.work.trust in ("metric", "drifting") for fr in frames) \
             and not any(fr.work.trust in ("metric", "drifting") for fr in registered)
-        quality = self._quality(frames, registered, kept, prev, anchored, w.accept_if,
-                                result is not None and result[1].rebuilt, no_prior)
+        # rotation consistency applies to this engine too (map.md §1 "Every engine"; updates
+        # without priors, registered frames only)
+        bad = result is not None and record is not None and registered and not any(
+            fr.work.trust in ("metric", "drifting") for fr in frames) and self._rotations_bad(
+            registered, record, result[1])
+        # this engine stores kept frames only with a registration (its record): without one, a
+        # kept-only update fails the hard limit
+        quality = self._quality(frames, registered, kept if result is not None else [], prev,
+                                anchored, w.accept_if, result is not None and result[1].rebuilt,
+                                no_prior, bool(bad))
         job.quality = quality
         if anchored is not None:
             job.scale_source, job.scale_sigma_rel = anchored.scale_source, round(
@@ -835,6 +840,34 @@ class Updater:
         job.state = "committed"
         job.progress = 1.0
         job.timings_s["commit"] = round(time.perf_counter() - t, 3)
+
+    @staticmethod
+    def _rotations_bad(registered: list[_Frame], record: dict[str, Any], internal: InternalMap
+                       ) -> bool:
+        """``rotation_inconsistent`` of the older mapper (``standpoint.views_inconsistent``):
+        the registered frames at their committed poses, with their request images, against the
+        version's other fused frames at the poses it commits, with their stored images."""
+        import cv2
+
+        mine = {fr.work.name for fr in registered}
+        fx = {g.name: g.fx for g in internal.frames}
+        new = [standpoint.View(fr.work.name, fr.cam.canonical(), features(fr.rgb, fr.ignore),
+                               fr.pose[:3, :3].copy(), fr.pose[:3, 3].copy(), False, fr.work.index)
+               for fr in registered if fr.pose is not None and fr.rgb is not None]
+        stored = []
+        for r in record["frames"]:
+            if r["name"] in mine or r.get("pose_state") != "fused" or r.get("internal") not in fx:
+                continue
+            img = internal.image(r["internal"])
+            bgr = None if img is None else cv2.imread(str(img))
+            if bgr is None:
+                continue
+            rgb = np.asarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), np.uint8)
+            h, w = rgb.shape[:2]
+            f, T = fx[r["internal"]], _mat(r["T_map_cam"])
+            stored.append(standpoint.View(r["name"], Intrinsics(f, f, w / 2.0, h / 2.0, w, h),
+                                          features(rgb), T[:3, :3].copy(), T[:3, 3].copy(), True))
+        return standpoint.views_inconsistent(new, stored)
 
     @staticmethod
     def _keep_at_prior(fr: _Frame, anchored: _Anchored | None) -> None:
@@ -939,8 +972,8 @@ class Updater:
     @staticmethod
     def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],
                  prev: dict[str, Any] | None, anchored: _Anchored | None,
-                 accept_if: dict[str, float] | None, rebuilt: bool, no_prior: bool
-                 ) -> dict[str, Any]:
+                 accept_if: dict[str, float] | None, rebuilt: bool, no_prior: bool,
+                 rotations_bad: bool = False) -> dict[str, Any]:
         rejected = len(frames) - len(registered) - len(kept)
         low = sum((fr.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
                   or (fr.internal is not None and fr.internal.low_confidence) for fr in registered)
@@ -964,6 +997,7 @@ class Updater:
             "prior_gravity_deg": None if prev is not None or anchored is None
             else anchored.prior_gravity_deg,
         }
-        return gate(q, bool(registered), accept_if, no_prior)
+        # the hard limit on content: nothing registered and nothing kept (map.md §4)
+        return gate(q, bool(registered or kept), accept_if, no_prior, rotations_bad)
 
 

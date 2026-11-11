@@ -81,9 +81,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -100,15 +102,20 @@ from oh_my_slam.segmentation.api import (
     OBB,
     PASSAGE_LABELS,
     Detection,
+    Region,
     compatible,
     door_leaf,
     fit_object_obb,
     label_fit,
     lift_on_grid,
     on_the_floor,
+    raised_regions,
     surface_label,
     trim_support,
 )
+
+if TYPE_CHECKING:
+    from oh_my_slam.mapping.anchored import AnchoredMap, Keyframe, Placement
 
 log = get_logger("oh_my_slam.mapping.anchored_objects")
 
@@ -1308,3 +1315,77 @@ def extent_seen(o: MapObject) -> dict[str, str]:
     if any(not s.cut[2] and not s.cut[3] and abs(s.ray[2]) <= ACROSS_COS for s in whole):
         out["z"] = "full"
     return out
+
+
+# -- an update's objects (map.md §5), orchestrated for the prior-first engine ---------------------
+
+# the closer look at a keyframe looking down at its support (image, raised areas, detections,
+# grid): its detections, more and with their other labels
+Closer = Callable[[Path, list[Region], list[Detection], tuple[int, int]], list[Detection]]
+
+
+def _on_grid(a: NDArray[Any], shape: tuple[int, int], interp: int) -> NDArray[Any]:
+    if a.shape[:2] == shape:
+        return a
+    return cv2.resize(a, (shape[1], shape[0]), interpolation=interp)
+
+
+def fuse_objects(am: AnchoredMap,
+                 frames: list[tuple[Placement, NDArray[np.bool_] | None, Path | None,
+                                    Future[list[Detection]]]],
+                 version: int, closer: Closer,
+                 again: list[tuple[Keyframe, Future[list[Detection]]]] | None = None
+                 ) -> tuple[ObjectMap, int]:
+    """The objects of the new image-confirmed keyframes (``frames``: each placement, its ignore
+    mask, its image and its detections), fused in request order into the map's, then those of the stored keyframes this update re-registered
+    (``again``, their stored image's detections): struck objects carved from the cloud, then
+    the surfaces, the relations and each object's votes over the confirmed keyframes that see
+    it. A frame kept at its prior gives no object (map.md §2), but for the too-close exception
+    (``Keyframe.contributes``: kept only for too_close, a metric prior, a depth image; api.md
+    §4), whose detections count at its prior pose and which counts as confirmed in the votes.
+    ``closer`` looks closer at a keyframe looking down at its support
+    (``segmentation.api.raised_regions``; the backend's ``look_closer``). Returns the objects and how many are listed."""
+    om = ObjectMap.load(am.root)
+    by_id = {k.id: k for k in am.keyframes}
+    todo: list[tuple[Keyframe, NDArray[np.float32], NDArray[np.bool_] | None, Path | None,
+                     Future[list[Detection]]]] = []
+    for pl, own_ignore, path, fut in frames:
+        kf = by_id.get(pl.keyframe or "")
+        if kf is None or not kf.contributes() or kf.grid is None or kf.K_grid is None:
+            continue
+        todo.append((kf, kf.grid, own_ignore, path, fut))
+    # a re-registered keyframe has its stored image (``AnchoredMap.reregister`` set ``rgb``)
+    todo += [(kf, ref.depth, None, am.image_path(kf.id), fut) for kf, fut in again or []
+             for ref in [am._grid(kf)] if ref is not None]
+    views = []
+    for kf, grid, own_ignore, path, fut in todo:
+        assert kf.rgb is not None and kf.K_grid is not None
+        shape = grid.shape
+        dets = []
+        for d in fut.result():
+            m = _on_grid(d.mask.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+            sx, sy = shape[1] / d.mask.shape[1], shape[0] / d.mask.shape[0]
+            b = d.box
+            dets.append(Detection(d.label, d.score, d.source, m,
+                                  (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
+        ignore = None if own_ignore is None else _on_grid(
+            own_ignore.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+        rel = SENSOR_DEPTH_REL if kf.depth_kind == "sensor" else MONO_DEPTH_REL
+        regions = raised_regions(grid, kf.K_grid, kf.T, rel, None if ignore is None else ~ignore)
+        if regions:  # a view looking down at its support
+            assert path is not None  # a frame kept has its image
+            dets = closer(path, regions, dets, (shape[1], shape[0]))
+        views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, grid,
+                          _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore, rel))
+    # the version's one floor estimate (map.md §5): the objects' and, through the version
+    # record, the grid's (``run_anchored``: ``om.floor_z``, ``om.floor_sigma``)
+    floor, floor_sigma = am.floor()
+    struck = om.update(views, version, floor, floor_sigma)
+    if struck:
+        am.cloud.drop(om.carve(struck, am.cloud.points()))
+    confirmed = am.confirmed()
+    top = max((float(k.centre[2]) for k in confirmed), default=None)
+    om.finish(am.cloud.points(), top, version,
+              np.array([k.centre for k in confirmed]).reshape(-1, 3), floor,
+              [(k.id, k.T, k.K) for k in am.keyframes if k.contributes()])
+    return om, len(om.records()["objects"])

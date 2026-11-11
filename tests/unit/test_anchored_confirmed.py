@@ -225,3 +225,84 @@ def test_a_re_registered_keyframe_without_depth_is_not_fused(
                         lambda kf: (pl, np.zeros((K.height, K.width, 3), np.uint8)))
     got = m.reregister([kept], [m.keyframes[0]])
     assert [e["name"] for e in got] == ["k"] and kept.usable() and len(m.cloud.keys) == n
+
+
+def test_a_bare_wall_frame_with_depth_is_never_re_registered_by_depth(tmp_path: Path) -> None:
+    """api.md §4, map.md §2 (S-7): a frame kept for a failed check, with a depth image that
+    agrees with the map, overlapped by a new registered frame, stays kept with its reason:
+    only images confirm a re-registration."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    blank = np.full((K.height, K.width, 3), 120, np.uint8)
+    wall = frame("wall", base_pose(20), rgb=blank)  # its depth image is the room's own
+    wall.unconfirmed = "plain"
+    assert m.update([wall])[0].status == "kept_at_prior"
+    kept = m.keyframes[-1]
+    assert kept.reason == "plain" and kept.depth_kind == "sensor"
+    m.save()
+    m = AnchoredMap.load(m.root)
+    kept = m.keyframes[-1]
+    assert kept.reason == "plain"
+    assert m._place_again(kept) is None  # depth alone would have placed it
+    pls = m.update([frame("b", base_pose(22))])
+    assert pls[0].status == "registered" and m.reregistered == []
+    kept = m.keyframe(kept.id)
+    assert kept is not None and not kept.usable() and kept.reason == "plain"
+
+
+def test_depth_never_overrides_too_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                         ) -> None:
+    """api.md §4 (S-3): a too-close frame with a prior whose image does not place it but whose
+    depth would is kept_at_prior too_close: depth correspondences never count toward the 300
+    inliers."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
+    blank = np.full((K.height, K.width, 3), 120, np.uint8)
+    near = frame("near", base_pose(10), rgb=blank)
+    got = m.place(near, an.features(blank), None)
+    assert (got.status, got.method) == ("registered", "depth") and got.inliers >= 300
+    p = m.update([frame("near", base_pose(10), rgb=blank)])[0]
+    assert (p.status, p.reason) == ("kept_at_prior", "too_close")
+    # kept only for too_close with a metric prior and a depth image: its depth is content
+    assert m.keyframes[-1].contributes() and not m.keyframes[-1].usable()
+
+
+def test_the_too_close_exception_fuses_in_range_depth_only(tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch
+                                                            ) -> None:
+    """api.md §4: kept only for too_close with a metric prior: its depth inside the valid range
+    joins the cloud (never scale evidence); with a drifting prior, or kept for another reason,
+    nothing; re-registered later, it is not fused twice."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
+    monkeypatch.setattr(an, "TOO_CLOSE_INLIERS", 10 ** 6)
+    n0 = len(m.cloud.keys)
+    residuals = list(m.scale.depth_residuals.get("sensor", []))
+    p = m.update([frame("c", base_pose(40))])[0]
+    assert (p.status, p.reason) == ("kept_at_prior", "too_close")
+    n1 = len(m.cloud.keys)
+    assert n1 > n0 and m.scale.depth_residuals.get("sensor", []) == residuals
+    d = m.update([frame("d", base_pose(60), p="drifting")])[0]
+    assert (d.status, d.reason) == ("kept_at_prior", "too_close")
+    assert len(m.cloud.keys) == n1 and not m.keyframes[-1].contributes()
+    far = frame("far", base_pose(80))
+    assert far.depth is not None
+    far.depth = np.full_like(far.depth, an.DEPTH_VALID_RANGE_M[1] + 1.0)  # beyond the range
+    m.update([far])
+    assert len(m.cloud.keys) == n1
+    monkeypatch.undo()
+    kept = m.keyframes[1]
+    assert kept.contributes()
+    m.save()
+    m.update([frame("b", base_pose(42))])
+    content = {e["name"]: e["content"] for e in m.reregistered}
+    assert content["c"] and not content["d"]
+    assert m.keyframe(kept.id) is not None and m.keyframe(kept.id).usable()  # type: ignore[union-attr]
+
+
+def test_valid_depth_range() -> None:
+    lo, hi = an.DEPTH_VALID_RANGE_M
+    d = np.array([[0.0, lo, hi, hi + 0.1, np.nan]], np.float32)
+    assert an.valid_depth(d).tolist() == [[False, True, True, False, False]]

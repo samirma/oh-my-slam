@@ -62,13 +62,13 @@ def test_a_camera_only_map_turning_in_place(client: Client) -> None:
     """The origin by the prior-first engine, the turn by unposed MapAnything calls aligned on
     the map's keyframes: its metres are not the map's (``mv_scale``). One standpoint: the frames
     are registered as a pure rotation about the origin's centre (map.md §1), MapAnything's
-    rotations replaced by the two-view ones."""
+    centres (moved 4 cm) snapped to it, its rotations kept."""
     client.backend.mv_scale = 3.0
     poses = [base_pose(25.0 * k, offset=0.0) for k in range(6)]
     fr, files = ma_frames(client, poses, trust=None, depth=False, height_above_floor_m=0.5)
-    for T in poses[1:]:  # MapAnything turns them wrongly; the standpoint corrects it
+    for T in poses[1:]:  # MapAnything places them off the standpoint
         bad = T.copy()
-        bad[:3, :3] = cv2.Rodrigues(np.array([0.0, 0.0, 0.06]))[0] @ T[:3, :3]
+        bad[:3, 3] += np.array([0.04, 0.0, 0.0])
         client.backend.mv_pose[hashlib.sha256(shot(T)[0]).hexdigest()] = bad
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "committed", job
@@ -85,6 +85,9 @@ def test_a_camera_only_map_turning_in_place(client: Client) -> None:
     v = client.service.store.version("m")
     assert {f["method"] for f in v["frames"][1:]} == {"rotation"}
     assert job["quality"]["failed_checks"] == []
+    # map.md §1: a rotation-only frame counts its rotation only, here none
+    q = job["quality"]
+    assert q["max_displacement_m"] is None and q["max_displacement_deg"] == 0.0
     h = client.get("/api/health", "Health")["timings"]
     assert h["registration_mapanything_per_frame"]["count"] == 5
     assert h["checks_per_frame"]["source"] == "measured"
@@ -112,6 +115,23 @@ def test_camera_only_frames_on_a_map_with_priors(client: Client) -> None:
         assert np.linalg.norm(np.array(i["T_map_cam"])[:3, 3] - T[:3, 3]) < 0.03
         assert i["prior_residual_m"] is None
     assert job["scale_source"] == "priors"  # the metric priors span 1.2 m
+    # MapAnything frames carry a displacement (0: committed at their image-only pose)
+    assert job["quality"]["max_displacement_m"] == 0.0
+    assert job["quality"]["max_displacement_deg"] == 0.0
+
+
+def test_camera_only_maps_record_depth_residuals(client: Client) -> None:
+    """map.md §2: a camera-only map with depth images registered by MapAnything records each
+    depth keyframe's residual against the map, so its scale_sigma_rel is no constant."""
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    fr, files = ma_frames(client, [base_pose(0, 0.0)], tag="a", trust=None)
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    nf, nfiles = ma_frames(client, [base_pose(0, -0.3), base_pose(0, 0.3)], tag="n", trust=None)
+    job = client.update("m", nf, nfiles)
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 2
+    am = AnchoredMap.load(client.service.store.mapper_dir("m"))
+    assert len(am.scale.depth_residuals.get("sensor", [])) >= 2
 
 
 def test_too_close_and_a_new_map_without_origin(client: Client, tmp_path: Path) -> None:

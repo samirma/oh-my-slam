@@ -74,7 +74,6 @@ from oh_my_slam.service.prior_first import (
     _frame_in,
     frame_class,
     none_engine,
-    stored_views,
 )
 
 if TYPE_CHECKING:
@@ -128,16 +127,16 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         for k, fr in enumerate(frames):
             row, pl = _frame(fr, links[k], placed.get(fr.work.index), am is not None,
                              prev is None, first_kept)
-            if row["predicted_status"] == "registered" and am is not None and pl is not None \
-                    and pl.T is not None:
+            T = _predicted_pose(fr, pl, am is not None, prev is None)
+            if row["predicted_status"] == "registered" and T is not None:
                 own = feats.get(fr.work.index)
-                dup = am.duplicate_of(fr.work.camera_id, pl.T, own) or duplicate_among(
-                    fr.work.camera_id, pl.T, own, earlier)
+                dup = (None if am is None else am.duplicate_of(fr.work.camera_id, T, own)) \
+                    or duplicate_among(fr.work.camera_id, T, own, earlier)
                 if dup is not None:
                     row.update(predicted_status="rejected", predicted_reason="duplicate",
                                duplicate_of=dup)
                 else:
-                    earlier.append((fr.work.name, fr.work.camera_id, pl.T,
+                    earlier.append((fr.work.name, fr.work.camera_id, T,
                                     functools.partial(feats.get, fr.work.index)))
             if row["predicted_status"] != "rejected":
                 first_kept = False
@@ -153,7 +152,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             ins = {fr.work.index: fr for fr in frames}
             for idx, pl in placed.items():
                 if pl.status == "registered":
-                    am._checked(_frame_in(ins[idx], None), pl, mine)
+                    am._checked(_frame_in(ins[idx], None), pl, mine, feats[idx])
             disagreement = am.prior_disagreement_deg
         source, sigma = _scale(prev, am, frames)
         # an update without priors: its predicted poses against the images' relative rotations
@@ -169,8 +168,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
               for pl in registered)
     # stored frames do not move (no gauge shift, no previous residual); the registered frames
     # against their image-only poses, as the update measures them (``prior_first``)
-    moved = displacements([pl for pl in registered if pl is not None],
-                          [] if am is None else am.keyframes)
+    moved = displacements([pl for pl in registered if pl is not None])
     q: dict[str, Any] = {
         "scale_ratio_vs_prev": None if prev is None else 1.0,
         "gauge_shift": None if prev is None else {"translation_m": 0.0, "rotation_deg": 0.0,
@@ -203,6 +201,19 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
 
 
+def _predicted_pose(fr: _Frame, pl: Placement | None, anchored: bool, new_map: bool
+                    ) -> Any:
+    """A frame's predicted registered pose, for the pose-duplicate test (api.md §4): its
+    placement on an anchored map; on a map's first update, the prior of a frame with a metric or
+    drifting prior (the priors' frame is the map frame, and the origin's registration keeps the
+    prior); None otherwise (a camera-only first update, a map of the older mapper)."""
+    if anchored:
+        return None if pl is None else pl.T
+    if new_map and fr.work.trust in ("metric", "drifting") and fr.work.prior is not None:
+        return np.asarray(fr.work.prior["T_map_cam"], np.float64)
+    return None
+
+
 def _rotations_bad(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],
                    placed: dict[int, Placement]) -> bool:
     """The predicted ``rotation_inconsistent`` (``standpoint.consistency``) of the frames
@@ -210,7 +221,7 @@ def _rotations_bad(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Featu
     new = [(fr, pl) for fr in frames for pl in [placed.get(fr.work.index)]
            if pl is not None and pl.status == "registered" and pl.T is not None
            and fr.work.index in feats]
-    views = stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3]) for _, pl in new  # type: ignore[index]
+    views = standpoint.stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3]) for _, pl in new  # type: ignore[index]
                               ])
     views += [standpoint.View(fr.work.name, fr.cam.canonical(), feats[fr.work.index],
                               pl.T[:3, :3].copy(), pl.T[:3, 3].copy(),  # type: ignore[index]
@@ -362,7 +373,9 @@ def _frame(fr: _Frame, neighbours: list[dict[str, Any]], pl: Placement | None, a
             and max([int(n["inliers"]) for n in neighbours] or [0]) < MIN_INLIERS:
         # a new map's frame without prior holds only by its links to the request's frames
         status, reason = "rejected", "no_overlap"
-    close = too_close(fr.scene_m, 0 if map_inliers is None else map_inliers)
+    # the 300-inlier exemption counts image feature inliers only, never depth (api.md §4)
+    close = too_close(fr.scene_m, 0 if map_inliers is None or pl is None
+                      or pl.method == "depth" else map_inliers)
     if close and fr.reason is None and fr.work.trust in ("metric", "drifting"):
         # the distance limit (api.md §4): a frame with a prior is kept at it, its reason the
         # check its image failed, else too_close

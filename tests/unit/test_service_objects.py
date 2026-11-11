@@ -296,3 +296,77 @@ def test_birdseye_of_each_version(client: Client) -> None:
     assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
     client.get("/api/maps/t/birdseye?version=9", status=400)
     client.get("/api/maps/none/birdseye.png", status=404)
+
+
+def _too_close_case(client: Client, monkeypatch: pytest.MonkeyPatch, trust: str
+                    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A first version from EYES[0], then EYES[1:3] too close (every scene within the limit,
+    no inlier count enough) with a ``trust`` prior: the job and the objects after it."""
+    from oh_my_slam.mapping import anchored as an
+    from oh_my_slam.mapping import checks
+
+    fr, files = frames(client, "full", EYES[:1], "a")
+    assert client.update("t", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
+    monkeypatch.setattr(checks, "TOO_CLOSE_M", 100.0)
+    monkeypatch.setattr(an, "TOO_CLOSE_INLIERS", 10 ** 6)
+    fr, files = frames(client, "full", EYES[1:3], "c")
+    for f in fr:
+        f["prior"]["trust"] = trust
+    job = client.update("t", fr, files)
+    assert job["state"] == "committed", job
+    assert [(i["status"], i["reason"]) for i in job["inputs"]] == [("kept_at_prior",
+                                                                    "too_close")] * 2
+    return job, client.get("/api/maps/t/objects", "Objects")
+
+
+def _volume_frames(client: Client, version: int) -> set[str]:
+    from oh_my_slam.mapping import navgrid
+
+    client.get("/api/maps/t/grid", "Grid")  # derived
+    p = client.service.derived.dir("t") / str(version) / "volume.npz"
+    return set(navgrid.Volume.from_bytes(p.read_bytes()).frames)
+
+
+def test_a_too_close_frame_with_a_metric_prior_contributes(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.md §4 too-close exception: kept only for too_close with a metric prior, its
+    detections update the objects and its depth the occupancy, at its prior pose."""
+    _, doc = _too_close_case(client, monkeypatch, "metric")
+    assert any(o["last_seen_version"] == 2 for o in doc["objects"])
+    assert {"c0", "c1"} <= _volume_frames(client, 2)
+    rows = client.service.store.version("t")["frames"]
+    assert [r.get("content") for r in rows if r["name"].startswith("c")] == [True, True]
+    # confirmed later by its images: its detections are not asked again (they are in)
+    monkeypatch.undo()
+    fr, files = frames(client, "full", EYES[3:4], "d")
+    n = len(client.backend.detected)
+    job = client.update("t", fr, files)
+    assert job["state"] == "committed"
+    again = {e["name"] for e in job["quality"]["reregistered"]}
+    assert again and again <= {"c0", "c1"} and len(client.backend.detected) == n + 1
+
+
+def test_a_too_close_frame_with_a_drifting_prior_contributes_nothing(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, doc = _too_close_case(client, monkeypatch, "drifting")
+    assert all(o["last_seen_version"] == 1 for o in doc["objects"])
+    assert not {"c0", "c1"} & _volume_frames(client, 2)
+
+
+def test_a_bare_wall_kept_frame_contributes_nothing(client: Client) -> None:
+    from tests.fakes.service import plain
+
+    fr, files = frames(client, "full", EYES[:1], "a")
+    assert client.update("t", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    points = client.service.store.version("t")["points"]
+    _, dep, T, _ = _shot("full", EYES[1])
+    files = {"w": plain(K_TABLE.width, K_TABLE.height), "wd": dep}
+    job = client.update("t", [{"name": "w", "image": "w", "depth": "wd", "camera_id": "cam",
+                               "prior": {"trust": "metric", "T_map_cam": T.tolist(),
+                                         "sigma_pos_m": 0.01, "sigma_rot_deg": 0.5}}], files)
+    assert (job["inputs"][0]["status"], job["inputs"][0]["reason"]) == ("kept_at_prior", "plain")
+    assert client.service.store.version("t")["points"] == points
+    assert "w" not in _volume_frames(client, 2)
+    doc = client.get("/api/maps/t/objects", "Objects")
+    assert all(o["last_seen_version"] == 1 for o in doc["objects"])

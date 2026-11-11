@@ -57,6 +57,7 @@ from oh_my_slam.core.errors import OhMySlamError
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
+from oh_my_slam.mapping.anchored import valid_depth
 from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
@@ -140,6 +141,12 @@ class DerivedVersion:
                                    "rgb": np.zeros((0, 3), np.uint8),
                                    "object_id": np.zeros(0, np.uint32)}
             return self._cloud
+
+
+def _occupies(f: dict[str, Any]) -> bool:
+    """Whether a version frame feeds occupancy and heights: confirmed by the images, or kept at
+    its prior under the too-close exception (``content``, api.md §4)."""
+    return f.get("pose_state") != "kept_at_prior" or bool(f.get("content"))
 
 
 def _sha_file(p: Path) -> str:
@@ -350,7 +357,7 @@ class Derived:
         vol = self._base_volume(name, n)
         by_name = {f["name"]: f for f in frames}
         stale = [k for k, T in vol.frames.items()
-                 if k not in by_name or by_name[k].get("pose_state") == "kept_at_prior"
+                 if k not in by_name or not _occupies(by_name[k])
                  or navgrid.pose_moved(T, np.asarray(
                      by_name[k]["T_map_cam"]).reshape(-1).tolist())]
         if stale:
@@ -368,15 +375,17 @@ class Derived:
             return depth_of[f["name"]]
 
         for f in frames:
-            if f["name"] in vol.frames or f.get("pose_state") == "kept_at_prior":
+            if f["name"] in vol.frames or not _occupies(f):
                 # occupancy and heights come only from image-confirmed frames; a kept frame
-                # counts for the free-by-rule cells alone (``_stands``, map.md §6)
+                # counts for the free-by-rule cells alone (``_stands``, map.md §6), but for the
+                # too-close exception (api.md §4: its depth in the valid range, at its prior)
                 continue
             d = depth(f)
             if d is None:
                 continue
             K = cams[f["camera_id"]].canonical().resized(d.shape[1], d.shape[0])
-            vol.integrate(f["name"], d, K.K(), np.asarray(f["T_map_cam"], np.float64), d > 0)
+            ok = valid_depth(d) if f.get("content") else d > 0
+            vol.integrate(f["name"], d, K.K(), np.asarray(f["T_map_cam"], np.float64), ok)
         # every camera stands inside the grid, even one whose depth gave nothing (all unknown)
         C: NDArray[np.float64] = np.array(
             [np.asarray(f["T_map_cam"])[:3, 3] for f in frames]) if frames else np.zeros((1, 3))

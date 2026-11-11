@@ -88,9 +88,10 @@ DEFS: list[Def] = [
     Def("update.sigma_tightness_bound", "C1, C4", "Median error / sigma of registered update "
         "frames, position and rotation separately, two-sided", "median", "ratio",
         parts=(("pos", "median", "ratio"), ("rot", "median", "ratio"))),
-    Def("update.sigma_containment", "C1, C4", "Non-rejected inputs (registered and "
-        "kept_at_prior) whose committed pose is within 3 of its sigmas of the truth", "share",
-        "share"),
+    Def("update.sigma_containment", "C1, C4", "Registered inputs whose committed pose is "
+        "within 3 of its sigmas of the truth", "share", "share"),
+    Def("update.sigma_containment_kept", "C1, C4", "kept_at_prior inputs whose pose is within "
+        "3 of their reported sigmas of the truth (information)", "share", "share"),
     Def("scale.error_metric", "C2", "Scale error with metric priors", "max", "ratio"),
     Def("scale.error_camera_height", "C2", "Scale error with camera height only", "max",
         "ratio"),
@@ -572,9 +573,10 @@ class Measure:
                 self.s.add("gate.others_accepted", j.job["state"] == "committed")
 
     def update_sigmas(self) -> None:
-        """update.sigma_containment: each non-rejected input's committed pose against its truth
-        (after the map -> world alignment), within 3 of its sigmas (a kept_at_prior input's
-        sigmas are its prior's)."""
+        """update.sigma_containment: each registered input's committed pose against its truth
+        (after the map -> world alignment), within 3 of its sigmas (3-D RMS: the error's norm);
+        update.sigma_containment_kept the same over kept_at_prior inputs, against their
+        reported sigmas; the tightness over registered inputs only."""
         if self.al is None:
             return
         sim = self.al[0]
@@ -589,7 +591,8 @@ class Measure:
                 W = sim.pose(mat4(i["T_map_cam"]))
                 e_pos = float(np.linalg.norm(W[:3, 3] - T[:3, 3]))
                 e_rot = angle_deg(W[:3, :3], T[:3, :3])
-                self.s.add("update.sigma_containment",
+                self.s.add("update.sigma_containment" if i["status"] == "registered"
+                           else "update.sigma_containment_kept",
                            e_pos <= 3 * sim.s * float(i["sigma_pos_m"])
                            and e_rot <= 3 * float(i["sigma_rot_deg"]))
                 if i["status"] != "registered":
@@ -903,7 +906,9 @@ class Measure:
                     fz: float) -> int:
         """grid.unconfirmed_occupancy (map.md §2, §6): occupied cells, and floor-standing
         objects, on open floor of the floor plan (more than one cell from every truth object)
-        inside the view of kept_at_prior frames only, and of no image-confirmed frame."""
+        inside the view of kept_at_prior frames only, and of no image-confirmed frame. A frame
+        kept only for too_close with a metric prior (its input's reason too_close, in a metric
+        episode) counts as confirmed (api.md §4: its depth and detections contribute)."""
         assert self.al is not None
         sim = self.al[0]
         cell = float(self.rec.grid["cell_m"]) * sim.s  # type: ignore[index]
@@ -914,8 +919,11 @@ class Measure:
             open_floor &= ~np.all(np.abs(W - t.centre[:2]) <= half + cell, axis=1)
         kept = np.zeros(len(W), dtype=bool)
         confirmed = np.zeros(len(W), dtype=bool)
+        content = {i["name"] for j in self.rec.jobs for i in j.job.get("inputs") or []
+                   if i["status"] == "kept_at_prior" and i.get("reason") == "too_close"} \
+            if self.rec.mode == "metric" else set()
         for r in frames:
-            if r.get("pose_state", "fused") == "kept_at_prior":
+            if r.get("pose_state", "fused") == "kept_at_prior" and r["name"] not in content:
                 kept |= self.in_view(W, r)
             else:
                 confirmed |= self.in_view(W, r)

@@ -14,6 +14,7 @@
   "update.sigma_tightness": {"info": true, "unit": "ratio"},
   "update.sigma_tightness_bound": {"parts": {"pos": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}, "rot": {"op": "between", "value": [0.3, 1.5], "unit": "ratio"}}, "description": "median error / sigma of registered update frames, position and rotation each between 0.3 and 1.5"},
   "update.sigma_containment": {"op": ">=", "value": 0.99, "unit": "share"},
+  "update.sigma_containment_kept": {"info": true, "unit": "share"},
   "scale.error_metric": {"op": "<=", "value": 0.03, "unit": "ratio"},
   "scale.error_camera_height": {"op": "<=", "value": 0.10, "unit": "ratio"},
   "scale.error_by_direction": {"parts": {"error": {"op": "<=", "value": 0.10, "unit": "ratio"}, "within": {"op": "<=", "value": 1.0, "unit": "ratio"}}, "description": "error: the worst relative scale error over four horizontal directions; within: that error over 3 x the stated scale_sigma_rel, and with a camera height and no priors |floor_z_m| over 0.02 m"},

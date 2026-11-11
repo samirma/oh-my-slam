@@ -357,6 +357,24 @@ def test_dry_run_of_a_new_map_writes_nothing(client: Client) -> None:
     assert job["quality"]["prior_gravity_deg"] == g
 
 
+def test_dry_run_of_a_new_map_predicts_pose_duplicates(client: Client) -> None:
+    """HL-7/A-46: on a map's first update the frames with a prior are predicted at their priors,
+    so a frame within the duplicate limits of an earlier one, its image agreeing, is predicted a
+    pose duplicate; a camera-only first update predicts none (it has no predicted poses)."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(0), base_pose(30)], tag="a")
+    files["a1"] = files["a0"]
+    out = dry(client, "m", fr, files, cameras={"cam": CAM})
+    rows = {r["name"]: r for r in out["frames"]}
+    assert (rows["a1"]["predicted_status"], rows["a1"]["predicted_reason"],
+            rows["a1"]["duplicate_of"]) == ("rejected", "duplicate", "a0")
+    assert rows["a2"]["predicted_status"] == "registered"
+    nf, nfiles = frames_for(client, [base_pose(0), base_pose(0)], tag="n", trust=None)
+    nfiles["n1"] = nfiles["n0"]
+    rows = {r["name"]: r for r in dry(client, "m", nf, nfiles, cameras={"cam": CAM})["frames"]}
+    assert rows["n1"]["predicted_reason"] != "duplicate"
+    assert "rotation_inconsistent" not in out["quality"]["failed_checks"]
+
+
 def test_dry_run_against_an_anchored_map(client: Client) -> None:
     fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
@@ -684,31 +702,23 @@ def test_a_stored_keyframe_that_moves_fails_the_gate(client: Client,
 
 
 def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> None:
-    """A PnP frame within ``PARALLAX_MIN`` of its stored keyframe's depth counts only its
-    rotation; one with parallax counts both; rejected frames and frames without a residual do
-    not count; without stored keyframes nothing is excluded."""
-    from types import SimpleNamespace
-
+    """A frame unconstrained in translation (map.md §1: below 0.3 px against every reference,
+    ``Placement.unconstrained``) or rotation-only counts only its rotation; one constrained
+    counts both; rejected frames and frames without a residual do not count."""
     from oh_my_slam.mapping.anchored import Placement
-    from oh_my_slam.mapping.quality import PARALLAX_MIN, displacement_quality, displacements
+    from oh_my_slam.mapping.quality import displacement_quality, displacements
 
     T = np.eye(4)
-    far = np.eye(4)
-    far[0, 3] = 0.5
-    kfs: Any = [SimpleNamespace(centre=np.zeros(3), median_depth=None),
-                SimpleNamespace(centre=np.array([9.0, 0, 0]), median_depth=3.0)]
 
-    def pl(T: np.ndarray, status: str = "registered", method: str = "pnp",
-           res: tuple[float, float] | None = (0.3, 2.0)) -> Placement:
-        return Placement("f", status, None, T, 0.01, 0.1, 100, method, map_residual=res)
+    def pl(status: str = "registered", method: str = "pnp",
+           res: tuple[float, float] | None = (0.3, 2.0), free: bool = False) -> Placement:
+        return Placement("f", status, None, T, 0.01, 0.1, 100, method, map_residual=res,
+                         unconstrained=free)
 
-    near = np.eye(4)
-    near[0, 3] = PARALLAX_MIN * 2.0 * 0.5
-    got = displacements([pl(T), pl(near), pl(far), pl(T, method="rotation"),
-                         pl(T, "rejected"), pl(T, "kept_at_prior"), pl(T, res=None), None], kfs)
+    got = displacements([pl(free=True), pl(), pl(method="rotation"), pl("rejected"),
+                         pl("kept_at_prior"), pl(res=None), None])
     # unconstrained in translation: rotation only (None in metres); kept and rejected left out
-    assert got == [(None, 2.0), (None, 2.0), (0.3, 2.0), (None, 2.0)]
-    assert displacements([pl(T)], []) == [(0.3, 2.0)]
+    assert got == [(None, 2.0), (0.3, 2.0), (None, 2.0)]
     assert displacement_quality(got) == {"max_displacement_m": 0.3, "max_displacement_deg": 2.0}
     assert displacement_quality([(None, 1.0)]) == {"max_displacement_m": None,
                                                    "max_displacement_deg": 1.0}

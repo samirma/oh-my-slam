@@ -8,13 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from oh_my_slam.mapping.anchored import TOO_CLOSE_INLIERS, TOO_CLOSE_M, Keyframe, Placement
-
-# a new frame whose baseline to its nearest stored keyframe is below this share of that
-# keyframe's median depth turned in place: its image-only translation is unconstrained, and only
-# its rotation counts in its displacement (README "Quality report")
-PARALLAX_MIN = 0.02
-PARALLAX_DEPTH_M = 2.0  # a keyframe's depth when it has none
+from oh_my_slam.mapping.anchored import TOO_CLOSE_INLIERS, TOO_CLOSE_M, Placement
 
 
 def residual_stats(res: list[tuple[float, float]]) -> dict[str, Any] | None:
@@ -34,26 +28,18 @@ def too_close(scene_m: float | None, inliers: int) -> bool:
     return scene_m is not None and scene_m < TOO_CLOSE_M and inliers < TOO_CLOSE_INLIERS
 
 
-def displacements(pls: list[Placement | None], stored: list[Keyframe]
-                  ) -> list[tuple[float | None, float]]:
+def displacements(pls: list[Placement | None]) -> list[tuple[float | None, float]]:
     """The new frames' disagreement with the stored map (map.md §1): each registered frame's
     committed pose against its image-only pose (``Placement.map_residual``), as (m or None,
     deg). Frames kept at their prior or rejected have no image-only pose and are left out; a
-    frame whose image pose is unconstrained in translation — rotation-only, or registered by PnP
-    with a parallax to its nearest stored keyframe below ``PARALLAX_MIN`` — counts only its
-    rotation (None in metres)."""
+    frame whose image pose is unconstrained in translation — rotation-only, or below the
+    two-view parallax limit against every reference it registers to
+    (``Placement.unconstrained``) — counts only its rotation (None in metres)."""
     out: list[tuple[float | None, float]] = []
     for pl in pls:
         if pl is None or pl.status != "registered" or pl.map_residual is None:
             continue
-        dp: float | None = pl.map_residual[0]
-        if pl.method == "rotation":
-            dp = None
-        elif pl.method == "pnp" and stored and pl.T is not None:
-            d = [float(np.linalg.norm(k.centre - pl.T[:3, 3])) for k in stored]
-            k = stored[int(np.argmin(d))]
-            if min(d) < PARALLAX_MIN * (k.median_depth or PARALLAX_DEPTH_M):
-                dp = None
+        dp = None if pl.method == "rotation" or pl.unconstrained else pl.map_residual[0]
         out.append((dp, pl.map_residual[1]))
     return out
 

@@ -303,7 +303,9 @@ def test_locate_sigmas_and_update_containment(world: Any) -> None:
          "rivals": [{"pos_m": 0.3, "rot_deg": 0.0, "support": 0.5}]}]}, 0.1, "plan")
     rec.locates = [lo]
     s = measure(rec, ep)
-    assert s.values["update.sigma_containment"] == [1.0, 0.0]
+    # registered only (the kept frame, 0.2 m off with 5 cm sigmas, is in the kept metric)
+    assert s.values["update.sigma_containment"] == [1.0]
+    assert s.values["update.sigma_containment_kept"] == [0.0]
     assert s.values["locate.sigma_right_median"] == [pytest.approx(0.01)]
     assert s.values["locate.sigma_containment"] == [1.0, 0.0]
     assert s.values["locate.sigma_tightness#pos"] == [pytest.approx(0.0, abs=1e-6)]
@@ -580,3 +582,12 @@ def test_unconfirmed_occupancy(world: Any) -> None:
     kept = measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0]
     rec.frames = {1: {"frames": rows(ep, names)}}
     assert kept > 0 == measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0]
+    # kept only for too_close with a metric prior: confirmed here (api.md §4); not in a run
+    # without metric priors
+    rec.frames = {1: {"frames": rows(ep, names, state="kept_at_prior")}}
+    rec.jobs = [job(names)]
+    rec.jobs[0].job["inputs"] = [{"name": n, "status": "kept_at_prior", "reason": "too_close"}
+                                 for n in names]
+    assert measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0] == 0
+    rec.mode = "none"
+    assert measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0] == kept
