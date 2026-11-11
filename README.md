@@ -31,8 +31,9 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.2) for the robot-guide skill. Implemented so far
-(`/api/health → capabilities`): **O1** (anchored map frame and priors), **O3-jobs**
+The HTTP API of `specs/api.md` (schema oms/2.3) for the robot-guide skill. Implemented so far
+(`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
+list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
 status), **O5** (locate with uncertainty), **O6** (navigation grid, points near a place),
 **O8** (object records, support surfaces and relations), **O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing
@@ -50,7 +51,8 @@ they need. New maps take the *prior-first registration* (below).
   again only if it started it), and writes `server.sh: listening on http://<host>:<port>/` on
   stderr once it accepts connections. Its log is `<data>/oms/service.log`; the inference server's
   log `~/Library/Caches/oh-my-slam/server.log` (`OH_MY_SLAM_RUNTIME_DIR` moves it). One service per data folder (`<data>/oms/service.lock`).
-  `--keep-versions` is accepted; retention comes with O2 (every version is kept until then).
+  `--keep-versions <n>` (at least 1, default **20**, `store.DEFAULT_KEEP_VERSIONS`) is the
+  retention of *Versions and revert* (O2, below).
 * **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
   folder: `maps/<name>/` (`map.json`: the cameras of its committed versions, mask digests, latest
   version, the first version the mapper map serves; `masks/`; `versions/<n>.json`, immutable,
@@ -62,8 +64,9 @@ they need. New maps take the *prior-first registration* (below).
   `GET /api/jobs/{id}` (`?wait_s` ≤ 30), `GET /api/maps/{name}` and `/frames` (`?version=`),
   `GET /api/maps/{name}/grid`, `/points`, `/objects`, `/birdseye.png` and `/birdseye`,
   `POST /api/maps/{name}/locate`, `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and
-  `?dry_run=1` (O10, *Dry run*).
-  The other endpoints of api.md come with their groups (O2, O3, O7).
+  `?dry_run=1` (O10, *Dry run*), `GET /api/maps/{name}/versions` and
+  `POST /api/maps/{name}/revert` (O2, *Versions and revert*).
+  The other endpoints of api.md come with their groups (O3, O7).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
@@ -81,6 +84,44 @@ they need. New maps take the *prior-first registration* (below).
   device queue is a priority queue: requests sent with `x-oms-priority: interactive` (dry runs:
   `Backend.interactive`) run before every waiting fusion request (`server.gpu_worker`); locate
   needs no inference.
+
+### Versions and revert (O2)
+
+* **Versions.** `GET /api/maps/{name}/versions` lists the kept versions, ascending
+  ([`VersionInfo`]: `version`, `created_at`, `kind`, `job_id`, `reverted_to`, `frames`,
+  `objects`), from the index `map.json` keeps (`store.Store.versions`; a version committed before
+  the index is read from its record). Until O3 every update's version is `kind` `update`; no
+  version is `provisional` or `fusing`.
+* **Revert.** `POST /api/maps/{name}/revert {to_version}` (a JSON body, [`RevertRequest`])
+  commits version *latest + 1* whose content equals `to_version` (`store.Store.revert`): its
+  record (frames and poses with their states and sigmas, the similarity from the mapper's frame,
+  scale and its source, floor, bounds, object count, label vocabulary), its own files (the
+  anchored map's objects; a kept frame's depth stays the version's that added it), the cameras it
+  held, and a clone of the mapper map it was committed with. The new version is `kind` `revert`,
+  `job_id` null, `reverted_to` the target; its reads are derived as any version's before it is
+  published, and each names it in `map_version`. The map frame is never re-gauged: the next
+  update starts from that mapper map and fits onto the reverted version's poses (map.md §1).
+  The map's camera registry is not reverted: a camera a later version defined stays defined
+  (its id cannot be redefined), though the reverted summary's `cameras` are the target's.
+  A revert is refused with `map_busy` (409, retryable) while a job of the map is registering
+  (no fusion phase before O3); it holds the job worker off that map while it commits
+  (`jobs.Jobs.holding`), so a queued job then starts from the reverted version (its
+  `base_version`). An unknown `to_version` is `invalid_request` (`details.field`
+  `to_version`); one no longer kept, `version_gone`.
+* **Mapper maps per version.** A commit that replaces the mapper map keeps the replaced one as
+  `mappers/<k>/`, `k` the first version it served (it serves the versions up to the next one's
+  first; `map.json` `mappers`). Updates clone the mapper map as APFS clones (`cp -c`), so kept
+  maps share their unchanged files and a version costs only what changed. A map whose mapper
+  maps were replaced before this was kept (`mappers_since`) answers `version_gone` for a revert
+  to (or a first derivation of) those earlier versions.
+* **Retention.** After each commit the versions older than the last `--keep-versions` are
+  deleted (`store.Store.prune`): their record, their own files, their derived reads, and the
+  mapper maps no kept version uses. A version a read is answering from is kept until that read
+  ends (`store.Store.hold`, taken by every read that names a version, locate included) and
+  deleted at a later commit; a version file a kept version still reads (the `kept_depth.json` of
+  the version that added a kept frame) stays. A job's base version is the latest when it starts,
+  and no commit happens while it runs, so retention never deletes it. A deleted version answers
+  `version_gone`.
 
 ### Update jobs (minimal until O3)
 

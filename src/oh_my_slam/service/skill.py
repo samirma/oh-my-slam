@@ -22,7 +22,8 @@ FILE = ROOT / "SKILL.md"
 def render() -> str:
     rows = []
     for e in ENDPOINTS:
-        body = f"[`{e.request}`] (multipart: part `request` + file parts)" if e.request else ""
+        body = "" if not e.request else f"[`{e.request}`] (multipart: part `request` + file " \
+            "parts)" if e.multipart else f"[`{e.request}`] (JSON)"
         ok = ", ".join(f"{s} [`{n}`]" if n else f"{s} `{e.media}`" if e.media else str(s)
                        for s, n in e.responses.items())
         params = ", ".join(f"`{p.name}`" for p in e.params if p.where == "query")

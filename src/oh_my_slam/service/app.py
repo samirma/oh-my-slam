@@ -4,6 +4,7 @@ on every response."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -40,7 +41,7 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]  # the groups this service
+CAPABILITIES = ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]  # the groups this service
 # implements (high_level_spec.md §12)
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
@@ -344,12 +345,23 @@ class Api:
                 raise invalid("version", "version must be a positive integer")
             n = int(raw)
         meta = self.s.store.require(name)
+        n = n or int(meta["latest_version"])
+        self._hold(request, name, n)
         return name, meta, self.s.store.version(name, n)
+
+    def _hold(self, request: Request, name: str, n: int) -> None:
+        """Retention keeps version ``n`` until the request ends (map.md §2, ``_wrap``)."""
+        stack = request.scope.setdefault("oms_holds", contextlib.ExitStack())
+        stack.enter_context(self.s.store.hold(name, n))
 
     async def get_map(self, request: Request) -> Response:
         name, meta, v = self._version(request)
+        return body(self._summary(name, meta, v))
+
+    def _summary(self, name: str, meta: dict[str, Any], v: dict[str, Any]) -> dict[str, Any]:
+        """A version's ``MapSummary`` (without ``schema``)."""
         job = self.s.jobs.active_for(name)
-        return body({
+        return ({
             "map": name, "map_version": v["version"], "latest_version": meta["latest_version"],
             "created_at": meta["created_at"], "frames": len(v["frames"]),
             "provisional_frames": sum(f["pose_state"] == "provisional" for f in v["frames"]),
@@ -357,6 +369,28 @@ class Api:
             "bounds_m": v["bounds_m"],
             "floor_z_m": v["floor_z_m"], "running_job": None if job is None else job.id,
             "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"]})
+
+    async def get_versions(self, request: Request) -> Response:
+        name = check_name(request.path_params["name"])
+        meta = self.s.store.require(name)
+        versions = await run_in_threadpool(self.s.store.versions, name)
+        return body({"map": name, "latest_version": meta["latest_version"],
+                     "versions": versions})
+
+    async def post_revert(self, request: Request) -> Response:
+        name = check_name(request.path_params["name"])
+        self.s.store.require(name)
+        data = await read_body(request, self.s.upload_cap)
+        try:
+            req = json.loads(data)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise invalid("body", f"the body is not JSON ({exc})") from exc
+        schema.validate("RevertRequest", req)
+        with self.s.jobs.holding(name):  # map_busy while a job registers or fuses
+            n = await run_in_threadpool(self.s.store.revert, name, int(req["to_version"]))
+        self._hold(request, name, n)
+        return body(self._summary(name, self.s.store.require(name),
+                                  self.s.store.version(name, n)))
 
     async def get_frames(self, request: Request) -> Response:
         name, _, v = self._version(request)
@@ -462,7 +496,9 @@ class Api:
             raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
         schema.validate("LocateRequest", req)
         frames = await run_in_threadpool(nav.locate_frames, self.s.store, name, req, parts)
-        v = self.s.store.version(name, req.get("version") or int(meta["latest_version"]))
+        n = req.get("version") or int(meta["latest_version"])
+        self._hold(request, name, n)
+        v = self.s.store.version(name, n)
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         _stage(request, "prepare", t0)
         t0 = time.perf_counter()
@@ -509,6 +545,10 @@ def _wrap(handler: Callable[[Request], Awaitable[Response]]
             log.exception("%s %s failed", request.method, request.url.path)
             return error_response(ApiError("internal", f"internal error: {type(exc).__name__}: "
                                            f"{exc}", {"stage": handler.__name__}))
+        finally:
+            holds = request.scope.pop("oms_holds", None)
+            if holds is not None:  # the versions the read used (``Api._hold``)
+                holds.close()
     return run
 
 

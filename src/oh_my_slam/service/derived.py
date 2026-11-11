@@ -61,7 +61,6 @@ from oh_my_slam.mapping.anchored import valid_depth
 from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
-from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.store import Store
 
 log = get_logger("oh_my_slam.service.derived")
@@ -183,6 +182,7 @@ class Derived:
         # read's answer: ``objects.body``), with the version's committed JSON files
         self.prepared: list[Callable[[DerivedVersion, dict[str, Any]], Any]] = []
         store.listeners.append(self.committed)
+        store.pruned.append(self.forget)
         store.replacing.append(self.replacing)
         store.preparing.append(self.prepare)
 
@@ -207,6 +207,13 @@ class Derived:
             meta = self.store.meta(name) or {}
             self._keep((name, str(meta.get("created_at")), n), dv, latest=True)
         self._queue.put((name, n))
+
+    def forget(self, name: str, n: int) -> None:
+        """Version ``n`` was deleted by retention: out of memory too."""
+        with self._lock:
+            for key in [k for k in self._cache if k[0] == name and k[2] == n]:
+                del self._cache[key]
+            self._version_locks.pop((name, n), None)
 
     def prepare(self, name: str, n: int, record: dict[str, Any], mapper: Path,
                 cameras: dict[str, Any], files: dict[str, Any] | None = None) -> None:
@@ -307,12 +314,18 @@ class Derived:
         vdir = self.dir(name) / str(n)
         with self._version_lock(name, n):  # held by a derivation of this version only
             if not (vdir / "meta.json").exists():
-                if self.store.mapper_version(name) > n:
-                    raise ApiError("version_gone", f"version {n} of map {name!r} is no longer "
-                                   "kept: its mapper map was replaced before it was derived",
-                                   {"map": name, "version": n,
-                                    "latest_version": self.store.latest(name)})
-                self._derive(name, n, record, vdir)
+                # from the mapper map it was committed with (kept under ``mappers/``, O2);
+                # ``version_gone`` when that one is gone
+                path = self.store.mapper_for(name, n)
+                if path == self.store.mapper_dir(name):
+                    self._derive(name, n, record, vdir)
+                else:
+                    internal = None
+                    if path is not None:
+                        with contextlib.suppress(OSError, OhMySlamError):
+                            internal = self.read_map(path)
+                    self._derive(name, n, record, vdir, internal,
+                                 record.get("cameras") or self.store.cameras(name))
         return DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
                               vdir, self._stands(record, self.store.cameras(name)))
 

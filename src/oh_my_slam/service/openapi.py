@@ -39,7 +39,10 @@ def build(version: str) -> dict[str, Any]:
     for e in ENDPOINTS:
         op: dict[str, Any] = {"operationId": e.handler, "summary": e.summary,
                               "parameters": [_param(p) for p in e.params], "responses": {}}
-        if e.request:  # every request body so far carries images: multipart
+        if e.request and not e.multipart:
+            op["requestBody"] = {"required": True,
+                                 "content": {"application/json": {"schema": _ref(e.request)}}}
+        elif e.request:  # a body that carries images: multipart
             op["description"] = UPLOAD_NOTE
             op["requestBody"] = {"required": True, "content": {"multipart/form-data": {
                 "schema": {"type": "object", "required": ["request"],

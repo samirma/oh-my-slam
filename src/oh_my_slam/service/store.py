@@ -10,13 +10,23 @@ Under ``<data>/oms/maps/<name>/``:
   poses and sigmas, the similarity from the mapper's internal frame (``anchor.Sim3``), the scale
   and its source, the cameras known at that version, and the counts a summary reads;
 * ``mapper/`` — the mapper's map of the latest version (``mapping.store``), in its internal
-  frame. An update works on a clone of it and moves the clone into place when it commits.
+  frame. An update works on a clone of it and moves the clone into place when it commits;
+* ``mappers/<k>/`` — the mapper maps a commit replaced (O2, map.md §2), each named by the first
+  version it served: it serves the versions from ``k`` to the next one's first, a revert clones
+  it back. Kept while a kept version uses it; clones share their unchanged files (APFS), so a
+  version costs only what changed.
+
+Retention (``--keep-versions``, map.md §2): after each commit the versions older than the last
+``keep`` are deleted (their record, their own files, their derived reads), except one a read
+holds (``hold``) and the files a kept version still reads (``kept_depth.json`` of the version
+that added a kept frame).
 
 Every file is written atomically; a version is written before ``map.json`` names it, so a read
 always sees a complete version."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
@@ -24,7 +34,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +60,11 @@ def check_name(name: str) -> str:
     return name
 
 
+def latest_plus(meta: dict[str, Any]) -> int:
+    """One past a map's latest version."""
+    return int(meta.get("latest_version") or 0) + 1
+
+
 def clone_tree(src: Path, dst: Path) -> None:
     """Copy a folder as APFS clones (``cp -c``: instant, no extra space), else a plain copy."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -58,8 +73,25 @@ def clone_tree(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst, symlinks=True)
 
 
+DEFAULT_KEEP_VERSIONS = 20  # versions kept per map (``--keep-versions``, README)
+KEPT_DEPTH = "kept_depth.json"  # a version file later versions read (``update.KEPT_DEPTH``)
+
+
+def _info(record: dict[str, Any]) -> dict[str, Any]:
+    """A version's ``VersionInfo`` (api.md §5) from its record."""
+    return {"version": record["version"], "created_at": record["created_at"],
+            "kind": record.get("kind") or "update", "job_id": record.get("job_id"),
+            "reverted_to": record.get("reverted_to"), "frames": len(record.get("frames", [])),
+            "objects": int(record.get("objects") or 0)}
+
+
 class Store:
-    def __init__(self, data: Path) -> None:
+    def __init__(self, data: Path, keep_versions: int = DEFAULT_KEEP_VERSIONS) -> None:
+        self.keep_versions = max(int(keep_versions), 1)
+        # (map, version) -> reads using it now: retention does not delete it (``hold``)
+        self._holds: dict[tuple[str, int], int] = {}
+        # called with (map, version) once retention deleted a version (``derived`` forgets it)
+        self.pruned: list[Callable[[str, int], None]] = []
         self.root = Path(data).expanduser() / ROOT
         self.maps = self.root / "maps"
         self.jobs = self.root / "jobs"
@@ -185,7 +217,9 @@ class Store:
     def commit(self, name: str, record: dict[str, Any], mapper: Path | None,
                files: dict[str, Any] | None = None,
                cameras: dict[str, dict[str, Any]] | None = None,
-               masks: dict[str, tuple[str, bytes]] | None = None) -> int:
+               masks: dict[str, tuple[str, bytes]] | None = None,
+               record_cameras: dict[str, dict[str, Any]] | None = None,
+               no_mapper: bool = False) -> int:
         """Commit a new version: ``record`` (its ``version``, ``created_at`` and ``cameras``
         set here), the version's JSON ``files`` (``versions/<n>.<file name>``: the objects of an
         anchored map), the job's new ``cameras`` and their ignore ``masks`` (creating the map)
@@ -193,32 +227,205 @@ class Store:
 
         Before the mapper map is replaced, ``replacing`` listeners get the versions the current
         one serves (``mapper_version`` to the latest): what is derived from the mapper map of a
-        version is derived from that version's, never from a later one."""
-        if mapper is not None:
+        version is derived from that version's, never from a later one. The replaced map is
+        kept under ``mappers/`` (a revert clones it back). A revert names the cameras its version
+        holds (``record_cameras``: the target's) and, when the target had no mapper map,
+        ``no_mapper``: the version then has none."""
+        if mapper is not None or no_mapper:
             self._replacing(name)
-        self._prepare(name, record, mapper, cameras or {}, files or {})
+        self._prepare(name, record, mapper if not no_mapper else self.work / "no-mapper",
+                      record_cameras if record_cameras is not None else cameras or {},
+                      files or {}, record_cameras is not None)
         with self._lock:
             meta = self.add_cameras(name, cameras or {}, masks or {})
             n = int(meta.get("latest_version") or 0) + 1
             now = time.time()
             record = {**record, "version": n, "created_at": utc(now),
-                      "cameras": dict(meta["cameras"])}
-            if mapper is not None:
+                      "cameras": dict(meta["cameras"] if record_cameras is None
+                                      else record_cameras)}
+            if "mappers" not in meta:  # the history starts (an earlier map: from its latest)
+                known = self.mapper_dir(name).exists()
+                first = (self.mapper_version(name) or n - 1) if known else 0
+                meta["mappers"] = [first] if known else []
+                meta["mappers_since"] = first if known else 1
+            if mapper is not None or no_mapper:
                 current = self.mapper_dir(name)
                 if current.exists():
-                    current.rename(self.trash / f"{name}-{uuid.uuid4().hex}")
-                mapper.rename(current)
+                    dest = self.dir(name) / "mappers" / str(self.mapper_version(name) or n - 1)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.exists():  # never: one map per first version
+                        dest.rename(self.trash / f"{name}-{uuid.uuid4().hex}")
+                    current.rename(dest)
+                if mapper is not None:
+                    mapper.rename(current)
                 meta["mapper_version"] = n
+                # the first versions of the mapper maps in order; negative: from it, none
+                meta["mappers"] = [*meta["mappers"], n if mapper is not None else -n]
             for fname, data in (files or {}).items():
                 atomic_write_json(self.version_file(name, n, fname), data)
             atomic_write_json(self.dir(name) / "versions" / f"{n}.json", record)
             meta["latest_version"] = n
             meta["created_at"] = meta.get("created_at") or utc(now)
+            meta["index"] = {**meta.get("index", {}), str(n): _info(record)}
             self._write_meta(name, meta)
         shutil.rmtree(self.trash, ignore_errors=True)
         self.trash.mkdir(parents=True, exist_ok=True)
         self.committed(name, n)
+        self.prune(name)
         return n
+
+    # -- versions (O2) -------------------------------------------------------------------------
+
+    def kept(self, name: str) -> list[int]:
+        """The kept versions of a map, ascending."""
+        d = self.dir(name) / "versions"
+        return sorted(int(p.stem) for p in d.glob("*.json") if p.stem.isdigit())
+
+    def versions(self, name: str) -> list[dict[str, Any]]:
+        """The kept versions' ``VersionInfo`` (api.md §5), ascending."""
+        meta = self.require(name)
+        index = meta.get("index", {})
+        out = []
+        for n in self.kept(name):
+            info = index.get(str(n))
+            if info is None:  # a version committed before the index was kept
+                try:
+                    info = _info(self.version(name, n))
+                except ApiError:
+                    continue  # deleted meanwhile
+            out.append(info)
+        return out
+
+    def mapper_for(self, name: str, n: int) -> Path | None:
+        """The mapper map version ``n`` was committed with (None: it had none);
+        ``version_gone`` when it is no longer kept (replaced before versions kept theirs)."""
+        meta = self.require(name)
+        gone = ApiError("version_gone", f"version {n} of map {name!r} is no longer kept: its "
+                        "mapper map is gone", {"map": name, "version": n,
+                                               "latest_version": meta["latest_version"]})
+        if "mappers" not in meta:  # no commit kept the history yet: the current map only
+            current = self.mapper_version(name)
+            if not self.mapper_dir(name).exists():
+                return None
+            if current > n:  # 0: unknown, as before (the current map)
+                raise gone
+            return self.mapper_dir(name)
+        if n < int(meta.get("mappers_since") or 1):
+            raise gone
+        firsts = [k for k in meta["mappers"] if abs(k) <= n]
+        k = max(firsts, key=abs) if firsts else -1
+        if k < 0:
+            return None
+        path = self.mapper_dir(name) if k == self.mapper_version(name) and k == max(
+            abs(j) for j in meta["mappers"]) else self.dir(name) / "mappers" / str(k)
+        if not path.exists():
+            raise gone
+        return path
+
+    @contextlib.contextmanager
+    def hold(self, name: str, n: int) -> Iterator[None]:
+        """Version ``n`` of a map is used by a read: retention keeps it until it ends."""
+        with self._lock:
+            self._holds[(name, n)] = self._holds.get((name, n), 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                left = self._holds.pop((name, n)) - 1
+                if left:
+                    self._holds[(name, n)] = left
+
+    def revert(self, name: str, to_version: int) -> int:
+        """Commit a new version whose content equals ``to_version`` (map.md §2 Revert): its
+        record (frames and poses, the similarity, scale, floor, objects, label vocabulary), its
+        own files, the cameras it held and a clone of the mapper map it was committed with, so
+        updates continue from it in the same map frame (never re-gauged). The caller keeps
+        jobs of the map from starting meanwhile (``Jobs.holding``)."""
+        meta = self.require(name)
+        latest = int(meta["latest_version"])
+        if to_version < 1 or to_version > latest:
+            raise invalid("to_version", f"version {to_version} of map {name!r} does not exist "
+                          f"(latest is {latest})", latest_version=latest)
+        with self.hold(name, to_version):
+            try:
+                src = self.version(name, to_version)
+            except ApiError as exc:
+                raise ApiError(exc.code, exc.message, {**exc.details, "field": "to_version"}
+                               ) from exc
+            source = self.mapper_for(name, to_version)
+            mapper = None
+            if source is not None:
+                mapper = self.work / f"revert-{uuid.uuid4().hex}"
+                clone_tree(source, mapper)
+            files = {}
+            prefix = f"{to_version}."
+            for p in sorted((self.dir(name) / "versions").glob(f"{to_version}.*.json")):
+                fname = p.name[len(prefix):]
+                if fname != KEPT_DEPTH:  # read by the frames' added_version, not copied
+                    files[fname] = json.loads(p.read_text())
+            record = {k: v for k, v in src.items()
+                      if k not in ("version", "created_at", "cameras")}
+            record.update(kind="revert", job_id=None, reverted_to=to_version)
+            try:
+                return self.commit(name, record, mapper, files,
+                                   record_cameras=dict(src.get("cameras") or {}),
+                                   no_mapper=source is None)
+            finally:
+                if mapper is not None:
+                    shutil.rmtree(mapper, ignore_errors=True)
+
+    def prune(self, name: str) -> None:
+        """Retention (map.md §2): delete the versions older than the last ``keep_versions``,
+        except those a read holds, and the mapper maps no kept version uses."""
+        gone = []
+        with self._lock:
+            meta = self.meta(name)
+            if meta is None or not meta.get("latest_version"):
+                return
+            kept = self.kept(name)
+            last = kept[-self.keep_versions:]
+            old = [n for n in kept if n not in last and (name, n) not in self._holds]
+            if not old:
+                return
+            stay = [n for n in kept if n not in old]
+            records = {}
+            for n in stay:
+                with contextlib.suppress(ApiError, OSError, ValueError):
+                    records[n] = self.version(name, n)
+            # a kept version's frames read the kept depth of the version that added them
+            readers = {int(f["added_version"]) for r in records.values()
+                       for f in r.get("frames", []) if f.get("content") and f.get("added_version")}
+            vdir = self.dir(name) / "versions"
+            for n in old:
+                (vdir / f"{n}.json").unlink(missing_ok=True)
+                for p in vdir.glob(f"{n}.*.json"):
+                    if not (p.name == f"{n}.{KEPT_DEPTH}" and n in readers):
+                        p.unlink(missing_ok=True)
+                d = self.dir(name) / "derived" / str(n)
+                if d.exists():
+                    d.rename(self.trash / f"{name}-{n}-{uuid.uuid4().hex}")
+                gone.append(n)
+            meta["index"] = {k: v for k, v in meta.get("index", {}).items()
+                             if int(k) not in old}
+            # the mapper maps no kept version uses: their range holds no kept version
+            firsts = sorted(abs(k) for k in meta.get("mappers", []))
+            for i, k in enumerate(firsts):
+                end = firsts[i + 1] if i + 1 < len(firsts) else latest_plus(meta)
+                path = self.dir(name) / "mappers" / str(k)
+                if path.exists() and not any(k <= n < end for n in stay):
+                    path.rename(self.trash / f"{name}-m{k}-{uuid.uuid4().hex}")
+            self._write_meta(name, meta)
+        shutil.rmtree(self.trash, ignore_errors=True)
+        self.trash.mkdir(parents=True, exist_ok=True)
+        for n in gone:
+            for listener in self.pruned:
+                try:
+                    listener(name, n)
+                except Exception:
+                    from oh_my_slam.core.log import get_logger
+
+                    get_logger("oh_my_slam.service.store").exception(
+                        "pruned listener failed for %s version %d", name, n)
 
     def mapper_version(self, name: str) -> int:
         """The first version the current mapper map serves: it holds the content of every
@@ -241,13 +448,14 @@ class Store:
                     "replacing listener failed for %s versions %d-%d", name, first, latest)
 
     def _prepare(self, name: str, record: dict[str, Any], mapper: Path | None,
-                 cameras: dict[str, dict[str, Any]], files: dict[str, Any]) -> None:
+                 cameras: dict[str, dict[str, Any]], files: dict[str, Any],
+                 exact: bool = False) -> None:
         """The ``preparing`` listeners on the version about to be committed: its number (one job
         writes a map at a time), its record as it will read (``version``, ``cameras``), the
         mapper map it is committed with (the current one when none), the map's cameras and the
-        version's JSON files."""
+        version's JSON files (``exact``: ``cameras`` are the version's own, a revert's)."""
         n = int((self.meta(name) or {}).get("latest_version") or 0) + 1
-        cams = {**self.cameras(name), **cameras}
+        cams = dict(cameras) if exact else {**self.cameras(name), **cameras}
         full = {**record, "version": n, "cameras": cams}
         for listener in self.preparing:
             try:

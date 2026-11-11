@@ -8,12 +8,13 @@ that was running when the service stopped is ``failed`` when it starts again."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,7 @@ class Jobs:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self.running: str | None = None
+        self._paused: set[str] = set()  # maps whose jobs do not start now (``holding``)
 
     # -- persistence -----------------------------------------------------------------------------
 
@@ -214,6 +216,24 @@ class Jobs:
             return sorted((j for j in self._jobs.values() if j.map == map_name and j.active),
                           key=lambda j: j.created)
 
+    @contextlib.contextmanager
+    def holding(self, map_name: str) -> Iterator[None]:
+        """No job of the map starts while held (a revert, api.md §5); ``map_busy`` while one is
+        registering or fusing. Queued jobs wait, then start from what was committed."""
+        with self._cond:
+            job = self._jobs.get(self.running) if self.running else None
+            if job is not None and job.map == map_name and job.active:
+                raise ApiError("map_busy", f"job {job.id} of map {map_name!r} is {job.state}; "
+                               "revert once it has ended", {"job_id": job.id,
+                                                            "state": job.state})
+            self._paused.add(map_name)
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._paused.discard(map_name)
+                self._cond.notify_all()
+
     def queued(self) -> list[Job]:
         with self._cond:
             return sorted((j for j in self._jobs.values() if j.state == "queued"),
@@ -237,7 +257,10 @@ class Jobs:
             job = self._jobs.get(jid)
             if job is None or job.state != "queued":
                 continue
-            self.running = jid
+            with self._cond:
+                while job.map in self._paused:
+                    self._cond.wait()
+                self.running = jid
             job.started = time.time()
             try:
                 self.runner(job, lambda j=job: self.changed(j))  # type: ignore[misc]

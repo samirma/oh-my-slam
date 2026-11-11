@@ -31,12 +31,11 @@ from typing import Any
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.constants import SERVICE_PORT
 from oh_my_slam.server.lifecycle import AlreadyRunningError, ServerLock, pid_alive
-from oh_my_slam.service.store import Store
+from oh_my_slam.service.store import DEFAULT_KEEP_VERSIONS, Store
 from oh_my_slam.version import __version__
 
 PROG = "server.sh"
 DEFAULT_DATA = Path("~/oh-my-slam-data")
-DEFAULT_KEEP_VERSIONS = 20
 STOP_TIMEOUT_S = 60.0
 LOCK, STATE, LOG = "service.lock", "service.json", "service.log"
 
@@ -53,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", type=Path, default=DEFAULT_DATA,
                    help="data folder (default ~/oh-my-slam-data)")
     p.add_argument("--keep-versions", type=int, default=DEFAULT_KEEP_VERSIONS,
-                   help="versions kept per map (default 20; retention comes with O2)")
+                   help="versions kept per map at least (default 20, map.md §2)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help="print GET /api/health")
     mode.add_argument("--stop", action="store_true", help="stop the service")
@@ -223,7 +222,10 @@ def main(argv: list[str]) -> int:
     if not 0 <= args.port <= 65535:
         _say(f"error: --port must be between 0 and 65535, got {args.port}")
         return 2
-    store = Store(args.data)
+    if args.keep_versions < 1:
+        _say(f"error: --keep-versions must be at least 1, got {args.keep_versions}")
+        return 2
+    store = Store(args.data, args.keep_versions)
     if args.status:
         return status(store)
     if args.stop:

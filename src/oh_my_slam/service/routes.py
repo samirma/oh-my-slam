@@ -54,6 +54,15 @@ ENDPOINTS: tuple[Endpoint, ...] = (
                            maximum=30))),
     Endpoint("GET", "/api/maps/{name}", "get_map", "Map summary", {200: "MapSummary"},
              ("map_not_found", "version_gone", "invalid_request"), params=(MAP, VERSION)),
+    Endpoint("GET", "/api/maps/{name}/versions", "get_versions",
+             "Kept versions (O2): each with its kind, job and counts", {200: "Versions"},
+             ("map_not_found", "invalid_request"), params=(MAP,)),
+    Endpoint("POST", "/api/maps/{name}/revert", "post_revert",
+             "Commit a copy of a kept version (O2) as a new version, and answer its summary; "
+             "map_busy while a job of the map is registering or fusing; queued jobs then start "
+             "from it", {200: "MapSummary"},
+             ("map_not_found", "version_gone", "map_busy", "invalid_request"),
+             request="RevertRequest", params=(MAP,)),
     Endpoint("GET", "/api/maps/{name}/frames", "get_frames", "Keyframes and their poses",
              {200: "Frames"}, ("map_not_found", "version_gone", "invalid_request"),
              params=(MAP, VERSION)),
