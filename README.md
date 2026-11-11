@@ -166,10 +166,34 @@ the version. A rejected or failed job leaves the map as it was.
   focal length (refined within 1.15, see *A focal length the keyframes carry*). A canonical JPEG
   without a mask reaches the mapper byte for byte. EXIF orientation is not applied: intrinsics
   describe the stored pixels.
-* **Ignore mask.** The camera's mask and the frame's own (`FrameInput.ignore_mask`) are combined.
-  Their pixels take no part in the per-frame checks and are filled from their
-  surroundings (`cv2.inpaint`) in the image the mapper gets, so no feature is extracted on the
-  robot's body. Not yet applied to the mapper's depth and fusion (the cloud reads come with O6/O7).
+* **Ignore mask.** The camera's mask and the frame's own (`FrameInput.ignore_mask`) are combined,
+  and a pixel in their union contributes nothing anywhere, on every engine (map.md §2 "Ignored
+  pixels", oms/2.3 P18). Their pixels take no part in the per-frame checks and are filled from
+  their surroundings (`cv2.inpaint`) in the image the mapper gets. Then, per sink:
+  * **keypoints and matches**: the prior-first engine's SIFT (`anchored.features`, every job and
+    dry-run frame) takes none there; the older mapper writes each keyframe's mask beside its
+    frames (`frame_masks/<image>.png`, `sfm.ignore_mask_path`, kept with the map for a later
+    re-extraction) and the Homebrew `colmap feature_extractor` gets them as
+    `--ImageReader.mask_path` (`Sfm._keypoint_masks`), so neither SIFT matching nor the LightGlue
+    re-matching, both on those keypoints, has a match there; the locate index of every version
+    extracts its keyframes' features without them (`InternalMap.ignore`, the mask in the feature
+    cache key), as locate's own frames do;
+  * **depth, cloud, occupancy, free space and floor**: a depth image is zero there
+    (`cameras.mapper_depth`), so is the monocular depth (`prior_first._waiter`: no scale
+    evidence or scene distance either) and MapAnything's depth of a new frame (`register_ma.
+    _without_ignored`: no scale, agreement or fusion); a prior-first keyframe stores its depth
+    grid with them zeroed and its mask as `kf/<id>.ignore.png` (`AnchoredMap.ignore_of`), so the
+    cloud, the derived occupancy volume (no ray: neither occupied nor free evidence) and the
+    floor estimates never see them; the older mapper zeroes its keyframe depth and validity
+    there (`mapping.api._ignore_pixels`);
+  * **detections and votes**: a detection with more than **`IGNORED_DETECTION_MAX_SHARE` = 0.5**
+    of its mask (its box when the mask is empty) on the ignored pixels is dropped
+    (`anchored_objects.unignored`, `mapping.api._ignore_pixels`); the others lose those pixels
+    when lifted. On the prior-first engine a keyframe whose view of an object's centre falls on
+    its ignored pixels does not count among the keyframes seeing it (`anchored_objects.in_view`,
+    `detection_votes`), and a re-registered stored keyframe's detections use its stored mask.
+    Known gap: the older mapper's in-frustum count of an object's keyframes
+    (`objects.count_views`) does not consult the masks.
 * **The map frame.** The mapper keeps its own internal frame, which a rebuild may define again.
   The service frame is reached from it by one similarity `S` per version (`versions/<n>.json →
   sim3`), fitted to *anchors* (`mapping.anchor`):

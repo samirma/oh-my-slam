@@ -117,6 +117,23 @@ class New:
     K: Intrinsics
     depth: NDArray[np.float32] | None = None  # metric, on the image's pixels
     features: int = FEW_FEATURES
+    # its ignored pixels (the union of its camera's and its own mask, on the image's pixels):
+    # MapAnything's depth there counts for nothing, neither scale, agreement nor fusion (map.md
+    # §2 "Ignored pixels")
+    ignore: NDArray[np.bool_] | None = None
+
+
+def _without_ignored(out: list[MvView], na: int, chunk: list[New]) -> list[MvView]:
+    """A call's views with the new frames' ignored pixels (``New.ignore``) holding no depth."""
+    views = list(out)
+    for i, f in enumerate(chunk):
+        if f.ignore is None or not f.ignore.any():
+            continue
+        v = views[na + i]
+        m = cv2.resize(f.ignore.astype(np.uint8), (v.depth.shape[1], v.depth.shape[0]),
+                       interpolation=cv2.INTER_NEAREST) > 0
+        views[na + i] = MvView(v.pose, np.where(m, 0.0, v.depth).astype(np.float32), v.K)
+    return views
 
 
 @dataclass
@@ -429,6 +446,7 @@ class Registration:
                 continue
             for f in chunk:
                 self.pool_at[f.index] = len(self.pool)
+            out = _without_ignored(out, len(anchors), chunk)
             S, src, ma_sigma = self._align(anchors, chunk, out)
             self._place_chunk(chunk, out, anchors, S, ma_sigma)
             self.notes["calls"].append({"anchors": len(anchors), "new": len(chunk),

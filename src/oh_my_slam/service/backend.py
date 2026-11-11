@@ -28,6 +28,7 @@ from oh_my_slam.core.errors import (
 )
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping.register_ma import MvView
+from oh_my_slam.mapping.sfm import ignore_mask_path
 from oh_my_slam.service.errors import ApiError
 
 if TYPE_CHECKING:
@@ -70,6 +71,8 @@ class InternalMap:
     image: Callable[[str], Path | None] = field(default=lambda name: None)  # the keyframe image
     cloud: Callable[[], Cloud | None] = field(default=lambda: None)  # the fused cloud
     objects: Callable[[], list[dict[str, Any]]] = field(default=lambda: [])  # internal frame
+    # a keyframe's ignored pixels (map.md §2 "Ignored pixels"), on its image, None: none
+    ignore: Callable[[str], NDArray[np.bool_] | None] = field(default=lambda name: None)
 
 
 @dataclass
@@ -197,7 +200,7 @@ def read_anchored(mapper_dir: Path) -> InternalMap:
 
     return InternalMap(frames, floor, bounds, False, am.depth_of,
                        np.asarray(xyz[:, 2], np.float64) if len(xyz) else None, am.image_path,
-                       cloud, objects)
+                       cloud, objects, am.ignore_of)
 
 
 def api_error(exc: OhMySlamError) -> ApiError:
@@ -418,9 +421,19 @@ class MapperBackend:
                                 "last_seen_update": o.get("last_seen_update")})
             return out
 
+        def ignore(name: str) -> NDArray[np.bool_] | None:
+            p = image(name)
+            m = None if p is None else ignore_mask_path(p.parent, p.name)
+            if m is None or not m.exists():
+                return None
+            import cv2
+
+            got = cv2.imread(str(m), cv2.IMREAD_GRAYSCALE)
+            return None if got is None else got > 0
+
         floor = reader.meta.get("floor_z")
         return InternalMap(frames, None if floor is None else float(floor), bounds, rebuilt, depth,
-                           points_z, image, cloud, objects)
+                           points_z, image, cloud, objects, ignore)
 
     def terminate(self) -> None:
         with self._lock:

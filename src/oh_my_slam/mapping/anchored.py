@@ -128,6 +128,7 @@ from oh_my_slam.core.constants import (
     REGISTRATION_MIN,
 )
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
+from oh_my_slam.core.images import on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import sigmas
@@ -961,6 +962,8 @@ class Keyframe:
     grid: NDArray[np.float32] | None = None
     K_grid: Intrinsics | None = None
     rgb: NDArray[np.uint8] | None = None
+    # its ignored pixels on the grid (map.md §2 "Ignored pixels"; kf/<id>.ignore.png), None: none
+    ignore: NDArray[np.bool_] | None = None
     # kept at its prior: the reason (the check its image failed, too_close, no_overlap ...)
     reason: str | None = None
     # its committed camera height agrees with the one sent (map.md §2 height gate): False
@@ -1854,6 +1857,9 @@ class AnchoredMap:
                      kdepth=kf.kdepth, **extra)
             assert kf.grid is not None and kf.rgb is not None
             np.save(self.root / KF_DIR / f"{kf.id}.depth.npy", kf.grid.astype(np.float16))
+            if kf.ignore is not None:
+                cv2.imwrite(str(self.root / KF_DIR / f"{kf.id}.ignore.png"),
+                            kf.ignore.astype(np.uint8) * 255)
             cv2.imwrite(str(self.root / KF_DIR / f"{kf.id}.jpg"),
                         cv2.cvtColor(kf.rgb, cv2.COLOR_RGB2BGR),
                         [cv2.IMWRITE_JPEG_QUALITY, KF_JPEG_QUALITY])
@@ -1870,6 +1876,15 @@ class AnchoredMap:
         """A keyframe's canonical image, or None."""
         p = self.root / KF_DIR / f"{kid}.jpg"
         return p if p.exists() else None
+
+    def ignore_of(self, kid: str) -> NDArray[np.bool_] | None:
+        """A keyframe's ignored pixels on its depth grid (map.md §2), None when it has none."""
+        kf = self.keyframe(kid)
+        if kf is not None and kf.ignore is not None:
+            return kf.ignore
+        p = self.root / KF_DIR / f"{kid}.ignore.png"
+        got = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+        return None if got is None else got > 0
 
     def depth_of(self, kid: str) -> NDArray[np.float32] | None:
         """A keyframe's depth grid in metres (0: none), at the map's depth scale now."""
@@ -2485,6 +2500,9 @@ class AnchoredMap:
             prior = {"trust": f.prior["trust"], "T": np.asarray(f.prior["T_map_cam"]).tolist(),
                      "sigma_pos_m": _prior_sigmas(f.prior)[0],
                      "sigma_rot_deg": _prior_sigmas(f.prior)[1]}
+        ignore = on_grid(f.ignore, depth.shape)
+        if ignore is not None:  # no depth point there: no cloud, occupancy, free space or floor
+            depth = np.where(ignore, 0.0, depth).astype(np.float32)
         valid = depth[np.isfinite(depth) & (depth > 0)]
         kf = Keyframe(kid, f.name, f.camera_id, f.K, pl.T.copy(), pl.sigma_pos_m,
                       pl.sigma_rot_deg, "provisional" if pl.status == "kept_at_prior" else "fused",
@@ -2495,7 +2513,7 @@ class AnchoredMap:
         kf.kdepth = sample_depth(depth, K_grid, f.K, feats.kps) if len(feats.kps) \
             else np.zeros(0, np.float32)
         kf.descriptor = None if descriptor is None else np.asarray(descriptor, np.float32)
-        kf.grid, kf.K_grid, kf.rgb = depth, K_grid, f.rgb
+        kf.grid, kf.K_grid, kf.rgb, kf.ignore = depth, K_grid, f.rgb, ignore
         kf.height_m, kf.height_sigma_m = f.height_m, f.height_sigma_m
         if seed is not None:
             kf.seed, kf.seed_sigma = seed

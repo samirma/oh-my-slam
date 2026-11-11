@@ -29,6 +29,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core import paths, timing
+from oh_my_slam.core.constants import IGNORED_DETECTION_MAX_SHARE
 from oh_my_slam.core.constants import RETRIEVAL_TOP_K as RETRIEVAL_TOP_K
 from oh_my_slam.core.constants import UPDATE_EXHAUSTIVE_MAX as UPDATE_EXHAUSTIVE_MAX
 from oh_my_slam.core.errors import DeviceMemoryError, RegistrationError
@@ -49,6 +50,7 @@ from oh_my_slam.mapping.sfm import (
     camera_intrinsics,
     check_versions,
     contradicted,
+    ignore_mask_path,
     shared_camera,
     vet,
     video_source,
@@ -193,6 +195,7 @@ whose source ``ignore`` names has that mask's pixels taken out (``_ignore_pixels
         with timing.stage(timing.Stage.INGEST):
             for kf in kfs:
                 written.append(kf)
+                _keep_mask(kf, (ignore or {}).get(kf.source))
                 futures.append(pool.submit(one, kf))
         progress(f"{len(futures)} keyframes from {kind}")
         ingested(written)
@@ -205,6 +208,16 @@ whose source ``ignore`` names has that mask's pixels taken out (``_ignore_pixels
     finally:
         pool.shutdown(cancel_futures=True)  # on an error, the keyframes not started yet
     return out
+
+
+def _keep_mask(kf: ingest.Keyframe, mask_png: Path | None) -> None:
+    """A keyframe's ignore mask beside the map's frames (``sfm.ignore_mask_path``), before its
+    features are extracted: no SIFT keypoint lies on it (``Sfm.extract``, map.md §2)."""
+    if mask_png is None:
+        return
+    dst = ignore_mask_path(kf.path.parent, kf.path.name)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(mask_png, dst)
 
 
 def _ignore_pixels(frame: FrameReconstruction, dets: list[Detection], mask_png: Path
@@ -228,7 +241,12 @@ def _ignore_pixels(frame: FrameReconstruction, dets: list[Detection], mask_png: 
     frame.depth = np.where(m, 0.0, frame.depth).astype(frame.depth.dtype)
     kept = []
     for det in dets:
-        keep = det.mask & ~on(det.mask.shape)
+        ign = on(det.mask.shape)
+        n = int(det.mask.sum())
+        # mostly on the ignored pixels: dropped (map.md §2, the README share)
+        if n and float((det.mask & ign).sum()) / n > IGNORED_DETECTION_MAX_SHARE:
+            continue
+        keep = det.mask & ~ign
         if keep.any():
             kept.append(replace(det, mask=keep))
     return kept
@@ -2203,6 +2221,10 @@ def _remap_small(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,
         dst = frames_dir / name
         if not dst.exists():
             shutil.copyfile(tx.root / f.image, dst)
+        mask = ignore_mask_path((tx.root / f.image).parent, name)
+        if mask.exists() and not ignore_mask_path(frames_dir, name).exists():
+            ignore_mask_path(frames_dir, name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mask, ignore_mask_path(frames_dir, name))
         if name not in in_db:
             missing.append(f)
     if missing:

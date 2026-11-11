@@ -93,8 +93,13 @@ from numpy.typing import NDArray
 from scipy import ndimage
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M, floor_band_m
+from oh_my_slam.core.constants import (
+    FLOOR_SIGMA_DEFAULT_M,
+    IGNORED_DETECTION_MAX_SHARE,
+    floor_band_m,
+)
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
+from oh_my_slam.core.images import on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
@@ -876,7 +881,7 @@ class ObjectMap:
         self.floor_sigma = FLOOR_SIGMA_DEFAULT_M  # its height sigma (the floor band)
         # the image-confirmed keyframes (id, T_map_cam, intrinsics) the votes count views over
         # (``detection_votes``), set by ``finish``
-        self.cameras: list[tuple[str, Array, Intrinsics]] = []
+        self.cameras: list[tuple[str, Array, Intrinsics, NDArray[np.bool_] | None]] = []
 
     @staticmethod
     def load(root: Path) -> ObjectMap:
@@ -1093,7 +1098,8 @@ class ObjectMap:
 
     def finish(self, xyz: Array, top_z: float | None, version: int,
                viewpoints: Array | None = None, floor_z: float | None = None,
-               cameras: list[tuple[str, Array, Intrinsics]] | None = None) -> None:
+               cameras: list[tuple[str, Array, Intrinsics, NDArray[np.bool_] | None]] | None
+               = None) -> None:
         """Surfaces from the fused cloud (the points facing up, seen from ``viewpoints``), then
         every listed object's relations, on its box as fitted (it rests on its support anew).
         ``cameras``: the map's image-confirmed keyframes, which ``detection_votes`` counts."""
@@ -1221,17 +1227,51 @@ def listed(o: MapObject) -> bool:
         and (o.label != DOOR_LABEL or door_leaf(o.box.size))
 
 
-def in_view(X: Array, T: Array, K: Intrinsics) -> bool:
+def in_view(X: Array, T: Array, K: Intrinsics, ignore: NDArray[np.bool_] | None = None
+            ) -> bool:
     """Whether the camera ``T`` (``T_map_cam``) with intrinsics ``K`` has the map point ``X``
-    in its view frustum: in front of it and inside its image."""
+    in its view frustum: in front of it and inside its image, not on its ignored pixels
+    (``ignore``, any grid of the image: map.md §2, they give no vote)."""
     pc = (np.asarray(X, np.float64) - T[:3, 3]) @ T[:3, :3]
     if pc[2] <= VIEW_NEAR_M:
         return False
     u, v = K.fx * pc[0] / pc[2] + K.cx, K.fy * pc[1] / pc[2] + K.cy
-    return bool(0.0 <= u < K.width and 0.0 <= v < K.height)
+    if not (0.0 <= u < K.width and 0.0 <= v < K.height):
+        return False
+    if ignore is None:
+        return True
+    h, w = ignore.shape[:2]
+    return not bool(ignore[min(int(v * h / K.height), h - 1), min(int(u * w / K.width), w - 1)])
 
 
-def detection_votes(o: MapObject, cameras: list[tuple[str, Array, Intrinsics]]
+def unignored(dets: list[Detection], ignore: NDArray[np.bool_] | None) -> list[Detection]:
+    """The detections of a view (masks on the grid of ``ignore``) without those lying mostly
+    on its ignored pixels: more than ``IGNORED_DETECTION_MAX_SHARE`` of the mask (of the box
+    without one) inside them (map.md §2 "Ignored pixels"). The rest lose those pixels when they
+    are lifted (``observe``: ``valid``)."""
+    if ignore is None:
+        return dets
+    out = []
+    for d in dets:
+        area = d.mask if d.mask.shape == ignore.shape and d.mask.any() \
+            else _box_mask(d.box, ignore.shape)
+        n = int(area.sum())
+        if n and float((area & ignore).sum()) / n > IGNORED_DETECTION_MAX_SHARE:
+            continue
+        out.append(d)
+    return out
+
+
+def _box_mask(box: tuple[float, float, float, float], shape: tuple[int, ...]
+              ) -> NDArray[np.bool_]:
+    m = np.zeros(shape[:2], bool)
+    x0, y0, x1, y1 = (round(c) for c in box)
+    m[max(y0, 0):max(y1, 0), max(x0, 0):max(x1, 0)] = True
+    return m
+
+
+def detection_votes(o: MapObject,
+                    cameras: list[tuple[str, Array, Intrinsics, NDArray[np.bool_] | None]]
                     ) -> list[dict[str, Any]]:
     """``detection_votes`` (map.md §5): per label, the keyframes that detected the object as it
     over the image-confirmed keyframes whose view frustum holds its box centre, detected or not
@@ -1242,7 +1282,7 @@ def detection_votes(o: MapObject, cameras: list[tuple[str, Array, Intrinsics]]
         frames.setdefault(s.label, set()).add(s.kid)
     seen = set().union(*frames.values()) if frames else set()
     if o.box is not None:
-        seen |= {kid for kid, T, K in cameras if in_view(o.box.centre, T, K)}
+        seen |= {kid for kid, T, K, ign in cameras if in_view(o.box.centre, T, K, ign)}
     n = max(len(seen), 1)
     out = [{"label": k, "share": round(min(len(v) / n, 1.0), 4)} for k, v in frames.items()]
     return sorted(out, key=lambda e: (-e["share"], e["label"]))
@@ -1369,13 +1409,15 @@ def fuse_objects(am: AnchoredMap,
             b = d.box
             dets.append(Detection(d.label, d.score, d.source, m,
                                   (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
-        ignore = None if own_ignore is None else _on_grid(
-            own_ignore.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+        # the union of its camera's and its own mask (map.md §2 "Ignored pixels"), kept with
+        # the keyframe: a re-registered stored keyframe's too
+        ignore = on_grid(own_ignore if own_ignore is not None else am.ignore_of(kf.id), shape)
+        dets = unignored(dets, ignore)
         rel = SENSOR_DEPTH_REL if kf.depth_kind == "sensor" else MONO_DEPTH_REL
         regions = raised_regions(grid, kf.K_grid, kf.T, rel, None if ignore is None else ~ignore)
         if regions:  # a view looking down at its support
             assert path is not None  # a frame kept has its image
-            dets = closer(path, regions, dets, (shape[1], shape[0]))
+            dets = unignored(closer(path, regions, dets, (shape[1], shape[0])), ignore)
         views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, grid,
                           _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore, rel))
     # the version's one floor estimate (map.md §5): the objects' and, through the version
@@ -1388,5 +1430,5 @@ def fuse_objects(am: AnchoredMap,
     top = max((float(k.centre[2]) for k in confirmed), default=None)
     om.finish(am.cloud.points(), top, version,
               np.array([k.centre for k in confirmed]).reshape(-1, 3), floor,
-              [(k.id, k.T, k.K) for k in am.keyframes if k.detects()])
+              [(k.id, k.T, k.K, am.ignore_of(k.id)) for k in am.keyframes if k.detects()])
     return om, len(om.records()["objects"])

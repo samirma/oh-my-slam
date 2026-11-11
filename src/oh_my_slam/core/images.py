@@ -205,3 +205,16 @@ def png_bytes(array: NDArray[Any], text: dict[str, str] | None = None) -> bytes:
 def load_png(path: Path) -> NDArray[Any]:
     with Image.open(path) as img:
         return np.asarray(img)
+
+
+def on_grid(mask: NDArray[np.bool_] | None, shape: tuple[int, ...]) -> NDArray[np.bool_] | None:
+    """An ignore mask resampled onto a grid of ``shape`` (nearest); None without ignored pixels."""
+    if mask is None or not mask.any():
+        return None
+    if mask.shape[:2] == tuple(shape[:2]):
+        return mask.astype(bool)
+    import cv2
+
+    out: NDArray[np.bool_] = cv2.resize(mask.astype(np.uint8), (shape[1], shape[0]),
+                                        interpolation=cv2.INTER_NEAREST) > 0
+    return out

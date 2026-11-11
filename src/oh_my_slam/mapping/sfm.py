@@ -523,6 +523,15 @@ def extraction_threads(width: int, height: int, doubled: bool, images: int) -> i
     return threads
 
 
+IGNORE_MASKS = "frame_masks"  # beside a map's frames: each keyframe's ignore mask, if any
+
+
+def ignore_mask_path(image_dir: Path, name: str) -> Path:
+    """Where the ignore mask of keyframe image ``name`` lives: ``<frames>/../frame_masks/
+    <name>.png`` (8-bit PNG, non-zero = ignored; ``mapping.api`` writes it at ingest)."""
+    return Path(image_dir).parent / IGNORE_MASKS / f"{name}.png"
+
+
 class Sfm:
     def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
                  only: Iterable[str] | None = None) -> None:
@@ -569,8 +578,40 @@ class Sfm:
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
         args += ["--ImageReader.existing_camera_id", str(camera)]
+        masks = self._keypoint_masks(names)
+        if masks is not None:
+            args += ["--ImageReader.mask_path", str(masks)]
         _run(args, self.log_path)
         return camera
+
+    def _keypoint_masks(self, names: list[str]) -> Path | None:
+        """COLMAP's masks for ``names`` (``--ImageReader.mask_path``: ``<name>.png`` at the
+        image's size, 0 where no keypoint may lie) from their ignore masks (``ignore_mask_path``:
+        8-bit PNG, non-zero = the robot's own body; map.md §2 "Ignored pixels": no keypoints and
+        so no matches there, SIFT's or LightGlue's on them); None when none has one. An image
+        without its own mask gets an all-keep one, so every listed image is masked the same way."""
+        import cv2
+
+        found = {n: ignore_mask_path(self.image_dir, n) for n in names}
+        if not any(p.exists() for p in found.values()):
+            return None
+        out = self.work / "keypoint_masks"
+        shutil.rmtree(out, ignore_errors=True)
+        for name, src in found.items():
+            img = cv2.imread(str(self.image_dir / name), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue  # COLMAP reports the unreadable image itself
+            keep = np.full(img.shape, 255, np.uint8)
+            if src.exists():
+                ign = cv2.imread(str(src), cv2.IMREAD_GRAYSCALE)
+                if ign is not None:
+                    ign = cv2.resize(ign, (img.shape[1], img.shape[0]),
+                                     interpolation=cv2.INTER_NEAREST)
+                    keep[ign > 0] = 0
+            dst = out / f"{name}.png"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dst), keep)
+        return out
 
     def _without_features(self, names: list[str]) -> list[str]:
         """``names`` whose features the database does not hold yet."""

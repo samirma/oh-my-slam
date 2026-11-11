@@ -4,6 +4,7 @@ the label vocabulary (P18, oms/2.3), and object extents over many views."""
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -210,3 +211,167 @@ def test_retention_keeps_the_last_versions(tmp_path: Path) -> None:
     assert store.revert("m", 3) == 5
     assert (store.mapper_dir("m") / "tag").read_text() == "2"
     assert store.version("m", 5)["reverted_to"] == 3
+
+
+# -- P18: ignored pixels contribute nothing, on every engine ------------------------------------
+
+
+def _png8(a: np.ndarray) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(a.astype(np.uint8)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+FEET_ROW = 190  # the rows below it show the robot's own feet, 0.32 m away
+
+
+def _feet_frames(c: Client, poses: list[np.ndarray], tag: str, depth: bool = True
+                 ) -> tuple[list[Any], dict[str, bytes]]:
+    import hashlib
+
+    from tests.synth.room import png_depth
+    from tests.unit.test_service_prior_first import shot
+
+    fr, files = frames_for(c, poses, tag=tag, depth=depth)
+    for i, T in enumerate(poses):
+        img, _, z = shot(T)
+        z = z.copy()
+        z[FEET_ROW:, 100:220] = 0.32
+        if depth:
+            files[f"{tag}{i}d"] = png_depth(z)
+        c.backend.mono_depth[hashlib.sha256(img).hexdigest()] = z
+    return fr, files
+
+
+def _near_occupied(c: Client, name: str) -> int:
+    import base64
+
+    g = c.get(f"/api/maps/{name}/grid?cell_m=0.05", "Grid")
+    st = np.frombuffer(base64.b64decode(g["layers"]["state"]["data"]), np.uint8) \
+        .reshape(g["shape"])
+    ox, oy = g["origin_m"]
+    rows, cols = np.nonzero(st == 2)
+    xy = np.c_[ox + (cols + 0.5) * 0.05, oy + (rows + 0.5) * 0.05]
+    cams = np.array([np.asarray(f["T_map_cam"])[:2, 3]
+                     for f in c.get(f"/api/maps/{name}/frames", "Frames")["frames"]])
+    d = np.linalg.norm(xy[:, None, :] - cams[None], axis=2).min(1) if len(xy) else np.zeros(0)
+    return int((d < 0.5).sum())
+
+
+@pytest.mark.parametrize("depth", [True, False], ids=["sensor", "monocular"])
+def test_a_camera_seeing_its_own_feet_in_its_mask_leaves_no_trace(
+        client: Client, depth: bool) -> None:  # noqa: F811
+    """map.md §2 "Ignored pixels" (P18), prior-first engine: the feet a camera sees in its
+    ignore mask give no occupied cell near it (the reported phantom cells 0.30-0.34 m away), no
+    cloud point, no keypoint (registration or locate) and no stored depth; without the mask the
+    same feet are occupied (the control)."""
+    mask = np.zeros((240, 320), np.uint8)
+    mask[FEET_ROW:, :] = 255
+    poses = [base_pose(30.0 * k) for k in range(3)]
+    fr, files = _feet_frames(client, poses, "c", depth)
+    assert client.update("control", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    assert _near_occupied(client, "control") > 0
+    cam = {**CAM, "ignore_mask": "mask"}
+    fr, files = _feet_frames(client, poses, "m", depth)
+    job = client.update("m", fr, {**files, "mask": _png8(mask)}, cameras={"cam": cam})
+    assert job["state"] == "committed"
+    assert _near_occupied(client, "m") == 0
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    am = AnchoredMap.load(client.service.store.mapper_dir("m"))
+    for k in am.keyframes:
+        am._load_kf(k)
+        assert k.feats is not None and (k.feats.kps[:, 1] < FEET_ROW).all()
+        ign = am.ignore_of(k.id)
+        d = am.depth_of(k.id)
+        assert ign is not None and d is not None and not d[ign].any()
+    # the cloud has no point at the feet (0.32 m ahead, below the camera)
+    pts = client.get("/api/maps/m/points?min=-0.6,-0.6,0.05&max=0.6,0.6,0.45", "Points")
+    ctrl = client.get("/api/maps/control/points?min=-0.6,-0.6,0.05&max=0.6,0.6,0.45", "Points")
+    assert ctrl["xyz"]["shape"][0] > 0 and pts["xyz"]["shape"][0] == 0
+    # the locate index's keypoints avoid them too
+    feats = list((client.service.store.dir("m") / "derived" / "features").glob("*-m*.npz"))
+    assert feats and all((np.load(p)["uv"][:, 1] < FEET_ROW).all() for p in feats)
+
+
+@pytest.mark.skipif(shutil.which("colmap") is None, reason="needs Homebrew colmap")
+def test_colmap_extracts_no_keypoint_on_ignored_pixels(tmp_path: Path) -> None:
+    """The older mapper's SIFT (Homebrew colmap CLI, ``Sfm.extract``): no keypoint on a
+    keyframe's ignored pixels (``frame_masks/<name>.png``), so no match (SIFT's or LightGlue's,
+    both on those keypoints) either; a keyframe without a mask keeps them all."""
+    import pycolmap
+
+    from oh_my_slam.mapping.sfm import CameraPrior, Sfm, ignore_mask_path
+    from tests.fakes.service import textured
+
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for n in ("a.jpg", "b.jpg"):
+        (frames / n).write_bytes(textured(3, 320, 240))
+    mask = np.zeros((240, 320), np.uint8)
+    mask[:, :160] = 255
+    p = ignore_mask_path(frames, "a.jpg")
+    p.parent.mkdir()
+    p.write_bytes(_png8(mask))
+    sfm = Sfm(tmp_path / "db.db", frames, tmp_path / "work")
+    sfm.extract(["a.jpg", "b.jpg"], CameraPrior(320, 240, focal=300.0))
+    db = pycolmap.Database.open(str(tmp_path / "db.db"))
+    try:
+        ids = {im.name: im.image_id for im in db.read_all_images()}
+        a, b = (np.asarray(db.read_keypoints(ids[n])) for n in ("a.jpg", "b.jpg"))
+    finally:
+        db.close()
+    assert len(a) > 20 and (a[:, 0] >= 159.0).all()
+    assert (b[:, 0] < 159.0).sum() > 20
+    assert Sfm(tmp_path / "db2.db", frames, tmp_path / "w2")._keypoint_masks(["b.jpg"]) is None
+
+
+def test_detections_mostly_on_ignored_pixels_are_dropped() -> None:
+    """map.md §2 (P18): a detection with more than ``IGNORED_DETECTION_MAX_SHARE`` of its mask
+    on the ignored pixels gives no object and no vote; a camera whose view of an object falls
+    on its ignored pixels does not count as seeing it."""
+    from oh_my_slam.core.constants import IGNORED_DETECTION_MAX_SHARE
+    from oh_my_slam.core.images import on_grid
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.mapping import anchored_objects as ao
+    from oh_my_slam.segmentation.detect import Detection
+
+    assert IGNORED_DETECTION_MAX_SHARE == 0.5
+    ign = np.zeros((20, 30), bool)
+    ign[10:] = True
+    low = np.zeros((20, 30), bool)
+    low[12:] = True
+    half = np.zeros((20, 30), bool)
+    half[5:15] = True
+    dets = [Detection("rug", 0.9, "default", low, (0, 12, 30, 20)),
+            Detection("chair", 0.8, "default", half, (0, 5, 30, 15)),
+            Detection("box", 0.7, "default", np.zeros((4, 4), bool), (0, 0, 30, 6))]
+    assert [d.label for d in ao.unignored(dets, ign)] == ["chair", "box"]
+    assert ao.unignored(dets, None) == dets
+    assert on_grid(None, (2, 2)) is None and on_grid(np.zeros((4, 4), bool), (2, 2)) is None
+    assert on_grid(ign, (40, 60)).shape == (40, 60)  # type: ignore[union-attr]
+    K = Intrinsics(30.0, 30.0, 15.0, 10.0, 30, 20)
+    T = np.eye(4)
+    below = np.array([0.0, 0.2, 1.0])  # row 16: ignored
+    above = np.array([0.0, -0.2, 1.0])  # row 4
+    assert ao.in_view(below, T, K) and not ao.in_view(below, T, K, ign)
+    assert ao.in_view(above, T, K, ign)
+    assert ao.in_view(below, T, K, on_grid(ign, (40, 60))) is False
+
+
+def test_mapanything_depth_on_ignored_pixels_counts_for_nothing() -> None:
+    from oh_my_slam.core.types import Intrinsics
+    from oh_my_slam.mapping import register_ma as rm
+
+    ign = np.zeros((20, 30), bool)
+    ign[10:] = True
+    v = rm.MvView(np.eye(4), np.ones((10, 15), np.float32), np.eye(3))
+    K = Intrinsics(30.0, 30.0, 15.0, 10.0, 30, 20)
+    chunk = [rm.New(0, Path("a"), K, ignore=ign), rm.New(1, Path("b"), K)]
+    out = rm._without_ignored([v, v, v], 1, chunk)
+    assert out[0] is v and out[2] is v
+    assert not out[1].depth[5:].any() and out[1].depth[:5].all()

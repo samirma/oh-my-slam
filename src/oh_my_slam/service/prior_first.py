@@ -28,8 +28,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from numpy.typing import NDArray
 
-from oh_my_slam.core.images import size_at_max_side
+from oh_my_slam.core.images import on_grid, size_at_max_side
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import register_ma, sigmas, standpoint
 from oh_my_slam.mapping.anchor import Sim3
@@ -148,7 +149,7 @@ class _MaRun:
             assert fr.path is not None and fr.measures is not None
             new.append(register_ma.New(fr.work.index, fr.path, fr.cam.canonical(),
                                        fr.depth_m if _has_depth(fr) else None,
-                                       fr.measures.features))
+                                       fr.measures.features, fr.ignore))
         calls = [0]
 
         def multiview(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
@@ -323,8 +324,16 @@ def detection_grid(K: Intrinsics) -> tuple[int, int]:
     return size_at_max_side(K.width, K.height, MONO_GRID_SIDE)
 
 
-def _waiter(fut: Future[Mono]) -> Callable[[], tuple[Any, Any, Any, Any]]:
-    return lambda: fut.result().as_tuple()
+def _waiter(fut: Future[Mono], ignore: NDArray[np.bool_] | None = None
+            ) -> Callable[[], tuple[Any, Any, Any, Any]]:
+    """A frame's monocular depth when it is ready, none on its ignored pixels (map.md §2: no
+    depth point, scale evidence or scene distance from them)."""
+    def get() -> tuple[Any, Any, Any, Any]:
+        d, K, desc, up = fut.result().as_tuple()
+        m = on_grid(ignore, d.shape)
+        return (d if m is None else np.where(m, 0.0, d).astype(np.float32)), K, desc, up
+
+    return get
 
 
 def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
@@ -334,7 +343,7 @@ def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
     height, sigma = (f.height_m, f.height_sigma_m) if f.height_m is not None else (
         fr.cam.height_above_floor_m, fr.cam.height_sigma_m)
     return FrameIn(f.name, f.camera_id, fr.rgb, fr.cam.canonical(), prior, fr.depth_m, fr.ignore,
-                   height, sigma, fr.measures.features, None if mono is None else _waiter(mono),
+                   height, sigma, fr.measures.features, None if mono is None else _waiter(mono, fr.ignore),
                    check_close=fr.deferred, unconfirmed=fr.unconfirmed)
 
 

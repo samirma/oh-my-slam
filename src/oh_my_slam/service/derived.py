@@ -54,6 +54,7 @@ from numpy.typing import NDArray
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
 from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.errors import OhMySlamError
+from oh_my_slam.core.images import on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
@@ -430,8 +431,14 @@ class Derived:
                 else None
             if img is None or not img.exists():
                 continue
+            # no keypoint on its ignored pixels (map.md §2): the mask is part of the key
+            ignore = internal.ignore(f["internal"]) if internal is not None else None
+            if ignore is not None and not ignore.any():
+                ignore = None
             key = f"{f.get('sha256') or _sha_file(img)}-{relocalize.FEATURES_TAG}"
-            feat = self._features(name, key, img)
+            if ignore is not None:
+                key += "-m" + hashlib.sha256(np.packbits(ignore).tobytes()).hexdigest()[:12]
+            feat = self._features(name, key, img, ignore)
             if feat is None:
                 continue
             uv, desc, w, h = feat
@@ -509,7 +516,7 @@ class Derived:
         mm = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_UNCHANGED)
         return None if mm is None else (mm.astype(np.float32) / 1000.0)
 
-    def _features(self, name: str, key: str, img: Path
+    def _features(self, name: str, key: str, img: Path, ignore: NDArray[np.bool_] | None = None
                   ) -> tuple[NDArray[np.float32], NDArray[np.uint8], int, int] | None:
         p = self.dir(name) / "features" / f"{key}.npz"
         if p.exists():
@@ -520,7 +527,8 @@ class Derived:
         gray = cv2.imread(str(img), cv2.IMREAD_GRAYSCALE)
         if gray is None:
             return None
-        uv, desc = relocalize.extract(np.asarray(gray, np.uint8))
+        mask = on_grid(ignore, gray.shape)
+        uv, desc = relocalize.extract(np.asarray(gray, np.uint8), mask)
         buf = io.BytesIO()
         np.savez(buf, uv=uv, desc=desc, size=np.array([gray.shape[1], gray.shape[0]]))
         atomic_write_bytes(p, buf.getvalue())

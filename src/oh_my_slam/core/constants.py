@@ -37,6 +37,9 @@ REGISTRATION_MIN = 15
 FLOOR_BAND_MIN_M = 0.06
 FLOOR_BAND_SIGMAS = 3.0
 FLOOR_SIGMA_DEFAULT_M = 0.02
+# map.md §2 "Ignored pixels": a detection with more than this share of its mask (its box when it
+# has no mask) inside the ignored pixels (the camera's and the frame's ignore masks) is dropped
+IGNORED_DETECTION_MAX_SHARE = 0.5
 
 
 def floor_band_m(floor_sigma_m: float) -> float:
