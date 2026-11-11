@@ -213,7 +213,10 @@ error code `invalid_request` (§9).
   (`update.sigma_containment`, evaluation.md) are met. They are 3-D RMS (§6), and mean the same
   for every engine.
 
-* **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
+* **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
+  dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
+  its measured, committed and difference angles, so a client can see which pairs drove
+  `rotation_inconsistent` (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
   waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
   single worker (inference.md). Documented limit: on maps built by the MapAnything engine, the
