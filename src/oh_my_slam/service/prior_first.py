@@ -37,10 +37,11 @@ from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import (
     TOO_CLOSE_M,
     AnchoredMap,
+    Features,
     FrameIn,
     Keyframe,
     Placement,
-    features,
+    job_features,
     natural_key,
     pose_residual,
     rot_deg,
@@ -92,22 +93,26 @@ def _trusted(fr: _Frame) -> bool:
 
 
 def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
-                   progress: Callable[[str], None], pairs: standpoint.Pairs | None = None
+                   progress: Callable[[str], None], pairs: standpoint.Pairs | None = None,
+                   feats: dict[int, Features] | None = None
                    ) -> tuple[list[Placement], float, float]:
     """The camera-only frames by MapAnything (``register_ma``) against the map's confirmed
     keyframes, each registered one added as a keyframe; its depth scale is the map's, and its
     camera height feeds the map's depth scale (``ScaleState``) as a monocular keyframe's does.
     Order-independent (map.md §2): the frames go in canonical order (name, camera), and the ones
     no reference confirmed (``no_overlap``) are tried again against what the others added, until
-    a pass registers nothing. Returns the placements (frames' order) and the registration and
-    fusion seconds."""
+    a pass registers nothing. ``feats``: the frames' features by request index, the job's
+    static content left out (``job_features``). Returns the placements
+    (frames' order) and the registration and fusion seconds."""
     got: dict[int, Placement] = {}
     reg_s = fuse_s = 0.0
     pairs = pairs or standpoint.Pairs()
+    feats = dict(feats or {})
     todo = sorted(frames, key=lambda fr: (natural_key(fr.work.name), fr.work.index))
     passes = itertools.count()
     while True:
-        r, f_s = _register_none_pass(up, am, todo, workdir / f"ma{next(passes)}", pairs, got)
+        r, f_s = _register_none_pass(up, am, todo, workdir / f"ma{next(passes)}", pairs, got,
+                                     feats)
         reg_s, fuse_s = reg_s + r, fuse_s + f_s
         again = [fr for fr in todo if got[fr.work.index].reason == "no_overlap"]
         if len(again) == len(todo) or not again:
@@ -120,7 +125,8 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
 
 
 def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
-                        pairs: standpoint.Pairs, got: dict[int, Placement]) -> tuple[float, float]:
+                        pairs: standpoint.Pairs, got: dict[int, Placement],
+                        feats: dict[int, Features]) -> tuple[float, float]:
     """One pass of ``_register_none`` over ``frames``, their placements into ``got``."""
     t = time.perf_counter()
     am.save()  # this update's keyframes get their image and depth on disk: anchors
@@ -144,11 +150,9 @@ def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], work
         return up.backend.geometry_views(images, Ks, poses, workdir / f"mv{calls[0]}")
 
     res = register_ma.Registration(multiview, new, stored).run()
-    # frames of one standpoint: a pure rotation about its centre (map.md §1)
-    feats = {}
-    for fr in frames:
-        assert fr.rgb is not None
-        feats[fr.work.index] = features(fr.rgb, fr.ignore)
+    # frames of one standpoint: a pure rotation about its centre (map.md §1). MapAnything
+    # matches its views internally (no features of ours reach it): the static image content is
+    # left out of the features the service matches, those of standpoints and duplicates
     turned = standpoint.standpoints(
         am, [standpoint.NewFrame(fr.work.name, fr.cam.canonical(), fr.work.index, _has_depth(fr),
                                  p.T, feats[fr.work.index]) for fr in frames
@@ -159,7 +163,9 @@ def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], work
     for fr in frames:
         p = res.placements[fr.work.index]
         scene = fr.scene_m if fr.scene_m is not None else p.scene_m
-        if too_close(scene, p.inliers):
+        # MapAnything gives no image feature inliers: depth agreement never counts toward the
+        # 300-inlier exemption (api.md §4, depth never overrides too_close)
+        if too_close(scene, 0):
             got[fr.work.index] = Placement(fr.work.name, "rejected", "too_close",
                                            inliers=p.inliers, scene_m=scene)
             continue
@@ -169,7 +175,7 @@ def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], work
         assert p.T is not None and p.depth is not None and p.K_depth is not None
         T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
             p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
-        dup = am.duplicate_of(fr.work.camera_id, T, feats[fr.work.index])
+        dup = am.duplicate_of(fr.work.camera_id, T, feats[fr.work.index], fr.work.name)
         if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
             got[fr.work.index] = Placement(fr.work.name, "rejected", "duplicate",
                                            inliers=p.inliers, duplicate_of=dup)
@@ -198,6 +204,56 @@ def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], work
         am.add(f, feats[fr.work.index], pl, depth, Kg, kind, None)
         got[fr.work.index] = pl
     return reg_s, time.perf_counter() - t
+
+
+def _canonical(fr: _Frame) -> tuple[Any, ...]:
+    """A frame's canonical order (map.md §2): its name in natural order, its camera."""
+    return natural_key(fr.work.name), fr.work.camera_id, fr.work.index
+
+
+def _late(up: Updater, am: AnchoredMap, geo: list[_Frame], ins: list[FrameIn],
+          late: list[_Frame], feats: dict[int, Features], placements: dict[int, Placement],
+          stored: list[Keyframe], workdir: Path, progress: Callable[[str], None],
+          pairs: standpoint.Pairs) -> tuple[float, float]:
+    """The frames without a prior by MapAnything after the others (``_register_none``), then
+    one match graph over both engines (map.md §2: the same fixed point whatever the request
+    order): the job's frames with a prior still kept for want of an image pose are placed
+    again against the frames MapAnything registered (``AnchoredMap.retry_kept``), and the
+    frames MapAnything left unplaced are tried again against those, until neither adds a
+    frame. The stored kept keyframes the new frames overlap are re-registered (map.md §2).
+    Returns the registration and fusion seconds."""
+    reg_s = fuse_s = 0.0
+    todo, new = list(late), []
+    rounds = itertools.count()
+    while todo:
+        n = next(rounds)
+        d = workdir if not n else workdir / f"late{n}"
+        d.mkdir(parents=True, exist_ok=True)
+        lp, r, fu = _register_none(up, am, todo, d, progress, pairs, feats)
+        reg_s, fuse_s = reg_s + r, fuse_s + fu
+        added = []
+        for fr, pl in zip(todo, lp, strict=True):
+            placements[fr.work.index] = pl
+            k = None if pl.keyframe is None else am.keyframe(pl.keyframe)
+            if pl.status == "registered" and k is not None:
+                added.append(k)
+        new += added
+        t = time.perf_counter()
+        kept = [(f, k) for fr, f in zip(geo, ins, strict=True)
+                for pl in [placements[fr.work.index]]
+                if pl.status == "kept_at_prior" and pl.keyframe is not None
+                for k in [am.keyframe(pl.keyframe)] if k is not None]
+        again = am.retry_kept(kept, added) if added else {}
+        placements.update({fr.work.index: again[fr.work.name] for fr in geo
+                           if fr.work.name in again})
+        new += [k for got in again.values() for k in [am.keyframe(got.keyframe or "")]
+                if k is not None]
+        reg_s += time.perf_counter() - t
+        if not any(p.status == "registered" for p in again.values()):
+            break
+        todo = [fr for fr in late if placements[fr.work.index].reason == "no_overlap"]
+    am.reregistered += am.reregister([k for k in stored if not k.usable()], new)
+    return reg_s, fuse_s
 
 
 def frame_class(fr: _Frame) -> str:
@@ -339,13 +395,14 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         else:
             mapper.mkdir(parents=True, exist_ok=True)
             am = AnchoredMap(mapper)
+        am.begin_job()
         tm["clone"] = round(time.perf_counter() - t, 3)
         pool = ThreadPoolExecutor(INFERENCE_IN_FLIGHT)
         # a new map's origin frame (its first with a prior, else its first) also gives
         # gravity: the angle to its prior's up axis, or the camera-only map's up
         origin = None
-        if prev is None:
-            origin = next((fr for fr in todo if _trusted(fr)), todo[0])
+        if prev is None:  # in canonical name order (map.md §1, §2)
+            origin = min([fr for fr in todo if _trusted(fr)] or todo, key=_canonical)
         # frames without a prior go to MapAnything after the others, but a new camera-only
         # map's origin is the prior-first engine's
         late = [fr for fr in todo if not _trusted(fr) and fr is not origin] \
@@ -358,6 +415,10 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 assert fr.path is not None
                 fut = pool.submit(up.backend.infer, fr.path, fr.cam.canonical(), fr is origin)
             ins.append(_frame_in(fr, fut))
+        # the job's static image content, over every frame whichever engine registers it
+        late_ins = [_frame_in(fr, None) for fr in late]
+        late_feats = dict(zip([fr.work.index for fr in late], job_features(ins + late_ins)[len(ins):],
+                              strict=True)) if late else {}
         # the detections queue behind the monocular depth registration waits for
         dets = {fr.work.index: pool.submit(up.backend.detect, fr.path,
                                            detection_grid(fr.cam.canonical()))
@@ -366,13 +427,13 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
 
         def progress(msg: str) -> None:
             done[0] += 1
-            job.progress = round(0.1 + 0.8 * done[0] / len(todo), 3)
+            job.progress = round(0.1 + 0.8 * min(1.0, done[0] / len(todo)), 3)
             changed()
 
         # a frame without a prior registered by the prior-first engine joins a standpoint
         am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
         try:
-            pls = am.update(ins, progress) if ins else []
+            pls = am.update(ins, progress, static=not late) if ins else []
             reg_s, fuse_s = am.timings.get("register", 0.0), am.timings.get("fuse", 0.0)
             for fr, pl in zip(geo, pls, strict=True):
                 placements[fr.work.index] = pl
@@ -380,17 +441,11 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
             fused = {"geo": fuse_s, "late": 0.0}  # each engine's fusion seconds
             if late:  # their scene distance is MapAnything's depth (``register_ma``)
-                lp, r, fu = _register_none(up, am, late, workdir, progress, pairs)
+                r, fu = _late(up, am, geo, ins, late, late_feats, placements, stored, workdir,
+                              progress, pairs)
                 up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
                 reg_s, fuse_s = reg_s + r, fuse_s + fu
                 fused["late"] = fu
-                for fr, pl in zip(late, lp, strict=True):
-                    placements[fr.work.index] = pl
-                # the stored kept keyframes these frames overlap too (map.md §2)
-                news = [am.keyframe(pl.keyframe) for pl in lp
-                        if pl.status == "registered" and pl.keyframe is not None]
-                am.reregistered += am.reregister([k for k in stored if not k.usable()],
-                                                 [k for k in news if k is not None])
             if not any(_trusted(fr) for fr in frames):
                 # an update without priors: committed relative rotations against the images'
                 # (map.md §4 rotation_inconsistent; registered frames only)
@@ -401,7 +456,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             version = (prev["version"] + 1) if prev else 1
             again = []  # the re-registered keyframes' objects: their stored image's detections
             for e in am.reregistered:  # confirmed from their stored image: it exists
-                if e.get("content"):  # the too-close exception: its detections are in already
+                if e.get("objects"):  # the too-close exception: its detections are in already
                     continue
                 kf, path = am.keyframe(e["keyframe"]), am.image_path(e["keyframe"])
                 assert kf is not None and path is not None

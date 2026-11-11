@@ -206,8 +206,6 @@ def test_measures_tell_texture_blur_and_features() -> None:
     assert checks.reason(m, 0.1) == "too_close"
     few = checks.Measures(5, 0.2, 0.3)
     assert checks.reason(few, None) == "few_features"
-    assert checks.unregistered_reason(few) == "few_features"
-    assert checks.unregistered_reason(m) == "no_overlap"
 
 
 def test_ignored_pixels_take_no_part() -> None:

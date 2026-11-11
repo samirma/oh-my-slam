@@ -333,7 +333,8 @@ def test_each_input_has_a_status_and_a_reason(client: Client) -> None:
     files["blur"] = enc.tobytes()
     frames.append({"name": "blur", "image": "blur", "camera_id": "cam"})
     files["dup"] = files["img0"]
-    frames.append({"name": "dup", "image": "dup", "camera_id": "cam"})
+    # after f0_0 in canonical name order: the pose duplicate's later frame (api.md §4)
+    frames.append({"name": "zdup", "image": "dup", "camera_id": "cam"})
     client.backend.stats = {"observations": 120.0, "reproj_error": 0.6}  # below 300 inliers
     job = client.update("m", frames, files, {"cam": CAMERA})
     reasons = {i["name"]: (i["status"], i["reason"]) for i in job["inputs"]}
@@ -344,7 +345,7 @@ def test_each_input_has_a_status_and_a_reason(client: Client) -> None:
     assert near_in["min_distance_m"] == 0.3 and near_in["scene_distance_m"] == 0.15
     assert reasons["lost"] == ("rejected", "no_overlap")
     assert reasons["blur"] == ("rejected", "blur")
-    assert reasons["dup"] == ("rejected", "duplicate")
+    assert reasons["zdup"] == ("rejected", "duplicate")
     lost_in = next(i for i in job["inputs"] if i["name"] == "lost")
     assert lost_in["T_map_cam"] is None and lost_in["inliers"] == 0
     assert lost_in["prior_residual_m"] is None

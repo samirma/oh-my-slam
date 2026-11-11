@@ -327,9 +327,11 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
         q.prior = np.asarray(p["T_map_cam"], np.float64)
         # its own sigmas, else its trust's defaults (api.md §3)
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
+    # z_expected (api.md §6): the floor plus the frame's height above it, else its camera's
+    # registered one; height_sigma the frame's own when it carries one, else its camera's
     h = fr.height_m if fr.height_m is not None else cam.height_above_floor_m
     if h is not None:
-        sig = fr.height_sigma_m if fr.height_m is not None else cam.height_sigma_m
+        sig = fr.height_sigma_m if fr.height_sigma_m is not None else cam.height_sigma_m
         q.camera_z = floor_z + float(h)
         q.camera_z_sigma = float(sig if sig is not None else relocalize.DEFAULT_HEIGHT_SIGMA_M)
         q.height_scale = height_scale

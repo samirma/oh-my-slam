@@ -102,9 +102,3 @@ def reason(m: Measures, depth_median_m: float | None) -> str | None:
     if m.features < FEW_FEATURES:
         return "few_features"
     return None
-
-
-def unregistered_reason(m: Measures) -> str:
-    """Why a frame the mapper did not register was rejected: ``few_features`` when it has few,
-    else ``no_overlap`` (no verified link to the map)."""
-    return "few_features" if m.features < SUSPECT_FEATURES else "no_overlap"

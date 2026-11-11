@@ -335,13 +335,15 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
-    # no features at all, no depth image: kept at its prior
+    # no features at all, no depth image, the checks not run (no ``unconfirmed``): kept at its
+    # prior, no_overlap (api.md §4: in updates few_features is only the checks' verdict)
     p0 = m.update([frame("blank", base_pose(10), rgb=blank, depth=False, mono=1.0)])[0]
-    assert (p0.status, p0.reason, p0.method) == ("kept_at_prior", "few_features", "prior")
+    assert (p0.status, p0.reason, p0.method) == ("kept_at_prior", "no_overlap", "prior")
+    assert p0.detail == "no_image_pose"
     assert p0.prior_residual is not None and p0.prior_residual[1] < 1e-3
     # with its depth image: no edge of the match graph, its depth confirms nothing (map.md §2)
     pd = m.update([frame("blankd", base_pose(15), rgb=blank)])[0]
-    assert (pd.status, pd.reason, pd.detail) == ("kept_at_prior", "few_features", None)
+    assert (pd.status, pd.reason, pd.detail) == ("kept_at_prior", "no_overlap", "no_image_pose")
     # its prior points away from anything mapped: kept at its prior
     p1 = m.update([frame("away", base_pose(180))])[0]
     assert (p1.status, p1.reason) == ("kept_at_prior", "no_overlap")
@@ -554,7 +556,7 @@ def test_rejection_of_unmatched_prior_free_frames_with_few_features(tmp_path: Pa
     m.update([frame("a0", base_pose(0))])
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     p = m.update([frame("x", base_pose(0), p=None, rgb=blank)])[0]
-    assert (p.status, p.reason) == ("rejected", "few_features")
+    assert (p.status, p.reason) == ("rejected", "no_overlap")  # few_features: the checks' only
 
 
 def test_progress_and_timings(tmp_path: Path) -> None:
@@ -820,7 +822,7 @@ def test_an_unconfirmed_frame_is_stored_not_fused(tmp_path: Path,
     T = base_pose(10)
     n = len(m.cloud.keys)
     p = m.update([frame("same", T, p=prior(T), rgb=blank)])[0]
-    assert (p.status, p.reason) == ("kept_at_prior", "few_features")
+    assert (p.status, p.reason) == ("kept_at_prior", "no_overlap")
     assert m.keyframes[-1].depth_kind == "sensor" and len(m.cloud.keys) == n
     p = m.update([frame("m", T, p=prior(T), rgb=blank, depth=False, mono=1.4)])[0]
     assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "mono"

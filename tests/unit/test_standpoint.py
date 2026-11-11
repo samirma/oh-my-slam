@@ -98,9 +98,13 @@ def test_two_view_and_group_edges(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sp, "rotation_ransac", lambda *x, **k: None)
     assert sp.two_view(a, b) is None  # no rotation fit
     monkeypatch.undo()
-    # request-order neighbours always measured, even beyond the nearest k
-    far = [view(f"v{i}", look(25 * i, C0, -10), i) for i in range(3)]
-    assert 1 in sp.neighbours(far, 0, k=0) and sp.neighbours(far, 0, k=0) == [1]
+    # every view that can share a view is a neighbour, in canonical name order whatever the
+    # request order; one facing away (axes 180 deg apart) or too far is not
+    far = [view(f"v{i}", look(5 * i, C0, -10), i) for i in (2, 10, 1)]
+    far.append(view("w", look(180, C0, -10)))
+    far.append(view("x", look(0, (9.0, 0.0, 0.5), -10)))
+    assert sp.neighbours(far, 0) == [2, 1]  # v1 before v10
+    assert sp.neighbours(list(reversed(far)), 4) == [2, 3]  # the same views, by name
     # a new frame reached only through a stored keyframe that is not the group's root
     s1 = view("s1", A, stored=True)
     s2 = view("s2", look(0, C0, -10), stored=True)
@@ -111,9 +115,9 @@ def test_two_view_and_group_edges(monkeypatch: pytest.MonkeyPatch) -> None:
     got = sp.groups([s1, s2, n], pairs)
     assert set(got) == {"n"}
     pairs2 = sp.Pairs()
-    pairs2.fits[("n", "s1")] = sp.TwoView(np.eye(3), 0.0, 10, 0.5, 0.01)
-    pairs2.fits[("n", "s2")] = sp.TwoView(np.eye(3), 0.0, 100, 0.5, 0.01)
-    pairs2.fits[("m", "s1")] = sp.TwoView(np.eye(3), 0.0, 50, 0.5, 0.01)
+    pairs2.fits[("n", "s1")] = sp.TwoView(np.eye(3), 0.0, 100, 0.5, 0.01)
+    pairs2.fits[("n", "s2")] = sp.TwoView(np.eye(3), 0.0, 300, 0.5, 0.01)
+    pairs2.fits[("m", "s1")] = sp.TwoView(np.eye(3), 0.0, 150, 0.5, 0.01)
     pairs2.fits[("m", "s2")] = None
     pairs2.fits[("m", "n")] = None
     pairs2.fits[("n", "m")] = None

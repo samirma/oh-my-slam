@@ -204,7 +204,8 @@ def test_registration_edges(tmp_path: Path) -> None:
     # no stored depth: MapAnything's metres, its own depths of the call as references
     assert res.notes["calls"][0]["scale_source"] == "mapanything"
     assert res.placements[0].status == "registered"
-    assert (res.placements[1].status, res.placements[1].reason) == ("rejected", "few_features")
+    # few_features is only the checks' verdict (api.md §4): unplaced, no_overlap
+    assert (res.placements[1].status, res.placements[1].reason) == ("rejected", "no_overlap")
     assert res.calls == 1 and res.views == 4
 
     def down(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:

@@ -1341,8 +1341,9 @@ def fuse_objects(am: AnchoredMap,
     (``again``, their stored image's detections): struck objects carved from the cloud, then
     the surfaces, the relations and each object's votes over the confirmed keyframes that see
     it. A frame kept at its prior gives no object (map.md §2), but for the too-close exception
-    (``Keyframe.contributes``: kept only for too_close, a metric prior, a depth image; api.md
-    §4), whose detections count at its prior pose and which counts as confirmed in the votes.
+    (``Keyframe.detects``: kept only for too_close, with a metric prior; api.md §4), whose
+    detections count at its prior pose (on its depth image, else its monocular depth) and which
+    counts as confirmed in the votes.
     ``closer`` looks closer at a keyframe looking down at its support
     (``segmentation.api.raised_regions``; the backend's ``look_closer``). Returns the objects and how many are listed."""
     om = ObjectMap.load(am.root)
@@ -1351,7 +1352,7 @@ def fuse_objects(am: AnchoredMap,
                      Future[list[Detection]]]] = []
     for pl, own_ignore, path, fut in frames:
         kf = by_id.get(pl.keyframe or "")
-        if kf is None or not kf.contributes() or kf.grid is None or kf.K_grid is None:
+        if kf is None or not kf.detects() or kf.grid is None or kf.K_grid is None:
             continue
         todo.append((kf, kf.grid, own_ignore, path, fut))
     # a re-registered keyframe has its stored image (``AnchoredMap.reregister`` set ``rgb``)
@@ -1387,5 +1388,5 @@ def fuse_objects(am: AnchoredMap,
     top = max((float(k.centre[2]) for k in confirmed), default=None)
     om.finish(am.cloud.points(), top, version,
               np.array([k.centre for k in confirmed]).reshape(-1, 3), floor,
-              [(k.id, k.T, k.K) for k in am.keyframes if k.contributes()])
+              [(k.id, k.T, k.K) for k in am.keyframes if k.detects()])
     return om, len(om.records()["objects"])

@@ -29,10 +29,11 @@ MapAnything's, scaled) agrees with the map there: at least ``MIN_OVERLAP`` of it
 reference view's depth and ``MIN_AGREEMENT`` of those agree within ``DEPTH_TOL``
 (``mapping.anchored.agreement``) (``CALL_DEPTH_TOL``
 between MapAnything's own depths of one call). The references are the anchors and the frames this
-update already registered. A frame no reference confirms is rejected (``no_overlap``, or
-``few_features`` with fewer than 150 features). Each placement carries the frame's median scene
-depth (``Placement.scene_m``): the caller applies the distance limit, which a frame with enough
-inliers escapes (api.md §4)."""
+update already registered. A frame no reference confirms is rejected ``no_overlap`` (in updates
+``few_features`` is only the checks' verdict, api.md §4). Each placement carries the frame's
+median scene depth (``Placement.scene_m``): the caller applies the distance limit. MapAnything
+gives no image feature inliers, so ``inliers`` (agreeing depth points) never counts toward its
+300-inlier exemption (api.md §4: depth never overrides ``too_close``)."""
 
 from __future__ import annotations
 
@@ -331,10 +332,9 @@ class Registration:
                 call.append(Ref(T, ma_depth, Kma))
                 del cand[idx]
                 changed = True
-        for idx, (f, *_rest) in cand.items():
-            self.placements[idx] = Placement(
-                "rejected", "few_features" if f.features < FEW_FEATURES else "no_overlap",
-                scene_m=self.scenes.get(idx))
+        for idx in cand:  # few_features is only the checks' verdict (api.md §4)
+            self.placements[idx] = Placement("rejected", "no_overlap",
+                                             scene_m=self.scenes.get(idx))
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
                   Kd: Array, inliers: int) -> None:

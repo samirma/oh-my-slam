@@ -14,8 +14,14 @@ relative rotation is the epipolar fit's (unbiased whether the camera moved or no
 rotation-only fit's only for a translation-unconstrained pair whose epipolar rotation leaves it by
 more than ``EPIPOLAR_AGREE_DEG`` (a degenerate essential matrix), independent of any joint solve.
 
+**Measurable pair** (``TwoView.measurable``, map.md §1): at least ``CHECK_MIN_INLIERS`` epipolar
+inliers and an overlap of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use
+it. The pairs fitted are every pair of views that can share a view (``close``: centres within
+``PAIR_MAX_DIST_M``, optical axes within ``PAIR_MAX_ANGLE_DEG``, the registration candidates'
+rule), with no count cap and in canonical name order: they do not depend on the request order.
+
 **Standpoint groups** (``groups``). Frames without priors whose pairwise parallax is below
-``PARALLAX_MAX_PX`` (pairs overlapping by at least ``VIEW_SHARE``) form one standpoint:
+``PARALLAX_MAX_PX`` over measurable pairs form one standpoint:
 connected through such pairs. A group is registered as a pure rotation about a common centre:
 the position of the overlapped stored image-confirmed keyframe with the most pair inliers with
 the group (ties: the lowest keyframe id; stored keyframes never move), else the mean of its
@@ -24,11 +30,10 @@ engine's image-only rotation: a two-view rotation of a small baseline absorbs th
 robot turning with its camera ahead of its axis: 1.5-2 deg per pair on the test room, adding up
 along a chain), the engine's multi-view or lifted-point rotation does not. Its rotation sigma is
 the noise of its path along the strongest pairs (a maximum spanning tree by inliers) from that
-stored keyframe, else the group's first frame in request order.
+stored keyframe, else the group's first frame in canonical name order.
 
-**Rotation consistency** (``consistency``). Over the pairs of overlapping neighbours (view share
-at least ``VIEW_SHARE``) among the update's registered frames and the confirmed keyframes they
-are measured against, each with at least ``CHECK_MIN_INLIERS`` epipolar inliers: the angle
+**Rotation consistency** (``consistency``). Over the measurable pairs among the update's
+registered frames and the confirmed keyframes they can share a view with: the angle
 between their committed relative rotation and the pair's image-measured one; the hard limit ``rotation_inconsistent`` fails when the median exceeds
 ``MEDIAN_MAX_DEG`` or any pair ``PAIR_MAX_DEG``. No measurable pair passes."""
 
@@ -46,7 +51,11 @@ from numpy.typing import NDArray
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchored import (
+    CANDIDATE_MAX_ANGLE_DEG,
+    CANDIDATE_MAX_DIST_M,
     EPIPOLAR_MIN_MATCHES,
+    MEASURABLE_INLIERS,
+    MEASURABLE_OVERLAP,
     AnchoredMap,
     Features,
     FrameIn,
@@ -55,6 +64,7 @@ from oh_my_slam.mapping.anchored import (
     cell_share,
     epipolar,
     kabsch,
+    natural_key,
     pose,
     rot_deg,
     rotation_ransac,
@@ -64,17 +74,21 @@ from oh_my_slam.mapping.anchored import (
 Array = NDArray[np.float64]
 
 PARALLAX_MAX_PX = 1.0  # map.md §1: a pair below this two-view parallax (px) is one standpoint
-VIEW_SHARE = 0.10  # map.md §4: overlapping neighbours overlap by at least this
+VIEW_SHARE = MEASURABLE_OVERLAP  # map.md §1 "Measurable pair": an overlap of at least this
 MEDIAN_MAX_DEG = 3.0  # rotation_inconsistent: the pairs' median disagreement above this...
 PAIR_MAX_DEG = 10.0  # ... or one pair's above this
 MIN_MATCHES = EPIPOLAR_MIN_MATCHES  # a pair with fewer epipolar inliers is not measured
-# the rotation check measures a pair only on this many epipolar inliers: a weakly overlapping
-# pair's two-view rotation is off by 4-8 deg on 50 inliers (test room), which no committed map
-# could meet within the 10 deg pair limit
-CHECK_MIN_INLIERS = 100
+# a measurable pair (map.md §1) has this many epipolar inliers: a weakly overlapping pair's
+# two-view rotation is off by 4-8 deg on 50 inliers (test room), which no committed map could
+# meet within the 10 deg pair limit
+CHECK_MIN_INLIERS = MEASURABLE_INLIERS
 EPIPOLAR_AGREE_DEG = 2.0  # a pair's epipolar rotation this near its rotation fit's is taken
 SIN_MIN = 0.3  # a ray this near the baseline direction has its parallax scaled by at most 1/this
-NEIGHBOURS = 6  # each frame is measured against this many nearest frames (by committed pose)
+# the pairs measured (``close``): committed centres at most this far apart and optical axes at
+# most this far apart, the registration candidates' rule (``anchored``): views further apart share
+# no view. No count cap: every such pair is fitted (each once, ``Pairs``)
+PAIR_MAX_DIST_M = CANDIDATE_MAX_DIST_M
+PAIR_MAX_ANGLE_DEG = CANDIDATE_MAX_ANGLE_DEG
 
 
 @dataclass
@@ -107,8 +121,14 @@ class TwoView:
         return self.parallax < PARALLAX_MAX_PX
 
     @property
+    def measurable(self) -> bool:
+        """A measurable pair (map.md §1): ``CHECK_MIN_INLIERS`` epipolar inliers and an overlap
+        of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use it."""
+        return self.inliers >= CHECK_MIN_INLIERS and self.share >= VIEW_SHARE
+
+    @property
     def standpoint(self) -> bool:
-        return self.unconstrained and self.share >= VIEW_SHARE
+        return self.unconstrained and self.measurable
 
 
 def two_view(a: View, b: View) -> TwoView | None:
@@ -163,22 +183,20 @@ class Pairs:
         return self.fits[key]
 
 
-def neighbours(views: Sequence[View], i: int, k: int = NEIGHBOURS) -> list[int]:
-    """The ``k`` views nearest view ``i`` by centre distance (0.5 m) plus optical-axis angle
-    (30°), and its neighbours in request order."""
+def close(Ra: Array, ca: Array, Rb: Array, cb: Array) -> bool:
+    """Whether two poses (rotation, centre) can share a view: centres within
+    ``PAIR_MAX_DIST_M``, optical axes within ``PAIR_MAX_ANGLE_DEG``."""
+    cos = float(np.clip(Ra[:, 2] @ Rb[:, 2], -1.0, 1.0))
+    return float(np.linalg.norm(cb - ca)) <= PAIR_MAX_DIST_M \
+        and math.degrees(math.acos(cos)) <= PAIR_MAX_ANGLE_DEG
+
+
+def neighbours(views: Sequence[View], i: int) -> list[int]:
+    """Every other view that view ``i`` can share a view with (``close``), in canonical name
+    order: the pairs do not depend on the request order (map.md §2)."""
     v = views[i]
-    score = []
-    for j, w in enumerate(views):
-        if j == i:
-            continue
-        d = float(np.linalg.norm(w.c - v.c))
-        a = rot_deg(v.R.T @ w.R)
-        score.append((d / 0.5 + a / 30.0, j))
-    near = [j for _, j in sorted(score)[:k]]
-    for j, w in enumerate(views):
-        if not w.stored and not v.stored and abs(w.order - v.order) == 1 and j not in near:
-            near.append(j)
-    return near
+    near = [j for j, w in enumerate(views) if j != i and close(v.R, v.c, w.R, w.c)]
+    return sorted(near, key=lambda j: (natural_key(views[j].name), views[j].stored))
 
 
 @dataclass
@@ -225,7 +243,7 @@ def groups(views: Sequence[View], pairs: Pairs, ref_sigma_rot_deg: float = 0.0
         # lowest keyframe id (map.md §1): its centre
         strength = {i: sum(e[2] for e in edges if i in (e[0], e[1])) for i in stored}
         root = min(stored, key=lambda i: (-strength[i], views[i].kid, views[i].name)) \
-            if stored else min(new, key=lambda i: views[i].order)
+            if stored else min(new, key=lambda i: natural_key(views[i].name))
         centre = views[root].c if stored else np.mean([views[i].c for i in new], axis=0)
         spread = math.sqrt(float(np.mean([np.sum((views[i].c - centre) ** 2) for i in new])))
         # rotations along a maximum spanning tree of the group's standpoint pairs
@@ -269,7 +287,7 @@ def consistency(views: Sequence[View], pairs: Pairs) -> tuple[float | None, floa
                 continue
             seen.add(key)
             tv = pairs.get(v, w)
-            if tv is None or tv.share < VIEW_SHARE or tv.inliers < CHECK_MIN_INLIERS:
+            if tv is None or not tv.measurable:
                 continue
             committed = v.R.T @ w.R
             dis.append(rot_deg(committed.T @ tv.R_ab))
@@ -290,19 +308,13 @@ def inconsistent(median_deg: float | None, max_deg: float | None) -> bool:
 
 def stored_views(am: AnchoredMap, near: list[tuple[Any, Any]], exclude: list[Keyframe] | None = None
                  ) -> list[View]:
-    """The map's image-confirmed keyframes (but ``exclude``) as views: those among the
-    ``NEIGHBOURS`` nearest (by centre and optical axis) of each pose of ``near`` ((R, centre)
-    pairs), with their features."""
+    """The map's image-confirmed keyframes (but ``exclude``) as views: those that can share a
+    view (``close``) with a pose of ``near`` ((R, centre) pairs), with their features."""
     conf = [k for k in am.confirmed() if all(k is not n for n in exclude or [])]
-    chosen: dict[str, Keyframe] = {}
-    for R, c in near:
-        score = sorted((float(np.linalg.norm(k.centre - c)) / 0.5
-                        + rot_deg(R.T @ k.T[:3, :3]) / 30.0, i)
-                       for i, k in enumerate(conf))
-        for _, i in score[:NEIGHBOURS]:
-            chosen[conf[i].id] = conf[i]
     out = []
-    for k in chosen.values():
+    for k in conf:
+        if not any(close(R, c, k.T[:3, :3], k.centre) for R, c in near):
+            continue
         am._load_kf(k)
         if k.feats is not None and len(k.feats.kps):
             out.append(View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), True,
@@ -387,11 +399,6 @@ def rotation_check(am: AnchoredMap, placed: list[Placement], pairs: Pairs) -> bo
 def views_inconsistent(new: list[View], stored: list[View]) -> bool:
     """The hard limit ``rotation_inconsistent`` (map.md §4) for an engine that hands its
     committed poses as views (the older mapper): the new views against each other and the
-    stored ones among the ``NEIGHBOURS`` nearest of each."""
-    near: dict[str, View] = {}
-    for v in new:
-        score = sorted((float(np.linalg.norm(w.c - v.c)) / 0.5 + rot_deg(v.R.T @ w.R) / 30.0, i)
-                       for i, w in enumerate(stored))
-        for _, i in score[:NEIGHBOURS]:
-            near[stored[i].name] = stored[i]
-    return inconsistent(*consistency([*near.values(), *new], Pairs()))
+    stored ones that can share a view with one of them (``close``)."""
+    near = [w for w in stored if any(close(v.R, v.c, w.R, w.c) for v in new)]
+    return inconsistent(*consistency([*near, *new], Pairs()))

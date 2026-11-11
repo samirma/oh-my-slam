@@ -1,0 +1,521 @@
+"""oms/2.2 P11-P12 (round 6): the MapAnything path's distance limit and match graph, the
+re-registration rules (distance limit, eligibility, height gate), the drift support rule, the
+seeded component's sigmas, static content on textured frames, the measurable pairs of the
+rotation check and standpoint groups, the too-close exception without a depth image, and the
+older mapper's drift and kept-only updates."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+
+from oh_my_slam.mapping import anchored as an
+from oh_my_slam.mapping import register_ma
+from oh_my_slam.mapping.anchored import AnchoredMap
+from oh_my_slam.service import prior_first
+from tests.synth.room import base_pose
+from tests.unit.test_anchored import K, frame, new_map, prior, shot
+from tests.unit.test_service_api import Client
+from tests.unit.test_service_api import client as old  # noqa: F401
+from tests.unit.test_service_prior_first import CAM, frames_for
+from tests.unit.test_service_prior_first import client as _client  # noqa: F401
+
+
+@pytest.fixture
+def ma(_client: Client, monkeypatch: pytest.MonkeyPatch) -> Iterator[Client]:  # noqa: F811
+    monkeypatch.setenv(prior_first.NONE_ENGINE_ENV, "mapanything")
+    yield _client
+
+
+def ma_frames(c: Client, poses: list[np.ndarray], **kw: Any
+              ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+    fr, files = frames_for(c, poses, **kw)
+    for f, T in zip(fr, poses, strict=True):
+        c.backend.mv_add(files[f["image"]], T)
+    return fr, files
+
+
+def _status(job: dict[str, Any]) -> dict[str, tuple[str, str | None]]:
+    return {i["name"]: (i["status"], i["reason"]) for i in job["inputs"]}
+
+
+def _poses(job: dict[str, Any]) -> dict[str, np.ndarray]:
+    return {i["name"]: np.array(i["T_map_cam"]) for i in job["inputs"]
+            if i["T_map_cam"] is not None}
+
+
+# -- the MapAnything path ------------------------------------------------------------------------
+
+
+def test_depth_agreement_never_overrides_too_close_on_mapanything(
+        ma: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.md §4: MapAnything's agreeing depth points are no image feature inliers: a frame
+    whose depth agrees (thousands of points) but whose scene lies within 0.30 m is rejected
+    too_close."""
+    fr, files = ma_frames(ma, [base_pose(0, 0.0)], tag="a")
+    assert ma.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    run = register_ma.Registration.run
+
+    def close(self: register_ma.Registration) -> register_ma.Result:
+        res = run(self)
+        for p in res.placements.values():
+            p.scene_m = 0.2
+        return res
+
+    monkeypatch.setattr(register_ma.Registration, "run", close)
+    nf, nfiles = ma_frames(ma, [base_pose(20, 0.0)], tag="n", trust=None, depth=False)
+    job = ma.update("m", nf, nfiles)
+    assert _status(job) == {"n0": ("rejected", "too_close")}
+    assert job["inputs"][0]["scene_distance_m"] == 0.2
+
+
+def test_one_match_graph_over_both_engines(ma: Client) -> None:
+    """map.md §2: a frame with a prior that only a MapAnything frame of the same job reaches is
+    placed again once that frame registers (one fixed point over both engines), whatever the
+    request order."""
+    fr, files = ma_frames(ma, [base_pose(0, 0.0)], tag="a")
+    nf, nfiles = ma_frames(ma, [base_pose(40, 0.0)], tag="n", trust=None, depth=False)
+    pf, pfiles = ma_frames(ma, [base_pose(90, 0.0)], tag="p")
+    out = []
+    for name, order in (("m1", nf + pf), ("m2", pf + nf)):
+        assert ma.update(name, fr, files, cameras={"cam": CAM})["state"] == "committed"
+        job = ma.update(name, order, {**nfiles, **pfiles})
+        assert _status(job) == {"n0": ("registered", None), "p0": ("registered", None)}, job
+        out.append(_poses(job))
+    for n, T in out[0].items():
+        dp, dr = an.pose_residual(T, out[1][n])
+        assert dp < 0.01 and dr < 0.3
+    assert np.linalg.norm(out[0]["p0"][:3, 3] - base_pose(90, 0.0)[:3, 3]) < 0.03
+
+
+def test_mapanything_standpoints_do_not_depend_on_the_request_order(ma: Client) -> None:
+    """map.md §1, §2: a turn in place registered by MapAnything, shuffled: the same standpoint
+    (centre and statuses), the same poses."""
+    out = []
+    poses = [base_pose(25.0 * k, offset=0.0) for k in range(5)]
+    for name, order in (("s1", [0, 1, 2, 3, 4]), ("s2", [0, 3, 1, 4, 2])):
+        fr, files = ma_frames(ma, [poses[k] for k in order], tag=name, trust=None, depth=False,
+                              height_above_floor_m=0.5)
+        for f, k in zip(fr, order, strict=True):  # names in capture order whatever the order
+            f["name"] = f"t{k}"
+        job = ma.update(name, fr, files, cameras={"cam": CAM})
+        assert job["state"] == "committed", job
+        out.append(job)
+    a, b = _poses(out[0]), _poses(out[1])
+    assert _status(out[0]) == _status(out[1])
+    for n, T in a.items():
+        dp, dr = an.pose_residual(T, b[n])
+        assert dp < 0.01 and dr < 0.3, n
+
+
+# -- re-registration -----------------------------------------------------------------------------
+
+
+def test_re_registration_reapplies_the_distance_limit(tmp_path: Path,
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """map.md §2 with api.md §4: a stored frame kept too_close, overlapped by a new frame, is
+    placed again with the distance limit: under 300 image inliers it stays kept."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
+    monkeypatch.setattr(an, "TOO_CLOSE_INLIERS", 10 ** 6)
+    assert m.update([frame("c", base_pose(40))])[0].reason == "too_close"
+    m.save()
+    m = AnchoredMap.load(m.root)
+    pls = m.update([frame("b", base_pose(42), depth=False, mono=1.0)])
+    assert pls[0].status == "registered" and m.reregistered == []
+    kept = m.keyframes[1]
+    assert (kept.state, kept.reason) == ("provisional", "too_close")
+
+
+def test_re_registration_eligibility_and_the_height_gate(tmp_path: Path) -> None:
+    """map.md §2: eligibility is the coverage of the kept frame's image by a new frame's matches
+    (no pose test: a kept frame whose prior turned it away is matched all the same); the height
+    gate runs again at the re-registered pose."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    T = base_pose(20)
+    off = T.copy()
+    off[2, 3] += 0.10
+    k = frame("k", T, p=prior(off, sp=0.3, sr=2.0), depth=False, mono=1.0)
+    k.unconfirmed = "blur"
+    k.height_m, k.height_sigma_m = float(off[2, 3]), 0.005  # consistent at its prior
+    assert m.update([k])[0].status == "kept_at_prior"
+    kept = m.keyframes[-1]
+    assert kept.height_ok and (kept.height_m, kept.height_sigma_m) == (float(off[2, 3]), 0.005)
+    m.save()
+    m = AnchoredMap.load(m.root)
+    kept = m.keyframes[-1]
+    assert kept.height_m == float(off[2, 3])
+    turned = an.Keyframe("x", "x", "cam", K, base_pose(180), 0.01, 0.1, "fused", None, "none")
+    turned.feats = an.features(shot(base_pose(22))[0])
+    saved = kept.T.copy()
+    kept.T = base_pose(200)  # its prior's pose faces away: still eligible by its image
+    assert m.overlaps(kept, turned)
+    kept.T = saved
+    pls = m.update([frame("b", base_pose(25))])
+    assert pls[0].status == "registered" and [e["name"] for e in m.reregistered] == ["k"]
+    kept = m.keyframe(kept.id)
+    assert kept is not None and kept.usable() and not kept.height_ok
+    assert "k" in m.height_inconsistent and not kept.contributes() and not kept.detects()
+
+
+def test_eligibility_asks_the_registration_minimum_of_inliers() -> None:
+    """S-1 (map.md §2): an epipolar fit for eligibility needs 15 matches, not 30."""
+    a = an.features(shot(base_pose(0))[0])
+    b = an.features(shot(base_pose(10))[0])
+    ib, ia = an.match(b.desc, a.desc)
+    few_a = an.Features(a.kps[ia[:20]], a.desc[ia[:20]])
+    few_b = an.Features(b.kps[ib[:20]], b.desc[ib[:20]])
+    assert an.epipolar(few_a, K, few_b, K) is None
+    e = an.epipolar(few_a, K, few_b, K, an.MIN_INLIERS)
+    assert e is not None and len(e.ua) >= an.MIN_INLIERS
+
+
+# -- the too-close exception without a depth image -----------------------------------------------
+
+
+def test_a_too_close_frame_without_depth_image_gives_detections_only(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.md §4: kept only for too_close with a metric prior and no depth image: its detections
+    and votes count (``detects``), its depth never reaches the cloud (``contributes``)."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    monkeypatch.setattr(an, "TOO_CLOSE_M", 100.0)
+    monkeypatch.setattr(an, "TOO_CLOSE_INLIERS", 10 ** 6)
+    n = len(m.cloud.keys)
+    f = frame("c", base_pose(30), depth=False, mono=1.0)
+    f.check_close = True
+    assert (m.update([f])[0].status, m.keyframes[-1].reason) == ("kept_at_prior", "too_close")
+    kf = m.keyframes[-1]
+    assert kf.depth_kind == "mono" and kf.detects() and not kf.contributes()
+    assert len(m.cloud.keys) == n
+    d = frame("d", base_pose(50), p="drifting", depth=False, mono=1.0)
+    d.check_close = True
+    m.update([d])
+    assert not m.keyframes[-1].detects()  # a drifting prior: nothing
+
+
+# -- canonical order -----------------------------------------------------------------------------
+
+
+def test_a_map_without_priors_starts_at_its_first_frame_by_name(tmp_path: Path) -> None:
+    """map.md §1 (P11): without priors the origin is the first frame in canonical name order."""
+    m = new_map(tmp_path)
+    pls = m.update([frame("f10", base_pose(20, pitch_deg=0.0), p=None, depth=False, mono=1.0),
+                    frame("f2", base_pose(0, pitch_deg=0.0), p=None, depth=False, mono=1.0)])
+    assert pls[1].method == "origin" and pls[0].method != "origin"
+
+
+def test_a_job_duplicate_is_the_later_frame_by_name(tmp_path: Path) -> None:
+    """api.md §4 (P11): a job keyframe counts as a pose duplicate's earlier frame only when it
+    precedes the frame in canonical name order; a stored one always does."""
+    m = new_map(tmp_path)
+    m.update([frame("s", base_pose(60))])
+    m.begin_job()
+    T = base_pose(0)
+    m.keyframes.append(an.Keyframe("k9", "f10", "cam", K, T, 0.01, 0.1, "fused", None, "none"))
+    assert m.duplicate_of("cam", T, None, "f2") is None  # f10 comes after f2
+    assert m.duplicate_of("cam", T, None, "f11") == "f10"
+    assert m.duplicate_of("cam", base_pose(60), None, "a") == "s"  # stored
+    assert m.duplicate_of("cam", T) == "f10"  # without a name: every keyframe
+
+
+def test_the_drift_reference_is_the_last_frame_by_name(tmp_path: Path) -> None:
+    """map.md §2 (audit r6 item 4c): the drift estimate kept for later jobs does not depend on
+    the request order."""
+    got = []
+    for name, order in (("a", (0, 1)), ("b", (1, 0))):
+        m = new_map(tmp_path / name)
+        m.update([frame("a0", base_pose(0), p="drifting")])
+        fs = [frame("s2", base_pose(20), p="drifting"), frame("s10", base_pose(40), p="drifting")]
+        m.update([fs[k] for k in order])
+        assert m.drift.ref_prior is not None
+        got.append(m.drift.ref_prior)
+    assert np.allclose(got[0], got[1]) and np.allclose(got[0], base_pose(40))
+
+
+# -- the drift estimate --------------------------------------------------------------------------
+
+
+def test_one_strong_frame_alone_never_makes_a_drift_estimate(tmp_path: Path) -> None:
+    """map.md §1 (P12, S-5): a first estimate needs min(3, n) supporting frames, at least half
+    of those that can support it, never one alone: a lone drifting frame 25° off on a metric
+    map is left out (``prior_conflict``); three that agree make the estimate."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    T = base_pose(20)
+    p = m.update([frame("d", T, p=prior(_rot_z(T, 25.0), "drifting"))])[0]
+    assert (p.status, p.reason) == ("rejected", "prior_conflict")
+    m2 = new_map(tmp_path / "three")
+    m2.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    truth = [base_pose(y) for y in (10, 20, 40)]
+    pls = m2.update([frame(f"d{k}", T, p=prior(_rot_z(T, 25.0), "drifting"))
+                     for k, T in enumerate(truth)])
+    assert [p.status for p in pls] == ["registered"] * 3
+
+
+def test_who_can_support_a_drift_estimate() -> None:
+    """map.md §1 (S-5): an image-only pose at the measurable-pair threshold (100 inliers over
+    10 % of the image), not an origin's or a seed's."""
+    T = base_pose(0)
+
+    def obs(method: str, n: int, share: float) -> an._DriftObs:
+        pl = an.Placement("x", "registered", T=T, inliers=n, method=method, inlier_share=share)
+        return an._DriftObs(0, "x", T, T, (0.02, 1.0), (0.01, 0.5), False, pl)
+
+    assert an._can_support(obs("pnp", 100, 0.1))
+    assert not an._can_support(obs("pnp", 99, 0.5))
+    assert not an._can_support(obs("pnp", 500, 0.05))
+    assert not an._can_support(obs("prior", 500, 0.5))
+
+
+def test_the_drift_passes_end_with_the_last_fit_applied(tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit r6 item 12: at the pass cap the last fit's outliers are rejected, never left
+    registered under an estimate that left them out."""
+    monkeypatch.setattr(an, "DRIFT_PASSES", 1)
+    calls = []
+    fit = an.AnchoredMap._fit_drift
+
+    def counted(self: AnchoredMap, *a: Any) -> Any:
+        calls.append(1)
+        return fit(self, *a)
+
+    monkeypatch.setattr(an.AnchoredMap, "_fit_drift", counted)
+    truth = [base_pose(y) for y in (40, 50, 70, 80)]
+    good = [frame(f"g{k}", T, p=prior(T, "drifting", 0.15, 7.4)) for k, T in enumerate(truth)]
+    m = new_map(tmp_path)
+    m.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
+    calls.clear()
+    bad_T = base_pose(55)
+    bad = frame("bad", bad_T, p=prior(_rot_z(bad_T, 86.0), "drifting", 0.15, 7.4))
+    pls = m.update([*good[:2], bad, *good[2:]])
+    assert (pls[2].status, pls[2].reason) == ("rejected", "prior_conflict")
+    assert len(calls) == 1 and all(p.status == "registered" for p in [*pls[:2], *pls[3:]])
+
+
+def _rot_z(T: np.ndarray, deg: float) -> np.ndarray:
+    a = np.radians(deg)
+    R = np.eye(4)
+    R[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
+    return R @ T
+
+
+# -- a seeded component --------------------------------------------------------------------------
+
+
+def test_a_seeded_component_is_never_tighter_than_its_seed(tmp_path: Path) -> None:
+    """map.md §2 step 2 (P11): the frames registered through a component's seed report the seed
+    prior's sigma combined with their own, on their keyframes too, and the height gate
+    re-runs on them."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    kf = an.Keyframe("k9", "x", "cam", K, base_pose(0), 0.004, 0.2, "fused", None, "none",
+                     height_m=float(base_pose(0)[2, 3]) + 0.02, height_sigma_m=0.001,
+                     height_ok=False)
+    m.keyframes.append(kf)
+    m.height_inconsistent = ["x"]
+    pl = an.Placement("x", "registered", T=base_pose(0), sigma_pos_m=0.004, sigma_rot_deg=0.2,
+                      keyframe="k9")
+    other = an.Placement("y", "registered", T=base_pose(0), sigma_pos_m=0.001,
+                         sigma_rot_deg=0.01)
+    seed = an.Placement("s", "registered", T=base_pose(0), sigma_pos_m=0.05, sigma_rot_deg=2.0)
+    m._through_seed(seed, [pl, other])
+    assert pl.sigma_pos_m == pytest.approx(round(np.hypot(0.05, 0.004), 4))
+    assert pl.sigma_rot_deg >= 2.0 and other.sigma_pos_m >= 0.05  # type: ignore[operator]
+    assert (kf.sigma_pos_m, kf.sigma_rot_deg) == (pl.sigma_pos_m, pl.sigma_rot_deg)
+    assert kf.height_ok and m.height_inconsistent == []  # within its looser sigma now
+
+
+# -- static content ------------------------------------------------------------------------------
+
+
+def test_static_content_on_textured_frames() -> None:
+    """map.md §1 (audit r6 item 5): frames of thousands of keypoints each (more than the old
+    all-pairs bound) still lose the keypoints fixed across three frames turned pairwise beyond
+    5°; the scene's keep."""
+    rng = np.random.default_rng(3)
+    fixed = rng.uniform(0, 300, (5, 2)).astype(np.float32)
+    d = rng.random((5, 128)) + 0.01
+    fd = np.round(np.sqrt(d / d.sum(1, keepdims=True)) * an.ROOTSIFT_QUANT).astype(np.uint8)
+    fs, prep = [], []
+    for k in range(3):
+        f = frame(f"t{k}", base_pose(10 * k))
+        kps = np.vstack([rng.uniform(0, [K.width, K.height], (3000, 2)).astype(np.float32),
+                         fixed])
+        r = rng.random((3000, 128)) + 0.01
+        desc = np.vstack([np.round(np.sqrt(r / r.sum(1, keepdims=True))
+                                   * an.ROOTSIFT_QUANT).astype(np.uint8), fd])
+        fs.append(f)
+        prep.append(an._Prep(an.Features(kps, desc), None, False, None))
+    an.static_content(fs, prep)
+    for p in prep:
+        assert len(p.feats.kps) == 3000
+        assert not any(np.allclose(q, fixed[0]) for q in p.feats.kps)
+    got = an.job_features(fs)  # the whole job's (both engines): set on each frame
+    assert all(f.feats is g for f, g in zip(fs, got, strict=True))
+
+
+def test_near_pairs() -> None:
+    a = np.array([[0.0, 0.0], [10.0, 10.0], [2.5, 2.0]])
+    b = np.array([[1.0, 1.0], [10.5, 9.0], [50.0, 50.0], [-1.0, 0.0]])
+    ia, ib = an.near_pairs(a, b, 2.0)
+    assert sorted(zip(ia.tolist(), ib.tolist(), strict=True)) == [(0, 0), (0, 3), (1, 1),
+                                                                   (2, 0)]
+    assert len(an.near_pairs(a, np.zeros((0, 2)), 2.0)[0]) == 0
+    assert len(an.near_pairs(a, np.array([[100.0, 100.0]]), 2.0)[0]) == 0
+
+
+# -- the rotation check --------------------------------------------------------------------------
+
+
+def test_the_rotation_check_measures_every_pair_that_can_share_a_view() -> None:
+    """map.md §4 (audit r6 item 7): a pair beyond the six nearest views is measured too (no
+    count cap), only measurable pairs count (100 inliers and 10 % overlap), and the pairs do
+    not depend on the request order."""
+    from oh_my_slam.mapping import standpoint as sp
+
+    empty = an.Features(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8))
+    R = base_pose(0)[:3, :3]
+    new = sp.View("n", K, empty, R, np.zeros(3))
+    stored = [sp.View(f"s{k}", K, empty, R, np.array([0.3 * (k + 1), 0.0, 0.0]), True)
+              for k in range(8)]
+    pairs = sp.Pairs()
+    for v in stored:
+        pairs.fits[("n", v.name)] = sp.TwoView(np.eye(3), 5.0, 200, 0.5, 0.01)
+    bad = an.exp_so3(np.array([0.0, 0.0, np.radians(20.0)]))
+    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 200, 0.5, 0.01)  # the farthest, 20° off
+    med, mx = sp.consistency([*stored, new], pairs)
+    assert mx is not None and mx > 19.0 and sp.inconsistent(med, mx)
+    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 99, 0.5, 0.01)  # not measurable
+    assert sp.consistency([new, *reversed(stored)], pairs)[1] == pytest.approx(0.0, abs=1e-6)
+    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 500, 0.09, 0.01)  # overlaps too little
+    assert sp.consistency([*stored, new], pairs)[1] == pytest.approx(0.0, abs=1e-6)
+    assert not sp.TwoView(np.eye(3), 0.0, 99, 0.5, 0.01).standpoint  # grouping too
+
+
+# -- the older mapper (map.md §1 "Every engine", P12 S-6) -----------------------------------------
+
+
+def _metric(i: int, T: np.ndarray) -> dict[str, Any]:
+    return {"trust": "metric", "T_map_cam": T.tolist(), "sigma_pos_m": 0.01, "sigma_rot_deg": 0.5}
+
+
+def test_the_older_mapper_accepts_a_kept_only_update(old: Client) -> None:  # noqa: F811
+    """map.md §4: a later update whose frames are all kept_at_prior is accepted and stores them
+    (the mapper's map as it was)."""
+    from tests.unit.test_service_api import CAMERA, WORLD, frames_of, textured
+
+    frames, files, _ = frames_of(old, 3, prior=_metric)
+    assert old.update("m", frames, files, {"cam": CAMERA})["state"] == "committed"
+    files = {"lost": textured(91)}  # unknown to the fake mapper: not placed
+    frames = [{"name": "lost", "image": "lost", "camera_id": "cam", "prior": _metric(0, WORLD[4])}]
+    job = old.update("m", frames, files)
+    assert job["state"] == "committed" and job["result_version"] == 2, job["quality"]
+    assert (job["inputs"][0]["status"], job["inputs"][0]["reason"]) == ("kept_at_prior",
+                                                                        "no_overlap")
+    assert job["inputs"][0]["detail"] == "no_image_pose"
+    rows = old.get("/api/maps/m/frames", "Frames")["frames"]
+    assert [r["pose_state"] for r in rows] == ["fused"] * 3 + ["kept_at_prior"]
+    assert job["scale_source"] == "priors"
+
+
+def test_the_older_mapper_keeps_its_drift_estimate_across_versions(old: Client) -> None:  # noqa: F811
+    """map.md §1 "Drift estimate", every engine: three drifting frames make the estimate (in
+    the version record); a later lone frame whose odometry slipped cannot change it and is
+    rejected prior_conflict; a kept drifting frame takes the prior's sigma plus the estimate's
+    own."""
+    from oh_my_slam.mapping.anchor import Sim3
+    from tests.unit.test_service_api import CAMERA, WORLD, anchor_rot, frames_of, textured
+
+    frames, files, _ = frames_of(old, 3, prior=_metric)
+    assert old.update("m", frames, files, {"cam": CAMERA})["state"] == "committed"
+    drift = Sim3(1.0, anchor_rot(-30), np.array([5.0, 5.0, 0.0]))
+
+    def drifting(sim: Sim3) -> Any:
+        return lambda i, T: {"trust": "drifting", "T_map_cam": sim.pose(T).tolist(),
+                             "sigma_pos_m": 0.05, "sigma_rot_deg": 2.0}
+
+    frames, files, truth = frames_of(old, 3, start=3, prior=drifting(drift))
+    job = old.update("m", frames, files)
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 3, job["inputs"]
+    rec = old.service.store.version("m")
+    assert rec["drift_sim"] is not None and len(rec["drift_sigma"]) == 2
+    slip = Sim3(1.0, anchor_rot(-60), np.array([5.0, 5.0, 0.0]))
+    frames, files, _ = frames_of(old, 1, start=1, prior=drifting(slip), seed=2)
+    files["lost"] = textured(91)
+    frames.append({"name": "lost", "image": "lost", "camera_id": "cam",
+                   "prior": drifting(drift)(4, WORLD[4])})
+    job = old.update("m", frames, files)
+    st = {i["name"]: i for i in job["inputs"]}
+    assert (st["f2_1"]["status"], st["f2_1"]["reason"]) == ("rejected", "prior_conflict")
+    lost = st["lost"]
+    assert lost["status"] == "kept_at_prior" and lost["sigma_pos_m"] > 0.05
+    assert centre_error(lost["T_map_cam"], WORLD[4]) < 0.02
+
+
+def centre_error(T: Any, ref: np.ndarray) -> float:
+    return float(np.linalg.norm(np.asarray(T)[:3, 3] - ref[:3, 3]))
+
+
+def test_locate_takes_the_frame_s_own_height_sigma() -> None:
+    """api.md §6 (P12, S-7): height_sigma is the locate frame's own when it carries one, even
+    when the height is its camera's registered one."""
+    from oh_my_slam.service import nav
+    from oh_my_slam.service.cameras import Camera
+
+    cam = Camera(160.0, 160.0, 160.0, 120.0, 320, 240, height_above_floor_m=0.5,
+                 height_sigma_m=0.02)
+    img = np.asarray(shot(base_pose(0))[0], np.uint8)
+    fr = nav.LocateFrame("q", cam, img, None, None, None, 0.004)
+    q, _ = nav._query(fr, 0.1, True)
+    assert (q.camera_z, q.camera_z_sigma) == (pytest.approx(0.6), 0.004)
+    fr = nav.LocateFrame("q", cam, img, None, None, None, None)
+    assert nav._query(fr, 0.1, True)[0].camera_z_sigma == 0.02
+    fr = nav.LocateFrame("q", Camera(160.0, 160.0, 160.0, 120.0, 320, 240), img, None, None,
+                         None, 0.004)
+    assert nav._query(fr, 0.1, True)[0].camera_z is None  # no height at all
+
+
+def test_retry_kept_places_the_job_s_kept_frames_against_new_keyframes(tmp_path: Path) -> None:
+    """``AnchoredMap.retry_kept`` (map.md §2, one match graph over both engines): a kept frame
+    whose candidates hold a new keyframe is placed again: registered (fused, the height gate
+    run), or a pose duplicate (its keyframe dropped); one not placed, kept for a failed check,
+    confirmed already, or with no new candidate stays as it was."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    p = frame("p", base_pose(90))
+    p.height_m, p.height_sigma_m = float(base_pose(90)[2, 3]) + 1.0, 0.001  # inconsistent
+    p2 = frame("p2", base_pose(100), depth=False)  # no depth: nothing to fuse
+    blank = frame("q", base_pose(60), rgb=np.full((K.height, K.width, 3), 120, np.uint8))
+    bad = frame("r", base_pose(70))
+    bad.unconfirmed = "blur"
+    pls = m.update([p]) + m.update([p2, blank, bad])  # apart: no component of their own
+    assert [(x.status, x.reason) for x in pls] == [("kept_at_prior", "no_overlap")] * 3 + [
+        ("kept_at_prior", "blur")]
+    kfs = {k.name: k for k in m.keyframes}
+    n = frame("n", base_pose(45))
+    nk = m.add(n, an.features(n.rgb),
+               an.Placement("n", "registered", None, base_pose(45), 0.01, 0.1, 500, "pnp"),
+               n.depth, K, "sensor", None)  # type: ignore[arg-type]
+    zd = frame("zd", base_pose(45))
+    zk = m.add(zd, an.features(zd.rgb),
+               an.Placement("zd", "kept_at_prior", "no_overlap", base_pose(45), 0.02, 1.0),
+               zd.depth, K, "sensor", None)  # type: ignore[arg-type]
+    kept = [(p, kfs["p"]), (p2, kfs["p2"]), (blank, kfs["q"]), (bad, kfs["r"]),
+            (frame("a0", base_pose(0)), kfs["a0"]), (zd, zk)]
+    assert m.retry_kept(kept, []) == {}  # nothing new among their candidates
+    n_cloud = len(m.cloud.keys)
+    got = m.retry_kept(kept, [nk])
+    assert set(got) == {"p", "p2", "zd"}
+    assert got["p"].status == got["p2"].status == "registered"
+    assert (got["zd"].status, got["zd"].duplicate_of) == ("rejected", "n")
+    assert zk not in m.keyframes and kfs["p"].usable() and kfs["p2"].usable()
+    assert not kfs["p"].height_ok and m.height_inconsistent == ["p"]
+    assert not kfs["q"].usable() and not kfs["r"].usable()
+    assert len(m.cloud.keys) == n_cloud  # p fails the height gate, p2 has no depth
