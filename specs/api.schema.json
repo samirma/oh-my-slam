@@ -368,7 +368,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas the prior's (or 0.20 m / 5 deg) plus the drift's uncertainty; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), except a frame kept only for too_close with a metric prior, whose detections and in-range depth contribute at the prior pose (never scale evidence), and locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -400,14 +400,14 @@
             "number",
             "null"
           ],
-          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met."
+          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met. 3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
           ],
-          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met."
+          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met. 3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "prior_residual_m": {
           "type": [
@@ -693,7 +693,7 @@
         "prior_disagreement_deg": {
           "type": "number",
           "minimum": 0,
-          "description": "Largest disagreement, over pairs of the update's frames overlapping by at least 50 % (overlap: the smaller of the two directed shares of matched points inside the other image), between the images' relative rotation and the priors' relative rotation; 0 when none. Beyond 3 x hypot of the two frames' prior rotation sigmas the rotation is corrected from the images."
+          "description": "Largest disagreement, over pairs of the update's frames overlapping by at least 50 % (overlap: 8x8 inlier-cell coverage, map.md §1), between the images' relative rotation and the priors' relative rotation; 0 when none. Beyond 3 x hypot of the two frames' prior rotation sigmas the rotation is corrected from the images."
         },
         "accepted": {
           "type": "boolean"
@@ -713,7 +713,7 @@
               "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only; with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only; with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -738,7 +738,7 @@
               }
             }
           },
-          "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test. Overlap: a new registered frame shares at least 10 % of the stored frame's view. The dry-run prediction is approximate. An engine that cannot re-register reports an empty list."
+          "description": "One entry per stored kept_at_prior frame this job's images confirmed (the service re-runs the registration of stored kept frames that the new frames overlap): how far confirmation moved it from its prior-placed pose. This movement is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it with the same test. Overlap: at least 10 % 8x8 inlier-cell coverage of the kept frame's image by a new registered frame. Only images confirm, never depth. The dry-run prediction is approximate. An engine that cannot re-register reports an empty list."
         }
       }
     },
@@ -1250,10 +1250,12 @@
           "$ref": "#/$defs/Mat4"
         },
         "sigma_pos_m": {
-          "type": "number"
+          "type": "number",
+          "description": "3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "sigma_rot_deg": {
-          "type": "number"
+          "type": "number",
+          "description": "3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "pose_state": {
           "enum": [
@@ -1261,7 +1263,7 @@
             "fused",
             "kept_at_prior"
           ],
-          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells (except a frame kept only for too_close with a metric prior: its detections and in-range depth contribute) until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -1516,7 +1518,7 @@
                 "type": "number",
                 "minimum": 0,
                 "maximum": 1,
-                "description": "Frames that gave this label over image-confirmed frames whose view frustum contains the box centre, detected or not, plus every confirmed frame that detected the object (kept_at_prior excluded); for older-mapper maps, that mapper's per-label vote counts over its observing frames."
+                "description": "Frames that gave this label over image-confirmed frames whose view frustum contains the box centre, detected or not, plus every confirmed frame that detected the object (kept_at_prior excluded, except frames kept only for too_close with a metric prior); for older-mapper maps, that mapper's per-label vote counts over its observing frames."
               }
             }
           },
@@ -2053,14 +2055,14 @@
             "number",
             "null"
           ],
-          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold."
+          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold. 3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
           ],
-          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold."
+          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold. 3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "inlier_ratio": {
           "type": [
@@ -2230,10 +2232,12 @@
           "$ref": "#/$defs/Mat4"
         },
         "sigma_pos_m": {
-          "type": "number"
+          "type": "number",
+          "description": "3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         },
         "sigma_rot_deg": {
-          "type": "number"
+          "type": "number",
+          "description": "3-D RMS: sigma^2 is the trace of the position (or rotation) covariance; the same meaning for every engine."
         }
       }
     },

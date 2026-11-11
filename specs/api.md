@@ -123,10 +123,21 @@ error code `invalid_request` (§9).
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
   `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
   uses it as a reference (§6), nor does registration of new frames. Occupancy, heights, the
-  cloud, object records and scale evidence come only from image-confirmed frames: a `kept_at_prior` frame counts only for free-by-rule cells (its camera
-  stand and near blind disc, map.md §6) until a later job's images confirm it; its pose then
-  becomes a registered one in that version (map.md §2), and the job reports it in
+  cloud, object records and scale evidence come only from image-confirmed frames, with one
+  exception below: a `kept_at_prior` frame counts only for free-by-rule cells (its camera stand
+  and near blind disc, map.md §6) until a later job's images confirm it; its pose then becomes a
+  registered one in that version (map.md §2), and the job reports it in
   `quality.reregistered`.
+  * **Too-close exception.** A frame that is `kept_at_prior` only because it is `too_close`,
+    and has a `metric` prior, still contributes at its prior pose: its detections, to object
+    records and `detection_votes`; its depth points, to the cloud, occupancy and heights. Only
+    depth inside the depth image's valid range (`README.md`) counts. It never contributes scale
+    evidence: scale stays confirmed-only.
+  * Every other `kept_at_prior` frame contributes nothing until its images confirm it,
+    including a `too_close` frame with a `drifting` prior and a frame kept for any other failed
+    check.
+  * A client tells the kept frames that carried content by their `reason`, `too_close`, which
+    every kept frame carries (the schema requires a reason for `kept_at_prior`).
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
@@ -167,15 +178,20 @@ error code `invalid_request` (§9).
       Otherwise it is `registered`, and the later observation wins (map.md §3, C13).
     * Stored `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
       `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or
-      5° away is never a duplicate. A view the map already has, beyond those limits, is `registered`.
+      5° away is never a duplicate. A view the map already has, beyond those limits, is
+      `registered`.
   * `too_close` is only the camera-to-scene distance limit, with `min_distance_m` and
-    `scene_distance_m`.
-  * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
-    alone.
+    `scene_distance_m`. Depth never overrides it.
+  * A frame with at least 300 image feature inliers to neighbouring keyframes is never rejected
+    for distance alone. Depth correspondences never count toward these 300.
+  * A frame kept for a failed check is eligible for re-registration by a later job (map.md §2),
+    but only its images can confirm it, never depth. When they do not, it stays
+    `kept_at_prior` and is not listed in `quality.reregistered`.
 
   **Pose sigmas** (`sigma_pos_m`, `sigma_rot_deg`, here and in [`Frames`]) include the
   image-registration noise, calibrated so that the containment targets
-  (`update.sigma_containment`, evaluation.md) are met.
+  (`update.sigma_containment`, evaluation.md) are met. They are 3-D RMS (§6), and mean the same
+  for every engine.
 
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
@@ -232,6 +248,8 @@ The versions read, revert and `--keep-versions` are O2.
   located with `consistent_with_prior: false`; so a located frame with a prior always has
   `consistent_with_prior: true`. A prior without sigmas takes the fixed defaults of §3
   (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send sigmas.
+* **Sigma convention.** `sigma_pos_m` and `sigma_rot_deg` are 3-D RMS, for update and locate
+  alike: σ² is the trace of the position or rotation covariance.
 * **Locate sigmas.** A located pose's sigmas come from the images alone, with trust class
   `none`. The prior only ranks and gates (`prior_conflict`); it never changes the sigmas, so a
   client that fuses the answer with its own prior does not count the prior twice.

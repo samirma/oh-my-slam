@@ -73,9 +73,10 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `locate.sigma_containment` | C8 | Share of located frames whose position error ≤ 3 × `sigma_pos_m` and rotation error ≤ 3 × `sigma_rot_deg` |
 | `locate.sigma_tightness` | C8 | Information, no target: median over located frames of error / sigma (position and rotation reported separately); near 1 means sigmas neither over- nor under-confident |
 | `locate.sigma_tightness_bound` | C8 | Median over located frames of error / sigma, position and rotation separately, two-sided |
-| `update.sigma_tightness` | C1, C4 | Information, no target: median over registered update frames of error / sigma (position and rotation separately) |
-| `update.sigma_tightness_bound` | C1, C4 | Median over registered update frames of error / sigma, position and rotation separately, two-sided |
-| `update.sigma_containment` | C1, C4 | Share of non-rejected update frames (registered and `kept_at_prior`, the latter against their prior's sigmas) whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
+| `update.sigma_tightness` | C1, C4 | Information, no target: median over registered update frames only of error / sigma (position and rotation separately) |
+| `update.sigma_tightness_bound` | C1, C4 | Median over registered update frames only of error / sigma, position and rotation separately, two-sided |
+| `update.sigma_containment` | C1, C4 | Share of registered update frames whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
+| `update.sigma_containment_kept` | C1, C4 | Information, no target: the same share over `kept_at_prior` frames, against their reported sigmas |
 | `scale.error_metric` | C2 | Scale error with `metric` priors |
 | `scale.error_camera_height` | C2 | Scale error with camera height only |
 | `scale.error_by_direction` | C2 | Worst relative scale error over four horizontal directions at 45° steps, measured on keyframe truth positions (distances between keyframes along each direction), not on walls. Verified by the error in all four directions within 3 × the stated `scale_sigma_rel`, and, without priors and with a camera height (`height_above_floor_m`), \|`floor_z_m`\| ≤ 0.02 m |
@@ -95,7 +96,7 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
 | `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
 | `grid.floor_false_obstacles` | C9 | Service-occupied cells and floor-standing objects lower than 0.06 m on open floor: cells that are free floor in the truth floor plan with no object or fixture, restricted to cells inside some keyframe camera's view frustum within the height band (unseen floor counts neither way) (map.md §5–§6) |
-| `grid.unconfirmed_occupancy` | C9, C10 | Computed with truth: occupied cells and floor-standing objects on truth open floor that lie inside the view of `kept_at_prior` frames only, and of no confirmed frame; a frame's view is bounded by the floor-plan walls |
+| `grid.unconfirmed_occupancy` | C9, C10 | Computed with truth: occupied cells and floor-standing objects on truth open floor that lie inside the view of `kept_at_prior` frames only, and of no confirmed frame (a frame kept only for `too_close` with a `metric` prior counts as confirmed here, api.md §4); a frame's view is bounded by the floor-plan walls |
 | `grid.id_stability` | C9 | Share of regions and passages whose id is unchanged between consecutive versions where their geometry did not change |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
@@ -157,6 +158,7 @@ these ids.
 | `update.sigma_tightness` | information only |
 | `update.sigma_tightness_bound` | between 0.3 and 1.5 |
 | `update.sigma_containment` | ≥ 0.99 |
+| `update.sigma_containment_kept` | information only |
 | `scale.error_metric` | ≤ 3 % |
 | `scale.error_camera_height` | ≤ 10 % |
 | `scale.error_by_direction` | ≤ 10 % |
