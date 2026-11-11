@@ -146,16 +146,24 @@ error code `invalid_request` (§9).
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
     `few_features`, `too_close`, with `min_distance_m` and `scene_distance_m` when it is
     `too_close`. It is `rejected` only when the image is unusable (`unusable_image`: it does not
-    decode, or its size is not the camera's).
+    decode, or its size is not the camera's). This wins over `prior_conflict`: a frame that
+    fails a check, or is too close, and whose image also strongly conflicts with its prior, is
+    `kept_at_prior` with that check's reason.
   * This holds for an origin frame too: a frame of a map's first update whose image fails a
     quality check is `kept_at_prior` and still defines the map frame (map.md §1). An engine that
     cannot tie kept frames to the priors' frame, when no prior-carrying frame registers, may
     reject the first update with `prior_frames_rejected` (map.md §1).
-  * `duplicate`: an input within 0.02 m and 2° of a stored keyframe of the same camera, or of
-    an earlier `registered` frame of the same request and camera, or one whose name the map or
-    the request already holds (§3). `duplicate_of` names that frame. The pose test uses the
-    frame's registered pose, after registration: a frame that does not register can be a
-    duplicate only by name. A duplicate is always `rejected`, never `kept_at_prior`. Stored
+  * `duplicate`: a name duplicate, or a pose duplicate whose image agrees. `duplicate_of` names
+    the frame it duplicates. A duplicate is always `rejected`, never `kept_at_prior`.
+    * A name duplicate holds a name the map or the request already holds (§3). It is always
+      rejected.
+    * A pose duplicate lies within 0.02 m and 2° of a stored confirmed keyframe of the same
+      camera, or of an earlier `registered` frame of the same request and camera. The pose test
+      uses the frame's registered pose, after registration: a frame that does not register can
+      be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
+      with that keyframe: at least 90 % of its features re-matched, and no object record
+      visible in that view would change. Otherwise it is `registered`, and the later
+      observation wins (map.md §3, C13). Stored
     `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
     `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or 5°
     away is never a duplicate. A view the map already has, beyond those limits, is `registered`.

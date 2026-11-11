@@ -92,13 +92,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     (§6) until it is registered. Only image-confirmed keyframes are registration references
     for new frames; `kept_at_prior` frames are not.
   * **Re-registration.** When a job registers new frames that overlap a stored `kept_at_prior`
-    frame, the service re-runs that stored frame's registration against the confirmed map. If
+    frame (a new registered frame of the job shares at least 10 % of the stored frame's
+    view), the service re-runs that stored frame's registration against the confirmed map. If
     its images confirm it, its pose leaves `kept_at_prior` in that version (it becomes a
     registered pose, `provisional` then `fused`), and from then on it feeds occupancy,
     heights, the cloud and objects. The job lists each such frame in `quality.reregistered`
     (§4); the movement of that confirmation is excluded from `previous_residuals` and
-    `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing.
-    Nothing re-registers a frame outside a job: there is no automatic background refinement;
+    `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
+    the prediction is approximate. An engine that cannot re-register (the older mapper) reports
+    `reregistered` as an empty list; this is allowed. Nothing re-registers a frame outside a job: there is no automatic background refinement;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -200,7 +202,7 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | --- | --- |
 | `id` | Positive integer, persistent for the map's lifetime. |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
-| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre, detected or not (`kept_at_prior` frames excluded), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
+| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre, detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
 | `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. When the map's builder never recorded those views, `partial` on every axis. |
