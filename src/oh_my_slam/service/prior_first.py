@@ -67,6 +67,7 @@ from oh_my_slam.segmentation.api import (
 )
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
 from oh_my_slam.service.store import POSE_STATES, clone_tree
+from oh_my_slam.service.timings import fusion_class
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -268,6 +269,36 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
     return out, reg_s, time.perf_counter() - t
 
 
+def frame_class(fr: _Frame) -> str:
+    """A frame's fusion class (``timings.fusion_class``): its prior's trust, its depth kind."""
+    return fusion_class(_trusted(fr), _has_depth(fr))
+
+
+def _fusion_by_class(up: Updater, geo: list[_Frame], late: list[_Frame],
+                     placements: dict[int, Placement], fused: dict[str, float], shared: float
+                     ) -> None:
+    """The fusion seconds per kept frame by fusion class (``Timings``): each engine's fusion
+    over its kept frames, plus the objects and the save (``shared``) over every kept frame."""
+    kept = {g: [fr for fr in frs if placements[fr.work.index].status != "rejected"]
+            for g, frs in (("geo", geo), ("late", late))}
+    total = sum(len(v) for v in kept.values())
+    per: dict[str, list[float]] = {}
+    for g, frs in kept.items():
+        for fr in frs:
+            per.setdefault(frame_class(fr), []).append(fused[g] / len(frs) + shared / total)
+    for cls, v in per.items():
+        up.timings.add(f"fusion_per_frame_{cls}", float(np.mean(v)), len(v))
+
+
+def classes(w: UpdateWork) -> dict[str, int]:
+    """The request's frames by fusion class (the job's ETA, ``Timings.predict_phases``)."""
+    out: dict[str, int] = {}
+    for f in w.frames:
+        c = fusion_class(f.trust in ("metric", "drifting"), f.depth is not None)
+        out[c] = out.get(c, 0) + 1
+    return out
+
+
 def detection_grid(K: Intrinsics) -> tuple[int, int]:
     """The grid (width, height) a frame's detections are asked on: its monocular depth grid."""
     return size_at_max_side(K.width, K.height, MONO_GRID_SIDE)
@@ -464,10 +495,12 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 placements[fr.work.index] = pl
             if geo:
                 up.timings.add("registration_per_frame", reg_s / len(geo), len(geo))
+            fused = {"geo": fuse_s, "late": 0.0}  # each engine's fusion seconds
             if late:  # their scene distance is MapAnything's depth (``register_ma``)
                 lp, r, fu = _register_none(up, am, late, workdir, progress, pairs)
                 up.timings.add("registration_mapanything_per_frame", r / len(late), len(late))
                 reg_s, fuse_s = reg_s + r, fuse_s + fu
+                fused["late"] = fu
                 for fr, pl in zip(late, lp, strict=True):
                     placements[fr.work.index] = pl
                 # the stored kept keyframes these frames overlap too (map.md §2)
@@ -504,6 +537,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         n_kept = sum(pl.status != "rejected" for pl in placements.values())
         if n_kept:
             up.timings.add("fusion_per_frame", tm["fusion"] / n_kept, n_kept)
+            _fusion_by_class(up, geo, late, placements, fused, tm["fusion"] - fuse_s)
     job.progress = 0.95
     changed()
     t = time.perf_counter()

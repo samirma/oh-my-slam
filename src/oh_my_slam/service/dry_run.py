@@ -67,7 +67,12 @@ from oh_my_slam.mapping.quality import (
     residual_stats,
     too_close,
 )
-from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in, none_engine
+from oh_my_slam.service.prior_first import (
+    LOW_CONFIDENCE_SIGMA_M,
+    _frame_in,
+    frame_class,
+    none_engine,
+)
 
 if TYPE_CHECKING:
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
@@ -172,7 +177,11 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     reached = [fr for fr in frames if fr.reason is None]
     ma = len([fr for fr in reached if fr.work.trust not in ("metric", "drifting")]) \
         if none_engine() == "mapanything" and (prev is None or am is not None) else 0
-    reg, fus = up.timings.predict_phases(len(frames), len(reached) - ma, ma, len(kept))
+    reg, fus = up.timings.predict_phases(
+        len(frames), len(reached) - ma, ma, len(kept),
+        _classes([fr for fr, r in zip(frames, out, strict=True)
+                  if r["predicted_status"] != "rejected"]),
+        0 if prev is None else len(prev["frames"]))
     trusted = [r for fr, r in zip(frames, out, strict=True)
                if fr.work.trust in ("metric", "drifting")]
     return {"map": w.map,
@@ -181,6 +190,15 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                 r["predicted_status"] == "rejected" for r in trusted)),
             "scale_source": source, "scale_sigma_rel": round(sigma, 5),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
+
+
+def _classes(frames: list[_Frame]) -> dict[str, int]:
+    """The predicted kept frames by fusion class (``prior_first.frame_class``)."""
+    out: dict[str, int] = {}
+    for fr in frames:
+        c = frame_class(fr)
+        out[c] = out.get(c, 0) + 1
+    return out
 
 
 def _earlier_duplicate(camera_id: str, T: Any, earlier: list[tuple[str, str, Any]]

@@ -269,7 +269,12 @@ class Updater:
                              len(w.frames))
             self.timings.add("job_overhead", max(tm["total"] - tm.get("checks", 0.0)
                                                  - tm.get("register", 0.0)
-                                                 - tm.get("fusion", 0.0), 0.0))
+                                                 - tm.get("fusion", 0.0)
+                                                 - tm.get("commit", 0.0), 0.0))
+            if "commit" in tm and job.result_version is not None:
+                # the commit and the version's derivation grow with the map
+                n = len(self.store.version(w.map, job.result_version)["frames"])
+                self.timings.add("commit_per_keyframe", tm["commit"] / max(n, 1))
 
     # -- the job -------------------------------------------------------------------------------
 

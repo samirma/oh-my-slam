@@ -27,6 +27,16 @@ DEFAULTS: dict[str, float] = {
     "checks_per_frame": 0.02,
     "registration_mapanything_per_frame": 1.9,
     "job_overhead": 0.4,
+    # fusion per kept frame by class (``fusion_class``: the prior's trust class and the depth
+    # kind), its objects included: camera-only frames (MapAnything) fuse 5.8-11.2 s per frame,
+    # frames with priors 0.7-2.0 s (the client's measurements on 04c1815)
+    "fusion_per_frame_prior_depth": 1.0,
+    "fusion_per_frame_prior_mono": 1.6,
+    "fusion_per_frame_none_depth": 6.0,
+    "fusion_per_frame_none_mono": 8.5,
+    # the commit and the version's derivation before it is published, per keyframe of the
+    # committed version (they grow with the map)
+    "commit_per_keyframe": 0.01,
     "locate_per_frame": 2.0,
     "analyse_per_frame": 1.5,
     "grid_read": 0.5,
@@ -34,6 +44,15 @@ DEFAULTS: dict[str, float] = {
 }
 # the mapper's stages (``core.timing.Stage``) that fuse what registration placed
 FUSION_STAGES = frozenset({"persist_frames", "validity", "objects", "cloud", "export", "commit"})
+
+
+FUSION_CLASSES = ("prior_depth", "prior_mono", "none_depth", "none_mono")
+
+
+def fusion_class(trusted: bool, depth: bool) -> str:
+    """A frame's fusion class: ``prior`` (metric or drifting) or ``none``, and ``depth`` (a
+    depth image) or ``mono``."""
+    return f"{'prior' if trusted else 'none'}_{'depth' if depth else 'mono'}"
 
 
 class Timings:
@@ -77,20 +96,35 @@ class Timings:
                               "source": "default"}
         return out
 
-    def predict_update(self, frames: int, camera_only: int = 0) -> float:
+    def predict_update(self, frames: int, camera_only: int = 0,
+                       classes: dict[str, int] | None = None, keyframes: int = 0) -> float:
         """Seconds an update of ``frames`` frames is expected to take, ``camera_only`` of them
-        registered by MapAnything, all of them kept (``predict_phases``)."""
-        reg, fus = self.predict_phases(frames, frames - camera_only, camera_only, frames)
+        registered by MapAnything, all of them kept, ``classes`` their fusion classes, on a map
+        of ``keyframes`` keyframes (``predict_phases``)."""
+        reg, fus = self.predict_phases(frames, frames - camera_only, camera_only, frames,
+                                       classes, keyframes)
         return reg + fus
 
-    def predict_phases(self, sent: int, geometric: int, mapanything: int, kept: int
+    def fusion_median(self, cls: str) -> float:
+        """The fusion seconds per frame of a class: its own measurements, else its default."""
+        return self.median(f"fusion_per_frame_{cls}")
+
+    def predict_phases(self, sent: int, geometric: int, mapanything: int, kept: int,
+                       classes: dict[str, int] | None = None, keyframes: int = 0
                        ) -> tuple[float, float]:
         """(registration, fusion) seconds of an update: its overhead, the checks of the
-        ``sent`` frames, the registration of the frames each engine gets and the fusion of
-        the ``kept`` ones."""
+        ``sent`` frames, the registration of the frames each engine gets; the fusion of the
+        ``kept`` ones by their fusion ``classes`` (counts; without them, the pooled median),
+        their objects included, and the commit with the version's derivation, per keyframe of
+        the version it commits (``keyframes`` stored plus the kept)."""
         if not sent:
             return 0.0, 0.0
         reg = (self.median("job_overhead") + sent * self.median("checks_per_frame")
                + geometric * self.median("registration_per_frame")
                + mapanything * self.median("registration_mapanything_per_frame"))
-        return reg, kept * self.median("fusion_per_frame")
+        if classes:
+            share = kept / max(sum(classes.values()), 1)  # the classes of the sent frames
+            fus = sum(n * share * self.fusion_median(c) for c, n in classes.items())
+        else:
+            fus = kept * self.median("fusion_per_frame")
+        return reg, fus + (keyframes + kept) * self.median("commit_per_keyframe")

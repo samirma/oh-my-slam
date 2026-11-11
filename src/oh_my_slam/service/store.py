@@ -72,10 +72,12 @@ class Store:
         # called with (map, first, last) before a commit replaces the mapper map that versions
         # first..last were committed with (``derived`` derives them from it first)
         self.replacing: list[Callable[[str, int, int], None]] = []
-        # called with (map, version, record, mapper map, cameras) before a version is published
+        # called with (map, version, record, mapper map, cameras, JSON files) before a version is
+        # published
         # (``derived`` derives it there, so a read never derives: high_level_spec.md §8); a
         # listener's failure never fails the commit (the read then derives it)
-        self.preparing: list[Callable[[str, int, dict[str, Any], Path, dict[str, Any]], None]] \
+        self.preparing: list[Callable[[str, int, dict[str, Any], Path, dict[str, Any],
+                                       dict[str, Any]], None]] \
             = []
 
     def create(self) -> None:
@@ -194,7 +196,7 @@ class Store:
         version is derived from that version's, never from a later one."""
         if mapper is not None:
             self._replacing(name)
-        self._prepare(name, record, mapper, cameras or {})
+        self._prepare(name, record, mapper, cameras or {}, files or {})
         with self._lock:
             meta = self.add_cameras(name, cameras or {}, masks or {})
             n = int(meta.get("latest_version") or 0) + 1
@@ -239,16 +241,17 @@ class Store:
                     "replacing listener failed for %s versions %d-%d", name, first, latest)
 
     def _prepare(self, name: str, record: dict[str, Any], mapper: Path | None,
-                 cameras: dict[str, dict[str, Any]]) -> None:
+                 cameras: dict[str, dict[str, Any]], files: dict[str, Any]) -> None:
         """The ``preparing`` listeners on the version about to be committed: its number (one job
         writes a map at a time), its record as it will read (``version``, ``cameras``), the
-        mapper map it is committed with (the current one when none) and the map's cameras."""
+        mapper map it is committed with (the current one when none), the map's cameras and the
+        version's JSON files."""
         n = int((self.meta(name) or {}).get("latest_version") or 0) + 1
         cams = {**self.cameras(name), **cameras}
         full = {**record, "version": n, "cameras": cams}
         for listener in self.preparing:
             try:
-                listener(name, n, full, mapper or self.mapper_dir(name), cams)
+                listener(name, n, full, mapper or self.mapper_dir(name), cams, files)
             except Exception:
                 from oh_my_slam.core.log import get_logger
 

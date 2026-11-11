@@ -13,10 +13,15 @@ Under ``<data>/oms/maps/<name>/derived/``:
   version.
 
 ``Derived`` subscribes to ``Store.preparing`` and derives each version before the store
-publishes it (``prepare``, in the job, from the mapper map it is committed with), so a read
-never waits for a derivation (high_level_spec.md §8); ``Store.listeners`` then has the worker
-thread compute the objects answer and the locate index. A version that preparation did not
-derive (an error, or a version committed before this) is derived by its first read. A version's
+publishes it (``prepare``, in the job, from the mapper map it is committed with): the files
+above, its locate index (``index``, built once) and the answers of the ``prepared`` hooks (the
+objects read's, with the default grid it uses), so a read never waits for a derivation and no
+locate builds an index (high_level_spec.md §8). Each map's latest version stays in memory
+(``_latest``) beside the ``CACHE_VERSIONS`` most recent others; a version's read answers are
+kept per version and parameters (``DerivedVersion.answer``, one computation per key). A read
+never takes a lock a derivation holds: derivations of one version are serialised by that
+version's own lock. A version that preparation did not derive (an error, or a version committed
+before this) is derived by its first read. A version's
 mapper-map content
 (depth, cloud, images, objects) comes from the mapper map it was committed with: before a commit
 replaces that map, every version it serves that is not derived yet is derived from it
@@ -60,7 +65,8 @@ from oh_my_slam.service.store import Store
 
 log = get_logger("oh_my_slam.service.derived")
 
-CACHE_VERSIONS = 3  # versions kept in memory
+CACHE_VERSIONS = 3  # versions kept in memory beside each map's latest
+ANSWERS = 16  # read answers kept per version (grid parameters, objects)
 DEFAULT_CAMERA_HEIGHT_M = 1.0
 # what the older mapper records of an object beyond its box, kept for the objects read
 MAPPER_OBJECT_KEYS = ("score", "label_votes", "observations", "created_update",
@@ -81,6 +87,10 @@ class DerivedVersion:
     _cloud: dict[str, NDArray[Any]] | None = None
     _index: relocalize.Index | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # read answers by key (``answer``) and the locks that compute each once
+    _answers: OrderedDict[Any, Any] = field(default_factory=OrderedDict)
+    _answer_locks: dict[Any, threading.Lock] = field(default_factory=dict)
+    _index_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def floor_z(self) -> float:
@@ -90,6 +100,27 @@ class DerivedVersion:
     def floor_sigma(self) -> float:
         """The floor's height sigma (a version derived before oms/2.2: the default)."""
         return float(self.meta.get("floor_sigma", FLOOR_SIGMA_DEFAULT_M))
+
+    def answer(self, key: Any, compute: Callable[[], Any]) -> Any:
+        """A read's answer of this version for ``key`` (its parameters): computed once, by the
+        first read that needs it (the others wait for it), then kept (the ``ANSWERS`` most
+        recent keys)."""
+        with self._lock:
+            if key in self._answers:
+                self._answers.move_to_end(key)
+                return self._answers[key]
+            lock = self._answer_locks.setdefault(key, threading.Lock())
+        with lock:
+            with self._lock:
+                if key in self._answers:
+                    return self._answers[key]
+            out = compute()
+            with self._lock:
+                self._answers[key] = out
+                while len(self._answers) > ANSWERS:
+                    gone, _ = self._answers.popitem(last=False)
+                    self._answer_locks.pop(gone, None)
+            return out
 
     def volume(self) -> navgrid.Volume:
         with self._lock:
@@ -133,12 +164,14 @@ class Derived:
         self._queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._cache: OrderedDict[tuple[str, str, int], DerivedVersion] = OrderedDict()
+        self._latest: dict[str, tuple[tuple[str, str, int], DerivedVersion]] = {}
+        self._prepared: dict[tuple[str, int], DerivedVersion] = {}  # derived, being committed
         self._lock = threading.Lock()
-        self._map_locks: dict[str, threading.Lock] = {}
+        self._version_locks: dict[tuple[str, int], threading.Lock] = {}
         self._pairs: dict[tuple[str, str], NDArray[np.int64]] = {}  # keyframe matches by image
-        # what the worker also computes for each committed version once derived (the objects
-        # read's answer: ``objects.body``)
-        self.after: list[Callable[[DerivedVersion], Any]] = []
+        # what preparation also computes for each version before it is published (the objects
+        # read's answer: ``objects.body``), with the version's committed JSON files
+        self.prepared: list[Callable[[DerivedVersion, dict[str, Any]], Any]] = []
         store.listeners.append(self.committed)
         store.replacing.append(self.replacing)
         store.preparing.append(self.prepare)
@@ -156,15 +189,23 @@ class Derived:
             self._thread = None
 
     def committed(self, name: str, n: int) -> None:
+        """Version ``n`` is published: the one ``prepare`` derived is the map's latest; the
+        worker derives it if preparation did not."""
+        with self._lock:
+            dv = self._prepared.pop((name, n), None)
+        if dv is not None:
+            meta = self.store.meta(name) or {}
+            self._keep((name, str(meta.get("created_at")), n), dv, latest=True)
         self._queue.put((name, n))
 
     def prepare(self, name: str, n: int, record: dict[str, Any], mapper: Path,
-                cameras: dict[str, Any]) -> None:
+                cameras: dict[str, Any], files: dict[str, Any] | None = None) -> None:
         """Version ``n`` of map ``name`` derived before it is published, from its ``record``,
-        the ``mapper`` map it is committed with and the map's ``cameras`` (what a version
-        derived earlier under that number, never committed, held is replaced)."""
+        the ``mapper`` map it is committed with, the map's ``cameras`` and its committed JSON
+        ``files`` (what a version derived earlier under that number, never committed, held is
+        replaced): its files, its locate index and the ``prepared`` hooks' answers."""
         vdir = self.dir(name) / str(n)
-        with self._map_lock(name):
+        with self._version_lock(name, n):
             shutil.rmtree(vdir, ignore_errors=True)
             internal = None
             if mapper.exists():
@@ -173,6 +214,16 @@ class Derived:
                 except (OSError, OhMySlamError):
                     internal = None
             self._derive(name, n, record, vdir, internal, cameras)
+            dv = DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
+                                vdir, self._stands(record, cameras))
+            self.index(dv, cameras)  # the locate index ready before the version is
+            for hook in self.prepared:
+                try:
+                    hook(dv, files or {})
+                except Exception:
+                    log.exception("preparing %s version %d: a read answer failed", name, n)
+            with self._lock:
+                self._prepared[(name, n)] = dv
 
     def replacing(self, name: str, first: int, last: int) -> None:
         """Versions ``first``..``last`` derived from the mapper map a commit is about to
@@ -187,21 +238,37 @@ class Derived:
             if item is None:
                 return
             try:
-                dv = self.get(*item)
-                for hook in self.after:
-                    hook(dv)
-                self.index(dv)  # the locate index ready before the first locate
+                dv = self.get(*item)  # derived now if preparation did not
+                self.index(dv)  # ... and its locate index (built once: ``index``)
             except Exception:
                 log.exception("deriving %s version %d failed", *item)
 
     # -- reads ----------------------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def _map_lock(self, name: str) -> Iterator[None]:
+    def _version_lock(self, name: str, n: int) -> Iterator[None]:
+        """The lock deriving version ``n`` of a map: a read of another version never waits."""
         with self._lock:
-            lock = self._map_locks.setdefault(name, threading.Lock())
+            lock = self._version_locks.setdefault((name, n), threading.Lock())
         with lock:
             yield
+
+    def _keep(self, key: tuple[str, str, int], dv: DerivedVersion, latest: bool) -> None:
+        """``dv`` in memory: as its map's latest (pinned until a later version is), else among
+        the ``CACHE_VERSIONS`` most recent others."""
+        name = key[0]
+        with self._lock:
+            old = self._latest.get(name)
+            if latest and (old is None or old[0][1] != key[1] or old[0][2] <= key[2]):
+                if old is not None and old[0] != key and old[0][1] == key[1]:
+                    self._cache[old[0]] = old[1]  # no longer the latest: an ordinary entry
+                self._latest[name] = (key, dv)
+                self._cache.pop(key, None)
+            elif old is None or old[0] != key:
+                self._cache[key] = dv
+                self._cache.move_to_end(key)
+            while len(self._cache) > CACHE_VERSIONS:
+                self._cache.popitem(last=False)
 
     def dir(self, name: str) -> Path:
         return self.store.dir(name) / "derived"
@@ -210,30 +277,37 @@ class Derived:
         """Version ``n`` of map ``name`` derived (now, if it was not yet)."""
         meta = self.store.require(name)
         key = (name, str(meta.get("created_at")), n)
+        latest = int(meta.get("latest_version") or 0) == n
         with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                return self._cache[key]
-        record = self.store.version(name, n)
-        vdir = self.dir(name) / str(n)
-        with self._map_lock(name):
-            if not (vdir / "meta.json").exists():
-                if self.store.mapper_version(name) > n:
-                    raise ApiError("version_gone", f"version {n} of map {name!r} is no longer "
-                                   "kept: its mapper map was replaced before it was derived",
-                                   {"map": name, "version": n,
-                                    "latest_version": self.store.latest(name)})
-                self._derive(name, n, record, vdir)
-        dv = DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()), vdir,
-                            self._stands(name, record))
-        with self._lock:
-            self._cache[key] = dv
-            while len(self._cache) > CACHE_VERSIONS:
-                self._cache.popitem(last=False)
+            pinned = self._latest.get(name)
+            if pinned is not None and pinned[0] == key:
+                return pinned[1]
+            dv = self._cache.get(key)
+            prepared = self._prepared.get((name, n))
+        if dv is None:
+            record = self.store.version(name, n)
+            if prepared is not None and prepared.record.get("job_id") == record.get("job_id"):
+                dv = prepared  # published while its commit finishes
+            else:
+                dv = self._load(name, n, record)
+        self._keep(key, dv, latest)
         return dv
 
-    def _stands(self, name: str, record: dict[str, Any]) -> list[navgrid.Stand]:
-        cams = self.store.cameras(name)
+    def _load(self, name: str, n: int, record: dict[str, Any]) -> DerivedVersion:
+        vdir = self.dir(name) / str(n)
+        if not (vdir / "meta.json").exists():
+            with self._version_lock(name, n):
+                if not (vdir / "meta.json").exists():
+                    if self.store.mapper_version(name) > n:
+                        raise ApiError("version_gone", f"version {n} of map {name!r} is no "
+                                       "longer kept: its mapper map was replaced before it was "
+                                       "derived", {"map": name, "version": n,
+                                                   "latest_version": self.store.latest(name)})
+                    self._derive(name, n, record, vdir)
+        return DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
+                              vdir, self._stands(record, self.store.cameras(name)))
+
+    def _stands(self, record: dict[str, Any], cams: dict[str, Any]) -> list[navgrid.Stand]:
         out = []
         for f in record["frames"]:
             cam = cams.get(f["camera_id"])
@@ -406,11 +480,19 @@ class Derived:
 
     # -- locate index ---------------------------------------------------------------------------
 
-    def index(self, dv: DerivedVersion) -> relocalize.Index:
-        with dv._lock:
-            if dv._index is not None:
-                return dv._index
-        cams = {cid: Camera.from_json(c) for cid, c in self.store.cameras(dv.name).items()}
+    def index(self, dv: DerivedVersion, cameras: dict[str, Any] | None = None
+              ) -> relocalize.Index:
+        """The version's locate index, built once (the first caller builds it, the others
+        wait): at commit by ``prepare``, else by the worker or the first locate."""
+        with dv._index_lock:
+            if dv._index is None:
+                dv._index = self._build_index(dv, cameras)
+            return dv._index
+
+    def _build_index(self, dv: DerivedVersion, cameras: dict[str, Any] | None
+                     ) -> relocalize.Index:
+        cams = {cid: Camera.from_json(c) for cid, c in (
+            self.store.cameras(dv.name) if cameras is None else cameras).items()}
         z = np.load(dv.dir / "locate.npz")
         by_name = {f["name"]: f for f in dv.record["frames"]}
         kfs = []
@@ -426,6 +508,4 @@ class Derived:
                 f.get("depth_kind") == "sensor"))
         idx = relocalize.Index(kfs)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
-        with dv._lock:
-            dv._index = idx
         return idx

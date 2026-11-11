@@ -28,10 +28,10 @@ from oh_my_slam.service import birdseye as birdseye_read
 from oh_my_slam.service import nav, openapi, schema
 from oh_my_slam.service import objects as objects_read
 from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, same_camera
-from oh_my_slam.service.derived import Derived
+from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
 from oh_my_slam.service.jobs import Jobs
-from oh_my_slam.service.prior_first import camera_only
+from oh_my_slam.service.prior_first import camera_only, classes
 from oh_my_slam.service.routes import ENDPOINTS
 from oh_my_slam.service.schema import SCHEMA_VERSION
 from oh_my_slam.service.store import Store, check_name
@@ -314,7 +314,10 @@ class Api:
             out = await run_in_threadpool(self.s.dry_run, work)
             _stage(request, "dry_run", t0)
             return body(out)
-        job = self.s.jobs.submit(name, work, len(work.frames), camera_only(work))
+        latest = self.s.store.latest(name)
+        keyframes = len(self.s.store.version(name, latest)["frames"]) if latest else 0
+        job = self.s.jobs.submit(name, work, len(work.frames), camera_only(work), classes(work),
+                                 keyframes)
         return JSONResponse(job.queued_view, 202, {"Location": f"/api/jobs/{job.id}"})
 
     async def get_job(self, request: Request) -> Response:
@@ -391,21 +394,24 @@ class Api:
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         _stage(request, "derive", t0)
         t1 = time.perf_counter()
-        answer = await run_in_threadpool(nav.grid, dv, self._ids(), cell, z_min, z_max, foot,
-                                         cap)
+        answer = await run_in_threadpool(nav.grid_answer, dv, self._ids(), cell, z_min, z_max,
+                                         foot, cap)
+        out = body(answer.body)
         _stage(request, "grid", t1)
+        # what the client waits for: the whole read, the body serialised, a cold read too
         self.s.timings.add("grid_read", time.perf_counter() - t0)
-        return body(answer.body)
+        return out
 
     async def get_objects(self, request: Request) -> Response:
         t0 = time.perf_counter()
         name, _, v = self._version(request)
         derived = self._derived()
         dv = await run_in_threadpool(derived.get, name, v["version"])
-        out = await run_in_threadpool(objects_read.body, self.s.store, derived, self._ids(), dv)
+        got = await run_in_threadpool(objects_read.body, self.s.store, derived, self._ids(), dv)
+        out = body(got)
         _stage(request, "objects", t0)
-        self.s.timings.add("objects_read", time.perf_counter() - t0)
-        return body(out)
+        self.s.timings.add("objects_read", time.perf_counter() - t0)  # as the client waits
+        return out
 
     async def get_points(self, request: Request) -> Response:
         name, _, v = self._version(request)
@@ -518,9 +524,16 @@ async def _http_error(request: Request, exc: Exception) -> Response:
 
 def create_app(service: Service) -> ASGIApp:
     api = Api(service)
-    if service.derived is not None:  # each version's objects answer, computed once derived
+    if service.derived is not None:
         derived = service.derived
-        derived.after.append(lambda dv: objects_read.body(service.store, derived, api._ids(), dv))
+
+        def reads(dv: DerivedVersion, files: dict[str, Any]) -> None:
+            """A version's default grid (5 cm) and objects answers, before it is published."""
+            nav.grid_answer(dv, api._ids(), nav.DEFAULT_CELL_M, *nav.DEFAULT_Z_BAND, None,
+                            nav.HEIGHT_CAP_M)
+            objects_read.body(service.store, derived, api._ids(), dv, files)
+
+        derived.prepared.append(reads)
     routes = [Route(e.path, _wrap(getattr(api, e.handler)), methods=[e.method])
               for e in ENDPOINTS]
     app = Starlette(routes=routes, exception_handlers={HTTPException: _http_error})

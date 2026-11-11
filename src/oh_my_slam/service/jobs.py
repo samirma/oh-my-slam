@@ -50,6 +50,8 @@ class Job:
     ended: float | None = None
     frames: int = 0  # frames sent
     camera_only: int = 0  # ... of them registered by MapAnything (``prior_first.none_engine``)
+    classes: dict[str, int] = field(default_factory=dict)  # ... by fusion class (``timings``)
+    keyframes: int = 0  # the map's keyframes when it was queued
     started: float | None = None
     # the request, kept while the job runs (not part of the body)
     work: Any = None
@@ -94,7 +96,7 @@ class Jobs:
     (an exception fails it as ``internal``)."""
 
     def __init__(self, folder: Path, runner: Runner,
-                 predict: Callable[[int, int], float] = lambda frames, camera_only: 0.0
+                 predict: Callable[..., float] = lambda *a: 0.0
                  ) -> None:
         self.folder = folder
         self.runner = runner
@@ -138,9 +140,10 @@ class Jobs:
 
     # -- jobs ------------------------------------------------------------------------------------
 
-    def submit(self, map_name: str, work: Any, frames: int = 0, camera_only: int = 0) -> Job:
+    def submit(self, map_name: str, work: Any, frames: int = 0, camera_only: int = 0,
+               classes: dict[str, int] | None = None, keyframes: int = 0) -> Job:
         job = Job(uuid.uuid4().hex[:16], map_name, time.time(), work=work, frames=frames,
-                  camera_only=camera_only)
+                  camera_only=camera_only, classes=dict(classes or {}), keyframes=keyframes)
         with self._cond:
             self._expire()
             self._jobs[job.id] = job
@@ -159,7 +162,7 @@ class Jobs:
         return job
 
     def _remaining(self, job: Job, now: float) -> float:
-        own = self.predict(job.frames, job.camera_only)
+        own = self.predict(job.frames, job.camera_only, job.classes, job.keyframes)
         return max(0.0, own - (now - job.started)) if job.started is not None else own
 
     def _eta(self, job: Job) -> float:

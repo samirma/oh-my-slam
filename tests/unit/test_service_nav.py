@@ -685,3 +685,90 @@ def test_passages_do_not_depend_on_the_cell_size(rooms_map: Nav) -> None:
         fl = decode(g["layers"]["floor_observed"])
         assert set(np.unique(fl).tolist()) <= {0, 1, 2}
     assert got[0] == got[1] == got[2] and len(got[0]) == 1
+
+
+def test_a_commit_prepares_the_locate_index_and_the_read_answers(
+        rooms_map: Nav, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R23/R24: the version a commit publishes already holds its locate index and its objects
+    answer (prepared before publication, once); grid answers are kept per version and
+    parameters; the map's latest version is never evicted by reads of others; and a read never
+    waits for the lock a derivation of another version holds."""
+    import threading
+
+    from oh_my_slam.service import derived as derived_mod
+    from oh_my_slam.service import nav as nav_mod
+
+    s = rooms_map.service
+    assert s.derived is not None
+    dv = s.derived.get("house", 1)
+    assert dv._index is not None and ("objects",) in dv._answers  # before any read
+    assert ("grid", 0.05, 0.05, 1.8, None, 2.0) in dv._answers
+    built: list[int] = []
+    real_build = derived_mod.Derived._build_index
+    monkeypatch.setattr(derived_mod.Derived, "_build_index",
+                        lambda self, *a: built.append(1) or real_build(self, *a))
+    grids: list[float] = []
+    real_grid = nav_mod.grid
+    monkeypatch.setattr(nav_mod, "grid", lambda *a, **k: grids.append(a[2]) or real_grid(*a, **k))
+    T = rooms.tour()[0]
+    img = rooms_map.backend.add(textured(1000), T)
+    rooms_map.locate("house", {"frames": [{"name": "q", "image": "q", "camera_id": "cam"}],
+                               "record": False}, {"q": img})
+    assert built == []  # the committed version's index: no locate builds it
+    rooms_map.get("/api/maps/house/objects", "Objects")
+    for _ in range(2):
+        rooms_map.get("/api/maps/house/grid", "Grid")  # the default grid: the objects' own
+        rooms_map.get("/api/maps/house/grid?cell_m=0.1", "Grid")
+    assert grids == [0.1]  # one computation per parameters
+    # many versions read: the latest stays in memory
+    rec = {k: v for k, v in s.store.version("house").items() if k not in ("version", "created_at")}
+    for _ in range(derived_mod.CACHE_VERSIONS + 2):
+        s.store.commit("house", {**rec, "job_id": None}, None)
+    latest = s.store.latest("house")
+    assert latest is not None
+    top = s.derived.get("house", latest)
+    for n in range(1, latest):
+        s.derived.get("house", n)
+    assert s.derived.get("house", latest) is top
+    # a derivation of the next version holds only its own lock
+    with s.derived._version_lock("house", latest + 1):
+        got: list[Any] = []
+        t = threading.Thread(target=lambda: got.append(s.derived.get("house", 1)))  # type: ignore[union-attr]
+        t.start()
+        t.join(10)
+        assert got and got[0].version == 1
+    # an answer computed once even when two reads ask at once
+    calls: list[int] = []
+    gate = threading.Event()
+
+    def slow() -> int:
+        calls.append(1)
+        gate.wait(5)
+        return 7
+
+    out: list[int] = []
+    ts = [threading.Thread(target=lambda: out.append(top.answer(("k",), slow)))
+          for _ in range(2)]
+    for x in ts:
+        x.start()
+    gate.set()
+    for x in ts:
+        x.join(10)
+    assert out == [7, 7] and calls == [1]
+    for k in range(derived_mod.ANSWERS + 1):  # bounded per version
+        top.answer(("n", k), lambda: 0)
+    assert len(top._answers) == derived_mod.ANSWERS
+
+
+def test_a_failed_read_answer_never_fails_the_commit(nav: Nav) -> None:
+    s = nav.service
+    assert s.derived is not None
+
+    def boom(dv: Any, files: Any) -> None:
+        raise RuntimeError("test")
+
+    s.derived.prepared.append(boom)
+    nav.backend.floor_z = 0.0
+    frames, files = scene_frames(nav, rooms.two_rooms(), rooms.tour()[:3])
+    assert nav.update("house", frames, files, {"cam": CAM320})["state"] == "committed"
+    assert nav.get("/api/maps/house/objects", "Objects")["map_version"] == 1

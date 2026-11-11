@@ -142,6 +142,14 @@ class GridAnswer:
     region_ids: list[int]
 
 
+def grid_answer(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
+                footprint: float | None, height_cap: float = HEIGHT_CAP_M) -> GridAnswer:
+    """``grid``, computed once per version and parameters (``DerivedVersion.answer``)."""
+    out: GridAnswer = dv.answer(("grid", cell, z_min, z_max, footprint, height_cap),
+                                lambda: grid(dv, ids, cell, z_min, z_max, footprint, height_cap))
+    return out
+
+
 def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
          footprint: float | None, height_cap: float = HEIGHT_CAP_M) -> GridAnswer:
     """The ``Grid`` answer (map.md §6) on the version's floor estimate (``floor_z_m``,

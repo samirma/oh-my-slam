@@ -385,8 +385,18 @@ def test_timings_persist_and_predict(tmp_path: Path) -> None:
     d = DEFAULTS
     assert t.predict_update(2, 1) == pytest.approx(
         d["job_overhead"] + 2 * d["checks_per_frame"] + d["registration_per_frame"]
-        + d["registration_mapanything_per_frame"] + 2 * d["fusion_per_frame"])
+        + d["registration_mapanything_per_frame"] + 2 * d["fusion_per_frame"]
+        + 2 * d["commit_per_keyframe"])
     assert t.predict_phases(0, 0, 0, 0) == (0.0, 0.0)
+    # R25: fusion by class (trust class, depth kind), the commit per keyframe of the version
+    reg, fus = t.predict_phases(3, 1, 2, 2, {"prior_depth": 1, "none_mono": 2}, 100)
+    assert fus == pytest.approx(2 / 3 * (d["fusion_per_frame_prior_depth"]
+                                         + 2 * d["fusion_per_frame_none_mono"])
+                                + 102 * d["commit_per_keyframe"])
+    assert t.predict_update(1, 1, {"none_mono": 1}, 10) > t.predict_update(1, 0, {
+        "prior_depth": 1}, 10)
+    from oh_my_slam.service.timings import fusion_class
+    assert fusion_class(True, False) == "prior_mono" and fusion_class(False, True) == "none_depth"
     t.add("locate_per_frame", 1.0, 3)
     t.add("locate_per_frame", 3.0)
     again = Timings(path)

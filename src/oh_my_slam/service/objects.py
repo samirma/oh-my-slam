@@ -3,8 +3,9 @@
 An anchored map commits each version's object records and surfaces with it
 (``versions/<n>.objects.json``, written by ``prior_first`` from ``mapping.anchored_objects``);
 this module adds each object's ``region`` from the version's default grid (``nav.object_regions``,
-5 cm cells, the default band) and keeps the answer per version (``derived/<n>/objects.json``),
-computed by the derivation worker after each commit, so a read only loads it.
+5 cm cells, the default band, the answer a default ``GET grid`` shares) and keeps the answer per
+version (``derived/<n>/objects.json``, and in memory: ``DerivedVersion.answer``), computed when
+the version is prepared, before it is published, so a read only returns it.
 
 A map of the older mapper has no such records: its objects (``derived`` meta) are listed from
 what that mapper records (README "Objects of the older mapper"): its score and label votes (the
@@ -73,14 +74,19 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
     return {"objects": out, "surfaces": []}
 
 
-def compute(store: Store, ids: nav.Ids, dv: DerivedVersion) -> dict[str, Any]:
-    """The ``Objects`` body of a derived version (without ``schema``)."""
-    p = store.version_file(dv.name, dv.version, "objects.json")
-    data = json.loads(p.read_text()) if p.exists() else _mapper_records(dv)
+def compute(store: Store, ids: nav.Ids, dv: DerivedVersion,
+            files: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The ``Objects`` body of a derived version (without ``schema``), from its committed
+    records (``files``, before it is published; else the store's)."""
+    p = store.version_file(dv.name, dv.version, CACHE)
+    data = (files or {}).get(CACHE)
+    if data is None:
+        data = json.loads(p.read_text()) if p.exists() else _mapper_records(dv)
     objects = data["objects"]
     regions: dict[int, int | None] = {}
     if objects:
-        answer = nav.grid(dv, ids, nav.DEFAULT_CELL_M, *nav.DEFAULT_Z_BAND, None)
+        answer = nav.grid_answer(dv, ids, nav.DEFAULT_CELL_M, *nav.DEFAULT_Z_BAND, None,
+                                 nav.HEIGHT_CAP_M)
         regions = nav.object_regions(answer, objects,
                                      {o["id"]: o.get("seen_from", []) for o in objects})
     return {"map": dv.name, "map_version": dv.version,
@@ -92,12 +98,18 @@ def compute(store: Store, ids: nav.Ids, dv: DerivedVersion) -> dict[str, Any]:
             "surfaces": data["surfaces"]}
 
 
-def body(store: Store, derived: Derived, ids: nav.Ids, dv: DerivedVersion) -> dict[str, Any]:
-    """The answer of a version: kept per version once computed."""
-    path = derived.dir(dv.name) / str(dv.version) / CACHE
-    if path.exists():
-        out: dict[str, Any] = json.loads(path.read_text())
+def body(store: Store, derived: Derived, ids: nav.Ids, dv: DerivedVersion,
+         files: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The answer of a version: computed once (``prepare``'s hook, with its ``files``), kept
+    on disk and in memory."""
+    def load() -> dict[str, Any]:
+        path = derived.dir(dv.name) / str(dv.version) / CACHE
+        if path.exists():
+            out: dict[str, Any] = json.loads(path.read_text())
+            return out
+        out = compute(store, ids, dv, files)
+        atomic_write_json(path, out)
         return out
-    out = compute(store, ids, dv)
-    atomic_write_json(path, out)
-    return out
+
+    got: dict[str, Any] = dv.answer(("objects",), load)
+    return got
