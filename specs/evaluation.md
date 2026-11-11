@@ -100,7 +100,7 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
 | `grid.floor_height` | C9 | Floor height error, against the surface the robot stands on (map.md §6): the large horizontal plane nearest the priors' origin height, else the lowest large horizontal plane below the cameras |
-| `reads.latency` | C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map, each |
+| `reads.latency` | C9, C10 | `GET grid` (5 cm cells) and `GET objects` on a committed version, house-sized map, each. Precomputing the locate index and read answers at commit counts toward `update.readable_latency`, not this metric |
 | `objects.support_height` | C10 | Support height error of objects on a surface (`supported_by` surface `height_m`) |
 | `objects.relations` | C10 | Share of `supported_by` / `inside_of` agreeing with the truth's relations |
 | `objects.centre_error`, `objects.label_agreement`, `objects.id_stability` | C10 | Object centre error, label agreement and id stability across updates |

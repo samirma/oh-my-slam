@@ -21,16 +21,21 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     committed and no map created. A frame `kept_at_prior` is not rejected. An engine that cannot
     tie kept frames to the priors' frame, on a first update where no prior-carrying frame
     registers, may reject the update the same way (`prior_frames_rejected`).
+* **Two-view parallax.** The one parallax measure of this specification. For a pair of frames,
+  it is the median, over their epipolar inliers, of the rotation-only residual divided by
+  sin of the angle between the ray and the baseline. Below 0.3 px the pair is
+  translation-unconstrained: one standpoint. Translation in front of a planar scene can read as
+  a rotation: an accepted degenerate case, since priors are expected whenever odometry exists.
 * **Without priors:**
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
-  * frames whose pairwise parallax (baseline over median scene depth, from their two-view fit)
-    is below 0.02 form one standpoint group, registered as a pure rotation about a common
-    centre. The common centre is the mean of their image-only centres, or the position of the
-    stored keyframe they overlap; its position sigma is their spread. A rotation-only
-    hypothesis takes the standpoint's position sigma, and the position test (api.md §4) uses
-    it;
+  * frames whose pairwise two-view parallax (above) is below 0.3 px form one standpoint group,
+    registered as a pure rotation about a common centre. The common centre is the overlapped stored keyframe with the most pair inliers
+    (ties: the lowest keyframe id), or, when they overlap none, the mean of their image-only
+    centres; its position sigma is their spread.
+  * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
+    (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
     image-measured relative rotations: a hard limit (§4, `rotation_inconsistent`). With priors
     this limit does not apply; the prior-rotation correction below covers it;
@@ -58,8 +63,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **New-frame disagreement.** The disagreement of the update's new frames between committed
   pose and image-only pose (the pose their images alone give against the map) is in
   `quality.max_displacement_m` and `max_displacement_deg` (§4), not in `gauge_shift`:
-  * a frame whose image-only pose is unconstrained in translation (parallax, baseline over
-    median scene depth, below 0.02) counts only its rotation;
+  * a frame whose image-only pose is unconstrained in translation (two-view parallax, above,
+    below 0.3 px against every reference it registers to) counts only its rotation;
   * frames `kept_at_prior` or `rejected` have no image-only pose and are left out.
 
   So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gates
@@ -193,7 +198,9 @@ becomes a job with a `job_id`. A job goes through these states:
   * A failing job is `rejected` with `quality.accepted: false` and the failing checks listed.
   * `accept_if: {}`, or a field left out, applies no check for that field.
   * Without `accept_if`, the job is accepted. Hard limits in `README.md` still reject updates
-    that would make the map inconsistent, for example a frame set that registers to nothing.
+    that would make the map inconsistent. An update fails the hard limit on content only when
+    it registers nothing and keeps nothing: an update whose frames are all `kept_at_prior` is
+    accepted and stores them.
   * **Rotation consistency** (updates without priors only): a hard limit rejects the update,
     `failed_checks` holding `rotation_inconsistent`, when the committed relative rotations
     between overlapping neighbours disagree with their image-measured relative rotations by
@@ -203,8 +210,8 @@ becomes a job with a `job_id`. A job goes through these states:
     * Without priors: the update's frames carry no priors.
     * Image-measured: each pair's own two-view relative rotation, independent of the joint
       solve.
-  * Hard limits are measured on registered frames only. With no measurable pair,
-    `rotation_inconsistent` passes.
+  * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
+    registered frames only. With no measurable pair, every pair limit passes.
 
 ## 5. Objects (O8)
 

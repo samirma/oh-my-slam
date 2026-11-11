@@ -163,12 +163,11 @@ error code `invalid_request` (§9).
       camera, or of an earlier `registered` frame of the same request and camera. The pose test
       uses the frame's registered pose, after registration: a frame that does not register can
       be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
-      with that keyframe: at least 90 % of its features re-matched, and no object record
-      visible in that view would change. Otherwise it is `registered`, and the later
-      observation wins (map.md §3, C13). Stored
-    `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
-    `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or 5°
-    away is never a duplicate. A view the map already has, beyond those limits, is `registered`.
+      with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
+      Otherwise it is `registered`, and the later observation wins (map.md §3, C13).
+    * Stored `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
+      `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or
+      5° away is never a duplicate. A view the map already has, beyond those limits, is `registered`.
   * `too_close` is only the camera-to-scene distance limit, with `min_distance_m` and
     `scene_distance_m`.
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
@@ -231,9 +230,25 @@ The versions read, revert and `--keep-versions` are O2.
   the conflict bound of §4 qualify: 3 × sqrt(σ_prior² + σ_hypothesis²), tested separately for
   position and rotation. When none does, the frame is `rejected` with `prior_conflict`, not
   located with `consistent_with_prior: false`; so a located frame with a prior always has
-  `consistent_with_prior: true`. A prior without sigmas takes the fixed
-  defaults of §3 (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send
-  sigmas.
+  `consistent_with_prior: true`. A prior without sigmas takes the fixed defaults of §3
+  (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send sigmas.
+* **Locate sigmas.** A located pose's sigmas come from the images alone, with trust class
+  `none`. The prior only ranks and gates (`prior_conflict`); it never changes the sigmas, so a
+  client that fuses the answer with its own prior does not count the prior twice.
+  * σ_rel = hypot(scale × covariance σ, floor[depth kind / none]), for position and rotation
+    separately: the registration covariance sigma in map metres, and the noise floor below.
+  * σ_rel is combined with the reference keyframe's map sigma only while
+    `locate.sigma_containment` and `locate.sigma_tightness_bound` (evaluation.md) both hold.
+    If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported
+    alone.
+  * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
+
+    | Depth | `metric` | `drifting` | `none` |
+    | --- | --- | --- | --- |
+    | with depth | 8 mm / 1.25° | 8 mm / 1.25° | 12 mm / 1.25° |
+    | without depth | 5 cm / 2.1° | 5 cm / 2.1° | 7.5 cm / 2.1° |
+
+    Locate uses the `none` column.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
     it.

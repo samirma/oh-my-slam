@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched, no visible object record would change); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior."
     },
     "InputStatus": {
       "type": "object",
@@ -435,7 +435,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or an earlier registered frame of the request, same camera) is rejected only when its image also agrees: >= 90 % of features re-matched and no visible object record would change; otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
+          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or an earlier registered frame of the request, same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
         }
       },
       "allOf": [
@@ -639,7 +639,7 @@
             "null"
           ],
           "minimum": 0,
-          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (parallax = baseline / median depth < 0.02) are left out; kept_at_prior and rejected frames excluded; null when there is none."
+          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (two-view parallax below 0.3 px against every reference, map.md §1) are left out; kept_at_prior and rejected frames excluded; null when there is none."
         },
         "max_displacement_deg": {
           "type": [
@@ -713,7 +713,7 @@
               "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Hard limits are measured on registered frames only; with no measurable pair, rotation_inconsistent passes."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only; with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -964,7 +964,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or an earlier registered frame of the request, same camera) is rejected only when its image also agrees: >= 90 % of features re-matched and no visible object record would change; otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
+          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or an earlier registered frame of the request, same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
         }
       },
       "allOf": [
@@ -2053,14 +2053,14 @@
             "number",
             "null"
           ],
-          "description": "Uncertainty of the chosen hypothesis only, including the image-registration noise, calibrated so that locate.sigma_containment is met."
+          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
           ],
-          "description": "Uncertainty of the chosen hypothesis only, including the image-registration noise, calibrated so that locate.sigma_containment is met."
+          "description": "From the images alone (trust class none): hypot(scale x covariance sigma, noise floor); the prior never changes it. Combined with the reference keyframe's map sigma only while locate.sigma_containment and locate.sigma_tightness_bound hold."
         },
         "inlier_ratio": {
           "type": [
