@@ -639,7 +639,7 @@
             "null"
           ],
           "minimum": 0,
-          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (parallax = baseline / median depth < 0.02) are left out; kept_at_prior and rejected frames excluded; null when there is none."
+          "description": "Largest translation, over the update's new frames that have an image-only pose, between committed pose and image-only pose; frames unconstrained in translation (two-view parallax below 0.3 px against every reference, map.md §1) are left out; kept_at_prior and rejected frames excluded; null when there is none."
         },
         "max_displacement_deg": {
           "type": [
