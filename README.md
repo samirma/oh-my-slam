@@ -418,7 +418,15 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   produced the estimate and every drifting frame the images confirmed under it since, each
   once and with no count bound; it resets to the new fit's inliers whenever a fit changes the
   estimate; on the older mapper `drift_support`, its kept estimate taking the job's registered
-  drifting frames, `Updater._confirmed_support`) at
+  drifting frames, `Updater._confirmed_support`). A confirmed frame joins the support only from
+  the commit of the version that registered it, never within its own job (oms/2.3 P19, every
+  engine, also when the job's drift change was refused): the prior-first engine marks the job's
+  confirmations `Drift.fresh`, which `Drift.predict` leaves out (the cross-engine retry, the
+  drift and duplicate reruns and `close_job` grow sigmas from the support as the job found it)
+  until the next job starts (`AnchoredMap.begin_job`); the older mapper adds them when it writes
+  the version's record. The fit's outliers never join. The supporting frames have no count
+  bound; odometry-scale evidence (and every other evidence list) stays capped at
+  **`MAX_EVIDENCE` = 500** entries, the most recent kept (`anchored.MAX_EVIDENCE`). The sigma grows at
   **`DRIFT_POS_REL` = 0.10** of that distance in position and **`DRIFT_ROT_DEG_PER_M` = 2° per
   metre** of it in rotation. Travel since the client's last fix is the client's part: drifting
   priors carry sigmas grown with it, and the engine no longer adds the odometry's path. A state

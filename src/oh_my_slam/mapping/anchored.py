@@ -1128,6 +1128,11 @@ class Drift:
     # the prior centres (odometry frame) of the frames that supported it: the fit's inliers and
     # every drifting frame the images confirmed since (``confirm``)
     support: list[list[float]] = field(default_factory=list)
+    # the supporting frames the running job confirmed (``confirm``): they join the support only
+    # from the commit of the version that registered them, never within their own job (map.md
+    # §1 "Supporting frames", P19), so ``predict`` leaves them out until the next job starts
+    # (``AnchoredMap.begin_job``); never written (``to_json``: the committed support has them)
+    fresh: list[list[float]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {"ref_T": None if self.ref_T is None else self.ref_T.tolist(),
@@ -1153,8 +1158,9 @@ class Drift:
             return P.copy(), sigma_pos, sigma_rot
         D = np.linalg.inv(self.ref_prior) @ P
         D[:3, 3] *= self.odo_scale
+        support = [c for c in self.support if c not in self.fresh]
         sp, sr = drift_grown(sigma_pos, sigma_rot, P, self.fit_sigma,
-                             self.support or [self.ref_prior[:3, 3].tolist()])
+                             support or [self.ref_prior[:3, 3].tolist()])
         return self.ref_T @ D, sp, sr
 
     def confirm(self, T: Array, P: Array) -> None:
@@ -1173,6 +1179,7 @@ class Drift:
         c = P[:3, 3].tolist()
         if c not in self.support:  # no count bound (SI-19): each supporting frame once
             self.support = [*self.support, c]
+            self.fresh = [*self.fresh, c]  # ... from the commit on (P19)
 
 
 def drift_grown(sigma_pos: float, sigma_rot: float, P: Array, fit_sigma: tuple[float, float],
@@ -1937,6 +1944,7 @@ class AnchoredMap:
         the job's caches start empty."""
         self._stored_ids = {k.id for k in self.keyframes}
         self._epi, self._placed = {}, {}
+        self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
 
     def _epipolar(self, a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
                   min_matches: int = EPIPOLAR_MIN_MATCHES) -> Epipolar | None:
