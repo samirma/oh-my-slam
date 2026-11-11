@@ -291,10 +291,13 @@ The versions read, revert and `--keep-versions` are O2.
       the camera's registered height in the map.
     * Without any height, `height_consistent` is null and the position sigma is σ_rel.
     * `height_consistent` is false when |z_located − z_expected| > 3 × sqrt(height_sigma² +
-      σ_z²), with σ_z = σ_rel / √3 (the sigmas are 3-D RMS). height_sigma is the locate
-      frame's `height_sigma_m` when it carries one; else the median `height_sigma_m` of the
-      confirmed keyframes that served as the answer's references; else, when none of them
-      carries one, the camera's registered z sigma (`sigma_pos_m` / √3).
+      σ_z²), with σ_z = σ_rel / √3 (the sigmas are 3-D RMS). height_sigma is, in this order:
+      1. the locate frame's own `height_sigma_m`;
+      2. else the median `height_sigma_m` that the answer's reference keyframes carried when
+         they were sent (the map frames' `height_sigma_m`);
+      3. else, when none of them carries one, the median of those reference keyframes'
+         `sigma_pos_m` / √3, from their registered pose sigmas;
+      4. else the default recorded in `README.md`.
     * Such a hypothesis ranks below any height-consistent rival. `consistent_with_prior` does
       not change.
   * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
