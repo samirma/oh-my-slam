@@ -12,8 +12,12 @@ Under ``<data>/oms/maps/<name>/derived/``:
 * ``features/<key>.npz`` — each keyframe image's SIFT keypoints and descriptors, shared by every
   version.
 
-``Derived`` subscribes to ``Store.listeners`` and derives each committed version on a worker
-thread; a read of a version not derived yet derives it at once. A version's mapper-map content
+``Derived`` subscribes to ``Store.preparing`` and derives each version before the store
+publishes it (``prepare``, in the job, from the mapper map it is committed with), so a read
+never waits for a derivation (high_level_spec.md §8); ``Store.listeners`` then has the worker
+thread compute the objects answer and the locate index. A version that preparation did not
+derive (an error, or a version committed before this) is derived by its first read. A version's
+mapper-map content
 (depth, cloud, images, objects) comes from the mapper map it was committed with: before a commit
 replaces that map, every version it serves that is not derived yet is derived from it
 (``Store.replacing``); a version whose mapper map is gone and that was never derived answers
@@ -31,6 +35,7 @@ import io
 import json
 import math
 import queue
+import shutil
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
@@ -43,6 +48,7 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
 from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
+from oh_my_slam.core.errors import OhMySlamError
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
@@ -135,6 +141,7 @@ class Derived:
         self.after: list[Callable[[DerivedVersion], Any]] = []
         store.listeners.append(self.committed)
         store.replacing.append(self.replacing)
+        store.preparing.append(self.prepare)
 
     # -- worker ---------------------------------------------------------------------------------
 
@@ -150,6 +157,22 @@ class Derived:
 
     def committed(self, name: str, n: int) -> None:
         self._queue.put((name, n))
+
+    def prepare(self, name: str, n: int, record: dict[str, Any], mapper: Path,
+                cameras: dict[str, Any]) -> None:
+        """Version ``n`` of map ``name`` derived before it is published, from its ``record``,
+        the ``mapper`` map it is committed with and the map's ``cameras`` (what a version
+        derived earlier under that number, never committed, held is replaced)."""
+        vdir = self.dir(name) / str(n)
+        with self._map_lock(name):
+            shutil.rmtree(vdir, ignore_errors=True)
+            internal = None
+            if mapper.exists():
+                try:
+                    internal = self.read_map(mapper)
+                except (OSError, OhMySlamError):
+                    internal = None
+            self._derive(name, n, record, vdir, internal, cameras)
 
     def replacing(self, name: str, first: int, last: int) -> None:
         """Versions ``first``..``last`` derived from the mapper map a commit is about to
@@ -227,8 +250,6 @@ class Derived:
 
     def _read(self, name: str) -> InternalMap | None:
         """The mapper map, None when the map has none (no update placed a frame yet)."""
-        from oh_my_slam.core.errors import OhMySlamError
-
         try:
             return self.read_map(self.store.mapper_dir(name))
         except (OSError, OhMySlamError):
@@ -241,15 +262,23 @@ class Derived:
                 return navgrid.Volume.from_bytes(p.read_bytes())
         return navgrid.Volume()
 
-    def _derive(self, name: str, n: int, record: dict[str, Any], vdir: Path) -> None:
+    def _derive(self, name: str, n: int, record: dict[str, Any], vdir: Path,
+                internal: InternalMap | None = None, cameras: dict[str, Any] | None = None
+                ) -> None:
+        """Derive a version into ``vdir`` (meta.json last) from its record, its mapper map
+        (``internal``; default: the map's current one) and the map's cameras (default: the
+        store's)."""
         sim = Sim3.from_dict(record["sim3"])
-        internal = self._read(name)
-        cams = {cid: Camera.from_json(c) for cid, c in self.store.cameras(name).items()}
+        if cameras is None:
+            internal = self._read(name)
+        cams = {cid: Camera.from_json(c) for cid, c in (
+            self.store.cameras(name) if cameras is None else cameras).items()}
         frames = [f for f in record["frames"] if f.get("camera_id") in cams]
         vol = self._base_volume(name, n)
         by_name = {f["name"]: f for f in frames}
         stale = [k for k, T in vol.frames.items()
-                 if k not in by_name or navgrid.pose_moved(T, np.asarray(
+                 if k not in by_name or by_name[k].get("pose_state") == "kept_at_prior"
+                 or navgrid.pose_moved(T, np.asarray(
                      by_name[k]["T_map_cam"]).reshape(-1).tolist())]
         if stale:
             vol = navgrid.Volume()
@@ -266,7 +295,9 @@ class Derived:
             return depth_of[f["name"]]
 
         for f in frames:
-            if f["name"] in vol.frames:
+            if f["name"] in vol.frames or f.get("pose_state") == "kept_at_prior":
+                # occupancy and heights come only from image-confirmed frames; a kept frame
+                # counts for the free-by-rule cells alone (``_stands``, map.md §6)
                 continue
             d = depth(f)
             if d is None:

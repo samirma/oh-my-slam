@@ -9,6 +9,7 @@ import math
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
@@ -278,24 +279,31 @@ def test_a_version_is_derived_from_its_own_mapper_map(tmp_path: Path,
         return m
 
     s.add_cameras("m", {}, {})
-    assert s.commit("m", rec, None) == 1  # no mapper map yet (unknown: the latest at least)
+    assert s.commit("m", rec, None) == 1  # no mapper map yet: derived without one
+    assert read == [] and (d.dir("m") / "1" / "meta.json").exists()
     assert s.commit("m", rec, mapper("A")) == 2
-    assert read == []  # version 1 had none (derived without one), nothing read from A
+    assert read == ["A"]  # derived from its own mapper map before it is published
     assert s.mapper_version("m") == 2
     assert s.commit("m", rec, None) == 3  # version 3 shares A
     assert s.commit("m", rec, mapper("B")) == 4
-    assert read == ["A", "A"]  # versions 2 and 3, before B replaced A
-    # a derivation that fails before the replacement: the version is gone, never derived from
-    # a later mapper map
+    assert read == ["A", "A", "B"]  # 2 and 3 were derived already when B replaced A
+    # a preparation that fails never fails the commit; a version neither prepared nor
+    # derived before its mapper map is replaced is gone, never derived from a later one
     real = d._derive
     monkeypatch.setattr(d, "_derive", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
-    assert s.commit("m", rec, mapper("C")) == 5  # the listener's failure never fails a commit
+    assert s.commit("m", rec, mapper("C")) == 5
+    assert s.commit("m", rec, mapper("D")) == 6
     monkeypatch.setattr(d, "_derive", real)
     with pytest.raises(ApiError) as e:
-        d.get("m", 4)
+        d.get("m", 5)
     assert e.value.code == "version_gone"
-    d.get("m", 5)
-    assert read[-1] == "C"
+    d.get("m", 6)  # its first read derives it, from its own mapper map
+    assert read[-1] == "D"
+    # a mapper map that cannot be read: derived without one
+    bad = mapper("E")
+    (bad / "tag").unlink()
+    assert s.commit("m", rec, bad) == 7 and (d.dir("m") / "7" / "meta.json").exists()
+    assert d._read("nomap") is None  # no mapper map to read
 
 
 
@@ -390,17 +398,24 @@ def test_timings_persist_and_predict(tmp_path: Path) -> None:
 
 
 def test_the_floor_of_a_cloud() -> None:
-    from oh_my_slam.service.update import estimate_floor, map_floor
+    from oh_my_slam.mapping.anchored import lowest_layer
+    from oh_my_slam.service.update import map_floor
 
     rng = np.random.default_rng(5)
     z = np.concatenate([rng.normal(-1.5, 0.01, 4000), rng.uniform(-1.4, -0.2, 1500),
                         rng.uniform(-3.0, -2.0, 20)])  # a few points below it: noise
-    assert estimate_floor(z, 0.0) == pytest.approx(-1.5, abs=0.03)
-    assert estimate_floor(None, 0.0) is None
-    assert estimate_floor(np.zeros(10) - 1.0, 0.0) is None
+    assert lowest_layer(z, 0.0) == pytest.approx(-1.5, abs=0.03)
+    assert lowest_layer(np.zeros(10) - 1.0, 0.0) is None
 
     class Empty:
         floor_z = None
         frames: tuple[Any, ...] = ()
 
     assert map_floor(Empty()) is None  # type: ignore[arg-type]
+
+    class NoCloud:  # frames but no point heights: no floor
+        floor_z = None
+        frames = (SimpleNamespace(T=np.eye(4)),)
+        points_z = None
+
+    assert map_floor(NoCloud()) is None  # type: ignore[arg-type]
