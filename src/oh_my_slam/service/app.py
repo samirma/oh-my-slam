@@ -373,16 +373,22 @@ class Api:
         z_min = nav.number(q, "z_min", nav.DEFAULT_Z_BAND[0])
         z_max = nav.number(q, "z_max", nav.DEFAULT_Z_BAND[1])
         foot = nav.number(q, "footprint_radius_m", None, 0.0)
-        assert cell is not None and z_min is not None and z_max is not None
+        # the height_m layer's ceiling (map.md §6): as asked, else the band's z_max when the
+        # request gives one, else the default
+        cap = nav.number(q, "height_cap_m", z_max if "z_max" in q else nav.HEIGHT_CAP_M)
+        assert cell is not None and z_min is not None and z_max is not None and cap is not None
         if z_max <= z_min:
             raise invalid("z_max", f"z_max ({z_max}) must be above z_min ({z_min})")
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         _stage(request, "derive", t0)
         t1 = time.perf_counter()
-        answer = await run_in_threadpool(nav.grid, dv, self._ids(), cell, z_min, z_max, foot)
+        answer = await run_in_threadpool(nav.grid, dv, self._ids(), cell, z_min, z_max, foot,
+                                         cap)
         _stage(request, "grid", t1)
         self.s.timings.add("grid_read", time.perf_counter() - t0)
         return body(answer.body)
+        if cap <= 0:
+            raise invalid("height_cap_m", f"height_cap_m ({cap}) must be above the floor (> 0)")
 
     async def get_objects(self, request: Request) -> Response:
         t0 = time.perf_counter()

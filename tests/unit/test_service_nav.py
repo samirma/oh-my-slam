@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
+from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.service import schema
 from oh_my_slam.service.app import Service, create_app
 from oh_my_slam.service.backend import Cloud
@@ -135,6 +136,7 @@ def test_grid_finds_the_door_between_two_rooms_exactly(rooms_map: Nav) -> None:
     g = rooms_map.get("/api/maps/house/grid", "Grid")
     assert g["map_version"] == 1 and g["cell_m"] == 0.05 and g["z_band_m"] == [0.05, 1.8]
     assert g["floor_z_m"] == pytest.approx(0.0, abs=0.005) and g["scale_source"] == "priors"
+    assert g["floor_sigma_m"] >= 0 and g["height_cap_m"] == 2.0  # no z_max asked: the default
     rows, cols = g["shape"]
     state = decode(g["layers"]["state"])
     assert state.shape == (rows, cols) and state.dtype == np.uint8
@@ -142,7 +144,9 @@ def test_grid_finds_the_door_between_two_rooms_exactly(rooms_map: Nav) -> None:
     assert decode(g["layers"]["height_m"]).dtype == np.float32
     assert len(g["regions"]) == 2
     (p,) = g["passages"]
-    assert p["kind"] == "door" and p["leaf"] is None
+    # no door object: an opening between two observed regions
+    assert p["kind"] == "opening" and p["leaf"] is None and p["leaves"] == []
+    assert p["narrow"] is None and p["frontier"] is None and None not in p["regions"]
     # the jambs lie on cell boundaries here: half a cell (the faces' mean place in a cell) over
     assert p["width_m"] == pytest.approx(0.95, abs=0.011)
     assert p["centre_m"][1] == pytest.approx(1.95, abs=0.011)
@@ -179,7 +183,9 @@ def test_grid_ids_are_stable_and_bands_apply_as_asked(rooms_map: Nav) -> None:
     assert [r["id"] for r in g1["regions"]] == sorted(r["id"] for r in g2["regions"])
     assert g1["passages"][0]["id"] == g2["passages"][0]["id"]
     g3 = rooms_map.get("/api/maps/house/grid?cell_m=0.025&footprint_radius_m=0.5", "Grid")
-    assert g3["passages"][0]["kind"] == "narrow"  # 0.9 m < 2 x 0.5 m
+    assert g3["passages"][0]["narrow"] is True  # 0.9 m < 2 x 0.5 m
+    assert g3["passages"][0]["kind"] == "opening" and g2["passages"][0]["narrow"] is None
+    assert g2["height_cap_m"] == 0.5  # the band's z_max, when asked
     assert g3["shape"][0] >= 2 * g1["shape"][0] - 1
 
 
@@ -193,15 +199,27 @@ def test_overhangs_above_the_band_are_free_below_it(nav: Nav) -> None:
     r, c = int((2.9 - oy) / 0.05), int((1.5 - ox) / 0.05)  # under the table top, between legs
     assert decode(low["layers"]["state"])[r, c] == 1
     assert decode(high["layers"]["state"])[r, c] == 2
-    assert decode(low["layers"]["height_m"])[r, c] == pytest.approx(0.75, abs=0.05)
+    # the height layer's cap is the asked z_max: the table top above it is left out, unless a
+    # higher cap is asked
+    assert low["height_cap_m"] == 0.5
+    assert decode(low["layers"]["height_m"])[r, c] == pytest.approx(0.0, abs=0.05)
+    capped = nav.get("/api/maps/t/grid?z_max=0.5&height_cap_m=1.0", "Grid")
+    assert capped["height_cap_m"] == 1.0
+    assert decode(capped["layers"]["height_m"])[r, c] == pytest.approx(0.75, abs=0.05)
+    assert nav.get("/api/maps/t/grid?height_cap_m=0", status=400)["error"]["details"][
+        "field"] == "height_cap_m"
 
 
 def test_an_open_leaf_is_reported_and_narrows_the_gap(nav: Nav) -> None:
     nav.backend.floor_z = 0.0
+    # the leaf's door object (map.md §5): the passage names it
+    nav.backend.objects_world = [{"id": 4, "label": "door", "center": [4.5, 2.38, 1.0],
+                                  "R": np.eye(3).tolist(), "size": [0.8, 0.04, 2.0]}]
     frames, files = scene_frames(nav, rooms.two_rooms(leaf=True), rooms.tour())
     nav.update("l", frames, files, {"cam": CAM320})
     (p,) = nav.get("/api/maps/l/grid", "Grid")["passages"]
     assert p["kind"] == "door" and p["leaf"] is not None and p["leaf"]["intrudes"] is False
+    assert p["leaves"] == [p["leaf"]] and p["leaf"]["object_id"] == 4
     assert 0.8 <= p["width_m"] < 0.95  # narrower than the 0.9 m + a cell of the bare gap
 
 
@@ -521,6 +539,15 @@ def test_derived_floor_fallbacks_and_maps_without_mapper(nav: Nav) -> None:
     assert s.derived.get("bare", n).floor_z == 0.0
     n = s.store.commit("bare", rec([f], floor=-0.5), None)
     assert s.derived.get("bare", n).floor_z == -0.5
+    assert s.derived.get("bare", n).floor_sigma == FLOOR_SIGMA_DEFAULT_M  # an older record
+    # an oms/2.2 record holds the version's one floor estimate: the grid uses it as is
+    n = s.store.commit("bare", {**rec([f], floor=-0.3), "floor_sigma_m": 0.025}, None)
+    dv = s.derived.get("bare", n)
+    assert (dv.floor_z, dv.floor_sigma) == (-0.3, 0.025)
+    g = nav.get(f"/api/maps/bare/grid?version={n}", "Grid")
+    assert (g["floor_z_m"], g["floor_sigma_m"]) == (-0.3, 0.025)
+    n = s.store.commit("bare", {**rec([f]), "floor_sigma_m": 0.025}, None)  # no floor found
+    assert s.derived.get("bare", n).floor_z == pytest.approx(0.2)
     s.derived.committed("nomap", 1)  # a failed derivation is logged, the worker goes on
     s.derived.stop()
     s.derived.stop()
@@ -531,7 +558,9 @@ def test_derived_floor_from_the_volume_doors_and_unhashed_images(nav: Nav) -> No
     nav.backend.objects_world = [
         {"id": 5, "label": "Door", "center": [4.05, 1.95, 1.0], "R": np.eye(3).tolist(),
          "size": [0.9, 0.1, 2.0]},
-        {"id": 6, "label": "chair", "center": [2.0, 2.0, 0.4], "size": [0.5, 0.5, 0.8]}]
+        {"id": 6, "label": "chair", "center": [2.0, 2.0, 0.4], "size": [0.5, 0.5, 0.8]},
+        # a box labelled door that is no leaf (0.5 m thick): a hint only, never a leaf
+        {"id": 7, "label": "door", "center": [6.0, 3.0, 1.0], "size": [0.9, 0.5, 2.0]}]
     frames, files = scene_frames(nav, rooms.two_rooms(), rooms.tour())
     job = nav.update("f", frames, files, {"cam": CAM320})
     assert job["state"] == "committed"
@@ -541,10 +570,11 @@ def test_derived_floor_from_the_volume_doors_and_unhashed_images(nav: Nav) -> No
     assert v["floor_z_m"] is None
     dv = s.derived.get("f", 1)
     assert dv.floor_z == pytest.approx(-0.025, abs=0.03)
-    assert dv.meta["doors"] == [pytest.approx([4.05, 1.95])]
+    assert dv.meta["doors"] == [pytest.approx([4.05, 1.95]), pytest.approx([6.0, 3.0])]
+    assert [d["id"] for d in dv.meta["door_leaves"]] == [5]
     assert dv.meta["objects"][1]["yaw_deg"] == 0.0
     (p,) = nav.get("/api/maps/f/grid", "Grid")["passages"]
-    assert p["kind"] == "door"
+    assert p["kind"] == "door" and [lf["object_id"] for lf in p["leaves"]] == [5]
     rec = {k: val for k, val in v.items() if k not in ("version", "created_at")}
     rec["frames"] = [{k: val for k, val in fr.items() if k != "sha256"} for fr in rec["frames"]]
     n = s.store.commit("f", rec, None)

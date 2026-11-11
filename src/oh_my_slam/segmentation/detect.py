@@ -113,10 +113,26 @@ COMPATIBLE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"rug", "carpet"}),
     frozenset({"cushion", "pillow"}),
     frozenset({"window", "shop window", "window shutter", "shutter"}),
-    frozenset({"door", "doorway", "gate"}),
     frozenset({"car", "taxi", "van"}),
     frozenset({"cell phone", "remote control", "tablet computer"}),
 )
+
+
+# Doorways (map.md §5). A door opening is a passage of the grid, not an object: a detection
+# naming an opening (PASSAGE_LABELS) is never an object, and may only hint a passage. A detected
+# door is an object only as a leaf (``door_leaf``): an upright box thinner than DOOR_LEAF_MAX_M
+# across (its thin side horizontal, so the leaf stands vertical) and at least DOOR_LEAF_MIN_M tall.
+PASSAGE_LABELS = frozenset({"doorway", "gate", "opening", "archway", "entrance", "door frame"})
+DOOR_LABEL = "door"
+DOOR_LEAF_MAX_M = 0.20  # an open leaf seen at an angle measured 0.17 m
+DOOR_LEAF_MIN_M = 0.6
+
+
+def door_leaf(size: Any) -> bool:
+    """Whether an upright box of ``size`` (x the longer horizontal side, y, z up) is a door
+    leaf: thin across, vertical, tall enough (see ``DOOR_LEAF_MAX_M``)."""
+    x, y, z = (float(v) for v in size)
+    return min(x, y) < DOOR_LEAF_MAX_M and z >= DOOR_LEAF_MIN_M
 
 
 # Floor grounding (``segmentation.obb.ground_upright``). When a floor plane is known, the box of a

@@ -202,6 +202,15 @@ def test_the_floor_named_as_an_object_is_dropped(tmp_path: Path) -> None:
     v = View("a", T, 0.01, K_TABLE, z, rgb, [det])
     assert ao.observe(v, 1, 0.0) == []
     assert len(ao.observe(v, 1, None)) == 1
+    # the floor band is max(0.06 m, 3 floor sigmas) of the floor estimate (map.md §5): the floor
+    # still, with the estimate 4.5 cm off; not floor 8 cm off on a well-known floor; floor again
+    # when the floor's height is known to 3 cm only
+    assert ao.observe(v, 1, 0.045) == []
+    assert len(ao.observe(v, 1, 0.08)) == 1
+    assert ao.observe(v, 1, 0.08, floor_sigma=0.03) == []
+    # a detection naming an opening is no object (map.md §5)
+    v.dets = [Detection("doorway", 0.8, "test", m, det.box)]
+    assert ao.observe(v, 1, None) == []
 
 
 def test_flickering_labels_and_ignore_masks(tmp_path: Path) -> None:
@@ -735,6 +744,17 @@ def test_tiny_fragments_are_not_listed() -> None:
     assert not ao.listed(o)
     o.box = Box(np.zeros(3), np.array([0.04, 0.01, 0.01]), 0.0)
     assert ao.listed(o)
+
+
+def test_a_door_is_listed_only_as_a_leaf() -> None:
+    """A door object is a leaf (map.md §5): thinner than 0.20 m, vertical, at least 0.6 m tall."""
+    o = MapObject(1, {"door": 1.0}, published=True,
+                  box=Box(np.zeros(3), np.array([0.9, 0.17, 2.0]), 0.0))
+    assert o.label == "door" and ao.listed(o)  # an open leaf seen at an angle
+    o.box = Box(np.zeros(3), np.array([0.9, 0.4, 2.0]), 0.0)  # a block: no leaf
+    assert not ao.listed(o)
+    o.box = Box(np.zeros(3), np.array([0.9, 0.05, 0.4]), 0.0)  # too low
+    assert not ao.listed(o)
 
 
 def test_background_and_robot_masks_are_dropped() -> None:

@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from oh_my_slam.core.constants import FLOOR_BAND_MIN_M, floor_band_m
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.reconstruction.api import FrameReconstruction
 from oh_my_slam.reconstruction.gravity import (
@@ -21,8 +22,11 @@ from oh_my_slam.reconstruction.gravity import (
 )
 from oh_my_slam.segmentation.api import (
     FLOOR_SHARE,
+    PASSAGE_LABELS,
     Detection,
     LiftedInstance,
+    compatible,
+    door_leaf,
     frame_floor,
     on_the_floor,
     segment_frame,
@@ -121,3 +125,10 @@ def test_a_single_image_drops_the_floor_named_as_a_bed(seed: int) -> None:
     # an image without a floor has nothing to measure it against
     assert frame_floor(FrameReconstruction(Path("x.jpg"), frame.rgb, frame.depth, valid, K, K)
                        ) is None
+
+
+def test_the_door_leaf_rule_and_the_floor_band() -> None:
+    assert door_leaf([0.9, 0.17, 2.0]) and door_leaf([0.05, 0.8, 2.0])
+    assert not door_leaf([0.9, 0.25, 2.0]) and not door_leaf([0.9, 0.05, 0.5])
+    assert "doorway" in PASSAGE_LABELS and not compatible("door", "doorway")
+    assert floor_band_m(0.0) == FLOOR_BAND_MIN_M and floor_band_m(0.03) == pytest.approx(0.09)

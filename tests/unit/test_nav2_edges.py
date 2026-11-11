@@ -58,7 +58,7 @@ def test_a_door_object_finds_the_gap_of_a_wall_seen_partly() -> None:
     door = [3.5, 1.35]
     f = ng.features(lay, doors=[door, [20.0, 20.0]])  # the second lies off the grid's free space
     (p,) = f.passages
-    assert p.kind == "door" and abs(p.centre[1] - 1.35) < 0.1 and 0.8 <= p.width <= 1.1
+    assert p.kind == "opening" and abs(p.centre[1] - 1.35) < 0.1 and 0.8 <= p.width <= 1.1
     again = ng.features(lay, doors=[door, door])  # a door already given its chord
     assert len(again.passages) == 1
 

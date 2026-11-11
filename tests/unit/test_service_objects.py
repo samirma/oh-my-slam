@@ -102,6 +102,11 @@ def test_objects_of_an_anchored_map(client: Client) -> None:
     assert o["box"]["mean_rgb"] == pytest.approx([200, 40, 40], abs=6)
     assert all(x["region"] is not None for x in doc["objects"])
     assert "seen_from" not in doc["objects"][0]
+    # one floor estimate per version (map.md §5): the record's, which the grid answers as is
+    rec = client.service.store.version("t", 1)
+    grid = client.get("/api/maps/t/grid", "Grid")
+    assert rec["floor_z_m"] == pytest.approx(0.0, abs=0.01) and rec["floor_sigma_m"] > 0
+    assert (grid["floor_z_m"], grid["floor_sigma_m"]) == (rec["floor_z_m"], rec["floor_sigma_m"])
     # kept per version: the derivation worker computed it, the read loads it
     cache = client.service.store.dir("t") / "derived" / "1" / "objects.json"
     assert cache.exists()

@@ -60,8 +60,11 @@ from oh_my_slam.segmentation.detect import (
     priority,
     request_floor,
 )
+from oh_my_slam.segmentation.detect import DOOR_LABEL as DOOR_LABEL
+from oh_my_slam.segmentation.detect import PASSAGE_LABELS as PASSAGE_LABELS
 from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
+from oh_my_slam.segmentation.detect import door_leaf as door_leaf
 from oh_my_slam.segmentation.detect import label_fit as label_fit
 from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.detect import surface_label as surface_label
@@ -214,7 +217,11 @@ def trim_support(inst: LiftedInstance, depth: NDArray[Any], K: Intrinsics, valid
 # floor's points); nothing more of a body is left than the share a support fringe may take of an
 # object (``lift.SUPPORT_MAX_SHARE``). The floor strips of that room: 100 % of their points; the
 # room's real detections at most 12 %. A floor covering (a rug, a mat) or what may lie flat on
-# the floor (a towel, a book) is no floor-standing class and is kept.
+# the floor (a towel, a book) is no floor-standing class and is kept. On a map the band is the
+# version's floor band (map.md §5: ``core.constants.floor_band_m``, at least 6 cm): a
+# floor-standing object must rise above it. The rule judges only what stands on the floor
+# estimate: an object on another support, a worktop above or a lower floor more than the band
+# below, keeps its detection whatever its height, and no support surface becomes an object.
 FLOOR_SHARE = 1.0 - SUPPORT_MAX_SHARE
 
 

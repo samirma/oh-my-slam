@@ -59,6 +59,12 @@ def test_integrate_skips_frames_with_nothing_to_add(monkeypatch: pytest.MonkeyPa
     assert w.estimate_floor() == pytest.approx(0.0, abs=0.01)  # the floor box top: z 0
 
 
+def _door(x: float, y: float, oid: int = 1, yaw: float = 0.0, width: float = 0.8,
+          thick: float = 0.04) -> dict[str, object]:
+    """A door object shaped as a leaf (map.md §5), as the derived meta lists it."""
+    return {"id": oid, "centre_m": [x, y, 1.0], "size_m": [width, thick, 2.0], "yaw_deg": yaw}
+
+
 def _grid(state: np.ndarray, cell: float = 0.1) -> ng.Layers:
     R, C = state.shape
     return ng.Layers(np.zeros(2), cell, state.astype(np.uint8), np.ones((R, C), np.uint16),
@@ -156,15 +162,27 @@ def test_features_kinds_frontiers_and_small_parts() -> None:
     f = ng.features(lay)
     assert len(f.regions) == 2 and len(f.passages) == 1
     (p,) = f.passages
-    assert p.kind == "door" and p.width == pytest.approx(0.9, abs=0.11)
+    # no door object: an opening, whatever its width; narrow unknown without a footprint
+    assert p.kind == "opening" and p.width == pytest.approx(0.9, abs=0.11)
+    assert p.leaves == [] and p.leaf is None and p.narrow is None and p.frontier is None
+    assert p.regions[1] is not None
     assert {fr.region for fr in f.frontiers} <= {0, 1, None}
-    f2 = ng.features(lay, doors=[p.centre])
-    assert f2.passages[0].kind == "door" and f2.passages[0].leaf is None
-    st[13:27, 34:36] = 1  # a wider gap: no door-shaped gap (an opening)
+    f2 = ng.features(lay, doors=[p.centre])  # a door hint alone is no leaf
+    assert f2.passages[0].kind == "opening" and f2.passages[0].leaf is None
+    # a door object shaped as a leaf, swung into the gap, and one along the wall: a door with
+    # both leaves (no open leaf in this grid: their boxes' footprints), the larger first
+    f4 = ng.features(lay, leaves=[_door(3.95, 2.0, 7, width=0.4), _door(3.95, 1.62, 8),
+                                  _door(9.0, 9.0, 9)])
+    (q,) = f4.passages
+    assert q.kind == "door" and [lf["object_id"] for lf in q.leaves] == [8, 7]
+    assert q.leaf == q.leaves[0] and not q.leaves[0]["intrudes"] and q.leaves[1]["intrudes"]
+    assert len(q.leaves[0]["polygon_m"]) == 4
+    st[13:27, 34:36] = 1  # a wider gap: an opening
     wide = ng.features(_grid(st))
     assert [q.kind for q in wide.passages] in ([], ["opening"])
-    f3 = ng.features(lay, footprint_radius=0.5)
-    assert f3.passages[0].kind == "narrow"
+    f3 = ng.features(lay, footprint_radius=0.5)  # 0.9 m < 2 x 0.5 m
+    assert f3.passages[0].kind == "opening" and f3.passages[0].narrow is True
+    assert ng.features(lay, footprint_radius=0.3).passages[0].narrow is False
     # the blob's frontier is too short and touches no region
     assert all(fr.length >= ng.MIN_FRONTIER_M for fr in f.frontiers)
 
@@ -192,7 +210,7 @@ def test_a_chord_that_does_not_split_is_no_passage() -> None:
     assert len(f.regions) == 2 and len(f.passages) == 2
     for p in f.passages:
         # 0.8 m of free cells; the jambs' faces half a cell into the cells the chord ends on
-        assert p.width == pytest.approx(0.9, abs=0.01) and p.kind == "door"
+        assert p.width == pytest.approx(0.9, abs=0.01) and p.kind == "opening"
 
 
 def test_walled_checks_both_ends() -> None:
@@ -351,7 +369,11 @@ def test_a_thin_open_leaf_seen_from_a_few_views_stays_occupied(thickness: float)
     assert all(lay.state[rc] == ng.OCCUPIED for rc in seen)
     feat = ng.features(lay)
     door = [p for p in feat.passages if abs(p.centre[0] - 4.05) < 0.3]
-    assert door and door[0].leaf is not None
+    assert door and door[0].kind == "opening" and door[0].leaf is None  # no door object
+    leaf = _door(4.5, y, 5, width=0.8, thick=thickness)
+    door = [p for p in ng.features(lay, leaves=[leaf]).passages if abs(p.centre[0] - 4.05) < 0.3]
+    assert door and door[0].kind == "door" and door[0].leaf is not None
+    assert door[0].leaf["object_id"] == 5 and not door[0].leaf["intrudes"]
 
 
 def test_the_floor_is_the_surface_the_robot_stands_on() -> None:
@@ -399,9 +421,14 @@ def test_a_wide_double_doorway_with_both_leaves_open_into_the_room(height: float
     ng.mark_stands(lay, [ng.Stand(T, rooms.K640, 320, 240) for T in cams], floor, 0.0)
     assert lay.state[lay.cell_of([3.5, 3.5])] == ng.UNKNOWN  # behind a leaf, inside a disc
     assert not ng.features(lay).passages
-    feat = ng.features(lay, doors=[(3.5, 1.02), (3.5, 2.98)])
+    doors = [(3.5, 1.02), (3.5, 2.98)]
+    hinted = ng.features(lay, doors=doors)  # door hints find the doorway; no leaf named
+    assert [(q.kind, q.leaves) for q in hinted.passages] == [("opening", [])]
+    feat = ng.features(lay, doors=doors, leaves=[_door(x, y, i, width=0.9) for i, (x, y) in
+                                                 enumerate(doors, start=1)])
     (p,) = feat.passages
     assert p.kind == "door" and len(feat.regions) == 2 and p.regions in ((0, 1), (1, 0))
+    assert sorted(lf["object_id"] for lf in p.leaves) == [1, 2]
     assert p.width == pytest.approx(1.92, abs=0.1)
     assert float(np.linalg.norm(p.centre - [4.05, 2.0])) <= 0.1
     assert sorted(round(float(j[1]), 1) for j in p.jambs) == [1.0, 3.0]
@@ -412,3 +439,90 @@ def test_a_wide_double_doorway_with_both_leaves_open_into_the_room(height: float
     # one door object at the gap's centre finds it too
     (q,) = ng.features(lay, doors=[(4.05, 2.0)]).passages
     assert float(np.linalg.norm(q.centre - p.centre)) < 1e-6
+
+
+def test_a_doorway_to_a_never_observed_side() -> None:
+    """A room whose wall has a 0.8 m gap with only a sliver seen beyond it, then unknown: the
+    passage goes from the room to the unobserved side (regions [a, null]), names the frontier
+    there, and its normal points toward it (map.md §6). Fully seen beyond (no frontier there): no
+    passage."""
+    st = np.zeros((40, 70), np.uint8)
+    st[5:35, 2:34] = 1
+    st[5:35, 34:36] = 2
+    st[16:24, 34:36] = 1  # the gap
+    st[16:24, 36:38] = 1  # a sliver seen beyond it: too small for a region
+    f = ng.features(_grid(st))
+    assert len(f.regions) == 1
+    (p,) = f.passages
+    assert p.regions == (0, None) and p.frontier is not None and p.kind == "opening"
+    fr = f.frontiers[p.frontier]
+    assert fr.centre[0] > 3.4  # on the far side
+    assert abs(p.normal_deg) < 1.0  # toward +x, the unobserved side
+    # the same doorway on the room's other side: the normal still points away from the room
+    flipped = ng.features(_grid(st[:, ::-1].copy()))
+    (q,) = flipped.passages
+    assert q.regions == (0, None) and abs(abs(q.normal_deg) - 180.0) < 1.0
+    closed = st.copy()
+    closed[14:26, 38] = 2  # walled in beyond the sliver
+    closed[14, 36:38] = 2
+    closed[25, 36:38] = 2
+    closed[16:24, 36:38] = 2
+    assert ng.features(_grid(closed)).passages == []
+
+
+def test_far_frontier_needs_one_ahead_and_near() -> None:
+    centre, n = np.array([0.0, 0.0]), np.array([1.0, 0.0])
+    behind = [np.array([[-0.5, 0.0], [-0.4, 0.1]])]
+    assert ng._far_frontier(behind, centre, n) is None
+    far = [np.array([[3.0, 0.0]])]
+    assert ng._far_frontier(far, centre, n) is None
+    both = [np.array([[0.8, 0.0]]), np.array([[0.3, 0.0]])]
+    assert ng._far_frontier(both, centre, n) == 1
+
+
+def test_an_open_leaf_without_a_door_object_is_no_leaf() -> None:
+    st = np.zeros((40, 70), np.uint8)
+    st[5:35, 2:34] = 1
+    st[5:35, 36:68] = 1
+    st[5:35, 34:36] = 2
+    st[16:24, 34:36] = 1
+    st[24, 36:44] = 2  # an open leaf, hinged at the upper jamb, swung 90 deg into room B
+    lay = _grid(st)
+    (p,) = ng.features(lay).passages
+    assert p.kind == "opening" and p.leaves == []
+    # named by a door object near it: the leaf the grid shows, with the object's id
+    (q,) = ng.features(lay, leaves=[_door(4.0, 2.45, 3)]).passages
+    assert q.kind == "door" and q.leaves[0]["object_id"] == 3
+    assert q.leaves[0] == {**ng._leaves(st, lay, *q.jambs)[0], "object_id": 3}
+
+
+def test_the_floor_band_and_the_height_cap() -> None:
+    """The floor band is max(0.06 m, 3 floor sigmas) about the floor (map.md §6): a flat surface
+    0.075 m up is an obstacle on a well-known floor, floor on a floor of sigma 0.03 m. ``height_m``
+    keeps surfaces at or below the cap only."""
+    v = ng.Volume()
+    v.ensure(np.zeros(3), np.array([0.5, 0.5, 3.0]))
+    Z = v.shape[0]
+    zc = v.origin[2] + (np.arange(Z) + 0.5) * v.vz
+    low = int(np.argmin(np.abs(zc - 0.075)))
+    v.hit[low, 2, 2] = v.flat[low, 2, 2] = 3
+    v.hit[low, 4, 4] = v.flat[low, 4, 4] = 3
+    top = int(np.argmin(np.abs(zc - 2.475)))
+    v.hit[top, 4, 4] = 3  # a ceiling over (4, 4)
+    floor = float(zc[low] - 0.075)
+    sharp = ng.layers(v, floor, 0.05, 1.8)
+    assert sharp.state[2, 2] == ng.OCCUPIED and sharp.floor_observed[2, 2] == 0
+    loose = ng.layers(v, floor, 0.05, 1.8, floor_sigma=0.03)
+    assert loose.state[2, 2] == ng.FREE and loose.floor_observed[2, 2] == 1
+    assert sharp.height[4, 4] == pytest.approx(0.075, abs=0.01)  # the ceiling is above 2.0 m
+    high = ng.layers(v, floor, 0.05, 1.8, height_cap=2.6)
+    assert high.height[4, 4] == pytest.approx(2.475, abs=0.01)
+
+
+def test_a_gap_between_two_sides_of_one_region_is_no_passage() -> None:
+    st = np.zeros((45, 70), np.uint8)
+    st[5:40, 2:68] = 1
+    st[5:35, 34:36] = 2  # a wall with a gap; the rooms also meet below its end
+    st[16:24, 34:36] = 1
+    f = ng.features(_grid(st))
+    assert len(f.regions) == 1 and f.passages == []

@@ -42,9 +42,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
+from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
+from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
 from oh_my_slam.service.errors import ApiError
@@ -77,6 +79,11 @@ class DerivedVersion:
     @property
     def floor_z(self) -> float:
         return float(self.meta["floor_z"])
+
+    @property
+    def floor_sigma(self) -> float:
+        """The floor's height sigma (a version derived before oms/2.2: the default)."""
+        return float(self.meta.get("floor_sigma", FLOOR_SIGMA_DEFAULT_M))
 
     def volume(self) -> navgrid.Volume:
         with self._lock:
@@ -316,11 +323,14 @@ class Derived:
         arrays: dict[str, Any] = {f"p{i}": p for i, p in enumerate(points)}
         np.savez(buf, **arrays)
         atomic_write_bytes(vdir / "locate.npz", buf.getvalue())
-        # the floor: the plane of the volume's flat points below the cameras (the depth's own,
-        # to the centimetre) that the version's floor names — the surface the robot stands on,
-        # which the objects use too (map.md §6) — else the lowest; else the version's
-        floor = vol.estimate_floor(float(C[:, 2].min()), record.get("floor_z_m")) \
-            if frames else None
+        # the floor: the version's one estimate (map.md §5), which its objects used, when its
+        # record holds it (``floor_sigma_m``: oms/2.2 records); for an older record, the plane of
+        # the volume's flat points below the cameras that the version's floor names — else the
+        # lowest; else the version's; else from the camera heights
+        floor_sigma = float(record.get("floor_sigma_m") or FLOOR_SIGMA_DEFAULT_M)
+        floor = record.get("floor_z_m") if "floor_sigma_m" in record else None
+        if floor is None and frames:
+            floor = vol.estimate_floor(float(C[:, 2].min()), record.get("floor_z_m"))
         if floor is None:
             floor = record.get("floor_z_m")
         if floor is None:
@@ -338,8 +348,12 @@ class Derived:
                             "size_m": size.tolist(), "yaw_deg": yaw_of(sim.R @ R),
                             **{k: o[k] for k in MAPPER_OBJECT_KEYS if k in o}})
         atomic_write_json(vdir / "meta.json", {
-            "version": n, "floor_z": float(floor), "objects": objects,
+            "version": n, "floor_z": float(floor), "floor_sigma": floor_sigma, "objects": objects,
             "doors": [o["centre_m"][:2] for o in objects if "door" in o["label"].lower()],
+            # the door leaves a passage names (map.md §5-§6): door objects shaped as leaves
+            "door_leaves": [{k: o[k] for k in ("id", "centre_m", "size_m", "yaw_deg")}
+                            for o in objects if o["label"].lower() == DOOR_LABEL and o.get("id")
+                            and door_leaf(o["size_m"])],
             "keyframes": [k.name for k in kfs], "keys": keys})
 
     def _features(self, name: str, key: str, img: Path

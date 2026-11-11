@@ -303,7 +303,10 @@ called by `service.prior_first` after the engine placed and fused the update's k
   server, `segmentation.api.detect_on_grid`) while it is registered, masks on its monocular
   depth grid (640 px on the long side), and only the frames kept as keyframes are used. Each
   detection is lifted on the keyframe's fused depth into the map frame (`lift_on_grid`, without
-  the support its mask bled onto, without the floor named as an object).
+  the support its mask bled onto, without the floor named as an object: a floor-standing class
+  with more than 75 % of its points within the floor band of the version's floor, max(0.06 m,
+  3 × `floor_sigma_m`), the grid's (below; map.md §5). An object on any other support keeps its
+  detection whatever its height, and no support surface becomes an object).
 * **Association, incremental.** Only the new keyframes are folded in, in request order. A
   detection goes to the object it overlaps (points within the object's box grown by 5 cm, or the
   object's within its own; for compatible labels also the nearness of the centres; for other
@@ -390,7 +393,7 @@ called by `service.prior_first` after the engine placed and fused the update's k
   `verified_version`: the latest version that observed the object or its support with the
   relation holding (surfaces are measured by every update).
 * **Region** is the grid's (`nav.object_regions`, the default grid), set when the read's answer
-  is computed. Door-labelled objects feed the grid's passages of kind `door`; the points read
+  is computed. Door objects shaped as leaves feed the grid's passages of kind `door`; the points read
   carries each object's id in `object_id`.
 * **Per version.** The records are committed with the version (`versions/<n>.objects.json`); the
   answer with regions is computed by the derivation worker after the commit and kept
@@ -549,8 +552,8 @@ server.
 
 ### Navigation grid and points (O6)
 
-`GET /api/maps/{name}/grid?cell_m=&z_min=&z_max=&footprint_radius_m=&version=` (defaults 0.05 m,
-0.05 m, 1.8 m; `cell_m` 0.01–1 m) and `GET /api/maps/{name}/points?min=x,y,z&max=x,y,z&voxel_m=
+`GET /api/maps/{name}/grid?cell_m=&z_min=&z_max=&footprint_radius_m=&height_cap_m=&version=`
+(defaults 0.05 m, 0.05 m, 1.8 m; `height_cap_m` `z_max` when given, else 2.0 m, > 0; `cell_m` 0.01–1 m) and `GET /api/maps/{name}/points?min=x,y,z&max=x,y,z&voxel_m=
 &max_points=` (defaults 0.01 m, 200 000; at most 2 000 000), from the version's derived data
 (`mapping.navgrid`, `service.nav`).
 
@@ -568,22 +571,35 @@ server.
   (≤ 0.3 m), so the far floor between pixel rows counts as seen.
 * **A band.** A voxel is a surface when `hit ≥ 0.2 (hit + free)` — a thin panel (an open door
   leaf) hit from any view stays a surface unless rays saw through it four times as often —
-  unless it is floor-like (within 0.10 m of the floor: any hit below the band's `z_min`, at least
-  half its hits flat inside it). Walls — occupied structures ≥ 1.5 m long — grow by one cell
+  unless it is floor-like: its centre within the floor band of the floor, max(0.06 m, 3 ×
+  `floor_sigma_m`) (`core.constants.floor_band_m`: `FLOOR_BAND_MIN_M`, `FLOOR_BAND_SIGMAS`), any
+  hit below the band's `z_min`, at least half its hits flat inside it. The band counts on both
+  sides of `floor_z_m`, as "within" in map.md §5–§6 reads: the floor's own points lie on both
+  sides of its estimate; a surface lower than the band (a step down) is no floor. Walls — occupied structures ≥ 1.5 m long — grow by one cell
   where they are less than 4 cells thick (`navgrid.inflate_walls`): a wall's face lies anywhere
   in its cell, and a thin wall seen from both sides sits on a cell boundary. Passages and regions
   use the grid before that growth. A cell is `occupied` when a surface voxel's centre
   lies in `[floor + z_min, floor + z_max]`, `free` when not occupied and a ray passed through it in
   the band (or its floor was seen), else `unknown`; an overhang above `z_max` never makes a cell
-  occupied. `height_m` is the highest surface or floor voxel's centre below `max(z_max, 2.0)`,
-  relative to the floor; `floor_observed` 1 for a floor-like voxel in the column, 2 for a cell free
-  by rule (below) whose floor was not seen, else 0. `floor_z_m` is the
-  surface the robot stands on (map.md §6), from the heights of the volume's flat points (1 cm
-  bins, smoothed over 3): of the peaks below the lowest camera (by 5 cm) holding ≥ 50 % of the
-  highest, the one within 0.10 m of the version's floor (the mapper's choice: the plane nearest
-  z 0 when priors fixed the frame, else the lowest), else the lowest; its height is the mean of
-  the points within 3 cm. Else the version's floor, else the cameras' heights, else 1 m below the
-  lowest camera.
+  occupied. `height_m` is the highest surface or floor voxel's centre at or below the height
+  cap, relative to the floor: the request's `height_cap_m`, else its `z_max` when it gives one,
+  else 2.0 m (`navgrid.HEIGHT_CAP_M`), echoed as `height_cap_m`; a ceiling above it is left out.
+  `floor_observed` 1 for a floor-like voxel in the column, 2 for a cell free by rule (below) whose
+  floor was not seen, else 0.
+* **The floor: one estimate per version** (map.md §5). `floor_z_m` and `floor_sigma_m` are the
+  version record's, estimated once at commit, before the objects are fused, which use the same
+  two (`AnchoredMap.floor`): the surface the robot stands on, among the large horizontal planes
+  of the fused cloud below every camera holding ≥ 50 % of the best one's points, the one nearest
+  z 0 when priors fixed the frame, else the lowest; without one, the lowest dense layer.
+  `floor_sigma_m` is the spread of the floor's own points about it (`anchored.floor_spread`: the
+  half width at half maximum of their heights within 0.12 m, `FLOOR_SPREAD_M`, as a normal
+  sigma), so the floor band holds the floor's noise and drift; 0.02 m
+  (`FLOOR_SIGMA_DEFAULT_M`) with fewer than 200 such points. The older mapper's records take the
+  same spread of its cloud. A version recorded before oms/2.2 (no `floor_sigma_m`) keeps the
+  earlier rule: of the peaks of the volume's flat points (1 cm bins, smoothed over 3) below the
+  lowest camera (by 5 cm) holding ≥ 50 % of the highest, the one within 0.10 m of the version's
+  floor, else the lowest, its height the mean of the points within 3 cm; else the version's
+  floor, else the cameras' heights, else 1 m below the lowest camera; and `floor_sigma_m` 0.02 m.
 * **Camera stands.** The cell under every keyframe camera (and the disc of `footprint_radius_m`)
   is free whatever was seen; so is its blind disc: radius `h / tan(depression)` of the bottom
   row's centre ray at camera height `h` — its pose above the floor, or the frame's (camera's)
@@ -621,13 +637,27 @@ server.
   cell: leaves open at 90°) the nearest to the walled chord, so that an open leaf or a deep frame
   counts as an obstacle and the jambs stay on the wall line. Its ends, moved half a cell outward (a jamb's face lies inside the cell the chord ends on), are `jambs_m`, their distance `width_m`, its midpoint
   `centre_m`, `normal_deg` perpendicular to it from `regions[0]` to `regions[1]`. `kind`:
-  `narrow` when narrower than `2 × footprint_radius_m`; else `door` when a door-labelled object
-  of the version lies within 0.6 m of its jamb segment, or both jambs are occupied and it is
-  0.55–1.3 m wide; else `opening`. `leaf` (doors): the occupied cells within the gap's width of
-  the jamb line (off it by > 0.15 m), along it within 0.15 m of the gap, in connected pieces
-  spanning ≥ 0.3 m (a double door's two leaves) — the largest one's rectangle (the schema has
-  one leaf; the others are computed, `Passage.leaves`, but not answered); `intrudes` when it
-  reaches between the jambs.
+  `door` when a door object shaped as a leaf (below) lies within 0.6 m of its jamb segment,
+  so `leaves` is not empty; else `opening` (`narrow` is no longer a kind). `narrow`: true when
+  `width_m < 2 × footprint_radius_m`, false when not, null without `footprint_radius_m`.
+  `leaves[]` (largest first), one per such door object, with its `object_id`: the open leaf the
+  grid shows nearest the object's centre (within 0.5 m, `LEAF_MATCH_M`) — the occupied cells
+  within the gap's width of the jamb line (off it by > 0.15 m), along it within 0.15 m of the
+  gap, in a connected piece spanning ≥ 0.3 m — as its rectangle, else the object's box
+  footprint; `intrudes` when it reaches between the jambs. An open leaf the grid shows that no
+  door object names is no leaf. `leaf` (deprecated) is `leaves[0]` or null.
+* **To a never-observed side.** A chord with a region on one side only — beyond it a sliver
+  smaller than a region, then unknown — is a passage `regions [a, null]` when a frontier has a
+  cell within 1 m of its centre (`PASSAGE_FRONTIER_M`), not more than 0.1 m behind the jamb line;
+  `frontier` names it (null otherwise), and `normal_deg` points toward the unobserved side.
+  Without such a frontier (the far side seen and closed) it is no passage. The narrowest-chord
+  search never ends a chord on an unknown cell: where nothing was seen there is no jamb.
+* **Door objects** (map.md §5). A door object is a leaf: an upright box thinner than 0.20 m
+  across (`detect.DOOR_LEAF_MAX_M`; an open leaf seen at an angle measured 0.17 m), so standing
+  vertical, and at least 0.6 m tall (`DOOR_LEAF_MIN_M`); a door-labelled box of another shape is
+  not listed. Detections naming an opening (`detect.PASSAGE_LABELS`: doorway, gate, opening,
+  archway, entrance, door frame) are never objects, nor merged with doors; every door-labelled
+  object of a version still hints where to look for a passage (above).
 * **Regions.** The chords are cut out of the free cells; each connected part of ≥ 0.25 m² is a
   region (a chord whose two sides stay connected is dropped). `polygon_m` its outer boundary,
   `coverage_share` its cells with `floor_observed` 1 over its free cells plus the unknown cells its
@@ -694,8 +724,9 @@ uint8 `[n, 3]`.
   features, with 11 of its 12 doors found (0.89–0.90 m; one narrowed to 0.5 m by a box beside it;
   the missed one has a box 5 cm in front of it) and two spurious passages beside boxes. Camera cells free: 23/23 (ainex) and 13/13 (office). `GET points` of a
   10 m box 35–330 ms. The two-room scene of `tests/synth/rooms.py` gives the door exactly: width
-  0.90 m, jambs at y 1.50 and 2.40, normal 0°/180°, kind `door`; with an open leaf 0.85 m, leaf
-  reported.
+  0.90 m, jambs at y 1.50 and 2.40, normal 0°/180°, kind `door` (then a door-shaped gap; since
+  oms/2.2 `opening` unless a door object names a leaf); with an open leaf 0.85 m, leaf reported
+  (since oms/2.2 with the leaf's door object).
 
 ### Locate outliers and wide doorways measured (2026-11-10, M3 Pro, in process)
 
@@ -732,7 +763,8 @@ uint8 `[n, 3]`.
   ends. The 2 m double door: width 1.95 m (clear 1.92 m), centre 7 cm off the gap's along the
   normal (the jamb line lies inside the cell), jambs at y 1.03 and 2.98, both leaves. With a
   depth range of 2.5 m (3 m) only 12/24 (15/24): from 2 m the doorway itself and the far side
-  stay unknown, so no far region exists and, by map.md §6, no passage. House bench (five 0.9 m
+  stay unknown, so no far region exists (measured before oms/2.2: such a doorway is now a passage
+  `regions [a, null]` when its far side's frontier lies within 1 m). House bench (five 0.9 m
   doors, 2 cm and 10 cm walls): doors 5/5 and their geometry unchanged, camera rings unchanged
   (0.74), passages 11 → 12 and 13 → 14 (one more beside furniture), `GET grid` layers and
   features 0.26–0.30 s → 0.27–0.42 s (measured while the test suite ran).

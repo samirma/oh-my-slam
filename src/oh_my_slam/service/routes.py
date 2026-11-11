@@ -71,8 +71,11 @@ ENDPOINTS: tuple[Endpoint, ...] = (
                            "the floor estimate (default 1.8): the robot's height plus a margin "
                            "marks everything it could hit."),
                      Param("footprint_radius_m", "query", "number", "The robot's radius: its "
-                           "footprint is free where cameras stood, and passages narrower than "
-                           "twice it are kind narrow.", minimum=0))),
+                           "footprint is free where cameras stood, and a passage narrower than "
+                           "twice it has narrow: true (null without it).", minimum=0),
+                     Param("height_cap_m", "query", "number", "Ceiling of the height_m layer, "
+                           "metres above the floor estimate: surfaces above it are left out "
+                           "(default: z_max when given, else 2.0); echoed in the header."))),
     Endpoint("GET", "/api/maps/{name}/points", "get_points", "Fused points inside a box",
              {200: "Points"}, ("map_not_found", "version_gone", "invalid_request"),
              params=(MAP, VERSION,

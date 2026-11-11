@@ -25,3 +25,16 @@ MAX_GRID_SIDE = 1024
 # server's retrieval descriptor, so locate needs the server only then.
 UPDATE_EXHAUSTIVE_MAX = 150
 RETRIEVAL_TOP_K = 30
+
+# The floor band (map.md §5-§6): a surface within max(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS x the
+# floor's height sigma) of the floor estimate is floor: it never makes an occupied cell, a
+# passage or a floor-standing object. FLOOR_SIGMA_DEFAULT_M: the sigma of a floor nothing
+# measured (too few floor points, or a version recorded before oms/2.2).
+FLOOR_BAND_MIN_M = 0.06
+FLOOR_BAND_SIGMAS = 3.0
+FLOOR_SIGMA_DEFAULT_M = 0.02
+
+
+def floor_band_m(floor_sigma_m: float) -> float:
+    """The floor band's half thickness for a floor of height sigma ``floor_sigma_m``."""
+    return max(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS * floor_sigma_m)

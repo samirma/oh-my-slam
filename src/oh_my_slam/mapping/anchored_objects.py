@@ -91,13 +91,17 @@ from numpy.typing import NDArray
 from scipy import ndimage
 
 from oh_my_slam.core.atomic import atomic_write_json
+from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M, floor_band_m
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
+    DOOR_LABEL,
     OBB,
+    PASSAGE_LABELS,
     Detection,
     compatible,
+    door_leaf,
     fit_object_obb,
     label_fit,
     lift_on_grid,
@@ -114,7 +118,6 @@ OBJECTS_JSON = "objects.json"
 OBJECTS_NPZ = "objects.npz"
 UP = np.array([0.0, 0.0, 1.0])
 
-FLOOR_BAND_M = 0.03  # the floor's half thickness when telling a detection that is the floor
 SIGHTING_POINTS = 600  # points kept per sighting (thinned to POINT_VOXEL_M first)
 POINT_VOXEL_M = 0.01
 SHAPING_SIGHTINGS = 8  # the largest sightings keep their points
@@ -542,8 +545,12 @@ def _thin(points: Array, cap: int = SIGHTING_POINTS) -> Array:
     return pts
 
 
-def observe(view: View, version: int, floor_z: float | None) -> list[Observation]:
-    """The lifted detections of a keyframe (see the module docstring)."""
+def observe(view: View, version: int, floor_z: float | None,
+            floor_sigma: float = FLOOR_SIGMA_DEFAULT_M) -> list[Observation]:
+    """The lifted detections of a keyframe (see the module docstring). A detection naming an
+    opening (``detect.PASSAGE_LABELS``) is no object; a floor-standing one that lies within the
+    floor band (``core.constants.floor_band_m`` of ``floor_sigma``) of the floor ``floor_z`` is
+    the floor (map.md §5)."""
     if not view.dets:
         return []
     depth = np.where(np.isfinite(view.depth), view.depth, 0.0).astype(np.float32)
@@ -561,7 +568,9 @@ def observe(view: View, version: int, floor_z: float | None) -> list[Observation
             continue  # too few points, or the background (a tree, a sign over the whole view)
         if float(np.median(np.linalg.norm(pts - view.centre, axis=1))) < NEAR_CAMERA_M:
             continue  # on the camera (a gripper, a lens hood)
-        if floor_z is not None and on_the_floor(inst, UP, floor_z, FLOOR_BAND_M):
+        if inst.detection.label in PASSAGE_LABELS:
+            continue  # a doorway is a passage of the grid, not an object (map.md §5)
+        if floor_z is not None and on_the_floor(inst, UP, floor_z, floor_band_m(floor_sigma)):
             continue
         rgb = robust_rgb(view.rgb, inst.mask) or [128.0, 128.0, 128.0]
         rows, cols = np.flatnonzero(inst.mask.any(1)), np.flatnonzero(inst.mask.any(0))
@@ -856,6 +865,7 @@ class ObjectMap:
         self.surfaces: list[Surface] = []
         self.version = 0
         self.floor_z: float | None = None  # the floor of the latest update (box grounding)
+        self.floor_sigma = FLOOR_SIGMA_DEFAULT_M  # its height sigma (the floor band)
 
     @staticmethod
     def load(root: Path) -> ObjectMap:
@@ -903,16 +913,18 @@ class ObjectMap:
 
     # -- an update ------------------------------------------------------------------------------
 
-    def update(self, views: list[View], version: int, floor_z: float | None) -> list[Struck]:
-        """Fold the new keyframes ``views`` (request order) into the objects of ``version``;
-        returns the objects struck, for carving."""
+    def update(self, views: list[View], version: int, floor_z: float | None,
+               floor_sigma: float = FLOOR_SIGMA_DEFAULT_M) -> list[Struck]:
+        """Fold the new keyframes ``views`` (request order) into the objects of ``version``, on
+        the version's floor estimate (``floor_z``, ``floor_sigma``: map.md §5); returns the
+        objects struck, for carving."""
         self.version = version
-        self.floor_z = floor_z
+        self.floor_z, self.floor_sigma = floor_z, floor_sigma
         self.objects = [o for o in self.objects if o.state != "struck"]
         events: dict[int, list[tuple[str, float, View]]] = {}
         created: set[int] = set()
         for view in views:
-            obs = observe(view, version, floor_z)
+            obs = observe(view, version, floor_z, floor_sigma)
             cands = [o for o in self.objects if o.box is not None]
             ids = match([(ob.label, ob.points, ob.centre) for ob in obs], cands,
                         [ob.sighting.truncated for ob in obs])
@@ -1188,8 +1200,10 @@ class ObjectMap:
 
 def listed(o: MapObject) -> bool:
     """Whether the objects read lists an object: published, with a box of at least
-    ``MIN_OBJECT_M`` on its longest side (a few pixels of a mask lifted are no object)."""
-    return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M
+    ``MIN_OBJECT_M`` on its longest side (a few pixels of a mask lifted are no object); a door
+    only as a leaf (``detect.door_leaf``, map.md §5)."""
+    return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M \
+        and (o.label != DOOR_LABEL or door_leaf(o.box.size))
 
 
 def relief(o: MapObject) -> str | None:

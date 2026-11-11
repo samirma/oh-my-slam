@@ -13,11 +13,12 @@ volume is the previous one plus its new frames (``Volume.integrate``).
 **A band** (``layers``). Relative to the floor ``f`` and the band ``[z_min, z_max]``:
 
 * a voxel is a surface when ``hit >= OCC_RATIO * (hit + free)``, except a floor-like voxel
-  (mostly ``flat`` hits within ``FLOOR_TOL_M`` of the floor);
+  (mostly ``flat`` hits whose centre lies within the floor band, max(0.06 m, 3 floor sigmas), of
+  the floor: ``core.constants.floor_band_m``);
 * a cell is ``occupied`` when a surface voxel's centre lies in the band, ``free`` when it is not
   occupied and a ray passed through it in the band (or its floor was seen), else ``unknown``;
-* ``height_m`` is the highest surface below ``max(z_max, HEIGHT_CAP_M)``; ``floor_observed`` is a
-  floor-like voxel there.
+* ``height_m`` is the highest surface at or below the height cap (the request's ``height_cap_m``,
+  else its ``z_max``, else ``HEIGHT_CAP_M``); ``floor_observed`` is a floor-like voxel there.
 
 **Camera stands** (``mark_stands``). The cell under each keyframe camera, and the robot's footprint
 there, are free whatever was seen; so are the cells of the disc the camera could not see, but for
@@ -34,9 +35,13 @@ between furniture, or between furniture and a wall, is no passage), the shortest
 Its ends are the jambs, its length the clear width (the free width at the narrowest point: an
 open leaf is an obstacle), its midpoint the centre, its normal the crossing direction. Every chord
 is cut out of the free space, and the connected parts are the regions (at least
-``MIN_REGION_M2``); a chord whose two sides stay connected is no passage. Frontiers are the free
-cells next to unknown ones, in connected runs of at
-least ``MIN_FRONTIER_M``."""
+``MIN_REGION_M2``); a chord whose two sides stay connected is no passage. A chord with a region
+on one side only is a passage to a never-observed side (regions ``[a, null]``) when a frontier lies
+on the other side within ``PASSAGE_FRONTIER_M`` (``_far_frontier``). A passage is a ``door`` when a
+door object shaped as a leaf lies within ``DOOR_OBJECT_M`` of its jamb line (``_door_leaves``: its
+leaves, each with its object id), else an ``opening``; ``narrow`` says whether it is narrower than
+twice the robot's footprint radius. Frontiers are the free cells next to unknown ones, in connected
+runs of at least ``MIN_FRONTIER_M``."""
 
 from __future__ import annotations
 
@@ -49,6 +54,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
+
+from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M, floor_band_m
 
 VOXEL_M = 0.05
 VOXEL_Z_M = 0.05
@@ -81,8 +88,7 @@ MAX_WEIGHT = 4
 OCC_RATIO = 0.2  # a voxel is a surface unless rays saw through it four times as often
 WALL_EXTENT_M = 1.5  # inflate_walls: an occupied structure this long is a wall,
 WALL_THICK_CELLS = 4  # ... grown beside it where it is thinner than this
-FLOOR_TOL_M = 0.10
-HEIGHT_CAP_M = 2.0
+HEIGHT_CAP_M = 2.0  # the height_m layer's ceiling when the request gives no z_max
 BLIND_RING_MAX_M = 2.0
 MIN_DEPRESSION_DEG = 2.0
 SIGHT_MARGIN_M = 0.10  # a blind disc's surface this far above the lowest line of sight stays
@@ -103,12 +109,16 @@ JAMB_OCCUPIED = 0.5
 JAMB_IN_CELL = 0.5  # a jamb's face: this far (in cells) into the cell its chord ends on
 DOOR_MIN_W = 0.55
 DOOR_MAX_W = 1.3
-DOOR_OBJECT_M = 0.6  # a door-labelled object this close to a passage's centre makes it a door
+DOOR_OBJECT_M = 0.6  # a door object this close to a passage's jamb line is its leaf
 DOOR_CHORD_STEP_DEG = 10.0
 DOOR_SEARCH_M = 1.0  # a door object's chord passes through free cells this near it
 DOOR_CLEAR_SHARE = 0.4  # a door chord's midpoint is at least this share of its length from obstacles
 DOOR_WALL_M = 1.0  # _door_walled: the door's wall is looked for this far beyond a chord's end
 LEAF_MIN_M = 0.3
+LEAF_MATCH_M = 0.5  # a door object names the open leaf the grid shows this near its centre
+LEAF_SAMPLES = 5  # _box_leaf: a box footprint sampled on this many points per side
+PASSAGE_FRONTIER_M = 1.0  # a passage to a never-observed side: its frontier is this near
+PASSAGE_FRONTIER_BEHIND_M = 0.1  # ... and not farther than this behind the jamb line
 LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, are leaf cells
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
@@ -429,17 +439,23 @@ class Layers:
                          self.origin[1] + (row + 0.5) * self.cell])
 
 
-def layers(vol: Volume, floor_z: float, z_min: float, z_max: float) -> Layers:
-    """The band's layers at the volume's resolution (see the module docstring)."""
+def layers(vol: Volume, floor_z: float, z_min: float, z_max: float,
+           floor_sigma: float = FLOOR_SIGMA_DEFAULT_M, height_cap: float = HEIGHT_CAP_M
+           ) -> Layers:
+    """The band's layers at the volume's resolution (see the module docstring): the floor band
+    is ``core.constants.floor_band_m(floor_sigma)``, ``height_m`` is capped at ``height_cap``
+    (both relative to ``floor_z``)."""
     Z, Y, X = vol.shape
     zc = vol.origin[2] + (np.arange(Z) + 0.5) * vol.vz - floor_z  # relative to the floor
     hit = vol.hit.astype(np.float32)
     free = vol.free.astype(np.float32)
     surface = (vol.hit > 0) & (hit >= OCC_RATIO * (hit + free))
-    # floor-like: hits at the floor's height, mostly flat ones where they lie inside the band
-    # (below it, any hit is the floor or what stands on it, which the band does not judge)
+    # floor-like: hits within the floor band of the floor's height, mostly flat ones where they
+    # lie inside the height band (below it, any hit is the floor or what stands on it, which the
+    # band does not judge)
     flat_enough = (vol.flat.astype(np.float32) * 2 >= hit) | (zc < z_min)[:, None, None]
-    floorlike = flat_enough & (vol.hit > 0) & (np.abs(zc) <= FLOOR_TOL_M)[:, None, None]
+    floorlike = flat_enough & (vol.hit > 0) & \
+        (np.abs(zc) <= floor_band_m(floor_sigma))[:, None, None]
     surface &= ~floorlike
     band = ((zc >= z_min) & (zc <= z_max))[:, None, None]
     in_band = surface & band
@@ -450,8 +466,7 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float) -> Layers:
     floor_obs = floorlike.any(axis=0)
     free2 = (((vol.free > 0) & band).any(axis=0) | floor_obs) & ~occupied
     state = np.where(occupied, OCCUPIED, np.where(free2, FREE, UNKNOWN)).astype(np.uint8)
-    cap = max(z_max, HEIGHT_CAP_M)
-    top = (surface | floorlike) & (zc <= cap)[:, None, None]
+    top = (surface | floorlike) & (zc <= height_cap)[:, None, None]
     has = top.any(axis=0)
     k = Z - 1 - np.argmax(top[::-1], axis=0)
     height = np.where(has, zc[np.clip(k, 0, max(Z - 1, 0))], np.nan).astype(np.float32) \
@@ -664,11 +679,15 @@ class Passage:
     width: float
     normal_deg: float
     jambs: tuple[Array, Array]
-    regions: tuple[int, int]  # indices into the regions list until ids are assigned
-    kind: str
-    leaf: dict[str, Any] | None  # the largest of ``leaves`` (the API's one leaf)
+    # indices into the regions list until ids are assigned; None: a never-observed far side
+    regions: tuple[int, int | None]
+    kind: str  # "door" when ``leaves`` is not empty, else "opening"
+    leaf: dict[str, Any] | None  # the largest of ``leaves`` (deprecated in the API)
     id: int = 0
-    leaves: list[dict[str, Any]] = field(default_factory=list)  # every open leaf, largest first
+    # every door leaf, largest first: ``polygon_m``, ``intrudes``, ``object_id``
+    leaves: list[dict[str, Any]] = field(default_factory=list)
+    narrow: bool | None = None  # narrower than the robot (null without its footprint)
+    frontier: int | None = None  # index into the frontiers on the unobserved far side
 
 
 @dataclass
@@ -834,7 +853,7 @@ def _passage_chords(state: NDArray[np.uint8], cell: float
         best = min(walled, key=lambda ch: round(ch[0], 6)) if walled else \
             _chord_at(free, p, th, max_t)
         centres.append((p, best[0]))
-        narrow = _narrowest(free, best, cell, max_t)
+        narrow = _narrowest(free, best, cell, max_t, state)
         mid = (narrow[1] + narrow[2]) / 2
         if all(float(np.linalg.norm(mid - (o[1] + o[2]) / 2)) * cell >= NMS_M for o in out):
             out.append(narrow)
@@ -895,7 +914,7 @@ def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
                         best_any = ch
         pick = best if best is not None else best_any
         if pick is not None:
-            out.append(_narrowest(free, pick, cell, max_t))
+            out.append(_narrowest(free, pick, cell, max_t, state))
     return out
 
 
@@ -949,12 +968,14 @@ def _door_walled(state: NDArray[np.uint8], e1: Array, e2: Array, cell: float
 
 
 def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any], cell: float,
-               max_t: float) -> tuple[float, Array, Array, tuple[int, int] | None,
-                                      tuple[int, int] | None]:
+               max_t: float, state: NDArray[np.uint8]
+               ) -> tuple[float, Array, Array, tuple[int, int] | None, tuple[int, int] | None]:
     """The narrowest free chord of a passage: shifted along its normal by up to
-    ``NARROW_SHIFT_M``, turned by up to ``NARROW_TURN_DEG``, ending on obstacles at both ends,
-    its midpoint between the walled chord ``ch``'s jambs (along their line). An open leaf, or a
-    door frame deeper than the wall, narrows the gap beside the wall line."""
+    ``NARROW_SHIFT_M``, turned by up to ``NARROW_TURN_DEG``, ending on obstacles at both ends
+    (cells of ``state`` that are not unknown: the free gap's end is no jamb where
+    nothing was seen, as beyond a doorway to a never-observed side), its midpoint between the
+    walled chord ``ch``'s jambs (along their line). An open leaf, or a door frame deeper than the
+    wall, narrows the gap beside the wall line."""
     L0, a, b = ch[0], ch[1], ch[2]
     u = (b - a) / max(L0, 1e-9)
     n = np.array([-u[1], u[0]])
@@ -985,7 +1006,8 @@ def _narrowest(free: NDArray[np.bool_], ch: tuple[float, Array, Array, Any, Any]
         mid_along = float((mid - a) @ u)
         off = abs(float((mid - a) @ n))
         shorter = c[0] < best[0] - 0.1 or (c[0] < best[0] - 1e-9 and off <= best_off + 1e-9)
-        if shorter and c[3] is not None and c[4] is not None and 0.0 <= mid_along <= L0:
+        if shorter and c[3] is not None and c[4] is not None and state[c[3]] != UNKNOWN \
+                and state[c[4]] != UNKNOWN and 0.0 <= mid_along <= L0:
             best, best_off = (c[0], c[2], c[1], c[4], c[3]), off  # from a's side to b's
     return best
 
@@ -1084,10 +1106,80 @@ def _leaves(state: NDArray[np.uint8], lay: Layers, j1: Array, j2: Array) -> list
     return [leaf for _, leaf in sorted(out, key=lambda x: -x[0])]
 
 
+def _far_frontier(front_xy: Sequence[Array], centre: Array, n: Array) -> int | None:
+    """The frontier on a passage's unobserved far side (map.md §6): the index of the one with a
+    cell nearest ``centre`` within ``PASSAGE_FRONTIER_M`` and not behind the jamb line (along the
+    normal ``n`` toward that side, a cell's tolerance), else None."""
+    best, pick = PASSAGE_FRONTIER_M, None
+    for i, xy in enumerate(front_xy):
+        d = np.linalg.norm(xy - centre, axis=1)
+        ahead = (xy - centre) @ n >= -PASSAGE_FRONTIER_BEHIND_M
+        if ahead.any() and float(d[ahead].min()) <= best:
+            best, pick = float(d[ahead].min()), i
+    return pick
+
+
+def _box_leaf(o: dict[str, Any], j1: Array, j2: Array, cell: float) -> dict[str, Any]:
+    """The leaf of a door object at the gap ``j1``-``j2`` from its box: its footprint, and
+    whether it reaches into the gap between the jambs (as ``_leaves``)."""
+    a = math.radians(float(o["yaw_deg"]))
+    ux, vx = np.array([math.cos(a), math.sin(a)]), np.array([-math.sin(a), math.cos(a)])
+    c = np.asarray(o["centre_m"][:2], np.float64)
+    hx, hy = float(o["size_m"][0]) / 2, float(o["size_m"][1]) / 2
+    poly = [[round(float(x), 4), round(float(y), 4)] for x, y in
+            (c - ux * hx - vx * hy, c + ux * hx - vx * hy, c + ux * hx + vx * hy,
+             c - ux * hx + vx * hy)]
+    gap = float(np.linalg.norm(j2 - j1))
+    u = (j2 - j1) / max(gap, 1e-9)
+    t = np.linspace(-1.0, 1.0, LEAF_SAMPLES)
+    pts = (c + ux * hx * t[:, None, None] + vx * hy * t[None, :, None]).reshape(-1, 2)
+    along = (pts - j1) @ u
+    off = np.abs((pts - j1) @ np.array([-u[1], u[0]]))
+    intrudes = bool(np.any((along > cell) & (along < gap - cell) & (off <= gap + cell)))
+    return {"polygon_m": poly, "intrudes": intrudes, "object_id": int(o["id"])}
+
+
+def _area(poly: Sequence[Sequence[float]]) -> float:
+    x = np.array([p[0] for p in poly])
+    y = np.array([p[1] for p in poly])
+    return float(abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))) / 2)
+
+
+def _door_leaves(state: NDArray[np.uint8], lay: Layers, j1: Array, j2: Array,
+                 leaves: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The door leaves of the gap ``j1``-``j2`` (map.md §6), largest first: each door object
+    shaped as a leaf (``leaves``) within ``DOOR_OBJECT_M`` of the jamb line, with its object id,
+    and the footprint of the open leaf the grid shows nearest it (``_leaves``, within
+    ``LEAF_MATCH_M``), else its box's (``_box_leaf``). A leaf the grid shows that no door object
+    names is no leaf: a door is a detected door object (map.md §5)."""
+    dist = [_segment_distance(np.asarray(o["centre_m"][:2], np.float64), j1, j2) for o in leaves]
+    near = [leaves[i] for i in np.argsort(dist, kind="stable") if dist[i] <= DOOR_OBJECT_M]
+    if not near:
+        return []
+    seen = _leaves(state, lay, j1, j2)
+    used: set[int] = set()
+    out = []
+    for o in near:
+        c = np.asarray(o["centre_m"][:2], np.float64)
+        best, pick = LEAF_MATCH_M, None
+        for i, lf in enumerate(seen):
+            d = float(np.linalg.norm(np.mean(np.asarray(lf["polygon_m"]), axis=0) - c))
+            if i not in used and d <= best:
+                best, pick = d, i
+        if pick is None:
+            out.append(_box_leaf(o, j1, j2, lay.cell))
+        else:
+            used.add(pick)
+            out.append({**seen[pick], "object_id": int(o["id"])})
+    return sorted(out, key=lambda lf: -_area(lf["polygon_m"]))
+
+
 def features(lay: Layers, footprint_radius: float | None = None,
-             doors: Sequence[Sequence[float]] = ()) -> Features:
+             doors: Sequence[Sequence[float]] = (),
+             leaves: Sequence[dict[str, Any]] = ()) -> Features:
     """Regions, passages and frontiers of a grid (see the module docstring); ``doors``: the map x,
-    y of door-labelled objects."""
+    y of door-labelled objects (hints where to look for a passage); ``leaves``: the door objects
+    shaped as leaves (``id``, ``centre_m``, ``size_m``, ``yaw_deg``), which a passage names."""
     state = lay.state
     free = state == FREE
     R, C = state.shape
@@ -1123,8 +1215,28 @@ def features(lay: Layers, footprint_radius: float | None = None,
         index[i] = len(regions)
     labels = index[parts].astype(np.int32)
     near_lab = _geodesic_labels(free, labels)  # barrier cells and small parts: nearest region
+    # frontiers: free cells next to unknown ones (or the grid's edge)
+    unknown = np.pad(state == UNKNOWN, 1, constant_values=True)
+    next_unknown = unknown[:-2, 1:-1] | unknown[2:, 1:-1] | unknown[1:-1, :-2] | unknown[1:-1, 2:]
+    front = free & next_unknown
+    flab, nf = ndimage.label(front, structure=np.ones((3, 3)))
+    frontiers: list[Frontier] = []
+    front_xy: list[Array] = []  # each frontier's cell centres (map x, y)
+    for i in range(1, nf + 1):
+        cells = np.argwhere(flab == i)
+        length = len(cells) * cell
+        if length < MIN_FRONTIER_M:
+            continue
+        mean = cells.mean(axis=0)
+        r, c = cells[int(np.argmin(np.hypot(cells[:, 0] - mean[0], cells[:, 1] - mean[1])))]
+        labs = near_lab[cells[:, 0], cells[:, 1]]
+        labs = labs[labs > 0]
+        region = int(np.bincount(labs).argmax()) - 1 if labs.size else None
+        frontiers.append(Frontier(lay.centre(float(r), float(c)), round(length, 4), region))
+        front_xy.append(np.column_stack([lay.origin[0] + (cells[:, 1] + 0.5) * cell,
+                                         lay.origin[1] + (cells[:, 0] + 0.5) * cell]))
     passages: list[Passage] = []
-    for _, e1, e2, c1, c2 in chords:
+    for _, e1, e2, _c1, _c2 in chords:
         u = (e2 - e1) / max(float(np.linalg.norm(e2 - e1)), 1e-9)
         n = np.array([-u[1], u[0]])
         mid = (e1 + e2) / 2
@@ -1137,7 +1249,7 @@ def features(lay: Layers, footprint_radius: float | None = None,
                 if 0 <= r < R and 0 <= c < C and labels[r, c] > 0:
                     votes[int(labels[r, c])] = votes.get(int(labels[r, c]), 0) + 1
             sides.append(max(votes, key=lambda v: votes[v]) if votes else 0)
-        if sides[0] == 0 or sides[1] == 0 or sides[0] == sides[1]:
+        if sides[0] == sides[1]:  # one region on both sides (or none): no narrowing between
             continue
         # the jambs' faces lie inside the cells the chord ends on: half a cell beyond its ends
         # on average (the chord stops at those cells' boundaries)
@@ -1147,37 +1259,20 @@ def features(lay: Layers, footprint_radius: float | None = None,
             + u * cell * JAMB_IN_CELL
         width = float(np.linalg.norm(j2 - j1))
         centre = (j1 + j2) / 2
-        normal = math.degrees(math.atan2(n[1], n[0]))  # from sides[0] (behind) to sides[1]
-        walls = c1 is not None and c2 is not None and state[c1] == OCCUPIED and \
-            state[c2] == OCCUPIED
-        door_obj = any(_segment_distance(np.asarray(d[:2], np.float64), j1, j2) <= DOOR_OBJECT_M
-                       for d in doors)
-        if footprint_radius and width < 2 * footprint_radius:
-            kind = "narrow"
-        elif door_obj or (walls and DOOR_MIN_W <= width <= DOOR_MAX_W):
-            kind = "door"
-        else:
-            kind = "opening"
-        leaves = _leaves(state, lay, j1, j2) if kind == "door" else []
-        passages.append(Passage(centre, width, normal, (j1, j2), (sides[0] - 1, sides[1] - 1),
-                                kind, leaves[0] if leaves else None, leaves=leaves))
-    # frontiers: free cells next to unknown ones (or the grid's edge)
-    unknown = np.pad(state == UNKNOWN, 1, constant_values=True)
-    next_unknown = unknown[:-2, 1:-1] | unknown[2:, 1:-1] | unknown[1:-1, :-2] | unknown[1:-1, 2:]
-    front = free & next_unknown
-    flab, nf = ndimage.label(front, structure=np.ones((3, 3)))
-    frontiers: list[Frontier] = []
-    for i in range(1, nf + 1):
-        cells = np.argwhere(flab == i)
-        length = len(cells) * cell
-        if length < MIN_FRONTIER_M:
-            continue
-        mean = cells.mean(axis=0)
-        r, c = cells[int(np.argmin(np.hypot(cells[:, 0] - mean[0], cells[:, 1] - mean[1])))]
-        labs = near_lab[cells[:, 0], cells[:, 1]]
-        labs = labs[labs > 0]
-        region = int(np.bincount(labs).argmax()) - 1 if labs.size else None
-        frontiers.append(Frontier(lay.centre(float(r), float(c)), round(length, 4), region))
+        frontier = None
+        if 0 in sides:  # a doorway whose far side was never observed: regions [a, null]
+            if sides[0] == 0:  # the region first; the normal toward the unobserved side
+                sides, n = [sides[1], 0], -n
+            frontier = _far_frontier(front_xy, centre, n)
+            if frontier is None:  # nothing unobserved beyond: no passage
+                continue
+        normal = math.degrees(math.atan2(n[1], n[0]))  # from regions[0] to regions[1]
+        found = _door_leaves(state, lay, j1, j2, leaves)
+        passages.append(Passage(
+            centre, width, normal, (j1, j2), (sides[0] - 1, sides[1] - 1 if sides[1] else None),
+            "door" if found else "opening", found[0] if found else None, leaves=found,
+            narrow=None if footprint_radius is None else bool(width < 2 * footprint_radius),
+            frontier=frontier))
     return Features(regions, passages, frontiers, near_lab)
 
 

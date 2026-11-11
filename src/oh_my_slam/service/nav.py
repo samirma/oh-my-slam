@@ -31,6 +31,7 @@ MIN_CELL_M = 0.01
 MAX_CELL_M = 1.0
 MAX_GRID_CELLS = 16_000_000
 DEFAULT_Z_BAND = (0.05, 1.8)
+HEIGHT_CAP_M = navgrid.HEIGHT_CAP_M  # the height_m layer's default ceiling
 DEFAULT_VOXEL_M = 0.01
 DEFAULT_MAX_POINTS = 200_000
 MAX_POINTS = 2_000_000
@@ -142,10 +143,13 @@ class GridAnswer:
 
 
 def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
-         footprint: float | None) -> GridAnswer:
+         footprint: float | None, height_cap: float = HEIGHT_CAP_M) -> GridAnswer:
+    """The ``Grid`` answer (map.md §6) on the version's floor estimate (``floor_z_m``,
+    ``floor_sigma_m``), ``height_m`` capped at ``height_cap`` (relative to the floor)."""
     vol = dv.volume()
-    floor = dv.floor_z
-    base = navgrid.layers(vol, floor, z_min, z_max)  # the features at the volume's resolution,
+    floor, sigma = dv.floor_z, dv.floor_sigma
+    # the features at the volume's resolution,
+    base = navgrid.layers(vol, floor, z_min, z_max, sigma, height_cap)
     walls = navgrid.inflate_walls(base)  # whatever cell size is asked, on the walls as seen
     navgrid.mark_stands(base, dv.stands, floor, footprint)
     navgrid.mark_stands(walls, dv.stands, floor, footprint)
@@ -155,7 +159,8 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
                       f"{MAX_GRID_CELLS}): ask for larger cells")
     if lay is not walls:
         navgrid.mark_stands(lay, dv.stands, floor, footprint)
-    feat = navgrid.features(base, footprint, dv.meta.get("doors", []))
+    feat = navgrid.features(base, footprint, dv.meta.get("doors", []),
+                            dv.meta.get("door_leaves", []))
     rid = ids.assign(dv.name, "regions", [(r.centroid, r.area_m2) for r in feat.regions])
     pid = ids.assign(dv.name, "passages", [(p.centre, 0.0) for p in feat.passages])
     fid = ids.assign(dv.name, "frontiers", [(f.centre, 0.0) for f in feat.frontiers])
@@ -163,8 +168,12 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
                 "polygon_m": r.polygon} for i, r in zip(rid, feat.regions, strict=True)]
     passages = [{"id": i, "centre_m": [_r(p.centre[0]), _r(p.centre[1])],
                  "width_m": _r(p.width), "normal_deg": _r(p.normal_deg, 2),
-                 "regions": [rid[p.regions[0]], rid[p.regions[1]]], "kind": p.kind,
-                 "jambs_m": [[_r(j[0]), _r(j[1])] for j in p.jambs], "leaf": p.leaf}
+                 "regions": [rid[p.regions[0]],
+                             None if p.regions[1] is None else rid[p.regions[1]]],
+                 "frontier": None if p.frontier is None else fid[p.frontier],
+                 "kind": p.kind, "narrow": p.narrow,
+                 "jambs_m": [[_r(j[0]), _r(j[1])] for j in p.jambs],
+                 "leaves": p.leaves, "leaf": p.leaf}
                 for i, p in zip(pid, feat.passages, strict=True)]
     frontiers = [{"id": i, "centre_m": [_r(f.centre[0]), _r(f.centre[1])],
                   "length_m": _r(f.length), "region": None if f.region is None else rid[f.region]}
@@ -174,6 +183,7 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
         "map": dv.name, "map_version": dv.version,
         "origin_m": [_r(lay.origin[0]), _r(lay.origin[1])], "cell_m": cell,
         "shape": [rows, cols], "z_band_m": [z_min, z_max], "floor_z_m": _r(floor),
+        "floor_sigma_m": _r(sigma), "height_cap_m": height_cap,
         "scale_source": dv.record["scale_source"],
         "scale_sigma_rel": dv.record["scale_sigma_rel"],
         "layers": {"state": binary(lay.state.astype(np.uint8)),
