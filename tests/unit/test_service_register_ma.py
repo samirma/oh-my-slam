@@ -200,13 +200,20 @@ def test_registration_edges(tmp_path: Path) -> None:
     def mv(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
         return fb.geometry_views(images, Ks, poses, tmp_path)
 
-    res = register_ma.Registration(mv, new, stored).run()
+    reg = register_ma.Registration(mv, new, stored)
+    res = reg.run()
     # no stored depth: MapAnything's metres, its own depths of the call as references
     assert res.notes["calls"][0]["scale_source"] == "mapanything"
     assert res.placements[0].status == "registered"
     # few_features is only the checks' verdict (api.md §4): unplaced, no_overlap
     assert (res.placements[1].status, res.placements[1].reason) == ("rejected", "no_overlap")
     assert res.calls == 1 and res.views == 4
+    # tested again from its first output, never inferred again: nothing new confirms it; a
+    # reference that sees its depth where it put it does (another engine's keyframe)
+    assert reg.recheck() == [] and set(reg.waiting) == {1}
+    _, T, _, depth, Kd = reg.waiting[1]
+    assert reg.recheck([register_ma.Ref(T, depth, Kd)]) == [1]
+    assert reg.placements[1].status == "registered" and not reg.waiting and reg.calls == 1
 
     def down(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
         raise ApiError("inference_unavailable", "down (test)")

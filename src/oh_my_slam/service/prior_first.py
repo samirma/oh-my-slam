@@ -21,7 +21,6 @@ similarity: the mapper's frame is the map frame, and stored poses never move.
 from __future__ import annotations
 
 import functools
-import itertools
 import os
 import time
 from collections.abc import Callable
@@ -96,114 +95,141 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
                    progress: Callable[[str], None], pairs: standpoint.Pairs | None = None,
                    feats: dict[int, Features] | None = None
                    ) -> tuple[list[Placement], float, float]:
-    """The camera-only frames by MapAnything (``register_ma``) against the map's confirmed
-    keyframes, each registered one added as a keyframe; its depth scale is the map's, and its
-    camera height feeds the map's depth scale (``ScaleState``) as a monocular keyframe's does.
-    Order-independent (map.md §2): the frames go in canonical order (name, camera), and the ones
-    no reference confirmed (``no_overlap``) are tried again against what the others added, until
-    a pass registers nothing. ``feats``: the frames' features by request index, the job's
-    static content left out (``job_features``). Returns the placements
-    (frames' order) and the registration and fusion seconds."""
-    got: dict[int, Placement] = {}
-    reg_s = fuse_s = 0.0
-    pairs = pairs or standpoint.Pairs()
-    feats = dict(feats or {})
-    todo = sorted(frames, key=lambda fr: (natural_key(fr.work.name), fr.work.index))
-    passes = itertools.count()
-    while True:
-        r, f_s = _register_none_pass(up, am, todo, workdir / f"ma{next(passes)}", pairs, got,
-                                     feats)
-        reg_s, fuse_s = reg_s + r, fuse_s + f_s
-        again = [fr for fr in todo if got[fr.work.index].reason == "no_overlap"]
-        if len(again) == len(todo) or not again:
-            break
-        todo = again
+    """The camera-only frames by MapAnything (``_MaRun``) against the map's confirmed
+    keyframes. Returns the placements (frames' order) and the registration and fusion
+    seconds."""
+    run = _MaRun(up, am, frames, workdir, pairs or standpoint.Pairs(), feats or {})
+    run.first()
     for fr in frames:
-        pl = got[fr.work.index]
+        pl = run.got[fr.work.index]
         progress(f"{fr.work.name}: {pl.status} ({pl.reason or pl.method})")
-    return [got[fr.work.index] for fr in frames], reg_s, fuse_s
+    return [run.got[fr.work.index] for fr in frames], run.reg_s, run.fuse_s
 
 
-def _register_none_pass(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
-                        pairs: standpoint.Pairs, got: dict[int, Placement],
-                        feats: dict[int, Features]) -> tuple[float, float]:
-    """One pass of ``_register_none`` over ``frames``, their placements into ``got``."""
-    t = time.perf_counter()
-    am.save()  # this update's keyframes get their image and depth on disk: anchors
-    stored = [register_ma.Stored(k.id, img, k.K, k.T, i, functools.partial(am.depth_of, k.id))
-              for i, k in enumerate(am.keyframes)
-              if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
-    if not stored:  # nothing confirmed to register against (a camera-only map without origin)
+class _MaRun:
+    """MapAnything over a job's camera-only frames (``register_ma``), each registered one added
+    as a keyframe; its depth scale is the map's, and its camera height feeds the map's depth
+    scale (``ScaleState``) as a monocular keyframe's does. Every frame is inferred once per job
+    (``Registration.run``): order independence (map.md §2) re-tests the frames no reference
+    confirmed (``no_overlap``) against what registered since from their first output
+    (``Registration.recheck``), never inferring them again. The frames go in canonical order
+    (name, camera). ``feats``: the frames' features by request index, the job's static content
+    left out (``job_features``)."""
+
+    def __init__(self, up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: Path,
+                 pairs: standpoint.Pairs, feats: dict[int, Features]) -> None:
+        self.up, self.am, self.workdir, self.pairs, self.feats = up, am, workdir, pairs, feats
+        self.frames = sorted(frames, key=lambda fr: (natural_key(fr.work.name), fr.work.index))
+        self.got: dict[int, Placement] = {}
+        self.reg: register_ma.Registration | None = None
+        self.reg_s = self.fuse_s = 0.0
+
+    def first(self) -> list[Keyframe]:
+        """Infer every frame once and register what the map confirms; the keyframes added."""
+        t = time.perf_counter()
+        am = self.am
+        am.save()  # this update's keyframes get their image and depth on disk: anchors
+        stored = [register_ma.Stored(k.id, img, k.K, k.T, i, functools.partial(am.depth_of,
+                                                                                 k.id))
+                  for i, k in enumerate(am.keyframes)
+                  if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
+        if not stored:  # nothing confirmed to register against (a camera-only map, no origin)
+            for fr in self.frames:
+                self.got[fr.work.index] = Placement(fr.work.name, "rejected", "no_overlap")
+            self.reg_s += time.perf_counter() - t
+            return []
+        new = []
+        for fr in self.frames:
+            assert fr.path is not None and fr.measures is not None
+            new.append(register_ma.New(fr.work.index, fr.path, fr.cam.canonical(),
+                                       fr.depth_m if _has_depth(fr) else None,
+                                       fr.measures.features))
+        calls = [0]
+
+        def multiview(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
+            calls[0] += 1
+            return self.up.backend.geometry_views(images, Ks, poses,
+                                                  self.workdir / f"mv{calls[0]}")
+
+        self.reg = register_ma.Registration(multiview, new, stored)
+        self.reg.run()
+        self.reg.recheck()  # across the calls: what later calls registered
+        self.reg_s += time.perf_counter() - t
+        return self._place(self.frames)
+
+    def more(self, extra: list[Keyframe]) -> list[Keyframe]:
+        """The frames still unconfirmed tested again against ``extra`` (keyframes the other
+        engine added since) and what they bring; the keyframes added."""
+        assert self.reg is not None  # only after ``first`` added keyframes
+        t = time.perf_counter()
+        refs = [r for k in extra for r in [self.am.depth_ref(k)] if r is not None]
+        got = set(self.reg.recheck(refs))
+        self.reg_s += time.perf_counter() - t
+        return self._place([fr for fr in self.frames if fr.work.index in got])
+
+    def _place(self, frames: list[_Frame]) -> list[Keyframe]:
+        """``frames``' placements (``Registration.placements``) into ``got``: the distance
+        limit, one standpoint (map.md §1), pose duplicates, each registered one a keyframe."""
+        assert self.reg is not None
+        t = time.perf_counter()
+        am, feats, res = self.am, self.feats, self.reg.placements
+        # frames of one standpoint: a pure rotation about its centre (map.md §1). MapAnything
+        # matches its views internally (no features of ours reach it): the static image content
+        # is left out of the features the service matches, those of standpoints and duplicates
+        turned = standpoint.standpoints(
+            am, [standpoint.NewFrame(fr.work.name, fr.cam.canonical(), fr.work.index,
+                                     _has_depth(fr), p.T, feats[fr.work.index]) for fr in frames
+                 for p in [res[fr.work.index]] if p.status == "registered" and p.T is not None],
+            self.pairs)
+        self.reg_s += time.perf_counter() - t
+        t = time.perf_counter()
+        added = []
         for fr in frames:
-            got[fr.work.index] = Placement(fr.work.name, "rejected", "no_overlap")
-        return time.perf_counter() - t, 0.0
-    new = []
-    for fr in frames:
-        assert fr.path is not None and fr.measures is not None
-        new.append(register_ma.New(fr.work.index, fr.path, fr.cam.canonical(),
-                                   fr.depth_m if _has_depth(fr) else None,
-                                   fr.measures.features))
-    calls = [0]
-
-    def multiview(images: list[Path], Ks: list[Intrinsics], poses: list[Any]) -> Any:
-        calls[0] += 1
-        return up.backend.geometry_views(images, Ks, poses, workdir / f"mv{calls[0]}")
-
-    res = register_ma.Registration(multiview, new, stored).run()
-    # frames of one standpoint: a pure rotation about its centre (map.md §1). MapAnything
-    # matches its views internally (no features of ours reach it): the static image content is
-    # left out of the features the service matches, those of standpoints and duplicates
-    turned = standpoint.standpoints(
-        am, [standpoint.NewFrame(fr.work.name, fr.cam.canonical(), fr.work.index, _has_depth(fr),
-                                 p.T, feats[fr.work.index]) for fr in frames
-             for p in [res.placements[fr.work.index]]
-             if p.status == "registered" and p.T is not None], pairs)
-    reg_s = time.perf_counter() - t
-    t = time.perf_counter()
-    for fr in frames:
-        p = res.placements[fr.work.index]
-        scene = fr.scene_m if fr.scene_m is not None else p.scene_m
-        # MapAnything gives no image feature inliers: depth agreement never counts toward the
-        # 300-inlier exemption (api.md §4, depth never overrides too_close)
-        if too_close(scene, 0):
-            got[fr.work.index] = Placement(fr.work.name, "rejected", "too_close",
-                                           inliers=p.inliers, scene_m=scene)
-            continue
-        if p.status == "rejected":
-            got[fr.work.index] = Placement(fr.work.name, "rejected", p.reason)
-            continue
-        assert p.T is not None and p.depth is not None and p.K_depth is not None
-        T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
-            p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
-        dup = am.duplicate_of(fr.work.camera_id, T, feats[fr.work.index], fr.work.name)
-        if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
-            got[fr.work.index] = Placement(fr.work.name, "rejected", "duplicate",
-                                           inliers=p.inliers, duplicate_of=dup)
-            continue
-        # its sigmas calibrated as every image pose's (``mapping.sigmas``; no prior); its
-        # displacement (map.md §1): the committed pose against MapAnything's image-only one, 0
-        # unless a standpoint turned it
-        pl = Placement(fr.work.name, "registered", None, T, round(sp, 4), round(sr, 3),
-                       p.inliers, "rotation" if fr.work.index in turned else "mapanything",
-                       align_T=p.T, map_residual=(0.0, round(rot_deg(T[:3, :3].T @ p.T[:3, :3]),
-                                                             3)))
-        f = _frame_in(fr, None)
-        h, w = p.depth.shape
-        Kg = Intrinsics(float(p.K_depth[0, 0]), float(p.K_depth[1, 1]), float(p.K_depth[0, 2]),
-                        float(p.K_depth[1, 2]), w, h)
-        depth = p.depth
-        kind = "sensor" if _has_depth(fr) else "mono"
-        if kind == "sensor":  # its depth image's residual against the map (scale_sigma_rel)
-            am.depth_residual(f, T, depth, Kg)
-        if kind == "mono":
-            am.add_height_evidence(f, T, depth, Kg)
-            k = am.scale.k
-            am.scale.estimate(am.prior_span(), am.prior_span("drifting"))
-            depth = (depth * (am.scale.k / k)).astype(np.float32)
-        assert fr.rgb is not None
-        am.add(f, feats[fr.work.index], pl, depth, Kg, kind, None)
-        got[fr.work.index] = pl
-    return reg_s, time.perf_counter() - t
+            p = res[fr.work.index]
+            scene = fr.scene_m if fr.scene_m is not None else p.scene_m
+            # MapAnything gives no image feature inliers: depth agreement never counts toward
+            # the 300-inlier exemption (api.md §4, depth never overrides too_close)
+            if too_close(scene, 0):
+                self.reg.waiting.pop(fr.work.index, None)
+                self.got[fr.work.index] = Placement(fr.work.name, "rejected", "too_close",
+                                                    inliers=p.inliers, scene_m=scene)
+                continue
+            if p.status == "rejected":
+                self.got[fr.work.index] = Placement(fr.work.name, "rejected", p.reason)
+                continue
+            assert p.T is not None and p.depth is not None and p.K_depth is not None
+            T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
+                p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
+            dup = am.duplicate_of(fr.work.camera_id, T, feats[fr.work.index], fr.work.name)
+            if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
+                self.got[fr.work.index] = Placement(fr.work.name, "rejected", "duplicate",
+                                                    inliers=p.inliers, duplicate_of=dup)
+                continue
+            # its sigmas calibrated as every image pose's (``mapping.sigmas``; no prior); its
+            # displacement (map.md §1): the committed pose against MapAnything's image-only
+            # one, 0 unless a standpoint turned it
+            pl = Placement(fr.work.name, "registered", None, T, round(sp, 4), round(sr, 3),
+                           p.inliers, "rotation" if fr.work.index in turned else "mapanything",
+                           align_T=p.T,
+                           map_residual=(0.0, round(rot_deg(T[:3, :3].T @ p.T[:3, :3]), 3)))
+            f = _frame_in(fr, None)
+            h, w = p.depth.shape
+            Kg = Intrinsics(float(p.K_depth[0, 0]), float(p.K_depth[1, 1]),
+                            float(p.K_depth[0, 2]), float(p.K_depth[1, 2]), w, h)
+            depth = p.depth
+            kind = "sensor" if _has_depth(fr) else "mono"
+            if kind == "sensor":  # its depth image's residual against the map (scale_sigma_rel)
+                am.depth_residual(f, T, depth, Kg)
+            if kind == "mono":
+                am.add_height_evidence(f, T, depth, Kg)
+                k = am.scale.k
+                am.scale.estimate(am.prior_span(), am.prior_span("drifting"))
+                depth = (depth * (am.scale.k / k)).astype(np.float32)
+            assert fr.rgb is not None
+            added.append(am.add(f, feats[fr.work.index], pl, depth, Kg, kind, None))
+            self.got[fr.work.index] = pl
+        self.fuse_s += time.perf_counter() - t
+        return added
 
 
 def _canonical(fr: _Frame) -> tuple[Any, ...]:
@@ -215,45 +241,36 @@ def _late(up: Updater, am: AnchoredMap, geo: list[_Frame], ins: list[FrameIn],
           late: list[_Frame], feats: dict[int, Features], placements: dict[int, Placement],
           stored: list[Keyframe], workdir: Path, progress: Callable[[str], None],
           pairs: standpoint.Pairs) -> tuple[float, float]:
-    """The frames without a prior by MapAnything after the others (``_register_none``), then
-    one match graph over both engines (map.md §2: the same fixed point whatever the request
-    order): the job's frames with a prior still kept for want of an image pose are placed
-    again against the frames MapAnything registered (``AnchoredMap.retry_kept``), and the
-    frames MapAnything left unplaced are tried again against those, until neither adds a
-    frame. The stored kept keyframes the new frames overlap are re-registered (map.md §2).
-    Returns the registration and fusion seconds."""
-    reg_s = fuse_s = 0.0
-    todo, new = list(late), []
-    rounds = itertools.count()
-    while todo:
-        n = next(rounds)
-        d = workdir if not n else workdir / f"late{n}"
-        d.mkdir(parents=True, exist_ok=True)
-        lp, r, fu = _register_none(up, am, todo, d, progress, pairs, feats)
-        reg_s, fuse_s = reg_s + r, fuse_s + fu
-        added = []
-        for fr, pl in zip(todo, lp, strict=True):
-            placements[fr.work.index] = pl
-            k = None if pl.keyframe is None else am.keyframe(pl.keyframe)
-            if pl.status == "registered" and k is not None:
-                added.append(k)
-        new += added
+    """The frames without a prior by MapAnything after the others (``_MaRun``), then one match
+    graph over both engines (map.md §2: the same fixed point whatever the request order): the
+    job's frames with a prior still kept for want of an image pose are placed again against the
+    frames MapAnything registered (``AnchoredMap.retry_kept``), and the frames MapAnything left
+    unplaced are tested again against those (never inferred again), until neither adds a frame.
+    The stored kept keyframes the new frames overlap are re-registered (map.md §2). Returns the
+    registration and fusion seconds."""
+    run = _MaRun(up, am, late, workdir, pairs, feats)
+    added = run.first()
+    new = list(added)
+    while added:
         t = time.perf_counter()
         kept = [(f, k) for fr, f in zip(geo, ins, strict=True)
                 for pl in [placements[fr.work.index]]
                 if pl.status == "kept_at_prior" and pl.keyframe is not None
                 for k in [am.keyframe(pl.keyframe)] if k is not None]
-        again = am.retry_kept(kept, added) if added else {}
+        again = am.retry_kept(kept, added)
         placements.update({fr.work.index: again[fr.work.name] for fr in geo
                            if fr.work.name in again})
-        new += [k for got in again.values() for k in [am.keyframe(got.keyframe or "")]
-                if k is not None]
-        reg_s += time.perf_counter() - t
-        if not any(p.status == "registered" for p in again.values()):
-            break
-        todo = [fr for fr in late if placements[fr.work.index].reason == "no_overlap"]
+        confirmed = [k for got in again.values() for k in [am.keyframe(got.keyframe or "")]
+                     if k is not None]
+        new += confirmed
+        run.reg_s += time.perf_counter() - t
+        added = run.more(confirmed) if confirmed else []
+        new += added
+    for fr in late:
+        pl = placements[fr.work.index] = run.got[fr.work.index]
+        progress(f"{fr.work.name}: {pl.status} ({pl.reason or pl.method})")
     am.reregistered += am.reregister([k for k in stored if not k.usable()], new)
-    return reg_s, fuse_s
+    return run.reg_s, run.fuse_s
 
 
 def frame_class(fr: _Frame) -> str:

@@ -236,6 +236,11 @@ class Registration:
         self.unposed = False  # the last call ran without pose inputs
         self.notes: dict[str, Any] = {"calls": []}
         self._thumbs: dict[str, NDArray[np.float32] | None] = {}
+        # the frames no reference confirmed yet, with their call's output (``recheck``): each
+        # frame is inferred once per job
+        self.waiting: dict[int, tuple[New, Array, tuple[float, float], NDArray[np.float32],
+                                      Array]] = {}
+        self.order = {f.index: k for k, f in enumerate(new)}
 
     def _thumb(self, key: str, path: Path) -> NDArray[np.float32] | None:
         if key not in self._thumbs:
@@ -332,9 +337,11 @@ class Registration:
                 call.append(Ref(T, ma_depth, Kma))
                 del cand[idx]
                 changed = True
-        for idx in cand:  # few_features is only the checks' verdict (api.md §4)
+        for idx, (f, T, sig, depth, Kd, _ma, _K) in cand.items():
+            # few_features is only the checks' verdict (api.md §4)
             self.placements[idx] = Placement("rejected", "no_overlap",
                                              scene_m=self.scenes.get(idx))
+            self.waiting[idx] = (f, T, sig, depth, Kd)
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
                   Kd: Array, inliers: int) -> None:
@@ -345,6 +352,30 @@ class Registration:
         got = (depth, Kd)
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
                                 lambda: got))
+
+    def recheck(self, extra: list[Ref] | None = None) -> list[int]:
+        """The frames no reference confirmed (``waiting``) tested again, without inferring them
+        again (their call's pose and depth), against every view registered since — this
+        update's and ``extra`` (other engines' new keyframes) — in the order of ``new``, until
+        none is added (map.md §2: the order of the frames does not matter). Returns the indices
+        registered."""
+        out: list[int] = []
+        changed = True
+        while changed:
+            changed = False
+            refs = [r for v in self.pool for r in [v.ref()] if r is not None] + list(extra or [])
+            for idx in sorted(self.waiting, key=lambda i: self.order[i]):
+                f, T, sig, depth, Kd = self.waiting[idx]
+                tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
+                a = agreement(backproject(depth, Kd), T, refs, tol)
+                if not a.confirmed:
+                    continue
+                del self.waiting[idx]
+                self._register(f, T, sig, depth, Kd, a.agree)
+                out.append(idx)
+                changed = True
+                break  # the references grew
+        return out
 
     def run(self) -> Result:
         todo = list(self.new)
