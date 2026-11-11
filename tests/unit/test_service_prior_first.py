@@ -821,17 +821,21 @@ def test_a_stored_kept_frame_is_re_registered_by_a_later_job(client: Client) -> 
 
 def test_pose_duplicates_name_the_frame_they_repeat(client: Client) -> None:
     """api.md §4: a registered pose within 0.02 m and 2 deg of a stored confirmed keyframe of
-    the same camera, or of an earlier registered frame of the request, is a duplicate naming
-    that frame; the dry run predicts it."""
+    the same camera, or of an earlier registered frame of the request, whose image agrees
+    with it (90 % of its features re-matched) is a duplicate naming that frame; the dry run
+    predicts it. One whose image does not agree (turned 0.5 deg: a third of its features no
+    longer re-match) is registered: the later observation wins."""
     fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
     client.update("m", fr, files, cameras={"cam": CAM})
-    fr, files = frames_for(client, [base_pose(0.5), base_pose(60), base_pose(60.5)], tag="b")
+    fr, files = frames_for(client, [base_pose(0), base_pose(60), base_pose(60), base_pose(35.5)],
+                           tag="b")
     d = dry(client, "m", fr, files)
     rows = [(r["predicted_reason"], r.get("duplicate_of")) for r in d["frames"]]
-    assert rows[0] == ("duplicate", "a0")
+    assert rows[0] == ("duplicate", "a0") and rows[2] == ("duplicate", "b1")
+    assert rows[3] == (None, None)
     job = client.update("m", fr, files)
     got = [(i["reason"], i.get("duplicate_of")) for i in job["inputs"]]
-    assert got == [("duplicate", "a0"), (None, None), ("duplicate", "b1")]
+    assert got == [("duplicate", "a0"), (None, None), ("duplicate", "b1"), (None, None)]
 
 
 def test_a_too_close_camera_only_origin_leaves_no_map(client: Client,

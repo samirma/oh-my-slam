@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import shutil
@@ -54,11 +55,12 @@ from oh_my_slam.mapping import anchor, checks, sigmas
 from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import (
     OVERLAP_MIN,
-    duplicate_limits,
+    Features,
+    duplicate_among,
+    features,
     floor_spread,
     frustum_points,
     lowest_layer,
-    pose_residual,
     view_overlap,
 )
 from oh_my_slam.mapping.quality import gate, residual_stats
@@ -724,14 +726,25 @@ class Updater:
 
     def _post_check(self, placed: list[_Frame], anchored: _Anchored, internal: InternalMap,
                     prev: dict[str, Any] | None = None) -> list[_Frame]:
-        """The registered frames to leave out: ``prior_conflict``, ``too_close`` (kept at its
-        prior when it has one) and pose ``duplicate`` (``_duplicate_of``)."""
+        """The registered frames to leave out: ``too_close`` (kept at its prior when it has one:
+        a failed check wins over ``prior_conflict``, api.md §4), ``prior_conflict`` and pose
+        ``duplicate`` (``_duplicate_of``)."""
         out = []
         earlier: list[_Frame] = []
         for fr in sorted(placed, key=lambda fr: fr.work.index):
             assert fr.internal is not None
             d = internal.depth(fr.internal.name)
             med = None if d is None else checks.median_depth(d)
+            if med is not None:
+                fr.scene_m = med * anchored.sim.s
+            if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M \
+                    and _inliers(fr.internal) < TOO_CLOSE_INLIERS:
+                if fr.work.trust in ("metric", "drifting"):  # kept at its prior (api.md §4)
+                    fr.unconfirmed, fr.internal = "too_close", None
+                else:
+                    fr.reason = "too_close"
+                out.append(fr)
+                continue
             if fr.prior_residual is not None and fr.work.prior is not None:
                 # beyond the combined bound 3 x sqrt(sigma_prior^2 + sigma_image^2) (api.md §4:
                 # the prior's sigmas floored as the anchors' noise; the image pose's calibrated
@@ -746,17 +759,7 @@ class Updater:
                     fr.reason = "prior_conflict"
                     out.append(fr)
                     continue
-            if med is not None:
-                fr.scene_m = med * anchored.sim.s
-            if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M \
-                    and _inliers(fr.internal) < TOO_CLOSE_INLIERS:
-                if fr.work.trust in ("metric", "drifting"):  # kept at its prior (api.md §4)
-                    fr.unconfirmed, fr.internal = "too_close", None
-                else:
-                    fr.reason = "too_close"
-                out.append(fr)
-                continue
-            dup = self._duplicate_of(fr, prev, earlier)
+            dup = self._duplicate_of(fr, prev, earlier, internal)
             if dup is not None:
                 fr.reason, fr.duplicate_of = "duplicate", dup
                 out.append(fr)
@@ -765,23 +768,35 @@ class Updater:
         return out
 
     @staticmethod
-    def _duplicate_of(fr: _Frame, prev: dict[str, Any] | None, earlier: list[_Frame]
-                      ) -> str | None:
-        """The frame a registered frame duplicates (api.md §4): a stored fused frame of the
-        previous version, or an earlier registered frame of the request, of its camera, within
-        ``duplicate_limits`` of its pose; None."""
+    def _duplicate_of(fr: _Frame, prev: dict[str, Any] | None, earlier: list[_Frame],
+                      internal: InternalMap | None = None) -> str | None:
+        """The frame a registered frame duplicates (api.md §4, ``anchored.duplicate_among``): a
+        stored fused frame of the previous version, or an earlier registered frame of the
+        request, of its camera, within ``duplicate_limits`` of its pose, whose image its own
+        agrees with (their images: the mapper map's, the request's); None."""
         assert fr.pose is not None
-        lim_m, lim_deg = duplicate_limits()
-        cands = [(r["name"], _mat(r["T_map_cam"])) for r in (prev["frames"] if prev else [])
-                 if r.get("pose_state", "fused") != "kept_at_prior"
-                 and r.get("camera_id") == fr.work.camera_id]
-        cands += [(e.work.name, e.pose) for e in earlier
-                  if e.work.camera_id == fr.work.camera_id and e.pose is not None]
-        for name, T in cands:
-            dp, dr = pose_residual(T, fr.pose)
-            if dp <= lim_m and dr <= lim_deg:
-                return name
-        return None
+
+        def of_rgb(rgb: Any) -> Features | None:
+            return None if rgb is None else features(rgb, None)
+
+        def of_image(name: str | None) -> Features | None:
+            p = None if internal is None or not name else internal.image(name)
+            if p is None or not p.exists():
+                return None
+            import cv2
+
+            bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            return None if bgr is None else features(
+                np.asarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), np.uint8))
+
+        cands: list[tuple[str, str, Any, Callable[[], Features | None]]] = [
+            (r["name"], r.get("camera_id", ""), _mat(r["T_map_cam"]),
+             functools.partial(of_image, r.get("internal")))
+            for r in (prev["frames"] if prev else [])
+            if r.get("pose_state", "fused") != "kept_at_prior"]
+        cands += [(e.work.name, e.work.camera_id, e.pose, functools.partial(of_rgb, e.rgb))
+                  for e in earlier if e.pose is not None]
+        return duplicate_among(fr.work.camera_id, fr.pose, of_rgb(fr.rgb), cands)
 
     # -- result ----------------------------------------------------------------------------------
 

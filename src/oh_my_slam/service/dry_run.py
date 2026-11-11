@@ -30,10 +30,12 @@ Its inference requests (monocular depth, gravity) are sent as interactive
 from __future__ import annotations
 
 import copy
+import functools
 import itertools
 import math
 import shutil
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -53,7 +55,7 @@ from oh_my_slam.mapping.anchored import (
     Features,
     Placement,
     _prior_sigmas,
-    duplicate_limits,
+    duplicate_among,
     features,
     match,
     pose_residual,
@@ -120,19 +122,22 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             links = list(pool.map(lambda k: _neighbours(k, frames, feats), range(len(frames))))
         out, kept, prior_res = [], [], []
         first_kept = True
-        earlier: list[tuple[str, str, Any]] = []  # predicted registered: camera, name, pose
+        # predicted registered: name, camera, pose, features (the pose duplicate's candidates)
+        earlier: list[tuple[str, str, Any, Callable[[], Features | None]]] = []
         for k, fr in enumerate(frames):
             row, pl = _frame(fr, links[k], placed.get(fr.work.index), am is not None,
                              prev is None, first_kept)
             if row["predicted_status"] == "registered" and am is not None and pl is not None \
                     and pl.T is not None:
-                dup = am.duplicate_of(fr.work.camera_id, pl.T) or _earlier_duplicate(
-                    fr.work.camera_id, pl.T, earlier)
+                own = feats.get(fr.work.index)
+                dup = am.duplicate_of(fr.work.camera_id, pl.T, own) or duplicate_among(
+                    fr.work.camera_id, pl.T, own, earlier)
                 if dup is not None:
                     row.update(predicted_status="rejected", predicted_reason="duplicate",
                                duplicate_of=dup)
                 else:
-                    earlier.append((fr.work.camera_id, fr.work.name, pl.T))
+                    earlier.append((fr.work.name, fr.work.camera_id, pl.T,
+                                    functools.partial(feats.get, fr.work.index)))
             if row["predicted_status"] != "rejected":
                 first_kept = False
                 kept.append((row["predicted_status"], pl))
@@ -199,18 +204,6 @@ def _classes(frames: list[_Frame]) -> dict[str, int]:
         c = frame_class(fr)
         out[c] = out.get(c, 0) + 1
     return out
-
-
-def _earlier_duplicate(camera_id: str, T: Any, earlier: list[tuple[str, str, Any]]
-                       ) -> str | None:
-    """An earlier predicted registered frame of the request, of camera ``camera_id``, within
-    the duplicate limits of pose ``T`` (api.md §4), or None."""
-    lim_m, lim_deg = duplicate_limits()
-    for cid, name, U in earlier:
-        dp, dr = pose_residual(U, T)
-        if cid == camera_id and dp <= lim_m and dr <= lim_deg:
-            return name
-    return None
 
 
 def _reregistered(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],

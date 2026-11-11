@@ -72,6 +72,7 @@ retrieval descriptor), ``cloud.npz``."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 import json
 import math
@@ -163,7 +164,8 @@ SCALE_EVIDENCE_MIN_M = 0.1  # a PnP baseline shorter than this tells little abou
 SCALE_EVIDENCE_MIN = 3
 SCALE_RANGE = (0.2, 5.0)
 MAX_EVIDENCE = 500
-DEPTH_SIGMA_REL = 0.01  # depth images (README "Prior-first registration")
+DEPTH_SIGMA_REL = 0.01  # depth images, before their residuals (README "Prior-first registration")
+DEPTH_SENSOR_SIGMA_REL = 0.005  # a depth sensor's own scale error, which no residual shows
 MONOCULAR_SIGMA_REL = 0.10
 MIN_SCALE_SIGMA_REL = 0.002
 DEFAULT_HEIGHT_SIGMA_M = 0.02
@@ -211,6 +213,7 @@ DUPLICATE_CAP_POS_M = 0.05
 DUPLICATE_CAP_ROT_DEG = 5.0
 DUPLICATE_POS_ENV = "OH_MY_SLAM_DUPLICATE_M"
 DUPLICATE_ROT_ENV = "OH_MY_SLAM_DUPLICATE_DEG"
+DUPLICATE_REMATCH = 0.90  # a pose duplicate's features re-matched in the keyframe (api.md §4)
 REREGISTER_OVERLAP = 0.10  # a new frame sees this share of a kept keyframe's view: placed again
 MIN_CAMERA_HEIGHT = 0.05
 ALIGN_MIN_POINTS = 30  # a new monocular keyframe's depth is aligned on this many lifted points
@@ -430,6 +433,40 @@ def features(rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None = None) ->
     d = np.sqrt(d / (d.sum(axis=1, keepdims=True) + 1e-7))
     return Features(np.array([k.pt for k in kps], np.float32),
                     np.clip(np.round(d * ROOTSIFT_QUANT), 0, 255).astype(np.uint8))
+
+
+def duplicate_among(camera_id: str, T: Array, feats: Features | None,
+                    cands: list[tuple[str, str, Array, Callable[[], Features | None]]]
+                    ) -> str | None:
+    """The pose duplicate's test (api.md §4), shared by every engine and the dry run: the first
+    candidate ``(name, camera_id, pose, its features)`` of camera ``camera_id`` within
+    ``duplicate_limits`` of pose ``T`` whose image the frame's (``feats``) agrees with
+    (``images_agree``); without ``feats``, the pose alone. None when there is none."""
+    lim_m, lim_deg = duplicate_limits()
+    for name, cid, U, theirs in cands:
+        if cid != camera_id:
+            continue
+        dp, dr = pose_residual(U, T)
+        if dp > lim_m or dr > lim_deg:
+            continue
+        if feats is not None:
+            other = theirs()
+            if other is None or not images_agree(feats, other):
+                continue
+        return name
+    return None
+
+
+def images_agree(a: Features, b: Features) -> bool:
+    """Whether image ``a`` agrees with image ``b`` as a pose duplicate's must (api.md §4): at
+    least ``DUPLICATE_REMATCH`` of its features re-matched (ratio test) in ``b``. A view whose
+    scene changed (an object moved, added or gone) re-matches less, so the later observation is
+    registered and wins (map.md §3): the re-match stands for "no object record visible in that
+    view would change" (README "Pose duplicates")."""
+    if not len(a.kps):
+        return False
+    ia, _ = match(b.desc, a.desc)
+    return len(ia) >= DUPLICATE_REMATCH * len(a.kps)
 
 
 def match(a: NDArray[np.uint8], b: NDArray[np.uint8]) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
@@ -1085,18 +1122,31 @@ class ScaleState:
     odometry: list[list[float]] = field(default_factory=list)
     # the map-frame viewing yaw (deg) of each ``heights`` entry's camera (``direction_spread``)
     height_yaws: list[float] = field(default_factory=list)
+    # per registered keyframe, the log of the factor bringing its own depth onto the map's
+    # lifted points (``depth_alignment``): the residuals of its depth source, by depth kind
+    depth_residuals: dict[str, list[float]] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {"k": self.k, "source": self.source, "sigma_rel": self.sigma_rel,
                 "priors": self.priors, "heights": self.heights, "odometry": self.odometry,
-                "height_yaws": self.height_yaws}
+                "height_yaws": self.height_yaws, "depth_residuals": self.depth_residuals}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> ScaleState:
         return ScaleState(float(d["k"]), d["source"], float(d["sigma_rel"]),
                           [list(e) for e in d["priors"]], [list(e) for e in d["heights"]],
                           [list(e) for e in d["odometry"]],
-                          [float(y) for y in d.get("height_yaws", [])])
+                          [float(y) for y in d.get("height_yaws", [])],
+                          {k: [float(x) for x in v]
+                           for k, v in d.get("depth_residuals", {}).items()})
+
+    def residual_spread(self, kind: str) -> float | None:
+        """The robust spread (1.4826 MAD) of a depth kind's residuals (``depth_residuals``),
+        None with fewer than ``SCALE_EVIDENCE_MIN``."""
+        r = np.asarray(self.depth_residuals.get(kind, []), np.float64)
+        if len(r) < SCALE_EVIDENCE_MIN:
+            return None
+        return 1.4826 * float(np.median(np.abs(r - np.median(r))))
 
     def direction_spread(self) -> float:
         """How the camera heights' scale differs between viewing directions (map.md §1: the
@@ -1177,7 +1227,10 @@ class ScaleState:
             self.k, self.source = got[0], "priors"
             self.sigma_rel = max(got[1], DRIFT_POS_REL)
             return
-        self.k, self.source, self.sigma_rel = 1.0, "monocular", MONOCULAR_SIGMA_REL
+        # the monocular model's metres: its stated error, with its keyframes' residual spread
+        spread = self.residual_spread("mono") or 0.0
+        self.k, self.source = 1.0, "monocular"
+        self.sigma_rel = math.hypot(MONOCULAR_SIGMA_REL, spread)
 
 
 @dataclass
@@ -1454,23 +1507,36 @@ class AnchoredMap:
         heights or the monocular model)."""
         span = self.prior_span()
         if span >= PRIOR_SPAN_M and self.prior_bias() == 1.0:
-            sp = float(np.median([_prior_sigmas(k.prior)[0] for k in self.confirmed()
-                                  if k.prior is not None and k.prior["trust"] == "metric"]))
-            return "priors", max(math.sqrt(2.0) * sp / span, MIN_SCALE_SIGMA_REL)
+            # the metric priors' residuals against the committed positions of the confirmed
+            # keyframes (their RMS), at least their stated sigma over the root of their count
+            ms = [k for k in self.confirmed() if k.prior is not None
+                  and k.prior["trust"] == "metric"]
+            sp = float(np.median([_prior_sigmas(k.prior)[0] for k in ms]))
+            res = np.array([float(np.linalg.norm(k.centre - np.asarray(k.prior["T"])[:3, 3]))  # type: ignore[index]
+                            for k in ms])
+            rms = math.sqrt(float(np.mean(res ** 2)))
+            return "priors", max(math.sqrt(2.0) * max(rms, sp / math.sqrt(len(ms))) / span,
+                                 MIN_SCALE_SIGMA_REL)
         if any(k.depth_kind == "sensor" for k in self.confirmed()):
-            return "depth", DEPTH_SIGMA_REL
+            # the depth images' residuals against the map (``ScaleState.depth_residuals``),
+            # with the sensor's own scale error; the documented constant before enough of them
+            spread = self.scale.residual_spread("sensor")
+            return "depth", DEPTH_SIGMA_REL if spread is None else max(
+                math.hypot(spread, DEPTH_SENSOR_SIGMA_REL), MIN_SCALE_SIGMA_REL)
         return self.scale.source, self.scale.sigma_rel
 
-    def duplicate_of(self, camera_id: str, T: Array) -> str | None:
+    def duplicate_of(self, camera_id: str, T: Array, feats: Features | None = None
+                     ) -> str | None:
         """The image-confirmed keyframe of camera ``camera_id`` within ``duplicate_limits`` of
-        pose ``T`` (api.md §4: a kept_at_prior keyframe does not count), or None."""
-        lim_m, lim_deg = duplicate_limits()
-        for k in self.confirmed():
-            if k.camera_id == camera_id:
-                dp, dr = pose_residual(k.T, T)
-                if dp <= lim_m and dr <= lim_deg:
-                    return k.name
-        return None
+        pose ``T`` (api.md §4: a kept_at_prior keyframe does not count) whose image the frame's
+        agrees with (``feats``: at least ``DUPLICATE_REMATCH`` of its features re-matched in
+        that keyframe's, ``images_agree``), or None. Without ``feats``, the pose alone."""
+        def loaded(k: Keyframe) -> Features | None:
+            self._load_kf(k)
+            return k.feats
+
+        return duplicate_among(camera_id, T, feats, [
+            (k.name, k.camera_id, k.T, functools.partial(loaded, k)) for k in self.confirmed()])
 
     # -- registration --------------------------------------------------------------------------
 
@@ -2009,6 +2075,14 @@ class AnchoredMap:
             depth, Kg, kind, desc = self._keyframe_depth(f)
             if not self.keyframes and self.created_with != "none" and f.mono is not None:
                 self._up_check(f, pl)
+            if kind == "sensor" and pl.status == "registered" and pl.lifted is not None:
+                assert pl.T is not None
+                # the depth image against the map's lifted points: its source's residual
+                a = depth_alignment(pl.T if pl.align_T is None else pl.align_T, *pl.lifted,
+                                    depth, Kg, f.K)
+                if a is not None:
+                    self.scale.depth_residuals.setdefault("sensor", []).append(math.log(a))
+                    del self.scale.depth_residuals["sensor"][:-MAX_EVIDENCE]
             if kind == "mono" and pl.status == "registered":
                 assert pl.T is not None
                 # its own scale brought onto the map's (the monocular model's metres vary from
@@ -2018,6 +2092,8 @@ class AnchoredMap:
                                         *pl.lifted, depth, Kg, f.K)
                     if a is not None:
                         depth = (depth * a).astype(np.float32)
+                        self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
+                        del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
                 # its camera height, if known, refines the depth scale before it is fused (a
                 # frame kept at its prior is no scale evidence: map.md §2)
                 self.add_height_evidence(f, pl.T, depth, Kg)
@@ -2060,7 +2136,7 @@ class AnchoredMap:
                     pl = self.standpoint(f, feats_of[i], pl)
                 if close and pl.inliers < TOO_CLOSE_INLIERS:
                     pl = self._too_close(f, pl, scene)
-            pl = self._dedup(f, pl)
+            pl = self._dedup(f, pl, feats_of[i])
             again = []
             if pl.reason == "prior_conflict" and f.prior is not None \
                     and f.prior["trust"] == "drifting":
@@ -2090,7 +2166,7 @@ class AnchoredMap:
             for j in again:
                 t = time.perf_counter()
                 out[j] = self._checked(frames[j], self._dedup(frames[j], self.place(
-                    frames[j], feats_of[j], None)), mine)
+                    frames[j], feats_of[j], None), feats_of[j]), mine)
                 self._odometry(frames[j], out[j])
                 reg_s += time.perf_counter() - t
                 if out[j].status != "rejected":
@@ -2151,25 +2227,24 @@ class AnchoredMap:
             return _kept(f, *pred, f.unconfirmed, pl.inliers)
         return _kept(f, *pred, "too_close", pl.inliers, scene)
 
-    def _dedup(self, f: FrameIn, pl: Placement) -> Placement:
+    def _dedup(self, f: FrameIn, pl: Placement, feats: Features | None = None) -> Placement:
         """A registered frame within ``duplicate_limits`` of an image-confirmed keyframe of its
-        camera, stored or added earlier in the update (api.md §4: the registered pose): rejected
-        ``duplicate``, naming it."""
+        camera, stored or added earlier in the update (api.md §4: the registered pose), whose
+        image agrees with that keyframe's (``duplicate_of``): rejected ``duplicate``, naming
+        it. One whose image does not agree is registered (the later observation wins)."""
         if pl.status != "registered" or pl.T is None:
             return pl
-        dup = self.duplicate_of(f.camera_id, pl.T)
+        dup = self.duplicate_of(f.camera_id, pl.T, feats)
         if dup is None:
             return pl
         return Placement(f.name, "rejected", "duplicate", inliers=pl.inliers, duplicate_of=dup)
 
     def overlaps(self, kept: Keyframe, other: Keyframe) -> bool:
-        """Whether two keyframes overlap for re-registration: either sees at least
-        ``REREGISTER_OVERLAP`` of the other's view (its pixels at its median depth)."""
-        for a, b in ((kept, other), (other, kept)):
-            X = frustum_points(a.T, a.K, a.median_depth or 2.0)
-            if view_overlap(X, b.T, b.K) >= REREGISTER_OVERLAP:
-                return True
-        return False
+        """Whether a new keyframe ``other`` overlaps a stored kept one for re-registration
+        (map.md §2): it shares at least ``REREGISTER_OVERLAP`` of the kept frame's view (its
+        pixels at its median depth)."""
+        X = frustum_points(kept.T, kept.K, kept.median_depth or 2.0)
+        return view_overlap(X, other.T, other.K) >= REREGISTER_OVERLAP
 
     def reregister(self, kept: list[Keyframe], new: list[Keyframe]) -> list[dict[str, Any]]:
         """The stored ``kept_at_prior`` keyframes ``kept`` that a new image-confirmed keyframe
@@ -2356,8 +2431,8 @@ class AnchoredMap:
         * priors fixed the map frame: the plane nearest z 0 (their origin is where the robot
           stands), not a lower floor seen past a worktop's edge;
         * a camera-only map whose first frame had a camera height: z 0 (the floor that height
-          defines, map.md §1), refined to the plane nearest it within ``FLOOR_BAND_SIGMAS`` of
-          the floor points' spread about z 0;
+          defines, map.md §1), refined to the observed plane nearest it when that lies within
+          ``FLOOR_BAND_SIGMAS`` of its own points' spread (``floor_sigma_m``);
         * otherwise the lowest; without one, the lowest dense layer."""
         pts = self.cloud.points()
         centres = np.array([k.centre for k in self.confirmed()]).reshape(-1, 3)
@@ -2366,11 +2441,14 @@ class AnchoredMap:
         if self.created_with == "none" and self.origin_height_m is not None:
             floor = 0.0
             if len(pts):
-                band = FLOOR_BAND_SIGMAS * floor_spread(pts[:, 2], 0.0)
+                # the observed plane nearest the height's floor, accepted within
+                # FLOOR_BAND_SIGMAS of its own points' spread (map.md §6)
                 planes = [below - h for h in floor_candidates(
                     pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)]
-                near = [z for z in planes if abs(z) <= band]
-                floor = min(near, key=abs) if near else 0.0
+                if planes:
+                    z = min(planes, key=abs)
+                    if abs(z) <= FLOOR_BAND_SIGMAS * floor_spread(pts[:, 2], z):
+                        floor = z
         elif len(pts):
             planes = floor_candidates(pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)
             if planes and self.created_with in ("metric", "drifting"):

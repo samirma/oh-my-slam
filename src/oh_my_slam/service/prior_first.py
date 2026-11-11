@@ -242,7 +242,7 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
         assert p.T is not None and p.depth is not None and p.K_depth is not None
         T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
             p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
-        dup = am.duplicate_of(fr.work.camera_id, T)
+        dup = am.duplicate_of(fr.work.camera_id, T, feats[fr.work.index])
         if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
             out.append(Placement(fr.work.name, "rejected", "duplicate", inliers=p.inliers,
                                  duplicate_of=dup))

@@ -979,7 +979,9 @@ def test_overlapping_frames_correct_the_priors_rotation(tmp_path: Path) -> None:
     rel = pls[0].T[:3, :3].T @ pls[1].T[:3, :3]  # type: ignore[union-attr]
     assert an.rot_deg(rel.T @ (b[:3, :3].T @ c[:3, :3])) < 2.0  # the images' relative rotation
     assert pls[1].prior_residual is not None and pls[1].prior_residual[1] > 3.0
-    # priors that agree: measured, nothing corrected
+    # priors that agree (on a map the corrected ones did not lean): measured, nothing corrected
+    m = new_map(tmp_path / "agree")
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     pls = m.update([frame("d", base_pose(25), p=prior(base_pose(25))),
                     frame("e", base_pose(29), p=prior(base_pose(29)))])
     assert m.prior_disagreement_deg < 1.0
