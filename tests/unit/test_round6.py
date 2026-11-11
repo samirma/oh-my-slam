@@ -519,3 +519,60 @@ def test_retry_kept_places_the_job_s_kept_frames_against_new_keyframes(tmp_path:
     assert not kfs["p"].height_ok and m.height_inconsistent == ["p"]
     assert not kfs["q"].usable() and not kfs["r"].usable()
     assert len(m.cloud.keys) == n_cloud  # p fails the height gate, p2 has no depth
+
+
+def test_mapanything_infers_each_frame_once_per_job(ma: Client) -> None:
+    """A frame MapAnything does not place at first is tested again against what registered
+    since from its first output: never inferred twice in one job (``Registration.recheck``)."""
+    fr, files = ma_frames(ma, [base_pose(0, -0.6), base_pose(0, 0.0), base_pose(0, 0.6)],
+                          tag="a")
+    assert ma.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    nf, nfiles = ma_frames(ma, [base_pose(0, -0.3), base_pose(0, 0.3), base_pose(5, 0.1)],
+                           tag="n", trust=None, depth=False)
+    bad, bfiles = frames_for(ma, [base_pose(0, 0.2)], tag="x", trust=None, depth=False)
+    import hashlib
+
+    ma.backend.mv_pose[hashlib.sha256(bfiles["x0"]).hexdigest()] = base_pose(180, 0.2)
+    ma.backend.mv_calls.clear()
+    job = ma.update("m", nf + bad, {**nfiles, **bfiles})
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 3 + ["rejected"]
+    stored = {p.name for p in (ma.service.store.mapper_dir("m") / an.KF_DIR).glob("*.jpg")}
+    new = [n for call in ma.backend.mv_calls for n in call if n not in stored]
+    assert len(new) == len(set(new)) == 4, ma.backend.mv_calls
+
+
+@pytest.mark.parametrize("engine", ["mapanything", "geometric"])
+def test_a_pure_turn_in_45_degree_steps_passes_the_rotation_check(
+        _client: Client, monkeypatch: pytest.MonkeyPatch, engine: str) -> None:  # noqa: F811
+    """The replay's real sweeps (about 45° steps, 7-8 frames, the camera ahead of the robot's
+    axis, a few frames rejected): at true committed rotations the image-measured relative
+    rotations were 1.5-6.2° off (the essential matrix of the best RANSAC sample, the
+    rotation-only fit's absorbed translation), enough for rotation_inconsistent on real noise.
+    The refined relative pose (``standpoint.refined_rotation``) agrees within 2°.
+    Each measured pair is logged (``standpoint.measured``)."""
+    from oh_my_slam.mapping import standpoint as sp
+    from tests.fakes.service import plain
+
+    monkeypatch.setenv(prior_first.NONE_ENGINE_ENV, engine)
+    got: list[sp.PairCheck] = []
+    real = sp.measured
+
+    def logged(views: Any, pairs: Any) -> list[sp.PairCheck]:
+        out = real(views, pairs)
+        got.extend(out)
+        return out
+
+    monkeypatch.setattr(sp, "measured", logged)
+    poses = [base_pose(45.0 * k, offset=0.1) for k in range(8)]
+    fr, files = ma_frames(_client, poses, trust=None, depth=False, height_above_floor_m=0.5)
+    for k in (3, 6):  # rejected frames never enter the check
+        files[f"w{k}"] = plain(320, 240)
+        fr.append({"name": f"f{k}x", "image": f"w{k}", "camera_id": "cam"})
+    job = _client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "committed" and job["quality"]["failed_checks"] == [], job["quality"]
+    assert len(got) == 8 and {c.a for c in got} | {c.b for c in got} == {f"f{k}" for k in range(8)}
+    # the refined rotations vary a little with the RANSAC samples drawn (OpenCV's global random
+    # state, which earlier tests advance): within 2 deg of the truth here, far inside the 10 deg
+    # pair limit, against 3.9 and 6.2 deg before the refinement
+    deg = sorted(c.deg for c in got)
+    assert deg[-1] < 2.0 and float(np.median(deg)) < 0.8, got

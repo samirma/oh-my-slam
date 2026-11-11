@@ -10,9 +10,9 @@ the pair's focal length) divided by the sine of the ray's angle to the epipolar 
 ``SIN_MIN``). About 0 when the camera only turned. Below ``PARALLAX_MAX_PX`` the pair is
 translation-unconstrained: one standpoint. The pair's *overlap* is the smaller of the two images'
 8 x 8 inlier-cell coverages (``anchored.cell_share``, map.md §1 "Overlap"). The image-measured
-relative rotation is the epipolar fit's (unbiased whether the camera moved or not), the
-rotation-only fit's only for a translation-unconstrained pair whose epipolar rotation leaves it by
-more than ``EPIPOLAR_AGREE_DEG`` (a degenerate essential matrix), independent of any joint solve.
+relative rotation is that of the relative pose refined on the epipolar inliers
+(``refined_rotation``: Huber-robust Sampson error, from the essential matrix's pose and from the
+rotation-only fit), independent of any joint solve.
 
 **Measurable pair** (``TwoView.measurable``, map.md §1): at least ``CHECK_MIN_INLIERS`` epipolar
 inliers and an overlap of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use
@@ -48,6 +48,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchored import (
@@ -63,6 +64,7 @@ from oh_my_slam.mapping.anchored import (
     Placement,
     cell_share,
     epipolar,
+    exp_so3,
     kabsch,
     natural_key,
     pose,
@@ -72,6 +74,7 @@ from oh_my_slam.mapping.anchored import (
 )
 
 Array = NDArray[np.float64]
+log = get_logger("oh_my_slam.mapping.standpoint")
 
 PARALLAX_MAX_PX = 1.0  # map.md §1: a pair below this two-view parallax (px) is one standpoint
 VIEW_SHARE = MEASURABLE_OVERLAP  # map.md §1 "Measurable pair": an overlap of at least this
@@ -82,7 +85,6 @@ MIN_MATCHES = EPIPOLAR_MIN_MATCHES  # a pair with fewer epipolar inliers is not 
 # two-view rotation is off by 4-8 deg on 50 inliers (test room), which no committed map could
 # meet within the 10 deg pair limit
 CHECK_MIN_INLIERS = MEASURABLE_INLIERS
-EPIPOLAR_AGREE_DEG = 2.0  # a pair's epipolar rotation this near its rotation fit's is taken
 SIN_MIN = 0.3  # a ray this near the baseline direction has its parallax scaled by at most 1/this
 # the pairs measured (``close``): committed centres at most this far apart and optical axes at
 # most this far apart, the registration candidates' rule (``anchored``): views further apart share
@@ -131,6 +133,36 @@ class TwoView:
         return self.unconstrained and self.measurable
 
 
+def refined_rotation(ra: Array, rb: Array, starts: list[tuple[Array, Array]], thr: float
+                     ) -> Array:
+    """The relative rotation R (b's camera in a's: x_a ~ R x_b + t) of the relative pose that
+    minimises the Huber-robust Sampson error of the essential matrix [t]x R over the pair's
+    epipolar inliers (rays ``ra``, ``rb``, normalised image units, ``thr`` the Huber scale),
+    from each start (rotation, translation direction); the lowest cost wins."""
+    from scipy.optimize import least_squares
+
+    xa, xb = np.asarray(ra, np.float64), np.asarray(rb, np.float64)
+
+    def sampson(p: Array, R0: Array) -> Array:
+        R = exp_so3(p[:3]) @ R0
+        t = p[3:] / (np.linalg.norm(p[3:]) + 1e-12)
+        tx = np.array([[0.0, -t[2], t[1]], [t[2], 0.0, -t[0]], [-t[1], t[0], 0.0]])
+        E = tx @ R
+        Ex, Etx = xb @ E.T, xa @ E
+        den = Ex[:, 0] ** 2 + Ex[:, 1] ** 2 + Etx[:, 0] ** 2 + Etx[:, 1] ** 2
+        out: Array = np.sum(xa * Ex, axis=1) / np.sqrt(den + 1e-18)
+        return out
+
+    best: tuple[float, Array] | None = None
+    for R0, t0 in starts:
+        r = least_squares(sampson, np.r_[np.zeros(3), t0], loss="huber", f_scale=thr,
+                          args=(R0,))
+        if best is None or r.cost < best[0]:
+            best = (float(r.cost), exp_so3(r.x[:3]) @ R0)
+    assert best is not None
+    return best[1]
+
+
 def two_view(a: View, b: View) -> TwoView | None:
     """The two-view fit of a pair (module docstring), None below ``MIN_MATCHES``."""
     e = epipolar(a.feats, a.K, b.feats, b.K)
@@ -152,15 +184,20 @@ def two_view(a: View, b: View) -> TwoView | None:
     focal = math.sqrt(a.K.fx * b.K.fx)  # the residual angle in pixels
     parallax = float(np.median(ang * focal / np.maximum(sin, SIN_MIN)))
     R_epi = np.asarray(R_e, np.float64).T
-    # the epipolar rotation is unbiased whether or not the camera moved; the rotation-only fit
-    # absorbs a small translation as rotation (a robot turning with its camera ahead of its
-    # axis). It stands in only where the epipolar fit is degenerate: a pair without parallax
-    # whose epipolar rotation leaves the rotation fit's by more than ``EPIPOLAR_AGREE_DEG``
-    R_ab = R_rot if parallax < PARALLAX_MAX_PX and rot_deg(R_epi.T @ R_rot) > EPIPOLAR_AGREE_DEG \
-        else R_epi
+    # the relative rotation: the five-degree-of-freedom relative pose refined on the epipolar
+    # inliers (``refined_rotation``). The rotation-only fit absorbs a small translation as
+    # rotation (a robot turning with its camera ahead of its axis), and the essential matrix of
+    # the best RANSAC sample is coarse on a small baseline: on 45 deg steps of the test room
+    # both were 1.5-3.9 deg off the truth, the refined pose 0.1-0.6 deg (2.7 deg on a pair of
+    # 0.55 px parallax)
+    # (only a measurable pair is refined: no limit reads another's rotation)
     n = len(e.ua)
     noise = math.degrees(float(np.sqrt(np.mean(np.minimum(ang, 2.0 * thr) ** 2))))
     share = min(cell_share(e.ua, a.K), cell_share(e.ub, b.K))
+    R_ab = R_epi
+    if n >= CHECK_MIN_INLIERS and share >= VIEW_SHARE:
+        t_a = -(np.asarray(R_e, np.float64).T @ np.asarray(t_e, np.float64).ravel())
+        R_ab = refined_rotation(e.ra, e.rb, [(R_epi, t_a), (R_rot, t_a), (R_rot, -t_a)], thr)
     return TwoView(np.asarray(R_ab, np.float64), parallax, n, share,
                    noise / math.sqrt(max(n, 1)))
 
@@ -271,11 +308,35 @@ def groups(views: Sequence[View], pairs: Pairs, ref_sigma_rot_deg: float = 0.0
     return out
 
 
+@dataclass
+class PairCheck:
+    """One measurable pair of the rotation check (``measured``): its names, the disagreement
+    (deg) between the committed and the image-measured relative rotation, its epipolar inliers,
+    overlap and two-view parallax (px)."""
+
+    a: str
+    b: str
+    deg: float
+    inliers: int
+    share: float
+    parallax: float
+
+
 def consistency(views: Sequence[View], pairs: Pairs) -> tuple[float | None, float | None]:
     """The median and largest disagreement (deg) between committed and image-measured relative
-    rotations over the overlapping pairs of the new frames of ``views`` (with each other and
-    with the stored ones); (None, None) without a measurable pair."""
-    dis: list[float] = []
+    rotations over the measurable pairs of the new frames of ``views`` (with each other and
+    with the stored ones, ``measured``); (None, None) without a measurable pair."""
+    dis = [c.deg for c in measured(views, pairs)]
+    if not dis:
+        return None, None
+    return float(np.median(dis)), float(max(dis))
+
+
+def measured(views: Sequence[View], pairs: Pairs) -> list[PairCheck]:
+    """The rotation check's measurable pairs (``TwoView.measurable``) of the new frames of
+    ``views``, each logged (the service log: which pairs a ``rotation_inconsistent`` comes
+    from)."""
+    out: list[PairCheck] = []
     seen: set[frozenset[str]] = set()
     for i, v in enumerate(views):
         if v.stored:
@@ -290,10 +351,12 @@ def consistency(views: Sequence[View], pairs: Pairs) -> tuple[float | None, floa
             if tv is None or not tv.measurable:
                 continue
             committed = v.R.T @ w.R
-            dis.append(rot_deg(committed.T @ tv.R_ab))
-    if not dis:
-        return None, None
-    return float(np.median(dis)), float(max(dis))
+            c = PairCheck(v.name, w.name, rot_deg(committed.T @ tv.R_ab), tv.inliers,
+                          round(tv.share, 3), round(tv.parallax, 2))
+            log.info("rotation check %s-%s: %.2f deg (%d inliers, overlap %.2f, parallax "
+                     "%.2f px)", c.a, c.b, c.deg, c.inliers, c.share, c.parallax)
+            out.append(c)
+    return out
 
 
 def inconsistent(median_deg: float | None, max_deg: float | None) -> bool:
