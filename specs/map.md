@@ -277,6 +277,12 @@ becomes a job with a `job_id`. A job goes through these states:
   * `prior_disagreement_deg` (§1), 0 when no image relative rotation disagrees with the priors;
   * `height_inconsistent`: the names of the frames the height gate (§2) excluded from content;
     empty when none;
+  * `rotation_pairs`: every measurable pair (§1) the rotation check evaluated, on dry runs as
+    on jobs, each `{a, b, inliers, overlap, measured_deg, committed_deg, difference_deg}`: the
+    frame names in canonical order, the pair's epipolar inliers, its 8 × 8 overlap, the
+    image-measured and the committed relative rotation angles, and the angle between those two
+    rotations. Empty unless the check ran on at least one measurable pair; it shows which pairs
+    drove `rotation_inconsistent`;
   * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
     frame this job's images confirmed (§2): how far confirmation moved the frame from its
     prior-placed pose. Empty when there are none; a dry run predicts it. This movement is not

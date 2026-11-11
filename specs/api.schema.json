@@ -674,7 +674,8 @@
         "failed_checks",
         "prior_disagreement_deg",
         "reregistered",
-        "height_inconsistent"
+        "height_inconsistent",
+        "rotation_pairs"
       ],
       "properties": {
         "scale_ratio_vs_prev": {
@@ -808,6 +809,58 @@
             "type": "string"
           },
           "description": "Names of frames whose committed camera height disagrees with their height_above_floor_m by more than 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_pos_m / sqrt(3); they contribute nothing to occupancy, heights or objects, and their status is unchanged. Empty when none."
+        },
+        "rotation_pairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "a",
+              "b",
+              "inliers",
+              "overlap",
+              "measured_deg",
+              "committed_deg",
+              "difference_deg"
+            ],
+            "properties": {
+              "a": {
+                "type": "string",
+                "description": "Frame name, first in canonical order."
+              },
+              "b": {
+                "type": "string",
+                "description": "Frame name, second in canonical order."
+              },
+              "inliers": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The pair's epipolar inliers."
+              },
+              "overlap": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "8x8 inlier-cell coverage."
+              },
+              "measured_deg": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Image-measured relative rotation angle."
+              },
+              "committed_deg": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Committed relative rotation angle."
+              },
+              "difference_deg": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Angle between the measured and the committed relative rotations."
+              }
+            }
+          },
+          "description": "Every measurable pair the rotation check evaluated (jobs and dry runs); empty unless it ran on at least one measurable pair. Shows which pairs drove rotation_inconsistent."
         }
       }
     },
