@@ -320,6 +320,20 @@ class PairCheck:
     inliers: int
     share: float
     parallax: float
+    measured_deg: float = 0.0  # the image-measured relative rotation's angle
+    committed_deg: float = 0.0  # the committed relative rotation's angle
+
+    def row(self) -> dict[str, Any]:
+        """Its ``quality.rotation_pairs`` entry (map.md §4, P14): the names in canonical
+        order."""
+        from oh_my_slam.mapping.anchored import natural_key
+
+        a, b = sorted((self.a, self.b), key=natural_key)
+        return {"a": a, "b": b, "inliers": int(self.inliers),
+                "overlap": round(min(max(self.share, 0.0), 1.0), 4),
+                "measured_deg": round(self.measured_deg, 3),
+                "committed_deg": round(self.committed_deg, 3),
+                "difference_deg": round(self.deg, 3)}
 
 
 def consistency(views: Sequence[View], pairs: Pairs) -> tuple[float | None, float | None]:
@@ -352,7 +366,8 @@ def measured(views: Sequence[View], pairs: Pairs) -> list[PairCheck]:
                 continue
             committed = v.R.T @ w.R
             c = PairCheck(v.name, w.name, rot_deg(committed.T @ tv.R_ab), tv.inliers,
-                          round(tv.share, 3), round(tv.parallax, 2))
+                          round(tv.share, 3), round(tv.parallax, 2), rot_deg(tv.R_ab),
+                          rot_deg(committed))
             log.info("rotation check %s-%s: %.2f deg (%d inliers, overlap %.2f, parallax "
                      "%.2f px)", c.a, c.b, c.deg, c.inliers, c.share, c.parallax)
             out.append(c)
@@ -443,25 +458,37 @@ def join_standpoint(am: AnchoredMap, pairs: Pairs, f: FrameIn, feats: Features, 
     T = pose(image_T[:3, :3], v.c)
     return Placement(pl.name, "registered", None, T, round(sp, 4), pl.sigma_rot_deg, pl.inliers,
                      "rotation", lifted=pl.lifted, align_T=image_T,
-                     map_residual=(0.0, rot_deg(T[:3, :3].T @ image_T[:3, :3])))
+                     map_residual=(0.0, rot_deg(T[:3, :3].T @ image_T[:3, :3])),
+                     refs=tuple(dict.fromkeys((*pl.refs, v.kid))))
 
 
-def rotation_check(am: AnchoredMap, placed: list[Placement], pairs: Pairs) -> bool:
+def check(views: Sequence[View], pairs: Pairs) -> tuple[bool, list[dict[str, Any]]]:
+    """The hard limit ``rotation_inconsistent`` (map.md §4) over the measurable pairs of the
+    new frames of ``views`` (``measured``), and those pairs as ``quality.rotation_pairs``."""
+    got = measured(views, pairs)
+    dis = [c.deg for c in got]
+    bad = bool(dis) and inconsistent(float(np.median(dis)), float(max(dis)))
+    return bad, [c.row() for c in got]
+
+
+def rotation_check(am: AnchoredMap, placed: list[Placement], pairs: Pairs
+                   ) -> tuple[bool, list[dict[str, Any]]]:
     """The hard limit ``rotation_inconsistent`` (map.md §4) over the update's registered
-    frames ``placed`` (their keyframes) and the stored confirmed keyframes they neighbour."""
+    frames ``placed`` (their keyframes) and the stored confirmed keyframes they neighbour, with
+    the pairs it evaluated (``check``)."""
     kfs = [k for pl in placed if pl.status == "registered" and pl.keyframe is not None
            for k in [am.keyframe(pl.keyframe)] if k is not None and k.feats is not None]
     if not kfs:
-        return False
+        return False, []
     views = stored_views(am, [(k.T[:3, :3], k.centre) for k in kfs], kfs)
     views += [View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), False, i)
               for i, k in enumerate(kfs) if k.feats is not None]
-    return inconsistent(*consistency(views, pairs))
+    return check(views, pairs)
 
 
-def views_inconsistent(new: list[View], stored: list[View]) -> bool:
+def views_inconsistent(new: list[View], stored: list[View]) -> tuple[bool, list[dict[str, Any]]]:
     """The hard limit ``rotation_inconsistent`` (map.md §4) for an engine that hands its
     committed poses as views (the older mapper): the new views against each other and the
-    stored ones that can share a view with one of them (``close``)."""
+    stored ones that can share a view with one of them (``close``), with the pairs evaluated."""
     near = [w for w in stored if any(close(v.R, v.c, w.R, w.c) for v in new)]
-    return inconsistent(*consistency([*near, *new], Pairs()))
+    return check([*near, *new], Pairs())

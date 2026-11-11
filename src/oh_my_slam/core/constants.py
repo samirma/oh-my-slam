@@ -26,6 +26,10 @@ MAX_GRID_SIDE = 1024
 UPDATE_EXHAUSTIVE_MAX = 150
 RETRIEVAL_TOP_K = 30
 
+# The registration minimum (api.md §4, §6): a pose needs this many inliers, and the update and
+# locate ``few_features`` check asks this many keypoints (one constant for both).
+REGISTRATION_MIN = 15
+
 # The floor band (map.md §5-§6): a surface within max(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS x the
 # floor's height sigma) of the floor estimate is floor: it never makes an occupied cell, a
 # passage or a floor-standing object. FLOOR_SIGMA_DEFAULT_M: the sigma of a floor nothing

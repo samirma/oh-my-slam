@@ -28,12 +28,14 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.constants import REGISTRATION_MIN
+
 WORK_SIDE = 1024
 TEXTURE_SIDE = 512
 TEXTURE_GRADIENT = 4.0  # grey levels per pixel (Sobel / 8)
 PLAIN_TEXTURE = 0.01  # bare walls 0.0003-0.0024; the 128 reference frames >= 0.0395
 BLUR_SHARPNESS = 0.035  # the reference frames >= 0.12; a Gaussian blur of >= 1.2 px < 0.035
-FEW_FEATURES = 20  # the reference frames >= 27 (a bare ceiling with a door frame)
+FEW_FEATURES = REGISTRATION_MIN  # fewer keypoints than a pose needs inliers (api.md §4, §6)
 SUSPECT_FEATURES = 150  # below this (or a low texture) the median depth is measured
 SUSPECT_TEXTURE = 0.05
 TOO_CLOSE_M = 0.30  # median depth along the optical axis

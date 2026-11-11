@@ -49,7 +49,8 @@ def test_kept_frames_are_stored_but_never_fused_or_references(tmp_path: Path) ->
     f = frame("other", base_pose(0))
     f.camera_id = "cam2"
     assert m.update([f])[0].status == "registered"
-    assert m.duplicate_of("cam", base_pose(10)) is None  # the kept frame does not count
+    pl = m.update([frame("again", base_pose(10))])[0]  # the kept frame does not count
+    assert pl.status == "registered"
 
 
 def test_an_origin_failing_a_check_is_kept_then_the_next_prior_registers(tmp_path: Path

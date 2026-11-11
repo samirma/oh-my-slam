@@ -856,16 +856,31 @@ def test_pose_duplicates_name_the_frame_they_repeat(client: Client) -> None:
     assert got == [("duplicate", "a0"), (None, None), ("duplicate", "b1"), (None, None)]
 
 
-def test_a_too_close_camera_only_origin_leaves_no_map(client: Client,
-                                                     monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without priors, a first frame too close (its depth image) cannot be the origin, and
-    MapAnything's frames find no confirmed keyframe: nothing registered, no map."""
+def test_a_too_close_camera_only_origin_falls_through_to_the_next_frame(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without priors, a first frame too close (its depth image) cannot be the origin: the
+    next frame in canonical name order is (map.md §1, the first registered frame)."""
     monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
-    fr, files = frames_for(client, [base_pose(0), base_pose(20)], tag="n", trust=None)
+    fr, files = frames_for(client, [base_pose(0), base_pose(20), base_pose(40)], tag="n",
+                           trust=None)
+    files["n0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "committed", job["quality"]
+    assert [i["status"] for i in job["inputs"]][:2] == ["rejected", "registered"]
+    assert job["inputs"][0]["reason"] == "too_close"
+    assert np.allclose(np.asarray(job["inputs"][1]["T_map_cam"])[:3, 3], 0.0, atol=1e-6)
+
+
+def test_a_lone_too_close_camera_only_frame_leaves_no_map(client: Client,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without priors and with no other frame to hand the origin to, a too-close first frame
+    leaves nothing registered: no map."""
+    monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
+    fr, files = frames_for(client, [base_pose(0)], tag="n", trust=None)
     files["n0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "rejected" and job["quality"]["failed_checks"] == ["hard_limit"]
-    assert [i["reason"] for i in job["inputs"]] == ["too_close", "no_overlap"]
+    assert [i["reason"] for i in job["inputs"]] == ["too_close"]
 
 
 @pytest.mark.parametrize("engine", ["geometric", "mapanything"])
@@ -907,4 +922,10 @@ def test_a_dry_run_predicts_rotation_inconsistent(client: Client,
         return pl
 
     monkeypatch.setattr(AnchoredMap, "place", turned)
-    assert dry(client, "m", fr, files)["quality"]["failed_checks"] == ["rotation_inconsistent"]
+    q = dry(client, "m", fr, files)["quality"]
+    assert q["failed_checks"] == ["rotation_inconsistent"]
+    # map.md §4 (P14): the pairs that drove it, names in canonical order
+    assert q["rotation_pairs"] and max(p["difference_deg"] for p in q["rotation_pairs"]) > 10
+    assert all(p["a"] <= p["b"] for p in q["rotation_pairs"])
+    job = client.update("m", fr, files)
+    assert job["quality"]["rotation_pairs"] and job["state"] == "rejected"

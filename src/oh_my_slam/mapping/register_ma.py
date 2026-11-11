@@ -130,6 +130,9 @@ class Placement:
     depth: NDArray[np.float32] | None = None  # metric depth for fusion, on the grid of ``K_depth``
     K_depth: Array | None = None  # 3x3
     scene_m: float | None = None  # the frame's median scene depth (the distance limit)
+    # the keys of the anchors its call's alignment rests on (a stored keyframe's name, or
+    # ``new<index>`` for a frame of this update)
+    anchors: tuple[str, ...] = ()
 
 
 @dataclass
@@ -239,8 +242,10 @@ class Registration:
         # the frames no reference confirmed yet, with their call's output (``recheck``): each
         # frame is inferred once per job
         self.waiting: dict[int, tuple[New, Array, tuple[float, float], NDArray[np.float32],
-                                      Array]] = {}
+                                      Array, tuple[str, ...]]] = {}
         self.order = {f.index: k for k, f in enumerate(new)}
+        # the pool's size when each frame was inferred (``retry``: again only once it grew)
+        self.pool_at: dict[int, int] = {}
 
     def _thumb(self, key: str, path: Path) -> NDArray[np.float32] | None:
         if key not in self._thumbs:
@@ -306,6 +311,7 @@ class Registration:
         anchors' stored depth; one without, against the anchors' depth from the same call (one
         network pass predicts consistent depths), each at its map-frame pose."""
         na = len(anchors)
+        keys = tuple(a.key for a in anchors)
         sensor = [r for a in anchors for r in [a.ref()] if r is not None]
         call = [Ref(a.T, (out[i].depth * S.s).astype(np.float32), out[i].K)
                 for i, a in enumerate(anchors)]
@@ -332,7 +338,7 @@ class Registration:
                 a = agreement(backproject(depth, Kd), T, refs, tol)
                 if not a.confirmed:
                     continue
-                self._register(f, T, sig, depth, Kd, a.agree)
+                self._register(f, T, sig, depth, Kd, a.agree, keys)
                 sensor.append(Ref(T, depth, Kd))
                 call.append(Ref(T, ma_depth, Kma))
                 del cand[idx]
@@ -341,14 +347,14 @@ class Registration:
             # few_features is only the checks' verdict (api.md §4)
             self.placements[idx] = Placement("rejected", "no_overlap",
                                              scene_m=self.scenes.get(idx))
-            self.waiting[idx] = (f, T, sig, depth, Kd)
+            self.waiting[idx] = (f, T, sig, depth, Kd, keys)
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
-                  Kd: Array, inliers: int) -> None:
+                  Kd: Array, inliers: int, anchors: tuple[str, ...] = ()) -> None:
         self.placements[f.index] = Placement(
             "registered", None, T, round(max(sig[0], SIGMA_POS_FLOOR_M), 4),
             round(max(sig[1], SIGMA_ROT_FLOOR_DEG), 3), inliers, depth, Kd,
-            self.scenes.get(f.index))
+            self.scenes.get(f.index), anchors)
         got = (depth, Kd)
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
                                 lambda: got))
@@ -365,20 +371,41 @@ class Registration:
             changed = False
             refs = [r for v in self.pool for r in [v.ref()] if r is not None] + list(extra or [])
             for idx in sorted(self.waiting, key=lambda i: self.order[i]):
-                f, T, sig, depth, Kd = self.waiting[idx]
+                f, T, sig, depth, Kd, keys = self.waiting[idx]
                 tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
                 a = agreement(backproject(depth, Kd), T, refs, tol)
                 if not a.confirmed:
                     continue
                 del self.waiting[idx]
-                self._register(f, T, sig, depth, Kd, a.agree)
+                self._register(f, T, sig, depth, Kd, a.agree, keys)
                 out.append(idx)
                 changed = True
                 break  # the references grew
         return out
 
     def run(self) -> Result:
-        todo = list(self.new)
+        self._infer(list(self.new))
+        return Result(self.placements, self.calls, self.views, self.notes)
+
+    def retry(self) -> list[int]:
+        """The frames still unconfirmed after ``recheck`` inferred again with the anchors the
+        pool offers now, each only when it grew since its last call (frames registered since:
+        a turn the first call's anchors did not see), then ``recheck``, until no frame is left
+        to infer. Returns the indices registered."""
+        out: list[int] = []
+        while True:
+            todo = [f for f in self.new if f.index in self.waiting
+                    and self.pool_at.get(f.index, 0) < len(self.pool)]
+            if not todo:
+                return out
+            for f in todo:
+                del self.waiting[f.index]
+            self._infer(todo)
+            out += [f.index for f in todo if self.placements[f.index].status == "registered"]
+            out += self.recheck()
+
+    def _infer(self, todo: list[New]) -> None:
+        """MapAnything over ``todo`` in calls of ``max_new`` frames with their anchors."""
         while todo:
             chunk = todo[:self.max_new]
             anchors = self.anchors(chunk)
@@ -393,10 +420,11 @@ class Registration:
                 else:
                     self.max_anchors = MIN_ANCHORS
                 continue
+            for f in chunk:
+                self.pool_at[f.index] = len(self.pool)
             S, src, ma_sigma = self._align(anchors, chunk, out)
             self._place_chunk(chunk, out, anchors, S, ma_sigma)
             self.notes["calls"].append({"anchors": len(anchors), "new": len(chunk),
                                         "scale": round(S.s, 5), "scale_source": src,
                                         "unposed": self.unposed})
             todo = todo[len(chunk):]
-        return Result(self.placements, self.calls, self.views, self.notes)

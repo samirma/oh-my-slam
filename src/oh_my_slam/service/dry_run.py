@@ -57,6 +57,7 @@ from oh_my_slam.mapping.anchored import (
     duplicate_among,
     features,
     match,
+    natural_key,
     pose_residual,
 )
 from oh_my_slam.mapping.quality import (
@@ -124,24 +125,31 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         am, placed, pairs = _engine(up, frames, prev, workdir) if engine else (None, {}, None)
         out, kept, prior_res = [], [], []
         first_kept = True
-        # predicted registered without the engine: name, camera, pose, features (the pose
-        # duplicate's candidates)
-        earlier: list[tuple[str, str, Any, Callable[[], Features | None]]] = []
+        rows = []
         for k, fr in enumerate(frames):
             row, pl = _frame(fr, links[k], placed.get(fr.work.index), engine,
                              prev is None, first_kept)
-            T = _predicted_pose(fr, pl, engine, prev is None)
-            if not engine and row["predicted_status"] == "registered" and T is not None:
-                own = feats.get(fr.work.index)
-                dup = duplicate_among(fr.work.camera_id, T, own, earlier)
-                if dup is not None:
-                    row.update(predicted_status="rejected", predicted_reason="duplicate",
-                               duplicate_of=dup)
-                else:
-                    earlier.append((fr.work.name, fr.work.camera_id, T,
-                                    functools.partial(feats.get, fr.work.index)))
+            first_kept = first_kept and row["predicted_status"] == "rejected"
+            rows.append((row, pl, _predicted_pose(fr, pl, engine, prev is None)))
+        # without the engine, one pose-duplicate pass over the predicted registered frames in
+        # canonical name order (api.md §4; the engine's own pass is ``AnchoredMap.end_job``):
+        # name, camera, pose, features of the duplicate's candidates
+        earlier: list[tuple[str, str, Any, Callable[[], Features | None]]] = []
+        for k in sorted(range(len(frames)) if not engine else [],
+                        key=lambda j: (natural_key(frames[j].work.name),
+                                       frames[j].work.camera_id, j)):
+            fr, (row, pl, T) = frames[k], rows[k]
+            if row["predicted_status"] != "registered" or T is None:
+                continue
+            dup = duplicate_among(fr.work.camera_id, T, feats.get(fr.work.index), earlier)
+            if dup is not None:
+                row.update(predicted_status="rejected", predicted_reason="duplicate",
+                           duplicate_of=dup)
+            else:
+                earlier.append((fr.work.name, fr.work.camera_id, T,
+                                functools.partial(feats.get, fr.work.index)))
+        for fr, (row, pl, _) in zip(frames, rows, strict=True):
             if row["predicted_status"] != "rejected":
-                first_kept = False
                 kept.append((row["predicted_status"], pl))
                 if pl is not None and pl.T is not None and fr.work.trust == "metric":
                     assert fr.work.prior is not None
@@ -156,9 +164,9 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         source, sigma = _scale(prev, am, frames)
         # an update without priors: its predicted poses against the images' relative rotations
         # (map.md §4 rotation_inconsistent), as the job measures them
-        rotations_bad = am is not None and pairs is not None and not any(
-            fr.work.trust in ("metric", "drifting") for fr in frames) \
-            and standpoint.rotation_check(am, list(placed.values()), pairs)
+        rotations_bad, rotation_pairs = standpoint.rotation_check(
+            am, list(placed.values()), pairs) if am is not None and pairs is not None \
+            and not any(fr.work.trust in ("metric", "drifting") for fr in frames) else (False, [])
         again = [] if am is None else reregistered(am.reregistered)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -176,6 +184,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "prior_disagreement_deg": disagreement,
         "reregistered": again,
         "height_inconsistent": heights,
+        "rotation_pairs": rotation_pairs,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
         else None,

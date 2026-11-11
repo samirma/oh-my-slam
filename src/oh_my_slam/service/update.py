@@ -57,6 +57,8 @@ from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.mapping.anchored import (
     DRIFT_MIN_SUPPORT,
     DRIFT_NEVER_ALONE,
+    DRIFT_POS_REL,
+    DRIFT_ROT_DEG_PER_M,
     DRIFT_SUPPORT_SHARE,
     MEASURABLE_INLIERS,
     OVERLAP_MIN,
@@ -174,8 +176,11 @@ class _Anchored:
     # the similarity from the map frame to the update's drifting priors' frame, fitted on its
     # registered drifting frames (``_drifting_residuals``); None without any
     drift_sim: Sim3 | None = None
-    # that estimate's own sigma (position m, rotation deg): kept drifting frames grow by it
+    # that estimate's own sigma at its supporting frames (position m, rotation deg), and those
+    # frames' prior centres (the priors' frame): kept drifting frames grow by it, more away
+    # from them (``drift_grown``)
     drift_sigma: tuple[float, float] | None = None
+    drift_support: list[list[float]] | None = None
     prior_disagreement_deg: float = 0.0
     # a map without priors whose first registered frame has a camera height: that height (the
     # origin is the floor below that frame, map.md §1); carried by every later version
@@ -248,8 +253,49 @@ def _has_depth(fr: _Frame) -> bool:
     return fr.depth_m is not None and bool(np.count_nonzero(fr.depth_m > 0))
 
 
+def drift_grown(sigma_pos: float, sigma_rot: float, P: NDArray[np.float64],
+                sigma: tuple[float, float] | None, support: list[list[float]] | None
+                ) -> tuple[float, float]:
+    """A drifting prior ``P``'s drift-grown sigmas (map.md §1, P13; every engine): the root sum
+    of squares of the prior's and the drift estimate's own at that pose, which is its fit's
+    sigma (``sigma``) and its extrapolation away from the frames that supported it (``support``,
+    their prior centres), growing with the distance to the nearest as the prior-first engine's
+    drift does with travel (``DRIFT_POS_REL``, ``DRIFT_ROT_DEG_PER_M``)."""
+    fp, fr = sigma or (0.0, 0.0)  # a record before the drift sigma: none
+    d = min((float(np.linalg.norm(P[:3, 3] - np.asarray(c))) for c in support), default=0.0) \
+        if support else 0.0
+    return (math.hypot(sigma_pos, math.hypot(fp, DRIFT_POS_REL * d)),
+            math.hypot(sigma_rot, math.hypot(fr, DRIFT_ROT_DEG_PER_M * d)))
+
+
+def _too_close_content(fr: _Frame) -> bool:
+    """The too-close exception on the older mapper (api.md §4, every engine): a frame kept at
+    its prior only because it is too close, with a metric prior and a depth image, gives its
+    in-range depth at its prior pose (``KEPT_DEPTH``)."""
+    return fr.unconfirmed == "too_close" and fr.work.trust == "metric" and _has_depth(fr)
+
+
+def kept_depth(frames: list[_Frame]) -> dict[str, Any]:
+    """The depth images of the version's too-close kept frames (``_too_close_content``), by
+    name: 16-bit PNG millimetres, base64 (``KEPT_DEPTH``, read by ``derived``)."""
+    import base64
+
+    import cv2
+
+    out = {}
+    for fr in frames:
+        if _too_close_content(fr):
+            assert fr.depth_m is not None
+            mm = np.clip(np.round(fr.depth_m * 1000.0), 0, 65535).astype(np.uint16)
+            out[fr.work.name] = base64.b64encode(cv2.imencode(".png", mm)[1].tobytes()).decode()
+    return out
+
+
 def _inliers(f: InternalFrame) -> int:
     return int(f.stats.get("observations") or f.stats.get("pose_matches") or 0)
+
+
+KEPT_DEPTH = "kept_depth.json"  # the version file of its too-close kept frames' depth
 
 
 class Updater:
@@ -610,7 +656,8 @@ class Updater:
             fr.pose = out.sim.pose(fr.internal.T)
             if fr.work.name in new_metric:
                 fr.prior_residual = anchor.residual(out.sim, new_metric[fr.work.name])
-        out.drift_sim, out.drift_sigma = self._drifting_residuals(placed, out.sim, prev)
+        out.drift_sim, out.drift_sigma, out.drift_support = self._drifting_residuals(
+            placed, out.sim, prev)
         out.prior_disagreement_deg = self._prior_disagreement(placed, internal, out.sim)
         out.prior_residuals = [anchor.residual(out.sim, a) for a in metric]
         out.previous_residuals = [anchor.residual(out.sim, a) for a in previous]
@@ -720,7 +767,8 @@ class Updater:
 
     @staticmethod
     def _drifting_residuals(placed: list[_Frame], sim: Sim3, prev: dict[str, Any] | None = None
-                            ) -> tuple[Sim3 | None, tuple[float, float] | None]:
+                            ) -> tuple[Sim3 | None, tuple[float, float] | None,
+                                       list[list[float]] | None]:
         """The robust drift estimate across versions (map.md §1 "Drift estimate", every engine):
         the similarity that best brings the request's aligned poses onto their drifting priors
         (``anchor.fit``, robust: its inliers), against the previous version's (``drift_sim`` of
@@ -728,19 +776,17 @@ class Updater:
         ``K_SIGMA`` × the fit's own sigma (the RMS of its inliers' prior sigmas over the root of
         their count), needs min(``DRIFT_MIN_SUPPORT``, n) supporting inliers, n the frames that
         can support it (the mapper's ``MEASURABLE_INLIERS`` inliers: the measurable-pair
-        threshold), ``DRIFT_SUPPORT_SHARE`` of the n and never one alone; without it the
-        previous estimate stays. Each drifting frame's residual is against the estimate kept,
-        so ``_post_check`` rejects those beyond the bound (``prior_conflict``) and the mapper
-        runs again without them: every frame re-tested under it. Returns the estimate (map
-        frame to the priors' frame) and its sigma; the previous version's without drifting
-        frames."""
-        before = None if prev is None or not prev.get("drift_sim") \
-            else Sim3.from_dict(prev["drift_sim"])
-        before_sigma = None if prev is None or not prev.get("drift_sigma") \
-            else (float(prev["drift_sigma"][0]), float(prev["drift_sigma"][1]))
+        threshold), ``DRIFT_SUPPORT_SHARE`` of the n and never one alone; without it a change
+        keeps the previous estimate, and a refused first estimate leaves the drift at the
+        identity (None: priors as sent, with their sigmas). Each drifting frame's residual is
+        against the estimate kept, so ``_post_check`` rejects those beyond the bound
+        (``prior_conflict``) and the mapper runs again without them: every frame re-tested
+        under it. Returns the estimate (map frame to the priors' frame), its sigma and its
+        supporting frames' prior centres; the previous version's without drifting frames."""
+        before, before_sigma, before_support = Updater._previous_drift(prev)
         drift = [fr for fr in placed if fr.work.trust == "drifting"]
         if not drift:
-            return before, before_sigma
+            return before, before_sigma, before_support
         anchors = []
         for fr in drift:
             assert fr.internal is not None and fr.work.prior is not None
@@ -761,12 +807,15 @@ class Updater:
         n, got = len(able), len(able & set(inl))
         supported = got >= max(min(DRIFT_MIN_SUPPORT, n), DRIFT_NEVER_ALONE) \
             and got >= DRIFT_SUPPORT_SHARE * n
-        out, out_sigma = fit.sim, sig
+        out: Sim3 | None = fit.sim
+        out_sigma: tuple[float, float] | None = sig
+        support: list[list[float]] | None = [
+            [round(float(v), 4) for v in anchors[i].dst[:3, 3]] for i in inl]
         if (large or before is None) and not supported:
-            out, out_sigma = used, before_sigma or sig
+            out, out_sigma, support = before, before_sigma, before_support
         for fr, a in zip(drift, anchors, strict=True):
-            fr.prior_residual = anchor.residual(out, a)
-        return out, out_sigma
+            fr.prior_residual = anchor.residual(out or Sim3(), a)
+        return out, out_sigma, support
 
     def _post_check(self, placed: list[_Frame], anchored: _Anchored, internal: InternalMap,
                     prev: dict[str, Any] | None = None) -> list[_Frame]:
@@ -797,6 +846,10 @@ class Updater:
                 # proxy before the anchoring), and the mapper's one hypothesis is the only one:
                 # none lies near the prior
                 sp, sr = _prior_sigmas(fr.work.prior)
+                if fr.work.trust == "drifting" and anchored.drift_sim is not None:
+                    # a drifting prior's sigma is the drift-grown one (api.md §4)
+                    sp, sr = drift_grown(sp, sr, _mat(fr.work.prior["T_map_cam"]),
+                                         anchored.drift_sigma, anchored.drift_support)
                 hyp = pose_sigmas(fr.internal, None if med is None else med * anchored.sim.s,
                                   0.0, _has_depth(fr), fr.work.trust)
                 dp, dr = fr.prior_residual
@@ -854,8 +907,8 @@ class Updater:
         record: dict[str, Any] | None = None
         anchored = None if result is None else result[2]
         kept = [fr for fr in frames if fr.reason is None and fr.unconfirmed is not None]
-        drift = (anchored.drift_sim, anchored.drift_sigma) if anchored is not None \
-            else self._previous_drift(prev)
+        drift = (anchored.drift_sim, anchored.drift_sigma, anchored.drift_support) \
+            if anchored is not None else self._previous_drift(prev)
         for fr in kept:
             self._keep_at_prior(fr, *drift)
         if result is not None:
@@ -873,14 +926,14 @@ class Updater:
             and not any(fr.work.trust in ("metric", "drifting") for fr in registered)
         # rotation consistency applies to this engine too (map.md §1 "Every engine"; updates
         # without priors, registered frames only)
-        bad = result is not None and record is not None and registered and not any(
-            fr.work.trust in ("metric", "drifting") for fr in frames) and self._rotations_bad(
-            registered, record, result[1])
+        bad, rotation_pairs = self._rotations_bad(registered, record, result[1]) \
+            if result is not None and record is not None and registered and not any(
+                fr.work.trust in ("metric", "drifting") for fr in frames) else (False, [])
         # a first update stores kept frames only with a registration (the engine exemption of
         # map.md §1): a kept-only first update fails the hard limit
         quality = self._quality(frames, registered, kept if record is not None else [], prev,
                                 anchored, w.accept_if, result is not None and result[1].rebuilt,
-                                no_prior, bool(bad))
+                                no_prior, bool(bad), rotation_pairs)
         job.quality = quality
         if anchored is not None:
             job.scale_source, job.scale_sigma_rel = anchored.scale_source, round(
@@ -893,8 +946,10 @@ class Updater:
             job.progress = 1.0
             return
         assert record is not None
+        depths = kept_depth(kept)
         job.result_version = self.store.commit(w.map, record,
-                                               None if result is None else result[0], None,
+                                               None if result is None else result[0],
+                                               {KEPT_DEPTH: depths} if depths else None,
                                                w.cameras, w.masks)
         job.state = "committed"
         job.progress = 1.0
@@ -902,7 +957,7 @@ class Updater:
 
     @staticmethod
     def _rotations_bad(registered: list[_Frame], record: dict[str, Any], internal: InternalMap
-                       ) -> bool:
+                       ) -> tuple[bool, list[dict[str, Any]]]:
         """``rotation_inconsistent`` of the older mapper (``standpoint.views_inconsistent``):
         the registered frames at their committed poses, with their request images, against the
         version's other fused frames at the poses it commits, with their stored images."""
@@ -943,30 +998,33 @@ class Updater:
 
     @staticmethod
     def _previous_drift(prev: dict[str, Any] | None
-                        ) -> tuple[Sim3 | None, tuple[float, float] | None]:
-        """The previous version's drift estimate and its sigma (``_drifting_residuals``)."""
+                        ) -> tuple[Sim3 | None, tuple[float, float] | None,
+                                   list[list[float]] | None]:
+        """The previous version's drift estimate, its sigma and its supporting frames' prior
+        centres (``_drifting_residuals``)."""
         if prev is None or not prev.get("drift_sim"):
-            return None, None
+            return None, None, None
         sig = prev.get("drift_sigma")
-        return Sim3.from_dict(prev["drift_sim"]), None if not sig else (float(sig[0]),
-                                                                         float(sig[1]))
+        return (Sim3.from_dict(prev["drift_sim"]),
+                None if not sig else (float(sig[0]), float(sig[1])),
+                prev.get("drift_support"))
 
     @staticmethod
     def _keep_at_prior(fr: _Frame, drift_sim: Sim3 | None = None,
-                       drift_sigma: tuple[float, float] | None = None) -> None:
+                       drift_sigma: tuple[float, float] | None = None,
+                       drift_support: list[list[float]] | None = None) -> None:
         """A frame kept at its prior (api.md §4): a metric prior as given, a drifting one mapped
         into the map frame by the drift estimate (``drift_sim``, else as given), with the
-        prior's sigmas, a drifting prior's plus the drift estimate's own (``drift_sigma``, map.md
-        §1 "Every engine"); prior residual 0."""
+        prior's sigmas, a drifting prior's drift-grown (``drift_grown``, map.md §1 "Every
+        engine"); prior residual 0."""
         p = fr.work.prior
         assert p is not None
         P = _mat(p["T_map_cam"])
         fr.sigma_pos_m, fr.sigma_rot_deg = _prior_sigmas(p)
         if p["trust"] == "drifting" and drift_sim is not None:
+            sp, sr = drift_grown(fr.sigma_pos_m, fr.sigma_rot_deg, P, drift_sigma, drift_support)
             P = drift_sim.inverse().pose(P)
-            dp, dr = drift_sigma or (0.0, 0.0)  # a record before the drift sigma: none
-            fr.sigma_pos_m = round(fr.sigma_pos_m + dp, 4)
-            fr.sigma_rot_deg = round(fr.sigma_rot_deg + dr, 3)
+            fr.sigma_pos_m, fr.sigma_rot_deg = round(sp, 4), round(sr, 3)
         fr.pose = P
         fr.prior_residual = (0.0, 0.0)
 
@@ -979,10 +1037,14 @@ class Updater:
                 "T_map_cam": fr.pose.tolist(), "sigma_pos_m": fr.sigma_pos_m,
                 "sigma_rot_deg": fr.sigma_rot_deg, "pose_state": "kept_at_prior",
                 "added_version": version, "sha256": fr.sha, "inliers": 0,
+                # the too-close exception (api.md §4): its in-range depth feeds occupancy and
+                # heights at its prior (``derived``)
+                "content": _too_close_content(fr),
                 "prior": p if p is not None and p["trust"] == "metric" else None}
 
     def _kept_only(self, job: Job, kept: list[_Frame], prev: dict[str, Any],
-                   drift: tuple[Sim3 | None, tuple[float, float] | None]) -> dict[str, Any]:
+                   drift: tuple[Sim3 | None, tuple[float, float] | None,
+                                list[list[float]] | None]) -> dict[str, Any]:
         """The record of an update whose frames are all kept at their priors (map.md §4): the
         previous version's, its mapper map unchanged, with the kept frames' rows added."""
         version = int(prev["version"]) + 1
@@ -997,6 +1059,7 @@ class Updater:
         rec.update({"kind": "update", "job_id": job.id, "frames": rows,
                     "drift_sim": None if drift[0] is None else drift[0].to_dict(),
                     "drift_sigma": None if drift[1] is None else list(drift[1]),
+                    "drift_support": drift[2],
                     "bounds_m": {"min": lo.round(4).tolist(), "max": hi.round(4).tolist()}})
         return rec
 
@@ -1041,7 +1104,13 @@ class Updater:
                         "pose_state": "fused" if fr.internal is not None else "kept_at_prior",
                         "added_version": version, "sha256": fr.sha,
                         "inliers": 0 if fr.internal is None else _inliers(fr.internal),
+                        # the too-close exception (api.md §4): a kept frame's in-range depth
+                        # feeds occupancy and heights at its prior (``derived``)
+                        "content": fr.internal is None and _too_close_content(fr),
                         **({} if raw is None else {"anchor_sigmas": raw}),
+                        # its camera height sigma (locate's height_sigma, api.md §6)
+                        "height_sigma_m": fr.work.height_sigma_m if fr.work.height_m is not None
+                        else fr.cam.height_sigma_m,
                         "prior": p if p is not None and p["trust"] == "metric" else None})
         centres = np.array([np.asarray(r["T_map_cam"])[:3, 3] for r in out])
         if internal.bounds is not None:
@@ -1075,6 +1144,7 @@ class Updater:
                 "drift_sim": None if anchored.drift_sim is None else anchored.drift_sim.to_dict(),
                 "drift_sigma": None if anchored.drift_sigma is None
                 else [round(v, 5) for v in anchored.drift_sigma],
+                "drift_support": anchored.drift_support,
                 "scale_source": anchored.scale_source,
                 "scale_sigma_rel": round(anchored.scale_sigma_rel, 5), "frames": out,
                 "objects": objects, "floor_z_m": floor, "floor_sigma_m": round(floor_sigma, 4),
@@ -1099,7 +1169,8 @@ class Updater:
     def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],
                  prev: dict[str, Any] | None, anchored: _Anchored | None,
                  accept_if: dict[str, float] | None, rebuilt: bool, no_prior: bool,
-                 rotations_bad: bool = False) -> dict[str, Any]:
+                 rotations_bad: bool = False,
+                 rotation_pairs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         rejected = len(frames) - len(registered) - len(kept)
         low = sum((fr.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
                   or (fr.internal is not None and fr.internal.low_confidence) for fr in registered)
@@ -1119,6 +1190,7 @@ class Updater:
             # the mapper ties kept frames to no image: nothing re-registers them (map.md §2)
             "reregistered": [],
             "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
+            "rotation_pairs": list(rotation_pairs or []),
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),
             "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,

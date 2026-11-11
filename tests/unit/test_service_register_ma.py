@@ -211,7 +211,7 @@ def test_registration_edges(tmp_path: Path) -> None:
     # tested again from its first output, never inferred again: nothing new confirms it; a
     # reference that sees its depth where it put it does (another engine's keyframe)
     assert reg.recheck() == [] and set(reg.waiting) == {1}
-    _, T, _, depth, Kd = reg.waiting[1]
+    _, T, _, depth, Kd, _ = reg.waiting[1]
     assert reg.recheck([register_ma.Ref(T, depth, Kd)]) == [1]
     assert reg.placements[1].status == "registered" and not reg.waiting and reg.calls == 1
 

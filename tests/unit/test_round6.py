@@ -211,18 +211,40 @@ def test_a_map_without_priors_starts_at_its_first_frame_by_name(tmp_path: Path) 
     assert pls[1].method == "origin" and pls[0].method != "origin"
 
 
-def test_a_job_duplicate_is_the_later_frame_by_name(tmp_path: Path) -> None:
-    """api.md §4 (P11): a job keyframe counts as a pose duplicate's earlier frame only when it
-    precedes the frame in canonical name order; a stored one always does."""
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_a_job_duplicate_is_the_later_frame_by_name(tmp_path: Path, order: tuple[int, int]
+                                                    ) -> None:
+    """api.md §4, map.md §2 step 6 (P13): one pose-duplicate pass after the registration fixed
+    point, in canonical name order: of a pair the later-named frame is the duplicate, whatever
+    the request order or the round it registered in; a stored keyframe always counts. The
+    duplicate's keyframe is dropped and gives no content."""
     m = new_map(tmp_path)
-    m.update([frame("s", base_pose(60))])
-    m.begin_job()
-    T = base_pose(0)
-    m.keyframes.append(an.Keyframe("k9", "f10", "cam", K, T, 0.01, 0.1, "fused", None, "none"))
-    assert m.duplicate_of("cam", T, None, "f2") is None  # f10 comes after f2
-    assert m.duplicate_of("cam", T, None, "f11") == "f10"
-    assert m.duplicate_of("cam", base_pose(60), None, "a") == "s"  # stored
-    assert m.duplicate_of("cam", T) == "f10"  # without a name: every keyframe
+    m.update([frame("s", base_pose(60)), frame("s1", base_pose(30))])
+    fs = [frame("f10", base_pose(0)), frame("f2", base_pose(0)), frame("a", base_pose(60))]
+    pls = m.update([fs[order[0]], fs[order[1]], fs[2]])
+    got = {pl.name: (pl.status, pl.reason, pl.duplicate_of) for pl in pls}
+    assert got == {"f2": ("registered", None, None), "f10": ("rejected", "duplicate", "f2"),
+                   "a": ("rejected", "duplicate", "s")}
+    assert sorted(k.name for k in m.keyframes) == ["f2", "s", "s1"]
+    assert all(pl.keyframe is None for pl in pls if pl.status == "rejected")
+
+
+def test_a_held_job_ends_with_one_duplicate_pass_over_both_engines(tmp_path: Path) -> None:
+    """The prior-first engine holds the job open for the other engine's frames
+    (``update(hold=True)``): nothing is fused nor tested for duplicates until ``end_job``,
+    which rejects the later-named frame of a pair across engines."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    n = len(m.cloud.keys)
+    pls = m.update([frame("z", base_pose(15))], hold=True)
+    assert pls[0].status == "registered" and len(m.cloud.keys) == n  # held
+    b = frame("b", base_pose(15))  # the other engine's frame, named before z
+    m.add(b, an.features(b.rgb), an.Placement("b", "registered", None, base_pose(15), 0.01,
+                                              0.1, 500, "mapanything"),
+          b.depth, K, "sensor", None)  # type: ignore[arg-type]
+    dups, _ = m.end_job(pls, False)
+    assert (dups["z"].reason, dups["z"].duplicate_of) == ("duplicate", "b")
+    assert "z" not in {k.name for k in m.keyframes} and len(m.cloud.keys) > n
 
 
 def test_the_drift_reference_is_the_last_frame_by_name(tmp_path: Path) -> None:
@@ -260,18 +282,25 @@ def test_one_strong_frame_alone_never_makes_a_drift_estimate(tmp_path: Path) -> 
 
 
 def test_who_can_support_a_drift_estimate() -> None:
-    """map.md §1 (S-5): an image-only pose at the measurable-pair threshold (100 inliers over
-    10 % of the image), not an origin's or a seed's."""
+    """map.md §1 (P13, SI-1): an image-only pose with 100 inliers across all its references and
+    a 10 % overlap with one of them, whatever its status; an origin or a seed has no image-only
+    pose."""
     T = base_pose(0)
 
-    def obs(method: str, n: int, share: float) -> an._DriftObs:
-        pl = an.Placement("x", "registered", T=T, inliers=n, method=method, inlier_share=share)
-        return an._DriftObs(0, "x", T, T, (0.02, 1.0), (0.01, 0.5), False, pl)
+    def pl(n: int, share: float, status: str = "registered") -> an.Placement:
+        return an.Placement("x", status, T=T, inliers=n, method="pnp", inlier_share=share)
 
-    assert an._can_support(obs("pnp", 100, 0.1))
-    assert not an._can_support(obs("pnp", 99, 0.5))
-    assert not an._can_support(obs("pnp", 500, 0.05))
-    assert not an._can_support(obs("prior", 500, 0.5))
+    assert an._can_support(pl(100, 0.1))
+    assert an._can_support(pl(300, 0.2, "kept_at_prior"))  # whatever its final status
+    assert not an._can_support(pl(99, 0.5))
+    assert not an._can_support(pl(500, 0.05))
+    assert not an._can_support(an.Placement("o", "registered", T=T, inliers=0, method="origin"))
+    # the overlap is with one reference: two references at 6 % each do not make 12 %
+    uv = np.array([[10.0, 10.0], [50.0, 10.0], [90.0, 10.0], [130.0, 10.0], [170.0, 10.0],
+                   [10.0, 50.0], [50.0, 50.0], [90.0, 50.0]])
+    one = an.ref_share(uv, np.zeros(8, np.intp), K)
+    two = an.ref_share(uv, np.array([0, 1, 0, 1, 0, 1, 0, 1], np.intp), K)
+    assert one > two > 0.0 and an.ref_share(uv[:0], np.zeros(0, np.intp), K) == 0.0
 
 
 def test_the_drift_passes_end_with_the_last_fit_applied(tmp_path: Path,
@@ -310,26 +339,33 @@ def _rot_z(T: np.ndarray, deg: float) -> np.ndarray:
 
 
 def test_a_seeded_component_is_never_tighter_than_its_seed(tmp_path: Path) -> None:
-    """map.md §2 step 2 (P11): the frames registered through a component's seed report the seed
-    prior's sigma combined with their own, on their keyframes too, and the height gate
-    re-runs on them."""
+    """map.md §2 step 2 (P11, P13): a placement whose references are all in a seeded component
+    reports the seed prior's sigma combined with its own, its keyframe too, and the height gate
+    runs on that; a placement resting also on a confirmed keyframe outside it links the
+    component: its floor ends."""
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0))])
-    kf = an.Keyframe("k9", "x", "cam", K, base_pose(0), 0.004, 0.2, "fused", None, "none",
-                     height_m=float(base_pose(0)[2, 3]) + 0.02, height_sigma_m=0.001,
-                     height_ok=False)
-    m.keyframes.append(kf)
-    m.height_inconsistent = ["x"]
-    pl = an.Placement("x", "registered", T=base_pose(0), sigma_pos_m=0.004, sigma_rot_deg=0.2,
-                      keyframe="k9")
-    other = an.Placement("y", "registered", T=base_pose(0), sigma_pos_m=0.001,
-                         sigma_rot_deg=0.01)
-    seed = an.Placement("s", "registered", T=base_pose(0), sigma_pos_m=0.05, sigma_rot_deg=2.0)
-    m._through_seed(seed, [pl, other])
+    a0 = m.keyframes[0]
+    s = an.Keyframe("k8", "s", "cam", K, base_pose(90), 0.05, 2.0, "fused", None, "none",
+                    seed="k8", seed_sigma=(0.05, 2.0))
+    m.keyframes.append(s)
+    f = frame("x", base_pose(95), p=None)
+    f.height_m, f.height_sigma_m = float(base_pose(95)[2, 3]) + 0.05, 0.001
+    pl = an.Placement("x", "registered", T=base_pose(95), sigma_pos_m=0.004, sigma_rot_deg=0.2,
+                      refs=("k8",))
+    kf = m.add(f, an.features(f.rgb), pl, f.depth, K, "sensor", None)  # type: ignore[arg-type]
     assert pl.sigma_pos_m == pytest.approx(round(np.hypot(0.05, 0.004), 4))
-    assert pl.sigma_rot_deg >= 2.0 and other.sigma_pos_m >= 0.05  # type: ignore[operator]
-    assert (kf.sigma_pos_m, kf.sigma_rot_deg) == (pl.sigma_pos_m, pl.sigma_rot_deg)
-    assert kf.height_ok and m.height_inconsistent == []  # within its looser sigma now
+    assert pl.sigma_rot_deg >= 2.0  # type: ignore[operator]
+    assert (kf.sigma_pos_m, kf.seed, kf.seed_sigma) == (pl.sigma_pos_m, "k8", (0.05, 2.0))
+    assert kf.height_ok and "x" not in m.height_inconsistent  # within its looser sigma
+    assert an.Keyframe.from_json(kf.to_json()).seed_sigma == (0.05, 2.0)
+    # through the component and a confirmed keyframe outside it: linked, no floor any more
+    other = an.Placement("y", "registered", T=base_pose(95), sigma_pos_m=0.001,
+                         sigma_rot_deg=0.01, refs=("k8", a0.id))
+    assert m._seed_floor(other) is None and other.sigma_pos_m == 0.001
+    assert s.seed is None and kf.seed is None
+    assert m._seed_floor(an.Placement("z", "registered", sigma_pos_m=0.001, sigma_rot_deg=0.01,
+                                      refs=("k8",))) is None
 
 
 # -- static content ------------------------------------------------------------------------------
@@ -484,9 +520,9 @@ def test_locate_takes_the_frame_s_own_height_sigma() -> None:
 
 def test_retry_kept_places_the_job_s_kept_frames_against_new_keyframes(tmp_path: Path) -> None:
     """``AnchoredMap.retry_kept`` (map.md §2, one match graph over both engines): a kept frame
-    whose candidates hold a new keyframe is placed again: registered (fused, the height gate
-    run), or a pose duplicate (its keyframe dropped); one not placed, kept for a failed check,
-    confirmed already, or with no new candidate stays as it was."""
+    whose candidates hold a new keyframe is placed again and registered (fused, the height gate
+    run; pose duplicates are the job's last pass, ``end_job``); one not placed, kept for a
+    failed check, confirmed already, or with no new candidate stays as it was."""
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0))])
     p = frame("p", base_pose(90))
@@ -513,17 +549,40 @@ def test_retry_kept_places_the_job_s_kept_frames_against_new_keyframes(tmp_path:
     n_cloud = len(m.cloud.keys)
     got = m.retry_kept(kept, [nk])
     assert set(got) == {"p", "p2", "zd"}
-    assert got["p"].status == got["p2"].status == "registered"
-    assert (got["zd"].status, got["zd"].duplicate_of) == ("rejected", "n")
-    assert zk not in m.keyframes and kfs["p"].usable() and kfs["p2"].usable()
+    assert got["p"].status == got["p2"].status == got["zd"].status == "registered"
+    assert zk.usable() and kfs["p"].usable() and kfs["p2"].usable()
     assert not kfs["p"].height_ok and m.height_inconsistent == ["p"]
     assert not kfs["q"].usable() and not kfs["r"].usable()
-    assert len(m.cloud.keys) == n_cloud  # p fails the height gate, p2 has no depth
+    # p fails the height gate, p2 has no depth, zd's points fall in n's voxels
+    assert len(m.cloud.keys) == n_cloud
+
+
+def test_retry_kept_iterates_to_a_fixed_point(tmp_path: Path) -> None:
+    """map.md §2 (audit r7 item 3): a kept frame X that links to the map only through a kept
+    frame Y, which ``retry_kept`` confirms later in name order, is placed again once Y is
+    confirmed: X ends registered."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0))])
+    x, y = frame("a1", base_pose(100)), frame("b1", base_pose(95))
+    pls = m.update([x]) + m.update([y])  # apart from a0: kept
+    assert [pl.status for pl in pls] == ["kept_at_prior"] * 2
+    kfs = {k.name: k for k in m.keyframes}
+    n = frame("n", base_pose(90))
+    nk = m.add(n, an.features(n.rgb),
+               an.Placement("n", "registered", None, base_pose(90), 0.01, 0.1, 500, "pnp"),
+               n.depth, K, "sensor", None)  # type: ignore[arg-type]
+    cands = {"a1": [kfs["b1"]], "b1": [nk]}  # X sees only Y, Y sees the new keyframe
+    m.candidates_for = lambda f, *a, **k: cands[f.name]  # type: ignore[method-assign]
+    got = m.retry_kept([(x, kfs["a1"]), (y, kfs["b1"])], [nk])
+    assert got["b1"].status == got["a1"].status == "registered"
+    assert kfs["a1"].usable() and kfs["b1"].usable()
 
 
 def test_mapanything_infers_each_frame_once_per_job(ma: Client) -> None:
-    """A frame MapAnything does not place at first is tested again against what registered
-    since from its first output: never inferred twice in one job (``Registration.recheck``)."""
+    """A frame MapAnything places is inferred once per job; one it does not place is tested
+    again against what registered since from its output (``Registration.recheck``) and
+    inferred again only when the pool of anchors grew since its call (``retry``, round 7: the
+    real sweeps lost frames their first call's anchors did not see), once per growth."""
     fr, files = ma_frames(ma, [base_pose(0, -0.6), base_pose(0, 0.0), base_pose(0, 0.6)],
                           tag="a")
     assert ma.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
@@ -538,7 +597,11 @@ def test_mapanything_infers_each_frame_once_per_job(ma: Client) -> None:
     assert [i["status"] for i in job["inputs"]] == ["registered"] * 3 + ["rejected"]
     stored = {p.name for p in (ma.service.store.mapper_dir("m") / an.KF_DIR).glob("*.jpg")}
     new = [n for call in ma.backend.mv_calls for n in call if n not in stored]
-    assert len(new) == len(set(new)) == 4, ma.backend.mv_calls
+    # the first call infers the four; the one more infers x0 alone (its anchors: the frames
+    # registered since), and nothing after it (the pool did not grow again)
+    assert len(set(new)) == 4 and len(ma.backend.mv_calls) == 2, ma.backend.mv_calls
+    assert ma.backend.mv_calls[1][-1] not in ma.backend.mv_calls[1][:-1]
+    assert all(n in stored or n in ma.backend.mv_calls[0] for n in ma.backend.mv_calls[1])
 
 
 @pytest.mark.parametrize("engine", ["mapanything", "geometric"])

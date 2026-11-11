@@ -328,12 +328,14 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
         # its own sigmas, else its trust's defaults (api.md §3)
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
     # z_expected (api.md §6): the floor plus the frame's height above it, else its camera's
-    # registered one; height_sigma the frame's own when it carries one, else its camera's
+    # registered one; height_sigma the frame's own when it carries one, else the answer's
+    # reference keyframes' (``relocalize.z_sigma``), else its camera's
     h = fr.height_m if fr.height_m is not None else cam.height_above_floor_m
     if h is not None:
         sig = fr.height_sigma_m if fr.height_sigma_m is not None else cam.height_sigma_m
         q.camera_z = floor_z + float(h)
         q.camera_z_sigma = float(sig if sig is not None else relocalize.DEFAULT_HEIGHT_SIGMA_M)
+        q.camera_z_sigma_given = fr.height_sigma_m is not None
         q.height_scale = height_scale
     return q, measures
 
@@ -366,8 +368,8 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
             # api.md §6 "Camera-height scale": the height disagreement joins the position sigma
             res.update({"status": "located", "T_map_cam": np.round(o.T, 6).tolist(),
                         "sigma_pos_m": round(relocalize.height_sigma(q, o.T, o.sigma_pos_m), 4),
-                        "height_consistent": relocalize.height_consistent(q, o.T,
-                                                                          o.sigma_pos_m),
+                        "height_consistent": relocalize.height_consistent(
+                            q, o.T, o.sigma_pos_m, o.height_sigma_m),
                         "sigma_rot_deg": o.sigma_rot_deg,
                         "inlier_ratio": o.inlier_ratio, "ambiguity": o.ambiguity,
                         "rivals": o.rivals, "consistent_with_prior": o.consistent_with_prior})

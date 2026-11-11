@@ -45,6 +45,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.constants import REGISTRATION_MIN
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import DEFAULT_SIGMA_POS_M, DEFAULT_SIGMA_ROT_DEG
 from oh_my_slam.mapping.locate import kabsch, turn_ransac
@@ -62,7 +63,7 @@ VOTE_DIST = 230.0  # SIFT L2 distance of a nearest neighbour that votes
 PRIOR_RADIUS_M = 1.0
 PRIOR_KEYFRAMES = 6
 MIN_PAIR_MATCHES = 8
-MIN_INLIERS = 15
+MIN_INLIERS = REGISTRATION_MIN
 PX_THRESHOLD = 4.0
 RANSAC_ITERATIONS = 2000
 MIN_PX_SIGMA = 0.3
@@ -156,6 +157,7 @@ class Keyframe:
     sigma_pos_m: float = 0.0
     sigma_rot_deg: float = 0.0
     depth: bool = False  # its points come from a depth image (the calibration's data kind)
+    height_sigma_m: float | None = None  # the camera height sigma its update frame carried
 
     @property
     def centre(self) -> Array:
@@ -332,7 +334,10 @@ class Query:
     prior_sigma_pos_m: float = DEFAULT_SIGMA_POS_M
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
+    # height_sigma (api.md §6): the frame's own when ``camera_z_sigma_given``, else the median
+    # of the answer's reference keyframes' (``ref_z_sigma``), else this one (the camera's)
     camera_z_sigma: float = DEFAULT_HEIGHT_SIGMA_M
+    camera_z_sigma_given: bool = False
     # the map's scale comes from camera heights (api.md §6 "Camera-height scale"): a pose's
     # height disagreement joins its position sigma and ranks it (``height_consistent``)
     height_scale: bool = False
@@ -359,6 +364,7 @@ class Outcome:
     rivals: list[dict[str, float]] = field(default_factory=list)  # strongest first
     nearest: int | None = None  # keyframe index most similar by votes (for no_overlap)
     votes: NDArray[np.int64] = field(default_factory=lambda: np.zeros(0, np.int64))
+    height_sigma_m: float | None = None  # the height_sigma its height test used (``z_sigma``)
 
     @property
     def located(self) -> bool:
@@ -545,20 +551,40 @@ def within_prior(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0),
                                 position)
 
 
-def _height_ok(q: Query, T: Array) -> bool:
+def _height_ok(q: Query, T: Array, zs: float | None = None) -> bool:
     if q.camera_z is None:
         return True
-    return abs(float(T[2, 3]) - q.camera_z) <= K_SIGMA * q.camera_z_sigma + HEIGHT_SLACK_M
+    return abs(float(T[2, 3]) - q.camera_z) <= K_SIGMA * (
+        q.camera_z_sigma if zs is None else zs) + HEIGHT_SLACK_M
 
 
-def height_consistent(q: Query, T: Array, sigma_pos_m: float) -> bool | None:
+def z_sigma(q: Query, refs: Sequence[float | None]) -> float:
+    """A located pose's height_sigma (api.md §6): the frame's own ``height_sigma_m`` when it
+    carries one; else the median ``height_sigma_m`` of the confirmed keyframes that served as
+    the answer's references (``refs``, theirs); else, none of them carrying one, the camera's
+    (``Query.camera_z_sigma``)."""
+    got = [float(r) for r in refs if r is not None]
+    if q.camera_z_sigma_given or not got:
+        return q.camera_z_sigma
+    return float(np.median(got))
+
+
+def _ref_z_sigma(q: Query, used: NDArray[np.int64], index: Index) -> float:
+    """``z_sigma`` over the keyframes ``used`` (indices: the answer's references)."""
+    return z_sigma(q, [index.keyframes[int(i)].height_sigma_m for i in np.unique(used)])
+
+
+def height_consistent(q: Query, T: Array, sigma_pos_m: float, zs: float | None = None
+                      ) -> bool | None:
     """With a camera-height scale and an expected camera height (api.md §6): whether a pose's
     camera height agrees with it within ``K_SIGMA`` × sqrt(height_sigma² + σ_z²), σ_z its
-    image-only position sigma along z (a 3-D RMS sigma over √3); None otherwise."""
+    image-only position sigma along z (a 3-D RMS sigma over √3), height_sigma ``zs``
+    (``z_sigma``; ``Query.camera_z_sigma`` when None); None otherwise."""
     if not q.height_scale or q.camera_z is None:
         return None
     dz = abs(float(T[2, 3]) - q.camera_z)
-    return dz <= K_SIGMA * math.hypot(q.camera_z_sigma, sigma_pos_m / math.sqrt(3.0))
+    return dz <= K_SIGMA * math.hypot(q.camera_z_sigma if zs is None else zs,
+                                      sigma_pos_m / math.sqrt(3.0))
 
 
 def height_sigma(q: Query, T: Array, sigma_pos_m: float) -> float:
@@ -570,9 +596,10 @@ def height_sigma(q: Query, T: Array, sigma_pos_m: float) -> float:
 
 
 def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
-           sig: Sequence[tuple[float, float]] | None = None) -> int | None:
+           sig: Sequence[tuple[float, float]] | None = None,
+           zs: Sequence[float] | None = None) -> int | None:
     """The hypothesis to report among ``poses`` (their inlier counts ``inliers``, their
-    calibrated sigmas ``sig``): only those with support (inliers over the best's) at least
+    calibrated sigmas ``sig``, their height_sigmas ``zs``, ``z_sigma``): only those with support (inliers over the best's) at least
     ``SUPPORT_MIN`` compete. With a prior, the one nearest the prior (``prior_distance``) among
     those within the combined conflict bound (``within_prior``), None when none is
     (``prior_conflict``); without one, the best-supported, preferring those that agree with the
@@ -581,7 +608,8 @@ def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
     sg = list(sig) if sig is not None else [(0.0, 0.0)] * len(poses)
     sup = [k for k in range(len(poses)) if inliers[k] >= SUPPORT_MIN * best]
     # with a camera-height scale, a height-inconsistent pose ranks below any consistent one
-    off = [height_consistent(q, poses[k], sg[k][0]) is False for k in range(len(poses))]
+    z = list(zs) if zs is not None else [q.camera_z_sigma] * len(poses)
+    off = [height_consistent(q, poses[k], sg[k][0], z[k]) is False for k in range(len(poses))]
     if q.prior is not None:
         near = [k for k in sup if within_prior(q, poses[k], sg[k])]
         if not near:
@@ -590,7 +618,7 @@ def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
                                         -inliers[k], k))
     if any(off):
         sup = [k for k in sup if not off[k]] or sup
-    level = [k for k in sup if _height_ok(q, poses[k])]
+    level = [k for k in sup if _height_ok(q, poses[k], z[k])]
     return max(level or sup, key=lambda k: (inliers[k], -k))
 
 
@@ -689,7 +717,8 @@ def locate(q: Query, index: Index) -> Outcome:
         # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
         sig = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
                        _on_depth(h, kfs, index)) for h in hyps]
-        k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps], sig)
+        zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in hyps]
+        k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps], sig, zs)
         if k is None:
             out.reason = "prior_conflict"
             return out
@@ -709,6 +738,7 @@ def locate(q: Query, index: Index) -> Outcome:
         if out.inlier_ratio < LOW_RATIO:  # most matches unexplained: never millimetres
             sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
+        out.height_sigma_m = _ref_z_sigma(q, kfs[main.mask], index)
         return _finish(q, out)
     if ray_q:
         turned = _turn(q, index, np.concatenate(ray_q), np.concatenate(ray_k),
@@ -956,11 +986,14 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
             R2 = kabsch(ar[inl2], br[inl2])
             hyps.append((pose(R2), n2, rot_sigma(ar[inl2], br[inl2], R2)))
     # the position test uses the standpoint's sigma (map.md §1): its centre is the keyframes'
-    k = choose(q, [h[0] for h in hyps], [h[1] for h in hyps], [(sp, h[2]) for h in hyps])
+    zs = _ref_z_sigma(q, used, index)  # its references: the keyframes of the one spot
+    k = choose(q, [h[0] for h in hyps], [h[1] for h in hyps], [(sp, h[2]) for h in hyps],
+               [zs] * len(hyps))
     if k is None:
         return Outcome(reason="prior_conflict")
     T, nk, sr = hyps[k]
-    out = Outcome(T, round(sp, 4), round(sr, 3), round(nk / len(a), 4), nk, method="turn")
+    out = Outcome(T, round(sp, 4), round(sr, 3), round(nk / len(a), 4), nk, method="turn",
+                  height_sigma_m=zs)
     others = [h for j, h in enumerate(hyps) if j != k]
     out.rivals = rivals_of(T, [h[0] for h in others], [h[1] for h in others],
                            max(h[1] for h in hyps))

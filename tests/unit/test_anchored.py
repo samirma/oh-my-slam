@@ -186,7 +186,20 @@ def test_drift() -> None:
     assert np.allclose(T0, P) and (sp, sr) == (0.02, 1.0)
     d.confirm(base_pose(0), P)
     T1, sp1, sr1 = d.predict(base_pose(90, 2.0, 0.0), 0.02, 1.0)
-    assert np.allclose(T1[:3, 3], base_pose(90, 1.0, 0.0)[:3, 3]) and sp1 > 0.1 and sr1 > 5
+    assert np.allclose(T1[:3, 3], base_pose(90, 1.0, 0.0)[:3, 3]) and sp1 > 0.09 and sr1 > 5
+    # map.md §1 (P13): the root sum of squares of the prior's and the drift's own, which is its
+    # fit's sigma and its growth with the travel
+    P2 = base_pose(90, 2.0, 0.0)
+    D = np.linalg.inv(P) @ P2
+    travel, turn = float(np.linalg.norm(D[:3, 3])), an.rot_deg(D[:3, :3])
+    assert sp1 == pytest.approx(math.hypot(0.02, an.DRIFT_POS_REL * travel))
+    d.fit_sigma = (0.03, 0.4)
+    sp2, sr2 = d.predict(P2, 0.02, 1.0)[1:]
+    assert sp2 == pytest.approx(math.hypot(0.02, 0.03, an.DRIFT_POS_REL * travel))
+    assert sr2 == pytest.approx(math.hypot(1.0, 0.4, an.DRIFT_ROT_REL * turn
+                                           + an.DRIFT_ROT_DEG_PER_M * travel))
+    assert Drift.from_json(d.to_json()).fit_sigma == (0.03, 0.4)
+    d.fit_sigma = (0.0, 0.0)
     d.confirm(base_pose(0, 0.05), base_pose(0, 1.05))  # too short to tell the odometry's scale
     assert d.evidence == []
     d.confirm(base_pose(0, 1.0), base_pose(0, 2.13))

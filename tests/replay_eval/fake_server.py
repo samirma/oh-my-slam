@@ -192,6 +192,7 @@ class Fake:
                 "low_confidence_share": 0.0, "rebuilt": False, "prior_gravity_deg": 0.5,
                 "max_displacement_m": 0.01, "max_displacement_deg": 0.1,
                 "prior_disagreement_deg": 0.0, "reregistered": [], "height_inconsistent": [],
+                "rotation_pairs": [],
                 "accepted": not gated, "failed_checks": ["max_residual_m"] if gated else []}
 
     def job_body(self, job: Job) -> dict[str, Any]:

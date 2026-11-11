@@ -71,11 +71,16 @@ def test_the_mapper_rotation_check(tmp_path: Path) -> None:
               "T_map_cam": poses[1].tolist()}]
     T = base_pose(15)
     good = _fr("new", T, 0)
-    assert not Updater._rotations_bad([good], {"frames": rows}, internal)
+    bad, pairs = Updater._rotations_bad([good], {"frames": rows}, internal)
+    assert not bad and pairs  # map.md §4 (P14): the pairs it evaluated
+    assert set(pairs[0]) == {"a", "b", "inliers", "overlap", "measured_deg", "committed_deg",
+                             "difference_deg"}
+    assert pairs[0]["difference_deg"] < 2.0 and 0.0 < pairs[0]["overlap"] <= 1.0
     off = _fr("new", T, 0)
     off.pose = T.copy()
     off.pose[:3, :3] = an.exp_so3(np.array([0.0, 0.0, np.radians(30.0)])) @ T[:3, :3]
-    assert Updater._rotations_bad([off], {"frames": rows}, internal)
+    bad, pairs = Updater._rotations_bad([off], {"frames": rows}, internal)
+    assert bad and max(p["difference_deg"] for p in pairs) > 20.0
 
 
 def test_depth_residual_needs_seen_points_and_overlaps_need_features(tmp_path: Path) -> None:

@@ -223,7 +223,7 @@ class Derived:
                     internal = self.read_map(mapper)
                 except (OSError, OhMySlamError):
                     internal = None
-            self._derive(name, n, record, vdir, internal, cameras)
+            self._derive(name, n, record, vdir, internal, cameras, files)
             dv = DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
                                 vdir, self._stands(record, cameras))
             self.index(dv, cameras)  # the locate index ready before the version is
@@ -346,11 +346,11 @@ class Derived:
         return navgrid.Volume()
 
     def _derive(self, name: str, n: int, record: dict[str, Any], vdir: Path,
-                internal: InternalMap | None = None, cameras: dict[str, Any] | None = None
-                ) -> None:
+                internal: InternalMap | None = None, cameras: dict[str, Any] | None = None,
+                files: dict[str, Any] | None = None) -> None:
         """Derive a version into ``vdir`` (meta.json last) from its record, its mapper map
-        (``internal``; default: the map's current one) and the map's cameras (default: the
-        store's)."""
+        (``internal``; default: the map's current one), the map's cameras (default: the
+        store's) and, before it is committed, its JSON ``files``."""
         sim = Sim3.from_dict(record["sim3"])
         if cameras is None:
             internal = self._read(name)
@@ -374,6 +374,10 @@ class Derived:
                     raw = internal.depth(f["internal"])
                     if raw is not None:
                         d = (np.asarray(raw, np.float32) * np.float32(sim.s))
+                elif f.get("content") and f.get("added_version"):
+                    a = int(f["added_version"])
+                    d = self._kept_depth(name, a, f["name"],
+                                         (files or {}).get("kept_depth.json") if a == n else None)
                 depth_of[f["name"]] = d
             return depth_of[f["name"]]
 
@@ -472,6 +476,26 @@ class Derived:
                             and door_leaf(o["size_m"])],
             "keyframes": [k.name for k in kfs], "keys": keys})
 
+    def _kept_depth(self, name: str, n: int, frame: str, held: dict[str, Any] | None = None
+                    ) -> NDArray[np.float32] | None:
+        """A too-close kept frame's depth image on the older mapper (metres; the version file
+        ``update.KEPT_DEPTH`` of the version that added it, ``held`` while that version is
+        being committed), or None."""
+        import base64
+
+        import cv2
+
+        if held is None:
+            p = self.store.version_file(name, n, "kept_depth.json")
+            if not p.exists():
+                return None
+            held = json.loads(p.read_text())
+        b64 = held.get(frame)
+        if not b64:
+            return None
+        mm = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_UNCHANGED)
+        return None if mm is None else (mm.astype(np.float32) / 1000.0)
+
     def _features(self, name: str, key: str, img: Path
                   ) -> tuple[NDArray[np.float32], NDArray[np.uint8], int, int] | None:
         p = self.dir(name) / "features" / f"{key}.npz"
@@ -516,7 +540,7 @@ class Derived:
                 kname, np.asarray(f["T_map_cam"], np.float64),
                 cams[f["camera_id"]].canonical().resized(w, h).K(), uv, desc, z[f"p{i}"],
                 float(f.get("sigma_pos_m") or 0.0), float(f.get("sigma_rot_deg") or 0.0),
-                f.get("depth_kind") == "sensor"))
+                f.get("depth_kind") == "sensor", f.get("height_sigma_m")))
         idx = relocalize.Index(kfs)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
         return idx

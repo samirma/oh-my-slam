@@ -206,6 +206,11 @@ def test_measures_tell_texture_blur_and_features() -> None:
     assert checks.reason(m, 0.1) == "too_close"
     few = checks.Measures(5, 0.2, 0.3)
     assert checks.reason(few, None) == "few_features"
+    # api.md §4, §6: the check asks the registration minimum, one constant for both
+    from oh_my_slam.mapping import anchored, relocalize
+    assert checks.FEW_FEATURES == anchored.MIN_INLIERS == relocalize.MIN_INLIERS == 15
+    assert checks.reason(checks.Measures(14, 0.2, 0.3), None) == "few_features"
+    assert checks.reason(checks.Measures(15, 0.2, 0.3), None) is None
 
 
 def test_ignored_pixels_take_no_part() -> None:
