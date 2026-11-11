@@ -132,9 +132,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     those frames. Travel since the client's last fix is the client's part: `drifting` priors
     already carry sigmas grown with travel. This holds on every engine.
   * **Supporting frames.** The supporting frames are the inliers of the fit that produced the
-    current drift estimate, plus every `drifting`-prior frame that images later confirmed under
-    that same estimate, with no count bound. The set resets to the new fit's inliers whenever
-    the estimate changes.
+    current drift estimate, plus every `drifting`-prior frame that images confirmed under that
+    same estimate, the job's own registered `drifting` frames that were not fit inliers
+    included. Such a frame joins the support only from the commit of the version that
+    registered it, never within the job that registered it, so no frame loosens its own bound;
+    this holds on every engine, also when the job's drift change was refused. The fit's
+    outliers never join the support. The set has no count bound, and resets to the new fit's
+    inliers whenever the estimate changes. The no-count-bound rule applies only to the
+    supporting frames: odometry-scale evidence stays capped by a constant recorded in
+    `README.md`.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
