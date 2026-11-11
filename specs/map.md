@@ -243,7 +243,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the objects;
   * the grid inputs;
   * the scale;
+  * the label vocabulary (§5);
   * the metadata.
+* **Ignored pixels.** A pixel in the union of the camera's ignore mask and the frame's own mask
+  contributes nothing anywhere, on every engine: no keypoints or matches, no depth points, no
+  occupancy, free-space or floor evidence, no detections or votes, and no cloud points. A
+  detection whose box or mask lies mostly inside the ignored region is dropped: more than the
+  share recorded as a constant in `README.md`.
 * **Reads.**
   * A read without `?version=` answers from the latest committed version at the moment the
     request arrives.
@@ -376,6 +382,14 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 points, such as the floor, table tops, counters and shelves. Each has `id`, `height_m`,
 `polygon_m` and `area_m2`. An arm descends to and places on these heights.
 
+* **Label vocabulary.** An update request's `labels` (api.md §3) are added to the map's
+  vocabulary, which is stored with the version: the union of the labels of all its updates.
+  Detection on the map, in fusion and in any later re-detection, prompts with the default
+  vocabulary (`README.md`, `default_labels.txt`) merged with the map's vocabulary, duplicates
+  removed case-insensitively. A label gets no special treatment beyond being a prompt. The
+  map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
+  would use.
+* **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote.
 * **Doorways.** A door opening is a passage of the grid (§6), not an object. A detected door
   leaf is an object: label `door`, with its `state` and `region`. The passage names it in
   `leaves[].object_id`. A door object is a leaf: thin (< 0.20 m), vertical and at least 0.6 m
@@ -395,6 +409,8 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
 * cells seen through are **free**;
 * cells holding surfaces within the height band are **occupied**, except floor;
 * everything else is **unknown**.
+
+**Ignored pixels** (§2) give no occupancy, free-space or floor evidence.
 
 **Where cameras stood is free.** The cells under each keyframe's camera position are free,
 whatever the camera saw, because the robot stood there. So is the ring around that position
