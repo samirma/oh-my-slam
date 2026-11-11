@@ -74,7 +74,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `update.sigma_containment` | C1, C4 | Share of non-rejected update frames (registered and `kept_at_prior`, the latter against their prior's sigmas) whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
 | `scale.error_metric` | C2 | Scale error with `metric` priors |
 | `scale.error_camera_height` | C2 | Scale error with camera height only |
-| `scale.error_by_direction` | C2 | Worst relative scale error over four horizontal directions at 45° steps, measured on keyframe truth positions (distances between keyframes along each direction), not on walls. Verified by the error in all four directions within 3 × the stated `scale_sigma_rel`, and, without priors, \|`floor_z_m`\| ≤ 0.02 m |
+| `scale.error_by_direction` | C2 | Worst relative scale error over four horizontal directions at 45° steps, measured on keyframe truth positions (distances between keyframes along each direction), not on walls. Verified by the error in all four directions within 3 × the stated `scale_sigma_rel`, and, without priors and with a camera height (`height_above_floor_m`), \|`floor_z_m`\| ≤ 0.02 m |
 | `frame.shift` | C1 | Map-frame shift of stored keyframes between consecutive versions, median position and rotation, beyond the stated `gauge_shift` |
 | `update.readable_latency` | C3 | Upload to frame readable in a version (`provisional_version` committed) |
 | `fusion.time_per_frame` | C3 | Fusion time per new frame, maps up to 500 keyframes |
