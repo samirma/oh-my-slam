@@ -147,9 +147,12 @@ error code `invalid_request` (§9).
     plus the drift estimate's uncertainty.
 
   **Choosing a status.** Registration is order-independent and runs over the job's match graph
-  (map.md §2): each connected component of new frames registers as a whole, and the checks
-  below apply frame by frame to its fitted poses, iterating to a fixed point. The outcome does
-  not depend on frame order, and a dry run predicts the same statuses.
+  (map.md §2). An edge needs the registration minimum of inliers (the `README.md` constant,
+  currently 15, behind `few_features`, §6) and counts only if the frame's fitted pose passes
+  the prior checks. Each connected component of new frames registers as a whole, and the
+  checks below apply frame by frame to its fitted poses, iterating to a fixed point. A lone
+  frame with a prior and no edge is `kept_at_prior`, `no_overlap`, `detail` `no_image_pose`.
+  The outcome does not depend on frame order, and a dry run predicts the same statuses.
   * A hypothesis's support is its inlier count over the best image hypothesis's inlier count;
     it is supported at 0.25 or more (the same definition as locate, §6).
   * **Conflict with the prior.** A hypothesis conflicts with the prior when its distance from

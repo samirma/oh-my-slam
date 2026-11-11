@@ -155,7 +155,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * **Match graph.** A job's registration is order-independent and runs over the job's match
     graph:
     1. An edge joins two frames of the job, or a new frame and a confirmed stored keyframe.
-       Each edge needs at least 100 epipolar inliers.
+       Each edge needs at least the registration minimum of inliers: the implementation
+       constant in `README.md` (currently 15) behind `few_features` (api.md §6). An edge counts
+       only if the frame's fitted pose then passes the prior checks (step 3). The 100-inlier
+       measurable-pair threshold (§1) stays for the rotation check and the other pair
+       limits.
     2. Each connected component of new frames registers as a whole. Relative poses come from
        the images. The component is placed by its matches to confirmed keyframes, by the
        priors of all its frames together, or both.
@@ -165,11 +169,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        and placed without that frame. Removals iterate to a fixed point, re-checking
        connectivity after each removal, and the final statuses do not depend on the order in
        which frames are removed.
-    4. A frame is kept with `no_overlap` only if its component cannot be placed at all. A
-       frame with no edge forms a component that the images cannot place.
+    4. A frame is kept with `no_overlap` only if its component cannot be placed at all. A lone
+       frame, with no edge at the registration minimum, cannot be placed: with a prior it is
+       `kept_at_prior`, reason `no_overlap`, `detail` `no_image_pose`.
     5. `kept_at_prior` frames of earlier versions are not references, and a job frame counts
        as an edge only once it is registered. Earlier kept frames that match a registered
-       component with at least 100 inliers go through re-registration (above, images only),
+       component with at least the registration minimum of inliers go through re-registration (above, images only),
        so the same job can confirm them.
     6. The outcome does not depend on the order of frames in the request. A dry run applies
        the same procedure and predicts the same statuses;
