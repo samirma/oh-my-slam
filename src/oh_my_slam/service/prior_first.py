@@ -35,7 +35,6 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import register_ma
 from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import (
-    TOO_CLOSE_INLIERS,
     TOO_CLOSE_M,
     AnchoredMap,
     FrameIn,
@@ -49,6 +48,14 @@ from oh_my_slam.mapping.anchored_objects import (
     SENSOR_DEPTH_REL,
     ObjectMap,
     View,
+)
+from oh_my_slam.mapping.quality import (
+    displacement_quality,
+    displacements,
+    gate,
+    reregistered,
+    residual_stats,
+    too_close,
 )
 from oh_my_slam.segmentation.api import (
     Detection,
@@ -72,11 +79,6 @@ INFERENCE_IN_FLIGHT = 2
 LOW_CONFIDENCE_SIGMA_M = 0.10  # as update.LOW_CONFIDENCE_SIGMA_M
 NONE_ENGINE_ENV = "OH_MY_SLAM_NONE_ENGINE"
 DEFAULT_NONE_ENGINE = "mapanything"
-# a new frame whose baseline to its nearest stored keyframe is below this share of that
-# keyframe's median depth turned in place: its image-only translation is unconstrained, and only
-# its rotation counts in its displacement (README "Quality report")
-PARALLAX_MIN = 0.02
-PARALLAX_DEPTH_M = 2.0  # a keyframe's depth when it has none
 
 
 def none_engine() -> str:
@@ -143,6 +145,12 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
             progress(f"{fr.work.name}: rejected ({p.reason})")
             continue
         assert p.T is not None and p.depth is not None and p.K_depth is not None
+        dup = am.duplicate_of(fr.work.camera_id, p.T)
+        if dup is not None:  # within the duplicate limits of a confirmed keyframe (api.md §4)
+            out.append(Placement(fr.work.name, "rejected", "duplicate", inliers=p.inliers,
+                                 duplicate_of=dup))
+            progress(f"{fr.work.name}: rejected (duplicate of {dup})")
+            continue
         pl = Placement(fr.work.name, "registered", None, p.T, p.sigma_pos_m, p.sigma_rot_deg,
                        p.inliers, "mapanything")
         f = _frame_in(fr, None)
@@ -163,43 +171,6 @@ def _register_none(up: Updater, am: AnchoredMap, frames: list[_Frame], workdir: 
     return out, reg_s, time.perf_counter() - t
 
 
-def too_close(scene_m: float | None, inliers: int) -> bool:
-    """The distance limit (api.md §4): a median scene depth below ``TOO_CLOSE_M``, unless the
-    frame has at least ``TOO_CLOSE_INLIERS`` inliers."""
-    return scene_m is not None and scene_m < TOO_CLOSE_M and inliers < TOO_CLOSE_INLIERS
-
-
-def displacements(pls: list[Placement | None], stored: list[Keyframe]
-                  ) -> list[tuple[float | None, float]]:
-    """The new frames' disagreement with the stored map (map.md §1): each registered frame's
-    committed pose against its image-only pose (``Placement.map_residual``), as (m or None,
-    deg). Frames kept at their prior or rejected have no image-only pose and are left out; a
-    frame whose image pose is unconstrained in translation — rotation-only, or registered by PnP
-    with a parallax to its nearest stored keyframe below ``PARALLAX_MIN`` — counts only its
-    rotation (None in metres)."""
-    out: list[tuple[float | None, float]] = []
-    for pl in pls:
-        if pl is None or pl.status != "registered" or pl.map_residual is None:
-            continue
-        dp: float | None = pl.map_residual[0]
-        if pl.method == "rotation":
-            dp = None
-        elif pl.method == "pnp" and stored and pl.T is not None:
-            d = [float(np.linalg.norm(k.centre - pl.T[:3, 3])) for k in stored]
-            k = stored[int(np.argmin(d))]
-            if min(d) < PARALLAX_MIN * (k.median_depth or PARALLAX_DEPTH_M):
-                dp = None
-        out.append((dp, pl.map_residual[1]))
-    return out
-
-
-def displacement_quality(moved: list[tuple[float | None, float]]) -> dict[str, float | None]:
-    """``max_displacement_m`` and ``max_displacement_deg`` (map.md §4), null without any."""
-    m = [d for d, _ in moved if d is not None]
-    return {"max_displacement_m": round(max(m), 4) if m else None,
-            "max_displacement_deg": round(max(r for _, r in moved), 3) if moved else None}
-
-
 def detection_grid(K: Intrinsics) -> tuple[int, int]:
     """The grid (width, height) a frame's detections are asked on: its monocular depth grid."""
     return size_at_max_side(K.width, K.height, MONO_GRID_SIDE)
@@ -212,20 +183,32 @@ def _on_grid(a: NDArray[Any], shape: tuple[int, int], interp: int) -> NDArray[An
 
 
 def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[list[Detection]]]],
-                 version: int, closer: Closer) -> tuple[ObjectMap, int]:
-    """The objects of the new keyframes (``mapping.anchored_objects``), fused in request order
-    into the map's: struck objects carved from the cloud, then the surfaces and relations.
-    ``closer`` looks closer at a keyframe looking down at its support
-    (``segmentation.api.raised_regions``; the backend's ``look_closer``). Returns the objects and how many are listed."""
+                 version: int, closer: Closer,
+                 again: list[tuple[Keyframe, Future[list[Detection]]]] | None = None
+                 ) -> tuple[ObjectMap, int]:
+    """The objects of the new image-confirmed keyframes (``mapping.anchored_objects``), fused in
+    request order into the map's, then those of the stored keyframes this update re-registered
+    (``again``, their stored image's detections): struck objects carved from the cloud, then
+    the surfaces, the relations and each object's votes over the confirmed keyframes that see
+    it. A frame kept at its prior gives no object (map.md §2). ``closer`` looks closer at a
+    keyframe looking down at its support (``segmentation.api.raised_regions``; the backend's
+    ``look_closer``). Returns the objects and how many are listed."""
     om = ObjectMap.load(am.root)
     by_id = {k.id: k for k in am.keyframes}
-    views = []
+    todo: list[tuple[Keyframe, NDArray[np.float32], NDArray[np.bool_] | None, Path | None,
+                     Future[list[Detection]]]] = []
     for fr, pl, fut in frames:
         kf = by_id.get(pl.keyframe or "")
-        if pl.status == "rejected" or kf is None or kf.grid is None or kf.K_grid is None:
+        if pl.status != "registered" or kf is None or kf.grid is None or kf.K_grid is None:
             continue
-        assert kf.rgb is not None
-        shape = kf.grid.shape
+        todo.append((kf, kf.grid, fr.ignore, fr.path, fut))
+    # a re-registered keyframe has its stored image (``AnchoredMap.reregister`` set ``rgb``)
+    todo += [(kf, ref.depth, None, am.image_path(kf.id), fut) for kf, fut in again or []
+             for ref in [am._grid(kf)] if ref is not None]
+    views = []
+    for kf, grid, own_ignore, path, fut in todo:
+        assert kf.rgb is not None and kf.K_grid is not None
+        shape = grid.shape
         dets = []
         for d in fut.result():
             m = _on_grid(d.mask.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
@@ -233,15 +216,14 @@ def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[l
             b = d.box
             dets.append(Detection(d.label, d.score, d.source, m,
                                   (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
-        ignore = None if fr.ignore is None else _on_grid(
-            fr.ignore.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+        ignore = None if own_ignore is None else _on_grid(
+            own_ignore.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
         rel = SENSOR_DEPTH_REL if kf.depth_kind == "sensor" else MONO_DEPTH_REL
-        regions = raised_regions(kf.grid, kf.K_grid, kf.T, rel,
-                                 None if ignore is None else ~ignore)
+        regions = raised_regions(grid, kf.K_grid, kf.T, rel, None if ignore is None else ~ignore)
         if regions:  # a view looking down at its support
-            assert fr.path is not None  # a frame kept has its image
-            dets = closer(fr.path, regions, dets, (shape[1], shape[0]))
-        views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, kf.grid,
+            assert path is not None  # a frame kept has its image
+            dets = closer(path, regions, dets, (shape[1], shape[0]))
+        views.append(View(kf.id, kf.T, kf.sigma_pos_m, kf.K_grid, grid,
                           _on_grid(kf.rgb, shape, cv2.INTER_AREA), dets, ignore, rel))
     # the version's one floor estimate (map.md §5): the objects' and, through the version
     # record, the grid's (``run_anchored``: ``om.floor_z``, ``om.floor_sigma``)
@@ -249,9 +231,11 @@ def fuse_objects(am: AnchoredMap, frames: list[tuple[_Frame, Placement, Future[l
     struck = om.update(views, version, floor, floor_sigma)
     if struck:
         am.cloud.drop(om.carve(struck, am.cloud.points()))
-    top = max((float(k.centre[2]) for k in am.keyframes), default=None)
+    confirmed = am.confirmed()
+    top = max((float(k.centre[2]) for k in confirmed), default=None)
     om.finish(am.cloud.points(), top, version,
-              np.array([k.centre for k in am.keyframes]).reshape(-1, 3), floor)
+              np.array([k.centre for k in confirmed]).reshape(-1, 3), floor,
+              [(k.id, k.T, k.K) for k in confirmed])
     return om, len(om.records()["objects"])
 
 
@@ -278,18 +262,19 @@ def _input(fr: _Frame, pl: Placement | None) -> dict[str, Any]:
     """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed."""
     if pl is None:  # rejected by the checks
         return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
-                         fr.scene_m)
+                         fr.scene_m, fr.duplicate_of)
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
     return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
-                     pl.sigma_rot_deg, res, pl.scene_m)
+                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of)
 
 
 def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
               sigma_pos_m: float | None, sigma_rot_deg: float | None,
-              residual: tuple[float, float] | None, scene_m: float | None) -> dict[str, Any]:
+              residual: tuple[float, float] | None, scene_m: float | None,
+              duplicate_of: str | None = None) -> dict[str, Any]:
     """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
-    null without a prior, and with reason ``too_close`` the distance limit and the frame's
-    median scene depth."""
+    null without a prior, with reason ``too_close`` the distance limit and the frame's median
+    scene depth, and with reason ``duplicate`` the frame it duplicates."""
     kept = status != "rejected"
     row = {"name": name, "status": status, "reason": reason, "inliers": inliers,
            "T_map_cam": np.asarray(T).round(6).tolist() if kept and T is not None else None,
@@ -300,6 +285,8 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
     if reason == "too_close":
         row["min_distance_m"] = TOO_CLOSE_M
         row["scene_distance_m"] = round(scene_m if scene_m is not None else 0.0, 3)
+    if reason == "duplicate":
+        row["duplicate_of"] = duplicate_of or name
     return row
 
 
@@ -314,8 +301,6 @@ def prior_frames_rejected(frames: list[_Frame], status: dict[int, str]) -> bool:
 def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                  prev: dict[str, Any] | None, workdir: Path,
                  changed: Callable[[], None] = lambda: None) -> None:
-    from oh_my_slam.service.update import gate, residual_stats
-
     tm = job.timings_s
     todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
     placements: dict[int, Placement] = {}
@@ -378,12 +363,22 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 reg_s, fuse_s = reg_s + r, fuse_s + fu
                 for fr, pl in zip(late, lp, strict=True):
                     placements[fr.work.index] = pl
+                # the stored kept keyframes these frames overlap too (map.md §2)
+                news = [am.keyframe(pl.keyframe) for pl in lp
+                        if pl.status == "registered" and pl.keyframe is not None]
+                am.reregistered += am.reregister([k for k in stored if not k.usable()],
+                                                 [k for k in news if k is not None])
             t = time.perf_counter()
             version = (prev["version"] + 1) if prev else 1
+            again = []  # the re-registered keyframes' objects: their stored image's detections
+            for e in am.reregistered:  # confirmed from their stored image: it exists
+                kf, path = am.keyframe(e["keyframe"]), am.image_path(e["keyframe"])
+                assert kf is not None and path is not None
+                again.append((kf, pool.submit(up.backend.detect, path, detection_grid(kf.K))))
             if am.keyframes:  # else no origin: every frame with a prior was rejected
                 om, n_objects = fuse_objects(am, [(fr, placements[fr.work.index],
                                                    dets[fr.work.index]) for fr in todo],
-                                             version, up.backend.look_closer)
+                                             version, up.backend.look_closer, again)
             tm["objects"] = round(time.perf_counter() - t, 3)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -406,9 +401,17 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     # the stored frames at the poses this version would commit (their keyframes'), and how far
     # each moved from the previous version: the gauge shift and ``previous_residuals``
     by_id = {k.id: k for k in am.keyframes} if am is not None else {}
+    again_ids = {e["keyframe"] for e in am.reregistered} if am is not None else set()
     rows, shifts = [], []
     for r in prev["frames"] if prev else []:
         k = by_id.get(r.get("internal") or "")
+        if k is not None and k.id in again_ids:
+            # confirmed by this job's images (map.md §2): registered now; the movement of its
+            # confirmation is in ``reregistered`` only, not in the gauge shift or the residuals
+            rows.append({**r, "T_map_cam": k.T.tolist(), "sigma_pos_m": k.sigma_pos_m,
+                         "sigma_rot_deg": k.sigma_rot_deg, "pose_state": "fused",
+                         "inliers": k.inliers, "method": k.method})
+            continue
         row = r if k is None else {**r, "T_map_cam": k.T.tolist()}
         shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
         rows.append(row)
@@ -446,6 +449,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "gauge_shift": gauge,
         **displacement_quality(moved),
         "prior_disagreement_deg": 0.0 if am is None else am.prior_disagreement_deg,
+        "reregistered": [] if am is None else reregistered(am.reregistered),
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats(shifts) if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),

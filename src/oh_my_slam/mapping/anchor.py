@@ -234,12 +234,13 @@ def fit(anchors: list[Anchor], scale: float | None = None, seed: int = 0) -> Fit
     return Fit(S, use, observable, sigma)
 
 
-def yaw_frame(T_first: Array, scale: float) -> Sim3:
+def yaw_frame(T_first: Array, scale: float, height_m: float | None = None) -> Sim3:
     """The first-camera rule (map.md §1) on a gravity-aligned internal frame: the origin at the
-    camera centre, +x its viewing direction projected onto the horizontal plane, +z up, and the
-    internal metres times ``scale``."""
+    camera centre (with a camera height ``height_m``, the floor that far below it), +x its
+    viewing direction projected onto the horizontal plane, +z up, and the internal metres times
+    ``scale``."""
     z = T_first[:3, 2]
     yaw = math.atan2(float(z[1]), float(z[0])) if abs(z[0]) + abs(z[1]) > 1e-9 else 0.0
     c, s_ = math.cos(-yaw), math.sin(-yaw)
     R = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
-    return Sim3(scale, R, -scale * R @ T_first[:3, 3])
+    return Sim3(scale, R, -scale * R @ T_first[:3, 3] + np.array([0.0, 0.0, height_m or 0.0]))

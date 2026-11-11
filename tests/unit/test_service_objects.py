@@ -81,6 +81,11 @@ def frames(c: Client, scene: str, eyes: list[tuple[float, float, float]], tag: s
     return out, files
 
 
+def moved(eyes: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """The eyes 6 cm aside: the same view again is a pose duplicate (api.md §4)."""
+    return [(x + 0.06, y, z) for x, y, z in eyes]
+
+
 def labels(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {o["label"]: o for o in doc["objects"]}
 
@@ -120,14 +125,14 @@ def test_objects_of_an_anchored_map(client: Client) -> None:
     assert {o["basket"]["id"], o["apple"]["id"]} <= set(ids.tolist())
 
     # the apple taken away: struck in version 2, the others keep their ids
-    fr, files = frames(client, "taken", EYES[:3], "b")
+    fr, files = frames(client, "taken", moved(EYES[:3]), "b")
     assert client.update("t", fr, files)["state"] == "committed"
     o2 = labels(client.get("/api/maps/t/objects", "Objects"))
     assert o2["apple"]["state"] == "struck" and o2["apple"]["id"] == o["apple"]["id"]
     assert {k: v["id"] for k, v in o2.items()} == {k: v["id"] for k, v in o.items()}
     assert client.get("/api/maps/t", "MapSummary")["objects"] == 4
     # and gone the version after
-    fr, files = frames(client, "taken", EYES[3:4], "c")
+    fr, files = frames(client, "taken", moved(EYES[3:4]), "c")
     assert client.update("t", fr, files)["state"] == "committed"
     assert "apple" not in labels(client.get("/api/maps/t/objects", "Objects"))
     assert client.get("/api/maps/t", "MapSummary")["objects"] == 3
@@ -279,7 +284,7 @@ def test_birdseye_of_each_version(client: Client) -> None:
     assert all(drawn(meta, r.content, o) for o in objects)
     # kept per version: a second read loads it; a past version answers its own
     assert client.get("/api/maps/t/birdseye?version=1", "Birdseye") == meta
-    fr2, files2 = frames(client, "taken", EYES[2:3], "b")
+    fr2, files2 = frames(client, "taken", moved(EYES[1:3]), "b")
     assert client.update("t", fr2, files2)["state"] == "committed"
     meta2 = client.get("/api/maps/t/birdseye", "Birdseye")
     assert meta2["map_version"] == 2

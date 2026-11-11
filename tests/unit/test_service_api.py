@@ -776,7 +776,8 @@ def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
     job = client.update("m", frames, files, {"cam": CAMERA})
     assert job["scale_source"] == "monocular"
     s = client.get("/api/maps/m", "MapSummary")
-    assert s["floor_z_m"] is None and s["bounds_m"]["min"] == s["bounds_m"]["min"]
+    # a camera height without priors: the floor below the first frame is z 0 (map.md §1, §6)
+    assert s["floor_z_m"] == 0.0 and s["bounds_m"]["min"] == s["bounds_m"]["min"]
 
 
 # -- oms/2.1: capabilities, expected durations, per-frame masks ----------------------------------
@@ -876,9 +877,9 @@ def test_metric_first_frames_then_drifting_and_none_land_in_the_priors_frame(
     assert job["inputs"][0]["prior_residual_m"] < 1e-6 and job["inputs"][2]["prior_residual_m"] is None
     assert job["quality"]["gauge_shift"]["translation_m"] < 1e-6
     frames, files, truth = frames_of(client, 2, start=0, seed=9)
-    job = client.update("m", frames, files)  # trust none: anchored on the stored frames
-    for i, t in zip(job["inputs"], truth, strict=True):
-        assert centre_error(i["T_map_cam"], t) < 1e-6
+    job = client.update("m", frames, files)  # trust none, at the stored frames' poses
+    assert [(i["reason"], i.get("duplicate_of")) for i in job["inputs"]] == [
+        ("duplicate", "f0_0"), ("duplicate", "f0_1")]  # pose duplicates (api.md §4)
 
 
 def anchor_rot(deg: float) -> np.ndarray:
@@ -901,7 +902,10 @@ def test_heights_anchor_the_scale_on_the_cloud_s_floor_when_the_mapper_has_none(
     assert job["scale_source"] == "camera_height"
     d01 = centre_error(job["inputs"][1]["T_map_cam"], np.asarray(job["inputs"][0]["T_map_cam"]))
     assert d01 == pytest.approx(centre_error(truth[1], truth[0]), rel=0.02)
-    assert client.get("/api/maps/m", "MapSummary")["floor_z_m"] == pytest.approx(-1.0, abs=0.02)
+    # the origin is the floor below the first frame (map.md §1): the cloud's floor is z 0
+    fr0 = np.asarray(job["inputs"][0]["T_map_cam"])
+    assert fr0[2, 3] == pytest.approx(1.0) and abs(fr0[0, 3]) + abs(fr0[1, 3]) < 1e-9
+    assert client.get("/api/maps/m", "MapSummary")["floor_z_m"] == pytest.approx(0.0, abs=0.02)
 
 
 def test_a_monocular_map_takes_the_first_height_anchor(client: Client) -> None:
@@ -989,7 +993,8 @@ def test_frames_with_a_prior_the_mapper_does_not_place_are_kept_at_it(client: Cl
                         accept_if={"max_displacement_m": 0.0, "max_displacement_deg": 0.0,
                                    "max_prior_disagreement_deg": 0.0})
     st = {i["name"]: (i["status"], i["reason"]) for i in job["inputs"]}
-    assert st["lost"] == ("kept_at_prior", "no_overlap") and st["close"] == ("rejected", "too_close")
+    assert st["lost"] == ("kept_at_prior", "no_overlap")
+    assert st["close"] == ("kept_at_prior", "too_close")  # with a prior: kept (api.md §4)
     lost2 = next(i for i in job["inputs"] if i["name"] == "lost2")
     assert lost2["T_map_cam"] == WORLD[5].round(6).tolist() and lost2["sigma_pos_m"] == 0.05
     lost = next(i for i in job["inputs"] if i["name"] == "lost")
@@ -1025,3 +1030,18 @@ def test_old_versions_read_kept_frames_as_kept_at_prior(client: Client) -> None:
     assert [r["pose_state"] for r in s.version("m", n)["frames"]] == ["fused", "kept_at_prior"]
     m = s.commit("m", {**rec, "frames": rows, "pose_states": POSE_STATES}, None)
     assert s.version("m", m)["frames"][1]["pose_state"] == "provisional"  # the O3 state
+
+
+def test_a_registered_frame_too_close_with_a_prior_is_kept_at_it(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mapper's engine (api.md §4): a frame the mapper registers within the distance limit
+    is kept at its prior when it has one, rejected too_close without."""
+    from oh_my_slam.service import update
+
+    monkeypatch.setattr(update, "TOO_CLOSE_INLIERS", 10 ** 6)
+    frames, files, _ = frames_of(client, 4, prior=lambda i, T: {
+        "trust": "metric", "T_map_cam": T.tolist(), "sigma_pos_m": 0.01, "sigma_rot_deg": 0.5})
+    client.backend.add(files["img1"], WORLD[1], depth_m=0.15)  # the mapper's depth: 15 cm
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    st = [(i["status"], i["reason"]) for i in job["inputs"]]
+    assert st[1] == ("kept_at_prior", "too_close"), st

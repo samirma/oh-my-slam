@@ -265,8 +265,12 @@ def test_cold_start_sweep_with_depth(tmp_path: Path) -> None:
     assert first[0].status == "registered" and first[0].method == "origin"
     assert m.created_with == "metric" and m.up_check_deg is None  # depth image: no gravity asked
     pls = m.update(sweep(30.0, 11))
-    assert [p.status for p in pls] == ["registered"] * 11
+    # s0 stands where a0 does: a pose duplicate of it (api.md §4)
+    assert (pls[0].status, pls[0].reason, pls[0].duplicate_of) == ("rejected", "duplicate", "a0")
+    assert [p.status for p in pls[1:]] == ["registered"] * 10
     for k, p in enumerate(pls):
+        if k == 0:
+            continue
         assert p.T is not None
         e = err(p.T, base_pose(30.0 * k))
         assert e[0] < 0.02 and e[1] < 0.5, (k, e)
@@ -290,7 +294,7 @@ def test_cold_start_sweep_with_depth(tmp_path: Path) -> None:
     m.cloud.drop(m.cloud.points()[:, 2] < -1.0)
     m.save()
     again = AnchoredMap.load(m.root)
-    assert len(again.keyframes) == 12 and again.keyframes[0].feats is None
+    assert len(again.keyframes) == 11 and again.keyframes[0].feats is None
     more = again.update([frame("b", base_pose(45))])
     assert more[0].status == "registered" and err(more[0].T, base_pose(45))[1] < 0.5
 
@@ -300,7 +304,8 @@ def test_sweep_with_monocular_depth_and_camera_height(tmp_path: Path) -> None:
     m.update([frame("a0", base_pose(0), depth=False, mono=1.2, height=0.5)])
     assert m.up_check_deg is not None and m.up_check_deg < 15
     pls = m.update(sweep(30.0, 6, depth=False, mono=1.2, height=0.5))
-    assert all(p.status == "registered" for p in pls)
+    assert pls[0].reason == "duplicate"  # where the origin stands
+    assert all(p.status == "registered" for p in pls[1:])
     src, sig = m.scale_summary()
     assert src == "camera_height" and sig < 0.05
     assert m.scale.k == pytest.approx(1 / 1.2, rel=0.05)
@@ -351,7 +356,7 @@ def test_provisional_and_conflicting_frames(tmp_path: Path) -> None:
     finally:
         an.STRONG_INLIERS = strong
     assert p3.status == "kept_at_prior" and p3.inliers > 0
-    # provisional frames at metric priors are references; nothing stored moved
+    # nothing stored moved
     assert [k.state for k in m.keyframes] == ["fused", "fused", "provisional", "fused",
                                               "provisional", "provisional"]
     assert np.allclose(m.keyframes[0].T, base_pose(0))
@@ -496,7 +501,7 @@ def test_fusion_ignores_masked_pixels(tmp_path: Path) -> None:
     m.update([frame("a1", base_pose(10), ignore=ign)])
     n = len(m.cloud.keys)
     assert n > 0
-    m.update([frame("a2", base_pose(10, 0.01), p=prior(base_pose(10, 0.01)))])
+    m.update([frame("a2", base_pose(10, 0.05), p=prior(base_pose(10, 0.05)))])
     assert len(m.cloud.keys) > n
 
 
@@ -518,10 +523,10 @@ def test_floor_spread_is_the_floor_points_sigma() -> None:
 
 def test_summary_and_candidates(tmp_path: Path) -> None:
     m = new_map(tmp_path)
-    m.update([frame("a0", base_pose(0), depth=False, mono=1.0)])
-    assert m.scale_summary() == ("monocular", an.MONOCULAR_SIGMA_REL)
+    m.update([frame("a0", base_pose(0))])
+    assert m.scale_summary() == ("depth", an.DEPTH_SIGMA_REL)
     assert m.prior_span() == 0.0
-    m.update([frame("a1", base_pose(0, 0.5, 0.0), depth=False, mono=1.0)])
+    m.update([frame("a1", base_pose(0, 0.5, 0.0))])
     src, sigma = m.scale_summary()
     assert src == "priors" and sigma == pytest.approx(math.sqrt(2) * 0.02 / 0.5)
     # a candidate far away or facing elsewhere is not one
@@ -607,8 +612,19 @@ def test_suspicious_frames_too_close_by_their_monocular_depth(
     near2 = frame("near2", base_pose(15), depth=False, mono=0.05)
     near2.check_close = True
     p = m.update([near2])[0]
-    assert (p.status, p.reason) == ("rejected", "too_close")
+    # with a prior, too close is kept at it (api.md §4), its scene distance reported
+    assert (p.status, p.reason) == ("kept_at_prior", "too_close")
     assert p.scene_m is not None and p.scene_m < an.TOO_CLOSE_M
+    # an image that failed a check gives that reason first (plain, blur, few_features, too_close)
+    near3 = frame("near3", base_pose(16), depth=False, mono=0.05)
+    near3.check_close, near3.unconfirmed = True, "blur"
+    p = m.update([near3])[0]
+    assert (p.status, p.reason, p.scene_m) == ("kept_at_prior", "blur", None)
+    # without a prior: rejected too_close
+    near4 = frame("near4", base_pose(17), p=None, depth=False, mono=0.05)
+    near4.check_close = True
+    p = m.update([near4])[0]
+    assert (p.status, p.reason) == ("rejected", "too_close")
 
 
 def test_a_too_close_origin_gives_way_to_the_next_prior(tmp_path: Path) -> None:
@@ -616,12 +632,20 @@ def test_a_too_close_origin_gives_way_to_the_next_prior(tmp_path: Path) -> None:
     near = frame("near", base_pose(0), depth=False, mono=0.05)
     near.check_close = True
     pls = m.update([frame("cam", base_pose(5), p=None), near, frame("a1", base_pose(10))])
-    assert (pls[1].status, pls[1].reason) == ("rejected", "too_close")
+    # kept at its prior (api.md §4): it lies in the priors' frame, but registers nothing
+    assert (pls[1].status, pls[1].reason) == ("kept_at_prior", "too_close")
+    assert pls[1].scene_m is not None
     assert pls[2].method == "origin" and m.created_with == "metric"
+    assert [k.state for k in m.keyframes][:2] == ["provisional", "fused"]
     m2 = new_map(tmp_path / "m2")
     pls = m2.update([frame("cam", base_pose(5), p=None), near])
-    # every frame with a prior rejected: no origin, nothing else registered (map.md §1)
-    assert [p.status for p in pls] == ["rejected", "rejected"] and not m2.keyframes
+    # no frame with a prior registered: no origin, the camera-only one has no reference
+    assert [(p.status, p.reason) for p in pls] == [("rejected", "no_overlap"),
+                                                   ("kept_at_prior", "too_close")]
+    assert [k.state for k in m2.keyframes] == ["provisional"] and len(m2.cloud.keys) == 0
+    # a later update's first prior frame that passes becomes the origin
+    p = m2.update([frame("a1", base_pose(10))])[0]
+    assert (p.status, p.method) == ("registered", "origin")
 
 
 def test_drifting_priors_scale_monocular_depth_without_heights(tmp_path: Path) -> None:
@@ -781,8 +805,10 @@ def test_a_slipped_odometry_is_reanchored_on_two_agreeing_frames(tmp_path: Path)
     assert not m2._same_drift(f, an.Placement("x", "rejected"), f, p)
 
 
-def test_an_unconfirmed_frame_against_the_map_s_depth(tmp_path: Path,
-                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_unconfirmed_frame_is_stored_not_fused(tmp_path: Path,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """map.md §2: a kept_at_prior frame is stored with its depth, never fused into the cloud,
+    whatever its depth says."""
     monkeypatch.setattr(AnchoredMap, "_depth_place", lambda self, *a: None)
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
@@ -790,26 +816,13 @@ def test_an_unconfirmed_frame_against_the_map_s_depth(tmp_path: Path,
     m = AnchoredMap.load(tmp_path / "m")  # the keyframes' depth from disk
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     T = base_pose(10)
-    far = T.copy()
-    far[:3, 3] += [0.8, 0.0, 0.0]
     n = len(m.cloud.keys)
-    p = m.update([frame("far", T, p=prior(far), rgb=blank)])[0]
-    # its depth contradicts the map's at its prior: kept, stored, not fused (api.md §4)
-    assert (p.status, p.reason) == ("kept_at_prior", "few_features")
-    assert p.map_residual is None and m.keyframes[-1].depth_kind == "none"
-    assert len(m.cloud.keys) == n
-    # contradicted within its sigmas, or agreeing: fused
-    near = T.copy()
-    near[:3, 3] += [0.45, 0.0, 0.0]
-    p = m.update([frame("near", T, p=prior(near, sp=0.4), rgb=blank)])[0]
-    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "sensor"
     p = m.update([frame("same", T, p=prior(T), rgb=blank)])[0]
-    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "sensor"
-    # a keyframe without a depth grid is no reference
-    for k in m.keyframes:
-        k.grid, k.K_grid = None, None
-    p = m.update([frame("none", T, p=prior(far), rgb=blank)])[0]
-    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "sensor"
+    assert (p.status, p.reason) == ("kept_at_prior", "few_features")
+    assert m.keyframes[-1].depth_kind == "sensor" and len(m.cloud.keys) == n
+    p = m.update([frame("m", T, p=prior(T), rgb=blank, depth=False, mono=1.4)])[0]
+    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "mono"
+    assert len(m.cloud.keys) == n and m.scale.heights == []
 
 
 def test_guided_matching_without_candidates_in_reach() -> None:
@@ -839,21 +852,6 @@ def test_a_reanchored_frame_may_still_be_rejected(tmp_path: Path,
     pls = m.update([frame(f"s{k}", T, p=prior(_slip(T, 25.0), "drifting"))
                     for k, T in enumerate(truth)])
     assert [p.status for p in pls] == ["rejected", "rejected"] and calls[0] == 4
-
-
-def test_an_unconfirmed_monocular_frame_is_judged_at_the_map_s_scale(tmp_path: Path) -> None:
-    m = new_map(tmp_path)
-    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
-    blank = np.full((K.height, K.width, 3), 120, np.uint8)
-    T = base_pose(10)
-    # its monocular depth 1.4x off: consistent once scaled
-    p = m.update([frame("m", T, p=prior(T), rgb=blank, depth=False, mono=1.4)])[0]
-    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "mono"
-    p = m.update([frame("f", T, p=prior(base_pose(40, 0.0, 0.6)), rgb=blank, depth=False,
-                        mono=1.4)])[0]
-    # a scale does not explain a wrong view: contradicted, yet within its sigmas and the
-    # monocular tolerance, so still fused
-    assert p.status == "kept_at_prior" and m.keyframes[-1].depth_kind == "mono"
 
 
 def test_depth_registration_edges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -971,7 +969,7 @@ def test_overlapping_frames_correct_the_priors_rotation(tmp_path: Path) -> None:
     is corrected from the images; prior_disagreement_deg reports the largest disagreement."""
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
-    b, c = base_pose(12), base_pose(15)
+    b, c = base_pose(10), base_pose(20)
     pls = m.update([frame("b", b, p=prior(_yaw(b, 5.0), sr=2.0)),
                     frame("c", c, p=prior(_yaw(c, -5.0), sr=2.0))])
     assert [p.status for p in pls] == ["registered", "registered"]
@@ -980,8 +978,8 @@ def test_overlapping_frames_correct_the_priors_rotation(tmp_path: Path) -> None:
     assert an.rot_deg(rel.T @ (b[:3, :3].T @ c[:3, :3])) < 1.0  # the images' relative rotation
     assert pls[1].prior_residual is not None and pls[1].prior_residual[1] > 3.0
     # priors that agree: measured, nothing corrected
-    pls = m.update([frame("d", base_pose(20), p=prior(base_pose(20))),
-                    frame("e", base_pose(22), p=prior(base_pose(22)))])
+    pls = m.update([frame("d", base_pose(25), p=prior(base_pose(25))),
+                    frame("e", base_pose(29), p=prior(base_pose(29)))])
     assert m.prior_disagreement_deg < 1.0
     assert an.view_overlap(np.zeros((0, 3)), np.eye(4), K) == 0.0
 

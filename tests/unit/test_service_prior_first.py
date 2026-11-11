@@ -592,7 +592,7 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
     poses = [base_pose(30 * k) for k in range(6)]
     fr, files = frames_for(client, poses, tag="a", trust=trust)
     client.update("m", fr, files, cameras={"cam": CAM})
-    new = [base_pose(12 + 25 * k) for k in range(5)]
+    new = [base_pose(y) for y in (12, 37, 65, 87, 112)]  # none within 2 deg of a stored one
     shift = np.eye(4)
     shift[0, 3] = slip
     fr, files = frames_for(client, new, tag="b", trust=trust,
@@ -604,7 +604,7 @@ def test_a_warping_update_with_priors_is_rejected_by_the_gate(client: Client, tr
     job = client.update("m", fr, files, accept_if=gate)
     q = job["quality"]
     if slip == 0.0:
-        assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"]
+        assert job["state"] == "committed" and q["accepted"] and d["quality"]["accepted"], (q, job["inputs"])
         assert [i["status"] for i in job["inputs"]] == ["registered"] * 5
         assert q["previous_residuals"]["max_m"] < 0.02
         return
@@ -688,7 +688,7 @@ def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> N
     from types import SimpleNamespace
 
     from oh_my_slam.mapping.anchored import Placement
-    from oh_my_slam.service.prior_first import PARALLAX_MIN, displacement_quality, displacements
+    from oh_my_slam.mapping.quality import PARALLAX_MIN, displacement_quality, displacements
 
     T = np.eye(4)
     far = np.eye(4)
@@ -714,10 +714,10 @@ def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> N
 
 
 def test_a_too_close_origin_and_late_frames_without_one(client: Client) -> None:
-    """The only frame with a prior is too close (its depth image): the origin it would be is
-    rejected, the camera-only frames find no confirmed keyframe, nothing is fused, and the job
-    is ``prior_frames_rejected`` (map.md §1). Its dry run predicts ``too_close`` with the
-    distances, and a bare frame with a prior ``kept_at_prior``."""
+    """The only frame with a prior is too close (its depth image): kept at its prior (api.md §4,
+    reason too_close with the distances), not the origin; the camera-only frames find no
+    confirmed keyframe, nothing is fused, and the map holds the kept frame alone. Its dry run
+    predicts the same, and a bare frame with a prior ``kept_at_prior``."""
     fr, files = frames_for(client, [base_pose(0)], tag="a")
     files["a0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
     nf, nfiles = frames_for(client, [base_pose(10)], tag="n", trust=None, depth=False)
@@ -726,16 +726,18 @@ def test_a_too_close_origin_and_late_frames_without_one(client: Client) -> None:
             cameras={"cam": CAM})
     rows = {r["name"]: r for r in d["frames"]}
     assert (rows["a0"]["predicted_status"], rows["a0"]["predicted_reason"]) == (
-        "rejected", "too_close")
+        "kept_at_prior", "too_close")
     assert rows["a0"]["min_distance_m"] == 0.3 and rows["a0"]["scene_distance_m"] == 0.15
     assert rows["a0"]["too_close"]
     assert (rows["p"]["predicted_status"], rows["p"]["predicted_reason"]) == (
         "kept_at_prior", "plain")
     job = client.update("m", fr + nf, {**files, **nfiles}, cameras={"cam": CAM})
-    assert job["state"] == "rejected"
-    assert job["quality"]["failed_checks"] == ["hard_limit", "prior_frames_rejected"]
-    assert [i["reason"] for i in job["inputs"]] == ["too_close", "no_overlap"]
-    client.get("/api/maps/m", status=404)
+    assert job["state"] == "committed" and job["quality"]["failed_checks"] == []
+    assert [(i["status"], i["reason"]) for i in job["inputs"]] == [
+        ("kept_at_prior", "too_close"), ("rejected", "no_overlap")]
+    assert job["inputs"][0]["scene_distance_m"] == 0.15
+    frames = client.get("/api/maps/m/frames", "Frames")["frames"]
+    assert [f["pose_state"] for f in frames] == ["kept_at_prior"]
 
 
 def test_late_camera_only_frames_too_close(client: Client,
@@ -752,11 +754,14 @@ def test_late_camera_only_frames_too_close(client: Client,
     cv2.rectangle(img, (40, 40), (280, 200), (30, 30, 30), 3)
     nfiles["s"] = jpeg(img)
     nf.append({"name": "s", "image": "s", "camera_id": "cam"})
-    from oh_my_slam.service import prior_first
+    from oh_my_slam.mapping import quality
 
-    monkeypatch.setattr(prior_first, "TOO_CLOSE_INLIERS", 10 ** 9)  # however many points
+    monkeypatch.setattr(quality, "TOO_CLOSE_INLIERS", 10 ** 9)  # however many points
     monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
     client.backend.mono = 0.2
+    d = dry(client, "m", nf[:1], nfiles)  # predicted on the stored map: too close as well
+    assert (d["frames"][0]["predicted_status"], d["frames"][0]["predicted_reason"]) == (
+        "rejected", "too_close")
     job = client.update("m", nf, nfiles)
     client.backend.mono = 2.0
     assert job["inputs"][0]["reason"] == "too_close", job["inputs"]
@@ -785,3 +790,69 @@ def test_the_dry_run_scale_of_a_new_map() -> None:
     src, sig = _scale(None, None, [fr(h=0.5), fr(cam_h=1.0), fr()])
     assert src == "camera_height" and 0 < sig < 0.1
     assert _scale({"scale_source": "depth", "scale_sigma_rel": 0.02}, None, []) == ("depth", 0.02)
+
+
+def test_a_stored_kept_frame_is_re_registered_by_a_later_job(client: Client) -> None:
+    """map.md §2: a frame kept at its prior (nothing mapped there yet) is confirmed by a later
+    job whose frames reach it: fused in that version and listed in quality.reregistered, its
+    move out of gauge_shift and previous_residuals. A dry run predicts it with the same test."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    fr, files = frames_for(client, [base_pose(180)], tag="k")
+    job = client.update("m", fr, files)
+    assert (job["inputs"][0]["status"], job["quality"]["reregistered"]) == ("kept_at_prior", [])
+    chain = [base_pose(y) for y in (65, 95, 125, 155, 185)]
+    fr, files = frames_for(client, chain, tag="c")
+    d = dry(client, "m", fr, files)
+    assert isinstance(d["quality"]["reregistered"], list)
+    job = client.update("m", fr, files)
+    assert [i["status"] for i in job["inputs"]] == ["registered"] * 5, job["inputs"]
+    q = job["quality"]
+    assert [e["name"] for e in q["reregistered"]] == ["k0"]
+    assert q["previous_residuals"]["count"] == 2  # a0, a1: the re-registered one left out
+    frames = {f["name"]: f for f in client.get("/api/maps/m/frames", "Frames")["frames"]}
+    assert frames["k0"]["pose_state"] == "fused"
+    # the next dry run has nothing kept left to predict
+    fr, files = frames_for(client, [base_pose(200)], tag="e")
+    assert dry(client, "m", fr, files)["quality"]["reregistered"] == []
+
+
+def test_pose_duplicates_name_the_frame_they_repeat(client: Client) -> None:
+    """api.md §4: a registered pose within 0.02 m and 2 deg of a stored confirmed keyframe of
+    the same camera, or of an earlier registered frame of the request, is a duplicate naming
+    that frame; the dry run predicts it."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    fr, files = frames_for(client, [base_pose(0.5), base_pose(60), base_pose(60.5)], tag="b")
+    d = dry(client, "m", fr, files)
+    rows = [(r["predicted_reason"], r.get("duplicate_of")) for r in d["frames"]]
+    assert rows[0] == ("duplicate", "a0")
+    job = client.update("m", fr, files)
+    got = [(i["reason"], i.get("duplicate_of")) for i in job["inputs"]]
+    assert got == [("duplicate", "a0"), (None, None), ("duplicate", "b1")]
+
+
+def test_a_too_close_camera_only_origin_leaves_no_map(client: Client,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without priors, a first frame too close (its depth image) cannot be the origin, and
+    MapAnything's frames find no confirmed keyframe: nothing registered, no map."""
+    monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
+    fr, files = frames_for(client, [base_pose(0), base_pose(20)], tag="n", trust=None)
+    files["n0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
+    job = client.update("m", fr, files, cameras={"cam": CAM})
+    assert job["state"] == "rejected" and job["quality"]["failed_checks"] == ["hard_limit"]
+    assert [i["reason"] for i in job["inputs"]] == ["too_close", "no_overlap"]
+
+
+@pytest.mark.parametrize("engine", ["geometric", "mapanything"])
+def test_a_camera_only_frame_at_a_stored_pose_is_a_duplicate(
+        client: Client, monkeypatch: pytest.MonkeyPatch, engine: str) -> None:
+    """MapAnything's frames too (api.md §4): a camera-only frame registered at a stored
+    keyframe's pose is a duplicate naming it."""
+    monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", engine)
+    fr, files = frames_for(client, [base_pose(0), base_pose(35)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    fr, files = frames_for(client, [base_pose(35)], tag="z", trust=None)
+    job = client.update("m", fr, files)
+    assert (job["inputs"][0]["reason"], job["inputs"][0].get("duplicate_of")) == (
+        "duplicate", "a1"), job["inputs"]

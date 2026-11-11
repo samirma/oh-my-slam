@@ -202,6 +202,7 @@ ROOM_FLOOR_M2 = 3.0
 SUPPORT_AREA_RATIO = 1.0  # a support object's footprint is at least the object's
 SUPPORT_SAME_M = 0.01
 SUPPORT_REACH_M = 0.30  # surfaces this near in gap: the larger one supports
+VIEW_NEAR_M = 0.05  # a point nearer a camera than this is not in its view (detection_votes)
 CONTAINERS = frozenset({
     "bowl", "box", "cardboard box", "basket", "bin", "trash can", "recycling bin", "bucket",
     "drawer", "cup", "mug", "pot", "pan", "sink", "tray", "crate", "container", "storage box",
@@ -866,6 +867,9 @@ class ObjectMap:
         self.version = 0
         self.floor_z: float | None = None  # the floor of the latest update (box grounding)
         self.floor_sigma = FLOOR_SIGMA_DEFAULT_M  # its height sigma (the floor band)
+        # the image-confirmed keyframes (id, T_map_cam, intrinsics) the votes count views over
+        # (``detection_votes``), set by ``finish``
+        self.cameras: list[tuple[str, Array, Intrinsics]] = []
 
     @staticmethod
     def load(root: Path) -> ObjectMap:
@@ -1081,9 +1085,12 @@ class ObjectMap:
     # -- what the cloud says ------------------------------------------------------------------
 
     def finish(self, xyz: Array, top_z: float | None, version: int,
-               viewpoints: Array | None = None, floor_z: float | None = None) -> None:
+               viewpoints: Array | None = None, floor_z: float | None = None,
+               cameras: list[tuple[str, Array, Intrinsics]] | None = None) -> None:
         """Surfaces from the fused cloud (the points facing up, seen from ``viewpoints``), then
-        every listed object's relations, on its box as fitted (it rests on its support anew)."""
+        every listed object's relations, on its box as fitted (it rests on its support anew).
+        ``cameras``: the map's image-confirmed keyframes, which ``detection_votes`` counts."""
+        self.cameras = list(cameras or [])
         self.surfaces = find_surfaces(xyz, top_z, viewpoints)
         self.surface_ids, self.next_surface_id = assign_surface_ids(
             self.surfaces, self.surface_ids, self.next_surface_id)
@@ -1186,6 +1193,7 @@ class ObjectMap:
                 "size_m": o.box.size.round(4).tolist(), "yaw_deg": yaw_deg(o.box.yaw_deg),
                 "sigma_centre_m": round(sigma_centre(o), 4), "extent_seen": extent_seen(o),
                 "mean_rgb": [round(v) for v in mean_rgb(o)],
+                "detection_votes": detection_votes(o, self.cameras),
                 "state": o.state,
                 "moved_from_m": o.moved_from, "first_seen_version": o.first_seen_version,
                 "last_seen_version": o.last_seen_version,
@@ -1204,6 +1212,33 @@ def listed(o: MapObject) -> bool:
     only as a leaf (``detect.door_leaf``, map.md §5)."""
     return o.published and o.box is not None and float(np.max(o.box.size)) >= MIN_OBJECT_M \
         and (o.label != DOOR_LABEL or door_leaf(o.box.size))
+
+
+def in_view(X: Array, T: Array, K: Intrinsics) -> bool:
+    """Whether the camera ``T`` (``T_map_cam``) with intrinsics ``K`` has the map point ``X``
+    in its view frustum: in front of it and inside its image."""
+    pc = (np.asarray(X, np.float64) - T[:3, 3]) @ T[:3, :3]
+    if pc[2] <= VIEW_NEAR_M:
+        return False
+    u, v = K.fx * pc[0] / pc[2] + K.cx, K.fy * pc[1] / pc[2] + K.cy
+    return bool(0.0 <= u < K.width and 0.0 <= v < K.height)
+
+
+def detection_votes(o: MapObject, cameras: list[tuple[str, Array, Intrinsics]]
+                    ) -> list[dict[str, Any]]:
+    """``detection_votes`` (map.md §5): per label, the keyframes that detected the object as it
+    over the image-confirmed keyframes whose view frustum holds its box centre, detected or not
+    (``cameras``; its sightings come from confirmed keyframes only, and every keyframe that
+    detected it counts as seeing it), highest share first."""
+    frames: dict[str, set[str]] = {}
+    for s in o.sightings:
+        frames.setdefault(s.label, set()).add(s.kid)
+    seen = set().union(*frames.values()) if frames else set()
+    if o.box is not None:
+        seen |= {kid for kid, T, K in cameras if in_view(o.box.centre, T, K)}
+    n = max(len(seen), 1)
+    out = [{"label": k, "share": round(min(len(v) / n, 1.0), 4)} for k, v in frames.items()]
+    return sorted(out, key=lambda e: (-e["share"], e["label"]))
 
 
 def relief(o: MapObject) -> str | None:

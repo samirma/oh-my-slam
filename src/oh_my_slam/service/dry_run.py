@@ -15,8 +15,13 @@ It runs synchronously and writes nothing (no camera, version, job or mapper file
 * its links to its neighbours in the request (the previous and the next frame): the inliers of a
   fundamental matrix (RANSAC) on their ratio-test SIFT matches;
 * the predicted status (``registered``, ``kept_at_prior`` or ``rejected``) and reason, with
-  ``too_close`` its distances, the predicted quality report with its gate (``accept_if``), the
-  predicted scale and the predicted durations from the measured per-frame timings.
+  ``too_close`` its distances and with ``duplicate`` the frame it duplicates (a predicted pose
+  within the duplicate limits of a stored confirmed keyframe or of an earlier predicted
+  registered frame of its camera), the predicted quality report with its gate (``accept_if``)
+  and the stored kept frames the update would re-register (``reregistered``: the update's test,
+  ``AnchoredMap.reregister``, on the read-only copy with the predicted frames added at their
+  predicted poses, with their depth images when they have one), the predicted scale and the
+  predicted durations from the measured per-frame timings.
 
 Its inference requests (monocular depth, gravity) are sent as interactive
 (``Backend.interactive``): the inference server serves them before a job's fusion requests
@@ -48,19 +53,21 @@ from oh_my_slam.mapping.anchored import (
     Features,
     Placement,
     _prior_sigmas,
+    duplicate_limits,
     features,
     match,
     pose_residual,
     unit,
 )
-from oh_my_slam.service.prior_first import (
-    LOW_CONFIDENCE_SIGMA_M,
-    _frame_in,
+from oh_my_slam.mapping.quality import (
     displacement_quality,
     displacements,
-    none_engine,
+    gate,
+    reregistered,
+    residual_stats,
     too_close,
 )
+from oh_my_slam.service.prior_first import LOW_CONFIDENCE_SIGMA_M, _frame_in, none_engine
 
 if TYPE_CHECKING:
     from oh_my_slam.service.update import Updater, UpdateWork, _Frame
@@ -82,8 +89,6 @@ def link(a: Features, b: Features) -> int:
 
 def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     """The ``DryRun`` body of an update request."""
-    from oh_my_slam.service.update import gate, residual_stats
-
     up = copy.copy(up)
     up.backend = up.backend.interactive()  # served ahead of fusion (inference.md)
     store = up.store
@@ -110,9 +115,19 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             links = list(pool.map(lambda k: _neighbours(k, frames, feats), range(len(frames))))
         out, kept, prior_res = [], [], []
         first_kept = True
+        earlier: list[tuple[str, str, Any]] = []  # predicted registered: camera, name, pose
         for k, fr in enumerate(frames):
             row, pl = _frame(fr, links[k], placed.get(fr.work.index), am is not None,
                              prev is None, first_kept)
+            if row["predicted_status"] == "registered" and am is not None and pl is not None \
+                    and pl.T is not None:
+                dup = am.duplicate_of(fr.work.camera_id, pl.T) or _earlier_duplicate(
+                    fr.work.camera_id, pl.T, earlier)
+                if dup is not None:
+                    row.update(predicted_status="rejected", predicted_reason="duplicate",
+                               duplicate_of=dup)
+                else:
+                    earlier.append((fr.work.camera_id, fr.work.name, pl.T))
             if row["predicted_status"] != "rejected":
                 first_kept = False
                 kept.append((row["predicted_status"], pl))
@@ -130,6 +145,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                     am._checked(_frame_in(ins[idx], None), pl, mine)
             disagreement = am.prior_disagreement_deg
         source, sigma = _scale(prev, am, frames)
+        again = [] if am is None else _reregistered(am, frames, feats, placed, out)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     registered = [pl for status, pl in kept if status == "registered"]
@@ -145,6 +161,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                                                   "scale_ratio": 1.0},
         **displacement_quality(moved),
         "prior_disagreement_deg": disagreement,
+        "reregistered": again,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
         else None,
@@ -164,6 +181,43 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                 r["predicted_status"] == "rejected" for r in trusted)),
             "scale_source": source, "scale_sigma_rel": round(sigma, 5),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
+
+
+def _earlier_duplicate(camera_id: str, T: Any, earlier: list[tuple[str, str, Any]]
+                       ) -> str | None:
+    """An earlier predicted registered frame of the request, of camera ``camera_id``, within
+    the duplicate limits of pose ``T`` (api.md §4), or None."""
+    lim_m, lim_deg = duplicate_limits()
+    for cid, name, U in earlier:
+        dp, dr = pose_residual(U, T)
+        if cid == camera_id and dp <= lim_m and dr <= lim_deg:
+            return name
+    return None
+
+
+def _reregistered(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],
+                  placed: dict[int, Placement], rows: list[dict[str, Any]]
+                  ) -> list[dict[str, Any]]:
+    """The predicted ``quality.reregistered`` (map.md §2): the frames predicted registered are
+    added to the read-only copy at their predicted poses (their depth image, else no depth),
+    then the stored kept keyframes they overlap are placed again as the update does
+    (``AnchoredMap.reregister``). Nothing is written."""
+    kept = [k for k in am.keyframes if not k.usable()]
+    if not kept:
+        return []
+    added = []
+    for fr, row in zip(frames, rows, strict=True):
+        pl = placed.get(fr.work.index)
+        if row["predicted_status"] != "registered" or pl is None or pl.T is None \
+                or pl.sigma_pos_m is None or fr.work.index not in feats:
+            continue
+        f = _frame_in(fr, None)
+        K = f.K
+        depth, kind = (f.depth, "sensor") if f.depth is not None \
+            and bool(np.count_nonzero(f.depth > 0)) else (
+            np.zeros((K.height, K.width), np.float32), "none")
+        added.append(am.add(f, feats[fr.work.index], copy.copy(pl), depth, K, kind, None))
+    return reregistered(am.reregister(kept, added))
 
 
 def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Frame]
@@ -276,15 +330,22 @@ def _frame(fr: _Frame, neighbours: list[dict[str, Any]], pl: Placement | None, a
             and max([int(n["inliers"]) for n in neighbours] or [0]) < MIN_INLIERS:
         # a new map's frame without prior holds only by its links to the request's frames
         status, reason = "rejected", "no_overlap"
-    if status != "rejected" and too_close(fr.scene_m, 0 if map_inliers is None else map_inliers):
-        status, reason = "rejected", "too_close"  # the distance limit (api.md §4)
+    close = too_close(fr.scene_m, 0 if map_inliers is None else map_inliers)
+    if close and fr.reason is None and fr.work.trust in ("metric", "drifting"):
+        # the distance limit (api.md §4): a frame with a prior is kept at it, its reason the
+        # check its image failed, else too_close
+        status, reason = "kept_at_prior", fr.unconfirmed or "too_close"
+    elif close and status != "rejected":
+        status, reason = "rejected", "too_close"
     row = {"name": fr.work.name, "features": 0 if m is None else m.features,
            "map_inliers": map_inliers, "neighbour_inliers": neighbours,
            "plain": m is not None and m.texture < checks.PLAIN_TEXTURE,
            "too_close": fr.scene_m is not None and fr.scene_m < TOO_CLOSE_M,
            "predicted_status": status, "predicted_reason": None if status == "registered"
            else reason}
-    if reason == "too_close" and status == "rejected":
+    if reason == "too_close" and status != "registered":
         row["min_distance_m"] = TOO_CLOSE_M
         row["scene_distance_m"] = round(fr.scene_m or 0.0, 3)
+    if reason == "duplicate" and status == "rejected":
+        row["duplicate_of"] = fr.duplicate_of or fr.work.name
     return row, pl

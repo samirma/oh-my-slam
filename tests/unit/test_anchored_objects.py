@@ -780,3 +780,37 @@ def test_a_low_score_detection_needs_a_second_view(tmp_path: Path) -> None:
     w.dets = [Detection(d.label, 0.25, d.source, d.mask, d.box) for d in w.dets]
     om.update([w], 2, 0.0)
     assert [o["label"] for o in om.records()["objects"]] == ["plate"]
+
+
+def test_detection_votes_over_the_frames_that_see_the_centre() -> None:
+    """map.md §5: per label, the frames that gave it over the confirmed frames whose frustum
+    holds the box centre (detected or not), highest share first."""
+    o = MapObject(3, {"cup": 1.0, "mug": 0.5})
+
+    def sight(kid: str, label: str) -> Sighting:
+        return Sighting(kid, 1, [0, 0, 0], 1.0, 100, [False] * 4, [1.0, 0.0, 0.0], [-1, 0, 0],
+                        0.01, [1.0, 2.0, 3.0], label, 0.5)
+
+    o.sightings = [sight("a", "cup"), sight("b", "cup"), sight("b", "cup"), sight("c", "mug")]
+    assert ao.detection_votes(o, []) == [{"label": "cup", "share": 0.6667},
+                                         {"label": "mug", "share": 0.3333}]
+    o.box = Box(np.zeros(3), np.ones(3) * 0.1, 0.0)
+    looking = look_at((-1.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    away = look_at((-1.0, 0.0, 0.0), (-2.0, 0.0, 0.0))
+    side = look_at((-1.0, 0.0, 0.0), (-1.0, 3.0, 0.0))  # the centre left of its image
+    cams = [("d", looking, K_TABLE), ("e", away, K_TABLE), ("a", looking, K_TABLE),
+            ("f", side, K_TABLE)]
+    assert ao.in_view(np.zeros(3), looking, K_TABLE) and not ao.in_view(np.zeros(3), away,
+                                                                         K_TABLE)
+    assert not ao.in_view(np.zeros(3), side, K_TABLE)
+    votes = ao.detection_votes(o, cams)  # seen by a, b, c, d: 4 frames
+    assert votes == [{"label": "cup", "share": 0.5}, {"label": "mug", "share": 0.25}]
+    assert ao.detection_votes(MapObject(4, {}), cams) == []
+
+
+def test_records_carry_detection_votes() -> None:
+    rec, _ = _first()
+    for o in rec["objects"]:
+        votes = o["detection_votes"]
+        assert votes and sum(v["share"] for v in votes) <= 1.0 + 1e-9
+        assert votes == sorted(votes, key=lambda v: (-v["share"], v["label"]))
