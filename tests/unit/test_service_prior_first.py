@@ -711,3 +711,77 @@ def test_displacements_count_only_the_rotation_of_a_frame_turned_in_place() -> N
     assert displacement_quality([(None, 1.0)]) == {"max_displacement_m": None,
                                                    "max_displacement_deg": 1.0}
     assert displacement_quality([]) == {"max_displacement_m": None, "max_displacement_deg": None}
+
+
+def test_a_too_close_origin_and_late_frames_without_one(client: Client) -> None:
+    """The only frame with a prior is too close (its depth image): the origin it would be is
+    rejected, the camera-only frames find no confirmed keyframe, nothing is fused, and the job
+    is ``prior_frames_rejected`` (map.md §1). Its dry run predicts ``too_close`` with the
+    distances, and a bare frame with a prior ``kept_at_prior``."""
+    fr, files = frames_for(client, [base_pose(0)], tag="a")
+    files["a0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
+    nf, nfiles = frames_for(client, [base_pose(10)], tag="n", trust=None, depth=False)
+    bare = {"name": "p", "image": "p", "camera_id": "cam", "prior": prior(base_pose(5))}
+    d = dry(client, "m", fr + nf + [bare], {**files, **nfiles, "p": plain(320, 240)},
+            cameras={"cam": CAM})
+    rows = {r["name"]: r for r in d["frames"]}
+    assert (rows["a0"]["predicted_status"], rows["a0"]["predicted_reason"]) == (
+        "rejected", "too_close")
+    assert rows["a0"]["min_distance_m"] == 0.3 and rows["a0"]["scene_distance_m"] == 0.15
+    assert rows["a0"]["too_close"]
+    assert (rows["p"]["predicted_status"], rows["p"]["predicted_reason"]) == (
+        "kept_at_prior", "plain")
+    job = client.update("m", fr + nf, {**files, **nfiles}, cameras={"cam": CAM})
+    assert job["state"] == "rejected"
+    assert job["quality"]["failed_checks"] == ["hard_limit", "prior_frames_rejected"]
+    assert [i["reason"] for i in job["inputs"]] == ["too_close", "no_overlap"]
+    client.get("/api/maps/m", status=404)
+
+
+def test_late_camera_only_frames_too_close(client: Client,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """A camera-only frame registered by MapAnything is still subject to the distance limit;
+    a suspicious one has its scene distance measured first."""
+    fr, files = frames_for(client, [base_pose(0), base_pose(30)], tag="a")
+    client.update("m", fr, files, cameras={"cam": CAM})
+    nf, nfiles = frames_for(client, [base_pose(15)], tag="n", trust=None)
+    nfiles["n0d"] = png_depth(np.full((240, 320), 0.15, np.float32))
+    import cv2
+
+    img = np.full((240, 320, 3), 128, np.uint8)
+    cv2.rectangle(img, (40, 40), (280, 200), (30, 30, 30), 3)
+    nfiles["s"] = jpeg(img)
+    nf.append({"name": "s", "image": "s", "camera_id": "cam"})
+    from oh_my_slam.service import prior_first
+
+    monkeypatch.setattr(prior_first, "TOO_CLOSE_INLIERS", 10 ** 9)  # however many points
+    monkeypatch.setenv("OH_MY_SLAM_NONE_ENGINE", "mapanything")
+    client.backend.mono = 0.2
+    job = client.update("m", nf, nfiles)
+    client.backend.mono = 2.0
+    assert job["inputs"][0]["reason"] == "too_close", job["inputs"]
+    assert job["inputs"][1]["reason"] in ("few_features", "too_close")
+
+
+def test_the_dry_run_scale_of_a_new_map() -> None:
+    from types import SimpleNamespace
+
+    from oh_my_slam.service.dry_run import _scale
+
+    def fr(prior: Any = None, depth: Any = None, h: Any = None, cam_h: Any = None) -> Any:
+        trust = "none" if prior is None else prior["trust"]
+        return SimpleNamespace(reason=None, depth_m=depth, work=SimpleNamespace(
+            trust=trust, prior=prior, height_m=h, height_sigma_m=None),
+            cam=SimpleNamespace(height_above_floor_m=cam_h, height_sigma_m=0.01))
+
+    def P(x: float) -> dict[str, Any]:
+        T = np.eye(4)
+        T[0, 3] = x
+        return {"trust": "metric", "T_map_cam": T.tolist(), "sigma_pos_m": 0.02}
+
+    assert _scale(None, None, [fr(P(0)), fr(P(1.0))])[0] == "priors"
+    assert _scale(None, None, [fr(P(0)), fr(P(0.1))])[0] == "monocular"  # too short a span
+    assert _scale(None, None, [fr(depth=np.ones((2, 2)))]) == ("depth", 0.01)
+    src, sig = _scale(None, None, [fr(h=0.5), fr(cam_h=1.0), fr()])
+    assert src == "camera_height" and 0 < sig < 0.1
+    assert _scale({"scale_source": "depth", "scale_sigma_rel": 0.02}, None, []) == ("depth", 0.02)

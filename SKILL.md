@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.1) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; health and timings."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.2) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; health and timings."
 ---
 
 # oh-my-slam API
@@ -8,7 +8,7 @@ description: "Short reference of the oh-my-slam HTTP API (schema oms/2.1) for th
 Generated from the API definitions (`python -m oh_my_slam.service.skill`); never edit it by hand. The full contract is `GET /api/openapi.json` (OpenAPI 3.1, its schemas those of `specs/api.schema.json`) and `specs/api.md`.
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
-* Every JSON body carries `schema` (`oms/2.1`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
+* Every JSON body carries `schema` (`oms/2.2`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
 * Implemented groups (`GET /api/health` → `capabilities`): O1, O3-jobs, O4, O5, O6, O8, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
@@ -23,12 +23,12 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `GET /api/maps/{name}` | Map summary |  | 200 [`MapSummary`] | `version` |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses |  | 200 [`Frames`] | `version` |
 | `GET /api/maps/{name}/objects` | Object records and support surfaces |  | 200 [`Objects`] | `version` |
-| `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m` |
+| `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m`, `height_cap_m` |
 | `GET /api/maps/{name}/points` | Fused points inside a box |  | 200 [`Points`] | `version`, `min`, `max`, `voxel_m`, `max_points` |
 | `GET /api/maps/{name}/birdseye.png` | Bird's-eye image: the cloud, the objects' footprints with their ids and the keyframe cameras seen from above; its text metadata records map_version and pixel_to_map |  | 200 `image/png` | `version` |
-| `GET /api/maps/{name}/birdseye` | The bird's-eye image's metadata: size and pixel_to_map |  | 200 [`Birdseye`] | `version` |
+| `GET /api/maps/{name}/birdseye` | The bird's-eye image's metadata: size, pixel_to_map and the version's scale_source and scale_sigma_rel |  | 200 [`Birdseye`] | `version` |
 | `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] (multipart: part `request` + file parts) | 200 [`Locate`] |  |
-| `GET /api/maps/{name}/pose` | Last recorded pose |  | 200 [`Pose`] |  |
+| `GET /api/maps/{name}/pose` | Last recorded pose, with the version it was located in and that version's scale; takes no ?version (400 invalid_request, details.field version) |  | 200 [`Pose`] |  |
 | `DELETE /api/maps/{name}` | Delete the map and its versions |  | 204 |  |
 
 An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with `?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate.

@@ -967,3 +967,61 @@ def test_cameras_are_recorded_by_the_commit_and_may_come_from_a_pending_job(
     with pytest.raises(ApiError) as e:
         updater._frames(w)  # type: ignore[attr-defined]
     assert e.value.code == "camera_conflict"  # the same values, another mask
+
+
+def test_frames_with_a_prior_the_mapper_does_not_place_are_kept_at_it(client: Client) -> None:
+    """The mapper's engine (api.md §4): a frame with a prior that the mapper does not register is
+    kept at its prior — a drifting one mapped by the update's drift estimate — unless it is too
+    close; the gate's own checks each fail on their own field (map.md §4)."""
+    drift = lambda i, T: {"trust": "drifting", "T_map_cam": T.tolist(),  # noqa: E731
+                          "sigma_pos_m": 0.05, "sigma_rot_deg": 2.0}
+    frames, files, truth = frames_of(client, 4, prior=drift)
+    files["lost"] = textured(91)  # unknown to the fake mapper: not placed
+    frames.append({"name": "lost", "image": "lost", "camera_id": "cam",
+                   "prior": drift(4, WORLD[4])})
+    files["lost2"] = textured(93)
+    frames.append({"name": "lost2", "image": "lost2", "camera_id": "cam",
+                   "prior": {"trust": "metric", "T_map_cam": WORLD[5].tolist()}})
+    files["close"], files["cd"] = textured(92), png16(np.full((240, 320), 150))
+    frames.append({"name": "close", "image": "close", "camera_id": "cam", "depth": "cd",
+                   "prior": drift(5, WORLD[5])})
+    job = client.update("m", frames, files, {"cam": CAMERA},
+                        accept_if={"max_displacement_m": 0.0, "max_displacement_deg": 0.0,
+                                   "max_prior_disagreement_deg": 0.0})
+    st = {i["name"]: (i["status"], i["reason"]) for i in job["inputs"]}
+    assert st["lost"] == ("kept_at_prior", "no_overlap") and st["close"] == ("rejected", "too_close")
+    lost2 = next(i for i in job["inputs"] if i["name"] == "lost2")
+    assert lost2["T_map_cam"] == WORLD[5].round(6).tolist() and lost2["sigma_pos_m"] == 0.05
+    lost = next(i for i in job["inputs"] if i["name"] == "lost")
+    assert centre_error(lost["T_map_cam"], WORLD[4]) < 1e-3 and lost["prior_residual_m"] == 0.0
+    q = job["quality"]
+    assert q["max_displacement_m"] == 0.0 and job["state"] == "committed"
+    frames_read = client.get("/api/maps/m/frames", "Frames")["frames"]
+    assert frames_read[-1]["pose_state"] == "kept_at_prior"
+    from oh_my_slam.service.update import gate
+
+    base = {**q, "max_displacement_m": 0.2, "max_displacement_deg": 3.0,
+            "prior_disagreement_deg": 4.0}
+    got = gate(dict(base), True, {"max_displacement_m": 0.1, "max_displacement_deg": 2.0,
+                                  "max_prior_disagreement_deg": 1.0})
+    assert got["failed_checks"] == ["max_displacement_m", "max_displacement_deg",
+                                    "max_prior_disagreement_deg"]
+    nulls = gate({**base, "max_displacement_m": None, "max_displacement_deg": None}, True,
+                 {"max_displacement_m": 0.1, "max_displacement_deg": 2.0})
+    assert nulls["accepted"]  # a null value passes
+
+
+def test_old_versions_read_kept_frames_as_kept_at_prior(client: Client) -> None:
+    from oh_my_slam.service.store import POSE_STATES
+
+    frames, files, _ = frames_of(client, 2)
+    client.update("m", frames, files, {"cam": CAMERA})
+    s = client.service.store
+    rec = {k: v for k, v in s.version("m").items() if k not in ("version", "created_at")}
+    rows = [dict(r) for r in rec["frames"]]
+    rows[1]["pose_state"] = "provisional"  # a kept frame, as oms/2.1 named it
+    rec.pop("pose_states", None)
+    n = s.commit("m", {**rec, "frames": rows}, None)
+    assert [r["pose_state"] for r in s.version("m", n)["frames"]] == ["fused", "kept_at_prior"]
+    m = s.commit("m", {**rec, "frames": rows, "pose_states": POSE_STATES}, None)
+    assert s.version("m", m)["frames"][1]["pose_state"] == "provisional"  # the O3 state

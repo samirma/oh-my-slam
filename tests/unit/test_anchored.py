@@ -955,3 +955,70 @@ def test_keyframes_load_once_across_threads_and_incomplete_ones_are_skipped(
     m4 = AnchoredMap.load(m.root)
     corr = m4._correspondences(feats[0], m4.keyframes)
     assert len(corr.uv) == 0 and all(k.feats is None for k in m4.keyframes)
+
+
+def _yaw(T: np.ndarray, deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    out = T.copy()
+    Rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0, 0, 1]])
+    out[:3, :3] = Rz @ T[:3, :3]
+    return out
+
+
+def test_overlapping_frames_correct_the_priors_rotation(tmp_path: Path) -> None:
+    """map.md §1: two overlapping frames whose priors' relative rotation disagrees with the
+    images' by more than 3 of the priors' combined rotation sigmas: the later frame's rotation
+    is corrected from the images; prior_disagreement_deg reports the largest disagreement."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    b, c = base_pose(12), base_pose(15)
+    pls = m.update([frame("b", b, p=prior(_yaw(b, 5.0), sr=2.0)),
+                    frame("c", c, p=prior(_yaw(c, -5.0), sr=2.0))])
+    assert [p.status for p in pls] == ["registered", "registered"]
+    assert m.prior_disagreement_deg == pytest.approx(10.0, abs=1.0)
+    rel = pls[0].T[:3, :3].T @ pls[1].T[:3, :3]  # type: ignore[union-attr]
+    assert an.rot_deg(rel.T @ (b[:3, :3].T @ c[:3, :3])) < 1.0  # the images' relative rotation
+    assert pls[1].prior_residual is not None and pls[1].prior_residual[1] > 3.0
+    # priors that agree: measured, nothing corrected
+    pls = m.update([frame("d", base_pose(20), p=prior(base_pose(20))),
+                    frame("e", base_pose(22), p=prior(base_pose(22)))])
+    assert m.prior_disagreement_deg < 1.0
+    assert an.view_overlap(np.zeros((0, 3)), np.eye(4), K) == 0.0
+
+
+def test_a_supported_hypothesis_near_the_prior(tmp_path: Path) -> None:
+    """api.md §4: the matches that reproject at the prior give a hypothesis of their own; it
+    counts when supported and within 3 prior sigmas, and a frame whose image pose conflicts is
+    then registered on it."""
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    T = base_pose(15)
+    f = frame("n", T)
+    feats = an.features(f.rgb)
+    cands = m._candidates(f, T, None)
+    corr = m._correspondences(feats, cands, (T, 0.02, 1.0), K)
+    got = m._near_prior(f, corr, cands, T, 0.02, 1.0, 10)
+    assert got is not None and an.pose_residual(got[0].T, T)[0] < 0.06
+    assert m._near_prior(f, corr, cands, T, 0.02, 1.0, 10 ** 6) is None  # unsupported
+    far = T.copy()
+    far[:3, 3] += [0.5, 0.0, 0.0]
+    assert m._near_prior(f, corr, cands, far, 0.02, 1.0, 10) is None  # nothing reprojects there
+
+
+def test_a_conflict_with_a_supported_hypothesis_near_the_prior_registers(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    m = new_map(tmp_path)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
+    T = base_pose(15)
+    off = T.copy()
+    off[:3, 3] += [0.3, 0.0, 0.0]
+    seen: list[Any] = []
+    real = AnchoredMap._near_prior
+
+    def near(self: AnchoredMap, f: FrameIn, corr: Any, cands: Any, T0: Any, *a: Any) -> Any:
+        seen.append(T0)
+        return real(self, f, corr, cands, T, 0.02, 1.0, 10)  # a hypothesis at the truth
+
+    monkeypatch.setattr(AnchoredMap, "_near_prior", near)
+    p = m.update([frame("n", T, p=prior(off))])[0]
+    assert seen and p.status == "registered" and p.inliers > 0

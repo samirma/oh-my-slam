@@ -2062,8 +2062,8 @@ class AnchoredMap:
             if dis > K_SIGMA * math.hypot(sr, _prior_sigmas(g.prior)[1]):
                 T = pl.T.copy()
                 T[:3, :3] = q.T[:3, :3] @ img_rel
-                if pl.prior_ref is not None:
-                    pl.prior_residual = pose_residual(T, pl.prior_ref)
+                assert pl.prior_ref is not None  # a frame its image pose and prior placed
+                pl.prior_residual = pose_residual(T, pl.prior_ref)
                 pl.map_residual = _displacement(T, pl.align_T, pl.method == "rotation")
                 pl.T = T
         mine.append((f, pl))
