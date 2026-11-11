@@ -649,7 +649,7 @@ def test_grid_cell_cap(rooms_map: Nav, monkeypatch: pytest.MonkeyPatch) -> None:
     from oh_my_slam.service import nav as navmod
 
     monkeypatch.setattr(navmod, "MAX_GRID_CELLS", 100)
-    doc = rooms_map.get("/api/maps/house/grid", status=400)
+    doc = rooms_map.get("/api/maps/house/grid?cell_m=0.04", status=400)
     assert doc["error"]["details"]["field"] == "cell_m"
 
 
@@ -772,3 +772,26 @@ def test_a_failed_read_answer_never_fails_the_commit(nav: Nav) -> None:
     frames, files = scene_frames(nav, rooms.two_rooms(), rooms.tour()[:3])
     assert nav.update("house", frames, files, {"cam": CAM320})["state"] == "committed"
     assert nav.get("/api/maps/house/objects", "Objects")["map_version"] == 1
+
+
+def test_derived_versions_kept_prepared_and_reloaded(rooms_map: Nav) -> None:
+    """A version published while its commit finishes is the one preparation derived; an entry
+    that is already the pinned latest stays pinned; a version dropped from memory loads again,
+    its objects answer from disk."""
+    s = rooms_map.service
+    d = s.derived
+    assert d is not None
+    dv = d.get("house", 1)
+    key = next(iter(d._latest.values()))[0]
+    d._keep(key, dv, latest=False)  # already the latest: stays pinned, not cached twice
+    assert key not in d._cache and d.get("house", 1) is dv
+    d._latest.clear()
+    d._cache.clear()
+    d._prepared[("house", 1)] = dv  # as between preparation and the commit listener
+    assert d.get("house", 1) is dv
+    d._prepared.clear()
+    d._latest.clear()
+    d._cache.clear()
+    again = d.get("house", 1)
+    assert again is not dv and ("objects",) not in again._answers
+    assert rooms_map.get("/api/maps/house/objects", "Objects")["map_version"] == 1  # from disk

@@ -295,15 +295,14 @@ class Derived:
 
     def _load(self, name: str, n: int, record: dict[str, Any]) -> DerivedVersion:
         vdir = self.dir(name) / str(n)
-        if not (vdir / "meta.json").exists():
-            with self._version_lock(name, n):
-                if not (vdir / "meta.json").exists():
-                    if self.store.mapper_version(name) > n:
-                        raise ApiError("version_gone", f"version {n} of map {name!r} is no "
-                                       "longer kept: its mapper map was replaced before it was "
-                                       "derived", {"map": name, "version": n,
-                                                   "latest_version": self.store.latest(name)})
-                    self._derive(name, n, record, vdir)
+        with self._version_lock(name, n):  # held by a derivation of this version only
+            if not (vdir / "meta.json").exists():
+                if self.store.mapper_version(name) > n:
+                    raise ApiError("version_gone", f"version {n} of map {name!r} is no longer "
+                                   "kept: its mapper map was replaced before it was derived",
+                                   {"map": name, "version": n,
+                                    "latest_version": self.store.latest(name)})
+                self._derive(name, n, record, vdir)
         return DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
                               vdir, self._stands(record, self.store.cameras(name)))
 

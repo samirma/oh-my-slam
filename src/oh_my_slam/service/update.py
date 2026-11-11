@@ -777,7 +777,7 @@ class Updater:
         assert fr.pose is not None
 
         def of_rgb(rgb: Any) -> Features | None:
-            return None if rgb is None else features(rgb, None)
+            return features(rgb, None)  # a registered frame of the request has its image
 
         def of_image(name: str | None) -> Features | None:
             p = None if internal is None or not name else internal.image(name)
@@ -796,6 +796,7 @@ class Updater:
             if r.get("pose_state", "fused") != "kept_at_prior"]
         cands += [(e.work.name, e.work.camera_id, e.pose, functools.partial(of_rgb, e.rgb))
                   for e in earlier if e.pose is not None]
+        assert fr.rgb is not None
         return duplicate_among(fr.work.camera_id, fr.pose, of_rgb(fr.rgb), cands)
 
     # -- result ----------------------------------------------------------------------------------

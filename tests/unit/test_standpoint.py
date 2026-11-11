@@ -87,3 +87,36 @@ def test_a_new_only_group_centres_on_its_mean_and_nothing_measurable_passes() ->
     assert not sp.inconsistent(None, None)
     assert sp.inconsistent(4.0, 4.0) and sp.inconsistent(1.0, 11.0)
     assert not sp.inconsistent(2.0, 9.0)
+
+
+def test_two_view_and_group_edges(monkeypatch: pytest.MonkeyPatch) -> None:
+    A, B = look(0, C0, -10), look(25, C0, -10)
+    a, b = view("a", A), view("b", B)
+    monkeypatch.setattr(sp.cv2, "findEssentialMat", lambda *x, **k: (None, None))
+    assert sp.two_view(a, b) is None  # no epipolar fit
+    monkeypatch.undo()
+    monkeypatch.setattr(sp, "rotation_ransac", lambda *x, **k: None)
+    assert sp.two_view(a, b) is None  # no rotation fit
+    monkeypatch.undo()
+    # request-order neighbours always measured, even beyond the nearest k
+    far = [view(f"v{i}", look(25 * i, C0, -10), i) for i in range(3)]
+    assert 1 in sp.neighbours(far, 0, k=0) and sp.neighbours(far, 0, k=0) == [1]
+    # a new frame reached only through a stored keyframe that is not the group's root
+    s1 = view("s1", A, stored=True)
+    s2 = view("s2", look(0, C0, -10), stored=True)
+    n = view("n", B, 1)
+    pairs = sp.Pairs()
+    pairs.fits[("n", "s1")] = sp.TwoView(np.eye(3), 0.0, 100, 0.5, 0.01)
+    pairs.fits[("n", "s2")] = None
+    got = sp.groups([s1, s2, n], pairs)
+    assert set(got) == {"n"}
+    pairs2 = sp.Pairs()
+    pairs2.fits[("n", "s1")] = sp.TwoView(np.eye(3), 0.0, 10, 0.5, 0.01)
+    pairs2.fits[("n", "s2")] = sp.TwoView(np.eye(3), 0.0, 100, 0.5, 0.01)
+    pairs2.fits[("m", "s1")] = sp.TwoView(np.eye(3), 0.0, 50, 0.5, 0.01)
+    pairs2.fits[("m", "s2")] = None
+    pairs2.fits[("m", "n")] = None
+    pairs2.fits[("n", "m")] = None
+    m = view("m", B, 2)
+    got = sp.groups([s1, s2, n, m], pairs2)
+    assert "n" in got and "m" not in got  # m joins the group only through s1, not its root

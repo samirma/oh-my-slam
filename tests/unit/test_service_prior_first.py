@@ -864,3 +864,29 @@ def test_a_camera_only_frame_at_a_stored_pose_is_a_duplicate(
     job = client.update("m", fr, files)
     assert (job["inputs"][0]["reason"], job["inputs"][0].get("duplicate_of")) == (
         "duplicate", "a1"), job["inputs"]
+
+
+def test_a_dry_run_predicts_rotation_inconsistent(client: Client,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """map.md §4: a dry run of an update without priors predicts the rotation hard limit from
+    its predicted poses, as the job measures it."""
+    import cv2
+
+    from oh_my_slam.mapping.anchored import AnchoredMap
+
+    poses = [base_pose(0, 0.25 * k - 0.5, 0.0) for k in range(3)]
+    fr, files = frames_for(client, poses[:1], tag="a", trust=None)
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    fr, files = frames_for(client, poses[1:], tag="b", trust=None)
+    assert dry(client, "m", fr, files)["quality"]["failed_checks"] == []
+    real = AnchoredMap.place
+
+    def turned(self: AnchoredMap, f: Any, *a: Any, **k: Any) -> Any:
+        pl = real(self, f, *a, **k)
+        if pl.T is not None:
+            pl.T = pl.T.copy()
+            pl.T[:3, :3] = cv2.Rodrigues(np.array([0.0, 0.0, 0.4]))[0] @ pl.T[:3, :3]
+        return pl
+
+    monkeypatch.setattr(AnchoredMap, "place", turned)
+    assert dry(client, "m", fr, files)["quality"]["failed_checks"] == ["rotation_inconsistent"]

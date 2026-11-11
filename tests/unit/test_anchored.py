@@ -274,7 +274,10 @@ def test_cold_start_sweep_with_depth(tmp_path: Path) -> None:
         assert p.T is not None
         e = err(p.T, base_pose(30.0 * k))
         assert e[0] < 0.02 and e[1] < 0.5, (k, e)
-    assert m.scale_summary() == ("depth", an.DEPTH_SIGMA_REL)
+    # from the depth images' residuals against the map (rendered: consistent), with the
+    # sensor's own scale error
+    src, sig = m.scale_summary()
+    assert src == "depth" and an.DEPTH_SENSOR_SIGMA_REL <= sig < an.DEPTH_SIGMA_REL
     floor, pts = m.floor_and_bounds()
     assert floor is not None and abs(floor) < 0.03 and len(pts) > 1000  # a base: the floor
     # the version's one floor estimate, with its height sigma (map.md §5): a rendered floor
@@ -528,7 +531,8 @@ def test_summary_and_candidates(tmp_path: Path) -> None:
     assert m.prior_span() == 0.0
     m.update([frame("a1", base_pose(0, 0.5, 0.0))])
     src, sigma = m.scale_summary()
-    assert src == "priors" and sigma == pytest.approx(math.sqrt(2) * 0.02 / 0.5)
+    # the priors' residuals (none here) or their sigma over the root of their count
+    assert src == "priors" and sigma == pytest.approx(math.sqrt(2) * 0.02 / math.sqrt(2) / 0.5)
     # a candidate far away or facing elsewhere is not one
     assert m._candidates(frame("x", base_pose(180)), base_pose(180, 10.0, 0.0), None) == []
 
@@ -1045,3 +1049,27 @@ def test_a_tight_prior_registers_and_one_metre_off_conflicts(tmp_path: Path) -> 
     f.unconfirmed = "plain"
     r = m.update([f])[0]
     assert (r.status, r.reason, r.method) == ("kept_at_prior", "plain", "prior")
+
+
+def test_duplicate_test_edges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pose duplicate without features is the pose alone; an image without features
+    agrees with nothing; a candidate without features is no duplicate; correspondences on no
+    keyframe are no depth evidence; a sensor keyframe whose depth disagrees as a whole adds no
+    residual; a camera-only map with a camera height and no plane keeps the floor at 0."""
+    T = base_pose(0)
+    feats = an.features(shot(T)[0])
+    cands = [("k", "cam", T, lambda: None)]
+    assert an.duplicate_among("cam", T, None, cands) == "k"
+    assert an.duplicate_among("cam", T, feats, cands) is None
+    empty = an.Features(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8))
+    assert not an.images_agree(empty, feats)
+    assert not AnchoredMap._on_sensor([], np.zeros(0, np.intp))
+    m = new_map(tmp_path)
+    monkeypatch.setattr(an, "depth_alignment", lambda *a, **k: None)
+    m.update([frame("a0", base_pose(0)), frame("a1", base_pose(20))])
+    assert "sensor" not in m.scale.depth_residuals
+    c = new_map(tmp_path / "c")
+    c.created_with, c.origin_height_m = "none", 0.5
+    c.cloud.add(np.array([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]]), np.zeros((2, 3)))
+    monkeypatch.setattr(an, "floor_candidates", lambda *a, **k: [])
+    assert c.floor()[0] == 0.0

@@ -800,7 +800,7 @@ def test_eta_counts_the_queue_ahead_and_the_job_s_own_frames(
         client: Client, monkeypatch: pytest.MonkeyPatch) -> None:
     import threading
 
-    client.service.jobs.predict = lambda n, camera_only: 10.0 * n
+    client.service.jobs.predict = lambda n, camera_only, *_: 10.0 * n
     gate = threading.Event()
     real = client.backend.register
 
@@ -878,6 +878,13 @@ def test_metric_first_frames_then_drifting_and_none_land_in_the_priors_frame(
     assert job["quality"]["gauge_shift"]["translation_m"] < 1e-6
     frames, files, truth = frames_of(client, 2, start=0, seed=9)
     job = client.update("m", frames, files)  # trust none, at the stored frames' poses
+    # other images at those poses: they do not agree with the stored ones, so they register and
+    # the later observation wins (api.md §4)
+    assert [(i["status"], i["reason"]) for i in job["inputs"]] == [("registered", None)] * 2
+    frames, files, truth = frames_of(client, 2, start=0)
+    for f in frames:
+        f["name"] = "again_" + f["name"]
+    job = client.update("m", frames, files)  # the stored frames' own images, new names
     assert [(i["reason"], i.get("duplicate_of")) for i in job["inputs"]] == [
         ("duplicate", "f0_0"), ("duplicate", "f0_1")]  # pose duplicates (api.md §4)
 

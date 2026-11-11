@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
-from oh_my_slam.mapping import checks
+from oh_my_slam.mapping import checks, standpoint
 from oh_my_slam.mapping.anchored import DEFAULT_HEIGHT_SIGMA_M as HEIGHT_SIGMA_M
 from oh_my_slam.mapping.anchored import (
     DEPTH_SIGMA_REL,
@@ -74,6 +74,7 @@ from oh_my_slam.service.prior_first import (
     _frame_in,
     frame_class,
     none_engine,
+    stored_views,
 )
 
 if TYPE_CHECKING:
@@ -155,6 +156,11 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                     am._checked(_frame_in(ins[idx], None), pl, mine)
             disagreement = am.prior_disagreement_deg
         source, sigma = _scale(prev, am, frames)
+        # an update without priors: its predicted poses against the images' relative rotations
+        # (map.md §4 rotation_inconsistent), as the job measures them
+        rotations_bad = am is not None and not any(
+            fr.work.trust in ("metric", "drifting") for fr in frames) and _rotations_bad(
+            am, frames, feats, placed)
         again = [] if am is None else _reregistered(am, frames, feats, placed, out)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -192,9 +198,24 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     return {"map": w.map,
             "base_version": None if prev is None else prev["version"], "frames": out,
             "quality": gate(q, bool(kept), w.accept_if, prev is None and bool(trusted) and all(
-                r["predicted_status"] == "rejected" for r in trusted)),
+                r["predicted_status"] == "rejected" for r in trusted), rotations_bad),
             "scale_source": source, "scale_sigma_rel": round(sigma, 5),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)}}
+
+
+def _rotations_bad(am: AnchoredMap, frames: list[_Frame], feats: dict[int, Features],
+                   placed: dict[int, Placement]) -> bool:
+    """The predicted ``rotation_inconsistent`` (``standpoint.consistency``) of the frames
+    predicted registered, at their predicted poses, with the stored keyframes they neighbour."""
+    new = [(fr, pl) for fr in frames for pl in [placed.get(fr.work.index)]
+           if pl is not None and pl.status == "registered" and pl.T is not None
+           and fr.work.index in feats]
+    views = stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3]) for _, pl in new  # type: ignore[index]
+                              ])
+    views += [standpoint.View(fr.work.name, fr.cam.canonical(), feats[fr.work.index],
+                              pl.T[:3, :3].copy(), pl.T[:3, 3].copy(),  # type: ignore[index]
+                              False, fr.work.index) for fr, pl in new]
+    return standpoint.inconsistent(*standpoint.consistency(views, standpoint.Pairs()))
 
 
 def _classes(frames: list[_Frame]) -> dict[str, int]:
