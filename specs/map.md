@@ -23,7 +23,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     registers, may reject the update the same way (`prior_frames_rejected`).
 * **Two-view parallax.** The one parallax measure of this specification. For a pair of frames,
   it is the median, over their epipolar inliers, of the rotation-only residual divided by
-  sin of the angle between the ray and the baseline. Below 0.3 px the pair is
+  max(sin of the angle between the ray and the baseline, 0.3): the sine is floored at 0.3. It is
+  measured in pixels of the image as sent. Below 1 px the pair is
   translation-unconstrained: one standpoint. Translation in front of a planar scene can read as
   a rotation: an accepted degenerate case, since priors are expected whenever odometry exists.
 * **Overlap.** The one overlap measure of this specification is the 8 × 8 inlier-cell
@@ -35,7 +36,7 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
-  * frames whose pairwise two-view parallax (above) is below 0.3 px form one standpoint group,
+  * frames whose pairwise two-view parallax (above) is below 1 px form one standpoint group,
     registered as a pure rotation about a common centre. The common centre is the overlapped
     stored keyframe with the most pair inliers (ties: the lowest keyframe id), or, when they overlap none, the mean of their image-only
     centres; its position sigma is their spread.
@@ -72,7 +73,7 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   pose and image-only pose (the pose their images alone give against the map) is in
   `quality.max_displacement_m` and `max_displacement_deg` (§4), not in `gauge_shift`:
   * a frame whose image-only pose is unconstrained in translation (two-view parallax, above,
-    below 0.3 px against every reference it registers to) counts only its rotation;
+    below 1 px against every reference it registers to) counts only its rotation;
   * frames `kept_at_prior` or `rejected` have no image-only pose and are left out.
 
   So the gates on `gauge_shift` and `max_residual_m` measure stored-map movement, and the gates
