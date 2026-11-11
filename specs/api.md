@@ -135,9 +135,12 @@ error code `invalid_request` (§9).
   **Choosing a status.**
   * A hypothesis's support is its inlier count over the best image hypothesis's inlier count;
     it is supported at 0.25 or more (the same definition as locate, §6).
-  * `rejected` with `prior_conflict` only when the images confirm a pose farther than 3 × the
-    prior's sigmas from the prior (the prior's sigmas alone, not combined with the image's), and
-    no supported hypothesis lies within 3 × the prior's sigmas of it.
+  * **Conflict with the prior.** A hypothesis conflicts with the prior when its distance from
+    the prior exceeds 3 × sqrt(σ_prior² + σ_hypothesis²), tested separately for position and
+    rotation; σ_hypothesis is the hypothesis's own calibrated sigma. The same bound applies to
+    locate (§6).
+  * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with
+    the prior, and no supported hypothesis lies within that bound.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
   * A frame with a prior whose image fails a quality check, or that is too close, is
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
@@ -161,9 +164,9 @@ error code `invalid_request` (§9).
   * A frame with at least 300 inliers to neighbouring keyframes is never rejected for distance
     alone.
 
-  **Pose sigmas are a lower bound** until O5 calibrates them against replay truth: until then
-  `sigma_pos_m` and `sigma_rot_deg`, here and in [`Frames`], come from the registration's noise
-  and the anchoring's residual, not from a pose covariance, and the true error can be larger.
+  **Pose sigmas** (`sigma_pos_m`, `sigma_rot_deg`, here and in [`Frames`]) include the
+  image-registration noise, calibrated so that the containment targets
+  (`update.sigma_containment`, evaluation.md) are met.
 
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
@@ -205,17 +208,20 @@ The versions read, revert and `--keep-versions` are O2.
   | `name` | The frame's name. |
   | `status` | `located` or `rejected`. |
   | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `blur` or `prior_conflict`; otherwise null. |
-  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. The sigmas describe the chosen hypothesis only, not the spread of rivals. |
+  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. The sigmas describe the chosen hypothesis only, not the spread of rivals; they include the image-registration noise, calibrated so that `locate.sigma_containment` (evaluation.md) is met. |
   | `inlier_ratio` | The share of inliers. |
   | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
   | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
-  support at least 0.25, nearest by hypot(dp / σp, dr / σr): the position and rotation
-  distances to the prior over the prior's position and rotation sigmas. When none lies within 3 × the prior's sigmas, the frame is `rejected`
-  with `prior_conflict`, not located with `consistent_with_prior: false`; so a located frame
-  with a prior always has `consistent_with_prior: true`. A prior without sigmas takes the fixed
+  support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
+  position and rotation distances to the prior over the combined prior and hypothesis sigmas, the
+  same normalisation as the conflict bound. Only hypotheses within
+  the conflict bound of §4 qualify: 3 × sqrt(σ_prior² + σ_hypothesis²), tested separately for
+  position and rotation. When none does, the frame is `rejected` with `prior_conflict`, not
+  located with `consistent_with_prior: false`; so a located frame with a prior always has
+  `consistent_with_prior: true`. A prior without sigmas takes the fixed
   defaults of §3 (`metric` 0.05 m / 2°, `drifting` 0.20 m / 5°). Clients should always send
   sigmas.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.

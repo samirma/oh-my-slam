@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg) of a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, same camera, or a frame name the map or request already holds; duplicate_of names that frame."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: within 0.02 m and 2 deg (defaults, configurable below 0.05 m / 5 deg) of a stored keyframe (not kept_at_prior) or an earlier registered frame of the request, same camera, or a frame name the map or request already holds; duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound."
     },
     "InputStatus": {
       "type": "object",
@@ -399,13 +399,15 @@
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
-          ]
+          ],
+          "description": "Includes the image-registration noise, calibrated so that update.sigma_containment is met."
         },
         "prior_residual_m": {
           "type": [
@@ -707,10 +709,11 @@
               "max_prior_disagreement_deg",
               "max_rejected_share",
               "hard_limit",
-              "prior_frames_rejected"
+              "prior_frames_rejected",
+              "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair."
         },
         "reregistered": {
           "type": "array",
@@ -2032,7 +2035,7 @@
               "type": "null"
             }
           ],
-          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x the prior's sigmas (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
+          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior, position and rotation tested separately (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
         },
         "T_map_cam": {
           "oneOf": [
@@ -2043,21 +2046,21 @@
               "type": "null"
             }
           ],
-          "description": "With a prior: among hypotheses with support >= 0.25, the nearest the prior by hypot(dp / sigma_pos, dr / sigma_rot)."
+          "description": "With a prior: among hypotheses with support >= 0.25 within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior (position and rotation separately), the nearest the prior by hypot(dp / sqrt(sigma_pos_prior^2 + sigma_pos_hyp^2), dr / sqrt(sigma_rot_prior^2 + sigma_rot_hyp^2))."
         },
         "sigma_pos_m": {
           "type": [
             "number",
             "null"
           ],
-          "description": "Uncertainty of the chosen hypothesis only."
+          "description": "Uncertainty of the chosen hypothesis only, including the image-registration noise, calibrated so that locate.sigma_containment is met."
         },
         "sigma_rot_deg": {
           "type": [
             "number",
             "null"
           ],
-          "description": "Uncertainty of the chosen hypothesis only."
+          "description": "Uncertainty of the chosen hypothesis only, including the image-registration noise, calibrated so that locate.sigma_containment is met."
         },
         "inlier_ratio": {
           "type": [
@@ -2121,7 +2124,7 @@
             "boolean",
             "null"
           ],
-          "description": "Null without a prior; always true for a located frame with a prior, since a frame that no supported hypothesis matches within 3 prior sigmas is rejected with prior_conflict."
+          "description": "Null without a prior; always true for a located frame with a prior, since a frame that no supported hypothesis matches within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) (position and rotation separately) is rejected with prior_conflict."
         },
         "nearest_view": {
           "oneOf": [
