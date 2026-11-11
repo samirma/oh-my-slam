@@ -909,10 +909,12 @@ server.
     `height_sigma`). When the version's `scale_source` is `camera_height` and the frame (else its
     camera) carries `height_above_floor_m`, z_expected is the floor plus that height, and a
     hypothesis is height-consistent when |z − z_expected| ≤ 3 × sqrt(height_sigma² + σ_z²) (σ_z
-    = σ_rel / √3; height_sigma the frame's `height_sigma_m` when it carries one, else the median
-    `height_sigma_m` of the confirmed keyframes that served as the answer's references (the
-    version rows record the sigma each frame carried; `relocalize.z_sigma`), else its camera's
-    registered `height_sigma_m`, oms/2.2 P13). A height-inconsistent hypothesis ranks below every
+    = σ_rel / √3). height_sigma is, in order (oms/2.2 P15, `relocalize.z_sigma`): the locate
+    frame's own `height_sigma_m`; else the median `height_sigma_m` that the answer's reference
+    keyframes carried when they were sent (the version rows record the sigma each frame used:
+    its own, else its camera's); else the median of those keyframes' registered `sigma_pos_m` /
+    √3; else the default **`DEFAULT_HEIGHT_SIGMA_M` = 0.02 m**. The locate camera's registered
+    `height_sigma_m` is not used. A height-inconsistent hypothesis ranks below every
     height-consistent supported one, with a prior or without. The located `sigma_pos_m` is
     hypot(σ_rel, |z_located − z_expected|), and `height_consistent` reports the test (null on any
     other scale or without a height). `consistent_with_prior` is unchanged.

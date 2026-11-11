@@ -329,10 +329,10 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
     # z_expected (api.md §6): the floor plus the frame's height above it, else its camera's
     # registered one; height_sigma the frame's own when it carries one, else the answer's
-    # reference keyframes' (``relocalize.z_sigma``), else its camera's
+    # reference keyframes' (``relocalize.z_sigma``), else the README default
     h = fr.height_m if fr.height_m is not None else cam.height_above_floor_m
     if h is not None:
-        sig = fr.height_sigma_m if fr.height_sigma_m is not None else cam.height_sigma_m
+        sig = fr.height_sigma_m
         q.camera_z = floor_z + float(h)
         q.camera_z_sigma = float(sig if sig is not None else relocalize.DEFAULT_HEIGHT_SIGMA_M)
         q.camera_z_sigma_given = fr.height_sigma_m is not None

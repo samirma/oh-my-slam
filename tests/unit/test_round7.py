@@ -27,15 +27,20 @@ def _query() -> rl.Query:
     return q
 
 
-def test_height_sigma_is_the_frame_s_else_the_references_median_else_the_camera_s() -> None:
-    """api.md §6 (P13): the frame's own height_sigma_m; else the median of the answer's
-    reference keyframes' height_sigma_m; else, none of them carrying one, the camera's."""
+def test_height_sigma_is_the_frame_s_else_the_references_else_the_default() -> None:
+    """api.md §6 (P15), in order: 1. the frame's own height_sigma_m; 2. else the median
+    height_sigma_m the answer's reference keyframes carried; 3. else the median of their
+    sigma_pos_m / sqrt(3); 4. else the README default."""
     q = _query()
-    assert rl.z_sigma(q, [0.1, None, 0.3, 0.2]) == pytest.approx(0.2)  # their median
-    assert rl.z_sigma(q, [None, None]) == 0.01 and rl.z_sigma(q, []) == 0.01  # the camera's
-    q.camera_z_sigma_given = True
-    assert rl.z_sigma(q, [0.1, 0.3]) == 0.01  # the frame's own
+    q.camera_z_sigma_given = True  # 1. the frame's own, whatever the references carry
+    assert rl.z_sigma(q, [0.1, 0.3], [0.3, 0.6]) == 0.01
     q.camera_z_sigma_given = False
+    assert rl.z_sigma(q, [0.1, None, 0.3, 0.2], [3.0] * 4) == pytest.approx(0.2)  # 2. median
+    r3 = math.sqrt(3.0)
+    assert rl.z_sigma(q, [None, None], [0.3 * r3, 0.1 * r3, 0.2 * r3]) == pytest.approx(0.2)
+    assert rl.z_sigma(q, [None], [0.0]) == 0.01  # 4. no sigma at all: the default
+    assert rl.z_sigma(q, []) == 0.01
+    assert rl.DEFAULT_HEIGHT_SIGMA_M == 0.02  # the README default
     T = base_pose(0, height=0.9)  # 0.4 m above the expected height
     assert rl.height_consistent(q, T, 0.01) is False
     assert rl.height_consistent(q, T, 0.01, 0.2) is True  # the references' sigma
@@ -47,6 +52,8 @@ def test_height_sigma_is_the_frame_s_else_the_references_median_else_the_camera_
                                     np.zeros((0, 3), np.float32))])
     assert rl._ref_z_sigma(q, np.array([0, 0, 1]), idx) == 0.3
     assert rl._ref_z_sigma(q, np.array([1]), idx) == 0.01
+    idx.keyframes[1].sigma_pos_m = 0.3 * math.sqrt(3.0)  # 3. its registered pose sigma
+    assert rl._ref_z_sigma(q, np.array([1]), idx) == pytest.approx(0.3)
     # ranking takes each hypothesis's own height_sigma
     low, high = base_pose(0, height=0.5), base_pose(0, 1.0, height=0.9)
     assert rl.choose(q, [high, low], [100, 60], [(0.01, 0.5)] * 2) == 1

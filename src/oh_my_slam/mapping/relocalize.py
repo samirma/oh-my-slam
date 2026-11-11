@@ -334,8 +334,8 @@ class Query:
     prior_sigma_pos_m: float = DEFAULT_SIGMA_POS_M
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
-    # height_sigma (api.md §6): the frame's own when ``camera_z_sigma_given``, else the median
-    # of the answer's reference keyframes' (``ref_z_sigma``), else this one (the camera's)
+    # height_sigma (api.md §6, ``z_sigma``): the frame's own when ``camera_z_sigma_given``, else
+    # the answer's reference keyframes', else this one (the README default)
     camera_z_sigma: float = DEFAULT_HEIGHT_SIGMA_M
     camera_z_sigma_given: bool = False
     # the map's scale comes from camera heights (api.md §6 "Camera-height scale"): a pose's
@@ -558,20 +558,27 @@ def _height_ok(q: Query, T: Array, zs: float | None = None) -> bool:
         q.camera_z_sigma if zs is None else zs) + HEIGHT_SLACK_M
 
 
-def z_sigma(q: Query, refs: Sequence[float | None]) -> float:
-    """A located pose's height_sigma (api.md §6): the frame's own ``height_sigma_m`` when it
-    carries one; else the median ``height_sigma_m`` of the confirmed keyframes that served as
-    the answer's references (``refs``, theirs); else, none of them carrying one, the camera's
-    (``Query.camera_z_sigma``)."""
-    got = [float(r) for r in refs if r is not None]
-    if q.camera_z_sigma_given or not got:
+def z_sigma(q: Query, refs: Sequence[float | None], pos: Sequence[float] = ()) -> float:
+    """A located pose's height_sigma (api.md §6, oms/2.2 P15), in this order: the frame's own
+    ``height_sigma_m`` (``Query.camera_z_sigma`` when ``camera_z_sigma_given``); else the median
+    ``height_sigma_m`` the answer's reference keyframes carried when they were sent (``refs``);
+    else the median of their registered ``sigma_pos_m`` / √3 (``pos``, those above zero); else
+    the README default (``Query.camera_z_sigma``, ``DEFAULT_HEIGHT_SIGMA_M``)."""
+    if q.camera_z_sigma_given:
         return q.camera_z_sigma
-    return float(np.median(got))
+    got = [float(r) for r in refs if r is not None]
+    if got:
+        return float(np.median(got))
+    sp = [float(s) / math.sqrt(3.0) for s in pos if s > 0.0]
+    if sp:
+        return float(np.median(sp))
+    return q.camera_z_sigma
 
 
 def _ref_z_sigma(q: Query, used: NDArray[np.int64], index: Index) -> float:
     """``z_sigma`` over the keyframes ``used`` (indices: the answer's references)."""
-    return z_sigma(q, [index.keyframes[int(i)].height_sigma_m for i in np.unique(used)])
+    kfs = [index.keyframes[int(i)] for i in np.unique(used)]
+    return z_sigma(q, [k.height_sigma_m for k in kfs], [k.sigma_pos_m for k in kfs])
 
 
 def height_consistent(q: Query, T: Array, sigma_pos_m: float, zs: float | None = None

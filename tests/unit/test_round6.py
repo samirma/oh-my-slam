@@ -512,7 +512,8 @@ def test_locate_takes_the_frame_s_own_height_sigma() -> None:
     q, _ = nav._query(fr, 0.1, True)
     assert (q.camera_z, q.camera_z_sigma) == (pytest.approx(0.6), 0.004)
     fr = nav.LocateFrame("q", cam, img, None, None, None, None)
-    assert nav._query(fr, 0.1, True)[0].camera_z_sigma == 0.02
+    q, _ = nav._query(fr, 0.1, True)  # P15: never the camera's; the README default meanwhile
+    assert (q.camera_z_sigma, q.camera_z_sigma_given) == (0.02, False)
     fr = nav.LocateFrame("q", Camera(160.0, 160.0, 160.0, 120.0, 320, 240), img, None, None,
                          None, 0.004)
     assert nav._query(fr, 0.1, True)[0].camera_z is None  # no height at all
