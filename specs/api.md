@@ -118,11 +118,14 @@ error code `invalid_request` (§9).
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
+  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it). Null otherwise, including a frame kept for a failed check. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
   `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
-  uses it as a reference (§6), nor does registration of new frames. Occupancy, heights, the
+  uses it as a reference (§6), nor does registration of new frames: a `kept_at_prior` frame of
+  an earlier version, or a frame that ends the job kept, is never a registration reference
+  (map.md §2, match graph). Occupancy, heights, the
   cloud, object records and scale evidence come only from image-confirmed frames, with one
   exception below: a `kept_at_prior` frame counts only for free-by-rule cells (its camera stand
   and near blind disc, map.md §6) until a later job's images confirm it; its pose then becomes a
@@ -143,7 +146,10 @@ error code `invalid_request` (§9).
     current drift estimate, and its sigmas are the prior's (or the 0.20 m / 5° default, §3)
     plus the drift estimate's uncertainty.
 
-  **Choosing a status.**
+  **Choosing a status.** Registration is order-independent and runs over the job's match graph
+  (map.md §2): each connected component of new frames registers as a whole, and the checks
+  below apply frame by frame to its fitted poses, iterating to a fixed point. The outcome does
+  not depend on frame order, and a dry run predicts the same statuses.
   * A hypothesis's support is its inlier count over the best image hypothesis's inlier count;
     it is supported at 0.25 or more (the same definition as locate, §6).
   * **Conflict with the prior.** A hypothesis conflicts with the prior when its distance from
@@ -238,6 +244,7 @@ The versions read, revert and `--keep-versions` are O2.
   | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
   | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
+  | `height_consistent` | With a camera-height scale (see below): whether the located camera height agrees with the expected one within 3 sigma; null otherwise. |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
   support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
@@ -259,6 +266,11 @@ The versions read, revert and `--keep-versions` are O2.
     `locate.sigma_containment` and `locate.sigma_tightness_bound` (evaluation.md) both hold.
     If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported
     alone.
+  * **Camera-height scale.** When the map's `scale_source` is `camera_height`, the position
+    sigma is hypot(σ_rel, |z_located − z_expected|). z_expected is the map's camera height at
+    that pose, used only where the map's frames carried `height_above_floor_m`.
+    `height_consistent` is false beyond 3 sigma, and such a hypothesis ranks below any
+    height-consistent rival. `consistent_with_prior` does not change.
   * Noise floors, position / rotation. These are defaults, tunable in `README.md`:
 
     | Depth | `metric` | `drifting` | `none` |
