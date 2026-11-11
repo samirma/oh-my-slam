@@ -1170,7 +1170,9 @@ class Drift:
                 s = float((odo_m * map_m).sum() / (odo_m ** 2).sum())
                 self.odo_scale = float(np.clip(s, *ODO_SCALE_RANGE))
         self.ref_T, self.ref_prior = T.copy(), P.copy()
-        self.support = [*self.support, P[:3, 3].tolist()][-MAX_EVIDENCE:]
+        c = P[:3, 3].tolist()
+        if c not in self.support:  # no count bound (SI-19): each supporting frame once
+            self.support = [*self.support, c]
 
 
 def drift_grown(sigma_pos: float, sigma_rot: float, P: Array, fit_sigma: tuple[float, float],
@@ -1814,6 +1816,8 @@ class AnchoredMap:
         self._exclude: dict[str, Placement] = {}
         self._no_rereg: set[str] = set()
         self._start_drift: Drift | None = None
+        # the estimate a held job's first registration closed from (``close_job``)
+        self._close_base: Drift | None = None
         self.reran: set[str] = set()
         self._retried_drifting = False
 
@@ -2605,6 +2609,8 @@ class AnchoredMap:
             if hold or not self.plan_rerun(pls):
                 break
             self._restore(snap)
+        if hold and self._close_base is None:
+            self._close_base = copy.deepcopy(used)
         fuse_s = self._keep_s
         if not hold:
             dups, end_s = self.end_job(pls, new)
@@ -2668,6 +2674,7 @@ class AnchoredMap:
             pl.keyframe = None
         self._epi, self._placed = {}, {}  # the job's caches end with it (memory)
         self._exclude, self._no_rereg, self._start_drift = {}, set(), None
+        self._close_base = None
         self._evidence_from, self._rereg_by, self._rereg_state = set(), {}, {}
         self._mine, self._job_used, self.reran, self._retried_drifting = [], None, set(), False
         return dups, time.perf_counter() - t
@@ -2758,6 +2765,16 @@ class AnchoredMap:
         """A held job back at ``start`` (``job_start``) for its second registration; the plan
         (``excluded``, ``reran``) stays."""
         self._restore(start)
+        self._close_base = None
+
+    def close_job(self, frames: list[FrameIn], pls: list[Placement]) -> None:
+        """A held job's drift after both engines (before ``end_job``): ``_close_drift`` again
+        over its final placements (``pls``, of ``frames``) from the estimate its registration
+        closed from, so a drifting frame only the cross-engine retries confirmed
+        (``retry_kept``) becomes a supporting frame, the reference and odometry-scale evidence
+        like any other, all in canonical order (map.md §1, §2; none confirmed twice)."""
+        if self._close_base is not None:
+            self._close_drift(frames, dict(enumerate(pls)), self._close_base)
 
     def excluded(self) -> dict[str, Placement]:
         """The frames a planned second registration forces to a placement, by name."""

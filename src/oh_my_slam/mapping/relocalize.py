@@ -158,6 +158,9 @@ class Keyframe:
     sigma_rot_deg: float = 0.0
     depth: bool = False  # its points come from a depth image (the calibration's data kind)
     height_sigma_m: float | None = None  # the camera height sigma its update frame carried
+    # its images confirmed its pose (``pose_state`` not ``kept_at_prior``): only such a
+    # reference's ``sigma_pos_m`` counts for ``z_sigma`` (api.md §6 step 3, P17)
+    registered: bool = True
 
     @property
     def centre(self) -> Array:
@@ -562,8 +565,8 @@ def z_sigma(q: Query, refs: Sequence[float | None], pos: Sequence[float] = ()) -
     """A located pose's height_sigma (api.md §6, oms/2.2 P15), in this order: the frame's own
     ``height_sigma_m`` (``Query.camera_z_sigma`` when ``camera_z_sigma_given``); else the median
     ``height_sigma_m`` the answer's reference keyframes carried when they were sent (``refs``);
-    else the median of their registered ``sigma_pos_m`` / √3 (``pos``, those above zero); else
-    the README default (``Query.camera_z_sigma``, ``DEFAULT_HEIGHT_SIGMA_M``)."""
+    else the median ``sigma_pos_m`` / √3 of the registered (image-confirmed) ones (``pos``,
+    those above zero; kept references skipped by the caller, P17); else the README default (``Query.camera_z_sigma``, ``DEFAULT_HEIGHT_SIGMA_M``)."""
     if q.camera_z_sigma_given:
         return q.camera_z_sigma
     got = [float(r) for r in refs if r is not None]
@@ -576,9 +579,11 @@ def z_sigma(q: Query, refs: Sequence[float | None], pos: Sequence[float] = ()) -
 
 
 def _ref_z_sigma(q: Query, used: NDArray[np.int64], index: Index) -> float:
-    """``z_sigma`` over the keyframes ``used`` (indices: the answer's references)."""
+    """``z_sigma`` over the keyframes ``used`` (indices: the answer's references); step 3 over
+    the registered ones only (a kept reference's pose is its prior's, P17)."""
     kfs = [index.keyframes[int(i)] for i in np.unique(used)]
-    return z_sigma(q, [k.height_sigma_m for k in kfs], [k.sigma_pos_m for k in kfs])
+    return z_sigma(q, [k.height_sigma_m for k in kfs],
+                   [k.sigma_pos_m for k in kfs if k.registered])
 
 
 def height_consistent(q: Query, T: Array, sigma_pos_m: float, zs: float | None = None

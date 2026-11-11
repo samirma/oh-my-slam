@@ -414,7 +414,11 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   root sum of squares of the prior's sigma and the drift estimate's own at that pose, which is
   the accepted fit's sigma (`Drift.fit_sigma`) and its extrapolation, growing with the distance
   from the frame's prior position to the nearest supporting frame's prior position
-  (`Drift.support`: the fit's inliers and every drifting frame the images confirmed since) at
+  (`Drift.support`, map.md §1 "Supporting frames", oms/2.2 P17: the inliers of the fit that
+  produced the estimate and every drifting frame the images confirmed under it since, each
+  once and with no count bound; it resets to the new fit's inliers whenever a fit changes the
+  estimate; on the older mapper `drift_support`, its kept estimate taking the job's registered
+  drifting frames, `Updater._confirmed_support`) at
   **`DRIFT_POS_REL` = 0.10** of that distance in position and **`DRIFT_ROT_DEG_PER_M` = 2° per
   metre** of it in rotation. Travel since the client's last fix is the client's part: drifting
   priors carry sigmas grown with it, and the engine no longer adds the odometry's path. A state
@@ -422,7 +426,11 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   estimate is the one in force when the job starts (every frame predicted from it, whatever its
   place in the request); after the job its registered drifting frames, in canonical name order,
   become the new reference and supporters (`Drift.confirm`, with the odometry-scale evidence):
-  later jobs do not depend on the request order either.
+  later jobs do not depend on the request order either. A job held open over both engines
+  closes its drift once more after the cross-engine phase (`AnchoredMap.close_job`, before
+  `end_job`): from the same estimate, over every frame's final placement in canonical order,
+  so a drifting frame only `retry_kept` confirmed counts like the others and none counts
+  twice.
 * **Robust drift estimate** (map.md §1 "Drift estimate", `AnchoredMap._fit_drift`). After the
   job is registered, the drift is fitted over its drifting-prior frames whose images give a pose
   (registered, rejected `prior_conflict`, or kept `conflict_unsupported` when it can support
@@ -936,8 +944,10 @@ server.
     = σ_rel / √3). height_sigma is, in order (oms/2.2 P15, `relocalize.z_sigma`): the locate
     frame's own `height_sigma_m`; else the median `height_sigma_m` that the answer's reference
     keyframes carried when they were sent (the version rows record the sigma each frame used:
-    its own, else its camera's); else the median of those keyframes' registered `sigma_pos_m` /
-    √3; else the default **`DEFAULT_HEIGHT_SIGMA_M` = 0.02 m**. The locate camera's registered
+    its own, else its camera's); else the median `sigma_pos_m` / √3 of those keyframes whose
+    images confirmed their pose (registered; a kept-at-prior reference is skipped, oms/2.2 P17,
+    `relocalize.Keyframe.registered`, carried by the index from the row's `pose_state`); else,
+    none of them left, the default **`DEFAULT_HEIGHT_SIGMA_M` = 0.02 m**. The locate camera's registered
     `height_sigma_m` is not used. A height-inconsistent hypothesis ranks below every
     height-consistent supported one, with a prior or without. The located `sigma_pos_m` is
     hypot(σ_rel, |z_located − z_expected|), and `height_consistent` reports the test (null on any

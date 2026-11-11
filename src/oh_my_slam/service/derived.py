@@ -540,7 +540,8 @@ class Derived:
                 kname, np.asarray(f["T_map_cam"], np.float64),
                 cams[f["camera_id"]].canonical().resized(w, h).K(), uv, desc, z[f"p{i}"],
                 float(f.get("sigma_pos_m") or 0.0), float(f.get("sigma_rot_deg") or 0.0),
-                f.get("depth_kind") == "sensor", f.get("height_sigma_m")))
+                f.get("depth_kind") == "sensor", f.get("height_sigma_m"),
+                f.get("pose_state", "fused") != "kept_at_prior"))
         idx = relocalize.Index(kfs)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
         return idx

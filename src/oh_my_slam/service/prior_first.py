@@ -529,6 +529,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             if late:
                 up.timings.add("registration_mapanything_per_frame", late_r / len(late),
                                len(late))
+            # the drift takes the frames the cross-engine retries confirmed too
+            am.close_job(ins, [placements[fr.work.index] for fr in geo])
             dups, end_s = am.end_job([placements[fr.work.index] for fr in todo
                                       if fr.work.index in placements], prev is None)
             for fr in todo:

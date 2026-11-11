@@ -182,6 +182,9 @@ class _Anchored:
     # from them (``drift_grown``)
     drift_sigma: tuple[float, float] | None = None
     drift_support: list[list[float]] | None = None
+    # the previous version's estimate stayed (``_drift_estimate``): this job's registered
+    # drifting frames join its supporting frames (map.md §1 "Supporting frames")
+    drift_kept: bool = False
     prior_disagreement_deg: float = 0.0
     # a map without priors whose first registered frame has a camera height: that height (the
     # origin is the floor below that frame, map.md §1); carried by every later version
@@ -652,8 +655,8 @@ class Updater:
             fr.pose = out.sim.pose(fr.internal.T)
             if fr.work.name in new_metric:
                 fr.prior_residual = anchor.residual(out.sim, new_metric[fr.work.name])
-        out.drift_sim, out.drift_sigma, out.drift_support = self._drifting_residuals(
-            placed, out.sim, prev)
+        out.drift_sim, out.drift_sigma, out.drift_support, out.drift_kept = \
+            self._drift_estimate(placed, out.sim, prev)
         out.prior_disagreement_deg = self._prior_disagreement(placed, internal, out.sim)
         out.prior_residuals = [anchor.residual(out.sim, a) for a in metric]
         out.previous_residuals = [anchor.residual(out.sim, a) for a in previous]
@@ -765,6 +768,13 @@ class Updater:
     def _drifting_residuals(placed: list[_Frame], sim: Sim3, prev: dict[str, Any] | None = None
                             ) -> tuple[Sim3 | None, tuple[float, float] | None,
                                        list[list[float]] | None]:
+        """``_drift_estimate`` without whether the previous estimate stayed."""
+        return Updater._drift_estimate(placed, sim, prev)[:3]
+
+    @staticmethod
+    def _drift_estimate(placed: list[_Frame], sim: Sim3, prev: dict[str, Any] | None = None
+                        ) -> tuple[Sim3 | None, tuple[float, float] | None,
+                                   list[list[float]] | None, bool]:
         """The robust drift estimate across versions (map.md §1 "Drift estimate", every engine):
         the similarity that best brings the request's aligned poses onto their drifting priors
         (``anchor.fit``, robust: its inliers), against the previous version's (``drift_sim`` of
@@ -777,12 +787,14 @@ class Updater:
         identity (None: priors as sent, with their sigmas). Each drifting frame's residual is
         against the estimate kept, so ``_post_check`` rejects those beyond the bound
         (``prior_conflict``) and the mapper runs again without them: every frame re-tested
-        under it. Returns the estimate (map frame to the priors' frame), its sigma and its
-        supporting frames' prior centres; the previous version's without drifting frames."""
+        under it. Returns the estimate (map frame to the priors' frame), its sigma, its
+        supporting frames' prior centres (the new fit's inliers whenever the estimate changes)
+        and whether the previous version's estimate stayed (``_confirmed_support``); the
+        previous version's without drifting frames."""
         before, before_sigma, before_support = Updater._previous_drift(prev)
         drift = [fr for fr in placed if fr.work.trust == "drifting"]
         if not drift:
-            return before, before_sigma, before_support
+            return before, before_sigma, before_support, before is not None
         anchors = []
         for fr in drift:
             assert fr.internal is not None and fr.work.prior is not None
@@ -807,11 +819,31 @@ class Updater:
         out_sigma: tuple[float, float] | None = sig
         support: list[list[float]] | None = [
             [round(float(v), 4) for v in anchors[i].dst[:3, 3]] for i in inl]
-        if (large or before is None) and not supported:
+        kept = (large or before is None) and not supported
+        if kept:
             out, out_sigma, support = before, before_sigma, before_support
         for fr, a in zip(drift, anchors, strict=True):
             fr.prior_residual = anchor.residual(out or Sim3(), a)
-        return out, out_sigma, support
+        return out, out_sigma, support, kept and before is not None
+
+    @staticmethod
+    def _confirmed_support(anchored: _Anchored, registered: list[_Frame]) -> None:
+        """The supporting frames after the job (map.md §1 "Supporting frames", P17): under an
+        estimate the job kept (``drift_kept``), its fit's inliers and every drifting frame the
+        images confirmed under it since, this job's registered ones in canonical order, each
+        once and without a count bound; a changed estimate's are its new fit's inliers."""
+        if not anchored.drift_kept:
+            return
+        support = list(anchored.drift_support or [])
+        for fr in sorted(registered, key=lambda fr: (natural_key(fr.work.name),
+                                                     fr.work.camera_id, fr.work.index)):
+            p = fr.work.prior
+            if fr.internal is None or p is None or p["trust"] != "drifting":
+                continue
+            c = [round(float(v), 4) for v in _mat(p["T_map_cam"])[:3, 3]]
+            if c not in support:
+                support.append(c)
+        anchored.drift_support = support
 
     def _post_check(self, placed: list[_Frame], anchored: _Anchored, internal: InternalMap,
                     prev: dict[str, Any] | None = None) -> list[_Frame]:
@@ -918,6 +950,7 @@ class Updater:
             self._keep_at_prior(fr, *drift)
         if result is not None:
             _, internal, anchored, objects = result
+            self._confirmed_support(anchored, registered)
             record = self._record(job, frames, registered + kept, prev, internal, anchored,
                                   objects)
         elif prev is not None and kept:
