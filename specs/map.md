@@ -122,8 +122,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * **Drift-grown sigma.** A frame placed through the drift estimate has the root sum of
     squares of its prior's sigma and the drift estimate's own sigma at that pose. The drift
     estimate's sigma includes its extrapolation away from the frames that supported it: it
-    grows with distance from them, and is never only the fit residual at those frames. This
-    holds on every engine.
+    grows with the distance from the frame's prior position to the nearest supporting frame's
+    prior position, at the rate recorded in `README.md`, and is never only the fit residual at
+    those frames. Travel since the client's last fix is the client's part: `drifting` priors
+    already carry sigmas grown with travel. This holds on every engine.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
@@ -193,8 +195,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        whatever the engine or pass (MapAnything, a retry, re-registration), until the
        component links to a confirmed keyframe.
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests,
-       api.md §4) apply frame by frame to the component's fitted poses. A failing frame is
-       `kept_at_prior`. The rest of the component stays registered if it is still connected
+       api.md §4) apply frame by frame to the component's fitted poses. A frame that fails
+       them is rejected with `prior_conflict` when its image-only pose meets the
+       measurable-pair threshold (at least 100 inliers and 10 % overlap with a confirmed or
+       registered reference, §1); otherwise it is `kept_at_prior` with `detail`
+       `conflict_unsupported` (or the looseness detail when it failed a looseness test). The
+       rest of the component stays registered if it is still connected
        and placed without that frame. Removals iterate to a fixed point, re-checking
        connectivity after each removal, and the final statuses do not depend on the order in
        which frames are removed.
@@ -209,7 +215,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        the prior checks. So the same job can confirm it.
     6. **Pose duplicates.** After the registration fixed point, one pose-duplicate pass covers
        every frame registered in the job, in canonical name order; of a pair, the later-named
-       frame is the duplicate (api.md §4).
+       frame is the duplicate (api.md §4). A stored kept keyframe re-registered in this job
+       counts as a frame of this job for the pass, not as a stored confirmed keyframe. If a
+       frame the pass rejects served as a reference for other frames, as the drift reference,
+       as scale evidence, or for a re-registration, the job's registration fixed point runs
+       once more without it, so none of its effects remain.
     7. The outcome does not depend on the order of frames in the request. Where any order is
        still needed (the origin frame, the seed frame, the pose-duplicate pass), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the

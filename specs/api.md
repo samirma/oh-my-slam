@@ -132,13 +132,13 @@ error code `invalid_request` (§9).
   registered one in that version (map.md §2), and the job reports it in
   `quality.reregistered`.
   * **Too-close exception** (every engine, the older mapper included). A frame that is
-    `kept_at_prior` only because it is `too_close`,
-    and has a `metric` prior, still contributes at its prior pose: its detections, to object
-    records and `detection_votes`; its depth points, to the cloud, occupancy and heights. Depth
+    `kept_at_prior` only because it is `too_close`, and has a `metric` prior, still contributes
+    at its prior pose: its detections, to object records and `detection_votes`; its depth
+    points, to the cloud, occupancy and heights. On the older mapper engine its depth reaches
+    occupancy and heights but not the cloud, which is that engine's own fused cloud. Depth
     points count only from a depth image, inside its valid range (`README.md`). Without a depth
     image, its detections and `detection_votes` still count at the prior pose, placed like any
-    monocular detection. It never contributes scale
-    evidence: scale stays confirmed-only.
+    monocular detection. It never contributes scale evidence: scale stays confirmed-only.
   * Every other `kept_at_prior` frame contributes nothing until its images confirm it,
     including a `too_close` frame with a `drifting` prior and a frame kept for any other failed
     check.
@@ -166,12 +166,15 @@ error code `invalid_request` (§9).
     with the prior and with no rival inflation. For a `drifting` prior, σ_prior is the
     drift-grown sigma. The same bound applies to locate (§6).
   * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with
-    the prior, and no supported hypothesis lies within that bound.
+    the prior, and no supported hypothesis lies within that bound. The images confirm a pose
+    when its image-only pose meets the measurable-pair threshold (at least 100 inliers and
+    10 % overlap with a confirmed or registered reference, map.md §1). A frame that fails the
+    prior checks without meeting it is `kept_at_prior`, `detail` `conflict_unsupported`.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
   * In updates, `few_features` is only the checks' verdict: fewer keypoints than the
     registration minimum (§6); one `README.md` constant serves both (currently 15). A frame
-    with a prior that passed the checks but was not placed
-    is `kept_at_prior` with `no_overlap`, `detail` `no_image_pose` or `loose_image_pose`.
+    with a prior that passed the checks but was not placed is `kept_at_prior` with
+    `no_overlap`, `detail` `no_image_pose` or `loose_image_pose`.
   * A frame with a prior whose image fails a quality check, or that is too close, is
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
     `few_features`, `too_close`, with `min_distance_m` and `scene_distance_m` when it is
@@ -192,9 +195,12 @@ error code `invalid_request` (§9).
       camera, or of another frame registered in the same job with the same camera. There is
       one pose-duplicate pass, after the registration fixed point, over all frames registered
       in the job in canonical name order; of a pair, the later-named frame is the duplicate
-      (map.md §2, match graph). The pose test uses the frame's registered pose: a frame that
-      does not register can be a duplicate only by name. A pose duplicate is rejected only when its image also agrees
-      with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
+      (map.md §2, match graph). A stored kept keyframe re-registered in this job counts as a
+      frame of this job for the pass. If a rejected duplicate served as a reference, as the
+      drift reference, as scale evidence or for a re-registration, the registration fixed
+      point runs once more without it. The pose test uses the frame's registered pose: a frame
+      that does not register can be a duplicate only by name. A pose duplicate is rejected only
+      when its image also agrees with that keyframe: at least 90 % of its features re-matched. No detection is run for it.
       Otherwise it is `registered`, and the later observation wins (map.md §3, C13).
     * Stored `kept_at_prior` keyframes do not count for this test. 0.02 m and 2° are defaults;
       `README.md` may raise them up to, but not reaching, 0.05 m and 5°, so a frame 0.05 m or
