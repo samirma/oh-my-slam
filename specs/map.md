@@ -23,6 +23,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane.
+* **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
+  the same convention as with priors. The origin is straight below the first registered
+  frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
 * **Re-estimating poses.** An update may re-estimate the poses of stored frames, for example in
   a rebuild after a loop closes. Its result is then aligned back to the previous version before
   commit, by a similarity transform fitted on the frames both versions hold. The update reports:
@@ -61,7 +64,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   3. camera heights above the floor, per frame or per camera (`camera_height`);
   4. monocular depth (`monocular`).
 
-  `scale_sigma_rel` is estimated from the residuals of that source. A later update may refine
+  `scale_sigma_rel` is estimated from the residuals of that source. It bounds the relative error
+  of any horizontal distance, in every direction. A later update may refine
   the scale: `quality.scale_ratio_vs_prev` reports the change.
 
 ## 2. Versions (O2)
@@ -69,8 +73,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Versions.** Every commit creates version *n + 1*: integers from 1, never reused, immutable
   once written. A version holds:
   * the frames and their poses, each pose marked `provisional` (registered, not yet fused),
-    `fused`, or `kept_at_prior` (the prior, unconfirmed by the images; it may be fused);
-  * the cloud and its free-space fusion;
+    `fused`, or `kept_at_prior` (the prior, unconfirmed by the images);
+  * the cloud and its free-space fusion. Occupancy, heights, the cloud and object records come
+    only from image-confirmed frames; a `kept_at_prior` frame counts only for free-by-rule cells
+    (§6) until it is registered. A later update may re-register a stored `kept_at_prior`
+    frame: when a later job's images confirm it, its pose leaves `kept_at_prior` in that
+    version (it becomes a registered pose, `provisional` then `fused`), and from then on it
+    feeds occupancy, heights, the cloud and objects. The job lists each such frame in
+    `quality.reregistered` (§4). There is no automatic background refinement;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -129,6 +139,9 @@ becomes a job with a `job_id`. A job goes through these states:
     image-only pose (§1), or null when there is none. A frame unconstrained in translation
     (§1) contributes to `max_displacement_deg` only;
   * `prior_disagreement_deg` (§1), 0 when no image relative rotation disagrees with the priors;
+  * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
+    frame this job's images confirmed (§2): how far confirmation moved the frame from its
+    prior-placed pose. Empty when there are none; a dry run predicts it;
   * the anchor residuals (median and max, in m and deg, against metric priors and, over earlier
     keyframes only, against the previous version);
   * `rejected_share`: inputs rejected over inputs sent;
@@ -164,6 +177,7 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | --- | --- |
 | `id` | Positive integer, persistent for the map's lifetime. |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
+| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of frames in which the object was in view, detected or not, so shares sum to at most 1 and may sum to less. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
 | `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. When the map's builder never recorded those views, `partial` on every axis. |
@@ -204,6 +218,10 @@ whatever the camera saw, because the robot stood there. So is the ring around th
 that the camera could not see: its near blind zone on the floor, from the camera's height and
 its lower field-of-view edge.
 
+**Unconfirmed frames.** A `kept_at_prior` keyframe counts only for these free-by-rule cells
+(camera stand and near blind disc) until a later job's images confirm it (§2). Occupancy,
+heights, the cloud and object records come only from image-confirmed frames.
+
 **The band applies as asked.** `occupied` uses the requested `z_min`–`z_max`, whatever its
 height. A request whose `z_max` is the robot's height plus a margin marks everything the robot
 could hit.
@@ -220,7 +238,11 @@ seen there.
   * when priors fixed the map frame, it is the large horizontal plane nearest the priors'
     origin height (z = 0). Robots put that origin where they stand: on the floor for a base or a
     humanoid, at the base link on the worktop for an arm;
-  * without priors, it is the lowest large horizontal plane seen below the cameras.
+  * without priors but with a camera height (`height_above_floor_m`), it is the floor plane the
+    height defines (about 0, §1), refined by an observed large horizontal plane within 3 sigma
+    of it;
+  * with neither priors nor a camera height, it is the lowest large horizontal plane seen below
+    the cameras.
 
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.

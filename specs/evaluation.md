@@ -74,6 +74,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `update.sigma_containment` | C1, C4 | Share of non-rejected update frames (registered and `kept_at_prior`, the latter against their prior's sigmas) whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
 | `scale.error_metric` | C2 | Scale error with `metric` priors |
 | `scale.error_camera_height` | C2 | Scale error with camera height only |
+| `scale.error_by_direction` | C2 | Worst relative scale error over four orthogonal horizontal directions. Verified by walls measured within 3 × the stated `scale_sigma_rel` of the stated scale in all four directions, and, when a camera height is given, `floor_z_m` within 0.02 m of 0 |
 | `frame.shift` | C1 | Map-frame shift of stored keyframes between consecutive versions, median position and rotation, beyond the stated `gauge_shift` |
 | `update.readable_latency` | C3 | Upload to frame readable in a version (`provisional_version` committed) |
 | `fusion.time_per_frame` | C3 | Fusion time per new frame, maps up to 500 keyframes |
@@ -90,6 +91,7 @@ are part of a definition (a distance, an angle, a cell size) stay here.
 | `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
 | `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
 | `grid.floor_false_obstacles` | C9 | Service-occupied cells and floor-standing objects lower than 0.06 m on open floor: cells that are free floor in the truth floor plan with no object or fixture, restricted to cells inside some keyframe camera's view frustum within the height band (unseen floor counts neither way) (map.md §5–§6) |
+| `grid.unconfirmed_occupancy` | C9, C10 | Occupied cells and objects attributable only to `kept_at_prior` frames |
 | `grid.id_stability` | C9 | Share of regions and passages whose id is unchanged between consecutive versions where their geometry did not change |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |
@@ -148,6 +150,7 @@ these ids.
 | `update.sigma_containment` | ≥ 0.99 |
 | `scale.error_metric` | ≤ 3 % |
 | `scale.error_camera_height` | ≤ 10 % |
+| `scale.error_by_direction` | ≤ 10 % |
 | `frame.shift` | ≤ 2 cm and ≤ 0.5° |
 | `update.readable_latency` | ≤ 2 s |
 | `fusion.time_per_frame` | ≤ 3 s |
@@ -164,6 +167,7 @@ these ids.
 | `grid.floor_observed` | ≥ 0.9 |
 | `grid.camera_cells_free` | 100 % |
 | `grid.floor_false_obstacles` | 0 |
+| `grid.unconfirmed_occupancy` | 0 |
 | `grid.id_stability` | 1.0 |
 | `features.region_set` | 100 % |
 | `grid.band_occupied` | ≥ 0.95 |
