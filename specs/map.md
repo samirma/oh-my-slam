@@ -26,13 +26,18 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   sin of the angle between the ray and the baseline. Below 0.3 px the pair is
   translation-unconstrained: one standpoint. Translation in front of a planar scene can read as
   a rotation: an accepted degenerate case, since priors are expected whenever odometry exists.
+* **Overlap.** The one overlap measure of this specification is the 8 × 8 inlier-cell
+  coverage of a reference image: the share of the reference image's 64 cells that hold at
+  least one matched inlier. A check that names a reference uses that image; for a pair with no
+  named reference, the overlap is the smaller of the two coverages, each image taken as the
+  reference.
 * **Without priors:**
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
   * frames whose pairwise two-view parallax (above) is below 0.3 px form one standpoint group,
-    registered as a pure rotation about a common centre. The common centre is the overlapped stored keyframe with the most pair inliers
-    (ties: the lowest keyframe id), or, when they overlap none, the mean of their image-only
+    registered as a pure rotation about a common centre. The common centre is the overlapped
+    stored keyframe with the most pair inliers (ties: the lowest keyframe id), or, when they overlap none, the mean of their image-only
     centres; its position sigma is their spread.
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
@@ -40,6 +45,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     image-measured relative rotations: a hard limit (§4, `rotation_inconsistent`). With priors
     this limit does not apply; the prior-rotation correction below covers it;
   * sigmas stay honest: the containment targets (evaluation.md) apply.
+* **Every engine.** Calibrated sigmas and the `rotation_inconsistent` limit (§4) apply to every
+  engine, the older mapper included: every engine's sigmas mean the same thing. The older
+  mapper is exempt from standpoint grouping only.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -71,9 +79,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   on `max_displacement_m` / `max_displacement_deg` measure new-frame disagreement. Prior
   corrections show in `prior_disagreement_deg` and `prior_residual_*` only.
 * **Priors against images.** A prior is weighed by its sigmas against the relative pose the
-  images give between overlapping frames. The overlap of two frames is the smaller of the two
-  directed shares: the share of one frame's matched points that lie inside the other image.
-  Where two frames overlap by at least 50 % and their image relative rotation disagrees with
+  images give between overlapping frames. Where two frames overlap (§1, Overlap) by at least
+  50 % and their image relative rotation disagrees with
   their priors' relative rotation by more than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames'
   prior rotation sigmas (`metric` and `drifting` priors alike), the rotation is corrected from
   the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
@@ -98,12 +105,16 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the cloud and its free-space fusion. Occupancy, heights (the `height_m` layer and object
     heights), the cloud, object records and all scale evidence (depth, camera height) come only
     from image-confirmed frames; a `kept_at_prior` frame counts only for free-by-rule cells
-    (§6) until it is registered. Only image-confirmed keyframes are registration references
+    (§6) until it is registered. Exception: a frame kept only for `too_close` with a `metric`
+    prior contributes its detections and its in-range depth at the prior pose (api.md §4), but
+    never scale evidence. Only image-confirmed keyframes are registration references
     for new frames; `kept_at_prior` frames are not.
   * **Re-registration.** When a job registers new frames that overlap a stored `kept_at_prior`
-    frame (a new registered frame of the job shares at least 10 % of the stored frame's
-    view), the service re-runs that stored frame's registration against the confirmed map. If
-    its images confirm it, its pose leaves `kept_at_prior` in that version (it becomes a
+    frame (the overlap of §1 with the kept frame as the reference: at least 10 % of the kept
+    frame's image covered by a new registered frame of the job), the service re-runs that
+    stored frame's registration against the confirmed map. A frame kept for a failed check is
+    eligible too. Only its images can confirm it, never depth; when they do not, it stays
+    `kept_at_prior` and is not listed in `quality.reregistered`. If its images confirm it, its pose leaves `kept_at_prior` in that version (it becomes a
     registered pose, `provisional` then `fused`), and from then on it feeds occupancy,
     heights, the cloud and objects. The job lists each such frame in `quality.reregistered`
     (§4); the movement of that confirmation is excluded from `previous_residuals` and
@@ -205,8 +216,7 @@ becomes a job with a `job_id`. A job goes through these states:
     `failed_checks` holding `rotation_inconsistent`, when the committed relative rotations
     between overlapping neighbours disagree with their image-measured relative rotations by
     more than 3° in median over the pairs, or by more than 10° on any single pair.
-    * Overlapping neighbours: pairs sharing at least 10 % of their view (the overlap measure of
-      §1).
+    * Overlapping neighbours: pairs whose overlap (§1, Overlap) is at least 10 %.
     * Without priors: the update's frames carry no priors.
     * Image-measured: each pair's own two-view relative rotation, independent of the joint
       solve.
@@ -222,7 +232,7 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | --- | --- |
 | `id` | Positive integer, persistent for the map's lifetime. |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
-| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre, detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
+| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre, detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
 | `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. When the map's builder never recorded those views, `partial` on every axis. |
@@ -265,7 +275,9 @@ its lower field-of-view edge.
 
 **Unconfirmed frames.** A `kept_at_prior` keyframe counts only for these free-by-rule cells
 (camera stand and near blind disc) until a later job's images confirm it (§2). Occupancy, the
-`height_m` layer, the cloud and object records come only from image-confirmed frames.
+`height_m` layer, the cloud and object records come only from image-confirmed frames, except
+the in-range depth and detections of a frame kept only for `too_close` with a `metric` prior
+(api.md §4).
 
 **The band applies as asked.** `occupied` uses the requested `z_min`–`z_max`, whatever its
 height. A request whose `z_max` is the robot's height plus a margin marks everything the robot
