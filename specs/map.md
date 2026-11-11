@@ -45,7 +45,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     when they overlap none, the mean of their image-only centres; its position sigma is their
     spread;
   * **Measurable pair.** A pair of frames is measurable only with at least 100 epipolar
-    inliers and an overlap (§1, Overlap) of at least 10 %. Otherwise it counts as no
+    inliers and an overlap (§1, Overlap) of at least 10 %. For a frame's image-only pose against
+    its references, both must hold with the same confirmed or registered reference. Otherwise
+    it counts as no
     measurable pair, which passes every pair limit (§4). Standpoint grouping and the pair
     limits use this threshold;
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
@@ -99,12 +101,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   images give between overlapping frames. Where two frames overlap (§1, Overlap) by at least
   50 % and their image relative rotation disagrees with their priors' relative rotation by more
   than 3 × hypot(σ_rot,a, σ_rot,b) of the two frames' prior rotation sigmas (`metric` and
-  `drifting` priors alike), the rotation is corrected from the images. `quality` always reports `prior_disagreement_deg`: the largest such disagreement
-  over the update's frames, 0 when none.
+  `drifting` priors alike), the rotation is corrected from the images. `quality` always
+  reports `prior_disagreement_deg`: the largest such disagreement over the update's frames, 0
+  when none.
 * **Drift estimate.** The drift estimate that places `drifting` priors is robust:
   * it is fitted over image-confirmed frames with `drifting` priors;
   * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
-    rejected with `prior_conflict`;
+    rejected with `prior_conflict` (when its image-only pose meets the measurable-pair threshold;
+    otherwise `kept_at_prior`, `conflict_unsupported`);
   * a frame can support a first estimate or a change when its image-only pose, per frame and
     across all its references, has at least 100 inliers against confirmed keyframes and an
     8 × 8 overlap of at least 10 % with at least one of them, even if it conflicts under the
@@ -113,8 +117,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     larger than 3 × its own sigma, both need the same robust support: min(3, n) supporting
     frames and at least 50 % of n, where n counts every `drifting`-prior frame of the job that
     can support it, whatever its final status. One strong frame alone is never enough;
-  * a refused change keeps the previous estimate, and the unsupported frames are rejected with
-    `prior_conflict`;
+  * a refused change keeps the previous estimate, and each unsupported frame is rejected with
+    `prior_conflict` (when its image-only pose meets the measurable-pair threshold; otherwise
+    `kept_at_prior`, `conflict_unsupported`);
   * a refused first estimate leaves the drift at the identity: priors are used as sent, with
     their sigmas. Only frames that conflict with their priors under the identity are rejected
     with `prior_conflict`; frames consistent with their priors keep their normal status;
@@ -126,6 +131,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     prior position, at the rate recorded in `README.md`, and is never only the fit residual at
     those frames. Travel since the client's last fix is the client's part: `drifting` priors
     already carry sigmas grown with travel. This holds on every engine.
+  * **Supporting frames.** The supporting frames are the inliers of the fit that produced the
+    current drift estimate, plus every `drifting`-prior frame that images later confirmed under
+    that same estimate, with no count bound. The set resets to the new fit's inliers whenever
+    the estimate changes.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
@@ -162,22 +171,21 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
     kept. Within a job, a job frame counts as an edge once it is registered (match graph,
     below).
-  * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame
-    of the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
-    reference) and matches it with at least the registration minimum of inliers (the
-    `README.md` constant, currently 15). The service then re-runs that stored frame's
-    registration against the confirmed map. A frame kept for a failed check is eligible too.
-    It is confirmed by its images only, never by depth, and only when its fitted pose passes
-    the prior checks (api.md §4); otherwise it stays `kept_at_prior` and is not listed in
-    `quality.reregistered`. If its images confirm it, its
-    pose leaves `kept_at_prior` in that version (it becomes a registered pose, `provisional`
-    then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job
-    lists each such frame in `quality.reregistered` (§4); the movement of that confirmation is
-    excluded from `previous_residuals` and `gauge_shift`. A dry run predicts `reregistered`
-    with the same test, without committing; the prediction is approximate. An engine that cannot re-register (the older mapper) reports
-    `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
-    keyframes, even within the duplicate limits. Nothing re-registers a frame outside a job:
-    there is no automatic background refinement;
+  * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame of
+    the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
+    reference) and matches it with at least the registration minimum of inliers (the `README.md`
+    constant, currently 15). The service then re-runs that stored frame's registration against the
+    confirmed map. A frame kept for a failed check is eligible too. It is confirmed by its images
+    only, never by depth, and only when its fitted pose passes the prior checks (api.md §4);
+    otherwise it stays `kept_at_prior` and is not listed in `quality.reregistered`. If its images
+    confirm it, its pose leaves `kept_at_prior` in that version (it becomes a registered pose,
+    `provisional` then `fused`), and from then on it feeds occupancy, heights, the cloud and
+    objects. The job lists each such frame in `quality.reregistered` (§4); the movement of that
+    confirmation is excluded from `previous_residuals` and `gauge_shift`. A dry run predicts
+    `reregistered` with the same test, without committing; the prediction is approximate. An engine
+    that cannot re-register (the older mapper) reports `reregistered` as an empty list; this is
+    allowed. Re-registration never rejects or merges keyframes, even within the duplicate limits.
+    Nothing re-registers a frame outside a job: there is no automatic background refinement;
   * **Match graph.** A job's registration is order-independent and runs over the job's match
     graph:
     1. An edge joins two frames of the job, or a new frame and a confirmed stored keyframe.
@@ -194,16 +202,16 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        prior's. This floor applies to every frame whose placement depends on the component,
        whatever the engine or pass (MapAnything, a retry, re-registration), until the
        component links to a confirmed keyframe.
-    3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests,
-       api.md §4) apply frame by frame to the component's fitted poses. A frame that fails
-       them is rejected with `prior_conflict` when its image-only pose meets the
-       measurable-pair threshold (at least 100 inliers and 10 % overlap with a confirmed or
-       registered reference, §1); otherwise it is `kept_at_prior` with `detail`
-       `conflict_unsupported` (or the looseness detail when it failed a looseness test). The
-       rest of the component stays registered if it is still connected
-       and placed without that frame. Removals iterate to a fixed point, re-checking
-       connectivity after each removal, and the final statuses do not depend on the order in
-       which frames are removed.
+    3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests, api.md
+       §4) apply frame by frame to the component's fitted poses. A frame that fails a looseness test
+       is `kept_at_prior` with `detail` `loose_image_pose`, whatever else it fails. Otherwise, a
+       frame beyond the conflict bound is rejected with `prior_conflict` when its image-only pose
+       meets the measurable-pair threshold (at least 100 inliers and 10 % overlap, both with the
+       same confirmed or registered reference, §1), and is otherwise `kept_at_prior` with `detail`
+       `conflict_unsupported`. The rest of the component stays registered if it is still connected
+       and placed without that frame. Removals iterate to a fixed point, re-checking connectivity
+       after each removal, and the final statuses do not depend on the order in which frames are
+       removed.
     4. A frame is kept with `no_overlap` only if its component cannot be placed at all. A lone
        frame, with no edge at the registration minimum, cannot be placed: with a prior it is
        `kept_at_prior`, reason `no_overlap`, `detail` `no_image_pose`.
@@ -219,7 +227,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        counts as a frame of this job for the pass, not as a stored confirmed keyframe. If a
        frame the pass rejects served as a reference for other frames, as the drift reference,
        as scale evidence, or for a re-registration, the job's registration fixed point runs
-       once more without it, so none of its effects remain.
+       once more without it, so none of its effects remain:
+       * that second run happens at most once per job; a duplicate found in it is rejected
+         without a further run;
+       * a frame rejected as a duplicate keeps its first `duplicate_of`, even if its partner
+         ends differently in the second run;
+       * if the later member of the pair is a stored kept keyframe that the job re-registered,
+         its re-registration is undone (it stays kept as stored) and the second run skips
+         it.
     7. The outcome does not depend on the order of frames in the request. Where any order is
        still needed (the origin frame, the seed frame, the pose-duplicate pass), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the

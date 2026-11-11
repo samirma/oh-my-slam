@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change. In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with a confirmed or registered reference); otherwise it is kept_at_prior with detail conflict_unsupported."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change (when its image-only pose meets the measurable-pair threshold; otherwise kept_at_prior, conflict_unsupported). In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap, both with the same confirmed or registered reference); a frame failing a looseness test is kept_at_prior with loose_image_pose, whatever else it fails; otherwise it is kept_at_prior with detail conflict_unsupported."
     },
     "InputStatus": {
       "type": "object",
@@ -436,7 +436,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
+          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior. Kept even if the partner ends differently when the fixed point is re-run (at most once per job)."
         },
         "detail": {
           "oneOf": [
@@ -451,7 +451,7 @@
               "type": "null"
             }
           ],
-          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. conflict_unsupported: failed the prior checks without meeting the measurable-pair threshold."
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference)."
         }
       },
       "allOf": [
@@ -1086,7 +1086,7 @@
         },
         "duplicate_of": {
           "type": "string",
-          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior."
+          "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior. Kept even if the partner ends differently when the fixed point is re-run (at most once per job)."
         }
       },
       "allOf": [
@@ -2256,7 +2256,7 @@
             "boolean",
             "null"
           ],
-          "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is, in order: the locate frame's height_sigma_m; else the median height_sigma_m the answer's reference keyframes carried when sent; else the median of their sigma_pos_m / sqrt(3); else the README default. The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
+          "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is, in order: the locate frame's height_sigma_m; else the median height_sigma_m the answer's reference keyframes carried when sent; else the median sigma_pos_m / sqrt(3) of the registered (image-confirmed) reference keyframes, kept references skipped; else the README default. The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
         },
         "nearest_view": {
           "oneOf": [
