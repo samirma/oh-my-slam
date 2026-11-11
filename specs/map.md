@@ -33,7 +33,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   named reference, the overlap is the smaller of the two coverages, each image taken as the
   reference.
 * **Without priors:**
-  * the origin is the optical centre of the first registered frame, in request order;
+  * the origin is the optical centre of the first registered frame, in canonical name order
+    (§2, match graph);
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
   * frames whose pairwise two-view parallax (above) is below 1 px form one standpoint group,
@@ -99,6 +100,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * it is fitted over image-confirmed frames with `drifting` priors;
   * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
     rejected with `prior_conflict`;
+  * a first estimate, when the map has none yet, needs the support of min(3, n) frames, n the
+    job's `drifting`-prior frames, and of at least 50 % of them;
   * a change of the estimate between versions larger than 3 × its own sigma needs the support
     of at least 3 frames and of at least 50 % of the job's `drifting`-prior frames. Without it
     the change is refused, the previous estimate stays, and the unsupported frames are
@@ -131,7 +134,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     never scale evidence.
   * **Height gate.** When frames carry `height_above_floor_m` and `height_sigma_m`, a frame
     whose committed camera height disagrees with it by more than
-    3 × sqrt(height_sigma² + σ_z²) (σ_z: its committed position sigma along z) contributes
+    3 × sqrt(height_sigma² + σ_z²) (σ_z = `sigma_pos_m` / √3, its committed position sigma
+    being 3-D RMS) contributes
     nothing to occupancy, heights or objects. Its registration status is unchanged, and
     `quality.height_inconsistent` lists it by name.
   * Only image-confirmed keyframes are registration references for new
@@ -145,8 +149,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     eligible too. Only its images can confirm it, never depth; when they do not, it stays
     `kept_at_prior` and is not listed in `quality.reregistered`. If its images confirm it, its
     pose leaves `kept_at_prior` in that version (it becomes a registered pose, `provisional`
-    then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job lists each such frame in `quality.reregistered`
-    (§4); the movement of that confirmation is excluded from `previous_residuals` and
+    then `fused`), and from then on it feeds occupancy, heights, the cloud and objects. The job
+    lists each such frame in `quality.reregistered` (§4); the movement of that confirmation is excluded from `previous_residuals` and
     `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
     the prediction is approximate. An engine that cannot re-register (the older mapper) reports
     `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
@@ -162,7 +166,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        limits.
     2. Each connected component of new frames registers as a whole. Relative poses come from
        the images. The component is placed by its matches to confirmed keyframes, by the
-       priors of all its frames together, or both.
+       priors of all its frames together, or both. A component that reaches no confirmed
+       keyframe is seeded at one frame's prior. Its frames' reported sigmas cover the seed
+       prior's sigma combined with each frame's fusion, and are never tighter than the seed
+       prior's.
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests,
        api.md §4) apply frame by frame to the component's fitted poses. A failing frame is
        `kept_at_prior`. The rest of the component stays registered if it is still connected
@@ -174,10 +181,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        `kept_at_prior`, reason `no_overlap`, `detail` `no_image_pose`.
     5. `kept_at_prior` frames of earlier versions are not references, and a job frame counts
        as an edge only once it is registered. Earlier kept frames that match a registered
-       component with at least the registration minimum of inliers go through re-registration (above, images only),
-       so the same job can confirm them.
-    6. The outcome does not depend on the order of frames in the request. A dry run applies
-       the same procedure and predicts the same statuses;
+       component with at least the registration minimum of inliers go through re-registration
+       (above, images only), so the same job can confirm them.
+    6. The outcome does not depend on the order of frames in the request. Where any order is
+       still needed (the origin frame, the seed frame, a duplicate's earlier frame), frames are
+       taken in canonical name order. A dry run applies the same procedure and predicts the
+       same statuses, except on maps built by the MapAnything engine, where it predicts with
+       geometric registration and its statuses can differ (api.md §4);
   * the objects;
   * the grid inputs;
   * the scale;
