@@ -429,3 +429,18 @@ def test_the_floor_of_a_cloud() -> None:
         points_z = None
 
     assert map_floor(NoCloud()) is None  # type: ignore[arg-type]
+
+
+def test_a_mapper_pose_duplicate_needs_the_stored_image() -> None:
+    """api.md §4 on the older mapper's engine: a stored frame whose image is gone cannot agree,
+    so a frame at its pose is no duplicate."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.service.update import Updater
+
+    rgb = (np.random.default_rng(0).random((120, 160, 3)) * 255).astype(np.uint8)
+    fr = SimpleNamespace(pose=np.eye(4), rgb=rgb,
+                         work=SimpleNamespace(name="n", camera_id="cam"))
+    prev = {"frames": [{"name": "s", "camera_id": "cam", "T_map_cam": np.eye(4).tolist(),
+                        "internal": "s.jpg"}]}
+    assert Updater._duplicate_of(fr, prev, [], None) is None  # type: ignore[arg-type]
