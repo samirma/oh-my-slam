@@ -25,8 +25,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the origin is the optical centre of the first registered frame, in request order;
   * +x is that camera's viewing direction projected onto the horizontal plane;
   * +z is up, estimated from gravity and the floor plane;
-  * frames whose mutual parallax (baseline over median scene depth) is below 0.02, that is one
-    standpoint, are registered as a pure rotation about a common centre;
+  * frames whose pairwise parallax (baseline over median scene depth, from their two-view fit)
+    is below 0.02 form one standpoint group, registered as a pure rotation about a common
+    centre. The common centre is the mean of their image-only centres, or the position of the
+    stored keyframe they overlap; its position sigma is their spread. A rotation-only
+    hypothesis takes the standpoint's position sigma, and the position test (api.md §4) uses
+    it;
   * the committed relative rotations of overlapping neighbours must agree with their
     image-measured relative rotations: a hard limit (§4, `rotation_inconsistent`). With priors
     this limit does not apply; the prior-rotation correction below covers it;
@@ -100,7 +104,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     (§4); the movement of that confirmation is excluded from `previous_residuals` and
     `gauge_shift`. A dry run predicts `reregistered` with the same test, without committing;
     the prediction is approximate. An engine that cannot re-register (the older mapper) reports
-    `reregistered` as an empty list; this is allowed. Nothing re-registers a frame outside a job: there is no automatic background refinement;
+    `reregistered` as an empty list; this is allowed. Re-registration never rejects or merges
+    keyframes, even within the duplicate limits. Nothing re-registers a frame outside a job:
+    there is no automatic background refinement;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -192,6 +198,13 @@ becomes a job with a `job_id`. A job goes through these states:
     `failed_checks` holding `rotation_inconsistent`, when the committed relative rotations
     between overlapping neighbours disagree with their image-measured relative rotations by
     more than 3° in median over the pairs, or by more than 10° on any single pair.
+    * Overlapping neighbours: pairs sharing at least 10 % of their view (the overlap measure of
+      §1).
+    * Without priors: the update's frames carry no priors.
+    * Image-measured: each pair's own two-view relative rotation, independent of the joint
+      solve.
+  * Hard limits are measured on registered frames only. With no measurable pair,
+    `rotation_inconsistent` passes.
 
 ## 5. Objects (O8)
 
@@ -264,9 +277,9 @@ seen there.
     origin height (z = 0). Robots put that origin where they stand: on the floor for a base or a
     humanoid, at the base link on the worktop for an arm;
   * without priors but with a camera height (`height_above_floor_m`), it is the floor plane the
-    height defines (about 0, §1), refined by an observed large horizontal plane within
-    3 × `floor_sigma_m` of it. The height used is the first registered frame's
-    `height_above_floor_m`;
+    height defines (about 0, §1), refined by the observed large horizontal plane nearest it,
+    accepted when within 3 × that plane's own point spread; `floor_sigma_m` is that spread. The
+    height used is the first registered frame's `height_above_floor_m`;
   * with neither priors nor a camera height, it is the lowest large horizontal plane seen below
     the cameras.
 

@@ -342,7 +342,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched, no visible object record would change); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or an earlier registered frame of the request, same camera) whose image also agrees (>= 90 % features re-matched, no visible object record would change); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior."
     },
     "InputStatus": {
       "type": "object",
@@ -713,7 +713,7 @@
               "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Hard limits are measured on registered frames only; with no measurable pair, rotation_inconsistent passes."
         },
         "reregistered": {
           "type": "array",
@@ -1830,7 +1830,7 @@
         "floor_sigma_m": {
           "type": "number",
           "minimum": 0,
-          "description": "Spread (standard deviation) of the floor points' heights, not the uncertainty of their mean; the floor band is max(0.06, 3 x floor_sigma_m) on either side of floor_z_m."
+          "description": "Spread (standard deviation) of the floor points' heights, not the uncertainty of their mean; the floor band is max(0.06, 3 x floor_sigma_m) on either side of floor_z_m. With a camera height and no priors: the point spread of the observed plane nearest the height-defined floor, accepted within 3 x that spread."
         },
         "height_cap_m": {
           "type": "number",

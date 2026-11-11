@@ -137,8 +137,9 @@ error code `invalid_request` (§9).
     it is supported at 0.25 or more (the same definition as locate, §6).
   * **Conflict with the prior.** A hypothesis conflicts with the prior when its distance from
     the prior exceeds 3 × sqrt(σ_prior² + σ_hypothesis²), tested separately for position and
-    rotation; σ_hypothesis is the hypothesis's own calibrated sigma. The same bound applies to
-    locate (§6).
+    rotation. σ_hypothesis is the hypothesis's own image-only calibrated sigma, before fusion
+    with the prior and with no rival inflation. For a `drifting` prior, σ_prior is the
+    drift-grown sigma. The same bound applies to locate (§6).
   * `rejected` with `prior_conflict` only when the images confirm a pose that conflicts with
     the prior, and no supported hypothesis lies within that bound.
   * A frame whose images merely fail to confirm it is `kept_at_prior`, not rejected.
@@ -148,7 +149,8 @@ error code `invalid_request` (§9).
     `too_close`. It is `rejected` only when the image is unusable (`unusable_image`: it does not
     decode, or its size is not the camera's). This wins over `prior_conflict`: a frame that
     fails a check, or is too close, and whose image also strongly conflicts with its prior, is
-    `kept_at_prior` with that check's reason.
+    `kept_at_prior` with that check's reason. Depth agreement alone never confirms a frame with
+    a prior that failed a check: it stays `kept_at_prior`.
   * This holds for an origin frame too: a frame of a map's first update whose image fails a
     quality check is `kept_at_prior` and still defines the map frame (map.md §1). An engine that
     cannot tie kept frames to the priors' frame, when no prior-carrying frame registers, may
