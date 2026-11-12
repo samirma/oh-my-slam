@@ -25,7 +25,7 @@ def _fr(name: str, T: np.ndarray, index: int, trust: str | None = None,
                                                                   else prior).tolist()}
     return SimpleNamespace(work=SimpleNamespace(name=name, index=index, trust=trust, prior=p),
                            cam=SimpleNamespace(canonical=lambda: K), rgb=rgb, ignore=None,
-                           pose=T, internal=object())
+                           pose=T, internal=object(), depth_m=None)
 
 
 def test_the_mapper_prior_disagreement_uses_the_coverage() -> None:

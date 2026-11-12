@@ -50,8 +50,8 @@ from numpy.typing import NDArray
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import anchor
 from oh_my_slam.mapping.anchor import Anchor, Sim3
+from oh_my_slam.mapping.anchored import MIN_AGREEING, agreement, backproject, depth_confirmed
 from oh_my_slam.mapping.anchored import DepthRef as Ref
-from oh_my_slam.mapping.anchored import agreement, backproject
 
 Array = NDArray[np.float64]
 
@@ -66,6 +66,10 @@ MA_SIGMA_ROT_DEG = 1.5
 MA_SIGMA_POS_REL = 0.03  # of the frame's median depth
 UNPOSED_SIGMA_POS_REL = 0.10  # an unposed call's, whose positions drift in a turn
 UNPOSED_SIGMA_ROT_DEG = 5.0  # an unposed call's rotations in a turn: up to 15 deg at 120 deg
+# map.md §2 step 8 (P20): a call with a single anchor has no anchor residual to estimate its
+# rotation noise from; its frames report no tighter (README "Camera-only frames": the largest
+# rotation error such calls committed on the client's wheeled turns, 17.7 deg, within 3 sigma)
+SINGLE_ANCHOR_SIGMA_ROT_DEG = 6.0
 DEPTH_TOL = 0.10  # relative depth agreement against depth images
 CALL_DEPTH_TOL = 0.15  # between MapAnything's depths of one call (0.76 / 0.88 at 10 / 20 %)
 MIN_DEPTH_M = 0.05
@@ -106,6 +110,7 @@ class Stored:
     T: Array  # T_map_cam
     order: int  # its position in the map (later = more recent)
     depth: Callable[[], NDArray[np.float32] | None] = lambda: None  # metric, on its grid
+    sensor: bool = False  # its depth is a depth image (the depth confirmation's references)
 
 
 @dataclass
@@ -150,6 +155,12 @@ class Placement:
     # the keys of the anchors its call's alignment rests on (a stored keyframe's name, or
     # ``new<index>`` for a frame of this update)
     anchors: tuple[str, ...] = ()
+
+    @property
+    def sigma_rot_floor(self) -> float:
+        """The rotation sigma it reports at least (``SINGLE_ANCHOR_SIGMA_ROT_DEG`` for a call of
+        a single anchor), whatever pass refines it (a standpoint's rotation sigma)."""
+        return SINGLE_ANCHOR_SIGMA_ROT_DEG if len(self.anchors) == 1 else 0.0
 
 
 @dataclass
@@ -210,6 +221,23 @@ def _thumb(path: Path) -> NDArray[np.float32] | None:
     return t / n if n > 1e-6 else t
 
 
+def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: list[Ref]
+             ) -> bool:
+    """The depth confirmation of a candidate pose (map.md §2 step 2, every engine;
+    ``anchored.depth_confirmed``) of a frame carrying a depth image, against the reference
+    carrying one (``images``) that sees most of its points agree (at least ``MIN_AGREEING``
+    seen); True for a monocular frame or with no such reference seeing it."""
+    if f.depth is None:
+        return True
+    pts = backproject(depth, Kd)
+    best: tuple[int, Ref] | None = None
+    for r in images:
+        a = agreement(pts, T, [r], DEPTH_TOL)
+        if a.agree + a.conflict >= MIN_AGREEING and (best is None or a.agree > best[0]):
+            best = (a.agree, r)
+    return best is None or depth_confirmed(Ref(T, depth, Kd), best[1], DEPTH_TOL)
+
+
 # -- the registration ----------------------------------------------------------------------------
 
 
@@ -223,6 +251,7 @@ class _Posed:
     T: Array
     order: int
     depth: Callable[[], tuple[NDArray[np.float32], Array] | None]  # metric depth, grid's K
+    sensor: bool = False  # that depth is a depth image
     _cache: list[tuple[NDArray[np.float32], Array] | None] = field(default_factory=list)
 
     def ref(self) -> Ref | None:
@@ -246,7 +275,8 @@ class Registration:
         self.views_of = multiview
         self.new = new
         self.pool: list[_Posed] = [
-            _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s)) for s in stored]
+            _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor)
+            for s in stored]
         self.placements: dict[int, Placement] = {}
         self.scenes: dict[int, float | None] = {}  # each new frame's median scene depth
         self.calls = 0
@@ -320,6 +350,8 @@ class Registration:
         rp = float(np.sqrt(np.mean([r[0] ** 2 for r in res])))
         rr = float(np.sqrt(np.mean([r[1] ** 2 for r in res])))
         floor_r = UNPOSED_SIGMA_ROT_DEG if self.unposed else MA_SIGMA_ROT_DEG
+        if len(anchors) == 1:  # no residual to estimate from (map.md §2 step 8)
+            floor_r = max(floor_r, SINGLE_ANCHOR_SIGMA_ROT_DEG)
         return S, src, (max(rp, MA_SIGMA_POS_M), max(rr, floor_r))
 
     def _place_chunk(self, chunk: list[New], out: list[MvView], anchors: list[_Posed], S: Sim3,
@@ -330,6 +362,7 @@ class Registration:
         na = len(anchors)
         keys = tuple(a.key for a in anchors)
         sensor = [r for a in anchors for r in [a.ref()] if r is not None]
+        images = [r for a in anchors if a.sensor for r in [a.ref()] if r is not None]
         call = [Ref(a.T, (out[i].depth * S.s).astype(np.float32), out[i].K)
                 for i, a in enumerate(anchors)]
         cand: dict[int, tuple[New, Array, tuple[float, float], NDArray[np.float32], Array,
@@ -353,10 +386,12 @@ class Registration:
                 refs = sensor if f.depth is not None else call
                 tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
                 a = agreement(backproject(depth, Kd), T, refs, tol)
-                if not a.confirmed:
+                if not a.confirmed or not confirms(f, T, depth, Kd, images):
                     continue
                 self._register(f, T, sig, depth, Kd, a.agree, keys)
                 sensor.append(Ref(T, depth, Kd))
+                if f.depth is not None:
+                    images.append(Ref(T, depth, Kd))
                 call.append(Ref(T, ma_depth, Kma))
                 del cand[idx]
                 changed = True
@@ -374,13 +409,13 @@ class Registration:
             self.scenes.get(f.index), anchors)
         got = (depth, Kd)
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
-                                lambda: got))
+                                lambda: got, f.depth is not None))
 
     def add_anchors(self, stored: list[Stored]) -> None:
         """Views another engine registered during the job, joining the pool: anchors of later
         calls (``retry``: a frame is inferred again once the pool grew since its call) and
         references of ``recheck``."""
-        self.pool += [_Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s))
+        self.pool += [_Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor)
                       for s in stored]
 
     def recheck(self, extra: list[Ref] | None = None) -> list[int]:
@@ -394,11 +429,12 @@ class Registration:
         while changed:
             changed = False
             refs = [r for v in self.pool for r in [v.ref()] if r is not None] + list(extra or [])
+            images = [r for v in self.pool if v.sensor for r in [v.ref()] if r is not None]
             for idx in sorted(self.waiting, key=lambda i: self.order[i]):
                 f, T, sig, depth, Kd, keys = self.waiting[idx]
                 tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
                 a = agreement(backproject(depth, Kd), T, refs, tol)
-                if not a.confirmed:
+                if not a.confirmed or not confirms(f, T, depth, Kd, images):
                     continue
                 del self.waiting[idx]
                 self._register(f, T, sig, depth, Kd, a.agree, keys)

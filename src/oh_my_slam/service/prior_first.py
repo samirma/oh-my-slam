@@ -84,11 +84,12 @@ def none_engine() -> str:
 
 
 def camera_only(w: UpdateWork) -> int:
-    """The frames of a request MapAnything registers (``none_engine``): those without a metric
-    or drifting prior."""
+    """The frames of a request MapAnything registers (``none_engine``): the monocular ones
+    without a metric or drifting prior (map.md §2 step 8: frames with depth images go to the
+    geometric engine first)."""
     if none_engine() != "mapanything":
         return 0
-    return sum(f.trust not in ("metric", "drifting") for f in w.frames)
+    return sum(f.trust not in ("metric", "drifting") and f.depth is None for f in w.frames)
 
 
 def _trusted(fr: _Frame) -> bool:
@@ -136,7 +137,8 @@ class _MaRun:
         am = self.am
         am.save()  # this update's keyframes get their image and depth on disk: anchors
         stored = [register_ma.Stored(k.id, img, k.K, k.T, i, functools.partial(am.depth_of,
-                                                                                 k.id))
+                                                                                 k.id),
+                                     k.depth_kind == "sensor")
                   for i, k in enumerate(am.keyframes)
                   if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
         if not stored:  # nothing confirmed to register against (a camera-only map, no origin)
@@ -176,7 +178,8 @@ class _MaRun:
         am = self.am
         am.save()  # their image and depth on disk: anchors
         self.reg.add_anchors([register_ma.Stored(k.id, img, k.K, k.T, ANCHOR_ORDER + i,
-                                                 functools.partial(am.depth_of, k.id))
+                                                 functools.partial(am.depth_of, k.id),
+                                                 k.depth_kind == "sensor")
                               for i, k in enumerate(extra)
                               for img in [am.image_path(k.id)] if img is not None])
         got = set(self.reg.recheck())
@@ -196,7 +199,8 @@ class _MaRun:
         # is left out of the features the service matches, those of standpoints and duplicates
         turned = standpoint.standpoints(
             am, [standpoint.NewFrame(fr.work.name, fr.cam.canonical(), fr.work.index,
-                                     _has_depth(fr), p.T, feats[fr.work.index]) for fr in frames
+                                     _has_depth(fr), p.T, feats[fr.work.index],
+                                     _depth_image(fr)) for fr in frames
                  for p in [res[fr.work.index]] if p.status == "registered" and p.T is not None],
             self.pairs)
         self.reg_s += time.perf_counter() - t
@@ -218,6 +222,8 @@ class _MaRun:
             assert p.T is not None and p.depth is not None and p.K_depth is not None
             T, sp, sr = turned.get(fr.work.index) or (p.T, *sigmas.calibrated(
                 p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
+            # a call of a single anchor: never tighter than its floor (map.md §2 step 8)
+            sr = max(sr, p.sigma_rot_floor)
             # its sigmas calibrated as every image pose's (``mapping.sigmas``; no prior); its
             # displacement (map.md §1): the committed pose against MapAnything's image-only
             # one, 0 unless a standpoint turned it
@@ -376,6 +382,19 @@ def _has_depth(fr: _Frame) -> bool:
     return fr.depth_m is not None and bool(np.count_nonzero(fr.depth_m > 0))
 
 
+def _depth_image(fr: _Frame) -> tuple[NDArray[np.float32], Intrinsics] | None:
+    """A frame's depth image for its two-view fits (``standpoint.NewFrame``): on its canonical
+    pixels, its ignored pixels holding none (``anchored.depth_image``); None without one."""
+    if not _has_depth(fr):
+        return None
+    assert fr.depth_m is not None
+    K = fr.cam.canonical()
+    m = on_grid(fr.ignore, fr.depth_m.shape)
+    d = fr.depth_m.astype(np.float32) if m is None else np.where(m, 0.0, fr.depth_m).astype(
+        np.float32)
+    return d, K
+
+
 def _input(fr: _Frame, pl: Placement | None) -> dict[str, Any]:
     """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed."""
     if pl is None:  # rejected by the checks
@@ -458,11 +477,16 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         if prev is None:  # in canonical name order (map.md §1, §2)
             origin = min([fr for fr in todo if _trusted(fr)] or todo, key=_canonical)
         camera_only_origin = origin is not None and not _trusted(origin)
-        # frames without a prior go to MapAnything after the others, but a new camera-only
-        # map's origin is the prior-first engine's
-        late = [fr for fr in todo if not _trusted(fr) and fr is not origin] \
-            if none_engine() == "mapanything" else []
+        # the engine order (map.md §2 step 8): frames with depth images go to the geometric
+        # engine first, as a dry run registers them; monocular frames without a prior go to
+        # MapAnything after the others (a new camera-only map's origin is the prior-first
+        # engine's), and so do the frames without a prior the geometric engine leaves unplaced
+        ma = none_engine() == "mapanything"
+        late = [fr for fr in todo if not _trusted(fr) and fr is not origin
+                and not _has_depth(fr)] if ma else []
         geo = [fr for fr in todo if all(fr is not x for x in late)]
+        # MapAnything may take some of them: the job's static content is measured over all
+        spill = ma and any(not _trusted(fr) for fr in geo)
         ins = []
         for fr in geo:
             fut = None
@@ -472,8 +496,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             ins.append(_frame_in(fr, fut))
         # the job's static image content, over every frame whichever engine registers it
         late_ins = [_frame_in(fr, None) for fr in late]
+        shared = bool(late) or spill  # else the engine measures it (``AnchoredMap.update``)
         late_feats = dict(zip([fr.work.index for fr in late], job_features(ins + late_ins)[len(ins):],
-                              strict=True)) if late else {}
+                              strict=True)) if shared else {}
         # the detections queue behind the monocular depth registration waits for
         dets = {fr.work.index: pool.submit(up.backend.detect, fr.path,
                                            detection_grid(fr.cam.canonical()), labels)
@@ -493,10 +518,11 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             start = am.job_start()
             geo0, ins0, late0, late_feats0 = list(geo), list(ins), list(late), dict(late_feats)
             reg_s = fuse_s = late_r = 0.0
+            spilled: list[_Frame] = []
             while True:
                 # the job stays open until both engines registered (``AnchoredMap.end_job``:
                 # the pose-duplicate pass over all of them, then the fusion)
-                pls = am.update(ins, progress, static=not late, hold=True) if ins else []
+                pls = am.update(ins, progress, static=not shared, hold=True) if ins else []
                 reg_s += am.timings.get("register", 0.0)
                 fuse_s += am.timings.get("fuse", 0.0)
                 # a new camera-only map whose origin was rejected: the next frame in canonical
@@ -515,6 +541,15 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                     fuse_s += am.timings.get("fuse", 0.0)
                 for fr, pl in zip(geo, pls, strict=True):
                     placements[fr.work.index] = pl
+                # the frames without a prior it left unplaced: MapAnything's too (map.md §2)
+                spilled = []
+                for fr, f in zip(geo, ins, strict=True):
+                    pl = placements[fr.work.index]
+                    if ma and not _trusted(fr) and pl.status == "rejected" \
+                            and pl.reason == "no_overlap" and f.feats is not None:
+                        spilled.append(fr)
+                        late_feats[fr.work.index] = f.feats
+                late = [*late, *spilled]
                 geo_s = reg_s - late_r
                 fused = {"geo": fuse_s, "late": 0.0}  # each engine's fusion seconds
                 if late:  # their scene distance is MapAnything's depth (``register_ma``)
@@ -586,7 +621,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         n_kept = sum(pl.status != "rejected" for pl in placements.values())
         if n_kept:
             up.timings.add("fusion_per_frame", tm["fusion"] / n_kept, n_kept)
-            _fusion_by_class(up, geo, late, placements, fused, tm["fusion"] - fuse_s)
+            _fusion_by_class(up, [fr for fr in geo if all(fr is not x for x in spilled)],
+                             late, placements, fused, tm["fusion"] - fuse_s)
     job.progress = 0.95
     changed()
     t = time.perf_counter()
