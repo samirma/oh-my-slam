@@ -167,7 +167,7 @@ z = 0 when priors fixed the map frame, weighted with the floor's own sigma, whic
 that convention (map.md §2); on every map, a version keeps the previous `floor_z_m` within the
 floor band (map.md §6); the drift estimate is fitted
 against the priors as sent (map.md §1); and a monocular frame beyond the scale bound is not
-judged by the floor check and keeps k (map.md §2).
+judged by the floor check, keeps k and is not rejected for it, but its content is excluded (map.md §2).
 
 ## 8. Concurrency and latency
 

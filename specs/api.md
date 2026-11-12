@@ -138,7 +138,7 @@ error code `invalid_request` (§9).
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
-  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound, so it keeps the map's scale and has no `depth_scale`). Null otherwise, including a frame kept for a failed check. |
+  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, only free-by-rule cells; the client can retake the view). Null otherwise, including a frame kept for a failed check. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
@@ -150,7 +150,9 @@ error code `invalid_request` (§9).
   exception below: a `kept_at_prior` frame counts only for free-by-rule cells (its camera stand
   and near blind disc, map.md §6) until a later job's images confirm it; its pose then becomes a
   registered one in that version (map.md §2), and the job reports it in
-  `quality.reregistered`.
+  `quality.reregistered`. A registered or provisional monocular frame with `detail`
+  `floor_not_judged` is not a `kept_at_prior` frame, but its content is excluded likewise (map.md
+  §2); it counts for free-by-rule cells.
   * **Too-close exception** (every engine, the older mapper included). A frame that is
     `kept_at_prior` only because it is `too_close`, and has a `metric` prior, still contributes
     at its prior pose: its detections, to object records and `detection_votes`; its depth
