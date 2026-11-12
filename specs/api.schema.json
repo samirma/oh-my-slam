@@ -384,7 +384,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas drift-grown: root sum of squares of the prior's (or 0.20 m / 5 deg) and the drift estimate's own sigma at that pose, which grows away from the supporting frames; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), except a frame kept only for too_close with a metric prior, whose detections and in-range depth contribute at the prior pose (never scale evidence), and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas drift-grown: root sum of squares of the prior's (or 0.20 m / 5 deg) and the drift estimate's own sigma at that pose, which grows away from the supporting frames; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), except a frame kept only for too_close with a metric prior, whose detections and in-range depth contribute at the prior pose (never scale evidence), and except a frame kept with detail conflict_unsupported (its images contradict the prior; the prior is what is in doubt), which counts for nothing, free-by-rule cells included, until a later job's images confirm it; locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -473,7 +473,7 @@
               "type": "null"
             }
           ],
-          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference). oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k, has no depth_scale and is not rejected, but its content is excluded (no cloud points, no grid evidence, no objects; it still counts for free-by-rule cells), so the client can retake the view. The first three values occur only with kept_at_prior; floor_not_judged never does."
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference); the frame contributes nothing to the map, free-by-rule grid cells included, because the prior is exactly what is in doubt, until a later job's images confirm it. oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k, has no depth_scale and is not rejected, but its content is excluded (no cloud points, no grid evidence, no objects, and its depth gives no scale evidence; its pose is trusted and still counts for free-by-rule cells), so the client can retake the view. The first three values occur only with kept_at_prior; floor_not_judged never does."
         }
       },
       "allOf": [
@@ -1567,7 +1567,7 @@
             "fused",
             "kept_at_prior"
           ],
-          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells (except a frame kept only for too_close with a metric prior: its detections and in-range depth contribute) until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells (except a frame kept only for too_close with a metric prior: its detections and in-range depth contribute; and a frame kept with detail conflict_unsupported, which counts for nothing, free-by-rule cells included) until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -2189,7 +2189,7 @@
             },
             "floor_observed": {
               "$ref": "#/$defs/Binary",
-              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc); 0 not observed."
+              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc; none from a frame kept_at_prior with detail conflict_unsupported); 0 not observed."
             }
           }
         },
