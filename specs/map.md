@@ -243,14 +243,26 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the cloud and its free-space fusion. Occupancy, heights (the `height_m` layer and object
     heights), the cloud, object records and all scale evidence (depth, camera height) come only
     from image-confirmed frames; a `kept_at_prior` frame counts only for free-by-rule cells
-    (§6) until it is registered. Exception: a frame kept only for `too_close` with a `metric`
+    (§6) until it is registered, with one exception: a frame kept at a prior its images
+    contradict (reason `prior_conflict`, `detail` `conflict_unsupported`) counts for nothing,
+    free-by-rule cells included (no camera stand, no near blind disc), because the prior is
+    exactly what is in doubt. If a later job's images confirm it, it counts normally from then
+    on (re-registration, below). Every other `kept_at_prior` frame (no image pose, a loose image
+    pose, a failed check such as `too_close`) keeps counting for free-by-rule cells. A frame
+    whose content is withheld but whose pose is trusted still counts for free-by-rule cells:
+    a sensor-depth frame excluded by the floor check or the height gate, and a registered or
+    provisional monocular frame the floor check did not judge (`floor_not_judged`, below), which
+    gives no cloud, occupancy, heights or objects either. A `floor_not_judged` frame's depth
+    gives no scale evidence; its pose counts like any registered frame's for everything that
+    uses poses. Exception: a frame kept only for `too_close` with a `metric`
     prior contributes its detections and its in-range depth at the prior pose (api.md §4), but
     never scale evidence.
   * **Height gate.** When frames carry `height_above_floor_m` and `height_sigma_m`, a frame
     whose committed camera height disagrees with it by more than
     3 × sqrt(height_sigma² + σ_z²) (σ_z = `sigma_pos_m` / √3, its committed position sigma
     being 3-D RMS) contributes
-    nothing to occupancy, heights or objects. Its registration status is unchanged, and
+    nothing to occupancy, heights or objects. Its registration status is unchanged, it still
+    counts for free-by-rule cells (§6: its pose is trusted), and
     `quality.height_inconsistent` lists it by name. The gate is evaluated on the frame's
     image-only pose, before the height term of the registration below, so that it still
     measures a disagreement; where the frame has no such term, on the committed pose.
@@ -273,21 +285,32 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     With H the sent height and `height_sigma_m` its sigma:
     * a frame with a sensor depth image whose |h_f − H| exceeds
       3 × sqrt(height_sigma² + (σ_depth · H)² + σ_z²) contributes no content: no cloud points, no
-      grid evidence (no occupancy, no free space from its depth, no heights) and no objects.
+      grid evidence (no occupancy, no free space from its depth, no heights) and no objects. It
+      is a registered frame with a trusted pose and still counts for free-by-rule cells (§6).
       σ_z is the gate's; σ_depth, the relative depth sigma, is a constant in `README.md`;
     * a monocular frame gets its own depth scale, k · H / h_f, with k the map's monocular depth
       scale, in place of k for its cloud points, its grid evidence and its objects. If that
       scale differs from k by more than the monocular scale bound (a constant in `README.md`,
-      the relative bound on one monocular frame's depth scale), the frame is not judged: it keeps
-      k, contributes its content at k, and is not listed in `quality.floor_inconsistent`. Its
-      input status carries no `depth_scale` and has `detail` `floor_not_judged` (oms/2.5).
+      the relative bound on one monocular frame's depth scale), the frame is not judged for
+      registration and pose: it keeps k, is never rejected for it and is not listed in
+      `quality.floor_inconsistent`. Its content is excluded all the same (oms/2.5): no cloud
+      points, no grid evidence (no occupancy, no free space from its depth, no `height_m`) and
+      no objects, since its depth has no scale it can be placed with. Its input status carries
+      no `depth_scale` and has `detail` `floor_not_judged`, so the client knows the content of
+      that view is missing and can retake it. Like any registered frame it still counts for
+      free-by-rule cells (camera stand and near blind disc, §6): its pose is trusted, and its
+      pose counts like any registered frame's for everything that uses poses. Its depth gives no
+      scale evidence: it does not enter the monocular depth scale k.
 
     A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
     by name. A monocular frame is never listed: one whose own scale was applied reports that
     scale as `depth_scale` in its input status, and one beyond the bound is not judged: no
-    `depth_scale`, `detail` `floor_not_judged`. A frame without a measurable floor plane, without a sent
+    `depth_scale`, `detail` `floor_not_judged`, and its content is excluded as an excluded
+    frame's is. A frame without a measurable floor plane, without a sent
     height, or without a map floor is not checked. Excluded frames are still registered: their
-    status, pose and sigmas are unchanged, and only their content is withheld. The check
+    status, pose and sigmas are unchanged, and only their content is withheld (a monocular frame
+    that was not judged is withheld the same way). Their pose is trusted, so they still count
+    for free-by-rule cells (§6). The check
     comes before the floor estimate (§6), which is made from the kept frames only.
   * Only image-confirmed keyframes are registration references for new
     frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
@@ -301,8 +324,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     only, never by depth, and only when its fitted pose passes the prior checks (api.md §4);
     otherwise it stays `kept_at_prior` and is not listed in `quality.reregistered`. If its images
     confirm it, its pose leaves `kept_at_prior` in that version (it becomes a registered pose,
-    `provisional` then `fused`), and from then on it feeds occupancy, heights, the cloud and
-    objects. The job lists each such frame in `quality.reregistered` (§4); the movement of that
+    `provisional` then `fused`), and from then on it counts normally: it feeds occupancy,
+    heights, the cloud, objects and free-by-rule cells (a frame kept for `conflict_unsupported`
+    counted for none of them until then). The job lists each such frame in `quality.reregistered` (§4); the movement of that
     confirmation is excluded from `previous_residuals` and `gauge_shift`. A dry run predicts
     `reregistered` with the same test, without committing; the prediction is approximate. An engine
     that cannot re-register (the older mapper) reports `reregistered` as an empty list; this is
@@ -474,8 +498,8 @@ becomes a job with a `job_id`. A job goes through these states:
     empty when none;
   * `floor_inconsistent` (oms/2.4): the names of the frames the floor check (§2) excluded from
     content, by the sent height against the frame's own floor (frames with a sensor depth image
-    only; a monocular frame is rescaled or not judged, never excluded); empty when none. A frame
-    may be in both lists;
+    only; a monocular frame is rescaled or not judged, never listed here, though a frame not
+    judged gives no content too); empty when none. A frame may be in both lists;
   * `drift_correction` (oms/2.5): `{translation_m, rotation_deg, odo_scale}`, the drift
     estimate's correction at the job's frames, from the prior as sent to the prior as placed (§1,
     Drift estimate): the largest translation and the largest rotation, over the job's frames
@@ -663,10 +687,18 @@ that the camera could not see: its near blind zone on the floor, from the camera
 its lower field-of-view edge.
 
 **Unconfirmed frames.** A `kept_at_prior` keyframe counts only for these free-by-rule cells
-(camera stand and near blind disc) until a later job's images confirm it (§2). Occupancy, the
-`height_m` layer, the cloud and object records come only from image-confirmed frames, except
-the in-range depth and detections of a frame kept only for `too_close` with a `metric` prior
-(api.md §4).
+(camera stand and near blind disc) until a later job's images confirm it (§2), except a frame
+kept at a prior its images contradict (reason `prior_conflict`, `detail` `conflict_unsupported`):
+it counts for nothing, so it makes no camera stand and no near blind disc and gives no
+`floor_observed` = 2, because the prior is exactly what is in doubt. When a later job's images
+confirm it, it counts normally from then on. Every other `kept_at_prior` keyframe (no image
+pose, a loose image pose, a failed check such as `too_close`) keeps counting for these cells.
+Occupancy, the `height_m` layer, the cloud and object records come only from image-confirmed
+frames, except the in-range depth and detections of a frame kept only for `too_close` with a
+`metric` prior (api.md §4). A frame whose content is withheld still counts for these cells,
+because it is a registered frame with a trusted pose: a sensor-depth frame excluded by the floor
+check or the height gate (§2), and a registered or provisional monocular frame the floor check
+did not judge (`floor_not_judged`, §2), which gives no occupancy, `height_m`, cloud or objects.
 
 **The band applies as asked.** `occupied` uses the requested `z_min`–`z_max`, whatever its
 height. A request whose `z_max` is the robot's height plus a margin marks everything the robot
@@ -709,7 +741,7 @@ seen there.
   **Floor sigma** (oms/2.4). `floor_sigma_m` is a robust standard deviation of the heights of
   the floor points, for example 1.4826 × the median absolute deviation, not a half-width of a
   histogram peak. The points are those of the kept frames, after the floor check (§2): a frame
-  the check excluded adds none.
+  the check excluded, or did not judge (`floor_not_judged`), adds none.
 * Optional `footprint_radius_m`: the robot's radius.
 * `height_cap_m`: the ceiling of the `height_m` layer, relative to `floor_z_m`. Default 2.0 m,
   or the band's `z_max` when the request gives one. Echoed in the header.
@@ -730,7 +762,9 @@ seen there.
 * `floor_observed`: uint8:
   * 1 — a floor surface was observed in the cell at the floor height;
   * 2 — not observed, but free by rule: a camera stood here, or the cell lies inside a camera's
-    near blind disc;
+    near blind disc. The cameras are those of registered and provisional frames (also when their
+    content is withheld, §2) and of `kept_at_prior` frames, except one kept for
+    `conflict_unsupported`, which makes no such cell;
   * 0 — not observed.
   A cell that is free but whose floor was not observed means the camera saw through it above a
   floor nobody saw: there may be a low obstacle or a step, so the planner looks first.

@@ -167,7 +167,7 @@ z = 0 when priors fixed the map frame, weighted with the floor's own sigma, whic
 that convention (map.md §2); on every map, a version keeps the previous `floor_z_m` within the
 floor band (map.md §6); the drift estimate is fitted
 against the priors as sent (map.md §1); and a monocular frame beyond the scale bound is not
-judged by the floor check and keeps k (map.md §2).
+judged by the floor check, keeps k and is not rejected for it, but its content is excluded (map.md §2).
 
 **oms/2.6** is additive: the `failed_checks` value `depth_inconsistent` (map.md §4), a hard limit
 that rejects an update, with or without priors, when two committed views contradict each other's
@@ -179,7 +179,11 @@ twins also separates two depth-confirmed hypotheses whose rotations are at least
 pair measurement and in the registration gate, when the measured parallax is plausible for the
 pair (map.md §1, Symmetric scenes, and §2, Match graph); and a whole sequence registered through a
 lattice pose, which every measured pair agrees with, is left to the depth-consistency limit, so a
-false lattice pair can cause a rejection (map.md §1, Cycle consistency).
+false lattice pair can cause a rejection (map.md §1, Cycle consistency). A frame kept at a prior its
+images contradict (`kept_at_prior`, `detail` `conflict_unsupported`) contributes nothing to the map, free-by-rule
+grid cells included (map.md §2, §6; api.md §4); a frame whose content is withheld but whose pose is trusted
+(excluded by the floor check or the height gate, or `floor_not_judged`) keeps its free-by-rule cells, and a
+`floor_not_judged` frame's depth gives no scale evidence (map.md §2).
 
 ## 8. Concurrency and latency
 
