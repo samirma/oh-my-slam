@@ -246,11 +246,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     `height_sigma_m` and the map has a floor (§6: `floor_z_m` from priors or a camera height,
     the base version's, or on a first update the floor those define), the height is a
     z measurement in the pose refinement: the camera's z is the floor + the height, weighted by
-    hypot(`height_sigma_m`, the floor's own sigma, `floor_sigma_m`). The floor is z = 0 when
-    priors fixed the map frame, unless the observed plane nearest it lies beyond
-    max(0.06 m, 3 × `floor_sigma_m`) (§6), else `floor_z_m`; a floor measured on monocular depth
-    carries `scale_sigma_rel` × the height in its sigma. It adds to the frame's image evidence and its prior, and its effect shows
-    in the committed pose and sigmas, which stay calibrated (api.md §4).
+    hypot(`height_sigma_m`, the floor's own sigma). The floor is z = 0 when priors fixed the map
+    frame, unless the observed plane nearest it lies beyond max(0.06 m, 3 × `floor_sigma_m`)
+    (§6); else it is `floor_z_m`. Under the z = 0 convention the floor's own sigma is 0, so only
+    `height_sigma_m` counts. With `floor_z_m` (the observed plane beyond the band, or no priors
+    fixing the frame) it is `floor_sigma_m`, and when that plane is measured on monocular depth
+    it also carries `scale_sigma_rel` × the height (root sum of squares). The
+    `scale_sigma_rel` term never applies to the z = 0 convention. The term adds to the frame's
+    image evidence and its prior, and its effect shows in the committed pose and sigmas, which
+    stay calibrated (api.md §4).
   * **Floor check** (oms/2.4). A frame with a sent `height_above_floor_m` whose own depth,
     at its committed pose, holds a measurable floor plane (a large horizontal plane below the
     camera, the one nearest the expected height) has its own camera height h_f above that plane.
@@ -263,12 +267,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       scale, in place of k for its cloud points, its grid evidence and its objects. If that
       scale differs from k by more than the monocular scale bound (a constant in `README.md`,
       the relative bound on one monocular frame's depth scale), the frame is not judged: it keeps
-      k, contributes its content at k, and is not listed in `quality.floor_inconsistent`.
+      k, contributes its content at k, and is not listed in `quality.floor_inconsistent`. Its
+      input status carries no `depth_scale` and has `detail` `floor_not_judged` (oms/2.5).
 
     A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
     by name. A monocular frame is never listed: one whose own scale was applied reports that
-    scale as `depth_scale` in its input status, and one beyond the bound is not judged and has
-    no `depth_scale`. A frame without a measurable floor plane, without a sent
+    scale as `depth_scale` in its input status, and one beyond the bound is not judged: no
+    `depth_scale`, `detail` `floor_not_judged`. A frame without a measurable floor plane, without a sent
     height, or without a map floor is not checked. Excluded frames are still registered: their
     status, pose and sigmas are unchanged, and only their content is withheld. The check
     comes before the floor estimate (§6), which is made from the kept frames only.
@@ -627,8 +632,7 @@ seen there.
   * when priors fixed the map frame, it is the large horizontal plane nearest the priors'
     origin height (z = 0), and z = 0 itself unless that plane lies beyond
     max(0.06 m, 3 × `floor_sigma_m`) from it. Robots put that origin where they stand: on the
-    floor for a base or a humanoid, at the base link on the worktop for an arm. A version keeps
-    the previous version's `floor_z_m` unless the new estimate differs from it beyond that band;
+    floor for a base or a humanoid, at the base link on the worktop for an arm;
   * without priors but with a camera height (`height_above_floor_m`), it is the floor plane the
     height defines (about 0, §1), refined by the observed large horizontal plane nearest it,
     accepted when within 3 × that plane's own point spread; `floor_sigma_m` is a robust
@@ -636,6 +640,10 @@ seen there.
     height used is the first registered frame's `height_above_floor_m`;
   * with neither priors nor a camera height, it is the lowest large horizontal plane seen below
     the cameras.
+
+  **Floor across versions** (oms/2.5). On every map, whatever fixed its frame, a version keeps
+  the previous version's `floor_z_m` unless the new estimate (by whichever of the rules above
+  applies) differs from it by more than max(0.06 m, 3 × the new estimate's `floor_sigma_m`).
 
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.
