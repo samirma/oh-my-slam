@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -297,11 +298,19 @@ def test_a_version_is_derived_from_its_own_mapper_map(tmp_path: Path,
     assert s.commit("m", rec, mapper("C")) == 5
     assert s.commit("m", rec, mapper("D")) == 6
     monkeypatch.setattr(d, "_derive", real)
+    d.get("m", 6)  # its first read derives it, from its own mapper map
+    assert read[-1] == "D"
+    # O2: the replaced map is kept (``mappers/5``): version 5 is derived from it, never from a
+    # later one; once that map is gone too, the version is gone
+    assert (s.dir("m") / "mappers" / "5" / "tag").read_text() == "C"
+    shutil.copytree(s.dir("m") / "mappers" / "5", tmp_path / "keep5")
+    shutil.rmtree(s.dir("m") / "mappers" / "5")
     with pytest.raises(ApiError) as e:
         d.get("m", 5)
     assert e.value.code == "version_gone"
-    d.get("m", 6)  # its first read derives it, from its own mapper map
-    assert read[-1] == "D"
+    shutil.copytree(tmp_path / "keep5", s.dir("m") / "mappers" / "5")
+    d.get("m", 5)
+    assert read[-1] == "C"
     # a mapper map that cannot be read: derived without one
     bad = mapper("E")
     (bad / "tag").unlink()

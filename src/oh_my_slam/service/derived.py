@@ -437,10 +437,8 @@ class Derived:
                 continue
             # no keypoint on its ignored pixels (map.md §2): the mask is part of the key
             ignore = internal.ignore(f["internal"]) if internal is not None else None
-            if ignore is not None and not ignore.any():
-                ignore = None
             key = f"{f.get('sha256') or _sha_file(img)}-{relocalize.FEATURES_TAG}"
-            if ignore is not None:
+            if ignore is not None and ignore.any():
                 key += "-m" + hashlib.sha256(np.packbits(ignore).tobytes()).hexdigest()[:12]
             feat = self._features(name, key, img, ignore)
             if feat is None:

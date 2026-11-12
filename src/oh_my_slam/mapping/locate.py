@@ -54,8 +54,8 @@ from oh_my_slam.mapping.sfm import (
     MIN_INLIERS,
     CameraPrior,
     Sfm,
+    copy_ignore_mask,
     epipolar_deg,
-    ignore_mask_path,
     shared_camera,
 )
 
@@ -194,10 +194,8 @@ def _extract(reader: store.MapReader, queries: list[_Query], work: Path
     for fr in reader.frames:
         if _kf_file(fr) not in known:
             clone_file(reader.image_path(fr), images / _kf_file(fr))
-            mask = ignore_mask_path(reader.image_path(fr).parent, _kf_file(fr))
-            if mask.exists():  # its keypoints as the map's (map.md §2 "Ignored pixels")
-                ignore_mask_path(images, _kf_file(fr)).parent.mkdir(exist_ok=True)
-                clone_file(mask, ignore_mask_path(images, _kf_file(fr)))
+            # its keypoints as the map's (map.md §2 "Ignored pixels")
+            copy_ignore_mask(reader.image_path(fr).parent, images, _kf_file(fr))
             missing.setdefault((fr.width, fr.height, fr.K.fx), []).append(_kf_file(fr))
     for (w, h, f), names in sorted(missing.items()):
         sfm.extract(names, CameraPrior(w, h, focal=f))

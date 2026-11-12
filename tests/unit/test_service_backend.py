@@ -208,7 +208,8 @@ def test_read_gives_keyframe_images_the_cloud_and_objects(tmp_path: Path) -> Non
     assert b.read(m).objects() == [{"id": 3, "label": "door", "center": [1, 2, 3],
                                     "R": np.eye(3).tolist(), "size": [1, 0.1, 2],
                                     "score": None, "label_votes": {}, "observations": None,
-                                    "created_update": None, "last_seen_update": None}]
+                                    "created_update": None, "last_seen_update": None,
+                                    "sightings": []}]
 
 
 # -- the depth model -----------------------------------------------------------------------------
@@ -491,7 +492,7 @@ def test_look_closer_asks_the_detector(tmp_path: Path, monkeypatch: pytest.Monke
     seen: list[Any] = []
 
     def look_closer(path: Path, regions: Any, dets: Any, grid: Any, client: Any,
-                    min_score: float) -> list[Any]:
+                    min_score: float, labels: Any = ()) -> list[Any]:
         seen.append((regions, dets, grid, min_score))
         return ["d", "e"]
 

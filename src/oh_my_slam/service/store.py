@@ -253,9 +253,7 @@ class Store:
                 if current.exists():
                     dest = self.dir(name) / "mappers" / str(self.mapper_version(name) or n - 1)
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    if dest.exists():  # never: one map per first version
-                        dest.rename(self.trash / f"{name}-{uuid.uuid4().hex}")
-                    current.rename(dest)
+                    current.rename(dest)  # one map per first version
                 if mapper is not None:
                     mapper.rename(current)
                 meta["mapper_version"] = n

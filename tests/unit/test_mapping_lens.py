@@ -65,8 +65,8 @@ def test_keyframes_of_a_known_lens_are_inferred_undistorted(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, tuple[Path, Any]] = {}
 
-    def infer(kf: ingest.Keyframe, work: Path, client: Any, lens: Any = None
-              ) -> tuple[Any, list[Any]]:
+    def infer(kf: ingest.Keyframe, work: Path, client: Any, lens: Any = None,
+              labels: Any = ()) -> tuple[Any, list[Any]]:
         seen[kf.name] = (kf.path, lens)
         return SimpleNamespace(), []
 
@@ -102,7 +102,8 @@ def test_a_lens_keyframe_is_reconstructed_undistorted_and_detected_as_the_camera
         calls["reconstruct"] = (path, intrinsics)
         return _grid_frame()
 
-    def alongside(path: Path, client: Any, rec: Any, *, max_side: int) -> Any:
+    def alongside(path: Path, client: Any, rec: Any, *, max_side: int, labels: Any = ()
+                  ) -> Any:
         calls["detect"] = path
         return rec(client), [_raw_detection()]
 
@@ -350,7 +351,7 @@ def test_every_inference_path_drops_the_out_of_focus_near_field(
         assert frame.valid[:, 100:].all() and (frame.depth[:, 100:] == 2.0).all()
 
     monkeypatch.setattr(api, "detect_alongside",
-                        lambda path, client, rec, *, max_side: (rec(client), []))
+                        lambda path, client, rec, *, max_side, labels=(): (rec(client), []))
     monkeypatch.setattr(api, "_reconstruct_keyframe",
                         lambda *a, **k: _blurred_frame(intrinsics=K))
     kf = ingest.Keyframe("f000000", 0, _image(tmp_path / "in.jpg"), "in.jpg", None)

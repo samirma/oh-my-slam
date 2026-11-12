@@ -21,8 +21,11 @@ from oh_my_slam.service.update import Updater
 from tests.synth.room import base_pose
 from tests.unit.test_anchored import frame, new_map
 from tests.unit.test_service_api import Client
-from tests.unit.test_service_prior_first import CAM, frames_for
-from tests.unit.test_service_prior_first import client  # noqa: F401
+from tests.unit.test_service_prior_first import (
+    CAM,
+    client,  # noqa: F401
+    frames_for,
+)
 
 # -- P19: a frame joins the drift support at its version's commit -------------------------------
 
@@ -476,3 +479,165 @@ def test_the_older_mapper_s_recorded_views_give_its_extents() -> None:
     assert _mapper_extent(o, cams) == {"x": "partial", "y": "full", "z": "full"}
     assert _mapper_extent({"yaw_deg": 10.0}, cams) == {"x": "partial", "y": "partial",
                                                        "z": "partial"}
+
+
+def test_store_versions_edges(tmp_path: Path) -> None:
+    """O2 store edges: a revert to a version without a mapper map has none; a map from before
+    the mapper history; the version index of an earlier map; nested holds; retention's derived
+    reads and its listeners (one failing never fails the commit)."""
+    from oh_my_slam.mapping.anchor import Sim3
+
+    store = Store(tmp_path, keep_versions=2)
+    store.create()
+    rec = {"frames": [], "sim3": Sim3().to_dict(), "scale_source": "priors",
+           "scale_sigma_rel": 0.01}
+    store.prune("nothing")  # no such map: nothing to do
+    assert store.commit("m", rec, None, {"kept_depth.json": {}, "objects.json": {}}) == 1
+    assert store.mapper_for("m", 1) is None
+    m = store.work / "m2"
+    m.mkdir()
+    (m / "tag").write_text("2")
+    assert store.commit("m", rec, m) == 2
+    gone: list[int] = []
+    store.pruned += [lambda n, v: gone.append(v), lambda n, v: 1 / 0]
+    with store.hold("m", 1), store.hold("m", 1):
+        assert store.revert("m", 1) == 3  # no mapper map: the version has none either
+    assert not store.mapper_dir("m").exists() and store.mapper_for("m", 3) is None
+    v3 = store.version("m", 3)
+    assert v3["reverted_to"] == 1 and not store.version_file("m", 3, "kept_depth.json").exists()
+    assert store.version_file("m", 3, "objects.json").exists()
+    (store.dir("m") / "derived" / "1").mkdir(parents=True)
+    store.commit("m", rec, None)  # retention: 1 (held no more) and 2 go
+    assert store.kept("m") == [3, 4] and gone == [1, 2]
+    assert not (store.dir("m") / "derived" / "1").exists()
+    # a version committed before the index: read from its record
+    meta = store.meta("m")
+    assert meta is not None
+    del meta["index"]["3"]
+    store._write_meta("m", meta)
+    assert [v["version"] for v in store.versions("m")] == [3, 4]
+    monkey = store.version
+    store.version = lambda name, n=None: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        ApiError("version_gone", "gone"))
+    assert [v["version"] for v in store.versions("m")] == [4]
+    store.version = monkey  # type: ignore[method-assign]
+    # a map from before the mapper history
+    old = Store(tmp_path / "old")
+    old.create()
+    old.commit("o", rec, None)
+    meta = old.meta("o")
+    assert meta is not None
+    for k in ("mappers", "mappers_since"):
+        meta.pop(k)
+    old._write_meta("o", meta)
+    assert old.mapper_for("o", 1) is None  # no mapper map at all
+    old.mapper_dir("o").mkdir()
+    meta["mapper_version"] = 2
+    old._write_meta("o", meta)
+    with pytest.raises(ApiError):
+        old.mapper_for("o", 1)  # replaced before versions kept theirs
+    meta["mapper_version"] = 1
+    old._write_meta("o", meta)
+    assert old.mapper_for("o", 1) == old.mapper_dir("o")
+    m = old.work / "o2"
+    m.mkdir()
+    old.commit("o", rec, m)  # the history starts: from the latest
+    meta = old.meta("o")
+    assert meta is not None and meta["mappers"] == [1, 2] and meta["mappers_since"] == 1
+    meta["mappers_since"] = 2
+    old._write_meta("o", meta)
+    with pytest.raises(ApiError):
+        old.mapper_for("o", 1)
+    assert (old.mapper_for("o", 2) or Path()).name == "mapper"
+
+
+def test_ignore_mask_files_of_the_older_mapper(tmp_path: Path) -> None:
+    """The older mapper's keyframe masks: copied beside re-extracted frames once; an image or
+    mask COLMAP cannot read leaves it to COLMAP or unmasked; ``InternalMap.ignore`` reads them;
+    ``--keep-versions`` below 1 is refused."""
+    import cv2
+
+    from oh_my_slam.mapping.sfm import Sfm, copy_ignore_mask, ignore_mask_path
+    from oh_my_slam.service import main as sm
+    from tests.fakes.service import textured
+
+    a, b = tmp_path / "a" / "frames", tmp_path / "b" / "frames"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    copy_ignore_mask(a, b, "x.jpg")  # none: nothing
+    assert not ignore_mask_path(b, "x.jpg").exists()
+    ignore_mask_path(a, "x.jpg").parent.mkdir()
+    ignore_mask_path(a, "x.jpg").write_bytes(_png8(np.full((4, 4), 255)))
+    copy_ignore_mask(a, b, "x.jpg")
+    copy_ignore_mask(a, b, "x.jpg")  # once
+    assert ignore_mask_path(b, "x.jpg").read_bytes() == ignore_mask_path(a, "x.jpg").read_bytes()
+    (a / "x.jpg").write_bytes(textured(1, 16, 12))
+    (a / "bad.jpg").write_bytes(b"no image")
+    ignore_mask_path(a, "y.jpg").write_bytes(b"no png")
+    (a / "y.jpg").write_bytes(textured(2, 16, 12))
+    out = Sfm(tmp_path / "db", a, tmp_path / "w")._keypoint_masks(["x.jpg", "bad.jpg", "y.jpg"])
+    assert out is not None and not (out / "bad.jpg.png").exists()
+    assert not cv2.imread(str(out / "x.jpg.png"), cv2.IMREAD_GRAYSCALE).any()
+    assert cv2.imread(str(out / "y.jpg.png"), cv2.IMREAD_GRAYSCALE).all()
+    assert sm.main(["--keep-versions", "0", "--data", str(tmp_path / "d")]) == 2
+
+
+def test_older_mapper_internal_map_reads_keyframe_masks(tmp_path: Path) -> None:
+    import json as js
+
+    from oh_my_slam.core.types import Intrinsics, Pose
+    from oh_my_slam.mapping.sfm import ignore_mask_path
+    from oh_my_slam.mapping.store import FrameRecord
+    from oh_my_slam.service import backend as be
+
+    K = Intrinsics(30.0, 30.0, 16.0, 12.0, 32, 24)
+    m = tmp_path / "map"
+    (m / "frames").mkdir(parents=True)
+    recs = [FrameRecord(i, f"f00000{i}", f"frames/f00000{i}.jpg", f"/in/{i}.jpg", 1, 32, 24, K,
+                        Pose(np.eye(3), np.zeros(3)), 32, 24) for i in range(3)]
+    (m / "frames.json").write_text(js.dumps({"frames": [r.to_dict() for r in recs]}))
+    (m / "map.json").write_text(js.dumps({}))
+    mask = np.zeros((24, 32), np.uint8)
+    mask[12:] = 255
+    p = ignore_mask_path(m / "frames", "f000000.jpg")
+    p.parent.mkdir()
+    p.write_bytes(_png8(mask))
+    ignore_mask_path(m / "frames", "f000001.jpg").write_bytes(b"broken")
+    r = be.MapperBackend().read(m)
+    got = r.ignore("f000000")
+    assert got is not None and got[12:].all() and not got[:12].any()
+    assert r.ignore("f000001") is None and r.ignore("f000002") is None
+    assert r.ignore("nope") is None
+
+
+def test_a_version_without_a_mapper_map_derives_without_one(tmp_path: Path) -> None:
+    """``Derived._load`` of a version committed before the map had a mapper map, after a later
+    one replaced it: derived without one (never from a later map); a keyframe mask with no
+    ignored pixel is no mask."""
+    from oh_my_slam.mapping.anchor import Sim3
+    from oh_my_slam.service.backend import InternalMap
+    from oh_my_slam.service.derived import Derived
+
+    s = Store(tmp_path / "data")
+    s.create()
+    read: list[Path] = []
+
+    def read_map(p: Path) -> InternalMap:
+        read.append(p)
+        return InternalMap([], None, None, False, lambda name: None,
+                           ignore=lambda name: np.zeros((2, 2), bool))
+
+    d = Derived(s, read_map)
+    rec = {"frames": [], "sim3": Sim3().to_dict(), "floor_z_m": 0.0}
+    s.add_cameras("m", {}, {})
+    assert s.commit("m", rec, None) == 1
+    m = s.work / "mm"
+    m.mkdir()
+    assert s.commit("m", rec, m) == 2
+    shutil.rmtree(d.dir("m") / "1")
+    d._cache.clear()
+    d._latest.clear()
+    n = len(read)
+    assert d.get("m", 1).version == 1 and len(read) == n  # no mapper map read
+    d.forget("m", 1)
+    assert all(k[2] != 1 for k in d._cache)

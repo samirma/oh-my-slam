@@ -532,6 +532,16 @@ def ignore_mask_path(image_dir: Path, name: str) -> Path:
     return Path(image_dir).parent / IGNORE_MASKS / f"{name}.png"
 
 
+def copy_ignore_mask(src_dir: Path, dst_dir: Path, name: str) -> None:
+    """Keyframe ``name``'s ignore mask beside the frames of ``src_dir`` copied beside those of
+    ``dst_dir`` (``ignore_mask_path``), when it has one and the copy has none yet: its keypoints
+    extracted again stay off its ignored pixels."""
+    src, dst = ignore_mask_path(src_dir, name), ignore_mask_path(dst_dir, name)
+    if src.exists() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+
+
 class Sfm:
     def __init__(self, db_path: Path, image_dir: Path, work_dir: Path,
                  only: Iterable[str] | None = None) -> None:

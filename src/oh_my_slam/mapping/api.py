@@ -50,6 +50,7 @@ from oh_my_slam.mapping.sfm import (
     camera_intrinsics,
     check_versions,
     contradicted,
+    copy_ignore_mask,
     ignore_mask_path,
     shared_camera,
     vet,
@@ -2222,10 +2223,7 @@ def _remap_small(ctx: UpdateContext, sfm: Sfm, new_names: set[str], client: Any,
         dst = frames_dir / name
         if not dst.exists():
             shutil.copyfile(tx.root / f.image, dst)
-        mask = ignore_mask_path((tx.root / f.image).parent, name)
-        if mask.exists() and not ignore_mask_path(frames_dir, name).exists():
-            ignore_mask_path(frames_dir, name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(mask, ignore_mask_path(frames_dir, name))
+        copy_ignore_mask((tx.root / f.image).parent, frames_dir, name)
         if name not in in_db:
             missing.append(f)
     if missing:

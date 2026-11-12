@@ -700,9 +700,9 @@ def test_a_queued_job_shows_in_health_and_the_summary(client: Client,
     gate = threading.Event()
     real = client.backend.register
 
-    def slow(*a: Any) -> Any:
+    def slow(*a: Any, **k: Any) -> Any:
         gate.wait(10)
-        return real(*a)
+        return real(*a, **k)
 
     monkeypatch.setattr(client.backend, "register", slow)
     j1 = client.post_update("m", {"frames": frames[1:]}, files)
@@ -809,9 +809,9 @@ def test_eta_counts_the_queue_ahead_and_the_job_s_own_frames(
     gate = threading.Event()
     real = client.backend.register
 
-    def slow(*a: Any) -> Any:
+    def slow(*a: Any, **k: Any) -> Any:
         gate.wait(10)
-        return real(*a)
+        return real(*a, **k)
 
     monkeypatch.setattr(client.backend, "register", slow)
     frames, files, _ = frames_of(client, 3)

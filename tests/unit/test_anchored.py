@@ -790,6 +790,7 @@ def test_the_drift_grows_from_the_nearest_supporting_frame() -> None:
     d = Drift()
     d.confirm(base_pose(0), base_pose(0))
     d.confirm(base_pose(0, 3.0, 0.0), base_pose(0, 3.0, 0.0))  # the reference: the last one
+    d.fresh = []  # committed: they support from the next job on (P19)
     near_first = base_pose(5, 0.1, 0.0)  # far from the reference, near the first supporter
     sp = d.predict(near_first, 0.02, 1.0)[1]
     near = float(np.linalg.norm(near_first[:3, 3] - base_pose(0)[:3, 3]))

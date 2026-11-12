@@ -1176,7 +1176,8 @@ def test_ignored_pixels_are_neither_fused_nor_detected(tmp_path: Path,
     Image.fromarray(mask).save(png)
     K = Intrinsics(30.0, 30.0, 15.0, 10.0, 30, 20)
 
-    def reconstruct(kf: Any, work: Path, client: Any, lens: Any = None) -> Any:
+    def reconstruct(kf: Any, work: Path, client: Any, lens: Any = None, labels: Any = ()
+                    ) -> Any:
         frame = FrameReconstruction(kf.path, np.zeros((20, 30, 3), np.uint8),
                                     np.ones((20, 30), np.float32), np.ones((20, 30), bool), K, K)
         low = np.zeros((20, 30), bool)
