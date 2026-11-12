@@ -55,7 +55,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       measurable pair. This depth confirmation is the same test that registration applies to
       candidate poses on every engine but the older mapper (§2, Match graph), so a lattice pose
       can be neither measured nor registered. Its agreement threshold is a constant in
-      `README.md`.
+      `README.md`. It never uses the depth of a `floor_not_judged` keyframe (§2, the references
+      bullet): against such a reference it is the case of a reference without depth.
     * **Depth agreement.** Points of one view's depth image are mapped into the other view under
       the candidate pose. A point is a contradiction only if the other view would see through
       it: it lies in front of the surface that view measures along that ray. A point behind
@@ -235,7 +236,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   4. monocular depth (`monocular`).
 
   `scale_sigma_rel` is estimated from the residuals of that source, from image-confirmed frames
-  only (§2). It is one sigma: the relative error of any horizontal distance, in every
+  only (§2), and never from the depth of a `floor_not_judged` keyframe, whether as the frame's
+  own evidence or as a reference's for a later frame (§2). It is one sigma: the relative error of any horizontal distance, in every
   direction, stays within 3 × `scale_sigma_rel`. A later update may refine the scale:
   `quality.scale_ratio_vs_prev` reports the change.
 
@@ -265,7 +267,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     gives no cloud, occupancy, heights or objects either. A `floor_not_judged` frame's depth
     gives no scale evidence, and its sent camera height constrains only its own camera pose
     (never combined with its own depth or floor plane into camera-height evidence or k); its
-    pose counts like any registered frame's for everything that uses poses. Exception: a frame
+    pose counts like any registered frame's for everything that uses poses. Nor does its depth
+    serve any later frame (oms/2.6): see the references bullet below. Exception: a frame
     kept only for `too_close` with a `metric` prior and no conflict with it (`detail` null)
     contributes its detections and its in-range depth at the prior pose (api.md §4), but never
     scale evidence.
@@ -317,7 +320,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       it is never combined with the frame's own depth or floor plane into a scale estimate,
       neither camera-height evidence (§1) nor k, because that depth is the out-of-bound part.
       The height may still count where camera-height evidence is formed from poses and other
-      frames' floor.
+      frames' floor. Its depth also lifts no later frame (oms/2.6): the keyframe stays a
+      registration reference for image matching and pose, its features used without its depth
+      (the rule is in the references bullet below).
 
     A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
     by name. A monocular frame is never listed: one whose own scale was applied reports that
@@ -333,6 +338,24 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
     kept. Within a job, a job frame counts as an edge once it is registered (match graph,
     below).
+  * **A `floor_not_judged` keyframe as a reference** (oms/2.6). An image-confirmed keyframe whose
+    `detail` is `floor_not_judged` (its own depth scale lay beyond the monocular scale bound,
+    above) stays a registration reference for image matching and pose: its features are used,
+    without its depth. Its pose is trusted, its depth is the out-of-bound part, so that depth
+    lifts no later frame:
+    * no keypoint depth for metric lifting or alignment of a frame registered against it;
+    * no depth confirmation (§1, Measurable pair; step 2 of the match graph below) of a
+      candidate pose against it;
+    * no scale evidence for any later frame: not the alignment residual, not camera-height
+      evidence, not the monocular depth scale k (§1, Scale).
+
+    A frame whose only references that carry depth are `floor_not_judged` ones is a frame with no
+    depth reference: the case of a reference without depth, which §1 (Measurable pair: the
+    depth confirmation applies only where both frames carry depth) and the match graph (step 2:
+    only against a reference that carries depth images) already define. Its pose comes from the
+    images alone, it gets no depth confirmation and no scale evidence from those references, and
+    the update's scale source is chosen from the evidence that remains (§1, Scale). Locate
+    follows the same rule (api.md §6).
   * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame of
     the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
     reference) and matches it with at least the registration minimum of inliers (the `README.md`
@@ -361,7 +384,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        the images. The component is placed by its matches to confirmed keyframes, by the
        priors of all its frames together, or both. On every engine but the older mapper (§1,
        Every engine), a candidate pose of a frame that carries depth images, against a
-       reference that carries them, is placed only if it passes the depth confirmation of §1
+       reference that carries them (not a `floor_not_judged` one, whose depth is not used:
+       above), is placed only if it passes the depth confirmation of §1
        (Measurable pair); a candidate failing it is not a placement. When two distinct candidate
        poses of a frame against one reference both pass it (§1, Symmetric scenes), the pair is
        ambiguous and that reference alone places the frame in neither, unless the parallax

@@ -187,7 +187,10 @@ too-close content exception applies only to a frame without such a conflict (map
 whose content is withheld but whose pose is trusted (excluded by the floor check or the height gate, or
 `floor_not_judged`) keeps its free-by-rule cells, and a `floor_not_judged` frame's depth gives no scale evidence:
 its sent camera height constrains only its own camera pose and is never combined with its own depth or floor
-plane into a scale estimate (map.md §2).
+plane into a scale estimate (map.md §2). Such a keyframe stays a registration reference for image matching and
+pose, its features used without its depth: that depth lifts no later frame, in registration or in locate (no keypoint
+depth for metric lifting or alignment, no depth confirmation, no scale evidence), so a frame whose only depth
+references are such keyframes is one with no depth reference (map.md §2; api.md §6).
 
 ## 8. Concurrency and latency
 
