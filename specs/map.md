@@ -169,7 +169,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   (api.md §4), the pose refinement, the drift estimate and the rotation check above. The
   reported `sigma_rot_deg` stays 3-D RMS (api.md §4).
 * **Drift estimate.** The drift estimate that places `drifting` priors is robust:
-  * it is fitted over image-confirmed frames with `drifting` priors;
+  * it is fitted over image-confirmed frames with `drifting` priors, each image-only pose weighed
+    by its calibrated sigma against the prior as sent by the prior's own sigma, so a correction
+    the priors' sigmas do not allow is not made;
   * a frame whose residual exceeds 3 × sqrt(σ_prior² + σ_hyp²) is left out of the fit and is
     rejected with `prior_conflict` (when its image-only pose meets the measurable-pair threshold;
     otherwise `kept_at_prior`, `conflict_unsupported`);
@@ -243,8 +245,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * **Sent height in registration** (oms/2.4). When a frame sends `height_above_floor_m` with
     `height_sigma_m` and the map has a floor (§6: `floor_z_m` from priors or a camera height,
     the base version's, or on a first update the floor those define), the height is a
-    z measurement in the pose refinement: the camera's z is `floor_z_m` + the height, weighted by
-    `height_sigma_m`. It adds to the frame's image evidence and its prior, and its effect shows
+    z measurement in the pose refinement: the camera's z is the floor + the height, weighted by
+    hypot(`height_sigma_m`, the floor's own sigma, `floor_sigma_m`). The floor is z = 0 when
+    priors fixed the map frame, unless the observed plane nearest it lies beyond
+    max(0.06 m, 3 × `floor_sigma_m`) (§6), else `floor_z_m`; a floor measured on monocular depth
+    carries `scale_sigma_rel` × the height in its sigma. It adds to the frame's image evidence and its prior, and its effect shows
     in the committed pose and sigmas, which stay calibrated (api.md §4).
   * **Floor check** (oms/2.4). A frame with a sent `height_above_floor_m` whose own depth,
     at its committed pose, holds a measurable floor plane (a large horizontal plane below the
@@ -257,12 +262,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     * a monocular frame gets its own depth scale, k · H / h_f, with k the map's monocular depth
       scale, in place of k for its cloud points, its grid evidence and its objects. If that
       scale differs from k by more than the monocular scale bound (a constant in `README.md`,
-      the relative bound on one monocular frame's depth scale), the frame contributes no
-      content, as above.
+      the relative bound on one monocular frame's depth scale), the frame is not judged: it keeps
+      k, contributes its content at k, and is not listed in `quality.floor_inconsistent`.
 
-    A frame excluded by the floor check is listed in `quality.floor_inconsistent`, by name. A
-    monocular frame whose own scale was applied and kept is not listed: its input status reports
-    that scale as `depth_scale`. A frame without a measurable floor plane, without a sent
+    A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
+    by name. A monocular frame is never listed: one whose own scale was applied reports that
+    scale as `depth_scale` in its input status, and one beyond the bound is not judged and has
+    no `depth_scale`. A frame without a measurable floor plane, without a sent
     height, or without a map floor is not checked. Excluded frames are still registered: their
     status, pose and sigmas are unchanged, and only their content is withheld. The check
     comes before the floor estimate (§6), which is made from the kept frames only.
@@ -445,8 +451,18 @@ becomes a job with a `job_id`. A job goes through these states:
   * `height_inconsistent`: the names of the frames the height gate (§2) excluded from content;
     empty when none;
   * `floor_inconsistent` (oms/2.4): the names of the frames the floor check (§2) excluded from
-    content, by the sent height against the frame's own floor; empty when none. A frame may
-    be in both lists;
+    content, by the sent height against the frame's own floor (frames with a sensor depth image
+    only; a monocular frame is rescaled or not judged, never excluded); empty when none. A frame
+    may be in both lists;
+  * `drift_correction` (oms/2.5): `{translation_m, rotation_deg, odo_scale}`, the drift
+    estimate's correction at the job's frames, from the prior as sent to the prior as placed (§1,
+    Drift estimate): the largest translation and the largest rotation, over the job's frames
+    with a `drifting` prior, between a frame's prior as sent and as placed, and the estimate's
+    odometry scale (map metres per odometry metre, 1 without scale evidence). The estimate is
+    the one the job's frames were placed with, after any change the job accepted. On a dry run,
+    the estimate it would place them with. Null when no frame of the job has a `drifting`
+    prior; the identity estimate gives `{0, 0, 1}`. It tells a client how much of a frame's
+    `prior_residual_*` (api.md §4) is the estimate moving the prior and how much is the images;
   * `rotation_pairs`: every measurable pair (§1) the rotation check evaluated, on dry runs as
     on jobs, each `{a, b, inliers, overlap, measured_deg, committed_deg, difference_deg}`: the
     frame names in canonical order, the pair's epipolar inliers, its 8 × 8 overlap, the
@@ -609,8 +625,10 @@ seen there.
 * `z_min`, `z_max`: the height band in the map frame, relative to the floor estimate
   `floor_z_m` (default 0.05–1.8 m). `floor_z_m` is the surface the robot stands on:
   * when priors fixed the map frame, it is the large horizontal plane nearest the priors'
-    origin height (z = 0). Robots put that origin where they stand: on the floor for a base or a
-    humanoid, at the base link on the worktop for an arm;
+    origin height (z = 0), and z = 0 itself unless that plane lies beyond
+    max(0.06 m, 3 × `floor_sigma_m`) from it. Robots put that origin where they stand: on the
+    floor for a base or a humanoid, at the base link on the worktop for an arm. A version keeps
+    the previous version's `floor_z_m` unless the new estimate differs from it beyond that band;
   * without priors but with a camera height (`height_above_floor_m`), it is the floor plane the
     height defines (about 0, §1), refined by the observed large horizontal plane nearest it,
     accepted when within 3 × that plane's own point spread; `floor_sigma_m` is a robust

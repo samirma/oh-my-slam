@@ -156,6 +156,16 @@ It also adds the job's `timings_s` stage `stored_pairs`, the seconds spent measu
 stored-to-stored pairs from the stored keyframes' own images when the cycle rule needs a chain
 for a pair that involves a stored keyframe (map.md §1).
 
+**oms/2.5** is additive: the quality report's `drift_correction` (the drift estimate's correction
+at the job's frames, map.md §4), and the explicit meaning of an input status's `T_map_cam` and
+`prior_residual_*` (from the prior as placed; on a job the gate rejected, the pose that would
+have been committed, api.md §4). It also changes behaviour with no change of shape: the
+monocular noise floor without depth is 0.15 m (api.md §6); the sent height is measured from
+z = 0 when priors fixed the map frame, weighted with the floor's own sigma (map.md §2); the
+floor keeps its previous value within its band (map.md §6); the drift estimate is fitted
+against the priors as sent (map.md §1); and a monocular frame beyond the scale bound is not
+judged by the floor check and keeps k (map.md §2).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

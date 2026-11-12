@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.4"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.5"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -133,9 +133,9 @@ error code `invalid_request` (§9).
   | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. |
   | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
   | `inliers` | Number of inliers. |
-  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
+  | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
   | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's. Absent otherwise. |
-  | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
+  | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
   | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it). Null otherwise, including a frame kept for a failed check. |
@@ -244,6 +244,12 @@ error code `invalid_request` (§9).
   (`update.sigma_containment`, evaluation.md) are met. They are 3-D RMS (§6), and mean the same
   for every engine.
 
+  **Drift correction** (oms/2.5). `quality.drift_correction` reports what the drift estimate did
+  to the job's `drifting` priors: `{translation_m, rotation_deg, odo_scale}`, defined in map.md §4.
+  A job's inputs' `prior_residual_*` are measured from the prior as placed, so with it a client
+  sees how much of a frame's distance from the prior it sent is the estimate and how much the
+  images. Null when the job has no `drifting` prior.
+
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
   dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
   its measured, committed and difference angles, so a client can see which pairs drove
@@ -265,8 +271,8 @@ error code `invalid_request` (§9).
   * with `predicted_reason` `too_close`: `min_distance_m` and `scene_distance_m`, as in
     `inputs[]`.
 
-  It also gives a predicted `quality`, without fusion, and `scale_source` and
-  `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use
+  It also gives a predicted `quality`, without fusion (`drift_correction` included, map.md §4),
+  and `scale_source` and `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use
   (map.md §5).
 
 ## 5. Versions and revert (O2)
@@ -351,7 +357,7 @@ The versions read, revert and `--keep-versions` are O2.
     | Depth | `metric` | `drifting` | `none` |
     | --- | --- | --- | --- |
     | with depth | 8 mm / 1.25° | 8 mm / 1.25° | 12 mm / 1.25° |
-    | without depth | 5 cm / 2.1° | 5 cm / 2.1° | 7.5 cm / 2.1° |
+    | without depth | 0.15 m / 2.1° | 0.15 m / 2.1° | 0.15 m / 2.1° |
 
     Locate uses the `none` column.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
