@@ -1004,6 +1004,13 @@
         },
         "timings_s": {
           "type": "object",
+          "description": "Seconds spent per stage. Stage names are additive; ignore unknown ones.",
+          "properties": {
+            "stored_pairs": {
+              "type": "number",
+              "description": "oms/2.4. Seconds spent measuring stored-to-stored pairs for the cycle rule; 0 when none was measured."
+            }
+          },
           "additionalProperties": {
             "type": "number"
           }

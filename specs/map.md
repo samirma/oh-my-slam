@@ -74,10 +74,17 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       composes the two-view rotations along a path of measurable pairs that each have strictly
       more inliers than the pair. The rule is independent of the joint solve (§4). It cannot
       catch a lattice geometry that stays consistent around a whole cycle, or a pair with no
-      stronger chain: an accepted degenerate case, as above. When stored frames are joined to a
-      standpoint, stored-to-stored pairs are not re-measured, so the rule may have no chain
-      there: the pair is then judged by the depth test only, or kept as measured when no depth
-      is available;
+      stronger chain: an accepted degenerate case, as above.
+      * **Stored-to-stored pairs.** When the rule needs a chain for a pair that involves a
+        stored keyframe, including a standpoint join of a new frame to stored keyframes, the job
+        measures the stored-to-stored pairs that chain needs. Each is measured from the two
+        stored keyframes' own images as a two-view fit, with the depth confirmation where both
+        carry depth, under the same rules as any measured pair (this rule included, which ends
+        because a chain uses only strictly stronger pairs). The measurement never uses the
+        stored or committed poses, and the chain never falls back to committed rotations: a
+        pair whose chain still cannot be measured is the degenerate case above. A measurement
+        is cached per version and reused across jobs while both stored frames are unchanged.
+        The seconds spent are reported as the job's `timings_s.stored_pairs` (api.md §4);
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
