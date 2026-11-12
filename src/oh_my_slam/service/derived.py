@@ -59,6 +59,7 @@ from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import valid_depth
+from oh_my_slam.mapping.store import frame_name
 from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
@@ -70,6 +71,9 @@ CACHE_VERSIONS = 3  # versions kept in memory beside each map's latest
 ANSWERS = 16  # read answers kept per version (grid parameters, objects)
 DEFAULT_CAMERA_HEIGHT_M = 1.0
 # what the older mapper records of an object beyond its box, kept for the objects read
+# the older mapper's sighting of an object is uncut (``objects.extent_from``) when none of its
+# mask lies in the image-border band (``Sighting.border``: that share)
+MAPPER_UNCUT_BORDER = 0.0
 MAPPER_OBJECT_KEYS = ("score", "label_votes", "observations", "created_update",
                       "last_seen_update")  # a map with no floor at all: this far below its lowest camera
 
@@ -483,10 +487,15 @@ class Derived:
         for o in (internal.objects() if internal is not None else []):
             R = np.asarray(o.get("R") or np.eye(3), np.float64)
             size = np.asarray(o.get("size") or [0.0, 0.0, 0.0], np.float64) * sim.s
+            views = [{"frame": frame_name(int(v[0])),
+                      "centroid": sim.point(np.asarray(v[3:6], np.float64)).round(5).tolist(),
+                      "uncut": float(v[2]) <= MAPPER_UNCUT_BORDER}
+                     for v in o.get("sightings") or [] if len(v) >= 6]
             objects.append({"id": o.get("id"), "label": o["label"],
                             "centre_m": sim.point(np.asarray(o["center"], np.float64)).tolist(),
                             "size_m": size.tolist(), "yaw_deg": yaw_of(sim.R @ R),
-                            **{k: o[k] for k in MAPPER_OBJECT_KEYS if k in o}})
+                            **{k: o[k] for k in MAPPER_OBJECT_KEYS if k in o},
+                            **({"views": views} if "sightings" in o else {})})
         atomic_write_json(vdir / "meta.json", {
             "version": n, "floor_z": float(floor), "floor_sigma": floor_sigma, "objects": objects,
             "doors": [o["centre_m"][:2] for o in objects if "door" in o["label"].lower()],

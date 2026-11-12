@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from oh_my_slam.core.atomic import atomic_write_json
+from oh_my_slam.mapping.anchored_objects import extent_from
 from oh_my_slam.segmentation.api import color_for_id
 from oh_my_slam.segmentation.detect import PASSAGE_LABELS, door_leaf
 from oh_my_slam.service import nav
@@ -39,6 +40,9 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
     cloud = dv.cloud()
     sig = [float(f["sigma_pos_m"]) for f in dv.record["frames"] if f.get("sigma_pos_m")]
     pose_sigma = float(np.median(sig)) if sig else 0.0
+    # each keyframe's camera centre by the mapper's frame name: the views of its objects
+    cams = {f["internal"]: np.asarray(f["T_map_cam"], np.float64)[:3, 3]
+            for f in dv.record["frames"] if f.get("internal")}
     out = []
     for o in dv.meta.get("objects", []):
         oid = int(o.get("id") or 0)
@@ -65,13 +69,33 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
                     "centre_m": o["centre_m"], "size_m": o["size_m"],
                     "yaw_deg": round(float(o["yaw_deg"]), 3),
                     "sigma_centre_m": round(math.hypot(pose_sigma, spread / math.sqrt(n)), 4),
-                    "extent_seen": {"x": "partial", "y": "partial", "z": "partial"},
+                    "extent_seen": _mapper_extent(o, cams),
                     "mean_rgb": [round(c) for c in rgb],
                     "detection_votes": sorted(shares, key=lambda e: (-e["share"], e["label"])),
                     "state": "confirmed", "moved_from_m": None,
                     "first_seen_version": first, "last_seen_version": last,
                     "supported_by": None, "inside_of": None, "seen_from": []})
     return {"objects": out, "surfaces": []}
+
+
+def _mapper_extent(o: dict[str, Any], cams: dict[str, Any]) -> dict[str, str]:
+    """``extent_seen`` of an older-mapper object from the views it recorded (``views``: each its
+    keyframe, its points' centroid and whether its mask kept off the image border), the rule of
+    the prior-first engine (``anchored_objects.extent_from``) on its yaw's axes; ``partial`` on
+    every axis when the builder recorded none (a map derived before they were read)."""
+    views = []
+    for v in o.get("views", []):
+        c = cams.get(v["frame"])
+        if c is None:
+            continue
+        ray = np.asarray(v["centroid"], np.float64) - c
+        n = float(np.linalg.norm(ray))
+        if n > 0:
+            views.append((ray / n, [not v["uncut"]] * 4))
+    a = math.radians(float(o["yaw_deg"]))
+    R = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0],
+                  [0.0, 0.0, 1.0]])
+    return extent_from(R, views)
 
 
 def compute(store: Store, ids: nav.Ids, dv: DerivedVersion,

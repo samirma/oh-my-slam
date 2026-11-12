@@ -927,7 +927,12 @@ called by `service.prior_first` after the engine placed and fused the update's k
   RMS distance of its points from their mean, n its observations), and `first_seen_version` /
   `last_seen_version` its first and last mapper update ids, which are the versions on a map the
   service built (one mapper update per committed version; clamped to the version read). That
-  mapper does not record which views bound a box: every extent is `partial` (not seen in full).
+  mapper does record the views that bound a box (`mapping.objects.Sighting`: keyframe, its
+  points' centroid, the share of its mask in the image-border band): `extent_seen` applies the
+  prior-first engine's rule to them (`anchored_objects.extent_from` on the box's yaw axes; a
+  view is uncut when none of its mask lies in the border band, `derived.MAPPER_UNCUT_BORDER`;
+  `service.objects._mapper_extent`). Only a version derived before the views were read reports
+  `partial` on every axis (its builder's views never reached it).
   `state` is `confirmed`; no surfaces or relations. An object without those records, or without
   points in the cloud, is not listed.
 

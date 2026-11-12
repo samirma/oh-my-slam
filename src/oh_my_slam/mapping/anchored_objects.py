@@ -70,9 +70,10 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   version that observed the object or its support with the relation holding.
 * **Uncertainty.** ``sigma_centre_m`` combines the sightings' pose sigmas and depth noise (over
   their number) and, while an axis is seen only in part, the spread of their centres.
-  ``extent_seen`` per box axis: ``full`` when a sighting whose mask no image border cuts sees the
-  axis across (``ACROSS_COS``), or sightings from both ends of it see it; ``z`` also when the box
-  rests on a support and a sighting sees its top.
+  ``extent_seen`` per box axis (``extent_from``): ``full`` when a sighting whose mask no image
+  border cuts sees the axis across (``ACROSS_COS``), or sightings from both ends of it see it;
+  ``z`` when a sighting whose mask neither the top nor the bottom border cuts sees it from the
+  side.
 
 State lives in the mapper folder of each version: ``objects.json`` (objects without points,
 surface ids, ``next_id``) and ``objects.npz`` (each object's points and their sighting)."""
@@ -1338,21 +1339,34 @@ def sigma_centre(o: MapObject) -> float:
 
 
 def extent_seen(o: MapObject) -> dict[str, str]:
-    """``full`` or ``partial`` per box axis (see the module docstring)."""
-    out = {"x": "partial", "y": "partial", "z": "partial"}
+    """``full`` or ``partial`` per box axis (see the module docstring), from its sightings
+    (``extent_from``)."""
     if o.box is None:
-        return out
-    R = o.box.R
-    whole = [s for s in o.sightings if not s.truncated]
+        return {"x": "partial", "y": "partial", "z": "partial"}
+    return extent_from(o.box.R, [(s.ray, s.cut) for s in o.sightings])
+
+
+def extent_from(R: Array, views: list[tuple[Any, Any]]) -> dict[str, str]:
+    """``extent_seen`` of a box (axes ``R``, columns x, y, z) from the views that bound it
+    (map.md §5): each its unit ray from the camera to the box (map frame) and which image borders
+    (left, right, top, bottom) cut its mask. An axis x or y is ``full`` when an uncut view sees it
+    across (|cos| to the ray at most ``ACROSS_COS``) or views from both of its ends see it
+    (``ENDS_COS``); ``z`` when a view whose mask neither the top nor the bottom border cuts sees
+    it from the side (|ray z| at most ``ACROSS_COS``; a view the left or right border cuts still
+    sees the top and the bottom; a view from above sees the top alone). Every engine's views:
+    the prior-first engine's sightings, the older mapper's recorded ones (``service.objects``)."""
+    out = {"x": "partial", "y": "partial", "z": "partial"}
+    whole = [np.asarray(r, np.float64) for r, cut in views if not any(cut)]
+    rays = [np.asarray(r, np.float64) for r, _ in views]
     for k, name in ((0, "x"), (1, "y")):
         a = R[:, k]
-        dots = [float(np.dot(np.asarray(s.ray), a)) for s in o.sightings]
-        across = any(abs(float(np.dot(np.asarray(s.ray), a))) <= ACROSS_COS for s in whole)
+        dots = [float(np.dot(r, a)) for r in rays]
+        across = any(abs(float(np.dot(r, a))) <= ACROSS_COS for r in whole)
         ends = any(d > ENDS_COS for d in dots) and any(d < -ENDS_COS for d in dots)
         if across or ends:
             out[name] = "full"
-    # the height is seen only from the side: a view from above sees the top alone
-    if any(not s.cut[2] and not s.cut[3] and abs(s.ray[2]) <= ACROSS_COS for s in whole):
+    if any(not cut[2] and not cut[3] and abs(float(np.asarray(r)[2])) <= ACROSS_COS
+           for r, cut in views):
         out["z"] = "full"
     return out
 

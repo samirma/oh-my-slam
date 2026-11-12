@@ -430,3 +430,49 @@ def test_prompts_merge_the_defaults_case_insensitively() -> None:
     assert got[:len(defaults)] == defaults and got[len(defaults):] == ["Red  Mug", "blue_box"]
     assert dt.label_of("Red  Mug") == "red mug"
     assert dt.vocabulary(["Red Mug"])[-1] == "Red Mug" and dt.prompts() == defaults
+
+
+# -- extent_seen over many views ----------------------------------------------------------------
+
+
+def test_objects_seen_from_many_views_are_seen_in_full(tmp_path: Path) -> None:
+    """map.md §5 ``extent_seen`` from the views that bound the box: objects on a table seen
+    uncut from around and above, two rings of keyframes and one overhead, are ``full`` on every
+    axis (the prior-first engine records each sighting's ray and cut borders)."""
+    import math
+
+    from oh_my_slam.mapping.anchored import Cloud
+    from oh_my_slam.mapping.anchored_objects import ObjectMap
+    from tests.synth.table import TableScene
+    from tests.unit.test_anchored_objects import view
+
+    sc = TableScene()
+    eyes = [(0.6 + r * math.cos(2 * math.pi * k / 12), 0.4 + r * math.sin(2 * math.pi * k / 12), h)
+            for k in range(12) for h, r in ((1.6, 1.0), (1.2, 1.3))] + [(0.6, 0.41, 2.2)]
+    cloud = Cloud()
+    om = ObjectMap(tmp_path)
+    views = [view(f"k{i}", e, sc, cloud) for i, e in enumerate(eyes)]
+    om.update(views, 1, 0.0)
+    om.finish(cloud.points(), 1.5, 1, np.array([v.centre for v in views]), 0.0)
+    recs = om.records()["objects"]
+    assert {o["label"] for o in recs} >= {"box", "basket", "apple"}
+    for o in recs:
+        assert o["extent_seen"] == {"x": "full", "y": "full", "z": "full"}, o["label"]
+
+
+def test_the_older_mapper_s_recorded_views_give_its_extents() -> None:
+    """``service.objects._mapper_extent``: the older mapper records each object's views (its
+    ``Sighting``: keyframe, centroid, border share), so its extents follow the same rule; a view
+    whose keyframe the version does not hold counts for nothing; none recorded: partial."""
+    from oh_my_slam.service.objects import _mapper_extent
+
+    cams = {"f000000": np.array([-2.0, 0.0, 0.5]), "f000001": np.array([0.0, -2.0, 0.5])}
+    side = {"frame": "f000000", "centroid": [0.0, 0.0, 0.5], "uncut": True}
+    o = {"yaw_deg": 0.0, "views": [side, {"frame": "f000001", "centroid": [0.0, 0.0, 0.5],
+                                          "uncut": False},
+                                   {"frame": "gone", "centroid": [0, 0, 0], "uncut": True},
+                                   {"frame": "f000000", "centroid": [-2.0, 0.0, 0.5],
+                                    "uncut": True}]}
+    assert _mapper_extent(o, cams) == {"x": "partial", "y": "full", "z": "full"}
+    assert _mapper_extent({"yaw_deg": 10.0}, cams) == {"x": "partial", "y": "partial",
+                                                       "z": "partial"}

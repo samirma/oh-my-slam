@@ -424,7 +424,9 @@ class MapperBackend:
                                 "label_votes": o.get("label_votes") or {},
                                 "observations": o.get("observations"),
                                 "created_update": o.get("created_update"),
-                                "last_seen_update": o.get("last_seen_update")})
+                                "last_seen_update": o.get("last_seen_update"),
+                                # the views it was detected in (``objects.Sighting.to_list``)
+                                "sightings": o.get("sightings") or []})
             return out
 
         def ignore(name: str) -> NDArray[np.bool_] | None:

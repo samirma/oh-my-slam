@@ -236,7 +236,10 @@ def test_cut_masks_leave_extents_partial(tmp_path: Path) -> None:
     om.update([view("a", (0.0, 1.2, 1.0), sc, target=(0.0, 3.0, 1.0))], 1, 0.0)
     assert om.records()["objects"] == []  # one sighting cut by the border: not listed yet
     o = om.objects[0]
-    assert ao.extent_seen(o) == {"x": "partial", "y": "partial", "z": "partial"}
+    # cut by the left and right borders: its width is partial, its height seen whole (the top
+    # and bottom of its mask uncut, seen from the side)
+    assert o.sightings[0].cut[:2] != [False, False] and o.sightings[0].cut[2:] == [False, False]
+    assert ao.extent_seen(o) == {"x": "partial", "y": "partial", "z": "full"}
     assert ao.sigma_centre(o) >= ao.MIN_SIGMA_M
 
 
@@ -798,8 +801,8 @@ def test_detection_votes_over_the_frames_that_see_the_centre() -> None:
     looking = look_at((-1.0, 0.0, 0.0), (0.0, 0.0, 0.0))
     away = look_at((-1.0, 0.0, 0.0), (-2.0, 0.0, 0.0))
     side = look_at((-1.0, 0.0, 0.0), (-1.0, 3.0, 0.0))  # the centre left of its image
-    cams = [("d", looking, K_TABLE), ("e", away, K_TABLE), ("a", looking, K_TABLE),
-            ("f", side, K_TABLE)]
+    cams = [("d", looking, K_TABLE, None), ("e", away, K_TABLE, None),
+            ("a", looking, K_TABLE, None), ("f", side, K_TABLE, None)]
     assert ao.in_view(np.zeros(3), looking, K_TABLE) and not ao.in_view(np.zeros(3), away,
                                                                          K_TABLE)
     assert not ao.in_view(np.zeros(3), side, K_TABLE)
