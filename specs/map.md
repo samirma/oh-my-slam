@@ -47,9 +47,22 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * **Measurable pair.** A pair of frames is measurable only with at least 100 epipolar
     inliers and an overlap (§1, Overlap) of at least 10 %. For a frame's image-only pose against
     its references, both must hold with the same confirmed or registered reference. Otherwise
-    it counts as no
-    measurable pair, which passes every pair limit (§4). Standpoint grouping and the pair
-    limits use this threshold;
+    it counts as no measurable pair, which passes every pair limit (§4). Standpoint grouping and
+    the pair limits use this threshold.
+    * The epipolar inliers are those of a relative pose that the pair's own depth images
+      confirm when both frames carry depth; repetitive or symmetric content can make the
+      largest consensus a false geometry, and a pair with no confirmed pose counts as no
+      measurable pair. This depth confirmation is the same test that registration applies to
+      candidate poses on every engine (§2, Match graph), so a lattice pose can be neither
+      measured nor registered. Its agreement threshold is a constant in `README.md`.
+    * Frames without depth: when either frame carries no depth image, the pair's own data
+      cannot reject such a geometry, so a cycle-consistency rule applies among image-measured
+      rotations only. A pair whose two-view rotation disagrees by more than 10° (a constant in
+      `README.md`) with the chain of stronger measured pairs is not measurable. A chain
+      composes the two-view rotations along a path of measurable pairs that each have strictly
+      more inliers than the pair. The rule is independent of the joint solve (§4). It cannot
+      catch a lattice geometry that stays consistent around a whole cycle, or a pair with no
+      stronger chain: an accepted degenerate case, as above;
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
@@ -202,7 +215,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        limits.
     2. Each connected component of new frames registers as a whole. Relative poses come from
        the images. The component is placed by its matches to confirmed keyframes, by the
-       priors of all its frames together, or both. A component that reaches no confirmed
+       priors of all its frames together, or both. On every engine, a candidate pose of a
+       frame that carries depth images, against a reference that carries them, is placed only
+       if it passes the depth confirmation of §1 (Measurable pair); a candidate failing it is
+       not a placement. A component that reaches no confirmed
        keyframe is seeded at one frame's prior. Its frames' reported sigmas cover the seed
        prior's sigma combined with each frame's fusion, and are never tighter than the seed
        prior's. This floor applies to every frame whose placement depends on the component,
@@ -244,8 +260,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     7. The outcome does not depend on the order of frames in the request. Where any order is
        still needed (the origin frame, the seed frame, the pose-duplicate pass), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the
-       same statuses, except on maps built by the MapAnything engine, where it predicts with
-       geometric registration and its statuses can differ (api.md §4);
+       same statuses, except for monocular frames (below) that a job registers with the
+       MapAnything engine: it predicts them with geometric registration, so their statuses
+       and poses, and the `rotation_pairs` they enter, can differ (api.md §4).
+    8. **Engine order in a job.** Frames that carry depth images register with the geometric
+       engine first, as a dry run does. MapAnything takes the monocular frames and the frames
+       the geometric engine leaves unplaced. A MapAnything call with a single anchor has no
+       anchor residual to estimate its rotation noise from, so it reports `sigma_rot_deg` no
+       tighter than a rotation sigma floor, a constant in `README.md`, calibrated so that
+       `update.sigma_containment` (evaluation.md) holds;
   * the objects;
   * the grid inputs;
   * the scale;
@@ -358,10 +381,13 @@ becomes a job with a `job_id`. A job goes through these states:
     * Overlapping neighbours: pairs whose overlap (§1, Overlap) is at least 10 %.
     * Without priors: the update's frames carry no priors.
     * Image-measured: each pair's own two-view relative rotation, independent of the joint
-      solve.
+      solve: the measurement is never seeded from, nor refined toward, the committed or the
+      joint solve. It uses the pair's images, its depth images when both frames carry them,
+      and the cycle-consistency rule (§1, Measurable pair), nothing else.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
-    registered frames only, over measurable pairs (§1: at least 100 epipolar inliers and an
-    overlap of at least 10 %). With no measurable pair, every pair limit passes.
+    registered frames only, over measurable pairs (§1: at least 100 epipolar inliers, depth- or
+    cycle-confirmed as there, and an overlap of at least 10 %). With no measurable pair, every
+    pair limit passes.
 
 ## 5. Objects (O8)
 

@@ -236,8 +236,10 @@ error code `invalid_request` (§9).
   `rotation_inconsistent` (map.md §4).
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
   waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
-  single worker (inference.md). Documented limit: on maps built by the MapAnything engine, the
-  dry run predicts with geometric registration, so its statuses can differ from the update's.
+  single worker (inference.md). Documented limit: a job registers frames that carry depth
+  images with the geometric engine, as the dry run does, and monocular frames with the
+  MapAnything engine (map.md §2, Match graph). For monocular frames the dry run predicts with
+  geometric registration, so their statuses and poses can differ from the update's.
   Per frame it gives:
   * `features`;
   * the predicted link to the map: `map_inliers`, `predicted_status` (`registered`,
