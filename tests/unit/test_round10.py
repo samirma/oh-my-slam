@@ -363,6 +363,7 @@ def test_detections_mostly_on_ignored_pixels_are_dropped() -> None:
     above = np.array([0.0, -0.2, 1.0])  # row 4
     assert ao.in_view(below, T, K) and not ao.in_view(below, T, K, ign)
     assert ao.in_view(above, T, K, ign)
+    assert not ao.in_view(np.array([5.0, 0.0, 1.0]), T, K, ign)  # in front, off the image
     assert ao.in_view(below, T, K, on_grid(ign, (40, 60))) is False
 
 

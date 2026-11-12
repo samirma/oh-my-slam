@@ -245,12 +245,11 @@ def _ignore_pixels(frame: FrameReconstruction, dets: list[Detection], mask_png: 
     for det in dets:
         ign = on(det.mask.shape)
         n = int(det.mask.sum())
-        # mostly on the ignored pixels: dropped (map.md §2, the README share)
-        if n and float((det.mask & ign).sum()) / n > IGNORED_DETECTION_MAX_SHARE:
+        # empty, or mostly on the ignored pixels: dropped (map.md §2, the README share); the
+        # rest keeps more than half its mask
+        if not n or float((det.mask & ign).sum()) / n > IGNORED_DETECTION_MAX_SHARE:
             continue
-        keep = det.mask & ~ign
-        if keep.any():
-            kept.append(replace(det, mask=keep))
+        kept.append(replace(det, mask=det.mask & ~ign))
     return kept
 
 
