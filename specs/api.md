@@ -130,7 +130,7 @@ error code `invalid_request` (§9).
   | Field | Meaning |
   | --- | --- |
   | `name` | The frame's name. |
-  | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. A `kept_at_prior` frame whose `detail` is `conflict_unsupported` contributes nothing to the map; every other kept frame counts for free-by-rule cells only (Kept at prior, below). |
+  | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. A `kept_at_prior` frame whose `detail` is `conflict_unsupported` contributes nothing to the map, whatever its `reason`; every other kept frame counts for free-by-rule cells only (Kept at prior, below). |
   | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
@@ -138,7 +138,7 @@ error code `invalid_request` (§9).
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
-  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view). Null otherwise, including a frame kept for a failed check. |
+  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2)). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
@@ -153,31 +153,51 @@ error code `invalid_request` (§9).
   `quality.reregistered`; from then on it counts normally. A registered or provisional monocular
   frame with `detail` `floor_not_judged` is not a `kept_at_prior` frame, but its content is
   excluded likewise (map.md §2); it counts for free-by-rule cells, its pose being trusted, and
-  its depth gives no scale evidence. The same holds for a sensor-depth frame excluded by the
-  floor check or the height gate: its content is withheld, its pose is trusted, and it counts
-  for free-by-rule cells.
-  * **Conflicting prior exception.** A `kept_at_prior` frame whose `detail` is
-    `conflict_unsupported` (reason `prior_conflict`: its images contradict the prior without
-    enough support to reject it) contributes nothing: no free-by-rule cells either (no camera
-    stand, no near blind disc, so no `floor_observed` 2 from it), and no occupancy, `height_m`,
-    cloud or objects. The prior is exactly what is in doubt. If a later job's images confirm
-    the frame, it counts normally from then on. The other `kept_at_prior` frames (no image
-    pose, a loose image pose, a failed check such as `too_close`) are unchanged: they keep
-    counting for free-by-rule cells, and the too-close exception below stays.
+  its depth gives no scale evidence, and its sent camera height constrains only its own camera
+  pose: it is never combined with that frame's own depth or floor plane into a scale estimate
+  (camera-height evidence or the monocular scale k), since that depth is the out-of-bound part;
+  the height may still count where camera-height evidence is formed from poses and other frames'
+  floor (map.md §1, §2). A sensor-depth frame excluded by the floor check or the height gate
+  is likewise a frame whose content is withheld, whose pose is trusted and which counts for
+  free-by-rule cells.
+  * **Conflicting prior exception.** A `kept_at_prior` frame whose images show a conflict with
+    its prior beyond the conflict bound (the bound of Choosing a status, below: 3 ×
+    sqrt(σ_prior² + σ_image²), position and rotation tested separately) contributes nothing
+    until a later job's images confirm it: no detections, no depth (no cloud points, no
+    occupancy, no `height_m`, no free space from its depth), no objects and no free-by-rule
+    cells either (no camera stand, no near blind disc, so no `floor_observed` 2 from it). The
+    prior is exactly what is in doubt: content never enters the map at a pose the images
+    contradict. This holds **whatever the frame's `reason`**: a frame with no failed check
+    (`reason` `no_overlap`, `detail` `conflict_unsupported`: its images contradict the prior
+    without enough support to reject it) and a frame kept for a failed check (`plain`, `blur`,
+    `few_features`, `too_close`) whose image pose still conflicts, where the failed check wins
+    the `reason`. A conflict is evaluated only when an image-only pose exists for the frame: a
+    frame the images give no pose (`no_image_pose`) has none, and nothing is withheld from it
+    on this ground. If a later job's images confirm the frame, it counts normally from then on.
+    The other `kept_at_prior` frames (no image pose, a loose image pose, a failed check whose
+    image pose shows no conflict) are unchanged: they keep counting for free-by-rule cells, and
+    the too-close exception below applies to them.
+  * **How the client sees it.** On every such frame `detail` is `conflict_unsupported` (an
+    existing value), and `reason` is whatever won: `prior_conflict`'s kept form (`no_overlap`,
+    or the first failed check). A kept frame whose `detail` is null, or `no_image_pose` or
+    `loose_image_pose`, had no conflict evaluated or none found. No other field is needed.
   * **Too-close exception** (every engine, the older mapper included). A frame that is
-    `kept_at_prior` only because it is `too_close`, and has a `metric` prior, still contributes
+    `kept_at_prior` only because it is `too_close`, has a `metric` prior and whose images show no
+    conflict with it (`detail` null; with `conflict_unsupported` the exception does not apply),
+    still contributes
     at its prior pose: its detections, to object records and `detection_votes`; its depth
     points, to the cloud, occupancy and heights. On the older mapper engine its depth reaches
     occupancy and heights but not the cloud, which is that engine's own fused cloud. Depth
     points count only from a depth image, inside its valid range (`README.md`). Without a depth
     image, its detections and `detection_votes` still count at the prior pose, placed like any
     monocular detection. It never contributes scale evidence: scale stays confirmed-only.
-  * Every other `kept_at_prior` frame, apart from the `conflict_unsupported` one above,
+  * Every other `kept_at_prior` frame, apart from a `conflict_unsupported` one above,
     contributes nothing but free-by-rule cells until its images confirm it, including a
     `too_close` frame with a `drifting` prior and a frame kept
     for any other failed check.
-  * A client tells the kept frames that carried content by their `reason`, `too_close`, which
-    every kept frame carries (the schema requires a reason for `kept_at_prior`).
+  * A client tells the kept frames that carried content by their `reason` `too_close` with a
+    null `detail` (every kept frame carries a reason: the schema requires one for
+    `kept_at_prior`); `too_close` with `conflict_unsupported` carried none.
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate. Its sigmas are drift-grown: the root sum of squares of the prior's
@@ -218,7 +238,11 @@ error code `invalid_request` (§9).
     decode, or its size is not the camera's). This wins over `prior_conflict`: a frame that
     fails a check, or is too close, and whose image also strongly conflicts with its prior, is
     `kept_at_prior` with that check's reason. Depth agreement alone never confirms a frame with
-    a prior that failed a check: it stays `kept_at_prior`.
+    a prior that failed a check: it stays `kept_at_prior`. The check's reason wins the `reason`
+    only: when the frame's image-only pose conflicts with its prior (the conflict test above,
+    which needs an image-only pose; no measurable-pair threshold is applied, since the frame is
+    kept either way), the frame's `detail` is `conflict_unsupported` and it contributes nothing,
+    free-by-rule cells included (Kept at prior, above).
   * This holds for an origin frame too: a frame of a map's first update whose image fails a
     quality check is `kept_at_prior` and still defines the map frame (map.md §1). An engine that
     cannot tie kept frames to the priors' frame, when no prior-carrying frame registers, may

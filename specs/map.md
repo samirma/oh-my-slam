@@ -226,7 +226,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
-  3. camera heights above the floor, per frame or per camera (`camera_height`);
+  3. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
+     floor check did not judge (`floor_not_judged`, §2) gives no such evidence from its own
+     depth or floor plane: its sent height constrains only its own camera pose, and is never
+     combined with that frame's depth into a scale estimate, since that depth is the
+     out-of-bound part. Its height may still count where the evidence is formed from poses
+     and other frames' floor;
   4. monocular depth (`monocular`).
 
   `scale_sigma_rel` is estimated from the residuals of that source, from image-confirmed frames
@@ -243,20 +248,27 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the cloud and its free-space fusion. Occupancy, heights (the `height_m` layer and object
     heights), the cloud, object records and all scale evidence (depth, camera height) come only
     from image-confirmed frames; a `kept_at_prior` frame counts only for free-by-rule cells
-    (§6) until it is registered, with one exception: a frame kept at a prior its images
-    contradict (reason `prior_conflict`, `detail` `conflict_unsupported`) counts for nothing,
-    free-by-rule cells included (no camera stand, no near blind disc), because the prior is
-    exactly what is in doubt. If a later job's images confirm it, it counts normally from then
-    on (re-registration, below). Every other `kept_at_prior` frame (no image pose, a loose image
-    pose, a failed check such as `too_close`) keeps counting for free-by-rule cells. A frame
+    (§6) until it is registered, with one exception: a frame whose images show a conflict with
+    its prior beyond the conflict bound (api.md §4; `detail` `conflict_unsupported`) counts for
+    nothing until a later job's images confirm it: no detections, no depth, and no free-by-rule
+    cells either (no camera stand, no near blind disc), because the prior is exactly what is in
+    doubt and content never enters the map at a pose the images contradict. This holds whatever
+    the frame's reason: also for a frame kept for a failed check (`plain`, `blur`,
+    `few_features`, `too_close`) whose image pose conflicts, the failed check winning the
+    reason. A conflict is evaluated only when an image-only pose exists for the frame. If a
+    later job's images confirm it, it counts normally from then on (re-registration, below).
+    Every other `kept_at_prior` frame (no image pose, a loose image pose, a failed check whose
+    image pose shows no conflict) keeps counting for free-by-rule cells. A frame
     whose content is withheld but whose pose is trusted still counts for free-by-rule cells:
     a sensor-depth frame excluded by the floor check or the height gate, and a registered or
     provisional monocular frame the floor check did not judge (`floor_not_judged`, below), which
     gives no cloud, occupancy, heights or objects either. A `floor_not_judged` frame's depth
-    gives no scale evidence; its pose counts like any registered frame's for everything that
-    uses poses. Exception: a frame kept only for `too_close` with a `metric`
-    prior contributes its detections and its in-range depth at the prior pose (api.md §4), but
-    never scale evidence.
+    gives no scale evidence, and its sent camera height constrains only its own camera pose
+    (never combined with its own depth or floor plane into camera-height evidence or k); its
+    pose counts like any registered frame's for everything that uses poses. Exception: a frame
+    kept only for `too_close` with a `metric` prior and no conflict with it (`detail` null)
+    contributes its detections and its in-range depth at the prior pose (api.md §4), but never
+    scale evidence.
   * **Height gate.** When frames carry `height_above_floor_m` and `height_sigma_m`, a frame
     whose committed camera height disagrees with it by more than
     3 × sqrt(height_sigma² + σ_z²) (σ_z = `sigma_pos_m` / √3, its committed position sigma
@@ -300,7 +312,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       that view is missing and can retake it. Like any registered frame it still counts for
       free-by-rule cells (camera stand and near blind disc, §6): its pose is trusted, and its
       pose counts like any registered frame's for everything that uses poses. Its depth gives no
-      scale evidence: it does not enter the monocular depth scale k.
+      scale evidence: it does not enter the monocular depth scale k. Its sent height constrains
+      only its own camera pose (the height term of the registration above and the height gate):
+      it is never combined with the frame's own depth or floor plane into a scale estimate,
+      neither camera-height evidence (§1) nor k, because that depth is the out-of-bound part.
+      The height may still count where camera-height evidence is formed from poses and other
+      frames' floor.
 
     A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
     by name. A monocular frame is never listed: one whose own scale was applied reports that
@@ -325,8 +342,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     otherwise it stays `kept_at_prior` and is not listed in `quality.reregistered`. If its images
     confirm it, its pose leaves `kept_at_prior` in that version (it becomes a registered pose,
     `provisional` then `fused`), and from then on it counts normally: it feeds occupancy,
-    heights, the cloud, objects and free-by-rule cells (a frame kept for `conflict_unsupported`
-    counted for none of them until then). The job lists each such frame in `quality.reregistered` (§4); the movement of that
+    heights, the cloud, objects and free-by-rule cells (a frame kept with `detail`
+    `conflict_unsupported`, whatever its reason, counted for none of them until then). The job lists each such frame in `quality.reregistered` (§4); the movement of that
     confirmation is excluded from `previous_residuals` and `gauge_shift`. A dry run predicts
     `reregistered` with the same test, without committing; the prediction is approximate. An engine
     that cannot re-register (the older mapper) reports `reregistered` as an empty list; this is
@@ -688,11 +705,13 @@ its lower field-of-view edge.
 
 **Unconfirmed frames.** A `kept_at_prior` keyframe counts only for these free-by-rule cells
 (camera stand and near blind disc) until a later job's images confirm it (§2), except a frame
-kept at a prior its images contradict (reason `prior_conflict`, `detail` `conflict_unsupported`):
-it counts for nothing, so it makes no camera stand and no near blind disc and gives no
-`floor_observed` = 2, because the prior is exactly what is in doubt. When a later job's images
-confirm it, it counts normally from then on. Every other `kept_at_prior` keyframe (no image
-pose, a loose image pose, a failed check such as `too_close`) keeps counting for these cells.
+kept at a prior its images contradict (`detail` `conflict_unsupported`, whatever its reason:
+`no_overlap`, or a failed check such as `too_close` that won the reason): it counts for
+nothing, so it makes no camera stand and no near blind disc and gives no `floor_observed` = 2,
+because the prior is exactly what is in doubt. A conflict is evaluated only when an image-only
+pose exists for the frame. When a later job's images confirm it, it counts normally from then
+on. Every other `kept_at_prior` keyframe (no image pose, a loose image pose, a failed check
+whose image pose shows no conflict) keeps counting for these cells.
 Occupancy, the `height_m` layer, the cloud and object records come only from image-confirmed
 frames, except the in-range depth and detections of a frame kept only for `too_close` with a
 `metric` prior (api.md §4). A frame whose content is withheld still counts for these cells,
@@ -763,8 +782,8 @@ seen there.
   * 1 — a floor surface was observed in the cell at the floor height;
   * 2 — not observed, but free by rule: a camera stood here, or the cell lies inside a camera's
     near blind disc. The cameras are those of registered and provisional frames (also when their
-    content is withheld, §2) and of `kept_at_prior` frames, except one kept for
-    `conflict_unsupported`, which makes no such cell;
+    content is withheld, §2) and of `kept_at_prior` frames, except one kept with
+    `detail` `conflict_unsupported` (whatever its reason), which makes no such cell;
   * 0 — not observed.
   A cell that is free but whose floor was not observed means the camera saw through it above a
   floor nobody saw: there may be a low obstacle or a step, so the planner looks first.
