@@ -172,7 +172,9 @@ judged by the floor check and keeps k (map.md §2).
 **oms/2.6** is additive: the `failed_checks` value `depth_inconsistent` (map.md §4), a hard limit
 that rejects an update, with or without priors, when two committed views contradict each other's
 sensor depth images; it is predicted by a dry run, and monocular frames are not tested by it. It
-also changes behaviour with no change of shape: the parallax choice that separates translational
+also adds the quality report's `depth_pairs` (every pair that limit evaluated, with its agreement
+share in each direction and whether it failed, as `rotation_pairs` does for the rotation check,
+map.md §4). It also changes behaviour with no change of shape: the parallax choice that separates translational
 twins also separates two depth-confirmed hypotheses whose rotations are at least 10° apart, in
 pair measurement and in the registration gate, when the measured parallax is plausible for the
 pair (map.md §1, Symmetric scenes, and §2, Match graph); and a whole sequence registered through a

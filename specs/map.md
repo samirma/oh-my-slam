@@ -491,6 +491,14 @@ becomes a job with a `job_id`. A job goes through these states:
     image-measured and the committed relative rotation angles, and the angle between those two
     rotations. Empty unless the check ran on at least one measurable pair; it shows which pairs
     drove `rotation_inconsistent`;
+  * `depth_pairs` (oms/2.6): every pair the depth-consistency limit (below) evaluated, on dry
+    runs as on jobs, each `{a, b, agree_ratio_ab, agree_ratio_ba, fails}`: the frame names in
+    canonical order; the share of points that agree among those that agree or contradict, in
+    each direction (a's depth points mapped into b, then b's into a), null for a direction with
+    fewer than the depth confirmation's minimum count of such points; and whether the pair
+    failed the limit. Empty when the limit evaluated no pair (no sensor depth, or the older
+    mapper). On a `depth_inconsistent` rejection it shows which frames contradict each other,
+    so a client can drop or retake them;
   * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
     frame this job's images confirmed (§2): how far confirmation moved the frame from its
     prior-placed pose. Empty when there are none; a dry run predicts it. This movement is not

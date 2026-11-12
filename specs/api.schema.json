@@ -768,6 +768,7 @@
         "height_inconsistent",
         "floor_inconsistent",
         "rotation_pairs",
+        "depth_pairs",
         "drift_correction"
       ],
       "properties": {
@@ -973,6 +974,52 @@
             }
           },
           "description": "Every measurable pair the rotation check evaluated (jobs and dry runs); empty unless it ran on at least one measurable pair. Shows which pairs drove rotation_inconsistent."
+        },
+        "depth_pairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "a",
+              "b",
+              "agree_ratio_ab",
+              "agree_ratio_ba",
+              "fails"
+            ],
+            "properties": {
+              "a": {
+                "type": "string",
+                "description": "Frame name, first in canonical order."
+              },
+              "b": {
+                "type": "string",
+                "description": "Frame name, second in canonical order."
+              },
+              "agree_ratio_ab": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "agree / (agree + see-through) for a's depth points mapped into b under the committed relative pose; null when fewer than the depth confirmation's minimum count of points agreed or contradicted in that direction."
+              },
+              "agree_ratio_ba": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "The same for b's depth points mapped into a."
+              },
+              "fails": {
+                "type": "boolean",
+                "description": "Whether the pair failed the depth-consistency limit: in some direction, at least the minimum count of points agreed or contradicted and fewer than the agreement threshold of them agreed."
+              }
+            }
+          },
+          "description": "oms/2.6. Every pair the depth-consistency limit evaluated (map.md section 4), jobs and dry runs; empty when it evaluated no pair (no sensor depth, or the older mapper). On a depth_inconsistent rejection it shows which frames contradict each other, so a client can drop or retake them."
         }
       }
     },
