@@ -83,9 +83,10 @@ Each row is something the skill needs. Each row's test is in §11.
   * distortion: the OpenCV model, or none;
   * optional ignore mask, for pixels showing the robot itself. A frame may add its own mask,
     for example the arms in a head camera or a held object in a wrist camera. The two masks are
-    combined, and a pixel in their union contributes nothing anywhere, on every engine: no
-    keypoints or matches, no depth points, no occupancy, free-space or floor evidence, no
-    detections or votes, no cloud points (map.md §2);
+    combined, and a pixel in their union contributes nothing anywhere, on every engine, in every
+    use: no keypoints or matches, no depth points, no occupancy, free-space or floor evidence,
+    no detections or votes, no cloud points, and none to the frame quality checks, the
+    `too_close` scene distance, scale evidence or the camera-height check (map.md §2);
   * optional height of the optical centre above the floor, with a sigma: the scale anchor for
     robots without metric priors. A frame may carry its own height, with a sigma, which
     overrides the camera's: a camera on a pan-tilt head or a wrist moves with the robot's joints.
