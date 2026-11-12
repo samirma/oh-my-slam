@@ -76,12 +76,15 @@ def reregistered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None,
-         prior_frames_rejected: bool = False, rotation_inconsistent: bool = False
-         ) -> dict[str, Any]:
+         prior_frames_rejected: bool = False, rotation_inconsistent: bool = False,
+         depth_inconsistent: bool = False) -> dict[str, Any]:
     """``accepted`` and ``failed_checks`` of a quality report (map.md §4): nothing kept is the
     hard limit, a map's first update whose frames with a prior are all rejected is
     ``prior_frames_rejected`` (map.md §1), and an update without priors whose committed relative
-    rotations disagree with the images' is ``rotation_inconsistent`` (``mapping.standpoint``). ``accept_if`` checks, each on its own and only when
+    rotations disagree with the images' is ``rotation_inconsistent`` (``mapping.standpoint``),
+    an update two of whose committed views contradict each other's sensor depth images is
+    ``depth_inconsistent`` (oms/2.6, ``standpoint.depth_consistency``). ``accept_if`` checks,
+    each on its own and only when
     given: ``max_residual_m`` on ``previous_residuals.max_m`` (stored keyframes only; prior
     corrections never fail it), ``max_gauge_shift_m``, ``max_displacement_m`` and
     ``max_displacement_deg`` (a null value passes), ``max_prior_disagreement_deg`` and
@@ -94,6 +97,8 @@ def gate(q: dict[str, Any], kept_any: bool, accept_if: dict[str, float] | None,
         failed.append("prior_frames_rejected")
     if rotation_inconsistent:
         failed.append("rotation_inconsistent")
+    if depth_inconsistent:
+        failed.append("depth_inconsistent")
     a = accept_if or {}
     if "max_residual_m" in a and prev_res and prev_res["max_m"] > a["max_residual_m"]:
         failed.append("max_residual_m")

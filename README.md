@@ -661,6 +661,38 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   not fused into the cloud and gives no occupancy, `height_m` or objects: only its camera stand
   and near blind disc count, as free-by-rule cells (map.md §2, §6). It is never
   `prior_conflict`: no image confirms another pose.
+* **Kept at a contradicted prior** (map.md §2, §6, api.md §4, P30b, P30c). A kept frame whose
+  image-only pose conflicts with its prior beyond the conflict bound has `detail`
+  `conflict_unsupported` whatever its reason: `no_overlap` (short of the measurable-pair
+  threshold), or a failed check that won the reason (`plain`, `blur`, `few_features`,
+  `too_close`; `AnchoredMap._conflict_detail`, the conflict test on its image pose without the
+  measurable-pair threshold, a loose image pose keeping precedence: no detail; `_too_close`
+  keeps the conflict of the placement it demotes; the mapper's engine `Updater._conflicts` before
+  its too-close demotion). Such a frame contributes nothing until a later job's images confirm
+  it: no detections or depth (`Keyframe.conflict`: no too-close exception; the mapper's
+  `_too_close_content`), and no camera stand or near blind disc (the version row's
+  `no_stand: true`, which `service.derived` leaves out of its stands and grid extent; a
+  re-registered row drops it). Every other kept frame, and every frame whose content is
+  withheld but whose pose is trusted (floor check, height gate, `floor_not_judged`), keeps its
+  free-by-rule cells.
+* **A not-judged keyframe lifts nothing** (map.md §2 "A floor_not_judged keyframe as a
+  reference", api.md §6, oms/2.6 P30d; `Keyframe.lifts`). A keyframe the floor check did not
+  judge (`floor_not_judged`) stays a registration reference for image matching and pose, its
+  features used without its depth: `AnchoredMap._correspondences` gives its matches no lifted
+  point (rays only, as a reference without depth), so it gives a later frame no keypoint depth
+  for PnP or for the depth alignment (the monocular residual), no camera-height evidence through
+  that alignment and no part in k; the depth confirmation and MapAnything's depth evidence never
+  take its grid (`depth_confirms`, `depth_residual`), and MapAnything's anchors take its image
+  and pose without depth (`prior_first._anchor_depth`). A frame whose only depth references are
+  such keyframes is placed from the images alone (the rotation-only fallback at the reference
+  when no lifted point remains). This removes the scale skew of the half-scale sweep (s5, s6 at half
+  depth): the frames lifted on their depth took it as their own (monocular residuals at log 0.5,
+  a wider `scale_sigma_rel`); now its k and evidence equal those of the same sweep with s5 and
+  s6 sent without depth. Locate takes
+  the same rule: its version row carries `depth_unused: true` (both engines), and
+  `service.derived` builds its locate keyframe without depth points (triangulated from the
+  other keyframes' poses where it can be, never lifted by its depth); a frame located through
+  such keyframes alone has the without-depth noise floor (0.15 m), never the 8 mm one.
 * **Too-close exception** (api.md §4, `Keyframe.detects`, `Keyframe.contributes`). A frame kept
   only because it is `too_close` (its reason `too_close`, which every client sees), with a
   `metric` prior, still contributes at its prior pose: its detections to the object records and
@@ -785,6 +817,49 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   no measurable pair passes (`standpoint.rotation_check`). The
   mapper's engine is checked the same way on its committed poses (*Quality and gate*); it is
   exempt from standpoint grouping only (map.md §1 "Every engine").
+* **Depth consistency** (map.md §4, oms/2.6 P30, P30a; `standpoint.depth_consistency`). Every
+  update of this engine with sensor depth, with or without priors (wide drifting priors do not
+  exclude a 90° lattice pose), after the job's registration (`AnchoredMap.end_job`), on the job
+  and on its dry run. *Pairs*: each registered keyframe of the update (image-confirmed: a frame
+  kept at its prior is never paired) with every other one and with each stored image-confirmed
+  keyframe, both `depth_kind` `sensor` (a monocular depth is estimated: not tested), that can
+  share a view under their committed poses: `standpoint.close`, the registration candidates'
+  test (centres within `CANDIDATE_MAX_DIST_M` = 5 m, optical axes within
+  `CANDIDATE_MAX_ANGLE_DEG` = 100°). *Test*: each one's stored depth grid (`backproject`, 64 per
+  side) at its committed pose, seen by the other (`anchored.depth_counts`): a point is a
+  contradiction when it lies in front of the other's surface by more than `SENSOR_DEPTH_TOL` =
+  10 % of that depth plus `K_SIGMA` = 3 × the two frames' combined committed position sigma
+  (`hypot`, the margin `margin_m`: a standpoint join's by-design spread, 0.10 m on the turn of
+  `test_a_job_measures_the_stored_pairs_its_chains_need`, never fires; the rotation sigma is not
+  in it, since the 1.25° floor × 3 × 3 m swallows the near-exact lattice's contradictions). A
+  pair fails when in either direction at least `MIN_AGREEING` = 40 points agree or contradict
+  and fewer than `DEPTH_CONFIRM_AGREEMENT` = 0.90 of them agree; one failing pair rejects the
+  update `depth_inconsistent`. Each pair is logged (`depth consistency a-b: a>b agree … through
+  … (margin m): ok | fails`) and listed in `quality.depth_pairs` (`agree_ratio_ab`/`_ba` null
+  in a direction under 40 counted points). *Evidence* (diag-lattice, the empty room with walls
+  repeating every 2 or 2.5 m whose turn the registration locked 90° off): the lattice commits'
+  pairs agree at 0.19-0.80 (f0 against f3/f4/f6/f7), every correct commit tested (furnished and
+  textured rooms, a moving base, round 11's tiled turn, the service-test turns, with metric and
+  drifting priors) at ≥ 0.98 with no fire, so 302 offline tests passed unchanged under the
+  prototype. *Cost*: 13-18 ms for 28 pairs of 8 frames (numpy), reported as
+  `timings_s.depth_consistency` (part of `register`). *Limit*: a scene symmetric as a whole for
+  the narrow camera, where the committed depths agree everywhere (two frames locked by the
+  lattice; the room's 2 m translational twins of a whole sub-sequence, every view of which sees
+  one flat wall and the floor) still passes: the accepted degenerate case. The older mapper is
+  exempt (its registrations are not depth-gated): `depth_pairs` empty.
+* **Two-view parallax on repeating textures** (map.md §1 "Two-view parallax";
+  `standpoint.turn_parallax`). A turn in place satisfies every essential matrix, so on a
+  repeating wall texture the largest epipolar consensus of an adjacent turn takes the walls'
+  period-shifted matches with it (they lie on the horizontal epipolar lines of a baseline along
+  the wall: a translational twin's geometry) and its median measured them: 365-591 px on the
+  empty 2 m room's f1-f2 / f5-f6 where the true pose predicts 0.3-0.7 px. The epipolar inliers
+  of the zero-baseline pose are then the rotation-only fit's own consensus (its residual within
+  twice the epipolar threshold): when that consensus holds at least `CHECK_MIN_INLIERS` = 100
+  matches and `TURN_MIN_SHARE` = 0.25 of the inliers (the supported-hypothesis share; 40-56 %
+  there) and is itself one standpoint (its median below `PARALLAX_MAX_PX` = 1 px), its median is
+  the pair's parallax (0.4-0.7 px there). It never fires on a moving base (0.25 m steps: the
+  rotation-only consensus holds 3-20 % of the inliers at 6-15 px) nor on any pair whose whole
+  consensus is already below 1 px.
 * **Depth confirmation** (map.md §1 "Measurable pair", §2 step 2, oms/2.4 P20). Repetitive,
   square-symmetric texture (floor tiles, parquet) makes the largest epipolar consensus of two
   frames turned by about 90° a false geometry: the lattice looks the same after a quarter turn
@@ -822,8 +897,19 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   0.2-3.9° off). With no confirmed hypothesis the pair carries no measurement (`TwoView.confirmed`
   false: not measurable). *Symmetric scenes* (map.md §1, P24): when a second confirmed
   hypothesis lies at least `SYMMETRIC_MIN_DEG` = 10° (`anchored`) from the first, the scene
-  itself is symmetric (its depths agree with both) and the pair is ambiguous
-  (`TwoView.ambiguous`): not measurable. The bound is its own constant, not `CYCLE_MAX_DEG`: it
+  itself is symmetric (its depths agree with both). Since P30 the pair takes the one whose
+  predicted parallax matches the measured one (as for translational twins, below:
+  `anchored.rotated_pick`), when those matching are one geometry and the measured parallax is
+  plausible: not above `PARALLAX_PLAUSIBLE_MARGIN` = 2 × the largest parallax the hypotheses
+  predict (`anchored.parallax_plausible`; a false consensus of the 2 m room measured 437 px
+  where its lattice hypothesis predicted 130 px, the turn in place 0.5 px; the turn in place
+  measures 0.7 px). Otherwise the pair is ambiguous (`TwoView.ambiguous`): not measurable. On
+  the empty 2 m room this keeps the turn's true pose where P24 left f0-f1 ambiguous (0.7 px
+  measured, 0.5 / 130 px predicted) and let the registration lock the whole turn 90° off. The
+  registration gate applies it the same way (`AnchoredMap._ambiguous` collects every confirmed
+  candidate ≥ 10° away, `AnchoredMap._separated`; MapAnything's `standpoint.places`), a prior
+  sent for the frame deciding first, within 3 × its position sigma (`anchored.prior_geometry`:
+  the candidates there one geometry). The bound is its own constant, not `CYCLE_MAX_DEG`: it
   separates two geometries (a lattice turn is about 90°) from one geometry measured twice
   (sequential RANSAC's leftovers of one geometry give a rotation within about a degree of it),
   and 10° is the pair limit beyond which a rotation counts as another. *The test*
@@ -977,8 +1063,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     limits`) but neither in `rotation_pairs` nor in the limits. So a sequence measured by its
     adjacent pairs only stays judged (its end frames keep their only pairs, and an interior
     pair is outside only when both its frames' pairs all lack a chain), a two-frame job's single
-    pair is judged, and a false lattice pair kept this way can cause a rejection, never a wrong
-    commit.
+    pair is judged, and a false lattice pair kept this way can cause a rejection; a whole
+    sequence locked on a lattice pose is left to the depth-consistency limit (P30).
 * **Camera-height scale in every direction** (map.md §1). `scale_sigma_rel` is one sigma that
   must hold for a horizontal distance in any direction (3 σ). The camera heights measure the
   monocular depth's scale along each frame's view, so each height's frame records its viewing
@@ -2894,6 +2980,11 @@ above it.
   pairs exists. It cannot reject one consistent around a whole cycle or a pair with no stronger
   chain (map.md §1, the accepted degenerate case); a pair both of whose frames have two or more
   measurable pairs that all lack a chain is outside the pair limits (P28b), any other is judged.
+  A whole sequence registered through a lattice pose, which every measured pair agrees with, is
+  left to the depth-consistency limit (P30: rejected `depth_inconsistent` when its views
+  contradict the frames they were never measured against); one whose committed depths agree
+  everywhere (the empty 2 m room's translational twins of a sub-sequence, 2 m off along the
+  wall) still commits wrong.
 
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the

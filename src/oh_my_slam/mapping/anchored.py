@@ -256,6 +256,12 @@ PARALLAX_NOISE_PX = 1.0
 PARALLAX_NOISE_REL = 0.25
 PARALLAX_K = 2.0
 PARALLAX_SIN_MIN = 0.3  # map.md §1 "Two-view parallax": the sine is floored at this
+# map.md §1 "Symmetric scenes" (P30): the parallax separates two depth-confirmed hypotheses at
+# least ``SYMMETRIC_MIN_DEG`` apart only when the measured parallax is plausible for the pair:
+# not above the largest that the hypotheses predict times this margin (README "Symmetric
+# scenes"). A false consensus of a repeating texture measured 437 px where the pair's lattice
+# hypothesis, the largest prediction, gave 130 px
+PARALLAX_PLAUSIBLE_MARGIN = 2.0
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -302,6 +308,7 @@ DUPLICATE_POS_ENV = "OH_MY_SLAM_DUPLICATE_M"
 DUPLICATE_ROT_ENV = "OH_MY_SLAM_DUPLICATE_DEG"
 DUPLICATE_REMATCH = 0.90  # a pose duplicate's features re-matched in the keyframe (api.md §4)
 FAILED_CHECKS = ("plain", "blur", "few_features", "too_close")  # api.md §4, in that order
+CONFLICT_DETAIL = "conflict_unsupported"  # api.md §4 ``detail``: an image pose against the prior
 REREGISTER_OVERLAP = 0.10  # a new frame sees this share of a kept keyframe's view: placed again
 # the match graph (map.md §2): an edge needs the registration minimum of inliers (MIN_INLIERS)
 DRIFT_PASSES = 6  # passes before the last: a job re-tested under its drift fit's decision
@@ -1112,9 +1119,10 @@ class DepthCounts:
                 f"{self.outside} of {self.points} = {self.ratio:.3f}")
 
 
-def depth_counts(p: DepthRef, q: DepthRef, tol: float) -> DepthCounts:
+def depth_counts(p: DepthRef, q: DepthRef, tol: float, margin_m: float = 0.0) -> DepthCounts:
     """View ``p``'s depth points (``backproject``) at its pose, seen by view ``q`` (map.md §1
-    "Depth agreement"): how many agree with ``q``'s depth within ``tol`` (relative) and how many
+    "Depth agreement"): how many agree with ``q``'s depth within ``tol`` (relative, plus
+    ``margin_m`` metres: the depth-consistency limit's committed sigmas, map.md §4) and how many
     lie in front of ``q``'s surface by more than that — ``q`` would see through them, a
     contradiction. A point behind ``q``'s surface is occluded there and tells nothing (the wide
     baselines of frames around an object); so does a point outside ``q``'s image, behind ``q``,
@@ -1132,8 +1140,9 @@ def depth_counts(p: DepthRef, q: DepthRef, tol: float) -> DepthCounts:
     d[inside] = q.depth[v[inside], u[inside]]
     lo, hi = DEPTH_VALID_RANGE_M
     seen = inside & np.isfinite(d) & (d >= lo) & (d <= hi)
-    agree = seen & (np.abs(z - d) <= tol * d)
-    through = seen & (z < d * (1.0 - tol))
+    band = tol * d + margin_m
+    agree = seen & (np.abs(z - d) <= band)
+    through = seen & (z < d - band)
     occluded = seen & ~agree & ~through
     return DepthCounts(len(z), int(agree.sum()), int(through.sum()), int(occluded.sum()),
                        int((~seen).sum()))
@@ -1221,6 +1230,51 @@ def twin_pick(measured: float, predicted: list[float | None], centres: list[Arra
     separate them (none matches, or twins match alike): the pair is ambiguous."""
     return one_position([k for k, p in enumerate(predicted) if parallax_matches(p, measured)],
                         centres)
+
+
+def one_geometry(picked: list[int], Rs: list[Array], centres: list[Array]) -> int | None:
+    """The first of ``picked`` when all of them share its rotation (within
+    ``SYMMETRIC_MIN_DEG``) and position (within ``TWIN_MIN_M``): one geometry; else None."""
+    if not picked:
+        return None
+    k0 = picked[0]
+    if any(rot_deg(Rs[k0].T @ Rs[k]) >= SYMMETRIC_MIN_DEG
+           or float(np.linalg.norm(centres[k] - centres[k0])) >= TWIN_MIN_M for k in picked):
+        return None
+    return k0
+
+
+def parallax_plausible(measured: float, predicted: list[float | None]) -> bool:
+    """Whether a pair's measured two-view parallax is plausible for its hypotheses (map.md §1
+    "Symmetric scenes", P30): not above the largest parallax they predict (each from its own
+    baseline and the depths) times ``PARALLAX_PLAUSIBLE_MARGIN``; a measurement far above what
+    the baselines and depths allow is a false consensus. False when none predicts one."""
+    known = [p for p in predicted if p is not None]
+    return bool(known) and measured <= PARALLAX_PLAUSIBLE_MARGIN * max(known)
+
+
+def rotated_pick(measured: float, predicted: list[float | None], Rs: list[Array],
+                 centres: list[Array]) -> int | None:
+    """Hypotheses whose rotations lie ``SYMMETRIC_MIN_DEG`` or more apart, all depth-confirmed,
+    separated by their parallax (map.md §1 "Symmetric scenes", P30): when the measured parallax
+    is plausible (``parallax_plausible``), the first whose predicted parallax matches it
+    (``parallax_matches``), when those that match are one geometry (``one_geometry``); None
+    otherwise (implausible, none or distinct ones match): the pair is ambiguous."""
+    if not parallax_plausible(measured, predicted):
+        return None
+    return one_geometry([k for k, p in enumerate(predicted) if parallax_matches(p, measured)],
+                        Rs, centres)
+
+
+def prior_geometry(Rs: list[Array], centres: list[Array], prior_c: Array, sigma_m: float
+                   ) -> int | None:
+    """Candidate poses decided by a prior sent for the frame (map.md §2 step 2: first, within
+    ``K_SIGMA`` x its position sigma, P30: also for rotated candidates): the first whose position
+    lies that near the prior's centre, when those that do are one geometry (``one_geometry``);
+    None otherwise (the parallax decides)."""
+    near = [k for k, c in enumerate(centres)
+            if float(np.linalg.norm(c - prior_c)) <= K_SIGMA * sigma_m]
+    return one_geometry(near, Rs, centres)
 
 
 def prior_pick(centres: list[Array], prior_c: Array, sigma_m: float) -> int | None:
@@ -1371,6 +1425,17 @@ class Keyframe:
     # content, as a frame the check excluded (``floor_withheld``: ``floor_not_judged``, map.md
     # §2, oms/2.5, P29b)
     floor_unjudged: bool = False
+    # kept at a prior its image pose conflicts with (``detail`` ``conflict_unsupported``,
+    # whatever its reason, api.md §4, P30b/P30c): no content, no free-by-rule cells, no
+    # too-close exception, until a later job's images confirm it
+    conflict: bool = False
+
+    def lifts(self) -> bool:
+        """Whether its depth serves later frames (map.md §2 "A floor_not_judged keyframe as a
+        reference", oms/2.6 P30d): keypoint depth for their lifting and alignment, depth
+        confirmation, scale evidence. A keyframe the floor check did not judge stays a reference
+        for image matching and pose, its features used without its depth."""
+        return not self.floor_unjudged
 
     def floor_withheld(self) -> bool:
         """Whether the floor check keeps its content out (map.md §2): it excluded the frame
@@ -1399,7 +1464,8 @@ class Keyframe:
                 "seed_sigma": None if self.seed_sigma is None else list(self.seed_sigma),
                 "K_grid": None if self.K_grid is None else self.K_grid.to_dict(),
                 "floor_ok": self.floor_ok, "grid_scale": self.grid_scale,
-                "floor_factor": self.floor_factor, "floor_unjudged": self.floor_unjudged}
+                "floor_factor": self.floor_factor, "floor_unjudged": self.floor_unjudged,
+                "conflict": self.conflict}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1415,7 +1481,8 @@ class Keyframe:
                         else (float(d["seed_sigma"][0]), float(d["seed_sigma"][1])),
                         floor_ok=bool(d.get("floor_ok", True)),
                         grid_scale=d.get("grid_scale"), floor_factor=d.get("floor_factor"),
-                        floor_unjudged=bool(d.get("floor_unjudged", False)))
+                        floor_unjudged=bool(d.get("floor_unjudged", False)),
+                        conflict=bool(d.get("conflict", False)))
 
     @property
     def centre(self) -> Array:
@@ -1436,9 +1503,9 @@ class Keyframe:
         return self.detects() and (self.usable() or self.depth_kind == "sensor")
 
     def too_close_exception(self) -> bool:
-        """Kept at its prior only because it is ``too_close``, with a ``metric`` prior (api.md
-        §4 "Too-close exception")."""
-        return self.state != "fused" and self.reason == "too_close" \
+        """Kept at its prior only because it is ``too_close``, with a ``metric`` prior and no
+        conflict with it (api.md §4 "Too-close exception", P30c: ``conflict``)."""
+        return self.state != "fused" and self.reason == "too_close" and not self.conflict \
             and self.prior is not None and self.prior["trust"] == "metric"
 
     def detects(self) -> bool:
@@ -2615,7 +2682,10 @@ class AnchoredMap:
                     or not len(k.feats.kps):
                 continue  # a keyframe without features or keypoint depths: no reference
             ray = rays(k.K, k.feats.kps)
-            z = k.kdepth.astype(np.float64) * self._depth_factor(k)
+            # a keyframe the floor check did not judge lifts nothing (P30d): its matches are
+            # rays only, as a reference without depth
+            z = k.kdepth.astype(np.float64) * self._depth_factor(k) if k.lifts() \
+                else np.full(len(k.kdepth), np.nan)
             R, c = k.T[:3, :3], k.centre
             Xk = c + (ray * z[:, None]) @ R.T
             dk = unit(ray @ R.T)
@@ -2744,8 +2814,8 @@ class AnchoredMap:
         prior's grown by the drift estimate's uncertainty)."""
         assert f.prior is not None
         T0 = (pred or self._predict(f))[0]  # type: ignore[index]
-        if reason in FAILED_CHECKS:  # kept for a failed check: no detail (api.md §4)
-            detail = None
+        if reason in FAILED_CHECKS and detail != CONFLICT_DETAIL:
+            detail = None  # kept for a failed check: no detail but a conflict (api.md §4)
         gp, gr = _given_sigmas(f.prior)
         if f.prior["trust"] == "drifting":
             _, gp, gr = self.drift.predict(np.asarray(f.prior["T_map_cam"], np.float64), gp, gr)
@@ -2813,7 +2883,6 @@ class AnchoredMap:
                     spi = sp0 if T0 is not None else UNANCHORED_SIGMA_POS_M
                 img = (s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri,
                        sub, refs)
-        trust = None if f.prior is None else f.prior["trust"]
         if T0 is None:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
@@ -2843,26 +2912,23 @@ class AnchoredMap:
 
         if f.unconfirmed is not None:
             # its image failed a check: the prior holds it, and depth agreement alone never
-            # confirms it (api.md §4)
-            return self.kept_at(f, f.unconfirmed, 0, pred=pred)
+            # confirms it (api.md §4); an image pose conflicting with the prior shows in its
+            # detail and withholds all its content (P30c)
+            tested = None if img is None else self._image_conflict(f, img, cands, T0, sp0, sr0)
+            return self.kept_at(f, f.unconfirmed, 0, pred=pred,
+                                detail=CONFLICT_DETAIL if tested and tested[3] else None)
         if img is None:
             # no edge (map.md §2 match graph): the images give no pose
             return self.kept_at(f, reason, 0, detail="no_image_pose", pred=pred)
         s, n, _, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
-        if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
-                                                                       2.0 * sp0)):
+        tested = self._image_conflict(f, img, cands, T0, sp0, sr0)
+        if tested is None:
             return self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
-        dp, dr = pose_residual(s.T, T0)
-        # the image-only calibrated sigmas (api.md §4: σ_hypothesis); a rotation-only pose takes
-        # the standpoint's position sigma (its centre is the prior's: dp is 0)
-        ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
-        if rot_only:
-            ci = (spi, ci[1])
+        dp, dr, ci, conflict = tested
         share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
         measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
-        if sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only,
-                            tilt=sigmas.tilt_of(s.R, T0[:3, :3], _tilt_sigma(f.prior))):
+        if conflict:
             # beyond the combined bound (api.md §4, P16): the images confirm the conflict only
             # when its image-only pose meets the measurable-pair threshold, and no supported
             # hypothesis lies near the prior; else it is kept, its image-only pose (which may
@@ -2889,6 +2955,31 @@ class AnchoredMap:
         pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
         return pl
+
+    def _image_conflict(self, f: FrameIn, img: Any, cands: list[Keyframe], T0: Array,
+                        sp0: float, sr0: float
+                        ) -> tuple[float, float, tuple[float, float], bool] | None:
+        """A frame's image-only pose (``img``, ``place``'s) against its prior as placed
+        (``T0``, sigmas ``sp0``, ``sr0``; api.md §4 "Choosing a status"): None when the pose is
+        too loose to confirm it (``loose_image_pose``: rotation sigma above
+        ``CONFIRM_SIGMA_ROT_DEG``, or position sigma above max(``CONFIRM_SIGMA_POS_M``, 2 x the
+        prior's)); else its residual (m, deg), its calibrated image-only sigmas (σ_hypothesis;
+        a rotation-only pose takes the standpoint's position sigma: its centre is the prior's)
+        and whether it lies beyond the combined conflict bound."""
+        assert f.prior is not None
+        s, _, _, method, spi, sri, sub, refs = img
+        rot_only = method == "rotation"
+        if sri > CONFIRM_SIGMA_ROT_DEG or (not rot_only and spi > max(CONFIRM_SIGMA_POS_M,
+                                                                       2.0 * sp0)):
+            return None
+        dp, dr = pose_residual(s.T, T0)
+        ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
+                               f.prior["trust"])
+        if rot_only:
+            ci = (spi, ci[1])
+        conflict = sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only,
+                                    tilt=sigmas.tilt_of(s.R, T0[:3, :3], _tilt_sigma(f.prior)))
+        return dp, dr, ci, conflict
 
     def with_height(self, f: FrameIn, T: Array, cov: Array, sp: float, sr: float
                     ) -> tuple[Array, float, float, bool]:
@@ -2991,7 +3082,7 @@ class AnchoredMap:
             return s, None
         per = np.bincount(ref_of, minlength=len(cands))
         order = sorted((int(i) for i in np.flatnonzero(per >= MIN_INLIERS)
-                        if cands[int(i)].depth_kind == "sensor"),
+                        if cands[int(i)].depth_kind == "sensor" and cands[int(i)].lifts()),
                        key=lambda i: (-per[i], cands[i].id))
         refs = [(i, g) for i in order for g in [self._grid(cands[i])] if g is not None]
         T = s.T
@@ -3009,12 +3100,20 @@ class AnchoredMap:
                 return s, None
             # (only a pose the depth confirms asks whether another one would pass too)
             twin: list[Solve] = []
-            alt = self._ambiguous(f, T, own, corr, cands, i, ref, twin)
+            turned: list[Solve] = []
+            alt = self._ambiguous(f, T, own, corr, cands, i, ref, twin, turned)
             if alt is not None:
-                log.info("%s: against %s, candidate poses %.1f deg apart both pass the depth "
-                         "confirmation (a symmetric scene): that reference places it in "
-                         "neither", f.name, k.id, alt)
-                continue
+                # a symmetric scene (map.md §1, §2 step 2, P30): the prior, else the parallax
+                # when plausible, picks one; otherwise that reference places it in neither
+                got = self._separated(f, s, turned, own, i, ref, corr, cands, feats, prior,
+                                      rotated=True) if turned else None
+                if got is None:
+                    log.info("%s: against %s, candidate poses %.1f deg apart both pass the "
+                             "depth confirmation (a symmetric scene) and nothing separates "
+                             "them: that reference places it in neither", f.name, k.id, alt)
+                    continue
+                if got[1] is not None or not twin:
+                    return got
             if not twin:
                 return s, None
             got = self._twin(f, s, twin, own, i, ref, corr, cands, feats, prior)
@@ -3035,24 +3134,44 @@ class AnchoredMap:
         frame's correspondences, with them, when it stays that twin (within ``TWIN_MIN_M`` and
         ``SYMMETRIC_MIN_DEG``, ``MIN_INLIERS``, confirmed by the reference); None when nothing
         separates them (that reference places the frame in neither) or the twin does not hold."""
+        return self._separated(f, s, alts, own, j, ref, corr, cands, feats, prior)
+
+    def _separated(self, f: FrameIn, s: Solve, alts: list[Solve], own: NDArray[np.float32],
+                   j: int, ref: DepthRef, corr: _Corr, cands: list[Keyframe],
+                   feats: Features | None, prior: tuple[Array, float] | None,
+                   rotated: bool = False) -> tuple[Solve, _Sub | None] | None:
+        """``_twin``'s rule for the frame's pose ``s`` and the confirmed candidates ``alts``
+        against reference ``cands[j]``: translational twins (``twin_pick``), or, ``rotated``,
+        candidates ``SYMMETRIC_MIN_DEG`` or more from it (map.md §1 "Symmetric scenes", P30:
+        ``rotated_pick``, the parallax only when plausible). A prior sent for the frame decides
+        first, within ``K_SIGMA`` x its position sigma (``prior_pick``; ``prior_geometry`` for
+        rotated ones). The candidate picked over ``s`` is refined on all the frame's
+        correspondences and must stay that candidate."""
         k = cands[j]
         poses = [s, *alts]
         centres = [p.c for p in poses]
-        pick = None if prior is None else prior_pick(centres, *prior)
+        Rs = [p.R for p in poses]
+        what = "candidate poses" if rotated else "translational twins"
+        pick = None if prior is None else (prior_geometry(Rs, centres, *prior) if rotated
+                                           else prior_pick(centres, *prior))
         how = "the prior"
         if pick is None:
             how = "the parallax"
             measured, preds = self._twin_parallax(f, feats, k, own, poses)
-            pick = None if measured is None else twin_pick(measured, preds, centres)
-        far = ", ".join(f"{float(np.linalg.norm(p.c - s.c)):.2f} m" for p in alts)
+            pick = None if measured is None else (
+                rotated_pick(measured, preds, Rs, centres) if rotated
+                else twin_pick(measured, preds, centres))
+        far = ", ".join((f"{rot_deg(s.R.T @ p.R):.1f} deg " if rotated else "")
+                        + f"{float(np.linalg.norm(p.c - s.c)):.2f} m" for p in alts)
         if pick is None:
-            log.info("%s: against %s, translational twins (%s away) pass the depth "
-                     "confirmation and nothing separates them: that reference places it in "
-                     "neither", f.name, k.id, far)
+            if not rotated:
+                log.info("%s: against %s, translational twins (%s away) pass the depth "
+                         "confirmation and nothing separates them: that reference places it "
+                         "in neither", f.name, k.id, far)
             return None
-        log.info("%s: against %s, translational twins (%s away): %s picks %s", f.name, k.id,
-                 far, how, "its pose" if pick == 0 else
-                 f"the twin {float(np.linalg.norm(centres[pick] - s.c)):.2f} m away")
+        log.info("%s: against %s, %s (%s away): %s picks %s", f.name, k.id, what, far, how,
+                 "its pose" if pick == 0 else
+                 f"the {'candidate' if rotated else 'twin'} {far.split(', ')[pick - 1]} away")
         if pick == 0:
             return s, None
         t = poses[pick]
@@ -3061,8 +3180,8 @@ class AnchoredMap:
         if int(r.inliers.sum()) < MIN_INLIERS or float(np.linalg.norm(r.c - t.c)) >= TWIN_MIN_M \
                 or rot_deg(r.R.T @ t.R) >= SYMMETRIC_MIN_DEG \
                 or not depth_confirmed(DepthRef(r.T, own, f.K.K()), ref):
-            log.info("%s: the twin picked does not hold on its correspondences: no placement",
-                     f.name)
+            log.info("%s: the candidate picked does not hold on its correspondences: no "
+                     "placement", f.name)
             return None
         return r, sub
 
@@ -3089,7 +3208,8 @@ class AnchoredMap:
 
     def _ambiguous(self, f: FrameIn, T: Array, own: NDArray[np.float32], corr: _Corr,
                    cands: list[Keyframe], j: int, ref: DepthRef,
-                   twin: list[Solve] | None = None) -> float | None:
+                   twin: list[Solve] | None = None, turned: list[Solve] | None = None
+                   ) -> float | None:
         """Another candidate pose of a frame against reference ``cands[j]`` that passes the
         depth confirmation as its pose ``T`` does, at least ``SYMMETRIC_MIN_DEG`` from it (map.md
         §1 "Symmetric scenes", §2 step 2; the rule of ``standpoint.two_view`` on this engine's
@@ -3098,19 +3218,22 @@ class AnchoredMap:
         unexplained, up to ``EPIPOLAR_HYPOTHESES`` poses in all, each on at least
         ``MIN_INLIERS``. Returns the angle between the two (deg), or None. Those within
         ``SYMMETRIC_MIN_DEG`` but ``TWIN_MIN_M`` or more from ``T`` that pass it (translational
-        twins, P28) are added to ``twin`` when given."""
+        twins, P28) are added to ``twin`` when given; with ``turned`` given, every confirmed one
+        ``SYMMETRIC_MIN_DEG`` or more away is added to it (P30: the parallax may separate them)
+        and the search goes on, the angle returned being the first one's."""
         mine = (corr.kf == j) & np.isfinite(corr.X).all(axis=1)
         uv, X, d = corr.uv[mine], corr.X[mine], corr.d[mine]
         thr = 2.0 * self._thr(f.K)
         left = np.linalg.norm(_project(T[:3, :3], T[:3, 3], X, f.K, False) - uv, axis=1) > thr
         refs = self._refs([cands[j]])
+        first: float | None = None
         for _ in range(EPIPOLAR_HYPOTHESES - 1):
             if int(left.sum()) < MIN_INLIERS:
-                return None
+                return first
             idx = np.flatnonzero(left)
             got = pnp(X[idx], uv[idx], f.K, thr)
             if got is None or int(got[2].sum()) < MIN_INLIERS:
-                return None
+                return first
             inl = idx[got[2]]
             s, _ = refine_pose(got[0], got[1], uv[inl], X[inl], d[inl],
                                np.zeros(len(inl), np.intp), refs, f.K)
@@ -3119,11 +3242,15 @@ class AnchoredMap:
             if (deg >= SYMMETRIC_MIN_DEG or far) \
                     and depth_confirmed(DepthRef(s.T, own, f.K.K()), ref):
                 if deg >= SYMMETRIC_MIN_DEG:
-                    return deg
-                assert twin is not None
-                twin.append(s)
+                    if turned is None:
+                        return deg
+                    turned.append(s)
+                    first = deg if first is None else first
+                else:
+                    assert twin is not None
+                    twin.append(s)
             left[inl] = False
-        return None
+        return first
 
     def _register(self, f: FrameIn, s: Solve, n: int, method: str, spi: float, sri: float,
                   sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs, corr: _Corr,
@@ -3423,7 +3550,8 @@ class AnchoredMap:
                       pl.sigma_rot_deg, "provisional" if pl.status == "kept_at_prior" else "fused",
                       prior, kind, self.scale.k if kind == "mono" else 1.0,
                       float(np.median(valid)) if valid.size else None, pl.method or "prior",
-                      pl.inliers, reason=pl.reason if pl.status == "kept_at_prior" else None)
+                      pl.inliers, reason=pl.reason if pl.status == "kept_at_prior" else None,
+                      conflict=pl.status == "kept_at_prior" and pl.detail == CONFLICT_DETAIL)
         kf.feats = feats
         kf.kdepth = sample_depth(depth, K_grid, f.K, feats.kps) if len(feats.kps) \
             else np.zeros(0, np.float32)
@@ -3484,7 +3612,8 @@ class AnchoredMap:
         against the confirmed keyframes' depth near it (``agreement``: the median ratio of their
         depth to its own where they see it), when at least ``ALIGN_MIN_POINTS`` are seen and the
         ratio lies in ``ALIGN_RANGE``."""
-        refs = [r for k in self._candidates(f, T, None) for r in [self._grid(k)] if r is not None]
+        refs = [r for k in self._candidates(f, T, None) if k.lifts()
+                for r in [self._grid(k)] if r is not None]
         a = agreement(backproject(depth, K_grid.K()), T, refs, SENSOR_DEPTH_TOL)
         if a.agree + a.conflict < ALIGN_MIN_POINTS \
                 or not ALIGN_RANGE[0] <= a.median_ratio <= ALIGN_RANGE[1]:
@@ -4246,9 +4375,13 @@ class AnchoredMap:
         pred = self._predict(f)
         if pred is None:
             return Placement(f.name, "rejected", "too_close", inliers=pl.inliers, scene_m=scene)
+        # the check wins the reason only: its image pose's conflict with the prior shows in its
+        # detail (api.md §4, P30c)
+        detail = CONFLICT_DETAIL if pl.detail == CONFLICT_DETAIL or (
+            pl.status == "rejected" and pl.reason == "prior_conflict") else None
         if f.unconfirmed is not None:
-            return self.kept_at(f, f.unconfirmed, pl.inliers, pred=pred)
-        return self.kept_at(f, "too_close", pl.inliers, scene, pred=pred)
+            return self.kept_at(f, f.unconfirmed, pl.inliers, pred=pred, detail=detail)
+        return self.kept_at(f, "too_close", pl.inliers, scene, pred=pred, detail=detail)
 
     def overlaps(self, kept: Keyframe, other: Keyframe) -> bool:
         """Whether a new keyframe ``other`` makes a stored kept one eligible for re-registration

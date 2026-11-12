@@ -19,8 +19,11 @@ hypothesis (``depth_pose``), whose rotation is then the measured one: repetitive
 content (a square tile lattice) can make the largest consensus a false geometry. Every hypothesis
 that could make the pair measurable is evaluated, not only up to the first confirmed: when two
 confirmed ones have rotations at least ``SYMMETRIC_MIN_DEG`` apart, the scene itself is symmetric
-(depth cannot reject either), and the pair is ambiguous (``TwoView.ambiguous``): no measurable
-pair, and no placement by that reference alone (map.md §1 "Symmetric scenes", §2 step 2). Two
+(depth cannot reject either): the parallax picks one when the measured parallax is plausible for
+the pair (``anchored.rotated_pick``, P30), else the pair is ambiguous (``TwoView.ambiguous``): no
+measurable pair, and no placement by that reference alone (map.md §1 "Symmetric scenes", §2
+step 2). The measured parallax of a turn in place whose epipolar consensus took a repeating
+texture's aliases is its rotation-only consensus's (``turn_parallax``). Two
 that share the rotation but lie ``TWIN_MIN_M`` apart are translational twins, separated by their
 predicted two-view parallax against the pair's measured one (``anchored.twin_pick``), ambiguous
 only when it cannot separate them (map.md §1 "Translational twins", P28).
@@ -75,8 +78,10 @@ from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchored import (
     CANDIDATE_MAX_ANGLE_DEG,
     CANDIDATE_MAX_DIST_M,
+    DEPTH_CONFIRM_AGREEMENT,
     EPIPOLAR_HYPOTHESES,
     EPIPOLAR_MIN_MATCHES,
+    K_SIGMA,
     MEASURABLE_INLIERS,
     MEASURABLE_OVERLAP,
     MIN_AGREEING,
@@ -84,6 +89,8 @@ from oh_my_slam.mapping.anchored import (
     PARALLAX_SIN_MIN,
     REF_WIDTH,
     REPROJ_PX,
+    SENSOR_DEPTH_TOL,
+    SUPPORT_MIN,
     SYMMETRIC_MIN_DEG,
     TWIN_MIN_M,
     AnchoredMap,
@@ -96,14 +103,17 @@ from oh_my_slam.mapping.anchored import (
     Placement,
     cell_share,
     depth_check,
+    depth_counts,
     depth_image,
     epipolar_hypotheses,
     exp_so3,
     kabsch,
     natural_key,
+    parallax_plausible,
     pose,
     predicted_parallax,
     rot_deg,
+    rotated_pick,
     rotation_ransac,
     sample_depth,
     twin_pick,
@@ -139,6 +149,11 @@ PNP_MAX_STEP_DEG = 5.0
 # by more than this with the chain of stronger measured pairs is not measurable
 CYCLE_MAX_DEG = 10.0
 LOG_HYPOTHESES = EPIPOLAR_HYPOTHESES  # (L1) at most this many hypothesis lines per pair
+# ``turn_parallax``: a rotation-only consensus holding this share of the epipolar inliers (the
+# supported-hypothesis share) and one standpoint measures a turn in place whose epipolar
+# consensus took a repeating texture's aliases with it (empty room, walls repeating every 2 m:
+# 40-56 % of 750-990 inliers at 0.4-0.7 px, where the whole consensus read 365-591 px)
+TURN_MIN_SHARE = SUPPORT_MIN
 
 
 DepthImage = tuple[NDArray[np.float32], Intrinsics]  # metres on a grid, the grid's intrinsics
@@ -284,6 +299,24 @@ def refined_rotation(ra: Array, rb: Array, starts: list[tuple[Array, Array]], th
     return best[1]
 
 
+def turn_parallax(px: Array, rot: NDArray[np.bool_]) -> float:
+    """The two-view parallax (px) of a pair's epipolar inliers from their per-match values
+    ``px`` (rotation-only residual over the floored sine), ``rot`` marking the rotation-only
+    fit's own consensus: the median over all of them, unless the pair is a turn in place whose
+    epipolar consensus took aliases with it. A turn in place satisfies every essential matrix,
+    so on a repeating texture the largest epipolar consensus is fixed by the period-shifted
+    matches along the epipolar lines (a translational twin's) and its median measures them,
+    hundreds of pixels (README "Two-view parallax on repeating textures"). When the rotation-only
+    consensus holds at least ``CHECK_MIN_INLIERS`` matches and ``TURN_MIN_SHARE`` of the inliers
+    and is itself one standpoint (below ``PARALLAX_MAX_PX``), its median is the pair's."""
+    allp = float(np.median(px))
+    n = int(rot.sum())
+    if allp < PARALLAX_MAX_PX or n < CHECK_MIN_INLIERS or n < TURN_MIN_SHARE * len(px):
+        return allp
+    own = float(np.median(px[rot]))
+    return own if own < PARALLAX_MAX_PX else allp
+
+
 def _fit(a: View, b: View, e: Epipolar) -> TwoView | None:
     """The two-view fit of one epipolar hypothesis ``e`` (module docstring); None without a
     rotation-only fit."""
@@ -301,7 +334,8 @@ def _fit(a: View, b: View, e: Epipolar) -> TwoView | None:
     # epipole (a camera moving forward) it vanishes, so each residual is divided by that sine
     sin = np.sqrt(np.clip(1.0 - (da @ base) ** 2, 0.0, 1.0))
     focal = math.sqrt(a.K.fx * b.K.fx)  # the residual angle in pixels
-    parallax = float(np.median(ang * focal / np.maximum(sin, SIN_MIN)))
+    px = ang * focal / np.maximum(sin, SIN_MIN)
+    parallax = turn_parallax(px, ang <= 2.0 * thr)
     R_epi = np.asarray(R_e, np.float64).T
     # the relative rotation: the five-degree-of-freedom relative pose refined on the epipolar
     # inliers (``refined_rotation``). The rotation-only fit absorbs a small translation as
@@ -410,8 +444,10 @@ def two_view(a: View, b: View) -> TwoView | None:
     make the pair measurable (``CHECK_MIN_INLIERS``), not only up to the first confirmed. The
     first confirmed is the fit (its inliers, overlap and PnP rotation), unless
 
-    * another confirmed one lies ``SYMMETRIC_MIN_DEG`` or more from it: the pair is ambiguous
-      (``TwoView.ambiguous``, map.md §1 "Symmetric scenes");
+    * another confirmed one lies ``SYMMETRIC_MIN_DEG`` or more from it: the fit is the one
+      whose predicted parallax matches the measured one when that measurement is plausible
+      (``rotated_pick``, map.md §1 "Symmetric scenes", P30), else the pair is ambiguous
+      (``TwoView.ambiguous``);
     * confirmed ones share the rotation but lie ``TWIN_MIN_M`` or more apart (translational
       twins, map.md §1, P28): the fit is the one whose predicted two-view parallax
       (``predicted_parallax`` at the pair's matches) matches the pair's measured one
@@ -487,11 +523,25 @@ def _verdict(a: View, b: View, first: TwoView, confirmed: list[TwoView]) -> TwoV
                   if rot_deg(c.R_ab.T @ d.R_ab) >= SYMMETRIC_MIN_DEG), None)
     if apart is not None:
         c, d = apart
-        log.info("%s: ambiguous hyp %d %.1f deg / hyp %d %.1f deg (%.1f deg apart: a symmetric "
-                 "scene)", pair, c.hyp, rot_deg(c.R_ab), d.hyp, rot_deg(d.R_ab),
-                 rot_deg(c.R_ab.T @ d.R_ab))
-        first.confirmed, first.ambiguous = False, True
-        return first
+        assert first.measured_px is not None
+        preds = [h.predicted_px for h in confirmed]
+        # (each confirmed one has its depth pose's position)
+        cs = [np.zeros(3) if h.t_m is None else h.t_m for h in confirmed]
+        pick = rotated_pick(first.measured_px, preds, [h.R_ab for h in confirmed], cs)
+        about = " / ".join(f"hyp {h.hyp} {rot_deg(h.R_ab):.1f} deg predicts {_px(h.predicted_px)}"
+                           for h in confirmed)
+        if pick is None:
+            why = "the parallax cannot separate them" if parallax_plausible(
+                first.measured_px, preds) else "the measured parallax is implausible"
+            log.info("%s: ambiguous hyp %d %.1f deg / hyp %d %.1f deg (%.1f deg apart: a "
+                     "symmetric scene; %s; measured %.1f px: %s)", pair, c.hyp, rot_deg(c.R_ab),
+                     d.hyp, rot_deg(d.R_ab), rot_deg(c.R_ab.T @ d.R_ab), about,
+                     first.measured_px, why)
+            first.confirmed, first.ambiguous = False, True
+            return first
+        log.info("%s: rotated hypotheses (%s; measured %.1f px): the parallax picks hyp %d",
+                 pair, about, first.measured_px, confirmed[pick].hyp)
+        confirmed = [confirmed[pick]]
     centres = [c.t_m for c in confirmed if c.t_m is not None]  # (each confirmed one has it)
     if twins(centres):
         assert first.measured_px is not None
@@ -525,7 +575,9 @@ def ambiguous(a: View, b: View, pairs: Pairs | None = None) -> bool:
 def places(a: View, b: View, T_a_b: Array, pairs: Pairs | None = None) -> bool:
     """The registration gate's pair rules (map.md §2 step 2) for a candidate pose of frame ``a``
     that reference ``b``'s depth confirmed, ``T_a_b`` (b's camera in a's): False when the pair
-    is ambiguous (``ambiguous``), or when the pair's confirmed fit shares the candidate's
+    is ambiguous (``ambiguous``); a candidate ``SYMMETRIC_MIN_DEG`` or more from the pair's
+    confirmed fit only when the parallax picks it (``rotated_pick``, plausible: map.md §1
+    "Symmetric scenes", P30); False when the pair's confirmed fit shares the candidate's
     rotation (within ``SYMMETRIC_MIN_DEG``) at a position ``TWIN_MIN_M`` or more away and the
     parallax picks the fit, or cannot separate the two (map.md §1 "Translational twins",
     ``twin_pick``: measured at the pair's matches, predicted by a's depth). True otherwise
@@ -535,13 +587,26 @@ def places(a: View, b: View, T_a_b: Array, pairs: Pairs | None = None) -> bool:
         return True
     if tv.ambiguous:
         return False
-    if not tv.confirmed or tv.t_m is None or tv.ua is None or tv.measured_px is None \
-            or rot_deg(T_a_b[:3, :3].T @ tv.R_ab) >= SYMMETRIC_MIN_DEG \
-            or float(np.linalg.norm(T_a_b[:3, 3] - tv.t_m)) < TWIN_MIN_M:
+    if not tv.confirmed or tv.t_m is None or tv.ua is None or tv.measured_px is None:
+        return True
+    turned = rot_deg(T_a_b[:3, :3].T @ tv.R_ab) >= SYMMETRIC_MIN_DEG
+    if not turned and float(np.linalg.norm(T_a_b[:3, 3] - tv.t_m)) < TWIN_MIN_M:
         return True
     d = a.depth_image()
     pred = None if d is None else predicted_parallax(tv.ua, a.K, d[0], d[1], T_a_b,
                                                      math.sqrt(a.K.fx * b.K.fx))
+    if turned:
+        # two depth-confirmed poses of a symmetric scene (map.md §1, P30): the parallax picks
+        # one when the measurement is plausible for the pair, else the pair is ambiguous
+        pick = rotated_pick(tv.measured_px, [tv.predicted_px, pred], [tv.R_ab, T_a_b[:3, :3]],
+                            [tv.t_m, T_a_b[:3, 3]])
+        log.info("%s: against %s, the candidate pose and the pair's fit are %.1f deg apart "
+                 "(measured %.1f px, the fit predicts %s, the candidate %s): %s", a.name,
+                 b.name, rot_deg(T_a_b[:3, :3].T @ tv.R_ab), tv.measured_px,
+                 _px(tv.predicted_px), _px(pred),
+                 {1: "the candidate", 0: "the fit"}.get(pick if pick is not None else -1,
+                                                         "ambiguous"))
+        return pick == 1
     pick = twin_pick(tv.measured_px, [tv.predicted_px, pred], [tv.t_m, T_a_b[:3, 3]])
     log.info("%s: against %s, the candidate pose and the pair's fit are translational twins "
              "(%.2f m apart; measured %.1f px, the fit predicts %s, the candidate %s): %s",
@@ -1044,3 +1109,92 @@ def views_inconsistent(new: list[View], stored: list[View], pairs: Pairs | None 
     (through ``pairs``: its stored-to-stored seconds)."""
     near = [w for w in stored if any(close(v.R, v.c, w.R, w.c) for v in new)]
     return check([*near, *new], Pairs() if pairs is None else pairs)
+
+
+# -- the depth-consistency hard limit (map.md §4, P30) ------------------------------------------
+
+
+@dataclass
+class DepthPair:
+    """One pair the depth-consistency limit evaluated (``depth_consistency``): the frame names
+    in canonical order, each way's counts (a's depth points mapped into b, then b's into a) at
+    the committed relative pose, the contradiction margin (m) and whether the pair fails."""
+
+    a: str
+    b: str
+    ab: DepthCounts
+    ba: DepthCounts
+    margin_m: float
+
+    @staticmethod
+    def _ratio(c: DepthCounts) -> float | None:
+        return None if c.agree + c.through < MIN_AGREEING else c.ratio
+
+    @staticmethod
+    def _fails(c: DepthCounts) -> bool:
+        n = c.agree + c.through
+        return n >= MIN_AGREEING and c.agree < DEPTH_CONFIRM_AGREEMENT * n
+
+    @property
+    def fails(self) -> bool:
+        """Under the depth confirmation's minimum count and agreement threshold, in either
+        direction: at least ``MIN_AGREEING`` points agree or contradict, fewer than
+        ``DEPTH_CONFIRM_AGREEMENT`` of them agree."""
+        return self._fails(self.ab) or self._fails(self.ba)
+
+    def row(self) -> dict[str, Any]:
+        """Its ``quality.depth_pairs`` entry (map.md §4, oms/2.6)."""
+        r1, r2 = self._ratio(self.ab), self._ratio(self.ba)
+        return {"a": self.a, "b": self.b,
+                "agree_ratio_ab": None if r1 is None else round(r1, 4),
+                "agree_ratio_ba": None if r2 is None else round(r2, 4), "fails": self.fails}
+
+
+def depth_pairs(views: Sequence[tuple[Keyframe, DepthImage]], new: int) -> list[DepthPair]:
+    """The depth-consistency pairs (map.md §4 "Depth consistency"): each of the first ``new``
+    keyframes (the update's registered ones) with every later one of ``views`` (the update's
+    others, then the stored image-confirmed keyframes), each with its sensor depth image, where
+    the two can share a view under their committed poses (``close``). Each view's depth points
+    are mapped into the other under the committed relative pose (``depth_counts``), a point a
+    contradiction only beyond ``SENSOR_DEPTH_TOL`` x depth + ``K_SIGMA`` x the two frames'
+    combined committed position sigma. Each pair is logged (L6)."""
+    out = []
+    for i in range(new):
+        ka, da = views[i]
+        for kb, db in views[i + 1:]:
+            if not close(ka.T[:3, :3], ka.centre, kb.T[:3, :3], kb.centre):
+                continue
+            if natural_key(kb.name) < natural_key(ka.name):
+                (k1, d1), (k2, d2) = (kb, db), (ka, da)
+            else:
+                (k1, d1), (k2, d2) = (ka, da), (kb, db)
+            margin = K_SIGMA * math.hypot(k1.sigma_pos_m, k2.sigma_pos_m)
+            p = DepthRef(k1.T, d1[0], d1[1].K())
+            q = DepthRef(k2.T, d2[0], d2[1].K())
+            got = DepthPair(k1.name, k2.name, depth_counts(p, q, SENSOR_DEPTH_TOL, margin),
+                            depth_counts(q, p, SENSOR_DEPTH_TOL, margin), margin)
+            log.info("depth consistency %s-%s: a>b %s, b>a %s (margin %.2f m): %s", got.a, got.b,
+                     got.ab.text(), got.ba.text(), margin, "fails" if got.fails else "ok")
+            out.append(got)
+    return out
+
+
+def depth_consistency(am: AnchoredMap, placed: list[Placement]
+                      ) -> tuple[bool, list[dict[str, Any]]]:
+    """The hard limit ``depth_inconsistent`` (map.md §4, P30) of an update, with or without
+    priors: its registered (image-confirmed) frames ``placed`` (their keyframes) with each other
+    and with the stored image-confirmed keyframes, where both carry sensor depth images
+    (``depth_pairs``; a frame kept at its prior is never paired, a monocular one never tested),
+    and the pairs it evaluated as ``quality.depth_pairs``. It reads the committed poses and the
+    depth images only, never the pairs' image measurements."""
+    new = [k for pl in placed if pl.status == "registered" and pl.keyframe is not None
+           for k in [am.keyframe(pl.keyframe)] if k is not None and k.depth_kind == "sensor"]
+    if not new:
+        return False, []
+    new = sorted({k.id: k for k in new}.values(), key=lambda k: natural_key(k.name))
+    stored = [k for k in am.confirmed() if k.depth_kind == "sensor"
+              and all(k is not n for n in new)]
+    views = [(k, d) for k in [*new, *stored] for d in [am.sensor_depth(k)] if d is not None]
+    n = sum(1 for k, _ in views if any(k is m for m in new))
+    got = depth_pairs(views, n)
+    return any(p.fails for p in got), [p.row() for p in got]

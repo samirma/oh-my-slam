@@ -53,6 +53,25 @@ ROOT = "oms"  # under --data, beside what the earlier tools keep there
 # its prior is ``kept_at_prior``). Earlier records named such frames ``provisional``, before the
 # O3 two-phase state existed: they are read as ``kept_at_prior`` (``version``)
 POSE_STATES = "oms/2.2"
+# a version frame row's key: a frame kept at a prior its images contradict (``detail``
+# ``conflict_unsupported``, whatever its reason) makes no camera stand and no near blind disc
+# (map.md §6 "Unconfirmed frames", P30b/P30c; ``derived``) until a later job confirms it
+NO_STAND = "no_stand"
+
+
+def no_stand(conflict: bool) -> dict[str, bool]:
+    """A version frame row's ``NO_STAND`` entry: present only on such a frame."""
+    return {NO_STAND: True} if conflict else {}
+
+
+# a version frame row's key: a keyframe the floor check did not judge (``floor_not_judged``),
+# whose depth lifts no later frame, in registration or in locate (api.md §6, P30d; ``derived``)
+DEPTH_UNUSED = "depth_unused"
+
+
+def depth_unused(unjudged: bool) -> dict[str, bool]:
+    """A version frame row's ``DEPTH_UNUSED`` entry: present only on such a frame."""
+    return {DEPTH_UNUSED: True} if unjudged else {}
 
 
 def utc(t: float) -> str:

@@ -224,11 +224,11 @@ def test_the_older_mapper_s_too_close_kept_frame_gives_its_depth(tmp_path: Path)
     from oh_my_slam.service.update import KEPT_DEPTH, kept_depth
 
     z = np.full((24, 32), 0.15, np.float32)
-    near = SimpleNamespace(unconfirmed="too_close", depth_m=z,
+    near = SimpleNamespace(unconfirmed="too_close", depth_m=z, detail=None,
                            work=SimpleNamespace(trust="metric", name="near"))
-    far = SimpleNamespace(unconfirmed="too_close", depth_m=None,
+    far = SimpleNamespace(unconfirmed="too_close", depth_m=None, detail=None,
                           work=SimpleNamespace(trust="metric", name="far"))
-    drift = SimpleNamespace(unconfirmed="too_close", depth_m=z,
+    drift = SimpleNamespace(unconfirmed="too_close", depth_m=z, detail=None,
                             work=SimpleNamespace(trust="drifting", name="d"))
     got = kept_depth([near, far, drift])  # type: ignore[list-item]
     assert list(got) == ["near"]

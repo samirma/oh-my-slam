@@ -92,7 +92,7 @@ from oh_my_slam.service.cameras import (
 )
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.jobs import Job
-from oh_my_slam.service.store import POSE_STATES, Store, clone_tree
+from oh_my_slam.service.store import POSE_STATES, Store, clone_tree, depth_unused, no_stand
 from oh_my_slam.service.timings import FUSION_STAGES, Timings
 
 log = get_logger("oh_my_slam.service.update")
@@ -350,7 +350,8 @@ def _too_close_content(fr: _Frame) -> bool:
     """The too-close exception on the older mapper (api.md §4, every engine): a frame kept at
     its prior only because it is too close, with a metric prior and a depth image, gives its
     in-range depth at its prior pose (``KEPT_DEPTH``)."""
-    return fr.unconfirmed == "too_close" and fr.work.trust == "metric" and _has_depth(fr)
+    return fr.unconfirmed == "too_close" and fr.work.trust == "metric" and _has_depth(fr) \
+        and fr.detail != "conflict_unsupported"  # no exception at a contradicted prior (P30c)
 
 
 def kept_depth(frames: list[_Frame]) -> dict[str, Any]:
@@ -949,43 +950,30 @@ class Updater:
             med = None if d is None else checks.median_depth(d)
             if med is not None:
                 fr.scene_m = med * anchored.sim.s
+            conflict = self._conflicts(fr, anchored, med)
             if fr.scene_m is not None and fr.scene_m < checks.TOO_CLOSE_M \
                     and _inliers(fr.internal) < TOO_CLOSE_INLIERS:
                 if fr.work.trust in ("metric", "drifting"):  # kept at its prior (api.md §4)
                     fr.unconfirmed, fr.internal = "too_close", None
+                    # the check wins the reason only: an image pose conflicting with the prior
+                    # withholds all its content (api.md §4, P30c)
+                    fr.detail = "conflict_unsupported" if conflict else None
                 else:
                     fr.reason = "too_close"
                 out.append(fr)
                 continue
-            if fr.prior_residual is not None and fr.work.prior is not None:
-                # beyond the combined bound 3 x sqrt(sigma_prior^2 + sigma_image^2) (api.md §4:
-                # the prior's sigmas floored as the anchors' noise; the image pose's calibrated
-                # proxy before the anchoring), and the mapper's one hypothesis is the only one:
-                # none lies near the prior
-                sp, sr = _prior_sigmas(fr.work.prior)
-                if fr.work.trust == "drifting" and anchored.drift_sim is not None:
-                    # a drifting prior's sigma is the drift-grown one (api.md §4)
-                    sp, sr = drift_grown(sp, sr, _mat(fr.work.prior["T_map_cam"]),
-                                         anchored.drift_sigma, anchored.drift_support)
-                hyp = pose_sigmas(fr.internal, None if med is None else med * anchored.sim.s,
-                                  0.0, _has_depth(fr), fr.work.trust)
-                dp, dr = fr.prior_residual
-                st = _tilt(fr.work.prior)
-                tilt = None if st is None or fr.prior_tilt is None else (*fr.prior_tilt, st)
-                if sigmas.conflicts(dp, dr, (max(sp, anchor.MIN_SIGMA_POS_M),
-                                             max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp,
-                                    tilt=tilt):
-                    # the images confirm the conflict only when its pose meets the
-                    # measurable-pair threshold (api.md §4, P16; on this engine its mapper
-                    # inliers, as its drift support); else it is kept at its prior,
-                    # ``conflict_unsupported``, and the mapper runs again without it
-                    if _inliers(fr.internal) >= MEASURABLE_INLIERS:
-                        fr.reason = "prior_conflict"
-                    else:
-                        fr.unconfirmed, fr.detail = "no_overlap", "conflict_unsupported"
-                        fr.internal = None
-                    out.append(fr)
-                    continue
+            if conflict:
+                # the images confirm the conflict only when its pose meets the measurable-pair
+                # threshold (api.md §4, P16; on this engine its mapper inliers, as its drift
+                # support); else it is kept at its prior, ``conflict_unsupported``, and the
+                # mapper runs again without it
+                if _inliers(fr.internal) >= MEASURABLE_INLIERS:
+                    fr.reason = "prior_conflict"
+                else:
+                    fr.unconfirmed, fr.detail = "no_overlap", "conflict_unsupported"
+                    fr.internal = None
+                out.append(fr)
+                continue
             dup = self._duplicate_of(fr, prev, earlier, internal)
             if dup is not None:
                 fr.reason, fr.duplicate_of = "duplicate", dup
@@ -993,6 +981,29 @@ class Updater:
                 continue
             earlier.append(fr)
         return out
+
+    @staticmethod
+    def _conflicts(fr: _Frame, anchored: _Anchored, med: float | None) -> bool:
+        """Whether a registered frame's image pose lies beyond the combined bound 3 x
+        sqrt(sigma_prior^2 + sigma_image^2) of its prior (api.md §4: the prior's sigmas floored
+        as the anchors' noise; the image pose's calibrated proxy before the anchoring; the
+        mapper's one hypothesis is the only one: none lies near the prior). False without a
+        prior or an image pose."""
+        if fr.prior_residual is None or fr.work.prior is None:
+            return False
+        assert fr.internal is not None
+        sp, sr = _prior_sigmas(fr.work.prior)
+        if fr.work.trust == "drifting" and anchored.drift_sim is not None:
+            # a drifting prior's sigma is the drift-grown one (api.md §4)
+            sp, sr = drift_grown(sp, sr, _mat(fr.work.prior["T_map_cam"]),
+                                 anchored.drift_sigma, anchored.drift_support)
+        hyp = pose_sigmas(fr.internal, None if med is None else med * anchored.sim.s,
+                          0.0, _has_depth(fr), fr.work.trust)
+        dp, dr = fr.prior_residual
+        st = _tilt(fr.work.prior)
+        tilt = None if st is None or fr.prior_tilt is None else (*fr.prior_tilt, st)
+        return sigmas.conflicts(dp, dr, (max(sp, anchor.MIN_SIGMA_POS_M),
+                                         max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp, tilt=tilt)
 
     @staticmethod
     def _duplicate_of(fr: _Frame, prev: dict[str, Any] | None, earlier: list[_Frame],
@@ -1202,6 +1213,7 @@ class Updater:
                 # the too-close exception (api.md §4): its in-range depth feeds occupancy and
                 # heights at its prior (``derived``)
                 "content": _too_close_content(fr),
+                **no_stand(fr.detail == "conflict_unsupported"),
                 "prior": p if p is not None and p["trust"] == "metric" else None}
 
     def _kept_only(self, job: Job, kept: list[_Frame], prev: dict[str, Any],
@@ -1269,6 +1281,8 @@ class Updater:
                         # the too-close exception (api.md §4): a kept frame's in-range depth
                         # feeds occupancy and heights at its prior (``derived``)
                         "content": fr.internal is None and _too_close_content(fr),
+                        # no free-by-rule cells at a contradicted prior (map.md §6, P30b)
+                        **no_stand(fr.internal is None and fr.detail == "conflict_unsupported"),
                         **({} if raw is None else {"anchor_sigmas": raw}),
                         # its camera height sigma (locate's height_sigma, api.md §6)
                         "height_sigma_m": fr.work.height_sigma_m if fr.work.height_m is not None
@@ -1310,6 +1324,8 @@ class Updater:
                 rows[fr.work.name]["floor_inconsistent"] = True
             if fr.floor_unjudged:  # no content, and not listed (P29b)
                 rows[fr.work.name]["floor_inconsistent"] = True
+                # its depth lifts no located frame (api.md §6, P30d)
+                rows[fr.work.name].update(depth_unused(True))
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "origin_height_m": anchored.origin_height_m,
                 # the drift estimate across versions (``_drifting_residuals``)
@@ -1366,6 +1382,8 @@ class Updater:
             "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
             "floor_inconsistent": [fr.work.name for fr in registered if fr.floor_off],
             "rotation_pairs": list(rotation_pairs or []),
+            # the depth-consistency limit is not the older mapper's (map.md §4, P30)
+            "depth_pairs": [],
             "drift_correction": mapper_drift_correction(frames, drift_sim),
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),

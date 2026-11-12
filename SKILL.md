@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.5) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; health and timings."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.6) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; health and timings."
 ---
 
 # oh-my-slam API
@@ -8,7 +8,7 @@ description: "Short reference of the oh-my-slam HTTP API (schema oms/2.5) for th
 Generated from the API definitions (`python -m oh_my_slam.service.skill`); never edit it by hand. The full contract is `GET /api/openapi.json` (OpenAPI 3.1, its schemas those of `specs/api.schema.json`) and `specs/api.md`.
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
-* Every JSON body carries `schema` (`oms/2.5`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
+* Every JSON body carries `schema` (`oms/2.6`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
 * Implemented groups (`GET /api/health` → `capabilities`): O1, O2, O3-jobs, O4, O5, O6, O8, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 

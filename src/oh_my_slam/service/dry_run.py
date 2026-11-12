@@ -173,6 +173,9 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         rotations_bad, rotation_pairs = standpoint.rotation_check(
             am, list(placed.values()), pairs) if am is not None and pairs is not None \
             and not any(fr.work.trust in ("metric", "drifting") for fr in frames) else (False, [])
+        # every update with sensor depth (map.md §4 depth_inconsistent, P30), as the job
+        depths_bad, depth_rows = standpoint.depth_consistency(am, list(placed.values())) \
+            if am is not None else (False, [])
         again = [] if am is None else reregistered(am.reregistered)
         # the estimate the job would place its drifting priors with (map.md §4, oms/2.5)
         drift = job_drift_correction(am, frames) if engine else _mapper_drift(up, frames, prev)
@@ -195,6 +198,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "height_inconsistent": heights,
         "floor_inconsistent": floors,
         "rotation_pairs": rotation_pairs,
+        "depth_pairs": depth_rows,
         "drift_correction": drift,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
@@ -218,7 +222,8 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     return {"map": w.map,
             "base_version": None if prev is None else prev["version"], "frames": out,
             "quality": gate(q, bool(kept), w.accept_if, prev is None and bool(trusted) and all(
-                r["predicted_status"] == "rejected" for r in trusted), rotations_bad),
+                r["predicted_status"] == "rejected" for r in trusted), rotations_bad,
+                depths_bad),
             "scale_source": source, "scale_sigma_rel": round(sigma, 5),
             "predicted_s": {"registration": round(reg, 3), "fusion": round(fus, 3)},
             # the vocabulary detection would use (map.md §5): the defaults and the map's with

@@ -102,7 +102,7 @@ def test_the_registration_gate_takes_no_ambiguous_reference(
     bad: set[str] = set()
 
     def amb(self: Any, f: Any, T: Any, own: Any, corr: Any, cands: Any, j: int,
-            ref: Any, twin: Any = None) -> float | None:
+            ref: Any, twin: Any = None, turned: Any = None) -> float | None:
         asked.append(cands[j].name)
         return 90.0 if cands[j].name in bad else None
 
@@ -238,11 +238,14 @@ def test_the_service_answers_mapanythings_gate(
     gate = got[0]
     run = gate.__self__
     f2 = next(n for n in run.reg.new if n.index == 2)
-    assert gate(f2, "new3", np.eye(4)) is False
+    # the candidates at the true relative poses (since P30 a candidate 10 deg or more from the
+    # pair's confirmed fit is placed only when the parallax picks it)
+    rel3, rel0 = (np.linalg.inv(poses[2]) @ poses[j] for j in (3, 0))
+    assert gate(f2, "new3", rel3) is False
     stored = run.am.keyframes[0].id
-    assert gate(f2, stored, np.eye(4)) is False and gate(f2, "nope", np.eye(4)) is False
+    assert gate(f2, stored, rel0) is False and gate(f2, "nope", rel0) is False
     run.feats.pop(2)
-    assert gate(f2, stored, np.eye(4)) is False
+    assert gate(f2, stored, rel0) is False
 
 
 def test_the_depth_agreement_counts_only_what_it_could_see() -> None:
@@ -408,7 +411,7 @@ def test_label_scores_list_the_label_then_the_votes() -> None:
     assert with_label_scores(got, ["Red Mug"]) == got  # idempotent
     item = schema.defs()["MapObject"]["properties"]["label_scores"]
     assert item["maxItems"] == 3
-    assert schema.SCHEMA_VERSION == "oms/2.5"  # additive since (oms/2.5 P29)
+    assert schema.SCHEMA_VERSION == "oms/2.6"  # additive since (oms/2.6 P30)
 
 
 def test_an_objects_read_carries_label_scores_with_client_labels(

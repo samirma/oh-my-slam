@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.5. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.6. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -357,7 +357,7 @@
         "duplicate",
         "unusable_image"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change (when its image-only pose meets the measurable-pair threshold; otherwise kept_at_prior, conflict_unsupported). In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap, both with the same confirmed or registered reference); a frame failing a looseness test is kept_at_prior with loose_image_pose, whatever else it fails; otherwise it is kept_at_prior with detail conflict_unsupported."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior; the check wins the reason only: such a conflict (evaluated only when an image-only pose exists) is shown by detail conflict_unsupported and the frame contributes nothing. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change (when its image-only pose meets the measurable-pair threshold; otherwise kept_at_prior, conflict_unsupported). In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap, both with the same confirmed or registered reference); a frame failing a looseness test is kept_at_prior with loose_image_pose, whatever else it fails; otherwise it is kept_at_prior with detail conflict_unsupported."
     },
     "InputStatus": {
       "type": "object",
@@ -384,7 +384,7 @@
             "kept_at_prior",
             "rejected"
           ],
-          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas drift-grown: root sum of squares of the prior's (or 0.20 m / 5 deg) and the drift estimate's own sigma at that pose, which grows away from the supporting frames; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), except a frame kept only for too_close with a metric prior, whose detections and in-range depth contribute at the prior pose (never scale evidence), and locate never uses it as a reference."
+          "description": "provisional: registered, not yet fused (O3 two-phase). kept_at_prior: a frame with a prior its images did not confirm (or whose image failed a check: reason the first of plain, blur, few_features, too_close); with a metric prior its pose and sigmas are the prior's; with a drifting prior its pose is the prior mapped through the current drift estimate, its sigmas drift-grown: root sum of squares of the prior's (or 0.20 m / 5 deg) and the drift estimate's own sigma at that pose, which grows away from the supporting frames; prior residuals 0; it counts only for free-by-rule grid cells until registered (no occupancy, heights, cloud or objects), except a frame kept only for too_close with a metric prior, whose detections and in-range depth contribute at the prior pose (never scale evidence), and except a frame kept with detail conflict_unsupported (its images contradict the prior, whatever its reason; the prior is what is in doubt), which counts for nothing, free-by-rule cells included, until a later job's images confirm it (the too_close exception then does not apply to it); locate never uses it as a reference."
         },
         "reason": {
           "oneOf": [
@@ -473,7 +473,7 @@
               "type": "null"
             }
           ],
-          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference). oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k, has no depth_scale and is not rejected, but its content is excluded (no cloud points, no grid evidence, no objects; it still counts for free-by-rule cells), so the client can retake the view. The first three values occur only with kept_at_prior; floor_not_judged never does."
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check whose images show no conflict with its prior. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference), or, on a frame kept for a failed check (reason plain, blur, few_features or too_close), whose image-only pose conflicts with its prior beyond the bound (a conflict is evaluated only when an image-only pose exists); the frame contributes nothing to the map whatever its reason (no detections, no depth, no free-by-rule grid cells), because the prior is exactly what is in doubt, until a later job's images confirm it; the too_close/metric content exception does not apply to it. oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k, has no depth_scale and is not rejected, but its content is excluded (no cloud points, no grid evidence, no objects, and its depth gives no scale evidence; its sent camera height constrains only its own camera pose and is never combined with its own depth or floor plane into a scale estimate, camera-height evidence or k; its pose is trusted and still counts for free-by-rule cells), so the client can retake the view. The first three values occur only with kept_at_prior; floor_not_judged never does."
         }
       },
       "allOf": [
@@ -671,7 +671,10 @@
           "then": {
             "properties": {
               "detail": {
-                "type": "null"
+                "enum": [
+                  "conflict_unsupported",
+                  null
+                ]
               }
             }
           }
@@ -768,6 +771,7 @@
         "height_inconsistent",
         "floor_inconsistent",
         "rotation_pairs",
+        "depth_pairs",
         "drift_correction"
       ],
       "properties": {
@@ -866,10 +870,11 @@
               "max_rejected_share",
               "hard_limit",
               "prior_frames_rejected",
-              "rotation_inconsistent"
+              "rotation_inconsistent",
+              "depth_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. depth_inconsistent (oms/2.6; every update whose frames carry sensor depth images, with or without priors; every engine but the older mapper; jobs and dry runs): two committed views contradict each other's depth images, mapped under their committed relative pose. The pairs are the update's registered frames with each other and with the stored image-confirmed keyframes, where both carry sensor depth images and can share a view; a frame kept at its prior without image confirmation is not paired, and a monocular frame is not tested. A point is a contradiction only when the other view would see through it by more than the depth tolerance plus 3 x the two frames' combined committed position sigma; a pair fails when, in either direction, at least the depth confirmation's minimum count of points agree or contradict and fewer than its agreement threshold of them agree. It uses the committed poses and depth images only. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -972,6 +977,52 @@
             }
           },
           "description": "Every measurable pair the rotation check evaluated (jobs and dry runs); empty unless it ran on at least one measurable pair. Shows which pairs drove rotation_inconsistent."
+        },
+        "depth_pairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "a",
+              "b",
+              "agree_ratio_ab",
+              "agree_ratio_ba",
+              "fails"
+            ],
+            "properties": {
+              "a": {
+                "type": "string",
+                "description": "Frame name, first in canonical order."
+              },
+              "b": {
+                "type": "string",
+                "description": "Frame name, second in canonical order."
+              },
+              "agree_ratio_ab": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "agree / (agree + see-through) for a's depth points mapped into b under the committed relative pose; null when fewer than the depth confirmation's minimum count of points agreed or contradicted in that direction."
+              },
+              "agree_ratio_ba": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "The same for b's depth points mapped into a."
+              },
+              "fails": {
+                "type": "boolean",
+                "description": "Whether the pair failed the depth-consistency limit: in some direction, at least the minimum count of points agreed or contradicted and fewer than the agreement threshold of them agreed."
+              }
+            }
+          },
+          "description": "oms/2.6. Every pair the depth-consistency limit evaluated (map.md section 4), jobs and dry runs; empty when it evaluated no pair (no sensor depth, or the older mapper). On a depth_inconsistent rejection it shows which frames contradict each other, so a client can drop or retake them."
         }
       }
     },
@@ -1519,7 +1570,7 @@
             "fused",
             "kept_at_prior"
           ],
-          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells (except a frame kept only for too_close with a metric prior: its detections and in-range depth contribute) until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
+          "description": "provisional: registered, not yet fused. kept_at_prior: the prior, unconfirmed by the images; counts only for free-by-rule grid cells (except a frame kept only for too_close with a metric prior and no detail conflict_unsupported: its detections and in-range depth contribute; and a frame kept with detail conflict_unsupported, whatever its reason, which counts for nothing, free-by-rule cells included) until a later job's images confirm it, when it becomes a registered pose in that version; never a locate reference."
         },
         "added_version": {
           "type": "integer"
@@ -2141,7 +2192,7 @@
             },
             "floor_observed": {
               "$ref": "#/$defs/Binary",
-              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc); 0 not observed."
+              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc; none from a frame kept_at_prior with detail conflict_unsupported, whatever its reason); 0 not observed."
             }
           }
         },

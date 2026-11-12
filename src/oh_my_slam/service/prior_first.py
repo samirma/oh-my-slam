@@ -57,7 +57,14 @@ from oh_my_slam.mapping.quality import (
     too_close,
 )
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
-from oh_my_slam.service.store import POSE_STATES, clone_tree
+from oh_my_slam.service.store import (
+    DEPTH_UNUSED,
+    NO_STAND,
+    POSE_STATES,
+    clone_tree,
+    depth_unused,
+    no_stand,
+)
 from oh_my_slam.service.timings import fusion_class
 
 if TYPE_CHECKING:
@@ -137,9 +144,8 @@ class _MaRun:
         t = time.perf_counter()
         am = self.am
         am.save()  # this update's keyframes get their image and depth on disk: anchors
-        stored = [register_ma.Stored(k.id, img, k.K, k.T, i, functools.partial(am.depth_of,
-                                                                                 k.id),
-                                     k.depth_kind == "sensor")
+        stored = [register_ma.Stored(k.id, img, k.K, k.T, i, _anchor_depth(am, k),
+                                     k.depth_kind == "sensor" and k.lifts())
                   for i, k in enumerate(am.keyframes)
                   if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
         if not stored:  # nothing confirmed to register against (a camera-only map, no origin)
@@ -202,8 +208,8 @@ class _MaRun:
         am = self.am
         am.save()  # their image and depth on disk: anchors
         self.reg.add_anchors([register_ma.Stored(k.id, img, k.K, k.T, ANCHOR_ORDER + i,
-                                                 functools.partial(am.depth_of, k.id),
-                                                 k.depth_kind == "sensor")
+                                                 _anchor_depth(am, k),
+                                                 k.depth_kind == "sensor" and k.lifts())
                               for i, k in enumerate(extra)
                               for img in [am.image_path(k.id)] if img is not None])
         got = set(self.reg.recheck())
@@ -386,6 +392,21 @@ def _depth_kind(am: AnchoredMap | None, pl: Placement) -> str:
     return "none" if k is None else k.depth_kind
 
 
+def _anchor_depth(am: AnchoredMap, k: Keyframe) -> Callable[[], Any]:
+    """A stored keyframe's depth as MapAnything's anchor (``register_ma.Stored``): none for one
+    the floor check did not judge, whose depth lifts no later frame (P30d)."""
+    if not k.lifts():
+        return lambda: None
+    return functools.partial(am.depth_of, k.id)
+
+
+def _unjudged(am: AnchoredMap | None, pl: Placement) -> dict[str, bool]:
+    """A version row's ``DEPTH_UNUSED`` entry (``store.depth_unused``): a keyframe the floor
+    check did not judge, whose depth gives locate no keypoint points (api.md §6, P30d)."""
+    k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
+    return depth_unused(k is not None and not k.lifts())
+
+
 def _contributes(am: AnchoredMap | None, pl: Placement) -> bool:
     """Whether a placed frame's keyframe carries content (``Keyframe.contributes``)."""
     k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
@@ -429,9 +450,10 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
         return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
                          fr.scene_m, fr.duplicate_of)
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
-    k = None if am is None or pl.keyframe is None or pl.status != "registered" \
-        else am.keyframe(pl.keyframe)
-    # a registered monocular frame the floor check did not judge (map.md §2, oms/2.5)
+    k = None if am is None or pl.keyframe is None \
+        or pl.status not in ("registered", "provisional") else am.keyframe(pl.keyframe)
+    # a registered or provisional monocular frame the floor check did not judge (map.md §2,
+    # api.md §4 ``detail``, oms/2.5)
     detail = "floor_not_judged" if k is not None and k.floor_unjudged else pl.detail
     return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
                      pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, detail,
@@ -518,6 +540,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     pairs = standpoint.Pairs()  # the two-view fits of this update (standpoints, the hard limit)
     rotations_bad = False
     rotation_pairs: list[dict[str, Any]] = []  # the rotation check's pairs (map.md §4)
+    depths_bad = False
+    depth_rows: list[dict[str, Any]] = []  # the depth-consistency limit's pairs (oms/2.6)
     # the map's label vocabulary with this update's labels (map.md §5): every detection of the
     # job prompts with it and the defaults
     from oh_my_slam.service.update import map_labels
@@ -664,6 +688,12 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 rotations_bad, rotation_pairs = standpoint.rotation_check(
                     am, list(placements.values()), pairs)
                 reg_s += time.perf_counter() - t
+            # every update with sensor depth, with or without priors: the committed views
+            # against each other's depth images (map.md §4 depth_inconsistent, P30)
+            t = time.perf_counter()
+            depths_bad, depth_rows = standpoint.depth_consistency(am, list(placements.values()))
+            tm["depth_consistency"] = round(time.perf_counter() - t, 3)
+            reg_s += tm["depth_consistency"]
             t = time.perf_counter()
             version = (prev["version"] + 1) if prev else 1
             again = []  # the re-registered keyframes' objects: their stored image's detections
@@ -712,7 +742,10 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         if k is not None and k.id in again_ids:
             # confirmed by this job's images (map.md §2): registered now; the movement of its
             # confirmation is in ``reregistered`` only, not in the gauge shift or the residuals
-            rows.append({**r, "T_map_cam": k.T.tolist(), "sigma_pos_m": k.sigma_pos_m,
+            # (it counts normally from now on, free-by-rule cells included: map.md §2, P30b)
+            rows.append({**{x: v for x, v in r.items() if x not in (NO_STAND, DEPTH_UNUSED)},
+                         **depth_unused(not k.lifts()),
+                         "T_map_cam": k.T.tolist(), "sigma_pos_m": k.sigma_pos_m,
                          "sigma_rot_deg": k.sigma_rot_deg, "pose_state": "fused",
                          "inliers": k.inliers, "method": k.method,
                          # its gate and floor check at its confirmed pose (map.md §2)
@@ -740,7 +773,13 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                      # the floor check (map.md §2, oms/2.4): likewise
                      "floor_inconsistent": _floor_off(am, pl),
                      # its camera height sigma (locate's height_sigma, api.md §6)
-                     "height_sigma_m": _height_sigma(am, pl)})
+                     "height_sigma_m": _height_sigma(am, pl),
+                     # kept at a prior its image pose contradicts: not even free-by-rule cells
+                     # (map.md §2, §6, P30b/P30c)
+                     **no_stand(pl.status == "kept_at_prior"
+                                and pl.detail == "conflict_unsupported"),
+                     # not judged by the floor check: its depth lifts no locate (P30d)
+                     **_unjudged(am, pl)})
     prior_res = [pose_residual(np.asarray(r["T_map_cam"]), np.asarray(r["prior"]["T_map_cam"]))
                  for r in rows if r.get("prior")]
     source, sigma = am.scale_summary() if am is not None else ("monocular", 0.1)
@@ -769,6 +808,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "height_inconsistent": [] if am is None else list(am.height_inconsistent),
         "floor_inconsistent": [] if am is None else list(am.floor_inconsistent),
         "rotation_pairs": rotation_pairs,
+        "depth_pairs": depth_rows,
         "drift_correction": job_drift_correction(
             am if am is not None or prev is None or not up.store.mapper_dir(w.map).exists()
             else AnchoredMap.load(up.store.mapper_dir(w.map)), frames),
@@ -781,7 +821,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     }
     status = {i: pl.status for i, pl in placements.items()}
     job.quality = gate(q, bool(kept), w.accept_if,
-                       prev is None and prior_frames_rejected(frames, status), rotations_bad)
+                       prev is None and prior_frames_rejected(frames, status), rotations_bad,
+                       depths_bad)
     if am is not None:
         job.scale_source, job.scale_sigma_rel = source, round(sigma, 5)
     if not job.quality["accepted"]:

@@ -707,7 +707,9 @@ def test_a_stored_keyframe_that_moves_fails_the_gate(client: Client,
     assert q["gauge_shift"]["translation_m"] == pytest.approx(0.9, abs=1e-6)
     assert q["previous_residuals"]["count"] == 1
     assert q["previous_residuals"]["max_m"] == pytest.approx(0.9, abs=1e-6)
-    assert sorted(q["failed_checks"]) == ["max_gauge_shift_m", "max_residual_m"]
+    # (the moved stored keyframe also contradicts the new frames' depth images: oms/2.6 P30)
+    assert sorted(q["failed_checks"]) == ["depth_inconsistent", "max_gauge_shift_m",
+                                          "max_residual_m"]
     assert client.service.store.latest("m") == 1
 
 
@@ -927,7 +929,9 @@ def test_a_dry_run_predicts_rotation_inconsistent(client: Client,
 
     monkeypatch.setattr(AnchoredMap, "place", turned)
     q = dry(client, "m", fr, files)["quality"]
-    assert q["failed_checks"] == ["rotation_inconsistent"]
+    # the turned frames' views also contradict the stored one's depth (oms/2.6 P30)
+    assert q["failed_checks"] == ["rotation_inconsistent", "depth_inconsistent"]
+    assert any(r["fails"] for r in q["depth_pairs"])
     # map.md §4 (P14): the pairs that drove it, names in canonical order
     assert q["rotation_pairs"] and max(p["difference_deg"] for p in q["rotation_pairs"]) > 10
     assert all(p["a"] <= p["b"] for p in q["rotation_pairs"])

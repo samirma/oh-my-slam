@@ -303,7 +303,7 @@ def test_mapanythings_gate_takes_the_twin_the_parallax_picks() -> None:
     assert not sp.places(a, b, far, pairs)  # the parallax picks the pair's fit
     turned = far.copy()
     turned[:3, :3] = an.exp_so3(np.array([0.0, np.radians(90.0), 0.0])) @ true[:3, :3]
-    assert sp.places(a, b, turned, pairs)
+    assert not sp.places(a, b, turned, pairs)  # P30: the parallax picks the pair's fit
     key = ("f0", "f1")
     pairs.fits[key] = dataclasses.replace(tv, t_m=far[:3, 3].copy(), predicted_px=400.0)
     assert sp.places(a, b, true, pairs)  # the fit is the twin: the candidate is picked
@@ -334,7 +334,7 @@ def test_the_geometric_gate_separates_translational_twins(
     shift = np.array([0.0, 1.0, 0.0])
 
     def amb(self: Any, f: Any, T: Any, own: Any, corr: Any, cands: Any, j: int, ref: Any,
-            twin: Any = None) -> float | None:
+            twin: Any = None, turned: Any = None) -> float | None:
         if twin is not None:
             twin.append(an.Solve(T[:3, :3].copy(), T[:3, 3] + shift, np.eye(6) * 1e-6,
                                  np.ones(len(corr.uv), bool), 0.5))

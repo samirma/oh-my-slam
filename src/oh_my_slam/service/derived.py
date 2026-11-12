@@ -75,7 +75,7 @@ from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
 from oh_my_slam.service.errors import ApiError
-from oh_my_slam.service.store import Store
+from oh_my_slam.service.store import DEPTH_UNUSED, NO_STAND, Store
 
 log = get_logger("oh_my_slam.service.derived")
 
@@ -442,10 +442,13 @@ class Derived:
                               vdir, self._stands(record, self.store.cameras(name)))
 
     def _stands(self, record: dict[str, Any], cams: dict[str, Any]) -> list[navgrid.Stand]:
+        """The version's camera stands (map.md §6 free-by-rule cells): every frame's, those whose
+        content is withheld included, but a frame kept at a prior its images contradict
+        (``NO_STAND``, P30b/P30c)."""
         out = []
         for f in record["frames"]:
             cam = cams.get(f["camera_id"])
-            if cam is None:
+            if cam is None or f.get(NO_STAND):
                 continue
             c = Camera.from_json(cam)
             K = c.canonical()
@@ -519,8 +522,10 @@ class Derived:
             ok = valid_depth(d) if f.get("content") else d > 0
             vol.integrate(f["name"], d, K.K(), np.asarray(f["T_map_cam"], np.float64), ok)
         # every camera stands inside the grid, even one whose depth gave nothing (all unknown)
+        # (a frame kept at a prior its images contradict stands nowhere: map.md §6, P30b)
+        placed = [f for f in frames if not f.get(NO_STAND)]
         C: NDArray[np.float64] = np.array(
-            [np.asarray(f["T_map_cam"])[:3, 3] for f in frames]) if frames else np.zeros((1, 3))
+            [np.asarray(f["T_map_cam"])[:3, 3] for f in placed]) if placed else np.zeros((1, 3))
         vol.ensure(C.min(0) - np.array([0.0, 0.0, navgrid.BELOW_CAMERA_M]),
                    C.max(0) + np.array([0.0, 0.0, navgrid.ABOVE_CAMERA_M]))
         vdir.mkdir(parents=True, exist_ok=True)
@@ -553,8 +558,10 @@ class Derived:
             uv, desc, w, h = feat
             Kf = cams[f["camera_id"]].canonical().resized(w, h).K()
             T = np.asarray(f["T_map_cam"], np.float64)
-            kfs.append(relocalize.Keyframe(f["name"], T, Kf, uv, desc,
-                                           relocalize.keyframe_points(uv, Kf, depth(f), T)))
+            # a keyframe the floor check did not judge: its features without its depth, which
+            # lifts no located frame (api.md §6, P30d)
+            kfs.append(relocalize.Keyframe(f["name"], T, Kf, uv, desc, relocalize.keyframe_points(
+                uv, Kf, None if f.get(DEPTH_UNUSED) else depth(f), T)))
             keys[f["name"]] = key
 
         def pair(i: int, j: int) -> NDArray[np.int64]:
