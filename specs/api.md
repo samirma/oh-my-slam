@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.3"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.4"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -94,7 +94,8 @@ error code `invalid_request` (§9).
 * **`labels`** (update requests, optional, oms/2.3) — text prompts added to the map's label
   vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. Labels are
   compared as map.md §5 defines (case-folded, `_` as a space). An invalid label refuses the
-  request with `invalid_request` (`details.field: "labels"`); it is never a frame status.
+  request with `invalid_request` (`details.field: "labels"`); it is never a frame status. The
+  objects read reports the effect on each record's label as `label_scores` (oms/2.4, map.md §5).
 * **Request order** is the order of addition (map.md §3).
 * **`analyse`** takes one frame, with its camera inline or by id of a map's camera (`map`
   given).

@@ -143,6 +143,10 @@ minor 2.2, because the API has a single client, updated in step with it:
 **oms/2.3** is additive: the update request's optional `labels` (a map's label vocabulary,
 map.md §5), reported on the map summary and the dry run.
 
+**oms/2.4** is additive: the object record's optional `label_scores` (up to three label
+candidates with their scores, map.md §5), and the label choice rule that prefers a client label
+over a default one whose score is higher by no more than a margin (map.md §5).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

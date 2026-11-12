@@ -435,12 +435,14 @@ becomes a job with a `job_id`. A job goes through these states:
 ## 5. Objects (O8)
 
 Each object record [`MapObject`] has the fields below; frame analysis returns the subset
-[`AnalysisObject`] (api.md §7). Every field is present in an objects read.
+[`AnalysisObject`] (api.md §7). Every field is present in an objects read, except `label_scores`,
+where its row allows omission.
 
 | Field | Meaning |
 | --- | --- |
 | `id` | Positive integer, unique across the map's whole version history and never reused, even after a revert (§2). |
-| `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
+| `label`, `detected_as[]`, `score` | Label chosen (Label choice, below), labels it was detected as, and confidence. |
+| `label_scores[]` | Optional (oms/2.4). Up to the 3 best label candidates of the record, `{label, score}`, in the order of the label choice (below): the first is `label`, the rest follow by score, highest first. `score` is the label's `detection_votes[].share` (same count, same denominator, same ignored-pixel rule), in 0–1, so the scores sum to at most 1. Present whenever the version's label vocabulary holds client labels (§5, Label vocabulary); otherwise it may be omitted. A label with no share is no candidate: the list holds fewer than 3 entries when fewer labels got votes. Map objects only; frame analysis does not carry it. |
 | `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre and that gives a view of it (Ignored pixels, below), detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
@@ -467,9 +469,21 @@ these heights.
   removed from the prompt list. Two labels are equal when their Unicode case-folded forms are
   equal after trimming, reading `_` as a space and collapsing whitespace runs to one space. A
   label equal to a default stays in the stored vocabulary and in `MapSummary.labels`: it is
-  dropped only from the prompt list. A label gets no special treatment beyond being a prompt.
-  The map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
-  would use.
+  dropped only from the prompt list. The map summary reports the version's vocabulary
+  read-only, and a dry run the vocabulary it would use.
+* **Label choice.** A record's `label` is chosen among the labels of its `detection_votes` by
+  their `share`, the highest winning, with one exception (oms/2.4): a **client label** is a
+  label equal (by the comparison above) to a label of the map's vocabulary, whether or not it
+  also equals a default; every other label is a **default label**. A client label beats a default
+  label whose share exceeds the client label's by no more than `CLIENT_LABEL_MARGIN`
+  (`README.md`), an absolute difference of shares. Concretely: with the best-share label `L`,
+  if `L` is a client label it is chosen; else the client label of the highest share among those
+  within the margin of `L`'s share is chosen, if there is one; else `L`. The margin is applied
+  once, against the best-share label, not chained. Candidates of equal share are ordered as
+  before this rule. The same rule chooses the label of a merged object (`README.md`, Persistent
+  identity) from the merged evidence. `label_scores` lists the candidates in this order. The
+  rule changes the label only, not `detection_votes`, `detected_as[]` or `score`, and a map with
+  no client label chooses as before.
 * **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote. On every
   engine, a view where the object lies mostly in ignored pixels (§2) is not a view of it: the
   object's share of its projected box or mask in the ignored region exceeds
