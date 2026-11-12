@@ -105,6 +105,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import hashlib
 import itertools
 import json
 import math
@@ -112,6 +113,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -224,6 +226,12 @@ MIN_AGREEING = 40  # points
 # geometries 90 deg off at 0.59-0.78 (README "Depth confirmation")
 DEPTH_CONFIRM_AGREEMENT = 0.90
 EPIPOLAR_HYPOTHESES = 3  # sequential RANSAC hypotheses of a pair (``epipolar_hypotheses``)
+# map.md §1 "Symmetric scenes" (P24): two depth-confirmed hypotheses of a pair, or candidate poses
+# of a frame against one reference, whose rotations are at least this far apart make it ambiguous
+# (a symmetric scene: depth agrees with both). Separate from the cycle rule's bound
+# (``standpoint.CYCLE_MAX_DEG``): a hypothesis this far from another is a different geometry, not
+# the same one measured twice (sequential RANSAC's leftovers of one geometry agree within a degree)
+SYMMETRIC_MIN_DEG = 10.0
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -892,11 +900,13 @@ def backproject(depth: NDArray[np.float32], K: Array, side: int = SAMPLE_SIDE) -
 
 @dataclass
 class DepthRef:
-    """A reference view of a depth agreement: a pose and a metric depth on its grid (3x3)."""
+    """A reference view of a depth agreement: a pose and a metric depth on its grid (3x3), and
+    the engine's key of its view (the registration gate's ambiguous pairs, ``register_ma``)."""
 
     T: Array
     depth: NDArray[np.float32]
     K: Array
+    key: str = ""
 
 
 @dataclass
@@ -962,11 +972,12 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
 
 
 def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
-    """View ``p``'s depth points (``backproject``) at its pose, seen by view ``q``: how many
-    agree with ``q``'s depth within ``tol`` (relative) and how many lie in front of ``q``'s
-    surface by more than that — ``q`` would see through them, a contradiction. A point behind
-    ``q``'s surface is occluded there and tells nothing (the wide baselines of frames around an
-    object)."""
+    """View ``p``'s depth points (``backproject``) at its pose, seen by view ``q`` (map.md §1
+    "Depth agreement"): how many agree with ``q``'s depth within ``tol`` (relative) and how many
+    lie in front of ``q``'s surface by more than that — ``q`` would see through them, a
+    contradiction. A point behind ``q``'s surface is occluded there and tells nothing (the wide
+    baselines of frames around an object); so does a point outside ``q``'s image, behind ``q``,
+    or where ``q`` measures no depth inside ``DEPTH_VALID_RANGE_M`` (its depth range)."""
     X = backproject(p.depth, p.K) @ p.T[:3, :3].T + p.T[:3, 3]
     Xq = (X - q.T[:3, 3]) @ q.T[:3, :3]
     z = Xq[:, 2]
@@ -978,7 +989,8 @@ def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
     inside = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
     d = np.zeros(len(z))
     d[inside] = q.depth[v[inside], u[inside]]
-    seen = inside & np.isfinite(d) & (d > MIN_DEPTH_M)
+    lo, hi = DEPTH_VALID_RANGE_M
+    seen = inside & np.isfinite(d) & (d >= lo) & (d <= hi)
     agree = seen & (np.abs(z - d) <= tol * d)
     through = seen & (z < d * (1.0 - tol))
     return int(agree.sum()), int(through.sum())
@@ -1879,10 +1891,16 @@ class AnchoredMap:
         # the keyframes stored before the running job (``begin_job``): the others are its own
         self._stored_ids: set[str] = set()
         # the running job's epipolar fits by pair of feature sets (``_epipolar``): a job's
-        # features never change, so its rounds and drift passes fit each pair once; and its
-        # placements (``_placed``) by frame, prediction and candidates
+        # features never change, so its rounds and drift passes fit each pair once; its
+        # placements (``_placed``) by frame, prediction, candidates (all ``place`` reads of
+        # them, ``_kf_state``) and depth scale; its frames as measured (``_preps``, by the
+        # frames, the static-content pass and the depth scale); the arrays' content digests
+        # (``_digest``). A second registration of the job (``reran``) keeps them all: each
+        # entry is keyed by everything it depends on, so it is what a full re-run computes
         self._epi: dict[tuple[int, int, int], tuple[Features, Features, Epipolar | None]] = {}
-        self._placed: dict[tuple[Any, ...], Placement] = {}
+        self._placed: dict[tuple[Any, ...], tuple[FrameIn, Placement]] = {}
+        self._preps: dict[tuple[Any, ...], tuple[list[FrameIn], list[_Prep]]] = {}
+        self._digests: dict[int, tuple[Any, bytes]] = {}
         # the running job (map.md §2 match graph, step 6): the frames that gave scale evidence,
         # the new keyframes each re-registration rested on (by re-registered id) and its
         # keyframe's state before it (``_rereg_state``, to undo it), its frames with a prior
@@ -2031,7 +2049,8 @@ class AnchoredMap:
         """A job starts: the keyframes stored now are the earlier versions' (``_job_duplicates``);
         the job's caches start empty."""
         self._stored_ids = {k.id for k in self.keyframes}
-        self._epi, self._placed = {}, {}
+        if not self.reran:  # a second registration of the job keeps them (``_epi``)
+            self._epi, self._placed, self._preps, self._digests = {}, {}, {}, {}
         self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
 
     def _epipolar(self, a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
@@ -2291,7 +2310,8 @@ class AnchoredMap:
             n = int(s.inliers.sum())
             # a candidate pose the depth images do not confirm is no placement (map.md §2 step
             # 2): a lattice pose is never registered
-            if n >= MIN_INLIERS and self.depth_confirms(f, s.T, sub[3][s.inliers], cands):
+            if n >= MIN_INLIERS and self.depth_confirms(f, s.T, sub[3][s.inliers], cands,
+                                                        corr):
                 spi, sri = s.sigmas()
                 spi = max(spi, MIN_SIGMA_POS_M)
                 sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -2417,33 +2437,72 @@ class AnchoredMap:
         trust = None if f.prior is None else f.prior["trust"]
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
         if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci) \
-                or not self.depth_confirms(f, s.T, sub[3][s.inliers], cands):
+                or not self.depth_confirms(f, s.T, sub[3][s.inliers], cands, corr):
             return None
         return s, n, sub, refs
 
     def depth_confirms(self, f: FrameIn, T: Array, ref_of: NDArray[np.intp],
-                       cands: list[Keyframe]) -> bool:
+                       cands: list[Keyframe], corr: _Corr | None = None) -> bool:
         """Whether a candidate pose ``T`` of a frame passes the depth confirmation (map.md §1
         "Measurable pair", §2 step 2, ``depth_confirmed``) against the reference carrying a
         depth image that holds most of its inliers (``ref_of``, at least ``MIN_INLIERS``; ties
-        to the lowest keyframe id). True when the frame or every such reference carries none."""
+        to the lowest keyframe id). A reference against which another candidate pose of the
+        frame passes it too (``_ambiguous``, from the frame's correspondences ``corr``: map.md
+        §1 "Symmetric scenes") places it in neither pose: the next such reference must confirm
+        it, and with none left the pose is no placement. A pose a reference rejects is no
+        placement. True when the frame or every such reference carries none."""
         own = depth_image(f)
         if own is None:
             return True
         per = np.bincount(ref_of, minlength=len(cands))
-        best = None
-        for i in np.flatnonzero(per >= MIN_INLIERS):
-            k = cands[int(i)]
-            ref = None if k.depth_kind != "sensor" else self._grid(k)
-            if ref is not None and (best is None or (-per[i], k.id) < (-best[0], best[1])):
-                best = (int(per[i]), k.id, ref)
-        if best is None:
-            return True
-        ok = depth_confirmed(DepthRef(T, own, f.K.K()), best[2])
-        if not ok:
-            log.info("%s: its image pose against %s fails the depth confirmation", f.name,
-                     best[1])
-        return ok
+        order = sorted((int(i) for i in np.flatnonzero(per >= MIN_INLIERS)
+                        if cands[int(i)].depth_kind == "sensor"),
+                       key=lambda i: (-per[i], cands[i].id))
+        refs = [(i, g) for i in order for g in [self._grid(cands[i])] if g is not None]
+        for i, ref in refs:
+            k = cands[i]
+            if not depth_confirmed(DepthRef(T, own, f.K.K()), ref):
+                log.info("%s: its image pose against %s fails the depth confirmation", f.name,
+                         k.id)
+                return False
+            # (only a pose the depth confirms asks whether another one would pass too)
+            alt = None if corr is None else self._ambiguous(f, T, own, corr, cands, i, ref)
+            if alt is None:
+                return True
+            log.info("%s: against %s, candidate poses %.1f deg apart both pass the depth "
+                     "confirmation (a symmetric scene): that reference places it in neither",
+                     f.name, k.id, alt)
+        return not refs
+
+    def _ambiguous(self, f: FrameIn, T: Array, own: NDArray[np.float32], corr: _Corr,
+                   cands: list[Keyframe], j: int, ref: DepthRef) -> float | None:
+        """Another candidate pose of a frame against reference ``cands[j]`` that passes the
+        depth confirmation as its pose ``T`` does, at least ``SYMMETRIC_MIN_DEG`` from it (map.md
+        §1 "Symmetric scenes", §2 step 2; the rule of ``standpoint.two_view`` on this engine's
+        candidate poses): sequential PnP hypotheses (``pnp``, then ``refine_pose`` as the
+        candidate) on the frame's lifted matches to that reference that the poses before left
+        unexplained, up to ``EPIPOLAR_HYPOTHESES`` poses in all, each on at least
+        ``MIN_INLIERS``. Returns the angle between the two (deg), or None."""
+        mine = (corr.kf == j) & np.isfinite(corr.X).all(axis=1)
+        uv, X, d = corr.uv[mine], corr.X[mine], corr.d[mine]
+        thr = 2.0 * self._thr(f.K)
+        left = np.linalg.norm(_project(T[:3, :3], T[:3, 3], X, f.K, False) - uv, axis=1) > thr
+        refs = self._refs([cands[j]])
+        for _ in range(EPIPOLAR_HYPOTHESES - 1):
+            if int(left.sum()) < MIN_INLIERS:
+                return None
+            idx = np.flatnonzero(left)
+            got = pnp(X[idx], uv[idx], f.K, thr)
+            if got is None or int(got[2].sum()) < MIN_INLIERS:
+                return None
+            inl = idx[got[2]]
+            s, _ = refine_pose(got[0], got[1], uv[inl], X[inl], d[inl],
+                               np.zeros(len(inl), np.intp), refs, f.K)
+            deg = rot_deg(T[:3, :3].T @ s.R)
+            if deg >= SYMMETRIC_MIN_DEG and depth_confirmed(DepthRef(s.T, own, f.K.K()), ref):
+                return deg
+            left[inl] = False
+        return None
 
     def _register(self, f: FrameIn, s: Solve, n: int, method: str, spi: float, sri: float,
                   sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs, corr: _Corr,
@@ -2488,19 +2547,25 @@ class AnchoredMap:
                        map_residual=_displacement(T, s.T, rot_only), prior_ref=ref,
                        image_sigmas=(rp, rr), has_prior=True)
         if method == "pnp":
+            # the reference keyframe (the most matches) as it is now: the placement may be
+            # reused later in the job (``_place_cached``), when that keyframe may have moved
+            j = int(np.bincount(corr.kf).argmax())
+            k = cands[j]
             ev = functools.partial(self._scale_evidence, s,
                                    np.asarray(f.prior["T_map_cam"], np.float64),
-                                   f.prior["trust"], corr, cands,
+                                   f.prior["trust"], j, (k.centre.copy(), copy.deepcopy(k.prior),
+                                                         k.depth_kind),
                                    (sub, refs, f.K, _prior_sigmas(f.prior)), self.scale.k)
             pl.evidence = lambda: self._record_evidence(ev())
         return pl
 
-    def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, corr: _Corr,
-                        cands: list[Keyframe], fit: tuple[Any, Refs, Intrinsics,
-                                                          tuple[float, float]],
+    def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, j: int,
+                        ref: tuple[Array, dict[str, Any] | None, str],
+                        fit: tuple[Any, Refs, Intrinsics, tuple[float, float]],
                         k: float) -> list[tuple[str, list[float]]]:
         """An image-only centre against its prior, both relative to the reference keyframe
-        (the one with the most matches). For a monocular reference, in its raw depth units: a
+        (the one with the most matches, candidate ``j``: its centre, prior and depth kind at
+        placement, ``ref``). For a monocular reference, in its raw depth units: a
         metric prior is compared with the reference's map centre, a drifting one with the
         reference's own drifting prior (odometry baselines), both evidence of ``k``. For a
         reference whose depth scale is measured independently of the priors (a depth image,
@@ -2509,18 +2574,16 @@ class AnchoredMap:
         the frame (``_record_evidence``): a list of (``bias`` | ``priors`` | ``odometry``,
         entry)."""
         out: list[tuple[str, list[float]]] = []
-        j = int(np.bincount(corr.kf).argmax())
-        ref = cands[j]
-        b_img = float(np.linalg.norm(s.c - ref.centre))
+        centre, prior, kind = ref
+        b_img = float(np.linalg.norm(s.c - centre))
         # the prior baseline between the same two frames: to the reference's own metric prior
-        ref_p = np.asarray(ref.prior["T"])[:3, 3] if ref.prior is not None \
-            and ref.prior["trust"] == "metric" else ref.centre
+        ref_p = np.asarray(prior["T"])[:3, 3] if prior is not None \
+            and prior["trust"] == "metric" else centre
         b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref_p))
-        anchored = ref.depth_kind == "sensor" or (ref.depth_kind == "mono"
-                                                  and self.scale.source == "camera_height")
+        anchored = kind == "sensor" or (kind == "mono" and self.scale.source == "camera_height")
         if trust == "metric" and anchored:
             out.append(("bias", [b_prior, b_img]))
-        if ref.depth_kind != "mono":
+        if kind != "mono":
             return out
         b_img /= k
         if trust == "metric":
@@ -2531,8 +2594,8 @@ class AnchoredMap:
             _, sc = refine_pose(s.R, s.c, *sub, free, K, prior=(prior_T, sp, sr))
             b_img = b_prior / float(sc[j]) / k
             out.append(("priors", [b_prior, b_img]))
-        elif ref.prior is not None and ref.prior["trust"] == "drifting":
-            b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(ref.prior["T"])[:3, 3]))
+        elif prior is not None and prior["trust"] == "drifting":
+            b_odo = float(np.linalg.norm(prior_T[:3, 3] - np.asarray(prior["T"])[:3, 3]))
             out.append(("odometry", [b_odo, b_img]))
         return out
 
@@ -2723,9 +2786,7 @@ class AnchoredMap:
         t0 = time.perf_counter()
         new = not self.keyframes
         self.begin_job()
-        prep = [self._prepare(f) for f in frames]
-        if static:  # else the job's features left static content out already (``job_features``)
-            static_content(frames, prep)
+        prep = self._prepared(frames, static)
         snap = self._snapshot()
         self._keep_s = 0.0
         while True:
@@ -2798,7 +2859,8 @@ class AnchoredMap:
             self._level_by_floor([pl for pl in pls if pl.name not in dups])
         for pl in dups.values():
             pl.keyframe = None
-        self._epi, self._placed = {}, {}  # the job's caches end with it (memory)
+        # the job's caches end with it
+        self._epi, self._placed, self._preps, self._digests = {}, {}, {}, {}
         self._exclude, self._no_rereg, self._start_drift = {}, set(), None
         self._close_base = None
         self._evidence_from, self._rereg_by, self._rereg_state = set(), {}, {}
@@ -2928,6 +2990,45 @@ class AnchoredMap:
         log.info("pose duplicates %s served the job: it registers once more without them",
                  sorted(dups))
         return True
+
+    def _prepared(self, frames: list[FrameIn], static: bool) -> list[_Prep]:
+        """The job's frames as registration needs them (``_prepare``), the static image
+        content left out (``static_content``) unless the job's features left it out already
+        (``job_features``): once per job for the same frames, static pass and depth scale (a
+        second registration measures them as the first did, ``_preps``)."""
+        key = (tuple(id(f) for f in frames), static, self.scale.k)
+        got = self._preps.get(key)
+        if got is None:
+            prep = [self._prepare(f) for f in frames]
+            if static:
+                static_content(frames, prep)
+            got = self._preps[key] = (list(frames), prep)  # the frames kept: their ids stay
+        return got[1]
+
+    def _digest(self, a: NDArray[Any] | None) -> bytes | None:
+        """A content digest of an array of the job (None for none), once per array (a weak
+        reference kept with it: an id another array reuses is digested again)."""
+        if a is None:
+            return None
+        got = self._digests.get(id(a))
+        if got is None or got[0]() is not a:
+            got = self._digests[id(a)] = (weakref.ref(a), hashlib.blake2b(
+                np.ascontiguousarray(a).tobytes(), digest_size=16).digest())
+        return got[1]
+
+    def _kf_state(self, k: Keyframe) -> tuple[Any, ...]:
+        """All ``place`` reads of a candidate keyframe (``_place_cached``'s key): its identity,
+        pose and state, its depth kind and scale, its features, keypoint depths and depth
+        grid (by content)."""
+        self._load_kf(k)
+        self._load_grid(k)
+        f = k.feats
+        return (k.id, k.name, k.camera_id, json.dumps(k.K.to_dict(), sort_keys=True),
+                k.T.tobytes(), k.state, k.depth_kind, k.k_used, k.median_depth,
+                json.dumps(k.prior, sort_keys=True, default=str),
+                None if f is None else (self._digest(f.kps), self._digest(f.desc)),
+                self._digest(k.kdepth), self._digest(k.grid),
+                None if k.K_grid is None else json.dumps(k.K_grid.to_dict(), sort_keys=True))
 
     def _prepare(self, f: FrameIn) -> _Prep:
         """A frame's features, its scene distance (depth image, else, for a suspicious frame,
@@ -3238,12 +3339,14 @@ class AnchoredMap:
         and scale evidence depend on it): a drift pass that predicts it as before, on the same
         scale, reuses it. A copy each time (its fields are reassigned, never changed in place,
         by the steps after)."""
-        key = (i, None if pred is None else (pred[0].tobytes(), pred[1], pred[2]),
-               tuple((k.id, k.name, k.T.tobytes()) for k in cands),
+        key = (i, id(f), id(pr.feats),
+               None if pred is None else (pred[0].tobytes(), pred[1], pred[2]),
+               tuple(self._kf_state(k) for k in cands),
                (self.scale.k, self.scale.source, self.scale.sigma_rel))
-        if key not in self._placed:
-            self._placed[key] = self.place(f, pr.feats, pr.descriptor, cands=cands)
-        return copy.copy(self._placed[key])
+        got = self._placed.get(key)
+        if got is None or got[0] is not f:  # (the frame kept with it: its id stays its own)
+            got = self._placed[key] = (f, self.place(f, pr.feats, pr.descriptor, cands=cands))
+        return copy.copy(got[1])
 
     def _drift_evidence(self, frames: list[FrameIn], out: dict[int, Placement]
                         ) -> list[_DriftObs]:
@@ -3654,12 +3757,16 @@ class AnchoredMap:
         ref = self._grid(k)
         return None if ref is None else (ref.depth, k.K_grid)
 
-    def _grid(self, k: Keyframe) -> DepthRef | None:
-        """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
+    def _load_grid(self, k: Keyframe) -> None:
+        """A keyframe's depth grid as fused (``kf/<id>.depth.npy``), loaded once."""
         if k.grid is None and k.K_grid is not None:
             p = self.root / KF_DIR / f"{k.id}.depth.npy"
             if p.exists():
                 k.grid = np.load(p).astype(np.float32)
+
+    def _grid(self, k: Keyframe) -> DepthRef | None:
+        """A keyframe's depth grid at the map's depth scale now, as a depth reference."""
+        self._load_grid(k)
         if k.grid is None or k.K_grid is None:
             return None
         return DepthRef(k.T, (k.grid * self._depth_factor(k)).astype(np.float32), k.K_grid.K())

@@ -197,7 +197,7 @@ class Fake:
 
     def job_body(self, job: Job) -> dict[str, Any]:
         registered = job.state not in ("queued",)
-        return {"schema": "oms/2.3", "job_id": job.id, "map": job.map, "state": job.state,
+        return {"schema": "oms/2.4", "job_id": job.id, "map": job.map, "state": job.state,
                 "progress": 1.0 if job.state == "committed" else 0.5,
                 "eta_s": self.cfg.eta, "created_at": NOW, "base_version": None,
                 "provisional_version": job.provisional, "result_version": job.result,
@@ -213,7 +213,7 @@ class Fake:
     def health(self) -> dict[str, Any]:
         stat = {"median_s": 0.1, "p90_s": 0.2, "count": 0, "source": "default"}
         body: dict[str, Any] = {
-            "schema": "oms/2.3", "version": "fake-1", "service": "ready",
+            "schema": "oms/2.4", "version": "fake-1", "service": "ready",
             "inference": {"state": "ready", "device": "mps", "memory_used_gb": 1.0,
                           "memory_cap_gb": 10.0, "error": None},
             "lanes": {"worker": {"state": "idle", "queued": 0, "oldest_s": None}},
@@ -239,13 +239,13 @@ class Fake:
 
     def frames(self, name: str, q: dict[str, list[str]]) -> dict[str, Any]:
         v = self.version_of(name, q)
-        return {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+        return {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                 **self.scale(name), "frames": v["frames"]}
 
     def summary(self, name: str, v: dict[str, Any] | None = None) -> dict[str, Any]:
         m = self.maps[name]
         v = v or m.versions[-1]
-        return {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+        return {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                 "latest_version": len(m.versions), "created_at": NOW,
                 "frames": len(v["frames"]), "provisional_frames": 0, "objects": 4,
                 "cameras": m.cameras, "bounds_m": {"min": [0, 0, 0], "max": [1, 1, 1]},
@@ -289,7 +289,7 @@ class Fake:
                     "data": base64.b64encode(a.astype(a.dtype.newbyteorder("<")).tobytes())
                     .decode()}
 
-        return {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+        return {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                 "origin_m": lo.tolist(), "cell_m": cell, "shape": [int(rows), int(cols)],
                 "z_band_m": band, "floor_z_m": float(m.sim.to_map([0.0, 0.0, self.cfg.floor_world_z])[2]),
                 "floor_sigma_m": 0.01, "height_cap_m": float(band[1]),
@@ -338,7 +338,7 @@ class Fake:
                      "polygon_m": [[0, 0], [1, 0], [1, 1]]},
                     {"id": 2, "height_m": floor_h + 0.8 / m.sim.s, "area_m2": 1.0,
                      "polygon_m": [[0, 0], [1, 0], [1, 1]]}]
-        return {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+        return {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                 **self.scale(name), "objects": out, "surfaces": surfaces}
 
     def locate(self, name: str, req: dict[str, Any]) -> dict[str, Any]:
@@ -375,11 +375,11 @@ class Fake:
                         "consistent_with_prior": True if "prior" in f else None,
                         "height_consistent": None,
                         "nearest_view": None})
-        return {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+        return {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                 **self.scale(name), "frames": out}
 
     def analyse(self, req: dict[str, Any]) -> dict[str, Any]:
-        body: dict[str, Any] = {"schema": "oms/2.3", "scale_source": "priors",
+        body: dict[str, Any] = {"schema": "oms/2.4", "scale_source": "priors",
                                 "scale_sigma_rel": 0.01}
         if "T_map_cam" not in req:
             return {**body, "frame": "gravity_camera", "range_scan": []}
@@ -457,7 +457,7 @@ class Fake:
                     status, body = fake.route(method, path, q, self)
                     self.send(status, body)
                 except FakeError as e:
-                    self.send(e.status, {"schema": "oms/2.3", "error": {
+                    self.send(e.status, {"schema": "oms/2.4", "error": {
                         "code": e.code, "message": e.message, "retryable": e.retryable,
                         "details": {}}})
 
@@ -518,12 +518,12 @@ class Fake:
                 return 200, self.objects(name, q)
             if tail == "birdseye":
                 v = self.version_of(name, q)
-                return 200, {"schema": "oms/2.3", "map": name, "map_version": v["version"],
+                return 200, {"schema": "oms/2.4", "map": name, "map_version": v["version"],
                              "width": 200, "height": 200,
                              "pixel_to_map": [[0.1, 0.0, -10.0], [0.0, -0.1, 10.0]],
                              **self.scale(name)}
             if tail == "versions":
-                return 200, {"schema": "oms/2.3", "map": name,
+                return 200, {"schema": "oms/2.4", "map": name,
                              "latest_version": len(m.versions),
                              "versions": [{"version": v["version"], "created_at": NOW,
                                            "kind": v["kind"], "job_id": v["job_id"],
@@ -577,7 +577,7 @@ class Fake:
                                "camera_id": f["camera_id"]})
             if dry:
                 job = Job("dry", name, [], inputs, 0.0, False)
-                return 200, {"schema": "oms/2.3", "map": name, "base_version": None,
+                return 200, {"schema": "oms/2.4", "map": name, "base_version": None,
                              "frames": [{"name": i["name"], "features": 500,
                                          "map_inliers": None, "neighbour_inliers": [],
                                          "plain": False, "too_close": False,

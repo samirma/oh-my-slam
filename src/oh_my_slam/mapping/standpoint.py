@@ -16,7 +16,11 @@ rotation-only fit), independent of any joint solve. When both frames carry depth
 is the first of up to ``EPIPOLAR_HYPOTHESES`` sequential hypotheses that the pair's depth images
 confirm (``anchored.depth_confirmed``) after a PnP refinement on its depth-lifted inliers
 (``depth_pose``), whose rotation is then the measured one: repetitive or symmetric content (a
-square tile lattice) can make the largest consensus a false geometry.
+square tile lattice) can make the largest consensus a false geometry. Every hypothesis that could
+make the pair measurable is evaluated, not only up to the first confirmed: when two confirmed ones
+have rotations at least ``SYMMETRIC_MIN_DEG`` apart, the scene itself is symmetric (depth cannot
+reject either), and the pair is ambiguous (``TwoView.ambiguous``): no measurable pair, and no
+placement by that reference alone (map.md §1 "Symmetric scenes", §2 step 2).
 
 **Measurable pair** (``TwoView.measurable``, map.md §1): at least ``CHECK_MIN_INLIERS`` epipolar
 inliers of a confirmed relative pose (by the depth images when both frames carry them, else by
@@ -68,6 +72,7 @@ from oh_my_slam.mapping.anchored import (
     MIN_DEPTH_M,
     REF_WIDTH,
     REPROJ_PX,
+    SYMMETRIC_MIN_DEG,
     AnchoredMap,
     DepthRef,
     Epipolar,
@@ -155,6 +160,9 @@ class TwoView:
     # when both carry one (``depth``), else not yet judged (the cycle rule, ``consistent``)
     confirmed: bool = True
     depth: bool = False  # both frames carry depth images: their test, not the cycle rule
+    # two distinct hypotheses (``SYMMETRIC_MIN_DEG`` apart) both pass the depth confirmation
+    # (map.md §1 "Symmetric scenes"): not confirmed, and no placement by this pair alone
+    ambiguous: bool = False
 
     @property
     def unconstrained(self) -> bool:
@@ -275,11 +283,14 @@ def depth_pose(a: View, b: View, e: Epipolar, R_ab: Array, da: DepthImage, db: D
 def two_view(a: View, b: View) -> TwoView | None:
     """The two-view fit of a pair (module docstring), None below ``MIN_MATCHES``. When both
     frames carry depth images, its sequential epipolar hypotheses (``epipolar_hypotheses``, in
-    support order) are each refined by PnP on the depth-lifted inliers (``depth_pose``) and the
-    first that the pair's depth images confirm both ways (``depth_confirmed``) is the fit: its
-    inliers, overlap and PnP rotation. With none confirmed the pair carries no measurement (not
-    measurable). Without depth on either side, the largest consensus, judged by the cycle rule
-    (``consistent``)."""
+    support order) are each refined by PnP on the depth-lifted inliers (``depth_pose``) and
+    tested by the pair's depth images both ways (``depth_confirmed``): every hypothesis that
+    could make the pair measurable (``CHECK_MIN_INLIERS``), not only up to the first confirmed.
+    The first confirmed is the fit (its inliers, overlap and PnP rotation), unless another
+    confirmed one lies ``SYMMETRIC_MIN_DEG`` or more from it: the pair is then ambiguous
+    (``TwoView.ambiguous``, map.md §1 "Symmetric scenes"). With none confirmed, or ambiguous, the
+    pair carries no measurement (not measurable). Without depth on either side, the largest
+    consensus, judged by the cycle rule (``consistent``)."""
     # a later hypothesis only matters when it could make the pair measurable: its RANSAC on
     # fewer matches than that is not run (an adaptive RANSAC on a low inlier share is slow)
     hyps = epipolar_hypotheses(a.feats, a.K, b.feats, b.K, then=CHECK_MIN_INLIERS)
@@ -295,27 +306,48 @@ def two_view(a: View, b: View) -> TwoView | None:
     first.depth = True
     tv: TwoView | None = first
     tried: list[str] = []
+    confirmed: list[TwoView] = []
     # RANSAC takes the largest consensus first: once one is below the measurable threshold, so
-    # are the ones the matches it left can give
+    # are the ones the matches it left can give (``epipolar_hypotheses`` stops there)
     while e is not None and len(e.ua) >= CHECK_MIN_INLIERS:
         if tv is not None and tv.share >= VIEW_SHARE:
             T = depth_pose(a, b, e, tv.R_ab, da, db)
             if T is not None and depth_confirmed(
                     DepthRef(np.eye(4), da[0], da[1].K()), DepthRef(T, db[0], db[1].K())):
                 tv.R_ab, tv.depth = T[:3, :3].copy(), True
-                if tried:
-                    log.info("two-view %s-%s: depth confirms a hypothesis of %d inliers at %.1f "
-                             "deg after %s", a.name, b.name, tv.inliers, rot_deg(tv.R_ab),
-                             ", ".join(tried))
-                return tv
-            tried.append(f"{tv.inliers} inliers at {rot_deg(tv.R_ab):.1f} deg")
+                other = next((c for c in confirmed
+                              if rot_deg(c.R_ab.T @ tv.R_ab) >= SYMMETRIC_MIN_DEG), None)
+                if other is not None:
+                    log.info("two-view %s-%s: depth confirms hypotheses %.1f deg apart (%d and "
+                             "%d inliers): a symmetric scene, ambiguous, not measurable",
+                             a.name, b.name, rot_deg(other.R_ab.T @ tv.R_ab), other.inliers,
+                             tv.inliers)
+                    first.confirmed, first.ambiguous = False, True
+                    return first
+                confirmed.append(tv)
+            else:
+                tried.append(f"{tv.inliers} inliers at {rot_deg(tv.R_ab):.1f} deg")
         e = next(hyps, None)
         tv = None if e is None or len(e.ua) < CHECK_MIN_INLIERS else _fit(a, b, e)
+    if confirmed:
+        if tried:
+            log.info("two-view %s-%s: depth confirms a hypothesis of %d inliers at %.1f deg "
+                     "after %s", a.name, b.name, confirmed[0].inliers,
+                     rot_deg(confirmed[0].R_ab), ", ".join(tried))
+        return confirmed[0]
     if tried:
         log.info("two-view %s-%s: no hypothesis the depth images confirm (%s): not measurable",
                  a.name, b.name, ", ".join(tried))
     first.confirmed = False
     return first
+
+
+def ambiguous(a: View, b: View, pairs: Pairs | None = None) -> bool:
+    """Whether a pair is ambiguous (``TwoView.ambiguous``, map.md §1 "Symmetric scenes"): the
+    registration gate's rule (§2 step 2), the reference ``b`` alone places the frame ``a`` in
+    neither pose. Through ``pairs`` when given (each pair fitted once)."""
+    tv = two_view(a, b) if pairs is None else pairs.get(a, b)
+    return tv is not None and tv.ambiguous
 
 
 class Pairs:
@@ -331,7 +363,7 @@ class Pairs:
             if rev is not False:
                 self.fits[key] = None if rev is None else TwoView(
                     rev.R_ab.T, rev.parallax, rev.inliers, rev.share, rev.noise_deg,
-                    rev.confirmed, rev.depth)
+                    rev.confirmed, rev.depth, rev.ambiguous)
             else:
                 self.fits[key] = two_view(a, b)
         return self.fits[key]
@@ -398,7 +430,10 @@ def consistent(views: Sequence[View], cand: list[tuple[int, int, TwoView]]
     depends on the pairs' inliers and names, not on the request order, and never on any pose. A
     pair with no stronger chain passes (the accepted degenerate case, as a lattice geometry
     consistent around a whole cycle). A pair both of whose frames carry depth images is
-    confirmed by them (``two_view``) and kept."""
+    confirmed by them (``two_view``) and kept. Stored-to-stored pairs are never candidates (they
+    are not re-measured, ``evaluated``), so a pair joining stored frames to a standpoint may have
+    no chain: it is then judged by the depth test only, or kept as measured without depth
+    (map.md §1, P24)."""
     parent = list(range(len(views)))
 
     def find(x: int) -> int:
@@ -585,6 +620,15 @@ def stored_views(am: AnchoredMap, near: list[tuple[Any, Any]], exclude: list[Key
             out.append(View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), True,
                             kid=k.id, depth=keyframe_depth(am, k)))
     return out
+
+
+def keyframe_view(am: AnchoredMap, k: Keyframe) -> View | None:
+    """A keyframe as a stored view with its features (loaded) and its depth image for the
+    two-view fits; None without features."""
+    am._load_kf(k)
+    return None if k.feats is None else View(k.name, k.K, k.feats, k.T[:3, :3].copy(),
+                                             k.centre.copy(), True, kid=k.id,
+                                             depth=keyframe_depth(am, k))
 
 
 def keyframe_depth(am: AnchoredMap, k: Keyframe) -> Callable[[], DepthImage | None] | None:

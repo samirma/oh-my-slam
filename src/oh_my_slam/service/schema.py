@@ -15,7 +15,7 @@ from referencing import Registry, Resource
 from oh_my_slam.service.errors import invalid
 
 SCHEMA_FILE = Path(__file__).with_name("api.schema.json")
-SCHEMA_VERSION = "oms/2.3"
+SCHEMA_VERSION = "oms/2.4"
 
 
 @cache
