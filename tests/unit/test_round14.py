@@ -8,7 +8,6 @@ import functools
 import hashlib
 import json
 import math
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -647,43 +646,45 @@ def test_the_older_mapper_checks_the_floor_on_its_grid() -> None:
     assert not Updater._floor_off(fr, internal, anchor.Sim3())  # type: ignore[arg-type]
 
 
-# -- the client's stored map (read-only copy) ------------------------------------------------------
+# -- a phantom floor on monocular keyframes (the client's task_map, synthetic) ----------------------
 
 
-CLIENT_MAP = Path.home() / "oh-my-slam-data" / "service-main" / "oms" / "maps" / "task_map"
+CAM_H = 0.339  # the client's camera height
+EMPTY = Room(boxes=[])
 
 
-def _real_grid(root: Path, check: bool) -> tuple[int, float, float]:
-    """The grid of the copy's latest version rebuilt from its keyframes' stored depth as
-    ``service.derived`` does (half resolution), with or without the floor check: the occupied
-    cells within 1 m of the cameras, and the SD and robust SD (1.4826 MAD) of the volume's flat
-    points' heights within 0.25 m of the version's floor."""
-    m = AnchoredMap.load(root / "mapper")
-    versions = sorted(int(p.stem) for p in (root / "versions").glob("*.json")
-                      if p.stem.isdigit())
-    rec = json.loads((root / "versions" / f"{versions[-1]}.json").read_text())
-    rows = {f["name"]: f for f in rec["frames"]}
+def _phantom_frames() -> list[tuple[np.ndarray, np.ndarray, str]]:
+    """A turn in place of monocular keyframes in the empty room, camera 0.339 m high: every
+    other frame's depth is scaled so that its own floor lies 0.15-0.22 m high (a monocular
+    scale 35-56 % too small, as the client's), the others at the true scale."""
+    out = []
+    lifts = iter([0.15, 0.17, 0.20, 0.22])
+    for k in range(8):
+        T = base_pose(45.0 * k, 0.3, -0.2, CAM_H, 0.05, -20.0)
+        _, z = render(EMPTY, T, K)
+        scale = 1.0 if k % 2 == 0 else (CAM_H - next(lifts)) / CAM_H
+        out.append((T, (z * scale).astype(np.float32), "mono"))
+    return out
+
+
+def _grid_of(frames: list[tuple[np.ndarray, np.ndarray, str]], check: bool, floor: float = 0.0,
+             floor_sigma: float = 0.02) -> tuple[int, float, float]:
+    """The grid of a version rebuilt from its keyframes' depth as ``service.derived`` does (half
+    resolution), with or without the floor check (``floor_verdict``: the sent camera height,
+    each frame's own floor): the occupied cells within 1 m of the cameras, and the SD and
+    robust SD (1.4826 MAD) of the volume's flat points' heights within 0.25 m of the floor."""
     vol = navgrid.Volume()
     cams = []
-    for kf in m.keyframes:
-        f = rows.get(kf.name)
-        if f is None or not _occupies(f):
-            continue
-        d = m.depth_of(kf.id)
-        if d is None or kf.K_grid is None:
-            continue
-        T = np.asarray(f["T_map_cam"], np.float64)
+    for k, (T, d, kind) in enumerate(frames):
         cams.append(T[:3, 3])
         if check:
-            chk = an.floor_verdict(kf.depth_kind, kf.height_m, kf.height_sigma_m, T,
-                                   float(f["sigma_pos_m"]), d, kf.K_grid)
+            chk = an.floor_verdict(kind, CAM_H, None, T, 0.02, d, K)
             if not chk.ok:
                 continue
             d = (d * chk.factor).astype(np.float32)
         d = d[1::2, 1::2]
-        Kh = kf.K_grid.resized(d.shape[1], d.shape[0])
-        vol.integrate(kf.name, d, Kh.K(), T, an.valid_depth(d))
-    floor = float(rec["floor_z_m"])
+        Kh = K.resized(d.shape[1], d.shape[0])
+        vol.integrate(f"k{k}", d, Kh.K(), T, an.valid_depth(d))
     C = np.array(cams)
     vol.ensure(C.min(0) - [0, 0, 3.0], C.max(0) + [0, 0, 2.0])
     zc = vol.origin[2] + (np.arange(len(vol.flat_z)) + 0.5) * navgrid.FLOOR_BIN_M
@@ -693,7 +694,7 @@ def _real_grid(root: Path, check: bool) -> tuple[int, float, float]:
     sd = math.sqrt(float((w * (z - mean) ** 2).sum() / w.sum()))
     pts = np.repeat(z, np.round(w).astype(np.int64))
     robust = 1.4826 * float(np.median(np.abs(pts - np.median(pts))))
-    lay = navgrid.layers(vol, floor, 0.05, 1.8, float(rec["floor_sigma_m"]))
+    lay = navgrid.layers(vol, floor, 0.05, 1.8, floor_sigma)
     R, Cc = lay.shape
     yy, xx = np.mgrid[0:R, 0:Cc]
     cx = lay.origin[0] + (xx + 0.5) * lay.cell
@@ -703,22 +704,18 @@ def _real_grid(root: Path, check: bool) -> tuple[int, float, float]:
     return int(((lay.state == navgrid.OCCUPIED) & near).sum()), sd, robust
 
 
-@pytest.mark.skipif(not (CLIENT_MAP / "mapper" / "state.json").exists(),
-                    reason="the client's stored map is on the serving machine only")
-def test_the_clients_stored_map_loses_its_phantom_floor(tmp_path: Path) -> None:
-    """Regression on a copy of the client's ``task_map`` (45 monocular keyframes, camera
-    0.339 m): its monocular frames whose own floor lies 0.15-0.22 m high made 300+ occupied
-    cells within 1 m of the cameras on the empty floor; under the floor check about none, and
-    the SD of the floor's heights about halves."""
-    root = tmp_path / "task_map"
-    shutil.copytree(CLIENT_MAP / "mapper", root / "mapper",
-                    ignore=shutil.ignore_patterns("*.jpg", "objects*", "cloud.npz"))
-    shutil.copytree(CLIENT_MAP / "versions", root / "versions")
-    before, sd0, _ = _real_grid(root, False)
-    after, sd1, _ = _real_grid(root, True)
-    assert before >= 150
-    assert after <= 10
-    assert sd1 <= 0.6 * sd0
+def test_monocular_keyframes_with_a_raised_floor_lose_their_phantom_floor() -> None:
+    """Regression of the client's ``task_map`` (monocular keyframes, camera 0.339 m), on a
+    synthetic copy: monocular frames whose own floor lies 0.15-0.22 m high make many occupied
+    cells within 1 m of the cameras on the empty floor; under the floor check (map.md §2,
+    oms/2.4: each takes its own scale from the sent height) about none, and the SD of the
+    floor's heights about halves."""
+    frames = _phantom_frames()
+    before, sd0, r0 = _grid_of(frames, False)
+    after, sd1, r1 = _grid_of(frames, True)
+    assert before >= 100  # 158 here
+    assert after <= 10  # 0
+    assert sd1 <= 0.6 * sd0 and r1 <= r0  # 0.094 m -> 0.0 m
 
 
 @pytest.fixture

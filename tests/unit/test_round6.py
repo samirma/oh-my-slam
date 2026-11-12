@@ -414,7 +414,7 @@ def test_the_rotation_check_measures_every_pair_that_can_share_a_view() -> None:
     """map.md §4 (audit r6 item 7): a pair beyond the six nearest views is measured too (no
     count cap), only measurable pairs count (100 inliers and 10 % overlap), and the pairs do
     not depend on the request order. (The stored pairs give the new frame's pairs their chains,
-    P27, so they stay inside the pair limits, P28a.)"""
+    P27, so they stay inside the pair limits, P28b.)"""
     from oh_my_slam.mapping import standpoint as sp
 
     empty = an.Features(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8))
@@ -618,8 +618,8 @@ def test_a_pure_turn_in_45_degree_steps_passes_the_rotation_check(
     rotation-only fit's absorbed translation), enough for rotation_inconsistent on real noise.
     The refined relative pose (``standpoint.refined_rotation``) agrees within 2°.
     Each measured pair is logged (``standpoint.measured``). Its eight adjacent pairs close one
-    cycle, so only the weakest has a chain: the pairs of the frames whose two pairs have none are
-    outside the pair limits (P28a); every measurable pair is checked here (``judged``)."""
+    cycle, so only the weakest has a chain: a pair both of whose frames' pairs have none is
+    outside the pair limits (P28b); every measurable pair is checked here (``judged``)."""
     from oh_my_slam.mapping import standpoint as sp
     from tests.fakes.service import plain
 

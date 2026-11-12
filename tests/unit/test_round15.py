@@ -1,4 +1,4 @@
-"""Round 15 (spec P25a, P27, P28, P28a): the label choice never takes a label without a share;
+"""Round 15 (spec P25a, P27, P28, P28a, P28b): the label choice never takes a label without a share;
 the cycle rule on every pair, depth-confirmed ones included, with stored-to-stored pairs measured
 from the stored images; frames whose pairs have no chain outside the pair limits; translational
 twins separated by their parallax; the PnP refinement kept on its hypothesis (map.md §1, §2, §4,
@@ -140,7 +140,7 @@ def test_the_cycle_rule_judges_depth_confirmed_pairs() -> None:
         assert bad and max(r["difference_deg"] for r in rows) > 10.0
 
 
-# -- P28a: frames whose pairs have no chain ------------------------------------------------------
+# -- P28a, P28b: frames whose pairs have no chain---------------------------------------------------
 
 
 def _tv(inliers: int, deg: float, depth: bool = True) -> sp.TwoView:
@@ -159,28 +159,47 @@ def _line(n: int, committed: dict[int, float], fits: dict[tuple[str, str], sp.Tw
     return sp.check(views, pairs)
 
 
-def test_a_two_frame_jobs_single_unchained_pair_is_still_judged() -> None:
-    """map.md §1 "Cycle consistency" (P28a): a frame's only measurable pair, without a chain,
-    stays measurable and is judged against the committed rotations (the single pair of a
-    two-frame job); a frame with two or more measurable pairs none of which has a chain has
-    them outside the pair limits, depth-confirmed or not, and never rejects the job on its own
-    (a pair one of whose frames puts it outside is outside); a frame with a chained pair keeps
-    all of its pairs."""
+def _adjacent(n: int, fits: dict[tuple[str, str], sp.TwoView] | None = None
+              ) -> dict[tuple[str, str], Any]:
+    """A sequence measured by its adjacent pairs only (no pair closes a cycle)."""
+    out: dict[tuple[str, str], Any] = {(f"v{i}", f"v{j}"): None
+                                       for i in range(n) for j in range(i + 1, n)}
+    out.update({(f"v{i}", f"v{i + 1}"): _tv(300 - 10 * i, 0.0) for i in range(n - 1)})
+    out.update(fits or {})
+    return out
+
+
+def test_a_pair_is_outside_the_limits_only_when_both_frames_put_it_there() -> None:
+    """map.md §1 "Cycle consistency" (P28a, P28b): each frame of a pair gives it a verdict; a
+    frame with two or more measurable pairs none of which has a chain puts them outside, a
+    frame whose only pair has none (either frame of a two-frame job) or with a chained pair
+    keeps its pairs; a pair is outside the pair limits only when both its frames put it there.
+    So a two-frame job's pair and a sequence measured by its adjacent pairs only stay judged (a
+    frame committed 15 deg off is rejected); only a pair between two such frames is outside (a
+    lattice pair there never rejects the job); depth confirmation changes nothing."""
     bad, rows = _line(2, {1: 20.0}, {("v0", "v1"): _tv(300, 0.0)})
     assert bad and [(r["a"], r["b"]) for r in rows] == [("v0", "v1")]
-    three: dict[tuple[str, str], Any] = {("v0", "v1"): _tv(300, 0.0), ("v1", "v2"): _tv(250, 0.0),
-                                         ("v0", "v2"): None}
     for depth in (True, False):
-        fits = {k: None if v is None else _tv(v.inliers, 0.0, depth) for k, v in three.items()}
-        bad, rows = _line(3, {2: 20.0}, fits)
-        assert not bad and rows == []  # v1's two pairs have no chain: outside, both
-    # a cycle: the weakest pair (v0-v2) has a chain, so v0 and v2 keep theirs; v1's two pairs
-    # have none, so v1 puts them outside (though v0 and v2 keep them); v0-v2 is judged
-    cyc = {**three, ("v0", "v2"): _tv(200, 0.0)}
+        fits = {k: None if v is None else _tv(v.inliers, 0.0, depth)
+                for k, v in _adjacent(3).items()}
+        bad, rows = _line(3, {}, fits)
+        assert not bad and len(rows) == 2  # the end frames keep their only pairs
+        bad, rows = _line(3, {1: 15.0}, fits)
+        assert bad
+    # four frames: v1 and v2 both put v1-v2 outside; v0-v1 and v2-v3 stay judged
+    bad, rows = _line(4, {}, _adjacent(4))
+    assert not bad and [(r["a"], r["b"]) for r in rows] == [("v0", "v1"), ("v2", "v3")]
+    bad, rows = _line(4, {3: 15.0}, _adjacent(4))
+    assert bad and max(r["difference_deg"] for r in rows) == pytest.approx(15.0, abs=0.01)
+    # a lattice pair between two frames whose pairs have no chain: outside, the job passes
+    bad, rows = _line(4, {}, _adjacent(4, {("v1", "v2"): _tv(280, 90.0)}))
+    assert not bad and ("v1", "v2") not in {(r["a"], r["b"]) for r in rows}
+    # a cycle: the weakest pair (v0-v2) has a chain, so v0 and v2 keep all their pairs
+    cyc = {**_adjacent(3), ("v0", "v2"): _tv(200, 0.0)}
     bad, rows = _line(3, {2: 20.0}, cyc)
-    assert bad and [(r["a"], r["b"]) for r in rows] == [("v0", "v2")]
+    assert bad and len(rows) == 3
     bad, rows = _line(3, {}, cyc)
-    assert not bad and len(rows) == 1
+    assert not bad and len(rows) == 3
 
 
 # -- translational twins (P28) -------------------------------------------------------------------
@@ -550,14 +569,16 @@ def test_two_view_logs_every_depth_hypothesis(caplog: pytest.LogCaptureFixture,
     assert any("chain n/a" not in m for m in lines)
 
 
-def test_a_frame_whose_pairs_have_no_chain_never_rejects_the_job() -> None:
-    """The client's W2 structure (map.md §1, P28a): frame 2's adjacent pairs unconfirmed, its
+def test_the_w2_structure_is_rejected_never_committed_wrong() -> None:
+    """The client's W2 structure (map.md §1, P28b): frame 2's adjacent pairs unconfirmed, its
     only measurable pair is the lattice pair f0-f2, which has no chain of stronger pairs and so
-    survives the cycle rule; but frame 0's two pairs (f0-f1, f0-f2) have none either, so they
-    are outside the pair limits: the true rotations pass. Without f0-f1, the lattice pair is
-    both frames' only pair: judged, ``rotation_inconsistent`` (the accepted degenerate case)."""
+    survives the cycle rule; frame 0 (two pairs without a chain) puts it outside, but frame 2
+    keeps it (its only pair), so it is judged: ``rotation_inconsistent`` (a false lattice pair
+    kept this way can cause a rejection, never a wrong commit). With the adjacent pairs measured
+    (the PnP kept on its hypothesis), the cycle rule removes it and the turn passes."""
     import dataclasses
 
+    assert not sp.check(_yawed({}), _copy(_pairs()))[0]
     base = _copy(_pairs())
     for k in (("f1", "f2"), ("f2", "f3")):
         tv = base.get(_view(int(k[0][1])), _view(int(k[1][1])))
@@ -565,14 +586,8 @@ def test_a_frame_whose_pairs_have_no_chain_never_rejects_the_job() -> None:
         base.fits[k] = dataclasses.replace(tv, confirmed=False)
         base.fits[(k[1], k[0])] = dataclasses.replace(tv.reversed(), confirmed=False)
     bad, rows = sp.check(_yawed({}), base)
-    assert not bad and ("f0", "f2") not in {(r["a"], r["b"]) for r in rows}
-    alone = _copy(base)
-    tv = alone.get(_view(0), _view(1))
-    assert tv is not None
-    alone.fits[("f0", "f1")] = dataclasses.replace(tv, confirmed=False)
-    alone.fits[("f1", "f0")] = dataclasses.replace(tv.reversed(), confirmed=False)
-    bad, rows = sp.check(_yawed({}), alone)
     assert bad and ("f0", "f2") in {(r["a"], r["b"]) for r in rows}
+    assert max(r["difference_deg"] for r in rows) > 80.0
 
 
 def _room_frames(c: Any, idx: list[int]) -> tuple[list[dict[str, Any]], dict[str, bytes],

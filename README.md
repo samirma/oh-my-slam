@@ -747,7 +747,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   (`rotation_inconsistent`); a pair is measurable with ≥ 100 epipolar inliers
   (`CHECK_MIN_INLIERS`: a weakly overlapping pair's two-view rotation is 4–8° off on 50 inliers),
   depth-confirmed where both frames carry depth and kept by the cycle rule (*Cycle rule*), and
-  the pairs of a frame whose two or more pairs have no chain are outside the limits (P28a);
+  a pair both of whose frames have two or more pairs without a chain is outside the limits
+  (P28b);
   no measurable pair passes (`standpoint.rotation_check`). The
   mapper's engine is checked the same way on its committed poses (*Quality and gate*); it is
   exempt from standpoint grouping only (map.md §1 "Every engine").
@@ -934,16 +935,17 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     the keyframes the map still holds; a dry run reads it and writes nothing. The seconds of the
     fits not found there are the job's `timings_s.stored_pairs`. The older mapper's stored
     frames have no keyframe store: its stored pairs are measured on each job (not cached).
-  * *Outside the pair limits* (P28a, `standpoint.outside`). A new frame with two or more
-    measurable pairs (after the rule), none of which has a chain, has them outside the pair
-    limits: they are logged (`outside the pair limits`) but neither in `rotation_pairs` nor in
-    the limits, depth-confirmed or not. A frame's only measurable pair is judged; a frame with
-    some chained pairs keeps them all. A pair shared by such a frame and a frame that keeps it
-    (a frame whose only pair it is, or one with chained pairs) is outside: the frame's rule is
-    the one that acts ("such a frame never rejects the job on its own"), the others only keep
-    what no frame puts outside. Stored keyframes are not classified (they are not the update's
-    frames). So a turn of three frames or more measured only by adjacent pairs (no pair closes
-    a cycle) has no pair in the limits, while a two-frame job's single pair is judged.
+  * *Outside the pair limits* (P28a, P28b, `standpoint.outside`). Each frame of a measurable
+    pair gives it a verdict over its own measurable pairs of the check (after the rule; stored
+    keyframes too, the stored-to-stored pairs a chain needed are no pair of the check): a frame
+    with two or more, none of which has a chain, puts them outside; a frame whose only pair has
+    no chain, or with some chained pairs, keeps its pairs. A pair is outside the pair limits only
+    when both its frames put it outside, depth-confirmed or not: it is logged (`outside the pair
+    limits`) but neither in `rotation_pairs` nor in the limits. So a sequence measured by its
+    adjacent pairs only stays judged (its end frames keep their only pairs, and an interior
+    pair is outside only when both its frames' pairs all lack a chain), a two-frame job's single
+    pair is judged, and a false lattice pair kept this way can cause a rejection, never a wrong
+    commit.
 * **Camera-height scale in every direction** (map.md §1). `scale_sigma_rel` is one sigma that
   must hold for a horizontal distance in any direction (3 σ). The camera heights measure the
   monocular depth's scale along each frame's view, so each height's frame records its viewing
@@ -2813,8 +2815,8 @@ above it.
   rule (`SYMMETRIC_MIN_DEG`) catches it only when RANSAC also offers the true hypothesis among
   the pair's sequential ones, and the cycle rule (every pair, P28) when a chain of stronger
   pairs exists. It cannot reject one consistent around a whole cycle or a pair with no stronger
-  chain (map.md §1, the accepted degenerate case); a frame whose two or more measurable pairs all
-  lack a chain is outside the pair limits (P28a), but a frame's only pair is judged.
+  chain (map.md §1, the accepted degenerate case); a pair both of whose frames have two or more
+  measurable pairs that all lack a chain is outside the pair limits (P28b), any other is judged.
 
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the

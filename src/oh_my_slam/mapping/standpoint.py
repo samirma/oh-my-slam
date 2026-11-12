@@ -49,9 +49,9 @@ stored keyframe, else the group's first frame in canonical name order.
 
 **Rotation consistency** (``consistency``). Over the measurable pairs among the update's
 registered frames and the confirmed keyframes they can share a view with: the angle
-between their committed relative rotation and the pair's image-measured one, but the pairs of a
-frame whose measurable pairs (two or more) have no chain (``outside``, P28a); the hard limit
-``rotation_inconsistent`` fails when the median exceeds ``MEDIAN_MAX_DEG`` or any pair
+between their committed relative rotation and the pair's image-measured one, but the pairs both
+of whose frames have two or more measurable pairs none with a chain (``outside``, P28b); the
+hard limit ``rotation_inconsistent`` fails when the median exceeds ``MEDIAN_MAX_DEG`` or any pair
 ``PAIR_MAX_DEG``. No measurable pair passes."""
 
 from __future__ import annotations
@@ -739,22 +739,21 @@ def _cycle(views: Sequence[View], cand: list[tuple[int, int, TwoView]]) -> list[
 
 
 def outside(views: Sequence[View], got: list[Judged]) -> set[int]:
-    """The pairs of ``got`` outside the pair limits (map.md §1 "Cycle consistency", P28a): those
-    of a new frame with two or more measurable pairs none of which has a chain of stronger
-    pairs (``Judged.chain_deg`` None), depth-confirmed or not; such a frame never rejects the
-    job on its own. A frame's only measurable pair stays measurable and judged, and a frame
-    with some chained pairs keeps them all; a pair one of whose frames puts it outside is
-    outside (README "Rotation consistency")."""
+    """The pairs of ``got`` outside the pair limits (map.md §1 "Cycle consistency", P28a,
+    P28b): each frame of a pair gives it a verdict over its own measurable pairs in ``got``
+    (stored keyframes too; the stored-to-stored pairs a chain needed are no pair of the check):
+    a frame with two or more of them, none of which has a chain of stronger pairs
+    (``Judged.chain_deg`` None), puts them outside; a frame whose only pair has no chain, or
+    with some chained pairs, keeps its pairs. A pair is outside only when both its frames put
+    it outside, depth-confirmed or not: a sequence measured by its adjacent pairs only stays
+    judged."""
     per: dict[int, list[int]] = {}
     for k, g in enumerate(got):
         for v in (g.i, g.j):
-            if not views[v].stored:
-                per.setdefault(v, []).append(k)
-    out: set[int] = set()
-    for ks in per.values():
-        if len(ks) >= 2 and all(got[k].chain_deg is None for k in ks):
-            out.update(ks)
-    return out
+            per.setdefault(v, []).append(k)
+    off = {v for v, ks in per.items()
+           if len(ks) >= 2 and all(got[k].chain_deg is None for k in ks)}
+    return {k for k, g in enumerate(got) if g.i in off and g.j in off}
 
 
 @dataclass
@@ -865,7 +864,7 @@ def consistency(views: Sequence[View], pairs: Pairs) -> tuple[float | None, floa
 
 def measured(views: Sequence[View], pairs: Pairs) -> list[PairCheck]:
     """The rotation check's measurable pairs (``TwoView.measurable``, after the cycle rule) of
-    the new frames of ``views``, but those outside the pair limits (``outside``, P28a), each
+    the new frames of ``views``, but those outside the pair limits (``outside``, P28b), each
     logged (L3, the service log: which pairs a ``rotation_inconsistent`` comes from, with the
     hypothesis, its shift, agreement and the angle to its chain)."""
     out: list[PairCheck] = []
@@ -881,7 +880,7 @@ def measured(views: Sequence[View], pairs: Pairs) -> list[PairCheck]:
         agree = "n/a" if tv.agreement is None else \
             f"{tv.agreement[0]:.2f}/{tv.agreement[1]:.2f}"
         chain = "n/a" if g.chain_deg is None else f"{g.chain_deg:.2f}"
-        limits = ", outside the pair limits (a frame whose measurable pairs have no chain)" \
+        limits = ", outside the pair limits (both frames' measurable pairs have no chain)" \
             if k in off else ""
         log.info("rotation check %s-%s: %.2f deg (measured %.2f, committed %.2f, %d inliers, "
                  "overlap %.2f, parallax %.2f px, hyp %d, |t| %s m, agreement %s, chain %s deg, "
