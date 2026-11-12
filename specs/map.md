@@ -296,9 +296,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     with its values, and camera ids are never freed. The map summary's `cameras` lists the
     registry as of that version's commit, so a revert version lists every camera defined so
     far, including those defined after `to_version`.
-  * Object ids are unique across the map's whole version history and never reused, even after a
-    revert: an object created later never takes an id held in a version that was reverted
-    away. `first_seen_version` and `last_seen_version` are version numbers of that history.
+  * Object ids and surface ids are unique across the map's whole version history and never
+    reused, even after a revert: an object or surface created later never takes an id held in a
+    version that was reverted away. When a revert's target has no stored mapper map, the map
+    records an id high-water mark for objects and surfaces, and the next mapper map numbers from
+    it, so ids never repeat. `first_seen_version` and `last_seen_version` are version numbers of
+    that history.
   * It reuses the target's derived reads (grid, cloud, locate index) instead of re-deriving
     them, so `revert.latency` (evaluation.md) holds.
 * **Retention (`--keep-versions`).** The service keeps at least the last *N* versions of each
@@ -339,8 +342,8 @@ becomes a job with a `job_id`. A job goes through these states:
 * **What a later observation does.**
   * A later observation of a surface or object replaces the earlier one: an object seen gone is
     `struck` (§5), and the surface behind it is refilled from the latest view.
-  * An object id persists for the lifetime of the map and is never reused, not even after a
-    revert (§2).
+  * An object id or surface id persists for the lifetime of the map and is never reused, not
+    even after a revert (§2).
 * **Split updates.** Mapping one sequence in one job, or split across several in the same order,
   gives the same objects and poses within the evaluator's targets.
 
@@ -431,7 +434,9 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 
 `Objects` also lists `surfaces[]`: the horizontal support planes estimated from the fused
 points, such as the floor, table tops, counters and shelves. Each has `id`, `height_m`,
-`polygon_m` and `area_m2`. An arm descends to and places on these heights.
+`polygon_m` and `area_m2`. A surface `id` is a positive integer, unique across the map's whole
+version history and never reused, even after a revert (§2). An arm descends to and places on
+these heights.
 
 * **Label vocabulary.** An update request's `labels` (api.md §3) are added to the map's
   vocabulary, which is stored with the version: the union of the labels of all its updates,

@@ -2882,7 +2882,8 @@
       ],
       "properties": {
         "id": {
-          "type": "integer"
+          "type": "integer",
+          "description": "Surface id: unique across the map's whole version history and never reused, even after a revert."
         },
         "height_m": {
           "type": "number"
