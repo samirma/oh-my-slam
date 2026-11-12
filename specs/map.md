@@ -53,8 +53,20 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       confirm when both frames carry depth; repetitive or symmetric content can make the
       largest consensus a false geometry, and a pair with no confirmed pose counts as no
       measurable pair. This depth confirmation is the same test that registration applies to
-      candidate poses on every engine (§2, Match graph), so a lattice pose can be neither
-      measured nor registered. Its agreement threshold is a constant in `README.md`.
+      candidate poses on every engine but the older mapper (§2, Match graph), so a lattice pose
+      can be neither measured nor registered. Its agreement threshold is a constant in
+      `README.md`.
+    * **Depth agreement.** Points of one view's depth image are mapped into the other view under
+      the candidate pose. A point is a contradiction only if the other view would see through
+      it: it lies in front of the surface that view measures along that ray. A point behind
+      that surface (occluded) is no contradiction. A point outside the other view's image or
+      depth range counts neither way. The agreement is measured over the points that count.
+    * **Symmetric scenes.** When the scene itself is symmetric, depth cannot reject a lattice
+      pose: both poses agree with the depths. When two distinct pose hypotheses of a pair,
+      with rotations at least 10° apart (a constant in `README.md`), both pass the depth
+      confirmation, the pair is ambiguous and counts as no measurable pair. Registration must
+      not choose between them on that pair alone. This applies to measurement and, the same
+      way, to the registration gate (§2, Match graph, step 2).
     * Frames without depth: when either frame carries no depth image, the pair's own data
       cannot reject such a geometry, so a cycle-consistency rule applies among image-measured
       rotations only. A pair whose two-view rotation disagrees by more than 10° (a constant in
@@ -62,7 +74,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       composes the two-view rotations along a path of measurable pairs that each have strictly
       more inliers than the pair. The rule is independent of the joint solve (§4). It cannot
       catch a lattice geometry that stays consistent around a whole cycle, or a pair with no
-      stronger chain: an accepted degenerate case, as above;
+      stronger chain: an accepted degenerate case, as above. When stored frames are joined to a
+      standpoint, stored-to-stored pairs are not re-measured, so the rule may have no chain
+      there: the pair is then judged by the depth test only, or kept as measured when no depth
+      is available;
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
@@ -74,7 +89,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   robust drift estimate across versions, drift-grown sigmas for kept frames, acceptance of an
   update whose frames are all `kept_at_prior` (§4), and the too-close content exception
   (api.md §4). The older mapper is exempt from
-  static-content exclusion, standpoint grouping and the match graph (§2) only.
+  static-content exclusion, standpoint grouping and the match graph (§2) only. Its
+  registrations come from its own internal solve and are not depth-gated (the depth
+  confirmation of §1, Measurable pair, and §2, Match graph, step 2); this is a documented
+  limit, which `README.md` records.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -216,13 +234,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        limits.
     2. Each connected component of new frames registers as a whole. Relative poses come from
        the images. The component is placed by its matches to confirmed keyframes, by the
-       priors of all its frames together, or both. On every engine, a candidate pose of a
-       frame that carries depth images, against a reference that carries them, is placed only
-       if it passes the depth confirmation of §1 (Measurable pair); a candidate failing it is
-       not a placement. A component that reaches no confirmed
-       keyframe is seeded at one frame's prior. Its frames' reported sigmas cover the seed
-       prior's sigma combined with each frame's fusion, and are never tighter than the seed
-       prior's. This floor applies to every frame whose placement depends on the component,
+       priors of all its frames together, or both. On every engine but the older mapper (§1,
+       Every engine), a candidate pose of a frame that carries depth images, against a
+       reference that carries them, is placed only if it passes the depth confirmation of §1
+       (Measurable pair); a candidate failing it is not a placement. When two distinct candidate
+       poses of a frame against one reference both pass it (§1, Symmetric scenes), the pair is
+       ambiguous and that reference alone places the frame in neither. A component that reaches
+       no confirmed keyframe is seeded at one frame's prior. Its frames' reported sigmas cover
+       the seed prior's sigma combined with each frame's fusion, and are never tighter than the
+       seed prior's. This floor applies to every frame whose placement depends on the component,
        whatever the engine or pass (MapAnything, a retry, re-registration), until the
        component links to a confirmed keyframe.
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests, api.md
@@ -261,9 +281,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     7. The outcome does not depend on the order of frames in the request. Where any order is
        still needed (the origin frame, the seed frame, the pose-duplicate pass), frames are
        taken in canonical name order. A dry run applies the same procedure and predicts the
-       same statuses, except for monocular frames (below) that a job registers with the
-       MapAnything engine: it predicts them with geometric registration, so their statuses
-       and poses, and the `rotation_pairs` they enter, can differ (api.md §4).
+       same statuses, except for monocular frames and frames the geometric engine leaves
+       unplaced (item 8), which a job may place with the MapAnything engine: it predicts
+       them with geometric registration, so their statuses and poses, and the
+       `rotation_pairs` they enter, can differ (api.md §4).
     8. **Engine order in a job.** Frames that carry depth images register with the geometric
        engine first, as a dry run does. MapAnything takes the monocular frames and the frames
        the geometric engine leaves unplaced. A MapAnything call with a single anchor has no
@@ -414,12 +435,14 @@ becomes a job with a `job_id`. A job goes through these states:
 ## 5. Objects (O8)
 
 Each object record [`MapObject`] has the fields below; frame analysis returns the subset
-[`AnalysisObject`] (api.md §7). Every field is present in an objects read.
+[`AnalysisObject`] (api.md §7). Every field is present in an objects read, except `label_scores`,
+where its row allows omission.
 
 | Field | Meaning |
 | --- | --- |
 | `id` | Positive integer, unique across the map's whole version history and never reused, even after a revert (§2). |
-| `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
+| `label`, `detected_as[]`, `score` | Label chosen (Label choice, below), labels it was detected as, and confidence. |
+| `label_scores[]` | Optional (oms/2.4). Up to the 3 best label candidates of the record, `{label, score}`, in the order of the label choice (below): the first is `label`, the rest follow by score, highest first. `score` is the label's `detection_votes[].share` (same count, same denominator, same ignored-pixel rule), in 0–1, so the scores sum to at most 1. Present whenever the version's label vocabulary holds client labels (§5, Label vocabulary); otherwise it may be omitted. A label with no share is no candidate: the list holds fewer than 3 entries when fewer labels got votes. Map objects only; frame analysis does not carry it. |
 | `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre and that gives a view of it (Ignored pixels, below), detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
@@ -446,14 +469,27 @@ these heights.
   removed from the prompt list. Two labels are equal when their Unicode case-folded forms are
   equal after trimming, reading `_` as a space and collapsing whitespace runs to one space. A
   label equal to a default stays in the stored vocabulary and in `MapSummary.labels`: it is
-  dropped only from the prompt list. A label gets no special treatment beyond being a prompt.
-  The map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
-  would use.
+  dropped only from the prompt list. The map summary reports the version's vocabulary
+  read-only, and a dry run the vocabulary it would use.
+* **Label choice.** A record's `label` is chosen among the labels of its `detection_votes` by
+  their `share`, the highest winning, with one exception (oms/2.4): a **client label** is a
+  label equal (by the comparison above) to a label of the map's vocabulary, whether or not it
+  also equals a default; every other label is a **default label**. A client label beats a default
+  label whose share exceeds the client label's by no more than `CLIENT_LABEL_MARGIN`
+  (`README.md`), an absolute difference of shares. Concretely: with the best-share label `L`,
+  if `L` is a client label it is chosen; else the client label of the highest share among those
+  within the margin of `L`'s share is chosen, if there is one; else `L`. The margin is applied
+  once, against the best-share label, not chained. Candidates of equal share are ordered as
+  before this rule. The same rule chooses the label of a merged object (`README.md`, Persistent
+  identity) from the merged evidence. `label_scores` lists the candidates in this order. The
+  rule changes the label only, not `detection_votes`, `detected_as[]` or `score`, and a map with
+  no client label chooses as before.
 * **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote. On every
   engine, a view where the object lies mostly in ignored pixels (§2) is not a view of it: the
   object's share of its projected box or mask in the ignored region exceeds
   `IGNORED_DETECTION_MAX_SHARE` (`README.md`, 0.5, the share of the dropped-detection rule).
-  Such a view enters no view count, no vote denominator and no extent evidence.
+  Such a view enters no view count, no extent evidence and no label vote share, numerator or
+  denominator (`detection_votes[].share`).
 * **Doorways.** A door opening is a passage of the grid (§6), not an object. A detected door
   leaf is an object: label `door`, with its `state` and `region`. The passage names it in
   `leaves[].object_id`. A door object is a leaf: thin (< 0.20 m), vertical and at least 0.6 m

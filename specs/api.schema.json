@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.3. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.4. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -1671,6 +1671,29 @@
             }
           },
           "description": "Highest share first; shares sum to at most 1, and may sum to less. detected_as is unchanged."
+        },
+        "label_scores": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "score"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "The label's detection_votes share (same count and denominator)."
+              }
+            }
+          },
+          "description": "oms/2.4: up to the 3 best label candidates in the order of the label choice (map.md section 5): the first is label, the rest by score, highest first. A client label beats a default label whose score exceeds its own by no more than CLIENT_LABEL_MARGIN (README.md). Present whenever the version's label vocabulary holds client labels; otherwise may be omitted. Fewer than 3 entries when fewer labels got votes."
         }
       },
       "description": "An object record of an objects read (map.md §5)."
