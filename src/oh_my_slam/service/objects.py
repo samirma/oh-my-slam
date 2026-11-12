@@ -90,8 +90,9 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
 def _mapper_extent(o: dict[str, Any], cams: dict[str, Any]) -> dict[str, str]:
     """``extent_seen`` of an older-mapper object from the views it recorded (``views``: each its
     keyframe, its points' centroid and whether its mask kept off the image border), the rule of
-    the prior-first engine (``anchored_objects.extent_from``) on its yaw's axes; ``partial`` on
-    every axis when the builder recorded none (a map derived before they were read)."""
+    the prior-first engine (``anchored_objects.extent_from``) on its yaw's axes, with the
+    support plane that mapper measured under it (``support_z``) bounding its bottom; ``partial``
+    on every axis when the builder recorded none (a map derived before they were read)."""
     views = []
     for v in o.get("views", []):
         c = cams.get(v["frame"])
@@ -104,7 +105,7 @@ def _mapper_extent(o: dict[str, Any], cams: dict[str, Any]) -> dict[str, str]:
     a = math.radians(float(o["yaw_deg"]))
     R = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0],
                   [0.0, 0.0, 1.0]])
-    return extent_from(R, views)
+    return extent_from(R, views, bool(o.get("supported")))
 
 
 def compute(store: Store, ids: nav.Ids, dv: DerivedVersion,

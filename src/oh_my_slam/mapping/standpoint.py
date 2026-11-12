@@ -12,11 +12,18 @@ translation-unconstrained: one standpoint. The pair's *overlap* is the smaller o
 8 x 8 inlier-cell coverages (``anchored.cell_share``, map.md §1 "Overlap"). The image-measured
 relative rotation is that of the relative pose refined on the epipolar inliers
 (``refined_rotation``: Huber-robust Sampson error, from the essential matrix's pose and from the
-rotation-only fit), independent of any joint solve.
+rotation-only fit), independent of any joint solve. When both frames carry depth images, the fit
+is the first of up to ``EPIPOLAR_HYPOTHESES`` sequential hypotheses that the pair's depth images
+confirm (``anchored.depth_confirmed``) after a PnP refinement on its depth-lifted inliers
+(``depth_pose``), whose rotation is then the measured one: repetitive or symmetric content (a
+square tile lattice) can make the largest consensus a false geometry.
 
 **Measurable pair** (``TwoView.measurable``, map.md §1): at least ``CHECK_MIN_INLIERS`` epipolar
-inliers and an overlap of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use
-it. The pairs fitted are every pair of views that can share a view (``close``: centres within
+inliers of a confirmed relative pose (by the depth images when both frames carry them, else by
+the cycle rule, ``consistent``: within ``CYCLE_MAX_DEG`` of the chain of stronger pairs) and an
+overlap of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use it, over the
+same pairs (``evaluated``). The measurement is never seeded from, nor refined toward, any
+committed or joint pose. The pairs fitted are every pair of views that can share a view (``close``: centres within
 ``PAIR_MAX_DIST_M``, optical axes within ``PAIR_MAX_ANGLE_DEG``, the registration candidates'
 rule), with no count cap and in canonical name order: they do not depend on the request order.
 
@@ -39,9 +46,10 @@ between their committed relative rotation and the pair's image-measured one; the
 
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -57,19 +65,27 @@ from oh_my_slam.mapping.anchored import (
     EPIPOLAR_MIN_MATCHES,
     MEASURABLE_INLIERS,
     MEASURABLE_OVERLAP,
+    MIN_DEPTH_M,
+    REF_WIDTH,
+    REPROJ_PX,
     AnchoredMap,
+    DepthRef,
+    Epipolar,
     Features,
     FrameIn,
     Keyframe,
     Placement,
     cell_share,
-    epipolar,
+    depth_confirmed,
+    depth_image,
+    epipolar_hypotheses,
     exp_so3,
     kabsch,
     natural_key,
     pose,
     rot_deg,
     rotation_ransac,
+    sample_depth,
     unit,
 )
 
@@ -91,13 +107,22 @@ SIN_MIN = 0.3  # a ray this near the baseline direction has its parallax scaled 
 # no view. No count cap: every such pair is fitted (each once, ``Pairs``)
 PAIR_MAX_DIST_M = CANDIDATE_MAX_DIST_M
 PAIR_MAX_ANGLE_DEG = CANDIDATE_MAX_ANGLE_DEG
+PNP_MIN_POINTS = 6  # a hypothesis's depth pose (``depth_pose``) needs this many lifted inliers
+PNP_ITERATIONS = 200
+# map.md §1 "Measurable pair", frames without depth (P20): a pair whose two-view rotation
+# disagrees by more than this with the chain of stronger measured pairs is not measurable
+CYCLE_MAX_DEG = 10.0
+
+
+DepthImage = tuple[NDArray[np.float32], Intrinsics]  # metres on a grid, the grid's intrinsics
 
 
 @dataclass
 class View:
     """A frame as the two-view fits see it: its name, intrinsics, features, committed rotation
-    and centre (image-only for a new frame), whether it is a stored confirmed keyframe, and its
-    request order (new frames)."""
+    and centre (image-only for a new frame), whether it is a stored confirmed keyframe, its
+    request order (new frames), and its depth image when it carries one (loaded once, when a fit
+    needs it)."""
 
     name: str
     K: Intrinsics
@@ -107,6 +132,16 @@ class View:
     stored: bool = False
     order: int = 0
     kid: str = ""  # a stored keyframe's id (the standpoint centre's tie-break)
+    depth: Callable[[], DepthImage | None] | None = None
+    _depth: list[DepthImage | None] = field(default_factory=list, repr=False)
+
+    def depth_image(self) -> DepthImage | None:
+        """Its depth image (metres on its grid, the grid's intrinsics), or None (monocular)."""
+        if self.depth is None:
+            return None
+        if not self._depth:
+            self._depth.append(self.depth())
+        return self._depth[0]
 
 
 @dataclass
@@ -116,6 +151,10 @@ class TwoView:
     inliers: int
     share: float  # the overlap: the smaller of the two coverages
     noise_deg: float  # the rotation-only fit's residual angle over sqrt(inliers)
+    # its relative pose is confirmed (map.md §1 "Measurable pair"): by both frames' depth images
+    # when both carry one (``depth``), else not yet judged (the cycle rule, ``consistent``)
+    confirmed: bool = True
+    depth: bool = False  # both frames carry depth images: their test, not the cycle rule
 
     @property
     def unconstrained(self) -> bool:
@@ -124,9 +163,11 @@ class TwoView:
 
     @property
     def measurable(self) -> bool:
-        """A measurable pair (map.md §1): ``CHECK_MIN_INLIERS`` epipolar inliers and an overlap
-        of at least ``VIEW_SHARE``. Standpoint grouping and the pair limits use it."""
-        return self.inliers >= CHECK_MIN_INLIERS and self.share >= VIEW_SHARE
+        """A measurable pair (map.md §1): ``CHECK_MIN_INLIERS`` epipolar inliers of a confirmed
+        relative pose and an overlap of at least ``VIEW_SHARE``; a pair of a monocular frame
+        also passes the cycle rule among the pairs evaluated together (``consistent``).
+        Standpoint grouping and the pair limits use it."""
+        return self.confirmed and self.inliers >= CHECK_MIN_INLIERS and self.share >= VIEW_SHARE
 
     @property
     def standpoint(self) -> bool:
@@ -163,11 +204,9 @@ def refined_rotation(ra: Array, rb: Array, starts: list[tuple[Array, Array]], th
     return best[1]
 
 
-def two_view(a: View, b: View) -> TwoView | None:
-    """The two-view fit of a pair (module docstring), None below ``MIN_MATCHES``."""
-    e = epipolar(a.feats, a.K, b.feats, b.K)
-    if e is None:
-        return None
+def _fit(a: View, b: View, e: Epipolar) -> TwoView | None:
+    """The two-view fit of one epipolar hypothesis ``e`` (module docstring); None without a
+    rotation-only fit."""
     thr = e.thr
     da, db = unit(e.ra), unit(e.rb)
     rot = rotation_ransac(da, db, 2.0 * thr)
@@ -202,6 +241,83 @@ def two_view(a: View, b: View) -> TwoView | None:
                    noise / math.sqrt(max(n, 1)))
 
 
+def depth_pose(a: View, b: View, e: Epipolar, R_ab: Array, da: DepthImage, db: DepthImage
+               ) -> Array | None:
+    """The metric relative pose ``T_a_b`` (b's camera in a's) of a hypothesis from the pair's
+    depth images: the translation from its inliers' depths (median of P_a - R P_b), then PnP
+    (RANSAC at the registration threshold, seeded there) of a's depth-lifted inliers onto b's
+    pixels: rotation errors of 0.02-0.3 deg where the Sampson rotation of a weak pair is off by
+    up to 21 deg (test room; README "Depth confirmation"). None with fewer than six lifted
+    inliers on both sides or no PnP."""
+    za = sample_depth(da[0], da[1], a.K, e.ua).astype(np.float64)
+    zb = sample_depth(db[0], db[1], b.K, e.ub).astype(np.float64)
+    ok = np.isfinite(za) & np.isfinite(zb) & (za > MIN_DEPTH_M) & (zb > MIN_DEPTH_M)
+    if int(ok.sum()) < PNP_MIN_POINTS:
+        return None
+    Pa, Pb = e.ra[ok] * za[ok, None], e.rb[ok] * zb[ok, None]
+    t = np.median(Pa - Pb @ R_ab.T, axis=0)  # x_a = R x_b + t
+    r0, _ = cv2.Rodrigues(R_ab.T)
+    t0 = (-R_ab.T @ t).reshape(3, 1)
+    cv2.setRNGSeed(0)
+    good, rv, tv, inl = cv2.solvePnPRansac(
+        Pa, e.ub[ok], b.K.K(), None, r0.copy(), t0.copy(), useExtrinsicGuess=True,
+        iterationsCount=PNP_ITERATIONS, reprojectionError=REPROJ_PX * b.K.width / REF_WIDTH,
+        confidence=0.999, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not good or inl is None or len(inl) < PNP_MIN_POINTS:
+        return None
+    Rp = np.asarray(cv2.Rodrigues(rv)[0], np.float64)  # x_b = Rp x_a + tp
+    T = np.eye(4)
+    T[:3, :3] = Rp.T
+    T[:3, 3] = -Rp.T @ np.asarray(tv, np.float64).ravel()
+    return T
+
+
+def two_view(a: View, b: View) -> TwoView | None:
+    """The two-view fit of a pair (module docstring), None below ``MIN_MATCHES``. When both
+    frames carry depth images, its sequential epipolar hypotheses (``epipolar_hypotheses``, in
+    support order) are each refined by PnP on the depth-lifted inliers (``depth_pose``) and the
+    first that the pair's depth images confirm both ways (``depth_confirmed``) is the fit: its
+    inliers, overlap and PnP rotation. With none confirmed the pair carries no measurement (not
+    measurable). Without depth on either side, the largest consensus, judged by the cycle rule
+    (``consistent``)."""
+    # a later hypothesis only matters when it could make the pair measurable: its RANSAC on
+    # fewer matches than that is not run (an adaptive RANSAC on a low inlier share is slow)
+    hyps = epipolar_hypotheses(a.feats, a.K, b.feats, b.K, then=CHECK_MIN_INLIERS)
+    e = next(hyps, None)
+    if e is None:
+        return None
+    first = _fit(a, b, e)
+    if first is None:
+        return None
+    da, db = a.depth_image(), b.depth_image()
+    if da is None or db is None:
+        return first
+    first.depth = True
+    tv: TwoView | None = first
+    tried: list[str] = []
+    # RANSAC takes the largest consensus first: once one is below the measurable threshold, so
+    # are the ones the matches it left can give
+    while e is not None and len(e.ua) >= CHECK_MIN_INLIERS:
+        if tv is not None and tv.share >= VIEW_SHARE:
+            T = depth_pose(a, b, e, tv.R_ab, da, db)
+            if T is not None and depth_confirmed(
+                    DepthRef(np.eye(4), da[0], da[1].K()), DepthRef(T, db[0], db[1].K())):
+                tv.R_ab, tv.depth = T[:3, :3].copy(), True
+                if tried:
+                    log.info("two-view %s-%s: depth confirms a hypothesis of %d inliers at %.1f "
+                             "deg after %s", a.name, b.name, tv.inliers, rot_deg(tv.R_ab),
+                             ", ".join(tried))
+                return tv
+            tried.append(f"{tv.inliers} inliers at {rot_deg(tv.R_ab):.1f} deg")
+        e = next(hyps, None)
+        tv = None if e is None or len(e.ua) < CHECK_MIN_INLIERS else _fit(a, b, e)
+    if tried:
+        log.info("two-view %s-%s: no hypothesis the depth images confirm (%s): not measurable",
+                 a.name, b.name, ", ".join(tried))
+    first.confirmed = False
+    return first
+
+
 class Pairs:
     """The two-view fits of an update, each pair fitted once."""
 
@@ -214,7 +330,8 @@ class Pairs:
             rev = self.fits.get((b.name, a.name), False)
             if rev is not False:
                 self.fits[key] = None if rev is None else TwoView(
-                    rev.R_ab.T, rev.parallax, rev.inliers, rev.share, rev.noise_deg)
+                    rev.R_ab.T, rev.parallax, rev.inliers, rev.share, rev.noise_deg,
+                    rev.confirmed, rev.depth)
             else:
                 self.fits[key] = two_view(a, b)
         return self.fits[key]
@@ -234,6 +351,90 @@ def neighbours(views: Sequence[View], i: int) -> list[int]:
     v = views[i]
     near = [j for j, w in enumerate(views) if j != i and close(v.R, v.c, w.R, w.c)]
     return sorted(near, key=lambda j: (natural_key(views[j].name), views[j].stored))
+
+
+def evaluated(views: Sequence[View], pairs: Pairs) -> list[tuple[int, int, TwoView]]:
+    """The measurable pairs (``TwoView.measurable``) among ``views`` that the standpoints and
+    the pair limits evaluate: each new view with every view it can share a view with
+    (``neighbours``), each pair once, after the cycle rule (``consistent``)."""
+    out: list[tuple[int, int, TwoView]] = []
+    seen: set[frozenset[str]] = set()
+    for i, v in enumerate(views):
+        if v.stored:
+            continue
+        for j in neighbours(views, i):
+            key = frozenset((v.name, views[j].name))
+            if key in seen:
+                continue
+            seen.add(key)
+            tv = pairs.get(v, views[j])  # R_ab: j's camera in i's
+            if tv is not None and tv.measurable:
+                out.append((i, j, tv))
+    return consistent(views, out)
+
+
+def _chain(tree: dict[int, list[tuple[int, Array]]], i: int, j: int) -> Array | None:
+    """The rotation of ``j``'s camera in ``i``'s composed along the forest ``tree``'s path, or
+    None without one."""
+    got = {i: np.eye(3)}
+    todo = [i]
+    while todo:
+        k = todo.pop()
+        for m, R in tree.get(k, []):
+            if m not in got:
+                got[m] = got[k] @ R
+                todo.append(m)
+    return got.get(j)
+
+
+def consistent(views: Sequence[View], cand: list[tuple[int, int, TwoView]]
+               ) -> list[tuple[int, int, TwoView]]:
+    """The cycle rule (map.md §1 "Measurable pair", frames without depth; P20): a pair of
+    ``cand`` where either frame carries no depth image is measurable only when its two-view
+    rotation agrees within ``CYCLE_MAX_DEG`` with the chain of stronger measured pairs, the
+    two-view rotations composed along a path of pairs that each have strictly more inliers.
+    Strongest first: each pair is judged against the pairs already kept that are stronger, the
+    path that of their maximum spanning forest (ties to the canonical names), so the outcome
+    depends on the pairs' inliers and names, not on the request order, and never on any pose. A
+    pair with no stronger chain passes (the accepted degenerate case, as a lattice geometry
+    consistent around a whole cycle). A pair both of whose frames carry depth images is
+    confirmed by them (``two_view``) and kept."""
+    parent = list(range(len(views)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    tree: dict[int, list[tuple[int, Array]]] = {}
+    keep: set[int] = set()
+    order = sorted(range(len(cand)), key=lambda c: -cand[c][2].inliers)
+    at = 0
+    while at < len(order):
+        n = cand[order[at]][2].inliers
+        level = [c for c in order[at:] if cand[c][2].inliers == n]
+        at += len(level)
+        kept = []
+        for c in level:
+            i, j, tv = cand[c]
+            R = None if tv.depth else _chain(tree, i, j)
+            if R is not None and rot_deg(R.T @ tv.R_ab) > CYCLE_MAX_DEG:
+                log.info("two-view %s-%s: %.1f deg off the chain of stronger pairs (%d "
+                         "inliers): not measurable", views[i].name, views[j].name,
+                         rot_deg(R.T @ tv.R_ab), tv.inliers)
+                continue
+            kept.append(c)
+        keep.update(kept)
+        # the level's pairs join the stronger ones (Kruskal, in canonical name order)
+        for c in sorted(kept, key=lambda c: sorted((natural_key(views[cand[c][0]].name),
+                                                    natural_key(views[cand[c][1]].name)))):
+            i, j, tv = cand[c]
+            if find(i) != find(j):
+                parent[find(i)] = find(j)
+                tree.setdefault(i, []).append((j, tv.R_ab))
+                tree.setdefault(j, []).append((i, tv.R_ab.T))
+    return [cand[c] for c in sorted(keep)]
 
 
 @dataclass
@@ -259,14 +460,10 @@ def groups(views: Sequence[View], pairs: Pairs, ref_sigma_rot_deg: float = 0.0
         return x
 
     edges: list[tuple[int, int, int, TwoView]] = []
-    for i, v in enumerate(views):
-        if v.stored:
-            continue
-        for j in neighbours(views, i):
-            tv = pairs.get(v, views[j])  # R_ab: j's camera in i's
-            if tv is not None and tv.standpoint:
-                edges.append((i, j, tv.inliers, tv))
-                parent[find(i)] = find(j)
+    for i, j, tv in evaluated(views, pairs):  # R_ab: j's camera in i's
+        if tv.unconstrained:
+            edges.append((i, j, tv.inliers, tv))
+            parent[find(i)] = find(j)
     out: dict[str, Placed] = {}
     members: dict[int, list[int]] = {}
     for i in range(n):
@@ -351,26 +548,16 @@ def measured(views: Sequence[View], pairs: Pairs) -> list[PairCheck]:
     ``views``, each logged (the service log: which pairs a ``rotation_inconsistent`` comes
     from)."""
     out: list[PairCheck] = []
-    seen: set[frozenset[str]] = set()
-    for i, v in enumerate(views):
-        if v.stored:
-            continue
-        for j in neighbours(views, i):
-            w = views[j]
-            key = frozenset((v.name, w.name))
-            if key in seen:
-                continue
-            seen.add(key)
-            tv = pairs.get(v, w)
-            if tv is None or not tv.measurable:
-                continue
-            committed = v.R.T @ w.R
-            c = PairCheck(v.name, w.name, rot_deg(committed.T @ tv.R_ab), tv.inliers,
-                          round(tv.share, 3), round(tv.parallax, 2), rot_deg(tv.R_ab),
-                          rot_deg(committed))
-            log.info("rotation check %s-%s: %.2f deg (%d inliers, overlap %.2f, parallax "
-                     "%.2f px)", c.a, c.b, c.deg, c.inliers, c.share, c.parallax)
-            out.append(c)
+    for i, j, tv in evaluated(views, pairs):
+        v, w = views[i], views[j]
+        committed = v.R.T @ w.R
+        c = PairCheck(v.name, w.name, rot_deg(committed.T @ tv.R_ab), tv.inliers,
+                      round(tv.share, 3), round(tv.parallax, 2), rot_deg(tv.R_ab),
+                      rot_deg(committed))
+        log.info("rotation check %s-%s: %.2f deg (%d inliers, overlap %.2f, parallax "
+                 "%.2f px, %s)", c.a, c.b, c.deg, c.inliers, c.share, c.parallax,
+                 "depth-confirmed" if tv.depth else "cycle rule")
+        out.append(c)
     return out
 
 
@@ -396,14 +583,30 @@ def stored_views(am: AnchoredMap, near: list[tuple[Any, Any]], exclude: list[Key
         am._load_kf(k)
         if k.feats is not None and len(k.feats.kps):
             out.append(View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), True,
-                            kid=k.id))
+                            kid=k.id, depth=keyframe_depth(am, k)))
     return out
+
+
+def keyframe_depth(am: AnchoredMap, k: Keyframe) -> Callable[[], DepthImage | None] | None:
+    """A keyframe's depth image for its two-view fits (``AnchoredMap.sensor_depth``), None for
+    a keyframe without one."""
+    if k.depth_kind != "sensor":
+        return None
+    return functools.partial(am.sensor_depth, k)
+
+
+def frame_depth(f: FrameIn) -> Callable[[], DepthImage | None] | None:
+    """A new frame's depth image for its two-view fits (``anchored.depth_image``: on its
+    canonical pixels, its ignored pixels holding none), None without one."""
+    d = depth_image(f)
+    return None if d is None else (lambda: (d, f.K))
 
 
 @dataclass
 class NewFrame:
     """A frame without a prior registered by an engine, for ``standpoints``: its name,
-    intrinsics, request index, whether it has a depth image, its image-only pose and features."""
+    intrinsics, request index, whether it has a depth image, its image-only pose and features,
+    and that depth image (metres on its grid, the grid's intrinsics) for its two-view fits."""
 
     name: str
     K: Intrinsics
@@ -411,6 +614,7 @@ class NewFrame:
     depth: bool
     T: Array
     feats: Features
+    image: DepthImage | None = None
 
 
 def standpoints(am: AnchoredMap, new: list[NewFrame], pairs: Pairs
@@ -419,7 +623,8 @@ def standpoints(am: AnchoredMap, new: list[NewFrame], pairs: Pairs
     keyframe (``groups``, map.md §1): by request index, their pure-rotation pose about the
     group's centre and its calibrated sigmas (the position's: the group's spread)."""
     views = stored_views(am, [(n.T[:3, :3], n.T[:3, 3]) for n in new])
-    views += [View(n.name, n.K, n.feats, n.T[:3, :3].copy(), n.T[:3, 3].copy(), False, n.index)
+    views += [View(n.name, n.K, n.feats, n.T[:3, :3].copy(), n.T[:3, 3].copy(), False, n.index,
+                   depth=None if n.image is None else functools.partial(lambda d: d, n.image))
               for n in new]
     got = groups(views, pairs)
     out = {}
@@ -442,7 +647,8 @@ def join_standpoint(am: AnchoredMap, pairs: Pairs, f: FrameIn, feats: Features, 
     axis, test room), the lifted points' is not. Its displacement is the rotation between its
     committed and its image-only pose (0 here). As it was when it shares none."""
     assert pl.T is not None
-    new = View(f.name, f.K, feats, pl.T[:3, :3].copy(), pl.T[:3, 3].copy())
+    new = View(f.name, f.K, feats, pl.T[:3, :3].copy(), pl.T[:3, 3].copy(),
+               depth=frame_depth(f))
     best = None
     for v in stored_views(am, [(pl.T[:3, :3], pl.T[:3, 3])]):
         tv = pairs.get(new, v)
@@ -481,7 +687,8 @@ def rotation_check(am: AnchoredMap, placed: list[Placement], pairs: Pairs
     if not kfs:
         return False, []
     views = stored_views(am, [(k.T[:3, :3], k.centre) for k in kfs], kfs)
-    views += [View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), False, i)
+    views += [View(k.name, k.K, k.feats, k.T[:3, :3].copy(), k.centre.copy(), False, i,
+                   depth=keyframe_depth(am, k))
               for i, k in enumerate(kfs) if k.feats is not None]
     return check(views, pairs)
 

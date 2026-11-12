@@ -72,6 +72,7 @@ from oh_my_slam.mapping.quality import (
 from oh_my_slam.segmentation.detect import vocabulary
 from oh_my_slam.service.prior_first import (
     LOW_CONFIDENCE_SIGMA_M,
+    _canonical,
     _frame_in,
     _has_depth,
     frame_class,
@@ -197,7 +198,9 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "rebuilt": False, "prior_gravity_deg": gravity,
     }
     reached = [fr for fr in frames if fr.reason is None]
-    ma = len([fr for fr in reached if fr.work.trust not in ("metric", "drifting")]) \
+    # the frames a job hands MapAnything (map.md §2 step 8): monocular ones without a prior
+    ma = len([fr for fr in reached if fr.work.trust not in ("metric", "drifting")
+              and not _has_depth(fr)]) \
         if none_engine() == "mapanything" and (prev is None or am is not None) else 0
     reg, fus = up.timings.predict_phases(
         len(frames), len(reached) - ma, ma, len(kept),
@@ -282,8 +285,10 @@ def _engine(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None, work
     pairs = standpoint.Pairs()
     am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
     todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
-    origin = next((fr for fr in todo if fr.work.trust in ("metric", "drifting")),
-                  todo[0] if todo else None) if prev is None else None
+    # a new map's origin as the job takes it (``prior_first.run_anchored``): the first frame
+    # with a prior in canonical order, else the first frame (map.md §1, §2)
+    origin = min([fr for fr in todo if fr.work.trust in ("metric", "drifting")] or todo,
+                 key=_canonical) if prev is None and todo else None
     ins = [_frame_in_lazy(up, fr, fr is origin) for fr in todo]
     pls = am.update(ins, lambda _: None) if ins else []
     return am, {fr.work.index: pl for fr, pl in zip(todo, pls, strict=True)}, pairs

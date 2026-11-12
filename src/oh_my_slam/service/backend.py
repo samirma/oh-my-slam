@@ -428,7 +428,11 @@ class MapperBackend:
                                 "created_update": o.get("created_update"),
                                 "last_seen_update": o.get("last_seen_update"),
                                 # the views it was detected in (``objects.Sighting.to_list``)
-                                "sightings": o.get("sightings") or []})
+                                "sightings": o.get("sightings") or [],
+                                # the views that are no view of it (map.md §5 "Ignored
+                                # pixels") and the support its box rests on
+                                "masked_frames": o.get("masked_frames") or [],
+                                "support_z": o.get("support_z")})
             return out
 
         def ignore(name: str) -> NDArray[np.bool_] | None:

@@ -49,7 +49,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.constants import FLOOR_BAND_SIGMAS, FLOOR_SIGMA_DEFAULT_M
-from oh_my_slam.core.images import png_bytes, save_jpeg
+from oh_my_slam.core.images import on_grid, png_bytes, save_jpeg
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import anchor, checks, sigmas, standpoint
@@ -285,6 +285,19 @@ def _height(fr: _Frame) -> float | None:
 
 def _has_depth(fr: _Frame) -> bool:
     return fr.depth_m is not None and bool(np.count_nonzero(fr.depth_m > 0))
+
+
+def _two_view_depth(fr: _Frame) -> Callable[[], tuple[NDArray[np.float32], Intrinsics]] | None:
+    """A frame's depth image for its two-view fits (``standpoint.View.depth``): on its canonical
+    pinhole, its ignored pixels holding none; None without one."""
+    if not _has_depth(fr):
+        return None
+    assert fr.depth_m is not None
+    m = on_grid(fr.ignore, fr.depth_m.shape)
+    d = fr.depth_m.astype(np.float32) if m is None else np.where(m, 0.0, fr.depth_m).astype(
+        np.float32)
+    K = fr.cam.canonical()
+    return lambda: (d, K)
 
 
 def drift_grown(sigma_pos: float, sigma_rot: float, P: NDArray[np.float64],
@@ -1040,8 +1053,11 @@ class Updater:
 
         mine = {fr.work.name for fr in registered}
         fx = {g.name: g.fx for g in internal.frames}
+        # the request's depth images confirm its pairs' two-view fits (map.md §1 "Measurable
+        # pair"); the stored frames' images come without, so their pairs take the cycle rule
         new = [standpoint.View(fr.work.name, fr.cam.canonical(), features(fr.rgb, fr.ignore),
-                               fr.pose[:3, :3].copy(), fr.pose[:3, 3].copy(), False, fr.work.index)
+                               fr.pose[:3, :3].copy(), fr.pose[:3, 3].copy(), False, fr.work.index,
+                               depth=_two_view_depth(fr))
                for fr in registered if fr.pose is not None and fr.rgb is not None]
         stored = []
         for r in record["frames"]:

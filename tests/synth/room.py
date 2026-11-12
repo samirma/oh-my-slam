@@ -32,6 +32,11 @@ class Room:
                                  ((-2.2, -1.8, 0.0), (-1.4, -1.2, 1.2)),
                                  ((-0.5, 1.7, 0.0), (0.7, 2.5, 0.75)),
                                  ((1.0, -2.5, 0.0), (2.2, -1.9, 1.6))])
+    # the floor's texture: ``texture`` as the walls', or ``tiles`` (identical, 4-fold symmetric
+    # square tiles of ``tile`` m: repetitive content whose largest epipolar consensus between
+    # frames turned by about 90 deg is a false geometry, map.md §1 "Measurable pair")
+    floor: str = "texture"
+    tile: float = 0.30
 
     def cast(self, C: Array, d: Array) -> Array:
         """Distance along rays ``d`` (N x 3, any length: the parameter t) from ``C``."""
@@ -69,6 +74,20 @@ def texture(p: Array) -> Array:
     return out
 
 
+def tiles(p: Array, tile: float) -> Array:
+    """The colour of floor points ``p`` (N x 3) on a lattice of identical square tiles, each
+    4-fold symmetric about its centre: rings, a diagonal star and dark grout."""
+    f = p[:, :2] / tile
+    f = f - np.floor(f) - 0.5
+    ax, ay = np.abs(f[:, 0]), np.abs(f[:, 1])
+    ring, diag = np.maximum(ax, ay), np.minimum(ax, ay)
+    v = 0.55 + 0.25 * np.cos(ring * 2 * np.pi * 3) + 0.15 * np.cos(diag * 2 * np.pi * 4)
+    v = np.where(ring > 0.46, 0.15, v)
+    v = np.where((np.abs(ax - ay) < 0.04) & (ring < 0.35), 0.9, v)
+    out: Array = np.clip(v[:, None] * np.array([0.9, 0.8, 0.7]) * 255.0, 0, 255)
+    return out
+
+
 def render(room: Room, T: Array, K: Intrinsics = K_ROBOT, supersample: int = 2
            ) -> tuple[NDArray[np.uint8], NDArray[np.float32]]:
     """RGB (antialiased by ``supersample``) and z-depth of the camera ``T_map_cam``."""
@@ -81,7 +100,11 @@ def render(room: Room, T: Array, K: Intrinsics = K_ROBOT, supersample: int = 2
     d = rays @ R.T
     t = room.cast(C, d)
     p = C + d * t[:, None]
-    rgb = texture(p).reshape(K.height * s, K.width * s, 3)
+    col = texture(p)
+    if room.floor == "tiles":
+        on = p[:, 2] < 1e-4
+        col[on] = tiles(p[on], room.tile)
+    rgb = col.reshape(K.height * s, K.width * s, 3)
     rgb = rgb.reshape(K.height, s, K.width, s, 3).mean(axis=(1, 3))
     z = t.reshape(K.height * s, K.width * s)[s // 2::s, s // 2::s]  # unit-z rays: t is z-depth
     return rgb.astype(np.uint8), z.astype(np.float32)

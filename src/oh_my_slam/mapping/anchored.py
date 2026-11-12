@@ -112,7 +112,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -217,6 +217,13 @@ SENSOR_DEPTH_TOL = 0.10  # relative depth agreement of depth images
 MIN_OVERLAP = 0.10  # share of a frame's points a reference view's depth sees
 MIN_AGREEMENT = 0.75  # share of those that agree
 MIN_AGREEING = 40  # points
+# map.md §1 "Measurable pair", §2 step 2 (P20): a relative pose of two frames carrying depth
+# images is confirmed when, both ways, at least this share of one frame's depth points that the
+# other's depth sees agree within ``SENSOR_DEPTH_TOL`` (and ``MIN_AGREEING`` of them). True
+# poses agree at 1.00 on the tiled and the textured test rooms, a square tile lattice's false
+# geometries 90 deg off at 0.59-0.78 (README "Depth confirmation")
+DEPTH_CONFIRM_AGREEMENT = 0.90
+EPIPOLAR_HYPOTHESES = 3  # sequential RANSAC hypotheses of a pair (``epipolar_hypotheses``)
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -557,18 +564,38 @@ def epipolar(a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
              min_matches: int = EPIPOLAR_MIN_MATCHES) -> Epipolar | None:
     """Two frames' SIFT matches (``match``) that agree with some relative pose (essential matrix,
     RANSAC): None below ``min_matches`` (``EPIPOLAR_MIN_MATCHES``; re-registration's
-    eligibility asks the registration minimum, ``MIN_INLIERS``)."""
+    eligibility asks the registration minimum, ``MIN_INLIERS``). The largest consensus: the
+    first of ``epipolar_hypotheses``."""
+    return next(epipolar_hypotheses(a, Ka, b, Kb, 1, min_matches), None)
+
+
+def epipolar_hypotheses(a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
+                        k: int = EPIPOLAR_HYPOTHESES, min_matches: int = EPIPOLAR_MIN_MATCHES,
+                        then: int | None = None) -> Iterator[Epipolar]:
+    """Up to ``k`` sequential epipolar hypotheses of two frames' matches, lazily: the largest
+    RANSAC consensus, then the largest among the matches the earlier ones left, while at least
+    ``min_matches`` (after the first: ``then``, when given) remain and agree. Repetitive or
+    symmetric content (a square tile lattice) can make the largest one a false geometry (map.md
+    §1 "Measurable pair")."""
     ib, ia = match(b.desc, a.desc)  # one per keypoint of a
     if len(ia) < min_matches:
-        return None
+        return
     ua, ub = a.kps[ia].astype(np.float64), b.kps[ib].astype(np.float64)
     ra, rb = rays(Ka, ua), rays(Kb, ub)
     thr = REPROJ_PX * Ka.width / REF_WIDTH / Ka.fx
-    E, mask = cv2.findEssentialMat(ra[:, :2], rb[:, :2], np.eye(3), cv2.RANSAC, 0.999, thr)
-    if E is None or mask is None or int(mask.sum()) < min_matches:
-        return None
-    inl = mask.ravel().astype(bool)
-    return Epipolar(ua[inl], ub[inl], ra[inl], rb[inl], np.asarray(E[:3], np.float64), thr)
+    left = np.arange(len(ia))
+    for _ in range(k):
+        if len(left) < min_matches:
+            return
+        E, mask = cv2.findEssentialMat(ra[left, :2], rb[left, :2], np.eye(3), cv2.RANSAC, 0.999,
+                                       thr)
+        if E is None or mask is None or int(mask.sum()) < min_matches:
+            return
+        inl = mask.ravel().astype(bool)
+        i = left[inl]
+        yield Epipolar(ua[i], ub[i], ra[i], rb[i], np.asarray(E[:3], np.float64), thr)
+        left = left[~inl]
+        min_matches = min_matches if then is None else then
 
 
 def cell_share(uv: Array, K: Intrinsics) -> float:
@@ -932,6 +959,52 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
         return Agreement(n, int(agree.sum()), int(conflict.sum()))
     return Agreement(n, int(agree.sum()), int(conflict.sum()), float(np.median(best[seen_any])),
                      float(np.median(ratio[seen_any])))
+
+
+def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
+    """View ``p``'s depth points (``backproject``) at its pose, seen by view ``q``: how many
+    agree with ``q``'s depth within ``tol`` (relative) and how many lie in front of ``q``'s
+    surface by more than that — ``q`` would see through them, a contradiction. A point behind
+    ``q``'s surface is occluded there and tells nothing (the wide baselines of frames around an
+    object)."""
+    X = backproject(p.depth, p.K) @ p.T[:3, :3].T + p.T[:3, 3]
+    Xq = (X - q.T[:3, 3]) @ q.T[:3, :3]
+    z = Xq[:, 2]
+    front = z > MIN_DEPTH_M
+    uv, _ = project(np.where(front[:, None], Xq, 1.0), q.K)
+    uv = np.floor(np.nan_to_num(uv, nan=-1.0, posinf=-1.0, neginf=-1.0))
+    u, v = uv[:, 0].astype(np.int64), uv[:, 1].astype(np.int64)
+    h, w = q.depth.shape
+    inside = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    d = np.zeros(len(z))
+    d[inside] = q.depth[v[inside], u[inside]]
+    seen = inside & np.isfinite(d) & (d > MIN_DEPTH_M)
+    agree = seen & (np.abs(z - d) <= tol * d)
+    through = seen & (z < d * (1.0 - tol))
+    return int(agree.sum()), int(through.sum())
+
+
+def depth_confirmed(a: DepthRef, b: DepthRef, tol: float = SENSOR_DEPTH_TOL) -> bool:
+    """The depth confirmation of two views' relative pose (map.md §1 "Measurable pair", §2 step
+    2): each view's depth points at its pose, seen by the other (``seen_through``), agree within
+    ``tol`` for at least ``DEPTH_CONFIRM_AGREEMENT`` of those that agree or that the other would
+    see through (at least ``MIN_AGREEING`` agreeing), both ways. Every engine's candidate poses
+    and the pairs' two-view fits take this one test."""
+    for p, q in ((a, b), (b, a)):
+        agree, through = seen_through(p, q, tol)
+        if agree < MIN_AGREEING or agree < DEPTH_CONFIRM_AGREEMENT * (agree + through):
+            return False
+    return True
+
+
+def depth_image(f: FrameIn) -> NDArray[np.float32] | None:
+    """A frame's depth image (on its canonical pixels) with its ignored pixels holding none
+    (map.md §2), or None without one."""
+    if f.depth is None or not np.count_nonzero(f.depth > 0):
+        return None
+    m = on_grid(f.ignore, f.depth.shape)
+    return f.depth.astype(np.float32) if m is None else np.where(m, 0.0, f.depth).astype(
+        np.float32)
 
 
 # -- the map ---------------------------------------------------------------------------------------
@@ -2216,7 +2289,9 @@ class AnchoredMap:
             sub = (corr.uv[inl], corr.X[inl], corr.d[inl], corr.kf[inl])
             s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
             n = int(s.inliers.sum())
-            if n >= MIN_INLIERS:
+            # a candidate pose the depth images do not confirm is no placement (map.md §2 step
+            # 2): a lattice pose is never registered
+            if n >= MIN_INLIERS and self.depth_confirms(f, s.T, sub[3][s.inliers], cands):
                 spi, sri = s.sigmas()
                 spi = max(spi, MIN_SIGMA_POS_M)
                 sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -2341,9 +2416,34 @@ class AnchoredMap:
         dp, dr = pose_residual(s.T, T0)
         trust = None if f.prior is None else f.prior["trust"]
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
-        if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci):
+        if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci) \
+                or not self.depth_confirms(f, s.T, sub[3][s.inliers], cands):
             return None
         return s, n, sub, refs
+
+    def depth_confirms(self, f: FrameIn, T: Array, ref_of: NDArray[np.intp],
+                       cands: list[Keyframe]) -> bool:
+        """Whether a candidate pose ``T`` of a frame passes the depth confirmation (map.md §1
+        "Measurable pair", §2 step 2, ``depth_confirmed``) against the reference carrying a
+        depth image that holds most of its inliers (``ref_of``, at least ``MIN_INLIERS``; ties
+        to the lowest keyframe id). True when the frame or every such reference carries none."""
+        own = depth_image(f)
+        if own is None:
+            return True
+        per = np.bincount(ref_of, minlength=len(cands))
+        best = None
+        for i in np.flatnonzero(per >= MIN_INLIERS):
+            k = cands[int(i)]
+            ref = None if k.depth_kind != "sensor" else self._grid(k)
+            if ref is not None and (best is None or (-per[i], k.id) < (-best[0], best[1])):
+                best = (int(per[i]), k.id, ref)
+        if best is None:
+            return True
+        ok = depth_confirmed(DepthRef(T, own, f.K.K()), best[2])
+        if not ok:
+            log.info("%s: its image pose against %s fails the depth confirmation", f.name,
+                     best[1])
+        return ok
 
     def _register(self, f: FrameIn, s: Solve, n: int, method: str, spi: float, sri: float,
                   sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs, corr: _Corr,
@@ -3545,6 +3645,14 @@ class AnchoredMap:
                 pl.map_residual = _displacement(T, pl.align_T, pl.method == "rotation")
                 pl.T = T
         mine.append((f, pl, feats))
+
+    def sensor_depth(self, k: Keyframe) -> tuple[NDArray[np.float32], Intrinsics] | None:
+        """A keyframe's depth image (``depth_kind`` sensor) at the map's depth scale now, on its
+        grid, with the grid's intrinsics; None for a monocular or depth-less keyframe."""
+        if k.depth_kind != "sensor" or k.K_grid is None:
+            return None
+        ref = self._grid(k)
+        return None if ref is None else (ref.depth, k.K_grid)
 
     def _grid(self, k: Keyframe) -> DepthRef | None:
         """A keyframe's depth grid at the map's depth scale now, as a depth reference."""

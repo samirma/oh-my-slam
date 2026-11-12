@@ -242,8 +242,16 @@ the version. A rejected or failed job leaves the map as it was.
     when lifted. On the prior-first engine a keyframe whose view of an object's centre falls on
     its ignored pixels does not count among the keyframes seeing it (`anchored_objects.in_view`,
     `detection_votes`), and a re-registered stored keyframe's detections use its stored mask.
-    Known gap: the older mapper's in-frustum count of an object's keyframes
-    (`objects.count_views`) does not consult the masks.
+  * **masked views** (map.md §2, §5, oms/2.4 P21): on every engine a keyframe whose view holds
+    an object mostly on its ignored pixels — its box's eight corners projected into that view,
+    their bounding rectangle clipped to the image, more than `IGNORED_DETECTION_MAX_SHARE` on
+    the mask (`core.images.masked_view`) — is no view of it: it enters no view count, no vote
+    (numerator or denominator) and no extent evidence. Prior-first engine:
+    `anchored_objects.masked_by` (`MapObject.masked`, on the box as fitted and again as it rests
+    on its support; `detection_votes`, `extent_seen`). Older mapper:
+    `objects.masked_frames` (each record's mask beside the map's frames, `record_ignore`;
+    recorded as `masked_frames`) leaves those keyframes out of `objects.count_views` and of the
+    views `derived` records for `extent_seen`.
 * **The map frame.** The mapper keeps its own internal frame, which a rebuild may define again.
   The service frame is reached from it by one similarity `S` per version (`versions/<n>.json →
   sim3`), fitted to *anchors* (`mapping.anchor`):
@@ -431,10 +439,23 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
 
 * **Camera-only frames** (prior `none`) take the engine `OH_MY_SLAM_NONE_ENGINE` names:
   `mapanything` (default, `service.register_ma`, ported from the MapAnything candidate
-  `cand/mapanything-priors`) or `geometric` (`mapping.anchored`, as frames with priors). The
-  frames with priors are registered first; the camera-only ones after them, against the map's
+  `cand/mapanything-priors`) or `geometric` (`mapping.anchored`, as frames with priors).
+  *Engine order* (map.md §2 step 8, oms/2.4 P20): the frames with priors and every frame
+  carrying a depth image are registered by the geometric engine first, as a dry run registers
+  them; MapAnything takes the monocular frames without a prior and the frames without a prior
+  that the geometric engine leaves `no_overlap` (`prior_first.run_anchored`), against the map's
   confirmed keyframes (a new camera-only map's origin is the geometric engine's: the first-camera
-  rule). This internal order is free (map.md §3): the objects are fused in request order after
+  rule). The client's wheeled turns (W1-W3, 803cc9a) showed why: MapAnything committed
+  rotations 3-18° off where PnP on the depth-lifted points was within 0.3°, and rejected frames
+  the geometric engine registered. *Single-anchor floor*: a MapAnything call with a single
+  anchor (the origin of a first update) has no anchor residual to estimate its rotation noise
+  from, so its frames report `sigma_rot_deg` no tighter than `SINGLE_ANCHOR_SIGMA_ROT_DEG` =
+  6° (`register_ma`), whatever pass refines them (a standpoint's tree sigma included,
+  `Placement.sigma_rot_floor`). Calibration for `update.sigma_containment` (error ≤ 3 σ): the
+  largest committed rotation error the client measured on such calls was 17.7° (W2; 10.0° W1,
+  7.0° W3, ≤ 1.9° on the walker), and 3 × 6° = 18° covers it; the former floor (1.5°, 1.25°
+  calibrated) was 5-10× overconfident, which dropped `update.sigma_containment` from 0.77 to
+  0.719. The noise floor of `mapping.sigmas` is added in quadrature on top. This internal order is free (map.md §3): the objects are fused in request order after
   every frame is placed, so a later observation still wins. One MapAnything call per 4 new frames with up to 4 anchors (the most similar keyframes by
   thumbnail among the 60 most recent); anchors closer than 0.30 m leave a call without depth images
   unposed (a turn in place). Its output is aligned rigidly on the anchors and scaled by the frames'
@@ -725,6 +746,64 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   no measurable pair passes (`standpoint.rotation_check`). The
   mapper's engine is checked the same way on its committed poses (*Quality and gate*); it is
   exempt from standpoint grouping only (map.md §1 "Every engine").
+* **Depth confirmation** (map.md §1 "Measurable pair", §2 step 2, oms/2.4 P20). Repetitive,
+  square-symmetric texture (floor tiles, parquet) makes the largest epipolar consensus of two
+  frames turned by about 90° a false geometry: the lattice looks the same after a quarter turn
+  plus a shift, SIFT is rotation-invariant, and the consensus is a valid, floor-preserving
+  essential matrix. Every bad pair of the client's wheeled turns read |true − 90°| (a 55° pair
+  35°, an 84° pair 5°), with 135-395 inliers (measurable). When both frames carry depth images,
+  `standpoint.two_view` runs up to 3 sequential RANSAC hypotheses (`EPIPOLAR_HYPOTHESES`,
+  `anchored.epipolar_hypotheses`: the largest consensus, then the largest among the matches it
+  left), in support order and only while a hypothesis keeps ≥ 100 inliers; each is refined as
+  before, given a metric translation from its inliers' depths (median of P_a − R P_b), then
+  refined by PnP (RANSAC at the registration threshold, seeded there) of a's depth-lifted inliers
+  onto b's pixels (`standpoint.depth_pose`), and the first that the pair's depth images confirm
+  is the pair's fit: its inliers and overlap make the pair measurable and its PnP rotation is the
+  image-measured one (0.02-0.16° off on the tiled test room where the Sampson rotation was
+  0.2-3.9° off). With no confirmed hypothesis the pair carries no measurement (`TwoView.confirmed`
+  false: not measurable). *The test* (`anchored.depth_confirmed`), computed after the PnP
+  refinement: each frame's depth grid (`backproject`, 64 per side) at the relative pose is seen
+  by the other (`anchored.seen_through`); of its points the other's depth sees, those within
+  10 % agree (`SENSOR_DEPTH_TOL`) and those in front of the other's surface by more than that
+  contradict it (the other would see through them; a point behind the surface is occluded and
+  tells nothing — frames around a table see each other's backs); at least
+  `DEPTH_CONFIRM_AGREEMENT` = 0.90 of agreeing plus contradicting must agree (and at least 40
+  agree), both ways. Calibration (`tests/synth/room.py` `Room(floor="tiles")`, 28° steps, 640 ×
+  480): true poses agree at 0.999-1.000; the lattice poses (90° off) of the furnished tiled room
+  at 0.52-0.86, every 84° and 112° pair rejected; the diagnosis's measure before PnP found true
+  weak pairs at 0.80-0.88 (Sampson rotations 2-5° off), which PnP brings to 1.00. Counting
+  occluded points as conflicts (`anchored.agreement`) failed true poses of the table scene's
+  frames around a table, hence the seen-through count. The same test gates every engine's
+  candidate poses of a frame carrying a depth image: the geometric engine's image pose against
+  the depth reference that holds most of its inliers (≥ 15; ties to the lowest keyframe id;
+  `AnchoredMap.depth_confirms`, also the near-prior hypothesis), MapAnything's against the
+  reference carrying a depth image that sees most of its points agree (`register_ma.confirms`);
+  a candidate failing it is no placement (`no_overlap`, or kept at its prior with
+  `no_image_pose`). The older mapper's poses are COLMAP's (not gated, *Known limitations*); its
+  rotation check gives the request's depth images to the new frames' pairs (stored frames'
+  pairs take the cycle rule). Limit: a scene that is itself symmetric under the lattice's motion
+  (an empty, nearly square room tiled throughout) agrees with the false pose too (0.97-0.98 on
+  two pairs of the empty test room); a real room's furniture breaks it. *Cost* (M3 Pro, heavy lock, 640 × 480, 4000 features, the furnished tiled room's 22
+  pairs): 62 ms a pair without depth (matching, one RANSAC, the fit); a pair whose first
+  hypothesis the depth confirms adds 3.5 ms (PnP 2.9 ms, the two-way test 0.6 ms); one whose
+  first hypothesis it rejects adds about 100 ms (the later RANSACs on the leftover matches, run
+  only while at least 100 remain: a low inlier share runs RANSAC's full 1000 iterations), so 92
+  ms a pair on that room, where 7 of 22 pairs are lattice pairs. Only updates without priors
+  run the rotation check, and the fits are shared with the standpoints (`Pairs`).
+* **Cycle rule** (map.md §1, frames without depth). When either frame carries no depth image,
+  the pair's own data cannot reject a lattice geometry; a pair whose two-view rotation disagrees
+  by more than `CYCLE_MAX_DEG` = 10° with the chain of stronger measured pairs is not measurable
+  (`standpoint.consistent`). Over the pairs evaluated together (each new view with every view it
+  can share a view with, `standpoint.evaluated`, which the standpoints and the rotation check
+  share), strongest first: a pair is judged against the pairs already kept that have strictly
+  more inliers, composing their two-view rotations along the path of their maximum spanning
+  forest (ties to the canonical names), so it depends on the pairs' inliers and names, never on
+  the request order or any pose (no joint solve, no committed seed). A pair with no stronger
+  chain passes, as does a lattice geometry consistent around a whole cycle: the accepted
+  degenerate case. On the tiled test room without depth it leaves out every lattice pair (85-93°
+  off their chains). Pairs both of whose frames carry depth images are confirmed by them and
+  never judged by it. `join_standpoint` sees one new frame against stored keyframes only (no
+  stored pair is fitted), so it has no chain there.
 * **Camera-height scale in every direction** (map.md §1). `scale_sigma_rel` is one sigma that
   must hold for a horizontal distance in any direction (3 σ). The camera heights measure the
   monocular depth's scale along each frame's view, so each height's frame records its viewing
@@ -823,10 +902,15 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   (`dry_run._engine`: `AnchoredMap.update` over every frame the checks keep — the match graph,
   the drift fit, the distance limit, pose duplicates, re-registration, the height gate), then
   discards it, so its statuses are the update's; a frame's monocular depth is asked only when the
-  engine needs it (interactive). Frames without a prior that the update gives MapAnything are
-  predicted by the geometric registration (running MapAnything would make a dry run as slow as a
-  job): on such frames the prediction can differ — the documented limit of api.md §4 and map.md
-  §2 step 6 (oms/2.2 P11). `map_inliers` is null on a new map (the
+  engine needs it (interactive). A job registers the frames carrying depth images with the
+  geometric engine as the dry run does (*Camera-only frames*, oms/2.4 P20), and the new map's
+  origin is taken in canonical order by both, so for those frames the dry run's statuses,
+  poses and `rotation_pairs` are the job's (`tests/unit/test_round11.py`). The monocular frames
+  without a prior that the update gives MapAnything, and a frame with depth that the geometric
+  engine leaves unplaced and MapAnything then places, are predicted by the geometric
+  registration (running MapAnything would make a dry run as slow as a job): on such frames the
+  prediction can differ — the documented limit of api.md §4 and map.md §2 step 7. `map_inliers`
+  is null on a new map (the
   schema). Its predicted `quality` is the registration phase's, without fusion:
   `scale_ratio_vs_prev` 1 (fusion refines the scale, map.md §3), `gauge_shift`, the residuals,
   `max_displacement_*`, `prior_disagreement_deg`, `height_inconsistent` and `reregistered` as the
@@ -940,8 +1024,13 @@ called by `service.prior_first` after the engine placed and fused the update's k
   id's display colour. `sigma_centre_m`: the sightings' pose sigma and depth noise (1 % sensor,
   5 % monocular, of the distance) over their number, plus the spread of their centres while an
   axis is only partly seen. `extent_seen`: an axis is `full` when an uncut sighting sees it across
-  (|cos| ≤ 0.8 to the ray) or sightings from both ends see it; `z` when one sees top and bottom
-  uncut, or the top with the box resting on a support. `detection_votes` (map.md §5,
+  (|cos| ≤ 0.8 to the ray, `ACROSS_COS`) or sightings from both ends see it; `z` when one sees
+  top and bottom uncut from the side (|ray z| ≤ 0.8), or (oms/2.4 P21) when a sighting that no
+  border cuts sees the top from above — ray z below −`TOP_VIEW_COS` = −0.8, the same |ray z|
+  threshold — and a support plane is measured under the footprint (`supported_by`, a surface or
+  an object top, measurable from other views): the support bounds the bottom. The support
+  search itself (below) judges the height on the side views alone (`extent_seen(o,
+  support=False)`). Sightings of masked views are no evidence. `detection_votes` (map.md §5,
   `anchored_objects.detection_votes`): per label, the keyframes whose sightings gave it over the
   image-confirmed keyframes whose view frustum (in front of the camera by 5 cm and inside its
   image) holds the box centre, together with every keyframe that detected the object (so a
@@ -985,7 +1074,9 @@ called by `service.prior_first` after the engine placed and fused the update's k
   points' centroid, the share of its mask in the image-border band): `extent_seen` applies the
   prior-first engine's rule to them (`anchored_objects.extent_from` on the box's yaw axes; a
   view is uncut when none of its mask lies in the border band, `derived.MAPPER_UNCUT_BORDER`;
-  `service.objects._mapper_extent`). Only a version derived before the views were read reports
+  `service.objects._mapper_extent`), with the support plane that mapper measured under the box
+  (`objects.support_level`, its `support_z`, recorded as `supported`) completing a top view.
+  Only a version derived before the views were read reports
   `partial` on every axis (its builder's views never reached it).
   `state` is `confirmed`; no surfaces or relations. An object without those records, or without
   points in the cloud, is not listed.
@@ -2457,6 +2548,16 @@ above it.
 
 
 ## Known limitations
+
+* **The older mapper's registrations are not depth-confirmed** (map.md §2 step 2, oms/2.4 P20,
+  "on every engine"). Its poses come from COLMAP's incremental registration, which the service
+  does not re-test against the frames' depth images; only its rotation check measures the new
+  frames' pairs with their depth images (`update._rotations_bad`). The prior-first engine and
+  MapAnything apply the test (*Depth confirmation*).
+* **A lattice geometry in a symmetric scene.** The depth confirmation cannot reject a false
+  geometry the scene's own shape repeats (an empty, nearly square room tiled throughout: 0.97 on
+  the test room), and the cycle rule cannot reject one consistent around a whole cycle or a pair
+  with no stronger chain (map.md §1, the accepted degenerate case).
 
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the

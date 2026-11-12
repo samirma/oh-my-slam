@@ -109,6 +109,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -516,6 +517,9 @@ class MapObject:
     sources: NDArray[np.uint8] | None = None
     # the height of the surface its box rests on (``support_level``; None: the box is its points')
     support: float | None = None
+    # the keyframes whose view is no view of it: it lies mostly on their ignored pixels
+    # (``masked_frames``, map.md §5 "Ignored pixels"); no view count, no extent evidence
+    masked: list[int] = field(default_factory=list)
     _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def memo(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -638,6 +642,7 @@ class MapObject:
             "point_file": points_file(self.id),
             "sightings": [s.to_list() for s in self.sightings],
             "support_z": self.support,
+            "masked_frames": self.masked,
         }
 
     @staticmethod
@@ -665,6 +670,7 @@ class MapObject:
             cloud_points=None if cloud is None else int(cloud),
             cloud_min=None if least is None else int(least),
             support=None if d.get("support_z") is None else float(d["support_z"]),
+            masked=sorted(int(f) for f in d.get("masked_frames", [])),
         )
 
     @property
@@ -1082,12 +1088,54 @@ def in_view(pts: NDArray[Any], K: Any, T_map_cam: Any) -> bool:
 
 
 def count_views(obj: MapObject, records: list[Any]) -> int:
-    """Keyframes of the map (``records``) that detected the object or have it in view."""
+    """Keyframes of the map (``records``) that detected the object or have it in view, but for
+    those whose view is no view of it (``MapObject.masked``: it lies mostly on their ignored
+    pixels, map.md §5)."""
     pts = obj.points
     if len(pts) > VIEW_SAMPLES:
         pts = pts[np.linspace(0, len(pts) - 1, VIEW_SAMPLES).astype(int)]
     detected = set(obj.frames)
-    return sum(1 for r in records if r.index in detected or in_view(pts, r.K_grid, r.T_map_cam))
+    masked = set(obj.masked)
+    return sum(1 for r in records if r.index not in masked and (
+        r.index in detected or in_view(pts, r.K_grid, r.T_map_cam)))
+
+
+def masked_frames(obj: MapObject, records: list[Any],
+                  ignore_of: Callable[[Any], NDArray[np.bool_] | None]) -> list[int]:
+    """The keyframes (``records``) whose view is no view of the object (map.md §5 "Ignored
+    pixels", every engine: ``core.images.masked_view``): its box projected there lies mostly on
+    their ignored pixels (``ignore_of``: a record's mask, None without one). Empty without a
+    box."""
+    from oh_my_slam.core.images import masked_view
+
+    if obj.obb is None:
+        return []
+    corners = obj.obb.corners()
+    out = []
+    for r in records:
+        ign = ignore_of(r)
+        if ign is not None and masked_view(r.T_map_cam.inverse().apply(corners), r.K_grid, ign):
+            out.append(int(r.index))
+    return sorted(out)
+
+
+def record_ignore(tx: Any) -> Callable[[Any], NDArray[np.bool_] | None]:
+    """A keyframe record's ignore mask beside the map's frames (``sfm.ignore_mask_path``, the
+    latest copy: staged in this update, else committed), read once; None without one."""
+    from functools import cache
+
+    from oh_my_slam.mapping.sfm import IGNORE_MASKS
+
+    @cache
+    def load(image: str) -> NDArray[np.bool_] | None:
+        import cv2
+
+        rel = str(Path(image).parent.parent / IGNORE_MASKS / f"{Path(image).name}.png")
+        p = tx.current(rel)
+        got = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+        return None if got is None else got > 0
+
+    return lambda r: load(r.image)
 
 
 def below_floor(obj: MapObject, floor_z: float | None, margin: float = 0.3) -> bool:
@@ -1461,6 +1509,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
     horizontal surface are one object; ``cuts``: per keyframe index, how deep the map fuses it
     (``geometry.keyframe_depth_cuts``: places beyond are not judged, ``_Places``)."""
     tx = ctx.tx
+    ignore_of = record_ignore(tx)  # the keyframes' ignore masks (``masked_frames``)
     state = load_state(tx.current, ctx.meta)
     uid = ctx.update_id
     moved = rescale_objects(state, getattr(ctx, "rescaled", {}) or {}, records)
@@ -1591,6 +1640,7 @@ def update_objects(ctx: Any, records: list[Any], progress: Any,
                 o.published = True
     for o in state.objects:
         o.forget_tree()
+        o.masked = masked_frames(o, records, ignore_of)
         o.views_in_frustum = count_views(o, records)
         confirm(o)
     # boxes whose lower part no keyframe saw rest on the surface beneath (``support_level``),

@@ -218,3 +218,30 @@ def on_grid(mask: NDArray[np.bool_] | None, shape: tuple[int, ...]) -> NDArray[n
     out: NDArray[np.bool_] = cv2.resize(mask.astype(np.uint8), (shape[1], shape[0]),
                                         interpolation=cv2.INTER_NEAREST) > 0
     return out
+
+
+def masked_view(corners_cam: NDArray[Any], K: Intrinsics, ignore: NDArray[np.bool_] | None
+                ) -> bool:
+    """Whether a view is no view of an object (map.md §2, §5 "Ignored pixels"; every engine):
+    the object's box, its corners in the camera frame (``corners_cam``, N x 3) projected with
+    ``K`` (the corners in front of the camera; their bounding rectangle clipped to the image),
+    lies on the view's ignored pixels (``ignore``, any grid of the image) by more than
+    ``IGNORED_DETECTION_MAX_SHARE``, the share of the dropped-detection rule. Such a view enters
+    no view count, vote denominator or extent evidence."""
+    from oh_my_slam.core.constants import IGNORED_DETECTION_MAX_SHARE
+
+    if ignore is None or not ignore.any():
+        return False
+    c = np.asarray(corners_cam, np.float64).reshape(-1, 3)
+    c = c[c[:, 2] > 1e-6]
+    if not len(c):
+        return False
+    u, v = K.fx * c[:, 0] / c[:, 2] + K.cx, K.fy * c[:, 1] / c[:, 2] + K.cy
+    h, w = ignore.shape[:2]
+    sx, sy = w / K.width, h / K.height
+    x0, x1 = (int(np.clip(math.floor(float(u.min()) * sx), 0, w)),
+              int(np.clip(math.ceil(float(u.max()) * sx), 0, w)))
+    y0, y1 = (int(np.clip(math.floor(float(v.min()) * sy), 0, h)),
+              int(np.clip(math.ceil(float(v.max()) * sy), 0, h)))
+    area = ignore[y0:y1, x0:x1]
+    return bool(area.size) and float(area.mean()) > IGNORED_DETECTION_MAX_SHARE
