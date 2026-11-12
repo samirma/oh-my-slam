@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.3) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.4) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -70,7 +70,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.3; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.4; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -862,6 +862,48 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   mean's own variance (`w² σ_img² + (1−w)² σ_prior²`, `w` from the weights the fusion used, which
   floor the image pose at 5 cm / 1°), for a drifting prior the inverse-variance combination; floored
   at 1 mm and 0.01° (no longer at 1 cm / 0.1°).
+* **One fusion of image, prior and height** (oms/2.4 P26, `anchored.fuse_measures`). A frame with
+  a prior is the information-weighted mean of its image pose, its prior and, when sent, its camera
+  height (below), about its image pose: the image pose by the shape of its own covariance (the
+  height-pitch trade of a camera turning in place is kept) scaled to its calibrated sigmas (at
+  least the 5 cm / 1° image floors against a metric prior), the prior per axis. A drifting
+  prior stays one term of the joint Gauss-Newton on the frame's matches (as before); that
+  solve, by its covariance's shape at the combined sigmas above, is then fused with the prior's
+  pitch and roll when it gives `sigma_tilt_deg` (`tilt_measure`) and with the sent height. Not
+  done: weighing a drifting prior against the image pose's calibrated sigma as a metric one is
+  (the diagnosis's F2a). Tried, it let overconfident drifting priors (0.02 m against an 8 %
+  odometry over-count) pull the frames off the depth images' positions and moved the
+  odometry-scale evidence of monocular maps by 16 % (`test_drifting_walk_with_odometry_overcount`,
+  `test_drifting_priors_scale_monocular_depth_without_heights`). The reported sigmas are the
+  real covariances of the inputs carried through the weights (the RMS over the axes: the formulas
+  above when everything is isotropic).
+* **Sent height in registration** (map.md §2, oms/2.4 P26; `AnchoredMap._height_z`). With
+  `height_above_floor_m` and `height_sigma_m` sent and a map floor (priors or a camera height),
+  the camera's z is measured as the floor plus the height, weighted by `height_sigma_m`: the map
+  floor is the base version's floor estimate (`AnchoredMap.map_floor`, at the job's start), z 0
+  on a first update. It joins the image pose and the prior (above) and, for a frame without a
+  prior, its image pose alone (`with_height`, MapAnything's poses too); the committed pose and
+  sigmas show it, and its displacement counts it. The height gate (below) then tests the frame's
+  image-only pose with that pose's calibrated sigma, so it still measures a disagreement; a frame
+  with no such term (the origin, a frame kept at its prior) is tested on its committed pose. On
+  the mapper's engine the poses are the mapper's (no per-frame refinement): no height term, the
+  gate on the committed pose.
+* **Prior tilt sigma** (map.md §1, oms/2.4 P26; `mapping.sigmas`). A prior's `sigma_tilt_deg`
+  weighs its pitch and roll, `sigma_rot_deg` its yaw: per axis in the fusion
+  (`sigmas.rotation_axes`, the map-frame rotation vector's x, y by the tilt sigma, z by the
+  rotation sigma); in every conflict bound as two tests, the yaw (the turn about +z bringing one
+  orientation nearest the other) against `sigma_rot_deg` and the tilt (the angle between the two
+  cameras' up directions) against `sigma_tilt_deg` (`sigmas.yaw_tilt`, `conflicts`, `distance`:
+  update, the drift fit's inliers and outliers, the near-prior hypothesis, locate's
+  `prior_conflict` and ranking); in the drift estimate, a drifting prior predicted through the
+  drift correction keeps its own pitch and roll by the weights of its tilt sigma and its
+  drift-grown rotation sigma (`anchored.level_toward`: the drift turns its yaw, not its gravity);
+  in the rotation check (map.md §1 "Priors against images"), the disagreement's yaw and tilt
+  each against the two priors' combined sigmas. A reported rotation sigma of such a prior (kept
+  at its prior, the origin) is the RMS of the three axes' sigmas. The mapper's engine applies it
+  to its anchors' χ (`anchor.chi`) and its prior-conflict test; its anchoring Procrustes still
+  weighs each anchor's rotation by one sigma (`sigma_rot_deg`), as it fits one similarity for
+  the whole map.
 * **Bare walls with depth.** A frame with a metric or drifting prior is not rejected `plain`,
   `blur` or `few_features` by the checks: it is kept at its prior, and its depth image never
   confirms it (api.md §4). Since oms/2.2 P10 a frame the images do not place is kept too, depth or
@@ -877,7 +919,43 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   (`Keyframe.contributes`), and `quality.height_inconsistent` lists it. σ_z is its committed
   position sigma along z: the reported 3-D RMS sigma over √3. A camera-only map without a camera
   height has no floor convention and no gate. On the mapper's engine the objects are the mapper's
-  own and are not gated.
+  own and are not gated. Since oms/2.4 the prior-first engine tests the image-only pose where the
+  sent height was a z measurement (above), and measures the height above the map floor
+  (`AnchoredMap.floor_z`) rather than above z 0.
+* **Floor check** (map.md §2, oms/2.4 P26; `anchored.floor_verdict`, `AnchoredMap.floor_check`).
+  A keyframe with a sent `height_above_floor_m` on a map with a floor has its own camera height
+  h_f measured in its own depth (map metres, as it would be fused) at its committed pose: the
+  large horizontal plane below the camera nearest the sent height H (`own_floor`:
+  `floor_candidates` on its points levelled by its rotation). Without such a plane, a height or a
+  floor, it is not checked; the height sigma defaults to 0.02 m (`DEFAULT_HEIGHT_SIGMA_M`).
+  * A depth image whose |h_f − H| exceeds 3 × sqrt(height_sigma² + (σ_depth · H)² + σ_z²)
+    (σ_depth `FLOOR_DEPTH_SIGMA_REL` = 0.01, the depth images' relative sigma; σ_z = the
+    committed `sigma_pos_m` / √3) gives no content.
+  * A monocular depth takes its own scale, k · H / h_f (its stored depth grid times H / h_f, the
+    factor fixed for good: `Keyframe.floor_factor`, so the map's later k does not move it), for its
+    cloud points, grid evidence, objects and keypoint depths; its input status reports it as
+    `depth_scale` (raw monocular depth to map metres). An own scale more than
+    `MONO_FLOOR_BOUND_REL` = 0.30 (3 × `MONOCULAR_SIGMA_REL`, the monocular scale bound) from k,
+    relative, gives no content.
+  * A frame the check excludes keeps its status, pose, sigmas and reference role; it is not fused,
+    its version row has `floor_inconsistent: true` (no occupancy, free space or heights from its
+    depth, `service.derived`), it gives no objects (`Keyframe.detects`), and
+    `quality.floor_inconsistent` lists it (a frame may also be in `height_inconsistent`). A
+    stored kept keyframe a job re-registers is checked at its confirmed pose. The cloud holds
+    the kept frames only, so the floor estimate and `floor_sigma_m` (below) come from them.
+  * The mapper's engine (`Updater._floor_off`) checks its registered frames on the mapper's
+    depth grid at their committed poses with the same rule; a frame it fails is left out of the
+    grid's evidence and listed, but the mapper's own cloud and objects (built in its process)
+    still hold it, its floor spread is the mapper's cloud's, and a monocular frame within the
+    bound is not rescaled (the mapper fits each keyframe's depth scale itself).
+  * On the client's stored map `task_map` version 10 (45 monocular keyframes, camera 0.339 m):
+    look008/009/039–041, whose monocular depth is about half the map's in one sector, land
+    their floor 0.15–0.22 m high; they are excluded, the frames whose floor is within the bound
+    are rescaled; the grid rebuilt from its stored keyframes (half resolution) has 4 occupied
+    cells within 1 m of the cameras on the empty floor instead of 244, and the SD of its flat
+    floor points' heights within 0.25 m of the floor falls from 0.061 to 0.028 m (their robust SD
+    stays 0.030 m: the sheets were outliers to it) (`tests/unit/test_round14.py`, measured on a
+    copy, 2026-11-12).
 * **Static image content** (map.md §1, `anchored.static_content`). Before registration, a feature
   whose image position stays within 2 px (`STATIC_PX`; its RootSIFT descriptor within 0.25,
   `STATIC_DESC`) across at least 3 frames of the job turned pairwise by more than 5°
@@ -1259,11 +1337,18 @@ server.
   (≤ 0.3 m), so the far floor between pixel rows counts as seen.
 * **A band.** A voxel is a surface when `hit ≥ 0.2 (hit + free)` — a thin panel (an open door
   leaf) hit from any view stays a surface unless rays saw through it four times as often —
-  unless it is floor-like: its centre within the floor band of the floor, max(0.06 m, 3 ×
-  `floor_sigma_m`) (`core.constants.floor_band_m`: `FLOOR_BAND_MIN_M`, `FLOOR_BAND_SIGMAS`), any
-  hit below the band's `z_min`, at least half its hits flat inside it. The band counts on both
+  unless it is floor-like: its surface height within the floor band of the floor, max(0.06 m, 3 ×
+  `floor_sigma_m`) (`core.constants.floor_band_m`: `FLOOR_BAND_MIN_M`, `FLOOR_BAND_SIGMAS`),
+  whatever its normals (oms/2.4: before, inside the height band at least half its hits had to be
+  flat, and the stencil's normals break at grazing angles and image borders). The band counts on both
   sides of `floor_z_m`, as "within" in map.md §5–§6 reads: the floor's own points lie on both
-  sides of its estimate; a surface lower than the band (a step down) is no floor. Walls — occupied structures ≥ 1.5 m long — grow by one cell
+  sides of its estimate; a surface lower than the band (a step down) is no floor. The surface
+  height is the mean height of the voxel's hits (oms/2.4 P26, map.md §6: by surface height, not
+  voxel centre; `Volume.hit_dz`, each frame's mean per voxel weighted as its hit count;
+  `Volume.surface_z`), so the band does not depend on where the floor falls on the 5 cm lattice
+  (before, a floor at +0.055 m lay in the voxel centred at 0.075 m, outside a 0.06 m band, and
+  became an obstacle); a volume derived before it (no `hit_dz`) keeps its voxel centres until a
+  stale frame rebuilds it. Walls — occupied structures ≥ 1.5 m long — grow by one cell
   where they are less than 4 cells thick (`navgrid.inflate_walls`): a wall's face lies anywhere
   in its cell, and a thin wall seen from both sides sits on a cell boundary. Passages and regions
   use the grid before that growth. A cell is `occupied` when a surface voxel's centre
@@ -1284,9 +1369,12 @@ server.
   z 0 (`FLOOR_BAND_SIGMAS`; `floor_sigma_m` that spread), else 0 (the mapper's engine: its floor
   when within 3 × its spread of 0, else 0); otherwise the lowest; without one, the lowest dense
   layer.
-  `floor_sigma_m` is the spread of the floor's own points about it (`anchored.floor_spread`: the
-  half width at half maximum of their heights within 0.12 m, `FLOOR_SPREAD_M`, as a normal
-  sigma), so the floor band holds the floor's noise and drift; 0.02 m
+  `floor_sigma_m` is a robust standard deviation of the floor's own points' heights
+  (`anchored.floor_spread`, oms/2.4 P26: 1.4826 × their median absolute deviation, over the
+  points within 0.12 m of the floor, `FLOOR_SPREAD_M`; before, the half width at half maximum of
+  their peak as a normal sigma, which a floor made of a few bad frames' sheets underestimated),
+  over the kept frames' points after the floor check (above), so the floor band holds the floor's
+  noise and drift; 0.02 m
   (`FLOOR_SIGMA_DEFAULT_M`) with fewer than 200 such points. The older mapper's records take the
   same spread of its cloud. A version recorded before oms/2.2 (no `floor_sigma_m`) keeps the
   earlier rule: of the peaks of the volume's flat points (1 cm bins, smoothed over 3) below the

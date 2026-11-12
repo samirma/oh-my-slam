@@ -224,16 +224,22 @@ class _MaRun:
                 p.sigma_pos_m or 0.0, p.sigma_rot_deg or 0.0, _has_depth(fr), None))
             # a call of a single anchor: never tighter than its floor (map.md §2 step 8)
             sr = max(sr, p.sigma_rot_floor)
+            f = _frame_in(fr, None)
+            # the sent camera height as a z measurement of its pose (map.md §2, oms/2.4)
+            image = (sp, sr)
+            T, sp, sr, ht = am.with_height(f, T, np.zeros((6, 6)), sp, sr)
             # its sigmas calibrated as every image pose's (``mapping.sigmas``; no prior); its
             # displacement (map.md §1): the committed pose against MapAnything's image-only
-            # one, 0 unless a standpoint turned it
+            # one, 0 unless a standpoint turned it or its height moved it
             pl = Placement(fr.work.name, "registered", None, T, round(sp, 4), round(sr, 3),
                            p.inliers, "rotation" if fr.work.index in turned else "mapanything",
                            align_T=p.T,
-                           map_residual=(0.0, round(rot_deg(T[:3, :3].T @ p.T[:3, :3]), 3)),
+                           map_residual=(round(float(np.linalg.norm(T[:3, 3] - p.T[:3, 3])), 4)
+                                         if ht else 0.0,
+                                         round(rot_deg(T[:3, :3].T @ p.T[:3, :3]), 3)),
+                           image_sigmas=image if ht else None, height_term=ht,
                            # its call's anchors (a seeded component's floor, ``_seed_floor``)
                            refs=tuple(self.kf_of.get(a, a) for a in p.anchors))
-            f = _frame_in(fr, None)
             h, w = p.depth.shape
             Kg = Intrinsics(float(p.K_depth[0, 0]), float(p.K_depth[1, 1]),
                             float(p.K_depth[0, 2]), float(p.K_depth[1, 2]), w, h)
@@ -395,20 +401,36 @@ def _depth_image(fr: _Frame) -> tuple[NDArray[np.float32], Intrinsics] | None:
     return d, K
 
 
-def _input(fr: _Frame, pl: Placement | None) -> dict[str, Any]:
-    """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed."""
+def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> dict[str, Any]:
+    """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed; a
+    monocular keyframe's own depth scale from the floor check (``depth_scale``, map.md §2)."""
     if pl is None:  # rejected by the checks
         return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
                          fr.scene_m, fr.duplicate_of)
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
     return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
-                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, pl.detail)
+                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, pl.detail,
+                     _depth_scale(am, pl))
+
+
+def _depth_scale(am: AnchoredMap | None, pl: Placement) -> float | None:
+    """A placed frame's own depth scale (``Keyframe.depth_scale``), None without one."""
+    k = None if am is None or pl.keyframe is None or pl.status == "rejected" \
+        else am.keyframe(pl.keyframe)
+    return None if k is None else k.depth_scale
+
+
+def _floor_off(am: AnchoredMap | None, pl: Placement) -> bool:
+    """Whether the floor check left a placed frame's keyframe out of content (map.md §2)."""
+    k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
+    return k is not None and not k.floor_ok
 
 
 def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
               sigma_pos_m: float | None, sigma_rot_deg: float | None,
               residual: tuple[float, float] | None, scene_m: float | None,
-              duplicate_of: str | None = None, detail: str | None = None) -> dict[str, Any]:
+              duplicate_of: str | None = None, detail: str | None = None,
+              depth_scale: float | None = None) -> dict[str, Any]:
     """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
     null without a prior, with reason ``too_close`` the distance limit and the frame's median
     scene depth, with reason ``duplicate`` the frame it duplicates, and ``detail`` (why the
@@ -427,6 +449,8 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
         row["scene_distance_m"] = round(scene_m if scene_m is not None else 0.0, 3)
     if reason == "duplicate":
         row["duplicate_of"] = duplicate_of or name
+    if depth_scale is not None and kept:  # the floor check's own scale (map.md §2, oms/2.4)
+        row["depth_scale"] = round(depth_scale, 5)
     return row
 
 
@@ -629,7 +653,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     job.progress = 0.95
     changed()
     t = time.perf_counter()
-    job.inputs = [_input(fr, placements.get(fr.work.index)) for fr in frames]
+    job.inputs = [_input(fr, placements.get(fr.work.index), am) for fr in frames]
     kept = [(fr, placements[fr.work.index]) for fr in todo
             if placements[fr.work.index].status != "rejected"]
     version = (prev["version"] + 1) if prev else 1
@@ -645,7 +669,10 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             # confirmation is in ``reregistered`` only, not in the gauge shift or the residuals
             rows.append({**r, "T_map_cam": k.T.tolist(), "sigma_pos_m": k.sigma_pos_m,
                          "sigma_rot_deg": k.sigma_rot_deg, "pose_state": "fused",
-                         "inliers": k.inliers, "method": k.method})
+                         "inliers": k.inliers, "method": k.method,
+                         # its gate and floor check at its confirmed pose (map.md §2)
+                         "height_inconsistent": not k.height_ok,
+                         "floor_inconsistent": not k.floor_ok})
             continue
         row = r if k is None else {**r, "T_map_cam": k.T.tolist()}
         shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
@@ -665,6 +692,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                      "content": _contributes(am, pl),
                      # the height gate (map.md §2): a reference, but no content
                      "height_inconsistent": _height_off(am, pl),
+                     # the floor check (map.md §2, oms/2.4): likewise
+                     "floor_inconsistent": _floor_off(am, pl),
                      # its camera height sigma (locate's height_sigma, api.md §6)
                      "height_sigma_m": _height_sigma(am, pl)})
     prior_res = [pose_residual(np.asarray(r["T_map_cam"]), np.asarray(r["prior"]["T_map_cam"]))
@@ -693,6 +722,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "prior_disagreement_deg": 0.0 if am is None else am.prior_disagreement_deg,
         "reregistered": [] if am is None else reregistered(am.reregistered),
         "height_inconsistent": [] if am is None else list(am.height_inconsistent),
+        "floor_inconsistent": [] if am is None else list(am.floor_inconsistent),
         "rotation_pairs": rotation_pairs,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats(shifts) if prev else None,

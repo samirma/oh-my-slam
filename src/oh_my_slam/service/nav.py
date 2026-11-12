@@ -20,7 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.mapping import anchor, checks, navgrid, relocalize
+from oh_my_slam.mapping import anchor, checks, navgrid, relocalize, sigmas
 from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
@@ -327,6 +327,7 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
         q.prior = np.asarray(p["T_map_cam"], np.float64)
         # its own sigmas, else its trust's defaults (api.md §3)
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
+        q.prior_sigma_tilt_deg = sigmas.tilt_sigma(p, anchor.MIN_SIGMA_ROT_DEG)
     # z_expected (api.md §6): the floor plus the frame's height above it, else its camera's
     # registered one; height_sigma the frame's own when it carries one, else the answer's
     # reference keyframes' (``relocalize.z_sigma``), else the README default

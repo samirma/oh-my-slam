@@ -65,6 +65,7 @@ from oh_my_slam.mapping.anchored import (
     duplicate_among,
     features,
     floor_spread,
+    floor_verdict,
     lowest_layer,
     natural_key,
 )
@@ -190,6 +191,10 @@ class _Frame:
     sigma_pos_m: float | None = None
     sigma_rot_deg: float | None = None
     prior_residual: tuple[float, float] | None = None
+    # the yaw and tilt (deg) of its prior residual's rotation (``anchor.residual_parts``): its
+    # prior's ``sigma_tilt_deg`` judges the tilt (map.md §1); None without
+    prior_tilt: tuple[float, float] | None = None
+    floor_off: bool = False  # registered, the floor check left its depth out (map.md §2)
 
 
 @dataclass
@@ -227,6 +232,11 @@ def _mat(T: Any) -> NDArray[np.float64]:
 
 def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
     return anchor.prior_sigmas(p)
+
+
+def _tilt(p: dict[str, Any] | None) -> float | None:
+    """A prior's ``sigma_tilt_deg`` (map.md §1, oms/2.4), floored as the anchors' rotation."""
+    return sigmas.tilt_sigma(p, anchor.MIN_SIGMA_ROT_DEG)
 
 
 def pose_sigmas(f: InternalFrame, scene_depth_m: float | None, align_rms_m: float,
@@ -691,7 +701,7 @@ class Updater:
             if p is None or p["trust"] == "none":
                 continue
             a = Anchor(fr.work.name, "prior" if p["trust"] == "metric" else "drifting",
-                       fr.internal.T, _mat(p["T_map_cam"]), *_prior_sigmas(p))
+                       fr.internal.T, _mat(p["T_map_cam"]), *_prior_sigmas(p), _tilt(p))
             if p["trust"] == "metric":
                 metric.append(a)
                 new_metric[fr.work.name] = a
@@ -704,6 +714,7 @@ class Updater:
             fr.pose = out.sim.pose(fr.internal.T)
             if fr.work.name in new_metric:
                 fr.prior_residual = anchor.residual(out.sim, new_metric[fr.work.name])
+                fr.prior_tilt = anchor.residual_parts(out.sim, new_metric[fr.work.name])
         out.drift_sim, out.drift_sigma, out.drift_support, out.drift_kept = \
             self._drift_estimate(placed, out.sim, prev)
         out.prior_disagreement_deg = self._prior_disagreement(placed, internal, out.sim)
@@ -849,7 +860,7 @@ class Updater:
             assert fr.internal is not None and fr.work.prior is not None
             anchors.append(Anchor(fr.work.name, "drifting", sim.pose(fr.internal.T),
                                   _mat(fr.work.prior["T_map_cam"]),
-                                  *_prior_sigmas(fr.work.prior)))
+                                  *_prior_sigmas(fr.work.prior), _tilt(fr.work.prior)))
         fit = anchor.fit(anchors)
         inl = [i for i, u in enumerate(fit.inliers) if u]
         sig = (math.sqrt(float(np.mean([anchors[i].sigma_pos_m ** 2 for i in inl])) / len(inl)),
@@ -873,6 +884,7 @@ class Updater:
             out, out_sigma, support = before, before_sigma, before_support
         for fr, a in zip(drift, anchors, strict=True):
             fr.prior_residual = anchor.residual(out or Sim3(), a)
+            fr.prior_tilt = anchor.residual_parts(out or Sim3(), a)
         return out, out_sigma, support, kept and before is not None
 
     @staticmethod
@@ -931,8 +943,11 @@ class Updater:
                 hyp = pose_sigmas(fr.internal, None if med is None else med * anchored.sim.s,
                                   0.0, _has_depth(fr), fr.work.trust)
                 dp, dr = fr.prior_residual
+                st = _tilt(fr.work.prior)
+                tilt = None if st is None or fr.prior_tilt is None else (*fr.prior_tilt, st)
                 if sigmas.conflicts(dp, dr, (max(sp, anchor.MIN_SIGMA_POS_M),
-                                             max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp):
+                                             max(sr, anchor.MIN_SIGMA_ROT_DEG)), hyp,
+                                    tilt=tilt):
                     # the images confirm the conflict only when its pose meets the
                     # measurable-pair threshold (api.md §4, P16; on this engine its mapper
                     # inliers, as its drift support); else it is kept at its prior,
@@ -1088,6 +1103,24 @@ class Updater:
         return dz > anchor.K_SIGMA * math.hypot(hs, fr.sigma_pos_m / math.sqrt(3.0))
 
     @staticmethod
+    def _floor_off(fr: _Frame, internal: InternalMap, sim: Sim3) -> bool:
+        """The floor check (map.md §2, oms/2.4; ``anchored.floor_verdict``) on a registered
+        frame of the mapper: its depth on the mapper's grid in map metres at its committed pose.
+        A frame it fails is left out of the grid's evidence (``derived``: occupancy, free space,
+        heights); the mapper's own cloud and objects, which its process builds, still hold it,
+        and a monocular frame the check keeps is not rescaled: the mapper fits each monocular
+        keyframe's depth scale itself (README, known limitations)."""
+        assert fr.internal is not None
+        d = internal.depth(fr.internal.name)
+        if d is None or fr.pose is None or fr.sigma_pos_m is None:
+            return False
+        depth = (np.asarray(d, np.float32) * np.float32(sim.s)).astype(np.float32)
+        K = fr.cam.canonical().resized(depth.shape[1], depth.shape[0])
+        hs = fr.work.height_sigma_m if fr.work.height_m is not None else fr.cam.height_sigma_m
+        return not floor_verdict("sensor" if _has_depth(fr) else "mono", _height(fr), hs,
+                                 fr.pose, fr.sigma_pos_m, depth, K).ok
+
+    @staticmethod
     def _previous_drift(prev: dict[str, Any] | None
                         ) -> tuple[Sim3 | None, tuple[float, float] | None,
                                    list[list[float]] | None]:
@@ -1116,6 +1149,8 @@ class Updater:
             sp, sr = drift_grown(fr.sigma_pos_m, fr.sigma_rot_deg, P, drift_sigma, drift_support)
             P = drift_sim.inverse().pose(P)
             fr.sigma_pos_m, fr.sigma_rot_deg = round(sp, 4), round(sr, 3)
+        # its pitch and roll by its tilt sigma (map.md §1): one rotation sigma over the axes
+        fr.sigma_rot_deg = round(sigmas.axes_rms(fr.sigma_rot_deg, _tilt(p)), 3)
         fr.pose = P
         fr.prior_residual = (0.0, 0.0)
 
@@ -1229,6 +1264,11 @@ class Updater:
             if fr.internal is not None and self._height_off(fr, floor):
                 fr.height_off = True
                 rows[fr.work.name]["height_inconsistent"] = True
+            if fr.internal is not None and (floor is not None
+                                            or anchored.origin_height_m is not None) \
+                    and self._floor_off(fr, internal, sim):
+                fr.floor_off = True
+                rows[fr.work.name]["floor_inconsistent"] = True
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "origin_height_m": anchored.origin_height_m,
                 # the drift estimate across versions (``_drifting_residuals``)
@@ -1282,6 +1322,7 @@ class Updater:
             # the mapper ties kept frames to no image: nothing re-registers them (map.md §2)
             "reregistered": [],
             "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
+            "floor_inconsistent": [fr.work.name for fr in registered if fr.floor_off],
             "rotation_pairs": list(rotation_pairs or []),
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),

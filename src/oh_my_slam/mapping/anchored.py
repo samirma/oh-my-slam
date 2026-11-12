@@ -30,7 +30,9 @@ in the priors' frame, and never re-posed:
     keyframes). Without enough lifted points, a rotation-only fit at the prior's centre, when
     that is within ``ROTATION_FALLBACK_M`` of a keyframe (without a prior: at the best-matched
     keyframe's centre);
-  * the image pose and the prior are combined by their sigmas (``fuse_poses``). Each frame so
+  * the image pose, the prior and the sent camera height are combined by their sigmas
+    (``fuse_measures``: the prior's pitch and roll by its ``sigma_tilt_deg`` when given; the
+    height a z measurement above the map floor, map.md §2 oms/2.4). Each frame so
     placed is a fixed reference for the frames placed after it in the same update.
 * **Origin.** The map frame is the priors' frame. While the map has no image-confirmed
   keyframe, the first frame with a prior in canonical order that passes the checks and is not
@@ -57,9 +59,15 @@ in the priors' frame, and never re-posed:
   never its depth (a frame kept for a failed check too); confirmed, its pose leaves
   ``kept_at_prior`` and it is fused (``reregistered``: name and displacement); otherwise it stays
   kept with its reason. Confirmed, it is a reference for the job's later rounds.
-* **Height gate** (map.md §2, ``height_consistent``). A frame whose committed camera height
+* **Height gate** (map.md §2, ``height_consistent``). A frame whose camera height (its
+  image-only pose's when the sent height was a z measurement of it, else its committed one)
   disagrees with the one sent beyond ``K_SIGMA`` × sqrt(height_sigma² + σ_z²) stays registered
   but gives no content (``Keyframe.height_ok``; ``height_inconsistent``).
+* **Floor check** (map.md §2, oms/2.4, ``floor_check``). A frame with a sent height whose own
+  depth holds a floor plane at its committed pose: a depth image whose floor disagrees with the
+  height beyond its bound gives no content; a monocular depth takes its own scale, H / h_f,
+  in place of the map's, and none when that lies beyond ``MONO_FLOOR_BOUND_REL`` of ``k``
+  (``Keyframe.floor_ok``; ``floor_inconsistent``; ``Keyframe.depth_scale``).
 * **Static image content** (map.md §1, ``static_content``). Features fixed in the image across
   three frames of the job turned pairwise by more than ``STATIC_ROT_DEG`` are left out of
   matching.
@@ -284,6 +292,11 @@ ALIGN_RANGE = (0.5, 2.0)
 # the depth scale's sigma that weighs PnP centres on monocular depth while nothing has measured
 # the scale: the monocular model's metres are off by up to this between scenes
 MONOCULAR_REGISTRATION_SIGMA_REL = 0.30  # raw monocular units: a camera this low tells no scale
+# the floor check (map.md §2, oms/2.4; README "Prior-first registration"): a depth image's relative
+# depth sigma at the floor (sigma_depth), and the relative bound on one monocular frame's own
+# depth scale against the map's (three monocular sigmas)
+FLOOR_DEPTH_SIGMA_REL = 0.01
+MONO_FLOOR_BOUND_REL = 3.0 * MONOCULAR_SIGMA_REL
 
 
 # -- small geometry -------------------------------------------------------------------------------
@@ -325,16 +338,92 @@ def pose_residual(A: Array, B: Array) -> tuple[float, float]:
     return (float(np.linalg.norm(A[:3, 3] - B[:3, 3])), rot_deg(A[:3, :3].T @ B[:3, :3]))
 
 
-def fuse_poses(A: Array, spa: float, sra: float, B: Array, spb: float, srb: float
-               ) -> tuple[Array, float, float]:
-    """The information-weighted mean of two independent pose estimates with isotropic sigmas:
-    centres weighted by ``1/sigma_pos²``, rotation interpolated on the geodesic by
-    ``1/sigma_rot²``; the sigmas of the mean."""
-    wa, wb = 1.0 / spa ** 2, 1.0 / spb ** 2
-    c = (A[:3, 3] * wa + B[:3, 3] * wb) / (wa + wb)
-    va, vb = 1.0 / sra ** 2, 1.0 / srb ** 2
-    R = exp_so3(log_so3(A[:3, :3] @ B[:3, :3].T) * va / (va + vb)) @ B[:3, :3]
-    return pose(R, c), 1.0 / math.sqrt(wa + wb), 1.0 / math.sqrt(va + vb)
+def _scaled_cov(cov: Array, sp: float, sr: float, centre: bool) -> Array:
+    """An image pose's covariance (rotation vector in rad, centre) brought to the sigmas it is
+    weighed or reported by: each block scaled so its mean per-axis variance is ``sr`` (deg) and
+    ``sp`` squared, the shape (and the correlation of height and pitch) kept; isotropic where a
+    block is degenerate. Without ``centre`` (a rotation-only pose) the centre block is
+    unmeasured (zero)."""
+    out = np.zeros((6, 6))
+    r = math.radians(sr)
+    tr = float(np.trace(cov[:3, :3]))
+    a = 3.0 * r ** 2 / tr if tr > 1e-18 else 0.0
+    out[:3, :3] = cov[:3, :3] * a if a else np.eye(3) * r ** 2
+    if centre:
+        tp = float(np.trace(cov[3:, 3:]))
+        b = 3.0 * sp ** 2 / tp if tp > 1e-18 else 0.0
+        out[3:, 3:] = cov[3:, 3:] * b if b else np.eye(3) * sp ** 2
+        if a and b:
+            out[:3, 3:] = cov[:3, 3:] * math.sqrt(a * b)
+            out[3:, :3] = out[:3, 3:].T
+    return out
+
+
+@dataclass
+class Measure:
+    """A Gaussian measurement of a pose about a base orientation and centre: the 6-vector (the
+    map-frame rotation vector in rad, the centre offset in m) it measures, the information it is
+    weighed by and its real covariance (for the reported sigmas), each 6 x 6."""
+
+    x: Array
+    info: Array
+    cov: Array
+
+
+def fuse_measures(R: Array, c: Array, ms: list[Measure]) -> tuple[Array, float, float]:
+    """The information-weighted mean of measurements of one pose about ``R``, ``c``
+    (``Measure``): its pose, and its position and rotation sigmas from the measurements' real
+    covariances through the weights (the RMS over the axes: one per-axis sigma, as the inputs
+    are). With two isotropic measurements the centre is their ``1/sigma²``-weighted mean, the
+    rotation the geodesic interpolation by ``1/sigma_rot²``, and each sigma
+    hypot(w·real_a, (1 − w)·real_b), w the share of the first."""
+    info = sum((m.info for m in ms), np.zeros((6, 6)))
+    P = np.linalg.pinv(info)
+    x = P @ sum((m.info @ m.x for m in ms), np.zeros(6))
+    C = sum(((P @ m.info) @ m.cov @ (P @ m.info).T for m in ms), np.zeros((6, 6)))
+    sp = math.sqrt(max(float(np.trace(C[3:, 3:])) / 3.0, 0.0))
+    sr = math.degrees(math.sqrt(max(float(np.trace(C[:3, :3])) / 3.0, 0.0)))
+    return pose(exp_so3(x[:3]) @ R, c + x[3:]), sp, sr
+
+
+def prior_measure(R: Array, c: Array, P: Array, sp: float, sr: float, st: float | None,
+                  real: tuple[float, float, float | None]) -> Measure:
+    """A pose prior ``P`` as a measurement about ``R``, ``c`` (``fuse_measures``): weighed by
+    ``sp`` and per axis by ``sigmas.rotation_axes`` (``sr``; pitch and roll by ``st``, its
+    ``sigma_tilt_deg``, when given: map.md §1); its real covariance from ``real`` (position,
+    rotation, tilt sigmas)."""
+    w = np.radians(sigmas.rotation_axes(sr, st))
+    v = np.radians(sigmas.rotation_axes(real[1], real[2]))
+    x = np.concatenate([log_so3(P[:3, :3] @ R.T), P[:3, 3] - c])
+    return Measure(x, np.diag(np.concatenate([1.0 / w ** 2, np.full(3, 1.0 / sp ** 2)])),
+                   np.diag(np.concatenate([v ** 2, np.full(3, real[0] ** 2)])))
+
+
+def tilt_measure(R: Array, P: Array, st: float, real: float) -> Measure:
+    """A prior's pitch and roll (``P``'s rotation, its ``sigma_tilt_deg`` ``st``) as a
+    measurement about ``R``: the map-frame rotation from ``R`` to ``P``'s gravity at ``R``'s
+    yaw, its x and y weighted by ``st`` (the real sigma ``real``); its yaw and centre
+    unmeasured."""
+    x = np.zeros(6)
+    # P's gravity at R's yaw (``level_toward``): the rotation between them is a tilt alone
+    x[:3] = log_so3(level_toward(R, P[:3, :3], 1.0) @ R.T)
+    info = np.zeros((6, 6))
+    info[0, 0] = info[1, 1] = 1.0 / math.radians(st) ** 2
+    cov = np.zeros((6, 6))
+    cov[0, 0] = cov[1, 1] = math.radians(real) ** 2
+    return Measure(x, info, cov)
+
+
+def height_measure(c: Array, z: float, sigma: float) -> Measure:
+    """The sent camera height as a measurement of the centre's z (map.md §2, oms/2.4): the
+    camera at ``z`` (the floor plus the height), weighted by its sigma."""
+    x = np.zeros(6)
+    x[5] = z - float(c[2])
+    info = np.zeros((6, 6))
+    info[5, 5] = 1.0 / sigma ** 2
+    cov = np.zeros((6, 6))
+    cov[5, 5] = sigma ** 2
+    return Measure(x, info, cov)
 
 
 def rays(K: Intrinsics, uv: NDArray[Any]) -> Array:
@@ -444,19 +533,18 @@ def horizontal_plane(q: Array, h0: float, band: float = FLOOR_BAND_REL
 
 
 def floor_spread(z: NDArray[Any], floor: float) -> float:
-    """``floor_sigma_m`` of a floor at ``floor`` among point heights ``z``: the spread
-    (standard deviation) of the floor's own points about its level, not the uncertainty of their
-    mean (map.md §6) (``reconstruction.gravity.floor_band``, the
-    floor's half thickness over ``FLOOR_BAND_SIGMAS``), so that the floor band of map.md §5-§6
+    """``floor_sigma_m`` of a floor at ``floor`` among point heights ``z`` (map.md §6 "Floor
+    sigma", oms/2.4): a robust standard deviation, 1.4826 × the median absolute deviation, of
+    the heights of the floor's points (those within ``FLOOR_SPREAD_M`` of its level), not a
+    half-width and not the uncertainty of their mean, so that the floor band of map.md §5-§6
     holds the floor's noise and drift; ``FLOOR_SIGMA_DEFAULT_M`` with fewer than
-    ``FLOOR_MIN_POINTS`` points within ``FLOOR_SPREAD_M`` of it."""
-    from oh_my_slam.reconstruction.gravity import FLOOR_BAND_SIGMAS, floor_band
-
+    ``FLOOR_MIN_POINTS`` such points. The points are the kept frames' (the floor check, map.md
+    §2, keeps the others out of the cloud)."""
     z = np.asarray(z, np.float64)
     near = z[np.isfinite(z) & (np.abs(z - floor) <= FLOOR_SPREAD_M)]
     if near.size < FLOOR_MIN_POINTS:
         return FLOOR_SIGMA_DEFAULT_M
-    return round(floor_band(near, floor, margin=FLOOR_SPREAD_M)[1] / FLOOR_BAND_SIGMAS, 4)
+    return round(1.4826 * float(np.median(np.abs(near - np.median(near)))), 4)
 
 
 def lowest_layer(z: NDArray[Any], below: float) -> float | None:
@@ -997,6 +1085,71 @@ def depth_confirmed(a: DepthRef, b: DepthRef, tol: float = SENSOR_DEPTH_TOL) -> 
     return True
 
 
+def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
+              ) -> float | None:
+    """A frame's own camera height above its floor (map.md §2 "Floor check"): among the large
+    horizontal planes below the camera in its depth (map metres) levelled by its rotation ``R``
+    (``floor_candidates``), the one nearest the ``expected`` height (relative). None without
+    one: no measurable floor plane."""
+    from oh_my_slam.reconstruction.pointcloud import pixel_points
+
+    ok = edge_free(depth)
+    if not ok.any():
+        return None
+    pts, _ = pixel_points(depth, K_grid, ok)
+    planes = floor_candidates(pts @ R.T)
+    return min(planes, key=lambda h: abs(math.log(h / expected))) if planes else None
+
+
+@dataclass
+class FloorCheck:
+    """A frame's floor check (``AnchoredMap.floor_check``): whether it keeps its content, the
+    factor its depth takes (a monocular frame's own scale over the map's: 1 otherwise) and the
+    own depth scale it reports (``depth_scale``, raw depth to map metres; None when none was
+    applied)."""
+
+    ok: bool = True
+    factor: float = 1.0
+    scale: float | None = None
+
+
+def floor_verdict(kind: str, height_m: float | None, height_sigma_m: float | None, T: Array,
+                  sigma_pos_m: float, depth: NDArray[np.float32], K_grid: Intrinsics,
+                  rel: float = 1.0) -> FloorCheck:
+    """The floor check (map.md §2, oms/2.4) of a frame's depth (map metres) at its committed
+    pose ``T``: with a sent height H and a measurable floor plane in its own depth
+    (``own_floor``) at height h_f,
+
+    * a depth image (``kind`` sensor) whose |h_f − H| exceeds ``K_SIGMA`` × sqrt(height_sigma² +
+      (σ_depth H)² + σ_z²) (σ_depth ``FLOOR_DEPTH_SIGMA_REL``, σ_z = ``sigma_pos_m`` / √3) gives
+      no content;
+    * a monocular depth takes its own scale, H / h_f times its depth (``FloorCheck.factor``;
+      ``rel``: its depth's scale over the map's monocular scale ``k``), in place of the map's; an
+      own scale more than ``MONO_FLOOR_BOUND_REL`` from ``k`` gives no content.
+
+    Not checked (kept as it is) without a height, a depth or such a plane; the height sigma
+    defaults to ``DEFAULT_HEIGHT_SIGMA_M``. The caller decides whether the map has a floor."""
+    if height_m is None or height_m <= 0 or kind == "none":
+        return FloorCheck()
+    h = own_floor(depth, K_grid, T[:3, :3], height_m)
+    if h is None:
+        return FloorCheck()
+    hs = height_sigma_m if height_sigma_m else DEFAULT_HEIGHT_SIGMA_M
+    if kind == "sensor":
+        bound = K_SIGMA * math.sqrt(hs ** 2 + (FLOOR_DEPTH_SIGMA_REL * height_m) ** 2
+                                    + sigma_pos_m ** 2 / 3.0)
+        if abs(h - height_m) > bound:
+            log.info("floor check: its own floor %.3f m below the camera, %.3f m sent", h,
+                     height_m)
+            return FloorCheck(False)
+        return FloorCheck()
+    factor = height_m / h
+    if abs(rel * factor - 1.0) > MONO_FLOOR_BOUND_REL:
+        log.info("floor check: its own depth scale %.3f times the map's", rel * factor)
+        return FloorCheck(False)
+    return FloorCheck(True, factor, factor)
+
+
 def depth_image(f: FrameIn) -> NDArray[np.float32] | None:
     """A frame's depth image (on its canonical pixels) with its ignored pixels holding none
     (map.md §2), or None without one."""
@@ -1050,6 +1203,23 @@ class Keyframe:
     # links to a confirmed keyframe outside it (``AnchoredMap._seed_floor``)
     seed: str | None = None
     seed_sigma: tuple[float, float] | None = None
+    # the floor check (map.md §2, oms/2.4; ``floor_check``): False keeps it registered and a
+    # reference but out of the cloud, occupancy, heights and objects. A monocular keyframe's
+    # stored depth grid over its raw depth (``grid_scale``: the map's k and its alignment, its
+    # own scale when the check gave one), and, once the check gave it its own scale, the factor
+    # its grid takes for good (``floor_factor``, in place of the map's scale change:
+    # ``AnchoredMap._depth_factor``)
+    floor_ok: bool = True
+    grid_scale: float | None = None
+    floor_factor: float | None = None
+
+    @property
+    def depth_scale(self) -> float | None:
+        """Its own depth scale from the floor check (raw depth to map metres: ``depth_scale``
+        of its input status, api.md §4), None when the check gave it none."""
+        if self.floor_factor is None or self.grid_scale is None:
+            return None
+        return self.grid_scale * self.floor_factor
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "camera_id": self.camera_id,
@@ -1061,7 +1231,9 @@ class Keyframe:
                 "height_m": self.height_m, "height_sigma_m": self.height_sigma_m,
                 "seed": self.seed,
                 "seed_sigma": None if self.seed_sigma is None else list(self.seed_sigma),
-                "K_grid": None if self.K_grid is None else self.K_grid.to_dict()}
+                "K_grid": None if self.K_grid is None else self.K_grid.to_dict(),
+                "floor_ok": self.floor_ok, "grid_scale": self.grid_scale,
+                "floor_factor": self.floor_factor}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1074,7 +1246,9 @@ class Keyframe:
                         height_ok=bool(d.get("height_ok", True)), height_m=d.get("height_m"),
                         height_sigma_m=d.get("height_sigma_m"), seed=d.get("seed"),
                         seed_sigma=None if d.get("seed_sigma") is None
-                        else (float(d["seed_sigma"][0]), float(d["seed_sigma"][1])))
+                        else (float(d["seed_sigma"][0]), float(d["seed_sigma"][1])),
+                        floor_ok=bool(d.get("floor_ok", True)),
+                        grid_scale=d.get("grid_scale"), floor_factor=d.get("floor_factor"))
 
     @property
     def centre(self) -> Array:
@@ -1090,8 +1264,8 @@ class Keyframe:
         """Depth content for the cloud, occupancy and heights (never scale evidence nor a
         reference): confirmed by the images, or the too-close exception (api.md §4) with a depth
         image (its depth inside ``DEPTH_VALID_RANGE_M``, at the prior pose: depth points come
-        only from a depth image); never a frame the height gate failed (``height_ok``, map.md
-        §2)."""
+        only from a depth image); never a frame the height gate or the floor check failed
+        (``height_ok``, ``floor_ok``, map.md §2)."""
         return self.detects() and (self.usable() or self.depth_kind == "sensor")
 
     def too_close_exception(self) -> bool:
@@ -1104,8 +1278,8 @@ class Keyframe:
         """Content for objects and ``detection_votes``: confirmed by the images, or the too-close
         exception whatever its depth (without a depth image its detections are placed on its
         monocular depth at the prior pose, as any monocular detection: api.md §4); never a frame
-        the height gate failed."""
-        return self.height_ok and (self.usable() or (
+        the height gate or the floor check failed."""
+        return self.height_ok and self.floor_ok and (self.usable() or (
             self.too_close_exception() and self.depth_kind != "none"))
 
 
@@ -1224,12 +1398,15 @@ class Drift:
                      tuple(d.get("fit_sigma", (0.0, 0.0))),  # type: ignore[arg-type]
                      [list(c) for c in d.get("support", [])])
 
-    def predict(self, P: Array, sigma_pos: float, sigma_rot: float
-                ) -> tuple[Array, float, float]:
+    def predict(self, P: Array, sigma_pos: float, sigma_rot: float,
+                sigma_tilt: float | None = None) -> tuple[Array, float, float]:
         """The map pose and drift-grown sigmas of a drifting prior ``P`` (map.md §1, P16):
         through the latest correction; the sigmas ``drift_grown`` from its supporting frames
         (a state written before they were kept: its reference). Without an estimate (the
-        identity), the prior as sent with its sigmas."""
+        identity), the prior as sent with its sigmas. With a tilt sigma (``sigma_tilt_deg``,
+        map.md §1 "Prior rotation sigma"), the prior's own pitch and roll (gravity) weigh
+        against the correction's by that sigma and the drift-grown rotation sigma
+        (``level_toward``): the drift moves its yaw, not its gravity."""
         if self.ref_T is None or self.ref_prior is None:
             return P.copy(), sigma_pos, sigma_rot
         D = np.linalg.inv(self.ref_prior) @ P
@@ -1237,7 +1414,10 @@ class Drift:
         support = [c for c in self.support if c not in self.fresh]
         sp, sr = drift_grown(sigma_pos, sigma_rot, P, self.fit_sigma,
                              support or [self.ref_prior[:3, 3].tolist()])
-        return self.ref_T @ D, sp, sr
+        T = self.ref_T @ D
+        if sigma_tilt is not None:
+            T[:3, :3] = level_toward(T[:3, :3], P[:3, :3], sr ** 2 / (sr ** 2 + sigma_tilt ** 2))
+        return T, sp, sr
 
     def confirm(self, T: Array, P: Array) -> None:
         """A drifting frame the images placed at ``T``: the new reference, and odometry scale
@@ -1256,6 +1436,17 @@ class Drift:
         if c not in self.support:  # no count bound (SI-19): each supporting frame once
             self.support = [*self.support, c]
             self.fresh = [*self.fresh, c]  # ... from the commit on (P19)
+
+
+def level_toward(R: Array, G: Array, gain: float) -> Array:
+    """``R`` with its pitch and roll moved toward ``G``'s by ``gain`` (0: ``R``, 1: ``G``'s tilt
+    at ``R``'s yaw): ``G`` turned about the map's +z onto ``R``'s yaw (``sigmas.yaw_tilt``'s
+    turn), then the geodesic share ``gain`` of the way from ``R`` to it."""
+    M = G @ R.T
+    psi = math.atan2(float(M[0, 1] - M[1, 0]), float(M[0, 0] + M[1, 1]))
+    target = exp_so3(np.array([0.0, 0.0, psi])) @ G
+    out: Array = exp_so3(log_so3(target @ R.T) * gain) @ R
+    return out
 
 
 def drift_grown(sigma_pos: float, sigma_rot: float, P: Array, fit_sigma: tuple[float, float],
@@ -1466,6 +1657,9 @@ class Placement:
     # (``measurable_pose``): when it fails the prior checks, the images confirm the conflict
     # (rejected ``prior_conflict``), else it is kept ``conflict_unsupported`` (api.md §4, P16)
     measurable: bool = False
+    # the sent camera height was a z measurement of its pose (map.md §2, oms/2.4): the height
+    # gate then tests its image-only pose (``align_T``, ``image_sigmas``)
+    height_term: bool = False
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -1504,16 +1698,15 @@ def _given_sigmas(p: dict[str, Any]) -> tuple[float, float]:
     return max(sp, REPORT_MIN_SIGMA_POS_M), max(sr, REPORT_MIN_SIGMA_ROT_DEG)
 
 
-def _combined(real_a: float, weight_a: float, real_b: float, weight_b: float) -> float:
-    """The sigma of the weighted mean of two independent estimates whose weights are
-    ``1/weight²`` and whose real sigmas are ``real_a``, ``real_b``."""
-    w = weight_b ** 2 / (weight_a ** 2 + weight_b ** 2)  # the share of estimate a
-    return math.hypot(w * real_a, (1.0 - w) * real_b)
-
-
 def _prior_sigmas(p: dict[str, Any]) -> tuple[float, float]:
     sp, sr = prior_sigmas(p)
     return max(sp, MIN_SIGMA_POS_M), max(sr, MIN_SIGMA_ROT_DEG)
+
+
+def _tilt_sigma(p: dict[str, Any] | None) -> float | None:
+    """A prior's ``sigma_tilt_deg`` (map.md §1 "Prior rotation sigma", oms/2.4), floored as its
+    rotation sigma; None without one."""
+    return sigmas.tilt_sigma(p, MIN_SIGMA_ROT_DEG)
 
 
 def _median(depth: NDArray[np.float32] | None) -> float | None:
@@ -1614,6 +1807,7 @@ class _DriftObs:
     sigma_image: tuple[float, float]
     rotation_only: bool
     pl: Placement
+    sigma_tilt: float | None = None  # its prior's ``sigma_tilt_deg`` (map.md §1)
 
 
 def _drift_inliers(d: Drift, obs: list[_DriftObs]) -> set[int]:
@@ -1621,9 +1815,10 @@ def _drift_inliers(d: Drift, obs: list[_DriftObs]) -> set[int]:
     drift-grown prior sigma and the image-only sigma; a rotation-only pose, the rotation)."""
     out = set()
     for o in obs:
-        T, sp, sr = d.predict(o.P, *o.sigma_prior)
+        T, sp, sr = d.predict(o.P, *o.sigma_prior, o.sigma_tilt)
         dp, dr = pose_residual(o.T, T)
-        if not sigmas.conflicts(dp, dr, (sp, sr), o.sigma_image, position=not o.rotation_only):
+        if not sigmas.conflicts(dp, dr, (sp, sr), o.sigma_image, position=not o.rotation_only,
+                                tilt=sigmas.tilt_of(o.T[:3, :3], T[:3, :3], o.sigma_tilt)):
             out.add(o.index)
     return out
 
@@ -1639,7 +1834,7 @@ def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[i
     for o in obs:
         if o.index in inliers:
             continue
-        T, sp, sr = d.predict(o.P, *o.sigma_prior)
+        T, sp, sr = d.predict(o.P, *o.sigma_prior, o.sigma_tilt)
         if o.pl.measurable:
             out[o.index] = Placement(o.name, "rejected", "prior_conflict", None, None, None,
                                      o.pl.inliers, o.pl.method, pose_residual(o.T, T),
@@ -1648,7 +1843,9 @@ def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[i
                                      inlier_share=o.pl.inlier_share, measurable=True)
         else:
             out[o.index] = Placement(o.name, "kept_at_prior", "no_overlap", T.copy(),
-                                     round(sp, 4), round(sr, 3), o.pl.inliers, "prior",
+                                     round(sp, 4),
+                                     round(sigmas.axes_rms(sr, o.sigma_tilt), 3),
+                                     o.pl.inliers, "prior",
                                      (0.0, 0.0), align_T=o.T.copy(),
                                      image_sigmas=o.sigma_image, has_prior=True,
                                      detail="conflict_unsupported",
@@ -1871,6 +2068,11 @@ class AnchoredMap:
         self.standpoint: Callable[[FrameIn, Features, Placement], Placement] | None = None
         # the last update's frames the height gate kept out of content (map.md §2)
         self.height_inconsistent: list[str] = []
+        # ... and those the floor check kept out (map.md §2, oms/2.4: ``floor_check``)
+        self.floor_inconsistent: list[str] = []
+        # the running job's map floor (``begin_job``): the sent camera height's z measurement
+        # is the floor plus that height (map.md §2); None without a floor convention
+        self.floor_z: float | None = None
         # while an update runs: the keyframes whose fusion waits for its end (``_fuse_later``)
         self._defer: list[tuple[Keyframe, NDArray[np.uint8], NDArray[np.bool_] | None,
                                 NDArray[np.float32], Intrinsics]] | None = None
@@ -2033,6 +2235,31 @@ class AnchoredMap:
         self._stored_ids = {k.id for k in self.keyframes}
         self._epi, self._placed = {}, {}
         self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
+        self.floor_z = self.map_floor()
+
+    def has_floor(self) -> bool:
+        """Whether the map has a floor convention (map.md §1, §6): priors fixed its frame, or a
+        camera-only map's first frame had a camera height."""
+        return self.created_with in ("metric", "drifting") or self.origin_height_m is not None
+
+    def map_floor(self) -> float | None:
+        """The floor a job's sent heights measure the cameras' z from (map.md §2 "Sent height in
+        registration"): the base version's floor estimate (``floor``), else the floor the map's
+        convention defines (z 0); None without a floor convention (a new map: decided by its
+        origin, ``_height_z``)."""
+        if not self.has_floor():
+            return None
+        z = self.floor()[0] if len(self.cloud.keys) else None
+        return 0.0 if z is None else z
+
+    def _height_z(self, f: FrameIn) -> tuple[float, float] | None:
+        """A frame's sent camera height as a z measurement (map.md §2, oms/2.4): the map floor
+        (``floor_z``; on a first update the floor its priors or camera height define, z 0) plus
+        the height, and its sigma; None without a height and its sigma, or without a floor."""
+        if f.height_m is None or f.height_sigma_m is None or f.height_m <= 0 \
+                or f.height_sigma_m <= 0 or not self.has_floor():
+            return None
+        return (self.floor_z or 0.0) + f.height_m, f.height_sigma_m
 
     def _epipolar(self, a: Features, Ka: Intrinsics, b: Features, Kb: Intrinsics,
                   min_matches: int = EPIPOLAR_MIN_MATCHES) -> Epipolar | None:
@@ -2065,7 +2292,7 @@ class AnchoredMap:
                 P = P.copy()
                 P[:3, 3] = self.origin_c + s_b * (P[:3, 3] - self.origin_c)
             return P, sp, sr
-        return self.drift.predict(P, sp, sr)
+        return self.drift.predict(P, sp, sr, _tilt_sigma(p))
 
     def prior_bias(self) -> float:
         """The metric priors' own scale bias, measured against image baselines whose scale the
@@ -2175,7 +2402,10 @@ class AnchoredMap:
 
     def _depth_factor(self, k: Keyframe) -> float:
         """What a keyframe's stored depth is multiplied by now: the depth scale's change since
-        it was fused (monocular keyframes only)."""
+        it was fused (monocular keyframes only), or, once the floor check gave it its own scale
+        (``Keyframe.floor_factor``, map.md §2), that scale's factor for good."""
+        if k.floor_factor is not None:
+            return k.floor_factor
         return self.scale.k / k.k_used if k.depth_kind == "mono" else 1.0
 
     def _scale_sigma(self, k: Keyframe) -> float:
@@ -2244,7 +2474,9 @@ class AnchoredMap:
         gp, gr = _given_sigmas(f.prior)
         if f.prior["trust"] == "drifting":
             _, gp, gr = self.drift.predict(np.asarray(f.prior["T_map_cam"], np.float64), gp, gr)
-        return _kept(f, T0, gp, gr, reason, n, scene_m, detail)
+        # its pitch and roll by its tilt sigma (map.md §1): one rotation sigma over the axes
+        return _kept(f, T0, gp, sigmas.axes_rms(gr, _tilt_sigma(f.prior)), reason, n, scene_m,
+                     detail)
 
     def candidates_for(self, f: FrameIn, descriptor: Any,
                        pred: tuple[Array, float, float] | None) -> list[Keyframe]:
@@ -2309,12 +2541,16 @@ class AnchoredMap:
                                        None)
             if method == "rotation":
                 rp = max(rp, UNANCHORED_SIGMA_POS_M)
-            # its committed pose is its image-only one (displacement 0) until a standpoint
-            # turns it (``standpoint``); its displacement counts the rotation only when that
-            # pose is unconstrained in translation (map.md §1)
-            return Placement(f.name, "registered", None, s.T, round(rp, 4), round(rr, 3), n,
+            # its committed pose is its image-only one (displacement 0) with the sent height's
+            # z measurement (map.md §2) until a standpoint turns it (``standpoint``); its
+            # displacement counts the rotation only when that pose is unconstrained in
+            # translation (map.md §1)
+            T, fsp, fsr, ht = self.with_height(f, s.T, s.cov, rp, rr)
+            return Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), n,
                              method, lifted=_lifted(corr),  # type: ignore[arg-type]
-                             align_T=s.T, map_residual=(0.0, 0.0),
+                             align_T=s.T,
+                             map_residual=_displacement(T, s.T, method == "rotation"),
+                             image_sigmas=(rp, rr) if ht else None, height_term=ht,
                              refs=_ref_ids(cands, sub[3][s.inliers]),
                              inlier_share=ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K),
                              unconstrained=method != "rotation" and self._unconstrained(
@@ -2343,7 +2579,8 @@ class AnchoredMap:
             ci = (spi, ci[1])
         share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
         measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
-        if sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only):
+        if sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only,
+                            tilt=sigmas.tilt_of(s.R, T0[:3, :3], _tilt_sigma(f.prior))):
             # beyond the combined bound (api.md §4, P16): the images confirm the conflict only
             # when its image-only pose meets the measurable-pair threshold, and no supported
             # hypothesis lies near the prior; else it is kept, its image-only pose (which may
@@ -2370,6 +2607,21 @@ class AnchoredMap:
         pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
         return pl
+
+    def with_height(self, f: FrameIn, T: Array, cov: Array, sp: float, sr: float
+                    ) -> tuple[Array, float, float, bool]:
+        """A frame's image pose ``T`` (covariance ``cov``, the shape its calibrated sigmas
+        ``sp``, ``sr`` scale; isotropic where it is none) with the sent camera height as a z
+        measurement (map.md §2, oms/2.4: ``_height_z``): the pose, its sigmas and whether the
+        height was used (unchanged without one)."""
+        hz = self._height_z(f)
+        if hz is None:
+            return T, sp, sr, False
+        R, c = T[:3, :3], T[:3, 3]
+        C = _scaled_cov(cov, sp, sr, True)
+        out, fsp, fsr = fuse_measures(R, c, [Measure(np.zeros(6), np.linalg.pinv(C), C),
+                                             height_measure(c, *hz)])
+        return out, fsp, fsr, True
 
     def _unconstrained(self, f: FrameIn, feats: Features, s: Solve, ref_of: NDArray[np.intp],
                        cands: list[Keyframe]) -> bool:
@@ -2416,7 +2668,9 @@ class AnchoredMap:
         dp, dr = pose_residual(s.T, T0)
         trust = None if f.prior is None else f.prior["trust"]
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
-        if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci) \
+        if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci,
+                                        tilt=sigmas.tilt_of(s.R, T0[:3, :3],
+                                                            _tilt_sigma(f.prior))) \
                 or not self.depth_confirms(f, s.T, sub[3][s.inliers], cands):
             return None
         return s, n, sub, refs
@@ -2449,44 +2703,61 @@ class AnchoredMap:
                   sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs, corr: _Corr,
                   cands: list[Keyframe], pred: tuple[Array, float, float], ref: Array
                   ) -> Placement:
-        """A frame with a prior that its image pose ``s`` confirms: the two combined."""
+        """A frame with a prior that its image pose ``s`` confirms: the image pose, the prior and
+        the sent camera height (a z measurement, map.md §2 oms/2.4: ``_height_z``) combined by
+        their weights (``fuse_measures``): the image pose by its covariance's shape (the
+        height-pitch trade of a turning camera) at its calibrated sigmas, the prior per axis
+        (``sigmas.rotation_axes``: pitch and roll by its ``sigma_tilt_deg`` when given, map.md
+        §1), ``metric`` and ``drifting`` priors alike against the image pose's calibrated sigmas
+        (map.md §1: calibrated sigmas mean the same thing)."""
         assert f.prior is not None
         T0, sp0, sr0 = pred
         rot_only = method == "rotation"
         metric = f.prior["trust"] == "metric"
+        st0 = _tilt_sigma(f.prior)
         # the image pose's calibrated sigmas (``mapping.sigmas``): its covariance with the depth
         # bias it does not see and the image-registration noise of its data kind
         rp, rr = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
                                    f.prior["trust"])
+        # a prior is weighed against the image pose's real uncertainty: depth images
+        # misregistered to the colour, monocular depth, a few references — far more than the
+        # covariance of hundreds of correlated matches says; a metric prior against at least
+        # the documented image floors
+        spi, sri = max(spi, rp), max(sri, rr)
         if metric:
-            # a metric prior is weighed against the image pose's real uncertainty: depth
-            # images misregistered to the colour, monocular depth, a few references — far more
-            # than the covariance of hundreds of correlated matches says
-            spi = max(spi, METRIC_IMAGE_SIGMA_POS_M, rp)
-            sri = max(sri, METRIC_IMAGE_SIGMA_ROT_DEG, rr)
-        # the reported sigmas: the calibrated image sigmas combined with the prior's own as the
-        # estimate combines them
-        gp, gr = _given_sigmas(f.prior)
+            spi = max(spi, METRIC_IMAGE_SIGMA_POS_M)
+            sri = max(sri, METRIC_IMAGE_SIGMA_ROT_DEG)
+        # the reported sigmas: the calibrated image sigmas combined with the prior's own (as
+        # given for a metric prior, drift-grown for a drifting one) as the estimate combines them
+        gp, gr = _given_sigmas(f.prior) if metric else (sp0, sr0)
+        gt = None if st0 is None else max(st0, REPORT_MIN_SIGMA_ROT_DEG)
+        R_img, c_img = s.R, (T0[:3, 3].copy() if rot_only else s.c)
+        hz = self._height_z(f)
         if metric:
-            img_T = s.T
-            if rot_only:
-                img_T[:3, 3] = T0[:3, 3]
-            T, _, _ = fuse_poses(img_T, spi, sri, T0, sp0, sr0)
-            fsp = gp if rot_only else _combined(rp, spi, gp, sp0)
-            fsr = _combined(rr, sri, gr, sr0)
+            w = np.linalg.pinv(_scaled_cov(s.cov, spi, sri, not rot_only))
+            ms = [Measure(np.zeros(6), w, _scaled_cov(s.cov, rp, rr, not rot_only)),
+                  prior_measure(R_img, c_img, T0, sp0, sr0, st0, (gp, gr, gt))]
         else:
-            # the frame refined on its matches and its prior together (stored poses fixed)
-            fused, _ = refine_pose(s.R, T0[:3, 3].copy() if rot_only else s.c, *sub, refs, f.K,
-                                   prior=(T0, sp0, sr0))
-            T = fused.T
-            fsp = sp0 if rot_only else 1.0 / math.sqrt(1.0 / rp ** 2 + 1.0 / sp0 ** 2)
-            fsr = 1.0 / math.sqrt(1.0 / rr ** 2 + 1.0 / sr0 ** 2)
+            # a drifting prior: the frame refined on its matches and its prior together (stored
+            # poses fixed), its sigmas the calibrated image sigmas combined with the prior's;
+            # then its prior's pitch and roll (``sigma_tilt_deg``) and its sent height
+            fused, _ = refine_pose(s.R, c_img.copy(), *sub, refs, f.K, prior=(T0, sp0, sr0))
+            R_img, c_img = fused.R, fused.c
+            jp = sp0 if rot_only else 1.0 / math.sqrt(1.0 / rp ** 2 + 1.0 / sp0 ** 2)
+            jr = 1.0 / math.sqrt(1.0 / rr ** 2 + 1.0 / sr0 ** 2)
+            C = _scaled_cov(fused.cov, jp, jr, True)
+            ms = [Measure(np.zeros(6), np.linalg.pinv(C), C)]
+            if st0 is not None:
+                ms.append(tilt_measure(R_img, T0, st0, gt or st0))
+        if hz is not None:
+            ms.append(height_measure(c_img, *hz))
+        T, fsp, fsr = fuse_measures(R_img, c_img, ms)
         pl = Placement(f.name, "registered", None, T, round(max(fsp, REPORT_MIN_SIGMA_POS_M), 4),
                        round(max(fsr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, method,
                        pose_residual(T, ref),
                        lifted=_lifted(corr), align_T=s.T,  # type: ignore[arg-type]
                        map_residual=_displacement(T, s.T, rot_only), prior_ref=ref,
-                       image_sigmas=(rp, rr), has_prior=True)
+                       image_sigmas=(rp, rr), has_prior=True, height_term=hz is not None)
         if method == "pnp":
             ev = functools.partial(self._scale_evidence, s,
                                    np.asarray(f.prior["T_map_cam"], np.float64),
@@ -2566,31 +2837,82 @@ class AnchoredMap:
         return (d * self.scale.k).astype(np.float32), Kg, "mono", desc
 
     def height_consistent(self, f: FrameIn, pl: Placement) -> bool:
-        """The height gate (map.md §2) of a placed frame (``height_gate``)."""
-        return self.height_gate(f.height_m, f.height_sigma_m, pl.T, pl.sigma_pos_m)
+        """The height gate (map.md §2) of a placed frame (``height_gate``): on its image-only
+        pose and that pose's calibrated sigma when the sent height was a z measurement of it
+        (``Placement.height_term``: the gate still measures a disagreement), else on its
+        committed pose."""
+        return self.placement_gate(f.height_m, f.height_sigma_m, pl)
+
+    def placement_gate(self, height_m: float | None, height_sigma_m: float | None,
+                       pl: Placement) -> bool:
+        """``height_consistent`` with the height and its sigma given."""
+        if pl.height_term and pl.align_T is not None and pl.image_sigmas is not None:
+            return self.height_gate(height_m, height_sigma_m, pl.align_T, pl.image_sigmas[0])
+        return self.height_gate(height_m, height_sigma_m, pl.T, pl.sigma_pos_m)
 
     def height_gate(self, height_m: float | None, height_sigma_m: float | None,
                     T: Array | None, sigma_pos_m: float | None) -> bool:
         """The height gate (map.md §2): with ``height_above_floor_m`` and ``height_sigma_m``
-        sent, whether the frame's committed camera height (its centre's z: the map's floor is
-        z 0 when priors or a camera height fixed the frame, map.md §1) agrees with the one sent
+        sent, whether the frame's camera height (its centre's z over the map floor,
+        ``floor_z``: about z 0 when priors or a camera height fixed the frame, map.md §1) agrees
+        with the one sent
         within ``K_SIGMA`` × sqrt(height_sigma² + σ_z²), σ_z = ``sigma_pos_m`` / √3 (its
         committed position sigma being 3-D RMS). True when nothing is sent or the map has no
         floor convention (a camera-only map without a camera height)."""
         if height_m is None or height_sigma_m is None or T is None or sigma_pos_m is None:
             return True
-        if self.created_with not in ("metric", "drifting") and self.origin_height_m is None:
+        if not self.has_floor():
             return True
         sz = sigma_pos_m / math.sqrt(3.0)
-        return abs(float(T[2, 3]) - height_m) <= K_SIGMA * math.hypot(height_sigma_m, sz)
+        dz = float(T[2, 3]) - (self.floor_z or 0.0) - height_m
+        return abs(dz) <= K_SIGMA * math.hypot(height_sigma_m, sz)
+
+    def floor_check(self, kind: str, height_m: float | None, height_sigma_m: float | None,
+                    T: Array, sigma_pos_m: float, depth: NDArray[np.float32], K_grid: Intrinsics,
+                    raw_scale: float) -> FloorCheck:
+        """The floor check (``floor_verdict``) of a keyframe's depth (map metres as it would be
+        fused, ``raw_scale`` times its raw monocular depth) on a map with a floor convention: a
+        monocular depth's own scale reported raw depth to map metres."""
+        if not self.has_floor():
+            return FloorCheck()
+        chk = floor_verdict(kind, height_m, height_sigma_m, T, sigma_pos_m, depth, K_grid,
+                            raw_scale / self.scale.k)
+        if chk.scale is not None:
+            chk.scale = raw_scale * chk.factor
+        return chk
+
+    def _floor_out(self, kf: Keyframe) -> None:
+        """A keyframe the floor check left out of content, listed (``floor_inconsistent``)."""
+        if not kf.floor_ok and kf.name not in self.floor_inconsistent:
+            self.floor_inconsistent.append(kf.name)
+
+    def _recheck_floor(self, kf: Keyframe) -> None:
+        """The floor check of a stored keyframe at the pose a job confirmed it at (re-registered
+        or retried): its depth grid as it stands, a monocular one's own scale then its grid's
+        factor (``floor_factor``)."""
+        ref = self._grid(kf)
+        if ref is None or kf.K_grid is None:
+            return
+        cur = self._depth_factor(kf)
+        raw = (kf.grid_scale or kf.k_used) * cur if kf.depth_kind == "mono" else 1.0
+        chk = self.floor_check(kf.depth_kind, kf.height_m, kf.height_sigma_m, kf.T,
+                               kf.sigma_pos_m, ref.depth, kf.K_grid, raw)
+        kf.floor_ok = chk.ok
+        if chk.scale is not None:
+            kf.grid_scale, kf.floor_factor = kf.grid_scale or kf.k_used, cur * chk.factor
+        self._floor_out(kf)
 
     def add(self, f: FrameIn, feats: Features, pl: Placement, depth: NDArray[np.float32],
-            K_grid: Intrinsics, kind: str, descriptor: Any) -> Keyframe:
+            K_grid: Intrinsics, kind: str, descriptor: Any, raw_scale: float | None = None
+            ) -> Keyframe:
         """Keep a placed frame as a keyframe and, when the images confirmed it, fuse it into the
         cloud (a frame kept at its prior is stored, not fused: map.md §2). A frame the height
         gate fails (``height_consistent``) stays a reference but gives no content, and is
-        listed in ``height_inconsistent``. While an update runs, the fusion waits for its end
-        (``update``: a frame registered there may still be dropped)."""
+        listed in ``height_inconsistent``; so does one the floor check fails (``floor_check``,
+        listed in ``floor_inconsistent``), and a monocular one it keeps takes its own depth
+        scale (``raw_scale``: its ``depth`` over its raw monocular depth; the map's ``k`` by
+        default). While an update runs, the fusion waits for its end (``update``: a frame
+        registered there may still be dropped)."""
         assert pl.T is not None and pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
         seed = self._seed_floor(pl) if pl.status == "registered" else None
         kid = f"k{self.next_id:06d}"
@@ -2600,9 +2922,16 @@ class AnchoredMap:
             prior = {"trust": f.prior["trust"], "T": np.asarray(f.prior["T_map_cam"]).tolist(),
                      "sigma_pos_m": _prior_sigmas(f.prior)[0],
                      "sigma_rot_deg": _prior_sigmas(f.prior)[1]}
+            if _tilt_sigma(f.prior) is not None:
+                prior["sigma_tilt_deg"] = _tilt_sigma(f.prior)
         ignore = on_grid(f.ignore, depth.shape)
         if ignore is not None:  # no depth point there: no cloud, occupancy, free space or floor
             depth = np.where(ignore, 0.0, depth).astype(np.float32)
+        raw = (self.scale.k if raw_scale is None else raw_scale) if kind == "mono" else 1.0
+        chk = self.floor_check(kind, f.height_m, f.height_sigma_m, pl.T, pl.sigma_pos_m, depth,
+                               K_grid, raw)
+        if chk.scale is not None:  # its own depth scale (map.md §2): its stored grid takes it
+            depth = (depth * chk.factor).astype(np.float32)
         valid = depth[np.isfinite(depth) & (depth > 0)]
         kf = Keyframe(kid, f.name, f.camera_id, f.K, pl.T.copy(), pl.sigma_pos_m,
                       pl.sigma_rot_deg, "provisional" if pl.status == "kept_at_prior" else "fused",
@@ -2620,6 +2949,12 @@ class AnchoredMap:
         kf.height_ok = self.height_consistent(f, pl)
         if not kf.height_ok:
             self.height_inconsistent.append(f.name)
+        if kind == "mono":
+            kf.grid_scale = raw * chk.factor
+            kf.floor_factor = None if chk.scale is None else 1.0
+        kf.floor_ok = chk.ok
+        if pl.status == "registered" or kf.too_close_exception():
+            self._floor_out(kf)  # only a frame that would give content is listed
         self.keyframes.append(kf)
         self._added.append(kf)
         pl.keyframe = kid
@@ -2764,6 +3099,7 @@ class AnchoredMap:
             passes += 1
             self.drift = copy.deepcopy(used)
             self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = 0.0, [], []
+            self.floor_inconsistent = []
             self._defer = list(snap["defer"] or [])
             out = self._register_job(frames, prep, {**forced, **excluded}, progress)
             if final:  # the last pass applies the last fit's outliers
@@ -2852,12 +3188,14 @@ class AnchoredMap:
             kf = self.keyframe(kid)
             assert kf is not None
             (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg, kf.state, kf.method, kf.inliers, kf.rgb,
-             kf.reason, kf.height_ok, kf.seed, kf.seed_sigma) = self._rereg_state[kid]
+             kf.reason, kf.height_ok, kf.seed, kf.seed_sigma,
+             (kf.floor_ok, kf.grid_scale, kf.floor_factor)) = self._rereg_state[kid]
         self.reregistered = [e for e in self.reregistered if e["keyframe"] not in again]
         drop = gone - again
         self.keyframes = [k for k in self.keyframes if k.id not in drop]
         self._added = [k for k in self._added if k.id not in drop]
         self.height_inconsistent = [n for n in self.height_inconsistent if n not in dups]
+        self.floor_inconsistent = [n for n in self.floor_inconsistent if n not in dups]
         return {n: pl for n, pl in dups.items() if pl.keyframe not in again}, gone
 
     def _dup_effects(self, dups: dict[str, Placement], pls: list[Placement]) -> bool:
@@ -2952,12 +3290,13 @@ class AnchoredMap:
                 "origin": (self.created_with, self.origin_c, self.origin_height_m,
                            self.up_check_deg),
                 "report": (self.prior_disagreement_deg, list(self.reregistered),
-                           list(self.height_inconsistent)),
+                           list(self.height_inconsistent), list(self.floor_inconsistent)),
                 "defer": None if self._defer is None else list(self._defer),
                 "job": (set(self._evidence_from), copy.deepcopy(self._rereg_by),
                         dict(self._rereg_state)),
                 "stored": [(k, k.T.copy(), k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method,
-                            k.inliers, k.rgb, k.reason, k.height_ok, k.seed, k.seed_sigma)
+                            k.inliers, k.rgb, k.reason, k.height_ok, k.seed, k.seed_sigma,
+                            (k.floor_ok, k.grid_scale, k.floor_factor))
                            for k in self.keyframes]}
 
     def _restore(self, snap: dict[str, Any]) -> None:
@@ -2965,17 +3304,19 @@ class AnchoredMap:
         self.next_id, self.bias = snap["next_id"], list(snap["bias"])
         self.scale, self.drift = copy.deepcopy(snap["scale"]), copy.deepcopy(snap["drift"])
         self.created_with, self.origin_c, self.origin_height_m, self.up_check_deg = snap["origin"]
-        d, r, h = snap["report"]
+        d, r, h, fi = snap["report"]
         self.prior_disagreement_deg, self.reregistered, self.height_inconsistent = \
             d, list(r), list(h)
+        self.floor_inconsistent = list(fi)
         self._defer = None if snap["defer"] is None else list(snap["defer"])
         ev, by, st = snap["job"]
         self._evidence_from, self._rereg_by, self._rereg_state = set(ev), copy.deepcopy(by), \
             dict(st)
-        for k, T, sp, sr, state, method, n, rgb, reason, h_ok, seed, seed_s in snap["stored"]:
+        for k, T, sp, sr, state, method, n, rgb, reason, h_ok, seed, seed_s, fl in snap["stored"]:
             k.T, k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method = T.copy(), sp, sr, state, method
             k.inliers, k.rgb, k.reason, k.height_ok = n, rgb, reason, h_ok
             k.seed, k.seed_sigma = seed, seed_s
+            k.floor_ok, k.grid_scale, k.floor_factor = fl
 
     def _keep(self, f: FrameIn, pr: _Prep, pl: Placement,
               progress: Callable[[str], None]) -> Keyframe:
@@ -2984,6 +3325,7 @@ class AnchoredMap:
         and, registered with a depth image, its depth's residual against the map."""
         t = time.perf_counter()
         depth, Kg, kind, desc = self._keyframe_depth(f)
+        raw = self.scale.k  # a monocular depth over its raw depth (``add``)
         if not self.keyframes and self.created_with != "none" and f.mono is not None:
             self._up_check(f, pl)
         if kind == "sensor" and pl.status == "registered" and pl.lifted is not None:
@@ -3004,6 +3346,7 @@ class AnchoredMap:
                                     *pl.lifted, depth, Kg, f.K)
                 if a is not None:
                     depth = (depth * a).astype(np.float32)
+                    raw *= a
                     self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
                     del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
                     self._evidence_from.add(f.name)
@@ -3013,7 +3356,8 @@ class AnchoredMap:
             k = self.scale.k
             self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
             depth = (depth * (self.scale.k / k)).astype(np.float32)
-        kf = self.add(f, pr.feats, pl, depth, Kg, kind, desc)
+            raw *= self.scale.k / k
+        kf = self.add(f, pr.feats, pl, depth, Kg, kind, desc, raw)
         progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
         self._keep_s += time.perf_counter() - t
         return kf
@@ -3168,9 +3512,16 @@ class AnchoredMap:
             for k in self.keyframes:
                 if k.seed is not None and k.seed == kf.id:
                     k.seed = k.seed_sigma = None
-        kf.height_ok = self.height_gate(kf.height_m, kf.height_sigma_m, kf.T, kf.sigma_pos_m)
+        kf.height_ok = self.height_consistent(f, pl)
         self.height_inconsistent = [n for n in self.height_inconsistent if n != kf.name] + (
             [] if kf.height_ok else [kf.name])
+        # the floor check at its image pose (map.md §2): its depth as it waits for its fusion
+        assert kf.grid is not None and kf.K_grid is not None  # a job's keyframe (``add``)
+        kf.floor_ok = self.floor_check(kf.depth_kind, f.height_m, f.height_sigma_m, kf.T,
+                                       kf.sigma_pos_m, kf.grid, kf.K_grid,
+                                       kf.grid_scale or 1.0).ok
+        self.floor_inconsistent = [n for n in self.floor_inconsistent if n != kf.name]
+        self._floor_out(kf)
         pl.keyframe = kf.id
         log.info("%s: a component's seed, placed by its images now (%s)", f.name, pl.method)
         return pl
@@ -3266,7 +3617,8 @@ class AnchoredMap:
             else:
                 continue
             obs.append(_DriftObs(i, f.name, T, np.asarray(f.prior["T_map_cam"], np.float64),
-                                 _prior_sigmas(f.prior), sh, pl.method == "rotation", pl))
+                                 _prior_sigmas(f.prior), sh, pl.method == "rotation", pl,
+                                 _tilt_sigma(f.prior)))
         return obs
 
     def _fit_drift(self, frames: list[FrameIn], out: dict[int, Placement], used: Drift
@@ -3355,7 +3707,8 @@ class AnchoredMap:
             if f.unconfirmed is not None or close:
                 return self.kept_at(f, f.unconfirmed or "too_close", 0,
                                     scene if f.unconfirmed is None else None)
-            return Placement(f.name, "registered", None, P, sp, sr, 0, "origin", (0.0, 0.0),
+            return Placement(f.name, "registered", None, P, sp,
+                             sigmas.axes_rms(sr, _tilt_sigma(p)), 0, "origin", (0.0, 0.0),
                              has_prior=True)
         if close:  # an origin has no inliers: too close, it cannot be registered
             return Placement(f.name, "rejected", "too_close", scene_m=scene)
@@ -3413,7 +3766,8 @@ class AnchoredMap:
             self._rereg_by[kf.id] = {by, *pl.refs}
             self._rereg_state[kf.id] = (kf.T.copy(), kf.sigma_pos_m, kf.sigma_rot_deg,
                                         kf.state, kf.method, kf.inliers, kf.rgb, kf.reason,
-                                        kf.height_ok, kf.seed, kf.seed_sigma)
+                                        kf.height_ok, kf.seed, kf.seed_sigma,
+                                        (kf.floor_ok, kf.grid_scale, kf.floor_factor))
             assert pl.T is not None and pl.sigma_pos_m is not None \
                 and pl.sigma_rot_deg is not None
             seed = self._seed_floor(pl)  # through a seeded component: its floor
@@ -3425,10 +3779,13 @@ class AnchoredMap:
             kf.state, kf.method, kf.inliers = "fused", pl.method or "pnp", pl.inliers
             kf.rgb, kf.reason = rgb, None
             kf.seed, kf.seed_sigma = seed or (None, None)
-            # the height gate at its confirmed pose (map.md §2)
-            kf.height_ok = self.height_gate(kf.height_m, kf.height_sigma_m, kf.T, kf.sigma_pos_m)
+            # the height gate at its confirmed pose (map.md §2; its image-only pose when its
+            # sent height was a z measurement of it)
+            kf.height_ok = self.placement_gate(kf.height_m, kf.height_sigma_m, pl)
             if not kf.height_ok and kf.name not in self.height_inconsistent:
                 self.height_inconsistent.append(kf.name)
+            if not had:  # the floor check at its confirmed pose (map.md §2)
+                self._recheck_floor(kf)
             ref = self._grid(kf)
             if not had and ref is not None and kf.depth_kind != "none" and kf.K_grid is not None:
                 self._fuse_later(kf, rgb, None, ref.depth, kf.K_grid)
@@ -3503,9 +3860,10 @@ class AnchoredMap:
         kf.state, kf.method, kf.inliers = "fused", pl.method or "pnp", pl.inliers
         kf.reason = None
         kf.seed, kf.seed_sigma = seed or (None, None)
-        kf.height_ok = self.height_gate(kf.height_m, kf.height_sigma_m, kf.T, kf.sigma_pos_m)
+        kf.height_ok = self.height_consistent(f, pl)  # its image-only pose, with a height term
         if not kf.height_ok and kf.name not in self.height_inconsistent:
             self.height_inconsistent.append(kf.name)
+        self._recheck_floor(kf)  # the floor check at its confirmed pose (map.md §2)
         ref = self._grid(kf)
         if ref is not None and kf.K_grid is not None and kf.depth_kind != "none":
             self._fuse_later(kf, f.rgb, f.ignore, ref.depth, kf.K_grid)
@@ -3554,8 +3912,10 @@ class AnchoredMap:
         rgb = np.asarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), np.uint8)
         prior = {"trust": kf.prior["trust"], "T_map_cam": kf.prior["T"],
                  "sigma_pos_m": kf.prior["sigma_pos_m"], "sigma_rot_deg": kf.prior["sigma_rot_deg"]}
-        f = FrameIn(kf.name, kf.camera_id, rgb, kf.K, prior, None,
-                    features_count=len(kf.feats.kps))
+        if kf.prior.get("sigma_tilt_deg") is not None:
+            prior["sigma_tilt_deg"] = kf.prior["sigma_tilt_deg"]
+        f = FrameIn(kf.name, kf.camera_id, rgb, kf.K, prior, None, height_m=kf.height_m,
+                    height_sigma_m=kf.height_sigma_m, features_count=len(kf.feats.kps))
         pl = self.place(f, kf.feats, kf.descriptor, (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg))
         # its registration re-run whole, the distance limit included (as ``_rounds``: only
         # image feature inliers count toward ``TOO_CLOSE_INLIERS``)
@@ -3626,7 +3986,7 @@ class AnchoredMap:
         assert f.prior is not None and pl.T is not None and pl.align_T is not None \
             and pl.lifted is not None
         P = np.asarray(f.prior["T_map_cam"], np.float64)
-        sr = _prior_sigmas(f.prior)[1]
+        sr, st = _prior_sigmas(f.prior)[1], _tilt_sigma(f.prior)
         for g, q, gf in mine:
             assert g.prior is not None and q.T is not None and q.align_T is not None \
                 and q.lifted is not None
@@ -3637,7 +3997,16 @@ class AnchoredMap:
             img_rel = q.align_T[:3, :3].T @ pl.align_T[:3, :3]
             dis = rot_deg(img_rel.T @ (Q[:3, :3].T @ P[:3, :3]))
             self.prior_disagreement_deg = max(self.prior_disagreement_deg, round(dis, 3))
-            if dis > K_SIGMA * math.hypot(sr, _prior_sigmas(g.prior)[1]):
+            sr_g, st_g = _prior_sigmas(g.prior)[1], _tilt_sigma(g.prior)
+            if st is None and st_g is None:
+                off = dis > K_SIGMA * math.hypot(sr, sr_g)
+            else:
+                # per part (map.md §1 "Prior rotation sigma"): this frame's orientation the
+                # images imply from the earlier frame's prior, against its own prior
+                yaw, tilt = sigmas.yaw_tilt(Q[:3, :3] @ img_rel, P[:3, :3])
+                off = yaw > K_SIGMA * math.hypot(sr, sr_g) or tilt > K_SIGMA * math.hypot(
+                    sr if st is None else st, sr_g if st_g is None else st_g)
+            if off:
                 T = pl.T.copy()
                 T[:3, :3] = q.T[:3, :3] @ img_rel
                 assert pl.prior_ref is not None  # a frame its image pose and prior placed

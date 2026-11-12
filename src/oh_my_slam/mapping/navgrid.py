@@ -13,8 +13,8 @@ volume is the previous one plus its new frames (``Volume.integrate``).
 **A band** (``layers``). Relative to the floor ``f`` and the band ``[z_min, z_max]``:
 
 * a voxel is a surface when ``hit >= OCC_RATIO * (hit + free)``, except a floor-like voxel
-  (mostly ``flat`` hits whose centre lies within the floor band, max(0.06 m, 3 floor sigmas), of
-  the floor: ``core.constants.floor_band_m``);
+  (its hits' mean height, ``Volume.surface_z``, within the floor band, max(0.06 m, 3 floor
+  sigmas), of the floor: ``core.constants.floor_band_m``);
 * a cell is ``occupied`` when a surface voxel's centre lies in the band, ``free`` when it is not
   occupied and a ray passed through it in the band (or its floor was seen), else ``unknown``;
 * ``height_m`` is the highest surface at or below the height cap (the request's ``height_cap_m``,
@@ -167,6 +167,11 @@ class Volume:
     frames: dict[str, list[float]] = field(default_factory=dict)  # key -> flattened T_map_cam
     # heights of the flat surface points, in FLOOR_BIN_M bins from origin z (the floor's height)
     flat_z: NDArray[np.float64] = field(default_factory=lambda: np.zeros(0, np.float64))
+    # per voxel, the sum of its hits' heights about the voxel's centre, each frame's mean
+    # weighted as its ``hit`` count: the surface's height (``surface_z``, map.md §6 floor band);
+    # None for a volume of a version derived before it (its voxel centres stand in)
+    hit_dz: NDArray[np.float32] | None = field(
+        default_factory=lambda: np.zeros((0, 0, 0), np.float32))
 
     @property
     def bins_per_voxel(self) -> int:
@@ -199,6 +204,7 @@ class Volume:
             self.flat = np.zeros_like(self.free)
             self.obs = np.zeros((n[1], n[0]), np.uint16)
             self.flat_z = np.zeros(n[2] * self.bins_per_voxel, np.float64)
+            self.hit_dz = np.zeros(self.free.shape, np.float32)
             return True
         Z, Y, X = self.shape
         cur_hi = self.origin + step * np.array([X, Y, Z])
@@ -215,6 +221,8 @@ class Volume:
         self.free = np.pad(self.free, pad3)
         self.hit = np.pad(self.hit, pad3)
         self.flat = np.pad(self.flat, pad3)
+        if self.hit_dz is not None and self.hit_dz.shape == (Z, Y, X):
+            self.hit_dz = np.pad(self.hit_dz, pad3)
         self.obs = np.pad(self.obs, pad3[1:])
         b = self.bins_per_voxel
         self.flat_z = np.pad(self.flat_z, (before[2] * b, after[2] * b))
@@ -337,9 +345,20 @@ class Volume:
             order = np.lexsort((-w, fi))  # per voxel, the frame's most precise evidence once
             fi, w = fi[order], w[order]
             first = np.concatenate([[True], fi[1:] != fi[:-1]]) if fi.size else np.zeros(0, bool)
+            zmean = None
+            if arr is self.hit and fi.size:  # the mean height of the frame's hits per voxel
+                grp = np.cumsum(first) - 1
+                z = np.asarray(at, np.float64)[inside][order, 2]
+                zmean = np.bincount(grp, z) / np.bincount(grp)
             fi, w = fi[first], w[first]
-            arr.reshape(-1)[fi] = np.minimum(arr.reshape(-1)[fi].astype(np.int64) + w,
-                                             np.iinfo(np.uint16).max).astype(np.uint16)
+            old = arr.reshape(-1)[fi].astype(np.int64)
+            new = np.minimum(old + w, np.iinfo(np.uint16).max)
+            arr.reshape(-1)[fi] = new.astype(np.uint16)
+            if zmean is not None and self.hit_dz is not None \
+                    and self.hit_dz.shape == self.hit.shape:
+                centre = self.origin[2] + (fi // (Y * X) + 0.5) * self.vz
+                np.add.at(self.hit_dz.reshape(-1), fi,
+                          ((new - old) * (zmean - centre)).astype(np.float32))
             cols_seen[fi % (Y * X)] = True
         zb = np.floor((flat_heights - self.origin[2]) / FLOOR_BIN_M).astype(np.int64)
         zb = zb[(zb >= 0) & (zb < len(self.flat_z))]
@@ -356,9 +375,10 @@ class Volume:
         import json
 
         buf = io.BytesIO()
+        extra = {} if self.hit_dz is None else {"hit_dz": self.hit_dz}
         np.savez_compressed(buf, origin=self.origin, voxel=np.array([self.voxel, self.vz]),
                             free=self.free, hit=self.hit, flat=self.flat, obs=self.obs,
-                            flat_z=self.flat_z,
+                            flat_z=self.flat_z, **extra,
                             frames=np.frombuffer(json.dumps(self.frames).encode(), np.uint8))
         return buf.getvalue()
 
@@ -373,7 +393,20 @@ class Volume:
                    json.loads(bytes(z["frames"]).decode()))
         v.flat_z = np.asarray(z["flat_z"], np.float64) if "flat_z" in z.files else \
             np.zeros(v.shape[0] * v.bins_per_voxel, np.float64)  # a volume of an older version
+        v.hit_dz = np.asarray(z["hit_dz"], np.float32) if "hit_dz" in z.files else None
         return v
+
+    def surface_z(self) -> Array:
+        """Per voxel, the height of its surface (map frame): the mean height of its hits
+        (``hit_dz``), the voxel's centre where it has none or the volume predates them."""
+        Z = self.shape[0]
+        zc = self.origin[2] + (np.arange(Z) + 0.5) * self.vz
+        out = np.broadcast_to(zc[:, None, None], self.hit.shape).astype(np.float64)
+        if self.hit_dz is None or self.hit_dz.shape != self.hit.shape:
+            return out
+        h = self.hit.astype(np.float64)
+        got: Array = out + self.hit_dz / np.where(h > 0, h, 1.0)
+        return got
 
     def estimate_floor(self, below: float | None = None, near: float | None = None
                        ) -> float | None:
@@ -450,12 +483,12 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float,
     hit = vol.hit.astype(np.float32)
     free = vol.free.astype(np.float32)
     surface = (vol.hit > 0) & (hit >= OCC_RATIO * (hit + free))
-    # floor-like: hits within the floor band of the floor's height, mostly flat ones where they
-    # lie inside the height band (below it, any hit is the floor or what stands on it, which the
-    # band does not judge)
-    flat_enough = (vol.flat.astype(np.float32) * 2 >= hit) | (zc < z_min)[:, None, None]
-    floorlike = flat_enough & (vol.hit > 0) & \
-        (np.abs(zc) <= floor_band_m(floor_sigma))[:, None, None]
+    # floor-like: a surface within the floor band of the floor's height (map.md §6: it never
+    # makes an occupied cell), by the height of the surface its hits make, not the voxel's
+    # centre, wherever the floor falls in the voxels; whatever its normals (the stencil's
+    # normals break at grazing angles and image borders)
+    floorlike = (vol.hit > 0) & \
+        (np.abs(vol.surface_z() - floor_z) <= floor_band_m(floor_sigma))
     surface &= ~floorlike
     band = ((zc >= z_min) & (zc <= z_max))[:, None, None]
     in_band = surface & band

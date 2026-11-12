@@ -165,8 +165,9 @@ class DerivedVersion:
 def _occupies(f: dict[str, Any]) -> bool:
     """Whether a version frame feeds occupancy and heights: confirmed by the images, or kept at
     its prior under the too-close exception (``content``, api.md §4), and not left out by the
-    height gate (``height_inconsistent``, map.md §2)."""
-    if f.get("height_inconsistent"):
+    height gate (``height_inconsistent``) or the floor check (``floor_inconsistent``, map.md
+    §2)."""
+    if f.get("height_inconsistent") or f.get("floor_inconsistent"):
         return False
     return f.get("pose_state") != "kept_at_prior" or bool(f.get("content"))
 

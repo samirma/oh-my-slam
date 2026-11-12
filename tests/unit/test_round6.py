@@ -636,7 +636,8 @@ def test_a_pure_turn_in_45_degree_steps_passes_the_rotation_check(
     assert job["state"] == "committed" and job["quality"]["failed_checks"] == [], job["quality"]
     assert len(got) == 8 and {c.a for c in got} | {c.b for c in got} == {f"f{k}" for k in range(8)}
     # the refined rotations vary a little with the RANSAC samples drawn (OpenCV's global random
-    # state, which earlier tests advance): within 2 deg of the truth here, far inside the 10 deg
-    # pair limit, against 3.9 and 6.2 deg before the refinement
+    # state, which earlier tests advance): within 2.5 deg of the truth here, far inside the 10 deg
+    # pair limit, against 3.9 and 6.2 deg before the refinement (2.3 deg on the geometric engine
+    # since the floor check gives each monocular keyframe its own depth scale, oms/2.4)
     deg = sorted(c.deg for c in got)
-    assert deg[-1] < 2.0 and float(np.median(deg)) < 0.8, got
+    assert deg[-1] < 2.5 and float(np.median(deg)) < 0.8, got

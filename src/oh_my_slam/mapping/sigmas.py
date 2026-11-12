@@ -20,13 +20,24 @@ position or rotation covariance, for update and locate and every engine; the noi
 ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²), position and rotation tested separately; σ_hypothesis
 is the hypothesis's image-only calibrated sigma (before fusion with the prior, no rival
 inflation), σ_prior the prior's (drift-grown for a ``drifting`` prior). Hypotheses are ranked by
-hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)), the same normalisation."""
+hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)), the same normalisation.
+
+**Tilt sigma** (map.md §1 "Prior rotation sigma", oms/2.4). A prior that gives
+``sigma_tilt_deg`` has its rotation weighed per axis: the rotation between two poses splits into
+its yaw (about the map's +z, ``yaw_tilt``) and its tilt (the angle between the two cameras' up
+directions), the yaw tested against ``sigma_rot_deg`` and the tilt against ``sigma_tilt_deg``
+(``conflicts``, ``distance`` with ``tilt``). Per axis, weights take (σ_tilt, σ_tilt, σ_rot) for
+(x, y, z) of the map-frame rotation vector (``rotation_axes``); a sigma reported for such a
+prior is the RMS of the three (``axes_rms``), which is σ_rot without a tilt sigma."""
 
 from __future__ import annotations
 
 import json
 import math
 import os
+from typing import Any
+
+import numpy as np
 
 K_SIGMA = 3.0
 SIGMA_SCALE_ENV = "OH_MY_SLAM_SIGMA_SCALE"
@@ -110,14 +121,66 @@ def bounds(prior: tuple[float, float], hyp: tuple[float, float]) -> tuple[float,
 
 
 def conflicts(dp: float, dr: float, prior: tuple[float, float], hyp: tuple[float, float],
-              position: bool = True) -> bool:
+              position: bool = True, tilt: tuple[float, float, float] | None = None) -> bool:
     """Whether a hypothesis ``dp`` m and ``dr`` deg from the prior conflicts with it; without
-    ``position`` only its rotation is tested."""
+    ``position`` only its rotation is tested. With ``tilt`` (yaw deg, tilt deg, the prior's
+    ``sigma_tilt_deg``; ``yaw_tilt``) the rotation is tested per part: the yaw against the
+    prior's ``sigma_rot_deg``, the tilt against its tilt sigma."""
     bp, br = bounds(prior, hyp)
-    return (position and dp > bp) or dr > br
+    if tilt is None:
+        rot = dr > br
+    else:
+        yaw, tl, st = tilt
+        rot = yaw > br or tl > K_SIGMA * math.hypot(st, hyp[1])
+    return (position and dp > bp) or rot
 
 
-def distance(dp: float, dr: float, prior: tuple[float, float], hyp: tuple[float, float]) -> float:
-    """The ranking distance to the prior over the combined sigmas."""
-    return math.hypot(dp / max(math.hypot(prior[0], hyp[0]), 1e-9),
-                      dr / max(math.hypot(prior[1], hyp[1]), 1e-9))
+def distance(dp: float, dr: float, prior: tuple[float, float], hyp: tuple[float, float],
+             tilt: tuple[float, float, float] | None = None) -> float:
+    """The ranking distance to the prior over the combined sigmas (``tilt`` as ``conflicts``:
+    the rotation term the hypot of its yaw and tilt parts, each over its own sigmas)."""
+    rot = dr / max(math.hypot(prior[1], hyp[1]), 1e-9)
+    if tilt is not None:
+        yaw, tl, st = tilt
+        rot = math.hypot(yaw / max(math.hypot(prior[1], hyp[1]), 1e-9),
+                         tl / max(math.hypot(st, hyp[1]), 1e-9))
+    return math.hypot(dp / max(math.hypot(prior[0], hyp[0]), 1e-9), rot)
+
+
+def tilt_sigma(p: dict[str, Any] | None, floor: float = 0.0) -> float | None:
+    """A request ``Prior``'s ``sigma_tilt_deg`` (oms/2.4), at least ``floor``; None without."""
+    if p is None or p.get("sigma_tilt_deg") is None:
+        return None
+    return max(float(p["sigma_tilt_deg"]), floor)
+
+
+def yaw_tilt(Ra: Any, Rb: Any) -> tuple[float, float]:
+    """The rotation between two camera orientations (``T_map_cam`` rotations, map z up) split
+    into its yaw and its tilt (deg): the tilt is the angle between the two cameras' up
+    directions (gravity in each camera's frame: a turn about the map's +z leaves it unchanged),
+    the yaw the angle of the turn about +z that brings ``Rb`` nearest ``Ra``."""
+    A, B = np.asarray(Ra, np.float64), np.asarray(Rb, np.float64)
+    c = float(np.clip(A[2] @ B[2], -1.0, 1.0))
+    M = B @ A.T
+    yaw = math.degrees(abs(math.atan2(float(M[0, 1] - M[1, 0]), float(M[0, 0] + M[1, 1]))))
+    return yaw, math.degrees(math.acos(c))
+
+
+def tilt_of(Ra: Any, Rb: Any, sigma_tilt: float | None) -> tuple[float, float, float] | None:
+    """``conflicts``' ``tilt`` argument for two orientations and a prior's tilt sigma (None
+    without one)."""
+    if sigma_tilt is None:
+        return None
+    return (*yaw_tilt(Ra, Rb), sigma_tilt)
+
+
+def rotation_axes(sigma_rot: float, sigma_tilt: float | None) -> Any:
+    """Per-axis rotation sigmas (x, y, z of a map-frame rotation vector): (σ_tilt, σ_tilt,
+    σ_rot) with a tilt sigma, else σ_rot on all three."""
+    st = sigma_rot if sigma_tilt is None else sigma_tilt
+    return np.array([st, st, sigma_rot], np.float64)
+
+
+def axes_rms(sigma_rot: float, sigma_tilt: float | None) -> float:
+    """The one rotation sigma of per-axis sigmas (``rotation_axes``): their RMS."""
+    return float(np.sqrt(np.mean(rotation_axes(sigma_rot, sigma_tilt) ** 2)))

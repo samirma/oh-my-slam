@@ -336,6 +336,9 @@ class Query:
     # a prior's sigmas: its own, else its trust's defaults (``anchor.prior_sigmas``)
     prior_sigma_pos_m: float = DEFAULT_SIGMA_POS_M
     prior_sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
+    # its ``sigma_tilt_deg`` (map.md §1 "Prior rotation sigma", oms/2.4): pitch and roll by it,
+    # yaw by ``prior_sigma_rot_deg``; None: all three by the latter
+    prior_sigma_tilt_deg: float | None = None
     camera_z: float | None = None  # expected map z of the camera (floor + height above it)
     # height_sigma (api.md §6, ``z_sigma``): the frame's own when ``camera_z_sigma_given``, else
     # the answer's reference keyframes', else this one (the README default)
@@ -539,7 +542,8 @@ def prior_distance(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0)) ->
     if q.prior is None:
         return 0.0
     dp, dr = pose_distance(T, q.prior)
-    return sigmas.distance(dp, dr, (q.prior_sigma_pos_m, q.prior_sigma_rot_deg), sig)
+    return sigmas.distance(dp, dr, (q.prior_sigma_pos_m, q.prior_sigma_rot_deg), sig,
+                           sigmas.tilt_of(T[:3, :3], q.prior[:3, :3], q.prior_sigma_tilt_deg))
 
 
 def within_prior(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0),
@@ -551,7 +555,8 @@ def within_prior(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0),
         return True
     dp, dr = pose_distance(T, q.prior)
     return not sigmas.conflicts(dp, dr, (q.prior_sigma_pos_m, q.prior_sigma_rot_deg), sig,
-                                position)
+                                position, sigmas.tilt_of(T[:3, :3], q.prior[:3, :3],
+                                                         q.prior_sigma_tilt_deg))
 
 
 def _height_ok(q: Query, T: Array, zs: float | None = None) -> bool:

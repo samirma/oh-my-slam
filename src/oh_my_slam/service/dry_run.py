@@ -165,6 +165,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             and am.created_with in ("metric", "drifting") else None
         disagreement = 0.0 if am is None else am.prior_disagreement_deg
         heights = [] if am is None else list(am.height_inconsistent)
+        floors = [] if am is None else list(am.floor_inconsistent)
         source, sigma = _scale(prev, am, frames)
         # an update without priors: its predicted poses against the images' relative rotations
         # (map.md §4 rotation_inconsistent), as the job measures them
@@ -189,6 +190,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "prior_disagreement_deg": disagreement,
         "reregistered": again,
         "height_inconsistent": heights,
+        "floor_inconsistent": floors,
         "rotation_pairs": rotation_pairs,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev

@@ -21,6 +21,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.mapping import sigmas
+
 Array = NDArray[np.float64]
 
 K_SIGMA = 3.0  # an anchor whose residual exceeds this many sigmas is an outlier
@@ -110,6 +112,9 @@ class Anchor:
     dst: Array  # 4x4 map-frame pose
     sigma_pos_m: float = DEFAULT_SIGMA_POS_M
     sigma_rot_deg: float = DEFAULT_SIGMA_ROT_DEG
+    # a prior's ``sigma_tilt_deg`` (map.md §1 "Prior rotation sigma", oms/2.4): its pitch and
+    # roll judged by it (``chi``), its yaw by ``sigma_rot_deg``; None: all three by the latter
+    sigma_tilt_deg: float | None = None
 
     @property
     def sp(self) -> float:
@@ -127,10 +132,21 @@ def residual(S: Sim3, a: Anchor) -> tuple[float, float]:
             rotation_deg(a.dst[:3, :3].T @ T[:3, :3]))
 
 
+def residual_parts(S: Sim3, a: Anchor) -> tuple[float, float]:
+    """The yaw and tilt (deg) of anchor ``a``'s rotation residual under ``S``
+    (``sigmas.yaw_tilt``)."""
+    return sigmas.yaw_tilt(S.pose(a.src)[:3, :3], a.dst[:3, :3])
+
+
 def chi(S: Sim3, a: Anchor) -> float:
-    """The larger of an anchor's position and rotation residuals, in sigmas."""
+    """The larger of an anchor's position and rotation residuals, in sigmas; with a tilt sigma
+    its rotation's yaw and tilt each in its own (``Anchor.sigma_tilt_deg``)."""
     dp, dr = residual(S, a)
-    return max(dp / a.sp, math.radians(dr) / a.sr)
+    if a.sigma_tilt_deg is None:
+        return max(dp / a.sp, math.radians(dr) / a.sr)
+    yaw, tilt = residual_parts(S, a)
+    st = math.radians(max(a.sigma_tilt_deg, MIN_SIGMA_ROT_DEG))
+    return max(dp / a.sp, math.radians(yaw) / a.sr, math.radians(tilt) / st)
 
 
 @dataclass
