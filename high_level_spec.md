@@ -181,9 +181,13 @@ pair (map.md §1, Symmetric scenes, and §2, Match graph); and a whole sequence 
 lattice pose, which every measured pair agrees with, is left to the depth-consistency limit, so a
 false lattice pair can cause a rejection (map.md §1, Cycle consistency). A frame kept at a prior its
 images contradict (`kept_at_prior`, `detail` `conflict_unsupported`) contributes nothing to the map, free-by-rule
-grid cells included (map.md §2, §6; api.md §4); a frame whose content is withheld but whose pose is trusted
-(excluded by the floor check or the height gate, or `floor_not_judged`) keeps its free-by-rule cells, and a
-`floor_not_judged` frame's depth gives no scale evidence (map.md §2).
+grid cells included, whatever its `reason`: also a frame kept for a failed check (such as `too_close`) whose
+image-only pose conflicts with its prior, the check winning the `reason` and `detail` showing the conflict; the
+too-close content exception applies only to a frame without such a conflict (map.md §2, §6; api.md §4). A frame
+whose content is withheld but whose pose is trusted (excluded by the floor check or the height gate, or
+`floor_not_judged`) keeps its free-by-rule cells, and a `floor_not_judged` frame's depth gives no scale evidence:
+its sent camera height constrains only its own camera pose and is never combined with its own depth or floor
+plane into a scale estimate (map.md §2).
 
 ## 8. Concurrency and latency
 
