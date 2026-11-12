@@ -207,7 +207,9 @@ def grounding(label: str) -> tuple[float, float]:
 
 
 def normalize_label(label: str) -> str:
-    return re.sub(r"\s+", " ", label.replace("_", " ").strip().lower())
+    """A label's comparison form (map.md §5): ``_`` read as a space, trimmed, whitespace runs
+    collapsed to one space, Unicode case-folded."""
+    return re.sub(r"\s+", " ", label.replace("_", " ").strip()).casefold()
 
 
 # Vocabulary (``data/default_labels.txt``). YOLOE scores a text prompt by the similarity of its

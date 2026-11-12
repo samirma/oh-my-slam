@@ -29,6 +29,7 @@ Its inference requests (monocular depth, gravity) are sent as interactive
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import math
@@ -105,9 +106,10 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
     workdir = store.work / f"dry-{uuid.uuid4().hex}"
     indir = workdir / "in"
     indir.mkdir(parents=True, exist_ok=True)
+    holds = contextlib.ExitStack()  # the version it answers from (map.md §2 Holds)
     try:
         # the latest committed version and its mapper map, as one: a job may commit meanwhile
-        prev = store.snapshot(w.map, workdir / "mapper")
+        prev = store.snapshot(w.map, workdir / "mapper", holds)
         frames, masks = up._frames(w)
         up._check(frames, masks, prev, indir)
         engine = up._is_anchored(prev, frames)
@@ -171,6 +173,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         again = [] if am is None else reregistered(am.reregistered)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        holds.close()  # what follows reads no stored file
     registered = [pl for status, pl in kept if status == "registered"]
     low = sum(pl is not None and (pl.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
               for pl in registered)

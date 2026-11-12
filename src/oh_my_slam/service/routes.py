@@ -55,12 +55,14 @@ ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint("GET", "/api/maps/{name}", "get_map", "Map summary", {200: "MapSummary"},
              ("map_not_found", "version_gone", "invalid_request"), params=(MAP, VERSION)),
     Endpoint("GET", "/api/maps/{name}/versions", "get_versions",
-             "Kept versions (O2): each with its kind, job and counts", {200: "Versions"},
+             "Kept versions (O2): each with its kind, job and counts; takes no ?version (400 "
+             "invalid_request, details.field version)", {200: "Versions"},
              ("map_not_found", "invalid_request"), params=(MAP,)),
     Endpoint("POST", "/api/maps/{name}/revert", "post_revert",
              "Commit a copy of a kept version (O2) as a new version, and answer its summary; "
-             "map_busy while a job of the map is registering or fusing; queued jobs then start "
-             "from it", {200: "MapSummary"},
+             "map_busy while a job of the map is registering or fusing, never for queued ones, "
+             "which then start from it; keeps the camera registry and object ids, reuses the "
+             "target's derived reads", {200: "MapSummary"},
              ("map_not_found", "version_gone", "map_busy", "invalid_request"),
              request="RevertRequest", params=(MAP,)),
     Endpoint("GET", "/api/maps/{name}/frames", "get_frames", "Keyframes and their poses",
@@ -114,6 +116,7 @@ ENDPOINTS: tuple[Endpoint, ...] = (
              "Last recorded pose, with the version it was located in and that version's scale; "
              "takes no ?version (400 invalid_request, details.field version)", {200: "Pose"},
              ("map_not_found", "no_pose", "invalid_request"), params=(MAP,)),
-    Endpoint("DELETE", "/api/maps/{name}", "delete_map", "Delete the map and its versions",
+    Endpoint("DELETE", "/api/maps/{name}", "delete_map", "Delete the map and its versions; "
+             "map_busy while a job of the map is queued or running (never cancels a job)",
              {204: None}, ("map_not_found", "map_busy", "invalid_request"), params=(MAP,)),
 )

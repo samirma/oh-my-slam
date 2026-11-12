@@ -91,37 +91,77 @@ they need. New maps take the *prior-first registration* (below).
   ([`VersionInfo`]: `version`, `created_at`, `kind`, `job_id`, `reverted_to`, `frames`,
   `objects`), from the index `map.json` keeps (`store.Store.versions`; a version committed before
   the index is read from its record). Until O3 every update's version is `kind` `update`; no
-  version is `provisional` or `fusing`.
+  version is `provisional` or `fusing`. It takes no `?version` (400 `invalid_request`,
+  `details.field` `version`), like `GET …/pose`.
 * **Revert.** `POST /api/maps/{name}/revert {to_version}` (a JSON body, [`RevertRequest`])
   commits version *latest + 1* whose content equals `to_version` (`store.Store.revert`): its
   record (frames and poses with their states and sigmas, the similarity from the mapper's frame,
   scale and its source, floor, bounds, object count, label vocabulary), its own files (the
-  anchored map's objects; a kept frame's depth stays the version's that added it), the cameras it
-  held, and a clone of the mapper map it was committed with. The new version is `kind` `revert`,
-  `job_id` null, `reverted_to` the target; its reads are derived as any version's before it is
-  published, and each names it in `map_version`. The map frame is never re-gauged: the next
-  update starts from that mapper map and fits onto the reverted version's poses (map.md §1).
-  The map's camera registry is not reverted: a camera a later version defined stays defined
-  (its id cannot be redefined), though the reverted summary's `cameras` are the target's.
-  A revert is refused with `map_busy` (409, retryable) while a job of the map is registering
-  (no fusion phase before O3); it holds the job worker off that map while it commits
-  (`jobs.Jobs.holding`), so a queued job then starts from the reverted version (its
-  `base_version`). An unknown `to_version` is `invalid_request` (`details.field`
-  `to_version`); one no longer kept, `version_gone`.
+  anchored map's objects; a kept frame's depth stays the version's that added it), and a clone
+  of the mapper map it was committed with. The new version is `kind` `revert`, `job_id` null,
+  `reverted_to` the target; each read names it in `map_version`. The map frame is never
+  re-gauged: the next update starts from that mapper map and fits onto the reverted version's
+  poses (map.md §1).
+  * *Derived reads reused.* The revert's derived reads are its target's, never derived again
+    (`derived.Derived._reuse`): `derived/<n>/` holds hard links to the target's `volume.npz`,
+    `cloud.npz`, `locate.npz` (one inode each), its `meta.json` and objects answer renamed to
+    the version, and the target's loaded parts, locate index and read answers (`map_version`
+    renamed) serve it in memory. A target whose derived reads cannot be had (its mapper map
+    gone and never derived, no hard links) is derived as any version.
+  * *Revert latency* (`revert.latency` ≤ 2 s, measured 2026-11-12 on the M3 Pro): on the
+    older mapper's 79-keyframe evaluation map `single` (62.7 MB cloud) wrapped as a service
+    map, a revert takes 0.11 s with its target in memory and 1.27 s after a restart (target
+    loaded from its files, its locate index and default grid built again); deriving that
+    version again, as a revert did before, took 2.55 s (19.2 s for the first derivation,
+    SIFT features included). The two identical versions of that run shared one blob per file.
+  * *Camera registry.* It is not reverted (map.md §2): a camera id, once defined, stays known
+    with its values and cannot be redefined (`camera_conflict`), and camera ids are never freed.
+    A version's `cameras` (its summary's) are the registry at its commit, so a revert's list
+    every camera defined so far, those defined after its target included.
+  * *Object ids.* Unique over the whole history and never reused (map.md §2, §5): the revert
+    raises the cloned mapper map's object counter (the prior-first `objects.json` `next_id`,
+    the older mapper's `map.json` `next_object_id` and `objects.json` `next_id`) to the map's
+    high-water mark (`service.object_ids`): the count of the mapper map it replaces, of its
+    target's, and the mark an earlier revert recorded (`map.json` `next_object_id`). A
+    revert's objects carry the target's `first_seen_version` / `last_seen_version`.
+  * *Jobs.* A revert is refused with `map_busy` (409, retryable) while a job of the map is
+    registering (no fusion phase before O3); while jobs are only queued it proceeds, holding the
+    job worker off that map while it commits (`jobs.Jobs.holding`, a count: holds nest), so a
+    queued job then starts from the reverted version, and its `base_version` (null while queued)
+    names the version it ran on. Commits of one map, a job's or a revert's, are serialised
+    (`store.Store._commit_lock`), so two concurrent reverts commit two versions in turn; reads
+    never take that lock.
+  * An unknown `to_version` is `invalid_request` (`details.field` `to_version`); one no longer
+    kept, `version_gone`.
+* **Delete.** `DELETE /api/maps/{name}` is refused with `map_busy` while a job of the map is
+  queued or registering: it never cancels a job.
 * **Mapper maps per version.** A commit that replaces the mapper map keeps the replaced one as
   `mappers/<k>/`, `k` the first version it served (it serves the versions up to the next one's
   first; `map.json` `mappers`). Updates clone the mapper map as APFS clones (`cp -c`), so kept
   maps share their unchanged files and a version costs only what changed. A map whose mapper
   maps were replaced before this was kept (`mappers_since`) answers `version_gone` for a revert
   to (or a first derivation of) those earlier versions.
+* **Derived reads shared by content.** Each version's `volume.npz`, `cloud.npz` and
+  `locate.npz` is a hard link to `derived/blobs/<sha256>.npz`, keyed by its arrays' names and
+  data (not their zip encoding): versions whose derived reads
+  did not change (a revert, an update whose frames were all kept at their priors, for the cloud
+  and the locate index) share one file (`derived.Derived._share`). A blob no kept version links
+  is deleted with the last version that linked it (`Derived.forget`). With the mapper maps'
+  APFS clones, a version costs only what changed (map.md §2 Sharing).
 * **Retention.** After each commit the versions older than the last `--keep-versions` are
   deleted (`store.Store.prune`): their record, their own files, their derived reads, and the
-  mapper maps no kept version uses. A version a read is answering from is kept until that read
-  ends (`store.Store.hold`, taken by every read that names a version, locate included) and
-  deleted at a later commit; a version file a kept version still reads (the `kept_depth.json` of
-  the version that added a kept frame) stays. A job's base version is the latest when it starts,
-  and no commit happens while it runs, so retention never deletes it. A deleted version answers
-  `version_gone`.
+  mapper maps no kept version uses, except a held version (`store.Store.hold`, map.md §2
+  Holds):
+  * a job holds its base version, the latest when it starts, until it ends (`Updater.__call__`);
+  * a read holds the version it answers from until it ends: every versioned `GET`, a locate
+    (with or without `version`) from before it reads its frames, a dry run from its snapshot
+    of the latest to the end of its checks (`Store.snapshot`), a revert its target;
+  * the latest version is read and held in one step under the store lock
+    (`Store.hold_latest`), so with `--keep-versions 1` no commit prunes it in between.
+  A held version does not count toward the last *N*: one older than them is kept on top, and
+  deleted at the first commit after its last hold ended. A version file a kept version still
+  reads (the `kept_depth.json` of the version that added a kept frame) stays. A deleted version
+  answers `version_gone`.
 
 ### Update jobs (minimal until O3)
 
@@ -796,7 +836,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
 * **Label vocabulary** (oms/2.3, map.md §5). An update's optional `labels` (at most 64, each
   1-64 characters after trimming; otherwise `invalid_request`, `details.field` `labels`) join
   the map's vocabulary, stored with the version (`versions/<n>.json` `labels`): the previous
-  version's, then each new label it does not hold yet, compared case-insensitively
+  version's, then each new label it does not hold yet, equal when their Unicode case-folded
+  forms are equal after trimming, `_` read as a space and whitespace runs collapsed
   (`segmentation.detect.normalize_label`), trimmed, first spelling kept
   (`update.map_labels`), never the defaults; a revert restores the target's. Every detection of
   a job (each frame's, a re-registered keyframe's, the closer looks and their label scores, the
@@ -925,8 +966,11 @@ called by `service.prior_first` after the engine placed and fused the update's k
   median colour of its points in the version's cloud, `sigma_centre_m`
   `√(σ_pose² + (spread / √n)²)` (σ_pose the version's median keyframe `sigma_pos_m`, spread the
   RMS distance of its points from their mean, n its observations), and `first_seen_version` /
-  `last_seen_version` its first and last mapper update ids, which are the versions on a map the
-  service built (one mapper update per committed version; clamped to the version read). That
+  `last_seen_version` its first and last mapper update ids translated into versions of the
+  history: each version record keeps `update_versions` (each update id of its line and the
+  version that committed it, `update.update_versions`), so a version whose frames were all kept
+  at their priors (no mapper update) and a revert (its target's) shift nothing (clamped to the
+  version read; a record from before this: the ids themselves). That
   mapper does record the views that bound a box (`mapping.objects.Sighting`: keyframe, its
   points' centroid, the share of its mask in the image-border band): `extent_seen` applies the
   prior-first engine's rule to them (`anchored_objects.extent_from` on the box's yaw axes; a

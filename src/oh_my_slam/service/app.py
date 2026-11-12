@@ -351,15 +351,20 @@ class Api:
             if not raw.isdigit() or int(raw) < 1:
                 raise invalid("version", "version must be a positive integer")
             n = int(raw)
-        meta = self.s.store.require(name)
-        n = n or int(meta["latest_version"])
-        self._hold(request, name, n)
-        return name, meta, self.s.store.version(name, n)
+        self.s.store.require(name)
+        n = self._hold(request, name, n)
+        return name, self.s.store.require(name), self.s.store.version(name, n)
 
-    def _hold(self, request: Request, name: str, n: int) -> None:
-        """Retention keeps version ``n`` until the request ends (map.md §2, ``_wrap``)."""
+    def _hold(self, request: Request, name: str, n: int | None) -> int:
+        """Retention keeps version ``n`` (None: the latest, read and held in one step) until the
+        request ends (map.md §2 Holds, ``_wrap``); returns it."""
         stack = request.scope.setdefault("oms_holds", contextlib.ExitStack())
-        stack.enter_context(self.s.store.hold(name, n))
+        if n is not None:
+            stack.enter_context(self.s.store.hold(name, n))
+            return n
+        latest = stack.enter_context(self.s.store.hold_latest(name, required=True))
+        assert latest is not None  # else map_not_found
+        return int(latest)
 
     async def get_map(self, request: Request) -> Response:
         name, meta, v = self._version(request)
@@ -381,6 +386,9 @@ class Api:
 
     async def get_versions(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])
+        if "version" in request.query_params:
+            raise invalid("version", "GET …/versions takes no ?version: it lists every kept "
+                          "version, and latest_version names the newest")
         meta = self.s.store.require(name)
         versions = await run_in_threadpool(self.s.store.versions, name)
         return body({"map": name, "latest_version": meta["latest_version"],
@@ -491,7 +499,7 @@ class Api:
 
     async def post_locate(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])
-        meta = self.s.store.require(name)
+        self.s.store.require(name)
         t0 = time.perf_counter()
         data = await read_body(request, self.s.upload_cap)
         parts = parse_multipart(request.headers.get("content-type", ""), data)
@@ -504,9 +512,9 @@ class Api:
         except (ValueError, UnicodeDecodeError) as exc:
             raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
         schema.validate("LocateRequest", req)
+        # the version it answers from, held from now until it ends (map.md §2 Holds)
+        n = self._hold(request, name, req.get("version"))
         frames = await run_in_threadpool(nav.locate_frames, self.s.store, name, req, parts)
-        n = req.get("version") or int(meta["latest_version"])
-        self._hold(request, name, n)
         v = self.s.store.version(name, n)
         dv = await run_in_threadpool(self._derived().get, name, v["version"])
         _stage(request, "prepare", t0)

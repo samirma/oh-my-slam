@@ -337,7 +337,7 @@
             "pattern": "^\\s*\\S(.{0,62}\\S)?\\s*$",
             "description": "A text prompt, 1-64 characters after trimming."
           },
-          "description": "oms/2.3: text prompts added to the map's label vocabulary (the union over all its updates). Detection prompts with the default vocabulary merged with the map's, duplicates removed case-insensitively. An invalid label refuses the request with invalid_request (details.field labels)."
+          "description": "oms/2.3: text prompts added to the map's label vocabulary (the union over all its updates). Detection prompts with the default vocabulary merged with the map's, duplicates removed from the prompt list: labels are equal when their Unicode case-folded forms are equal after trimming, reading _ as a space and collapsing whitespace runs. A label equal to a default stays in the stored vocabulary. An invalid label refuses the request with invalid_request (details.field labels)."
         }
       }
     },
@@ -786,7 +786,7 @@
               "rotation_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers); with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images when both frames carry depth, else consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -935,7 +935,7 @@
             "integer",
             "null"
           ],
-          "description": "Version registration ran against; null for a new map."
+          "description": "Version registration ran against; null for a new map and while the job is queued. A queued job starts from the latest version at that moment, a reverted one included, and reports the version it actually ran on."
         },
         "provisional_version": {
           "type": [
@@ -1195,7 +1195,7 @@
           "items": {
             "type": "string"
           },
-          "description": "oms/2.3: the vocabulary detection would use: the defaults merged with the map's vocabulary and the request's labels, duplicates removed case-insensitively."
+          "description": "oms/2.3: the vocabulary detection would use: the defaults merged with the map's vocabulary and the request's labels, duplicates removed (equal after Unicode case-folding, trimming, _ read as a space and whitespace runs collapsed)."
         }
       }
     },
@@ -1287,7 +1287,7 @@
           "items": {
             "type": "string"
           },
-          "description": "oms/2.3: the version's label vocabulary (read-only): the union of its updates' labels, without the defaults."
+          "description": "oms/2.3: the version's label vocabulary (read-only): the union of its updates' labels, without the defaults. A label equal to a default stays here."
         }
       }
     },
@@ -1474,7 +1474,7 @@
         "id": {
           "type": "integer",
           "minimum": 1,
-          "description": "Map object id. In an AnalysisObject: the map's persistent id when the detection matched a map object (map and T_map_cam given), else a local id >= 1000000."
+          "description": "Map object id. In an AnalysisObject: the map's persistent id (unique across the map's whole version history, never reused) when the detection matched a map object (map and T_map_cam given), else a local id >= 1000000."
         },
         "label": {
           "type": "string"
@@ -1525,7 +1525,7 @@
               "$ref": "#/$defs/Extent"
             }
           },
-          "description": "full or partial per box axis, from the views that bound it; partial on every axis when the map's builder never recorded those views."
+          "description": "full or partial per box axis, from the views that bound it; a view of the top seen uncut with a support plane measured under the footprint makes z full; partial on every axis when the map's builder never recorded those views."
         },
         "mean_rgb": {
           "type": "array",

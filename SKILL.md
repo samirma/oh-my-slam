@@ -21,8 +21,8 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `POST /api/maps/{name}/updates` | Start an update job (creates the map); with dry_run=1, check the frames and write nothing | [`UpdateRequest`] (multipart: part `request` + file parts) | 202 [`Job`], 200 [`DryRun`] | `dry_run` |
 | `GET /api/jobs/{id}` | Job state and result |  | 200 [`Job`] | `wait_s` |
 | `GET /api/maps/{name}` | Map summary |  | 200 [`MapSummary`] | `version` |
-| `GET /api/maps/{name}/versions` | Kept versions (O2): each with its kind, job and counts |  | 200 [`Versions`] |  |
-| `POST /api/maps/{name}/revert` | Commit a copy of a kept version (O2) as a new version, and answer its summary; map_busy while a job of the map is registering or fusing; queued jobs then start from it | [`RevertRequest`] (JSON) | 200 [`MapSummary`] |  |
+| `GET /api/maps/{name}/versions` | Kept versions (O2): each with its kind, job and counts; takes no ?version (400 invalid_request, details.field version) |  | 200 [`Versions`] |  |
+| `POST /api/maps/{name}/revert` | Commit a copy of a kept version (O2) as a new version, and answer its summary; map_busy while a job of the map is registering or fusing, never for queued ones, which then start from it; keeps the camera registry and object ids, reuses the target's derived reads | [`RevertRequest`] (JSON) | 200 [`MapSummary`] |  |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses |  | 200 [`Frames`] | `version` |
 | `GET /api/maps/{name}/objects` | Object records and support surfaces |  | 200 [`Objects`] | `version` |
 | `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m`, `height_cap_m` |
@@ -31,7 +31,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `GET /api/maps/{name}/birdseye` | The bird's-eye image's metadata: size, pixel_to_map and the version's scale_source and scale_sigma_rel |  | 200 [`Birdseye`] | `version` |
 | `POST /api/maps/{name}/locate` | Locate frames in the map | [`LocateRequest`] (multipart: part `request` + file parts) | 200 [`Locate`] |  |
 | `GET /api/maps/{name}/pose` | Last recorded pose, with the version it was located in and that version's scale; takes no ?version (400 invalid_request, details.field version) |  | 200 [`Pose`] |  |
-| `DELETE /api/maps/{name}` | Delete the map and its versions |  | 204 |  |
+| `DELETE /api/maps/{name}` | Delete the map and its versions; map_busy while a job of the map is queued or running (never cancels a job) |  | 204 |  |
 
 An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with `?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate.
 

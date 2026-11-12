@@ -10,7 +10,15 @@ Under ``<data>/oms/maps/<name>/derived/``:
 * ``<n>/meta.json`` — the floor, door positions and objects in the map frame (written last: a
   version is derived once it exists);
 * ``features/<key>.npz`` — each keyframe image's SIFT keypoints and descriptors, shared by every
-  version.
+  version;
+* ``blobs/<sha256>.npz`` — the store of the files above by content (map.md §2 Sharing): each
+  version's ``volume.npz``, ``cloud.npz`` and ``locate.npz`` is a hard link to its content's blob,
+  so kept versions whose derived reads did not change share one file (``_share``); a blob no
+  version links goes with the last version that did (``forget``).
+
+A revert's version (map.md §2 Revert) reuses its target's derived reads instead of deriving them
+(``_reuse``): its files are links to the target's, and the target's loaded parts, locate index and
+read answers serve it, renamed to its version.
 
 ``Derived`` subscribes to ``Store.preparing`` and derives each version before the store
 publishes it (``prepare``, in the job, from the mapper map it is committed with): the files
@@ -35,13 +43,16 @@ mapper map read by the backend (``backend.InternalMap``: ``depth``, ``image``, `
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
 import math
+import os
 import queue
 import shutil
 import threading
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -63,11 +74,15 @@ from oh_my_slam.mapping.store import frame_name
 from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
+from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.store import Store
 
 log = get_logger("oh_my_slam.service.derived")
 
+CACHE_OBJECTS = "objects.json"  # the objects read's answer of a version (``objects.CACHE``)
+
 CACHE_VERSIONS = 3  # versions kept in memory beside each map's latest
+SHARED = ("volume.npz", "cloud.npz", "locate.npz")  # a version's files kept by content
 ANSWERS = 16  # read answers kept per version (grid parameters, objects)
 DEFAULT_CAMERA_HEIGHT_M = 1.0
 # what the older mapper records of an object beyond its box, kept for the objects read
@@ -164,11 +179,41 @@ def _sha_file(p: Path) -> str:
     return h.hexdigest()
 
 
+def content_key(p: Path) -> str:
+    """The content of an ``.npz`` file (its arrays: names and data), whatever its zip encoding
+    (headers, compression)."""
+    import zipfile
+
+    h = hashlib.sha256()
+    with zipfile.ZipFile(p) as z:
+        for info in sorted(z.infolist(), key=lambda i: i.filename):
+            h.update(info.filename.encode() + b"\0")
+            with z.open(info) as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return h.hexdigest()
+
+
+def _link(src: Path, dst: Path) -> None:
+    """``dst`` as a hard link to ``src`` (atomic: a read sees the old file or the new one)."""
+    tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex}")
+    os.link(src, tmp)
+    tmp.replace(dst)
+
+
 def yaw_of(R: NDArray[Any]) -> float:
     """The yaw (deg, in (-90, 90]) of an upright box's x axis."""
     a = math.degrees(math.atan2(float(R[1][0]), float(R[0][0])))
     a = (a + 90.0) % 180.0 - 90.0
     return 90.0 if a == -90.0 else a
+
+
+def _renamed(answer: Any, n: int) -> Any:
+    """A read answer of a revert's target as the revert's version ``n`` answers it."""
+    if isinstance(answer, dict):  # a body (the objects read)
+        return {**answer, "map_version": n}
+    # one carrying its body (``nav.GridAnswer``)
+    return dataclasses.replace(answer, body={**answer.body, "map_version": n})
 
 
 class Derived:
@@ -214,11 +259,65 @@ class Derived:
         self._queue.put((name, n))
 
     def forget(self, name: str, n: int) -> None:
-        """Version ``n`` was deleted by retention: out of memory too."""
+        """Version ``n`` was deleted by retention: out of memory too, and the blobs no kept
+        version links any more."""
         with self._lock:
             for key in [k for k in self._cache if k[0] == name and k[2] == n]:
                 del self._cache[key]
             self._version_locks.pop((name, n), None)
+            for blob in (self.dir(name) / "blobs").glob("*.npz"):
+                with contextlib.suppress(OSError):
+                    if blob.stat().st_nlink <= 1:
+                        blob.unlink()
+
+    def _share(self, name: str, vdir: Path) -> None:
+        """The version's ``SHARED`` files as links to their content's blobs (map.md §2
+        Sharing): a file whose content a blob already holds is replaced by a link to it, else
+        it becomes that blob."""
+        blobs = self.dir(name) / "blobs"
+        blobs.mkdir(parents=True, exist_ok=True)
+        for fname in SHARED:
+            p = vdir / fname
+            if not p.exists():
+                continue
+            blob = blobs / f"{content_key(p)}.npz"
+            with self._lock:  # one blob per content, even when two versions derive at once
+                if blob.exists():
+                    _link(blob, p)
+                else:
+                    os.link(p, blob)
+
+    def _reuse(self, name: str, n: int, record: dict[str, Any], vdir: Path,
+               cameras: dict[str, Any]) -> DerivedVersion | None:
+        """A revert's version ``n`` from its target's derived reads (map.md §2 Revert), or None
+        when the target has none to reuse (the revert is then derived like any version)."""
+        to = int(record["reverted_to"])
+        try:
+            src = self.get(name, to)  # in memory, else from its files (derived now if never)
+        except (ApiError, OSError, ValueError):
+            return None
+        sdir = self.dir(name) / str(to)
+        vdir.mkdir(parents=True, exist_ok=True)
+        try:
+            for p in sorted(sdir.iterdir()):
+                if p.name not in ("meta.json", CACHE_OBJECTS):  # they name the version: below
+                    _link(p, vdir / p.name)
+        except OSError:  # a file system without hard links, or the target's files gone
+            return None
+        objects = sdir / CACHE_OBJECTS
+        if objects.exists():
+            atomic_write_json(vdir / CACHE_OBJECTS,
+                              {**json.loads(objects.read_text()), "map_version": n})
+        meta = {**src.meta, "version": n}
+        atomic_write_json(vdir / "meta.json", meta)
+        dv = DerivedVersion(name, n, record, meta, vdir, self._stands(record, cameras))
+        with src._lock:  # what the target loaded serves the revert: equal content
+            dv._volume, dv._cloud = src._volume, src._cloud
+            for key, got in src._answers.items():
+                dv._answers[key] = _renamed(got, n)
+        with src._index_lock:
+            dv._index = src._index
+        return dv
 
     def prepare(self, name: str, n: int, record: dict[str, Any], mapper: Path,
                 cameras: dict[str, Any], files: dict[str, Any] | None = None) -> None:
@@ -229,15 +328,21 @@ class Derived:
         vdir = self.dir(name) / str(n)
         with self._version_lock(name, n):
             shutil.rmtree(vdir, ignore_errors=True)
-            internal = None
-            if mapper.exists():
-                try:
-                    internal = self.read_map(mapper)
-                except (OSError, OhMySlamError):
-                    internal = None
-            self._derive(name, n, record, vdir, internal, cameras, files)
-            dv = DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
-                                vdir, self._stands(record, cameras))
+            dv = self._reuse(name, n, record, vdir, cameras) \
+                if record.get("kind") == "revert" and record.get("reverted_to") else None
+            if dv is None:
+                shutil.rmtree(vdir, ignore_errors=True)
+                internal = None
+                if mapper.exists():
+                    try:
+                        internal = self.read_map(mapper)
+                    except (OSError, OhMySlamError):
+                        internal = None
+                self._derive(name, n, record, vdir, internal, cameras, files)
+                self._share(name, vdir)
+                dv = DerivedVersion(name, n, record,
+                                    json.loads((vdir / "meta.json").read_text()), vdir,
+                                    self._stands(record, cameras))
             self.index(dv, cameras)  # the locate index ready before the version is
             for hook in self.prepared:
                 try:
@@ -331,6 +436,7 @@ class Derived:
                             internal = self.read_map(path)
                     self._derive(name, n, record, vdir, internal,
                                  record.get("cameras") or self.store.cameras(name))
+                self._share(name, vdir)
         return DerivedVersion(name, n, record, json.loads((vdir / "meta.json").read_text()),
                               vdir, self._stands(record, self.store.cameras(name)))
 

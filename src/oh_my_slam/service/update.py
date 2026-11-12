@@ -152,6 +152,19 @@ def map_labels(prev: dict[str, Any] | None, labels: list[str]) -> list[str]:
     return out
 
 
+def update_versions(prev: dict[str, Any] | None, update_id: int | None, version: int
+                    ) -> dict[str, int]:
+    """The version each mapper update id of a version's line was committed as (the older
+    mapper numbers its updates, and its objects' ``created_update`` / ``last_seen_update``,
+    along its own line: map.md §5 ``first_seen_version``, ``objects._mapper_records``): the
+    previous version's, plus this version's update. A version without a mapper update (all kept
+    at their priors) and a revert carry their base's and their target's."""
+    out = {str(k): int(v) for k, v in ((prev or {}).get("update_versions") or {}).items()}
+    if update_id is not None:
+        out[str(update_id)] = version
+    return out
+
+
 @dataclass
 class _Frame:
     """A frame's state through the job."""
@@ -330,18 +343,21 @@ class Updater:
         w: UpdateWork = job.work
         t0 = time.perf_counter()
         job.state = "registering"
-        job.base_version = self.store.latest(w.map)
-        changed()
         workdir = self.store.work / job.id
-        try:
-            self.backend.require_inference()
-            self._run(job, w, workdir, changed)
-        except ApiError as exc:
-            job.state, job.error = "failed", exc.body()
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-            tm = job.timings_s
-            tm["total"] = round(time.perf_counter() - t0, 3)
+        # the job holds its base version, the latest as it starts (a revert committed while it
+        # was queued included), until it ends (map.md §2 Holds)
+        with self.store.hold_latest(w.map) as base:
+            job.base_version = base
+            changed()
+            try:
+                self.backend.require_inference()
+                self._run(job, w, workdir, changed)
+            except ApiError as exc:
+                job.state, job.error = "failed", exc.body()
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+                tm = job.timings_s
+                tm["total"] = round(time.perf_counter() - t0, 3)
         if job.state != "failed" and w.frames:
             # the phases a prediction adds up (``Timings.predict_phases``)
             self.timings.add("checks_per_frame", tm.get("checks", 0.0) / len(w.frames),
@@ -1207,7 +1223,8 @@ class Updater:
                 "objects": objects, "floor_z_m": floor, "floor_sigma_m": round(floor_sigma, 4),
                 "pose_states": POSE_STATES,
                 "bounds_m": {"min": pts.min(0).round(4).tolist(),
-                             "max": pts.max(0).round(4).tolist()}}
+                             "max": pts.max(0).round(4).tolist()},
+                "update_versions": update_versions(prev, internal.update_id, version)}
 
     @staticmethod
     def _input(fr: _Frame) -> dict[str, Any]:

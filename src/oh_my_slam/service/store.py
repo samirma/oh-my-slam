@@ -17,9 +17,14 @@ Under ``<data>/oms/maps/<name>/``:
   version costs only what changed.
 
 Retention (``--keep-versions``, map.md §2): after each commit the versions older than the last
-``keep`` are deleted (their record, their own files, their derived reads), except one a read
-holds (``hold``) and the files a kept version still reads (``kept_depth.json`` of the version
-that added a kept frame).
+``keep`` are deleted (their record, their own files, their derived reads), except a held one
+(``hold``: a job holds its base version, a read the version it answers from, until it ends; a held
+version does not count toward ``keep`` and goes at the first commit after its last hold ended)
+and the files a kept version still reads (``kept_depth.json`` of the version that added a kept
+frame).
+
+Commits of one map are serialised (``_commit_lock``: a job's, a revert's), so two reverts never
+take the same version number; reads never take that lock.
 
 Every file is written atomically; a version is written before ``map.json`` names it, so a read
 always sees a complete version."""
@@ -98,6 +103,7 @@ class Store:
         self.work = self.root / "work"
         self.trash = self.root / "trash"
         self._lock = threading.RLock()
+        self._commit_locks: dict[str, threading.RLock] = {}  # per map (``_commit_lock``)
         # called with (map, version) once a version is committed (``derived`` derives the grid,
         # points and locate inputs from it); a listener's failure never fails the commit
         self.listeners: list[Callable[[str, int], None]] = []
@@ -202,24 +208,43 @@ class Store:
     def mapper_dir(self, name: str) -> Path:
         return self.dir(name) / "mapper"
 
-    def snapshot(self, name: str, dest: Path) -> dict[str, Any] | None:
+    def snapshot(self, name: str, dest: Path, holds: contextlib.ExitStack | None = None
+                 ) -> dict[str, Any] | None:
         """The latest committed version of a map (None before any) and its mapper map cloned
         to ``dest``, both read under the commit lock: one version, even while a job commits
-        the next (a dry run reads it while a job runs)."""
+        the next (a dry run reads it while a job runs). ``holds`` holds that version until it
+        closes (map.md §2 Holds)."""
         with self._lock:
-            if not self.latest(name):
+            n = self.latest(name)
+            if not n:
                 return None
-            v = self.version(name)
+            if holds is not None:
+                holds.enter_context(self.hold(name, n))
+            v = self.version(name, n)
             if self.mapper_dir(name).exists():
                 clone_tree(self.mapper_dir(name), dest)
             return v
+
+    @contextlib.contextmanager
+    def _commit_lock(self, name: str) -> Iterator[None]:
+        """The lock serialising the commits of one map (a job's, a revert's)."""
+        with self._lock:
+            lock = self._commit_locks.setdefault(name, threading.RLock())
+        with lock:
+            yield
 
     def commit(self, name: str, record: dict[str, Any], mapper: Path | None,
                files: dict[str, Any] | None = None,
                cameras: dict[str, dict[str, Any]] | None = None,
                masks: dict[str, tuple[str, bytes]] | None = None,
-               record_cameras: dict[str, dict[str, Any]] | None = None,
                no_mapper: bool = False) -> int:
+        """Commit a new version (``_commit``), serialised with the map's other commits."""
+        with self._commit_lock(name):
+            return self._commit(name, record, mapper, files, cameras, masks, no_mapper)
+
+    def _commit(self, name: str, record: dict[str, Any], mapper: Path | None,
+                files: dict[str, Any] | None, cameras: dict[str, dict[str, Any]] | None,
+                masks: dict[str, tuple[str, bytes]] | None, no_mapper: bool) -> int:
         """Commit a new version: ``record`` (its ``version``, ``created_at`` and ``cameras``
         set here), the version's JSON ``files`` (``versions/<n>.<file name>``: the objects of an
         anchored map), the job's new ``cameras`` and their ignore ``masks`` (creating the map)
@@ -228,21 +253,20 @@ class Store:
         Before the mapper map is replaced, ``replacing`` listeners get the versions the current
         one serves (``mapper_version`` to the latest): what is derived from the mapper map of a
         version is derived from that version's, never from a later one. The replaced map is
-        kept under ``mappers/`` (a revert clones it back). A revert names the cameras its version
-        holds (``record_cameras``: the target's) and, when the target had no mapper map,
-        ``no_mapper``: the version then has none."""
+        kept under ``mappers/`` (a revert clones it back). A version's ``cameras`` are the map's
+        camera registry at its commit, a revert's too (map.md §2 Revert: camera ids are never
+        freed). When a revert's target had no mapper map, ``no_mapper``: the version then has
+        none."""
         if mapper is not None or no_mapper:
             self._replacing(name)
         self._prepare(name, record, mapper if not no_mapper else self.work / "no-mapper",
-                      record_cameras if record_cameras is not None else cameras or {},
-                      files or {}, record_cameras is not None)
+                      cameras or {}, files or {})
         with self._lock:
             meta = self.add_cameras(name, cameras or {}, masks or {})
             n = int(meta.get("latest_version") or 0) + 1
             now = time.time()
             record = {**record, "version": n, "created_at": utc(now),
-                      "cameras": dict(meta["cameras"] if record_cameras is None
-                                      else record_cameras)}
+                      "cameras": dict(meta["cameras"])}
             if "mappers" not in meta:  # the history starts (an earlier map: from its latest)
                 known = self.mapper_dir(name).exists()
                 first = (self.mapper_version(name) or n - 1) if known else 0
@@ -322,7 +346,8 @@ class Store:
 
     @contextlib.contextmanager
     def hold(self, name: str, n: int) -> Iterator[None]:
-        """Version ``n`` of a map is used by a read: retention keeps it until it ends."""
+        """Version ``n`` of a map is used by a read or a job: retention keeps it until it ends
+        (map.md §2 Holds)."""
         with self._lock:
             self._holds[(name, n)] = self._holds.get((name, n), 0) + 1
         try:
@@ -333,12 +358,35 @@ class Store:
                 if left:
                     self._holds[(name, n)] = left
 
+    @contextlib.contextmanager
+    def hold_latest(self, name: str, required: bool = False) -> Iterator[int | None]:
+        """The latest version of a map (None before any; ``required``: ``map_not_found``), held
+        as ``hold`` does: reading it and taking the hold are one step, so no commit prunes it in
+        between (``--keep-versions 1``)."""
+        with self._lock, contextlib.ExitStack() as stack:
+            n = self.latest(name)
+            if not n and required:
+                self.require(name)
+            if n:
+                stack.enter_context(self.hold(name, n))
+            held = stack.pop_all()
+        with held:
+            yield n
+
     def revert(self, name: str, to_version: int) -> int:
         """Commit a new version whose content equals ``to_version`` (map.md §2 Revert): its
         record (frames and poses, the similarity, scale, floor, objects, label vocabulary), its
-        own files, the cameras it held and a clone of the mapper map it was committed with, so
-        updates continue from it in the same map frame (never re-gauged). The caller keeps
-        jobs of the map from starting meanwhile (``Jobs.holding``)."""
+        own files and a clone of the mapper map it was committed with, so updates continue from
+        it in the same map frame (never re-gauged). The camera registry is not rolled back, and
+        the clone numbers new objects past every id the map has given (``object_ids``). The
+        derived reads are the target's (``Derived.prepare``). The caller keeps jobs of the map
+        from starting meanwhile (``Jobs.holding``); two reverts of a map are serialised."""
+        with self._commit_lock(name):
+            return self._revert(name, to_version)
+
+    def _revert(self, name: str, to_version: int) -> int:
+        from oh_my_slam.service import object_ids
+
         meta = self.require(name)
         latest = int(meta["latest_version"])
         if to_version < 1 or to_version > latest:
@@ -351,10 +399,21 @@ class Store:
                 raise ApiError(exc.code, exc.message, {**exc.details, "field": "to_version"}
                                ) from exc
             source = self.mapper_for(name, to_version)
+            # every id the map has given: the current map's count, and the mark of an earlier
+            # revert (the ids of the versions it reverted away)
+            current = self.mapper_dir(name)
+            mark = max(int(meta.get("next_object_id") or 1),
+                       object_ids.next_id(current if current.exists() else None),
+                       object_ids.next_id(source))
+            with self._lock:
+                fresh = self.meta(name) or meta
+                fresh["next_object_id"] = mark
+                self._write_meta(name, fresh)
             mapper = None
             if source is not None:
                 mapper = self.work / f"revert-{uuid.uuid4().hex}"
                 clone_tree(source, mapper)
+                object_ids.reserve(mapper, mark)
             files = {}
             prefix = f"{to_version}."
             for p in sorted((self.dir(name) / "versions").glob(f"{to_version}.*.json")):
@@ -365,9 +424,8 @@ class Store:
                       if k not in ("version", "created_at", "cameras")}
             record.update(kind="revert", job_id=None, reverted_to=to_version)
             try:
-                return self.commit(name, record, mapper, files,
-                                   record_cameras=dict(src.get("cameras") or {}),
-                                   no_mapper=source is None)
+                return self._commit(name, record, mapper, files, None, None,
+                                    no_mapper=source is None)
             finally:
                 if mapper is not None:
                     shutil.rmtree(mapper, ignore_errors=True)
@@ -446,14 +504,13 @@ class Store:
                     "replacing listener failed for %s versions %d-%d", name, first, latest)
 
     def _prepare(self, name: str, record: dict[str, Any], mapper: Path | None,
-                 cameras: dict[str, dict[str, Any]], files: dict[str, Any],
-                 exact: bool = False) -> None:
-        """The ``preparing`` listeners on the version about to be committed: its number (one job
-        writes a map at a time), its record as it will read (``version``, ``cameras``), the
-        mapper map it is committed with (the current one when none), the map's cameras and the
-        version's JSON files (``exact``: ``cameras`` are the version's own, a revert's)."""
+                 cameras: dict[str, dict[str, Any]], files: dict[str, Any]) -> None:
+        """The ``preparing`` listeners on the version about to be committed: its number (the
+        map's commits are serialised), its record as it will read (``version``, ``cameras``),
+        the mapper map it is committed with (the current one when none), the map's cameras and
+        the version's JSON files."""
         n = int((self.meta(name) or {}).get("latest_version") or 0) + 1
-        cams = dict(cameras) if exact else {**self.cameras(name), **cameras}
+        cams = {**self.cameras(name), **cameras}
         full = {**record, "version": n, "cameras": cams}
         for listener in self.preparing:
             try:

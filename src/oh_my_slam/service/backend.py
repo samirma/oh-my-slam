@@ -73,6 +73,8 @@ class InternalMap:
     objects: Callable[[], list[dict[str, Any]]] = field(default=lambda: [])  # internal frame
     # a keyframe's ignored pixels (map.md §2 "Ignored pixels"), on its image, None: none
     ignore: Callable[[str], NDArray[np.bool_] | None] = field(default=lambda name: None)
+    # the older mapper's count of its updates, the id of its latest (None: another engine)
+    update_id: int | None = None
 
 
 @dataclass
@@ -440,8 +442,10 @@ class MapperBackend:
             return None if got is None else got > 0
 
         floor = reader.meta.get("floor_z")
+        count = reader.meta.get("update_count")
         return InternalMap(frames, None if floor is None else float(floor), bounds, rebuilt, depth,
-                           points_z, image, cloud, objects, ignore)
+                           points_z, image, cloud, objects, ignore,
+                           None if count is None else int(count))
 
     def terminate(self) -> None:
         with self._lock:

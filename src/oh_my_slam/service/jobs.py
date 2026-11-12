@@ -107,7 +107,8 @@ class Jobs:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self.running: str | None = None
-        self._paused: set[str] = set()  # maps whose jobs do not start now (``holding``)
+        # maps whose jobs do not start now: the reverts holding each (``holding``)
+        self._paused: dict[str, int] = {}
 
     # -- persistence -----------------------------------------------------------------------------
 
@@ -219,19 +220,22 @@ class Jobs:
     @contextlib.contextmanager
     def holding(self, map_name: str) -> Iterator[None]:
         """No job of the map starts while held (a revert, api.md §5); ``map_busy`` while one is
-        registering or fusing. Queued jobs wait, then start from what was committed."""
+        registering or fusing, never for queued ones: they wait, then start from what was
+        committed. Holds nest (two reverts of a map): jobs start once the last ends."""
         with self._cond:
             job = self._jobs.get(self.running) if self.running else None
             if job is not None and job.map == map_name and job.active:
                 raise ApiError("map_busy", f"job {job.id} of map {map_name!r} is {job.state}; "
                                "revert once it has ended", {"job_id": job.id,
                                                             "state": job.state})
-            self._paused.add(map_name)
+            self._paused[map_name] = self._paused.get(map_name, 0) + 1
         try:
             yield
         finally:
             with self._cond:
-                self._paused.discard(map_name)
+                left = self._paused.pop(map_name) - 1
+                if left:
+                    self._paused[map_name] = left
                 self._cond.notify_all()
 
     def queued(self) -> list[Job]:

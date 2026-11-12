@@ -163,7 +163,8 @@ def test_openapi_describes_every_endpoint_with_the_schema_defs(client: Client) -
     assert body["properties"]["request"] == {"$ref": "#/components/schemas/UpdateRequest"}
     assert "409" in post["responses"] and "503" in post["responses"]
     assert doc["paths"]["/api/maps/{name}"]["delete"]["responses"]["204"] == {
-        "description": "Delete the map and its versions"}
+        "description": "Delete the map and its versions; map_busy while a job of the map is queued "
+        "or running (never cancels a job)"}
 
 
 def test_unknown_routes_and_methods_are_typed_errors(client: Client) -> None:

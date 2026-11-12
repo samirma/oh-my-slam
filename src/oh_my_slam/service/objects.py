@@ -11,8 +11,9 @@ A map of the older mapper has no such records: its objects (``derived`` meta) ar
 what that mapper records (README "Objects of the older mapper"): its score and label votes (the
 ``detection_votes`` shares: each label's votes over its observing frames); the
 observed colour and the centre's spread from the object's points in the version's cloud; the
-versions from the mapper's update ids, which are the versions on a map the service built (one
-mapper update per committed version). That mapper does not record which views bound a box, so
+versions from the mapper's update ids, translated by the version record's ``update_versions``
+(each update id of the version's line and the version that committed it: a version with no
+mapper update and a revert do not shift them, ``update.update_versions``). That mapper does not record which views bound a box, so
 every extent is ``partial`` (not seen in full). An object without those records, or without
 points in the cloud, is not listed: the read never makes a field up."""
 
@@ -43,6 +44,13 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
     # each keyframe's camera centre by the mapper's frame name: the views of its objects
     cams = {f["internal"]: np.asarray(f["T_map_cam"], np.float64)[:3, 3]
             for f in dv.record["frames"] if f.get("internal")}
+    # the mapper's update ids as the versions of the history that committed them (a version
+    # recorded before this: the ids themselves)
+    updates = {int(k): int(v) for k, v in (dv.record.get("update_versions") or {}).items()}
+
+    def as_version(u: int) -> int:
+        return updates.get(u, u)
+
     out = []
     for o in dv.meta.get("objects", []):
         oid = int(o.get("id") or 0)
@@ -62,8 +70,9 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
         # that mapper's per-label votes over its observing frames (map.md §5)
         shares = [{"label": k, "share": round(min(max(float(votes[k]) / n, 0.0), 1.0), 4)}
                   for k in votes]
-        first = min(max(int(o["created_update"]), 1), dv.version)
-        last = min(max(int(o.get("last_seen_update") or first), first), dv.version)
+        first = min(max(as_version(int(o["created_update"])), 1), dv.version)
+        last = min(max(as_version(int(o.get("last_seen_update") or o["created_update"])),
+                       first), dv.version)
         out.append({"id": oid, "label": o["label"], "detected_as": labels,
                     "score": round(min(max(float(o["score"]), 0.0), 1.0), 4),
                     "centre_m": o["centre_m"], "size_m": o["size_m"],
