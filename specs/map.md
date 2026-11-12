@@ -278,7 +278,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   contributes nothing anywhere, on every engine: no keypoints or matches, no depth points, no
   occupancy, free-space or floor evidence, no detections or votes, and no cloud points. A
   detection whose box or mask lies mostly inside the ignored region is dropped: more than the
-  share recorded as a constant in `README.md`.
+  share recorded as a constant in `README.md` (`IGNORED_DETECTION_MAX_SHARE`, 0.5). On every
+  engine, a view where the object lies mostly in ignored pixels, by that same share, is not a
+  view of it (§5, Ignored pixels).
 * **Reads.**
   * A read without `?version=` answers from the latest committed version at the moment the
     request arrives.
@@ -398,10 +400,10 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | --- | --- |
 | `id` | Positive integer, persistent for the map's lifetime. |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
-| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre, detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
+| `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre and that gives a view of it (Ignored pixels, below), detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
-| `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. When the map's builder never recorded those views, `partial` on every axis. |
+| `extent_seen {x, y, z}` | `full` or `partial` per box axis, from the views that bound it. A view of the object's top seen uncut (an elevation threshold, a constant in `README.md`), together with a support plane measured under its footprint, makes `z` `full`: the support plane bounds the bottom; the support may be measured from other views. The other rules per axis are unchanged. When the map's builder never recorded those views, `partial` on every axis. |
 | `mean_rgb` | Observed colour: robust mean of the object's pixels in sRGB 0–255, from the views that saw it best. |
 | `color` | Display colour only: a pure function of `id`. |
 | `state` | `confirmed` (seen again where it was), `moved` (seen elsewhere: `moved_from_m` gives the earlier centre), or `struck` (seen gone; kept for one version, then removed). |
@@ -421,7 +423,11 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
   removed case-insensitively. A label gets no special treatment beyond being a prompt. The
   map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
   would use.
-* **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote.
+* **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote. On every
+  engine, a view where the object lies mostly in ignored pixels (§2) is not a view of it: the
+  object's share of its projected box or mask in the ignored region exceeds
+  `IGNORED_DETECTION_MAX_SHARE` (`README.md`, 0.5, the share of the dropped-detection rule).
+  Such a view enters no view count, no vote denominator and no extent evidence.
 * **Doorways.** A door opening is a passage of the grid (§6), not an object. A detected door
   leaf is an object: label `door`, with its `state` and `region`. The passage names it in
   `leaves[].object_id`. A door object is a leaf: thin (< 0.20 m), vertical and at least 0.6 m
