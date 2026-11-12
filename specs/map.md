@@ -147,13 +147,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * **Supporting frames.** The supporting frames are the inliers of the fit that produced the
     current drift estimate, plus every `drifting`-prior frame that images confirmed under that
     same estimate, the job's own registered `drifting` frames that were not fit inliers
-    included. Such a frame joins the support only from the commit of the version that
-    registered it, never within the job that registered it, so no frame loosens its own bound;
-    this holds on every engine, also when the job's drift change was refused. The fit's
-    outliers never join the support. The set has no count bound, and resets to the new fit's
-    inliers whenever the estimate changes. The no-count-bound rule applies only to the
-    supporting frames: odometry-scale evidence stays capped by a constant recorded in
-    `README.md`.
+    included. The inliers of a fit that this job changes support at once, because they define
+    the estimate. The job's other confirmed `drifting` frames, the non-inliers, join the
+    support only from the commit of the version that registered them, never within the job that
+    registered them, so no frame loosens its own bound; this holds on every engine, also when
+    the job's drift change was refused. The fit's outliers never join the support. The set has
+    no count bound, and resets to the new fit's inliers whenever the estimate changes. The
+    no-count-bound rule applies only to the supporting frames: odometry-scale evidence stays
+    capped by a constant recorded in `README.md`.
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
@@ -275,12 +276,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * the label vocabulary (§5);
   * the metadata.
 * **Ignored pixels.** A pixel in the union of the camera's ignore mask and the frame's own mask
-  contributes nothing anywhere, on every engine: no keypoints or matches, no depth points, no
-  occupancy, free-space or floor evidence, no detections or votes, and no cloud points. A
-  detection whose box or mask lies mostly inside the ignored region is dropped: more than the
-  share recorded as a constant in `README.md` (`IGNORED_DETECTION_MAX_SHARE`, 0.5). On every
-  engine, a view where the object lies mostly in ignored pixels, by that same share, is not a
-  view of it (§5, Ignored pixels).
+  contributes nothing anywhere, on every engine, in every use. The list is examples, not the
+  whole set: no keypoints or matches, no depth points, no occupancy, free-space or floor
+  evidence, no detections or votes, no cloud points, and also none to the frame quality checks
+  (`plain`, `blur`), the `too_close` scene distance, scale evidence (depth residuals, monocular
+  depth) or the camera-height check. A detection is dropped when its share in the
+  ignored region exceeds `IGNORED_DETECTION_MAX_SHARE` (`README.md`, 0.5): the share of its
+  mask, or of its box when it has no mask. On every engine, a view where the object lies mostly
+  in ignored pixels, by that same share, is not a view of it (§5, Ignored pixels).
 * **Reads.**
   * A read without `?version=` answers from the latest committed version at the moment the
     request arrives.
@@ -289,10 +292,23 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * A version that is no longer kept answers `version_gone`.
 * **Revert.** `revert {to_version}` commits a new version whose content equals `to_version`.
   History stays linear and readers never see a version change in place.
+  * It does not roll back the map's camera registry: a camera id, once defined, stays known
+    with its values, and camera ids are never freed. The map summary's `cameras` lists the
+    registry as of that version's commit, so a revert version lists every camera defined so
+    far, including those defined after `to_version`.
+  * Object ids are unique across the map's whole version history and never reused, even after a
+    revert: an object created later never takes an id held in a version that was reverted
+    away. `first_seen_version` and `last_seen_version` are version numbers of that history.
+  * It reuses the target's derived reads (grid, cloud, locate index) instead of re-deriving
+    them, so `revert.latency` (evaluation.md) holds.
 * **Retention (`--keep-versions`).** The service keeps at least the last *N* versions of each
-  map (default 20, recorded in `README.md`). Older ones are deleted, except one that a running
-  job or read is using. Kept versions share their unchanged content, so a version costs only
-  what changed.
+  map (default 20, recorded in `README.md`). Older ones are deleted, except a held one.
+  * **Holds.** A job holds its base version, the version its registration ran against. A read
+    holds the version it answers from, a dry run or a locate with `version` included, until it
+    ends. A held version does not count toward *N*: a held version older than the newest *N* is
+    kept in addition. It is deleted at the first commit after its last hold ends.
+  * **Sharing.** Kept versions share the parts a version does not change: the mapper's map and
+    the derived reads (grid, cloud, locate index). A version costs only what changed.
 
 ## 3. Update jobs (O3)
 
@@ -323,7 +339,8 @@ becomes a job with a `job_id`. A job goes through these states:
 * **What a later observation does.**
   * A later observation of a surface or object replaces the earlier one: an object seen gone is
     `struck` (§5), and the surface behind it is refilled from the latest view.
-  * An object id persists for the lifetime of the map.
+  * An object id persists for the lifetime of the map and is never reused, not even after a
+    revert (§2).
 * **Split updates.** Mapping one sequence in one job, or split across several in the same order,
   gives the same objects and poses within the evaluator's targets.
 
@@ -398,7 +415,7 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Positive integer, persistent for the map's lifetime. |
+| `id` | Positive integer, unique across the map's whole version history and never reused, even after a revert (§2). |
 | `label`, `detected_as[]`, `score` | Label chosen, labels it was detected as, and confidence. |
 | `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre and that gives a view of it (Ignored pixels, below), detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
@@ -407,7 +424,7 @@ Each object record [`MapObject`] has the fields below; frame analysis returns th
 | `mean_rgb` | Observed colour: robust mean of the object's pixels in sRGB 0–255, from the views that saw it best. |
 | `color` | Display colour only: a pure function of `id`. |
 | `state` | `confirmed` (seen again where it was), `moved` (seen elsewhere: `moved_from_m` gives the earlier centre), or `struck` (seen gone; kept for one version, then removed). |
-| `first_seen_version`, `last_seen_version` | Versions where it first and last appeared. |
+| `first_seen_version`, `last_seen_version` | Real version numbers of the map's history where it first and last appeared; a revert version carries the values of `to_version`. |
 | `region` | The grid region (§6) of the object, or null. It is set when its centre or footprint lies in a region or on its boundary; the region chosen is the one its footprint overlaps most. An object on a wall, such as a door or a shelf, belongs to the region it was seen from. Null only when it touches no region. |
 | `supported_by` | `{kind: surface \| object, id, verified_version}` for the support surface or object it rests on, or null. |
 | `inside_of` | `{id, verified_version}` when its centre lies within another object's concave interior (a bowl, a drawer, a box), or null. |
@@ -417,11 +434,15 @@ points, such as the floor, table tops, counters and shelves. Each has `id`, `hei
 `polygon_m` and `area_m2`. An arm descends to and places on these heights.
 
 * **Label vocabulary.** An update request's `labels` (api.md §3) are added to the map's
-  vocabulary, which is stored with the version: the union of the labels of all its updates.
+  vocabulary, which is stored with the version: the union of the labels of all its updates,
+  equal labels kept once, in their first form.
   Detection on the map, in fusion and in any later re-detection, prompts with the default
   vocabulary (`README.md`, `default_labels.txt`) merged with the map's vocabulary, duplicates
-  removed case-insensitively. A label gets no special treatment beyond being a prompt. The
-  map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
+  removed from the prompt list. Two labels are equal when their Unicode case-folded forms are
+  equal after trimming, reading `_` as a space and collapsing whitespace runs to one space. A
+  label equal to a default stays in the stored vocabulary and in `MapSummary.labels`: it is
+  dropped only from the prompt list. A label gets no special treatment beyond being a prompt.
+  The map summary reports the version's vocabulary read-only, and a dry run the vocabulary it
   would use.
 * **Ignored pixels.** Detections follow §2: masked pixels give no detection or vote. On every
   engine, a view where the object lies mostly in ignored pixels (§2) is not a view of it: the

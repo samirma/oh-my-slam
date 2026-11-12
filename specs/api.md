@@ -61,9 +61,11 @@ Each other endpoint belongs to the group named in its section, or in map.md.
 | `DELETE /api/maps/{name}` | Delete the map and its versions | → 204 |
 | `POST /api/frames/analyse` | Analyse one frame, no map change | [`AnalyseRequest`] → [`Analysis`] |
 
-Every `GET` under `/api/maps/{name}`, except `/pose`, accepts `?version=<n>` and names its
-version in `map_version`. `GET …/pose` takes no `?version`: the recorded pose lives outside the
-versions, and its `map_version` is the version it was located in (§6). A `?version` sent to it
+Every `GET` under `/api/maps/{name}`, except `/pose` and `/versions`, accepts `?version=<n>` and
+names its version in `map_version`. `GET …/pose` takes no `?version`: the recorded pose lives
+outside the versions, and its `map_version` is the version it was located in (§6).
+`GET …/versions` takes no `?version` either: it lists every kept version (§5), so its response
+has no `map_version` (its `latest_version` names the newest). A `?version` sent to either
 answers 400 `invalid_request` with `details.field: "version"`.
 
 An unknown route answers HTTP 404 and a known route with another method HTTP 405, both with the
@@ -73,9 +75,10 @@ error code `invalid_request` (§9).
 
 * **`cameras`** — a dictionary from `camera_id` to [`Camera`]. A camera already known to the map
   may be omitted; sending it again with other values is refused (`camera_conflict`). A camera
-  sent by an earlier job of the same map that is still queued or running counts as known, so a
-  later job may omit it. If that earlier job does not commit, the later job fails with
-  `invalid_request`.
+  id, once defined, stays known to the map with its values: a revert does not roll the registry
+  back (map.md §2), and camera ids are never freed. A camera sent by an earlier job of the same
+  map that is still queued or running counts as known, so a later job may omit it. If that
+  earlier job does not commit, the later job fails with `invalid_request`.
 * **`frames[]`** — each [`FrameInput`] has:
   * `name`, unique within the map: a name the map or the request already holds is rejected
     `duplicate`, whatever the image;
@@ -86,12 +89,12 @@ error code `invalid_request` (§9).
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name;
   * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
-    union of the two masks contributes nothing anywhere, on every engine (map.md §2, Ignored
-    pixels).
+    union of the two masks contributes nothing anywhere, on every engine, in every use (map.md §2,
+    Ignored pixels).
 * **`labels`** (update requests, optional, oms/2.3) — text prompts added to the map's label
-  vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. An invalid
-  label refuses the request with `invalid_request` (`details.field: "labels"`); it is never a
-  frame status.
+  vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. Labels are
+  compared as map.md §5 defines (case-folded, `_` as a space). An invalid label refuses the
+  request with `invalid_request` (`details.field: "labels"`); it is never a frame status.
 * **Request order** is the order of addition (map.md §3).
 * **`analyse`** takes one frame, with its camera inline or by id of a map's camera (`map`
   given).
@@ -103,6 +106,8 @@ error code `invalid_request` (§9).
   duplicates `job_id`.
 * **Watching a job.** `GET /api/jobs/{id}` returns:
   * its state, `progress` and `eta_s`;
+  * `base_version`, the version its registration ran against (null for a new map, and while the
+    job is queued: a queued job's base is fixed when it starts, §5);
   * `provisional_version` and `result_version`;
   * `latest_version`, the newest version it has committed so far, intermediate `fusing`
     versions included, or null before any;
@@ -263,8 +268,17 @@ The versions read, revert and `--keep-versions` are O2.
   `objects`.
 * `POST /api/maps/{name}/revert {to_version}` commits a new version equal to `to_version`, and
   answers with the new summary.
-  * It is refused with `map_busy` while a job of that map is registering or fusing.
-  * Queued jobs then start from the reverted version.
+  * It is refused with `map_busy` while a job of that map is registering or fusing. While only
+    queued jobs exist (none running), it proceeds.
+  * A queued job then starts from the reverted version, and its `base_version` reports the
+    version it actually ran on.
+  * A revert reuses the target's derived reads and keeps the camera registry and the object ids
+    (map.md §2), so `revert.latency` (evaluation.md) holds.
+* `DELETE /api/maps/{name}` is refused with `map_busy` while a job of that map is queued,
+  registering or fusing: it never cancels a job. Unlike a revert, it is refused even while only
+  queued jobs exist.
+* A job holds its base version, and every read holds the version it answers from, a dry run or
+  a locate with `version` included; retention treats held versions as map.md §2 says.
 
 ## 6. Locate (O5)
 
@@ -431,7 +445,7 @@ So the client can gate even a run's first update on its deadline.
   | `map_not_found`, `job_not_found` | 404 | no | Unknown name or id |
   | `version_gone` | 410 | no | Version no longer kept |
   | `no_pose` | 404 | no | No recorded pose |
-  | `map_busy` | 409 | yes | Revert or delete during a running job |
+  | `map_busy` | 409 | yes | Revert during a running job; delete during a queued or running job |
   | `inference_unavailable` | 503 | yes | Inference server down or restarting |
   | `out_of_memory` | 503 | yes | Device memory exhausted; the server recovers |
   | `payload_too_large` | 413 | no | Upload over the cap or the free disk |
