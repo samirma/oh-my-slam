@@ -483,8 +483,8 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
     """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
     null without a prior, with reason ``too_close`` the distance limit and the frame's median
     scene depth, with reason ``duplicate`` the frame it duplicates, and ``detail``: why the
-    images did not confirm a kept frame, only on a ``kept_at_prior`` frame not kept for a
-    failed check; ``floor_not_judged`` (oms/2.5) only on a ``registered`` or ``provisional``
+    images did not confirm a kept frame, only on a ``kept_at_prior`` frame (on one kept for a
+    failed check only ``conflict_unsupported``, since P30c); ``floor_not_judged`` (oms/2.5) only on a ``registered`` or ``provisional``
     frame."""
     kept = status != "rejected"
     row = {"name": name, "status": status, "reason": reason, "inliers": inliers,

@@ -907,8 +907,8 @@ class Measure:
         """grid.unconfirmed_occupancy (map.md §2, §6): occupied cells, and floor-standing
         objects, on open floor of the floor plan (more than one cell from every truth object)
         inside the view of kept_at_prior frames only, and of no image-confirmed frame. A frame
-        kept only for too_close with a metric prior (its input's reason too_close, in a metric
-        episode) counts as confirmed (api.md §4: its depth and detections contribute)."""
+        kept only for too_close with a metric prior (its input's reason too_close and null
+        detail, in a metric episode) counts as confirmed (api.md §4: its depth and detections contribute)."""
         assert self.al is not None
         sim = self.al[0]
         cell = float(self.rec.grid["cell_m"]) * sim.s  # type: ignore[index]
@@ -920,7 +920,8 @@ class Measure:
         kept = np.zeros(len(W), dtype=bool)
         confirmed = np.zeros(len(W), dtype=bool)
         content = {i["name"] for j in self.rec.jobs for i in j.job.get("inputs") or []
-                   if i["status"] == "kept_at_prior" and i.get("reason") == "too_close"} \
+                   if i["status"] == "kept_at_prior" and i.get("reason") == "too_close"
+                   and i.get("detail") is None} \
             if self.rec.mode == "metric" else set()
         for r in frames:
             if r.get("pose_state", "fused") == "kept_at_prior" and r["name"] not in content:

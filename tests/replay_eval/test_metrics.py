@@ -589,5 +589,9 @@ def test_unconfirmed_occupancy(world: Any) -> None:
     rec.jobs[0].job["inputs"] = [{"name": n, "status": "kept_at_prior", "reason": "too_close"}
                                  for n in names]
     assert measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0] == 0
+    # too_close with detail conflict_unsupported carried no content: still unconfirmed
+    for i in rec.jobs[0].job["inputs"]:
+        i["detail"] = "conflict_unsupported"
+    assert measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0] == kept
     rec.mode = "none"
     assert measure(rec, ep, plan, raster).values["grid.unconfirmed_occupancy"][0] == kept

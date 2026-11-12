@@ -1,4 +1,4 @@
-"""Typed API errors (api.md §8): a fixed code, its HTTP status, whether a retry can succeed, a
+"""Typed API errors (api.md §9): a fixed code, its HTTP status, whether a retry can succeed, a
 message that says what to do, and details."""
 
 from __future__ import annotations
