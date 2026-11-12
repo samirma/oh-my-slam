@@ -87,10 +87,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       two-view rotations along a path of measurable pairs that each have strictly more inliers
       than the pair. The rule is independent of the joint solve (§4). It cannot catch a lattice
       geometry that stays consistent around a whole cycle, or a pair with no stronger chain:
-      an accepted degenerate case, as above. A frame whose only measurable pairs have no chain
-      of stronger pairs to be judged against stays outside the pair limits (§4): its pairs
-      neither pass nor fail the rotation check, and such a frame never rejects the job on its
-      own.
+      an accepted degenerate case, as above. A frame with two or more measurable pairs, none
+      of which has a chain of stronger pairs to be judged against, has those pairs outside the
+      pair limits (§4): they neither pass nor fail the rotation check, and such a frame never
+      rejects the job on its own. Depth confirmation does not change this. A pair without a
+      chain that is its frame's only measurable pair (for example the single pair of a
+      two-frame job, or a frame joined by one pair) stays measurable and is judged against the
+      committed rotations. A frame with some chained and some unchained pairs keeps all of
+      them measurable.
       * **Stored-to-stored pairs.** When the rule needs a chain for a pair that involves a
         stored keyframe, including a standpoint join of a new frame to stored keyframes, the job
         measures the stored-to-stored pairs that chain needs. Each is measured from the two
