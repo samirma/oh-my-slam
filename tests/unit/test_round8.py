@@ -197,7 +197,8 @@ def test_a_re_registered_stored_keyframe_is_a_frame_of_the_job_for_the_pass(tmp_
     m._rereg_state[kept.id] = (kept.T.copy(), kept.sigma_pos_m, kept.sigma_rot_deg, kept.state,
                                kept.method, kept.inliers, kept.rgb, kept.reason, kept.height_ok,
                                kept.seed, kept.seed_sigma,
-                               (kept.floor_ok, kept.grid_scale, kept.floor_factor))
+                               (kept.floor_ok, kept.grid_scale, kept.floor_factor,
+                                kept.floor_unjudged))
     kept.state, kept.reason = "fused", None
     m.reregistered = [{"name": "w", "keyframe": kept.id, "displacement_m": 0.0,
                        "displacement_deg": 0.0, "content": False, "objects": False}]

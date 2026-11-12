@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.core.atomic import atomic_write_json
-from oh_my_slam.core.log import get_logger
+from oh_my_slam.core.log import get_logger, log_context
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.schema import SCHEMA_VERSION
 from oh_my_slam.service.store import utc
@@ -89,6 +89,36 @@ class Job:
 
 
 Runner = Callable[[Job, Callable[[], None]], None]
+
+
+def job_summary(job: Job) -> dict[str, Any] | None:
+    """The service log's one line of an ended update job (README "Service log"): its id, map,
+    state and versions, ``quality.drift_correction``, and per input its name, status, committed
+    ``sigma_pos_m`` / ``sigma_rot_deg``, its prior's kind and sigmas (as used: the trust's
+    defaults for one sent without) and its ``prior_residual_*``; a client joins it with its own
+    truth on the job id and the input names to measure sigma containment. None for a job
+    without inputs."""
+    from oh_my_slam.mapping.anchor import prior_sigmas
+
+    if job.inputs is None:
+        return None
+    priors = {f.name: f.prior for f in getattr(job.work, "frames", None) or []}
+    rows = []
+    for r in job.inputs:
+        p = priors.get(r["name"])
+        sp, sr = prior_sigmas(p) if p is not None and p.get("trust") in (
+            "metric", "drifting") else (None, None)
+        rows.append({"name": r["name"], "status": r["status"], "sigma_pos_m": r["sigma_pos_m"],
+                     "sigma_rot_deg": r["sigma_rot_deg"],
+                     "prior": None if p is None else p.get("trust"),
+                     "prior_sigma_pos_m": sp, "prior_sigma_rot_deg": sr,
+                     "prior_sigma_tilt_deg": None if p is None else p.get("sigma_tilt_deg"),
+                     "prior_residual_m": r["prior_residual_m"],
+                     "prior_residual_deg": r["prior_residual_deg"]})
+    q = job.quality or {}
+    return {"job_id": job.id, "map": job.map, "state": job.state,
+            "base_version": job.base_version, "result_version": job.result_version,
+            "drift_correction": q.get("drift_correction"), "inputs": rows}
 
 
 class Jobs:
@@ -266,6 +296,13 @@ class Jobs:
                     self._cond.wait()
                 self.running = jid
             job.started = time.time()
+            with log_context(f"job {jid}"):  # every line it logs carries its id
+                self._run(job)
+
+    def _run(self, job: Job) -> None:
+        """One job on the worker (``_work``), then its summary line (``job_summary``)."""
+        jid = job.id
+        try:
             try:
                 self.runner(job, lambda j=job: self.changed(j))  # type: ignore[misc]
             except Exception as exc:  # a bug: the job fails, the worker goes on
@@ -273,11 +310,14 @@ class Jobs:
                 job.state = "failed"
                 job.error = ApiError("internal", f"internal error: {type(exc).__name__}: {exc}",
                                      {"stage": "job"}).body()
-            finally:
-                job.work = None
-                self.running = None
-                if job.active:  # a runner that returned without ending the job
-                    job.state = "failed"
-                    job.error = ApiError("internal", "the job ended without a result",
-                                         {"stage": "job"}).body()
-                self.changed(job)
+            summary = job_summary(job)
+            if summary is not None:
+                log.info("job summary %s", json.dumps(summary, separators=(",", ":")))
+        finally:
+            job.work = None
+            self.running = None
+            if job.active:  # a runner that returned without ending the job
+                job.state = "failed"
+                job.error = ApiError("internal", "the job ended without a result",
+                                     {"stage": "job"}).body()
+            self.changed(job)

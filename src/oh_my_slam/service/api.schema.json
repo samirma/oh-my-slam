@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.4. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.5. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -409,7 +409,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "The committed pose. Null for a frame whose status is rejected. For the frames of a job the gate (accept_if) rejected, which keep their own statuses: the pose that would have been committed. sigma_pos_m and sigma_rot_deg follow the same rule."
         },
         "sigma_pos_m": {
           "type": [
@@ -430,19 +431,19 @@
             "number",
             "null"
           ],
-          "description": "Residual between the committed pose and the frame's prior; null without a prior."
+          "description": "Residual between the committed pose and the frame's prior as placed (a drifting prior through the drift estimate, map.md section 1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is quality.max_displacement_m / max_displacement_deg, frames without a prior aside (those are measured against their image-only pose)."
         },
         "prior_residual_deg": {
           "type": [
             "number",
             "null"
           ],
-          "description": "Residual between the committed pose and the frame's prior; null without a prior."
+          "description": "Residual between the committed pose and the frame's prior as placed (a drifting prior through the drift estimate, map.md section 1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is quality.max_displacement_m / max_displacement_deg, frames without a prior aside (those are measured against their image-only pose)."
         },
         "depth_scale": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "oms/2.4. Present when a per-frame depth scale was applied to the frame's monocular depth (map.md section 2, floor check): the factor applied to its raw depth, in map metres, k x H / h_f, in place of the map's scale. Absent otherwise."
+          "description": "oms/2.4. Present when a per-frame depth scale was applied to the frame's monocular depth (map.md section 2, floor check): the factor applied to its raw depth, in map metres, k x H / h_f, in place of the map's scale. Absent otherwise, also for a frame the floor check did not judge (detail floor_not_judged)."
         },
         "min_distance_m": {
           "type": "number",
@@ -464,14 +465,15 @@
               "enum": [
                 "no_image_pose",
                 "loose_image_pose",
-                "conflict_unsupported"
+                "conflict_unsupported",
+                "floor_not_judged"
               ]
             },
             {
               "type": "null"
             }
           ],
-          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference)."
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference). oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k and has no depth_scale. The first three values occur only with kept_at_prior; floor_not_judged never does."
         }
       },
       "allOf": [
@@ -589,9 +591,7 @@
           "if": {
             "properties": {
               "status": {
-                "not": {
-                  "const": "kept_at_prior"
-                }
+                "const": "rejected"
               }
             },
             "required": [
@@ -602,6 +602,52 @@
             "properties": {
               "detail": {
                 "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "kept_at_prior"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "not": {
+                  "const": "floor_not_judged"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "registered",
+                  "provisional"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "enum": [
+                  "floor_not_judged",
+                  null
+                ]
               }
             }
           }
@@ -651,6 +697,31 @@
         }
       }
     },
+    "DriftCorrection": {
+      "type": "object",
+      "required": [
+        "translation_m",
+        "rotation_deg",
+        "odo_scale"
+      ],
+      "properties": {
+        "translation_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Largest translation, over the job's frames with a drifting prior, between the prior as sent and as placed."
+        },
+        "rotation_deg": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Largest rotation, over the same frames, between the prior as sent and as placed."
+        },
+        "odo_scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "The estimate's odometry scale: map metres per odometry metre; 1 without scale evidence."
+        }
+      }
+    },
     "Residuals": {
       "type": "object",
       "required": [
@@ -696,7 +767,8 @@
         "reregistered",
         "height_inconsistent",
         "floor_inconsistent",
-        "rotation_pairs"
+        "rotation_pairs",
+        "drift_correction"
       ],
       "properties": {
         "scale_ratio_vs_prev": {
@@ -836,7 +908,18 @@
           "items": {
             "type": "string"
           },
-          "description": "oms/2.4. Names of frames the floor check excluded from content (no cloud, grid evidence or objects; status, pose and sigmas unchanged): the frame's own floor height h_f differs from the sent height H by more than 3 x sqrt(height_sigma^2 + (depth_sigma x H)^2 + sigma_z^2) (sensor depth), or the monocular depth scale k x H / h_f lies beyond the monocular scale bound. A monocular frame rescaled and kept is not listed (its input status gives depth_scale). Empty when none."
+          "description": "oms/2.4. Names of frames the floor check excluded from content (no cloud, grid evidence or objects; status, pose and sigmas unchanged): the frame's own floor height h_f differs from the sent height H by more than 3 x sqrt(height_sigma^2 + (depth_sigma x H)^2 + sigma_z^2) (sensor depth), (sensor depth frames only). A monocular frame is never listed: one whose own depth scale k x H / h_f was applied gives depth_scale in its input status, and one whose scale lies beyond the monocular scale bound is not judged and keeps k (its input status has detail floor_not_judged). Empty when none."
+        },
+        "drift_correction": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DriftCorrection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "oms/2.5. The drift estimate's correction at the job's frames, from the prior as sent to the prior as placed (map.md section 1, Drift estimate), over the job's frames with a drifting prior: the estimate the frames were placed with (on a dry run, the one it would place them with). Null when no frame of the job has a drifting prior. The identity estimate gives translation_m 0, rotation_deg 0, odo_scale 1."
         },
         "rotation_pairs": {
           "type": "array",

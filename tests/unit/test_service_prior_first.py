@@ -258,6 +258,8 @@ def test_drifting_map_and_frames_without_prior(client: Client) -> None:
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "committed" and job["quality"]["prior_residuals"] is None
     fr, files = frames_for(client, truth[1:], tag="b", trust="drifting", priors=odo[1:])
+    for f, T in zip(fr, truth[1:], strict=True):  # sigmas grown with travel (api.md §3, oms/2.5)
+        f["prior"]["sigma_pos_m"] = 0.02 + 0.10 * float(T[0, 3] + 0.9)
     nf, nfiles = frames_for(client, [base_pose(0, -0.5, 0.0)], tag="n", trust=None)
     nf[0]["prior"] = {"trust": "none"}
     job = client.update("m", fr + nf, {**files, **nfiles})
@@ -414,6 +416,8 @@ def test_a_re_sweep_after_an_odometry_slip(client: Client) -> None:
     slips = [-30.0, 25.0, 25.0, 25.0]  # the first slipped otherwise: a conflict of its own
     fr, files = frames_for(client, truth, tag="s", trust="drifting",
                            priors=[_slip(T, d) for T, d in zip(truth, slips, strict=True)])
+    for f in fr:  # a 5° sigma allows the correction (oms/2.5, map.md §1 "Drift estimate")
+        f["prior"]["sigma_rot_deg"] = 5.0
     out = dry(client, "m", fr, files)
     want = ["rejected"] + ["registered"] * 3
     assert [r["predicted_status"] for r in out["frames"]] == want

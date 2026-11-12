@@ -271,12 +271,13 @@ def test_one_strong_frame_alone_never_makes_a_drift_estimate(tmp_path: Path) -> 
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     T = base_pose(20)
-    p = m.update([frame("d", T, p=prior(_rot_z(T, 25.0), "drifting"))])[0]
+    # (a 5° prior sigma: since oms/2.5 a correction the priors' sigmas do not allow is not made)
+    p = m.update([frame("d", T, p=prior(_rot_z(T, 25.0), "drifting", sr=5.0))])[0]
     assert (p.status, p.reason) == ("rejected", "prior_conflict")
     m2 = new_map(tmp_path / "three")
     m2.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
     truth = [base_pose(y) for y in (10, 20, 40)]
-    pls = m2.update([frame(f"d{k}", T, p=prior(_rot_z(T, 25.0), "drifting"))
+    pls = m2.update([frame(f"d{k}", T, p=prior(_rot_z(T, 25.0), "drifting", sr=5.0))
                      for k, T in enumerate(truth)])
     assert [p.status for p in pls] == ["registered"] * 3
 
@@ -646,8 +647,9 @@ def test_a_pure_turn_in_45_degree_steps_passes_the_rotation_check(
     assert job["state"] == "committed" and job["quality"]["failed_checks"] == [], job["quality"]
     assert len(got) == 8 and {c.a for c in got} | {c.b for c in got} == {f"f{k}" for k in range(8)}
     # the refined rotations vary a little with the RANSAC samples drawn (OpenCV's global random
-    # state, which earlier tests advance): within 2.5 deg of the truth here, far inside the 10 deg
+    # state, which earlier tests advance): within 3.5 deg of the truth here, far inside the 10 deg
     # pair limit, against 3.9 and 6.2 deg before the refinement (2.3 deg on the geometric engine
-    # since the floor check gives each monocular keyframe its own depth scale, oms/2.4)
+    # while the floor check's own depth scale reached registration, oms/2.4; 3.1 deg since it is
+    # the content's only and registration lifts at k, P26-2)
     deg = sorted(c.deg for c in got)
-    assert deg[-1] < 2.5 and float(np.median(deg)) < 0.8, got
+    assert deg[-1] < 3.5 and float(np.median(deg)) < 0.8, got

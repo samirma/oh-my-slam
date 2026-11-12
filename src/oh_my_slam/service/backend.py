@@ -203,7 +203,7 @@ def read_anchored(mapper_dir: Path) -> InternalMap:
                         "R": o.box.R.tolist(), "size": o.box.size.tolist()})
         return out
 
-    return InternalMap(frames, floor, bounds, False, am.depth_of,
+    return InternalMap(frames, floor, bounds, False, am.content_depth,
                        np.asarray(xyz[:, 2], np.float64) if len(xyz) else None, am.image_path,
                        cloud, objects, am.ignore_of)
 

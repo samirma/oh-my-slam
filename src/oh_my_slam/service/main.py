@@ -132,8 +132,13 @@ def _bind(host: str, port: int) -> socket.socket:
 
 
 def _log_to(path: Path) -> None:
+    from oh_my_slam.core.log import ContextFilter
+
     handler = logging.FileHandler(path, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    # each line with the job (or locate) it belongs to (``log_context``)
+    handler.addFilter(ContextFilter())
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s%(context)s: %(message)s"))
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "oh_my_slam", ""):
         logger = logging.getLogger(name)
         logger.handlers = [handler]

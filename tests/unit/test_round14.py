@@ -239,8 +239,9 @@ def test_floor_verdicts() -> None:
     # a monocular depth: its own scale, H / h_f, or out beyond the bound
     got = an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 1.2, Kg)
     assert got.ok and got.factor == pytest.approx(1 / 1.2, rel=0.02)
-    assert not an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 2.0, Kg).ok
-    assert an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 1.2, Kg, rel=1.6).ok is False
+    # beyond the bound: not judged, kept at k (oms/2.5, P29a)
+    assert an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 2.0, Kg) == an.FloorCheck(judged=False)
+    assert not an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 1.2, Kg, rel=1.6).judged
     # not checked: no height, no depth, no plane
     assert an.floor_verdict("mono", None, 0.01, T, 0.05, z, Kg) == an.FloorCheck()
     assert an.floor_verdict("none", 0.5, 0.01, T, 0.05, z, Kg) == an.FloorCheck()
@@ -260,18 +261,19 @@ def _cloud_floor(m: AnchoredMap) -> np.ndarray:
 
 def test_a_monocular_frame_with_a_wrong_scale_gives_no_content(tmp_path: Path) -> None:
     """Diagnosis test 2 (F1): a 360 deg monocular sweep with two adjacent frames whose depth is
-    half the others' (as look008/009 were): they stay registered but give no cloud points nor
-    objects, and ``floor_inconsistent`` lists them; the others take their own scale."""
+    half the others' (as look008/009 were): they stay registered and, since oms/2.5 (P29a), are
+    not judged: they keep k and their content and are not listed; the others take their own
+    scale."""
     m = AnchoredMap(tmp_path / "m")
     m.update([frame("a0", base_pose(0), depth=None, mono=1.3)])
     half = {"s5", "s6"}
     pls = m.update([frame(f"s{k}", base_pose(30.0 * k + 15.0), depth=None,
                           mono=0.65 if f"s{k}" in half else 1.3) for k in range(12)])
     assert all(p.status == "registered" for p in pls)
-    assert set(m.floor_inconsistent) == half
+    assert m.floor_inconsistent == []
     kf = {k.name: k for k in m.keyframes}
     for n in half:
-        assert not kf[n].floor_ok and not kf[n].contributes() and not kf[n].detects()
+        assert kf[n].floor_ok and kf[n].floor_unjudged and kf[n].contributes()
         assert kf[n].depth_scale is None
     kept = [k for k in m.keyframes if k.name not in half and k.depth_scale is not None]
     assert len(kept) >= 6
@@ -279,8 +281,6 @@ def test_a_monocular_frame_with_a_wrong_scale_gives_no_content(tmp_path: Path) -
         assert k.depth_scale == pytest.approx(1 / 1.3, rel=0.05)
     floor, sigma = m.floor()
     assert floor is not None and abs(floor) < 0.03 and sigma <= 0.02
-    z = _cloud_floor(m)
-    assert np.percentile(z, 99) < 0.06  # no floor sheet 0.15-0.25 m up
 
 
 def test_a_sensor_frame_whose_depth_disagrees_with_its_height(tmp_path: Path) -> None:
@@ -311,13 +311,22 @@ def test_the_floor_check_on_reregistered_and_unseeded_keyframes(tmp_path: Path) 
     m.floor_inconsistent = []
     m._recheck_floor(k)
     assert k.floor_factor is not None and k.depth_scale == pytest.approx(1 / 1.3, rel=0.05)
-    assert m._depth_factor(k) == k.floor_factor
-    # its own floor's scale far from the map's now: out
+    # its own scale is its content's only (P26-2): registration keeps k
+    assert m._depth_factor(k, content=True) == k.floor_factor
+    assert m._depth_factor(k) == pytest.approx(m.scale.k / k.k_used)
+    # its own floor's scale far from the map's now: not judged, back at k (oms/2.5)
     m.scale.k *= 2.0
     m._recheck_floor(k)
-    assert not k.floor_ok and m.floor_inconsistent == [k.name]
+    assert k.floor_ok and k.floor_unjudged and k.floor_factor is None
+    assert m.floor_inconsistent == []
+    # a depth image far from its height: out, listed once
+    k.depth_kind = "sensor"
+    assert k.grid is not None
+    k.grid = (k.grid * 1.5).astype(np.float32)
     m._recheck_floor(k)
-    assert m.floor_inconsistent == [k.name]  # listed once
+    m._recheck_floor(k)
+    assert not k.floor_ok and m.floor_inconsistent == [k.name]
+    k.depth_kind = "mono"
     # without a depth grid: nothing to check
     k.grid, k.K_grid = None, None
     m._recheck_floor(k)
@@ -587,8 +596,8 @@ def test_floor_inconsistent_rows_feed_no_occupancy() -> None:
 
 def test_the_service_reports_the_floor_check(client: Client) -> None:  # noqa: F811
     """api.md §4 (oms/2.4): a monocular frame the floor check rescales reports ``depth_scale``;
-    one it excludes is in ``quality.floor_inconsistent`` (a dry run's too) and its version row
-    says so."""
+    one beyond the monocular bound is, since oms/2.5, not judged: in no ``floor_inconsistent``
+    (a dry run's neither), ``detail`` ``floor_not_judged``, its version row content kept."""
     cam = {**CAM, "height_above_floor_m": 0.5, "height_sigma_m": 0.01}
     fr, files = frames_for(client, [base_pose(0)], tag="a", depth=False)
     assert client.update("m", fr, files, cameras={"cam": cam})["state"] == "committed"
@@ -597,15 +606,16 @@ def test_the_service_reports_the_floor_check(client: Client) -> None:  # noqa: F
     key = hashlib.sha256(files["s2"]).hexdigest()
     client.backend.mono_depth[key] = client.backend.mono_depth[key] * 0.5
     d = dry(client, "m", fr, files)
-    assert d["quality"]["floor_inconsistent"] == ["s2"]
+    assert d["quality"]["floor_inconsistent"] == []
     job = client.update("m", fr, files)
     assert job["state"] == "committed"
-    assert job["quality"]["floor_inconsistent"] == ["s2"]
+    assert job["quality"]["floor_inconsistent"] == []
     rows = {i["name"]: i for i in job["inputs"]}
     assert "depth_scale" not in rows["s2"] and rows["s2"]["status"] == "registered"
+    assert rows["s2"]["detail"] == "floor_not_judged"
     assert all(rows[f"s{k}"].get("depth_scale", 0) > 0 for k in (0, 1, 3, 4))
     rec = {f["name"]: f for f in client.service.store.version("m")["frames"]}
-    assert rec["s2"]["floor_inconsistent"] and not rec["s1"]["floor_inconsistent"]
+    assert not rec["s2"]["floor_inconsistent"] and rec["s2"]["content"]
 
 
 # -- the older mapper ------------------------------------------------------------------------------
@@ -635,7 +645,8 @@ def test_the_older_mapper_checks_the_floor_on_its_grid() -> None:
     internal = type("M", (), {})()
     internal.depth = lambda name: z * 2.0
     fr = Fr()
-    assert Updater._floor_off(fr, internal, anchor.Sim3())  # type: ignore[arg-type]
+    # beyond the monocular bound: not judged (oms/2.5)
+    assert not Updater._floor_off(fr, internal, anchor.Sim3())  # type: ignore[arg-type]
     internal.depth = lambda name: z * 1.2
     assert not Updater._floor_off(fr, internal, anchor.Sim3())  # type: ignore[arg-type]
     fr.depth_m = z  # a depth image: the sensor bound
@@ -653,16 +664,18 @@ CAM_H = 0.339  # the client's camera height
 EMPTY = Room(boxes=[])
 
 
-def _phantom_frames() -> list[tuple[np.ndarray, np.ndarray, str]]:
+def _phantom_frames(lifts: tuple[float, ...] = (0.06, 0.065, 0.07, 0.075)
+                   ) -> list[tuple[np.ndarray, np.ndarray, str]]:
     """A turn in place of monocular keyframes in the empty room, camera 0.339 m high: every
-    other frame's depth is scaled so that its own floor lies 0.15-0.22 m high (a monocular
-    scale 35-56 % too small, as the client's), the others at the true scale."""
+    other frame's depth is scaled so that its own floor lies ``lifts`` high (0.06-0.075 m: a
+    monocular scale 18-22 % too small, within the monocular bound; the client's 0.15-0.22 m,
+    35-56 %, lie beyond it), the others at the true scale."""
     out = []
-    lifts = iter([0.15, 0.17, 0.20, 0.22])
+    it = iter(lifts)
     for k in range(8):
         T = base_pose(45.0 * k, 0.3, -0.2, CAM_H, 0.05, -20.0)
         _, z = render(EMPTY, T, K)
-        scale = 1.0 if k % 2 == 0 else (CAM_H - next(lifts)) / CAM_H
+        scale = 1.0 if k % 2 == 0 else (CAM_H - next(it)) / CAM_H
         out.append((T, (z * scale).astype(np.float32), "mono"))
     return out
 
@@ -706,16 +719,19 @@ def _grid_of(frames: list[tuple[np.ndarray, np.ndarray, str]], check: bool, floo
 
 def test_monocular_keyframes_with_a_raised_floor_lose_their_phantom_floor() -> None:
     """Regression of the client's ``task_map`` (monocular keyframes, camera 0.339 m), on a
-    synthetic copy: monocular frames whose own floor lies 0.15-0.22 m high make many occupied
+    synthetic copy: monocular frames whose own floor lies 0.06-0.075 m high make many occupied
     cells within 1 m of the cameras on the empty floor; under the floor check (map.md §2,
     oms/2.4: each takes its own scale from the sent height) about none, and the SD of the
-    floor's heights about halves."""
+    floor's heights about halves. The client's 0.15-0.22 m (an own scale beyond the monocular
+    bound) are, since oms/2.5 (P29a), not judged: they keep k and their content."""
     frames = _phantom_frames()
     before, sd0, r0 = _grid_of(frames, False)
     after, sd1, r1 = _grid_of(frames, True)
-    assert before >= 100  # 158 here
+    assert before >= 100  # 182 here
     assert after <= 10  # 0
-    assert sd1 <= 0.6 * sd0 and r1 <= r0  # 0.094 m -> 0.0 m
+    assert sd1 <= 0.6 * sd0 and r1 <= r0  # 0.033 m -> 0.0 m
+    far = _phantom_frames((0.15, 0.17, 0.20, 0.22))
+    assert _grid_of(far, True) == _grid_of(far, False)  # not judged: as they are
 
 
 @pytest.fixture

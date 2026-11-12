@@ -68,11 +68,18 @@ from oh_my_slam.mapping.anchored import (
     floor_verdict,
     lowest_layer,
     natural_key,
+    pose_residual,
+    version_floor,
 )
 from oh_my_slam.mapping.anchored import (
     drift_grown as anchored_drift_grown,
 )
-from oh_my_slam.mapping.quality import displacement_quality, gate, residual_stats
+from oh_my_slam.mapping.quality import (
+    displacement_quality,
+    drift_correction,
+    gate,
+    residual_stats,
+)
 from oh_my_slam.segmentation.detect import normalize_label
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
 from oh_my_slam.service.cameras import (
@@ -224,6 +231,22 @@ class _Anchored:
     # a map without priors whose first registered frame has a camera height: that height (the
     # origin is the floor below that frame, map.md §1); carried by every later version
     origin_height_m: float | None = None
+
+
+def mapper_drift_correction(frames: list[_Frame], drift_sim: Sim3 | None
+                            ) -> dict[str, Any] | None:
+    """``quality.drift_correction`` (map.md §4, oms/2.5) on the older mapper: its frames'
+    ``drifting`` priors as sent against as placed through the drift estimate (``drift_sim``
+    maps the map frame onto the odometry's: a prior is placed by its inverse; the identity
+    without one); None without such a frame."""
+    to_map = Sim3() if drift_sim is None else drift_sim.inverse()
+    moved = []
+    for fr in frames:
+        if fr.work.trust != "drifting" or fr.work.prior is None:
+            continue
+        P = _mat(fr.work.prior["T_map_cam"])
+        moved.append(pose_residual(P, to_map.pose(P)))
+    return drift_correction(moved, to_map.s)
 
 
 def _mat(T: Any) -> NDArray[np.float64]:
@@ -1038,7 +1061,7 @@ class Updater:
         # map.md §1): a kept-only first update fails the hard limit
         quality = self._quality(frames, registered, kept if record is not None else [], prev,
                                 anchored, w.accept_if, result is not None and result[1].rebuilt,
-                                no_prior, bool(bad), rotation_pairs)
+                                no_prior, bool(bad), rotation_pairs, drift[0])
         job.quality = quality
         if anchored is not None:
             job.scale_source, job.scale_sigma_rel = anchored.scale_source, round(
@@ -1113,7 +1136,8 @@ class Updater:
         A frame it fails is left out of the grid's evidence (``derived``: occupancy, free space,
         heights); the mapper's own cloud and objects, which its process builds, still hold it,
         and a monocular frame the check keeps is not rescaled: the mapper fits each monocular
-        keyframe's depth scale itself (README, known limitations)."""
+        keyframe's depth scale itself (README, known limitations). A monocular frame beyond the
+        monocular scale bound is not judged (``detail`` ``floor_not_judged``, oms/2.5)."""
         assert fr.internal is not None
         d = internal.depth(fr.internal.name)
         if d is None or fr.pose is None or fr.sigma_pos_m is None:
@@ -1121,8 +1145,11 @@ class Updater:
         depth = (np.asarray(d, np.float32) * np.float32(sim.s)).astype(np.float32)
         K = fr.cam.canonical().resized(depth.shape[1], depth.shape[0])
         hs = fr.work.height_sigma_m if fr.work.height_m is not None else fr.cam.height_sigma_m
-        return not floor_verdict("sensor" if _has_depth(fr) else "mono", _height(fr), hs,
-                                 fr.pose, fr.sigma_pos_m, depth, K).ok
+        chk = floor_verdict("sensor" if _has_depth(fr) else "mono", _height(fr), hs, fr.pose,
+                            fr.sigma_pos_m, depth, K)
+        if not chk.judged:  # beyond the monocular scale bound: not judged (oms/2.5)
+            fr.detail = "floor_not_judged"
+        return not chk.ok
 
     @staticmethod
     def _previous_drift(prev: dict[str, Any] | None
@@ -1263,6 +1290,9 @@ class Updater:
             # lies within FLOOR_BAND_SIGMAS of the floor points' spread of it
             floor = floor if floor is not None and abs(floor) <= FLOOR_BAND_SIGMAS * floor_sigma \
                 else 0.0
+        # the previous version's floor within the floor band of this one's (map.md §6, oms/2.5)
+        floor = version_floor(None if prev is None else prev.get("floor_z_m"), floor,
+                              floor_sigma)
         rows = {r["name"]: r for r in out}
         for fr in registered:
             if fr.internal is not None and self._height_off(fr, floor):
@@ -1306,7 +1336,8 @@ class Updater:
                  prev: dict[str, Any] | None, anchored: _Anchored | None,
                  accept_if: dict[str, float] | None, rebuilt: bool, no_prior: bool,
                  rotations_bad: bool = False,
-                 rotation_pairs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                 rotation_pairs: list[dict[str, Any]] | None = None,
+                 drift_sim: Sim3 | None = None) -> dict[str, Any]:
         rejected = len(frames) - len(registered) - len(kept)
         low = sum((fr.sigma_pos_m or 0.0) > LOW_CONFIDENCE_SIGMA_M
                   or (fr.internal is not None and fr.internal.low_confidence) for fr in registered)
@@ -1328,6 +1359,7 @@ class Updater:
             "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
             "floor_inconsistent": [fr.work.name for fr in registered if fr.floor_off],
             "rotation_pairs": list(rotation_pairs or []),
+            "drift_correction": mapper_drift_correction(frames, drift_sim),
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),
             "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,

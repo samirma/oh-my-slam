@@ -16,6 +16,7 @@ import pytest
 from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import anchored as an
+from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchored import AnchoredMap, Cloud, Drift, FrameIn, ScaleState
 from tests.synth.room import Room, base_pose, look, render
 
@@ -421,7 +422,10 @@ def test_rotation_only_without_depth(tmp_path: Path) -> None:
     # without a prior: rotation at the best-matched keyframe's centre
     q = m.update([frame("q", look(-20, (0.0, 0.0, 0.5)), p=None, depth=False)])[0]
     assert q.status == "registered" and q.method == "rotation"
-    assert q.sigma_pos_m == an.UNANCHORED_SIGMA_POS_M
+    # its position sigma: at least the unanchored one; the monocular noise floor (0.15 m since
+    # oms/2.5) is larger
+    assert q.sigma_pos_m == pytest.approx(max(an.UNANCHORED_SIGMA_POS_M,
+                                              sigmas.floor_of(False, None)[0]), abs=0.005)
 
 
 def test_rotation_failing_is_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -473,10 +477,15 @@ def test_drifting_walk_with_odometry_overcount(tmp_path: Path) -> None:
         return P
 
     truth = [base_pose(0, -1.0 + 0.2 * k, 0.0) for k in range(9)]
-    m.update([frame("w0", truth[0], p=prior(odo(truth[0]), "drifting"))])
+
+    def odo_prior(T: np.ndarray) -> dict[str, Any]:
+        # a drifting prior's sigma grown with the travel since the client's fix (api.md §3,
+        # 10 % of it): since oms/2.5 a prior is weighed by its sigma (map.md §1)
+        return prior(odo(T), "drifting", 0.02 + 0.10 * float(np.linalg.norm(T[:2, 3] - [-0.9, 0.0])))
+
+    m.update([frame("w0", truth[0], p=odo_prior(truth[0]))])
     assert m.created_with == "drifting"
-    pls = m.update([frame(f"w{k}", truth[k], p=prior(odo(truth[k]), "drifting"))
-                    for k in range(1, 9)])
+    pls = m.update([frame(f"w{k}", truth[k], p=odo_prior(truth[k])) for k in range(1, 9)])
     assert all(p.status == "registered" for p in pls)
     assert err(pls[-1].T, truth[-1])[0] < 0.03  # the depth images fix the over-count
     assert m.drift.odo_scale == pytest.approx(1 / 1.08, rel=0.03)
@@ -486,9 +495,10 @@ def test_drifting_walk_with_odometry_overcount(tmp_path: Path) -> None:
     # an unconfirmed drifting frame goes where the corrected odometry puts it
     blank = np.full((K.height, K.width, 3), 120, np.uint8)
     T = base_pose(0, 0.9, 0.0)
-    p = m.update([frame("b", T, p=prior(odo(T), "drifting"), rgb=blank, depth=False,
-                        mono=1.0)])[0]
-    assert p.status == "kept_at_prior" and err(p.T, T)[0] < 0.03
+    p = m.update([frame("b", T, p=odo_prior(T), rgb=blank, depth=False, mono=1.0)])[0]
+    # (within 4 cm: since oms/2.5 the drift reference is the images' fit weighed against the
+    # priors as sent, not the last committed pose alone, map.md §1)
+    assert p.status == "kept_at_prior" and err(p.T, T)[0] < 0.04
     assert m.keyframes[-1].usable() is False  # a provisional drifting frame is no reference
 
 
@@ -816,7 +826,9 @@ def test_a_slipped_odometry_is_reanchored_on_two_agreeing_frames(tmp_path: Path)
     m = new_map(tmp_path)
     m.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
     truth = [base_pose(y) for y in (80, 65, 50)]
-    pls = m.update([frame(f"s{k}", T, p=prior(_slip(T, 25.0), "drifting"))
+    # the slipped priors' 5° sigma allows the correction (oms/2.5: a correction the priors'
+    # sigmas do not allow is not made, map.md §1)
+    pls = m.update([frame(f"s{k}", T, p=prior(_slip(T, 25.0), "drifting", sr=5.0))
                     for k, T in enumerate(truth)])
     assert [p.status for p in pls] == ["registered"] * 3
     for p, T in zip(pls, truth, strict=True):
@@ -824,7 +836,7 @@ def test_a_slipped_odometry_is_reanchored_on_two_agreeing_frames(tmp_path: Path)
     # a single strong conflict stays one; placements without an image pose never agree
     m2 = new_map(tmp_path / "one")
     m2.update([frame(f"a{k}", base_pose(30 * k), p="drifting") for k in range(4)])
-    p = m2.update([frame("s", truth[0], p=prior(_slip(truth[0], 25.0), "drifting"))])[0]
+    p = m2.update([frame("s", truth[0], p=prior(_slip(truth[0], 25.0), "drifting", sr=5.0))])[0]
     assert (p.status, p.reason) == ("rejected", "prior_conflict") and p.align_T is not None
 
 

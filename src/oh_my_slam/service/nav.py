@@ -20,11 +20,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
+from oh_my_slam.core.log import get_logger, log_context
 from oh_my_slam.mapping import anchor, checks, navgrid, relocalize, sigmas
 from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
 from oh_my_slam.service.store import Store, utc
+
+log = get_logger("oh_my_slam.service.nav")
 
 DEFAULT_CELL_M = 0.05
 MIN_CELL_M = 0.01
@@ -345,7 +348,36 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
            ) -> list[dict[str, Any]]:
     """One ``LocateResult`` per frame (api.md §6): ``plain`` and ``blur`` from the image checks,
     ``few_features`` below ``relocalize.MIN_INLIERS`` keypoints (fewer than a pose needs
-    inliers), else the pose, ``prior_conflict``, or ``no_overlap`` with its ``nearest_view``."""
+    inliers), else the pose, ``prior_conflict``, or ``no_overlap`` with its ``nearest_view``.
+    Each answer's sigmas and prior residual go to the service log (``locate_summary``)."""
+    with log_context(f"locate {dv.name} v{dv.version}"):
+        out = _locate(derived, dv, frames)
+        for fr, res in zip(frames, out, strict=True):
+            log.info("locate summary %s", json.dumps(locate_summary(fr, res),
+                                                     separators=(",", ":")))
+    return out
+
+
+def locate_summary(fr: LocateFrame, res: dict[str, Any]) -> dict[str, Any]:
+    """A locate answer's line in the service log: the frame's name, status and reason, its
+    sigmas, and its residual against the prior sent (m, deg; null without a prior or a pose), so
+    a client measures the located sigmas' containment against its own truth."""
+    p, T = fr.prior, res["T_map_cam"]
+    dm = dd = None
+    if p is not None and "T_map_cam" in p and T is not None:
+        A, B = np.asarray(T, np.float64), np.asarray(p["T_map_cam"], np.float64)
+        dm = round(float(np.linalg.norm(A[:3, 3] - B[:3, 3])), 4)
+        c = (float(np.trace(A[:3, :3].T @ B[:3, :3])) - 1.0) / 2.0
+        dd = round(math.degrees(math.acos(max(-1.0, min(1.0, c)))), 3)
+    return {"name": fr.name, "status": res["status"], "reason": res["reason"],
+            "sigma_pos_m": res["sigma_pos_m"], "sigma_rot_deg": res["sigma_rot_deg"],
+            "prior": None if p is None else p.get("trust"),
+            "prior_residual_m": dm, "prior_residual_deg": dd}
+
+
+def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
+            ) -> list[dict[str, Any]]:
+    """``locate``'s answers."""
     index = derived.index(dv)
     out = []
     for fr in frames:

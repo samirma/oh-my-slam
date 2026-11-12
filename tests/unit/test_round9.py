@@ -56,7 +56,12 @@ def test_a_drifting_frame_only_a_retry_confirmed_closes_the_drift(tmp_path: Path
     assert centre not in m.drift.support  # the job's own close did not see it
     m.close_job([p], [got["p"]])
     assert centre in m.drift.support
-    assert m.drift.ref_T is not None and np.allclose(m.drift.ref_T, got["p"].T)
+    # the reference at its prior: the weighted fit of its image-only pose against its prior as
+    # sent (oms/2.5, map.md §1), not its committed pose itself; here both lie at the truth
+    assert m.drift.ref_T is not None and m.drift.ref_prior is not None
+    assert np.allclose(m.drift.ref_prior, np.asarray(p.prior["T_map_cam"]))  # type: ignore[index]
+    dp, dr = an.pose_residual(m.drift.ref_T, got["p"].T)
+    assert dp < 0.01 and dr < 0.5
     m.end_job([got["p"]], False)
     assert m._close_base is None
 

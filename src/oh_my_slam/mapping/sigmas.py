@@ -48,16 +48,17 @@ DEPTH, NO_DEPTH = "depth", "nodepth"
 TRUSTS = ("metric", "drifting", "none")
 # (m, deg): the image-registration noise of one image pose, by data kind (module docstring).
 # With depth: the measured 7.2 mm / 1.06° of a pose fused with a metric prior of 2° (the default)
-# needs an image noise of about 8 mm / 1.25° (1 / 1.06² = 1 / 1.25² + 1 / 2²). Without depth:
-# the measured 2.1° is the image pose's own, plus monocular scale (10 %) on a 0.5 m baseline.
-# Without a prior, nothing bounds the chain: half again.
+# needs an image noise of about 8 mm / 1.25° (1 / 1.06² = 1 / 1.25² + 1 / 2²). Without depth
+# (api.md §6, oms/2.5 P29): the measured 2.1° is the image pose's own; its position, 0.15 m
+# whatever the prior, the median image-only error the client measured on monocular frames with
+# tight priors (0.08-0.22 m), the monocular depth's scale and bend included.
 NOISE_FLOORS: dict[str, tuple[float, float]] = {
     f"{DEPTH}/metric": (0.008, 1.25),
     f"{DEPTH}/drifting": (0.008, 1.25),
     f"{DEPTH}/none": (0.012, 1.25),
-    f"{NO_DEPTH}/metric": (0.05, 2.1),
-    f"{NO_DEPTH}/drifting": (0.05, 2.1),
-    f"{NO_DEPTH}/none": (0.075, 2.1),
+    f"{NO_DEPTH}/metric": (0.15, 2.1),
+    f"{NO_DEPTH}/drifting": (0.15, 2.1),
+    f"{NO_DEPTH}/none": (0.15, 2.1),
 }
 
 

@@ -76,6 +76,7 @@ from oh_my_slam.service.prior_first import (
     _frame_in,
     _has_depth,
     frame_class,
+    job_drift_correction,
     none_engine,
 )
 
@@ -173,6 +174,8 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
             am, list(placed.values()), pairs) if am is not None and pairs is not None \
             and not any(fr.work.trust in ("metric", "drifting") for fr in frames) else (False, [])
         again = [] if am is None else reregistered(am.reregistered)
+        # the estimate the job would place its drifting priors with (map.md §4, oms/2.5)
+        drift = job_drift_correction(am, frames) if engine else _mapper_drift(up, frames, prev)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         holds.close()  # what follows reads no stored file
@@ -192,6 +195,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "height_inconsistent": heights,
         "floor_inconsistent": floors,
         "rotation_pairs": rotation_pairs,
+        "drift_correction": drift,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
         else None,
@@ -274,6 +278,15 @@ def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Fr
         return "camera_height", max(float(np.median(rel)) / math.sqrt(len(rel)),
                                     MIN_SCALE_SIGMA_REL)
     return "monocular", MONOCULAR_SIGMA_REL
+
+
+def _mapper_drift(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None
+                  ) -> dict[str, Any] | None:
+    """``quality.drift_correction`` the older mapper would report (``mapper_drift_correction``,
+    the previous version's drift estimate)."""
+    from oh_my_slam.service.update import mapper_drift_correction
+
+    return mapper_drift_correction(frames, up._previous_drift(prev)[0])
 
 
 def _engine(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None, workdir: Path

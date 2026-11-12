@@ -1450,10 +1450,12 @@ def fuse_objects(am: AnchoredMap,
         kf = by_id.get(pl.keyframe or "")
         if kf is None or not kf.detects() or kf.grid is None or kf.K_grid is None:
             continue
-        todo.append((kf, kf.grid, own_ignore, path, fut))
+        grid = am.content_grid(kf)  # its content's depth (its own floor-check scale)
+        assert grid is not None
+        todo.append((kf, grid, own_ignore, path, fut))
     # a re-registered keyframe has its stored image (``AnchoredMap.reregister`` set ``rgb``)
     todo += [(kf, ref.depth, None, am.image_path(kf.id), fut) for kf, fut in again or []
-             for ref in [am._grid(kf)] if ref is not None]
+             for ref in [am._grid(kf, content=True)] if ref is not None]
     views = []
     for kf, grid, own_ignore, path, fut in todo:
         assert kf.rgb is not None and kf.K_grid is not None

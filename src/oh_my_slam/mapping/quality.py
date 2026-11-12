@@ -57,6 +57,19 @@ def displacement_quality(moved: list[tuple[float | None, float]]) -> dict[str, f
             "max_displacement_deg": round(max(r for _, r in moved), 3) if moved else None}
 
 
+def drift_correction(moved: list[tuple[float, float]], odo_scale: float
+                     ) -> dict[str, float] | None:
+    """``quality.drift_correction`` (map.md §4, oms/2.5): the largest translation and rotation
+    over the job's frames with a drifting prior between the prior as sent and as placed (one
+    (m, deg) pair per frame: ``moved``) and the estimate's odometry scale; None without such a
+    frame."""
+    if not moved:
+        return None
+    return {"translation_m": round(max(m for m, _ in moved), 4),
+            "rotation_deg": round(max(d for _, d in moved), 3),
+            "odo_scale": round(odo_scale, 5)}
+
+
 def reregistered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """``quality.reregistered`` (map.md §4) of the engine's re-registrations."""
     return [{k: e[k] for k in ("name", "displacement_m", "displacement_deg")} for e in entries]

@@ -339,8 +339,9 @@ def test_locate_places_frames_with_sigmas_and_records_the_pose(room_map: tuple[N
         assert res["status"] == "located" and res["reason"] is None
         err = np.linalg.norm(np.asarray(res["T_map_cam"])[:3, 3] - T[:3, 3])
         # calibrated (mapping.sigmas): this map's keyframes carry no depth kind, so the
-        # no-depth noise floor (2.1 deg) adds to the keyframes' own calibrated sigmas
-        assert err < 0.03 and 0 < res["sigma_pos_m"] < 0.15 and 2.1 <= res["sigma_rot_deg"] < 4
+        # no-depth noise floor (0.15 m / 2.1 deg, oms/2.5) adds to the keyframes' own sigmas
+        assert err < 0.03 and 0.15 <= res["sigma_pos_m"] < 0.2
+        assert 2.1 <= res["sigma_rot_deg"] < 4
         assert 0 < res["inlier_ratio"] <= 1 and res["ambiguity"] is None and res["rivals"] == []
     assert doc["frames"][0]["consistent_with_prior"] is None
     assert doc["frames"][1]["consistent_with_prior"] is True
@@ -361,10 +362,11 @@ def test_locate_places_frames_with_sigmas_and_records_the_pose(room_map: tuple[N
     del old["scale_source"], old["scale_sigma_rel"]
     path.write_text(json.dumps(old))
     assert nav.get("/api/maps/room/pose", "Pose")["scale_source"] == "priors"
-    # a prior 0.3 m off: within 3 x the drifting defaults (0.20 m / 5 deg), beyond the metric
-    # ones (0.05 m / 2 deg), where no hypothesis agrees with it: prior_conflict (api.md §6)
+    # a prior 0.6 m off: within 3 x hypot(the drifting defaults' 0.20 m, the 0.15 m monocular
+    # floor), beyond 3 x hypot(the metric ones' 0.05 m, 0.15 m), where no hypothesis agrees
+    # with it: prior_conflict (api.md §6; 0.3 m before the oms/2.5 floor)
     off = truth[0].copy()
-    off[0, 3] += 0.3
+    off[0, 3] += 0.6
     req = [{"name": t, "image": "q0", "camera_id": "cam",
             "prior": {"trust": t, "T_map_cam": off.tolist()}} for t in ("drifting", "metric")]
     drifting, conflict = nav.locate("room", {"frames": req}, files)["frames"]

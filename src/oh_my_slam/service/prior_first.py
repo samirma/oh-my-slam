@@ -50,6 +50,7 @@ from oh_my_slam.mapping.anchored_objects import ObjectMap, fuse_objects
 from oh_my_slam.mapping.quality import (
     displacement_quality,
     displacements,
+    drift_correction,
     gate,
     reregistered,
     residual_stats,
@@ -431,8 +432,12 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
         return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
                          fr.scene_m, fr.duplicate_of)
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
+    k = None if am is None or pl.keyframe is None or pl.status != "registered" \
+        else am.keyframe(pl.keyframe)
+    # a registered monocular frame the floor check did not judge (map.md §2, oms/2.5)
+    detail = "floor_not_judged" if k is not None and k.floor_unjudged else pl.detail
     return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
-                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, pl.detail,
+                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, detail,
                      _depth_scale(am, pl))
 
 
@@ -456,9 +461,10 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
               depth_scale: float | None = None) -> dict[str, Any]:
     """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
     null without a prior, with reason ``too_close`` the distance limit and the frame's median
-    scene depth, with reason ``duplicate`` the frame it duplicates, and ``detail`` (why the
-    images did not confirm a kept frame) only on a ``kept_at_prior`` frame not kept for a
-    failed check."""
+    scene depth, with reason ``duplicate`` the frame it duplicates, and ``detail``: why the
+    images did not confirm a kept frame, only on a ``kept_at_prior`` frame not kept for a
+    failed check; ``floor_not_judged`` (oms/2.5) only on a ``registered`` or ``provisional``
+    frame."""
     kept = status != "rejected"
     row = {"name": name, "status": status, "reason": reason, "inliers": inliers,
            "T_map_cam": np.asarray(T).round(6).tolist() if kept and T is not None else None,
@@ -466,7 +472,8 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
            "sigma_rot_deg": sigma_rot_deg if kept else None,
            "prior_residual_m": None if residual is None else round(residual[0], 4),
            "prior_residual_deg": None if residual is None else round(residual[1], 3),
-           "detail": detail if status == "kept_at_prior" else None}
+           "detail": detail if (status == "kept_at_prior") != (detail == "floor_not_judged")
+           and status != "rejected" else None}
     if reason == "too_close":
         row["min_distance_m"] = TOO_CLOSE_M
         row["scene_distance_m"] = round(scene_m if scene_m is not None else 0.0, 3)
@@ -475,6 +482,18 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
     if depth_scale is not None and kept:  # the floor check's own scale (map.md §2, oms/2.4)
         row["depth_scale"] = round(depth_scale, 5)
     return row
+
+
+def job_drift_correction(am: AnchoredMap | None, frames: list[_Frame]) -> dict[str, Any] | None:
+    """``quality.drift_correction`` (map.md §4, oms/2.5) of a job's (or a dry run's) frames
+    with a ``drifting`` prior, through the estimate they were placed with (``am``'s
+    ``drift_moves``; the identity without a map); None without such a frame."""
+    priors = [fr.work.prior for fr in frames
+              if fr.work.trust == "drifting" and fr.work.prior is not None]
+    if not priors:
+        return None
+    moved, odo = am.drift_moves(priors) if am is not None else ([(0.0, 0.0)] * len(priors), 1.0)
+    return drift_correction(moved, odo)
 
 
 def prior_frames_rejected(frames: list[_Frame], status: dict[int, str]) -> bool:
@@ -751,6 +770,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "height_inconsistent": [] if am is None else list(am.height_inconsistent),
         "floor_inconsistent": [] if am is None else list(am.floor_inconsistent),
         "rotation_pairs": rotation_pairs,
+        "drift_correction": job_drift_correction(
+            am if am is not None or prev is None or not up.store.mapper_dir(w.map).exists()
+            else AnchoredMap.load(up.store.mapper_dir(w.map)), frames),
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats(shifts) if prev else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),

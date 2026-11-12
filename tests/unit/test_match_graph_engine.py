@@ -118,16 +118,18 @@ def test_one_mismatched_drifting_frame_moves_no_other_frame(tmp_path: Path) -> N
 
 def test_a_drift_change_needs_three_frames_and_half_the_job(tmp_path: Path) -> None:
     """Two of five drifting frames agreeing on a 25° slip cannot change the estimate: they are
-    rejected ``prior_conflict`` and the rest registered; three of three can."""
+    rejected ``prior_conflict`` and the rest registered; three of three can. (Since oms/2.5 the
+    fit weighs the images against the priors as sent: the slipped priors' 5° sigma allows the
+    correction, a 1° one would not, map.md §1.)"""
     truth = [base_pose(y) for y in (40, 50, 70, 80, 100)]
     slips = [0.0, 0.0, 0.0, 25.0, 25.0]
     m = _drift_map(tmp_path)
-    pls = m.update([frame(f"s{k}", T, p=prior(_rot_z(T, d), "drifting"))
+    pls = m.update([frame(f"s{k}", T, p=prior(_rot_z(T, d), "drifting", sr=5.0 if d else 1.0))
                     for k, (T, d) in enumerate(zip(truth, slips, strict=True))])
     assert [(p.status, p.reason) for p in pls] == [("registered", None)] * 3 + [
         ("rejected", "prior_conflict")] * 2
     m2 = _drift_map(tmp_path / "two")
-    pls = m2.update([frame(f"s{k}", T, p=prior(_rot_z(T, 25.0), "drifting"))
+    pls = m2.update([frame(f"s{k}", T, p=prior(_rot_z(T, 25.0), "drifting", sr=5.0))
                      for k, T in enumerate(truth[2:])])
     assert [p.status for p in pls] == ["registered"] * 3
     for p, T in zip(pls, truth[2:], strict=True):

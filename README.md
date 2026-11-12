@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.4) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.5) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -49,10 +49,22 @@ they need. New maps take the *prior-first registration* (below).
 * **Process.** Starlette under uvicorn. It binds `--host` on `--port` (0: a free port), starts
   the inference server in the background when it is not running (`server.sh --stop` stops it
   again only if it started it), and writes `server.sh: listening on http://<host>:<port>/` on
-  stderr once it accepts connections. Its log is `<data>/oms/service.log`; the inference server's
+  stderr once it accepts connections. Its log is `<data>/oms/service.log` (*Service log*
+  below); the inference server's
   log `~/Library/Caches/oh-my-slam/server.log` (`OH_MY_SLAM_RUNTIME_DIR` moves it). One service per data folder (`<data>/oms/service.lock`).
   `--keep-versions <n>` (at least 1, default **20**, `store.DEFAULT_KEEP_VERSIONS`) is the
   retention of *Versions and revert* (O2, below).
+* **Service log** (oms/2.5). Every line an update job logs (its registration's
+  `mapping.anchored` / `standpoint` lines) carries `[job <id>]`, and every locate line
+  `[locate <map> v<version>]` (`core.log.log_context`, `ContextFilter`; lines logged on a job's
+  helper threads, such as inference, carry none). An ended update job logs one line
+  `job summary {json}` (`jobs.job_summary`): its id, map, state, base and result versions,
+  `quality.drift_correction`, and per input its name, status, committed `sigma_pos_m` /
+  `sigma_rot_deg`, its prior's kind and sigmas as used (the trust's defaults for a prior sent
+  without; `sigma_tilt_deg` as sent) and `prior_residual_m` / `_deg`. Each locate answer logs
+  `locate summary {json}` (`nav.locate_summary`): name, status, reason, sigmas, and the
+  residual against the prior sent. A client joins these with its own truth on job id and input
+  name (locate: map, version and frame name) to measure sigma containment; no image is logged.
 * **Data.** Everything lives under `<data>/oms/`, beside what the older tools keep in the same
   folder: `maps/<name>/` (`map.json`: the cameras of its committed versions, mask digests, latest
   version, the first version the mapper map serves; `masks/`; `versions/<n>.json`, immutable,
@@ -70,7 +82,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.4; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.5; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -345,6 +357,16 @@ update needs a registration on the mapper's engine (its engine exemption, map.md
 `low_confidence_share` counts registered frames with `sigma_pos_m` > 0.10 m or the mapper's
 low-confidence flag, over the registered frames.
 
+**Drift correction** (oms/2.5, map.md §4, `mapping.quality.drift_correction`). Every job's and
+dry run's `quality.drift_correction` is null without a `drifting` prior, else the largest
+translation and rotation between a drifting frame's prior as sent and as placed, over all the
+job's drifting frames (rejected ones too), through the estimate the frames were placed with
+(`AnchoredMap.drift_moves`: the job's last registration's, after any change it accepted; on
+the older mapper the previous version's `drift_sim`), and its `odo_scale` (1 for the identity).
+Each input's `prior_residual_*` is measured from the prior as placed, and on a job the gate
+rejects `T_map_cam`, sigmas and prior residuals are those the job would have committed (the
+input statuses are built before the gate; a `rejected` frame has none).
+
 **Quality and gate** (map.md §4, `mapping.quality.gate`; the same for both engines and the dry run).
 `accept_if` is applied to the registration's report before the commit, each field on its own and
 only when given:
@@ -410,8 +432,7 @@ its data kind:
 | --- | --- |
 | `depth/metric`, `depth/drifting` | 8 mm, 1.25° (fused with a 2° metric prior: the measured 1.06°) |
 | `depth/none` | 12 mm, 1.25° |
-| `nodepth/metric`, `nodepth/drifting` | 5 cm, 2.1° (the measured 2.1°; monocular scale over a 0.5 m baseline) |
-| `nodepth/none` | 7.5 cm, 2.1° |
+| `nodepth/metric`, `nodepth/drifting`, `nodepth/none` | 0.15 m, 2.1° (oms/2.5, api.md §6: the measured 2.1°; 0.15 m, the median monocular image-only error measured with tight priors, 0.08–0.22 m) |
 
 *Depth* is a depth image on the references the pose was measured against (most of its inliers on
 depth keyframes; for locate, the version records each keyframe's `depth_kind`); *trust* the
@@ -572,8 +593,14 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   written before the supporters were kept grows from its reference. Within a job the drift
   estimate is the one in force when the job starts (every frame predicted from it, whatever its
   place in the request); after the job its registered drifting frames, in canonical name order,
-  become the new reference and supporters (`Drift.confirm`, with the odometry-scale evidence):
-  later jobs do not depend on the request order either. A job held open over both engines
+  become the new reference and supporters (`Drift.confirm`, with the odometry-scale evidence;
+  the reference pose is then the weighted fit of *Robust drift estimate* below, oms/2.5):
+  later jobs do not depend on the request order either. A monocular frame's odometry-scale
+  evidence measures its image baseline on its main reference's own depth alone (its scale held,
+  `FIXED_SCALE_SIGMA`; oms/2.5): with drifting priors weighed by their sigmas the references sit
+  near their priors rather than where their depths' scale puts them, and a pose on several
+  references mixed their scales (k came out 0.84 instead of 0.71 in
+  `test_drifting_priors_scale_monocular_depth_without_heights`; 0.70 now). A job held open over both engines
   closes its drift once more after the cross-engine phase (`AnchoredMap.close_job`, before
   `end_job`): from the same estimate, over every frame's final placement in canonical order,
   so a drifting frame only `retry_kept` confirmed counts like the others and none counts
@@ -585,8 +612,14 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   (that frame as the reference) each count the frames whose image pose lies within 3 ×
   sqrt(σ_prior² + σ_hypothesis²) of their prediction (position and rotation; σ_prior
   drift-grown, σ_hypothesis the image-only calibrated sigma). The trial with the most, refined
-  over its inliers (the chordal mean of the reference poses they imply), replaces the estimate
-  only with more inliers. A change larger than 3 × its own sigma (the RMS of its inliers'
+  over its inliers, replaces the estimate only with more inliers. The refinement (oms/2.5 P29,
+  `_refined_drift`) is the weighted mean of the reference poses its inliers' image-only poses
+  imply, each at 1/σ_image² (its calibrated sigma; a rotation-only pose's centre not at all),
+  and of those their priors as sent imply (the identity correction), each at 1/σ_prior² by the
+  prior's own sigma (rotations by the weighted chordal mean): a correction the priors' sigmas
+  do not allow is not made. After the job (`_close_drift`) the estimate's reference is that
+  weighted fit over the job's registered drifting frames at the last one's prior, never its
+  committed pose alone, so image errors no longer ratchet from job to job. A change larger than 3 × its own sigma (the RMS of its inliers'
   combined sigmas over √n), and a first estimate (a map whose frame no drifting prior fixed,
   before its first), need robust support (oms/2.2 P12): min(3, n) supporting inliers, n the
   job's drifting-prior frames that *can* support an estimate, whatever their final status, at
@@ -1004,26 +1037,34 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   mean's own variance (`w² σ_img² + (1−w)² σ_prior²`, `w` from the weights the fusion used, which
   floor the image pose at 5 cm / 1°), for a drifting prior the inverse-variance combination; floored
   at 1 mm and 0.01° (no longer at 1 cm / 0.1°).
-* **One fusion of image, prior and height** (oms/2.4 P26, `anchored.fuse_measures`). A frame with
-  a prior is the information-weighted mean of its image pose, its prior and, when sent, its camera
-  height (below), about its image pose: the image pose by the shape of its own covariance (the
-  height-pitch trade of a camera turning in place is kept) scaled to its calibrated sigmas (at
-  least the 5 cm / 1° image floors against a metric prior), the prior per axis. A drifting
-  prior stays one term of the joint Gauss-Newton on the frame's matches (as before); that
-  solve, by its covariance's shape at the combined sigmas above, is then fused with the prior's
-  pitch and roll when it gives `sigma_tilt_deg` (`tilt_measure`) and with the sent height. Not
-  done: weighing a drifting prior against the image pose's calibrated sigma as a metric one is
-  (the diagnosis's F2a). Tried, it let overconfident drifting priors (0.02 m against an 8 %
-  odometry over-count) pull the frames off the depth images' positions and moved the
-  odometry-scale evidence of monocular maps by 16 % (`test_drifting_walk_with_odometry_overcount`,
-  `test_drifting_priors_scale_monocular_depth_without_heights`). The reported sigmas are the
-  real covariances of the inputs carried through the weights (the RMS over the axes: the formulas
-  above when everything is isotropic).
-* **Sent height in registration** (map.md §2, oms/2.4 P26; `AnchoredMap._height_z`). With
-  `height_above_floor_m` and `height_sigma_m` sent and a map floor (priors or a camera height),
-  the camera's z is measured as the floor plus the height, weighted by `height_sigma_m`: the map
-  floor is the base version's floor estimate (`AnchoredMap.map_floor`, at the job's start), z 0
-  on a first update. It joins the image pose and the prior (above) and, for a frame without a
+* **One fusion of image, prior and height** (oms/2.4 P26, oms/2.5 P29; `anchored.fuse_measures`).
+  A frame with a prior is the information-weighted mean of its image pose, its prior and, when
+  sent, its camera height (below), about its image pose: the image pose at its calibrated
+  sigmas (at least the 5 cm / 1° image floors against a metric prior), isotropic on monocular
+  references (the covariance's shape does not describe monocular error) and by the shape of its
+  own covariance on depth-image references (the height-pitch trade of a camera turning in
+  place), the prior per axis (`prior_measure`, its pitch and roll by its `sigma_tilt_deg` when
+  given). `metric` and `drifting` priors take this one path (oms/2.5, the diagnosis's F1): a
+  drifting prior as placed through the drift estimate, with its drift-grown sigmas. Before, a
+  drifting prior was one term of the Gauss-Newton on the frame's raw matches, where hundreds of
+  pixel residuals outweighed any prior of a few centimetres, so the committed pose was in effect
+  the image-only pose (on monocular maps 0.1–0.5 m off with priors near truth). The reported
+  sigmas are the real covariances of the inputs carried through the weights (the RMS over the
+  axes: the formulas above when everything is isotropic).
+* **Sent height in registration** (map.md §2, oms/2.4 P26, oms/2.5 P29; `AnchoredMap._height_z`,
+  `map_floor`). With `height_above_floor_m` and `height_sigma_m` sent and a map floor (priors or
+  a camera height), the camera's z is measured as the floor plus the height, weighted by
+  hypot(`height_sigma_m`, the floor's own sigma). When priors fixed the map frame the floor is
+  z 0 (their origin's height) with sigma 0, unless the base version's floor estimate is the
+  observed plane beyond the floor band of z 0 (below); else it is the base version's
+  `floor_z_m` with its `floor_sigma_m`, and when that is an observed plane (not the convention's
+  z 0) measured on monocular depth (more contributing keyframes monocular than with depth
+  images) also the map's `scale_sigma_rel` × the height (root sum of squares). On a first update
+  the floor is the one the priors or camera height define, z 0, sigma 0 (nothing measured it
+  yet). Before oms/2.5 the target was always the cloud's plane nearest z 0 at
+  `height_sigma_m`: a monocular cloud's plane, biased by the depth's scale and bend (+0.06 m in
+  the diagnosis's replay), lifted every frame and, through the covariance's z–xy correlation,
+  moved it sideways. It joins the image pose and the prior (above) and, for a frame without a
   prior, its image pose alone (`with_height`, MapAnything's poses too); the committed pose and
   sigmas show it, and its displacement counts it. The height gate (below) then tests the frame's
   image-only pose with that pose's calibrated sigma, so it still measures a disagreement; a frame
@@ -1069,16 +1110,33 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   h_f measured in its own depth (map metres, as it would be fused) at its committed pose: the
   large horizontal plane below the camera nearest the sent height H (`own_floor`:
   `floor_candidates` on its points levelled by its rotation). Without such a plane, a height or a
-  floor, it is not checked; the height sigma defaults to 0.02 m (`DEFAULT_HEIGHT_SIGMA_M`).
+  floor, it is not checked; the height sigma defaults to 0.02 m (`DEFAULT_HEIGHT_SIGMA_M`). A
+  plane is a large one only (P26, `horizontal_plane`): its inliers' second principal spread (the
+  second singular value over √n) at least `FLOOR_EXTENT_REL` = 0.05 × its distance below the
+  camera and `FLOOR_FLAT_RATIO` = 8 times their thickness (the third), and their own (SVD) normal
+  within `FLOOR_TILT_DEG` of vertical. (A wall slice's second axis is its depth noise: 1.1–6.5 ×
+  the third over the walls measured; a floor's is 40 × and more. The diagnosis's 0.25 × the
+  distance rejected the narrow floor strips a 64 × 48 grid keeps after its depth-edge filter.) Before, a horizontal
+  slice of a wall (singular values 0.645 / 0.009 / 0.004 m against 0.612 / 0.478 / 0.0015 m for a
+  real floor) passed on depth noise, so a frame with no floor in view was judged on a wall
+  ribbon (a depth image excluded, a monocular frame given an arbitrary own scale); now it is
+  not checked.
   * A depth image whose |h_f − H| exceeds 3 × sqrt(height_sigma² + (σ_depth · H)² + σ_z²)
     (σ_depth `FLOOR_DEPTH_SIGMA_REL` = 0.01, the depth images' relative sigma; σ_z = the
     committed `sigma_pos_m` / √3) gives no content.
-  * A monocular depth takes its own scale, k · H / h_f (its stored depth grid times H / h_f, the
-    factor fixed for good: `Keyframe.floor_factor`, so the map's later k does not move it), for its
-    cloud points, grid evidence, objects and keypoint depths; its input status reports it as
+  * A monocular depth takes its own scale, k · H / h_f (its stored depth grid's factor H / h_f,
+    fixed for good: `Keyframe.floor_factor`, so the map's later k does not move it), for its
+    content only: its cloud points, grid evidence (`AnchoredMap.content_depth`) and objects
+    (`content_grid`). Its stored grid and keypoint depths stay at k, and registration lifting,
+    depth confirmation, `depth_of` (MapAnything's anchors) and scale evidence use k (P26-2,
+    `_depth_factor(k, content=False)`): before, the own scale reached the references' lifted
+    keypoints, spreading their scales by up to ±30 %. Its input status reports it as
     `depth_scale` (raw monocular depth to map metres). An own scale more than
     `MONO_FLOOR_BOUND_REL` = 0.30 (3 × `MONOCULAR_SIGMA_REL`, the monocular scale bound) from k,
-    relative, gives no content.
+    relative, is not judged (oms/2.5): the frame keeps k and its content, is not listed in
+    `floor_inconsistent`, has no `depth_scale`, and its registered input status has `detail`
+    `floor_not_judged` (`Keyframe.floor_unjudged`; the older mapper's too). Only depth images
+    are excluded.
   * A frame the check excludes keeps its status, pose, sigmas and reference role; it is not fused,
     its version row has `floor_inconsistent: true` (no occupancy, free space or heights from its
     depth, `service.derived`), it gives no objects (`Keyframe.detects`), and
@@ -1528,12 +1586,18 @@ server.
   version record's, estimated once at commit, before the objects are fused, which use the same
   two (`AnchoredMap.floor`): the surface the robot stands on, among the large horizontal planes
   of the fused cloud (image-confirmed frames only) below every confirmed camera holding ≥ 50 %
-  of the best one's points, the one nearest z 0 when priors fixed the frame; for a camera-only
+  of the best one's points, when priors fixed the frame z 0 itself unless the one nearest z 0
+  (without a plane, the lowest dense layer) lies beyond max(0.06 m, 3 × its own spread) of it
+  (oms/2.5: the origin is then not on it, as an arm's on a worktop): then that plane; for a camera-only
   map whose first frame had a camera height, z 0 (the floor that height defines, map.md §1),
   refined to the observed plane nearest it when that lies within 3 × its own points' spread of
   z 0 (`FLOOR_BAND_SIGMAS`; `floor_sigma_m` that spread), else 0 (the mapper's engine: its floor
   when within 3 × its spread of 0, else 0); otherwise the lowest; without one, the lowest dense
-  layer.
+  layer. **Across versions** (oms/2.5, map.md §6, on every map and both engines): a version keeps
+  the previous version's `floor_z_m` while the new estimate lies within max(0.06 m, 3 × the new
+  `floor_sigma_m`) of it (`AnchoredMap.floor`, the previous one in `state.json` `floor_z_m`;
+  `anchored.version_floor`; the older mapper's from the previous record), so frames on a
+  monocular map no longer flip the floor from version to version.
   `floor_sigma_m` is a robust standard deviation of the floor's own points' heights
   (`anchored.floor_spread`, oms/2.4 P26: 1.4826 × their median absolute deviation, over the
   points within 0.12 m of the floor, `FLOOR_SPREAD_M`; before, the half width at half maximum of
