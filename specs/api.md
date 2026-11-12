@@ -85,7 +85,10 @@ error code `invalid_request` (§9).
   * `image`, a part name;
   * `camera_id`;
   * an optional `prior` [`Prior`]. A prior without sigmas takes fixed defaults: `metric`
-    0.05 m / 2°, `drifting` 0.20 m / 5°. Clients should always send sigmas;
+    0.05 m / 2°, `drifting` 0.20 m / 5°. Clients should always send sigmas. A prior may also
+    give `sigma_tilt_deg` (oms/2.4), the 1-σ uncertainty of its pitch and roll, known from
+    gravity, independent of `sigma_rot_deg`; when given, pitch and roll are weighted by it and
+    yaw by `sigma_rot_deg` (map.md §1);
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name;
   * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
@@ -127,6 +130,7 @@ error code `invalid_request` (§9).
   | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty; null when rejected. |
+  | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's. Absent otherwise. |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior; null without a prior. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
