@@ -87,14 +87,17 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       two-view rotations along a path of measurable pairs that each have strictly more inliers
       than the pair. The rule is independent of the joint solve (§4). It cannot catch a lattice
       geometry that stays consistent around a whole cycle, or a pair with no stronger chain:
-      an accepted degenerate case, as above. A frame with two or more measurable pairs, none
-      of which has a chain of stronger pairs to be judged against, has those pairs outside the
-      pair limits (§4): they neither pass nor fail the rotation check, and such a frame never
-      rejects the job on its own. Depth confirmation does not change this. A pair without a
-      chain that is its frame's only measurable pair (for example the single pair of a
-      two-frame job, or a frame joined by one pair) stays measurable and is judged against the
-      committed rotations. A frame with some chained and some unchained pairs keeps all of
-      them measurable.
+      an accepted degenerate case, as above. Each frame of a measurable pair gives the pair a
+      verdict: a frame with two or more measurable pairs, none of which has a chain of stronger
+      pairs to be judged against, puts each of those pairs outside; a frame whose only
+      measurable pair has no chain (for example either frame of a two-frame job, or a frame
+      joined by one pair), or a frame with some chained and some unchained pairs, keeps its
+      pairs. A pair is outside the pair limits (§4) only when **both** its frames put it
+      outside; it then neither passes nor fails the rotation check, and it never rejects the
+      job on its own. Otherwise the pair stays measurable and is judged against the committed
+      rotations, so a sequence measured by its adjacent pairs only stays judged. Depth
+      confirmation does not change this. A false lattice pair kept this way can cause a
+      rejection, never a wrong commit.
       * **Stored-to-stored pairs.** When the rule needs a chain for a pair that involves a
         stored keyframe, including a standpoint join of a new frame to stored keyframes, the job
         measures the stored-to-stored pairs that chain needs. Each is measured from the two
