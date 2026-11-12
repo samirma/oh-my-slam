@@ -531,6 +531,8 @@ class Updater:
             mapper = workdir / f"mapper{attempt}"
             if self.store.mapper_dir(w.map).exists():
                 clone_tree(self.store.mapper_dir(w.map), mapper)
+            elif prev is not None:  # a new mapper map past every id the map gave (map.md §2)
+                self.store.seed_ids(w.map, mapper, anchored=False)
             paths = [fr.path for fr in todo if fr.path is not None]
             intrinsics = {fr.path: fr.cam.canonical() for fr in todo if fr.path is not None}
             try:

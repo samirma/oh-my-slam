@@ -441,13 +441,16 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     labels = map_labels(prev, w.labels)
     if todo:
         t = time.perf_counter()
-        if prev is not None:
+        if prev is not None and up.store.mapper_dir(w.map).exists():
             clone_tree(up.store.mapper_dir(w.map), mapper)
             am = AnchoredMap.load(mapper)
             k_prev = am.scale.k
             stored = list(am.keyframes)
         else:
             mapper.mkdir(parents=True, exist_ok=True)
+            # a new mapper map numbers its objects and surfaces past every id the map gave
+            # (a revert to a version without a stored mapper map: map.md §2 Revert)
+            up.store.seed_ids(w.map, mapper, anchored=True)
             am = AnchoredMap(mapper)
         am.begin_job()
         tm["clone"] = round(time.perf_counter() - t, 3)

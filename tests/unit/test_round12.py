@@ -132,6 +132,124 @@ def test_a_revert_never_reuses_an_object_id(tmp_path: Path) -> None:
     assert object_ids.next_id(store.mapper_dir("m")) == 12
 
 
+def test_surface_ids_count_and_a_revert_raises_them(tmp_path: Path) -> None:
+    """map.md §2 Revert (P23): surface ids follow the object-id rule: a revert raises the
+    clone's surface counter to the map's high-water mark, never back to the target's."""
+    from oh_my_slam.mapping.anchored_objects import ObjectMap
+
+    a = _anchored(tmp_path / "a", {"objects": [], "next_id": 2, "surface_ids": [],
+                                   "next_surface_id": 3, "version": 0, "surfaces": []})
+    assert object_ids.next_ids(a) == object_ids.Ids(2, 3)
+    object_ids.reserve(a, object_ids.Ids(2, 6))  # the objects' counter stays, surfaces rise
+    assert (ObjectMap.load(a).next_id, ObjectMap.load(a).next_surface_id) == (2, 6)
+    b = _anchored(tmp_path / "b")
+    object_ids.reserve(b, object_ids.Ids(1, 4))
+    assert ObjectMap.load(b).next_surface_id == 4
+    # the older mapper numbers no surfaces: its objects file gets no surface counter
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "objects.json").write_text(json.dumps({"next_id": 2, "objects": []}))
+    object_ids.reserve(old, object_ids.Ids(5, 7))
+    assert json.loads((old / "objects.json").read_text()) == {"next_id": 5, "objects": []}
+    store = Store(tmp_path / "s")
+    store.create()
+
+    def mapper(tag: str, objects: int, surfaces: int) -> Path:
+        return _anchored(store.work / f"m-{tag}", {"objects": [], "next_id": objects,
+                                                   "surface_ids": [],
+                                                   "next_surface_id": surfaces,
+                                                   "version": 0, "surfaces": []})
+
+    store.commit("m", REC, mapper("1", 2, 2))
+    store.commit("m", REC, mapper("2", 2, 5))  # surfaces 2..4 in version 2
+    assert store.revert("m", 1) == 3
+    assert object_ids.next_ids(store.mapper_dir("m")) == object_ids.Ids(2, 5)
+    assert store.id_marks("m") == object_ids.Ids(2, 5)
+
+
+def test_a_new_mapper_map_is_seeded_with_the_marks(tmp_path: Path) -> None:
+    """map.md §2 Revert (P23): after a revert to a version without a stored mapper map, the
+    next mapper map a job builds numbers from the recorded high-water marks."""
+    from oh_my_slam.mapping.anchored_objects import ObjectMap
+    from oh_my_slam.mapping.store import MapReader
+
+    store = Store(tmp_path)
+    store.create()
+    assert store.seed_ids("m", tmp_path / "x", anchored=True) is False  # no mark: nothing
+    store.commit("m", REC, None)
+    assert store.seed_ids("m", tmp_path / "x", anchored=True) is False
+    store.commit("m", REC, _anchored(store.work / "m2", {
+        "objects": [], "next_id": 8, "surface_ids": [], "next_surface_id": 4, "version": 0,
+        "surfaces": []}))
+    assert store.revert("m", 1) == 3  # version 1 had no mapper map
+    assert store.mapper_for("m", 3) is None and not store.mapper_dir("m").exists()
+    assert store.id_marks("m") == object_ids.Ids(8, 4)
+    a = tmp_path / "anchored"
+    assert store.seed_ids("m", a, anchored=True)
+    assert (ObjectMap.load(a).next_id, ObjectMap.load(a).next_surface_id) == (8, 4)
+    old = tmp_path / "old"
+    assert store.seed_ids("m", old, anchored=False)
+    assert object_ids.next_id(old) == 8
+    reader = MapReader(old)  # a new map the older mapper extends
+    assert reader.frames == [] and reader.meta["update_count"] == 0
+
+
+def test_jobs_seed_a_new_mapper_map_on_both_engines(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """A job on a map with versions but no stored mapper map builds a new one numbering past
+    the recorded marks: the prior-first engine's object map, the older mapper's ``map.json``."""
+    from oh_my_slam.service import update as update_mod
+
+    _three(client)
+    store = client.service.store
+    meta = store.meta("m")
+    assert meta is not None
+    meta.update(next_object_id=40, next_surface_id=9)
+    store._write_meta("m", meta)
+    import shutil as sh
+
+    sh.rmtree(store.mapper_dir("m"))
+    seen: list[tuple[bool, int]] = []
+    real = Store.seed_ids
+
+    def spy(self: Store, name: str, mapper: Path, anchored: bool) -> bool:
+        out = real(self, name, mapper, anchored)
+        seen.append((anchored, object_ids.next_id(mapper)))
+        return out
+
+    monkeypatch.setattr(Store, "seed_ids", spy)
+    fr, files = frames_for(client, [base_pose(60.0)], tag="e")
+    assert client.update("m", fr, files)["state"] == "committed"
+    assert seen == [(True, 40)]
+    surfaces = client.get("/api/maps/m/objects", "Objects")["surfaces"]
+    assert surfaces and min(x["id"] for x in surfaces) >= 9
+    # the older mapper's path: the folder it extends holds the seeded count
+    from tests.fakes.service import CAMERA
+    from tests.unit.test_service_api import frames_of
+
+    old = client.backend.register
+    counts: list[int] = []
+
+    def register(mapper_dir: Path, *a: Any, **k: Any) -> Any:
+        counts.append(object_ids.next_id(mapper_dir))
+        return old(mapper_dir, *a, **k)
+
+    monkeypatch.setattr(client.backend, "register", register)
+    up = Updater(store, client.backend, prior_first=False)
+    frames, files, _ = frames_of(client, 2)
+    client.service.jobs.runner = up
+    assert client.update("o", frames, files, {"cam": CAMERA})["state"] == "committed"
+    meta = store.meta("o")
+    assert meta is not None
+    meta.update(next_object_id=30)
+    store._write_meta("o", meta)
+    sh.rmtree(store.mapper_dir("o"))
+    frames, files, _ = frames_of(client, 2, start=2)
+    client.update("o", frames, files)  # the new map lacks the stored frames: may be rejected
+    assert counts == [1, 30] and seen[-1] == (False, 30)
+    assert update_mod is not None
+
+
 def test_older_mapper_update_ids_follow_the_versions() -> None:
     """map.md §5 ``first_seen_version`` (SI-23): the older mapper's update ids become versions
     through each version's line: a version with no mapper update and a revert shift nothing."""

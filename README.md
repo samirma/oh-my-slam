@@ -118,12 +118,22 @@ they need. New maps take the *prior-first registration* (below).
     with its values and cannot be redefined (`camera_conflict`), and camera ids are never freed.
     A version's `cameras` (its summary's) are the registry at its commit, so a revert's list
     every camera defined so far, those defined after its target included.
-  * *Object ids.* Unique over the whole history and never reused (map.md §2, §5): the revert
-    raises the cloned mapper map's object counter (the prior-first `objects.json` `next_id`,
-    the older mapper's `map.json` `next_object_id` and `objects.json` `next_id`) to the map's
-    high-water mark (`service.object_ids`): the count of the mapper map it replaces, of its
-    target's, and the mark an earlier revert recorded (`map.json` `next_object_id`). A
-    revert's objects carry the target's `first_seen_version` / `last_seen_version`.
+  * *Object and surface ids.* Unique over the whole history and never reused (map.md §2, §5,
+    P23): the revert raises the cloned mapper map's counters (the prior-first `objects.json`
+    `next_id` and `next_surface_id`; the older mapper's `map.json` `next_object_id` and
+    `objects.json` `next_id`, it numbers no surfaces) to the map's high-water marks
+    (`service.object_ids`): the counts of the mapper map it replaces, of its target's, and the
+    marks an earlier revert recorded (`map.json` `next_object_id`, `next_surface_id`). The
+    surface registry (heights and outlines matched to ids) is the target's, so a surface found
+    again keeps the target's id and a new one numbers past the mark. A revert's objects carry
+    the target's `first_seen_version` / `last_seen_version`.
+  * *Targets without a stored mapper map* (a version from before mapper maps were kept per
+    version, 20e025b; `mapper_for` None): the revert has no clone to raise, so the marks stay
+    recorded, and the next job builds a new mapper map seeded with them (`Store.seed_ids`: an
+    empty prior-first object map with both counters, or the older mapper's new `map.json` with
+    its object count). The limit: that new mapper map holds none of the earlier keyframes, so the
+    job registers against nothing stored (the older mapper's quality gate may then reject it);
+    only the ids are guaranteed not to repeat.
   * *Jobs.* A revert is refused with `map_busy` (409, retryable) while a job of the map is
     registering (no fusion phase before O3); while jobs are only queued it proceeds, holding the
     job worker off that map while it commits (`jobs.Jobs.holding`, a count: holds nest), so a

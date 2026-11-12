@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
+from oh_my_slam.service import object_ids
 from oh_my_slam.service.errors import ApiError, invalid
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -385,8 +386,6 @@ class Store:
             return self._revert(name, to_version)
 
     def _revert(self, name: str, to_version: int) -> int:
-        from oh_my_slam.service import object_ids
-
         meta = self.require(name)
         latest = int(meta["latest_version"])
         if to_version < 1 or to_version > latest:
@@ -399,15 +398,16 @@ class Store:
                 raise ApiError(exc.code, exc.message, {**exc.details, "field": "to_version"}
                                ) from exc
             source = self.mapper_for(name, to_version)
-            # every id the map has given: the current map's count, and the mark of an earlier
-            # revert (the ids of the versions it reverted away)
+            # every object and surface id the map has given: the current map's counts, the
+            # target's, and the marks of an earlier revert (the ids of the versions it reverted
+            # away)
             current = self.mapper_dir(name)
-            mark = max(int(meta.get("next_object_id") or 1),
-                       object_ids.next_id(current if current.exists() else None),
-                       object_ids.next_id(source))
+            mark = self.id_marks(name).max(
+                object_ids.next_ids(current if current.exists() else None)).max(
+                object_ids.next_ids(source))
             with self._lock:
                 fresh = self.meta(name) or meta
-                fresh["next_object_id"] = mark
+                fresh["next_object_id"], fresh["next_surface_id"] = mark.objects, mark.surfaces
                 self._write_meta(name, fresh)
             mapper = None
             if source is not None:
@@ -429,6 +429,23 @@ class Store:
             finally:
                 if mapper is not None:
                     shutil.rmtree(mapper, ignore_errors=True)
+
+    def id_marks(self, name: str) -> object_ids.Ids:
+        """The object and surface id high-water marks a revert recorded (map.md §2 Revert)."""
+        meta = self.meta(name) or {}
+        return object_ids.Ids(int(meta.get("next_object_id") or 1),
+                              int(meta.get("next_surface_id") or 1))
+
+    def seed_ids(self, name: str, mapper: Path, anchored: bool) -> bool:
+        """Before a job builds a new mapper map in ``mapper`` for a map that has versions but
+        no stored mapper map (a revert to a version from before mapper maps were kept): seed it
+        with the recorded high-water marks, so ids never repeat (map.md §2 Revert). False when
+        there is nothing to seed (no mark recorded)."""
+        marks = self.id_marks(name)
+        if marks == object_ids.Ids():
+            return False
+        object_ids.seed(mapper, marks, anchored)
+        return True
 
     def prune(self, name: str) -> None:
         """Retention (map.md §2): delete the versions older than the last ``keep_versions``,
