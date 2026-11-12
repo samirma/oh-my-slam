@@ -1525,7 +1525,7 @@
               "$ref": "#/$defs/Extent"
             }
           },
-          "description": "full or partial per box axis, from the views that bound it; partial on every axis when the map's builder never recorded those views."
+          "description": "full or partial per box axis, from the views that bound it; a view of the top seen uncut with a support plane measured under the footprint makes z full; partial on every axis when the map's builder never recorded those views."
         },
         "mean_rgb": {
           "type": "array",
