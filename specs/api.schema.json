@@ -473,7 +473,7 @@
               "type": "null"
             }
           ],
-          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference). oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k and has no depth_scale. The first three values occur only with kept_at_prior; floor_not_judged never does."
+          "description": "For a kept_at_prior frame whose images did not confirm it: why (no image pose; image pose too loose; conflicting image pose without enough support to reject). Null otherwise, including a frame kept for a failed check. loose_image_pose wins whatever else the frame fails. conflict_unsupported: beyond the conflict bound without meeting the measurable-pair threshold (>= 100 inliers and >= 10 % overlap with the same confirmed or registered reference). oms/2.5: floor_not_judged, only on a registered or provisional monocular frame: the floor check (map.md section 2) did not judge it because its own depth scale lay beyond the monocular scale bound; it keeps the map's scale k, has no depth_scale and is not rejected, but its content is excluded (no cloud points, no grid evidence, no objects; it still counts for free-by-rule cells), so the client can retake the view. The first three values occur only with kept_at_prior; floor_not_judged never does."
         }
       },
       "allOf": [
@@ -910,7 +910,7 @@
           "items": {
             "type": "string"
           },
-          "description": "oms/2.4. Names of frames the floor check excluded from content (no cloud, grid evidence or objects; status, pose and sigmas unchanged): the frame's own floor height h_f differs from the sent height H by more than 3 x sqrt(height_sigma^2 + (depth_sigma x H)^2 + sigma_z^2) (sensor depth), (sensor depth frames only). A monocular frame is never listed: one whose own depth scale k x H / h_f was applied gives depth_scale in its input status, and one whose scale lies beyond the monocular scale bound is not judged and keeps k (its input status has detail floor_not_judged). Empty when none."
+          "description": "oms/2.4. Names of frames the floor check excluded from content (no cloud, grid evidence or objects; status, pose and sigmas unchanged): the frame's own floor height h_f differs from the sent height H by more than 3 x sqrt(height_sigma^2 + (depth_sigma x H)^2 + sigma_z^2) (sensor depth), (sensor depth frames only). A monocular frame is never listed: one whose own depth scale k x H / h_f was applied gives depth_scale in its input status, and one whose scale lies beyond the monocular scale bound is not judged and keeps k, but its content is excluded too (its input status has detail floor_not_judged; it is not listed here). Empty when none."
         },
         "drift_correction": {
           "oneOf": [
