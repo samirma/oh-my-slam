@@ -1255,7 +1255,8 @@ class FloorCheck:
     factor its depth takes (a monocular frame's own scale over the map's: 1 otherwise), the
     own depth scale it reports (``depth_scale``, raw depth to map metres; None when none was
     applied), and whether it was judged (False: a monocular frame whose own scale lies beyond
-    the monocular scale bound, which keeps ``k``: ``floor_not_judged``, oms/2.5)."""
+    the monocular scale bound, which keeps ``k`` and its pose but gives no content:
+    ``floor_not_judged``, oms/2.5, P29b)."""
 
     ok: bool = True
     factor: float = 1.0
@@ -1276,7 +1277,8 @@ def floor_verdict(kind: str, height_m: float | None, height_sigma_m: float | Non
     * a monocular depth takes its own scale, H / h_f times its depth (``FloorCheck.factor``;
       ``rel``: its depth's scale over the map's monocular scale ``k``), in place of the map's; an
       own scale more than ``MONO_FLOOR_BOUND_REL`` from ``k`` is not judged (oms/2.5): the frame
-      keeps ``k`` and its content (``FloorCheck.judged`` False).
+      keeps ``k``, its pose and its registration, but its content is excluded
+      (``FloorCheck.judged`` False, ``Keyframe.floor_withheld``, P29b).
 
     Not checked (kept as it is) without a height, a depth or such a plane; the height sigma
     defaults to ``DEFAULT_HEIGHT_SIGMA_M``. The caller decides whether the map has a floor."""
@@ -1296,8 +1298,8 @@ def floor_verdict(kind: str, height_m: float | None, height_sigma_m: float | Non
         return FloorCheck()
     factor = height_m / h
     if abs(rel * factor - 1.0) > MONO_FLOOR_BOUND_REL:
-        log.info("floor check: its own depth scale %.3f times the map's: not judged, it keeps "
-                 "the map's", rel * factor)
+        log.info("floor check: its own depth scale %.3f times the map's: not judged, no content",
+                 rel * factor)
         return FloorCheck(judged=False)
     return FloorCheck(True, factor, factor)
 
@@ -1365,8 +1367,17 @@ class Keyframe:
     grid_scale: float | None = None
     floor_factor: float | None = None
     # the floor check did not judge it: a monocular keyframe whose own scale lay beyond the
-    # monocular scale bound keeps k (``floor_not_judged``, map.md §2, oms/2.5)
+    # monocular scale bound keeps k and its pose, and is never rejected for it, but gives no
+    # content, as a frame the check excluded (``floor_withheld``: ``floor_not_judged``, map.md
+    # §2, oms/2.5, P29b)
     floor_unjudged: bool = False
+
+    def floor_withheld(self) -> bool:
+        """Whether the floor check keeps its content out (map.md §2): it excluded the frame
+        (``floor_ok``; a depth image out of its bound), or did not judge it (``floor_unjudged``;
+        a monocular frame beyond the monocular scale bound: no scale to place its depth with).
+        Only the first lists it in ``floor_inconsistent``."""
+        return not self.floor_ok or self.floor_unjudged
 
     @property
     def depth_scale(self) -> float | None:
@@ -1420,8 +1431,8 @@ class Keyframe:
         """Depth content for the cloud, occupancy and heights (never scale evidence nor a
         reference): confirmed by the images, or the too-close exception (api.md §4) with a depth
         image (its depth inside ``DEPTH_VALID_RANGE_M``, at the prior pose: depth points come
-        only from a depth image); never a frame the height gate or the floor check failed
-        (``height_ok``, ``floor_ok``, map.md §2)."""
+        only from a depth image); never a frame the height gate or the floor check failed or did
+        not judge (``height_ok``, ``floor_withheld``, map.md §2)."""
         return self.detects() and (self.usable() or self.depth_kind == "sensor")
 
     def too_close_exception(self) -> bool:
@@ -1434,8 +1445,8 @@ class Keyframe:
         """Content for objects and ``detection_votes``: confirmed by the images, or the too-close
         exception whatever its depth (without a depth image its detections are placed on its
         monocular depth at the prior pose, as any monocular detection: api.md §4); never a frame
-        the height gate or the floor check failed."""
-        return self.height_ok and self.floor_ok and (self.usable() or (
+        the height gate or the floor check failed or did not judge."""
+        return self.height_ok and not self.floor_withheld() and (self.usable() or (
             self.too_close_exception() and self.depth_kind != "none"))
 
 
@@ -3328,6 +3339,55 @@ class AnchoredMap:
             kf.floor_factor = None if chk.scale is None else cur * chk.factor
         self._floor_out(kf)
 
+    def refine_scale(self, f: FrameIn, T: Array, sigma_pos_m: float, depth: NDArray[np.float32],
+                     K_grid: Intrinsics, raw: float, align: float | None = None
+                     ) -> tuple[NDArray[np.float32], float]:
+        """A registered monocular frame's depth (``raw`` over its raw depth) as scale evidence:
+        its alignment onto the map's lifted points (``align``) as the monocular residual, its
+        camera height (``add_height_evidence``), then the map's scale re-estimated and the depth
+        brought onto it. Returns the depth and ``raw`` at the new scale. A frame the floor check
+        does not judge at that scale (``mono_unjudged``: its own depth scale lies beyond the
+        monocular bound) is no scale evidence either, which follows its content's exclusion
+        (map.md §2, oms/2.5, P29b): what it recorded is taken back, and its depth is at the
+        scale without it."""
+        before, noted = copy.deepcopy(self.scale), set(self._evidence_from)
+        if align is not None:
+            self.scale.depth_residuals.setdefault("mono", []).append(math.log(align))
+            del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
+            self._evidence_from.add(f.name)
+        self.add_height_evidence(f, T, depth, K_grid)
+        k = self.scale.k
+        self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+        depth = (depth * (self.scale.k / k)).astype(np.float32)
+        raw *= self.scale.k / k
+        if self.mono_unjudged(f, T, sigma_pos_m, depth, K_grid, raw):
+            k = self.scale.k
+            self.scale, self._evidence_from = before, noted
+            self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+            depth = (depth * (self.scale.k / k)).astype(np.float32)
+            raw *= self.scale.k / k
+        return depth, raw
+
+    def mono_unjudged(self, f: FrameIn, T: Array, sigma_pos_m: float,
+                      depth: NDArray[np.float32], K_grid: Intrinsics, raw_scale: float) -> bool:
+        """Whether the floor check would not judge a monocular frame's depth (map metres as it
+        would be fused, ``raw_scale`` over its raw depth): its own depth scale lies beyond the
+        monocular scale bound (``floor_verdict``). Asked before its depth is recorded as scale
+        evidence (``add_height_evidence``, the monocular residual): that depth is not scale
+        evidence, following its content's exclusion (map.md §2, oms/2.5, P29b)."""
+        masked = self._ignored_off(f, depth)
+        return not self.floor_check("mono", f.height_m, f.height_sigma_m, T, sigma_pos_m, masked,
+                                    K_grid, raw_scale).judged
+
+    @staticmethod
+    def _ignored_off(f: FrameIn, depth: NDArray[np.float32]) -> NDArray[np.float32]:
+        """A frame's depth without its ignored pixels (no depth point there: no cloud,
+        occupancy, free space or floor)."""
+        ignore = on_grid(f.ignore, depth.shape)
+        if ignore is None:
+            return depth
+        return np.where(ignore, 0.0, depth).astype(np.float32)
+
     def add(self, f: FrameIn, feats: Features, pl: Placement, depth: NDArray[np.float32],
             K_grid: Intrinsics, kind: str, descriptor: Any, raw_scale: float | None = None
             ) -> Keyframe:
@@ -3351,8 +3411,7 @@ class AnchoredMap:
             if _tilt_sigma(f.prior) is not None:
                 prior["sigma_tilt_deg"] = _tilt_sigma(f.prior)
         ignore = on_grid(f.ignore, depth.shape)
-        if ignore is not None:  # no depth point there: no cloud, occupancy, free space or floor
-            depth = np.where(ignore, 0.0, depth).astype(np.float32)
+        depth = self._ignored_off(f, depth)
         raw = (self.scale.k if raw_scale is None else raw_scale) if kind == "mono" else 1.0
         chk = self.floor_check(kind, f.height_m, f.height_sigma_m, pl.T, pl.sigma_pos_m, depth,
                                K_grid, raw)
@@ -3807,22 +3866,14 @@ class AnchoredMap:
             assert pl.T is not None
             # its own scale brought onto the map's (the monocular model's metres vary from
             # frame to frame), on the points lifted at the map's current scale
+            a = None
             if pl.lifted is not None:
                 a = depth_alignment(pl.T if pl.align_T is None else pl.align_T,
                                     *pl.lifted, depth, Kg, f.K)
                 if a is not None:
                     depth = (depth * a).astype(np.float32)
                     raw *= a
-                    self.scale.depth_residuals.setdefault("mono", []).append(math.log(a))
-                    del self.scale.depth_residuals["mono"][:-MAX_EVIDENCE]
-                    self._evidence_from.add(f.name)
-            # its camera height, if known, refines the depth scale before it is fused (a
-            # frame kept at its prior is no scale evidence: map.md §2)
-            self.add_height_evidence(f, pl.T, depth, Kg)
-            k = self.scale.k
-            self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
-            depth = (depth * (self.scale.k / k)).astype(np.float32)
-            raw *= self.scale.k / k
+            depth, raw = self.refine_scale(f, pl.T, pl.sigma_pos_m or 0.0, depth, Kg, raw, a)
         kf = self.add(f, pr.feats, pl, depth, Kg, kind, desc, raw)
         progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
         self._keep_s += time.perf_counter() - t

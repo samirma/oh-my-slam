@@ -1133,10 +1133,20 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     keypoints, spreading their scales by up to ±30 %. Its input status reports it as
     `depth_scale` (raw monocular depth to map metres). An own scale more than
     `MONO_FLOOR_BOUND_REL` = 0.30 (3 × `MONOCULAR_SIGMA_REL`, the monocular scale bound) from k,
-    relative, is not judged (oms/2.5): the frame keeps k and its content, is not listed in
-    `floor_inconsistent`, has no `depth_scale`, and its registered input status has `detail`
-    `floor_not_judged` (`Keyframe.floor_unjudged`; the older mapper's too). Only depth images
-    are excluded.
+    relative, is not judged (oms/2.5): the frame keeps k, its registration and its pose, is
+    never rejected for it and is not listed in `floor_inconsistent`, has no `depth_scale`, and
+    its registered input status has `detail` `floor_not_judged` (`Keyframe.floor_unjudged`; the
+    older mapper's too). Since P29b its content is excluded all the same, as an excluded frame's
+    (`Keyframe.floor_withheld`: no cloud points, no occupancy, free space from its depth or
+    `height_m`, no objects), because its depth has no scale it can be placed with: the client
+    sees the detail and can retake the view. Its depth is no scale evidence either (the evidence
+    it recorded is taken back: `AnchoredMap.refine_scale`, judged against the scale its own
+    evidence refined, so a first frame defines it), which follows the content exclusion. It
+    still counts for the free-by-rule cells (camera stand, near blind disc): its pose is
+    trusted. On the 0.15-0.22 m raised-floor frames of the client's `task_map` (synthetic copy,
+    `test_monocular_keyframes_with_a_raised_floor_lose_their_phantom_floor`) the occupied cells
+    within 1 m of the cameras went from 158 (P29a: kept at k) to 0. Only depth images are
+    excluded (listed).
   * A frame the check excludes keeps its status, pose, sigmas and reference role; it is not fused,
     its version row has `floor_inconsistent: true` (no occupancy, free space or heights from its
     depth, `service.derived`), it gives no objects (`Keyframe.detects`), and
@@ -1146,8 +1156,11 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   * The mapper's engine (`Updater._floor_off`) checks its registered frames on the mapper's
     depth grid at their committed poses with the same rule; a frame it fails is left out of the
     grid's evidence and listed, but the mapper's own cloud and objects (built in its process)
-    still hold it, its floor spread is the mapper's cloud's, and a monocular frame within the
-    bound is not rescaled (the mapper fits each keyframe's depth scale itself).
+    still hold it (a monocular frame it does not judge is left out of the grid's evidence in
+    the same way, unlisted: `_Frame.floor_unjudged`), its floor spread is the mapper's cloud's,
+    and a monocular frame within the bound is not rescaled (the mapper fits each keyframe's
+    depth scale itself). It has no scale evidence of its own to withhold (the mapper fits its
+    scales in its process).
   * On the client's stored map `task_map` version 10 (45 monocular keyframes, camera 0.339 m):
     look008/009/039–041, whose monocular depth is about half the map's in one sector, land
     their floor 0.15–0.22 m high; they are excluded, the frames whose floor is within the bound

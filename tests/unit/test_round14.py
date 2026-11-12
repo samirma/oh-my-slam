@@ -262,8 +262,8 @@ def _cloud_floor(m: AnchoredMap) -> np.ndarray:
 def test_a_monocular_frame_with_a_wrong_scale_gives_no_content(tmp_path: Path) -> None:
     """Diagnosis test 2 (F1): a 360 deg monocular sweep with two adjacent frames whose depth is
     half the others' (as look008/009 were): they stay registered and, since oms/2.5 (P29a), are
-    not judged: they keep k and their content and are not listed; the others take their own
-    scale."""
+    not judged: they keep k and their pose and are not listed, and, since P29b, give no content;
+    the others take their own scale."""
     m = AnchoredMap(tmp_path / "m")
     m.update([frame("a0", base_pose(0), depth=None, mono=1.3)])
     half = {"s5", "s6"}
@@ -273,8 +273,8 @@ def test_a_monocular_frame_with_a_wrong_scale_gives_no_content(tmp_path: Path) -
     assert m.floor_inconsistent == []
     kf = {k.name: k for k in m.keyframes}
     for n in half:
-        assert kf[n].floor_ok and kf[n].floor_unjudged and kf[n].contributes()
-        assert kf[n].depth_scale is None
+        assert kf[n].floor_ok and kf[n].floor_unjudged and not kf[n].contributes()
+        assert kf[n].floor_withheld() and kf[n].depth_scale is None
     kept = [k for k in m.keyframes if k.name not in half and k.depth_scale is not None]
     assert len(kept) >= 6
     for k in kept:  # the own scale brings the raw depth (1.3 x true) onto metres
@@ -318,7 +318,7 @@ def test_the_floor_check_on_reregistered_and_unseeded_keyframes(tmp_path: Path) 
     m.scale.k *= 2.0
     m._recheck_floor(k)
     assert k.floor_ok and k.floor_unjudged and k.floor_factor is None
-    assert m.floor_inconsistent == []
+    assert m.floor_inconsistent == [] and k.floor_withheld() and not k.contributes()  # P29b
     # a depth image far from its height: out, listed once
     k.depth_kind = "sensor"
     assert k.grid is not None
@@ -597,7 +597,8 @@ def test_floor_inconsistent_rows_feed_no_occupancy() -> None:
 def test_the_service_reports_the_floor_check(client: Client) -> None:  # noqa: F811
     """api.md §4 (oms/2.4): a monocular frame the floor check rescales reports ``depth_scale``;
     one beyond the monocular bound is, since oms/2.5, not judged: in no ``floor_inconsistent``
-    (a dry run's neither), ``detail`` ``floor_not_judged``, its version row content kept."""
+    (a dry run's neither), ``detail`` ``floor_not_judged``, its version row without content
+    (P29b)."""
     cam = {**CAM, "height_above_floor_m": 0.5, "height_sigma_m": 0.01}
     fr, files = frames_for(client, [base_pose(0)], tag="a", depth=False)
     assert client.update("m", fr, files, cameras={"cam": cam})["state"] == "committed"
@@ -615,7 +616,8 @@ def test_the_service_reports_the_floor_check(client: Client) -> None:  # noqa: F
     assert rows["s2"]["detail"] == "floor_not_judged"
     assert all(rows[f"s{k}"].get("depth_scale", 0) > 0 for k in (0, 1, 3, 4))
     rec = {f["name"]: f for f in client.service.store.version("m")["frames"]}
-    assert not rec["s2"]["floor_inconsistent"] and rec["s2"]["content"]
+    assert not rec["s2"]["content"] and rec["s2"]["floor_inconsistent"]  # withheld, not listed
+    assert all(rec[f"s{k}"]["content"] for k in (0, 1, 3, 4))
 
 
 # -- the older mapper ------------------------------------------------------------------------------
@@ -692,7 +694,7 @@ def _grid_of(frames: list[tuple[np.ndarray, np.ndarray, str]], check: bool, floo
         cams.append(T[:3, 3])
         if check:
             chk = an.floor_verdict(kind, CAM_H, None, T, 0.02, d, K)
-            if not chk.ok:
+            if not chk.ok or not chk.judged:  # excluded, or not judged: no content (P29b)
                 continue
             d = (d * chk.factor).astype(np.float32)
         d = d[1::2, 1::2]
@@ -723,7 +725,8 @@ def test_monocular_keyframes_with_a_raised_floor_lose_their_phantom_floor() -> N
     cells within 1 m of the cameras on the empty floor; under the floor check (map.md §2,
     oms/2.4: each takes its own scale from the sent height) about none, and the SD of the
     floor's heights about halves. The client's 0.15-0.22 m (an own scale beyond the monocular
-    bound) are, since oms/2.5 (P29a), not judged: they keep k and their content."""
+    bound) are not judged (oms/2.5, P29a) and, since P29b, give no content: their phantom floor
+    is gone too (no occupied cell; the frames at the true scale remain)."""
     frames = _phantom_frames()
     before, sd0, r0 = _grid_of(frames, False)
     after, sd1, r1 = _grid_of(frames, True)
@@ -731,7 +734,10 @@ def test_monocular_keyframes_with_a_raised_floor_lose_their_phantom_floor() -> N
     assert after <= 10  # 0
     assert sd1 <= 0.6 * sd0 and r1 <= r0  # 0.033 m -> 0.0 m
     far = _phantom_frames((0.15, 0.17, 0.20, 0.22))
-    assert _grid_of(far, True) == _grid_of(far, False)  # not judged: as they are
+    far_before, _, _ = _grid_of(far, False)
+    far_after, _, _ = _grid_of(far, True)
+    assert far_before >= 100  # the phantom floor of the raised frames, unchecked
+    assert far_after == 0  # not judged, no content: gone
 
 
 @pytest.fixture

@@ -271,11 +271,8 @@ class _MaRun:
             kind = "sensor" if _has_depth(fr) else "mono"
             if kind == "sensor":  # its depth image's residual against the map (scale_sigma_rel)
                 am.depth_residual(f, T, depth, Kg)
-            if kind == "mono":
-                am.add_height_evidence(f, T, depth, Kg)
-                k = am.scale.k
-                am.scale.estimate(am.prior_span(), am.prior_span("drifting"))
-                depth = (depth * (am.scale.k / k)).astype(np.float32)
+            if kind == "mono":  # its camera height refines the scale (not an unjudged frame's)
+                depth, _ = am.refine_scale(f, T, sp, depth, Kg, am.scale.k)
             assert fr.rgb is not None
             added.append(am.add(f, feats[fr.work.index], pl, depth, Kg, kind, None))
             self.kf_of[f"new{fr.work.index}"] = added[-1].id
@@ -449,9 +446,11 @@ def _depth_scale(am: AnchoredMap | None, pl: Placement) -> float | None:
 
 
 def _floor_off(am: AnchoredMap | None, pl: Placement) -> bool:
-    """Whether the floor check left a placed frame's keyframe out of content (map.md §2)."""
+    """Whether the floor check left a placed frame's keyframe out of content (map.md §2): it
+    excluded it, or did not judge it (a monocular frame beyond the scale bound, P29b; only the
+    first is listed in ``floor_inconsistent``, ``AnchoredMap.floor_inconsistent``)."""
     k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
-    return k is not None and not k.floor_ok
+    return k is not None and k.floor_withheld()
 
 
 def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
@@ -718,7 +717,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                          "inliers": k.inliers, "method": k.method,
                          # its gate and floor check at its confirmed pose (map.md §2)
                          "height_inconsistent": not k.height_ok,
-                         "floor_inconsistent": not k.floor_ok})
+                         "floor_inconsistent": k.floor_withheld()})
             continue
         row = r if k is None else {**r, "T_map_cam": k.T.tolist()}
         shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
