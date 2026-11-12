@@ -202,6 +202,9 @@ class _Frame:
     # prior's ``sigma_tilt_deg`` judges the tilt (map.md §1); None without
     prior_tilt: tuple[float, float] | None = None
     floor_off: bool = False  # registered, the floor check left its depth out (map.md §2)
+    # registered, a monocular frame the floor check did not judge: its depth is left out of the
+    # grid as a floor_off frame's, but it is not listed in floor_inconsistent (oms/2.5, P29b)
+    floor_unjudged: bool = False
 
 
 @dataclass
@@ -1137,7 +1140,9 @@ class Updater:
         heights); the mapper's own cloud and objects, which its process builds, still hold it,
         and a monocular frame the check keeps is not rescaled: the mapper fits each monocular
         keyframe's depth scale itself (README, known limitations). A monocular frame beyond the
-        monocular scale bound is not judged (``detail`` ``floor_not_judged``, oms/2.5)."""
+        monocular scale bound is not judged (``detail`` ``floor_not_judged``, oms/2.5): it is
+        not excluded for it (``floor_inconsistent``) and keeps its pose, but its depth is left
+        out of the grid likewise (``floor_unjudged``, P29b)."""
         assert fr.internal is not None
         d = internal.depth(fr.internal.name)
         if d is None or fr.pose is None or fr.sigma_pos_m is None:
@@ -1148,7 +1153,7 @@ class Updater:
         chk = floor_verdict("sensor" if _has_depth(fr) else "mono", _height(fr), hs, fr.pose,
                             fr.sigma_pos_m, depth, K)
         if not chk.judged:  # beyond the monocular scale bound: not judged (oms/2.5)
-            fr.detail = "floor_not_judged"
+            fr.detail, fr.floor_unjudged = "floor_not_judged", True
         return not chk.ok
 
     @staticmethod
@@ -1302,6 +1307,8 @@ class Updater:
                                             or anchored.origin_height_m is not None) \
                     and self._floor_off(fr, internal, sim):
                 fr.floor_off = True
+                rows[fr.work.name]["floor_inconsistent"] = True
+            if fr.floor_unjudged:  # no content, and not listed (P29b)
                 rows[fr.work.name]["floor_inconsistent"] = True
         return {"kind": "update", "job_id": job.id, "sim3": sim.to_dict(),
                 "origin_height_m": anchored.origin_height_m,

@@ -1,7 +1,8 @@
-"""Round 16 (P29, P29a, oms/2.5): drifting priors fused by calibrated sigmas, the monocular noise
+"""Round 16 (P29, P29a, P29b, oms/2.5): drifting priors fused by calibrated sigmas, the monocular noise
 floor, the sent height measured from z 0 when priors fixed the frame, the floor across versions,
 the drift estimate weighed against the priors as sent, a monocular frame beyond the scale bound
-not judged by the floor check, ``quality.drift_correction``, a real plane extent for the floor,
+not judged by the floor check (it keeps k and its pose, its content is excluded: P29b),
+``quality.drift_correction``, a real plane extent for the floor,
 the floor-check scale for content only, and the service log's job and locate lines."""
 
 from __future__ import annotations
@@ -24,8 +25,9 @@ from oh_my_slam.mapping import anchored as an
 from oh_my_slam.mapping.anchored import AnchoredMap, FrameIn
 from oh_my_slam.mapping.quality import drift_correction
 from tests.synth.room import base_pose, look
-from tests.unit.test_round14 import H, K, _floor_points, frame, prior, shot
+from tests.unit.test_round14 import H, K, _floor_points, frame, old, prior, shot  # noqa: F401
 from tests.unit.test_service_api import Client
+from tests.unit.test_service_nav import decode
 from tests.unit.test_service_prior_first import (
     CAM,
     client,  # noqa: F401
@@ -318,8 +320,8 @@ def test_a_wall_slice_is_no_floor(Hc: float) -> None:
 
 
 def test_a_monocular_frame_beyond_the_bound_is_not_judged() -> None:
-    """map.md §2 (oms/2.5): its own scale beyond the monocular bound, it keeps k and its content
-    (no own scale); sensor depth unchanged."""
+    """map.md §2 (oms/2.5): its own scale beyond the monocular bound, it keeps k (no own scale)
+    and is not excluded for it; sensor depth unchanged."""
     z, Kg, T = _floor_points(0.5)
     got = an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 2.0, Kg)
     assert got == an.FloorCheck(True, 1.0, None, False)
@@ -327,26 +329,112 @@ def test_a_monocular_frame_beyond_the_bound_is_not_judged() -> None:
     assert not an.floor_verdict("sensor", 0.5, 0.01, T, 0.01, z * 1.2, Kg).ok
 
 
-def test_unjudged_monocular_keyframes_keep_k_and_their_content(tmp_path: Path) -> None:
-    """The diagnosis's half-scale frames (item 4): registered, not in ``floor_inconsistent``,
-    contributing at k, without a depth scale; the others take their own."""
+def _half_scale_sweep(tmp_path: Path, fused: list[str] | None = None) -> tuple[AnchoredMap, set[str]]:
+    """The diagnosis's sweep: a monocular map whose frames s5 and s6 have half the others' depth.
+    ``fused`` collects the names of the keyframes whose depth goes into the cloud."""
     m = AnchoredMap(tmp_path / "m")
+    if fused is not None:
+        fuse = m._fuse
+
+        def spy(image: Any, ignore: Any, kf: Any, depth: Any, K_grid: Any) -> None:
+            fused.append(kf.name)
+            fuse(image, ignore, kf, depth, K_grid)
+
+        m._fuse = spy  # type: ignore[method-assign]
     m.update([frame("a0", base_pose(0), depth=None, mono=1.3)])
     half = {"s5", "s6"}
     pls = m.update([frame(f"s{k}", base_pose(30.0 * k + 15.0), depth=None,
                           mono=0.65 if f"s{k}" in half else 1.3) for k in range(12)])
     assert all(p.status == "registered" for p in pls)
+    return m, half
+
+
+def test_unjudged_monocular_keyframes_keep_k_and_their_pose_but_no_content(
+        tmp_path: Path) -> None:
+    """The diagnosis's half-scale frames (item 4): registered with their pose and sigmas, not
+    in ``floor_inconsistent``, without a depth scale (k kept), but, since P29b, withheld exactly
+    as a frame the check excluded: no cloud points, no objects; the others take their own
+    scale."""
+    fused: list[str] = []
+    m, half = _half_scale_sweep(tmp_path, fused)
     assert m.floor_inconsistent == []
     kf = {k.name: k for k in m.keyframes}
     for n in half:
         k = kf[n]
-        assert k.floor_ok and k.floor_unjudged and k.contributes()
+        assert k.floor_ok and k.floor_unjudged and k.floor_withheld()
+        assert k.state == "fused" and k.usable()  # a registered frame, a reference
+        assert k.sigma_pos_m > 0 and k.T[2, 3] == pytest.approx(H, abs=0.05)  # its pose kept
+        assert not k.contributes() and not k.detects()  # no cloud, no objects
         assert k.depth_scale is None and k.floor_factor is None
+        assert n not in fused
     rescaled = [k for k in m.keyframes if k.depth_scale is not None]
     assert len(rescaled) >= 6 and not any(k.floor_unjudged for k in rescaled)
+    assert all(k.contributes() and k.detects() and k.name in fused for k in rescaled)
+    assert not any(k.floor_withheld() for k in rescaled)
     # stored and loaded again
     d = an.Keyframe.from_json(json.loads(json.dumps(kf["s5"].to_json())))
-    assert d.floor_unjudged
+    assert d.floor_unjudged and d.floor_withheld() and not d.detects()
+    # the floor estimate is made from the others' cloud only
+    floor, sigma = m.floor()
+    assert floor is not None and abs(floor) < 0.03 and sigma <= 0.02
+
+
+def test_an_unjudged_frame_is_no_scale_evidence_and_no_cloud(tmp_path: Path) -> None:
+    """P29b: a frame whose own scale lies beyond the monocular bound, registered last, leaves the
+    map's scale, its evidence and its cloud as they are without it (what it recorded is taken
+    back: ``AnchoredMap.refine_scale``)."""
+    def build(name: str, odd: bool) -> AnchoredMap:
+        m = AnchoredMap(tmp_path / name)
+        m.update([frame("a0", base_pose(0), depth=None, mono=1.3)])
+        fs = [frame(f"s{k}", base_pose(30.0 * k + 15.0), depth=None, mono=1.3)
+              for k in range(5)]
+        if odd:
+            fs.append(frame("odd", base_pose(165.0), depth=None, mono=0.65))
+        m.update(fs)
+        return m
+
+    a, b = build("a", True), build("b", False)
+    assert [k.name for k in a.keyframes if k.floor_unjudged] == ["odd"]
+    assert a.scale.k == b.scale.k and a.scale.source == b.scale.source
+    assert a.scale.heights == b.scale.heights and len(a.scale.heights) == 6
+    assert a.scale.height_yaws == b.scale.height_yaws
+    assert a.scale.depth_residuals == b.scale.depth_residuals
+    assert a.scale.sigma_rel == b.scale.sigma_rel
+    assert np.array_equal(a.cloud.keys, b.cloud.keys) and len(a.cloud.keys) > 0
+    # the same frame judged (its own scale within the bound) is evidence and content
+    c = AnchoredMap(tmp_path / "c")
+    c.update([frame("a0", base_pose(0), depth=None, mono=1.3)])
+    c.update([frame("odd", base_pose(15.0), depth=None, mono=1.3)])
+    assert len(c.scale.heights) == 2 and c.keyframes[-1].contributes()
+
+
+def test_unjudged_frames_give_no_objects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P29b: ``fuse_objects`` takes no view of a frame the check did not judge, nor of one it
+    excluded (a keyframe's ``detects``)."""
+    from concurrent.futures import Future
+
+    from oh_my_slam.mapping.anchored_objects import ObjectMap, fuse_objects
+
+    m, half = _half_scale_sweep(tmp_path)
+    pls = [an.Placement(k.name, "registered", None, k.T, k.sigma_pos_m, k.sigma_rot_deg, 100,
+                        keyframe=k.id) for k in m.keyframes]
+    seen: list[list[str]] = []
+    update = ObjectMap.update
+
+    def spy(self: ObjectMap, views: Any, *a: Any, **k: Any) -> Any:
+        seen.append([v.kid for v in views])
+        return update(self, views, *a, **k)
+
+    monkeypatch.setattr(ObjectMap, "update", spy)
+    futures = []
+    for _ in pls:
+        fut: Future[list[Any]] = Future()
+        fut.set_result([])
+        futures.append(fut)
+    frames = [(pl, None, Path("kf.jpg"), fut) for pl, fut in zip(pls, futures, strict=True)]
+    fuse_objects(m, frames, 2, lambda path, regions, dets, size: dets)
+    unjudged = {k.id for k in m.keyframes if k.name in half}
+    assert seen and unjudged.isdisjoint(seen[0]) and len(seen[0]) == len(m.keyframes) - 2
 
 
 # -- P26-2: the floor-check scale is for content only -----------------------------------------------
@@ -512,6 +600,57 @@ def test_the_service_reports_floor_not_judged(client: Client) -> None:  # noqa: 
     assert all(rows[f"s{k}"]["detail"] is None for k in (0, 1, 3, 4))
 
 
+def _behind_map(c: Client, name: str, u_scale: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A monocular map with a camera height (``a0``), then a job of three frames turning at the
+    origin and ``u``, 0.9 m behind it, whose monocular depth is ``u_scale`` times the true
+    one (0.5: its own scale beyond the bound). Returns the dry run of the job and the job."""
+    cam = {**CAM, "height_above_floor_m": 0.5, "height_sigma_m": 0.01}
+    fr, files = frames_for(c, [base_pose(0)], tag="a", depth=False)
+    assert c.update(name, fr, files, cameras={"cam": cam})["state"] == "committed"
+    poses = [base_pose(15.0 * (k + 1)) for k in range(3)] + [base_pose(0.0, -0.9)]
+    fr, files = frames_for(c, poses, tag="s", depth=False)
+    key = hashlib.sha256(files["s3"]).hexdigest()
+    c.backend.mono_depth[key] = c.backend.mono_depth[key] * u_scale
+    d = dry(c, name, fr, files)
+    return d, c.update(name, fr, files)
+
+
+def test_the_service_withholds_an_unjudged_frames_content_but_not_its_stand(
+        client: Client) -> None:  # noqa: F811
+    """P29b, prior-first engine: the unjudged frame ``s3`` keeps its registration and pose, is no
+    rejection and is not in ``floor_inconsistent``, but its version row has no content: it gives
+    no occupancy, no free space from its depth, no floor seen; it still marks free-by-rule cells
+    (its stand). A dry run predicts the same quality as the job."""
+    d, job = _behind_map(client, "m", 0.5)
+    _, ctrl = _behind_map(client, "c", 1.0)
+    assert job["state"] == ctrl["state"] == "committed"
+    rows = {i["name"]: i for i in job["inputs"]}
+    assert rows["s3"]["status"] == "registered" and rows["s3"]["detail"] == "floor_not_judged"
+    assert rows["s3"]["T_map_cam"] is not None and "depth_scale" not in rows["s3"]
+    assert rows["s3"]["sigma_pos_m"] is not None
+    assert {i["name"]: i["detail"] for i in ctrl["inputs"]}["s3"] is None  # the control: judged
+    assert job["quality"]["floor_inconsistent"] == ctrl["quality"]["floor_inconsistent"] == []
+    # the dry run predicts what the job reports
+    assert d["quality"]["floor_inconsistent"] == []
+    for key in ("height_inconsistent", "rejected_share", "reregistered"):
+        assert d["quality"][key] == job["quality"][key]
+    assert [r["predicted_status"] for r in d["frames"]] == ["registered"] * 4
+    rec = {f["name"]: f for f in client.service.store.version("m")["frames"]}
+    assert not rec["s3"]["content"] and rec["s3"]["floor_inconsistent"]
+    assert rec["s2"]["content"] and not rec["s2"]["floor_inconsistent"]
+    # the grid: what the control sees through s3 is missing, its stand is free by rule
+    g, c = (client.get(f"/api/maps/{n}/grid", "Grid") for n in ("m", "c"))
+    assert g["origin_m"] == c["origin_m"] and g["shape"] == c["shape"]
+    state, cstate = (decode(x["layers"]["state"]) for x in (g, c))
+    seen, cseen = (decode(x["layers"]["floor_observed"]) for x in (g, c))
+    assert int((cseen == 1).sum()) > int((seen == 1).sum())  # floor it saw, not seen now
+    assert int((cstate == 2).sum()) > int((state == 2).sum())  # occupancy it gave, none now
+    ox, oy = g["origin_m"]
+    r, col = int((rec["s3"]["T_map_cam"][1][3] - oy) / g["cell_m"]), \
+        int((rec["s3"]["T_map_cam"][0][3] - ox) / g["cell_m"])
+    assert state[r, col] == 1 and seen[r, col] == 2  # free by rule, floor not seen
+
+
 def test_input_rows_carry_detail_by_status() -> None:
     from oh_my_slam.service.prior_first import input_row
 
@@ -556,6 +695,48 @@ def test_the_older_mapper_does_not_judge_a_monocular_frame_beyond_the_bound() ->
     fr = Fr()
     assert not Updater._floor_off(fr, internal, anchor.Sim3())  # type: ignore[arg-type]
     assert fr.detail == "floor_not_judged"
+    assert fr.floor_unjudged  # P29b: left out of the grid's evidence, though not listed
+
+
+def test_the_older_mapper_withholds_an_unjudged_frames_grid_evidence(
+        old: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """P29b, the older mapper: a frame the floor check did not judge keeps its registration,
+    pose and ``detail`` ``floor_not_judged``, is not in ``floor_inconsistent`` and not rejected,
+    but its version row feeds no occupancy, heights or free space (``derived._occupies``), as an
+    excluded frame's; its camera still stands (free by rule). A dry run predicts the same
+    quality. (The mapper's own cloud and objects, which its process builds, still hold it:
+    ``Updater._floor_off``.)"""
+    from oh_my_slam.service.derived import _occupies
+    from oh_my_slam.service.update import Updater
+    from tests.fakes.service import CAMERA, pose, textured
+
+    def judge(fr: Any, internal: Any, sim: Any) -> bool:
+        if fr.work.name == "t2":
+            fr.detail, fr.floor_unjudged = "floor_not_judged", True
+        return False
+
+    monkeypatch.setattr(Updater, "_floor_off", staticmethod(judge))
+    frames, files = [], {}
+    for i, a in enumerate((0, 30, 60, 90)):
+        T = pose(a, 0.0, 0.0, 1.2)
+        files[f"t{i}"] = old.backend.add(textured(700 + i), T)
+        frames.append({"name": f"t{i}", "image": f"t{i}", "camera_id": "cam",
+                       "prior": prior(T), "height_above_floor_m": 1.2,
+                       "height_sigma_m": 0.01})
+    d = dry(old, "m", frames, files, cameras={"cam": CAMERA})
+    job = old.update("m", frames, files, {"cam": CAMERA})
+    assert d["quality"]["floor_inconsistent"] == job["quality"]["floor_inconsistent"] == []
+    rows = {i["name"]: i for i in job["inputs"]}
+    assert rows["t2"]["status"] == "registered" and rows["t2"]["detail"] == "floor_not_judged"
+    assert rows["t2"]["T_map_cam"] is not None and rows["t1"]["detail"] is None
+    rec = {r["name"]: r for r in old.service.store.version("m")["frames"]}
+    assert rec["t2"]["floor_inconsistent"] and not _occupies(rec["t2"])  # no grid evidence
+    assert _occupies(rec["t1"]) and rec["t2"]["pose_state"] == "fused"
+    from oh_my_slam.service.derived import Derived
+
+    stands = Derived(old.service.store, old.backend.read)._stands(
+        old.service.store.version("m"), old.service.store.cameras("m"))
+    assert len(stands) == 4  # its stand counts for the free-by-rule cells
 
 
 # -- containment logging ----------------------------------------------------------------------------
