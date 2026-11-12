@@ -152,6 +152,9 @@ depth puts the floor away from their sent height, map.md §2); the input status'
 `sigma_tilt_deg` (the uncertainty of pitch and roll apart from yaw, map.md §1). The sent camera
 height also becomes a z measurement in registration (map.md §2), and `floor_sigma_m` a robust
 standard deviation with a floor band tested on surface height (map.md §6).
+It also adds the job's `timings_s` stage `stored_pairs`, the seconds spent measuring
+stored-to-stored pairs from the stored keyframes' own images when the cycle rule needs a chain
+for a pair that involves a stored keyframe (map.md §1).
 
 ## 8. Concurrency and latency
 

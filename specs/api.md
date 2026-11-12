@@ -117,6 +117,10 @@ error code `invalid_request` (§9).
     versions included, or null before any;
   * `created_at` and `ended_at`. Once registration has run, the job also carries
   `inputs[]` and `quality`.
+  * `timings_s`, the seconds the job spent per stage, a map of stage name to seconds. Stages
+    are additive and a consumer ignores those it does not know. `stored_pairs` (oms/2.4) is the
+    time spent measuring stored-to-stored pairs for the cycle rule (map.md §1, Measurable
+    pair); it is 0 when no such pair was measured, and cached pairs cost nothing.
   * An optional `?wait_s=<s>` (≤ 30) holds the answer until the state changes or the time
     passes. A job already in a terminal state (`committed`, `rejected`, `cancelled`, `failed`)
     answers at once, whatever `wait_s`.

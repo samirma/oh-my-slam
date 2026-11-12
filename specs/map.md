@@ -67,17 +67,44 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       confirmation, the pair is ambiguous and counts as no measurable pair. Registration must
       not choose between them on that pair alone. This applies to measurement and, the same
       way, to the registration gate (§2, Match graph, step 2).
-    * Frames without depth: when either frame carries no depth image, the pair's own data
-      cannot reject such a geometry, so a cycle-consistency rule applies among image-measured
-      rotations only. A pair whose two-view rotation disagrees by more than 10° (a constant in
-      `README.md`) with the chain of stronger measured pairs is not measurable. A chain
-      composes the two-view rotations along a path of measurable pairs that each have strictly
-      more inliers than the pair. The rule is independent of the joint solve (§4). It cannot
-      catch a lattice geometry that stays consistent around a whole cycle, or a pair with no
-      stronger chain: an accepted degenerate case, as above. When stored frames are joined to a
-      standpoint, stored-to-stored pairs are not re-measured, so the rule may have no chain
-      there: the pair is then judged by the depth test only, or kept as measured when no depth
-      is available;
+    * **Translational twins.** On a plain wall and floor, a pose with the true rotation and a
+      shifted position can agree with both depth images as well as the true one. When two
+      depth-confirmed hypotheses share the rotation (differ by less than 10°) but their
+      positions are at least 0.3 m apart (a constant in `README.md`), the pair takes the one
+      whose predicted two-view parallax (above) matches the measured parallax of the pair's
+      matches: a turn in place predicts about 1 px, a shifted pose hundreds. Only when the
+      parallax cannot separate them, within its noise (a model in `README.md`), is the pair
+      ambiguous: it counts as no measurable pair, and registration must not choose a pose on
+      it alone. This applies to measurement and, the same way, to the registration gate (§2,
+      Match graph, step 2), alongside the rule above.
+    * **Cycle consistency.** The cycle-consistency rule applies to every pair: a pair whose
+      two-view rotation disagrees by more than 10° (a constant in `README.md`) with the chain
+      of stronger measured pairs is not measurable. Where both frames carry depth it applies
+      after the depth confirmation, because a scene can be symmetric for depth too: in an empty
+      rectilinear room each view of a narrow camera sees the floor and one flat wall, and a
+      pose turned by 90° and shifted agrees with both depth images exactly, while the true pose
+      of a pair turned by more than the field of view shares no view. A chain composes the
+      two-view rotations along a path of measurable pairs that each have strictly more inliers
+      than the pair. The rule is independent of the joint solve (§4). It cannot catch a lattice
+      geometry that stays consistent around a whole cycle, or a pair with no stronger chain:
+      an accepted degenerate case, as above. A frame with two or more measurable pairs, none
+      of which has a chain of stronger pairs to be judged against, has those pairs outside the
+      pair limits (§4): they neither pass nor fail the rotation check, and such a frame never
+      rejects the job on its own. Depth confirmation does not change this. A pair without a
+      chain that is its frame's only measurable pair (for example the single pair of a
+      two-frame job, or a frame joined by one pair) stays measurable and is judged against the
+      committed rotations. A frame with some chained and some unchained pairs keeps all of
+      them measurable.
+      * **Stored-to-stored pairs.** When the rule needs a chain for a pair that involves a
+        stored keyframe, including a standpoint join of a new frame to stored keyframes, the job
+        measures the stored-to-stored pairs that chain needs. Each is measured from the two
+        stored keyframes' own images as a two-view fit, with the depth confirmation where both
+        carry depth, under the same rules as any measured pair (this rule included, which ends
+        because a chain uses only strictly stronger pairs). The measurement never uses the
+        stored or committed poses, and the chain never falls back to committed rotations: a
+        pair whose chain still cannot be measured is the degenerate case above. A measurement
+        is cached per version and reused across jobs while both stored frames are unchanged.
+        The seconds spent are reported as the job's `timings_s.stored_pairs` (api.md §4);
   * a rotation-only hypothesis takes the standpoint's position sigma, and the position test
     (api.md §4) uses it;
   * the committed relative rotations of overlapping neighbours must agree with their
@@ -273,7 +300,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        reference that carries them, is placed only if it passes the depth confirmation of §1
        (Measurable pair); a candidate failing it is not a placement. When two distinct candidate
        poses of a frame against one reference both pass it (§1, Symmetric scenes), the pair is
-       ambiguous and that reference alone places the frame in neither. A component that reaches
+       ambiguous and that reference alone places the frame in neither. Two that share the
+       rotation but lie far apart (§1, Translational twins) are separated by their
+       parallax first, and the pair is ambiguous only when the parallax cannot separate them;
+       a prior sent for the frame still decides first, within its sigma. A component that reaches
        no confirmed keyframe is seeded at one frame's prior. Its frames' reported sigmas cover
        the seed prior's sigma combined with each frame's fusion, and are never tighter than the
        seed prior's. This floor applies to every frame whose placement depends on the component,
@@ -465,9 +495,10 @@ becomes a job with a `job_id`. A job goes through these states:
       joint solve. It uses the pair's images, its depth images when both frames carry them,
       and the cycle-consistency rule (§1, Measurable pair), nothing else.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
-    registered frames only, over measurable pairs (§1: at least 100 epipolar inliers, depth- or
-    cycle-confirmed as there, and an overlap of at least 10 %). With no measurable pair, every
-    pair limit passes.
+    registered frames only, over measurable pairs (§1: at least 100 epipolar inliers,
+    depth-confirmed where both frames carry depth and consistent with the chain of stronger
+    pairs, as there, and an overlap of at least 10 %). With no measurable pair, every pair limit
+    passes.
 
 ## 5. Objects (O8)
 
@@ -479,7 +510,7 @@ where its row allows omission.
 | --- | --- |
 | `id` | Positive integer, unique across the map's whole version history and never reused, even after a revert (§2). |
 | `label`, `detected_as[]`, `score` | Label chosen (Label choice, below), labels it was detected as, and confidence. |
-| `label_scores[]` | Optional (oms/2.4). Up to the 3 best label candidates of the record, `{label, score}`, in the order of the label choice (below): the first is `label`, the rest follow by score, highest first. `score` is the label's `detection_votes[].share` (same count, same denominator, same ignored-pixel rule), in 0–1, so the scores sum to at most 1. Present whenever the version's label vocabulary holds client labels (§5, Label vocabulary); otherwise it may be omitted. A label with no share is no candidate: the list holds fewer than 3 entries when fewer labels got votes. Map objects only; frame analysis does not carry it. |
+| `label_scores[]` | Optional (oms/2.4). Up to the 3 best label candidates of the record, `{label, score}`, in the order of the label choice (below): the first is `label` (whose score is always above 0, §5 Label choice), the rest follow by score, highest first. `score` is the label's `detection_votes[].share` (same count, same denominator, same ignored-pixel rule), in 0–1, so the scores sum to at most 1. Present whenever the version's label vocabulary holds client labels (§5, Label vocabulary); otherwise it may be omitted. A label with no share is no candidate: the list holds fewer than 3 entries when fewer labels got votes. Map objects only; frame analysis does not carry it. |
 | `detection_votes[]` | `{label, share}`, highest share first: `share` is the number of frames that gave that label over the number of image-confirmed frames whose view frustum contains the object's box centre and that gives a view of it (Ignored pixels, below), detected or not, plus every confirmed frame that detected the object even with the box centre outside its frustum (`kept_at_prior` frames excluded, except a frame kept only for `too_close` with a `metric` prior, which counts as a confirmed frame here, api.md §4), so shares sum to at most 1 and may sum to less. For a map built by the older mapper, shares come from that mapper's per-label vote counts over its observing frames. Map objects only; frame analysis does not carry it. |
 | `centre_m`, `size_m`, `yaw_deg` | Upright oriented box in the map frame: z is up, x is the longer horizontal side. |
 | `sigma_centre_m` | One-sigma uncertainty of the centre. When the map's builder never recorded which views bound the box, it comes from the formula documented in `README.md`. |
@@ -508,14 +539,18 @@ these heights.
   label equal to a default stays in the stored vocabulary and in `MapSummary.labels`: it is
   dropped only from the prompt list. The map summary reports the version's vocabulary
   read-only, and a dry run the vocabulary it would use.
-* **Label choice.** A record's `label` is chosen among the labels of its `detection_votes` by
-  their `share`, the highest winning, with one exception (oms/2.4): a **client label** is a
+* **Label choice.** A record's `label` is the engine's own choice among the labels of its
+  `detection_votes` (its evidence rule, `README.md`; it need not be the highest `share`), with
+  two exceptions (oms/2.4). A label with no share (share 0 or no `detection_votes` entry) is never
+  chosen: when the engine's choice has no share, the best-share label is chosen instead. And a
+  **client label** is a
   label equal (by the comparison above) to a label of the map's vocabulary, whether or not it
   also equals a default; every other label is a **default label**. A client label beats a default
   label whose share exceeds the client label's by no more than `CLIENT_LABEL_MARGIN`
-  (`README.md`), an absolute difference of shares. Concretely: with the best-share label `L`,
-  if `L` is a client label it is chosen; else the client label of the highest share among those
-  within the margin of `L`'s share is chosen, if there is one; else `L`. The margin is applied
+  (`README.md`), an absolute difference of shares. Concretely, with the best-share label `L` and
+  the engine's choice `E` (replaced by `L` when `E` has no share): if `E` is a client label it is
+  chosen; else the client label of the highest share among those within the margin of `L`'s
+  share is chosen, if there is one (so `L` itself when `L` is a client label); else `E`. The margin is applied
   once, against the best-share label, not chained. Candidates of equal share are ordered as
   before this rule. The same rule chooses the label of a merged object (`README.md`, Persistent
   identity) from the merged evidence. `label_scores` lists the candidates in this order. The
