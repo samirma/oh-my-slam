@@ -143,6 +143,16 @@ minor 2.2, because the API has a single client, updated in step with it:
 **oms/2.3** is additive: the update request's optional `labels` (a map's label vocabulary,
 map.md §5), reported on the map summary and the dry run.
 
+**oms/2.4** is additive: the object record's optional `label_scores` (up to three label
+candidates with their scores, map.md §5), and the label choice rule that prefers a client label
+over a default one whose score is higher by no more than a margin (map.md §5). It also adds,
+all optional or empty by default: the quality report's `floor_inconsistent` (frames whose own
+depth puts the floor away from their sent height, map.md §2); the input status's `depth_scale`
+(the per-frame depth scale applied to a monocular frame, map.md §2); and the prior's
+`sigma_tilt_deg` (the uncertainty of pitch and roll apart from yaw, map.md §1). The sent camera
+height also becomes a z measurement in registration (map.md §2), and `floor_sigma_m` a robust
+standard deviation with a floor band tested on surface height (map.md §6).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
