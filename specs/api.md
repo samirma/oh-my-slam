@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.5"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.6"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -253,7 +253,12 @@ error code `invalid_request` (§9).
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
   dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
   its measured, committed and difference angles, so a client can see which pairs drove
-  `rotation_inconsistent` (map.md §4).
+  `rotation_inconsistent` (map.md §4). `failed_checks` holds `depth_inconsistent` (oms/2.6) when
+  two committed views contradict each other's sensor depth images (map.md §4, Depth
+  consistency), with or without priors; a dry run predicts it. `quality.depth_pairs` (oms/2.6)
+  lists every pair that limit evaluated, `{a, b, agree_ratio_ab, agree_ratio_ba, fails}`, on jobs
+  and dry runs, so on a rejection a client sees which frames contradict and can drop or retake
+  them.
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
   waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
   single worker (inference.md). Documented limit: a job registers frames that carry depth
