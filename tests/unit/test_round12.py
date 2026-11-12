@@ -506,3 +506,14 @@ def test_labels_compare_unicode_case_folded() -> None:
     assert normalize_label(" Straße_Sign ") == normalize_label("STRASSE   sign") == "strasse sign"
     assert map_labels({"labels": ["Straße sign"]}, ["strasse_SIGN", "red mug"]) \
         == ["Straße sign", "red mug"]
+
+
+def test_a_revert_whose_target_has_no_objects_answer(client: Client) -> None:  # noqa: F811
+    """A target derived without its objects answer on disk: the revert links the rest, and its
+    objects read is computed for its own version."""
+    _three(client)
+    d = client.service.store.dir("m") / "derived"
+    (d / "1" / "objects.json").unlink()
+    assert _revert(client, 1)["map_version"] == 4
+    assert (d / "4" / "volume.npz").stat().st_ino == (d / "1" / "volume.npz").stat().st_ino
+    assert client.get("/api/maps/m/objects", "Objects")["map_version"] == 4
