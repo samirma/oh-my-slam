@@ -152,6 +152,8 @@ ENGINE = "anchored"
 STATE_JSON = "state.json"
 CLOUD_NPZ = "cloud.npz"
 KF_DIR = "kf"
+# the stored-to-stored pairs' two-view fits (``AnchoredMap.pair_cache``, map.md §1, P27)
+PAIRS_JSON = "stored_pairs.json"
 KF_JPEG_QUALITY = 92
 
 MAX_FEATURES = 4000
@@ -240,6 +242,18 @@ EPIPOLAR_HYPOTHESES = 3  # sequential RANSAC hypotheses of a pair (``epipolar_hy
 # (``standpoint.CYCLE_MAX_DEG``): a hypothesis this far from another is a different geometry, not
 # the same one measured twice (sequential RANSAC's leftovers of one geometry agree within a degree)
 SYMMETRIC_MIN_DEG = 10.0
+# map.md §1 "Translational twins" (P28): two depth-confirmed hypotheses (or candidate poses) whose
+# rotations are within ``SYMMETRIC_MIN_DEG`` but whose positions are at least this far apart are
+# twins (a plain wall and floor agree with a shifted pose): the two-view parallax separates them
+# (``twin_pick``). Below it, two hypotheses are one geometry measured twice (sequential RANSAC's
+# leftovers of one geometry lie within centimetres; a twin of the test room is 1-2 m away)
+TWIN_MIN_M = 0.3
+# the two-view parallax's noise (README "Translational twins"): a prediction matches the measured
+# parallax within ``PARALLAX_K`` x (``PARALLAX_NOISE_PX`` + ``PARALLAX_NOISE_REL`` x measured)
+PARALLAX_NOISE_PX = 1.0
+PARALLAX_NOISE_REL = 0.25
+PARALLAX_K = 2.0
+PARALLAX_SIN_MIN = 0.3  # map.md §1 "Two-view parallax": the sine is floored at this
 EDGE_REL = 0.06  # a depth sample whose 3x3 neighbourhood spans more than this is a depth edge
 GN_ITERATIONS = 15
 BEHIND_PX = 1e6  # the pixel of a point behind the camera (a residual Huber ignores)
@@ -1059,7 +1073,37 @@ def agreement(points_cam: Array, T: Array, refs: list[DepthRef], tol: float) -> 
                      float(np.median(ratio[seen_any])))
 
 
-def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
+@dataclass(frozen=True)
+class DepthCounts:
+    """One way of a depth agreement (``depth_counts``): view ``p``'s depth points and how many
+    of them view ``q`` sees agree, see through (a contradiction), occluded (behind its surface)
+    or outside (its image, its front or its depth range)."""
+
+    points: int
+    agree: int
+    through: int
+    occluded: int
+    outside: int
+
+    @property
+    def ratio(self) -> float:
+        """The agreeing share of those that agree or contradict (0 without any)."""
+        n = self.agree + self.through
+        return self.agree / n if n else 0.0
+
+    @property
+    def passes(self) -> bool:
+        """This way of the depth confirmation (``depth_confirmed``)."""
+        return self.agree >= MIN_AGREEING \
+            and self.agree >= DEPTH_CONFIRM_AGREEMENT * (self.agree + self.through)
+
+    def text(self) -> str:
+        """For the service log: agree, through, occluded, outside, of points, the ratio."""
+        return (f"agree {self.agree} through {self.through} occluded {self.occluded} outside "
+                f"{self.outside} of {self.points} = {self.ratio:.3f}")
+
+
+def depth_counts(p: DepthRef, q: DepthRef, tol: float) -> DepthCounts:
     """View ``p``'s depth points (``backproject``) at its pose, seen by view ``q`` (map.md §1
     "Depth agreement"): how many agree with ``q``'s depth within ``tol`` (relative) and how many
     lie in front of ``q``'s surface by more than that — ``q`` would see through them, a
@@ -1081,20 +1125,103 @@ def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
     seen = inside & np.isfinite(d) & (d >= lo) & (d <= hi)
     agree = seen & (np.abs(z - d) <= tol * d)
     through = seen & (z < d * (1.0 - tol))
-    return int(agree.sum()), int(through.sum())
+    occluded = seen & ~agree & ~through
+    return DepthCounts(len(z), int(agree.sum()), int(through.sum()), int(occluded.sum()),
+                       int((~seen).sum()))
+
+
+def seen_through(p: DepthRef, q: DepthRef, tol: float) -> tuple[int, int]:
+    """``depth_counts``' agreeing and seen-through points."""
+    c = depth_counts(p, q, tol)
+    return c.agree, c.through
+
+
+def depth_check(a: DepthRef, b: DepthRef, tol: float = SENSOR_DEPTH_TOL
+                ) -> tuple[bool, DepthCounts, DepthCounts]:
+    """``depth_confirmed`` with both ways' counts (``depth_counts``, for the service log)."""
+    ab, ba = depth_counts(a, b, tol), depth_counts(b, a, tol)
+    return ab.passes and ba.passes, ab, ba
 
 
 def depth_confirmed(a: DepthRef, b: DepthRef, tol: float = SENSOR_DEPTH_TOL) -> bool:
     """The depth confirmation of two views' relative pose (map.md §1 "Measurable pair", §2 step
-    2): each view's depth points at its pose, seen by the other (``seen_through``), agree within
+    2): each view's depth points at its pose, seen by the other (``depth_counts``), agree within
     ``tol`` for at least ``DEPTH_CONFIRM_AGREEMENT`` of those that agree or that the other would
     see through (at least ``MIN_AGREEING`` agreeing), both ways. Every engine's candidate poses
     and the pairs' two-view fits take this one test."""
-    for p, q in ((a, b), (b, a)):
-        agree, through = seen_through(p, q, tol)
-        if agree < MIN_AGREEING or agree < DEPTH_CONFIRM_AGREEMENT * (agree + through):
-            return False
-    return True
+    return all(depth_counts(p, q, tol).passes for p, q in ((a, b), (b, a)))
+
+
+# -- translational twins (map.md §1, §2 step 2; P28) ----------------------------------------------
+
+
+def predicted_parallax(ua: Array, Ka: Intrinsics, depth: NDArray[np.float32], K_grid: Intrinsics,
+                       T_a_b: Array, focal: float) -> float | None:
+    """The two-view parallax (map.md §1) a relative pose ``T_a_b`` (b's camera in a's, metric)
+    predicts at a's pixels ``ua`` (the pair's epipolar inliers), lifted by a's depth (``depth``
+    on the grid ``K_grid``): the median, over those points seen in front of b, of the
+    rotation-only residual (the best rotation of the predicted rays, ``kabsch``) times
+    ``focal`` (px) over max(sin of the ray's angle to the baseline, ``PARALLAX_SIN_MIN``) — the
+    measured parallax's formula (``standpoint._fit``) on the rays the pose predicts. 0 for a
+    pose without translation; None with fewer than three such points."""
+    z = sample_depth(depth, K_grid, Ka, ua).astype(np.float64)
+    ok = np.isfinite(z) & (z > MIN_DEPTH_M)
+    P = rays(Ka, ua[ok]) * z[ok, None]
+    R, t = T_a_b[:3, :3], T_a_b[:3, 3]
+    xb = (P - t) @ R  # in b's camera: R^T (P - t)
+    front = xb[:, 2] > MIN_DEPTH_M
+    if int(front.sum()) < 3:
+        return None
+    if float(np.linalg.norm(t)) < 1e-9:
+        return 0.0
+    da, db = unit(P[front]), unit(xb[front])
+    Q = kabsch(db, da)
+    ang = np.arccos(np.clip(np.sum((db @ Q.T) * da, axis=1), -1.0, 1.0))
+    sin = np.sqrt(np.clip(1.0 - (da @ unit(t)) ** 2, 0.0, 1.0))
+    return float(np.median(ang * focal / np.maximum(sin, PARALLAX_SIN_MIN)))
+
+
+def parallax_matches(predicted: float | None, measured: float) -> bool:
+    """Whether a predicted two-view parallax matches the measured one within its noise
+    (``PARALLAX_K`` x (``PARALLAX_NOISE_PX`` + ``PARALLAX_NOISE_REL`` x measured), README
+    "Translational twins"); a pose that predicts none does not."""
+    return predicted is not None and abs(predicted - measured) <= PARALLAX_K * (
+        PARALLAX_NOISE_PX + PARALLAX_NOISE_REL * measured)
+
+
+def twins(centres: list[Array]) -> bool:
+    """Whether two of the positions lie at least ``TWIN_MIN_M`` apart (map.md §1 "Translational
+    twins": the hypotheses share the rotation, their caller's test)."""
+    return any(float(np.linalg.norm(p - q)) >= TWIN_MIN_M
+               for k, p in enumerate(centres) for q in centres[k + 1:])
+
+
+def one_position(picked: list[int], centres: list[Array]) -> int | None:
+    """The first of ``picked`` when all of them lie within ``TWIN_MIN_M`` of it (one position),
+    else None (twins remain, or nothing was picked)."""
+    if not picked or twins([centres[k] for k in picked]):
+        return None
+    return picked[0]
+
+
+def twin_pick(measured: float, predicted: list[float | None], centres: list[Array]
+              ) -> int | None:
+    """Translational twins separated by their parallax (map.md §1, P28): the first hypothesis
+    whose predicted two-view parallax matches the pair's measured one (``parallax_matches``),
+    when those that match share one position (``one_position``); None when the parallax cannot
+    separate them (none matches, or twins match alike): the pair is ambiguous."""
+    return one_position([k for k, p in enumerate(predicted) if parallax_matches(p, measured)],
+                        centres)
+
+
+def prior_pick(centres: list[Array], prior_c: Array, sigma_m: float) -> int | None:
+    """Translational twins decided by a prior sent for the frame (map.md §2 step 2: first,
+    within its sigma): the first candidate whose position lies within ``K_SIGMA`` x the prior's
+    position sigma of the prior's centre, when those that do share one position; None
+    otherwise (the parallax decides)."""
+    near = [k for k, c in enumerate(centres)
+            if float(np.linalg.norm(c - prior_c)) <= K_SIGMA * sigma_m]
+    return one_position(near, centres)
 
 
 def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
@@ -1776,6 +1903,9 @@ def _may_overlap(Xa: Array, Ta: Array, Pa: Array, Ka: Intrinsics,
     return False
 
 
+_Sub = tuple[Array, Array, Array, NDArray[np.intp]]  # a frame's correspondences: uv, X, d, kf
+
+
 @dataclass
 class _Corr:
     uv: Array  # new frame pixels
@@ -2123,6 +2253,18 @@ class AnchoredMap:
         self._close_base: Drift | None = None
         self.reran: set[str] = set()
         self._retried_drifting = False
+        self._pair_cache: dict[str, Any] | None = None
+
+    @property
+    def pair_cache(self) -> dict[str, Any]:
+        """The stored-to-stored pairs' two-view fits (map.md §1 "Stored-to-stored pairs", P27),
+        by keyframe and content (``standpoint.Pairs.stored``): kept with the map, so cached per
+        version and reused while both keyframes are unchanged. Loaded once, saved with the map
+        (``save``: only the pairs of keyframes it still holds)."""
+        if self._pair_cache is None:
+            p = self.root / PAIRS_JSON
+            self._pair_cache = json.loads(p.read_text()) if p.exists() else {}
+        return self._pair_cache
 
     # -- persistence ---------------------------------------------------------------------------
 
@@ -2164,6 +2306,11 @@ class AnchoredMap:
             "next_id": self.next_id, "created_with": self.created_with,
             "origin_c": None if self.origin_c is None else self.origin_c.tolist(),
             "bias": self.bias, "origin_height_m": self.origin_height_m})
+        if self._pair_cache is not None:
+            ids = {k.id for k in self.keyframes}
+            atomic_write_json(self.root / PAIRS_JSON, {
+                key: v for key, v in self._pair_cache.items()
+                if all(side.split(":")[0] in ids for side in key.split("|"))})
 
     def image_path(self, kid: str) -> Path | None:
         """A keyframe's canonical image, or None."""
@@ -2541,9 +2688,15 @@ class AnchoredMap:
             s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
             n = int(s.inliers.sum())
             # a candidate pose the depth images do not confirm is no placement (map.md §2 step
-            # 2): a lattice pose is never registered
-            if n >= MIN_INLIERS and self.depth_confirms(f, s.T, sub[3][s.inliers], cands,
-                                                        corr):
+            # 2): a lattice pose is never registered; a translational twin picked over it
+            # replaces it (P28)
+            gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, feats,
+                                       None if T0 is None else (T0[:3, 3], sp0)) \
+                if n >= MIN_INLIERS else None
+            if gate and gate[1] is not None:
+                s, sub, rot_only = gate[0], gate[1], False
+                n = int(s.inliers.sum())
+            if gate:
                 spi, sri = s.sigmas()
                 spi = max(spi, MIN_SIGMA_POS_M)
                 sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -2658,6 +2811,10 @@ class AnchoredMap:
             self._load_kf(k)
             tv = None if k.feats is None else standpoint.two_view(
                 new, standpoint.View(k.name, k.K, k.feats, k.T[:3, :3], k.centre, True))
+            # (L5) which consensus decided it, per reference
+            log.info("%s: translation test against %s: %s", f.name, k.id, "no fit" if tv is None
+                     else f"parallax {tv.parallax:.2f} px ({tv.inliers} inliers): "
+                          f"{'unconstrained' if tv.unconstrained else 'constrained'}")
             if tv is None or not tv.unconstrained:
                 return False
         return bool(used)
@@ -2690,53 +2847,149 @@ class AnchoredMap:
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]), trust)
         if n < need or sigmas.conflicts(dp, dr, (sp0, sr0), ci,
                                         tilt=sigmas.tilt_of(s.R, T0[:3, :3],
-                                                            _tilt_sigma(f.prior))) \
-                or not self.depth_confirms(f, s.T, sub[3][s.inliers], cands, corr):
+                                                            _tilt_sigma(f.prior))):
             return None
+        # (the prior decides translational twins first: one it cannot separate the parallax may)
+        gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, None, (T0[:3, 3], sp0))
+        if not gate:
+            return None
+        if gate[1] is not None:
+            s, sub = gate[0], gate[1]
+            n = int(s.inliers.sum())
         return s, n, sub, refs
 
-    def depth_confirms(self, f: FrameIn, T: Array, ref_of: NDArray[np.intp],
-                       cands: list[Keyframe], corr: _Corr | None = None) -> bool:
-        """Whether a candidate pose ``T`` of a frame passes the depth confirmation (map.md §1
-        "Measurable pair", §2 step 2, ``depth_confirmed``) against the reference carrying a
+    def depth_confirms(self, f: FrameIn, s: Solve, ref_of: NDArray[np.intp],
+                       cands: list[Keyframe], corr: _Corr | None = None,
+                       feats: Features | None = None, prior: tuple[Array, float] | None = None
+                       ) -> tuple[Solve, _Sub | None] | None:
+        """The registration gate (map.md §1 "Measurable pair", §2 step 2, ``depth_check``) of a
+        candidate pose ``s`` of a frame: the depth confirmation against the reference carrying a
         depth image that holds most of its inliers (``ref_of``, at least ``MIN_INLIERS``; ties
-        to the lowest keyframe id). A reference against which another candidate pose of the
-        frame passes it too (``_ambiguous``, from the frame's correspondences ``corr``: map.md
-        §1 "Symmetric scenes") places it in neither pose: the next such reference must confirm
-        it, and with none left the pose is no placement. A pose a reference rejects is no
-        placement. True when the frame or every such reference carries none."""
+        to the lowest keyframe id), logged (L4: its agreement both ways and its distance to the
+        reference). A reference against which another candidate pose of the frame at least
+        ``SYMMETRIC_MIN_DEG`` away passes it too (``_ambiguous``, from the frame's
+        correspondences ``corr``: map.md §1 "Symmetric scenes") places it in neither pose: the
+        next such reference must confirm it, and with none left the pose is no placement.
+        Another one sharing its rotation but ``TWIN_MIN_M`` or more away (translational twins,
+        P28) is separated first by the frame's prior (``prior``: its centre and position sigma)
+        and else by the parallax (``_twin``, with the frame's ``feats``); only when nothing
+        separates them does that reference place it in neither. A pose a reference rejects is no
+        placement. Returns the pose to place, ``(s, None)``, or a twin picked over it with the
+        correspondences it was refined on; None: no placement. ``(s, None)`` when the frame or
+        every such reference carries no depth image."""
         own = depth_image(f)
         if own is None:
-            return True
+            return s, None
         per = np.bincount(ref_of, minlength=len(cands))
         order = sorted((int(i) for i in np.flatnonzero(per >= MIN_INLIERS)
                         if cands[int(i)].depth_kind == "sensor"),
                        key=lambda i: (-per[i], cands[i].id))
         refs = [(i, g) for i in order for g in [self._grid(cands[i])] if g is not None]
+        T = s.T
         for i, ref in refs:
             k = cands[i]
-            if not depth_confirmed(DepthRef(T, own, f.K.K()), ref):
-                log.info("%s: its image pose against %s fails the depth confirmation", f.name,
-                         k.id)
-                return False
+            ok, ab, ba = depth_check(DepthRef(T, own, f.K.K()), ref)
+            log.info("%s: image pose against %s (%d inliers on it) |dt| %.2f m: agreement "
+                     "%d/%d/%d = %.3f, %d/%d/%d = %.3f: %s", f.name, k.id, per[i],
+                     float(np.linalg.norm(T[:3, 3] - k.centre)), ab.agree, ab.through,
+                     ab.occluded, ab.ratio, ba.agree, ba.through, ba.occluded, ba.ratio,
+                     "confirmed" if ok else "fails")
+            if not ok:
+                return None
+            if corr is None:
+                return s, None
             # (only a pose the depth confirms asks whether another one would pass too)
-            alt = None if corr is None else self._ambiguous(f, T, own, corr, cands, i, ref)
-            if alt is None:
-                return True
-            log.info("%s: against %s, candidate poses %.1f deg apart both pass the depth "
-                     "confirmation (a symmetric scene): that reference places it in neither",
-                     f.name, k.id, alt)
-        return not refs
+            twin: list[Solve] = []
+            alt = self._ambiguous(f, T, own, corr, cands, i, ref, twin)
+            if alt is not None:
+                log.info("%s: against %s, candidate poses %.1f deg apart both pass the depth "
+                         "confirmation (a symmetric scene): that reference places it in "
+                         "neither", f.name, k.id, alt)
+                continue
+            if not twin:
+                return s, None
+            got = self._twin(f, s, twin, own, i, ref, corr, cands, feats, prior)
+            if got is not None:
+                return got
+        return None if refs else (s, None)
+
+    def _twin(self, f: FrameIn, s: Solve, alts: list[Solve], own: NDArray[np.float32], j: int,
+              ref: DepthRef, corr: _Corr, cands: list[Keyframe], feats: Features | None,
+              prior: tuple[Array, float] | None) -> tuple[Solve, _Sub | None] | None:
+        """Translational twins against reference ``cands[j]`` (map.md §1, §2 step 2, P28): the
+        frame's pose ``s`` and candidate poses ``alts`` that share its rotation at least
+        ``TWIN_MIN_M`` away, all confirmed by that reference's depth. A prior sent for the frame
+        decides first (``prior_pick``: within ``K_SIGMA`` of its position sigma), else the
+        two-view parallax of the frame's pair with that reference (``twin_pick``: measured over
+        the pair's matches, ``standpoint.two_view``, and predicted there by the frame's depth at
+        each pose). Returns ``(s, None)`` when it picks ``s``; a twin it picks, refined on all the
+        frame's correspondences, with them, when it stays that twin (within ``TWIN_MIN_M`` and
+        ``SYMMETRIC_MIN_DEG``, ``MIN_INLIERS``, confirmed by the reference); None when nothing
+        separates them (that reference places the frame in neither) or the twin does not hold."""
+        k = cands[j]
+        poses = [s, *alts]
+        centres = [p.c for p in poses]
+        pick = None if prior is None else prior_pick(centres, *prior)
+        how = "the prior"
+        if pick is None:
+            how = "the parallax"
+            measured, preds = self._twin_parallax(f, feats, k, own, poses)
+            pick = None if measured is None else twin_pick(measured, preds, centres)
+        far = ", ".join(f"{float(np.linalg.norm(p.c - s.c)):.2f} m" for p in alts)
+        if pick is None:
+            log.info("%s: against %s, translational twins (%s away) pass the depth "
+                     "confirmation and nothing separates them: that reference places it in "
+                     "neither", f.name, k.id, far)
+            return None
+        log.info("%s: against %s, translational twins (%s away): %s picks %s", f.name, k.id,
+                 far, how, "its pose" if pick == 0 else
+                 f"the twin {float(np.linalg.norm(centres[pick] - s.c)):.2f} m away")
+        if pick == 0:
+            return s, None
+        t = poses[pick]
+        sub = (corr.uv, corr.X, corr.d, corr.kf)
+        r, _ = refine_pose(t.R, t.c, *sub, self._refs(cands), f.K)
+        if int(r.inliers.sum()) < MIN_INLIERS or float(np.linalg.norm(r.c - t.c)) >= TWIN_MIN_M \
+                or rot_deg(r.R.T @ t.R) >= SYMMETRIC_MIN_DEG \
+                or not depth_confirmed(DepthRef(r.T, own, f.K.K()), ref):
+            log.info("%s: the twin picked does not hold on its correspondences: no placement",
+                     f.name)
+            return None
+        return r, sub
+
+    def _twin_parallax(self, f: FrameIn, feats: Features | None, k: Keyframe,
+                       own: NDArray[np.float32], poses: list[Solve]
+                       ) -> tuple[float | None, list[float | None]]:
+        """The two-view parallax of a frame's pair with keyframe ``k`` (``standpoint.two_view``
+        on their features, its largest consensus: map.md §1) and the one each candidate pose
+        predicts at the pair's matches (``predicted_parallax``, the frame's depth ``own``); (None,
+        []) without features or a fit."""
+        from oh_my_slam.mapping import standpoint
+
+        self._load_kf(k)
+        if feats is None or k.feats is None:
+            return None, []
+        tv = standpoint.two_view(
+            standpoint.View(f.name, f.K, feats, np.eye(3), np.zeros(3)),
+            standpoint.View(k.name, k.K, k.feats, k.T[:3, :3], k.centre, True))
+        if tv is None or tv.ua is None:
+            return None, []
+        focal = math.sqrt(f.K.fx * k.K.fx)
+        return tv.parallax, [predicted_parallax(tv.ua, f.K, own, f.K,
+                                                np.linalg.inv(p.T) @ k.T, focal) for p in poses]
 
     def _ambiguous(self, f: FrameIn, T: Array, own: NDArray[np.float32], corr: _Corr,
-                   cands: list[Keyframe], j: int, ref: DepthRef) -> float | None:
+                   cands: list[Keyframe], j: int, ref: DepthRef,
+                   twin: list[Solve] | None = None) -> float | None:
         """Another candidate pose of a frame against reference ``cands[j]`` that passes the
         depth confirmation as its pose ``T`` does, at least ``SYMMETRIC_MIN_DEG`` from it (map.md
         §1 "Symmetric scenes", §2 step 2; the rule of ``standpoint.two_view`` on this engine's
         candidate poses): sequential PnP hypotheses (``pnp``, then ``refine_pose`` as the
         candidate) on the frame's lifted matches to that reference that the poses before left
         unexplained, up to ``EPIPOLAR_HYPOTHESES`` poses in all, each on at least
-        ``MIN_INLIERS``. Returns the angle between the two (deg), or None."""
+        ``MIN_INLIERS``. Returns the angle between the two (deg), or None. Those within
+        ``SYMMETRIC_MIN_DEG`` but ``TWIN_MIN_M`` or more from ``T`` that pass it (translational
+        twins, P28) are added to ``twin`` when given."""
         mine = (corr.kf == j) & np.isfinite(corr.X).all(axis=1)
         uv, X, d = corr.uv[mine], corr.X[mine], corr.d[mine]
         thr = 2.0 * self._thr(f.K)
@@ -2753,8 +3006,13 @@ class AnchoredMap:
             s, _ = refine_pose(got[0], got[1], uv[inl], X[inl], d[inl],
                                np.zeros(len(inl), np.intp), refs, f.K)
             deg = rot_deg(T[:3, :3].T @ s.R)
-            if deg >= SYMMETRIC_MIN_DEG and depth_confirmed(DepthRef(s.T, own, f.K.K()), ref):
-                return deg
+            far = twin is not None and float(np.linalg.norm(s.c - T[:3, 3])) >= TWIN_MIN_M
+            if (deg >= SYMMETRIC_MIN_DEG or far) \
+                    and depth_confirmed(DepthRef(s.T, own, f.K.K()), ref):
+                if deg >= SYMMETRIC_MIN_DEG:
+                    return deg
+                assert twin is not None
+                twin.append(s)
             left[inl] = False
         return None
 

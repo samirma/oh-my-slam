@@ -60,35 +60,58 @@ def label_scores(o: dict[str, Any]) -> list[dict[str, Any]]:
 CLIENT_LABEL_MARGIN = 0.15
 
 
-def client_label(o: dict[str, Any], vocabulary: list[str]) -> str | None:
-    """The client label an object record takes by the label choice (map.md §5, oms/2.4), or
-    None when its label stays as chosen: among the labels of its ``detection_votes``, a client
-    label is one equal (``normalize_label``) to a label of the version's stored vocabulary,
-    whether or not it also equals a default; the client label of the highest share within
-    ``CLIENT_LABEL_MARGIN`` of the best share (the best itself when it is one; ties as the votes
-    list them) wins, applied once against the best share."""
-    client = {normalize_label(v) for v in vocabulary}
+def _share(votes: list[dict[str, Any]], label: str) -> float:
+    """A label's ``detection_votes`` share (0 without an entry)."""
+    return max((float(e["share"]) for e in votes if e["label"] == label), default=0.0)
+
+
+def chosen_label(o: dict[str, Any], vocabulary: list[str]) -> str:
+    """An object record's label by the label choice (map.md §5, oms/2.4, P25a). ``E`` is the
+    engine's own choice (the record's ``label``, its evidence rule) and ``L`` the best-share
+    label of its ``detection_votes`` (the first of the highest share, as the votes list them).
+
+    1. A label with no share is never chosen: when ``E`` has none (share 0 or no entry), ``E``
+       becomes ``L``.
+    2. A client label (``is_client``: equal, by ``normalize_label``, to a label of the version's
+       stored vocabulary, whether or not it also equals a default) chosen as ``E`` stays.
+    3. Else the client label of the highest share within ``CLIENT_LABEL_MARGIN`` of ``L``'s
+       share (``L`` itself when it is one), applied once against ``L``.
+    4. Else ``E``.
+
+    A record without votes keeps its label (no ``L``)."""
     votes = o.get("detection_votes") or []
+    engine = o["label"]
     if not votes:
-        return None
-    best = max(float(e["share"]) for e in votes)
-    near = [e for e in votes if normalize_label(e["label"]) in client
-            and float(e["share"]) > 0.0 and best - float(e["share"]) <= CLIENT_LABEL_MARGIN + 1e-9]
-    return max(near, key=lambda e: float(e["share"]))["label"] if near else None
+        return str(engine)
+    best = max(votes, key=lambda e: float(e["share"]))  # the first of the highest share
+    if _share(votes, engine) <= 0.0:
+        engine = best["label"]
+    client = {normalize_label(v) for v in vocabulary}
+
+    def is_client(label: str) -> bool:
+        return normalize_label(label) in client
+
+    if is_client(engine):
+        return str(engine)
+    top = float(best["share"])
+    near = [e for e in votes if is_client(e["label"]) and float(e["share"]) > 0.0
+            and top - float(e["share"]) <= CLIENT_LABEL_MARGIN + 1e-9]
+    return str(max(near, key=lambda e: float(e["share"]))["label"]) if near else str(engine)
 
 
 def with_label_scores(answer: dict[str, Any], vocabulary: list[str]) -> dict[str, Any]:
-    """An ``Objects`` answer whose records carry ``label_scores`` when the version's label
-    vocabulary (``vocabulary``: the client's labels as stored, never the defaults) holds any
-    (map.md §5: present whenever it does), each record's label taken by the label choice
-    (``client_label``); unchanged otherwise (a map with no client label chooses as before).
-    Idempotent (an answer kept on disk before oms/2.4 gets them on its read)."""
-    if not vocabulary:
-        return answer
+    """An ``Objects`` answer whose records take their label by the label choice
+    (``chosen_label``, map.md §5: a label with no share is never chosen, on every version) and
+    carry ``label_scores`` when the version's label vocabulary (``vocabulary``: the client's
+    labels as stored, never the defaults) holds any (map.md §5: present whenever it does).
+    Idempotent (an answer kept on disk before oms/2.4 gets them on its read); the answer itself
+    when it changes nothing."""
     out = []
     for o in answer["objects"]:
-        o = {**o, "label": client_label(o, vocabulary) or o["label"]}
-        out.append({**o, "label_scores": label_scores(o)})
+        o = {**o, "label": chosen_label(o, vocabulary)}
+        out.append({**o, "label_scores": label_scores(o)} if vocabulary else o)
+    if out == answer["objects"]:
+        return answer
     return {**answer, "objects": out}
 
 

@@ -284,7 +284,7 @@ def _engine(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None, work
     root = workdir / "mapper"
     am = AnchoredMap.load(root) if prev is not None else AnchoredMap(workdir / "new-map")
     am.root.mkdir(parents=True, exist_ok=True)
-    pairs = standpoint.Pairs()
+    pairs = standpoint.Pairs(dict(am.pair_cache))  # the map's stored pairs, never written
     am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
     todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
     # a new map's origin as the job takes it (``prior_first.run_anchored``): the first frame

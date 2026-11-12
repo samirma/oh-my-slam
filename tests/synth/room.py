@@ -37,6 +37,12 @@ class Room:
     # frames turned by about 90 deg is a false geometry, map.md §1 "Measurable pair")
     floor: str = "texture"
     tile: float = 0.30
+    # the walls' texture: ``texture`` (aperiodic), or ``periodic`` (the same texture repeated
+    # every ``wall_period`` m along the wall and up it, as a simulator tiles a wall texture:
+    # with no boxes, an empty rectilinear room whose plain walls and floor make a pose turned by
+    # 90 deg and shifted agree with both depth images exactly, map.md §1 "Cycle consistency")
+    walls: str = "texture"
+    wall_period: float = 1.0
 
     def cast(self, C: Array, d: Array) -> Array:
         """Distance along rays ``d`` (N x 3, any length: the parameter t) from ``C``."""
@@ -88,6 +94,21 @@ def tiles(p: Array, tile: float) -> Array:
     return out
 
 
+def periodic(room: Room, p: Array, col: Array) -> Array:
+    """``col`` with the walls' points (``p`` on a wall plane) coloured by ``texture`` of their
+    in-wall coordinate and height, each modulo ``room.wall_period``."""
+    hx, hy = room.half
+    onx = np.abs(np.abs(p[:, 0]) - hx) < 1e-4
+    ony = np.abs(np.abs(p[:, 1]) - hy) < 1e-4
+    wall = onx | ony
+    q = np.zeros((int(wall.sum()), 3))
+    q[:, 0] = np.mod(np.where(onx, p[:, 1], p[:, 0])[wall], room.wall_period)
+    q[:, 2] = np.mod(p[wall, 2], room.wall_period)
+    out = col.copy()
+    out[wall] = texture(q)
+    return out
+
+
 def render(room: Room, T: Array, K: Intrinsics = K_ROBOT, supersample: int = 2
            ) -> tuple[NDArray[np.uint8], NDArray[np.float32]]:
     """RGB (antialiased by ``supersample``) and z-depth of the camera ``T_map_cam``."""
@@ -101,6 +122,8 @@ def render(room: Room, T: Array, K: Intrinsics = K_ROBOT, supersample: int = 2
     t = room.cast(C, d)
     p = C + d * t[:, None]
     col = texture(p)
+    if room.walls == "periodic":
+        col = periodic(room, p, col)
     if room.floor == "tiles":
         on = p[:, 2] < 1e-4
         col[on] = tiles(p[on], room.tile)

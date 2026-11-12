@@ -527,6 +527,7 @@ class Updater:
         frames, masks = self._frames(w)
         self._check(frames, masks, prev, indir)
         tm["checks"] = round(time.perf_counter() - t, 3)
+        tm["stored_pairs"] = 0.0  # api.md §4 (oms/2.4): the engine sets it when it measures any
         job.progress = 0.1
         changed()
         if self._is_anchored(prev, frames):
@@ -1028,9 +1029,11 @@ class Updater:
             and not any(fr.work.trust in ("metric", "drifting") for fr in registered)
         # rotation consistency applies to this engine too (map.md §1 "Every engine"; updates
         # without priors, registered frames only)
-        bad, rotation_pairs = self._rotations_bad(registered, record, result[1]) \
+        pairs = standpoint.Pairs()  # (the older mapper's stored pairs are measured per job)
+        bad, rotation_pairs = self._rotations_bad(registered, record, result[1], pairs) \
             if result is not None and record is not None and registered and not any(
                 fr.work.trust in ("metric", "drifting") for fr in frames) else (False, [])
+        job.timings_s["stored_pairs"] = round(pairs.stored_s, 3)
         # a first update stores kept frames only with a registration (the engine exemption of
         # map.md §1): a kept-only first update fails the hard limit
         quality = self._quality(frames, registered, kept if record is not None else [], prev,
@@ -1059,7 +1062,8 @@ class Updater:
         job.timings_s["commit"] = round(time.perf_counter() - t, 3)
 
     @staticmethod
-    def _rotations_bad(registered: list[_Frame], record: dict[str, Any], internal: InternalMap
+    def _rotations_bad(registered: list[_Frame], record: dict[str, Any], internal: InternalMap,
+                       pairs: standpoint.Pairs | None = None
                        ) -> tuple[bool, list[dict[str, Any]]]:
         """``rotation_inconsistent`` of the older mapper (``standpoint.views_inconsistent``):
         the registered frames at their committed poses, with their request images, against the
@@ -1087,7 +1091,7 @@ class Updater:
             f, T = fx[r["internal"]], _mat(r["T_map_cam"])
             stored.append(standpoint.View(r["name"], Intrinsics(f, f, w / 2.0, h / 2.0, w, h),
                                           features(rgb), T[:3, :3].copy(), T[:3, 3].copy(), True))
-        return standpoint.views_inconsistent(new, stored)
+        return standpoint.views_inconsistent(new, stored, pairs)
 
     @staticmethod
     def _height_off(fr: _Frame, floor: float | None) -> bool:

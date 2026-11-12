@@ -40,13 +40,15 @@ def _hypotheses(monkeypatch: pytest.MonkeyPatch, turns: list[float]) -> list[str
     poses = iter(turns)
     calls: list[str] = []
 
-    def pose(*x: Any) -> np.ndarray:
+    def pose(*x: Any) -> sp.DepthPose:
         T = true.copy()
         T[:3, :3] = _yaw(next(poses)) @ true[:3, :3]
-        return T
+        return sp.DepthPose(T, 50, 60, "ransac", 0.0)
 
+    ok = an.DepthCounts(100, 100, 0, 0, 0)
     monkeypatch.setattr(sp, "depth_pose", pose)
-    monkeypatch.setattr(sp, "depth_confirmed", lambda *x, **k: calls.append("c") or True)
+    monkeypatch.setattr(sp, "depth_check",
+                        lambda *x, **k: calls.append("c") or (True, ok, ok))
     return calls
 
 
@@ -100,7 +102,7 @@ def test_the_registration_gate_takes_no_ambiguous_reference(
     bad: set[str] = set()
 
     def amb(self: Any, f: Any, T: Any, own: Any, corr: Any, cands: Any, j: int,
-            ref: Any) -> float | None:
+            ref: Any, twin: Any = None) -> float | None:
         asked.append(cands[j].name)
         return 90.0 if cands[j].name in bad else None
 
@@ -115,7 +117,8 @@ def test_the_registration_gate_takes_no_ambiguous_reference(
     asked.clear()
     pl = am.update([frame("e", base_pose(10.0), p=None)])[0]
     assert pl.status == "registered" and asked == [first, other]
-    monkeypatch.setattr(an, "depth_confirmed", lambda *x, **k: False)
+    no = an.DepthCounts(100, 0, 100, 0, 0)
+    monkeypatch.setattr(an, "depth_check", lambda *x, **k: (False, no, no))
     asked.clear()
     pl = am.update([frame("g", base_pose(10.0), p=None)])[0]
     assert pl.status == "rejected" and asked == []
@@ -190,7 +193,7 @@ def test_mapanything_takes_no_ambiguous_reference(tmp_path: Any) -> None:
     keys: list[str] = []
 
     def amb(bad: set[str]) -> Any:
-        return lambda r: keys.append(r.key) or r.key in bad
+        return lambda r, T: keys.append(r.key) or r.key in bad
 
     assert register_ma.confirms(new, T, refs[0].depth, refs[0].K, refs, amb({refs[0].key}))
     assert keys == [refs[0].key, refs[1].key]
@@ -205,9 +208,9 @@ def test_mapanything_takes_no_ambiguous_reference(tmp_path: Any) -> None:
     assert reg._gate(new) is None
     seen: list[tuple[int, str]] = []
     reg = register_ma.Registration(lambda *x: [], [new], [],
-                                   lambda f, key: seen.append((f.index, key)) or True)
+                                   lambda f, key, T: seen.append((f.index, key)) or True)
     gate = reg._gate(new)
-    assert gate is not None and gate(refs[1]) and seen == [(0, refs[1].key)]
+    assert gate is not None and gate(refs[1], np.eye(4)) and seen == [(0, refs[1].key)]
 
 
 def test_the_service_answers_mapanythings_gate(
@@ -235,11 +238,11 @@ def test_the_service_answers_mapanythings_gate(
     gate = got[0]
     run = gate.__self__
     f2 = next(n for n in run.reg.new if n.index == 2)
-    assert gate(f2, "new3") is False
+    assert gate(f2, "new3", np.eye(4)) is False
     stored = run.am.keyframes[0].id
-    assert gate(f2, stored) is False and gate(f2, "nope") is False
+    assert gate(f2, stored, np.eye(4)) is False and gate(f2, "nope", np.eye(4)) is False
     run.feats.pop(2)
-    assert gate(f2, stored) is False
+    assert gate(f2, stored, np.eye(4)) is False
 
 
 def test_the_depth_agreement_counts_only_what_it_could_see() -> None:
@@ -293,22 +296,26 @@ def test_the_dry_run_differs_from_the_job_only_where_mapanything_places(
     assert len(client.backend.mv_calls) == 1
 
 
-def test_a_standpoint_join_without_a_chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    """map.md §1 (P24): stored-to-stored pairs are not re-measured, so a pair joining a new
-    frame to a stored one may have no chain of stronger pairs: kept as measured without depth,
-    judged by the depth test alone with it, even far off what a chain would give."""
+def test_a_standpoint_join_takes_the_chain_through_stored_pairs(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """map.md §1 "Stored-to-stored pairs" (P27, replacing P24's "not re-measured"): the stored
+    pair a chain needs is measured, so a pair joining a new frame to stored ones that is 70 deg
+    off its chain n-s1-s2 is not measurable, with depth or without (P28: every pair); a stored
+    pair that cannot be measured leaves it without a chain: kept (the degenerate case)."""
     f, _ = _frame(0)
     T = base_pose(0.0)
     views = [sp.View("s1", K_ROBOT, f, T[:3, :3], T[:3, 3], True, kid="k1"),
              sp.View("s2", K_ROBOT, f, T[:3, :3], T[:3, 3], True, kid="k2"),
              sp.View("n", K_ROBOT, f, T[:3, :3], T[:3, 3], False, 0)]
     for depth in (False, True):
-        pairs = sp.Pairs()
-        # s1-s2 would make n-s2 70 deg off its chain n-s1-s2: it is never measured
-        pairs.fits.update({("n", "s1"): _tv(500, 20.0, depth), ("n", "s2"): _tv(300, -50.0, depth),
-                           ("s1", "s2"): _tv(900, 0.0, depth)})
-        got = {frozenset((views[i].name, views[j].name)) for i, j, _ in sp.evaluated(views, pairs)}
-        assert got == {frozenset(("n", "s1")), frozenset(("n", "s2"))}
+        for stored, want in ((_tv(900, 0.0, depth), {frozenset(("n", "s1"))}),
+                             (None, {frozenset(("n", "s1")), frozenset(("n", "s2"))})):
+            pairs = sp.Pairs()
+            pairs.fits.update({("n", "s1"): _tv(500, 20.0, depth),
+                               ("n", "s2"): _tv(300, -50.0, depth), ("s1", "s2"): stored})
+            got = {frozenset((views[i].name, views[j].name))
+                   for i, j, _ in sp.evaluated(views, pairs)}
+            assert got == want
 
 
 # -- masked views and the older mapper's vote shares (map.md §5 "Ignored pixels", P24) ----------

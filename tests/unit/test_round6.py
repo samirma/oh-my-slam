@@ -413,24 +413,28 @@ def test_near_pairs() -> None:
 def test_the_rotation_check_measures_every_pair_that_can_share_a_view() -> None:
     """map.md §4 (audit r6 item 7): a pair beyond the six nearest views is measured too (no
     count cap), only measurable pairs count (100 inliers and 10 % overlap), and the pairs do
-    not depend on the request order."""
+    not depend on the request order. (The stored pairs give the new frame's pairs their chains,
+    P27, so they stay inside the pair limits, P28a.)"""
     from oh_my_slam.mapping import standpoint as sp
 
     empty = an.Features(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8))
     R = base_pose(0)[:3, :3]
+    bad = an.exp_so3(np.array([0.0, 0.0, np.radians(20.0)]))
     new = sp.View("n", K, empty, R, np.zeros(3))
-    stored = [sp.View(f"s{k}", K, empty, R, np.array([0.3 * (k + 1), 0.0, 0.0]), True)
-              for k in range(8)]
+    # the farthest committed 20° off what the images measure
+    stored = [sp.View(f"s{k}", K, empty, bad @ R if k == 7 else R,
+                      np.array([0.3 * (k + 1), 0.0, 0.0]), True) for k in range(8)]
     pairs = sp.Pairs()
     for v in stored:
-        pairs.fits[("n", v.name)] = sp.TwoView(np.eye(3), 5.0, 200, 0.5, 0.01)
-    bad = an.exp_so3(np.array([0.0, 0.0, np.radians(20.0)]))
-    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 200, 0.5, 0.01)  # the farthest, 20° off
+        pairs.fits[("n", v.name)] = sp.TwoView(np.eye(3), 5.0, 500 if v.name == "s0" else 200,
+                                               0.5, 0.01)
+        for w in stored:
+            pairs.fits[(v.name, w.name)] = sp.TwoView(np.eye(3), 5.0, 300, 0.5, 0.01)
     med, mx = sp.consistency([*stored, new], pairs)
     assert mx is not None and mx > 19.0 and sp.inconsistent(med, mx)
-    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 99, 0.5, 0.01)  # not measurable
+    pairs.fits[("n", "s7")] = sp.TwoView(np.eye(3), 5.0, 99, 0.5, 0.01)  # not measurable
     assert sp.consistency([new, *reversed(stored)], pairs)[1] == pytest.approx(0.0, abs=1e-6)
-    pairs.fits[("n", "s7")] = sp.TwoView(bad, 5.0, 500, 0.09, 0.01)  # overlaps too little
+    pairs.fits[("n", "s7")] = sp.TwoView(np.eye(3), 5.0, 500, 0.09, 0.01)  # overlaps too little
     assert sp.consistency([*stored, new], pairs)[1] == pytest.approx(0.0, abs=1e-6)
     assert not sp.TwoView(np.eye(3), 0.0, 99, 0.5, 0.01).standpoint  # grouping too
 
@@ -613,20 +617,26 @@ def test_a_pure_turn_in_45_degree_steps_passes_the_rotation_check(
     rotations were 1.5-6.2° off (the essential matrix of the best RANSAC sample, the
     rotation-only fit's absorbed translation), enough for rotation_inconsistent on real noise.
     The refined relative pose (``standpoint.refined_rotation``) agrees within 2°.
-    Each measured pair is logged (``standpoint.measured``)."""
+    Each measured pair is logged (``standpoint.measured``). Its eight adjacent pairs close one
+    cycle, so only the weakest has a chain: the pairs of the frames whose two pairs have none are
+    outside the pair limits (P28a); every measurable pair is checked here (``judged``)."""
     from oh_my_slam.mapping import standpoint as sp
     from tests.fakes.service import plain
 
     monkeypatch.setenv(prior_first.NONE_ENGINE_ENV, engine)
     got: list[sp.PairCheck] = []
-    real = sp.measured
+    real = sp.judged
 
-    def logged(views: Any, pairs: Any) -> list[sp.PairCheck]:
+    def logged(views: Any, pairs: Any) -> list[sp.Judged]:
         out = real(views, pairs)
-        got.extend(out)
+        if not any(v.stored for v in views):  # the rotation check's (the joins' have stored)
+            for g in out:
+                v, w = views[g.i], views[g.j]
+                got.append(sp.PairCheck(v.name, w.name, an.rot_deg((v.R.T @ w.R).T @ g.tv.R_ab),
+                                        g.tv.inliers, g.tv.share, g.tv.parallax))
         return out
 
-    monkeypatch.setattr(sp, "measured", logged)
+    monkeypatch.setattr(sp, "judged", logged)
     poses = [base_pose(45.0 * k, offset=0.1) for k in range(8)]
     fr, files = ma_frames(_client, poses, trust=None, depth=False, height_above_floor_m=0.5)
     for k in (3, 6):  # rejected frames never enter the check

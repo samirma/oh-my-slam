@@ -104,8 +104,8 @@ def _tv(inliers: int, deg: float, depth: bool = False) -> sp.TwoView:
 def test_the_cycle_rule_without_depth() -> None:
     """map.md §1: a pair disagreeing by more than 10 deg with the chain of strictly stronger
     measured pairs is not measurable; a pair with no stronger chain passes; pairs as strong do
-    not judge each other; a pair both of whose frames carry depth keeps its confirmation; the
-    outcome depends neither on the request order nor on any pose."""
+    not judge each other; a pair both of whose frames carry depth is judged too (P28: after its
+    depth confirmation); the outcome depends neither on the request order nor on any pose."""
     names = ["a", "b", "c", "d"]
     fits = {("a", "b"): _tv(500, 20.0), ("b", "c"): _tv(400, 20.0),
             ("a", "c"): _tv(200, -50.0),  # 90 deg off its chain a-b-c
@@ -125,7 +125,7 @@ def test_the_cycle_rule_without_depth() -> None:
     got = run([0, 1, 2, 3], fits)
     assert frozenset("ac") not in got and len(got) == 5
     assert run([3, 1, 0, 2], fits) == got
-    assert frozenset("ac") in run([0, 1, 2, 3], {**fits, ("a", "c"): _tv(200, -50.0, True)})
+    assert frozenset("ac") not in run([0, 1, 2, 3], {**fits, ("a", "c"): _tv(200, -50.0, True)})
     alone = {("a", "c"): _tv(200, -50.0)}  # no stronger chain: passes
     assert run([0, 1, 2, 3], {**{k: None for k in fits}, **alone}) == {frozenset("ac")}
 
@@ -264,7 +264,8 @@ def test_the_engines_refuse_a_pose_their_depth_does_not_confirm(
     am = new_map(tmp_path)
     pls = am.update([frame("a", base_pose(0.0), p=None), frame("b", base_pose(20.0), p=None)])
     assert [p.status for p in pls] == ["registered", "registered"]
-    monkeypatch.setattr(an, "depth_confirmed", lambda *x, **k: False)
+    no = an.DepthCounts(100, 0, 100, 0, 0)
+    monkeypatch.setattr(an, "depth_check", lambda *x, **k: (False, no, no))
     pl = am.update([frame("c", base_pose(10.0), p=None)])[0]
     assert pl.status == "rejected" and pl.reason == "no_overlap"
     monkeypatch.undo()
@@ -417,7 +418,8 @@ def test_a_later_hypothesis_can_be_the_confirmed_one(monkeypatch: pytest.MonkeyP
     thin = an.Epipolar(e.ua[:, :] * 0 + e.ua[0], e.ub * 0 + e.ub[0], e.ra, e.rb, e.E, e.thr)
     monkeypatch.setattr(sp, "epipolar_hypotheses", lambda *x, **k: iter([e, thin, e, e]))
     verdicts = iter([False, True])
-    monkeypatch.setattr(sp, "depth_confirmed", lambda *x, **k: next(verdicts))
+    ok = an.DepthCounts(100, 100, 0, 0, 0)
+    monkeypatch.setattr(sp, "depth_check", lambda *x, **k: (next(verdicts), ok, ok))
     real = sp._fit
     fits = iter([real, real, lambda *x: None, real])
     monkeypatch.setattr(sp, "_fit", lambda *x: next(fits)(*x))

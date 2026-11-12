@@ -168,11 +168,13 @@ class _MaRun:
         self.reg_s += time.perf_counter() - t
         return self._place(self.frames)
 
-    def _ambiguous(self, f: register_ma.New, key: str) -> bool:
-        """The registration gate's rule (map.md §1 "Symmetric scenes", §2 step 2) for
-        MapAnything (``register_ma.confirms``): whether the pair of new frame ``f`` and the view
-        of anchor ``key`` (a keyframe id, or ``new<index>`` for a frame of this job) is
-        ambiguous, through the job's two-view fits (``standpoint.ambiguous``)."""
+    def _ambiguous(self, f: register_ma.New, key: str, T: Any) -> bool:
+        """The registration gate's rule (map.md §1 "Symmetric scenes", "Translational twins",
+        §2 step 2) for MapAnything (``register_ma.confirms``): whether the pair of new frame
+        ``f`` and the view of anchor ``key`` (a keyframe id, or ``new<index>`` for a frame of
+        this job) keeps that anchor from placing ``f`` at the candidate's relative pose ``T``
+        (the anchor's camera in the frame's), through the job's two-view fits
+        (``standpoint.places``)."""
         def view(fr: _Frame) -> standpoint.View | None:
             got = self.feats.get(fr.work.index)
             d = _depth_image(fr)
@@ -187,7 +189,7 @@ class _MaRun:
         else:
             k = self.am.keyframe(key)
             b = None if k is None else standpoint.keyframe_view(self.am, k)
-        return a is not None and b is not None and standpoint.ambiguous(a, b, self.pairs)
+        return a is not None and b is not None and not standpoint.places(a, b, T, self.pairs)
 
     def more(self, extra: list[Keyframe]) -> list[Keyframe]:
         """The frames still unconfirmed tested again against ``extra`` (keyframes the other
@@ -517,6 +519,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             up.store.seed_ids(w.map, mapper, anchored=True)
             am = AnchoredMap(mapper)
         am.begin_job()
+        # the stored-to-stored pairs' fits are kept with the map (map.md §1, P27)
+        pairs.cache = am.pair_cache
         tm["clone"] = round(time.perf_counter() - t, 3)
         pool = ThreadPoolExecutor(INFERENCE_IN_FLIGHT)
         # a new map's origin frame (its first with a prior, else its first registered) also
@@ -671,6 +675,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             up.timings.add("fusion_per_frame", tm["fusion"] / n_kept, n_kept)
             _fusion_by_class(up, [fr for fr in geo if all(fr is not x for x in spilled)],
                              late, placements, fused, tm["fusion"] - fuse_s)
+    # api.md §4 (oms/2.4): the seconds measuring stored-to-stored pairs (part of register)
+    tm["stored_pairs"] = round(pairs.stored_s, 3)
     job.progress = 0.95
     changed()
     t = time.perf_counter()

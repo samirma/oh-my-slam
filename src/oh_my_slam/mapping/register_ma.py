@@ -222,14 +222,16 @@ def _thumb(path: Path) -> NDArray[np.float32] | None:
 
 
 def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: list[Ref],
-             ambiguous: Callable[[Ref], bool] | None = None) -> bool:
+             ambiguous: Callable[[Ref, Array], bool] | None = None) -> bool:
     """The depth confirmation of a candidate pose (map.md §2 step 2, every engine;
     ``anchored.depth_confirmed``) of a frame carrying a depth image, against the reference
     carrying one (``images``) that sees most of its points agree (at least ``MIN_AGREEING``
     seen); True for a monocular frame or with no such reference seeing it. A reference whose
-    pair with the frame is ambiguous (``ambiguous``: two distinct hypotheses both pass the
-    confirmation, map.md §1 "Symmetric scenes") places it in neither pose: the next such
-    reference must confirm it, and with none left the pose is no placement (as
+    pair with the frame is ambiguous for the pose (``ambiguous(reference, T_frame_reference)``:
+    two distinct hypotheses both pass the confirmation, map.md §1 "Symmetric scenes", or the
+    pair's fit is a translational twin of the pose that the parallax picks or cannot separate
+    from it, "Translational twins") places it in neither pose: the next such reference must
+    confirm it, and with none left the pose is no placement (as
     ``AnchoredMap.depth_confirms``). A pose a reference rejects is no placement."""
     if f.depth is None:
         return True
@@ -243,7 +245,7 @@ def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: li
         if not depth_confirmed(Ref(T, depth, Kd), r, DEPTH_TOL):
             return False
         # (only a pose the depth confirms asks whether another one would pass too)
-        if ambiguous is None or not ambiguous(r):
+        if ambiguous is None or not ambiguous(r, np.linalg.inv(T) @ r.T):
             return True
     return not seen
 
@@ -278,16 +280,16 @@ def _stored_depth(s: Stored) -> Callable[[], tuple[NDArray[np.float32], Array] |
     return load
 
 
-Ambiguous = Callable[[New, str], bool]
+Ambiguous = Callable[[New, str, Array], bool]
 
 
 class Registration:
     """The camera-only frames ``new`` against the map's keyframes ``stored`` (at least one).
-    ``ambiguous(frame, key)``: whether the pair of a new frame and the view of a reference
-    (``_Posed.key``: a stored keyframe's ``Stored.name``, ``new<index>`` for a frame of this
-    update) is
-    ambiguous (map.md §1 "Symmetric scenes", the registration gate's rule: ``confirms``); None:
-    no pair is."""
+    ``ambiguous(frame, key, T_frame_reference)``: whether the pair of a new frame and the view
+    of a reference (``_Posed.key``: a stored keyframe's ``Stored.name``, ``new<index>`` for a
+    frame of this update) keeps that reference from placing the frame at the candidate pose
+    (map.md §1 "Symmetric scenes", "Translational twins", the registration gate's rule:
+    ``confirms``); None: no pair does."""
 
     def __init__(self, multiview: Multiview, new: list[New], stored: list[Stored],
                  ambiguous: Ambiguous | None = None) -> None:
@@ -421,11 +423,11 @@ class Registration:
                                              scene_m=self.scenes.get(idx))
             self.waiting[idx] = (f, T, sig, depth, Kd, keys)
 
-    def _gate(self, f: New) -> Callable[[Ref], bool] | None:
+    def _gate(self, f: New) -> Callable[[Ref, Array], bool] | None:
         """The registration gate's ambiguous pairs of frame ``f`` (``confirms``), by the
-        reference's key."""
+        reference's key and the candidate's relative pose."""
         amb = self.ambiguous
-        return None if amb is None else (lambda r: amb(f, r.key))
+        return None if amb is None else (lambda r, T: amb(f, r.key, T))
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
                   Kd: Array, inliers: int, anchors: tuple[str, ...] = ()) -> None:

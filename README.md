@@ -78,7 +78,10 @@ they need. New maps take the *prior-first registration* (below).
   have 3 times the upload free. Larger: `payload_too_large`.
 * **Map names**: 1-64 letters, digits, `.`, `_`, `-`, starting with a letter or digit.
 * **Server-Timing** on every response: the request's stages (`upload`, `validate`) and `total`.
-  A job's stages are in its body, `timings_s` (`checks`, `register`, `anchor`, `commit`, `total`).
+  A job's stages are in its body, `timings_s` (`checks`, `register`, `anchor`, `commit`, `total`,
+  and on every job `stored_pairs`, oms/2.4: the seconds of `register` spent measuring
+  stored-to-stored pairs for the cycle rule, 0 when none was measured or all were cached;
+  *Cycle rule*).
 * **Lanes.** No lanes until O3: one job worker, reported as the single lane `lanes.worker` (busy
   while a job runs, the queue, the age of the oldest job; inference.md). The inference server's
   device queue is a priority queue: requests sent with `x-oms-priority: interactive` (dry runs:
@@ -742,7 +745,9 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   and the confirmed keyframes they neighbour, the angle between committed and image-measured
   relative rotations; a median above 3° or a pair above 10° rejects the job
   (`rotation_inconsistent`); a pair is measurable with ≥ 100 epipolar inliers
-  (`CHECK_MIN_INLIERS`: a weakly overlapping pair's two-view rotation is 4–8° off on 50 inliers);
+  (`CHECK_MIN_INLIERS`: a weakly overlapping pair's two-view rotation is 4–8° off on 50 inliers),
+  depth-confirmed where both frames carry depth and kept by the cycle rule (*Cycle rule*), and
+  the pairs of a frame whose two or more pairs have no chain are outside the limits (P28a);
   no measurable pair passes (`standpoint.rotation_check`). The
   mapper's engine is checked the same way on its committed poses (*Quality and gate*); it is
   exempt from standpoint grouping only (map.md §1 "Every engine").
@@ -758,7 +763,26 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   before, given a metric translation from its inliers' depths (median of P_a − R P_b), then
   refined by PnP (RANSAC at the registration threshold, seeded there) of a's depth-lifted inliers
   onto b's pixels (`standpoint.depth_pose`), and every one of them is tested (oms/2.4 P24: not
-  only up to the first confirmed). The first that the pair's depth images confirm is the pair's
+  only up to the first confirmed). The PnP stays on its hypothesis: on lattice-ambiguous lifted
+  points its RANSAC can lock onto another consensus (the empty periodic room's 53° pair f1-f3:
+  Sampson 52.0°, PnP RANSAC 133.7° and 4.7 m, rejected, so a true pair failed its confirmation).
+  When the RANSAC's rotation lies more than `PNP_MAX_STEP_DEG` = 5° from the hypothesis's
+  Sampson rotation, the seed (that rotation, the median translation) is refined locally instead
+  (`cv2.solvePnPRefineLM` on the lifted inliers within the registration threshold of the seed),
+  and when that still moves more than 5° the seed itself is judged; a refinement never replaces
+  the hypothesis with another (spec-neutral: map.md fixes neither the PnP nor its RANSAC).
+  *Logging* (logger `oh_my_slam.mapping.standpoint`, INFO, the service log): one line per
+  depth-tested hypothesis (`two-view a-b hyp k/K: inliers, overlap, sampson, pnp (its inliers of
+  the lifted, and `local`/`seed from` the RANSAC's angle when it was kept on the hypothesis), t
+  and |t|, a>b and b>a agree / through / occluded / outside of points = ratio: confirmed |
+  rejected agreement | rejected agreeing | rejected no pnp | skipped overlap`), one verdict per
+  pair (`chose hyp k`, `none confirmed`, `ambiguous hyp k1 / hyp k2`, translational twins), one
+  rotation check line per pair (measured and committed angles, inliers, overlap, parallax, the
+  hypothesis, |t|, the agreement, the angle to its chain, and whether it is outside the pair
+  limits), the cycle rule's removals, and on the geometric engine one line per registration gate
+  test (`image pose against k (n inliers on it) |dt|: agreement a/t/o = r, a/t/o = r:
+  confirmed | fails`, |dt| the distance to that keyframe: a turn in place with |dt| about 1 m is
+  a translational twin) and per translation test (`translation test against k: parallax`). The first that the pair's depth images confirm is the pair's
   fit: its inliers and overlap make the pair measurable and its PnP rotation is the
   image-measured one (0.02-0.16° off on the tiled test room where the Sampson rotation was
   0.2-3.9° off). With no confirmed hypothesis the pair carries no measurement (`TwoView.confirmed`
@@ -821,6 +845,47 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   updates without priors run the rotation check, and the fits are shared with the standpoints
   (`Pairs`); a job with priors fits no pair (0 two-view fits on the 59-frame job below), and its
   gate's PnP hypotheses cost nothing measurable there (register 148.7 s against 148.6 s).
+  Round 15 (P27, P28, the PnP kept on its hypothesis, the logging; 2026-11-12, same machine,
+  heavy lock, the same script on both trees): 138.1 ms a pair with depth on the furnished tiled
+  room (136.7 ms before), 122.4 ms on the empty periodic room's 18 pairs (116.3 ms before: the
+  local refinements, the twins' predicted parallax, the log lines); the 59-frame job with
+  metric priors fits no pair and measures no stored pair (`stored_pairs` 0): 101.7 s
+  (register 85.5 s; 101.9 s and 85.7 s on 756e141 in the same run).
+* **Translational twins** (map.md §1, §2 step 2, P28). On a plain wall and floor a pose with the
+  true rotation and a shifted position agrees with both depth images as well as the true one
+  (the empty periodic room: true rotation, |t| 1-3 m, 0 contradicting points). Two
+  depth-confirmed hypotheses of a pair (or candidate poses of a frame against one reference)
+  whose rotations differ by less than `SYMMETRIC_MIN_DEG` = 10° but whose positions lie at least
+  `TWIN_MIN_M` = 0.3 m apart (`anchored`) are twins: sequential RANSAC's leftovers of one
+  geometry lie within centimetres of it (a turn in place with the camera 4 cm off its axis moves
+  it 2 cm a step), the twins of the empty test room 1-3 m away. *The parallax test* (`anchored.twin_pick`): each
+  twin's *predicted* two-view parallax (`anchored.predicted_parallax`: the pair's matches — a's
+  pixels of its largest consensus — lifted by a's depth, moved by the twin's metric relative
+  pose, and run through the measured parallax's formula, the rotation-only residual of the best
+  rotation over max(sin, 0.3)) is compared with the pair's *measured* two-view parallax (that
+  consensus's, map.md §1). *Noise model*: a prediction matches when it lies within
+  `PARALLAX_K` × (`PARALLAX_NOISE_PX` + `PARALLAX_NOISE_REL` × measured) = 2 × (1 px + 0.25 ×
+  measured) of it: the 1 px floor is the pixel noise of a turn in place (the empty room's
+  adjacent turns measure 0.9-1.4 px, their depth poses predict 0.3-0.9 px), the 25 % the
+  rotation-only fit's absorption of a translation, which differs between the measured rays
+  (RANSAC) and the predicted ones (least squares). A sideways shift in front of a plane is
+  mostly absorbed (a 1 m twin of the turn in place predicts 34 px there), still far outside
+  the noise of a 1 px measurement. The first twin whose
+  prediction matches is taken when those that match share one position; otherwise (none or
+  twins match) the pair is ambiguous: no measurable pair, and no placement by that reference
+  alone. In registration a prior sent for the frame decides first (`anchored.prior_pick`): the
+  twin within `K_SIGMA` = 3 × its position sigma of its centre, when those within share one
+  position. *Where*: `standpoint.two_view` (the pair's fit: the twin picked, else ambiguous);
+  the geometric engine's gate (`AnchoredMap._ambiguous` also returns the confirmed sequential
+  PnP poses within 10° but ≥ 0.3 m away, `AnchoredMap._twin` picks one, measured by the
+  frame's two-view fit with that reference; a twin picked over the pose replaces it after a
+  refinement on all the frame's correspondences that must stay within 0.3 m, 10°, 15 inliers
+  and the depth confirmation, else no placement); MapAnything's gate (`standpoint.places`
+  through `Registration.ambiguous`: its candidate pose against the pair's confirmed fit, a twin
+  of it the parallax does not pick, or cannot separate, keeps that reference from placing it).
+  The parallax cannot separate a twin whose matches dominate the pair (its own consensus is
+  the measured one): with no other evidence its rotation is still right (the rotation check
+  passes) and only its position is off, as before.
 * **A second registration reuses the first** (map.md §2 step 6, P16). A pose duplicate that
   served the job makes it register once more from its start; that run used to measure
   everything again. It now keeps the job's caches (`AnchoredMap.begin_job` while `reran`): the
@@ -836,22 +901,49 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   heavy lock): 164.5 s a job before (register 148.6 s: 2161 epipolar fits, most of them
   `_against_priors`' overlap of every pair of the job's frames, half of them the second run's),
   101.3 s after (register 85.5 s), statuses identical.
-* **Cycle rule** (map.md §1, frames without depth). When either frame carries no depth image,
-  the pair's own data cannot reject a lattice geometry; a pair whose two-view rotation disagrees
-  by more than `CYCLE_MAX_DEG` = 10° with the chain of stronger measured pairs is not measurable
-  (`standpoint.consistent`). Over the pairs evaluated together (each new view with every view it
-  can share a view with, `standpoint.evaluated`, which the standpoints and the rotation check
-  share), strongest first: a pair is judged against the pairs already kept that have strictly
-  more inliers, composing their two-view rotations along the path of their maximum spanning
-  forest (ties to the canonical names), so it depends on the pairs' inliers and names, never on
-  the request order or any pose (no joint solve, no committed seed). A pair with no stronger
-  chain passes, as does a lattice geometry consistent around a whole cycle: the accepted
-  degenerate case. On the tiled test room without depth it leaves out every lattice pair (85-93°
-  off their chains). Pairs both of whose frames carry depth images are confirmed by them and
-  never judged by it. Stored-to-stored pairs are never re-measured (map.md §1, P24), so a pair
-  joining stored frames to a standpoint may have no chain: it is judged by the depth test only,
-  or kept as measured without depth; `join_standpoint` sees one new frame against stored
-  keyframes only, so it has no chain there.
+* **Cycle rule** (map.md §1 "Cycle consistency", P20, P28: every pair). A pair whose two-view
+  rotation disagrees by more than `CYCLE_MAX_DEG` = 10° with the chain of stronger measured pairs
+  is not measurable (`standpoint.consistent`). Where both frames carry depth images it applies
+  after the depth confirmation: an empty rectilinear room seen by a narrow camera (52°, the
+  client's) makes a pose turned by 90° and shifted agree with both depth images exactly
+  (`tests/synth/room.py` `Room(walls="periodic")`: 2189/0/0 and 2600/0/0 points agree / see
+  through / occluded on the 53° pair), while the true pose of a pair turned by more than the field
+  of view shares no view. Over the pairs evaluated together (each new view with every view it
+  can share a view with, `standpoint.judged`, which the standpoints, the joins and the rotation
+  check share), strongest first: a pair is judged against the pairs already kept that have
+  strictly more inliers, composing their two-view rotations along the path of their maximum
+  spanning forest (ties to the canonical names), so it depends on the pairs' inliers and names,
+  never on the request order or any pose (no joint solve, no committed seed). A pair with no
+  stronger chain passes, as does a lattice geometry consistent around a whole cycle: the
+  accepted degenerate case. On the tiled test room without depth it leaves out every lattice pair
+  (85-93° off their chains); on the empty room with depth, the 53° lattice pair (90° off its
+  chain of adjacent pairs). Each kept pair records the angle to its chain (`Judged.chain_deg`,
+  None without a chain), logged on its rotation check line.
+  * *Stored-to-stored pairs* (P27). When a pair evaluated involves stored keyframes, the pairs
+    among the stored keyframes that are ends of such pairs and can share a view (`close`) join
+    the rule's candidates (`standpoint.stored_pairs`), so a chain may pass through them; a
+    standpoint join (`join_standpoint`) goes through the same rule. Each is measured from the two
+    keyframes' own features and depth grids (`two_view`, the depth confirmation where both carry
+    depth, never their poses) and judged by the rule like any pair; it is not itself a pair of
+    the rotation check. A chain through a stored keyframe that is not an end of an evaluated
+    pair is not looked for (it would need every stored pair near the frames: 435 pairs for 30
+    keyframes): such a pair is the degenerate case. The fits are cached with the map
+    (`AnchoredMap.pair_cache`, `stored_pairs.json` in the mapper's folder, saved with each
+    version: so per version, reused across jobs), keyed by keyframe id and a digest of each
+    view's keypoints, descriptors, intrinsics and depth presence (`View.digest`), and pruned to
+    the keyframes the map still holds; a dry run reads it and writes nothing. The seconds of the
+    fits not found there are the job's `timings_s.stored_pairs`. The older mapper's stored
+    frames have no keyframe store: its stored pairs are measured on each job (not cached).
+  * *Outside the pair limits* (P28a, `standpoint.outside`). A new frame with two or more
+    measurable pairs (after the rule), none of which has a chain, has them outside the pair
+    limits: they are logged (`outside the pair limits`) but neither in `rotation_pairs` nor in
+    the limits, depth-confirmed or not. A frame's only measurable pair is judged; a frame with
+    some chained pairs keeps them all. A pair shared by such a frame and a frame that keeps it
+    (a frame whose only pair it is, or one with chained pairs) is outside: the frame's rule is
+    the one that acts ("such a frame never rejects the job on its own"), the others only keep
+    what no frame puts outside. Stored keyframes are not classified (they are not the update's
+    frames). So a turn of three frames or more measured only by adjacent pairs (no pair closes
+    a cycle) has no pair in the limits, while a two-frame job's single pair is judged.
 * **Camera-height scale in every direction** (map.md §1). `scale_sigma_rel` is one sigma that
   must hold for a horizontal distance in any direction (3 σ). The camera heights measure the
   monocular depth's scale along each frame's view, so each height's frame records its viewing
@@ -1069,19 +1161,26 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   text embeddings cached per prompt set), so it did not change. `GET /api/maps/{name}` reports
   the version's vocabulary in `labels` (without the defaults), a dry run in `labels` the merged
   one it would use (`segmentation.detect.vocabulary`: the default labels, then the others).
-* **Label scores and the label choice** (oms/2.4, map.md §5). On a version whose stored
-  vocabulary holds client labels, the objects read (`service.objects.with_label_scores`, both
-  engines, on the read, so an answer kept before oms/2.4 gets it too) applies the label choice
-  to each record's `detection_votes` shares: a client label is one equal
-  (`normalize_label`) to a label of that stored vocabulary, also when it equals a default
-  (`egg`, `bowl`); the client label of the highest share within `CLIENT_LABEL_MARGIN` = 0.15 of
-  the best share (the best itself when it is one) is the label (`client_label`). 0.15 is about
-  one view's vote of an object seen from seven views (a robot's pass): a client label wins when
-  it trails by about one view, never against a default two views ahead. With no such client
-  label the record keeps the engine's own label (see *Known limitations*). `detected_as`,
-  `score` and `detection_votes` are unchanged. Every record then carries `label_scores`: its
-  label first, the other labels with a share by share (ties by label, as the votes list them),
-  at most 3, each its `detection_votes` share. A map without client labels is unchanged.
+* **Label scores and the label choice** (oms/2.4, map.md §5, P25, P25a). The objects read
+  (`service.objects.with_label_scores`, both engines, on the read, so an answer kept before
+  oms/2.4 gets it too) takes each record's label by the label choice (`chosen_label`) from its
+  `detection_votes` shares. `E` is the engine's own choice (its evidence rule: the prior-first
+  engine takes the label of most *evidence*, the detection scores of the sightings detected as it
+  plus the scores the detector gave the others under it, times `label_fit`, a specific label
+  beating a generic one from `SPECIFIC_SHARE` of its evidence, `anchored_objects.MapObject.label`;
+  the older mapper the highest summed detection score, `objects.MapObject.vote`), `L` the
+  best-share label (the first of the highest share, as the votes list them). A label with no
+  share (share 0 or no entry) is never chosen: when `E` has none, `E` becomes `L`, on every
+  version. On a version whose stored vocabulary holds client labels (a client label is one
+  equal, `normalize_label`, to a label of that stored vocabulary, also when it equals a default:
+  `egg`, `bowl`): if `E` is a client label it is chosen; else the client label of the highest
+  share within `CLIENT_LABEL_MARGIN` = 0.15 of `L`'s share (`L` itself when it is one); else
+  `E`. 0.15 is about one view's vote of an object seen from seven views (a robot's pass): a
+  client label wins when it trails by about one view, never against a default two views ahead.
+  A record without votes keeps its label. `detected_as`, `score` and `detection_votes` are
+  unchanged. On such a version every record then carries `label_scores`: its label first (so its
+  score is above 0 whenever it has votes), the other labels with a share by share (ties by
+  label, as the votes list them), at most 3, each its `detection_votes` share.
 
 `GET /api/maps/{name}/objects` [`Objects`] on an anchored map (`mapping.anchored_objects`,
 called by `service.prior_first` after the engine placed and fused the update's keyframes):
@@ -2708,23 +2807,14 @@ above it.
   rotation check measures the new frames' pairs with their depth images
   (`update._rotations_bad`). The prior-first engine and MapAnything apply both (*Depth
   confirmation*).
-* **The label choice's baseline is not the best vote share** (map.md §5 "Label choice", P25).
-  The rule is written against a choice "by `detection_votes` share, the highest winning", but
-  the prior-first engine takes the label of most *evidence* (the detection scores of the
-  sightings detected as it plus the scores the detector gave the others under it, times
-  `label_fit`, a specific label beating a generic one from `SPECIFIC_SHARE` of its evidence:
-  `anchored_objects.MapObject.label`), whose `detection_votes` shares count frames; the older
-  mapper takes the highest summed detection score (`objects.MapObject.vote`, its shares being
-  those confidence-weighted sums). So the read applies the margin rule only where it picks a
-  client label, and otherwise keeps the engine's label rather than the best-share one (the
-  spec's "else L"): a map without client labels, and a record no client label comes near, keep
-  today's choice. Pending the spec's answer.
 * **A lattice geometry in a symmetric scene.** The depth confirmation cannot reject a false
   geometry the scene's own shape repeats (an empty, nearly square room tiled throughout: 0.97 on
-  the test room); the symmetric-scene rule (`SYMMETRIC_MIN_DEG`) catches it only when RANSAC
-  also offers the true hypothesis among the pair's sequential ones. The cycle rule cannot
-  reject one consistent around a whole cycle or a pair with no stronger chain (map.md §1, the
-  accepted degenerate case).
+  the test room; an empty rectilinear room seen by a narrow camera: 1.00); the symmetric-scene
+  rule (`SYMMETRIC_MIN_DEG`) catches it only when RANSAC also offers the true hypothesis among
+  the pair's sequential ones, and the cycle rule (every pair, P28) when a chain of stronger
+  pairs exists. It cannot reject one consistent around a whole cycle or a pair with no stronger
+  chain (map.md §1, the accepted degenerate case); a frame whose two or more measurable pairs all
+  lack a chain is outside the pair limits (P28a), but a frame's only pair is judged.
 
 * **Labels come from an open-vocabulary detector (YOLOE with text prompts) and inherit its
   confusions.** On the rendered `ainex-captures` kitchen, prompting each label alone on the
