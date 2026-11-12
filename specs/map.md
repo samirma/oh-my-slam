@@ -64,9 +64,17 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     * **Symmetric scenes.** When the scene itself is symmetric, depth cannot reject a lattice
       pose: both poses agree with the depths. When two distinct pose hypotheses of a pair,
       with rotations at least 10° apart (a constant in `README.md`), both pass the depth
-      confirmation, the pair is ambiguous and counts as no measurable pair. Registration must
-      not choose between them on that pair alone. This applies to measurement and, the same
-      way, to the registration gate (§2, Match graph, step 2).
+      confirmation, the pair takes the one whose predicted two-view parallax (above) matches
+      the measured parallax of the pair's matches, over their largest consensus, as for
+      translational twins (below), but only when that measured parallax is plausible for the
+      pair: not above the largest two-view parallax that the hypotheses predict, each from its
+      own baseline and the depths, times a margin (the parallax plausibility margin, a constant
+      in `README.md`). A measurement far above what the baselines and depths allow is a false
+      consensus, not evidence. When the parallax cannot separate them, within its noise (a
+      model in `README.md`, as below), or is implausible, the pair is ambiguous and counts as no
+      measurable pair, and registration must not choose between them on that pair alone. This
+      applies to measurement and, the same way, to the registration gate (§2, Match graph,
+      step 2).
     * **Translational twins.** On a plain wall and floor, a pose with the true rotation and a
       shifted position can agree with both depth images as well as the true one. When two
       depth-confirmed hypotheses share the rotation (differ by less than 10°) but their
@@ -97,7 +105,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       job on its own. Otherwise the pair stays measurable and is judged against the committed
       rotations, so a sequence measured by its adjacent pairs only stays judged. Depth
       confirmation does not change this. A false lattice pair kept this way can cause a
-      rejection, never a wrong commit.
+      rejection. A whole sequence registered through a lattice pose, which every measured pair
+      agrees with, is left to the depth-consistency limit (§4).
       * **Stored-to-stored pairs.** When the rule needs a chain for a pair that involves a
         stored keyframe, including a standpoint join of a new frame to stored keyframes, the job
         measures the stored-to-stored pairs that chain needs. Each is measured from the two
@@ -314,10 +323,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        reference that carries them, is placed only if it passes the depth confirmation of §1
        (Measurable pair); a candidate failing it is not a placement. When two distinct candidate
        poses of a frame against one reference both pass it (§1, Symmetric scenes), the pair is
-       ambiguous and that reference alone places the frame in neither. Two that share the
-       rotation but lie far apart (§1, Translational twins) are separated by their
-       parallax first, and the pair is ambiguous only when the parallax cannot separate them;
-       a prior sent for the frame still decides first, within its sigma. A component that reaches
+       ambiguous and that reference alone places the frame in neither, unless the parallax
+       separates them. Two that share the rotation but lie far apart (§1, Translational
+       twins), and two whose rotations are at least 10° apart (§1, Symmetric scenes), are
+       separated by their parallax first: the one whose predicted parallax matches the measured
+       parallax of the pair's matches is placed, the second case only when that measured
+       parallax is plausible for the pair (§1, Symmetric scenes). The pair is ambiguous only
+       when the parallax cannot separate them or, for rotations at least 10° apart, is
+       implausible; a prior sent for the frame still decides first, within 3 × its position
+       sigma. A component that reaches
        no confirmed keyframe is seeded at one frame's prior. Its frames' reported sigmas cover
        the seed prior's sigma combined with each frame's fusion, and are never tighter than the
        seed prior's. This floor applies to every frame whose placement depends on the component,
@@ -518,6 +532,33 @@ becomes a job with a `job_id`. A job goes through these states:
       solve: the measurement is never seeded from, nor refined toward, the committed or the
       joint solve. It uses the pair's images, its depth images when both frames carry them,
       and the cycle-consistency rule (§1, Measurable pair), nothing else.
+  * **Depth consistency** (every update whose frames carry sensor depth images, with or without
+    priors: wide drifting priors do not exclude a 90° lattice pose): a hard limit rejects the
+    update, `failed_checks` holding `depth_inconsistent`, when two committed views contradict
+    each other's depth images. A dry run predicts it, as it does the other limits.
+    * The pairs: the update's registered (image-confirmed) frames with each other and with the
+      stored image-confirmed keyframes, where both carry sensor depth images and the two can
+      share a view under their committed poses (the test is in `README.md`). A frame kept at
+      its prior without image confirmation is not paired.
+    * Each view's depth points are mapped into the other under the pair's **committed**
+      relative pose (§1, Depth agreement). A point is a contradiction only when the other view
+      would see through it by more than the depth tolerance of the depth confirmation (a
+      constant in `README.md`) plus three times the two frames' combined committed position
+      sigma.
+    * A pair fails under the depth confirmation's minimum count and agreement threshold (§1,
+      Measurable pair), in either direction: at least that minimum of points agree or
+      contradict, and fewer than that threshold of them agree.
+    * It uses the committed poses and the depth images only, never the pairs' image
+      measurements, so it catches a commit that every measured pair agrees with: a sequence
+      registered through a lattice pose (an empty rectilinear room with a repeating wall
+      texture, a narrow camera) agrees pair by pair, but its views contradict the frames they
+      were never measured against.
+    * Sensor depth only: a pair with a monocular frame is not tested, as its depth scale is
+      estimated, not measured.
+    * A scene that is symmetric as a whole, where the committed depths agree everywhere,
+      remains the accepted degenerate case.
+    * Every engine but the older mapper (§1, Every engine), whose registrations are not
+      depth-gated.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
     registered frames only, over measurable pairs (§1: at least 100 epipolar inliers,
     depth-confirmed where both frames carry depth and consistent with the chain of stronger

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.5. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.6. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -866,10 +866,11 @@
               "max_rejected_share",
               "hard_limit",
               "prior_frames_rejected",
-              "rotation_inconsistent"
+              "rotation_inconsistent",
+              "depth_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. depth_inconsistent (oms/2.6; every update whose frames carry sensor depth images, with or without priors; every engine but the older mapper; jobs and dry runs): two committed views contradict each other's depth images, mapped under their committed relative pose. The pairs are the update's registered frames with each other and with the stored image-confirmed keyframes, where both carry sensor depth images and can share a view; a frame kept at its prior without image confirmation is not paired, and a monocular frame is not tested. A point is a contradiction only when the other view would see through it by more than the depth tolerance plus 3 x the two frames' combined committed position sigma; a pair fails when, in either direction, at least the depth confirmation's minimum count of points agree or contradict and fewer than its agreement threshold of them agree. It uses the committed poses and depth images only. hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
