@@ -73,7 +73,10 @@ this module, keyframe by keyframe in request order, after the keyframes are plac
   ``extent_seen`` per box axis (``extent_from``): ``full`` when a sighting whose mask no image
   border cuts sees the axis across (``ACROSS_COS``), or sightings from both ends of it see it;
   ``z`` when a sighting whose mask neither the top nor the bottom border cuts sees it from the
-  side.
+  side, or when an uncut sighting sees its top from above (``TOP_VIEW_COS``) and a support
+  plane is measured under its footprint (``supported_by``: it bounds the bottom). A view where
+  the object lies mostly on ignored pixels (``masked_by``) is no view of it: no vote, no vote
+  denominator, no extent evidence.
 
 State lives in the mapper folder of each version: ``objects.json`` (objects without points,
 surface ids, ``next_id``) and ``objects.npz`` (each object's points and their sighting)."""
@@ -100,7 +103,7 @@ from oh_my_slam.core.constants import (
     floor_band_m,
 )
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
-from oh_my_slam.core.images import on_grid
+from oh_my_slam.core.images import masked_view, on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics, Pose
 from oh_my_slam.segmentation.api import (
@@ -163,6 +166,9 @@ SENSOR_DEPTH_REL = 0.01  # a depth image's relative noise
 MONO_DEPTH_REL = 0.05  # monocular depth's, once brought onto the map
 MIN_SIGMA_M = 0.005
 ACROSS_COS = 0.8
+# a view sees an object's top from above when its ray's z is below minus this (the same |ray z|
+# threshold as a side view's, ``ACROSS_COS``; map.md §5 ``extent_seen``, P21)
+TOP_VIEW_COS = ACROSS_COS
 ENDS_COS = 0.3
 SURFACE_CELL_M = 0.05
 SURFACE_BIN_M = 0.01
@@ -379,6 +385,9 @@ class MapObject:
     # the scores the detector gave its sightings under the labels they were not detected as
     # (``Detection.alternatives``), summed: label -> score
     others: dict[str, float] = field(default_factory=dict)
+    # the keyframes whose view is no view of it (``masked_by``: it lies mostly on their ignored
+    # pixels), set on its box as fitted (``ObjectMap.finish``); not stored
+    masked: set[str] = field(default_factory=set)
 
     @property
     def label(self) -> str:
@@ -1116,8 +1125,12 @@ class ObjectMap:
         live = self.live()
         for o in live:
             self._fit(o, self.floor_z if floor_z is None else floor_z)
+        for o in self.objects:  # views it lies mostly masked in: no view of it (map.md §5)
+            o.masked = masked_by(o, self.cameras)
         for o in live:
             self._relate(o, live, version)
+        for o in live:  # on its box as it rests on its support
+            o.masked = masked_by(o, self.cameras)
 
     def _relate(self, o: MapObject, live: list[MapObject], version: int) -> None:
         assert o.box is not None
@@ -1138,7 +1151,9 @@ class ObjectMap:
         else:
             # an object whose height no sighting saw (seen from above) may stand on a support
             # as far below its visible top part as SUPPORT_REACH_M
-            reach = SUPPORT_TOL_M if extent_seen(o)["z"] == "full" else SUPPORT_REACH_M
+            # (its height seen from the side: a support it rests on is not evidence here)
+            reach = SUPPORT_TOL_M if extent_seen(o, support=False)["z"] == "full" \
+                else SUPPORT_REACH_M
             best_s = None
             for s in sorted(self.surfaces, key=lambda s: -s.area_m2):
                 gap = box.bottom - s.height_m
@@ -1278,12 +1293,15 @@ def detection_votes(o: MapObject,
     over the image-confirmed keyframes whose view frustum holds its box centre, detected or not
     (``cameras``; its sightings come from confirmed keyframes only, and every keyframe that
     detected it counts as seeing it), highest share first."""
+    masked = masked_by(o, cameras)  # no view of it: neither a vote nor its denominator
     frames: dict[str, set[str]] = {}
     for s in o.sightings:
-        frames.setdefault(s.label, set()).add(s.kid)
+        if s.kid not in masked:
+            frames.setdefault(s.label, set()).add(s.kid)
     seen = set().union(*frames.values()) if frames else set()
     if o.box is not None:
-        seen |= {kid for kid, T, K, ign in cameras if in_view(o.box.centre, T, K, ign)}
+        seen |= {kid for kid, T, K, ign in cameras
+                 if kid not in masked and in_view(o.box.centre, T, K, ign)}
     n = max(len(seen), 1)
     out = [{"label": k, "share": round(min(len(v) / n, 1.0), 4)} for k, v in frames.items()]
     return sorted(out, key=lambda e: (-e["share"], e["label"]))
@@ -1338,23 +1356,45 @@ def sigma_centre(o: MapObject) -> float:
     return max(MIN_SIGMA_M, math.hypot(spread, noise))
 
 
-def extent_seen(o: MapObject) -> dict[str, str]:
-    """``full`` or ``partial`` per box axis (see the module docstring), from its sightings
-    (``extent_from``)."""
+def masked_by(o: MapObject,
+              cameras: list[tuple[str, Array, Intrinsics, NDArray[np.bool_] | None]]
+              ) -> set[str]:
+    """The keyframes of ``cameras`` whose view is no view of the object (map.md §5 "Ignored
+    pixels", ``core.images.masked_view``): its box projected there lies mostly on their ignored
+    pixels. Empty without a box."""
+    if o.box is None:
+        return set()
+    h = o.box.size / 2
+    local = np.array([[x, y, z] for x in (-h[0], h[0]) for y in (-h[1], h[1])
+                      for z in (-h[2], h[2])])
+    corners = local @ o.box.R.T + o.box.centre
+    return {kid for kid, T, K, ign in cameras
+            if masked_view((corners - T[:3, 3]) @ T[:3, :3], K, ign)}
+
+
+def extent_seen(o: MapObject, support: bool = True) -> dict[str, str]:
+    """``full`` or ``partial`` per box axis (see the module docstring), from its sightings in
+    the views that are views of it (not ``MapObject.masked``; ``extent_from``), with the support
+    it rests on (``supported_by``) bounding its bottom unless ``support`` is false."""
     if o.box is None:
         return {"x": "partial", "y": "partial", "z": "partial"}
-    return extent_from(o.box.R, [(s.ray, s.cut) for s in o.sightings])
+    return extent_from(o.box.R, [(s.ray, s.cut) for s in o.sightings if s.kid not in o.masked],
+                       support and o.supported_by is not None)
 
 
-def extent_from(R: Array, views: list[tuple[Any, Any]]) -> dict[str, str]:
+def extent_from(R: Array, views: list[tuple[Any, Any]], supported: bool = False
+                ) -> dict[str, str]:
     """``extent_seen`` of a box (axes ``R``, columns x, y, z) from the views that bound it
     (map.md §5): each its unit ray from the camera to the box (map frame) and which image borders
     (left, right, top, bottom) cut its mask. An axis x or y is ``full`` when an uncut view sees it
     across (|cos| to the ray at most ``ACROSS_COS``) or views from both of its ends see it
     (``ENDS_COS``); ``z`` when a view whose mask neither the top nor the bottom border cuts sees
     it from the side (|ray z| at most ``ACROSS_COS``; a view the left or right border cuts still
-    sees the top and the bottom; a view from above sees the top alone). Every engine's views:
-    the prior-first engine's sightings, the older mapper's recorded ones (``service.objects``)."""
+    sees the top and the bottom; a view from above sees the top alone), or when ``supported`` (a
+    support plane measured under its footprint, from any views, bounds the bottom) and a view
+    that no border cuts sees its top from above (ray z below -``TOP_VIEW_COS``, map.md §5, P21).
+    Every engine's views: the prior-first engine's sightings, the older mapper's recorded ones
+    (``service.objects``)."""
     out = {"x": "partial", "y": "partial", "z": "partial"}
     whole = [np.asarray(r, np.float64) for r, cut in views if not any(cut)]
     rays = [np.asarray(r, np.float64) for r, _ in views]
@@ -1367,6 +1407,8 @@ def extent_from(R: Array, views: list[tuple[Any, Any]]) -> dict[str, str]:
             out[name] = "full"
     if any(not cut[2] and not cut[3] and abs(float(np.asarray(r)[2])) <= ACROSS_COS
            for r, cut in views):
+        out["z"] = "full"
+    if supported and any(float(np.asarray(r)[2]) < -TOP_VIEW_COS for r in whole):
         out["z"] = "full"
     return out
 

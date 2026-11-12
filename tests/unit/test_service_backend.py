@@ -209,7 +209,7 @@ def test_read_gives_keyframe_images_the_cloud_and_objects(tmp_path: Path) -> Non
                                     "R": np.eye(3).tolist(), "size": [1, 0.1, 2],
                                     "score": None, "label_votes": {}, "observations": None,
                                     "created_update": None, "last_seen_update": None,
-                                    "sightings": []}]
+                                    "sightings": [], "masked_frames": [], "support_z": None}]
 
 
 # -- the depth model -----------------------------------------------------------------------------

@@ -485,15 +485,19 @@ class Derived:
         for o in (internal.objects() if internal is not None else []):
             R = np.asarray(o.get("R") or np.eye(3), np.float64)
             size = np.asarray(o.get("size") or [0.0, 0.0, 0.0], np.float64) * sim.s
+            # its views but those that are no view of it (map.md §5 "Ignored pixels")
+            masked = {int(f) for f in o.get("masked_frames") or []}
             views = [{"frame": frame_name(int(v[0])),
                       "centroid": sim.point(np.asarray(v[3:6], np.float64)).round(5).tolist(),
                       "uncut": float(v[2]) <= MAPPER_UNCUT_BORDER}
-                     for v in o.get("sightings") or [] if len(v) >= 6]
+                     for v in o.get("sightings") or [] if len(v) >= 6 and int(v[0]) not in masked]
             objects.append({"id": o.get("id"), "label": o["label"],
                             "centre_m": sim.point(np.asarray(o["center"], np.float64)).tolist(),
                             "size_m": size.tolist(), "yaw_deg": yaw_of(sim.R @ R),
                             **{k: o[k] for k in MAPPER_OBJECT_KEYS if k in o},
-                            **({"views": views} if "sightings" in o else {})})
+                            **({"views": views} if "sightings" in o else {}),
+                            # a support plane measured under it (``objects.support_level``)
+                            "supported": o.get("support_z") is not None})
         atomic_write_json(vdir / "meta.json", {
             "version": n, "floor_z": float(floor), "floor_sigma": floor_sigma, "objects": objects,
             "doors": [o["centre_m"][:2] for o in objects if "door" in o["label"].lower()],

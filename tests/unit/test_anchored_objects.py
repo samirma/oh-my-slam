@@ -379,7 +379,9 @@ def test_summaries_without_sightings() -> None:
     from_above = Sighting("k3", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 0.0, -1.0],
                           [0, 0, 1], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
     o.sightings = [s, from_above]
-    assert ao.extent_seen(o)["z"] == "partial"  # seen from above: the top alone
+    # seen from above uncut, a support measured under it: the support bounds the bottom (P21)
+    assert ao.extent_seen(o)["z"] == "full"
+    assert ao.extent_seen(o, support=False)["z"] == "partial"  # the top alone
     side = Sighting("k4", 1, [0, 0, 0], 1.0, 100, [False] * 4, [0.0, 1.0, 0.0],
                     [0, -1, 0], 0.01, [1.0, 2.0, 3.0], "x", 0.5)
     o.sightings = [s, side]
@@ -702,7 +704,9 @@ def test_worktop_support_heights_with_noisy_depth(tmp_path: Path,
     assert o["tomato"]["supported_by"] == {"kind": "object", "id": o["plate"]["id"],
                                            "verified_version": 1}
     if eyes is ABOVE:
-        assert o["egg"]["extent_seen"]["z"] == "partial"
+        # its top seen uncut from above, the worktop measured under it: the support bounds
+        # the bottom (map.md §5 extent_seen, P21)
+        assert o["egg"]["extent_seen"]["z"] == "full"
 
 
 def _edge_view(sc: TableScene, kid: str) -> View:
