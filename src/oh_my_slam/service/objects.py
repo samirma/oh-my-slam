@@ -15,7 +15,11 @@ versions from the mapper's update ids, translated by the version record's ``upda
 (each update id of the version's line and the version that committed it: a version with no
 mapper update and a revert do not shift them, ``update.update_versions``). That mapper does not record which views bound a box, so
 every extent is ``partial`` (not seen in full). An object without those records, or without
-points in the cloud, is not listed: the read never makes a field up."""
+points in the cloud, is not listed: the read never makes a field up.
+
+Each record of a version whose label vocabulary holds client labels (map.md §5, oms/2.4) carries
+``label_scores`` (``label_scores``): its label first, then the other labels of its
+``detection_votes`` by share, at most three, each scored by its share."""
 
 from __future__ import annotations
 
@@ -28,12 +32,64 @@ import numpy as np
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.mapping.anchored_objects import extent_from
 from oh_my_slam.segmentation.api import color_for_id
-from oh_my_slam.segmentation.detect import PASSAGE_LABELS, door_leaf
+from oh_my_slam.segmentation.detect import PASSAGE_LABELS, door_leaf, normalize_label
 from oh_my_slam.service import nav
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.store import Store
 
 CACHE = "objects.json"
+LABEL_SCORES = 3  # map.md §5 ``label_scores``: at most this many candidates
+
+
+def label_scores(o: dict[str, Any]) -> list[dict[str, Any]]:
+    """An object record's ``label_scores`` (map.md §5, oms/2.4): its ``label`` first, then the
+    other labels of its ``detection_votes`` with a share, highest first (ties as the votes list
+    them: by label), at most ``LABEL_SCORES``, each scored by its ``detection_votes`` share (its
+    label's own: 0 when it got no vote)."""
+    shares = {e["label"]: float(e["share"]) for e in o.get("detection_votes") or []}
+    rest = [e["label"] for e in o.get("detection_votes") or []
+            if e["label"] != o["label"] and float(e["share"]) > 0.0]
+    return [{"label": lab, "score": shares.get(lab, 0.0)}
+            for lab in [o["label"], *rest][:LABEL_SCORES]]
+
+
+# map.md §5 "Label choice" (oms/2.4): a client label beats a default label whose vote share
+# exceeds its own by no more than this (absolute). One view's vote of an object seen from about
+# seven views (a robot's pass) is a share of about 0.14: the client label wins when it trails by
+# at most about one view's vote, never against a label two views ahead
+CLIENT_LABEL_MARGIN = 0.15
+
+
+def client_label(o: dict[str, Any], vocabulary: list[str]) -> str | None:
+    """The client label an object record takes by the label choice (map.md §5, oms/2.4), or
+    None when its label stays as chosen: among the labels of its ``detection_votes``, a client
+    label is one equal (``normalize_label``) to a label of the version's stored vocabulary,
+    whether or not it also equals a default; the client label of the highest share within
+    ``CLIENT_LABEL_MARGIN`` of the best share (the best itself when it is one; ties as the votes
+    list them) wins, applied once against the best share."""
+    client = {normalize_label(v) for v in vocabulary}
+    votes = o.get("detection_votes") or []
+    if not votes:
+        return None
+    best = max(float(e["share"]) for e in votes)
+    near = [e for e in votes if normalize_label(e["label"]) in client
+            and float(e["share"]) > 0.0 and best - float(e["share"]) <= CLIENT_LABEL_MARGIN + 1e-9]
+    return max(near, key=lambda e: float(e["share"]))["label"] if near else None
+
+
+def with_label_scores(answer: dict[str, Any], vocabulary: list[str]) -> dict[str, Any]:
+    """An ``Objects`` answer whose records carry ``label_scores`` when the version's label
+    vocabulary (``vocabulary``: the client's labels as stored, never the defaults) holds any
+    (map.md §5: present whenever it does), each record's label taken by the label choice
+    (``client_label``); unchanged otherwise (a map with no client label chooses as before).
+    Idempotent (an answer kept on disk before oms/2.4 gets them on its read)."""
+    if not vocabulary:
+        return answer
+    out = []
+    for o in answer["objects"]:
+        o = {**o, "label": client_label(o, vocabulary) or o["label"]}
+        out.append({**o, "label_scores": label_scores(o)})
+    return {**answer, "objects": out}
 
 
 def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
@@ -67,9 +123,12 @@ def _mapper_records(dv: DerivedVersion) -> dict[str, Any]:
         n = max(int(o.get("observations") or 1), 1)
         votes = o.get("label_votes") or {}
         labels = sorted(votes, key=lambda k: (-float(votes[k]), k)) or [o["label"]]
-        # that mapper's per-label votes over its observing frames (map.md §5)
-        shares = [{"label": k, "share": round(min(max(float(votes[k]) / n, 0.0), 1.0), 4)}
-                  for k in votes]
+        # that mapper's per-label votes over its observing frames (map.md §5), but its masked
+        # views' (``view_votes``: no vote, no denominator, "Ignored pixels")
+        shown = o.get("view_votes", votes)
+        m = max(int(o.get("view_observations", n)), 1)
+        shares = [{"label": k, "share": round(min(max(float(shown[k]) / m, 0.0), 1.0), 4)}
+                  for k in shown]
         first = min(max(as_version(int(o["created_update"])), 1), dv.version)
         last = min(max(as_version(int(o.get("last_seen_update") or o["created_update"])),
                        first), dv.version)
@@ -123,13 +182,13 @@ def compute(store: Store, ids: nav.Ids, dv: DerivedVersion,
                                  nav.HEIGHT_CAP_M)
         regions = nav.object_regions(answer, objects,
                                      {o["id"]: o.get("seen_from", []) for o in objects})
-    return {"map": dv.name, "map_version": dv.version,
-            "scale_source": dv.record["scale_source"],
-            "scale_sigma_rel": dv.record["scale_sigma_rel"],
-            "objects": [{**{k: v for k, v in o.items() if k != "seen_from"},
-                         "color": list(color_for_id(o["id"])), "region": regions.get(o["id"])}
-                        for o in objects],
-            "surfaces": data["surfaces"]}
+    return with_label_scores({
+        "map": dv.name, "map_version": dv.version, "scale_source": dv.record["scale_source"],
+        "scale_sigma_rel": dv.record["scale_sigma_rel"],
+        "objects": [{**{k: v for k, v in o.items() if k != "seen_from"},
+                     "color": list(color_for_id(o["id"])), "region": regions.get(o["id"])}
+                    for o in objects],
+        "surfaces": data["surfaces"]}, dv.record.get("labels") or [])
 
 
 def body(store: Store, derived: Derived, ids: nav.Ids, dv: DerivedVersion,
@@ -139,8 +198,8 @@ def body(store: Store, derived: Derived, ids: nav.Ids, dv: DerivedVersion,
     def load() -> dict[str, Any]:
         path = derived.dir(dv.name) / str(dv.version) / CACHE
         if path.exists():
-            out: dict[str, Any] = json.loads(path.read_text())
-            return out
+            return with_label_scores(json.loads(path.read_text()),
+                                     dv.record.get("labels") or [])
         out = compute(store, ids, dv, files)
         atomic_write_json(path, out)
         return out

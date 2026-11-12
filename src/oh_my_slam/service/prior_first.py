@@ -159,7 +159,7 @@ class _MaRun:
             return self.up.backend.geometry_views(images, Ks, poses,
                                                   self.workdir / f"mv{calls[0]}")
 
-        self.reg = register_ma.Registration(multiview, new, stored)
+        self.reg = register_ma.Registration(multiview, new, stored, self._ambiguous)
         self.reg.run()
         self.reg.recheck()  # across the calls: what later calls registered
         # a frame still unconfirmed is inferred again, once each time the pool grew since its
@@ -167,6 +167,27 @@ class _MaRun:
         self.reg.retry()
         self.reg_s += time.perf_counter() - t
         return self._place(self.frames)
+
+    def _ambiguous(self, f: register_ma.New, key: str) -> bool:
+        """The registration gate's rule (map.md §1 "Symmetric scenes", §2 step 2) for
+        MapAnything (``register_ma.confirms``): whether the pair of new frame ``f`` and the view
+        of anchor ``key`` (a keyframe id, or ``new<index>`` for a frame of this job) is
+        ambiguous, through the job's two-view fits (``standpoint.ambiguous``)."""
+        def view(fr: _Frame) -> standpoint.View | None:
+            got = self.feats.get(fr.work.index)
+            d = _depth_image(fr)
+            return None if got is None else standpoint.View(
+                fr.work.name, fr.cam.canonical(), got, np.eye(3), np.zeros(3),
+                depth=lambda: d)
+
+        by_index = {fr.work.index: fr for fr in self.frames}
+        a = view(by_index[f.index])
+        if key.startswith("new"):
+            b = view(by_index[int(key[3:])])
+        else:
+            k = self.am.keyframe(key)
+            b = None if k is None else standpoint.keyframe_view(self.am, k)
+        return a is not None and b is not None and standpoint.ambiguous(a, b, self.pairs)
 
     def more(self, extra: list[Keyframe]) -> list[Keyframe]:
         """The frames still unconfirmed tested again against ``extra`` (keyframes the other

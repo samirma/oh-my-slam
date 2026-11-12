@@ -520,6 +520,9 @@ class MapObject:
     # the keyframes whose view is no view of it: it lies mostly on their ignored pixels
     # (``masked_frames``, map.md §5 "Ignored pixels"); no view count, no extent evidence
     masked: list[int] = field(default_factory=list)
+    # per keyframe, the label votes its detections gave (score sums, as ``label_votes``): a
+    # masked view's leave the vote shares (``view_votes``); empty for a map written before
+    frame_votes: dict[int, dict[str, float]] = field(default_factory=dict)
     _memo: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def memo(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -598,6 +601,8 @@ class MapObject:
         n0 = len(self.frames)
         for ob in obs:
             self.vote(ob.label, ob.score)
+            fv = self.frame_votes.setdefault(ob.frame, {})
+            fv[ob.label] = fv.get(ob.label, 0.0) + ob.score
         self.add_points(np.concatenate([ob.points for ob in obs]),
                         np.concatenate([np.full(len(ob.points), ob.source, np.uint8)
                                         for ob in obs]))
@@ -614,6 +619,10 @@ class MapObject:
         for lab, v in gone.label_votes.items():
             self.label_votes[lab] = self.label_votes.get(lab, 0.0) + v
         self.label = max(self.label_votes.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        for f, votes in gone.frame_votes.items():
+            fv = self.frame_votes.setdefault(f, {})
+            for lab, v in votes.items():
+                fv[lab] = fv.get(lab, 0.0) + v
         self.scores = sorted(self.scores + gone.scores, reverse=True)[:10]
         self.add_points(gone.points, gone.point_sources())
         n_a, n_b = len(self.frames), len(gone.frames)
@@ -643,7 +652,25 @@ class MapObject:
             "sightings": [s.to_list() for s in self.sightings],
             "support_z": self.support,
             "masked_frames": self.masked,
+            "frame_votes": {str(f): v for f, v in sorted(self.frame_votes.items())},
+            **self.view_votes(),
         }
+
+    def view_votes(self) -> dict[str, Any]:
+        """The label vote shares' numerator and denominator without the masked views (map.md §5
+        "Ignored pixels": a view mostly on ignored pixels gives no vote and counts in no
+        denominator): ``view_votes`` (``label_votes`` but the votes of the masked keyframes
+        whose votes were recorded, ``frame_votes``) and ``view_observations`` (the keyframes
+        that detected it but those); empty when no masked keyframe's votes are recorded."""
+        gone = [f for f in self.masked if f in self.frame_votes and f in self.frames]
+        if not gone:
+            return {}
+        votes = dict(self.label_votes)
+        for f in gone:
+            for lab, v in self.frame_votes[f].items():
+                votes[lab] = votes.get(lab, 0.0) - v
+        return {"view_votes": {k: v for k, v in votes.items() if v > 1e-9},
+                "view_observations": len(self.frames) - len(gone)}
 
     @staticmethod
     def from_dict(d: dict[str, Any], points: NDArray[np.float32]) -> MapObject:
@@ -671,6 +698,7 @@ class MapObject:
             cloud_min=None if least is None else int(least),
             support=None if d.get("support_z") is None else float(d["support_z"]),
             masked=sorted(int(f) for f in d.get("masked_frames", [])),
+            frame_votes={int(f): dict(v) for f, v in (d.get("frame_votes") or {}).items()},
         )
 
     @property
@@ -3029,6 +3057,8 @@ def _weigh_part(a: MapObject, b: MapObject, views: _Views | None, surfaces: _Sur
         return
     part, _, ratio = pw
     part.label_votes = {k: v * ratio for k, v in part.label_votes.items()}
+    part.frame_votes = {f: {k: v * ratio for k, v in fv.items()}
+                        for f, fv in part.frame_votes.items()}
 
 
 def _content_key(o: MapObject) -> tuple[Any, ...]:

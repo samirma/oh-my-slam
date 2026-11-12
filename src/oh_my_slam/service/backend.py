@@ -432,6 +432,9 @@ class MapperBackend:
                                 # the views that are no view of it (map.md §5 "Ignored
                                 # pixels") and the support its box rests on
                                 "masked_frames": o.get("masked_frames") or [],
+                                # the vote shares without them (``MapObject.view_votes``)
+                                **{k: o[k] for k in ("view_votes", "view_observations")
+                                   if k in o},
                                 "support_z": o.get("support_z")})
             return out
 

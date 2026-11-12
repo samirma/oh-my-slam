@@ -90,7 +90,7 @@ DEFAULT_CAMERA_HEIGHT_M = 1.0
 # mask lies in the image-border band (``Sighting.border``: that share)
 MAPPER_UNCUT_BORDER = 0.0
 MAPPER_OBJECT_KEYS = ("score", "label_votes", "observations", "created_update",
-                      "last_seen_update")  # a map with no floor at all: this far below its lowest camera
+                      "last_seen_update", "view_votes", "view_observations")  # a map with no floor at all: this far below its lowest camera
 
 
 @dataclass

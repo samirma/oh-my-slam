@@ -221,21 +221,31 @@ def _thumb(path: Path) -> NDArray[np.float32] | None:
     return t / n if n > 1e-6 else t
 
 
-def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: list[Ref]
-             ) -> bool:
+def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: list[Ref],
+             ambiguous: Callable[[Ref], bool] | None = None) -> bool:
     """The depth confirmation of a candidate pose (map.md §2 step 2, every engine;
     ``anchored.depth_confirmed``) of a frame carrying a depth image, against the reference
     carrying one (``images``) that sees most of its points agree (at least ``MIN_AGREEING``
-    seen); True for a monocular frame or with no such reference seeing it."""
+    seen); True for a monocular frame or with no such reference seeing it. A reference whose
+    pair with the frame is ambiguous (``ambiguous``: two distinct hypotheses both pass the
+    confirmation, map.md §1 "Symmetric scenes") places it in neither pose: the next such
+    reference must confirm it, and with none left the pose is no placement (as
+    ``AnchoredMap.depth_confirms``). A pose a reference rejects is no placement."""
     if f.depth is None:
         return True
     pts = backproject(depth, Kd)
-    best: tuple[int, Ref] | None = None
-    for r in images:
+    seen: list[tuple[int, int, Ref]] = []
+    for k, r in enumerate(images):
         a = agreement(pts, T, [r], DEPTH_TOL)
-        if a.agree + a.conflict >= MIN_AGREEING and (best is None or a.agree > best[0]):
-            best = (a.agree, r)
-    return best is None or depth_confirmed(Ref(T, depth, Kd), best[1], DEPTH_TOL)
+        if a.agree + a.conflict >= MIN_AGREEING:
+            seen.append((-a.agree, k, r))
+    for _, _, r in sorted(seen, key=lambda e: (e[0], e[1])):
+        if not depth_confirmed(Ref(T, depth, Kd), r, DEPTH_TOL):
+            return False
+        # (only a pose the depth confirms asks whether another one would pass too)
+        if ambiguous is None or not ambiguous(r):
+            return True
+    return not seen
 
 
 # -- the registration ----------------------------------------------------------------------------
@@ -258,7 +268,7 @@ class _Posed:
         if not self._cache:
             self._cache.append(self.depth())
         d = self._cache[0]
-        return None if d is None else Ref(self.T, d[0], d[1])
+        return None if d is None else Ref(self.T, d[0], d[1], self.key)
 
 
 def _stored_depth(s: Stored) -> Callable[[], tuple[NDArray[np.float32], Array] | None]:
@@ -268,11 +278,21 @@ def _stored_depth(s: Stored) -> Callable[[], tuple[NDArray[np.float32], Array] |
     return load
 
 
-class Registration:
-    """The camera-only frames ``new`` against the map's keyframes ``stored`` (at least one)."""
+Ambiguous = Callable[[New, str], bool]
 
-    def __init__(self, multiview: Multiview, new: list[New], stored: list[Stored]) -> None:
+
+class Registration:
+    """The camera-only frames ``new`` against the map's keyframes ``stored`` (at least one).
+    ``ambiguous(frame, key)``: whether the pair of a new frame and the view of a reference
+    (``_Posed.key``: a stored keyframe's ``Stored.name``, ``new<index>`` for a frame of this
+    update) is
+    ambiguous (map.md §1 "Symmetric scenes", the registration gate's rule: ``confirms``); None:
+    no pair is."""
+
+    def __init__(self, multiview: Multiview, new: list[New], stored: list[Stored],
+                 ambiguous: Ambiguous | None = None) -> None:
         self.views_of = multiview
+        self.ambiguous = ambiguous
         self.new = new
         self.pool: list[_Posed] = [
             _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor)
@@ -386,12 +406,12 @@ class Registration:
                 refs = sensor if f.depth is not None else call
                 tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
                 a = agreement(backproject(depth, Kd), T, refs, tol)
-                if not a.confirmed or not confirms(f, T, depth, Kd, images):
+                if not a.confirmed or not confirms(f, T, depth, Kd, images, self._gate(f)):
                     continue
                 self._register(f, T, sig, depth, Kd, a.agree, keys)
-                sensor.append(Ref(T, depth, Kd))
+                sensor.append(Ref(T, depth, Kd, f"new{f.index}"))
                 if f.depth is not None:
-                    images.append(Ref(T, depth, Kd))
+                    images.append(Ref(T, depth, Kd, f"new{f.index}"))
                 call.append(Ref(T, ma_depth, Kma))
                 del cand[idx]
                 changed = True
@@ -400,6 +420,12 @@ class Registration:
             self.placements[idx] = Placement("rejected", "no_overlap",
                                              scene_m=self.scenes.get(idx))
             self.waiting[idx] = (f, T, sig, depth, Kd, keys)
+
+    def _gate(self, f: New) -> Callable[[Ref], bool] | None:
+        """The registration gate's ambiguous pairs of frame ``f`` (``confirms``), by the
+        reference's key."""
+        amb = self.ambiguous
+        return None if amb is None else (lambda r: amb(f, r.key))
 
     def _register(self, f: New, T: Array, sig: tuple[float, float], depth: NDArray[np.float32],
                   Kd: Array, inliers: int, anchors: tuple[str, ...] = ()) -> None:
@@ -434,7 +460,7 @@ class Registration:
                 f, T, sig, depth, Kd, keys = self.waiting[idx]
                 tol = DEPTH_TOL if f.depth is not None else CALL_DEPTH_TOL
                 a = agreement(backproject(depth, Kd), T, refs, tol)
-                if not a.confirmed or not confirms(f, T, depth, Kd, images):
+                if not a.confirmed or not confirms(f, T, depth, Kd, images, self._gate(f)):
                     continue
                 del self.waiting[idx]
                 self._register(f, T, sig, depth, Kd, a.agree, keys)
