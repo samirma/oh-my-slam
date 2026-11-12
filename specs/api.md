@@ -138,7 +138,7 @@ error code `invalid_request` (§9).
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
-  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2)). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
+  | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2); the keyframe stays a registration reference for image matching and pose, its features used without its depth, which lifts no later frame, in registration or in locate (map.md §2, §6 below))). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
   `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
@@ -157,7 +157,9 @@ error code `invalid_request` (§9).
   pose: it is never combined with that frame's own depth or floor plane into a scale estimate
   (camera-height evidence or the monocular scale k), since that depth is the out-of-bound part;
   the height may still count where camera-height evidence is formed from poses and other frames'
-  floor (map.md §1, §2). A sensor-depth frame excluded by the floor check or the height gate
+  floor (map.md §1, §2). It stays a registration reference for image matching and pose, with
+  its features used and its depth not: that depth lifts no later frame and gives it no depth
+  confirmation or scale evidence (map.md §2). A sensor-depth frame excluded by the floor check or the height gate
   is likewise a frame whose content is withheld, whose pose is trusted and which counts for
   free-by-rule cells.
   * **Conflicting prior exception.** A `kept_at_prior` frame whose images show a conflict with
@@ -434,6 +436,12 @@ The versions read, revert and `--keep-versions` are O2.
 * **Provisional frames.** Locate works against a version whose newest frames are still
   provisional, using their provisional poses.
 * **Frames kept at prior.** Locate never uses a `kept_at_prior` frame as a reference.
+* **Frames the floor check did not judge** (oms/2.6). A keyframe with `detail`
+  `floor_not_judged` (map.md §2) stays a reference for image matching and pose, with its
+  features used and its depth not, as in registration (map.md §2): that depth lifts no located
+  frame, gives it no keypoint depth, no depth confirmation of a candidate pose and no scale
+  evidence. A frame whose only references that carry depth are such keyframes is located as one
+  with no depth reference: from the images alone.
 * **Nothing located** is a `200` response with every frame `rejected`, not an error.
 * **Recording.** With `record: true`, the last located frame's pose is stored as the map's
   *recorded pose*, outside the map's versions.
