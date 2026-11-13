@@ -65,7 +65,9 @@ def render() -> str:
         "",
         "An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with "
         "`?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each "
-        "frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate.",
+        "frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate, "
+        "and `scale_check`, the sent camera heights against the frames' own floor heights "
+        "(ratio near 1: they agree).",
         "",
         "```sh",
         "curl -s http://HOST:9091/api/maps/home/updates \\",
@@ -83,7 +85,9 @@ def render() -> str:
         "`matches` then names the best object of each (`object_id` null when none). Outputs are "
         "in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects "
         "carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a "
-        "gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`.",
+        "gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`. "
+        "Outside the map frame, a camera with `height_above_floor_m` gets `scale_check`: that "
+        "height against the camera's height above the frame's own floor plane in its raw depth.",
         "",
         "```sh",
         "curl -s http://HOST:9091/api/frames/analyse \\",

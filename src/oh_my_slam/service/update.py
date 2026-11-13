@@ -68,6 +68,7 @@ from oh_my_slam.mapping.anchored import (
     floor_verdict,
     lowest_layer,
     natural_key,
+    own_floor,
     pose_residual,
     version_floor,
 )
@@ -79,6 +80,7 @@ from oh_my_slam.mapping.quality import (
     drift_correction,
     gate,
     residual_stats,
+    scale_check,
 )
 from oh_my_slam.segmentation.detect import normalize_label
 from oh_my_slam.service.backend import Backend, InternalFrame, InternalMap, NothingRegisteredError
@@ -205,6 +207,9 @@ class _Frame:
     # registered, a monocular frame the floor check did not judge: its depth is left out of the
     # grid as a floor_off frame's, but it is not listed in floor_inconsistent (oms/2.5, P29b)
     floor_unjudged: bool = False
+    # registered with a sent camera height and a measurable floor plane of its own in its raw
+    # depth: that height over its own floor height (``quality.scale_check``, oms/2.8)
+    floor_ratio: float | None = None
 
 
 @dataclass
@@ -1168,6 +1173,29 @@ class Updater:
         return not chk.ok
 
     @staticmethod
+    def _floor_ratio(fr: _Frame, internal: InternalMap) -> float | None:
+        """A registered frame's sent camera height H over its own floor height h_f in its raw
+        depth (``quality.scale_check``, api.md §4, oms/2.8; the floor check's own-floor rule,
+        ``anchored.own_floor``, at the committed rotation): the depth image's sensor metres, else
+        the mapper's monocular depth on its grid, before the similarity to the map. None without
+        a height, a depth or such a plane."""
+        assert fr.internal is not None
+        h = _height(fr)
+        if h is None or fr.pose is None:
+            return None
+        two = _two_view_depth(fr)
+        if two is not None:
+            depth, K = two()
+        else:
+            d = internal.depth(fr.internal.name)
+            if d is None:
+                return None
+            depth = np.asarray(d, np.float32)
+            K = fr.cam.canonical().resized(depth.shape[1], depth.shape[0])
+        own = own_floor(depth, K, fr.pose[:3, :3], h)
+        return None if own is None else h / own
+
+    @staticmethod
     def _previous_drift(prev: dict[str, Any] | None
                         ) -> tuple[Sim3 | None, tuple[float, float] | None,
                                    list[list[float]] | None]:
@@ -1314,6 +1342,8 @@ class Updater:
                               floor_sigma)
         rows = {r["name"]: r for r in out}
         for fr in registered:
+            if fr.internal is not None:
+                fr.floor_ratio = self._floor_ratio(fr, internal)
             if fr.internal is not None and self._height_off(fr, floor):
                 fr.height_off = True
                 rows[fr.work.name]["height_inconsistent"] = True
@@ -1391,6 +1421,8 @@ class Updater:
             "rebuilt": rebuilt,
             "prior_gravity_deg": None if prev is not None or anchored is None
             else anchored.prior_gravity_deg,
+            "scale_check": scale_check([fr.floor_ratio for fr in registered
+                                        if fr.floor_ratio is not None]),
         }
         # the hard limit on content: nothing registered and nothing kept (map.md §4)
         return gate(q, bool(registered or kept), accept_if, no_prior, rotations_bad)

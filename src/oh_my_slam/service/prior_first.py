@@ -54,6 +54,7 @@ from oh_my_slam.mapping.quality import (
     gate,
     reregistered,
     residual_stats,
+    scale_check,
     too_close,
 )
 from oh_my_slam.service.backend import MONO_GRID_SIDE, Mono
@@ -542,6 +543,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     rotation_pairs: list[dict[str, Any]] = []  # the rotation check's pairs (map.md §4)
     depths_bad = False
     depth_rows: list[dict[str, Any]] = []  # the depth-consistency limit's pairs (oms/2.6)
+    scale_ratios: list[float] = []  # the frames' H / h_f (``quality.scale_check``, oms/2.8)
     # the map's label vocabulary with this update's labels (map.md §5): every detection of the
     # job prompts with it and the defaults
     from oh_my_slam.service.update import map_labels
@@ -713,6 +715,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         t = time.perf_counter()
+        scale_ratios = am.floor_ratios()  # before ``save`` forgets the job's keyframes
         am.save()
         if om is not None:
             om.save()
@@ -818,6 +821,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
         "rebuilt": False,
         "prior_gravity_deg": None if prev is not None or am is None else am.up_check_deg,
+        "scale_check": scale_check(scale_ratios),
     }
     status = {i: pl.status for i, pl in placements.items()}
     job.quality = gate(q, bool(kept), w.accept_if,

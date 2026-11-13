@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.7) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.8) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
 ---
 
 # oh-my-slam API
@@ -8,7 +8,7 @@ description: "Short reference of the oh-my-slam HTTP API (schema oms/2.7) for th
 Generated from the API definitions (`python -m oh_my_slam.service.skill`); never edit it by hand. The full contract is `GET /api/openapi.json` (OpenAPI 3.1, its schemas those of `specs/api.schema.json`) and `specs/api.md`.
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
-* Every JSON body carries `schema` (`oms/2.7`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
+* Every JSON body carries `schema` (`oms/2.8`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
 * Implemented groups (`GET /api/health` → `capabilities`): O1, O2, O3-jobs, O4, O5, O6, O7, O8, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
@@ -34,7 +34,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `DELETE /api/maps/{name}` | Delete the map and its versions; map_busy while a job of the map is queued or running (never cancels a job) |  | 204 |  |
 | `POST /api/frames/analyse` | Analyse one frame, no map change (O7): objects (with labels, the best match per client label), image masks, points, a range scan and depth, in the map frame (map and T_map_cam), the pose's own frame (T_map_cam alone) or a gravity-aligned camera frame | [`AnalyseRequest`] (multipart: part `request` + file parts) | 200 [`Analysis`] |  |
 
-An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with `?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate.
+An update answers `202` with a job (`Location: /api/jobs/{id}`); poll it with `?wait_s=30` until `state` is `committed`, `rejected` or `failed`. `inputs[]` gives each frame's `status`, `reason`, `T_map_cam` and sigmas; `quality` the residuals and the gate, and `scale_check`, the sent camera heights against the frames' own floor heights (ratio near 1: they agree).
 
 ```sh
 curl -s http://HOST:9091/api/maps/home/updates \
@@ -43,7 +43,7 @@ curl -s http://HOST:9091/api/maps/home/updates \
 curl -s 'http://HOST:9091/api/jobs/JOB_ID?wait_s=30'
 ```
 
-`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses `objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and `matches` then names the best object of each (`object_id` null when none). Outputs are in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`.
+`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses `objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and `matches` then names the best object of each (`object_id` null when none). Outputs are in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`. Outside the map frame, a camera with `height_above_floor_m` gets `scale_check`: that height against the camera's height above the frame's own floor plane in its raw depth.
 
 ```sh
 curl -s http://HOST:9091/api/frames/analyse \

@@ -257,6 +257,7 @@ class Analyser:
         height = cam.height_above_floor_m if (cam.height_above_floor_m or 0.0) > 0 else None
         factor, floor_sigma = 1.0, FLOOR_SIGMA_DEFAULT_M
         floor: float | None
+        scale_check: dict[str, Any] | None = None  # outside the map frame, with a sent height
         if frame == "map":
             assert dv is not None
             source, sigma = str(dv.record["scale_source"]), float(dv.record["scale_sigma_rel"])
@@ -268,6 +269,9 @@ class Analyser:
             depth = (depth * factor).astype(np.float32)
         else:
             source, sigma = "depth", DEPTH_SIGMA_REL
+            if height is not None:  # the raw depth, before the sent height rescales it
+                scale_check = analysis.scale_check(depth, K_grid, T[:3, :3], height,
+                                                   "monocular" if sensor is None else "sensor")
             if sensor is None:
                 f = analysis.height_factor(depth, K_grid, T[:3, :3], height)
                 if f is None:
@@ -301,6 +305,8 @@ class Analyser:
             seen = analysis.objects(view, floor, floor_sigma, w.min_score, known)
         out: dict[str, Any] = {"frame": frame, "scale_source": source,
                                "scale_sigma_rel": round(sigma, 5)}
+        if scale_check is not None:
+            out["scale_check"] = scale_check
         if w.wants_objects:
             out["objects"] = self._objects(w, seen, T)
             returned = {o["id"] for o in out["objects"]}
