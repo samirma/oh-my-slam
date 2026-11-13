@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.8. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.9. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -2237,7 +2237,7 @@
           "properties": {
             "state": {
               "$ref": "#/$defs/Binary",
-              "description": "uint8: 0 unknown, 1 free, 2 occupied."
+              "description": "uint8: 0 unknown, 1 free, 2 occupied (also a drop, floor_observed 3, oms/2.9)."
             },
             "observations": {
               "$ref": "#/$defs/Binary",
@@ -2245,11 +2245,11 @@
             },
             "height_m": {
               "$ref": "#/$defs/Binary",
-              "description": "float32 highest surface in the cell at or below height_cap_m, relative to floor_z_m; NaN if none."
+              "description": "float32 highest surface in the cell at or below height_cap_m, relative to floor_z_m; NaN if none; in a drop cell the drop's surface, negative (oms/2.9)."
             },
             "floor_observed": {
               "$ref": "#/$defs/Binary",
-              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc; none from a frame kept_at_prior with detail conflict_unsupported, whatever its reason); 0 not observed."
+              "description": "uint8: 1 floor observed at floor height; 2 not observed but free by rule (camera stand or its near blind disc; none from a frame kept_at_prior with detail conflict_unsupported, whatever its reason); 3 a drop (oms/2.9): no floor observed and a surface below the floor band, state occupied; 0 not observed. A drop cell, or a cell past one from the camera stand, is never free by rule."
             }
           }
         },
@@ -2270,6 +2270,14 @@
           "items": {
             "$ref": "#/$defs/Frontier"
           }
+        },
+        "blind_disc": {
+          "enum": [
+            "full",
+            "footprint",
+            "none"
+          ],
+          "description": "oms/2.9: the near blind disc as requested: full (default), footprint (limited to footprint_radius_m), none (stand cells only); never over or past a drop cell."
         }
       }
     },

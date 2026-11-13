@@ -205,6 +205,13 @@ against its frames' own floor heights in their raw depth, api.md §4) and frame 
 `scale_check` (a sent camera height against the frame's own floor height, api.md §7), so a
 client sees when a documented camera height and the depth disagree.
 
+**oms/2.9** is additive: the grid marks a **drop**, a cell whose floor was not seen and that
+holds a surface below the floor band, as occupied with `floor_observed` 3 and its negative
+`height_m`, and never makes it, or a cell behind it from a camera stand, free by rule; the grid
+request's `blind_disc` (`full`, `footprint`, `none`) limits the near blind disc (map.md §6). A
+cell that was free by rule or free over an unseen drop may now be occupied, so a robot on a
+raised surface does not plan off its edge.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

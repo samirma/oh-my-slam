@@ -726,6 +726,12 @@ these heights.
 whatever the camera saw, because the robot stood there. So is the ring around that position
 that the camera could not see: its near blind zone on the floor, from the camera's height and
 its lower field-of-view edge.
+* **Blind disc extent** (oms/2.9). The request's `blind_disc` chooses the disc: `full` (default)
+  as above; `footprint`, the disc limited to `footprint_radius_m` around the stand (a request
+  with `footprint` and no `footprint_radius_m` is `invalid_request`); `none`, the stand's own
+  cell only. Whatever the extent, a disc cell is free by rule only when the straight segment
+  from the stand to it crosses no drop cell (Drops, below), and a drop cell is never free by
+  rule.
 
 **Unconfirmed frames.** A `kept_at_prior` keyframe counts only for these free-by-rule cells
 (camera stand and near blind disc) until a later job's images confirm it (§2), except a frame
@@ -775,6 +781,13 @@ seen there.
   Other planes, such as the room floor seen past a worktop's edge, are support surfaces
   (`surfaces[]`), not the floor.
 
+  **Drops** (oms/2.9). A cell whose floor was not observed and that holds a surface below the
+  floor band (lower than `floor_z_m` − max(0.06 m, 3 × `floor_sigma_m`)), with the evidence an
+  occupied cell needs, is a **drop**: a worktop's edge, a stair down, a hole. Its `state` is
+  occupied (2), whatever the band, its `floor_observed` is 3 and its `height_m` is that
+  surface's height, negative. A cell where the floor was observed is never a drop. Drops come
+  from the same image-confirmed content as occupancy, never from free-by-rule cells.
+
   **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m`, on either
   side of it, is floor: it never makes an occupied cell or defines a passage, whatever `z_min`
   is. The band classifies by the height of the surface, the height of the points that make it,
@@ -786,6 +799,8 @@ seen there.
   histogram peak. The points are those of the kept frames, after the floor check (§2): a frame
   the check excluded, or did not judge (`floor_not_judged`), adds none.
 * Optional `footprint_radius_m`: the robot's radius.
+* Optional `blind_disc` (oms/2.9): `full` (default), `footprint` or `none` (Blind disc extent
+  above). Echoed in the header.
 * `height_cap_m`: the ceiling of the `height_m` layer, relative to `floor_z_m`. Default 2.0 m,
   or the band's `z_max` when the request gives one. Echoed in the header.
 
@@ -801,13 +816,16 @@ seen there.
 * `state`: uint8, 0 unknown, 1 free, 2 occupied;
 * `observations`: uint16, the number of frames that observed the cell;
 * `height_m`: float32, the highest surface in the cell at or below `height_cap_m`, relative to
-  `floor_z_m`, NaN if none. Surfaces above the cap, such as a ceiling, are left out;
+  `floor_z_m`, NaN if none; in a drop cell, the drop's surface, negative (oms/2.9). Surfaces
+  above the cap, such as a ceiling, are left out;
 * `floor_observed`: uint8:
   * 1 — a floor surface was observed in the cell at the floor height;
   * 2 — not observed, but free by rule: a camera stood here, or the cell lies inside a camera's
     near blind disc. The cameras are those of registered and provisional frames (also when their
     content is withheld, §2) and of `kept_at_prior` frames, except one kept with
     `detail` `conflict_unsupported` (whatever its reason), which makes no such cell;
+  * 3 — a drop (oms/2.9, Drops above): no floor observed, a surface below the floor band;
+    `state` is occupied;
   * 0 — not observed.
   A cell that is free but whose floor was not observed means the camera saw through it above a
   floor nobody saw: there may be a low obstacle or a step, so the planner looks first.
