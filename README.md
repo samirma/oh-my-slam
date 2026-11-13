@@ -31,11 +31,12 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.5) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.7) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
 status), **O5** (locate with uncertainty), **O6** (navigation grid, points near a place),
+**O7** (frame analysis: *Frame analysis*, below),
 **O8** (object records, support surfaces and relations), **O9** (quality report and `accept_if` gate) and **O10** (dry run), with the service plumbing
 they need. New maps take the *prior-first registration* (below).
 
@@ -77,12 +78,13 @@ they need. New maps take the *prior-first registration* (below).
   `GET /api/maps/{name}/grid`, `/points`, `/objects`, `/birdseye.png` and `/birdseye`,
   `POST /api/maps/{name}/locate`, `GET /api/maps/{name}/pose`, `DELETE /api/maps/{name}`, and
   `?dry_run=1` (O10, *Dry run*), `GET /api/maps/{name}/versions` and
-  `POST /api/maps/{name}/revert` (O2, *Versions and revert*).
-  The other endpoints of api.md come with their groups (O3, O7).
+  `POST /api/maps/{name}/revert` (O2, *Versions and revert*), and
+  `POST /api/frames/analyse` (O7, *Frame analysis*).
+  The other endpoints of api.md come with their group (O3).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.5; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.7; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -96,9 +98,9 @@ they need. New maps take the *prior-first registration* (below).
   *Cycle rule*).
 * **Lanes.** No lanes until O3: one job worker, reported as the single lane `lanes.worker` (busy
   while a job runs, the queue, the age of the oldest job; inference.md). The inference server's
-  device queue is a priority queue: requests sent with `x-oms-priority: interactive` (dry runs:
-  `Backend.interactive`) run before every waiting fusion request (`server.gpu_worker`); locate
-  needs no inference.
+  device queue is a priority queue: requests sent with `x-oms-priority: interactive` (dry runs
+  and frame analysis: `Backend.interactive`) run before every waiting fusion request
+  (`server.gpu_worker`); locate needs no inference.
 
 ### Versions and revert (O2)
 
@@ -1789,6 +1791,111 @@ shape `[rows (y), cols (x)]`; cell `[r, c]` covers x `origin_m[0] + c·cell_m` t
 likewise with `r`. Points: `xyz` float32 `[n, 3]`, `object_id` uint32 `[n]` (0: none), `rgb`
 uint8 `[n, 3]`.
 
+### Frame analysis (O7)
+
+`POST /api/frames/analyse` (api.md §7; `service.analyse`, `mapping.analysis`) analyses one frame
+and changes nothing: no map, camera, version, job or id registry is written, and its one scratch
+file (the frame as the models read it, `<data>/oms/work/analyse-*/`) is removed with the answer.
+It is an update's own code on one frame, kept nowhere.
+
+* **The frame.** Taken as an update takes one: rectified to its camera's canonical pinhole, its
+  ignored pixels (the camera's mask, sent inline or kept with the map's camera, and the frame's
+  own) filled for the detector and giving nothing anywhere: no detection (one with more than half
+  its mask on them is dropped, `IGNORED_DETECTION_MAX_SHARE`), no point, no beam, no depth, no
+  mask pixel. For a camera that is not its canonical pinhole, the pixels of that pinhole the
+  image does not reach are ignored too, and the pixels of the image that pinhole does not cover
+  give nothing (as in a map). A canonical JPEG without ignored pixels reaches the models as sent,
+  so its detections are an update's of the same frame. An image, depth image or mask that is not
+  the camera's size is `invalid_request`: there is no input status here.
+* **Depth.** The depth image, read with the camera's `depth_scale_m`, when it holds a value;
+  else the monocular model's on its 640 px grid (`MONO_GRID_SIDE`).
+* **Frame of the outputs.** `map` with `map` and `T_map_cam`; `client` with `T_map_cam` alone
+  (the pose's own frame, taken as gravity-aligned with z up); else `gravity_camera`: the camera
+  at the origin, z up along the gravity the model sees (GeoCalib, refined by the floor plane),
+  x the viewing direction (`anchored.first_camera`, the first-camera rule). A request with `map`
+  answers from the map's latest version, held until the answer ends (map.md §2 Holds); the
+  `Analysis` body has no `map_version` field.
+* **Scale.** In the map frame the version's `scale_source` and `scale_sigma_rel`. A depth image
+  is taken as it is (an anchored map fuses depth images as they are: their correction to the map
+  is 1). A monocular depth is brought onto the map by the median ratio of the map's cloud, as
+  the pose sees it, to the frame's depth at the same pixels (`analysis.map_factor`: a cloud
+  point is seen when it is the nearest of its cell of a 64-cell grid, within 5 %; at least 200
+  such points, a factor within 0.5–2); when the pose sees too little of the cloud, by the
+  camera's height above the version's floor over its height above its own floor plane
+  (`analysis.height_factor`, the floor check's scale of map.md §2); else it stays the model's
+  metres. Without a map frame: `depth` (σ 0.01, `DEPTH_SIGMA_REL`) with a depth image; else
+  `camera_height` when the camera gives `height_above_floor_m` and the frame shows a measurable
+  floor plane (the same factor; σ = `height_sigma_m`, default 0.02 m, over the height); else
+  `monocular` (σ 0.10). A camera height with no floor plane in view cannot scale the frame: it
+  is `monocular`.
+* **Floor.** The version's `floor_z_m` and `floor_sigma_m` in the map frame. Elsewhere the
+  frame's own floor: the large horizontal plane below the camera nearest the camera's height,
+  the lowest one without a height (`anchored.own_floor`); without such a plane, the camera's
+  height below it; else unknown: no object is grounded on it or dropped as the floor, and the
+  range scan takes it 1.0 m below the camera (`analyse.DEFAULT_CAMERA_HEIGHT_M`).
+* **Objects.** The detections are lifted and filtered as a keyframe's
+  (`anchored_objects.observe`: exclusive masks, no support fringe, no floor named as an object,
+  no opening, nothing nearer than 12 cm, no mask over 40 % of the image), boxed as a sighting is
+  (`fit_object_obb`, floor-standing classes grounded on the floor); a box under 3 cm
+  (`MIN_OBJECT_M`) and a door that is no leaf are no objects. The detector is asked from
+  `request_floor(min_score)` (0.5 from the default threshold up, 0.05 below it), overlaps are
+  resolved among everything it returns, and only then are the objects below `min_score`
+  dropped: an object never depends on the threshold. The closer look and the label scores of a
+  map update (`look_closer`) are not run: one detector call per frame. `sigma_centre_m` and
+  `extent_seen` are a map object's with this one sighting (the pose's sigma taken as 0: the
+  request carries none; no support plane is looked for, so `z` is `full` only when seen from
+  the side). `detected_as` is the one label. `bbox_px` is the bounding box of the object's
+  pixels (its `mask`: its exclusive mask, without ignored pixels), in the pixels of the image as
+  sent, as `[x_min, y_min, x_max, y_max]` with the maxima exclusive; an object without a pixel
+  there is not returned.
+* **Ids.** In the map frame a detection takes the id of the map object it matches
+  (`anchored_objects.match`, the update's association, against the objects read's records that
+  are not `struck`, each with its box and the version's cloud points that carry its id); the
+  others, and every detection elsewhere, take local ids from 1 000 000 in the detections' order
+  (score first). A local id's `color` is the palette colour of its rank (1 000 000 takes id 1's:
+  the palette is built id by id), so it stays a pure function of the id.
+* **Labels.** Prompts are the default vocabulary, the map's (`map` given, with or without a
+  pose) and `labels`, equal ones once (`detect.prompts`); with `labels_only` the labels alone,
+  equal ones once, a label equal to a default one in the wording the detector knows for it
+  (`detect.own_prompts`: `computer mouse` is shown as `mouse`). The background prompts (`wall`,
+  `floor`, …) are then not shown, and a detection named as one is never reported. A detection's
+  `label` is the first client label equal to its label or to the prompt it was detected as
+  (`analyse.client_form`), in the client's form (trimmed), else the label as the map reports it.
+  `matches` compares by map.md §5 equality on those labels; `labels` (an empty list too) adds
+  `objects` and `matches` to the answer. `labels_only` without labels, or with an empty list, is
+  `invalid_request` (`details.field: "labels_only"`).
+* **Points.** Every pixel with a valid depth that is no flying pixel (the cloud's edge rule) and
+  not ignored, with the id of the object whose points it was lifted into (the pixels a mask
+  loses in lifting stay 0) and its colour; one point per `voxel_m` voxel (the first), all of
+  them with 0. There is no cap.
+* **Range scan.** One beam per bearing k × `bearing_step_deg` in (−180, 180], the whole circle
+  (a beam the frame does not see is `unseen`), each holding the points nearest its bearing; when
+  the step does not divide 360 the two end beams share what is left at ±180. At least 0.1°
+  (3600 beams; smaller: `invalid_request`). `obstacle`: the nearest point within `z_band_m`
+  above the floor and above the floor band (max(0.06 m, 3 × the floor's sigma), which is floor,
+  map.md §6); else `floor_end`: the farthest point within the floor band; nearest and farthest
+  are the beam's third point, so one or two flying pixels are no surface. Ranges are horizontal,
+  from the camera, with no cap. `z_band_m` needs its top above its bottom.
+* **Depth output.** The schema's `Binary` (`uint16`, the image's rows × columns, 0 = no value)
+  in units of the camera's `depth_scale_m`, at the outputs' scale, on the pixels of the image
+  as sent (nearest); a monocular depth is resampled from its grid.
+* **Concurrency.** The request runs in the service's thread pool beside the job worker; its
+  inference requests are interactive ones, served before a job's waiting fusion requests
+  (inference.md, single worker). A depth image with a pose needs no model for `points`,
+  `range_scan` and `depth`; without a pose the gravity comes with the monocular depth
+  (`Backend.infer`), also beside a depth image.
+* **Timings.** `timings.analyse_per_frame` is the analysis stage of each request (the
+  `Server-Timing` stage `analyse`), upload and validation aside.
+* **Measured** (2026-11-13, M3 Pro, heavy lock held, a scratch service on the resident
+  inference server, `examples/ainex-captures` at 640×480 with the camera inline, no pose, no
+  depth image: monocular depth, gravity and detection): 1.33–1.70 s per frame with objects,
+  masks, points, range scan and depth (median 1.4 s; upload and validation 1–2 ms); 0.74 s for
+  a range scan alone with a pose (monocular depth, no detector). The first request with a new
+  prompt list took 3.4 s (labels alone) to 6.5 s (the service's first request, the defaults
+  with three labels): the detector embeds a prompt list once and keeps the embeddings of 16
+  lists (`server/models/seg_yoloe.py`), so a client that changes its `labels` on every request
+  pays that each time. The C12 target is 3 s under load.
+
 ### O5 and O6 measured (2026-11-10, M3 Pro, served from the working tree, heavy lock held)
 
 * **Wheeled-base bench** (in process; a 12 × 8 m house of six 4 × 4 m rooms joined by five
@@ -1951,7 +2058,8 @@ depth image), 8.5 (no prior, monocular: the client measured 5.8–11.2 s camera-
 with priors); commit and derivation 0.01 per keyframe of the committed version; locate 2.0 per
 frame and grid read 0.5 (the
 targets: measured values replace them as soon as the service has run them); frame analysis 1.5
-and objects read 0.1 are placeholders until their groups measure them. Each kind
+per frame (measured 1.3–1.7 s, *Frame analysis*); objects read 0.1 is a placeholder until its
+group measures it. Each kind
 keeps its last 50 measurements in `<data>/oms/timings.json`; a job records its frames' mean.
 A prediction adds up a job's phases, each measured as run (`Timings.predict_phases`):
 `job_overhead` (per job: clone, save, commit) + `checks_per_frame` × frames sent +
@@ -2845,7 +2953,9 @@ import-linter contracts in `pyproject.toml` and `tests/unit/test_ownership.py` e
 * `service` owns the HTTP layer (`server.sh`): routes, validation, jobs, versions, anchoring and
   per-input status. Nothing imports it; it reaches the models only through the mapping,
   reconstruction and segmentation APIs, and the inference server through its client and lock.
-* `mapping` owns registration, fusion, objects, the store and the bird's-eye renderer. It reaches
+* `mapping` owns registration, fusion, objects, the store, the bird's-eye renderer and what a
+  frame analysis computes of one frame (`mapping.analysis`: its objects, points, range scan
+  and monocular scale; `service.analyse` decodes the request and builds the body). It reaches
   the inference server only through `reconstruction` and `segmentation`. The update's standpoint
   registration and rotation hard limit (`mapping.standpoint`: `stored_views`, `standpoints`,
   `join_standpoint`, `rotation_check`, `views_inconsistent`) and its object fusion
@@ -2865,7 +2975,8 @@ import-linter contracts in `pyproject.toml` and `tests/unit/test_ownership.py` e
 ## Display colours
 
 An object's `color` is a display colour, a pure function of its id (`segmentation/colors.py`),
-not its appearance (that is `mean_rgb`). Mid-grey `#808080` is reserved for unsegmented points.
+not its appearance (that is `mean_rgb`). A frame analysis' local id (1 000 000 + n) takes the
+colour of id n + 1 (`mapping.analysis.color_of`). Mid-grey `#808080` is reserved for unsegmented points.
 Every colour has a WCAG contrast of at least 3:1 against `#1d2027`, OKLab lightness at most 0.93,
 chroma at least 0.08 and a distance of at least 0.11 from mid-grey.
 
