@@ -2627,7 +2627,7 @@
         },
         "map": {
           "type": "string",
-          "description": "With camera_id: take the camera, and the scale, from this map."
+          "description": "With camera_id: take the camera from this map; with T_map_cam also the map frame, its scale and its object ids."
         },
         "T_map_cam": {
           "$ref": "#/$defs/Mat4",
@@ -2793,7 +2793,7 @@
         },
         "depth": {
           "$ref": "#/$defs/Binary",
-          "description": "uint16 depth, metres = value x depth_scale_m (0.001); 0 = no value."
+          "description": "uint16 depth at the image's size (rows x columns), metres = value x 0.001; 0 = no value."
         },
         "matches": {
           "type": "array",

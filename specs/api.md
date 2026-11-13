@@ -469,7 +469,8 @@ The versions read, revert and `--keep-versions` are O2.
     * `obstacle`: the nearest surface within `z_band_m`;
     * `floor_end`: the farthest floor seen, when no obstacle is;
     * `unseen`.
-  * `depth` — a 16-bit PNG part, as the input depth.
+  * `depth` — the frame's depth at the image's size, as a base64 `uint16` array (rows ×
+    columns), metres = value × 0.001, 0 = no value: the input depth when given, else the model's.
 * **Labels** (oms/2.7). `labels` are text prompts with the rules of an update's labels (§3): at
   most 64 entries, each 1–64 characters after trimming, compared as map.md §5 defines; an invalid
   label refuses the request with `invalid_request` (`details.field: "labels"`). Detection prompts
@@ -491,7 +492,8 @@ The versions read, revert and `--keep-versions` are O2.
   one map object's points out of a close view. A detection that matches no map object, and every
   detection when there is no map or no pose, gets a local id from 1 000 000 up. `object_id` 0
   means no object.
-* **Range-scan bearings.**
+* **Range-scan bearings.** The scan lists the whole circle, bearings k × `bearing_step_deg` in
+  (−180°, 180°]; a bearing outside the camera's view is `unseen`.
   * With `T_map_cam`: `bearing_deg` is a direction in the output frame, counter-clockwise from
     its +x, and `range_m` is measured from the camera's position projected on the floor.
   * Without it: `bearing_deg` is counter-clockwise from the camera's viewing direction.
@@ -499,13 +501,14 @@ The versions read, revert and `--keep-versions` are O2.
   * With `map` and `T_map_cam`: every output is in the map frame and scale-corrected to the map;
     `frame` is `map`.
   * With `T_map_cam` and no `map` (oms/2.7): every output is in the frame `T_map_cam` is given
-    in, taken as gravity-aligned with z up, at the scale of the frame's depth (monocular without
-    it); `frame` is `client`. No detection gets a map id.
+    in, taken as gravity-aligned with z up, at the scale given by **Scale** below; `frame` is
+    `client`. No detection gets a map id.
   * Without `T_map_cam`: outputs are in a gravity-aligned camera frame: the camera at the
     origin, z up, yaw 0 along the viewing direction; `frame` is `gravity_camera`.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and
   `T_map_cam`, else `depth` with the frame's depth, else `camera_height` when the camera gives
-  its height, else `monocular`.
+  its height, else `monocular`. Without `T_map_cam`, a `map` gives the camera only, never the
+  scale.
 
 ## 8. Expected durations
 
