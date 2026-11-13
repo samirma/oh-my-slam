@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.7"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.9"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -294,7 +294,8 @@ error code `invalid_request` (§9).
   with what the frames' own depth measures: `{median_ratio, spread, frames}`, over the job's
   frames that carry a sent height (`height_above_floor_m`, per frame or per camera) and show a
   measurable floor plane of their own (map.md §2), whether or not the floor check judged them:
-  the job's registered, provisional and `kept_at_prior` frames (on the older mapper engine, its
+  the frames the job added, registered, provisional or `kept_at_prior` (not stored keyframes
+  it re-registers) (on the older mapper engine, its
   registered frames, its own aligned depth taken as the raw monocular depth, and null on its dry
   runs, which measure no per-frame depth).
   A frame's ratio is H / h_f: its sent height over its own floor height in its raw depth (the
