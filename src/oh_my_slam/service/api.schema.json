@@ -2659,8 +2659,9 @@
         },
         "bearing_step_deg": {
           "type": "number",
-          "exclusiveMinimum": 0,
-          "default": 1.0
+          "minimum": 0.1,
+          "default": 1.0,
+          "description": "At least 0.1 degree (at most 3600 beams)."
         },
         "voxel_m": {
           "type": "number",

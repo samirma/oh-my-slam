@@ -470,14 +470,15 @@ The versions read, revert and `--keep-versions` are O2.
     * `floor_end`: the farthest floor seen, when no obstacle is;
     * `unseen`.
   * `depth` — the frame's depth at the image's size, as a base64 `uint16` array (rows ×
-    columns), metres = value × 0.001, 0 = no value: the input depth when given, else the model's.
+    columns), metres = value × 0.001, 0 = no value (also for a non-finite value), 65 535 beyond
+    65.535 m: the input depth when given, else the model's.
 * **Labels** (oms/2.7). `labels` are text prompts with the rules of an update's labels (§3): at
   most 64 entries, each 1–64 characters after trimming, compared as map.md §5 defines; an invalid
   label refuses the request with `invalid_request` (`details.field: "labels"`). Detection prompts
   with the default vocabulary (`README.md`), the map's vocabulary when `map` is given, and
   `labels`, duplicates removed; with `labels_only: true` (default false) it prompts with `labels`
-  alone, and `labels_only` without `labels` is `invalid_request`. A detection's `label` is the
-  prompt it was detected as, in the client's form when it equals a client label.
+  alone, and `labels_only` without `labels`, or with an empty list, is `invalid_request`. A detection's `label` is the
+  prompt it was detected as, in the client's form when it equals one of the request's `labels`.
 * **Matches** (oms/2.7). When `labels` is given, the response carries `matches`, one entry per
   client label in request order: `{label, object_id, score}`, the returned object (score at
   least `min_score`) whose `label` equals that label with the highest `score`, ties broken by
@@ -491,9 +492,12 @@ The versions read, revert and `--keep-versions` are O2.
   object's persistent `id`, in `objects` and in the points' `object_id`. So the client can pick
   one map object's points out of a close view. A detection that matches no map object, and every
   detection when there is no map or no pose, gets a local id from 1 000 000 up. `object_id` 0
-  means no object.
+  means no object. Points carry non-zero ids only when the request also asks for objects
+  (`objects`, `masks` or `labels`): `points` alone runs no detector.
 * **Range-scan bearings.** The scan lists the whole circle, bearings k × `bearing_step_deg` in
-  (−180°, 180°]; a bearing outside the camera's view is `unseen`.
+  (−180°, 180°]; a bearing outside the camera's view is `unseen`. `bearing_step_deg` is at least
+  0.1° (at most 3 600 beams), and `z_band_m`'s top must be above its bottom; otherwise
+  `invalid_request`.
   * With `T_map_cam`: `bearing_deg` is a direction in the output frame, counter-clockwise from
     its +x, and `range_m` is measured from the camera's position projected on the floor.
   * Without it: `bearing_deg` is counter-clockwise from the camera's viewing direction.
@@ -505,9 +509,12 @@ The versions read, revert and `--keep-versions` are O2.
     `client`. No detection gets a map id.
   * Without `T_map_cam`: outputs are in a gravity-aligned camera frame: the camera at the
     origin, z up, yaw 0 along the viewing direction; `frame` is `gravity_camera`.
+* **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
+  the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and
-  `T_map_cam`, else `depth` with the frame's depth, else `camera_height` when the camera gives
-  its height, else `monocular`. Without `T_map_cam`, a `map` gives the camera only, never the
+  `T_map_cam` (a depth image is then taken in the map's metres), else `depth` with the frame's
+  depth, else `camera_height` when the camera gives its height and the frame shows a measurable
+  floor plane, else `monocular`. Without `T_map_cam`, a `map` gives the camera only, never the
   scale.
 
 ## 8. Expected durations

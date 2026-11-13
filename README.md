@@ -1877,7 +1877,8 @@ It is an update's own code on one frame, kept nowhere.
   are the beam's third point, so one or two flying pixels are no surface. Ranges are horizontal,
   from the camera, with no cap. `z_band_m` needs its top above its bottom.
 * **Depth output.** The schema's `Binary` (`uint16`, the image's rows × columns, 0 = no value)
-  in units of the camera's `depth_scale_m`, at the outputs' scale, on the pixels of the image
+  in millimetres (metres = value × 0.001, fixed, whatever the camera's `depth_scale_m`, with
+  which the input is read; a non-finite value is 0, beyond 65.535 m it saturates), at the outputs' scale, on the pixels of the image
   as sent (nearest); a monocular depth is resampled from its grid.
 * **Concurrency.** The request runs in the service's thread pool beside the job worker; its
   inference requests are interactive ones, served before a job's waiting fusion requests

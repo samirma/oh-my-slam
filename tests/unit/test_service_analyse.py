@@ -287,6 +287,13 @@ def test_a_pose_without_a_map_gives_the_client_s_frame(
     assert (len(an.backend.infers), len(an.backend.detected)) == (infers, detected)
     assert (doc["frame"], doc["scale_source"], doc["scale_sigma_rel"]) == ("client", "depth", 0.01)
     assert "objects" not in doc and "matches" not in doc
+    # the depth output is in millimetres whatever the camera's depth scale
+    for scale in (0.0005, 0.01):
+        buf = io.BytesIO()
+        Image.fromarray(np.rint(metres(dep) / scale).astype(np.uint16)).save(buf, format="PNG")
+        other = an.analyse({**req, "camera": {**CAM, "depth_scale_m": scale}, "outputs": ["depth"]},
+                           {"i": img, "d": buf.getvalue()})
+        assert np.abs(decode(other["depth"]) * 0.001 - metres(dep)).max() < scale / 2 + 0.001
     xyz, ids = decode(doc["points"]["xyz"]), decode(doc["points"]["object_id"])
     assert len(xyz) > 250_000 and not ids.any()  # every pixel that is a point, no object
     world = (xyz - S[:3, 3]) @ S[:3, :3]  # back in the scene's frame

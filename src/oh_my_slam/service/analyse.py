@@ -5,7 +5,8 @@
   (``cameras``), its ignored pixels (the camera's mask and its own, and what the camera's image
   does not reach of that pinhole) filled for the detector and giving nothing anywhere. Its
   depth is its depth image (read with the camera's ``depth_scale_m``) when it holds a value,
-  else the monocular model's (``Backend.infer``).
+  else the monocular model's (``Backend.infer``). The depth output is in millimetres
+  (``DEPTH_OUTPUT_UNIT_M``), whatever the camera's scale.
 * **The frame of the outputs** (``frame``): ``map`` with ``map`` and ``T_map_cam``; ``client``
   with ``T_map_cam`` alone, the pose's own frame; else ``gravity_camera``
   (``mapping.analysis.gravity_pose`` of the gravity the model sees).
@@ -87,6 +88,7 @@ DEFAULT_VOXEL_M = 0.02
 DEFAULT_MIN_SCORE = 0.5
 DEFAULT_CAMERA_HEIGHT_M = 1.0  # the range scan's floor below a camera that sees and gives none
 MAX_DEPTH_UNITS = 65535
+DEPTH_OUTPUT_UNIT_M = 0.001  # the depth output's unit, whatever the camera's depth_scale_m
 
 Array = NDArray[np.float64]
 
@@ -173,11 +175,7 @@ def work(store: Store, req: dict[str, Any], parts: dict[str, bytes]) -> Work:
     lo, hi = (float(v) for v in req.get("z_band_m", DEFAULT_Z_BAND))
     if not hi > lo:
         raise invalid("z_band_m", f"z_band_m [{lo}, {hi}]: its top must be above its bottom")
-    step = float(req.get("bearing_step_deg", DEFAULT_BEARING_STEP_DEG))
-    if step < analysis.MIN_BEARING_STEP_DEG:
-        raise invalid("bearing_step_deg", f"bearing_step_deg {step} gives more than "
-                      f"{round(360 / analysis.MIN_BEARING_STEP_DEG)} beams: ask for at least "
-                      f"{analysis.MIN_BEARING_STEP_DEG}")
+    step = float(req.get("bearing_step_deg", DEFAULT_BEARING_STEP_DEG))  # >= 0.1: the schema
     return Work(cam, image, rgb, depth, mask, T, frozenset(req["outputs"]), labels, only,
                 (lo, hi), step, float(req.get("voxel_m", DEFAULT_VOXEL_M)),
                 float(req.get("min_score", DEFAULT_MIN_SCORE)))
@@ -319,7 +317,8 @@ class Analyser:
                 out["range_scan"] = analysis.range_scan(
                     pts.xyz, T[:3, 3], level, floor_band_m(floor_sigma), w.z_band, w.step_deg)
         if "depth" in w.outputs:
-            units = np.rint(self._on_image(w, depth) / cam.depth_scale_m)
+            metres = np.nan_to_num(self._on_image(w, depth), nan=0.0, posinf=0.0, neginf=0.0)
+            units = np.rint(metres / DEPTH_OUTPUT_UNIT_M)
             out["depth"] = binary(np.clip(units, 0, MAX_DEPTH_UNITS).astype(np.uint16))
         if w.labels is not None:
             out["matches"] = matches(w.labels, out["objects"])
