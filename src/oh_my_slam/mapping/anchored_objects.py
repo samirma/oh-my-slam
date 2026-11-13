@@ -466,6 +466,9 @@ class Observation:
     mask: NDArray[np.bool_]
     sighting: Sighting
     alternatives: dict[str, float] = field(default_factory=dict)
+    # the flat pixels of the keyframe's depth grid its points were lifted from, in their order
+    # (frame analysis' point ids, ``mapping.analysis``)
+    pixels: NDArray[np.int64] = field(default_factory=lambda: np.zeros(0, np.int64))
 
     @property
     def centre(self) -> Array:
@@ -609,7 +612,8 @@ def observe(view: View, version: int, floor_z: float | None,
                      inst.detection.label, round(float(inst.detection.score), 4),
                      view.depth_rel, round(behind, 4), round(mask_range, 4))
         out.append(Observation(inst.detection.label, float(inst.detection.score), pts,
-                               inst.mask, s, dict(inst.detection.alternatives)))
+                               inst.mask, s, dict(inst.detection.alternatives),
+                               np.asarray(inst.lifted.pixels, np.int64)))
     return out
 
 
@@ -1426,6 +1430,19 @@ def _on_grid(a: NDArray[Any], shape: tuple[int, int], interp: int) -> NDArray[An
     return cv2.resize(a, (shape[1], shape[0]), interpolation=interp)
 
 
+def regrid(dets: list[Detection], shape: tuple[int, int]) -> list[Detection]:
+    """Detections with their masks and boxes on a depth grid of ``shape`` (rows, columns): a
+    keyframe's, or an analysed frame's (``mapping.analysis``)."""
+    out = []
+    for d in dets:
+        m = _on_grid(d.mask.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
+        sx, sy = shape[1] / d.mask.shape[1], shape[0] / d.mask.shape[0]
+        b = d.box
+        out.append(Detection(d.label, d.score, d.source, m,
+                             (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
+    return out
+
+
 def fuse_objects(am: AnchoredMap,
                  frames: list[tuple[Placement, NDArray[np.bool_] | None, Path | None,
                                     Future[list[Detection]]]],
@@ -1460,13 +1477,7 @@ def fuse_objects(am: AnchoredMap,
     for kf, grid, own_ignore, path, fut in todo:
         assert kf.rgb is not None and kf.K_grid is not None
         shape = grid.shape
-        dets = []
-        for d in fut.result():
-            m = _on_grid(d.mask.astype(np.uint8), shape, cv2.INTER_NEAREST) > 0
-            sx, sy = shape[1] / d.mask.shape[1], shape[0] / d.mask.shape[0]
-            b = d.box
-            dets.append(Detection(d.label, d.score, d.source, m,
-                                  (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)))
+        dets = regrid(fut.result(), shape)
         # the union of its camera's and its own mask (map.md §2 "Ignored pixels"), kept with
         # the keyframe: a re-registered stored keyframe's too
         ignore = on_grid(own_ignore if own_ignore is not None else am.ignore_of(kf.id), shape)
