@@ -361,6 +361,13 @@ class Box:
                    yaw_deg(math.degrees(math.atan2(float(ax[1]), float(ax[0])))))
 
 
+def fitted_box(points: Array, label: str, floor_z: float | None) -> Box:
+    """The upright box of an object's points (map frame, z up) under ``label``
+    (``segmentation.api.fit_object_obb``: a floor-standing class grounded on the floor
+    ``floor_z``): a map object's, and an analysed frame's (``mapping.analysis``)."""
+    return Box.of(fit_object_obb(points, label, UP, floor_z))
+
+
 @dataclass
 class MapObject:
     id: int
@@ -1087,7 +1094,7 @@ class ObjectMap:
         tol = max(AGREE_MIN_M, AGREE_REL * float(np.median(dev)))
         agree = [i for i, d in zip(idx, dev, strict=True) if d <= tol]
         pts = o.points[np.isin(o.source, agree)]
-        o.box = Box.of(fit_object_obb(pts, o.label, UP, floor_z))
+        o.box = fitted_box(pts, o.label, floor_z)
 
     def carve(self, struck: list[Struck], xyz: Array) -> NDArray[np.bool_]:
         """The cloud points (``xyz``, map frame) to drop: inside a struck object's box (grown by

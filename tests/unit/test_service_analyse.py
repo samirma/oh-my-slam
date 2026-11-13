@@ -754,8 +754,8 @@ def test_known_objects_and_local_colours() -> None:
     assert np.array_equal(o.points, xyz[[1, 3, 4]]) and o.box.yaw_deg == 30.0
     many = {"xyz": np.zeros((5000, 3), np.float32), "object_id": np.full(5000, 4, np.uint32)}
     assert len(analysis.known_objects([rec], many)[0].points) == analysis.KNOWN_POINTS
-    assert analysis.color_of(4) == color_for_id(4)
-    assert analysis.color_of(1_000_002) == color_for_id(3)
+    assert analyse.color_of(4) == color_for_id(4)
+    assert analyse.color_of(1_000_002) == color_for_id(3)
 
 
 def test_objects_of_a_view_are_boxed_filtered_and_matched() -> None:

@@ -2976,7 +2976,7 @@ import-linter contracts in `pyproject.toml` and `tests/unit/test_ownership.py` e
 
 An object's `color` is a display colour, a pure function of its id (`segmentation/colors.py`),
 not its appearance (that is `mean_rgb`). A frame analysis' local id (1 000 000 + n) takes the
-colour of id n + 1 (`mapping.analysis.color_of`). Mid-grey `#808080` is reserved for unsegmented points.
+colour of id n + 1 (`service.analyse.color_of`). Mid-grey `#808080` is reserved for unsegmented points.
 Every colour has a WCAG contrast of at least 3:1 against `#1d2027`, OKLab lightness at most 0.93,
 chroma at least 0.08 and a distance of at least 0.11 from mid-grey.
 

@@ -8,7 +8,7 @@ does with a keyframe, on one frame and kept nowhere:
 * **Objects** (``objects``): the view's detections lifted and filtered as a keyframe's
   (``anchored_objects.observe``: exclusive masks, no support fringe, no floor named as an object,
   no opening, nothing on the camera, no background), those scoring at least ``min_score`` boxed
-  as a map object's sightings are (``segmentation.api.fit_object_obb``; a fragment under
+  as a map object's sightings are (``anchored_objects.fitted_box``; a fragment under
   ``MIN_OBJECT_M`` and a door that is no leaf are no objects, ``anchored_objects.listed``). Each
   takes the id of the map object it matches (``anchored_objects.match`` against
   ``known_objects``), else a local id from ``LOCAL_ID_START``, in the detections' order. Its
@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.geometry import voxel_downsample_indices
+from oh_my_slam.core.geometry import project, voxel_downsample_indices
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping.anchored import (
     ALIGN_RANGE,
@@ -40,18 +40,18 @@ from oh_my_slam.mapping.anchored import (
 )
 from oh_my_slam.mapping.anchored_objects import (
     MIN_OBJECT_M,
-    UP,
     Box,
     MapObject,
     View,
     _thin,
     extent_seen,
+    fitted_box,
     match,
     observe,
     sigma_centre,
 )
 from oh_my_slam.reconstruction.pointcloud import pixel_mask, pixel_points
-from oh_my_slam.segmentation.api import DOOR_LABEL, color_for_id, door_leaf, fit_object_obb
+from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 
 Array = NDArray[np.float64]
 
@@ -111,11 +111,10 @@ def map_factor(depth: NDArray[np.float32], K: Intrinsics, T: Array, cloud_xyz: N
     outside ``anchored.ALIGN_RANGE`` (the depth and the pose disagree)."""
     h, w = depth.shape
     pc = (np.asarray(cloud_xyz, np.float64).reshape(-1, 3) - T[:3, 3]) @ T[:3, :3]
-    pc = pc[pc[:, 2] > MIN_DEPTH_M]
-    u = np.rint(K.fx * pc[:, 0] / pc[:, 2] + K.cx).astype(np.int64)
-    v = np.rint(K.fy * pc[:, 1] / pc[:, 2] + K.cy).astype(np.int64)
+    uv, z = project(pc[pc[:, 2] > MIN_DEPTH_M], K.K())
+    u, v = np.rint(uv[:, 0]).astype(np.int64), np.rint(uv[:, 1]).astype(np.int64)
     inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    u, v, z = u[inside], v[inside], pc[inside, 2]
+    u, v, z = u[inside], v[inside], z[inside]
     s = RENDER_SIDE / max(w, h)
     cols = math.ceil(w * s)
     cell = (v * s).astype(np.int64) * cols + (u * s).astype(np.int64)
@@ -183,7 +182,7 @@ def objects(view: View, floor_z: float | None, floor_sigma: float, min_score: fl
     for ob in observe(view, 0, floor_z, floor_sigma):
         if ob.score < min_score:
             continue
-        box = Box.of(fit_object_obb(ob.points, ob.label, UP, floor_z))
+        box = fitted_box(ob.points, ob.label, floor_z)
         if float(np.max(box.size)) < MIN_OBJECT_M or (
                 ob.label == DOOR_LABEL and not door_leaf(box.size)):
             continue
@@ -203,15 +202,6 @@ def objects(view: View, floor_z: float | None, floor_sigma: float, min_score: fl
                         extent_seen(one, support=False), [round(c) for c in ob.sighting.rgb],
                         mask, ob.pixels))
     return out
-
-
-def color_of(object_id: int) -> tuple[int, int, int]:
-    """An analysis object's display colour, a pure function of its id: a map object's own
-    (``segmentation.api.color_for_id``); a local id's is the colour of its rank among the local
-    ids (``LOCAL_ID_START`` takes id 1's: the palette is built id by id, so the millionth colour
-    is never asked)."""
-    return color_for_id(object_id - LOCAL_ID_START + 1 if object_id >= LOCAL_ID_START
-                        else object_id)
 
 
 # -- points --------------------------------------------------------------------------------------

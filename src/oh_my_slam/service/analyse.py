@@ -57,7 +57,12 @@ from oh_my_slam.mapping.anchored_objects import (
     regrid,
     unignored,
 )
-from oh_my_slam.segmentation.api import normalize_label, prompt_of, request_floor
+from oh_my_slam.segmentation.api import (
+    color_for_id,
+    normalize_label,
+    prompt_of,
+    request_floor,
+)
 from oh_my_slam.segmentation.detect import order
 from oh_my_slam.service.backend import Backend
 from oh_my_slam.service.cameras import (
@@ -73,6 +78,7 @@ from oh_my_slam.service.errors import invalid
 from oh_my_slam.service.nav import DEFAULT_Z_BAND, binary
 from oh_my_slam.service.prior_first import detection_grid
 from oh_my_slam.service.store import Store
+from oh_my_slam.service.update import JPEG_QUALITY
 
 log = get_logger("oh_my_slam.service.analyse")
 
@@ -80,7 +86,6 @@ DEFAULT_BEARING_STEP_DEG = 1.0
 DEFAULT_VOXEL_M = 0.02
 DEFAULT_MIN_SCORE = 0.5
 DEFAULT_CAMERA_HEIGHT_M = 1.0  # the range scan's floor below a camera that sees and gives none
-JPEG_QUALITY = 95  # as an update's frames (``update.JPEG_QUALITY``)
 MAX_DEPTH_UNITS = 65535
 
 Array = NDArray[np.float64]
@@ -197,6 +202,15 @@ def matches(labels: list[str], objects: list[dict[str, Any]]) -> list[dict[str, 
         out.append({"label": lab, "object_id": None if best is None else best["id"],
                     "score": None if best is None else best["score"]})
     return out
+
+
+def color_of(object_id: int) -> tuple[int, int, int]:
+    """An analysis object's display colour, a pure function of its id: a map object's own
+    (``segmentation.api.color_for_id``); a local id's is the colour of its rank among the local
+    ids (``LOCAL_ID_START`` takes id 1's: the palette is built id by id, so the millionth colour
+    is never asked)."""
+    local = object_id - analysis.LOCAL_ID_START
+    return color_for_id(local + 1 if local >= 0 else object_id)
 
 
 def _round(v: Any, nd: int = 4) -> list[float]:
@@ -373,7 +387,7 @@ class Analyser:
                 "centre_m": _round(s.box.centre), "size_m": _round(s.box.size),
                 "yaw_deg": s.box.yaw_deg, "sigma_centre_m": round(s.sigma_centre_m, 4),
                 "extent_seen": s.extent_seen, "mean_rgb": s.mean_rgb,
-                "color": list(analysis.color_of(s.id)),
+                "color": list(color_of(s.id)),
                 "bbox_px": [float(cols[0]), float(rows[0]), float(cols[-1] + 1),
                             float(rows[-1] + 1)],
                 "centre_cam_m": _round((s.box.centre - T[:3, 3]) @ T[:3, :3])}
