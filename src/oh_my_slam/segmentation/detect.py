@@ -280,6 +280,27 @@ def prompts(labels: Sequence[str] = ()) -> list[str]:
     return [*default_prompts(), *extra_labels(labels)]
 
 
+def prompt_of(label: str) -> str:
+    """What the detector is shown for a label: the prompt of the default label it equals
+    (``normalize_label``), else the label itself, trimmed."""
+    return _vocabulary().get(normalize_label(label), label.strip())
+
+
+def own_prompts(labels: Sequence[str]) -> list[str]:
+    """What the detector is shown for ``labels`` alone, without the default vocabulary (frame
+    analysis with ``labels_only``, api.md §7): each label's prompt (``prompt_of``), those equal
+    to one before it (``normalize_label``) left out."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for lab in labels:
+        prompt = prompt_of(lab)
+        key = normalize_label(prompt)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(prompt)
+    return out
+
+
 @cache
 def _labels_of_prompts() -> dict[str, str]:
     return {prompt: label for label, prompt in _vocabulary().items()}
@@ -449,44 +470,45 @@ def detect(
     client: InferenceClient | None = None,
     min_area_px: int = MIN_AREA_PX,
     labels: Sequence[str] = (),
+    defaults: bool = True,
 ) -> list[Detection]:
     """Detections scoring at least ``min_score``, with masks and boxes on the ``max_side`` grid
     (the reconstruction's grid of the image; ``min_area_px`` counts its pixels). The detector's
     input does not depend on ``max_side`` (``DETECT_SIDE``, ``COARSE_SIDE``), so every caller
     gets the same detections of an image. The server is asked for everything above ``floor``
     (between 0 and ``min_score``), so the request — and the detections it returns — do not depend
-    on ``min_score``. ``labels``: the map's vocabulary beyond the defaults (``prompts``)."""
+    on ``min_score``. ``labels``: the map's vocabulary beyond the defaults (``prompts``);
+    without ``defaults`` the detector is shown ``labels`` alone (``own_prompts``)."""
     if not 0.0 <= floor <= max(min_score, 0.0):
         raise ValueError(f"the detection floor {floor} must lie between 0 and min_score "
                          f"{min_score}")
     with timing.part("segmentation"):
         return _detect(image_path, min_score, floor, max_side, client or connect(), min_area_px,
-                       labels)
+                       prompts(labels) if defaults else own_prompts(labels))
 
 
 def _detect(image_path: Path, min_score: float, floor: float, max_side: int,
-            client: InferenceClient, min_area_px: int, labels: Sequence[str] = ()
-            ) -> list[Detection]:
+            client: InferenceClient, min_area_px: int, shown: list[str]) -> list[Detection]:
     w, h = upright_size(Path(image_path))
     grid = size_at_max_side(w, h, max_side)
     fine = _detect_pass(image_path, DETECT_SIDE, min_score, floor, grid, client, min_area_px,
-                        labels)
+                        shown)
     if max(w, h) <= COARSE_SIDE:
         return order(dedupe(fine))
     large = max(min_area_px, COARSE_MIN_SHARE * grid[0] * grid[1])
-    coarse = _detect_pass(image_path, COARSE_SIDE, min_score, floor, grid, client, large, labels)
+    coarse = _detect_pass(image_path, COARSE_SIDE, min_score, floor, grid, client, large, shown)
     return order(dedupe(fuse_passes([fine, coarse])))
 
 
 def _detect_pass(image_path: Path, side: int, min_score: float, floor: float,
                  grid: tuple[int, int], client: InferenceClient, min_area_px: float,
-                 labels: Sequence[str] = ()) -> list[Detection]:
-    """One pass: the image at ``side`` px shown to the detector, masks resampled onto ``grid``
-    (width, height)."""
+                 shown: list[str]) -> list[Detection]:
+    """One pass: the image at ``side`` px shown to the detector with the prompts ``shown``, masks
+    resampled onto ``grid`` (width, height)."""
     res = client.segment_image(
         p.SegmentRequest(
             image_path=str(Path(image_path).resolve()),
-            labels=prompts(labels),
+            labels=shown,
             max_side=side,
             imgsz=DETECT_SIDE,
             # the model keeps scores strictly above its threshold, which must not be negative

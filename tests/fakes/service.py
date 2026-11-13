@@ -125,6 +125,13 @@ class FakeBackend:
     looked: list[tuple[str, list[Any]]] = field(default_factory=list)
     closer: Any = lambda image, regions, dets: dets
     detect_error: bool = False
+    # frame analysis: each detect call's score floor and whether the defaults were prompted; the
+    # up direction ``infer`` answers with gravity; the detections and the monocular depth of an
+    # image whose bytes are unknown (a frame the service encoded again)
+    asked: list[tuple[float, bool]] = field(default_factory=list)
+    up: Any = (0.0, -1.0, 0.0)
+    other_detections: list[Any] = field(default_factory=list)
+    other_depth: np.ndarray | None = None
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -155,10 +162,12 @@ class FakeBackend:
         if self.infer_error:
             raise ApiError("inference_unavailable", "down (test)")
         sha = hashlib.sha256(image.read_bytes()).hexdigest()
-        d = self.mono_depth.get(sha)
+        d = self.mono_depth.get(sha, self.other_depth)
         depth = (np.full((K.height, K.width), 2.0) if d is None else d * self.mono_scale)
+        if depth.shape != (K.height, K.width):  # a depth grid smaller than the image
+            K = K.resized(depth.shape[1], depth.shape[0])
         return Mono(depth.astype(np.float32), K, self.descriptors.get(sha),
-                    np.array([0.0, -1.0, 0.0]) if gravity else None)
+                    np.asarray(self.up, np.float64) if gravity else None)
 
     def mv_add(self, image: bytes, T: np.ndarray) -> None:
         sha = hashlib.sha256(image).hexdigest()
@@ -193,16 +202,21 @@ class FakeBackend:
             out.append(MvView(rel, (depth * self.mv_scale).astype(np.float32), K.K()))
         return out
 
-    def detect(self, image: Path, grid: tuple[int, int], labels: Any = ()) -> list[Any]:
+    def detect(self, image: Path, grid: tuple[int, int], labels: Any = (),
+               min_score: float | None = None, defaults: bool = True) -> list[Any]:
         from oh_my_slam.segmentation.api import Detection
         from oh_my_slam.service.errors import ApiError
 
         self.detected.append((image.name, grid))
         self.prompted.append(list(labels))
+        self.asked.append((min_score or 0.0, defaults))
         if self.detect_error:
             raise ApiError("inference_unavailable", "down (test)")
         out = []
-        for d in self.detections.get(hashlib.sha256(image.read_bytes()).hexdigest(), []):
+        for d in self.detections.get(hashlib.sha256(image.read_bytes()).hexdigest(),
+                                     self.other_detections):
+            if min_score is not None and d.score < min_score:
+                continue
             m = cv2.resize(d.mask.astype(np.uint8), grid, interpolation=cv2.INTER_NEAREST) > 0
             sx, sy = grid[0] / d.mask.shape[1], grid[1] / d.mask.shape[0]
             b = d.box

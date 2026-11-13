@@ -128,10 +128,12 @@ class Backend(Protocol):
         """MapAnything over ``images`` with their intrinsics and the given camera-to-world
         poses; ``ApiError`` ``out_of_memory`` when the call does not fit."""
 
-    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = ()
-               ) -> list[Detection]:
-        """The detections of an image, masks on ``grid`` (width, height); ``labels``: the map's
-        vocabulary, prompted with the defaults (``segmentation.detect.prompts``)."""
+    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = (),
+               min_score: float = MAP_MIN_SCORE, defaults: bool = True) -> list[Detection]:
+        """The detections of an image scoring at least ``min_score``, masks on ``grid`` (width,
+        height); ``labels``: the map's vocabulary, prompted with the defaults
+        (``segmentation.detect.prompts``), or alone without ``defaults`` (frame analysis with
+        ``labels_only``)."""
 
     def look_closer(self, image: Path, regions: list[Region], dets: list[Detection],
                     grid: tuple[int, int], labels: Sequence[str] = ()) -> list[Detection]:
@@ -300,16 +302,16 @@ class MapperBackend:
         return [MvView(r.pose.matrix(), np.load(str(r.depth_path)).astype(np.float32), r.K)
                 for r in res]
 
-    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = ()
-               ) -> list[Detection]:
+    def detect(self, image: Path, grid: tuple[int, int], labels: Sequence[str] = (),
+               min_score: float = MAP_MIN_SCORE, defaults: bool = True) -> list[Detection]:
         from oh_my_slam.reconstruction.api import connect_server
         from oh_my_slam.segmentation.api import detect_on_grid
 
         try:
             client = connect_server().clone(self.priority)
             try:
-                return detect_on_grid(image, grid, client, min_score=MAP_MIN_SCORE,
-                                      labels=labels)
+                return detect_on_grid(image, grid, client, min_score=min_score,
+                                      labels=labels, defaults=defaults)
             finally:
                 client.close()
         except OhMySlamError as exc:

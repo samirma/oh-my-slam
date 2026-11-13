@@ -475,6 +475,10 @@ def test_detect_asks_the_detector_on_a_grid(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(seg, "detect_on_grid", detect_on_grid)
     assert be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48)) == ["d"]
     assert seen["grid"] == (64, 48) and seen["min_score"] == be.MAP_MIN_SCORE
+    assert seen["defaults"] is True and seen["labels"] == ()
+    # frame analysis: its own threshold, and the labels alone with labels_only (api.md §7)
+    assert be.MapperBackend().detect(tmp_path / "a.jpg", (64, 48), ["cup"], 0.5, False) == ["d"]
+    assert (seen["labels"], seen["min_score"], seen["defaults"]) == (["cup"], 0.5, False)
 
     def boom() -> Any:
         raise ServerUnavailableError("down")

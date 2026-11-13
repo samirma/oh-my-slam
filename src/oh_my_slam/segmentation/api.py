@@ -58,7 +58,6 @@ from oh_my_slam.segmentation.detect import (
     mask_iou,
     order,
     priority,
-    request_floor,
 )
 from oh_my_slam.segmentation.detect import DOOR_LABEL as DOOR_LABEL
 from oh_my_slam.segmentation.detect import PASSAGE_LABELS as PASSAGE_LABELS
@@ -66,6 +65,9 @@ from oh_my_slam.segmentation.detect import Detection as Detection
 from oh_my_slam.segmentation.detect import compatible as compatible
 from oh_my_slam.segmentation.detect import door_leaf as door_leaf
 from oh_my_slam.segmentation.detect import label_fit as label_fit
+from oh_my_slam.segmentation.detect import normalize_label as normalize_label
+from oh_my_slam.segmentation.detect import prompt_of as prompt_of
+from oh_my_slam.segmentation.detect import request_floor as request_floor
 from oh_my_slam.segmentation.detect import split_surface as split_surface
 from oh_my_slam.segmentation.detect import surface_label as surface_label
 from oh_my_slam.segmentation.lift import (
@@ -320,14 +322,16 @@ def lift_on_grid(dets: list[Detection], depth: NDArray[Any], K: Intrinsics,
 
 
 def detect_on_grid(image_path: Path, grid: tuple[int, int], client: InferenceClient | None = None,
-                   min_score: float = DEFAULT_MIN_SCORE, labels: Sequence[str] = ()
-                   ) -> list[Detection]:
+                   min_score: float = DEFAULT_MIN_SCORE, labels: Sequence[str] = (),
+                   defaults: bool = True) -> list[Detection]:
     """Detections of an image with masks and boxes on ``grid`` (width, height): a keyframe's
-    depth grid, whatever its size (the detector's input does not depend on it)."""
+    depth grid, whatever its size (the detector's input does not depend on it). Without
+    ``defaults`` the detector is shown ``labels`` alone (``detect.own_prompts``: frame analysis
+    with ``labels_only``)."""
     from oh_my_slam.segmentation.detect import resample_mask
 
     dets = detect(image_path, min_score=min_score, floor=min_score, max_side=max(grid),
-                  client=client, labels=labels)
+                  client=client, labels=labels, defaults=defaults)
     out = []
     for d in dets:
         h, w = d.mask.shape
