@@ -318,6 +318,7 @@ def test_targets_file_and_rules(tmp_path: Path) -> None:
         "features.region_set", "grid.band_occupied", "grid.floor_height", "reads.latency",
         "objects.support_height", "objects.relations", "objects.centre_error",
         "objects.label_agreement", "objects.id_stability", "analysis.range_scan_error",
+        "analysis.label_match",
         "interactive.latency_under_load", "locate.latency_idle", "update.later_wins"}
     assert set(t.metrics) == appendix  # exactly the appendix ids, no gate parameters
     assert t.param("passages.geometry", "centre_tolerance_m", 0) == 0.10

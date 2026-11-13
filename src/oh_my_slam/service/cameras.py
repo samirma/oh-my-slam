@@ -12,6 +12,7 @@ resampled with it (nearest neighbour). Ignored pixels are filled from their surr
 
 from __future__ import annotations
 
+import functools
 import io
 import math
 from dataclasses import dataclass
@@ -84,6 +85,36 @@ class Camera:
                                       borderMode=cv2.BORDER_REPLICATE if not nearest
                                       else cv2.BORDER_CONSTANT, borderValue=0)
         return out
+
+    def unrectify(self, img: NDArray[Any]) -> NDArray[Any]:
+        """``img`` (the canonical pinhole's size) as this camera's own pixels see it, the
+        inverse of ``rectify``: each pixel takes the canonical pixel nearest its ray (nearest
+        neighbour: masks, depth), 0 where the canonical image does not reach."""
+        if self.is_canonical:
+            return img
+        m1, m2 = _inverse_maps(self)
+        out: NDArray[Any] = cv2.remap(img, m1, m2, cv2.INTER_NEAREST,
+                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return out
+
+    def beyond(self) -> NDArray[np.bool_] | None:
+        """The pixels of the canonical pinhole that this camera's image does not reach (filled
+        from its border by ``rectify``); None when it reaches them all."""
+        seen = self.rectify(np.full((self.height, self.width), 255, np.uint8), nearest=True) > 0
+        return None if seen.all() else ~seen
+
+
+@functools.lru_cache(maxsize=8)
+def _inverse_maps(cam: Camera) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Per pixel of a camera, the canonical pixel its ray falls on (``Camera.unrectify``)."""
+    u, v = np.meshgrid(np.arange(cam.width, dtype=np.float32),
+                       np.arange(cam.height, dtype=np.float32))
+    K = np.array([[cam.fx, 0.0, cam.cx], [0.0, cam.fy, cam.cy], [0.0, 0.0, 1.0]])
+    dist = np.array(cam.distortion or (0.0, 0.0, 0.0, 0.0), np.float64)
+    got = cv2.undistortPoints(np.stack([u.ravel(), v.ravel()], 1).reshape(-1, 1, 2), K, dist,
+                              P=cam.canonical().K()).reshape(cam.height, cam.width, 2)
+    return (np.ascontiguousarray(got[..., 0], np.float32),
+            np.ascontiguousarray(got[..., 1], np.float32))
 
 
 def same_camera(a: dict[str, Any], b: dict[str, Any]) -> bool:

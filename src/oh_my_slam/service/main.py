@@ -149,6 +149,7 @@ def _log_to(path: Path) -> None:
 def serve(store: Store, host: str, port: int) -> int:
     import uvicorn
 
+    from oh_my_slam.service.analyse import Analyser
     from oh_my_slam.service.app import Service, create_app
     from oh_my_slam.service.backend import MapperBackend
     from oh_my_slam.service.derived import Derived
@@ -179,7 +180,8 @@ def serve(store: Store, host: str, port: int) -> int:
         derived = Derived(store, backend.read)
         derived.start()
         service = Service(store, jobs, inference, backend.require_inference, timings=timings,
-                          version=git_version(), dry_run=updater.dry_run, derived=derived)
+                          version=git_version(), dry_run=updater.dry_run, derived=derived,
+                          analyser=Analyser(store, backend))
         app = create_app(service)
         bound = sock.getsockname()[1]
         url = f"http://{host}:{bound}/"
