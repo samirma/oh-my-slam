@@ -27,7 +27,7 @@ server.sh --status | --stop
     JSON body, and every other part is a file, referenced from the JSON by its part name.
   * All other requests are `application/json`.
 * **Responses.**
-  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.6"`), except
+  * Every JSON response carries `schema` (the schema version, e.g. `"oms/2.7"`), except
     `/api/openapi.json`, which is an OpenAPI document.
   * Every response carries per-stage timings in a `Server-Timing` header.
   * No information is carried only in headers.
@@ -452,11 +452,17 @@ The versions read, revert and `--keep-versions` are O2.
 ## 7. Frame analysis (O7)
 
 * **Request.** `POST /api/frames/analyse {image, camera | camera_id + map, T_map_cam?, depth?,
-  outputs[], z_band_m?, bearing_step_deg?}` analyses one frame and changes nothing.
+  ignore_mask?, outputs[], labels?, labels_only?, z_band_m?, bearing_step_deg?, voxel_m?,
+  min_score?}` analyses one frame and changes nothing. It is multipart, as an update: a JSON part
+  `request` and the file parts it names. The frame's depth is read with its camera's
+  `depth_scale_m`; with metric depth the outputs' scale is the depth's.
 * **Outputs.** `outputs` chooses any of:
-  * `objects` — [`AnalysisObject`]: as map.md §5, plus `bbox_px`, without the map-only fields
-    (`state`, `moved_from_m`, versions, `region`, `supported_by`, `inside_of`), which only
-    [`MapObject`] carries;
+  * `objects` — [`AnalysisObject`]: as map.md §5, plus `bbox_px` and `centre_cam_m`, without
+    the map-only fields (`state`, `moved_from_m`, versions, `region`, `supported_by`,
+    `inside_of`, `label_scores`, `detection_votes`), which only [`MapObject`] carries;
+  * `masks` (oms/2.7) — implies `objects`: each object also carries `mask`, its pixels in the
+    image (`{size: [height, width], counts}`, COCO run-length encoding, column-major, compressed
+    string form), ignored pixels removed;
   * `points` — the frame's 3-D points (`float32` xyz), their object ids (`uint32`, 0 = none) and
     `rgb` (`uint8`), each as a base64 array, thinned to the voxel size given;
   * `range_scan` — per bearing in the horizontal plane: `range_m` and `kind`:
@@ -464,19 +470,42 @@ The versions read, revert and `--keep-versions` are O2.
     * `floor_end`: the farthest floor seen, when no obstacle is;
     * `unseen`.
   * `depth` — a 16-bit PNG part, as the input depth.
+* **Labels** (oms/2.7). `labels` are text prompts with the rules of an update's labels (§3): at
+  most 64 entries, each 1–64 characters after trimming, compared as map.md §5 defines; an invalid
+  label refuses the request with `invalid_request` (`details.field: "labels"`). Detection prompts
+  with the default vocabulary (`README.md`), the map's vocabulary when `map` is given, and
+  `labels`, duplicates removed; with `labels_only: true` (default false) it prompts with `labels`
+  alone, and `labels_only` without `labels` is `invalid_request`. A detection's `label` is the
+  prompt it was detected as, in the client's form when it equals a client label.
+* **Matches** (oms/2.7). When `labels` is given, the response carries `matches`, one entry per
+  client label in request order: `{label, object_id, score}`, the returned object (score at
+  least `min_score`) whose `label` equals that label with the highest `score`, ties broken by
+  the lower `id`; `object_id` and `score` are null when no returned object has that label.
+  `matches` refers to `objects`, so a request with `labels` returns `objects` even when
+  `outputs` does not name it.
+* **Camera-frame centre** (oms/2.7). Every [`AnalysisObject`] carries `centre_cam_m`, its box
+  centre in the camera's optical frame (x right, y down, z forward), in metres at the output's
+  scale, whatever the frame of the other outputs.
 * **Object ids.** With `map` and `T_map_cam`, a detection matched to a map object carries that
   object's persistent `id`, in `objects` and in the points' `object_id`. So the client can pick
   one map object's points out of a close view. A detection that matches no map object, and every
   detection when there is no map or no pose, gets a local id from 1 000 000 up. `object_id` 0
   means no object.
 * **Range-scan bearings.**
-  * With `T_map_cam`: `bearing_deg` is a direction in the map frame, counter-clockwise from map
-    +x, and `range_m` is measured from the camera's position projected on the floor.
+  * With `T_map_cam`: `bearing_deg` is a direction in the output frame, counter-clockwise from
+    its +x, and `range_m` is measured from the camera's position projected on the floor.
   * Without it: `bearing_deg` is counter-clockwise from the camera's viewing direction.
-* **Frame of the outputs.** With `T_map_cam`, every output is in the map frame and scale-corrected
-  to the map. Without it, outputs are in a gravity-aligned camera frame: the camera at the
-  origin, z up, yaw 0 along the viewing direction.
-* **Scale.** The response carries `scale_source` and `scale_sigma_rel`.
+* **Frame of the outputs.**
+  * With `map` and `T_map_cam`: every output is in the map frame and scale-corrected to the map;
+    `frame` is `map`.
+  * With `T_map_cam` and no `map` (oms/2.7): every output is in the frame `T_map_cam` is given
+    in, taken as gravity-aligned with z up, at the scale of the frame's depth (monocular without
+    it); `frame` is `client`. No detection gets a map id.
+  * Without `T_map_cam`: outputs are in a gravity-aligned camera frame: the camera at the
+    origin, z up, yaw 0 along the viewing direction; `frame` is `gravity_camera`.
+* **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and
+  `T_map_cam`, else `depth` with the frame's depth, else `camera_height` when the camera gives
+  its height, else `monocular`.
 
 ## 8. Expected durations
 

@@ -58,6 +58,7 @@ Each row is something the skill needs. Each row's test is in §11.
 | C11 | What the camera sees now, without changing the map: objects, points, and a range scan. | Frame analysis (api.md §7) |
 | C12 | Locate and frame analysis answered within seconds even while an update runs. | Inference lanes (inference.md) |
 | C13 | A map that shows what is there now: a later observation wins over an earlier one. | Update semantics (map.md §3) |
+| C14 | To find objects it names by text in what the camera sees now: the best match per name, with its 3-D centre (also in the camera's own frame), extent and image mask. | Frame analysis labels and matches (api.md §7) |
 
 ## 3. Frames and units
 
@@ -191,6 +192,13 @@ plane into a scale estimate (map.md §2). Such a keyframe stays a registration r
 pose, its features used without its depth: that depth lifts no later frame, in registration or in locate (no keypoint
 depth for metric lifting or alignment, no depth confirmation, no scale evidence), so a frame whose only depth
 references are such keyframes is one with no depth reference (map.md §2; api.md §6).
+
+**oms/2.7** is additive: frame analysis (api.md §7) takes the request's optional `labels` (text
+prompts, as an update's) and `labels_only`, the output `masks` (each object's image mask, COCO
+run-length encoded), and answers `matches` (the best object per client label, or none). Every
+analysis object also carries `centre_cam_m`, its centre in the camera's optical frame. A
+`T_map_cam` may be sent without a map: the outputs are then in the frame that pose is given in,
+at the scale of the frame's own depth.
 
 ## 8. Concurrency and latency
 

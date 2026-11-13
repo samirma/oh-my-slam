@@ -106,6 +106,7 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `objects.relations` | C10 | Share of `supported_by` / `inside_of` agreeing with the truth's relations |
 | `objects.centre_error`, `objects.label_agreement`, `objects.id_stability` | C10 | Object centre error, label agreement and id stability across updates |
 | `analysis.range_scan_error` | C11 | Range-scan error against the floor-plan walls within the band, relative to range |
+| `analysis.label_match` | C14 | Frames analysed with the truth labels of the objects in view as `labels`: share of labels whose `matches` entry names an object with `centre_m` within 0.10 m of that truth object's centre, and with `centre_cam_m` consistent with it through the frame's pose |
 | `interactive.latency_under_load` | C12 | Locate and analyse latency while an update runs: ratio to idle latency, and absolute |
 | `locate.latency_idle` | C12 | Locate while idle, per frame of the request |
 | `update.later_wins` | C13 | `office_sequence/`: the cup is `struck`, and the other objects keep their ids and boxes |
@@ -188,6 +189,7 @@ these ids.
 | `objects.relations` | ≥ 0.9 |
 | `objects.centre_error`, `objects.label_agreement`, `objects.id_stability` | The round-4 values already in `targets.json` |
 | `analysis.range_scan_error` | ≤ 5 % of range |
+| `analysis.label_match` | ≥ 0.8 |
 | `interactive.latency_under_load` | ≤ 2 × idle latency, and ≤ 3 s |
 | `locate.latency_idle` | ≤ 2 s |
 | `update.later_wins` | As before (unchanged ids and boxes; cup `struck`) |

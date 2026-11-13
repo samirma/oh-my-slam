@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.6. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.7. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -1865,7 +1865,8 @@
         }
       ],
       "required": [
-        "bbox_px"
+        "bbox_px",
+        "centre_cam_m"
       ],
       "properties": {
         "bbox_px": {
@@ -1876,6 +1877,34 @@
             "type": "number"
           },
           "description": "x_min, y_min, x_max, y_max."
+        },
+        "centre_cam_m": {
+          "$ref": "#/$defs/Vec3",
+          "description": "oms/2.7: box centre in the camera's optical frame (x right, y down, z forward), metres at the output's scale."
+        },
+        "mask": {
+          "type": "object",
+          "required": [
+            "size",
+            "counts"
+          ],
+          "additionalProperties": false,
+          "description": "oms/2.7, with the masks output: the detection's pixels, ignored pixels removed; COCO run-length encoding (column-major, compressed string form).",
+          "properties": {
+            "size": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "description": "height, width"
+            },
+            "counts": {
+              "type": "string"
+            }
+          }
         }
       },
       "description": "A detection of a frame analysis: the frame-analysis subset of an object, plus bbox_px."
@@ -2601,7 +2630,8 @@
           "description": "With camera_id: take the camera, and the scale, from this map."
         },
         "T_map_cam": {
-          "$ref": "#/$defs/Mat4"
+          "$ref": "#/$defs/Mat4",
+          "description": "Pose of the camera's optical frame. With map: in the map frame, outputs in the map frame (frame map). Without map (oms/2.7): in the client's own gravity-aligned z-up frame, outputs in that frame at the frame's depth scale (frame client)."
         },
         "depth": {
           "$ref": "#/$defs/PartName"
@@ -2613,6 +2643,7 @@
           "items": {
             "enum": [
               "objects",
+              "masks",
               "points",
               "range_scan",
               "depth"
@@ -2645,6 +2676,21 @@
         "ignore_mask": {
           "$ref": "#/$defs/PartName",
           "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "pattern": "^\\s*\\S(.{0,62}\\S)?\\s*$",
+            "description": "A text prompt, 1-64 characters after trimming."
+          },
+          "description": "oms/2.7: text prompts for this analysis, with an update's label rules (1-64 characters after trimming, at most 64, compared case-folded with _ as a space). Detection prompts with the default vocabulary, the map's vocabulary when map is given, and these labels, duplicates removed. Implies the objects output and the matches field. An invalid label refuses the request with invalid_request (details.field labels)."
+        },
+        "labels_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "oms/2.7: with labels, prompt with labels alone (no default or map vocabulary). Without labels it is invalid_request."
         }
       },
       "oneOf": [
@@ -2703,8 +2749,10 @@
         "frame": {
           "enum": [
             "map",
+            "client",
             "gravity_camera"
-          ]
+          ],
+          "description": "map: map and T_map_cam given; client (oms/2.7): T_map_cam without map, outputs in its frame; gravity_camera: no T_map_cam."
         },
         "scale_source": {
           "$ref": "#/$defs/ScaleSource"
@@ -2746,6 +2794,41 @@
         "depth": {
           "$ref": "#/$defs/Binary",
           "description": "uint16 depth, metres = value x depth_scale_m (0.001); 0 = no value."
+        },
+        "matches": {
+          "type": "array",
+          "description": "oms/2.7, present when the request has labels: one entry per client label, in request order.",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "object_id",
+              "score"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "The client label, as sent (trimmed)."
+              },
+              "object_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "description": "id of the returned object with this label and the highest score (ties: lower id); null when none."
+              },
+              "score": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
         }
       }
     },

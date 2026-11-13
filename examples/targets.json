@@ -46,6 +46,7 @@
   "objects.label_agreement": {"op": ">=", "value": 0.95, "unit": "share", "tolerance_abs": 0.05, "description": "round-4 value of the legacy map.stability.label_agreement"},
   "objects.id_stability": {"op": ">=", "value": 0.8, "unit": "share", "tolerance_abs": 0.05, "description": "round-4 value of the legacy map.stability.id_agreement"},
   "analysis.range_scan_error": {"op": "<=", "value": 0.05, "unit": "ratio"},
+  "analysis.label_match": {"op": ">=", "value": 0.8, "unit": "ratio"},
   "interactive.latency_under_load": {"parts": {"ratio": {"op": "<=", "value": 2.0, "unit": "ratio"}, "abs_s": {"op": "<=", "value": 3.0, "unit": "s"}}},
   "locate.latency_idle": {"op": "<=", "value": 2.0, "unit": "s"},
   "update.later_wins": {"parts": {"cup_struck": {"op": ">=", "value": 1.0, "unit": "share"}, "ids_kept": {"op": ">=", "value": 0.95, "unit": "share"}, "box_centre_delta_m": {"op": "<=", "value": 0.15, "unit": "m"}}, "description": "As before: the legacy map_update.absent_fraction (cup struck, 1.0), map_update.split_*.ids_persistent_fraction (0.95) and map_update.split_*.stability.centre_delta_median_m (0.15 m)"}
