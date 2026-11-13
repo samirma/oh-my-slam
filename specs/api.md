@@ -290,6 +290,16 @@ error code `invalid_request` (§9).
   sees how much of a frame's distance from the prior it sent is the estimate and how much the
   images. Null when the job has no `drifting` prior.
 
+  **Scale check** (oms/2.8). `quality.scale_check` compares the camera heights the client sent
+  with what the frames' own depth measures: `{median_ratio, spread, frames}`, over the job's
+  frames that carry a sent height (`height_above_floor_m`, per frame or per camera) and show a
+  measurable floor plane of their own (map.md §2), whether or not the floor check judged them.
+  A frame's ratio is H / h_f: its sent height over its own floor height in its raw depth (the
+  sensor depth's metres, or the monocular model's own metres, before any map scale or per-frame
+  `depth_scale`). `median_ratio` is their median, `spread` 1.4826 × their median absolute
+  deviation over `median_ratio`, `frames` their count. Null when no frame qualifies. A ratio far
+  from 1 means the sent height and the depth disagree: a wrong height, or a wrong depth scale.
+
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
   dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
   its measured, committed and difference angles, so a client can see which pairs drove
@@ -509,6 +519,15 @@ The versions read, revert and `--keep-versions` are O2.
     `client`. No detection gets a map id.
   * Without `T_map_cam`: outputs are in a gravity-aligned camera frame: the camera at the
     origin, z up, yaw 0 along the viewing direction; `frame` is `gravity_camera`.
+* **Scale check** (oms/2.8). Outside the map frame (`client` or `gravity_camera`), when the
+  camera gives `height_above_floor_m`, the response carries `scale_check`: `{sent_height_m,
+  model_height_m, ratio, floor_inlier_share, depth_source}`. `model_height_m` is the camera's
+  height above the frame's own floor plane in the raw depth (`depth_source` `sensor` with a
+  depth image, else `monocular`, the model's own metres, before the sent height rescales it);
+  `ratio` is `sent_height_m / model_height_m`; `floor_inlier_share` is the share of the frame's
+  valid depth pixels on that plane. With no measurable floor plane, `model_height_m` and
+  `ratio` are null and `floor_inlier_share` is 0. Absent in the map frame and without a sent
+  height.
 * **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
   the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.7. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.8. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -1023,6 +1023,34 @@
             }
           },
           "description": "oms/2.6. Every pair the depth-consistency limit evaluated (map.md section 4), jobs and dry runs; empty when it evaluated no pair (no sensor depth, or the older mapper). On a depth_inconsistent rejection it shows which frames contradict each other, so a client can drop or retake them."
+        },
+        "scale_check": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "median_ratio",
+            "spread",
+            "frames"
+          ],
+          "additionalProperties": false,
+          "description": "oms/2.8: sent camera heights against the frames' own floor heights in their raw depth (sensor metres or the monocular model's own metres): ratio H / h_f per frame with a sent height and a measurable own floor plane, judged or not. Null when no frame qualifies.",
+          "properties": {
+            "median_ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "spread": {
+              "type": "number",
+              "minimum": 0,
+              "description": "1.4826 x median absolute deviation of the ratios, over median_ratio."
+            },
+            "frames": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
         }
       }
     },
@@ -2828,6 +2856,48 @@
                 "minimum": 0,
                 "maximum": 1
               }
+            }
+          }
+        },
+        "scale_check": {
+          "type": "object",
+          "required": [
+            "sent_height_m",
+            "model_height_m",
+            "ratio",
+            "floor_inlier_share",
+            "depth_source"
+          ],
+          "additionalProperties": false,
+          "description": "oms/2.8, outside the map frame when the camera gives height_above_floor_m: the sent height against the frame's own floor height in its raw depth.",
+          "properties": {
+            "sent_height_m": {
+              "type": "number"
+            },
+            "model_height_m": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "Camera height above the frame's own floor plane in the raw depth; null without a measurable floor plane."
+            },
+            "ratio": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "sent_height_m / model_height_m."
+            },
+            "floor_inlier_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "depth_source": {
+              "enum": [
+                "sensor",
+                "monocular"
+              ]
             }
           }
         }

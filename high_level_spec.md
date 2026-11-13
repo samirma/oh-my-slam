@@ -200,6 +200,11 @@ analysis object also carries `centre_cam_m`, its centre in the camera's optical 
 `T_map_cam` may be sent without a map: the outputs are then in the frame that pose is given in,
 at the scale of the frame's own depth.
 
+**oms/2.8** is additive: the quality report's `scale_check` (the job's sent camera heights
+against its frames' own floor heights in their raw depth, api.md §4) and frame analysis's
+`scale_check` (a sent camera height against the frame's own floor height, api.md §7), so a
+client sees when a documented camera height and the depth disagree.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
