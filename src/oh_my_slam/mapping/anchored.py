@@ -490,12 +490,20 @@ def first_camera(up_cam: Any, height_m: float | None = None) -> Array:
 
 def floor_candidates(p: Array, share: float = 0.25) -> list[float]:
     """The camera's heights above every strong horizontal plane below it, in its own points
-    ``p`` (camera-centred, z up along gravity, unscaled), best supported first: the peaks of the
-    points' log heights, each tried as a plane (``_horizontal_plane``), kept when it holds
-    ``share`` of the best one's points. Which one is the floor is decided across
-    frames (``ScaleState._height_votes``): fitted per frame, so a frame that sees a lower floor
-    through a door or a counter offers it without moving the others."""
-    out: list[float] = []
+    ``p`` (camera-centred, z up along gravity, unscaled), best supported first
+    (``floor_planes``)."""
+    return [h for h, _ in floor_planes(p, share)]
+
+
+def floor_planes(p: Array, share: float = 0.25) -> list[tuple[float, Array]]:
+    """The strong horizontal planes below the camera, in its own points ``p`` (camera-centred, z
+    up along gravity, unscaled), best supported first, as (distance to the camera, unit normal
+    with z up): the peaks of the points' log heights, each tried as a plane
+    (``_horizontal_plane``), kept when it holds ``share`` of the best one's points. Which one is
+    the floor is decided across frames (``ScaleState._height_votes``): fitted per frame, so a
+    frame that sees a lower floor through a door or a counter offers it without moving the
+    others."""
+    out: list[tuple[float, Array]] = []
     q = p[np.isfinite(p).all(axis=1) & (p[:, 2] < -MIN_CAMERA_HEIGHT)]
     if len(q) < FLOOR_MIN_POINTS:
         return out
@@ -508,16 +516,17 @@ def floor_candidates(p: Array, share: float = 0.25) -> list[float]:
     planes = [got for i in sorted(peaks, key=lambda j: -smooth[j])[:FLOOR_CANDIDATES]
               if (got := _horizontal_plane(q, math.exp(centres[i]))) is not None]
     if planes:
-        top = max(n for _, n in planes)
-        out = [h for h, n in sorted(planes, key=lambda hn: -hn[1]) if n >= share * top]
+        top = max(n for _, n, _ in planes)
+        out = [(h, nrm) for h, n, nrm in sorted(planes, key=lambda hn: -hn[1])
+               if n >= share * top]
     return out
 
 
-def _horizontal_plane(q: Array, h0: float) -> tuple[float, int] | None:
+def _horizontal_plane(q: Array, h0: float) -> tuple[float, int, Array] | None:
     """The plane (RANSAC, normal within ``FLOOR_TILT_DEG`` of vertical) among the points near
-    height ``-h0``: its distance to the camera and its inliers, or None."""
+    height ``-h0``: its distance to the camera, its inliers and its unit normal, or None."""
     got = horizontal_plane(q, h0)
-    return None if got is None else (got[1], got[2])
+    return None if got is None else (got[1], got[2], got[0])
 
 
 def horizontal_plane(q: Array, h0: float, band: float = FLOOR_BAND_REL
@@ -1287,20 +1296,44 @@ def prior_pick(centres: list[Array], prior_c: Array, sigma_m: float) -> int | No
     return one_position(near, centres)
 
 
-def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
-              ) -> float | None:
-    """A frame's own camera height above its floor (map.md §2 "Floor check"): among the large
-    horizontal planes below the camera in its depth (map metres) levelled by its rotation ``R``
-    (``floor_candidates``), the one nearest the ``expected`` height (relative). None without
-    one: no measurable floor plane."""
+def own_floor_plane(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
+                    ) -> tuple[float, Array] | None:
+    """A frame's own floor plane (map.md §2 "Floor check"): among the large horizontal planes
+    below the camera in its depth (map metres) levelled by its rotation ``R`` (``floor_planes``),
+    the one nearest the ``expected`` height (relative), as its distance to the camera and its
+    unit normal (z up) in the levelled frame. None without one: no measurable floor plane."""
     from oh_my_slam.reconstruction.pointcloud import pixel_points
 
     ok = edge_free(depth)
     if not ok.any():
         return None
     pts, _ = pixel_points(depth, K_grid, ok)
-    planes = floor_candidates(pts @ R.T)
-    return min(planes, key=lambda h: abs(math.log(h / expected))) if planes else None
+    planes = floor_planes(pts @ R.T)
+    return min(planes, key=lambda hn: abs(math.log(hn[0] / expected))) if planes else None
+
+
+def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
+              ) -> float | None:
+    """A frame's own camera height above its floor (map.md §2 "Floor check"): the distance of
+    ``own_floor_plane``. None without a measurable floor plane."""
+    got = own_floor_plane(depth, K_grid, R, expected)
+    return None if got is None else got[0]
+
+
+def floor_share(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, height: float,
+                normal: Array) -> float:
+    """The share of a frame's valid depth pixels (finite and positive: depth edges included) on
+    its floor plane (``own_floor_plane``: ``height`` and ``normal``): their distance to the
+    plane is within ``FLOOR_PLANE_TOL_REL`` × ``height``, the tolerance the plane was fitted
+    with. 0 without a valid pixel."""
+    from oh_my_slam.reconstruction.pointcloud import pixel_points
+
+    ok = np.isfinite(depth) & (depth > 0)
+    if not ok.any():
+        return 0.0
+    pts, _ = pixel_points(depth, K_grid, ok)
+    near = np.abs((pts @ R.T) @ normal + height) < FLOOR_PLANE_TOL_REL * height
+    return float(near.mean())
 
 
 @dataclass
@@ -3442,6 +3475,26 @@ class AnchoredMap:
         if chk.scale is not None:
             chk.scale = raw_scale * chk.factor
         return chk
+
+    def floor_ratios(self) -> list[float]:
+        """The job's frames' ratios H / h_f (``quality.scale_check``, api.md §4, oms/2.8): each
+        keyframe the job added (the pose duplicates it dropped are gone) with a sent camera
+        height H, per frame or per camera, and a measurable floor plane of its own
+        (``own_floor``, the floor check's rule: whether it judged the frame or not, even on a
+        map without a floor convention), over its own floor height h_f in its raw depth: a depth
+        image's sensor metres, a monocular depth's own metres (its stored grid over its
+        ``grid_scale``), before any map scale or own depth scale. Call it before ``save``."""
+        out: list[float] = []
+        for k in self._added:
+            if k.height_m is None or k.height_m <= 0 or k.depth_kind == "none":
+                continue
+            assert k.grid is not None and k.K_grid is not None  # a job keyframe keeps its grid
+            raw = k.grid if k.depth_kind == "sensor" \
+                else (k.grid / (k.grid_scale or k.k_used)).astype(np.float32)
+            h = own_floor(raw, k.K_grid, k.T[:3, :3], k.height_m)
+            if h is not None:
+                out.append(k.height_m / h)
+        return out
 
     def _floor_out(self, kf: Keyframe) -> None:
         """A keyframe the floor check left out of content, listed (``floor_inconsistent``)."""

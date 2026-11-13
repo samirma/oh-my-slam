@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.7) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.8) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.7; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.8; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -1249,6 +1249,27 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     and a monocular frame within the bound is not rescaled (the mapper fits each keyframe's
     depth scale itself). It has no scale evidence of its own to withhold (the mapper fits its
     scales in its process).
+  * **`quality.scale_check`** (oms/2.8, api.md §4) reports what the check measures, for every
+    job and dry run, as pure report fields (nothing in registration, content, objects or grid
+    reads them). h_f is `anchored.own_floor` (the rule above), measured again at the end of the
+    job (`AnchoredMap.floor_ratios`, before `save` forgets the job's keyframes: a keyframe
+    re-registered or retried after `add` is read at its final pose, and a pose duplicate the job
+    dropped is gone) on each keyframe the job added with a sent height H (per frame, else its
+    camera's, as the floor check takes it) and a depth: its stored grid, which is the raw sensor
+    depth, or, for a monocular keyframe, the grid over its `grid_scale`, the model's own metres
+    before the map's k and before its own `depth_scale`. It counts whether the floor check judged
+    the frame or not, and whether the map has a floor convention (the check itself does not run
+    without one), and a frame kept at its prior counts at its prior pose; a frame rejected or
+    given no keyframe does not. `median_ratio`, `spread` and `frames` are
+    `mapping.quality.scale_check` (the median of H / h_f; 1.4826 × MAD over the median; their
+    count; rounded to 5 decimals); null with no qualifying frame. The stored keyframes of earlier
+    versions are not the job's frames, even those it re-registers.
+    The dry run reports the engine's own: the same measure on the snapshot's prediction; a dry
+    run of the older mapper (no prior-first engine, nothing measured per frame) reports null.
+    The older mapper's job measures its registered frames only (`Updater._floor_ratio`, the
+    check's rule at their committed rotation): a depth image's own sensor metres, else the
+    mapper's monocular depth on its grid before the similarity to the map (which the mapper
+    fits itself), in `_record`, so it also runs where the floor check does not.
   * On the client's stored map `task_map` version 10 (45 monocular keyframes, camera 0.339 m):
     look008/009/039–041, whose monocular depth is about half the map's in one sector, land
     their floor 0.15–0.22 m high; they are excluded, the frames whose floor is within the bound
@@ -1833,6 +1854,19 @@ It is an update's own code on one frame, kept nowhere.
   the lowest one without a height (`anchored.own_floor`); without such a plane, the camera's
   height below it; else unknown: no object is grounded on it or dropped as the floor, and the
   range scan takes it 1.0 m below the camera (`analyse.DEFAULT_CAMERA_HEIGHT_M`).
+* **Scale check** (oms/2.8, api.md §7). Outside the map frame, with the camera's
+  `height_above_floor_m`, the response's `scale_check` is measured on the frame's raw depth: the
+  depth image's, else the monocular model's own metres, taken before `height_factor` rescales it
+  (`analysis.scale_check`). The floor plane is the floor check's rule, `anchored.own_floor_plane`
+  (`own_floor`'s plane and its unit normal: the plane nearest the sent height among the large
+  horizontal planes below the camera), so the check and the scale agree on which plane is the
+  floor. `floor_inlier_share` is the share of the frame's valid depth pixels (finite and above 0:
+  depth edges included, ignored pixels already out) whose distance to that plane (its fitted
+  normal, not exactly level) is within `FLOOR_PLANE_TOL_REL` = 2 % of the plane's height, the
+  tolerance the plane was fitted with (`anchored.floor_share`). The values are rounded to 4
+  decimals. A depth image with no value is none: the source is then `monocular`. It is not
+  produced in the map frame (the map's floor is the version's, and the depth is aligned onto the
+  map), nor when the sent height is not above the floor (<= 0, ignored as for the scale).
 * **Objects.** The detections are lifted and filtered as a keyframe's
   (`anchored_objects.observe`: exclusive masks, no support fringe, no floor named as an object,
   no opening, nothing nearer than 12 cm, no mask over 40 % of the image), boxed as a sighting is

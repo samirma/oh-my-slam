@@ -144,7 +144,7 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
                       "T_map_cam": T.tolist(), "outputs": ALL,
                       "labels": [" Apple ", "cup", "apple"]}, {"i": img, "d": dep})
     summary = before[0]
-    assert doc["frame"] == "map" and doc["schema"] == "oms/2.7"
+    assert doc["frame"] == "map" and doc["schema"] == "oms/2.8"
     assert (doc["scale_source"], doc["scale_sigma_rel"]) == (summary["scale_source"],
                                                              summary["scale_sigma_rel"])
     # a depth image with a pose asks the detector alone, as an interactive request, with the
@@ -809,3 +809,67 @@ def test_objects_of_a_view_are_boxed_filtered_and_matched() -> None:
     empty = analysis.FramePoints(np.zeros((0, 3)), np.zeros(0, np.uint32), np.zeros((0, 3), np.uint8))
     assert analysis.thinned(empty, 0.1) is empty
     assert analysis.objects(View("frame", T, 0.0, K_TABLE, z, rgb, []), None, 0.02, 0.5, []) == []
+
+
+# -- the scale check (oms/2.8) -------------------------------------------------------------------
+
+
+def test_the_scale_check_of_a_depth_image_and_of_a_monocular_depth(
+        an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]]) -> None:
+    """api.md §7 (oms/2.8): outside the map frame a sent camera height is checked against the
+    frame's own floor plane in its raw depth: the sensor's metres, or the model's own metres
+    before the sent height rescales them."""
+    img, dep, T, _ = shot
+    z, eye = metres(dep), float(T[2, 3])
+    key = hashlib.sha256(img).hexdigest()
+    base = {"image": "i", "outputs": ["depth"], "T_map_cam": T.tolist()}
+    # a depth image with a right height: the ratio is 1, the floor holds a good share of it
+    doc = an.analyse({**base, "depth": "d", "camera": {**CAM, "height_above_floor_m": eye}},
+                     {"i": img, "d": dep})
+    sc = doc["scale_check"]
+    assert doc["frame"] == "client" and sc["depth_source"] == "sensor"
+    assert sc["sent_height_m"] == pytest.approx(eye, abs=1e-4)
+    assert sc["model_height_m"] == pytest.approx(eye, abs=0.02)
+    assert sc["ratio"] == pytest.approx(1.0, abs=0.02)
+    assert 0.1 < sc["floor_inlier_share"] < 0.9
+    # a wrong sent height: the ratio says by how much, the depth is untouched
+    doc = an.analyse({**base, "depth": "d", "camera": {**CAM, "height_above_floor_m": 2 * eye}},
+                     {"i": img, "d": dep})
+    assert doc["scale_check"]["ratio"] == pytest.approx(2.0, abs=0.04)
+    assert doc["scale_check"]["model_height_m"] == sc["model_height_m"]
+    assert np.abs(decode(doc["depth"]) * 0.001 - z).max() < 0.02
+    # a monocular depth (the model's metres 0.8 of the truth): the model's own height, before
+    # the sent height rescales the depth onto itself
+    an.backend.mono_depth[key] = z * 0.8
+    doc = an.analyse({**base, "camera": {**CAM, "height_above_floor_m": eye}}, {"i": img})
+    sc = doc["scale_check"]
+    assert doc["scale_source"] == "camera_height" and sc["depth_source"] == "monocular"
+    assert sc["model_height_m"] == pytest.approx(0.8 * eye, abs=0.02)
+    assert sc["ratio"] == pytest.approx(1.25, abs=0.04)
+    assert np.abs(decode(doc["depth"]) * 0.001 - z).max() < 0.03  # rescaled by the height
+    # without a pose: the gravity-aligned camera frame, the same check
+    an.backend.up = T[:3, :3].T @ np.array([0.0, 0.0, 1.0])
+    doc = an.analyse({"image": "i", "outputs": ["depth"],
+                      "camera": {**CAM, "height_above_floor_m": eye}}, {"i": img})
+    assert doc["frame"] == "gravity_camera"
+    assert doc["scale_check"]["ratio"] == pytest.approx(1.25, abs=0.04)
+    # no sent height (or none above the floor): no check
+    for cam in (CAM, {**CAM, "height_above_floor_m": -1.0}):
+        assert "scale_check" not in an.analyse({**base, "depth": "d", "camera": cam},
+                                               {"i": img, "d": dep})
+
+
+def test_the_scale_check_is_absent_in_the_map_frame_and_empty_without_a_floor_plane(
+        an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]]) -> None:
+    img, dep, T, _ = shot
+    # in the map frame, whatever height the map's camera has
+    doc = an.analyse({"image": "i", "depth": "d", "camera_id": "cam", "map": "t",
+                      "T_map_cam": T.tolist(), "outputs": ["depth"]}, {"i": img, "d": dep})
+    assert doc["frame"] == "map" and "scale_check" not in doc
+    # a frame whose depth shows no floor plane: no model height, no ratio, a share of 0
+    an.backend.other_depth = np.full((480, 640), 2.0, np.float32)
+    flat = png(np.asarray(Image.open(io.BytesIO(img))))
+    doc = an.analyse({"image": "i", "outputs": ["depth"], "T_map_cam": T.tolist(),
+                      "camera": {**CAM, "height_above_floor_m": 0.9}}, {"i": flat})
+    assert doc["scale_check"] == {"sent_height_m": 0.9, "model_height_m": None, "ratio": None,
+                                  "floor_inlier_share": 0.0, "depth_source": "monocular"}

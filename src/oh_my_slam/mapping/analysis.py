@@ -36,7 +36,9 @@ from oh_my_slam.mapping.anchored import (
     MIN_DEPTH_M,
     SCALE_RANGE,
     first_camera,
+    floor_share,
     own_floor,
+    own_floor_plane,
 )
 from oh_my_slam.mapping.anchored_objects import (
     MIN_OBJECT_M,
@@ -90,6 +92,24 @@ def height_factor(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m:
         return None
     f = height_m / h
     return f if SCALE_RANGE[0] <= f <= SCALE_RANGE[1] else None
+
+
+def scale_check(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m: float,
+                source: str) -> dict[str, Any]:
+    """A frame's ``scale_check`` (api.md §7, oms/2.8): the sent camera height ``height_m``
+    against the camera's height above the frame's own floor plane (``anchored.own_floor_plane``,
+    the floor check's rule, in the raw ``depth`` levelled by ``R``), the ratio of the two and
+    the share of the frame's valid depth pixels on that plane (``anchored.floor_share``).
+    Without a measurable plane: no model height or ratio, a share of 0. ``source``: the raw
+    depth's, ``sensor`` or ``monocular``."""
+    out: dict[str, Any] = {"sent_height_m": round(float(height_m), 4), "model_height_m": None,
+                           "ratio": None, "floor_inlier_share": 0.0, "depth_source": source}
+    got = own_floor_plane(depth, K, R, height_m)
+    if got is not None:
+        h, normal = got
+        out.update(model_height_m=round(h, 4), ratio=round(height_m / h, 4),
+                   floor_inlier_share=round(floor_share(depth, K, R, h, normal), 4))
+    return out
 
 
 def own_floor_z(depth: NDArray[np.float32], K: Intrinsics, T: Array, height_m: float | None

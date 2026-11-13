@@ -22,6 +22,20 @@ def residual_stats(res: list[tuple[float, float]]) -> dict[str, Any] | None:
             "count": len(res)}
 
 
+def scale_check(ratios: list[float]) -> dict[str, Any] | None:
+    """``quality.scale_check`` (api.md §4, oms/2.8) of the frames' ratios H / h_f (their sent
+    camera height over their own floor height in their raw depth): their median, their spread
+    (1.4826 × the median absolute deviation over the median) and their count; None without
+    any."""
+    if not ratios:
+        return None
+    r = np.asarray(ratios, np.float64)
+    med = float(np.median(r))
+    mad = float(np.median(np.abs(r - med)))
+    return {"median_ratio": round(med, 5), "spread": round(1.4826 * mad / med, 5),
+            "frames": len(ratios)}
+
+
 def too_close(scene_m: float | None, inliers: int) -> bool:
     """The distance limit (api.md §4): a median scene depth below ``TOO_CLOSE_M``, unless the
     frame has at least ``TOO_CLOSE_INLIERS`` inliers."""

@@ -67,6 +67,7 @@ from oh_my_slam.mapping.quality import (
     gate,
     reregistered,
     residual_stats,
+    scale_check,
     too_close,
 )
 from oh_my_slam.segmentation.detect import vocabulary
@@ -167,6 +168,8 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         disagreement = 0.0 if am is None else am.prior_disagreement_deg
         heights = [] if am is None else list(am.height_inconsistent)
         floors = [] if am is None else list(am.floor_inconsistent)
+        # null without the engine: the older mapper's dry run measures no depth per frame
+        scale = scale_check([] if am is None else am.floor_ratios())
         source, sigma = _scale(prev, am, frames)
         # an update without priors: its predicted poses against the images' relative rotations
         # (map.md §4 rotation_inconsistent), as the job measures them
@@ -205,7 +208,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         else None,
         "rejected_share": round(1.0 - len(kept) / len(frames), 4),
         "low_confidence_share": round(low / len(registered), 4) if registered else 0.0,
-        "rebuilt": False, "prior_gravity_deg": gravity,
+        "rebuilt": False, "prior_gravity_deg": gravity, "scale_check": scale,
     }
     reached = [fr for fr in frames if fr.reason is None]
     # the frames a job hands MapAnything (map.md §2 step 8): monocular ones without a prior
