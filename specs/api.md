@@ -293,7 +293,10 @@ error code `invalid_request` (§9).
   **Scale check** (oms/2.8). `quality.scale_check` compares the camera heights the client sent
   with what the frames' own depth measures: `{median_ratio, spread, frames}`, over the job's
   frames that carry a sent height (`height_above_floor_m`, per frame or per camera) and show a
-  measurable floor plane of their own (map.md §2), whether or not the floor check judged them.
+  measurable floor plane of their own (map.md §2), whether or not the floor check judged them:
+  the job's registered, provisional and `kept_at_prior` frames (on the older mapper engine, its
+  registered frames, its own aligned depth taken as the raw monocular depth, and null on its dry
+  runs, which measure no per-frame depth).
   A frame's ratio is H / h_f: its sent height over its own floor height in its raw depth (the
   sensor depth's metres, or the monocular model's own metres, before any map scale or per-frame
   `depth_scale`). `median_ratio` is their median, `spread` 1.4826 × their median absolute
