@@ -25,8 +25,8 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oh_my_slam.core.log import get_logger
+from oh_my_slam.service import analyse, nav, openapi, schema
 from oh_my_slam.service import birdseye as birdseye_read
-from oh_my_slam.service import nav, openapi, schema
 from oh_my_slam.service import objects as objects_read
 from oh_my_slam.service.cameras import decode_mask, decode_png16, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
@@ -41,8 +41,8 @@ from oh_my_slam.service.update import FrameWork, UpdateWork
 
 log = get_logger("oh_my_slam.service.app")
 
-CAPABILITIES = ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]  # the groups this service
-# implements (high_level_spec.md §12)
+# the groups this service implements (high_level_spec.md §12)
+CAPABILITIES = ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O7", "O8", "O9", "O10"]
 UPLOAD_CAP_BYTES = 512 * 1024 * 1024  # one request's body
 FREE_DISK_FACTOR = 3  # an upload needs this many times its size free on the data disk
 ROTATION_TOLERANCE = 1e-3
@@ -68,6 +68,8 @@ class Service:
     dry_run: Callable[[Any], dict[str, Any]] | None = None
     derived: Derived | None = None  # the grid, points and locate inputs of each version
     ids: nav.Ids | None = None
+    # frame analysis on the backend's models (``analyse.Analyser``), None: not served
+    analyser: analyse.Analyser | None = None
 
 
 def body(data: dict[str, Any], status: int = 200, headers: dict[str, str] | None = None
@@ -539,6 +541,53 @@ class Api:
                           "located in")
         self.s.store.require(name)
         return body({"map": name, **nav.recorded_pose(self.s.store, name)})
+
+    async def post_analyse(self, request: Request) -> Response:
+        analyser = self.s.analyser
+        if analyser is None:
+            raise invalid("path", "frame analysis is not served by this service")
+        t0 = time.perf_counter()
+        data = await read_body(request, self.s.upload_cap)
+        parts = parse_multipart(request.headers.get("content-type", ""), data)
+        _stage(request, "upload", t0)
+        t0 = time.perf_counter()
+        if "request" not in parts:
+            raise invalid("request", "no multipart part named 'request' (the JSON body)")
+        try:
+            req = json.loads(parts["request"])
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise invalid("request", f"the 'request' part is not JSON ({exc})") from exc
+        try:
+            schema.validate("AnalyseRequest", req)
+        except ApiError as exc:
+            # a label is refused as the field labels (api.md §7), as an update's
+            field = str(exc.details.get("field", ""))
+            if field == "labels" or field.startswith("labels["):
+                raise invalid("labels", exc.message, schema="AnalyseRequest") from exc
+            raise
+        dv = records = None
+        if "map" in req:
+            # the map's latest version, held until the answer ends (map.md §2 Holds): its
+            # cameras, vocabulary, scale, floor and objects
+            name = check_name(req["map"])
+            self.s.store.require(name)
+            n = self._hold(request, name, None)
+        work = await run_in_threadpool(analyse.work, self.s.store, req, parts)
+        if "map" in req:
+            derived = self._derived()
+            dv = at = await run_in_threadpool(derived.get, name, n)
+
+            def records() -> list[dict[str, Any]]:
+                got: list[dict[str, Any]] = objects_read.body(self.s.store, derived,
+                                                              self._ids(), at)["objects"]
+                return got
+
+        _stage(request, "validate", t0)
+        t0 = time.perf_counter()
+        out = await run_in_threadpool(analyser.run, work, dv, records)
+        _stage(request, "analyse", t0)
+        self.s.timings.add("analyse_per_frame", time.perf_counter() - t0)
+        return body(out)
 
     async def delete_map(self, request: Request) -> Response:
         name = check_name(request.path_params["name"])

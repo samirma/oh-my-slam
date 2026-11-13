@@ -103,7 +103,7 @@ def frames_for(c: Client, poses: list[np.ndarray], *, tag: str = "f", depth: boo
 
 
 def test_health_lists_o3_jobs(client: Client) -> None:
-    assert CAPABILITIES == ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]
+    assert CAPABILITIES == ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O7", "O8", "O9", "O10"]
     assert client.get("/api/health", "Health")["capabilities"] == CAPABILITIES
 
 

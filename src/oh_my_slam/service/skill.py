@@ -38,7 +38,9 @@ def render() -> str:
         "from camera frames with pose priors, per-frame status and the quality gate; the map "
         "summary, keyframes, objects and support surfaces, navigation grid, points near a place "
         "and bird's-eye image of any kept version; locating frames with uncertainty and "
-        'ambiguity, the recorded pose; health and timings."',
+        "ambiguity, the recorded pose; analysing one frame without changing a map (objects, "
+        "the best match per label, image masks, points, a range scan); health and "
+        'timings."',
         "---",
         "",
         "# oh-my-slam API",
@@ -74,6 +76,21 @@ def render() -> str:
         "type=application/json' \\",
         "  -F f0=@f0.jpg",
         "curl -s 'http://HOST:9091/api/jobs/JOB_ID?wait_s=30'",
+        "```",
+        "",
+        "`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses "
+        "`objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and "
+        "`matches` then names the best object of each (`object_id` null when none). Outputs are "
+        "in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects "
+        "carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a "
+        "gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`.",
+        "",
+        "```sh",
+        "curl -s http://HOST:9091/api/frames/analyse \\",
+        "  -F 'request={\"image\":\"f0\",\"camera_id\":\"head\",\"map\":\"home\","
+        "\"outputs\":[\"objects\",\"range_scan\"],\"labels\":[\"red mug\"]};"
+        "type=application/json' \\",
+        "  -F f0=@f0.jpg",
         "```",
         "",
         "## Errors",

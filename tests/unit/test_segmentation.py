@@ -111,6 +111,34 @@ def test_edge_on_screens_are_dropped(tmp_path: Path) -> None:
     assert not detect.edge_on_screen("person", (40, 5, 55, 55), 100)
 
 
+def test_labels_alone_are_prompted_without_the_defaults(tmp_path: Path) -> None:
+    """Frame analysis with ``labels_only`` (api.md §7): the detector is shown the labels alone,
+    a default label in the wording the detector knows, equal labels once."""
+    assert detect.prompt_of(" Computer_Mouse ") == "mouse" and detect.prompt_of("mouse") == "mouse"
+    assert detect.prompt_of("  Red  Mug ") == "Red  Mug"
+    labels = ["Red Mug", "computer mouse", "red_mug", " ", "TV", "Mouse"]
+    assert detect.own_prompts(labels) == ["Red Mug", "mouse", "tv"]
+    img = tmp_path / "shelf.png"
+    Image.new("RGB", (100, 60)).save(img)
+    shown: list[list[str]] = []
+
+    class Recording(BoxDetector):
+        def segment_image(self, req):  # type: ignore[no-untyped-def]
+            shown.append(list(req.labels))
+            return super().segment_image(req)
+
+    client = Recording([("mouse", 0.9, (40, 5, 80, 55)), ("Red Mug", 0.8, (0, 5, 30, 55))])
+    dets = detect.detect(img, client=client, max_side=100, labels=labels, defaults=False)  # type: ignore[arg-type]
+    assert shown == [["Red Mug", "mouse", "tv"]]
+    assert [(d.label, d.score) for d in dets] == [("computer mouse", 0.9), ("red mug", 0.8)]
+    from oh_my_slam.segmentation.api import detect_on_grid
+
+    dets = detect_on_grid(img, (50, 30), client, labels=["cup"], defaults=False)  # type: ignore[arg-type]
+    assert shown[-1] == ["cup"] and dets[0].mask.shape == (30, 50)
+    detect.detect(img, client=client, max_side=100, labels=["blue box"])  # type: ignore[arg-type]
+    assert shown[-1] == [*detect.default_prompts(), "blue box"]
+
+
 def test_vocabulary_and_label_rules() -> None:
     vocab = detect.default_vocabulary()
     assert 250 <= len(vocab) <= 320 and len(set(vocab)) == len(vocab)

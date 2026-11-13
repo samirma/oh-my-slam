@@ -147,7 +147,7 @@ def test_openapi_describes_every_endpoint_with_the_schema_defs(client: Client) -
                                  "/api/maps/{name}/locate", "/api/maps/{name}/pose",
                                  "/api/maps/{name}/objects", "/api/maps/{name}/birdseye.png",
                                  "/api/maps/{name}/birdseye", "/api/maps/{name}/versions",
-                                 "/api/maps/{name}/revert"}
+                                 "/api/maps/{name}/revert", "/api/frames/analyse"}
     revert = doc["paths"]["/api/maps/{name}/revert"]["post"]
     assert revert["requestBody"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/RevertRequest"}
@@ -791,7 +791,7 @@ def test_heights_without_a_floor_and_a_map_without_a_cloud(client: Client,
 
 def test_health_lists_capabilities_and_default_then_measured_timings(client: Client) -> None:
     h = client.get("/api/health", "Health")
-    assert h["capabilities"] == ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O8", "O9", "O10"]
+    assert h["capabilities"] == ["O1", "O2", "O3-jobs", "O4", "O5", "O6", "O7", "O8", "O9", "O10"]
     reg = h["timings"]["registration_per_frame"]
     assert reg["source"] == "default" and reg["count"] == 0 and reg["median_s"] > 0
     frames, files, _ = frames_of(client, 3)
