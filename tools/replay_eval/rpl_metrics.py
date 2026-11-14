@@ -136,6 +136,11 @@ DEFS: list[Def] = [
     Def("grid.unconfirmed_occupancy", "C9, C10", "Occupied cells, and floor-standing objects, "
         "on open floor of the floor plan inside the view of kept_at_prior frames only and of no "
         "confirmed frame (count)", "sum", "count", ("O6",), True),
+    Def("grid.drops", "C9", "Cells over a truth drop (a surface below the floor band) observed "
+        "by some keyframe marked occupied with floor_observed 3 (marked), and the free-by-rule "
+        "cells over any truth drop (free_by_rule); no samples yet: an episode's truth names no "
+        "drop's extent", "share", "", ("O6",), True,
+        parts=(("marked", "share", "ratio"), ("free_by_rule", "sum", "cells"))),
     Def("grid.id_stability", "C9", "Regions and passages keeping their id between consecutive "
         "versions where their geometry did not change", "share", "share", ("O6",)),
     Def("features.region_set", "C9", "Frontiers bordering a region, and objects in or on one, "

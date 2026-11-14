@@ -314,7 +314,7 @@ def test_targets_file_and_rules(tmp_path: Path) -> None:
         "gate.warping_rejected", "gate.others_accepted", "grid.floor_plan_agreement",
         "passages.door_recall", "passages.geometry", "grid.floor_observed",
         "grid.camera_cells_free", "grid.floor_false_obstacles", "grid.unconfirmed_occupancy",
-        "grid.id_stability",
+        "grid.drops", "grid.id_stability",
         "features.region_set", "grid.band_occupied", "grid.floor_height", "reads.latency",
         "objects.support_height", "objects.relations", "objects.centre_error",
         "objects.label_agreement", "objects.id_stability", "analysis.range_scan_error",
