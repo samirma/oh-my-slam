@@ -785,8 +785,20 @@ seen there.
   floor band (lower than `floor_z_m` − max(0.06 m, 3 × `floor_sigma_m`)), with the evidence an
   occupied cell needs, is a **drop**: a worktop's edge, a stair down, a hole. Its `state` is
   occupied (2), whatever the band, its `floor_observed` is 3 and its `height_m` is that
-  surface's height, negative. A cell where the floor was observed is never a drop. Drops come
-  from the same image-confirmed content as occupancy, never from free-by-rule cells.
+  highest such surface's height, negative. A cell where the floor was observed is never a drop.
+  Drops come from the same image-confirmed content as occupancy, never from free-by-rule cells.
+  So that a sagging or noisy floor makes no drop:
+  * a candidate whose surface is reached from observed floor through neighbouring cells by
+    height steps no larger than a step limit is floor continuing, not a drop;
+  * a connected set of candidates smaller than a minimum area is not a drop;
+  * a candidate where an obstacle of the requested band stands is that obstacle, as before.
+
+  The step limit and the minimum area are constants in `README.md`. A coarser grid (`cell_m`
+  above the fused resolution) marks a cell that covers a drop as a drop, even when it also
+  covers observed floor. A drop whose lower surface no camera saw, such as the strip just past a
+  raised top's edge that is only seen through, holds no surface and is not a drop: it stays
+  free or unknown with `floor_observed` 0, and only `blind_disc` `footprint` or `none` keeps
+  free-by-rule cells off it.
 
   **Floor band.** A surface within max(0.06 m, 3 × `floor_sigma_m`) of `floor_z_m`, on either
   side of it, is floor: it never makes an occupied cell or defines a passage, whatever `z_min`

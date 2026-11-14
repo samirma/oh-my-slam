@@ -94,10 +94,10 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `passages.door_recall` | C9 | Share of the floor plan's doors found as passages within 0.3 m |
 | `passages.geometry` | C9 | Share of found doors whose `centre_m` is within the tolerance of the floor plan's door-gap centre and whose `width_m` is within the tolerance of its free width |
 | `grid.floor_observed` | C9 | Share of free cells with `floor_observed` where the floor plan has floor |
-| `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free` |
+| `grid.camera_cells_free` | C9 | Share of keyframe camera cells, and their near blind ring, that are `free`, cells over a truth drop excluded |
 | `grid.floor_false_obstacles` | C9 | Service-occupied cells and floor-standing objects lower than 0.06 m on open floor: cells that are free floor in the truth floor plan with no object or fixture, restricted to cells inside some keyframe camera's view frustum within the height band (unseen floor counts neither way) (map.md §5–§6) |
 | `grid.unconfirmed_occupancy` | C9, C10 | Computed with truth: occupied cells and floor-standing objects on truth open floor that lie inside the view of `kept_at_prior` frames only, and of no confirmed frame (a frame kept only for `too_close` with a `metric` prior counts as confirmed here, api.md §4); a frame's view is bounded by the floor-plan walls |
-| `grid.drops` | C9 | Cells over a truth drop (a surface below the floor band, such as the room floor past a raised top) observed by some keyframe: share marked `occupied` with `floor_observed` 3; and the number of free-by-rule cells over any truth drop |
+| `grid.drops` | C9 | Cells over a truth drop (a surface below the floor band, such as the room floor past a raised top) observed by some keyframe: share marked `occupied` with `floor_observed` 3; and, with `blind_disc` `footprint`, the number of free-by-rule cells over any truth drop |
 | `grid.id_stability` | C9 | Share of regions and passages whose id is unchanged between consecutive versions where their geometry did not change |
 | `features.region_set` | C9 | Share of frontiers bordering a region, and of objects in or on a region, with `region` set |
 | `grid.band_occupied` | C9 | Share of cells holding an obstacle between the band's `z_min` and the requested `z_max` marked `occupied` |

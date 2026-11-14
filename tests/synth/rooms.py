@@ -98,3 +98,28 @@ def double_door(gap: tuple[float, float] = (1.0, 3.0), leaf_t: float = 0.04) -> 
     s.add((4.0 - w, gap[0], 0.0), (4.0, gap[0] + leaf_t, 2.0))
     s.add((4.0 - w, gap[1] - leaf_t, 0.0), (4.0, gap[1], 2.0))
     return s
+
+
+TOP = (0.55, 1.0)  # the raised top's half extents in x and y (1.1 m x 2 m), its surface at z 0
+TOP_DROP = 1.1  # the room floor lies this far below it
+
+
+def raised_top() -> Scene:
+    """A worktop 1.1 m x 2 m whose top is z 0 (where a robot on it puts its priors' origin), in
+    a room whose floor lies 1.1 m below (map.md §6 "Drops")."""
+    s = Scene()
+    s.add((-4.0, -4.0, -TOP_DROP - 0.05), (4.0, 4.0, -TOP_DROP))  # the room floor
+    s.add((-TOP[0], -TOP[1], -TOP_DROP), (TOP[0], TOP[1], 0.0))  # the worktop
+    return s
+
+
+def top_tour(height: float = 0.5) -> list[NDArray[np.float64]]:
+    """A wheeled robot's camera ``height`` above the raised top: a level turn at its centre (the
+    top lies in its blind disc, which reaches past the edges), turns pitched down by 35 deg at
+    two spots, and looks down past the edges from 0.15 m inside them."""
+    out = [camera(0.0, 0.0, height, yaw, 0.0) for yaw in range(0, 360, 30)]
+    out += [camera(0.0, y, height, yaw, -35.0) for y in (0.6, -0.6) for yaw in range(0, 360, 30)]
+    out += [camera((TOP[0] - 0.15) * math.cos(math.radians(a)),
+                   (TOP[1] - 0.15) * math.sin(math.radians(a)), height, a, -65.0)
+            for a in range(0, 360, 20)]
+    return out

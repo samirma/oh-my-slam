@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.8) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.9) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
 ---
 
 # oh-my-slam API
@@ -8,7 +8,7 @@ description: "Short reference of the oh-my-slam HTTP API (schema oms/2.8) for th
 Generated from the API definitions (`python -m oh_my_slam.service.skill`); never edit it by hand. The full contract is `GET /api/openapi.json` (OpenAPI 3.1, its schemas those of `specs/api.schema.json`) and `specs/api.md`.
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
-* Every JSON body carries `schema` (`oms/2.8`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
+* Every JSON body carries `schema` (`oms/2.9`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
 * Implemented groups (`GET /api/health` → `capabilities`): O1, O2, O3-jobs, O4, O5, O6, O7, O8, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
@@ -25,7 +25,7 @@ Generated from the API definitions (`python -m oh_my_slam.service.skill`); never
 | `POST /api/maps/{name}/revert` | Commit a copy of a kept version (O2) as a new version, and answer its summary; map_busy while a job of the map is registering or fusing, never for queued ones, which then start from it; keeps the camera registry and object ids, reuses the target's derived reads | [`RevertRequest`] (JSON) | 200 [`MapSummary`] |  |
 | `GET /api/maps/{name}/frames` | Keyframes and their poses |  | 200 [`Frames`] | `version` |
 | `GET /api/maps/{name}/objects` | Object records and support surfaces |  | 200 [`Objects`] | `version` |
-| `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m`, `height_cap_m` |
+| `GET /api/maps/{name}/grid` | Navigation grid |  | 200 [`Grid`] | `version`, `cell_m`, `z_min`, `z_max`, `footprint_radius_m`, `blind_disc`, `height_cap_m` |
 | `GET /api/maps/{name}/points` | Fused points inside a box |  | 200 [`Points`] | `version`, `min`, `max`, `voxel_m`, `max_points` |
 | `GET /api/maps/{name}/birdseye.png` | Bird's-eye image: the cloud, the objects' footprints with their ids and the keyframe cameras seen from above; its text metadata records map_version and pixel_to_map |  | 200 `image/png` | `version` |
 | `GET /api/maps/{name}/birdseye` | The bird's-eye image's metadata: size, pixel_to_map and the version's scale_source and scale_sigma_rel |  | 200 [`Birdseye`] | `version` |

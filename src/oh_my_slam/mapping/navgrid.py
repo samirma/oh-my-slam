@@ -18,13 +18,24 @@ volume is the previous one plus its new frames (``Volume.integrate``).
 * a cell is ``occupied`` when a surface voxel's centre lies in the band, ``free`` when it is not
   occupied and a ray passed through it in the band (or its floor was seen), else ``unknown``;
 * ``height_m`` is the highest surface at or below the height cap (the request's ``height_cap_m``,
-  else its ``z_max``, else ``HEIGHT_CAP_M``); ``floor_observed`` is a floor-like voxel there.
+  else its ``z_max``, else ``HEIGHT_CAP_M``); ``floor_observed`` is a floor-like voxel there;
+* a cell without a floor-like voxel that holds a surface voxel lower than the floor band (its
+  hits' mean height below the floor less the band) is a **drop** (oms/2.9): ``occupied`` whatever
+  the band, ``floor_observed`` ``FLOOR_DROP`` (3), ``height_m`` its highest such surface
+  (negative) — unless an obstacle of the band stands in the cell above the floor (it reads as
+  that obstacle), that surface continues the observed floor without a step (``drop_step_m``:
+  the floor's own sheet sagging below the band, a ramp) or the cells are fewer than
+  ``DROP_MIN_M2`` together (``_drops``). A drop is never a wall (``inflate_walls``) nor a
+  passage's jamb (``features``).
 
 **Camera stands** (``mark_stands``). The cell under each keyframe camera, and the robot's footprint
 there, are free whatever was seen; so are the cells of the disc the camera could not see, but for
 surfaces above its lowest line of sight and what lies behind them:
 radius ``h / tan(depression)`` of its lower field-of-view edge at height ``h`` above the floor
-(``blind_radius``, at most ``BLIND_RING_MAX_M``).
+(``blind_radius``, at most ``BLIND_RING_MAX_M``). The request's ``blind_disc`` limits it
+(``BLIND_DISCS``: ``full``; ``footprint``, the footprint alone; ``none``, the camera's own cell),
+and no cell is freed that is a drop or lies past one on the straight segment from the camera
+(``_past_drop``).
 
 **Features** (``features``). Passages are chords across narrow free gaps that lie in a wall:
 through every free cell on the medial axis of the free space (its clearance a local maximum across
@@ -53,7 +64,8 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import ndimage
+from scipy import ndimage, sparse
+from scipy.sparse import csgraph
 
 from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M, floor_band_m
 
@@ -123,6 +135,13 @@ LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, a
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 FLOOR_BY_RULE = 2  # floor_observed: free by rule (camera stand, blind disc), floor not seen
+FLOOR_DROP = 3  # floor_observed: a drop (oms/2.9): no floor seen, a surface below the floor band
+DROP = 3  # features: a drop cell's state there (not free, not unknown, never a wall or a jamb)
+BLIND_DISCS = ("full", "footprint", "none")  # the request's blind_disc (map.md §6)
+DROP_SIGHT_STEP = 0.5  # _past_drop: its rays' spacing and step, in cells
+DROP_STEP_BANDS = 0.5  # drop_step_m: a drop's step beside the floor, in floor bands,
+DROP_STEP_MIN_M = 0.06  # ... and at least (a smaller step continues the floor: _drops)
+DROP_MIN_M2 = 0.05  # a drop is at least this large (connected cells)
 
 Array = NDArray[np.float64]
 
@@ -487,8 +506,8 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float,
     # makes an occupied cell), by the height of the surface its hits make, not the voxel's
     # centre, wherever the floor falls in the voxels; whatever its normals (the stencil's
     # normals break at grazing angles and image borders)
-    floorlike = (vol.hit > 0) & \
-        (np.abs(vol.surface_z() - floor_z) <= floor_band_m(floor_sigma))
+    sz = vol.surface_z()
+    floorlike = (vol.hit > 0) & (np.abs(sz - floor_z) <= floor_band_m(floor_sigma))
     surface &= ~floorlike
     band = ((zc >= z_min) & (zc <= z_max))[:, None, None]
     in_band = surface & band
@@ -497,21 +516,88 @@ def layers(vol: Volume, floor_z: float, z_min: float, z_max: float,
     band_top = np.where(occupied, zc[np.clip(kb, 0, max(Z - 1, 0))], np.nan).astype(
         np.float32) if Z else np.full((Y, X), np.nan, np.float32)
     floor_obs = floorlike.any(axis=0)
-    free2 = (((vol.free > 0) & band).any(axis=0) | floor_obs) & ~occupied
-    state = np.where(occupied, OCCUPIED, np.where(free2, FREE, UNKNOWN)).astype(np.uint8)
     top = (surface | floorlike) & (zc <= height_cap)[:, None, None]
     has = top.any(axis=0)
     k = Z - 1 - np.argmax(top[::-1], axis=0)
     height = np.where(has, zc[np.clip(k, 0, max(Z - 1, 0))], np.nan).astype(np.float32) \
         if Z else np.full((Y, X), np.nan, np.float32)
+    # a drop (map.md §6, oms/2.9): no floor seen in the cell, and a surface (the evidence an
+    # occupied cell needs) lower than the floor band, by its height as the band classifies;
+    # but a cell where an obstacle of the band stands above the floor (a wall that rises from
+    # below the floor, a wall's foot under a floor estimated too high) reads as that obstacle
+    below = surface & (sz < floor_z - floor_band_m(floor_sigma))
+    drop = below.any(axis=0) & ~floor_obs & ~(in_band & (sz > floor_z)).any(axis=0)
+    if drop.any():
+        kd = Z - 1 - np.argmax(below[::-1], axis=0)  # the highest surface below the band
+        kf = np.argmax(floorlike, axis=0)  # the lowest floor-like one
+        drop = _drops(drop, np.where(below.any(axis=0), np.take_along_axis(sz, kd[None], 0)[0],
+                                     np.nan),
+                      np.where(floor_obs, np.take_along_axis(sz, kf[None], 0)[0], np.nan),
+                      drop_step_m(floor_sigma), vol.voxel)
+        height = np.where(drop, zc[kd], height).astype(np.float32)
+    free2 = (((vol.free > 0) & band).any(axis=0) | floor_obs) & ~occupied & ~drop
+    state = np.where(occupied | drop, OCCUPIED, np.where(free2, FREE, UNKNOWN)).astype(np.uint8)
+    floor_observed = np.where(drop, FLOOR_DROP, floor_obs).astype(np.uint8)
     return Layers(vol.origin[:2].copy(), vol.voxel, state, vol.obs.copy(), height,
-                  floor_obs.astype(np.uint8), band_top)
+                  floor_observed, band_top)
+
+
+def drop_step_m(floor_sigma: float) -> float:
+    """The height step a drop needs beside the floor it is seen next to: half the floor band,
+    ``DROP_STEP_MIN_M`` at least (``_drops``)."""
+    return max(DROP_STEP_MIN_M, DROP_STEP_BANDS * floor_band_m(floor_sigma))
+
+
+def _drops(cand: NDArray[np.bool_], h_below: Array, h_floor: Array, step: float, cell: float
+           ) -> NDArray[np.bool_]:
+    """The drop cells among the candidates ``cand`` (no floor seen, a surface below the floor
+    band): those whose surface does not continue the observed floor, in connected pieces
+    (8-connected) of ``DROP_MIN_M2`` at least.
+
+    ``h_below`` is each column's highest surface below the band (NaN: none), ``h_floor`` its
+    lowest floor-like surface (NaN: no floor seen). A surface below the band **continues the
+    floor** when it is reached from a floor-like surface through neighbouring columns
+    (8-connected) whose heights differ by ``step`` at most, along the surfaces below the band
+    alone (those under a seen floor included), never down a column: the floor's own sheet,
+    sagging or sloping below the band as far monocular depth and tilted poses make it, or a
+    ramp. A drop has a step: the lower floor past an edge, seen beyond the strip the edge
+    hides or right beside it, a stair, a hole. Without this, the floor of a real room seen
+    from a low camera made hundreds to thousands of drop cells, some more than 1 m down
+    (README, "Drops"). The reach is by connection, so a lower floor that a slope or a leaning
+    face joins to the floor's height reads as its continuation too."""
+    Y, X = cand.shape
+    has = np.isfinite(h_below)
+    n = int(has.sum())
+    ids = np.full((Y + 2, X + 2), -1, np.int64)
+    ids[1:-1, 1:-1][has] = np.arange(n)
+    pf = np.pad(h_floor, 1, constant_values=np.nan)
+    pb = np.pad(h_below, 1, constant_values=np.nan)
+    seed = np.zeros((Y, X), bool)
+    a: list[NDArray[np.int64]] = []
+    b: list[NDArray[np.int64]] = []
+    for dr, dc in ((0, 1), (1, -1), (1, 0), (1, 1), (0, -1), (-1, 1), (-1, 0), (-1, -1)):
+        win = (slice(1 + dr, Y + 1 + dr), slice(1 + dc, X + 1 + dc))
+        seed |= np.abs(h_below - pf[win]) <= step  # beside a floor-like surface (NaN: never)
+        if (dr, dc) > (0, 0):  # each pair of neighbours once
+            link = np.abs(h_below - pb[win]) <= step
+            a.append(ids[1:-1, 1:-1][link])
+            b.append(ids[win][link])
+    rows, cols = np.concatenate(a), np.concatenate(b)
+    graph = sparse.coo_matrix((np.ones(len(rows), bool), (rows, cols)), shape=(n, n))
+    _, part = csgraph.connected_components(graph, directed=False)
+    continues = np.zeros((Y, X), bool)
+    continues[has] = np.isin(part, part[ids[1:-1, 1:-1][seed]])
+    drop = cand & ~continues
+    lab, _ = ndimage.label(drop, np.ones((3, 3), bool))
+    big: NDArray[np.bool_] = np.bincount(lab.ravel()) * cell * cell >= DROP_MIN_M2
+    return drop & big[lab]
 
 
 def resample(lay: Layers, cell: float) -> Layers:
     """The layers on cells of ``cell`` metres over the same extent: nearest for finer cells; for
     coarser ones, the worst state (occupied, then free), the most observations, the highest
-    surface and any observed floor of the cells each covers."""
+    surface and any observed floor of the cells each covers; a coarse cell covering a drop is a
+    drop (as its worst state is occupied), its height the highest of its drops' surfaces."""
     if abs(cell - lay.cell) < 1e-9:
         return lay
     R, C = lay.shape
@@ -532,9 +618,10 @@ def resample(lay: Layers, cell: float) -> Layers:
     np.maximum.at(state, target, prio)
     obs = np.zeros(rows * cols, np.uint16)
     np.maximum.at(obs, target, lay.observations.ravel())
-    fl = np.zeros(rows * cols, np.uint8)  # seen (1) over free by rule (2) over not seen (0)
-    np.maximum.at(fl, target, np.array([0, 2, 1], np.uint8)[lay.floor_observed.ravel()])
-    fl = np.array([0, 2, 1], np.uint8)[fl]
+    # a drop (3) over seen (1) over free by rule (2) over not seen (0)
+    rank = np.zeros(rows * cols, np.uint8)
+    np.maximum.at(rank, target, np.array([0, 2, 1, 3], np.uint8)[lay.floor_observed.ravel()])
+    fl = np.array([0, 2, 1, 3], np.uint8)[rank].reshape(rows, cols)
 
     def highest(a: NDArray[np.float32]) -> NDArray[np.float32]:
         h = np.full(rows * cols, -np.inf, np.float32)
@@ -542,9 +629,10 @@ def resample(lay: Layers, cell: float) -> Layers:
         h[np.isinf(h)] = np.nan
         return h.reshape(rows, cols)
 
+    drops = highest(np.where(lay.floor_observed == FLOOR_DROP, lay.height, np.nan))
+    height = np.where(fl == FLOOR_DROP, drops, highest(lay.height)).astype(np.float32)
     return Layers(lay.origin, cell, state.reshape(rows, cols), obs.reshape(rows, cols),
-                  highest(lay.height), fl.reshape(rows, cols),
-                  None if lay.top is None else highest(lay.top))
+                  height, fl, None if lay.top is None else highest(lay.top))
 
 
 def inflate_walls(lay: Layers) -> Layers:
@@ -554,8 +642,9 @@ def inflate_walls(lay: Layers) -> Layers:
     thickened it already). A wall's
     face lies anywhere in its cell, and a thin wall seen from both sides sits on a cell boundary:
     the cell beside it may hold the surface. Furniture and thin obstacles are left as seen. The
-    grown cells take the highest surface of the wall cells beside them (``top``)."""
-    occ = lay.state == OCCUPIED
+    grown cells take the highest surface of the wall cells beside them (``top``). A drop cell is
+    no wall: it neither grows nor is grown into."""
+    occ = (lay.state == OCCUPIED) & (lay.floor_observed != FLOOR_DROP)
     lab, n = ndimage.label(occ, np.ones((3, 3), bool))
     big = np.zeros(n + 1, bool)
     for i, sl in enumerate(ndimage.find_objects(lab), start=1):
@@ -574,7 +663,7 @@ def inflate_walls(lay: Layers) -> Layers:
         for m in range(1, WALL_THICK_CELLS + 1):
             thick &= at(m)
         grow |= at(1) & ~thick  # beside a wall thinner than WALL_THICK_CELLS that way
-    grow &= ~occ
+    grow &= lay.state != OCCUPIED
     state = lay.state.copy()
     state[grow] = OCCUPIED
     top = None
@@ -645,8 +734,40 @@ def _disc(lay: Layers, xy: Array, radius: float
     return rr[inside], cc[inside], dist[inside]
 
 
+def _past_drop(lay: Layers, drop: NDArray[np.bool_], xy: Array, r: NDArray[np.int64],
+               c: NDArray[np.int64], dist: Array) -> NDArray[np.bool_]:
+    """Per cell (``r``, ``c``, its centre ``dist`` from ``xy``): whether it is a drop cell or the
+    straight segment from ``xy`` to it crosses one (map.md §6: such a cell is never free by
+    rule). From ``xy``, rays ``DROP_SIGHT_STEP`` cells apart at the farthest cell, stepped by as
+    much, give each direction's distance to its first drop cell; a cell is past a drop when its
+    centre is at least that far along its direction's ray (a quarter cell beside it at most)."""
+    out = np.zeros(r.shape, bool)
+    if not r.size or not drop[max(r.min() - 1, 0):r.max() + 2,
+                              max(c.min() - 1, 0):c.max() + 2].any():
+        return out  # no drop near these cells
+    R, C = lay.shape
+    step = DROP_SIGHT_STEP * lay.cell
+    reach = float(dist.max()) + lay.cell
+    n = max(8, math.ceil(2 * math.pi * reach / step))
+    theta = (np.arange(n) + 0.5) * (2 * math.pi / n)
+    t = np.arange(0.0, reach + step, step)
+    cols = np.floor((xy[0] + np.cos(theta)[:, None] * t[None] - lay.origin[0]) / lay.cell
+                    ).astype(np.int64)
+    rows = np.floor((xy[1] + np.sin(theta)[:, None] * t[None] - lay.origin[1]) / lay.cell
+                    ).astype(np.int64)
+    inside = (rows >= 0) & (rows < R) & (cols >= 0) & (cols < C)
+    hit = np.zeros(inside.shape, bool)
+    hit[inside] = drop[rows[inside], cols[inside]]
+    horizon = np.where(hit.any(axis=1), t[np.argmax(hit, axis=1)], np.inf)
+    ang = np.arctan2(lay.origin[1] + (r + 0.5) * lay.cell - xy[1],
+                     lay.origin[0] + (c + 0.5) * lay.cell - xy[0]) % (2 * math.pi)
+    b = np.minimum((ang / (2 * math.pi / n)).astype(np.int64), n - 1)
+    past: NDArray[np.bool_] = drop[r, c] | (dist >= horizon[b])
+    return past
+
+
 def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
-                footprint_radius: float | None) -> None:
+                footprint_radius: float | None, blind_disc: str = "full") -> None:
     """Free the camera cells (and the footprint) whatever was seen there, and each camera's blind
     disc (in place): its floor out to ``blind_radius``, which the camera could not see. A cell of
     the disc stays occupied only when it holds a surface the camera could see: higher, by
@@ -654,12 +775,22 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
     jamb, a table's leg), not what lies below it (other frames' floor noise, a low step); and
     the disc stops at those surfaces (not the floor behind a wall that cuts the disc). Every
     other cell of the disc is free, already free ones included; those whose floor nobody saw get
-    ``floor_observed`` 2 (free by rule)."""
+    ``floor_observed`` 2 (free by rule).
+
+    ``blind_disc`` (map.md §6, oms/2.9, one of ``BLIND_DISCS``): ``full`` as above;
+    ``footprint`` the footprint's disc alone; ``none`` the camera's own cell alone, whatever the
+    footprint. Whatever it is, a drop cell stays a drop, and so does every cell past one from
+    the camera (``_past_drop``): no cell at all for a camera that stands over a drop."""
+    drop = lay.floor_observed == FLOOR_DROP
     for st in stands:
         xy = np.asarray(st.T_map_cam, np.float64)[:2, 3]
-        r, c, _ = _disc(lay, xy, footprint_radius or 0.0)
+        r, c, dist = _disc(lay, xy, 0.0 if blind_disc == "none" else footprint_radius or 0.0)
+        ok = ~_past_drop(lay, drop, xy, r, c, dist)
+        r, c = r[ok], c[ok]
         lay.state[r, c] = FREE
         _by_rule(lay, r, c)
+        if blind_disc != "full":
+            continue
         ring = blind_radius(st, floor_z)
         if ring <= lay.cell:
             continue
@@ -682,6 +813,7 @@ def mark_stands(lay: Layers, stands: Sequence[Stand], floor_z: float,
         if not (0 <= me[0] - r0 < box.shape[0] and 0 <= me[1] - c0 < box.shape[1]):
             continue  # the camera lies outside the grid
         go = (lab[r - r0, c - c0] == lab[me[0] - r0, me[1] - c0]) & ~keep
+        go &= ~_past_drop(lay, drop, xy, r, c, dist)
         lay.state[r[go], c[go]] = FREE
         _by_rule(lay, r[go], c[go])
 
@@ -1212,8 +1344,11 @@ def features(lay: Layers, footprint_radius: float | None = None,
              leaves: Sequence[dict[str, Any]] = ()) -> Features:
     """Regions, passages and frontiers of a grid (see the module docstring); ``doors``: the map x,
     y of door-labelled objects (hints where to look for a passage); ``leaves``: the door objects
-    shaped as leaves (``id``, ``centre_m``, ``size_m``, ``yaw_deg``), which a passage names."""
-    state = lay.state
+    shaped as leaves (``id``, ``centre_m``, ``size_m``, ``yaw_deg``), which a passage names. A
+    drop cell (oms/2.9) bounds the free space as an obstacle does (no region or frontier runs
+    over it: it is not unknown), but it is no wall: no passage's chord is walled by drops, and
+    no door's jamb or leaf is one (``DROP``)."""
+    state = np.where(lay.floor_observed == FLOOR_DROP, DROP, lay.state).astype(np.uint8)
     free = state == FREE
     R, C = state.shape
     cell = lay.cell

@@ -144,7 +144,7 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
                       "T_map_cam": T.tolist(), "outputs": ALL,
                       "labels": [" Apple ", "cup", "apple"]}, {"i": img, "d": dep})
     summary = before[0]
-    assert doc["frame"] == "map" and doc["schema"] == "oms/2.8"
+    assert doc["frame"] == "map" and doc["schema"] == "oms/2.9"
     assert (doc["scale_source"], doc["scale_sigma_rel"]) == (summary["scale_source"],
                                                              summary["scale_sigma_rel"])
     # a depth image with a pose asks the detector alone, as an interactive request, with the

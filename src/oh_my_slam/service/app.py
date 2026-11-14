@@ -436,6 +436,7 @@ class Api:
         z_min = nav.number(q, "z_min", nav.DEFAULT_Z_BAND[0])
         z_max = nav.number(q, "z_max", nav.DEFAULT_Z_BAND[1])
         foot = nav.number(q, "footprint_radius_m", None, 0.0)
+        disc = nav.blind_disc(q, foot)
         # the height_m layer's ceiling (map.md §6): as asked, else the band's z_max when the
         # request gives one, else the default
         cap = nav.number(q, "height_cap_m", z_max if "z_max" in q else nav.HEIGHT_CAP_M)
@@ -448,7 +449,7 @@ class Api:
         _stage(request, "derive", t0)
         t1 = time.perf_counter()
         answer = await run_in_threadpool(nav.grid_answer, dv, self._ids(), cell, z_min, z_max,
-                                         foot, cap)
+                                         foot, cap, disc)
         out = body(answer.body)
         _stage(request, "grid", t1)
         # what the client waits for: the whole read, the body serialised, a cold read too
