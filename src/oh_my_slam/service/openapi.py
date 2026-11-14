@@ -30,6 +30,8 @@ def _param(p: Param) -> dict[str, Any]:
         schema["minimum"] = p.minimum
     if p.maximum is not None:
         schema["maximum"] = p.maximum
+    if p.enum is not None:
+        schema["enum"] = list(p.enum)
     return {"name": p.name, "in": p.where, "required": p.required, "description": p.description,
             "schema": schema}
 

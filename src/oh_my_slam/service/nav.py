@@ -35,6 +35,7 @@ MAX_CELL_M = 1.0
 MAX_GRID_CELLS = 16_000_000
 DEFAULT_Z_BAND = (0.05, 1.8)
 HEIGHT_CAP_M = navgrid.HEIGHT_CAP_M  # the height_m layer's default ceiling
+DEFAULT_BLIND_DISC = navgrid.BLIND_DISCS[0]  # full: the whole near blind disc
 DEFAULT_VOXEL_M = 0.01
 DEFAULT_MAX_POINTS = 200_000
 MAX_POINTS = 2_000_000
@@ -145,31 +146,53 @@ class GridAnswer:
     region_ids: list[int]
 
 
+def blind_disc(params: Any, footprint: float | None) -> str:
+    """The grid request's ``blind_disc`` (map.md §6, oms/2.9): ``full`` by default;
+    ``invalid_request`` for another word, and for ``footprint`` without
+    ``footprint_radius_m``."""
+    raw = params.get("blind_disc")
+    if raw is None:
+        return DEFAULT_BLIND_DISC
+    if raw not in navgrid.BLIND_DISCS:
+        raise invalid("blind_disc", "blind_disc must be one of "
+                      f"{', '.join(navgrid.BLIND_DISCS)}, got {raw!r}")
+    if raw == "footprint" and footprint is None:
+        raise invalid("footprint_radius_m", "blind_disc=footprint limits the blind disc to "
+                      "footprint_radius_m, which the request does not give")
+    return str(raw)
+
+
 def grid_answer(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
-                footprint: float | None, height_cap: float = HEIGHT_CAP_M) -> GridAnswer:
-    """``grid``, computed once per version and parameters (``DerivedVersion.answer``)."""
-    out: GridAnswer = dv.answer(("grid", cell, z_min, z_max, footprint, height_cap),
-                                lambda: grid(dv, ids, cell, z_min, z_max, footprint, height_cap))
+                footprint: float | None, height_cap: float = HEIGHT_CAP_M,
+                disc: str = DEFAULT_BLIND_DISC) -> GridAnswer:
+    """``grid``, computed once per version and parameters (``DerivedVersion.answer``; the
+    default blind disc's key is the one of before oms/2.9)."""
+    key = ("grid", cell, z_min, z_max, footprint, height_cap)
+    out: GridAnswer = dv.answer(
+        key if disc == DEFAULT_BLIND_DISC else (*key, disc),
+        lambda: grid(dv, ids, cell, z_min, z_max, footprint, height_cap, disc))
     return out
 
 
 def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
-         footprint: float | None, height_cap: float = HEIGHT_CAP_M) -> GridAnswer:
+         footprint: float | None, height_cap: float = HEIGHT_CAP_M,
+         disc: str = DEFAULT_BLIND_DISC) -> GridAnswer:
     """The ``Grid`` answer (map.md §6) on the version's floor estimate (``floor_z_m``,
-    ``floor_sigma_m``), ``height_m`` capped at ``height_cap`` (relative to the floor)."""
+    ``floor_sigma_m``), ``height_m`` capped at ``height_cap`` (relative to the floor), the
+    near blind disc as ``disc`` asks (the request's ``blind_disc``)."""
     vol = dv.volume()
     floor, sigma = dv.floor_z, dv.floor_sigma
     # the features at the volume's resolution,
     base = navgrid.layers(vol, floor, z_min, z_max, sigma, height_cap)
     walls = navgrid.inflate_walls(base)  # whatever cell size is asked, on the walls as seen
-    navgrid.mark_stands(base, dv.stands, floor, footprint)
-    navgrid.mark_stands(walls, dv.stands, floor, footprint)
+    navgrid.mark_stands(base, dv.stands, floor, footprint, disc)
+    navgrid.mark_stands(walls, dv.stands, floor, footprint, disc)
     lay = navgrid.resample(walls, cell)
     if lay.state.size > MAX_GRID_CELLS:
         raise invalid("cell_m", f"cell_m {cell} gives {lay.state.size} cells (at most "
                       f"{MAX_GRID_CELLS}): ask for larger cells")
     if lay is not walls:
-        navgrid.mark_stands(lay, dv.stands, floor, footprint)
+        navgrid.mark_stands(lay, dv.stands, floor, footprint, disc)
     feat = navgrid.features(base, footprint, dv.meta.get("doors", []),
                             dv.meta.get("door_leaves", []))
     rid = ids.assign(dv.name, "regions", [(r.centroid, r.area_m2) for r in feat.regions])
@@ -194,7 +217,7 @@ def grid(dv: DerivedVersion, ids: Ids, cell: float, z_min: float, z_max: float,
         "map": dv.name, "map_version": dv.version,
         "origin_m": [_r(lay.origin[0]), _r(lay.origin[1])], "cell_m": cell,
         "shape": [rows, cols], "z_band_m": [z_min, z_max], "floor_z_m": _r(floor),
-        "floor_sigma_m": _r(sigma), "height_cap_m": height_cap,
+        "floor_sigma_m": _r(sigma), "height_cap_m": height_cap, "blind_disc": disc,
         "scale_source": dv.record["scale_source"],
         "scale_sigma_rel": dv.record["scale_sigma_rel"],
         "layers": {"state": binary(lay.state.astype(np.uint8)),
