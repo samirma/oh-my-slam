@@ -218,6 +218,39 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
     assert t["count"] == count + 1 and t["source"] == "measured"
 
 
+def test_an_analysis_on_a_stored_monocular_map_reports_the_constant(
+        an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]]) -> None:
+    """map.md §1, oms/2.12: a version stored with the nominal 0.10 reads 0.65 (oms/2.12)."""
+    import json
+
+    img, dep, T, _ = shot
+    files = [p for p in (an.service.store.dir("t") / "versions").glob("*.json")
+             if p.stem.isdigit()]
+    kept = {p: p.read_text() for p in files}  # the fixture is shared: put the records back
+
+    def reread() -> None:  # as after a restart
+        derived = an.service.derived
+        assert derived is not None
+        with derived._lock:
+            derived._cache.clear()
+            derived._latest.clear()
+    try:
+        for p in files:
+            d = json.loads(kept[p])
+            d["scale_source"], d["scale_sigma_rel"] = "monocular", 0.10
+            p.write_text(json.dumps(d))
+        reread()
+        req = {"image": "i", "depth": "d", "camera_id": "cam", "map": "t",
+               "T_map_cam": T.tolist(), "outputs": ["points"]}
+        doc = an.analyse(req, {"i": img, "d": dep})
+        assert (doc["scale_source"], doc["scale_sigma_rel"]) == ("monocular", 0.65)
+        assert an.get("/api/maps/t", "MapSummary")["scale_sigma_rel"] == 0.65
+    finally:
+        for p, text in kept.items():
+            p.write_text(text)
+        reread()
+
+
 def test_monocular_depth_is_brought_onto_the_map(
         an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]],
         monkeypatch: pytest.MonkeyPatch) -> None:

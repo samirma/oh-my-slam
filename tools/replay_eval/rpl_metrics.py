@@ -256,9 +256,27 @@ def target_of(d: Def, targets: Targets) -> dict[str, Any] | None:
     return targets.get(d.id)
 
 
+def upper_only(t: dict[str, Any] | None) -> dict[str, Any] | None:
+    """``t`` with every ``between`` bound reduced to its upper end (evaluation.md: a monocular
+    map's scale sigma is a deliberately conservative constant, so its sigmas are exempt from the
+    lower tightness bound)."""
+    def one(p: dict[str, Any]) -> dict[str, Any]:
+        if p.get("op") != "between":
+            return p
+        return {**{k: v for k, v in p.items() if k != "value"}, "op": "<=",
+                "value": p["value"][1]}
+    if not t or t.get("info"):
+        return t
+    if "parts" in t:
+        return {**t, "parts": {k: one(p) for k, p in t["parts"].items()}}
+    return one(t)
+
+
 def verdict(d: Def, values: dict[str, list[float]] | None, missing: str | None,
-            targets: Targets) -> dict[str, Any]:
+            targets: Targets, exempt_lower: bool = False) -> dict[str, Any]:
     t = target_of(d, targets)
+    if exempt_lower:
+        t = upper_only(t)
     out: dict[str, Any] = {"contract": d.contract, "description": d.description,
                            "unit": d.unit, "target": t}
     if missing is not None:
@@ -704,6 +722,8 @@ class Measure:
         tol = max(self.p.locate_abs_m, self.p.locate_depth_share * depth)
         s.info["locate_tolerance_m"] = tol
         for lo in rec.locates:
+            if lo.response.get("scale_source") == "monocular":
+                s.info["locate_monocular"] = True
             kfs = [self.by_name[r["name"]] for r in
                    rec.frames.get(int(lo.response["map_version"]), {"frames": []})["frames"]
                    if r["name"] in self.by_name]
@@ -1158,7 +1178,9 @@ def run_metrics(samples: Samples, caps: set[str], plan: FloorPlan | None, mode: 
         if not applies(d, mode, episode, params):
             continue
         miss = missing_for(d, caps, plan)
-        out[d.id] = verdict(d, samples.values, miss, targets)
+        out[d.id] = verdict(d, samples.values, miss, targets,
+                            d.id == "locate.sigma_tightness_bound"
+                            and bool(samples.info.get("locate_monocular")))
     return out
 
 

@@ -315,6 +315,39 @@ def test_locate_sigmas_and_update_containment(world: Any) -> None:
     assert s.values["locate.ambiguity_flagged"] == [1.0]
 
 
+def test_monocular_map_exempt_from_lower_tightness_bound(world: Any) -> None:
+    ep, syn, _, _ = world
+    kf = keyframes(syn)
+    by = {f.name: f for f in ep.all_frames()}
+    rec = record(["O5"], frames={1: {"frames": rows(ep, kf[:3])}})
+    j = job(kf[:3])
+    j.job["inputs"] = [
+        {"name": n, "status": "registered", "sigma_pos_m": 0.01, "sigma_rot_deg": 0.1,
+         "T_map_cam": ANCHOR.pose_to_map(by[n].truth).tolist()} for n in kf[:3]]
+    rec.jobs = [j]
+    exact = ANCHOR.pose_to_map(by[kf[3]].truth).tolist()  # error 0: ratio 0, under the 0.3 bound
+
+    def locates(source: str) -> None:
+        rec.locates = [LocateObs([kf[3]], {"map_version": 1, "scale_source": source, "frames": [
+            {"name": kf[3], "status": "located", "T_map_cam": exact, "sigma_pos_m": 0.65,
+             "sigma_rot_deg": 5.0, "ambiguity": None, "rivals": []}]}, 0.1, "plan")]
+    tg = Targets({"locate.sigma_tightness_bound": {"parts": {
+        "pos": {"op": "between", "value": [0.3, 1.5]},
+        "rot": {"op": "between", "value": [0.3, 1.5]}}}})
+
+    def status(source: str) -> tuple[str, Any]:
+        locates(source)
+        s = measure(rec, ep)
+        v = rm.run_metrics(s, {"O5"}, None, "metric", "e", rm.Params(), tg)
+        return v["locate.sigma_tightness_bound"]["status"], v["locate.sigma_tightness_bound"]
+    assert status("priors")[0] == "fail"
+    st, v = status("monocular")
+    assert st == "pass" and v["target"]["parts"]["pos"] == {"op": "<=", "value": 1.5}
+    assert rm.upper_only({"info": True}) == {"info": True} and rm.upper_only(None) is None
+    assert rm.upper_only({"op": "between", "value": [1, 2]}) == {"op": "<=", "value": 2}
+    assert rm.upper_only({"op": ">=", "value": 2}) == {"op": ">=", "value": 2}
+
+
 def test_grid_id_stability(world: Any) -> None:
     ep, _, _, _ = world
     reg = {"id": 1, "area_m2": 4.0, "polygon_m": [[0, 0], [2, 0], [2, 2], [0, 2]],

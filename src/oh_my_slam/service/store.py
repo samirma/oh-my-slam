@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from oh_my_slam.core.atomic import atomic_write_bytes, atomic_write_json
+from oh_my_slam.mapping.anchored import recorded_scale_sigma
 from oh_my_slam.service import object_ids
 from oh_my_slam.service.errors import ApiError, invalid
 
@@ -111,6 +112,17 @@ def clone_tree(src: Path, dst: Path) -> None:
 
 DEFAULT_KEEP_VERSIONS = 20  # versions kept per map (``--keep-versions``, README)
 KEPT_DEPTH = "kept_depth.json"  # a version file later versions read (``update.KEPT_DEPTH``)
+
+
+def read_scale(d: dict[str, Any]) -> dict[str, Any]:
+    """``d`` (a version record, a recorded pose, a job record) with its ``scale_sigma_rel``
+    as it reads now: a ``monocular`` scale reads the constant, also when it was stored before
+    oms/2.12 as the nominal one (map.md §1). The one place reads of a stored scale go through;
+    the stored file is never rewritten."""
+    if d.get("scale_source") is not None and d.get("scale_sigma_rel") is not None:
+        d["scale_sigma_rel"] = recorded_scale_sigma(str(d["scale_source"]),
+                                                    d["scale_sigma_rel"])
+    return d
 
 
 def _info(record: dict[str, Any]) -> dict[str, Any]:
@@ -205,7 +217,7 @@ class Store:
             for r in out.get("frames", []):
                 if r.get("pose_state") == "provisional":
                     r["pose_state"] = "kept_at_prior"
-        return out
+        return read_scale(out)
 
     def version_file(self, name: str, n: int, fname: str) -> Path:
         """A file committed with version ``n`` (``commit``'s ``files``)."""

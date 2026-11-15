@@ -25,7 +25,7 @@ from oh_my_slam.mapping import anchor, checks, navgrid, relocalize, sigmas
 from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
-from oh_my_slam.service.store import Store, utc
+from oh_my_slam.service.store import Store, read_scale, utc
 
 log = get_logger("oh_my_slam.service.nav")
 
@@ -463,4 +463,4 @@ def recorded_pose(store: Store, name: str) -> dict[str, Any]:
     if "scale_source" not in out:
         v = store.version(name, int(out["map_version"]))
         out["scale_source"], out["scale_sigma_rel"] = v["scale_source"], v["scale_sigma_rel"]
-    return out
+    return read_scale(out)

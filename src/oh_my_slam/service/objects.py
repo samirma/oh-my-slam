@@ -221,8 +221,11 @@ def body(store: Store, derived: Derived, ids: nav.Ids, dv: DerivedVersion,
     def load() -> dict[str, Any]:
         path = derived.dir(dv.name) / str(dv.version) / CACHE
         if path.exists():
-            return with_label_scores(json.loads(path.read_text()),
-                                     dv.record.get("labels") or [])
+            # the answer's scale is the version's as it reads now (a cache kept before oms/2.12
+            # may hold the nominal monocular one)
+            cached = {**json.loads(path.read_text()), "scale_source": dv.record["scale_source"],
+                      "scale_sigma_rel": dv.record["scale_sigma_rel"]}
+            return with_label_scores(cached, dv.record.get("labels") or [])
         out = compute(store, ids, dv, files)
         atomic_write_json(path, out)
         return out

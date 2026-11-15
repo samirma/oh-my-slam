@@ -23,7 +23,7 @@ from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.log import get_logger, log_context
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.schema import SCHEMA_VERSION
-from oh_my_slam.service.store import utc
+from oh_my_slam.service.store import read_scale, utc
 
 log = get_logger("oh_my_slam.service.jobs")
 
@@ -82,6 +82,7 @@ class Job:
 
     @staticmethod
     def from_record(d: dict[str, Any]) -> Job:
+        d = read_scale(dict(d))
         return Job(d["job_id"], d["map"], float(d["created"]), d["state"], float(d["progress"]),
                    d["eta_s"], d.get("base_version"), d["result_version"], d["inputs"],
                    d["quality"], d.get("scale_source"), d.get("scale_sigma_rel"),
