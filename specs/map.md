@@ -238,7 +238,7 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   `scale_sigma_rel` is estimated from the residuals of that source, from image-confirmed frames
   only (§2), and never from the depth of a `floor_not_judged` keyframe, whether as the frame's
   own evidence or as a reference's for a later frame (§2). For `camera_height`, it never falls
-  below the sent heights' own relative sigma, one value common to a camera's frames, since
+  below the median of the sent heights' relative sigmas over the frames that anchor it, since
   residuals cannot reveal an error common to them all. It is one sigma: the relative error of any horizontal distance, in every
   direction, stays within 3 × `scale_sigma_rel`. A later update may refine the scale:
   `quality.scale_ratio_vs_prev` reports the change.
@@ -300,7 +300,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     at its committed pose, holds a measurable floor plane (among the large horizontal planes below the camera holding
     at least a minimum share of the frame's depth points, a constant in `README.md`, the one
     nearest the expected height within the floor check's bound, the monocular scale bound for a
-    monocular frame; when none is that near, the widest) has its own camera height h_f above that plane.
+    monocular frame; when none is that near, the widest whose implied scale is plausible, a range
+    in `README.md`). The same rule, with the same minimum share, defines a "large" plane
+    wherever this document uses the word, at map level too (§6) has its own camera height h_f above that plane.
     With H the sent height and `height_sigma_m` its sigma:
     * a frame with a sensor depth image whose |h_f − H| exceeds
       3 × sqrt(height_sigma² + (σ_depth · H)² + σ_z²) contributes no content: no cloud points, no
@@ -769,7 +771,8 @@ seen there.
   * when priors fixed the map frame, it is the large horizontal plane nearest the priors'
     origin height (z = 0) among those seen under the robot (within a distance of its
     image-confirmed cameras recorded in `README.md`), and z = 0 itself when there is none or
-    it lies within max(0.06 m, 3 × `floor_sigma_m`) of z = 0; a surface seen only past the
+    it lies within max(0.06 m, 3 × `floor_sigma_m`) of z = 0 (with no plane there, the lowest
+    dense layer of the points under the robot, else z = 0); a surface seen only past the
     support's edge is a support surface, never the floor. Robots put that origin where they stand: on the
     floor for a base or a humanoid, at the base link on the worktop for an arm;
   * without priors but with a camera height (`height_above_floor_m`), it is the floor plane the
@@ -813,7 +816,7 @@ seen there.
   floor falls in the grid's voxels.
 
   **Floor sigma** (oms/2.4). `floor_sigma_m` is a robust standard deviation of the heights of
-  the points of the floor plane under the robot, for example 1.4826 × the median absolute deviation, not a half-width of a
+  the points under the robot at the floor's level (within a tolerance in `README.md`), for example 1.4826 × the median absolute deviation, not a half-width of a
   histogram peak. The points are those of the kept frames, after the floor check (§2): a frame
   the check excluded, or did not judge (`floor_not_judged`), adds none.
 * Optional `footprint_radius_m`: the robot's radius.

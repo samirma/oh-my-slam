@@ -535,7 +535,10 @@ The versions read, revert and `--keep-versions` are O2.
 * **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
   the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and
-  `T_map_cam` (a depth image is then taken in the map's metres), else `depth` with the frame's
+  `T_map_cam` (a depth image is then taken in the map's metres; on a `camera_height` map a
+  monocular frame takes its own sent-height scale, as an update gives its content (map.md §2),
+  and the map's cloud scale when it sends no height, shows no floor plane, or its own scale lies
+  beyond the monocular scale bound from the map's monocular depth scale), else `depth` with the frame's
   depth, else `camera_height` when the camera gives its height and the frame shows a measurable
   floor plane, else `monocular`. Without `T_map_cam`, a `map` gives the camera only, never the
   scale.
