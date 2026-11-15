@@ -548,7 +548,9 @@ The versions read, revert and `--keep-versions` are O2.
   held by at least a minimum number of valid pixels (a constant in `README.md`), none of them
   the model's low-confidence pixels, depth edges or image-border pixels; a beam whose returns
   are all unsupported is `unseen`, never a short-range `obstacle`. Each beam carries `support`,
-  the number of pixels holding its return (0 for `unseen`).
+  the number of pixels holding its return (for `floor_end`, the beam's supported floor pixels; 0
+  for `unseen`). The model's low-confidence pixels are those without depth and a margin around
+  them (a constant in `README.md`).
 * **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
   the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and
