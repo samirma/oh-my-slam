@@ -70,7 +70,8 @@ Each row is something the skill needs. Each row's test is in §11.
   row-major arrays `M[row][col]`. `T_map_cam` is the pose of the camera's *optical* frame in the
   map frame, so it maps optical-frame points to map-frame points.
 * **Scale.** Every response that carries map-frame metres also carries:
-  * `scale_source`: one of `priors`, `depth`, `camera_height`, `monocular`;
+  * `scale_source`: one of `priors`, `depth`, `camera_height`, `monocular`, and `baseline`
+    (frame analysis with motion stereo, oms/2.11);
   * `scale_sigma_rel`: the relative one-sigma uncertainty of the map's scale.
 
 ## 4. Inputs
