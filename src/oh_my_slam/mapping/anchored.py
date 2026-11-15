@@ -298,6 +298,10 @@ HEIGHT_VOTE_BIN = 0.03  # log scale: the frames' floor candidates vote in bins t
 HEIGHT_VOTE_TOL = 0.15  # a frame's candidate this near the vote counts
 DIRECTION_SECTORS = 4  # camera heights' scale compared between this many viewing directions
 FLOOR_CANDIDATES = 8  # the most supported height peaks tried as planes
+# where priors fixed the frame, the map's floor is looked for among the cloud's points within this
+# (horizontally) of an image-confirmed camera: the surface the robot stands on, never a lower one
+# seen only past its edge (map.md §6, ``AnchoredMap._floor_estimate``)
+FLOOR_NEAR_M = 1.0
 MAP_FLOOR_SHARE = 0.5  # the map's floor: the lowest plane with this share of the best one's
 LEVEL_MIN_DEG = 0.1  # a camera-only map's floor plane levels it from this tilt
 LEVEL_BAND_REL = 0.3  # ... fitted on the points this near its height (a tilted floor spreads)
@@ -598,6 +602,15 @@ def horizontal_plane(q: Array, h0: float, band: float = FLOOR_BAND_REL
         return None
     support = int((np.abs((q - c0) @ nrm) < tol).sum())
     return nrm, float(abs(nrm @ c0)), support, float(-c0[2]), len(inl)
+
+
+def _near_standpoints(pts: Array, centres: Array) -> NDArray[np.bool_]:
+    """The points of ``pts`` within ``FLOOR_NEAR_M`` horizontally of a camera centre of
+    ``centres`` (none without one)."""
+    out = np.zeros(len(pts), bool)
+    for c in centres:
+        out |= np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) <= FLOOR_NEAR_M
+    return out
 
 
 def version_floor(prev: float | None, z: float | None, sigma: float) -> float | None:
@@ -4831,7 +4844,7 @@ class AnchoredMap:
         kept = version_floor(self.floor_prev, z, sig)
         if kept != z:
             assert kept is not None
-            z, sig = kept, floor_spread(self.cloud.points()[:, 2], kept)
+            z, sig = kept, floor_spread(self._floor_points()[:, 2], kept)
         self._last_floor = z
         return z, sig
 
@@ -4839,24 +4852,30 @@ class AnchoredMap:
         """A version's floor estimate by the rules of map.md §6, before the previous version's
         is kept (``floor``). The floor is the surface the robot stands on, among the large
         horizontal planes of the cloud below every image-confirmed camera
-        (``floor_candidates``). Where priors fixed the frame, every one of them, each at its own
-        level, the height of its points (never its distance to the map's origin: a plane tilted
-        by 1.8° reads 0.10 m lower 3 m from where it was seen, and the cameras of such a map
-        are anywhere); on a camera-only map, those holding ``MAP_FLOOR_SHARE`` of the best
-        one's sampled points, at their distance below the origin's camera:
+        (``floor_candidates``):
 
         * priors fixed the map frame: z 0 (their origin is where the robot stands), unless the
-          plane nearest it (not a lower floor seen past a worktop's edge; without a plane, the
-          lowest dense layer) lies beyond max(0.06 m, 3 × its own spread) of it (the origin is
-          then not on that plane, as an arm's on a worktop): then that plane;
+          plane nearest it lies beyond max(0.06 m, 3 × its own spread) of it (the origin is then
+          not on that plane, as an arm's on a worktop): then that plane. The planes are those
+          under the robot, among the points within ``FLOOR_NEAR_M`` of a confirmed camera (not
+          counters or a lower floor seen only past a worktop's edge, which are support
+          surfaces), every one holding ``FLOOR_MIN_SHARE`` of those points, each at its own
+          level, the height of its points (never its distance to the map's origin: a plane
+          tilted by 2.5° reads 0.11 m lower 2.6 m from where it was seen, and the cameras of
+          such a map are anywhere); without one, the lowest dense layer of those points;
+          without that, z 0;
         * a camera-only map whose first frame had a camera height: z 0 (the floor that height
           defines, map.md §1), refined to the observed plane nearest it when that lies within
           ``FLOOR_BAND_SIGMAS`` of its own points' spread (``floor_sigma_m``);
-        * otherwise the lowest; without one, the lowest dense layer."""
+        * otherwise the lowest; without one, the lowest dense layer.
+
+        On a camera-only map the planes are those holding ``MAP_FLOOR_SHARE`` of the best
+        one's sampled points, at their distance below the lowest camera, as before."""
         pts = self.cloud.points()
         centres = np.array([k.centre for k in self.confirmed()]).reshape(-1, 3)
         below = float(centres[:, 2].min()) if len(centres) else 0.0
         floor = None
+        spread = pts[:, 2]  # the heights the floor's spread is taken over (``_floor_points``)
         if self.created_with == "none" and self.origin_height_m is not None:
             floor = 0.0
             if len(pts):
@@ -4868,29 +4887,39 @@ class AnchoredMap:
                     z = min(planes, key=abs)
                     if abs(z) <= FLOOR_BAND_SIGMAS * floor_spread(pts[:, 2], z):
                         floor = z
-        elif len(pts):
-            # priors fixed the frame: the plane nearest z 0 is looked for among every large
-            # plane (map.md §6), not only those with a share of the best supported one's points
-            # (the surface a robot stands on is often smaller than what it sees around it: a
-            # worktop among counters), each at its level (the cameras are anywhere in the
-            # frame). A camera-only map's rules are as they were: its cameras start above the
-            # origin, where a plane's distance to the origin is the camera's height above it
-            fixed = self.created_with in ("metric", "drifting")
-            q = pts - np.array([0.0, 0.0, below])
-            planes = floor_candidates(q, 0.0, level=True) if fixed \
-                else floor_candidates(q, MAP_FLOOR_SHARE, sampled=True)
-            if planes and fixed:
-                # priors fixed the frame: the plane the robot stands on, nearest their origin
-                # height (z 0), not a lower floor seen past a worktop's edge (map.md §6)
-                floor = below - min(planes, key=lambda h: abs(below - h))
-            else:
-                floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
-            if floor is not None and fixed \
-                    and abs(floor) <= floor_band_m(floor_spread(pts[:, 2], floor)):
+        elif len(pts) and self.created_with in ("metric", "drifting"):
+            # priors fixed the frame: the plane the robot stands on, nearest their origin height
+            # (z 0), among the planes under it (the points within FLOOR_NEAR_M of a camera: not
+            # counters or a lower floor seen only past a worktop's edge), each at its level (the
+            # cameras are anywhere in the frame), every one with real support
+            # (FLOOR_MIN_SHARE of those points), not only those with a share of the best one's:
+            # the surface a robot stands on is often smaller than what it sees around it
+            near = self._floor_points()
+            spread = near[:, 2]
+            planes = floor_candidates(near - np.array([0.0, 0.0, below]), 0.0, level=True,
+                                      min_share=FLOOR_MIN_SHARE)
+            floor = below - min(planes, key=lambda h: abs(below - h)) if planes \
+                else lowest_layer(spread, below)
+            if floor is None or abs(floor) <= floor_band_m(floor_spread(spread, floor)):
                 floor = 0.0  # z 0 itself within the floor band of it (map.md §6, oms/2.5)
+        elif len(pts):
+            planes = floor_candidates(pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE,
+                                      sampled=True)
+            floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
         if floor is None:
             return None, FLOOR_SIGMA_DEFAULT_M
-        return floor, floor_spread(pts[:, 2], floor)
+        return floor, floor_spread(spread, floor)
+
+    def _floor_points(self) -> NDArray[np.float64]:
+        """The cloud's points the floor and its spread are taken on (``floor_spread``): where
+        priors fixed the frame, those under the robot, within ``FLOOR_NEAR_M`` of an
+        image-confirmed camera (the floor's points, not walls or counters away from it that lie
+        within ``FLOOR_SPREAD_M`` of its height); else all of them."""
+        pts = self.cloud.points()
+        if self.created_with not in ("metric", "drifting"):
+            return pts
+        centres = np.array([k.centre for k in self.confirmed()]).reshape(-1, 3)
+        return pts[_near_standpoints(pts, centres)]
 
     def bounds(self) -> NDArray[np.float64]:
         """The points bounding the map: the cloud's and the cameras'."""

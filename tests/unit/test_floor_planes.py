@@ -13,19 +13,34 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
+from starlette.testclient import TestClient
 
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.mapping import analysis
+from oh_my_slam.mapping import analysis, quality
 from oh_my_slam.mapping import anchored as an
 from oh_my_slam.mapping.anchored import AnchoredMap
 from oh_my_slam.reconstruction.pointcloud import pixel_points
-from tests.synth.room import Room, base_pose, look, render
+from oh_my_slam.service.app import Service, create_app
+from oh_my_slam.service.derived import Derived
+from oh_my_slam.service.jobs import Jobs
+from oh_my_slam.service.store import Store
+from oh_my_slam.service.timings import Timings
+from oh_my_slam.service.update import Updater
+from tests.fakes.service import FakeBackend, FakeInference
+from tests.synth.room import Room, base_pose, jpeg, look, png_depth, render
+from tests.synth.table import K_TABLE, Item, TableScene
 from tests.unit import test_round14
+from tests.unit.test_anchored_objects import detections
 from tests.unit.test_round14 import frame, prior
+from tests.unit.test_service_api import Client
+from tests.unit.test_service_nav import decode
 
 K640 = Intrinsics(270.0, 270.0, 320.0, 240.0, 640, 480)  # the client's camera
 # the model's floor 0.9 m below the camera, a 15 cm box top 0.37 m below it (0.3 % of the frame)
@@ -87,6 +102,22 @@ def test_a_sliver_at_the_sent_height_is_not_the_floor() -> None:
     # a monocular depth near its true scale takes the plane near the height
     got = an.floor_verdict("mono", 0.9, 0.03, T, 0.05, z * 1.2, K640)
     assert got.judged and got.factor == pytest.approx(1 / 1.2, rel=0.02)
+
+
+def test_quality_scale_check_reads_the_floor_not_the_sliver(tmp_path: Path) -> None:
+    """``quality.scale_check`` (api.md §4, oms/2.8; ``AnchoredMap.floor_ratios``) and
+    ``quality.scale_check``'s statistics take the same plane as the floor check: the low view's
+    ratio is its sent height over the wide floor, 0.37 / 0.9 (before: 1.0, the box top that
+    lay at the sent height)."""
+    T = look(0.0, (0.0, 0.0, 0.9), -30.0)
+    img, z = render(LOW, T, K640, supersample=1)[:2]
+    mono = (z.astype(np.float32), K640, None, np.array([0.0, -1.0, 0.0]))
+    m = AnchoredMap(tmp_path / "m")
+    m.update([an.FrameIn("s0", "cam", img, K640, prior(T), None, None, 0.37, 0.03, 1000,
+                         lambda: mono)])
+    assert m.floor_ratios() == [pytest.approx(0.37 / 0.9, abs=0.01)]
+    got = quality.scale_check(m.floor_ratios())
+    assert got is not None and got["median_ratio"] == pytest.approx(0.411, abs=0.01)
 
 
 def test_the_worktop_under_the_robot_is_its_floor_among_wider_counters() -> None:
@@ -172,6 +203,26 @@ def test_the_map_s_floor_is_the_plane_nearest_z_0_whatever_its_size(tmp_path: Pa
     assert _raised(tmp_path, -0.15)._floor_estimate()[0] == pytest.approx(-0.15, abs=0.005)
 
 
+def test_a_surface_seen_only_past_the_edge_is_not_the_floor(tmp_path: Path) -> None:
+    """map.md §6 "Other planes, such as the room floor seen past a worktop's edge, are support
+    surfaces": the floor is looked for under the robot, within ``FLOOR_NEAR_M`` of its cameras.
+    A base camera that sees only the counters 1.5 m away and 0.2 m lower keeps z 0 (before:
+    the counters, the plane nearest z 0, −0.2 m); a ramp under the robot with no plane is its
+    lowest dense layer."""
+    rng = np.random.default_rng(2)
+    m = _raised(tmp_path, 0.0)
+    far = np.vstack([_plane(rng, (-3.0, 3.0), (-2.5, -1.5), -0.2),
+                     _plane(rng, (1.5, 3.0), (-1.5, 2.5), -0.2)])
+    m.cloud = an.Cloud()
+    m.cloud.add(far, np.zeros((len(far), 3)))
+    assert m._floor_estimate()[0] == 0.0
+    xs, ys = np.meshgrid(np.arange(-0.6, 0.6, 0.02), np.arange(-0.6, 0.6, 0.02))
+    ramp = np.column_stack([xs.ravel(), ys.ravel(), -0.5 + 0.5 * xs.ravel()])  # 27 deg
+    m.cloud.add(ramp, np.zeros((len(ramp), 3)))
+    z = m._floor_estimate()[0]
+    assert z is not None and -0.8 < z < -0.2
+
+
 # the room of the engine test: the robot on a 0.9 x 0.8 m worktop 1.1 m up, counters 0.9 m high
 # along the four walls
 test_round14.ROOMS["worktop"] = Room(boxes=[((-0.45, -0.4, 0.0), (0.45, 0.4, 1.1)),
@@ -211,3 +262,91 @@ def test_a_robot_on_a_worktop_keeps_its_floor_and_its_wrist_frames(tmp_path: Pat
     kf = m.keyframe(later.keyframe)
     assert kf is not None and kf.height_ok and kf.contributes() and kf.detects()
     assert m.floor()[0] == 0.0
+
+
+# -- the raised-surface scene through the service: objects on the worktop ----------------------
+
+# the robot on a 0.9 x 0.8 m worktop 1.1 m up (the priors' z 0), counters 0.9 m high along the
+# walls; a mug and a box on the worktop 0.2-0.4 m from the base, a kettle and a pot on the
+# counters
+WORKTOP = TableScene(
+    items=[Item("mug", [((0.25, 0.1, UP), (0.35, 0.2, UP + 0.12))], (200, 40, 40)),
+           Item("box", [((0.2, -0.3, UP), (0.38, -0.15, UP + 0.1))], (40, 60, 200)),
+           Item("kettle", [((2.0, -0.2, 0.9), (2.25, 0.05, 1.15))], (60, 190, 50)),
+           Item("pot", [((-2.25, 0.3, 0.9), (-1.95, 0.6, 1.05))], (200, 200, 40))],
+    room=test_round14.ROOMS["worktop"])
+TABLE_CAM = {"fx": K_TABLE.fx, "fy": K_TABLE.fy, "cx": K_TABLE.cx, "cy": K_TABLE.cy,
+             "width": K_TABLE.width, "height": K_TABLE.height}
+
+
+@pytest.fixture
+def client(tmp_path: Path) -> Iterator[Client]:
+    store = Store(tmp_path / "data")
+    store.create()
+    backend = FakeBackend()
+    timings = Timings()
+    updater = Updater(store, backend, timings)
+    jobs = Jobs(store.jobs, updater, timings.predict_update)
+    jobs.start()
+    derived = Derived(store, backend.read)
+    derived.start()
+    service = Service(store, jobs, FakeInference(), backend.require_inference, timings=timings,
+                      version="test", dry_run=updater.dry_run, derived=derived)
+    with TestClient(create_app(service)) as http:
+        yield Client(http, backend, service)
+    jobs.stop(timeout=10)
+    derived.stop()
+
+
+def _worktop_frames(c: Client, tag: str, poses: list[np.ndarray], height: float | None
+                    ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+    """Depth-image frames of ``WORKTOP`` with metric priors in the odometry's frame (its z 0 the
+    worktop) and their detections; ``height``: the sent camera height above the worktop."""
+    out, files = [], {}
+    for i, T in enumerate(poses):
+        rgb, z, idx = WORKTOP.render(T)
+        img = jpeg(rgb, 95)
+        c.backend.detections[hashlib.sha256(img).hexdigest()] = detections(WORKTOP, idx)
+        P = T.copy()
+        P[2, 3] -= UP
+        name = f"{tag}{i}"
+        files[name], files[name + "d"] = img, png_depth(z)
+        f: dict[str, Any] = {"name": name, "image": name, "depth": name + "d", "camera_id": "cam",
+                             "prior": {"trust": "metric", "T_map_cam": P.tolist(),
+                                       "sigma_pos_m": 0.02, "sigma_rot_deg": 1.0}}
+        if height is not None:
+            f["height_above_floor_m"], f["height_sigma_m"] = height, 0.01
+        out.append(f)
+    return out, files
+
+
+def test_the_objects_on_the_worktop_reach_the_map(client: Client) -> None:
+    """The client's raised-surface case through the API: the base camera 0.5 m above the
+    worktop, level, looks around first and sees only the counters 0.2 m lower (the worktop is
+    below its view); then the wrist camera 0.35 m above it (its sent height) looks at the
+    worktop. ``floor_z_m`` is the worktop's z 0 in both versions, the wrist frames pass the
+    height gate, the mug and the box on the worktop are objects of the map beside the counters'
+    kettle and pot, and the grid observes the floor on the worktop and marks the counters as
+    drops (oms/2.9). Before: the counters were the floor (−0.2 m, the plane nearest z 0 among
+    those seen), the wrist frames 0.2 m off their sent height above it were left out (two even
+    rejected as prior conflicts), and nothing on the worktop reached the map."""
+    base = [look(yaw, (0.0, 0.0, UP + 0.5), 0.0) for yaw in range(0, 360, 45)]
+    wrist = [look(yaw, (0.05, 0.0, UP + 0.35), -45.0) for yaw in (-60.0, -30.0, 0.0, 30.0, 60.0)]
+    for tag, poses, height in (("b", base, None), ("w", wrist, 0.35)):
+        frames, files = _worktop_frames(client, tag, poses, height)
+        job = client.update("top", frames, files, cameras={"cam": TABLE_CAM})
+        assert job["state"] == "committed", job
+        assert {i["status"] for i in job["inputs"]} == {"registered"}
+        assert job["quality"]["height_inconsistent"] == []
+        assert client.get("/api/maps/top", "MapSummary")["floor_z_m"] == 0.0
+    doc = client.get("/api/maps/top/objects", "Objects")
+    assert sorted(o["label"] for o in doc["objects"]) == ["box", "kettle", "mug", "pot"]
+    g = client.get("/api/maps/top/grid?z_max=1.0", "Grid")  # below the ceiling
+    floor = decode(g["layers"]["floor_observed"])
+
+    def at(x: float, y: float) -> int:
+        return int(floor[int((y - g["origin_m"][1]) / g["cell_m"]),
+                         int((x - g["origin_m"][0]) / g["cell_m"])])
+
+    assert at(0.3, -0.05) == 1  # the worktop between the mug and the box
+    assert at(2.6, -1.0) == 3  # a counter: a drop below the floor band

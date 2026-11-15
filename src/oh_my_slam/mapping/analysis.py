@@ -118,9 +118,9 @@ def scale_check(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m: f
 
 def own_floor_z(depth: NDArray[np.float32], K: Intrinsics, T: Array, height_m: float | None
                 ) -> float | None:
-    """The floor's z in the frame of the pose ``T``, from the frame's own depth: the large
-    horizontal plane below the camera nearest ``height_m`` under it, the lowest one without a
-    height; None without such a plane."""
+    """The floor's z in the frame of the pose ``T``, from the frame's own depth: its own floor
+    plane (``anchored.own_floor``: with real support, near ``height_m``, else the widest), the
+    lowest one without a height; None without such a plane."""
     h = own_floor(depth, K, T[:3, :3], height_m if height_m else None)
     return None if h is None else float(T[2, 3]) - h
 
