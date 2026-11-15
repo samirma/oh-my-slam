@@ -144,7 +144,7 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
                       "T_map_cam": T.tolist(), "outputs": ALL,
                       "labels": [" Apple ", "cup", "apple"]}, {"i": img, "d": dep})
     summary = before[0]
-    assert doc["frame"] == "map" and doc["schema"] == "oms/2.11"
+    assert doc["frame"] == "map" and doc["schema"] == "oms/2.12"
     assert (doc["scale_source"], doc["scale_sigma_rel"]) == (summary["scale_source"],
                                                              summary["scale_sigma_rel"])
     # a depth image with a pose asks the detector alone, as an interactive request, with the
@@ -363,7 +363,7 @@ def test_the_gravity_camera_frame_and_the_camera_height_scale(
     doc = an.analyse({**req, "camera": {**CAM, "height_above_floor_m": -1.0}}, {"i": img})
     assert doc["scale_source"] == "monocular"
     doc = an.analyse({**req, "camera": CAM}, {"i": img})
-    assert (doc["scale_source"], doc["scale_sigma_rel"]) == ("monocular", 0.1)
+    assert (doc["scale_source"], doc["scale_sigma_rel"]) == ("monocular", 0.65)
     box = {o["label"]: o for o in doc["objects"]}["box"]
     assert box["centre_m"] == pytest.approx(0.8 * truth, abs=0.03)
     table = {o["label"]: o for o in doc["objects"]}["table"]

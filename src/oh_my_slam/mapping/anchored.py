@@ -222,7 +222,10 @@ SCALE_RANGE = (0.2, 5.0)
 MAX_EVIDENCE = 500
 DEPTH_SIGMA_REL = 0.01  # depth images, before their residuals (README "Prior-first registration")
 DEPTH_SENSOR_SIGMA_REL = 0.005  # a depth sensor's own scale error, which no residual shows
-MONOCULAR_SIGMA_REL = 0.10
+# the monocular model's metres against truth (map.md §1, oms/2.12; README "Monocular scale
+# sigma"): one sigma of ln(scale), a constant that no count of frames reduces (a scene's frames
+# share the model's error)
+MONOCULAR_SIGMA_REL = 0.65
 MIN_SCALE_SIGMA_REL = 0.002
 DEFAULT_HEIGHT_SIGMA_M = 0.02
 MIN_DEPTH_M = 0.05
@@ -339,9 +342,17 @@ ALIGN_RANGE = (0.5, 2.0)
 MONOCULAR_REGISTRATION_SIGMA_REL = 0.30  # raw monocular units: a camera this low tells no scale
 # the floor check (map.md §2, oms/2.4; README "Prior-first registration"): a depth image's relative
 # depth sigma at the floor (sigma_depth), and the relative bound on one monocular frame's own
-# depth scale against the map's (three monocular sigmas)
+# depth scale against the map's: its own constant (map.md §1, oms/2.12), not a multiple of
+# ``MONOCULAR_SIGMA_REL``
 FLOOR_DEPTH_SIGMA_REL = 0.01
-MONO_FLOOR_BOUND_REL = 3.0 * MONOCULAR_SIGMA_REL
+MONO_FLOOR_BOUND_REL = 0.30
+
+
+def recorded_scale_sigma(source: str, sigma: float) -> float:
+    """A recorded ``scale_sigma_rel`` as it holds now: a ``monocular`` one is the measured
+    constant ``MONOCULAR_SIGMA_REL`` (map.md §1, oms/2.12), also where a version or a map state
+    recorded the nominal one before; any other as recorded."""
+    return MONOCULAR_SIGMA_REL if source == "monocular" else float(sigma)
 
 
 # -- small geometry -------------------------------------------------------------------------------
@@ -1559,6 +1570,16 @@ class Keyframe:
             return None
         return self.grid_scale * self.floor_factor
 
+    @property
+    def own_scale_sigma(self) -> float | None:
+        """The relative sigma of its own depth scale (``depth_scale``: the sent camera height
+        over its floor's height, so the height's relative sigma, ``DEFAULT_HEIGHT_SIGMA_M`` when
+        it carried none, at least ``MIN_SCALE_SIGMA_REL``), None without one."""
+        if self.depth_scale is None or not self.height_m:
+            return None
+        return max((self.height_sigma_m or DEFAULT_HEIGHT_SIGMA_M) / self.height_m,
+                   MIN_SCALE_SIGMA_REL)
+
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "camera_id": self.camera_id,
                 "K": self.K.to_dict(), "T": self.T.tolist(), "sigma_pos_m": self.sigma_pos_m,
@@ -1832,7 +1853,9 @@ class ScaleState:
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> ScaleState:
-        return ScaleState(float(d["k"]), d["source"], float(d["sigma_rel"]),
+        # a monocular sigma is the measured constant, also in a state an earlier one wrote
+        return ScaleState(float(d["k"]), d["source"],
+                          recorded_scale_sigma(d["source"], d["sigma_rel"]),
                           [list(e) for e in d["priors"]], [list(e) for e in d["heights"]],
                           [list(e) for e in d["odometry"]],
                           [float(y) for y in d.get("height_yaws", [])],
@@ -1929,10 +1952,11 @@ class ScaleState:
             self.k, self.source = got[0], "priors"
             self.sigma_rel = max(got[1], DRIFT_POS_REL)
             return
-        # the monocular model's metres: its stated error, with its keyframes' residual spread
-        spread = self.residual_spread("mono") or 0.0
+        # the monocular model's metres: its error measured against truth, a constant (map.md
+        # §1, oms/2.12): its keyframes' alignment spread is part of it, and their count never
+        # shrinks it
         self.k, self.source = 1.0, "monocular"
-        self.sigma_rel = math.hypot(MONOCULAR_SIGMA_REL, spread)
+        self.sigma_rel = MONOCULAR_SIGMA_REL
 
 
 @dataclass

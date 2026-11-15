@@ -188,7 +188,7 @@ def test_first_update_without_priors_follows_the_first_camera_rule(client: Clien
     job = client.update("m", frames, files, {"cam": CAMERA})
     assert job["state"] == "committed" and job["result_version"] == 1
     assert job["base_version"] is None and job["provisional_version"] is None
-    assert job["scale_source"] == "monocular" and job["scale_sigma_rel"] == 0.1
+    assert job["scale_source"] == "monocular" and job["scale_sigma_rel"] == 0.65
     ins = job["inputs"]
     assert [i["status"] for i in ins] == ["registered"] * 4 and ins[0]["inliers"] == 400
     T0 = np.asarray(ins[0]["T_map_cam"])

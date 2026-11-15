@@ -60,6 +60,7 @@ from oh_my_slam.mapping.anchored import (
     match,
     natural_key,
     pose_residual,
+    recorded_scale_sigma,
 )
 from oh_my_slam.mapping.quality import (
     displacement_quality,
@@ -265,7 +266,8 @@ def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Fr
     if am is not None:
         return am.scale_summary()
     if prev is not None:
-        return str(prev["scale_source"]), float(prev["scale_sigma_rel"])
+        return str(prev["scale_source"]), recorded_scale_sigma(str(prev["scale_source"]),
+                                                               prev["scale_sigma_rel"])
     kept = [fr for fr in frames if fr.reason is None]
     metric = [fr.work.prior for fr in kept if fr.work.trust == "metric"]
     if len(metric) > 1:

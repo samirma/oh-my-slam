@@ -74,6 +74,17 @@ def depth_unused(unjudged: bool) -> dict[str, bool]:
     return {DEPTH_UNUSED: True} if unjudged else {}
 
 
+# a version frame row's key: the relative sigma of a monocular keyframe's own depth scale (the
+# floor check's, ``Keyframe.own_scale_sigma``), which locate's reference scale takes in place of
+# the map's (api.md §6 "Reference scale", oms/2.12; ``derived``)
+OWN_SCALE_SIGMA = "depth_scale_sigma_rel"
+
+
+def own_scale_sigma(sigma: float | None) -> dict[str, float]:
+    """A version frame row's ``OWN_SCALE_SIGMA`` entry: present only on such a frame."""
+    return {} if sigma is None else {OWN_SCALE_SIGMA: round(sigma, 5)}
+
+
 def utc(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t % 1 * 1000):03d}Z"
 

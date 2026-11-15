@@ -35,6 +35,7 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import register_ma, sigmas, standpoint
 from oh_my_slam.mapping.anchor import Sim3
 from oh_my_slam.mapping.anchored import (
+    MONOCULAR_SIGMA_REL,
     TOO_CLOSE_M,
     AnchoredMap,
     Features,
@@ -65,6 +66,7 @@ from oh_my_slam.service.store import (
     clone_tree,
     depth_unused,
     no_stand,
+    own_scale_sigma,
 )
 from oh_my_slam.service.timings import fusion_class
 
@@ -408,6 +410,13 @@ def _unjudged(am: AnchoredMap | None, pl: Placement) -> dict[str, bool]:
     return depth_unused(k is not None and not k.lifts())
 
 
+def _own_scale_sigma(am: AnchoredMap | None, pl: Placement) -> float | None:
+    """The sigma of a placed frame's keyframe's own depth scale (``Keyframe.own_scale_sigma``),
+    None without one."""
+    k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
+    return None if k is None else k.own_scale_sigma
+
+
 def _contributes(am: AnchoredMap | None, pl: Placement) -> bool:
     """Whether a placed frame's keyframe carries content (``Keyframe.contributes``)."""
     k = None if am is None or pl.keyframe is None else am.keyframe(pl.keyframe)
@@ -747,7 +756,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             # confirmation is in ``reregistered`` only, not in the gauge shift or the residuals
             # (it counts normally from now on, free-by-rule cells included: map.md §2, P30b)
             rows.append({**{x: v for x, v in r.items() if x not in (NO_STAND, DEPTH_UNUSED)},
-                         **depth_unused(not k.lifts()),
+                         **depth_unused(not k.lifts()), **own_scale_sigma(k.own_scale_sigma),
                          "T_map_cam": k.T.tolist(), "sigma_pos_m": k.sigma_pos_m,
                          "sigma_rot_deg": k.sigma_rot_deg, "pose_state": "fused",
                          "inliers": k.inliers, "method": k.method,
@@ -782,10 +791,13 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                      **no_stand(pl.status == "kept_at_prior"
                                 and pl.detail == "conflict_unsupported"),
                      # not judged by the floor check: its depth lifts no locate (P30d)
-                     **_unjudged(am, pl)})
+                     **_unjudged(am, pl),
+                     # its own depth scale's sigma: locate's reference scale (oms/2.12)
+                     **own_scale_sigma(_own_scale_sigma(am, pl))})
     prior_res = [pose_residual(np.asarray(r["T_map_cam"]), np.asarray(r["prior"]["T_map_cam"]))
                  for r in rows if r.get("prior")]
-    source, sigma = am.scale_summary() if am is not None else ("monocular", 0.1)
+    source, sigma = am.scale_summary() if am is not None else ("monocular",
+                                                                    MONOCULAR_SIGMA_REL)
     ratio = None
     if prev is not None and am is not None:
         # the monocular keyframes' depth follows k; positions and depth images do not move

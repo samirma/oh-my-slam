@@ -240,15 +240,21 @@ def test_the_locate_index_carries_each_reference_s_status(tmp_path: Path) -> Non
         np.savez(feats / f"{n}.npz", **z_f)
     vdir = tmp_path / "v"
     vdir.mkdir()
+    # the second keyframe's lifted mask, the first's missing (an index written before oms/2.12)
     np.savez(vdir / "locate.npz", p0=np.zeros((0, 3), np.float32),
-             p1=np.zeros((0, 3), np.float32))
+             p1=np.zeros((0, 3), np.float32), l1=np.zeros(0, bool))
     rows = [{"name": "f", "camera_id": "cam", "T_map_cam": np.eye(4).tolist(),
              "sigma_pos_m": 0.01, "pose_state": "fused"},
             {"name": "k", "camera_id": "cam", "T_map_cam": np.eye(4).tolist(),
-             "sigma_pos_m": 0.02, "pose_state": "kept_at_prior"}]
-    dv = SimpleNamespace(name="m", dir=vdir, record={"frames": rows},
+             "sigma_pos_m": 0.02, "pose_state": "kept_at_prior", "depth_scale_sigma_rel": 0.08}]
+    # a monocular version recorded with the nominal 0.10: its depth's scale sigma is the measured
+    # constant (oms/2.12); a keyframe with its own depth scale takes its own
+    dv = SimpleNamespace(name="m", dir=vdir, record={"frames": rows, "scale_source": "monocular",
+                                                     "scale_sigma_rel": 0.1},
                          meta={"keyframes": names, "keys": {n: n for n in names}})
     self = SimpleNamespace(store=None, dir=lambda name: tmp_path / name)
     cams = {"cam": CAM}
     idx = derived.Derived._build_index(self, dv, cams)  # type: ignore[arg-type]
     assert [k.registered for k in idx.keyframes] == [True, False]
+    assert [k.scale_sigma_rel for k in idx.keyframes] == [0.65, 0.08]
+    assert idx.keyframes[0].lifted is None and idx.keyframes[1].lifted is not None

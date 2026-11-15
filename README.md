@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.11) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.12) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.11; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.12; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -302,7 +302,8 @@ the version. A rejected or failed job leaves the map as it was.
      (1.4826 MAD(log r))² / n)`, at least 0.5 %: the sent heights' relative sigma (default 2 cm)
      is common to the frames and never divided by √n (map.md §1; before, the whole root was
      divided by √n, so 17 frames sent 0.37 ± 0.03 m gave 0.02 where the sent sigma is 0.081);
-  4. `monocular`: the mapper's MoGe-aligned metres, `σ = 10 %`.
+  4. `monocular`: the mapper's MoGe-aligned metres, `σ = 0.65` (one sigma of ln scale, the
+     measured constant of *Monocular scale sigma* below; before oms/2.12 a nominal 10 %).
   A later update keeps its map's source unless metric priors (two or more inliers) fix the scale.
 * **Quality** (map.md §4): `gauge_shift` is the alignment applied to the update's result in the
   previous gauge, `A = S_new ∘ S_prev⁻¹`: `translation_m` the median displacement it gives the
@@ -1089,8 +1090,12 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   lifted points, records its depth's median ratio to the confirmed keyframes' depth near its
   committed pose (`AnchoredMap.depth_residual`); the sigma is the robust spread of their logs combined with a
   sensor scale error of 0.5 % (`DEPTH_SENSOR_SIGMA_REL`), the documented 1 % before 3 of them.
-  Monocular: the model's stated 10 % combined with the spread of its keyframes' alignment
-  factors. Camera heights: as above.
+  Monocular (oms/2.12): `MONOCULAR_SIGMA_REL` = **0.65**, one sigma of the scale's natural
+  logarithm measured against truth (*Monocular scale sigma*, below), a constant: never divided
+  by √n nor combined with the keyframes' alignment spread, since a scene's frames share the
+  model's error (before: the nominal 10 % with that spread). A map state or version written with
+  the nominal value reads as the constant (`anchored.recorded_scale_sigma`). Camera heights: as
+  above.
 * **Priors against images** (map.md §1). A registered frame with a prior is compared with each
   earlier registered frame with a prior of the same update that overlaps it by ≥ 50 % (*Overlap*
   above, the smaller of the two coverages): the
@@ -1259,7 +1264,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     `_depth_factor(k, content=False)`): before, the own scale reached the references' lifted
     keypoints, spreading their scales by up to ±30 %. Its input status reports it as
     `depth_scale` (raw monocular depth to map metres). An own scale more than
-    `MONO_FLOOR_BOUND_REL` = 0.30 (3 × `MONOCULAR_SIGMA_REL`, the monocular scale bound) from k,
+    `MONO_FLOOR_BOUND_REL` = 0.30 (the monocular scale bound, its own constant since oms/2.12:
+    no longer 3 × `MONOCULAR_SIGMA_REL`, which would now be 1.95) from k,
     relative, is not judged (oms/2.5): the frame keeps k, its registration and its pose, is
     never rejected for it and is not listed in `floor_inconsistent`, has no `depth_scale`, and
     its registered input status has `detail` `floor_not_judged` (`Keyframe.floor_unjudged`; the
@@ -1361,7 +1367,7 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   engine's (`AnchoredMap.scale_summary`), a mapper map's version's, else on a new mapper map
   metric priors spanning 0.3 m (σ √2 · median prior σ / span), else depth images (1 %), else
   camera heights (the median height σ over height, never divided by √n: map.md §1; before it
-  was), else monocular (10 %). On a new
+  was), else monocular (0.65, `MONOCULAR_SIGMA_REL`). On a new
   anchored map `prior_gravity_deg` is the engine's (the origin's gravity), null for a camera-only
   map.
 
@@ -1619,13 +1625,27 @@ server.
   poses where a neighbour keyframe (4 nearest with a baseline ≥ 5 % of the scene depth, optical
   axes within 60°) sees it (reprojection ≤ 2 px at 640 px, rays ≥ 2° apart); the others come from
   the keyframe's depth, rescaled to the triangulated ones (median over ≥ 20). Only confirmed
-  keyframes take part: a `kept_at_prior` frame is never a reference.
+  keyframes take part: a `kept_at_prior` frame is never a reference. The derived `locate.npz`
+  marks, per keypoint, the points still *lifted* from the stored depth as it is (no
+  triangulation measured that keyframe's scale: `relocalize.triangulated`, `l<i>` beside
+  `p<i>`; an index written before oms/2.12 has no marks and counts every point lifted), and each
+  keyframe carries the scale sigma of its depth (`Keyframe.scale_sigma_rel`): the version's
+  `scale_sigma_rel` (`monocular` read as 0.65), or a monocular keyframe's own when the floor check
+  gave it its own depth scale (`depth_scale`): the sent height's relative sigma, `height_sigma_m`
+  (default 0.02 m) over the height, at least 0.2 % (`anchored.Keyframe.own_scale_sigma`, version
+  row key `depth_scale_sigma_rel`).
 * **Pose.** RANSAC PnP (AP3P, 2000 iterations, 4 px at 640 px) on every 2-D/3-D correspondence;
   besides that pooled hypothesis, a second fit without its inliers, a fit on each of the 6
   keyframes with most correspondences alone, a fit on each of the 4 *places* the matched keyframes
   were taken from (each keyframe, best-matched first, joins the first place whose first keyframe
-  lies within 1.5 m: a twin room's keyframes give their own hypothesis) and, with a prior, a fit on
-  the keyframes near it (those `candidates` adds). A solve far from every keyframe, outside
+  lies within 1.5 m: a twin room's keyframes give their own hypothesis), a fit on each of up to
+  4 *reference groups* (oms/2.12, `relocalize.reference_groups`: each matched keyframe,
+  best-matched first, joins the first group whose first keyframe was taken within 0.5 m
+  (`GROUP_M`) and looks within 30° (`GROUP_DEG`) of it; groups with ≥ 30 correspondences
+  (`GROUP_MIN_POINTS`, twice `MIN_INLIERS`), most first (`RIVAL_GROUPS` = 4), and only when two or
+  more qualify), each on its own correspondences, so that one group whose depth is scaled wrong
+  meets the others as a rival even for a robot turning on one spot (one *place*) and, with a
+  prior, a fit on the keyframes near it (those `candidates` adds). A solve far from every keyframe, outside
   their bounds or held by one keyframe's few inliers (`plausible`) is no hypothesis. A
   hypothesis's **support** is its inliers (query keypoints it explains) over the best
   hypothesis's, at most 1; it is *supported* at **0.25** (`SUPPORT_MIN`). The reported pose is
@@ -1673,6 +1693,15 @@ server.
   version (RMS weighted by the inliers on each: a pose is no better placed than the keyframes it
   is measured against). With an `inlier_ratio` below 0.4, at least 5 cm and 1° (the chosen
   hypothesis explains few of its matches).
+  * **Reference scale** (api.md §6, oms/2.12; `relocalize.reference_scale`). The position sigma
+    of every hypothesis (the reported one's and those the prior's conflict bound tests) is
+    hypot(σ_rel, s × d): s the mean over its inlier correspondences of their keyframe's depth
+    scale sigma (*Map points*; 0 for a triangulated or rescaled point, so a pose on triangulated
+    points only has no such term), d the median distance from the located camera to its inlier
+    points. Before, a monocular map's pose had only the 0.15 m floor without depth, whatever its
+    references' depth scale: the client saw two locates of a standing robot 0.9 m apart, both
+    0.15 m and without ambiguity, on a camera-height map of monocular keyframes. The camera-height
+    scale's term (above) is added after it.
 * **Rivals and ambiguity.** A rival is any other plausible hypothesis farther than **0.10 m** or
   **5°** from the reported pose (`RIVAL_POS_M`, `RIVAL_ROT_DEG`) with support ≥ 0.25, whatever
   else its inliers explain (`relocalize.rivals_of`). `rivals` lists them strongest first with
@@ -2017,7 +2046,8 @@ It is an update's own code on one frame, kept nowhere.
   metres. Without a map frame: `depth` (σ 0.01, `DEPTH_SIGMA_REL`) with a depth image; else
   `camera_height` when the camera gives `height_above_floor_m` and the frame shows a measurable
   floor plane (the same factor; σ = `height_sigma_m`, default 0.02 m, over the height); else
-  `monocular` (σ 0.10). A camera height with no floor plane in view cannot scale the frame: it
+  `monocular` (σ 0.65, `MONOCULAR_SIGMA_REL`, oms/2.12). A camera height with no floor plane
+  in view cannot scale the frame: it
   is `monocular`. With `frames` (oms/2.11) a monocular depth may take `baseline` instead
   (*Motion stereo* below).
 * **Floor.** The version's `floor_z_m` and `floor_sigma_m` in the map frame. Elsewhere the
@@ -2358,6 +2388,51 @@ It is an update's own code on one frame, kept nowhere.
   (0.74), passages 11 → 12 and 13 → 14 (one more beside furniture), `GET grid` layers and
   features 0.26–0.30 s → 0.27–0.42 s (measured while the test suite ran).
 
+### Locate reference scale and groups measured (oms/2.12, 2026-11-15, M3 Pro, in process)
+
+Leave-one-out on a read-only copy of a client map (`dev_ainex_loop4` v25: 25 monocular keyframes
+of a humanoid turning near one spot, `camera_height` scale σ 0.061, 15 keyframes with their own
+depth scale): each of the 24 confirmed keyframes' image located against the other 23 (points
+triangulated without it), against the map's own pose of it (no external truth), with the
+keyframe's sent height. Before (no reference-scale term, no reference groups) → after:
+located 22/24 → 22/24, position within 3 σ 22/22 → 22/22 (position and rotation 21/22 both),
+median `sigma_pos_m` 0.173 → 0.180 m, median error 0.070 m (p90 0.169) unchanged, error/σ median
+0.42 → 0.41, `ambiguity` on 18/22 → 18/22 frames, locate latency median 0.21 → 0.25 s (max 0.25 →
+0.34 s; `locate.latency_idle` ≤ 2 s). Read as a `monocular` map (s 0.65, no own scales): median
+`sigma_pos_m` 0.49 m, error/σ median 0.19: most of these inliers are triangulated or rescaled, so
+the term stays well below 0.65 × d. On the synthetic scenes of `tests/unit/test_reference_scale.py`
+(a 1.4 × depth error in one group of keyframes from one spot) the reference groups add the rival
+the subsets of one group missed, and the term covers the biased pose's 0.2 m error within 3 σ.
+
+### Monocular scale sigma (oms/2.12, measured 2026-11-13, M3 Pro)
+
+`MONOCULAR_SIGMA_REL` = **0.65**: one sigma of the natural logarithm of the monocular depth's
+scale (MoGe-2 ViT-L as the service runs it, given field of view), measured against truth
+(`reports/mono_scale_eval.md`, scripts and outputs in `~/oh-my-slam-data/experiments/mono-scale/`):
+
+* **Data.** 93 frames with a known camera height: 55 keyframes of the client's maps
+  (`dev_ainex_1/2/3/loop1`, a 640 × 480 camera 0.355–0.37 m above a kitchen floor, pitched 10–35°
+  down) and 38 frames of `examples/ainex-captures` (the robot on the worktop, 0.34 m above it).
+  The widest horizontal plane below the camera in the model's depth over the true height is the
+  frame's scale error.
+* **Result.** Floor frames read 1.86 × (median; p10–p90 1.10–3.23, worst 3.55), worktop frames
+  0.71 × (0.57–1.15): no fixed sign, a bias (+0.62 in ln on the floor, −0.34 on the worktop)
+  with a frame-to-frame spread of 0.2–0.4 inside each set. The pooled RMS of ln(ratio) is 0.62.
+* **Coverage.** σ(ln) = 0.65 covers, pooled, 70 % of the frames within 1 σ and 100 % within 3 σ
+  (100 % already within 2 σ). The nominal 0.10 it replaces, never measured, covered 6 % within
+  1 σ and 22 % within 3 σ; 0.50 covers 100 % within 3 σ but fewer within 1 σ, 0.80 more than the
+  1 σ share calls for.
+* **Why constant.** No truth-free cue (crop or model disagreement, the model's own field of view,
+  pitch, floor share) predicts the error with the same sign on both sets, and the error is shared
+  by a scene's frames, so averaging them does not reduce it: the sigma never shrinks with the
+  number of frames (map.md §1).
+* **Limits.** One rendered kitchen, one camera, one height: nothing measured at eye level or on
+  a real camera. A client that needs metric distances on such views sends the camera's
+  `height_above_floor_m` (scale `camera_height`, about 8 % for 0.03 m at 0.355 m).
+* **Floor bound.** The floor check's monocular scale bound `MONO_FLOOR_BOUND_REL` stays 0.30,
+  now its own constant (map.md §1, oms/2.12): 3 × 0.65 would admit a frame's own scale of
+  almost three times the map's.
+
 ### Derived versions
 
 What the grid, points and locate read is derived from each version once, in the job, before the
@@ -2411,7 +2486,7 @@ intrinsics given as the camera), one job each (scripts in the session's scratchp
 
 | Run | Result |
 | --- | --- |
-| 1. trust `none`, new map | 13/13 registered, `scale_source: monocular` (σ 10 %); 58 s wall (checks 1.5 s, mapper 56 s). |
+| 1. trust `none`, new map | 13/13 registered, `scale_source: monocular` (σ 10 % then; 0.65 since oms/2.12); 58 s wall (checks 1.5 s, mapper 56 s). |
 | 2. metric priors = run 1's poses after a known similarity (s 1.3, yaw 40°, t (2, −1, 0.5)) plus noise (σ 2 cm per axis, 0.5°), sent with σ 3 cm / 1°; plus a bare-wall frame (the right part of `examples/camera/img_012`) | 13/13 registered, the wall `plain` (texture 0.0003, 0 features), `scale_source: priors`, `scale_sigma_rel` 0.029. Against the known similarity of run 1: median 1.1 cm, max 1.5 cm, 0.31° — within the noise; scale 1.319 for 1.3 (1.5 %). Prior residuals median 2.1 cm, max 3.7 cm, 0.74°. `prior_gravity_deg` 0.22. 58 s. |
 | 3. main path: the first 7 photos with metric priors (as run 2, new noise), then the other 6 with `drifting` priors in an odometry frame rotated −30° and moved (5, 5, 0) | Update 1: 5/7 registered within 0.9–3.6 cm of the truth; 2 `prior_conflict` (17 and 20 cm, 3–5°: the 7 photos alone are the weakly posed window set, see *Rebuilding a weakly posed map*), mapped again without them. Update 2: the mapper rebuilt the map (`rebuilt`, `gauge_shift` 1.59 m / 1.56° / scale 0.117 for its new internal gauge), aligned back: stored frames within 0.8 cm median, 1.5 cm max of version 1; the new frames 0.3–2.1 cm from the truth, in the priors' frame; 2 drifting frames `prior_conflict` at 8–9° (their default σ of 2°). 69 s and 76 s. |
 

@@ -19,11 +19,19 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
 * **Turn fit.** Without enough of those, a frame whose matched keyframes were taken from one spot
   (centres within ``ONE_SPOT_REL`` of their depth, or ``ONE_SPOT_M``) is placed at their centre with
   the rotation that turns its rays onto theirs (``locate.turn_ransac``).
+* **Reference scale** (api.md §6, oms/2.12; ``reference_scale``). A pose resting on points
+  lifted from stored depth (``Keyframe.lifted``: not triangulated, nor rescaled to triangulated
+  points) holds that depth's scale error: its position sigma is hypot(σ_rel, s × d), s the mean
+  over its inliers of their keyframe's depth scale sigma (``Keyframe.scale_sigma_rel``; 0 for a
+  triangulated point), d the median distance from the located camera to its inlier points.
 * **Hypotheses.** The pose fit, a second fit without its inliers, a fit on each of the
   ``RIVAL_KEYFRAMES`` keyframes with most correspondences alone, one on each of the
-  ``RIVAL_PLACES`` places the matched keyframes were taken from (``places``) and one on the
-  keyframes near the prior; a degenerate solve (``plausible``) is none. A hypothesis's support is
-  its inliers over the best hypothesis's; it is supported at ``SUPPORT_MIN`` (``choose``).
+  ``RIVAL_PLACES`` places the matched keyframes were taken from (``places``), one on each of the
+  ``RIVAL_GROUPS`` groups of reference keyframes (``reference_groups``: taken together and looking
+  alike), each on its own correspondences, so that one biased group meets the others (api.md §6,
+  oms/2.12), and one on the keyframes near the prior; a degenerate solve (``plausible``) is none.
+  A hypothesis's support is its inliers over the best hypothesis's; it is supported at
+  ``SUPPORT_MIN`` (``choose``).
 * **The reported pose.** With a prior, the supported hypothesis nearest it (``sigmas.distance``)
   among those within the combined bound ``K_SIGMA`` × sqrt(σ_prior² + σ_hypothesis²), position
   and rotation separately, σ_hypothesis each hypothesis's own calibrated sigma
@@ -88,6 +96,14 @@ PIXEL_SIGMA = 1.0  # a keypoint's pixel noise at 640 px
 HUBER_SIGMAS = 2.0
 REFINE_ITERATIONS = 8
 BEHIND_SIGMAS = 1e3
+# reference groups (api.md §6 "Ambiguity", oms/2.12): the matched keyframes taken within GROUP_M of
+# a group's first keyframe and looking within GROUP_DEG of it are one group of references; each
+# group with GROUP_MIN_POINTS correspondences or more, at most RIVAL_GROUPS of them, is solved on its
+# own correspondences
+GROUP_M = 0.5
+GROUP_DEG = 30.0
+GROUP_MIN_POINTS = 2 * MIN_INLIERS
+RIVAL_GROUPS = 4
 
 
 # ------------------------------------------------------------------------------------------------
@@ -161,6 +177,17 @@ class Keyframe:
     # its images confirmed its pose (``pose_state`` not ``kept_at_prior``): only such a
     # reference's ``sigma_pos_m`` counts for ``z_sigma`` (api.md §6 step 3, P17)
     registered: bool = True
+    # the relative sigma of its stored depth's scale (api.md §6 "Reference scale", oms/2.12): the
+    # map's ``scale_sigma_rel``, or a monocular keyframe's own; 0: none known
+    scale_sigma_rel: float = 0.0
+    # per keypoint, whether its point is lifted from that depth as it was stored (neither
+    # triangulated nor rescaled to triangulated points, ``triangulated``); None: every point
+    lifted: NDArray[np.bool_] | None = None
+
+    def lifted_mask(self) -> NDArray[np.bool_]:
+        """Per keypoint, whether its point is lifted from stored depth (``lifted``)."""
+        has = np.isfinite(self.xyz).all(axis=1)
+        return has if self.lifted is None else has & np.asarray(self.lifted, bool)
 
     @property
     def centre(self) -> Array:
@@ -415,15 +442,24 @@ def _depth_of(kf_xyz: NDArray[Any], T: Array) -> Array:
 
 
 def triangulate(kfs: Sequence[Keyframe], pair_matches: Any = None) -> list[NDArray[np.float32]]:
+    """Each keyframe's keypoint points (``triangulated``)."""
+    return triangulated(kfs, pair_matches)[0]
+
+
+def triangulated(kfs: Sequence[Keyframe], pair_matches: Any = None
+                 ) -> tuple[list[NDArray[np.float32]], list[NDArray[np.bool_]]]:
     """Each keyframe's keypoint points (see above): triangulated where possible, else its depth
-    points scaled to those. ``pair_matches(i, j)`` gives the ratio-test matches of two keyframes
-    (default: computed); a cache may stand in for it."""
+    points scaled to those; and per keypoint whether its point is lifted from the depth as stored
+    (``Keyframe.lifted``: not triangulated, and not rescaled to triangulated points).
+    ``pair_matches(i, j)`` gives the ratio-test matches of two keyframes (default: computed); a
+    cache may stand in for it."""
     import cv2
 
     n = len(kfs)
     out = [k.xyz.copy() for k in kfs]
+    lifted = [np.isfinite(k.xyz).all(axis=1) for k in kfs]
     if n < 2:
-        return out
+        return out, lifted
     C = np.array([k.centre for k in kfs])
     depth = []
     for k in kfs:
@@ -468,8 +504,8 @@ def triangulate(kfs: Sequence[Keyframe], pair_matches: Any = None) -> list[NDArr
         z_d = _depth_of(a.xyz, a.T)
         z_t = _depth_of(tri, a.T)
         both = has & np.isfinite(z_d) & (z_d > 0)
-        scale = float(np.median(z_t[both] / z_d[both])) \
-            if int(both.sum()) >= DEPTH_SCALE_MIN_POINTS else 1.0
+        measured = int(both.sum()) >= DEPTH_SCALE_MIN_POINTS
+        scale = float(np.median(z_t[both] / z_d[both])) if measured else 1.0
         if not TRIANGULATE_SCALE_RANGE[0] <= scale <= TRIANGULATE_SCALE_RANGE[1]:
             # the triangulation disagrees with the keyframe's own depth as a whole (poses that
             # the images did not confirm, rays too parallel): the depth points stand
@@ -481,7 +517,9 @@ def triangulate(kfs: Sequence[Keyframe], pair_matches: Any = None) -> list[NDArr
         has &= ~off
         fill = a.centre + scale * (np.asarray(a.xyz, np.float64) - a.centre)
         out[i] = np.where(has[:, None], tri, fill).astype(np.float32)
-    return out
+        # the depth's own scale stays only where nothing triangulated measured it
+        lifted[i] = lifted[i] & ~has & (not measured)
+    return out, lifted
 
 
 def _pair(a: Keyframe, b: Keyframe) -> NDArray[np.int64]:
@@ -534,6 +572,38 @@ def places(per_kf: Sequence[tuple[int, int]], index: Index) -> list[list[int]]:
     if len(groups) < 2:
         return []
     return [g[1] for g in sorted(groups, key=lambda g: -sum(g[2]))]
+
+
+def reference_groups(per_kf: Sequence[tuple[int, int]], index: Index) -> list[list[int]]:
+    """The matched keyframes (``(correspondences, keyframe)``) as groups of references (api.md
+    §6 "Ambiguity", oms/2.12): each, best-matched first, joins the first group whose first
+    keyframe was taken within ``GROUP_M`` of it and looks within ``GROUP_DEG`` of its direction,
+    else starts one. The groups of at least ``GROUP_MIN_POINTS`` correspondences, most first, at
+    most ``RIVAL_GROUPS``; none when fewer than two (the pooled fit is the one group's)."""
+    cos = math.cos(math.radians(GROUP_DEG))
+    groups: list[tuple[Keyframe, list[int], int]] = []
+    for n, i in sorted(per_kf, reverse=True):
+        k = index.keyframes[i]
+        j = next((j for j, g in enumerate(groups)
+                  if float(np.linalg.norm(g[0].centre - k.centre)) <= GROUP_M
+                  and float(g[0].T[:3, 2] @ k.T[:3, 2]) >= cos), None)
+        if j is None:
+            groups.append((k, [i], n))
+        else:
+            groups[j] = (groups[j][0], [*groups[j][1], i], groups[j][2] + n)
+    big = [g for g in sorted(groups, key=lambda g: -g[2]) if g[2] >= GROUP_MIN_POINTS]
+    return [g[1] for g in big[:RIVAL_GROUPS]] if len(big) >= 2 else []
+
+
+def reference_scale(T: Array, xyz: Array, srel: Array, mask: NDArray[np.bool_]) -> float:
+    """The reference depth's scale error of a pose ``T`` (api.md §6 "Reference scale",
+    oms/2.12), in metres: s × d, s the mean over its inlier correspondences (``mask``) of the
+    scale sigma of the depth their points came from (``srel``: 0 for a triangulated point), d the
+    median distance from the camera to those points; 0 without inliers."""
+    if not mask.any():
+        return 0.0
+    d = float(np.median(np.linalg.norm(xyz[mask] - T[:3, 3], axis=1)))
+    return float(np.mean(srel[mask])) * d
 
 
 def prior_distance(q: Query, T: Array, sig: tuple[float, float] = (0.0, 0.0)) -> float:
@@ -687,7 +757,7 @@ def locate(q: Query, index: Index) -> Outcome:
         out.nearest = int(np.argmin([float(np.linalg.norm(k.centre - c))
                                      for k in index.keyframes]))
     px = PX_THRESHOLD * max(q.width, q.height) / 640.0
-    iq_l, xyz_l, kf_l, ray_q, ray_k, ray_kf = [], [], [], [], [], []
+    iq_l, xyz_l, kf_l, s_l, ray_q, ray_k, ray_kf = [], [], [], [], [], [], []
     per_kf: list[tuple[int, int]] = []
     for i in chosen:
         kf = index.keyframes[i]
@@ -702,12 +772,15 @@ def locate(q: Query, index: Index) -> Outcome:
         iq_l.append(m[ok, 0])
         xyz_l.append(pts[ok])
         kf_l.append(np.full(int(ok.sum()), i))
+        # the scale sigma of the depth each point came from (0: triangulated)
+        s_l.append(np.where(kf.lifted_mask()[m[ok, 1]], kf.scale_sigma_rel, 0.0))
         per_kf.append((int(ok.sum()), i))
     # every correspondence (a query keypoint may match points of several keyframes: a symmetric
     # room's twin views give each its own hypothesis); a pose's support counts query keypoints
     iq = np.concatenate(iq_l) if iq_l else np.zeros(0, np.int64)
     xyz = np.concatenate(xyz_l).astype(np.float64) if xyz_l else np.zeros((0, 3))
     kfs = np.concatenate(kf_l) if kf_l else np.zeros(0, np.int64)
+    srel = np.concatenate(s_l).astype(np.float64) if s_l else np.zeros(0)
     uv = np.asarray(q.uv, np.float64)[iq].reshape(-1, 2)
 
     def hypothesis(T: Array) -> Hypothesis:
@@ -720,6 +793,8 @@ def locate(q: Query, index: Index) -> Outcome:
         subsets = [~hyps[0].mask]  # the second fit
         subsets += [kfs == i for _, i in sorted(per_kf, reverse=True)[:RIVAL_KEYFRAMES]]
         subsets += [np.isin(kfs, g) for g in places(per_kf, index)[:RIVAL_PLACES]]
+        # separate groups of references, each on its own correspondences (oms/2.12)
+        subsets += [np.isin(kfs, g) for g in reference_groups(per_kf, index)]
         near = near_prior(q, index)
         if near:
             subsets.append(np.isin(kfs, near))
@@ -733,7 +808,7 @@ def locate(q: Query, index: Index) -> Outcome:
             return out
         # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
         sig = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
-                       _on_depth(h, kfs, index)) for h in hyps]
+                       _on_depth(h, kfs, index), srel) for h in hyps]
         zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in hyps]
         k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps], sig, zs)
         if k is None:
@@ -743,7 +818,7 @@ def locate(q: Query, index: Index) -> Outcome:
         main, cov = _refined(hypothesis(_refine(hyps[k], q.K, uv, xyz, iq)), hypothesis, q, uv,
                              xyz, origin, px)
         sp, sr = _sigmas(main, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index),
-                         _on_depth(main, kfs, index))
+                         _on_depth(main, kfs, index), srel)
         if not within_prior(q, main.T, (sp, sr)):  # the refinement left the prior: as it was
             main, (sp, sr) = hyps[k], sig[k]
         others = [h for j, h in enumerate(hyps) if j != k]
@@ -919,13 +994,16 @@ def _on_depth(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
 
 
 def _sigmas(h: Hypothesis, q: Query, uv: Array, xyz: Array, iq: NDArray[np.int64],
-            cov: Array | None = None, keyframes: tuple[float, float] = (0.0, 0.0),
-            depth: bool = False) -> tuple[float, float]:
+            cov: Array | None, keyframes: tuple[float, float], depth: bool, srel: Array
+            ) -> tuple[float, float]:
     """A hypothesis's own sigmas (``_fit``), calibrated from the images alone
     (``sigmas.calibrated``, the data kind of ``depth`` and trust class ``none``; api.md §6
-    "Locate sigmas"): never the spread of its rivals, never changed by the prior."""
+    "Locate sigmas"), the position's with the reference depth's scale error (``srel`` per
+    correspondence, ``reference_scale``): never the spread of its rivals, never changed by the
+    prior."""
     fit = _fit(h, q, uv, xyz, iq, cov, keyframes)
     sp, sr = sigmas.calibrated(fit[0], fit[1], depth, None)
+    sp = math.hypot(sp, reference_scale(h.T, xyz, srel, h.mask))
     return round(sp, 4), round(sr, 3)
 
 

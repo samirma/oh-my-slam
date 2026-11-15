@@ -411,7 +411,7 @@ def test_label_scores_list_the_label_then_the_votes() -> None:
     assert with_label_scores(got, ["Red Mug"]) == got  # idempotent
     item = schema.defs()["MapObject"]["properties"]["label_scores"]
     assert item["maxItems"] == 3
-    assert schema.SCHEMA_VERSION == "oms/2.11"  # additive since (oms/2.6 P30, oms/2.7 O7, oms/2.8 scale_check, oms/2.9 drops, oms/2.10 horizontal, oms/2.11 motion stereo)
+    assert schema.SCHEMA_VERSION == "oms/2.12"  # additive since (oms/2.6 P30, oms/2.7 O7, oms/2.8 scale_check, oms/2.9 drops, oms/2.10 horizontal, oms/2.11 motion stereo; oms/2.12 behaviour only)
 
 
 def test_an_objects_read_carries_label_scores_with_client_labels(

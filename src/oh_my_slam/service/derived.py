@@ -69,13 +69,13 @@ from oh_my_slam.core.images import on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.mapping import navgrid, relocalize
 from oh_my_slam.mapping.anchor import Sim3
-from oh_my_slam.mapping.anchored import valid_depth
+from oh_my_slam.mapping.anchored import recorded_scale_sigma, valid_depth
 from oh_my_slam.mapping.store import frame_name
 from oh_my_slam.segmentation.api import DOOR_LABEL, door_leaf
 from oh_my_slam.service.backend import InternalMap
 from oh_my_slam.service.cameras import Camera
 from oh_my_slam.service.errors import ApiError
-from oh_my_slam.service.store import DEPTH_UNUSED, NO_STAND, Store
+from oh_my_slam.service.store import DEPTH_UNUSED, NO_STAND, OWN_SCALE_SIGMA, Store
 
 log = get_logger("oh_my_slam.service.derived")
 
@@ -574,9 +574,12 @@ class Derived:
                     self._pairs[k] = hit
             return hit
 
-        points = relocalize.triangulate(kfs, pair)
+        points, lifted = relocalize.triangulated(kfs, pair)
         buf = io.BytesIO()
+        # the points, and which of them are lifted from the stored depth as it is (api.md §6
+        # "Reference scale", oms/2.12)
         arrays: dict[str, Any] = {f"p{i}": p for i, p in enumerate(points)}
+        arrays.update({f"l{i}": m for i, m in enumerate(lifted)})
         np.savez(buf, **arrays)
         atomic_write_bytes(vdir / "locate.npz", buf.getvalue())
         # the floor: the version's one estimate (map.md §5), which its objects used, when its
@@ -676,6 +679,10 @@ class Derived:
             self.store.cameras(dv.name) if cameras is None else cameras).items()}
         z = np.load(dv.dir / "locate.npz")
         by_name = {f["name"]: f for f in dv.record["frames"]}
+        # the scale sigma of the version's stored depth (api.md §6 "Reference scale", oms/2.12):
+        # the map's, or a monocular keyframe's own
+        scale = recorded_scale_sigma(str(dv.record["scale_source"]),
+                                     dv.record["scale_sigma_rel"])
         kfs = []
         for i, kname in enumerate(dv.meta["keyframes"]):
             f = by_name[kname]
@@ -687,7 +694,10 @@ class Derived:
                 cams[f["camera_id"]].canonical().resized(w, h).K(), uv, desc, z[f"p{i}"],
                 float(f.get("sigma_pos_m") or 0.0), float(f.get("sigma_rot_deg") or 0.0),
                 f.get("depth_kind") == "sensor", f.get("height_sigma_m"),
-                f.get("pose_state", "fused") != "kept_at_prior"))
+                f.get("pose_state", "fused") != "kept_at_prior",
+                float(f.get(OWN_SCALE_SIGMA, scale)),
+                # a locate index written before oms/2.12 does not say: every point lifted
+                z[f"l{i}"] if f"l{i}" in z.files else None))
         idx = relocalize.Index(kfs)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
         return idx

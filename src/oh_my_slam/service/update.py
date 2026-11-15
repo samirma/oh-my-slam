@@ -59,6 +59,7 @@ from oh_my_slam.mapping.anchored import (
     DRIFT_NEVER_ALONE,
     DRIFT_SUPPORT_SHARE,
     MEASURABLE_INLIERS,
+    MONOCULAR_SIGMA_REL,
     OVERLAP_MIN,
     Features,
     coverage,
@@ -71,6 +72,7 @@ from oh_my_slam.mapping.anchored import (
     natural_key,
     own_floor,
     pose_residual,
+    recorded_scale_sigma,
     version_floor,
 )
 from oh_my_slam.mapping.anchored import (
@@ -100,7 +102,6 @@ from oh_my_slam.service.timings import FUSION_STAGES, Timings
 
 log = get_logger("oh_my_slam.service.update")
 
-MONOCULAR_SIGMA_REL = 0.10  # MoGe-2 metric depth: about 10 % scale error between scenes
 MIN_SCALE_SIGMA_REL = 0.005
 DEFAULT_HEIGHT_SIGMA_M = 0.02
 MIN_CAMERA_HEIGHT_M = 0.05  # internal camera heights below this tell no scale
@@ -783,7 +784,8 @@ class Updater:
         prev_sim = Sim3.from_dict(prev["sim3"])
         group = previous + metric
         if not group:  # the mapper kept none of the stored frames: its frame is unchanged
-            return _Anchored(prev_sim, prev["scale_source"], prev["scale_sigma_rel"], 0.0,
+            return _Anchored(prev_sim, prev["scale_source"], recorded_scale_sigma(
+                prev["scale_source"], prev["scale_sigma_rel"]), 0.0,
                              gauge_shift={"translation_m": 0.0, "rotation_deg": 0.0,
                                           "scale_ratio": 1.0}, scale_ratio_vs_prev=1.0,
                              origin_height_m=prev.get("origin_height_m"))
@@ -791,7 +793,8 @@ class Updater:
         if not fit.scale_observable:
             fit = anchor.fit(group, scale=prev_sim.s)
         used = [a for a, u in zip(group, fit.inliers, strict=True) if u]
-        source, sigma = prev["scale_source"], float(prev["scale_sigma_rel"])
+        source = prev["scale_source"]
+        sigma = recorded_scale_sigma(source, prev["scale_sigma_rel"])
         metric_in = [a for a in used if a.kind == "prior"]
         if metric_in and fit.scale_observable and len(metric_in) >= 2:
             source = "priors"

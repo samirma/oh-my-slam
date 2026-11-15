@@ -19,7 +19,7 @@ import pytest
 
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import analysis, motion
-from oh_my_slam.mapping.anchored import Features, exp_so3, rot_deg
+from oh_my_slam.mapping.anchored import MONOCULAR_SIGMA_REL, Features, exp_so3, rot_deg
 from oh_my_slam.reconstruction import stereo
 from oh_my_slam.segmentation.api import Detection
 from tests.synth import stereo as syn
@@ -254,7 +254,7 @@ def test_depth_sigma_with_motion_stereo_and_for_one_frame(an: An, views: dict[st
     """``depth_sigma``: σ(ln z) x 1000 per pixel of ``depth``, 0 where it is 0. With stereo the
     scale's sigma combined with the correction's local one: never below the scale's, lower
     near the triangulated points than away from them; for one frame the scale's sigma with the
-    model's own (hypot(0.10, 0.05))."""
+    model's own (hypot(MONOCULAR_SIGMA_REL, 0.05), oms/2.12)."""
     doc = analyse(an, views, [frame(rel(views, "step10"), "step10")])
     d, s = decode(doc["depth"]), decode(doc["depth_sigma"]).astype(np.float64)
     assert d.shape == s.shape == (syn.H, syn.W)
@@ -264,7 +264,7 @@ def test_depth_sigma_with_motion_stereo_and_for_one_frame(an: An, views: dict[st
     one = analyse(an, views, [], outputs=("depth_sigma",))
     assert "depth" not in one
     s1 = decode(one["depth_sigma"])
-    want = round(math.hypot(0.10, 0.05) * 1000)
+    want = round(math.hypot(MONOCULAR_SIGMA_REL, 0.05) * 1000)
     assert set(np.unique(s1).tolist()) <= {0, want} and (s1 == want).mean() > 0.5
     only = analyse(an, views, [], outputs=("depth",))
     assert "depth_sigma" not in only and np.array_equal((s1 > 0), decode(only["depth"]) > 0)
