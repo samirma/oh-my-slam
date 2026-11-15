@@ -2765,6 +2765,10 @@
               "sigma_rot_deg": {
                 "type": "number",
                 "exclusiveMinimum": 0
+              },
+              "ignore_mask": {
+                "$ref": "#/$defs/PartName",
+                "description": "oms/2.11: this frame's own 8-bit PNG mask, non-zero = ignore; combined with the camera's."
               }
             }
           }
@@ -3055,7 +3059,8 @@
             "used": {
               "enum": [
                 "baseline",
-                "camera_height"
+                "camera_height",
+                "monocular"
               ]
             }
           }

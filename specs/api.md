@@ -537,7 +537,8 @@ The versions read, revert and `--keep-versions` are O2.
 * **Motion stereo** (oms/2.11). A request may carry `frames[]`: other images of the same
   camera, each `{image, T_ref_frame, sigma_pos_m, sigma_rot_deg}`, `image` a part name and
   `T_ref_frame` the pose of that frame's optical frame in the reference frame's (the request's
-  `image`), in metres. At most 4 entries (a constant in `README.md`); a part of another size is
+  `image`), in metres. An entry may add `ignore_mask`, a part name: that frame's own mask, combined with
+  the camera's, as the request's `ignore_mask` is for the reference. At most 4 entries (a constant in `README.md`); a part of another size is
   `invalid_request`. The service matches each frame to the reference and refines each relative
   pose on the images, with the sent pose and sigmas as a prior: the rotation and the
   translation's direction, never its length |t|, which stays the client's. It triangulates the
@@ -558,7 +559,7 @@ The versions read, revert and `--keep-versions` are O2.
   * **Baseline check.** With `frames` and the camera's `height_above_floor_m`, the response
     carries `baseline_check: {baseline_scale_ratio, sigma, used}`: the camera-height scale over
     the baseline scale (null without a measurable floor or a qualifying pair), its sigma, and
-    the scale the outputs use. When the two differ by more than 3 sigma, or no pair qualifies,
+    the scale the outputs use: `baseline`, `camera_height`, or `monocular` when neither applies. When the two differ by more than 3 sigma, or no pair qualifies,
     the outputs take the camera-height scale with the motion-stereo shape, `scale_source`
     `camera_height`, `used` `camera_height`.
   * Without a qualifying pair or a camera height, `scale_source` is `monocular`, as for one
